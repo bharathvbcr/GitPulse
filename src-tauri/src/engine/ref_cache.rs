@@ -379,12 +379,17 @@ pub(crate) fn through_stamped(
     };
     let stamp = stamp
         .map(|stamp| &stamp.0)
-        .filter(|stamp| stamp.settled(SystemTime::now()))
+        .filter(|stamp| stamp.settled(wall_now()))
         .cloned();
     if let Some(stamp) = &stamp {
         let table = kept().lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(entry) = table.get(&key) {
-            if &entry.stamp == stamp && entry.stored_at.elapsed() < TTL {
+            // An entry stamped after `now` (the clock stepped back) has no
+            // age, and is not trusted rather than treated as brand new.
+            let fresh = mono_now()
+                .checked_duration_since(entry.stored_at)
+                .is_some_and(|age| age < TTL);
+            if &entry.stamp == stamp && fresh {
                 note_hit();
                 return Ok(entry.value.clone());
             }
@@ -413,7 +418,7 @@ pub(crate) fn through_stamped(
             key,
             Kept {
                 stamp,
-                stored_at: Instant::now(),
+                stored_at: mono_now(),
                 value: value.clone(),
             },
         );
@@ -451,6 +456,21 @@ pub(crate) fn through_stamped_coalesced(
         .run(key, || through_stamped(repo, args, stamp, run))
 }
 
+/// The monotonic "now" the TTL is measured on. Production reads the real
+/// clock; tests install a [`ManualClock`] so the TTL boundary needs no sleep.
+#[cfg(not(test))]
+fn mono_now() -> Instant {
+    Instant::now()
+}
+
+/// The wall-clock "now" a stamp's file mtimes are compared against. A second
+/// reading beside [`mono_now`] because the two clocks are different types; a
+/// [`ManualClock`] moves both together.
+#[cfg(not(test))]
+fn wall_now() -> SystemTime {
+    SystemTime::now()
+}
+
 #[cfg(not(test))]
 fn racy_window() -> Duration {
     RACY_WINDOW
@@ -463,6 +483,67 @@ fn note_hit() {}
 thread_local! {
     static RACY_OVERRIDE: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
     static HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static CLOCK: std::cell::Cell<Option<(Instant, SystemTime)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn mono_now() -> Instant {
+    CLOCK
+        .with(std::cell::Cell::get)
+        .map_or_else(Instant::now, |(mono, _)| mono)
+}
+
+#[cfg(test)]
+fn wall_now() -> SystemTime {
+    CLOCK
+        .with(std::cell::Cell::get)
+        .map_or_else(SystemTime::now, |(_, wall)| wall)
+}
+
+/// A clock a test moves by hand, on this thread only, until dropped. Moves
+/// the monotonic and wall readings together, in either direction.
+#[cfg(test)]
+pub(crate) struct ManualClock;
+
+#[cfg(test)]
+impl ManualClock {
+    pub(crate) fn install() -> Self {
+        // An hour of headroom so `rewind` never underflows the platform epoch.
+        let start = (
+            Instant::now() + Duration::from_secs(3600),
+            SystemTime::now() + Duration::from_secs(3600),
+        );
+        CLOCK.with(|cell| cell.set(Some(start)));
+        Self
+    }
+
+    pub(crate) fn now(&self) -> SystemTime {
+        wall_now()
+    }
+
+    pub(crate) fn advance(&self, by: Duration) {
+        CLOCK.with(|cell| {
+            let (mono, wall) = cell.get().expect("clock installed");
+            cell.set(Some((mono + by, wall + by)));
+        });
+    }
+
+    pub(crate) fn rewind(&self, by: Duration) {
+        CLOCK.with(|cell| {
+            let (mono, wall) = cell.get().expect("clock installed");
+            cell.set(Some((
+                mono.checked_sub(by).expect("headroom"),
+                wall - by,
+            )));
+        });
+    }
+}
+
+#[cfg(test)]
+impl Drop for ManualClock {
+    fn drop(&mut self) {
+        CLOCK.with(|cell| cell.set(None));
+    }
 }
 
 #[cfg(test)]
@@ -1222,6 +1303,145 @@ mod tests {
         assert!(
             table.contains_key(&key(chunks_in_window + 11)),
             "the newest chunk was evicted"
+        );
+    }
+
+    /// A stamp for `through_stamped` whose newest file is `age` old on `clock`.
+    fn stamp_aged(clock: &ManualClock, age: Duration) -> Stamp {
+        Stamp(RefStamp {
+            entries: Vec::new(),
+            newest: clock.now() - age,
+        })
+    }
+
+    /// Runs `through_stamped` and says whether `run` had to compute.
+    fn computed(fx: &Fixture, args: &[&str], stamp: &Stamp) -> bool {
+        let ran = std::cell::Cell::new(false);
+        let value = through_stamped(&fx.main, args, Some(stamp), || {
+            ran.set(true);
+            Ok(("answer".to_string(), true))
+        })
+        .unwrap();
+        assert_eq!(value, "answer");
+        ran.get()
+    }
+
+    const MILLI: Duration = Duration::from_millis(1);
+
+    /// The TTL is the safety net for inputs no stamp sees: an unchanged stamp
+    /// is served until the entry is exactly `TTL` old, and recomputed from then.
+    #[test]
+    fn an_entry_is_served_before_the_ttl_and_recomputed_at_it() {
+        let _held = retention();
+        let fx = fixture(None).unwrap();
+        let clock = ManualClock::install();
+        let stamp = stamp_aged(&clock, Duration::from_secs(10));
+        let args = ["log", "ttl-boundary"];
+        assert!(computed(&fx, &args, &stamp), "first ask computes");
+        clock.advance(TTL - MILLI);
+        assert!(!computed(&fx, &args, &stamp), "served 1 ms before the TTL");
+        clock.advance(MILLI);
+        assert!(computed(&fx, &args, &stamp), "recomputed at exactly the TTL");
+        assert!(!computed(&fx, &args, &stamp), "and kept afresh from there");
+    }
+
+    /// `through`, which reads the stamp from the real files, honours the same
+    /// clock: the files are an hour old on it, so the answer is kept, then
+    /// expires after the TTL.
+    #[test]
+    fn through_honours_the_injected_clock() {
+        let _held = retention();
+        let fx = fixture(None).unwrap();
+        let clock = ManualClock::install();
+        let runs = std::cell::Cell::new(0);
+        let ask = || {
+            through(&fx.main, TAGS, &["log", "through-clock"], || {
+                runs.set(runs.get() + 1);
+                Ok(("answer".to_string(), true))
+            })
+            .unwrap()
+        };
+        ask();
+        ask();
+        assert_eq!(runs.get(), 1, "kept before the TTL");
+        clock.advance(TTL);
+        ask();
+        assert_eq!(runs.get(), 2, "expired at the TTL with the files unchanged");
+    }
+
+    /// The coalesced path ends in `through_stamped`, so it expires on the same
+    /// clock.
+    #[test]
+    fn the_coalesced_path_honours_the_injected_clock() {
+        let _held = retention();
+        let fx = fixture(None).unwrap();
+        let clock = ManualClock::install();
+        let stamp = stamp_aged(&clock, Duration::from_secs(10));
+        let runs = std::cell::Cell::new(0);
+        let ask = || {
+            through_stamped_coalesced(&fx.main, &["log", "coalesced-clock"], Some(&stamp), || {
+                runs.set(runs.get() + 1);
+                Ok(("answer".to_string(), true))
+            })
+            .unwrap()
+        };
+        ask();
+        clock.advance(TTL - MILLI);
+        ask();
+        assert_eq!(runs.get(), 1, "served 1 ms before the TTL");
+        clock.advance(MILLI);
+        ask();
+        assert_eq!(runs.get(), 2, "recomputed at the TTL");
+    }
+
+    /// A stamp whose newest file is under `RACY_WINDOW` old is not stored; at
+    /// exactly the window it is. The boundary is inclusive on the settled side.
+    #[test]
+    fn the_young_stamp_guard_holds_at_its_boundary() {
+        let _held = retention();
+        let fx = fixture(None).unwrap();
+        let clock = ManualClock::install();
+        let young = stamp_aged(&clock, RACY_WINDOW - MILLI);
+        assert!(computed(&fx, &["log", "racy-young"], &young));
+        assert!(
+            computed(&fx, &["log", "racy-young"], &young),
+            "2.999 s old is never stored"
+        );
+        let settled = stamp_aged(&clock, RACY_WINDOW);
+        assert!(computed(&fx, &["log", "racy-settled"], &settled));
+        assert!(
+            !computed(&fx, &["log", "racy-settled"], &settled),
+            "3.000 s old is stored"
+        );
+    }
+
+    /// An NTP step backwards must neither pin a stale answer until the clock
+    /// catches up nor panic: an entry stored "in the future" is recomputed.
+    #[test]
+    fn a_clock_stepped_backwards_neither_panics_nor_serves_a_stale_entry() {
+        let _held = retention();
+        let fx = fixture(None).unwrap();
+        let clock = ManualClock::install();
+        clock.advance(Duration::from_secs(600));
+        let stamp = stamp_aged(&clock, Duration::from_secs(10));
+        let args = ["log", "clock-backwards"];
+        assert!(computed(&fx, &args, &stamp));
+        assert!(!computed(&fx, &args, &stamp));
+        clock.rewind(Duration::from_secs(5));
+        assert!(
+            computed(&fx, &args, &stamp),
+            "an entry newer than now is not trusted"
+        );
+        clock.rewind(Duration::from_secs(1800));
+        assert!(
+            computed(&fx, &args, &stamp),
+            "a stamp from the future is not stored either"
+        );
+        clock.advance(Duration::from_secs(1800));
+        clock.advance(Duration::from_secs(5));
+        assert!(
+            !computed(&fx, &args, &stamp),
+            "once the clock is back the entry stored after the step is 5 s old and served"
         );
     }
 
