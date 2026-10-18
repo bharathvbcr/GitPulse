@@ -81,6 +81,21 @@ fn the_agent_server_and_the_daemon_run_as_background() {
     }
 }
 
+/// The agent server's reads have a caller waiting on them, so its background
+/// spawns wait a bounded time for budget instead of being shed; the daemon's
+/// scheduled work has no one waiting and keeps shedding.
+#[test]
+fn the_agent_server_waits_for_background_budget_and_the_daemon_does_not() {
+    const AWAIT_SWITCH: &str =
+        "gitpulse_lib::engine::git_cli::run_process_awaiting_background_budget();";
+    assert!(leading_switches("src/bin/gitpulse-mcp.rs")
+        .iter()
+        .any(|s| s == AWAIT_SWITCH));
+    assert!(!leading_switches("src/bin/gitpulsed.rs")
+        .iter()
+        .any(|s| s == AWAIT_SWITCH));
+}
+
 /// Every shipped binary spends the per-user spawn budget, and opts in before
 /// its first spawn could build the gate without it. A binary that forgot
 /// would run on its own bucket, and N of them could start N times the rate

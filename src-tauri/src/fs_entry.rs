@@ -697,7 +697,15 @@ pub(crate) fn open_regular_nofollow(path: &Path) -> Result<(std::fs::File, u64),
         // file" behind an I/O error). Both are classified from the handle.
         options.custom_flags(0x0020_0000 | 0x0200_0000);
     }
-    let file = options.open(path).map_err(BoundedRead::Io)?;
+    let file = options.open(path).map_err(|err| {
+        // Opening a socket fails (ENXIO, or EOPNOTSUPP on macOS) before there
+        // is a descriptor to classify; it is still "not a regular file".
+        #[cfg(unix)]
+        if matches!(err.raw_os_error(), Some(libc::ENXIO | libc::EOPNOTSUPP)) {
+            return BoundedRead::NotRegular;
+        }
+        BoundedRead::Io(err)
+    })?;
     let meta = file.metadata().map_err(BoundedRead::Io)?;
     #[cfg(windows)]
     let is_link = {
