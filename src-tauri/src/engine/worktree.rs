@@ -9499,4 +9499,161 @@ some-future-field whatever
         assert_eq!(merged.target_branch, "main");
         assert!(repo.join("feature.txt").exists());
     }
+
+    // ---- adversarial review: aside deletion (ft-22bcf053) ----
+
+    fn vanishing(_: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+    }
+
+    /// A symlink inside an aside, pointing outside it, is unlinked and never
+    /// followed.
+    #[cfg(unix)]
+    #[test]
+    fn adv22_a_symlink_inside_an_aside_is_not_followed() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("precious"), "keep").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let aside = dir.path().join("1-50-1");
+        std::fs::create_dir_all(aside.join("build")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), aside.join("build/link")).unwrap();
+        delete_dir_tree(&aside).unwrap();
+        assert!(!aside.exists());
+        assert!(outside.path().join("precious").exists());
+    }
+
+    /// TOCTOU: the aside is swapped for a symlink to a real directory after the
+    /// sweep checked it and before it deletes. The target must survive.
+    #[cfg(unix)]
+    #[test]
+    fn adv22_an_aside_swapped_for_a_symlink_does_not_delete_the_target() {
+        let (dir, _wt) = teardown_fixture(None);
+        let victim = tempfile::tempdir().unwrap();
+        std::fs::write(victim.path().join("precious"), "keep").unwrap();
+        plant_aside(dir.path(), "1-51-1");
+        let victim_path = victim.path().to_path_buf();
+        let _ = sweep_teardown_asides_from(dir.path(), &list_holding, &|path| {
+            std::fs::remove_dir_all(path)?;
+            std::os::unix::fs::symlink(&victim_path, path)?;
+            delete_dir_tree(path)
+        });
+        assert!(
+            victim.path().join("precious").exists(),
+            "the symlink target was deleted"
+        );
+    }
+
+    /// A walk that keeps vanishing with the tree still there is retried a
+    /// bounded number of times and then returned as an error.
+    #[test]
+    fn adv22_a_walk_that_keeps_vanishing_is_bounded_and_returns_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let aside = dir.path().join("1-52-1");
+        std::fs::create_dir_all(&aside).unwrap();
+        let attempts = std::cell::Cell::new(0usize);
+        let result = delete_dir_tree_with(&aside, &|_| {
+            attempts.set(attempts.get() + 1);
+            vanishing(&aside)
+        });
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(attempts.get(), VANISHED_WALK_RETRIES + 1);
+        assert!(aside.exists());
+    }
+
+    /// Permission-denied on a nested child is returned, not swallowed.
+    #[cfg(unix)]
+    #[test]
+    fn adv22_permission_denied_on_a_nested_child_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let aside = dir.path().join("1-53-1");
+        std::fs::create_dir_all(aside.join("a/b")).unwrap();
+        std::fs::write(aside.join("a/b/f"), "x").unwrap();
+        std::fs::set_permissions(aside.join("a/b"), std::fs::Permissions::from_mode(0o500))
+            .unwrap();
+        let result = delete_dir_tree(&aside);
+        std::fs::set_permissions(aside.join("a/b"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        if result.is_ok() {
+            return; // running as a user the mode does not bind (root)
+        }
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(aside.exists());
+    }
+
+    /// The sweep must not turn a persistent in-walk NotFound (tree still
+    /// there) into "already removed": it is a problem, and the marker, the
+    /// only thing that finds a sibling aside, must stay.
+    #[test]
+    #[ignore = "break: sweep treats the NotFound that delete_dir_tree_with returns after exhausting its retries (tree still present) as already removed: no problem reported, marker deleted, sibling aside orphaned"]
+    fn adv22_sweep_reports_a_persistent_vanishing_walk_and_keeps_the_marker() {
+        let (dir, wt) = teardown_fixture(None);
+        let beside = wt
+            .path()
+            .parent()
+            .unwrap()
+            .join(".lane.gitpulse-teardown-1-54-1");
+        std::fs::create_dir_all(beside.join("build")).unwrap();
+        let holding = teardown_holding_dir(dir.path());
+        std::fs::create_dir_all(&holding).unwrap();
+        let marker = holding.join("1-54-1.sibling");
+        std::fs::write(&marker, format!("{}\n{}", beside.display(), "feed02")).unwrap();
+        std::fs::write(
+            beside.join(SENTINEL_FILE),
+            format!(
+                "{}\n{}",
+                resolve_git_common_dir(dir.path()).unwrap().display(),
+                "feed02"
+            ),
+        )
+        .unwrap();
+        let report = sweep_teardown_asides_from(dir.path(), &list_holding, &|path| {
+            delete_dir_tree_with(path, &vanishing)
+        });
+        assert!(beside.exists());
+        assert!(
+            marker.exists(),
+            "the marker was removed while the aside is still there: {report:?}"
+        );
+        assert_eq!(
+            report.problems.len(),
+            1,
+            "a persistent failure went unreported: {report:?}"
+        );
+    }
+
+    /// finish_teardown keeps its contract: a delete that cannot finish is
+    /// reported to the caller, and the marker stays.
+    #[test]
+    fn adv22_finish_teardown_reports_a_persistent_vanishing_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("1-55-1");
+        std::fs::create_dir_all(&path).unwrap();
+        let marker = dir.path().join("1-55-1.sibling");
+        std::fs::write(&marker, "m").unwrap();
+        let aside = TeardownAside {
+            path: path.clone(),
+            marker: Some(marker.clone()),
+        };
+        let note = finish_teardown(Some(aside), &mut |p| {
+            delete_dir_tree_with(p, &vanishing)
+        });
+        assert!(note.is_some_and(|n| n.contains("could not be deleted")));
+        assert!(marker.exists());
+        assert!(path.exists());
+    }
+
+    /// finish_teardown with a path already gone (a sweep won) is clean.
+    #[test]
+    fn adv22_finish_teardown_of_an_already_deleted_aside_is_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let aside = TeardownAside {
+            path: dir.path().join("nope"),
+            marker: None,
+        };
+        assert_eq!(finish_teardown(Some(aside), &mut delete_dir_tree), None);
+    }
 }
