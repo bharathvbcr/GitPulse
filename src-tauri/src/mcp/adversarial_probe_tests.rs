@@ -63,7 +63,10 @@ fn ledger_events_with_heavy_rows_holds_the_64k_budget_and_a_continuable_cursor()
     let fitted = budget::fit(true, payload.clone(), BUDGET).expect("fits");
     let structured = fitted.structured.clone().expect("structured");
     assert!(wire(&fitted) <= BUDGET, "{} bytes", wire(&fitted));
-    assert!(structured[TRUNCATION_KEY].is_object(), "cut without saying so");
+    assert!(
+        structured[TRUNCATION_KEY].is_object(),
+        "cut without saying so"
+    );
     let violations: Vec<String> =
         validate::validate(&structured, &schema_of("gitpulse_ledger_events"))
             .iter()
@@ -122,14 +125,14 @@ fn list_tasks_with_many_long_tasks_holds_the_64k_budget() {
             filed += 1;
         }
     }
-    assert!(filed >= 3,"only {filed} tasks could be filed");
+    assert!(filed >= 3, "only {filed} tasks could be filed");
     let payload = handle_tool_call(
         "gitpulse_list_tasks",
         &json!({ "repo_path": repo, "limit": 100 }),
     )
     .expect("list tasks");
     let listed = payload["tasks"].as_array().map_or(0, Vec::len);
-    assert!(listed >= 3,"list_tasks returned {listed} tasks");
+    assert!(listed >= 3, "list_tasks returned {listed} tasks");
     match budget::fit(true, payload, BUDGET) {
         Ok(fitted) => {
             assert!(wire(&fitted) <= BUDGET, "{} bytes", wire(&fitted));

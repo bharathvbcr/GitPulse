@@ -693,6 +693,25 @@ fn retry_after_property() -> Value {
     json!({ "type": "integer", "minimum": 0, "description": "With deferred: the soonest worth asking again, one refill interval of the spawn rate budget." })
 }
 
+/// An evidence or gap row of `gitpulse_task_view`: open, declaring only the
+/// optional record of a cut `data_json` / `evidence_json`.
+fn task_view_row_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "data_json_truncated": {
+                "type": ["object", "null"],
+                "description": "Null when the row's JSON text is whole. Otherwise `kept` of `total` top-level elements (array) or members (object) remain, of a text that was `bytes` long.",
+                "properties": {
+                    "kept": { "type": "integer" },
+                    "total": { "type": "integer" },
+                    "bytes": { "type": "integer" }
+                }
+            }
+        }
+    })
+}
+
 /// An open object facet that can carry the deferral fields.
 fn deferrable_object() -> Value {
     json!({
@@ -883,7 +902,7 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_ledger_events",
             "Ledger events",
-            "Read durable ledger event history (actor, tool, verdict, changes), oldest first from `cursor` by default. `order: \"desc\"` returns the newest first (`{order: \"desc\", limit: 5}` is the five newest, read by index without paging older rows); `since_ts`, `action`, `object`, `worktree_path`, `task_id`, `session_id` and `after_ref` filter by exact value and combine with AND; `since_ts`, `action`, `task_id` and `session_id` are index-backed, while `object`, `worktree_path` and `after_ref` are not: they walk the ledger newest-first or oldest-first and stop at `limit` matches, so one that matches nothing reads the whole ledger (an event time filter is not offered: event time rides in `detail_json`, not in a column). Page by passing the last `id` you saw back as `cursor` (an upper bound when `order` is `desc`); `truncated` says whether more follow. `ts_utc` is when the row was appended; `detail_json.occurred_at` carries event time when the source knew it, with `occurred_at_basis` (`ingest` means `occurred_at` is the ingest time, the source gave none that could be trusted) and, for transcript and reflog rows, `task_basis` (`bound`, `unbound` or `unresolved`) for how `task_id` was decided. On transcript rows `occurred_at` comes from the agent-written transcript, so task attribution there is as trustworthy as the transcript itself, not an authority. A page is also bounded in bytes (about 1 MiB), so it can hold fewer rows than `limit` with `truncated` true: continue from `next_cursor`. A field too long to return is cut, and says so inside its value (`detail_json.gitpulse_truncated`, `detail_json.object_truncated` for `object`, or a `…[truncated N bytes]` suffix).",
+            "Read durable ledger event history (actor, tool, verdict, changes), oldest first from `cursor` by default. `order: \"desc\"` returns the newest first (`{order: \"desc\", limit: 5}` is the five newest, read by index without paging older rows); `since_ts`, `action`, `object`, `worktree_path`, `task_id`, `session_id` and `after_ref` filter by exact value and combine with AND; `since_ts`, `action`, `task_id` and `session_id` are index-backed, while `object`, `worktree_path` and `after_ref` are not: they walk the ledger newest-first or oldest-first and stop at `limit` matches, so one that matches nothing reads the whole ledger (an event time filter is not offered: event time rides in `detail_json`, not in a column). Page by passing the last `id` you saw back as `cursor` (an upper bound when `order` is `desc`); `truncated` says whether more follow. `ts_utc` is when the row was appended; `detail_json.occurred_at` carries event time when the source knew it, with `occurred_at_basis` (`ingest` means `occurred_at` is the ingest time, the source gave none that could be trusted) and, for transcript and reflog rows, `task_basis` (`bound`, `unbound` or `unresolved`) for how `task_id` was decided. On transcript rows `occurred_at` comes from the agent-written transcript, so task attribution there is as trustworthy as the transcript itself, not an authority. A page is also bounded in bytes (about 1 MiB), so it can hold fewer rows than `limit` with `truncated` true: continue from `next_cursor`. A field too long to return is cut, and says so inside its value (`detail_json.gitpulse_truncated`, `detail_json.object_truncated` for `object`, or a `…[truncated N bytes]` suffix). A `verdict_json` has no room for a marker, so a cut one (long strings shortened, array tails and trailing object members dropped, never a new member or a changed kind) is recorded in the row's `verdict_truncated` (`{elements_dropped, members_dropped, strings_cut, bytes}`, null when whole); `detail_json` is returned as stored apart from its own length cut.",
             LedgerEventsArgs::properties(),
             &LedgerEventsArgs::required(),
             json!({
@@ -891,7 +910,24 @@ fn build_tools() -> Vec<Value> {
                 "properties": {
                     "ok": { "type": "boolean" },
                     "error": { "type": "string" },
-                    "events": { "type": "array" },
+                    "events": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "verdict_truncated": {
+                                    "type": ["object", "null"],
+                                    "description": "Null when `verdict_json` is whole. Otherwise what this page cut from it: `elements_dropped` and `members_dropped` (array tails and trailing object members removed; the verdict stays the same kind of JSON, with nothing added), `strings_cut` (long strings shortened, each ending with how much it lost) and `bytes` (its length before the cut).",
+                                    "properties": {
+                                        "elements_dropped": { "type": "integer" },
+                                        "members_dropped": { "type": "integer" },
+                                        "strings_cut": { "type": "integer" },
+                                        "bytes": { "type": "integer" }
+                                    }
+                                }
+                            }
+                        }
+                    },
                     "returned": { "type": "integer" },
                     "truncated": { "type": "boolean" },
                     "next_cursor": {
@@ -905,10 +941,17 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_task_view",
             "Task view",
-            "Read task leases plus evidence, gaps, and verification runs from dc-store. Never acquires a lease.",
+            "Read task leases plus evidence, gaps, and verification runs from dc-store. Never acquires a lease. An evidence row's `data_json` and a gap's `evidence_json` over 16 KiB are cut without changing what kind of JSON they hold (an array loses its tail, with no marker element; a string is shortened; an object loses members): the row's `data_json_truncated` (`{kept, total, bytes}`: elements or members kept of how many, and the length before the cut) says so, and is null when the text is whole.",
             TaskViewArgs::properties(),
             &TaskViewArgs::required(),
-            json!({ "type": "object" }),
+            json!({
+                "type": "object",
+                "description": "Manvi's task view; its shape is Manvi's contract. Only the rows' optional `data_json_truncated` is declared here.",
+                "properties": {
+                    "evidence": { "type": "array", "items": task_view_row_schema() },
+                    "gaps": { "type": "array", "items": task_view_row_schema() }
+                }
+            }),
         ),
         mutating_tool(
             "gitpulse_add_task",
@@ -1762,14 +1805,32 @@ fn task_view(a: TaskViewArgs) -> Result<Value, String> {
     // the MCP boundary. Each row's stored JSON text is cut the way a ledger
     // page cuts its own; the result budget then cuts the lists themselves and
     // sets `evidence_truncated` / `gaps_truncated`.
+    //
+    // A cut text keeps its kind and carries no marker; the cut is recorded on
+    // the row as `data_json_truncated` (`{kept, total, bytes}`, null when whole).
+    // The field exists only here, so the desktop's own view is unchanged.
     let cap = crate::ledger::ROW_FIELD_CAP_BYTES;
+    let mut evidence_cuts = Vec::with_capacity(view.evidence.len());
     for evidence in &mut view.evidence {
-        evidence.data_json = crate::ledger::bound_evidence_json(&evidence.data_json, cap);
+        let (text, cut) = crate::ledger::bound_evidence_json(&evidence.data_json, cap);
+        evidence.data_json = text;
+        evidence_cuts.push(cut);
     }
+    let mut gap_cuts = Vec::with_capacity(view.gaps.len());
     for gap in &mut view.gaps {
-        gap.evidence_json = crate::ledger::bound_evidence_json(&gap.evidence_json, cap);
+        let (text, cut) = crate::ledger::bound_evidence_json(&gap.evidence_json, cap);
+        gap.evidence_json = text;
+        gap_cuts.push(cut);
     }
-    Ok(json!(view))
+    let mut out = json!(view);
+    for (rows, cuts) in [("evidence", evidence_cuts), ("gaps", gap_cuts)] {
+        if let Some(rows) = out[rows].as_array_mut() {
+            for (row, cut) in rows.iter_mut().zip(cuts) {
+                row["data_json_truncated"] = cut.map_or(Value::Null, |cut| json!(cut));
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn meta_object(params: &Value) -> Option<&Value> {
@@ -3406,10 +3467,10 @@ mod tests {
     /// `every_advertised_tool_result_matches_its_declared_output_schema` fails
     /// both for a tool missing from this list and for one that no longer
     /// belongs on it.
-    const OBJECT_ONLY_OUTPUT_SCHEMAS: &[(&str, &str)] = &[(
-        "gitpulse_task_view",
-        "relays Manvi's task view; the shape is Manvi's contract",
-    )];
+    ///
+    /// Empty now: `gitpulse_task_view` declares the optional cut record of its
+    /// evidence and gap rows, so no tool is object-only.
+    const OBJECT_ONLY_OUTPUT_SCHEMAS: &[(&str, &str)] = &[];
 
     /// Whether a schema declares an array anywhere (`"type": "array"`, alone
     /// or in a type list), at any depth.
@@ -3433,10 +3494,6 @@ mod tests {
     /// budget has nothing to do beyond the long-string probe, which every one
     /// of them passes. The test checks the claim against the schema.
     const NO_ARRAY_IN_SCHEMA: &[(&str, &str)] = &[
-        (
-            "gitpulse_task_view",
-            "object-only schema; Manvi's view, capped per row and per list in `task_view`",
-        ),
         ("gitpulse_add_task", "one task record back, no list"),
         ("gitpulse_complete_task", "one task record back, no list"),
         ("gitpulse_delete_task", "one deletion receipt, no list"),
@@ -3453,6 +3510,10 @@ mod tests {
     /// test checks the schema does declare an array, so the claim cannot be a
     /// tool that simply has none.
     const EMPTY_ON_FIXTURES: &[(&str, &str)] = &[
+        (
+            "gitpulse_task_view",
+            "no evidence or gap rows on the fixture board; the row cut is held by the ledger cap tests",
+        ),
         (
             "gitpulse_collision_risk",
             "no overlapping dirty files on the fixture repositories",
@@ -3766,7 +3827,7 @@ mod tests {
             );
         }
         // Every other advertised tool is probed too, unless it is listed in
-        // `NO_LIST_TO_INFLATE` with why: the roster comes from the registry,
+        // `NO_ARRAY_IN_SCHEMA` or `EMPTY_ON_FIXTURES` with why: the roster comes from the registry,
         // so a tool added later and left unprobed fails here by name.
         let misfiled: Vec<String> = tools()
             .iter()
@@ -3791,8 +3852,8 @@ mod tests {
             .collect();
         assert!(
             misfiled.is_empty(),
-            "each advertised tool must be budget-probed or listed in NO_LIST_TO_INFLATE with a \
-             reason, and not both:\n{}",
+            "each advertised tool must be budget-probed or listed in NO_ARRAY_IN_SCHEMA or \
+             EMPTY_ON_FIXTURES with a reason, and not both:\n{}",
             misfiled.join("\n")
         );
         // Every advertised tool whose result holds a string was run with a

@@ -38,7 +38,8 @@ pub mod redact;
 #[cfg(test)]
 pub(crate) use anchor::forget as forget_identity_state;
 pub(crate) use anchor::settle as settle_identity;
-pub(crate) use cap::{bound_evidence_json, ROW_FIELD_CAP_BYTES};
+pub use cap::ValueCut;
+pub(crate) use cap::{bound_evidence_json, JsonCut, ROW_FIELD_CAP_BYTES};
 use cap::{cap_object, ObjectCap, OBJECT_TRUNCATED_KEY};
 use std::collections::HashMap;
 use std::io::Read;
@@ -2309,6 +2310,9 @@ pub struct EventPage {
     pub byte_capped: bool,
     /// More rows matched past the limit.
     pub more: bool,
+    /// What the page cut from each row's `verdict_json`, by event id; a row
+    /// with no entry kept its verdict whole.
+    pub verdict_cuts: std::collections::BTreeMap<i64, ValueCut>,
 }
 
 /// [`tail_readonly_page`] for a filtered, ordered read; `Ok(None)` is no ledger.
@@ -2395,25 +2399,31 @@ fn read_events(
                 events,
                 byte_capped: false,
                 more,
+                verdict_cuts: Default::default(),
             });
         };
         let mut used = 0;
         let mut page = Vec::with_capacity(events.len());
+        let mut verdict_cuts = std::collections::BTreeMap::new();
         let mut capped = false;
         for event in events {
-            let event = event.bounded();
+            let (event, verdict_cut) = event.bounded_recorded();
             let size = serde_json::to_string(&event).map_or(0, |text| text.len() + 1);
             if !page.is_empty() && used + size > budget {
                 capped = true;
                 break;
             }
             used += size;
+            if let Some(cut) = verdict_cut {
+                verdict_cuts.insert(event.id, cut);
+            }
             page.push(event);
         }
         Ok(EventPage {
             events: page,
             byte_capped: capped,
             more,
+            verdict_cuts,
         })
     })
 }
