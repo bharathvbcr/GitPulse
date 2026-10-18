@@ -1762,10 +1762,10 @@ fn task_view(a: TaskViewArgs) -> Result<Value, String> {
     // sets `evidence_truncated` / `gaps_truncated`.
     let cap = crate::ledger::ROW_FIELD_CAP_BYTES;
     for evidence in &mut view.evidence {
-        evidence.data_json = crate::ledger::bound_json_text(&evidence.data_json, cap);
+        evidence.data_json = crate::ledger::bound_evidence_json(&evidence.data_json, cap);
     }
     for gap in &mut view.gaps {
-        gap.evidence_json = crate::ledger::bound_json_text(&gap.evidence_json, cap);
+        gap.evidence_json = crate::ledger::bound_evidence_json(&gap.evidence_json, cap);
     }
     Ok(json!(view))
 }
@@ -3409,6 +3409,11 @@ mod tests {
         "relays Manvi's task view; the shape is Manvi's contract",
     )];
 
+    /// Tools whose payload holds no list the budget probe can inflate, each
+    /// with why. The probe cannot cut what is not a list, so these are the ones
+    /// the 64 KiB budget is not exercised against.
+    const NO_LIST_TO_INFLATE: &[(&str, &str)] = &[];
+
     fn is_object_only_exempt(name: &str) -> bool {
         OBJECT_ONLY_OUTPUT_SCHEMAS
             .iter()
@@ -3676,9 +3681,22 @@ mod tests {
                 "{name} was never held to the result budget; probed: {probed:?}"
             );
         }
+        // Every other advertised tool is probed too, unless it is listed in
+        // `NO_LIST_TO_INFLATE` with why: the roster comes from the registry,
+        // so a tool added later and left unprobed fails here by name.
+        let misfiled: Vec<String> = tools()
+            .iter()
+            .filter_map(|tool| {
+                let name = tool["name"].as_str().expect("name");
+                let listed = NO_LIST_TO_INFLATE.iter().any(|(exempt, _)| *exempt == name);
+                (probed.contains(name) == listed)
+                    .then(|| format!("{name} (probed={}, listed={listed})", probed.contains(name)))
+            })
+            .collect();
         assert!(
-            probed.len() >= 5,
-            "only {probed:?} could be inflated and budgeted"
+            misfiled.is_empty(),
+            "each advertised tool must be budget-probed or listed in NO_LIST_TO_INFLATE with a \
+             reason, and not both: {misfiled:?}"
         );
         // Every advertised tool whose result holds a string was run with a
         // long one at the mirror threshold.
