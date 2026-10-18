@@ -2897,11 +2897,38 @@ fn delete_dir_tree(path: &Path) -> std::io::Result<()> {
     delete_dir_tree_with(path, &|path| std::fs::remove_dir_all(path))
 }
 
+/// How many times a recursive delete is retried after NotFound from inside
+/// its walk before the NotFound is reported.
+const VANISHED_WALK_RETRIES: usize = 8;
+
+/// Deletes a tree with `remove_once`, treating NotFound as the goal state. A
+/// concurrent sweep can delete the tree, or children of it, while this walk is
+/// reading it, so NotFound can come from the top or from inside the walk: if
+/// the tree is gone it is done, and if it is not the walk is run again over
+/// what is left. Every other error is returned as it came, and a NotFound
+/// that persists past [`VANISHED_WALK_RETRIES`] with the tree still there is
+/// returned too.
 fn delete_dir_tree_with(
     path: &Path,
     remove_once: &dyn Fn(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    remove_once(path)
+    let mut attempt = 0;
+    loop {
+        match remove_once(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if matches!(std::fs::symlink_metadata(path),
+                    Err(gone) if gone.kind() == std::io::ErrorKind::NotFound)
+                {
+                    return Ok(());
+                }
+                attempt += 1;
+                if attempt > VANISHED_WALK_RETRIES {
+                    return Err(e);
+                }
+            }
+            other => return other,
+        }
+    }
 }
 
 /// Deletes the files [`remove_worktree_split`] moved aside, with the lock
@@ -3221,6 +3248,13 @@ fn sweep_teardown_asides_from(
                     let _ = std::fs::remove_file(marker);
                 }
                 report.removed += 1;
+            }
+            // Gone already (another sweep deleted it between the listing and
+            // this delete): the goal state, and that sweep reports it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(marker) = &marker {
+                    let _ = std::fs::remove_file(marker);
+                }
             }
             Err(e) => report.problems.push(format!(
                 "could not delete the leftover {}: {e}",
