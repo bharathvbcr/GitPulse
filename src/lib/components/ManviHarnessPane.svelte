@@ -267,6 +267,7 @@
     Gauge,
   } from "@lucide/svelte";
   import ExternalToolsPanel from "./ExternalToolsPanel.svelte";
+  import ManviClaudeModel from "./ManviClaudeModel.svelte";
   import { openSetupWizard } from "../tools/onboardingStore";
 
   let branchSuggestion = $state<string>("");
@@ -693,6 +694,8 @@
       </button>
     </div>
   </section>
+
+  <ManviClaudeModel />
 
   <!-- Model servers -->
   <section id={manviSectionId("model")} tabindex="-1" class="gp-card p-4 space-y-2">

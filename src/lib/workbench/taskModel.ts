@@ -1,20 +1,38 @@
 /**
- * Effective local-model selection for task enhancements.
+ * Effective model selection for task enhancements.
  *
- * The sheet never owns a second model picker: GitPulse's "Local model servers"
- * card pins `preferred`, discovery fills `ai.selected`, and host methods carry
- * that pair so the sidecar can spawn with matching MANVI_* env.
+ * The sheet never owns a second model picker: the Manvi pane either names a
+ * Claude model (`manviClaude`) or leaves Manvi on the "Local model servers"
+ * card, which pins `preferred` while discovery fills `ai.selected`. Host
+ * methods carry the result so the sidecar can spawn with matching MANVI_* env.
  */
 
-export interface ModelSelection {
+/** A model on an OpenAI-compatible server on this machine. */
+export interface LocalModelSelection {
+  provider?: "local";
   base_url: string;
   model: string;
 }
 
-export interface SelectionState {
-  preferred: ModelSelection | null;
-  ai: { selected: ModelSelection | null } | null;
+/** A Claude model through Anthropic's API, using the key in the Keychain. */
+export interface ClaudeModelSelection {
+  provider: "anthropic";
+  model: string;
 }
+
+export type ModelSelection = LocalModelSelection | ClaudeModelSelection;
+
+/** The Claude models Manvi's Anthropic adapter knows, newest tier first. */
+export const CLAUDE_MODELS = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"] as const;
+
+export interface SelectionState {
+  preferred: LocalModelSelection | null;
+  ai: { selected: LocalModelSelection | null } | null;
+  /** Set when Manvi should use Claude instead of a local model. */
+  manviClaude?: { model: string } | null;
+}
+
+const CLAUDE_MODEL = /^claude-[a-z0-9.-]{1,120}$/;
 
 export interface EnhancementFailureAdvice {
   guidance: string;
@@ -23,14 +41,26 @@ export interface EnhancementFailureAdvice {
 
 const LOOPBACK = /^(https?:\/\/)?(127\.0\.0\.1|localhost)(:\d+)?(\/.*)?$/i;
 
-/** preferred wins; otherwise the auto-chosen scan result. */
+/**
+ * Claude when the Manvi pane chose it; otherwise preferred wins over the
+ * auto-chosen scan result. A Claude choice that is not a valid model id falls
+ * back to nothing rather than to a local model the person did not pick.
+ */
 export function effectiveSelection(state: SelectionState): ModelSelection | null {
+  if (state.manviClaude) return normalizeSelection({ provider: "anthropic", model: state.manviClaude.model });
   return normalizeSelection(state.preferred) ?? normalizeSelection(state.ai?.selected ?? null);
 }
 
-/** Refuse empty, oversized, control-laden, or non-loopback selections. */
+/**
+ * Refuse empty, oversized or control-laden selections, local ones that are not
+ * on loopback, and Claude ones that are not a `claude-` model id.
+ */
 export function normalizeSelection(selection: ModelSelection | null | undefined): ModelSelection | null {
   if (!selection) return null;
+  if (selection.provider === "anthropic") {
+    const model = typeof selection.model === "string" ? selection.model.trim() : "";
+    return CLAUDE_MODEL.test(model) ? { provider: "anthropic", model } : null;
+  }
   const base_url = typeof selection.base_url === "string" ? selection.base_url.trim() : "";
   const model = typeof selection.model === "string" ? selection.model.trim() : "";
   if (!base_url || !model) return null;
@@ -46,10 +76,11 @@ export function selectionWire(selection: ModelSelection | null | undefined): { m
   return normalized ? { model: normalized } : {};
 }
 
-/** "qwen3.8:27b-mlx on 127.0.0.1:11434" */
+/** "qwen3.8:27b-mlx on 127.0.0.1:11434", or "claude-sonnet-5-5 via the Claude API" */
 export function describeSelection(selection: ModelSelection): string {
   const normalized = normalizeSelection(selection);
   if (!normalized) return "";
+  if (normalized.provider === "anthropic") return `${normalized.model} via the Claude API`;
   let host = normalized.base_url.replace(/^https?:\/\//i, "");
   host = host.replace(/\/v1\/?$/i, "").replace(/\/$/, "");
   return `${normalized.model} on ${host}`;

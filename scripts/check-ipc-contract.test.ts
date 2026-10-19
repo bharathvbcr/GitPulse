@@ -308,11 +308,12 @@ describe("annotated but unregistered commands", () => {
     // cmd_host_load_admit_anyway, 280 with cmd_terminal_incidents, 281
     // with cmd_verify_commit_signature, 282 with cmd_create_file, 283
     // with cmd_terminal_conversations, 284 with cmd_checkout_detached, and
-    // 285 with cmd_terminal_backend;
+    // 285 with cmd_terminal_backend, and 288 with the Claude key commands
+    // (cmd_claude_key_status, cmd_claude_key_save, cmd_claude_key_delete);
     // `bun run check:ipc`
     // prints all three numbers, so a bump made without re-running it will not
     // agree.
-    expect(found.size).toBe(285);
+    expect(found.size).toBe(288);
     expect(found.has("cmd_terminal_incidents")).toBe(true);
     expect(found.has("cmd_terminal_conversations")).toBe(true);
     expect(found.has("cmd_terminal_backend")).toBe(true);

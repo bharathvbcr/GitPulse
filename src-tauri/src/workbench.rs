@@ -52,7 +52,7 @@ const MAX_MODEL_ID: usize = 128;
 pub(crate) use dc_store::workbench::WORKBENCH_SCHEMA;
 
 /// Identity of the Manvi child environment. Changing it retires the worker.
-type WorkerFingerprint = Option<(String, String)>;
+type WorkerFingerprint = Option<crate::harness::sidecar::ModelSelection>;
 /// An open-file scan of a directory: `Ok` only when nothing is open in it.
 #[cfg(test)]
 type OpenFiles = fn(&std::path::Path) -> Result<(), String>;
@@ -311,6 +311,26 @@ impl WorkbenchState {
         std::fs::create_dir_all(parent)
             .map_err(|e| WorkbenchError::new("store_error", e.to_string()))?;
         Ok(path)
+    }
+
+    /// Stops a worker that was spawned with the Claude key, so the next call
+    /// spawns one with whatever key is saved now. A worker on a local model
+    /// holds no key and is left alone.
+    pub(crate) fn retire_claude_worker(&self) {
+        let previous = {
+            let mut guard = crate::supervisor::lock_or_recover(&self.0.worker);
+            match guard.as_ref() {
+                Some((Some(crate::harness::sidecar::ModelSelection::Claude { .. }), _)) => {
+                    guard.take()
+                }
+                _ => None,
+            }
+        };
+        if let Some((_, worker)) = previous {
+            if !worker.retire() {
+                log::warn!(target: "workbench", "Claude worker retire could not acquire the active request; it stops when that request ends");
+            }
+        }
     }
 
     pub(crate) fn shutdown(&self) {
@@ -739,9 +759,7 @@ impl WorkbenchState {
     ) -> Result<Arc<crate::harness::sidecar::ProfileConnection>, WorkbenchError> {
         self.check_open()?;
         let path = self.profile_path()?;
-        let fingerprint: WorkerFingerprint = selection
-            .as_ref()
-            .map(|s| (s.base_url.clone(), s.model.clone()));
+        let fingerprint: WorkerFingerprint = selection.clone();
         let worker = {
             let mut guard = crate::supervisor::lock_or_recover(&self.0.worker);
             let rebuild = match guard.as_ref() {
@@ -813,10 +831,15 @@ impl WorkbenchState {
     }
 }
 
+/// `provider` absent means a local server, which is every selection written
+/// before Claude could be chosen.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModelSelectionInput {
-    base_url: String,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
     model: String,
 }
 
@@ -849,34 +872,47 @@ fn parse_model_selection(
     let Some(input) = input else {
         return Ok(None);
     };
-    if input.base_url.len() > MAX_MODEL_BASE_URL || input.model.len() > MAX_MODEL_ID {
-        return Err(WorkbenchError::new(
-            "invalid_input",
-            "Model selection exceeds the size limit.",
-        ));
-    }
-    if input.base_url.is_empty() || input.model.is_empty() {
-        return Err(WorkbenchError::new(
-            "invalid_input",
-            "Model selection requires both base_url and model.",
-        ));
+    let invalid = |message: &str| WorkbenchError::new("invalid_input", message);
+    if input.model.is_empty() || input.model.len() > MAX_MODEL_ID {
+        return Err(invalid("Model id is empty or exceeds the size limit."));
     }
     if input
         .model
         .bytes()
         .any(|b| b <= 0x20 || b == 0x7f || b >= 0x80)
     {
-        return Err(WorkbenchError::new(
-            "invalid_input",
-            "Model id contains spaces or control characters.",
-        ));
+        return Err(invalid("Model id contains spaces or control characters."));
     }
-    let endpoint = crate::ai::http::parse_base_url(&input.base_url)
-        .map_err(|e| WorkbenchError::new("invalid_input", e))?;
-    Ok(Some(crate::harness::sidecar::ModelSelection {
-        base_url: endpoint.base_url(),
-        model: input.model,
-    }))
+    match input.provider.as_deref() {
+        None | Some("local") => {
+            let base_url = input.base_url.unwrap_or_default();
+            if base_url.is_empty() || base_url.len() > MAX_MODEL_BASE_URL {
+                return Err(invalid(
+                    "A local model selection requires a base_url within the size limit.",
+                ));
+            }
+            let endpoint = crate::ai::http::parse_base_url(&base_url)
+                .map_err(|e| WorkbenchError::new("invalid_input", e))?;
+            Ok(Some(crate::harness::sidecar::ModelSelection::Local {
+                base_url: endpoint.base_url(),
+                model: input.model,
+            }))
+        }
+        // Claude goes only to Anthropic's own endpoint: a base_url here would be
+        // a way to send the saved key somewhere else.
+        Some("anthropic") => {
+            if input.base_url.is_some() {
+                return Err(invalid("A Claude selection takes no base_url."));
+            }
+            if !input.model.starts_with("claude-") {
+                return Err(invalid("A Claude model id starts with `claude-`."));
+            }
+            Ok(Some(crate::harness::sidecar::ModelSelection::Claude {
+                model: input.model,
+            }))
+        }
+        Some(_) => Err(invalid("Model provider must be `local` or `anthropic`.")),
+    }
 }
 
 fn generation_input(method: &str, input: &str) -> Result<HostControl, WorkbenchError> {
@@ -1180,9 +1216,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.params, json!({}));
-        let selection = parsed.selection.unwrap();
-        assert_eq!(selection.base_url, "http://127.0.0.1:11434/v1");
-        assert_eq!(selection.model, "qwen3.8:27b-mlx");
+        assert_eq!(
+            parsed.selection,
+            Some(crate::harness::sidecar::ModelSelection::Local {
+                base_url: "http://127.0.0.1:11434/v1".into(),
+                model: "qwen3.8:27b-mlx".into(),
+            })
+        );
 
         let generate = generation_input(
             "enhancements.generate",
@@ -1193,7 +1233,10 @@ mod tests {
             generate.params,
             json!({"id":"e","request_id":"r","expected_revision":1})
         );
-        assert_eq!(generate.selection.as_ref().unwrap().model, "gemma4:31b-mlx");
+        assert!(matches!(
+            generate.selection,
+            Some(crate::harness::sidecar::ModelSelection::Local { ref model, .. }) if model == "gemma4:31b-mlx"
+        ));
 
         for input in [
             r#"{"model":{"base_url":"https://127.0.0.1:11434/v1","model":"x"}}"#,
@@ -1209,6 +1252,50 @@ mod tests {
                     .unwrap_err()
                     .code,
                 "invalid_input"
+            );
+        }
+    }
+
+    #[test]
+    fn host_control_accepts_a_claude_selection_and_refuses_one_that_names_an_endpoint() {
+        let parsed = generation_input(
+            "enhancements.configuration",
+            r#"{"model":{"provider":"anthropic","model":"claude-sonnet-5-5"}}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.params, json!({}));
+        assert_eq!(
+            parsed.selection,
+            Some(crate::harness::sidecar::ModelSelection::Claude {
+                model: "claude-sonnet-5-5".into()
+            })
+        );
+        let local = generation_input(
+            "enhancements.wake",
+            r#"{"model":{"provider":"local","base_url":"http://127.0.0.1:11434/v1","model":"m"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            local.selection,
+            Some(crate::harness::sidecar::ModelSelection::Local { .. })
+        ));
+
+        for input in [
+            // A Claude selection that names an endpoint could send the key there.
+            r#"{"model":{"provider":"anthropic","base_url":"http://127.0.0.1:1/v1","model":"claude-x"}}"#,
+            r#"{"model":{"provider":"anthropic","model":"gpt-5"}}"#,
+            r#"{"model":{"provider":"anthropic","model":""}}"#,
+            r#"{"model":{"provider":"anthropic","model":"claude x"}}"#,
+            r#"{"model":{"provider":"openai","model":"claude-x"}}"#,
+            r#"{"model":{"provider":"local","model":"m"}}"#,
+            r#"{"model":{"provider":"anthropic","model":"claude-x","api_key":"sk-ant-x"}}"#,
+        ] {
+            assert_eq!(
+                generation_input("enhancements.wake", input)
+                    .unwrap_err()
+                    .code,
+                "invalid_input",
+                "{input}"
             );
         }
     }
@@ -1301,9 +1388,11 @@ done
             host.request("tasks.suggest", "{}").unwrap();
             let guard = host.0.worker.lock().unwrap();
             let (fingerprint, live) = guard.as_ref().expect("worker still live");
-            assert_eq!(
-                fingerprint.as_ref().map(|(_, model)| model.as_str()),
-                Some("model-b"),
+            assert!(
+                matches!(
+                    fingerprint,
+                    Some(crate::harness::sidecar::ModelSelection::Local { model, .. }) if model == "model-b"
+                ),
                 "suggest rebuilt the worker to the default selection"
             );
             assert_eq!(Some(Arc::as_ptr(live)), pid_before);
