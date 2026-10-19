@@ -76,9 +76,10 @@ CREATE TABLE IF NOT EXISTS events (
   before_ref     TEXT,
   after_ref      TEXT,
   duration_ms    INTEGER,
-  detail_json    TEXT
+  detail_json    TEXT,
+  occurred_at    TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_events_repo_ts  ON events(repo_path, ts_utc);
+CREATE INDEX IF NOT EXISTS idx_events_repo_ts ON events(repo_path, ts_utc);
 CREATE INDEX IF NOT EXISTS idx_events_reflog   ON events(worktree_path, object)
     WHERE action LIKE 'reflog.%';
 CREATE INDEX IF NOT EXISTS idx_events_task     ON events(task_id)    WHERE task_id IS NOT NULL;
@@ -113,7 +114,22 @@ CREATE TABLE IF NOT EXISTS transcript_cursors (
   worktree_key   TEXT NOT NULL,
   file_key       TEXT NOT NULL,
   byte_offset    INTEGER NOT NULL,
+  fingerprint    TEXT,
   PRIMARY KEY (worktree_key, file_key)
+);
+CREATE TABLE IF NOT EXISTS reflog_watermarks (
+  worktree_key        TEXT PRIMARY KEY,
+  newest_entry_unix   INTEGER,
+  newest_entry_commit TEXT,
+  entries_at_newest   INTEGER,
+  updated_at          TEXT
+);
+CREATE TABLE IF NOT EXISTS catch_up_state (
+  worktree_key   TEXT PRIMARY KEY,
+  completed_at   TEXT,
+  truncated      INTEGER,
+  error          TEXT,
+  catch_up_json  TEXT
 );
 CREATE TABLE IF NOT EXISTS transcript_baselines (
   worktree_key   TEXT PRIMARY KEY,
@@ -189,28 +205,131 @@ pub const SCHEMA_VERSION: i64 = 1;
 /// knows about the stamp refuses a ledger stamped newer than itself, and a
 /// build older than the stamp's introduction is stopped by the daemon lock and
 /// the version check in Health instead.
-pub const WRITER_VERSION: i64 = 1;
+///
+/// Generation 2 (OD 1) is the one additive schema bump: `events.occurred_at`,
+/// `transcript_cursors.fingerprint`, the `reflog_watermarks` and
+/// `catch_up_state` tables, and the unique reflog identity index
+/// ([`migrate_to_writer_2`]). All of it is nullable or new, so no existing
+/// read or insert changes. A generation-1 build's queries and inserts name
+/// their columns, so they run unchanged against the migrated file; its writable
+/// open refuses the file by this very stamp, so it never writes one.
+pub const WRITER_VERSION: i64 = 2;
 
-/// Refuses a ledger a newer writer has stamped, and stamps one a writer of
-/// this generation is now using. Never lowers the stamp.
-fn check_writer_version(conn: &Connection, db_path: &Path) -> Result<(), LedgerError> {
-    let stamped: i64 = conn
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|e| LedgerError::new("pragma_failed", format!("user_version: {e}")))?;
+/// The unique index a reflog entry's identity is held to: one row per
+/// worktree, `object` (commit plus message, as stored), event time and, for an
+/// `object` that was cut to the append cap, the hash of its full text. The
+/// worktree and time are coalesced because SQLite treats NULLs as distinct in a
+/// unique index, and the anchor checkout stores a NULL worktree.
+const REFLOG_IDENTITY_INDEX: &str = "idx_events_reflog_identity";
+const REFLOG_IDENTITY_KEY: &str =
+    "COALESCE(worktree_path, ''), object, COALESCE(occurred_at, ''), \
+     COALESCE(CASE WHEN json_valid(detail_json) \
+                   THEN json_extract(detail_json, '$.object_truncated.hash') END, '')";
+const REFLOG_ROWS: &str = "action LIKE 'reflog.%' AND object IS NOT NULL";
+
+/// SQL for the event time `detail` carries, or NULL: the interim
+/// `detail_json.occurred_at` of a row written before the typed column, taken
+/// only when it has the exact canonical shape the writer produces.
+fn occurred_at_from_detail(detail: &str) -> String {
+    format!(
+        "CASE WHEN json_valid({detail}) AND json_extract({detail}, '$.occurred_at') GLOB \
+         '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' \
+         THEN json_extract({detail}, '$.occurred_at') END"
+    )
+}
+
+fn stamped_writer_version(conn: &Connection) -> Result<i64, LedgerError> {
+    conn.pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| LedgerError::new("pragma_failed", format!("user_version: {e}")))
+}
+
+fn writer_too_old(db_path: &Path, stamped: i64) -> LedgerError {
+    LedgerError::new(
+        "writer_too_old",
+        format!(
+            "{} was written by a newer GitPulse (writer generation {stamped}; this build is {WRITER_VERSION}). Update GitPulse, or restart the old gitpulsed, before writing to it.",
+            db_path.display()
+        ),
+    )
+}
+
+/// Refuses a ledger a newer writer has stamped, creates and migrates one an
+/// older (or no) writer left, and stamps it. Never lowers the stamp.
+///
+/// A refused writer alters nothing. A ledger below this generation is migrated
+/// in ONE immediate transaction that also holds the schema batch and the stamp,
+/// so a crash or an error at any point rolls all of it back and the next open
+/// starts again from the old stamp; every step is also safe to repeat, so a
+/// ledger some earlier attempt half-changed is completed rather than failed.
+/// The stamp is re-read under the write lock, so two processes opening one old
+/// ledger migrate it once.
+fn ensure_schema(conn: &Connection, db_path: &Path) -> Result<(), LedgerError> {
+    let stamped = stamped_writer_version(conn)?;
     if stamped > WRITER_VERSION {
-        return Err(LedgerError::new(
-            "writer_too_old",
-            format!(
-                "{} was written by a newer GitPulse (writer generation {stamped}; this build is {WRITER_VERSION}). Update GitPulse, or restart the old gitpulsed, before writing to it.",
-                db_path.display()
-            ),
-        ));
+        return Err(writer_too_old(db_path, stamped));
+    }
+    if stamped == WRITER_VERSION {
+        return conn
+            .execute_batch(SCHEMA)
+            .map_err(|e| LedgerError::new("schema_failed", e.to_string()));
+    }
+    let failed = |e: rusqlite::Error| LedgerError::new("migration_failed", e.to_string());
+    let tx = write_tx(conn).map_err(failed)?;
+    let stamped = stamped_writer_version(&tx)?;
+    if stamped > WRITER_VERSION {
+        return Err(writer_too_old(db_path, stamped));
     }
     if stamped < WRITER_VERSION {
-        conn.pragma_update(None, "user_version", WRITER_VERSION)
-            .map_err(|e| LedgerError::new("pragma_failed", format!("user_version: {e}")))?;
+        tx.execute_batch(SCHEMA).map_err(failed)?;
+        migrate_to_writer_2(&tx).map_err(failed)?;
+        tx.pragma_update(None, "user_version", WRITER_VERSION)
+            .map_err(failed)?;
+    }
+    tx.commit().map_err(failed)
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> rusqlite::Result<()> {
+    let present: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        params![table, column],
+        |row| row.get(0),
+    )?;
+    if present == 0 {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        ))?;
     }
     Ok(())
+}
+
+/// Writer generation 1 to 2. Runs inside [`ensure_schema`]'s transaction.
+///
+/// Dedupe rule: among reflog rows (`action LIKE 'reflog.%'` with an `object`)
+/// that share [`REFLOG_IDENTITY_KEY`], the lowest `id` survives and the rest are
+/// deleted. Rows from before the typed column carry their event time only in
+/// `detail_json`, so it is copied into the column first (reflog rows only, and
+/// only in the writer's exact shape): without that, two genuinely different
+/// entries with the same commit and message would look like one. Rows with no
+/// event time at all are the duplicates the old replay wrote; they collapse.
+fn migrate_to_writer_2(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "events", "occurred_at", "TEXT")?;
+    add_column_if_missing(conn, "transcript_cursors", "fingerprint", "TEXT")?;
+    conn.execute_batch(&format!(
+        "UPDATE events SET occurred_at = {from_detail}
+         WHERE occurred_at IS NULL AND {REFLOG_ROWS};
+         DELETE FROM events
+         WHERE {REFLOG_ROWS}
+           AND id NOT IN (SELECT MIN(id) FROM events WHERE {REFLOG_ROWS}
+                          GROUP BY {REFLOG_IDENTITY_KEY});
+         CREATE UNIQUE INDEX IF NOT EXISTS {REFLOG_IDENTITY_INDEX}
+           ON events({REFLOG_IDENTITY_KEY}) WHERE {REFLOG_ROWS};",
+        from_detail = occurred_at_from_detail("detail_json"),
+    ))
 }
 
 /// Who acted.
@@ -1117,9 +1236,7 @@ fn open(db_path: &Path) -> Result<Connection, LedgerError> {
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| LedgerError::new("pragma_failed", format!("synchronous: {e}")))?;
     // Before the schema batch: a refused writer must not alter anything.
-    check_writer_version(&conn, db_path)?;
-    conn.execute_batch(SCHEMA)
-        .map_err(|e| LedgerError::new("schema_failed", e.to_string()))?;
+    ensure_schema(&conn, db_path)?;
     checked_state_directory(dir, Some(repo), false)?;
     validate_ledger_files(db_path, repo)?;
     Ok(conn)
@@ -1385,6 +1502,8 @@ pub fn append(draft: Draft) -> Result<i64, LedgerError> {
 
     match &result {
         Ok(cursor) => announce(&draft.repo_path, *cursor),
+        // The entry is already in the ledger: nothing was lost.
+        Err(e) if e.code == "duplicate_reflog" => {}
         Err(_) => {
             // Counted, not swallowed. `status()` reports it, and the UI can say
             // the history it is showing is known to be incomplete.
@@ -1416,6 +1535,9 @@ struct Prepared {
     after_ref: Option<String>,
     duration_ms: Option<i64>,
     detail: Option<String>,
+    /// The typed `occurred_at` column: the draft's event-time stamp, only when
+    /// it is well-formed (the same check that lets it skip the redactor).
+    occurred_at: Option<String>,
 }
 
 /// `contracts/event.schema.json`'s action pattern,
@@ -1494,6 +1616,11 @@ fn prepare(draft: &Draft) -> Result<Prepared, LedgerError> {
         after_ref: draft.after_ref.as_deref().map(redact::text),
         duration_ms: draft.duration_ms,
         detail,
+        occurred_at: draft
+            .event_stamp
+            .as_ref()
+            .filter(|stamp| stamp.is_well_formed())
+            .map(|stamp| stamp.occurred_at.clone()),
     })
 }
 
@@ -1526,8 +1653,8 @@ fn insert(conn: &Connection, event: &Prepared) -> Result<i64, LedgerError> {
              ulid, ts_utc, schema_version, repo_path, worktree_path,
              actor_kind, actor_id, session_id, task_id, action, object,
              argv_json, outcome, verdict_json, before_ref, after_ref,
-             duration_ms, detail_json
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+             duration_ms, detail_json, occurred_at
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
         params![
             event.ulid,
             event.ts,
@@ -1547,9 +1674,20 @@ fn insert(conn: &Connection, event: &Prepared) -> Result<i64, LedgerError> {
             event.after_ref,
             event.duration_ms,
             event.detail,
+            event.occurred_at,
         ],
     )
-    .map_err(|e| LedgerError::new("insert_failed", e.to_string()))?;
+    .map_err(|e| match e {
+        // Another writer (the app and `gitpulsed` both replay the reflog)
+        // recorded this entry first. Not data loss, and not an insert failure.
+        rusqlite::Error::SqliteFailure(code, Some(message))
+            if code.code == rusqlite::ErrorCode::ConstraintViolation
+                && message.contains(REFLOG_IDENTITY_INDEX) =>
+        {
+            LedgerError::new("duplicate_reflog", message)
+        }
+        other => LedgerError::new("insert_failed", other.to_string()),
+    })?;
     Ok(conn.last_insert_rowid())
 }
 
@@ -2618,16 +2756,23 @@ fn import_legacy_page(
         let mut imported = 0usize;
         let mut newest_cursor = None;
 
+        // A copied reflog row keeps its interim event time in the typed column
+        // too, or it would not match the same entry the anchor recorded itself.
+        let insert_sql = format!(
+            "INSERT INTO events (
+                 ulid, ts_utc, schema_version, repo_path, worktree_path,
+                 actor_kind, actor_id, session_id, task_id, action, object,
+                 argv_json, outcome, verdict_json, before_ref, after_ref,
+                 duration_ms, detail_json, occurred_at
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,
+                 CASE WHEN ?10 LIKE 'reflog.%' THEN {} END)
+             ON CONFLICT DO NOTHING",
+            occurred_at_from_detail("?18")
+        );
         for event in page {
             let changed = transaction
                 .execute(
-                    "INSERT INTO events (
-                         ulid, ts_utc, schema_version, repo_path, worktree_path,
-                         actor_kind, actor_id, session_id, task_id, action, object,
-                         argv_json, outcome, verdict_json, before_ref, after_ref,
-                         duration_ms, detail_json
-                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
-                     ON CONFLICT(ulid) DO NOTHING",
+                    &insert_sql,
                     params![
                         event.ulid,
                         event.ts_utc,
@@ -2669,6 +2814,11 @@ fn import_legacy_page(
                 )
                 .optional()
                 .map_err(|error| LedgerError::new("legacy_import_failed", error.to_string()))?;
+            // No row has this ULID, so the conflict was the reflog identity
+            // index: the anchor already holds this entry. Not a ULID collision.
+            if existing.is_none() && event.action.starts_with("reflog.") {
+                continue;
+            }
             if existing
                 .as_ref()
                 .is_none_or(|existing| !same_event_payload(existing, event))
@@ -2871,7 +3021,7 @@ pub(crate) fn recorded_reflog_objects(
                 "SELECT object,
                         CASE WHEN json_valid(detail_json)
                              THEN json_extract(detail_json, '$.object_truncated.hash') END
-                 FROM events
+                 FROM events INDEXED BY idx_events_reflog
                  WHERE action LIKE 'reflog.%' AND object IS NOT NULL
                    AND (worktree_path IN (?1, ?2) OR (?3 AND worktree_path IS NULL))",
             )
@@ -3927,6 +4077,9 @@ mod reliability_tests;
 
 #[cfg(test)]
 mod query_tests;
+
+#[cfg(test)]
+mod schema_bump_tests;
 
 /// Test-only helpers that need the private registry.
 #[cfg(test)]
