@@ -138,7 +138,13 @@ fn an_unresolvable_commit_or_base_is_null_with_an_error() {
 /// indexes) with its bytes, in path order: the listing, the count and the
 /// content in one value.
 fn object_store(repo: &Repo) -> Vec<(String, Vec<u8>)> {
-    object_files(&repo.path().join(".git").join("objects"))
+    let mut store = object_files(&repo.path().join(".git").join("objects"));
+    // Every ref too: a textconv cache writes a notes ref, not only objects.
+    store.push((
+        "<refs: for-each-ref>".to_string(),
+        repo.git(&["for-each-ref"]).into_bytes(),
+    ));
+    store
 }
 
 #[test]
@@ -366,4 +372,137 @@ fn a_gate_refusal_is_a_comparison_failure_not_a_landed_false() {
     assert_eq!(answer.landed, None, "{answer:?}");
     assert!(answer.reason.is_some(), "{answer:?}");
     assert!(!answer.error.is_empty());
+}
+
+#[test]
+fn every_git_the_landed_path_spawns_is_told_not_to_lazy_fetch() {
+    let repo = Repo::new();
+    let env_of = || {
+        let run = crate::engine::git_cli::git_captured(
+            repo.path(),
+            &["-c", "alias.show-env=!env", "show-env"],
+        )
+        .expect("git");
+        String::from_utf8_lossy(&run.stdout).into_owned()
+    };
+    assert!(
+        !env_of().contains("GIT_NO_LAZY_FETCH"),
+        "the fence must be scoped to the caller that asks for it"
+    );
+    let fenced = crate::engine::git_cli::without_lazy_fetch(env_of);
+    assert!(fenced.contains("GIT_NO_LAZY_FETCH=1"), "{fenced}");
+    // And is lifted again afterwards.
+    assert!(!env_of().contains("GIT_NO_LAZY_FETCH"));
+}
+
+#[test]
+fn a_tag_and_a_branch_of_one_name_are_placed_by_the_ref_resolution_picked() {
+    let repo = Repo::new();
+    repo.git(&["checkout", "-b", "feature"]);
+    let tip = repo.commit("feature work", "feature.txt");
+    repo.git(&["checkout", "main"]);
+    repo.git(&["merge", "--ff-only", "feature"]);
+    // A tag and a branch both named `rel`, at different commits. Git's name
+    // lookup takes the tag, so the base is the tag's commit and the branch's
+    // reflog says nothing about it.
+    repo.git(&["tag", "rel"]);
+    repo.commit("after the tag", "later.txt");
+    repo.git(&["branch", "rel"]);
+    assert_ne!(
+        repo.git(&["rev-parse", "refs/tags/rel"]),
+        repo.git(&["rev-parse", "refs/heads/rel"])
+    );
+
+    let answer = landed(repo.as_str(), &tip, Some("rel"));
+
+    assert_eq!(answer.landed, Some(true), "{answer:?}");
+    assert_eq!(
+        answer.base_oid.as_deref(),
+        Some(repo.git(&["rev-parse", "refs/tags/rel"]).as_str())
+    );
+    assert_eq!(
+        answer.landed_at_source,
+        Some(LandedAtSource::CommitDate),
+        "the tag has no reflog; the branch's must not be read for it: {answer:?}"
+    );
+    // The unambiguous spellings each use their own.
+    let branch = landed(repo.as_str(), &tip, Some("refs/heads/rel"));
+    // (the branch was created at a later commit, so its reflog cannot place the
+    // landing, and says so in words about the reflog)
+    assert_ne!(branch.landed_at_source, Some(LandedAtSource::CommitDate));
+    assert!(branch.landed_at_reason.contains("reflog"), "{branch:?}");
+    let tag = landed(repo.as_str(), &tip, Some("refs/tags/rel"));
+    assert_eq!(tag.landed_at_source, Some(LandedAtSource::CommitDate));
+}
+
+/// `count` reverts in a row of one commit on the base: revert, reland, ...
+fn reverted_n_times(count: usize) -> (Repo, String) {
+    let repo = Repo::new();
+    repo.git(&["checkout", "-b", "feature"]);
+    let tip = repo.commit("feature work", "feature.txt");
+    repo.git(&["checkout", "main"]);
+    repo.git(&["merge", "--ff-only", "feature"]);
+    let mut current = tip.clone();
+    for _ in 0..count {
+        repo.git(&["revert", "--no-edit", &current]);
+        current = repo.git(&["rev-parse", "HEAD"]);
+    }
+    (repo, tip)
+}
+
+#[test]
+fn a_revert_chain_is_read_to_its_end_up_to_the_limit_and_null_beyond_it() {
+    for (count, expected) in [(1, Some(true)), (3, Some(true)), (4, Some(false))] {
+        let (repo, tip) = reverted_n_times(count);
+        let answer = landed(repo.as_str(), &tip, Some("main"));
+        assert_eq!(answer.reverted, expected, "{count} reverts: {answer:?}");
+    }
+    let (repo, tip) = reverted_n_times(5);
+    let answer = landed(repo.as_str(), &tip, Some("main"));
+    assert_eq!(answer.landed, Some(true));
+    assert_eq!(answer.reverted, None, "{answer:?}");
+    assert!(
+        answer.reverted_reason.starts_with("revert_chain_exceeded"),
+        "{answer:?}"
+    );
+    assert_eq!(answer.reverted_by, None);
+}
+
+#[test]
+fn absence_is_claimed_only_when_the_base_never_touched_the_branchs_paths() {
+    // The base edits a different part of the file the branch edits: merging is
+    // clean and adds the branch's lines, but the base did change that path
+    // since the fork, so the work may have landed edited and been rewritten.
+    let repo = Repo::new();
+    std::fs::write(repo.path().join("doc.txt"), "top\nmiddle\nbottom\n").unwrap();
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-m", "doc"]);
+    repo.git(&["checkout", "-b", "feature"]);
+    std::fs::write(
+        repo.path().join("doc.txt"),
+        "top\nmiddle\nbottom\nfeature line\n",
+    )
+    .unwrap();
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-m", "feature edits doc"]);
+    let tip = repo.git(&["rev-parse", "HEAD"]);
+    repo.git(&["checkout", "main"]);
+    std::fs::write(repo.path().join("doc.txt"), "main top\nmiddle\nbottom\n").unwrap();
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-m", "main edits doc"]);
+
+    let touched = landed(repo.as_str(), &tip, Some("main"));
+
+    assert_eq!(touched.landed, None, "{touched:?}");
+    assert_eq!(touched.reason, Some(LandedReason::ContentNotProvable));
+
+    // The same branch against a base that only changed other files is absent.
+    let other = Repo::new();
+    other.git(&["checkout", "-b", "feature"]);
+    let other_tip = other.commit("feature work", "feature.txt");
+    other.git(&["checkout", "main"]);
+    other.commit("main work", "main.txt");
+    let untouched = landed(other.as_str(), &other_tip, Some("main"));
+    assert_eq!(untouched.landed, Some(false), "{untouched:?}");
+    assert_eq!(untouched.reason, None);
 }

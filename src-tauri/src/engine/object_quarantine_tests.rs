@@ -322,3 +322,68 @@ fn names_are_unique_across_quarantines() {
     let second = ObjectQuarantine::new(repo.path()).expect("quarantine");
     assert_ne!(first.path(), second.path());
 }
+
+/// A directory under `base` with a file in it, last modified `age` ago.
+#[cfg(unix)]
+fn aged_dir(base: &Path, name: &str, age: Duration) -> PathBuf {
+    let path = base.join(name);
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("obj"), b"x").unwrap();
+    let handle = std::fs::File::open(&path).unwrap();
+    handle
+        .set_modified(std::time::SystemTime::now() - age)
+        .unwrap();
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn a_sweep_removes_only_old_directories_named_as_a_quarantine_names_them() {
+    let base = tempfile::tempdir().expect("tempdir");
+    let two_hours = Duration::from_secs(2 * 60 * 60);
+    let stale = aged_dir(base.path(), "gitpulse-quarantine-1-1-1", two_hours);
+    let fresh = aged_dir(base.path(), "gitpulse-quarantine-2-2-2", Duration::ZERO);
+    let foreign = aged_dir(base.path(), "not-gitpulse-quarantine-1-1-1", two_hours);
+    let odd = aged_dir(base.path(), "gitpulse-quarantine-abc", two_hours);
+    let bare = aged_dir(base.path(), "gitpulse-quarantine-", two_hours);
+    let file = base.path().join("gitpulse-quarantine-3-3-3");
+    std::fs::write(&file, b"not a directory").unwrap();
+    // A link under a matching name is not followed to what it points at.
+    let target = aged_dir(base.path(), "elsewhere", two_hours);
+    let link = base.path().join("gitpulse-quarantine-4-4-4");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let removed = sweep_stale(base.path(), STALE_AFTER);
+
+    assert_eq!(removed, 1);
+    assert!(!stale.exists(), "an old quarantine was left behind");
+    for kept in [&fresh, &foreign, &odd, &bare, &file, &target] {
+        assert!(kept.exists(), "{} was removed", kept.display());
+    }
+    assert!(target.join("obj").exists(), "the sweep followed a symlink");
+    assert!(link.symlink_metadata().is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn one_sweep_removes_a_bounded_number_and_the_next_continues() {
+    let base = tempfile::tempdir().expect("tempdir");
+    let two_hours = Duration::from_secs(2 * 60 * 60);
+    let total = SWEEP_REMOVALS + 5;
+    for n in 0..total {
+        aged_dir(
+            base.path(),
+            &format!("gitpulse-quarantine-9-{n}-1"),
+            two_hours,
+        );
+    }
+    assert_eq!(sweep_stale(base.path(), STALE_AFTER), SWEEP_REMOVALS);
+    assert_eq!(sweep_stale(base.path(), STALE_AFTER), 5);
+    assert_eq!(sweep_stale(base.path(), STALE_AFTER), 0);
+}
+
+#[test]
+fn a_missing_base_sweeps_nothing() {
+    let base = tempfile::tempdir().expect("tempdir");
+    assert_eq!(sweep_stale(&base.path().join("absent"), STALE_AFTER), 0);
+}

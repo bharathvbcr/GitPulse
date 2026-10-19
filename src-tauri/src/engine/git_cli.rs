@@ -917,6 +917,11 @@ fn git_command_with_env(
         _ => cmd.args(args),
     };
     pin_git_environment(&mut cmd);
+    if NO_LAZY_FETCH.get() {
+        // Set after the scrub, like the other pins: a missing object of a
+        // partial clone is then an error instead of a fetch from the remote.
+        cmd.env("GIT_NO_LAZY_FETCH", "1");
+    }
     // Git resolves its own helpers through the child's PATH, so a GUI launch
     // handed them the same minimal `/usr/bin:/bin:/usr/sbin:/sbin` that hid
     // `gh` and `cargo` from us: `gpg` for a signed commit, the interpreter a
@@ -4555,6 +4560,27 @@ fn run_with_gate(
         gate,
         &|| {},
     )
+}
+
+thread_local! {
+    /// Set only by [`without_lazy_fetch`]: every git this thread builds gets
+    /// `GIT_NO_LAZY_FETCH=1`.
+    static NO_LAZY_FETCH: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `body` with every git command built on this thread told not to fetch
+/// missing objects from a promisor remote (`GIT_NO_LAZY_FETCH=1`, git 2.44 and
+/// later; older gits ignore an unknown variable, which is why a read that must
+/// not fetch also refuses a partial clone up front instead of relying on this).
+pub(crate) fn without_lazy_fetch<T>(body: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NO_LAZY_FETCH.set(self.0);
+        }
+    }
+    let _restore = Restore(NO_LAZY_FETCH.replace(true));
+    body()
 }
 
 thread_local! {

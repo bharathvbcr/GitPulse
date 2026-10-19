@@ -1023,6 +1023,10 @@ pub enum LandedReason {
     /// A git comparison could not run: the spawn gate refused it, it hit its
     /// deadline, or the installed git lacks `merge-tree --write-tree`.
     ComparisonFailed,
+    /// The commit shares no history with the base, no patch of it is on the
+    /// base and its tree is not the tree of any base commit searched: it may
+    /// have been imported under other ids, so absence is not provable.
+    UnrelatedHistory,
 }
 
 /// Where `landed_at` came from.
@@ -1116,29 +1120,47 @@ const REVERT_TARGET_LIMIT: usize = 64;
 /// Whether the repository is a partial clone (`extensions.partialclone` or a
 /// promisor remote). Read from configuration only, so it fetches nothing.
 fn is_partial_clone(repo: &Path) -> Result<bool, String> {
-    let run = git_captured(
+    // Git decides what a boolean is (`true`, `yes`, `on`, `1`, any case, and a
+    // bare key), so it is asked with `--type=bool` rather than parsed here.
+    // A value it cannot read as a boolean is a failed read, which refuses: a
+    // config that could not be read is never "not partial".
+    let promisors = git_captured(
         repo,
         &[
             "config",
+            "--type=bool",
             "--get-regexp",
-            r"^(extensions\.partialclone|remote\..+\.promisor)$",
+            r"^remote\..*\.promisor$",
         ],
     )?
     .require_complete("git config")?;
-    match (run.success, run.status_code) {
-        (true, _) => Ok(String::from_utf8_lossy(&run.stdout).lines().any(|line| {
-            let (key, value) = line.split_once(' ').unwrap_or((line, ""));
-            if key.eq_ignore_ascii_case("extensions.partialclone") {
-                !value.trim().is_empty()
-            } else {
-                value.trim().eq_ignore_ascii_case("true")
+    match (promisors.success, promisors.status_code) {
+        (true, _) => {
+            if String::from_utf8_lossy(&promisors.stdout)
+                .lines()
+                .any(|line| line.rsplit(' ').next() == Some("true"))
+            {
+                return Ok(true);
             }
-        })),
+        }
         // Exit 1 with nothing on stderr is "no such key".
-        (false, 1) if run.stderr.is_empty() && !run.cancelled => Ok(false),
+        (false, 1) if promisors.stderr.is_empty() && !promisors.cancelled => {}
+        _ => {
+            return Err(format!(
+                "git config failed: {}",
+                String::from_utf8_lossy(&promisors.stderr).trim()
+            ))
+        }
+    }
+    // `extensions.partialclone` names the promisor remote: set means partial.
+    let extension = git_captured(repo, &["config", "--get", "extensions.partialclone"])?
+        .require_complete("git config")?;
+    match (extension.success, extension.status_code) {
+        (true, _) => Ok(!String::from_utf8_lossy(&extension.stdout).trim().is_empty()),
+        (false, 1) if extension.stderr.is_empty() && !extension.cancelled => Ok(false),
         _ => Err(format!(
             "git config failed: {}",
-            String::from_utf8_lossy(&run.stderr).trim()
+            String::from_utf8_lossy(&extension.stderr).trim()
         )),
     }
 }
@@ -1254,6 +1276,9 @@ fn squash_commit(
             "diff",
             "--no-color",
             "--no-ext-diff",
+            // A repository's `diff.<driver>.textconv` is a program it names,
+            // and its cache writes objects and a notes ref.
+            "--no-textconv",
             merge_base,
             commit,
             "--",
@@ -1289,6 +1314,7 @@ fn squash_commit(
             "-p",
             "--no-color",
             "--no-ext-diff",
+            "--no-textconv",
             "--no-merges",
             "--reverse",
             &max,
@@ -1446,12 +1472,24 @@ fn revert_state(
         let mut depth = 0;
         loop {
             match first_revert(repo, &current, base) {
-                Ok(Some(revert)) if depth < REVERT_CHAIN_LIMIT => {
+                Ok(Some(_)) if depth >= REVERT_CHAIN_LIMIT => {
+                    // The parity of a chain cut short is not the chain's.
+                    return (
+                        None,
+                        None,
+                        format!(
+                            "revert_chain_exceeded: more than {REVERT_CHAIN_LIMIT} reverts of \
+                             reverts follow this landing, so whether it ends reverted is not \
+                             told"
+                        ),
+                    );
+                }
+                Ok(Some(revert)) => {
                     first.get_or_insert_with(|| revert.clone());
                     current = revert;
                     depth += 1;
                 }
-                Ok(_) => break,
+                Ok(None) => break,
                 Err(e) => {
                     failure = Some(e);
                     break;
@@ -1504,18 +1542,18 @@ fn base_ref_name(repo: &Path, base_name: &str) -> Result<Option<String>, String>
     if base_name.starts_with('-') {
         return Ok(None);
     }
-    let candidates = [
-        base_name.to_string(),
-        format!("refs/heads/{base_name}"),
-        format!("refs/remotes/{base_name}"),
-    ];
-    for candidate in candidates.iter().filter(|c| c.starts_with("refs/")) {
-        let run = git_captured(repo, &["show-ref", "--verify", "--quiet", candidate])?;
-        if run.success && !run.cancelled {
-            return Ok(Some(candidate.clone()));
-        }
+    // The base was resolved to a commit by git's own name lookup, so the ref
+    // whose reflog speaks for it is the one that lookup picks (a tag wins over
+    // a branch of the same name), asked of git rather than guessed.
+    let run = git_captured(repo, &["rev-parse", "--symbolic-full-name", base_name])?;
+    if !run.success || run.cancelled {
+        return Err(format!(
+            "git rev-parse --symbolic-full-name failed: {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        ));
     }
-    Ok(None)
+    let full = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    Ok((full.starts_with("refs/heads/") || full.starts_with("refs/remotes/")).then_some(full))
 }
 
 /// When the base first contained `target`, and from what.
@@ -1708,9 +1746,17 @@ fn reflog_landed_at(repo: &Path, full_ref: &str, target: &str) -> Placement {
 /// time from the base branch's own reflog (never `HEAD`'s).
 ///
 /// Writes nothing: no ref, index, working-tree file or object. A commit with
-/// no history in common with the base has nothing to merge, so only the patch
-/// comparison applies and finding nothing is `false`.
+/// no history in common with the base has nothing to merge: its tree is looked
+/// for among the base's commits (`tree`), and finding nothing is
+/// `unrelated_history`, never `false`.
 pub fn landed(repo_path: &str, commit: &str, base_branch: Option<&str>) -> Landed {
+    // The second fence, independent of the partial-clone refusal below: every
+    // git this answer spawns is told not to fetch a missing object.
+    crate::engine::git_cli::without_lazy_fetch(|| landed_unfenced(repo_path, commit, base_branch))
+}
+
+/// The body of [`landed`], run with lazy fetch off.
+fn landed_unfenced(repo_path: &str, commit: &str, base_branch: Option<&str>) -> Landed {
     let base_name = base_branch.unwrap_or(DEFAULT_BASE);
     let repo = match validate_repo(repo_path) {
         Ok(repo) => repo,
@@ -1784,7 +1830,10 @@ pub fn landed(repo_path: &str, commit: &str, base_branch: Option<&str>) -> Lande
                 answer.via = Some(route.via);
                 answer.merge_commit = route.merge_commit;
                 if route.via == LandedVia::Merge {
-                    revert_targets = vec![route.landing.clone()];
+                    // A revert names the commit it undoes: the merge when the
+                    // whole merge was reverted, the asked commit when only it
+                    // was.
+                    revert_targets = vec![route.landing.clone(), sha.clone()];
                 }
                 place = Some(route.landing);
             }
@@ -1880,12 +1929,6 @@ fn unreachable_landing(
     };
     let mut squash_incomplete = false;
     if let Some(fork) = merge_base {
-        // A commit that adds nothing has nothing to find on the base.
-        match has_no_content_to_land(repo, sha, fork) {
-            Ok(true) => return Unreachable::Absent,
-            Ok(false) => {}
-            Err(reason) => return failed("tree comparison", reason),
-        }
         match squash_commit(repo, fork, sha, base) {
             Ok(Search::Found(commit)) => {
                 return Unreachable::Landed {
@@ -1899,6 +1942,8 @@ fn unreachable_landing(
             Err(reason) => return failed("patch comparison", reason),
         }
     }
+    // Every patch matched comes before "nothing to land": a net-empty branch
+    // that was cherry-picked commit by commit did land.
     match is_rebased(repo, sha, base) {
         Ok(true) => {
             return Unreachable::Landed {
@@ -1910,10 +1955,15 @@ fn unreachable_landing(
         Ok(false) => {}
         Err(reason) => return failed("git cherry", reason),
     }
-    // Without a fork there is no merge to run; no patch matched, and the
-    // histories share nothing for a landing to have gone through.
-    if merge_base.is_none() {
-        return Unreachable::Absent;
+    let Some(fork) = merge_base else {
+        return unrelated_landing(repo, sha, base);
+    };
+    // A commit whose tree is its fork's adds nothing, and no commit of it is on
+    // the base: there is nothing to land, which is absence.
+    match has_no_content_to_land(repo, sha, fork) {
+        Ok(true) => return Unreachable::Absent,
+        Ok(false) => {}
+        Err(reason) => return failed("tree comparison", reason),
     }
     match tree_route(repo, sha, base) {
         TreeRoute::Present => Unreachable::Landed {
@@ -1929,7 +1979,29 @@ fn unreachable_landing(
                  not find the work on the base"
             ),
         },
-        TreeRoute::Absent => Unreachable::Absent,
+        // A clean merge that adds something says part of the work is not on the
+        // base *as it is now*. It proves the work never landed only when the
+        // base's history since the fork never touched a path the branch
+        // changed: otherwise it may have landed (edited) and been removed or
+        // rewritten since.
+        TreeRoute::Absent => match base_touched_branch_paths(repo, fork, sha, base) {
+            Ok(Touched::No) => Unreachable::Absent,
+            Ok(Touched::Yes) => Unreachable::Unknown {
+                reason: LandedReason::ContentNotProvable,
+                error: "no merge, squash or rebase of this work was found and merging it adds \
+                        content, but the base changed some of the same paths since the fork, so \
+                        the work may have landed edited and been changed or removed since"
+                    .to_string(),
+            },
+            Ok(Touched::TooDeep) => Unreachable::Unknown {
+                reason: LandedReason::SearchDepthExceeded,
+                error: format!(
+                    "the base has more than {SQUASH_SEARCH_COMMITS} commits since the fork, so \
+                     whether it changed the branch's paths was not searched"
+                ),
+            },
+            Err(reason) => failed("path comparison", reason),
+        },
         TreeRoute::Conflicted => Unreachable::Unknown {
             reason: LandedReason::ContentNotProvable,
             error: "no merge, squash or rebase of this work was found, and merging it into the \
@@ -1939,6 +2011,123 @@ fn unreachable_landing(
         },
         TreeRoute::Failed(reason) => failed("content comparison", reason),
     }
+}
+
+/// A commit with no history in common with the base: there is no merge to run.
+/// Its tree is looked for among the newest [`SQUASH_SEARCH_COMMITS`] base
+/// commits (an import of a snapshot lands as exactly that tree); no match is
+/// null, because the content may have come in under other ids.
+fn unrelated_landing(repo: &Path, sha: &str, base: &str) -> Unreachable {
+    let failed = |reason: String| Unreachable::Unknown {
+        reason: LandedReason::ComparisonFailed,
+        error: format!("could not tell whether the base already holds this work: {reason}"),
+    };
+    let tree = match git_complete_text(
+        repo,
+        &["rev-parse", &format!("{sha}^{{tree}}")],
+        "git rev-parse",
+    ) {
+        Ok(text) => text.trim().to_string(),
+        Err(reason) => return failed(reason),
+    };
+    let max = format!("--max-count={}", SQUASH_SEARCH_COMMITS + 1);
+    let trees = match git_complete_text(repo, &["log", "--format=%T", &max, base, "--"], "git log")
+    {
+        Ok(text) => text,
+        Err(reason) => return failed(reason),
+    };
+    let searched: Vec<&str> = trees.lines().map(str::trim).collect();
+    if searched
+        .iter()
+        .take(SQUASH_SEARCH_COMMITS)
+        .any(|t| *t == tree)
+    {
+        return Unreachable::Landed {
+            via: LandedVia::Tree,
+            landing: None,
+            revert_targets: Vec::new(),
+        };
+    }
+    if searched.len() > SQUASH_SEARCH_COMMITS {
+        return Unreachable::Unknown {
+            reason: LandedReason::SearchDepthExceeded,
+            error: format!(
+                "this commit has no history in common with the base, and the base has more than \
+                 {SQUASH_SEARCH_COMMITS} commits, so its tree was not searched for in all of them"
+            ),
+        };
+    }
+    Unreachable::Unknown {
+        reason: LandedReason::UnrelatedHistory,
+        error: "this commit has no history in common with the base, and no patch or tree of the \
+                base matches it: it may have been imported under other ids, so it cannot be \
+                shown absent"
+            .to_string(),
+    }
+}
+
+/// Whether the base's history since `fork` touched any path the branch changed.
+enum Touched {
+    Yes,
+    No,
+    TooDeep,
+}
+
+/// Paths changed by `sha` since `fork` against paths changed by any commit of
+/// `fork..base` (renames split into their delete and add, merges counted
+/// against every parent). Bounded to the newest [`SQUASH_SEARCH_COMMITS`]
+/// commits: a longer history is `TooDeep`, never `No`.
+fn base_touched_branch_paths(
+    repo: &Path,
+    fork: &str,
+    sha: &str,
+    base: &str,
+) -> Result<Touched, String> {
+    let own = git_complete_text(
+        repo,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            fork,
+            sha,
+            "--",
+        ],
+        "git diff --name-only",
+    )?;
+    let branch_paths: std::collections::HashSet<&str> = own.lines().collect();
+    let range = format!("{fork}..{base}");
+    let max = format!("--max-count={}", SQUASH_SEARCH_COMMITS + 1);
+    let log = git_complete_text(
+        repo,
+        &[
+            "log",
+            "--name-only",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "-m",
+            "--format=%x01",
+            &max,
+            &range,
+            "--",
+        ],
+        "git log --name-only",
+    )?;
+    let commits = log.lines().filter(|line| *line == "\u{1}").count();
+    if log
+        .lines()
+        .any(|line| !line.is_empty() && line != "\u{1}" && branch_paths.contains(line))
+    {
+        return Ok(Touched::Yes);
+    }
+    Ok(if commits > SQUASH_SEARCH_COMMITS {
+        Touched::TooDeep
+    } else {
+        Touched::No
+    })
 }
 
 /// Freshness for many revisions, in one pass.

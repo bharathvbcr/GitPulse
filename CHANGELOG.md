@@ -29,6 +29,19 @@ before that tag is pushed.
   and a base with no reflog give a reason (or the commit date, labelled)
   instead of a wrong time. A partial clone is refused before any command that
   could fetch.
+- `gitpulse_landed` round 2: a partial clone is detected by asking git for the
+  boolean (`yes`, `on`, `1`, any case and a bare key all count; an unreadable
+  value refuses) and every git it spawns carries `GIT_NO_LAZY_FETCH=1` as a
+  second fence; a net-empty branch that was cherry-picked reads `rebase`, not
+  false; an unrelated history reads `tree` when its tree is a base commit's and
+  otherwise null (`unrelated_history`), never false; `git diff`/`log -p` run
+  with `--no-textconv`; a revert of one commit of a `--no-ff` merge is found; a
+  clean "adds content" merge is absence only when the base never touched the
+  branch's paths since the fork (otherwise null, `content_not_provable`); a
+  revert chain longer than four is null (`revert_chain_exceeded`); a tag and a
+  branch of one name are read by the ref git's lookup picks. The quarantine
+  sweeps leftover directories (an hour old, its own name, this user's) when a
+  new one is made.
 - `engine::object_quarantine`: a reusable quarantined `GIT_OBJECT_DIRECTORY`
   (alternates to the repository's objects, removed on every exit path) for git
   commands that must write objects without writing the repository.

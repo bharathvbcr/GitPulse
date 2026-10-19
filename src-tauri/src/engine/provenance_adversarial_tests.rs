@@ -911,8 +911,17 @@ fn an_unrelated_history_commit_is_not_on_the_base_and_has_no_merge_base() {
     assert_eq!(f.ahead, Some(1));
     assert_eq!(f.behind, Some(2));
     assert_eq!(f.distance, old_distance(&repo, &island, "main"));
+    // Retired: this test pinned `landed == Some(false)` here, the opposite of
+    // the ruling that false needs proof. No shared history is no merge to
+    // run, and the content may have come in under other ids.
     let answer = repo.land(&island);
-    assert_eq!(answer.landed, Some(false), "{}", describe(&answer));
+    assert_eq!(answer.landed, None, "{}", describe(&answer));
+    assert_eq!(
+        answer.reason,
+        Some(LandedReason::UnrelatedHistory),
+        "{}",
+        describe(&answer)
+    );
 }
 
 #[test]

@@ -1,9 +1,9 @@
 //! Adversarial review (round 2) of the rebuilt `gitpulse_landed` and the object
 //! quarantine, against real git in temporary repositories.
 //!
-//! A test marked `#[ignore = "adv: ..."]` pins a break: it states the answer an
-//! honest tool gives and fails against the current code. The others are
-//! attacks that held, kept as regression guards.
+//! Each test states the answer an
+//! honest tool gives. Ten of them were `#[ignore]`d breaks, failing on the first
+//! rebuild and fixed in round 2; the rest are attacks that held.
 
 use crate::engine::provenance::{landed, Landed, LandedReason, LandedVia};
 use crate::procguard::LockedSpawn;
@@ -322,7 +322,6 @@ fn commit_graph_settings_do_not_make_landed_write_a_graph() {
 /// notes commit into the object database and `refs/notes/textconv/*`. The
 /// pinned `--no-ext-diff` does not turn textconv off.
 #[test]
-#[ignore = "adv: git diff/log -p run repo textconv and its cache writes objects + a notes ref"]
 fn a_textconv_cache_does_not_write_into_the_object_database() {
     let r = R::new();
     r.git(&["config", "diff.up.textconv", "tr a-z A-Z <"]);
@@ -355,7 +354,6 @@ fn a_repository_path_with_the_list_separator_is_null_with_a_reason_never_false()
 /// moved main. The tip's tree equals the fork's, and `unreachable_landing` takes
 /// "adds nothing" to mean "not landed" before it ever asks `git cherry`.
 #[test]
-#[ignore = "adv: net-empty branch that was cherry-picked reads landed:false (no-content shortcut runs before cherry)"]
 fn a_net_empty_branch_that_was_cherry_picked_is_not_false() {
     let r = R::new();
     r.git(&["checkout", "-q", "-b", "f"]);
@@ -374,7 +372,6 @@ fn a_net_empty_branch_that_was_cherry_picked_is_not_false() {
 /// An orphan commit whose tree equals the base tip's: unrelated histories, so
 /// the patch search never runs, and absence is declared with no proof.
 #[test]
-#[ignore = "adv: unrelated history with the base's exact tree reads landed:false without proof"]
 fn an_unrelated_history_holding_the_bases_exact_tree_is_not_false() {
     let r = R::new();
     r.put("b.txt", "two\n", "second");
@@ -410,7 +407,6 @@ fn an_unrelated_binary_change_on_the_base_is_not_a_squash_of_this_one() {
 /// deleted later: merging adds the file back cleanly, which `tree_route` reads
 /// as "absent, provably".
 #[test]
-#[ignore = "adv: an edited squash whose file was later deleted reads landed:false"]
 fn an_edited_squash_whose_file_was_later_deleted_is_not_false() {
     let r = R::new();
     r.git(&["checkout", "-q", "-b", "f"]);
@@ -429,7 +425,6 @@ fn an_edited_squash_whose_file_was_later_deleted_is_not_false() {
 /// `git revert <c>` of a commit that came in through a `--no-ff` merge: the
 /// revert names `c`, not the merge, and only the merge is searched.
 #[test]
-#[ignore = "adv: revert of the asked commit (not the merge commit) reads reverted:false"]
 fn reverting_a_commit_of_a_merged_branch_is_found() {
     let r = R::new();
     r.git(&["checkout", "-q", "-b", "f"]);
@@ -445,7 +440,6 @@ fn reverting_a_commit_of_a_merged_branch_is_found() {
 /// A chain of five reverts (revert, reland, revert, reland, revert) leaves the
 /// work reverted; the chain is followed four deep and the fifth is dropped.
 #[test]
-#[ignore = "adv: a revert chain longer than REVERT_CHAIN_LIMIT reads the parity of the cut chain"]
 fn a_revert_chain_longer_than_the_limit_is_not_a_confident_not_reverted() {
     let r = R::new();
     r.git(&["checkout", "-q", "-b", "f"]);
@@ -659,25 +653,21 @@ fn extensions_partialclone_is_refused_without_a_fetch() {
 }
 
 #[test]
-#[ignore = "adv: remote.<n>.promisor=yes is a promisor to git but not to is_partial_clone, which matches only the word true"]
 fn promisor_yes_is_refused_without_a_fetch() {
     assert_refused_without_fetching("\tpromisor = yes\n");
 }
 
 #[test]
-#[ignore = "adv: remote.<n>.promisor=1 is a promisor to git but not to is_partial_clone"]
 fn promisor_one_is_refused_without_a_fetch() {
     assert_refused_without_fetching("\tpromisor = 1\n");
 }
 
 #[test]
-#[ignore = "adv: remote.<n>.promisor=on is a promisor to git but not to is_partial_clone"]
 fn promisor_on_is_refused_without_a_fetch() {
     assert_refused_without_fetching("\tpromisor = on\n");
 }
 
 #[test]
-#[ignore = "adv: a bare `promisor` key (implicit true) is a promisor to git but not to is_partial_clone"]
 fn a_bare_promisor_key_is_refused_without_a_fetch() {
     assert_refused_without_fetching("\tpromisor\n");
 }
@@ -725,4 +715,21 @@ fn a_promisor_only_in_the_worktree_local_config_is_refused_from_that_worktree() 
     let a = landed(wt_path.to_str().unwrap(), &tip, Some("main"));
     assert!(!marker.exists(), "{}", describe(&a));
     assert_eq!(a.reason, Some(LandedReason::PartialCloneFetchRequired));
+}
+
+/// A config git cannot read as a boolean is a failed read, and a failed read is
+/// never "not a partial clone": the answer is null and the helper never ran.
+#[test]
+fn an_unreadable_promisor_value_fails_closed_without_a_fetch() {
+    let (r, tip, marker) = promisor_repo("\tpromisor = banana\n");
+    let a = r.land(&tip);
+    assert!(!marker.exists(), "git ran the helper: {}", describe(&a));
+    assert_eq!(a.landed, None, "{}", describe(&a));
+    assert!(a.reason.is_some(), "{}", describe(&a));
+}
+
+#[test]
+fn promisor_spelled_in_capitals_with_padding_is_refused_without_a_fetch() {
+    assert_refused_without_fetching("\tpromisor = TRUE \n");
+    assert_refused_without_fetching("\tPROMISOR = Yes\n");
 }

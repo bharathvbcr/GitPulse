@@ -103,6 +103,10 @@ impl ObjectQuarantine {
         // which git could not read back as one directory.
         let alternates = std::env::join_paths([&objects])
             .map_err(|e| QuarantineError::Setup(format!("alternates: {e}")))?;
+        // A crash or a SIGKILL skips the Drop guard and leaves a directory
+        // behind; the next quarantine clears the old ones. Best effort: a
+        // sweep that cannot finish never stops this one from being made.
+        sweep_stale(&std::env::temp_dir(), STALE_AFTER);
         Ok(Self {
             dir: create_private_dir()?,
             alternates,
@@ -205,6 +209,76 @@ impl Drop for ObjectQuarantine {
             }
         }
     }
+}
+
+/// What every quarantine directory's name starts with.
+const NAME_PREFIX: &str = "gitpulse-quarantine-";
+
+/// A quarantine only lives for one command (a minute at most), so one this old
+/// belongs to a process that died without running its Drop guard.
+const STALE_AFTER: Duration = Duration::from_secs(60 * 60);
+
+/// Most leftovers removed by one sweep, and most directory entries looked at:
+/// a temp directory of millions of files costs one sweep a bounded read.
+const SWEEP_REMOVALS: usize = 32;
+const SWEEP_ENTRIES: usize = 10_000;
+
+/// Removes quarantine directories under `base` that are older than
+/// `older_than`: named exactly as [`create_private_dir`] names them (prefix and
+/// digit groups), a real directory (never a symlink), and owned by this user.
+/// Returns how many were removed.
+pub(crate) fn sweep_stale(base: &Path, older_than: Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.take(SWEEP_ENTRIES).flatten() {
+        if removed >= SWEEP_REMOVALS {
+            break;
+        }
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(NAME_PREFIX)) else {
+            continue;
+        };
+        if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+            continue;
+        }
+        let path = entry.path();
+        // `symlink_metadata`: a link planted under this name is not followed.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_dir() || !owned_by_this_user(&meta) {
+            continue;
+        }
+        let old_enough = meta
+            .modified()
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= older_than);
+        if !old_enough {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => removed += 1,
+            Err(e) => log::warn!(
+                "stale object quarantine {} not removed: {e}",
+                path.display()
+            ),
+        }
+    }
+    removed
+}
+
+#[cfg(unix)]
+fn owned_by_this_user(meta: &std::fs::Metadata) -> bool {
+    // SAFETY: `geteuid` reads this process's own credentials and cannot fail.
+    std::os::unix::fs::MetadataExt::uid(meta) == unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn owned_by_this_user(_meta: &std::fs::Metadata) -> bool {
+    true
 }
 
 fn is_object_name(text: &str) -> bool {
