@@ -186,6 +186,43 @@ pub async fn cmd_harness_reconnect() -> crate::harness::HarnessStatus {
     .unwrap_or_else(|e| harness_join_failure(e.to_string()))
 }
 
+/// Whether a Claude API key is saved for Manvi. The key itself never crosses
+/// into the webview.
+#[tauri::command(async)]
+pub async fn cmd_claude_key_status() -> Result<bool, IpcError> {
+    off_thread(|| crate::harness::claude_key::Keychain::system()?.present()).await
+}
+
+/// Saves the Claude API key Manvi uses when Claude is its model, replacing
+/// any saved one, and stops a worker still holding the old key.
+#[tauri::command(async)]
+pub async fn cmd_claude_key_save(
+    key: String,
+    workbench: State<'_, crate::workbench::WorkbenchState>,
+) -> Result<(), IpcError> {
+    let workbench = workbench.inner().clone();
+    off_thread(move || {
+        crate::harness::claude_key::Keychain::system()?.save(&key)?;
+        workbench.retire_claude_worker();
+        Ok(())
+    })
+    .await
+}
+
+/// Removes the saved Claude API key and stops a worker holding it.
+#[tauri::command(async)]
+pub async fn cmd_claude_key_delete(
+    workbench: State<'_, crate::workbench::WorkbenchState>,
+) -> Result<(), IpcError> {
+    let workbench = workbench.inner().clone();
+    off_thread(move || {
+        crate::harness::claude_key::Keychain::system()?.delete()?;
+        workbench.retire_claude_worker();
+        Ok(())
+    })
+    .await
+}
+
 /// Judges `command` for `repo_path` on the calling thread.
 ///
 /// Reserved endpoint, but still an entry point: `root` crosses a process

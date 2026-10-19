@@ -73,6 +73,13 @@ pub struct HelloResult {
     /// predates the field and did not say; it is never read as "no deadlines".
     #[serde(default)]
     pub op_limits: Option<std::collections::HashMap<String, OpLimit>>,
+    /// Whether this process keeps provider credentials from every child it
+    /// starts, and which variables that covers. `None` means a build that
+    /// predates the fields, which does not withhold them.
+    #[serde(default)]
+    pub withholds_provider_credentials: Option<bool>,
+    #[serde(default)]
+    pub withheld_provider_env: Option<Vec<String>>,
 }
 
 /// One op's lane and the deadline Manvi enforces on it.
@@ -132,6 +139,7 @@ mod managed_adapter_tests {
             managed_providers: managed
                 .map(|list| list.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>()),
             op_limits: None,
+            ..Default::default()
         }
     }
 
@@ -255,6 +263,7 @@ mod managed_adapter_tests {
             posture: "host".into(),
             managed_providers: Some(many),
             op_limits: None,
+            ..Default::default()
         };
         assert_eq!(hello.managed_adapter("claude"), ManagedAdapter::Present);
         assert_eq!(hello.managed_adapter("codex"), ManagedAdapter::Present);

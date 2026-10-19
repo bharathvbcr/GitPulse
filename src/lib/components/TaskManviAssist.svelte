@@ -41,6 +41,7 @@
     describeSelection,
     effectiveSelection,
     explainEnhancementFailure,
+    selectionWire,
   } from "../workbench/taskModel";
   import { harnessStore } from "../stores/harnessStore";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
@@ -269,7 +270,7 @@
     : `${draftingVerb(askKind, quick)} with ${engineName}`);
   const selectionSummary = $derived(liveSelection ? describeSelection(liveSelection) : "");
   const confirmedModel = $derived(configuration?.model_source === "env" && configuration.model.trim()
-    ? (liveSelection ? describeSelection({ base_url: liveSelection.base_url, model: configuration.model }) : `${configuration.provider} / ${configuration.model}`)
+    ? (liveSelection ? describeSelection({ ...liveSelection, model: configuration.model }) : `${configuration.provider} / ${configuration.model}`)
     : selectionSummary);
   const manviReady = $derived(!configPending && Boolean(liveSelection) && Boolean(configuration?.provider.trim() && configuration?.model.trim()) && !configurationError);
   const fieldReason = $derived(
@@ -336,8 +337,9 @@
   $effect(() => {
     // Configuration belongs to the shared model selection. A picker change
     // must recover this editor without closing it or losing the draft.
-    void liveSelection?.base_url;
-    void liveSelection?.model;
+    // A string, not the object: `liveSelection` is rebuilt on every store
+    // tick, and only a change of provider, endpoint or model should reload.
+    void (liveSelection ? JSON.stringify(selectionWire(liveSelection)) : "");
     untrack(() => { void loadConfig(); });
   });
   $effect(() => {
