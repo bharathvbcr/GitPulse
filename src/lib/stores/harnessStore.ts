@@ -151,6 +151,11 @@ export interface HarnessState {
   ai: AiStatus | null;
   /** Model the user pinned, or null to let discovery choose. */
   preferred: AiSelection | null;
+  /**
+   * The Claude model Manvi uses instead of a local one, or null to keep Manvi
+   * on the local selection. Manvi only: GitPulse's own AI features stay local.
+   */
+  manviClaude: { model: string } | null;
   isProbing: boolean;
   /** Most recent policy decision for the active repository, for the status strip. */
   lastVerdict: PolicyVerdict | null;
@@ -184,6 +189,7 @@ export interface HarnessState {
 }
 
 const STORAGE_KEY_MODEL = "gitpulse_ai_model";
+const STORAGE_KEY_MANVI_CLAUDE = "gitpulse_manvi_claude_model";
 
 type RepositoryProjectionState = Pick<
   HarnessState,
@@ -285,6 +291,25 @@ function loadPreferred(): AiSelection | null {
   return null;
 }
 
+/** The persisted Claude choice. Only the model id is stored; the key is in the Keychain. */
+function loadManviClaude(): { model: string } | null {
+  try {
+    const model = localStorage.getItem(STORAGE_KEY_MANVI_CLAUDE);
+    return model ? { model } : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveManviClaude(choice: { model: string } | null) {
+  try {
+    if (choice) localStorage.setItem(STORAGE_KEY_MANVI_CLAUDE, choice.model);
+    else localStorage.removeItem(STORAGE_KEY_MANVI_CLAUDE);
+  } catch {
+    /* ignore quota / private-mode failures */
+  }
+}
+
 function savePreferred(selection: AiSelection | null) {
   try {
     if (selection) {
@@ -320,6 +345,7 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
     harness: null,
     ai: null,
     preferred: loadPreferred(),
+    manviClaude: loadManviClaude(),
     isProbing: false,
     lastVerdict: null,
     error: null,
@@ -742,6 +768,12 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
       savePreferred(selection);
       update((s) => ({ ...s, preferred: selection }));
       return probeAi(++probeToken);
+    },
+
+    /** Points Manvi at a Claude model, or back at the local selection with null. */
+    selectManviClaude: (choice: { model: string } | null) => {
+      saveManviClaude(choice);
+      update((s) => ({ ...s, manviClaude: choice }));
     },
 
     recordVerdict: (verdict: PolicyVerdict | null, repoPath?: string) => {

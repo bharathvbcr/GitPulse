@@ -57,6 +57,44 @@ describe("selectionWire", () => {
   });
 });
 
+describe("Claude selections", () => {
+  const claude = { provider: "anthropic" as const, model: "claude-sonnet-5-5" };
+
+  it("wins over a local selection when the Manvi pane chose Claude", () => {
+    expect(effectiveSelection({ preferred: ok, ai: { selected: ok }, manviClaude: { model: "claude-sonnet-5-5" } })).toEqual(claude);
+    expect(effectiveSelection({ preferred: ok, ai: null, manviClaude: null })).toEqual(ok);
+  });
+
+  it("never falls back to a local model when the Claude choice is invalid", () => {
+    expect(effectiveSelection({ preferred: ok, ai: null, manviClaude: { model: "gpt-5" } })).toBeNull();
+  });
+
+  it("carries the provider on the wire and never a base_url", () => {
+    expect(selectionWire(claude)).toEqual({ model: claude });
+    expect(selectionWire({ provider: "anthropic", model: " claude-opus-5-5 " })).toEqual({
+      model: { provider: "anthropic", model: "claude-opus-5-5" },
+    });
+    for (const model of ["", "gpt-5", "claude-x\ny","claude- spaced", `claude-${"a".repeat(130)}`]) {
+      expect(selectionWire({ provider: "anthropic", model })).toEqual({});
+    }
+  });
+
+  it("describes itself as the Claude API", () => {
+    expect(describeSelection(claude)).toBe("claude-sonnet-5-5 via the Claude API");
+  });
+
+  it("passes key refusals through as written, never as a retry", () => {
+    // Each names its own remedy; none may be mistaken for "still starting".
+    for (const text of [
+      "Manvi is set to use Claude, but no Claude API key is saved. Add one in the Manvi pane, or switch Manvi back to a local model.",
+      "`/usr/local/bin/manvi` does not promise to keep ANTHROPIC_API_KEY from the programs it starts, so GitPulse will not give it your Claude API key. Update Manvi.",
+      "the running harness does not promise to keep ANTHROPIC_API_KEY from the programs it starts; stopped it rather than leave your Claude API key with it",
+    ]) {
+      expect(explainEnhancementFailure(text)).toEqual({ guidance: text, action: null });
+    }
+  });
+});
+
 describe("explainEnhancementFailure", () => {
   it.each([
     ["model not served by endpoint", "not served", "change_model"],
