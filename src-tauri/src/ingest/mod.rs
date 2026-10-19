@@ -96,6 +96,12 @@ pub struct CatchUp {
     pub reanchored_from: Vec<String>,
     /// Reflog entries replayed.
     pub reflog_entries: i64,
+    /// Replayed entries the ledger refused because it already held them (the
+    /// unique reflog identity index): another pass or process recorded them
+    /// first. `reflog_entries` is these plus the entries recorded plus any that
+    /// failed to write, so a shortfall is always accounted for.
+    #[serde(default)]
+    pub duplicates_refused: i64,
     /// True when the wall-clock deadline stopped the pass early.
     ///
     /// A truncated pass is a floor: remaining transcripts/reflog entries were
@@ -546,6 +552,13 @@ fn replay_reflog(
         }
     };
     let now_ms = ledger::ids::now_millis();
+    // Identical entries of one pass (a script's `git reset` twice in a second)
+    // are told apart by their occurrence index, 0, 1, 2, in the oldest-first
+    // order below. That order is the reflog's own, so two processes replaying
+    // the same pass number the same entries the same way, and the ledger's
+    // unique identity index refuses the second process's copies.
+    let mut occurrences: std::collections::HashMap<(String, i64), i64> =
+        std::collections::HashMap::new();
     // Oldest first, so the ledger's order matches the order things happened.
     for entry in entries.iter().rev() {
         // The selector (`HEAD@{3}`) is positional and shifts as the reflog
@@ -582,27 +595,35 @@ fn replay_reflog(
             "message": entry.message,
         })
         .to_string();
-        if ledger::record(Draft {
-            repo_path: ledger_repo.to_string(),
-            worktree_path: (ledger_repo != worktree_path).then(|| worktree_path.to_string()),
-            task_id: when.task.task_id().map(str::to_string),
-            action,
-            object: Some(identity),
-            after_ref: Some(entry.commit_id.clone()),
-            // Git does not record which actor moved the ref, and inventing one
-            // would be a guess written to disk. `system` says GitPulse
-            // synthesised this row from git's record.
-            actor_kind: Some(ActorKind::System),
-            actor_id: Some("reflog".into()),
-            outcome: Some(Outcome::Ok),
-            verdict_json: None,
-            detail_json: Some(detail),
-            event_stamp: Some(when.stamp()),
-            ..Default::default()
-        })
-        .is_some()
-        {
-            out.recorded += 1;
+        let occurrence = occurrences
+            .entry((identity.clone(), entry.timestamp))
+            .or_insert(0);
+        let reflog_ordinal = *occurrence;
+        *occurrence += 1;
+        match ledger::record_outcome(
+            Draft {
+                repo_path: ledger_repo.to_string(),
+                worktree_path: (ledger_repo != worktree_path).then(|| worktree_path.to_string()),
+                task_id: when.task.task_id().map(str::to_string),
+                action,
+                object: Some(identity),
+                after_ref: Some(entry.commit_id.clone()),
+                // Git does not record which actor moved the ref, and inventing one
+                // would be a guess written to disk. `system` says GitPulse
+                // synthesised this row from git's record.
+                actor_kind: Some(ActorKind::System),
+                actor_id: Some("reflog".into()),
+                outcome: Some(Outcome::Ok),
+                verdict_json: None,
+                detail_json: Some(detail),
+                event_stamp: Some(when.stamp()),
+                ..Default::default()
+            },
+            reflog_ordinal,
+        ) {
+            ledger::Recorded::Appended(_) => out.recorded += 1,
+            ledger::Recorded::Duplicate => out.duplicates_refused += 1,
+            ledger::Recorded::Failed => {}
         }
     }
     out

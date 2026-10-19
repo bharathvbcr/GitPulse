@@ -148,6 +148,7 @@ CREATE TABLE IF NOT EXISTS catch_up_state (
   skipped_lines       INTEGER,
   reflog_entries      INTEGER,
   failed_records      INTEGER,
+  duplicates_refused  INTEGER,
   error               TEXT
 );
 CREATE TABLE IF NOT EXISTS transcript_baselines (
@@ -231,7 +232,17 @@ pub const SCHEMA_VERSION: i64 = 1;
 /// ([`migrate_to_writer_2`]). All of it is nullable or new, so no existing
 /// read or insert changes. A generation-1 build's queries and inserts name
 /// their columns, so they run unchanged against the migrated file; its writable
-/// open refuses the file by this very stamp, so it never writes one.
+/// open refuses the file by this very stamp, so a generation-1 process that
+/// *starts* after the migration never writes it.
+///
+/// The stamp is read when a connection opens, not on every write. A
+/// generation-1 process that was already running when a generation-2 build
+/// migrated the ledger keeps its open connection and keeps writing, un-stamped:
+/// its rows carry no `occurred_at` or ordinal, and a duplicate reflog insert
+/// from it is refused by the unique index (which that build counts as a dropped
+/// append). Nothing can change a binary that is already running, so after an
+/// upgrade every running GitPulse process (the app, `gitpulsed`, `gitpulse-mcp`)
+/// must be restarted.
 pub const WRITER_VERSION: i64 = 2;
 
 /// The unique index a reflog entry's identity is held to (CARD 27 / S6-08):
@@ -241,17 +252,76 @@ pub const WRITER_VERSION: i64 = 2;
 /// worktree, time and ordinal are coalesced because SQLite treats NULLs as
 /// distinct in a unique index, and the anchor checkout stores a NULL worktree.
 const REFLOG_IDENTITY_INDEX: &str = "idx_events_reflog_identity";
-macro_rules! reflog_group_key {
-    () => {
-        "COALESCE(worktree_path, ''), object, COALESCE(occurred_at, ''), \
-         COALESCE(CASE WHEN json_valid(detail_json) \
-                       THEN json_extract(detail_json, '$.object_truncated.hash') END, '')"
-    };
-}
-/// The identity without the ordinal: what the migration numbers within.
-const REFLOG_GROUP_KEY: &str = reflog_group_key!();
-const REFLOG_IDENTITY_KEY: &str = concat!(reflog_group_key!(), ", COALESCE(reflog_ordinal, 0)");
 const REFLOG_ROWS: &str = "action LIKE 'reflog.%' AND object IS NOT NULL";
+
+/// The four things a reflog identity is made of, as SQL expressions: column
+/// names (the migration, the index) or bound values (the legacy import's
+/// lookup). ONE definition of the identity without its ordinal, shared by the
+/// index, the migration's numbering and the import's numbering, so none of them
+/// can disagree about which rows are "the same entry".
+///
+/// The cut-object hash is only read from a detail that mentions
+/// `object_truncated` at all; `instr` is a plain scan, where `json_valid` would
+/// parse every detail of every reflog row.
+struct IdentityParts<'a> {
+    worktree: &'a str,
+    object: &'a str,
+    occurred_at: &'a str,
+    detail: &'a str,
+}
+
+impl IdentityParts<'_> {
+    /// The `events` columns themselves.
+    const COLUMNS: IdentityParts<'static> = IdentityParts {
+        worktree: "worktree_path",
+        object: "object",
+        occurred_at: "occurred_at",
+        detail: "detail_json",
+    };
+
+    fn terms(&self) -> [String; 4] {
+        let Self {
+            worktree,
+            object,
+            occurred_at,
+            detail,
+        } = self;
+        [
+            format!("COALESCE({worktree}, '')"),
+            object.to_string(),
+            format!("COALESCE({occurred_at}, '')"),
+            format!(
+                "COALESCE(CASE WHEN instr({detail}, 'object_truncated') > 0 \
+                 AND json_valid({detail}) \
+                 THEN json_extract({detail}, '$.object_truncated.hash') END, '')"
+            ),
+        ]
+    }
+
+    /// The comma-separated key, without the ordinal.
+    fn key(&self) -> String {
+        self.terms().join(", ")
+    }
+}
+
+/// The full `CREATE UNIQUE INDEX` text. Also what a stored index is compared
+/// with (whitespace-normalised) before it is trusted.
+fn reflog_identity_index_sql() -> String {
+    format!(
+        "CREATE UNIQUE INDEX {REFLOG_IDENTITY_INDEX} ON events({}, COALESCE(reflog_ordinal, 0)) \
+         WHERE {REFLOG_ROWS}",
+        IdentityParts::COLUMNS.key()
+    )
+}
+
+fn normalise_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Upper bound on how long an opener waits for another process's migration.
+/// rusqlite's default busy timeout is 5 s, which a large ledger's migration
+/// can outlast; only the `BEGIN IMMEDIATE` of a migration waits this long.
+const MIGRATION_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// SQL for the event time `detail` carries, or NULL: the interim
 /// `detail_json.occurred_at` of a row written before the typed column, taken
@@ -300,7 +370,19 @@ fn ensure_schema(conn: &Connection, db_path: &Path) -> Result<(), LedgerError> {
             .map_err(|e| LedgerError::new("schema_failed", e.to_string()));
     }
     let failed = |e: rusqlite::Error| LedgerError::new("migration_failed", e.to_string());
-    let tx = write_tx(conn).map_err(failed)?;
+    // Another process may be migrating this very ledger. Waiting for its write
+    // lock is the one place a long wait is right, so the timeout is raised for
+    // that `BEGIN IMMEDIATE` alone and put back; the stamp is re-read below.
+    let ordinary_timeout: i64 = conn
+        .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+        .map_err(failed)?;
+    conn.busy_timeout(MIGRATION_BUSY_TIMEOUT).map_err(failed)?;
+    let begun = write_tx(conn);
+    let restored = conn.busy_timeout(std::time::Duration::from_millis(
+        u64::try_from(ordinary_timeout).unwrap_or(0),
+    ));
+    let tx = begun.map_err(failed)?;
+    restored.map_err(failed)?;
     let stamped = stamped_writer_version(&tx)?;
     if stamped > WRITER_VERSION {
         return Err(writer_too_old(db_path, stamped));
@@ -338,32 +420,56 @@ fn add_column_if_missing(
 /// Non-destructive: no row is deleted. An old row cannot tell a double-recorded
 /// reflog entry from a genuine repeat (two identical checkouts), so the
 /// migration keeps both and numbers them: within each group of reflog rows that
-/// share [`REFLOG_GROUP_KEY`], `reflog_ordinal` is 0, 1, 2... by ascending `id`.
-/// The unique index is then built over the group key plus the ordinal, which
-/// cannot fail on existing data. Reconciling old double-writes against the live
-/// reflog is Wave B replay work. Ordinals are recomputed from `id` on every
-/// run, so a re-run (the stamp was reset) is a no-op.
+/// share an [`IdentityParts`] key, the later rows get `reflog_ordinal` 1, 2...
+/// by ascending `id`. The first row of a group, and every row of a group of
+/// one, keeps a NULL ordinal, which the index reads as 0, so the work scales
+/// with the duplicates and not with the rows. The unique index is then built
+/// over the key plus the ordinal, which cannot fail on existing data.
+/// Reconciling old double-writes against the live reflog is Wave B replay work.
+/// Ordinals are recomputed from `id`, so a re-run (the stamp was reset) is a
+/// no-op.
 ///
 /// Rows from before the typed column carry their event time only in
 /// `detail_json`, so it is copied into the column first (reflog rows only, and
 /// only in the writer's exact shape); otherwise two entries at different times
 /// would be numbered as repeats of one.
+///
+/// An index of the same name with another definition (an earlier build's) is
+/// dropped and rebuilt rather than trusted.
 fn migrate_to_writer_2(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "events", "occurred_at", "TEXT")?;
     add_column_if_missing(conn, "events", "reflog_ordinal", "INTEGER")?;
     add_column_if_missing(conn, "transcript_cursors", "fingerprint", "TEXT")?;
+    let wanted = reflog_identity_index_sql();
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            params![REFLOG_IDENTITY_INDEX],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let current = stored
+        .as_deref()
+        .is_some_and(|sql| normalise_sql(sql) == normalise_sql(&wanted));
+    if !current && stored.is_some() {
+        conn.execute_batch(&format!("DROP INDEX {REFLOG_IDENTITY_INDEX}"))?;
+    }
+    let key = IdentityParts::COLUMNS.key();
     conn.execute_batch(&format!(
         "UPDATE events SET occurred_at = {from_detail}
          WHERE occurred_at IS NULL AND {REFLOG_ROWS};
          UPDATE events SET reflog_ordinal = numbered.n
          FROM (SELECT id,
-                      ROW_NUMBER() OVER (PARTITION BY {REFLOG_GROUP_KEY} ORDER BY id) - 1 AS n
+                      ROW_NUMBER() OVER (PARTITION BY {key} ORDER BY id) - 1 AS n
                FROM events WHERE {REFLOG_ROWS}) AS numbered
-         WHERE events.id = numbered.id AND events.reflog_ordinal IS NOT numbered.n;
-         CREATE UNIQUE INDEX IF NOT EXISTS {REFLOG_IDENTITY_INDEX}
-           ON events({REFLOG_IDENTITY_KEY}) WHERE {REFLOG_ROWS};",
+         WHERE events.id = numbered.id AND numbered.n > 0
+           AND events.reflog_ordinal IS NOT numbered.n;",
         from_detail = occurred_at_from_detail("detail_json"),
-    ))
+    ))?;
+    if !current {
+        conn.execute_batch(&wanted)?;
+    }
+    Ok(())
 }
 
 /// Who acted.
@@ -1261,6 +1367,13 @@ fn open(db_path: &Path) -> Result<Connection, LedgerError> {
     checked_state_directory(dir, Some(repo), false)?;
     validate_ledger_files(db_path, repo)?;
 
+    // A ledger a newer writer stamped is refused before anything below can touch
+    // it: switching a rollback-journal file to WAL rewrites its header.
+    let stamped = stamped_writer_version(&conn)?;
+    if stamped > WRITER_VERSION {
+        return Err(writer_too_old(db_path, stamped));
+    }
+
     // WAL lets a reader page the history while the writer appends. NORMAL
     // trades a fsync per commit for one per checkpoint; the ledger is a record
     // of actions that git has already made durable itself, so losing the last
@@ -1531,7 +1644,19 @@ fn open_readonly_initialised(db_path: &Path) -> Result<Connection, LedgerError> 
 /// [`advance_transcripts`] commits — passes through [`prepare`] and [`insert`];
 /// only the legacy import copies rows, already redacted when first written.
 pub fn append(draft: Draft) -> Result<i64, LedgerError> {
-    let event = prepare(&draft)?;
+    append_numbered(draft, 0)
+}
+
+/// [`append`] for a `reflog.*` row that is one of several identical entries of
+/// a replay pass: `ordinal` counts them from 0. Two processes replaying one
+/// pass number its entries the same way, so the unique reflog identity index
+/// refuses the second copy of each (`duplicate_reflog`). The ordinal means
+/// nothing to any other action.
+pub fn append_numbered(draft: Draft, ordinal: i64) -> Result<i64, LedgerError> {
+    let mut event = prepare(&draft)?;
+    if event.reflog_ordinal.is_some() {
+        event.reflog_ordinal = Some(ordinal);
+    }
     let result = with_conn(&draft.repo_path, |conn| insert(conn, &event));
 
     match &result {
@@ -1686,13 +1811,13 @@ fn store_object_and_detail(
 
 /// Inserts one prepared row.
 ///
-/// Every reflog row is written with `reflog_ordinal` 0, and the unique reflog
-/// identity index refuses a second row with the same identity and ordinal; that
-/// refusal is `INSERT OR IGNORE` in effect (code `duplicate_reflog`, which
-/// [`append`] neither counts as dropped nor announces). This lane does not
-/// compute real ordinals: numbering two genuinely identical entries of one
-/// replay pass 0, 1, 2 and matching them against the live reflog is Wave B's
-/// replay work. Until then identical entries in one second still record once.
+/// A reflog row is written with the draft's `reflog_ordinal` (0 when it names
+/// none), and the unique reflog identity index refuses a second row with the
+/// same identity and ordinal; that refusal is `INSERT OR IGNORE` in effect
+/// (code `duplicate_reflog`, which [`append`] neither counts as dropped nor
+/// announces, and [`record_outcome`] reports as [`Recorded::Duplicate`]). The
+/// replay numbers identical entries of one pass 0, 1, 2; matching those
+/// against the live reflog across passes is Wave B's replay work.
 fn insert(conn: &Connection, event: &Prepared) -> Result<i64, LedgerError> {
     conn.execute(
         "INSERT INTO events (
@@ -1981,11 +2106,39 @@ pub(crate) fn forget_transcripts(
 /// with no harness installed. The failure is counted and surfaced by
 /// [`status`]; it is never silent, and it never blocks the action.
 pub fn record(draft: Draft) -> Option<i64> {
-    match append(draft) {
-        Ok(id) => Some(id),
+    match record_outcome(draft, 0) {
+        Recorded::Appended(id) => Some(id),
+        Recorded::Duplicate | Recorded::Failed => None,
+    }
+}
+
+/// What [`record_outcome`] did with a draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recorded {
+    /// A new row, at this cursor id.
+    Appended(i64),
+    /// The ledger already holds this reflog entry (same worktree, object, event
+    /// time and ordinal): another pass or process recorded it first. Nothing
+    /// was lost and nothing counts as a dropped append, but a caller that
+    /// reports how many entries it recorded must say how many it refused.
+    Duplicate,
+    /// The append failed; it is counted by [`status`] and logged.
+    Failed,
+}
+
+/// [`record`] that says which of the three things happened, for a row that is
+/// the `ordinal`-th of several identical `reflog.*` entries (see
+/// [`append_numbered`]; 0 for any other row).
+pub fn record_outcome(draft: Draft, ordinal: i64) -> Recorded {
+    match append_numbered(draft, ordinal) {
+        Ok(id) => Recorded::Appended(id),
+        Err(e) if e.code == "duplicate_reflog" => {
+            log::debug!("ledger append refused as a duplicate reflog entry: {e}");
+            Recorded::Duplicate
+        }
         Err(e) => {
             log::warn!("ledger append failed: {e}");
-            None
+            Recorded::Failed
         }
     }
 }
@@ -2804,7 +2957,30 @@ fn import_legacy_page(
         let mut newest_cursor = None;
 
         // A copied reflog row keeps its interim event time in the typed column
-        // too, or it would not match the same entry the anchor recorded itself.
+        // too, and takes the next free ordinal of its identity group in the
+        // anchor: rows arrive in source id order, so two identical source rows
+        // import as 0 and 1 exactly as the migration numbers them in place, and
+        // a re-import is stopped by the ULID before the ordinal matters. The
+        // group is [`IdentityParts`] over the bound values, written to match the
+        // index's own expressions so its leading columns serve the lookup.
+        let imported_time = format!("CASE WHEN ?10 LIKE 'reflog.%' THEN {} END", {
+            occurred_at_from_detail("?18")
+        });
+        let group = IdentityParts::COLUMNS
+            .terms()
+            .into_iter()
+            .zip(
+                IdentityParts {
+                    worktree: "?5",
+                    object: "?11",
+                    occurred_at: &format!("({imported_time})"),
+                    detail: "?18",
+                }
+                .terms(),
+            )
+            .map(|(column, bound)| format!("{column} = {bound}"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
         let insert_sql = format!(
             "INSERT INTO events (
                  ulid, ts_utc, schema_version, repo_path, worktree_path,
@@ -2812,10 +2988,12 @@ fn import_legacy_page(
                  argv_json, outcome, verdict_json, before_ref, after_ref,
                  duration_ms, detail_json, occurred_at, reflog_ordinal
              ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,
-                 CASE WHEN ?10 LIKE 'reflog.%' THEN {} END,
-                 CASE WHEN ?10 LIKE 'reflog.%' THEN 0 END)
-             ON CONFLICT DO NOTHING",
-            occurred_at_from_detail("?18")
+                 {imported_time},
+                 CASE WHEN ?10 LIKE 'reflog.%' AND ?11 IS NOT NULL THEN
+                     (SELECT COALESCE(MAX(COALESCE(reflog_ordinal, 0)) + 1, 0)
+                      FROM events WHERE {REFLOG_ROWS} AND {group})
+                 WHEN ?10 LIKE 'reflog.%' THEN 0 END)
+             ON CONFLICT(ulid) DO NOTHING"
         );
         for event in page {
             let changed = transaction
@@ -2862,11 +3040,6 @@ fn import_legacy_page(
                 )
                 .optional()
                 .map_err(|error| LedgerError::new("legacy_import_failed", error.to_string()))?;
-            // No row has this ULID, so the conflict was the reflog identity
-            // index: the anchor already holds this entry. Not a ULID collision.
-            if existing.is_none() && event.action.starts_with("reflog.") {
-                continue;
-            }
             if existing
                 .as_ref()
                 .is_none_or(|existing| !same_event_payload(existing, event))

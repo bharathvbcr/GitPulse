@@ -46,6 +46,13 @@ export interface CatchUp {
    */
   reanchored_from?: string[];
   reflog_entries: number;
+  /**
+   * Reflog entries the ledger refused because it already held them (same
+   * worktree, object, event time and ordinal), so another pass or process
+   * recorded them first. Not lost, not an error: `reflog_entries` equals the
+   * entries recorded here plus these plus any that failed to write.
+   */
+  duplicates_refused?: number;
   /** True when the wall-clock deadline stopped the pass early. */
   truncated: boolean;
   /** Ledger events the retention policy deleted at the end of the pass. */

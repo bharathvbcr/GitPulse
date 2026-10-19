@@ -212,7 +212,8 @@ fn fuzzed_generation_1_ledgers_migrate_without_changing_any_original_column() {
             let distinct: i64 = conn
                 .query_row(
                     &format!(
-                        "SELECT COUNT(*) FROM (SELECT DISTINCT {REFLOG_GROUP_KEY} FROM events WHERE {REFLOG_ROWS})"
+                        "SELECT COUNT(*) FROM (SELECT DISTINCT {} FROM events WHERE {REFLOG_ROWS})",
+                        IdentityParts::COLUMNS.key()
                     ),
                     [],
                     |r| r.get(0),
@@ -325,8 +326,9 @@ fn the_index_cannot_fail_to_build_over_coalesce_collisions() {
         );
     }
     let conn = open(&db).expect("migrates");
+    // The first row of a group keeps a NULL ordinal, which the index reads as 0.
     let ordinals: Vec<i64> = conn
-        .prepare("SELECT reflog_ordinal FROM events ORDER BY id")
+        .prepare("SELECT COALESCE(reflog_ordinal, 0) FROM events ORDER BY id")
         .unwrap()
         .query_map([], |r| r.get(0))
         .unwrap()
@@ -337,7 +339,6 @@ fn the_index_cannot_fail_to_build_over_coalesce_collisions() {
 }
 
 #[test]
-#[ignore = "adv: CREATE UNIQUE INDEX IF NOT EXISTS trusts the name, so a pre-existing index of that name with another definition is kept and the ledger is stamped 2 with the wrong identity"]
 fn a_stale_index_of_the_same_name_is_replaced_not_trusted() {
     let (_dir, repo) = repo_dir();
     let db = old_ledger(&repo);
@@ -522,7 +523,6 @@ fn two_processes_opening_one_old_ledger_migrate_it_once_and_both_succeed() {
 }
 
 #[test]
-#[ignore = "adv: a second process opening an old ledger while another migrates fails after the 5 s default busy timeout with migration_failed 'database is locked' (measured: 200k rows in a debug build; ~1M rows optimized takes ~15 s)"]
 fn a_second_opener_survives_a_migration_longer_than_the_busy_timeout() {
     let (_dir, repo) = repo_dir();
     let db = old_ledger(&repo);
@@ -538,9 +538,15 @@ fn a_second_opener_survives_a_migration_longer_than_the_busy_timeout() {
     );
 }
 
+/// Characterization, renamed from
+/// `a_live_generation_1_connection_keeps_working_exactly_as_before_the_migration`:
+/// the stamp is read at open, so a generation-1 process already running keeps
+/// writing after a generation-2 build migrated the ledger (documented on
+/// [`WRITER_VERSION`]; the fix is to restart it). Its rows carry no typed event
+/// time, and a duplicate reflog insert from it hits the unique index.
 #[test]
-#[ignore = "adv: a generation-1 process that still holds an open connection is NOT refused by the stamp (it is only read at open); it keeps inserting un-backfilled reflog rows, and a second identical same-pass row now fails as a UNIQUE violation, which generation 1 counts as a dropped append"]
-fn a_live_generation_1_connection_keeps_working_exactly_as_before_the_migration() {
+fn a_live_generation_1_connection_is_not_stopped_by_the_stamp_and_its_duplicate_reflog_insert_hits_the_unique_index(
+) {
     let (_dir, repo) = repo_dir();
     let db = old_ledger(&repo);
     let live_old = Connection::open(&db).unwrap();
@@ -563,7 +569,11 @@ fn a_live_generation_1_connection_keeps_working_exactly_as_before_the_migration(
                  'reflog.c', 'o', 'ok', ?1)",
         params![at],
     );
-    assert!(second.is_ok(), "generation 1 recorded both: {second:?}");
+    let refused = second.expect_err("the unique index refuses the identical second insert");
+    assert!(
+        refused.to_string().contains(REFLOG_IDENTITY_INDEX),
+        "refused by the identity index: {refused}"
+    );
     let untyped: i64 = live_old
         .query_row(
             "SELECT COUNT(*) FROM events WHERE ulid = 'A1' AND occurred_at IS NULL",
@@ -572,7 +582,7 @@ fn a_live_generation_1_connection_keeps_working_exactly_as_before_the_migration(
         )
         .unwrap();
     assert_eq!(
-        untyped, 0,
+        untyped, 1,
         "the live old writer's row has no typed event time"
     );
 }
@@ -636,14 +646,22 @@ fn a_child_killed_mid_migration_leaves_a_ledger_the_next_open_finishes() {
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
     assert_eq!(version, WRITER_VERSION);
-    let missing: i64 = conn
+    // Only duplicates are numbered, so a NULL ordinal is normal; what must
+    // hold is that no two reflog rows share an identity once the ordinal (NULL
+    // read as 0) is part of it.
+    let key = IdentityParts::COLUMNS.key();
+    let (rows, distinct): (i64, i64) = conn
         .query_row(
-            &format!("SELECT COUNT(*) FROM events WHERE {REFLOG_ROWS} AND reflog_ordinal IS NULL"),
+            &format!(
+                "SELECT (SELECT COUNT(*) FROM events WHERE {REFLOG_ROWS}),
+                        (SELECT COUNT(*) FROM (SELECT DISTINCT {key}, COALESCE(reflog_ordinal, 0)
+                                               FROM events WHERE {REFLOG_ROWS}))"
+            ),
             [],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert_eq!(missing, 0);
+    assert_eq!(rows, distinct);
 }
 
 // ---------------------------------------------------------------------------
@@ -667,32 +685,43 @@ fn reflog_draft(repo: &str, at: &str) -> Draft {
     }
 }
 
+/// Renamed from `a_second_identical_entry_in_the_same_second_is_still_recorded`:
+/// the replay numbers identical entries of a pass 0, 1, 2, so the second is
+/// recorded under the next ordinal; the same ordinal twice is the duplicate.
 #[test]
-#[ignore = "adv: two genuinely identical reflog entries in one second (a script's `git reset` twice) were both recorded by generation 1; the ordinal-0 unique index now drops the second"]
-fn a_second_identical_entry_in_the_same_second_is_still_recorded() {
+fn a_second_identical_entry_in_the_same_second_is_recorded_under_the_next_ordinal() {
     let (_dir, repo) = repo_dir();
     let at = "2026-03-04T05:06:07.000Z";
     append(reflog_draft(&repo, at)).expect("first");
-    append(reflog_draft(&repo, at)).expect("generation 1 recorded the second too");
-}
-
-#[test]
-#[ignore = "adv: a refused duplicate is not counted anywhere: no dropped_appends, no CatchUp counter, only a log::warn through ledger::record"]
-fn a_refused_duplicate_reflog_row_is_counted_somewhere_a_reader_can_see() {
-    let (_dir, repo) = repo_dir();
-    let at = "2026-03-04T05:06:07.000Z";
-    append(reflog_draft(&repo, at)).expect("first");
-    let _ = append(reflog_draft(&repo, at));
-    let status = status(&repo);
-    let json = serde_json::to_string(&status).unwrap();
-    assert!(
-        json.contains("duplicate"),
-        "nothing in the ledger status says an entry was refused as a duplicate: {json}"
+    append_numbered(reflog_draft(&repo, at), 1).expect("the second identical entry has ordinal 1");
+    assert_eq!(
+        append(reflog_draft(&repo, at))
+            .expect_err("ordinal 0 again is the same entry")
+            .code,
+        "duplicate_reflog"
     );
 }
 
+/// Renamed from `a_refused_duplicate_reflog_row_is_counted_somewhere_a_reader_can_see`:
+/// the ledger reports the refusal as `Recorded::Duplicate` (the replay counts it
+/// in `CatchUp::duplicates_refused`, see `ingest::od1_adv_tests`) and never as a
+/// dropped append.
 #[test]
-#[ignore = "adv: import_legacy_page now uses ON CONFLICT DO NOTHING with ordinal 0 for every reflog row, so two identical rows of a generation-1 sibling ledger collapse to one on import; main imported both, and the migration of the same rows keeps both (0 and 1)"]
+fn a_refused_duplicate_reflog_row_is_reported_as_a_duplicate_and_never_as_dropped() {
+    let (_dir, repo) = repo_dir();
+    let at = "2026-03-04T05:06:07.000Z";
+    assert!(matches!(
+        record_outcome(reflog_draft(&repo, at), 0),
+        Recorded::Appended(_)
+    ));
+    assert_eq!(
+        record_outcome(reflog_draft(&repo, at), 0),
+        Recorded::Duplicate
+    );
+    assert_eq!(status(&repo).dropped, 0, "a duplicate is not a drop");
+}
+
+#[test]
 fn legacy_import_keeps_two_identical_reflog_rows_like_the_migration_does() {
     let (_dir, anchor) = repo_dir();
     let event = |id: i64, ulid: &str| LedgerEvent {
@@ -726,6 +755,29 @@ fn legacy_import_keeps_two_identical_reflog_rows_like_the_migration_does() {
         imported, 2,
         "one of two distinct-ULID rows was silently skipped"
     );
+    let numbered = |anchor: &str| -> Vec<(String, Option<i64>)> {
+        with_conn(anchor, |conn| {
+            Ok(conn
+                .prepare("SELECT ulid, reflog_ordinal FROM events ORDER BY id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap())
+        })
+        .unwrap()
+    };
+    let rows = numbered(&anchor);
+    assert_eq!(
+        rows.iter().map(|(_, n)| n.unwrap_or(0)).collect::<Vec<_>>(),
+        [0, 1],
+        "two identical source rows import as ordinals 0 and 1, as the migration numbers them"
+    );
+    // A re-import is stopped by the ULID: nothing new, nothing renumbered.
+    let (again, _) =
+        import_legacy_page(&anchor, &"a".repeat(40), "sibling", &page, 2).expect("re-import");
+    assert_eq!(again, 0, "a re-import must be idempotent");
+    assert_eq!(numbered(&anchor), rows);
 }
 
 // ---------------------------------------------------------------------------
@@ -758,7 +810,6 @@ fn a_stamp_3_ledger_is_refused_for_writes_clearly_and_not_modified() {
 }
 
 #[test]
-#[ignore = "adv: a stamp-3 ledger left in rollback-journal mode is converted to WAL (header bytes rewritten) BEFORE the version refusal; pre-existing on main, not introduced here"]
 fn a_refused_stamp_3_ledger_in_delete_mode_is_byte_identical() {
     let (_dir, repo) = repo_dir();
     let db = ledger_path(&repo);

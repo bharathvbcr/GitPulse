@@ -255,18 +255,20 @@ fn an_old_ledger_is_migrated_with_every_row_kept_and_identical_reflog_rows_numbe
     assert_eq!(
         numbered,
         [
-            // A group of three identical rows is numbered 0, 1, 2 by id.
-            ("A1", Some(0)),
+            // A group of three identical rows reads as 0, 1, 2 by id: the first
+            // keeps a NULL ordinal, which the index coalesces to 0, so only
+            // the duplicates are written.
+            ("A1", None),
             ("A2", Some(1)),
             ("A3", Some(2)),
-            ("B1", Some(0)),
+            ("B1", None),
             ("B2", Some(1)),
-            ("B3", Some(0)),
-            ("C1", Some(0)),
+            ("B3", None),
+            ("C1", None),
             ("C2", Some(1)),
-            ("D1", Some(0)),
-            ("D2", Some(0)),
-            ("E1", Some(0)),
+            ("D1", None),
+            ("D2", None),
+            ("E1", None),
             // An `object`-less reflog row is outside the index and unnumbered.
             ("G1", None),
             ("G2", None),
@@ -345,7 +347,7 @@ fn the_migration_is_idempotent_across_two_opens() {
     assert_eq!(ulids(&conn), ["A1", "A2"]);
     assert_eq!(
         ordinals(&conn),
-        [("A1".to_string(), Some(0)), ("A2".to_string(), Some(1))],
+        [("A1".to_string(), None), ("A2".to_string(), Some(1))],
         "a re-run renumbers to the same ordinals"
     );
     assert_new_shape(&conn);
@@ -393,7 +395,7 @@ fn a_migration_interrupted_midway_leaves_the_old_ledger_and_the_next_open_finish
     assert_eq!(ulids(&conn), ["A1", "A2"]);
     assert_eq!(
         ordinals(&conn),
-        [("A1".to_string(), Some(0)), ("A2".to_string(), Some(1))]
+        [("A1".to_string(), None), ("A2".to_string(), Some(1))]
     );
     assert_eq!(version(&db), WRITER_VERSION);
 }
@@ -530,7 +532,7 @@ fn bench_append_cost_of_the_reflog_identity_index() {
                     }
                     match arm {
                         1 => conn.execute_batch(&format!(
-                            "CREATE UNIQUE INDEX {DEDUPED_INDEX} ON events({REFLOG_GROUP_KEY}) WHERE {REFLOG_ROWS}"
+                            "CREATE UNIQUE INDEX {DEDUPED_INDEX} ON events({}) WHERE {REFLOG_ROWS}", IdentityParts::COLUMNS.key()
                         )),
                         4 => conn.execute_batch(&format!(
                             "CREATE UNIQUE INDEX {DEDUPED_INDEX} ON events(ulid) WHERE {REFLOG_ROWS}"

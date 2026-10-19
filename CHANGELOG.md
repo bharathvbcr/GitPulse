@@ -21,12 +21,19 @@ before that tag is pushed.
   object, event time, cut-object hash, ordinal). Nothing reads the new columns
   or tables yet. The migration runs once, in one transaction, on the first
   writable open. It deletes no row: reflog rows that share an identity are
-  numbered 0, 1, 2 by id (existing duplicates get ordinals), so genuine
-  repeats and old double-writes are both kept for the reflog replay work to
-  reconcile. A generation-1 app, `gitpulsed` or `gitpulse-mcp` refuses to write
-  a migrated ledger (`gitpulse-ptyd` never writes the ledger), so rebuild and
-  reinstall them together. A reflog entry another process already recorded is
-  skipped without counting as a dropped append.
+  numbered 0, 1, 2 by id (existing duplicates get ordinals; the first of a
+  group keeps a NULL ordinal that reads as 0), so genuine repeats and old
+  double-writes are both kept for the reflog replay work to reconcile. A
+  generation-1 app, `gitpulsed` or `gitpulse-mcp` that starts after the
+  migration refuses to write the ledger (`gitpulse-ptyd` never writes it), so
+  rebuild and reinstall them together. The stamp is read when a connection
+  opens, so a generation-1 process that was already running keeps writing
+  after the migration and must be restarted. A second process opening an old
+  ledger waits for the migration (up to two minutes) instead of failing.
+  Identical reflog entries of one replay pass are recorded under ordinals 0, 1,
+  2; an entry another pass or process already recorded is refused without
+  counting as a dropped append, and the catch-up result counts it in
+  `duplicates_refused`.
 
 ### Added
 

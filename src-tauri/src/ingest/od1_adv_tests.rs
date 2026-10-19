@@ -16,7 +16,6 @@ fn entry(index: usize, timestamp: i64) -> ReflogEntry {
 }
 
 #[test]
-#[ignore = "adv: generation 1 recorded both identical same-second entries of one pass (the seen-set is built once); the unique index now drops the second and `recorded` silently falls short of `reflog_entries`"]
 fn two_identical_entries_in_one_pass_are_both_recorded_and_the_shortfall_is_not_silent() {
     let dir = tempfile::tempdir().expect("repo");
     let repo = dir.path().canonicalize().expect("canonical");
@@ -33,4 +32,49 @@ fn two_identical_entries_in_one_pass_are_both_recorded_and_the_shortfall_is_not_
         out.recorded, 2,
         "one entry vanished with no error, no counter and no truncated flag: {out:?}"
     );
+    assert_eq!(out.duplicates_refused, 0, "{out:?}");
+}
+
+/// Two processes replaying the same pass number its entries the same way, so
+/// the second records nothing and says how many it refused: every replayed
+/// entry is accounted for as recorded, refused as a duplicate, or failed.
+#[test]
+fn a_second_process_replaying_the_same_pass_refuses_every_entry_and_counts_them() {
+    let dir = tempfile::tempdir().expect("repo");
+    let repo = dir.path().canonicalize().expect("canonical");
+    let repo = repo.to_string_lossy();
+    let pass = || {
+        vec![
+            entry(2, 1_790_000_000),
+            entry(1, 1_790_000_000),
+            entry(0, 1_790_000_005),
+        ]
+    };
+    let first = replay_reflog(
+        &repo,
+        &repo,
+        pass(),
+        Ok(std::collections::HashSet::new()),
+        CatchUp::default(),
+    );
+    assert_eq!(
+        (first.recorded, first.duplicates_refused),
+        (3, 0),
+        "{first:?}"
+    );
+    // The other process built its seen-set before the first one wrote.
+    let second = replay_reflog(
+        &repo,
+        &repo,
+        pass(),
+        Ok(std::collections::HashSet::new()),
+        CatchUp::default(),
+    );
+    assert_eq!(second.reflog_entries, 3, "{second:?}");
+    assert_eq!(
+        (second.recorded, second.duplicates_refused),
+        (0, 3),
+        "{second:?}"
+    );
+    assert_eq!(ledger::status(&repo).dropped, 0);
 }
