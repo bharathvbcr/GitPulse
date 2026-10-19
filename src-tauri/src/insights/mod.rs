@@ -8,6 +8,7 @@
 mod collision_memo;
 mod entity_collision;
 pub(crate) mod live_sessions;
+pub mod merge_conflicts;
 
 pub use collision_memo::{
     collision_risk_for_path_memoized, MemoizedCollision, TTL as COLLISION_MEMO_TTL,
@@ -45,7 +46,7 @@ const MAX_ACTIVE_FILES: usize = 200;
 /// How many worktree summaries the snapshot lists.
 const MAX_SNAPSHOT_WORKTREES: usize = 64;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorktreeSummary {
     pub path: String,
     pub name: String,
@@ -64,6 +65,28 @@ pub struct WorktreeSummary {
     /// `operation_kind` with `operation_ok: false` means "not looked at",
     /// which is not the same fact as "nothing parked here".
     pub operation_ok: bool,
+    /// The commit this checkout is on (a full object name), detached or not.
+    /// `None` when git named none (a bare entry, a checkout the listing did
+    /// not describe).
+    #[serde(default)]
+    pub head: Option<String>,
+    /// Commits on `head` that the repository's default base lacks: the lane's
+    /// committed-but-unmerged work, which `dirty_files` stops showing the
+    /// moment a lane commits. `None` is "not measured" (see
+    /// `divergence_note`), never zero.
+    #[serde(default)]
+    pub ahead: Option<u32>,
+    /// Commits on the default base that `head` lacks.
+    #[serde(default)]
+    pub behind: Option<u32>,
+    /// Commits since `head` left the default base: the same count as `ahead`,
+    /// under the name a reader asking "how much has this lane done" looks for.
+    #[serde(default)]
+    pub commits_since_base: Option<u32>,
+    /// Why `ahead`, `behind` and `commits_since_base` are absent for a
+    /// checkout that has a `head`; `None` when they were measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub divergence_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -645,6 +668,58 @@ fn summarise_worktree(
         session_slug,
         operation_kind,
         operation_ok,
+        head: Some(info.head.clone()).filter(|head| !head.is_empty()),
+        ahead: None,
+        behind: None,
+        commits_since_base: None,
+        divergence_note: None,
+    }
+}
+
+/// Fills each row's `ahead`, `behind` and `commits_since_base` from its HEAD
+/// commit, detached or not, against the repository's default base. The one
+/// place those are set: [`summarise_worktree`] leaves them unmeasured so the
+/// fleet and context rows, which never pay for the read, cannot read as zero.
+fn fill_head_divergence(
+    repo_path: &str,
+    items: &mut [WorktreeSummary],
+    clock: &worktree::ScanDeadline,
+) {
+    let heads: Vec<String> = items
+        .iter()
+        .filter(|item| !item.is_bare)
+        .filter_map(|item| item.head.clone())
+        .collect();
+    if heads.is_empty() {
+        return;
+    }
+    let asked: Vec<&str> = heads.iter().map(String::as_str).collect();
+    let measured = match validate_repo(repo_path) {
+        Ok(repo) => worktree::measure_head_divergence(&repo, &asked, clock),
+        Err(error) => worktree::HeadDivergences {
+            unread: Some(error),
+            ..Default::default()
+        },
+    };
+    for item in items.iter_mut().filter(|item| !item.is_bare) {
+        let Some(head) = item.head.as_deref() else {
+            continue;
+        };
+        match measured.by_head.get(head) {
+            Some(found) => {
+                item.ahead = Some(found.ahead);
+                item.behind = Some(found.behind);
+                item.commits_since_base = Some(found.ahead);
+            }
+            None => {
+                item.divergence_note = Some(
+                    measured
+                        .unread
+                        .clone()
+                        .unwrap_or_else(|| "this HEAD was not measured".to_string()),
+                );
+            }
+        }
     }
 }
 
@@ -931,7 +1006,8 @@ fn snapshot_observed(
                     summarise_worktree(info, kind, probed)
                 })
                 .collect();
-            let facet = worktree_facet(list.len() as u32, truncated, items);
+            let mut facet = worktree_facet(list.len() as u32, truncated, items);
+            fill_head_divergence(repo_path, &mut facet.items, &clock);
             // The same `truncated` the facet carries: these counts are rolled
             // from `facet.items`, which is the capped list, so a repository
             // past the cap must not report its floor as an exact count.
@@ -2443,7 +2519,7 @@ mod tests {
     #[test]
     fn listed_and_unlisted_worktree_rows_are_built_identically() {
         let path = "/repo/.gitpulse/worktrees/fix-1a2b3c4d";
-        let pinned = r#"{"path":"/repo/.gitpulse/worktrees/fix-1a2b3c4d","name":"fix-1a2b3c4d","branch":null,"is_detached":false,"is_main":false,"is_bare":false,"dirty_files":null,"agent_kind":"gitpulse","session_slug":"fix-1a2b3c4d","operation_kind":"rebase","operation_ok":true}"#;
+        let pinned = r#"{"path":"/repo/.gitpulse/worktrees/fix-1a2b3c4d","name":"fix-1a2b3c4d","branch":null,"is_detached":false,"is_main":false,"is_bare":false,"dirty_files":null,"agent_kind":"gitpulse","session_slug":"fix-1a2b3c4d","operation_kind":"rebase","operation_ok":true,"head":null,"ahead":null,"behind":null,"commits_since_base":null}"#;
         let unlisted = unlisted_worktree(path, "rebase".into(), true);
         assert_eq!(serde_json::to_string(&unlisted).unwrap(), pinned);
         let listed = summarise_worktree(&bare_listing(path, "fix-1a2b3c4d"), "rebase".into(), true);
@@ -2455,7 +2531,7 @@ mod tests {
         let root = unlisted_worktree("/", String::new(), false);
         assert_eq!(
             serde_json::to_string(&root).unwrap(),
-            r#"{"path":"/","name":"/","branch":null,"is_detached":false,"is_main":false,"is_bare":false,"dirty_files":null,"agent_kind":"","session_slug":"","operation_kind":"","operation_ok":false}"#
+            r#"{"path":"/","name":"/","branch":null,"is_detached":false,"is_main":false,"is_bare":false,"dirty_files":null,"agent_kind":"","session_slug":"","operation_kind":"","operation_ok":false,"head":null,"ahead":null,"behind":null,"commits_since_base":null}"#
         );
     }
 
@@ -4153,12 +4229,34 @@ mod tests {
         }
         fs::write(root.join("shared.txt"), "main-edit").unwrap();
         fs::write(cwds[1].join("shared.txt"), "agent-edit").unwrap();
-        let measured = |cwds: &[std::path::PathBuf]| {
+        // The one per-HEAD read the snapshot does make (`ahead`/`behind` of a
+        // commit against the default base): `rev-list --left-right --count
+        // <oid>...<oid>`, named by commit ids and never by `refs/`. The old
+        // per-branch divergence read names `refs/heads/<branch>`, so it is
+        // still counted below.
+        let head_read = |argv: &Vec<String>| {
+            argv.iter().any(|arg| arg == "rev-list")
+                && argv.iter().any(|arg| arg == "--left-right")
+                && argv.iter().any(|arg| arg == "--count")
+                && argv.last().is_some_and(|range| {
+                    !range.contains("refs/")
+                        && range
+                            .split("...")
+                            .all(crate::engine::git_writer::is_full_oid)
+                })
+        };
+        let all_spawns = |cwds: &[std::path::PathBuf]| -> Vec<Vec<String>> {
             cwds.iter()
                 .flat_map(|cwd| crate::engine::git_cli::spawn_log::spawns_in(cwd))
+                .collect()
+        };
+        let measured = |cwds: &[std::path::PathBuf]| {
+            all_spawns(cwds)
+                .iter()
                 .filter(|argv| {
                     argv.iter()
                         .any(|arg| arg == "--shortstat" || arg == "rev-list" || arg == "--verify")
+                        && !head_read(argv)
                 })
                 .count()
         };
@@ -4180,6 +4278,14 @@ mod tests {
             .iter()
             .all(|w| w.dirty_files.is_some()));
         assert_eq!(measured(&cwds), 0, "snapshot");
+        // Only the snapshot reads head divergence, once per distinct HEAD at
+        // most: the three checkouts here are on one commit, so one read.
+        let head_reads = all_spawns(&cwds).iter().filter(|a| head_read(a)).count();
+        assert!(
+            head_reads <= cwds.len(),
+            "{head_reads} head divergence reads for {} worktrees",
+            cwds.len()
+        );
     }
 
     /// A repository with `linked` extra worktrees, all trusted. Returns the
@@ -4382,6 +4488,75 @@ mod tests {
             .iter()
             .find(|w| same_path(&w.path, dir.to_str().unwrap()))
             .expect("the worktree is listed")
+    }
+
+    /// Committed-but-unmerged work is invisible to a `git status` scan. A
+    /// detached worktree has no branch to name, so its divergence is measured
+    /// from its HEAD commit.
+    #[test]
+    fn a_detached_worktrees_committed_work_is_ahead_and_a_stale_one_behind() {
+        use crate::test_support::{git_in, write};
+        let (main, _parent, linked) = crate::test_support::repo_with_worktrees(2);
+        let root = main.path().canonicalize().unwrap();
+        // Lane 0 detaches and commits twice; lane 1 stays on its branch.
+        git_in(&linked[0], &["switch", "-q", "--detach"]);
+        for n in 0..2 {
+            write(&linked[0], &format!("lane{n}.txt"), "work\n");
+            git_in(&linked[0], &["add", "-A"]);
+            git_in(&linked[0], &["commit", "-q", "-m", &format!("lane {n}")]);
+        }
+        // The base moves on by one commit.
+        write(&root, "base.txt", "base\n");
+        git_in(&root, &["add", "-A"]);
+        git_in(&root, &["commit", "-q", "-m", "base moves"]);
+
+        let snap = snapshot(root.to_str().unwrap());
+
+        let lane = row(&snap, &linked[0]);
+        assert!(lane.is_detached, "{lane:?}");
+        assert!(lane.branch.is_none());
+        assert_eq!(lane.ahead, Some(2), "{lane:?}");
+        assert_eq!(lane.behind, Some(1), "{lane:?}");
+        assert_eq!(lane.commits_since_base, Some(2));
+        assert_eq!(lane.divergence_note, None);
+        let head = git_text(&linked[0], &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(lane.head.as_deref(), Some(head.trim()));
+        // The clean-status lane that never committed is behind, not ahead.
+        let idle = row(&snap, &linked[1]);
+        assert_eq!((idle.ahead, idle.behind), (Some(0), Some(1)), "{idle:?}");
+        let primary = row(&snap, &root);
+        assert_eq!((primary.ahead, primary.behind), (Some(0), Some(0)));
+    }
+
+    /// A row whose divergence was not measured says why; it never reads as 0.
+    #[test]
+    fn unmeasured_divergence_is_absent_with_a_reason_never_zero() {
+        let (main, _parent, linked) = crate::test_support::repo_with_worktrees(1);
+        let root = main.path().canonicalize().unwrap();
+        let mut rows: Vec<WorktreeSummary> = worktree::list_worktrees_lite(root.to_str().unwrap())
+            .unwrap()
+            .iter()
+            .map(|info| summarise_worktree(info, String::new(), false))
+            .collect();
+        assert_eq!(rows.len(), 1 + linked.len());
+        // A deadline that has already passed measures nothing.
+        let passed = worktree::ScanDeadline::after(Instant::now(), Duration::ZERO);
+        fill_head_divergence(root.to_str().unwrap(), &mut rows, &passed);
+        for row in &rows {
+            assert!(row.head.is_some(), "{row:?}");
+            assert_eq!(
+                (row.ahead, row.behind, row.commits_since_base),
+                (None, None, None)
+            );
+            let note = row.divergence_note.as_deref().unwrap_or_default();
+            assert!(note.contains("deadline"), "{row:?}");
+        }
+        // The fleet and context rows never pay for the read: unmeasured too.
+        let unlisted = summarise_worktree(&unlisted_info("/nowhere"), String::new(), false);
+        assert_eq!(
+            (unlisted.ahead, unlisted.behind, unlisted.head),
+            (None, None, None)
+        );
     }
 
     /// An edit made while the snapshot is running is reported when it lands

@@ -1074,6 +1074,21 @@
     ],
     "type": "object"
   },
+  "gitpulse_merge_conflicts": {
+    "additionalProperties": false,
+    "properties": {
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
   "gitpulse_merge_tasks": {
     "additionalProperties": false,
     "properties": {

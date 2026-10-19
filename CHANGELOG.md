@@ -13,6 +13,15 @@ before that tag is pushed.
 
 ### Changed
 
+- `deadbranch::is_branch_merged_by_tree` is tri-state (`TreeMerge::Merged`,
+  `NotMerged`, `Unknown`). A conflicting merge (merge-tree exit 1) is
+  `NotMerged`, where it used to read as an unreadable failure, and the check
+  now writes its trees to the quarantine instead of the repository. A partial
+  clone is refused once per scan.
+- The git floor stays 2.23 (owner decision 13): the clone floor (2.45.1) is a
+  feature floor that gates cloning only, so the app runs on older gits. A git
+  before 2.38 makes the conflict engine answer `unknown` for its
+  `merge-tree --write-tree`, per feature.
 - The ledger moves to writer generation 2 (owner decision 1), one additive
   schema bump: a typed nullable `events.occurred_at` (filled from a
   well-formed event-time stamp), a nullable `events.reflog_ordinal`, a nullable
@@ -36,6 +45,23 @@ before that tag is pushed.
   `duplicates_refused`.
 
 ### Added
+
+- `gitpulse_merge_conflicts` answers whether the checkouts' committed work
+  would merge, which `gitpulse_collision_risk` cannot (it reads uncommitted
+  files, so a lane's files leave it the moment the lane commits). For each pair
+  of worktrees on different commits, detached ones included, it reports
+  `clean`, `conflict` with the paths, or `unknown` with a reason (a git
+  failure, unrelated histories, a deadline, a git before 2.38, a partial clone):
+  an unknown pair is never clean. At most 64 pairs are merged; above that
+  `ok` is false, `truncated` is true and `pairs_total` / `pairs_checked` carry
+  both numbers. The merge runs in the Wave A object quarantine, so the
+  repository's object store is byte for byte the same afterwards and the tool
+  stays read-only. The one primitive is `object_quarantine::merge_tree_candidate`.
+- Insights worktree rows carry `head`, `ahead`, `behind` and
+  `commits_since_base`, measured from the HEAD commit so a detached worktree
+  has them (one `rev-list` per distinct HEAD, not one per worktree). A row that
+  was not measured has null counts and a `divergence_note`, never zero.
+  `commits_since_base` is the same number as `ahead`.
 
 - `gitpulse_landed` answers whether a commit's work reached a base and how:
   `via` is `merge` (decided before `ff`, so a non-tip commit of a `--no-ff`

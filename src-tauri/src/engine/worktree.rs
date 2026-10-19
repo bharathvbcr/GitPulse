@@ -1097,6 +1097,118 @@ fn batch_divergence(
     Some(out)
 }
 
+/// How far one checkout's HEAD commit is from the default base: commits it has
+/// that the base lacks (`ahead`) and commits the base has that it lacks
+/// (`behind`). Counted from the commit, so a detached HEAD has them too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadDivergence {
+    pub ahead: u32,
+    pub behind: u32,
+}
+
+/// Most distinct HEAD commits one [`measure_head_divergence`] reads: the
+/// snapshot lists at most this many worktrees.
+const MAX_HEAD_DIVERGENCE_READS: usize = 64;
+
+/// What [`measure_head_divergence`] established.
+#[derive(Debug, Default)]
+pub struct HeadDivergences {
+    /// Divergence by full HEAD oid, for every oid that was measured.
+    pub by_head: HashMap<String, HeadDivergence>,
+    /// Why anything is missing from `by_head`: no default base resolved, a
+    /// read failed, or the deadline passed. `None` when every asked oid has
+    /// an entry, so an absent count is never mistaken for zero.
+    pub unread: Option<String>,
+}
+
+/// Measures each distinct commit in `heads` against the repository's default
+/// base, keyed by oid: a detached worktree has no branch for
+/// [`measure_main_divergence`] to name, and worktrees on one commit share one
+/// read. The base is the one default-base owner
+/// ([`crate::engine::git_reader::default_base`]), the same answer the branch
+/// list measures against.
+///
+/// One `rev-list --left-right --count` per distinct oid, at most
+/// [`MAX_HEAD_DIVERGENCE_READS`], each given what the deadline has left.
+pub fn measure_head_divergence(
+    repo: &Path,
+    heads: &[&str],
+    deadline: &ScanDeadline,
+) -> HeadDivergences {
+    let mut out = HeadDivergences::default();
+    let mut distinct: Vec<&str> = Vec::new();
+    for head in heads.iter().copied().filter(|h| is_full_oid(h)) {
+        if !distinct.contains(&head) {
+            distinct.push(head);
+        }
+    }
+    if distinct.is_empty() {
+        return out;
+    }
+    let base_oid = match read_base(repo) {
+        Ok(Some((_, oid))) => oid,
+        Ok(None) => {
+            out.unread = Some("the repository has no default base to measure against".into());
+            return out;
+        }
+        Err(reason) => {
+            out.unread = Some(format!("the default base could not be read: {reason}"));
+            return out;
+        }
+    };
+    let mut unread = 0usize;
+    let mut first_reason = None;
+    for (index, head) in distinct.iter().enumerate() {
+        let reason = if index >= MAX_HEAD_DIVERGENCE_READS {
+            "past the per-pass read limit".to_string()
+        } else if deadline.expired() {
+            "the deadline passed".to_string()
+        } else {
+            match left_right_counts(repo, &base_oid, head, deadline.remaining()) {
+                Ok(counts) => {
+                    out.by_head.insert((*head).to_string(), counts);
+                    continue;
+                }
+                Err(reason) => reason,
+            }
+        };
+        unread += 1;
+        first_reason.get_or_insert(reason);
+    }
+    if let Some(reason) = first_reason {
+        out.unread = Some(format!(
+            "{unread} of {} distinct HEAD commits not measured: {reason}",
+            distinct.len()
+        ));
+    }
+    out
+}
+
+fn left_right_counts(
+    repo: &Path,
+    base_oid: &str,
+    head_oid: &str,
+    timeout: Duration,
+) -> Result<HeadDivergence, String> {
+    let stdout = git_text_with_timeout(
+        repo,
+        &[
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{base_oid}...{head_oid}"),
+        ],
+        timeout,
+    )?;
+    let mut parts = stdout.split_whitespace();
+    let behind = parts.next().and_then(|n| n.parse().ok());
+    let ahead = parts.next().and_then(|n| n.parse().ok());
+    match (ahead, behind) {
+        (Some(ahead), Some(behind)) => Ok(HeadDivergence { ahead, behind }),
+        _ => Err(format!("unreadable rev-list counts: {:?}", stdout.trim())),
+    }
+}
+
 /// Lists every worktree of the repository, main entry first, with dirty-file
 /// counts, diff deltas, and detected portless routes for the worktrees closest to the front.
 pub fn list_worktrees(repo_path: &str) -> Result<Vec<WorktreeInfo>, String> {

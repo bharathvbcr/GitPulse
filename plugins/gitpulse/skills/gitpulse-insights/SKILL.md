@@ -29,6 +29,7 @@ It surfaces GitPulse-owned facts and selected **DevCouncil** modules (in-process
 | `gitpulse_change_context` | About to edit one worktree |
 | `gitpulse_collision_risk` | Parallel agents or several worktrees |
 | `gitpulse_active_changes` | Need the file list, not just counts |
+| `gitpulse_merge_conflicts` | Whether the worktrees' committed work would merge, pair by pair (`clean`, `conflict` with paths, `unknown` with a reason; detached worktrees included). Read-only: the merge runs in an object quarantine deleted afterwards. `ok: false` with `truncated` above 64 pairs: the counts are a floor |
 | `gitpulse_status` | Narrower status (ledger + worktrees + codeintel) |
 | `gitpulse_ledger_events` | Policy verdicts and recorded mutations |
 | `gitpulse_task_view` | DevCouncil tasks and leases, when a store exists |

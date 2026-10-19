@@ -251,6 +251,9 @@ fn server_document(name: &str) -> Result<Value, ReadError> {
             // while a tool writes. It said `true` after the task-board tools
             // began writing the GitPulse task profile.
             "readOnly": super::tools().iter().all(|tool| tool["annotations"]["readOnlyHint"] == true),
+            // True of `gitpulse_merge_conflicts` and `gitpulse_landed` too: a
+            // merge-tree writes its objects to a quarantined directory that is
+            // deleted afterwards, and the object-store tests hold that.
             "gitWrites": false,
             "writes": super::tools().iter()
                 .filter(|tool| tool["annotations"]["readOnlyHint"] != true)

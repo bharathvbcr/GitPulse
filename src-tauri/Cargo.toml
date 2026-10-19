@@ -342,6 +342,11 @@ harness = false
 test = false
 
 [[bench]]
+name = "merge_conflicts"
+harness = false
+test = false
+
+[[bench]]
 name = "worktree_teardown"
 harness = false
 test = false

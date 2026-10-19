@@ -141,7 +141,7 @@ fn a_conflicted_merge_is_reported_and_leaves_the_object_store_byte_identical() {
         .merge_tree(repo.path(), &main, &f, soon())
         .expect("merge-tree");
 
-    let MergeOutcome::Conflicted { tree } = outcome else {
+    let MergeOutcome::Conflicted { tree, .. } = outcome else {
         panic!("expected a conflict, got {outcome:?}");
     };
     assert!(!repo.has_object(&tree));
@@ -386,4 +386,229 @@ fn one_sweep_removes_a_bounded_number_and_the_next_continues() {
 fn a_missing_base_sweeps_nothing() {
     let base = tempfile::tempdir().expect("tempdir");
     assert_eq!(sweep_stale(&base.path().join("absent"), STALE_AFTER), 0);
+}
+
+// ---- the conflict engine: `merge_tree_candidate` -------------------------
+
+/// A linked worktree of `repo` on a detached HEAD, with `file` committed in it.
+/// Returns the worktree's directory (kept alive by the caller) and its HEAD.
+fn detached_lane(repo: &Repo, parent: &Path, file: &str, content: &str) -> (PathBuf, String) {
+    let dir = parent.join(format!(
+        "lane-{}-{file}",
+        std::fs::read_dir(parent).unwrap().count()
+    ));
+    repo.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "--detach",
+        dir.to_str().unwrap(),
+        "HEAD",
+    ]);
+    crate::test_support::trust_repo(&dir);
+    let run = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&dir)
+            .output_locked()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    std::fs::write(dir.join(file), content).unwrap();
+    run(&["add", "-A"]);
+    run(&["commit", "-q", "-m", file]);
+    let head = run(&["rev-parse", "HEAD"]);
+    assert_eq!(
+        run(&["rev-parse", "--abbrev-ref", "HEAD"]),
+        "HEAD",
+        "the lane is not detached"
+    );
+    (dir, head)
+}
+
+#[test]
+fn a_merge_that_conflicts_names_its_paths_once_each() {
+    let repo = Repo::new();
+    std::fs::create_dir(repo.path().join("b dir")).unwrap();
+    repo.put("a.txt", "root\n");
+    repo.put("b dir/it's \"b\".txt", "root\n");
+    repo.git(&["checkout", "-q", "-b", "f"]);
+    std::fs::write(repo.path().join("a.txt"), "f\n").unwrap();
+    std::fs::write(repo.path().join("b dir/it's \"b\".txt"), "f\n").unwrap();
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "f"]);
+    let f = repo.git(&["rev-parse", "HEAD"]);
+    repo.git(&["checkout", "-q", "main"]);
+    std::fs::write(repo.path().join("a.txt"), "m\n").unwrap();
+    std::fs::write(repo.path().join("b dir/it's \"b\".txt"), "m\n").unwrap();
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-q", "-m", "m"]);
+    let main = repo.git(&["rev-parse", "HEAD"]);
+
+    let quarantine = ObjectQuarantine::new(repo.path()).expect("quarantine");
+    let outcome = quarantine
+        .merge_tree(repo.path(), &main, &f, soon())
+        .expect("merge-tree");
+    let MergeOutcome::Conflicted {
+        mut paths,
+        paths_total,
+        ..
+    } = outcome
+    else {
+        panic!("expected a conflict, got {outcome:?}");
+    };
+    paths.sort();
+    // The quote and the space survive: `-z` output is not escaped.
+    assert_eq!(paths, vec!["a.txt", "b dir/it's \"b\".txt"]);
+    assert_eq!(paths_total, 2);
+}
+
+#[test]
+fn two_lanes_one_detached_editing_the_same_lines_conflict_and_the_store_is_untouched() {
+    let repo = Repo::new();
+    repo.put("shared.txt", "root\n");
+    repo.put("other.txt", "other\n");
+    let lanes = tempfile::tempdir().expect("tempdir");
+    let (_a, a_head) = detached_lane(&repo, lanes.path(), "shared.txt", "from lane a\n");
+    let (_b, b_head) = detached_lane(&repo, lanes.path(), "shared.txt", "from lane b\n");
+    // The lanes' commits are loose objects, so the listing is a real one.
+    let before = object_store(&repo);
+    assert!(!before.is_empty());
+
+    let answer = merge_tree_candidate(repo.path(), &a_head, &b_head, soon());
+
+    assert_eq!(
+        answer,
+        MergeCandidate::Conflict {
+            paths: vec!["shared.txt".to_string()],
+            paths_total: 1
+        }
+    );
+    assert!(object_store(&repo) == before, "the object store changed");
+}
+
+#[test]
+fn disjoint_edits_are_clean_and_the_store_is_untouched() {
+    let repo = Repo::new();
+    repo.put("one.txt", "1\n");
+    repo.put("two.txt", "2\n");
+    let lanes = tempfile::tempdir().expect("tempdir");
+    let (_a, a_head) = detached_lane(&repo, lanes.path(), "one.txt", "lane a\n");
+    let (_b, b_head) = detached_lane(&repo, lanes.path(), "two.txt", "lane b\n");
+    repo.git(&["gc", "-q", "--prune=now"]);
+    let before = object_store(&repo);
+
+    let answer = merge_tree_candidate(repo.path(), &a_head, &b_head, soon());
+
+    let MergeCandidate::Clean { tree } = answer else {
+        panic!("expected a clean merge, got {answer:?}");
+    };
+    assert!(!repo.has_object(&tree), "the merged tree reached the repo");
+    assert!(object_store(&repo) == before, "the object store changed");
+}
+
+#[test]
+fn operands_may_be_names_and_are_resolved_to_full_commits_first() {
+    let repo = Repo::new();
+    let (_main, _f) = conflicting(&repo);
+    let answer = merge_tree_candidate(repo.path(), "main", "f", soon());
+    assert!(
+        matches!(&answer, MergeCandidate::Conflict { paths, .. } if paths == &["shared.txt"]),
+        "{answer:?}"
+    );
+}
+
+#[test]
+fn unrelated_histories_are_unknown_never_clean() {
+    let repo = Repo::new();
+    let (main, _f) = diverged(&repo);
+    repo.git(&["checkout", "-q", "--orphan", "island"]);
+    repo.git(&["rm", "-rf", "-q", "."]);
+    let island = repo.put("island.txt", "alone\n");
+
+    let answer = merge_tree_candidate(repo.path(), &main, &island, soon());
+
+    assert!(
+        matches!(&answer, MergeCandidate::Unknown { reason } if !reason.is_empty()),
+        "{answer:?}"
+    );
+}
+
+#[test]
+fn a_git_failure_a_deadline_and_a_bad_operand_are_unknown() {
+    let repo = Repo::new();
+    let (main, f) = diverged(&repo);
+    let unknown = |answer: MergeCandidate| match answer {
+        MergeCandidate::Unknown { reason } => reason,
+        other => panic!("expected unknown, got {other:?}"),
+    };
+
+    let refused = unknown(crate::engine::git_cli::with_forced_spawn_failure(|| {
+        merge_tree_candidate(repo.path(), &main, &f, soon())
+    }));
+    assert!(!refused.is_empty());
+    let deferred = unknown(crate::engine::git_cli::with_forced_deferral(|| {
+        merge_tree_candidate(repo.path(), &main, &f, soon())
+    }));
+    assert!(!deferred.is_empty());
+    // A deadline that has passed is a timeout: nothing ran, nothing is clean.
+    let late = unknown(merge_tree_candidate(repo.path(), &main, &f, Instant::now()));
+    assert!(late.contains("deadline"), "{late}");
+    for bad in ["", "--output=/tmp/x", "no-such-ref", "HEAD:diverged"] {
+        let reason = unknown(merge_tree_candidate(repo.path(), &main, bad, soon()));
+        assert!(!reason.is_empty(), "{bad:?}");
+    }
+}
+
+#[test]
+fn a_partial_clone_is_unknown_before_anything_runs() {
+    let repo = Repo::new();
+    let (main, f) = diverged(&repo);
+    repo.git(&["config", "remote.origin.url", "file:///nowhere"]);
+    repo.git(&["config", "remote.origin.promisor", "true"]);
+    let before = object_store(&repo);
+
+    let answer = merge_tree_candidate(repo.path(), &main, &f, soon());
+
+    assert!(
+        matches!(&answer, MergeCandidate::Unknown { reason } if reason.contains("partial clone")),
+        "{answer:?}"
+    );
+    assert!(object_store(&repo) == before);
+}
+
+#[test]
+fn a_git_without_write_tree_is_unsupported_not_a_failed_run() {
+    let old =
+        "error: unknown option `write-tree'\nusage: git merge-tree [<options>] <branch1> <branch2>";
+    assert!(matches!(
+        classify_failure(129, old),
+        QuarantineError::Unsupported(_)
+    ));
+    assert!(matches!(
+        classify_failure(128, "fatal: refusing to merge unrelated histories"),
+        QuarantineError::Git(_)
+    ));
+}
+
+#[test]
+fn alternates_are_joined_with_the_platforms_own_separator() {
+    let repo = Repo::new();
+    diverged(&repo);
+    let quarantine = ObjectQuarantine::new(repo.path()).expect("quarantine");
+    let objects = resolve_git_common_dir(repo.path()).unwrap().join("objects");
+    assert_eq!(quarantine.alternates, objects.as_os_str());
+    // Two directories are told apart by `;` on Windows and `:` elsewhere,
+    // which is `join_paths`' contract; a path holding the separator is refused
+    // rather than split into two directories.
+    let two = std::env::join_paths([&objects, &objects]).unwrap();
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    assert_eq!(
+        two.to_string_lossy().matches(separator).count(),
+        1,
+        "{two:?}"
+    );
+    let holding = PathBuf::from(format!("/a{separator}b"));
+    assert!(std::env::join_paths([holding]).is_err());
 }

@@ -37,6 +37,8 @@ mod adversarial_tests;
 mod budget;
 pub mod complete;
 pub mod devmap_parity;
+#[cfg(test)]
+mod merge_conflicts_tool_tests;
 pub mod page;
 pub mod prompts;
 pub mod resources;
@@ -885,6 +887,52 @@ fn build_tools() -> Vec<Value> {
             collision_risk_output(),
         ),
         tool(
+            "gitpulse_merge_conflicts",
+            "Merge conflicts between worktrees",
+            "Would the checkouts' committed work merge? For each pair of worktrees whose HEAD commits differ (detached ones included), `git merge-tree --write-tree` computes the merge, which survives a commit where `gitpulse_collision_risk` (uncommitted files only) does not. Each pair is `clean`, `conflict` with `paths` (the first 200 of `paths_total`), or `unknown` with a `reason` (a git failure, unrelated histories, a deadline, a git older than 2.38, a partial clone): an unknown pair is never clean. At most 64 pairs are merged: above that `ok` is false, `truncated` is true, `pairs_total` is how many there were and `pairs_checked` how many were merged, so the counts are a floor. Worktrees on the very same commit need no merge and are counted in `same_head_pairs`. Read-only: the merge writes its trees and blobs to a scratch object directory that is deleted afterwards (the repository reads through it as an alternate), so no ref, index, working-tree file or repository object is written.",
+            RepoArgs::properties(),
+            &RepoArgs::required(),
+            ok_error_output(
+                json!({
+                    "worktrees": { "type": "integer" },
+                    "pairs_total": { "type": "integer" },
+                    "pairs_checked": { "type": "integer" },
+                    "same_head_pairs": { "type": "integer" },
+                    "clean": { "type": "integer" },
+                    "conflict": { "type": "integer" },
+                    "unknown": { "type": "integer" },
+                    "truncated": { "type": "boolean" },
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "a_path": { "type": "string" },
+                                "b_path": { "type": "string" },
+                                "a_head": { "type": "string" },
+                                "b_head": { "type": "string" },
+                                "state": {
+                                    "type": "string",
+                                    "enum": ["clean", "conflict", "unknown"]
+                                },
+                                "tree": { "type": "string" },
+                                "paths": { "type": "array", "items": { "type": "string" } },
+                                "paths_total": { "type": "integer" },
+                                "reason": { "type": "string" }
+                            },
+                            "required": ["a_path", "b_path", "a_head", "b_head", "state"]
+                        }
+                    },
+                    "deferred": deferred_property(),
+                    "retry_after_ms": retry_after_property()
+                }),
+                &[
+                    "worktrees", "pairs_total", "pairs_checked", "same_head_pairs", "clean",
+                    "conflict", "unknown", "truncated", "items",
+                ],
+            ),
+        ),
+        tool(
             "gitpulse_change_context",
             "Change context",
             "In-flight context for one worktree: branch, dirty files, parked merge/rebase, bound task, and collisions that involve it.",
@@ -1601,6 +1649,15 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             let a: RepoArgs = parse(name, arguments)?;
             Ok(with_production_retry(|retry| {
                 read_insights(|| json!(insights::collision_risk(&a.repo_path)), retry)
+            }))
+        }
+        "gitpulse_merge_conflicts" => {
+            let a: RepoArgs = parse(name, arguments)?;
+            Ok(with_production_retry(|retry| {
+                read_insights(
+                    || json!(insights::merge_conflicts::merge_conflicts(&a.repo_path)),
+                    retry,
+                )
             }))
         }
         "gitpulse_change_context" => {
@@ -3640,6 +3697,10 @@ mod tests {
         (
             "gitpulse_collision_risk",
             "no overlapping dirty files on the fixture repositories",
+        ),
+        (
+            "gitpulse_merge_conflicts",
+            "no two fixture worktrees sit on different commits, so there are no pairs",
         ),
         (
             "gitpulse_ledger_events",
@@ -6355,6 +6416,7 @@ mod tests {
             ("gitpulse_status", RepoArgs),
             ("gitpulse_active_changes", ActiveChangesArgs),
             ("gitpulse_collision_risk", RepoArgs),
+            ("gitpulse_merge_conflicts", RepoArgs),
             ("gitpulse_change_context", ChangeContextArgs),
             ("gitpulse_ledger_events", LedgerEventsArgs),
             ("gitpulse_task_view", TaskViewArgs),
@@ -6456,6 +6518,7 @@ mod tests {
                 ("gitpulse_status", RepoArgs),
                 ("gitpulse_active_changes", ActiveChangesArgs),
                 ("gitpulse_collision_risk", RepoArgs),
+                ("gitpulse_merge_conflicts", RepoArgs),
                 ("gitpulse_change_context", ChangeContextArgs),
                 ("gitpulse_ledger_events", LedgerEventsArgs),
                 ("gitpulse_task_view", TaskViewArgs),

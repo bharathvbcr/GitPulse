@@ -22,7 +22,7 @@ use crate::engine::git_cli::{
     git, git_captured, git_captured_with_stdin, read_objects_batch, validate_repo, BatchObject,
     BoundedRun, MAX_OUTPUT_BYTES,
 };
-use crate::engine::object_quarantine::{MergeOutcome, ObjectQuarantine};
+use crate::engine::object_quarantine::{is_partial_clone, MergeOutcome, ObjectQuarantine};
 use crate::engine::{git_reader, ref_cache};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -1116,54 +1116,6 @@ const REVERT_CHAIN_LIMIT: usize = 4;
 /// Commits of one landing searched for a revert (a long rebase carries one
 /// per commit).
 const REVERT_TARGET_LIMIT: usize = 64;
-
-/// Whether the repository is a partial clone (`extensions.partialclone` or a
-/// promisor remote). Read from configuration only, so it fetches nothing.
-fn is_partial_clone(repo: &Path) -> Result<bool, String> {
-    // Git decides what a boolean is (`true`, `yes`, `on`, `1`, any case, and a
-    // bare key), so it is asked with `--type=bool` rather than parsed here.
-    // A value it cannot read as a boolean is a failed read, which refuses: a
-    // config that could not be read is never "not partial".
-    let promisors = git_captured(
-        repo,
-        &[
-            "config",
-            "--type=bool",
-            "--get-regexp",
-            r"^remote\..*\.promisor$",
-        ],
-    )?
-    .require_complete("git config")?;
-    match (promisors.success, promisors.status_code) {
-        (true, _) => {
-            if String::from_utf8_lossy(&promisors.stdout)
-                .lines()
-                .any(|line| line.rsplit(' ').next() == Some("true"))
-            {
-                return Ok(true);
-            }
-        }
-        // Exit 1 with nothing on stderr is "no such key".
-        (false, 1) if promisors.stderr.is_empty() && !promisors.cancelled => {}
-        _ => {
-            return Err(format!(
-                "git config failed: {}",
-                String::from_utf8_lossy(&promisors.stderr).trim()
-            ))
-        }
-    }
-    // `extensions.partialclone` names the promisor remote: set means partial.
-    let extension = git_captured(repo, &["config", "--get", "extensions.partialclone"])?
-        .require_complete("git config")?;
-    match (extension.success, extension.status_code) {
-        (true, _) => Ok(!String::from_utf8_lossy(&extension.stdout).trim().is_empty()),
-        (false, 1) if extension.stderr.is_empty() && !extension.cancelled => Ok(false),
-        _ => Err(format!(
-            "git config failed: {}",
-            String::from_utf8_lossy(&extension.stderr).trim()
-        )),
-    }
-}
 
 /// How a reachable `sha` is on the base, and the base commit to place in time.
 struct Reachable {

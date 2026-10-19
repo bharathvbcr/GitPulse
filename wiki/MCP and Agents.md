@@ -96,6 +96,7 @@ Pass an **absolute** `repo_path` on every call.
 | `gitpulse_change_context` | About to edit one worktree |
 | `gitpulse_collision_risk` | Parallel agents or several worktrees |
 | `gitpulse_active_changes` | File list, not just counts |
+| `gitpulse_merge_conflicts` | Whether the worktrees' committed work would merge, pair by pair (`clean`, `conflict` with paths, `unknown` with a reason; detached worktrees included). Read-only: the merge runs in an object quarantine deleted afterwards. `ok: false` with `truncated` above 64 pairs: the counts are a floor |
 | `gitpulse_ledger_events` | Policy verdicts and recorded mutations |
 | `gitpulse_task_view` | DevCouncil tasks/leases, when a store exists |
 | `gitpulse_codeintel_search` / `_impact` / `_dependencies` / `_trace` / `_dead_symbols` | In-process DevMap code graph (schema 20). The GUI also exposes neighbors, explore, affected tests, clones, and layered impact — those are Tauri commands today, not MCP tools. |
