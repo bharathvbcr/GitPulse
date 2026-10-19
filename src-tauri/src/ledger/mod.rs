@@ -77,7 +77,8 @@ CREATE TABLE IF NOT EXISTS events (
   after_ref      TEXT,
   duration_ms    INTEGER,
   detail_json    TEXT,
-  occurred_at    TEXT
+  occurred_at    TEXT,
+  reflog_ordinal INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_events_repo_ts ON events(repo_path, ts_utc);
 CREATE INDEX IF NOT EXISTS idx_events_reflog   ON events(worktree_path, object)
@@ -117,19 +118,37 @@ CREATE TABLE IF NOT EXISTS transcript_cursors (
   fingerprint    TEXT,
   PRIMARY KEY (worktree_key, file_key)
 );
+-- CARD 27 (ft-9d043f74...4671), S6-08/S6-09: where reflog replay stopped, per
+-- worktree and ref (Wave B walks every family worktree's HEAD and
+-- refs/heads/<default>), as the last recorded entry's identity: selector time,
+-- oid, message hash and ordinal among identical entries. Written by Wave B.
 CREATE TABLE IF NOT EXISTS reflog_watermarks (
-  worktree_key        TEXT PRIMARY KEY,
-  newest_entry_unix   INTEGER,
-  newest_entry_commit TEXT,
-  entries_at_newest   INTEGER,
-  updated_at          TEXT
+  worktree_key        TEXT NOT NULL,
+  ref_name            TEXT NOT NULL,
+  last_entry_unix     INTEGER,
+  last_entry_oid      TEXT,
+  last_entry_msg_hash TEXT,
+  last_entry_ordinal  INTEGER,
+  updated_at          TEXT,
+  PRIMARY KEY (worktree_key, ref_name)
 );
+-- CARD 29 (ft-9d044974...3c3f), S6-13 and S6-11: the last CatchUp per worktree,
+-- so a read-only reader can say when it last ran (as_of / last_catch_up /
+-- stale), whether it was cut short with the counts (transcripts read, listed
+-- and unlisted, so a partial pass never reads as complete), lines skipped, and
+-- records that failed to write (S6-08's "a failed record surfaces").
 CREATE TABLE IF NOT EXISTS catch_up_state (
-  worktree_key   TEXT PRIMARY KEY,
-  completed_at   TEXT,
-  truncated      INTEGER,
-  error          TEXT,
-  catch_up_json  TEXT
+  worktree_key        TEXT PRIMARY KEY,
+  completed_at        TEXT,
+  truncated           INTEGER,
+  recorded            INTEGER,
+  transcripts         INTEGER,
+  transcripts_listed  INTEGER,
+  transcripts_unlisted INTEGER,
+  skipped_lines       INTEGER,
+  reflog_entries      INTEGER,
+  failed_records      INTEGER,
+  error               TEXT
 );
 CREATE TABLE IF NOT EXISTS transcript_baselines (
   worktree_key   TEXT PRIMARY KEY,
@@ -207,7 +226,7 @@ pub const SCHEMA_VERSION: i64 = 1;
 /// the version check in Health instead.
 ///
 /// Generation 2 (OD 1) is the one additive schema bump: `events.occurred_at`,
-/// `transcript_cursors.fingerprint`, the `reflog_watermarks` and
+/// `events.reflog_ordinal`, `transcript_cursors.fingerprint`, the `reflog_watermarks` and
 /// `catch_up_state` tables, and the unique reflog identity index
 /// ([`migrate_to_writer_2`]). All of it is nullable or new, so no existing
 /// read or insert changes. A generation-1 build's queries and inserts name
@@ -215,16 +234,23 @@ pub const SCHEMA_VERSION: i64 = 1;
 /// open refuses the file by this very stamp, so it never writes one.
 pub const WRITER_VERSION: i64 = 2;
 
-/// The unique index a reflog entry's identity is held to: one row per
-/// worktree, `object` (commit plus message, as stored), event time and, for an
-/// `object` that was cut to the append cap, the hash of its full text. The
-/// worktree and time are coalesced because SQLite treats NULLs as distinct in a
-/// unique index, and the anchor checkout stores a NULL worktree.
+/// The unique index a reflog entry's identity is held to (CARD 27 / S6-08):
+/// the worktree, `object` (the commit id plus the message, as stored), the
+/// event time, for an `object` cut to the append cap the hash of its full text
+/// (the message hash), and the ordinal of the entry among identical ones. The
+/// worktree, time and ordinal are coalesced because SQLite treats NULLs as
+/// distinct in a unique index, and the anchor checkout stores a NULL worktree.
 const REFLOG_IDENTITY_INDEX: &str = "idx_events_reflog_identity";
-const REFLOG_IDENTITY_KEY: &str =
-    "COALESCE(worktree_path, ''), object, COALESCE(occurred_at, ''), \
-     COALESCE(CASE WHEN json_valid(detail_json) \
-                   THEN json_extract(detail_json, '$.object_truncated.hash') END, '')";
+macro_rules! reflog_group_key {
+    () => {
+        "COALESCE(worktree_path, ''), object, COALESCE(occurred_at, ''), \
+         COALESCE(CASE WHEN json_valid(detail_json) \
+                       THEN json_extract(detail_json, '$.object_truncated.hash') END, '')"
+    };
+}
+/// The identity without the ordinal: what the migration numbers within.
+const REFLOG_GROUP_KEY: &str = reflog_group_key!();
+const REFLOG_IDENTITY_KEY: &str = concat!(reflog_group_key!(), ", COALESCE(reflog_ordinal, 0)");
 const REFLOG_ROWS: &str = "action LIKE 'reflog.%' AND object IS NOT NULL";
 
 /// SQL for the event time `detail` carries, or NULL: the interim
@@ -309,23 +335,31 @@ fn add_column_if_missing(
 
 /// Writer generation 1 to 2. Runs inside [`ensure_schema`]'s transaction.
 ///
-/// Dedupe rule: among reflog rows (`action LIKE 'reflog.%'` with an `object`)
-/// that share [`REFLOG_IDENTITY_KEY`], the lowest `id` survives and the rest are
-/// deleted. Rows from before the typed column carry their event time only in
+/// Non-destructive: no row is deleted. An old row cannot tell a double-recorded
+/// reflog entry from a genuine repeat (two identical checkouts), so the
+/// migration keeps both and numbers them: within each group of reflog rows that
+/// share [`REFLOG_GROUP_KEY`], `reflog_ordinal` is 0, 1, 2... by ascending `id`.
+/// The unique index is then built over the group key plus the ordinal, which
+/// cannot fail on existing data. Reconciling old double-writes against the live
+/// reflog is Wave B replay work. Ordinals are recomputed from `id` on every
+/// run, so a re-run (the stamp was reset) is a no-op.
+///
+/// Rows from before the typed column carry their event time only in
 /// `detail_json`, so it is copied into the column first (reflog rows only, and
-/// only in the writer's exact shape): without that, two genuinely different
-/// entries with the same commit and message would look like one. Rows with no
-/// event time at all are the duplicates the old replay wrote; they collapse.
+/// only in the writer's exact shape); otherwise two entries at different times
+/// would be numbered as repeats of one.
 fn migrate_to_writer_2(conn: &Connection) -> rusqlite::Result<()> {
     add_column_if_missing(conn, "events", "occurred_at", "TEXT")?;
+    add_column_if_missing(conn, "events", "reflog_ordinal", "INTEGER")?;
     add_column_if_missing(conn, "transcript_cursors", "fingerprint", "TEXT")?;
     conn.execute_batch(&format!(
         "UPDATE events SET occurred_at = {from_detail}
          WHERE occurred_at IS NULL AND {REFLOG_ROWS};
-         DELETE FROM events
-         WHERE {REFLOG_ROWS}
-           AND id NOT IN (SELECT MIN(id) FROM events WHERE {REFLOG_ROWS}
-                          GROUP BY {REFLOG_IDENTITY_KEY});
+         UPDATE events SET reflog_ordinal = numbered.n
+         FROM (SELECT id,
+                      ROW_NUMBER() OVER (PARTITION BY {REFLOG_GROUP_KEY} ORDER BY id) - 1 AS n
+               FROM events WHERE {REFLOG_ROWS}) AS numbered
+         WHERE events.id = numbered.id AND events.reflog_ordinal IS NOT numbered.n;
          CREATE UNIQUE INDEX IF NOT EXISTS {REFLOG_IDENTITY_INDEX}
            ON events({REFLOG_IDENTITY_KEY}) WHERE {REFLOG_ROWS};",
         from_detail = occurred_at_from_detail("detail_json"),
@@ -1538,6 +1572,8 @@ struct Prepared {
     /// The typed `occurred_at` column: the draft's event-time stamp, only when
     /// it is well-formed (the same check that lets it skip the redactor).
     occurred_at: Option<String>,
+    /// `Some(0)` on a reflog row, `None` otherwise. See [`insert`].
+    reflog_ordinal: Option<i64>,
 }
 
 /// `contracts/event.schema.json`'s action pattern,
@@ -1621,6 +1657,7 @@ fn prepare(draft: &Draft) -> Result<Prepared, LedgerError> {
             .as_ref()
             .filter(|stamp| stamp.is_well_formed())
             .map(|stamp| stamp.occurred_at.clone()),
+        reflog_ordinal: draft.action.starts_with("reflog.").then_some(0),
     })
 }
 
@@ -1647,14 +1684,23 @@ fn store_object_and_detail(
     (object, redact_detail(detail, stamp, cap.as_ref()))
 }
 
+/// Inserts one prepared row.
+///
+/// Every reflog row is written with `reflog_ordinal` 0, and the unique reflog
+/// identity index refuses a second row with the same identity and ordinal; that
+/// refusal is `INSERT OR IGNORE` in effect (code `duplicate_reflog`, which
+/// [`append`] neither counts as dropped nor announces). This lane does not
+/// compute real ordinals: numbering two genuinely identical entries of one
+/// replay pass 0, 1, 2 and matching them against the live reflog is Wave B's
+/// replay work. Until then identical entries in one second still record once.
 fn insert(conn: &Connection, event: &Prepared) -> Result<i64, LedgerError> {
     conn.execute(
         "INSERT INTO events (
              ulid, ts_utc, schema_version, repo_path, worktree_path,
              actor_kind, actor_id, session_id, task_id, action, object,
              argv_json, outcome, verdict_json, before_ref, after_ref,
-             duration_ms, detail_json, occurred_at
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+             duration_ms, detail_json, occurred_at, reflog_ordinal
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
         params![
             event.ulid,
             event.ts,
@@ -1675,6 +1721,7 @@ fn insert(conn: &Connection, event: &Prepared) -> Result<i64, LedgerError> {
             event.duration_ms,
             event.detail,
             event.occurred_at,
+            event.reflog_ordinal,
         ],
     )
     .map_err(|e| match e {
@@ -2763,9 +2810,10 @@ fn import_legacy_page(
                  ulid, ts_utc, schema_version, repo_path, worktree_path,
                  actor_kind, actor_id, session_id, task_id, action, object,
                  argv_json, outcome, verdict_json, before_ref, after_ref,
-                 duration_ms, detail_json, occurred_at
+                 duration_ms, detail_json, occurred_at, reflog_ordinal
              ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,
-                 CASE WHEN ?10 LIKE 'reflog.%' THEN {} END)
+                 CASE WHEN ?10 LIKE 'reflog.%' THEN {} END,
+                 CASE WHEN ?10 LIKE 'reflog.%' THEN 0 END)
              ON CONFLICT DO NOTHING",
             occurred_at_from_detail("?18")
         );

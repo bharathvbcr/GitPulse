@@ -87,8 +87,19 @@ fn ulids(conn: &Connection) -> Vec<String> {
         .unwrap()
 }
 
+/// `(ulid, reflog_ordinal)` of every reflog row that has an object, by id.
+fn ordinals(conn: &Connection) -> Vec<(String, Option<i64>)> {
+    conn.prepare("SELECT ulid, reflog_ordinal FROM events WHERE action LIKE 'reflog.%' ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
 fn assert_new_shape(conn: &Connection) {
     assert!(columns(conn, "events").contains(&"occurred_at".to_string()));
+    assert!(columns(conn, "events").contains(&"reflog_ordinal".to_string()));
     assert!(columns(conn, "transcript_cursors").contains(&"fingerprint".to_string()));
     for table in NEW_TABLES {
         assert!(has_object(conn, "table", table), "missing table {table}");
@@ -118,7 +129,7 @@ fn a_fresh_ledger_has_every_new_column_table_and_index() {
 }
 
 #[test]
-fn an_old_ledger_is_migrated_with_rows_intact_and_duplicates_removed_by_the_stated_rule() {
+fn an_old_ledger_is_migrated_with_every_row_kept_and_identical_reflog_rows_numbered() {
     let (_dir, repo) = repo_dir();
     let db = old_ledger(&repo);
     let old = Connection::open(&db).unwrap();
@@ -234,9 +245,43 @@ fn an_old_ledger_is_migrated_with_rows_intact_and_duplicates_removed_by_the_stat
     assert_eq!(version(&db), WRITER_VERSION);
     assert_eq!(
         ulids(&conn),
-        ["A1", "B1", "B3", "C1", "D1", "D2", "E1", "F1", "F2", "G1", "G2"],
-        "the lowest id of each identity survives; every other row is untouched"
+        [
+            "A1", "A2", "A3", "B1", "B2", "B3", "C1", "C2", "D1", "D2", "E1", "F1", "F2", "G1",
+            "G2"
+        ],
+        "the migration deletes nothing"
     );
+    let numbered: Vec<(String, Option<i64>)> = ordinals(&conn);
+    assert_eq!(
+        numbered,
+        [
+            // A group of three identical rows is numbered 0, 1, 2 by id.
+            ("A1", Some(0)),
+            ("A2", Some(1)),
+            ("A3", Some(2)),
+            ("B1", Some(0)),
+            ("B2", Some(1)),
+            ("B3", Some(0)),
+            ("C1", Some(0)),
+            ("C2", Some(1)),
+            ("D1", Some(0)),
+            ("D2", Some(0)),
+            ("E1", Some(0)),
+            // An `object`-less reflog row is outside the index and unnumbered.
+            ("G1", None),
+            ("G2", None),
+        ]
+        .map(|(ulid, n)| (ulid.to_string(), n)),
+        "ordinals count up within an identity group; groups never share a count"
+    );
+    let non_reflog: Vec<Option<i64>> = conn
+        .prepare("SELECT reflog_ordinal FROM events WHERE ulid IN ('F1','F2')")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(non_reflog, [None, None], "only reflog rows are numbered");
     let offset: (i64, Option<String>) = conn
         .query_row(
             "SELECT byte_offset, fingerprint FROM transcript_cursors WHERE worktree_key = 'w'",
@@ -288,7 +333,7 @@ fn the_migration_is_idempotent_across_two_opens() {
         (ulids(&conn), version(&db))
     };
     assert_eq!(first, second);
-    assert_eq!(first.0, ["A1"]);
+    assert_eq!(first.0, ["A1", "A2"]);
 
     // Run again with the stamp forced back, as a crash after the commit's
     // data but before a stamp the next open can see would look.
@@ -297,7 +342,12 @@ fn the_migration_is_idempotent_across_two_opens() {
         .pragma_update(None, "user_version", 1)
         .unwrap();
     let conn = open(&db).unwrap();
-    assert_eq!(ulids(&conn), ["A1"]);
+    assert_eq!(ulids(&conn), ["A1", "A2"]);
+    assert_eq!(
+        ordinals(&conn),
+        [("A1".to_string(), Some(0)), ("A2".to_string(), Some(1))],
+        "a re-run renumbers to the same ordinals"
+    );
     assert_new_shape(&conn);
     assert_eq!(version(&db), WRITER_VERSION);
 }
@@ -309,10 +359,11 @@ fn a_migration_interrupted_midway_leaves_the_old_ledger_and_the_next_open_finish
     let old = Connection::open(&db).unwrap();
     old_insert(&old, "A1", Some("/w/1"), "reflog.commit", Some("x"), None);
     old_insert(&old, "A2", Some("/w/1"), "reflog.commit", Some("x"), None);
-    // The dedupe is the last data step; making it fail interrupts the migration
-    // after the columns and tables were added inside the same transaction.
+    // Numbering the ordinals is the last data step; making it fail interrupts
+    // the migration after the columns and tables were added inside the same
+    // transaction.
     old.execute_batch(
-        "CREATE TRIGGER interrupt BEFORE DELETE ON events
+        "CREATE TRIGGER interrupt BEFORE UPDATE OF reflog_ordinal ON events
          BEGIN SELECT RAISE(ABORT, 'interrupted'); END;",
     )
     .unwrap();
@@ -339,7 +390,11 @@ fn a_migration_interrupted_midway_leaves_the_old_ledger_and_the_next_open_finish
 
     let conn = open(&db).expect("the next open re-runs the migration cleanly");
     assert_new_shape(&conn);
-    assert_eq!(ulids(&conn), ["A1"]);
+    assert_eq!(ulids(&conn), ["A1", "A2"]);
+    assert_eq!(
+        ordinals(&conn),
+        [("A1".to_string(), Some(0)), ("A2".to_string(), Some(1))]
+    );
     assert_eq!(version(&db), WRITER_VERSION);
 }
 
@@ -519,6 +574,11 @@ fn the_writer_fills_the_typed_column_only_from_a_well_formed_stamp() {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(values, [Some(at.to_string()), None, None]);
+        assert_eq!(
+            ordinals(conn).iter().map(|(_, n)| *n).collect::<Vec<_>>(),
+            [Some(0), Some(0), Some(0)],
+            "this lane writes every reflog row with ordinal 0"
+        );
         Ok(())
     })
     .unwrap();
