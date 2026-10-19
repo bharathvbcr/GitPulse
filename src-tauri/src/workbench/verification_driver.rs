@@ -698,7 +698,7 @@ fn named_base(checkout: &str, named: &str, head: &str) -> Result<String, Workben
 /// True when `err` is a git question that was not asked: the spawn gate
 /// deferred it under load, or the child never got a process slot. The command
 /// did not run, so the error is not an answer about the repository.
-fn git_question_unasked(err: &str) -> bool {
+pub(crate) fn git_question_unasked(err: &str) -> bool {
     crate::engine::git_cli::is_deferred_under_load(err)
         || crate::engine::git_cli::is_slot_wait_timeout(err)
 }
@@ -870,3 +870,7 @@ pub(crate) fn install(host: WorkbenchState) {
         log::warn!(target: "workbench", "verification driver did not start: {error}");
     }
 }
+
+#[cfg(test)]
+#[path = "verification_driver_measure.rs"]
+mod measure;

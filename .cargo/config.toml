@@ -1,0 +1,11 @@
+# Local test fan-out is bounded to 4 threads.
+#
+# libtest runs one test thread per core by default, and these tests spawn
+# processes (git, sh, ptys). Several agent sessions each running `cargo test`
+# at once, each with a thread per core, put the machine into a process storm
+# that saturated syspolicyd (the macOS exec checker) and starved the window
+# server. An explicit `--test-threads` still wins, which is how every CI line
+# sets it, and `[env]` never overrides RUST_TEST_THREADS already in the
+# environment, so a developer can still raise it for one run.
+[env]
+RUST_TEST_THREADS = "4"

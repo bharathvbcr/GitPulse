@@ -1736,27 +1736,17 @@ mod tests {
             started.elapsed()
         );
         assert!(!err.is_empty());
-        let pid = std::fs::read_to_string(stub.path().join("pid"))
+        let pid: u32 = std::fs::read_to_string(stub.path().join("pid"))
             .expect("the stub started")
             .trim()
-            .to_string();
-        let alive = || {
-            std::process::Command::new("kill")
-                .args(["-0", &pid])
-                .output_locked()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        };
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while alive() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let survived = alive();
+            .parse()
+            .expect("the stub wrote its pid");
+        // In-process probes: this used to spawn a `kill` every 50 ms.
+        let survived = !crate::test_support::wait_gone(pid, Duration::from_secs(5));
         if survived {
             // Not ours to leave behind: this pid is the stub we started.
-            let _ = std::process::Command::new("kill")
-                .args(["-9", &pid])
-                .output_locked();
+            // SAFETY: SIGKILL to the one pid the stub announced.
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
         }
         assert!(!survived, "the signing program outlived the timeout");
     }
