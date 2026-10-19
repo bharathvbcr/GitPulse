@@ -217,6 +217,7 @@ const UMASK_CHILD: &str = "GITPULSE_UMASK_CHILD";
 /// child sets it and runs the body. A child that matched no test would pass
 /// vacuously, so the parent also requires "1 passed" in its output.
 fn under_umask(test: &str, mask: libc::mode_t, body: impl FnOnce()) {
+    use crate::procguard::LockedSpawn;
     match std::env::var(UMASK_CHILD) {
         Ok(want) if want == format!("{mask:o}") => {
             // SAFETY: umask swaps the mask of this single-test child process.
@@ -229,7 +230,7 @@ fn under_umask(test: &str, mask: libc::mode_t, body: impl FnOnce()) {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", test, "--nocapture", "--test-threads=1"])
                 .env(UMASK_CHILD, format!("{mask:o}"))
-                .output()
+                .output_locked()
                 .unwrap();
             let text = format!(
                 "{}{}",
