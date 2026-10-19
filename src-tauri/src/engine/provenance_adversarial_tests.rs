@@ -467,7 +467,7 @@ fn a_squash_landing_buried_under_more_than_the_search_window_is_not_a_confident_
         .args(["fast-import", "--quiet"])
         .current_dir(repo.path())
         .stdin(Stdio::piped())
-        .spawn()
+        .spawn_locked()
         .expect("fast-import");
     child
         .stdin
@@ -516,7 +516,7 @@ fn a_buried_squash_that_later_commits_edited_is_null_search_depth_exceeded() {
         .args(["fast-import", "--quiet"])
         .current_dir(repo.path())
         .stdin(Stdio::piped())
-        .spawn()
+        .spawn_locked()
         .expect("fast-import");
     child
         .stdin
@@ -762,7 +762,7 @@ fn long_reflog(index: usize) -> (Repo, String, Vec<String>) {
         .args(["fast-import", "--quiet"])
         .current_dir(repo.path())
         .stdin(Stdio::piped())
-        .spawn()
+        .spawn_locked()
         .expect("fast-import");
     child
         .stdin
@@ -831,7 +831,7 @@ fn a_reflog_of_exactly_1000_entries_is_not_called_truncated() {
         .args(["fast-import", "--quiet"])
         .current_dir(repo.path())
         .stdin(Stdio::piped())
-        .spawn()
+        .spawn_locked()
         .expect("fast-import");
     child
         .stdin

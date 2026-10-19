@@ -36,6 +36,7 @@ fn put(repo: &str, file: &str, content: &str, message: &str) -> String {
 }
 
 /// `(label, repository, commit, base)` for every landing shape and failure.
+#[allow(clippy::type_complexity)]
 fn fixtures() -> (
     Vec<tempfile::TempDir>,
     Vec<(String, String, String, Option<String>)>,

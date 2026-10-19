@@ -272,6 +272,7 @@ fn edited_content_that_is_all_on_the_base_reads_tree_and_names_no_commit() {
 fn the_content_comparison_writes_nothing_to_the_repository() {
     // The `tree` route, a conflicting (null) comparison and a clean "not
     // landed" one each run merge-tree, which writes the merged trees.
+    #[allow(clippy::type_complexity)]
     let scenarios: [(&str, fn() -> (Repo, String), Option<bool>); 3] = [
         ("tree", squash_with_an_unrelated_extra_file, Some(true)),
         (
