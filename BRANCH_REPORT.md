@@ -1,3 +1,27 @@
+# Branch consolidation report — 2026-10-19 (third pass: the "next wave", feat/manvi-claude-api)
+
+The owner repeated "commit and merge all changes and next wave, delete old and stale branches". The next wave the second pass named was feat/manvi-claude-api. **Main fast-forwarded 88feadf1 → 6b2c3947.** Nothing was pushed.
+
+| Branch | Commit | How it landed |
+|---|---|---|
+| feat/manvi-claude-api | bcc9611b (feat: Manvi can run on Claude through the Anthropic API) | main merged into the branch with no conflicts (6b2c3947), the gate run on that tree, then main fast-forwarded |
+
+**Gate on 6b2c3947:**
+- Passed: Rust fmt, clippy `-D warnings`, `bun run check`, `check:ipc`, and vitest (769 files, 10,790 tests).
+- Rust `--tests --no-fail-fast`: 6,475 passed and 3 failed at load ~20. All three pass when run alone: `adv_a_conflict_of_ten_thousand_files_is_bounded` (527 s alone), `a_renamed_directory_cannot_split_the_pin_from_the_trust_decision`, and `coalesced_late_acknowledgements_across_a_shed_keep_credit_exact`. None of them is in code the merge touched.
+
+**Deleted:** feat/manvi-claude-api, with `-d`, after its worktree was removed. Backups: `refs/backup/2026-10-19/feat/manvi-claude-api`, and the old main at `refs/backup/2026-10-19/main-before-claude-api`.
+
+**Still held (every other branch is merged into main):**
+- The 11 b17 lanes from the second pass are still held by PID 99318.
+- That integrator has started four new lanes at 88feadf1: b17/df6bf5ea-landed, b17/8f398bb6-umask, b17/adc5dca5-stash-pop and b17/od1-ledger-schema.
+- The claude/* worktrees still have live session cwds (92674, 67181, 9043).
+- worktree-agent-a47e3e00 is unchanged, and still left for the owner.
+
+**Remote:** origin/main-pql0l2 is superseded. Main holds newer and longer copies of its three reports, and its 20 `tasks/gp-*` briefs were filed as board cards. Deleting it is a push, so it is left for the owner. origin/dependabot/… is open PR #10.
+
+---
+
 # Branch consolidation report — 2026-10-19 (01:55, second pass: "merge all")
 
 The owner said "merge all changes and next wave, delete old and stale branches". **Main fast-forwarded 32a57763 → 1e168898**: 4 merges, 1 carried-forward test and 1 clippy fix. Nothing was pushed.
