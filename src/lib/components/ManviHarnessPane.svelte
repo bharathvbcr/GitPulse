@@ -133,6 +133,26 @@
   }
 
   /**
+   * The label of the action that keeps a refused ledger, and the words the
+   * backend's refusal uses to name it (`ledger::anchor::ADOPT_HINT`).
+   */
+  export const ADOPT_LEDGER_LABEL = "Adopt this ledger";
+
+  /**
+   * Whether the history is refused for sitting in another directory than the
+   * one it was anchored in, which only a person can resolve by adopting it.
+   * Read off the refusal's own text, from either source that carries it.
+   */
+  export function ledgerAdoptable(
+    ledger: LedgerStatus | null,
+    catchUp: Pick<CatchUp, "error"> | null,
+  ): boolean {
+    return [ledger?.error, catchUp?.error].some(
+      (error) => typeof error === "string" && error.includes(ADOPT_LEDGER_LABEL),
+    );
+  }
+
+  /**
    * Separately reports UI refresh, durable recording, and external catch-up.
    * One successful source must never hide a gap in another source.
    */
@@ -277,6 +297,8 @@
   let isSuggesting = $state(false);
   let branchError = $state<string | null>(null);
   let logCopied = $state(false);
+  let adopting = $state(false);
+  let adoptError = $state<string | null>(null);
 
   let ai = $derived($harnessStore.ai);
   let harness = $derived($harnessStore.harness);
@@ -293,6 +315,28 @@
       $harnessStore.catchUp,
     ),
   );
+
+  let adoptable = $derived(ledgerAdoptable($harnessStore.ledger, $harnessStore.catchUp));
+
+  /**
+   * Asks the backend to adopt this repository's refused ledger. The approval is
+   * an OS dialog the backend draws, so this button is a request, not the
+   * decision; a declined or refused adoption is reported here, never swallowed.
+   */
+  async function adoptLedger() {
+    const repo = $currentRepoPath;
+    if (!repo || adopting) return;
+    adopting = true;
+    adoptError = null;
+    try {
+      await invoke<string[]>("cmd_adopt_ledger", { repoPath: repo });
+      await harnessStore.catchUp(repo);
+    } catch (error: unknown) {
+      adoptError = redactDiagnosticText(formatError(error));
+    } finally {
+      adopting = false;
+    }
+  }
 
   /**
    * The harness's grant ledger.
@@ -1000,6 +1044,27 @@
         </div>
       {/each}
     </div>
+    {#if adoptable}
+      <div class="rounded-xl border border-border/70 bg-background p-3 flex flex-col gap-2">
+        <p class="text-[11px] text-textMuted leading-relaxed">
+          This checkout is not the directory its activity history was recorded in. If it is that
+          repository, moved or restored here, adopt the history to keep recording into it. You
+          will be asked to confirm in a system dialog.
+        </p>
+        <div>
+          <button
+            onclick={() => void adoptLedger()}
+            disabled={adopting}
+            class="text-[11px] px-2 py-1 rounded-lg border border-border hover:bg-surfaceHover disabled:opacity-50"
+          >
+            {adopting ? "Adopting…" : ADOPT_LEDGER_LABEL}
+          </button>
+        </div>
+        {#if adoptError}
+          <p class="text-[11px] text-rose-400 wrap-break-word" role="alert">{adoptError}</p>
+        {/if}
+      </div>
+    {/if}
     {#if recentActions.length === 0}
       <div class="rounded-xl border border-border/70 bg-background p-3 text-textMuted leading-relaxed">
         No activity rows are currently available. The history status above says whether this

@@ -511,6 +511,18 @@ thread_local! {
     static CLOCK: std::cell::Cell<Option<(Instant, SystemTime)>> = const { std::cell::Cell::new(None) };
 }
 
+/// Whether [`mono_now`] is a test's [`ManualClock`] rather than the real clock:
+/// the one thing that tells a deadline stamped on it from one on the real clock.
+#[cfg(not(test))]
+pub(crate) fn mono_is_manual() -> bool {
+    false
+}
+
+#[cfg(test)]
+pub(crate) fn mono_is_manual() -> bool {
+    CLOCK.with(|cell| cell.get().is_some())
+}
+
 #[cfg(test)]
 pub(crate) fn mono_now() -> Instant {
     CLOCK

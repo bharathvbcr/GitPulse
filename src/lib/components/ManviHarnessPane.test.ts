@@ -6,7 +6,9 @@ import { functionBody } from "../stores/sourceScan";
 import { render } from "svelte/server";
 import ManviHarnessPane, {
   activityHistoryPresentations,
+  ADOPT_LEDGER_LABEL,
   createRepositoryRefreshTimer,
+  ledgerAdoptable,
   scopedRunnerPresentation,
 } from "./ManviHarnessPane.svelte";
 
@@ -219,5 +221,16 @@ describe("ManviHarnessPane capability truth", () => {
     expect(create).toContain("if (outcome.ok)");
     expect(create).toMatch(/branchError = outcome\.error/);
     expect(create.indexOf('branchSuggestion = ""')).toBeGreaterThan(create.indexOf("if (outcome.ok)"));
+  });
+
+  it("offers adoption only for the refusal that names it, from either source", () => {
+    const refusal = `the ledger contains an event attributed to a different repository: a copy or another clone. If this checkout is the repository that was moved or copied here, use "${ADOPT_LEDGER_LABEL}" in Activity history.`;
+    const ledger = (error: string) => ({ recording: false, path: "", dropped: 0, error, error_code: "x" });
+    expect(ledgerAdoptable(null, null)).toBe(false);
+    expect(ledgerAdoptable(ledger(""), null)).toBe(false);
+    expect(ledgerAdoptable(ledger("the ledger could not be opened"), null)).toBe(false);
+    expect(ledgerAdoptable(ledger(refusal), null)).toBe(true);
+    expect(ledgerAdoptable(null, { error: refusal })).toBe(true);
+    expect(source).toContain('invoke<string[]>("cmd_adopt_ledger"');
   });
 });

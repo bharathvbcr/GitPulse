@@ -716,6 +716,64 @@ fn a_repository_that_merged_the_source_history_is_refused_the_carried_ledger() {
     assert_eq!(count_action(&b, "ledger.reanchor"), 0);
 }
 
+/// Fable's required test: a cross-device move (a copy to another directory and a
+/// delete of the source, so the checkout is a different inode) is refused with
+/// the adopt action named, and adopting it heals it: the move is then reported,
+/// the pre-move history stays, the adoption is an audit row, and recording
+/// goes on.
+#[test]
+fn a_cross_device_move_is_refused_and_an_adoption_heals_it() {
+    let parent = tempfile::tempdir().unwrap();
+    let old = repo_at(parent.path(), "before", "seed");
+    let mut corpus = Corpus::new();
+    let before_file = corpus.edit(&old);
+    assert_eq!(corpus.pass(&old).recorded, 1);
+
+    // What `mv` across devices does: copy, then delete the source.
+    let new = cp_r(&old, &parent.path().canonicalize().unwrap().join("after"));
+    std::fs::remove_dir_all(&old).unwrap();
+    let after_file = corpus.edit(&new);
+    let out = corpus.pass(&new);
+    assert_refused(&out, "not the directory the ledger was anchored in");
+    assert!(
+        out.error.contains("Adopt this ledger"),
+        "the refusal names the action that heals it: {out:?}"
+    );
+    assert_eq!(count_action(&new, "ledger.reanchor"), 0);
+
+    // A declined adoption changes nothing.
+    let declined = ledger::bindings::adopt_ledger(&new, "user:test", &|_| false).unwrap_err();
+    assert_eq!(declined.code, "adoption_declined");
+    ledger::forget_identity_state(&new);
+    assert_refused(
+        &corpus.pass(&new),
+        "not the directory the ledger was anchored in",
+    );
+
+    let earlier = std::cell::RefCell::new(Vec::new());
+    let adopted = ledger::bindings::adopt_ledger(&new, "user:test", &|paths| {
+        earlier.borrow_mut().extend(paths.iter().cloned());
+        true
+    })
+    .unwrap();
+    assert_eq!(adopted, vec![old.clone()]);
+    assert_eq!(*earlier.borrow(), vec![old.clone()]);
+
+    let out = corpus.pass(&new);
+    assert_eq!((out.recorded, out.error.as_str()), (1, ""), "{out:?}");
+    let rows = transcript_rows(&new);
+    for file in [&before_file, &after_file] {
+        let named = rows.iter().filter(|(_, object, _)| object == file).count();
+        assert_eq!(named, 1, "{file} is neither lost nor duplicated: {rows:?}");
+    }
+    assert_eq!(count_action(&new, "ledger.reanchor"), 1);
+    assert_eq!(
+        count_action(&new, "ledger.adopt"),
+        1,
+        "the adoption is an audit row"
+    );
+}
+
 /// The other side of the same roots rule: a repository that grew an orphan root
 /// (so its roots are a superset of what the ledger recorded) and is then
 /// renamed is still the same directory, and keeps recording.
