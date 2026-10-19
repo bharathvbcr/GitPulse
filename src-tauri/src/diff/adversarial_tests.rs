@@ -452,7 +452,11 @@ fn a_new_directory_under_umask_0277_matches_mkdir() {
         &format!("{ADV}a_new_directory_under_umask_0277_matches_mkdir"),
         0o277,
         || {
+            use std::os::unix::fs::PermissionsExt;
             let (_g, root) = tmp();
+            // The temp dir itself was made under this umask: give it back
+            // its owner write bit so the folders under test can be made.
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
             let oracle = root.join("oracle");
             std::fs::create_dir(&oracle).unwrap();
             let mut created = Vec::new();
@@ -462,7 +466,6 @@ fn a_new_directory_under_umask_0277_matches_mkdir() {
             assert_eq!(mode_of(&root.join("ours")), mode_of(&oracle));
             assert_eq!(mode_of(&root.join("ours")), 0o500);
             // Restore access so the temp dir can be removed.
-            use std::os::unix::fs::PermissionsExt;
             for dir in [&oracle, &root.join("ours")] {
                 std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
             }
