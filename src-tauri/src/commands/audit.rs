@@ -108,7 +108,8 @@ fn catch_up_before_binding(
 
 /// Runs `catch_up` for the address a binding change is about to be written at,
 /// and returns what it found as the `detail_json` of that row:
-/// `{"catch_up": {"ok", "truncated", "recorded", "error"}}`, plus a `note` when
+/// `{"catch_up": {"ok", "truncated", "recorded", "failed_records",
+/// "reflog_pending", "error"}}`, plus a `note` when
 /// there was nothing to read.
 ///
 /// The catch-up is best-effort. Whatever it does, the binding is written, and
@@ -132,6 +133,8 @@ fn catch_up_note(
         "ok": ok,
         "truncated": found.truncated,
         "recorded": found.recorded,
+        "failed_records": found.failed_records,
+        "reflog_pending": found.reflog_pending,
         "error": if nothing_to_read {
             String::new()
         } else {

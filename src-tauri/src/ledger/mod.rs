@@ -1816,8 +1816,9 @@ fn store_object_and_detail(
 /// same identity and ordinal; that refusal is `INSERT OR IGNORE` in effect
 /// (code `duplicate_reflog`, which [`append`] neither counts as dropped nor
 /// announces, and [`record_outcome`] reports as [`Recorded::Duplicate`]). The
-/// replay numbers identical entries of one pass 0, 1, 2; matching those
-/// against the live reflog across passes is Wave B's replay work.
+/// replay numbers identical entries of a second 0, 1, 2 in the reflog's own
+/// order, and carries that numbering across passes through the watermark
+/// (`reflog_watermarks`, see `ingest::replay_ref`).
 fn insert(conn: &Connection, event: &Prepared) -> Result<i64, LedgerError> {
     conn.execute(
         "INSERT INTO events (
@@ -3219,9 +3220,115 @@ fn import_source(
     Ok(imported_total)
 }
 
-/// The `object` of every `reflog.*` event recorded for one checkout, in the
-/// form it is stored (redacted), for the reflog catch-up's "already recorded"
-/// test.
+/// Where reflog replay stopped for one ref of one checkout: the identity of
+/// the last entry it recorded, as `reflog_watermarks` holds it. The four
+/// fields are what tell that entry from every other one of the same ref: the
+/// selector's time, the commit, a hash of the stored identity (commit and
+/// message), and the entry's ordinal among identical ones of that second.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReflogWatermark {
+    pub unix: i64,
+    pub oid: String,
+    pub msg_hash: String,
+    pub ordinal: i64,
+}
+
+/// The hash a watermark keeps of a reflog entry's identity (`"{oid} {message}"`).
+/// Taken over the stored spelling, so a message that carried a secret leaves
+/// no digest of the secret in this table.
+pub(crate) fn reflog_message_hash(identity: &str) -> String {
+    format!("{:016x}", ids::fnv1a64(stored_object(identity).as_bytes()))
+}
+
+/// The watermark for `ref_name` of `worktree_path`'s checkout, if replay has
+/// recorded any entry of it. A read error is an error, never "no watermark":
+/// the caller would then replay from the top of the window.
+pub(crate) fn reflog_watermark(
+    repo_path: &str,
+    worktree_path: &str,
+    ref_name: &str,
+) -> Result<Option<ReflogWatermark>, LedgerError> {
+    let key = transcript_key(Path::new(worktree_path));
+    with_conn(repo_path, |conn| {
+        conn.query_row(
+            "SELECT last_entry_unix, last_entry_oid, last_entry_msg_hash, last_entry_ordinal
+             FROM reflog_watermarks WHERE worktree_key = ?1 AND ref_name = ?2",
+            params![key, ref_name],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map(|row| match row {
+            // A row with a missing part cannot name an entry; it is no mark.
+            Some((Some(unix), Some(oid), Some(msg_hash), Some(ordinal))) => Some(ReflogWatermark {
+                unix,
+                oid,
+                msg_hash,
+                ordinal,
+            }),
+            _ => None,
+        })
+        .map_err(|e| LedgerError::new("watermark_read_failed", e.to_string()))
+    })
+}
+
+/// Moves the watermark for `ref_name` of `worktree_path`'s checkout to `mark`.
+///
+/// Written only after the entries up to `mark` are in the ledger, and never
+/// needed for correctness: the unique reflog identity index refuses a replayed
+/// entry, so a crash between the rows and this write costs a re-read, not a
+/// duplicate or a gap.
+pub(crate) fn set_reflog_watermark(
+    repo_path: &str,
+    worktree_path: &str,
+    ref_name: &str,
+    mark: &ReflogWatermark,
+) -> Result<(), LedgerError> {
+    let key = transcript_key(Path::new(worktree_path));
+    let updated_at = ids::iso8601_utc(ids::now_millis());
+    with_conn(repo_path, |conn| {
+        conn.execute(
+            "INSERT INTO reflog_watermarks (
+                 worktree_key, ref_name, last_entry_unix, last_entry_oid,
+                 last_entry_msg_hash, last_entry_ordinal, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(worktree_key, ref_name) DO UPDATE SET
+                 last_entry_unix = excluded.last_entry_unix,
+                 last_entry_oid = excluded.last_entry_oid,
+                 last_entry_msg_hash = excluded.last_entry_msg_hash,
+                 last_entry_ordinal = excluded.last_entry_ordinal,
+                 updated_at = excluded.updated_at",
+            params![
+                key,
+                ref_name,
+                mark.unix,
+                mark.oid,
+                mark.msg_hash,
+                mark.ordinal,
+                updated_at
+            ],
+        )
+        .map(|_| ())
+        .map_err(|e| LedgerError::new("watermark_write_failed", e.to_string()))
+    })
+}
+
+/// The `object` of every *legacy* `reflog.*` event recorded for one checkout,
+/// in the form it is stored (redacted), for the reflog catch-up's "already
+/// recorded" test.
+///
+/// Legacy means no `occurred_at`: a row written before replay typed its event
+/// time. Those cannot be matched by the unique reflog identity index (their
+/// time part is empty), so replay still skips an entry whose identity one of
+/// them holds. A row with an `occurred_at` is deliberately absent: the index
+/// refuses its replayed copy exactly, and counting it here would hide the
+/// second of two identical entries after a pass that stopped between them.
 ///
 /// One query on the partial index `idx_events_reflog` in place of paging the whole ledger
 /// through [`tail`]. A read error is an error: the caller must not read "could
@@ -3244,6 +3351,7 @@ pub(crate) fn recorded_reflog_objects(
                              THEN json_extract(detail_json, '$.object_truncated.hash') END
                  FROM events INDEXED BY idx_events_reflog
                  WHERE action LIKE 'reflog.%' AND object IS NOT NULL
+                   AND occurred_at IS NULL
                    AND (worktree_path IN (?1, ?2) OR (?3 AND worktree_path IS NULL))",
             )
             .map_err(|e| LedgerError::new("prepare_failed", e.to_string()))?;

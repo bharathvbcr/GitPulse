@@ -102,6 +102,27 @@ pub struct CatchUp {
     /// failed to write, so a shortfall is always accounted for.
     #[serde(default)]
     pub duplicates_refused: i64,
+    /// Reflog entries whose ledger write failed (counted by the ledger's dropped
+    /// total too). The pass stops at the first, so everything after it in that
+    /// ref is `reflog_pending`; the next pass retries from the same place.
+    /// Non-zero is never a complete pass.
+    #[serde(default)]
+    pub failed_records: i64,
+    /// Reflog entries the pass knew of and did not record: more than a window
+    /// newer than the watermark, or left behind a failed write. They are
+    /// recorded, oldest first, by the next passes; non-zero sets `truncated`.
+    #[serde(default)]
+    pub reflog_pending: i64,
+    /// True when a ref's log reaches past what the pass read and its watermark
+    /// was not in the read (a first pass over a long log, or more than the depth
+    /// bound of new entries): older entries were not examined. Sets `truncated`.
+    #[serde(default)]
+    pub reflog_unreached: bool,
+    /// Reflogs (worktree HEADs, the default branch) the pass did not read: the
+    /// per-pass bound on worktrees, a deadline, or an unreadable default branch.
+    /// Non-zero sets `truncated`.
+    #[serde(default)]
+    pub reflog_refs_skipped: i64,
     /// True when the wall-clock deadline stopped the pass early.
     ///
     /// A truncated pass is a floor: remaining transcripts/reflog entries were
@@ -488,56 +509,342 @@ pub fn ingest_reflog(repo_path: &str, max_entries: usize) -> CatchUp {
     ingest_reflog_into(repo_path, repo_path, max_entries)
 }
 
+/// Reflog entries one ref records per pass, and the window it reads to find
+/// them. More than this newer than the watermark is not lost: the pass records
+/// the oldest of them, advances the watermark to the last, and says
+/// `truncated` with the count it left for the next pass.
+const REFLOG_WINDOW: usize = 200;
+
+/// How deep a pass reads for its watermark when the window does not hold it
+/// (more than [`REFLOG_WINDOW`] entries since the last pass). Bounded: past it
+/// the ref reports `reflog_unreached` instead of reading an unbounded log.
+const REFLOG_DEPTH: usize = 2000;
+
+/// Worktree HEAD reflogs one pass reads. A family past this reports how many
+/// it left (`reflog_refs_skipped`) and is `truncated`, never complete.
+const MAX_REFLOG_WORKTREES: usize = 16;
+
 /// Replays one checkout's HEAD reflog into its repository-wide ledger.
 pub(crate) fn ingest_reflog_into(
     ledger_repo: &str,
     worktree_path: &str,
     max_entries: usize,
 ) -> CatchUp {
-    ingest_reflog_within(ledger_repo, worktree_path, max_entries, None)
+    replay_ref(ledger_repo, worktree_path, "HEAD", max_entries, None)
 }
 
-/// [`ingest_reflog_into`] with the reflog's Git child held to `timeout`.
-fn ingest_reflog_within(
+/// Replays the HEAD reflog of every worktree in the family `worktree_path`
+/// belongs to, and the repository's default branch once, into the shared
+/// ledger. `family` is [`family_siblings`]'s answer: unresolved, only the
+/// trigger's own HEAD is read (the default branch waits for a resolved family).
+///
+/// Spawns at most `max_worktrees + 1` reflog children (two more per ref that
+/// had to look past its window), plus the default-base lookup the rest of the
+/// engine already caches.
+fn ingest_reflogs(
     ledger_repo: &str,
     worktree_path: &str,
-    max_entries: usize,
+    family: &Result<Vec<String>, String>,
+    max_worktrees: usize,
+    budget: &Budget,
+) -> CatchUp {
+    let mut total = CatchUp::default();
+    let mut worktrees = vec![worktree_path.to_string()];
+    if let Ok(siblings) = family {
+        worktrees.extend(siblings.iter().cloned());
+    }
+    let skipped = worktrees.len().saturating_sub(max_worktrees);
+    worktrees.truncate(max_worktrees);
+    total.reflog_refs_skipped = i64::try_from(skipped).unwrap_or(i64::MAX);
+
+    let mut refs: Vec<(String, String)> = worktrees
+        .into_iter()
+        .map(|worktree| (worktree, "HEAD".to_string()))
+        .collect();
+    if family.is_ok() {
+        // The default branch's own reflog holds what no HEAD log does: a
+        // fast-forward made from another worktree moves it without touching
+        // this one's HEAD.
+        let base = crate::engine::git_reader::default_base(std::path::Path::new(ledger_repo));
+        match base.checked() {
+            Ok(base) => {
+                if let Some((short, _)) = base.base {
+                    refs.push((ledger_repo.to_string(), format!("refs/heads/{short}")));
+                }
+            }
+            Err(reason) => {
+                total.reflog_refs_skipped += 1;
+                total.absorb_reflog(CatchUp {
+                    error: format!("the default branch could not be read: {reason}"),
+                    ..CatchUp::default()
+                });
+            }
+        }
+    }
+    for (index, (worktree, ref_name)) in refs.iter().enumerate() {
+        if budget.expired() {
+            total.reflog_refs_skipped += i64::try_from(refs.len() - index).unwrap_or(i64::MAX);
+            break;
+        }
+        let one = replay_ref(
+            ledger_repo,
+            worktree,
+            ref_name,
+            REFLOG_WINDOW,
+            budget.remaining(),
+        );
+        total.absorb_reflog(one);
+    }
+    if total.reflog_refs_skipped > 0 {
+        total.mark_reflog_incomplete(format!(
+            "{} reflog(s) not read this pass",
+            total.reflog_refs_skipped
+        ));
+    }
+    total
+}
+
+/// One reflog entry laid out for replay: where it sits among identical
+/// entries, and the commit the ref held before it.
+struct Step<'a> {
+    entry: &'a crate::engine::git_reader::ReflogEntry,
+    ordinal: i64,
+    before: Option<&'a str>,
+}
+
+impl Step<'_> {
+    /// `"{commit} {message}"`: the selector (`HEAD@{3}`) is positional and
+    /// shifts as the reflog grows, so identity is the commit plus the message.
+    fn identity(&self) -> String {
+        format!("{} {}", self.entry.commit_id, self.entry.message)
+    }
+
+    fn watermark(&self) -> ledger::ReflogWatermark {
+        ledger::ReflogWatermark {
+            unix: self.entry.timestamp,
+            oid: self.entry.commit_id.clone(),
+            msg_hash: ledger::reflog_message_hash(&self.identity()),
+            ordinal: self.ordinal,
+        }
+    }
+}
+
+/// A reflog read (newest first, at most `limit + 1` entries) laid out oldest
+/// first with each entry's ordinal among identical ones.
+///
+/// Identical entries of one second (a script's `git reset` twice) are told
+/// apart by their occurrence index, 0, 1, 2, in the reflog's own order, so two
+/// processes replaying the same log number the same entries the same way and
+/// the ledger's unique identity index refuses the second process's copies.
+///
+/// An occurrence index is only absolute when every identical entry is in the
+/// read. The read asks for one entry more than `limit`: that extra is kept as
+/// the before-image of the oldest entry, and when it shares a second with the
+/// entries just after it, the group may continue past what was read, so that
+/// run is left unrecorded (`start` skips it) rather than numbered wrongly.
+struct Laid<'a> {
+    /// Oldest first; with `capped`, `steps[0]` is the extra entry.
+    steps: Vec<Step<'a>>,
+    /// The read hit its limit: older entries exist.
+    capped: bool,
+    /// First index that may be recorded.
+    start: usize,
+}
+
+impl<'a> Laid<'a> {
+    fn new(entries: &'a [crate::engine::git_reader::ReflogEntry], limit: usize) -> Self {
+        let capped = entries.len() > limit;
+        let mut occurrences: std::collections::HashMap<(String, i64), i64> =
+            std::collections::HashMap::new();
+        let mut steps: Vec<Step<'a>> = Vec::with_capacity(entries.len());
+        for entry in entries.iter().rev() {
+            let identity = format!("{} {}", entry.commit_id, entry.message);
+            let occurrence = occurrences.entry((identity, entry.timestamp)).or_insert(0);
+            let before = steps.last().map(|older| older.entry.commit_id.as_str());
+            steps.push(Step {
+                entry,
+                ordinal: *occurrence,
+                before,
+            });
+            *occurrence += 1;
+        }
+        let mut start = usize::from(capped);
+        if let Some(extra) = steps.first().filter(|_| capped) {
+            let second = extra.entry.timestamp;
+            while steps
+                .get(start)
+                .is_some_and(|s| s.entry.timestamp == second)
+            {
+                start += 1;
+            }
+        }
+        Laid {
+            steps,
+            capped,
+            start,
+        }
+    }
+
+    /// Where `mark` sits among the recordable steps.
+    fn position_of(&self, mark: &ledger::ReflogWatermark) -> Option<usize> {
+        (self.start..self.steps.len()).rev().find(|&i| {
+            let step = &self.steps[i];
+            step.entry.timestamp == mark.unix
+                && step.ordinal == mark.ordinal
+                && step.entry.commit_id == mark.oid
+                && ledger::reflog_message_hash(&step.identity()) == mark.msg_hash
+        })
+    }
+}
+
+/// Replays one ref's reflog (`HEAD` of the checkout at `worktree_path`, or a
+/// full ref such as `refs/heads/main` read from it) into the ledger at
+/// `ledger_repo`, from where the last pass stopped.
+///
+/// The watermark (`reflog_watermarks`) is the last entry recorded, by selector
+/// time, commit, message hash and ordinal. Everything newer is recorded
+/// oldest first, and the watermark advances only over entries that are in the
+/// ledger, so a pass that ends anywhere (a failed write, a deadline, a killed
+/// process) leaves nothing unrecorded behind it. The unique reflog identity
+/// index is what makes a re-read harmless, so the watermark is a bound on the
+/// work, never the thing exactly-once rests on.
+///
+/// More than `window` entries newer than the watermark are recorded `window`
+/// at a time, oldest first, and counted in `reflog_pending` with `truncated`.
+fn replay_ref(
+    ledger_repo: &str,
+    worktree_path: &str,
+    ref_name: &str,
+    window: usize,
     timeout: Option<std::time::Duration>,
 ) -> CatchUp {
     let mut out = CatchUp::default();
-    let entries = match crate::engine::git_reader::GitReader::get_reflog_within(
-        worktree_path,
-        max_entries,
-        timeout,
-    ) {
+    let mark = match ledger::reflog_watermark(ledger_repo, worktree_path, ref_name) {
+        Ok(mark) => mark,
+        Err(e) => {
+            out.error = format!("could not read the reflog watermark for {ref_name}: {e}");
+            return out;
+        }
+    };
+    let read = |limit: usize| {
+        crate::engine::git_reader::GitReader::get_reflog_within(
+            worktree_path,
+            ref_name,
+            limit + 1,
+            timeout,
+        )
+    };
+    let mut limit = window;
+    let mut entries = match read(limit) {
         Ok(entries) => entries,
         Err(e) => {
             out.error = e;
             return out;
         }
     };
+    let mut laid = Laid::new(&entries, limit);
+    // The watermark is not in the window: more than a window of entries came
+    // since it. Look once, bounded, deeper for it.
+    if mark
+        .as_ref()
+        .is_some_and(|mark| laid.capped && laid.position_of(mark).is_none())
+        && limit < REFLOG_DEPTH
+    {
+        limit = REFLOG_DEPTH;
+        entries = match read(limit) {
+            Ok(entries) => entries,
+            Err(e) => {
+                out.error = e;
+                return out;
+            }
+        };
+        laid = Laid::new(&entries, limit);
+    }
+    let found = mark.as_ref().and_then(|mark| laid.position_of(mark));
+    let first = found.map_or(laid.start, |position| position + 1);
+    // A capped read that did not reach its watermark (or had none) cannot say
+    // what lies before it.
+    let unreached = laid.capped && found.is_none();
+    let recordable = &laid.steps[first.min(laid.steps.len())..];
+    let take = recordable.len().min(window.max(1));
+    let steps = &recordable[..take];
+    // Entries the read held but this pass will not record: past the per-pass
+    // bound, or the oldest second a capped read cut in two (when that second
+    // is newer than the watermark, which only a missing watermark leaves).
+    let mut pending = recordable.len() - take;
+    if found.is_none() {
+        pending += laid.start - usize::from(laid.capped);
+    }
 
-    // Already-recorded identities, so a second open adds nothing. Stored rows
-    // hold the redacted spelling, so that is what each entry is compared as. A
-    // failed read stops the replay: recording against an unknown "seen" set is
-    // how the same history would be written twice.
-    let seen =
-        ledger::recorded_reflog_objects(ledger_repo, worktree_path, ledger_repo == worktree_path);
-    replay_reflog(ledger_repo, worktree_path, entries, seen, out)
+    // Entries an old build recorded without an event time cannot be matched
+    // by the unique index, so replay still skips an identity one of them holds.
+    // Only a replay with no usable watermark can meet one.
+    let seen = if found.is_some() {
+        Ok(std::collections::HashSet::new())
+    } else {
+        ledger::recorded_reflog_objects(ledger_repo, worktree_path, ledger_repo == worktree_path)
+    };
+    let (settled, mut out) = record_steps(ledger_repo, worktree_path, ref_name, steps, seen, out);
+    if let Some(last) = settled.checked_sub(1).map(|i| &steps[i]) {
+        if let Err(e) =
+            ledger::set_reflog_watermark(ledger_repo, worktree_path, ref_name, &last.watermark())
+        {
+            out.error = format!("could not move the reflog watermark for {ref_name}: {e}");
+        }
+    }
+    pending += steps.len() - settled;
+    out.reflog_pending = i64::try_from(pending).unwrap_or(i64::MAX);
+    out.reflog_unreached = unreached;
+    if out.failed_records > 0 {
+        out.mark_reflog_incomplete(format!(
+            "{} reflog entr(ies) of {ref_name} could not be written",
+            out.failed_records
+        ));
+    }
+    if pending > 0 || unreached {
+        out.mark_reflog_incomplete(format!(
+            "{ref_name}: {pending} entr(ies) not yet recorded{}",
+            if unreached {
+                ", older entries beyond the read were not examined"
+            } else {
+                ""
+            }
+        ));
+    }
+    out
 }
 
+/// A complete reflog, newest first, replayed as one pass with no watermark:
+/// what the unit tests of the recording rules feed.
+#[cfg(test)]
 fn replay_reflog(
     ledger_repo: &str,
     worktree_path: &str,
     entries: Vec<crate::engine::git_reader::ReflogEntry>,
     seen: Result<std::collections::HashSet<String>, ledger::LedgerError>,
-    mut out: CatchUp,
+    out: CatchUp,
 ) -> CatchUp {
+    let laid = Laid::new(&entries, entries.len());
+    record_steps(ledger_repo, worktree_path, "HEAD", &laid.steps, seen, out).1
+}
+
+/// Records `steps` (oldest first) and returns how many leading ones are settled
+/// (in the ledger already or now) with the pass's tallies. Stops at the first
+/// write that fails, so the settled prefix is contiguous: a watermark moved to
+/// its end leaves no gap behind it.
+fn record_steps(
+    ledger_repo: &str,
+    worktree_path: &str,
+    ref_name: &str,
+    steps: &[Step<'_>],
+    seen: Result<std::collections::HashSet<String>, ledger::LedgerError>,
+    mut out: CatchUp,
+) -> (usize, CatchUp) {
     let seen = match seen {
         Ok(seen) => seen,
         Err(e) => {
             out.error = format!("could not read the recorded reflog history: {e}");
-            return out;
+            return (0, out);
         }
     };
 
@@ -552,18 +859,9 @@ fn replay_reflog(
         }
     };
     let now_ms = ledger::ids::now_millis();
-    // Identical entries of one pass (a script's `git reset` twice in a second)
-    // are told apart by their occurrence index, 0, 1, 2, in the oldest-first
-    // order below. That order is the reflog's own, so two processes replaying
-    // the same pass number the same entries the same way, and the ledger's
-    // unique identity index refuses the second process's copies.
-    let mut occurrences: std::collections::HashMap<(String, i64), i64> =
-        std::collections::HashMap::new();
-    // Oldest first, so the ledger's order matches the order things happened.
-    for entry in entries.iter().rev() {
-        // The selector (`HEAD@{3}`) is positional and shifts as the reflog
-        // grows, so identity is the commit plus the message.
-        let identity = format!("{} {}", entry.commit_id, entry.message);
+    for (settled, step) in steps.iter().enumerate() {
+        let entry = step.entry;
+        let identity = step.identity();
         // Compared as stored: redacted, and cut to the ledger's `object` cap,
         // or an identity past the cap would never match its own row.
         if seen.contains(&ledger::stored_object(&identity)) {
@@ -591,15 +889,11 @@ fn replay_reflog(
         );
         let detail = serde_json::json!({
             "source": "reflog",
+            "ref": ref_name,
             "selector": entry.selector,
             "message": entry.message,
         })
         .to_string();
-        let occurrence = occurrences
-            .entry((identity.clone(), entry.timestamp))
-            .or_insert(0);
-        let reflog_ordinal = *occurrence;
-        *occurrence += 1;
         match ledger::record_outcome(
             Draft {
                 repo_path: ledger_repo.to_string(),
@@ -607,6 +901,10 @@ fn replay_reflog(
                 task_id: when.task.task_id().map(str::to_string),
                 action,
                 object: Some(identity),
+                // What the ref held before this move: the commit the next
+                // older entry moved it to. Absent for the first entry of a
+                // log, which has no earlier value to name.
+                before_ref: step.before.map(str::to_string),
                 after_ref: Some(entry.commit_id.clone()),
                 // Git does not record which actor moved the ref, and inventing one
                 // would be a guess written to disk. `system` says GitPulse
@@ -619,17 +917,58 @@ fn replay_reflog(
                 event_stamp: Some(when.stamp()),
                 ..Default::default()
             },
-            reflog_ordinal,
+            step.ordinal,
         ) {
-            ledger::Recorded::Appended(_) => out.recorded += 1,
+            ledger::Recorded::Appended(_) => {
+                out.recorded += 1;
+                #[cfg(all(test, unix))]
+                reflog_replay_tests::crash_point(out.recorded);
+            }
             ledger::Recorded::Duplicate => out.duplicates_refused += 1,
-            ledger::Recorded::Failed => {}
+            ledger::Recorded::Failed => {
+                // Surfaced, and the pass stops here: moving the watermark past
+                // an entry that is not in the ledger would lose it for good.
+                out.failed_records += 1;
+                return (settled, out);
+            }
         }
     }
-    out
+    (steps.len(), out)
 }
 
 impl CatchUp {
+    /// Folds another ref's reflog replay into this pass's total.
+    fn absorb_reflog(&mut self, other: CatchUp) {
+        self.recorded += other.recorded;
+        self.reflog_entries += other.reflog_entries;
+        self.duplicates_refused += other.duplicates_refused;
+        self.failed_records += other.failed_records;
+        self.reflog_pending += other.reflog_pending;
+        self.reflog_refs_skipped += other.reflog_refs_skipped;
+        self.reflog_unreached |= other.reflog_unreached;
+        self.truncated |= other.truncated;
+        if !other.error.is_empty() {
+            self.error = if self.error.is_empty() {
+                other.error
+            } else {
+                format!("{}; {}", self.error, other.error)
+            };
+        }
+    }
+
+    /// Marks a reflog pass that did not examine or record everything it knew
+    /// of: `truncated`, with `reason` in `error` beside the counts. A
+    /// shortfall never reads as a complete pass.
+    fn mark_reflog_incomplete(&mut self, reason: String) {
+        self.truncated = true;
+        let note = format!("catch-up truncated: {reason}");
+        self.error = if self.error.is_empty() {
+            note
+        } else {
+            format!("{}; {note}", self.error)
+        };
+    }
+
     /// This reflog replay's result with the transcript pass's folded in.
     fn with_transcripts(mut self, transcripts: &CatchUp) -> CatchUp {
         self.recorded += transcripts.recorded;
@@ -767,7 +1106,16 @@ fn catch_up_with(
         };
     };
     progress.enter(Phase::Reflog);
-    let mut total = ingest_reflog_within(ledger_repo, worktree_path, 200, budget.remaining());
+    // Resolved once: the reflogs of every worktree and the transcript pass
+    // below both need the family.
+    let family = family_siblings(ledger_repo, worktree_path);
+    let mut total = ingest_reflogs(
+        ledger_repo,
+        worktree_path,
+        &family,
+        MAX_REFLOG_WORKTREES,
+        budget,
+    );
     progress.publish(&total);
     if budget.expired() {
         total.truncated = true;
@@ -783,7 +1131,6 @@ fn catch_up_with(
     }
 
     progress.enter(Phase::Transcripts);
-    let family = family_siblings(ledger_repo, worktree_path);
     let base = total.clone();
     let mut checks = 0u32;
     let mut expired = |out: &CatchUp| {
@@ -1621,3 +1968,9 @@ mod family_tests;
 mod od1_adv_tests;
 #[cfg(test)]
 mod reanchor_tests;
+#[cfg(test)]
+mod reflog_bench_tests;
+#[cfg(test)]
+mod reflog_coverage_tests;
+#[cfg(test)]
+mod reflog_replay_tests;
