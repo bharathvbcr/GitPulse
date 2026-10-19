@@ -29,6 +29,13 @@ before that tag is pushed.
   gains two additive indexes (`ts_utc`, `action`) the next time a writer opens
   it; nothing else in the schema changes.
 
+### Removed
+
+- The unaddressed `cmd_stash_pop` IPC command and `GitWriter::stash_pop`. Nothing
+  called them: the menu, palette and native actions pop the listed entry by object
+  id through `cmd_stash_action`. Its generated `allow-cmd-stash-pop` permission goes
+  with it (derived from the handler list at build), and the registry is 284 handlers.
+
 ### Fixed
 
 - The Edit/Write hook (`gitpulse-hook collision-guard`) asks the running app for

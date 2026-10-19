@@ -87,7 +87,7 @@ describe("native mutation policy contract", () => {
   });
 
   it("keeps the historically hand-listed commands covered", () => {
-    // Regression guard for the derivation itself: these five were the whole
+    // Regression guard for the derivation itself: these were the whole
     // contract before it was derived, so losing them means the regex broke.
     const commands = guardedCommands();
     for (const name of [
@@ -95,7 +95,6 @@ describe("native mutation policy contract", () => {
       "cmd_unstage_file",
       "cmd_fetch",
       "cmd_stash_save",
-      "cmd_stash_pop",
     ]) {
       expect(commands).toContain(name);
       expect(functionSource(name)).toContain("guard(");
