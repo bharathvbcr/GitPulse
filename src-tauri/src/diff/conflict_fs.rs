@@ -276,6 +276,58 @@ mod unix {
         }
         Err("Cannot allocate a conflict recovery entry".into())
     }
+    /// The permission bits a regular file created in `directory` gets from the
+    /// process umask. Asked of the kernel with an exclusive, immediately
+    /// unlinked probe rather than by `umask(2)`, whose only read is a
+    /// process-wide write that races every other thread's creates.
+    ///
+    /// The probe is named `.gitpulse-conflict-<pid>-<n>-mode-probe`. Nothing
+    /// scans for it: only the `-recovery` and conflict_session `create_temp`
+    /// suffixes are generated and none lists the directory by that prefix. If
+    /// the unlink fails the error names the leftover probe and nothing is
+    /// published. `path` is the file being written, used only for that name.
+    fn creation_mode(directory: &File, path: &Path) -> Result<u32, String> {
+        for _ in 0..32 {
+            let filename = format!(
+                ".gitpulse-conflict-{}-{}-mode-probe",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            );
+            let name = CString::new(filename.as_bytes()).map_err(|e| e.to_string())?;
+            // SAFETY: exclusive no-follow create of an empty probe under the
+            // pinned parent; existing entries are never opened.
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o666,
+                )
+            };
+            if fd < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::AlreadyExists {
+                    continue;
+                }
+                return Err(error());
+            }
+            let probe = opened(fd)?;
+            let mode = probe.metadata().map(|meta| meta.mode() & 0o777);
+            // SAFETY: removes only the probe name created above.
+            if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                return Err(format!(
+                    "Cannot remove the file mode probe {}: {}",
+                    path.with_file_name(&filename).display(),
+                    error()
+                ));
+            }
+            return mode.map_err(|e| e.to_string());
+        }
+        Err("Cannot allocate a file mode probe".into())
+    }
     fn rename(directory: &File, from: &CString, to: &CString, swap: bool) -> Result<(), String> {
         if !swap {
             return crate::fs_entry::rename_noreplace_at(directory, from, directory, to)
@@ -438,6 +490,21 @@ mod unix {
             return Err(CHANGED_BEFORE_PUBLISH.into());
         }
         if source.mode == "missing" {
+            if next.mode != "120000" {
+                // A new file is the user's content, so it takes the mode any
+                // other tool would give it (`0o666` under the process umask).
+                // The staged temporary stays owner-only until here, so a
+                // failure above never leaves a world-readable leftover.
+                let mut mode = creation_mode(&directory, path)?;
+                if next.mode == "100755" {
+                    mode |= ((mode & 0o444) >> 2) | 0o100;
+                } else {
+                    mode &= !0o111;
+                }
+                handle
+                    .set_permissions(std::fs::Permissions::from_mode(mode))
+                    .map_err(|e| e.to_string())?;
+            }
             // SAFETY: linkat without AT_SYMLINK_FOLLOW links the entry itself;
             // it fails if another writer created the destination meanwhile.
             if unsafe {

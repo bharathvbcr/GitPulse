@@ -207,3 +207,133 @@ fn absent_save_over_an_existing_file_keeps_it() {
     assert_eq!(r, Err(WriteFailure::AlreadyExists));
     assert_eq!(std::fs::read(&f).unwrap(), b"mine");
 }
+
+const UMASK_CHILD: &str = "GITPULSE_UMASK_CHILD";
+
+/// Runs `body` under process umask `mask` in a child process. The umask is
+/// process-wide, and every other test in the lib process creates files and
+/// asserts their modes, so it is never changed here. The parent re-executes
+/// this test binary on exactly `test` with the mask in the environment; the
+/// child sets it and runs the body. A child that matched no test would pass
+/// vacuously, so the parent also requires "1 passed" in its output.
+fn under_umask(test: &str, mask: libc::mode_t, body: impl FnOnce()) {
+    use crate::procguard::LockedSpawn;
+    match std::env::var(UMASK_CHILD) {
+        Ok(want) if want == format!("{mask:o}") => {
+            // SAFETY: umask swaps the mask of this single-test child process.
+            unsafe { libc::umask(mask) };
+            body();
+        }
+        // The child was started for another mask of the same test.
+        Ok(_) => {}
+        Err(_) => {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                .env(UMASK_CHILD, format!("{mask:o}"))
+                .output_locked()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.status.success() && text.contains("1 passed"),
+                "umask {mask:o} child failed:\n{text}"
+            );
+        }
+    }
+}
+
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// A new file follows the process umask, like `touch` and a git checkout.
+#[test]
+fn a_new_file_gets_the_umask_default_mode() {
+    for (mask, want) in [(0o022, 0o644), (0o077, 0o600), (0o002, 0o664)] {
+        under_umask(
+            "diff::conflict_fs::adversarial_tests::a_new_file_gets_the_umask_default_mode",
+            mask,
+            || {
+                let (_g, root) = tmp();
+                let f = root.join("new.txt");
+                write_regular_expecting(&f, Expect::Absent, |_| Ok(b"x".to_vec())).unwrap();
+                assert_eq!(mode_of(&f), want, "umask {mask:o}");
+            },
+        );
+    }
+}
+
+/// New folders made on the way to a new file follow the umask too.
+#[test]
+fn a_new_directory_gets_the_umask_default_mode() {
+    for (mask, want) in [(0o022, 0o755), (0o077, 0o700), (0o002, 0o775)] {
+        under_umask(
+            "diff::conflict_fs::adversarial_tests::a_new_directory_gets_the_umask_default_mode",
+            mask,
+            || {
+                let (_g, root) = tmp();
+                write_regular_expecting(&root.join("a/b/new.txt"), Expect::Absent, |_| {
+                    Ok(Vec::new())
+                })
+                .unwrap();
+                assert_eq!(mode_of(&root.join("a")), want, "umask {mask:o}");
+                assert_eq!(mode_of(&root.join("a/b")), want, "umask {mask:o}");
+            },
+        );
+    }
+}
+
+/// An overwrite keeps the existing mode whatever the umask is.
+#[test]
+fn an_overwrite_keeps_the_existing_mode_under_any_umask() {
+    use std::os::unix::fs::PermissionsExt;
+    for mask in [0o022, 0o077] {
+        under_umask(
+            "diff::conflict_fs::adversarial_tests::an_overwrite_keeps_the_existing_mode_under_any_umask",
+            mask,
+            || {
+                let (_g, root) = tmp();
+                for mode in [0o755, 0o600, 0o640] {
+                    let f = root.join(format!("f-{mode:o}"));
+                    std::fs::write(&f, b"old").unwrap();
+                    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(mode)).unwrap();
+                    write_regular_expecting(&f, Expect::Any, |_| Ok(b"new".to_vec())).unwrap();
+                    assert_eq!(std::fs::read(&f).unwrap(), b"new");
+                    assert_eq!(mode_of(&f), mode, "umask {mask:o}, mode {mode:o}");
+                }
+            },
+        );
+    }
+}
+
+/// A write that fails after staging leaves nothing world-readable behind.
+#[test]
+fn a_failed_create_leaves_no_world_readable_temporary() {
+    under_umask(
+        "diff::conflict_fs::adversarial_tests::a_failed_create_leaves_no_world_readable_temporary",
+        0o022,
+        || {
+            let (_g, root) = tmp();
+            let f = root.join("raced.txt");
+            let racer = f.clone();
+            let result = write_regular_after_check(
+                &f,
+                Expect::Absent,
+                |_| Ok(b"secret".to_vec()),
+                move || std::fs::write(&racer, b"other").unwrap(),
+            );
+            assert!(result.is_err(), "{result:?}");
+            assert_eq!(std::fs::read(&f).unwrap(), b"other");
+            for entry in std::fs::read_dir(&root).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_name() != "raced.txt" {
+                    assert_eq!(mode_of(&entry.path()) & 0o077, 0, "{:?}", entry.path());
+                }
+            }
+        },
+    );
+}
