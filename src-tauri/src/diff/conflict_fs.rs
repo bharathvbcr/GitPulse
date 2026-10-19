@@ -276,8 +276,10 @@ mod unix {
         }
         Err("Cannot allocate a conflict recovery entry".into())
     }
-    /// The permission bits a regular file created in `directory` gets from the
-    /// process umask. Asked of the kernel with an exclusive, immediately
+    /// `0o777 & !umask` for `directory`: the nine bits the process umask leaves
+    /// on a create requested at `0o777`. A regular file takes `& 0o666` of it,
+    /// an executable all of it, as `git checkout` does. Asked of the kernel
+    /// with an exclusive, immediately
     /// unlinked probe rather than by `umask(2)`, whose only read is a
     /// process-wide write that races every other thread's creates.
     ///
@@ -286,7 +288,7 @@ mod unix {
     /// suffixes are generated and none lists the directory by that prefix. If
     /// the unlink fails the error names the leftover probe and nothing is
     /// published. `path` is the file being written, used only for that name.
-    fn creation_mode(directory: &File, path: &Path) -> Result<u32, String> {
+    fn umask_applied_mode(directory: &File, path: &Path) -> Result<u32, String> {
         for _ in 0..32 {
             let filename = format!(
                 ".gitpulse-conflict-{}-{}-mode-probe",
@@ -305,7 +307,7 @@ mod unix {
                         | libc::O_EXCL
                         | libc::O_NOFOLLOW
                         | libc::O_CLOEXEC,
-                    0o666,
+                    0o777,
                 )
             };
             if fd < 0 {
@@ -492,15 +494,16 @@ mod unix {
         if source.mode == "missing" {
             if next.mode != "120000" {
                 // A new file is the user's content, so it takes the mode any
-                // other tool would give it (`0o666` under the process umask).
+                // other tool would give it: `0o666 & !umask`, or for an
+                // executable what `git checkout` makes, `0o777 & !umask`.
                 // The staged temporary stays owner-only until here, so a
                 // failure above never leaves a world-readable leftover.
-                let mut mode = creation_mode(&directory, path)?;
-                if next.mode == "100755" {
-                    mode |= ((mode & 0o444) >> 2) | 0o100;
+                let probe = umask_applied_mode(&directory, path)?;
+                let mode = if next.mode == "100755" {
+                    probe
                 } else {
-                    mode &= !0o111;
-                }
+                    probe & 0o666
+                };
                 handle
                     .set_permissions(std::fs::Permissions::from_mode(mode))
                     .map_err(|e| e.to_string())?;

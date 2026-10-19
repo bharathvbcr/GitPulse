@@ -217,15 +217,24 @@ const UMASK_CHILD: &str = "GITPULSE_UMASK_CHILD";
 /// child sets it and runs the body. A child that matched no test would pass
 /// vacuously, so the parent also requires "1 passed" in its output.
 fn under_umask(test: &str, mask: libc::mode_t, body: impl FnOnce()) {
+    if let Err(failure) = try_under_umask(test, mask, body) {
+        panic!("{failure}");
+    }
+}
+
+/// [`under_umask`] that reports a failing mask instead of panicking, so a
+/// test over several masks can name every one that fails.
+fn try_under_umask(test: &str, mask: libc::mode_t, body: impl FnOnce()) -> Result<(), String> {
     use crate::procguard::LockedSpawn;
     match std::env::var(UMASK_CHILD) {
         Ok(want) if want == format!("{mask:o}") => {
             // SAFETY: umask swaps the mask of this single-test child process.
             unsafe { libc::umask(mask) };
             body();
+            Ok(())
         }
         // The child was started for another mask of the same test.
-        Ok(_) => {}
+        Ok(_) => Ok(()),
         Err(_) => {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -243,10 +252,11 @@ fn under_umask(test: &str, mask: libc::mode_t, body: impl FnOnce()) {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            assert!(
-                output.status.success() && text.contains("1 passed"),
-                "umask {mask:o} child failed:\n{text}"
-            );
+            if output.status.success() && text.contains("1 passed") {
+                Ok(())
+            } else {
+                Err(format!("umask {mask:o} child failed:\n{text}"))
+            }
         }
     }
 }
@@ -389,8 +399,8 @@ fn git_checkout_exec_mode(root: &Path) -> u32 {
     mode_of(&root.join("tool.sh"))
 }
 
-fn exec_matches_git(mask: libc::mode_t, test: &str) {
-    under_umask(&format!("{ADV}{test}"), mask, || {
+fn exec_matches_git(mask: libc::mode_t, test: &str) -> Result<(), String> {
+    try_under_umask(&format!("{ADV}{test}"), mask, || {
         let (_g, root) = tmp();
         let oracle = git_checkout_exec_mode(&root);
         let (_h, other) = tmp();
@@ -402,32 +412,62 @@ fn exec_matches_git(mask: libc::mode_t, test: &str) {
             "umask {mask:o}: ours {:o}, git checkout {oracle:o}",
             mode_of(&f)
         );
-    });
+    })
+}
+
+/// Runs [`exec_matches_git`] for every mask and fails naming all that differ.
+fn exec_matches_git_for_all(masks: &[libc::mode_t], test: &str) {
+    let failures: Vec<String> = masks
+        .iter()
+        .filter_map(|&mask| exec_matches_git(mask, test).err())
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// ATTACK 3: a new `100755` file matches what `git checkout` writes.
 #[test]
 fn a_new_executable_matches_git_checkout_under_common_umasks() {
-    for mask in [0o022, 0o077, 0o027, 0o002] {
-        exec_matches_git(
-            mask,
-            "a_new_executable_matches_git_checkout_under_common_umasks",
-        );
-    }
+    exec_matches_git_for_all(
+        &[0o022, 0o077, 0o027, 0o002],
+        "a_new_executable_matches_git_checkout_under_common_umasks",
+    );
 }
 
-/// ATTACK 3: the executable bits are derived from the read bits rather than
-/// taken from `0o777 & !umask`, so a umask that clears an execute bit but not
-/// the matching read bit (026, 006, 011) gives a different mode from git's.
+/// ATTACK 3: a new executable is `0o777 & !umask`, exactly git's mode, also
+/// where the umask clears an execute bit but not the matching read bit
+/// (026, 006, 011).
 #[test]
-#[ignore = "adv: exec bits derived from read bits diverge from git checkout (0777 & !umask) under umask 026/006/011"]
 fn a_new_executable_matches_git_checkout_under_unusual_umasks() {
-    for mask in [0o026, 0o006, 0o011] {
-        exec_matches_git(
-            mask,
-            "a_new_executable_matches_git_checkout_under_unusual_umasks",
-        );
-    }
+    exec_matches_git_for_all(
+        &[0o026, 0o006, 0o011],
+        "a_new_executable_matches_git_checkout_under_unusual_umasks",
+    );
+}
+
+/// Characterization, pinned: a folder made under a umask that clears the owner
+/// write bit has no owner write bit, exactly as `mkdir -p` makes it.
+#[test]
+fn a_new_directory_under_umask_0277_matches_mkdir() {
+    under_umask(
+        &format!("{ADV}a_new_directory_under_umask_0277_matches_mkdir"),
+        0o277,
+        || {
+            let (_g, root) = tmp();
+            let oracle = root.join("oracle");
+            std::fs::create_dir(&oracle).unwrap();
+            let mut created = Vec::new();
+            crate::fs_entry::pin_parent_recording(&root.join("ours/new.txt"), &mut created)
+                .unwrap();
+            assert_eq!(created, vec![root.join("ours")]);
+            assert_eq!(mode_of(&root.join("ours")), mode_of(&oracle));
+            assert_eq!(mode_of(&root.join("ours")), 0o500);
+            // Restore access so the temp dir can be removed.
+            use std::os::unix::fs::PermissionsExt;
+            for dir in [&oracle, &root.join("ours")] {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        },
+    );
 }
 
 /// ATTACK 4: a new `120000` entry never chmods through the link.
