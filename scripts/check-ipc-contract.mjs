@@ -64,10 +64,6 @@ export const ORPHAN_ALLOWLIST = Object.freeze({
   // in case layout moves back to Rust.
   cmd_get_bezier_connector: "canvas draws connectors internally; geometry endpoint reserved",
 
-  // Unaddressed `git stash pop` targets stash@{0} sight-unseen. The UI
-  // pops through cmd_stash_action with the listed object id so a stale
-  // stack cannot destroy an entry the user did not choose.
-  cmd_stash_pop: "unaddressed pop is a footgun; UI uses cmd_stash_action with the listed OID",
   // Direct policy verdicts flow through runMutating()'s gate; this explicit
   // per-command check is reserved for harness diagnostics surfaces.
   cmd_policy_check_command: "policy gate reached via store mutations; direct endpoint reserved",

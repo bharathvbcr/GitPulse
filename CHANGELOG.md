@@ -30,6 +30,39 @@ before that tag is pushed.
 
 ### Added
 
+- `gitpulse_landed` answers whether a commit's work reached a base and how:
+  `via` is `merge` (decided before `ff`, so a non-tip commit of a `--no-ff`
+  branch reads merge), `ff`, `squash` (decided before `rebase`, so a
+  one-commit squash names its commit), `rebase`, or `tree` (the content is
+  already on the base: `git merge-tree --write-tree`, run in a quarantined
+  object directory that is deleted afterwards, so the repository's object
+  store is byte-identical before and after). `landed: false` is given only
+  when absence is provable; everything else is null with a `reason`
+  (`partial_clone_fetch_required`, `search_depth_exceeded`,
+  `content_not_provable`, `shallow_clone`, ...). `reverted` is true only when a
+  revert commit is found by ancestry (a reland reads false; no content
+  inference). `landed_at` comes from the base branch's own reflog, never
+  `HEAD`'s; an expired reflog, a landing older than the 1000 newest entries
+  and a base with no reflog give a reason (or the commit date, labelled)
+  instead of a wrong time. A partial clone is refused before any command that
+  could fetch.
+- `gitpulse_landed` round 2: a partial clone is detected by asking git for the
+  boolean (`yes`, `on`, `1`, any case and a bare key all count; an unreadable
+  value refuses) and every git it spawns carries `GIT_NO_LAZY_FETCH=1` as a
+  second fence; a net-empty branch that was cherry-picked reads `rebase`, not
+  false; an unrelated history reads `tree` when its tree is a base commit's and
+  otherwise null (`unrelated_history`), never false; `git diff`/`log -p` run
+  with `--no-textconv`; a revert of one commit of a `--no-ff` merge is found; a
+  clean "adds content" merge is absence only when the base never touched the
+  branch's paths since the fork (otherwise null, `content_not_provable`); a
+  revert chain longer than four is null (`revert_chain_exceeded`); a tag and a
+  branch of one name are read by the ref git's lookup picks. The quarantine
+  sweeps leftover directories (an hour old, its own name, this user's) when a
+  new one is made.
+- `engine::object_quarantine`: a reusable quarantined `GIT_OBJECT_DIRECTORY`
+  (alternates to the repository's objects, removed on every exit path) for git
+  commands that must write objects without writing the repository.
+- `gitpulse_provenance` gains `verified` (a verification note is attached).
 - `gitpulse_provenance` says where a commit sits relative to its base:
   `landed_on_base` / `on_base` (reachable from the base), `ahead`, `behind`,
   `merge_base` and `base_oid`, each null with `base_relation_reason` when it
@@ -45,6 +78,20 @@ before that tag is pushed.
   `limit` matches (one that matches nothing reads the whole ledger). The ledger
   gains two additive indexes (`ts_utc`, `action`) the next time a writer opens
   it; nothing else in the schema changes.
+
+### Changed
+
+- `gitpulse_provenance` `confidence` is null when the commit has no
+  verification note (it was 1.0 for an unverified tip). `distance` and
+  `is_fresh` are unchanged. A verification does not carry over a rewrite
+  (rebase, amend, squash): the new commit has none.
+
+### Removed
+
+- The unaddressed `cmd_stash_pop` IPC command and `GitWriter::stash_pop`. Nothing
+  called them: the menu, palette and native actions pop the listed entry by object
+  id through `cmd_stash_action`. Its generated `allow-cmd-stash-pop` permission goes
+  with it (derived from the handler list at build), and the registry is 284 handlers.
 
 ### Fixed
 

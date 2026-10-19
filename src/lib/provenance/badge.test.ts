@@ -54,6 +54,7 @@ function fresh(over: Partial<ProvenanceFreshness> = {}): ProvenanceFreshness {
     is_fresh: true,
     unmeasured_reason: "",
     notes_readable: true,
+    verified: false,
     verification: null,
     session: null,
     landed_on_base: null,

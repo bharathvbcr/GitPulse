@@ -153,5 +153,32 @@ fn a_batch_row_does_not_claim_a_relation_it_did_not_measure() {
     assert!(!rows[0].base_relation_reason.is_empty());
 }
 
+/// Every file under an object directory (loose objects, pack files and their
+/// indexes) with its bytes, in path order: the listing, the count and the
+/// content in one comparable value.
+fn object_files(root: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else {
+                let name = path.strip_prefix(root).unwrap().display().to_string();
+                out.push((name, std::fs::read(&path).expect("read")));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
 #[path = "provenance_adversarial_tests.rs"]
 mod adversarial;
+
+#[path = "provenance_landing_tests.rs"]
+mod landing;
+
+#[path = "provenance_adv_landed_tests.rs"]
+mod adv_round2;

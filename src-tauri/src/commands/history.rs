@@ -124,16 +124,6 @@ pub async fn cmd_stash_save(
     .await
 }
 
-#[tauri::command(async)]
-pub async fn cmd_stash_pop(repo_path: String) -> Result<Guarded<String>, IpcError> {
-    off_thread(move || {
-        let policy = guard(&repo_path, &["git", "stash", "pop"])?;
-        let output = GitWriter::stash_pop(&repo_path)?;
-        Ok(Guarded { policy, output })
-    })
-    .await
-}
-
 // --- stash -------------------------------------------------------------
 
 /// Lists the stash stack. Read-only and ungated.
