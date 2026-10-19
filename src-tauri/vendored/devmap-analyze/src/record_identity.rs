@@ -67,7 +67,13 @@ mod tests {
         for c in EVIDENCE_CATEGORIES {
             assert!(is_evidence_category(c), "{c}");
         }
-        for s in ["", "rg_declaration_only ", "Rg_declaration_only", "prose here", "a/b"] {
+        for s in [
+            "",
+            "rg_declaration_only ",
+            "Rg_declaration_only",
+            "prose here",
+            "a/b",
+        ] {
             assert!(!is_evidence_category(s), "{s:?}");
         }
     }

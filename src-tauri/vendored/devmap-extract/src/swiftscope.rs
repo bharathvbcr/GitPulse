@@ -59,6 +59,7 @@ pub(crate) fn reset() {
     IN_PROGRESS.with(|open| open.borrow_mut().clear());
     FILE_INDEX.with(|index| index.borrow_mut().clear());
     ALIAS_INDEX.with(|index| index.borrow_mut().clear());
+    crate::langdecl::swift::reset_roles();
 }
 
 /// What one file declares that a scope's own bindings cannot say: the written

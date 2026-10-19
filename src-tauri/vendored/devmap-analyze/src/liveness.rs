@@ -1263,8 +1263,10 @@ fn external_supertypes<'e>(
             continue;
         }
         // A dotted base arrives as one `Heritage` reference per segment over
-        // one span, innermost first (`Function`, `autograd`, `torch`), so the
-        // written base is the segments reversed; the bare name is the first.
+        // one span. Python records the member first and the qualifier from the
+        // root down (`Function`, `torch`, `autograd`); the other languages
+        // record it innermost first (`Function`, `autograd`, `torch`), so the
+        // written base is the segments reversed. The bare name is the first.
         let mut bases: Vec<(&str, usize, Vec<&str>)> = Vec::new();
         for reference in &ext.references {
             // `implements` names an interface, which has no code to call with.
@@ -1289,10 +1291,26 @@ fn external_supertypes<'e>(
         }
         for (declarer, _, segments) in bases {
             let base = segments[0].rsplit('.').next().unwrap_or(segments[0]);
-            if base.is_empty() || supertype_dispatches_nothing(base) {
+            // A base no name denotes is a marker for the resolver's MRO walk,
+            // not a supertype this report can name.
+            if base.is_empty()
+                || base == devmap_extract::model::OPAQUE_BASE
+                || supertype_dispatches_nothing(base)
+            {
                 continue;
             }
-            let written: Vec<&str> = segments.iter().rev().copied().collect();
+            // A Python base is the member first and then the qualifier from
+            // the root down, so the written path is the qualifier and then the
+            // member; the other languages record theirs innermost first.
+            let written: Vec<&str> = if ext.code_language() == "python" {
+                segments[1..]
+                    .iter()
+                    .chain(&segments[..1])
+                    .copied()
+                    .collect()
+            } else {
+                segments.iter().rev().copied().collect()
+            };
             if devmap_extract::wiring::known_dispatch_contract(&import_qualified(ext, &written)) {
                 continue;
             }
@@ -2900,6 +2918,27 @@ fn android_component_reason(
     })
 }
 
+/// Bare names of the Swift types that state any supertype anywhere in the
+/// corpus, an `extension T: P` included. The extractor records the declaring
+/// type of a heritage clause by its name, so a conformance written in another
+/// file than the type still lands on the type's bare name.
+fn swift_types_with_supertypes(extractions: &[Extraction]) -> HashSet<String> {
+    extractions
+        .iter()
+        .filter(|ext| ext.language == "swift")
+        .flat_map(|ext| ext.references.iter())
+        .filter(|reference| {
+            matches!(
+                reference.kind,
+                ReferenceKind::Heritage | ReferenceKind::HeritageInterface
+            )
+        })
+        .filter_map(|reference| reference.enclosing_symbol.as_deref())
+        .filter_map(|enclosing| enclosing.rsplit("::").next())
+        .map(str::to_string)
+        .collect()
+}
+
 fn symbol_exemption_index(
     extractions: &[Extraction],
     resolution: &ResolutionResult,
@@ -2916,6 +2955,7 @@ fn symbol_exemption_index(
     let go_build_variants = go_build_variant_identities(extractions);
     let go_value_mentions = go_value_mentioned_names(extractions);
     let go_exported_specs = go_exported_interface_specs(extractions);
+    let swift_conforming = swift_types_with_supertypes(extractions);
 
     // The one annotation kind whose target lives in a *different* file from the
     // one that carries it: `[project.scripts] cli = "pkg.mod:func"` is written
@@ -3045,6 +3085,27 @@ fn symbol_exemption_index(
                 })
                 .or_else(|| android_component_reason(ext, sym, &android_components))
                 .or(heritage)
+                // A synthesized `Codable`, `Equatable` or `Hashable` conformance
+                // reads every stored property of its type, private ones
+                // included — and the conformance may be declared by an
+                // `extension` in any file of the module, which only this
+                // corpus-wide join can see. Any supertype counts: the one named
+                // may itself inherit one of them (`protocol Model: Codable`).
+                .or_else(|| {
+                    (ext.language == "swift"
+                        && !sym.is_exported
+                        && sym.signature.as_deref()
+                            == Some(devmap_extract::model::SWIFT_STORED_PROPERTY)
+                        && sym
+                            .parent_symbol
+                            .as_deref()
+                            .and_then(|parent| parent.rsplit("::").next())
+                            .is_some_and(|owner| swift_conforming.contains(owner)))
+                    .then(|| {
+                        "Swift private stored property of a type with supertypes — a synthesized conformance reads every stored property"
+                            .to_string()
+                    })
+                })
                 .or_else(|| {
                     go_interface_exemptions
                         .get(sym.qualified_name.as_str())

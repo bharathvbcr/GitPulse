@@ -74,6 +74,10 @@ mod returns;
 // tree; its one caller is `treesitter::collect_site_bindings`.
 #[cfg(feature = "parse")]
 mod literals;
+// How a JS/TS module-scope object is built (spread, `Object.assign`, alias).
+// Walks a parse tree; its one caller is `treesitter::extract_treesitter`.
+#[cfg(feature = "parse")]
+mod jsobjects;
 pub mod pyproject;
 #[cfg(feature = "parse")]
 mod rustlocal;

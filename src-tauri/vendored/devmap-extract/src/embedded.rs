@@ -970,6 +970,12 @@ fn absorb(extraction: &mut Extraction, inner: Extraction, offset: usize) {
     );
     extraction.scope_locals.extend(inner.scope_locals);
     extraction
+        .js_objects
+        .extend(inner.js_objects.into_iter().map(|mut fact| {
+            fact.start_byte = fact.start_byte.saturating_add(offset);
+            fact
+        }));
+    extraction
         .local_bindings
         .extend(inner.local_bindings.into_iter().map(|mut binding| {
             binding.start_byte = binding.start_byte.saturating_add(offset);
@@ -1045,6 +1051,9 @@ pub(crate) fn reorder_after_merge(extraction: &mut Extraction) {
     });
     extraction.scope_locals.sort();
     extraction.scope_locals.dedup();
+    extraction
+        .js_objects
+        .sort_by_key(|fact| (fact.start_byte, !fact.declaration));
     extraction.local_bindings.sort();
     extraction.local_bindings.dedup();
 }

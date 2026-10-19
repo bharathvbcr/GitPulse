@@ -795,17 +795,34 @@ fn extract_treesitter_before_deadline(
                     });
                 }
 
+                // The names the exports so far publish, kept as sets so each
+                // exported symbol asks one lookup instead of scanning every
+                // export: a type with tens of thousands of exported members made
+                // this loop quadratic (30,000 Swift properties spent most of
+                // their extraction here).
+                let mut published_as: std::collections::HashSet<String> = exports
+                    .iter()
+                    .map(|export| export.exported_name.clone())
+                    .collect();
+                let mut published_from: std::collections::HashSet<String> = exports
+                    .iter()
+                    .filter(|export| {
+                        export.module_specifier.is_none() && export.exported_name != "default"
+                    })
+                    .filter_map(|export| export.local_name.clone())
+                    .collect();
                 for symbol in symbols.iter().filter(|symbol| symbol.is_exported) {
                     // A symbol already published under another name —
                     // `export { local as Public }` — is not also exported as
                     // itself. Matching on `exported_name` alone fabricated a
                     // second export, `local`, that the module never declared.
-                    if !exports.iter().any(|export| {
-                        export.exported_name == symbol.name
-                            || (export.module_specifier.is_none()
-                                && export.exported_name != "default"
-                                && export.local_name.as_deref() == Some(symbol.name.as_str()))
-                    }) {
+                    if !published_as.contains(&symbol.name)
+                        && !published_from.contains(&symbol.name)
+                    {
+                        published_as.insert(symbol.name.clone());
+                        if symbol.name != "default" {
+                            published_from.insert(symbol.name.clone());
+                        }
                         exports.push(ExtractedExport {
                             exported_name: symbol.name.clone(),
                             local_name: Some(symbol.name.clone()),
@@ -832,11 +849,22 @@ fn extract_treesitter_before_deadline(
                     );
                     rust_calls_through_fn_pointer_items(root, source, &mut calls);
                 }
+                // Ties on a span break by name, except for a Python base: its
+                // segments share the base's one span and their emission order
+                // (member, then the qualifier from the root down) is what says which
+                // segment is the class, so the sort keeps it.
+                fn tie_name<'r>(lang: &str, reference: &'r ExtractedReference) -> &'r str {
+                    if lang == "python" && reference.kind == ReferenceKind::Heritage {
+                        ""
+                    } else {
+                        reference.name.as_str()
+                    }
+                }
                 references.sort_by(|a, b| {
-                    (a.span.start_byte, a.span.end_byte, &a.name).cmp(&(
+                    (a.span.start_byte, a.span.end_byte, tie_name(lang, a)).cmp(&(
                         b.span.start_byte,
                         b.span.end_byte,
-                        &b.name,
+                        tie_name(lang, b),
                     ))
                 });
 
@@ -969,6 +997,11 @@ fn extract_treesitter_before_deadline(
                     local_bindings,
                     source_code: Some(source.to_string()),
                     literals: Vec::new(),
+                    js_objects: if matches!(lang, "javascript" | "typescript" | "tsx") {
+                        crate::jsobjects::collect(root, source)
+                    } else {
+                        Vec::new()
+                    },
                 };
 
                 // The code inside a template language's `<script>` blocks, in
@@ -1665,7 +1698,17 @@ fn python_bound_names(target: Node, source: &str) -> Vec<String> {
                     names.push(name);
                 }
             }
-            "pattern_list" | "tuple_pattern" | "list_pattern" | "list_splat_pattern" => {
+            // `tuple` and `as_pattern_target` are the shapes a `with … as (A, B)`
+            // alias and an `except … as e` alias are parsed into.
+            "pattern_list"
+            | "tuple_pattern"
+            | "list_pattern"
+            | "list_splat_pattern"
+            | "tuple"
+            | "list"
+            | "expression_list"
+            | "parenthesized_expression"
+            | "as_pattern_target" => {
                 let mut cursor = node.walk();
                 let children: Vec<Node> = node.named_children(&mut cursor).collect();
                 stack.extend(children.into_iter().rev());
@@ -1674,6 +1717,301 @@ fn python_bound_names(target: Node, source: &str) -> Vec<String> {
         }
     }
     names
+}
+
+/// The names a `case` pattern captures: a bare name (`case [A, _]`, `case x as
+/// A`, `case {'k': A}`, `case P(x=A)`, `case [*A]`, `case {**A}`), never the
+/// class of a class pattern (`case A()`), a dotted value (`case m.n`) or a
+/// keyword (`x` in `P(x=A)`).
+fn python_pattern_captures(pattern: Node, source: &str, out: &mut Vec<String>) {
+    let mut stack = vec![pattern];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        let children: Vec<Node> = node.named_children(&mut cursor).collect();
+        match node.kind() {
+            "dotted_name" => {
+                if let [only] = children.as_slice() {
+                    out.push(get_node_text(*only, source));
+                }
+            }
+            "splat_pattern" => {
+                if let Some(name) = children.first().filter(|c| c.kind() == "identifier") {
+                    out.push(get_node_text(*name, source));
+                }
+            }
+            "as_pattern" => {
+                if let Some(alias) = children.last().filter(|c| c.kind() == "identifier") {
+                    out.push(get_node_text(*alias, source));
+                }
+                stack.extend(children.first());
+            }
+            // The first child is the class (or the keyword), the rest are patterns.
+            "class_pattern" | "keyword_pattern" => stack.extend(children.into_iter().skip(1)),
+            "string" | "concatenated_string" | "integer" | "float" => {}
+            _ => stack.extend(children),
+        }
+    }
+}
+
+/// How a module-scope binding binds, and where.
+#[derive(Debug, Clone)]
+struct PythonBinding {
+    name: String,
+    /// Byte offset of the binding statement; `0` for a binding a function makes
+    /// through `global`, which may run at any time.
+    at: usize,
+}
+
+/// What a Python file's module scope says about the names it binds, computed
+/// once per file ([`python_file_facts`]) and read by every decorator, base and
+/// scope-local question about that file.
+#[derive(Debug, Default)]
+struct PythonFileFacts {
+    /// Every module-scope binding of a name: assignment, `def`, `class`,
+    /// import, `for`/`with`/`except` target, walrus, `del`, `match` capture, and
+    /// a name a function both declares `global` and binds. Not a `from
+    /// builtins import X` or `import builtins`, which bind the builtins
+    /// themselves.
+    bindings: Vec<PythonBinding>,
+    /// Local names bound to the `builtins` module (`import builtins [as b]`).
+    builtins_modules: Vec<PythonBinding>,
+    /// `from builtins import X [as L]`: `(L, X)` and where.
+    builtins_members: Vec<(PythonBinding, String)>,
+    /// Module-scope imports: local name -> the module (or member) each binds it
+    /// to, spelled as the import system names it.
+    imports: BTreeMap<String, Vec<String>>,
+    /// The names bound other than by a plain assignment, `def`, `class` or
+    /// import (and by a function through `global`): what the resolver must read
+    /// as "this module-scope name may hold something else", emitted as
+    /// file-scope locals.
+    rebound: BTreeSet<String>,
+}
+
+impl PythonFileFacts {
+    /// Whether a binding of `name` other than the builtins' own is written
+    /// textually before `at`.
+    fn binds_before(&self, name: &str, at: usize) -> bool {
+        self.bindings
+            .iter()
+            .any(|binding| binding.name == name && binding.at < at)
+    }
+
+    /// Whether `name`, read at `at`, is the `builtins` module.
+    fn names_builtins_module(&self, name: &str, at: usize) -> bool {
+        (name == "builtins"
+            || self
+                .builtins_modules
+                .iter()
+                .any(|bound| bound.name == name && bound.at < at))
+            && !self.binds_before(name, at)
+    }
+
+    /// The builtin (`staticmethod`/`classmethod`) the bare name `name`, read at
+    /// `at`, is: itself unless a binding precedes it, or the member a `from
+    /// builtins import X as name` bound.
+    fn builtin_for_bare_name(&self, name: &str, at: usize) -> Option<String> {
+        if self.binds_before(name, at) {
+            return None;
+        }
+        self.builtins_members
+            .iter()
+            .find(|(bound, _)| bound.name == name && bound.at < at)
+            .map(|(_, original)| original.clone())
+            .or_else(|| Some(name.to_string()))
+    }
+}
+
+thread_local! {
+    /// The facts of the file being extracted, with the identity of the tree
+    /// they were read from. Cleared between files with the scope-local cache:
+    /// a node id is an address that a later tree reuses.
+    static PYTHON_FILE_FACTS: RefCell<Option<((usize, usize, usize), std::rc::Rc<PythonFileFacts>)>> =
+        const { RefCell::new(None) };
+}
+
+/// The module-scope facts of the file `root` is the tree of, computed on first
+/// use. Every question about a file's names asks this, so a file with thousands
+/// of decorated methods reads its bindings once, not once per method.
+fn python_file_facts(root: Node, source: &str) -> std::rc::Rc<PythonFileFacts> {
+    let key = (root.id(), source.as_ptr() as usize, source.len());
+    if let Some(known) = PYTHON_FILE_FACTS.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|(known, _)| *known == key)
+            .map(|(_, facts)| facts.clone())
+    }) {
+        return known;
+    }
+    let facts = std::rc::Rc::new(python_read_file_facts(root, source));
+    PYTHON_FILE_FACTS.with(|cache| *cache.borrow_mut() = Some((key, facts.clone())));
+    facts
+}
+
+/// One walk of each scope (the module, then every function and class body it
+/// reaches) into [`PythonFileFacts`].
+///
+/// A scope's walk does not enter a nested function, class or lambda: those are
+/// other scopes, queued, and their only effect on the module is a name they
+/// declare `global` and then bind. A comprehension is not a scope for a
+/// walrus, so the walk enters it; its own `for` target is not a `for_statement`
+/// and binds nothing here.
+fn python_read_file_facts(root: Node, source: &str) -> PythonFileFacts {
+    // `(name, at, is_rebinding)`: a rebinding is one the resolver's tables
+    // would not otherwise carry.
+    type Bound = (String, usize, bool);
+    let mut facts = PythonFileFacts::default();
+    let mut scopes: Vec<(Node, bool)> = vec![(root, true)];
+    while let Some((scope, is_module)) = scopes.pop() {
+        let mut bound: Vec<Bound> = Vec::new();
+        let mut globals: BTreeSet<String> = BTreeSet::new();
+        let mut work: Vec<Node> = Vec::new();
+        fn body<'t>(node: Node<'t>) -> Vec<Node<'t>> {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor).collect()
+        }
+        work.extend(body(scope).into_iter().rev());
+        while let Some(node) = work.pop() {
+            let at = node.start_byte();
+            let targets = |target: Option<Node>, rebinding: bool, bound: &mut Vec<Bound>| {
+                if let Some(target) = target {
+                    for name in python_bound_names(target, source) {
+                        bound.push((name, at, rebinding));
+                    }
+                }
+            };
+            match node.kind() {
+                "function_definition" | "class_definition" => {
+                    if let Some(name) = node.child_by_field_name("name") {
+                        bound.push((get_node_text(name, source), at, false));
+                    }
+                    scopes.push((node, false));
+                    // Everything but the body (parameters, bases) is read here.
+                    let inner = node.child_by_field_name("body");
+                    work.extend(
+                        body(node)
+                            .into_iter()
+                            .rev()
+                            .filter(|child| inner.is_none_or(|b| b.id() != child.id())),
+                    );
+                    continue;
+                }
+                "lambda" => continue,
+                "global_statement" => {
+                    let mut cursor = node.walk();
+                    globals.extend(
+                        node.named_children(&mut cursor)
+                            .filter(|child| child.kind() == "identifier")
+                            .map(|child| get_node_text(child, source)),
+                    );
+                }
+                "for_statement" => targets(node.child_by_field_name("left"), true, &mut bound),
+                "with_item" | "except_clause" | "except_group_clause" => targets(
+                    node.child_by_field_name("value")
+                        .or_else(|| node.named_child(0))
+                        .filter(|value| value.kind() == "as_pattern")
+                        .and_then(|value| value.child_by_field_name("alias")),
+                    true,
+                    &mut bound,
+                ),
+                "named_expression" => targets(node.child_by_field_name("name"), true, &mut bound),
+                "delete_statement" => targets(node.named_child(0), true, &mut bound),
+                "case_clause" => {
+                    let mut names = Vec::new();
+                    let mut cursor = node.walk();
+                    for pattern in node
+                        .named_children(&mut cursor)
+                        .filter(|child| child.kind() == "case_pattern")
+                    {
+                        python_pattern_captures(pattern, source, &mut names);
+                    }
+                    bound.extend(names.into_iter().map(|name| (name, at, true)));
+                }
+                "assignment" | "augmented_assignment" => {
+                    targets(node.child_by_field_name("left"), false, &mut bound)
+                }
+                "import_statement" => {
+                    let mut cursor = node.walk();
+                    for target in node.children_by_field_name("name", &mut cursor) {
+                        let (local, module) = match target.kind() {
+                            "aliased_import" => (
+                                target.child_by_field_name("alias"),
+                                target.child_by_field_name("name"),
+                            ),
+                            _ => (target.named_child(0), Some(target)),
+                        };
+                        let (Some(local), Some(module)) = (local, module) else {
+                            continue;
+                        };
+                        let local = get_node_text(local, source);
+                        let module = python_module_path(module, source);
+                        if is_module {
+                            let root_name = if target.kind() == "aliased_import" {
+                                module.clone()
+                            } else {
+                                local.clone()
+                            };
+                            facts
+                                .imports
+                                .entry(local.clone())
+                                .or_default()
+                                .push(root_name);
+                            if module == "builtins" {
+                                facts
+                                    .builtins_modules
+                                    .push(PythonBinding { name: local, at });
+                                continue;
+                            }
+                        }
+                        bound.push((local, at, false));
+                    }
+                }
+                "import_from_statement" => {
+                    let module = node
+                        .child_by_field_name("module_name")
+                        .map(|module| python_module_path(module, source))
+                        .unwrap_or_default();
+                    let (imported, locals) = python_import_bindings(node, source);
+                    for (imported, local) in imported.into_iter().zip(locals) {
+                        if is_module {
+                            facts
+                                .imports
+                                .entry(local.clone())
+                                .or_default()
+                                .push(format!("{module}.{imported}"));
+                            if module == "builtins" {
+                                facts
+                                    .builtins_members
+                                    .push((PythonBinding { name: local, at }, imported));
+                                continue;
+                            }
+                        }
+                        bound.push((local, at, false));
+                    }
+                }
+                _ => {}
+            }
+            work.extend(body(node).into_iter().rev());
+        }
+        if is_module {
+            for (name, at, rebinding) in bound {
+                if rebinding {
+                    facts.rebound.insert(name.clone());
+                }
+                facts.bindings.push(PythonBinding { name, at });
+            }
+        } else {
+            // A function or class body binds the module's name only for a name
+            // it declares `global` AND binds: `global A` alone binds nothing.
+            for (name, _, _) in bound {
+                if globals.contains(&name) {
+                    facts.rebound.insert(name.clone());
+                    facts.bindings.push(PythonBinding { name, at: 0 });
+                }
+            }
+        }
+    }
+    facts
 }
 
 /// A Python module path as the import system reads it — `pkg.mod`, `.sibling`,
@@ -2158,6 +2496,7 @@ fn unparsed_extraction(
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
         literals: Vec::new(),
+        js_objects: Vec::new(),
     }
 }
 
@@ -2375,6 +2714,7 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
         literals: Vec::new(),
+        js_objects: Vec::new(),
     }
 }
 
@@ -3022,8 +3362,33 @@ fn member_access_receiver(node: Node, source: &str) -> Option<String> {
         let navigation =
             bounded_parent(parent).filter(|nav| nav.kind() == "navigation_expression")?;
         let target = navigation.child_by_field_name("target")?;
-        let text = receiver_identity(target, source, 0);
+        // A key path names its member through the root type written after the
+        // backslash: `\S.secret` reads `S.secret`, and `\.secret` names no root.
+        if target.kind() == "key_path_expression" {
+            let mut cursor = target.walk();
+            let root = target
+                .named_children(&mut cursor)
+                .find(|child| matches!(child.kind(), "type_identifier" | "user_type"))
+                .map(|child| get_node_text(child, source));
+            return root.filter(|root| !root.is_empty());
+        }
+        // `p.a + q.b` parses as `((p.a + q).b)`: the sum is the target of the
+        // member access, which binds tighter than `+`. The receiver is the
+        // right operand (and what follows it), as `langcalls::swift` reads it
+        // for a call.
+        if let Some(tail) = crate::langcalls::swift::swift_sum_tail(target) {
+            return source
+                .get(tail.start_byte()..target.end_byte())
+                .and_then(crate::langcalls::scope::clamp_receiver);
+        }
+        let operand = crate::langcalls::swift::swift_call_operand(target);
+        let text = receiver_identity(operand, source, 0);
         return (!text.is_empty()).then_some(text);
+    }
+    // The member of a leading-dot expression (`.circle(1)`) names a member of
+    // the type the expression is written against, where that type is stated.
+    if parent.kind() == "prefix_expression" && swift_leading_dot_member(node, source) {
+        return swift_leading_dot_context(node, source);
     }
     // Kotlin's `callable_reference` has no fields either: `Type::m` names the
     // receiver type in its first named child and the member in its last.
@@ -3137,6 +3502,40 @@ fn python_enclosing_superclasses(node: Node, source: &str) -> Vec<String> {
         ancestor = bounded_parent(parent);
     }
     Vec::new()
+}
+
+/// A base written `written` (`autograd.Function`, `nn.Module`, `Function`) with
+/// its first segment replaced by what the file's module-scope imports bind it
+/// to (`torch.autograd.Function` under `from torch import autograd`), so the
+/// dispatch registry matches the library and not a spelling. `None` when an
+/// import binds the root to something outside `torch` (`from local import
+/// autograd` makes `autograd.Function` the repository's own class). A root no
+/// import binds is returned as written: a name declared in the file, or a
+/// global.
+///
+/// Read from [`python_file_facts`], so a function-scope import of the same
+/// name does not change the module-level reading, and the file's imports are
+/// read once per file rather than once per method.
+fn python_torch_qualified_base(node: Node, written: &str, source: &str) -> Option<String> {
+    let (root_name, rest) = match written.trim().split_once('.') {
+        Some((root_name, rest)) => (root_name.trim(), Some(rest)),
+        None => (written.trim(), None),
+    };
+    let facts = python_file_facts(python_tree_root(node), source);
+    let Some(bound) = facts.imports.get(root_name) else {
+        return Some(written.trim().to_string());
+    };
+    if !bound
+        .iter()
+        .all(|module| module == "torch" || module.starts_with("torch."))
+    {
+        return None;
+    }
+    let first = bound.first()?;
+    Some(match rest {
+        Some(rest) => format!("{first}.{rest}"),
+        None => first.clone(),
+    })
 }
 
 fn enclosing_type_name(node: Node, source: &str) -> Option<String> {
@@ -3886,7 +4285,7 @@ fn rust_crate_private_scopes(
 ///
 /// Module-level bindings are public API surface; a constant declared inside a
 /// function is a local and belongs in nobody's graph.
-fn is_module_level(node: Node) -> bool {
+pub(crate) fn is_module_level(node: Node) -> bool {
     let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         if is_callable_node(parent) {
@@ -4320,7 +4719,10 @@ fn extract_node(
                     if is_method {
                         if let Some(reason) = python_enclosing_superclasses(node, source)
                             .iter()
-                            .find_map(|base| crate::wiring::python_base_dispatch_reason(base, &n))
+                            .find_map(|base| {
+                                let qualified = python_torch_qualified_base(node, base, source)?;
+                                crate::wiring::python_base_dispatch_reason(&qualified, &n)
+                            })
                         {
                             wiring.push(WiringAnnotation {
                                 kind: WiringKind::RuntimeEntryPoint,
@@ -5810,7 +6212,12 @@ fn extract_node(
                         file_symbol_name,
                     ),
                     docstring: None,
-                    signature: None,
+                    // A Swift member property says so, and whether it stores a
+                    // value: it shares `Field` with an enum case.
+                    signature: (lang == "swift")
+                        .then(|| crate::langdecl::swift::property_signature(node))
+                        .flatten()
+                        .map(str::to_string),
                     parent_symbol: Some(declaration.parent_symbol(file_symbol_name)),
                     body_signature: None,
                     declaration_hash: None,
@@ -9338,6 +9745,11 @@ fn maybe_push_name_reference(
         || is_inside_import_or_export(node)
         || is_call_callee(node)
         || rust_macro_member_name(node, lang)
+        // Last: a declaration's own name is refused above and never pays for
+        // the extra ancestor walk.
+        || (lang == "swift"
+            && swift_leading_dot_member(node, source)
+            && swift_leading_dot_context(node, source).is_none())
     {
         return;
     }
@@ -9592,6 +10004,99 @@ fn c_declarator_declaration(node: Node) -> Option<Node> {
     climbed.then_some(current)
 }
 
+/// Whether `node` is the member of a Swift leading-dot expression: the
+/// `minute` of `f(.minute)` or the `size` of `return .size`.
+///
+/// tree-sitter-swift parses `.minute` as a `prefix_expression` whose target is
+/// the bare identifier, so it looked exactly like a bare read of `minute`. A
+/// leading-dot member names a case or static member of the *contextual* type —
+/// a type this extractor cannot see — so it is no reference to any declaration
+/// that merely shares the spelling: a free function `minute`, or a property
+/// `size` of the type the expression is written inside.
+fn swift_leading_dot_member(node: Node, source: &str) -> bool {
+    let Some(parent) = bounded_parent(node) else {
+        return false;
+    };
+    parent.kind() == "prefix_expression"
+        && source
+            .get(parent.start_byte()..node.start_byte())
+            .is_some_and(|operator| operator.trim() == ".")
+}
+
+/// The type a Swift leading-dot expression is written against, when the source
+/// states it: `Shape` for the `.circle(1)` of `func unit() -> Shape { .circle(1) }`
+/// (an implicit or explicit `return`), of `var v: Shape = .circle(1)` and of
+/// `var w: Shape { .square }`.
+///
+/// Anything else — an argument (`f(.minute)`, whose parameter type is the
+/// callee's), an assignment, a `switch` pattern — has no contextual type this
+/// extractor can read, and the member then names nothing. Only a plain
+/// capitalised type name counts: an optional, an array or a generic names a
+/// different thing than the member's owner.
+fn swift_leading_dot_context(node: Node, source: &str) -> Option<String> {
+    let simple_type = |ty: Node| -> Option<String> {
+        if ty.kind() != "user_type" || ty.named_child_count() != 1 {
+            return None;
+        }
+        let name = ty
+            .named_child(0)
+            .filter(|n| n.kind() == "type_identifier")?;
+        let name = get_node_text(name, source);
+        // A generic parameter of the enclosing function or type stands for any
+        // type: a real `struct T` elsewhere is not what `-> T` names there.
+        if crate::swiftscope::is_generic_parameter(node, source, &name) {
+            return None;
+        }
+        name.chars()
+            .next()
+            .is_some_and(char::is_uppercase)
+            .then_some(name)
+    };
+    let mut current = bounded_parent(node)?;
+    let mut returned = false;
+    for _ in 0..8 {
+        let parent = bounded_parent(current)?;
+        match parent.kind() {
+            // `.circle(1)`: the member is the callee, the call is the value.
+            "call_expression"
+                if parent
+                    .named_child(0)
+                    .is_some_and(|c| c.id() == current.id()) => {}
+            "control_transfer_statement"
+                if source
+                    .get(parent.start_byte()..parent.end_byte())
+                    .is_some_and(|text| text.trim_start().starts_with("return")) =>
+            {
+                returned = true;
+            }
+            // An implicit return is the body's last expression.
+            "statements"
+                if returned
+                    || parent
+                        .named_child(parent.named_child_count().checked_sub(1)?)
+                        .is_some_and(|last| last.id() == current.id()) => {}
+            "function_body" | "computed_property" | "computed_getter" => {}
+            "function_declaration" => {
+                let mut cursor = parent.walk();
+                let returns = parent
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "user_type");
+                return returns.and_then(simple_type);
+            }
+            "property_declaration" => {
+                let mut cursor = parent.walk();
+                let annotation = parent
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "type_annotation")?;
+                return annotation.child_by_field_name("name").and_then(simple_type);
+            }
+            _ => return None,
+        }
+        current = parent;
+    }
+    None
+}
+
 /// Whether `node` is a call's argument label — the `x` of Python `f(x=…)`,
 /// C# `F(x: …)` and `[A(x = …)]`, R and PHP `f(x = …)` / `f(x: …)`, Solidity
 /// `f({x: …})`, Scala `T[x = …]`.
@@ -9607,16 +10112,20 @@ fn c_declarator_declaration(node: Node) -> Option<Node> {
 /// fabricated read of whatever shares its name.
 fn is_argument_label(node: Node) -> bool {
     bounded_parent(node).is_some_and(|parent| {
-        matches!(
-            parent.kind(),
-            "keyword_argument"
-                | "argument"
-                | "attribute_argument"
-                | "call_struct_argument"
-                | "named_type_argument"
-        ) && parent
-            .child_by_field_name("name")
-            .is_some_and(|label| label.id() == node.id())
+        // Swift's `f(count: 1)` wraps the label in its own node:
+        // `value_argument > name: value_argument_label > simple_identifier`, so
+        // the label is never on a `name` field of the identifier's own parent.
+        parent.kind() == "value_argument_label"
+            || (matches!(
+                parent.kind(),
+                "keyword_argument"
+                    | "argument"
+                    | "attribute_argument"
+                    | "call_struct_argument"
+                    | "named_type_argument"
+            ) && parent
+                .child_by_field_name("name")
+                .is_some_and(|label| label.id() == node.id()))
     })
 }
 
@@ -10084,6 +10593,7 @@ fn take_nesting_cap_notes() -> Vec<String> {
 fn reset_scope_locals() {
     crate::swiftscope::reset();
     SCOPE_LOCALS.with(|cache| cache.borrow_mut().clear());
+    PYTHON_FILE_FACTS.with(|cache| *cache.borrow_mut() = None);
 }
 
 /// Number of cached scopes. Test-only: the clear has no other observable effect
@@ -10222,6 +10732,19 @@ fn is_symbol_binding(node: Node, source: &str) -> bool {
     // Same reasoning for Objective-C, whose class names and selector parts are
     // unnamed children rather than declarator chains.
     if is_objc_declaring_identifier(node) {
+        return true;
+    }
+    // A Swift member property is a `Field` symbol. Filed as a file-scope local
+    // instead, its own name shadowed every bare read of it written outside a
+    // function body — a computed property's getter, a property initializer —
+    // and the read was dropped before the resolver saw it.
+    //
+    // An enum case is the same: it is a symbol, so its own spelling is no local
+    // either, and `.circle` in a property initializer must not be dropped
+    // because `case circle` is declared in the same file.
+    if crate::langdecl::swift::property_declaration_of(node).is_some()
+        || crate::langdecl::swift::is_enum_case_name(node)
+    {
         return true;
     }
     let Some(parent) = bounded_parent(node) else {
@@ -11461,6 +11984,30 @@ fn collect_scope_locals(
                 .extend(module_names);
         }
     }
+    // A Python module-scope name bound by a `for`/`with`/`except` target, a
+    // walrus, a `del` or a `global` declaration is a binding of the file itself,
+    // keyed by the file's own name as the JS/TS ones are. None of them is a
+    // symbol, so without this a name an import brought in could be rebound
+    // beneath the resolver without a trace.
+    if lang == "python" {
+        let facts = python_file_facts(root, source);
+        if !facts.rebound.is_empty() {
+            by_scope
+                .entry(file_symbol_name.to_string())
+                .or_default()
+                .extend(facts.rebound.iter().cloned());
+        }
+        // What `from this_module import *` takes, when `__all__` says: filed
+        // under a scope no symbol can have (`{file}::__all__`), so a reader that
+        // asks about a real scope never sees it.
+        let all = python_all_exports(source);
+        if !all.is_empty() {
+            by_scope
+                .entry(format!("{file_symbol_name}::__all__"))
+                .or_default()
+                .extend(all);
+        }
+    }
     by_scope
         .into_iter()
         .flat_map(|(scope, locals)| locals.into_iter().map(move |local| (scope.clone(), local)))
@@ -11627,9 +12174,236 @@ fn is_call_callee(node: Node) -> bool {
     false
 }
 
+/// The field a Python `self.name = callee(..)` assigns, spelled `self.name`,
+/// when `origin` is the callee of the call that is the assignment's whole
+/// right-hand side.
+///
+/// Spelled with the `self.` prefix so it can never equal a local's name: the
+/// receiver maps key a local by its bare name, and a field is not in scope as
+/// a variable (Swift's `swift_assignment_binding` refuses the same spelling for
+/// that reason). The resolver reads the prefix and routes the initializer to
+/// the owning class's field table instead.
+///
+/// Only the direct right-hand side counts. `self.xs = [Engine()]` holds a list,
+/// `self.e = wrap(Engine())` holds what `wrap` returns, and
+/// `self.e = Engine() if c else None` is not one type: binding any of them to
+/// the inner call would type the field wrongly, and nothing here can tell a
+/// wrapper from the value.
+fn python_self_field_binding(assignment: Node, origin: Node, source: &str) -> Option<String> {
+    let left = assignment.child_by_field_name("left")?;
+    if left.kind() != "attribute" {
+        return None;
+    }
+    let object = left.child_by_field_name("object")?;
+    let attribute = left.child_by_field_name("attribute")?;
+    if object.kind() != "identifier"
+        || attribute.kind() != "identifier"
+        || get_node_text(object, source) != "self"
+    {
+        return None;
+    }
+    let right = assignment.child_by_field_name("right")?;
+    if right.kind() != "call" {
+        return None;
+    }
+    // The callee must be a name (`Engine`, `mod.make`): `A()()`, `A().build()`,
+    // `(lambda: A())()` and `fns[0]()` return what some other value returns,
+    // and the inner call is not that value.
+    let function = right.child_by_field_name("function")?;
+    if !python_is_dotted_name(function) || !python_self_names_an_instance(assignment, source) {
+        return None;
+    }
+    // The call itself, or its callee: an argument lies past the callee's end.
+    (origin.id() == right.id()
+        || (origin.start_byte() >= right.start_byte() && origin.end_byte() <= function.end_byte()))
+    .then(|| format!("self.{}", get_node_text(attribute, source)))
+}
+
+/// `name` or `a.b.c`, with nothing but identifiers in it.
+pub(crate) fn python_is_dotted_name(node: Node) -> bool {
+    match node.kind() {
+        "identifier" => true,
+        "attribute" => {
+            node.child_by_field_name("attribute")
+                .is_some_and(|attribute| attribute.kind() == "identifier")
+                && node
+                    .child_by_field_name("object")
+                    .is_some_and(python_is_dotted_name)
+        }
+        _ => false,
+    }
+}
+
+/// The name a Python parameter binds: `x`, `x: T`, `x=1`, `x: T = 1`.
+fn python_parameter_name<'a>(parameter: Node<'a>, source: &str) -> Option<String> {
+    match parameter.kind() {
+        "identifier" => Some(get_node_text(parameter, source)),
+        "typed_parameter" => parameter
+            .named_child(0)
+            .filter(|name| name.kind() == "identifier")
+            .map(|name| get_node_text(name, source)),
+        "default_parameter" | "typed_default_parameter" => parameter
+            .child_by_field_name("name")
+            .filter(|name| name.kind() == "identifier")
+            .map(|name| get_node_text(name, source)),
+        _ => None,
+    }
+}
+
+/// The root of the tree `node` is in.
+fn python_tree_root(node: Node) -> Node {
+    let mut root = node;
+    while let Some(parent) = bounded_parent(root) {
+        root = parent;
+    }
+    root
+}
+
+/// Whether `object`, the left side of `X.staticmethod`, read at byte `at`, is
+/// the `builtins` module: the name `builtins` or a module-scope `import builtins
+/// as X`, neither rebound before `at`, or the call `__import__('builtins')`.
+fn python_names_the_builtins_module(
+    object: Node,
+    at: usize,
+    facts: &PythonFileFacts,
+    source: &str,
+) -> bool {
+    match object.kind() {
+        "identifier" => facts.names_builtins_module(&get_node_text(object, source), at),
+        "call" => {
+            let named_import = object
+                .child_by_field_name("function")
+                .is_some_and(|function| get_node_text(function, source) == "__import__");
+            let mut cursor = object.walk();
+            let argument = object
+                .child_by_field_name("arguments")
+                .and_then(|arguments| arguments.named_children(&mut cursor).next());
+            named_import
+                && argument.is_some_and(|argument| {
+                    argument.kind() == "string"
+                        && get_node_text(argument, source).trim_matches(['"', '\'']) == "builtins"
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Whether a decorator makes its method take no instance: its expression is the
+/// builtin `staticmethod` or `classmethod`.
+///
+/// A bare name is the builtin unless the file binds it textually before the
+/// decorator (an import, a `def`, an assignment, a `for` target ...), or it is
+/// the member `from builtins import staticmethod [as sm]` bound. An attribute
+/// `X.staticmethod` is the builtin only when `X` is the `builtins` module
+/// ([`python_names_the_builtins_module`]): `deco.staticmethod` is some other
+/// object's attribute that merely shares the spelling. Any other expression
+/// leaves the method an instance method.
+///
+/// Read from the expression node, not the decorator's text: the text carries a
+/// trailing comment (`@classmethod  # build`), which is no part of the
+/// expression. The module's names come from [`python_file_facts`], read once
+/// per file.
+fn python_decorator_drops_instance(decorator: Node, source: &str) -> bool {
+    let mut cursor = decorator.walk();
+    let expression = decorator
+        .named_children(&mut cursor)
+        .find(|child| child.kind() != "comment");
+    let is_builtin_name = |name: &str| matches!(name, "staticmethod" | "classmethod");
+    let Some(expression) = expression.filter(|e| matches!(e.kind(), "identifier" | "attribute"))
+    else {
+        return false;
+    };
+    let facts = python_file_facts(python_tree_root(decorator), source);
+    let at = decorator.start_byte();
+    match expression.kind() {
+        "identifier" => facts
+            .builtin_for_bare_name(&get_node_text(expression, source), at)
+            .is_some_and(|name| is_builtin_name(&name)),
+        _ => {
+            expression
+                .child_by_field_name("attribute")
+                .is_some_and(|name| is_builtin_name(&get_node_text(name, source)))
+                && expression
+                    .child_by_field_name("object")
+                    .is_some_and(|object| {
+                        python_names_the_builtins_module(object, at, &facts, source)
+                    })
+        }
+    }
+}
+
+/// Whether the `self` an assignment names is the instance of a class: the
+/// outermost function around the assignment is an instance method of a class
+/// (its first parameter is `self`, and it is neither a `@staticmethod` nor a
+/// `@classmethod`), and no function nested between rebinds `self` as its own
+/// parameter. A closure inside the method still writes the method's `self`.
+fn python_self_names_an_instance(assignment: Node, source: &str) -> bool {
+    let mut method: Option<Node> = None;
+    let mut current = assignment;
+    for _ in 0..64 {
+        let Some(parent) = bounded_parent(current) else {
+            return false;
+        };
+        match parent.kind() {
+            "function_definition" => {
+                if let Some(inner) = method {
+                    // A nested function that takes its own `self` shadows it.
+                    let rebinds = inner
+                        .child_by_field_name("parameters")
+                        .into_iter()
+                        .flat_map(|parameters| {
+                            let mut cursor = parameters.walk();
+                            parameters
+                                .named_children(&mut cursor)
+                                .filter_map(|p| python_parameter_name(p, source))
+                                .collect::<Vec<_>>()
+                        })
+                        .any(|name| name == "self");
+                    if rebinds {
+                        return false;
+                    }
+                }
+                method = Some(parent);
+            }
+            "lambda" => {}
+            "class_definition" => {
+                let Some(method) = method else {
+                    return false;
+                };
+                let first = method
+                    .child_by_field_name("parameters")
+                    .and_then(|parameters| parameters.named_child(0))
+                    .and_then(|first| python_parameter_name(first, source));
+                if first.as_deref() != Some("self") {
+                    return false;
+                }
+                let decorated = bounded_parent(method)
+                    .filter(|wrapper| wrapper.kind() == "decorated_definition");
+                return !decorated.is_some_and(|wrapper| {
+                    let mut cursor = wrapper.walk();
+                    let mut decorators = wrapper.named_children(&mut cursor);
+                    decorators.any(|decorator| {
+                        decorator.kind() == "decorator"
+                            && python_decorator_drops_instance(decorator, source)
+                    })
+                });
+            }
+            _ => {}
+        }
+        current = parent;
+    }
+    false
+}
+
 fn assignment_binding(mut node: Node, source: &str) -> Option<String> {
+    let origin = node;
     for _ in 0..4 {
         node = bounded_parent(node)?;
+        if node.kind() == "assignment" {
+            if let Some(field) = python_self_field_binding(node, origin, source) {
+                return Some(field);
+            }
+        }
         let binding = match node.kind() {
             "assignment"
             | "assignment_expression"
