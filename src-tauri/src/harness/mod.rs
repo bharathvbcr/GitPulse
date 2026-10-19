@@ -9,6 +9,7 @@
 //! Everything here degrades: with no harness installed GitPulse still commits,
 //! pushes and rebases, and every unguarded action is reported as unguarded.
 
+pub(crate) mod claude_key;
 pub mod policy;
 pub mod protocol;
 pub(crate) mod review;

@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde_json::Value;
 
+use super::claude_key::CLAUDE_KEY_ENV;
 use super::protocol::*;
 
 /// How long a single request may take before the child is considered wedged.
@@ -1096,12 +1097,79 @@ fn not_installed_message() -> String {
     format!("no `manvi` binary on PATH, in {searched}, or named by GITPULSE_MANVI_BIN")
 }
 
-/// Local model the host selected for this Manvi session. Frozen into the
+/// The model the host selected for this Manvi session. Frozen into the
 /// child's environment at spawn; changing it requires retiring the process.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ModelSelection {
-    pub base_url: String,
-    pub model: String,
+pub(crate) enum ModelSelection {
+    /// A model on an OpenAI-compatible server on this machine.
+    Local { base_url: String, model: String },
+    /// A Claude model through Anthropic's API, billed to the key saved in the
+    /// Keychain (see [`super::claude_key`]).
+    Claude { model: String },
+}
+
+/// Whether a harness's own account of what it withholds from its children
+/// covers the Claude key. Absent is not a promise: a build that predates the
+/// fields omits them, and it does not withhold.
+fn withholds_claude_key(withholds: Option<bool>, withheld: Option<&[String]>) -> bool {
+    withholds == Some(true)
+        && withheld.is_some_and(|names| names.iter().any(|name| name == CLAUDE_KEY_ENV))
+}
+
+/// The Claude key for a spawn of `binary`, or why it may not have one.
+///
+/// Manvi runs a model-driven tool loop in a repository the user may not trust,
+/// and everything that loop starts (git and its hooks, verifiers, coding
+/// agents) must not inherit a paid credential. Manvi promises that in `manvi
+/// version --json` before the process exists, so the promise is checked first
+/// and the key read only once it holds. The handshake checks it again from the
+/// running process.
+fn claude_key_for(binary: &str) -> Result<String, HarnessError> {
+    let mut probe = Command::new(binary);
+    probe.args(["version", "--json"]).env_clear();
+    for (name, value) in sidecar_ambient_env(std::env::vars_os()) {
+        probe.env(name, value);
+    }
+    probe.current_dir(std::env::temp_dir());
+    let run = crate::engine::git_cli::run_bounded_capped(
+        probe,
+        "manvi version",
+        Duration::from_secs(10),
+        None,
+        64 * 1024,
+    )
+    .and_then(|run| run.require_complete("manvi version"))
+    .map_err(|e| {
+        HarnessError::Unavailable(format!("could not ask `{binary}` what it withholds: {e}"))
+    })?;
+    let version: Value = serde_json::from_slice(&run.stdout).unwrap_or(Value::Null);
+    let withheld: Option<Vec<String>> = version
+        .get("withheld_provider_env")
+        .and_then(|names| serde_json::from_value(names.clone()).ok());
+    if !run.success
+        || !withholds_claude_key(
+            version
+                .get("withholds_provider_credentials")
+                .and_then(Value::as_bool),
+            withheld.as_deref(),
+        )
+    {
+        return Err(HarnessError::Unavailable(format!(
+            "`{binary}` does not promise to keep {CLAUDE_KEY_ENV} from the programs it starts, \
+             so GitPulse will not give it your Claude API key. Update Manvi."
+        )));
+    }
+    let keychain = super::claude_key::Keychain::system().map_err(HarnessError::Unavailable)?;
+    keychain
+        .load()
+        .map_err(HarnessError::Unavailable)?
+        .ok_or_else(|| {
+            HarnessError::Unavailable(
+                "Manvi is set to use Claude, but no Claude API key is saved. Add one in the \
+                 Manvi pane, or switch Manvi back to a local model."
+                    .into(),
+            )
+        })
 }
 
 /// Ambient variables the harness child may inherit.
@@ -1180,7 +1248,16 @@ fn sidecar_ambient_env(
 
 /// The `manvi serve` invocation, built separately so its environment can be
 /// asserted without starting a sidecar.
-fn sidecar_command(binary: &str, dir: &Path, selection: Option<&ModelSelection>) -> Command {
+///
+/// `claude_key` is set only for a Claude selection, after [`claude_key_for`]
+/// has checked the binary's promise; it is the one credential this child is
+/// ever given.
+fn sidecar_command(
+    binary: &str,
+    dir: &Path,
+    selection: Option<&ModelSelection>,
+    claude_key: Option<&str>,
+) -> Command {
     let mut command = Command::new(binary);
     command.env_clear();
     for (name, value) in sidecar_ambient_env(std::env::vars_os()) {
@@ -1215,12 +1292,24 @@ fn sidecar_command(binary: &str, dir: &Path, selection: Option<&ModelSelection>)
     // Always pin or clear model env. An ambient shell `MANVI_*` would otherwise
     // leak into a GUI-launched child and contradict the Local model servers card.
     match selection {
-        Some(selection) => {
+        Some(ModelSelection::Local { base_url, model }) => {
             command
                 .env("MANVI_LLM_PROVIDER_DEFAULT", "local")
-                .env("MANVI_MODEL", &selection.model)
-                .env("MANVI_LLM_LOCAL_BASE_URL", &selection.base_url)
+                .env("MANVI_MODEL", model)
+                .env("MANVI_LLM_LOCAL_BASE_URL", base_url)
                 .env_remove("MANVI_LLM_LOCAL_MODEL");
+        }
+        Some(ModelSelection::Claude { model }) => {
+            command
+                .env("MANVI_LLM_PROVIDER_DEFAULT", "anthropic")
+                .env("MANVI_MODEL", model)
+                .env_remove("MANVI_LLM_LOCAL_BASE_URL")
+                .env_remove("MANVI_LLM_LOCAL_MODEL");
+            // Without it Manvi answers "no credential for anthropic", which is
+            // the honest failure; the caller never gets here without one.
+            if let Some(key) = claude_key {
+                command.env(CLAUDE_KEY_ENV, key);
+            }
         }
         None => {
             command
@@ -1263,8 +1352,12 @@ fn spawn_with_profile(
     let binary =
         resolve_binary().ok_or_else(|| HarnessError::NotInstalled(resolve_binary_absence()))?;
 
+    let claude_key = match selection {
+        Some(ModelSelection::Claude { .. }) => Some(claude_key_for(&binary)?),
+        _ => None,
+    };
     let dir = scratch_dir()?;
-    let mut command = sidecar_command(&binary, &dir, selection);
+    let mut command = sidecar_command(&binary, &dir, selection, claude_key.as_deref());
     if let Some(profile) = profile {
         let store = crate::tool_install::components::verified_store_binary();
         attach_workbench(&mut command, &dir, profile, store.as_deref());
@@ -1353,6 +1446,20 @@ fn spawn_with_profile(
             "sidecar speaks protocol {} and this build speaks {}; refusing rather than \
              mis-reading a policy decision",
             hello.protocol, PROTOCOL_VERSION
+        )));
+    }
+    // The probe in `claude_key_for` asked the binary on disk; this asks the
+    // process that actually holds the key. Returning drops `sidecar`, which
+    // stops the child.
+    if claude_key.is_some()
+        && !withholds_claude_key(
+            hello.withholds_provider_credentials,
+            hello.withheld_provider_env.as_deref(),
+        )
+    {
+        return Err(HarnessError::Unavailable(format!(
+            "the running harness does not promise to keep {CLAUDE_KEY_ENV} from the programs \
+             it starts; stopped it rather than leave your Claude API key with it"
         )));
     }
     sidecar.hello = hello;
@@ -2594,7 +2701,7 @@ done
     #[test]
     fn sidecar_children_inherit_the_extended_path() {
         let dir = tempfile::TempDir::new().unwrap();
-        let cmd = sidecar_command("manvi", dir.path(), None);
+        let cmd = sidecar_command("manvi", dir.path(), None, None);
         let path = cmd
             .get_envs()
             .find(|(key, _)| *key == std::ffi::OsStr::new("PATH"))
@@ -2623,7 +2730,7 @@ done
                 .map(|(_, v)| v.map(std::ffi::OsStr::to_owned))
         };
 
-        let mut verified = sidecar_command("manvi", dir.path(), None);
+        let mut verified = sidecar_command("manvi", dir.path(), None, None);
         attach_workbench(
             &mut verified,
             dir.path(),
@@ -2646,7 +2753,7 @@ done
 
         // Nothing verified: the host's own resolution is left alone, never
         // pointed at a binary GitPulse did not check.
-        let mut unverified = sidecar_command("manvi", dir.path(), None);
+        let mut unverified = sidecar_command("manvi", dir.path(), None, None);
         attach_workbench(&mut unverified, dir.path(), &profile, None);
         assert_eq!(env(&unverified, "MANVI_STORE_BINARY"), None);
     }
@@ -2668,7 +2775,7 @@ done
             "the canary must be ambient for this test to mean anything"
         );
         use crate::procguard::LockedSpawn;
-        let out = sidecar_command(script.to_str().unwrap(), dir.path(), None)
+        let out = sidecar_command(script.to_str().unwrap(), dir.path(), None, None)
             .output_locked()
             .expect("run the env dump");
         let text = String::from_utf8_lossy(&out.stdout);
@@ -2723,11 +2830,12 @@ done
     #[test]
     fn sidecar_command_pins_or_clears_model_environment() {
         let dir = tempfile::TempDir::new().unwrap();
-        let selection = ModelSelection {
+        let selection = ModelSelection::Local {
             base_url: "http://127.0.0.1:11434/v1".into(),
             model: "qwen3.8:27b-mlx".into(),
         };
-        let with = sidecar_command("manvi", dir.path(), Some(&selection));
+        // A key handed in alongside a local selection must not ride along.
+        let with = sidecar_command("manvi", dir.path(), Some(&selection), Some("sk-ant-stray"));
         let envs: std::collections::HashMap<_, _> = with
             .get_envs()
             .map(|(k, v)| (k.to_owned(), v.map(|value| value.to_owned())))
@@ -2754,8 +2862,12 @@ done
             ),
             "local model alias must not ride along: {envs:?}"
         );
+        assert!(
+            !envs.contains_key(std::ffi::OsStr::new(CLAUDE_KEY_ENV)),
+            "a local selection must never carry the Claude key"
+        );
 
-        let without = sidecar_command("manvi", dir.path(), None);
+        let without = sidecar_command("manvi", dir.path(), None, None);
         let cleared: std::collections::HashMap<_, _> = without
             .get_envs()
             .map(|(k, v)| (k.to_owned(), v.map(|value| value.to_owned())))
@@ -2765,6 +2877,7 @@ done
             "MANVI_MODEL",
             "MANVI_LLM_LOCAL_BASE_URL",
             "MANVI_LLM_LOCAL_MODEL",
+            CLAUDE_KEY_ENV,
         ] {
             // On a cleared environment `env_remove` deletes the entry instead
             // of recording a removal, so "not set" is `None`; what must never
@@ -2772,6 +2885,109 @@ done
             assert!(
                 !matches!(cleared.get(std::ffi::OsStr::new(key)), Some(Some(_))),
                 "{key} must not be set when no selection is given: {cleared:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_claude_selection_selects_anthropic_and_carries_only_its_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let selection = ModelSelection::Claude {
+            model: "claude-sonnet-5-5".into(),
+        };
+        let command = sidecar_command(
+            "manvi",
+            dir.path(),
+            Some(&selection),
+            Some("sk-ant-api03-fixture"),
+        );
+        let envs: std::collections::HashMap<_, _> = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|value| value.to_owned()),
+                )
+            })
+            .collect();
+        let value = |key: &str| envs.get(key).cloned().flatten();
+        assert_eq!(
+            value("MANVI_LLM_PROVIDER_DEFAULT"),
+            Some("anthropic".into())
+        );
+        assert_eq!(value("MANVI_MODEL"), Some("claude-sonnet-5-5".into()));
+        assert_eq!(value(CLAUDE_KEY_ENV), Some("sk-ant-api03-fixture".into()));
+        assert_eq!(value("MANVI_LLM_LOCAL_BASE_URL"), None);
+        // The workspace and bearer forms are never handed over: the env is an
+        // allowlist, and this key is the one credential added to it.
+        for name in envs.keys() {
+            let upper = name.to_ascii_uppercase();
+            assert!(
+                upper == CLAUDE_KEY_ENV
+                    || !(upper.starts_with("ANTHROPIC_") || upper.ends_with("_KEY")),
+                "unexpected credential-shaped variable {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_an_explicit_promise_naming_the_key_counts_as_withholding() {
+        let named = vec![CLAUDE_KEY_ENV.to_string(), "OPENAI_API_KEY".to_string()];
+        let other = vec!["OPENAI_API_KEY".to_string()];
+        assert!(withholds_claude_key(Some(true), Some(&named)));
+        assert!(
+            !withholds_claude_key(None, None),
+            "an old build says nothing"
+        );
+        assert!(!withholds_claude_key(Some(true), None));
+        assert!(!withholds_claude_key(Some(true), Some(&other)));
+        assert!(!withholds_claude_key(Some(false), Some(&named)));
+
+        let hello: HelloResult = serde_json::from_value(serde_json::json!({
+            "protocol": 1,
+            "withholds_provider_credentials": true,
+            "withheld_provider_env": [CLAUDE_KEY_ENV],
+        }))
+        .unwrap();
+        assert!(withholds_claude_key(
+            hello.withholds_provider_credentials,
+            hello.withheld_provider_env.as_deref()
+        ));
+        let old: HelloResult = serde_json::from_value(serde_json::json!({"protocol": 1})).unwrap();
+        assert!(!withholds_claude_key(
+            old.withholds_provider_credentials,
+            old.withheld_provider_env.as_deref()
+        ));
+    }
+
+    /// The Keychain is never read for a binary that does not promise to keep
+    /// the key from its children: each of these fails at the promise, which
+    /// is why the error names it rather than a missing key.
+    #[cfg(unix)]
+    #[test]
+    fn claude_key_is_refused_to_a_binary_that_does_not_promise_to_withhold_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        for (name, body) in [
+            ("old", r#"echo '{"name":"manvi"}'"#),
+            (
+                "narrow",
+                r#"echo '{"withholds_provider_credentials":true,"withheld_provider_env":["OPENAI_API_KEY"]}'"#,
+            ),
+            (
+                "failing",
+                r#"echo '{"withholds_provider_credentials":true,"withheld_provider_env":["ANTHROPIC_API_KEY"]}'; exit 3"#,
+            ),
+            ("garbage", "echo 'not json'"),
+        ] {
+            let binary = dir.path().join(name);
+            std::fs::write(&binary, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let error = claude_key_for(binary.to_str().unwrap()).unwrap_err();
+            assert!(
+                error.message().contains("does not promise"),
+                "{name}: {}",
+                error.message()
             );
         }
     }

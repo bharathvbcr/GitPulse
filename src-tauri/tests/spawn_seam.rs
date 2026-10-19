@@ -79,6 +79,14 @@ const ALLOWED: &[(&str, &str)] = &[
          optional component would starve the git calls behind it",
     ),
     (
+        "src/harness/claude_key.rs",
+        "the Keychain, through `/usr/bin/security`: its single `Command` is \
+         handed to `git_cli::run_bounded_capped` with a 60s timeout and a 16 KiB \
+         cap. Built here rather than through `capture_command` because the key \
+         must travel on stdin (`security -i`), never in argv where the process \
+         table shows it, and `capture_command` has no stdin. Not git",
+    ),
+    (
         "src/engine/worktree_hooks.rs",
         "repository hook commands (`sh -c` / `cmd /C`) with the repository's \
          own env, run only after `repository_trust::require`. Each `Command` is \
