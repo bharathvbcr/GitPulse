@@ -703,12 +703,9 @@ fn settle_with(repo_path: &str, prober: &Prober) -> Result<Option<Vec<String>>, 
     let home = PathBuf::from(canonical_repo(repo_path));
     let mut result = Err(LedgerError::new(STALE_PROBE, "the prior locations changed"));
     for _ in 0..SETTLE_PASSES {
-        let foreign = match super::with_conn(repo_path, |conn| {
+        let foreign = super::with_conn(repo_path, |conn| {
             Ok(foreign_of(conn, repo_path).unwrap_or_default())
-        }) {
-            Ok(foreign) => foreign,
-            Err(e) => return Err(e),
-        };
+        })?;
         let probed = prober.probe(foreign, &home);
         result = super::with_conn(repo_path, |conn| settle_in(conn, repo_path, &seen, &probed));
         if !matches!(&result, Err(e) if e.code == STALE_PROBE) {
