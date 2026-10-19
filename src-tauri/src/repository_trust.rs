@@ -576,6 +576,15 @@ fn trusted(current: &Identity) -> Result<bool, String> {
     scope(current).map(TrustScope::admits)
 }
 
+/// What the trust store under `root` says about `repo_path`, read only. A
+/// measurement over real repositories runs in a hermetic test process, whose
+/// own store is empty; this mirrors the developer's approvals without writing
+/// to their store.
+#[cfg(test)]
+pub(crate) fn trusted_by_store_at(root: &Path, repo_path: &str) -> Result<bool, String> {
+    read_grant(root, &identity(repo_path)?).map(TrustScope::admits)
+}
+
 /// How many working trees this repository has, counted from its own registry.
 ///
 /// Metadata only, and deliberately not `git worktree list`: this is read while

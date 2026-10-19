@@ -165,6 +165,25 @@ describe("check:workflows", () => {
     }
   });
 
+  it("runs the #[ignore]d descriptor-inheritance burst in its own step and fails when it collects nothing", () => {
+    const ci = readFileSync(
+      fileURLToPath(new URL("../.github/workflows/ci.yml", import.meta.url)),
+      "utf8",
+    );
+    const test = "procguard::tests::concurrent_spawns_never_inherit_a_siblings_descriptors";
+    // The test is opt-in, so no other line of ci.yml runs it: deleting this
+    // step would silently stop checking descriptor inheritance.
+    const runs = ci.split("\n").filter((line) => line.includes(`--ignored --exact ${test}`));
+    expect(runs.length, "no ci.yml line runs the ignored test").toBeGreaterThan(0);
+    for (const line of runs) {
+      expect(line).toContain("cargo test --manifest-path");
+      expect(line).toContain("--test-threads=1");
+    }
+    // "0 tests" is a green cargo exit: only the count makes a rename fail.
+    expect(ci).toContain('grep -q "test result: ok. 1 passed"');
+    expect(ci).toMatch(/Descriptor inheritance under concurrent spawns[\s\S]*?runner\.os != 'Windows'/);
+  });
+
   it("measures Rust branch coverage, on a pinned nightly because the flag is unstable", () => {
     const coverage = readFileSync(
       fileURLToPath(new URL("../.github/workflows/coverage.yml", import.meta.url)),

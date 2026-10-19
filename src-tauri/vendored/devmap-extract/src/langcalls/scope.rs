@@ -58,6 +58,18 @@ pub(crate) fn enclosing_emitted_symbol(
 ) -> Option<String> {
     let mut ancestor = crate::treesitter::bounded_parent(node);
     while let Some(parent) = ancestor {
+        // A Swift extension is no symbol of the file that holds it (the type is
+        // declared elsewhere), so a computed property written in one has no
+        // enclosing declaration of its own to name. The property it declares is
+        // that symbol: its body is attributed to it. A property in a type body
+        // keeps the type as the enclosing symbol.
+        if lang == "swift" {
+            if let Some(property) = crate::langdecl::swift::extension_property_symbol(parent, node)
+            {
+                return crate::langdecl::declaration_of(lang, property, source)
+                    .map(|declaration| declaration.qualified(file_symbol_name));
+            }
+        }
         // A declaration the emitter cannot name emits no symbol, so keep
         // walking rather than inventing one.
         if let Some(declaration) = crate::langdecl::declaration_of(lang, parent, source) {

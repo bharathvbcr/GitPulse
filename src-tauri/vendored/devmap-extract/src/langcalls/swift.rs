@@ -252,7 +252,7 @@ fn swift_unwrap_prefix<'tree>(target: Node<'tree>) -> Option<Node<'tree>> {
 /// typed its second call by the receiver `a.bump() + g`. The right operand of
 /// the sum is the callee (or the member target); `+ - * /` are the only
 /// operators the grammar treats this way.
-fn swift_call_operand<'tree>(node: Node<'tree>) -> Node<'tree> {
+pub(crate) fn swift_call_operand<'tree>(node: Node<'tree>) -> Node<'tree> {
     let mut node = node;
     while matches!(
         node.kind(),
@@ -345,7 +345,7 @@ fn swift_navigation_call<'tree>(nav: Node<'tree>, source: &str) -> Option<SwiftC
 /// The right operand of the sum at the base of a member chain: for
 /// `(a + b).c` the node `b`. `None` when the chain does not start from a sum
 /// (the sum directly under the call is [`swift_call_operand`]'s).
-fn swift_sum_tail<'tree>(chain: Node<'tree>) -> Option<Node<'tree>> {
+pub(crate) fn swift_sum_tail<'tree>(chain: Node<'tree>) -> Option<Node<'tree>> {
     let mut node = chain;
     let mut steps = 0;
     while matches!(node.kind(), "navigation_expression" | "call_expression") {

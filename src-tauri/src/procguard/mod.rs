@@ -1695,8 +1695,19 @@ mod tests {
     /// has probability e^-68; even at a quarter of that rate it is 4e-8. The
     /// count is asserted too: a run that spawned nothing must not read like a
     /// run that spawned everything cleanly.
+    ///
+    /// Opt-in, because the sample is the cost: 12,003 `sh` spawns in a
+    /// 16-thread burst, on top of whatever else a developer's `cargo test` is
+    /// running. On a machine that is also exec-checking every new process
+    /// (macOS `syspolicyd`) that burst is what pushed the load average past
+    /// 100. CI runs it in its own step (`ci.yml`, "Descriptor inheritance
+    /// under concurrent spawns"), which checks the output for `1 passed` so a
+    /// run that collected nothing cannot pass. Locally:
+    /// `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored
+    /// --exact procguard::tests::concurrent_spawns_never_inherit_a_siblings_descriptors`.
     #[cfg(unix)]
     #[test]
+    #[ignore = "12,003 sh spawns in a 16-thread burst; run by its own CI step (ci.yml) with --ignored"]
     fn concurrent_spawns_never_inherit_a_siblings_descriptors() {
         const CHILD: &str = "GITPULSE_FD_INHERITANCE_CHILD";
         const THREADS: usize = 16;
@@ -1706,6 +1717,9 @@ mod tests {
             let (mut command, _harness) = crate::test_support::isolated_libtest_command(
                 "procguard::tests::concurrent_spawns_never_inherit_a_siblings_descriptors",
             );
+            // The child filters on `#[ignore]` too: without this it would
+            // collect nothing and the `1 passed` check below would fail.
+            command.arg("--ignored");
             command.arg("--test-threads=1");
             command.env(CHILD, "1");
             let run = crate::engine::git_cli::run_bounded_capped(

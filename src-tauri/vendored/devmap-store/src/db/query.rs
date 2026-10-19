@@ -374,7 +374,7 @@ impl Store {
         }))
     }
 
-    /// Literal sites whose value equals `query`, or starts with it.
+    /// Literal sites whose value equals `query`, or contains it anywhere.
     ///
     /// `None` when the store holds no generation. The comparison is binary, so
     /// `Session.` does not match `session.`. At most `page_cap` rows are
@@ -395,7 +395,7 @@ impl Store {
         let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
             return Ok(None);
         };
-        let (predicate, mut params) = literal_predicate(generation, query, exact)?;
+        let (predicate, mut params) = literal_predicate(generation, query, exact);
         let count_sql = format!("SELECT COUNT(*) FROM generation_literals l WHERE {predicate}");
         let count: i64 = snapshot
             .query_row(&count_sql, params_from_iter(params.iter()), |row| {

@@ -88,8 +88,7 @@ fn a_grandchild_retaining_the_pipe_does_not_stretch_the_grace() {
     let _kept = KeepDeadlinePrefix::enter();
     let dir = tempfile::tempdir().unwrap();
     let pidfile = dir.path().join("pid");
-    let script =
-        r#"set -m; sleep 30 & echo $! > "$1"; trap 'exit 0' TERM; while :; do sleep 0.05; done"#;
+    let script = r#"set -m; sleep 30 & echo $! > "$1"; trap 'exit 0' TERM; wait"#;
     let started = Instant::now();
     let run = run_bounded(
         sh(script, &[&pidfile]),
@@ -115,7 +114,7 @@ fn output_over_the_caps_during_the_grace_sets_flags_and_stays_bounded() {
     let _kept = KeepDeadlinePrefix::enter();
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("m");
-    let script = r#"trap 'head -c 30000000 /dev/zero; head -c 30000000 /dev/zero >&2; exit 0' TERM; touch "$1"; while :; do sleep 0.05; done"#;
+    let script = r#"sleep 30 & s=$!; trap 'kill $s 2>/dev/null; head -c 30000000 /dev/zero; head -c 30000000 /dev/zero >&2; exit 0' TERM; touch "$1"; wait"#;
     let cap = 100_000;
     let run = run_bounded_capped(
         sh(script, &[&marker]),
@@ -153,7 +152,8 @@ fn a_clean_exit_inside_a_deadline_grace_is_still_a_deadline() {
     let _kept = KeepDeadlinePrefix::enter();
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("m");
-    let script = r#"trap 'echo bye; exit 0' TERM; touch "$1"; while :; do sleep 0.05; done"#;
+    let script =
+        r#"sleep 30 & s=$!; trap 'kill $s 2>/dev/null; echo bye; exit 0' TERM; touch "$1"; wait"#;
     let run = run_bounded(
         sh(script, &[&marker]),
         "d",
@@ -204,7 +204,7 @@ fn a_cleanup_that_reads_stdin_to_eof_completes_when_stdin_closes_at_the_ask() {
     let _kept = KeepDeadlinePrefix::enter();
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("lock");
-    let script = r#"trap 'cat >/dev/null; rm -f "$1"; exit 0' TERM; touch "$1"; while :; do sleep 0.05; done"#;
+    let script = r#"sleep 30 & s=$!; trap 'kill $s 2>/dev/null; cat >/dev/null; rm -f "$1"; exit 0' TERM; touch "$1"; wait"#;
     let input = vec![b'i'; 100_000];
     let run = run_bounded(
         sh(script, &[&marker]),

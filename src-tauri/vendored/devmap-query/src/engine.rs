@@ -2356,8 +2356,9 @@ impl<'a> StoreQueryEngine<'a> {
 
     /// Sites where a string value is written.
     ///
-    /// `exact` is equality. Otherwise `query` is a case-sensitive prefix, so
-    /// `session.` matches `session.spawn`. A Rust module-level const's value
+    /// `exact` is equality. Otherwise the value contains `query` anywhere,
+    /// case-sensitively, so `sky-time` matches `--sky-time` and `session.`
+    /// matches `session.spawn`. A Rust module-level const's value
     /// is also reported at each use of that const. `shown + hidden == total`.
     /// `walk_incomplete` is set when no generation exists, or when the page
     /// cap cut the read before the budget did.

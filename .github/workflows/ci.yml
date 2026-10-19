@@ -181,6 +181,24 @@ jobs:
             cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast -- --nocapture --test-threads=1
           fi
 
+      - name: Descriptor inheritance under concurrent spawns
+        # The test is #[ignore]d out of the suite above: it is a 12,003-spawn,
+        # 16-thread burst, which loads a developer's machine for no signal in
+        # the common case. It still gates every change here. --ignored selects
+        # only opt-in tests and --exact keeps the run to the one named test,
+        # so a rename fails on the "1 passed" check below instead of quietly
+        # running nothing. The test is #[cfg(unix)], hence no Windows run.
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            out="$(xvfb-run -a dbus-run-session -- cargo test --manifest-path src-tauri/Cargo.toml --locked --lib -- --ignored --exact procguard::tests::concurrent_spawns_never_inherit_a_siblings_descriptors --test-threads=1 2>&1 | tee /dev/stderr)"
+          else
+            out="$(cargo test --manifest-path src-tauri/Cargo.toml --locked --lib -- --ignored --exact procguard::tests::concurrent_spawns_never_inherit_a_siblings_descriptors --test-threads=1 2>&1 | tee /dev/stderr)"
+          fi
+          grep -q "test result: ok. 1 passed" <<<"$out"
+
       - name: Terminal Suites Against the Terminal Host
         # The same terminal suites, every session registry backed by a real
         # gitpulse-ptyd rather than the engine in the test process

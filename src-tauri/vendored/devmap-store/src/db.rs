@@ -1864,44 +1864,21 @@ fn distinct_kinds(
     Ok(present)
 }
 
-/// `?` placeholders, in order: generation, then the value bound(s).
-fn literal_predicate(
-    generation: u32,
-    query: &str,
-    exact: bool,
-) -> Result<(String, Vec<Box<dyn ToSql>>)> {
-    let mut params: Vec<Box<dyn ToSql>> =
+/// `?` placeholders, in order: generation, then the value.
+///
+/// Exact is equality. Otherwise the value contains the query anywhere:
+/// `instr` rather than `LIKE`, so `%` and `_` are text and the comparison is
+/// case-sensitive, as `str::contains` is. A prefix-only match missed a CSS
+/// custom property `--sky-time` asked for as `sky-time`.
+fn literal_predicate(generation: u32, query: &str, exact: bool) -> (String, Vec<Box<dyn ToSql>>) {
+    let params: Vec<Box<dyn ToSql>> =
         vec![Box::new(i64::from(generation)), Box::new(query.to_string())];
-    if exact {
-        return Ok(("l.generation_id = ? AND l.value = ?".to_string(), params));
-    }
-    if let Some(end) = prefix_successor(query) {
-        params.push(Box::new(end));
-        Ok((
-            "l.generation_id = ? AND l.value >= ? AND l.value < ?".to_string(),
-            params,
-        ))
+    let predicate = if exact {
+        "l.generation_id = ? AND l.value = ?"
     } else {
-        params.push(Box::new(query.to_string()));
-        Ok((
-            "l.generation_id = ? AND l.value >= ? AND instr(l.value, ?) = 1".to_string(),
-            params,
-        ))
-    }
-}
-
-/// The smallest string strictly above every string that starts with `prefix`,
-/// or `None` when incrementing the last non-0xFF byte is not valid UTF-8.
-fn prefix_successor(prefix: &str) -> Option<String> {
-    let mut bytes = prefix.as_bytes().to_vec();
-    loop {
-        let last = bytes.last_mut()?;
-        if *last < 0xFF {
-            *last += 1;
-            return String::from_utf8(bytes).ok();
-        }
-        bytes.pop();
-    }
+        "l.generation_id = ? AND instr(l.value, ?) > 0"
+    };
+    (predicate.to_string(), params)
 }
 
 /// The stored byte span of a symbol row, or a refusal naming the row.

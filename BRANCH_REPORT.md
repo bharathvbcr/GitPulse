@@ -1,3 +1,235 @@
+# Branch consolidation report — 2026-10-19 (01:55, second pass: "merge all")
+
+The owner said "merge all changes and next wave, delete old and stale branches". **Main fast-forwarded 32a57763 → 1e168898**: 4 merges, 1 carried-forward test and 1 clippy fix. Nothing was pushed.
+
+**Every local branch is now merged into main.** The branches left are held by live sessions, by PID 99318's locks, or by one dirty worktree. On the owner's instruction, PID 99318 was left alone.
+
+## Merged (ordered by blast radius, smallest first)
+
+| # | Branch | Merge commit | Conflicts | Review |
+|---|---|---|---|---|
+| 1 | b17/9cfa4d74-adv (1212f904) | bc508e74, plus 9a0637df | 6 files, all resolved to main's side | Opus: CHANGE (carry the wire test), applied |
+| 2 | worktree-agent-a814ee33 chain (65d0d7e2, contains a47e3e00 and aae86bb0) | 0634ad20 | 2 files | Opus: CHANGE (message, and keep the sweep test), applied |
+| 3 | claude/epic-volhard-d23b09 | f62defe6 | none | — |
+| 4 | claude/vendor-devmap-extract-97 (contains vendor-devmap-literals-substring) | 205a72ef | none | — |
+| — | clippy fix for #3 | 1e168898 | — | — |
+
+### Conflict resolutions
+
+**1. b17/9cfa4d74-adv.** Six files: provenance_adversarial_tests.rs, ledger/adversarial_tests.rs, ledger/query_tests.rs, mcp/mod.rs, provenance_landing_tests.rs, mcp/adversarial_landed_tests.rs. All six were resolved to main's content, because main provably supersedes the branch:
+- The branch-only provenance and MCP tests call `land`, `landed` and `LandedVia`. bf08d80b removed that code from main and split it to backlog task ft-df6bf5ea, whose brief names this branch @ 1212f904 as the home of the parked break tests. The merge keeps 1212f904 reachable from main.
+- The branch's ledger tests predate e284ae49's index trim. They assert five indexes, and they pin as a break the since_ts bug that main fixed.
+- Opus found one test that needs no landed code: `ledger_events_argument_edges_at_the_wire`. Main had none of its assertions (limit 1001, order "DESC"/"", malformed since_ts, an oversized object filter, desc reuse of an asc cursor). It was carried into mcp/mod.rs's existing ledger_events tests, reusing their helpers, in 9a0637df. It passes alongside the 7 neighbouring tests.
+
+The blast-radius gate declined `git checkout --ours` / `git restore` three times, once right after the owner chose this resolution. So the merge commit was built with `git commit-tree` from main's tree and parents 32a57763 and 1212f904, in a fresh integration worktree. No working file was overwritten.
+
+**2. worktree-agent chain.**
+- `verification_gate.rs current_head`: main's `ALL_REFS` stamp was kept. The branch stamped `refs/heads`, which is the symref staleness a1e1bc02 fixed. The branch's auto-merged doc comment, which claimed "stamps the branch refs", was dropped as untrue.
+- `verification_driver_tests.rs`: main's block was kept whole, and two branch tests were added that main lacked:
+  - `sweeping_held_cards_on_an_unmoved_worktree_spawns_at_most_one_head_read` (several cards sharing one worktree through Driver::sweep)
+  - `a_head_read_the_gate_declined_stays_a_retryable_deferral_and_is_not_kept` (governor pressure end to end)
+- The branch's moved-head test was dropped. `head_cache_adversarial_tests` already covers commit, checkout, detached HEAD and update-ref through gate::current_head.
+
+## Gate (ci:local plus check:schema-parity, on 205a72ef; the clippy fix re-checked on 1e168898)
+
+| Gate | Result |
+|---|---|
+| Vendored crates unedited, vendored schema vs installed devmap, actionlint, fixture authors, IPC contract, coverage types, release version | PASS |
+| Svelte/TS check, Vite build, WKWebView regressions, gusset, Rust fmt | PASS |
+| Rust tests with coverage (`--workspace --locked --no-fail-fast`) | PASS (2718 s) |
+| Rust clippy `-D warnings` | FAIL: `type_complexity` at collision_memo.rs:85, from merge #3. **Fixed in 1e168898**, and clippy and fmt are clean on it |
+| Frontend unit tests with coverage | FAIL at load ~100 (11 timeouts and 2 timing/env asserts). Re-run alone: everything passes except `markdevRender` "does not slow quadratically", whose ratio went 18.9, 8.3, 20.2 and 15.1 against a bound of 8 across four runs at load 58–100. **Environmental:** `git diff main 1e168898 -- src/` is empty. |
+| Coverage floor | Failed only because the vitest run above exited non-zero, so lcov was never written. Re-run with that one file excluded: frontend lines 96.70% (≥90), branches 90.20% (≥85), Rust lines 90.13% (≥80). **OK** |
+| Browser regressions (Chrome) | FAIL in `terminal` at load ~100. Re-run with `--harness terminal`: 147/147. Full `test:browser:all` re-run: **PASS**, every harness |
+| Terminal host suites | FAIL `context_names_the_foreground_program_and_follows_cd` at load ~100. Re-run alone 3 times: 15/15. Full suite re-run: **PASS** |
+| `grace_adversarial::output_over_the_caps_during_the_grace…` | Failed once in a targeted parallel run at load ~100. Alone 5 times: 8/8. Its file was changed by d952ca3e, so it is a **load-sensitive test to watch** |
+| check:schema-parity | GitPulse vendored crates **match** (extract 97). gitpulse-mcp on PATH matches. The devmap CLI and the GitPulse.app bundle are unverifiable (they don't print the extraction schema). **The Manvi and Jarvis pins are stale at 94** (they pin 1ae3bc15). Those are sibling repos, and bumping a pin needs the owner's approval, so they were not bumped |
+
+## Deleted in this pass
+
+| Branch | Was | Worktree removed | Backup ref |
+|---|---|---|---|
+| claude/vendor-devmap-literals-substring | efd3dc40 | — | refs/backup/2026-10-18/claude/vendor-devmap-literals-substring |
+| worktree-agent-aae86bb0a8e663075 | 68000277 | agent-aae86bb0 | refs/backup/2026-10-18/worktree-agent-aae86bb0a8e663075 |
+| worktree-agent-a814ee3327298181b | 65d0d7e2 | agent-a814ee33 | refs/backup/2026-10-18/worktree-agent-a814ee3327298181b |
+| consolidate/1018b | 1e168898 (= main) | consolidate-1018b | refs/backup/2026-10-18/consolidate/1018b |
+| consolidate/1018 | 32a57763 | consolidate-1018, removed with `--force`: this session's own abandoned mid-merge, holding only conflict-marker copies | refs/backup/2026-10-18/consolidate/1018 |
+
+All were deleted with `-d`, so git verified each was merged.
+
+## Kept (all merged into main)
+
+| Branch | Reason |
+|---|---|
+| 10 b17 lanes (541eafaf-adv, 541eafaf-budget-residuals, 5c1313c9-adv, 8f398bb6-adv, 8f398bb6-write-primitives, 9cfa4d74-adv, adc5dca5-writer-parity, ade6e999-adv, bdb253cf-adv, cd18575e-head-cache) | Worktree locked by live PID 99318. The owner chose to leave that session alone |
+| b17/f815889e-contracts | A PID 99318 loop has its cwd in its worktree |
+| claude/epic-volhard-d23b09, claude/graft-notify-forward-de1a04, claude/vendor-devmap-extract-97 | Live sessions 92675, 67182 and 9043 |
+| feat/manvi-claude-api | **New** since the inventory: live session 60062, 21 dirty files, likely the next wave |
+| worktree-agent-a47e3e00850015499 | Dirty worktree. Its untracked verification_driver_measure.rs (blob be4ed692) is committed in 68000277, which is now reachable from main, so `git worktree remove --force` would lose nothing. Left for the owner under the dirty-worktree rule |
+| main | trunk |
+
+## For the owner
+
+1. **PID 99318's stuck loops** (46283, 64851, 2742) are still running and adding to the load. `kill 46283 64851 2742` frees them. Ending that session frees the 10 locked lanes for `git worktree remove` and `git branch -d`.
+2. **Leftover directories** from earlier gated removals: `.claude/worktrees/agent-a60b635c6dcef95a1`, `agent-ac8982efa7168df29` and `agent-afcb2722c245aeea0`. They are not registered worktrees, and `rm -rf` needs a person.
+3. **Pin bumps for extraction schema 97:** Manvi `scripts/module-pins.txt` and Jarvis `upstream.lock.json` (both at 1ae3bc15; DevCouncil HEAD is 505344aa).
+4. **Follow-ups:**
+   - d9d95044 `#[ignore]`s the 12k-spawn descriptor burst, which now runs only in its own ci.yml step. release.yml and ci:local no longer run it.
+   - head_cache_adversarial_tests.rs:130 still says "current_head stamps refs/heads only", which has been stale since a1e1bc02.
+   - `markdevRender`'s linearity bound is load-sensitive.
+5. **Not consolidated:** the detached `seed` worktree and the remote branches.
+
+## Restore
+
+```sh
+git branch <name> refs/backup/2026-10-18/<name>     # any branch deleted on 10-18 or 10-19
+git fetch /Users/bharath/branch-backups/GitPulse-2026-10-18.bundle 'refs/backup/2026-10-18/*:refs/backup/2026-10-18/*'
+# Main before this pass: refs/backup/2026-10-18/main (32a57763)
+```
+
+---
+
+# Branch consolidation report — 2026-10-18 (22:10)
+
+Scope: local branches only. Nothing was pushed, and remote branches were not touched. **Main did not move: it is still `32a57763`.**
+No branch qualified for a whole-branch merge. Six branches were deleted (three merged lanes and their stale aliases, plus one superseded lane), and three worktrees were removed. Everything else is in use or flagged for the owner.
+
+## Inventory (21:56)
+
+`gitpulse_insights`:
+- 22 worktrees, 21 scanned.
+- 8 live Claude sessions and 0 Codex sessions. 5 of the sessions are in the main checkout, including this one (pid 50087).
+- One dirty worktree: `agent-a47e3e00`.
+
+The `changes` and `collisions` facets were **deferred under load** (`ok:false`), so they are not a clean result. `gitpulse_collision_risk` reported `ok`, 0 overlapping files, 16 worktrees scanned and **6 unscanned**.
+
+PID 99318 is a 28-hour CLI session in the main checkout. It is the b17 build-run integrator and made main's last commits. It holds `git worktree lock` on 10 lane worktrees, and its shell loops have their cwd in `agent-a2f1d93c`, `ab1b6435`, `abe61620` and `a96a3bd5`.
+
+| Branch | Behind/ahead main | Last commit | Worktree (dirty?) | Live session / lock | Task (status) | Class |
+|---|---|---|---|---|---|---|
+| main | 0/0 | 10-18 17:05 | main checkout (clean) | 5 sessions | — | keep |
+| b17/541eafaf-adv | 49/0 | 10-18 02:37 | agent-a6e3b6c9 (clean) | locked by 99318 | ft-541eafaf (review) | merged, in use |
+| b17/541eafaf-budget-residuals | 27/0 | 10-18 04:10 | agent-abe61620 (clean) | locked; 99318 loop cwd | ft-541eafaf (review) | merged, in use |
+| b17/5c1313c9-adv | 7/0 | 10-18 13:46 | agent-ab1b6435 (clean) | locked; 99318 loop cwd | ft-5c1313c9 (review) | merged, in use |
+| b17/5c1313c9-adv2 | 3/0 | 10-18 15:15 | agent-ab2ce09b (clean) | none | ft-5c1313c9 (review) | **merged → deleted** |
+| b17/5c1313c9-ipc-error | 1/0 | 10-18 15:56 | agent-a455ec4f (clean) | none | ft-5c1313c9 (review) | **merged → deleted** |
+| b17/8f398bb6-adv | 20/0 | 10-18 06:53 | agent-a67fb5d5 (clean) | locked by 99318 | ft-8f398bb6 (review) | merged, in use |
+| b17/8f398bb6-write-primitives | 18/0 | 10-18 07:37 | agent-a35273bd (clean) | locked by 99318 | ft-8f398bb6 (review) | merged, in use |
+| b17/9cfa4d74-adv | 82/3 (2 patch-unique) | 10-17 21:56 | agent-aa89d8f3 (clean) | locked by 99318 | ft-9cfa4d74 (review) | **unmerged, in use** |
+| b17/adc5dca5-writer-parity | 72/0 | 10-17 22:11 | agent-a370d77f (clean) | locked by 99318 | ft-adc5dca5 (review) | merged, in use |
+| b17/ade6e999-adv | 58/0 | 10-17 23:44 | agent-a96a3bd5 (clean) | locked; 99318 loop cwd | ft-ade6e999 (review) | merged, in use |
+| b17/bdb253cf-adv | 109/0 | 10-17 18:35 | agent-a4d3e9f3 (not scanned) | locked by 99318 | ft-bdb253cf (review) | merged, in use |
+| b17/cd18575e-adv | 84/4 (3 patch-unique) | 10-17 20:49 | agent-a80c33d3 (clean) | none | ft-cd18575e (review) | **superseded → deleted (-D)** |
+| b17/cd18575e-head-cache | 78/0 | 10-17 21:10 | agent-a843b40b (clean) | locked by 99318 | ft-cd18575e (review) | merged, in use |
+| b17/f815889e-contracts | 71/0 | 10-17 22:57 | agent-a2f1d93c (clean) | 99318 loop cwd (not locked) | ft-f815889e (review) | merged, in use |
+| claude/epic-volhard-d23b09 | 83/2 (2) | 10-17 22:54 | epic-volhard-d23b09 (clean) | pid 92675 | — | **unmerged, in use** |
+| claude/graft-notify-forward-de1a04 | 11/0 | 10-18 08:43 | graft-notify-forward-de1a04 (clean) | pid 67182 | — | merged, in use |
+| claude/vendor-devmap-extract-97 | 11/2 (2) | 10-18 13:49 | vendor-devmap-extract-97 (clean) | pid 9043 | — | **unmerged, in use** |
+| claude/vendor-devmap-literals-substring | 11/1 (1) | 10-18 13:38 | none | — | — | keep + flag (contained in extract-97) |
+| worktree-agent-a47e3e00850015499 | 118/4 (4) | 10-17 18:00 | agent-a47e3e00 (**1 untracked**) | none | — | keep + flag (ambiguous) |
+| worktree-agent-aae86bb0a8e663075 | 118/5 (5) | 10-17 21:18 | agent-aae86bb0 (clean) | none | — | keep + flag (ambiguous) |
+| worktree-agent-a814ee3327298181b | 118/6 (6) | 10-17 21:37 | agent-a814ee33 (clean) | none | — | keep + flag (ambiguous) |
+| worktree-agent-a455ec4f6bafb2230 | 968/0 | 10-08 | none | — | — | **merged → deleted** |
+| worktree-agent-ab1b6435d5ddc2ed7 | 968/0 | 10-08 | none | — | — | **merged → deleted** |
+| worktree-agent-ab2ce09bb67515300 | 968/0 | 10-08 | none | — | — | **merged → deleted** |
+
+Two things are outside the 25-branch scope: the detached worktree `.claude/worktrees/seed` (at ed54ac18, which is reachable from main and clean), and the remote branches `origin/dependabot/bun/bun-dependencies-9785278404` and `origin/main-pql0l2`.
+
+How each verdict was reached:
+- **Classification:** `git cherry` for patch identity. For every patch-unique commit, the branch's files were compared with main's.
+- **Agents:** two read-only agents checked the two ambiguous lines, and Fable reviewed the whole classification. Fable agreed with every bucket and spot-checked the ancestry, the cd18575e diff, the cwd scans and the merge-tree dry runs.
+- **Gap:** neither the agents nor this session got a DevMap or GitPulse answer for this. The evidence is git plus source reading, and Insights was deferred under load for most facets.
+
+## Backups (Phase 2)
+
+- There is one ref per branch: `refs/backup/2026-10-18/<branch>`, 25 refs in all, listed in `tmp/consolidate-1018/backup-refs.txt`.
+- The bundle is `/Users/bharath/branch-backups/GitPulse-2026-10-18.bundle`. It has 25 heads, `git bundle verify` reports "complete history", and its sha256 is `43fd2e7ecf6784a90f5640fd1cca4961fb659c08a98ca7ca757e956446db77a0`.
+
+## Pending work (Phase 3)
+
+Nothing was committed. The only dirty worktree is `agent-a47e3e00`, which has an untracked `src-tauri/src/workbench/verification_driver_measure.rs`. Its blob is `be4ed692`, which is byte-identical to the file `68000277` committed on `worktree-agent-aae86bb0`. The work is already committed, and committing it again would only duplicate it. The worktree was left untouched.
+
+## Merges (Phase 4)
+
+**None.** No branch is both unmerged and free:
+- The unmerged branches with live sessions or locks are `b17/9cfa4d74-adv`, `epic-volhard` and `vendor-devmap-extract-97`.
+- `b17/cd18575e-adv` is superseded (see below).
+- The `worktree-agent` chain cannot be merged as a whole. `git merge-tree --write-tree main 65d0d7e2` conflicts in `verification_gate.rs` and `verification_driver_tests.rs`, and those conflicts are its superseded commit 07dee1a2 colliding with main's ref-cache work.
+
+With no merges, there were no conflict resolutions and no Opus reviews.
+
+## Deleted (Phase 5)
+
+Every precondition was re-checked immediately before each delete (`tmp/consolidate-1018/delete.sh`):
+- main still at 32a57763
+- the backup ref equals the tip
+- `merge-base --is-ancestor main` for each `-d`
+- the worktree is clean, including untracked files
+- no process has its cwd inside the worktree
+
+| Branch | Was | How | Worktree removed | Backup ref |
+|---|---|---|---|---|
+| worktree-agent-a455ec4f6bafb2230 | 98c776d4 | `-d` (merged) | — | refs/backup/2026-10-18/worktree-agent-a455ec4f6bafb2230 |
+| worktree-agent-ab1b6435d5ddc2ed7 | 98c776d4 | `-d` (merged) | — | refs/backup/2026-10-18/worktree-agent-ab1b6435d5ddc2ed7 |
+| worktree-agent-ab2ce09bb67515300 | 98c776d4 | `-d` (merged) | — | refs/backup/2026-10-18/worktree-agent-ab2ce09bb67515300 |
+| b17/5c1313c9-ipc-error | ef961ae5 | `-d` (merged; main's report says the final gate ran on ef961ae5) | agent-a455ec4f | refs/backup/2026-10-18/b17/5c1313c9-ipc-error |
+| b17/5c1313c9-adv2 | ececb498 | `-d` (merged) | agent-ab2ce09b | refs/backup/2026-10-18/b17/5c1313c9-adv2 |
+| b17/cd18575e-adv | fe74c10f | **`-D` (proven superseded)** | agent-a80c33d3 | refs/backup/2026-10-18/b17/cd18575e-adv |
+
+**Proof that `b17/cd18575e-adv` was superseded.** It touched 7 files. Five of them are byte-identical to main. The `fs_entry.rs` hunk (ENXIO/EOPNOTSUPP → NotRegular) is on main. That leaves its three patch-unique commits:
+- `3a5dd6f7` and `fe74c10f`: main's `a1e1bc02` carries the same 19 head-cache adversarial tests, plus the `verification_gate.rs` fix. The only lines unique to the branch are an `#[ignore]` on `a_head_symref_to_another_namespace_is_seen`, which main now asserts; an older ignore wording; and an unscaled `Duration::from_secs(60)`, which main replaced with `coverage_relaxed`. Merging the branch would have weakened main.
+- `2db36a17` removed conflict markers. Main's `verification_driver_tests.rs` has none.
+
+## Kept
+
+| Branch | Reason |
+|---|---|
+| main | Trunk. No release branches exist. |
+| 10 locked `b17/*` lanes (541eafaf-adv, 541eafaf-budget-residuals, 5c1313c9-adv, 8f398bb6-adv, 8f398bb6-write-primitives, 9cfa4d74-adv, adc5dca5-writer-parity, ade6e999-adv, bdb253cf-adv, cd18575e-head-cache) | `git worktree lock` held by live PID 99318. All are merged except `9cfa4d74-adv`. |
+| b17/f815889e-contracts | Merged, but a live 99318 shell loop has its cwd in its worktree. |
+| claude/epic-volhard-d23b09 | Live session 92675. It has 2 unmerged commits (the collision-guard memo perf work). |
+| claude/graft-notify-forward-de1a04 | Live session 67182 (already merged). |
+| claude/vendor-devmap-extract-97 | Live session 9043. It is also a cross-app schema bump (DevCouncil 7aa6bf51, extraction schema 97), so landing it needs `check:schema-parity` and the consumer rebuilds, not a consolidation merge. |
+| claude/vendor-devmap-literals-substring | Its only commit, efd3dc40, is contained in extract-97 but is not on main. It goes when extract-97 lands or is dropped. |
+| worktree-agent-a47e3e00 / -aae86bb0 / -a814ee33 | Ambiguous: needs an owner decision (below). The a47e3e00 worktree is dirty, so `worktree remove` would refuse it anyway. |
+
+## Blocked / needs the owner
+
+1. **`worktree-agent` chain** (a47e3e00 ⊂ aae86bb0 ⊂ a814ee33, 6 commits). Each commit, with the evidence from source reading:
+   - `07dee1a2` is superseded by main's ref-cache `current_head` (`verification_gate.rs:171-180`).
+   - `d952ca3e` (tests probe in-process instead of spawning `kill`/`sleep`) and `d9d95044` (the 12k-spawn procguard burst in its own CI step) are absent from main, and each **cherry-picks cleanly** in a merge-tree dry run.
+   - `923d95e6` (`.cargo/config.toml` capping local test threads at 4), `68000277` and `65d0d7e2` (an ignored driver-measurement harness) are absent, and nothing on main asks for them.
+
+   **Decision needed:** cherry-pick d952ca3e and d9d95044, then run the full merge gate? Keep or drop the other three?
+2. **`b17/9cfa4d74-adv`** has 2 unmerged adversarial-test commits (provenance, ledger, MCP landed). It is locked by 99318. Let that run land it, or release the lock.
+3. **PID 99318's stuck loops.** None of these were started by this session, so nothing was killed. Their PIDs:
+   - 46283 and 64851 wait on `until ! pgrep -f "cargo test --manifest-path"`. That pattern matches the loop's own command line, so it never exits.
+   - 2742 is a sleepless `until …; do ls; done` spin that has run for about 21 hours.
+
+   All three contribute to the load average.
+4. **The `seed` detached worktree and the two remote branches** were out of scope.
+
+## Verification (Phase 6)
+
+- `git fsck --no-dangling`: no errors.
+- main = 32a57763, unchanged. There are 19 branches and 19 worktrees.
+- **Final `ci:local` was not run.** Main's tree is identical to before the run (no merges; deletions don't touch it), and the load average was 33–43, above the ~18 line where prior runs found ci:local unreliable.
+- **Post-run `gitpulse_insights` could not confirm the sessions.** Both attempts were deferred under load, with `ok:false` on agents, worktrees and collisions. Checked directly instead: all 7 other live sessions (6147, 9043, 67182, 76744, 82178, 92675, 99318) are running, and every live process cwd still exists. None of the removed worktrees was any session's cwd.
+
+## Restore
+
+```sh
+# one branch
+git branch b17/cd18575e-adv refs/backup/2026-10-18/b17/cd18575e-adv
+git worktree add .claude/worktrees/agent-a80c33d38468f804d b17/cd18575e-adv   # optional
+# the same pattern for: b17/5c1313c9-ipc-error, b17/5c1313c9-adv2,
+#   worktree-agent-a455ec4f6bafb2230, worktree-agent-ab1b6435d5ddc2ed7, worktree-agent-ab2ce09bb67515300
+# from the bundle, if the refs are gone
+git fetch /Users/bharath/branch-backups/GitPulse-2026-10-18.bundle 'refs/backup/2026-10-18/*:refs/backup/2026-10-18/*'
+```
+
+---
+
 # Branch consolidation report — 2026-10-17 (landing run, 07:56)
 
 Scope: local branches only; nothing was pushed. **Main moved 8026dd7e → dc331e8c (fast-forward to
