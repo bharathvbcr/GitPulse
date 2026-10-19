@@ -296,13 +296,15 @@ fn a_ledger_copied_from_a_live_clone_is_refused_until_the_source_is_gone() {
     assert_refused(&out, "copy or another clone");
     assert_eq!(count_action(&second, "ledger.reanchor"), 0);
 
-    // The honest residual, pinned: two clones of one upstream have the same
-    // root commits and remotes, so once the source is gone the carried ledger
-    // reads as a move. Nothing in a common dir tells the two apart.
+    // Two clones of one upstream have the same root commits and remotes, and a
+    // ledger copy carries the same lineage UUID, so none of those tell them
+    // apart. What does is the directory the ledger was anchored in: the clone
+    // is another one, so the carried ledger stays refused once the source is gone.
     std::fs::remove_dir_all(&first).unwrap();
     ledger::forget_identity_state(&second);
     let out = corpus.pass(&second);
-    assert_eq!(out.reanchored_from, vec![first], "{out:?}");
+    assert_refused(&out, "not the directory the ledger was anchored in");
+    assert_eq!(count_action(&second, "ledger.reanchor"), 0);
 }
 
 /// Threat: a fork shares the root commit and points `origin` elsewhere.
@@ -673,13 +675,13 @@ fn shallow_clone_at(parent: &Path, name: &str) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// Threat (pinned, not endorsed): a different repository that merged this
-/// one's whole history has every root this ledger recorded, so once the source
-/// is gone the carried ledger reads as a move. The rule says "recorded roots
-/// are still roots": it cannot tell a merged-in history from a root added by an
-/// orphan branch, and refusing the first refuses the second.
+/// Threat: a different repository that merged this one's whole history has
+/// every root this ledger recorded, so the roots alone read the carried ledger
+/// as a move once the source is gone. Roots cannot tell a merged-in history
+/// from a root added by an orphan branch; the directory the ledger was anchored
+/// in can, and the merging repository is another directory.
 #[test]
-fn a_repository_that_merged_the_source_history_takes_the_carried_ledger() {
+fn a_repository_that_merged_the_source_history_is_refused_the_carried_ledger() {
     let parent = tempfile::tempdir().unwrap();
     let a = repo_at(parent.path(), "a", "alpha");
     let mut corpus = Corpus::new();
@@ -710,7 +712,29 @@ fn a_repository_that_merged_the_source_history_takes_the_carried_ledger() {
     std::fs::remove_dir_all(&a).unwrap();
     corpus.edit(&b);
     let out = corpus.pass(&b);
-    assert_eq!(out.reanchored_from, vec![a], "{out:?}");
+    assert_refused(&out, "not the directory the ledger was anchored in");
+    assert_eq!(count_action(&b, "ledger.reanchor"), 0);
+}
+
+/// The other side of the same roots rule: a repository that grew an orphan root
+/// (so its roots are a superset of what the ledger recorded) and is then
+/// renamed is still the same directory, and keeps recording.
+#[test]
+fn a_renamed_repository_that_grew_an_orphan_root_keeps_its_ledger() {
+    let parent = tempfile::tempdir().unwrap();
+    let old = repo_at(parent.path(), "grew", "seed");
+    let mut corpus = Corpus::new();
+    corpus.edit(&old);
+    assert_eq!(corpus.pass(&old).recorded, 1);
+    git_in(Path::new(&old), &["checkout", "-q", "--orphan", "island"]);
+    std::fs::write(Path::new(&old).join("island.txt"), "i").unwrap();
+    git_in(Path::new(&old), &["add", "island.txt"]);
+    git_in(Path::new(&old), &["commit", "-q", "-m", "island"]);
+    let new = mv(&old, &parent.path().canonicalize().unwrap().join("renamed"));
+    corpus.edit(&new);
+    let out = corpus.pass(&new);
+    assert_eq!(out.reanchored_from, vec![old], "{out:?}");
+    assert_eq!(out.error, "", "{out:?}");
 }
 
 /// A remote carrying a credential in any spelling is never written to the

@@ -484,7 +484,7 @@ fn coalesced_followers(repo: &Path, args: &[&str], stamp: &Stamp) -> usize {
 /// The monotonic "now" the TTL is measured on. Production reads the real
 /// clock; tests install a [`ManualClock`] so the TTL boundary needs no sleep.
 #[cfg(not(test))]
-fn mono_now() -> Instant {
+pub(crate) fn mono_now() -> Instant {
     Instant::now()
 }
 
@@ -512,7 +512,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn mono_now() -> Instant {
+pub(crate) fn mono_now() -> Instant {
     CLOCK
         .with(std::cell::Cell::get)
         .map_or_else(Instant::now, |(mono, _)| mono)

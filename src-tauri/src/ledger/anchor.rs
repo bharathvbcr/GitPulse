@@ -19,6 +19,12 @@
 //! that was copied in. No schema or writer-version change: the records are
 //! ordinary rows, found through `idx_events_session` by [`MARKER`].
 //!
+//! The same detail JSON also carries a **lineage UUID** (minted once, carried
+//! through every later record) and the **site**: the device and inode of the
+//! checkout directory when the record was written. Old binaries read only
+//! `roots`, `remotes` and `from` and ignore the rest; a record without them is
+//! legacy and is given them on the next settle.
+//!
 //! # The rule
 //!
 //! Rows naming a path other than this repository's are accepted as a prior
@@ -34,10 +40,17 @@
 //! 3. the remotes do not contradict: when both sides name any, they share at
 //!    least one (a remote added after the move is fine, a fork that points
 //!    `origin` elsewhere is not);
-//! 4. no prior path is still occupied by a Git repository of its own. A
+//! 4. when the record names a site, this checkout directory is that very
+//!    directory. A rename keeps the inode; a sibling clone, a history-merging
+//!    repository and any other copy are different directories, whether or not
+//!    the original still exists. A record with no site (legacy, or a platform
+//!    with no inode) falls back to the roots-only rule;
+//! 5. no prior path is still occupied by a Git repository of its own. A
 //!    checkout that still exists at the old path is a copy or an independent
 //!    clone, not a move, and is never absorbed. Nothing is run at a prior path:
-//!    it comes from ledger content, which a checkout's writer controls.
+//!    it comes from ledger content, which a checkout's writer controls. The
+//!    probe runs before the write transaction, never inside it, and the
+//!    transaction only rechecks that the set of prior paths is the one probed.
 //!
 //! The prior paths are then recorded in a [`REANCHOR`] row naming the new path;
 //! history is not rewritten. A row is foreign unless it names this path or a
@@ -47,13 +60,17 @@
 //!
 //! The ledger lives inside the checkout, so whoever can write the checkout can
 //! write any row, including an identity record: the guard catches accidents
-//! and copies, not a deliberate forger. Two independent clones of one upstream
-//! have the same identity, so a ledger copied from one into the other is taken
-//! for a move once the source is gone.
+//! and copies, not a deliberate forger. The lineage UUID lives only in the
+//! ledger, so it is identical in a ledger and in every copy of it and cannot
+//! tell them apart; the site is what does. The site is not a marker in the
+//! repository (nothing is written into `.git`), so a move that changes the
+//! directory's inode (a cross-device `mv`, a restore from backup at a new path)
+//! is refused like a copy, and an inode reused by a new checkout after the
+//! original was deleted is indistinguishable from the original.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use rusqlite::types::ValueRef;
@@ -64,6 +81,7 @@ use super::{
     canonical_repo, foreign_row_sql, home_spellings, insert, prepare, write_tx, ActorKind, Draft,
     LedgerError,
 };
+use crate::engine::ref_cache::mono_now;
 
 /// The action of the record written while a ledger is at home.
 const ANCHOR: &str = "ledger.anchor";
@@ -86,7 +104,17 @@ const MAX_ALIASES: usize = 256;
 /// comes from ledger content and may sit on a mount that never answers.
 const OCCUPIED_BUDGET: Duration = Duration::from_secs(5);
 /// How long a repository whose identity could not be settled is left alone.
+/// Measured on `ref_cache::mono_now`, the repo's clock seam, so a test moves it
+/// by hand instead of sleeping.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
+/// Probes of prior paths that may be unanswered at once, across the process.
+/// One per path (a retry reuses it), and no more than this in total.
+const MAX_OUTSTANDING_PROBES: usize = 64;
+/// How many times one settle re-reads the prior paths when the ledger gained
+/// some between the probe and the transaction.
+const SETTLE_PASSES: usize = 2;
+/// The code of the internal "the prior paths changed under the probe" answer.
+const STALE_PROBE: &str = "identity_probe_stale";
 /// Bound on the one `git rev-list` that reads the roots.
 const READ_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -123,13 +151,19 @@ impl Identity {
         })
     }
 
-    fn to_detail(&self, from: &[String]) -> String {
+    fn to_detail(&self, from: &[String], binding: Option<&Binding>) -> String {
         let mut detail = serde_json::json!({
             "roots": self.roots,
             "remotes": self.remotes,
         });
         if !from.is_empty() {
             detail["from"] = serde_json::json!(from);
+        }
+        if let Some(binding) = binding {
+            detail["uuid"] = serde_json::json!(binding.uuid);
+            if let Some((dev, ino)) = binding.site {
+                detail["site"] = serde_json::json!({ "dev": dev, "ino": ino });
+            }
         }
         detail.to_string()
     }
@@ -148,6 +182,89 @@ impl Identity {
             remotes: set("remotes")?,
         })
     }
+}
+
+/// The device and inode of a checkout directory.
+type Site = (u64, u64);
+
+/// What an identity record says beyond roots and remotes: which ledger lineage
+/// it is, and which directory it was written in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Binding {
+    uuid: String,
+    site: Option<Site>,
+}
+
+impl Binding {
+    /// `None` for a legacy record (no usable `uuid`). A `site` that is not two
+    /// integers is absent, never half-read.
+    fn from_detail(detail: &serde_json::Value) -> Option<Binding> {
+        let uuid = detail.get("uuid")?.as_str()?;
+        if uuid.is_empty() || uuid.len() > 64 || uuid.chars().any(char::is_control) {
+            return None;
+        }
+        let site = detail
+            .get("site")
+            .and_then(|site| Some((site.get("dev")?.as_u64()?, site.get("ino")?.as_u64()?)));
+        Some(Binding {
+            uuid: uuid.to_string(),
+            site,
+        })
+    }
+}
+
+/// What the ledger last recorded about its repository.
+struct Recorded {
+    identity: Identity,
+    binding: Option<Binding>,
+}
+
+/// What this process reads of the repository before it touches the ledger.
+struct Observed {
+    identity: Result<Identity, String>,
+    site: Option<Site>,
+}
+
+impl Observed {
+    fn read(repo_path: &str) -> Observed {
+        Observed {
+            identity: Identity::read(repo_path),
+            site: site_of(Path::new(&canonical_repo(repo_path))),
+        }
+    }
+}
+
+/// The site of the directory at `path`, where the platform has inodes.
+fn site_of(path: &Path) -> Option<Site> {
+    super::file_id(path).map(|id| (id.0, id.1))
+}
+
+/// A random version-4 UUID. A lineage name, never a credential: nothing is
+/// authorised by knowing it.
+fn new_uuid() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let part = |salt: u64| {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u64(salt);
+        hasher.write_u64(super::ids::now_millis());
+        hasher.finish().to_be_bytes()
+    };
+    let (high, low) = (part(1), part(2));
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(&high);
+    b[8..].copy_from_slice(&low);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
 }
 
 /// Whether `current` is the repository `recorded` was, and why not.
@@ -300,7 +417,7 @@ pub(super) fn aliases(conn: &Connection, home: &[String]) -> Result<Vec<String>,
 }
 
 /// The newest identity record: what the ledger last knew this repository to be.
-fn latest_identity(conn: &Connection) -> Result<Option<Identity>, LedgerError> {
+fn latest_identity(conn: &Connection) -> Result<Option<Recorded>, LedgerError> {
     let detail: Option<Option<String>> = conn
         .query_row(
             "SELECT detail_json FROM events WHERE session_id = ?1 AND action IN (?2, ?3)
@@ -313,16 +430,21 @@ fn latest_identity(conn: &Connection) -> Result<Option<Identity>, LedgerError> {
     Ok(detail
         .flatten()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .and_then(|value| Identity::from_detail(&value)))
+        .and_then(|value| {
+            Some(Recorded {
+                identity: Identity::from_detail(&value)?,
+                binding: Binding::from_detail(&value),
+            })
+        }))
 }
 
-/// Whether `prior` is, today, a Git repository other than the one at `home`.
-/// Filesystem only: a path from ledger content is never a place to run Git.
-fn occupied(prior: &str, home: &Path) -> bool {
-    match Path::new(prior).canonicalize() {
-        Ok(real) => real != home && crate::engine::git_cli::is_git_repository(&real),
-        Err(_) => false,
-    }
+/// The real path of `prior` when it is, today, a Git repository; `None` when it
+/// is not (or does not exist). Filesystem only: a path from ledger content is
+/// never a place to run Git. Independent of which repository asks, so one
+/// answer serves every caller.
+fn repository_at(prior: &str) -> Option<PathBuf> {
+    let real = Path::new(prior).canonicalize().ok()?;
+    crate::engine::git_cli::is_git_repository(&real).then_some(real)
 }
 
 /// Whether a prior path names a place a repository could have been: absolute
@@ -332,26 +454,158 @@ fn is_location(prior: &str) -> bool {
     Path::new(prior).is_absolute() && !prior.chars().any(char::is_control)
 }
 
-/// The first of `paths` that `probe` reports occupied, or `Err` when the probe
-/// did not finish within `budget` (or died): an unanswered question is a
-/// refusal, never "vacant". The probe runs on its own thread so a mount that
-/// never answers cannot hold the pass; the thread is left to finish on its own.
-fn first_occupied(
-    paths: Vec<String>,
+/// Asks whether a path is a repository: `Some(real path)` when it is.
+type Probe = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
+
+/// Where one probe stands.
+enum Answer {
+    Pending,
+    Done(Option<PathBuf>),
+    Died,
+}
+
+/// One outstanding probe of one path, shared by every caller that asks while
+/// it is unanswered.
+struct Slot {
+    answer: Mutex<Answer>,
+    ready: Condvar,
+}
+
+/// Probes prior paths on worker threads, at most one outstanding per path and
+/// [`MAX_OUTSTANDING_PROBES`] in all. A mount that never answers costs one
+/// parked thread, however many retries ask about it: later callers wait on
+/// that probe's slot, and the thread removes it when it finally answers.
+struct Prober {
     budget: Duration,
-    probe: impl Fn(&str) -> bool + Send + 'static,
-) -> Result<Option<String>, String> {
-    let (send, receive) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("ledger-anchor-occupied".into())
-        .spawn(move || {
-            let found = paths.into_iter().find(|path| probe(path));
-            let _ = send.send(found);
-        })
-        .map_err(|e| format!("could not check the earlier locations: {e}"))?;
-    receive
-        .recv_timeout(budget)
-        .map_err(|_| format!("the earlier locations could not be checked within {budget:?}"))
+    probe: Probe,
+    slots: Arc<Mutex<HashMap<String, Arc<Slot>>>>,
+}
+
+fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl Prober {
+    fn new(budget: Duration, probe: Probe) -> Prober {
+        Prober {
+            budget,
+            probe,
+            slots: Arc::default(),
+        }
+    }
+
+    /// The probe slot of `path`: the outstanding one, or a fresh one with its
+    /// worker started.
+    fn slot(&self, path: &str) -> Result<Arc<Slot>, String> {
+        let mut slots = locked(&self.slots);
+        if let Some(slot) = slots.get(path) {
+            return Ok(Arc::clone(slot));
+        }
+        if slots.len() >= MAX_OUTSTANDING_PROBES {
+            return Err(format!(
+                "{MAX_OUTSTANDING_PROBES} earlier locations are still unanswered"
+            ));
+        }
+        let slot = Arc::new(Slot {
+            answer: Mutex::new(Answer::Pending),
+            ready: Condvar::new(),
+        });
+        slots.insert(path.to_string(), Arc::clone(&slot));
+        let (worker, registry, probe, key) = (
+            Arc::clone(&slot),
+            Arc::clone(&self.slots),
+            Arc::clone(&self.probe),
+            path.to_string(),
+        );
+        let started = std::thread::Builder::new()
+            .name("ledger-anchor-occupied".into())
+            .spawn(move || {
+                let outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| probe(&key)));
+                *locked(&worker.answer) = outcome.map_or(Answer::Died, Answer::Done);
+                worker.ready.notify_all();
+                let mut slots = locked(&registry);
+                if slots
+                    .get(&key)
+                    .is_some_and(|held| Arc::ptr_eq(held, &worker))
+                {
+                    slots.remove(&key);
+                }
+            });
+        if let Err(e) = started {
+            slots.remove(path);
+            return Err(format!("could not check the earlier locations: {e}"));
+        }
+        Ok(slot)
+    }
+
+    /// The real path of `path` when it is a repository, or `Err` when the probe
+    /// did not answer by `deadline` (or died): an unanswered question is a
+    /// refusal, never "vacant".
+    fn ask(&self, path: &str, deadline: Instant) -> Result<Option<PathBuf>, String> {
+        let slot = self.slot(path)?;
+        let wait = deadline.saturating_duration_since(Instant::now());
+        let (answer, _) = slot
+            .ready
+            .wait_timeout_while(locked(&slot.answer), wait, |a| matches!(a, Answer::Pending))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*answer {
+            Answer::Done(found) => Ok(found.clone()),
+            Answer::Died => Err("checking an earlier location failed".to_string()),
+            Answer::Pending => Err(format!(
+                "the earlier locations could not be checked within {:?}",
+                self.budget
+            )),
+        }
+    }
+
+    /// The first of `paths` that is a repository other than `home`, or `Err`
+    /// when the whole question could not be answered within the budget.
+    fn first_occupied(&self, paths: &[String], home: &Path) -> Result<Option<String>, String> {
+        let deadline = Instant::now() + self.budget;
+        for path in paths {
+            if self.ask(path, deadline)?.is_some_and(|real| real != home) {
+                return Ok(Some(path.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Probes the prior paths a settle is about to judge, outside any ledger
+    /// transaction. Only a plausible list is probed: one `settle_in` would
+    /// refuse for its length or shape anyway is left unprobed.
+    fn probe(&self, foreign: Vec<String>, home: &Path) -> Probed {
+        if foreign.len() > MAX_PRIOR_PATHS || foreign.iter().any(|path| !is_location(path)) {
+            return Probed::default();
+        }
+        let verdict = self.first_occupied(&foreign, home);
+        Probed {
+            checked: foreign.into_iter().collect(),
+            verdict,
+        }
+    }
+}
+
+/// What probing the prior paths found, and which paths it covered.
+struct Probed {
+    checked: BTreeSet<String>,
+    verdict: Result<Option<String>, String>,
+}
+
+impl Default for Probed {
+    fn default() -> Self {
+        Probed {
+            checked: BTreeSet::new(),
+            verdict: Ok(None),
+        }
+    }
+}
+
+fn prober() -> &'static Prober {
+    static PROBER: OnceLock<Prober> = OnceLock::new();
+    PROBER.get_or_init(|| Prober::new(OCCUPIED_BUDGET, Arc::new(repository_at)))
 }
 
 fn record(
@@ -406,6 +660,10 @@ fn states() -> &'static Mutex<std::collections::HashMap<PathBuf, State>> {
 /// settled is looked at again after [`RETRY_AFTER`], so that fixing the cause
 /// (removing the stale copy) heals it without a restart.
 pub(crate) fn settle(repo_path: &str) -> Result<Option<Vec<String>>, LedgerError> {
+    settle_with(repo_path, prober())
+}
+
+fn settle_with(repo_path: &str, prober: &Prober) -> Result<Option<Vec<String>>, LedgerError> {
     let db = super::ledger_path(repo_path);
     // Read under the lock, acted on outside it: the probe below waits for the
     // ledger's own lock, and that wait must not hold every other repository's
@@ -416,7 +674,7 @@ pub(crate) fn settle(repo_path: &str) -> Result<Option<Vec<String>>, LedgerError
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match states.get(&db) {
             Some(State::Settled) => Some(None),
-            Some(State::Waiting { until, refusal }) if Instant::now() < *until => {
+            Some(State::Waiting { until, refusal }) if mono_now() < *until => {
                 Some(Some(refusal.clone()))
             }
             _ => None,
@@ -438,17 +696,38 @@ pub(crate) fn settle(repo_path: &str) -> Result<Option<Vec<String>>, LedgerError
         Some(Some(refusal)) => return refusal.map_or(Ok(None), Err),
         None => {}
     }
-    // Git runs before the ledger's lock is taken, never under it.
-    let current = Identity::read(repo_path);
-    let result = super::with_conn(repo_path, |conn| settle_in(conn, repo_path, &current));
+    // Git and the probe of prior paths run before the ledger's write
+    // transaction is opened, never under it: a mount that never answers must
+    // not hold every other writer for the probe's budget.
+    let seen = Observed::read(repo_path);
+    let home = PathBuf::from(canonical_repo(repo_path));
+    let mut result = Err(LedgerError::new(STALE_PROBE, "the prior locations changed"));
+    for _ in 0..SETTLE_PASSES {
+        let foreign = match super::with_conn(repo_path, |conn| {
+            Ok(foreign_of(conn, repo_path).unwrap_or_default())
+        }) {
+            Ok(foreign) => foreign,
+            Err(e) => return Err(e),
+        };
+        let probed = prober.probe(foreign, &home);
+        result = super::with_conn(repo_path, |conn| settle_in(conn, repo_path, &seen, &probed));
+        if !matches!(&result, Err(e) if e.code == STALE_PROBE) {
+            break;
+        }
+    }
+    if matches!(&result, Err(e) if e.code == STALE_PROBE) {
+        result = Err(mismatch(
+            "the ledger kept gaining earlier locations while they were being checked",
+        ));
+    }
     let next = match &result {
-        Ok(_) if current.is_ok() => State::Settled,
+        Ok(_) if seen.identity.is_ok() => State::Settled,
         Ok(_) => State::Waiting {
-            until: Instant::now() + RETRY_AFTER,
+            until: mono_now() + RETRY_AFTER,
             refusal: None,
         },
         Err(e) if e.code == "repository_mismatch" => State::Waiting {
-            until: Instant::now() + RETRY_AFTER,
+            until: mono_now() + RETRY_AFTER,
             refusal: Some(e.clone()),
         },
         Err(_) => return result,
@@ -466,43 +745,88 @@ pub(crate) fn settle(repo_path: &str) -> Result<Option<Vec<String>>, LedgerError
     result
 }
 
+/// The spellings of other repositories' paths that rows of this ledger name and
+/// no re-anchor record to this repository vouches for.
+fn foreign_of(conn: &Connection, repo_path: &str) -> Result<Vec<String>, LedgerError> {
+    let home = home_spellings(repo_path);
+    let mut allowed = home.clone();
+    allowed.extend(aliases(conn, &home)?);
+    allowed.sort();
+    allowed.dedup();
+    foreign_paths(conn, &allowed)
+}
+
+/// Judges the ledger under one write transaction. `probed` was gathered before
+/// the transaction opened; it is only trusted for the prior paths it covered,
+/// and a ledger that has gained others since is answered [`STALE_PROBE`] for
+/// the caller to probe again.
 fn settle_in(
     conn: &Connection,
     repo_path: &str,
-    current: &Result<Identity, String>,
+    seen: &Observed,
+    probed: &Probed,
 ) -> Result<Option<Vec<String>>, LedgerError> {
     let failed = |e: rusqlite::Error| LedgerError::new("query_failed", e.to_string());
     let tx = write_tx(conn).map_err(failed)?;
-    let home = home_spellings(repo_path);
-    let mut allowed = home.clone();
-    allowed.extend(aliases(&tx, &home)?);
-    allowed.sort();
-    allowed.dedup();
-    let foreign = foreign_paths(&tx, &allowed)?;
+    let foreign = foreign_of(&tx, repo_path)?;
     let latest = latest_identity(&tx)?;
     let canonical = canonical_repo(repo_path);
+    let kept = latest.as_ref().and_then(|r| r.binding.as_ref());
 
     if foreign.is_empty() {
-        if let Ok(identity) = current {
-            if latest.as_ref() != Some(identity) {
-                record(&tx, &canonical, ANCHOR, identity.to_detail(&[]))?;
+        if let Ok(identity) = &seen.identity {
+            // The lineage is carried; a legacy record is given one here, and a
+            // site that could not be read this time keeps the one recorded.
+            let binding = Binding {
+                uuid: kept.map_or_else(new_uuid, |b| b.uuid.clone()),
+                site: seen.site.or(kept.and_then(|b| b.site)),
+            };
+            let current = latest
+                .as_ref()
+                .is_some_and(|r| &r.identity == identity && r.binding.as_ref() == Some(&binding));
+            if !current {
+                record(
+                    &tx,
+                    &canonical,
+                    ANCHOR,
+                    identity.to_detail(&[], Some(&binding)),
+                )?;
             }
         }
         tx.commit().map_err(failed)?;
         return Ok(None);
     }
 
-    let identity = current.as_ref().map_err(|e| {
+    let identity = seen.identity.as_ref().map_err(|e| {
         mismatch(format!(
             "this repository's identity could not be read ({e})"
         ))
     })?;
-    let recorded = latest.ok_or_else(|| {
+    let recorded = latest.as_ref().ok_or_else(|| {
         mismatch(
             "it records no repository identity, so a moved or copied repository cannot be told from a foreign one",
         )
     })?;
-    same_repository(&recorded, identity).map_err(mismatch)?;
+    same_repository(&recorded.identity, identity).map_err(mismatch)?;
+    if let Some(Binding {
+        site: Some(anchored),
+        ..
+    }) = &recorded.binding
+    {
+        match seen.site {
+            Some(here) if here == *anchored => {}
+            Some(_) => {
+                return Err(mismatch(
+                    "this checkout is not the directory the ledger was anchored in: a copy or another clone, not a move",
+                ))
+            }
+            None => {
+                return Err(mismatch(
+                    "the ledger was anchored to a directory and this checkout's directory could not be read",
+                ))
+            }
+        }
+    }
     if foreign.len() > MAX_PRIOR_PATHS {
         return Err(mismatch(format!(
             "it names more than {MAX_PRIOR_PATHS} other repository locations"
@@ -513,17 +837,34 @@ fn settle_in(
             "it names {odd:?}, which is no absolute repository path"
         )));
     }
-    let home_dir = PathBuf::from(&canonical);
-    if let Some(live) = first_occupied(foreign.clone(), OCCUPIED_BUDGET, move |prior| {
-        occupied(prior, &home_dir)
-    })
-    .map_err(mismatch)?
-    {
-        return Err(mismatch(format!(
-            "{live} is still a Git repository: this is a copy or another clone, not a move"
-        )));
+    if foreign.iter().any(|prior| !probed.checked.contains(prior)) {
+        return Err(LedgerError::new(
+            STALE_PROBE,
+            "the ledger gained earlier locations since they were probed",
+        ));
     }
-    let cursor = record(&tx, &canonical, REANCHOR, identity.to_detail(&foreign))?;
+    match &probed.verdict {
+        Err(unanswered) => return Err(mismatch(unanswered)),
+        Ok(Some(live)) => {
+            return Err(mismatch(format!(
+                "{live} is still a Git repository: this is a copy or another clone, not a move"
+            )))
+        }
+        Ok(None) => {}
+    }
+    let binding = Binding {
+        uuid: recorded
+            .binding
+            .as_ref()
+            .map_or_else(new_uuid, |b| b.uuid.clone()),
+        site: seen.site,
+    };
+    let cursor = record(
+        &tx,
+        &canonical,
+        REANCHOR,
+        identity.to_detail(&foreign, Some(&binding)),
+    )?;
     tx.commit().map_err(failed)?;
     super::announce(repo_path, cursor);
     Ok(Some(foreign))
@@ -628,7 +969,38 @@ mod tests {
     }
 
     fn reanchor_to(conn: &Connection, to: &str, from: &[String]) -> i64 {
-        record(conn, to, REANCHOR, Identity::default().to_detail(from)).unwrap()
+        record(
+            conn,
+            to,
+            REANCHOR,
+            Identity::default().to_detail(from, None),
+        )
+        .unwrap()
+    }
+
+    /// What `settle_with` does around `settle_in`, minus the process cache: read
+    /// the prior paths, probe them with no transaction open, then judge.
+    fn judge(
+        conn: &Connection,
+        repo: &str,
+        seen: &Observed,
+        prober: &Prober,
+    ) -> Result<Option<Vec<String>>, LedgerError> {
+        let foreign = foreign_of(conn, repo).unwrap_or_default();
+        let probed = prober.probe(foreign, Path::new(&canonical_repo(repo)));
+        settle_in(conn, repo, seen, &probed)
+    }
+
+    fn real_prober() -> Prober {
+        Prober::new(OCCUPIED_BUDGET, Arc::new(repository_at))
+    }
+
+    /// An observation of a repository with `recorded`'s identity and no site.
+    fn seen(recorded: &Identity) -> Observed {
+        Observed {
+            identity: Ok(recorded.clone()),
+            site: None,
+        }
     }
 
     fn refusal(conn: &Connection, repo: &str) -> Option<String> {
@@ -742,9 +1114,9 @@ mod tests {
             let (_dir, repo) = home();
             let recorded = identity(&["r1"], &[]);
             super::super::with_conn(&repo, |conn| {
-                record(conn, &repo, ANCHOR, recorded.to_detail(&[])).unwrap();
+                record(conn, &repo, ANCHOR, recorded.to_detail(&[], None)).unwrap();
                 row_of(conn, hostile);
-                let out = settle_in(conn, &repo, &Ok(recorded.clone()));
+                let out = judge(conn, &repo, &seen(&recorded), &real_prober());
                 assert_eq!(
                     out.err().map(|e| e.code.to_string()).as_deref(),
                     Some("repository_mismatch"),
@@ -759,30 +1131,104 @@ mod tests {
     /// Threat: a prior path on a mount that never answers must not hang a pass.
     #[test]
     fn a_probe_that_never_answers_is_a_refusal_not_a_hang() {
-        let started = Instant::now();
-        let out = first_occupied(
-            vec!["/net/slow".to_string(), "/fast".to_string()],
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let hold = Mutex::new(hold);
+        let slow = Prober::new(
             Duration::from_millis(150),
-            |path| {
+            Arc::new(move |path: &str| {
                 if path == "/net/slow" {
-                    std::thread::sleep(Duration::from_secs(30));
+                    let _ = locked(&hold).recv_timeout(Duration::from_secs(30));
                 }
-                false
-            },
+                None
+            }),
+        );
+        let started = Instant::now();
+        let out = slow.first_occupied(
+            &["/net/slow".to_string(), "/fast".to_string()],
+            Path::new("/home"),
         );
         assert!(out.is_err(), "{out:?}");
         // Relaxed at most 4x (20 s), still short of the 30 s probe.
         assert!(started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5)));
-        let out = first_occupied(
-            vec!["/a".to_string(), "/b".to_string()],
+        drop(release);
+        let found = Prober::new(
             Duration::from_secs(5),
-            |path| path == "/b",
+            Arc::new(|path: &str| (path == "/b").then(|| PathBuf::from(path))),
         );
-        assert_eq!(out, Ok(Some("/b".to_string())));
         assert_eq!(
-            first_occupied(vec!["/a".to_string()], Duration::from_secs(5), |_| false),
+            found.first_occupied(&["/a".to_string(), "/b".to_string()], Path::new("/home")),
+            Ok(Some("/b".to_string()))
+        );
+        assert_eq!(
+            found.first_occupied(&["/a".to_string()], Path::new("/home")),
             Ok(None)
         );
+        // A prior path that is the repository's own home is no other repository.
+        assert_eq!(
+            found.first_occupied(&["/b".to_string()], Path::new("/b")),
+            Ok(None)
+        );
+    }
+
+    /// Residual: a hung mount left one parked thread per 30 s retry. At most one
+    /// probe is outstanding per path, however often it is asked about, and a
+    /// late answer is what every waiter then gets.
+    #[test]
+    fn a_hung_path_costs_one_probe_thread_however_often_it_is_asked() {
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let hold = Arc::new(Mutex::new(hold));
+        let counted = Arc::clone(&started);
+        let prober = Prober::new(
+            Duration::from_millis(40),
+            Arc::new(move |path: &str| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = locked(&hold).recv_timeout(Duration::from_secs(30));
+                Some(PathBuf::from(path))
+            }),
+        );
+        let paths = ["/net/hung".to_string()];
+        for _ in 0..8 {
+            assert!(prober.first_occupied(&paths, Path::new("/home")).is_err());
+        }
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(locked(&prober.slots).len(), 1);
+        // The mount answers: the one probe finishes, its slot is released, and
+        // the next ask is a fresh probe.
+        release.send(()).unwrap();
+        let deadline =
+            Instant::now() + crate::test_support::coverage_relaxed(Duration::from_secs(5));
+        while !locked(&prober.slots).is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the probe never released its slot"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(release);
+    }
+
+    /// The total is bounded too: more hung paths than the cap are refused
+    /// rather than each given a thread.
+    #[test]
+    fn probes_outstanding_at_once_are_capped() {
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let hold = Arc::new(Mutex::new(hold));
+        let prober = Prober::new(
+            Duration::from_millis(5),
+            Arc::new(move |_: &str| {
+                let _ = locked(&hold).recv_timeout(Duration::from_secs(30));
+                None
+            }),
+        );
+        let deadline = Instant::now() + Duration::from_millis(5);
+        for i in 0..MAX_OUTSTANDING_PROBES {
+            assert!(prober.ask(&format!("/hung/{i}"), deadline).is_err());
+        }
+        let over = prober.ask("/hung/over", deadline).unwrap_err();
+        assert!(over.contains("still unanswered"), "{over}");
+        assert_eq!(locked(&prober.slots).len(), MAX_OUTSTANDING_PROBES);
+        drop(release);
     }
 
     /// Two processes settling one moved ledger: the second finds the first's
@@ -792,7 +1238,7 @@ mod tests {
         let (_dir, repo) = home();
         let recorded = identity(&["r1"], &["https://h/a"]);
         super::super::with_conn(&repo, |conn| {
-            record(conn, &repo, ANCHOR, recorded.to_detail(&[])).unwrap();
+            record(conn, &repo, ANCHOR, recorded.to_detail(&[], None)).unwrap();
             row_of(conn, "/gone");
             Ok(())
         })
@@ -800,12 +1246,13 @@ mod tests {
         let db = super::super::ledger_path(&repo);
         let first = Connection::open(&db).unwrap();
         let second = Connection::open(&db).unwrap();
-        let current = Ok(recorded.clone());
+        let current = seen(&recorded);
+        let prober = real_prober();
         assert_eq!(
-            settle_in(&first, &repo, &current).unwrap(),
+            judge(&first, &repo, &current, &prober).unwrap(),
             Some(vec!["/gone".to_string()])
         );
-        assert_eq!(settle_in(&second, &repo, &current).unwrap(), None);
+        assert_eq!(judge(&second, &repo, &current, &prober).unwrap(), None);
         let count: i64 = first
             .query_row(
                 "SELECT count(*) FROM events WHERE action = ?1",
@@ -867,7 +1314,7 @@ mod tests {
                 roots: ["r1".to_string()].into(),
                 remotes: remotes_in(&config),
             }
-            .to_detail(&[]);
+            .to_detail(&[], None);
             assert!(
                 !detail.to_lowercase().contains("secrettok"),
                 "{url}: {detail}"
@@ -911,7 +1358,7 @@ mod tests {
         let prepared = prepare(&Draft {
             repo_path: "/placeholder".into(),
             action: ANCHOR.into(),
-            detail_json: Some(identity.to_detail(&[])),
+            detail_json: Some(identity.to_detail(&[], None)),
             ..Default::default()
         })
         .unwrap();
@@ -965,6 +1412,285 @@ mod tests {
                 started.elapsed()
             );
         });
+    }
+
+    /// A git repository whose ledger holds a legacy identity record (as written
+    /// before the lineage and site existed) and one row naming `prior`.
+    fn moved_legacy_ledger(prior: &str) -> (tempfile::TempDir, String) {
+        let (dir, repo) = git_repo();
+        let identity = Identity::read(&repo).unwrap();
+        super::super::with_conn(&repo, |conn| {
+            record(conn, prior, ANCHOR, identity.to_detail(&[], None)).unwrap();
+            row_of(conn, prior);
+            Ok(())
+        })
+        .unwrap();
+        (dir, repo)
+    }
+
+    /// Residual 1: the probe of prior paths (up to 5 s, on its own thread) ran
+    /// inside `settle_in`'s write transaction, so a slow mount held the ledger's
+    /// write lock for its budget. The probe here tries to take that lock, from
+    /// another connection and through the registry's own, from the probe thread.
+    #[test]
+    fn the_probe_runs_with_no_ledger_lock_held() {
+        let (_dir, repo) = moved_legacy_ledger("/gone/before");
+        let write_lock_free = Arc::new(Mutex::new(None));
+        let registry_free = Arc::new(Mutex::new(None));
+        let (db, probed_repo) = (super::super::ledger_path(&repo), repo.clone());
+        let (lock_seen, registry_seen) = (Arc::clone(&write_lock_free), Arc::clone(&registry_free));
+        let prober = Prober::new(
+            crate::test_support::coverage_relaxed(Duration::from_secs(3)),
+            Arc::new(move |_: &str| {
+                let other = Connection::open(&db).unwrap();
+                other.busy_timeout(Duration::ZERO).unwrap();
+                let took = other.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").is_ok();
+                *locked(&lock_seen) = Some(took);
+                let reached = super::super::with_conn(&probed_repo, |_| Ok(())).is_ok();
+                *locked(&registry_seen) = Some(reached);
+                None
+            }),
+        );
+        assert_eq!(
+            settle_with(&repo, &prober).unwrap(),
+            Some(vec!["/gone/before".to_string()])
+        );
+        assert_eq!(
+            *locked(&write_lock_free),
+            Some(true),
+            "the write lock was held during the probe"
+        );
+        assert_eq!(
+            *locked(&registry_free),
+            Some(true),
+            "the ledger connection was held during the probe"
+        );
+    }
+
+    /// A prior path the ledger gained between the probe and the transaction was
+    /// never probed: it is not taken on trust, and a fresh settle covers it.
+    #[test]
+    fn a_prior_path_the_probe_did_not_cover_is_not_taken_on_trust() {
+        let (_dir, repo) = moved_legacy_ledger("/gone/one");
+        super::super::with_conn(&repo, |conn| {
+            row_of(conn, "/gone/two");
+            Ok(())
+        })
+        .unwrap();
+        let out = super::super::with_conn(&repo, |conn| {
+            let probed = Probed {
+                checked: ["/gone/one".to_string()].into(),
+                verdict: Ok(None),
+            };
+            settle_in(conn, &repo, &Observed::read(&repo), &probed)
+        });
+        assert_eq!(out.unwrap_err().code, STALE_PROBE);
+        assert_eq!(
+            settle_with(&repo, &real_prober()).unwrap(),
+            Some(vec!["/gone/one".to_string(), "/gone/two".to_string()])
+        );
+    }
+
+    /// Residual 3: the 30 s heal runs on the repo's clock seam, with no sleep.
+    #[test]
+    fn a_refused_repository_is_looked_at_again_after_the_retry_interval() {
+        let (_da, a) = git_repo();
+        let (db, b) = home();
+        crate::test_support::git_in(db.path(), &["clone", "-q", &a, &b]);
+        crate::test_support::trust_repo(Path::new(&b));
+        let identity = Identity::read(&b).unwrap();
+        super::super::with_conn(&b, |conn| {
+            record(conn, &a, ANCHOR, identity.to_detail(&[], None)).unwrap();
+            row_of(conn, &a);
+            Ok(())
+        })
+        .unwrap();
+        let clock = crate::engine::ref_cache::ManualClock::install();
+        let prober = real_prober();
+        let live = settle_with(&b, &prober).unwrap_err();
+        assert!(live.message.contains("copy or another clone"), "{live:?}");
+
+        std::fs::remove_dir_all(&a).unwrap();
+        clock.advance(RETRY_AFTER - Duration::from_secs(1));
+        let waiting = settle_with(&b, &prober).unwrap_err();
+        assert_eq!(waiting.message, live.message, "answered from the cache");
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(settle_with(&b, &prober).unwrap(), Some(vec![a]));
+    }
+
+    fn bound(site: Option<Site>) -> String {
+        let recorded = identity(&["r1"], &[]);
+        recorded.to_detail(
+            &[],
+            Some(&Binding {
+                uuid: "7f9c24e8-3b1a-4c5d-9e2f-0a1b2c3d4e5f".into(),
+                site,
+            }),
+        )
+    }
+
+    fn observed_at(site: Option<Site>) -> Observed {
+        Observed {
+            identity: Ok(identity(&["r1"], &[])),
+            site,
+        }
+    }
+
+    /// The site decides between a move and a copy that has the same roots and
+    /// remotes: a rename keeps the directory, anything else is another one.
+    #[test]
+    fn a_ledger_anchored_to_a_directory_follows_only_that_directory() {
+        for (here, outcome) in [
+            (Some((1, 2)), Ok(())),
+            (Some((1, 3)), Err("another clone")),
+            (Some((9, 2)), Err("another clone")),
+            (None, Err("could not be read")),
+        ] {
+            let (_dir, repo) = home();
+            super::super::with_conn(&repo, |conn| {
+                record(conn, &repo, ANCHOR, bound(Some((1, 2)))).unwrap();
+                row_of(conn, "/gone");
+                let out = judge(conn, &repo, &observed_at(here), &real_prober());
+                match outcome {
+                    Ok(()) => assert_eq!(out.unwrap(), Some(vec!["/gone".to_string()])),
+                    Err(why) => {
+                        let e = out.unwrap_err();
+                        assert!(e.message.contains(why), "{here:?}: {e:?}");
+                        assert_eq!(e.code, "repository_mismatch");
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    /// The re-anchor record names the new directory, so a second move is judged
+    /// against where the ledger last was, and the lineage is the same one.
+    #[test]
+    fn a_re_anchor_carries_the_lineage_and_the_new_site() {
+        let (_dir, repo) = home();
+        super::super::with_conn(&repo, |conn| {
+            record(conn, "/gone", ANCHOR, bound(Some((1, 2)))).unwrap();
+            row_of(conn, "/gone");
+            judge(conn, &repo, &observed_at(Some((1, 2))), &real_prober()).unwrap();
+            let latest = latest_identity(conn).unwrap().unwrap();
+            assert_eq!(
+                latest.binding,
+                Some(Binding {
+                    uuid: "7f9c24e8-3b1a-4c5d-9e2f-0a1b2c3d4e5f".into(),
+                    site: Some((1, 2)),
+                })
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Migration: a legacy record gets a lineage and a site on the next settle
+    /// at home, once; a refresh keeps the lineage; a site that cannot be read
+    /// this time keeps the recorded one.
+    #[test]
+    fn a_legacy_identity_record_is_given_a_lineage_on_the_next_settle() {
+        let (_dir, repo) = home();
+        let anchors = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM events WHERE action = ?1",
+                [ANCHOR],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        super::super::with_conn(&repo, |conn| {
+            let recorded = identity(&["r1"], &[]);
+            record(conn, &repo, ANCHOR, recorded.to_detail(&[], None)).unwrap();
+            assert!(latest_identity(conn).unwrap().unwrap().binding.is_none());
+            let prober = real_prober();
+            judge(conn, &repo, &observed_at(Some((4, 5))), &prober).unwrap();
+            let first = latest_identity(conn).unwrap().unwrap().binding.unwrap();
+            assert_eq!(first.site, Some((4, 5)));
+            assert_eq!(first.uuid.len(), 36);
+            assert_eq!(
+                first.uuid.as_bytes()[14],
+                b'4',
+                "a version-4 uuid: {}",
+                first.uuid
+            );
+            assert_eq!(anchors(conn), 2);
+
+            judge(conn, &repo, &observed_at(Some((4, 5))), &prober).unwrap();
+            assert_eq!(anchors(conn), 2, "nothing new to record");
+
+            let grown = Observed {
+                identity: Ok(identity(&["r1", "r2"], &[])),
+                site: None,
+            };
+            judge(conn, &repo, &grown, &prober).unwrap();
+            let after = latest_identity(conn).unwrap().unwrap().binding.unwrap();
+            assert_eq!(after, first, "lineage and site survive a refresh");
+            assert_eq!(anchors(conn), 3);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Compatibility with a binary that predates the lineage: it reads `roots`,
+    /// `remotes` and `from` out of the detail and nothing else, so the extra
+    /// fields cannot change what it sees. `Identity::from_detail` and
+    /// `aliases` are those readers, untouched by this change.
+    #[test]
+    fn a_detail_with_a_lineage_reads_back_through_the_readers_that_ignore_it() {
+        let recorded = identity(&["r1"], &["h:a/b"]);
+        let binding = Binding {
+            uuid: "7f9c24e8-3b1a-4c5d-9e2f-0a1b2c3d4e5f".into(),
+            site: Some((3, 4)),
+        };
+        let detail = recorded.to_detail(&["/old".to_string()], Some(&binding));
+        let value: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        assert_eq!(Identity::from_detail(&value), Some(recorded));
+        assert_eq!(Binding::from_detail(&value), Some(binding));
+        let (_dir, repo) = home();
+        super::super::with_conn(&repo, |conn| {
+            record(conn, &repo, REANCHOR, detail.clone()).unwrap();
+            assert_eq!(
+                aliases(conn, std::slice::from_ref(&repo)).unwrap(),
+                vec!["/old"]
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_lineage_that_is_not_a_plain_uuid_and_a_half_site_are_not_read() {
+        let read = |detail: serde_json::Value| Binding::from_detail(&detail);
+        assert_eq!(read(serde_json::json!({})), None);
+        assert_eq!(read(serde_json::json!({"uuid": 7})), None);
+        assert_eq!(read(serde_json::json!({"uuid": ""})), None);
+        assert_eq!(read(serde_json::json!({"uuid": "x".repeat(65)})), None);
+        assert_eq!(read(serde_json::json!({"uuid": "a\nb"})), None);
+        let half = read(serde_json::json!({"uuid": "u", "site": {"dev": 1}})).unwrap();
+        assert_eq!(half.site, None, "a half-read site is absent");
+        let two = read(serde_json::json!({"uuid": "u", "site": {"dev": 1, "ino": 2}})).unwrap();
+        assert_eq!(two.site, Some((1, 2)));
+    }
+
+    #[test]
+    fn minted_lineages_are_distinct_version_4_uuids() {
+        let ids: BTreeSet<String> = (0..64).map(|_| new_uuid()).collect();
+        assert_eq!(ids.len(), 64);
+        for id in ids {
+            let parts: Vec<usize> = id.split('-').map(str::len).collect();
+            assert_eq!(parts, [8, 4, 4, 4, 12], "{id}");
+            assert!(
+                id.chars().all(|c| c == '-' || c.is_ascii_hexdigit()),
+                "{id}"
+            );
+            assert!(
+                matches!(id.as_bytes()[19], b'8' | b'9' | b'a' | b'b'),
+                "{id}"
+            );
+        }
     }
 
     #[test]
