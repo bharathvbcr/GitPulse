@@ -11,6 +11,19 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Changed
+
+- The ledger moves to writer generation 2 (owner decision 1), one additive
+  schema bump: a typed nullable `events.occurred_at` (filled from a
+  well-formed event-time stamp), a nullable `transcript_cursors.fingerprint`,
+  the `reflog_watermarks` and `catch_up_state` tables, and a unique reflog
+  identity index. Nothing reads the new columns or tables yet. The migration runs
+  once, in one transaction, on the first writable open; it first deletes
+  duplicate reflog rows, keeping the lowest id of each (worktree, object, event
+  time, cut-object hash). A generation-1 build refuses to write a migrated
+  ledger, so reinstall `gitpulsed` with the app. A reflog entry another process
+  already recorded is skipped without counting as a dropped append.
+
 ### Added
 
 - `gitpulse_provenance` says where a commit sits relative to its base:
