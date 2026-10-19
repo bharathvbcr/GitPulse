@@ -455,7 +455,6 @@ pub fn run() {
             cmd_merge_branch,
             cmd_restack,
             cmd_stash_save,
-            cmd_stash_pop,
             cmd_repo_operation,
             cmd_note_tab_activated,
             cmd_last_fetch_at,

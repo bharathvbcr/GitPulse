@@ -165,8 +165,9 @@ describe("the command gate judges the command that actually runs", () => {
     // comparison below pass while examining nothing.
     // 14 since cmd_checkout_branch moved to a writer-built argv (DERIVED_ARGV),
     // 8 since the branch, tag and release commands moved to shared builders
-    // whose judged == spawned equality commands/parity_tests.rs asserts.
-    expect(compared.length, "no guarded commands were parsed for comparison").toBeGreaterThanOrEqual(8);
+    // whose judged == spawned equality commands/parity_tests.rs asserts, and
+    // 7 since cmd_stash_pop (the last hand-copied literal) was removed.
+    expect(compared.length, "no guarded commands were parsed for comparison").toBeGreaterThanOrEqual(7);
     for (const anchor of ["cmd_push", "cmd_commit", "cmd_fetch"]) {
       expect(compared.map((c) => c.name), `${anchor} must be compared`).toContain(anchor);
     }
