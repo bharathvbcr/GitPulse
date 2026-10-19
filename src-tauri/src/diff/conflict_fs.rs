@@ -280,7 +280,13 @@ mod unix {
     /// process umask. Asked of the kernel with an exclusive, immediately
     /// unlinked probe rather than by `umask(2)`, whose only read is a
     /// process-wide write that races every other thread's creates.
-    fn creation_mode(directory: &File) -> Result<u32, String> {
+    ///
+    /// The probe is named `.gitpulse-conflict-<pid>-<n>-mode-probe`. Nothing
+    /// scans for it: only the `-recovery` and conflict_session `create_temp`
+    /// suffixes are generated and none lists the directory by that prefix. If
+    /// the unlink fails the error names the leftover probe and nothing is
+    /// published. `path` is the file being written, used only for that name.
+    fn creation_mode(directory: &File, path: &Path) -> Result<u32, String> {
         for _ in 0..32 {
             let filename = format!(
                 ".gitpulse-conflict-{}-{}-mode-probe",
@@ -311,7 +317,13 @@ mod unix {
             let probe = opened(fd)?;
             let mode = probe.metadata().map(|meta| meta.mode() & 0o777);
             // SAFETY: removes only the probe name created above.
-            unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+            if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                return Err(format!(
+                    "Cannot remove the file mode probe {}: {}",
+                    path.with_file_name(&filename).display(),
+                    error()
+                ));
+            }
             return mode.map_err(|e| e.to_string());
         }
         Err("Cannot allocate a file mode probe".into())
@@ -483,7 +495,7 @@ mod unix {
                 // other tool would give it (`0o666` under the process umask).
                 // The staged temporary stays owner-only until here, so a
                 // failure above never leaves a world-readable leftover.
-                let mut mode = creation_mode(&directory)?;
+                let mut mode = creation_mode(&directory, path)?;
                 if next.mode == "100755" {
                     mode |= ((mode & 0o444) >> 2) | 0o100;
                 } else {
