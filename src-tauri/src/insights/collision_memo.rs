@@ -79,10 +79,13 @@ struct Slot<T> {
     held: Mutex<Option<(Instant, T)>>,
 }
 
+/// Each key's slot and the tick it was last asked for at.
+type Slots<T> = HashMap<String, (u64, Arc<Slot<T>>)>;
+
 /// Keyed answers that expire by age, filled one caller at a time per key.
 struct Memo<T> {
     cap: usize,
-    slots: Mutex<HashMap<String, (u64, Arc<Slot<T>>)>>,
+    slots: Mutex<Slots<T>>,
     touched: AtomicU64,
 }
 
