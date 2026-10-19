@@ -2486,15 +2486,6 @@ Unset the local override with `git config --local --unset-all user.name` and \
         git_text(&repo, &args)
     }
 
-    pub fn stash_pop(repo_path: &str) -> Result<String, String> {
-        let repo = validate_repo(repo_path)?;
-        let _repo_lock = repo_mutation_lock(&repo);
-        let _guard = _repo_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        git_text(&repo, &["stash", "pop"])
-    }
-
     /// Refuses when the worktree is already parked mid-operation, naming it.
     ///
     /// Starting a cherry-pick on top of a parked rebase does not queue behind

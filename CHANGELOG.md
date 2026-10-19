@@ -69,6 +69,13 @@ before that tag is pushed.
   `is_fresh` are unchanged. A verification does not carry over a rewrite
   (rebase, amend, squash): the new commit has none.
 
+### Removed
+
+- The unaddressed `cmd_stash_pop` IPC command and `GitWriter::stash_pop`. Nothing
+  called them: the menu, palette and native actions pop the listed entry by object
+  id through `cmd_stash_action`. Its generated `allow-cmd-stash-pop` permission goes
+  with it (derived from the handler list at build), and the registry is 284 handlers.
+
 ### Fixed
 
 - The Edit/Write hook (`gitpulse-hook collision-guard`) asks the running app for
