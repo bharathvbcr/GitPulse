@@ -4129,6 +4129,9 @@ mod query_tests;
 #[cfg(test)]
 mod schema_bump_tests;
 
+#[cfg(test)]
+mod schema_bump_adv_tests;
+
 /// Test-only helpers that need the private registry.
 #[cfg(test)]
 pub(crate) mod tests_support {
