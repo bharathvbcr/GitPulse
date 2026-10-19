@@ -42,7 +42,11 @@ export interface ProvenanceFreshness {
    * must never arrive as one.
    */
   distance: number | null;
-  /** Decays with distance. `null` when distance could not be measured. */
+  /**
+   * How much a recorded verification still counts; decays with distance.
+   * `null` when the commit has no verification note (`verified` is false) or
+   * the distance could not be measured.
+   */
   confidence: number | null;
   /** True only when the distance was measured *and* is zero. */
   is_fresh: boolean;
@@ -58,6 +62,12 @@ export interface ProvenanceFreshness {
    * unexamined commit as an unverified one.
    */
   notes_readable: boolean;
+  /**
+   * Whether a verification note is attached. It says a verification was
+   * recorded, not what it found (`verification.verdict` does). `confidence` is
+   * `null` whenever this is `false`.
+   */
+  verified: boolean;
   verification: VerificationNote | null;
   session: SessionEpisodeNote | null;
   /**

@@ -1343,6 +1343,30 @@ pub(crate) fn git_with_index(
     Ok(output.stdout)
 }
 
+/// [`git_captured`] with the object database redirected: new objects are
+/// written to `object_dir` and existing ones are read through `alternates`.
+///
+/// The redirect is applied after the environment scrub (an inherited
+/// `GIT_OBJECT_DIRECTORY` stays untrusted) and is the only override this seam
+/// takes, so the quarantine in [`crate::engine::object_quarantine`] is the one
+/// way a caller points git's object writes anywhere but the repository. The
+/// same trust check, spawn gate and output caps as [`git_captured`] apply; the
+/// deadline is the caller's.
+pub(crate) fn git_captured_quarantined(
+    repo: &Path,
+    args: &[&str],
+    object_dir: &Path,
+    alternates: &std::ffi::OsStr,
+    timeout: Duration,
+) -> Result<BoundedRun, String> {
+    crate::repository_trust::require(repo)?;
+    let label = format!("git {}", subcommand(args));
+    let mut command = git_command(Some(repo), args);
+    command.env("GIT_OBJECT_DIRECTORY", object_dir);
+    command.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", alternates);
+    run_bounded(command, &label, timeout, None)
+}
+
 /// Runs `git` in `repo` with an explicit deadline instead of
 /// [`DEFAULT_TIMEOUT`].
 ///
