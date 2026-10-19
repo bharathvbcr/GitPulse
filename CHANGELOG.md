@@ -37,6 +37,18 @@ before that tag is pushed.
 
 ### Added
 
+- Storage panel: a user-clicked "Write commit-graph..." for a repository whose
+  commit-graph is missing, out of date or lacks changed-path Bloom filters
+  (Owner Decision 3, part 2 of the commit-graph card). It previews the exact
+  command (`git commit-graph write --reachable --changed-paths`) and the common
+  git directory it writes under, runs only after a confirm, is judged by the
+  command gate, and is refused on an untrusted repository. It is hidden when the
+  graph is present and fresh, bounded at 600 s, cancellable, and one per common
+  directory (a second click joins the write already running). It writes derived
+  data under `objects/info` and no git config; the result is recorded as a
+  ledger event. Three new commands: `cmd_commit_graph_write_plan`,
+  `cmd_commit_graph_write` and `cmd_commit_graph_write_cancel`. Nothing in
+  ingest, the timers, hooks or MCP can run it.
 - `gitpulse_landed` answers whether a commit's work reached a base and how:
   `via` is `merge` (decided before `ff`, so a non-tip commit of a `--no-ff`
   branch reads merge), `ff`, `squash` (decided before `rebase`, so a

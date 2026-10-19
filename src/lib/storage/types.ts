@@ -136,6 +136,27 @@ export interface CommitGraphReport {
   note: string | null;
 }
 
+/** What a click on "Write commit-graph" would run (`cmd_commit_graph_write_plan`). */
+export interface CommitGraphWritePlan {
+  /** The exact line the gate judges and git is started with, program first. */
+  argv: string[];
+  /** The directory whose `objects/info` is written, shared by every worktree. */
+  common_dir: string;
+  state: CommitGraphState;
+  /** The run is killed after this many seconds. */
+  timeout_secs: number;
+}
+
+/** How a confirmed write ended (`cmd_commit_graph_write`). */
+export interface CommitGraphWriteOutcome {
+  cancelled: boolean;
+  /** This click joined a write another click had already started. */
+  joined: boolean;
+  elapsed_ms: number;
+  /** The detector's answer after the run. */
+  report: CommitGraphReport;
+}
+
 export interface StorageReport {
   repo_path: string;
   generated_at_epoch_secs: number;

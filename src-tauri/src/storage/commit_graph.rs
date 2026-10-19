@@ -17,10 +17,11 @@
 //!
 //! # What it does NOT do
 //!
-//! It never writes, and it holds no write command: the Health hint
-//! (`src/lib/health/commitGraph.ts`) shows the command for the person to run,
-//! because writing or refreshing a commit-graph from GitPulse is an undecided
-//! owner decision (OD 3).
+//! It never writes. The only writer is `GitWriter::commit_graph_write`
+//! (Owner Decision 3, approved): user-clicked from the Storage panel, previewed,
+//! gated, and offered only when [`CommitGraphState::offers_write`] says a write
+//! would help. The Health hint (`src/lib/health/commitGraph.ts`) still shows
+//! the command for a person who prefers their own terminal.
 //! It validates the header, chunk table, required chunk sizes, layer order and
 //! hash version, and checks every fanout bucket edge against the first byte
 //! of the OIDs on either side of it (at most 512 one-byte reads). It does not
@@ -102,6 +103,43 @@ pub struct CommitGraphReport {
     pub head_covered: Option<bool>,
     /// Why the state is what it is, in one sentence. Always set for `Unknown`.
     pub note: Option<String>,
+}
+
+impl CommitGraphState {
+    /// Whether a user-clicked write would improve this state. The one place
+    /// that decides when the Storage panel offers the button and when the
+    /// writer accepts a click: a present, fresh graph, an empty repository and
+    /// an unreadable state (never read as "missing") are all refused.
+    pub fn offers_write(self) -> bool {
+        matches!(self, Self::Missing | Self::Stale | Self::NoBloom)
+    }
+}
+
+/// What a click on "write commit-graph" would run, shown before it is
+/// confirmed. `argv` is the exact line the command gate judges and the writer
+/// spawns; `common_dir` is the directory whose `objects/info` it writes into,
+/// shared by every worktree of the repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitGraphWritePlan {
+    pub argv: Vec<String>,
+    pub common_dir: String,
+    pub state: CommitGraphState,
+    /// The run is killed after this many seconds.
+    pub timeout_secs: u64,
+}
+
+/// How a confirmed write ended. A timeout or a git failure is an error, not an
+/// outcome; a cancel is an outcome because the person asked for it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitGraphWriteOutcome {
+    /// The run was stopped by the person before git finished; nothing was kept.
+    pub cancelled: bool,
+    /// This click joined a write another click had already started in the
+    /// same common directory, and reports that write's result.
+    pub joined: bool,
+    pub elapsed_ms: u64,
+    /// The detector's answer after the run.
+    pub report: CommitGraphReport,
 }
 
 /// Longest note shown. Notes quote ref names and paths, which a repository
