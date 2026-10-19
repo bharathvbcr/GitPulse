@@ -3039,6 +3039,62 @@ mod tests {
         assert!(refused.is_err(), "{refused:?}");
     }
 
+    #[test]
+    fn ledger_events_argument_edges_at_the_wire() {
+        let (_dir, repo) = ledger_repo_with_events(12);
+        let call = |extra: Value| {
+            let mut arguments = json!({ "repo_path": repo });
+            for (key, value) in extra.as_object().unwrap() {
+                arguments[key] = value.clone();
+            }
+            validate_arguments("gitpulse_ledger_events", &arguments)
+                .map_err(|e| format!("refused: {e}"))
+                .and_then(|()| handle_tool_call("gitpulse_ledger_events", &arguments))
+        };
+        // Refused at the boundary, never reaching SQL.
+        for refused in [
+            json!({ "cursor": -1 }),
+            json!({ "cursor": "abc" }),
+            json!({ "cursor": 1.5 }),
+            json!({ "limit": 0 }),
+            json!({ "limit": 1001 }),
+            json!({ "limit": 4_294_967_295u64 }),
+            json!({ "order": "DESC" }),
+            json!({ "order": "" }),
+            json!({ "since_ts": "2026-01-01" }),
+            json!({ "since_ts": "2026-01-01T00:00:00.000z" }),
+            json!({ "since_ts": "2026-01-01T00:00:00.0000Z" }),
+            json!({ "action": "" }),
+            json!({ "object": "x".repeat(LEDGER_FILTER_MAX_BYTES + 1) }),
+        ] {
+            assert!(call(refused.clone()).is_err(), "{refused} was accepted");
+        }
+        // A cursor from an asc page, reused with desc, is an upper bound.
+        let asc = call(json!({ "limit": 5 })).unwrap();
+        assert_eq!(ledger_ids(&asc), vec![1, 2, 3, 4, 5]);
+        let flipped = call(json!({ "order": "desc", "cursor": asc["next_cursor"] })).unwrap();
+        assert_eq!(ledger_ids(&flipped), vec![4, 3, 2, 1]);
+        // Beyond the newest: the newest page. Zero: nothing is below it.
+        let beyond = call(json!({ "order": "desc", "cursor": 9_000_000, "limit": 2 })).unwrap();
+        assert_eq!(ledger_ids(&beyond), vec![12, 11]);
+        let zero = call(json!({ "order": "desc", "cursor": 0 })).unwrap();
+        assert_eq!(ledger_ids(&zero), Vec::<i64>::new());
+        assert_eq!(zero["truncated"], false);
+        // Every filter at once, with a value that matches nothing: an answer.
+        let none = call(json!({
+            "order": "desc", "limit": 3, "cursor": 100,
+            "since_ts": "2026-01-01T00:00:00.000Z", "action": "a", "object": "o",
+            "worktree_path": "w", "task_id": "t", "session_id": "s", "after_ref": "r"
+        }))
+        .unwrap();
+        assert_eq!(none["ok"], true);
+        assert_eq!(none["returned"], 0);
+        // A syntactically valid but impossible timestamp is accepted and simply
+        // orders after every real one.
+        let impossible = call(json!({ "since_ts": "2026-13-45T99:99:99.999Z" })).unwrap();
+        assert_eq!(impossible["returned"], 0);
+    }
+
     /// A trusted repository whose ledger holds `rows` events carrying `detail`
     /// bytes each, and the anchor to read it back by.
     fn repository_with_ledger_rows(rows: usize, detail: usize) -> (tempfile::TempDir, String) {
