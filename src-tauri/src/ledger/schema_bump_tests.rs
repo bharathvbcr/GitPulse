@@ -478,10 +478,13 @@ fn a_newer_ledger_is_refused_for_writes_and_left_unaltered() {
     .is_err());
 }
 
-/// Append cost of the OD 1 index: 10 000 real appends per arm into a fresh
-/// ledger, arms interleaved every round, minimum of 7 rounds, for an ordinary
-/// workload and for a reflog workload (the only rows the index covers). Run
-/// alone: `GITPULSE_TEST_WRITE_BUDGET=0 cargo test --manifest-path
+/// Append cost of the OD 1 index, isolated: 10 000 real appends per arm into
+/// a fresh ledger, arms rotated every round, minimum of 7 rounds, for an
+/// ordinary (session) workload and a reflog workload. Arms: a no new index;
+/// b the generation-2 key minus the ordinal; c the final key; d the final key
+/// with reflog drafts carrying no stamp (no stamp validated or parsed); e a
+/// cheap key (`ulid`) under the same partial predicate, pricing the predicate
+/// alone. Run alone: `GITPULSE_TEST_WRITE_BUDGET=0 cargo test --manifest-path
 /// src-tauri/Cargo.toml --lib -- --ignored --nocapture
 /// ledger::schema_bump_tests::bench_append_cost_of_the_reflog_identity_index`
 #[test]
@@ -489,27 +492,60 @@ fn a_newer_ledger_is_refused_for_writes_and_left_unaltered() {
 fn bench_append_cost_of_the_reflog_identity_index() {
     use std::time::{Duration, Instant};
     let rows = 10_000usize;
+    let arms = [
+        "a none",
+        "b old key",
+        "c final key",
+        "d final, no stamp",
+        "e cheap key",
+    ];
     for workload in ["session", "reflog"] {
-        let mut best = [Duration::MAX; 2];
+        let mut best = [Duration::MAX; 5];
         for round in 0..7 {
-            for step in 0..2 {
-                let with_index = (round + step) % 2 == 1;
+            for step in 0..arms.len() {
+                let arm = (round + step) % arms.len();
                 let (_dir, repo) = repo_dir();
                 with_conn(&repo, |conn| {
-                    if !with_index {
-                        conn.execute_batch(&format!("DROP INDEX {DEDUPED_INDEX}"))
-                            .map_err(|e| LedgerError::new("t", e.to_string()))?;
+                    let sql = |e: rusqlite::Error| LedgerError::new("t", e.to_string());
+                    if round == 0 && step == 0 && workload == "session" {
+                        let flags: Vec<(String, i64)> = conn
+                            .prepare("SELECT name, \"partial\" FROM pragma_index_list('events')")
+                            .map_err(sql)?
+                            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                            .map_err(sql)?
+                            .collect::<Result<_, _>>()
+                            .map_err(sql)?;
+                        let stored: String = conn
+                            .query_row(
+                                "SELECT sql FROM sqlite_master WHERE name = ?1",
+                                params![DEDUPED_INDEX],
+                                |r| r.get(0),
+                            )
+                            .map_err(sql)?;
+                        println!("INDEXLIST {flags:?}\nINDEXSQL {stored}");
                     }
+                    if arm != 2 && arm != 3 {
+                        conn.execute_batch(&format!("DROP INDEX {DEDUPED_INDEX}"))
+                            .map_err(sql)?;
+                    }
+                    match arm {
+                        1 => conn.execute_batch(&format!(
+                            "CREATE UNIQUE INDEX {DEDUPED_INDEX} ON events({REFLOG_GROUP_KEY}) WHERE {REFLOG_ROWS}"
+                        )),
+                        4 => conn.execute_batch(&format!(
+                            "CREATE UNIQUE INDEX {DEDUPED_INDEX} ON events(ulid) WHERE {REFLOG_ROWS}"
+                        )),
+                        _ => Ok(()),
+                    }
+                    .map_err(sql)?;
                     Ok(())
                 })
                 .unwrap();
                 let started = Instant::now();
                 for n in 0..rows {
                     let mut draft = if workload == "reflog" {
-                        reflog_draft(
-                            &repo,
-                            Some(&ids::iso8601_utc(1_700_000_000_000 + n as u64 * 1000)),
-                        )
+                        let at = ids::iso8601_utc(1_700_000_000_000 + n as u64 * 1000);
+                        reflog_draft(&repo, (arm != 3).then_some(at.as_str()))
                     } else {
                         Draft {
                             repo_path: repo.clone(),
@@ -522,18 +558,16 @@ fn bench_append_cost_of_the_reflog_identity_index() {
                     draft.object = Some(format!("{n:040x} echo {n}"));
                     append(draft).unwrap();
                 }
-                let slot = usize::from(with_index);
-                best[slot] = best[slot].min(started.elapsed());
+                best[arm] = best[arm].min(started.elapsed());
             }
         }
-        println!(
-            "APPENDBENCH {workload}: without index {:?} ({:?}/append), with index {:?} ({:?}/append), ratio {:.3}",
-            best[0],
-            best[0] / rows as u32,
-            best[1],
-            best[1] / rows as u32,
-            best[1].as_secs_f64() / best[0].as_secs_f64()
-        );
+        for (arm, name) in arms.iter().enumerate() {
+            println!(
+                "APPENDBENCH {workload} {name}: {:?}/append, ratio to a {:.3}",
+                best[arm] / rows as u32,
+                best[arm].as_secs_f64() / best[0].as_secs_f64()
+            );
+        }
     }
 }
 
