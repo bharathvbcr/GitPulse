@@ -85,6 +85,15 @@ before that tag is pushed.
   verification note (it was 1.0 for an unverified tip). `distance` and
   `is_fresh` are unchanged. A verification does not carry over a rewrite
   (rebase, amend, squash): the new commit has none.
+- Files and folders the editor or file tree creates follow the process umask
+  instead of being owner-only: a new file is `0o666 & !umask` (typically 0644,
+  as `touch` makes it), a new executable `0o777 & !umask` (as `git checkout`
+  makes it), and a new folder `0o777 & !umask`. This deliberately widens the
+  default mode of user-created content, as approved on 2026-10-19. Overwrites
+  keep the existing mode, and the staged temporary stays owner-only until it is
+  published. Under a umask that clears the owner write bit (`0o277`) a new
+  folder has no owner write bit, exactly as `mkdir -p` makes it; a test pins
+  that.
 
 ### Removed
 
