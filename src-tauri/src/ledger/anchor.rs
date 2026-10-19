@@ -1707,4 +1707,324 @@ mod tests {
         // Nothing recorded cannot vouch for anything.
         assert!(same_repository(&identity(&[], &["a"]), &identity(&["r1"], &["a"])).is_err());
     }
+
+    // ---- adversarial review of b17/723aab52-ledger-uuid ----
+
+    /// A trusted one-commit repository at `path` (created), with its identity
+    /// anchored and one event row under its own spelling, as a recording
+    /// session leaves it. Returns the canonical spelling.
+    fn real_repo_at(path: &Path) -> String {
+        std::fs::create_dir_all(path).unwrap();
+        let canonical = path.canonicalize().unwrap();
+        crate::test_support::git_in(&canonical, &["init", "-b", "main"]);
+        std::fs::write(canonical.join("seed.txt"), "seed").unwrap();
+        crate::test_support::git_in(&canonical, &["add", "seed.txt"]);
+        crate::test_support::git_in(&canonical, &["commit", "-m", "seed"]);
+        crate::test_support::trust_repo(&canonical);
+        let spelling = canonical.to_string_lossy().into_owned();
+        settle(&spelling).unwrap();
+        super::super::with_conn(&spelling, |conn| {
+            row_of(conn, &spelling);
+            Ok(())
+        })
+        .unwrap();
+        spelling
+    }
+
+    /// The anchor-writing path of a binary that predates the lineage.
+    fn old_binary_anchor(conn: &Connection, repo: &str, identity: &Identity) {
+        record(conn, repo, ANCHOR, identity.to_detail(&[], None)).unwrap();
+    }
+
+    /// macOS assigns an APFS volume's `st_dev` at mount time, so a reboot can
+    /// renumber it while the inode and the path stay the same (reports:
+    /// awebai/oats#1261, garrytan/gbrain#5604, openclaw#158781). A checkout
+    /// that is renamed while the app is closed and then opened after a reboot
+    /// is the same directory, and must follow its ledger.
+    #[test]
+    #[ignore = "adv: site compares st_dev, which macOS APFS renumbers across reboots; the same directory is refused as a copy"]
+    fn adv_a_renumbered_device_does_not_make_the_same_directory_a_copy() {
+        let (_dir, repo) = home();
+        super::super::with_conn(&repo, |conn| {
+            record(conn, &repo, ANCHOR, bound(Some((16777231, 42)))).unwrap();
+            row_of(conn, "/gone");
+            let out = judge(
+                conn,
+                &repo,
+                &observed_at(Some((16777234, 42))),
+                &real_prober(),
+            );
+            assert_eq!(out.unwrap(), Some(vec!["/gone".to_string()]));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// An old binary that refreshes the identity record (a remote added, say)
+    /// writes it without `uuid` and `site`. The next settle must not read that
+    /// as a legacy ledger and mint a second lineage.
+    #[test]
+    #[ignore = "adv: a record rewritten without uuid/site by an older binary makes the next settle mint a new lineage"]
+    fn adv_an_old_binary_refresh_does_not_lose_the_lineage() {
+        let (_dir, repo) = home();
+        super::super::with_conn(&repo, |conn| {
+            record(conn, &repo, ANCHOR, bound(Some((1, 2)))).unwrap();
+            let before = latest_identity(conn).unwrap().unwrap().binding.unwrap();
+            old_binary_anchor(conn, &repo, &identity(&["r1", "r2"], &[]));
+            let grown = Observed {
+                identity: Ok(identity(&["r1", "r2"], &[])),
+                site: Some((1, 2)),
+            };
+            judge(conn, &repo, &grown, &real_prober()).unwrap();
+            let after = latest_identity(conn).unwrap().unwrap().binding.unwrap();
+            assert_eq!(after.uuid, before.uuid, "the lineage was replaced");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// The same strip, aimed at the site: after an old binary's refresh the
+    /// newest record names no site, so a copy with the same roots takes the
+    /// ledger on the roots-only rule this change was meant to retire.
+    #[test]
+    #[ignore = "adv: a stripped identity record reopens the roots-only hole: a copy in another directory takes the ledger"]
+    fn adv_an_old_binary_refresh_does_not_reopen_the_copy_hole() {
+        let (_dir, repo) = home();
+        super::super::with_conn(&repo, |conn| {
+            record(conn, &repo, ANCHOR, bound(Some((1, 2)))).unwrap();
+            old_binary_anchor(conn, &repo, &identity(&["r1"], &["h:a/b"]));
+            row_of(conn, "/gone");
+            let copy = Observed {
+                identity: Ok(identity(&["r1"], &["h:a/b"])),
+                site: Some((1, 99)),
+            };
+            let out = judge(conn, &repo, &copy, &real_prober());
+            assert_eq!(
+                out.as_ref().map_err(|e| e.code),
+                Err("repository_mismatch"),
+                "a copy in another directory took the ledger: {out:?}"
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// `Binding::from_detail` accepts any short printable string as a lineage;
+    /// the test above it claims that a lineage "that is not a plain uuid" is
+    /// not read.
+    #[test]
+    #[ignore = "adv: any printable string up to 64 chars is accepted as the lineage uuid"]
+    fn adv_a_lineage_must_be_a_uuid() {
+        for forged in ["../../etc/passwd", "not-a-uuid", "'; DROP TABLE events;--"] {
+            let read = Binding::from_detail(&serde_json::json!({ "uuid": forged }));
+            assert_eq!(read, None, "{forged:?} was read as a lineage");
+        }
+    }
+
+    /// A prior path that becomes a repository after the probe answered "free"
+    /// and before the transaction commits is taken over: the transaction only
+    /// rechecks that the set of paths is the probed one, not that the answers
+    /// still hold.
+    #[test]
+    #[ignore = "adv: the occupancy answer is not rechecked in the transaction, so a path occupied after the probe is accepted"]
+    fn adv_a_prior_path_occupied_after_the_probe_is_not_taken_over() {
+        let (_da, prior) = home();
+        let (_dir, repo) = moved_legacy_ledger(&prior);
+        let home_path = PathBuf::from(canonical_repo(&repo));
+        let probed = real_prober().probe(vec![prior.clone()], &home_path);
+        assert_eq!(probed.verdict, Ok(None));
+        crate::test_support::git_in(Path::new(&prior), &["init", "-b", "main"]);
+        let out = super::super::with_conn(&repo, |conn| {
+            settle_in(conn, &repo, &Observed::read(&repo), &probed)
+        });
+        assert_eq!(
+            out.as_ref().map_err(|e| e.code),
+            Err("repository_mismatch"),
+            "{out:?}"
+        );
+    }
+
+    /// `until` is measured on `mono_now`, a thread-local clock under test, but
+    /// is stored in a process-global map. A refusal recorded under a
+    /// `ManualClock` is an hour in the real future once the clock is dropped.
+    #[test]
+    #[ignore = "adv: a refusal stamped under a ManualClock outlives it by the clock's hour of headroom (test-only leak through the global state map)"]
+    fn adv_a_retry_deadline_stamped_on_the_manual_clock_does_not_outlive_it() {
+        let (_da, a) = git_repo();
+        let (db, b) = home();
+        crate::test_support::git_in(db.path(), &["clone", "-q", &a, &b]);
+        crate::test_support::trust_repo(Path::new(&b));
+        let identity = Identity::read(&b).unwrap();
+        super::super::with_conn(&b, |conn| {
+            record(conn, &a, ANCHOR, identity.to_detail(&[], None)).unwrap();
+            row_of(conn, &a);
+            Ok(())
+        })
+        .unwrap();
+        {
+            let _clock = crate::engine::ref_cache::ManualClock::install();
+            settle_with(&b, &real_prober()).unwrap_err();
+        }
+        let key = super::super::ledger_path(&b);
+        let until = match states().lock().unwrap().get(&key) {
+            Some(State::Waiting { until, .. }) => *until,
+            _ => panic!("no refusal cached"),
+        };
+        let ahead = until.saturating_duration_since(Instant::now());
+        assert!(
+            ahead <= RETRY_AFTER + Duration::from_secs(5),
+            "the real-time retry deadline is {ahead:?} away"
+        );
+    }
+
+    /// One ledger that names 64 hung paths must not be able to occupy the
+    /// whole probe pool; it should cost one thread (held, kept as a check).
+    #[test]
+    fn adv_one_ledger_cannot_fill_the_probe_pool() {
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let hold = Arc::new(Mutex::new(hold));
+        let prober = Prober::new(
+            Duration::from_millis(20),
+            Arc::new(move |_: &str| {
+                let _ = locked(&hold).recv_timeout(Duration::from_secs(30));
+                None
+            }),
+        );
+        let paths: Vec<String> = (0..MAX_PRIOR_PATHS).map(|i| format!("/hung/{i}")).collect();
+        assert!(prober.first_occupied(&paths, Path::new("/home")).is_err());
+        assert_eq!(locked(&prober.slots).len(), 1);
+        drop(release);
+    }
+
+    /// A probe that panics is an unanswered question: a refusal, never "free".
+    #[test]
+    fn adv_a_panicking_probe_is_a_refusal() {
+        let prober = Prober::new(
+            Duration::from_secs(2),
+            Arc::new(|_: &str| -> Option<PathBuf> { panic!("adv probe panic") }),
+        );
+        let out = prober.first_occupied(&["/x".to_string()], Path::new("/home"));
+        assert!(out.is_err(), "{out:?}");
+        let again = prober.probe(vec!["/x".to_string()], Path::new("/home"));
+        assert!(again.verdict.is_err(), "{:?}", again.verdict);
+    }
+
+    /// Two connections migrating one legacy record at once mint one lineage.
+    #[test]
+    fn adv_concurrent_legacy_migrations_mint_one_lineage() {
+        let (_dir, repo) = home();
+        super::super::with_conn(&repo, |conn| {
+            old_binary_anchor(conn, &repo, &identity(&["r1"], &[]));
+            Ok(())
+        })
+        .unwrap();
+        let db = super::super::ledger_path(&repo);
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let conn = Connection::open(&db).unwrap();
+                    conn.busy_timeout(Duration::from_secs(10)).unwrap();
+                    barrier.wait();
+                    judge(&conn, &repo, &observed_at(Some((4, 5))), &real_prober()).unwrap();
+                });
+            }
+        });
+        let conn = Connection::open(&db).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT detail_json FROM events WHERE action = ?1")
+            .unwrap();
+        let uuids: BTreeSet<String> = stmt
+            .query_map([ANCHOR], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|d| {
+                let v: serde_json::Value = serde_json::from_str(&d.unwrap()).unwrap();
+                Some(v.get("uuid")?.as_str()?.to_string())
+            })
+            .collect();
+        assert_eq!(uuids.len(), 1, "{uuids:?}");
+    }
+
+    /// Settles a real repository after `mover` relocates its directory, and
+    /// returns what `settle` made of the new place.
+    fn settle_after(
+        old: &Path,
+        new: &Path,
+        mover: impl FnOnce(),
+    ) -> (String, Result<Option<Vec<String>>, LedgerError>) {
+        let before = real_repo_at(old);
+        mover();
+        crate::test_support::trust_repo(&new.canonicalize().unwrap());
+        (before, settle(&new.to_string_lossy()))
+    }
+
+    #[test]
+    fn adv_case_only_rename_keeps_the_ledger() {
+        let (parent, _) = home();
+        let (old, new) = (
+            parent.path().join("CaseRepo"),
+            parent.path().join("caserepo"),
+        );
+        let (before, out) = settle_after(&old, &new, || std::fs::rename(&old, &new).unwrap());
+        assert_eq!(out.unwrap(), Some(vec![before]));
+    }
+
+    #[test]
+    fn adv_symlinked_path_to_a_moved_checkout_keeps_the_ledger() {
+        let (parent, _) = home();
+        let (old, new) = (parent.path().join("old"), parent.path().join("new"));
+        let link = parent.path().join("link");
+        let (before, out) = settle_after(&old, &new, || {
+            std::fs::rename(&old, &new).unwrap();
+            std::os::unix::fs::symlink(&new, &link).unwrap();
+        });
+        drop(out);
+        let via_link = settle(&link.to_string_lossy());
+        assert!(via_link.is_ok(), "{before}: {via_link:?}");
+    }
+
+    #[test]
+    fn adv_parent_directory_rename_keeps_the_ledger() {
+        let (parent, _) = home();
+        let (old, new) = (
+            parent.path().join("outer").join("repo"),
+            parent.path().join("outer2").join("repo"),
+        );
+        let (before, out) = settle_after(&old, &new, || {
+            std::fs::rename(parent.path().join("outer"), parent.path().join("outer2")).unwrap();
+        });
+        assert_eq!(out.unwrap(), Some(vec![before]));
+    }
+
+    #[test]
+    fn adv_git_worktree_move_keeps_the_ledger() {
+        let (parent, _) = home();
+        let main = parent.path().join("main");
+        let _ = real_repo_at(&main);
+        let (old, new) = (parent.path().join("wt"), parent.path().join("wt-moved"));
+        crate::test_support::git_in(
+            &main.canonicalize().unwrap(),
+            &["worktree", "add", "-q", &old.to_string_lossy(), "-b", "wt"],
+        );
+        let wt = old.canonicalize().unwrap().to_string_lossy().into_owned();
+        crate::test_support::trust_repo(&old.canonicalize().unwrap());
+        settle(&wt).unwrap();
+        super::super::with_conn(&wt, |conn| {
+            row_of(conn, &wt);
+            Ok(())
+        })
+        .unwrap();
+        crate::test_support::git_in(
+            &main.canonicalize().unwrap(),
+            &[
+                "worktree",
+                "move",
+                &old.to_string_lossy(),
+                &new.to_string_lossy(),
+            ],
+        );
+        crate::test_support::trust_repo(&new.canonicalize().unwrap());
+        let out = settle(&new.to_string_lossy());
+        assert_eq!(out.unwrap(), Some(vec![wt]));
+    }
 }
