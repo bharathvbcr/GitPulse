@@ -99,6 +99,11 @@ pub fn establish() -> Launch {
                 primary.attach_gate(std::sync::Arc::new(|cwd, command| {
                     crate::hooks::serve_gate(cwd, command)
                 }));
+                // The collision scan every Edit/Write hook would otherwise run
+                // itself, remembered for a few seconds (`insights::collision_memo`).
+                primary.attach_collision(std::sync::Arc::new(|repo, path| {
+                    crate::hooks::serve_collision(repo, path)
+                }));
                 let _ = PRIMARY.set(primary);
             }
             launch
