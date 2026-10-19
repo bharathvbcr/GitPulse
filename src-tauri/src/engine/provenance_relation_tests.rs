@@ -179,3 +179,6 @@ mod adversarial;
 
 #[path = "provenance_landing_tests.rs"]
 mod landing;
+
+#[path = "provenance_adv_landed_tests.rs"]
+mod adv_round2;

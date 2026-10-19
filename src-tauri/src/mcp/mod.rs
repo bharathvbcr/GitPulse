@@ -27,6 +27,8 @@
 #[cfg(test)]
 mod adversarial_deferral_tests;
 #[cfg(test)]
+mod adversarial_landed_round2_tests;
+#[cfg(test)]
 mod adversarial_landed_tests;
 #[cfg(test)]
 mod adversarial_probe_tests;
