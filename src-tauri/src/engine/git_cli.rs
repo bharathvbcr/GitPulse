@@ -917,6 +917,11 @@ fn git_command_with_env(
         _ => cmd.args(args),
     };
     pin_git_environment(&mut cmd);
+    if NO_LAZY_FETCH.get() {
+        // Set after the scrub, like the other pins: a missing object of a
+        // partial clone is then an error instead of a fetch from the remote.
+        cmd.env("GIT_NO_LAZY_FETCH", "1");
+    }
     // Git resolves its own helpers through the child's PATH, so a GUI launch
     // handed them the same minimal `/usr/bin:/bin:/usr/sbin:/sbin` that hid
     // `gh` and `cargo` from us: `gpg` for a signed commit, the interpreter a
@@ -1341,6 +1346,30 @@ pub(crate) fn git_with_index(
         ));
     }
     Ok(output.stdout)
+}
+
+/// [`git_captured`] with the object database redirected: new objects are
+/// written to `object_dir` and existing ones are read through `alternates`.
+///
+/// The redirect is applied after the environment scrub (an inherited
+/// `GIT_OBJECT_DIRECTORY` stays untrusted) and is the only override this seam
+/// takes, so the quarantine in [`crate::engine::object_quarantine`] is the one
+/// way a caller points git's object writes anywhere but the repository. The
+/// same trust check, spawn gate and output caps as [`git_captured`] apply; the
+/// deadline is the caller's.
+pub(crate) fn git_captured_quarantined(
+    repo: &Path,
+    args: &[&str],
+    object_dir: &Path,
+    alternates: &std::ffi::OsStr,
+    timeout: Duration,
+) -> Result<BoundedRun, String> {
+    crate::repository_trust::require(repo)?;
+    let label = format!("git {}", subcommand(args));
+    let mut command = git_command(Some(repo), args);
+    command.env("GIT_OBJECT_DIRECTORY", object_dir);
+    command.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", alternates);
+    run_bounded(command, &label, timeout, None)
 }
 
 /// Runs `git` in `repo` with an explicit deadline instead of
@@ -4531,6 +4560,27 @@ fn run_with_gate(
         gate,
         &|| {},
     )
+}
+
+thread_local! {
+    /// Set only by [`without_lazy_fetch`]: every git this thread builds gets
+    /// `GIT_NO_LAZY_FETCH=1`.
+    static NO_LAZY_FETCH: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `body` with every git command built on this thread told not to fetch
+/// missing objects from a promisor remote (`GIT_NO_LAZY_FETCH=1`, git 2.44 and
+/// later; older gits ignore an unknown variable, which is why a read that must
+/// not fetch also refuses a partial clone up front instead of relying on this).
+pub(crate) fn without_lazy_fetch<T>(body: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NO_LAZY_FETCH.set(self.0);
+        }
+    }
+    let _restore = Restore(NO_LAZY_FETCH.replace(true));
+    body()
 }
 
 thread_local! {
