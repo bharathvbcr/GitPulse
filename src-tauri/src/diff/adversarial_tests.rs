@@ -207,3 +207,112 @@ fn absent_save_over_an_existing_file_keeps_it() {
     assert_eq!(r, Err(WriteFailure::AlreadyExists));
     assert_eq!(std::fs::read(&f).unwrap(), b"mine");
 }
+
+/// Sets the process umask for a test and restores it on drop. The umask is
+/// process-wide, so the guard holds the env serial for its whole lifetime.
+struct Umask {
+    previous: libc::mode_t,
+    _serial: crate::test_support::env::EnvGuard,
+}
+
+impl Umask {
+    fn set(mask: libc::mode_t) -> Self {
+        let serial = crate::test_support::env::env_serial();
+        // SAFETY: umask only swaps the process mask and cannot fail.
+        let previous = unsafe { libc::umask(mask) };
+        Self {
+            previous,
+            _serial: serial,
+        }
+    }
+}
+
+impl Drop for Umask {
+    fn drop(&mut self) {
+        // SAFETY: restores the mask this guard replaced.
+        unsafe { libc::umask(self.previous) };
+    }
+}
+
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// A new file follows the process umask, like `touch` and a git checkout.
+#[test]
+fn a_new_file_gets_the_umask_default_mode() {
+    let (_g, root) = tmp();
+    for (mask, want) in [(0o022, 0o644), (0o077, 0o600), (0o002, 0o664)] {
+        let _umask = Umask::set(mask);
+        let f = root.join(format!("new-{mask:o}.txt"));
+        write_regular_expecting(&f, Expect::Absent, |_| Ok(b"x".to_vec())).unwrap();
+        assert_eq!(mode_of(&f), want, "umask {mask:o}");
+    }
+}
+
+/// New folders made on the way to a new file follow the umask too.
+#[test]
+fn a_new_directory_gets_the_umask_default_mode() {
+    let (_g, root) = tmp();
+    {
+        let _umask = Umask::set(0o022);
+        write_regular_expecting(
+            &root.join("a/b/new.txt"),
+            Expect::Absent,
+            |_| Ok(Vec::new()),
+        )
+        .unwrap();
+        assert_eq!(mode_of(&root.join("a")), 0o755);
+        assert_eq!(mode_of(&root.join("a/b")), 0o755);
+    }
+    let _tight = Umask::set(0o077);
+    write_regular_expecting(&root.join("c/new.txt"), Expect::Absent, |_| Ok(Vec::new())).unwrap();
+    assert_eq!(mode_of(&root.join("c")), 0o700);
+    drop(_tight);
+    let _loose = Umask::set(0o002);
+    write_regular_expecting(&root.join("d/new.txt"), Expect::Absent, |_| Ok(Vec::new())).unwrap();
+    assert_eq!(mode_of(&root.join("d")), 0o775);
+}
+
+/// An overwrite keeps the existing mode whatever the umask is.
+#[test]
+fn an_overwrite_keeps_the_existing_mode_under_any_umask() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_g, root) = tmp();
+    for mask in [0o022, 0o077] {
+        let _umask = Umask::set(mask);
+        for mode in [0o755, 0o600, 0o640] {
+            let f = root.join(format!("f-{mask:o}-{mode:o}"));
+            std::fs::write(&f, b"old").unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(mode)).unwrap();
+            write_regular_expecting(&f, Expect::Any, |_| Ok(b"new".to_vec())).unwrap();
+            assert_eq!(std::fs::read(&f).unwrap(), b"new");
+            assert_eq!(mode_of(&f), mode, "umask {mask:o}, mode {mode:o}");
+        }
+    }
+}
+
+/// The temporary the atomic write stages in is never world-readable, and a
+/// write that fails after staging leaves nothing behind that is.
+#[test]
+fn a_failed_create_leaves_no_world_readable_temporary() {
+    let (_g, root) = tmp();
+    let _umask = Umask::set(0o022);
+    let f = root.join("raced.txt");
+    let racer = f.clone();
+    let result = write_regular_after_check(
+        &f,
+        Expect::Absent,
+        |_| Ok(b"secret".to_vec()),
+        move || std::fs::write(&racer, b"other").unwrap(),
+    );
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(std::fs::read(&f).unwrap(), b"other");
+    for entry in std::fs::read_dir(&root).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() != "raced.txt" {
+            assert_eq!(mode_of(&entry.path()) & 0o077, 0, "{:?}", entry.path());
+        }
+    }
+}
