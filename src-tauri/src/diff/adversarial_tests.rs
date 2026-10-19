@@ -532,3 +532,53 @@ fn a_new_file_in_a_read_only_folder_fails_cleanly() {
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
+
+/// ATTACK 2: a folder with an inheritable ACL gives a saved new file the same
+/// mode and the same inherited entries as a file created the ordinary way.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_new_file_in_an_acl_folder_matches_an_ordinary_create() {
+    use crate::procguard::LockedSpawn;
+    let (_g, root) = tmp();
+    let run = |program: &str, args: &[&str]| {
+        let out = std::process::Command::new(program)
+            .args(args)
+            .output_locked()
+            .unwrap();
+        assert!(out.status.success(), "{program} {args:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let dir = root.join("acl");
+    std::fs::create_dir(&dir).unwrap();
+    run(
+        "/bin/chmod",
+        &[
+            "+a",
+            "group:everyone allow read,file_inherit",
+            dir.to_str().unwrap(),
+        ],
+    );
+    let plain = dir.join("plain.txt");
+    std::fs::File::create(&plain).unwrap();
+    let saved = dir.join("saved.txt");
+    write_regular_expecting(&saved, Expect::Absent, |_| Ok(b"x".to_vec())).unwrap();
+    // `ls -le` prints the mode column, then the inherited ACL lines.
+    let describe = |path: &Path| {
+        let listing = run("/bin/ls", &["-le", path.to_str().unwrap()]);
+        let mut lines = listing.lines();
+        let head = lines.next().unwrap_or_default();
+        let mode: String = head.split_whitespace().next().unwrap_or_default().into();
+        (mode, lines.map(str::trim).collect::<Vec<_>>().join("|"))
+    };
+    let (plain_mode, plain_acl) = describe(&plain);
+    let (saved_mode, saved_acl) = describe(&saved);
+    assert!(!plain_acl.is_empty(), "the folder ACL was not inherited");
+    assert_eq!(
+        saved_mode.trim_end_matches('+'),
+        plain_mode.trim_end_matches('+')
+    );
+    assert_eq!(
+        saved_acl.split_once(' ').map(|x| x.1),
+        plain_acl.split_once(' ').map(|x| x.1)
+    );
+}
