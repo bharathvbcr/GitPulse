@@ -89,6 +89,8 @@ fn read_fingerprint_bytes(
     tail: usize,
 ) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
     use std::io::{Read, Seek};
+    #[cfg(test)]
+    FINGERPRINT_OPENS.with(|opens| opens.set(opens.get() + 1));
     let before = offset
         .checked_sub(tail as u64)
         .ok_or(std::io::ErrorKind::UnexpectedEof)?;
@@ -105,10 +107,33 @@ fn read_fingerprint_bytes(
 /// file at `path` ([`ledger::cursor_fingerprint`]), read from the file as it is
 /// now. `None` when it cannot be read or `offset` is 0: the cursor is then
 /// stored with none and checked by length alone, as it was before they existed.
-fn fingerprint_at(path: &std::path::Path, offset: u64) -> Option<String> {
+fn fingerprint_at(
+    path: &std::path::Path,
+    offset: u64,
+    stat: Option<ledger::FileStat>,
+) -> Option<String> {
     let n = usize::try_from(offset.min(ledger::CURSOR_FINGERPRINT_BYTES as u64)).ok()?;
     let (head, tail) = read_fingerprint_bytes(path, offset, n, n).ok()?;
-    ledger::cursor_fingerprint(&head, &tail)
+    ledger::cursor_fingerprint(&head, &tail, stat)
+}
+
+/// A file's length and mtime in nanoseconds, as a fingerprint records them;
+/// `None` when the filesystem will not say, which leaves the cursor's
+/// fingerprint without a stat and so re-hashed on every pass.
+fn file_stat(meta: &std::fs::Metadata) -> Option<ledger::FileStat> {
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some((meta.len(), u64::try_from(mtime.as_nanos()).ok()?))
+}
+
+// Files the fingerprint check has opened on this thread: what the "an
+// unchanged transcript costs a stat" tests count.
+#[cfg(test)]
+thread_local! {
+    pub(super) static FINGERPRINT_OPENS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether the bytes of the file at `path` that `fingerprint` covers are still
@@ -119,13 +144,27 @@ fn fingerprint_at(path: &std::path::Path, offset: u64) -> Option<String> {
 /// cannot be read right now, is not evidence of a rewrite: reading again
 /// from the start would record every line twice, and the open that follows
 /// reports a file that really cannot be read.
-fn fingerprint_matches(path: &std::path::Path, offset: u64, fingerprint: &str) -> bool {
-    let Some((head, tail)) = ledger::cursor_fingerprint_lens(fingerprint) else {
+///
+/// `now` is the file's stat as the pass already read it. A fingerprint that
+/// recorded a stat and finds the same one is a match with no open: the file has
+/// not been written since the cursor was. Any difference (a rewrite that kept
+/// the size but moved the mtime included) re-hashes the bytes. One without a
+/// stat always re-hashes.
+fn fingerprint_matches(
+    path: &std::path::Path,
+    now: Option<ledger::FileStat>,
+    offset: u64,
+    fingerprint: &str,
+) -> bool {
+    let Some(parts) = ledger::parse_cursor_fingerprint(fingerprint) else {
         return true;
     };
-    match read_fingerprint_bytes(path, offset, head, tail) {
+    if parts.stat.is_some() && parts.stat == now {
+        return true;
+    }
+    match read_fingerprint_bytes(path, offset, parts.head, parts.tail) {
         Ok((head, tail)) => {
-            ledger::cursor_fingerprint(&head, &tail).as_deref() == Some(fingerprint)
+            ledger::cursor_fingerprint(&head, &tail, parts.stat).as_deref() == Some(fingerprint)
         }
         Err(e) => e.kind() != std::io::ErrorKind::UnexpectedEof,
     }
@@ -135,16 +174,18 @@ fn fingerprint_matches(path: &std::path::Path, offset: u64, fingerprint: &str) -
 /// participant of a family usually holds the same offset.
 struct Probe<'a> {
     path: &'a std::path::Path,
+    /// The file's stat as the pass read it before anything else.
+    now: Option<ledger::FileStat>,
     answers: HashMap<(u64, String), bool>,
 }
 
 impl Probe<'_> {
     fn matches(&mut self, offset: u64, fingerprint: &str) -> bool {
-        let path = self.path;
+        let (path, now) = (self.path, self.now);
         *self
             .answers
             .entry((offset, fingerprint.to_string()))
-            .or_insert_with(|| fingerprint_matches(path, offset, fingerprint))
+            .or_insert_with(|| fingerprint_matches(path, now, offset, fingerprint))
     }
 
     /// Whether `participant`'s cursor on `file_key` still describes this file:
@@ -263,8 +304,10 @@ fn ingest_family(
         };
         let len = meta.len();
         let modified_ms = super::modified_ms(&meta);
+        let stat = file_stat(&meta);
         let mut probe = Probe {
             path: &path,
+            now: stat,
             answers: HashMap::new(),
         };
         let owed = owed_on(&participants, &file_key, len, modified_ms, &mut probe);
@@ -430,7 +473,10 @@ fn ingest_family(
         let end = start + consumed;
         // Taken from the file as it stands once the lines are read, and only
         // when a cursor is to be written at all.
-        let fingerprint = fingerprint_at(&path, end);
+        // The stat recorded with it is the one taken before the read: a file
+        // written during or after the read then differs on the next pass and is
+        // re-hashed, never taken for unchanged.
+        let fingerprint = fingerprint_at(&path, end, stat);
         let mut has_events = false;
         for (owes, drafts) in owed.iter().zip(drafts) {
             // A pass cut before it reached this participant's cursor moved

@@ -261,11 +261,7 @@ fn the_reflog_identity_query_uses_its_partial_index() {
     append(draft(&repo, "git.commit")).unwrap();
     let plan: Vec<String> = with_conn(&repo, |conn| {
         let mut stmt = conn
-            .prepare(
-                "EXPLAIN QUERY PLAN SELECT object FROM events
-                 WHERE action LIKE 'reflog.%' AND object IS NOT NULL
-                   AND (worktree_path IN (?1, ?2) OR (?3 AND worktree_path IS NULL))",
-            )
+            .prepare(&format!("EXPLAIN QUERY PLAN {RECORDED_REFLOG_SQL}"))
             .map_err(|e| LedgerError::new("t", e.to_string()))?;
         let rows = stmt
             .query_map(params!["a", "a", true], |row| row.get::<_, String>(3))

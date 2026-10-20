@@ -1975,3 +1975,5 @@ mod reflog_bench_tests;
 mod reflog_coverage_tests;
 #[cfg(test)]
 mod reflog_replay_tests;
+#[cfg(test)]
+mod transcript_bench_tests;

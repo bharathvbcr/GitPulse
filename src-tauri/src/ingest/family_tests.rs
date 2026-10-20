@@ -1602,6 +1602,113 @@ fn a_cursor_with_no_fingerprint_is_checked_by_length_alone() {
     assert_eq!(nested.rows_for("new2.rs").len(), 1, "{:?}", nested.rows());
 }
 
+fn fingerprint_opens() -> u64 {
+    pass::FINGERPRINT_OPENS.with(std::cell::Cell::get)
+}
+
+/// An unchanged transcript costs the `stat` the pass already made and nothing
+/// more: its fingerprint records the file's length and mtime, and a file that
+/// still has them is not opened.
+#[test]
+fn an_unchanged_transcript_is_not_opened_by_the_fingerprint_check() {
+    let nested = Nested::new();
+    let w = nested.worktrees[0].clone();
+    with_transcript_root(&nested.corpus, || {
+        for i in 0..20 {
+            write_lines(
+                &nested.file(&format!("U{i}.jsonl")),
+                &[edit_line(&w, &format!("U{i}"), 1, &format!("{w}/a{i}.rs"))],
+            );
+        }
+        let first = nested.pass(&nested.base, &[&w]);
+        assert_eq!(first.recorded, 20, "{first:?}");
+        let before = fingerprint_opens();
+        let second = nested.pass(&nested.base, &[&w]);
+        assert_eq!(second.recorded, 0, "{second:?}");
+        assert_eq!(
+            fingerprint_opens() - before,
+            0,
+            "an unchanged transcript was opened to be hashed"
+        );
+    });
+}
+
+/// A rewrite that keeps the size but moves the mtime is re-hashed, found
+/// different and read again.
+#[test]
+fn a_same_size_rewrite_with_a_new_mtime_is_detected() {
+    let nested = Nested::new();
+    let w = nested.worktrees[0].clone();
+    with_transcript_root(&nested.corpus, || {
+        let path = nested.file("M1.jsonl");
+        write_lines(&path, &[edit_line(&w, "M1", 1, &format!("{w}/a.rs"))]);
+        nested.pass(&nested.base, &[&w]);
+        write_lines(&path, &[edit_line(&w, "M1", 2, &format!("{w}/a.rs"))]);
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let before = fingerprint_opens();
+        let rewritten = nested.pass(&nested.base, &[&w]);
+        assert_eq!(rewritten.recorded, 1, "{rewritten:?}");
+        assert!(
+            fingerprint_opens() > before,
+            "the changed mtime was not re-hashed"
+        );
+        let again = nested.pass(&nested.base, &[&w]);
+        assert_eq!(again.recorded, 0, "{again:?}");
+    });
+    assert_eq!(nested.rows_for("a.rs").len(), 2, "{:?}", nested.rows());
+}
+
+/// A fingerprint without a stat (the first shape of the column) keeps the
+/// behaviour it had: it is re-hashed on every pass, and still catches a rewrite.
+#[test]
+fn a_fingerprint_with_no_stat_is_re_hashed_every_pass() {
+    let nested = Nested::new();
+    let w = nested.worktrees[0].clone();
+    with_transcript_root(&nested.corpus, || {
+        let path = nested.file("V1.jsonl");
+        write_lines(&path, &[edit_line(&w, "V1", 1, &format!("{w}/a.rs"))]);
+        nested.pass(&nested.base, &[&w]);
+        let db = std::path::Path::new(&nested.base)
+            .join(".devcouncil")
+            .join("ledger.sqlite");
+        let conn = rusqlite::Connection::open(db).expect("ledger file");
+        let stored: String = conn
+            .query_row("SELECT fingerprint FROM transcript_cursors", [], |r| {
+                r.get(0)
+            })
+            .expect("a fingerprint");
+        let fields: Vec<&str> = stored.split(':').collect();
+        assert_eq!(fields[0], "v2", "{stored}");
+        let legacy = format!("{}:{}:{}", fields[1], fields[2], fields[5]);
+        conn.execute("UPDATE transcript_cursors SET fingerprint = ?1", [legacy])
+            .expect("rewrite as the unversioned shape");
+
+        let before = fingerprint_opens();
+        let unchanged = nested.pass(&nested.base, &[&w]);
+        assert_eq!(unchanged.recorded, 0, "{unchanged:?}");
+        assert!(
+            fingerprint_opens() > before,
+            "no stat to trust, so it is hashed"
+        );
+
+        write_lines(
+            &path,
+            &[
+                edit_line(&w, "V1", 2, &format!("{w}/new1.rs")),
+                edit_line(&w, "V1", 3, &format!("{w}/new2.rs")),
+            ],
+        );
+        let rewritten = nested.pass(&nested.base, &[&w]);
+        assert_eq!(rewritten.recorded, 2, "{rewritten:?}");
+    });
+}
+
 /// Race: two passes on the same family at once keep every row exactly-once,
 /// departed rows included.
 #[test]

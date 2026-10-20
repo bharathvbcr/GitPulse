@@ -2008,38 +2008,85 @@ pub(crate) struct TranscriptAdvance {
 /// How many bytes each half of a cursor's fingerprint covers, at most.
 pub(crate) const CURSOR_FINGERPRINT_BYTES: usize = 64;
 
-/// The fingerprint stored with a transcript cursor: `"{h}:{t}:{hash}"`, a
-/// digest (the ledger's FNV-1a) of the first `h` bytes of the file and the `t`
-/// bytes that end at the cursor, each at most [`CURSOR_FINGERPRINT_BYTES`].
+/// A file's `(len, mtime in nanoseconds since the epoch)`, as a fingerprint
+/// folds it in.
+pub(crate) type FileStat = (u64, u64);
+
+/// The fingerprint stored with a transcript cursor:
+/// `"v2:{h}:{t}:{len}:{mtime_ns}:{hash}"`, where `hash` is a digest (the
+/// ledger's FNV-1a) of the first `h` bytes of the file and the `t` bytes that
+/// end at the cursor, each at most [`CURSOR_FINGERPRINT_BYTES`], and
+/// `len`/`mtime_ns` are the file's [`FileStat`] when the cursor was written.
 ///
-/// Both halves are needed. The bytes before the cursor are what a resume
+/// Both byte halves are needed. The bytes before the cursor are what a resume
 /// depends on, but a transcript's lines end alike (the same trailing keys), so
 /// a rewrite that changes only what comes earlier in each line leaves that tail
 /// as it was; the head of the file is where a rewritten transcript differs. The
 /// two lengths are in the text because a cursor near the start of a file covers
 /// fewer bytes than one deep in it. A digest, never the bytes: a transcript's
-/// text may hold anything. `None` when either half is empty (nothing read yet).
-pub(crate) fn cursor_fingerprint(head: &[u8], tail: &[u8]) -> Option<String> {
+/// text may hold anything.
+///
+/// The stat is what lets an unchanged file cost one `stat` per pass: a file
+/// whose length and mtime are still the recorded ones is not opened. Without it
+/// (the stat could not be read) the text is the unversioned `"{h}:{t}:{hash}"`,
+/// the shape the first build of this column wrote, and every pass re-hashes.
+/// `None` when either half is empty (nothing read yet).
+pub(crate) fn cursor_fingerprint(
+    head: &[u8],
+    tail: &[u8],
+    stat: Option<FileStat>,
+) -> Option<String> {
     if head.is_empty() || tail.is_empty() {
         return None;
     }
-    let bytes = [head, tail].concat();
-    Some(format!(
-        "{}:{}:{:016x}",
-        head.len(),
-        tail.len(),
-        ids::fnv1a64(&bytes)
-    ))
+    let hash = ids::fnv1a64(&[head, tail].concat());
+    Some(match stat {
+        Some((len, mtime_ns)) => format!(
+            "v2:{}:{}:{len}:{mtime_ns}:{hash:016x}",
+            head.len(),
+            tail.len()
+        ),
+        None => format!("{}:{}:{hash:016x}", head.len(), tail.len()),
+    })
 }
 
-/// The `(head, tail)` byte counts a stored fingerprint covers, or `None` for
-/// text this build did not write (which is then not checked).
-pub(crate) fn cursor_fingerprint_lens(fingerprint: &str) -> Option<(usize, usize)> {
-    let mut parts = fingerprint.splitn(3, ':');
-    let head = parts.next()?.parse::<usize>().ok()?;
-    let tail = parts.next()?.parse::<usize>().ok()?;
+/// What a stored fingerprint covers: the byte counts of its two halves and the
+/// file stat it recorded, if it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FingerprintParts {
+    pub head: usize,
+    pub tail: usize,
+    pub stat: Option<FileStat>,
+}
+
+/// Reads [`cursor_fingerprint`]'s text back, or `None` for text this build did
+/// not write (which is then not checked).
+pub(crate) fn parse_cursor_fingerprint(fingerprint: &str) -> Option<FingerprintParts> {
     let valid = 1..=CURSOR_FINGERPRINT_BYTES;
-    (valid.contains(&head) && valid.contains(&tail)).then_some((head, tail))
+    let counts = |head: &str, tail: &str| {
+        let (head, tail) = (head.parse::<usize>().ok()?, tail.parse::<usize>().ok()?);
+        (valid.contains(&head) && valid.contains(&tail)).then_some((head, tail))
+    };
+    let fields: Vec<&str> = fingerprint.split(':').collect();
+    match fields.as_slice() {
+        ["v2", head, tail, len, mtime_ns, _hash] => {
+            let (head, tail) = counts(head, tail)?;
+            Some(FingerprintParts {
+                head,
+                tail,
+                stat: Some((len.parse().ok()?, mtime_ns.parse().ok()?)),
+            })
+        }
+        [head, tail, _hash] => {
+            let (head, tail) = counts(head, tail)?;
+            Some(FingerprintParts {
+                head,
+                tail,
+                stat: None,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Records each advance's events and moves its offset, all in one
@@ -3385,6 +3432,16 @@ pub(crate) fn set_reflog_watermark(
     })
 }
 
+/// The query behind [`recorded_reflog_objects`], one text so the test that
+/// holds its plan to the partial index runs the statement production runs.
+const RECORDED_REFLOG_SQL: &str = "SELECT object,
+        CASE WHEN json_valid(detail_json)
+             THEN json_extract(detail_json, '$.object_truncated.hash') END
+ FROM events INDEXED BY idx_events_reflog
+ WHERE action LIKE 'reflog.%' AND object IS NOT NULL
+   AND occurred_at IS NULL
+   AND (worktree_path IN (?1, ?2) OR (?3 AND worktree_path IS NULL))";
+
 /// The `object` of every *legacy* `reflog.*` event recorded for one checkout,
 /// in the form it is stored (redacted), for the reflog catch-up's "already
 /// recorded" test.
@@ -3411,15 +3468,7 @@ pub(crate) fn recorded_reflog_objects(
     let stored = redact::text(worktree_path);
     with_conn(repo_path, |conn| {
         let mut stmt = conn
-            .prepare(
-                "SELECT object,
-                        CASE WHEN json_valid(detail_json)
-                             THEN json_extract(detail_json, '$.object_truncated.hash') END
-                 FROM events INDEXED BY idx_events_reflog
-                 WHERE action LIKE 'reflog.%' AND object IS NOT NULL
-                   AND occurred_at IS NULL
-                   AND (worktree_path IN (?1, ?2) OR (?3 AND worktree_path IS NULL))",
-            )
+            .prepare(RECORDED_REFLOG_SQL)
             .map_err(|e| LedgerError::new("prepare_failed", e.to_string()))?;
         let rows = stmt
             .query_map(params![raw, stored, is_anchor], |row| {
