@@ -68,6 +68,27 @@ before that tag is pushed.
 
 ### Added
 
+- Storage panel: a user-clicked "Write commit-graph..." for a repository whose
+  commit-graph is missing, out of date or lacks changed-path Bloom filters
+  (Owner Decision 3, part 2 of the commit-graph card). It previews the exact
+  command (`git commit-graph write --reachable --changed-paths`) and the common
+  git directory it writes under, runs only after a confirm, is judged by the
+  command gate, and is refused on an untrusted repository. It is hidden when the
+  graph is present and fresh, bounded at 600 s, cancellable, and one per common
+  directory (a second click joins the write already running). It writes derived
+  data under `objects/info` and no git config; the result is recorded as a
+  ledger event. Three new commands: `cmd_commit_graph_write_plan`,
+  `cmd_commit_graph_write` and `cmd_commit_graph_write_cancel`. Nothing in
+  ingest, the timers, hooks or MCP can run it. It is refused, and never
+  offered, on a git older than 2.27 (no `--changed-paths`), on a partial clone
+  (the write would fetch missing trees), and while another write is running; the
+  spawn runs with lazy fetch off. A Stop sent before the write registers is
+  remembered for five seconds and honoured, and a panel remounted mid-write
+  shows it and can stop it. A stop that races git's publish reports a written
+  graph, not "nothing written". GitPulse never deletes a commit-graph lock: a
+  lock that blocks or survives a write is reported with its path, age and the
+  manual remedy. The preview states the lasting effect: once written with
+  `--changed-paths`, later graph writes keep the filters.
 - `gitpulse_merge_conflicts` answers whether the checkouts' committed work
   would merge, which `gitpulse_collision_risk` cannot (it reads uncommitted
   files, so a lane's files leave it the moment the lane commits). For each pair

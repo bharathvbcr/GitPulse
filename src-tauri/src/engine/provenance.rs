@@ -22,7 +22,9 @@ use crate::engine::git_cli::{
     git, git_captured, git_captured_with_stdin, read_objects_batch, validate_repo, BatchObject,
     BoundedRun, MAX_OUTPUT_BYTES,
 };
-use crate::engine::object_quarantine::{is_partial_clone, MergeOutcome, ObjectQuarantine};
+// The one partial-clone probe lives with the quarantine; `git_writer` reaches it here.
+pub(crate) use crate::engine::object_quarantine::is_partial_clone;
+use crate::engine::object_quarantine::{MergeOutcome, ObjectQuarantine};
 use crate::engine::{git_reader, ref_cache};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};

@@ -3,10 +3,10 @@
  *
  * The Rust detector (`storage/commit_graph.rs`) reads the graph files and says
  * what state the repository is in. This turns that state into the one thing a
- * person can act on. It is display only: GitPulse does not run the command,
- * schedule it, or offer a button for it. Writing or refreshing a commit-graph
- * from the app is an undecided owner decision, so the command is shown for the
- * person to run in their own terminal.
+ * person can act on. It is display only: the command is shown for a person who
+ * prefers their own terminal. The in-app write (Owner Decision 3, approved) is a
+ * separate, user-clicked and confirmed flow in `commitGraphWrite.ts`, offered
+ * for the same states.
  */
 import type { CommitGraphReport, CommitGraphState } from "../storage/types";
 

@@ -40,7 +40,8 @@ const TABLE: Array<[string, string[], string, string[]]> = [
   ["cmd_rename_branch", ["rename_branch_argv"], "rename_branch", ["rename_branch_argv"]],
   ["cmd_create_tag", ["create_tag_argv"], "create_tag", ["create_tag_argv"]],
   ["cmd_delete_tag", ["delete_tag_argv"], "delete_tag", ["delete_tag_argv"]],
-  ["cmd_publish_release", ["create_tag_argv", "push_tag_argv"], "push_tag", ["push_tag_argv"]],
+  ["cmd_commit_graph_write", ["commit_graph_write_argv"], "commit_graph_write_checked", ["commit_graph_write_argv"]],
+  ["cmd_publish_release",["create_tag_argv", "push_tag_argv"], "push_tag", ["push_tag_argv"]],
   ["cmd_stage_selective_patch", ["apply_patch_to_index_argv"], "apply_patch_to_index", ["apply_patch_to_index_argv"]],
   ["cmd_unstage_selective_patch", ["apply_patch_to_index_argv"], "apply_patch_to_index", ["apply_patch_to_index_argv"]],
 ];

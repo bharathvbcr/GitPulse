@@ -464,12 +464,14 @@ fn detection_spawns_no_git_process() {
     assert!(scanned.is_ok());
 }
 
-/// No production file may build a commit-graph write argv: writing one is
-/// Owner Decision 3, and `git_config_posture.rs` guards the config half of the
-/// same rule. The Health hint prints the command as display text for the
-/// person to run, so the literal appears only in a TypeScript template string.
+/// Exactly one production file may build a commit-graph write argv:
+/// `engine/git_writer.rs`, the user-clicked writer approved under Owner
+/// Decision 3 (its reachability is pinned by
+/// `no_path_but_the_storage_panel_command_reaches_the_writer`).
+/// `git_config_posture.rs` guards the config half of the same rule. The Health
+/// hint still prints the command as display text, in a TypeScript template.
 #[test]
-fn no_production_rust_builds_a_commit_graph_write_argv() {
+fn only_the_gated_writer_builds_a_commit_graph_write_argv() {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
@@ -495,6 +497,19 @@ fn no_production_rust_builds_a_commit_graph_write_argv() {
             continue;
         }
         let text = std::fs::read_to_string(&file).unwrap();
+        if rel == "engine/git_writer.rs" {
+            // The writer must spell the argv, and only the reachable,
+            // changed-paths form, with no config or split flag beside it.
+            let squashed: String = text.split_whitespace().collect();
+            assert!(
+                squashed.contains(
+                    "\"git\",\"commit-graph\",\"write\",\"--reachable\",\"--changed-paths\",]"
+                ),
+                "the writer no longer spells the approved argv"
+            );
+            assert!(!squashed.contains("\"commit-graph\",\"write\",\"--split\""));
+            continue;
+        }
         // Production text only: drop an inline `#[cfg(test)] mod tests`.
         let production = text.split("#[cfg(test)]").next().unwrap_or("");
         // Whitespace-free, so `"commit-graph",\n "write"` and a spelled-out
