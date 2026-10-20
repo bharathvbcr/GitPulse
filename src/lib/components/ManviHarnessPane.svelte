@@ -132,24 +132,22 @@
     }
   }
 
-  /**
-   * The label of the action that keeps a refused ledger, and the words the
-   * backend's refusal uses to name it (`ledger::anchor::ADOPT_HINT`).
-   */
+  /** The label of the action that keeps a refused ledger. */
   export const ADOPT_LEDGER_LABEL = "Adopt this ledger";
 
   /**
-   * Whether the history is refused for sitting in another directory than the
-   * one it was anchored in, which only a person can resolve by adopting it.
-   * Read off the refusal's own text, from either source that carries it.
+   * Whether the history has a problem the adoption action might resolve: the
+   * ledger reports an error, or catch-up does. The panel does not read which
+   * error it is (that is the backend's to say, and it does: it refuses an
+   * adoption that does not apply with its own reason). Offering the action on any
+   * history error costs a refused request; hiding it behind text matching costs
+   * a person the only way out.
    */
-  export function ledgerAdoptable(
+  export function adoptionOffered(
     ledger: LedgerStatus | null,
     catchUp: Pick<CatchUp, "error"> | null,
   ): boolean {
-    return [ledger?.error, catchUp?.error].some(
-      (error) => typeof error === "string" && error.includes(ADOPT_LEDGER_LABEL),
-    );
+    return Boolean(ledger?.error) || Boolean(catchUp?.error);
   }
 
   /**
@@ -316,7 +314,7 @@
     ),
   );
 
-  let adoptable = $derived(ledgerAdoptable($harnessStore.ledger, $harnessStore.catchUp));
+  let adoptable = $derived(adoptionOffered($harnessStore.ledger, $harnessStore.catchUp));
 
   /**
    * Asks the backend to adopt this repository's refused ledger. The approval is
@@ -1047,9 +1045,10 @@
     {#if adoptable}
       <div class="rounded-xl border border-border/70 bg-background p-3 flex flex-col gap-2">
         <p class="text-[11px] text-textMuted leading-relaxed">
-          This checkout is not the directory its activity history was recorded in. If it is that
-          repository, moved or restored here, adopt the history to keep recording into it. You
-          will be asked to confirm in a system dialog.
+          If this checkout is a repository whose activity history was recorded elsewhere (moved
+          across devices, restored from a backup, or copied with the original gone), adopt that
+          history to keep recording into it. You will be asked to confirm in a system dialog, and
+          GitPulse says why if the history cannot be adopted.
         </p>
         <div>
           <button

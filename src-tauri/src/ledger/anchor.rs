@@ -129,7 +129,7 @@ const RECHECK_BUDGET: Duration = Duration::from_millis(250);
 /// The action of the audit row written when a person adopts a ledger.
 const ADOPT: &str = "ledger.adopt";
 /// What a site refusal tells the person to do. The words are the label of the
-/// action in the Activity history panel, and the frontend looks for them.
+/// action in the Activity history panel (`ADOPT_LEDGER_LABEL`).
 pub(crate) const ADOPT_HINT: &str = "If this checkout is the repository that was moved or copied here, use \"Adopt this ledger\" in Activity history to keep recording into it.";
 /// Bound on the one `git rev-list` that reads the roots.
 const READ_TIMEOUT: Duration = Duration::from_secs(20);

@@ -51,7 +51,7 @@ pub(super) fn adopt_ledger_confirmed(
 }
 
 #[cfg(test)]
-mod tests {
+mod ledger_adopt_tests {
     use super::*;
 
     use crate::ledger;
