@@ -1368,15 +1368,14 @@ fn adv_one_transcript_two_departed_worktrees() {
     assert_eq!(rows.len(), 4, "{rows:?}");
 }
 
-/// Rewrite longer than the departed cursor: the cursor cannot tell a rewritten
-/// file from an appended one while it is not past the file's end, so the lines
-/// it seems to have consumed are skipped. KNOWN LIMIT, shared with every live
-/// worktree's cursor (`owed_on` detects a rotation by length alone) and out of
-/// scope here; this test pins today's behaviour so a rotation-aware cursor
-/// shows up as a deliberate change. Only the first rewritten line is affected:
-/// the others lie past the stale cursor and are recorded once.
+/// Rewrite longer than the departed cursor. The cursor used to tell a
+/// rewritten file from an appended one by length alone, so a rewrite that grew
+/// past the stored offset resumed mid-file and skipped the first rewritten
+/// line (the pinned "known limit" this test used to assert). The cursor now
+/// carries a fingerprint of the bytes before its offset, and a mismatch is a
+/// rotation: the file is read again from the start.
 #[test]
-fn adv_rotation_longer_than_the_cursor_skips_the_first_line_a_known_limit() {
+fn adv_rotation_longer_than_the_cursor_is_detected_and_read_from_the_start() {
     let nested = Nested::new();
     let w = nested.worktrees[0].clone();
     with_transcript_root(&nested.corpus, || {
@@ -1397,14 +1396,210 @@ fn adv_rotation_longer_than_the_cursor_skips_the_first_line_a_known_limit() {
         nested.pass(&nested.base, &[]);
     });
     let rows = nested.rows();
+    for f in ["new1.rs", "new2.rs", "new3.rs"] {
+        assert_eq!(nested.rows_for(f).len(), 1, "{f}: {rows:?}");
+    }
+    assert_eq!(
+        rows.len(),
+        4,
+        "the old line once, each new line once: {rows:?}"
+    );
+}
+
+/// The departed cursor keeps its footing after the rotation is taken: a pass
+/// after the re-read records nothing more (the fingerprint moved with the offset).
+#[test]
+fn a_rotation_is_read_once_and_the_next_pass_adds_nothing() {
+    let nested = Nested::new();
+    let w = nested.worktrees[0].clone();
+    with_transcript_root(&nested.corpus, || {
+        write_lines(
+            &nested.file("O2.jsonl"),
+            &[edit_line(&w, "O2", 1, &format!("{w}/a.rs"))],
+        );
+        ingest_transcripts_into(&nested.base, &w);
+        std::fs::remove_dir_all(&w).unwrap();
+        write_lines(
+            &nested.file("O2.jsonl"),
+            &[
+                edit_line(&w, "O2", 2, &format!("{w}/new1.rs")),
+                edit_line(&w, "O2", 3, &format!("{w}/new2.rs")),
+            ],
+        );
+        let first = nested.pass(&nested.base, &[]);
+        assert_eq!(first.recorded, 2, "{first:?}");
+        let second = nested.pass(&nested.base, &[]);
+        assert_eq!(second.recorded, 0, "a re-read recorded twice: {second:?}");
+        let third = nested.pass(&nested.base, &[]);
+        assert_eq!(third.recorded, 0, "{third:?}");
+    });
+    for f in ["new1.rs", "new2.rs"] {
+        assert_eq!(nested.rows_for(f).len(), 1, "{f}: {:?}", nested.rows());
+    }
+}
+
+/// A live participant: the file is rewritten to more bytes than its cursor
+/// holds, and the first rewritten line is recorded, not skipped.
+#[test]
+fn a_live_cursor_detects_a_rewrite_longer_than_it() {
+    let nested = Nested::new();
+    let w = nested.worktrees[0].clone();
+    with_transcript_root(&nested.corpus, || {
+        write_lines(
+            &nested.file("L1.jsonl"),
+            &[edit_line(&w, "L1", 1, &format!("{w}/a.rs"))],
+        );
+        nested.pass(&nested.base, &[&w]);
+        write_lines(
+            &nested.file("L1.jsonl"),
+            &[
+                edit_line(&w, "L1", 2, &format!("{w}/new1.rs")),
+                edit_line(&w, "L1", 3, &format!("{w}/new2.rs")),
+                edit_line(&w, "L1", 4, &format!("{w}/new3.rs")),
+            ],
+        );
+        let rewritten = nested.pass(&nested.base, &[&w]);
+        assert_eq!(rewritten.recorded, 3, "{rewritten:?}");
+        let again = nested.pass(&nested.base, &[&w]);
+        assert_eq!(again.recorded, 0, "{again:?}");
+    });
+    let rows = nested.rows();
+    for f in ["new1.rs", "new2.rs", "new3.rs"] {
+        assert_eq!(nested.rows_for(f).len(), 1, "{f}: {rows:?}");
+    }
+}
+
+/// A rewrite to exactly the cursor's length (nothing past it to notice by
+/// length) is a rotation too, when the bytes the fingerprint covers differ (the
+/// first and last 64 bytes before the cursor: here the timestamp, which sits in
+/// a line's tail). A rewrite that changes only bytes outside both windows is
+/// the residual the fingerprint cannot see.
+#[test]
+fn a_rewrite_of_the_same_length_is_a_rotation() {
+    let nested = Nested::new();
+    let w = nested.worktrees[0].clone();
+    with_transcript_root(&nested.corpus, || {
+        write_lines(
+            &nested.file("E1.jsonl"),
+            &[edit_line(&w, "E1", 1, &format!("{w}/a.rs"))],
+        );
+        nested.pass(&nested.base, &[&w]);
+        write_lines(
+            &nested.file("E1.jsonl"),
+            &[edit_line(&w, "E1", 2, &format!("{w}/a.rs"))],
+        );
+        let rewritten = nested.pass(&nested.base, &[&w]);
+        assert_eq!(rewritten.recorded, 1, "{rewritten:?}");
+        let again = nested.pass(&nested.base, &[&w]);
+        assert_eq!(
+            again.recorded, 0,
+            "a rotated cursor must be rewritten: {again:?}"
+        );
+    });
+    assert_eq!(nested.rows_for("a.rs").len(), 2, "{:?}", nested.rows());
+}
+
+/// A hosted, off-cap owner (a live worktree past the participant cap, whose
+/// rows ride the transaction of another's cursor): the same rewrite is read
+/// again for it, and it is not skipped by its own stale cursor.
+#[test]
+fn a_hosted_cursor_detects_a_rewrite_longer_than_it() {
+    let nested = Nested::new();
+    let base = nested.base.clone();
+    let wts: Vec<String> = (0..pass::MAX_PARTICIPANTS + 2)
+        .map(|i| {
+            let p = format!("{base}/.claude/worktrees/live{i:02}");
+            std::fs::create_dir_all(&p).unwrap();
+            p
+        })
+        .collect();
+    let hosted = wts[pass::MAX_PARTICIPANTS + 1].clone();
+    with_transcript_root(&nested.corpus, || {
+        write_lines(
+            &nested.file("H1.jsonl"),
+            &[edit_line(&hosted, "H1", 1, &format!("{hosted}/a.rs"))],
+        );
+        let first = pass::ingest_family_until(&base, &base, &wts, &mut |_| false);
+        assert_eq!((first.recorded, first.rehosted_calls), (1, 1), "{first:?}");
+        write_lines(
+            &nested.file("H1.jsonl"),
+            &[
+                edit_line(&hosted, "H1", 2, &format!("{hosted}/new1.rs")),
+                edit_line(&hosted, "H1", 3, &format!("{hosted}/new2.rs")),
+                edit_line(&hosted, "H1", 4, &format!("{hosted}/new3.rs")),
+            ],
+        );
+        let rewritten = pass::ingest_family_until(&base, &base, &wts, &mut |_| false);
+        assert_eq!(rewritten.recorded, 3, "{rewritten:?}");
+        let again = pass::ingest_family_until(&base, &base, &wts, &mut |_| false);
+        assert_eq!(again.recorded, 0, "{again:?}");
+    });
+    let rows = nested.rows();
+    for f in ["new1.rs", "new2.rs", "new3.rs"] {
+        assert_eq!(nested.rows_for(f).len(), 1, "{f}: {rows:?}");
+    }
+}
+
+/// An append is not a rotation: the fingerprint still matches the bytes before
+/// the cursor, so only the appended bytes are read.
+#[test]
+fn an_appended_transcript_is_read_from_its_cursor_not_from_the_start() {
+    let nested = Nested::new();
+    let w = nested.worktrees[0].clone();
+    with_transcript_root(&nested.corpus, || {
+        let path = nested.file("P1.jsonl");
+        write_lines(&path, &[edit_line(&w, "P1", 1, &format!("{w}/a.rs"))]);
+        nested.pass(&nested.base, &[&w]);
+        let before = std::fs::metadata(&path).unwrap().len();
+        let added = edit_line(&w, "P1", 2, &format!("{w}/b.rs")) + "\n";
+        append_text(&path, &added);
+        let read_before = bytes_read();
+        let appended = nested.pass(&nested.base, &[&w]);
+        assert_eq!(appended.recorded, 1, "{appended:?}");
+        assert_eq!(
+            bytes_read() - read_before,
+            added.len() as u64,
+            "an append re-read the file from byte 0 (it began at {before})"
+        );
+    });
+    assert_eq!(nested.rows().len(), 2, "{:?}", nested.rows());
+}
+
+/// A cursor written before fingerprints existed holds a NULL, which skips the
+/// check: it is trusted on its offset alone, as it was.
+#[test]
+fn a_cursor_with_no_fingerprint_is_checked_by_length_alone() {
+    let nested = Nested::new();
+    let w = nested.worktrees[0].clone();
+    with_transcript_root(&nested.corpus, || {
+        write_lines(
+            &nested.file("N2.jsonl"),
+            &[edit_line(&w, "N2", 1, &format!("{w}/a.rs"))],
+        );
+        nested.pass(&nested.base, &[&w]);
+        let db = std::path::Path::new(&nested.base)
+            .join(".devcouncil")
+            .join("ledger.sqlite");
+        let conn = rusqlite::Connection::open(db).expect("ledger file");
+        let cleared = conn
+            .execute("UPDATE transcript_cursors SET fingerprint = NULL", [])
+            .expect("clear");
+        assert!(cleared >= 1, "the cursor had no fingerprint to clear");
+        write_lines(
+            &nested.file("N2.jsonl"),
+            &[
+                edit_line(&w, "N2", 2, &format!("{w}/new1.rs")),
+                edit_line(&w, "N2", 3, &format!("{w}/new2.rs")),
+            ],
+        );
+        nested.pass(&nested.base, &[&w]);
+    });
     assert_eq!(
         nested.rows_for("new1.rs").len(),
         0,
-        "the known limit: the stale cursor covers the first rewritten line: {rows:?}"
+        "a NULL fingerprint must skip the check, as an old cursor did"
     );
-    for f in ["new2.rs", "new3.rs"] {
-        assert_eq!(nested.rows_for(f).len(), 1, "{f}: {rows:?}");
-    }
+    assert_eq!(nested.rows_for("new2.rs").len(), 1, "{:?}", nested.rows());
 }
 
 /// Race: two passes on the same family at once keep every row exactly-once,

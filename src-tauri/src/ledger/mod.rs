@@ -1886,6 +1886,10 @@ pub(crate) fn transcript_key(path: &Path) -> String {
 pub(crate) struct TranscriptProgress {
     /// Bytes of each transcript already consumed, by [`transcript_key`].
     pub offsets: HashMap<String, u64>,
+    /// The fingerprint of the bytes ending at each offset ([`cursor_fingerprint`]),
+    /// by the same key. Absent for a cursor written before fingerprints existed
+    /// (a NULL column), which is trusted on its offset alone.
+    pub fingerprints: HashMap<String, String>,
     /// The timestamp watermark that governed catch-up before byte offsets
     /// existed, frozen the first time this worktree was caught up under
     /// offsets. `None` until then; empty when there was no watermark.
@@ -1918,7 +1922,10 @@ pub(crate) fn transcript_progress_many(
             .prepare("SELECT since_utc FROM transcript_baselines WHERE worktree_key = ?1")
             .map_err(failed)?;
         let mut offsets_stmt = conn
-            .prepare("SELECT file_key, byte_offset FROM transcript_cursors WHERE worktree_key = ?1")
+            .prepare(
+                "SELECT file_key, byte_offset, fingerprint FROM transcript_cursors
+                 WHERE worktree_key = ?1",
+            )
             .map_err(failed)?;
         keys.iter()
             .map(|worktree| {
@@ -1926,15 +1933,30 @@ pub(crate) fn transcript_progress_many(
                     .query_row(params![worktree], |row| row.get::<_, String>(0))
                     .optional()
                     .map_err(failed)?;
-                let offsets = offsets_stmt
+                let rows = offsets_stmt
                     .query_map(params![worktree], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
                     })
                     .map_err(failed)?
-                    .map(|row| row.map(|(key, offset)| (key, u64::try_from(offset).unwrap_or(0))))
-                    .collect::<Result<HashMap<_, _>, _>>()
+                    .collect::<Result<Vec<_>, _>>()
                     .map_err(failed)?;
-                Ok(TranscriptProgress { offsets, baseline })
+                let mut offsets = HashMap::new();
+                let mut fingerprints = HashMap::new();
+                for (key, offset, fingerprint) in rows {
+                    if let Some(fingerprint) = fingerprint {
+                        fingerprints.insert(key.clone(), fingerprint);
+                    }
+                    offsets.insert(key, u64::try_from(offset).unwrap_or(0));
+                }
+                Ok(TranscriptProgress {
+                    offsets,
+                    fingerprints,
+                    baseline,
+                })
             })
             .collect()
     })
@@ -1975,7 +1997,49 @@ pub(crate) struct TranscriptAdvance {
     /// it; `None` for a transcript never read for this worktree.
     pub from: Option<u64>,
     pub to: u64,
+    /// The fingerprint of the bytes ending at `to` ([`cursor_fingerprint`]),
+    /// stored beside the offset so a later read can tell the file it stopped in
+    /// from one rewritten past that offset. `None` leaves the check off for this
+    /// cursor (the last line was too long to keep, or nothing was read).
+    pub fingerprint: Option<String>,
     pub drafts: Vec<Draft>,
+}
+
+/// How many bytes each half of a cursor's fingerprint covers, at most.
+pub(crate) const CURSOR_FINGERPRINT_BYTES: usize = 64;
+
+/// The fingerprint stored with a transcript cursor: `"{h}:{t}:{hash}"`, a
+/// digest (the ledger's FNV-1a) of the first `h` bytes of the file and the `t`
+/// bytes that end at the cursor, each at most [`CURSOR_FINGERPRINT_BYTES`].
+///
+/// Both halves are needed. The bytes before the cursor are what a resume
+/// depends on, but a transcript's lines end alike (the same trailing keys), so
+/// a rewrite that changes only what comes earlier in each line leaves that tail
+/// as it was; the head of the file is where a rewritten transcript differs. The
+/// two lengths are in the text because a cursor near the start of a file covers
+/// fewer bytes than one deep in it. A digest, never the bytes: a transcript's
+/// text may hold anything. `None` when either half is empty (nothing read yet).
+pub(crate) fn cursor_fingerprint(head: &[u8], tail: &[u8]) -> Option<String> {
+    if head.is_empty() || tail.is_empty() {
+        return None;
+    }
+    let bytes = [head, tail].concat();
+    Some(format!(
+        "{}:{}:{:016x}",
+        head.len(),
+        tail.len(),
+        ids::fnv1a64(&bytes)
+    ))
+}
+
+/// The `(head, tail)` byte counts a stored fingerprint covers, or `None` for
+/// text this build did not write (which is then not checked).
+pub(crate) fn cursor_fingerprint_lens(fingerprint: &str) -> Option<(usize, usize)> {
+    let mut parts = fingerprint.splitn(3, ':');
+    let head = parts.next()?.parse::<usize>().ok()?;
+    let tail = parts.next()?.parse::<usize>().ok()?;
+    let valid = 1..=CURSOR_FINGERPRINT_BYTES;
+    (valid.contains(&head) && valid.contains(&tail)).then_some((head, tail))
 }
 
 /// Records each advance's events and moves its offset, all in one
@@ -2043,14 +2107,16 @@ pub(crate) fn advance_transcripts_family(
                     recorded += 1;
                 }
                 tx.execute(
-                    "INSERT INTO transcript_cursors (worktree_key, file_key, byte_offset)
-                     VALUES (?1, ?2, ?3)
+                    "INSERT INTO transcript_cursors (worktree_key, file_key, byte_offset, fingerprint)
+                     VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(worktree_key, file_key) DO UPDATE SET
-                        byte_offset = excluded.byte_offset",
+                        byte_offset = excluded.byte_offset,
+                        fingerprint = excluded.fingerprint",
                     params![
                         worktree,
                         advance.file_key,
-                        i64::try_from(advance.to).unwrap_or(i64::MAX)
+                        i64::try_from(advance.to).unwrap_or(i64::MAX),
+                        advance.fingerprint
                     ],
                 )
                 .map_err(failed)?;

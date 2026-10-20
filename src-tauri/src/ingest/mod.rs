@@ -1791,6 +1791,7 @@ mod tests {
             file_key: "f".into(),
             from: None,
             to: 10,
+            fingerprint: None,
             drafts: vec![Draft {
                 repo_path: repo.to_string(),
                 action: "session.edit".into(),
