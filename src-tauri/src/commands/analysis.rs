@@ -133,7 +133,7 @@ pub async fn cmd_commit_graph_write(
     .await
 }
 
-/// Stops the commit-graph write running in this repository's common
+/// Stops the graph write running in this repository's common
 /// directory. `false` when none is running.
 #[tauri::command(async)]
 pub async fn cmd_commit_graph_write_cancel(repo_path: String) -> Result<bool, IpcError> {

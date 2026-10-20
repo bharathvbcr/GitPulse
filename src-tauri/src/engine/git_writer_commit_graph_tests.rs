@@ -60,6 +60,14 @@ fn text(path: &Path) -> String {
     path.to_str().unwrap().to_string()
 }
 
+/// A click as the command makes it: the gate promotes the calling thread to a
+/// user action before the writer spawns, so a busy host defers refresh traffic,
+/// not the person's write. Marked per call because the mark is thread-local.
+fn click(repo: &str, confirmed: &[String]) -> Result<CommitGraphWriteOutcome, String> {
+    crate::engine::git_cli::mark_user_action(repo);
+    GitWriter::commit_graph_write(repo, confirmed)
+}
+
 #[test]
 fn the_argv_is_reachable_and_changed_paths_and_never_touches_config() {
     let argv = GitWriter::commit_graph_write_argv();
@@ -98,7 +106,7 @@ fn a_click_on_a_repository_without_a_graph_writes_one_and_the_detector_agrees() 
         crate::repository_trust::git_directories(&repo).unwrap().1
     );
 
-    let outcome = GitWriter::commit_graph_write(&text(&repo), &plan.argv).expect("write");
+    let outcome = click(&text(&repo), &plan.argv).expect("write");
     assert!(!outcome.cancelled && !outcome.joined);
     assert_eq!(outcome.report.state, CommitGraphState::Present);
     assert_eq!(graph_files(&repo), ["commit-graph"]);
@@ -121,11 +129,11 @@ fn a_stale_graph_is_offered_a_refresh() {
     let dir = git_repo();
     commits(dir.path(), 2);
     let repo = dir.path().canonicalize().unwrap();
-    GitWriter::commit_graph_write(&text(&repo), &GitWriter::commit_graph_write_argv()).unwrap();
+    click(&text(&repo), &GitWriter::commit_graph_write_argv()).unwrap();
     commits(&repo, 1);
     assert_eq!(states(&repo), CommitGraphState::Stale);
     let plan = GitWriter::commit_graph_write_plan(&text(&repo)).expect("stale offers a write");
-    GitWriter::commit_graph_write(&text(&repo), &plan.argv).unwrap();
+    click(&text(&repo), &plan.argv).unwrap();
     assert_eq!(states(&repo), CommitGraphState::Present);
 }
 
@@ -138,7 +146,7 @@ fn an_untrusted_repository_is_refused_before_anything_runs() {
     let argv = GitWriter::commit_graph_write_argv();
     for refused in [
         GitWriter::commit_graph_write_plan(&text(&repo)).map(|_| ()),
-        GitWriter::commit_graph_write(&text(&repo), &argv).map(|_| ()),
+        click(&text(&repo), &argv).map(|_| ()),
         GitWriter::commit_graph_write_cancel(&text(&repo)).map(|_| ()),
     ] {
         let error = refused.expect_err("untrusted");
@@ -169,7 +177,7 @@ fn a_command_other_than_the_previewed_one_does_not_run() {
         .map(String::from)
         .to_vec(),
     ] {
-        let error = GitWriter::commit_graph_write(&text(&repo), &confirmed).expect_err("mismatch");
+        let error = click(&text(&repo), &confirmed).expect_err("mismatch");
         assert!(error.contains("nothing ran"), "{error}");
     }
     assert!(graph_files(&repo).is_empty());
@@ -190,7 +198,7 @@ fn concurrent_clicks_in_one_common_dir_are_one_write() {
     let common = crate::repository_trust::git_directories(&repo).unwrap().1;
     let leader = {
         let (repo, argv) = (text(&repo), argv.clone());
-        std::thread::spawn(move || GitWriter::commit_graph_write(&repo, &argv))
+        std::thread::spawn(move || click(&repo, &argv))
     };
     // The leader is in flight once its cancel flag is registered; the second
     // click must then wait for it rather than start a second git.
@@ -205,7 +213,7 @@ fn concurrent_clicks_in_one_common_dir_are_one_write() {
     }
     let follower = {
         let (repo, argv) = (text(&repo), argv.clone());
-        std::thread::spawn(move || GitWriter::commit_graph_write(&repo, &argv))
+        std::thread::spawn(move || click(&repo, &argv))
     };
     let (leader, follower) = (leader.join().unwrap(), follower.join().unwrap());
     let (leader, follower) = (leader.expect("leader"), follower.expect("follower"));
@@ -220,6 +228,7 @@ fn concurrent_clicks_in_one_common_dir_are_one_write() {
 fn a_timeout_kills_the_write_and_leaves_no_lock_or_graph() {
     let (_dir, repo) = large_history(30_000);
     let argv = GitWriter::commit_graph_write_argv();
+    crate::engine::git_cli::mark_user_action(&text(&repo));
     let error = GitWriter::commit_graph_write_within(
         &text(&repo),
         &argv,
@@ -232,7 +241,7 @@ fn a_timeout_kills_the_write_and_leaves_no_lock_or_graph() {
     assert!(graph_files(&repo).is_empty(), "a partial graph was kept");
     assert!(!commit_graph_cancels().lock().unwrap().contains_key(&common));
     // And it is retryable: the next click, with a real budget, writes.
-    GitWriter::commit_graph_write(&text(&repo), &argv).expect("retry");
+    click(&text(&repo), &argv).expect("retry");
     assert_eq!(states(&repo), CommitGraphState::Present);
 }
 
@@ -248,7 +257,7 @@ fn a_cancel_stops_the_write_and_leaves_no_lock_or_graph() {
     );
     let running = {
         let (repo, argv) = (text(&repo), argv.clone());
-        std::thread::spawn(move || GitWriter::commit_graph_write(&repo, &argv))
+        std::thread::spawn(move || click(&repo, &argv))
     };
     let deadline = std::time::Instant::now()
         + crate::test_support::coverage_relaxed(std::time::Duration::from_secs(20));
@@ -267,7 +276,7 @@ fn a_cancel_stops_the_write_and_leaves_no_lock_or_graph() {
         "a cancelled write kept a graph"
     );
     assert!(!commit_graph_cancels().lock().unwrap().contains_key(&common));
-    GitWriter::commit_graph_write(&text(&repo), &argv).expect("a click after a cancel writes");
+    click(&text(&repo), &argv).expect("a click after a cancel writes");
     assert_eq!(states(&repo), CommitGraphState::Present);
 }
 
@@ -278,8 +287,8 @@ fn a_lock_held_by_another_git_is_never_removed_and_blocks_the_write() {
     let repo = dir.path().canonicalize().unwrap();
     let lock = repo.join(".git/objects/info/commit-graph.lock");
     std::fs::write(&lock, b"").unwrap();
-    let error = GitWriter::commit_graph_write(&text(&repo), &GitWriter::commit_graph_write_argv())
-        .expect_err("a held lock");
+    let error =
+        click(&text(&repo), &GitWriter::commit_graph_write_argv()).expect_err("a held lock");
     assert!(error.contains("Another git process holds"), "{error}");
     assert!(lock.exists(), "someone else's lock was removed");
 }

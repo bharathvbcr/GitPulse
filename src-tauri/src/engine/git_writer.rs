@@ -2184,6 +2184,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(common.to_path_buf(), Arc::clone(&flag));
+        let stop = Arc::clone(&flag);
         let _registered = CancelRegistration(common.to_path_buf());
         let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
         let run = crate::engine::git_cli::git_observed(
@@ -2217,6 +2218,14 @@ Unset the local override with `git config --local --unset-all user.name` and \
                     )),
                     "failed",
                 )
+            }
+            // Stopped while still waiting for a process slot: nothing was
+            // spawned, and the person's stop is the answer, not a failure.
+            Err(error)
+                if stop.load(std::sync::atomic::Ordering::SeqCst)
+                    && !crate::engine::git_cli::is_timed_out(&error) =>
+            {
+                (Ok(finished(true, started)), "cancelled")
             }
             Err(error) => {
                 sweep_commit_graph_locks(common, &before);
