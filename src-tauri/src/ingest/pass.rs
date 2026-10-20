@@ -181,6 +181,13 @@ struct Probe<'a> {
 
 impl Probe<'_> {
     fn matches(&mut self, offset: u64, fingerprint: &str) -> bool {
+        // The common answer, with no allocation: a fingerprint that recorded a
+        // stat and finds it unchanged.
+        if let Some(parts) = ledger::parse_cursor_fingerprint(fingerprint) {
+            if parts.stat.is_some() && parts.stat == self.now {
+                return true;
+            }
+        }
         let (path, now) = (self.path, self.now);
         *self
             .answers

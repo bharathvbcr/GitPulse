@@ -2067,26 +2067,27 @@ pub(crate) fn parse_cursor_fingerprint(fingerprint: &str) -> Option<FingerprintP
         let (head, tail) = (head.parse::<usize>().ok()?, tail.parse::<usize>().ok()?);
         (valid.contains(&head) && valid.contains(&tail)).then_some((head, tail))
     };
-    let fields: Vec<&str> = fingerprint.split(':').collect();
-    match fields.as_slice() {
-        ["v2", head, tail, len, mtime_ns, _hash] => {
-            let (head, tail) = counts(head, tail)?;
-            Some(FingerprintParts {
-                head,
-                tail,
-                stat: Some((len.parse().ok()?, mtime_ns.parse().ok()?)),
-            })
+    let mut fields = fingerprint.split(':');
+    let first = fields.next()?;
+    let parts = if first == "v2" {
+        let (head, tail) = counts(fields.next()?, fields.next()?)?;
+        let stat = (fields.next()?.parse().ok()?, fields.next()?.parse().ok()?);
+        FingerprintParts {
+            head,
+            tail,
+            stat: Some(stat),
         }
-        [head, tail, _hash] => {
-            let (head, tail) = counts(head, tail)?;
-            Some(FingerprintParts {
-                head,
-                tail,
-                stat: None,
-            })
+    } else {
+        let (head, tail) = counts(first, fields.next()?)?;
+        FingerprintParts {
+            head,
+            tail,
+            stat: None,
         }
-        _ => None,
-    }
+    };
+    // The digest, and nothing after it.
+    fields.next()?;
+    fields.next().is_none().then_some(parts)
 }
 
 /// Records each advance's events and moves its offset, all in one
