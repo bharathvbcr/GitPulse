@@ -1119,7 +1119,7 @@ const REVERT_TARGET_LIMIT: usize = 64;
 
 /// Whether the repository is a partial clone (`extensions.partialclone` or a
 /// promisor remote). Read from configuration only, so it fetches nothing.
-fn is_partial_clone(repo: &Path) -> Result<bool, String> {
+pub(crate) fn is_partial_clone(repo: &Path) -> Result<bool, String> {
     // Git decides what a boolean is (`true`, `yes`, `on`, `1`, any case, and a
     // bare key), so it is asked with `--type=bool` rather than parsed here.
     // A value it cannot read as a boolean is a failed read, which refuses: a

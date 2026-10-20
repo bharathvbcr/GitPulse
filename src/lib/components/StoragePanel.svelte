@@ -22,6 +22,7 @@
   import { createCopyFlash } from "../desktop/clipboard";
   import Skeleton from "./Skeleton.svelte";
   import HygienePanel from "./HygienePanel.svelte";
+  import CommitGraphWrite from "./CommitGraphWrite.svelte";
   import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
   import type { ArtifactDir } from "../storage/types";
   import {
@@ -544,7 +545,7 @@
           </table>
         </div>
         {#if commitGraph}
-          <!-- Display only: GitPulse never runs this command. -->
+          <!-- The hint itself is display text; the confirmed, gated write is CommitGraphWrite below. -->
           <div
             class="rounded-2xl border border-border/70 bg-surface p-3 space-y-1"
             data-testid="commit-graph-hint"
@@ -560,6 +561,13 @@
             {/if}
           </div>
         {/if}
+        {#key report.repo_path}
+          <CommitGraphWrite
+            report={report.commit_graph}
+            repoPath={report.repo_path}
+            onwritten={() => scan(report?.repo_path)}
+          />
+        {/key}
       </section>
 
       <!--

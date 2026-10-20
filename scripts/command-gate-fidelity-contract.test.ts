@@ -56,6 +56,7 @@ const DERIVED_ARGV = Object.freeze({
   cmd_reset: "shares reset_argv with the writer, so drift is impossible",
   cmd_set_git_identity: "shares GitWriter::identity_argv with set_identity, so the two judged `git config` lines are the lines that run",
   cmd_auto_fetch: "judges git_writer::AUTO_FETCH_ARGV, the same constant GitWriter::auto_fetch runs",
+  cmd_commit_graph_write: "GitWriter::commit_graph_write_argv builds the line the gate judges; commit_graph_write refuses any confirmed argv that is not that line and runs it; commands/parity_tests.rs asserts previewed == judged == spawned",
   cmd_remote_change: "argv varies by RemoteChange variant",
   cmd_submodule_change: "argv varies by SubmoduleChange variant",
   cmd_repo_operation_action: "argv varies by OperationAction variant",

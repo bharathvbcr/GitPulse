@@ -134,6 +134,31 @@ export interface CommitGraphReport {
   bloom: boolean | null;
   head_covered: boolean | null;
   note: string | null;
+  /** A commit-graph write is running in this repository right now (set by the storage scan). */
+  write_in_flight?: boolean;
+}
+
+/** What a click on "Write commit-graph" would run (`cmd_commit_graph_write_plan`). */
+export interface CommitGraphWritePlan {
+  /** The exact line the gate judges and git is started with, program first. */
+  argv: string[];
+  /** The directory whose `objects/info` is written, shared by every worktree. */
+  common_dir: string;
+  state: CommitGraphState;
+  /** The run is killed after this many seconds. */
+  timeout_secs: number;
+}
+
+/** How a confirmed write ended (`cmd_commit_graph_write`). */
+export interface CommitGraphWriteOutcome {
+  cancelled: boolean;
+  /** This click joined a write another click had already started. */
+  joined: boolean;
+  elapsed_ms: number;
+  /** The detector's answer after the run. */
+  report: CommitGraphReport;
+  /** Set when a lock file remains after a stopped write: its path, age and remedy. */
+  note: string | null;
 }
 
 export interface StorageReport {
