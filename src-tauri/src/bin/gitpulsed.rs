@@ -98,7 +98,14 @@ OUTPUT:
       {\"repo\":\"…\",\"cycle\":1,\"recorded\":3,\"transcripts\":2,\"skipped_lines\":0,
        \"rehosted_calls\":0,\"departed_overflow\":0,\"family_unresolved\":false,
        \"family_unresolved_cycles\":0,
-       \"reflog_entries\":7,\"recording\":true,\"error\":\"\",\"elapsed_ms\":42}
+       \"reflog_entries\":7,\"failed_records\":0,\"reflog_pending\":0,
+       \"recording\":true,\"error\":\"\",\"elapsed_ms\":42}
+
+    The reflog of every worktree in the family and of the default branch is
+    replayed from where the last cycle stopped. `reflog_pending` counts entries
+    known and not yet recorded (more than 200 since the last cycle, or behind a
+    failed write); `failed_records` counts writes that failed. Either non-zero
+    sets `truncated`, and the next cycle carries on from the same place.
 
     `rehosted_calls` and `departed_overflow` count transcript calls that needed
     another worktree's transaction (past the per-pass worktree cap, or from
@@ -239,6 +246,11 @@ struct CycleReport {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     reanchored_from: Vec<String>,
     reflog_entries: i64,
+    /// Reflog entries whose ledger write failed, and reflog entries known but
+    /// not yet recorded (a window overrun or a stop at a failed write). Either
+    /// non-zero means `truncated`: the next cycle carries on from there.
+    failed_records: i64,
+    reflog_pending: i64,
     /// True when the catch-up deadline stopped the pass early: the counts are
     /// a floor, and what was not reached is the next cycle's. Carried as its
     /// own field so a partial pass is not only a substring of `error`.
@@ -286,6 +298,8 @@ fn guarded_cycle(
                 family_unresolved_cycles: 0,
                 reanchored_from: Vec::new(),
                 reflog_entries: 0,
+                failed_records: 0,
+                reflog_pending: 0,
                 truncated: false,
                 pruned: 0,
                 // Unknown, so not claimed: the panic may have hit the ledger.
@@ -325,6 +339,8 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
                 family_unresolved_cycles: 0,
                 reanchored_from: Vec::new(),
                 reflog_entries: 0,
+                failed_records: 0,
+                reflog_pending: 0,
                 truncated: false,
                 pruned: 0,
                 recording: false,
@@ -351,6 +367,8 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
         family_unresolved_cycles: caught.family_unresolved_cycles,
         reanchored_from: caught.reanchored_from,
         reflog_entries: caught.reflog_entries,
+        failed_records: caught.failed_records,
+        reflog_pending: caught.reflog_pending,
         truncated: caught.truncated,
         pruned: caught.pruned,
         recording: status.recording,
@@ -507,6 +525,8 @@ mod tests {
                         family_unresolved_cycles: 0,
                         reanchored_from: Vec::new(),
                         reflog_entries: 0,
+                        failed_records: 0,
+                        reflog_pending: 0,
                         truncated: false,
                         pruned: 0,
                         recording: true,
@@ -853,6 +873,8 @@ mod tests {
             "family_unresolved",
             "family_unresolved_cycles",
             "reflog_entries",
+            "failed_records",
+            "reflog_pending",
             "recording",
             "error",
             "elapsed_ms",
