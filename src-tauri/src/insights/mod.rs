@@ -13,6 +13,8 @@ pub(crate) mod live_sessions;
 #[cfg(test)]
 mod merge_adv_tests;
 pub mod merge_conflicts;
+#[cfg(test)]
+mod merge_conflicts_bench_tests;
 
 pub use collision_memo::{
     collision_risk_for_path_memoized, MemoizedCollision, TTL as COLLISION_MEMO_TTL,
