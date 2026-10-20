@@ -9,6 +9,8 @@ mod collision_memo;
 mod entity_collision;
 pub(crate) mod live_sessions;
 pub mod merge_conflicts;
+#[cfg(test)]
+mod head_divergence_tests;
 
 pub use collision_memo::{
     collision_risk_for_path_memoized, MemoizedCollision, TTL as COLLISION_MEMO_TTL,
@@ -4229,34 +4231,12 @@ mod tests {
         }
         fs::write(root.join("shared.txt"), "main-edit").unwrap();
         fs::write(cwds[1].join("shared.txt"), "agent-edit").unwrap();
-        // The one per-HEAD read the snapshot does make (`ahead`/`behind` of a
-        // commit against the default base): `rev-list --left-right --count
-        // <oid>...<oid>`, named by commit ids and never by `refs/`. The old
-        // per-branch divergence read names `refs/heads/<branch>`, so it is
-        // still counted below.
-        let head_read = |argv: &Vec<String>| {
-            argv.iter().any(|arg| arg == "rev-list")
-                && argv.iter().any(|arg| arg == "--left-right")
-                && argv.iter().any(|arg| arg == "--count")
-                && argv.last().is_some_and(|range| {
-                    !range.contains("refs/")
-                        && range
-                            .split("...")
-                            .all(crate::engine::git_writer::is_full_oid)
-                })
-        };
-        let all_spawns = |cwds: &[std::path::PathBuf]| -> Vec<Vec<String>> {
+        let measured = |cwds: &[std::path::PathBuf]| {
             cwds.iter()
                 .flat_map(|cwd| crate::engine::git_cli::spawn_log::spawns_in(cwd))
-                .collect()
-        };
-        let measured = |cwds: &[std::path::PathBuf]| {
-            all_spawns(cwds)
-                .iter()
                 .filter(|argv| {
                     argv.iter()
                         .any(|arg| arg == "--shortstat" || arg == "rev-list" || arg == "--verify")
-                        && !head_read(argv)
                 })
                 .count()
         };
@@ -4271,21 +4251,16 @@ mod tests {
         assert_eq!(context.worktree.dirty_files, Some(1));
         assert_eq!(measured(&cwds), 0, "change_context");
 
-        let snapshot = snapshot(repo);
-        assert!(snapshot
-            .worktrees
-            .items
-            .iter()
-            .all(|w| w.dirty_files.is_some()));
-        assert_eq!(measured(&cwds), 0, "snapshot");
-        // Only the snapshot reads head divergence, once per distinct HEAD at
-        // most: the three checkouts here are on one commit, so one read.
-        let head_reads = all_spawns(&cwds).iter().filter(|a| head_read(a)).count();
-        assert!(
-            head_reads <= cwds.len(),
-            "{head_reads} head divergence reads for {} worktrees",
-            cwds.len()
-        );
+        // The snapshot's one per-HEAD read (ahead/behind) is cached by the
+        // immutable (head, base) pair: the first snapshot may spawn it for a
+        // HEAD it has not seen, and a second, with nothing moved, spawns no
+        // rev-list, no --shortstat and no --verify at all.
+        let first = snapshot(repo);
+        assert!(first.worktrees.items.iter().all(|w| w.dirty_files.is_some()));
+        let after_first = measured(&cwds);
+        let second = snapshot(repo);
+        assert!(second.worktrees.items.iter().all(|w| w.dirty_files.is_some()));
+        assert_eq!(measured(&cwds), after_first, "a steady-state snapshot");
     }
 
     /// A repository with `linked` extra worktrees, all trusted. Returns the

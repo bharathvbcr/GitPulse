@@ -298,12 +298,13 @@ export type MergeCandidate =
   | { state: "unknown"; reason: string };
 
 /** One pair of checkouts and what merging their HEADs would do. */
-export type MergePairVerdict = {
+export interface PairVerdict {
   a_path: string;
   b_path: string;
   a_head: string;
   b_head: string;
-} & MergeCandidate;
+  verdict: MergeCandidate;
+}
 
 /** `gitpulse_merge_conflicts`: wire shape of `insights::merge_conflicts::MergeConflicts`. */
 export interface MergeConflicts {
@@ -319,5 +320,5 @@ export interface MergeConflicts {
   unknown: number;
   /** True when `pairs_checked < pairs_total`: the counts are a floor. */
   truncated: boolean;
-  items: MergePairVerdict[];
+  items: PairVerdict[];
 }

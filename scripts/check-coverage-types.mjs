@@ -174,6 +174,11 @@ export const CONTRACTS = Object.freeze([
     "CollisionParty", "CollisionItem", "CollisionRisk", "InsightsSnapshot",
     "ChangedFile", "ActiveChanges", "ChangeContext", "McpToolInfo", "McpInfo",
   ] },
+  // `gitpulse_merge_conflicts`: an agent branches on `ok`, `truncated` and the
+  // counts to tell a floor from the whole, so a renamed field would read as a
+  // clean, complete answer. `MergeCandidate` (the `verdict` of each pair) is an
+  // enum, covered by scripts/enum-variant-contract.test.ts.
+  { label: "merge-conflicts", rustPath: rust("insights", "merge_conflicts.rs"), tsPath: ts("insights", "types.ts"), structs: ["MergeConflicts", "PairVerdict"] },
   // The Fleet grid's two wire surfaces. The metrics row is the one that must
   // not drift: every field is nullable ON PURPOSE — a null value with a null
   // timestamp is "never scanned", and a field that silently became
