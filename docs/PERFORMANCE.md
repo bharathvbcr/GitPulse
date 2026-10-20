@@ -891,6 +891,7 @@ Committed baselines: `local-macos-aarch64` (below, re-seeded after the lag-audit
 | `idle_wakeups` | process interrupt wakeups/s with 0, 1, 8, 32 idle terminal sessions, an idle mailbox, 8 / 24 idle watches, an idle alerts bridge and the host-load sampler | terminal-reader-kqueue; always-on-pollers; ft-79394019 (Wave 0) |
 | `live_index` | duty cycle of the live index under a 40-tick, 250 ms-cadence edit storm against a stub `devmap` | live-index-duty-cycle |
 | `worktree_teardown` | `remove_worktree` (lock-held) and `merge_and_teardown_worktree` on a worktree with 100k ignored files, and the merge with 0 entries as the control; `contender_wait_ns` of a `lock_worktree` issued mid-teardown | CARD 22 S5-11 (ft-9d04447403db7f9525dce4db970e4b8a) |
+| `merge_conflicts` | `merge_tree_candidate` (a clean pair and a conflicting pair) on a 2,000-file repository, against a raw `git merge-tree --write-tree` as the control | ft-9cfd4d74 (CARD 9) |
 | `graph_spawns` | `cmd_get_commit_graph` at the default 5,000-row cap on 6,000 commits; `cmd_get_stack_hierarchy` with 20 branches beyond its 2,000-commit window, cold and with refs unmoved; each with git processes | ft-9cfa4f74 (S4-03, S4-04) |
 
 `src/watcher/bench_seam.rs` is a `#[doc(hidden)]` module that builds the same
@@ -1800,6 +1801,33 @@ them would fail the compare with "baselined but produced no report". Only
 both benches to that list in the same change that seeds `ubuntu-latest` or
 `macos-latest`.
 
+
+## 2026-10-19: merge-tree per pair on a 2,000-file repository (ft-9cfd4d7403d5703225e3d7db97145421)
+
+`gitpulse_merge_conflicts` merges every pair of worktree HEADs, so its cost is the
+pair count (capped at 64) times one `merge_tree_candidate`. `cargo bench
+--manifest-path src-tauri/Cargo.toml --bench merge_conflicts`: 2,000 tracked files in
+50 directories, three one-file lanes off `main`, rows interleaved, N = 15 per row
+after 2 warm-up rounds, min-of-N. Load average at the start 17.15 (1 min) on 18 cores,
+16.60 at the end: the host was busy with other lanes throughout, so read the ratios
+and not the absolute milliseconds.
+
+| row | n | min ms | p50 ms | p95 ms | git processes |
+| --- | --- | --- | --- | --- | --- |
+| `merge_tree_candidate` clean pair | 15 | 33.26 | 49.03 | 68.39 | 5 |
+| `merge_tree_candidate` conflict pair | 15 | 33.18 | 54.22 | 85.76 | not counted |
+| raw `git merge-tree --write-tree` (control) | 15 | 9.99 | 11.99 | 13.38 | 1 |
+
+The five processes of a lone `merge_tree_candidate` are the two `git config` reads
+that tell a partial clone, two `rev-parse` operand resolutions and the merge. The
+conflict pair costs the same as the clean one: the merge itself is a few milliseconds
+on this tree, and the rest is process spawns. The tool does not pay the guard per
+pair: it tells a partial clone once per call and passes the worktrees' full HEAD
+oids, so each pair is one `merge-tree` (plus the quarantine directory's create and
+delete) through `merge_tree_resolved`. That per-pair figure is inferred from the
+code path and the 10 ms control, not measured: the bench reaches only the public
+entry point. The control writes its merged tree into the fixture's object store,
+which is the write the quarantine exists to prevent.
 
 ## 2026-10-16: word diff annotates a bounded window (ft-02b836b8)
 
