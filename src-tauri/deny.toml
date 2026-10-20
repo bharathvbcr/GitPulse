@@ -26,7 +26,14 @@ all-features = true
 # fail. Nothing is ignored; an exception needs an advisory id and a reason.
 unmaintained = "all"
 yanked = "deny"
-ignore = []
+ignore = [
+  # zbus 5.x standalone helper crates were merged into zbus 6.x as internal modules.
+  # Upstream tauri-plugin-opener and tauri-plugin-single-instance pin zbus 5.x;
+  # no safe upgrade is available until upstream plugins adopt zbus 6.
+  { id = "RUSTSEC-2026-0370", reason = "zvariant merged into zbus 6; upstream tauri plugins require zbus 5" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names merged into zbus 6; upstream tauri plugins require zbus 5" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive merged into zbus 6; upstream tauri plugins require zbus 5" },
+]
 
 [licenses]
 # GitPulse is MIT. Every licence below is permissive except MPL-2.0, a
