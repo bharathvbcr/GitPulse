@@ -86,7 +86,14 @@ before that tag is pushed.
   base moved spawns no `rev-list`, and one moved HEAD costs exactly one, through
   the shared spawn gate. At most 8 such reads run per snapshot, within its
   deadline. A row that was not measured has null counts and a
-  `divergence_note` starting `unmeasured:`, never zero.
+  `divergence_note` starting `unmeasured:`, never zero. The shallow boundary
+  (`<common dir>/shallow`, by length and mtime) is part of the cache key, and a
+  shallow clone's rows say `shallow: counts are bounded by the clone depth`.
+- `gitpulse_merge_conflicts` is `ok: false` whenever a pair is `unknown`, with
+  an `error` naming how many (and `deferred` with `retry_after_ms` when every
+  unknown pair was the spawn gate deferring). Conflicted paths are lossless:
+  UTF-8 as is, a byte that is not UTF-8 as an octal escape (`\377`), a
+  backslash doubled.
   `commits_since_base` is the same number as `ahead`.
 
 - `gitpulse_landed` answers whether a commit's work reached a base and how:

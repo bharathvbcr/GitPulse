@@ -253,7 +253,6 @@ fn a_path_with_a_newline_is_one_path() {
 }
 
 #[test]
-#[ignore = "adv: conflicted paths are String::from_utf8_lossy'd, so two different non-UTF-8 names collapse into the same U+FFFD string"]
 fn two_conflicted_paths_that_are_not_utf8_stay_distinguishable() {
     let repo = Repo::new();
     let base = repo.commit(

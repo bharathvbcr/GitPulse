@@ -209,9 +209,11 @@ impl ObjectQuarantine {
             ],
             deadline,
         )?;
-        let stdout = String::from_utf8_lossy(&run.stdout);
-        let mut fields = stdout.split('\0');
-        let tree = fields.next().unwrap_or_default().trim();
+        // Bytes, not text: a path git names need not be UTF-8, and a lossy
+        // conversion would make two different names the same string.
+        let mut fields = run.stdout.split(|byte| *byte == 0);
+        let tree = String::from_utf8_lossy(fields.next().unwrap_or_default());
+        let tree = tree.trim();
         match run.status_code {
             0 | 1 if is_object_name(tree) => {
                 if run.status_code == 0 {
@@ -221,7 +223,7 @@ impl ObjectQuarantine {
                 }
                 let named: Vec<String> = fields
                     .filter(|path| !path.is_empty())
-                    .map(str::to_string)
+                    .map(render_path)
                     .collect();
                 // A conflict that names no path is not an answer a caller can
                 // act on, and it is not a clean merge either.
@@ -243,6 +245,27 @@ impl ObjectQuarantine {
             )),
         }
     }
+}
+
+/// A conflicted path as text, losslessly: valid UTF-8 as it is, a byte that is
+/// not UTF-8 as a three-digit octal escape (`\377`, as git quotes it), and a
+/// backslash doubled so that an escape and a name that spells one never
+/// collide. Two different paths are always two different strings.
+fn render_path(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for chunk in bytes.utf8_chunks() {
+        for ch in chunk.valid().chars() {
+            if ch == '\\' {
+                out.push_str("\\\\");
+            } else {
+                out.push(ch);
+            }
+        }
+        for byte in chunk.invalid() {
+            out.push_str(&format!("\\{byte:03o}"));
+        }
+    }
+    out
 }
 
 /// git before 2.38 rejects the option itself; every other failure is a failed

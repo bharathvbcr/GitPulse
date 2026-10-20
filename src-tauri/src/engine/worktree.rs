@@ -1115,7 +1115,31 @@ pub const MAX_HEAD_DIVERGENCE_MISSES: usize = 8;
 /// only keeps a long-lived process from growing with every commit it has seen.
 const HEAD_DIVERGENCE_CACHE_CAPACITY: usize = 1024;
 
-type DivergenceKey = (PathBuf, String, String);
+/// `(repository, shallow boundary, head, base)`. Ancestry is immutable only
+/// while history is whole: a shallow clone's counts stop at its boundary, and
+/// deepening it changes them for the same head and base, so the boundary file's
+/// state is part of the key.
+type DivergenceKey = (PathBuf, String, String, String);
+
+/// The state of `<common dir>/shallow` as a key: empty when absent, otherwise
+/// its length and modification time (git rewrites the file whenever the
+/// boundary moves). Read without spawning. `None` when the common directory
+/// or the file could not be read, in which case nothing is cached or served.
+fn shallow_token(repo: &Path) -> Option<(String, bool)> {
+    let file = resolve_git_common_dir(repo).ok()?.join("shallow");
+    match std::fs::metadata(&file) {
+        Ok(meta) => {
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |since| since.as_nanos());
+            Some((format!("{}:{modified}", meta.len()), true))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some((String::new(), false)),
+        Err(_) => None,
+    }
+}
 
 fn head_divergence_cache() -> &'static Mutex<LruMap<DivergenceKey, HeadDivergence>> {
     static CACHE: OnceLock<Mutex<LruMap<DivergenceKey, HeadDivergence>>> = OnceLock::new();
@@ -1133,6 +1157,9 @@ pub struct HeadDivergences {
     /// when every asked oid has an entry, so an absent count is never mistaken
     /// for zero.
     pub unread: Option<String>,
+    /// The repository is a shallow clone: every count is bounded by the clone
+    /// depth and is not the whole history's.
+    pub shallow: bool,
 }
 
 /// Measures each distinct commit in `heads` against the repository's default
@@ -1190,13 +1217,24 @@ pub(crate) fn measure_head_divergence_capped(
     let mut misses = 0usize;
     let mut unread = 0usize;
     let mut first_reason = None;
+    let boundary = shallow_token(repo);
+    out.shallow = boundary.as_ref().is_some_and(|(_, shallow)| *shallow);
     for head in &distinct {
-        let key = (repo.to_path_buf(), (*head).to_string(), base_oid.clone());
-        let cached = head_divergence_cache()
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&key)
-            .copied();
+        let key = boundary.as_ref().map(|(token, _)| {
+            (
+                repo.to_path_buf(),
+                token.clone(),
+                (*head).to_string(),
+                base_oid.clone(),
+            )
+        });
+        let cached = key.as_ref().and_then(|key| {
+            head_divergence_cache()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(key)
+                .copied()
+        });
         if let Some(known) = cached {
             out.by_head.insert((*head).to_string(), known);
             continue;
@@ -1209,10 +1247,12 @@ pub(crate) fn measure_head_divergence_capped(
             misses += 1;
             match left_right_counts(repo, &base_oid, head, deadline.remaining()) {
                 Ok(counts) => {
-                    head_divergence_cache()
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .insert(key, counts);
+                    if let Some(key) = key {
+                        head_divergence_cache()
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .insert(key, counts);
+                    }
                     out.by_head.insert((*head).to_string(), counts);
                     continue;
                 }

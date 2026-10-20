@@ -174,6 +174,39 @@ pub(crate) fn merge_conflicts_within(
             "the repository has {} worktrees and only the first {MAX_MERGE_WORKTREES} were considered",
             listing.len()
         );
+    } else if out.unknown > 0 {
+        // `ok` is true only when every checked pair was merged to a clean or
+        // conflicting answer. When every unknown pair is the spawn gate
+        // deferring under load, the error is made of those sentences alone, so
+        // `insights::mark_deferrals` adds `deferred` and `retry_after_ms`;
+        // any other reason keeps its own words and is never made retryable.
+        let mut reasons: Vec<&str> = Vec::new();
+        for item in &out.items {
+            if let MergeCandidate::Unknown { reason } = &item.verdict {
+                if !reasons.contains(&reason.as_str()) {
+                    reasons.push(reason);
+                }
+            }
+        }
+        out.ok = false;
+        out.error = if reasons
+            .iter()
+            .all(|reason| crate::engine::git_cli::is_deferred_under_load(reason))
+        {
+            reasons
+                .iter()
+                .take(3)
+                .copied()
+                .collect::<Vec<_>>()
+                .join("; ")
+        } else {
+            format!(
+                "{} of {} pairs could not be merged (unknown): {}",
+                out.unknown,
+                out.pairs_checked,
+                reasons.first().copied().unwrap_or_default()
+            )
+        };
     }
     out
 }

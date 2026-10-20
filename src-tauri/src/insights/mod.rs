@@ -88,7 +88,9 @@ pub struct WorktreeSummary {
     #[serde(default)]
     pub commits_since_base: Option<u32>,
     /// Why `ahead`, `behind` and `commits_since_base` are absent for a
-    /// checkout that has a `head`; `None` when they were measured.
+    /// checkout that has a `head` (`unmeasured: ...`), or why they are not
+    /// exact (`shallow: counts are bounded by the clone depth`); `None` when
+    /// they were measured against whole history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub divergence_note: Option<String>,
 }
@@ -714,6 +716,10 @@ fn fill_head_divergence(
                 item.ahead = Some(found.ahead);
                 item.behind = Some(found.behind);
                 item.commits_since_base = Some(found.ahead);
+                if measured.shallow {
+                    item.divergence_note =
+                        Some("shallow: counts are bounded by the clone depth".to_string());
+                }
             }
             None => {
                 item.divergence_note = Some(

@@ -134,6 +134,44 @@ fn a_miss_after_the_deadline_is_unmeasured_and_a_hit_still_answers() {
 }
 
 #[test]
+fn a_shallow_clones_counts_say_they_are_bounded_by_the_depth() {
+    let (main, _parent, _linked) = repo_with_worktrees(1);
+    let src = main.path().canonicalize().unwrap();
+    commit_in(&src, "m1.txt");
+    commit_in(&src, "m2.txt");
+    let holder = tempfile::tempdir().unwrap();
+    let dst = holder.path().join("shallow");
+    let url = format!("file://{}", src.display());
+    git_in(
+        holder.path(),
+        &["clone", "-q", "--depth", "1", &url, dst.to_str().unwrap()],
+    );
+    crate::test_support::trust_repo(&dst);
+    let dst = dst.canonicalize().unwrap();
+    let mut rows: Vec<WorktreeSummary> = worktree::list_worktrees_lite(dst.to_str().unwrap())
+        .unwrap()
+        .iter()
+        .map(|info| summarise_worktree(info, String::new(), false))
+        .collect();
+    let clock = worktree::ScanDeadline::after(Instant::now(), Duration::from_secs(60));
+
+    fill_head_divergence(dst.to_str().unwrap(), &mut rows, &clock);
+
+    assert!(rows[0].ahead.is_some(), "{:?}", rows[0]);
+    assert_eq!(
+        rows[0].divergence_note.as_deref(),
+        Some("shallow: counts are bounded by the clone depth")
+    );
+    // A whole-history repository carries no note.
+    let whole = snapshot(src.to_str().unwrap());
+    assert!(whole
+        .worktrees
+        .items
+        .iter()
+        .all(|w| w.divergence_note.is_none()));
+}
+
+#[test]
 fn a_moved_base_remeasures_every_head() {
     let (_main, _parent, root, linked) = lanes_with_work(2);
     let repo = root.to_str().unwrap();

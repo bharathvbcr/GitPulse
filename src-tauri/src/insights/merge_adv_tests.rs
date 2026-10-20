@@ -99,7 +99,6 @@ fn clones_that_share_every_object_name_do_not_share_cache_entries() {
 }
 
 #[test]
-#[ignore = "adv: the cache key (repo, head, base) is held immutable, but a shallow clone deepened in place changes the counts for the same key"]
 fn a_deepened_shallow_clone_remeasures_instead_of_serving_the_shallow_counts() {
     let (main, _parent, _linked) = repo_with_worktrees(1);
     let src = main.path().canonicalize().unwrap();
@@ -154,7 +153,6 @@ fn a_deepened_shallow_clone_remeasures_instead_of_serving_the_shallow_counts() {
 }
 
 #[test]
-#[ignore = "adv: every pair unknown (git merge-tree refused) still reports ok:true, no `deferred`, although ok:true is documented to mean every pair was merged"]
 fn an_answer_in_which_no_pair_was_merged_is_not_ok() {
     let (main, _parent, linked) = repo_with_worktrees(2);
     let root = main.path().canonicalize().unwrap();
