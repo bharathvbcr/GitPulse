@@ -41,7 +41,6 @@ pub struct PairVerdict {
     /// `state` is `clean` (the merged tree exists only in the quarantine that
     /// has been deleted), `conflict` (with `paths` and `paths_total`) or
     /// `unknown` (with `reason`).
-    #[serde(flatten)]
     pub verdict: MergeCandidate,
 }
 

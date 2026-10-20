@@ -7,10 +7,10 @@
 
 mod collision_memo;
 mod entity_collision;
-pub(crate) mod live_sessions;
-pub mod merge_conflicts;
 #[cfg(test)]
 mod head_divergence_tests;
+pub(crate) mod live_sessions;
+pub mod merge_conflicts;
 
 pub use collision_memo::{
     collision_risk_for_path_memoized, MemoizedCollision, TTL as COLLISION_MEMO_TTL,
@@ -718,7 +718,7 @@ fn fill_head_divergence(
                     measured
                         .unread
                         .clone()
-                        .unwrap_or_else(|| "this HEAD was not measured".to_string()),
+                        .unwrap_or_else(|| "unmeasured: this HEAD was not measured".to_string()),
                 );
             }
         }
@@ -4256,10 +4256,18 @@ mod tests {
         // HEAD it has not seen, and a second, with nothing moved, spawns no
         // rev-list, no --shortstat and no --verify at all.
         let first = snapshot(repo);
-        assert!(first.worktrees.items.iter().all(|w| w.dirty_files.is_some()));
+        assert!(first
+            .worktrees
+            .items
+            .iter()
+            .all(|w| w.dirty_files.is_some()));
         let after_first = measured(&cwds);
         let second = snapshot(repo);
-        assert!(second.worktrees.items.iter().all(|w| w.dirty_files.is_some()));
+        assert!(second
+            .worktrees
+            .items
+            .iter()
+            .all(|w| w.dirty_files.is_some()));
         assert_eq!(measured(&cwds), after_first, "a steady-state snapshot");
     }
 

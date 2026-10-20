@@ -81,8 +81,12 @@ before that tag is pushed.
   stays read-only. The one primitive is `object_quarantine::merge_tree_candidate`.
 - Insights worktree rows carry `head`, `ahead`, `behind` and
   `commits_since_base`, measured from the HEAD commit so a detached worktree
-  has them (one `rev-list` per distinct HEAD, not one per worktree). A row that
-  was not measured has null counts and a `divergence_note`, never zero.
+  has them. The counts are cached by the immutable (repository, HEAD, base)
+  triple in a bounded LRU (1,024 entries), so a snapshot with no HEAD and no
+  base moved spawns no `rev-list`, and one moved HEAD costs exactly one, through
+  the shared spawn gate. At most 8 such reads run per snapshot, within its
+  deadline. A row that was not measured has null counts and a
+  `divergence_note` starting `unmeasured:`, never zero.
   `commits_since_base` is the same number as `ahead`.
 
 - `gitpulse_landed` answers whether a commit's work reached a base and how:

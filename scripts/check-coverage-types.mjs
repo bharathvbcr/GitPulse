@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 103 contracts over
- * 252 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 104 contracts over
+ * 254 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a

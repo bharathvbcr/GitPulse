@@ -1106,18 +1106,32 @@ pub struct HeadDivergence {
     pub behind: u32,
 }
 
-/// Most distinct HEAD commits one [`measure_head_divergence`] reads: the
-/// snapshot lists at most this many worktrees.
-const MAX_HEAD_DIVERGENCE_READS: usize = 64;
+/// Most `rev-list` reads (cache misses) one [`measure_head_divergence`] pass
+/// makes. A HEAD past it is reported unmeasured, not read.
+pub const MAX_HEAD_DIVERGENCE_MISSES: usize = 8;
+
+/// Most `(repository, head, base)` answers remembered. The key is immutable (a
+/// commit's ancestry never changes), so an entry is never stale; the bound
+/// only keeps a long-lived process from growing with every commit it has seen.
+const HEAD_DIVERGENCE_CACHE_CAPACITY: usize = 1024;
+
+type DivergenceKey = (PathBuf, String, String);
+
+fn head_divergence_cache() -> &'static Mutex<LruMap<DivergenceKey, HeadDivergence>> {
+    static CACHE: OnceLock<Mutex<LruMap<DivergenceKey, HeadDivergence>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(LruMap::new(HEAD_DIVERGENCE_CACHE_CAPACITY)))
+}
 
 /// What [`measure_head_divergence`] established.
 #[derive(Debug, Default)]
 pub struct HeadDivergences {
     /// Divergence by full HEAD oid, for every oid that was measured.
     pub by_head: HashMap<String, HeadDivergence>,
-    /// Why anything is missing from `by_head`: no default base resolved, a
-    /// read failed, or the deadline passed. `None` when every asked oid has
-    /// an entry, so an absent count is never mistaken for zero.
+    /// Why anything is missing from `by_head`, always starting `unmeasured:`:
+    /// no default base resolved, a read failed, the per-pass cap of
+    /// [`MAX_HEAD_DIVERGENCE_MISSES`] was spent, or the deadline passed. `None`
+    /// when every asked oid has an entry, so an absent count is never mistaken
+    /// for zero.
     pub unread: Option<String>,
 }
 
@@ -1128,12 +1142,26 @@ pub struct HeadDivergences {
 /// ([`crate::engine::git_reader::default_base`]), the same answer the branch
 /// list measures against.
 ///
-/// One `rev-list --left-right --count` per distinct oid, at most
-/// [`MAX_HEAD_DIVERGENCE_READS`], each given what the deadline has left.
+/// An answer already known for the immutable `(head, base)` pair costs no
+/// process. A miss is one `rev-list --left-right --count` through the shared
+/// spawn gate (so it spends the same budget as every other read), at most
+/// [`MAX_HEAD_DIVERGENCE_MISSES`] per pass and each given what the deadline
+/// has left; every HEAD past either limit is unmeasured.
 pub fn measure_head_divergence(
     repo: &Path,
     heads: &[&str],
     deadline: &ScanDeadline,
+) -> HeadDivergences {
+    measure_head_divergence_capped(repo, heads, deadline, MAX_HEAD_DIVERGENCE_MISSES)
+}
+
+/// [`measure_head_divergence`] with the per-pass miss cap as an argument, so
+/// the cold-cache-over-cap case is reachable without nine worktrees.
+pub(crate) fn measure_head_divergence_capped(
+    repo: &Path,
+    heads: &[&str],
+    deadline: &ScanDeadline,
+    max_misses: usize,
 ) -> HeadDivergences {
     let mut out = HeadDivergences::default();
     let mut distinct: Vec<&str> = Vec::new();
@@ -1148,24 +1176,43 @@ pub fn measure_head_divergence(
     let base_oid = match read_base(repo) {
         Ok(Some((_, oid))) => oid,
         Ok(None) => {
-            out.unread = Some("the repository has no default base to measure against".into());
+            out.unread =
+                Some("unmeasured: the repository has no default base to measure against".into());
             return out;
         }
         Err(reason) => {
-            out.unread = Some(format!("the default base could not be read: {reason}"));
+            out.unread = Some(format!(
+                "unmeasured: the default base could not be read: {reason}"
+            ));
             return out;
         }
     };
+    let mut misses = 0usize;
     let mut unread = 0usize;
     let mut first_reason = None;
-    for (index, head) in distinct.iter().enumerate() {
-        let reason = if index >= MAX_HEAD_DIVERGENCE_READS {
-            "past the per-pass read limit".to_string()
+    for head in &distinct {
+        let key = (repo.to_path_buf(), (*head).to_string(), base_oid.clone());
+        let cached = head_divergence_cache()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+            .copied();
+        if let Some(known) = cached {
+            out.by_head.insert((*head).to_string(), known);
+            continue;
+        }
+        let reason = if misses >= max_misses {
+            format!("past the per-pass limit of {max_misses} reads")
         } else if deadline.expired() {
             "the deadline passed".to_string()
         } else {
+            misses += 1;
             match left_right_counts(repo, &base_oid, head, deadline.remaining()) {
                 Ok(counts) => {
+                    head_divergence_cache()
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(key, counts);
                     out.by_head.insert((*head).to_string(), counts);
                     continue;
                 }
@@ -1177,7 +1224,7 @@ pub fn measure_head_divergence(
     }
     if let Some(reason) = first_reason {
         out.unread = Some(format!(
-            "{unread} of {} distinct HEAD commits not measured: {reason}",
+            "unmeasured: {unread} of {} distinct HEAD commits not measured: {reason}",
             distinct.len()
         ));
     }

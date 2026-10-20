@@ -74,9 +74,12 @@ fn the_three_states_reach_the_wire_and_the_object_store_is_untouched() {
     assert_eq!(payload["conflict"], 1, "{payload}");
     assert_eq!(payload["clean"], 5, "{payload}");
     let items = payload["items"].as_array().unwrap();
-    let conflicted: Vec<&Value> = items.iter().filter(|i| i["state"] == "conflict").collect();
+    let conflicted: Vec<&Value> = items
+        .iter()
+        .filter(|i| i["verdict"]["state"] == "conflict")
+        .collect();
     assert_eq!(conflicted.len(), 1);
-    assert_eq!(conflicted[0]["paths"], json!(["seed.txt"]));
+    assert_eq!(conflicted[0]["verdict"]["paths"], json!(["seed.txt"]));
     assert!(object_store(&root) == before, "the object store changed");
 }
 

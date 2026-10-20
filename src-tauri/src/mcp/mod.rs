@@ -889,7 +889,7 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_merge_conflicts",
             "Merge conflicts between worktrees",
-            "Would the checkouts' committed work merge? For each pair of worktrees whose HEAD commits differ (detached ones included), `git merge-tree --write-tree` computes the merge, which survives a commit where `gitpulse_collision_risk` (uncommitted files only) does not. Each pair is `clean`, `conflict` with `paths` (the first 200 of `paths_total`), or `unknown` with a `reason` (a git failure, unrelated histories, a deadline, a git older than 2.38, a partial clone): an unknown pair is never clean. At most 64 pairs are merged: above that `ok` is false, `truncated` is true, `pairs_total` is how many there were and `pairs_checked` how many were merged, so the counts are a floor. Worktrees on the very same commit need no merge and are counted in `same_head_pairs`. Read-only: the merge writes its trees and blobs to a scratch object directory that is deleted afterwards (the repository reads through it as an alternate), so no ref, index, working-tree file or repository object is written.",
+            "Would the checkouts' committed work merge? For each pair of worktrees whose HEAD commits differ (detached ones included), `git merge-tree --write-tree` computes the merge, which survives a commit where `gitpulse_collision_risk` (uncommitted files only) does not. Each pair's `verdict.state` is `clean`, `conflict` with `paths` (the first 200 of `paths_total`), or `unknown` with a `reason` (a git failure, unrelated histories, a deadline, a git older than 2.38, a partial clone): an unknown pair is never clean. At most 64 pairs are merged: above that `ok` is false, `truncated` is true, `pairs_total` is how many there were and `pairs_checked` how many were merged, so the counts are a floor. Worktrees on the very same commit need no merge and are counted in `same_head_pairs`. Read-only: the merge writes its trees and blobs to a scratch object directory that is deleted afterwards (the repository reads through it as an alternate), so no ref, index, working-tree file or repository object is written.",
             RepoArgs::properties(),
             &RepoArgs::required(),
             ok_error_output(
@@ -911,16 +911,22 @@ fn build_tools() -> Vec<Value> {
                                 "b_path": { "type": "string" },
                                 "a_head": { "type": "string" },
                                 "b_head": { "type": "string" },
-                                "state": {
-                                    "type": "string",
-                                    "enum": ["clean", "conflict", "unknown"]
-                                },
-                                "tree": { "type": "string" },
-                                "paths": { "type": "array", "items": { "type": "string" } },
-                                "paths_total": { "type": "integer" },
-                                "reason": { "type": "string" }
+                                "verdict": {
+                                    "type": "object",
+                                    "properties": {
+                                        "state": {
+                                            "type": "string",
+                                            "enum": ["clean", "conflict", "unknown"]
+                                        },
+                                        "tree": { "type": "string" },
+                                        "paths": { "type": "array", "items": { "type": "string" } },
+                                        "paths_total": { "type": "integer" },
+                                        "reason": { "type": "string" }
+                                    },
+                                    "required": ["state"]
+                                }
                             },
-                            "required": ["a_path", "b_path", "a_head", "b_head", "state"]
+                            "required": ["a_path", "b_path", "a_head", "b_head", "verdict"]
                         }
                     },
                     "deferred": deferred_property(),

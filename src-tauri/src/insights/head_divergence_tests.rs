@@ -53,7 +53,10 @@ fn a_snapshot_with_no_head_and_no_base_moved_spawns_no_rev_list() {
     let cold = snapshot(repo);
     let after_cold = head_reads(&root);
     // The two lanes are on two commits and the main checkout on a third.
-    assert_eq!(after_cold, 3, "a cold snapshot reads each distinct HEAD once");
+    assert_eq!(
+        after_cold, 3,
+        "a cold snapshot reads each distinct HEAD once"
+    );
     assert_eq!(row(&cold, &linked[0]).ahead, Some(1));
 
     let warm = snapshot(repo);
@@ -80,6 +83,54 @@ fn one_moved_head_costs_exactly_one_rev_list() {
     assert_eq!(head_reads(&root) - before, 1, "one HEAD moved");
     assert_eq!(row(&moved, &linked[0]).ahead, Some(2), "{moved:?}");
     assert_eq!(row(&moved, &linked[1]).ahead, Some(1));
+}
+
+#[test]
+fn a_cold_cache_past_the_per_pass_cap_is_unmeasured_never_zero() {
+    let (_main, _parent, root, linked) = lanes_with_work(3);
+    // Four distinct HEADs (three lanes and the main checkout), a cap of two.
+    let listing = worktree::list_worktrees_lite(root.to_str().unwrap()).unwrap();
+    let heads: Vec<&str> = listing.iter().map(|info| info.head.as_str()).collect();
+    assert_eq!(heads.len(), 4);
+    let clock = worktree::ScanDeadline::after(Instant::now(), Duration::from_secs(120));
+
+    let measured = worktree::measure_head_divergence_capped(&root, &heads, &clock, 2);
+
+    assert_eq!(head_reads(&root), 2, "the cap is on spawns");
+    assert_eq!(measured.by_head.len(), 2, "{measured:?}");
+    let reason = measured.unread.as_deref().expect("a reason");
+    assert!(reason.starts_with("unmeasured:"), "{reason}");
+    assert!(reason.contains("2 of 4"), "{reason}");
+    // The two it did not reach have no entry at all: nothing to read as 0/0.
+    let missing: Vec<&&str> = heads
+        .iter()
+        .filter(|head| !measured.by_head.contains_key(**head))
+        .collect();
+    assert_eq!(missing.len(), 2);
+
+    // A second pass with the same cap reads two more: the cache served the
+    // first two, so the cap went to HEADs that had none.
+    let again = worktree::measure_head_divergence_capped(&root, &heads, &clock, 2);
+    assert_eq!(head_reads(&root), 4);
+    assert_eq!(again.by_head.len(), 4, "{again:?}");
+    assert_eq!(again.unread, None);
+    let _ = linked;
+}
+
+#[test]
+fn a_miss_after_the_deadline_is_unmeasured_and_a_hit_still_answers() {
+    let (_main, _parent, root, _linked) = lanes_with_work(2);
+    let repo = root.to_str().unwrap();
+    snapshot(repo);
+    let listing = worktree::list_worktrees_lite(repo).unwrap();
+    let heads: Vec<&str> = listing.iter().map(|info| info.head.as_str()).collect();
+    let before = head_reads(&root);
+    let passed = worktree::ScanDeadline::after(Instant::now(), Duration::ZERO);
+
+    let measured = worktree::measure_head_divergence_capped(&root, &heads, &passed, 8);
+
+    assert_eq!(head_reads(&root), before, "an expired deadline spawned");
+    assert_eq!(measured.by_head.len(), heads.len(), "hits cost nothing");
 }
 
 #[test]
