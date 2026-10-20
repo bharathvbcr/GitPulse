@@ -233,6 +233,7 @@
     "allow-cmd-review-gate-save",
     "allow-cmd-review-outgoing-commits",
     "allow-cmd-revoke-repository-trust",
+    "allow-cmd-adopt-ledger",
     "allow-cmd-save-conflict",
     "allow-cmd-scan-coverage",
     "allow-cmd-scan-deps-health",

@@ -484,7 +484,7 @@ fn coalesced_followers(repo: &Path, args: &[&str], stamp: &Stamp) -> usize {
 /// The monotonic "now" the TTL is measured on. Production reads the real
 /// clock; tests install a [`ManualClock`] so the TTL boundary needs no sleep.
 #[cfg(not(test))]
-fn mono_now() -> Instant {
+pub(crate) fn mono_now() -> Instant {
     Instant::now()
 }
 
@@ -511,8 +511,20 @@ thread_local! {
     static CLOCK: std::cell::Cell<Option<(Instant, SystemTime)>> = const { std::cell::Cell::new(None) };
 }
 
+/// Whether [`mono_now`] is a test's [`ManualClock`] rather than the real clock:
+/// the one thing that tells a deadline stamped on it from one on the real clock.
+#[cfg(not(test))]
+pub(crate) fn mono_is_manual() -> bool {
+    false
+}
+
 #[cfg(test)]
-fn mono_now() -> Instant {
+pub(crate) fn mono_is_manual() -> bool {
+    CLOCK.with(|cell| cell.get().is_some())
+}
+
+#[cfg(test)]
+pub(crate) fn mono_now() -> Instant {
     CLOCK
         .with(std::cell::Cell::get)
         .map_or_else(Instant::now, |(mono, _)| mono)
