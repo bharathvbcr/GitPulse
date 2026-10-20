@@ -227,3 +227,38 @@ fn the_reflog_spawn_count_is_bounded_and_a_larger_family_is_reported() {
     );
     assert_eq!(again.recorded, 0, "{again:?}");
 }
+
+/// BREAK: the family is cut to the first `max` members in a fixed order on
+/// every pass, so the members past the bound are never read, however many
+/// passes run, and every pass reports `truncated` for ever. This repository's
+/// own agent lanes keep more than sixteen worktrees alive.
+#[test]
+#[ignore = "adv: worktrees past the reflog bound are skipped on every pass (stable tail), never read"]
+fn adv_a_worktree_past_the_reflog_bound_is_read_within_a_few_passes() {
+    let (main, _parent, linked) = repo_with_worktrees(4);
+    let anchor = plain(main.path());
+    let last = linked[3].clone();
+    commit_at(&last, "starved", T0 + 40, "gitpulse@test.local");
+    let siblings: Vec<String> = linked
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    let family = Ok(siblings);
+    let mut recorded_starved = false;
+    for _ in 0..6 {
+        ingest_reflogs(&anchor, &anchor, &family, 2, &Budget::unbounded());
+        recorded_starved = reflog_rows(&anchor).iter().any(|event| {
+            event
+                .object
+                .as_deref()
+                .is_some_and(|object| object.contains("starved"))
+        });
+        if recorded_starved {
+            break;
+        }
+    }
+    assert!(
+        recorded_starved,
+        "six passes never reached the fifth worktree's HEAD"
+    );
+}
