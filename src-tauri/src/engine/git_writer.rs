@@ -7309,3 +7309,7 @@ mod adv_tests;
 #[cfg(test)]
 #[path = "git_writer_commit_graph_tests.rs"]
 mod commit_graph_write_tests;
+
+#[cfg(test)]
+#[path = "git_writer_commit_graph_adv_tests.rs"]
+mod commit_graph_adv_tests;
