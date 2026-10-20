@@ -493,6 +493,7 @@ pub fn run() {
             cmd_repository_trust,
             cmd_grant_repository_trust,
             cmd_revoke_repository_trust,
+            cmd_adopt_ledger,
             cmd_list_worktrees,
             cmd_add_worktree,
             cmd_preview_worktree_hooks,

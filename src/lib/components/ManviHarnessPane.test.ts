@@ -6,6 +6,8 @@ import { functionBody } from "../stores/sourceScan";
 import { render } from "svelte/server";
 import ManviHarnessPane, {
   activityHistoryPresentations,
+  ADOPT_LEDGER_LABEL,
+  adoptionOffered,
   createRepositoryRefreshTimer,
   scopedRunnerPresentation,
 } from "./ManviHarnessPane.svelte";
@@ -219,5 +221,15 @@ describe("ManviHarnessPane capability truth", () => {
     expect(create).toContain("if (outcome.ok)");
     expect(create).toMatch(/branchError = outcome\.error/);
     expect(create.indexOf('branchSuggestion = ""')).toBeGreaterThan(create.indexOf("if (outcome.ok)"));
+  });
+
+  it("offers adoption whenever the history reports an error, without reading which", () => {
+    const ledger = (error: string) => ({ recording: false, path: "", dropped: 0, error, error_code: "x" });
+    expect(adoptionOffered(null, null)).toBe(false);
+    expect(adoptionOffered(ledger(""), { error: "" })).toBe(false);
+    expect(adoptionOffered(ledger("the ledger could not be opened"), null)).toBe(true);
+    expect(adoptionOffered(null, { error: "repository_mismatch" })).toBe(true);
+    expect(source).toContain('invoke<string[]>("cmd_adopt_ledger"');
+    expect(source).toContain(ADOPT_LEDGER_LABEL);
   });
 });
