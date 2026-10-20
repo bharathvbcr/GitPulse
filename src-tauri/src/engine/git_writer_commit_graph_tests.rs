@@ -290,22 +290,132 @@ fn a_lock_held_by_another_git_is_never_removed_and_blocks_the_write() {
     let error =
         click(&text(&repo), &GitWriter::commit_graph_write_argv()).expect_err("a held lock");
     assert!(error.contains("Another git process holds"), "{error}");
+    // The message names the lock, how old it is and who may delete it.
+    assert!(error.contains(&lock.display().to_string()), "{error}");
+    assert!(error.contains("last modified"), "{error}");
+    assert!(error.contains("delete that file yourself"), "{error}");
     assert!(lock.exists(), "someone else's lock was removed");
 }
 
 #[test]
-fn the_sweep_removes_only_locks_the_write_itself_left() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let common = dir.path();
-    let info = common.join("objects/info");
-    std::fs::create_dir_all(info.join("commit-graphs")).unwrap();
-    let theirs = info.join("commit-graph.lock");
-    let ours = info.join("commit-graphs/commit-graph-chain.lock");
-    std::fs::write(&theirs, b"").unwrap();
-    let before = commit_graph_locks(common);
-    std::fs::write(&ours, b"").unwrap();
-    sweep_commit_graph_locks(common, &before);
-    assert!(theirs.exists() && !ours.exists());
+fn an_old_git_is_refused_by_the_plan_and_the_writer_and_nothing_runs() {
+    let dir = git_repo();
+    commits(dir.path(), 2);
+    let repo = text(&dir.path().canonicalize().unwrap());
+    let plan = GitWriter::commit_graph_write_plan_with(&repo, false).expect_err("old git");
+    assert!(plan.contains("2.27"), "{plan}");
+    let written =
+        GitWriter::commit_graph_write_checked(&repo, &GitWriter::commit_graph_write_argv(), false)
+            .expect_err("old git");
+    assert!(written.contains("2.27"), "{written}");
+    assert!(graph_files(&dir.path().canonicalize().unwrap()).is_empty());
+    // The same repository is offered the write by a git that can run it.
+    GitWriter::commit_graph_write_plan_with(&repo, true).expect("a capable git");
+}
+
+#[test]
+fn the_panel_report_hides_the_write_for_an_old_git_but_not_for_a_new_one() {
+    use crate::storage::commit_graph::{gated_on_git, CommitGraphReport};
+    let missing = CommitGraphReport {
+        state: CommitGraphState::Missing,
+        ..CommitGraphReport::default()
+    };
+    let hidden = gated_on_git(missing.clone(), false, "2.27");
+    assert!(!hidden.state.offers_write());
+    assert!(hidden.note.unwrap().contains("2.27"));
+    assert!(gated_on_git(missing, true, "2.27").state.offers_write());
+    let present = CommitGraphReport {
+        state: CommitGraphState::Present,
+        ..CommitGraphReport::default()
+    };
+    assert_eq!(
+        gated_on_git(present, false, "2.27").state,
+        CommitGraphState::Present
+    );
+}
+
+#[test]
+fn a_stop_sent_before_the_write_registers_is_honoured_by_it() {
+    let (_dir, repo) = large_history(30_000);
+    let argv = GitWriter::commit_graph_write_argv();
+    assert_eq!(
+        GitWriter::commit_graph_write_cancel(&text(&repo)),
+        Ok(false),
+        "nothing is registered yet"
+    );
+    let outcome = click(&text(&repo), &argv).expect("a stopped write is an outcome");
+    assert!(outcome.cancelled, "the stop that came first was dropped");
+    assert!(graph_files(&repo).is_empty());
+    // The intent was consumed: the next click writes.
+    let again = click(&text(&repo), &argv).expect("write");
+    assert!(!again.cancelled);
+    assert_eq!(states(&repo), CommitGraphState::Present);
+}
+
+#[test]
+fn an_unclaimed_stop_expires_and_does_not_stop_a_later_write() {
+    let dir = git_repo();
+    commits(dir.path(), 2);
+    let repo = dir.path().canonicalize().unwrap();
+    let common = crate::repository_trust::git_directories(&repo).unwrap().1;
+    commit_graph_stop_intents().lock().unwrap().insert(
+        common,
+        std::time::Instant::now() - COMMIT_GRAPH_STOP_INTENT_LIFETIME * 2,
+    );
+    let outcome = click(&text(&repo), &GitWriter::commit_graph_write_argv()).expect("write");
+    assert!(!outcome.cancelled);
+    assert_eq!(states(&repo), CommitGraphState::Present);
+}
+
+#[test]
+fn a_running_write_is_reported_and_no_second_write_is_planned() {
+    let (_dir, repo) = large_history(30_000);
+    let argv = GitWriter::commit_graph_write_argv();
+    let common = crate::repository_trust::git_directories(&repo).unwrap().1;
+    assert!(!commit_graph_write_running(&common));
+    let running = {
+        let (repo, argv) = (text(&repo), argv.clone());
+        std::thread::spawn(move || click(&repo, &argv))
+    };
+    let deadline = std::time::Instant::now()
+        + crate::test_support::coverage_relaxed(std::time::Duration::from_secs(20));
+    while !commit_graph_write_running(&common) {
+        assert!(std::time::Instant::now() < deadline, "never started");
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+    let refused = GitWriter::commit_graph_write_plan(&text(&repo)).expect_err("already running");
+    assert!(refused.contains("already running"), "{refused}");
+    assert_eq!(GitWriter::commit_graph_write_cancel(&text(&repo)), Ok(true));
+    let _ = running.join().unwrap();
+    assert!(!commit_graph_write_running(&common));
+}
+
+#[test]
+fn a_partial_clone_is_not_offered_a_write_by_the_detector_or_the_plan() {
+    let source = git_repo();
+    commits(source.path(), 3);
+    git_in(source.path(), &["config", "uploadpack.allowFilter", "true"]);
+    let holder = tempfile::TempDir::new().unwrap();
+    let clone = holder.path().join("clone");
+    git_in(
+        holder.path(),
+        &[
+            "clone",
+            "-q",
+            "--filter=blob:none",
+            "--no-checkout",
+            &format!("file://{}", source.path().display()),
+            "clone",
+        ],
+    );
+    crate::test_support::trust_repo(&clone);
+    let clone = clone.canonicalize().unwrap();
+    let (private, common) = crate::repository_trust::git_directories(&clone).unwrap();
+    let report = inspect(&clone, &private, &common);
+    assert_eq!(report.state, CommitGraphState::Unknown, "{report:?}");
+    assert!(report.note.unwrap().contains("partial clone"));
+    let refused = GitWriter::commit_graph_write_plan(&text(&clone)).expect_err("partial");
+    assert!(refused.contains("partial clone"), "{refused}");
 }
 
 /// Every non-test source file that names the writer, the command or the

@@ -77,7 +77,21 @@ describe("the frontend reaches the write from one place", () => {
     expect(component.slice(component.lastIndexOf("<button", at), at)).toContain(
       'data-testid="commit-graph-write-confirm"',
     );
-    expect(component).not.toMatch(/\$effect|onMount|setTimeout|setInterval/);
+    expect(component).not.toMatch(/onMount|setTimeout|setInterval/);
+    // The one effect follows the scan; it cannot start, confirm or open a write.
+    const effects = [...component.matchAll(/\$effect\(\(\) => \{([\s\S]*?)\n  \}\);/g)];
+    expect(effects).toHaveLength(1);
+    expect(effects[0][1].trim()).toBe("flow.syncInFlight(!!report?.write_in_flight);");
+  });
+
+  it("the preview shows no speedup figure and says what the click leaves behind", () => {
+    const component = read("src/lib/components/CommitGraphWrite.svelte");
+    const flow = read("src/lib/health/commitGraphWrite.ts");
+    for (const ui of [component, flow]) {
+      expect(ui).not.toMatch(/\b\d+(\.\d+)?\s?[x×]\b|times faster|speed-?up|faster than/i);
+    }
+    expect(component).toContain("future commit-graph writes will");
+    expect(component).toContain("--no-changed-paths");
   });
 
   it("the panel mounts the component and never invokes the command itself", () => {
@@ -129,13 +143,34 @@ describe("the backend exposes the write to the webview only", () => {
     );
     for (const name of [
       "commit_graph_write",
+      "commit_graph_write_checked",
       "commit_graph_write_within",
       "commit_graph_write_run",
       "commit_graph_write_plan",
+      "commit_graph_write_plan_with",
+      "commit_graph_write_refusal",
     ]) {
       expect(fnBody(writer, name), `${name} must not touch git config`).not.toMatch(
         /"config"|core\.commitGraph|gc\.writeCommitGraph|set_identity/,
       );
     }
+  });
+
+  it("the writer never deletes a lock file", () => {
+    const writer = read("src-tauri/src/engine/git_writer.rs");
+    const start = writer.indexOf("const COMMIT_GRAPH_LOCKS");
+    const end = writer.indexOf("fn commit_graph_lock_remedy");
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    expect(writer.slice(start, end + 500)).not.toMatch(/remove_file|remove_dir/);
+    expect(fnBody(writer, "commit_graph_write_run")).not.toMatch(/remove_file|remove_dir/);
+  });
+
+  it("the write runs with lazy fetch off, and a partial clone is refused first", () => {
+    const writer = read("src-tauri/src/engine/git_writer.rs");
+    expect(fnBody(writer, "commit_graph_write_run")).toContain("without_lazy_fetch(");
+    expect(fnBody(writer, "commit_graph_write_refusal")).toContain("is_partial_clone(");
+    expect(fnBody(writer, "commit_graph_write_plan_with")).toContain("commit_graph_write_refusal(");
+    expect(fnBody(writer, "commit_graph_write_checked")).toContain("commit_graph_write_refusal(");
   });
 });

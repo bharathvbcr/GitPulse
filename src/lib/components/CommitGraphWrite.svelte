@@ -37,6 +37,11 @@
   onDestroy(unsubscribe);
 
   let offered = $derived(offersCommitGraphWrite(report));
+  // A panel mounted while a write is running shows it and can stop it; this
+  // only follows the scan and never starts anything.
+  $effect(() => {
+    flow.syncInFlight(!!report?.write_in_flight);
+  });
 </script>
 
 {#if current.phase !== "idle" || offered}
@@ -59,6 +64,13 @@
       <p class="text-[11px] text-textMuted">
         This runs the command below. It writes derived data under the repository's
         <code class="font-mono">objects/info</code> and changes no git config.
+      </p>
+      <p class="text-[11px] text-textMuted" data-testid="commit-graph-write-lasting">
+        Lasting effect: the graph keeps changed-path filters. Git's documentation says that once
+        <code class="font-mono">--changed-paths</code> is given, "future commit-graph writes will
+        automatically assume that this option was intended", so later writes, including git's own
+        maintenance, keep the filters until someone runs
+        <code class="font-mono">git commit-graph write --no-changed-paths</code>.
       </p>
       <code
         class="block select-all font-mono text-[11px] text-textPrimary"
@@ -108,6 +120,9 @@
           Joined a write already running in this repository ({current.outcome.elapsed_ms} ms).
         {:else}
           Commit-graph written in {current.outcome.elapsed_ms} ms.
+        {/if}
+        {#if current.outcome.note}
+          {current.outcome.note}
         {/if}
       </p>
       <button

@@ -26,6 +26,7 @@ const OUTCOME: CommitGraphWriteOutcome = {
   cancelled: false,
   joined: false,
   elapsed_ms: 12,
+  note: null,
   report: report("present"),
 };
 
@@ -58,6 +59,11 @@ describe("offersCommitGraphWrite", () => {
 
   it.each(["present", "no_history", "unknown"] as const)("hides the button for %s", (state) => {
     expect(offersCommitGraphWrite(report(state))).toBe(false);
+  });
+
+  it("hides the button while a write is already running", () => {
+    expect(offersCommitGraphWrite({ ...report("missing"), write_in_flight: true })).toBe(false);
+    expect(offersCommitGraphWrite({ ...report("missing"), write_in_flight: false })).toBe(true);
   });
 
   it("hides the button for a payload from before the detector", () => {
@@ -150,6 +156,33 @@ describe("the write flow", () => {
     expect(calls.map((call) => call.command)).toEqual(["cmd_commit_graph_write_plan"]);
     flow.dismiss();
     expect(step()).toEqual({ phase: "idle" });
+  });
+
+  it("a remounted flow shows a write found running, stops it, and leaves when it ends", async () => {
+    const { flow, calls, step } = harness();
+    flow.syncInFlight(true);
+    expect(step()).toEqual({ phase: "running", cancelling: false });
+    // No fresh write is offered from here: open() does nothing while running.
+    await flow.open();
+    expect(calls).toEqual([]);
+    await flow.cancel();
+    expect(calls).toEqual([{ command: "cmd_commit_graph_write_cancel", args: { repoPath: "/repo" } }]);
+    flow.syncInFlight(false);
+    expect(step()).toEqual({ phase: "idle" });
+  });
+
+  it("the scan never ends a write this flow started itself", async () => {
+    let finish!: (value: unknown) => void;
+    const { flow, step } = harness({
+      cmd_commit_graph_write: () => new Promise((resolve) => (finish = resolve)),
+    });
+    await flow.open();
+    const running = flow.confirm();
+    flow.syncInFlight(false);
+    expect(step()).toMatchObject({ phase: "running" });
+    finish({ policy: {}, output: OUTCOME });
+    await running;
+    expect(step()).toMatchObject({ phase: "done" });
   });
 
   it("a failed write reports the failure and does not call onWritten", async () => {

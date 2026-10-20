@@ -134,6 +134,8 @@ export interface CommitGraphReport {
   bloom: boolean | null;
   head_covered: boolean | null;
   note: string | null;
+  /** A commit-graph write is running in this repository right now (set by the storage scan). */
+  write_in_flight?: boolean;
 }
 
 /** What a click on "Write commit-graph" would run (`cmd_commit_graph_write_plan`). */
@@ -155,6 +157,8 @@ export interface CommitGraphWriteOutcome {
   elapsed_ms: number;
   /** The detector's answer after the run. */
   report: CommitGraphReport;
+  /** Set when a lock file remains after a stopped write: its path, age and remedy. */
+  note: string | null;
 }
 
 export interface StorageReport {

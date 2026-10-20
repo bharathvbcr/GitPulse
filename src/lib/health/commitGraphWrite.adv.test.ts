@@ -73,7 +73,7 @@ describe("adv: commit-graph write flow", () => {
     expect(t.step().phase).toBe("failed");
   });
 
-  it.skip("adv: a Stop that the backend answers `false` (no write registered yet) is not a permanent 'Stopping...'", async () => {
+  it("adv: a Stop that the backend answers `false` (no write registered yet) is not a permanent 'Stopping...'", async () => {
     const gate = deferred<unknown>();
     const t = build(
       { path: "/a" },
@@ -93,7 +93,7 @@ describe("adv: commit-graph write flow", () => {
     await running;
   });
 
-  it.skip("adv: a confirm after the repository changed does not write the other repository", async () => {
+  it("adv: a confirm after the repository changed does not write the other repository", async () => {
     const repo = { path: "/a" };
     const t = build(repo);
     await t.flow.open(); // previewed for /a (common_dir /a/.git)
@@ -103,7 +103,7 @@ describe("adv: commit-graph write flow", () => {
     expect(write?.args.repoPath).not.toBe("/b");
   });
 
-  it.skip("adv: a flow built after a remount can stop a write the old flow started", async () => {
+  it("adv: a flow built after a remount can stop a write the old flow started", async () => {
     // The old component was destroyed mid-write (onDestroy only unsubscribes);
     // the backend write keeps running for up to 600 s. The new flow starts idle,
     // and cancel() on idle does nothing, so no UI path can reach the stop.

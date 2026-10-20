@@ -30,14 +30,18 @@ const OFFERED: readonly CommitGraphState[] = ["missing", "stale", "no_bloom"];
  * the detector, and a state that could not be checked all hide it.
  */
 export function offersCommitGraphWrite(report: CommitGraphReport | null | undefined): boolean {
-  return !!report && OFFERED.includes(report.state);
+  return !!report && OFFERED.includes(report.state) && !report.write_in_flight;
 }
 
 export type CommitGraphWriteStep =
   | { phase: "idle" }
   | { phase: "previewing" }
   | { phase: "confirming"; plan: CommitGraphWritePlan }
-  | { phase: "running"; plan: CommitGraphWritePlan; cancelling: boolean }
+  /**
+   * `plan` is absent for a write this flow did not start: a panel remounted
+   * while one was running finds it through the scan (`write_in_flight`).
+   */
+  | { phase: "running"; plan?: CommitGraphWritePlan; cancelling: boolean }
   | { phase: "done"; outcome: CommitGraphWriteOutcome }
   | { phase: "failed"; message: string };
 
@@ -48,10 +52,20 @@ export interface CommitGraphWriteFlow extends Readable<CommitGraphWriteStep> {
   open(): Promise<void>;
   /** Runs the previewed argv. Does nothing unless a preview is awaiting it. */
   confirm(): Promise<void>;
-  /** Backs out of a preview, or asks a running write to stop. */
+  /**
+   * Backs out of a preview, or asks the write running in this repository to
+   * stop. From idle it still asks the backend: a flow built after a remount did
+   * not start the write it has to stop.
+   */
   cancel(): Promise<void>;
   /** Returns to idle after a finished or failed run. */
   dismiss(): void;
+  /**
+   * Follows the scan's `write_in_flight`: a write found running shows as
+   * running (and stoppable, with no fresh write offered), and one that has
+   * finished leaves that state. Never starts anything.
+   */
+  syncInFlight(inFlight: boolean): void;
 }
 
 function messageOf(error: unknown): string {
@@ -72,15 +86,23 @@ export function createCommitGraphWriteFlow(options: {
     step = next;
     set(next);
   };
+  /**
+   * The repository the preview was made for. `confirm` and `cancel` use it, not
+   * the live path: a tab switch between the preview and the click must not turn
+   * a confirmation of one repository's command into a write in another.
+   */
+  let pinned: string | null = null;
+  const target = () => pinned ?? options.repoPath();
 
   return {
     subscribe,
     async open() {
       if (step.phase !== "idle" && step.phase !== "failed" && step.phase !== "done") return;
       move({ phase: "previewing" });
+      pinned = options.repoPath();
       try {
         const plan = await options.invoke<CommitGraphWritePlan>("cmd_commit_graph_write_plan", {
-          repoPath: options.repoPath(),
+          repoPath: pinned,
         });
         // Backed out while the preview was loading: it is no longer wanted.
         if (phaseNow() === "previewing") move({ phase: "confirming", plan });
@@ -95,7 +117,7 @@ export function createCommitGraphWriteFlow(options: {
       try {
         const result = await options.invoke<Guarded<CommitGraphWriteOutcome>>(
           "cmd_commit_graph_write",
-          { repoPath: options.repoPath(), confirmedArgv: plan.argv },
+          { repoPath: target(), confirmedArgv: plan.argv },
         );
         move({ phase: "done", outcome: result.output });
         options.onWritten?.(result.output);
@@ -108,18 +130,33 @@ export function createCommitGraphWriteFlow(options: {
         move({ phase: "idle" });
         return;
       }
-      if (step.phase !== "running" || step.cancelling) return;
-      move({ ...step, cancelling: true });
+      if (step.phase === "done" || step.phase === "failed") return;
+      if (step.phase === "running") {
+        if (step.cancelling) return;
+        move({ ...step, cancelling: true });
+      }
       try {
-        await options.invoke<boolean>("cmd_commit_graph_write_cancel", {
-          repoPath: options.repoPath(),
+        const reached = await options.invoke<boolean>("cmd_commit_graph_write_cancel", {
+          repoPath: target(),
         });
+        // `false`: the write has not registered yet. The backend remembers the
+        // stop for a few seconds and the write starts stopped, but the person
+        // is not left on "Stopping..." and can ask again.
+        if (!reached && step.phase === "running") move({ ...step, cancelling: false });
       } catch (error) {
-        move({ phase: "failed", message: messageOf(error) });
+        if (step.phase === "running") move({ phase: "failed", message: messageOf(error) });
       }
     },
     dismiss() {
       if (step.phase === "done" || step.phase === "failed") move({ phase: "idle" });
+    },
+    syncInFlight(inFlight: boolean) {
+      if (inFlight && step.phase === "idle") {
+        pinned = options.repoPath();
+        move({ phase: "running", cancelling: false });
+      } else if (!inFlight && step.phase === "running" && step.plan === undefined) {
+        move({ phase: "idle" });
+      }
     },
   };
 }

@@ -70,7 +70,16 @@ before that tag is pushed.
   data under `objects/info` and no git config; the result is recorded as a
   ledger event. Three new commands: `cmd_commit_graph_write_plan`,
   `cmd_commit_graph_write` and `cmd_commit_graph_write_cancel`. Nothing in
-  ingest, the timers, hooks or MCP can run it.
+  ingest, the timers, hooks or MCP can run it. It is refused, and never
+  offered, on a git older than 2.27 (no `--changed-paths`), on a partial clone
+  (the write would fetch missing trees), and while another write is running; the
+  spawn runs with lazy fetch off. A Stop sent before the write registers is
+  remembered for five seconds and honoured, and a panel remounted mid-write
+  shows it and can stop it. A stop that races git's publish reports a written
+  graph, not "nothing written". GitPulse never deletes a commit-graph lock: a
+  lock that blocks or survives a write is reported with its path, age and the
+  manual remedy. The preview states the lasting effect: once written with
+  `--changed-paths`, later graph writes keep the filters.
 - `gitpulse_landed` answers whether a commit's work reached a base and how:
   `via` is `merge` (decided before `ff`, so a non-tip commit of a `--no-ff`
   branch reads merge), `ff`, `squash` (decided before `rebase`, so a

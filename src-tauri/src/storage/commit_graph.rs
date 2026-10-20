@@ -103,6 +103,11 @@ pub struct CommitGraphReport {
     pub head_covered: Option<bool>,
     /// Why the state is what it is, in one sentence. Always set for `Unknown`.
     pub note: Option<String>,
+    /// A commit-graph write is running in this repository's common directory
+    /// right now. Set by the storage scan, not by [`inspect`], so a remounted
+    /// panel can show the write and stop it instead of offering a second one.
+    #[serde(default)]
+    pub write_in_flight: bool,
 }
 
 impl CommitGraphState {
@@ -140,6 +145,9 @@ pub struct CommitGraphWriteOutcome {
     pub elapsed_ms: u64,
     /// The detector's answer after the run.
     pub report: CommitGraphReport,
+    /// Set when a lock file remains after a stopped write: its path, how long
+    /// ago it changed, and that only the person can delete it.
+    pub note: Option<String>,
 }
 
 /// Longest note shown. Notes quote ref names and paths, which a repository
@@ -589,6 +597,46 @@ fn config_value_is_false(value: &str) -> bool {
     )
 }
 
+/// Whether git's effective config makes this a partial clone: a named
+/// `extensions.partialclone`, or any remote marked `promisor`. A promisor value
+/// is a partial clone unless it is plainly false (a bare key counts), so an
+/// unreadable value fails towards refusing the write.
+fn config_is_partial_clone(config: &std::collections::HashMap<String, String>) -> bool {
+    config
+        .get("extensions.partialclone")
+        .is_some_and(|remote| !remote.trim().is_empty())
+        || config.iter().any(|(key, value)| {
+            key.starts_with("remote.")
+                && key.ends_with(".promisor")
+                && !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "false" | "no" | "off" | "0"
+                )
+        })
+}
+
+/// The report the Storage panel shows once the installed git is known: a state
+/// that would offer a write is not offered one when git cannot run the argv
+/// (`git_supports` false), so the button is never shown for a command that git
+/// would refuse. Kept apart from [`inspect`], which spawns nothing; the caller
+/// asks the (cached) git probe.
+pub fn gated_on_git(
+    report: CommitGraphReport,
+    git_supports: bool,
+    floor: &str,
+) -> CommitGraphReport {
+    if report.state.offers_write() && !git_supports {
+        return CommitGraphReport::unknown(
+            report.layout,
+            format!(
+                "git older than {floor} (or one that could not be checked) cannot write \
+                 changed-path filters, so no commit-graph write is offered"
+            ),
+        );
+    }
+    report
+}
+
 /// Inspect the commit-graph of the repository at `repo` (the path git config is
 /// read from) whose private git dir is `git_dir` and whose common dir (objects,
 /// packed-refs) is `common_dir`. For a linked worktree the two differ and the
@@ -635,6 +683,17 @@ pub fn inspect(repo: &Path, git_dir: &Path, common_dir: &Path) -> CommitGraphRep
         return CommitGraphReport::unknown(
             CommitGraphLayout::None,
             "core.commitGraph is false, so git ignores the commit-graph",
+        );
+    }
+
+    // A partial clone is not offered a write: building the graph with
+    // changed-path filters reads trees, and git would fetch every missing one
+    // from the promisor remote. Read from the config already in hand, so this
+    // costs no spawn; the writer asks the canonical `is_partial_clone` again.
+    if config_is_partial_clone(&config) {
+        return CommitGraphReport::unknown(
+            CommitGraphLayout::None,
+            "this is a partial clone; writing a commit-graph would fetch missing trees from its remote",
         );
     }
 

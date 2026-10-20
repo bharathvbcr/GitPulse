@@ -1,6 +1,5 @@
-//! Adversarial probes of the commit-graph write (b17/9cfa4874). Each test here
-//! that fails against the lane is `#[ignore = "adv: ..."]`; run them with
-//! `cargo test --lib commit_graph_adv -- --ignored` to see the failure.
+//! Adversarial probes of the commit-graph write (b17/9cfa4874), each a
+//! regression test of the break it found.
 
 use super::*;
 use crate::procguard::LockedSpawn;
@@ -58,7 +57,6 @@ fn wait_for_flight(common: &Path) {
 /// before" and before our git takes it. Our git then fails on the lock, and the
 /// sweep removes every lock "absent before": the foreign one.
 #[test]
-#[ignore = "adv: a foreign lock taken after the before-snapshot is swept as if the write left it"]
 fn adv_a_foreign_lock_taken_after_the_snapshot_is_not_swept() {
     let (_dir, repo) = large_history(30_000);
     let argv = GitWriter::commit_graph_write_argv();
@@ -83,15 +81,18 @@ fn adv_a_foreign_lock_taken_after_the_snapshot_is_not_swept() {
     );
     assert!(
         lock.exists(),
-        "the sweep removed a lock another git process created after the snapshot"
+        "a lock another git process created after the snapshot was removed"
     );
+    let message = result.unwrap_err();
+    assert!(message.contains("A lock file remains"), "{message}");
+    assert!(message.contains(&lock.display().to_string()), "{message}");
+    assert!(message.contains("GitPulse never removes"), "{message}");
 }
 
 /// A partial clone: `--reachable --changed-paths` reads trees, and without
 /// `GIT_NO_LAZY_FETCH` git fetches the missing ones from the promisor remote.
 /// That is network traffic the preview never named.
 #[test]
-#[ignore = "adv: a write in a partial clone lazy-fetches trees from the remote"]
 fn adv_a_write_in_a_partial_clone_fetches_nothing() {
     let source = git_repo();
     for index in 0..4 {
@@ -148,7 +149,6 @@ fn adv_a_write_in_a_partial_clone_fetches_nothing() {
 /// A cancel that lands after git has already published the graph and exited
 /// must not be reported as "Stopped. Nothing was written."
 #[test]
-#[ignore = "adv: a cancel racing git's exit reports cancelled although the graph was published"]
 fn adv_a_cancel_after_publish_is_not_reported_as_nothing_written() {
     let argv = GitWriter::commit_graph_write_argv();
     for round in 0..40 {
