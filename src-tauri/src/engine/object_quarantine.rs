@@ -532,3 +532,7 @@ fn create_private_dir() -> Result<PathBuf, QuarantineError> {
 #[cfg(test)]
 #[path = "object_quarantine_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "object_quarantine_adv_tests.rs"]
+mod adv_tests;

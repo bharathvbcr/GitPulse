@@ -38,6 +38,8 @@ mod budget;
 pub mod complete;
 pub mod devmap_parity;
 #[cfg(test)]
+mod merge_conflicts_adv_tests;
+#[cfg(test)]
 mod merge_conflicts_tool_tests;
 pub mod page;
 pub mod prompts;

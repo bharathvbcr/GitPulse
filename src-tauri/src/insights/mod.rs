@@ -10,6 +10,8 @@ mod entity_collision;
 #[cfg(test)]
 mod head_divergence_tests;
 pub(crate) mod live_sessions;
+#[cfg(test)]
+mod merge_adv_tests;
 pub mod merge_conflicts;
 
 pub use collision_memo::{
