@@ -420,15 +420,29 @@ pub fn is_branch_merged_by_tree(
     default_branch: &str,
     branch_ref: &str,
 ) -> TreeMerge {
-    TreeMerge::of(
-        merge_tree_candidate(
-            repo,
+    // SCRATCH: main's implementation, wrapped into the tri-state shape.
+    let output = git_text(
+        repo,
+        &[
+            "merge-tree",
+            "--write-tree",
+            "--no-messages",
             default_branch,
             branch_ref,
-            Instant::now() + TREE_MERGE_BUDGET,
-        ),
-        default_tree,
-    )
+        ],
+    );
+    let _ = (merge_tree_candidate, Instant::now() + TREE_MERGE_BUDGET, default_tree);
+    match output {
+        Ok(merged_tree) => {
+            let tree = merged_tree.trim();
+            if !tree.is_empty() && tree == default_tree {
+                TreeMerge::Merged
+            } else {
+                TreeMerge::NotMerged
+            }
+        }
+        Err(e) => TreeMerge::Unknown(e),
+    }
 }
 
 /// Scans the repository for branches, evaluates staleness and merge status (including squash merges),
