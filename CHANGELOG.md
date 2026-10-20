@@ -13,6 +13,28 @@ before that tag is pushed.
 
 ### Changed
 
+- A ledger is bound to the directory it was anchored in (OD 1). The identity
+  record's detail JSON now also carries a lineage UUID and the checkout
+  directory's site (inode, and on macOS the volume's persistent UUID rather than
+  `st_dev`, which a reboot can renumber). A ledger carried into a sibling clone
+  or a history-merging repository is refused even after its source is deleted; a
+  rename keeps the inode and keeps recording. No schema change and no
+  `WRITER_VERSION` bump: older binaries ignore the added fields, and a record an
+  older binary rewrites without them is looked past (up to 32 records back) so it
+  never reopens the roots-only rule. The refusal names **Adopt this ledger**,
+  a new user-only action (`cmd_adopt_ledger`, behind an OS confirmation and the
+  repository trust check) that takes over a ledger refused only for its site
+  (a cross-device move, a restore, a copy whose source is gone) and writes a
+  `ledger.adopt` audit row with both sites, both paths, the lineage, the actor
+  and the time. Legacy records get a lineage and site on their next settle.
+  The earlier-location probe now runs before the ledger's write transaction
+  (checked again briefly inside it), at most one probe thread per path, and the
+  30 s retry runs on the repo's clock seam.
+  Accepted gaps: where the platform has no inode (non-unix) the ledger stays on
+  the roots-only rule, filed as a gap; and a new checkout that reuses a deleted
+  checkout's inode, at the same path with the same roots and lineage, is
+  indistinguishable from the original.
+
 - `deadbranch::is_branch_merged_by_tree` is tri-state (`TreeMerge::Merged`,
   `NotMerged`, `Unknown`). A conflicting merge (merge-tree exit 1) is
   `NotMerged`, where it used to read as an unreadable failure, and the check
