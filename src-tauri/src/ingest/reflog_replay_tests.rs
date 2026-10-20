@@ -467,21 +467,24 @@ fn adv_a_generation_1_row_written_after_the_watermark_is_not_recorded_again() {
 /// unique identity, so nothing refuses its second recording. A process killed
 /// after the last row and before the watermark write (a separate statement)
 /// leaves the entry to be recorded again by the next pass.
-#[cfg(unix)]
+///
+/// The kill is modelled by removing the watermark row after a completed pass:
+/// the state a process leaves if it dies between the last insert and the
+/// watermark write. (A self-sent SIGKILL is not instantaneous, so a child that
+/// "dies" there sometimes still writes the watermark and the test flakes.)
 #[test]
 #[ignore = "adv: a future-dated reflog entry gets an ingest-time occurred_at, so a replay after a kill between the row and the watermark records it twice"]
 fn adv_a_future_dated_entry_is_not_recorded_twice_after_a_kill_before_the_watermark() {
-    use std::os::unix::process::ExitStatusExt;
     let (dir, repo) = seeded_repo();
     commit_at(dir.path(), "future", 4_100_000_000, "gitpulse@test.local");
     let total = head_entries(&repo);
-    let (mut command, _harness) = child_command(&repo);
-    let output = command
-        .env(ENV_KILL, total.to_string())
-        .output_locked()
-        .expect("run the child");
-    assert_eq!(output.status.signal(), Some(libc::SIGKILL), "{output:?}");
-    assert_eq!(reflog_rows(&repo).len(), total, "the crash point moved");
+    let first = ingest_reflog_into(&repo, &repo, 200);
+    assert_eq!(first.recorded, i64::try_from(total).unwrap(), "{first:?}");
+    let db = dir.path().join(".devcouncil").join("ledger.sqlite");
+    rusqlite::Connection::open(db)
+        .expect("open the ledger file")
+        .execute("DELETE FROM reflog_watermarks", [])
+        .expect("drop the watermark");
 
     std::thread::sleep(std::time::Duration::from_millis(20));
     let next = ingest_reflog_into(&repo, &repo, 200);
