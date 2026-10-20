@@ -150,60 +150,114 @@ thread_local! {
 /// not been written since the cursor was. Any difference (a rewrite that kept
 /// the size but moved the mtime included) re-hashes the bytes. One without a
 /// stat always re-hashes.
-fn fingerprint_matches(
+///
+/// A mismatch is not yet a rotation: the cursor's tail window (the bytes just
+/// before its offset, which the fingerprint holds a digest of) is searched for in
+/// the new file. A file that kept the old lines (a record prepended, an early
+/// line edited, anything appended) holds it, and the cursor resumes after it;
+/// only a file that does not is read again from the start.
+fn standing_of(
     path: &std::path::Path,
     now: Option<ledger::FileStat>,
     offset: u64,
     fingerprint: &str,
-) -> bool {
+) -> Standing {
     let Some(parts) = ledger::parse_cursor_fingerprint(fingerprint) else {
-        return true;
+        return Standing::Holds;
     };
     if parts.stat.is_some() && parts.stat == now {
-        return true;
+        return Standing::Holds;
     }
     match read_fingerprint_bytes(path, offset, parts.head, parts.tail) {
-        Ok((head, tail)) => {
-            ledger::cursor_fingerprint(&head, &tail, parts.stat).as_deref() == Some(fingerprint)
+        Ok((head, tail)) if ledger::cursor_fingerprint_holds(fingerprint, &parts, &head, &tail) => {
+            Standing::Holds
         }
-        Err(e) => e.kind() != std::io::ErrorKind::UnexpectedEof,
+        Ok(_) => rebase(path, offset, &parts).map_or(Standing::Rotated, Standing::Rebased),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            rebase(path, offset, &parts).map_or(Standing::Rotated, Standing::Rebased)
+        }
+        Err(_) => Standing::Holds,
     }
 }
 
-/// [`fingerprint_matches`] for one file, asked once per distinct cursor: every
+/// How far into a file the search for a moved cursor looks, in bytes. Past it
+/// the cursor is called rotated and read from the start: a duplicate row is
+/// recoverable, an unbounded read of a transcript that may be hundreds of
+/// megabytes is not.
+const REBASE_SEARCH_BYTES: u64 = 1 << 20;
+
+/// Where a cursor that stood at `offset` stands in the file at `path` now: the
+/// end of the line-ending window of `parts.tail` bytes whose digest is the
+/// fingerprint's, nearest `offset` within the first [`REBASE_SEARCH_BYTES`].
+/// `None` for a fingerprint with no tail digest or a window not found.
+fn rebase(path: &std::path::Path, offset: u64, parts: &ledger::FingerprintParts) -> Option<u64> {
+    use std::io::Read;
+    let wanted = parts.tail_hash?;
+    let width = parts.tail;
+    let mut buffer = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(REBASE_SEARCH_BYTES + width as u64)
+        .read_to_end(&mut buffer)
+        .ok()?;
+    // A cursor stands at a line's end, so the window ends in a newline: only
+    // those positions are hashed.
+    (width..=buffer.len())
+        .filter(|end| {
+            buffer[end - 1] == b'\n'
+                && ledger::cursor_tail_hash(&buffer[end - width..*end]) == wanted
+        })
+        .map(|end| end as u64)
+        .min_by_key(|end| end.abs_diff(offset))
+}
+
+/// Where a cursor stands against the file as it is now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Standing {
+    /// The bytes before it are the ones it was taken from (or it cannot be
+    /// checked): it is read from its offset.
+    Holds,
+    /// The file changed before the cursor but still holds the lines the cursor
+    /// had consumed, now ending at this offset: it resumes there.
+    Rebased(u64),
+    /// The file is not the one the cursor stopped in: it is read from the start.
+    Rotated,
+}
+
+/// [`standing_of`] for one file, asked once per distinct cursor: every
 /// participant of a family usually holds the same offset.
 struct Probe<'a> {
     path: &'a std::path::Path,
     /// The file's stat as the pass read it before anything else.
     now: Option<ledger::FileStat>,
-    answers: HashMap<(u64, String), bool>,
+    answers: HashMap<(u64, String), Standing>,
 }
 
 impl Probe<'_> {
-    fn matches(&mut self, offset: u64, fingerprint: &str) -> bool {
+    fn standing_at(&mut self, offset: u64, fingerprint: &str) -> Standing {
         // The common answer, with no allocation: a fingerprint that recorded a
         // stat and finds it unchanged.
         if let Some(parts) = ledger::parse_cursor_fingerprint(fingerprint) {
             if parts.stat.is_some() && parts.stat == self.now {
-                return true;
+                return Standing::Holds;
             }
         }
         let (path, now) = (self.path, self.now);
         *self
             .answers
             .entry((offset, fingerprint.to_string()))
-            .or_insert_with(|| fingerprint_matches(path, now, offset, fingerprint))
+            .or_insert_with(|| standing_of(path, now, offset, fingerprint))
     }
 
-    /// Whether `participant`'s cursor on `file_key` still describes this file:
-    /// no fingerprint (a cursor from before they existed) is taken as yes.
-    fn holds(&mut self, participant: &Participant, file_key: &str) -> bool {
+    /// Where `participant`'s cursor on `file_key` stands against this file: no
+    /// fingerprint (a cursor from before they existed) is taken as holding.
+    fn standing(&mut self, participant: &Participant, file_key: &str) -> Standing {
         match (
             participant.offsets.get(file_key),
             participant.fingerprints.get(file_key),
         ) {
-            (Some(offset), Some(fingerprint)) => self.matches(*offset, fingerprint),
-            _ => true,
+            (Some(offset), Some(fingerprint)) => self.standing_at(*offset, fingerprint),
+            _ => Standing::Holds,
         }
     }
 }
@@ -514,7 +568,7 @@ fn ingest_family(
             let owner = &mut owners.hosted[owner];
             let current = owner.offsets.get(&file_key).copied();
             // Or rewritten under it: its fingerprint no longer matches.
-            let rotated = !probe.holds(owner, &file_key);
+            let rotated = probe.standing(owner, &file_key) != Standing::Holds;
             if rotated || current.is_none_or(|current| current < end || current > len) {
                 owner.pending.push(ledger::TranscriptAdvance {
                     file_key: file_key.clone(),
@@ -669,11 +723,16 @@ fn consumed_by(
     len: u64,
     probe: &mut Probe<'_>,
 ) -> bool {
-    owner
-        .offsets
-        .get(file_key)
-        .is_some_and(|consumed| *consumed > offset && *consumed <= len)
-        && probe.holds(owner, file_key)
+    let Some(consumed) = owner.offsets.get(file_key) else {
+        return false;
+    };
+    match probe.standing(owner, file_key) {
+        Standing::Holds => *consumed > offset && *consumed <= len,
+        // The file moved the lines the cursor had consumed: those before where
+        // they now end are consumed, and nothing after.
+        Standing::Rebased(resume) => offset < resume,
+        Standing::Rotated => false,
+    }
 }
 
 /// Every participant's progress, with the baseline floor frozen for any that
@@ -765,14 +824,22 @@ fn owed_on(
             // the cursor stopped in: the bytes before it must still be the ones
             // its fingerprint was taken from. Only then is "at the end" or "past
             // the cursor" a statement about this file.
-            let rotated =
-                from.is_some_and(|done| done <= len) && !probe.holds(participant, file_key);
+            let standing = if from.is_some_and(|done| done <= len) {
+                probe.standing(participant, file_key)
+            } else {
+                Standing::Holds
+            };
+            let rotated = standing != Standing::Holds;
             // `floored` applies only to a transcript this worktree has never
             // read under offsets: calls at or before the frozen baseline were
             // the old watermark's to record, and reading them again would
             // duplicate them.
             let (start, floored) = match from {
-                Some(_) if rotated => (0, false),
+                Some(_) if standing == Standing::Rotated => (0, false),
+                Some(_) if rotated => match standing {
+                    Standing::Rebased(resume) => (resume, false),
+                    _ => (0, false),
+                },
                 Some(done) if done == len => return None,
                 Some(done) if done < len => (done, false),
                 // Shorter than what was read: rewritten rather than appended

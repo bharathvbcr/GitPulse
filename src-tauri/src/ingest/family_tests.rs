@@ -1684,8 +1684,12 @@ fn a_fingerprint_with_no_stat_is_re_hashed_every_pass() {
             })
             .expect("a fingerprint");
         let fields: Vec<&str> = stored.split(':').collect();
-        assert_eq!(fields[0], "v2", "{stored}");
-        let legacy = format!("{}:{}:{}", fields[1], fields[2], fields[5]);
+        assert_eq!(fields[0], "v3", "{stored}");
+        // The first shape of the column: one digest over both halves, no stat.
+        let bytes = std::fs::read(&path).unwrap();
+        let n = bytes.len().min(64);
+        let both = [&bytes[..n], &bytes[bytes.len() - n..]].concat();
+        let legacy = format!("{n}:{n}:{:016x}", ledger::ids::fnv1a64(&both));
         conn.execute("UPDATE transcript_cursors SET fingerprint = ?1", [legacy])
             .expect("rewrite as the unversioned shape");
 
@@ -2301,7 +2305,6 @@ fn the_baseline_floor_compares_instants_not_text() {
 /// transcript (its first 64 bytes change, so the fingerprint calls it a
 /// rotation) and the two old calls are in the ledger twice.
 #[test]
-#[ignore = "adv: a rewrite that keeps the old lines is re-read from 0 and its old lines are recorded a second time (no unique index on transcript rows)"]
 fn adv_a_rotation_that_keeps_the_old_lines_does_not_record_them_twice() {
     let nested = Nested::new();
     let w = nested.worktrees[0].clone();

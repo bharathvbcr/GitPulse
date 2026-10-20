@@ -520,6 +520,12 @@ const REFLOG_WINDOW: usize = 200;
 /// the ref reports `reflog_unreached` instead of reading an unbounded log.
 const REFLOG_DEPTH: usize = 2000;
 
+/// How far before the watermark's entry, in seconds, a legacy (untimed) row may
+/// have been appended and still be read as already holding a later entry: a
+/// generation-1 process writes a row when it sees the move, so well within a
+/// clock step of the move itself.
+const LEGACY_SEEN_MARGIN_SECS: i64 = 86_400;
+
 /// Worktree HEAD reflogs one pass reads. A family past this reports how many
 /// it left (`reflog_refs_skipped`) and is `truncated`, never complete.
 const MAX_REFLOG_WORKTREES: usize = 16;
@@ -552,6 +558,17 @@ fn ingest_reflogs(
     let mut worktrees = vec![worktree_path.to_string()];
     if let Ok(siblings) = family {
         worktrees.extend(siblings.iter().cloned());
+    }
+    // A fixed order, so a rotation means the same thing whichever worktree
+    // triggers the pass.
+    worktrees.sort();
+    worktrees.dedup();
+    let max_worktrees = max_worktrees.max(1);
+    if worktrees.len() > max_worktrees {
+        // The bound is on one pass, not on the family: the window moves on each
+        // pass, so every member's HEAD is read within ceil(N / bound) passes.
+        let start = next_rotation_start(ledger_repo, worktrees.len(), max_worktrees);
+        worktrees.rotate_left(start);
     }
     let skipped = worktrees.len().saturating_sub(max_worktrees);
     worktrees.truncate(max_worktrees);
@@ -602,6 +619,26 @@ fn ingest_reflogs(
         ));
     }
     total
+}
+
+/// Where this pass's window over a family of `members` starts, and the next
+/// pass's after it: `window` further on, kept in memory per repository. A
+/// process that restarts begins again at 0, which costs one pass's order, not
+/// coverage.
+fn next_rotation_start(ledger_repo: &str, members: usize, window: usize) -> usize {
+    static STARTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    let mut starts = STARTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if starts.len() >= 64 && !starts.contains_key(ledger_repo) {
+        starts.clear();
+    }
+    let next = starts.entry(ledger_repo.to_string()).or_insert(0);
+    let start = *next % members;
+    *next = (start + window) % members;
+    start
 }
 
 /// One reflog entry laid out for replay: where it sits among identical
@@ -776,22 +813,25 @@ fn replay_ref(
         pending += laid.start - usize::from(laid.capped);
     }
 
-    // Entries an old build recorded without an event time cannot be matched
-    // by the unique index, so replay still skips an identity one of them holds.
-    // Only a replay with no usable watermark can meet one.
-    let seen = if found.is_some() {
-        Ok(std::collections::HashSet::new())
-    } else {
-        ledger::recorded_reflog_objects(ledger_repo, worktree_path, ledger_repo == worktree_path)
+    // Entries an old build recorded without an event time cannot be matched by
+    // the unique index, so replay skips an identity one of them holds. A
+    // generation-1 process that was running when the ledger migrated keeps
+    // writing such rows, so this is read on every pass: all of them when the
+    // watermark did not place the read, else the ones appended since the
+    // watermark's entry (less a margin for clock skew), which bounds the query
+    // to recent appends.
+    let is_anchor = ledger_repo == worktree_path;
+    let seen = match (&mark, found) {
+        (Some(mark), Some(_)) => ledger::recorded_reflog_objects_since(
+            ledger_repo,
+            worktree_path,
+            is_anchor,
+            mark.unix.saturating_sub(LEGACY_SEEN_MARGIN_SECS),
+        ),
+        _ => ledger::recorded_reflog_objects(ledger_repo, worktree_path, is_anchor),
     };
+    // The rows and the watermark are one transaction (`record_steps`).
     let (settled, mut out) = record_steps(ledger_repo, worktree_path, ref_name, steps, seen, out);
-    if let Some(last) = settled.checked_sub(1).map(|i| &steps[i]) {
-        if let Err(e) =
-            ledger::set_reflog_watermark(ledger_repo, worktree_path, ref_name, &last.watermark())
-        {
-            out.error = format!("could not move the reflog watermark for {ref_name}: {e}");
-        }
-    }
     pending += steps.len() - settled;
     out.reflog_pending = i64::try_from(pending).unwrap_or(i64::MAX);
     out.reflog_unreached = unreached;
@@ -859,15 +899,21 @@ fn record_steps(
         }
     };
     let now_ms = ledger::ids::now_millis();
-    for (settled, step) in steps.iter().enumerate() {
+    let mut rows = Vec::with_capacity(steps.len());
+    for step in steps {
         let entry = step.entry;
         let identity = step.identity();
         // Compared as stored: redacted, and cut to the ledger's `object` cap,
         // or an identity past the cap would never match its own row.
         if seen.contains(&ledger::stored_object(&identity)) {
+            rows.push(ledger::ReflogRow {
+                draft: None,
+                ordinal: step.ordinal,
+                mark: step.watermark(),
+                untimed: false,
+            });
             continue;
         }
-        out.reflog_entries += 1;
         let action = format!(
             "reflog.{}",
             if entry.action.is_empty() {
@@ -894,46 +940,72 @@ fn record_steps(
             "message": entry.message,
         })
         .to_string();
-        match ledger::record_outcome(
-            Draft {
-                repo_path: ledger_repo.to_string(),
-                worktree_path: (ledger_repo != worktree_path).then(|| worktree_path.to_string()),
-                task_id: when.task.task_id().map(str::to_string),
-                action,
-                object: Some(identity),
-                // What the ref held before this move: the commit the next
-                // older entry moved it to. Absent for the first entry of a
-                // log, which has no earlier value to name.
-                before_ref: step.before.map(str::to_string),
-                after_ref: Some(entry.commit_id.clone()),
-                // Git does not record which actor moved the ref, and inventing one
-                // would be a guess written to disk. `system` says GitPulse
-                // synthesised this row from git's record.
-                actor_kind: Some(ActorKind::System),
-                actor_id: Some("reflog".into()),
-                outcome: Some(Outcome::Ok),
-                verdict_json: None,
-                detail_json: Some(detail),
-                event_stamp: Some(when.stamp()),
-                ..Default::default()
-            },
-            step.ordinal,
-        ) {
-            ledger::Recorded::Appended(_) => {
-                out.recorded += 1;
-                #[cfg(all(test, unix))]
-                reflog_replay_tests::crash_point(out.recorded);
+        let untimed = when.basis == "ingest";
+        let draft = Draft {
+            repo_path: ledger_repo.to_string(),
+            worktree_path: (ledger_repo != worktree_path).then(|| worktree_path.to_string()),
+            task_id: when.task.task_id().map(str::to_string),
+            action,
+            object: Some(identity),
+            // What the ref held before this move: the commit the next
+            // older entry moved it to. Absent for the first entry of a
+            // log, which has no earlier value to name.
+            before_ref: step.before.map(str::to_string),
+            after_ref: Some(entry.commit_id.clone()),
+            // Git does not record which actor moved the ref, and inventing one
+            // would be a guess written to disk. `system` says GitPulse
+            // synthesised this row from git's record.
+            actor_kind: Some(ActorKind::System),
+            actor_id: Some("reflog".into()),
+            outcome: Some(Outcome::Ok),
+            verdict_json: None,
+            detail_json: Some(detail),
+            event_stamp: Some(when.stamp()),
+            ..Default::default()
+        };
+        rows.push(ledger::ReflogRow {
+            draft: Some(draft),
+            ordinal: step.ordinal,
+            mark: step.watermark(),
+            untimed,
+        });
+    }
+    let attempted = rows.iter().filter(|row| row.draft.is_some()).count();
+    // One transaction for the rows and the watermark over them: a kill leaves
+    // both or neither, never rows past the mark.
+    match ledger::record_reflog_batch(ledger_repo, worktree_path, ref_name, rows) {
+        Ok(outcomes) => {
+            let mut settled = 0;
+            for outcome in outcomes {
+                match outcome {
+                    None => {}
+                    Some(ledger::Recorded::Appended(_)) => {
+                        out.reflog_entries += 1;
+                        out.recorded += 1;
+                    }
+                    Some(ledger::Recorded::Duplicate) => {
+                        out.reflog_entries += 1;
+                        out.duplicates_refused += 1;
+                    }
+                    Some(ledger::Recorded::Failed) => {
+                        // Surfaced, and the pass stops here: the watermark never
+                        // passes an entry that is not in the ledger.
+                        out.reflog_entries += 1;
+                        out.failed_records += 1;
+                        return (settled, out);
+                    }
+                }
+                settled += 1;
             }
-            ledger::Recorded::Duplicate => out.duplicates_refused += 1,
-            ledger::Recorded::Failed => {
-                // Surfaced, and the pass stops here: moving the watermark past
-                // an entry that is not in the ledger would lose it for good.
-                out.failed_records += 1;
-                return (settled, out);
-            }
+            (settled, out)
+        }
+        Err(e) => {
+            out.reflog_entries += i64::try_from(attempted).unwrap_or(i64::MAX);
+            out.failed_records += i64::try_from(attempted.max(1)).unwrap_or(i64::MAX);
+            out.error = format!("the reflog entries of {ref_name} could not be written: {e}");
+            (0, out)
         }
     }
-    (steps.len(), out)
 }
 
 impl CatchUp {

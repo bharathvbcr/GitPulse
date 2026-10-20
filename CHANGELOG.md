@@ -57,6 +57,18 @@ before that tag is pushed.
   counting as a dropped append, and the catch-up result counts it in
   `duplicates_refused`.
 
+- Reflog replay resumes from a per-(worktree, ref) watermark, reads every
+  worktree's HEAD log (a window of 16 per pass, rotated so each is read within
+  ceil(N/16) passes) and the default branch's own log, and records the rows and
+  the watermark in one transaction. Known limits, pinned as ignored tests: an
+  identical reflog entry whose older twin lies outside the 200-entry read, and
+  its time went backwards, takes the twin's ordinal and is refused as it; and
+  `git reflog delete` of one of several identical entries renumbers the rest, so
+  the next identical entry is taken as already recorded.
+- Transcript cursors carry a fingerprint (head, tail, file length and mtime), so
+  a rewritten transcript is read again, a moved one resumes after its old lines,
+  and an unchanged one costs a `stat`.
+
 ### Added
 
 - `gitpulse_landed` answers whether a commit's work reached a base and how:

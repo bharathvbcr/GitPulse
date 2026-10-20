@@ -14,19 +14,6 @@ const ENV_REPO: &str = "GITPULSE_TEST_REPLAY_REPO";
 const ENV_GO: &str = "GITPULSE_TEST_REPLAY_GO";
 const ENV_KILL: &str = "GITPULSE_TEST_KILL_AFTER_RECORDED";
 
-/// Test-only: a child replay process kills itself (SIGKILL, no unwinding, no
-/// destructors) once it has recorded the number of rows [`ENV_KILL`] names.
-#[cfg(unix)]
-pub(super) fn crash_point(recorded: i64) {
-    let after = std::env::var(ENV_KILL)
-        .ok()
-        .and_then(|n| n.parse::<i64>().ok());
-    if after == Some(recorded) {
-        // SAFETY: a signal to this very process; SIGKILL cannot be handled.
-        unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
-    }
-}
-
 /// `git` in `dir` with author and committer dated `epoch`.
 pub(super) fn git_at(dir: &std::path::Path, args: &[&str], epoch: i64) {
     let stamp = format!("@{epoch} +0000");
@@ -307,8 +294,9 @@ fn a_replay_killed_mid_pass_leaves_no_duplicates_and_no_gaps() {
     }
     let total = head_entries(&repo);
 
-    // 1 seed + 4 commits + the first reset = 6 rows, then the kill lands
-    // between the two identical resets.
+    // The kill lands after the sixth row (1 seed + 4 commits + the first reset),
+    // between the two identical resets, inside the one transaction that holds
+    // the rows and the watermark over them: neither survives it.
     let (mut command, _harness) = child_command(&repo);
     let output = command
         .env(ENV_KILL, "6")
@@ -321,11 +309,15 @@ fn a_replay_killed_mid_pass_leaves_no_duplicates_and_no_gaps() {
         output.status,
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(reflog_rows(&repo).len(), 6, "the crash point moved");
+    assert_eq!(
+        reflog_rows(&repo).len(),
+        0,
+        "a killed transaction left rows behind"
+    );
 
     let next = ingest_reflog_into(&repo, &repo, 200);
-    assert_eq!(next.recorded, i64::try_from(total - 6).unwrap(), "{next:?}");
-    assert_eq!(next.duplicates_refused, 6, "{next:?}");
+    assert_eq!(next.recorded, i64::try_from(total).unwrap(), "{next:?}");
+    assert_eq!(next.duplicates_refused, 0, "{next:?}");
     assert_eq!(reflog_rows(&repo).len(), total, "a gap or a duplicate");
     let resets = reflog_rows(&repo)
         .into_iter()
@@ -445,7 +437,6 @@ fn adv_held_legacy_rows_without_a_time_are_not_recorded_again() {
 /// (`found.is_some()` empties the seen set), so an entry the old process
 /// recorded after the watermark is recorded a second time by the new build.
 #[test]
-#[ignore = "adv: legacy-shaped rows written after the watermark exists are not matched by the unique index and the seen set is skipped when a watermark is found"]
 fn adv_a_generation_1_row_written_after_the_watermark_is_not_recorded_again() {
     let (dir, repo) = seeded_repo();
     let first = ingest_reflog_into(&repo, &repo, 200);
@@ -473,7 +464,6 @@ fn adv_a_generation_1_row_written_after_the_watermark_is_not_recorded_again() {
 /// watermark write. (A self-sent SIGKILL is not instantaneous, so a child that
 /// "dies" there sometimes still writes the watermark and the test flakes.)
 #[test]
-#[ignore = "adv: a future-dated reflog entry gets an ingest-time occurred_at, so a replay after a kill between the row and the watermark records it twice"]
 fn adv_a_future_dated_entry_is_not_recorded_twice_after_a_kill_before_the_watermark() {
     let (dir, repo) = seeded_repo();
     commit_at(dir.path(), "future", 4_100_000_000, "gitpulse@test.local");
@@ -502,7 +492,7 @@ fn adv_a_future_dated_entry_is_not_recorded_twice_after_a_kill_before_the_waterm
 /// reset carries the earlier second, which leaves the window's skipped-second
 /// guard (it only skips the extra entry's own second) looking at the wrong run.
 #[test]
-#[ignore = "adv: an identical entry with an older twin outside the read gets ordinal 0 and is refused as the twin"]
+#[ignore = "known limit: an identical entry with an older twin outside the read gets ordinal 0 and is refused as the twin"]
 fn adv_a_backdated_twin_outside_the_window_keeps_its_ordinal() {
     let (dir, repo) = seeded_repo();
     let seed = crate::engine::git_reader::GitReader::get_reflog(&repo, 10)
@@ -529,7 +519,7 @@ fn adv_a_backdated_twin_outside_the_window_keeps_its_ordinal() {
 /// the rest, so the watermark's ordinal names another entry and a later
 /// identical entry takes a number that is already in the ledger.
 #[test]
-#[ignore = "adv: deleting one identical reflog entry shifts ordinals; the next identical entry is skipped as already recorded"]
+#[ignore = "known limit: deleting one identical reflog entry shifts ordinals; the next identical entry is skipped as already recorded"]
 fn adv_deleting_an_identical_entry_does_not_swallow_the_next_one() {
     let (dir, repo) = seeded_repo();
     git_at(dir.path(), &["reset", "--hard", "HEAD"], T0 + 10);

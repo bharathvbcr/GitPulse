@@ -2013,10 +2013,14 @@ pub(crate) const CURSOR_FINGERPRINT_BYTES: usize = 64;
 pub(crate) type FileStat = (u64, u64);
 
 /// The fingerprint stored with a transcript cursor:
-/// `"v2:{h}:{t}:{len}:{mtime_ns}:{hash}"`, where `hash` is a digest (the
-/// ledger's FNV-1a) of the first `h` bytes of the file and the `t` bytes that
-/// end at the cursor, each at most [`CURSOR_FINGERPRINT_BYTES`], and
-/// `len`/`mtime_ns` are the file's [`FileStat`] when the cursor was written.
+/// `"v3:{h}:{t}:{len}:{mtime_ns}:{head_hash}:{tail_hash}"`, where the hashes are
+/// digests (the ledger's FNV-1a) of the first `h` bytes of the file and of the
+/// `t` bytes that end at the cursor, each at most [`CURSOR_FINGERPRINT_BYTES`],
+/// and `len`/`mtime_ns` are the file's [`FileStat`] when the cursor was written
+/// (`-` when it could not be read). The tail has a digest of its own so a
+/// rewrite that moved it (a record prepended, the head changed) can be told from
+/// one that replaced it: the new file is searched for the bytes that digest
+/// names, and a cursor that finds them resumes after them.
 ///
 /// Both byte halves are needed. The bytes before the cursor are what a resume
 /// depends on, but a transcript's lines end alike (the same trailing keys), so
@@ -2027,10 +2031,10 @@ pub(crate) type FileStat = (u64, u64);
 /// text may hold anything.
 ///
 /// The stat is what lets an unchanged file cost one `stat` per pass: a file
-/// whose length and mtime are still the recorded ones is not opened. Without it
-/// (the stat could not be read) the text is the unversioned `"{h}:{t}:{hash}"`,
-/// the shape the first build of this column wrote, and every pass re-hashes.
-/// `None` when either half is empty (nothing read yet).
+/// whose length and mtime are still the recorded ones is not opened. The
+/// unversioned `"{h}:{t}:{hash}"` the first build of this column wrote (one
+/// digest of both halves, no stat) is still read: it is re-hashed on every pass
+/// and cannot be searched for. `None` when either half is empty (nothing read yet).
 pub(crate) fn cursor_fingerprint(
     head: &[u8],
     tail: &[u8],
@@ -2039,24 +2043,50 @@ pub(crate) fn cursor_fingerprint(
     if head.is_empty() || tail.is_empty() {
         return None;
     }
-    let hash = ids::fnv1a64(&[head, tail].concat());
+    let (head_hash, tail_hash) = (ids::fnv1a64(head), cursor_tail_hash(tail));
     Some(match stat {
         Some((len, mtime_ns)) => format!(
-            "v2:{}:{}:{len}:{mtime_ns}:{hash:016x}",
+            "v3:{}:{}:{len}:{mtime_ns}:{head_hash:016x}:{tail_hash:016x}",
             head.len(),
             tail.len()
         ),
-        None => format!("{}:{}:{hash:016x}", head.len(), tail.len()),
+        None => format!(
+            "v3:{}:{}:-:-:{head_hash:016x}:{tail_hash:016x}",
+            head.len(),
+            tail.len()
+        ),
     })
 }
 
-/// What a stored fingerprint covers: the byte counts of its two halves and the
-/// file stat it recorded, if it did.
+/// The digest a fingerprint keeps of its tail bytes.
+pub(crate) fn cursor_tail_hash(tail: &[u8]) -> u64 {
+    ids::fnv1a64(tail)
+}
+
+/// Whether `head` and `tail` (read from a file as it is now, `parts.head` and
+/// `parts.tail` bytes long) are the bytes `fingerprint` was taken from.
+pub(crate) fn cursor_fingerprint_holds(
+    fingerprint: &str,
+    parts: &FingerprintParts,
+    head: &[u8],
+    tail: &[u8],
+) -> bool {
+    if parts.tail_hash.is_some() {
+        cursor_fingerprint(head, tail, parts.stat).as_deref() == Some(fingerprint)
+    } else {
+        let hash = ids::fnv1a64(&[head, tail].concat());
+        fingerprint == format!("{}:{}:{hash:016x}", head.len(), tail.len())
+    }
+}
+
+/// What a stored fingerprint covers: the byte counts of its two halves, the
+/// file stat it recorded if it did, and the tail's digest if it kept one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FingerprintParts {
     pub head: usize,
     pub tail: usize,
     pub stat: Option<FileStat>,
+    pub tail_hash: Option<u64>,
 }
 
 /// Reads [`cursor_fingerprint`]'s text back, or `None` for text this build did
@@ -2069,24 +2099,31 @@ pub(crate) fn parse_cursor_fingerprint(fingerprint: &str) -> Option<FingerprintP
     };
     let mut fields = fingerprint.split(':');
     let first = fields.next()?;
-    let parts = if first == "v2" {
+    let parts = if first == "v3" {
         let (head, tail) = counts(fields.next()?, fields.next()?)?;
-        let stat = (fields.next()?.parse().ok()?, fields.next()?.parse().ok()?);
+        let (len, mtime) = (fields.next()?, fields.next()?);
+        let stat = match (len, mtime) {
+            ("-", "-") => None,
+            _ => Some((len.parse().ok()?, mtime.parse().ok()?)),
+        };
+        fields.next()?;
+        let tail_hash = u64::from_str_radix(fields.next()?, 16).ok()?;
         FingerprintParts {
             head,
             tail,
-            stat: Some(stat),
+            stat,
+            tail_hash: Some(tail_hash),
         }
     } else {
         let (head, tail) = counts(first, fields.next()?)?;
+        fields.next()?;
         FingerprintParts {
             head,
             tail,
             stat: None,
+            tail_hash: None,
         }
     };
-    // The digest, and nothing after it.
-    fields.next()?;
     fields.next().is_none().then_some(parts)
 }
 
@@ -3392,21 +3429,160 @@ pub(crate) fn reflog_watermark(
     })
 }
 
-/// Moves the watermark for `ref_name` of `worktree_path`'s checkout to `mark`.
+/// One reflog entry of a [`record_reflog_batch`].
+pub(crate) struct ReflogRow {
+    /// The row to write; `None` for an entry replay settles without one (the
+    /// ledger already holds it as a row an old build wrote).
+    pub draft: Option<Draft>,
+    pub ordinal: i64,
+    /// The watermark that names this entry, written if it is the last settled.
+    pub mark: ReflogWatermark,
+    /// The entry's time was not believed (absent, or ahead of the clock), so its
+    /// `occurred_at` is ingest time: part of the unique identity, and different
+    /// on every replay, so the index alone cannot refuse a second recording. The
+    /// batch counts the rows already holding the entry and records only an
+    /// ordinal past them.
+    pub untimed: bool,
+}
+
+/// Records `rows` (one ref's entries, oldest first) and moves that ref's
+/// watermark to the last settled one, all in ONE transaction: a process killed
+/// anywhere in it leaves the rows and the watermark both written or neither.
 ///
-/// Written only after the entries up to `mark` are in the ledger, and never
-/// needed for correctness: the unique reflog identity index refuses a replayed
-/// entry, so a crash between the rows and this write costs a re-read, not a
-/// duplicate or a gap.
-pub(crate) fn set_reflog_watermark(
+/// Stops at the first row that fails to write and commits what settled before
+/// it. Returns one outcome per row attempted (`None`: settled without a row),
+/// so the caller's tallies and its "settled prefix" agree with what is in the
+/// ledger. `Err` only when the transaction could not be opened or committed, in
+/// which case nothing was written.
+pub(crate) fn record_reflog_batch(
     repo_path: &str,
     worktree_path: &str,
     ref_name: &str,
-    mark: &ReflogWatermark,
-) -> Result<(), LedgerError> {
+    rows: Vec<ReflogRow>,
+) -> Result<Vec<Option<Recorded>>, LedgerError> {
     let key = transcript_key(Path::new(worktree_path));
+    let prepared: Vec<Option<Result<Prepared, LedgerError>>> = rows
+        .iter()
+        .map(|row| row.draft.as_ref().map(prepare))
+        .collect();
+    let attempted = prepared.iter().flatten().count();
+    let result = with_conn(repo_path, |conn| {
+        let failed = |e: rusqlite::Error| LedgerError::new("insert_failed", e.to_string());
+        let tx = write_tx(conn).map_err(failed)?;
+        let mut outcomes: Vec<Option<Recorded>> = Vec::with_capacity(rows.len());
+        let mut settled: Option<&ReflogWatermark> = None;
+        let mut newest = None;
+        for (row, prepared) in rows.iter().zip(prepared) {
+            let outcome = match prepared {
+                None => None,
+                Some(Err(e)) => {
+                    log::warn!("ledger append failed: {e}");
+                    Some(Recorded::Failed)
+                }
+                Some(Ok(mut event)) => {
+                    event.reflog_ordinal = event.reflog_ordinal.map(|_| row.ordinal);
+                    let held = row.untimed && untimed_rows_held(&tx, &event) > row.ordinal;
+                    Some(if held {
+                        Recorded::Duplicate
+                    } else {
+                        match insert(&tx, &event) {
+                            Ok(id) => {
+                                newest = Some(id);
+                                #[cfg(all(test, unix))]
+                                crash_point(
+                                    1 + i64::try_from(
+                                        outcomes
+                                            .iter()
+                                            .flatten()
+                                            .filter(|o| matches!(o, Recorded::Appended(_)))
+                                            .count(),
+                                    )
+                                    .unwrap_or(0),
+                                );
+                                Recorded::Appended(id)
+                            }
+                            Err(e) if e.code == "duplicate_reflog" => Recorded::Duplicate,
+                            Err(e) => {
+                                log::warn!("ledger append failed: {e}");
+                                Recorded::Failed
+                            }
+                        }
+                    })
+                }
+            };
+            let stop = outcome == Some(Recorded::Failed);
+            outcomes.push(outcome);
+            if stop {
+                break;
+            }
+            settled = Some(&row.mark);
+        }
+        if let Some(mark) = settled {
+            upsert_reflog_watermark(&tx, &key, ref_name, mark)
+                .map_err(|e| LedgerError::new("watermark_write_failed", e.to_string()))?;
+        }
+        tx.commit().map_err(failed)?;
+        Ok((outcomes, newest))
+    });
+    match result {
+        Ok((outcomes, newest)) => {
+            for outcome in &outcomes {
+                if *outcome == Some(Recorded::Failed) {
+                    record_dropped_append(repo_path);
+                }
+            }
+            if let Some(cursor) = newest {
+                announce(repo_path, cursor);
+            }
+            Ok(outcomes)
+        }
+        Err(e) => {
+            for _ in 0..attempted {
+                record_dropped_append(repo_path);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// How many `reflog.*` rows already hold `event`'s entry, of an untimed one
+/// (see [`ReflogRow::untimed`]): same worktree and object, stamped with ingest
+/// time. A read that fails counts as none held, so the entry is attempted and a
+/// failure to write it surfaces as one.
+fn untimed_rows_held(conn: &Connection, event: &Prepared) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM events
+         WHERE action LIKE 'reflog.%' AND object = ?1 AND worktree_path IS ?2
+           AND instr(detail_json, '\"occurred_at_basis\":\"ingest\"') > 0",
+        params![event.object, event.worktree_path],
+        |row| row.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// Test-only: a child replay process kills itself (SIGKILL, no unwinding, no
+/// destructors) once a batch has written `GITPULSE_TEST_KILL_AFTER_RECORDED`
+/// rows, inside the transaction that has not committed them.
+#[cfg(all(test, unix))]
+fn crash_point(written: i64) {
+    let after = std::env::var("GITPULSE_TEST_KILL_AFTER_RECORDED")
+        .ok()
+        .and_then(|n| n.parse::<i64>().ok());
+    if after == Some(written) {
+        // SAFETY: a signal to this very process; SIGKILL cannot be handled.
+        unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+    }
+}
+
+/// Moves a watermark inside the transaction that wrote the rows it names.
+fn upsert_reflog_watermark(
+    conn: &Connection,
+    key: &str,
+    ref_name: &str,
+    mark: &ReflogWatermark,
+) -> rusqlite::Result<()> {
     let updated_at = ids::iso8601_utc(ids::now_millis());
-    with_conn(repo_path, |conn| {
+    {
         conn.execute(
             "INSERT INTO reflog_watermarks (
                  worktree_key, ref_name, last_entry_unix, last_entry_oid,
@@ -3429,8 +3605,7 @@ pub(crate) fn set_reflog_watermark(
             ],
         )
         .map(|_| ())
-        .map_err(|e| LedgerError::new("watermark_write_failed", e.to_string()))
-    })
+    }
 }
 
 /// The query behind [`recorded_reflog_objects`], one text so the test that
@@ -3465,20 +3640,66 @@ pub(crate) fn recorded_reflog_objects(
     worktree_path: &str,
     is_anchor: bool,
 ) -> Result<std::collections::HashSet<String>, LedgerError> {
+    legacy_reflog_objects(repo_path, worktree_path, is_anchor, None)
+}
+
+/// The query behind [`recorded_reflog_objects_since`]: the same rows, read
+/// through the append-time index from a time on, so its cost follows what was
+/// appended since and not the checkout's whole reflog history.
+const RECORDED_REFLOG_SINCE_SQL: &str = "SELECT object,
+        CASE WHEN json_valid(detail_json)
+             THEN json_extract(detail_json, '$.object_truncated.hash') END
+ FROM events INDEXED BY idx_events_ts
+ WHERE ts_utc >= ?4 AND action LIKE 'reflog.%' AND object IS NOT NULL
+   AND occurred_at IS NULL
+   AND (worktree_path IN (?1, ?2) OR (?3 AND worktree_path IS NULL))";
+
+/// [`recorded_reflog_objects`] for the legacy rows appended at or after
+/// `since_unix` (Unix seconds, append time).
+///
+/// A generation-1 process that was already running when the ledger migrated
+/// keeps writing reflog rows with no `occurred_at`, which the unique index
+/// cannot match, so replay must keep reading such rows after its watermark
+/// exists. Only recent ones can matter: such a row is appended no earlier than
+/// the entry it records happened, which is after the watermark's entry minus
+/// any clock skew, so the caller passes that time less a margin.
+pub(crate) fn recorded_reflog_objects_since(
+    repo_path: &str,
+    worktree_path: &str,
+    is_anchor: bool,
+    since_unix: i64,
+) -> Result<std::collections::HashSet<String>, LedgerError> {
+    let since = ids::iso8601_utc(u64::try_from(since_unix).unwrap_or(0).saturating_mul(1000));
+    legacy_reflog_objects(repo_path, worktree_path, is_anchor, Some(&since))
+}
+
+fn legacy_reflog_objects(
+    repo_path: &str,
+    worktree_path: &str,
+    is_anchor: bool,
+    since: Option<&str>,
+) -> Result<std::collections::HashSet<String>, LedgerError> {
     let raw = worktree_path.to_string();
     let stored = redact::text(worktree_path);
     with_conn(repo_path, |conn| {
         let mut stmt = conn
-            .prepare(RECORDED_REFLOG_SQL)
-            .map_err(|e| LedgerError::new("prepare_failed", e.to_string()))?;
-        let rows = stmt
-            .query_map(params![raw, stored, is_anchor], |row| {
-                Ok(cap::object_key_of_row(
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                ))
+            .prepare(if since.is_some() {
+                RECORDED_REFLOG_SINCE_SQL
+            } else {
+                RECORDED_REFLOG_SQL
             })
-            .map_err(|e| LedgerError::new("query_failed", e.to_string()))?;
+            .map_err(|e| LedgerError::new("prepare_failed", e.to_string()))?;
+        let map = |row: &Row<'_>| {
+            Ok(cap::object_key_of_row(
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        };
+        let rows = match since {
+            Some(since) => stmt.query_map(params![raw, stored, is_anchor, since], map),
+            None => stmt.query_map(params![raw, stored, is_anchor], map),
+        }
+        .map_err(|e| LedgerError::new("query_failed", e.to_string()))?;
         rows.collect::<Result<_, _>>()
             .map_err(|e| LedgerError::new("row_failed", e.to_string()))
     })
