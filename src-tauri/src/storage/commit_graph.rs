@@ -103,7 +103,7 @@ pub struct CommitGraphReport {
     pub head_covered: Option<bool>,
     /// Why the state is what it is, in one sentence. Always set for `Unknown`.
     pub note: Option<String>,
-    /// A commit-graph write is running in this repository's common directory
+    /// A graph write is running in this repository's common directory
     /// right now. Set by the storage scan, not by [`inspect`], so a remounted
     /// panel can show the write and stop it instead of offering a second one.
     #[serde(default)]
@@ -630,7 +630,7 @@ pub fn gated_on_git(
             report.layout,
             format!(
                 "git older than {floor} (or one that could not be checked) cannot write \
-                 changed-path filters, so no commit-graph write is offered"
+                 changed-path filters, so no write is offered"
             ),
         );
     }
