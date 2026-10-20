@@ -404,3 +404,141 @@ fn two_processes_replaying_at_once_record_exactly_one_row_per_entry() {
     );
     assert_eq!(ledger::status(&repo).dropped, 0);
 }
+
+// --- adversarial review of CARD 27 (branch b17/card27-adv) ------------------
+
+/// A reflog row as a generation-1 build wrote it: no event time, so no
+/// `occurred_at`, which the unique identity index cannot match.
+fn legacy_row(repo: &str, entry: &crate::engine::git_reader::ReflogEntry) {
+    let action = format!("reflog.{}", ledger::action_segment(&entry.action));
+    ledger::append(Draft {
+        repo_path: repo.to_string(),
+        action,
+        object: Some(format!("{} {}", entry.commit_id, entry.message)),
+        after_ref: Some(entry.commit_id.clone()),
+        actor_kind: Some(ActorKind::System),
+        actor_id: Some("reflog".into()),
+        outcome: Some(Outcome::Ok),
+        ..Default::default()
+    })
+    .expect("a generation-1 row");
+}
+
+/// Held: a ledger whose old reflog rows carry no `occurred_at` (written before
+/// replay typed its time) is not recorded a second time on the first replay.
+#[test]
+fn adv_held_legacy_rows_without_a_time_are_not_recorded_again() {
+    let (dir, repo) = seeded_repo();
+    commit_at(dir.path(), "later", T0 + 5, "gitpulse@test.local");
+    let entries = crate::engine::git_reader::GitReader::get_reflog(&repo, 200).expect("reflog");
+    for entry in entries.iter().rev() {
+        legacy_row(&repo, entry);
+    }
+    let out = ingest_reflog_into(&repo, &repo, 200);
+    assert_eq!(out.recorded, 0, "{out:?}");
+    assert_eq!(reflog_rows(&repo).len(), entries.len());
+}
+
+/// BREAK: a generation-1 process that was already running when the ledger was
+/// migrated keeps writing reflog rows with no `occurred_at` (the WRITER_VERSION
+/// doc says so). Once a watermark exists the replay reads no legacy rows
+/// (`found.is_some()` empties the seen set), so an entry the old process
+/// recorded after the watermark is recorded a second time by the new build.
+#[test]
+#[ignore = "adv: legacy-shaped rows written after the watermark exists are not matched by the unique index and the seen set is skipped when a watermark is found"]
+fn adv_a_generation_1_row_written_after_the_watermark_is_not_recorded_again() {
+    let (dir, repo) = seeded_repo();
+    let first = ingest_reflog_into(&repo, &repo, 200);
+    assert_eq!(first.recorded, 1, "{first:?}");
+    commit_at(dir.path(), "later", T0 + 5, "gitpulse@test.local");
+    let entries = crate::engine::git_reader::GitReader::get_reflog(&repo, 200).expect("reflog");
+    legacy_row(&repo, &entries[0]);
+
+    let second = ingest_reflog_into(&repo, &repo, 200);
+    let later = reflog_rows(&repo)
+        .into_iter()
+        .filter(|event| event.object.as_deref().is_some_and(|o| o.contains("later")))
+        .count();
+    assert_eq!(later, 1, "the entry is in the ledger twice: {second:?}");
+}
+
+/// BREAK: an entry whose time Git recorded more than a minute ahead of the
+/// clock (or not at all) is stamped with ingest time, which is part of the
+/// unique identity, so nothing refuses its second recording. A process killed
+/// after the last row and before the watermark write (a separate statement)
+/// leaves the entry to be recorded again by the next pass.
+#[cfg(unix)]
+#[test]
+#[ignore = "adv: a future-dated reflog entry gets an ingest-time occurred_at, so a replay after a kill between the row and the watermark records it twice"]
+fn adv_a_future_dated_entry_is_not_recorded_twice_after_a_kill_before_the_watermark() {
+    use std::os::unix::process::ExitStatusExt;
+    let (dir, repo) = seeded_repo();
+    commit_at(dir.path(), "future", 4_100_000_000, "gitpulse@test.local");
+    let total = head_entries(&repo);
+    let (mut command, _harness) = child_command(&repo);
+    let output = command
+        .env(ENV_KILL, total.to_string())
+        .output_locked()
+        .expect("run the child");
+    assert_eq!(output.status.signal(), Some(libc::SIGKILL), "{output:?}");
+    assert_eq!(reflog_rows(&repo).len(), total, "the crash point moved");
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let next = ingest_reflog_into(&repo, &repo, 200);
+    assert_eq!(
+        reflog_rows(&repo).len(),
+        total,
+        "the future-dated entry was recorded again: {next:?}"
+    );
+}
+
+/// BREAK: occurrence numbers are counted inside the read, so an identical
+/// entry whose older twin lies beyond the window is numbered 0 when it is 1,
+/// and the unique index refuses it as the twin. Reflog times are not
+/// monotonic after a clock step or a pinned committer date; here the later
+/// reset carries the earlier second, which leaves the window's skipped-second
+/// guard (it only skips the extra entry's own second) looking at the wrong run.
+#[test]
+#[ignore = "adv: an identical entry with an older twin outside the read gets ordinal 0 and is refused as the twin"]
+fn adv_a_backdated_twin_outside_the_window_keeps_its_ordinal() {
+    let (dir, repo) = seeded_repo();
+    let seed = crate::engine::git_reader::GitReader::get_reflog(&repo, 10)
+        .expect("reflog")
+        .remove(0)
+        .commit_id;
+    git_at(dir.path(), &["reset", "--hard", &seed], T0 + 10);
+    commit_at(dir.path(), "g", T0 + 90, "gitpulse@test.local");
+    commit_at(dir.path(), "e2", T0 + 100, "gitpulse@test.local");
+    let first = ingest_reflog_into(&repo, &repo, 200);
+    assert_eq!(first.recorded, 4, "{first:?}");
+
+    git_at(dir.path(), &["reset", "--hard", &seed], T0 + 10);
+    commit_at(dir.path(), "f", T0 + 110, "gitpulse@test.local");
+    let second = ingest_reflog_into(&repo, &repo, 3);
+    assert_eq!(
+        reflog_rows(&repo).len(),
+        head_entries(&repo),
+        "an entry was refused as its own older twin: {second:?}"
+    );
+}
+
+/// BREAK: `git reflog delete` of one of several identical entries renumbers
+/// the rest, so the watermark's ordinal names another entry and a later
+/// identical entry takes a number that is already in the ledger.
+#[test]
+#[ignore = "adv: deleting one identical reflog entry shifts ordinals; the next identical entry is skipped as already recorded"]
+fn adv_deleting_an_identical_entry_does_not_swallow_the_next_one() {
+    let (dir, repo) = seeded_repo();
+    git_at(dir.path(), &["reset", "--hard", "HEAD"], T0 + 10);
+    git_at(dir.path(), &["reset", "--hard", "HEAD"], T0 + 10);
+    let first = ingest_reflog_into(&repo, &repo, 200);
+    assert_eq!(first.recorded, 3, "{first:?}");
+    git_in(dir.path(), &["reflog", "delete", "HEAD@{1}"]);
+    git_at(dir.path(), &["reset", "--hard", "HEAD"], T0 + 10);
+    let second = ingest_reflog_into(&repo, &repo, 200);
+    let resets = reflog_rows(&repo)
+        .into_iter()
+        .filter(|event| event.action == "reflog.reset")
+        .count();
+    assert_eq!(resets, 3, "three resets happened: {second:?}");
+}

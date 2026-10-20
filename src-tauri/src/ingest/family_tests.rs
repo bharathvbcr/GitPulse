@@ -2187,3 +2187,38 @@ fn the_baseline_floor_compares_instants_not_text() {
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(rows[0].1.ends_with("new.rs"), "{rows:?}");
 }
+
+/// BREAK: a rotation is read from byte 0, and transcript rows carry no unique
+/// identity, so every call the old file already recorded is recorded again when
+/// the new file still holds it. Here a header record is prepended to a
+/// transcript (its first 64 bytes change, so the fingerprint calls it a
+/// rotation) and the two old calls are in the ledger twice.
+#[test]
+#[ignore = "adv: a rewrite that keeps the old lines is re-read from 0 and its old lines are recorded a second time (no unique index on transcript rows)"]
+fn adv_a_rotation_that_keeps_the_old_lines_does_not_record_them_twice() {
+    let nested = Nested::new();
+    let w = nested.worktrees[0].clone();
+    let a = edit_line(&w, "D1", 1, &format!("{w}/a.rs"));
+    let b = edit_line(&w, "D1", 2, &format!("{w}/b.rs"));
+    with_transcript_root(&nested.corpus, || {
+        write_lines(&nested.file("D1.jsonl"), &[a.clone(), b.clone()]);
+        let first = nested.pass(&nested.base, &[&w]);
+        assert_eq!(first.recorded, 2, "{first:?}");
+        write_lines(
+            &nested.file("D1.jsonl"),
+            &[
+                r#"{"type":"summary","summary":"resumed","leafUuid":"0"}"#.to_string(),
+                a.clone(),
+                b.clone(),
+                edit_line(&w, "D1", 3, &format!("{w}/c.rs")),
+            ],
+        );
+        nested.pass(&nested.base, &[&w]);
+    });
+    assert_eq!(
+        nested.rows().len(),
+        3,
+        "a.rs and b.rs once, c.rs once: {:?}",
+        nested.rows()
+    );
+}
