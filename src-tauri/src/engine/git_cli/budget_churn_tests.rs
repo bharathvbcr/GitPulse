@@ -39,7 +39,10 @@ fn farm(siblings: usize) -> Farm {
     std::fs::write(repo_dir.path().join("seed.txt"), "seed").expect("seed");
     git_in(repo_dir.path(), &["add", "seed.txt"]);
     git_in(repo_dir.path(), &["commit", "-m", "seed"]);
-    let repo = repo_dir.path().canonicalize().expect("canonical repository");
+    let repo = repo_dir
+        .path()
+        .canonicalize()
+        .expect("canonical repository");
     let sibling_root = tempfile::tempdir().expect("sibling worktrees");
     let root = sibling_root.path().canonicalize().expect("canonical root");
     let mut dirs = vec![repo.clone()];
@@ -47,7 +50,13 @@ fn farm(siblings: usize) -> Farm {
         let wt = root.join(format!("sibling-{n}"));
         git_in(
             &repo,
-            &["worktree", "add", "-b", &format!("b{n}"), &wt.to_string_lossy()],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &format!("b{n}"),
+                &wt.to_string_lossy(),
+            ],
         );
         std::fs::write(wt.join(format!("own-{n}.txt")), "mine").expect("dirty a sibling");
         dirs.push(wt);
@@ -108,7 +117,7 @@ fn one_edit_hook_invocation_spends_this_many_git_spawns_by_call_site() {
     }
     assert!(!output.is_silent() || total > 0, "the guard did not run");
     assert_eq!(
-        total, 14,
+        total, 4,
         "the hook's spend changed: {table:?}; if this is the hooks-half cut, lower the pin"
     );
 }
@@ -160,7 +169,9 @@ fn a_refusal_names_the_refusing_bucket_and_its_level() {
          spawn rate budget is low (local bucket: 3 token(s), needs more than 4, burst 16)"
     );
     assert!(super::is_deferred_under_load(&message), "{message}");
-    assert!(super::is_deferred_under_load(&format!("[deferred_worktree] {message}")));
+    assert!(super::is_deferred_under_load(&format!(
+        "[deferred_worktree] {message}"
+    )));
     assert_eq!(RunError::classify(&message), RunError::Deferred);
 }
 
@@ -245,7 +256,10 @@ fn a_waiter_asleep_for_a_token_still_ends_at_its_deadline_and_on_cancellation() 
         gate.acquire_until(began + Duration::from_millis(150), &|| false)
     })
     .err();
-    assert!(matches!(refusal, Some(Refusal::Refused { .. })), "{refusal:?}");
+    assert!(
+        matches!(refusal, Some(Refusal::Refused { .. })),
+        "{refusal:?}"
+    );
     assert!(
         began.elapsed() < coverage_relaxed(Duration::from_secs(1)),
         "{:?}",

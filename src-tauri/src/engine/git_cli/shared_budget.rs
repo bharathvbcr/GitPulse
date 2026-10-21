@@ -832,6 +832,82 @@ mod tests {
     /// the record as unreachable instead lets the gate admit, and every
     /// process that meets the same failure spends past the shared budget.
     #[test]
+    fn denied_waiters_on_an_empty_record_write_it_no_faster_than_it_refills() {
+        // Four handles (four processes) poll an empty record every 50 ms of
+        // injected time for 10 s, at 8 tokens/s. Only a credited token that is
+        // then granted changes the record; a denial changes nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let handles: Vec<_> = (0..4).map(|_| budget(&dir)).collect();
+        let (burst, per_sec, secs) = (16u32, 8u32, 10u64);
+        let start = 1_000 * S;
+        for _ in 0..burst {
+            assert_eq!(handles[0].take_at(0, burst, per_sec, start), Take::Granted);
+        }
+        let before: u64 = handles.iter().map(SharedBudget::writes).sum();
+        let mut granted = 0u64;
+        for tick in 1..=(secs * 20) {
+            let now = start + tick * (S / 20);
+            for handle in &handles {
+                if handle.take_at(0, burst, per_sec, now) == Take::Granted {
+                    granted += 1;
+                }
+            }
+        }
+        let writes = handles.iter().map(SharedBudget::writes).sum::<u64>() - before;
+        println!(
+            "RECORD WRITES: 4 handles x {secs} s polling every 50 ms at {per_sec}/s -> {writes} writes \
+             ({:.1}/s), {granted} grants",
+            writes as f64 / secs as f64
+        );
+        // One write per grant, plus one probe per handle.
+        assert_eq!(granted, u64::from(per_sec) * secs);
+        assert!(
+            writes <= u64::from(per_sec) * secs + handles.len() as u64,
+            "{writes} writes"
+        );
+    }
+
+    /// A denial that credits nothing, or credits tokens still at or below the
+    /// floor, leaves the record exactly as it was, and a later reader reaches
+    /// the same decision as if the denial had written.
+    #[test]
+    fn a_clean_denial_does_not_rewrite_the_record_and_costs_no_token_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let (burst, per_sec) = (16u32, 8u32);
+        let start = 1_000 * S;
+        let polled = budget(&dir);
+        let silent = budget(&dir);
+        for h in [&polled, &silent] {
+            for _ in 0..burst {
+                let _ = h.take_at(0, burst, per_sec, start);
+            }
+        }
+        // The first denial of a handle writes (the probe); the rest do not.
+        assert_eq!(
+            polled.take_at(4, burst, per_sec, start + S / 4),
+            Take::Denied
+        );
+        let probed = std::fs::read(polled.path()).unwrap();
+        for step in 1..=10u64 {
+            let now = start + S / 4 + step * (S / 50);
+            assert_eq!(polled.take_at(4, burst, per_sec, now), Take::Denied);
+        }
+        assert_eq!(
+            std::fs::read(polled.path()).unwrap(),
+            probed,
+            "denials rewrote the record"
+        );
+        // Polled or not, the record grants after the same wait, and not before.
+        let later = start + S / 4 + S;
+        assert_eq!(
+            polled.tokens_now(burst, per_sec, later),
+            silent.tokens_now(burst, per_sec, later)
+        );
+        let minted_by_polling = polled.tokens_now(burst, per_sec, later);
+        assert_eq!(minted_by_polling, 8 + 2, "refill from the old anchor");
+    }
+
+    #[test]
     fn a_denial_stays_a_denial_when_the_record_cannot_be_rewritten() {
         let dir = tempfile::tempdir().unwrap();
         let now = 1_000 * S;
@@ -1422,7 +1498,7 @@ mod tests {
         cut: Option<usize>,
     ) {
         let locked = shared.lock().expect("lock");
-        let mut state = shared.read_state(&locked, burst, now).expect("read");
+        let (mut state, _) = shared.read_state(&locked, burst, now).expect("read");
         refill(&mut state, burst, per_sec, now);
         if state.tokens > 0 {
             state.tokens -= 1;
@@ -1443,7 +1519,7 @@ mod tests {
     /// [`commit_steps`]' stream.
     fn new_binary_take_cut(shared: &SharedBudget, burst: u32, per_sec: u32, now: u64, cut: usize) {
         let locked = shared.lock().expect("lock");
-        let mut state = shared.read_state(&locked, burst, now).expect("read");
+        let (mut state, _) = shared.read_state(&locked, burst, now).expect("read");
         refill(&mut state, burst, per_sec, now);
         if state.tokens > 0 {
             state.tokens -= 1;

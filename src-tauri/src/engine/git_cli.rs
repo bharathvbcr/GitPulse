@@ -2467,6 +2467,7 @@ impl BucketLevel {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn refusal_message(label: &str, refusal: Refusal) -> String {
     refusal_message_at(label, refusal, None)
 }
