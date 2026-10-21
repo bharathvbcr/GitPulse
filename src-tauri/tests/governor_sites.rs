@@ -111,7 +111,7 @@ fn admit_is_asked_only_where_a_launch_starts() {
 fn shed_is_read_only_by_the_spawn_gate() {
     assert_eq!(
         call_sites(&["sysload::shed("]),
-        ["src/engine/git_cli.rs:acquire_until"],
+        ["src/engine/git_cli.rs:acquire_judged"],
         "shedding rides the existing admission classes; a second reader of the verdict \
          would be a second scheduler"
     );
