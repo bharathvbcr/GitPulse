@@ -35,6 +35,9 @@ mod shared_budget;
 mod awaiting_adversarial_tests;
 
 #[cfg(test)]
+mod budget_churn_tests;
+
+#[cfg(test)]
 mod run_errors_adversarial_tests;
 
 pub(crate) mod hooks;
@@ -2401,7 +2404,54 @@ pub(crate) fn found_but_failed_detail(program: &str, out: &CapturedOutput) -> St
     }
 }
 
+/// Which of the gate's two rate buckets refused a spawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RefusingBucket {
+    /// This process's own bucket (the process gate).
+    Local,
+    /// The cross-process record every GitPulse process of the user draws from.
+    Shared,
+}
+
+/// What a refusing bucket held when it refused: it admits a spawn only while
+/// more than `floor` tokens remain (`0` for reactive work, the reserve kept
+/// for reactive reads for background work), and refills up to `burst`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BucketLevel {
+    pub bucket: RefusingBucket,
+    pub tokens: u32,
+    pub floor: u32,
+    pub burst: u32,
+}
+
+impl BucketLevel {
+    /// `shared bucket: 0 tokens, needs more than 48, burst 192`.
+    fn describe(&self) -> String {
+        let bucket = match self.bucket {
+            RefusingBucket::Local => "local",
+            RefusingBucket::Shared => "shared",
+        };
+        format!(
+            "{bucket} bucket: {} token(s), needs more than {}, burst {}",
+            self.tokens, self.floor, self.burst
+        )
+    }
+}
+
 pub(crate) fn refusal_message(label: &str, refusal: Refusal) -> String {
+    refusal_message_at(label, refusal, None)
+}
+
+/// [`refusal_message`], naming the bucket that refused and its level when the
+/// gate knows them. The text before the level is unchanged, so every reader
+/// that matches on the deferral (see [`is_deferred_under_load`]) reads it as
+/// before; the level is a parenthesised tail after the sentence.
+pub(crate) fn refusal_message_at(
+    label: &str,
+    refusal: Refusal,
+    level: Option<BucketLevel>,
+) -> String {
+    let by = level.map_or_else(String::new, |level| format!(" ({})", level.describe()));
     // A deferral is typed where it is written (see `crate::ipc_error`): the
     // command that returns this exact text carries the kind, and nothing reads
     // the marker back out of a message.
@@ -2415,12 +2465,12 @@ pub(crate) fn refusal_message(label: &str, refusal: Refusal) -> String {
             deadline.as_secs_f64()
         ),
         Refusal::Refused { waited } => deferred(format!(
-            "{label}{DEFERRED_MARKER}{:.3}s: the git spawn rate limit admitted nothing sooner",
+            "{label}{DEFERRED_MARKER}{:.3}s: the git spawn rate limit admitted nothing sooner{by}",
             waited.as_secs_f64()
         )),
         Refusal::Shed => deferred(format!(
             "{label}{DEFERRED_MARKER}0.000s: background work is shed while the git spawn rate \
-             budget is low"
+             budget is low{by}"
         )),
         Refusal::Pressure { reactive } => deferred(format!(
             "{label}{DEFERRED_MARKER}0.000s: {} work is shed while the host is under memory \
@@ -3356,16 +3406,30 @@ impl SpawnGate {
     /// to spend. Does file IO and may wait on a lock another process holds, so
     /// it must be called with the gate mutex released; the answer is applied
     /// by [`Self::settle_shared`].
-    fn ask_shared(&self, class: Admission) -> shared_budget::Take {
+    fn ask_shared(&self, class: Admission) -> (shared_budget::Take, Option<u32>) {
         let Some(shared) = &self.shared else {
-            return shared_budget::Take::Granted;
+            return (shared_budget::Take::Granted, None);
         };
-        let floor = if class == Admission::Background {
+        shared.take_leveled(self.floor_for(class), self.burst, self.refill_per_sec)
+    }
+
+    /// The tokens a spawn of `class` may not spend: none for reactive work,
+    /// the reserve for background work.
+    fn floor_for(&self, class: Admission) -> u32 {
+        if class == Admission::Background {
             self.background_reserve()
         } else {
             0
-        };
-        shared.take(floor, self.burst, self.refill_per_sec)
+        }
+    }
+
+    fn level_of(&self, bucket: RefusingBucket, tokens: u32, class: Admission) -> BucketLevel {
+        BucketLevel {
+            bucket,
+            tokens,
+            floor: self.floor_for(class),
+            burst: self.burst,
+        }
     }
 
     /// Applies [`Self::ask_shared`]'s answer under the gate lock: `true` when
@@ -3432,6 +3496,17 @@ impl SpawnGate {
         self.acquire_until(deadline, &|| false).ok()
     }
 
+    /// [`Self::acquire_judged`] without the level of the bucket that refused.
+    #[cfg(test)]
+    fn acquire_until(
+        &self,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<SpawnPermit<'_>, Refusal> {
+        self.acquire_judged(deadline, cancelled)
+            .map_err(|(refusal, _)| refusal)
+    }
+
     /// Tokens background work may not spend: a quarter of the burst, so
     /// optional work is shed while reactive reads still have budget.
     /// How long one token takes to refill: the soonest the shared record can
@@ -3444,11 +3519,14 @@ impl SpawnGate {
         self.burst / 4
     }
 
-    fn acquire_until(
+    /// Waits for a slot and a rate token until `deadline`. A refusal that was
+    /// the rate budget's carries the bucket that refused and its level, for
+    /// [`refusal_message_at`].
+    fn acquire_judged(
         &self,
         deadline: Instant,
         cancelled: &dyn Fn() -> bool,
-    ) -> Result<SpawnPermit<'_>, Refusal> {
+    ) -> Result<SpawnPermit<'_>, (Refusal, Option<BucketLevel>)> {
         let class = current_admission();
         let background = class == Admission::Background;
         let interactive = class == Admission::Interactive;
@@ -3468,7 +3546,7 @@ impl SpawnGate {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .counters[class.index()]
                 .count(refusal);
-                return Err(refusal);
+                return Err((refusal, None));
             }
         }
         let rate_limited = self.refill_per_sec != u32::MAX
@@ -3509,6 +3587,11 @@ impl SpawnGate {
         // One that is never spent (the waiter is cancelled or times out first)
         // is lost to the shared budget, which has no way to take it back.
         let mut shared_token_held = false;
+        // What the shared record held the last time it denied this waiter, and
+        // which bucket was short the last time this waiter was refused a
+        // token: what a refusal names.
+        let mut shared_denial: Option<BucketLevel> = None;
+        let mut short: Option<BucketLevel> = None;
         let outcome = loop {
             // The cancel check is the caller's code. Under the gate lock, a
             // check that took a lock of its own or spawned anything would
@@ -3523,19 +3606,25 @@ impl SpawnGate {
             let now = Instant::now();
             let remaining = deadline.saturating_duration_since(now);
             if is_cancelled {
-                break Err(Refusal::Cancelled);
+                break Err((Refusal::Cancelled, None));
             }
             if remaining.is_zero() {
                 // Whatever the caller was last waiting for is the cause. A
                 // short deadline that ran out while the rate budget was spent
                 // is a deferral, not a slot that never came free.
                 break Err(match token_wait_started {
-                    Some(_) => Refusal::Refused {
-                        waited: now.saturating_duration_since(entered),
-                    },
-                    None => Refusal::TimedOut {
-                        deadline: deadline.saturating_duration_since(entered),
-                    },
+                    Some(_) => (
+                        Refusal::Refused {
+                            waited: now.saturating_duration_since(entered),
+                        },
+                        short,
+                    ),
+                    None => (
+                        Refusal::TimedOut {
+                            deadline: deadline.saturating_duration_since(entered),
+                        },
+                        None,
+                    ),
                 });
             }
             // Optional work gets at most a quarter of the slots (at least
@@ -3589,7 +3678,7 @@ impl SpawnGate {
                 // behind a background re-poll. Released like the cancel check
                 // above, and everything is re-read once the answer is in.
                 drop(state);
-                let taken = self.ask_shared(class);
+                let (taken, shared_level) = self.ask_shared(class);
                 state = self
                     .state
                     .lock()
@@ -3605,6 +3694,8 @@ impl SpawnGate {
                 } else {
                     tokens_ok = false;
                     next_shared_ask = Some(Instant::now() + self.refill_interval());
+                    shared_denial = shared_level
+                        .map(|tokens| self.level_of(RefusingBucket::Shared, tokens, class));
                 }
             }
             // An awaiting background reader counts in `waiting_background`
@@ -3622,22 +3713,31 @@ impl SpawnGate {
                 }
             }
             if !tokens_ok {
+                // The process bucket is short first; past it, the record is.
+                short = if tokens_available(&state) {
+                    shared_denial
+                } else {
+                    Some(self.level_of(RefusingBucket::Local, state.tokens, class))
+                };
                 // Background is shed at once: it is the first thing to go
                 // under load, and waiting would only hold a pool thread.
                 // Unless this process asked to wait (an agent's MCP read: see
                 // [`run_process_awaiting_background_budget`]), which then
                 // waits like a reactive read, still above the reserve.
                 if background && !awaits_budget {
-                    break Err(Refusal::Shed);
+                    break Err((Refusal::Shed, short));
                 }
                 let started = *token_wait_started.get_or_insert(now);
                 let waited = now.saturating_duration_since(started);
                 // A storm that has spent the burst must fail the spawn instead
                 // of occupying a blocking-pool thread for the whole git timeout.
                 if waited >= SPAWN_QUEUE_BUDGET {
-                    break Err(Refusal::Refused {
-                        waited: now.saturating_duration_since(entered),
-                    });
+                    break Err((
+                        Refusal::Refused {
+                            waited: now.saturating_duration_since(entered),
+                        },
+                        short,
+                    ));
                 }
             } else {
                 token_wait_started = None;
@@ -3645,14 +3745,23 @@ impl SpawnGate {
             if state.in_flight < self.limit && eligible && tokens_ok {
                 break Ok(());
             }
+            // Wake when the next token is due rather than on a fixed poll: a
+            // waiter refused a token has nothing to learn before then. The
+            // wait is still capped at the cancellation poll, and at the
+            // deadline.
+            let nap = match (tokens_ok, next_shared_ask) {
+                (false, Some(at)) => at.saturating_duration_since(now).max(MIN_TOKEN_NAP),
+                (false, None) if rate_limited => self.refill_interval().max(MIN_TOKEN_NAP),
+                _ => CANCEL_POLL,
+            };
             let (next, _) = self
                 .released
-                .wait_timeout(state, remaining.min(Duration::from_millis(50)))
+                .wait_timeout(state, remaining.min(nap.min(CANCEL_POLL)))
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state = next;
         };
         reservation.give_back(&mut state);
-        if let Err(refusal) = outcome {
+        if let Err((refusal, level)) = outcome {
             state.counters[class.index()].count(refusal);
             let counters = state.counters;
             let sharing =
@@ -3664,9 +3773,9 @@ impl SpawnGate {
                 // Rendered only when the throttle lets a line out: refusals
                 // come in storms, and sorting the labels under the gate lock
                 // for every one would tax exactly the path being diagnosed.
-                log_refusals(&counters, &sharing, || self.label_report());
+                log_refusals(&counters, &sharing, level, || self.label_report());
             }
-            return Err(refusal);
+            return Err((refusal, level));
         }
         state.in_flight += 1;
         if background {
@@ -3826,6 +3935,12 @@ const SPAWN_PER_SEC: u32 = 8;
 /// refill interval, short enough that a saturated storm does not pin the
 /// blocking pool until the 90s git deadline.
 pub(crate) const SPAWN_QUEUE_BUDGET: Duration = Duration::from_secs(2);
+
+/// The longest a waiter sleeps before it re-checks for cancellation.
+const CANCEL_POLL: Duration = Duration::from_millis(50);
+/// The shortest a waiter naps for a token that is due, so one already due
+/// cannot spin the loop.
+const MIN_TOKEN_NAP: Duration = Duration::from_millis(1);
 
 pub(crate) fn production_spawn_rate() -> (u32, u32) {
     (SPAWN_BURST, SPAWN_PER_SEC)
@@ -4366,7 +4481,12 @@ fn close_shared_read(key: &SharedReadKey, flight: &Arc<SharedRead>) {
 /// failed action was a deferred refresh, shed background work or a timeout,
 /// and how much was admitted meanwhile. A real log entry rather than a line
 /// appended at export: the export's "empty log" verdict must stay true.
-fn log_refusals(counters: &[AdmissionCounters; 3], sharing: &str, top: impl FnOnce() -> String) {
+fn log_refusals(
+    counters: &[AdmissionCounters; 3],
+    sharing: &str,
+    refused_by: Option<BucketLevel>,
+    top: impl FnOnce() -> String,
+) {
     static LAST: Mutex<Option<Instant>> = Mutex::new(None);
     let now = Instant::now();
     {
@@ -4378,9 +4498,13 @@ fn log_refusals(counters: &[AdmissionCounters; 3], sharing: &str, top: impl FnOn
         }
         *last = Some(now);
     }
+    let refused_by = refused_by.map_or_else(
+        || "last refusal named no bucket".to_string(),
+        |level| format!("last refusal: {}", level.describe()),
+    );
     log::warn!(
         target: "spawn_gate",
-        "{} | {}",
+        "{} | {refused_by} | {}",
         format_gate_report(counters, sharing),
         top()
     );
@@ -4870,9 +4994,9 @@ fn run_admitted_inner(
     };
     let _permit = Arc::new(
         with_admission(class, || {
-            gate.acquire_until(queue_deadline, &|| observer.cancelled())
+            gate.acquire_judged(queue_deadline, &|| observer.cancelled())
         })
-        .map_err(|refusal| refusal_message(label, refusal))?,
+        .map_err(|(refusal, level)| refusal_message_at(label, refusal, level))?,
     );
     gate.note_admitted_label(label);
     on_admitted();
