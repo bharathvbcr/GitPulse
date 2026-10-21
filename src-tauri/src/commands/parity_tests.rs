@@ -526,3 +526,41 @@ fn adv_a_name_the_writer_refuses_is_never_judged() {
         s.judged
     );
 }
+
+/// The commit-graph write (Owner Decision 3): the line the Storage panel previewed
+/// is the line the gate judged and the line git was started with, a gate refusal
+/// runs nothing, and a second click on the now-fresh graph is refused.
+#[cfg(unix)]
+#[test]
+fn the_commit_graph_write_runs_the_previewed_and_judged_line() {
+    let fx = Fixture::new(DENY);
+    let repo = fx.repo.clone();
+    let preview = GitWriter::commit_graph_write_plan(&repo).expect("a write is offered");
+    let (result, seen) = fx.observe(cmd_commit_graph_write(repo.clone(), preview.argv.clone()));
+    assert_blocked(result);
+    seen.assert_nothing_mutated("denied commit-graph write");
+    assert!(
+        !seen
+            .spawned
+            .iter()
+            .any(|argv| argv.first().map(String::as_str) == Some("commit-graph")),
+        "a denied write still spawned {:#?}",
+        seen.spawned
+    );
+    assert!(!fx.path().join(".git/objects/info/commit-graph").exists());
+
+    drop(fx);
+    let fx = Fixture::new(ALLOW);
+    let repo = fx.repo.clone();
+    let preview = GitWriter::commit_graph_write_plan(&repo).expect("a write is offered");
+    let (result, seen) = fx.observe(cmd_commit_graph_write(repo.clone(), preview.argv.clone()));
+    let written = result.expect("the write runs").output;
+    assert!(!written.cancelled);
+    // The gate row and the writer's own journal row carry the same line.
+    seen.assert_run_as_judged("commit-graph write", 2);
+    assert!(seen.judged.iter().all(|judged| *judged == preview.argv));
+    assert!(fx.path().join(".git/objects/info/commit-graph").exists());
+
+    let again = tauri::async_runtime::block_on(cmd_commit_graph_write(repo, preview.argv));
+    assert!(again.is_err(), "a fresh graph offers no second write");
+}

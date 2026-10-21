@@ -7,6 +7,7 @@ pub mod deadbranch;
 pub mod git_cli;
 pub mod git_reader;
 pub mod git_writer;
+pub mod object_quarantine;
 pub mod portless;
 pub mod provenance;
 pub mod ref_cache;

@@ -180,6 +180,21 @@ pub(crate) fn repository_status(repo_path: &str) -> Result<super::LedgerStatus, 
     }
 }
 
+/// Adopts the repository's ledger after its identity record refused it for
+/// sitting in another directory than the one it was anchored in (a cross-device
+/// move, a restore, a copy whose source is gone). A person's action: `confirm`
+/// must be an approval the person gave, `actor` names who gave it, and the
+/// caller has already checked repository trust. Returns the earlier locations
+/// the ledger now accepts. See `anchor::adopt` for the rule and the audit row.
+pub(crate) fn adopt_ledger(
+    repo_path: &str,
+    actor: &str,
+    confirm: &dyn Fn(&[String]) -> bool,
+) -> Result<Vec<String>, LedgerError> {
+    let family = resolve_address(repo_path, repo_path)?;
+    super::anchor::adopt(&family.address.anchor, actor, confirm)
+}
+
 /// [`repository_status`] for a caller that must not create or migrate anything.
 ///
 /// Two things are skipped relative to the creating path: the legacy

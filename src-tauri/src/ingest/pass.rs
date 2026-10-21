@@ -54,6 +54,9 @@ thread_local! {
 struct Participant {
     path: String,
     offsets: HashMap<String, u64>,
+    /// The fingerprint stored with each offset, where there is one: what tells
+    /// the file this cursor stopped in from one rewritten past that offset.
+    fingerprints: HashMap<String, String>,
     baseline: String,
     baseline_ms: u64,
     /// Its bind and unbind rows, read once: each call is stamped with the task
@@ -71,6 +74,192 @@ struct Owed {
     start: u64,
     /// Whether its baseline floor applies (only to a file it never read).
     floored: bool,
+    /// The file was rewritten under this cursor: the bytes before the offset
+    /// no longer match the fingerprint stored with it. The read starts over from
+    /// 0 and the cursor is rewritten even if it lands on the same offset.
+    rotated: bool,
+}
+
+/// The first `head` bytes of the file at `path`, and the `tail` bytes that end
+/// at `offset`.
+fn read_fingerprint_bytes(
+    path: &std::path::Path,
+    offset: u64,
+    head: usize,
+    tail: usize,
+) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    use std::io::{Read, Seek};
+    #[cfg(test)]
+    FINGERPRINT_OPENS.with(|opens| opens.set(opens.get() + 1));
+    let before = offset
+        .checked_sub(tail as u64)
+        .ok_or(std::io::ErrorKind::UnexpectedEof)?;
+    let mut file = std::fs::File::open(path)?;
+    let mut head_bytes = vec![0u8; head];
+    file.read_exact(&mut head_bytes)?;
+    let mut tail_bytes = vec![0u8; tail];
+    file.seek(std::io::SeekFrom::Start(before))?;
+    file.read_exact(&mut tail_bytes)?;
+    Ok((head_bytes, tail_bytes))
+}
+
+/// The fingerprint to store with a cursor that now stands at `offset` of the
+/// file at `path` ([`ledger::cursor_fingerprint`]), read from the file as it is
+/// now. `None` when it cannot be read or `offset` is 0: the cursor is then
+/// stored with none and checked by length alone, as it was before they existed.
+fn fingerprint_at(
+    path: &std::path::Path,
+    offset: u64,
+    stat: Option<ledger::FileStat>,
+) -> Option<String> {
+    let n = usize::try_from(offset.min(ledger::CURSOR_FINGERPRINT_BYTES as u64)).ok()?;
+    let (head, tail) = read_fingerprint_bytes(path, offset, n, n).ok()?;
+    ledger::cursor_fingerprint(&head, &tail, stat)
+}
+
+/// A file's length and mtime in nanoseconds, as a fingerprint records them;
+/// `None` when the filesystem will not say, which leaves the cursor's
+/// fingerprint without a stat and so re-hashed on every pass.
+fn file_stat(meta: &std::fs::Metadata) -> Option<ledger::FileStat> {
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some((meta.len(), u64::try_from(mtime.as_nanos()).ok()?))
+}
+
+// Files the fingerprint check has opened on this thread: what the "an
+// unchanged transcript costs a stat" tests count.
+#[cfg(test)]
+thread_local! {
+    pub(super) static FINGERPRINT_OPENS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether the bytes of the file at `path` that `fingerprint` covers are still
+/// the ones it was taken from.
+///
+/// False only for a positive mismatch (different bytes, or a file that ends
+/// before the offset). A fingerprint this build cannot read, or a file that
+/// cannot be read right now, is not evidence of a rewrite: reading again
+/// from the start would record every line twice, and the open that follows
+/// reports a file that really cannot be read.
+///
+/// `now` is the file's stat as the pass already read it. A fingerprint that
+/// recorded a stat and finds the same one is a match with no open: the file has
+/// not been written since the cursor was. Any difference (a rewrite that kept
+/// the size but moved the mtime included) re-hashes the bytes. One without a
+/// stat always re-hashes.
+///
+/// A mismatch is not yet a rotation: the cursor's tail window (the bytes just
+/// before its offset, which the fingerprint holds a digest of) is searched for in
+/// the new file. A file that kept the old lines (a record prepended, an early
+/// line edited, anything appended) holds it, and the cursor resumes after it;
+/// only a file that does not is read again from the start.
+fn standing_of(
+    path: &std::path::Path,
+    now: Option<ledger::FileStat>,
+    offset: u64,
+    fingerprint: &str,
+) -> Standing {
+    let Some(parts) = ledger::parse_cursor_fingerprint(fingerprint) else {
+        return Standing::Holds;
+    };
+    if parts.stat.is_some() && parts.stat == now {
+        return Standing::Holds;
+    }
+    match read_fingerprint_bytes(path, offset, parts.head, parts.tail) {
+        Ok((head, tail)) if ledger::cursor_fingerprint_holds(fingerprint, &parts, &head, &tail) => {
+            Standing::Holds
+        }
+        Ok(_) => rebase(path, offset, &parts).map_or(Standing::Rotated, Standing::Rebased),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            rebase(path, offset, &parts).map_or(Standing::Rotated, Standing::Rebased)
+        }
+        Err(_) => Standing::Holds,
+    }
+}
+
+/// How far into a file the search for a moved cursor looks, in bytes. Past it
+/// the cursor is called rotated and read from the start: a duplicate row is
+/// recoverable, an unbounded read of a transcript that may be hundreds of
+/// megabytes is not.
+const REBASE_SEARCH_BYTES: u64 = 1 << 20;
+
+/// Where a cursor that stood at `offset` stands in the file at `path` now: the
+/// end of the line-ending window of `parts.tail` bytes whose digest is the
+/// fingerprint's, nearest `offset` within the first [`REBASE_SEARCH_BYTES`].
+/// `None` for a fingerprint with no tail digest or a window not found.
+fn rebase(path: &std::path::Path, offset: u64, parts: &ledger::FingerprintParts) -> Option<u64> {
+    use std::io::Read;
+    let wanted = parts.tail_hash?;
+    let width = parts.tail;
+    let mut buffer = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(REBASE_SEARCH_BYTES + width as u64)
+        .read_to_end(&mut buffer)
+        .ok()?;
+    // A cursor stands at a line's end, so the window ends in a newline: only
+    // those positions are hashed.
+    (width..=buffer.len())
+        .filter(|end| {
+            buffer[end - 1] == b'\n'
+                && ledger::cursor_tail_hash(&buffer[end - width..*end]) == wanted
+        })
+        .map(|end| end as u64)
+        .min_by_key(|end| end.abs_diff(offset))
+}
+
+/// Where a cursor stands against the file as it is now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Standing {
+    /// The bytes before it are the ones it was taken from (or it cannot be
+    /// checked): it is read from its offset.
+    Holds,
+    /// The file changed before the cursor but still holds the lines the cursor
+    /// had consumed, now ending at this offset: it resumes there.
+    Rebased(u64),
+    /// The file is not the one the cursor stopped in: it is read from the start.
+    Rotated,
+}
+
+/// [`standing_of`] for one file, asked once per distinct cursor: every
+/// participant of a family usually holds the same offset.
+struct Probe<'a> {
+    path: &'a std::path::Path,
+    /// The file's stat as the pass read it before anything else.
+    now: Option<ledger::FileStat>,
+    answers: HashMap<(u64, String), Standing>,
+}
+
+impl Probe<'_> {
+    fn standing_at(&mut self, offset: u64, fingerprint: &str) -> Standing {
+        // The common answer, with no allocation: a fingerprint that recorded a
+        // stat and finds it unchanged.
+        if let Some(parts) = ledger::parse_cursor_fingerprint(fingerprint) {
+            if parts.stat.is_some() && parts.stat == self.now {
+                return Standing::Holds;
+            }
+        }
+        let (path, now) = (self.path, self.now);
+        *self
+            .answers
+            .entry((offset, fingerprint.to_string()))
+            .or_insert_with(|| standing_of(path, now, offset, fingerprint))
+    }
+
+    /// Where `participant`'s cursor on `file_key` stands against this file: no
+    /// fingerprint (a cursor from before they existed) is taken as holding.
+    fn standing(&mut self, participant: &Participant, file_key: &str) -> Standing {
+        match (
+            participant.offsets.get(file_key),
+            participant.fingerprints.get(file_key),
+        ) {
+            (Some(offset), Some(fingerprint)) => self.standing_at(*offset, fingerprint),
+            _ => Standing::Holds,
+        }
+    }
 }
 
 /// Runs one pass for `trigger` and the `siblings` that share its ledger,
@@ -176,7 +365,13 @@ fn ingest_family(
         };
         let len = meta.len();
         let modified_ms = super::modified_ms(&meta);
-        let owed = owed_on(&participants, &file_key, len, modified_ms);
+        let stat = file_stat(&meta);
+        let mut probe = Probe {
+            path: &path,
+            now: stat,
+            answers: HashMap::new(),
+        };
+        let owed = owed_on(&participants, &file_key, len, modified_ms, &mut probe);
         // Nothing appended since every participant's last read. This is what
         // keeps a corpus no agent touched from being re-read every call.
         let Some(start) = owed.iter().map(|o| o.start).min() else {
@@ -302,6 +497,7 @@ fn ingest_family(
                                             &file_key,
                                             line.offset,
                                             len,
+                                            &mut probe,
                                         ) {
                                             continue;
                                         }
@@ -336,6 +532,12 @@ fn ingest_family(
         BYTES_READ.with(|read| read.set(read.get() + reader.bytes_read()));
 
         let end = start + consumed;
+        // Taken from the file as it stands once the lines are read, and only
+        // when a cursor is to be written at all.
+        // The stat recorded with it is the one taken before the read: a file
+        // written during or after the read then differs on the next pass and is
+        // re-hashed, never taken for unchanged.
+        let fingerprint = fingerprint_at(&path, end, stat);
         let mut has_events = false;
         for (owes, drafts) in owed.iter().zip(drafts) {
             // A pass cut before it reached this participant's cursor moved
@@ -343,7 +545,9 @@ fn ingest_family(
             if end < owes.start {
                 continue;
             }
-            if owes.from != Some(end) && !(owes.from.is_none() && end == 0) {
+            // A rotated cursor is rewritten even where the new file ends at the
+            // old offset, or it would read as rotated again on every pass.
+            if (owes.from != Some(end) || owes.rotated) && !(owes.from.is_none() && end == 0) {
                 has_events |= !drafts.is_empty();
                 participants[owes.participant]
                     .pending
@@ -351,6 +555,7 @@ fn ingest_family(
                         file_key: file_key.clone(),
                         from: owes.from,
                         to: end,
+                        fingerprint: fingerprint.clone(),
                         drafts,
                     });
             }
@@ -362,14 +567,27 @@ fn ingest_family(
         for owner in touched {
             let owner = &mut owners.hosted[owner];
             let current = owner.offsets.get(&file_key).copied();
-            if current.is_none_or(|current| current < end || current > len) {
+            // Or rewritten under it: its fingerprint no longer matches.
+            let rotated = probe.standing(owner, &file_key) != Standing::Holds;
+            if rotated || current.is_none_or(|current| current < end || current > len) {
                 owner.pending.push(ledger::TranscriptAdvance {
                     file_key: file_key.clone(),
                     from: current,
                     to: end,
+                    fingerprint: fingerprint.clone(),
                     drafts: Vec::new(),
                 });
                 owner.offsets.insert(file_key.clone(), end);
+                match &fingerprint {
+                    Some(fingerprint) => {
+                        owner
+                            .fingerprints
+                            .insert(file_key.clone(), fingerprint.clone());
+                    }
+                    None => {
+                        owner.fingerprints.remove(&file_key);
+                    }
+                }
             }
         }
         // Events are committed as soon as their transcript is read, so a
@@ -451,16 +669,20 @@ fn hosted_owner(
     if !live && owners.departed >= MAX_DEPARTED_OWNERS {
         return None;
     }
-    let offsets = match ledger::transcript_progress_many(ledger_repo, &[root]) {
-        Ok(mut progress) => progress.pop().map(|p| p.offsets).unwrap_or_default(),
+    let (offsets, fingerprints) = match ledger::transcript_progress_many(ledger_repo, &[root]) {
+        Ok(mut progress) => progress
+            .pop()
+            .map(|p| (p.offsets, p.fingerprints))
+            .unwrap_or_default(),
         Err(e) => {
             out.error = format!("an owner's transcript progress could not be read: {e}");
-            HashMap::new()
+            (HashMap::new(), HashMap::new())
         }
     };
     owners.hosted.push(Participant {
         path: root.to_string(),
         offsets,
+        fingerprints,
         baseline: String::new(),
         baseline_ms: 0,
         history: load_history(ledger_repo, root, out),
@@ -492,11 +714,25 @@ fn load_history(ledger_repo: &str, worktree: &str, out: &mut CatchUp) -> Binding
 /// pass of its own or hosted by an earlier one, so recording it again would
 /// double it. A cursor past the file's `len` is stale (the file was rewritten
 /// shorter) and consumed nothing of it.
-fn consumed_by(owner: &Participant, file_key: &str, offset: u64, len: u64) -> bool {
-    owner
-        .offsets
-        .get(file_key)
-        .is_some_and(|consumed| *consumed > offset && *consumed <= len)
+/// A cursor whose fingerprint no longer matches (the file was rewritten past
+/// it, however long the new one is) consumed nothing of this file either.
+fn consumed_by(
+    owner: &Participant,
+    file_key: &str,
+    offset: u64,
+    len: u64,
+    probe: &mut Probe<'_>,
+) -> bool {
+    let Some(consumed) = owner.offsets.get(file_key) else {
+        return false;
+    };
+    match probe.standing(owner, file_key) {
+        Standing::Holds => *consumed > offset && *consumed <= len,
+        // The file moved the lines the cursor had consumed: those before where
+        // they now end are consumed, and nothing after.
+        Standing::Rebased(resume) => offset < resume,
+        Standing::Rotated => false,
+    }
 }
 
 /// Every participant's progress, with the baseline floor frozen for any that
@@ -559,6 +795,7 @@ fn participants(
                 Participant {
                     path: (*path).to_string(),
                     offsets: progress.offsets,
+                    fingerprints: progress.fingerprints,
                     baseline_ms: super::iso_to_millis(&baseline),
                     baseline,
                     history: load_history(ledger_repo, path, out),
@@ -576,17 +813,33 @@ fn owed_on(
     file_key: &str,
     len: u64,
     modified_ms: Option<u64>,
+    probe: &mut Probe<'_>,
 ) -> Vec<Owed> {
     participants
         .iter()
         .enumerate()
         .filter_map(|(index, participant)| {
             let from = participant.offsets.get(file_key).copied();
+            // A file as long as the cursor, or longer, is not thereby the file
+            // the cursor stopped in: the bytes before it must still be the ones
+            // its fingerprint was taken from. Only then is "at the end" or "past
+            // the cursor" a statement about this file.
+            let standing = if from.is_some_and(|done| done <= len) {
+                probe.standing(participant, file_key)
+            } else {
+                Standing::Holds
+            };
+            let rotated = standing != Standing::Holds;
             // `floored` applies only to a transcript this worktree has never
             // read under offsets: calls at or before the frozen baseline were
             // the old watermark's to record, and reading them again would
             // duplicate them.
             let (start, floored) = match from {
+                Some(_) if standing == Standing::Rotated => (0, false),
+                Some(_) if rotated => match standing {
+                    Standing::Rebased(resume) => (resume, false),
+                    _ => (0, false),
+                },
                 Some(done) if done == len => return None,
                 Some(done) if done < len => (done, false),
                 // Shorter than what was read: rewritten rather than appended
@@ -606,6 +859,7 @@ fn owed_on(
                 from,
                 start,
                 floored,
+                rotated,
             })
         })
         .collect()

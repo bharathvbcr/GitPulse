@@ -1099,6 +1099,205 @@ fn batch_divergence(
     Some(out)
 }
 
+/// How far one checkout's HEAD commit is from the default base: commits it has
+/// that the base lacks (`ahead`) and commits the base has that it lacks
+/// (`behind`). Counted from the commit, so a detached HEAD has them too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeadDivergence {
+    pub ahead: u32,
+    pub behind: u32,
+}
+
+/// Most `rev-list` reads (cache misses) one [`measure_head_divergence`] pass
+/// makes. A HEAD past it is reported unmeasured, not read.
+pub const MAX_HEAD_DIVERGENCE_MISSES: usize = 8;
+
+/// Most `(repository, head, base)` answers remembered. The key is immutable (a
+/// commit's ancestry never changes), so an entry is never stale; the bound
+/// only keeps a long-lived process from growing with every commit it has seen.
+const HEAD_DIVERGENCE_CACHE_CAPACITY: usize = 1024;
+
+/// `(repository, shallow boundary, head, base)`. Ancestry is immutable only
+/// while history is whole: a shallow clone's counts stop at its boundary, and
+/// deepening it changes them for the same head and base, so the boundary file's
+/// state is part of the key.
+type DivergenceKey = (PathBuf, String, String, String);
+
+/// The state of `<common dir>/shallow` as a key: empty when absent, otherwise
+/// its length and modification time (git rewrites the file whenever the
+/// boundary moves). Read without spawning. `None` when the common directory
+/// or the file could not be read, in which case nothing is cached or served.
+fn shallow_token(repo: &Path) -> Option<(String, bool)> {
+    let file = resolve_git_common_dir(repo).ok()?.join("shallow");
+    match std::fs::metadata(&file) {
+        Ok(meta) => {
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |since| since.as_nanos());
+            Some((format!("{}:{modified}", meta.len()), true))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some((String::new(), false)),
+        Err(_) => None,
+    }
+}
+
+fn head_divergence_cache() -> &'static Mutex<LruMap<DivergenceKey, HeadDivergence>> {
+    static CACHE: OnceLock<Mutex<LruMap<DivergenceKey, HeadDivergence>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(LruMap::new(HEAD_DIVERGENCE_CACHE_CAPACITY)))
+}
+
+/// What [`measure_head_divergence`] established.
+#[derive(Debug, Default)]
+pub struct HeadDivergences {
+    /// Divergence by full HEAD oid, for every oid that was measured.
+    pub by_head: HashMap<String, HeadDivergence>,
+    /// Why anything is missing from `by_head`, always starting `unmeasured:`:
+    /// no default base resolved, a read failed, the per-pass cap of
+    /// [`MAX_HEAD_DIVERGENCE_MISSES`] was spent, or the deadline passed. `None`
+    /// when every asked oid has an entry, so an absent count is never mistaken
+    /// for zero.
+    pub unread: Option<String>,
+    /// The repository is a shallow clone: every count is bounded by the clone
+    /// depth and is not the whole history's.
+    pub shallow: bool,
+}
+
+/// Measures each distinct commit in `heads` against the repository's default
+/// base, keyed by oid: a detached worktree has no branch for
+/// [`measure_main_divergence`] to name, and worktrees on one commit share one
+/// read. The base is the one default-base owner
+/// ([`crate::engine::git_reader::default_base`]), the same answer the branch
+/// list measures against.
+///
+/// An answer already known for the immutable `(head, base)` pair costs no
+/// process. A miss is one `rev-list --left-right --count` through the shared
+/// spawn gate (so it spends the same budget as every other read), at most
+/// [`MAX_HEAD_DIVERGENCE_MISSES`] per pass and each given what the deadline
+/// has left; every HEAD past either limit is unmeasured.
+pub fn measure_head_divergence(
+    repo: &Path,
+    heads: &[&str],
+    deadline: &ScanDeadline,
+) -> HeadDivergences {
+    measure_head_divergence_capped(repo, heads, deadline, MAX_HEAD_DIVERGENCE_MISSES)
+}
+
+/// [`measure_head_divergence`] with the per-pass miss cap as an argument, so
+/// the cold-cache-over-cap case is reachable without nine worktrees.
+pub(crate) fn measure_head_divergence_capped(
+    repo: &Path,
+    heads: &[&str],
+    deadline: &ScanDeadline,
+    max_misses: usize,
+) -> HeadDivergences {
+    let mut out = HeadDivergences::default();
+    let mut distinct: Vec<&str> = Vec::new();
+    for head in heads.iter().copied().filter(|h| is_full_oid(h)) {
+        if !distinct.contains(&head) {
+            distinct.push(head);
+        }
+    }
+    if distinct.is_empty() {
+        return out;
+    }
+    let base_oid = match read_base(repo) {
+        Ok(Some((_, oid))) => oid,
+        Ok(None) => {
+            out.unread =
+                Some("unmeasured: the repository has no default base to measure against".into());
+            return out;
+        }
+        Err(reason) => {
+            out.unread = Some(format!(
+                "unmeasured: the default base could not be read: {reason}"
+            ));
+            return out;
+        }
+    };
+    let mut misses = 0usize;
+    let mut unread = 0usize;
+    let mut first_reason = None;
+    let boundary = shallow_token(repo);
+    out.shallow = boundary.as_ref().is_some_and(|(_, shallow)| *shallow);
+    for head in &distinct {
+        let key = boundary.as_ref().map(|(token, _)| {
+            (
+                repo.to_path_buf(),
+                token.clone(),
+                (*head).to_string(),
+                base_oid.clone(),
+            )
+        });
+        let cached = key.as_ref().and_then(|key| {
+            head_divergence_cache()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(key)
+                .copied()
+        });
+        if let Some(known) = cached {
+            out.by_head.insert((*head).to_string(), known);
+            continue;
+        }
+        let reason = if misses >= max_misses {
+            format!("past the per-pass limit of {max_misses} reads")
+        } else if deadline.expired() {
+            "the deadline passed".to_string()
+        } else {
+            misses += 1;
+            match left_right_counts(repo, &base_oid, head, deadline.remaining()) {
+                Ok(counts) => {
+                    if let Some(key) = key {
+                        head_divergence_cache()
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .insert(key, counts);
+                    }
+                    out.by_head.insert((*head).to_string(), counts);
+                    continue;
+                }
+                Err(reason) => reason,
+            }
+        };
+        unread += 1;
+        first_reason.get_or_insert(reason);
+    }
+    if let Some(reason) = first_reason {
+        out.unread = Some(format!(
+            "unmeasured: {unread} of {} distinct HEAD commits not measured: {reason}",
+            distinct.len()
+        ));
+    }
+    out
+}
+
+fn left_right_counts(
+    repo: &Path,
+    base_oid: &str,
+    head_oid: &str,
+    timeout: Duration,
+) -> Result<HeadDivergence, String> {
+    let stdout = git_text_with_timeout(
+        repo,
+        &[
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{base_oid}...{head_oid}"),
+        ],
+        timeout,
+    )?;
+    let mut parts = stdout.split_whitespace();
+    let behind = parts.next().and_then(|n| n.parse().ok());
+    let ahead = parts.next().and_then(|n| n.parse().ok());
+    match (ahead, behind) {
+        (Some(ahead), Some(behind)) => Ok(HeadDivergence { ahead, behind }),
+        _ => Err(format!("unreadable rev-list counts: {:?}", stdout.trim())),
+    }
+}
+
 /// Lists every worktree of the repository, main entry first, with dirty-file
 /// counts, diff deltas, and detected portless routes for the worktrees closest to the front.
 pub fn list_worktrees(repo_path: &str) -> Result<Vec<WorktreeInfo>, String> {

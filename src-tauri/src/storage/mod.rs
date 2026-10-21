@@ -1626,7 +1626,19 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
         reclaim,
         reclaim_summary,
         commit_graph: match crate::engine::git_cli::resolve_git_dir(&repo) {
-            Ok(private_dir) => commit_graph::inspect(&repo, &private_dir, &git_dir),
+            Ok(private_dir) => {
+                let (major, minor, _) = crate::engine::git_writer::COMMIT_GRAPH_CHANGED_PATHS_GIT;
+                let mut report = commit_graph::gated_on_git(
+                    commit_graph::inspect(&repo, &private_dir, &git_dir),
+                    crate::engine::git_cli::git_supports(
+                        crate::engine::git_writer::COMMIT_GRAPH_CHANGED_PATHS_GIT,
+                    ),
+                    &format!("{major}.{minor}"),
+                );
+                report.write_in_flight =
+                    crate::engine::git_writer::commit_graph_write_running(&git_dir);
+                report
+            }
             Err(reason) => commit_graph::CommitGraphReport {
                 note: Some(format!("the git directory could not be resolved: {reason}")),
                 ..commit_graph::CommitGraphReport::default()

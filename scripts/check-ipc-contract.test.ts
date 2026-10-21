@@ -309,11 +309,15 @@ describe("annotated but unregistered commands", () => {
     // with cmd_verify_commit_signature, 282 with cmd_create_file, 283
     // with cmd_terminal_conversations, 284 with cmd_checkout_detached, and
     // 285 with cmd_terminal_backend, and 288 with the Claude key commands
-    // (cmd_claude_key_status, cmd_claude_key_save, cmd_claude_key_delete);
+    // (cmd_claude_key_status, cmd_claude_key_save, cmd_claude_key_delete), then
+    // 287 when cmd_stash_pop was removed (UI pops go through cmd_stash_action),
+    // then 288 with cmd_adopt_ledger (a person adopts a refused ledger), and
+    // 291 with the commit-graph write commands (cmd_commit_graph_write_plan,
+    // cmd_commit_graph_write, cmd_commit_graph_write_cancel);
     // `bun run check:ipc`
     // prints all three numbers, so a bump made without re-running it will not
     // agree.
-    expect(found.size).toBe(288);
+    expect(found.size).toBe(291);
     expect(found.has("cmd_terminal_incidents")).toBe(true);
     expect(found.has("cmd_terminal_conversations")).toBe(true);
     expect(found.has("cmd_terminal_backend")).toBe(true);

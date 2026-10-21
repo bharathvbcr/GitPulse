@@ -22,6 +22,20 @@ export interface WorktreeSummary {
   operation_kind: string;
   /** False when the parked-operation probe did not run. */
   operation_ok: boolean;
+  /** The commit this checkout is on, detached or not. Null when none was named. */
+  head?: string | null;
+  /**
+   * Commits on `head` that the default base lacks: committed-but-unmerged
+   * work, which `dirty_files` stops showing once a lane commits. Null is
+   * "not measured" (see `divergence_note`), never zero.
+   */
+  ahead?: number | null;
+  /** Commits on the default base that `head` lacks. Null when not measured. */
+  behind?: number | null;
+  /** Commits since `head` left the default base; the same count as `ahead`. */
+  commits_since_base?: number | null;
+  /** Why the three counts are absent for a checkout that has a `head`. */
+  divergence_note?: string;
 }
 
 export interface AgentKindCount {
@@ -272,4 +286,39 @@ export interface McpInfo {
   /** Hooks manifest to install: absolute path, deciding hooks refuse when the binary is missing; empty when not found. */
   hooks_config_json: string;
   tools: McpToolInfo[];
+}
+
+/**
+ * What merging two commits would do (`MergeCandidate`): three states, and
+ * `unknown` is never to be read as `clean`.
+ */
+export type MergeCandidate =
+  | { state: "clean"; tree: string }
+  | { state: "conflict"; paths: string[]; paths_total: number }
+  | { state: "unknown"; reason: string };
+
+/** One pair of checkouts and what merging their HEADs would do. */
+export interface PairVerdict {
+  a_path: string;
+  b_path: string;
+  a_head: string;
+  b_head: string;
+  verdict: MergeCandidate;
+}
+
+/** `gitpulse_merge_conflicts`: wire shape of `insights::merge_conflicts::MergeConflicts`. */
+export interface MergeConflicts {
+  /** False when the answer is incomplete (past the pair cap) or unavailable. */
+  ok: boolean;
+  error: string;
+  worktrees: number;
+  pairs_total: number;
+  pairs_checked: number;
+  same_head_pairs: number;
+  clean: number;
+  conflict: number;
+  unknown: number;
+  /** True when `pairs_checked < pairs_total`: the counts are a floor. */
+  truncated: boolean;
+  items: PairVerdict[];
 }

@@ -4,6 +4,7 @@ use crate::engine::git_cli::{
     resolve_git_common_dir, sandbox_join, validate_repo, with_background_processes, BoundedRun,
     OutputStream, ProcessObserver, NETWORK_TIMEOUT,
 };
+use crate::storage::commit_graph::{CommitGraphWriteOutcome, CommitGraphWritePlan};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -314,6 +315,159 @@ pub const AUTO_FETCH_ARGV: [&str; 4] = ["git", "fetch", "--all", "--quiet"];
 /// so it gets a short deadline: a slow network must not keep a user's
 /// commit waiting behind a fetch nobody asked for just now.
 pub const AUTO_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The argv, program included, of the user-clicked commit-graph write (Owner
+/// Decision 3). `--changed-paths` is included because the bench
+/// (docs/PERFORMANCE.md, 2026-10-16) puts Bloom filters at about 3x on a path
+/// log and 2x on blame at 50k commits on top of the graph, and file history and
+/// blame are screens GitPulse opens constantly; without it a graph that lacks
+/// Bloom data could never be fixed from the button. No `--split` (one file, no
+/// chain to maintain) and no `git config`: `core.commitGraph` and
+/// `gc.writeCommitGraph` are never touched.
+pub const COMMIT_GRAPH_WRITE_ARGV: [&str; 5] = [
+    "git",
+    "commit-graph",
+    "write",
+    "--reachable",
+    "--changed-paths",
+];
+
+/// A write that has not finished by now is killed, so a huge repository
+/// cannot leave a click running forever.
+pub const COMMIT_GRAPH_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Git's own output for a graph write is a line or two of progress.
+const COMMIT_GRAPH_WRITE_OUTPUT_CAP: usize = 256 * 1024;
+
+/// Lock files a `commit-graph write` holds under `objects/info`, relative to
+/// the common dir. A write that git cannot clean up after (SIGKILL) leaves one.
+const COMMIT_GRAPH_LOCKS: [&str; 2] = [
+    "objects/info/commit-graph.lock",
+    "objects/info/commit-graphs/commit-graph-chain.lock",
+];
+
+type CommitGraphFlight = Result<CommitGraphWriteOutcome, String>;
+
+/// One write per common directory, however many worktrees or clicks ask.
+fn commit_graph_flights() -> &'static crate::singleflight::SingleFlight<PathBuf, CommitGraphFlight>
+{
+    static FLIGHTS: OnceLock<crate::singleflight::SingleFlight<PathBuf, CommitGraphFlight>> =
+        OnceLock::new();
+    FLIGHTS.get_or_init(Default::default)
+}
+
+/// Cancel flags of the writes in flight, by common directory.
+fn commit_graph_cancels() -> &'static Mutex<HashMap<PathBuf, Arc<std::sync::atomic::AtomicBool>>> {
+    static CANCELS: OnceLock<Mutex<HashMap<PathBuf, Arc<std::sync::atomic::AtomicBool>>>> =
+        OnceLock::new();
+    CANCELS.get_or_init(Default::default)
+}
+
+struct CommitGraphCancel(Arc<std::sync::atomic::AtomicBool>);
+
+impl ProcessObserver for CommitGraphCancel {
+    fn cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// A stop that arrived before its write registered, by common directory. A
+/// write that registers within [`COMMIT_GRAPH_STOP_INTENT_LIFETIME`] of it
+/// starts already stopped, so a Stop is not lost to the window between the
+/// click and the registration. Cleared when a write ends.
+fn commit_graph_stop_intents() -> &'static Mutex<HashMap<PathBuf, std::time::Instant>> {
+    static INTENTS: OnceLock<Mutex<HashMap<PathBuf, std::time::Instant>>> = OnceLock::new();
+    INTENTS.get_or_init(Default::default)
+}
+
+/// How long an unanswered Stop waits for its write to register.
+const COMMIT_GRAPH_STOP_INTENT_LIFETIME: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Oldest git whose `commit-graph write` accepts `--changed-paths` (2.27).
+/// Older gits refuse the argv, so neither the plan nor the writer offers it.
+pub(crate) const COMMIT_GRAPH_CHANGED_PATHS_GIT: (u32, u32, u32) = (2, 27, 0);
+
+/// Registers a write's cancel flag (already set when a stop was waiting for
+/// it) and unregisters it, with any unclaimed stop, however the run ends.
+struct CancelRegistration(PathBuf);
+
+impl CancelRegistration {
+    fn register(common: &Path) -> (Self, Arc<std::sync::atomic::AtomicBool>) {
+        // Under the flags lock, the one a stop takes before it records an
+        // intent: a stop is either seen here or finds this flag.
+        let mut flags = commit_graph_cancels()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let waiting = commit_graph_stop_intents()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(common)
+            .is_some_and(|asked| asked.elapsed() <= COMMIT_GRAPH_STOP_INTENT_LIFETIME);
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(waiting));
+        flags.insert(common.to_path_buf(), Arc::clone(&flag));
+        (Self(common.to_path_buf()), flag)
+    }
+}
+
+impl Drop for CancelRegistration {
+    fn drop(&mut self) {
+        commit_graph_cancels()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+        commit_graph_stop_intents()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+/// Whether a commit-graph write is running in `common_dir` right now. The
+/// Storage panel reads it so a remounted panel shows the write and can stop it.
+pub(crate) fn commit_graph_write_running(common_dir: &Path) -> bool {
+    commit_graph_cancels()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_key(common_dir)
+}
+
+/// The commit-graph lock files that exist under `common_dir`.
+fn commit_graph_locks(common_dir: &Path) -> Vec<PathBuf> {
+    COMMIT_GRAPH_LOCKS
+        .iter()
+        .map(|lock| common_dir.join(lock))
+        .filter(|lock| lock.exists())
+        .collect()
+}
+
+/// Each lock file with how long ago it was last modified, for a message. A lock
+/// is never deleted by GitPulse: only a person can know that no git process is
+/// behind it, so the message names the path and the age and leaves the removal
+/// to them.
+fn commit_graph_lock_report(locks: &[PathBuf]) -> String {
+    locks
+        .iter()
+        .map(|lock| {
+            let age = std::fs::metadata(lock)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .map(|age| format!("last modified {} s ago", age.as_secs()))
+                .unwrap_or_else(|| "modification time unknown".to_string());
+            format!("{} ({age})", lock.display())
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The sentence appended to a stopped or failed write that left a lock behind.
+fn commit_graph_lock_remedy(locks: &[PathBuf]) -> String {
+    format!(
+        "{}. If no git process is running in this repository, delete that file yourself; \
+         GitPulse never removes a commit-graph lock",
+        commit_graph_lock_report(locks)
+    )
+}
 
 /// A squash merge that did not complete. The distinction matters to the
 /// caller: before the commit nothing is staged; after it, the squash is.
@@ -1971,6 +2125,283 @@ Unset the local override with `git config --local --unset-all user.name` and \
         }
     }
 
+    /// The line a confirmed commit-graph write runs, program included: the one
+    /// builder the preview, the command gate and [`Self::commit_graph_write`]
+    /// all read, so what was shown and judged is what is spawned.
+    pub fn commit_graph_write_argv() -> Vec<String> {
+        COMMIT_GRAPH_WRITE_ARGV
+            .iter()
+            .map(|part| (*part).to_string())
+            .collect()
+    }
+
+    /// The preview of a commit-graph write: the exact argv, the common
+    /// directory it writes under, and the state that makes it worth running.
+    /// Refused (nothing to confirm) unless
+    /// [`CommitGraphState::offers_write`](crate::storage::commit_graph::CommitGraphState::offers_write)
+    /// holds, and on an untrusted repository. Reads files only.
+    pub fn commit_graph_write_plan(repo_path: &str) -> Result<CommitGraphWritePlan, String> {
+        Self::commit_graph_write_plan_with(
+            repo_path,
+            crate::engine::git_cli::git_supports(COMMIT_GRAPH_CHANGED_PATHS_GIT),
+        )
+    }
+
+    /// Why no commit-graph write may be offered or run in `repo`, or `Ok`. Fails
+    /// closed: a git too old for `--changed-paths` (`git_supports` false, which
+    /// also covers a git that could not be probed), and a partial clone, whose
+    /// write would fetch every missing tree from the promisor remote. A partial
+    /// check that could not be read refuses too.
+    fn commit_graph_write_refusal(repo: &Path, git_supports: bool) -> Result<(), String> {
+        let (major, minor, _) = COMMIT_GRAPH_CHANGED_PATHS_GIT;
+        if !git_supports {
+            return Err(format!(
+                "A commit-graph write needs Git {major}.{minor} or newer (for --changed-paths), \
+                 or the installed Git could not be checked; update Git to use it"
+            ));
+        }
+        match crate::engine::provenance::is_partial_clone(repo) {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(
+                "This is a partial clone: a commit-graph write would fetch the missing trees \
+                 from its remote, so it is not offered"
+                    .to_string(),
+            ),
+            Err(error) => Err(format!(
+                "Could not tell whether this is a partial clone, so no commit-graph write is \
+                 offered: {error}"
+            )),
+        }
+    }
+
+    /// [`Self::commit_graph_write_plan`] with the git capability answer given,
+    /// so a test can stand in an old git.
+    pub(crate) fn commit_graph_write_plan_with(
+        repo_path: &str,
+        git_supports: bool,
+    ) -> Result<CommitGraphWritePlan, String> {
+        let repo = validate_repo(repo_path)?;
+        Self::commit_graph_write_refusal(&repo, git_supports)?;
+        let (private, common) = crate::repository_trust::git_directories(&repo)?;
+        if commit_graph_write_running(&common) {
+            return Err(
+                "A commit-graph write is already running in this repository; stop it from the \
+                 Storage panel or wait for it to finish"
+                    .to_string(),
+            );
+        }
+        let report = crate::storage::commit_graph::inspect(&repo, &private, &common);
+        if !report.state.offers_write() {
+            return Err(format!(
+                "No commit-graph write is offered here: the commit-graph state is {:?}{}",
+                report.state,
+                report
+                    .note
+                    .as_deref()
+                    .map(|note| format!(" ({note})"))
+                    .unwrap_or_default()
+            ));
+        }
+        Ok(CommitGraphWritePlan {
+            argv: Self::commit_graph_write_argv(),
+            common_dir: common.to_string_lossy().into_owned(),
+            state: report.state,
+            timeout_secs: COMMIT_GRAPH_WRITE_TIMEOUT.as_secs(),
+        })
+    }
+
+    /// Stops the commit-graph write running in this repository's common
+    /// directory. `Ok(true)` when it was running and has been asked to stop.
+    /// `Ok(false)` when none is registered yet: the stop is then remembered for
+    /// [`COMMIT_GRAPH_STOP_INTENT_LIFETIME`] and honoured by a write that
+    /// registers within it, so a Stop sent in the window between the click and
+    /// the registration is not lost, and the UI can ask again.
+    pub fn commit_graph_write_cancel(repo_path: &str) -> Result<bool, String> {
+        let repo = validate_repo(repo_path)?;
+        let (_, common) = crate::repository_trust::git_directories(&repo)?;
+        let flags = commit_graph_cancels()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(flag) = flags.get(&common) {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            return Ok(true);
+        }
+        // Recorded under the flags lock, so a write cannot register between
+        // the lookup above and this insert and miss the stop.
+        commit_graph_stop_intents()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(common, std::time::Instant::now());
+        Ok(false)
+    }
+
+    /// Writes the repository's commit-graph, once the person has confirmed the
+    /// previewed `confirmed` argv. The only caller is `cmd_commit_graph_write`,
+    /// which judges that same argv first.
+    ///
+    /// Bounded by [`COMMIT_GRAPH_WRITE_TIMEOUT`], cancellable through
+    /// [`Self::commit_graph_write_cancel`], and one per common directory: a
+    /// click that arrives while a write runs joins it and reports its result.
+    pub fn commit_graph_write(
+        repo_path: &str,
+        confirmed: &[String],
+    ) -> Result<CommitGraphWriteOutcome, String> {
+        Self::commit_graph_write_checked(
+            repo_path,
+            confirmed,
+            crate::engine::git_cli::git_supports(COMMIT_GRAPH_CHANGED_PATHS_GIT),
+        )
+    }
+
+    /// [`Self::commit_graph_write`] with the git capability answer given, so a
+    /// test can stand in an old git. The refusals the plan makes are made again
+    /// here: the writer is the owner of what may run, not the preview.
+    pub(crate) fn commit_graph_write_checked(
+        repo_path: &str,
+        confirmed: &[String],
+        git_supports: bool,
+    ) -> Result<CommitGraphWriteOutcome, String> {
+        let argv = Self::commit_graph_write_argv();
+        if confirmed != argv.as_slice() {
+            return Err(format!(
+                "The confirmed command `{}` is not the commit-graph write `{}`; nothing ran",
+                confirmed.join(" "),
+                argv.join(" ")
+            ));
+        }
+        let repo = validate_repo(repo_path)?;
+        Self::commit_graph_write_refusal(&repo, git_supports)?;
+        Self::commit_graph_write_within(repo_path, &argv, COMMIT_GRAPH_WRITE_TIMEOUT)
+    }
+
+    /// The write itself, under `timeout`: `argv` is already the confirmed
+    /// [`Self::commit_graph_write_argv`] line.
+    fn commit_graph_write_within(
+        repo_path: &str,
+        argv: &[String],
+        timeout: std::time::Duration,
+    ) -> Result<CommitGraphWriteOutcome, String> {
+        let repo = validate_repo(repo_path)?;
+        let (private, common) = crate::repository_trust::git_directories(&repo)?;
+        let ran = std::cell::Cell::new(false);
+        let mut answer = commit_graph_flights().run(common.clone(), || {
+            ran.set(true);
+            Self::commit_graph_write_run(&repo, &private, &common, argv, timeout)
+        });
+        if let (false, Ok(outcome)) = (ran.get(), answer.as_mut()) {
+            outcome.joined = true;
+        }
+        answer
+    }
+
+    fn commit_graph_write_run(
+        repo: &Path,
+        private: &Path,
+        common: &Path,
+        argv: &[String],
+        timeout: std::time::Duration,
+    ) -> CommitGraphFlight {
+        use crate::storage::commit_graph::inspect;
+        let finished = |cancelled: bool, started: std::time::Instant| CommitGraphWriteOutcome {
+            cancelled,
+            joined: false,
+            elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            report: inspect(repo, private, common),
+            note: None,
+        };
+        let started = std::time::Instant::now();
+        // A click that queued behind a finished write has nothing left to do.
+        if !inspect(repo, private, common).state.offers_write() {
+            return Ok(finished(false, started));
+        }
+        let held = commit_graph_locks(common);
+        if !held.is_empty() {
+            return Err(format!(
+                "Another git process holds, or a stopped one left behind, {}",
+                commit_graph_lock_remedy(&held)
+            ));
+        }
+        let (_registered, flag) = CancelRegistration::register(common);
+        let stop = Arc::clone(&flag);
+        let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
+        // The write reads trees, so a promisor remote would be asked for the
+        // missing ones; the plan refuses a partial clone and this is the
+        // second fence.
+        let run = crate::engine::git_cli::without_lazy_fetch(|| {
+            crate::engine::git_cli::git_observed(
+                repo,
+                &args,
+                timeout,
+                COMMIT_GRAPH_WRITE_OUTPUT_CAP,
+                &mut CommitGraphCancel(flag),
+            )
+        });
+        // A lock still on disk after a stopped or failed write is reported,
+        // never deleted: git removes its own lock when asked to stop (the
+        // runner asks, waits, and only then kills), and one that survives a
+        // kill may be another git's, so only a person can say it is stale.
+        let lock_note = || match commit_graph_locks(common) {
+            locks if locks.is_empty() => None,
+            locks => Some(format!(
+                "A lock file remains: {}",
+                commit_graph_lock_remedy(&locks)
+            )),
+        };
+        let with_lock = |message: String| match lock_note() {
+            Some(note) => format!("{message}. {note}"),
+            None => message,
+        };
+        let (outcome, journal) = match run {
+            // The graph is what the person asked for. A stop that raced git's
+            // publish (git exited 0, or was stopped after it renamed the graph
+            // into place) is a finished write, not "nothing was written".
+            Ok(run)
+                if run.cancelled
+                    && (run.status_code == 0
+                        || !inspect(repo, private, common).state.offers_write()) =>
+            {
+                (Ok(finished(false, started)), "written")
+            }
+            Ok(run) if run.cancelled => {
+                let mut stopped = finished(true, started);
+                stopped.note = lock_note();
+                (Ok(stopped), "cancelled")
+            }
+            // A deadline is a finished run that git did not: its message is
+            // the same sentence a timeout error carries.
+            Ok(crate::engine::git_cli::BoundedRun {
+                incomplete: Some(crate::engine::git_cli::Incomplete::Deadline { message, .. }),
+                ..
+            }) => (Err(with_lock(message)), "timed_out"),
+            Ok(run) if run.success => (Ok(finished(false, started)), "written"),
+            Ok(run) => (
+                Err(with_lock(format!(
+                    "git commit-graph write failed: {}",
+                    crate::engine::git_cli::byte_tail(&run.stderr, 400).trim()
+                ))),
+                "failed",
+            ),
+            // Stopped while still waiting for a process slot: nothing was
+            // spawned, and the person's stop is the answer, not a failure.
+            Err(error)
+                if stop.load(std::sync::atomic::Ordering::SeqCst)
+                    && !crate::engine::git_cli::is_timed_out(&error) =>
+            {
+                (Ok(finished(true, started)), "cancelled")
+            }
+            Err(error) => {
+                let journal = if crate::engine::git_cli::is_timed_out(&error) {
+                    "timed_out"
+                } else {
+                    "failed"
+                };
+                (Err(with_lock(error)), journal)
+            }
+        };
+        record_commit_graph_write(repo, common, argv, journal, started.elapsed());
+        outcome
+    }
+
     /// Git's arguments (no program) for a pull. Shared by the gate and
     /// [`Self::pull`]. `rebase`: `Some(true)` rebases local commits onto the
     /// upstream, `Some(false)` merges, `None` leaves it to `pull.rebase`.
@@ -2486,15 +2917,6 @@ Unset the local override with `git config --local --unset-all user.name` and \
         git_text(&repo, &args)
     }
 
-    pub fn stash_pop(repo_path: &str) -> Result<String, String> {
-        let repo = validate_repo(repo_path)?;
-        let _repo_lock = repo_mutation_lock(&repo);
-        let _guard = _repo_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        git_text(&repo, &["stash", "pop"])
-    }
-
     /// Refuses when the worktree is already parked mid-operation, naming it.
     ///
     /// Starting a cherry-pick on top of a parked rebase does not queue behind
@@ -2927,6 +3349,48 @@ pub(crate) fn record_deleted_branch_tip(
         tip,
         crate::ledger::Outcome::Ok,
     );
+}
+
+/// Journals how a commit-graph write ended. The gate's row authorises the
+/// click; this one records what the run did (`written`, `cancelled`,
+/// `timed_out` or `failed`). Through [`crate::ledger::record`], so a ledger
+/// outage never blocks or fails the write.
+fn record_commit_graph_write(
+    repo: &Path,
+    common: &Path,
+    argv: &[String],
+    ended: &str,
+    elapsed: std::time::Duration,
+) {
+    let repo_text = repo.to_string_lossy().into_owned();
+    let address = crate::ledger::bindings::repository_address(&repo_text).ok();
+    let anchor = address
+        .as_ref()
+        .map(|address| address.anchor.clone())
+        .unwrap_or_else(|| repo_text.clone());
+    let worktree = address
+        .and_then(|address| (address.worktree != address.anchor).then_some(address.worktree));
+    let _ = crate::ledger::record(crate::ledger::Draft {
+        repo_path: anchor,
+        worktree_path: worktree,
+        actor_kind: Some(crate::ledger::ActorKind::Human),
+        action: crate::ledger::action_for_argv(&GitWriter::argv_refs(argv)),
+        object: Some(common.to_string_lossy().into_owned()),
+        argv_json: serde_json::to_string(argv).ok(),
+        outcome: Some(if ended == "written" {
+            crate::ledger::Outcome::Ok
+        } else {
+            crate::ledger::Outcome::Failed
+        }),
+        detail_json: serde_json::to_string(&serde_json::json!({
+            "phase": "mutate",
+            "kind": "commit_graph.write",
+            "ended": ended,
+            "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        }))
+        .ok(),
+        ..Default::default()
+    });
 }
 
 /// Where a repository's branch-delete rows go, resolved once so a batch of
@@ -7002,3 +7466,11 @@ mod bound_to_checked_state {
 #[cfg(test)]
 #[path = "git_writer_adv_tests.rs"]
 mod adv_tests;
+
+#[cfg(test)]
+#[path = "git_writer_commit_graph_tests.rs"]
+mod commit_graph_write_tests;
+
+#[cfg(test)]
+#[path = "git_writer_commit_graph_adv_tests.rs"]
+mod commit_graph_adv_tests;

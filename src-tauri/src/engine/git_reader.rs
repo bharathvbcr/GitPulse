@@ -1764,31 +1764,54 @@ impl GitReader {
     }
 
     pub fn get_reflog(repo_path: &str, max_entries: usize) -> Result<Vec<ReflogEntry>, String> {
-        Self::get_reflog_within(repo_path, max_entries, None)
+        Self::get_reflog_within(repo_path, "HEAD", max_entries, None)
     }
 
-    /// [`Self::get_reflog`] with the Git child held to `timeout` when one is
-    /// given, so a caller on a deadline is not left behind the default
-    /// ninety-second ceiling.
+    /// The newest `max_entries` of `ref_name`'s reflog (`HEAD`, or a full ref
+    /// such as `refs/heads/main`), newest first, with the Git child held to
+    /// `timeout` when one is given, so a caller on a deadline is not left behind
+    /// the default ninety-second ceiling.
+    ///
+    /// `repo_path` is any checkout of the repository: a linked worktree's
+    /// `HEAD` is its own log, while `refs/heads/*` logs are shared. A ref with
+    /// no reflog at all (a remote-only default branch, a branch created with
+    /// logging off) is an empty answer, not an error; any other failure is one.
     pub fn get_reflog_within(
         repo_path: &str,
+        ref_name: &str,
         max_entries: usize,
         timeout: Option<std::time::Duration>,
     ) -> Result<Vec<ReflogEntry>, String> {
         let repo = validate_repo(repo_path)?;
+        validate_ref_name(ref_name)?;
         let limit = format!("-n{}", max_entries.clamp(1, 10_000));
         // `%gd` under `--date=unix` is `HEAD@{<seconds the ref moved at>}`:
         // the reflog's own time. `%ct` is the committer date of the commit
         // HEAD landed on, which a checkout of an old commit leaves where it was.
         let args = [
             "reflog",
+            "show",
             limit.as_str(),
             "--date=unix",
             "--format=%H%x00%gd%x00%gs",
+            ref_name,
         ];
-        let stdout = match timeout {
-            Some(timeout) => crate::engine::git_cli::git_text_with_timeout(&repo, &args, timeout)?,
-            None => git_text(&repo, &args)?,
+        let read = match timeout {
+            Some(timeout) => crate::engine::git_cli::git_text_with_timeout(&repo, &args, timeout),
+            None => git_text(&repo, &args),
+        };
+        let stdout = match read {
+            Ok(stdout) => stdout,
+            Err(error) if ref_name != "HEAD" => {
+                // `git reflog exists` answers 1 for "no log", which is not
+                // a failure to read one.
+                let probe = git_cli::git_captured(&repo, &["reflog", "exists", ref_name]);
+                return match probe {
+                    Ok(run) if run.status_code == 1 => Ok(Vec::new()),
+                    _ => Err(error),
+                };
+            }
+            Err(error) => return Err(error),
         };
         let mut entries = Vec::new();
         for (idx, line) in stdout.lines().enumerate() {

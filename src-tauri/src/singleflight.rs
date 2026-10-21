@@ -16,6 +16,11 @@ use crate::supervisor::lock_or_recover;
 struct Flight<V> {
     answer: Mutex<Option<V>>,
     done: Condvar,
+    /// Callers that joined this run instead of making their own, counted when
+    /// they take the flight under the map lock. Lets a test wait until a
+    /// follower has really joined rather than sleep and assume it did.
+    #[cfg(test)]
+    followers: std::sync::atomic::AtomicUsize,
 }
 
 pub struct SingleFlight<K, V> {
@@ -47,6 +52,17 @@ impl<K: Hash + Eq, V> Drop for Leader<'_, K, V> {
     }
 }
 
+#[cfg(test)]
+impl<K: Hash + Eq, V> SingleFlight<K, V> {
+    /// How many callers have joined the run now in flight for `key`; 0 when
+    /// none is running.
+    pub fn followers(&self, key: &K) -> usize {
+        lock_or_recover(&self.running).get(key).map_or(0, |flight| {
+            flight.followers.load(std::sync::atomic::Ordering::SeqCst)
+        })
+    }
+}
+
 impl<K: Hash + Eq + Clone, V: Clone> SingleFlight<K, V> {
     /// Runs `call` unless the same `key` is already running, in which case
     /// this waits for that run and returns its answer.
@@ -54,13 +70,21 @@ impl<K: Hash + Eq + Clone, V: Clone> SingleFlight<K, V> {
         let existing = {
             let mut running = lock_or_recover(&self.running);
             match running.get(&key) {
-                Some(flight) => Some(Arc::clone(flight)),
+                Some(flight) => {
+                    #[cfg(test)]
+                    flight
+                        .followers
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Some(Arc::clone(flight))
+                }
                 None => {
                     running.insert(
                         key.clone(),
                         Arc::new(Flight {
                             answer: Mutex::new(None),
                             done: Condvar::new(),
+                            #[cfg(test)]
+                            followers: std::sync::atomic::AtomicUsize::new(0),
                         }),
                     );
                     None

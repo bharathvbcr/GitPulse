@@ -16,13 +16,15 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::engine::git_cli::{canonicalize_plain, git_text, validate_repo};
 use crate::engine::git_reader::{compute_default_base, default_base, GitReader};
 use crate::engine::git_writer::{
-    checked_out_branches, repo_mutation_lock, validate_oid, validate_ref_name, BranchDeleteJournal,
+    checked_out_branches, is_full_oid, repo_mutation_lock, validate_oid, validate_ref_name,
+    BranchDeleteJournal,
 };
+use crate::engine::object_quarantine::{merge_tree_candidate, merge_tree_resolved, MergeCandidate};
 use crate::ledger::Outcome;
 
 /// Largest backup file restore or listing will read. A branch costs about a
@@ -373,34 +375,60 @@ fn create_unique_backup(dir: &Path, now_sec: u64) -> Result<(PathBuf, std::fs::F
     ))
 }
 
+/// What comparing a branch's content with the default branch's established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeMerge {
+    /// The merge of the two is the default branch's own tree: every change on
+    /// the branch is already in the default branch (a squash or rebase merge).
+    Merged,
+    /// The branch has content the default branch lacks, or conflicts with it:
+    /// a conflicting merge is an answer ("not merged"), not a failure.
+    NotMerged,
+    /// The comparison did not run to an answer (a git failure, unrelated
+    /// histories, a deadline, a partial clone, a git before 2.38). Never read
+    /// as either of the others.
+    Unknown(String),
+}
+
+impl TreeMerge {
+    /// The verdict of one merge against the default branch's tree.
+    fn of(candidate: MergeCandidate, default_tree: &str) -> Self {
+        match candidate {
+            MergeCandidate::Clean { tree } if !tree.is_empty() && tree == default_tree => {
+                Self::Merged
+            }
+            MergeCandidate::Clean { .. } | MergeCandidate::Conflict { .. } => Self::NotMerged,
+            MergeCandidate::Unknown { reason } => Self::Unknown(reason),
+        }
+    }
+}
+
+/// What one tree comparison may take, so a stuck git cannot hold a scan.
+const TREE_MERGE_BUDGET: Duration = Duration::from_secs(60);
+
 /// Check if a branch was squash-merged or rebase-merged into the default branch
-/// via `git merge-tree --write-tree --no-messages <default_branch> <branch>`.
+/// via `git merge-tree --write-tree` (in a quarantined object directory, so the
+/// repository gains no object).
 ///
 /// If merging produces the identical tree OID as `default_branch^{tree}`, all changes
-/// from `branch` have already been incorporated into `default_branch`.
+/// from `branch` have already been incorporated into `default_branch`. A merge
+/// that conflicts is [`TreeMerge::NotMerged`]; one that could not be computed is
+/// [`TreeMerge::Unknown`] with its reason.
 pub fn is_branch_merged_by_tree(
     repo: &Path,
     default_tree: &str,
     default_branch: &str,
     branch_ref: &str,
-) -> Option<bool> {
-    let output = git_text(
-        repo,
-        &[
-            "merge-tree",
-            "--write-tree",
-            "--no-messages",
+) -> TreeMerge {
+    TreeMerge::of(
+        merge_tree_candidate(
+            repo,
             default_branch,
             branch_ref,
-        ],
-    );
-    match output {
-        Ok(merged_tree) => {
-            let tree = merged_tree.trim();
-            Some(!tree.is_empty() && tree == default_tree)
-        }
-        Err(_) => None,
-    }
+            Instant::now() + TREE_MERGE_BUDGET,
+        ),
+        default_tree,
+    )
 }
 
 /// Scans the repository for branches, evaluates staleness and merge status (including squash merges),
@@ -557,17 +585,40 @@ fn scan_branches(
     // Second pass: deep tree-based squash/rebase merge detection for unmerged non-protected branches
     if let (Some(d_tree), Some((_, base_oid))) = (&default_tree, &base) {
         let tree_check_errors = Arc::new(AtomicUsize::new(0));
+        let first_reason = std::sync::Mutex::new(None::<String>);
+        // A partial clone is told once for the scan: a merge there would make
+        // git fetch blobs, and every branch would say so separately.
+        let refused = crate::engine::object_quarantine::refuse_partial_clone(repo).err();
 
         candidates.par_iter_mut().for_each(|branch| {
             if !branch.is_merged && !branch.is_protected && !branch.is_current_or_worktree {
-                match is_branch_merged_by_tree(repo, d_tree, base_oid, &branch.name) {
-                    Some(true) => {
+                let verdict = match &refused {
+                    Some(reason) => TreeMerge::Unknown(reason.clone()),
+                    // The tip is already a full object name, so the merge runs
+                    // without a resolve per branch; a short one goes by name.
+                    None if is_full_oid(&branch.last_commit_sha) => TreeMerge::of(
+                        merge_tree_resolved(
+                            repo,
+                            base_oid,
+                            &branch.last_commit_sha,
+                            Instant::now() + TREE_MERGE_BUDGET,
+                        ),
+                        d_tree,
+                    ),
+                    None => is_branch_merged_by_tree(repo, d_tree, base_oid, &branch.name),
+                };
+                match verdict {
+                    TreeMerge::Merged => {
                         branch.is_merged = true;
                         branch.merged_by_tree = true;
                     }
-                    Some(false) => {}
-                    None => {
+                    TreeMerge::NotMerged => {}
+                    TreeMerge::Unknown(reason) => {
                         tree_check_errors.fetch_add(1, Ordering::Relaxed);
+                        first_reason
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .get_or_insert(reason);
                     }
                 }
             }
@@ -575,8 +626,13 @@ fn scan_branches(
 
         let err_count = tree_check_errors.load(Ordering::Relaxed);
         if err_count > 0 {
+            let why = first_reason
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .map(|reason| format!(": {reason}"))
+                .unwrap_or_default();
             warnings.push(format!(
-                "Squash-merge tree comparison could not resolve for {err_count} branch(es); left as unmerged"
+                "Squash-merge tree comparison could not resolve for {err_count} branch(es); left as unmerged{why}"
             ));
         }
     } else if config.check_squash {
@@ -1656,7 +1712,10 @@ mod tests {
         assert_eq!(default_lookups, 2, "default-branch lookups: {used:#?}");
         assert_eq!(merge_trees, BRANCHES, "merge-tree per target: {used:#?}");
         assert_eq!(deletes, BRANCHES);
-        const CONSTANT: usize = 16;
+        // 16 plus the two `git config` reads that tell a partial clone once
+        // for the whole scan (a merge there would make git fetch blobs). The
+        // per-branch terms above are exact and unchanged.
+        const CONSTANT: usize = 18;
         assert!(
             used.len() <= 2 * BRANCHES + CONSTANT,
             "{} spawns for {BRANCHES} branches: {used:#?}",

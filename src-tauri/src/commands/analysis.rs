@@ -95,6 +95,51 @@ pub async fn cmd_storage_scan(
     off_thread(move || crate::storage::scan_storage(&repo_path)).await
 }
 
+/// What the Storage panel's "Write commit-graph" click would run: the exact
+/// argv and the common directory it writes under. Reads files only; refused
+/// when no write is offered (graph present and fresh, no history, state
+/// unknown) and on an untrusted repository.
+#[tauri::command(async)]
+pub async fn cmd_commit_graph_write_plan(
+    repo_path: String,
+) -> Result<crate::storage::commit_graph::CommitGraphWritePlan, IpcError> {
+    off_thread(move || GitWriter::commit_graph_write_plan(&repo_path)).await
+}
+
+/// Writes the commit-graph (Owner Decision 3). Reachable only from the Storage
+/// panel's confirm click: `confirmed_argv` is the previewed line echoed back,
+/// refused unless it is the one line the writer would run, and the gate judges
+/// that same line before it is spawned.
+#[tauri::command(async)]
+pub async fn cmd_commit_graph_write(
+    repo_path: String,
+    confirmed_argv: Vec<String>,
+) -> Result<Guarded<crate::storage::commit_graph::CommitGraphWriteOutcome>, IpcError> {
+    off_thread(move || {
+        // Trust, and that a write is still offered, before the gate is asked.
+        GitWriter::commit_graph_write_plan(&repo_path)?;
+        let argv = GitWriter::commit_graph_write_argv();
+        if confirmed_argv != argv {
+            return Err(format!(
+                "The confirmed command `{}` is not the previewed `{}`; nothing ran",
+                confirmed_argv.join(" "),
+                argv.join(" ")
+            ));
+        }
+        let policy = guard(&repo_path, &GitWriter::argv_refs(&argv))?;
+        let output = GitWriter::commit_graph_write(&repo_path, &argv)?;
+        Ok(Guarded { policy, output })
+    })
+    .await
+}
+
+/// Stops the graph write running in this repository's common
+/// directory. `false` when none is running.
+#[tauri::command(async)]
+pub async fn cmd_commit_graph_write_cancel(repo_path: String) -> Result<bool, IpcError> {
+    off_thread(move || GitWriter::commit_graph_write_cancel(&repo_path)).await
+}
+
 #[tauri::command]
 pub async fn cmd_cache_inventory() -> Result<crate::storage::hygiene::CacheInventory, IpcError> {
     off_thread(crate::storage::hygiene::cache_inventory).await

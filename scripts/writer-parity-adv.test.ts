@@ -40,7 +40,8 @@ const TABLE: Array<[string, string[], string, string[]]> = [
   ["cmd_rename_branch", ["rename_branch_argv"], "rename_branch", ["rename_branch_argv"]],
   ["cmd_create_tag", ["create_tag_argv"], "create_tag", ["create_tag_argv"]],
   ["cmd_delete_tag", ["delete_tag_argv"], "delete_tag", ["delete_tag_argv"]],
-  ["cmd_publish_release", ["create_tag_argv", "push_tag_argv"], "push_tag", ["push_tag_argv"]],
+  ["cmd_commit_graph_write", ["commit_graph_write_argv"], "commit_graph_write_checked", ["commit_graph_write_argv"]],
+  ["cmd_publish_release",["create_tag_argv", "push_tag_argv"], "push_tag", ["push_tag_argv"]],
   ["cmd_stage_selective_patch", ["apply_patch_to_index_argv"], "apply_patch_to_index", ["apply_patch_to_index_argv"]],
   ["cmd_unstage_selective_patch", ["apply_patch_to_index_argv"], "apply_patch_to_index", ["apply_patch_to_index_argv"]],
 ];
@@ -59,9 +60,15 @@ describe("derived writer commands really share their builder", () => {
   });
 
   it("no guarded command anywhere still hand-copies a git literal into guard()", () => {
-    // Known remaining: cmd_stash_pop (history.rs), a documented owner decision.
     const offenders = [...COMMANDS.matchAll(/guard\(\s*&repo_path,\s*&\[\s*"git"[^\]]*\]/g)].map((m) => m[0]);
-    expect(offenders.filter((o) => !o.includes('"stash", "pop"'))).toEqual([]);
+    expect(offenders).toEqual([]);
+  });
+
+  it("the unaddressed stash pop is gone from the writer and the command surface", () => {
+    // UI pops go through cmd_stash_action with the listed OID; an unaddressed
+    // `git stash pop` of stash@{0} can apply someone else's entry.
+    expect(WRITER).not.toMatch(/fn stash_pop\b/);
+    expect(COMMANDS).not.toMatch(/fn cmd_stash_pop\b/);
   });
 
   it("a hand-copied delete_tag literal is detectable by the same classifier", () => {

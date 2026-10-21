@@ -76,9 +76,11 @@ CREATE TABLE IF NOT EXISTS events (
   before_ref     TEXT,
   after_ref      TEXT,
   duration_ms    INTEGER,
-  detail_json    TEXT
+  detail_json    TEXT,
+  occurred_at    TEXT,
+  reflog_ordinal INTEGER
 );
-CREATE INDEX IF NOT EXISTS idx_events_repo_ts  ON events(repo_path, ts_utc);
+CREATE INDEX IF NOT EXISTS idx_events_repo_ts ON events(repo_path, ts_utc);
 CREATE INDEX IF NOT EXISTS idx_events_reflog   ON events(worktree_path, object)
     WHERE action LIKE 'reflog.%';
 CREATE INDEX IF NOT EXISTS idx_events_task     ON events(task_id)    WHERE task_id IS NOT NULL;
@@ -113,7 +115,41 @@ CREATE TABLE IF NOT EXISTS transcript_cursors (
   worktree_key   TEXT NOT NULL,
   file_key       TEXT NOT NULL,
   byte_offset    INTEGER NOT NULL,
+  fingerprint    TEXT,
   PRIMARY KEY (worktree_key, file_key)
+);
+-- CARD 27 (ft-9d043f74...4671), S6-08/S6-09: where reflog replay stopped, per
+-- worktree and ref (Wave B walks every family worktree's HEAD and
+-- refs/heads/<default>), as the last recorded entry's identity: selector time,
+-- oid, message hash and ordinal among identical entries. Written by Wave B.
+CREATE TABLE IF NOT EXISTS reflog_watermarks (
+  worktree_key        TEXT NOT NULL,
+  ref_name            TEXT NOT NULL,
+  last_entry_unix     INTEGER,
+  last_entry_oid      TEXT,
+  last_entry_msg_hash TEXT,
+  last_entry_ordinal  INTEGER,
+  updated_at          TEXT,
+  PRIMARY KEY (worktree_key, ref_name)
+);
+-- CARD 29 (ft-9d044974...3c3f), S6-13 and S6-11: the last CatchUp per worktree,
+-- so a read-only reader can say when it last ran (as_of / last_catch_up /
+-- stale), whether it was cut short with the counts (transcripts read, listed
+-- and unlisted, so a partial pass never reads as complete), lines skipped, and
+-- records that failed to write (S6-08's "a failed record surfaces").
+CREATE TABLE IF NOT EXISTS catch_up_state (
+  worktree_key        TEXT PRIMARY KEY,
+  completed_at        TEXT,
+  truncated           INTEGER,
+  recorded            INTEGER,
+  transcripts         INTEGER,
+  transcripts_listed  INTEGER,
+  transcripts_unlisted INTEGER,
+  skipped_lines       INTEGER,
+  reflog_entries      INTEGER,
+  failed_records      INTEGER,
+  duplicates_refused  INTEGER,
+  error               TEXT
 );
 CREATE TABLE IF NOT EXISTS transcript_baselines (
   worktree_key   TEXT PRIMARY KEY,
@@ -189,26 +225,249 @@ pub const SCHEMA_VERSION: i64 = 1;
 /// knows about the stamp refuses a ledger stamped newer than itself, and a
 /// build older than the stamp's introduction is stopped by the daemon lock and
 /// the version check in Health instead.
-pub const WRITER_VERSION: i64 = 1;
+///
+/// Generation 2 (OD 1) is the one additive schema bump: `events.occurred_at`,
+/// `events.reflog_ordinal`, `transcript_cursors.fingerprint`, the `reflog_watermarks` and
+/// `catch_up_state` tables, and the unique reflog identity index
+/// ([`migrate_to_writer_2`]). All of it is nullable or new, so no existing
+/// read or insert changes. A generation-1 build's queries and inserts name
+/// their columns, so they run unchanged against the migrated file; its writable
+/// open refuses the file by this very stamp, so a generation-1 process that
+/// *starts* after the migration never writes it.
+///
+/// The stamp is read when a connection opens, not on every write. A
+/// generation-1 process that was already running when a generation-2 build
+/// migrated the ledger keeps its open connection and keeps writing, un-stamped:
+/// its rows carry no `occurred_at` or ordinal, and a duplicate reflog insert
+/// from it is refused by the unique index (which that build counts as a dropped
+/// append). Nothing can change a binary that is already running, so after an
+/// upgrade every running GitPulse process (the app, `gitpulsed`, `gitpulse-mcp`)
+/// must be restarted.
+pub const WRITER_VERSION: i64 = 2;
 
-/// Refuses a ledger a newer writer has stamped, and stamps one a writer of
-/// this generation is now using. Never lowers the stamp.
-fn check_writer_version(conn: &Connection, db_path: &Path) -> Result<(), LedgerError> {
-    let stamped: i64 = conn
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|e| LedgerError::new("pragma_failed", format!("user_version: {e}")))?;
-    if stamped > WRITER_VERSION {
-        return Err(LedgerError::new(
-            "writer_too_old",
+/// The unique index a reflog entry's identity is held to (CARD 27 / S6-08):
+/// the worktree, `object` (the commit id plus the message, as stored), the
+/// event time, for an `object` cut to the append cap the hash of its full text
+/// (the message hash), and the ordinal of the entry among identical ones. The
+/// worktree, time and ordinal are coalesced because SQLite treats NULLs as
+/// distinct in a unique index, and the anchor checkout stores a NULL worktree.
+const REFLOG_IDENTITY_INDEX: &str = "idx_events_reflog_identity";
+const REFLOG_ROWS: &str = "action LIKE 'reflog.%' AND object IS NOT NULL";
+
+/// The four things a reflog identity is made of, as SQL expressions: column
+/// names (the migration, the index) or bound values (the legacy import's
+/// lookup). ONE definition of the identity without its ordinal, shared by the
+/// index, the migration's numbering and the import's numbering, so none of them
+/// can disagree about which rows are "the same entry".
+///
+/// The cut-object hash is only read from a detail that mentions
+/// `object_truncated` at all; `instr` is a plain scan, where `json_valid` would
+/// parse every detail of every reflog row.
+struct IdentityParts<'a> {
+    worktree: &'a str,
+    object: &'a str,
+    occurred_at: &'a str,
+    detail: &'a str,
+}
+
+impl IdentityParts<'_> {
+    /// The `events` columns themselves.
+    const COLUMNS: IdentityParts<'static> = IdentityParts {
+        worktree: "worktree_path",
+        object: "object",
+        occurred_at: "occurred_at",
+        detail: "detail_json",
+    };
+
+    fn terms(&self) -> [String; 4] {
+        let Self {
+            worktree,
+            object,
+            occurred_at,
+            detail,
+        } = self;
+        [
+            format!("COALESCE({worktree}, '')"),
+            object.to_string(),
+            format!("COALESCE({occurred_at}, '')"),
             format!(
-                "{} was written by a newer GitPulse (writer generation {stamped}; this build is {WRITER_VERSION}). Update GitPulse, or restart the old gitpulsed, before writing to it.",
-                db_path.display()
+                "COALESCE(CASE WHEN instr({detail}, 'object_truncated') > 0 \
+                 AND json_valid({detail}) \
+                 THEN json_extract({detail}, '$.object_truncated.hash') END, '')"
             ),
-        ));
+        ]
+    }
+
+    /// The comma-separated key, without the ordinal.
+    fn key(&self) -> String {
+        self.terms().join(", ")
+    }
+}
+
+/// The full `CREATE UNIQUE INDEX` text. Also what a stored index is compared
+/// with (whitespace-normalised) before it is trusted.
+fn reflog_identity_index_sql() -> String {
+    format!(
+        "CREATE UNIQUE INDEX {REFLOG_IDENTITY_INDEX} ON events({}, COALESCE(reflog_ordinal, 0)) \
+         WHERE {REFLOG_ROWS}",
+        IdentityParts::COLUMNS.key()
+    )
+}
+
+fn normalise_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Upper bound on how long an opener waits for another process's migration.
+/// rusqlite's default busy timeout is 5 s, which a large ledger's migration
+/// can outlast; only the `BEGIN IMMEDIATE` of a migration waits this long.
+const MIGRATION_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// SQL for the event time `detail` carries, or NULL: the interim
+/// `detail_json.occurred_at` of a row written before the typed column, taken
+/// only when it has the exact canonical shape the writer produces.
+fn occurred_at_from_detail(detail: &str) -> String {
+    format!(
+        "CASE WHEN json_valid({detail}) AND json_extract({detail}, '$.occurred_at') GLOB \
+         '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z' \
+         THEN json_extract({detail}, '$.occurred_at') END"
+    )
+}
+
+fn stamped_writer_version(conn: &Connection) -> Result<i64, LedgerError> {
+    conn.pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| LedgerError::new("pragma_failed", format!("user_version: {e}")))
+}
+
+fn writer_too_old(db_path: &Path, stamped: i64) -> LedgerError {
+    LedgerError::new(
+        "writer_too_old",
+        format!(
+            "{} was written by a newer GitPulse (writer generation {stamped}; this build is {WRITER_VERSION}). Update GitPulse, or restart the old gitpulsed, before writing to it.",
+            db_path.display()
+        ),
+    )
+}
+
+/// Refuses a ledger a newer writer has stamped, creates and migrates one an
+/// older (or no) writer left, and stamps it. Never lowers the stamp.
+///
+/// A refused writer alters nothing. A ledger below this generation is migrated
+/// in ONE immediate transaction that also holds the schema batch and the stamp,
+/// so a crash or an error at any point rolls all of it back and the next open
+/// starts again from the old stamp; every step is also safe to repeat, so a
+/// ledger some earlier attempt half-changed is completed rather than failed.
+/// The stamp is re-read under the write lock, so two processes opening one old
+/// ledger migrate it once.
+fn ensure_schema(conn: &Connection, db_path: &Path) -> Result<(), LedgerError> {
+    let stamped = stamped_writer_version(conn)?;
+    if stamped > WRITER_VERSION {
+        return Err(writer_too_old(db_path, stamped));
+    }
+    if stamped == WRITER_VERSION {
+        return conn
+            .execute_batch(SCHEMA)
+            .map_err(|e| LedgerError::new("schema_failed", e.to_string()));
+    }
+    let failed = |e: rusqlite::Error| LedgerError::new("migration_failed", e.to_string());
+    // Another process may be migrating this very ledger. Waiting for its write
+    // lock is the one place a long wait is right, so the timeout is raised for
+    // that `BEGIN IMMEDIATE` alone and put back; the stamp is re-read below.
+    let ordinary_timeout: i64 = conn
+        .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+        .map_err(failed)?;
+    conn.busy_timeout(MIGRATION_BUSY_TIMEOUT).map_err(failed)?;
+    let begun = write_tx(conn);
+    let restored = conn.busy_timeout(std::time::Duration::from_millis(
+        u64::try_from(ordinary_timeout).unwrap_or(0),
+    ));
+    let tx = begun.map_err(failed)?;
+    restored.map_err(failed)?;
+    let stamped = stamped_writer_version(&tx)?;
+    if stamped > WRITER_VERSION {
+        return Err(writer_too_old(db_path, stamped));
     }
     if stamped < WRITER_VERSION {
-        conn.pragma_update(None, "user_version", WRITER_VERSION)
-            .map_err(|e| LedgerError::new("pragma_failed", format!("user_version: {e}")))?;
+        tx.execute_batch(SCHEMA).map_err(failed)?;
+        migrate_to_writer_2(&tx).map_err(failed)?;
+        tx.pragma_update(None, "user_version", WRITER_VERSION)
+            .map_err(failed)?;
+    }
+    tx.commit().map_err(failed)
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> rusqlite::Result<()> {
+    let present: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        params![table, column],
+        |row| row.get(0),
+    )?;
+    if present == 0 {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        ))?;
+    }
+    Ok(())
+}
+
+/// Writer generation 1 to 2. Runs inside [`ensure_schema`]'s transaction.
+///
+/// Non-destructive: no row is deleted. An old row cannot tell a double-recorded
+/// reflog entry from a genuine repeat (two identical checkouts), so the
+/// migration keeps both and numbers them: within each group of reflog rows that
+/// share an [`IdentityParts`] key, the later rows get `reflog_ordinal` 1, 2...
+/// by ascending `id`. The first row of a group, and every row of a group of
+/// one, keeps a NULL ordinal, which the index reads as 0, so the work scales
+/// with the duplicates and not with the rows. The unique index is then built
+/// over the key plus the ordinal, which cannot fail on existing data.
+/// Reconciling old double-writes against the live reflog is Wave B replay work.
+/// Ordinals are recomputed from `id`, so a re-run (the stamp was reset) is a
+/// no-op.
+///
+/// Rows from before the typed column carry their event time only in
+/// `detail_json`, so it is copied into the column first (reflog rows only, and
+/// only in the writer's exact shape); otherwise two entries at different times
+/// would be numbered as repeats of one.
+///
+/// An index of the same name with another definition (an earlier build's) is
+/// dropped and rebuilt rather than trusted.
+fn migrate_to_writer_2(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "events", "occurred_at", "TEXT")?;
+    add_column_if_missing(conn, "events", "reflog_ordinal", "INTEGER")?;
+    add_column_if_missing(conn, "transcript_cursors", "fingerprint", "TEXT")?;
+    let wanted = reflog_identity_index_sql();
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            params![REFLOG_IDENTITY_INDEX],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let current = stored
+        .as_deref()
+        .is_some_and(|sql| normalise_sql(sql) == normalise_sql(&wanted));
+    if !current && stored.is_some() {
+        conn.execute_batch(&format!("DROP INDEX {REFLOG_IDENTITY_INDEX}"))?;
+    }
+    let key = IdentityParts::COLUMNS.key();
+    conn.execute_batch(&format!(
+        "UPDATE events SET occurred_at = {from_detail}
+         WHERE occurred_at IS NULL AND {REFLOG_ROWS};
+         UPDATE events SET reflog_ordinal = numbered.n
+         FROM (SELECT id,
+                      ROW_NUMBER() OVER (PARTITION BY {key} ORDER BY id) - 1 AS n
+               FROM events WHERE {REFLOG_ROWS}) AS numbered
+         WHERE events.id = numbered.id AND numbered.n > 0
+           AND events.reflog_ordinal IS NOT numbered.n;",
+        from_detail = occurred_at_from_detail("detail_json"),
+    ))?;
+    if !current {
+        conn.execute_batch(&wanted)?;
     }
     Ok(())
 }
@@ -1108,6 +1367,13 @@ fn open(db_path: &Path) -> Result<Connection, LedgerError> {
     checked_state_directory(dir, Some(repo), false)?;
     validate_ledger_files(db_path, repo)?;
 
+    // A ledger a newer writer stamped is refused before anything below can touch
+    // it: switching a rollback-journal file to WAL rewrites its header.
+    let stamped = stamped_writer_version(&conn)?;
+    if stamped > WRITER_VERSION {
+        return Err(writer_too_old(db_path, stamped));
+    }
+
     // WAL lets a reader page the history while the writer appends. NORMAL
     // trades a fsync per commit for one per checkpoint; the ledger is a record
     // of actions that git has already made durable itself, so losing the last
@@ -1117,9 +1383,7 @@ fn open(db_path: &Path) -> Result<Connection, LedgerError> {
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| LedgerError::new("pragma_failed", format!("synchronous: {e}")))?;
     // Before the schema batch: a refused writer must not alter anything.
-    check_writer_version(&conn, db_path)?;
-    conn.execute_batch(SCHEMA)
-        .map_err(|e| LedgerError::new("schema_failed", e.to_string()))?;
+    ensure_schema(&conn, db_path)?;
     checked_state_directory(dir, Some(repo), false)?;
     validate_ledger_files(db_path, repo)?;
     Ok(conn)
@@ -1380,11 +1644,25 @@ fn open_readonly_initialised(db_path: &Path) -> Result<Connection, LedgerError> 
 /// [`advance_transcripts`] commits — passes through [`prepare`] and [`insert`];
 /// only the legacy import copies rows, already redacted when first written.
 pub fn append(draft: Draft) -> Result<i64, LedgerError> {
-    let event = prepare(&draft)?;
+    append_numbered(draft, 0)
+}
+
+/// [`append`] for a `reflog.*` row that is one of several identical entries of
+/// a replay pass: `ordinal` counts them from 0. Two processes replaying one
+/// pass number its entries the same way, so the unique reflog identity index
+/// refuses the second copy of each (`duplicate_reflog`). The ordinal means
+/// nothing to any other action.
+pub fn append_numbered(draft: Draft, ordinal: i64) -> Result<i64, LedgerError> {
+    let mut event = prepare(&draft)?;
+    if event.reflog_ordinal.is_some() {
+        event.reflog_ordinal = Some(ordinal);
+    }
     let result = with_conn(&draft.repo_path, |conn| insert(conn, &event));
 
     match &result {
         Ok(cursor) => announce(&draft.repo_path, *cursor),
+        // The entry is already in the ledger: nothing was lost.
+        Err(e) if e.code == "duplicate_reflog" => {}
         Err(_) => {
             // Counted, not swallowed. `status()` reports it, and the UI can say
             // the history it is showing is known to be incomplete.
@@ -1416,6 +1694,11 @@ struct Prepared {
     after_ref: Option<String>,
     duration_ms: Option<i64>,
     detail: Option<String>,
+    /// The typed `occurred_at` column: the draft's event-time stamp, only when
+    /// it is well-formed (the same check that lets it skip the redactor).
+    occurred_at: Option<String>,
+    /// `Some(0)` on a reflog row, `None` otherwise. See [`insert`].
+    reflog_ordinal: Option<i64>,
 }
 
 /// `contracts/event.schema.json`'s action pattern,
@@ -1494,6 +1777,12 @@ fn prepare(draft: &Draft) -> Result<Prepared, LedgerError> {
         after_ref: draft.after_ref.as_deref().map(redact::text),
         duration_ms: draft.duration_ms,
         detail,
+        occurred_at: draft
+            .event_stamp
+            .as_ref()
+            .filter(|stamp| stamp.is_well_formed())
+            .map(|stamp| stamp.occurred_at.clone()),
+        reflog_ordinal: draft.action.starts_with("reflog.").then_some(0),
     })
 }
 
@@ -1520,14 +1809,24 @@ fn store_object_and_detail(
     (object, redact_detail(detail, stamp, cap.as_ref()))
 }
 
+/// Inserts one prepared row.
+///
+/// A reflog row is written with the draft's `reflog_ordinal` (0 when it names
+/// none), and the unique reflog identity index refuses a second row with the
+/// same identity and ordinal; that refusal is `INSERT OR IGNORE` in effect
+/// (code `duplicate_reflog`, which [`append`] neither counts as dropped nor
+/// announces, and [`record_outcome`] reports as [`Recorded::Duplicate`]). The
+/// replay numbers identical entries of a second 0, 1, 2 in the reflog's own
+/// order, and carries that numbering across passes through the watermark
+/// (`reflog_watermarks`, see `ingest::replay_ref`).
 fn insert(conn: &Connection, event: &Prepared) -> Result<i64, LedgerError> {
     conn.execute(
         "INSERT INTO events (
              ulid, ts_utc, schema_version, repo_path, worktree_path,
              actor_kind, actor_id, session_id, task_id, action, object,
              argv_json, outcome, verdict_json, before_ref, after_ref,
-             duration_ms, detail_json
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+             duration_ms, detail_json, occurred_at, reflog_ordinal
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
         params![
             event.ulid,
             event.ts,
@@ -1547,9 +1846,21 @@ fn insert(conn: &Connection, event: &Prepared) -> Result<i64, LedgerError> {
             event.after_ref,
             event.duration_ms,
             event.detail,
+            event.occurred_at,
+            event.reflog_ordinal,
         ],
     )
-    .map_err(|e| LedgerError::new("insert_failed", e.to_string()))?;
+    .map_err(|e| match e {
+        // Another writer (the app and `gitpulsed` both replay the reflog)
+        // recorded this entry first. Not data loss, and not an insert failure.
+        rusqlite::Error::SqliteFailure(code, Some(message))
+            if code.code == rusqlite::ErrorCode::ConstraintViolation
+                && message.contains(REFLOG_IDENTITY_INDEX) =>
+        {
+            LedgerError::new("duplicate_reflog", message)
+        }
+        other => LedgerError::new("insert_failed", other.to_string()),
+    })?;
     Ok(conn.last_insert_rowid())
 }
 
@@ -1575,6 +1886,10 @@ pub(crate) fn transcript_key(path: &Path) -> String {
 pub(crate) struct TranscriptProgress {
     /// Bytes of each transcript already consumed, by [`transcript_key`].
     pub offsets: HashMap<String, u64>,
+    /// The fingerprint of the bytes ending at each offset ([`cursor_fingerprint`]),
+    /// by the same key. Absent for a cursor written before fingerprints existed
+    /// (a NULL column), which is trusted on its offset alone.
+    pub fingerprints: HashMap<String, String>,
     /// The timestamp watermark that governed catch-up before byte offsets
     /// existed, frozen the first time this worktree was caught up under
     /// offsets. `None` until then; empty when there was no watermark.
@@ -1607,7 +1922,10 @@ pub(crate) fn transcript_progress_many(
             .prepare("SELECT since_utc FROM transcript_baselines WHERE worktree_key = ?1")
             .map_err(failed)?;
         let mut offsets_stmt = conn
-            .prepare("SELECT file_key, byte_offset FROM transcript_cursors WHERE worktree_key = ?1")
+            .prepare(
+                "SELECT file_key, byte_offset, fingerprint FROM transcript_cursors
+                 WHERE worktree_key = ?1",
+            )
             .map_err(failed)?;
         keys.iter()
             .map(|worktree| {
@@ -1615,15 +1933,30 @@ pub(crate) fn transcript_progress_many(
                     .query_row(params![worktree], |row| row.get::<_, String>(0))
                     .optional()
                     .map_err(failed)?;
-                let offsets = offsets_stmt
+                let rows = offsets_stmt
                     .query_map(params![worktree], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
                     })
                     .map_err(failed)?
-                    .map(|row| row.map(|(key, offset)| (key, u64::try_from(offset).unwrap_or(0))))
-                    .collect::<Result<HashMap<_, _>, _>>()
+                    .collect::<Result<Vec<_>, _>>()
                     .map_err(failed)?;
-                Ok(TranscriptProgress { offsets, baseline })
+                let mut offsets = HashMap::new();
+                let mut fingerprints = HashMap::new();
+                for (key, offset, fingerprint) in rows {
+                    if let Some(fingerprint) = fingerprint {
+                        fingerprints.insert(key.clone(), fingerprint);
+                    }
+                    offsets.insert(key, u64::try_from(offset).unwrap_or(0));
+                }
+                Ok(TranscriptProgress {
+                    offsets,
+                    fingerprints,
+                    baseline,
+                })
             })
             .collect()
     })
@@ -1664,7 +1997,134 @@ pub(crate) struct TranscriptAdvance {
     /// it; `None` for a transcript never read for this worktree.
     pub from: Option<u64>,
     pub to: u64,
+    /// The fingerprint of the bytes ending at `to` ([`cursor_fingerprint`]),
+    /// stored beside the offset so a later read can tell the file it stopped in
+    /// from one rewritten past that offset. `None` leaves the check off for this
+    /// cursor (the last line was too long to keep, or nothing was read).
+    pub fingerprint: Option<String>,
     pub drafts: Vec<Draft>,
+}
+
+/// How many bytes each half of a cursor's fingerprint covers, at most.
+pub(crate) const CURSOR_FINGERPRINT_BYTES: usize = 64;
+
+/// A file's `(len, mtime in nanoseconds since the epoch)`, as a fingerprint
+/// folds it in.
+pub(crate) type FileStat = (u64, u64);
+
+/// The fingerprint stored with a transcript cursor:
+/// `"v3:{h}:{t}:{len}:{mtime_ns}:{head_hash}:{tail_hash}"`, where the hashes are
+/// digests (the ledger's FNV-1a) of the first `h` bytes of the file and of the
+/// `t` bytes that end at the cursor, each at most [`CURSOR_FINGERPRINT_BYTES`],
+/// and `len`/`mtime_ns` are the file's [`FileStat`] when the cursor was written
+/// (`-` when it could not be read). The tail has a digest of its own so a
+/// rewrite that moved it (a record prepended, the head changed) can be told from
+/// one that replaced it: the new file is searched for the bytes that digest
+/// names, and a cursor that finds them resumes after them.
+///
+/// Both byte halves are needed. The bytes before the cursor are what a resume
+/// depends on, but a transcript's lines end alike (the same trailing keys), so
+/// a rewrite that changes only what comes earlier in each line leaves that tail
+/// as it was; the head of the file is where a rewritten transcript differs. The
+/// two lengths are in the text because a cursor near the start of a file covers
+/// fewer bytes than one deep in it. A digest, never the bytes: a transcript's
+/// text may hold anything.
+///
+/// The stat is what lets an unchanged file cost one `stat` per pass: a file
+/// whose length and mtime are still the recorded ones is not opened. The
+/// unversioned `"{h}:{t}:{hash}"` the first build of this column wrote (one
+/// digest of both halves, no stat) is still read: it is re-hashed on every pass
+/// and cannot be searched for. `None` when either half is empty (nothing read yet).
+pub(crate) fn cursor_fingerprint(
+    head: &[u8],
+    tail: &[u8],
+    stat: Option<FileStat>,
+) -> Option<String> {
+    if head.is_empty() || tail.is_empty() {
+        return None;
+    }
+    let (head_hash, tail_hash) = (ids::fnv1a64(head), cursor_tail_hash(tail));
+    Some(match stat {
+        Some((len, mtime_ns)) => format!(
+            "v3:{}:{}:{len}:{mtime_ns}:{head_hash:016x}:{tail_hash:016x}",
+            head.len(),
+            tail.len()
+        ),
+        None => format!(
+            "v3:{}:{}:-:-:{head_hash:016x}:{tail_hash:016x}",
+            head.len(),
+            tail.len()
+        ),
+    })
+}
+
+/// The digest a fingerprint keeps of its tail bytes.
+pub(crate) fn cursor_tail_hash(tail: &[u8]) -> u64 {
+    ids::fnv1a64(tail)
+}
+
+/// Whether `head` and `tail` (read from a file as it is now, `parts.head` and
+/// `parts.tail` bytes long) are the bytes `fingerprint` was taken from.
+pub(crate) fn cursor_fingerprint_holds(
+    fingerprint: &str,
+    parts: &FingerprintParts,
+    head: &[u8],
+    tail: &[u8],
+) -> bool {
+    if parts.tail_hash.is_some() {
+        cursor_fingerprint(head, tail, parts.stat).as_deref() == Some(fingerprint)
+    } else {
+        let hash = ids::fnv1a64(&[head, tail].concat());
+        fingerprint == format!("{}:{}:{hash:016x}", head.len(), tail.len())
+    }
+}
+
+/// What a stored fingerprint covers: the byte counts of its two halves, the
+/// file stat it recorded if it did, and the tail's digest if it kept one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FingerprintParts {
+    pub head: usize,
+    pub tail: usize,
+    pub stat: Option<FileStat>,
+    pub tail_hash: Option<u64>,
+}
+
+/// Reads [`cursor_fingerprint`]'s text back, or `None` for text this build did
+/// not write (which is then not checked).
+pub(crate) fn parse_cursor_fingerprint(fingerprint: &str) -> Option<FingerprintParts> {
+    let valid = 1..=CURSOR_FINGERPRINT_BYTES;
+    let counts = |head: &str, tail: &str| {
+        let (head, tail) = (head.parse::<usize>().ok()?, tail.parse::<usize>().ok()?);
+        (valid.contains(&head) && valid.contains(&tail)).then_some((head, tail))
+    };
+    let mut fields = fingerprint.split(':');
+    let first = fields.next()?;
+    let parts = if first == "v3" {
+        let (head, tail) = counts(fields.next()?, fields.next()?)?;
+        let (len, mtime) = (fields.next()?, fields.next()?);
+        let stat = match (len, mtime) {
+            ("-", "-") => None,
+            _ => Some((len.parse().ok()?, mtime.parse().ok()?)),
+        };
+        fields.next()?;
+        let tail_hash = u64::from_str_radix(fields.next()?, 16).ok()?;
+        FingerprintParts {
+            head,
+            tail,
+            stat,
+            tail_hash: Some(tail_hash),
+        }
+    } else {
+        let (head, tail) = counts(first, fields.next()?)?;
+        fields.next()?;
+        FingerprintParts {
+            head,
+            tail,
+            stat: None,
+            tail_hash: None,
+        }
+    };
+    fields.next().is_none().then_some(parts)
 }
 
 /// Records each advance's events and moves its offset, all in one
@@ -1732,14 +2192,16 @@ pub(crate) fn advance_transcripts_family(
                     recorded += 1;
                 }
                 tx.execute(
-                    "INSERT INTO transcript_cursors (worktree_key, file_key, byte_offset)
-                     VALUES (?1, ?2, ?3)
+                    "INSERT INTO transcript_cursors (worktree_key, file_key, byte_offset, fingerprint)
+                     VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(worktree_key, file_key) DO UPDATE SET
-                        byte_offset = excluded.byte_offset",
+                        byte_offset = excluded.byte_offset,
+                        fingerprint = excluded.fingerprint",
                     params![
                         worktree,
                         advance.file_key,
-                        i64::try_from(advance.to).unwrap_or(i64::MAX)
+                        i64::try_from(advance.to).unwrap_or(i64::MAX),
+                        advance.fingerprint
                     ],
                 )
                 .map_err(failed)?;
@@ -1796,11 +2258,39 @@ pub(crate) fn forget_transcripts(
 /// with no harness installed. The failure is counted and surfaced by
 /// [`status`]; it is never silent, and it never blocks the action.
 pub fn record(draft: Draft) -> Option<i64> {
-    match append(draft) {
-        Ok(id) => Some(id),
+    match record_outcome(draft, 0) {
+        Recorded::Appended(id) => Some(id),
+        Recorded::Duplicate | Recorded::Failed => None,
+    }
+}
+
+/// What [`record_outcome`] did with a draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recorded {
+    /// A new row, at this cursor id.
+    Appended(i64),
+    /// The ledger already holds this reflog entry (same worktree, object, event
+    /// time and ordinal): another pass or process recorded it first. Nothing
+    /// was lost and nothing counts as a dropped append, but a caller that
+    /// reports how many entries it recorded must say how many it refused.
+    Duplicate,
+    /// The append failed; it is counted by [`status`] and logged.
+    Failed,
+}
+
+/// [`record`] that says which of the three things happened, for a row that is
+/// the `ordinal`-th of several identical `reflog.*` entries (see
+/// [`append_numbered`]; 0 for any other row).
+pub fn record_outcome(draft: Draft, ordinal: i64) -> Recorded {
+    match append_numbered(draft, ordinal) {
+        Ok(id) => Recorded::Appended(id),
+        Err(e) if e.code == "duplicate_reflog" => {
+            log::debug!("ledger append refused as a duplicate reflog entry: {e}");
+            Recorded::Duplicate
+        }
         Err(e) => {
             log::warn!("ledger append failed: {e}");
-            None
+            Recorded::Failed
         }
     }
 }
@@ -2618,16 +3108,49 @@ fn import_legacy_page(
         let mut imported = 0usize;
         let mut newest_cursor = None;
 
+        // A copied reflog row keeps its interim event time in the typed column
+        // too, and takes the next free ordinal of its identity group in the
+        // anchor: rows arrive in source id order, so two identical source rows
+        // import as 0 and 1 exactly as the migration numbers them in place, and
+        // a re-import is stopped by the ULID before the ordinal matters. The
+        // group is [`IdentityParts`] over the bound values, written to match the
+        // index's own expressions so its leading columns serve the lookup.
+        let imported_time = format!("CASE WHEN ?10 LIKE 'reflog.%' THEN {} END", {
+            occurred_at_from_detail("?18")
+        });
+        let group = IdentityParts::COLUMNS
+            .terms()
+            .into_iter()
+            .zip(
+                IdentityParts {
+                    worktree: "?5",
+                    object: "?11",
+                    occurred_at: &format!("({imported_time})"),
+                    detail: "?18",
+                }
+                .terms(),
+            )
+            .map(|(column, bound)| format!("{column} = {bound}"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let insert_sql = format!(
+            "INSERT INTO events (
+                 ulid, ts_utc, schema_version, repo_path, worktree_path,
+                 actor_kind, actor_id, session_id, task_id, action, object,
+                 argv_json, outcome, verdict_json, before_ref, after_ref,
+                 duration_ms, detail_json, occurred_at, reflog_ordinal
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,
+                 {imported_time},
+                 CASE WHEN ?10 LIKE 'reflog.%' AND ?11 IS NOT NULL THEN
+                     (SELECT COALESCE(MAX(COALESCE(reflog_ordinal, 0)) + 1, 0)
+                      FROM events WHERE {REFLOG_ROWS} AND {group})
+                 WHEN ?10 LIKE 'reflog.%' THEN 0 END)
+             ON CONFLICT(ulid) DO NOTHING"
+        );
         for event in page {
             let changed = transaction
                 .execute(
-                    "INSERT INTO events (
-                         ulid, ts_utc, schema_version, repo_path, worktree_path,
-                         actor_kind, actor_id, session_id, task_id, action, object,
-                         argv_json, outcome, verdict_json, before_ref, after_ref,
-                         duration_ms, detail_json
-                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
-                     ON CONFLICT(ulid) DO NOTHING",
+                    &insert_sql,
                     params![
                         event.ulid,
                         event.ts_utc,
@@ -2848,9 +3371,263 @@ fn import_source(
     Ok(imported_total)
 }
 
-/// The `object` of every `reflog.*` event recorded for one checkout, in the
-/// form it is stored (redacted), for the reflog catch-up's "already recorded"
-/// test.
+/// Where reflog replay stopped for one ref of one checkout: the identity of
+/// the last entry it recorded, as `reflog_watermarks` holds it. The four
+/// fields are what tell that entry from every other one of the same ref: the
+/// selector's time, the commit, a hash of the stored identity (commit and
+/// message), and the entry's ordinal among identical ones of that second.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReflogWatermark {
+    pub unix: i64,
+    pub oid: String,
+    pub msg_hash: String,
+    pub ordinal: i64,
+}
+
+/// The hash a watermark keeps of a reflog entry's identity (`"{oid} {message}"`).
+/// Taken over the stored spelling, so a message that carried a secret leaves
+/// no digest of the secret in this table.
+pub(crate) fn reflog_message_hash(identity: &str) -> String {
+    format!("{:016x}", ids::fnv1a64(stored_object(identity).as_bytes()))
+}
+
+/// The watermark for `ref_name` of `worktree_path`'s checkout, if replay has
+/// recorded any entry of it. A read error is an error, never "no watermark":
+/// the caller would then replay from the top of the window.
+pub(crate) fn reflog_watermark(
+    repo_path: &str,
+    worktree_path: &str,
+    ref_name: &str,
+) -> Result<Option<ReflogWatermark>, LedgerError> {
+    let key = transcript_key(Path::new(worktree_path));
+    with_conn(repo_path, |conn| {
+        conn.query_row(
+            "SELECT last_entry_unix, last_entry_oid, last_entry_msg_hash, last_entry_ordinal
+             FROM reflog_watermarks WHERE worktree_key = ?1 AND ref_name = ?2",
+            params![key, ref_name],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map(|row| match row {
+            // A row with a missing part cannot name an entry; it is no mark.
+            Some((Some(unix), Some(oid), Some(msg_hash), Some(ordinal))) => Some(ReflogWatermark {
+                unix,
+                oid,
+                msg_hash,
+                ordinal,
+            }),
+            _ => None,
+        })
+        .map_err(|e| LedgerError::new("watermark_read_failed", e.to_string()))
+    })
+}
+
+/// One reflog entry of a [`record_reflog_batch`].
+pub(crate) struct ReflogRow {
+    /// The row to write; `None` for an entry replay settles without one (the
+    /// ledger already holds it as a row an old build wrote).
+    pub draft: Option<Draft>,
+    pub ordinal: i64,
+    /// The watermark that names this entry, written if it is the last settled.
+    pub mark: ReflogWatermark,
+    /// The entry's time was not believed (absent, or ahead of the clock), so its
+    /// `occurred_at` is ingest time: part of the unique identity, and different
+    /// on every replay, so the index alone cannot refuse a second recording. The
+    /// batch counts the rows already holding the entry and records only an
+    /// ordinal past them.
+    pub untimed: bool,
+}
+
+/// Records `rows` (one ref's entries, oldest first) and moves that ref's
+/// watermark to the last settled one, all in ONE transaction: a process killed
+/// anywhere in it leaves the rows and the watermark both written or neither.
+///
+/// Stops at the first row that fails to write and commits what settled before
+/// it. Returns one outcome per row attempted (`None`: settled without a row),
+/// so the caller's tallies and its "settled prefix" agree with what is in the
+/// ledger. `Err` only when the transaction could not be opened or committed, in
+/// which case nothing was written.
+pub(crate) fn record_reflog_batch(
+    repo_path: &str,
+    worktree_path: &str,
+    ref_name: &str,
+    rows: Vec<ReflogRow>,
+) -> Result<Vec<Option<Recorded>>, LedgerError> {
+    let key = transcript_key(Path::new(worktree_path));
+    let prepared: Vec<Option<Result<Prepared, LedgerError>>> = rows
+        .iter()
+        .map(|row| row.draft.as_ref().map(prepare))
+        .collect();
+    let attempted = prepared.iter().flatten().count();
+    let result = with_conn(repo_path, |conn| {
+        let failed = |e: rusqlite::Error| LedgerError::new("insert_failed", e.to_string());
+        let tx = write_tx(conn).map_err(failed)?;
+        let mut outcomes: Vec<Option<Recorded>> = Vec::with_capacity(rows.len());
+        let mut settled: Option<&ReflogWatermark> = None;
+        let mut newest = None;
+        for (row, prepared) in rows.iter().zip(prepared) {
+            let outcome = match prepared {
+                None => None,
+                Some(Err(e)) => {
+                    log::warn!("ledger append failed: {e}");
+                    Some(Recorded::Failed)
+                }
+                Some(Ok(mut event)) => {
+                    event.reflog_ordinal = event.reflog_ordinal.map(|_| row.ordinal);
+                    let held = row.untimed && untimed_rows_held(&tx, &event) > row.ordinal;
+                    Some(if held {
+                        Recorded::Duplicate
+                    } else {
+                        match insert(&tx, &event) {
+                            Ok(id) => {
+                                newest = Some(id);
+                                #[cfg(all(test, unix))]
+                                crash_point(
+                                    1 + i64::try_from(
+                                        outcomes
+                                            .iter()
+                                            .flatten()
+                                            .filter(|o| matches!(o, Recorded::Appended(_)))
+                                            .count(),
+                                    )
+                                    .unwrap_or(0),
+                                );
+                                Recorded::Appended(id)
+                            }
+                            Err(e) if e.code == "duplicate_reflog" => Recorded::Duplicate,
+                            Err(e) => {
+                                log::warn!("ledger append failed: {e}");
+                                Recorded::Failed
+                            }
+                        }
+                    })
+                }
+            };
+            let stop = outcome == Some(Recorded::Failed);
+            outcomes.push(outcome);
+            if stop {
+                break;
+            }
+            settled = Some(&row.mark);
+        }
+        if let Some(mark) = settled {
+            upsert_reflog_watermark(&tx, &key, ref_name, mark)
+                .map_err(|e| LedgerError::new("watermark_write_failed", e.to_string()))?;
+        }
+        tx.commit().map_err(failed)?;
+        Ok((outcomes, newest))
+    });
+    match result {
+        Ok((outcomes, newest)) => {
+            for outcome in &outcomes {
+                if *outcome == Some(Recorded::Failed) {
+                    record_dropped_append(repo_path);
+                }
+            }
+            if let Some(cursor) = newest {
+                announce(repo_path, cursor);
+            }
+            Ok(outcomes)
+        }
+        Err(e) => {
+            for _ in 0..attempted {
+                record_dropped_append(repo_path);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// How many `reflog.*` rows already hold `event`'s entry, of an untimed one
+/// (see [`ReflogRow::untimed`]): same worktree and object, stamped with ingest
+/// time. A read that fails counts as none held, so the entry is attempted and a
+/// failure to write it surfaces as one.
+fn untimed_rows_held(conn: &Connection, event: &Prepared) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM events
+         WHERE action LIKE 'reflog.%' AND object = ?1 AND worktree_path IS ?2
+           AND instr(detail_json, '\"occurred_at_basis\":\"ingest\"') > 0",
+        params![event.object, event.worktree_path],
+        |row| row.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// Test-only: a child replay process kills itself (SIGKILL, no unwinding, no
+/// destructors) once a batch has written `GITPULSE_TEST_KILL_AFTER_RECORDED`
+/// rows, inside the transaction that has not committed them.
+#[cfg(all(test, unix))]
+fn crash_point(written: i64) {
+    let after = std::env::var("GITPULSE_TEST_KILL_AFTER_RECORDED")
+        .ok()
+        .and_then(|n| n.parse::<i64>().ok());
+    if after == Some(written) {
+        // SAFETY: a signal to this very process; SIGKILL cannot be handled.
+        unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+    }
+}
+
+/// Moves a watermark inside the transaction that wrote the rows it names.
+fn upsert_reflog_watermark(
+    conn: &Connection,
+    key: &str,
+    ref_name: &str,
+    mark: &ReflogWatermark,
+) -> rusqlite::Result<()> {
+    let updated_at = ids::iso8601_utc(ids::now_millis());
+    {
+        conn.execute(
+            "INSERT INTO reflog_watermarks (
+                 worktree_key, ref_name, last_entry_unix, last_entry_oid,
+                 last_entry_msg_hash, last_entry_ordinal, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(worktree_key, ref_name) DO UPDATE SET
+                 last_entry_unix = excluded.last_entry_unix,
+                 last_entry_oid = excluded.last_entry_oid,
+                 last_entry_msg_hash = excluded.last_entry_msg_hash,
+                 last_entry_ordinal = excluded.last_entry_ordinal,
+                 updated_at = excluded.updated_at",
+            params![
+                key,
+                ref_name,
+                mark.unix,
+                mark.oid,
+                mark.msg_hash,
+                mark.ordinal,
+                updated_at
+            ],
+        )
+        .map(|_| ())
+    }
+}
+
+/// The query behind [`recorded_reflog_objects`], one text so the test that
+/// holds its plan to the partial index runs the statement production runs.
+const RECORDED_REFLOG_SQL: &str = "SELECT object,
+        CASE WHEN json_valid(detail_json)
+             THEN json_extract(detail_json, '$.object_truncated.hash') END
+ FROM events INDEXED BY idx_events_reflog
+ WHERE action LIKE 'reflog.%' AND object IS NOT NULL
+   AND occurred_at IS NULL
+   AND (worktree_path IN (?1, ?2) OR (?3 AND worktree_path IS NULL))";
+
+/// The `object` of every *legacy* `reflog.*` event recorded for one checkout,
+/// in the form it is stored (redacted), for the reflog catch-up's "already
+/// recorded" test.
+///
+/// Legacy means no `occurred_at`: a row written before replay typed its event
+/// time. Those cannot be matched by the unique reflog identity index (their
+/// time part is empty), so replay still skips an entry whose identity one of
+/// them holds. A row with an `occurred_at` is deliberately absent: the index
+/// refuses its replayed copy exactly, and counting it here would hide the
+/// second of two identical entries after a pass that stopped between them.
 ///
 /// One query on the partial index `idx_events_reflog` in place of paging the whole ledger
 /// through [`tail`]. A read error is an error: the caller must not read "could
@@ -2863,27 +3640,66 @@ pub(crate) fn recorded_reflog_objects(
     worktree_path: &str,
     is_anchor: bool,
 ) -> Result<std::collections::HashSet<String>, LedgerError> {
+    legacy_reflog_objects(repo_path, worktree_path, is_anchor, None)
+}
+
+/// The query behind [`recorded_reflog_objects_since`]: the same rows, read
+/// through the append-time index from a time on, so its cost follows what was
+/// appended since and not the checkout's whole reflog history.
+const RECORDED_REFLOG_SINCE_SQL: &str = "SELECT object,
+        CASE WHEN json_valid(detail_json)
+             THEN json_extract(detail_json, '$.object_truncated.hash') END
+ FROM events INDEXED BY idx_events_ts
+ WHERE ts_utc >= ?4 AND action LIKE 'reflog.%' AND object IS NOT NULL
+   AND occurred_at IS NULL
+   AND (worktree_path IN (?1, ?2) OR (?3 AND worktree_path IS NULL))";
+
+/// [`recorded_reflog_objects`] for the legacy rows appended at or after
+/// `since_unix` (Unix seconds, append time).
+///
+/// A generation-1 process that was already running when the ledger migrated
+/// keeps writing reflog rows with no `occurred_at`, which the unique index
+/// cannot match, so replay must keep reading such rows after its watermark
+/// exists. Only recent ones can matter: such a row is appended no earlier than
+/// the entry it records happened, which is after the watermark's entry minus
+/// any clock skew, so the caller passes that time less a margin.
+pub(crate) fn recorded_reflog_objects_since(
+    repo_path: &str,
+    worktree_path: &str,
+    is_anchor: bool,
+    since_unix: i64,
+) -> Result<std::collections::HashSet<String>, LedgerError> {
+    let since = ids::iso8601_utc(u64::try_from(since_unix).unwrap_or(0).saturating_mul(1000));
+    legacy_reflog_objects(repo_path, worktree_path, is_anchor, Some(&since))
+}
+
+fn legacy_reflog_objects(
+    repo_path: &str,
+    worktree_path: &str,
+    is_anchor: bool,
+    since: Option<&str>,
+) -> Result<std::collections::HashSet<String>, LedgerError> {
     let raw = worktree_path.to_string();
     let stored = redact::text(worktree_path);
     with_conn(repo_path, |conn| {
         let mut stmt = conn
-            .prepare(
-                "SELECT object,
-                        CASE WHEN json_valid(detail_json)
-                             THEN json_extract(detail_json, '$.object_truncated.hash') END
-                 FROM events
-                 WHERE action LIKE 'reflog.%' AND object IS NOT NULL
-                   AND (worktree_path IN (?1, ?2) OR (?3 AND worktree_path IS NULL))",
-            )
-            .map_err(|e| LedgerError::new("prepare_failed", e.to_string()))?;
-        let rows = stmt
-            .query_map(params![raw, stored, is_anchor], |row| {
-                Ok(cap::object_key_of_row(
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                ))
+            .prepare(if since.is_some() {
+                RECORDED_REFLOG_SINCE_SQL
+            } else {
+                RECORDED_REFLOG_SQL
             })
-            .map_err(|e| LedgerError::new("query_failed", e.to_string()))?;
+            .map_err(|e| LedgerError::new("prepare_failed", e.to_string()))?;
+        let map = |row: &Row<'_>| {
+            Ok(cap::object_key_of_row(
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        };
+        let rows = match since {
+            Some(since) => stmt.query_map(params![raw, stored, is_anchor, since], map),
+            None => stmt.query_map(params![raw, stored, is_anchor], map),
+        }
+        .map_err(|e| LedgerError::new("query_failed", e.to_string()))?;
         rows.collect::<Result<_, _>>()
             .map_err(|e| LedgerError::new("row_failed", e.to_string()))
     })
@@ -3927,6 +4743,12 @@ mod reliability_tests;
 
 #[cfg(test)]
 mod query_tests;
+
+#[cfg(test)]
+mod schema_bump_tests;
+
+#[cfg(test)]
+mod schema_bump_adv_tests;
 
 /// Test-only helpers that need the private registry.
 #[cfg(test)]

@@ -1,6 +1,7 @@
 use gitpulse_lib::engine::deadbranch::{
     age_severity, clean_branches, create_backup, is_branch_merged_by_tree, list_backups,
     matches_glob, restore_backup, scan_stale_branches, DeadbranchConfig, StaleBranchInfo,
+    TreeMerge,
 };
 use gitpulse_lib::engine::git_cli::git_text;
 use std::fs;
@@ -103,7 +104,7 @@ fn detect_squash_and_rebase_merges_via_merge_tree() {
     );
     assert_eq!(
         tree_merged,
-        Some(true),
+        TreeMerge::Merged,
         "is_branch_merged_by_tree failed to detect squash-merged branch"
     );
 
@@ -130,6 +131,37 @@ fn detect_squash_and_rebase_merges_via_merge_tree() {
         branch.merged_by_tree,
         "Branch should be marked merged_by_tree"
     );
+}
+
+#[test]
+fn a_conflicting_branch_is_not_merged_and_a_missing_one_is_unknown() {
+    let repo = TestRepo::init();
+    repo.write("shared.txt", "root\n");
+    repo.commit_all("root");
+    run_git(repo.dir.path(), &["checkout", "-b", "feature/edit"]);
+    repo.write("shared.txt", "from the branch\n");
+    repo.commit_all("branch edit");
+    run_git(repo.dir.path(), &["checkout", "main"]);
+    repo.write("shared.txt", "from main\n");
+    repo.commit_all("main edit");
+    let default_tree = git_text(repo.dir.path(), &["rev-parse", "main^{tree}"]).unwrap();
+
+    // merge-tree exits 1 on a conflict. That is an answer (the branch has
+    // content main lacks), where it used to be an unreadable failure.
+    assert_eq!(
+        is_branch_merged_by_tree(repo.dir.path(), default_tree.trim(), "main", "feature/edit"),
+        TreeMerge::NotMerged
+    );
+    // A ref that does not exist is a failure to compare, never "not merged".
+    assert!(matches!(
+        is_branch_merged_by_tree(
+            repo.dir.path(),
+            default_tree.trim(),
+            "main",
+            "no/such-branch"
+        ),
+        TreeMerge::Unknown(_)
+    ));
 }
 
 #[test]

@@ -290,5 +290,15 @@ export function sortByPriority<T extends Pick<TaskCard, "priority" | "due_at">>(
   return cards.map((card, index) => ({ card, index })).sort((a, b) => rank(a.card) - rank(b.card) || (due(a.card) < due(b.card) ? -1 : due(a.card) > due(b.card) ? 1 : 0) || a.index - b.index).map((entry) => entry.card);
 }
 
+/**
+ * The List layout's rows from the columns on screen: column by column in
+ * board order, or every card most urgent first whatever its status in
+ * priority order (`sortByPriority`, so ties keep the column order).
+ */
+export function listRows<T extends Pick<TaskCard, "priority" | "due_at">>(columns: readonly (readonly T[])[], order: "priority" | "board"): T[] {
+  const rows = columns.flat();
+  return order === "priority" ? sortByPriority(rows) : rows;
+}
+
 // The scale has one owner, `taskPriority.ts`; these stay importable from here.
 export { PRIORITY_LABELS, priorityLabel } from "./taskPriority";
