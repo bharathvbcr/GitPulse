@@ -179,13 +179,14 @@ pub const CATCH_UP_DEADLINE: std::time::Duration = std::time::Duration::from_sec
 /// callers that count failures leave it out, and callers that show errors keep it.
 pub(crate) const NO_TRANSCRIPT_ROOT: &str = "no home directory, so transcripts cannot be located";
 
-/// Where Claude Code keeps its transcripts, for the hermetic canary that checks
-/// every per-user directory resolves under the test process's own root. The
-/// pass asks each [`source::TranscriptSource`] for its own.
+/// Where each transcript source looks, by name, for the hermetic canary that
+/// checks every per-user directory resolves under the test process's own root.
 #[cfg(test)]
-pub(crate) fn transcript_root() -> Option<std::path::PathBuf> {
-    use source::TranscriptSource;
-    source::ClaudeSource.root().map(|root| root.path)
+pub(crate) fn source_roots() -> Vec<(&'static str, Option<std::path::PathBuf>)> {
+    source::sources()
+        .iter()
+        .map(|source| (source.name(), source.root().map(|root| root.path)))
+        .collect()
 }
 
 fn dirs_home() -> Option<std::path::PathBuf> {

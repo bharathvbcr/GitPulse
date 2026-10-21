@@ -1,10 +1,10 @@
 //! Codex rollouts, read as a transcript source.
 //!
 //! Codex writes one JSONL file per thread under
-//! `~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<thread id>.jsonl`. Every line is
-//! an envelope `{"timestamp", "ordinal", "type", "payload"}`. This reader was
-//! written against what the Codex CLI `0.149.1` writes (its SDK home is the
-//! only place on the build machine that held rollouts), and reads exactly that:
+//! `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<time>-<thread id>.jsonl` (`CODEX_HOME`
+//! defaults to `~/.codex`). Every line is an envelope `{"timestamp", "ordinal",
+//! "type", "payload"}`, as the Codex CLI `0.149.1` writes it (the rollouts on the
+//! build machine); the tool-call payloads are Codex's protocol types. Read:
 //!
 //! * `session_meta` is the first line. Its payload carries the thread `id`, the
 //!   `cwd` and the `cli_version`. Nothing else on a line says which thread or
@@ -12,20 +12,27 @@
 //!   mid-file (the cursor resumed) takes them from the file's first line.
 //! * `turn_context` carries the `cwd` of the turn that follows. A resume that
 //!   starts after it falls back to the `session_meta` one.
-//! * A command is a `response_item` whose payload is a `custom_tool_call` named
-//!   `exec`, whose `input` is JavaScript. The command is the string literal
-//!   handed to `tools.exec_command({cmd: ..., workdir: ...})`, and a file edit
-//!   is a `*** Add File:` / `*** Update File:` / `*** Delete File:` /
-//!   `*** Move to:` header of a patch handed to `tools.apply_patch`.
+//! * A command or a file edit is a `response_item` tool call, in one of the
+//!   shapes `scan_payload` lists, read from Codex's own protocol types
+//!   (`function_call` `exec_command` / `shell`, `local_shell_call`,
+//!   `custom_tool_call` `apply_patch`). The fifth is code mode, which the Codex
+//!   SDK writes (and the only one rollouts on the build machine held): a
+//!   `custom_tool_call` named `exec` whose `input` is JavaScript, read for the
+//!   string literal handed to `tools.exec_command({cmd: ..., workdir: ...})` and
+//!   the headers of a patch handed to `tools.apply_patch`. Code mode is a real
+//!   Codex feature (`CodeModeExecuteHandler` in `core/src/tools/handlers`), so
+//!   its scanner stays; it is the narrow part, and what it cannot read is counted.
+//!   A patch's edits are its `*** Add File:` / `*** Update File:` /
+//!   `*** Delete File:` / `*** Move to:` headers.
 //! * `event_msg`, `compacted`, `world_state`, `inter_agent_communication_metadata`
 //!   and every other `response_item` (messages, reasoning, tool outputs, calls to
 //!   tools that change nothing) cannot hold a call.
 //!
 //! Anything else is counted, never guessed at: a line that is not an envelope of
 //! a known `type`, a call to a shell or patch tool in a shape this reader does
-//! not know (a `function_call` named `exec_command`, a `local_shell_call`), and
-//! a command whose string is not a literal (a variable, a concatenation, a
-//! template with `${}`). The format moves, and a count of what was not read is
+//! not know (a `shell_command`, an `exec_command` whose arguments do not parse,
+//! a `local_shell_call` of another action), and a code-mode command whose string
+//! is not a literal (a variable, a concatenation, a template with `${}`). The format moves, and a count of what was not read is
 //! what keeps a partial history from reading as a whole one.
 //!
 //! Like Claude's reader, only the commands and paths an agent executed are
@@ -40,7 +47,7 @@ use super::source::{Parsed, RecordParser, SourceRoot, TranscriptSource};
 use super::transcript::ToolCall;
 
 /// The variable that moves the Codex rollout directory, as
-/// `GITPULSE_TRANSCRIPT_ROOT` moves Claude's.
+/// `GITPULSE_TRANSCRIPT_ROOT` moves Claude's. It wins over `CODEX_HOME`.
 pub(crate) const ROOT_ENV: &str = "GITPULSE_CODEX_TRANSCRIPT_ROOT";
 
 /// How much of a rollout's first line is read to find its `session_meta` when a
@@ -59,16 +66,22 @@ impl TranscriptSource for CodexSource {
     }
 
     fn root(&self) -> Option<SourceRoot> {
-        match std::env::var_os(ROOT_ENV) {
-            Some(path) => Some(SourceRoot {
+        if let Some(path) = std::env::var_os(ROOT_ENV).filter(|p| !p.is_empty()) {
+            return Some(SourceRoot {
                 path: PathBuf::from(path),
                 explicit: true,
-            }),
-            None => super::dirs_home().map(|home| SourceRoot {
-                path: home.join(".codex").join("sessions"),
-                explicit: false,
-            }),
+            });
         }
+        // Codex's own home: `CODEX_HOME`, else `~/.codex`; an empty value is
+        // unset (`codex-rs/utils/home-dir/src/lib.rs`). Its sessions are below it.
+        let home = std::env::var_os("CODEX_HOME")
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| super::dirs_home().map(|home| home.join(".codex")))?;
+        Some(SourceRoot {
+            path: home.join("sessions"),
+            explicit: false,
+        })
     }
 
     fn legacy_floor(&self) -> bool {
@@ -195,25 +208,9 @@ impl CodexParser {
     }
 
     fn calls_in(&self, payload: &serde_json::Value, timestamp: Option<&str>) -> Parsed {
-        let kind = payload["type"].as_str().unwrap_or_default();
-        let name = payload["name"].as_str().unwrap_or_default();
-        let shaped_like_a_change = ["exec_command", "shell", "apply_patch"]
-            .iter()
-            .any(|tool| name.contains(tool));
-        match (kind, name) {
-            ("custom_tool_call", "exec") => {}
-            // A call to a shell or patch tool in a shape this reader does not
-            // know is a gap. One to a tool that changes nothing is not.
-            ("custom_tool_call" | "function_call", _) if shaped_like_a_change => {
-                return Parsed::skipped()
-            }
-            ("local_shell_call", _) => return Parsed::skipped(),
-            _ => return Parsed::nothing(),
-        }
-        let Some(input) = payload["input"].as_str() else {
-            return Parsed::skipped();
+        let Some(found) = scan_payload(payload) else {
+            return Parsed::nothing();
         };
-        let found = scan_input(input);
         if found.commands.is_empty() && found.patched.is_empty() && found.unread == 0 {
             return Parsed::nothing();
         }
@@ -244,10 +241,15 @@ impl CodexParser {
                 command,
             };
         for command in found.commands {
-            let cwd = command.workdir.as_deref().unwrap_or(&self.cwd);
+            // A relative workdir is relative to the turn's directory.
+            let cwd = match command.workdir {
+                Some(dir) if dir.starts_with('/') => dir,
+                Some(dir) => format!("{}/{dir}", self.cwd.trim_end_matches('/')),
+                None => self.cwd.clone(),
+            };
             parsed
                 .calls
-                .push(call("Bash", cwd, None, Some(command.cmd)));
+                .push(call("Bash", &cwd, None, Some(command.cmd)));
         }
         for path in found.patched {
             let absolute = if path.starts_with('/') {
@@ -260,6 +262,114 @@ impl CodexParser {
                 .push(call("Edit", &self.cwd, Some(absolute), None));
         }
         parsed
+    }
+}
+
+/// What a tool-call payload of a `response_item` holds; `None` for one that
+/// cannot change anything.
+///
+/// The shapes are Codex's own (`codex-rs/protocol/src/models.rs`):
+/// * `function_call` `exec_command`, `arguments` a JSON string
+///   `{cmd, workdir?}` (`core/src/tools/handlers/unified_exec`, `shell_spec.rs`);
+/// * `function_call` `shell`, `arguments` `{command: [argv], workdir?}`
+///   (`ShellToolCallParams`);
+/// * `local_shell_call`, `action` `{type: "exec", command: [argv],
+///   working_directory?}` (`LocalShellExecAction`);
+/// * `custom_tool_call` `apply_patch`, `input` the raw patch text
+///   (`core/src/tools/handlers/apply_patch.rs`);
+/// * `custom_tool_call` `exec`, code mode, `input` JavaScript: what the Codex
+///   SDK writes, and the only shape the rollouts on the build machine held.
+///
+/// A call to a shell or patch tool in any other shape (or one of these that does
+/// not parse) is counted unread. A call to a tool that changes nothing is not.
+fn scan_payload(payload: &serde_json::Value) -> Option<Scanned> {
+    let kind = payload["type"].as_str().unwrap_or_default();
+    let name = payload["name"].as_str().unwrap_or_default();
+    let unread = || Scanned {
+        unread: 1,
+        ..Scanned::default()
+    };
+    let one = |command: Option<Command>| match command {
+        Some(command) => Scanned {
+            commands: vec![command],
+            ..Scanned::default()
+        },
+        None => unread(),
+    };
+    match (kind, name) {
+        ("custom_tool_call", "exec") => {
+            Some(payload["input"].as_str().map_or_else(unread, scan_input))
+        }
+        ("custom_tool_call", "apply_patch") => Some(match payload["input"].as_str() {
+            Some(input) => {
+                let patched = patch_paths(input);
+                let unread = usize::from(patched.is_empty());
+                Scanned {
+                    patched,
+                    unread,
+                    ..Scanned::default()
+                }
+            }
+            None => unread(),
+        }),
+        ("function_call", "exec_command") => {
+            let args = arguments(payload);
+            let cmd = args.as_ref().and_then(|a| a["cmd"].as_str());
+            Some(one(cmd.map(|cmd| Command {
+                cmd: cmd.to_string(),
+                workdir: args.as_ref().and_then(|a| text(&a["workdir"])),
+            })))
+        }
+        ("function_call", "shell") => {
+            let args = arguments(payload);
+            let argv = args.as_ref().and_then(|a| argv(&a["command"]));
+            Some(one(argv.map(|argv| Command {
+                cmd: argv,
+                workdir: args.as_ref().and_then(|a| text(&a["workdir"])),
+            })))
+        }
+        ("local_shell_call", _) => {
+            let action = &payload["action"];
+            let exec = action["type"].as_str() == Some("exec");
+            let argv = exec.then(|| argv(&action["command"])).flatten();
+            Some(one(argv.map(|argv| Command {
+                cmd: argv,
+                workdir: text(&action["working_directory"]),
+            })))
+        }
+        ("custom_tool_call" | "function_call", _)
+            if ["exec_command", "shell", "apply_patch"]
+                .iter()
+                .any(|tool| name.contains(tool)) =>
+        {
+            Some(unread())
+        }
+        _ => None,
+    }
+}
+
+/// The JSON a `function_call` carries in its `arguments` string.
+fn arguments(payload: &serde_json::Value) -> Option<serde_json::Value> {
+    serde_json::from_str(payload["arguments"].as_str()?).ok()
+}
+
+fn text(value: &serde_json::Value) -> Option<String> {
+    value.as_str().filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+/// An argv as the command line it ran: the script of a `bash -lc <script>`
+/// style wrapper, otherwise the words joined by spaces. `None` unless it is a
+/// non-empty array of strings.
+fn argv(value: &serde_json::Value) -> Option<String> {
+    let words: Vec<&str> = value
+        .as_array()?
+        .iter()
+        .map(serde_json::Value::as_str)
+        .collect::<Option<_>>()?;
+    match words.as_slice() {
+        [] => None,
+        [_, flag, script] if matches!(*flag, "-c" | "-lc") => Some((*script).to_string()),
+        words => Some(words.join(" ")),
     }
 }
 

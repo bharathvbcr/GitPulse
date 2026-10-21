@@ -217,13 +217,14 @@ fn unknown_and_malformed_codex_lines_are_counted_and_never_panic() {
         envelope(
             2,
             "response_item",
-            serde_json::json!({ "type": "function_call", "name": "exec_command",
-                                "arguments": "{\"cmd\":\"ls\"}", "call_id": "c" }),
+            serde_json::json!({ "type": "function_call", "name": "shell_command",
+                                "arguments": "{\"command\":\"ls\"}", "call_id": "c" }),
         ),
         envelope(
             3,
             "response_item",
-            serde_json::json!({ "type": "local_shell_call", "action": { "command": ["ls"] } }),
+            serde_json::json!({ "type": "local_shell_call",
+                                "action": { "type": "other", "command": ["ls"] } }),
         ),
         // A command that is not a literal.
         exec(4, "const c = 'ls'; await tools.exec_command({cmd: c});"),
@@ -583,4 +584,200 @@ fn a_codex_cursor_is_not_forgotten_while_its_root_is_not_walked() {
     assert_eq!(between.recorded, 0, "{between:?}");
     assert_eq!(again.recorded, 0, "the rollout was replayed: {again:?}");
     assert_eq!(rows(repo).len(), 1);
+}
+
+fn call(second: u32, payload: serde_json::Value) -> String {
+    envelope(second, "response_item", payload)
+}
+
+/// The shapes the ordinary Codex CLI writes (Codex's protocol types), as
+/// synthetic fixtures: the arguments are a JSON *string*, an argv is an array,
+/// and a freeform patch is the raw text.
+#[test]
+fn the_ordinary_codex_tool_call_shapes_are_read() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo = repo_dir.path().to_str().unwrap();
+    let codex = tempfile::tempdir().unwrap();
+    let empty_claude = tempfile::tempdir().unwrap();
+    let args = |v: serde_json::Value| v.to_string();
+    let lines = vec![
+        session_meta("THREAD-5", repo),
+        call(
+            1,
+            serde_json::json!({ "type": "function_call", "name": "exec_command", "call_id": "a",
+                "arguments": args(serde_json::json!({ "cmd": "cargo build", "workdir": repo,
+                                                      "yield_time_ms": 1000 })) }),
+        ),
+        call(
+            2,
+            serde_json::json!({ "type": "function_call", "name": "shell", "call_id": "b",
+                "arguments": args(serde_json::json!({ "command": ["bash", "-lc", "make all"],
+                                                      "workdir": "sub" })) }),
+        ),
+        call(
+            3,
+            serde_json::json!({ "type": "local_shell_call", "call_id": "c", "status": "completed",
+                "action": { "type": "exec", "command": ["git", "status"],
+                            "working_directory": repo } }),
+        ),
+        call(
+            4,
+            serde_json::json!({ "type": "custom_tool_call", "name": "apply_patch", "call_id": "d",
+                "input": format!("*** Begin Patch\n*** Update File: src/p.rs\n@@\n-a\n+b\n*** Add File: {repo}/n.rs\n+x\n*** End Patch") }),
+        ),
+        // Tools that change nothing, and a function call's output.
+        call(
+            5,
+            serde_json::json!({ "type": "function_call", "name": "wait", "arguments": "{}", "call_id": "e" }),
+        ),
+        call(
+            6,
+            serde_json::json!({ "type": "function_call_output", "call_id": "a", "output": "ok" }),
+        ),
+    ];
+    write_lines(&rollout_path(codex.path(), "THREAD-5"), &lines);
+
+    let out = with_roots(Some(empty_claude.path()), Some(codex.path()), || {
+        ingest_transcripts(repo)
+    });
+
+    assert_eq!((out.recorded, out.skipped_lines), (5, 0), "{out:?}");
+    let mut seen: Vec<(String, String)> = rows(repo)
+        .into_iter()
+        .map(|e| (e.action, e.object.unwrap_or_default()))
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            ("session.command".to_string(), "cargo build".to_string()),
+            ("session.command".to_string(), "git status".to_string()),
+            ("session.command".to_string(), "make all".to_string()),
+            ("session.edit".to_string(), format!("{repo}/n.rs")),
+            ("session.edit".to_string(), format!("{repo}/src/p.rs")),
+        ]
+    );
+}
+
+#[test]
+fn a_relative_workdir_attributes_to_the_turns_directory() {
+    let pair = Pair::new();
+    let codex = tempfile::tempdir().unwrap();
+    let empty_claude = tempfile::tempdir().unwrap();
+    let [w1, w2] = &pair.wt;
+    write_lines(
+        &rollout_path(codex.path(), "X5"),
+        &[
+            session_meta("X5", &pair.base),
+            call(
+                1,
+                serde_json::json!({ "type": "function_call", "name": "exec_command", "call_id": "a",
+                    "arguments": serde_json::json!({ "cmd": "ls", "workdir": "w2" }).to_string() }),
+            ),
+            call(
+                2,
+                serde_json::json!({ "type": "function_call", "name": "exec_command", "call_id": "b",
+                    "arguments": serde_json::json!({ "cmd": "pwd", "workdir": w1 }).to_string() }),
+            ),
+        ],
+    );
+
+    let out = with_roots(Some(empty_claude.path()), Some(codex.path()), || {
+        pair.pass()
+    });
+
+    assert_eq!(out.recorded, 2, "{out:?}");
+    let owners: Vec<(String, String)> = {
+        let mut v: Vec<_> = rows(w1)
+            .into_iter()
+            .map(|e| (e.object.unwrap(), e.worktree_path.unwrap_or_default()))
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        owners,
+        vec![
+            ("ls".to_string(), w2.clone()),
+            ("pwd".to_string(), String::new())
+        ]
+    );
+}
+
+#[test]
+fn a_function_call_whose_arguments_do_not_parse_is_counted() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let repo = repo_dir.path().to_str().unwrap();
+    let codex = tempfile::tempdir().unwrap();
+    let empty_claude = tempfile::tempdir().unwrap();
+    let bad = |name: &str, arguments: &str| {
+        call(
+            1,
+            serde_json::json!({ "type": "function_call", "name": name, "arguments": arguments,
+                                "call_id": "x" }),
+        )
+    };
+    write_lines(
+        &rollout_path(codex.path(), "THREAD-6"),
+        &[
+            session_meta("THREAD-6", repo),
+            bad("exec_command", "not json"),
+            bad("exec_command", "{}"),
+            bad("shell", r#"{"command":"a string, not an argv"}"#),
+            bad("shell", r#"{"command":[]}"#),
+        ],
+    );
+
+    let out = with_roots(Some(empty_claude.path()), Some(codex.path()), || {
+        ingest_transcripts(repo)
+    });
+
+    assert_eq!((out.recorded, out.skipped_lines), (0, 4), "{out:?}");
+}
+
+/// Runs `f` with the Codex variables as given and the Claude root pointed away.
+fn codex_root_with(
+    codex_home: Option<&std::path::Path>,
+    over: Option<&std::path::Path>,
+) -> std::path::PathBuf {
+    let serial = crate::test_support::env::env_serial();
+    let mut env = crate::test_support::env::bind_env(&serial);
+    env = match codex_home {
+        Some(path) => env.set("CODEX_HOME", path),
+        None => env.remove("CODEX_HOME"),
+    };
+    env = match over {
+        Some(path) => env.set(CODEX_ENV, path),
+        None => env.remove(CODEX_ENV),
+    };
+    let _env = env;
+    source::sources()
+        .iter()
+        .find(|s| s.actor_id() == "codex")
+        .and_then(|s| s.root())
+        .unwrap()
+        .path
+}
+
+#[test]
+fn the_codex_root_is_the_override_then_codex_home_then_the_home_directory() {
+    let home = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    assert_eq!(
+        codex_root_with(Some(home.path()), Some(other.path())),
+        other.path(),
+        "the override wins"
+    );
+    assert_eq!(
+        codex_root_with(Some(home.path()), None),
+        home.path().join("sessions"),
+        "CODEX_HOME names Codex's home, whose sessions are below it"
+    );
+    // Neither: under the process's own (hermetic) HOME, never the real one.
+    let default = codex_root_with(None, None);
+    assert!(default.ends_with(".codex/sessions"), "{default:?}");
+    assert!(
+        default.starts_with(crate::test_support::env::hermetic::root()),
+        "{default:?} is outside the hermetic root"
+    );
 }
