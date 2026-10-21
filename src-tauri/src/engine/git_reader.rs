@@ -1711,6 +1711,14 @@ impl GitReader {
         parse_commit_show(&stdout, cut.as_ref())
     }
 
+    /// [`tip_counts_against`] by repository path, for the command benches, which
+    /// cannot reach the crate-private function.
+    #[doc(hidden)]
+    pub fn bench_tip_counts(repo_path: &str, base_oid: &str) -> Option<usize> {
+        let repo = validate_repo(repo_path).ok()?;
+        tip_counts_against(&repo, base_oid).map(|counts| counts.len())
+    }
+
     pub fn list_tags(repo_path: &str) -> Result<TagList, String> {
         let repo = validate_repo(repo_path)?;
         // A tag row could name a commit but never say where that commit stood.
@@ -3983,14 +3991,20 @@ pub(crate) struct RefQuery<'a> {
     pub fields: &'a str,
 }
 
-/// The branch and remote-tracking listing, which `list_branches` and
-/// `tip_counts_against` both read: the same words, so one kept answer serves
-/// both while the base and the refs are unchanged.
+/// The branch and remote-tracking listing `list_branches` reads.
 const BRANCH_QUERY: RefQuery<'static> = RefQuery {
     namespaces: BRANCH_NAMESPACES,
     command: &["for-each-ref"],
     patterns: &["refs/heads/", "refs/remotes/"],
     fields: BRANCH_LIST_FORMAT,
+};
+
+/// The same refs as [`BRANCH_QUERY`] with only the tip oid: what
+/// `tip_counts_against` needs, without the upstream track, author and subject
+/// that cost three times as much to produce on a cold listing.
+const TIP_QUERY: RefQuery<'static> = RefQuery {
+    fields: "%(objectname)",
+    ..BRANCH_QUERY
 };
 
 const TAG_QUERY: RefQuery<'static> = RefQuery {
@@ -4421,13 +4435,12 @@ pub(crate) fn tip_counts_against(
     base_oid: &str,
 ) -> Option<HashMap<String, (usize, usize)>> {
     validate_oid(base_oid).ok()?;
-    // The branch list's own query, so a list read just before is the kept
-    // answer; no retry, because without the atom there are no counts to give.
-    let listing = list_against(repo, &BRANCH_QUERY, Some(base_oid), false).ok()?;
+    // No retry: without the atom there are no counts to give.
+    let listing = list_against(repo, &TIP_QUERY, Some(base_oid), false).ok()?;
     let rows = listing.rows().ok()?;
     Some(
         rows.into_iter()
-            .filter_map(|row| Some((row.fields[2].to_string(), row.counts?)))
+            .filter_map(|row| Some((row.fields[0].to_string(), row.counts?)))
             .collect(),
     )
 }
@@ -8578,9 +8591,10 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
         );
     }
 
-    /// The branch list and the tip counts are one listing: a list read just
-    /// before is the kept answer for the counts, and a ref written after it is
-    /// a miss that reads the new tip, never the kept answer.
+    /// The tip counts are their own narrow listing (the branch list's extra
+    /// fields tripled their cold cost), kept under the same stamp: a repeat is
+    /// served kept, and a ref written after it is a miss that reads the new
+    /// tip, never the kept answer.
     #[test]
     fn tip_counts_reuse_the_branch_list_and_see_a_ref_written_after_it() {
         let _held = ref_cache::retention();
@@ -8598,14 +8612,16 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
             GitReader::list_branches(path).unwrap();
             let counts = tip_counts_against(&root, &oids["main"]).unwrap();
             assert_eq!(counts.len(), 3);
-            assert_eq!(listings() - before, 1, "one listing served both callers");
+            assert_eq!(listings() - before, 2, "the narrow tip query is its own");
+            tip_counts_against(&root, &oids["main"]).unwrap();
+            assert_eq!(listings() - before, 2, "a repeat is the kept answer");
 
             git_in(dir.path(), &["branch", "fresh", &oids["feature"]]);
             git_in(dir.path(), &["branch", "newer", &oids["seed"]]);
             let counts = tip_counts_against(&root, &oids["main"]).unwrap();
             assert_eq!(counts.len(), 4, "the seed tip is new to the listing");
             assert_eq!(counts[&oids["seed"]], (0, 1));
-            assert_eq!(listings() - before, 2, "the new refs were a miss");
+            assert_eq!(listings() - before, 3, "the new refs were a miss");
         });
     }
 
@@ -12326,10 +12342,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
 
         let (_two, walked_root) = build();
         let base = git_cli::git_text(&walked_root, &["rev-parse", "main"]).unwrap();
-        let format = format!(
-            "--format={BRANCH_LIST_FORMAT}%00%(ahead-behind:{})",
-            base.trim()
-        );
+        let format = format!("--format=%(objectname)%00%(ahead-behind:{})", base.trim());
         let walked = git_cli::with_forced_spawn_failure_of(&format, || {
             GitReader::branch_stats(walked_root.to_str().unwrap())
         })

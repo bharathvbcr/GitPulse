@@ -55,6 +55,18 @@ const REF_SPEC: Spec = Spec {
     linked_worktrees: 7,
 };
 
+/// The tip-counts fixture: a history for the refs to sit at, no worktrees.
+const TIPS_SPEC: Spec = Spec {
+    files: 20,
+    dirs: 2,
+    extra_commits: 40,
+    touch: 2,
+    linked_worktrees: 0,
+};
+
+/// Refs in the tip-counts fixture.
+const TIP_REFS: usize = 2000;
+
 /// Branches and tags added to the ref-listing fixture, beside the worktrees'.
 const REF_BRANCHES: usize = 220;
 const REF_TAGS: usize = 60;
@@ -553,8 +565,50 @@ fn main() {
     let (tag_procs, tag_listings) = listing_spawns(&tag_rows);
     let (divergence_procs, divergence_listings) = listing_spawns(&divergence_rows);
 
+    // Tip counts alone, at 2000 refs (half branches, half remote-tracking): the
+    // listing `branch_stats` makes for every unanswered tip, which needs the
+    // oid and the counts and nothing else.
+    let tips_repo = build_repo(&temp.path().join("tips"), &TIPS_SPEC);
+    let tips_path = tips_repo.path().to_string();
+    let tips_tips = git_lines(&tips_repo.main, &["rev-list", "HEAD"]);
+    let mut tips_stdin = String::new();
+    for n in 0..TIP_REFS {
+        let kind = if n % 2 == 0 {
+            "heads/t"
+        } else {
+            "remotes/origin/t"
+        };
+        tips_stdin.push_str(&format!(
+            "create refs/{kind}{n:04} {}\n",
+            tips_tips[n % tips_tips.len()]
+        ));
+    }
+    update_refs(&tips_repo.main, &tips_stdin);
+    let tips_base = common::fixture::git(&tips_repo.main, &["rev-parse", "main"])
+        .trim()
+        .to_string();
+    let tips_flip = std::cell::Cell::new(false);
+    let tip_counts_cold = || {
+        let flip = !tips_flip.get();
+        tips_flip.set(flip);
+        let tip = &tips_tips[if flip { 1 } else { 2 }];
+        common::fixture::git(
+            &tips_repo.main,
+            &["update-ref", "refs/heads/bench-churn", tip],
+        );
+        let started = std::time::Instant::now();
+        let rows = GitReader::bench_tip_counts(&tips_path, &tips_base).unwrap_or_else(|| {
+            panic!("tip counts were not answered, so this run would time a failure")
+        });
+        let elapsed = started.elapsed();
+        assert!(rows > 1, "the listing answered no tips");
+        Sample::default()
+            .counter("tips", rows as u64)
+            .elapsed(elapsed)
+    };
     let ref_cases = || {
         vec![
+            Case::new("tip counts cold 2000 refs", || tip_counts_cold()),
             Case::new("list_branches cold", || {
                 let (rows, elapsed) = timed(&branch_rows);
                 Sample::default()
