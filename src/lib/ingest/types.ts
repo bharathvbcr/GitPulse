@@ -25,6 +25,11 @@ export interface CatchUp {
   /** Of `transcripts_unlisted`, the files past the walk's file cap. */
   unlisted_cap?: number;
   unlisted_lower_bound?: boolean;
+  /**
+   * Symlinks the walk refused because their target is outside the transcript
+   * root. Not unread transcripts, so not in `transcripts_unlisted`.
+   */
+  refused_outside_corpus: number;
   /** Whether the walk listed the whole corpus; null when no walk ran. */
   walk_complete?: boolean | null;
   skipped_lines: number;
