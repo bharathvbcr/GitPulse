@@ -847,11 +847,6 @@ pub struct LedgerStatus {
     /// for a later pass. Not folded into `dropped`.
     #[serde(default)]
     pub catch_up_failures: u64,
-    /// Bind/unbind rows a sibling worktree wrote that the ledger keeps as history
-    /// only, because only GitPulse and the bind/unbind commands may set a binding.
-    /// Its own field, so it reaches every surface whatever else `error_code` says.
-    #[serde(default)]
-    pub history_only_bindings: u64,
     /// Empty when recording; otherwise why not.
     pub error: String,
     pub error_code: String,
@@ -4355,7 +4350,6 @@ pub fn status_readonly(repo_path: &str) -> LedgerStatus {
         } else {
             0
         },
-        history_only_bindings: 0,
         error,
         error_code,
     }
@@ -4429,7 +4423,6 @@ pub fn status(repo_path: &str) -> LedgerStatus {
             path: path.display().to_string(),
             dropped,
             catch_up_failures,
-            history_only_bindings: 0,
             error: String::new(),
             error_code: String::new(),
         },
@@ -4438,7 +4431,6 @@ pub fn status(repo_path: &str) -> LedgerStatus {
             path: path.display().to_string(),
             dropped,
             catch_up_failures,
-            history_only_bindings: 0,
             error: e.message,
             error_code: e.code.to_string(),
         },

@@ -257,15 +257,15 @@ pub(crate) const HISTORY_ONLY_BINDINGS_CODE: &str = "binding_rows_history_only";
 /// Says how many sibling bind/unbind rows were imported as history only: a
 /// binding that did not take effect must not do so silently.
 ///
-/// The count is its own field, so it reaches every surface whatever else the
-/// status says. The error slot takes the notice too when it is free or holds only
-/// the legacy-unconsolidated caveat (which the message then keeps); a real
-/// failure keeps the slot.
+/// The error slot takes the notice when it is free or holds only the
+/// legacy-unconsolidated caveat (which the message then keeps); a real failure
+/// keeps the slot. The MCP view carries the count in its own field
+/// (`LedgerView::history_only_bindings`), so it also reaches that surface next to
+/// a failure; `LedgerStatus` has no such field.
 fn note_history_only_bindings(status: &mut super::LedgerStatus, anchor: &str) {
     let Some(count @ 1..) = super::history_only_binding_count(anchor) else {
         return;
     };
-    status.history_only_bindings = count;
     let notice = format!(
         "{count} bind/unbind row(s) written by sibling worktrees were kept as history only: \
          only GitPulse and the bind/unbind commands writing the primary ledger can set a \
@@ -291,7 +291,8 @@ pub(crate) fn repository_ledger_view(repo_path: &str) -> Result<super::LedgerVie
     let family = resolve_address(repo_path, repo_path)?;
     let status = readonly_status_of(&family);
     let freshness = super::freshness_readonly(&family.address.anchor);
-    Ok(super::LedgerView::from_readonly(status, freshness))
+    Ok(super::LedgerView::from_readonly(status, freshness)
+        .with_history_only_bindings(&family.address.anchor))
 }
 
 /// The `error_code` of a read that cannot see rows a sibling worktree's own

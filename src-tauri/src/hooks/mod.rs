@@ -2334,7 +2334,6 @@ mod tests {
                 path: "/repo/.gitpulse/ledger.sqlite".to_string(),
                 dropped: 0,
                 catch_up_failures: 0,
-                history_only_bindings: 0,
                 error: String::new(),
                 error_code: String::new(),
             },

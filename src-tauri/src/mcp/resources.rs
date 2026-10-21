@@ -333,7 +333,8 @@ fn with_freshness(mut page: Value, anchor: &str, caveat: Option<&str>) -> Value 
     let view = json!(crate::ledger::LedgerView::from_readonly(
         crate::ledger::status_readonly(anchor),
         crate::ledger::freshness_readonly(anchor),
-    ));
+    )
+    .with_history_only_bindings(anchor));
     if let (Some(page), Some(fields)) = (page.as_object_mut(), view.as_object()) {
         for (key, value) in fields {
             if key != "error" && key != "error_code" {
@@ -419,10 +420,13 @@ pub fn ledger_query_page(
 /// freshness.
 pub fn insights_document(repo: &str) -> Value {
     let snapshot = crate::insights::snapshot(repo);
-    let view = crate::ledger::LedgerView::from_readonly(
+    let mut view = crate::ledger::LedgerView::from_readonly(
         snapshot.ledger.clone(),
         crate::insights::ledger_freshness(repo),
     );
+    if let Ok(address) = crate::ledger::bindings::repository_address_readonly(repo) {
+        view = view.with_history_only_bindings(&address.anchor);
+    }
     let mut document = json!(snapshot);
     document["ledger"] = json!(view);
     document
