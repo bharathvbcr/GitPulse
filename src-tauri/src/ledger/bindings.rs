@@ -2051,3 +2051,6 @@ mod history_tests;
 
 #[cfg(test)]
 mod authority_tests;
+
+#[cfg(test)]
+mod adversarial_tests;
