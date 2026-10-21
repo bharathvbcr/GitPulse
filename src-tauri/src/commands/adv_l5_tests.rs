@@ -22,7 +22,6 @@ fn git_repo() -> (tempfile::TempDir, String) {
 /// bounded catch-up over them and the result never changes: the same 1000 files
 /// stay unlisted. Counts how many failures N binds record.
 #[test]
-#[ignore = "ADV-L5 BROKEN: catch_up_failures grows by one per bind for as long as any file is unlisted"]
 fn adv_binds_over_a_6000_file_corpus_count_one_failure_each_without_bound() {
     let (_dir, repo) = git_repo();
     let root = tempfile::tempdir().unwrap();
@@ -54,7 +53,6 @@ fn adv_binds_over_a_6000_file_corpus_count_one_failure_each_without_bound() {
 /// the lane's own note text starts with "catch-up truncated: ", the prefix
 /// `is_partial` accepts, but `is_partial` also needs a reflog backlog.
 #[test]
-#[ignore = "ADV-L5 BROKEN: is_partial needs a reflog backlog, so an unlisted-files-only pass is counted as a failure"]
 fn adv_a_pass_whose_only_truncation_is_unlisted_files_is_not_partial() {
     let (_dir, repo) = git_repo();
     bind_after_catch_up(&repo, &repo, "T-1", |_| CatchUp {

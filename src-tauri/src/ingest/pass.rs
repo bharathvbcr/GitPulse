@@ -355,6 +355,7 @@ fn ingest_family(
     out.unlisted_cap = walk.unlisted_cap;
     out.transcripts_unlisted = walk.unlisted_depth.saturating_add(walk.unlisted_cap);
     out.unlisted_lower_bound = walk.unlisted_lower_bound;
+    out.refused_outside_corpus = walk.refused_outside_corpus;
     out.walk_complete = Some(walk.complete);
     let mut listed = HashSet::new();
     for path in files {
@@ -645,7 +646,7 @@ fn ingest_family(
         };
         let note = format!(
             "catch-up truncated: the transcript walk left {at_least}{} file(s) unlisted and unread \
-             ({} below the depth bound, {} past the file cap); {} listed",
+             ({} below the depth bound, {} past the file cap), {} listed",
             out.transcripts_unlisted, out.unlisted_depth, out.unlisted_cap, out.transcripts_listed
         );
         out.error = if out.error.is_empty() {

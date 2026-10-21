@@ -753,7 +753,9 @@ fn freshness_properties() -> Value {
                 "transcripts_unlisted": { "type": "integer" },
                 "skipped_lines": { "type": "integer" },
                 "failed_records": { "type": "integer" },
-                "error": { "type": "string" }
+                "error": { "type": "string" },
+                "stale_worktrees": { "type": "integer", "description": "Rows whose last completed pass is older than `stale_after_secs` (idle or removed worktrees): counted, left out of the figures. The figures are per ledger, not per worktree." },
+                "future_dated_worktrees": { "type": "integer", "description": "Rows dated in the future (a skewed clock): flagged, left out of the figures and of freshness." }
             }
         }
     })

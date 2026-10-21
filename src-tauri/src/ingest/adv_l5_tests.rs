@@ -62,7 +62,6 @@ fn seeded_repo() -> (tempfile::TempDir, String) {
 }
 
 #[test]
-#[ignore = "ADV-L5 BROKEN: pre-existing: a symlink to / walks the host filesystem (about 35s to depth 5), listing files outside the corpus"]
 fn adv_walk_symlink_to_slash_terminates_and_stays_inside_the_corpus() {
     let root = tempfile::tempdir().unwrap();
     write_at(&root.path().join("slug"), "real.jsonl", "");
@@ -90,7 +89,6 @@ fn adv_walk_symlink_to_slash_terminates_and_stays_inside_the_corpus() {
 }
 
 #[test]
-#[ignore = "ADV-L5 BROKEN: pre-existing: symlinks are followed out of the corpus root"]
 fn adv_walk_symlink_to_an_ancestor_does_not_list_files_outside_the_corpus() {
     let top = tempfile::tempdir().unwrap();
     let corpus = top.path().join("corpus");
@@ -116,13 +114,15 @@ fn adv_walk_symlink_to_an_ancestor_does_not_list_files_outside_the_corpus() {
 
 #[test]
 fn adv_walk_two_symlinks_to_one_dir_list_each_distinct_file_once() {
-    let shared = tempfile::tempdir().unwrap();
-    for n in 0..3 {
-        write_at(shared.path(), &format!("f{n}.jsonl"), "");
-    }
+    // AMENDED (item 7): the shared directory is inside the corpus. A link to a
+    // directory outside it is refused, so it can no longer be the shared one.
     let root = tempfile::tempdir().unwrap();
-    std::os::unix::fs::symlink(shared.path(), root.path().join("l1")).unwrap();
-    std::os::unix::fs::symlink(shared.path(), root.path().join("l2")).unwrap();
+    let shared = root.path().join("shared");
+    for n in 0..3 {
+        write_at(&shared, &format!("f{n}.jsonl"), "");
+    }
+    std::os::unix::fs::symlink(&shared, root.path().join("l1")).unwrap();
+    std::os::unix::fs::symlink(&shared, root.path().join("l2")).unwrap();
     let (files, walk) = do_walk(root.path());
     assert_eq!(files.len(), 3, "{files:?}");
     assert!(walk.complete, "{walk:?}");
@@ -132,7 +132,6 @@ fn adv_walk_two_symlinks_to_one_dir_list_each_distinct_file_once() {
 /// depth that was. A directory reached first below the depth bound (counted,
 /// not listed) and again by a shallow link is never listed.
 #[test]
-#[ignore = "ADV-L5 BROKEN: regression: visited set is keyed on first visit regardless of listing depth; a dir first reached below the depth bound is never listed via its shallow alias"]
 fn adv_walk_dedup_does_not_hide_a_shallow_directory_behind_a_deep_alias() {
     for (deep_name, shallow_name) in [("a-deep", "z-shallow"), ("z-deep", "a-shallow")] {
         let root = tempfile::tempdir().unwrap();
@@ -163,13 +162,14 @@ fn adv_walk_dedup_does_not_hide_a_shallow_directory_behind_a_deep_alias() {
 }
 
 #[test]
-fn adv_walk_hard_links_are_distinct_files_listed_once_each() {
+fn adv_walk_hard_links_are_one_file_listed_once() {
+    // AMENDED (item 8): two names for one inode are one transcript.
     let root = tempfile::tempdir().unwrap();
     let a = write_at(&root.path().join("x"), "a.jsonl", "");
     std::fs::create_dir_all(root.path().join("y")).unwrap();
     std::fs::hard_link(&a, root.path().join("y/b.jsonl")).unwrap();
     let (files, walk) = do_walk(root.path());
-    assert_eq!(files.len(), 2);
+    assert_eq!(files.len(), 1, "{files:?}");
     assert!(walk.complete);
 }
 
@@ -280,7 +280,6 @@ fn adv_permission_denied_directory_is_incomplete_and_forgets_nothing() {
 /// succeeds, every `stat` of its entries fails, and `Path::is_dir` reports
 /// false for a failed stat.
 #[test]
-#[ignore = "ADV-L5 BROKEN: FORGET INVARIANT: visit_dir uses Path::is_dir (stat error reads as not-a-dir) so an unsearchable dir is walked as empty, complete:true, cursors forgotten"]
 fn adv_listable_but_unsearchable_directory_must_not_forget_what_is_below_it() {
     let (_repo_dir, repo) = seeded_repo();
     let root = tempfile::tempdir().unwrap();
@@ -330,7 +329,6 @@ fn adv_vanished_or_dangling_transcript_keeps_its_offset_and_is_counted() {
 }
 
 #[test]
-#[ignore = "ADV-L5 BROKEN: pre-existing: hard links are two paths, two cursors, two recorded rows"]
 fn adv_hard_linked_transcript_is_not_recorded_twice() {
     let (_repo_dir, repo) = seeded_repo();
     let root = tempfile::tempdir().unwrap();
@@ -348,7 +346,6 @@ fn adv_hard_linked_transcript_is_not_recorded_twice() {
 /// A pass that errored half-way (the deadline cut it, a write failed) must not
 /// be persisted as a successful catch-up that makes the ledger read fresh.
 #[test]
-#[ignore = "ADV-L5 BROKEN: persist_pass marks a deadline-cut pass that read nothing as a completed catch-up (completed = error.is_empty() || truncated)"]
 fn adv_a_pass_cut_by_the_deadline_before_reading_anything_does_not_refresh_staleness() {
     let (_repo_dir, repo) = seeded_repo();
     let mut total = CatchUp {
@@ -367,7 +364,6 @@ fn adv_a_pass_cut_by_the_deadline_before_reading_anything_does_not_refresh_stale
 }
 
 #[test]
-#[ignore = "ADV-L5 BROKEN: persist_pass marks a truncated pass with failed_records as completed: stale:false although the only pass failed writes (ingest/mod.rs persist_pass)"]
 fn adv_a_pass_with_failed_writes_is_not_a_clean_completion() {
     let (_repo_dir, repo) = seeded_repo();
     let mut total = CatchUp {

@@ -77,7 +77,6 @@ fn adv_future_dated_evidence_is_never_fresh_at_any_later_time_within_the_window_
 }
 
 #[test]
-#[ignore = "ADV-L5 BROKEN (fail-closed): one skewed row in any worktree makes the whole ledger stale:true even with a genuine fresh pass"]
 fn adv_one_future_dated_row_does_not_mask_a_genuinely_fresh_pass_as_stale() {
     // Reverse lie: pessimistic. A fresh, correctly stamped pass and an old
     // future-dated one in another worktree row: is the ledger called stale?
@@ -96,7 +95,6 @@ fn adv_one_future_dated_row_does_not_mask_a_genuinely_fresh_pass_as_stale() {
 }
 
 #[test]
-#[ignore = "ADV-L5 BROKEN (pessimistic): catch_up ORs/sums every catch_up_state row ever written; a removed worktree's day-old failure stays in truncated/failed_records/error forever"]
 fn adv_pass_rows_of_another_worktree_are_reported_and_a_removed_worktrees_failure_is_sticky() {
     let (_dir, repo) = repo_dir();
     append(draft(&repo)).unwrap();

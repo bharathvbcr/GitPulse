@@ -23,8 +23,8 @@ pub const STALE_AFTER_SECS: u64 = 600;
 /// means the clock was set backwards and "age" has no meaning.
 const FUTURE_TOLERANCE_SECS: u64 = 60;
 
-/// What the latest catch-up passes covered, summed over the worktrees that
-/// have one. Every field is the figure the pass itself reported.
+/// What the latest catch-up passes covered, summed over the worktrees whose
+/// last pass is current (see `stale_worktrees` and `future_dated_worktrees`). Every field is the figure the pass itself reported.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatchUpSummary {
     /// Worktrees with a recorded pass.
@@ -45,8 +45,18 @@ pub struct CatchUpSummary {
     pub skipped_lines: i64,
     /// Records whose ledger write failed.
     pub failed_records: i64,
-    /// What stopped or limited the newest-failing pass, empty when none did.
+    /// What stopped or limited the first current row that has one, empty when
+    /// none did.
     pub error: String,
+    /// Rows whose last completed pass is older than the stale window: idle or
+    /// removed worktrees. Counted here and left out of the figures above, so a
+    /// day-old failure is not reported as the current coverage. The table keeps
+    /// one row per worktree (by a hash of its path), so this is a count, not a
+    /// list: the figures are per ledger, not per worktree.
+    pub stale_worktrees: i64,
+    /// Rows whose completion time is in the future (a skewed clock): flagged,
+    /// left out of the figures and out of freshness.
+    pub future_dated_worktrees: i64,
 }
 
 /// The freshness block carried by `gitpulse_ledger_events`,
@@ -226,38 +236,87 @@ fn assess(as_of: Option<String>, rows: Vec<StateRow>, now_ms: u64) -> Freshness 
             .map(str::to_owned)
     };
     let as_of = well_formed(&as_of);
-    let newest_pass = rows
-        .iter()
-        .filter_map(|row| well_formed(&row.completed_at))
-        .max();
-    let (last_catch_up, basis) = match (&newest_pass, &as_of) {
+    let future_after = now_ms.saturating_add(FUTURE_TOLERANCE_SECS * 1000);
+    let window = STALE_AFTER_SECS * 1000;
+
+    // Each row is one worktree's newest pass. A pass dated in the future is
+    // flagged and left out of every figure below: it has no age, and it may not
+    // veto another row's genuine freshness. A pass that completed longer ago
+    // than the stale window belongs to a worktree that is idle or gone; it is
+    // counted, not summed, so its day-old failure is not today's coverage.
+    // A row with no completion (an attempt that did not finish) is current.
+    enum Kind {
+        Current,
+        Dormant,
+        Future,
+    }
+    let kind = |row: &StateRow| match well_formed(&row.completed_at)
+        .and_then(|ts| ids::parse_event_time(&ts))
+    {
+        None => Kind::Current,
+        Some(at) if at > future_after => Kind::Future,
+        Some(at) if now_ms.saturating_sub(at) > window => Kind::Dormant,
+        Some(_) => Kind::Current,
+    };
+    let mut future_dated = 0i64;
+    let mut dormant = 0i64;
+    let mut genuine_pass: Option<String> = None;
+    let mut summary = CatchUpSummary {
+        worktrees: i64::try_from(rows.len()).unwrap_or(i64::MAX),
+        ..CatchUpSummary::default()
+    };
+    for row in &rows {
+        match kind(row) {
+            Kind::Future => {
+                future_dated += 1;
+                continue;
+            }
+            Kind::Dormant => dormant += 1,
+            Kind::Current => {}
+        }
+        let completed = well_formed(&row.completed_at);
+        if completed > genuine_pass {
+            genuine_pass = completed;
+        }
+        if matches!(kind(row), Kind::Dormant) {
+            continue;
+        }
+        summary.truncated |= row.truncated != 0 || row.unlisted > 0;
+        summary.recorded = summary.recorded.saturating_add(row.recorded);
+        summary.transcripts = summary.transcripts.saturating_add(row.transcripts);
+        summary.transcripts_listed = summary.transcripts_listed.saturating_add(row.listed);
+        summary.transcripts_unlisted = summary.transcripts_unlisted.saturating_add(row.unlisted);
+        summary.skipped_lines = summary.skipped_lines.saturating_add(row.skipped);
+        summary.failed_records = summary.failed_records.saturating_add(row.failed);
+        if summary.error.is_empty() && !row.error.is_empty() {
+            summary.error = row.error.clone();
+        }
+    }
+    summary.stale_worktrees = dormant;
+    summary.future_dated_worktrees = future_dated;
+    let catch_up = (!rows.is_empty()).then_some(summary);
+
+    let (last_catch_up, basis) = match (&genuine_pass, &as_of) {
         (Some(pass), _) => (Some(pass.clone()), "catch_up_state"),
         (None, Some(row)) => (Some(row.clone()), "newest_row"),
         (None, None) => (None, "none"),
     };
-    let catch_up = (!rows.is_empty()).then(|| {
-        let mut summary = CatchUpSummary {
-            worktrees: i64::try_from(rows.len()).unwrap_or(i64::MAX),
-            ..CatchUpSummary::default()
-        };
-        for row in &rows {
-            summary.truncated |= row.truncated != 0 || row.unlisted > 0;
-            summary.recorded = summary.recorded.saturating_add(row.recorded);
-            summary.transcripts = summary.transcripts.saturating_add(row.transcripts);
-            summary.transcripts_listed = summary.transcripts_listed.saturating_add(row.listed);
-            summary.transcripts_unlisted =
-                summary.transcripts_unlisted.saturating_add(row.unlisted);
-            summary.skipped_lines = summary.skipped_lines.saturating_add(row.skipped);
-            summary.failed_records = summary.failed_records.saturating_add(row.failed);
-            if summary.error.is_empty() && !row.error.is_empty() {
-                summary.error = row.error.clone();
-            }
-        }
-        summary
-    });
-
-    let evidence = [&newest_pass, &as_of].into_iter().flatten().max();
+    // With a skewed writer in the ledger, its event rows are as suspect as its
+    // passes: only a genuine pass counts as evidence. Without one, the newer of
+    // the last pass and the newest row does.
+    let evidence = if future_dated > 0 {
+        genuine_pass.as_ref()
+    } else {
+        [&genuine_pass, &as_of].into_iter().flatten().max()
+    };
     let (stale, stale_reason) = match evidence {
+        None if future_dated > 0 => (
+            true,
+            format!(
+                "{future_dated} catch-up row(s) are dated in the future (the clock was set \
+                 backwards) and no genuine pass exists, so freshness cannot be told"
+            ),
+        ),
         None => (
             true,
             "the ledger holds no events and no catch-up has completed, so nothing shows a \
@@ -270,17 +329,16 @@ fn assess(as_of: Option<String>, rows: Vec<StateRow>, now_ms: u64) -> Freshness 
                 format!("the newest evidence timestamp {evidence:?} could not be parsed"),
             ),
             Some(at) => {
-                let now = now_ms;
-                if at > now.saturating_add(FUTURE_TOLERANCE_SECS * 1000) {
+                if at > future_after {
                     (
                         true,
                         format!(
                             "the newest evidence ({evidence}) is {}s in the future: the clock \
                              was set backwards, so its age cannot be told",
-                            (at - now) / 1000
+                            (at - now_ms) / 1000
                         ),
                     )
-                } else if now.saturating_sub(at) > STALE_AFTER_SECS * 1000 {
+                } else if now_ms.saturating_sub(at) > window {
                     (
                         true,
                         format!(

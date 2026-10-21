@@ -73,6 +73,11 @@ pub struct CatchUp {
     /// left out: `transcripts_unlisted` is then a floor.
     #[serde(default)]
     pub unlisted_lower_bound: bool,
+    /// Symlinks the walk refused because their target is outside the transcript
+    /// root. Not unread transcripts of the corpus, so not in
+    /// `transcripts_unlisted`.
+    #[serde(default)]
+    pub refused_outside_corpus: i64,
     /// Whether the corpus walk listed the whole corpus: null when no walk ran
     /// (no transcript root, or the pass was skipped), false when it was cut,
     /// hit an unreadable directory, or left files unlisted.
@@ -477,6 +482,11 @@ pub(super) struct Walk {
     /// True when the walk stopped counting (a bound on entries read) before it
     /// had seen everything it left out: the unlisted counts are a floor.
     pub unlisted_lower_bound: bool,
+    /// Symlinks whose target is outside the corpus root, refused: what is
+    /// listed is read and recorded, so a link out of the corpus is never
+    /// followed. Not part of the corpus, so they do not make the walk
+    /// incomplete.
+    pub refused_outside_corpus: i64,
 }
 
 /// The identity of a directory, so a walk can tell it has been in one before:
@@ -500,8 +510,18 @@ fn dir_id(_meta: &std::fs::Metadata, path: &std::path::Path) -> Option<DirId> {
     Some((0, hasher.finish()))
 }
 
+/// A directory waiting to be read, with whether it is listed or only counted.
+struct Pending {
+    dir: std::path::PathBuf,
+    depth: usize,
+    listing: bool,
+}
+
 struct WalkState {
     visited: std::collections::HashSet<DirId>,
+    /// Files already listed, by identity: a hard link is the same transcript
+    /// under a second name, and would be read and recorded twice.
+    seen_files: std::collections::HashSet<DirId>,
     counting_budget: usize,
     incomplete: bool,
     halted: bool,
@@ -522,6 +542,12 @@ fn collect_jsonl(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth
 /// bounds the walk instead of waiting out up to 5000 files.
 ///
 /// `depth` is the depth of `dir` below the root (0 for the root itself).
+///
+/// Directories are read shallowest first, so a directory reachable by several
+/// names is walked by the shallowest and the result does not depend on the
+/// order the filesystem lists entries in. Nothing outside `dir` is read: a
+/// symlink whose target is outside it is refused and counted
+/// (`refused_outside_corpus`), because what is listed is read and recorded.
 pub(super) fn collect_jsonl_until(
     dir: &std::path::Path,
     out: &mut Vec<std::path::PathBuf>,
@@ -530,12 +556,30 @@ pub(super) fn collect_jsonl_until(
 ) -> Walk {
     let mut state = WalkState {
         visited: std::collections::HashSet::new(),
+        seen_files: std::collections::HashSet::new(),
         counting_budget: MAX_UNLISTED_ENTRIES,
         incomplete: false,
         halted: false,
         walk: Walk::default(),
     };
-    visit_dir(dir, depth, depth <= MAX_WALK_DEPTH, out, stop, &mut state);
+    match std::fs::canonicalize(dir) {
+        Ok(corpus) => {
+            let mut queue = std::collections::VecDeque::new();
+            queue.push_back(Pending {
+                dir: dir.to_path_buf(),
+                depth,
+                listing: depth <= MAX_WALK_DEPTH,
+            });
+            while let Some(next) = queue.pop_front() {
+                if state.halted {
+                    break;
+                }
+                visit_dir(&next, &corpus, out, stop, &mut state, &mut queue);
+            }
+        }
+        // A root that cannot be resolved cannot be confined: nothing is read.
+        Err(_) => state.incomplete = true,
+    }
     let walk = &mut state.walk;
     walk.complete = !state.incomplete
         && !walk.cut
@@ -545,25 +589,24 @@ pub(super) fn collect_jsonl_until(
     state.walk
 }
 
-/// Reads one directory. `listing` is false below the depth bound: transcripts
-/// found there are counted as unlisted and nothing is added to `out`.
+/// Reads one directory, queueing its subdirectories. Any entry whose type or
+/// target cannot be determined, and any directory that cannot be read, marks
+/// the walk incomplete: it is never read as "nothing here".
 fn visit_dir(
-    dir: &std::path::Path,
-    depth: usize,
-    listing: bool,
+    pending: &Pending,
+    corpus: &std::path::Path,
     out: &mut Vec<std::path::PathBuf>,
     stop: &mut dyn FnMut() -> bool,
     state: &mut WalkState,
+    queue: &mut std::collections::VecDeque<Pending>,
 ) {
-    if state.halted {
-        return;
-    }
+    let dir = pending.dir.as_path();
     match std::fs::metadata(dir) {
         Ok(meta) => match dir_id(&meta, dir) {
             Some(id) => {
                 if !state.visited.insert(id) {
                     // Already walked, through another name for it: its files
-                    // are listed (or counted) once, wherever they were found.
+                    // are listed (or counted) once, by the shallowest name.
                     return;
                 }
             }
@@ -595,13 +638,44 @@ fn visit_dir(
             continue;
         };
         let path = entry.path();
-        let is_dir = path.is_dir();
-        let is_transcript = !is_dir && path.extension().and_then(|e| e.to_str()) == Some("jsonl");
+        let Ok(file_type) = entry.file_type() else {
+            state.incomplete = true;
+            continue;
+        };
+        let (is_dir, is_file, linked) = if file_type.is_symlink() {
+            match std::fs::metadata(&path) {
+                Ok(target) => (target.is_dir(), target.is_file(), true),
+                // Dangling: not a directory. A `.jsonl` one is still listed,
+                // so the pass counts the file that vanished.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, true, true),
+                Err(_) => {
+                    state.incomplete = true;
+                    continue;
+                }
+            }
+        } else {
+            (file_type.is_dir(), file_type.is_file(), false)
+        };
+        let is_transcript = is_file && path.extension().and_then(|e| e.to_str()) == Some("jsonl");
         if !is_dir && !is_transcript {
             continue;
         }
+        if linked {
+            match std::fs::canonicalize(&path) {
+                Ok(real) if !real.starts_with(corpus) => {
+                    state.walk.refused_outside_corpus += 1;
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    state.incomplete = true;
+                    continue;
+                }
+            }
+        }
         let capped = out.len() >= MAX_WALK_FILES;
-        if !listing || capped {
+        if !pending.listing || capped {
             if state.counting_budget == 0 {
                 state.walk.unlisted_lower_bound = true;
                 state.halted = true;
@@ -610,16 +684,22 @@ fn visit_dir(
             state.counting_budget -= 1;
         }
         if is_dir {
-            let child_depth = depth + 1;
-            visit_dir(
-                &path,
-                child_depth,
-                listing && child_depth <= MAX_WALK_DEPTH,
-                out,
-                stop,
-                state,
-            );
-        } else if !listing {
+            let depth = pending.depth + 1;
+            queue.push_back(Pending {
+                dir: path,
+                depth,
+                listing: pending.listing && depth <= MAX_WALK_DEPTH,
+            });
+            continue;
+        }
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if let Some(id) = dir_id(&meta, &path) {
+                if !state.seen_files.insert(id) {
+                    continue;
+                }
+            }
+        }
+        if !pending.listing {
             state.walk.unlisted_depth += 1;
         } else if capped {
             state.walk.unlisted_cap += 1;
@@ -1180,6 +1260,7 @@ impl CatchUp {
         self.unlisted_depth = transcripts.unlisted_depth;
         self.unlisted_cap = transcripts.unlisted_cap;
         self.unlisted_lower_bound = transcripts.unlisted_lower_bound;
+        self.refused_outside_corpus = transcripts.refused_outside_corpus;
         self.walk_complete = transcripts.walk_complete;
         self.skipped_lines = transcripts.skipped_lines;
         self.rehosted_calls = transcripts.rehosted_calls;
@@ -1200,6 +1281,41 @@ impl CatchUp {
             };
         }
         self
+    }
+}
+
+impl CatchUp {
+    /// True when the only thing that cut this pass short is transcripts the
+    /// walk left unlisted: every other part of it finished (no deadline, no
+    /// failed write, no reflog backlog, no other error). The unlisted counts
+    /// say what it left; it is a completed pass over what it could list.
+    pub fn is_unlisted_only_truncation(&self) -> bool {
+        (self.transcripts_unlisted > 0 || self.unlisted_lower_bound)
+            && self.truncated
+            && self.failed_records == 0
+            && self.reflog_pending == 0
+            && !self.reflog_unreached
+            && self.reflog_refs_skipped == 0
+            && !self.family_unresolved
+            && self
+                .error
+                .split("; ")
+                .all(|part| part.starts_with("catch-up truncated: the transcript walk left"))
+    }
+
+    /// Whether this pass finished the work it set out to do, for the ledger's
+    /// freshness: a pass cut by its deadline, one that could not run, or one
+    /// with a failed write has been attempted, not completed. Unlisted
+    /// transcripts alone do not undo a completion (see
+    /// [`CatchUp::is_unlisted_only_truncation`]).
+    pub fn finished(&self) -> bool {
+        if self.family_unresolved || self.failed_records > 0 {
+            return false;
+        }
+        if self.truncated {
+            return self.is_unlisted_only_truncation();
+        }
+        self.error.is_empty()
     }
 }
 
@@ -1410,7 +1526,7 @@ fn catch_up_with(
 /// rather than swallowed.
 fn persist_pass(ledger_repo: &str, worktree_path: &str, total: &mut CatchUp) {
     let record = ledger::CatchUpRecord {
-        completed: !total.family_unresolved && (total.error.is_empty() || total.truncated),
+        completed: total.finished(),
         truncated: total.truncated,
         recorded: total.recorded,
         transcripts: total.transcripts,

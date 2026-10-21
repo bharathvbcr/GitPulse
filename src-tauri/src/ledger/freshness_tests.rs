@@ -164,7 +164,11 @@ fn a_pass_that_did_not_run_does_not_move_the_last_catch_up() {
         Some(ids::iso8601_utc(t0).as_str())
     );
     assert!(read.stale, "the only completion is an hour old");
-    assert!(read.catch_up.expect("row").error.contains("family"));
+    // The attempt that did not run is behind the old completion, so the row is
+    // counted as dormant rather than summed into the current coverage.
+    assert_eq!(read.catch_up.as_ref().expect("row").stale_worktrees, 1);
+    let attempt = freshness_readonly_at(&repo, t0 + minutes(1));
+    assert!(attempt.catch_up.expect("row").error.contains("family"));
 }
 
 #[test]
@@ -354,7 +358,9 @@ fn no_reader_ever_writes_the_ledger_or_its_catch_up_state() {
         read.last_catch_up.as_deref(),
         Some(ids::iso8601_utc(t0).as_str())
     );
-    assert_eq!(read.catch_up.expect("row").skipped_lines, 2);
+    let soon = freshness_readonly_at(&repo, t0 + minutes(1));
+    assert_eq!(soon.catch_up.expect("row").skipped_lines, 2);
+    assert_eq!(read.catch_up.expect("row").stale_worktrees, 1);
 }
 
 #[cfg(unix)]
