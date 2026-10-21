@@ -5581,6 +5581,54 @@ some-future-field whatever
         assert_eq!(measured(&walked), Some(expected), "walked");
     }
 
+    /// Pins `batch_divergence` on worktrees whose branches are diverged, one of
+    /// them named with unicode, slashes and `@`: exact-name rows only, a
+    /// namespace prefix and a missing branch absent, and `None` for a base git
+    /// cannot measure.
+    #[test]
+    fn batch_divergence_pins_exact_branch_rows() {
+        let (main, _parent, linked) = repo_with_worktrees(2);
+        let root = plain(main.path());
+        let odd = "w\u{fc}/\u{e7}@x";
+        git_in(&root, &["branch", odd]);
+        let odd_tree = _parent.path().join("odd-tree");
+        git_in(
+            &root,
+            &["worktree", "add", "-q", odd_tree.to_str().unwrap(), odd],
+        );
+        for (tree, n) in [(&linked[0], 2), (&linked[1], 1), (&odd_tree, 3)] {
+            for i in 0..n {
+                std::fs::write(tree.join(format!("c{i}.txt")), "x").unwrap();
+                git_in(tree, &["add", "."]);
+                git_in(tree, &["commit", "-q", "-m", &format!("c{i}")]);
+            }
+        }
+        std::fs::write(root.join("m.txt"), "x").unwrap();
+        git_in(&root, &["add", "."]);
+        git_in(&root, &["commit", "-q", "-m", "main moves"]);
+        let base = rev(&root, "main");
+
+        let asked = ["agent/00", "agent/01", odd, "main", "agent", "gone/branch"];
+        let got = batch_divergence(&root, &base, &asked).expect("a batch");
+        let pair = |a, b| WorktreeDivergence {
+            ahead: a,
+            behind: b,
+        };
+        let expected = HashMap::from([
+            ("agent/00".to_string(), pair(2, 1)),
+            ("agent/01".to_string(), pair(1, 1)),
+            (odd.to_string(), pair(3, 1)),
+            ("main".to_string(), pair(0, 0)),
+        ]);
+        assert_eq!(
+            got, expected,
+            "`agent` is a prefix and `gone/branch` absent"
+        );
+        assert_eq!(batch_divergence(&root, &base, &[]), Some(HashMap::new()));
+        let missing = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(batch_divergence(&root, missing, &["main"]), None);
+    }
+
     /// The test checkout's pre-commit guard, and the identity it refuses.
     fn guard_fixture_identity(repo: &Path) {
         std::fs::create_dir_all(repo.join(".githooks")).unwrap();

@@ -8315,6 +8315,232 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
         );
     }
 
+    /// A repository whose refs stress every listing that measures against the
+    /// default base: a slashed branch, a branch named with unicode and `@`,
+    /// a diverged `main`, a remote-tracking ref, the remote's `HEAD` symref,
+    /// and lightweight and annotated tags. Returns the oids by name.
+    fn ahead_behind_fixture() -> (tempfile::TempDir, HashMap<&'static str, String>) {
+        let dir = init_repo_with_remotes(&["origin"], "main");
+        let path = dir.path();
+        let seed = rev_parse(path, "main");
+        git_in(path, &["switch", "-c", "feature/a"]);
+        git_in(path, &["commit", "--allow-empty", "-m", "a1"]);
+        git_in(path, &["commit", "--allow-empty", "-m", "a2"]);
+        git_in(path, &["switch", "main"]);
+        git_in(path, &["switch", "-c", "\u{fc}n\u{ef}/\u{e7}@x"]);
+        git_in(path, &["commit", "--allow-empty", "-m", "odd work"]);
+        git_in(path, &["switch", "main"]);
+        git_in(path, &["commit", "--allow-empty", "-m", "main moves"]);
+        let main = rev_parse(path, "main");
+        let feature = rev_parse(path, "feature/a");
+        let odd = rev_parse(path, "\u{fc}n\u{ef}/\u{e7}@x");
+        git_in(path, &["update-ref", "refs/remotes/origin/side", &feature]);
+        git_in(path, &["update-ref", "refs/remotes/origin/main", &main]);
+        git_in(
+            path,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        git_in(path, &["tag", "v0", &seed]);
+        git_in(path, &["tag", "v1", &feature]);
+        git_in(path, &["tag", "-a", "v2", "-m", "release two", &odd]);
+        let oids = HashMap::from([
+            ("seed", seed),
+            ("main", main),
+            ("feature", feature),
+            ("odd", odd),
+        ]);
+        (dir, oids)
+    }
+
+    /// Pins what `list_branches` reports against the base, row by row, on the
+    /// fixture above: the contract the shared ahead-behind listing keeps.
+    #[test]
+    fn list_branches_pins_the_base_counts_of_every_row() {
+        let (dir, oids) = ahead_behind_fixture();
+        let listed = GitReader::list_branches(dir.path().to_str().unwrap()).unwrap();
+        let rows: Vec<(String, bool, Option<String>, usize, usize, Option<String>)> = listed
+            .iter()
+            .map(|b| {
+                (
+                    b.name.clone(),
+                    b.is_remote,
+                    b.remote_name.clone(),
+                    b.commits_ahead_of_base,
+                    b.commits_behind_base,
+                    b.compared_to.clone(),
+                )
+            })
+            .collect();
+        let base = Some("main".to_string());
+        let remote = Some("origin".to_string());
+        let mut expected = vec![
+            ("feature/a".to_string(), false, None, 2, 1, base.clone()),
+            (
+                "\u{fc}n\u{ef}/\u{e7}@x".to_string(),
+                false,
+                None,
+                1,
+                1,
+                base.clone(),
+            ),
+            ("main".to_string(), false, None, 0, 0, base.clone()),
+            (
+                "origin/main".to_string(),
+                true,
+                remote.clone(),
+                0,
+                0,
+                base.clone(),
+            ),
+            (
+                "origin/side".to_string(),
+                true,
+                remote.clone(),
+                2,
+                1,
+                base.clone(),
+            ),
+        ];
+        let mut rows = rows;
+        rows.sort();
+        expected.sort();
+        assert_eq!(rows, expected, "origin/HEAD is a symref and is not listed");
+        let tips: HashMap<&str, &str> = listed
+            .iter()
+            .map(|b| (b.name.as_str(), b.tip_commit_id.as_str()))
+            .collect();
+        assert_eq!(tips["feature/a"], oids["feature"]);
+        assert_eq!(tips["\u{fc}n\u{ef}/\u{e7}@x"], oids["odd"]);
+        assert!(listed.iter().find(|b| b.name == "main").unwrap().is_default);
+    }
+
+    #[test]
+    fn list_tags_pins_the_base_counts_of_every_row() {
+        let (dir, oids) = ahead_behind_fixture();
+        let listed = GitReader::list_tags(dir.path().to_str().unwrap()).unwrap();
+        assert!(!listed.truncated);
+        let mut rows: Vec<(String, String, Option<String>, usize, usize, Option<String>)> = listed
+            .tags
+            .iter()
+            .map(|t| {
+                (
+                    t.name.clone(),
+                    t.commit_id.clone(),
+                    t.message.clone(),
+                    t.commits_ahead_of_base,
+                    t.commits_behind_base,
+                    t.compared_to.clone(),
+                )
+            })
+            .collect();
+        rows.sort();
+        let base = Some("main".to_string());
+        let mut expected = vec![
+            (
+                "v0".to_string(),
+                oids["seed"].clone(),
+                Some("seed".to_string()),
+                0,
+                1,
+                base.clone(),
+            ),
+            (
+                "v1".to_string(),
+                oids["feature"].clone(),
+                Some("a2".to_string()),
+                2,
+                1,
+                base.clone(),
+            ),
+            (
+                "v2".to_string(),
+                oids["odd"].clone(),
+                Some("release two".to_string()),
+                1,
+                1,
+                base.clone(),
+            ),
+        ];
+        expected.sort();
+        assert_eq!(rows, expected);
+    }
+
+    #[test]
+    fn tip_counts_pin_every_branch_and_remote_tracking_tip() {
+        let (dir, oids) = ahead_behind_fixture();
+        let counts = tip_counts_against(dir.path(), &oids["main"]).expect("a listing");
+        let expected = HashMap::from([
+            (oids["main"].clone(), (0, 0)),
+            (oids["feature"].clone(), (2, 1)),
+            (oids["odd"].clone(), (1, 1)),
+        ]);
+        assert_eq!(
+            counts, expected,
+            "tags are not read, a shared tip is one key"
+        );
+    }
+
+    #[test]
+    fn tip_counts_answer_none_for_a_base_git_cannot_measure() {
+        let (dir, _) = ahead_behind_fixture();
+        assert_eq!(tip_counts_against(dir.path(), "not-an-oid"), None);
+        let missing = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(tip_counts_against(dir.path(), missing), None);
+    }
+
+    /// A git that rejects the ahead-behind atom: one retry without it, the
+    /// rows still listed, every one uncompared rather than zero-ahead.
+    #[test]
+    fn listings_degrade_to_uncompared_rows_when_git_rejects_the_atom() {
+        let (dir, oids) = ahead_behind_fixture();
+        let path = dir.path().to_str().unwrap();
+        let atom = format!("%00%(ahead-behind:{})", oids["main"]);
+        let listing_spawns = |name: &str| {
+            git_cli::spawn_log::spawns_in(&dir.path().canonicalize().unwrap())
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == name))
+                .count()
+        };
+
+        let branch_arg = format!("--format={BRANCH_LIST_FORMAT}{atom}");
+        let before = listing_spawns("for-each-ref");
+        let branches =
+            git_cli::with_forced_spawn_failure_of(&branch_arg, || GitReader::list_branches(path))
+                .unwrap();
+        assert_eq!(branches.len(), 5);
+        assert!(branches
+            .iter()
+            .all(|b| b.compared_to.is_none() && b.commits_ahead_of_base == 0));
+        assert_eq!(
+            listing_spawns("for-each-ref") - before,
+            2,
+            "the refused listing and one retry, never a third"
+        );
+
+        let tag_arg = format!("--format={TAG_LIST_FORMAT}{atom}");
+        let tags =
+            git_cli::with_forced_spawn_failure_of(&tag_arg, || GitReader::list_tags(path)).unwrap();
+        assert_eq!(tags.tags.len(), 3);
+        assert!(tags
+            .tags
+            .iter()
+            .all(|t| t.compared_to.is_none() && t.commits_behind_base == 0));
+    }
+
+    #[test]
+    fn listings_of_an_unborn_repository_name_no_base_and_fail_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        let path = dir.path().to_str().unwrap();
+        assert!(GitReader::list_branches(path).unwrap().is_empty());
+        let tags = GitReader::list_tags(path).unwrap();
+        assert!(tags.tags.is_empty() && !tags.truncated);
+    }
+
     #[test]
     fn branch_refs_always_yield_two_counts() {
         // The assumption that lets the BRANCH listing keep the lenient parser:
