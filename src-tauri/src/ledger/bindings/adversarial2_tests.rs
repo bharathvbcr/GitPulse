@@ -20,7 +20,12 @@ fn canonical_repo() -> (tempfile::TempDir, String) {
     std::fs::write(dir.path().join("seed.txt"), "seed").expect("seed");
     git_in(dir.path(), &["add", "seed.txt"]);
     git_in(dir.path(), &["commit", "-m", "seed"]);
-    let path = dir.path().canonicalize().unwrap().to_string_lossy().into_owned();
+    let path = dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     (dir, path)
 }
 
@@ -110,17 +115,28 @@ fn crash_then_recover_with(poison_id: i64, early_bind: bool) {
     }
     write_row(&sibling, &sibling, Some("TASK-LAST"), now_millis());
     let original: String = raw(&sibling)
-        .query_row("SELECT ts_utc FROM events WHERE id = ?1", [poison_id], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT ts_utc FROM events WHERE id = ?1",
+            [poison_id],
+            |r| r.get(0),
+        )
         .expect("row to poison");
     raw(&sibling)
-        .execute("UPDATE events SET ts_utc = 'garbage' WHERE id = ?1", [poison_id])
+        .execute(
+            "UPDATE events SET ts_utc = 'garbage' WHERE id = ?1",
+            [poison_id],
+        )
         .expect("poison");
 
     let crashed = resolve(&main, &sibling);
-    assert!(crashed.is_err(), "the import must fail mid-pass: {crashed:?}");
-    assert!(fenced(&sibling), "hook must fail closed while the pass is cut short");
+    assert!(
+        crashed.is_err(),
+        "the import must fail mid-pass: {crashed:?}"
+    );
+    assert!(
+        fenced(&sibling),
+        "hook must fail closed while the pass is cut short"
+    );
 
     raw(&sibling)
         .execute(
@@ -209,7 +225,10 @@ fn upgrade_five_siblings_all_resolve_and_stay_fenced() {
         assert_eq!(resolve(&main, s).unwrap(), Some(format!("TASK-{i}")));
     }
     for (i, s) in sibs.iter().enumerate() {
-        assert!(fenced(s), "BROKEN: sibling {i} hook open after consolidation");
+        assert!(
+            fenced(s),
+            "BROKEN: sibling {i} hook open after consolidation"
+        );
         let direct = resolve_binding_readonly(s, s);
         assert_eq!(
             direct.unwrap().map(|b| b.task_id),
@@ -234,8 +253,17 @@ fn post_initial_pass_forgeries_are_history_only() {
     // a new sibling with a bind backdated before the anchor
     settle();
     let (_p1, fresh) = linked(&main, "fresh");
-    write_row(&fresh, &fresh, Some("TASK-FORGED"), now_millis() - 9 * HOUR_MS);
-    assert_eq!(resolve(&main, &fresh).unwrap(), None, "BROKEN: new sibling bound");
+    write_row(
+        &fresh,
+        &fresh,
+        Some("TASK-FORGED"),
+        now_millis() - 9 * HOUR_MS,
+    );
+    assert_eq!(
+        resolve(&main, &fresh).unwrap(),
+        None,
+        "BROKEN: new sibling bound"
+    );
 
     // a row appended to the imported sibling: an unbind of the legacy binding
     write_row(&old, &old, None, now_millis() - 9 * HOUR_MS);
@@ -246,7 +274,11 @@ fn post_initial_pass_forgeries_are_history_only() {
     );
     // ... and a bind for an unrelated worktree
     write_row(&old, &fresh, Some("TASK-APPENDED"), now_millis() + 1);
-    assert_eq!(resolve(&main, &fresh).unwrap(), None, "BROKEN: appended bind");
+    assert_eq!(
+        resolve(&main, &fresh).unwrap(),
+        None,
+        "BROKEN: appended bind"
+    );
 
     // mv of an old ledger file into a new sibling path
     let (_p2, moved) = linked(&main, "moved");
@@ -263,7 +295,11 @@ fn post_initial_pass_forgeries_are_history_only() {
         }
     }
     write_row(&moved, &moved, Some("TASK-MV"), now_millis());
-    assert_eq!(resolve(&main, &moved).unwrap(), None, "BROKEN: mv-ed ledger bound");
+    assert_eq!(
+        resolve(&main, &moved).unwrap(),
+        None,
+        "BROKEN: mv-ed ledger bound"
+    );
 }
 
 /// Attack 3 residual. The marker lives in the anchor. Resetting the epoch row
@@ -287,12 +323,19 @@ fn marker_delete_does_not_reopen_but_reset_to_zero_does() {
     eprintln!("MARKERS={rows:?}");
 
     raw(&main)
-        .execute("DELETE FROM ledger_family_imports WHERE source_key = 'family-initial-pass'", [])
+        .execute(
+            "DELETE FROM ledger_family_imports WHERE source_key = 'family-initial-pass'",
+            [],
+        )
         .unwrap();
     settle();
     let (_p1, f1) = linked(&main, "forger-delete");
     write_row(&f1, &f1, Some("TASK-F1"), now_millis());
-    assert_eq!(resolve(&main, &f1).unwrap(), None, "BROKEN: marker delete reopened");
+    assert_eq!(
+        resolve(&main, &f1).unwrap(),
+        None,
+        "BROKEN: marker delete reopened"
+    );
 
     raw(&main)
         .execute(
@@ -313,14 +356,18 @@ fn readonly_paths_never_write_the_marker() {
     let (_dir, main) = canonical_repo();
     note_in(&main);
     let before: i64 = raw(&main)
-        .query_row("SELECT COUNT(*) FROM ledger_family_imports", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM ledger_family_imports", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     let (_p, s) = linked(&main, "s");
     let _ = repository_status_readonly(&main);
     let _ = resolve_binding_readonly(&s, &s);
     let _ = repository_ledger_view(&main);
     let after: i64 = raw(&main)
-        .query_row("SELECT COUNT(*) FROM ledger_family_imports", [], |r| r.get(0))
+        .query_row("SELECT COUNT(*) FROM ledger_family_imports", [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(before, after, "BROKEN: a read wrote the marker");
 }
@@ -339,7 +386,11 @@ fn fresh_anchor_zero_siblings_first_pass_closes_window() {
             |r| r.get(0),
         )
         .ok();
-    assert_eq!(marker, Some(1), "BROKEN: zero-sibling pass left window open: {marker:?}");
+    assert_eq!(
+        marker,
+        Some(1),
+        "BROKEN: zero-sibling pass left window open: {marker:?}"
+    );
 }
 
 /// Attack 4b. Fresh install where the anchor is created by the FIRST bind
@@ -383,9 +434,12 @@ fn old_build_partially_imported_family_demotes_a_pending_legacy_bind() {
     let (_pa, a) = linked(&main, "a");
     write_row(&a, &a, Some("TASK-A"), now_millis());
     resolve(&main, &a).unwrap(); // old build imported A
-    // old build: no epoch row
+                                 // old build: no epoch row
     raw(&main)
-        .execute("DELETE FROM ledger_family_imports WHERE source_key = 'family-initial-pass'", [])
+        .execute(
+            "DELETE FROM ledger_family_imports WHERE source_key = 'family-initial-pass'",
+            [],
+        )
         .unwrap();
     settle();
     let (_pb, b) = linked(&main, "b");
@@ -424,6 +478,12 @@ fn demotion_notice_reach() {
     eprintln!("DEMOTED_ROWS_IN_EVENTS={demoted}");
     eprintln!("WRITABLE_STATUS code={:?}", writable.error_code);
     eprintln!("READONLY_STATUS code={:?}", readonly.error_code);
-    eprintln!("MCP_VIEW code={:?}", format!("{view:?}").contains("binding_rows_history_only"));
-    assert_eq!(readonly.error_code, HISTORY_ONLY_BINDINGS_CODE, "BROKEN(honesty): read-only status hides the demotion");
+    eprintln!(
+        "MCP_VIEW code={:?}",
+        format!("{view:?}").contains("binding_rows_history_only")
+    );
+    assert_eq!(
+        readonly.error_code, HISTORY_ONLY_BINDINGS_CODE,
+        "BROKEN(honesty): read-only status hides the demotion"
+    );
 }
