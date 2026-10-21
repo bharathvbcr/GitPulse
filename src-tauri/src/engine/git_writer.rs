@@ -383,9 +383,11 @@ fn commit_graph_stop_intents() -> &'static Mutex<HashMap<PathBuf, std::time::Ins
 /// How long an unanswered Stop waits for its write to register.
 const COMMIT_GRAPH_STOP_INTENT_LIFETIME: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Oldest git whose `commit-graph write` accepts `--changed-paths` (2.27).
-/// Older gits refuse the argv, so neither the plan nor the writer offers it.
-pub(crate) const COMMIT_GRAPH_CHANGED_PATHS_GIT: (u32, u32, u32) = (2, 27, 0);
+/// Oldest git whose `commit-graph write` accepts `--changed-paths`. Older gits
+/// refuse the argv, so neither the plan nor the writer offers it. The minimum
+/// is the capability table's row; this is its name here.
+pub(crate) const COMMIT_GRAPH_CHANGED_PATHS_GIT: (u32, u32, u32) =
+    crate::engine::git_cli::COMMIT_GRAPH_CHANGED_PATHS;
 
 /// Registers a write's cancel flag (already set when a stop was waiting for
 /// it) and unregisters it, with any unclaimed stop, however the run ends.
