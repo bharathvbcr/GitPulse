@@ -141,6 +141,9 @@ pub struct LedgerView {
     /// What `dropped` counts: `this_process`.
     pub dropped_scope: String,
     pub catch_up_failures: u64,
+    /// Sibling-worktree bind/unbind rows kept as history only; see
+    /// [`super::LedgerStatus::history_only_bindings`].
+    pub history_only_bindings: u64,
     pub error: String,
     pub error_code: String,
     #[serde(flatten)]
@@ -163,6 +166,7 @@ impl LedgerView {
             dropped: status.dropped,
             dropped_scope: "this_process".to_string(),
             catch_up_failures: status.catch_up_failures,
+            history_only_bindings: status.history_only_bindings,
             error: status.error,
             error_code: status.error_code,
             freshness,

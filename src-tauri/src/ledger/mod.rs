@@ -847,6 +847,11 @@ pub struct LedgerStatus {
     /// for a later pass. Not folded into `dropped`.
     #[serde(default)]
     pub catch_up_failures: u64,
+    /// Bind/unbind rows a sibling worktree wrote that the ledger keeps as history
+    /// only, because only GitPulse and the bind/unbind commands may set a binding.
+    /// Its own field, so it reaches every surface whatever else `error_code` says.
+    #[serde(default)]
+    pub history_only_bindings: u64,
     /// Empty when recording; otherwise why not.
     pub error: String,
     pub error_code: String,
@@ -3036,9 +3041,10 @@ const FAMILY_EPOCH_KEY: &str = "family-initial-pass";
 /// bind/unbind rows keep setting bindings. Everything that arrives later was
 /// written by something that could have written the anchor instead, and is
 /// history only. The marker is data in a table the ledger already has, never a
-/// schema change: a source row means that source was imported; the epoch row
-/// (cursor 0 while the pass runs, 1 once it ends with no source row to speak for
-/// it) covers a family with no sibling ledger at all.
+/// schema change: one `family-initial-pass` row in `ledger_family_imports`,
+/// cursor 0 while the pass is unfinished and 1 once it has ended. No row means no
+/// pass has finished, whatever source rows an older build left: those siblings
+/// are still legacy until a pass records the epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FamilyEpoch {
     /// No pass has completed: siblings found now are the legacy ledgers.
@@ -3049,16 +3055,6 @@ enum FamilyEpoch {
 
 fn marker_failed(error: rusqlite::Error) -> LedgerError {
     LedgerError::new("legacy_marker_failed", error.to_string())
-}
-
-/// Whether some import marker other than the epoch row exists.
-fn has_source_markers(conn: &Connection) -> Result<bool, LedgerError> {
-    conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM ledger_family_imports WHERE source_key != ?1)",
-        params![FAMILY_EPOCH_KEY],
-        |row| row.get(0),
-    )
-    .map_err(marker_failed)
 }
 
 /// The epoch, and whether its row is recorded.
@@ -3074,8 +3070,6 @@ fn read_family_epoch(conn: &Connection) -> Result<(FamilyEpoch, bool), LedgerErr
     Ok(match epoch {
         Some(0) => (FamilyEpoch::Initial, true),
         Some(_) => (FamilyEpoch::Settled, true),
-        // Imported by a build that kept no epoch: those sources were the pass.
-        None if has_source_markers(conn)? => (FamilyEpoch::Settled, false),
         None => (FamilyEpoch::Initial, false),
     })
 }
@@ -3130,18 +3124,35 @@ fn record_family_pass(anchor: &str) -> Result<FamilyEpoch, LedgerError> {
     })
 }
 
-/// Ends the initial pass: the epoch row is dropped when a source row now speaks
-/// for it, and kept (settled) when none does.
+/// Ends the initial pass: every sibling it enumerated has been imported.
 fn settle_family_pass(anchor: &str) -> Result<(), LedgerError> {
     with_conn(anchor, |conn| {
+        conn.execute(
+            "UPDATE ledger_family_imports SET source_cursor = 1 WHERE source_key = ?1",
+            params![FAMILY_EPOCH_KEY],
+        )
+        .map(|_| ())
+        .map_err(marker_failed)
+    })
+}
+
+/// Records a family as settled when its anchor was created by a binding writer
+/// and no pass ever ran: a fresh install has no legacy ledger, so the window in
+/// which a sibling could be mistaken for one closes with the ledger's creation.
+/// A ledger that cannot be written is left for the first caller that can.
+pub(crate) fn settle_fresh_family(anchor: &str) -> Result<(), LedgerError> {
+    let (epoch, recorded) = family_pass_state(anchor)?;
+    if epoch == FamilyEpoch::Settled || recorded || !anchor_is_writable(anchor) {
+        return Ok(());
+    }
+    with_conn(anchor, |conn| {
         let tx = write_tx(conn).map_err(marker_failed)?;
-        let sql = if has_source_markers(&tx)? {
-            "DELETE FROM ledger_family_imports WHERE source_key = ?1 AND source_cursor = 0"
-        } else {
-            "UPDATE ledger_family_imports SET source_cursor = 1 WHERE source_key = ?1"
-        };
-        tx.execute(sql, params![FAMILY_EPOCH_KEY])
-            .map_err(marker_failed)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO ledger_family_imports (source_key, source_label, source_cursor)
+             VALUES (?1, 'initial consolidation pass', 1)",
+            params![FAMILY_EPOCH_KEY],
+        )
+        .map_err(marker_failed)?;
         tx.commit().map_err(marker_failed)
     })
 }
@@ -3171,27 +3182,58 @@ pub(crate) fn history_only_binding_count(anchor: &str) -> Option<u64> {
     })
 }
 
+/// The `source_label` prefix of a sibling enumerated before the initial pass
+/// completed: `legacy@<max>|<path>`, `<max>` being that sibling's highest row id
+/// when it was first seen.
+const LEGACY_LABEL: &str = "legacy@";
+
+/// The legacy bound a stored label records, if it records one.
+fn legacy_bound(label: &str) -> Option<i64> {
+    label
+        .strip_prefix(LEGACY_LABEL)?
+        .split_once('|')?
+        .0
+        .parse()
+        .ok()
+}
+
 /// Whether a sibling ledger's bind/unbind rows may set a binding in the anchor.
+///
+/// Decided once per sibling, persisted in its import row, and never re-decided
+/// by how far an import got: a sibling enumerated before the initial pass
+/// completed is legacy, and the rows it held then (ids up to the bound) keep
+/// setting bindings however many passes it takes to import them. Rows past the
+/// bound, and every row of a sibling first seen after the pass, are history only.
 #[derive(Debug, Clone, Copy)]
 struct SourceAuthority {
-    /// This import is of a sibling the anchor's initial pass is taking for the
-    /// first time. A row that arrives in any later import (a sibling found after
-    /// the pass, or a row an already-imported sibling appended since) is history
-    /// only, however it is dated.
-    legacy: bool,
+    legacy_bound: Option<i64>,
 }
 
 impl SourceAuthority {
-    fn of(epoch: FamilyEpoch, first_import: bool) -> Self {
-        Self {
-            legacy: epoch == FamilyEpoch::Initial && first_import,
+    /// `stored` is the sibling's import label, `None` when it has no row yet;
+    /// `source_max` its highest row id now.
+    fn of(epoch: FamilyEpoch, stored: Option<&str>, source_max: i64) -> Self {
+        let legacy_bound = match stored.and_then(legacy_bound) {
+            Some(bound) => Some(bound),
+            None if epoch == FamilyEpoch::Initial => Some(source_max),
+            None => None,
+        };
+        Self { legacy_bound }
+    }
+
+    /// The label an import of this sibling stores.
+    fn label(&self, source_name: &str) -> String {
+        match self.legacy_bound {
+            Some(bound) => format!("{LEGACY_LABEL}{bound}|{source_name}"),
+            None => source_name.to_string(),
         }
     }
 
-    /// `event`, with a bind or unbind this source may not set a binding by
-    /// turned into its history-only spelling. Any other row is untouched.
+    /// `event` (its `id` still the sibling's own), with a bind or unbind this
+    /// source may not set a binding by turned into its history-only spelling.
+    /// Any other row is untouched.
     fn applied_to(&self, mut event: LedgerEvent) -> LedgerEvent {
-        if !self.legacy {
+        if !self.legacy_bound.is_some_and(|bound| event.id <= bound) {
             if let Some(imported) = bindings::imported_action(&event.action) {
                 event.action = imported.to_string();
             }
@@ -3341,15 +3383,19 @@ fn family_source_key(anchor: &Path, source: &str) -> Result<String, LedgerError>
     Ok(key)
 }
 
-fn family_import_cursor(anchor: &str, source_key: &str) -> Result<i64, LedgerError> {
+/// A sibling's import row: how far it got, and its stored label. `None` when the
+/// sibling has never had a row.
+fn family_import_state(
+    anchor: &str,
+    source_key: &str,
+) -> Result<Option<(i64, String)>, LedgerError> {
     with_conn(anchor, |conn| {
         conn.query_row(
-            "SELECT source_cursor FROM ledger_family_imports WHERE source_key = ?1",
+            "SELECT source_cursor, source_label FROM ledger_family_imports WHERE source_key = ?1",
             params![source_key],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
-        .map(|cursor| cursor.unwrap_or(0))
         .map_err(|error| LedgerError::new("legacy_marker_failed", error.to_string()))
     })
 }
@@ -3616,8 +3662,8 @@ fn import_source(
     {
         let source_name = source.to_string_lossy().into_owned();
         let source_key = family_source_key(anchor_path, &source_name)?;
-        let mut cursor = family_import_cursor(anchor, &source_key)?;
-        let authority = SourceAuthority::of(epoch, cursor == 0);
+        let stored = family_import_state(anchor, &source_key)?;
+        let mut cursor = stored.as_ref().map_or(0, |(cursor, _)| *cursor);
         #[cfg(test)]
         tests::LEDGER_SIBLING_OPENS.with(|opens| opens.set(opens.get() + 1));
         let source_conn = Connection::open_with_flags(source_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -3657,6 +3703,12 @@ fn import_source(
             // import. Re-scan from the start; ULID comparison keeps this safe.
             cursor = 0;
         }
+        let authority = SourceAuthority::of(
+            epoch,
+            stored.as_ref().map(|(_, label)| label.as_str()),
+            source_max,
+        );
+        let source_label = authority.label(&source_name);
 
         while cursor < source_max {
             let mut statement = source_transaction
@@ -3696,7 +3748,7 @@ fn import_source(
                 .filter(|event| bindings::base_action(&event.action) != event.action)
                 .count();
             let (imported, newest_cursor) =
-                import_legacy_page(anchor, &source_key, &source_name, &normalized, cursor)?;
+                import_legacy_page(anchor, &source_key, &source_label, &normalized, cursor)?;
             imported_total += imported;
             if let Some(newest_cursor) = newest_cursor {
                 announce(anchor, newest_cursor);
@@ -3707,7 +3759,7 @@ fn import_source(
         log::warn!(
             target: "ledger",
             "{demoted_total} bind/unbind row(s) from sibling ledger {} were imported as history only: \
-             the family's initial consolidation pass is over, so a sibling cannot set a binding",
+             this sibling was not part of the family's initial consolidation pass (or the row is newer than it), so it sets no binding",
             source.display()
         );
     }
@@ -4303,6 +4355,7 @@ pub fn status_readonly(repo_path: &str) -> LedgerStatus {
         } else {
             0
         },
+        history_only_bindings: 0,
         error,
         error_code,
     }
@@ -4376,6 +4429,7 @@ pub fn status(repo_path: &str) -> LedgerStatus {
             path: path.display().to_string(),
             dropped,
             catch_up_failures,
+            history_only_bindings: 0,
             error: String::new(),
             error_code: String::new(),
         },
@@ -4384,6 +4438,7 @@ pub fn status(repo_path: &str) -> LedgerStatus {
             path: path.display().to_string(),
             dropped,
             catch_up_failures,
+            history_only_bindings: 0,
             error: e.message,
             error_code: e.code.to_string(),
         },

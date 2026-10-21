@@ -46,6 +46,8 @@ export interface LedgerStatus {
   dropped: number;
   /** Bind/unbind writes whose catch-up failed or was cut short; not a dropped append. */
   catch_up_failures?: number;
+  /** Bind/unbind rows written by sibling worktrees, kept as history only (they set no binding). */
+  history_only_bindings?: number;
   error: string;
   error_code: string;
 }

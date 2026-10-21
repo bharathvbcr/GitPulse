@@ -302,11 +302,12 @@ fn post_initial_pass_forgeries_are_history_only() {
     );
 }
 
-/// Attack 3 residual. The marker lives in the anchor. Resetting the epoch row
-/// to cursor 0 (a same-user write to the anchor) reopens the window; a mere
-/// delete does not when source markers exist. Documents which.
+/// Attack 3 residual. The marker lives in the anchor. Deleting the epoch row, or
+/// resetting it to cursor 0, reopens the window: with no row no pass has
+/// finished, which is what an upgrade from a build that kept none looks like. Both
+/// need a write to the anchor itself, which is already full power.
 #[test]
-fn marker_delete_does_not_reopen_but_reset_to_zero_does() {
+fn marker_delete_and_reset_to_zero_reopen_the_window_like_an_upgrade() {
     let (_dir, main) = canonical_repo();
     note_in(&main);
     settle();
@@ -333,8 +334,8 @@ fn marker_delete_does_not_reopen_but_reset_to_zero_does() {
     write_row(&f1, &f1, Some("TASK-F1"), now_millis());
     assert_eq!(
         resolve(&main, &f1).unwrap(),
-        None,
-        "BROKEN: marker delete reopened"
+        Some("TASK-F1".into()),
+        "a deleted marker reads as an upgrade: the sibling is legacy"
     );
 
     raw(&main)

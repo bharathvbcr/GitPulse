@@ -254,20 +254,33 @@ fn readonly_status_of(family: &FamilyAddress) -> super::LedgerStatus {
 /// The `error_code` of a ledger holding sibling bind/unbind rows as history only.
 pub(crate) const HISTORY_ONLY_BINDINGS_CODE: &str = "binding_rows_history_only";
 
-/// Says, on a status that has nothing else to say, how many sibling bind/unbind
-/// rows were imported as history only: a binding that did not take effect must
-/// not do so silently. A status already carrying a failure keeps that one.
+/// Says how many sibling bind/unbind rows were imported as history only: a
+/// binding that did not take effect must not do so silently.
+///
+/// The count is its own field, so it reaches every surface whatever else the
+/// status says. The error slot takes the notice too when it is free or holds only
+/// the legacy-unconsolidated caveat (which the message then keeps); a real
+/// failure keeps the slot.
 fn note_history_only_bindings(status: &mut super::LedgerStatus, anchor: &str) {
-    if !status.error.is_empty() {
+    let Some(count @ 1..) = super::history_only_binding_count(anchor) else {
         return;
-    }
-    if let Some(count @ 1..) = super::history_only_binding_count(anchor) {
-        status.error = format!(
-            "{count} bind/unbind row(s) written by sibling worktrees were kept as history only: \
-             only GitPulse and the bind/unbind commands writing the primary ledger can set a \
-             binding, so those rows set none. Rebind the worktree in GitPulse if one was meant."
-        );
-        status.error_code = HISTORY_ONLY_BINDINGS_CODE.to_string();
+    };
+    status.history_only_bindings = count;
+    let notice = format!(
+        "{count} bind/unbind row(s) written by sibling worktrees were kept as history only: \
+         only GitPulse and the bind/unbind commands writing the primary ledger can set a \
+         binding, so those rows set none. Rebind the worktree in GitPulse if one was meant."
+    );
+    match status.error_code.as_str() {
+        "" => {
+            status.error = notice;
+            status.error_code = HISTORY_ONLY_BINDINGS_CODE.to_string();
+        }
+        LEGACY_UNCONSOLIDATED_CODE => {
+            status.error = format!("{notice} {}", status.error);
+            status.error_code = HISTORY_ONLY_BINDINGS_CODE.to_string();
+        }
+        _ => {}
     }
 }
 
@@ -371,7 +384,8 @@ pub fn bind_with(
     let address = address(repo_path, worktree_path)?;
     validate_task(&address.anchor, task_id)?;
     let detail_json = before(&address);
-    append(Draft {
+    let anchor = address.anchor.clone();
+    let row = append(Draft {
         repo_path: address.anchor,
         worktree_path: Some(address.worktree.clone()),
         task_id: Some(task_id.to_string()),
@@ -381,7 +395,18 @@ pub fn bind_with(
         outcome: Some(Outcome::Ok),
         detail_json,
         ..Default::default()
-    })
+    })?;
+    close_fresh_family_window(&anchor);
+    Ok(row)
+}
+
+/// The row is written: if this write created the family's ledger, no sibling
+/// ledger can be a legacy one, so record that. A failure leaves the window open
+/// (and is logged); it never undoes the binding.
+fn close_fresh_family_window(anchor: &str) {
+    if let Err(error) = super::settle_fresh_family(anchor) {
+        log::warn!(target: "ledger", "could not record the family's initial pass: {error}");
+    }
 }
 
 /// Clears whatever `worktree_path` was bound to.
@@ -397,7 +422,8 @@ pub fn unbind_with(
 ) -> Result<i64, LedgerError> {
     let address = address(repo_path, worktree_path)?;
     let detail_json = before(&address);
-    append(Draft {
+    let anchor = address.anchor.clone();
+    let row = append(Draft {
         repo_path: address.anchor,
         worktree_path: Some(address.worktree.clone()),
         action: UNBIND.to_string(),
@@ -406,7 +432,9 @@ pub fn unbind_with(
         outcome: Some(Outcome::Ok),
         detail_json,
         ..Default::default()
-    })
+    })?;
+    close_fresh_family_window(&anchor);
+    Ok(row)
 }
 
 /// The task `worktree_path` is bound to, if any.
@@ -1445,9 +1473,13 @@ mod tests {
         );
         super::super::with_conn(&address.anchor, |conn| {
             let marker_count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM ledger_family_imports", [], |row| {
-                    row.get(0)
-                })
+                .query_row(
+                    // Source markers: the family's own pass row is not one.
+                    "SELECT COUNT(*) FROM ledger_family_imports
+                     WHERE source_key != 'family-initial-pass'",
+                    [],
+                    |row| row.get(0),
+                )
                 .map_err(|error| LedgerError::new("fixture_failed", error.to_string()))?;
             assert_eq!(marker_count, 2);
             Ok(())
