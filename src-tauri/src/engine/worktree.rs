@@ -1074,23 +1074,25 @@ fn batch_divergence(
     if branches.is_empty() {
         return Some(HashMap::new());
     }
-    let format = format!("--format=%(refname)%00%(ahead-behind:{base_oid})");
     let patterns: Vec<String> = branches.iter().map(|b| format!("refs/heads/{b}")).collect();
-    let mut args = vec!["for-each-ref", format.as_str()];
-    args.extend(patterns.iter().map(String::as_str));
-    let text = crate::engine::ref_cache::git_text(repo, &["refs/heads"], &args).ok()?;
+    let patterns: Vec<&str> = patterns.iter().map(String::as_str).collect();
+    let query = crate::engine::git_reader::RefQuery {
+        namespaces: &["refs/heads"],
+        command: &["for-each-ref"],
+        patterns: &patterns,
+        fields: "%(refname)",
+    };
+    let listing =
+        crate::engine::git_reader::list_against(repo, &query, Some(base_oid), false).ok()?;
     let mut out = HashMap::new();
-    for line in text.lines() {
-        let Some((refname, counts)) = line.split_once('\0') else {
-            continue;
-        };
-        let Some(branch) = refname.strip_prefix("refs/heads/") else {
+    for row in listing.rows().ok()? {
+        let Some(branch) = row.fields[0].strip_prefix("refs/heads/") else {
             continue;
         };
         if !branches.contains(&branch) {
             continue;
         }
-        if let Some((ahead, behind)) = crate::engine::git_reader::parse_ahead_behind_pair(counts) {
+        if let Some((ahead, behind)) = row.counts {
             out.insert(branch.to_string(), WorktreeDivergence { ahead, behind });
         }
     }
@@ -5778,6 +5780,132 @@ some-future-field whatever
         })
         .expect("list");
         assert_eq!(measured(&walked), Some(expected), "walked");
+    }
+
+    /// Adversarial L4: `batch_divergence` is fresh after each ref move, and a git
+    /// that rejects the atom answers None with exactly one spawn.
+    #[test]
+    fn l4_batch_divergence_is_fresh_after_moves_and_none_without_a_retry() {
+        let _held = crate::engine::ref_cache::retention();
+        let (main, _parent, linked) = repo_with_worktrees(1);
+        let root = plain(main.path());
+        let truth = |base: &str, b: &str| {
+            let c = rev_text(
+                &root,
+                &[
+                    "rev-list",
+                    "--left-right",
+                    "--count",
+                    &format!("{base}...{b}"),
+                ],
+            );
+            let mut it = c.split_whitespace().map(|n| n.parse::<usize>().unwrap());
+            let behind = it.next().unwrap();
+            let ahead = it.next().unwrap();
+            WorktreeDivergence { ahead, behind }
+        };
+        crate::engine::ref_cache::eager(|| {
+            let ask = || {
+                let base = rev(&root, "main");
+                (
+                    base.clone(),
+                    batch_divergence(&root, &base, &["agent/00", "main"]).expect("a batch"),
+                )
+            };
+            let check = |label: &str| {
+                let (base, got) = ask();
+                for b in ["agent/00", "main"] {
+                    assert_eq!(got[b], truth(&base, b), "stale {b} after {label}");
+                }
+            };
+            check("warm");
+            check("warm again");
+            std::fs::write(linked[0].join("x.txt"), "x").unwrap();
+            git_in(&linked[0], &["add", "."]);
+            git_in(&linked[0], &["commit", "-q", "-m", "x"]);
+            check("a commit in the linked worktree");
+            git_in(
+                &root,
+                &["commit", "-q", "--allow-empty", "-m", "main moves"],
+            );
+            check("the base moving");
+            let tip = rev(&root, "agent/00");
+            git_in(
+                &root,
+                &["update-ref", "refs/heads/agent/00", &rev(&root, "main")],
+            );
+            check("update-ref back to base");
+            git_in(&root, &["pack-refs", "--all"]);
+            check("pack-refs");
+            git_in(&root, &["update-ref", "refs/heads/agent/00", &tip]);
+            check("loose over packed");
+        });
+        let base = rev(&root, "main");
+        let arg = format!("--format=%(refname)%00%(ahead-behind:{base})");
+        let retries = || {
+            crate::engine::git_cli::spawn_log::spawns_in(&root)
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == "--format=%(refname)"))
+                .count()
+        };
+        let before = retries();
+        let got = crate::engine::git_cli::with_forced_spawn_failure_of(&arg, || {
+            batch_divergence(&root, &base, &["main"])
+        });
+        assert_eq!(got, None);
+        assert_eq!(retries(), before, "no atom-less retry");
+    }
+
+    fn rev_text(repo: &Path, args: &[&str]) -> String {
+        git_text(repo, args).unwrap().trim().to_string()
+    }
+
+    /// Pins `batch_divergence` on worktrees whose branches are diverged, one of
+    /// them named with unicode, slashes and `@`: exact-name rows only, a
+    /// namespace prefix and a missing branch absent, and `None` for a base git
+    /// cannot measure.
+    #[test]
+    fn batch_divergence_pins_exact_branch_rows() {
+        let (main, _parent, linked) = repo_with_worktrees(2);
+        let root = plain(main.path());
+        let odd = "w\u{fc}/\u{e7}@x";
+        git_in(&root, &["branch", odd]);
+        let odd_tree = _parent.path().join("odd-tree");
+        git_in(
+            &root,
+            &["worktree", "add", "-q", odd_tree.to_str().unwrap(), odd],
+        );
+        for (tree, n) in [(&linked[0], 2), (&linked[1], 1), (&odd_tree, 3)] {
+            for i in 0..n {
+                std::fs::write(tree.join(format!("c{i}.txt")), "x").unwrap();
+                git_in(tree, &["add", "."]);
+                git_in(tree, &["commit", "-q", "-m", &format!("c{i}")]);
+            }
+        }
+        std::fs::write(root.join("m.txt"), "x").unwrap();
+        git_in(&root, &["add", "."]);
+        git_in(&root, &["commit", "-q", "-m", "main moves"]);
+        let base = rev(&root, "main");
+
+        let asked = ["agent/00", "agent/01", odd, "main", "agent", "gone/branch"];
+        let got = batch_divergence(&root, &base, &asked).expect("a batch");
+        let pair = |a, b| WorktreeDivergence {
+            ahead: a,
+            behind: b,
+        };
+        let expected = HashMap::from([
+            ("agent/00".to_string(), pair(2, 1)),
+            ("agent/01".to_string(), pair(1, 1)),
+            (odd.to_string(), pair(3, 1)),
+            ("main".to_string(), pair(0, 0)),
+        ]);
+        assert_eq!(
+            got, expected,
+            "`agent` is a prefix and `gone/branch` absent"
+        );
+        assert_eq!(batch_divergence(&root, &base, &[]), Some(HashMap::new()));
+        let missing = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(batch_divergence(&root, missing, &["main"]), None);
     }
 
     /// The test checkout's pre-commit guard, and the identity it refuses.

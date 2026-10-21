@@ -44,6 +44,75 @@ const SPEC: Spec = Spec {
     linked_worktrees: 17,
 };
 
+/// The ref-listing fixture: few files, enough commits for every ref to sit at
+/// a different one, and 7 linked worktrees (8 in all) whose branches the
+/// divergence batch measures.
+const REF_SPEC: Spec = Spec {
+    files: 40,
+    dirs: 4,
+    extra_commits: 60,
+    touch: 2,
+    linked_worktrees: 7,
+};
+
+/// The tip-counts fixture: a history for the refs to sit at, no worktrees.
+const TIPS_SPEC: Spec = Spec {
+    files: 20,
+    dirs: 2,
+    extra_commits: 40,
+    touch: 2,
+    linked_worktrees: 0,
+};
+
+/// Refs in the tip-counts fixture.
+const TIP_REFS: usize = 2000;
+
+/// Branches and tags added to the ref-listing fixture, beside the worktrees'.
+const REF_BRANCHES: usize = 220;
+const REF_TAGS: usize = 60;
+
+fn git_lines(repo: &Path, args: &[&str]) -> Vec<String> {
+    common::fixture::git(repo, args)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Applies `commands` (`git update-ref --stdin` lines) in one process.
+#[cfg(unix)]
+fn update_refs(repo: &Path, commands: &str) {
+    use gitpulse_lib::procguard::LockedSpawn;
+    use std::io::Write;
+    let mut child = std::process::Command::new("git")
+        .args(["update-ref", "--stdin"])
+        .current_dir(repo)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn_locked()
+        .expect("spawn git update-ref");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(commands.as_bytes())
+        .expect("write the ref commands");
+    let out = child.wait_with_output().expect("wait for update-ref");
+    assert!(
+        out.status.success(),
+        "update-ref failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(not(unix))]
+fn update_refs(repo: &Path, commands: &str) {
+    for line in commands.lines() {
+        let words: Vec<&str> = line.split(' ').skip(1).collect();
+        common::fixture::git(repo, &[&["update-ref"], words.as_slice()].concat());
+    }
+}
+
 /// `count` transcripts, each with `edits` assistant tool_use lines naming a
 /// file inside `repo`, in the shape `tests/catch_up_integration.rs` uses.
 fn write_transcripts(root: &Path, repo: &str, count: usize, edits: usize) {
@@ -403,6 +472,178 @@ fn main() {
         report.finish();
         return;
     }
+    // `git_preflight` caches a passing answer: warm it so a counted pass below
+    // is its own work and not charged for the one-time `git version` probe.
+    let preflight = gitpulse_lib::engine::git_cli::git_preflight();
+    assert_eq!(
+        preflight.status,
+        gitpulse_lib::engine::git_cli::GitPreflightStatus::Ok,
+        "git did not pass its preflight ({:?})",
+        preflight.message
+    );
+    // The ref-listing rows: a repository with 220 branches, 60 tags and 8
+    // worktrees, every ref at a different commit so ahead-behind has real work.
+    // A ref is moved before every timed call, outside the span: the ref cache
+    // never keeps an answer read inside its racy window of the last ref write,
+    // so each timed call is the cold listing a watcher event pays.
+    let refs = build_repo(&temp.path().join("refs"), &REF_SPEC);
+    let refs_path = refs.path().to_string();
+    let tips = git_lines(&refs.main, &["rev-list", "HEAD"]);
+    let mut stdin = String::new();
+    for n in 0..REF_BRANCHES {
+        stdin.push_str(&format!(
+            "create refs/heads/bench/b{n:03} {}\n",
+            tips[n % tips.len()]
+        ));
+    }
+    for n in 0..REF_TAGS {
+        stdin.push_str(&format!(
+            "create refs/tags/t{n:03} {}\n",
+            tips[(n * 3) % tips.len()]
+        ));
+    }
+    update_refs(&refs.main, &stdin);
+    let churn_tips = (tips[1].clone(), tips[2].clone());
+    let churn_flip = std::cell::Cell::new(false);
+    let churn = || {
+        let flip = !churn_flip.get();
+        churn_flip.set(flip);
+        let tip = if flip { &churn_tips.0 } else { &churn_tips.1 };
+        common::fixture::git(&refs.main, &["update-ref", "refs/heads/bench-churn", tip]);
+    };
+    let timed = |run: &dyn Fn() -> u64| {
+        churn();
+        let started = std::time::Instant::now();
+        let rows = run();
+        (rows, started.elapsed())
+    };
+    let branch_rows = || {
+        let listed = GitReader::list_branches(&refs_path)
+            .unwrap_or_else(|error| panic!("list_branches failed: {error}"));
+        assert!(
+            listed.len() >= REF_BRANCHES && listed.iter().all(|b| b.compared_to.is_some()),
+            "a branch row was dropped or uncompared, so this run would time a degraded listing"
+        );
+        std::hint::black_box(&listed);
+        listed.len() as u64
+    };
+    let tag_rows = || {
+        let listed = GitReader::list_tags(&refs_path)
+            .unwrap_or_else(|error| panic!("list_tags failed: {error}"));
+        assert!(
+            listed.tags.len() == REF_TAGS && listed.tags.iter().all(|t| t.compared_to.is_some()),
+            "a tag row was dropped or uncompared, so this run would time a degraded listing"
+        );
+        std::hint::black_box(&listed);
+        listed.tags.len() as u64
+    };
+    let divergence_rows = || {
+        let listed = gitpulse_lib::engine::worktree::list_worktrees(&refs_path)
+            .unwrap_or_else(|error| panic!("list_worktrees failed: {error}"));
+        assert!(
+            listed.len() == REF_SPEC.linked_worktrees + 1
+                && listed
+                    .iter()
+                    .filter(|w| w.branch.as_deref().is_some_and(|b| b.starts_with("wt/")))
+                    .all(|w| w.main_divergence.is_some()),
+            "a worktree has no divergence, so this run would time the per-worktree walks"
+        );
+        std::hint::black_box(&listed);
+        listed.len() as u64
+    };
+    // Untimed pass: git processes per call, and for-each-ref/tag among them.
+    let listing_spawns = |run: &dyn Fn() -> u64| {
+        churn();
+        let (_, argvs) = git_process_argvs(run);
+        let listings = argvs
+            .iter()
+            .filter(|argv| argv.iter().any(|a| a == "for-each-ref" || a == "tag"))
+            .count() as u64;
+        (argvs.len() as u64, listings)
+    };
+    let (branch_procs, branch_listings) = listing_spawns(&branch_rows);
+    let (tag_procs, tag_listings) = listing_spawns(&tag_rows);
+    let (divergence_procs, divergence_listings) = listing_spawns(&divergence_rows);
+
+    // Tip counts alone, at 2000 refs (half branches, half remote-tracking): the
+    // listing `branch_stats` makes for every unanswered tip, which needs the
+    // oid and the counts and nothing else.
+    let tips_repo = build_repo(&temp.path().join("tips"), &TIPS_SPEC);
+    let tips_path = tips_repo.path().to_string();
+    let tips_tips = git_lines(&tips_repo.main, &["rev-list", "HEAD"]);
+    let mut tips_stdin = String::new();
+    for n in 0..TIP_REFS {
+        let kind = if n % 2 == 0 {
+            "heads/t"
+        } else {
+            "remotes/origin/t"
+        };
+        tips_stdin.push_str(&format!(
+            "create refs/{kind}{n:04} {}\n",
+            tips_tips[n % tips_tips.len()]
+        ));
+    }
+    update_refs(&tips_repo.main, &tips_stdin);
+    let tips_base = common::fixture::git(&tips_repo.main, &["rev-parse", "main"])
+        .trim()
+        .to_string();
+    let tips_flip = std::cell::Cell::new(false);
+    let tip_counts_cold = || {
+        let flip = !tips_flip.get();
+        tips_flip.set(flip);
+        let tip = &tips_tips[if flip { 1 } else { 2 }];
+        common::fixture::git(
+            &tips_repo.main,
+            &["update-ref", "refs/heads/bench-churn", tip],
+        );
+        let started = std::time::Instant::now();
+        let rows = GitReader::bench_tip_counts(&tips_path, &tips_base).unwrap_or_else(|| {
+            panic!("tip counts were not answered, so this run would time a failure")
+        });
+        let elapsed = started.elapsed();
+        assert!(rows > 1, "the listing answered no tips");
+        Sample::default()
+            .counter("tips", rows as u64)
+            .elapsed(elapsed)
+    };
+    let ref_cases = || {
+        vec![
+            Case::new("tip counts cold 2000 refs", &tip_counts_cold),
+            Case::new("list_branches cold", || {
+                let (rows, elapsed) = timed(&branch_rows);
+                Sample::default()
+                    .counter("rows", rows)
+                    .counter("git_processes", branch_procs)
+                    .counter("listing_processes", branch_listings)
+                    .elapsed(elapsed)
+            }),
+            Case::new("list_tags cold", || {
+                let (rows, elapsed) = timed(&tag_rows);
+                Sample::default()
+                    .counter("rows", rows)
+                    .counter("git_processes", tag_procs)
+                    .counter("listing_processes", tag_listings)
+                    .elapsed(elapsed)
+            }),
+            Case::new("worktree divergence cold", || {
+                let (rows, elapsed) = timed(&divergence_rows);
+                Sample::default()
+                    .counter("worktrees", rows)
+                    .counter("git_processes", divergence_procs)
+                    .counter("listing_processes", divergence_listings)
+                    .elapsed(elapsed)
+            }),
+        ]
+    };
+    // `GITPULSE_BENCH_REFS_ONLY=1` times just the ref-listing rows, which is
+    // what an A/B of the listing code needs without the other rows' minutes.
+    if std::env::var_os("GITPULSE_BENCH_REFS_ONLY").is_some() {
+        let rows = interleave(ref_cases(), report.opts.samples(15), report.opts.warmup(2));
+        report.extend(rows);
+        report.finish();
+        return;
+    }
+
     let repo = build_repo(&temp.path().join("fixture"), &SPEC);
     let path = repo.path().to_string();
     let commit = head(&repo);
@@ -502,7 +743,8 @@ fn main() {
     std::thread::sleep(std::time::Duration::from_secs(4));
     GitReader::knowledge_report(&path, Some(WARM_OWNERSHIP_SAMPLE)).expect("prime ownership");
 
-    let cases = vec![
+    let mut cases = ref_cases();
+    cases.extend(vec![
         Case::new("insights snapshot", || {
             let (snap, facets_ok) = snapshot(&path);
             std::hint::black_box(&snap);
@@ -592,7 +834,7 @@ fn main() {
                 .counter("parents", details.parent_ids.len() as u64)
                 .counter("git_processes", details_procs)
         }),
-    ];
+    ]);
     let mut rows = interleave(cases, report.opts.samples(15), report.opts.warmup(2));
 
     // The cold pass: a fresh repository and transcript set per sample, built

@@ -606,56 +606,22 @@ impl GitReader {
         } = default_base(&repo).checked()?;
         let remote_names = configured_remote_names(&repo);
 
-        let mut format = String::from(BRANCH_LIST_FORMAT);
-        if let Some((_, base_oid)) = default_base.as_ref() {
-            format.push_str("%00%(ahead-behind:");
-            format.push_str(base_oid);
-            format.push(')');
-        }
-        let format_arg = format!("--format={format}");
-        let listed = ref_cache::git_text(
+        // Older git (<2.42) rejects the ahead-behind atom outright: the listing
+        // retries once without it so it still works. Ahead/behind then stay
+        // zero and cmd_branch_stats fills them progressively.
+        let listing = list_against(
             &repo,
-            BRANCH_NAMESPACES,
-            &[
-                "for-each-ref",
-                format_arg.as_str(),
-                "refs/heads/",
-                "refs/remotes/",
-            ],
-        );
-        // Older git (<2.42) rejects the ahead-behind atom outright: retry once
-        // without it so listing still works. Ahead/behind then stay zero and
-        // cmd_branch_stats fills them progressively.
-        let (stdout, has_ahead_behind) = match listed {
-            Ok(stdout) => (stdout, default_base.is_some()),
-            Err(err) if default_base.is_some() => {
-                let base_format_arg = format!("--format={BRANCH_LIST_FORMAT}");
-                let retried = git_text(
-                    &repo,
-                    &[
-                        "for-each-ref",
-                        base_format_arg.as_str(),
-                        "refs/heads/",
-                        "refs/remotes/",
-                    ],
-                )
-                .map_err(|retry_err| {
-                    format!("{err}; retry without ahead-behind also failed: {retry_err}")
-                })?;
-                (retried, false)
-            }
-            Err(err) => return Err(err),
-        };
+            &BRANCH_QUERY,
+            default_base.as_ref().map(|(_, oid)| oid.as_str()),
+            true,
+        )?;
         let default_short = default_base.map(|(name, _)| name);
 
         let mut branches = Vec::new();
         // One line per ref; refnames and subjects cannot contain newlines or
         // NULs, so NUL-separated fields stay aligned.
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.split('\0').collect();
-            if parts.len() < 3 {
-                continue;
-            }
+        for row in listing.rows()? {
+            let parts = row.fields;
             let is_current = parts[0].trim() == "*";
             let refname = parts[1];
             if is_remote_head(&remote_names, refname) {
@@ -690,9 +656,7 @@ impl GitReader {
             // leaves this branch uncompared rather than zero-ahead. Unreachable
             // for branch refs (see `branch_refs_always_yield_two_counts`), and
             // that is exactly why it must not be the one case read as "merged".
-            let measured = has_ahead_behind
-                .then(|| parse_ahead_behind_pair(parts.get(8).copied().unwrap_or("")))
-                .flatten();
+            let measured = row.counts;
             let (commits_ahead_of_base, commits_behind_base) = measured.unwrap_or((0, 0));
 
             branches.push(BranchInfo {
@@ -1747,6 +1711,14 @@ impl GitReader {
         parse_commit_show(&stdout, cut.as_ref())
     }
 
+    /// [`tip_counts_against`] by repository path, for the command benches, which
+    /// cannot reach the crate-private function.
+    #[doc(hidden)]
+    pub fn bench_tip_counts(repo_path: &str, base_oid: &str) -> Option<usize> {
+        let repo = validate_repo(repo_path).ok()?;
+        tip_counts_against(&repo, base_oid).map(|counts| counts.len())
+    }
+
     pub fn list_tags(repo_path: &str) -> Result<TagList, String> {
         let repo = validate_repo(repo_path)?;
         // A tag row could name a commit but never say where that commit stood.
@@ -1758,67 +1730,41 @@ impl GitReader {
         // against the same thing, and it rides this one listing process.
         let default_base = default_base(&repo).checked()?.base;
 
-        let mut format = String::from(TAG_LIST_FORMAT);
-        if let Some((_, base_oid)) = default_base.as_ref() {
-            format.push_str("%00%(ahead-behind:");
-            format.push_str(base_oid);
-            format.push(')');
-        }
-        let format_arg = format!("--format={format}");
-        let listed = ref_cache::git_text(
+        // Older git (<2.42) rejects the ahead-behind atom outright: the listing
+        // retries once without it. Every tag is then UNCOMPARED rather than
+        // zero-ahead — see `TagInfo::compared_to`.
+        let listing = list_against(
             &repo,
-            &["refs/tags"],
-            &["tag", "-l", "--sort=-creatordate", format_arg.as_str()],
-        );
-        // Older git (<2.42) rejects the ahead-behind atom outright: retry once
-        // without it so the listing still works. Every tag is then UNCOMPARED
-        // rather than zero-ahead — see `TagInfo::compared_to`.
-        let (stdout, has_ahead_behind) = match listed {
-            Ok(stdout) => (stdout, default_base.is_some()),
-            Err(err) if default_base.is_some() => {
-                let base_format_arg = format!("--format={TAG_LIST_FORMAT}");
-                let retried = git_text(
-                    &repo,
-                    &["tag", "-l", "--sort=-creatordate", base_format_arg.as_str()],
-                )
-                .map_err(|retry_err| {
-                    format!("{err}; retry without ahead-behind also failed: {retry_err}")
-                })?;
-                (retried, false)
-            }
-            Err(err) => return Err(err),
-        };
-        let base_name = has_ahead_behind
+            &TAG_QUERY,
+            default_base.as_ref().map(|(_, oid)| oid.as_str()),
+            true,
+        )?;
+        let base_name = listing
+            .measured()
             .then(|| default_base.map(|(name, _)| name))
             .flatten();
 
         let mut tags = Vec::new();
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.split('\x00').collect();
-            if parts.len() >= 2 {
-                // Lightweight tags have no peeled id; theirs is already a commit.
-                let peeled = parts.get(3).map(|s| s.trim()).unwrap_or("");
-                let commit_id = if peeled.is_empty() { parts[1] } else { peeled };
-                // Per ROW, not per listing: one tag git could not compare must
-                // not blind the rest, nor borrow their base.
-                let measured = base_name.as_ref().and_then(|name| {
-                    parse_ahead_behind_pair(parts.get(4).copied().unwrap_or(""))
-                        .map(|counts| (counts, name.clone()))
-                });
-                let (commits_ahead_of_base, commits_behind_base) =
-                    measured.as_ref().map(|(c, _)| *c).unwrap_or((0, 0));
-                tags.push(TagInfo {
-                    name: parts[0].to_string(),
-                    commit_id: commit_id.to_string(),
-                    message: parts
-                        .get(2)
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string()),
-                    commits_ahead_of_base,
-                    commits_behind_base,
-                    compared_to: measured.map(|(_, name)| name),
-                });
-            }
+        for row in listing.rows()? {
+            let parts = row.fields;
+            // Lightweight tags have no peeled id; theirs is already a commit.
+            let peeled = parts[3].trim();
+            let commit_id = if peeled.is_empty() { parts[1] } else { peeled };
+            // Per ROW, not per listing: one tag git could not compare must
+            // not blind the rest, nor borrow their base.
+            let measured = base_name
+                .as_ref()
+                .and_then(|name| row.counts.map(|counts| (counts, name.clone())));
+            let (commits_ahead_of_base, commits_behind_base) =
+                measured.as_ref().map(|(c, _)| *c).unwrap_or((0, 0));
+            tags.push(TagInfo {
+                name: parts[0].to_string(),
+                commit_id: commit_id.to_string(),
+                message: Some(parts[2]).filter(|s| !s.is_empty()).map(String::from),
+                commits_ahead_of_base,
+                commits_behind_base,
+                compared_to: measured.map(|(_, name)| name),
+            });
         }
         let truncated = tags.len() > TAG_LIST_CAP;
         tags.truncate(TAG_LIST_CAP);
@@ -4031,6 +3977,151 @@ const BRANCH_NAMESPACES: &[&str] = &["refs/heads", "refs/remotes"];
 
 const BRANCH_LIST_FORMAT: &str ="%(HEAD)%00%(refname)%00%(objectname)%00%(upstream:track)%00%(upstream:short)%00%(committerdate:unix)%00%(authorname)%00%(contents:subject)";
 
+/// A ref listing that may measure every row against a base commit with
+/// `%(ahead-behind:<base>)`: what to run, over which ref files it is a function
+/// of, and which fields each row carries before the counts.
+pub(crate) struct RefQuery<'a> {
+    /// What the answer is a function of; the ref cache stamps exactly these.
+    pub namespaces: &'a [&'a str],
+    /// The words before the `--format` argument (`for-each-ref`, or `tag -l`).
+    pub command: &'a [&'a str],
+    /// The ref patterns after it; empty for a listing that names none.
+    pub patterns: &'a [&'a str],
+    /// `%00`-separated atoms, without the ahead-behind atom.
+    pub fields: &'a str,
+}
+
+/// The branch and remote-tracking listing `list_branches` reads.
+const BRANCH_QUERY: RefQuery<'static> = RefQuery {
+    namespaces: BRANCH_NAMESPACES,
+    command: &["for-each-ref"],
+    patterns: &["refs/heads/", "refs/remotes/"],
+    fields: BRANCH_LIST_FORMAT,
+};
+
+/// The same refs as [`BRANCH_QUERY`] with only the tip oid: what
+/// `tip_counts_against` needs, without the upstream track, author and subject
+/// that cost three times as much to produce on a cold listing.
+const TIP_QUERY: RefQuery<'static> = RefQuery {
+    fields: "%(objectname)",
+    ..BRANCH_QUERY
+};
+
+const TAG_QUERY: RefQuery<'static> = RefQuery {
+    namespaces: &["refs/tags"],
+    command: &["tag", "-l", "--sort=-creatordate"],
+    patterns: &[],
+    fields: TAG_LIST_FORMAT,
+};
+
+/// The text of one [`RefQuery`], and whether git measured it against a base.
+pub(crate) struct AheadBehindListing {
+    text: String,
+    fields: usize,
+    measured: bool,
+}
+
+/// One row of an [`AheadBehindListing`].
+pub(crate) struct ListedRow<'a> {
+    /// The query's own fields, in order.
+    pub fields: Vec<&'a str>,
+    /// `Some` only when the listing was measured and git filled this row's
+    /// counts with two numbers. Per row, never per listing: a row git could not
+    /// compare is uncompared, not zero-ahead, and does not blind the others.
+    pub counts: Option<(usize, usize)>,
+}
+
+/// Runs `query`, asking git to measure each row against `base_oid` when one is
+/// given. The ref cache keeps the answer under the query's argv (the base is
+/// part of it) and the stamp of its namespaces, so a moved base or a changed
+/// ref is a miss.
+///
+/// Git older than 2.42 rejects the atom outright. With `retry`, the listing is
+/// asked once more without it and every row is then uncompared; without it the
+/// refusal is the error, for a caller whose only product is the counts.
+pub(crate) fn list_against(
+    repo: &Path,
+    query: &RefQuery<'_>,
+    base_oid: Option<&str>,
+    retry: bool,
+) -> Result<AheadBehindListing, String> {
+    let fields = query.fields.split("%00").count();
+    let run = |format: &str, cached: bool| {
+        let format_arg = format!("--format={format}");
+        let mut args: Vec<&str> = query.command.to_vec();
+        args.push(format_arg.as_str());
+        args.extend_from_slice(query.patterns);
+        if cached {
+            ref_cache::git_text(repo, query.namespaces, &args)
+        } else {
+            git_text(repo, &args)
+        }
+    };
+    let Some(base_oid) = base_oid else {
+        return Ok(AheadBehindListing {
+            text: run(query.fields, true)?,
+            fields,
+            measured: false,
+        });
+    };
+    match run(
+        &format!("{}%00%(ahead-behind:{base_oid})", query.fields),
+        true,
+    ) {
+        Ok(text) => Ok(AheadBehindListing {
+            text,
+            fields,
+            measured: true,
+        }),
+        Err(err) if retry => run(query.fields, false)
+            .map(|text| AheadBehindListing {
+                text,
+                fields,
+                measured: false,
+            })
+            .map_err(|retry_err| {
+                format!("{err}; retry without ahead-behind also failed: {retry_err}")
+            }),
+        Err(err) => Err(err),
+    }
+}
+
+impl AheadBehindListing {
+    /// False when no base was given or git refused the atom.
+    pub(crate) fn measured(&self) -> bool {
+        self.measured
+    }
+
+    /// Every row, split on NUL (refnames, subjects and author names cannot
+    /// contain one). A row with any other number of fields is an error naming
+    /// it: dropping it would turn a ref git did list into one that was never
+    /// there.
+    pub(crate) fn rows(&self) -> Result<Vec<ListedRow<'_>>, String> {
+        let expected = self.fields + usize::from(self.measured);
+        self.text
+            .lines()
+            .map(|line| {
+                let mut parts: Vec<&str> = line.split('\0').collect();
+                if parts.len() != expected {
+                    return Err(format!(
+                        "ref listing row has {} fields, expected {expected}: {line:?}",
+                        parts.len()
+                    ));
+                }
+                let counts = if self.measured {
+                    parse_ahead_behind_pair(parts.pop().unwrap_or(""))
+                } else {
+                    None
+                };
+                Ok(ListedRow {
+                    fields: parts,
+                    counts,
+                })
+            })
+            .collect()
+    }
+}
+
 /// Resolves the default branch to (short name, commit oid) without needing
 /// the local ref list, so callers can use it before listing refs.
 ///
@@ -4344,24 +4435,12 @@ pub(crate) fn tip_counts_against(
     base_oid: &str,
 ) -> Option<HashMap<String, (usize, usize)>> {
     validate_oid(base_oid).ok()?;
-    let format = format!("--format=%(objectname)%00%(ahead-behind:{base_oid})");
-    let text = ref_cache::git_text(
-        repo,
-        BRANCH_NAMESPACES,
-        &[
-            "for-each-ref",
-            format.as_str(),
-            "refs/heads/",
-            "refs/remotes/",
-        ],
-    )
-    .ok()?;
+    // No retry: without the atom there are no counts to give.
+    let listing = list_against(repo, &TIP_QUERY, Some(base_oid), false).ok()?;
+    let rows = listing.rows().ok()?;
     Some(
-        text.lines()
-            .filter_map(|line| {
-                let (tip, counts) = line.split_once('\0')?;
-                Some((tip.to_string(), parse_ahead_behind_pair(counts)?))
-            })
+        rows.into_iter()
+            .filter_map(|row| Some((row.fields[0].to_string(), row.counts?)))
             .collect(),
     )
 }
@@ -8336,6 +8415,295 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
             tag_named(&listed, "ordinary").compared_to.as_deref(),
             Some("main")
         );
+    }
+
+    /// (name, is_remote, remote_name, ahead, behind, compared_to)
+    type BranchRow = (String, bool, Option<String>, usize, usize, Option<String>);
+    /// (name, commit_id, message, ahead, behind, compared_to)
+    type TagRow = (String, String, Option<String>, usize, usize, Option<String>);
+
+    /// A repository whose refs stress every listing that measures against the
+    /// default base: a slashed branch, a branch named with unicode and `@`,
+    /// a diverged `main`, a remote-tracking ref, the remote's `HEAD` symref,
+    /// and lightweight and annotated tags. Returns the oids by name.
+    fn ahead_behind_fixture() -> (tempfile::TempDir, HashMap<&'static str, String>) {
+        let dir = init_repo_with_remotes(&["origin"], "main");
+        let path = dir.path();
+        let seed = rev_parse(path, "main");
+        git_in(path, &["switch", "-c", "feature/a"]);
+        git_in(path, &["commit", "--allow-empty", "-m", "a1"]);
+        git_in(path, &["commit", "--allow-empty", "-m", "a2"]);
+        git_in(path, &["switch", "main"]);
+        git_in(path, &["switch", "-c", "\u{fc}n\u{ef}/\u{e7}@x"]);
+        git_in(path, &["commit", "--allow-empty", "-m", "odd work"]);
+        git_in(path, &["switch", "main"]);
+        git_in(path, &["commit", "--allow-empty", "-m", "main moves"]);
+        let main = rev_parse(path, "main");
+        let feature = rev_parse(path, "feature/a");
+        let odd = rev_parse(path, "\u{fc}n\u{ef}/\u{e7}@x");
+        git_in(path, &["update-ref", "refs/remotes/origin/side", &feature]);
+        git_in(path, &["update-ref", "refs/remotes/origin/main", &main]);
+        git_in(
+            path,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        git_in(path, &["tag", "v0", &seed]);
+        git_in(path, &["tag", "v1", &feature]);
+        git_in(path, &["tag", "-a", "v2", "-m", "release two", &odd]);
+        let oids = HashMap::from([
+            ("seed", seed),
+            ("main", main),
+            ("feature", feature),
+            ("odd", odd),
+        ]);
+        (dir, oids)
+    }
+
+    /// Pins what `list_branches` reports against the base, row by row, on the
+    /// fixture above: the contract the shared ahead-behind listing keeps.
+    #[test]
+    fn list_branches_pins_the_base_counts_of_every_row() {
+        let (dir, oids) = ahead_behind_fixture();
+        let listed = GitReader::list_branches(dir.path().to_str().unwrap()).unwrap();
+        let rows: Vec<BranchRow> = listed
+            .iter()
+            .map(|b| {
+                (
+                    b.name.clone(),
+                    b.is_remote,
+                    b.remote_name.clone(),
+                    b.commits_ahead_of_base,
+                    b.commits_behind_base,
+                    b.compared_to.clone(),
+                )
+            })
+            .collect();
+        let base = Some("main".to_string());
+        let remote = Some("origin".to_string());
+        let mut expected = vec![
+            ("feature/a".to_string(), false, None, 2, 1, base.clone()),
+            (
+                "\u{fc}n\u{ef}/\u{e7}@x".to_string(),
+                false,
+                None,
+                1,
+                1,
+                base.clone(),
+            ),
+            ("main".to_string(), false, None, 0, 0, base.clone()),
+            (
+                "origin/main".to_string(),
+                true,
+                remote.clone(),
+                0,
+                0,
+                base.clone(),
+            ),
+            (
+                "origin/side".to_string(),
+                true,
+                remote.clone(),
+                2,
+                1,
+                base.clone(),
+            ),
+        ];
+        let mut rows = rows;
+        rows.sort();
+        expected.sort();
+        assert_eq!(rows, expected, "origin/HEAD is a symref and is not listed");
+        let tips: HashMap<&str, &str> = listed
+            .iter()
+            .map(|b| (b.name.as_str(), b.tip_commit_id.as_str()))
+            .collect();
+        assert_eq!(tips["feature/a"], oids["feature"]);
+        assert_eq!(tips["\u{fc}n\u{ef}/\u{e7}@x"], oids["odd"]);
+        assert!(listed.iter().find(|b| b.name == "main").unwrap().is_default);
+    }
+
+    #[test]
+    fn list_tags_pins_the_base_counts_of_every_row() {
+        let (dir, oids) = ahead_behind_fixture();
+        let listed = GitReader::list_tags(dir.path().to_str().unwrap()).unwrap();
+        assert!(!listed.truncated);
+        let mut rows: Vec<TagRow> = listed
+            .tags
+            .iter()
+            .map(|t| {
+                (
+                    t.name.clone(),
+                    t.commit_id.clone(),
+                    t.message.clone(),
+                    t.commits_ahead_of_base,
+                    t.commits_behind_base,
+                    t.compared_to.clone(),
+                )
+            })
+            .collect();
+        rows.sort();
+        let base = Some("main".to_string());
+        let mut expected = vec![
+            (
+                "v0".to_string(),
+                oids["seed"].clone(),
+                Some("seed".to_string()),
+                0,
+                1,
+                base.clone(),
+            ),
+            (
+                "v1".to_string(),
+                oids["feature"].clone(),
+                Some("a2".to_string()),
+                2,
+                1,
+                base.clone(),
+            ),
+            (
+                "v2".to_string(),
+                oids["odd"].clone(),
+                Some("release two".to_string()),
+                1,
+                1,
+                base.clone(),
+            ),
+        ];
+        expected.sort();
+        assert_eq!(rows, expected);
+    }
+
+    #[test]
+    fn tip_counts_pin_every_branch_and_remote_tracking_tip() {
+        let (dir, oids) = ahead_behind_fixture();
+        let counts = tip_counts_against(dir.path(), &oids["main"]).expect("a listing");
+        let expected = HashMap::from([
+            (oids["main"].clone(), (0, 0)),
+            (oids["feature"].clone(), (2, 1)),
+            (oids["odd"].clone(), (1, 1)),
+        ]);
+        assert_eq!(
+            counts, expected,
+            "tags are not read, a shared tip is one key"
+        );
+    }
+
+    /// The tip counts are their own narrow listing (the branch list's extra
+    /// fields tripled their cold cost), kept under the same stamp: a repeat is
+    /// served kept, and a ref written after it is a miss that reads the new
+    /// tip, never the kept answer.
+    #[test]
+    fn tip_counts_reuse_the_branch_list_and_see_a_ref_written_after_it() {
+        let _held = ref_cache::retention();
+        let (dir, oids) = ahead_behind_fixture();
+        let path = dir.path().to_str().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let listings = || {
+            git_cli::spawn_log::spawns_in(&root)
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a.contains("%(ahead-behind:")))
+                .count()
+        };
+        ref_cache::eager(|| {
+            let before = listings();
+            GitReader::list_branches(path).unwrap();
+            let counts = tip_counts_against(&root, &oids["main"]).unwrap();
+            assert_eq!(counts.len(), 3);
+            assert_eq!(listings() - before, 2, "the narrow tip query is its own");
+            tip_counts_against(&root, &oids["main"]).unwrap();
+            assert_eq!(listings() - before, 2, "a repeat is the kept answer");
+
+            git_in(dir.path(), &["branch", "fresh", &oids["feature"]]);
+            git_in(dir.path(), &["branch", "newer", &oids["seed"]]);
+            let counts = tip_counts_against(&root, &oids["main"]).unwrap();
+            assert_eq!(counts.len(), 4, "the seed tip is new to the listing");
+            assert_eq!(counts[&oids["seed"]], (0, 1));
+            assert_eq!(listings() - before, 3, "the new refs were a miss");
+        });
+    }
+
+    #[test]
+    fn a_listing_row_with_the_wrong_field_count_is_an_error_not_a_dropped_ref() {
+        let two = |text: &str, measured: bool| AheadBehindListing {
+            text: text.to_string(),
+            fields: 2,
+            measured,
+        };
+        let listing = two("a\0b\nc\0d\n", false);
+        let rows = listing.rows().unwrap();
+        assert_eq!(rows[1].fields, vec!["c", "d"]);
+        assert_eq!(rows[1].counts, None);
+        let listing = two("a\0b\0 3 4 \n", true);
+        let rows = listing.rows().unwrap();
+        assert_eq!((rows[0].fields.len(), rows[0].counts), (2, Some((3, 4))));
+        let listing = two("a\0b\0junk\n", true);
+        let rows = listing.rows().unwrap();
+        assert_eq!(rows[0].counts, None, "an unparsed count is uncompared");
+        for bad in ["a\n", "a\0b\0c\n", "a\0b\nc\n"] {
+            let err = two(bad, false).rows().map(|_| ()).unwrap_err();
+            assert!(err.contains("expected 2"), "{bad:?}: {err}");
+        }
+        assert!(two("a\0b\n", true).rows().is_err());
+    }
+
+    #[test]
+    fn tip_counts_answer_none_for_a_base_git_cannot_measure() {
+        let (dir, _) = ahead_behind_fixture();
+        assert_eq!(tip_counts_against(dir.path(), "not-an-oid"), None);
+        let missing = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(tip_counts_against(dir.path(), missing), None);
+    }
+
+    /// A git that rejects the ahead-behind atom: one retry without it, the
+    /// rows still listed, every one uncompared rather than zero-ahead.
+    #[test]
+    fn listings_degrade_to_uncompared_rows_when_git_rejects_the_atom() {
+        let (dir, oids) = ahead_behind_fixture();
+        let path = dir.path().to_str().unwrap();
+        let atom = format!("%00%(ahead-behind:{})", oids["main"]);
+        let listing_spawns = |name: &str| {
+            git_cli::spawn_log::spawns_in(&dir.path().canonicalize().unwrap())
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == name))
+                .count()
+        };
+
+        let branch_arg = format!("--format={BRANCH_LIST_FORMAT}{atom}");
+        let before = listing_spawns("for-each-ref");
+        let branches =
+            git_cli::with_forced_spawn_failure_of(&branch_arg, || GitReader::list_branches(path))
+                .unwrap();
+        assert_eq!(branches.len(), 5);
+        assert!(branches
+            .iter()
+            .all(|b| b.compared_to.is_none() && b.commits_ahead_of_base == 0));
+        assert_eq!(
+            listing_spawns("for-each-ref") - before,
+            2,
+            "the refused listing and one retry, never a third"
+        );
+
+        let tag_arg = format!("--format={TAG_LIST_FORMAT}{atom}");
+        let tags =
+            git_cli::with_forced_spawn_failure_of(&tag_arg, || GitReader::list_tags(path)).unwrap();
+        assert_eq!(tags.tags.len(), 3);
+        assert!(tags
+            .tags
+            .iter()
+            .all(|t| t.compared_to.is_none() && t.commits_behind_base == 0));
+    }
+
+    #[test]
+    fn listings_of_an_unborn_repository_name_no_base_and_fail_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        let path = dir.path().to_str().unwrap();
+        assert!(GitReader::list_branches(path).unwrap().is_empty());
+        let tags = GitReader::list_tags(path).unwrap();
+        assert!(tags.tags.is_empty() && !tags.truncated);
     }
 
     #[test]
@@ -14459,6 +14827,463 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
                 assert_eq!(report.candidate_files, 2000);
                 assert!(cold_n <= 136, "cold spawns {cold_n}");
                 assert!(warm_n <= 6, "warm spawns {warm_n}");
+            });
+        }
+    }
+
+    /// Adversarial lane-L4 tests: the shared ahead-behind listing against git itself.
+    mod adv_l4 {
+        use super::*;
+        use std::path::PathBuf;
+
+        fn out(dir: &Path, args: &[&str]) -> String {
+            let o = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output_locked()
+                .expect("spawn git");
+            assert!(
+                o.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            String::from_utf8(o.stdout).unwrap().trim().to_string()
+        }
+
+        fn counts_of(dir: &Path, base: &str, tip: &str) -> (usize, usize) {
+            let c = out(
+                dir,
+                &[
+                    "rev-list",
+                    "--left-right",
+                    "--count",
+                    &format!("{base}...{tip}"),
+                ],
+            );
+            let mut it = c.split_whitespace().map(|n| n.parse::<usize>().unwrap());
+            let behind = it.next().unwrap();
+            let ahead = it.next().unwrap();
+            (ahead, behind)
+        }
+
+        /// (refname, tip oid, (ahead, behind)) for every listed ref, from rev-list.
+        fn truth(dir: &Path, base: &str) -> Vec<(String, String, (usize, usize))> {
+            out(
+                dir,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname) %(objectname)",
+                    "refs/heads/",
+                    "refs/remotes/",
+                ],
+            )
+            .lines()
+            .map(|l| {
+                let (r, oid) = l.split_once(' ').unwrap();
+                (r.to_string(), oid.to_string(), counts_of(dir, base, r))
+            })
+            .collect()
+        }
+
+        fn check(root: &Path, label: &str) -> String {
+            let base = default_base(root).base.expect("a base").1;
+            let want = truth(root, &base);
+            let listed = GitReader::list_branches(root.to_str().unwrap()).unwrap();
+            let got: HashMap<String, (usize, usize)> = listed
+                .iter()
+                .map(|b| {
+                    (
+                        b.name.clone(),
+                        (b.commits_ahead_of_base, b.commits_behind_base),
+                    )
+                })
+                .collect();
+            let mut expect: HashMap<String, (usize, usize)> = HashMap::new();
+            for (r, _, c) in &want {
+                if let Some(n) = r.strip_prefix("refs/heads/") {
+                    expect.insert(n.to_string(), *c);
+                } else if let Some(n) = r.strip_prefix("refs/remotes/") {
+                    if !n.ends_with("/HEAD") {
+                        expect.insert(n.to_string(), *c);
+                    }
+                }
+            }
+            assert_eq!(got, expect, "list_branches stale after {label}");
+            let tips = tip_counts_against(root, &base).expect("tip counts");
+            let tip_expect: HashMap<String, (usize, usize)> =
+                want.iter().map(|(_, o, c)| (o.clone(), *c)).collect();
+            assert_eq!(tips, tip_expect, "tip_counts_against stale after {label}");
+            base
+        }
+
+        fn mk(dir: &Path, parent: &str, msg: &str) -> String {
+            let tree = out(dir, &["rev-parse", &format!("{parent}^{{tree}}")]);
+            out(dir, &["commit-tree", &tree, "-p", parent, "-m", msg])
+        }
+
+        fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, tempfile::TempDir) {
+            let dir = init_repo_with_remotes(&["origin"], "main");
+            let root = dir.path().canonicalize().unwrap();
+            let seed = rev_parse(&root, "main");
+            let f1 = mk(&root, &seed, "f1");
+            let f2 = mk(&root, &f1, "f2");
+            git_in(&root, &["update-ref", "refs/heads/feat", &f2]);
+            let m = mk(&root, &seed, "m1");
+            git_in(&root, &["update-ref", "refs/heads/main", &m]);
+            git_in(&root, &["update-ref", "refs/remotes/origin/main", &m]);
+            git_in(&root, &["update-ref", "refs/remotes/origin/side", &f1]);
+            git_in(
+                &root,
+                &[
+                    "symbolic-ref",
+                    "refs/remotes/origin/HEAD",
+                    "refs/remotes/origin/main",
+                ],
+            );
+            let wtparent = tempfile::TempDir::new().unwrap();
+            let wt = wtparent.path().canonicalize().unwrap().join("wt");
+            git_in(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "wtb",
+                    wt.to_str().unwrap(),
+                    &f1,
+                ],
+            );
+            (dir, root, wt, wtparent)
+        }
+
+        #[test]
+        fn l4_cached_listings_are_fresh_after_every_kind_of_ref_move() {
+            let _held = ref_cache::retention();
+            let (_dir, root, wt, _p) = fixture();
+            ref_cache::eager(|| {
+                let warm = || {
+                    check(&root, "warm-up");
+                    check(&root, "warm-up again");
+                };
+                warm();
+                git_in(&wt, &["commit", "--allow-empty", "-m", "wt1"]);
+                check(&root, "a commit in a linked worktree");
+
+                warm();
+                let f = rev_parse(&root, "feat");
+                let n = mk(&root, &f, "f3");
+                git_in(&root, &["update-ref", "refs/heads/feat", &n]);
+                check(&root, "update-ref");
+
+                warm();
+                git_in(&root, &["pack-refs", "--all"]);
+                check(&root, "pack-refs --all");
+
+                warm();
+                let n2 = mk(&root, &n, "f4");
+                git_in(&root, &["update-ref", "refs/heads/feat", &n2]);
+                check(&root, "a loose write over a packed ref");
+
+                warm();
+                let n3 = mk(&root, &n2, "f5");
+                git_in(&root, &["update-ref", "refs/heads/feat", &n3]);
+                git_in(&root, &["pack-refs", "--all", "--prune"]);
+                check(&root, "move then pack-refs --prune");
+
+                warm();
+                let s = rev_parse(&root, "refs/remotes/origin/side");
+                let s2 = mk(&root, &s, "s2");
+                git_in(&root, &["update-ref", "refs/remotes/origin/side", &s2]);
+                check(&root, "a remote-tracking-only move");
+
+                warm();
+                git_in(&root, &["branch", "-D", "feat"]);
+                check(&root, "branch -D");
+
+                warm();
+                let before = check(&root, "pre base");
+                git_in(&root, &["commit", "--allow-empty", "-m", "main2"]);
+                let after = check(&root, "the base moving");
+                assert_ne!(before, after, "the base oid did change");
+
+                warm();
+                git_in(
+                    &root,
+                    &[
+                        "symbolic-ref",
+                        "refs/remotes/origin/HEAD",
+                        "refs/remotes/origin/side",
+                    ],
+                );
+                let retarget = check(&root, "a symref retarget");
+                eprintln!(
+                    "base after retarget = {retarget}, side = {}",
+                    rev_parse(&root, "refs/remotes/origin/side")
+                );
+                assert_eq!(
+                    retarget,
+                    rev_parse(&root, "refs/remotes/origin/HEAD"),
+                    "default base follows origin/HEAD"
+                );
+            });
+        }
+
+        #[test]
+        fn l4_same_tick_double_and_triple_writes_are_seen() {
+            let _held = ref_cache::retention();
+            let (_dir, root, _wt, _p) = fixture();
+            ref_cache::eager(|| {
+                for round in 0..40 {
+                    check(&root, "warm");
+                    let tip = rev_parse(&root, "feat");
+                    let a = mk(&root, &tip, &format!("a{round}"));
+                    let b = mk(&root, &a, &format!("b{round}"));
+                    let c = mk(&root, &b, &format!("c{round}"));
+                    git_in(&root, &["update-ref", "refs/heads/feat", &a]);
+                    git_in(&root, &["update-ref", "refs/heads/feat", &b]);
+                    git_in(&root, &["update-ref", "refs/heads/feat", &c]);
+                    check(&root, &format!("triple write round {round}"));
+                    git_in(&root, &["update-ref", "refs/heads/feat", &a]);
+                    check(&root, "after first");
+                    git_in(&root, &["update-ref", "refs/heads/feat", &c]);
+                    check(&root, &format!("second write in the tick, round {round}"));
+                    git_in(&root, &["update-ref", "refs/heads/feat", &b]);
+                    git_in(&root, &["update-ref", "refs/heads/feat", &c]);
+                    git_in(&root, &["update-ref", "refs/heads/feat", &b]);
+                    check(&root, "aba");
+                    git_in(&root, &["update-ref", "refs/heads/feat", &c]);
+                }
+            });
+        }
+
+        #[test]
+        fn l4_a_remote_a_local_and_a_tag_at_one_oid_share_one_key() {
+            let _held = ref_cache::retention();
+            let (_dir, root, _wt, _p) = fixture();
+            let f = rev_parse(&root, "feat");
+            git_in(&root, &["update-ref", "refs/remotes/origin/twin", &f]);
+            git_in(&root, &["branch", "twin", &f]);
+            git_in(&root, &["tag", "tagtwin", &f]);
+            ref_cache::eager(|| {
+                let base = check(&root, "twins");
+                let tips = tip_counts_against(&root, &base).unwrap();
+                assert_eq!(tips[&f], (2, 1));
+                let listed = GitReader::list_branches(root.to_str().unwrap()).unwrap();
+                for n in ["feat", "twin", "origin/twin"] {
+                    let b = listed.iter().find(|b| b.name == n).unwrap();
+                    assert_eq!(
+                        (b.commits_ahead_of_base, b.commits_behind_base),
+                        (2, 1),
+                        "{n}"
+                    );
+                }
+                let tags = GitReader::list_tags(root.to_str().unwrap()).unwrap();
+                let t = tags.tags.iter().find(|t| t.name == "tagtwin").unwrap();
+                assert_eq!((t.commits_ahead_of_base, t.commits_behind_base), (2, 1));
+            });
+        }
+
+        /// A git that rejects the atom: tip_counts_against answers None after one spawn
+        /// (as main's `.ok()?` did), with no retry.
+        #[test]
+        fn l4_tip_counts_answer_none_without_a_retry_when_git_rejects_the_atom() {
+            let (_dir, root, _wt, _p) = fixture();
+            let base = default_base(&root).base.unwrap().1;
+            let arg = format!("--format=%(objectname)%00%(ahead-behind:{base})");
+            let retry_arg = "--format=%(objectname)".to_string();
+            let retries = || {
+                git_cli::spawn_log::spawns_in(&root)
+                    .iter()
+                    .filter(|argv| argv.contains(&retry_arg))
+                    .count()
+            };
+            let before = retries();
+            let got =
+                git_cli::with_forced_spawn_failure_of(&arg, || tip_counts_against(&root, &base));
+            assert_eq!(got, None);
+            assert_eq!(
+                retries(),
+                before,
+                "no atom-less retry for the counts-only caller"
+            );
+        }
+
+        fn old_tip_counts(repo: &Path, base_oid: &str) -> Option<HashMap<String, (usize, usize)>> {
+            let format = format!("--format=%(objectname)%00%(ahead-behind:{base_oid})");
+            let text = ref_cache::git_text(
+                repo,
+                BRANCH_NAMESPACES,
+                &[
+                    "for-each-ref",
+                    format.as_str(),
+                    "refs/heads/",
+                    "refs/remotes/",
+                ],
+            )
+            .ok()?;
+            Some(
+                text.lines()
+                    .filter_map(|line| {
+                        let (tip, counts) = line.split_once('\0')?;
+                        Some((tip.to_string(), parse_ahead_behind_pair(counts)?))
+                    })
+                    .collect(),
+            )
+        }
+
+        /// Cold cost, main's narrow format against the lane's wide one, interleaved,
+        /// min of 7, at ~2000 refs. A fresh repository's stamp is inside the racy
+        /// window, so neither arm is ever served from the cache.
+        #[test]
+        #[ignore = "benchmark; run with --ignored --nocapture"]
+        fn l4_cold_tip_counts_cost_at_2000_refs() {
+            let (_dir, root, _wt, _p) = fixture();
+            let base = default_base(&root).base.unwrap().1;
+            let seed = rev_parse(&root, "main");
+            let mut tips = vec![seed];
+            for i in 0..40 {
+                let t = mk(&root, &tips[tips.len() - 1], &format!("c{i}"));
+                tips.push(t);
+            }
+            let mut packed = String::from("# pack-refs with: peeled fully-peeled \n");
+            for i in 0..2000 {
+                let kind = if i % 2 == 0 {
+                    "heads/b"
+                } else {
+                    "remotes/origin/r"
+                };
+                packed.push_str(&format!("{} refs/{kind}{i}\n", tips[i % tips.len()]));
+            }
+            let (mut old, mut new) = (Vec::new(), Vec::new());
+            for _ in 0..7 {
+                // A fresh write keeps the stamp inside the racy window: always cold.
+                std::fs::write(root.join(".git").join("packed-refs"), &packed).unwrap();
+                let t = std::time::Instant::now();
+                let a = old_tip_counts(&root, &base).unwrap();
+                old.push(t.elapsed());
+                std::fs::write(root.join(".git").join("packed-refs"), &packed).unwrap();
+                let t = std::time::Instant::now();
+                let b = tip_counts_against(&root, &base).unwrap();
+                new.push(t.elapsed());
+                assert_eq!(a, b);
+            }
+            let (o, n) = (old.iter().min().unwrap(), new.iter().min().unwrap());
+            eprintln!(
+                "BENCH old min {o:?} new min {n:?} ratio {:.3} all old {old:?} all new {new:?}",
+                n.as_secs_f64() / o.as_secs_f64()
+            );
+        }
+
+        /// The same race with no cache and no lane code: raw git rows against rev-list.
+        #[test]
+        #[ignore = "documents a git-level race: for-each-ref can pair an old oid with a newer ref's counts"]
+        fn l4_raw_git_rows_are_not_torn_under_a_writer() {
+            let (_dir, root, _wt, _p) = fixture();
+            let base = default_base(&root).base.unwrap().1;
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            let torn = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                let mut readers = Vec::new();
+                for _ in 0..8 {
+                    readers.push(s.spawn(|| {
+                        let mut n = 0;
+                        while !stop.load(std::sync::atomic::Ordering::Relaxed) || n < 3 {
+                            let raw = out(
+                                &root,
+                                &[
+                                    "for-each-ref",
+                                    &format!(
+                                        "--format=%(refname) %(objectname) %(ahead-behind:{base})"
+                                    ),
+                                    "refs/heads/feat",
+                                ],
+                            );
+                            for l in raw.lines() {
+                                let f: Vec<&str> = l.split(' ').collect();
+                                let want = counts_of(&root, &base, f[1]);
+                                if format!("{} {}", want.0, want.1) != format!("{} {}", f[2], f[3])
+                                {
+                                    torn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    eprintln!("RAW TORN {l} vs {want:?}");
+                                }
+                            }
+                            n += 1;
+                        }
+                    }));
+                }
+                let mut tip = rev_parse(&root, "feat");
+                for i in 0..25 {
+                    tip = mk(&root, &tip, &format!("w{i}"));
+                    git_in(&root, &["update-ref", "refs/heads/feat", &tip]);
+                }
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                for r in readers {
+                    r.join().unwrap();
+                }
+            });
+            assert_eq!(
+                torn.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "raw git tore a row"
+            );
+        }
+
+        /// Readers race a writer. A row's counts are a pure function of its tip and
+        /// the (fixed) base, so any torn or mixed row is caught against rev-list.
+        #[test]
+        fn l4_concurrent_readers_never_see_a_torn_answer_and_end_fresh() {
+            let _held = ref_cache::retention();
+            let (_dir, root, _wt, _p) = fixture();
+            let base = default_base(&root).base.unwrap().1;
+            ref_cache::eager(|| {
+                let stop = std::sync::atomic::AtomicBool::new(false);
+                std::thread::scope(|s| {
+                    let mut readers = Vec::new();
+                    for _ in 0..8 {
+                        readers.push(s.spawn(|| {
+                            let mut n = 0;
+                            while !stop.load(std::sync::atomic::Ordering::Relaxed) || n < 3 {
+                                let listed =
+                                    GitReader::list_branches(root.to_str().unwrap()).unwrap();
+                                let tips = tip_counts_against(&root, &base).unwrap();
+                                // git pairs a moving ref's printed oid with counts of the
+                                // oid it re-read (see the ignored raw probe): that ref may
+                                // be one commit ahead; every other row is exact.
+                                let close = |got: (usize, usize), want: (usize, usize)| {
+                                    got == want || (got.0 == want.0 + 1 && got.1 == want.1)
+                                };
+                                for (tip, c) in &tips {
+                                    let want = counts_of(&root, &base, tip);
+                                    assert!(
+                                        close(*c, want),
+                                        "mixed tip row {tip}: {c:?} vs {want:?}"
+                                    );
+                                }
+                                for b in &listed {
+                                    let want = counts_of(&root, &base, &b.tip_commit_id);
+                                    let got = (b.commits_ahead_of_base, b.commits_behind_base);
+                                    if b.name == "feat" {
+                                        assert!(close(got, want), "torn feat {got:?} vs {want:?}");
+                                    } else {
+                                        assert_eq!(got, want, "torn row {}", b.name);
+                                    }
+                                }
+                                n += 1;
+                            }
+                        }));
+                    }
+                    let mut tip = rev_parse(&root, "feat");
+                    for i in 0..25 {
+                        tip = mk(&root, &tip, &format!("w{i}"));
+                        git_in(&root, &["update-ref", "refs/heads/feat", &tip]);
+                    }
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    for r in readers {
+                        r.join().unwrap();
+                    }
+                });
+                check(&root, "the end of the concurrent run");
             });
         }
     }
