@@ -2048,18 +2048,39 @@ Unset the local override with `git config --local --unset-all user.name` and \
     }
 
     /// Runs a previously planned `push` argv. Refuses anything other than
-    /// `--force-with-lease`, `-u`, and validated ref names so a caller cannot
-    /// smuggle `--force` past the lease-only contract.
+    /// the exact `--force-with-lease --force-if-includes` pair, `-u`, and
+    /// validated ref names so a caller cannot smuggle `--force`, a lease with
+    /// an explicit expected value, or a lease without the includes check past
+    /// the contract.
     pub fn push_planned(repo_path: &str, args: &[String]) -> Result<String, String> {
         let repo = validate_repo(repo_path)?;
         if args.first().map(String::as_str) != Some("push") {
             return Err("internal: planned push argv must start with push".into());
         }
+        let mut forced = [false; 2];
         for arg in args.iter().skip(1) {
-            if arg == "--force-with-lease" || arg == "-u" {
+            if arg == "-u" {
+                continue;
+            }
+            if let Some(slot) = FORCE_PUSH_FLAGS.iter().position(|flag| arg == flag) {
+                if std::mem::replace(&mut forced[slot], true) {
+                    return Err(format!("Duplicate push flag {arg}"));
+                }
                 continue;
             }
             validate_ref_name(arg)?;
+        }
+        if forced[0] != forced[1] {
+            return Err(
+                "A forced push carries --force-with-lease and --force-if-includes together, \
+                 or neither"
+                    .into(),
+            );
+        }
+        if forced[0] {
+            require_force_if_includes(crate::engine::git_cli::git_supports(
+                crate::engine::git_cli::FORCE_IF_INCLUDES,
+            ))?;
         }
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
@@ -2072,7 +2093,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         if let Some(repository) = args
             .iter()
             .skip(1)
-            .find(|arg| arg.as_str() != "--force-with-lease" && arg.as_str() != "-u")
+            .find(|arg| arg.as_str() != "-u" && !FORCE_PUSH_FLAGS.contains(&arg.as_str()))
         {
             crate::engine::remotes::require_configured(&repo, repository)?;
         }
@@ -3130,6 +3151,26 @@ fn unpublished_push_remote(repo: &Path) -> Result<String, String> {
     ))
 }
 
+/// The pair a force push carries. A bare `--force-with-lease` compares against
+/// the remote-tracking ref, which a background fetch moves to commits the user
+/// never saw; `--force-if-includes` additionally requires that the local
+/// branch contain that ref's tip, so the lease cannot be satisfied by a fetch.
+const FORCE_PUSH_FLAGS: [&str; 2] = ["--force-with-lease", "--force-if-includes"];
+
+/// Fails closed: a force push without `--force-if-includes` is the unsafe
+/// shape, so a git that lacks it, or could not be probed, refuses the push.
+fn require_force_if_includes(supported: bool) -> Result<(), String> {
+    if supported {
+        Ok(())
+    } else {
+        Err(
+            "Force push needs `--force-if-includes`, which requires Git 2.30 or newer \
+             (or a Git that could not be checked just now). Update Git, then restart GitPulse."
+                .into(),
+        )
+    }
+}
+
 fn plan_push_argv(
     repo: &Path,
     remote: Option<&str>,
@@ -3138,7 +3179,10 @@ fn plan_push_argv(
 ) -> Result<Vec<String>, String> {
     let mut args = vec!["push".to_string()];
     if force {
-        args.push("--force-with-lease".into());
+        require_force_if_includes(crate::engine::git_cli::git_supports(
+            crate::engine::git_cli::FORCE_IF_INCLUDES,
+        ))?;
+        args.extend(FORCE_PUSH_FLAGS.map(String::from));
     }
     match (remote, branch) {
         (None, None) => {
@@ -5405,7 +5449,14 @@ mod tests {
         let argv = GitWriter::plan_push(&repo_path(&repo), None, None, true).unwrap();
         assert_eq!(
             argv,
-            vec!["push", "--force-with-lease", "-u", "origin", "main"]
+            vec![
+                "push",
+                "--force-with-lease",
+                "--force-if-includes",
+                "-u",
+                "origin",
+                "main"
+            ]
         );
     }
 
@@ -5661,9 +5712,16 @@ mod tests {
             repo.path(),
             &["remote", "add", "origin", origin.path().to_str().unwrap()],
         );
-        let args: Vec<String> = ["push", "--force-with-lease", "-u", "elsewhere", "main"]
-            .map(String::from)
-            .to_vec();
+        let args: Vec<String> = [
+            "push",
+            "--force-with-lease",
+            "--force-if-includes",
+            "-u",
+            "elsewhere",
+            "main",
+        ]
+        .map(String::from)
+        .to_vec();
         let err = GitWriter::push_planned(&repo_path(&repo), &args).unwrap_err();
         assert!(
             err.contains("elsewhere") && err.contains("not a configured remote"),
@@ -5692,6 +5750,140 @@ mod tests {
         assert_eq!(
             err, "Invalid ref name",
             "raw --force starts with '-' so validate_ref_name must refuse it before git runs"
+        );
+    }
+
+    #[test]
+    fn a_force_push_plans_the_lease_and_includes_pair() {
+        let origin = init_bare();
+        let repo = init_repo_with_commit();
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        let forced =
+            GitWriter::plan_push(&repo_path(&repo), Some("origin"), Some("main"), true).unwrap();
+        assert_eq!(
+            forced,
+            vec![
+                "push",
+                "--force-with-lease",
+                "--force-if-includes",
+                "origin",
+                "main"
+            ]
+        );
+        let plain =
+            GitWriter::plan_push(&repo_path(&repo), Some("origin"), Some("main"), false).unwrap();
+        assert_eq!(plain, vec!["push", "origin", "main"]);
+        let nested =
+            GitWriter::plan_push(&repo_path(&repo), Some("origin"), Some("feat/x"), true).unwrap();
+        assert_eq!(&nested[1..3], FORCE_PUSH_FLAGS);
+    }
+
+    #[test]
+    fn push_planned_accepts_only_the_exact_force_pair() {
+        let origin = init_bare();
+        let repo = init_repo_with_commit();
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        let run = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+            GitWriter::push_planned(&repo_path(&repo), &args)
+        };
+        run(&[
+            "push",
+            "--force-with-lease",
+            "--force-if-includes",
+            "-u",
+            "origin",
+            "main",
+        ])
+        .expect("the pair, with -u, pushes");
+        run(&[
+            "push",
+            "--force-with-lease",
+            "--force-if-includes",
+            "origin",
+            "main",
+        ])
+        .expect("the pair pushes");
+        for refused in [
+            vec!["push", "--force", "origin", "main"],
+            vec!["push", "-f", "origin", "main"],
+            vec![
+                "push",
+                "--force-with-lease=main:abc",
+                "--force-if-includes",
+                "origin",
+            ],
+            vec!["push", "--force-with-lease", "origin", "main"],
+            vec!["push", "--force-if-includes", "origin", "main"],
+            vec![
+                "push",
+                "--force-with-lease",
+                "--force-with-lease",
+                "--force-if-includes",
+                "origin",
+            ],
+            vec![
+                "push",
+                "--force-with-lease",
+                "--force-if-includes",
+                "--no-verify",
+                "origin",
+            ],
+        ] {
+            assert!(run(&refused).is_err(), "{refused:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn force_push_is_refused_without_force_if_includes_and_names_it() {
+        let err = require_force_if_includes(false).unwrap_err();
+        assert!(
+            err.contains("--force-if-includes") && err.contains("2.30"),
+            "{err}"
+        );
+        assert!(require_force_if_includes(true).is_ok());
+    }
+
+    /// A background fetch moves `origin/main` to a commit the user never
+    /// integrated; amending and force pushing then satisfies a bare
+    /// `--force-with-lease` and destroys it. With `--force-if-includes` the
+    /// push is refused and the remote keeps the other clone's commit. (On the
+    /// pre-fix argv, `git push --force-with-lease origin main` here succeeds
+    /// and the remote ref becomes the amended commit.)
+    #[test]
+    fn force_push_after_auto_fetch_cannot_destroy_an_unseen_commit() {
+        let (local, origin) = diverged_clone();
+        let remote_tip = |dir: &Path| git_text(dir, &["rev-parse", "refs/heads/main"]).unwrap();
+        let theirs = remote_tip(origin.path());
+        GitWriter::auto_fetch(&repo_path(&local)).expect("auto-fetch runs");
+        git_ok(
+            local.path(),
+            &["commit", "-q", "--amend", "-m", "mine, amended"],
+        );
+        let err = GitWriter::push(&repo_path(&local), Some("origin"), Some("main"), true)
+            .expect_err("the lease must hold against an unseen commit");
+        assert!(!err.is_empty());
+        assert_eq!(
+            remote_tip(origin.path()),
+            theirs,
+            "the remote ref is untouched"
+        );
+
+        // The control: the argv this replaces overwrites it.
+        git_ok(
+            local.path(),
+            &["push", "-q", "--force-with-lease", "origin", "main"],
+        );
+        assert_ne!(
+            remote_tip(origin.path()),
+            theirs,
+            "a bare lease is what auto-fetch defeats"
         );
     }
 

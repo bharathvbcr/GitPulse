@@ -1218,32 +1218,52 @@ fn fleet_commit_stats(
     anchor_epoch: i64,
     window_days: u32,
 ) -> Result<FleetCommitStats, String> {
-    // One over the cap, so "we stopped early" is observable rather than
-    // indistinguishable from a repository that happens to have exactly the cap.
-    let limit = (MAX_FLEET_COMMITS + 1).to_string();
-    // Only commits inside the window count toward the cap. Without a date
-    // bound the cap was spent on history older than the window, so a
-    // repository with more than the cap in total read as truncated even when
-    // every commit of the window had been seen; with it, `truncated` means the
-    // window itself hit the cap. `--since-as-filter` (git 2.37) rather than
-    // `--since`: plain `--since` stops walking at the first old commit, so one
-    // commit with a skewed clock at the tip hid everything behind it.
-    let since = format!(
-        "--since-as-filter={}",
-        anchor_epoch.saturating_sub(i64::from(window_days) * BUCKET_SECONDS)
-    );
-    let text = match git_text(
+    fleet_commit_stats_walking(
         repo,
-        &[
-            "log",
-            "--no-show-signature",
-            &since,
+        anchor_epoch,
+        window_days,
+        crate::engine::git_cli::git_supports(crate::engine::git_cli::SINCE_AS_FILTER),
+    )
+}
+
+/// The `git log` arguments of the commit-rhythm walk. One over the cap, so
+/// "we stopped early" is observable rather than indistinguishable from a
+/// repository that happens to have exactly the cap.
+///
+/// With `since_as_filter` (git 2.37) only commits inside the window count
+/// toward the cap, so `truncated` means the window itself hit the cap. Plain
+/// `--since` is not used: it stops walking at the first old commit, so one
+/// commit with a skewed clock at the tip hid everything behind it. Below 2.37
+/// the walk is bounded by count alone and [`bucket_commit_log`] applies the
+/// window to the committer dates git printed; history older than the window
+/// spends the cap, so `truncated` there means "the window may be cut".
+fn fleet_log_args(since_as_filter: bool, since_epoch: i64) -> Vec<String> {
+    let mut args: Vec<String> = ["log", "--no-show-signature"].map(String::from).to_vec();
+    if since_as_filter {
+        args.push(format!("--since-as-filter={since_epoch}"));
+    }
+    args.extend(
+        [
             "-n",
-            &limit,
+            &(MAX_FLEET_COMMITS + 1).to_string(),
             "--format=%ct%x1f%ae",
             "--",
-        ],
-    ) {
+        ]
+        .map(String::from),
+    );
+    args
+}
+
+fn fleet_commit_stats_walking(
+    repo: &Path,
+    anchor_epoch: i64,
+    window_days: u32,
+    since_as_filter: bool,
+) -> Result<FleetCommitStats, String> {
+    let since_epoch = anchor_epoch.saturating_sub(i64::from(window_days) * BUCKET_SECONDS);
+    let args = fleet_log_args(since_as_filter, since_epoch);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let text = match git_text(repo, &argv) {
         Ok(text) => text,
         Err(error) => {
             // The same discrimination `last_commit_epoch` makes: no HEAD is an
@@ -2988,6 +3008,61 @@ mod tests {
             !stats.daily.iter().any(|c| *c > 1),
             "no bucket collected more than the one commit stamped into it"
         );
+    }
+
+    /// Below git 2.37 the walk must not carry `--since-as-filter`, which that
+    /// git rejects; at or above it the flag is the date bound.
+    #[test]
+    fn the_commit_walk_drops_since_as_filter_below_the_git_that_has_it() {
+        let with = fleet_log_args(true, 1_700_000_000);
+        assert!(
+            with.contains(&"--since-as-filter=1700000000".to_string()),
+            "{with:?}"
+        );
+        let without = fleet_log_args(false, 1_700_000_000);
+        assert!(
+            !without.iter().any(|arg| arg.contains("since")),
+            "{without:?}"
+        );
+        let limit = (MAX_FLEET_COMMITS + 1).to_string();
+        for args in [&with, &without] {
+            assert!(args.windows(2).any(|w| w[0] == "-n" && w[1] == limit));
+            assert_eq!(args.last().map(String::as_str), Some("--"));
+        }
+    }
+
+    /// Both walks, run against real git, describe the same window; only the
+    /// older git's `truncated` is allowed to differ (and does not on a small
+    /// repository).
+    #[test]
+    fn the_count_bounded_commit_walk_matches_the_filtered_one_on_a_small_repository() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        let anchor = 1_800_000_000i64;
+        for (i, days_ago) in [0i64, 1, 8].into_iter().enumerate() {
+            commit_at(
+                dir.path(),
+                &format!("c{i}"),
+                anchor - days_ago * 86_400,
+                "one@example.com",
+            );
+        }
+        commit_at(
+            dir.path(),
+            "ancient",
+            anchor - 200 * 86_400,
+            "old@example.com",
+        );
+        let walk = |filtered| {
+            fleet_commit_stats_walking(dir.path(), anchor, FLEET_COMMIT_WINDOW_DAYS, filtered)
+                .expect("probe runs")
+        };
+        let (filtered, counted) = (walk(true), walk(false));
+        assert_eq!(counted.commits, 3, "the ancient commit is windowed out");
+        assert_eq!(counted.daily, filtered.daily);
+        assert_eq!(counted.authors, filtered.authors);
+        assert_eq!(counted.last_commit_epoch, filtered.last_commit_epoch);
+        assert!(!counted.truncated);
     }
 
     /// A sweep on the default window, which is what most of these assert on.
