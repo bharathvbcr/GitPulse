@@ -246,6 +246,10 @@ struct Sidecar {
     /// and exercise the stall path inside a unit-test budget.
     write_deadline: Duration,
     shutdown_grace: Duration,
+    /// Set by [`Sidecar::terminate`] before it takes the child lock, and read by
+    /// the stdout pump: from then on frames nobody will read are discarded
+    /// instead of faulting a full queue (see [`spawn_stdout_pump`]).
+    shutting_down: std::sync::Arc<AtomicBool>,
 }
 
 impl Drop for Sidecar {
@@ -338,10 +342,19 @@ fn reap_after_eof(child: &Mutex<Child>, guard: &crate::procguard::Registration) 
 /// loop exists to enforce [`MAX_RESPONSE_TOTAL_BYTES`]. Backpressure alone is
 /// insufficient here: it would leave a hostile child blocked on its pipe and
 /// apparently healthy, so queue overflow kills and reaps the connection.
+///
+/// Once `shutting_down` is set nobody consumes the queue any more, and a child
+/// answering its stdin EOF with more than a queue of lines would otherwise be
+/// faulted by its own farewell: the overflow's kill waits on the child lock the
+/// shutdown grace holds, the pump stops reading meanwhile, and the child blocks
+/// on a full pipe until the grace ends in SIGKILL. During shutdown the pump
+/// therefore keeps reading and drops what it cannot queue. An oversized frame
+/// or a read error still kills, in either state.
 fn spawn_stdout_pump(
     stdout: std::process::ChildStdout,
     child: std::sync::Arc<Mutex<Child>>,
     guard: std::sync::Arc<crate::procguard::Registration>,
+    shutting_down: std::sync::Arc<AtomicBool>,
 ) -> Receiver<String> {
     let (tx, rx) = mpsc::sync_channel::<String>(MAX_QUEUED_STDOUT_FRAMES);
     let _ = crate::supervisor::spawn_once("sidecar-stdout", "sidecar stdout pump", move || {
@@ -356,6 +369,9 @@ fn spawn_stdout_pump(
                         Ok(()) => {}
                         Err(TrySendError::Disconnected(_)) => return,
                         Err(TrySendError::Full(_)) => {
+                            if shutting_down.load(Ordering::Acquire) {
+                                continue;
+                            }
                             force_kill(&child, &guard);
                             return;
                         }
@@ -409,6 +425,9 @@ impl Sidecar {
     /// every call still waiting on this child see it exit instead of running
     /// out its own deadline.
     fn terminate(&self) {
+        // Before the child lock, which the grace holds: a pump that overflowed
+        // first would queue on that lock and stop reading for the whole grace.
+        self.shutting_down.store(true, Ordering::Release);
         let stdin = self
             .stdin
             .try_lock()
@@ -1383,7 +1402,8 @@ fn spawn_with_profile(
 
     let child = std::sync::Arc::new(Mutex::new(child));
     let guard = std::sync::Arc::new(guard);
-    let rx = spawn_stdout_pump(stdout, child.clone(), guard.clone());
+    let shutting_down = std::sync::Arc::new(AtomicBool::new(false));
+    let rx = spawn_stdout_pump(stdout, child.clone(), guard.clone(), shutting_down.clone());
 
     let tail = std::sync::Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
     let tail_writer = tail.clone();
@@ -1431,6 +1451,7 @@ fn spawn_with_profile(
         } else {
             SHUTDOWN_GRACE
         },
+        shutting_down,
     };
 
     let raw = sidecar.call(
@@ -2112,6 +2133,8 @@ mod tests {
     // a helper the fixture forked outlive the process that owned it.
     #[cfg(unix)]
     use crate::test_support::{announced_pid, process_alive, wait_gone};
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
 
     /// Regression: an undecodable stdout line used to return
     /// HarnessError::Protocol, which drops a healthy sidecar and starts the
@@ -2374,7 +2397,8 @@ mod tests {
 
         let child = std::sync::Arc::new(Mutex::new(child));
         let guard = std::sync::Arc::new(guard);
-        let rx = spawn_stdout_pump(stdout, child.clone(), guard.clone());
+        let shutting_down = std::sync::Arc::new(AtomicBool::new(false));
+        let rx = spawn_stdout_pump(stdout, child.clone(), guard.clone(), shutting_down.clone());
 
         let tail = std::sync::Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
         let tail_writer = tail.clone();
@@ -2402,6 +2426,7 @@ mod tests {
             hosted: Mutex::new(HashSet::new()),
             write_deadline,
             shutdown_grace: SHUTDOWN_GRACE,
+            shutting_down,
         }
     }
 
@@ -2423,6 +2448,144 @@ mod tests {
             unsafe { libc::kill(pid, 0) } != 0,
             "the exited sidecar was left unreaped"
         );
+    }
+
+    /// A farewell larger than any pipe: `lines` lines of 100 bytes each, then a
+    /// clean exit 0. `cat` consumes stdin first, so the output only starts once
+    /// the owner has closed stdin.
+    #[cfg(unix)]
+    fn farewell_script(lines: usize, fd: &str) -> String {
+        format!(
+            "cat > /dev/null; yes '{}' | head -n {lines} >{fd}; exit 0",
+            "x".repeat(99)
+        )
+    }
+
+    /// Drops the sidecar (the production shutdown ladder: stdin EOF, grace,
+    /// group kill) and returns how its child ended, so a test can tell a child
+    /// that finished on its own (`code() == Some(0)`) from one that was
+    /// SIGKILLed (`signal() == Some(9)`).
+    #[cfg(unix)]
+    fn status_after_shutdown(sidecar: Sidecar) -> (std::process::ExitStatus, Duration) {
+        let child = sidecar.child.clone();
+        let started = Instant::now();
+        drop(sidecar);
+        let took = started.elapsed();
+        let status = relock(&child).wait().expect("cached status");
+        (status, took)
+    }
+
+    /// Polls for the child's exit without holding its lock across the wait: the
+    /// pumps reap through that lock, so a test that blocks in `wait()` under it
+    /// would stop the very kill or reap it is observing.
+    #[cfg(unix)]
+    fn status_when_it_exits(child: &Mutex<Child>) -> std::process::ExitStatus {
+        let deadline =
+            Instant::now() + crate::test_support::coverage_relaxed(Duration::from_secs(10));
+        loop {
+            if let Some(status) = relock(child).try_wait().expect("poll child") {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "the child never exited");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Characterization (ft-487108b9), established against the unmodified
+    /// code: a 1 MiB single-line farewell on stdout is drained by the pump
+    /// through the grace (one frame, under the 4 MiB cap), so the child exits 0.
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_lets_a_child_write_a_megabyte_to_stdout_and_exit() {
+        let mut sidecar = scripted_sidecar(
+            "cat > /dev/null; head -c 1048576 /dev/zero | tr '\\0' x; echo; exit 0",
+            WRITE_DEADLINE,
+        );
+        sidecar.shutdown_grace = crate::test_support::coverage_relaxed(Duration::from_secs(5));
+        let (status, took) = status_after_shutdown(sidecar);
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "reaped by SIGKILL, not its own exit"
+        );
+        assert!(took < Duration::from_secs(4), "shutdown took {took:?}");
+    }
+
+    /// The defect (ft-487108b9): a farewell of more lines than the stdout queue
+    /// holds, and more bytes than a pipe holds. Nobody consumes the queue during
+    /// `terminate`, so the pump's `Full` faulted the connection, and that kill
+    /// queued on the child lock the grace held: the pump stopped reading, the
+    /// child blocked on its full pipe, and the grace ended in SIGKILL.
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_lets_a_child_write_many_stdout_lines_and_exit() {
+        let mut sidecar = scripted_sidecar(&farewell_script(20_000, "&1"), WRITE_DEADLINE);
+        sidecar.shutdown_grace = crate::test_support::coverage_relaxed(Duration::from_secs(5));
+        let (status, took) = status_after_shutdown(sidecar);
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "killed during its own farewell: {status:?}"
+        );
+        assert!(took < Duration::from_secs(4), "shutdown took {took:?}");
+    }
+
+    /// Characterization: stderr is piped and read by its own thread for the
+    /// life of the child, so a stderr-heavy farewell cannot wedge the grace.
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_lets_a_child_write_a_flood_to_stderr_and_exit() {
+        let mut sidecar = scripted_sidecar(&farewell_script(20_000, "&2"), WRITE_DEADLINE);
+        sidecar.shutdown_grace = crate::test_support::coverage_relaxed(Duration::from_secs(5));
+        let (status, took) = status_after_shutdown(sidecar);
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "stderr wedged the shutdown: {status:?}"
+        );
+        assert!(took < Duration::from_secs(4), "shutdown took {took:?}");
+    }
+
+    /// Characterization of the EOF path: the child closes stdout, the pump's
+    /// `reap_after_eof` holds the child lock for `EOF_REAP_GRACE`, and the child
+    /// then floods stderr. The stderr thread drains independently of that lock,
+    /// so the child finishes on its own inside the grace.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_closes_stdout_then_floods_stderr_exits_on_its_own() {
+        let sidecar = scripted_sidecar(
+            &format!(
+                "exec >&-; yes '{}' | head -n 20000 >&2; exit 0",
+                "x".repeat(99)
+            ),
+            WRITE_DEADLINE,
+        );
+        let child = sidecar.child.clone();
+        let status = status_when_it_exits(&child);
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "SIGKILLed in the EOF grace: {status:?}"
+        );
+        drop(sidecar);
+    }
+
+    /// The hostile-child protection the shutdown carve-out must not remove: a
+    /// queue overflow while the sidecar is NOT shutting down still kills. (The
+    /// existing idle-flood test covers the bound itself; this one pins that the
+    /// kill is by SIGKILL of a child that would otherwise run on.)
+    #[cfg(unix)]
+    #[test]
+    fn a_stdout_flood_in_normal_operation_still_kills_the_child() {
+        let script = format!(
+            "i=0; while [ $i -lt {} ]; do printf 'noise-%s\\n' \"$i\"; i=$((i + 1)); done; exec sleep 30",
+            MAX_QUEUED_STDOUT_FRAMES + 1
+        );
+        let sidecar = scripted_sidecar(&script, WRITE_DEADLINE);
+        let child = sidecar.child.clone();
+        let status = status_when_it_exits(&child);
+        assert_eq!(status.signal(), Some(9), "flood did not kill: {status:?}");
+        drop(sidecar);
     }
 
     /// The criterion "a policy check completes in under 1 s while a 10 s
