@@ -325,8 +325,10 @@ which a draft's assets do not. That decides how to take a release back:
   and the checksum asset stays public.
 - **Fix forward with a higher patch version.** Never move or re-push a tag
   that was published: someone has already installed that build under that
-  name. Deleting the tag is optional once the release is gone, because a tag
-  with no published release is never announced.
+  name. Deleting the tag from origin is mandatory as long as v1.3.1 clients
+  exist (they announce any tag on origin without checking for a published
+  release); for newer clients, deleting the tag is optional once the release is
+  gone.
 
 Builds older than 1.4.0's update check announce the newest tag, published or
 not, so those users can see a version from the moment its tag is pushed. Publish
