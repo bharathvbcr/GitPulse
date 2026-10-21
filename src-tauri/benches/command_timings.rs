@@ -460,105 +460,15 @@ fn main() {
         report.finish();
         return;
     }
-    let repo = build_repo(&temp.path().join("fixture"), &SPEC);
-    let path = repo.path().to_string();
-    let commit = head(&repo);
-    report.note(format!(
-        "fixture: {} files, {} commits, {} worktrees ({} dirty), hermetic HOME, production spawn rate lifted",
-        SPEC.files,
-        SPEC.extra_commits + 1,
-        SPEC.linked_worktrees + 1,
-        SPEC.linked_worktrees
-    ));
-
-    // Transcripts for the steady catch_up row; one cold pass settles the
-    // watermark so the timed passes are the re-open cost.
-    let steady_root = temp.path().join("transcripts-steady");
-    write_transcripts(&steady_root, &path, 60, 8);
-
-    let snapshot = |path: &str| {
-        let snapshot = insights::snapshot(path);
-        assert!(
-            !snapshot.deadline_expired,
-            "the insights snapshot hit its deadline: this run would time a partial snapshot"
-        );
-        let value = serde_json::to_value(&snapshot).expect("snapshot serializes");
-        let facets_ok = require_no_failed_facets("insights::snapshot", &value);
-        (snapshot, facets_ok)
-    };
-    // The Worktrees panel's explicit opt-in: `ScanDepth::Full`.
-    let list_full = |path: &str| {
-        gitpulse_lib::engine::worktree::list_worktrees(path)
-            .unwrap_or_else(|error| panic!("list_worktrees full failed: {error}"))
-    };
-    // What `cmd_list_worktrees` runs by default
-    // (`depth.unwrap_or(ScanDepth::Listing)`): one `git worktree list`. At this
-    // depth a failure is the `Err`, and an entry cannot carry a partial scan,
-    // so the only way to time a degraded answer is a short list.
-    let list_listing = |path: &str| {
-        let worktrees =
-            gitpulse_lib::engine::worktree::list_worktrees_scanned(path, ScanDepth::Listing)
-                .unwrap_or_else(|error| panic!("list_worktrees listing failed: {error}"));
-        assert_eq!(
-            worktrees.len(),
-            SPEC.linked_worktrees + 1,
-            "the listing did not return every worktree, so this run would time a partial answer"
-        );
-        worktrees
-    };
-
-    // `git_preflight` runs `git version` once per process and remembers a
-    // passing answer; `git_supports` (commit details' merge rendering) is the
-    // first caller to trigger it. Production pays that once, off the per-call
-    // path, so warm it here: each row's counter is then its own work, and a
-    // row that happens to run first is not charged for the probe.
+    // `git_preflight` caches a passing answer: warm it so a counted pass below
+    // is its own work and not charged for the one-time `git version` probe.
     let preflight = gitpulse_lib::engine::git_cli::git_preflight();
     assert_eq!(
         preflight.status,
         gitpulse_lib::engine::git_cli::GitPreflightStatus::Ok,
-        "git did not pass its preflight ({:?}), so the warm-up did not cache and a counted row would pay the probe",
+        "git did not pass its preflight ({:?})",
         preflight.message
     );
-
-    // Work counters (git processes) in their own untimed pass.
-    let (_, snapshot_procs) = count_git_processes(|| snapshot(&path));
-    let (_, list_full_procs) = count_git_processes(|| list_full(&path));
-    let (_, list_listing_procs) = count_git_processes(|| list_listing(&path));
-    // Unbounded: the production 10 s deadline is a property of the host's load,
-    // and a scan it cut short would be timed as if it were the whole work.
-    let (_, lang_procs) =
-        count_git_processes(|| GitReader::get_repo_language_stats_bounded(&path, None));
-    let (_, details_argvs) = git_process_argvs(|| GitReader::get_commit_details(&path, &commit));
-    // Pins the warm-up: the probe is `git version`, and none may land in the
-    // counted pass, or the row would charge commit details a one-time cost.
-    // trace2's argv is the git binary, then the `-c key=value` pairs the app
-    // puts first, then the subcommand, so `version` is matched as a whole word
-    // anywhere after argv[0].
-    assert!(
-        !details_argvs
-            .iter()
-            .any(|argv| argv.iter().skip(1).any(|word| word == "version")),
-        "commit details started `git version` inside the counted pass; the git_preflight \
-         warm-up must run before it: {details_argvs:?}"
-    );
-    let details_procs = details_argvs.len() as u64;
-
-    // Settle catch_up's watermark (first pass over the transcripts).
-    let (first, _) = catch_up_sample(&steady_root, &path);
-    report.note(format!(
-        "catch_up first pass recorded {} events from {} transcripts (the timed `steady` rows start after it)",
-        first.counters["recorded"], first.counters["transcripts"]
-    ));
-
-    // Ownership sample sizes: every `cold` call takes the next one up from 20,
-    // and the primed `warm` size is the production default, which no cold call
-    // reaches. The ref cache does not keep an answer read inside its racy
-    // window of the repository's last write, so wait that out before priming.
-    const WARM_OWNERSHIP_SAMPLE: usize = 128;
-    let next_cold = std::cell::Cell::new(20usize);
-    std::thread::sleep(std::time::Duration::from_secs(4));
-    GitReader::knowledge_report(&path, Some(WARM_OWNERSHIP_SAMPLE)).expect("prime ownership");
-
     // The ref-listing rows: a repository with 220 branches, 60 tags and 8
     // worktrees, every ref at a different commit so ahead-behind has real work.
     // A ref is moved before every timed call, outside the span: the ref cache
@@ -679,6 +589,105 @@ fn main() {
         report.finish();
         return;
     }
+
+    let repo = build_repo(&temp.path().join("fixture"), &SPEC);
+    let path = repo.path().to_string();
+    let commit = head(&repo);
+    report.note(format!(
+        "fixture: {} files, {} commits, {} worktrees ({} dirty), hermetic HOME, production spawn rate lifted",
+        SPEC.files,
+        SPEC.extra_commits + 1,
+        SPEC.linked_worktrees + 1,
+        SPEC.linked_worktrees
+    ));
+
+    // Transcripts for the steady catch_up row; one cold pass settles the
+    // watermark so the timed passes are the re-open cost.
+    let steady_root = temp.path().join("transcripts-steady");
+    write_transcripts(&steady_root, &path, 60, 8);
+
+    let snapshot = |path: &str| {
+        let snapshot = insights::snapshot(path);
+        assert!(
+            !snapshot.deadline_expired,
+            "the insights snapshot hit its deadline: this run would time a partial snapshot"
+        );
+        let value = serde_json::to_value(&snapshot).expect("snapshot serializes");
+        let facets_ok = require_no_failed_facets("insights::snapshot", &value);
+        (snapshot, facets_ok)
+    };
+    // The Worktrees panel's explicit opt-in: `ScanDepth::Full`.
+    let list_full = |path: &str| {
+        gitpulse_lib::engine::worktree::list_worktrees(path)
+            .unwrap_or_else(|error| panic!("list_worktrees full failed: {error}"))
+    };
+    // What `cmd_list_worktrees` runs by default
+    // (`depth.unwrap_or(ScanDepth::Listing)`): one `git worktree list`. At this
+    // depth a failure is the `Err`, and an entry cannot carry a partial scan,
+    // so the only way to time a degraded answer is a short list.
+    let list_listing = |path: &str| {
+        let worktrees =
+            gitpulse_lib::engine::worktree::list_worktrees_scanned(path, ScanDepth::Listing)
+                .unwrap_or_else(|error| panic!("list_worktrees listing failed: {error}"));
+        assert_eq!(
+            worktrees.len(),
+            SPEC.linked_worktrees + 1,
+            "the listing did not return every worktree, so this run would time a partial answer"
+        );
+        worktrees
+    };
+
+    // `git_preflight` runs `git version` once per process and remembers a
+    // passing answer; `git_supports` (commit details' merge rendering) is the
+    // first caller to trigger it. Production pays that once, off the per-call
+    // path, so warm it here: each row's counter is then its own work, and a
+    // row that happens to run first is not charged for the probe.
+    let preflight = gitpulse_lib::engine::git_cli::git_preflight();
+    assert_eq!(
+        preflight.status,
+        gitpulse_lib::engine::git_cli::GitPreflightStatus::Ok,
+        "git did not pass its preflight ({:?}), so the warm-up did not cache and a counted row would pay the probe",
+        preflight.message
+    );
+
+    // Work counters (git processes) in their own untimed pass.
+    let (_, snapshot_procs) = count_git_processes(|| snapshot(&path));
+    let (_, list_full_procs) = count_git_processes(|| list_full(&path));
+    let (_, list_listing_procs) = count_git_processes(|| list_listing(&path));
+    // Unbounded: the production 10 s deadline is a property of the host's load,
+    // and a scan it cut short would be timed as if it were the whole work.
+    let (_, lang_procs) =
+        count_git_processes(|| GitReader::get_repo_language_stats_bounded(&path, None));
+    let (_, details_argvs) = git_process_argvs(|| GitReader::get_commit_details(&path, &commit));
+    // Pins the warm-up: the probe is `git version`, and none may land in the
+    // counted pass, or the row would charge commit details a one-time cost.
+    // trace2's argv is the git binary, then the `-c key=value` pairs the app
+    // puts first, then the subcommand, so `version` is matched as a whole word
+    // anywhere after argv[0].
+    assert!(
+        !details_argvs
+            .iter()
+            .any(|argv| argv.iter().skip(1).any(|word| word == "version")),
+        "commit details started `git version` inside the counted pass; the git_preflight \
+         warm-up must run before it: {details_argvs:?}"
+    );
+    let details_procs = details_argvs.len() as u64;
+
+    // Settle catch_up's watermark (first pass over the transcripts).
+    let (first, _) = catch_up_sample(&steady_root, &path);
+    report.note(format!(
+        "catch_up first pass recorded {} events from {} transcripts (the timed `steady` rows start after it)",
+        first.counters["recorded"], first.counters["transcripts"]
+    ));
+
+    // Ownership sample sizes: every `cold` call takes the next one up from 20,
+    // and the primed `warm` size is the production default, which no cold call
+    // reaches. The ref cache does not keep an answer read inside its racy
+    // window of the repository's last write, so wait that out before priming.
+    const WARM_OWNERSHIP_SAMPLE: usize = 128;
+    let next_cold = std::cell::Cell::new(20usize);
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    GitReader::knowledge_report(&path, Some(WARM_OWNERSHIP_SAMPLE)).expect("prime ownership");
 
     let mut cases = ref_cases();
     cases.extend(vec![
