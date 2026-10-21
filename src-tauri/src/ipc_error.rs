@@ -297,10 +297,39 @@ fn kind_written_as(text: &str) -> (IpcErrorKind, Option<serde_json::Value>) {
     TYPED.with(|typed| typed.borrow().kind_of(text))
 }
 
-/// A copy of what this thread has written, for a seam that hands one thread's
-/// answer to another (see [`absorb`]).
-pub(crate) fn snapshot() -> Records {
+/// A copy of what this thread has written (see [`with_records`]).
+fn snapshot() -> Records {
     TYPED.with(|typed| typed.borrow().clone())
+}
+
+/// Runs `work` on this thread and returns its result with what its producers
+/// wrote, for a seam that hands the answer to another thread (a single-flight
+/// leader to its waiters, a scoped helper to the command that joins it). The
+/// receiving thread calls [`absorb`] on the records.
+///
+/// The records returned are only what `work` wrote: this thread's earlier ones
+/// (a single-flight leader's command wrote some before it led) are set aside
+/// during `work` and put back after it, together with what `work` wrote, so
+/// this thread's own command still sees both. Without that, a waiter would
+/// inherit a refusal it never saw.
+pub(crate) fn with_records<T>(work: impl FnOnce() -> T) -> (T, Records) {
+    struct Restore(Option<Records>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(mut earlier) = self.0.take() {
+                // On unwind `work`'s partial record merges back too.
+                let wrote = TYPED.with(|typed| std::mem::take(&mut *typed.borrow_mut()));
+                earlier.absorb(wrote);
+                TYPED.with(|typed| *typed.borrow_mut() = earlier);
+            }
+        }
+    }
+    let earlier = TYPED.with(|typed| std::mem::take(&mut *typed.borrow_mut()));
+    let restore = Restore(Some(earlier));
+    let value = work();
+    let wrote = snapshot();
+    drop(restore);
+    (value, wrote)
 }
 
 /// Folds `records` into this thread's. A single-flight waiter is given the
@@ -430,6 +459,8 @@ impl From<LedgerError> for IpcError {
     }
 }
 
+#[cfg(test)]
+mod adv_l6_tests;
 #[cfg(test)]
 mod adversarial2_tests;
 #[cfg(test)]

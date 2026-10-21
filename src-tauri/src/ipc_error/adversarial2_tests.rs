@@ -17,27 +17,64 @@ fn read<T>(body: impl FnOnce() -> Result<T, String>) -> Result<T, IpcError> {
     run_command_as(Some("cmd_get_status"), body)
 }
 
-/// CHARACTERIZATION of a known gap, not a defect to fix in this card.
-///
 /// `cmd_get_commit_graph` runs its history walk in a `thread::scope` thread
 /// (commands/commit_graph.rs) and returns that thread's error. The gate writes
-/// its record on the helper thread, so the command thread has none and the
-/// deferral is unclassified: the read is shown the refusal instead of retried.
-/// That fails safe (it loses a retry, it never adds one). Carrying a helper's
-/// records back to its command is part of the typed-threading follow-up card;
-/// when it lands, flip this test to expect `DeferredUnderLoad`.
+/// its record on the helper thread; the helper hands it back with its result
+/// ([`with_records`]) and the command absorbs it at the join, so the read is
+/// typed deferred, and retried, as it is when the walk runs inline.
 #[test]
-fn a_deferral_raised_on_a_scoped_helper_thread_is_unclassified_until_helper_records_are_carried() {
+fn a_deferral_raised_on_a_scoped_helper_thread_types_an_allowlisted_read_when_its_records_are_carried(
+) {
     let error = read(|| {
-        std::thread::scope(|scope| {
+        let (result, records) = std::thread::scope(|scope| {
             scope
-                .spawn(|| Err::<(), _>(shed("git log")))
+                .spawn(|| with_records(|| Err::<(), _>(shed("git log"))))
                 .join()
                 .expect("helper joins")
-        })
+        });
+        absorb(records);
+        result
     })
     .expect_err("the helper was refused");
-    assert_eq!(error.kind, IpcErrorKind::Unclassified, "{error}");
+    assert_eq!(error.kind, IpcErrorKind::DeferredUnderLoad, "{error}");
+}
+
+/// The hand-back adds nothing a command may not already have: a command that
+/// is not on the replay-safe list, and a user action, still never carry the
+/// retryable kind out of a helper's refusal.
+#[test]
+fn a_carried_helper_deferral_never_makes_a_write_or_unlisted_command_retryable() {
+    let carried = || {
+        let (result, records) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| with_records(|| Err::<(), _>(shed("git log"))))
+                .join()
+                .expect("helper joins")
+        });
+        absorb(records);
+        result
+    };
+    let wrapped = || carried().map_err(|refused| format!("Stash failed: {refused}"));
+    let inline =
+        |command| run_command_as(command, || Err::<(), _>(shed("git log"))).expect_err("refused");
+    for command in [Some("cmd_commit"), None] {
+        // Only the loose rule (any wording) is reserved for the allowlist; an
+        // exact refusal is typed the same whether it came from a helper or not.
+        let rewritten = run_command_as(command, wrapped).expect_err("refused");
+        assert_eq!(rewritten.kind, IpcErrorKind::Unclassified, "{rewritten}");
+        let exact = run_command_as(command, carried).expect_err("refused");
+        assert_eq!(exact.kind, inline(command).kind, "{exact}");
+    }
+    let user_action = read(|| {
+        crate::engine::git_cli::mark_user_action("/nonexistent-adv-repo");
+        carried()
+    })
+    .expect_err("refused");
+    assert_eq!(
+        user_action.kind,
+        IpcErrorKind::Unclassified,
+        "{user_action}"
+    );
 }
 
 /// What a thread hop must never do: hand the command a kind another thread's

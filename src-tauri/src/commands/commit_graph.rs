@@ -320,16 +320,24 @@ pub async fn cmd_get_commit_graph(
         // the first page already carries.
         let probe_hidden =
             revision.is_none() && ref_scope == RefScope::Named && skip.unwrap_or(0) == 0;
+        // A test's governor injection is thread-local, so the helper that walks
+        // history takes the command's, as `off_thread` does for the pool thread.
+        #[cfg(test)]
+        let injected = crate::sysload::injected_governor_input();
         let (history, head, refs, default_branch, hidden) = std::thread::scope(|scope| {
             let history = scope.spawn(move || {
-                GitReader::read_commit_history_paged(
-                    &repo,
-                    skip.unwrap_or(0),
-                    fetch_limit,
-                    rev.as_deref(),
-                    path_filter.as_deref(),
-                    ref_scope,
-                )
+                #[cfg(test)]
+                let _carried = injected.map(crate::sysload::inject_governor);
+                crate::ipc_error::with_records(|| {
+                    GitReader::read_commit_history_paged(
+                        &repo,
+                        skip.unwrap_or(0),
+                        fetch_limit,
+                        rev.as_deref(),
+                        path_filter.as_deref(),
+                        ref_scope,
+                    )
+                })
             });
             let repo2 = repo_path.clone();
             let head = scope.spawn(move || GitReader::head_id(&repo2));
@@ -344,9 +352,7 @@ pub async fn cmd_get_commit_graph(
                     .transpose()
             });
             (
-                history
-                    .join()
-                    .unwrap_or_else(|_| Err("history walker panicked".into())),
+                history.join(),
                 head.join(),
                 refs.join(),
                 default_branch.join(),
@@ -448,6 +454,17 @@ pub async fn cmd_get_commit_graph(
             ),
         }
 
+        // The walk's own thread wrote the gate's refusal, if there was one. It
+        // is handed to this command's thread before the error leaves, so a
+        // deferred history read is typed (and retried) as it was when the walk
+        // ran inline.
+        let history = match history {
+            Ok((history, records)) => {
+                crate::ipc_error::absorb(records);
+                history
+            }
+            Err(_) => Err("history walker panicked".into()),
+        };
         let raw_commits = history?;
         Ok(assemble_commit_graph(
             raw_commits,

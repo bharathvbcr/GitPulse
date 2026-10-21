@@ -444,8 +444,7 @@ pub(crate) fn through_stamped_coalesced(
     };
     let key = coalesce_key(repo, args, stamped);
     let (answer, records) = coalesced_flights().run(key, || {
-        let answer = through_stamped(repo, args, stamp, run);
-        (answer, crate::ipc_error::snapshot())
+        crate::ipc_error::with_records(|| through_stamped(repo, args, stamp, run))
     });
     crate::ipc_error::absorb(records);
     answer

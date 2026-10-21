@@ -205,6 +205,29 @@ fn a_read_shed_under_memory_pressure_reaches_the_frontend_as_a_deferral() {
     );
 }
 
+/// The commit graph walks history on a scoped helper thread, so the gate's
+/// refusal is written there, not on the command's thread. The read is still
+/// asked again: the helper's record is handed back at the join.
+#[test]
+fn a_commit_graph_walk_shed_on_its_helper_thread_reaches_the_frontend_as_a_deferral() {
+    use crate::sysload::{GovernorInput, Level};
+    let dir = repo_with_tracked_and_untracked();
+    let root = dir.path().to_string_lossy().to_string();
+    let _pressed = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Critical));
+    let error =
+        tauri::async_runtime::block_on(cmd_get_commit_graph(root, 100, None, None, None, None))
+            .expect_err("the history walk is shed");
+    assert_eq!(
+        error.kind,
+        crate::ipc_error::IpcErrorKind::DeferredUnderLoad,
+        "{error}"
+    );
+    assert!(
+        error.message.contains(" deferred under load after "),
+        "{error}"
+    );
+}
+
 /// The engine wraps some runner failures in its own words (`Blame
 /// unavailable: ...`). The read is still asked again: the gate's refusal was
 /// recorded on this command's thread.
