@@ -2022,3 +2022,6 @@ mod family_cost_tests {
 
 #[cfg(test)]
 mod history_tests;
+
+#[cfg(test)]
+mod authority_tests;
