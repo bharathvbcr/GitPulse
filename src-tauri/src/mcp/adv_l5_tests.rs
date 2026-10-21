@@ -2,6 +2,7 @@
 
 use super::budget::{self, TRUNCATION_KEY};
 use super::*;
+use crate::procguard::LockedSpawn as _;
 use std::os::unix::fs::PermissionsExt;
 use std::time::Instant;
 
@@ -322,7 +323,7 @@ fn adv_every_mcp_read_path_on_a_ledger_locked_by_another_process_is_bounded() {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
-        .spawn()
+        .spawn_locked()
         .expect("sqlite3 on PATH");
     {
         use std::io::Write;
@@ -385,7 +386,7 @@ fn adv_every_mcp_read_path_on_a_ledger_locked_by_another_process_is_bounded() {
             && !s.ends_with("µs")
             && s.trim_end_matches('s')
                 .parse::<f64>()
-                .map_or(false, |v| v > 30.0)),
+                .is_ok_and(|v| v > 30.0)),
         "{timings:#?}"
     );
 }

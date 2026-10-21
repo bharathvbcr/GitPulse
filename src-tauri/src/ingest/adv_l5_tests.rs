@@ -74,7 +74,7 @@ fn adv_walk_symlink_to_slash_terminates_and_stays_inside_the_corpus() {
     let canon = root.path().canonicalize().unwrap();
     let outside: Vec<_> = files
         .iter()
-        .filter(|f| !f.canonicalize().map_or(false, |c| c.starts_with(&canon)))
+        .filter(|f| !f.canonicalize().is_ok_and(|c| c.starts_with(&canon)))
         .take(3)
         .collect();
     assert!(

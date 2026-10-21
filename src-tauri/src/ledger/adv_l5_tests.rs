@@ -1,6 +1,7 @@
 //! Adversarial probes of lane L5 (ledger freshness honesty). Tests only.
 
 use crate::ledger::*;
+use crate::procguard::LockedSpawn as _;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Barrier};
 use std::time::Instant;
@@ -236,7 +237,7 @@ fn adv_a_reader_against_a_ledger_locked_by_a_writer_is_bounded_and_says_why() {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn()
+        .spawn_locked()
         .expect("sqlite3 on PATH");
     {
         use std::io::Write;
