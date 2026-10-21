@@ -1940,3 +1940,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "budget_adversarial_tests.rs"]
+mod budget_adversarial_tests;
