@@ -245,7 +245,7 @@ pub(crate) const WORKTREE_LIST_Z: (u32, u32, u32) = (2, 36, 0);
 /// committer date. An optional row: a caller below it walks by count instead.
 pub(crate) const SINCE_AS_FILTER: (u32, u32, u32) = (2, 37, 0);
 
-/// `git commit-graph write --changed-paths`. An optional row: the Storage
+/// `--changed-paths` for building the commit graph. An optional row: the Storage
 /// panel offers the write only at or above it.
 pub(crate) const COMMIT_GRAPH_CHANGED_PATHS: (u32, u32, u32) = (2, 27, 0);
 
@@ -279,7 +279,7 @@ pub(crate) const GIT_FEATURES: &[GitFeature] = &[
         hard: false,
     },
     GitFeature {
-        name: "commit-graph write --changed-paths",
+        name: "--changed-paths (commit-graph)",
         min: COMMIT_GRAPH_CHANGED_PATHS,
         hard: false,
     },
@@ -392,11 +392,11 @@ mod tests {
         assert_eq!(row("--diff-merges").min, (2, 31, 0));
         assert_eq!(row("git worktree list -z").min, (2, 36, 0));
         assert_eq!(row("--since-as-filter").min, (2, 37, 0));
-        assert_eq!(row("commit-graph write --changed-paths").min, (2, 27, 0));
-        assert!(!row("commit-graph write --changed-paths").hard);
+        assert_eq!(row("--changed-paths (commit-graph)").min, (2, 27, 0));
+        assert!(!row("--changed-paths (commit-graph)").hard);
         assert_eq!(
             crate::engine::git_writer::COMMIT_GRAPH_CHANGED_PATHS_GIT,
-            row("commit-graph write --changed-paths").min,
+            row("--changed-paths (commit-graph)").min,
             "one source of truth"
         );
         for hard in [
