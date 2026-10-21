@@ -163,7 +163,7 @@ fn adv_l6_nested_with_records_neither_loses_nor_duplicates() {
             })
         });
         assert_eq!(inner_value, 7);
-        assert_eq!(inner.deferrals.len(), 2, "inner snapshot holds both");
+        assert_eq!(inner.deferrals.len(), 1, "inner holds only its own work's");
         assert_eq!(outer.deferrals.len(), 2);
         absorb(outer);
         absorb(inner);
@@ -196,7 +196,6 @@ fn adv_l6_nested_with_records_neither_loses_nor_duplicates() {
 /// to every waiter. This test asserts the clean behaviour; a failure is the
 /// finding.
 #[test]
-#[ignore = "FINDING: with_records snapshots the whole thread record, not just its work"]
 fn adv_l6_with_records_returns_only_what_its_work_wrote() {
     let _ = run_command(|| {
         let _ = shed("written before the flight");
