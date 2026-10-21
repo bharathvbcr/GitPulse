@@ -121,3 +121,33 @@ fn change_context_names_the_as_of_of_the_ledger_it_read() {
     assert_eq!(context["ledger_freshness"]["as_of"], as_of, "{context}");
     assert_eq!(context["ledger_freshness"]["stale"], false, "{context}");
 }
+
+#[test]
+fn every_mcp_ledger_surface_serialises_the_honest_view() {
+    let (_dir, repo) = trusted_repo();
+    record_events(&repo, 1);
+
+    let insights = crate::mcp::handle_tool_call("gitpulse_insights", &json!({ "repo_path": repo }))
+        .expect("insights");
+    let status = crate::mcp::handle_tool_call("gitpulse_status", &json!({ "repo_path": repo }))
+        .expect("status");
+    let page = tool_page(&repo);
+    let resource = repo_facet("ledger", &repo).expect("ledger resource");
+    let insights_resource = repo_facet("insights", &repo).expect("insights resource");
+    let status_resource = repo_facet("status", &repo).expect("status resource");
+
+    for (name, ledger) in [
+        ("gitpulse_insights", &insights["ledger"]),
+        ("insights resource", &insights_resource["ledger"]),
+        ("gitpulse_status", &status["ledger"]),
+        ("status resource", &status_resource["ledger"]),
+        ("gitpulse_ledger_events", &page),
+        ("ledger resource", &resource),
+    ] {
+        assert_eq!(ledger["recording"], false, "{name}: {ledger}");
+        assert_eq!(ledger["recording_state"], "readable", "{name}: {ledger}");
+        assert_eq!(ledger["dropped_scope"], "this_process", "{name}: {ledger}");
+        assert!(ledger["as_of"].is_string(), "{name}: {ledger}");
+        assert_eq!(ledger["stale"], false, "{name}: {ledger}");
+    }
+}

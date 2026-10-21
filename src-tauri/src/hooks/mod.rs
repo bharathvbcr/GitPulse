@@ -1692,17 +1692,6 @@ pub fn session_brief(snapshot: &InsightsSnapshot, here: &str, source: &str) -> S
             } else {
                 "recording".to_string()
             }
-        } else if snapshot.ledger.recording_state == "readable" {
-            // A read-only open: rows can be read, and nothing says anyone is
-            // writing them. Not "NOT recording" (no fault) and not "recording".
-            format!(
-                "readable (this session only reads it; {})",
-                if snapshot.ledger.freshness.stale {
-                    or_unknown(&snapshot.ledger.freshness.stale_reason)
-                } else {
-                    "a catch-up ran recently".to_string()
-                }
-            )
         } else {
             format!("NOT recording ({})", or_unknown(&snapshot.ledger.error))
         }
@@ -2342,14 +2331,11 @@ mod tests {
             }]),
             ledger: LedgerStatus {
                 recording: true,
-                recording_state: "recording".to_string(),
                 path: "/repo/.gitpulse/ledger.sqlite".to_string(),
                 dropped: 0,
-                dropped_scope: "this_process".to_string(),
                 catch_up_failures: 0,
                 error: String::new(),
                 error_code: String::new(),
-                freshness: Default::default(),
             },
             codeintel: CodeintelStatus {
                 available: true,
@@ -4075,25 +4061,6 @@ done
         );
         assert!(brief.contains("branch here: claude/feature"));
         assert!(brief.contains("main worktree branch: main"));
-    }
-
-    #[test]
-    fn a_read_only_ledger_is_briefed_as_readable_not_as_not_recording_or_recording() {
-        let mut snapshot = snapshot_fixture();
-        snapshot.ledger.recording = false;
-        snapshot.ledger.recording_state = "readable".to_string();
-        snapshot.ledger.freshness.stale = true;
-        snapshot.ledger.freshness.stale_reason = "no catch-up newer than 600s".to_string();
-
-        let brief = session_brief(&snapshot, "/repo", "startup");
-
-        assert!(
-            brief.contains(
-                "ledger: readable (this session only reads it; no catch-up newer than 600s)"
-            ),
-            "{brief}"
-        );
-        assert!(!brief.contains("NOT recording"), "{brief}");
     }
 
     #[test]

@@ -205,15 +205,29 @@ pub(crate) fn repository_status_readonly(
     repo_path: &str,
 ) -> Result<super::LedgerStatus, LedgerError> {
     let family = resolve_address(repo_path, repo_path)?;
+    Ok(readonly_status_of(&family))
+}
+
+fn readonly_status_of(family: &FamilyAddress) -> super::LedgerStatus {
     let mut status = super::status_readonly(&family.address.anchor);
     // A repository whose siblings still carry pre-consolidation ledgers has
     // rows this read cannot see. Saying so beats silently under-reporting, and
     // beats running the migration from a read to make the number right.
-    if status.recording_state == "readable" && legacy_unconsolidated(&family) {
+    if status.recording && legacy_unconsolidated(family) {
         status.error = LEGACY_UNCONSOLIDATED_MESSAGE.to_string();
         status.error_code = LEGACY_UNCONSOLIDATED_CODE.to_string();
     }
-    Ok(status)
+    status
+}
+
+/// [`repository_status_readonly`] as an MCP surface reports it: a
+/// [`super::LedgerView`] (never `recording`, scoped `dropped`) with the
+/// ledger's freshness, from one family resolution.
+pub(crate) fn repository_ledger_view(repo_path: &str) -> Result<super::LedgerView, LedgerError> {
+    let family = resolve_address(repo_path, repo_path)?;
+    let status = readonly_status_of(&family);
+    let freshness = super::freshness_readonly(&family.address.anchor);
+    Ok(super::LedgerView::from_readonly(status, freshness))
 }
 
 /// The `error_code` of a read that cannot see rows a sibling worktree's own

@@ -328,10 +328,17 @@ pub fn ledger_page(anchor: &str, cursor: i64, limit: u32) -> Result<Value, Strin
 /// empty when there is none). A page with rows and no such block reads as
 /// "this is everything, as of now", which nothing here can promise.
 fn with_freshness(mut page: Value, anchor: &str, caveat: Option<&str>) -> Value {
-    let freshness = json!(crate::ledger::freshness_readonly(anchor));
-    if let (Some(page), Some(fields)) = (page.as_object_mut(), freshness.as_object()) {
+    // The same view the status and insights facets serialize, minus the two
+    // fields the page already spends on its own `error`.
+    let view = json!(crate::ledger::LedgerView::from_readonly(
+        crate::ledger::status_readonly(anchor),
+        crate::ledger::freshness_readonly(anchor),
+    ));
+    if let (Some(page), Some(fields)) = (page.as_object_mut(), view.as_object()) {
         for (key, value) in fields {
-            page.insert(key.clone(), value.clone());
+            if key != "error" && key != "error_code" {
+                page.insert(key.clone(), value.clone());
+            }
         }
         page.insert("caveat".into(), json!(caveat.unwrap_or_default()));
         page.insert(
@@ -406,6 +413,21 @@ pub fn ledger_query_page(
     }
 }
 
+/// The insights snapshot as MCP reports it: the in-process snapshot (which the
+/// hooks consume as it is) with its `ledger` facet replaced by the honest
+/// [`crate::ledger::LedgerView`]: never `recording`, `dropped` scoped, with
+/// freshness.
+pub fn insights_document(repo: &str) -> Value {
+    let snapshot = crate::insights::snapshot(repo);
+    let view = crate::ledger::LedgerView::from_readonly(
+        snapshot.ledger.clone(),
+        crate::insights::ledger_freshness(repo),
+    );
+    let mut document = json!(snapshot);
+    document["ledger"] = json!(view);
+    document
+}
+
 /// The composed repository status document.
 ///
 /// The tool dispatch calls this too — it is the one shape that genuinely had
@@ -419,8 +441,8 @@ pub fn status_document(repo: &str) -> Result<Value, String> {
     // is refused whole. A ledger that exists but cannot be read is not that —
     // `status_readonly` reports it inside the ledger facet (`recording: false`
     // plus `error`), so the worktree and code-graph facets still answer.
-    let ledger_status = crate::ledger::bindings::repository_status_readonly(repo)
-        .map_err(|error| error.to_string())?;
+    let ledger_status =
+        crate::ledger::bindings::repository_ledger_view(repo).map_err(|error| error.to_string())?;
     let codeintel_status = crate::codeintel::status(repo);
     let worktrees = match crate::engine::worktree::list_worktrees_scanned(
         repo,
@@ -469,7 +491,7 @@ pub fn status_document(repo: &str) -> Result<Value, String> {
 
 pub(super) fn repo_facet(facet: &str, repo: &str) -> Result<Value, ReadError> {
     match facet {
-        "insights" => Ok(json!(crate::insights::snapshot(repo))),
+        "insights" => Ok(insights_document(repo)),
         "status" => status_document(repo).map_err(ReadError::Internal),
         "collisions" => Ok(json!(crate::insights::collision_risk(repo))),
         "changes" => Ok(json!(crate::insights::active_changes(repo, None, None))),

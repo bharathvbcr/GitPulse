@@ -1067,14 +1067,11 @@ fn snapshot_observed(
         Ok(status) => status,
         Err(error) => crate::ledger::LedgerStatus {
             recording: false,
-            recording_state: "unknown".to_string(),
             path: String::new(),
             dropped: 0,
-            dropped_scope: "this_process".to_string(),
             catch_up_failures: 0,
             error: error.to_string(),
             error_code: error.code.to_string(),
-            freshness: crate::ledger::Freshness::unavailable(error.to_string()),
         },
     };
 
@@ -2174,7 +2171,7 @@ pub fn change_context(repo_path: &str, worktree_path: Option<&str>) -> ChangeCon
 
 /// The freshness of the ledger a read of `repo_path` consults: its anchor's,
 /// or unavailable with the reason when the anchor cannot be named.
-fn ledger_freshness(repo_path: &str) -> crate::ledger::Freshness {
+pub(crate) fn ledger_freshness(repo_path: &str) -> crate::ledger::Freshness {
     match crate::ledger::bindings::repository_address_readonly(repo_path) {
         Ok(address) => crate::ledger::freshness_readonly(&address.anchor),
         Err(error) => crate::ledger::Freshness::unavailable(error.to_string()),

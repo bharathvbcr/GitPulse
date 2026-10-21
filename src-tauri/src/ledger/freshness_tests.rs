@@ -24,6 +24,11 @@ fn repo_dir() -> (tempfile::TempDir, String) {
     (dir, repo)
 }
 
+/// What an MCP surface serialises for the ledger of `repo` at `now_ms`.
+fn view_at(repo: &str, now_ms: u64) -> LedgerView {
+    LedgerView::from_readonly(status_readonly(repo), freshness_readonly_at(repo, now_ms))
+}
+
 fn minutes(n: u64) -> u64 {
     n * 60 * 1000
 }
@@ -39,7 +44,7 @@ fn an_empty_ledger_has_no_as_of_and_is_stale_with_a_reason() {
     let (_dir, repo) = repo_dir();
     with_conn(&repo, |_| Ok(())).expect("create the schema, no rows");
 
-    let status = status_readonly_at(&repo, ids::now_millis());
+    let status = view_at(&repo, ids::now_millis());
 
     assert_eq!(status.freshness.as_of, None, "no row, so no time to invent");
     assert_eq!(status.freshness.last_catch_up, None);
@@ -170,19 +175,22 @@ fn recording_a_pass_never_creates_a_ledger() {
 }
 
 #[test]
-fn a_read_only_open_is_readable_never_recording() {
+fn a_read_only_open_is_readable_never_recording_in_the_mcp_view() {
     let (_dir, repo) = repo_dir();
     append(draft(&repo)).unwrap();
 
-    let readonly = status_readonly(&repo);
+    // The base status says the file opened; the view must not call that
+    // recording.
+    assert!(status_readonly(&repo).recording, "base status semantics");
+    let view = view_at(&repo, ids::now_millis());
 
     assert!(
-        !readonly.recording,
+        !view.recording,
         "an open that cannot write is not recording"
     );
-    assert_eq!(readonly.recording_state, "readable");
-    assert_eq!(readonly.dropped_scope, "this_process");
-    let json = serde_json::to_value(&readonly).unwrap();
+    assert_eq!(view.recording_state, "readable");
+    assert_eq!(view.dropped_scope, "this_process");
+    let json = serde_json::to_value(&view).unwrap();
     assert_eq!(json["recording"], false);
     assert_eq!(json["recording_state"], "readable");
     assert_eq!(json["dropped_scope"], "this_process");
@@ -191,16 +199,12 @@ fn a_read_only_open_is_readable_never_recording() {
         "flattened beside recording: {json}"
     );
     assert!(json["stale"].is_boolean());
-    // The creating path in the writing process still says so.
-    let writing = status(&repo);
-    assert!(writing.recording);
-    assert_eq!(writing.recording_state, "recording");
 }
 
 #[test]
 fn no_ledger_is_unknown_and_stale_with_the_reason() {
     let (_dir, repo) = repo_dir();
-    let status = status_readonly(&repo);
+    let status = view_at(&repo, ids::now_millis());
     assert!(!status.recording);
     assert_eq!(status.recording_state, "unknown");
     assert!(status.freshness.stale);
@@ -224,7 +228,7 @@ fn an_unreadable_database_is_never_reported_fresh() {
     }
     std::fs::write(&db, garbage).unwrap();
 
-    let status = status_readonly_at(&repo, ids::now_millis());
+    let status = view_at(&repo, ids::now_millis());
 
     assert_eq!(status.recording_state, "unknown", "{status:?}");
     assert!(!status.recording);
@@ -298,7 +302,7 @@ fn a_drop_in_another_process_is_not_claimed_as_zero_everywhere() {
 
     // Process B (this one) cannot see A's count, and must not pass its own 0
     // off as the repository's.
-    let reader = status_readonly(&repo);
+    let reader = view_at(&repo, ids::now_millis());
 
     assert_eq!(reader.dropped, 0, "B's own count");
     assert_eq!(reader.dropped_scope, "this_process");
@@ -306,5 +310,135 @@ fn a_drop_in_another_process_is_not_claimed_as_zero_everywhere() {
         serde_json::to_value(&reader).unwrap()["dropped_scope"],
         "this_process",
         "the label travels with the number over the wire"
+    );
+}
+
+/// Bytes of the database and its write-ahead log: what any write would change.
+fn ledger_bytes(repo: &str) -> (Vec<u8>, Vec<u8>) {
+    let db = ledger_path(repo);
+    (
+        std::fs::read(&db).unwrap(),
+        std::fs::read(db.with_extension("sqlite-wal")).unwrap_or_default(),
+    )
+}
+
+#[test]
+fn no_reader_ever_writes_the_ledger_or_its_catch_up_state() {
+    let (_dir, repo) = repo_dir();
+    append(draft(&repo)).unwrap();
+    let t0 = newest_ms(&repo) + minutes(1);
+    record_catch_up(
+        &repo,
+        &repo,
+        &CatchUpRecord {
+            completed: true,
+            skipped_lines: 2,
+            ..CatchUpRecord::default()
+        },
+        t0,
+    )
+    .unwrap();
+    let before = ledger_bytes(&repo);
+
+    // Every read-only path: the status, the freshness at any clock, the view,
+    // a stale clock that would tempt a "refresh", and a page of events.
+    let _ = status_readonly(&repo);
+    let _ = freshness_readonly(&repo);
+    let _ = freshness_readonly_at(&repo, t0 + minutes(120));
+    let _ = view_at(&repo, t0 + minutes(120));
+    let _ = tail_readonly_page(&repo, 0, 10, PAGE_MAX_BYTES).unwrap();
+
+    assert_eq!(ledger_bytes(&repo), before, "a reader changed the ledger");
+    let read = freshness_readonly_at(&repo, t0 + minutes(120));
+    assert_eq!(
+        read.last_catch_up.as_deref(),
+        Some(ids::iso8601_utc(t0).as_str())
+    );
+    assert_eq!(read.catch_up.expect("row").skipped_lines, 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_catch_up_state_write_goes_through_the_writable_connection_and_fails_closed_without_one() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, repo) = repo_dir();
+    append(draft(&repo)).unwrap();
+    // The writer's registry connection is dropped by a state directory that is
+    // no longer writable: the write must fail loudly, not fall back to some
+    // other way of opening the database.
+    let state = dir.path().join(".devcouncil");
+    let db = ledger_path(&repo);
+    registry().lock().unwrap().remove(&db);
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o400)).unwrap();
+    for suffix in ["sqlite-wal", "sqlite-shm"] {
+        let _ = std::fs::set_permissions(
+            db.with_extension(suffix),
+            std::fs::Permissions::from_mode(0o400),
+        );
+    }
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let before = ledger_bytes(&repo);
+
+    let outcome = record_catch_up(
+        &repo,
+        &repo,
+        &CatchUpRecord {
+            completed: true,
+            ..CatchUpRecord::default()
+        },
+        ids::now_millis(),
+    );
+
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        outcome.is_err(),
+        "a write without a writer must not succeed"
+    );
+    assert_eq!(ledger_bytes(&repo), before);
+}
+
+#[test]
+fn the_basis_tells_a_persisted_pass_from_an_inferred_one() {
+    let (_dir, repo) = repo_dir();
+    append(draft(&repo)).unwrap();
+    let at = newest_ms(&repo) + minutes(1);
+    assert_eq!(
+        freshness_readonly_at(&repo, at).last_catch_up_basis,
+        "newest_row",
+        "no pass persisted: inferred"
+    );
+    record_catch_up(
+        &repo,
+        &repo,
+        &CatchUpRecord {
+            completed: true,
+            ..CatchUpRecord::default()
+        },
+        at,
+    )
+    .unwrap();
+    assert_eq!(
+        freshness_readonly_at(&repo, at).last_catch_up_basis,
+        "catch_up_state",
+        "a persisted pass"
+    );
+    // A pass that did not run is persisted but is not a completion: with no
+    // completed one the basis falls back to inferred.
+    let (_dir2, repo2) = repo_dir();
+    append(draft(&repo2)).unwrap();
+    record_catch_up(
+        &repo2,
+        &repo2,
+        &CatchUpRecord {
+            completed: false,
+            error: "did not run".into(),
+            ..CatchUpRecord::default()
+        },
+        at,
+    )
+    .unwrap();
+    assert_eq!(
+        freshness_readonly_at(&repo2, at).last_catch_up_basis,
+        "newest_row"
     );
 }

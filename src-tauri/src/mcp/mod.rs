@@ -789,7 +789,7 @@ fn ledger_facet_output() -> Value {
         }
     }
     facet["properties"]["recording"] = json!({ "type": "boolean", "description": "True only when this process is writing the ledger. Never true from a read-only open: see `recording_state`." });
-    facet["properties"]["recording_state"] = json!({ "type": "string", "enum": ["recording", "readable", "unknown"], "description": "`readable`: the ledger opened read-only, so its rows can be read; who is recording is not known. `unknown`: no ledger, or it could not be opened (see `error`)." });
+    facet["properties"]["recording_state"] = json!({ "type": "string", "enum": ["readable", "unknown"], "description": "`readable`: the ledger opened read-only, so its rows can be read; who is recording is not known. `unknown`: no ledger, or it could not be opened (see `error`)." });
     facet["properties"]["dropped"] = json!({ "type": "integer", "description": "Appends dropped by THIS process; see `dropped_scope`." });
     facet["properties"]["dropped_scope"] = json!({ "type": "string", "enum": ["this_process"], "description": "Drops are counted in memory per process. A reader that never appends reports 0 whatever another process dropped; 0 is never \"nothing was dropped anywhere\"." });
     facet
@@ -1088,7 +1088,13 @@ fn build_tools() -> Vec<Value> {
                     "freshness_error": freshness_field("freshness_error"),
                     "catch_up": freshness_field("catch_up"),
                     "caveat": { "type": "string", "description": "Non-empty when this answer cannot include every row: today, a sibling worktree still holds its own pre-consolidation ledger (`caveat_code` `legacy_ledger_unconsolidated`). Empty when there is none." },
-                    "caveat_code": { "type": "string" }
+                    "caveat_code": { "type": "string" },
+                    "recording": { "type": "boolean", "description": "Always false here: this read-only answer is not a recorder." },
+                    "recording_state": { "type": "string", "enum": ["readable", "unknown"] },
+                    "path": { "type": "string" },
+                    "dropped": { "type": "integer", "description": "Appends dropped by THIS process; see `dropped_scope`." },
+                    "dropped_scope": { "type": "string", "enum": ["this_process"] },
+                    "catch_up_failures": { "type": "integer" }
                 },
                 "required": ["ok", "events", "returned", "truncated"]
             }),
@@ -1742,7 +1748,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
         "gitpulse_insights" => {
             let a: RepoArgs = parse(name, arguments)?;
             Ok(with_production_retry(|retry| {
-                read_insights(|| json!(insights::snapshot(&a.repo_path)), retry)
+                read_insights(|| resources::insights_document(&a.repo_path), retry)
             }))
         }
         "gitpulse_status" => {

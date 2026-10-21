@@ -108,6 +108,58 @@ impl Freshness {
     }
 }
 
+/// The ledger as an MCP surface reports it: [`super::LedgerStatus`] from a
+/// read-only open, made honest, plus [`Freshness`].
+///
+/// `LedgerStatus::recording` from [`super::status_readonly`] means "the file
+/// opened". Nothing in a read-only process is recording, so the view says
+/// `recording: false` and carries what the open did prove in `recording_state`
+/// (`readable`, or `unknown` when there is no ledger or it could not be
+/// opened). `dropped` is counted in memory by the process that dropped, so it
+/// is labelled `dropped_scope: "this_process"`: a reader's 0 is not a verdict
+/// on any other process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerView {
+    /// Always false: a read-only view cannot be recording.
+    pub recording: bool,
+    /// `readable` (the ledger opened read-only; who is recording is not known)
+    /// or `unknown` (no ledger, or it could not be opened: see `error`).
+    pub recording_state: String,
+    pub path: String,
+    /// Appends dropped by THIS process; see `dropped_scope`.
+    pub dropped: u64,
+    /// What `dropped` counts: `this_process`.
+    pub dropped_scope: String,
+    pub catch_up_failures: u64,
+    pub error: String,
+    pub error_code: String,
+    #[serde(flatten)]
+    pub freshness: Freshness,
+}
+
+impl LedgerView {
+    /// The view of a status taken by [`super::status_readonly`] (or the
+    /// bindings wrapper that adds the legacy caveat), with its freshness.
+    pub fn from_readonly(status: super::LedgerStatus, freshness: Freshness) -> Self {
+        LedgerView {
+            recording: false,
+            recording_state: if status.recording {
+                "readable"
+            } else {
+                "unknown"
+            }
+            .to_string(),
+            path: status.path,
+            dropped: status.dropped,
+            dropped_scope: "this_process".to_string(),
+            catch_up_failures: status.catch_up_failures,
+            error: status.error,
+            error_code: status.error_code,
+            freshness,
+        }
+    }
+}
+
 /// One persisted pass as read back.
 struct StateRow {
     completed_at: Option<String>,
