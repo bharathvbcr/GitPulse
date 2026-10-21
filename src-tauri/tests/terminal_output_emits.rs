@@ -1269,7 +1269,12 @@ fn a_hidden_sessions_output_is_batched_at_least_ten_times_harder_and_still_whole
     }
     let dir = repo();
     // 150 bursts of 2 KiB, 10 ms apart: a stream that is nowhere near full.
-    let script = "stty raw -echo; perl -e '$|=1; select(undef,undef,undef,0.4); for (1..150) { syswrite(STDOUT, \"s\" x 2048); select(undef,undef,undef,0.01) }'; sleep 30".to_string();
+    // The gap is spun against the clock, not slept: a host whose timers are
+    // coalesced stretches every 10 ms sleep to ~66 ms, which spreads the stream
+    // over ten seconds and caps the ratio at 250 ms / 66 ms whatever the
+    // reader does. The ratio is a claim about a 10 ms cadence, so the cadence
+    // must not depend on the scheduler's timer slack.
+    let script = "stty raw -echo; perl -MTime::HiRes=time -e '$|=1; select(undef,undef,undef,0.4); for (1..150) { syswrite(STDOUT, \"s\" x 2048); $t = time + 0.01; 1 while time < $t }'; sleep 30".to_string();
     let (seen, seen_sink) = Viewer::new(&state, true);
     let (hidden, hidden_sink) = Viewer::new(&state, true);
     let visible_id = spawn_for(&app, &state, &dir, script.clone(), seen_sink);
