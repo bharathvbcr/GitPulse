@@ -7688,3 +7688,6 @@ mod deferral_retry_tests {
 
 #[cfg(test)]
 mod ledger_honesty_tests;
+
+#[cfg(test)]
+mod adv_l5_tests;

@@ -2226,3 +2226,6 @@ mod reflog_replay_tests;
 mod transcript_bench_tests;
 #[cfg(test)]
 mod walk_tests;
+
+#[cfg(test)]
+mod adv_l5_tests;

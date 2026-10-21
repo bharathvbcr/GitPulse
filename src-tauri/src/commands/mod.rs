@@ -172,3 +172,6 @@ mod assemble_tests;
 mod parity_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod adv_l5_tests;
