@@ -28,6 +28,10 @@ export function worktree(fields: Partial<WorktreeSummary> = {}): WorktreeSummary
     session_slug: "alpha",
     operation_kind: "",
     operation_ok: true,
+    head: null,
+    ahead: null,
+    behind: null,
+    commits_since_base: null,
     ...fields,
   };
 }

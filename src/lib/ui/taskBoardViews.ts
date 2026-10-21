@@ -51,6 +51,23 @@ export function effectiveSwimlane(layout: BoardLayout, lane: Swimlane): Swimlane
   return layout === "board" && lane === "status" ? "none" : lane;
 }
 
+/**
+ * How cards are ordered when no search ranks them. Priority first is the
+ * default: the most urgent work leads every column, and the List layout's
+ * rows across every status. Board order is the store's own positions, the
+ * only order a card can be moved within.
+ */
+export const TASK_ORDERS = ["priority", "board"] as const;
+export type TaskOrder = (typeof TASK_ORDERS)[number];
+export const TASK_ORDER_LABELS: Record<TaskOrder, string> = {
+  priority: "Priority first",
+  board: "Board order",
+};
+
+export function isTaskOrder(value: unknown): value is TaskOrder {
+  return TASK_ORDERS.some((order) => order === value);
+}
+
 /** The highest limit a column can carry; anything above is a typo, not a limit. */
 export const MAX_WIP_LIMIT = 999;
 
@@ -93,6 +110,7 @@ export interface TaskViewSnapshot {
   layout: BoardLayout;
   density: TaskDensity;
   swimlane: Swimlane;
+  order: TaskOrder;
   hiddenColumns: TaskStatus[];
   cardFields: TaskCardField[];
   facet: TaskFacet;
@@ -145,6 +163,8 @@ export function sanitizeSnapshot(value: unknown): TaskViewSnapshot {
     layout: isBoardLayout(raw.layout) ? raw.layout : "board",
     density: isTaskDensity(raw.density) ? raw.density : "comfortable",
     swimlane: isSwimlane(raw.swimlane) ? raw.swimlane : "none",
+    // A view saved before the order existed opens most urgent first, like a fresh board.
+    order: isTaskOrder(raw.order) ? raw.order : "priority",
     hiddenColumns: sanitizeHiddenStatuses(raw.hiddenColumns),
     cardFields: sanitizeCardFields(raw.cardFields),
     facet: sanitizeFacet(raw.facet),

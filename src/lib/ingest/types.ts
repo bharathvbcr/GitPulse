@@ -46,6 +46,36 @@ export interface CatchUp {
    */
   reanchored_from?: string[];
   reflog_entries: number;
+  /**
+   * Reflog entries the ledger refused because it already held them (same
+   * worktree, object, event time and ordinal), so another pass or process
+   * recorded them first. Not lost, not an error: `reflog_entries` equals the
+   * entries recorded here plus these plus any that failed to write.
+   */
+  duplicates_refused?: number;
+  /**
+   * Reflog entries whose ledger write failed. The pass stops at the first, so
+   * everything after it in that ref is `reflog_pending`; the next pass retries
+   * from the same place. Non-zero is never a complete pass.
+   */
+  failed_records?: number;
+  /**
+   * Reflog entries the pass knew of and did not record: more than a window
+   * newer than the watermark, or left behind a failed write. The next passes
+   * record them oldest first; non-zero sets `truncated`.
+   */
+  reflog_pending?: number;
+  /**
+   * True when a ref's log reaches past what the pass read and its watermark was
+   * not in the read: older entries were not examined. Sets `truncated`.
+   */
+  reflog_unreached?: boolean;
+  /**
+   * Reflogs (worktree HEADs, the default branch) the pass did not read: the
+   * per-pass bound on worktrees, a deadline, or an unreadable default branch.
+   * Non-zero sets `truncated`.
+   */
+  reflog_refs_skipped?: number;
   /** True when the wall-clock deadline stopped the pass early. */
   truncated: boolean;
   /** Ledger events the retention policy deleted at the end of the pass. */

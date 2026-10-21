@@ -16,6 +16,7 @@ import {
   parseDueInput,
   partitionLanes,
   priorityLabel,
+  listRows,
   reorderPlan,
   sortByPriority,
   visibleHiddenDetails,
@@ -240,5 +241,24 @@ describe("sortByPriority", () => {
   });
   it("names priorities for chips and screen readers", () => {
     expect([0, 1, 2, 3, 7, null].map(priorityLabel)).toEqual(["Urgent", "High", "Normal", "Low", "Normal", "Normal"]);
+  });
+});
+
+describe("listRows", () => {
+  const c = (id: string, status: TaskCard["status"], priority: number, due_at: number | null = null) => card({ id, status, priority, due_at });
+  const columns = [
+    [c("inbox-low", "inbox", 3), c("inbox-urgent", "inbox", 0)],
+    [c("ready-high", "ready", 1), c("ready-normal", "ready", 2, 50)],
+    [c("done-urgent", "done", 0, 10)],
+  ];
+  it("keeps the columns in order under board order", () => {
+    expect(listRows(columns, "board").map((x) => x.id)).toEqual(["inbox-low", "inbox-urgent", "ready-high", "ready-normal", "done-urgent"]);
+  });
+  it("puts the most urgent row first across every status under priority order", () => {
+    expect(listRows(columns, "priority").map((x) => x.id)).toEqual(["done-urgent", "inbox-urgent", "ready-high", "ready-normal", "inbox-low"]);
+  });
+  it("draws nothing from no columns and leaves its input alone", () => {
+    expect(listRows([], "priority")).toEqual([]);
+    expect(columns[0].map((x) => x.id)).toEqual(["inbox-low", "inbox-urgent"]);
   });
 });

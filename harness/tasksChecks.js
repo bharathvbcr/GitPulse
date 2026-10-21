@@ -489,6 +489,11 @@ const root = document.getElementById("app");
 // run, including after a real window blur (see harness/foreground.ts). The one
 // background check below sets `document.hidden`, which outranks it.
 holdForeground();
+// A fresh board opens most urgent first. The checks below move cards within
+// their columns, which only the board's own order allows, so the run starts
+// there; the order checks switch to Priority first themselves.
+const openedInPriorityOrder = get(interfaceStore).taskOrder === "priority";
+interfaceStore.setTaskOrder("board");
 mount(TasksHost, {target: root});
 let confirmations = 0, confirmAnswer = true;
 const settle = async (ms = 30) => {
@@ -549,6 +554,7 @@ const repoRow = name => [...(repoPopup()?.querySelectorAll(".repo-row") ?? [])].
 const repoSummaryText = () => editor()?.querySelector("[data-task-repo-picker]")?.textContent ?? "";
 const editor = () => root.querySelector(".task-editor");
 const check = (name, pass) => results.push({name, pass:Boolean(pass)});
+check("a fresh Tasks board opens most urgent first", openedInPriorityOrder);
 const change = async (el, value, event = "input") => { if(!el) throw Error("Missing form field"); el.value = value; el.dispatchEvent(new Event(event, {bubbles:true})); await settle(); };
 const click = async text => {
   if (text === "Clear task search") return change(root.querySelector('[aria-label="Search tasks"]'), "");
@@ -1812,6 +1818,10 @@ if (params.has("check")) {
     check("reset restores every column and field",
       root.querySelectorAll("[data-task-column]").length === 6 && !hiddenNote()
       && [...viewMenu().querySelectorAll('[data-task-field-toggle][aria-checked="true"]')].length === 5);
+    check("reset puts the board back to most urgent first",
+      viewMenu().querySelector('[data-task-order-option="priority"]')?.getAttribute("aria-checked") === "true");
+    // The keyboard and drag checks below move cards within a column.
+    viewMenu().querySelector('[data-task-order-option="board"]').click(); await settle();
     viewToggle().click(); await settle();
     check("the view menu closes without leaving the board changed", !viewMenu() && root.querySelectorAll("[data-task-column]").length === 6);
 
@@ -3048,6 +3058,19 @@ if (params.has("check")) {
       button("List").click(); await settle(200);
       const listLanes = [...root.querySelectorAll("[data-task-list] [data-task-lane]")].map(el => el.dataset.taskLane);
       check("in the list, status lanes group the rows by status", listLanes.length >= 2 && [...root.querySelectorAll("[data-task-list] [data-task-card]")].every(row => row.closest("[data-task-lane]")?.dataset.taskLane === `status:${tasks.find(task => task.id === row.dataset.cardId)?.status}`));
+
+      guardStep = "views: list in priority order";
+      await openView(); viewMenu().querySelector('[data-task-lane-option="none"]').click(); await settle();
+      viewMenu().querySelector('[data-task-order-option="priority"]').click(); await settle(200);
+      check("the View menu offers the order and says what it does to the list",
+        viewMenu().querySelector('[data-task-order-option="priority"]').getAttribute("aria-checked") === "true" && Boolean(viewMenu().querySelector('[data-testid="task-order-note"]')));
+      await closeView();
+      const rowPriority = row => tasks.find(task => task.id === row.dataset.cardId)?.priority ?? 2;
+      const rows = [...root.querySelectorAll("[data-task-list] [data-task-card]")];
+      const rowStatuses = new Set(rows.map(row => tasks.find(task => task.id === row.dataset.cardId)?.status));
+      check(`under Priority first the list puts the most urgent rows first across every status (${rows.map(rowPriority).join("")})`,
+        rows.length > 2 && rowStatuses.size >= 2 && rows.every((row, i) => i === 0 || rowPriority(rows[i - 1]) <= rowPriority(row)));
+      await openView(); viewMenu().querySelector('[data-task-order-option="board"]').click(); await settle(200); await closeView();
       button("Board").click(); await settle(150);
 
       guardStep = "views: saved";
@@ -3118,13 +3141,18 @@ if (params.has("check")) {
 
       guardStep = "claims: priority order locks moves";
       const readyIds = () => [...root.querySelectorAll('[data-task-column="ready"] [data-task-card]')].map(el => el.dataset.cardId);
-      button("Priority first").click(); await settle(200);
+      const pickOrder = async option => {
+        root.querySelector("[data-task-view-toggle]").click(); await settle();
+        document.querySelector(`[data-testid="task-view-menu"] [data-task-order-option="${option}"]`).click(); await settle(200);
+        root.querySelector("[data-task-view-toggle]").click(); await settle();
+      };
+      await pickOrder("priority");
       const lockedFrom = readyIds(), lockedWrites = writes.length;
       const lockedCard = root.querySelector('[data-task-column="ready"] [data-task-card]');
       lockedCard.focus(); lockedCard.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", altKey: true, bubbles: true, cancelable: true })); await settle(300);
       check("under Priority first a card is not moved within its column, and the board says why",
         writes.length === lockedWrites && readyIds().join() === lockedFrom.join() && /Switch to Board order/.test(root.querySelector('[role="status"][aria-live="polite"].sr-only')?.textContent ?? ""));
-      button("Board order").click(); await settle(200);
+      await pickOrder("board");
       const freeFirst = root.querySelector('[data-task-column="ready"] [data-task-card]');
       freeFirst.focus(); freeFirst.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", altKey: true, bubbles: true, cancelable: true }));
       await wait(() => writes.length > lockedWrites);

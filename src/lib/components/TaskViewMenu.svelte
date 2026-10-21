@@ -1,7 +1,7 @@
 <script lang="ts">
   /**
-   * The Tasks board's "View" popover: layout, density, which columns are on
-   * screen and which chips a card carries.
+   * The Tasks board's "View" popover: density, card order, lanes, which
+   * columns are on screen and which chips a card carries.
    *
    * Follows the Fleet grid's Columns menu deliberately — same `gp-menu` shell,
    * same `role="switch"` rows, same "Show all" escape hatch — because these
@@ -13,7 +13,7 @@
   import { LAYERS } from "../ui/layers";
   import { STATUSES, STATUS_LABELS } from "../workbench/vocabulary";
   import { TASK_CARD_FIELDS, TASK_CARD_FIELD_LABELS, canHideStatus } from "../ui/taskView";
-  import { MAX_WIP_LIMIT, SWIMLANES, SWIMLANE_LABELS, boardPrefs, effectiveSwimlane, sanitizeWipLimit } from "../ui/taskBoardViews";
+  import { MAX_WIP_LIMIT, SWIMLANES, SWIMLANE_LABELS, TASK_ORDERS, TASK_ORDER_LABELS, boardPrefs, effectiveSwimlane, sanitizeWipLimit } from "../ui/taskBoardViews";
 
   let { disabled = false, board, boardName }: {
     disabled?: boolean;
@@ -23,6 +23,7 @@
   } = $props();
   const limits = $derived(boardPrefs($interfaceStore.taskBoards, board).wip);
   const lane = $derived($interfaceStore.taskSwimlane);
+  const order = $derived($interfaceStore.taskOrder);
   const laneIgnored = $derived(lane !== "none" && effectiveSwimlane($interfaceStore.taskLayout, lane) === "none");
 
   let open = $state(false);
@@ -38,7 +39,8 @@
       compact ||
       fields.size !== TASK_CARD_FIELDS.length ||
       $interfaceStore.taskLayout !== "board" ||
-      lane !== "none",
+      lane !== "none" ||
+      order !== "priority",
   );
 
   /**
@@ -94,6 +96,24 @@
       >
         {@render mark(compact)}<span class="flex-1 text-textPrimary">Compact cards</span>
       </button>
+
+      <p class="px-1.5 pt-2 pb-1 text-[10px] uppercase tracking-wide text-textMuted" id="task-order-label">Order</p>
+      <div role="radiogroup" aria-labelledby="task-order-label" class="flex flex-col gap-0.5">
+        {#each TASK_ORDERS as option (option)}
+          <button
+            type="button"
+            class="row"
+            role="radio"
+            aria-checked={order === option}
+            data-task-order-option={option}
+            title={option === "priority" ? "Most urgent first, then the earlier due date. Cards cannot be moved within a column in this order." : "Cards in the board's own order, where they can be moved."}
+            onclick={() => interfaceStore.setTaskOrder(option)}
+          >
+            {@render mark(order === option)}<span class="flex-1 text-textPrimary">{TASK_ORDER_LABELS[option]}</span>
+          </button>
+        {/each}
+      </div>
+      {#if order === "priority"}<p class="note" data-testid="task-order-note">The List layout puts the most urgent rows first across every status. A search ranked by relevance keeps its own order.</p>{/if}
 
       <p class="px-1.5 pt-2 pb-1 text-[10px] uppercase tracking-wide text-textMuted" id="task-lanes-label">Lanes</p>
       <div role="radiogroup" aria-labelledby="task-lanes-label" class="flex flex-col gap-0.5">

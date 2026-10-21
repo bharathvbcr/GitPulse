@@ -20,8 +20,102 @@ before that tag is pushed.
   so a background fetch can no longer defeat the lease; the fleet commit
   rhythm walk falls back to a count-bounded `git log` below Git 2.37.
 
+## [1.5.0] - 2026-10-20
+
+1.5.0 is the first release published since 1.3.1. 1.3.5 was withdrawn and
+1.4.0 was never published, so upgrading from 1.3.1 also brings everything in
+the 1.4.0 section of `CHANGELOG.md`. Read its **Upgrade** steps first: the task
+profile is migrated one way, and `gitpulse-mcp` and `gitpulse-hook` need
+reinstalling.
+
 ### Added
 
+- Tasks board: order the Tasks board by priority by default
+  (`interfaceStore.taskOrder`, default "priority") in the View menu, saved with
+  views and restored by Reset board view. Under Priority first the List layout
+  sorts every row by priority across statuses (`listRows`); board order keeps
+  the column-by-column rows, and a relevance search keeps its ranking.
+- Storage panel: a user-clicked "Write commit-graph..." for a repository whose
+  commit-graph is missing, out of date or lacks changed-path Bloom filters
+  (Owner Decision 3, part 2 of the commit-graph card). It previews the exact
+  command (`git commit-graph write --reachable --changed-paths`) and the common
+  git directory it writes under, runs only after a confirm, is judged by the
+  command gate, and is refused on an untrusted repository. It is hidden when the
+  graph is present and fresh, bounded at 600 s, cancellable, and one per common
+  directory (a second click joins the write already running). It writes derived
+  data under `objects/info` and no git config; the result is recorded as a
+  ledger event. Three new commands: `cmd_commit_graph_write_plan`,
+  `cmd_commit_graph_write` and `cmd_commit_graph_write_cancel`. Nothing in
+  ingest, the timers, hooks or MCP can run it. It is refused, and never
+  offered, on a git older than 2.27 (no `--changed-paths`), on a partial clone
+  (the write would fetch missing trees), and while another write is running; the
+  spawn runs with lazy fetch off. A Stop sent before the write registers is
+  remembered for five seconds and honoured, and a panel remounted mid-write
+  shows it and can stop it. A stop that races git's publish reports a written
+  graph, not "nothing written". GitPulse never deletes a commit-graph lock: a
+  lock that blocks or survives a write is reported with its path, age and the
+  manual remedy. The preview states the lasting effect: once written with
+  `--changed-paths`, later graph writes keep the filters.
+- `gitpulse_merge_conflicts` answers whether the checkouts' committed work
+  would merge, which `gitpulse_collision_risk` cannot (it reads uncommitted
+  files, so a lane's files leave it the moment the lane commits). For each pair
+  of worktrees on different commits, detached ones included, it reports
+  `clean`, `conflict` with the paths, or `unknown` with a reason (a git
+  failure, unrelated histories, a deadline, a git before 2.38, a partial clone):
+  an unknown pair is never clean. At most 64 pairs are merged; above that
+  `ok` is false, `truncated` is true and `pairs_total` / `pairs_checked` carry
+  both numbers. The merge runs in the Wave A object quarantine, so the
+  repository's object store is byte for byte the same afterwards and the tool
+  stays read-only. The one primitive is `object_quarantine::merge_tree_candidate`.
+- Insights worktree rows carry `head`, `ahead`, `behind` and
+  `commits_since_base`, measured from the HEAD commit so a detached worktree
+  has them. The counts are cached by the immutable (repository, HEAD, base)
+  triple in a bounded LRU (1,024 entries), so a snapshot with no HEAD and no
+  base moved spawns no `rev-list`, and one moved HEAD costs exactly one, through
+  the shared spawn gate. At most 8 such reads run per snapshot, within its
+  deadline. A row that was not measured has null counts and a
+  `divergence_note` starting `unmeasured:`, never zero. The shallow boundary
+  (`<common dir>/shallow`, by length and mtime) is part of the cache key, and a
+  shallow clone's rows say `shallow: counts are bounded by the clone depth`.
+- `gitpulse_merge_conflicts` is `ok: false` whenever a pair is `unknown`, with
+  an `error` naming how many (and `deferred` with `retry_after_ms` when every
+  unknown pair was the spawn gate deferring). Conflicted paths are lossless:
+  UTF-8 as is, a byte that is not UTF-8 as an octal escape (`\377`), a
+  backslash doubled.
+  `commits_since_base` is the same number as `ahead`.
+- `gitpulse_landed` answers whether a commit's work reached a base and how:
+  `via` is `merge` (decided before `ff`, so a non-tip commit of a `--no-ff`
+  branch reads merge), `ff`, `squash` (decided before `rebase`, so a
+  one-commit squash names its commit), `rebase`, or `tree` (the content is
+  already on the base: `git merge-tree --write-tree`, run in a quarantined
+  object directory that is deleted afterwards, so the repository's object
+  store is byte-identical before and after). `landed: false` is given only
+  when absence is provable; everything else is null with a `reason`
+  (`partial_clone_fetch_required`, `search_depth_exceeded`,
+  `content_not_provable`, `shallow_clone`, ...). `reverted` is true only when a
+  revert commit is found by ancestry (a reland reads false; no content
+  inference). `landed_at` comes from the base branch's own reflog, never
+  `HEAD`'s; an expired reflog, a landing older than the 1000 newest entries
+  and a base with no reflog give a reason (or the commit date, labelled)
+  instead of a wrong time. A partial clone is refused before any command that
+  could fetch.
+- `gitpulse_landed` round 2: a partial clone is detected by asking git for the
+  boolean (`yes`, `on`, `1`, any case and a bare key all count; an unreadable
+  value refuses) and every git it spawns carries `GIT_NO_LAZY_FETCH=1` as a
+  second fence; a net-empty branch that was cherry-picked reads `rebase`, not
+  false; an unrelated history reads `tree` when its tree is a base commit's and
+  otherwise null (`unrelated_history`), never false; `git diff`/`log -p` run
+  with `--no-textconv`; a revert of one commit of a `--no-ff` merge is found; a
+  clean "adds content" merge is absence only when the base never touched the
+  branch's paths since the fork (otherwise null, `content_not_provable`); a
+  revert chain longer than four is null (`revert_chain_exceeded`); a tag and a
+  branch of one name are read by the ref git's lookup picks. The quarantine
+  sweeps leftover directories (an hour old, its own name, this user's) when a
+  new one is made.
+- `engine::object_quarantine`: a reusable quarantined `GIT_OBJECT_DIRECTORY`
+  (alternates to the repository's objects, removed on every exit path) for git
+  commands that must write objects without writing the repository.
+- `gitpulse_provenance` gains `verified` (a verification note is attached).
 - `gitpulse_provenance` says where a commit sits relative to its base:
   `landed_on_base` / `on_base` (reachable from the base), `ahead`, `behind`,
   `merge_base` and `base_oid`, each null with `base_relation_reason` when it
@@ -37,35 +131,6 @@ before that tag is pushed.
   `limit` matches (one that matches nothing reads the whole ledger). The ledger
   gains two additive indexes (`ts_utc`, `action`) the next time a writer opens
   it; nothing else in the schema changes.
-
-### Fixed
-
-- The Edit/Write hook (`gitpulse-hook collision-guard`) asks the running app for
-  its collision scan instead of reading `git status` in every worktree itself.
-  The app keeps the scan for 5 s, so a burst of edits over 7 worktrees spawns 8
-  git children where it spawned 40 (100 down to 50 when the file is contended).
-  A contended file is still re-read in the worktrees that hold it before it is
-  reported. With no app, a busy or older app, or an answer that is stale or
-  looked at nothing, the hook scans for itself as before. `gitpulse-hook` and
-  the app need reinstalling together to get the saving.
-
-- Pulse's ownership and bus-factor report samples the highest-churn files of
-  every top-level area instead of the first 128 paths, and names the areas it
-  did and did not sample. It is blamed at `HEAD` and kept until `HEAD`, the ref
-  stamp or the mailmap inputs move, so a second call spawns no blame. A
-  repository with a `.mailmap` no longer reports zero scanned files: `git blame`
-  rejects `--use-mailmap` and applies the map itself.
-
-## [1.5.0] - 2026-10-17
-
-1.5.0 is the first release published since 1.3.1. 1.3.5 was withdrawn and
-1.4.0 was never published, so upgrading from 1.3.1 also brings everything in
-the 1.4.0 section of `CHANGELOG.md`. Read its **Upgrade** steps first: the task
-profile is migrated one way, and `gitpulse-mcp` and `gitpulse-hook` need
-reinstalling.
-
-### Added
-
 - **GPU terminal rendering**, gated on the TUI-redraw A/B in
   `docs/PERFORMANCE.md`, which has not run yet.
   - Terminals you can see draw through `@xterm/addon-webgl` 0.19.0 (a new
@@ -81,10 +146,87 @@ reinstalling.
     ships. It reads frame pacing through a new private terminal sequence,
     OSC 7700 (`frames-start` / `frames-stop`). The terminal answers it with
     frame-interval statistics only. See `docs/TERMINAL.md`.
-
 - Host load governor, cards 1b and 1c: one verdict (`sysload::governor`) from the host-load sensor now decides what GitPulse does under memory pressure. Agent launches are refused at severe pressure (kernel level critical, or a thrashing memory compressor) before their checkout probes, capacity check and PTY open, with a typed `host_pressure` refusal that names the resource and value; the user's own shell is never gated, and stop, kill, cancel, save, commit, release and reconcile are never gated. GitPulse's own work is shed through the spawn gate's existing classes with the existing "deferred under load" marker: background work at `warn`, background and reactive work at critical or thrash, never a user action, resuming when the pressure clears. A stale-old or dead sensor admits with a warning and a `host_load.sensor_unavailable` ledger event and sheds nothing; Health shows it as ungoverned. Overrides are human only: **Admit anyway** (Health, and beside Retry on a refused launch) asks in a native dialog, then admits for two minutes. After 30 minutes of continuous refusal a toast offers one click to stop refusing; the refusal never lifts on its own. New setting `host_load.govern_launches`, new command `cmd_host_load_admit_anyway` (granted to the main window; 279 handlers). See `docs/LOAD_GOVERNOR.md`.
 
 ### Changed
+
+### Changed
+
+- A ledger is bound to the directory it was anchored in (OD 1). The identity
+  record's detail JSON now also carries a lineage UUID and the checkout
+  directory's site (inode, and on macOS the volume's persistent UUID rather than
+  `st_dev`, which a reboot can renumber). A ledger carried into a sibling clone
+  or a history-merging repository is refused even after its source is deleted; a
+  rename keeps the inode and keeps recording. No schema change and no
+  `WRITER_VERSION` bump: older binaries ignore the added fields, and a record an
+  older binary rewrites without them is looked past (up to 32 records back) so it
+  never reopens the roots-only rule. The refusal names **Adopt this ledger**,
+  a new user-only action (`cmd_adopt_ledger`, behind an OS confirmation and the
+  repository trust check) that takes over a ledger refused only for its site
+  (a cross-device move, a restore, a copy whose source is gone) and writes a
+  `ledger.adopt` audit row with both sites, both paths, the lineage, the actor
+  and the time. Legacy records get a lineage and site on their next settle.
+  The earlier-location probe now runs before the ledger's write transaction
+  (checked again briefly inside it), at most one probe thread per path, and the
+  30 s retry runs on the repo's clock seam.
+  Accepted gaps: where the platform has no inode (non-unix) the ledger stays on
+  the roots-only rule, filed as a gap; and a new checkout that reuses a deleted
+  checkout's inode, at the same path with the same roots and lineage, is
+  indistinguishable from the original.
+- `deadbranch::is_branch_merged_by_tree` is tri-state (`TreeMerge::Merged`,
+  `NotMerged`, `Unknown`). A conflicting merge (merge-tree exit 1) is
+  `NotMerged`, where it used to read as an unreadable failure, and the check
+  now writes its trees to the quarantine instead of the repository. A partial
+  clone is refused once per scan.
+- The git floor stays 2.23 (owner decision 13): the clone floor (2.45.1) is a
+  feature floor that gates cloning only, so the app runs on older gits. A git
+  before 2.38 makes the conflict engine answer `unknown` for its
+  `merge-tree --write-tree`, per feature.
+- The ledger moves to writer generation 2 (owner decision 1), one additive
+  schema bump: a typed nullable `events.occurred_at` (filled from a
+  well-formed event-time stamp), a nullable `events.reflog_ordinal`, a nullable
+  `transcript_cursors.fingerprint`, the `reflog_watermarks` and
+  `catch_up_state` tables, and a unique reflog identity index over (worktree,
+  object, event time, cut-object hash, ordinal). Nothing reads the new columns
+  or tables yet. The migration runs once, in one transaction, on the first
+  writable open. It deletes no row: reflog rows that share an identity are
+  numbered 0, 1, 2 by id (existing duplicates get ordinals; the first of a
+  group keeps a NULL ordinal that reads as 0), so genuine repeats and old
+  double-writes are both kept for the reflog replay work to reconcile. A
+  generation-1 app, `gitpulsed` or `gitpulse-mcp` that starts after the
+  migration refuses to write the ledger (`gitpulse-ptyd` never writes it), so
+  rebuild and reinstall them together. The stamp is read when a connection
+  opens, so a generation-1 process that was already running keeps writing
+  after the migration and must be restarted. A second process opening an old
+  ledger waits for the migration (up to two minutes) instead of failing.
+  Identical reflog entries of one replay pass are recorded under ordinals 0, 1,
+  2; an entry another pass or process already recorded is refused without
+  counting as a dropped append, and the catch-up result counts it in
+  `duplicates_refused`.
+- Reflog replay resumes from a per-(worktree, ref) watermark, reads every
+  worktree's HEAD log (a window of 16 per pass, rotated so each is read within
+  ceil(N/16) passes) and the default branch's own log, and records the rows and
+  the watermark in one transaction. Known limits, pinned as ignored tests: an
+  identical reflog entry whose older twin lies outside the 200-entry read, and
+  its time went backwards, takes the twin's ordinal and is refused as it; and
+  `git reflog delete` of one of several identical entries renumbers the rest, so
+  the next identical entry is taken as already recorded.
+- Transcript cursors carry a fingerprint (head, tail, file length and mtime), so
+  a rewritten transcript is read again, a moved one resumes after its old lines,
+  and an unchanged one costs a `stat`.
+- `gitpulse_provenance` `confidence` is null when the commit has no
+  verification note (it was 1.0 for an unverified tip). `distance` and
+  `is_fresh` are unchanged. A verification does not carry over a rewrite
+  (rebase, amend, squash): the new commit has none.
+- Files and folders the editor or file tree creates follow the process umask
+  instead of being owner-only: a new file is `0o666 & !umask` (typically 0644,
+  as `touch` makes it), a new executable `0o777 & !umask` (as `git checkout`
+  makes it), and a new folder `0o777 & !umask`. This deliberately widens the
+  default mode of user-created content, as approved on 2026-10-19. Overwrites
+  keep the existing mode, and the staged temporary stays owner-only until it is
+  published. Under a umask that clears the owner write bit (`0o277`) a new
+  folder has no owner write bit, exactly as `mkdir -p` makes it; a test pins
+  that.
 
 - **A repository is read one snapshot at a time, and switching back to a tab
   you just read no longer reads it again.**
@@ -241,7 +383,30 @@ reinstalling.
   committed baseline by `scripts/bench-compare.mjs`. See
   `docs/PERFORMANCE.md`.
 
+### Removed
+
+- The unaddressed `cmd_stash_pop` IPC command and `GitWriter::stash_pop`. Nothing
+  called them: the menu, palette and native actions pop the listed entry by object
+  id through `cmd_stash_action`. Its generated `allow-cmd-stash-pop` permission goes
+  with it (derived from the handler list at build), and the registry is 284 handlers.
+
 ### Fixed
+
+- The Edit/Write hook (`gitpulse-hook collision-guard`) asks the running app for
+  its collision scan instead of reading `git status` in every worktree itself.
+  The app keeps the scan for 5 s, so a burst of edits over 7 worktrees spawns 8
+  git children where it spawned 40 (100 down to 50 when the file is contended).
+  A contended file is still re-read in the worktrees that hold it before it is
+  reported. With no app, a busy or older app, or an answer that is stale or
+  looked at nothing, the hook scans for itself as before. `gitpulse-hook` and
+  the app need reinstalling together to get the saving.
+
+- Pulse's ownership and bus-factor report samples the highest-churn files of
+  every top-level area instead of the first 128 paths, and names the areas it
+  did and did not sample. It is blamed at `HEAD` and kept until `HEAD`, the ref
+  stamp or the mailmap inputs move, so a second call spawns no blame. A
+  repository with a `.mailmap` no longer reports zero scanned files: `git blame`
+  rejects `--use-mailmap` and applies the map itself.
 
 - **A dependency or coverage scan returns by one deadline, and a partial
   coverage scan no longer reads as Measured.**

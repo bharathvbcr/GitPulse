@@ -207,3 +207,421 @@ fn absent_save_over_an_existing_file_keeps_it() {
     assert_eq!(r, Err(WriteFailure::AlreadyExists));
     assert_eq!(std::fs::read(&f).unwrap(), b"mine");
 }
+
+const UMASK_CHILD: &str = "GITPULSE_UMASK_CHILD";
+
+/// Runs `body` under process umask `mask` in a child process. The umask is
+/// process-wide, and every other test in the lib process creates files and
+/// asserts their modes, so it is never changed here. The parent re-executes
+/// this test binary on exactly `test` with the mask in the environment; the
+/// child sets it and runs the body. A child that matched no test would pass
+/// vacuously, so the parent also requires "1 passed" in its output.
+fn under_umask(test: &str, mask: libc::mode_t, body: impl FnOnce()) {
+    if let Err(failure) = try_under_umask(test, mask, body) {
+        panic!("{failure}");
+    }
+}
+
+/// [`under_umask`] that reports a failing mask instead of panicking, so a
+/// test over several masks can name every one that fails.
+fn try_under_umask(test: &str, mask: libc::mode_t, body: impl FnOnce()) -> Result<(), String> {
+    use crate::procguard::LockedSpawn;
+    match std::env::var(UMASK_CHILD) {
+        Ok(want) if want == format!("{mask:o}") => {
+            // SAFETY: umask swaps the mask of this single-test child process.
+            unsafe { libc::umask(mask) };
+            body();
+            Ok(())
+        }
+        // The child was started for another mask of the same test.
+        Ok(_) => Ok(()),
+        Err(_) => {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    test,
+                    "--include-ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(UMASK_CHILD, format!("{mask:o}"))
+                .output_locked()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if output.status.success() && text.contains("1 passed") {
+                Ok(())
+            } else {
+                Err(format!("umask {mask:o} child failed:\n{text}"))
+            }
+        }
+    }
+}
+
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// A new file follows the process umask, like `touch` and a git checkout.
+#[test]
+fn a_new_file_gets_the_umask_default_mode() {
+    for (mask, want) in [(0o022, 0o644), (0o077, 0o600), (0o002, 0o664)] {
+        under_umask(
+            "diff::conflict_fs::adversarial_tests::a_new_file_gets_the_umask_default_mode",
+            mask,
+            || {
+                let (_g, root) = tmp();
+                let f = root.join("new.txt");
+                write_regular_expecting(&f, Expect::Absent, |_| Ok(b"x".to_vec())).unwrap();
+                assert_eq!(mode_of(&f), want, "umask {mask:o}");
+            },
+        );
+    }
+}
+
+/// New folders made on the way to a new file follow the umask too.
+#[test]
+fn a_new_directory_gets_the_umask_default_mode() {
+    for (mask, want) in [(0o022, 0o755), (0o077, 0o700), (0o002, 0o775)] {
+        under_umask(
+            "diff::conflict_fs::adversarial_tests::a_new_directory_gets_the_umask_default_mode",
+            mask,
+            || {
+                let (_g, root) = tmp();
+                write_regular_expecting(&root.join("a/b/new.txt"), Expect::Absent, |_| {
+                    Ok(Vec::new())
+                })
+                .unwrap();
+                assert_eq!(mode_of(&root.join("a")), want, "umask {mask:o}");
+                assert_eq!(mode_of(&root.join("a/b")), want, "umask {mask:o}");
+            },
+        );
+    }
+}
+
+/// An overwrite keeps the existing mode whatever the umask is.
+#[test]
+fn an_overwrite_keeps_the_existing_mode_under_any_umask() {
+    use std::os::unix::fs::PermissionsExt;
+    for mask in [0o022, 0o077] {
+        under_umask(
+            "diff::conflict_fs::adversarial_tests::an_overwrite_keeps_the_existing_mode_under_any_umask",
+            mask,
+            || {
+                let (_g, root) = tmp();
+                for mode in [0o755, 0o600, 0o640] {
+                    let f = root.join(format!("f-{mode:o}"));
+                    std::fs::write(&f, b"old").unwrap();
+                    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(mode)).unwrap();
+                    write_regular_expecting(&f, Expect::Any, |_| Ok(b"new".to_vec())).unwrap();
+                    assert_eq!(std::fs::read(&f).unwrap(), b"new");
+                    assert_eq!(mode_of(&f), mode, "umask {mask:o}, mode {mode:o}");
+                }
+            },
+        );
+    }
+}
+
+/// A write that fails after staging leaves nothing world-readable behind.
+#[test]
+fn a_failed_create_leaves_no_world_readable_temporary() {
+    under_umask(
+        "diff::conflict_fs::adversarial_tests::a_failed_create_leaves_no_world_readable_temporary",
+        0o022,
+        || {
+            let (_g, root) = tmp();
+            let f = root.join("raced.txt");
+            let racer = f.clone();
+            let result = write_regular_after_check(
+                &f,
+                Expect::Absent,
+                |_| Ok(b"secret".to_vec()),
+                move || std::fs::write(&racer, b"other").unwrap(),
+            );
+            assert!(result.is_err(), "{result:?}");
+            assert_eq!(std::fs::read(&f).unwrap(), b"other");
+            for entry in std::fs::read_dir(&root).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_name() != "raced.txt" {
+                    assert_eq!(mode_of(&entry.path()) & 0o077, 0, "{:?}", entry.path());
+                }
+            }
+        },
+    );
+}
+
+const ADV: &str = "diff::conflict_fs::adversarial_tests::";
+
+fn missing() -> Worktree {
+    Worktree {
+        bytes: None,
+        mode: "missing".into(),
+    }
+}
+
+fn entry(bytes: &[u8], mode: &str) -> Worktree {
+    Worktree {
+        bytes: Some(bytes.to_vec()),
+        mode: mode.into(),
+    }
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    use crate::procguard::LockedSpawn;
+    let out = std::process::Command::new("git")
+        .args(["-c", "user.name=a", "-c", "user.email=a@example.invalid"])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output_locked()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// What `git checkout` makes of a `100755` entry under the current umask.
+fn git_checkout_exec_mode(root: &Path) -> u32 {
+    git(root, &["init", "-q"]);
+    std::fs::write(root.join("tool.sh"), b"#!/bin/sh\n").unwrap();
+    git(root, &["add", "tool.sh"]);
+    git(root, &["update-index", "--chmod=+x", "tool.sh"]);
+    git(root, &["commit", "-q", "-m", "x"]);
+    std::fs::remove_file(root.join("tool.sh")).unwrap();
+    git(root, &["checkout", "--", "tool.sh"]);
+    mode_of(&root.join("tool.sh"))
+}
+
+fn exec_matches_git(mask: libc::mode_t, test: &str) -> Result<(), String> {
+    try_under_umask(&format!("{ADV}{test}"), mask, || {
+        let (_g, root) = tmp();
+        let oracle = git_checkout_exec_mode(&root);
+        let (_h, other) = tmp();
+        let f = other.join("tool.sh");
+        replace(&f, &missing(), &entry(b"#!/bin/sh\n", "100755")).unwrap();
+        assert_eq!(
+            mode_of(&f),
+            oracle,
+            "umask {mask:o}: ours {:o}, git checkout {oracle:o}",
+            mode_of(&f)
+        );
+    })
+}
+
+/// Runs [`exec_matches_git`] for every mask and fails naming all that differ.
+fn exec_matches_git_for_all(masks: &[libc::mode_t], test: &str) {
+    let failures: Vec<String> = masks
+        .iter()
+        .filter_map(|&mask| exec_matches_git(mask, test).err())
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// ATTACK 3: a new `100755` file matches what `git checkout` writes.
+#[test]
+fn a_new_executable_matches_git_checkout_under_common_umasks() {
+    exec_matches_git_for_all(
+        &[0o022, 0o077, 0o027, 0o002],
+        "a_new_executable_matches_git_checkout_under_common_umasks",
+    );
+}
+
+/// ATTACK 3: a new executable is `0o777 & !umask`, exactly git's mode, also
+/// where the umask clears an execute bit but not the matching read bit
+/// (026, 006, 011).
+#[test]
+fn a_new_executable_matches_git_checkout_under_unusual_umasks() {
+    exec_matches_git_for_all(
+        &[0o026, 0o006, 0o011],
+        "a_new_executable_matches_git_checkout_under_unusual_umasks",
+    );
+}
+
+/// Characterization, pinned: a folder made under a umask that clears the owner
+/// write bit has no owner write bit, exactly as `mkdir -p` makes it.
+#[test]
+fn a_new_directory_under_umask_0277_matches_mkdir() {
+    under_umask(
+        &format!("{ADV}a_new_directory_under_umask_0277_matches_mkdir"),
+        0o277,
+        || {
+            use std::os::unix::fs::PermissionsExt;
+            let (_g, root) = tmp();
+            // The temp dir itself was made under this umask: give it back
+            // its owner write bit so the folders under test can be made.
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let oracle = root.join("oracle");
+            std::fs::create_dir(&oracle).unwrap();
+            let mut created = Vec::new();
+            crate::fs_entry::pin_parent_recording(&root.join("ours/new.txt"), &mut created)
+                .unwrap();
+            assert_eq!(created, vec![root.join("ours")]);
+            assert_eq!(mode_of(&root.join("ours")), mode_of(&oracle));
+            assert_eq!(mode_of(&root.join("ours")), 0o500);
+            // Restore access so the temp dir can be removed.
+            for dir in [&oracle, &root.join("ours")] {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        },
+    );
+}
+
+/// ATTACK 4: a new `120000` entry never chmods through the link.
+#[test]
+fn a_new_symlink_entry_does_not_chmod_its_target() {
+    use std::os::unix::fs::PermissionsExt;
+    under_umask(
+        &format!("{ADV}a_new_symlink_entry_does_not_chmod_its_target"),
+        0o022,
+        || {
+            let (_g, root) = tmp();
+            let outside = root.join("outside.txt");
+            std::fs::write(&outside, b"secret").unwrap();
+            std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let link = root.join("link");
+            replace(
+                &link,
+                &missing(),
+                &entry(outside.to_str().unwrap().as_bytes(), "120000"),
+            )
+            .unwrap();
+            assert!(std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(mode_of(&outside), 0o600);
+        },
+    );
+}
+
+/// ATTACK 5: a target deleted between the check and the publish must not
+/// become a create with a wider mode: the save is refused.
+#[test]
+fn an_overwrite_whose_target_vanishes_is_refused_not_created() {
+    under_umask(
+        &format!("{ADV}an_overwrite_whose_target_vanishes_is_refused_not_created"),
+        0o022,
+        || {
+            let (_g, root) = tmp();
+            let f = root.join("f.txt");
+            std::fs::write(&f, b"old").unwrap();
+            let gone = f.clone();
+            let result = write_regular_after_check(
+                &f,
+                Expect::Any,
+                |_| Ok(b"new".to_vec()),
+                move || std::fs::remove_file(&gone).unwrap(),
+            );
+            assert!(result.is_err(), "{result:?}");
+            assert!(!f.exists(), "a vanished target was recreated");
+        },
+    );
+}
+
+/// ATTACK 5: a target swapped for a symlink in the same window is not written
+/// through, and its destination is neither modified nor chmoded.
+#[test]
+fn an_overwrite_whose_target_becomes_a_symlink_leaves_the_destination() {
+    use std::os::unix::fs::PermissionsExt;
+    under_umask(
+        &format!("{ADV}an_overwrite_whose_target_becomes_a_symlink_leaves_the_destination"),
+        0o022,
+        || {
+            let (_g, root) = tmp();
+            let f = root.join("f.txt");
+            let outside = root.join("outside.txt");
+            std::fs::write(&f, b"old").unwrap();
+            std::fs::write(&outside, b"keep").unwrap();
+            std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let (swap, dest) = (f.clone(), outside.clone());
+            let result = write_regular_after_check(
+                &f,
+                Expect::Any,
+                |_| Ok(b"new".to_vec()),
+                move || {
+                    std::fs::remove_file(&swap).unwrap();
+                    std::os::unix::fs::symlink(&dest, &swap).unwrap();
+                },
+            );
+            assert!(result.is_err(), "{result:?}");
+            assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+            assert_eq!(mode_of(&outside), 0o600);
+        },
+    );
+}
+
+/// ATTACK 1: a new-file save into a read-only folder fails exactly as it did
+/// before the probe (the staged temporary cannot be created either), leaving
+/// no probe behind.
+#[test]
+fn a_new_file_in_a_read_only_folder_fails_cleanly() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_g, root) = tmp();
+    let dir = root.join("ro");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(dir.join("writable"), b"").is_ok() {
+        return; // root ignores the mode; nothing to attack
+    }
+    let result = write_regular_expecting(&dir.join("n.txt"), Expect::Absent, |_| Ok(Vec::new()));
+    assert!(result.is_err());
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// ATTACK 2: a folder with an inheritable ACL gives a saved new file the same
+/// mode and the same inherited entries as a file created the ordinary way.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_new_file_in_an_acl_folder_matches_an_ordinary_create() {
+    use crate::procguard::LockedSpawn;
+    let (_g, root) = tmp();
+    let run = |program: &str, args: &[&str]| {
+        let out = std::process::Command::new(program)
+            .args(args)
+            .output_locked()
+            .unwrap();
+        assert!(out.status.success(), "{program} {args:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let dir = root.join("acl");
+    std::fs::create_dir(&dir).unwrap();
+    run(
+        "/bin/chmod",
+        &[
+            "+a",
+            "group:everyone allow read,file_inherit",
+            dir.to_str().unwrap(),
+        ],
+    );
+    let plain = dir.join("plain.txt");
+    std::fs::File::create(&plain).unwrap();
+    let saved = dir.join("saved.txt");
+    write_regular_expecting(&saved, Expect::Absent, |_| Ok(b"x".to_vec())).unwrap();
+    // `ls -le` prints the mode column, then the inherited ACL lines.
+    let describe = |path: &Path| {
+        let listing = run("/bin/ls", &["-le", path.to_str().unwrap()]);
+        let mut lines = listing.lines();
+        let head = lines.next().unwrap_or_default();
+        let mode: String = head.split_whitespace().next().unwrap_or_default().into();
+        (mode, lines.map(str::trim).collect::<Vec<_>>().join("|"))
+    };
+    let (plain_mode, plain_acl) = describe(&plain);
+    let (saved_mode, saved_acl) = describe(&saved);
+    assert!(!plain_acl.is_empty(), "the folder ACL was not inherited");
+    assert_eq!(
+        saved_mode.trim_end_matches('+'),
+        plain_mode.trim_end_matches('+')
+    );
+    assert_eq!(
+        saved_acl.split_once(' ').map(|x| x.1),
+        plain_acl.split_once(' ').map(|x| x.1)
+    );
+}

@@ -27,12 +27,20 @@
 #[cfg(test)]
 mod adversarial_deferral_tests;
 #[cfg(test)]
+mod adversarial_landed_round2_tests;
+#[cfg(test)]
+mod adversarial_landed_tests;
+#[cfg(test)]
 mod adversarial_probe_tests;
 #[cfg(test)]
 mod adversarial_tests;
 mod budget;
 pub mod complete;
 pub mod devmap_parity;
+#[cfg(test)]
+mod merge_conflicts_adv_tests;
+#[cfg(test)]
+mod merge_conflicts_tool_tests;
 pub mod page;
 pub mod prompts;
 pub mod resources;
@@ -643,6 +651,14 @@ tool_args! {
     }
 }
 
+tool_args! {
+    struct LandedArgs {
+        repo_path: String = repo_spec(),
+        commit: String = path_spec("Commit (SHA or any revision) to ask about"),
+        base: Option<String> = path_spec("Base branch or revision it should have landed on (default HEAD)"),
+    }
+}
+
 /// Read a tool's arguments, which [`validate_arguments`] has already accepted.
 ///
 /// Extraction repeats none of the bounds; it refuses what a schema cannot say
@@ -871,6 +887,62 @@ fn build_tools() -> Vec<Value> {
             RepoArgs::properties(),
             &RepoArgs::required(),
             collision_risk_output(),
+        ),
+        tool(
+            "gitpulse_merge_conflicts",
+            "Merge conflicts between worktrees",
+            "Would the checkouts' committed work merge? For each pair of worktrees whose HEAD commits differ (detached ones included), `git merge-tree --write-tree` computes the merge, which survives a commit where `gitpulse_collision_risk` (uncommitted files only) does not. Each pair's `verdict.state` is `clean`, `conflict` with `paths` (the first 200 of `paths_total`; a path is UTF-8 text as it is, a byte that is not UTF-8 is a three-digit octal escape such as `\\377`, and a backslash is doubled, so two different paths are never the same string), or `unknown` with a `reason` (a git failure, unrelated histories, a deadline, a git older than 2.38, a partial clone): an unknown pair is never clean. At most 64 pairs are merged: above that `ok` is false, `truncated` is true, `pairs_total` is how many there were and `pairs_checked` how many were merged, so the counts are a floor. `ok` is true only when every checked pair was `clean` or `conflict`: any `unknown` pair makes it false, with `error` naming how many (and `deferred` with `retry_after_ms` when each was the spawn gate deferring under load). Worktrees on the very same commit need no merge and are counted in `same_head_pairs`. Read-only: the merge writes its trees and blobs to a scratch object directory that is deleted afterwards (the repository reads through it as an alternate), so no ref, index, working-tree file or repository object is written.",
+            RepoArgs::properties(),
+            &RepoArgs::required(),
+            ok_error_output(
+                json!({
+                    "worktrees": { "type": "integer" },
+                    "pairs_total": { "type": "integer" },
+                    "pairs_checked": { "type": "integer" },
+                    "same_head_pairs": { "type": "integer" },
+                    "clean": { "type": "integer" },
+                    "conflict": { "type": "integer" },
+                    "unknown": { "type": "integer" },
+                    "truncated": { "type": "boolean" },
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "a_path": { "type": "string" },
+                                "b_path": { "type": "string" },
+                                "a_head": { "type": "string" },
+                                "b_head": { "type": "string" },
+                                "verdict": {
+                                    "type": "object",
+                                    "properties": {
+                                        "state": {
+                                            "type": "string",
+                                            "enum": ["clean", "conflict", "unknown"]
+                                        },
+                                        "tree": { "type": "string" },
+                                        "paths": {
+                                            "type": "array",
+                                            "items": { "type": "string" },
+                                            "description": "Conflicted paths: UTF-8 as is; each byte that is not UTF-8 as a three-digit octal escape (\\377); a backslash doubled (\\\\). Injective: two paths are never one string."
+                                        },
+                                        "paths_total": { "type": "integer" },
+                                        "reason": { "type": "string" }
+                                    },
+                                    "required": ["state"]
+                                }
+                            },
+                            "required": ["a_path", "b_path", "a_head", "b_head", "verdict"]
+                        }
+                    },
+                    "deferred": deferred_property(),
+                    "retry_after_ms": retry_after_property()
+                }),
+                &[
+                    "worktrees", "pairs_total", "pairs_checked", "same_head_pairs", "clean",
+                    "conflict", "unknown", "truncated", "items",
+                ],
+            ),
         ),
         tool(
             "gitpulse_change_context",
@@ -1191,7 +1263,7 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_provenance",
             "Commit provenance",
-            "Read Git-native verification notes and confidence decay for a commit. `distance` is how many commits the base has that the commit lacks (`rev-list --count <commit>..<base>`), so it is 0 for a commit AHEAD of the base as well as for the base tip: it says how far the base moved, not whether the commit is on it. Read `landed_on_base` / `on_base` (reachable from the base), `ahead`, `behind`, `merge_base` and `base_oid` for that; each is null with `base_relation_reason` when it could not be measured (unresolvable base, shallow clone), never false.",
+            "Read Git-native verification notes and confidence decay for a commit. `distance` is how many commits the base has that the commit lacks (`rev-list --count <commit>..<base>`), so it is 0 for a commit AHEAD of the base as well as for the base tip: it says how far the base moved, not whether the commit is on it. Read `landed_on_base` / `on_base` (reachable from the base), `ahead`, `behind`, `merge_base` and `base_oid` for that; each is null with `base_relation_reason` when it could not be measured (unresolvable base, shallow clone), never false. `confidence` is how much a recorded verification still counts (it decays with `distance`) and is null when the commit has no verification note: `verified` says whether one is attached (not what it found; read `verification.verdict`), so an unverified commit is never confident however fresh. A verification is keyed to the commit's sha and does not survive a rewrite: a rebased, amended or squashed commit is a new commit with no verification, even when `gitpulse_landed` finds its work on the base.",
             ProvenanceArgs::properties(),
             &ProvenanceArgs::required(),
             json!({
@@ -1203,6 +1275,7 @@ fn build_tools() -> Vec<Value> {
                     "is_fresh": { "type": "boolean" },
                     "unmeasured_reason": { "type": "string" },
                     "notes_readable": { "type": "boolean" },
+                    "verified": { "type": "boolean" },
                     "verification": { "type": ["object", "null"] },
                     "session": { "type": ["object", "null"] },
                     "landed_on_base": { "type": ["boolean", "null"] },
@@ -1215,8 +1288,52 @@ fn build_tools() -> Vec<Value> {
                 },
                 "required": [
                     "commit_sha", "distance", "confidence", "is_fresh", "unmeasured_reason",
-                    "notes_readable", "verification", "session", "landed_on_base", "on_base",
+                    "notes_readable", "verified", "verification", "session", "landed_on_base",
+                    "on_base",
                     "base_oid", "merge_base", "ahead", "behind", "base_relation_reason"
+                ]
+            }),
+        ),
+        tool(
+            "gitpulse_landed",
+            "Has a commit landed",
+            "Has a commit's work reached a base, and how. `landed: true` with `via`: `merge` when a merge commit joined it to the base (checked before `ff`, so a non-tip commit of a `--no-ff` branch is `merge`), `ff` when the base's own line runs through it, `squash` when one base commit carries the patch of its whole branch (checked before `rebase`, so a one-commit squash names its commit), `rebase` when every patch is on the base under new ids, `tree` when none of those match but merging it into the base changes nothing (its content is already there; no single commit is named). `merge_commit` is the base commit that brought it in (merge or squash). `landed: false` only when absence is provable: no route found, the base was searched in full, and merging the work in would add something. Everything else is null with `reason` (a code) and `error` (words): `partial_clone_fetch_required` (a partial clone: nothing is run, because git would fetch a missing blob), `search_depth_exceeded` (the base is longer than the 1000-commit squash search, so absence in the part searched proves nothing), `content_not_provable` (the work conflicts with the base, or merging it adds content but the base changed the same paths since the fork, so it may have landed edited and been changed since), `unrelated_history` (no common history, no matching patch or tree), `shallow_clone`, `unresolvable`, `not_measured`, `comparison_failed`. `reverted: true` only when a revert commit naming the landing is found after it in the base's history (`reverted_by`); a reland reads false, a revert chain longer than four is null with `reverted_reason` starting `revert_chain_exceeded`; no content inference, so `merge -s ours` reads landed and not reverted. `landed_at` is the Unix time the base first contained the landing, from the base branch's own reflog (never HEAD's; `HEAD` means the branch it is on) with `landed_at_source: reflog`, or the landing commit's date for a base with no reflog (`commit_date`); null with `landed_at_reason` when the reflog is absent, expired or older than its 1000 newest entries. Read-only: the content comparison runs in a quarantined object directory that is deleted afterwards, so no ref, index, working-tree file or repository object is written.",
+            LandedArgs::properties(),
+            &LandedArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "commit": { "type": "string" },
+                    "base_oid": { "type": ["string", "null"] },
+                    "landed": { "type": ["boolean", "null"] },
+                    "via": {
+                        "type": ["string", "null"],
+                        "enum": ["ff", "merge", "squash", "rebase", "tree", null]
+                    },
+                    "merge_commit": { "type": ["string", "null"] },
+                    "landed_at": { "type": ["integer", "null"] },
+                    "landed_at_source": {
+                        "type": ["string", "null"],
+                        "enum": ["reflog", "commit_date", null]
+                    },
+                    "landed_at_reason": { "type": "string" },
+                    "reverted": { "type": ["boolean", "null"] },
+                    "reverted_by": { "type": ["string", "null"] },
+                    "reverted_reason": { "type": "string" },
+                    "reason": {
+                        "type": ["string", "null"],
+                        "enum": [
+                            "partial_clone_fetch_required", "search_depth_exceeded",
+                            "shallow_clone", "unresolvable", "not_measured",
+                            "content_not_provable", "comparison_failed", "unrelated_history", null
+                        ]
+                    },
+                    "error": { "type": "string" }
+                },
+                "required": [
+                    "commit", "base_oid", "landed", "via", "merge_commit", "landed_at",
+                    "landed_at_source", "landed_at_reason", "reverted", "reverted_by",
+                    "reverted_reason", "reason", "error"
                 ]
             }),
         ),
@@ -1546,6 +1663,15 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 read_insights(|| json!(insights::collision_risk(&a.repo_path)), retry)
             }))
         }
+        "gitpulse_merge_conflicts" => {
+            let a: RepoArgs = parse(name, arguments)?;
+            Ok(with_production_retry(|retry| {
+                read_insights(
+                    || json!(insights::merge_conflicts::merge_conflicts(&a.repo_path)),
+                    retry,
+                )
+            }))
+        }
         "gitpulse_change_context" => {
             let a: ChangeContextArgs = parse(name, arguments)?;
             Ok(with_production_retry(|retry| {
@@ -1745,6 +1871,14 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 &a.repo_path,
                 &a.commit_sha,
                 a.base_branch.as_deref()
+            )))
+        }
+        "gitpulse_landed" => {
+            let a: LandedArgs = parse(name, arguments)?;
+            Ok(json!(crate::engine::provenance::landed(
+                &a.repo_path,
+                &a.commit,
+                a.base.as_deref()
             )))
         }
         _ => Err(format!("Unknown tool: {name}")),
@@ -2905,6 +3039,7 @@ mod tests {
                 "from",
                 "to",
                 "commit_sha",
+                "commit",
                 "task_id",
             ] {
                 if tool["inputSchema"]["properties"][extra].is_object() {
@@ -3554,6 +3689,7 @@ mod tests {
         ("gitpulse_complete_task", "one task record back, no list"),
         ("gitpulse_delete_task", "one deletion receipt, no list"),
         ("gitpulse_provenance", "one provenance record, no list"),
+        ("gitpulse_landed", "one landing record, no list"),
         ("devmap_status", "one status envelope, no list"),
         ("devmap_preview", "one preview verdict, no list"),
     ];
@@ -3573,6 +3709,10 @@ mod tests {
         (
             "gitpulse_collision_risk",
             "no overlapping dirty files on the fixture repositories",
+        ),
+        (
+            "gitpulse_merge_conflicts",
+            "no two fixture worktrees sit on different commits, so there are no pairs",
         ),
         (
             "gitpulse_ledger_events",
@@ -3774,6 +3914,7 @@ mod tests {
                     "from",
                     "to",
                     "commit_sha",
+                    "commit",
                     "task_id",
                     "symptom",
                     "since",
@@ -6287,6 +6428,7 @@ mod tests {
             ("gitpulse_status", RepoArgs),
             ("gitpulse_active_changes", ActiveChangesArgs),
             ("gitpulse_collision_risk", RepoArgs),
+            ("gitpulse_merge_conflicts", RepoArgs),
             ("gitpulse_change_context", ChangeContextArgs),
             ("gitpulse_ledger_events", LedgerEventsArgs),
             ("gitpulse_task_view", TaskViewArgs),
@@ -6304,6 +6446,7 @@ mod tests {
             ("gitpulse_codeintel_dead_symbols", BudgetArgs),
             ("gitpulse_codeintel_suspects", SuspectsArgs),
             ("gitpulse_provenance", ProvenanceArgs),
+            ("gitpulse_landed", LandedArgs),
             ("devmap_status", RepoArgs),
             ("devmap_search", SearchArgs),
             ("devmap_dependencies", dm::DependenciesArgs),
@@ -6387,6 +6530,7 @@ mod tests {
                 ("gitpulse_status", RepoArgs),
                 ("gitpulse_active_changes", ActiveChangesArgs),
                 ("gitpulse_collision_risk", RepoArgs),
+                ("gitpulse_merge_conflicts", RepoArgs),
                 ("gitpulse_change_context", ChangeContextArgs),
                 ("gitpulse_ledger_events", LedgerEventsArgs),
                 ("gitpulse_task_view", TaskViewArgs),
@@ -6404,6 +6548,7 @@ mod tests {
                 ("gitpulse_codeintel_dead_symbols", BudgetArgs),
                 ("gitpulse_codeintel_suspects", SuspectsArgs),
                 ("gitpulse_provenance", ProvenanceArgs),
+                ("gitpulse_landed", LandedArgs),
                 ("devmap_status", RepoArgs),
                 ("devmap_search", SearchArgs),
                 ("devmap_dependencies", dm::DependenciesArgs),

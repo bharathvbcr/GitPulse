@@ -50,6 +50,7 @@ import type { TaskStatus } from "../workbench/vocabulary";
 import {
   deleteView,
   isSwimlane,
+  isTaskOrder,
   sanitizeBoards,
   saveView,
   setWipLimit,
@@ -57,6 +58,7 @@ import {
   type SaveViewResult,
   type SavedTaskView,
   type Swimlane,
+  type TaskOrder,
   type TaskViewSnapshot,
 } from "../ui/taskBoardViews";
 import { defaultHandoff, reconcileHandoff, sanitizeHandoff, type HandoffSettings } from "../workbench/taskHandoff";
@@ -200,6 +202,12 @@ export interface InterfacePrefs {
    * layout; `effectiveSwimlane` decides what the current layout can draw.
    */
   taskSwimlane: Swimlane;
+  /**
+   * How the Tasks board orders cards when no search ranks them: most urgent
+   * first (the default) or the board's own order, the only one a card can be
+   * moved within. Saved with a view, like the lanes.
+   */
+  taskOrder: TaskOrder;
   /**
    * Saved views and work-in-progress limits, per board (`boardKey`): the
    * global board, each workspace's and each repository's. Bounded and
@@ -351,6 +359,7 @@ const DEFAULTS: InterfacePrefs = {
   taskHiddenColumns: [],
   taskCardFields: [...DEFAULT_TASK_CARD_FIELDS],
   taskSwimlane: "none",
+  taskOrder: "priority",
   taskBoards: {},
   taskShowArchivedWorkspaces: true,
   taskQuickAddAssist: false,
@@ -500,6 +509,7 @@ function readPrefs(): InterfacePrefs {
       taskHiddenColumns: sanitizeHiddenStatuses(parsed.taskHiddenColumns),
       taskCardFields: sanitizeCardFields(parsed.taskCardFields),
       taskSwimlane: isSwimlane(parsed.taskSwimlane) ? parsed.taskSwimlane : DEFAULTS.taskSwimlane,
+      taskOrder: isTaskOrder(parsed.taskOrder) ? parsed.taskOrder : DEFAULTS.taskOrder,
       taskBoards: sanitizeBoards(parsed.taskBoards),
       taskShowArchivedWorkspaces: bool(
         parsed.taskShowArchivedWorkspaces,
@@ -705,6 +715,7 @@ function createInterfaceStore() {
         ),
       })),
     setTaskSwimlane: (lane: Swimlane) => patch({ taskSwimlane: isSwimlane(lane) ? lane : "none" }),
+    setTaskOrder: (order: TaskOrder) => patch({ taskOrder: isTaskOrder(order) ? order : DEFAULTS.taskOrder }),
     /** A column's work-in-progress limit on one board; null removes it. */
     setTaskWipLimit: (board: string, status: TaskStatus, limit: number | null) =>
       patch((prefs) => ({ taskBoards: setWipLimit(prefs.taskBoards, board, status, limit) })),
@@ -728,6 +739,7 @@ function createInterfaceStore() {
         taskLayout: view.layout,
         taskDensity: view.density,
         taskSwimlane: view.swimlane,
+        taskOrder: view.order,
         taskHiddenColumns: [...view.hiddenColumns],
         taskCardFields: [...view.cardFields],
       }),
@@ -752,6 +764,7 @@ function createInterfaceStore() {
         // Saved views and limits are the reader's records, not a view
         // setting, so resetting the view keeps them.
         taskSwimlane: DEFAULTS.taskSwimlane,
+        taskOrder: DEFAULTS.taskOrder,
         taskShowArchivedWorkspaces: DEFAULTS.taskShowArchivedWorkspaces,
         taskQuickAddAssist: DEFAULTS.taskQuickAddAssist,
         taskHandoff: defaultHandoff(),
