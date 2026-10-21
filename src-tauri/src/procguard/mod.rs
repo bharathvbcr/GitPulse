@@ -541,6 +541,82 @@ pub fn spawn(cmd: &mut Command, label: &str) -> io::Result<(Child, Registration)
     Ok((child, registration))
 }
 
+/// Puts a child GitPulse just spawned into the macOS background band: lowest
+/// CPU scheduling priority, throttled disk I/O, and throttled network I/O for
+/// sockets it opens afterwards. A no-op elsewhere.
+///
+/// The caller decides *whether* — `engine::git_cli` does, from the admission
+/// class, which is the single source of truth for "this work may be starved".
+/// This function never looks at who is asking, so a child it is not called for
+/// is never touched.
+///
+/// Why from the parent after the spawn rather than as a spawn attribute:
+/// `posix_spawnattr_set_qos_class_np` and `POSIX_SPAWN_DARWIN_BG` are private
+/// SPI (absent from the SDK's `spawn.h`), and `std` exposes no spawn attribute
+/// of its own. The only documented way to apply a band *inside* the child is a
+/// `pre_exec` hook calling `setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)`,
+/// which disqualifies the command from `std`'s `posix_spawn` fast path (see
+/// [`sys::prepare`] and `benches/process_spawn.rs`: +35% to +95% per spawn).
+/// So the band is applied with `setpriority(PRIO_DARWIN_PROCESS, pid,
+/// PRIO_DARWIN_BG)`. The `setpriority(2)` man page says only `who == 0` is
+/// supported for background state, but the kernel accepts a pid owned by the
+/// caller (that is what `taskpolicy -b -p <pid>` does), and
+/// `procguard::tests::a_background_band_child_is_demoted` pins the observable
+/// result so an OS that stops honouring it fails a test instead of silently
+/// leaving background children at full priority.
+///
+/// There is a short window between `posix_spawn` returning and this call in
+/// which the child runs at default priority; its descendants inherit the band
+/// from it. Sources read: the SDK's `<sys/resource.h>` (`PRIO_DARWIN_PROCESS`,
+/// `PRIO_DARWIN_BG`) and the `setpriority(2)` man page.
+pub fn enter_background_band(child: &Child) -> io::Result<BandOutcome> {
+    #[cfg(target_os = "macos")]
+    {
+        let pid = libc::id_t::from(child.id());
+        // SAFETY: plain syscall on an integer pid; no pointers.
+        let rc = unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, pid, libc::PRIO_DARWIN_BG) };
+        if rc == 0 {
+            return Ok(BandOutcome::Entered);
+        }
+        let error = io::Error::last_os_error();
+        // A child that already exited and was reaped has nothing left to
+        // demote; with a short-lived `git` that is an ordinary race.
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(BandOutcome::ChildGone);
+        }
+        Err(error)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = child;
+        Ok(BandOutcome::NotApplicable)
+    }
+}
+
+/// What [`enter_background_band`] did, so "demoted" and "nothing to demote" are
+/// not the same answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandOutcome {
+    /// The kernel accepted the demotion.
+    Entered,
+    /// The child had already exited and been reaped.
+    ChildGone,
+    /// This platform has no background band.
+    NotApplicable,
+}
+
+/// The scheduler priority `ps -o pri` reports for `pid`. `getpriority(2)` only
+/// answers background state for the caller's own pid, so a child is read with
+/// `ps`; the background band shows as the lowest value (4), default as 31.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn scheduler_priority_of(pid: u32) -> Option<i32> {
+    let out = Command::new("/bin/ps")
+        .args(["-o", "pri=", "-p", &pid.to_string()])
+        .output_locked()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
 /// What one [`reap_all`] did, in terms that separate what it verified from
 /// what it could not.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1322,6 +1398,50 @@ mod tests {
         );
         guard.kill_tree(&mut child);
         let _ = guard.reap(|| child.wait());
+    }
+
+    /// The band is what the OS reports, not what the call returned: `ps`
+    /// shows the lowest scheduler priority for a background-band process and a
+    /// default one far above it, and a child nobody asked about is not moved.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_background_band_child_is_demoted_and_a_sibling_is_not() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30").stdin(Stdio::null()).stdout(Stdio::null());
+        let (mut demoted, demoted_guard) = spawn(&mut cmd, "sleep").expect("spawn");
+        let (mut ordinary, ordinary_guard) = spawn(&mut cmd, "sleep").expect("spawn");
+
+        assert_eq!(
+            enter_background_band(&demoted).expect("enter the band"),
+            BandOutcome::Entered
+        );
+
+        let demoted_priority = scheduler_priority_of(demoted.id()).expect("priority");
+        let ordinary_priority = scheduler_priority_of(ordinary.id()).expect("priority");
+        demoted_guard.kill_tree(&mut demoted);
+        ordinary_guard.kill_tree(&mut ordinary);
+        let _ = demoted_guard.reap(|| demoted.wait());
+        let _ = ordinary_guard.reap(|| ordinary.wait());
+        assert!(demoted_priority < 10, "demoted child at {demoted_priority}");
+        assert!(
+            ordinary_priority > demoted_priority + 10,
+            "sibling at {ordinary_priority}, demoted at {demoted_priority}"
+        );
+    }
+
+    /// A short-lived `git` can be gone before the parent reaches it; that is
+    /// an ordinary race, not a failure to report.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn demoting_a_child_that_already_exited_is_not_an_error() {
+        let mut cmd = Command::new("true");
+        cmd.stdin(Stdio::null()).stdout(Stdio::null());
+        let (mut child, guard) = spawn(&mut cmd, "true").expect("spawn");
+        let _ = guard.reap(|| child.wait());
+        assert_eq!(
+            enter_background_band(&child).expect("a reaped child is not an error"),
+            BandOutcome::ChildGone
+        );
     }
 
     /// The capability a bare `Child::kill` does not have, and the reason the

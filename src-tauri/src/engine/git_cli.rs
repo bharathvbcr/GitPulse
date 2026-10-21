@@ -3014,6 +3014,11 @@ pub fn current_admission_name() -> &'static str {
 
 /// Runs `body` under `class`, restoring the previous class on return, error
 /// and unwinding, so a pooled worker never keeps a class into its next task.
+///
+/// Entering [`Admission::Background`] from another class also runs the thread
+/// at UTILITY QoS for the span (macOS; see `pools::UtilityScope`). The class is
+/// the one decision about whether work may be starved, so it drives the
+/// thread's scheduling class as well as the children's ([`runs_in_background_band`]).
 pub(crate) fn with_admission<T>(class: Admission, body: impl FnOnce() -> T) -> T {
     struct Restore(Admission);
     impl Drop for Restore {
@@ -3021,8 +3026,80 @@ pub(crate) fn with_admission<T>(class: Admission, body: impl FnOnce() -> T) -> T
             ADMISSION.set(self.0);
         }
     }
-    let _restore = Restore(ADMISSION.replace(class));
+    let previous = ADMISSION.replace(class);
+    let _restore = Restore(previous);
+    let _qos = (class == Admission::Background && previous != Admission::Background)
+        .then(crate::pools::UtilityScope::enter);
+    // User-facing work nested in a background scope gets the thread's own
+    // class back for its span, never more than the thread had outside.
+    let _user_facing = (class != Admission::Background && previous == Admission::Background)
+        .then(crate::pools::UserFacingScope::enter);
     body()
+}
+
+thread_local! {
+    /// Depth of [`with_background_band`] scopes on this thread.
+    static BAND_FORCED: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Runs `body` with every child it spawns in the background band whatever the
+/// admission class, for work that is background by what it is: `devmap build`
+/// is an index rebuild that has run at 50-78% CPU and 1.3 GB, and a user
+/// asking for one still does not want their typing to wait behind it.
+/// Admission is untouched, so the gate still admits it as its caller's class.
+pub(crate) fn with_background_band<T>(body: impl FnOnce() -> T) -> T {
+    struct Leave;
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            BAND_FORCED.set(BAND_FORCED.get() - 1);
+        }
+    }
+    BAND_FORCED.set(BAND_FORCED.get() + 1);
+    let _leave = Leave;
+    body()
+}
+
+static BAND_ENTERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BAND_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Logs and counts what putting a child in the background band did, so a
+/// refused demotion is visible to a test as well as to the log.
+fn note_band_outcome(label: &str, outcome: std::io::Result<crate::procguard::BandOutcome>) {
+    use crate::procguard::BandOutcome;
+    use std::sync::atomic::Ordering;
+    match outcome {
+        Ok(BandOutcome::Entered) => {
+            BAND_ENTERED.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(BandOutcome::ChildGone | BandOutcome::NotApplicable) => {}
+        Err(error) => {
+            BAND_FAILED.fetch_add(1, Ordering::Relaxed);
+            log::warn!(
+                target: "git_cli",
+                "{label}: could not enter the background band: {error}"
+            );
+        }
+    }
+}
+
+/// `(entered, failed)`: children demoted into the background band, and
+/// demotions the OS refused, since process start.
+#[cfg(test)]
+pub(crate) fn band_outcomes() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        BAND_ENTERED.load(Ordering::Relaxed),
+        BAND_FAILED.load(Ordering::Relaxed),
+    )
+}
+
+/// Whether a child spawned under `class` on this thread goes into the macOS
+/// background band: exactly the children of [`Admission::Background`], plus
+/// those inside [`with_background_band`]. A user action (`Interactive`) and a
+/// read someone is waiting on (`Reactive`) are never starved, so a mis-classed
+/// write is slow at worst, never throttled.
+fn runs_in_background_band(class: Admission) -> bool {
+    class == Admission::Background || BAND_FORCED.get() > 0
 }
 
 /// Runs `body` with background spawns waiting for budget (`awaits`) or shed
@@ -5072,6 +5149,13 @@ fn run_admitted_inner(
     // instead of orphaning them. See [`crate::procguard`].
     let (mut child, guard) =
         crate::procguard::spawn(cmd, label).map_err(|e| spawn_error(label, &e))?;
+    // Applied after the spawn so `std` keeps its `posix_spawn` fast path; the
+    // child runs unthrottled for the instant before this call. A refusal is
+    // logged and the child carries on at normal priority: failing a read
+    // because it could not be demoted would trade a result for a hint.
+    if runs_in_background_band(class) {
+        note_band_outcome(label, crate::procguard::enter_background_band(&child));
+    }
     #[cfg(test)]
     spawn_log::record(cmd);
 
@@ -12949,5 +13033,124 @@ mod admission_scope_tests {
         });
         assert_eq!(failures, 1);
         assert!(message.unwrap_or_default().contains("forced by test"));
+    }
+}
+
+/// The admission class decides which children and threads are starved.
+#[cfg(all(test, target_os = "macos"))]
+mod qos_band_tests {
+    use super::*;
+
+    /// Polls of 50 ms a child waits for its demotion. The parent applies it
+    /// right after the spawn, but a parent starved on a loaded host can take a
+    /// long while to get there (one run at load 20+ read "not demoted" after
+    /// a 10 s budget), and a probe that gives up first proves nothing.
+    const POLLS_TO_BE_DEMOTED: u32 = 1200;
+
+    /// A child that reports its own scheduler priority once the parent has
+    /// demoted it (the demotion lands just after the spawn), or after `waits`
+    /// polls of 50 ms when it never is. `ps` reports the background band as 4
+    /// and a default process far above 10.
+    fn priority_probe(waits: u32) -> Command {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(format!(
+            "i=0; p=; while [ $i -lt {waits} ]; do \
+             p=$(/bin/ps -o pri= -p $$ | tr -d ' '); \
+             [ \"$p\" -lt 10 ] && break; sleep 0.05; i=$((i+1)); done; \
+             /bin/ps -o pri= -p $$ | tr -d ' '"
+        ));
+        cmd
+    }
+
+    /// Runs a probe child under the current class and returns its priority,
+    /// the demotions that succeeded and the ones the OS refused meanwhile.
+    fn priority_and_outcomes(waits: u32) -> (i32, u64, u64) {
+        let (entered, failed) = band_outcomes();
+        let priority = priority_of_child(waits);
+        let (entered_after, failed_after) = band_outcomes();
+        (priority, entered_after - entered, failed_after - failed)
+    }
+
+    fn priority_of_child(waits: u32) -> i32 {
+        // A background spawn is shed when the shared budget is low; waiting
+        // for it makes the test about the band, not about the budget.
+        let run = with_background_budget_wait(true, || {
+            run_bounded(
+                priority_probe(waits),
+                "priority-probe",
+                crate::test_support::coverage_relaxed(Duration::from_secs(120)),
+                None,
+            )
+        })
+        .expect("probe ran");
+        String::from_utf8_lossy(&run.stdout)
+            .trim()
+            .parse()
+            .expect("priority")
+    }
+
+    #[test]
+    fn a_background_class_child_is_in_the_background_band() {
+        let (priority, entered, failed) = with_admission(Admission::Background, || {
+            priority_and_outcomes(POLLS_TO_BE_DEMOTED)
+        });
+        assert_eq!(failed, 0, "the OS refused a demotion");
+        assert!(entered >= 1, "no demotion succeeded");
+        assert!(priority < 10, "background child ran at priority {priority}");
+    }
+
+    /// The mis-classed write must never be starved: a user action and a plain
+    /// read both stay at default priority. The probe waits long enough that a
+    /// demotion applied after the spawn would have landed.
+    #[test]
+    fn a_user_action_child_is_not_in_the_background_band() {
+        for class in [Admission::Interactive, Admission::Reactive] {
+            let priority = with_admission(class, || priority_of_child(12));
+            assert!(
+                priority >= 10,
+                "{} child ran at priority {priority}",
+                class.name()
+            );
+        }
+    }
+
+    #[test]
+    fn the_background_band_scope_demotes_a_child_of_any_class() {
+        let (priority, entered, failed) = with_admission(Admission::Reactive, || {
+            with_background_band(|| priority_and_outcomes(POLLS_TO_BE_DEMOTED))
+        });
+        assert_eq!(failed, 0, "the OS refused a demotion");
+        assert!(entered >= 1, "no demotion succeeded");
+        assert!(priority < 10, "scoped child ran at priority {priority}");
+        let after = with_admission(Admission::Reactive, || priority_of_child(12));
+        assert!(after >= 10, "the scope leaked: priority {after}");
+    }
+
+    #[test]
+    fn background_scopes_run_the_thread_at_utility_and_give_it_back() {
+        use crate::pools::{current_thread_qos, QOS_UTILITY};
+        std::thread::spawn(|| {
+            let class = || current_thread_qos().expect("qos").0;
+            assert_ne!(class(), QOS_UTILITY);
+            with_background_processes(|| {
+                assert_eq!(class(), QOS_UTILITY);
+                // Nested background scope: unchanged, and its exit must not
+                // restore early.
+                with_background_processes(|| assert_eq!(class(), QOS_UTILITY));
+                assert_eq!(class(), QOS_UTILITY);
+            });
+            assert_ne!(class(), QOS_UTILITY);
+            with_admission(Admission::Interactive, || {
+                assert_ne!(class(), QOS_UTILITY);
+            });
+            let original = class();
+            with_background_processes(|| {
+                with_admission(Admission::Interactive, || assert_eq!(class(), original));
+                assert_eq!(class(), QOS_UTILITY);
+            });
+            assert_eq!(class(), original);
+        })
+        .join()
+        .expect("qos thread");
     }
 }
