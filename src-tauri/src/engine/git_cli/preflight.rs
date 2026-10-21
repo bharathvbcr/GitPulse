@@ -612,3 +612,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "preflight_adv_l1_tests.rs"]
+mod adv_l1_tests;

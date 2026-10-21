@@ -350,3 +350,7 @@ mod tests {
         assert_eq!(judged_push_argv(&plain), ["git", "push", "origin", "main"]);
     }
 }
+
+#[cfg(test)]
+#[path = "remote_adv_l1_tests.rs"]
+mod adv_l1_tests;

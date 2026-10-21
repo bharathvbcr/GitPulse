@@ -4547,3 +4547,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "adv_l1_tests.rs"]
+mod adv_l1_tests;

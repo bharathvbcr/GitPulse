@@ -7194,3 +7194,7 @@ mod bound_to_checked_state {
 #[cfg(test)]
 #[path = "git_writer_adv_tests.rs"]
 mod adv_tests;
+
+#[cfg(test)]
+#[path = "git_writer_adv_l1_tests.rs"]
+mod adv_l1_tests;
