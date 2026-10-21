@@ -722,3 +722,52 @@ mod tests {
         assert_eq!(parse_record(&read), LineOutcome::NoCalls);
     }
 }
+
+#[cfg(test)]
+mod adv2_under_tests {
+    use super::*;
+
+    #[test]
+    fn u01_the_fast_path_and_the_normaliser_agree_on_separator_shapes() {
+        for (path, root, want) in [
+            ("/w1/f", "/w1", true),
+            ("/w1x/f", "/w1", false),
+            ("/w1", "/w1/", true),
+            ("/w1/", "/w1", true),
+            ("//w1/f", "/w1", true),
+            ("/w1//f", "/w1", true),
+            ("/w1/./f", "/w1", true),
+            ("/w1/.", "/w1", true),
+            ("/w1/f/..", "/w1", true),
+            ("/w1/..f", "/w1", true),
+            ("/w1/.hidden", "/w1", true),
+            ("/w1/...", "/w1", true),
+            ("/w1x", "/w1/", false),
+            ("/", "/", true),
+            ("/a", "/", true),
+            ("/a", "/w1/..", true),
+            ("/w1/f", "/w1/f/", true),
+            ("/w1/f/", "/w1/f", true),
+        ] {
+            assert_eq!(under(path, root), want, "under({path:?}, {root:?})");
+        }
+    }
+
+    /// A relative root that normalises to nothing (`.`, `./`, `a/..`) becomes
+    /// the empty string and then "owns" every absolute path.
+    #[test]
+    fn u02_a_relative_root_that_normalises_to_empty_owns_nothing() {
+        for root in [".", "./", "a/..", "./."] {
+            assert!(
+                !under("/etc/passwd", root),
+                "under(\"/etc/passwd\", {root:?}) claims an absolute path for a relative root"
+            );
+        }
+    }
+
+    #[test]
+    fn u03_backslash_paths_are_never_under_by_the_documented_byte_rule() {
+        assert!(!under("C:\\w1\\f", "C:\\w1"));
+        assert!(!under("C:\\w1\\..\\w2", "C:\\w1"));
+    }
+}

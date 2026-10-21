@@ -2381,4 +2381,6 @@ mod transcript_bench_tests;
 mod walk_tests;
 
 #[cfg(test)]
+mod adv2_bench_tests;
+#[cfg(test)]
 mod adv_l5_tests;
