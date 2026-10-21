@@ -3182,11 +3182,28 @@ fn require_force_if_includes(
         return Ok(());
     }
     if preflight.status == GitPreflightStatus::Outdated {
-        return Err(
-            "Force push needs `--force-if-includes`, which requires Git 2.30 or newer, and this \
-             Git is older. Update Git, then restart GitPulse."
-                .into(),
-        );
+        // Outdated is relative to GitPulse's own floor, which is above 2.30:
+        // a 2.30 to 2.35 git has the flag and is refused for the floor.
+        let found = preflight
+            .version
+            .as_deref()
+            .and_then(crate::engine::git_cli::parse_git_version);
+        return Err(match found {
+            Some((major, minor, patch))
+                if (major, minor, patch) >= crate::engine::git_cli::FORCE_IF_INCLUDES =>
+            {
+                let (min_major, min_minor, _) = crate::engine::git_cli::MIN_GIT_VERSION;
+                format!(
+                    "Force push is refused because this Git ({major}.{minor}.{patch}) is below \
+                     GitPulse's minimum, Git {min_major}.{min_minor}. {} Update Git, then \
+                     restart GitPulse.",
+                    preflight.message.as_deref().unwrap_or_default()
+                )
+            }
+            _ => "Force push needs `--force-if-includes`, which requires Git 2.30 or newer, and \
+                  this Git is older. Update Git, then restart GitPulse."
+                .to_string(),
+        });
     }
     let detail = preflight
         .message
@@ -5898,6 +5915,20 @@ mod tests {
             err.contains("--force-if-includes") && err.contains("2.30") && err.contains("older"),
             "{err}"
         );
+        let below_floor =
+            require_force_if_includes(&probe(GitPreflightStatus::Outdated, "git version 2.34.1"))
+                .unwrap_err();
+        assert!(
+            below_floor.contains("2.34.1")
+                && below_floor.contains("minimum")
+                && !below_floor.contains("2.30")
+                && !below_floor.contains("older"),
+            "2.34.1 has the flag and must not be told it lacks it: {below_floor}"
+        );
+        let ancient =
+            require_force_if_includes(&probe(GitPreflightStatus::Outdated, "git version 2.29.0"))
+                .unwrap_err();
+        assert!(ancient.contains("--force-if-includes"), "{ancient}");
         assert!(
             require_force_if_includes(&probe(GitPreflightStatus::Ok, "git version 2.36.0")).is_ok()
         );

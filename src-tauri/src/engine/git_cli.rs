@@ -48,7 +48,8 @@ pub use preflight::{
     MIN_GIT_VERSION, MIN_SUBMODULE_GIT_VERSION,
 };
 pub(crate) use preflight::{
-    git_supports, supports, DIFF_MERGES_OPTION, FORCE_IF_INCLUDES, SINCE_AS_FILTER,
+    git_supports, parse_git_version, supports, DIFF_MERGES_OPTION, FORCE_IF_INCLUDES,
+    SINCE_AS_FILTER,
 };
 
 /// Shared grace window for pipe EOF after child exit. Unix closes unfinished
