@@ -95,7 +95,8 @@ OPTIONS:
 
 OUTPUT:
     One NDJSON object per repository per cycle on stdout:
-      {\"repo\":\"…\",\"cycle\":1,\"recorded\":3,\"transcripts\":2,\"skipped_lines\":0,
+      {\"repo\":\"…\",\"cycle\":1,\"recorded\":3,\"transcripts\":2,\"transcripts_listed\":2,\"transcripts_unlisted\":0,
+       \"walk_complete\":true,\"skipped_lines\":0,
        \"rehosted_calls\":0,\"departed_overflow\":0,\"family_unresolved\":false,
        \"family_unresolved_cycles\":0,
        \"reflog_entries\":7,\"failed_records\":0,\"reflog_pending\":0,
@@ -106,6 +107,11 @@ OUTPUT:
     known and not yet recorded (more than 200 since the last cycle, or behind a
     failed write); `failed_records` counts writes that failed. Either non-zero
     sets `truncated`, and the next cycle carries on from the same place.
+
+    `transcripts_unlisted` counts transcript files the corpus walk saw and did
+    not list (below its depth bound, or past its file cap): they were not read,
+    so it sets `truncated`, and `error` says how many and why. `walk_complete`
+    is false for such a walk, and null when none ran.
 
     `rehosted_calls` and `departed_overflow` count transcript calls that needed
     another worktree's transaction (past the per-pass worktree cap, or from
@@ -232,6 +238,13 @@ struct CycleReport {
     cycle: u64,
     recorded: i64,
     transcripts: i64,
+    /// Transcript files the corpus walk listed, and the ones it saw and left
+    /// unlisted (depth bound or file cap; unread, so `truncated` is set). A cycle
+    /// that read fewer than it saw says so here.
+    transcripts_listed: i64,
+    transcripts_unlisted: i64,
+    /// Whether the walk listed the whole corpus; null when none ran.
+    walk_complete: Option<bool>,
     skipped_lines: i64,
     /// Calls hosted past the participant cap, calls from removed worktrees past
     /// the per-pass bound, and whether the worktree family could not be
@@ -292,6 +305,9 @@ fn guarded_cycle(
                 recorded: 0,
                 transcripts: 0,
                 skipped_lines: 0,
+                transcripts_listed: 0,
+                transcripts_unlisted: 0,
+                walk_complete: None,
                 rehosted_calls: 0,
                 departed_overflow: 0,
                 family_unresolved: false,
@@ -333,6 +349,9 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
                 recorded: 0,
                 transcripts: 0,
                 skipped_lines: 0,
+                transcripts_listed: 0,
+                transcripts_unlisted: 0,
+                walk_complete: None,
                 rehosted_calls: 0,
                 departed_overflow: 0,
                 family_unresolved: false,
@@ -360,6 +379,9 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
         cycle,
         recorded: caught.recorded,
         transcripts: caught.transcripts,
+        transcripts_listed: caught.transcripts_listed,
+        transcripts_unlisted: caught.transcripts_unlisted,
+        walk_complete: caught.walk_complete,
         skipped_lines: caught.skipped_lines,
         rehosted_calls: caught.rehosted_calls,
         departed_overflow: caught.departed_overflow,
@@ -519,6 +541,9 @@ mod tests {
                         recorded: 1,
                         transcripts: 0,
                         skipped_lines: 0,
+                        transcripts_listed: 0,
+                        transcripts_unlisted: 0,
+                        walk_complete: None,
                         rehosted_calls: 0,
                         departed_overflow: 0,
                         family_unresolved: false,
@@ -867,6 +892,9 @@ mod tests {
             "cycle",
             "recorded",
             "transcripts",
+            "transcripts_listed",
+            "transcripts_unlisted",
+            "walk_complete",
             "skipped_lines",
             "rehosted_calls",
             "departed_overflow",

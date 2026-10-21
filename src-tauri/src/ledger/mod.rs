@@ -32,6 +32,7 @@ mod anchor;
 pub mod bindings;
 mod cap;
 mod consolidated;
+pub mod freshness;
 pub mod ids;
 pub mod redact;
 
@@ -41,6 +42,10 @@ pub(crate) use anchor::settle as settle_identity;
 pub use cap::ValueCut;
 pub(crate) use cap::{bound_evidence_json, ROW_FIELD_CAP_BYTES};
 use cap::{cap_object, ObjectCap, OBJECT_TRUNCATED_KEY};
+pub use freshness::{
+    freshness_readonly, freshness_readonly_at, record_catch_up, CatchUpRecord, CatchUpSummary,
+    Freshness, LedgerView, STALE_AFTER_SECS,
+};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -6319,3 +6324,6 @@ mod object_cap_tests;
 
 #[cfg(test)]
 mod adversarial_cap_tests;
+
+#[cfg(test)]
+mod adv_l5_tests;

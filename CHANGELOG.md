@@ -11,6 +11,38 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Ledger answers over MCP say how current and how whole they are.** Added
+  fields only; nothing is renamed or retyped.
+  - `gitpulse_ledger_events`, the `ledger` resource, `gitpulse_status` and the
+    insights ledger facet carry `as_of` (when the newest row was appended),
+    `last_catch_up` with its `last_catch_up_basis`, and `stale` with
+    `stale_reason` (no catch-up or recorded event within `stale_after_secs`,
+    600). An empty or unreadable ledger has `as_of: null` and is stale with the
+    reason; a clock set backwards is never reported fresh.
+  - `catch_up` carries what the last passes covered, including `skipped_lines`
+    and `transcripts_unlisted`. Each pass now leaves its outcome in the ledger's
+    existing `catch_up_state` table, so a read-only process can report it.
+  - `recording` is true only for a process that is writing. A read-only open
+    reports `recording: false` and `recording_state: "readable"`; `"unknown"`
+    means no ledger or one that could not be opened.
+  - `dropped` is labelled `dropped_scope: "this_process"`: a reader reports 0
+    whatever another process dropped.
+  - The ledger tool and resource carry the same `legacy_ledger_unconsolidated`
+    caveat as the status facets (`caveat`, `caveat_code`), and
+    `gitpulse_change_context` names the `as_of` of the ledger it read
+    (`ledger_freshness`).
+- **The transcript walk counts what it leaves out.** It now reads the
+  `slug/session/subagents/workflows/wf_*/agent-*.jsonl` layout (five
+  directories deep), guards against symlink loops by device and inode, and
+  reports `transcripts_listed`, `transcripts_unlisted` (split into `unlisted_depth` and
+  `unlisted_cap`) and `walk_complete`. A tree past the depth bound or the
+  5000-file cap marks the pass `truncated` with the reasons in `error`, in
+  `gitpulsed` output and in `gitpulse_status`, instead of reporting a complete
+  walk. A transcript's saved offset is still forgotten only after a walk that
+  listed everything.
+
 ### Changed
 
 - The minimum supported Git is now 2.36, up from 2.23, because worktree

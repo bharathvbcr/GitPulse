@@ -205,23 +205,59 @@ pub(crate) fn repository_status_readonly(
     repo_path: &str,
 ) -> Result<super::LedgerStatus, LedgerError> {
     let family = resolve_address(repo_path, repo_path)?;
+    Ok(readonly_status_of(&family))
+}
+
+fn readonly_status_of(family: &FamilyAddress) -> super::LedgerStatus {
     let mut status = super::status_readonly(&family.address.anchor);
     // A repository whose siblings still carry pre-consolidation ledgers has
     // rows this read cannot see. Saying so beats silently under-reporting, and
     // beats running the migration from a read to make the number right.
-    if status.recording
-        && family.members.iter().any(|member| {
-            member.as_path() != std::path::Path::new(&family.address.anchor)
-                && super::is_initialised(&member.to_string_lossy())
-        })
-    {
-        status.error =
-            "a sibling worktree still holds its own ledger; open this repository in GitPulse to \
-             consolidate. Events recorded there are not included here."
-                .to_string();
-        status.error_code = "legacy_ledger_unconsolidated".to_string();
+    if status.recording && legacy_unconsolidated(family) {
+        status.error = LEGACY_UNCONSOLIDATED_MESSAGE.to_string();
+        status.error_code = LEGACY_UNCONSOLIDATED_CODE.to_string();
     }
-    Ok(status)
+    status
+}
+
+/// [`repository_status_readonly`] as an MCP surface reports it: a
+/// [`super::LedgerView`] (never `recording`, scoped `dropped`) with the
+/// ledger's freshness, from one family resolution.
+pub(crate) fn repository_ledger_view(repo_path: &str) -> Result<super::LedgerView, LedgerError> {
+    let family = resolve_address(repo_path, repo_path)?;
+    let status = readonly_status_of(&family);
+    let freshness = super::freshness_readonly(&family.address.anchor);
+    Ok(super::LedgerView::from_readonly(status, freshness))
+}
+
+/// The `error_code` of a read that cannot see rows a sibling worktree's own
+/// ledger still holds.
+pub(crate) const LEGACY_UNCONSOLIDATED_CODE: &str = "legacy_ledger_unconsolidated";
+
+/// What that read says about itself. One text for every surface that carries
+/// the caveat: the status facets, the ledger tool and the ledger resource.
+pub(crate) const LEGACY_UNCONSOLIDATED_MESSAGE: &str =
+    "a sibling worktree still holds its own ledger; open this repository in GitPulse to \
+     consolidate. Events recorded there are not included here.";
+
+/// Whether a member of the family other than the anchor still has a ledger of
+/// its own, which the read-only paths do not consolidate.
+fn legacy_unconsolidated(family: &FamilyAddress) -> bool {
+    family.members.iter().any(|member| {
+        member.as_path() != std::path::Path::new(&family.address.anchor)
+            && super::is_initialised(&member.to_string_lossy())
+    })
+}
+
+/// [`repository_address_readonly`] with the legacy-unconsolidated caveat, from
+/// the one family resolution: `Some` carries [`LEGACY_UNCONSOLIDATED_MESSAGE`]
+/// when rows exist that the anchor's ledger does not include.
+pub(crate) fn repository_read_target(
+    repo_path: &str,
+) -> Result<(BindingAddress, Option<&'static str>), LedgerError> {
+    let family = resolve_address(repo_path, repo_path)?;
+    let caveat = legacy_unconsolidated(&family).then_some(LEGACY_UNCONSOLIDATED_MESSAGE);
+    Ok((family.address, caveat))
 }
 
 fn validate_task(anchor: &str, task_id: &str) -> Result<(), LedgerError> {

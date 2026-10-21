@@ -728,6 +728,75 @@ fn task_view_row_schema() -> Value {
     })
 }
 
+/// The properties a ledger answer carries about how current and how whole it
+/// is: [`crate::ledger::Freshness`] flattened into the object, shared by the
+/// status, insights and ledger-page schemas so the three cannot drift.
+fn freshness_properties() -> Value {
+    json!({
+        "as_of": { "type": ["string", "null"], "description": "`ts_utc` of the newest event row this read could see; null for an empty or unreadable ledger. When the newest row was appended, not the time of the event it describes." },
+        "last_catch_up": { "type": ["string", "null"], "description": "When the last catch-up pass completed, by `last_catch_up_basis`: `catch_up_state` is the newest completion a pass persisted; `newest_row` is a lower bound taken from the newest event row (no pass persisted, and blind to passes that found nothing to write); `none` is null." },
+        "last_catch_up_basis": { "type": "string", "enum": ["catch_up_state", "newest_row", "none"] },
+        "stale": { "type": "boolean", "description": "True when no evidence of a recorder (the newer of `last_catch_up` and `as_of`) is within `stale_after_secs`, when there is none, or when it cannot be trusted (future-dated, unparseable, unreadable). Never false for a read that could not run." },
+        "stale_reason": { "type": "string", "description": "Why `stale` is true; empty when false." },
+        "stale_after_secs": { "type": "integer" },
+        "freshness_ok": { "type": "boolean", "description": "False when the ledger could not be read to compute freshness; `stale` is then true." },
+        "freshness_error": { "type": "string" },
+        "catch_up": {
+            "type": ["object", "null"],
+            "description": "What the persisted catch-up passes covered, summed over worktrees; null when none persisted. `transcripts_unlisted` counts transcript files the corpus walk saw and did not list (depth bound or file cap); `skipped_lines` counts lines this build could not read. `truncated` is true when any pass was cut short or left files unlisted.",
+            "properties": {
+                "worktrees": { "type": "integer" },
+                "truncated": { "type": "boolean" },
+                "recorded": { "type": "integer" },
+                "transcripts": { "type": "integer" },
+                "transcripts_listed": { "type": "integer" },
+                "transcripts_unlisted": { "type": "integer" },
+                "skipped_lines": { "type": "integer" },
+                "failed_records": { "type": "integer" },
+                "error": { "type": "string" },
+                "stale_worktrees": { "type": "integer", "description": "Rows whose last completed pass is older than `stale_after_secs` (idle or removed worktrees): counted, left out of the figures. The figures are per ledger, not per worktree." },
+                "future_dated_worktrees": { "type": "integer", "description": "Rows dated in the future (a skewed clock): flagged, left out of the figures and of freshness." }
+            }
+        }
+    })
+}
+
+/// [`freshness_properties`] for a freshness block whose `freshness_error` can
+/// be a deferral (the read of the ledger's address was deferred under load), so
+/// it may carry the deferral fields.
+fn ledger_freshness_properties() -> Value {
+    let mut properties = freshness_properties();
+    properties["deferred"] = deferred_property();
+    properties["retry_after_ms"] = retry_after_property();
+    properties
+}
+
+/// One property of [`freshness_properties`], for a schema that lists them
+/// beside its own.
+fn freshness_field(name: &str) -> Value {
+    freshness_properties()[name].clone()
+}
+
+/// The `ledger` facet of `gitpulse_status` and `gitpulse_insights`
+/// ([`crate::ledger::LedgerStatus`]): deferral fields, the fields it always
+/// had, and the additive honesty fields.
+fn ledger_facet_output() -> Value {
+    let mut facet = deferrable_object();
+    if let (Some(target), Some(extra)) = (
+        facet["properties"].as_object_mut(),
+        freshness_properties().as_object(),
+    ) {
+        for (key, value) in extra {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    facet["properties"]["recording"] = json!({ "type": "boolean", "description": "True only when this process is writing the ledger. Never true from a read-only open: see `recording_state`." });
+    facet["properties"]["recording_state"] = json!({ "type": "string", "enum": ["readable", "unknown"], "description": "`readable`: the ledger opened read-only, so its rows can be read; who is recording is not known. `unknown`: no ledger, or it could not be opened (see `error`)." });
+    facet["properties"]["dropped"] = json!({ "type": "integer", "description": "Appends dropped by THIS process; see `dropped_scope`." });
+    facet["properties"]["dropped_scope"] = json!({ "type": "string", "enum": ["this_process"], "description": "Drops are counted in memory per process. A reader that never appends reports 0 whatever another process dropped; 0 is never \"nothing was dropped anywhere\"." });
+    facet
+}
+
 /// An open object facet that can carry the deferral fields.
 fn deferrable_object() -> Value {
     json!({
@@ -837,7 +906,7 @@ fn build_tools() -> Vec<Value> {
                     "agents": agents_output(),
                     "changes": deferrable_object(),
                     "collisions": collision_risk_output(),
-                    "ledger": deferrable_object(),
+                    "ledger": ledger_facet_output(),
                     "codeintel": { "type": "object" }
                 },
                 "required": ["repo_path", "worktrees", "agents", "changes", "collisions", "ledger", "codeintel"]
@@ -853,7 +922,7 @@ fn build_tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "repo_path": { "type": "string" },
-                    "ledger": { "type": "object" },
+                    "ledger": ledger_facet_output(),
                     "codeintel": { "type": "object" },
                     "worktrees": { "type": "object" }
                 },
@@ -965,6 +1034,11 @@ fn build_tools() -> Vec<Value> {
                     "operation": { "type": ["object", "null"] },
                     "operation_ok": { "type": "boolean" },
                     "operation_error": { "type": "string" },
+                    "ledger_freshness": {
+                        "type": "object",
+                        "description": "How current the ledger data this context read is: `as_of` is the `ts_utc` of the newest row it could see (null when none), with the same `stale` and `last_catch_up` as the ledger tool.",
+                        "properties": ledger_freshness_properties()
+                    },
                     "deferred": deferred_property(),
                     "retry_after_ms": retry_after_property()
                 },
@@ -974,7 +1048,7 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_ledger_events",
             "Ledger events",
-            "Read durable ledger event history (actor, tool, verdict, changes), oldest first from `cursor` by default. `order: \"desc\"` returns the newest first (`{order: \"desc\", limit: 5}` is the five newest, read by index without paging older rows); `since_ts`, `action`, `object`, `worktree_path`, `task_id`, `session_id` and `after_ref` filter by exact value and combine with AND; `since_ts`, `action`, `task_id` and `session_id` are index-backed, while `object`, `worktree_path` and `after_ref` are not: they walk the ledger newest-first or oldest-first and stop at `limit` matches, so one that matches nothing reads the whole ledger (an event time filter is not offered: event time rides in `detail_json`, not in a column). Page by passing the last `id` you saw back as `cursor` (an upper bound when `order` is `desc`); `truncated` says whether more follow. `ts_utc` is when the row was appended; `detail_json.occurred_at` carries event time when the source knew it, with `occurred_at_basis` (`ingest` means `occurred_at` is the ingest time, the source gave none that could be trusted) and, for transcript and reflog rows, `task_basis` (`bound`, `unbound` or `unresolved`) for how `task_id` was decided. On transcript rows `occurred_at` comes from the agent-written transcript, so task attribution there is as trustworthy as the transcript itself, not an authority. A page is also bounded in bytes (about 1 MiB), so it can hold fewer rows than `limit` with `truncated` true: continue from `next_cursor`. A field too long to return is cut, and says so inside its value (`detail_json.gitpulse_truncated`, `detail_json.object_truncated` for `object`, or a `…[truncated N bytes]` suffix). A `verdict_json` has no room for a marker, so a cut one (long strings shortened, array tails and trailing object members dropped, never a new member or a changed kind) is recorded in the row's `verdict_truncated` (`{elements_dropped, members_dropped, strings_cut, bytes}`, null when whole); `detail_json` is returned as stored apart from its own length cut.",
+            "Read durable ledger event history (actor, tool, verdict, changes), oldest first from `cursor` by default. `order: \"desc\"` returns the newest first (`{order: \"desc\", limit: 5}` is the five newest, read by index without paging older rows); `since_ts`, `action`, `object`, `worktree_path`, `task_id`, `session_id` and `after_ref` filter by exact value and combine with AND; `since_ts`, `action`, `task_id` and `session_id` are index-backed, while `object`, `worktree_path` and `after_ref` are not: they walk the ledger newest-first or oldest-first and stop at `limit` matches, so one that matches nothing reads the whole ledger (an event time filter is not offered: event time rides in `detail_json`, not in a column). Page by passing the last `id` you saw back as `cursor` (an upper bound when `order` is `desc`); `truncated` says whether more follow. `ts_utc` is when the row was appended; `detail_json.occurred_at` carries event time when the source knew it, with `occurred_at_basis` (`ingest` means `occurred_at` is the ingest time, the source gave none that could be trusted) and, for transcript and reflog rows, `task_basis` (`bound`, `unbound` or `unresolved`) for how `task_id` was decided. On transcript rows `occurred_at` comes from the agent-written transcript, so task attribution there is as trustworthy as the transcript itself, not an authority. A page is also bounded in bytes (about 1 MiB), so it can hold fewer rows than `limit` with `truncated` true: continue from `next_cursor`. A field too long to return is cut, and says so inside its value (`detail_json.gitpulse_truncated`, `detail_json.object_truncated` for `object`, or a `…[truncated N bytes]` suffix). A `verdict_json` has no room for a marker, so a cut one (long strings shortened, array tails and trailing object members dropped, never a new member or a changed kind) is recorded in the row's `verdict_truncated` (`{elements_dropped, members_dropped, strings_cut, bytes}`, null when whole); `detail_json` is returned as stored apart from its own length cut. Every answer says how current it is: `as_of` (when the newest row was appended), `last_catch_up` (with its `last_catch_up_basis`), `stale` with `stale_reason` (true when no recorder has been seen within `stale_after_secs`; nothing launches gitpulsed by itself, so a stale ledger may simply be un-ingested), and `catch_up` (what the last passes covered, including `skipped_lines` and `transcripts_unlisted`). `caveat` is non-empty when rows exist that this read cannot include (`legacy_ledger_unconsolidated`).",
             LedgerEventsArgs::properties(),
             &LedgerEventsArgs::required(),
             json!({
@@ -1005,7 +1079,24 @@ fn build_tools() -> Vec<Value> {
                     "next_cursor": {
                         "type": ["integer", "null"],
                         "description": "Id of the last event returned; null when this page is empty, so there is nothing further to continue from yet."
-                    }
+                    },
+                    "as_of": freshness_field("as_of"),
+                    "last_catch_up": freshness_field("last_catch_up"),
+                    "last_catch_up_basis": freshness_field("last_catch_up_basis"),
+                    "stale": freshness_field("stale"),
+                    "stale_reason": freshness_field("stale_reason"),
+                    "stale_after_secs": freshness_field("stale_after_secs"),
+                    "freshness_ok": freshness_field("freshness_ok"),
+                    "freshness_error": freshness_field("freshness_error"),
+                    "catch_up": freshness_field("catch_up"),
+                    "caveat": { "type": "string", "description": "Non-empty when this answer cannot include every row: today, a sibling worktree still holds its own pre-consolidation ledger (`caveat_code` `legacy_ledger_unconsolidated`). Empty when there is none." },
+                    "caveat_code": { "type": "string" },
+                    "recording": { "type": "boolean", "description": "Always false here: this read-only answer is not a recorder." },
+                    "recording_state": { "type": "string", "enum": ["readable", "unknown"] },
+                    "path": { "type": "string" },
+                    "dropped": { "type": "integer", "description": "Appends dropped by THIS process; see `dropped_scope`." },
+                    "dropped_scope": { "type": "string", "enum": ["this_process"] },
+                    "catch_up_failures": { "type": "integer" }
                 },
                 "required": ["ok", "events", "returned", "truncated"]
             }),
@@ -1625,6 +1716,30 @@ fn read_address(
     .map_err(|error| error.to_string())
 }
 
+/// [`read_address`] plus the legacy-unconsolidated caveat, from one family
+/// resolution, for the reads that report what they could not see.
+fn read_target(
+    repo: &str,
+    retry: &DeferralRetry<'_>,
+) -> Result<
+    (
+        crate::ledger::bindings::BindingAddress,
+        Option<&'static str>,
+    ),
+    String,
+> {
+    retry_once_on_deferral(
+        || crate::ledger::bindings::repository_read_target(repo),
+        |result| {
+            result
+                .as_ref()
+                .is_err_and(|error| error.code == crate::ledger::bindings::DEFERRED_WORKTREE)
+        },
+        retry,
+    )
+    .map_err(|error| error.to_string())
+}
+
 fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
     // The schema refuses what it can say (bounds, enums, unknown keys); `parse`
     // then reads the accepted call into the tool's struct, and refuses what the
@@ -1635,7 +1750,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
         "gitpulse_insights" => {
             let a: RepoArgs = parse(name, arguments)?;
             Ok(with_production_retry(|retry| {
-                read_insights(|| json!(insights::snapshot(&a.repo_path)), retry)
+                read_insights(|| resources::insights_document(&a.repo_path), retry)
             }))
         }
         "gitpulse_status" => {
@@ -1890,7 +2005,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
 const NO_BOARD: &str = "GitPulse has no task board on this machine yet: nothing has been filed.";
 
 fn ledger_events(a: LedgerEventsArgs) -> Result<Value, String> {
-    let address = with_production_retry(|retry| read_address(&a.repo_path, retry))?;
+    let (address, caveat) = with_production_retry(|retry| read_target(&a.repo_path, retry))?;
     // `tail` pages *forward* from a cursor — deliberately, so a
     // consumer holding the last id it saw gets the same answer whether
     // it has been listening for an hour or just opened. This tool
@@ -1929,6 +2044,7 @@ fn ledger_events(a: LedgerEventsArgs) -> Result<Value, String> {
             session_id: a.session_id,
             after_ref: a.after_ref,
         },
+        caveat,
     )
 }
 
@@ -7571,3 +7687,9 @@ mod deferral_retry_tests {
         assert_eq!(harness.sleeps.borrow().len(), 1);
     }
 }
+
+#[cfg(test)]
+mod ledger_honesty_tests;
+
+#[cfg(test)]
+mod adv_l5_tests;

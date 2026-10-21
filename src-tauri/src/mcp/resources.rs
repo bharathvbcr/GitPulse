@@ -316,14 +316,52 @@ pub fn ledger_page(anchor: &str, cursor: i64, limit: u32) -> Result<Value, Strin
             limit,
             ..crate::ledger::EventQuery::default()
         },
+        None,
     )
+}
+
+/// What every ledger answer says about how current and how whole it is,
+/// merged into the page: the [`crate::ledger::Freshness`] fields (`as_of`,
+/// `last_catch_up`, `stale`, the last catch-up's counts including
+/// `skipped_lines`) and the legacy-unconsolidated caveat, which is the same
+/// text `status_readonly` carries (`caveat`, with its `caveat_code`; both
+/// empty when there is none). A page with rows and no such block reads as
+/// "this is everything, as of now", which nothing here can promise.
+fn with_freshness(mut page: Value, anchor: &str, caveat: Option<&str>) -> Value {
+    // The same view the status and insights facets serialize, minus the two
+    // fields the page already spends on its own `error`.
+    let view = json!(crate::ledger::LedgerView::from_readonly(
+        crate::ledger::status_readonly(anchor),
+        crate::ledger::freshness_readonly(anchor),
+    ));
+    if let (Some(page), Some(fields)) = (page.as_object_mut(), view.as_object()) {
+        for (key, value) in fields {
+            if key != "error" && key != "error_code" {
+                page.insert(key.clone(), value.clone());
+            }
+        }
+        page.insert("caveat".into(), json!(caveat.unwrap_or_default()));
+        page.insert(
+            "caveat_code".into(),
+            json!(if caveat.is_some() {
+                crate::ledger::bindings::LEGACY_UNCONSOLIDATED_CODE
+            } else {
+                ""
+            }),
+        );
+    }
+    page
 }
 
 /// [`ledger_page`] for a filtered, ordered query: the same bounds and the same
 /// `truncated` / `next_cursor` contract, in the query's own order. In newest
 /// first order `next_cursor` is the lowest id returned, to be passed back as
 /// the next query's `before`.
-pub fn ledger_query_page(anchor: &str, query: &crate::ledger::EventQuery) -> Result<Value, String> {
+pub fn ledger_query_page(
+    anchor: &str,
+    query: &crate::ledger::EventQuery,
+    caveat: Option<&str>,
+) -> Result<Value, String> {
     match crate::ledger::query_readonly_page(anchor, query, crate::ledger::PAGE_MAX_BYTES)
         .map_err(|e| e.to_string())?
     {
@@ -348,23 +386,46 @@ pub fn ledger_query_page(anchor: &str, query: &crate::ledger::EventQuery) -> Res
                     row
                 })
                 .collect();
-            Ok(json!({
-                "ok": true,
-                "returned": events.len(),
-                "truncated": truncated,
-                "next_cursor": next_cursor,
-                "events": events,
-            }))
+            Ok(with_freshness(
+                json!({
+                    "ok": true,
+                    "returned": events.len(),
+                    "truncated": truncated,
+                    "next_cursor": next_cursor,
+                    "events": events,
+                }),
+                anchor,
+                caveat,
+            ))
         }
         // No ledger is not an empty ledger, and must not read as one.
-        None => Ok(json!({
-            "ok": false,
-            "error": "no ledger in this repository yet; nothing has been recorded",
-            "returned": 0,
-            "truncated": false,
-            "events": [],
-        })),
+        None => Ok(with_freshness(
+            json!({
+                "ok": false,
+                "error": "no ledger in this repository yet; nothing has been recorded",
+                "returned": 0,
+                "truncated": false,
+                "events": [],
+            }),
+            anchor,
+            caveat,
+        )),
     }
+}
+
+/// The insights snapshot as MCP reports it: the in-process snapshot (which the
+/// hooks consume as it is) with its `ledger` facet replaced by the honest
+/// [`crate::ledger::LedgerView`]: never `recording`, `dropped` scoped, with
+/// freshness.
+pub fn insights_document(repo: &str) -> Value {
+    let snapshot = crate::insights::snapshot(repo);
+    let view = crate::ledger::LedgerView::from_readonly(
+        snapshot.ledger.clone(),
+        crate::insights::ledger_freshness(repo),
+    );
+    let mut document = json!(snapshot);
+    document["ledger"] = json!(view);
+    document
 }
 
 /// The composed repository status document.
@@ -380,8 +441,8 @@ pub fn status_document(repo: &str) -> Result<Value, String> {
     // is refused whole. A ledger that exists but cannot be read is not that —
     // `status_readonly` reports it inside the ledger facet (`recording: false`
     // plus `error`), so the worktree and code-graph facets still answer.
-    let ledger_status = crate::ledger::bindings::repository_status_readonly(repo)
-        .map_err(|error| error.to_string())?;
+    let ledger_status =
+        crate::ledger::bindings::repository_ledger_view(repo).map_err(|error| error.to_string())?;
     let codeintel_status = crate::codeintel::status(repo);
     let worktrees = match crate::engine::worktree::list_worktrees_scanned(
         repo,
@@ -428,18 +489,25 @@ pub fn status_document(repo: &str) -> Result<Value, String> {
     }))
 }
 
-fn repo_facet(facet: &str, repo: &str) -> Result<Value, ReadError> {
+pub(super) fn repo_facet(facet: &str, repo: &str) -> Result<Value, ReadError> {
     match facet {
-        "insights" => Ok(json!(crate::insights::snapshot(repo))),
+        "insights" => Ok(insights_document(repo)),
         "status" => status_document(repo).map_err(ReadError::Internal),
         "collisions" => Ok(json!(crate::insights::collision_risk(repo))),
         "changes" => Ok(json!(crate::insights::active_changes(repo, None, None))),
         "context" => Ok(json!(crate::insights::change_context(repo, None))),
         "ledger" => {
-            let address = crate::ledger::bindings::repository_address_readonly(repo)
+            let (address, caveat) = crate::ledger::bindings::repository_read_target(repo)
                 .map_err(|error| ReadError::Internal(error.to_string()))?;
-            ledger_page(&address.anchor, 0, super::LEDGER_DEFAULT_LIMIT)
-                .map_err(ReadError::Internal)
+            ledger_query_page(
+                &address.anchor,
+                &crate::ledger::EventQuery {
+                    limit: super::LEDGER_DEFAULT_LIMIT,
+                    ..crate::ledger::EventQuery::default()
+                },
+                caveat,
+            )
+            .map_err(ReadError::Internal)
         }
         "tasks" => {
             let address = crate::ledger::bindings::repository_address_readonly(repo)
@@ -820,5 +888,25 @@ mod tests {
         );
         assert!(status["worktrees"].is_object(), "{status}");
         assert!(status["codeintel"].is_object(), "{status}");
+        // A ledger that could not be read is never reported fresh.
+        assert_eq!(status["ledger"]["recording_state"], "unknown", "{status}");
+        assert_eq!(status["ledger"]["stale"], true, "{status}");
+        assert_eq!(status["ledger"]["freshness_ok"], false, "{status}");
+        assert!(status["ledger"]["as_of"].is_null(), "{status}");
+    }
+
+    #[test]
+    fn the_status_ledger_facet_is_readable_never_recording_and_labels_dropped() {
+        let (_dir, repo) = trusted_repo();
+        record_events(&repo, 1);
+
+        let status = status_document(&repo).expect("status");
+
+        let ledger = &status["ledger"];
+        assert_eq!(ledger["recording"], false, "{ledger}");
+        assert_eq!(ledger["recording_state"], "readable", "{ledger}");
+        assert_eq!(ledger["dropped_scope"], "this_process", "{ledger}");
+        assert!(ledger["as_of"].is_string(), "{ledger}");
+        assert_eq!(ledger["stale"], false, "{ledger}");
     }
 }

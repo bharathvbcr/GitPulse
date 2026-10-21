@@ -114,6 +114,10 @@ Resources use `gitpulse://<facet>{+repo_path}`; `gitpulse://server/manifest` des
 - Treat `walk_incomplete` / truncation fields as "floor, not complete" — the same honesty rule the Diff and Map panels enforce.
 - Agent worktrees are recognised from `/.<agent>/worktrees/` layout, never from a branch name.
 - Read every facet's `ok` / `error` / `available` field. Empty + `ok: false` means the check did not run.
+- A ledger answer (`gitpulse_ledger_events`, the `ledger` resource, the `ledger` facet of `gitpulse_status` and `gitpulse_insights`) says how current it is. `as_of` is when the newest row was appended (null for an empty or unreadable ledger). `last_catch_up` is when a catch-up pass last completed, with the method in `last_catch_up_basis`: `catch_up_state` (a pass persisted it), `newest_row` (a lower bound from the newest row), or `none`. `stale: true` means no catch-up or recorded event within `stale_after_secs` (600): nothing launches `gitpulsed` for you, so a stale ledger is often just un-ingested. `catch_up` carries what the last passes covered, including `skipped_lines` and `transcripts_unlisted`.
+- `recording` is true only for a process that is writing the ledger. The MCP server only reads, so it reports `recording: false` with `recording_state: "readable"`; `"unknown"` means no ledger or one that could not be opened. `dropped` counts appends dropped by the answering process only (`dropped_scope: "this_process"`): 0 from a reader is not "nothing was dropped anywhere".
+- `caveat` / `caveat_code` (`legacy_ledger_unconsolidated`) on the ledger tool and resource, and `error` on the status facets, mean a sibling worktree still holds its own ledger: open the repository in GitPulse to consolidate. Rows recorded there are not in the answer.
+- `gitpulse_change_context` names the ledger it read in `ledger_freshness` (same fields; `as_of` is the one to cite).
 
 ## Headless catch-up
 

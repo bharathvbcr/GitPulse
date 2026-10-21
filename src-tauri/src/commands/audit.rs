@@ -114,8 +114,14 @@ fn catch_up_before_binding(
 /// this one stopped, so a bind over a long log is not a failed one. A deadline
 /// that cut the pass, a failed write or any other error is not partial.
 fn is_partial(found: &crate::ingest::CatchUp) -> bool {
-    let backlog =
-        found.reflog_pending > 0 || found.reflog_unreached || found.reflog_refs_skipped > 0;
+    // Transcripts the walk left unlisted are a standing, counted condition of
+    // the corpus, not a failed pass: they are visible as unlisted counts, and
+    // a bind must not add a failure for them every time it runs.
+    let backlog = found.reflog_pending > 0
+        || found.reflog_unreached
+        || found.reflog_refs_skipped > 0
+        || found.transcripts_unlisted > 0
+        || found.unlisted_lower_bound;
     found.truncated
         && backlog
         && found.failed_records == 0
@@ -155,6 +161,7 @@ fn catch_up_note(
         "partial": partial,
         "truncated": found.truncated,
         "recorded": found.recorded,
+        "transcripts_unlisted": found.transcripts_unlisted,
         "failed_records": found.failed_records,
         "reflog_pending": found.reflog_pending,
         "error": if nothing_to_read {
