@@ -186,37 +186,65 @@ fn adv_l1_unicode_dashes_and_branch_slot_flags_do_not_become_options() {
 /// remote slot is only checked for the FIRST non-flag word, so `origin +main`
 /// is a force push with no lease. Predates the lane.
 #[test]
-#[ignore = "BROKEN (predates the lane): `push origin +main` force-pushes with no lease"]
 fn adv_l1_plus_refspec_in_the_branch_slot_is_a_force_push_without_a_lease() {
     let pair = pair();
     let theirs = diverge(&pair);
-    let result = run(&pair, &["push", "origin", "+main"]);
-    let after = tip(pair.origin.path());
-    assert!(
-        result.is_err() && after == theirs,
-        "BROKEN: `push origin +main` overwrote origin/main ({theirs} -> {after}): {result:?}"
-    );
+    for refspec in ["+main", ":main", "a:b", "main:main", "+HEAD:main"] {
+        let result = run(&pair, &["push", "origin", refspec]);
+        let after = tip(pair.origin.path());
+        assert!(
+            result.is_err() && after == theirs,
+            "`push origin {refspec}` overwrote origin/main ({theirs} -> {after}): {result:?}"
+        );
+    }
 }
 
 /// Same hole through the planner a caller reaches: `branch = "+main"`.
 #[test]
-#[ignore = "BROKEN (predates the lane): plan_push accepts branch +main"]
 fn adv_l1_plan_push_refuses_a_plus_branch() {
     let pair = pair();
-    let planned = GitWriter::plan_push(&path(&pair.work), Some("origin"), Some("+main"), false);
-    assert!(
-        planned.is_err(),
-        "BROKEN: plan_push accepted branch +main: {planned:?}"
-    );
+    for branch in ["+main", ":main", "a:b"] {
+        for remote in [Some("origin"), None] {
+            let planned = GitWriter::plan_push(&path(&pair.work), remote, Some(branch), false);
+            let message = planned.expect_err(branch);
+            // `+` is the one refspec shape the ref-name rules allow, so it is
+            // the one that carries the refspec explanation; `:` is refused
+            // earlier as a character git forbids in ref names.
+            if branch.starts_with('+') {
+                assert!(message.contains("refspec"), "{branch}: {message}");
+            }
+        }
+    }
 }
 
-/// The force guard has one input, a bool, so an old git, a shed probe and a
-/// timed-out probe produce the same refusal, which tells a user on a current
-/// git to update it. Pinned as the current behaviour.
+/// An old git is told to update; a git that could not be probed is told the
+/// version could not be checked, and a shed probe keeps its deferral shape so
+/// the retry classifier reads it as `deferred_under_load`.
 #[test]
 fn adv_l1_the_force_refusal_cannot_tell_an_old_git_from_an_unprobed_one() {
-    let message = require_force_if_includes(false).unwrap_err();
-    assert!(message.contains("2.30"), "{message}");
-    assert!(message.contains("could not be checked"), "{message}");
-    assert!(message.contains("Update Git"), "{message}");
+    use crate::engine::git_cli::{is_deferred_under_load, GitPreflight, GitPreflightStatus};
+    let answer = |status, message: &str| GitPreflight {
+        status,
+        version: None,
+        message: Some(message.to_string()),
+    };
+    let old =
+        require_force_if_includes(&answer(GitPreflightStatus::Outdated, "too old")).unwrap_err();
+    assert!(old.contains("2.30") && old.contains("Update Git"), "{old}");
+    assert!(!old.contains("could not be checked"), "{old}");
+
+    for status in [GitPreflightStatus::Broken, GitPreflightStatus::Missing] {
+        let unknown = require_force_if_includes(&answer(status, "xcrun: error")).unwrap_err();
+        assert!(unknown.contains("could not be checked"), "{unknown}");
+        assert!(!unknown.contains("older"), "{unknown}");
+        assert!(!is_deferred_under_load(&unknown), "{unknown}");
+    }
+
+    let shed = "git version deferred under load after 1.500s: too many git processes";
+    let deferred = require_force_if_includes(&answer(
+        GitPreflightStatus::Unchecked,
+        &format!("Git could not be checked yet: {shed}"),
+    ))
+    .unwrap_err();
+    assert!(is_deferred_under_load(&deferred), "{deferred}");
 }

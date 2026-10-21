@@ -47,7 +47,9 @@ pub use preflight::{
     git_preflight, require_git_for_clone, GitPreflight, GitPreflightStatus, MIN_CLONE_GIT_VERSION,
     MIN_GIT_VERSION, MIN_SUBMODULE_GIT_VERSION,
 };
-pub(crate) use preflight::{git_supports, DIFF_MERGES_OPTION, FORCE_IF_INCLUDES, SINCE_AS_FILTER};
+pub(crate) use preflight::{
+    git_supports, supports, DIFF_MERGES_OPTION, FORCE_IF_INCLUDES, SINCE_AS_FILTER,
+};
 
 /// Shared grace window for pipe EOF after child exit. Unix closes unfinished
 /// descriptors; Windows cancels workers and retains their resource slots until

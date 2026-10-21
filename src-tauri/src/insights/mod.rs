@@ -1116,6 +1116,13 @@ pub struct FleetCommitStats {
     /// True when [`MAX_FLEET_COMMITS`] stopped the walk. Every count above is
     /// then a floor, and a caller that renders it as a total is presenting a
     /// capped sample as complete coverage.
+    ///
+    /// What true means depends on the git. From 2.37 (`--since-as-filter`)
+    /// only in-window commits count toward the cap, so true means the window
+    /// itself hit it. Below 2.37 the walk has no date bound, history older
+    /// than the window spends the cap, and true means "the count bound was
+    /// hit; the window may be cut". It can be true for a long history whose
+    /// whole window was seen, and is never false for a window that was cut.
     pub truncated: bool,
 }
 
@@ -1166,10 +1173,11 @@ fn bucket_commit_log(text: &str, anchor_epoch: i64, window_days: u32) -> FleetCo
         };
         parsed += 1;
         // The walk covers all of history up to the cap, so most rows are older
-        // than the window. Anything outside it — including a commit stamped in
-        // the future by a skewed clock — is dropped from every count rather
-        // than folded into an edge bucket, so `commits` and `daily` always
-        // describe the same population.
+        // than the window. A row older than the window is dropped from every
+        // count rather than folded into the oldest bucket, so `commits` and
+        // `daily` always describe the same population. A commit stamped in the
+        // future by a skewed clock is the opposite case: it is counted, in the
+        // newest bucket (`age <= 0` below).
         //
         // Saturating, not plain subtraction: `%ct` is parsed as an i64, and a
         // corrupt stamp near the type's floor would overflow — a panic in a

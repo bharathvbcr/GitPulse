@@ -2078,9 +2078,18 @@ Unset the local override with `git config --local --unset-all user.name` and \
             );
         }
         if forced[0] {
-            require_force_if_includes(crate::engine::git_cli::git_supports(
-                crate::engine::git_cli::FORCE_IF_INCLUDES,
-            ))?;
+            require_force_if_includes(&crate::engine::git_cli::git_preflight())?;
+        }
+        // Positionals are `<remote> [<branch>]`. The branch slot is a plain
+        // branch name: git reads `+x` and `src:dst` there as refspecs, and
+        // `+` is a per-ref force with no lease.
+        for branch in args
+            .iter()
+            .skip(1)
+            .filter(|arg| arg.as_str() != "-u" && !FORCE_PUSH_FLAGS.contains(&arg.as_str()))
+            .skip(1)
+        {
+            validate_push_branch(branch)?;
         }
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
@@ -3159,16 +3168,52 @@ const FORCE_PUSH_FLAGS: [&str; 2] = ["--force-with-lease", "--force-if-includes"
 
 /// Fails closed: a force push without `--force-if-includes` is the unsafe
 /// shape, so a git that lacks it, or could not be probed, refuses the push.
-fn require_force_if_includes(supported: bool) -> Result<(), String> {
-    if supported {
-        Ok(())
-    } else {
-        Err(
-            "Force push needs `--force-if-includes`, which requires Git 2.30 or newer \
-             (or a Git that could not be checked just now). Update Git, then restart GitPulse."
-                .into(),
-        )
+///
+/// An old git and an unprobed one are different answers. A git that reported a
+/// version below 2.30 is told to update. Any other probe outcome says the
+/// version could not be read just now; when the probe was shed under load, the
+/// refusal is that deferral's own message, so the frontend's retry classifier
+/// reads it as `deferred_under_load` rather than as a terminal failure.
+fn require_force_if_includes(
+    preflight: &crate::engine::git_cli::GitPreflight,
+) -> Result<(), String> {
+    use crate::engine::git_cli::{is_deferred_under_load, supports, GitPreflightStatus};
+    if supports(preflight, crate::engine::git_cli::FORCE_IF_INCLUDES) {
+        return Ok(());
     }
+    if preflight.status == GitPreflightStatus::Outdated {
+        return Err(
+            "Force push needs `--force-if-includes`, which requires Git 2.30 or newer, and this \
+             Git is older. Update Git, then restart GitPulse."
+                .into(),
+        );
+    }
+    let detail = preflight
+        .message
+        .as_deref()
+        .unwrap_or("no version was reported");
+    let detail = detail
+        .strip_prefix("Git could not be checked yet: ")
+        .unwrap_or(detail);
+    if is_deferred_under_load(detail) {
+        return Err(detail.to_string());
+    }
+    Err(format!(
+        "Force push needs `--force-if-includes` (Git 2.30 or newer), but Git's version could not \
+         be checked just now: {detail}"
+    ))
+}
+
+/// A branch given to a push: a valid ref name that is not refspec syntax.
+fn validate_push_branch(name: &str) -> Result<(), String> {
+    validate_ref_name(name)?;
+    if name.starts_with('+') || name.contains(':') {
+        return Err(format!(
+            "Refusing to push `{name}`: a push takes a plain branch name, and a leading `+` \
+             or a `:` is refspec syntax (`+` forces the push without a lease)."
+        ));
+    }
+    Ok(())
 }
 
 fn plan_push_argv(
@@ -3179,9 +3224,7 @@ fn plan_push_argv(
 ) -> Result<Vec<String>, String> {
     let mut args = vec!["push".to_string()];
     if force {
-        require_force_if_includes(crate::engine::git_cli::git_supports(
-            crate::engine::git_cli::FORCE_IF_INCLUDES,
-        ))?;
+        require_force_if_includes(&crate::engine::git_cli::git_preflight())?;
         args.extend(FORCE_PUSH_FLAGS.map(String::from));
     }
     match (remote, branch) {
@@ -3190,7 +3233,7 @@ fn plan_push_argv(
                 let branch = current_branch_name(repo)?;
                 let remote = unpublished_push_remote(repo)?;
                 validate_ref_name(&remote)?;
-                validate_ref_name(&branch)?;
+                validate_push_branch(&branch)?;
                 args.push("-u".into());
                 args.push(remote);
                 args.push(branch);
@@ -3204,7 +3247,7 @@ fn plan_push_argv(
         (Some(remote), Some(branch)) => {
             crate::engine::remotes::require_configured(repo, remote)?;
             validate_ref_name(remote)?;
-            validate_ref_name(branch)?;
+            validate_push_branch(branch)?;
             args.push(remote.to_string());
             args.push(branch.to_string());
         }
@@ -3213,7 +3256,7 @@ fn plan_push_argv(
             // branch given without a remote must never be emitted alone: it
             // would turn any caller-supplied word into a push target. The
             // remote is resolved explicitly, from a configured name.
-            validate_ref_name(branch)?;
+            validate_push_branch(branch)?;
             let remote = implicit_push_remote(repo)?;
             validate_ref_name(&remote)?;
             args.push(remote);
@@ -5842,12 +5885,22 @@ mod tests {
 
     #[test]
     fn force_push_is_refused_without_force_if_includes_and_names_it() {
-        let err = require_force_if_includes(false).unwrap_err();
+        use crate::engine::git_cli::{GitPreflight, GitPreflightStatus};
+        let probe = |status, line: &str| GitPreflight {
+            status,
+            version: Some(line.to_string()),
+            message: Some("too old".into()),
+        };
+        let err =
+            require_force_if_includes(&probe(GitPreflightStatus::Outdated, "git version 2.29.3"))
+                .unwrap_err();
         assert!(
-            err.contains("--force-if-includes") && err.contains("2.30"),
+            err.contains("--force-if-includes") && err.contains("2.30") && err.contains("older"),
             "{err}"
         );
-        assert!(require_force_if_includes(true).is_ok());
+        assert!(
+            require_force_if_includes(&probe(GitPreflightStatus::Ok, "git version 2.36.0")).is_ok()
+        );
     }
 
     /// A background fetch moves `origin/main` to a commit the user never

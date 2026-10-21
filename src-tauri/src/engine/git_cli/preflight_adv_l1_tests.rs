@@ -34,7 +34,6 @@ fn adv_l1_assess_on_version_lines_names_the_right_features_and_never_panics() {
         "git version 10.1.0",
         "git version 2.36.0\r\n",
         "git version 2.36.0\n",
-        "git version 2.40.99999999999",
     ] {
         let answer = line(ok);
         assert_eq!(answer.status, GitPreflightStatus::Ok, "{ok:?}: {answer:?}");
@@ -54,6 +53,7 @@ fn adv_l1_assess_on_version_lines_names_the_right_features_and_never_panics() {
         "git version abc",
         "git version 99999999999999999999.1.0",
         "git version 4294967296.0.0",
+        "git version 2.40.99999999999",
         "hub version 2.40.0",
     ] {
         let answer = line(broken);
@@ -76,17 +76,24 @@ fn adv_l1_a_leading_bom_reads_as_unrecognised_and_fails_closed() {
     assert!(!supports(&answer, FORCE_IF_INCLUDES));
 }
 
-/// A minor that overflows u32 is read as 0 (`unwrap_or(0)` on the parse
-/// failure), so "2.99999999999.0" is reported as "Git 2.0.0 is too old". It
-/// fails closed, but the version in the message is invented.
+/// A component that overflows u32 is an unreadable version, not a zero: the
+/// message must not invent "Git 2.0.0".
 #[test]
 fn adv_l1_an_overflowing_minor_is_silently_read_as_zero() {
-    assert_eq!(
-        parse_git_version("git version 2.99999999999.0"),
-        Some((2, 0, 0))
-    );
-    let answer = line("git version 2.99999999999.0");
-    assert_eq!(answer.status, GitPreflightStatus::Outdated);
+    for text in [
+        "git version 2.99999999999.0",
+        "git version 2.36.99999999999",
+        "git version 99999999999.0.0",
+    ] {
+        assert_eq!(parse_git_version(text), None, "{text}");
+        let answer = line(text);
+        assert_eq!(answer.status, GitPreflightStatus::Broken, "{text}");
+        assert!(
+            answer.message.unwrap().contains("unrecognised version"),
+            "{text}"
+        );
+    }
+    assert_eq!(parse_git_version("git version 2.36"), Some((2, 36, 0)));
 }
 
 /// The floor and the missing list agree with tuple order, including equal
@@ -134,38 +141,33 @@ fn adv_l1_the_floor_and_the_missing_list_agree_with_tuple_order_on_random_versio
     }
 }
 
-/// `hard_floor` takes no table, so it cannot be run over a random one. This
-/// runs the same comparison expression over random row sets against a plain
-/// max, the strongest check the seam allows (the expression is copied, so a
-/// later edit to `hard_floor` is not covered by it).
+/// `hard_floor_of` over random tables, against the plain max of the hard rows
+/// (optional rows must not move it).
 #[test]
 fn adv_l1_the_floor_comparison_expression_is_a_lexicographic_max() {
-    let fold = |rows: &[(u32, u32, u32)]| {
-        let mut floor = (0, 0, 0);
-        for &min in rows {
-            if min.0 > floor.0
-                || (min.0 == floor.0 && (min.1 > floor.1 || (min.1 == floor.1 && min.2 > floor.2)))
-            {
-                floor = min;
-            }
-        }
-        floor
-    };
     let mut rng = Rng(0xdead_beef_cafe_f00d);
     for _ in 0..20_000 {
         let n = 1 + rng.below(8) as usize;
-        let rows: Vec<(u32, u32, u32)> = (0..n)
-            .map(|_| {
-                (
+        let table: Vec<GitFeature> = (0..n)
+            .map(|_| GitFeature {
+                name: "row",
+                min: (
                     rng.below(3) as u32,
                     rng.below(3) as u32,
                     rng.below(3) as u32,
-                )
+                ),
+                hard: rng.below(4) != 0,
             })
             .collect();
-        assert_eq!(fold(&rows), *rows.iter().max().unwrap(), "{rows:?}");
+        let expected = table
+            .iter()
+            .filter(|row| row.hard)
+            .map(|row| row.min)
+            .max()
+            .unwrap_or((0, 0, 0));
+        assert_eq!(hard_floor_of(&table), expected, "{table:?}");
     }
-    assert_eq!(hard_floor(), MIN_GIT_VERSION);
+    assert_eq!(hard_floor_of(GIT_FEATURES), MIN_GIT_VERSION);
 }
 
 /// Every probe outcome that is not a readable passing version fails the

@@ -39,7 +39,7 @@ pub async fn cmd_clone_repo(
     .await
 }
 
-/// Whether a usable git is installed: missing, older than 2.23, or broken,
+/// Whether a usable git is installed: missing, older than 2.36, or broken,
 /// each with a message the user can act on. Asked once at startup.
 #[tauri::command(async)]
 pub async fn cmd_git_preflight() -> Result<crate::engine::git_cli::GitPreflight, IpcError> {
@@ -183,6 +183,10 @@ pub async fn cmd_push(
 ) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         let force = force.unwrap_or(false);
+        // A user action from here on, so the version probe a force push makes
+        // while planning is admitted rather than shed under load; the command
+        // guard would only mark it after the plan.
+        crate::engine::git_cli::mark_user_action(&repo_path);
         let args = GitWriter::plan_push(&repo_path, remote.as_deref(), branch.as_deref(), force)?;
         let argv = judged_push_argv(&args);
         let policy = guard(&repo_path, &argv)?;

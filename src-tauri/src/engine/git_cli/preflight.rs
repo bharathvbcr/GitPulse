@@ -18,7 +18,7 @@ use std::time::Duration;
 /// rows (`--pathspec-from-file` 2.25, `--force-if-includes` 2.30,
 /// `--diff-merges` 2.31) are all below it. Derived, not typed: a new hard row
 /// raises the floor, and a test pins the equality.
-pub const MIN_GIT_VERSION: (u32, u32, u32) = hard_floor();
+pub const MIN_GIT_VERSION: (u32, u32, u32) = hard_floor_of(GIT_FEATURES);
 
 /// Oldest git that may clone. 2.45.1 is the first release with the fixes for
 /// CVE-2024-32002 (a hostile repository's symlinked submodule writes into
@@ -68,8 +68,14 @@ pub(crate) fn parse_git_version(line: &str) -> Option<(u32, u32, u32)> {
         .take_while(|part| !part.is_empty())
         .map(|part| part.parse::<u32>().ok());
     let major = parts.next()??;
-    let minor = parts.next().flatten().unwrap_or(0);
-    let patch = parts.next().flatten().unwrap_or(0);
+    // A missing component reads as zero; a component that is there but does
+    // not fit a u32 is an unreadable version, never a smaller one.
+    let mut component = || match parts.next() {
+        None => Some(0),
+        Some(parsed) => parsed,
+    };
+    let minor = component()?;
+    let patch = component()?;
     Some((major, minor, patch))
 }
 
@@ -270,12 +276,12 @@ pub(crate) const GIT_FEATURES: &[GitFeature] = &[
     },
 ];
 
-/// The highest minimum among the hard rows of [`GIT_FEATURES`].
-const fn hard_floor() -> (u32, u32, u32) {
+/// The highest minimum among the hard rows of `table`.
+pub(crate) const fn hard_floor_of(table: &[GitFeature]) -> (u32, u32, u32) {
     let mut floor = (0, 0, 0);
     let mut i = 0;
-    while i < GIT_FEATURES.len() {
-        let row = GIT_FEATURES[i];
+    while i < table.len() {
+        let row = table[i];
         if row.hard
             && (row.min.0 > floor.0
                 || (row.min.0 == floor.0
