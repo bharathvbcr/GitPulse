@@ -29,8 +29,32 @@ pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_CLOCK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with [`now_millis`] pinned to `ms` on this thread: the seam a test
+/// uses to write a row stamped as a stepped-back or runaway clock would, through
+/// the real append path. The previous clock is restored even if `f` panics.
+#[cfg(test)]
+pub(crate) fn with_test_clock<T>(ms: u64, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<u64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_CLOCK.with(|clock| clock.set(self.0));
+        }
+    }
+    let _restore = Restore(TEST_CLOCK.with(|clock| clock.replace(Some(ms))));
+    f()
+}
+
 /// Milliseconds since the Unix epoch, saturating at 0 for clocks before it.
 pub fn now_millis() -> u64 {
+    #[cfg(test)]
+    if let Some(ms) = TEST_CLOCK.with(std::cell::Cell::get) {
+        return ms;
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

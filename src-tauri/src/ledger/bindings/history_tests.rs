@@ -89,17 +89,17 @@ fn a_moment_resolves_to_the_newest_row_at_or_before_it() {
 }
 
 #[test]
-fn rows_in_one_millisecond_go_to_the_larger_ulid() {
+fn rows_in_one_millisecond_go_to_the_last_inserted_whatever_their_ulids() {
     let (_dir, repo) = repo();
-    // Inserted out of order on purpose.
+    // The ulids are out of order against the insertions on purpose.
     put(&repo, T0, &ulid(2), Some("LATER"));
-    put(&repo, T0, &ulid(1), Some("EARLIER"));
     put(&repo, T0, &ulid(3), None);
+    put(&repo, T0, &ulid(1), Some("LAST-INSERTED"));
     let history = BindingHistory::load(&repo, &repo).unwrap();
-    assert_eq!(history.as_of(T0), TaskAtTime::Unbound);
+    assert_eq!(history.as_of(T0), bound("LAST-INSERTED"));
     assert_eq!(
         binding_as_of(&address(&repo), T0).unwrap(),
-        TaskAtTime::Unbound
+        bound("LAST-INSERTED")
     );
     assert_eq!(history.as_of(T0 - 1), TaskAtTime::Unresolved);
 }
@@ -132,13 +132,10 @@ fn a_row_at_either_edge_of_the_second_is_inside_it() {
     assert_eq!(history.as_of_second(T0 + 1_000), bound("AT-START"));
 }
 
-/// The oracle: the newest `(ts, ulid)` at or before `at`, by brute force.
+/// The oracle: the row inserted last among those stamped at or before `at`, by
+/// brute force (`rows` is in insertion order).
 fn oracle(rows: &[(u64, String, Option<String>)], at: u64) -> TaskAtTime {
-    match rows
-        .iter()
-        .filter(|(ms, _, _)| *ms <= at)
-        .max_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)))
-    {
+    match rows.iter().rev().find(|(ms, _, _)| *ms <= at) {
         None => TaskAtTime::Unresolved,
         Some((_, _, Some(task))) => TaskAtTime::Bound(task.clone()),
         Some((_, _, None)) => TaskAtTime::Unbound,
@@ -180,19 +177,21 @@ fn as_of_agrees_with_the_oracle_and_with_the_live_read_at_the_end() {
                 at - T0
             );
         }
-        // After the last row, "as of" is "now": the live gate's answer.
+        // After the last row, "as of" is "now": the live gate's answer, the row
+        // written last.
         let live = latest_binding(&repo, &repo, &crate::ledger::redact::text(&repo)).unwrap();
         let end = binding_as_of(&address(&repo), FOREVER_MS).unwrap();
+        let last_written = rows.last().map(|(_, _, task)| task.clone());
         assert_eq!(
-            end.task_id().map(str::to_string),
-            live.clone().flatten(),
-            "round {round}: as of the end must be the binding that holds"
+            live, last_written,
+            "round {round}: the live read is insertion order"
         );
         assert_eq!(
             end == TaskAtTime::Unresolved,
             live.is_none(),
             "round {round}"
         );
+        assert_eq!(end, oracle(&rows, FOREVER_MS), "round {round}");
         assert_eq!(history.as_of(FOREVER_MS), end, "round {round}");
     }
 }
@@ -282,12 +281,13 @@ fn both_reads_stay_on_the_binding_index_and_share_one_order() {
     assert!(history.contains("idx_events_binding"), "{history}");
 
     // One precedence order: the live read, the as-of read and the history all
-    // sort by `(ts_utc, ulid)`, newest first.
+    // sort by the shared binding order (insertion), newest first.
     for sql in [
+        crate::ledger::LATEST_BINDING_SQL,
         crate::ledger::BINDING_AS_OF_SQL,
         crate::ledger::BINDING_HISTORY_SQL,
     ] {
-        assert!(sql.contains("ORDER BY ts_utc DESC, ulid DESC"), "{sql}");
+        assert!(sql.contains(crate::ledger::BINDING_ORDER), "{sql}");
     }
 }
 
@@ -394,19 +394,23 @@ fn the_live_gate_and_the_hook_still_authenticate_through_git() {
 // ---- adversarial cases -------------------------------------------------
 
 #[test]
-fn a_bind_and_an_unbind_in_one_millisecond_resolve_by_ulid_either_way() {
-    for (bind_ulid, unbind_ulid, expected) in [(1, 2, TaskAtTime::Unbound), (2, 1, bound("T"))] {
+fn a_bind_and_an_unbind_in_one_millisecond_resolve_by_insertion_either_way() {
+    // The ulids order the two rows both ways; the unbind is inserted last.
+    for (bind_ulid, unbind_ulid) in [(1, 2), (2, 1)] {
         let (_dir, repo) = repo();
         put(&repo, T0, &ulid(bind_ulid), Some("T"));
         put(&repo, T0, &ulid(unbind_ulid), None);
         let history = BindingHistory::load(&repo, &repo).unwrap();
-        assert_eq!(history.as_of(T0), expected);
-        assert_eq!(binding_as_of(&address(&repo), T0).unwrap(), expected);
+        assert_eq!(history.as_of(T0), TaskAtTime::Unbound);
+        assert_eq!(
+            binding_as_of(&address(&repo), T0).unwrap(),
+            TaskAtTime::Unbound
+        );
         assert_eq!(history.as_of(T0 - 1), TaskAtTime::Unresolved);
-        assert_eq!(history.as_of(T0 + 1), expected);
-        // The live read agrees with the history at the end.
+        assert_eq!(history.as_of(T0 + 1), TaskAtTime::Unbound);
+        // The live read, the as-of read and the history agree.
         let live = latest_binding(&repo, &repo, &repo).unwrap();
-        assert_eq!(live, Some(expected.task_id().map(str::to_string)));
+        assert_eq!(live, Some(None), "the unbind was inserted last");
     }
 }
 
@@ -427,20 +431,22 @@ fn the_reflog_second_next_to_a_row_resolves_exactly_at_the_edges() {
 }
 
 /// A clock that stepped backwards between two binds: the later append carries
-/// the earlier time. Order is by time, not by insertion, which is also what the
-/// live gate does, so the two agree and the later bind is the one never seen.
+/// the earlier time. Both the history and the live gate follow insertion, so the
+/// later bind holds from the moment its row is stamped and the history never
+/// names a task the gate would not have enforced.
 #[test]
-fn a_clock_that_went_backwards_orders_by_time_like_the_live_read() {
+fn a_clock_that_went_backwards_orders_history_and_the_live_read_by_insertion() {
     let (_dir, repo) = repo();
     put(&repo, T0 + 10_000, &ulid(1), Some("APPENDED-FIRST"));
     put(&repo, T0, &ulid(2), Some("APPENDED-SECOND"));
     let history = BindingHistory::load(&repo, &repo).unwrap();
+    assert_eq!(history.as_of(T0 - 1), TaskAtTime::Unresolved);
     assert_eq!(history.as_of(T0 + 5_000), bound("APPENDED-SECOND"));
-    assert_eq!(history.as_of(T0 + 10_000), bound("APPENDED-FIRST"));
-    assert_eq!(history.as_of(FOREVER_MS), bound("APPENDED-FIRST"));
+    assert_eq!(history.as_of(T0 + 10_000), bound("APPENDED-SECOND"));
+    assert_eq!(history.as_of(FOREVER_MS), bound("APPENDED-SECOND"));
     assert_eq!(
         latest_binding(&repo, &repo, &repo).unwrap(),
-        Some(Some("APPENDED-FIRST".to_string()))
+        Some(Some("APPENDED-SECOND".to_string()))
     );
 }
 

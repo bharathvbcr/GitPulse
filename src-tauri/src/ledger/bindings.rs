@@ -15,7 +15,9 @@
 //! "what holds now". [`binding_as_of`] and [`BindingHistory`] answer "what held
 //! at that moment", which is what a replayed event needs: a transcript call
 //! from before a rebind is stamped with the task that was bound when it ran.
-//! Both order rows by the same `(ts_utc, ulid)` key.
+//! "What holds now" is ordered by insertion sequence within a ledger and the
+//! as-of read by time; see "Worktree binding authority" in `ARCHITECTURE.md`,
+//! which also says who may write a binding.
 
 use super::{append, ActorKind, Draft, LedgerError, Outcome};
 
@@ -23,6 +25,30 @@ use super::{append, ActorKind, Draft, LedgerError, Outcome};
 pub const BIND: &str = "worktree.bind";
 /// The action name an unbinding event carries.
 pub const UNBIND: &str = "worktree.unbind";
+/// A sibling worktree's bind, imported as history only. No binding read
+/// matches this action, so it can never set a binding.
+pub const BIND_IMPORTED: &str = "worktree.bind.imported";
+/// A sibling worktree's unbind, imported as history only.
+pub const UNBIND_IMPORTED: &str = "worktree.unbind.imported";
+
+/// The authoritative action an imported binding action stands for; any other
+/// action is its own base.
+pub(super) fn base_action(action: &str) -> &str {
+    match action {
+        BIND_IMPORTED => BIND,
+        UNBIND_IMPORTED => UNBIND,
+        other => other,
+    }
+}
+
+/// The history-only spelling of a bind or unbind action.
+pub(super) fn imported_action(action: &str) -> Option<&'static str> {
+    match action {
+        BIND => Some(BIND_IMPORTED),
+        UNBIND => Some(UNBIND_IMPORTED),
+        _ => None,
+    }
+}
 
 /// The error code for a checkout path that no longer exists on disk.
 pub const MISSING_WORKTREE: &str = "missing_worktree";
@@ -169,7 +195,11 @@ pub fn repository_address_readonly(repo_path: &str) -> Result<BindingAddress, Le
 pub(crate) fn repository_status(repo_path: &str) -> Result<super::LedgerStatus, LedgerError> {
     let family = resolve_address(repo_path, repo_path)?;
     match super::consolidate_worktree_ledgers(&family.address.anchor, &family.members) {
-        Ok(_) => Ok(super::status(&family.address.anchor)),
+        Ok(_) => {
+            let mut status = super::status(&family.address.anchor);
+            note_history_only_bindings(&mut status, &family.address.anchor);
+            Ok(status)
+        }
         Err(error) => {
             let mut status = super::status(&family.address.anchor);
             status.recording = false;
@@ -217,7 +247,41 @@ fn readonly_status_of(family: &FamilyAddress) -> super::LedgerStatus {
         status.error = LEGACY_UNCONSOLIDATED_MESSAGE.to_string();
         status.error_code = LEGACY_UNCONSOLIDATED_CODE.to_string();
     }
+    note_history_only_bindings(&mut status, &family.address.anchor);
     status
+}
+
+/// The `error_code` of a ledger holding sibling bind/unbind rows as history only.
+pub(crate) const HISTORY_ONLY_BINDINGS_CODE: &str = "binding_rows_history_only";
+
+/// Says how many sibling bind/unbind rows were imported as history only: a
+/// binding that did not take effect must not do so silently.
+///
+/// The error slot takes the notice when it is free or holds only the
+/// legacy-unconsolidated caveat (which the message then keeps); a real failure
+/// keeps the slot. The MCP view carries the count in its own field
+/// (`LedgerView::history_only_bindings`), so it also reaches that surface next to
+/// a failure; `LedgerStatus` has no such field.
+fn note_history_only_bindings(status: &mut super::LedgerStatus, anchor: &str) {
+    let Some(count @ 1..) = super::history_only_binding_count(anchor) else {
+        return;
+    };
+    let notice = format!(
+        "{count} bind/unbind row(s) written by sibling worktrees were kept as history only: \
+         only GitPulse and the bind/unbind commands writing the primary ledger can set a \
+         binding, so those rows set none. Rebind the worktree in GitPulse if one was meant."
+    );
+    match status.error_code.as_str() {
+        "" => {
+            status.error = notice;
+            status.error_code = HISTORY_ONLY_BINDINGS_CODE.to_string();
+        }
+        LEGACY_UNCONSOLIDATED_CODE => {
+            status.error = format!("{notice} {}", status.error);
+            status.error_code = HISTORY_ONLY_BINDINGS_CODE.to_string();
+        }
+        _ => {}
+    }
 }
 
 /// [`repository_status_readonly`] as an MCP surface reports it: a
@@ -227,7 +291,8 @@ pub(crate) fn repository_ledger_view(repo_path: &str) -> Result<super::LedgerVie
     let family = resolve_address(repo_path, repo_path)?;
     let status = readonly_status_of(&family);
     let freshness = super::freshness_readonly(&family.address.anchor);
-    Ok(super::LedgerView::from_readonly(status, freshness))
+    Ok(super::LedgerView::from_readonly(status, freshness)
+        .with_history_only_bindings(&family.address.anchor))
 }
 
 /// The `error_code` of a read that cannot see rows a sibling worktree's own
@@ -320,7 +385,8 @@ pub fn bind_with(
     let address = address(repo_path, worktree_path)?;
     validate_task(&address.anchor, task_id)?;
     let detail_json = before(&address);
-    append(Draft {
+    let anchor = address.anchor.clone();
+    let row = append(Draft {
         repo_path: address.anchor,
         worktree_path: Some(address.worktree.clone()),
         task_id: Some(task_id.to_string()),
@@ -330,7 +396,18 @@ pub fn bind_with(
         outcome: Some(Outcome::Ok),
         detail_json,
         ..Default::default()
-    })
+    })?;
+    close_fresh_family_window(&anchor);
+    Ok(row)
+}
+
+/// The row is written: if this write created the family's ledger, no sibling
+/// ledger can be a legacy one, so record that. A failure leaves the window open
+/// (and is logged); it never undoes the binding.
+fn close_fresh_family_window(anchor: &str) {
+    if let Err(error) = super::settle_fresh_family(anchor) {
+        log::warn!(target: "ledger", "could not record the family's initial pass: {error}");
+    }
 }
 
 /// Clears whatever `worktree_path` was bound to.
@@ -346,7 +423,8 @@ pub fn unbind_with(
 ) -> Result<i64, LedgerError> {
     let address = address(repo_path, worktree_path)?;
     let detail_json = before(&address);
-    append(Draft {
+    let anchor = address.anchor.clone();
+    let row = append(Draft {
         repo_path: address.anchor,
         worktree_path: Some(address.worktree.clone()),
         action: UNBIND.to_string(),
@@ -355,15 +433,17 @@ pub fn unbind_with(
         outcome: Some(Outcome::Ok),
         detail_json,
         ..Default::default()
-    })
+    })?;
+    close_fresh_family_window(&anchor);
+    Ok(row)
 }
 
 /// The task `worktree_path` is bound to, if any.
 ///
 /// Finds the newest bind/unbind naming this path with one indexed query.
-/// Precedence uses the timestamp/ULID pair that survives a legacy
-/// sibling-ledger import; the anchor's newly assigned integer cursor cannot
-/// establish cross-database event order.
+/// Precedence is insertion order in the anchor ledger. Legacy sibling rows are
+/// placed in that order when imported (older ones lose to newer ones by their
+/// `(ts_utc, ulid)` key), and a sibling's post-anchor rows are not bindings.
 pub fn resolve(repo_path: &str, worktree_path: &str) -> Result<Option<String>, LedgerError> {
     Ok(resolve_binding(repo_path, worktree_path)?.map(|binding| binding.task_id))
 }
@@ -439,9 +519,9 @@ pub(crate) fn binding_at(address: &BindingAddress) -> Result<Option<ResolvedBind
         return Ok(None);
     }
     let stored_worktree = super::redact::text(&address.worktree);
-    // Imported rows receive new integer cursors in the anchor database. ULIDs
-    // retain their original timestamp and are the ledger's cross-database sort
-    // key, so binding precedence uses them rather than import order.
+    // Imported rows receive new integer cursors in the anchor database, and the
+    // import itself decides whether a legacy row outranks the one in force
+    // (`import_legacy_page`), so the newest by insertion is the answer.
     let newest = super::latest_binding(&address.anchor, &address.worktree, &stored_worktree)?;
     Ok(newest.flatten().map(|task_id| ResolvedBinding {
         task_id,
@@ -484,9 +564,9 @@ impl TaskAtTime {
 }
 
 /// The binding at `address` as of `at_ms` (epoch milliseconds): the newest bind
-/// or unbind appended at or before it. A row exactly at `at_ms` counts, and
-/// ties go to the larger ULID, as in [`binding_at`], which this agrees with at
-/// any moment after the last row.
+/// or unbind inserted last among those stamped at or before it. A row exactly
+/// at `at_ms` counts. Ordered by insertion like [`binding_at`], which this
+/// agrees with at any moment after the last row.
 ///
 /// One indexed query for one question. A pass with many calls to answer reads
 /// [`BindingHistory`] once instead.
@@ -511,19 +591,50 @@ pub fn binding_as_of(address: &BindingAddress, at_ms: u64) -> Result<TaskAtTime,
 /// One worktree's bind and unbind rows, read once, answering "what held at
 /// this moment" for any number of moments.
 ///
+/// "Held at a moment" follows the same order as the live gate
+/// (`binding_order!` in the ledger, insertion order): the row inserted last
+/// among those stamped at or before the moment. So the history and the gate
+/// cannot name different tasks, and a stepped-back clock reorders neither.
+///
 /// Departed worktrees resolve from their own path's rows with no family
 /// authentication: a bind row exists only for a path that was authenticated
 /// when it was bound, so this widens whose events can be attributed, not
 /// who can act.
 #[derive(Debug, Clone, Default)]
 pub struct BindingHistory {
-    /// Oldest first, in `(ts_utc, ulid)` order.
+    /// Oldest insertion first.
     rows: Vec<super::BindingRow>,
+    /// `suffix_min[i]` is the smallest `ts_utc` among `rows[i..]`. It never
+    /// decreases with `i`, so the last row stamped at or before a moment is
+    /// found by one binary search.
+    suffix_min: Vec<String>,
+    /// Every row's `ts_utc`, ascending, for the reflog's whole-second check.
+    by_time: Vec<String>,
     /// The read failed: every answer is `Unresolved`.
     unreadable: bool,
 }
 
 impl BindingHistory {
+    fn from_rows(rows: Vec<super::BindingRow>) -> Self {
+        let mut suffix_min: Vec<String> = Vec::with_capacity(rows.len());
+        for row in rows.iter().rev() {
+            let smallest = match suffix_min.last() {
+                Some(later) if later < &row.ts_utc => later.clone(),
+                _ => row.ts_utc.clone(),
+            };
+            suffix_min.push(smallest);
+        }
+        suffix_min.reverse();
+        let mut by_time: Vec<String> = rows.iter().map(|row| row.ts_utc.clone()).collect();
+        by_time.sort_unstable();
+        Self {
+            rows,
+            suffix_min,
+            by_time,
+            unreadable: false,
+        }
+    }
+
     /// The history of `worktree` in the ledger at `anchor`. A repository with
     /// no ledger has none, and is not created by asking.
     pub fn load(anchor: &str, worktree: &str) -> Result<Self, LedgerError> {
@@ -531,16 +642,19 @@ impl BindingHistory {
             return Ok(Self::default());
         }
         let stored_worktree = super::redact::text(worktree);
-        Ok(Self {
-            rows: super::binding_history(anchor, worktree, &stored_worktree)?,
-            unreadable: false,
-        })
+        Ok(Self::from_rows(super::binding_history(
+            anchor,
+            worktree,
+            &stored_worktree,
+        )?))
     }
 
     /// A history that could not be read: it decides nothing.
     pub const fn unreadable() -> Self {
         Self {
             rows: Vec::new(),
+            suffix_min: Vec::new(),
+            by_time: Vec::new(),
             unreadable: true,
         }
     }
@@ -553,9 +667,11 @@ impl BindingHistory {
             return TaskAtTime::Unresolved;
         }
         let at = super::ids::iso8601_utc(at_ms);
+        // The last row stamped at or before `at` is the last index whose
+        // suffix still holds such a row.
         match self
-            .rows
-            .partition_point(|row| row.ts_utc.as_str() <= at.as_str())
+            .suffix_min
+            .partition_point(|smallest| smallest.as_str() <= at.as_str())
         {
             0 => TaskAtTime::Unresolved,
             newest => match &self.rows[newest - 1].task_id {
@@ -573,12 +689,12 @@ impl BindingHistory {
         let from = super::ids::iso8601_utc(second_ms);
         let to = super::ids::iso8601_utc(second_ms.saturating_add(999));
         let start = self
-            .rows
-            .partition_point(|row| row.ts_utc.as_str() < from.as_str());
+            .by_time
+            .partition_point(|ts| ts.as_str() < from.as_str());
         if self
-            .rows
+            .by_time
             .get(start)
-            .is_some_and(|row| row.ts_utc.as_str() <= to.as_str())
+            .is_some_and(|ts| ts.as_str() <= to.as_str())
         {
             return TaskAtTime::Unresolved;
         }
@@ -1358,9 +1474,13 @@ mod tests {
         );
         super::super::with_conn(&address.anchor, |conn| {
             let marker_count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM ledger_family_imports", [], |row| {
-                    row.get(0)
-                })
+                .query_row(
+                    // Source markers: the family's own pass row is not one.
+                    "SELECT COUNT(*) FROM ledger_family_imports
+                     WHERE source_key != 'family-initial-pass'",
+                    [],
+                    |row| row.get(0),
+                )
                 .map_err(|error| LedgerError::new("fixture_failed", error.to_string()))?;
             assert_eq!(marker_count, 2);
             Ok(())
@@ -2022,3 +2142,12 @@ mod family_cost_tests {
 
 #[cfg(test)]
 mod history_tests;
+
+#[cfg(test)]
+mod authority_tests;
+
+#[cfg(test)]
+mod adversarial_tests;
+
+#[cfg(test)]
+mod adversarial2_tests;

@@ -141,6 +141,12 @@ pub struct LedgerView {
     /// What `dropped` counts: `this_process`.
     pub dropped_scope: String,
     pub catch_up_failures: u64,
+    /// Bind/unbind rows written by sibling worktrees that the ledger keeps as
+    /// history only (only GitPulse and the bind/unbind commands set a binding).
+    /// Its own field, read from the ledger when the view is built, so it reaches
+    /// the surface whatever `error_code` says.
+    #[serde(default)]
+    pub history_only_bindings: u64,
     pub error: String,
     pub error_code: String,
     #[serde(flatten)]
@@ -148,6 +154,13 @@ pub struct LedgerView {
 }
 
 impl LedgerView {
+    /// This view with the anchor's history-only binding count. A ledger that
+    /// cannot be counted leaves 0 and logs; the count is a notice, not a verdict.
+    pub fn with_history_only_bindings(mut self, anchor: &str) -> Self {
+        self.history_only_bindings = super::history_only_binding_count(anchor).unwrap_or(0);
+        self
+    }
+
     /// The view of a status taken by [`super::status_readonly`] (or the
     /// bindings wrapper that adds the legacy caveat), with its freshness.
     pub fn from_readonly(status: super::LedgerStatus, freshness: Freshness) -> Self {
@@ -163,6 +176,7 @@ impl LedgerView {
             dropped: status.dropped,
             dropped_scope: "this_process".to_string(),
             catch_up_failures: status.catch_up_failures,
+            history_only_bindings: 0,
             error: status.error,
             error_code: status.error_code,
             freshness,
