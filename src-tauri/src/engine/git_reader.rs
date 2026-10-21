@@ -606,56 +606,22 @@ impl GitReader {
         } = default_base(&repo).checked()?;
         let remote_names = configured_remote_names(&repo);
 
-        let mut format = String::from(BRANCH_LIST_FORMAT);
-        if let Some((_, base_oid)) = default_base.as_ref() {
-            format.push_str("%00%(ahead-behind:");
-            format.push_str(base_oid);
-            format.push(')');
-        }
-        let format_arg = format!("--format={format}");
-        let listed = ref_cache::git_text(
+        // Older git (<2.42) rejects the ahead-behind atom outright: the listing
+        // retries once without it so it still works. Ahead/behind then stay
+        // zero and cmd_branch_stats fills them progressively.
+        let listing = list_against(
             &repo,
-            BRANCH_NAMESPACES,
-            &[
-                "for-each-ref",
-                format_arg.as_str(),
-                "refs/heads/",
-                "refs/remotes/",
-            ],
-        );
-        // Older git (<2.42) rejects the ahead-behind atom outright: retry once
-        // without it so listing still works. Ahead/behind then stay zero and
-        // cmd_branch_stats fills them progressively.
-        let (stdout, has_ahead_behind) = match listed {
-            Ok(stdout) => (stdout, default_base.is_some()),
-            Err(err) if default_base.is_some() => {
-                let base_format_arg = format!("--format={BRANCH_LIST_FORMAT}");
-                let retried = git_text(
-                    &repo,
-                    &[
-                        "for-each-ref",
-                        base_format_arg.as_str(),
-                        "refs/heads/",
-                        "refs/remotes/",
-                    ],
-                )
-                .map_err(|retry_err| {
-                    format!("{err}; retry without ahead-behind also failed: {retry_err}")
-                })?;
-                (retried, false)
-            }
-            Err(err) => return Err(err),
-        };
+            &BRANCH_QUERY,
+            default_base.as_ref().map(|(_, oid)| oid.as_str()),
+            true,
+        )?;
         let default_short = default_base.map(|(name, _)| name);
 
         let mut branches = Vec::new();
         // One line per ref; refnames and subjects cannot contain newlines or
         // NULs, so NUL-separated fields stay aligned.
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.split('\0').collect();
-            if parts.len() < 3 {
-                continue;
-            }
+        for row in listing.rows()? {
+            let parts = row.fields;
             let is_current = parts[0].trim() == "*";
             let refname = parts[1];
             if is_remote_head(&remote_names, refname) {
@@ -690,9 +656,7 @@ impl GitReader {
             // leaves this branch uncompared rather than zero-ahead. Unreachable
             // for branch refs (see `branch_refs_always_yield_two_counts`), and
             // that is exactly why it must not be the one case read as "merged".
-            let measured = has_ahead_behind
-                .then(|| parse_ahead_behind_pair(parts.get(8).copied().unwrap_or("")))
-                .flatten();
+            let measured = row.counts;
             let (commits_ahead_of_base, commits_behind_base) = measured.unwrap_or((0, 0));
 
             branches.push(BranchInfo {
@@ -1758,67 +1722,41 @@ impl GitReader {
         // against the same thing, and it rides this one listing process.
         let default_base = default_base(&repo).checked()?.base;
 
-        let mut format = String::from(TAG_LIST_FORMAT);
-        if let Some((_, base_oid)) = default_base.as_ref() {
-            format.push_str("%00%(ahead-behind:");
-            format.push_str(base_oid);
-            format.push(')');
-        }
-        let format_arg = format!("--format={format}");
-        let listed = ref_cache::git_text(
+        // Older git (<2.42) rejects the ahead-behind atom outright: the listing
+        // retries once without it. Every tag is then UNCOMPARED rather than
+        // zero-ahead — see `TagInfo::compared_to`.
+        let listing = list_against(
             &repo,
-            &["refs/tags"],
-            &["tag", "-l", "--sort=-creatordate", format_arg.as_str()],
-        );
-        // Older git (<2.42) rejects the ahead-behind atom outright: retry once
-        // without it so the listing still works. Every tag is then UNCOMPARED
-        // rather than zero-ahead — see `TagInfo::compared_to`.
-        let (stdout, has_ahead_behind) = match listed {
-            Ok(stdout) => (stdout, default_base.is_some()),
-            Err(err) if default_base.is_some() => {
-                let base_format_arg = format!("--format={TAG_LIST_FORMAT}");
-                let retried = git_text(
-                    &repo,
-                    &["tag", "-l", "--sort=-creatordate", base_format_arg.as_str()],
-                )
-                .map_err(|retry_err| {
-                    format!("{err}; retry without ahead-behind also failed: {retry_err}")
-                })?;
-                (retried, false)
-            }
-            Err(err) => return Err(err),
-        };
-        let base_name = has_ahead_behind
+            &TAG_QUERY,
+            default_base.as_ref().map(|(_, oid)| oid.as_str()),
+            true,
+        )?;
+        let base_name = listing
+            .measured()
             .then(|| default_base.map(|(name, _)| name))
             .flatten();
 
         let mut tags = Vec::new();
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.split('\x00').collect();
-            if parts.len() >= 2 {
-                // Lightweight tags have no peeled id; theirs is already a commit.
-                let peeled = parts.get(3).map(|s| s.trim()).unwrap_or("");
-                let commit_id = if peeled.is_empty() { parts[1] } else { peeled };
-                // Per ROW, not per listing: one tag git could not compare must
-                // not blind the rest, nor borrow their base.
-                let measured = base_name.as_ref().and_then(|name| {
-                    parse_ahead_behind_pair(parts.get(4).copied().unwrap_or(""))
-                        .map(|counts| (counts, name.clone()))
-                });
-                let (commits_ahead_of_base, commits_behind_base) =
-                    measured.as_ref().map(|(c, _)| *c).unwrap_or((0, 0));
-                tags.push(TagInfo {
-                    name: parts[0].to_string(),
-                    commit_id: commit_id.to_string(),
-                    message: parts
-                        .get(2)
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string()),
-                    commits_ahead_of_base,
-                    commits_behind_base,
-                    compared_to: measured.map(|(_, name)| name),
-                });
-            }
+        for row in listing.rows()? {
+            let parts = row.fields;
+            // Lightweight tags have no peeled id; theirs is already a commit.
+            let peeled = parts[3].trim();
+            let commit_id = if peeled.is_empty() { parts[1] } else { peeled };
+            // Per ROW, not per listing: one tag git could not compare must
+            // not blind the rest, nor borrow their base.
+            let measured = base_name
+                .as_ref()
+                .and_then(|name| row.counts.map(|counts| (counts, name.clone())));
+            let (commits_ahead_of_base, commits_behind_base) =
+                measured.as_ref().map(|(c, _)| *c).unwrap_or((0, 0));
+            tags.push(TagInfo {
+                name: parts[0].to_string(),
+                commit_id: commit_id.to_string(),
+                message: Some(parts[2]).filter(|s| !s.is_empty()).map(String::from),
+                commits_ahead_of_base,
+                commits_behind_base,
+                compared_to: measured.map(|(_, name)| name),
+            });
         }
         let truncated = tags.len() > TAG_LIST_CAP;
         tags.truncate(TAG_LIST_CAP);
@@ -4008,6 +3946,145 @@ const BRANCH_NAMESPACES: &[&str] = &["refs/heads", "refs/remotes"];
 
 const BRANCH_LIST_FORMAT: &str ="%(HEAD)%00%(refname)%00%(objectname)%00%(upstream:track)%00%(upstream:short)%00%(committerdate:unix)%00%(authorname)%00%(contents:subject)";
 
+/// A ref listing that may measure every row against a base commit with
+/// `%(ahead-behind:<base>)`: what to run, over which ref files it is a function
+/// of, and which fields each row carries before the counts.
+pub(crate) struct RefQuery<'a> {
+    /// What the answer is a function of; the ref cache stamps exactly these.
+    pub namespaces: &'a [&'a str],
+    /// The words before the `--format` argument (`for-each-ref`, or `tag -l`).
+    pub command: &'a [&'a str],
+    /// The ref patterns after it; empty for a listing that names none.
+    pub patterns: &'a [&'a str],
+    /// `%00`-separated atoms, without the ahead-behind atom.
+    pub fields: &'a str,
+}
+
+/// The branch and remote-tracking listing, which `list_branches` and
+/// `tip_counts_against` both read: the same words, so one kept answer serves
+/// both while the base and the refs are unchanged.
+const BRANCH_QUERY: RefQuery<'static> = RefQuery {
+    namespaces: BRANCH_NAMESPACES,
+    command: &["for-each-ref"],
+    patterns: &["refs/heads/", "refs/remotes/"],
+    fields: BRANCH_LIST_FORMAT,
+};
+
+const TAG_QUERY: RefQuery<'static> = RefQuery {
+    namespaces: &["refs/tags"],
+    command: &["tag", "-l", "--sort=-creatordate"],
+    patterns: &[],
+    fields: TAG_LIST_FORMAT,
+};
+
+/// The text of one [`RefQuery`], and whether git measured it against a base.
+pub(crate) struct AheadBehindListing {
+    text: String,
+    fields: usize,
+    measured: bool,
+}
+
+/// One row of an [`AheadBehindListing`].
+pub(crate) struct ListedRow<'a> {
+    /// The query's own fields, in order.
+    pub fields: Vec<&'a str>,
+    /// `Some` only when the listing was measured and git filled this row's
+    /// counts with two numbers. Per row, never per listing: a row git could not
+    /// compare is uncompared, not zero-ahead, and does not blind the others.
+    pub counts: Option<(usize, usize)>,
+}
+
+/// Runs `query`, asking git to measure each row against `base_oid` when one is
+/// given. The ref cache keeps the answer under the query's argv (the base is
+/// part of it) and the stamp of its namespaces, so a moved base or a changed
+/// ref is a miss.
+///
+/// Git older than 2.42 rejects the atom outright. With `retry`, the listing is
+/// asked once more without it and every row is then uncompared; without it the
+/// refusal is the error, for a caller whose only product is the counts.
+pub(crate) fn list_against(
+    repo: &Path,
+    query: &RefQuery<'_>,
+    base_oid: Option<&str>,
+    retry: bool,
+) -> Result<AheadBehindListing, String> {
+    let fields = query.fields.split("%00").count();
+    let run = |format: &str, cached: bool| {
+        let format_arg = format!("--format={format}");
+        let mut args: Vec<&str> = query.command.to_vec();
+        args.push(format_arg.as_str());
+        args.extend_from_slice(query.patterns);
+        if cached {
+            ref_cache::git_text(repo, query.namespaces, &args)
+        } else {
+            git_text(repo, &args)
+        }
+    };
+    let Some(base_oid) = base_oid else {
+        return Ok(AheadBehindListing {
+            text: run(query.fields, true)?,
+            fields,
+            measured: false,
+        });
+    };
+    match run(
+        &format!("{}%00%(ahead-behind:{base_oid})", query.fields),
+        true,
+    ) {
+        Ok(text) => Ok(AheadBehindListing {
+            text,
+            fields,
+            measured: true,
+        }),
+        Err(err) if retry => run(query.fields, false)
+            .map(|text| AheadBehindListing {
+                text,
+                fields,
+                measured: false,
+            })
+            .map_err(|retry_err| {
+                format!("{err}; retry without ahead-behind also failed: {retry_err}")
+            }),
+        Err(err) => Err(err),
+    }
+}
+
+impl AheadBehindListing {
+    /// False when no base was given or git refused the atom.
+    pub(crate) fn measured(&self) -> bool {
+        self.measured
+    }
+
+    /// Every row, split on NUL (refnames, subjects and author names cannot
+    /// contain one). A row with any other number of fields is an error naming
+    /// it: dropping it would turn a ref git did list into one that was never
+    /// there.
+    pub(crate) fn rows(&self) -> Result<Vec<ListedRow<'_>>, String> {
+        let expected = self.fields + usize::from(self.measured);
+        self.text
+            .lines()
+            .map(|line| {
+                let mut parts: Vec<&str> = line.split('\0').collect();
+                if parts.len() != expected {
+                    return Err(format!(
+                        "ref listing row has {} fields, expected {expected}: {line:?}",
+                        parts.len()
+                    ));
+                }
+                let counts = if self.measured {
+                    parse_ahead_behind_pair(parts.pop().unwrap_or(""))
+                } else {
+                    None
+                };
+                Ok(ListedRow {
+                    fields: parts,
+                    counts,
+                })
+            })
+            .collect()
+    }
+}
+
 /// Resolves the default branch to (short name, commit oid) without needing
 /// the local ref list, so callers can use it before listing refs.
 ///
@@ -4321,24 +4398,13 @@ pub(crate) fn tip_counts_against(
     base_oid: &str,
 ) -> Option<HashMap<String, (usize, usize)>> {
     validate_oid(base_oid).ok()?;
-    let format = format!("--format=%(objectname)%00%(ahead-behind:{base_oid})");
-    let text = ref_cache::git_text(
-        repo,
-        BRANCH_NAMESPACES,
-        &[
-            "for-each-ref",
-            format.as_str(),
-            "refs/heads/",
-            "refs/remotes/",
-        ],
-    )
-    .ok()?;
+    // The branch list's own query, so a list read just before is the kept
+    // answer; no retry, because without the atom there are no counts to give.
+    let listing = list_against(repo, &BRANCH_QUERY, Some(base_oid), false).ok()?;
+    let rows = listing.rows().ok()?;
     Some(
-        text.lines()
-            .filter_map(|line| {
-                let (tip, counts) = line.split_once('\0')?;
-                Some((tip.to_string(), parse_ahead_behind_pair(counts)?))
-            })
+        rows.into_iter()
+            .filter_map(|row| Some((row.fields[2].to_string(), row.counts?)))
             .collect(),
     )
 }
@@ -8484,6 +8550,61 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
         );
     }
 
+    /// The branch list and the tip counts are one listing: a list read just
+    /// before is the kept answer for the counts, and a ref written after it is
+    /// a miss that reads the new tip, never the kept answer.
+    #[test]
+    fn tip_counts_reuse_the_branch_list_and_see_a_ref_written_after_it() {
+        let _held = ref_cache::retention();
+        let (dir, oids) = ahead_behind_fixture();
+        let path = dir.path().to_str().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let listings = || {
+            git_cli::spawn_log::spawns_in(&root)
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a.contains("%(ahead-behind:")))
+                .count()
+        };
+        ref_cache::eager(|| {
+            let before = listings();
+            GitReader::list_branches(path).unwrap();
+            let counts = tip_counts_against(&root, &oids["main"]).unwrap();
+            assert_eq!(counts.len(), 3);
+            assert_eq!(listings() - before, 1, "one listing served both callers");
+
+            git_in(dir.path(), &["branch", "fresh", &oids["feature"]]);
+            git_in(dir.path(), &["branch", "newer", &oids["seed"]]);
+            let counts = tip_counts_against(&root, &oids["main"]).unwrap();
+            assert_eq!(counts.len(), 4, "the seed tip is new to the listing");
+            assert_eq!(counts[&oids["seed"]], (0, 1));
+            assert_eq!(listings() - before, 2, "the new refs were a miss");
+        });
+    }
+
+    #[test]
+    fn a_listing_row_with_the_wrong_field_count_is_an_error_not_a_dropped_ref() {
+        let two = |text: &str, measured: bool| AheadBehindListing {
+            text: text.to_string(),
+            fields: 2,
+            measured,
+        };
+        let listing = two("a\0b\nc\0d\n", false);
+        let rows = listing.rows().unwrap();
+        assert_eq!(rows[1].fields, vec!["c", "d"]);
+        assert_eq!(rows[1].counts, None);
+        let listing = two("a\0b\0 3 4 \n", true);
+        let rows = listing.rows().unwrap();
+        assert_eq!((rows[0].fields.len(), rows[0].counts), (2, Some((3, 4))));
+        let listing = two("a\0b\0junk\n", true);
+        let rows = listing.rows().unwrap();
+        assert_eq!(rows[0].counts, None, "an unparsed count is uncompared");
+        for bad in ["a\n", "a\0b\0c\n", "a\0b\nc\n"] {
+            let err = two(bad, false).rows().map(|_| ()).unwrap_err();
+            assert!(err.contains("expected 2"), "{bad:?}: {err}");
+        }
+        assert!(two("a\0b\n", true).rows().is_err());
+    }
+
     #[test]
     fn tip_counts_answer_none_for_a_base_git_cannot_measure() {
         let (dir, _) = ahead_behind_fixture();
@@ -12177,7 +12298,10 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
 
         let (_two, walked_root) = build();
         let base = git_cli::git_text(&walked_root, &["rev-parse", "main"]).unwrap();
-        let format = format!("--format=%(objectname)%00%(ahead-behind:{})", base.trim());
+        let format = format!(
+            "--format={BRANCH_LIST_FORMAT}%00%(ahead-behind:{})",
+            base.trim()
+        );
         let walked = git_cli::with_forced_spawn_failure_of(&format, || {
             GitReader::branch_stats(walked_root.to_str().unwrap())
         })

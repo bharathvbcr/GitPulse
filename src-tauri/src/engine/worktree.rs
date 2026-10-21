@@ -1074,23 +1074,25 @@ fn batch_divergence(
     if branches.is_empty() {
         return Some(HashMap::new());
     }
-    let format = format!("--format=%(refname)%00%(ahead-behind:{base_oid})");
     let patterns: Vec<String> = branches.iter().map(|b| format!("refs/heads/{b}")).collect();
-    let mut args = vec!["for-each-ref", format.as_str()];
-    args.extend(patterns.iter().map(String::as_str));
-    let text = crate::engine::ref_cache::git_text(repo, &["refs/heads"], &args).ok()?;
+    let patterns: Vec<&str> = patterns.iter().map(String::as_str).collect();
+    let query = crate::engine::git_reader::RefQuery {
+        namespaces: &["refs/heads"],
+        command: &["for-each-ref"],
+        patterns: &patterns,
+        fields: "%(refname)",
+    };
+    let listing =
+        crate::engine::git_reader::list_against(repo, &query, Some(base_oid), false).ok()?;
     let mut out = HashMap::new();
-    for line in text.lines() {
-        let Some((refname, counts)) = line.split_once('\0') else {
-            continue;
-        };
-        let Some(branch) = refname.strip_prefix("refs/heads/") else {
+    for row in listing.rows().ok()? {
+        let Some(branch) = row.fields[0].strip_prefix("refs/heads/") else {
             continue;
         };
         if !branches.contains(&branch) {
             continue;
         }
-        if let Some((ahead, behind)) = crate::engine::git_reader::parse_ahead_behind_pair(counts) {
+        if let Some((ahead, behind)) = row.counts {
             out.insert(branch.to_string(), WorktreeDivergence { ahead, behind });
         }
     }
