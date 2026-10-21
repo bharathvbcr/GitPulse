@@ -11,6 +11,15 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Changed
+
+- The minimum supported Git is now 2.36, up from 2.23, because worktree
+  listing uses `git worktree list -z` with no fallback (Ubuntu 22.04 and
+  Debian 11 ship older Git). The version check names every feature an older
+  Git lacks, and force push now sends `--force-with-lease --force-if-includes`
+  so a background fetch can no longer defeat the lease; the fleet commit
+  rhythm walk falls back to a count-bounded `git log` below Git 2.37.
+
 ## [1.5.0] - 2026-10-20
 
 1.5.0 is the first release published since 1.3.1. 1.3.5 was withdrawn and

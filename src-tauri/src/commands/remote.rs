@@ -39,7 +39,7 @@ pub async fn cmd_clone_repo(
     .await
 }
 
-/// Whether a usable git is installed: missing, older than 2.23, or broken,
+/// Whether a usable git is installed: missing, older than 2.36, or broken,
 /// each with a message the user can act on. Asked once at startup.
 #[tauri::command(async)]
 pub async fn cmd_git_preflight() -> Result<crate::engine::git_cli::GitPreflight, IpcError> {
@@ -156,6 +156,14 @@ pub async fn cmd_pull(
     .await
 }
 
+/// The line the command gate judges for a planned push: `git` plus exactly the
+/// vec [`GitWriter::push_planned`] runs.
+fn judged_push_argv(args: &[String]) -> Vec<&str> {
+    std::iter::once("git")
+        .chain(args.iter().map(String::as_str))
+        .collect()
+}
+
 /// Pushes, after the command gate has judged it. A force push is refused by
 /// the harness's hard rules, which is the whole reason this call is gated.
 ///
@@ -163,8 +171,9 @@ pub async fn cmd_pull(
 /// planner, and [`GitWriter::push_planned`] runs that same vec. An unpublished
 /// branch therefore cannot be judged as a bare `git push` and then fail
 /// with git's "no upstream" fatal — the gate sees `-u <remote> <branch>`
-/// when that is what will run. `--force-with-lease` is still the force flag
-/// the harness's `command.force_push` hard rule catches.
+/// when that is what will run. A force push judges as `--force-with-lease
+/// --force-if-includes`; `--force-with-lease` is still the force flag the
+/// harness's `command.force_push` hard rule catches.
 #[tauri::command(async)]
 pub async fn cmd_push(
     repo_path: String,
@@ -174,10 +183,12 @@ pub async fn cmd_push(
 ) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         let force = force.unwrap_or(false);
+        // A user action from here on, so the version probe a force push makes
+        // while planning is admitted rather than shed under load; the command
+        // guard would only mark it after the plan.
+        crate::engine::git_cli::mark_user_action(&repo_path);
         let args = GitWriter::plan_push(&repo_path, remote.as_deref(), branch.as_deref(), force)?;
-        let argv: Vec<&str> = std::iter::once("git")
-            .chain(args.iter().map(String::as_str))
-            .collect();
+        let argv = judged_push_argv(&args);
         let policy = guard(&repo_path, &argv)?;
         let output = GitWriter::push_planned(&repo_path, &args)?;
         Ok(Guarded { policy, output })
@@ -315,3 +326,35 @@ pub async fn cmd_repo_operation_action(
     })
     .await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{git_in, git_repo};
+
+    /// The command gate judges `git` plus the planned vec, and for a force push
+    /// that vec carries the lease and includes pair that push_planned runs.
+    #[test]
+    fn the_gate_judges_the_argv_that_runs_including_the_force_pair() {
+        let repo = git_repo();
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", "https://example.invalid/x.git"],
+        );
+        let path = repo.path().to_string_lossy().into_owned();
+        let args = GitWriter::plan_push(&path, Some("origin"), Some("main"), true).unwrap();
+        let judged = judged_push_argv(&args);
+        assert_eq!(judged[0], "git");
+        assert_eq!(
+            judged[1..],
+            args.iter().map(String::as_str).collect::<Vec<_>>()[..]
+        );
+        assert!(judged.contains(&"--force-with-lease") && judged.contains(&"--force-if-includes"));
+        let plain = GitWriter::plan_push(&path, Some("origin"), Some("main"), false).unwrap();
+        assert_eq!(judged_push_argv(&plain), ["git", "push", "origin", "main"]);
+    }
+}
+
+#[cfg(test)]
+#[path = "remote_adv_l1_tests.rs"]
+mod adv_l1_tests;

@@ -2,8 +2,8 @@
 //!
 //! Every feature assumes one, and without this probe the first sign of a
 //! missing or too-old git was whichever command happened to run first:
-//! "Failed to spawn git: no such program", or `git: 'switch' is not a git
-//! command` from a git older than `restore`/`switch` (2.23). The probe runs
+//! "Failed to spawn git: no such program", or `unknown switch 'z'` from a git
+//! older than `worktree list -z` (2.36). The probe runs
 //! the same resolved binary every other call does and says, in one sentence
 //! a user can act on, what is wrong.
 
@@ -12,9 +12,13 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-/// Oldest git this app supports: 2.23 added `git restore` and `git switch`,
-/// which the checkout and discard paths run.
-pub const MIN_GIT_VERSION: (u32, u32, u32) = (2, 23, 0);
+/// Oldest git this app supports: the highest minimum among the hard rows of
+/// [`GIT_FEATURES`]. Today the binding feature is `git worktree list -z`
+/// (2.36), which every worktree reader runs with no fallback; the older hard
+/// rows (`--pathspec-from-file` 2.25, `--force-if-includes` 2.30,
+/// `--diff-merges` 2.31) are all below it. Derived, not typed: a new hard row
+/// raises the floor, and a test pins the equality.
+pub const MIN_GIT_VERSION: (u32, u32, u32) = hard_floor_of(GIT_FEATURES);
 
 /// Oldest git that may clone. 2.45.1 is the first release with the fixes for
 /// CVE-2024-32002 (a hostile repository's symlinked submodule writes into
@@ -64,14 +68,23 @@ pub(crate) fn parse_git_version(line: &str) -> Option<(u32, u32, u32)> {
         .take_while(|part| !part.is_empty())
         .map(|part| part.parse::<u32>().ok());
     let major = parts.next()??;
-    let minor = parts.next().flatten().unwrap_or(0);
-    let patch = parts.next().flatten().unwrap_or(0);
+    // A missing component reads as zero; a component that is there but does
+    // not fit a u32 is an unreadable version, never a smaller one.
+    let mut component = || match parts.next() {
+        None => Some(0),
+        Some(parsed) => parsed,
+    };
+    let minor = component()?;
+    let patch = component()?;
     Some((major, minor, patch))
 }
 
+fn version_text(min: (u32, u32, u32)) -> String {
+    format!("{}.{}", min.0, min.1)
+}
+
 fn minimum_text() -> String {
-    let (major, minor, _) = MIN_GIT_VERSION;
-    format!("{major}.{minor}")
+    version_text(MIN_GIT_VERSION)
 }
 
 /// Turns one probe run into the answer the UI shows.
@@ -84,14 +97,21 @@ pub(crate) fn assess(probe: ToolProbe) -> GitPreflight {
                 version: Some(line),
                 message: None,
             },
-            Some((major, minor, patch)) => GitPreflight {
-                status: GitPreflightStatus::Outdated,
-                message: Some(format!(
-                    "Git {major}.{minor}.{patch} is too old. GitPulse needs Git {min} or newer \
-                     (for git switch and git restore). Update Git, then restart GitPulse."
-                )),
-                version: Some(line),
-            },
+            Some(found @ (major, minor, patch)) => {
+                let needs = missing_hard_features(found)
+                    .iter()
+                    .map(|row| format!("`{}` (Git {})", row.name, version_text(row.min)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                GitPreflight {
+                    status: GitPreflightStatus::Outdated,
+                    message: Some(format!(
+                        "Git {major}.{minor}.{patch} is too old. GitPulse needs Git {min} or \
+                         newer, for {needs}. Update Git, then restart GitPulse."
+                    )),
+                    version: Some(line),
+                }
+            }
             None => GitPreflight {
                 status: GitPreflightStatus::Broken,
                 message: Some(format!(
@@ -190,18 +210,110 @@ pub(crate) fn assess_for_clone(preflight: &GitPreflight, submodules: bool) -> Re
     }
 }
 
+/// One git capability the engine relies on: what it is called in a message,
+/// the first git that has it, and whether the app cannot run without it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GitFeature {
+    /// How a user sees it: the flag or subcommand, as typed.
+    pub name: &'static str,
+    pub min: (u32, u32, u32),
+    /// A hard row sets [`MIN_GIT_VERSION`]; an optional row has a caller-side
+    /// fallback and is only queried with [`git_supports`].
+    pub hard: bool,
+}
+
+/// `git add/reset/commit --pathspec-from-file` with `--pathspec-file-nul`:
+/// stage, unstage and commit-by-path.
+pub(crate) const PATHSPEC_FROM_FILE: (u32, u32, u32) = (2, 25, 0);
+
+/// `git push --force-if-includes`: refuses a forced push whose local branch
+/// does not contain what the remote-tracking ref points at, which is what a
+/// background fetch silently defeats in a bare `--force-with-lease`.
+pub(crate) const FORCE_IF_INCLUDES: (u32, u32, u32) = (2, 30, 0);
+
+/// Oldest git that accepts `--diff-merges=<format>`. Read paths choose their
+/// spelling with it (below it, first-parent rendering is `-m --first-parent`),
+/// and it is still a hard row of the table.
+pub(crate) const DIFF_MERGES_OPTION: (u32, u32, u32) = (2, 31, 0);
+
+/// `git worktree list --porcelain -z`: the NUL-separated listing every
+/// worktree reader parses. The binding feature of [`MIN_GIT_VERSION`].
+pub(crate) const WORKTREE_LIST_Z: (u32, u32, u32) = (2, 36, 0);
+
 /// Oldest git whose `rev-list`/`log` accept `--since-as-filter`: the date
 /// bound that filters commits instead of ending the walk at the first old
-/// committer date. A feature floor, not the app's: [`MIN_GIT_VERSION`] stays
-/// where it is, and a caller below this one walks by count instead.
-///
-/// The per-feature capability table that ft-45b8099a plans owns this row; it is
-/// kept beside the probe until that table exists, so the two are one move.
+/// committer date. An optional row: a caller below it walks by count instead.
 pub(crate) const SINCE_AS_FILTER: (u32, u32, u32) = (2, 37, 0);
 
-/// Oldest git that accepts `--diff-merges=<format>`. A feature floor, not the
-/// app's: a caller below it spells first-parent rendering `-m --first-parent`.
-pub(crate) const DIFF_MERGES_OPTION: (u32, u32, u32) = (2, 31, 0);
+/// `git commit-graph write --changed-paths`. An optional row: the Storage
+/// panel offers the write only at or above it.
+pub(crate) const COMMIT_GRAPH_CHANGED_PATHS: (u32, u32, u32) = (2, 27, 0);
+
+/// The one per-feature capability table. Every feature minimum the engine
+/// checks, or that sets the app's floor, is a row here; callers hold the
+/// minimum through the named constants and ask [`git_supports`].
+pub(crate) const GIT_FEATURES: &[GitFeature] = &[
+    GitFeature {
+        name: "--pathspec-from-file",
+        min: PATHSPEC_FROM_FILE,
+        hard: true,
+    },
+    GitFeature {
+        name: "--force-if-includes",
+        min: FORCE_IF_INCLUDES,
+        hard: true,
+    },
+    GitFeature {
+        name: "--diff-merges",
+        min: DIFF_MERGES_OPTION,
+        hard: true,
+    },
+    GitFeature {
+        name: "git worktree list -z",
+        min: WORKTREE_LIST_Z,
+        hard: true,
+    },
+    GitFeature {
+        name: "--since-as-filter",
+        min: SINCE_AS_FILTER,
+        hard: false,
+    },
+    GitFeature {
+        name: "commit-graph write --changed-paths",
+        min: COMMIT_GRAPH_CHANGED_PATHS,
+        hard: false,
+    },
+];
+
+/// The highest minimum among the hard rows of `table`.
+pub(crate) const fn hard_floor_of(table: &[GitFeature]) -> (u32, u32, u32) {
+    let mut floor = (0, 0, 0);
+    let mut i = 0;
+    while i < table.len() {
+        let row = table[i];
+        if row.hard
+            && (row.min.0 > floor.0
+                || (row.min.0 == floor.0
+                    && (row.min.1 > floor.1 || (row.min.1 == floor.1 && row.min.2 > floor.2))))
+        {
+            floor = row.min;
+        }
+        i += 1;
+    }
+    floor
+}
+
+/// The hard rows a git at `version` lacks, lowest minimum first. The first is
+/// the most actionable (the oldest thing that breaks), and every later one is
+/// named too so a user on a very old git is told the whole bill.
+fn missing_hard_features(version: (u32, u32, u32)) -> Vec<&'static GitFeature> {
+    let mut missing: Vec<&GitFeature> = GIT_FEATURES
+        .iter()
+        .filter(|row| row.hard && version < row.min)
+        .collect();
+    missing.sort_by_key(|row| row.min);
+    missing
+}
 
 /// Whether `preflight`'s git is at least `min`. Fails closed: a git that was
 /// not probed (`Unchecked`), is missing or broken, or whose version line cannot
@@ -241,6 +353,10 @@ mod tests {
             Some((2, 45, 1))
         );
         assert_eq!(parse_git_version("git version 2.23.0"), Some((2, 23, 0)));
+        assert_eq!(
+            parse_git_version("git version 2.36.0.rc1"),
+            Some((2, 36, 0))
+        );
         assert_eq!(parse_git_version("git version 3"), Some((3, 0, 0)));
         assert_eq!(parse_git_version("git version 2.22.5\n"), Some((2, 22, 5)));
         assert_eq!(parse_git_version("hub version 2.14.2"), None);
@@ -249,16 +365,111 @@ mod tests {
 
     #[test]
     fn the_minimum_is_inclusive_and_older_is_outdated() {
-        let ok = assess(ToolProbe::Present("git version 2.23.0".into()));
+        let ok = assess(ToolProbe::Present("git version 2.36.0".into()));
         assert_eq!(ok.status, GitPreflightStatus::Ok);
         assert_eq!(ok.message, None);
-        let old = assess(ToolProbe::Present("git version 2.22.5".into()));
+        let old = assess(ToolProbe::Present("git version 2.35.9".into()));
         assert_eq!(old.status, GitPreflightStatus::Outdated);
         let message = old.message.unwrap();
         assert!(
-            message.contains("2.22.5") && message.contains("2.23"),
+            message.contains("2.35.9") && message.contains("2.36"),
             "{message}"
         );
+    }
+
+    /// The floor is the table's hard maximum, and every row's minimum is
+    /// pinned here so a changed row is a visible edit to this test.
+    #[test]
+    fn the_floor_equals_the_highest_hard_row_and_each_row_is_pinned() {
+        let row = |name: &str| {
+            GIT_FEATURES
+                .iter()
+                .find(|row| row.name == name)
+                .unwrap_or_else(|| panic!("no row named {name}"))
+        };
+        assert_eq!(row("--pathspec-from-file").min, (2, 25, 0));
+        assert_eq!(row("--force-if-includes").min, (2, 30, 0));
+        assert_eq!(row("--diff-merges").min, (2, 31, 0));
+        assert_eq!(row("git worktree list -z").min, (2, 36, 0));
+        assert_eq!(row("--since-as-filter").min, (2, 37, 0));
+        assert_eq!(row("commit-graph write --changed-paths").min, (2, 27, 0));
+        assert!(!row("commit-graph write --changed-paths").hard);
+        assert_eq!(
+            crate::engine::git_writer::COMMIT_GRAPH_CHANGED_PATHS_GIT,
+            row("commit-graph write --changed-paths").min,
+            "one source of truth"
+        );
+        for hard in [
+            "--pathspec-from-file",
+            "--force-if-includes",
+            "--diff-merges",
+            "git worktree list -z",
+        ] {
+            assert!(row(hard).hard, "{hard}");
+        }
+        assert!(
+            !row("--since-as-filter").hard,
+            "it has a count-bounded fallback"
+        );
+
+        let max_hard = GIT_FEATURES
+            .iter()
+            .filter(|row| row.hard)
+            .map(|row| row.min)
+            .max()
+            .unwrap();
+        assert_eq!(MIN_GIT_VERSION, max_hard);
+        assert_eq!(MIN_GIT_VERSION, (2, 36, 0));
+        let mut names: Vec<&str> = GIT_FEATURES.iter().map(|row| row.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), GIT_FEATURES.len(), "one row per feature");
+    }
+
+    /// The message names every missing hard feature, the lowest first.
+    #[test]
+    fn an_outdated_message_names_the_features_the_git_lacks() {
+        let message_for = |line: &str| {
+            let answer = preflight_of(line);
+            assert_eq!(answer.status, GitPreflightStatus::Outdated, "{line}");
+            answer.message.unwrap()
+        };
+        let ubuntu = message_for("git version 2.34.1");
+        assert!(
+            ubuntu.contains("`git worktree list -z` (Git 2.36)"),
+            "{ubuntu}"
+        );
+        assert!(
+            !ubuntu.contains("--diff-merges") && !ubuntu.contains("--pathspec"),
+            "2.34.1 has those: {ubuntu}"
+        );
+        let debian = message_for("git version 2.30.2");
+        assert!(debian.contains("`--diff-merges` (Git 2.31)"), "{debian}");
+        assert!(debian.contains("git worktree list -z"), "{debian}");
+        assert!(
+            debian.find("--diff-merges") < debian.find("worktree list -z"),
+            "lowest missing first: {debian}"
+        );
+        let ancient = message_for("git version 2.24.0");
+        assert!(
+            ancient.contains("`--pathspec-from-file` (Git 2.25)"),
+            "{ancient}"
+        );
+        assert!(
+            ancient.find("--pathspec-from-file") < ancient.find("--force-if-includes"),
+            "{ancient}"
+        );
+        assert!(ancient.contains("Git 2.36 or newer"), "{ancient}");
+        assert_eq!(
+            preflight_of("git version 2.36.0.rc1").status,
+            GitPreflightStatus::Ok,
+            "a release candidate of the floor reads as the floor"
+        );
+        let broken = preflight_of("");
+        assert_eq!(broken.status, GitPreflightStatus::Broken);
+        assert!(broken.message.unwrap().contains("2.36"));
+        let apple = preflight_of("git version 2.39.3 (Apple Git-146)");
+        assert_eq!(apple.status, GitPreflightStatus::Ok);
     }
 
     #[test]
@@ -341,7 +552,7 @@ mod tests {
         for old in [
             "git version 2.39.3 (Apple Git-146)",
             "git version 2.45.0",
-            "git version 2.30.2",
+            "git version 2.36.0",
         ] {
             let error = assess_for_clone(&preflight_of(old), false).expect_err(old);
             assert!(
@@ -349,6 +560,9 @@ mod tests {
                 "{old}: {error}"
             );
         }
+        // Below the app's own floor the preflight message is what a user sees,
+        // and cloning is still refused.
+        assert!(assess_for_clone(&preflight_of("git version 2.30.2"), false).is_err());
         for ok in [
             "git version 2.45.1",
             "git version 2.50.1",
@@ -420,3 +634,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "preflight_adv_l1_tests.rs"]
+mod adv_l1_tests;

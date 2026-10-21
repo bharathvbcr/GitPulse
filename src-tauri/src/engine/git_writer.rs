@@ -383,9 +383,11 @@ fn commit_graph_stop_intents() -> &'static Mutex<HashMap<PathBuf, std::time::Ins
 /// How long an unanswered Stop waits for its write to register.
 const COMMIT_GRAPH_STOP_INTENT_LIFETIME: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Oldest git whose `commit-graph write` accepts `--changed-paths` (2.27).
-/// Older gits refuse the argv, so neither the plan nor the writer offers it.
-pub(crate) const COMMIT_GRAPH_CHANGED_PATHS_GIT: (u32, u32, u32) = (2, 27, 0);
+/// Oldest git whose `commit-graph write` accepts `--changed-paths`. Older gits
+/// refuse the argv, so neither the plan nor the writer offers it. The minimum
+/// is the capability table's row; this is its name here.
+pub(crate) const COMMIT_GRAPH_CHANGED_PATHS_GIT: (u32, u32, u32) =
+    crate::engine::git_cli::COMMIT_GRAPH_CHANGED_PATHS;
 
 /// Registers a write's cancel flag (already set when a stop was waiting for
 /// it) and unregisters it, with any unclaimed stop, however the run ends.
@@ -2479,18 +2481,48 @@ Unset the local override with `git config --local --unset-all user.name` and \
     }
 
     /// Runs a previously planned `push` argv. Refuses anything other than
-    /// `--force-with-lease`, `-u`, and validated ref names so a caller cannot
-    /// smuggle `--force` past the lease-only contract.
+    /// the exact `--force-with-lease --force-if-includes` pair, `-u`, and
+    /// validated ref names so a caller cannot smuggle `--force`, a lease with
+    /// an explicit expected value, or a lease without the includes check past
+    /// the contract.
     pub fn push_planned(repo_path: &str, args: &[String]) -> Result<String, String> {
         let repo = validate_repo(repo_path)?;
         if args.first().map(String::as_str) != Some("push") {
             return Err("internal: planned push argv must start with push".into());
         }
+        let mut forced = [false; 2];
         for arg in args.iter().skip(1) {
-            if arg == "--force-with-lease" || arg == "-u" {
+            if arg == "-u" {
+                continue;
+            }
+            if let Some(slot) = FORCE_PUSH_FLAGS.iter().position(|flag| arg == flag) {
+                if std::mem::replace(&mut forced[slot], true) {
+                    return Err(format!("Duplicate push flag {arg}"));
+                }
                 continue;
             }
             validate_ref_name(arg)?;
+        }
+        if forced[0] != forced[1] {
+            return Err(
+                "A forced push carries --force-with-lease and --force-if-includes together, \
+                 or neither"
+                    .into(),
+            );
+        }
+        if forced[0] {
+            require_force_if_includes(&crate::engine::git_cli::git_preflight())?;
+        }
+        // Positionals are `<remote> [<branch>]`. The branch slot is a plain
+        // branch name: git reads `+x` and `src:dst` there as refspecs, and
+        // `+` is a per-ref force with no lease.
+        for branch in args
+            .iter()
+            .skip(1)
+            .filter(|arg| arg.as_str() != "-u" && !FORCE_PUSH_FLAGS.contains(&arg.as_str()))
+            .skip(1)
+        {
+            validate_push_branch(branch)?;
         }
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
@@ -2503,7 +2535,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         if let Some(repository) = args
             .iter()
             .skip(1)
-            .find(|arg| arg.as_str() != "--force-with-lease" && arg.as_str() != "-u")
+            .find(|arg| arg.as_str() != "-u" && !FORCE_PUSH_FLAGS.contains(&arg.as_str()))
         {
             crate::engine::remotes::require_configured(&repo, repository)?;
         }
@@ -3594,6 +3626,79 @@ fn unpublished_push_remote(repo: &Path) -> Result<String, String> {
     ))
 }
 
+/// The pair a force push carries. A bare `--force-with-lease` compares against
+/// the remote-tracking ref, which a background fetch moves to commits the user
+/// never saw; `--force-if-includes` additionally requires that the local
+/// branch contain that ref's tip, so the lease cannot be satisfied by a fetch.
+const FORCE_PUSH_FLAGS: [&str; 2] = ["--force-with-lease", "--force-if-includes"];
+
+/// Fails closed: a force push without `--force-if-includes` is the unsafe
+/// shape, so a git that lacks it, or could not be probed, refuses the push.
+///
+/// An old git and an unprobed one are different answers. A git that reported a
+/// version below 2.30 is told to update. Any other probe outcome says the
+/// version could not be read just now; when the probe was shed under load, the
+/// refusal is that deferral's own message, so the frontend's retry classifier
+/// reads it as `deferred_under_load` rather than as a terminal failure.
+fn require_force_if_includes(
+    preflight: &crate::engine::git_cli::GitPreflight,
+) -> Result<(), String> {
+    use crate::engine::git_cli::{is_deferred_under_load, supports, GitPreflightStatus};
+    if supports(preflight, crate::engine::git_cli::FORCE_IF_INCLUDES) {
+        return Ok(());
+    }
+    if preflight.status == GitPreflightStatus::Outdated {
+        // Outdated is relative to GitPulse's own floor, which is above 2.30:
+        // a 2.30 to 2.35 git has the flag and is refused for the floor.
+        let found = preflight
+            .version
+            .as_deref()
+            .and_then(crate::engine::git_cli::parse_git_version);
+        return Err(match found {
+            Some((major, minor, patch))
+                if (major, minor, patch) >= crate::engine::git_cli::FORCE_IF_INCLUDES =>
+            {
+                let (min_major, min_minor, _) = crate::engine::git_cli::MIN_GIT_VERSION;
+                format!(
+                    "Force push is refused because this Git ({major}.{minor}.{patch}) is below \
+                     GitPulse's minimum, Git {min_major}.{min_minor}. {} Update Git, then \
+                     restart GitPulse.",
+                    preflight.message.as_deref().unwrap_or_default()
+                )
+            }
+            _ => "Force push needs `--force-if-includes`, which requires Git 2.30 or newer, and \
+                  this Git is older. Update Git, then restart GitPulse."
+                .to_string(),
+        });
+    }
+    let detail = preflight
+        .message
+        .as_deref()
+        .unwrap_or("no version was reported");
+    let detail = detail
+        .strip_prefix("Git could not be checked yet: ")
+        .unwrap_or(detail);
+    if is_deferred_under_load(detail) {
+        return Err(detail.to_string());
+    }
+    Err(format!(
+        "Force push needs `--force-if-includes` (Git 2.30 or newer), but Git's version could not \
+         be checked just now: {detail}"
+    ))
+}
+
+/// A branch given to a push: a valid ref name that is not refspec syntax.
+fn validate_push_branch(name: &str) -> Result<(), String> {
+    validate_ref_name(name)?;
+    if name.starts_with('+') || name.contains(':') {
+        return Err(format!(
+            "Refusing to push `{name}`: a push takes a plain branch name, and a leading `+` \
+             or a `:` is refspec syntax (`+` forces the push without a lease)."
+        ));
+    }
+    Ok(())
+}
+
 fn plan_push_argv(
     repo: &Path,
     remote: Option<&str>,
@@ -3602,7 +3707,8 @@ fn plan_push_argv(
 ) -> Result<Vec<String>, String> {
     let mut args = vec!["push".to_string()];
     if force {
-        args.push("--force-with-lease".into());
+        require_force_if_includes(&crate::engine::git_cli::git_preflight())?;
+        args.extend(FORCE_PUSH_FLAGS.map(String::from));
     }
     match (remote, branch) {
         (None, None) => {
@@ -3610,7 +3716,7 @@ fn plan_push_argv(
                 let branch = current_branch_name(repo)?;
                 let remote = unpublished_push_remote(repo)?;
                 validate_ref_name(&remote)?;
-                validate_ref_name(&branch)?;
+                validate_push_branch(&branch)?;
                 args.push("-u".into());
                 args.push(remote);
                 args.push(branch);
@@ -3624,7 +3730,7 @@ fn plan_push_argv(
         (Some(remote), Some(branch)) => {
             crate::engine::remotes::require_configured(repo, remote)?;
             validate_ref_name(remote)?;
-            validate_ref_name(branch)?;
+            validate_push_branch(branch)?;
             args.push(remote.to_string());
             args.push(branch.to_string());
         }
@@ -3633,7 +3739,7 @@ fn plan_push_argv(
             // branch given without a remote must never be emitted alone: it
             // would turn any caller-supplied word into a push target. The
             // remote is resolved explicitly, from a configured name.
-            validate_ref_name(branch)?;
+            validate_push_branch(branch)?;
             let remote = implicit_push_remote(repo)?;
             validate_ref_name(&remote)?;
             args.push(remote);
@@ -5869,7 +5975,14 @@ mod tests {
         let argv = GitWriter::plan_push(&repo_path(&repo), None, None, true).unwrap();
         assert_eq!(
             argv,
-            vec!["push", "--force-with-lease", "-u", "origin", "main"]
+            vec![
+                "push",
+                "--force-with-lease",
+                "--force-if-includes",
+                "-u",
+                "origin",
+                "main"
+            ]
         );
     }
 
@@ -6125,9 +6238,16 @@ mod tests {
             repo.path(),
             &["remote", "add", "origin", origin.path().to_str().unwrap()],
         );
-        let args: Vec<String> = ["push", "--force-with-lease", "-u", "elsewhere", "main"]
-            .map(String::from)
-            .to_vec();
+        let args: Vec<String> = [
+            "push",
+            "--force-with-lease",
+            "--force-if-includes",
+            "-u",
+            "elsewhere",
+            "main",
+        ]
+        .map(String::from)
+        .to_vec();
         let err = GitWriter::push_planned(&repo_path(&repo), &args).unwrap_err();
         assert!(
             err.contains("elsewhere") && err.contains("not a configured remote"),
@@ -6156,6 +6276,164 @@ mod tests {
         assert_eq!(
             err, "Invalid ref name",
             "raw --force starts with '-' so validate_ref_name must refuse it before git runs"
+        );
+    }
+
+    #[test]
+    fn a_force_push_plans_the_lease_and_includes_pair() {
+        let origin = init_bare();
+        let repo = init_repo_with_commit();
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        let forced =
+            GitWriter::plan_push(&repo_path(&repo), Some("origin"), Some("main"), true).unwrap();
+        assert_eq!(
+            forced,
+            vec![
+                "push",
+                "--force-with-lease",
+                "--force-if-includes",
+                "origin",
+                "main"
+            ]
+        );
+        let plain =
+            GitWriter::plan_push(&repo_path(&repo), Some("origin"), Some("main"), false).unwrap();
+        assert_eq!(plain, vec!["push", "origin", "main"]);
+        let nested =
+            GitWriter::plan_push(&repo_path(&repo), Some("origin"), Some("feat/x"), true).unwrap();
+        assert_eq!(&nested[1..3], FORCE_PUSH_FLAGS);
+    }
+
+    #[test]
+    fn push_planned_accepts_only_the_exact_force_pair() {
+        let origin = init_bare();
+        let repo = init_repo_with_commit();
+        git_in(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        let run = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+            GitWriter::push_planned(&repo_path(&repo), &args)
+        };
+        run(&[
+            "push",
+            "--force-with-lease",
+            "--force-if-includes",
+            "-u",
+            "origin",
+            "main",
+        ])
+        .expect("the pair, with -u, pushes");
+        run(&[
+            "push",
+            "--force-with-lease",
+            "--force-if-includes",
+            "origin",
+            "main",
+        ])
+        .expect("the pair pushes");
+        for refused in [
+            vec!["push", "--force", "origin", "main"],
+            vec!["push", "-f", "origin", "main"],
+            vec![
+                "push",
+                "--force-with-lease=main:abc",
+                "--force-if-includes",
+                "origin",
+            ],
+            vec!["push", "--force-with-lease", "origin", "main"],
+            vec!["push", "--force-if-includes", "origin", "main"],
+            vec![
+                "push",
+                "--force-with-lease",
+                "--force-with-lease",
+                "--force-if-includes",
+                "origin",
+            ],
+            vec![
+                "push",
+                "--force-with-lease",
+                "--force-if-includes",
+                "--no-verify",
+                "origin",
+            ],
+        ] {
+            assert!(run(&refused).is_err(), "{refused:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn force_push_is_refused_without_force_if_includes_and_names_it() {
+        use crate::engine::git_cli::{GitPreflight, GitPreflightStatus};
+        let probe = |status, line: &str| GitPreflight {
+            status,
+            version: Some(line.to_string()),
+            message: Some("too old".into()),
+        };
+        let err =
+            require_force_if_includes(&probe(GitPreflightStatus::Outdated, "git version 2.29.3"))
+                .unwrap_err();
+        assert!(
+            err.contains("--force-if-includes") && err.contains("2.30") && err.contains("older"),
+            "{err}"
+        );
+        let below_floor =
+            require_force_if_includes(&probe(GitPreflightStatus::Outdated, "git version 2.34.1"))
+                .unwrap_err();
+        assert!(
+            below_floor.contains("2.34.1")
+                && below_floor.contains("minimum")
+                && !below_floor.contains("2.30")
+                && !below_floor.contains("older"),
+            "2.34.1 has the flag and must not be told it lacks it: {below_floor}"
+        );
+        let ancient =
+            require_force_if_includes(&probe(GitPreflightStatus::Outdated, "git version 2.29.0"))
+                .unwrap_err();
+        assert!(ancient.contains("--force-if-includes"), "{ancient}");
+        assert!(
+            require_force_if_includes(&probe(GitPreflightStatus::Ok, "git version 2.36.0")).is_ok()
+        );
+    }
+
+    /// A background fetch moves `origin/main` to a commit the user never
+    /// integrated; amending and force pushing then satisfies a bare
+    /// `--force-with-lease` and destroys it. With `--force-if-includes` the
+    /// push is refused and the remote keeps the other clone's commit. (On the
+    /// pre-fix argv, `git push --force-with-lease origin main` here succeeds
+    /// and the remote ref becomes the amended commit.)
+    #[test]
+    fn force_push_after_auto_fetch_cannot_destroy_an_unseen_commit() {
+        let (local, origin) = diverged_clone();
+        let remote_tip = |dir: &Path| git_text(dir, &["rev-parse", "refs/heads/main"]).unwrap();
+        let theirs = remote_tip(origin.path());
+        GitWriter::auto_fetch(&repo_path(&local)).expect("auto-fetch runs");
+        git_ok(
+            local.path(),
+            &["commit", "-q", "--amend", "-m", "mine, amended"],
+        );
+        let err = GitWriter::push(&repo_path(&local), Some("origin"), Some("main"), true)
+            .expect_err("the lease must hold against an unseen commit");
+        assert!(!err.is_empty());
+        assert_eq!(
+            remote_tip(origin.path()),
+            theirs,
+            "the remote ref is untouched"
+        );
+
+        // The control: the argv this replaces overwrites it.
+        git_ok(
+            local.path(),
+            &["push", "-q", "--force-with-lease", "origin", "main"],
+        );
+        assert_ne!(
+            remote_tip(origin.path()),
+            theirs,
+            "a bare lease is what auto-fetch defeats"
         );
     }
 
@@ -7466,6 +7744,10 @@ mod bound_to_checked_state {
 #[cfg(test)]
 #[path = "git_writer_adv_tests.rs"]
 mod adv_tests;
+
+#[cfg(test)]
+#[path = "git_writer_adv_l1_tests.rs"]
+mod adv_l1_tests;
 
 #[cfg(test)]
 #[path = "git_writer_commit_graph_tests.rs"]
