@@ -205,11 +205,12 @@ fn interleaved_silent_denial_then_foreign_grant_matches_always_write() {
             let now = t0 + i * 17_000_000;
             let (x, ox) = if i % 3 == 0 { (&b, &ob) } else { (&a, &oa) };
             lane += u32::from(x.take_at(0, burst, per_sec, now) == Take::Granted);
-            oracle += u32::from(
-                take_always_writing(ox, 0, burst, per_sec, now) == Take::Granted,
-            );
+            oracle += u32::from(take_always_writing(ox, 0, burst, per_sec, now) == Take::Granted);
         }
-        assert!(lane <= oracle, "rate {per_sec}: lane {lane} oracle {oracle}");
+        assert!(
+            lane <= oracle,
+            "rate {per_sec}: lane {lane} oracle {oracle}"
+        );
     }
 }
 
@@ -241,8 +242,7 @@ fn clock_forward_then_back_does_not_pay_more_than_always_write() {
         (t0 + 90 * SEC, 0),
     ] {
         lane += u32::from(a.take_at(floor, burst, per_sec, t) == Take::Granted);
-        oracle +=
-            u32::from(take_always_writing(&o, floor, burst, per_sec, t) == Take::Granted);
+        oracle += u32::from(take_always_writing(&o, floor, burst, per_sec, t) == Take::Granted);
     }
     assert!(lane <= oracle, "lane {lane} oracle {oracle}");
 }
@@ -250,7 +250,13 @@ fn clock_forward_then_back_does_not_pay_more_than_always_write() {
 /// ATTACK 1d. Refill anchor at the edge of u64.
 #[test]
 fn anchor_near_u64_max_mints_nothing_and_does_not_panic() {
-    for anchor in [u64::MAX, u64::MAX - 1, u64::MAX - 999_999, u64::MAX - SEC, u64::MAX / 2] {
+    for anchor in [
+        u64::MAX,
+        u64::MAX - 1,
+        u64::MAX - 999_999,
+        u64::MAX - SEC,
+        u64::MAX / 2,
+    ] {
         for now in [0u64, 1, anchor.saturating_sub(1), anchor, u64::MAX] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join(FILE_NAME);
@@ -275,7 +281,8 @@ fn anchor_near_u64_max_mints_nothing_and_does_not_panic() {
             // stepped-back clock re-anchors there) can be credited.
             let end = now.saturating_add(49_000_000);
             let from = if now >= anchor { anchor } else { now };
-            let allowed = u32::try_from((end - from) / 1_000_000 * 8 / 1000).unwrap_or(u32::MAX)
+            let allowed = u32::try_from((end - from) / 1_000_000 * 8 / 1000)
+                .unwrap_or(u32::MAX)
                 .saturating_add(1);
             assert!(
                 grants <= allowed.min(8),
@@ -298,10 +305,18 @@ fn foreign_blob_after_silent_denial_resets_empty_and_stays_empty() {
         assert_eq!(h.take_at(0, burst, per_sec, t0), Take::Granted);
     }
     for i in 0..30u64 {
-        assert_eq!(h.take_at(0, burst, per_sec, t0 + i * 10_000_000), Take::Denied);
+        assert_eq!(
+            h.take_at(0, burst, per_sec, t0 + i * 10_000_000),
+            Take::Denied
+        );
     }
     let path = dir.path().join("l");
-    for blob in [stamped(1, burst, t0), b"xx".to_vec(), vec![0u8; 31], stamped(3, 99, t0)] {
+    for blob in [
+        stamped(1, burst, t0),
+        b"xx".to_vec(),
+        vec![0u8; 31],
+        stamped(3, 99, t0),
+    ] {
         std::fs::write(&path, &blob).unwrap();
         let now = t0 + 400_000_000;
         let out = h.take_at(0, burst, per_sec, now);
@@ -414,7 +429,10 @@ fn four_waiters_each_get_tokens_under_the_nap_schedule() {
         max <= min.saturating_mul(4).max(8),
         "grants are lopsided: {per:?}"
     );
-    assert!(total >= 40, "the record's 8/s refill was underused: {total}");
+    assert!(
+        total >= 40,
+        "the record's 8/s refill was underused: {total}"
+    );
 }
 
 /// ATTACK 2b. One impatient hog re-enters instantly against three patient
@@ -442,8 +460,9 @@ fn patient_waiters_are_not_starved_by_an_instant_reentrant() {
                     let (mut ok, mut refused) = (0u64, 0u64);
                     while Instant::now() < end {
                         let d = Instant::now() + Duration::from_millis(1_500);
-                        match with_admission(Admission::Reactive, || gate.acquire_judged(d, &|| false))
-                        {
+                        match with_admission(Admission::Reactive, || {
+                            gate.acquire_judged(d, &|| false)
+                        }) {
                             Ok(_p) => ok += 1,
                             Err(_) => refused += 1,
                         }
@@ -458,7 +477,10 @@ fn patient_waiters_are_not_starved_by_an_instant_reentrant() {
         )
     });
     println!("HOG: hog grants {hog}; patient (grants, refusals) {patient:?}");
-    assert!(patient.iter().all(|p| p.0 >= 1), "patient starved: hog {hog}, {patient:?}");
+    assert!(
+        patient.iter().all(|p| p.0 >= 1),
+        "patient starved: hog {hog}, {patient:?}"
+    );
 }
 
 /// ATTACK 2c. A waiter whose LOCAL bucket is the empty one, after an earlier
@@ -523,7 +545,11 @@ fn cancel_mid_nap_returns_within_the_poll_cap_and_short_deadlines_hold() {
             (r.err().map(|e| e.0), Instant::now())
         });
         assert_eq!(res, Some(Refusal::Cancelled), "iteration {}", lat.len());
-        println!("CANCEL iter {}: {:?}", lat.len(), done.duration_since(set_at.lock().unwrap().unwrap()));
+        println!(
+            "CANCEL iter {}: {:?}",
+            lat.len(),
+            done.duration_since(set_at.lock().unwrap().unwrap())
+        );
         lat.push(done.duration_since(set_at.lock().unwrap().unwrap()));
     }
     let worst = lat.iter().max().copied().unwrap();
@@ -540,13 +566,22 @@ fn cancel_mid_nap_returns_within_the_poll_cap_and_short_deadlines_hold() {
         gate.acquire_judged(began + Duration::from_millis(120), &|| false)
     });
     let took = began.elapsed();
-    assert!(matches!(r, Err((Refusal::Refused { .. }, Some(_)))), "{:?}", r.err());
+    assert!(
+        matches!(r, Err((Refusal::Refused { .. }, Some(_)))),
+        "{:?}",
+        r.err()
+    );
     println!("DEADLINE: refused after {took:?} (deadline 120 ms)");
     assert!(
-        took < coverage_relaxed(Duration::from_millis(120) + host_wake_50ms() + Duration::from_millis(40)),
+        took < coverage_relaxed(
+            Duration::from_millis(120) + host_wake_50ms() + Duration::from_millis(40)
+        ),
         "slept past the deadline: {took:?}"
     );
-    assert!(took >= Duration::from_millis(110), "returned early: {took:?}");
+    assert!(
+        took >= Duration::from_millis(110),
+        "returned early: {took:?}"
+    );
 }
 
 /// The worst of six real 50 ms `Condvar::wait_timeout`s here, independent of
@@ -592,7 +627,10 @@ fn refusal_tail_is_single_line_json_safe_and_classified() {
         },
     ] {
         let message = refusal_message_at("git status", refusal, level);
-        assert!(!message.contains(['\n', '\r', '"', '\\', '\t']), "{message}");
+        assert!(
+            !message.contains(['\n', '\r', '"', '\\', '\t']),
+            "{message}"
+        );
         assert!(message.chars().all(|c| !c.is_control()), "{message}");
         let json = serde_json::to_string(&message).unwrap();
         assert_eq!(json.len(), message.len() + 2, "needed escaping: {message}");
