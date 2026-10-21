@@ -261,11 +261,7 @@ fn the_reflog_identity_query_uses_its_partial_index() {
     append(draft(&repo, "git.commit")).unwrap();
     let plan: Vec<String> = with_conn(&repo, |conn| {
         let mut stmt = conn
-            .prepare(
-                "EXPLAIN QUERY PLAN SELECT object FROM events
-                 WHERE action LIKE 'reflog.%' AND object IS NOT NULL
-                   AND (worktree_path IN (?1, ?2) OR (?3 AND worktree_path IS NULL))",
-            )
+            .prepare(&format!("EXPLAIN QUERY PLAN {RECORDED_REFLOG_SQL}"))
             .map_err(|e| LedgerError::new("t", e.to_string()))?;
         let rows = stmt
             .query_map(params!["a", "a", true], |row| row.get::<_, String>(3))
@@ -276,6 +272,31 @@ fn the_reflog_identity_query_uses_its_partial_index() {
     .unwrap();
     assert!(
         plan.iter().all(|step| step.contains("idx_events_reflog")),
+        "{plan:?}"
+    );
+}
+
+/// The per-pass legacy read is bounded by append time: it walks the time index,
+/// not the checkout's whole reflog history.
+#[test]
+fn the_legacy_reflog_read_since_a_time_uses_the_time_index() {
+    let (_dir, repo) = repo_dir();
+    append(draft(&repo, "git.commit")).unwrap();
+    let plan: Vec<String> = with_conn(&repo, |conn| {
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {RECORDED_REFLOG_SINCE_SQL}"))
+            .map_err(|e| LedgerError::new("t", e.to_string()))?;
+        let rows = stmt
+            .query_map(params!["a", "a", true, "2026-01-01T00:00:00.000Z"], |row| {
+                row.get::<_, String>(3)
+            })
+            .map_err(|e| LedgerError::new("t", e.to_string()))?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|e| LedgerError::new("t", e.to_string()))
+    })
+    .unwrap();
+    assert!(
+        plan.iter().all(|step| step.contains("idx_events_ts")),
         "{plan:?}"
     );
 }

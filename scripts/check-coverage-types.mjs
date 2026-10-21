@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 103 contracts over
- * 252 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 104 contracts over
+ * 256 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -174,6 +174,11 @@ export const CONTRACTS = Object.freeze([
     "CollisionParty", "CollisionItem", "CollisionRisk", "InsightsSnapshot",
     "ChangedFile", "ActiveChanges", "ChangeContext", "McpToolInfo", "McpInfo",
   ] },
+  // `gitpulse_merge_conflicts`: an agent branches on `ok`, `truncated` and the
+  // counts to tell a floor from the whole, so a renamed field would read as a
+  // clean, complete answer. `MergeCandidate` (the `verdict` of each pair) is an
+  // enum, covered by scripts/enum-variant-contract.test.ts.
+  { label: "merge-conflicts", rustPath: rust("insights", "merge_conflicts.rs"), tsPath: ts("insights", "types.ts"), structs: ["MergeConflicts", "PairVerdict"] },
   // The Fleet grid's two wire surfaces. The metrics row is the one that must
   // not drift: every field is nullable ON PURPOSE — a null value with a null
   // timestamp is "never scanned", and a field that silently became
@@ -212,7 +217,7 @@ export const CONTRACTS = Object.freeze([
   { label: "storage", rustPath: rust("storage", "mod.rs"), tsPath: ts("storage", "types.ts"), structs: ["StorageReport"] },
   // The commit-graph census inside StorageReport. `unknown` and the nullable
   // facts are what keep "could not check" from rendering as "missing".
-  { label: "commit-graph", rustPath: rust("storage", "commit_graph.rs"), tsPath: ts("storage", "types.ts"), structs: ["CommitGraphReport"] },
+  { label: "commit-graph", rustPath: rust("storage", "commit_graph.rs"), tsPath: ts("storage", "types.ts"), structs: ["CommitGraphReport", "CommitGraphWritePlan", "CommitGraphWriteOutcome"] },
   { label: "pulse", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("pulse", "types.ts"), structs: ["PulseReport", "PulseCommitSummary", "PulseFileChurn", "PulseExtensionChurn", "AuthorOwnership", "OrphanedFile", "CodeAgeDistribution", "KnowledgeReport", "AreaCoverage", "DoraReport"] },
   { label: "commit-signature", rustPath: rust("engine", "commit_signature.rs"), tsPath: ts("pulse", "types.ts"), structs: ["CommitSignatureCheck"] },
   { label: "pulse-snapshots", rustPath: rust("ledger", "mod.rs"), tsPath: ts("pulse", "types.ts"), structs: ["PulseSnapshotInput", "PulseSnapshotEntry"] },

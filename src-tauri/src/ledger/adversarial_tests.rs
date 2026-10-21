@@ -102,7 +102,7 @@ fn existing_queries() -> Vec<(&'static str, String, Vec<String>)> {
             "SELECT object,
                     CASE WHEN json_valid(detail_json)
                          THEN json_extract(detail_json, '$.object_truncated.hash') END
-             FROM events
+             FROM events INDEXED BY idx_events_reflog
              WHERE action LIKE 'reflog.%' AND object IS NOT NULL
                AND (worktree_path IN (?1, ?2) OR (?3 AND worktree_path IS NULL))"
                 .to_string(),
@@ -678,4 +678,67 @@ fn first_open_index_build_time_on_45k_rows() {
         Ok(())
     })
     .unwrap();
+}
+
+/// OD 1: migrating a writer-generation-1 ledger (new column, two tables, the
+/// unique reflog index) must not move any existing query off its old plan.
+/// The "before" plans come from the same database before the migration ran.
+#[test]
+fn the_od1_migration_keeps_every_existing_query_on_its_old_plan() {
+    use super::super::schema_bump_tests::{old_insert, old_ledger};
+    for analyzed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_str().unwrap().to_string();
+        let db = old_ledger(&repo);
+        let old = Connection::open(&db).unwrap();
+        old.execute_batch("BEGIN").unwrap();
+        for n in 0..4_000 {
+            let (worktree, action, object) = match n % 8 {
+                0 => ("/w/1", "worktree.bind", format!("o{n}")),
+                1 => ("/w/1", "worktree.unbind", format!("o{n}")),
+                2 | 3 => ("/w/1", "reflog.commit", format!("obj-z{n}")),
+                _ => ("/w/2", "session.command", format!("obj-{n}")),
+            };
+            old_insert(
+                &old,
+                &format!("U{n:025}"),
+                Some(worktree),
+                action,
+                Some(&object),
+                None,
+            );
+        }
+        old.execute_batch("COMMIT").unwrap();
+        if analyzed {
+            old.execute_batch("ANALYZE").unwrap();
+        }
+        let before = plans(&old);
+        drop(old);
+
+        let conn = open(&db).expect("the migration runs on open");
+        if analyzed {
+            conn.execute_batch("ANALYZE").unwrap();
+        }
+        let after = plans(&conn);
+        let moved: Vec<String> = before
+            .iter()
+            .zip(&after)
+            .filter(|(b, a)| a != b)
+            .map(|((label, was), (_, now))| format!("{label}\n   now: {now:?}\n   was: {was:?}"))
+            .collect();
+        assert!(
+            moved.is_empty(),
+            "analyzed={analyzed}: plans changed:\n{}",
+            moved.join("\n")
+        );
+        // And every one of them still runs against the migrated ledger.
+        for (label, sql, values) in existing_queries() {
+            let mut stmt = conn
+                .prepare(&sql)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            stmt.query_map(rusqlite::params_from_iter(values.iter()), |_| Ok(()))
+                .unwrap_or_else(|e| panic!("{label}: {e}"))
+                .for_each(|row| row.unwrap());
+        }
+    }
 }

@@ -439,23 +439,11 @@ pub(crate) fn through_stamped_coalesced(
     stamp: Option<&Stamp>,
     run: impl FnOnce() -> Result<(String, bool), String>,
 ) -> Result<String, String> {
-    type Key = (PathBuf, Vec<String>, u64, git_cli::Admission);
-    // The answer travels with what the leader's producers wrote on its thread
-    // (`ipc_error::snapshot`), so a waiter's command types the leader's refusal
-    // the way the leader's does: the text alone says nothing about its kind.
-    type Flights =
-        crate::singleflight::SingleFlight<Key, (Result<String, String>, crate::ipc_error::Records)>;
-    static FLIGHTS: OnceLock<Flights> = OnceLock::new();
     let Some(stamped) = stamp else {
         return through_stamped(repo, args, None, run);
     };
-    let key = (
-        repo.to_path_buf(),
-        args.iter().map(|arg| (*arg).to_string()).collect(),
-        stamped.0.fingerprint(),
-        git_cli::current_admission(),
-    );
-    let (answer, records) = FLIGHTS.get_or_init(Flights::default).run(key, || {
+    let key = coalesce_key(repo, args, stamped);
+    let (answer, records) = coalesced_flights().run(key, || {
         let answer = through_stamped(repo, args, stamp, run);
         (answer, crate::ipc_error::snapshot())
     });
@@ -463,10 +451,40 @@ pub(crate) fn through_stamped_coalesced(
     answer
 }
 
+type CoalesceKey = (PathBuf, Vec<String>, u64, git_cli::Admission);
+// The answer travels with what the leader's producers wrote on its thread
+// (`ipc_error::snapshot`), so a waiter's command types the leader's refusal
+// the way the leader's does: the text alone says nothing about its kind.
+type CoalescedFlights = crate::singleflight::SingleFlight<
+    CoalesceKey,
+    (Result<String, String>, crate::ipc_error::Records),
+>;
+
+fn coalesced_flights() -> &'static CoalescedFlights {
+    static FLIGHTS: OnceLock<CoalescedFlights> = OnceLock::new();
+    FLIGHTS.get_or_init(CoalescedFlights::default)
+}
+
+fn coalesce_key(repo: &Path, args: &[&str], stamp: &Stamp) -> CoalesceKey {
+    (
+        repo.to_path_buf(),
+        args.iter().map(|arg| (*arg).to_string()).collect(),
+        stamp.0.fingerprint(),
+        git_cli::current_admission(),
+    )
+}
+
+/// Callers that have joined the coalesced run now in flight for this ask, keyed
+/// as the calling thread would key it; 0 when none is running.
+#[cfg(test)]
+fn coalesced_followers(repo: &Path, args: &[&str], stamp: &Stamp) -> usize {
+    coalesced_flights().followers(&coalesce_key(repo, args, stamp))
+}
+
 /// The monotonic "now" the TTL is measured on. Production reads the real
 /// clock; tests install a [`ManualClock`] so the TTL boundary needs no sleep.
 #[cfg(not(test))]
-fn mono_now() -> Instant {
+pub(crate) fn mono_now() -> Instant {
     Instant::now()
 }
 
@@ -493,8 +511,20 @@ thread_local! {
     static CLOCK: std::cell::Cell<Option<(Instant, SystemTime)>> = const { std::cell::Cell::new(None) };
 }
 
+/// Whether [`mono_now`] is a test's [`ManualClock`] rather than the real clock:
+/// the one thing that tells a deadline stamped on it from one on the real clock.
+#[cfg(not(test))]
+pub(crate) fn mono_is_manual() -> bool {
+    false
+}
+
 #[cfg(test)]
-fn mono_now() -> Instant {
+pub(crate) fn mono_is_manual() -> bool {
+    CLOCK.with(|cell| cell.get().is_some())
+}
+
+#[cfg(test)]
+pub(crate) fn mono_now() -> Instant {
     CLOCK
         .with(std::cell::Cell::get)
         .map_or_else(Instant::now, |(mono, _)| mono)
@@ -1555,7 +1585,7 @@ mod tests {
         let repo = fx.main.clone();
         let runs = std::sync::Arc::new(AtomicUsize::new(0));
         let (stamp_tx, stamp_rx) = mpsc::channel::<Stamp>();
-        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (leading_tx, leading_rx) = mpsc::channel::<()>();
         let leader = {
             let repo = repo.clone();
             let runs = runs.clone();
@@ -1569,8 +1599,18 @@ mod tests {
                     Some(&stamp),
                     || {
                         runs.fetch_add(1, Ordering::SeqCst);
-                        let _ = started_rx.recv_timeout(Duration::from_secs(10));
-                        std::thread::sleep(Duration::from_millis(300));
+                        // Hold the run open until a follower has registered on
+                        // it (bounded), instead of assuming one has after a
+                        // sleep: under load the waiter can be arbitrarily late.
+                        leading_tx.send(()).unwrap();
+                        let deadline = Instant::now()
+                            + crate::test_support::coverage_relaxed(Duration::from_secs(10));
+                        while coalesced_followers(&repo, &["log", "adv-coalesce-thread"], &stamp)
+                            == 0
+                            && Instant::now() < deadline
+                        {
+                            std::thread::yield_now();
+                        }
                         Ok(("leader-answer".to_string(), true))
                     },
                 );
@@ -1578,12 +1618,18 @@ mod tests {
             })
         };
         let stamp = stamp_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        // The waiter starts only once the leader's run is open, so the two
+        // threads cannot swap roles (the waiter reaching the flight first).
+        leading_rx
+            .recv_timeout(crate::test_support::coverage_relaxed(Duration::from_secs(
+                10,
+            )))
+            .unwrap();
         let waiter = {
             let repo = repo.clone();
             let runs = runs.clone();
             let stamp = stamp.clone();
             std::thread::spawn(move || {
-                started_tx.send(()).unwrap();
                 through_stamped_coalesced(
                     &repo,
                     &["log", "adv-coalesce-thread"],
@@ -1626,7 +1672,7 @@ mod tests {
         let repo = fx.main.clone();
         let runs = std::sync::Arc::new(AtomicUsize::new(0));
         let (stamp_tx, stamp_rx) = mpsc::channel::<Stamp>();
-        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (leading_tx, leading_rx) = mpsc::channel::<()>();
         let leader = {
             let repo = repo.clone();
             let runs = runs.clone();
@@ -1641,8 +1687,15 @@ mod tests {
                         Some(&stamp),
                         || {
                             runs.fetch_add(1, Ordering::SeqCst);
-                            let _ = started_rx.recv_timeout(Duration::from_secs(10));
-                            std::thread::sleep(Duration::from_millis(300));
+                            leading_tx.send(()).unwrap();
+                            let deadline = Instant::now()
+                                + crate::test_support::coverage_relaxed(Duration::from_secs(10));
+                            while coalesced_followers(&repo, &["log", "coalesced-refusal"], &stamp)
+                                == 0
+                                && Instant::now() < deadline
+                            {
+                                std::thread::yield_now();
+                            }
                             Err(git_cli::refusal_message(
                                 "git log",
                                 git_cli::Refusal::Refused {
@@ -1656,11 +1709,15 @@ mod tests {
             })
         };
         let stamp = stamp_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        leading_rx
+            .recv_timeout(crate::test_support::coverage_relaxed(Duration::from_secs(
+                10,
+            )))
+            .unwrap();
         let waiter = {
             let repo = repo.clone();
             let runs = runs.clone();
             std::thread::spawn(move || {
-                started_tx.send(()).unwrap();
                 run_command_as(Some("cmd_get_file_blame"), || {
                     through_stamped_coalesced(
                         &repo,

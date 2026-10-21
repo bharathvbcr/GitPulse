@@ -296,13 +296,15 @@ fn a_ledger_copied_from_a_live_clone_is_refused_until_the_source_is_gone() {
     assert_refused(&out, "copy or another clone");
     assert_eq!(count_action(&second, "ledger.reanchor"), 0);
 
-    // The honest residual, pinned: two clones of one upstream have the same
-    // root commits and remotes, so once the source is gone the carried ledger
-    // reads as a move. Nothing in a common dir tells the two apart.
+    // Two clones of one upstream have the same root commits and remotes, and a
+    // ledger copy carries the same lineage UUID, so none of those tell them
+    // apart. What does is the directory the ledger was anchored in: the clone
+    // is another one, so the carried ledger stays refused once the source is gone.
     std::fs::remove_dir_all(&first).unwrap();
     ledger::forget_identity_state(&second);
     let out = corpus.pass(&second);
-    assert_eq!(out.reanchored_from, vec![first], "{out:?}");
+    assert_refused(&out, "not the directory the ledger was anchored in");
+    assert_eq!(count_action(&second, "ledger.reanchor"), 0);
 }
 
 /// Threat: a fork shares the root commit and points `origin` elsewhere.
@@ -673,13 +675,13 @@ fn shallow_clone_at(parent: &Path, name: &str) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// Threat (pinned, not endorsed): a different repository that merged this
-/// one's whole history has every root this ledger recorded, so once the source
-/// is gone the carried ledger reads as a move. The rule says "recorded roots
-/// are still roots": it cannot tell a merged-in history from a root added by an
-/// orphan branch, and refusing the first refuses the second.
+/// Threat: a different repository that merged this one's whole history has
+/// every root this ledger recorded, so the roots alone read the carried ledger
+/// as a move once the source is gone. Roots cannot tell a merged-in history
+/// from a root added by an orphan branch; the directory the ledger was anchored
+/// in can, and the merging repository is another directory.
 #[test]
-fn a_repository_that_merged_the_source_history_takes_the_carried_ledger() {
+fn a_repository_that_merged_the_source_history_is_refused_the_carried_ledger() {
     let parent = tempfile::tempdir().unwrap();
     let a = repo_at(parent.path(), "a", "alpha");
     let mut corpus = Corpus::new();
@@ -710,7 +712,87 @@ fn a_repository_that_merged_the_source_history_takes_the_carried_ledger() {
     std::fs::remove_dir_all(&a).unwrap();
     corpus.edit(&b);
     let out = corpus.pass(&b);
-    assert_eq!(out.reanchored_from, vec![a], "{out:?}");
+    assert_refused(&out, "not the directory the ledger was anchored in");
+    assert_eq!(count_action(&b, "ledger.reanchor"), 0);
+}
+
+/// Fable's required test: a cross-device move (a copy to another directory and a
+/// delete of the source, so the checkout is a different inode) is refused with
+/// the adopt action named, and adopting it heals it: the move is then reported,
+/// the pre-move history stays, the adoption is an audit row, and recording
+/// goes on.
+#[test]
+fn a_cross_device_move_is_refused_and_an_adoption_heals_it() {
+    let parent = tempfile::tempdir().unwrap();
+    let old = repo_at(parent.path(), "before", "seed");
+    let mut corpus = Corpus::new();
+    let before_file = corpus.edit(&old);
+    assert_eq!(corpus.pass(&old).recorded, 1);
+
+    // What `mv` across devices does: copy, then delete the source.
+    let new = cp_r(&old, &parent.path().canonicalize().unwrap().join("after"));
+    std::fs::remove_dir_all(&old).unwrap();
+    let after_file = corpus.edit(&new);
+    let out = corpus.pass(&new);
+    assert_refused(&out, "not the directory the ledger was anchored in");
+    assert!(
+        out.error.contains("Adopt this ledger"),
+        "the refusal names the action that heals it: {out:?}"
+    );
+    assert_eq!(count_action(&new, "ledger.reanchor"), 0);
+
+    // A declined adoption changes nothing.
+    let declined = ledger::bindings::adopt_ledger(&new, "user:test", &|_| false).unwrap_err();
+    assert_eq!(declined.code, "adoption_declined");
+    ledger::forget_identity_state(&new);
+    assert_refused(
+        &corpus.pass(&new),
+        "not the directory the ledger was anchored in",
+    );
+
+    let earlier = std::cell::RefCell::new(Vec::new());
+    let adopted = ledger::bindings::adopt_ledger(&new, "user:test", &|paths| {
+        earlier.borrow_mut().extend(paths.iter().cloned());
+        true
+    })
+    .unwrap();
+    assert_eq!(adopted, vec![old.clone()]);
+    assert_eq!(*earlier.borrow(), vec![old.clone()]);
+
+    let out = corpus.pass(&new);
+    assert_eq!((out.recorded, out.error.as_str()), (1, ""), "{out:?}");
+    let rows = transcript_rows(&new);
+    for file in [&before_file, &after_file] {
+        let named = rows.iter().filter(|(_, object, _)| object == file).count();
+        assert_eq!(named, 1, "{file} is neither lost nor duplicated: {rows:?}");
+    }
+    assert_eq!(count_action(&new, "ledger.reanchor"), 1);
+    assert_eq!(
+        count_action(&new, "ledger.adopt"),
+        1,
+        "the adoption is an audit row"
+    );
+}
+
+/// The other side of the same roots rule: a repository that grew an orphan root
+/// (so its roots are a superset of what the ledger recorded) and is then
+/// renamed is still the same directory, and keeps recording.
+#[test]
+fn a_renamed_repository_that_grew_an_orphan_root_keeps_its_ledger() {
+    let parent = tempfile::tempdir().unwrap();
+    let old = repo_at(parent.path(), "grew", "seed");
+    let mut corpus = Corpus::new();
+    corpus.edit(&old);
+    assert_eq!(corpus.pass(&old).recorded, 1);
+    git_in(Path::new(&old), &["checkout", "-q", "--orphan", "island"]);
+    std::fs::write(Path::new(&old).join("island.txt"), "i").unwrap();
+    git_in(Path::new(&old), &["add", "island.txt"]);
+    git_in(Path::new(&old), &["commit", "-q", "-m", "island"]);
+    let new = mv(&old, &parent.path().canonicalize().unwrap().join("renamed"));
+    corpus.edit(&new);
+    let out = corpus.pass(&new);
+    assert_eq!(out.reanchored_from, vec![old], "{out:?}");
+    assert_eq!(out.error, "", "{out:?}");
 }
 
 /// A remote carrying a credential in any spelling is never written to the

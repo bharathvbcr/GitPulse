@@ -2277,6 +2277,7 @@ mod tests {
                         operation_kind: String::new(),
                         is_detached: false,
                         operation_ok: true,
+                        ..Default::default()
                     },
                     WorktreeSummary {
                         path: "/repo/.claude/worktrees/feature".to_string(),
@@ -2290,6 +2291,7 @@ mod tests {
                         operation_kind: String::new(),
                         is_detached: false,
                         operation_ok: true,
+                        ..Default::default()
                     },
                 ],
             },
@@ -4170,6 +4172,7 @@ done
                 operation_kind: String::new(),
                 is_detached: false,
                 operation_ok: true,
+                ..Default::default()
             })
             .collect();
         let brief = session_brief(&snapshot, "/repo", "startup");

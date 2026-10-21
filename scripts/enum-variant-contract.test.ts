@@ -31,6 +31,18 @@ const TS_ROOT = fileURLToPath(new URL("../src/", import.meta.url));
  */
 const NO_TS_MIRROR = new Map<string, string>([
   ["CoverageFormat", "the frontend renders `format` as an opaque label and never branches on it"],
+  [
+    "LandedVia",
+    "`gitpulse_landed` is an MCP read tool: its `via` reaches agents over MCP and has no frontend consumer",
+  ],
+  [
+    "LandedReason",
+    "`gitpulse_landed` is an MCP read tool: its `reason` code reaches agents over MCP and has no frontend consumer",
+  ],
+  [
+    "LandedAtSource",
+    "`gitpulse_landed` is an MCP read tool: its `landed_at_source` reaches agents over MCP and has no frontend consumer",
+  ],
   ["ManviActionKind", "activity labels are produced by the frontend, not parsed from the backend"],
   [
     "PermissionDecision",

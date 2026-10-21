@@ -1,3 +1,84 @@
+# Branch consolidation report — 2026-10-20 (00:30, fifth pass: Wave B, and disk)
+
+The owner repeated the request and added "I am low on device storage". As with Wave A, the integrator (PID 99318) landed **Wave B** itself. This session watched, freed disk, and cleaned up. Nothing was pushed.
+
+**Main moved 94b5d928 → 24a658ef, all by 99318:**
+- the 723aab52 ledger-uuid/adopt lanes (5c6eee8d)
+- card27 reflog replay (6301dfb8)
+- 9cfd4d74 merge-conflicts (d861f0e5)
+- 9cfa4874 graph-write
+- 99318's report 24a658ef, which records "final gate green on d861f0e5"
+
+This session's own report for Wave A is b621f931.
+
+## Disk
+
+Free space went from 16 GiB (99%) to 181 GiB (80%).
+
+| What | Freed | By |
+|---|---|---|
+| `tmp/claude-api-target`: the third pass's cargo cache, idle since 11:59, no open files, its branch already landed | 4.4 GB | this session |
+| b17/723aab52-adv and b17/723aab52-ledger-uuid worktrees (both merged, unlocked, no process cwd), plus 2 `worktree-agent-*` refs | ~37 GB | this session, via `sweep-merged.sh`; backups under `refs/backup/2026-10-19/` |
+| the remaining Wave B lane worktrees | ~140 GB | 99318, after landing |
+
+A request to delete only the idle 9cfa4874-adv lane's `target/` (11 GB) was held by the blast-radius gate and timed out unanswered, so it never ran. 99318 later removed that worktree anyway.
+
+## Sweep and verification
+
+- `git branch --no-merged main` is empty. `git fsck --no-dangling` reports no errors.
+- The sweep kept `claude/epic-volhard-d23b09`, `claude/graft-notify-forward-de1a04` and `claude/vendor-devmap-extract-97`. All three are merged, and their sessions (92675, 67182, 9043) are still running in their worktrees.
+- Left alone:
+  - 99318's detached `tmp/final-gate` worktree (d861f0e5, on main), which it used minutes before this sweep
+  - the detached `seed` worktree
+- **Not committed, because it is not this session's:** uncommitted dependency changes in the main checkout (`package.json`, `bun.lock`, `src-tauri/Cargo.toml`, `Cargo.lock`, `deny.toml`, new `.cargo/audit.toml` and `src-tauri/.cargo/`). Dependency changes need the owner's approval.
+- This session ran no ci:local, because it landed no code. 99318 reports its own final gate.
+
+---
+
+# Branch consolidation report — 2026-10-19 (16:35, fourth pass: Wave A)
+
+The owner repeated "commit and merge all changes and next wave, delete old and stale branches". The next wave was **Wave A**. The live integrator, PID 99318, was landing it, and its card ft-df6bf5ea was `in_progress`. The owner chose to let 99318 land it and to have this session clean up afterwards. This session merged nothing itself, so main had no second integrator racing on it. Nothing was pushed.
+
+**Main moved f0a314c2 → 94b5d928, entirely by 99318:**
+
+| Time | Main | What |
+|---|---|---|
+| 12:00 | ca782694 | the fake Slack token fixture is built at compile time (the redact.rs edit that had been uncommitted) |
+| 12:04 | 43e04e5e | b17/adc5dca5-stash-pop |
+| 13:05 | 1084a6f1 | b17/df6bf5ea-landed and -adv (gitpulse_landed rebuilt) |
+| 14:24 | bae0fb37 | b17/8f398bb6-umask and -adv |
+| 15:15 | 147af07c | b17/refcache-coalesce-flake |
+| 15:50 | 94b5d928 | b17/od1-ledger-schema and od1-adv (OD 1 ledger schema bump) |
+
+A watcher (`tmp/consolidate-1018/wait-wave-all.sh`) polled every 60 s until no `b17/*` branch was unmerged and no agent worktree was locked. It fired LANDED at 94b5d928. By then 99318 had deleted every lane branch and worktree itself, including the `worktree-agent-*` refs.
+
+## Sweep (`tmp/consolidate-1018/sweep-merged.sh`)
+
+The sweep deleted nothing. Every merged branch left is in use:
+
+| Branch | Reason kept |
+|---|---|
+| claude/epic-volhard-d23b09 | live session 92675 has its cwd in its worktree (merged in f62defe6) |
+| claude/graft-notify-forward-de1a04 | live session 67182 (merged) |
+| claude/vendor-devmap-extract-97 | live session 9043 (merged in 205a72ef) |
+| main | trunk |
+
+**No local branch is unmerged.** The detached `seed` worktree (ed54ac18, which main contains) and the remote branches were left alone.
+
+## Verification
+
+- `git fsck --no-dangling`: no errors.
+- `git branch --no-merged main`: empty.
+- All four live sessions are running (9043, 67182, 92675, 99318).
+- **`gitpulse_insights` was deferred under load** (`ok:false` on agents, worktrees and collisions), so it confirms nothing for this pass. Sessions and cwds were checked directly with `ps` and `lsof`.
+- **ci:local was not run in this pass.** This session landed no code. 99318 gated its own merges, and that gate was not re-run here.
+
+## For the owner
+
+Closing sessions 92675, 67182 and 9043 frees their three branches, and the sweep script then deletes them with backups taken first. The stuck 99318 loops (46283, 64851, 2742) and the three leftover `agent-*` directories from earlier passes are still for you to clear.
+
+---
+
 # Branch consolidation report — 2026-10-19 (third pass: the "next wave", feat/manvi-claude-api)
 
 The owner repeated "commit and merge all changes and next wave, delete old and stale branches". The next wave the second pass named was feat/manvi-claude-api. **Main fast-forwarded 88feadf1 → 6b2c3947.** Nothing was pushed.

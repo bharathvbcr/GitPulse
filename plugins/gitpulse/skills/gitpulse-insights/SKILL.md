@@ -29,13 +29,15 @@ It surfaces GitPulse-owned facts and selected **DevCouncil** modules (in-process
 | `gitpulse_change_context` | About to edit one worktree |
 | `gitpulse_collision_risk` | Parallel agents or several worktrees |
 | `gitpulse_active_changes` | Need the file list, not just counts |
+| `gitpulse_merge_conflicts` | Whether the worktrees' committed work would merge, pair by pair (`clean`, `conflict` with paths, `unknown` with a reason; detached worktrees included). Read-only: the merge runs in an object quarantine deleted afterwards. `ok: false` with `truncated` above 64 pairs: the counts are a floor |
 | `gitpulse_status` | Narrower status (ledger + worktrees + codeintel) |
 | `gitpulse_ledger_events` | Policy verdicts and recorded mutations |
 | `gitpulse_task_view` | DevCouncil tasks and leases, when a store exists |
 | `gitpulse_codeintel_*` | Symbol search, impact, dependencies, trace, dead symbols |
 | `devmap_*` (11 tools: `status`, `search`, `dependencies`, `impact`, `trace`, `neighbors`, `dead_symbols`, `clones`, `preview`, `explore`, `affected_tests`) | The same code graph under DevMap's own tool names, for parity with the standalone `devmap mcp` server; pass `repo_path` on every call |
 | `gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_merge_tasks`, `gitpulse_delete_task` | The only write tools: they change the task board, never git (see the gitpulse-tasks skill) |
-| `gitpulse_provenance` | Verification freshness for a commit, and where it sits relative to the base (`landed_on_base`, `ahead`, `behind`) |
+| `gitpulse_provenance` | Verification freshness for a commit, and where it sits relative to the base (`landed_on_base`, `ahead`, `behind`). `confidence` is null and `verified` false for a commit with no verification note; a verification does not survive a rewrite |
+| `gitpulse_landed` | Whether a commit's work reached a base, and how (`ff`, `merge`, `squash`, `rebase`, `tree`). `false` only when absence is provable, otherwise null with a `reason` code; `reverted` from a revert commit by ancestry; `landed_at` from the base branch's reflog. Refuses in a partial clone. Writes nothing (the content check runs in a quarantined object directory) |
 
 ## Honesty rules this server already enforces
 

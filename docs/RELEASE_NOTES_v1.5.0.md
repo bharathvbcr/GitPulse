@@ -20,6 +20,11 @@ GitPulse 1.5.0 is a large release: agents that run in the background with a pane
 - **A host-load governor.** Under severe memory pressure GitPulse refuses agent launches with a clear reason and sheds its own background work. Your shell and stop, kill, cancel, save and commit are never gated. Health shows the state and offers **Admit anyway** (two minutes, after a native confirmation). (`73163a50`, `e96541bb`)
 - **Lighter at idle and with many tabs.** A repository is read one snapshot at a time, switching back to a freshly read tab costs no read, open tabs keep history for only the 6 most recent repositories, terminal scrollback is a setting, and idle watchers, the single-instance mailbox and idle terminals wait for events instead of polling. Switching tabs no longer rebuilds the sidebar or status bar. (`296eb20b`, `5b419492`, `7dc5c132`, `3d1c9bae`, `05e734a7`)
 - **GPU terminal rendering, on by default.** Visible terminals draw through WebGL (at most 8 at once) and fall back to the DOM renderer after a lost context. Settings, Appearance, GPU terminal rendering turns it off. See Known issues. (`75bee0f9`)
+- **Default Priority Ordering on Tasks Board.** The Tasks board orders by priority by default across columns and in the List layout (`interfaceStore.taskOrder`, default "priority"), preserved in saved views and the View menu. (`8032c383`)
+- **Storage Panel Commit-Graph Write (OD 3).** User-clicked, gated commit-graph write (`git commit-graph write --reachable --changed-paths`) for repositories missing commit-graphs or Bloom filters, previewed, judged by the command gate and cancellable. (`d7aa79a2`)
+- **Ledger Site Binding & Adoption (OD 1).** A ledger is bound to its anchor directory, lineage UUID, inode, and volume persistent UUID. A ledger moved across sibling clones is refused; **Adopt this ledger** (`cmd_adopt_ledger`) allows safe takeover with audit logging. (`2e904ff4`, `f053e297`)
+- **Cross-Lane Merge Conflict Detection.** `gitpulse_merge_conflicts` checks whether pairs of checkout heads would merge cleanly or conflict over an isolated object quarantine before merging. Insights worktree rows display cached `head`, `ahead`, `behind`, and `commits_since_base`. (`d3d947f8`, `14aced7e`)
+- **Commit Landing Verification (`gitpulse_landed`).** Proves whether a commit's work reached a base branch (`merge`, `ff`, `squash`, `rebase`, or `tree`) using quarantined merge trees with provable absence and lazy-fetch fences. (`a678ed7c`, `c22e9073`)
 - **Ledger rows record when things happened,** not when a catch-up pass saw them, and the journal shows event time. (`8221b353`, `c71e8daf`)
 - **Manvi proposals and verification verdicts.** A Proposals panel reviews Manvi's scan and refine proposals. A task's verdict can be posted to GitHub as a `devcouncil/verify` commit status, per repository and opt-in. (`cf07ebc2`, `03ca87ad`)
 
@@ -45,6 +50,10 @@ GitPulse 1.5.0 is a large release: agents that run in the background with a pane
 - **An update check that could not reach GitHub no longer reports "up to date".** A failed lookup, timeout, refusal or server error used to read as "not published"; now only a "not found" does, and anything else fails the check with its reason. (`d414ad3f`)
 - **Closing a tab group releases its tabs** the way closing a single tab does. (`8b47801d`)
 - **A moved or renamed repository takes its ledger over** instead of refusing to record. (`fbe3e99b`)
+- **Reflog replay resumes from watermarks** per worktree and ref, covering the full worktree family and default branch in one transaction. (`79bccca6`)
+- **Transcript cursors carry fingerprints** (head, tail, length, mtime), so rewritten transcripts re-read and moved files resume cleanly. (`a8990f56`)
+- **File & folder creation respects process umask** (`0o666 & !umask` for files, `0o777 & !umask` for executables/folders) instead of forcing owner-only permissions. (`e6578626`)
+- **In-flight edit collision hook asks the running app** for its cached collision scan, cutting spawned git processes during edit bursts. (`b1559022`)
 
 ## Hardening
 
@@ -66,6 +75,8 @@ GitPulse 1.5.0 is a large release: agents that run in the background with a pane
 ## Breaking changes
 
 - **The task profile is migrated one way, to dc-store workbench schema 13.** A host built against an older schema refuses a migrated profile. Rebuild GitPulse, Manvi and DevCouncil from the same dc-store before any of them opens the profile. (`3a7de123`, `c6b92930`, `6c0e1faa`)
+- **The ledger schema bumps to writer generation 2 (OD 1).** Additive columns and tables for occurred time, reflog ordinals, and deduplication indexes. Older generation 1 binaries (`gitpulsed`, `gitpulse-mcp`) refuse to write a migrated ledger and must be rebuilt and reinstalled together. (`f053e297`)
+- **Dead `cmd_stash_pop` IPC command removed.** `GitWriter::stash_pop` and `cmd_stash_pop` are removed in favor of `cmd_stash_action` with target OID. Registry stands at 284 handlers. (`6869235a`)
 - **Reinstall `gitpulse-mcp` and `gitpulse-hook`** (`bun run mcp:install`). An older binary carries an older `devmap-store` and cannot read a store a current `devmap` has built. `bun run check:schema-parity` asks every installed reader which schemas it reads. (`710aa9e0`, `650a587a`)
 - **Child processes drop relative `PATH` entries** (`.`, `bin`, `./node_modules/.bin`). A setup that relied on one must use an absolute path. The Manvi sidecar starts from an allowlisted environment, so provider keys and tokens set in the launching shell no longer reach it. (`87d03fc8`)
 - **An agent can no longer mark a task done on its own word.** `gitpulse_complete_task(done)` leaves the task in review unless Manvi recorded a passed verification for the worktree's current head. A person moving a card is unaffected. (`50eedd43`)

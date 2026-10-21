@@ -845,6 +845,14 @@ describe("tasks board view preferences", () => {
     expect(get(interfaceStore).taskCardFields).toEqual(["owner"]);
   });
 
+  it("orders the Tasks board by priority until the reader picks board order, and resets to priority", () => {
+    expect(get(interfaceStore).taskOrder).toBe("priority");
+    interfaceStore.setTaskOrder("board");
+    expect(get(interfaceStore).taskOrder).toBe("board");
+    interfaceStore.resetTaskView();
+    expect(get(interfaceStore).taskOrder).toBe("priority");
+  });
+
   it("resets only the board view, leaving unrelated preferences alone", () => {
     interfaceStore.setTerminalFontSize(18);
     interfaceStore.setTaskLayout("list");

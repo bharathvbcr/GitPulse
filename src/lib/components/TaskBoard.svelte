@@ -40,7 +40,7 @@
   import { describeMatch, searchCards, type RankContext, type RankedCard, type SearchOrder } from "../workbench/taskRank";
   import { CANDIDATE_PAGE, bucketByStatus, canLoadMore, candidatesComplete, describeSearch, mergeCandidates, planSearch, type CandidateSet, type SearchPlan } from "../workbench/taskSearchPlan";
   import TaskSearchField from "./TaskSearchField.svelte";
-  import { cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, priorityLabel, reorderPlan, partitionLanes, sortByPriority, type TaskFacet, type TaskLane } from "../workbench/taskOrganize";
+  import { cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, priorityLabel, reorderPlan, partitionLanes, listRows, sortByPriority, type TaskFacet, type TaskLane } from "../workbench/taskOrganize";
   import { plural } from "../format";
   import { archiveAction, archivable, archiveControl, archiveRefusal, archiveSkipped, archiveState } from "../workbench/taskArchive";
   import { interfaceStore } from "../stores/interfaceStore";
@@ -158,8 +158,8 @@
   const plan = $derived(planSearch(scope, parsedQuery, facet, repositories, repositoryCursor === null));
   const searching = $derived(plan.mode === "search");
   let sort = $state<SearchOrder>("relevance");
-  /** How a column is drawn when no search ranks it: the board's own order, or the most urgent first. A view; positions are never written. */
-  let boardSort = $state<"board" | "priority">("board");
+  /** How a column is drawn when no search ranks it: the most urgent first (the default), or the board's own order. A reader preference; positions are never written. */
+  const boardSort = $derived($interfaceStore.taskOrder);
   /** Manvi's ranking of what to start next (`work.tasks.suggest`), asked for on demand. */
   let showSuggest = $state(false);
   let suggestion = $state<TaskSuggestions | null>(null);
@@ -428,7 +428,8 @@
     const counts = Object.fromEntries(STATUSES.map((status) => [status, visibleIn(status).length])) as Partial<Record<TaskStatus, number>>;
     return visibleBoardStatuses(hiddenColumns, counts, drag !== null);
   });
-  const listCards = $derived(shown.flatMap((status) => visibleIn(status)));
+  /** The list's rows: a relevance ranking as ranked, otherwise across every status in the reader's order. */
+  const listCards = $derived(listRows(shown.map((status) => visibleIn(status)), listOrder()));
   /** What is on screen per column, in the order it is drawn, for range and select-all. */
   const drawnColumns = $derived(Object.fromEntries(STATUSES.map((status) => [status, { items: visibleIn(status) }])) as Partial<Record<TaskStatus, { items: TaskCard[] }>>);
   // ---- Saved views, lanes and limits, per board (`taskBoardViews.ts`) -----
@@ -443,6 +444,7 @@
     layout,
     density: $interfaceStore.taskDensity,
     swimlane: $interfaceStore.taskSwimlane,
+    order: boardSort,
     hiddenColumns: [...hiddenColumns],
     cardFields: [...$interfaceStore.taskCardFields],
     facet: { ...facet },
@@ -509,6 +511,10 @@
     if (ranking && order === "relevance") return ranked.byStatus[status] ?? [];
     const items = (displayColumns[status]?.items ?? []).filter(cardVisible);
     return boardSort === "priority" ? sortByPriority(items) : items;
+  }
+  /** The list keeps a relevance ranking as ranked; otherwise it follows the reader's order across every status. */
+  function listOrder(): "priority" | "board" {
+    return ranking && order === "relevance" ? "board" : boardSort;
   }
   /** A column's count: the store's total while browsing, the matches while searching. */
   function columnCount(status: TaskStatus): number {
@@ -1474,7 +1480,7 @@
    */
   async function nudgeCard(card: TaskCard, delta: -1 | 1) {
     if (busy) return;
-    if (reorderLocked) { announce = boardSort === "priority" ? "Cards are ordered by priority. Switch to Board order to move a card within its column." : "Matches are ordered by relevance. Switch to Board order to move a card within its column."; return; }
+    if (reorderLocked) { announce = boardSort === "priority" ? "Cards are ordered by priority. Switch to Board order in the View menu to move a card within its column." : "Matches are ordered by relevance. Switch to Board order to move a card within its column."; return; }
     const items = displayColumns[card.status]?.items ?? [];
     const from = items.findIndex((item) => item.id === card.id);
     const to = from + delta;
@@ -2355,10 +2361,6 @@
             {#each facetRepositories as repo (repo.id)}<option value={repo.id}>{repo.name}</option>{/each}
           </select>
         {/if}
-        <div class="gp-segmented" role="group" aria-label="Order cards">
-          <button type="button" class="gp-seg-btn" data-active={boardSort === "board"} aria-pressed={boardSort === "board"} title="Cards in the board's own order, where they can be moved." onclick={() => { boardSort = "board"; }}>Board order</button>
-          <button type="button" class="gp-seg-btn" data-active={boardSort === "priority"} aria-pressed={boardSort === "priority"} title="Most urgent first, then the earlier due date. Cards cannot be moved within a column in this order." onclick={() => { boardSort = "priority"; }}>Priority first</button>
-        </div>
         {#if filtering}<button type="button" class="gp-btn" onclick={() => { facet = emptyFacet(); search = ""; }}>Clear filters</button>{/if}
       </div>
     {/if}
