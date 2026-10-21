@@ -254,6 +254,40 @@ export interface ChangeContext {
   operation: RepoOperation | null;
   operation_ok: boolean;
   operation_error: string;
+  /**
+   * How current the ledger this context read is. `as_of` is the `ts_utc` of the
+   * newest row it could see; `stale` is true when nothing shows a recorder ran
+   * within `stale_after_secs`, or when freshness could not be read.
+   */
+  ledger_freshness: Freshness;
+}
+
+/** Mirrors `ledger::freshness::Freshness`. */
+export interface Freshness {
+  as_of: string | null;
+  last_catch_up: string | null;
+  last_catch_up_basis: string;
+  stale: boolean;
+  stale_reason: string;
+  stale_after_secs: number;
+  freshness_ok: boolean;
+  freshness_error: string;
+  catch_up: CatchUpSummary | null;
+}
+
+/** Mirrors `ledger::freshness::CatchUpSummary`. */
+export interface CatchUpSummary {
+  worktrees: number;
+  truncated: boolean;
+  recorded: number;
+  transcripts: number;
+  transcripts_listed: number;
+  transcripts_unlisted: number;
+  skipped_lines: number;
+  failed_records: number;
+  error: string;
+  stale_worktrees: number;
+  future_dated_worktrees: number;
 }
 
 export interface McpToolInfo {
