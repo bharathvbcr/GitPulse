@@ -3908,6 +3908,248 @@ while IFS= read -r line; do handle "$line" & done
             "gone".into()
         )));
     }
+
+    // ---- adversarial review of the shutdown carve-out (adv-l2) ----
+
+    /// Resident set of this test process in KiB, from `ps`.
+    #[cfg(unix)]
+    fn own_rss_kib() -> u64 {
+        let out = Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("rss")
+    }
+
+    /// True once the pump has exited (its sender dropped), draining what it
+    /// queued on the way.
+    #[cfg(unix)]
+    fn pump_exits(sidecar: &Sidecar) -> bool {
+        let deadline =
+            Instant::now() + crate::test_support::coverage_relaxed(Duration::from_secs(10));
+        loop {
+            match relock(&sidecar.inbox.rx).try_recv() {
+                Err(mpsc::TryRecvError::Disconnected) => return true,
+                _ => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn graceful(script: &str, grace_ms: u64) -> Sidecar {
+        let mut sidecar = scripted_sidecar(script, WRITE_DEADLINE);
+        sidecar.shutdown_grace =
+            crate::test_support::coverage_relaxed(Duration::from_millis(grace_ms));
+        sidecar
+    }
+
+    /// Attack 1: a child that floods stdout forever after stdin EOF is still
+    /// killed within the grace plus slack, the pump exits, memory stays flat.
+    #[cfg(unix)]
+    #[test]
+    fn adv_endless_flood_after_eof_is_killed_in_grace_with_bounded_memory() {
+        let sidecar = graceful(&format!("cat > /dev/null; yes '{}'", "x".repeat(99)), 600);
+        let before = own_rss_kib();
+        let started = Instant::now();
+        sidecar.terminate();
+        let took = started.elapsed();
+        let after = own_rss_kib();
+        let status = status_when_it_exits(&sidecar.child);
+        assert_eq!(status.signal(), Some(9), "{status:?}");
+        assert!(
+            took < sidecar.shutdown_grace
+                + crate::test_support::coverage_relaxed(Duration::from_secs(3)),
+            "terminate took {took:?}"
+        );
+        assert!(pump_exits(&sidecar), "pump never exited");
+        assert!(
+            after.saturating_sub(before) < 256 * 1024,
+            "rss grew {} KiB",
+            after.saturating_sub(before)
+        );
+    }
+
+    /// Attack 1b: an oversized frame during shutdown still ends in a kill, and
+    /// so does one that follows a flood of ordinary lines.
+    #[cfg(unix)]
+    #[test]
+    fn adv_oversized_frame_during_shutdown_still_kills() {
+        for script in [
+            "cat > /dev/null; head -c 8388608 /dev/zero | tr '\\0' x; exec sleep 30".to_string(),
+            format!(
+                "cat > /dev/null; yes '{}' | head -n 50; head -c 8388608 /dev/zero | tr '\\0' x; exec sleep 30",
+                "x".repeat(99)
+            ),
+        ] {
+            let sidecar = graceful(&script, 600);
+            let started = Instant::now();
+            sidecar.terminate();
+            let took = started.elapsed();
+            let status = status_when_it_exits(&sidecar.child);
+            assert_eq!(status.signal(), Some(9), "{status:?}");
+            assert!(
+                took < sidecar.shutdown_grace
+                    + crate::test_support::coverage_relaxed(Duration::from_secs(3)),
+                "terminate took {took:?}"
+            );
+            assert!(pump_exits(&sidecar), "pump never exited");
+        }
+    }
+
+    /// Attack 2 (deterministic emulation): the pump has already hit `Full` and
+    /// sits in `force_kill` behind the child lock when shutdown begins. The lock
+    /// is held across a shutdown-shaped grace by the test thread. Nothing may
+    /// hang: the pump must exit once the lock frees.
+    #[cfg(unix)]
+    #[test]
+    fn adv_pump_queued_in_force_kill_before_flag_does_not_hang() {
+        let script = format!(
+            "yes '{}' | head -n 12; cat > /dev/null; yes '{}' | head -n 20000; exit 0",
+            "x".repeat(99),
+            "y".repeat(99)
+        );
+        let sidecar = graceful(&script, 600);
+        let held = relock(&sidecar.child);
+        thread::sleep(crate::test_support::coverage_relaxed(
+            Duration::from_millis(300),
+        ));
+        sidecar.shutting_down.store(true, Ordering::Release);
+        drop(relock(&sidecar.stdin).take());
+        thread::sleep(sidecar.shutdown_grace);
+        drop(held);
+        let status = status_when_it_exits(&sidecar.child);
+        assert!(pump_exits(&sidecar), "pump hung behind the child lock");
+        eprintln!("adv race emulation: honest child ended as {status:?}");
+    }
+
+    /// Attack 2 (stress): shutdown at a spread of moments against a child that
+    /// chatters continuously. Every terminate must return in bounded time and
+    /// every pump must exit.
+    #[cfg(unix)]
+    #[test]
+    fn adv_terminate_at_random_moments_against_a_chatty_child_never_hangs() {
+        for step in 0..16u64 {
+            let sidecar = graceful("while :; do echo chatter; sleep 0.001; done", 300);
+            thread::sleep(Duration::from_millis(step * 2));
+            let started = Instant::now();
+            sidecar.terminate();
+            let took = started.elapsed();
+            assert!(
+                took < sidecar.shutdown_grace
+                    + crate::test_support::coverage_relaxed(Duration::from_secs(3)),
+                "step {step}: terminate took {took:?}"
+            );
+            assert!(pump_exits(&sidecar), "step {step}: pump never exited");
+            let status = status_when_it_exits(&sidecar.child);
+            assert_eq!(status.signal(), Some(9), "step {step}: {status:?}");
+        }
+    }
+
+    /// Attack 3: the flag belongs to one sidecar. Terminating A must not make
+    /// B drop a normal-operation flood instead of killing it, and terminate is
+    /// idempotent.
+    #[cfg(unix)]
+    #[test]
+    fn adv_flag_is_per_sidecar_and_a_fresh_one_still_kills_a_flood() {
+        let a = graceful("cat > /dev/null; exit 0", 600);
+        a.terminate();
+        a.terminate();
+        assert!(a.shutting_down.load(Ordering::Acquire));
+        let script = format!(
+            "i=0; while [ $i -lt {} ]; do printf 'noise-%s\\n' \"$i\"; i=$((i + 1)); done; exec sleep 30",
+            MAX_QUEUED_STDOUT_FRAMES + 1
+        );
+        let b = scripted_sidecar(&script, WRITE_DEADLINE);
+        assert!(!b.shutting_down.load(Ordering::Acquire));
+        let status = status_when_it_exits(&b.child);
+        assert_eq!(status.signal(), Some(9), "{status:?}");
+    }
+
+    /// Attack 4: a call waiting for an answer while terminate runs against a
+    /// child that floods after EOF. It must come back with an error, not hang.
+    #[cfg(unix)]
+    #[test]
+    fn adv_in_flight_call_returns_an_error_when_terminate_runs() {
+        let script = format!("read line; cat > /dev/null; yes '{}'", "x".repeat(99));
+        let sidecar = Arc::new(graceful(&script, 600));
+        let caller = {
+            let sidecar = sidecar.clone();
+            thread::spawn(move || {
+                let started = Instant::now();
+                let outcome = sidecar.call(
+                    "policy.check",
+                    None,
+                    crate::test_support::coverage_relaxed(Duration::from_secs(20)),
+                );
+                (outcome, started.elapsed())
+            })
+        };
+        thread::sleep(Duration::from_millis(200));
+        sidecar.terminate();
+        let (outcome, took) = caller.join().expect("caller");
+        assert!(outcome.is_err(), "answered?! {outcome:?}");
+        assert!(
+            took < crate::test_support::coverage_relaxed(Duration::from_secs(8)),
+            "call hung {took:?}"
+        );
+    }
+
+    /// Attack 4b: the call's own deadline is shorter than the shutdown grace.
+    /// Reports how late the call is delivered its Timeout/Unavailable.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "known defect: await_answer's exited() check waits on the child lock terminate holds for the grace (pre-existing, not the lane's change)"]
+    fn adv_in_flight_call_honours_its_deadline_while_terminate_holds_the_lock() {
+        let sidecar = Arc::new(graceful("read line; exec sleep 30", 1500));
+        let caller = {
+            let sidecar = sidecar.clone();
+            thread::spawn(move || {
+                let started = Instant::now();
+                let outcome = sidecar.call("policy.check", None, Duration::from_millis(300));
+                (outcome, started.elapsed())
+            })
+        };
+        thread::sleep(Duration::from_millis(100));
+        sidecar.terminate();
+        let (outcome, took) = caller.join().expect("caller");
+        assert!(outcome.is_err());
+        assert!(
+            took < sidecar.shutdown_grace,
+            "a 300ms call outlived terminate's lock for {took:?}"
+        );
+    }
+
+    /// Attack 5: stdout closed and stderr flooding forever, with the EOF reap
+    /// and an explicit terminate racing for the child lock.
+    #[cfg(unix)]
+    #[test]
+    fn adv_eof_reap_and_terminate_race_over_a_stderr_flood() {
+        let sidecar = Arc::new(graceful(
+            &format!("exec >&-; yes '{}' >&2", "x".repeat(99)),
+            600,
+        ));
+        thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        sidecar.terminate();
+        let took = started.elapsed();
+        let status = status_when_it_exits(&sidecar.child);
+        assert_eq!(status.signal(), Some(9), "{status:?}");
+        assert!(
+            took < sidecar.shutdown_grace
+                + crate::test_support::coverage_relaxed(Duration::from_secs(3)),
+            "terminate took {took:?}"
+        );
+        assert!(pump_exits(&sidecar));
+        assert!(relock(&sidecar.stderr).len() <= STDERR_TAIL_LINES);
+    }
 }
 
 #[cfg(test)]
