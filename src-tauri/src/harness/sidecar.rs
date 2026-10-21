@@ -3914,9 +3914,10 @@ while IFS= read -r line; do handle "$line" & done
     /// Resident set of this test process in KiB, from `ps`.
     #[cfg(unix)]
     fn own_rss_kib() -> u64 {
+        use crate::procguard::LockedSpawn;
         let out = Command::new("ps")
             .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-            .output()
+            .output_locked()
             .expect("ps");
         String::from_utf8_lossy(&out.stdout)
             .trim()
