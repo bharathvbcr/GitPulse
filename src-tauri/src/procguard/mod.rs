@@ -569,25 +569,40 @@ pub fn spawn(cmd: &mut Command, label: &str) -> io::Result<(Child, Registration)
 /// which the child runs at default priority; its descendants inherit the band
 /// from it. Sources read: the SDK's `<sys/resource.h>` (`PRIO_DARWIN_PROCESS`,
 /// `PRIO_DARWIN_BG`) and the `setpriority(2)` man page.
-pub fn enter_background_band(child: &Child) -> io::Result<()> {
+pub fn enter_background_band(child: &Child) -> io::Result<BandOutcome> {
     #[cfg(target_os = "macos")]
     {
         let pid = libc::id_t::from(child.id());
         // SAFETY: plain syscall on an integer pid; no pointers.
         let rc = unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, pid, libc::PRIO_DARWIN_BG) };
-        if rc != 0 {
-            let error = io::Error::last_os_error();
-            // A child that already exited and was reaped has nothing left to
-            // demote; with a short-lived `git` that is an ordinary race.
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                return Ok(());
-            }
-            return Err(error);
+        if rc == 0 {
+            return Ok(BandOutcome::Entered);
         }
+        let error = io::Error::last_os_error();
+        // A child that already exited and was reaped has nothing left to
+        // demote; with a short-lived `git` that is an ordinary race.
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(BandOutcome::ChildGone);
+        }
+        Err(error)
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = child;
-    Ok(())
+    {
+        let _ = child;
+        Ok(BandOutcome::NotApplicable)
+    }
+}
+
+/// What [`enter_background_band`] did, so "demoted" and "nothing to demote" are
+/// not the same answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandOutcome {
+    /// The kernel accepted the demotion.
+    Entered,
+    /// The child had already exited and been reaped.
+    ChildGone,
+    /// This platform has no background band.
+    NotApplicable,
 }
 
 /// The scheduler priority `ps -o pri` reports for `pid`. `getpriority(2)` only
@@ -1396,7 +1411,10 @@ mod tests {
         let (mut demoted, demoted_guard) = spawn(&mut cmd, "sleep").expect("spawn");
         let (mut ordinary, ordinary_guard) = spawn(&mut cmd, "sleep").expect("spawn");
 
-        enter_background_band(&demoted).expect("enter the band");
+        assert_eq!(
+            enter_background_band(&demoted).expect("enter the band"),
+            BandOutcome::Entered
+        );
 
         let demoted_priority = scheduler_priority_of(demoted.id()).expect("priority");
         let ordinary_priority = scheduler_priority_of(ordinary.id()).expect("priority");
@@ -1420,7 +1438,10 @@ mod tests {
         cmd.stdin(Stdio::null()).stdout(Stdio::null());
         let (mut child, guard) = spawn(&mut cmd, "true").expect("spawn");
         let _ = guard.reap(|| child.wait());
-        enter_background_band(&child).expect("a reaped child is not an error");
+        assert_eq!(
+            enter_background_band(&child).expect("a reaped child is not an error"),
+            BandOutcome::ChildGone
+        );
     }
 
     /// The capability a bare `Child::kill` does not have, and the reason the

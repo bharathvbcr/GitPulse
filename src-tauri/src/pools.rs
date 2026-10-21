@@ -100,6 +100,19 @@ pub(crate) fn install_async_runtime() -> Option<String> {
 pub(crate) struct UtilityScope {
     #[cfg(target_os = "macos")]
     restore: Option<(u32, libc::c_int)>,
+    /// What [`ORIGIN`] held before this scope, put back on drop.
+    #[cfg(target_os = "macos")]
+    outer_origin: Option<(u32, libc::c_int)>,
+}
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    /// The class the thread had before the outermost [`UtilityScope`] lowered
+    /// it, while one is active. Work nested inside a background scope that is
+    /// itself user-facing runs at this class ([`UserFacingScope`]) and never
+    /// above it.
+    static ORIGIN: std::cell::Cell<Option<(u32, libc::c_int)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// `QOS_CLASS_UTILITY` as the raw value [`current_thread_qos`] reports.
@@ -146,21 +159,32 @@ fn set_current_thread_qos(class: u32, priority: libc::c_int) -> bool {
 }
 
 impl UtilityScope {
+    /// Lowers the calling thread to UTILITY for the scope, remembering the
+    /// class it had so a nested user-facing scope can lift it back.
     pub(crate) fn enter() -> Self {
         #[cfg(target_os = "macos")]
         {
-            let Some((class, priority)) = current_thread_qos() else {
-                return Self { restore: None };
-            };
-            if class == QOS_UTILITY {
-                return Self { restore: None };
+            let outer_origin = ORIGIN.get();
+            let current = current_thread_qos().filter(|(class, _)| *class != QOS_UTILITY);
+            let restore = current.filter(|_| set_current_thread_qos(QOS_UTILITY, 0));
+            if restore.is_some() {
+                ORIGIN.set(current);
             }
             Self {
-                restore: set_current_thread_qos(QOS_UTILITY, 0).then_some((class, priority)),
+                restore,
+                outer_origin,
             }
         }
         #[cfg(not(target_os = "macos"))]
         Self {}
+    }
+
+    /// Lowers the calling thread to UTILITY for the rest of its life. Nothing
+    /// is remembered or restored: a pool worker exists only to run this
+    /// pool's tasks.
+    pub(crate) fn lower_for_life() {
+        #[cfg(target_os = "macos")]
+        set_current_thread_qos(QOS_UTILITY, 0);
     }
 }
 
@@ -169,6 +193,40 @@ impl Drop for UtilityScope {
         #[cfg(target_os = "macos")]
         if let Some((class, priority)) = self.restore {
             set_current_thread_qos(class, priority);
+            ORIGIN.set(self.outer_origin);
+        }
+    }
+}
+
+/// Lifts a thread that a surrounding [`UtilityScope`] lowered back to the
+/// class it had, for a user-facing scope nested inside background work, and
+/// lowers it again on drop. A no-op on a thread no scope lowered, so it never
+/// raises a thread above what it originally had.
+#[must_use = "the thread is lowered again when the scope is dropped"]
+pub(crate) struct UserFacingScope {
+    #[cfg(target_os = "macos")]
+    lifted: bool,
+}
+
+impl UserFacingScope {
+    pub(crate) fn enter() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            let lifted = ORIGIN
+                .get()
+                .is_some_and(|(class, priority)| set_current_thread_qos(class, priority));
+            Self { lifted }
+        }
+        #[cfg(not(target_os = "macos"))]
+        Self {}
+    }
+}
+
+impl Drop for UserFacingScope {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        if self.lifted {
+            set_current_thread_qos(QOS_UTILITY, 0);
         }
     }
 }
@@ -183,9 +241,7 @@ fn rayon_builder(threads: usize) -> rayon::ThreadPoolBuilder {
         .num_threads(threads)
         .thread_name(|index| format!("gitpulse-rayon-{index}"))
         .start_handler(|_| {
-            // The worker never gives the class back: it exists only to run
-            // this pool's tasks.
-            std::mem::forget(UtilityScope::enter());
+            UtilityScope::lower_for_life();
         })
 }
 
