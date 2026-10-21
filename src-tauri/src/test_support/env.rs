@@ -383,7 +383,15 @@ pub(crate) mod hermetic {
                 .unwrap_or_else(|error| panic!("hermetic test root {}: {error}", dir.display()));
         }
         let gitconfig = root.join("gitconfig");
-        std::fs::write(&gitconfig, "")
+        // Automatic maintenance is off: Git 2.54's `commit` runs `maintenance
+        // run --auto`, whose reflog-expire task deletes reflog entries older
+        // than the expiry once 100 have aged out. Fixtures date their commits
+        // at fixed epochs that age past it, so the same test lost 200 of its
+        // 251 entries on the day the epoch turned 30 days old.
+        std::fs::write(
+            &gitconfig,
+            "[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n\treflogExpire = never\n\treflogExpireUnreachable = never\n",
+        )
             .unwrap_or_else(|error| panic!("hermetic gitconfig {}: {error}", gitconfig.display()));
 
         let real_home = std::env::var_os("HOME")
