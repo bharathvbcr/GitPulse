@@ -1353,6 +1353,36 @@ mod tests {
         assert_eq!(shared.take_at(0, 4, 1, early + 2 * S), Take::Granted);
     }
 
+    /// The denial that finds the anchor ahead of its clock must write the
+    /// re-anchor even while its handle's probe is fresh; skipping it would leave
+    /// the anchor in the future and stall refill until the clock caught up.
+    #[test]
+    fn a_denial_after_a_clock_step_back_still_re_anchors_so_refill_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = budget(&dir);
+        let late = 10_000 * S;
+        for _ in 0..4 {
+            assert_eq!(a.take_at(0, 4, 1, late), Take::Granted);
+        }
+        // `a` proves the record writable, so its clean denials are now skipped.
+        assert_eq!(a.take_at(0, 4, 1, late), Take::Denied);
+        // A writer whose clock runs 5 s ahead anchors the record there.
+        std::fs::write(
+            a.path(),
+            encode(State {
+                tokens: 0,
+                at_ns: late + 5 * S,
+            }),
+        )
+        .unwrap();
+        // `a`'s clock is behind that anchor: the denial re-anchors and writes.
+        let writes = a.writes();
+        assert_eq!(a.take_at(0, 4, 1, late + S), Take::Denied);
+        assert_eq!(a.writes(), writes + 1, "the re-anchor was not written");
+        // Refill resumes within one interval of the stepped-back clock.
+        assert_eq!(a.take_at(0, 4, 1, late + 2 * S + S / 10), Take::Granted);
+    }
+
     #[test]
     fn a_long_idle_record_refills_to_the_burst_and_no_further() {
         let dir = tempfile::tempdir().unwrap();

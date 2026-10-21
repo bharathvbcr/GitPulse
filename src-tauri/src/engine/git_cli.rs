@@ -3779,11 +3779,15 @@ impl SpawnGate {
             // waiter refused a token has nothing to learn before then. The
             // wait is still capped at the cancellation poll, and at the
             // deadline.
+            // The shared ask time only says when to wake while it is still in
+            // the future; once past, whichever bucket is refusing now (the
+            // local one, say) refills on the same interval.
             let nap = match (tokens_ok, next_shared_ask) {
-                (false, Some(at)) => at.saturating_duration_since(now).max(MIN_TOKEN_NAP),
-                (false, None) if rate_limited => self.refill_interval().max(MIN_TOKEN_NAP),
+                (false, Some(at)) if at > now => at.saturating_duration_since(now),
+                (false, _) if rate_limited => self.refill_interval(),
                 _ => CANCEL_POLL,
-            };
+            }
+            .max(MIN_TOKEN_NAP);
             let (next, _) = self
                 .released
                 .wait_timeout(state, remaining.min(nap.min(CANCEL_POLL)))
