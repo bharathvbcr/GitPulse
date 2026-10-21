@@ -297,10 +297,18 @@ fn kind_written_as(text: &str) -> (IpcErrorKind, Option<serde_json::Value>) {
     TYPED.with(|typed| typed.borrow().kind_of(text))
 }
 
-/// A copy of what this thread has written, for a seam that hands one thread's
-/// answer to another (see [`absorb`]).
-pub(crate) fn snapshot() -> Records {
+/// A copy of what this thread has written (see [`with_records`]).
+fn snapshot() -> Records {
     TYPED.with(|typed| typed.borrow().clone())
+}
+
+/// Runs `work` on this thread and returns its result with what its producers
+/// wrote, for a seam that hands the answer to another thread (a single-flight
+/// leader to its waiters, a scoped helper to the command that joins it). The
+/// receiving thread calls [`absorb`] on the records.
+pub(crate) fn with_records<T>(work: impl FnOnce() -> T) -> (T, Records) {
+    let value = work();
+    (value, snapshot())
 }
 
 /// Folds `records` into this thread's. A single-flight waiter is given the
