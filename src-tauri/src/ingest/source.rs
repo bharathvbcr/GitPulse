@@ -92,6 +92,12 @@ pub(super) trait TranscriptSource: Sync {
     /// was walked whole.
     fn optional(&self) -> bool;
 
+    /// Whether the file at `path` is certainly this source's, by its first line.
+    /// Asked only of a file two sources both list (their roots overlap), which
+    /// has exactly one owner: the source that recognises it, else the one with
+    /// the deeper root, else the first listed. A source with no such mark says no.
+    fn recognises(&self, path: &Path) -> bool;
+
     /// A parser for the file at `path`, to be fed the lines from byte `start`.
     fn open(&self, path: &Path, start: u64) -> Box<dyn RecordParser>;
 }
@@ -142,6 +148,10 @@ impl TranscriptSource for ClaudeSource {
     }
 
     fn optional(&self) -> bool {
+        false
+    }
+
+    fn recognises(&self, _path: &Path) -> bool {
         false
     }
 

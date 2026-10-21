@@ -297,10 +297,55 @@ pub fn departed_root<'c, 'r>(call: &'c ToolCall, roots: &[&'r str]) -> Option<De
     (!live && under(candidate_path(call), root)).then_some(Departed { root, host })
 }
 
+/// Whether `path` has an empty, `.` or `..` component (a leading or trailing
+/// separator does not count), which [`lexical`] resolves.
+fn has_dot_components(path: &str) -> bool {
+    let body = path.strip_prefix('/').unwrap_or(path);
+    let body = body.strip_suffix('/').unwrap_or(body);
+    !body.is_empty() && body.split('/').any(|c| matches!(c, "" | "." | ".."))
+}
+
+/// `path` with its `.`, `..` and empty components resolved by text alone, as the
+/// shell would for a path with no symlinks in it; nothing is read from disk (a
+/// symlink is the limitation the module documents). A `..` at the root of an
+/// absolute path stays at the root; one before the start of a relative path is
+/// kept, so the result is never mistaken for a path under an absolute root.
+fn lexical(path: &str) -> std::borrow::Cow<'_, str> {
+    if !has_dot_components(path) {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let absolute = path.starts_with('/');
+    let mut kept: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => match kept.last() {
+                Some(last) if *last != ".." => {
+                    kept.pop();
+                }
+                _ if absolute => {}
+                _ => kept.push(".."),
+            },
+            other => kept.push(other),
+        }
+    }
+    let joined = kept.join("/");
+    std::borrow::Cow::Owned(if absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    })
+}
+
+/// Whether `path` lies under `root`, by whole components, after both are
+/// resolved lexically: `/repo-other` and `/repo/../repo-other` are not under
+/// `/repo`, and `/repo/../other/x` is not either.
 fn under(path: &str, root: &str) -> bool {
     if root.is_empty() || path.is_empty() {
         return false;
     }
+    let (path, root) = (lexical(path), lexical(root));
+    let (path, root) = (path.as_ref(), root.as_ref());
     let root = root.trim_end_matches('/');
     if path == root {
         return true;
@@ -416,6 +461,23 @@ mod tests {
         let cmd = &parse_line(&record("Bash", r#"{"command":"ls"}"#))[0];
         assert!(owned_by(cmd, "/repo"));
         assert!(!owned_by(cmd, "/other"));
+    }
+
+    #[test]
+    fn dot_components_are_resolved_by_text_before_a_path_is_compared() {
+        // Each of these named `/w2/f` or somewhere else outside `/w1`.
+        assert!(!under("/w1/../w2/f", "/w1"));
+        assert!(under("/w1/../w2/f", "/w2"));
+        assert!(under("/w1/./a/../b", "/w1"));
+        assert!(!under("/w1/../../etc", "/w1"));
+        assert!(!under("/w1/sub/../../w1x/f", "/w1"));
+        assert!(under("/w1//a", "/w1"));
+        // A `..` at the root stays at the root; a relative one that climbs out
+        // of nothing is under no absolute root.
+        assert!(under("/../w1/a", "/w1"));
+        assert!(!under("../w1/a", "/w1"));
+        // A root spelled with dots is the root it resolves to.
+        assert!(under("/w2/f", "/w1/../w2"));
     }
 
     #[test]

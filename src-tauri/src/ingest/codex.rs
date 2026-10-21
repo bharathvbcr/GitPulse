@@ -50,9 +50,14 @@ use super::transcript::ToolCall;
 /// `GITPULSE_TRANSCRIPT_ROOT` moves Claude's. It wins over `CODEX_HOME`.
 pub(crate) const ROOT_ENV: &str = "GITPULSE_CODEX_TRANSCRIPT_ROOT";
 
-/// How much of a rollout's first line is read to find its `session_meta` when a
-/// pass resumes mid-file. The line carries the whole system prompt.
-const HEAD_BYTES: u64 = 1 << 20;
+/// The most of a rollout read from its start, on a resume, to recover what its
+/// `session_meta` and `turn_context` lines said. Past it the resumed calls are
+/// counted unread rather than placed by a directory that may be stale.
+const RESUME_SCAN_BYTES: u64 = 32 << 20;
+
+/// The longest single line read on a resume (the `session_meta` line carries the
+/// whole system prompt).
+const RESUME_LINE_BYTES: u64 = 8 << 20;
 
 pub(super) struct CodexSource;
 
@@ -99,25 +104,33 @@ impl TranscriptSource for CodexSource {
     fn open(&self, path: &Path, start: u64) -> Box<dyn RecordParser> {
         let mut parser = CodexParser::default();
         if start > 0 {
-            if let Some(first) = first_line(path) {
-                parser.parse(&first);
-            }
+            parser.recover(path, start);
         }
         Box::new(parser)
     }
+
+    fn recognises(&self, path: &Path) -> bool {
+        first_line_is_session_meta(path)
+    }
 }
 
-/// The first line of the file at `path`, if it ends within [`HEAD_BYTES`].
-fn first_line(path: &Path) -> Option<String> {
-    use std::io::Read;
-    let mut head = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(HEAD_BYTES)
-        .read_to_end(&mut head)
-        .ok()?;
-    let end = head.iter().position(|b| *b == b'\n')?;
-    String::from_utf8(head[..end].to_vec()).ok()
+/// Whether the file's first line is a Codex `session_meta` envelope: the one
+/// thing no Claude transcript starts with.
+fn first_line_is_session_meta(path: &Path) -> bool {
+    use std::io::{BufRead, Read};
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut line = Vec::new();
+    let mut reader = std::io::BufReader::new(file.take(RESUME_LINE_BYTES));
+    if reader.read_until(b'\n', &mut line).is_err() {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(&line) else {
+        return false;
+    };
+    serde_json::from_str::<Head<'_>>(text)
+        .is_ok_and(|head| head.kind.as_deref() == Some("session_meta") && head.payload.is_some())
 }
 
 /// What a rollout's earlier lines said about the ones after them.
@@ -126,6 +139,9 @@ struct CodexParser {
     thread: String,
     cwd: String,
     version: String,
+    /// A resume could not recover the context it needs (the rollout's start was
+    /// not read in full), so no call after it can be placed.
+    lost: bool,
 }
 
 /// The envelope, read without building the payload.
@@ -190,6 +206,47 @@ fn parse_value(line: &str) -> Option<serde_json::Value> {
 }
 
 impl CodexParser {
+    /// Replays the context lines of the first `start` bytes, which a resumed read
+    /// does not see: `session_meta` names the thread, and each `turn_context`
+    /// moves the directory, so the one in force at `start` is the last before it.
+    /// Reads under [`RESUME_SCAN_BYTES`] and [`RESUME_LINE_BYTES`]; short of
+    /// `start` by either, the context is `lost`.
+    fn recover(&mut self, path: &Path, start: u64) {
+        use std::io::{BufRead, Read};
+        let Ok(file) = std::fs::File::open(path) else {
+            self.lost = true;
+            return;
+        };
+        let window = start.min(RESUME_SCAN_BYTES);
+        let mut reader = std::io::BufReader::new(file.take(window));
+        let mut line = Vec::new();
+        let mut read = 0u64;
+        while read < window {
+            line.clear();
+            let Ok(n) = reader
+                .by_ref()
+                .take(RESUME_LINE_BYTES)
+                .read_until(b'\n', &mut line)
+            else {
+                break;
+            };
+            if n == 0 {
+                break;
+            }
+            read += n as u64;
+            if line.last() != Some(&b'\n') && n as u64 >= RESUME_LINE_BYTES {
+                break;
+            }
+            let Ok(text) = std::str::from_utf8(&line) else {
+                continue;
+            };
+            if text.contains("\"session_meta\"") || text.contains("\"turn_context\"") {
+                self.parse(text.trim_end_matches(['\n', '\r']));
+            }
+        }
+        self.lost = read < start;
+    }
+
     fn note_context(&mut self, kind: &str, payload: &serde_json::Value) {
         if kind == "session_meta" {
             let thread = payload["id"]
@@ -220,8 +277,8 @@ impl CodexParser {
         };
         let (Some(ts_utc), false, false) = (
             timestamp.filter(|ts| !ts.is_empty()),
-            self.thread.is_empty(),
-            self.cwd.is_empty(),
+            self.thread.is_empty() || self.lost,
+            self.cwd.is_empty() || self.lost,
         ) else {
             // Without a time, a thread or a directory a call cannot be placed:
             // counted, as a Claude record without them is.
@@ -389,43 +446,311 @@ struct Command {
     workdir: Option<String>,
 }
 
-const EXEC: &str = "tools.exec_command(";
-const PATCH: &str = "tools.apply_patch(";
+const EXEC: &str = "exec_command";
+const PATCH: &str = "apply_patch";
 
 /// The most calls one `exec` is read for. A script with more is a program, not a
 /// call; the rest are counted unread.
 const MAX_CALLS_PER_EXEC: usize = 256;
 
+/// The longest script read. A longer one is not scanned and counts as one
+/// unread call: the scan is linear, but a line of megabytes is not a call.
+const MAX_SCRIPT_BYTES: usize = 2 << 20;
+
+/// How many times the two tool names occur in `text`, wherever.
+fn mentions(text: &str) -> usize {
+    text.matches(EXEC).count() + text.matches(PATCH).count()
+}
+
+/// Reads a code-mode script in one linear pass.
+///
+/// Comments, string and template literals and regex literals are stepped over,
+/// so a call written inside one is not a call (it is not run). A call is
+/// `tools.exec_command(` / `tools.apply_patch(` or `tools["…"](`, with
+/// whitespace and `?.` allowed. Every occurrence of either name that is not
+/// accounted for (read as a call, or inside a skipped comment or literal) is
+/// counted unread, so a spelling this does not know (`t.exec_command(…)`, a
+/// destructured `exec_command`) is a gap in the count, never silently lost.
 fn scan_input(input: &str) -> Scanned {
     let mut scanned = Scanned::default();
-    let mut from = 0;
-    while let Some(at) = input[from..].find(EXEC) {
-        let start = from + at + EXEC.len();
-        from = start;
-        if scanned.commands.len() + scanned.unread >= MAX_CALLS_PER_EXEC {
-            scanned.unread += 1;
-            continue;
-        }
-        match command_at(input, start) {
-            Some(command) => scanned.commands.push(command),
-            None => scanned.unread += 1,
+    if input.len() > MAX_SCRIPT_BYTES {
+        scanned.unread = 1;
+        return scanned;
+    }
+    let b = input.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    // The last significant byte, which says whether a `/` starts a regex.
+    let mut prev = b';';
+    let mut seen = 0usize;
+    let mut patching = false;
+    // Brace depth, and the depth of each open `${` of a template.
+    let mut depth = 0usize;
+    let mut interpolations: Vec<usize> = Vec::new();
+    while i < n {
+        let c = b[i];
+        match c {
+            b' ' | b'\t' | b'\n' | b'\r' => i += 1,
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                let end = input[i..].find('\n').map_or(n, |at| i + at);
+                seen += mentions(&input[i..end]);
+                i = end;
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let end = input[i + 2..].find("*/").map_or(n, |at| i + 2 + at + 2);
+                seen += mentions(&input[i..end]);
+                i = end;
+            }
+            b'/' if regex_may_start(prev) => {
+                let end = regex_end(b, i);
+                seen += mentions(&input[i..end]);
+                i = end;
+                prev = b'a';
+            }
+            b'\'' | b'"' => {
+                let end = quoted_end(b, i);
+                let body = input.get(i + 1..end.saturating_sub(1)).unwrap_or_default();
+                seen += mentions(body);
+                if body == EXEC || body == PATCH {
+                    scanned.unread += 1;
+                }
+                i = end;
+                prev = b'a';
+            }
+            b'`' => {
+                (i, prev) = template(input, i + 1, &mut seen, &mut depth, &mut interpolations);
+            }
+            b'{' => {
+                depth += 1;
+                prev = c;
+                i += 1;
+            }
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if interpolations.last() == Some(&depth) {
+                    interpolations.pop();
+                    (i, prev) = template(input, i + 1, &mut seen, &mut depth, &mut interpolations);
+                } else {
+                    prev = c;
+                    i += 1;
+                }
+            }
+            c if is_ident(c) => {
+                let start = i;
+                while i < n && is_ident(b[i]) {
+                    i += 1;
+                }
+                prev = b'a';
+                match &input[start..i] {
+                    "tools" => {
+                        if let Some((is_exec, args)) = tool_call(input, i) {
+                            seen += 1;
+                            i = args;
+                            if is_exec {
+                                let (command, end) = command_at(input, args);
+                                seen += mentions(&input[args..end]);
+                                i = end;
+                                if scanned.commands.len() + scanned.unread >= MAX_CALLS_PER_EXEC {
+                                    scanned.unread += 1;
+                                } else {
+                                    match command {
+                                        Some(command) => scanned.commands.push(command),
+                                        None => scanned.unread += 1,
+                                    }
+                                }
+                            } else {
+                                patching = true;
+                            }
+                        }
+                    }
+                    EXEC | PATCH => {
+                        seen += 1;
+                        scanned.unread += 1;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {
+                prev = c;
+                i += 1;
+            }
         }
     }
-    if input.contains(PATCH) {
+    if patching {
         scanned.patched = patch_paths(input);
         if scanned.patched.is_empty() {
             scanned.unread += 1;
         }
     }
+    // Anything the pass above did not account for: a mention it misplaced
+    // (a regex it took for division, say) is a call it did not read.
+    scanned.unread += mentions(input).saturating_sub(seen);
     scanned
 }
 
-/// The `{cmd: ..., workdir: ...}` object literal that starts at `start`.
-fn command_at(input: &str, start: usize) -> Option<Command> {
+fn is_ident(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80
+}
+
+/// Whether a `/` after the significant byte `prev` begins a regex literal
+/// rather than dividing.
+fn regex_may_start(prev: u8) -> bool {
+    matches!(
+        prev,
+        b'(' | b','
+            | b'='
+            | b':'
+            | b'['
+            | b'!'
+            | b'&'
+            | b'|'
+            | b'?'
+            | b'{'
+            | b'}'
+            | b';'
+            | b'+'
+            | b'-'
+            | b'*'
+            | b'%'
+            | b'<'
+            | b'>'
+            | b'~'
+            | b'^'
+    )
+}
+
+/// The end of the regex literal that starts at `start`: its closing `/`, on the
+/// same line, past `[...]` classes and escapes; the line's end if it has none.
+fn regex_end(b: &[u8], start: usize) -> usize {
+    let mut i = start + 1;
+    let mut class = false;
+    while i < b.len() && b[i] != b'\n' {
+        match b[i] {
+            b'\\' => i += 1,
+            b'[' => class = true,
+            b']' => class = false,
+            b'/' if !class => return i + 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    i.min(b.len())
+}
+
+/// The end of the quoted literal that starts at `start`; the text's end if it
+/// does not close.
+fn quoted_end(b: &[u8], start: usize) -> usize {
+    let quote = b[start];
+    let mut i = start + 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1,
+            c if c == quote => return i + 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    b.len()
+}
+
+/// Reads template text from `from` (just past a backtick or a `}` closing an
+/// interpolation) to the closing backtick, or to the next `${`, which opens an
+/// interpolation. Returns where lexing resumes and the last significant byte.
+fn template(
+    input: &str,
+    from: usize,
+    seen: &mut usize,
+    depth: &mut usize,
+    interpolations: &mut Vec<usize>,
+) -> (usize, u8) {
+    let b = input.as_bytes();
+    let mut i = from;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1,
+            b'`' => {
+                *seen += mentions(&input[from..i]);
+                return (i + 1, b'a');
+            }
+            b'$' if b.get(i + 1) == Some(&b'{') => {
+                *seen += mentions(&input[from..i]);
+                interpolations.push(*depth);
+                *depth += 1;
+                return (i + 2, b'{');
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let end = b.len();
+    *seen += mentions(input.get(from..end).unwrap_or_default());
+    (end, b'a')
+}
+
+/// After the identifier `tools` ending at `at`: a call to `exec_command` (true)
+/// or `apply_patch` (false) and where its arguments begin, in any of
+/// `tools.name(`, `tools?.name(`, `tools . name (`, `tools["name"](`.
+fn tool_call(input: &str, at: usize) -> Option<(bool, usize)> {
+    let b = input.as_bytes();
+    let skip = |mut i: usize| {
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        i
+    };
+    let mut i = skip(at);
+    if b.get(i) == Some(&b'?') {
+        i += 1;
+    }
+    let name = if b.get(i) == Some(&b'.') {
+        i = skip(i + 1);
+        let start = i;
+        while b.get(i).is_some_and(|c| is_ident(*c)) {
+            i += 1;
+        }
+        &input[start..i]
+    } else if b.get(i) == Some(&b'[') {
+        i = skip(i + 1);
+        let quote = *b.get(i)?;
+        if quote != b'\'' && quote != b'"' {
+            return None;
+        }
+        let end = quoted_end(b, i);
+        let name = input.get(i + 1..end.checked_sub(1)?)?;
+        i = skip(end);
+        if b.get(i) != Some(&b']') {
+            return None;
+        }
+        i += 1;
+        name
+    } else {
+        return None;
+    };
+    let is_exec = match name {
+        EXEC => true,
+        PATCH => false,
+        _ => return None,
+    };
+    i = skip(i);
+    if b.get(i) == Some(&b'?') && b.get(i + 1) == Some(&b'.') {
+        i = skip(i + 2);
+    }
+    (b.get(i) == Some(&b'(')).then_some((is_exec, i + 1))
+}
+
+/// The `{cmd: ..., workdir: ...}` object literal that starts at `start`, and
+/// where reading it ended (which is past anything it read, so the caller never
+/// reads the same bytes twice).
+fn command_at(input: &str, start: usize) -> (Option<Command>, usize) {
     let mut cursor = Cursor {
         text: input,
         at: start,
     };
+    let command = read_command(&mut cursor);
+    (command, cursor.at.max(start))
+}
+
+fn read_command(cursor: &mut Cursor<'_>) -> Option<Command> {
     cursor.skip_space();
     if !cursor.eat('{') {
         return None;
@@ -621,7 +946,9 @@ fn patch_paths(input: &str) -> Vec<String> {
         .split('\n')
         .flat_map(|line| line.split("\\n"))
         .filter_map(|line| {
-            let line = line.trim_start();
+            // Column 0: an indented ` *** Update File:` is a context line of the
+            // patch (a line that already held those words), and `+*** …` an
+            // added one.
             let rest = HEADERS.iter().find_map(|h| line.strip_prefix(h))?;
             let path = rest
                 .trim()
@@ -714,6 +1041,37 @@ mod tests {
         let scanned = scan_input(&src);
         assert_eq!(scanned.commands.len(), MAX_CALLS_PER_EXEC);
         assert_eq!(scanned.unread, 10);
+    }
+
+    #[test]
+    fn code_inside_a_template_interpolation_is_code_and_a_regex_is_not() {
+        let got = commands("const r = `a ${await tools.exec_command({cmd:'ls'})} b`;");
+        assert_eq!(got, vec![("ls".to_string(), None)]);
+        // A call written inside a regex literal is not run; the quote in the
+        // regex does not open a string that swallows the call after it.
+        let scanned = scan_input(
+            "const r = /tools.exec_command\\(\\{cmd:'x'/; await tools.exec_command({cmd:'ok'})",
+        );
+        assert_eq!(scanned.commands.len(), 1);
+        assert_eq!(scanned.commands[0].cmd, "ok");
+        assert_eq!(scanned.unread, 0);
+    }
+
+    #[test]
+    fn a_mention_the_scan_cannot_place_is_counted() {
+        for src in [
+            "const t = tools; t.exec_command({cmd:'x'})",
+            "const { apply_patch } = tools",
+            "await tools[name]({cmd:'x'}); // exec_command",
+        ] {
+            let scanned = scan_input(src);
+            let comment_only = src.contains("// exec_command");
+            assert_eq!(
+                scanned.unread,
+                usize::from(!comment_only),
+                "{src}: a comment is accounted for, the rest are gaps"
+            );
+        }
     }
 
     #[test]

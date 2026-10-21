@@ -586,6 +586,33 @@ fn a_codex_cursor_is_not_forgotten_while_its_root_is_not_walked() {
     assert_eq!(rows(repo).len(), 1);
 }
 
+/// A resume that cannot read the start of the rollout (its first line is past
+/// the per-line bound) must not place the resumed call by a guessed directory:
+/// it is counted unread, with the first pass's rows untouched.
+#[test]
+fn a_resume_that_cannot_recover_the_context_counts_the_calls_instead_of_placing_them() {
+    let pair = Pair::new();
+    let w1 = &pair.wt[0];
+    let codex = tempfile::tempdir().unwrap();
+    let claude = tempfile::tempdir().unwrap();
+    let path = rollout_path(codex.path(), "HUGEMETA");
+    let mut meta: serde_json::Value = serde_json::from_str(&session_meta("HUGEMETA", w1)).unwrap();
+    meta["payload"]["base_instructions"] = serde_json::json!("x".repeat(9 << 20));
+    write_lines(&path, &[meta.to_string()]);
+
+    let second = with_roots(Some(claude.path()), Some(codex.path()), || {
+        pair.pass();
+        append_text(&path, &(run(5, "later", w1) + "\n"));
+        pair.pass()
+    });
+
+    assert_eq!(
+        (second.recorded, second.skipped_lines),
+        (0, 1),
+        "{second:?}"
+    );
+}
+
 fn call(second: u32, payload: serde_json::Value) -> String {
     envelope(second, "response_item", payload)
 }

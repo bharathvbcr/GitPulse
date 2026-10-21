@@ -320,21 +320,60 @@ fn ingest_family(
     // A root that is absent where it should not be: the listing is then not the
     // whole corpus, whatever the roots that are there say.
     let mut missing_root = false;
+    // Optional sources whose default root is not there (ENOENT, nothing more).
+    // Whether that is "never installed" or "gone since the last pass" is told
+    // by the cursors, below.
+    let mut absent_optional: Vec<&'static dyn TranscriptSource> = Vec::new();
     let mut any_root = false;
     for source in source::sources() {
         let Some(root) = source.root() else { continue };
         any_root = true;
-        if root.path.is_dir() {
-            active.push((source, root.path));
+        let name = source.name();
+        let shown = root.path.display();
+        let note = source.reports_unwalkable_root();
+        // A root that is not an absolute path would be read against whatever
+        // directory the app happens to be in.
+        if note && !root.path.is_absolute() {
+            missing_root = true;
+            gaps.push(format!(
+                "the {name} transcript root {shown} is not an absolute path, so its transcripts were not read"
+            ));
             continue;
         }
-        missing_root |= root.explicit || !source.optional();
-        if root.explicit && source.reports_unwalkable_root() {
-            gaps.push(format!(
-                "the {} transcript root {} is not a directory, so its transcripts were not read",
-                source.name(),
-                root.path.display()
-            ));
+        match std::fs::metadata(&root.path) {
+            Ok(meta) if meta.is_dir() => active.push((source, root.path)),
+            Ok(_) => {
+                missing_root = true;
+                if note {
+                    gaps.push(format!(
+                        "the {name} transcript root {shown} is not a directory, so its transcripts were not read"
+                    ));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if root.explicit || !source.optional() {
+                    missing_root = true;
+                    if root.explicit && note {
+                        gaps.push(format!(
+                            "the {name} transcript root {shown} does not exist, so its transcripts were not read"
+                        ));
+                    }
+                } else {
+                    absent_optional.push(source);
+                }
+            }
+            // Present, or not, but not to be told: a permission, a component
+            // that is a file. Never "absent": an unreachable root is not a root
+            // with nothing in it.
+            Err(e) => {
+                missing_root = true;
+                if note {
+                    gaps.push(format!(
+                        "the {name} transcript root {shown} could not be read ({}), so its transcripts were not read",
+                        e.kind()
+                    ));
+                }
+            }
         }
     }
     if !any_root {
@@ -373,6 +412,37 @@ fn ingest_family(
         .collect();
     let mut owners = Owners::default();
 
+    // An optional source's root being absent is ordinary until the source has
+    // been read: once it has, its root vanishing (an unmounted volume, a moved
+    // home) says nothing about its files, and forgetting their cursors would
+    // replay them as duplicate rows when it returns. A marker cursor, kept in
+    // the cursor table beside the others, records "has been read" per worktree,
+    // and is never itself forgotten.
+    let mut markers: HashSet<String> = HashSet::new();
+    for (source, _) in active.iter().filter(|(s, _)| s.optional()) {
+        let key = seen_key(*source);
+        for participant in &mut participants {
+            if !participant.offsets.contains_key(&key) {
+                participant.offsets.insert(key.clone(), 1);
+                participant.pending.push(ledger::TranscriptAdvance {
+                    file_key: key.clone(),
+                    from: None,
+                    to: 1,
+                    fingerprint: None,
+                    drafts: Vec::new(),
+                });
+            }
+        }
+        markers.insert(key);
+    }
+    for source in &absent_optional {
+        let key = seen_key(*source);
+        if participants.iter().any(|p| p.offsets.contains_key(&key)) {
+            missing_root = true;
+        }
+        markers.insert(key);
+    }
+
     // Each source is walked on its own, under its own file cap and entry
     // budget: a source with a huge corpus cannot starve another of its listing.
     let mut files: Vec<(&'static dyn TranscriptSource, std::path::PathBuf)> = Vec::new();
@@ -394,6 +464,9 @@ fn ingest_family(
         files.extend(listed_here.into_iter().map(|path| (*source, path)));
     }
     walk.complete &= !missing_root;
+    if active.len() > 1 {
+        files = single_owner(files, &active);
+    }
     if walk.cut {
         out.truncated = true;
     }
@@ -404,7 +477,7 @@ fn ingest_family(
     out.unlisted_lower_bound = walk.unlisted_lower_bound;
     out.refused_outside_corpus = walk.refused_outside_corpus;
     out.walk_complete = Some(walk.complete);
-    let mut listed = HashSet::new();
+    let mut listed = markers;
     for (source, path) in files {
         if expired(&out) {
             out.truncated = true;
@@ -717,6 +790,83 @@ fn ingest_family(
         };
     }
     out
+}
+
+type Listed = Vec<(&'static dyn TranscriptSource, std::path::PathBuf)>;
+
+/// Gives every listed file exactly one owning source.
+///
+/// Two sources list the same file when their roots overlap (one directory named
+/// as both, or one root inside the other). Reading it with both would record
+/// its lines twice or, worse, let the wrong parser's cursor advance win. The
+/// owner is the source that recognises the file by its first line, else the one
+/// whose root is deeper (the more specific claim), else the first listed.
+/// Files are matched by identity, so two spellings of one path are one file.
+/// Without overlapping roots nothing is looked at.
+fn single_owner(
+    files: Listed,
+    active: &[(&'static dyn TranscriptSource, std::path::PathBuf)],
+) -> Listed {
+    let canonical: Vec<Option<std::path::PathBuf>> = active
+        .iter()
+        .map(|(_, root)| std::fs::canonicalize(root).ok())
+        .collect();
+    let overlap = canonical.iter().enumerate().any(|(i, a)| {
+        canonical
+            .iter()
+            .enumerate()
+            .any(|(j, b)| i != j && matches!((a, b), (Some(a), Some(b)) if a.starts_with(b)))
+    });
+    if !overlap {
+        return files;
+    }
+    let depth = |source: &dyn TranscriptSource| {
+        active
+            .iter()
+            .zip(&canonical)
+            .find(|((s, _), _)| s.actor_id() == source.actor_id())
+            .and_then(|(_, root)| root.as_ref())
+            .map_or(0, |root| root.components().count())
+    };
+    let mut at: HashMap<super::DirId, usize> = HashMap::new();
+    let mut kept: Listed = Vec::new();
+    for (source, path) in files {
+        let id = std::fs::metadata(&path)
+            .ok()
+            .and_then(|meta| super::dir_id(&meta, &path));
+        let Some(id) = id else {
+            kept.push((source, path));
+            continue;
+        };
+        let Some(&held_at) = at.get(&id) else {
+            at.insert(id, kept.len());
+            kept.push((source, path));
+            continue;
+        };
+        let held = kept[held_at].0;
+        if held.actor_id() == source.actor_id() {
+            continue;
+        }
+        let (claims, held_claims) = (source.recognises(&path), held.recognises(&path));
+        let preferred = if claims == held_claims {
+            depth(source) > depth(held)
+        } else {
+            claims
+        };
+        if preferred {
+            kept[held_at] = (source, path);
+        }
+    }
+    kept
+}
+
+/// The cursor key that records that `source` has been read for a worktree. It
+/// names no file, so it is never listed by a walk, and the pass keeps it.
+fn seen_key(source: &dyn TranscriptSource) -> String {
+    ledger::transcript_key(std::path::Path::new(&format!(
+        "gitpulse-transcript-source-read:{}",
+        source.actor_id()
+    )))
 }
 
 /// The answer for a removed worktree's rows the pass did not look up: no task,
