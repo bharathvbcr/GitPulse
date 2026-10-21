@@ -608,7 +608,7 @@ fn main() {
     };
     let ref_cases = || {
         vec![
-            Case::new("tip counts cold 2000 refs", || tip_counts_cold()),
+            Case::new("tip counts cold 2000 refs", &tip_counts_cold),
             Case::new("list_branches cold", || {
                 let (rows, elapsed) = timed(&branch_rows);
                 Sample::default()

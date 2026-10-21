@@ -15090,8 +15090,8 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         fn l4_tip_counts_answer_none_without_a_retry_when_git_rejects_the_atom() {
             let (_dir, root, _wt, _p) = fixture();
             let base = default_base(&root).base.unwrap().1;
-            let arg = format!("--format={BRANCH_LIST_FORMAT}%00%(ahead-behind:{base})");
-            let retry_arg = format!("--format={BRANCH_LIST_FORMAT}");
+            let arg = format!("--format=%(objectname)%00%(ahead-behind:{base})");
+            let retry_arg = "--format=%(objectname)".to_string();
             let retries = || {
                 git_cli::spawn_log::spawns_in(&root)
                     .iter()
