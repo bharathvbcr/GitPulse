@@ -88,7 +88,20 @@ pub(super) struct SharedBudget {
     /// record would. One handle's, never a global.
     #[cfg(test)]
     fail_writes: std::sync::atomic::AtomicBool,
+    /// Record writes this handle completed, so a test can count the churn.
+    #[cfg(test)]
+    writes: std::sync::atomic::AtomicU64,
+    /// Record time of the last denial this handle wrote, `0` when none has
+    /// been. A clean denial changes nothing the next reader cannot recompute,
+    /// so it is rewritten only to prove the record still takes writes (see
+    /// [`SharedBudget::take_at_leveled`]); this says when that was.
+    last_denial_write_ns: std::sync::atomic::AtomicU64,
 }
+
+/// How long a written denial vouches that the record still takes writes. A
+/// clean denial rewrites the record at most this often per handle, however
+/// often its waiter asks.
+const DENIAL_PROBE: Duration = Duration::from_secs(10);
 
 /// What the shared record said about one spawn.
 #[derive(Debug, PartialEq)]
@@ -149,6 +162,9 @@ impl SharedBudget {
             path: path.to_path_buf(),
             #[cfg(test)]
             fail_writes: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            writes: std::sync::atomic::AtomicU64::new(0),
+            last_denial_write_ns: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -158,34 +174,86 @@ impl SharedBudget {
 
     /// Takes one token if more than `floor` remain after refilling at
     /// `per_sec` up to `burst`.
+    #[cfg(test)]
     pub(super) fn take(&self, floor: u32, burst: u32, per_sec: u32) -> Take {
-        self.take_at(floor, burst, per_sec, wall_ns())
+        self.take_leveled(floor, burst, per_sec).0
     }
 
+    /// [`Self::take`], and the tokens the record held after refilling and
+    /// before this decision spent one (`None` when it could not be consulted),
+    /// so a refusal can say how far below the floor the budget was.
+    pub(super) fn take_leveled(&self, floor: u32, burst: u32, per_sec: u32) -> (Take, Option<u32>) {
+        self.take_at_leveled(floor, burst, per_sec, wall_ns())
+    }
+
+    #[cfg(test)]
     fn take_at(&self, floor: u32, burst: u32, per_sec: u32, now_ns: u64) -> Take {
+        self.take_at_leveled(floor, burst, per_sec, now_ns).0
+    }
+
+    fn take_at_leveled(
+        &self,
+        floor: u32,
+        burst: u32,
+        per_sec: u32,
+        now_ns: u64,
+    ) -> (Take, Option<u32>) {
         let locked = match self.lock() {
             Ok(locked) => locked,
-            Err(reason) => return Take::Unavailable(reason),
+            Err(reason) => return (Take::Unavailable(reason), None),
         };
-        let mut state = match self.read_state(&locked, burst, now_ns) {
-            Ok(state) => state,
-            Err(reason) => return Take::Unavailable(reason),
+        let (read, reset) = match self.read_state(&locked, burst, now_ns) {
+            Ok(read) => read,
+            Err(reason) => return (Take::Unavailable(reason), None),
         };
+        let mut state = read;
         refill(&mut state, burst, per_sec, now_ns);
+        let level = state.tokens;
         let granted = state.tokens > floor;
         if granted {
             state.tokens -= 1;
         }
-        // Written even on a denial: the refill anchor moved. A failed write
-        // changes only what the record says afterwards, not this decision: a
-        // grant it could not record is the record unreachable (fail open, the
-        // process bucket still caps this process), but a denial stays one.
-        match (granted, self.write_state(&locked, state)) {
+        // A grant is always written. A denial is written only when the record
+        // would otherwise say something wrong: it was reset (undecodable or
+        // never written), or the wall clock stepped back and the anchor moved
+        // earlier. Otherwise the record already holds everything the denial
+        // learned: refill is a function of (anchor, now), and a reader that
+        // recomputes from the old anchor at a later time credits the same
+        // whole tokens, or fewer by the remainder arithmetic's rounding, never
+        // more, so skipping the write cannot mint. (A credit that left the
+        // level at or below the floor never reached the burst cap, since the
+        // floor is below the burst.) The write is pure churn on a file every
+        // process shares, and the waiters of a drained budget made it every
+        // poll.
+        //
+        // Skipped only while this handle has recently proved the record takes
+        // writes: a record that stopped taking them must still show as
+        // [`Take::DeniedUnrecorded`], and it is a denial that finds out.
+        if !granted && !reset && state.at_ns >= read.at_ns && self.denial_probe_is_fresh(now_ns) {
+            return (Take::Denied, Some(level));
+        }
+        // A failed write changes only what the record says afterwards, not
+        // this decision: a grant it could not record is the record unreachable
+        // (fail open, the process bucket still caps this process), but a
+        // denial stays one.
+        let taken = match (granted, self.write_state(&locked, state)) {
             (true, Ok(())) => Take::Granted,
-            (false, Ok(())) => Take::Denied,
+            (false, Ok(())) => {
+                self.last_denial_write_ns
+                    .store(now_ns, std::sync::atomic::Ordering::Relaxed);
+                Take::Denied
+            }
             (true, Err(reason)) => Take::Unavailable(reason),
             (false, Err(reason)) => Take::DeniedUnrecorded(reason),
-        }
+        };
+        (taken, Some(level))
+    }
+
+    fn denial_probe_is_fresh(&self, now_ns: u64) -> bool {
+        let last = self
+            .last_denial_write_ns
+            .load(std::sync::atomic::Ordering::Relaxed);
+        last != 0 && now_ns >= last && u128::from(now_ns - last) < DENIAL_PROBE.as_nanos()
     }
 
     /// Takes the in-process guard and then the advisory lock, both within one
@@ -243,7 +311,12 @@ impl SharedBudget {
     /// write into a permanent stop, and a full burst would be a gift. A newer
     /// layout's record is an error, so the decision falls back and nothing is
     /// written over it.
-    fn read_state(&self, locked: &Locked<'_>, burst: u32, now_ns: u64) -> Result<State, String> {
+    fn read_state(
+        &self,
+        locked: &Locked<'_>,
+        burst: u32,
+        now_ns: u64,
+    ) -> Result<(State, bool), String> {
         let mut file: &File = &locked.file;
         file.seek(SeekFrom::Start(0))
             .map_err(|e| format!("could not read {}: {e}", self.path.display()))?;
@@ -254,16 +327,22 @@ impl SharedBudget {
             .read_to_end(&mut buf)
             .map_err(|e| format!("could not read {}: {e}", self.path.display()))?;
         if buf.is_empty() {
-            return Ok(State {
-                tokens: burst,
-                at_ns: now_ns,
-            });
+            return Ok((
+                State {
+                    tokens: burst,
+                    at_ns: now_ns,
+                },
+                true,
+            ));
         }
         match decode(&buf) {
-            Record::Current(state) => Ok(State {
-                tokens: state.tokens.min(burst),
-                ..state
-            }),
+            Record::Current(state) => Ok((
+                State {
+                    tokens: state.tokens.min(burst),
+                    ..state
+                },
+                false,
+            )),
             Record::Newer(version) => Err(format!(
                 "{} holds a layout-{version} record from a newer GitPulse (this one \
                  reads layout {VERSION}); left for its writer",
@@ -271,10 +350,13 @@ impl SharedBudget {
             )),
             Record::Unreadable => {
                 log::warn!(target: "spawn_gate", "{}", unreadable_warning(&self.path, &buf));
-                Ok(State {
-                    tokens: 0,
-                    at_ns: now_ns,
-                })
+                Ok((
+                    State {
+                        tokens: 0,
+                        at_ns: now_ns,
+                    },
+                    true,
+                ))
             }
         }
     }
@@ -291,7 +373,17 @@ impl SharedBudget {
         stage_update(&mut file, &encode(state), || {
             locked.file.set_len(RECORD_LEN as u64)
         })
-        .map_err(|e| format!("could not write {}: {e}", self.path.display()))
+        .map_err(|e| format!("could not write {}: {e}", self.path.display()))?;
+        #[cfg(test)]
+        self.writes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Record writes this handle has completed.
+    #[cfg(test)]
+    pub(super) fn writes(&self) -> u64 {
+        self.writes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Makes every later write through this handle fail (or succeed again).
@@ -304,7 +396,7 @@ impl SharedBudget {
     #[cfg(test)]
     fn tokens_now(&self, burst: u32, per_sec: u32, now_ns: u64) -> u32 {
         let locked = self.lock().expect("lock");
-        let mut state = self.read_state(&locked, burst, now_ns).expect("read");
+        let (mut state, _) = self.read_state(&locked, burst, now_ns).expect("read");
         refill(&mut state, burst, per_sec, now_ns);
         state.tokens
     }
@@ -740,6 +832,82 @@ mod tests {
     /// the record as unreachable instead lets the gate admit, and every
     /// process that meets the same failure spends past the shared budget.
     #[test]
+    fn denied_waiters_on_an_empty_record_write_it_no_faster_than_it_refills() {
+        // Four handles (four processes) poll an empty record every 50 ms of
+        // injected time for 10 s, at 8 tokens/s. Only a credited token that is
+        // then granted changes the record; a denial changes nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let handles: Vec<_> = (0..4).map(|_| budget(&dir)).collect();
+        let (burst, per_sec, secs) = (16u32, 8u32, 10u64);
+        let start = 1_000 * S;
+        for _ in 0..burst {
+            assert_eq!(handles[0].take_at(0, burst, per_sec, start), Take::Granted);
+        }
+        let before: u64 = handles.iter().map(SharedBudget::writes).sum();
+        let mut granted = 0u64;
+        for tick in 1..=(secs * 20) {
+            let now = start + tick * (S / 20);
+            for handle in &handles {
+                if handle.take_at(0, burst, per_sec, now) == Take::Granted {
+                    granted += 1;
+                }
+            }
+        }
+        let writes = handles.iter().map(SharedBudget::writes).sum::<u64>() - before;
+        println!(
+            "RECORD WRITES: 4 handles x {secs} s polling every 50 ms at {per_sec}/s -> {writes} writes \
+             ({:.1}/s), {granted} grants",
+            writes as f64 / secs as f64
+        );
+        // One write per grant, plus one probe per handle.
+        assert_eq!(granted, u64::from(per_sec) * secs);
+        assert!(
+            writes <= u64::from(per_sec) * secs + handles.len() as u64,
+            "{writes} writes"
+        );
+    }
+
+    /// A denial that credits nothing, or credits tokens still at or below the
+    /// floor, leaves the record exactly as it was, and a later reader reaches
+    /// the same decision as if the denial had written.
+    #[test]
+    fn a_clean_denial_does_not_rewrite_the_record_and_costs_no_token_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let (burst, per_sec) = (16u32, 8u32);
+        let start = 1_000 * S;
+        let polled = budget(&dir);
+        let silent = budget(&dir);
+        for h in [&polled, &silent] {
+            for _ in 0..burst {
+                let _ = h.take_at(0, burst, per_sec, start);
+            }
+        }
+        // The first denial of a handle writes (the probe); the rest do not.
+        assert_eq!(
+            polled.take_at(4, burst, per_sec, start + S / 4),
+            Take::Denied
+        );
+        let probed = std::fs::read(polled.path()).unwrap();
+        for step in 1..=10u64 {
+            let now = start + S / 4 + step * (S / 50);
+            assert_eq!(polled.take_at(4, burst, per_sec, now), Take::Denied);
+        }
+        assert_eq!(
+            std::fs::read(polled.path()).unwrap(),
+            probed,
+            "denials rewrote the record"
+        );
+        // Polled or not, the record grants after the same wait, and not before.
+        let later = start + S / 4 + S;
+        assert_eq!(
+            polled.tokens_now(burst, per_sec, later),
+            silent.tokens_now(burst, per_sec, later)
+        );
+        let minted_by_polling = polled.tokens_now(burst, per_sec, later);
+        assert_eq!(minted_by_polling, 8 + 2, "refill from the old anchor");
+    }
+
+    #[test]
     fn a_denial_stays_a_denial_when_the_record_cannot_be_rewritten() {
         let dir = tempfile::tempdir().unwrap();
         let now = 1_000 * S;
@@ -795,6 +963,8 @@ mod tests {
             file: Mutex::new(File::open(&path).unwrap()),
             path: path.clone(),
             fail_writes: std::sync::atomic::AtomicBool::new(false),
+            writes: std::sync::atomic::AtomicU64::new(0),
+            last_denial_write_ns: std::sync::atomic::AtomicU64::new(0),
         };
         let before = std::fs::read(&path).unwrap();
         let outcome = shared.take_at(0, 4, 1, now);
@@ -1183,6 +1353,36 @@ mod tests {
         assert_eq!(shared.take_at(0, 4, 1, early + 2 * S), Take::Granted);
     }
 
+    /// The denial that finds the anchor ahead of its clock must write the
+    /// re-anchor even while its handle's probe is fresh; skipping it would leave
+    /// the anchor in the future and stall refill until the clock caught up.
+    #[test]
+    fn a_denial_after_a_clock_step_back_still_re_anchors_so_refill_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = budget(&dir);
+        let late = 10_000 * S;
+        for _ in 0..4 {
+            assert_eq!(a.take_at(0, 4, 1, late), Take::Granted);
+        }
+        // `a` proves the record writable, so its clean denials are now skipped.
+        assert_eq!(a.take_at(0, 4, 1, late), Take::Denied);
+        // A writer whose clock runs 5 s ahead anchors the record there.
+        std::fs::write(
+            a.path(),
+            encode(State {
+                tokens: 0,
+                at_ns: late + 5 * S,
+            }),
+        )
+        .unwrap();
+        // `a`'s clock is behind that anchor: the denial re-anchors and writes.
+        let writes = a.writes();
+        assert_eq!(a.take_at(0, 4, 1, late + S), Take::Denied);
+        assert_eq!(a.writes(), writes + 1, "the re-anchor was not written");
+        // Refill resumes within one interval of the stepped-back clock.
+        assert_eq!(a.take_at(0, 4, 1, late + 2 * S + S / 10), Take::Granted);
+    }
+
     #[test]
     fn a_long_idle_record_refills_to_the_burst_and_no_further() {
         let dir = tempfile::tempdir().unwrap();
@@ -1328,7 +1528,7 @@ mod tests {
         cut: Option<usize>,
     ) {
         let locked = shared.lock().expect("lock");
-        let mut state = shared.read_state(&locked, burst, now).expect("read");
+        let (mut state, _) = shared.read_state(&locked, burst, now).expect("read");
         refill(&mut state, burst, per_sec, now);
         if state.tokens > 0 {
             state.tokens -= 1;
@@ -1349,7 +1549,7 @@ mod tests {
     /// [`commit_steps`]' stream.
     fn new_binary_take_cut(shared: &SharedBudget, burst: u32, per_sec: u32, now: u64, cut: usize) {
         let locked = shared.lock().expect("lock");
-        let mut state = shared.read_state(&locked, burst, now).expect("read");
+        let (mut state, _) = shared.read_state(&locked, burst, now).expect("read");
         refill(&mut state, burst, per_sec, now);
         if state.tokens > 0 {
             state.tokens -= 1;
@@ -1770,3 +1970,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "budget_adversarial_tests.rs"]
+mod budget_adversarial_tests;
