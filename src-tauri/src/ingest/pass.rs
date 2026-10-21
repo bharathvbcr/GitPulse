@@ -1,6 +1,6 @@
 //! The family-wide transcript pass.
 //!
-//! Claude transcripts (the only source ingested; no Codex reader exists)
+//! Agent transcripts (Claude Code's and Codex's, one [`TranscriptSource`] each)
 //! belong to the machine, not to a worktree, yet
 //! progress is recorded per worktree (`transcript_cursors (worktree_key,
 //! file_key, byte_offset)`) and used to be replayed per worktree: with eighteen
@@ -29,7 +29,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::lines::LineReader;
-use super::{transcript, CatchUp};
+use super::source::{self, TranscriptSource};
+use super::{transcript, CatchUp, Walk};
 use crate::ledger;
 use crate::ledger::bindings::BindingHistory;
 
@@ -313,13 +314,40 @@ fn ingest_family(
             return out;
         }
     }
-    let Some(root) = super::transcript_root() else {
+    let mut active: Vec<(&'static dyn TranscriptSource, std::path::PathBuf)> = Vec::new();
+    // What could not be read of a source's root, for `error`.
+    let mut gaps: Vec<String> = Vec::new();
+    // A root that is absent where it should not be: the listing is then not the
+    // whole corpus, whatever the roots that are there say.
+    let mut missing_root = false;
+    let mut any_root = false;
+    for source in source::sources() {
+        let Some(root) = source.root() else { continue };
+        any_root = true;
+        if root.path.is_dir() {
+            active.push((source, root.path));
+            continue;
+        }
+        missing_root |= root.explicit || !source.optional();
+        if root.explicit && source.reports_unwalkable_root() {
+            gaps.push(format!(
+                "the {} transcript root {} is not a directory, so its transcripts were not read",
+                source.name(),
+                root.path.display()
+            ));
+        }
+    }
+    if !any_root {
         out.error = super::NO_TRANSCRIPT_ROOT.into();
         return out;
-    };
-    if !root.is_dir() {
+    }
+    if active.is_empty() {
         // No transcripts is the ordinary case for a machine that has never run
-        // an agent. Not an error.
+        // an agent. Not an error, unless a root was named and is not there.
+        if !gaps.is_empty() {
+            out.walk_complete = Some(false);
+            out.error = gaps.join("; ");
+        }
         return out;
     }
 
@@ -345,8 +373,27 @@ fn ingest_family(
         .collect();
     let mut owners = Owners::default();
 
-    let mut files = Vec::new();
-    let walk = super::collect_jsonl_until(&root, &mut files, 0, &mut || expired(&out));
+    // Each source is walked on its own, under its own file cap and entry
+    // budget: a source with a huge corpus cannot starve another of its listing.
+    let mut files: Vec<(&'static dyn TranscriptSource, std::path::PathBuf)> = Vec::new();
+    let mut walk = Walk::none();
+    for (source, root) in &active {
+        let mut listed_here = Vec::new();
+        let walked = super::collect_jsonl_until(root, &mut listed_here, 0, &mut || expired(&out));
+        let counted_unlisted =
+            walked.unlisted_depth > 0 || walked.unlisted_cap > 0 || walked.unlisted_lower_bound;
+        if source.reports_unwalkable_root() && !walked.complete && !walked.cut && !counted_unlisted
+        {
+            gaps.push(format!(
+                "the {} transcript root {} could not be read in full",
+                source.name(),
+                root.display()
+            ));
+        }
+        walk.absorb(&walked);
+        files.extend(listed_here.into_iter().map(|path| (*source, path)));
+    }
+    walk.complete &= !missing_root;
     if walk.cut {
         out.truncated = true;
     }
@@ -358,7 +405,7 @@ fn ingest_family(
     out.refused_outside_corpus = walk.refused_outside_corpus;
     out.walk_complete = Some(walk.complete);
     let mut listed = HashSet::new();
-    for path in files {
+    for (source, path) in files {
         if expired(&out) {
             out.truncated = true;
             break;
@@ -377,7 +424,14 @@ fn ingest_family(
             now: stat,
             answers: HashMap::new(),
         };
-        let owed = owed_on(&participants, &file_key, len, modified_ms, &mut probe);
+        let owed = owed_on(
+            &participants,
+            &file_key,
+            len,
+            modified_ms,
+            source.legacy_floor(),
+            &mut probe,
+        );
         // Nothing appended since every participant's last read. This is what
         // keeps a corpus no agent touched from being re-read every call.
         let Some(start) = owed.iter().map(|o| o.start).min() else {
@@ -400,6 +454,7 @@ fn ingest_family(
             }
         };
         out.transcripts += 1;
+        let mut parser = source.open(&path, start);
 
         let mut drafts: Vec<Vec<ledger::Draft>> = owed.iter().map(|_| Vec::new()).collect();
         let mut touched: HashSet<usize> = HashSet::new();
@@ -432,106 +487,103 @@ fn ingest_family(
             if text.trim().is_empty() {
                 continue;
             }
-            match transcript::parse_record(text) {
-                transcript::LineOutcome::NoCalls => {}
-                transcript::LineOutcome::Unreadable => out.skipped_lines += 1,
-                transcript::LineOutcome::Calls(calls) => {
-                    for call in calls {
-                        // One owner per call, and the row is always the owner's:
-                        // its path, its task. A removed worktree is found by
-                        // its path alone, and only when the family is known (an
-                        // unresolved one may hold live worktrees this pass
-                        // cannot see). A worktree this pass has no room for
-                        // owns its rows just the same. Either is "hosted": the
-                        // bytes ride the transaction of the deepest root that
-                        // has a slot, whose cursor keeps them exactly-once.
-                        let departed = if resolved {
-                            transcript::departed_root(&call, &roots)
-                        } else {
-                            None
-                        };
-                        let (hosted_owner_root, live_host) = match &departed {
-                            Some(departed) => (Some((departed.root, false)), departed.host),
-                            None => match transcript::attribution_root(&call, &roots) {
-                                Some(root) if by_path.contains_key(root) => (None, root),
-                                Some(root) => (Some((root, true)), root),
-                                None => continue,
-                            },
-                        };
-                        let (index, rehosted) = match by_path.get(live_host) {
-                            Some(&index) => (index, false),
-                            None => {
-                                let owner = hosted_owner_root.map_or(live_host, |(root, _)| root);
-                                match transcript::deepest_root(owner, paths)
-                                    .and_then(|root| by_path.get(root))
-                                {
-                                    Some(&index) => (index, true),
-                                    None => continue,
-                                }
-                            }
-                        };
-                        // A host that owes nothing here has already consumed it.
-                        let Some(slot) = owed.iter().position(|o| o.participant == index) else {
-                            continue;
-                        };
-                        let owes = &owed[slot];
-                        // Bytes before a participant's own cursor are ones
-                        // it has already consumed.
-                        if line.offset < owes.start {
-                            continue;
-                        }
-                        let participant = &participants[index];
-                        // Compared as instants: a transcript's own spelling may
-                        // carry an offset, which does not order as text. A time
-                        // that cannot be read is not skipped; a duplicate row
-                        // is recoverable, a lost one is not.
-                        if owes.floored
-                            && participant.baseline_ms > 0
-                            && ledger::ids::parse_event_time(&call.ts_utc)
-                                .is_some_and(|at| at <= participant.baseline_ms)
+            let parsed = parser.parse(text);
+            out.skipped_lines += parsed.skipped;
+            for call in parsed.calls {
+                // One owner per call, and the row is always the owner's:
+                // its path, its task. A removed worktree is found by
+                // its path alone, and only when the family is known (an
+                // unresolved one may hold live worktrees this pass
+                // cannot see). A worktree this pass has no room for
+                // owns its rows just the same. Either is "hosted": the
+                // bytes ride the transaction of the deepest root that
+                // has a slot, whose cursor keeps them exactly-once.
+                let departed = if resolved {
+                    transcript::departed_root(&call, &roots)
+                } else {
+                    None
+                };
+                let (hosted_owner_root, live_host) = match &departed {
+                    Some(departed) => (Some((departed.root, false)), departed.host),
+                    None => match transcript::attribution_root(&call, &roots) {
+                        Some(root) if by_path.contains_key(root) => (None, root),
+                        Some(root) => (Some((root, true)), root),
+                        None => continue,
+                    },
+                };
+                let (index, rehosted) = match by_path.get(live_host) {
+                    Some(&index) => (index, false),
+                    None => {
+                        let owner = hosted_owner_root.map_or(live_host, |(root, _)| root);
+                        match transcript::deepest_root(owner, paths)
+                            .and_then(|root| by_path.get(root))
                         {
-                            continue;
+                            Some(&index) => (index, true),
+                            None => continue,
                         }
-                        let (worktree, history) = match hosted_owner_root {
-                            Some((root, live)) => {
-                                match hosted_owner(ledger_repo, root, live, &mut owners, &mut out) {
-                                    Some(owner) => {
-                                        // Consumed in a pass of its own, or
-                                        // hosted by an earlier one.
-                                        if consumed_by(
-                                            &owners.hosted[owner],
-                                            &file_key,
-                                            line.offset,
-                                            len,
-                                            &mut probe,
-                                        ) {
-                                            continue;
-                                        }
-                                        touched.insert(owner);
-                                        (root, &owners.hosted[owner].history)
-                                    }
-                                    // Past the bound on untrusted names: the
-                                    // row is still the owner's and the host's
-                                    // cursor still keeps it exactly-once, but
-                                    // the owner's own cursor is not touched,
-                                    // and its task is not looked up.
-                                    None => {
-                                        out.departed_overflow += 1;
-                                        (root, &NO_HISTORY)
-                                    }
-                                }
-                            }
-                            None => (participant.path.as_str(), &participant.history),
-                        };
-                        drafts[slot].push(super::transcript_draft(
-                            &call,
-                            ledger_repo,
-                            worktree,
-                            history,
-                        ));
-                        out.rehosted_calls += i64::from(rehosted);
                     }
+                };
+                // A host that owes nothing here has already consumed it.
+                let Some(slot) = owed.iter().position(|o| o.participant == index) else {
+                    continue;
+                };
+                let owes = &owed[slot];
+                // Bytes before a participant's own cursor are ones
+                // it has already consumed.
+                if line.offset < owes.start {
+                    continue;
                 }
+                let participant = &participants[index];
+                // Compared as instants: a transcript's own spelling may
+                // carry an offset, which does not order as text. A time
+                // that cannot be read is not skipped; a duplicate row
+                // is recoverable, a lost one is not.
+                if owes.floored
+                    && participant.baseline_ms > 0
+                    && ledger::ids::parse_event_time(&call.ts_utc)
+                        .is_some_and(|at| at <= participant.baseline_ms)
+                {
+                    continue;
+                }
+                let (worktree, history) = match hosted_owner_root {
+                    Some((root, live)) => {
+                        match hosted_owner(ledger_repo, root, live, &mut owners, &mut out) {
+                            Some(owner) => {
+                                // Consumed in a pass of its own, or
+                                // hosted by an earlier one.
+                                if consumed_by(
+                                    &owners.hosted[owner],
+                                    &file_key,
+                                    line.offset,
+                                    len,
+                                    &mut probe,
+                                ) {
+                                    continue;
+                                }
+                                touched.insert(owner);
+                                (root, &owners.hosted[owner].history)
+                            }
+                            // Past the bound on untrusted names: the
+                            // row is still the owner's and the host's
+                            // cursor still keeps it exactly-once, but
+                            // the owner's own cursor is not touched,
+                            // and its task is not looked up.
+                            None => {
+                                out.departed_overflow += 1;
+                                (root, &NO_HISTORY)
+                            }
+                        }
+                    }
+                    None => (participant.path.as_str(), &participant.history),
+                };
+                drafts[slot].push(super::transcript_draft(
+                    &call,
+                    source.actor_id(),
+                    ledger_repo,
+                    worktree,
+                    history,
+                ));
+                out.rehosted_calls += i64::from(rehosted);
             }
         }
         #[cfg(test)]
@@ -653,6 +705,15 @@ fn ingest_family(
             note
         } else {
             format!("{}; {note}", out.error)
+        };
+    }
+    // A root that was named and could not be read is a gap in the history, and
+    // is said whether or not anything else went wrong.
+    for gap in gaps {
+        out.error = if out.error.is_empty() {
+            gap
+        } else {
+            format!("{}; {gap}", out.error)
         };
     }
     out
@@ -841,6 +902,7 @@ fn owed_on(
     file_key: &str,
     len: u64,
     modified_ms: Option<u64>,
+    legacy_floor: bool,
     probe: &mut Probe<'_>,
 ) -> Vec<Owed> {
     participants
@@ -875,12 +937,15 @@ fn owed_on(
                 // one is not.
                 Some(_) => (0, false),
                 // Untouched since the baseline: the old watermark already read it.
-                None if participant.baseline_ms > 0
+                // Only for a source the old watermark described: a source it
+                // never read has nothing before the line to be skipped.
+                None if legacy_floor
+                    && participant.baseline_ms > 0
                     && !super::written_since(modified_ms, participant.baseline_ms) =>
                 {
                     return None
                 }
-                None => (0, !participant.baseline.is_empty()),
+                None => (0, legacy_floor && !participant.baseline.is_empty()),
             };
             Some(Owed {
                 participant: index,

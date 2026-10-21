@@ -11,6 +11,29 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- **Codex sessions are recorded in the ledger.** Transcript catch-up used to
+  read only Claude Code transcripts, so work done by Codex, which GitPulse
+  already hosts and counts live, never reached the ledger. Transcripts are now
+  read through one source per agent. Codex rollouts
+  (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, or
+  `GITPULSE_CODEX_TRANSCRIPT_ROOT`) become `session.edit` and `session.command`
+  rows with `actor_id` `codex`, attributed to worktrees by the same path and
+  `cwd` rules as Claude's. Claude rows are unchanged.
+  - It reads the format Codex CLI 0.149.1 writes. A line in any other shape, a
+    shell or patch call in a shape it does not know, and a command that is not
+    a string literal are counted in `skipped_lines`, never guessed.
+  - Each source is walked under its own depth and file caps. `walk_complete`
+    is true only when every walked source was whole, the unlisted counts add
+    across sources, and a saved offset is forgotten only after such a walk.
+  - A `GITPULSE_CODEX_TRANSCRIPT_ROOT` that is missing or unreadable marks the
+    walk incomplete and says so in `error`. A missing default directory is a
+    machine that never ran Codex, and is not an error.
+  - The first read of a Codex rollout is not held to the baseline the older
+    per-worktree watermark drew for Claude transcripts, so Codex history older
+    than a worktree's newest Claude row is recorded rather than dropped.
+
 ### Fixed
 
 - **Ledger answers over MCP say how current and how whole they are.** Added
