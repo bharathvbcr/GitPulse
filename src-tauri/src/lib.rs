@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod adv_w3l2_tests;
 pub mod ai;
 pub mod alerts;
 pub mod analyzer;
