@@ -5782,6 +5782,84 @@ some-future-field whatever
         assert_eq!(measured(&walked), Some(expected), "walked");
     }
 
+    /// Adversarial L4: `batch_divergence` is fresh after each ref move, and a git
+    /// that rejects the atom answers None with exactly one spawn.
+    #[test]
+    fn l4_batch_divergence_is_fresh_after_moves_and_none_without_a_retry() {
+        let _held = crate::engine::ref_cache::retention();
+        let (main, _parent, linked) = repo_with_worktrees(1);
+        let root = plain(main.path());
+        let truth = |base: &str, b: &str| {
+            let c = rev_text(
+                &root,
+                &[
+                    "rev-list",
+                    "--left-right",
+                    "--count",
+                    &format!("{base}...{b}"),
+                ],
+            );
+            let mut it = c.split_whitespace().map(|n| n.parse::<usize>().unwrap());
+            let behind = it.next().unwrap();
+            let ahead = it.next().unwrap();
+            WorktreeDivergence { ahead, behind }
+        };
+        crate::engine::ref_cache::eager(|| {
+            let ask = || {
+                let base = rev(&root, "main");
+                (
+                    base.clone(),
+                    batch_divergence(&root, &base, &["agent/00", "main"]).expect("a batch"),
+                )
+            };
+            let check = |label: &str| {
+                let (base, got) = ask();
+                for b in ["agent/00", "main"] {
+                    assert_eq!(got[b], truth(&base, b), "stale {b} after {label}");
+                }
+            };
+            check("warm");
+            check("warm again");
+            std::fs::write(linked[0].join("x.txt"), "x").unwrap();
+            git_in(&linked[0], &["add", "."]);
+            git_in(&linked[0], &["commit", "-q", "-m", "x"]);
+            check("a commit in the linked worktree");
+            git_in(
+                &root,
+                &["commit", "-q", "--allow-empty", "-m", "main moves"],
+            );
+            check("the base moving");
+            let tip = rev(&root, "agent/00");
+            git_in(
+                &root,
+                &["update-ref", "refs/heads/agent/00", &rev(&root, "main")],
+            );
+            check("update-ref back to base");
+            git_in(&root, &["pack-refs", "--all"]);
+            check("pack-refs");
+            git_in(&root, &["update-ref", "refs/heads/agent/00", &tip]);
+            check("loose over packed");
+        });
+        let base = rev(&root, "main");
+        let arg = format!("--format=%(refname)%00%(ahead-behind:{base})");
+        let retries = || {
+            crate::engine::git_cli::spawn_log::spawns_in(&root)
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == "--format=%(refname)"))
+                .count()
+        };
+        let before = retries();
+        let got = crate::engine::git_cli::with_forced_spawn_failure_of(&arg, || {
+            batch_divergence(&root, &base, &["main"])
+        });
+        assert_eq!(got, None);
+        assert_eq!(retries(), before, "no atom-less retry");
+    }
+
+    fn rev_text(repo: &Path, args: &[&str]) -> String {
+        git_text(repo, args).unwrap().trim().to_string()
+    }
+
     /// Pins `batch_divergence` on worktrees whose branches are diverged, one of
     /// them named with unicode, slashes and `@`: exact-name rows only, a
     /// namespace prefix and a missing branch absent, and `None` for a base git
