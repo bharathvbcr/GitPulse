@@ -322,6 +322,23 @@ fn force_kill(child: &Mutex<Child>, guard: &crate::procguard::Registration) {
     let _ = guard.stop_and_reap(&mut child, Duration::ZERO);
 }
 
+/// [`force_kill`] that never waits for the child lock: `false` means the lock
+/// was busy and nothing was done. For the stdout pump's overflow, where waiting
+/// is itself the fault: the lock is held for a whole shutdown grace, and a pump
+/// parked on it stops reading and turns an honest child's farewell into a
+/// SIGKILL. A busy lock means a shutdown or a brief liveness check is under
+/// way; a child that is really flooding overflows again on its next frame and
+/// is killed then.
+fn try_force_kill(child: &Mutex<Child>, guard: &crate::procguard::Registration) -> bool {
+    let mut child = match child.try_lock() {
+        Ok(child) => child,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return false,
+    };
+    let _ = guard.stop_and_reap(&mut child, Duration::ZERO);
+    true
+}
+
 /// How long a child that has closed its stdout gets to finish exiting before
 /// its group is stopped. A child honouring a shutdown closes stdout as it goes
 /// and exits within moments; the wait is only ever paid by one that does not.
@@ -372,8 +389,9 @@ fn spawn_stdout_pump(
                             if shutting_down.load(Ordering::Acquire) {
                                 continue;
                             }
-                            force_kill(&child, &guard);
-                            return;
+                            if try_force_kill(&child, &guard) {
+                                return;
+                            }
                         }
                     }
                 }
@@ -555,6 +573,20 @@ impl Sidecar {
         outcome
     }
 
+    /// Whether the child is known to have exited. Never waits for the child
+    /// lock, which [`Sidecar::terminate`] holds for its whole grace: a busy lock
+    /// is "not known", and the caller keeps waiting on the channel, which
+    /// closes when the shutdown is over. A call must honour its own deadline.
+    fn child_known_exited(&self) -> bool {
+        match self.child.try_lock() {
+            Ok(mut child) => self.guard.exited(&mut child),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                self.guard.exited(&mut poisoned.into_inner())
+            }
+            Err(std::sync::TryLockError::WouldBlock) => false,
+        }
+    }
+
     fn await_answer(&self, op: &str, id: &str, timeout: Duration) -> Result<Value, HarnessError> {
         let deadline = Instant::now() + timeout;
         let mut response_bytes = 0usize;
@@ -574,7 +606,7 @@ impl Sidecar {
                     // A child that died while a helper it forked still holds
                     // its stdout open never closes the channel; its exit status
                     // is the evidence, and every waiter fails on it at once.
-                    if self.guard.exited(&mut relock(&self.child)) {
+                    if self.child_known_exited() {
                         return Err(HarnessError::Unavailable(format!(
                             "sidecar exited during {}{}",
                             op,
@@ -4028,7 +4060,36 @@ while IFS= read -r line; do handle "$line" & done
         drop(held);
         let status = status_when_it_exits(&sidecar.child);
         assert!(pump_exits(&sidecar), "pump hung behind the child lock");
-        eprintln!("adv race emulation: honest child ended as {status:?}");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "the honest child was killed: {status:?}"
+        );
+    }
+
+    /// A busy child lock must not turn a real flood into a free pass: the pump
+    /// drops frames while the lock is held, and kills on the first overflow
+    /// after it frees. The bound asserted is the lock's release plus scaled
+    /// slack.
+    #[cfg(unix)]
+    #[test]
+    fn a_flood_that_met_a_busy_lock_is_killed_once_it_frees() {
+        let sidecar = scripted_sidecar(&format!("yes '{}'", "x".repeat(99)), WRITE_DEADLINE);
+        let held = relock(&sidecar.child);
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            !sidecar.shutting_down.load(Ordering::Acquire),
+            "not a shutdown"
+        );
+        let freed = Instant::now();
+        drop(held);
+        let status = status_when_it_exits(&sidecar.child);
+        assert_eq!(status.signal(), Some(9), "{status:?}");
+        assert!(
+            freed.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(3)),
+            "kill took {:?} after the lock freed",
+            freed.elapsed()
+        );
     }
 
     /// Attack 2 (stress): shutdown at a spread of moments against a child that
@@ -4107,7 +4168,6 @@ while IFS= read -r line; do handle "$line" & done
     /// Reports how late the call is delivered its Timeout/Unavailable.
     #[cfg(unix)]
     #[test]
-    #[ignore = "known defect: await_answer's exited() check waits on the child lock terminate holds for the grace (pre-existing, not the lane's change)"]
     fn adv_in_flight_call_honours_its_deadline_while_terminate_holds_the_lock() {
         let sidecar = Arc::new(graceful("read line; exec sleep 30", 1500));
         let caller = {
@@ -4123,7 +4183,8 @@ while IFS= read -r line; do handle "$line" & done
         let (outcome, took) = caller.join().expect("caller");
         assert!(outcome.is_err());
         assert!(
-            took < sidecar.shutdown_grace,
+            took < Duration::from_millis(300)
+                + crate::test_support::coverage_relaxed(Duration::from_millis(500)),
             "a 300ms call outlived terminate's lock for {took:?}"
         );
     }
