@@ -2326,19 +2326,54 @@ pub fn tail_newest(
     read_after(repo_path, cursor, limit, true, Access::Writable, None).map(|(events, _)| events)
 }
 
-/// The one precedence order of a worktree's bind and unbind rows, newest first:
-/// `(ts_utc, ulid)`, the pair an imported legacy row keeps across databases.
-/// Every binding read spells it through this macro, so "which row is newest"
-/// has one definition, and `ulid` (unique) leaves no ties.
+/// The one authority order of a worktree's bind and unbind rows *within one
+/// ledger*, newest first: insertion sequence (`id`), which `write_tx`
+/// (`BEGIN IMMEDIATE`) serialises across processes. `ts_utc` is display data
+/// here, so a backward clock step or a future-dated row cannot make an older
+/// bind outrank a later unbind. Both authority reads ([`latest_binding`] and
+/// [`newest_binding_readonly`]) spell it through this macro, so "which row is
+/// newest" has one definition.
+///
+/// Across databases an `id` means nothing, so rows of different ledgers are
+/// compared by [`binding_precedence_key`]; see [`NewestBinding`].
 macro_rules! binding_order {
     () => {
-        "ORDER BY ts_utc DESC, ulid DESC"
+        "ORDER BY id DESC"
     };
 }
 
+/// [`binding_order!`] as a value, for a test to hold every authority read to it.
+#[cfg(test)]
+pub(crate) const BINDING_ORDER: &str = binding_order!();
+
+/// How far ahead of the clock a bind or unbind's `ts_utc` may sit before the
+/// row is flagged (and, across ledgers, clamped): a day covers any real skew.
+pub(crate) const FAR_FUTURE_TOLERANCE_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Whether `ts_utc` is dated beyond [`FAR_FUTURE_TOLERANCE_MS`] ahead of the
+/// clock. A timestamp that does not parse is not "in the future", it is
+/// malformed, and is judged by the import's own validity check.
+pub(crate) fn is_far_future(ts_utc: &str) -> bool {
+    ids::parse_event_time(ts_utc)
+        .is_some_and(|ms| ms > ids::now_millis().saturating_add(FAR_FUTURE_TOLERANCE_MS))
+}
+
+/// The cross-database precedence key of a binding row: `(ts_utc, ulid)`, with a
+/// far-future `ts_utc` clamped to the tolerance horizon so it can never win by
+/// timestamp alone.
+pub(crate) fn binding_precedence_key(ts_utc: &str, ulid: &str) -> (String, String) {
+    let horizon = ids::iso8601_utc(ids::now_millis().saturating_add(FAR_FUTURE_TOLERANCE_MS));
+    let ts = if is_far_future(ts_utc) {
+        horizon
+    } else {
+        ts_utc.to_string()
+    };
+    (ts, ulid.to_string())
+}
+
 /// The newest bind/unbind row of a worktree (`?1`, `?2` its two spellings).
-const LATEST_BINDING_SQL: &str = concat!(
-    "SELECT action, task_id FROM events
+pub(crate) const LATEST_BINDING_SQL: &str = concat!(
+    "SELECT action, task_id, ts_utc FROM events
      WHERE action IN ('worktree.bind', 'worktree.unbind')
        AND worktree_path IN (?1, ?2)
      ",
@@ -2348,25 +2383,32 @@ const LATEST_BINDING_SQL: &str = concat!(
 );
 
 /// [`LATEST_BINDING_SQL`] as of a moment (`?3`, a fixed-width `ts_utc`): the
-/// newest row at or before it. A row exactly at `?3` counts.
-pub(crate) const BINDING_AS_OF_SQL: &str = concat!(
-    "SELECT action, task_id FROM events
+/// newest row at or before it. A row exactly at `?3` counts. A timeline query
+/// ("what held at that moment"), so it stays ordered by time, not authority.
+pub(crate) const BINDING_AS_OF_SQL: &str = "SELECT action, task_id FROM events
      WHERE action IN ('worktree.bind', 'worktree.unbind')
        AND worktree_path IN (?1, ?2)
        AND ts_utc <= ?3
+     ORDER BY ts_utc DESC, ulid DESC
+     LIMIT 1";
+
+/// Every bind/unbind row of a worktree, newest first by time (see
+/// [`BINDING_AS_OF_SQL`]).
+pub(crate) const BINDING_HISTORY_SQL: &str = "SELECT ts_utc, action, task_id FROM events
+     WHERE action IN ('worktree.bind', 'worktree.unbind')
+       AND worktree_path IN (?1, ?2)
+     ORDER BY ts_utc DESC, ulid DESC";
+
+/// The newest bind/unbind row of a worktree in one ledger, with the key
+/// [`NewestBinding`] ranks it by across ledgers.
+pub(crate) const NEWEST_BINDING_SQL: &str = concat!(
+    "SELECT ts_utc, ulid, action, task_id FROM events
+     WHERE action IN ('worktree.bind', 'worktree.unbind')
+       AND worktree_path IN (?1, ?2)
      ",
     binding_order!(),
     "
      LIMIT 1"
-);
-
-/// Every bind/unbind row of a worktree, newest first.
-pub(crate) const BINDING_HISTORY_SQL: &str = concat!(
-    "SELECT ts_utc, action, task_id FROM events
-     WHERE action IN ('worktree.bind', 'worktree.unbind')
-       AND worktree_path IN (?1, ?2)
-     ",
-    binding_order!()
 );
 
 /// One bind or unbind row: when it was appended, and the task it names
@@ -2420,9 +2462,10 @@ fn home_spellings(repo_path: &str) -> Vec<String> {
 ///
 /// One indexed query (`idx_events_binding`) in place of paging the whole
 /// ledger through [`tail`], which held the app-wide ledger lock once per
-/// 1000 rows and ran on every gated mutation. Precedence is `(ts_utc, ulid)`,
-/// the order an imported legacy row keeps across databases; `ulid` is unique,
-/// so there are no ties. Like [`tail`], any row attributed to a different
+/// 1000 rows and ran on every gated mutation. Precedence is insertion order
+/// ([`binding_order!`]), never the clock; a sibling's older legacy row takes
+/// its place in that order when it is imported (`import_legacy_page`). Like
+/// [`tail`], any row attributed to a different
 /// repository refuses the read. Unlike paging, a row elsewhere in the ledger
 /// that could not be decoded no longer fails it, because no other row is
 /// decoded.
@@ -2506,11 +2549,34 @@ fn query_latest_binding(
     conn.query_row(
         LATEST_BINDING_SQL,
         params![worktree, stored_worktree],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
     )
     .optional()
     .map_err(|e| LedgerError::new("query_failed", e.to_string()))
-    .map(|found| found.map(|(action, task_id)| bound_task(&action, task_id)))
+    .map(|found| {
+        found.map(|(action, task_id, ts_utc)| {
+            flag_far_future_binding(&action, &ts_utc);
+            bound_task(&action, task_id)
+        })
+    })
+}
+
+/// Says so when the binding in force carries a `ts_utc` far ahead of the clock.
+/// Insertion order means it cannot win by that date, so this is visibility: a
+/// runaway clock or a forged row, worth a person's look.
+fn flag_far_future_binding(action: &str, ts_utc: &str) {
+    if is_far_future(ts_utc) {
+        log::warn!(
+            target: "ledger",
+            "binding row {action} is dated in the future ({ts_utc}); it is ordered by insertion, not by that date"
+        );
+    }
 }
 
 /// The binding of a worktree as of `at_ts` (a fixed-width `ts_utc`): the
@@ -2565,14 +2631,17 @@ pub(crate) fn binding_history(
     })
 }
 
-/// A binding's `(ts_utc, ulid)` precedence key and the task it names, if any.
+/// A binding's [`binding_precedence_key`] and the task it names, if any. The
+/// key is how rows of *different* ledgers are ranked: an `id` is local to its
+/// database, so it cannot order them.
 pub(crate) type NewestBinding = ((String, String), Option<String>);
 
-/// The newest bind or unbind for a worktree in one *legacy sibling* ledger,
-/// with its `(ts_utc, ulid)` precedence key, read through a read-only
-/// connection. For resolving a binding while the family's own ledger does not
-/// exist yet, so the answer can still be enforced without creating or
-/// migrating that ledger from a read.
+/// The newest bind or unbind for a worktree in one *legacy sibling* ledger
+/// (newest by [`binding_order!`], the same order [`latest_binding`] uses), with
+/// its [`binding_precedence_key`], read through a read-only connection. For
+/// resolving a binding while the family's own ledger does not exist yet, so the
+/// answer can still be enforced without creating or migrating that ledger from
+/// a read.
 pub(crate) fn newest_binding_readonly(
     sibling_repo: &str,
     worktree: &str,
@@ -2580,21 +2649,15 @@ pub(crate) fn newest_binding_readonly(
 ) -> Result<Option<NewestBinding>, LedgerError> {
     with_access(sibling_repo, Access::ReadOnly, |conn| {
         conn.query_row(
-            concat!(
-                "SELECT ts_utc, ulid, action, task_id FROM events
-                 WHERE action IN ('worktree.bind', 'worktree.unbind')
-                   AND worktree_path IN (?1, ?2)
-                 ",
-                binding_order!(),
-                "
-                 LIMIT 1"
-            ),
+            NEWEST_BINDING_SQL,
             params![worktree, stored_worktree],
             |row| {
                 let action: String = row.get(2)?;
                 let task: Option<String> = row.get(3)?;
+                let (ts_utc, ulid) = (row.get::<_, String>(0)?, row.get::<_, String>(1)?);
+                flag_far_future_binding(&action, &ts_utc);
                 Ok((
-                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                    binding_precedence_key(&ts_utc, &ulid),
                     task.filter(|_| action == bindings::BIND),
                 ))
             },
@@ -2945,6 +3008,52 @@ pub(crate) fn valid_utc_timestamp(value: &str) -> bool {
         })
 }
 
+/// Whether a sibling ledger's bind/unbind rows may still set a binding in the
+/// anchor: only rows from before the anchor ledger existed (the migration of
+/// per-worktree ledgers the import was written for). A sibling ledger created
+/// after the anchor, or a row dated after it, was written by something that
+/// could have written the anchor directly instead, and is history only.
+#[derive(Debug, Clone)]
+struct SourceAuthority {
+    /// This import reads rows the anchor has never imported from this sibling
+    /// (its first), and the sibling's database file was created no later than
+    /// the anchor's. A row that arrives in a later import was written after the
+    /// anchor had already taken this sibling's history, however it is dated.
+    /// False when a creation time is unknown: unknown is never "before".
+    predates_anchor: bool,
+    /// The anchor database's creation, as a fixed-width `ts_utc`.
+    anchor_created_ts: String,
+}
+
+impl SourceAuthority {
+    fn of(source_db: &Path, anchor_db: &Path, first_import: bool) -> Self {
+        let created_ms = |path: &Path| {
+            std::fs::metadata(path)
+                .and_then(|metadata| metadata.created())
+                .ok()
+                .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|age| age.as_millis() as u64)
+        };
+        let (source, anchor) = (created_ms(source_db), created_ms(anchor_db));
+        Self {
+            predates_anchor: first_import
+                && matches!((source, anchor), (Some(source), Some(anchor)) if source <= anchor),
+            anchor_created_ts: ids::iso8601_utc(anchor.unwrap_or(0)),
+        }
+    }
+
+    /// `event`, with a bind or unbind this source may not set a binding by
+    /// turned into its history-only spelling. Any other row is untouched.
+    fn applied_to(&self, mut event: LedgerEvent) -> LedgerEvent {
+        if !(self.predates_anchor && event.ts_utc <= self.anchor_created_ts) {
+            if let Some(imported) = bindings::imported_action(&event.action) {
+                event.action = imported.to_string();
+            }
+        }
+        event
+    }
+}
+
 fn normalize_legacy_event(
     mut event: LedgerEvent,
     anchor: &Path,
@@ -3099,6 +3208,41 @@ fn family_import_cursor(anchor: &str, source_key: &str) -> Result<i64, LedgerErr
     })
 }
 
+/// `event` as its history-only spelling when it is a bind or unbind that a row
+/// already in the anchor outranks, `None` when it stands as it is.
+///
+/// A legacy row is placed in insertion order by arriving, so one older than the
+/// binding in force (a second sibling's earlier bind, imported after a later
+/// one) must not arrive as the newest: it is ranked against that binding by the
+/// cross-database [`binding_precedence_key`], the one place ids cannot decide.
+fn superseded_binding(
+    transaction: &rusqlite::Transaction<'_>,
+    event: &LedgerEvent,
+) -> Result<Option<LedgerEvent>, LedgerError> {
+    let (Some(_), Some(worktree)) = (
+        bindings::imported_action(&event.action),
+        event.worktree_path.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    let in_force = transaction
+        .query_row(NEWEST_BINDING_SQL, params![worktree, worktree], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .optional()
+        .map_err(|error| LedgerError::new("legacy_import_failed", error.to_string()))?;
+    let outranked = in_force.is_some_and(|(ts_utc, ulid)| {
+        binding_precedence_key(&ts_utc, &ulid) > binding_precedence_key(&event.ts_utc, &event.ulid)
+    });
+    Ok(outranked.then(|| {
+        let mut demoted = event.clone();
+        if let Some(imported) = bindings::imported_action(&event.action) {
+            demoted.action = imported.to_string();
+        }
+        demoted
+    }))
+}
+
 fn import_legacy_page(
     anchor: &str,
     source_key: &str,
@@ -3152,7 +3296,15 @@ fn import_legacy_page(
                  WHEN ?10 LIKE 'reflog.%' THEN 0 END)
              ON CONFLICT(ulid) DO NOTHING"
         );
-        for event in page {
+        for source_event in page {
+            let demoted;
+            let event = match superseded_binding(&transaction, source_event)? {
+                Some(event) => {
+                    demoted = event;
+                    &demoted
+                }
+                None => source_event,
+            };
             let changed = transaction
                 .execute(
                     &insert_sql,
@@ -3197,10 +3349,16 @@ fn import_legacy_page(
                 )
                 .optional()
                 .map_err(|error| LedgerError::new("legacy_import_failed", error.to_string()))?;
-            if existing
-                .as_ref()
-                .is_none_or(|existing| !same_event_payload(existing, event))
-            {
+            // Whether a binding row was demoted depends on what the anchor held
+            // when it arrived, so a retry may spell its action either way.
+            let same_row = existing.as_ref().is_some_and(|existing| {
+                let mut existing = existing.clone();
+                existing.action = bindings::base_action(&existing.action).to_string();
+                let mut event = event.clone();
+                event.action = bindings::base_action(&event.action).to_string();
+                same_event_payload(&existing, &event)
+            });
+            if !same_row {
                 return Err(LedgerError::new(
                     "legacy_ulid_conflict",
                     format!(
@@ -3294,6 +3452,8 @@ fn import_source(
         let source_name = source.to_string_lossy().into_owned();
         let source_key = family_source_key(anchor_path, &source_name)?;
         let mut cursor = family_import_cursor(anchor, &source_key)?;
+        // After the cursor read, which is what creates the anchor database.
+        let authority = SourceAuthority::of(source_db, &ledger_path(anchor), cursor == 0);
         #[cfg(test)]
         tests::LEDGER_SIBLING_OPENS.with(|opens| opens.set(opens.get() + 1));
         let source_conn = Connection::open_with_flags(source_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -3362,7 +3522,10 @@ fn import_source(
             cursor = source_page.last().map(|event| event.id).unwrap_or(cursor);
             let normalized = source_page
                 .into_iter()
-                .map(|event| normalize_legacy_event(event, anchor_path, source, members))
+                .map(|event| {
+                    normalize_legacy_event(event, anchor_path, source, members)
+                        .map(|event| authority.applied_to(event))
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             let (imported, newest_cursor) =
                 import_legacy_page(anchor, &source_key, &source_name, &normalized, cursor)?;

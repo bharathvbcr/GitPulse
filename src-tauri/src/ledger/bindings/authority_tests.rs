@@ -111,14 +111,19 @@ fn a_rebind_stamped_two_hours_earlier_still_wins_because_it_was_inserted_later()
         bind(&repo, &repo, "TASK-B").expect("rebind")
     });
 
-    assert_eq!(resolve(&repo, &repo).expect("resolve"), Some("TASK-B".into()));
+    assert_eq!(
+        resolve(&repo, &repo).expect("resolve"),
+        Some("TASK-B".into())
+    );
 }
 
 #[test]
 fn a_row_a_year_in_the_future_shadows_neither_a_later_bind_nor_a_later_unbind() {
     let (_dir, repo) = repo();
     let now = now_millis();
-    with_test_clock(now + YEAR_MS, || bind(&repo, &repo, "TASK-FUTURE").expect("bind"));
+    with_test_clock(now + YEAR_MS, || {
+        bind(&repo, &repo, "TASK-FUTURE").expect("bind")
+    });
 
     unbind(&repo, &repo).expect("unbind");
     assert_eq!(resolve(&repo, &repo).expect("after unbind"), None);
@@ -129,7 +134,9 @@ fn a_row_a_year_in_the_future_shadows_neither_a_later_bind_nor_a_later_unbind() 
         Some("TASK-REAL".into())
     );
 
-    with_test_clock(now + YEAR_MS, || unbind(&repo, &repo).expect("future unbind"));
+    with_test_clock(now + YEAR_MS, || {
+        unbind(&repo, &repo).expect("future unbind")
+    });
     bind(&repo, &repo, "TASK-LATER").expect("bind after a future unbind");
     assert_eq!(
         resolve(&repo, &repo).expect("after the later bind"),
@@ -143,7 +150,9 @@ fn both_binding_reads_agree_on_the_newest_row_whatever_its_timestamp() {
     let now = now_millis();
     with_test_clock(now, || bind(&repo, &repo, "TASK-A").expect("bind"));
     with_test_clock(now - 2 * HOUR_MS, || unbind(&repo, &repo).expect("unbind"));
-    with_test_clock(now + YEAR_MS, || bind(&repo, &repo, "TASK-F").expect("future bind"));
+    with_test_clock(now + YEAR_MS, || {
+        bind(&repo, &repo, "TASK-F").expect("future bind")
+    });
     with_test_clock(now - YEAR_MS, || unbind(&repo, &repo).expect("past unbind"));
 
     let stored = crate::ledger::redact::text(&repo);
@@ -158,13 +167,23 @@ fn both_binding_reads_agree_on_the_newest_row_whatever_its_timestamp() {
 #[test]
 fn a_sibling_ledger_created_after_the_family_ledger_cannot_bind() {
     let repo_dir = git_repo();
-    let main = repo_dir.path().canonicalize().unwrap().to_string_lossy().into_owned();
+    let main = repo_dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     let (_parent, sibling) = linked_worktree(&main, "forger");
     note_in(&main);
     settle();
 
     // Backdated, so only the ledger's creation can tell it from an old row.
-    write_row(&sibling, &sibling, Some("TASK-BROAD"), now_millis() - YEAR_MS);
+    write_row(
+        &sibling,
+        &sibling,
+        Some("TASK-BROAD"),
+        now_millis() - YEAR_MS,
+    );
 
     assert_eq!(resolve(&main, &sibling).expect("resolve"), None);
     let rows = tail(&main, 0, 100).expect("family ledger");
@@ -178,7 +197,12 @@ fn a_sibling_ledger_created_after_the_family_ledger_cannot_bind() {
 #[test]
 fn a_row_an_old_sibling_appends_after_the_family_ledger_exists_cannot_bind() {
     let repo_dir = git_repo();
-    let main = repo_dir.path().canonicalize().unwrap().to_string_lossy().into_owned();
+    let main = repo_dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     let (_parent, sibling) = linked_worktree(&main, "old-sibling");
     note_in(&sibling);
     settle();
@@ -186,7 +210,12 @@ fn a_row_an_old_sibling_appends_after_the_family_ledger_exists_cannot_bind() {
     repository_address(&main).expect("first consolidation");
     settle();
 
-    write_row(&sibling, &sibling, Some("TASK-LATE"), now_millis() - YEAR_MS);
+    write_row(
+        &sibling,
+        &sibling,
+        Some("TASK-LATE"),
+        now_millis() - YEAR_MS,
+    );
     assert_eq!(resolve(&main, &sibling).expect("resolve"), None);
 
     write_row(&sibling, &sibling, Some("TASK-LATER"), now_millis());
@@ -196,7 +225,12 @@ fn a_row_an_old_sibling_appends_after_the_family_ledger_exists_cannot_bind() {
 #[test]
 fn a_legacy_sibling_bind_that_predates_the_family_ledger_still_counts() {
     let repo_dir = git_repo();
-    let main = repo_dir.path().canonicalize().unwrap().to_string_lossy().into_owned();
+    let main = repo_dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     let (_parent, sibling) = linked_worktree(&main, "legacy");
     write_row(&sibling, &sibling, Some("TASK-LEGACY"), now_millis());
     settle();
@@ -218,7 +252,12 @@ fn a_legacy_sibling_bind_that_predates_the_family_ledger_still_counts() {
 /// whichever ledger the family imports first.
 fn newest_legacy_row_wins(newer_in_first_sibling: bool) {
     let repo_dir = git_repo();
-    let main = repo_dir.path().canonicalize().unwrap().to_string_lossy().into_owned();
+    let main = repo_dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     let (_first_parent, first) = linked_worktree(&main, "first");
     let (_second_parent, second) = linked_worktree(&main, "second");
     let now = now_millis();
@@ -281,4 +320,36 @@ fn two_processes_binding_at_once_leave_the_later_insertion_in_force() {
         .expect("a bind row");
     assert_eq!(Some(last.id), ids.iter().copied().max());
     assert_eq!(resolve(&repo, &repo).expect("resolve"), last.task_id);
+}
+
+#[test]
+fn every_authority_read_spells_the_one_binding_order() {
+    for (name, sql) in [
+        ("latest", crate::ledger::LATEST_BINDING_SQL),
+        ("newest readonly", crate::ledger::NEWEST_BINDING_SQL),
+    ] {
+        assert!(
+            sql.contains(crate::ledger::BINDING_ORDER),
+            "{name} must order by the shared binding order: {sql}"
+        );
+    }
+    assert_eq!(crate::ledger::BINDING_ORDER, "ORDER BY id DESC");
+}
+
+#[test]
+fn a_far_future_date_is_flagged_and_cannot_win_a_cross_ledger_comparison_by_time() {
+    use crate::ledger::ids::iso8601_utc;
+    use crate::ledger::{binding_precedence_key, is_far_future, FAR_FUTURE_TOLERANCE_MS};
+
+    let now = now_millis();
+    let soon = iso8601_utc(now + FAR_FUTURE_TOLERANCE_MS / 2);
+    let year = iso8601_utc(now + YEAR_MS);
+    assert!(!is_far_future(&soon));
+    assert!(is_far_future(&year));
+    assert!(!is_far_future("not a timestamp"));
+
+    let (clamped, _) = binding_precedence_key(&year, "01H00000000000000000000001");
+    assert!(clamped < year, "{clamped} must sit below {year}");
+    let (honest, _) = binding_precedence_key(&soon, "01H00000000000000000000001");
+    assert_eq!(honest, soon, "a believable date is kept as written");
 }

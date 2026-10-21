@@ -15,7 +15,9 @@
 //! "what holds now". [`binding_as_of`] and [`BindingHistory`] answer "what held
 //! at that moment", which is what a replayed event needs: a transcript call
 //! from before a rebind is stamped with the task that was bound when it ran.
-//! Both order rows by the same `(ts_utc, ulid)` key.
+//! "What holds now" is ordered by insertion sequence within a ledger and the
+//! as-of read by time; see "Worktree binding authority" in `ARCHITECTURE.md`,
+//! which also says who may write a binding.
 
 use super::{append, ActorKind, Draft, LedgerError, Outcome};
 
@@ -23,6 +25,30 @@ use super::{append, ActorKind, Draft, LedgerError, Outcome};
 pub const BIND: &str = "worktree.bind";
 /// The action name an unbinding event carries.
 pub const UNBIND: &str = "worktree.unbind";
+/// A sibling worktree's bind, imported as history only. No binding read
+/// matches this action, so it can never set a binding.
+pub const BIND_IMPORTED: &str = "worktree.bind.imported";
+/// A sibling worktree's unbind, imported as history only.
+pub const UNBIND_IMPORTED: &str = "worktree.unbind.imported";
+
+/// The authoritative action an imported binding action stands for; any other
+/// action is its own base.
+pub(super) fn base_action(action: &str) -> &str {
+    match action {
+        BIND_IMPORTED => BIND,
+        UNBIND_IMPORTED => UNBIND,
+        other => other,
+    }
+}
+
+/// The history-only spelling of a bind or unbind action.
+pub(super) fn imported_action(action: &str) -> Option<&'static str> {
+    match action {
+        BIND => Some(BIND_IMPORTED),
+        UNBIND => Some(UNBIND_IMPORTED),
+        _ => None,
+    }
+}
 
 /// The error code for a checkout path that no longer exists on disk.
 pub const MISSING_WORKTREE: &str = "missing_worktree";
@@ -361,9 +387,9 @@ pub fn unbind_with(
 /// The task `worktree_path` is bound to, if any.
 ///
 /// Finds the newest bind/unbind naming this path with one indexed query.
-/// Precedence uses the timestamp/ULID pair that survives a legacy
-/// sibling-ledger import; the anchor's newly assigned integer cursor cannot
-/// establish cross-database event order.
+/// Precedence is insertion order in the anchor ledger. Legacy sibling rows are
+/// placed in that order when imported (older ones lose to newer ones by their
+/// `(ts_utc, ulid)` key), and a sibling's post-anchor rows are not bindings.
 pub fn resolve(repo_path: &str, worktree_path: &str) -> Result<Option<String>, LedgerError> {
     Ok(resolve_binding(repo_path, worktree_path)?.map(|binding| binding.task_id))
 }
@@ -439,9 +465,9 @@ pub(crate) fn binding_at(address: &BindingAddress) -> Result<Option<ResolvedBind
         return Ok(None);
     }
     let stored_worktree = super::redact::text(&address.worktree);
-    // Imported rows receive new integer cursors in the anchor database. ULIDs
-    // retain their original timestamp and are the ledger's cross-database sort
-    // key, so binding precedence uses them rather than import order.
+    // Imported rows receive new integer cursors in the anchor database, and the
+    // import itself decides whether a legacy row outranks the one in force
+    // (`import_legacy_page`), so the newest by insertion is the answer.
     let newest = super::latest_binding(&address.anchor, &address.worktree, &stored_worktree)?;
     Ok(newest.flatten().map(|task_id| ResolvedBinding {
         task_id,

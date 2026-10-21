@@ -180,19 +180,23 @@ fn as_of_agrees_with_the_oracle_and_with_the_live_read_at_the_end() {
                 at - T0
             );
         }
-        // After the last row, "as of" is "now": the live gate's answer.
+        // After the last row, "as of" is "now": the live gate's answer, except
+        // that the gate follows insertion order. Rows here are written in time
+        // order, so the two differ only by the `ulid` tie-break among rows of
+        // one millisecond: the live read is the row written last.
         let live = latest_binding(&repo, &repo, &crate::ledger::redact::text(&repo)).unwrap();
         let end = binding_as_of(&address(&repo), FOREVER_MS).unwrap();
+        let last_written = rows.last().map(|(_, _, task)| task.clone());
         assert_eq!(
-            end.task_id().map(str::to_string),
-            live.clone().flatten(),
-            "round {round}: as of the end must be the binding that holds"
+            live, last_written,
+            "round {round}: the live read is insertion order"
         );
         assert_eq!(
             end == TaskAtTime::Unresolved,
             live.is_none(),
             "round {round}"
         );
+        assert_eq!(end, oracle(&rows, FOREVER_MS), "round {round}");
         assert_eq!(history.as_of(FOREVER_MS), end, "round {round}");
     }
 }
@@ -404,9 +408,11 @@ fn a_bind_and_an_unbind_in_one_millisecond_resolve_by_ulid_either_way() {
         assert_eq!(binding_as_of(&address(&repo), T0).unwrap(), expected);
         assert_eq!(history.as_of(T0 - 1), TaskAtTime::Unresolved);
         assert_eq!(history.as_of(T0 + 1), expected);
-        // The live read agrees with the history at the end.
+        // The live read is ordered by insertion, not by time or ulid, so it
+        // follows the row written last; the history is a timeline and keeps the
+        // `(ts_utc, ulid)` tie-break. They coincide only when time is monotonic.
         let live = latest_binding(&repo, &repo, &repo).unwrap();
-        assert_eq!(live, Some(expected.task_id().map(str::to_string)));
+        assert_eq!(live, Some(None), "the unbind was inserted last");
     }
 }
 
@@ -427,10 +433,11 @@ fn the_reflog_second_next_to_a_row_resolves_exactly_at_the_edges() {
 }
 
 /// A clock that stepped backwards between two binds: the later append carries
-/// the earlier time. Order is by time, not by insertion, which is also what the
-/// live gate does, so the two agree and the later bind is the one never seen.
+/// the earlier time. The history is a timeline, so it orders by time; the live
+/// gate orders by insertion, so the later bind is the one in force even though
+/// the timeline's last entry is the earlier one.
 #[test]
-fn a_clock_that_went_backwards_orders_by_time_like_the_live_read() {
+fn a_clock_that_went_backwards_orders_the_timeline_by_time_and_the_live_read_by_insertion() {
     let (_dir, repo) = repo();
     put(&repo, T0 + 10_000, &ulid(1), Some("APPENDED-FIRST"));
     put(&repo, T0, &ulid(2), Some("APPENDED-SECOND"));
@@ -440,7 +447,7 @@ fn a_clock_that_went_backwards_orders_by_time_like_the_live_read() {
     assert_eq!(history.as_of(FOREVER_MS), bound("APPENDED-FIRST"));
     assert_eq!(
         latest_binding(&repo, &repo, &repo).unwrap(),
-        Some(Some("APPENDED-FIRST".to_string()))
+        Some(Some("APPENDED-SECOND".to_string()))
     );
 }
 
