@@ -17,9 +17,10 @@
 //!   rounded up. Its callers (`insights`, the language scan) are bounded
 //!   fan-outs that were never meant to take every core from the foreground.
 //!
-//! Rayon's pool has no start handler here. A start handler is where a thread
-//! would be put in a lower scheduling class, which is the QoS work held by the
-//! governor lane; installing an empty one would only look like that work.
+//! Rayon's workers start at `QOS_CLASS_UTILITY` (see [`UtilityScope`]), and a
+//! tokio blocking thread takes the same class for the span of any
+//! `Admission::Background` scope, so background work yields to the UI, WebKit
+//! and the PTY threads on a loaded Mac.
 
 use std::sync::OnceLock;
 
@@ -79,13 +80,120 @@ pub(crate) fn install_async_runtime() -> Option<String> {
     }
 }
 
+/// The calling thread's macOS QoS class while it runs work nobody is waiting
+/// on, restored when dropped. Nothing on other platforms.
+///
+/// QoS is the scheduler's hint for which threads to run on the efficiency
+/// cores and to starve first: `QOS_CLASS_UTILITY` is below the user-initiated
+/// and default classes the UI, WebKit and the PTY threads run at. Rayon's
+/// workers keep it for life ([`install_rayon_pool`]); the tokio blocking pool
+/// is shared with user actions, so a blocking thread takes it only for the
+/// span of one `Admission::Background` scope (`engine::git_cli::with_admission`)
+/// and gives it back, never to leave a user's next click on a lowered thread.
+///
+/// `pthread_set_qos_class_self_np` and `pthread_get_qos_class_np` are
+/// documented in the SDK's `<pthread/qos.h>`; classes in `<sys/qos.h>`. The
+/// pair fails (EPERM) only for a thread that opted out of QoS with
+/// `pthread_setschedparam`, which none of ours do; a failure leaves the thread
+/// as it was and the guard restores nothing.
+#[must_use = "the class is restored when the scope is dropped"]
+pub(crate) struct UtilityScope {
+    #[cfg(target_os = "macos")]
+    restore: Option<(u32, libc::c_int)>,
+}
+
+/// `QOS_CLASS_UTILITY` as the raw value [`current_thread_qos`] reports.
+#[cfg(target_os = "macos")]
+pub(crate) const QOS_UTILITY: u32 = libc::qos_class_t::QOS_CLASS_UTILITY as u32;
+
+/// The calling thread's requested QoS class and relative priority, as the raw
+/// `u32` the kernel reports. `libc::qos_class_t` is a closed Rust enum, and
+/// reading a class it does not list (the SDK has others, e.g. maintenance) as
+/// that enum would be undefined behaviour, so the value is only ever held raw.
+#[cfg(target_os = "macos")]
+pub(crate) fn current_thread_qos() -> Option<(u32, libc::c_int)> {
+    let mut class: u32 = 0;
+    let mut priority: libc::c_int = 0;
+    // SAFETY: `qos_class_t` is `repr(u32)`, so a `u32` out-pointer has the
+    // layout the call writes; both out-pointers are live locals and
+    // `pthread_self` is the calling thread.
+    let rc = unsafe {
+        libc::pthread_get_qos_class_np(
+            libc::pthread_self(),
+            std::ptr::from_mut(&mut class).cast::<libc::qos_class_t>(),
+            &mut priority,
+        )
+    };
+    (rc == 0).then_some((class, priority))
+}
+
+/// Requests `class` (one of the five classes `pthread_set_qos_class_self_np`
+/// accepts) for the calling thread; `false` when the call refused.
+#[cfg(target_os = "macos")]
+fn set_current_thread_qos(class: u32, priority: libc::c_int) -> bool {
+    use libc::qos_class_t as Q;
+    let class = match class {
+        c if c == Q::QOS_CLASS_USER_INTERACTIVE as u32 => Q::QOS_CLASS_USER_INTERACTIVE,
+        c if c == Q::QOS_CLASS_USER_INITIATED as u32 => Q::QOS_CLASS_USER_INITIATED,
+        c if c == Q::QOS_CLASS_UTILITY as u32 => Q::QOS_CLASS_UTILITY,
+        c if c == Q::QOS_CLASS_BACKGROUND as u32 => Q::QOS_CLASS_BACKGROUND,
+        // DEFAULT, and the unspecified class a bare `std` thread reports,
+        // which cannot be requested back: the scheduler treats it as DEFAULT.
+        _ => Q::QOS_CLASS_DEFAULT,
+    };
+    // SAFETY: affects only the calling thread; no pointers.
+    unsafe { libc::pthread_set_qos_class_self_np(class, priority) == 0 }
+}
+
+impl UtilityScope {
+    pub(crate) fn enter() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            let Some((class, priority)) = current_thread_qos() else {
+                return Self { restore: None };
+            };
+            if class == QOS_UTILITY {
+                return Self { restore: None };
+            }
+            Self {
+                restore: set_current_thread_qos(QOS_UTILITY, 0).then_some((class, priority)),
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        Self {}
+    }
+}
+
+impl Drop for UtilityScope {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Some((class, priority)) = self.restore {
+            set_current_thread_qos(class, priority);
+        }
+    }
+}
+
+/// Rayon's global pool, sized and named, with every worker started at
+/// `QOS_CLASS_UTILITY` for life. Its callers (`insights`, the dead-branch
+/// scan) are bounded fan-outs; a `par_iter` hops threads, so the admission
+/// class of the caller does not follow the work and the class has to be the
+/// pool's own.
+fn rayon_builder(threads: usize) -> rayon::ThreadPoolBuilder {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|index| format!("gitpulse-rayon-{index}"))
+        .start_handler(|_| {
+            // The worker never gives the class back: it exists only to run
+            // this pool's tasks.
+            std::mem::forget(UtilityScope::enter());
+        })
+}
+
 /// Sizes rayon's global pool. Rayon builds the global pool on first use, so
 /// this reports, rather than resizes, if something already used it.
 pub(crate) fn install_rayon_pool() -> Option<String> {
     let threads = rayon_threads(logical_cpus());
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .thread_name(|index| format!("gitpulse-rayon-{index}"))
+    rayon_builder(threads)
         .build_global()
         .err()
         .map(|error| format!("rayon pool not sized to {threads} threads: {error}"))
@@ -130,6 +238,40 @@ mod tests {
             let answer = runtime.block_on(async { 6 * 7 });
             assert_eq!(answer, 42);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rayon_workers_run_at_utility_qos() {
+        let pool = rayon_builder(2).build().expect("rayon pool");
+        let classes: Vec<_> = pool.install(|| {
+            use rayon::prelude::*;
+            (0..8)
+                .into_par_iter()
+                .map(|_| current_thread_qos().map(|(class, _)| class))
+                .collect()
+        });
+        assert!(!classes.is_empty());
+        for class in classes {
+            assert_eq!(class, Some(QOS_UTILITY));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_utility_scope_lowers_the_thread_and_gives_the_class_back() {
+        std::thread::spawn(|| {
+            let class = || current_thread_qos().expect("qos").0;
+            assert_ne!(class(), QOS_UTILITY);
+            {
+                let _scope = UtilityScope::enter();
+                assert_eq!(class(), QOS_UTILITY);
+            }
+            assert_ne!(class(), QOS_UTILITY);
+            assert_ne!(class(), libc::qos_class_t::QOS_CLASS_BACKGROUND as u32);
+        })
+        .join()
+        .expect("scope thread");
     }
 
     #[test]

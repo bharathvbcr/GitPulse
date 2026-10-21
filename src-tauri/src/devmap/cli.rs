@@ -468,6 +468,23 @@ fn bytes_to_string(bytes: Vec<u8>) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// Caps the build child's rayon pool at half the logical cores, rounded up
+/// (the same rule as GitPulse's own pool, [`crate::pools::rayon_threads`]),
+/// unless the caller already set `RAYON_NUM_THREADS` on the command or the
+/// environment GitPulse runs in has one: an explicit choice is never
+/// overridden. Without a cap a build ran one rayon thread per core.
+fn limit_build_threads(cmd: &mut Command) {
+    const VAR: &str = "RAYON_NUM_THREADS";
+    let on_command = cmd
+        .get_envs()
+        .any(|(key, value)| key == VAR && value.is_some());
+    if on_command || std::env::var_os(VAR).is_some() {
+        return;
+    }
+    let cpus = std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get);
+    cmd.env(VAR, crate::pools::rayon_threads(cpus).to_string());
+}
+
 fn run_devmap(
     binary: &ResolvedDevmap,
     repo: &Path,
@@ -494,14 +511,21 @@ fn run_devmap(
         .collect::<Vec<_>>();
     let mut diagnostic =
         super::diagnostics::CommandLog::start(binary, repo, &effective_args, deadline);
-    let result = git_cli::run_observed(
-        &mut cmd,
-        "devmap",
-        deadline,
-        stdin,
-        STDOUT_CAP,
-        &mut diagnostic,
-    );
+    let is_build = args.first() == Some(&"build");
+    if is_build {
+        limit_build_threads(&mut cmd);
+    }
+    let mut run = |cmd: &mut Command| {
+        git_cli::run_observed(cmd, "devmap", deadline, stdin, STDOUT_CAP, &mut diagnostic)
+    };
+    // An index build is background work whoever asked for it: it runs in the
+    // OS background band (and with half the cores' worth of rayon threads, see
+    // above) so it cannot take the machine from the UI.
+    let result = if is_build {
+        git_cli::with_background_band(|| run(&mut cmd))
+    } else {
+        run(&mut cmd)
+    };
     let protocol_error = result
         .as_ref()
         .ok()
@@ -2711,5 +2735,65 @@ printf '%s\n' '{\"ok\":true}'
             built.ok,
             "a refused exclude must not cancel the build: {built:?}"
         );
+    }
+
+    /// The build child, run from a plain (non-background) caller, is in the OS
+    /// background band and has a capped rayon pool. The stub reports what its
+    /// own process sees: its scheduler priority (waiting for the parent's
+    /// demotion, which lands just after the spawn) and `RAYON_NUM_THREADS`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_build_child_runs_in_the_background_band_with_half_the_rayon_threads() {
+        let _lock = crate::harness::sidecar::test_serial();
+        let repo = git_repo();
+        let bin = write_fake_devmap(repo.path());
+        fs::write(
+            &bin,
+            r#"#!/bin/sh
+i=0
+p=
+while [ $i -lt 1200 ]; do
+  p=$(/bin/ps -o pri= -p $$ | tr -d ' ')
+  [ "$p" -lt 10 ] && break
+  sleep 0.05
+  i=$((i+1))
+done
+printf '%s %s\n' "$p" "${RAYON_NUM_THREADS:-unset}" > build.probe
+printf '%s\n' '{"ok":true}'
+"#,
+        )
+        .unwrap();
+        let _bound = bind_test_binary(bin.to_string_lossy().into_owned());
+        assert_eq!(
+            crate::engine::git_cli::current_admission_name(),
+            "reactive",
+            "the caller is not a background one"
+        );
+
+        let built = build(&repo.path().to_string_lossy()).expect("build");
+        assert!(built.ok, "{built:?}");
+        let probe = fs::read_to_string(repo.path().join("build.probe")).expect("probe");
+        let mut fields = probe.split_whitespace();
+        let priority: i32 = fields.next().unwrap().parse().expect("priority");
+        let rayon = fields.next().unwrap();
+        assert!(priority < 10, "build ran at priority {priority}: {probe}");
+        // `bind_test_binary` holds the env serial, so this read is stable.
+        let expected = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| {
+            let cpus = std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get);
+            crate::pools::rayon_threads(cpus).to_string()
+        });
+        assert_eq!(rayon, expected);
+    }
+
+    #[test]
+    fn an_explicit_rayon_thread_count_on_the_command_is_kept() {
+        let mut cmd = Command::new("devmap");
+        cmd.env("RAYON_NUM_THREADS", "3");
+        limit_build_threads(&mut cmd);
+        let value = cmd
+            .get_envs()
+            .find(|(key, _)| *key == "RAYON_NUM_THREADS")
+            .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()));
+        assert_eq!(value.as_deref(), Some("3"));
     }
 }

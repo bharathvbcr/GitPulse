@@ -6,10 +6,13 @@
 //! overrun, a slot the thread woke too late for is missed, and both are
 //! published rather than absorbed by stretching the interval.
 //!
-//! The thread asks for the user-initiated QoS class and holds an
-//! `NSProcessInfo` activity for its whole life, so App Nap does not coalesce
-//! its timer while the window is hidden. Either request failing is recorded
-//! in the status, not hidden.
+//! The thread asks for the user-initiated QoS class for its whole life: it is
+//! the sensor the governor fails closed on and must not be starved under the
+//! pressure it measures. It holds an `NSProcessInfo` activity, so App Nap does
+//! not coalesce its timer while the window is hidden, only while
+//! `host_load.enabled` is true: the activity begins on the tick that sees the
+//! switch on and ends on the tick that sees it off. Either request failing is
+//! recorded in the status, not hidden.
 
 use super::governor::{self, Governor, GovernorPulse, GovernorReport, Input};
 use super::procscan::{ProcView, ScanContext, Scanner};
@@ -123,6 +126,9 @@ pub struct SamplerOptions {
     pub govern_launches: Box<dyn Fn() -> bool + Send>,
     /// Called after every tick with that tick's pulse.
     pub on_tick: Option<Box<dyn Fn(HostLoadPulse) + Send>>,
+    /// Begins the App Nap opt-out; dropping what it returns ends it. A seam so
+    /// the begin/end transitions can be observed without a real activity.
+    pub begin_activity: Box<dyn Fn() -> Result<Box<dyn Send>, String> + Send>,
 }
 
 impl SamplerOptions {
@@ -133,7 +139,46 @@ impl SamplerOptions {
             enabled: Box::new(|| true),
             govern_launches: Box::new(|| true),
             on_tick: None,
+            begin_activity: Box::new(|| {
+                super::probe::Activity::begin("GitPulse host-load sampler")
+                    .map(|activity| Box::new(activity) as Box<dyn Send>)
+            }),
         }
+    }
+}
+
+/// The App Nap opt-out, held exactly while the sensor is switched on.
+#[derive(Default)]
+struct ActivityHold {
+    held: Option<Box<dyn Send>>,
+    /// Whether the last tick saw the sensor on. The request is made on a
+    /// change, not every tick, so a refusal is recorded once and not retried
+    /// at the cadence.
+    engaged: bool,
+    failure: Option<String>,
+}
+
+impl ActivityHold {
+    /// Follows `enabled`: begins the activity on the tick it turns on and ends
+    /// it on the tick it turns off. Returns the standing problem, if the OS
+    /// refused the last request.
+    fn follow(
+        &mut self,
+        enabled: bool,
+        begin: &dyn Fn() -> Result<Box<dyn Send>, String>,
+    ) -> Option<&str> {
+        if enabled != self.engaged {
+            self.engaged = enabled;
+            self.held = None;
+            self.failure = None;
+            if enabled {
+                match begin() {
+                    Ok(activity) => self.held = Some(activity),
+                    Err(why) => self.failure = Some(format!("App Nap activity: {why}")),
+                }
+            }
+        }
+        self.failure.as_deref()
     }
 }
 
@@ -365,13 +410,7 @@ fn run(shared: &Shared, options: &SamplerOptions) {
     if let Err(why) = super::probe::set_user_initiated_qos() {
         problems.push(format!("QoS: {why}"));
     }
-    let _activity = match super::probe::Activity::begin("GitPulse host-load sampler") {
-        Ok(activity) => Some(activity),
-        Err(why) => {
-            problems.push(format!("App Nap activity: {why}"));
-            None
-        }
-    };
+    let mut activity = ActivityHold::default();
     let mut sensor = OsSensor::new(&options.dir);
     let mut scanner = Scanner::os();
     let mut trend = CompressorTrend::default();
@@ -387,13 +426,18 @@ fn run(shared: &Shared, options: &SamplerOptions) {
     while !shared.stop.load(Ordering::Acquire) {
         let began = Instant::now();
         let mut tick_problems = problems.clone();
+        let enabled = (options.enabled)();
+        tick_problems.extend(
+            activity
+                .follow(enabled, options.begin_activity.as_ref())
+                .map(str::to_string),
+        );
         if writer.is_none() {
             match Writer::elect(&shared.dir) {
                 Ok(elected) => writer = elected,
                 Err(why) => tick_problems.push(format!("election: {why}")),
             }
         }
-        let enabled = (options.enabled)();
         let status = match writer.as_mut() {
             Some(w) => {
                 let mut snap = Snapshot::empty(Clock::now(), identity.clone(), enabled);
@@ -672,5 +716,117 @@ mod tests {
         assert!(!snap.enabled);
         assert_eq!(snap.host.pressure, Reading::default());
         assert!(status.procs.is_none());
+    }
+
+    /// Counts activities begun and still alive; dropping one ends it.
+    struct Live(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for Live {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    fn counting_begin(
+        begun: &Arc<std::sync::atomic::AtomicUsize>,
+        live: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> impl Fn() -> Result<Box<dyn Send>, String> {
+        let (begun, live) = (begun.clone(), live.clone());
+        move || {
+            begun.fetch_add(1, Ordering::SeqCst);
+            live.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(Live(live.clone())) as Box<dyn Send>)
+        }
+    }
+
+    #[test]
+    fn the_activity_follows_the_switch_and_is_never_held_while_it_is_off() {
+        let begun = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let begin = counting_begin(&begun, &live);
+        let mut hold = ActivityHold::default();
+        let at = |live: &Arc<std::sync::atomic::AtomicUsize>| live.load(Ordering::SeqCst);
+
+        // Disabled from the first tick: nothing is ever begun.
+        for _ in 0..3 {
+            assert_eq!(hold.follow(false, &begin), None);
+        }
+        assert_eq!((begun.load(Ordering::SeqCst), at(&live)), (0, 0));
+
+        // Enabled: begun once, not once per tick.
+        for _ in 0..3 {
+            assert_eq!(hold.follow(true, &begin), None);
+        }
+        assert_eq!((begun.load(Ordering::SeqCst), at(&live)), (1, 1));
+
+        // Disabled: ended on that tick.
+        assert_eq!(hold.follow(false, &begin), None);
+        assert_eq!((begun.load(Ordering::SeqCst), at(&live)), (1, 0));
+
+        // Enabled again: begun again.
+        assert_eq!(hold.follow(true, &begin), None);
+        assert_eq!((begun.load(Ordering::SeqCst), at(&live)), (2, 1));
+    }
+
+    #[test]
+    fn a_refused_activity_is_reported_once_and_not_retried_every_tick() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = attempts.clone();
+        let refuse = move || -> Result<Box<dyn Send>, String> {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Err("no".to_string())
+        };
+        let mut hold = ActivityHold::default();
+        for _ in 0..4 {
+            assert_eq!(hold.follow(true, &refuse), Some("App Nap activity: no"));
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(hold.follow(false, &refuse), None, "off clears the problem");
+    }
+
+    /// Real: the sampler thread itself, not just the state machine, holds no
+    /// activity at start while `host_load.enabled` is false, begins one when
+    /// it turns on and ends it when it turns off.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn real_sampler_holds_its_activity_only_while_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let enabled = Arc::new(AtomicBool::new(false));
+        let begun = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut options = SamplerOptions::new(dir.path().to_path_buf());
+        options.cadence = Duration::from_millis(50);
+        let switch = enabled.clone();
+        options.enabled = Box::new(move || switch.load(Ordering::SeqCst));
+        options.begin_activity = Box::new(counting_begin(&begun, &live));
+        let sampler = start(options).unwrap();
+        let limit = crate::test_support::coverage_relaxed(Duration::from_secs(20));
+        let wait_for = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + limit;
+            while !done() {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        wait_for("the first published tick", &|| {
+            sampler
+                .status()
+                .is_some_and(|status| status.tick.ticks >= 3)
+        });
+        assert_eq!(begun.load(Ordering::SeqCst), 0, "begun while disabled");
+
+        enabled.store(true, Ordering::SeqCst);
+        wait_for("the activity to begin", &|| {
+            live.load(Ordering::SeqCst) == 1
+        });
+        enabled.store(false, Ordering::SeqCst);
+        wait_for("the activity to end", &|| live.load(Ordering::SeqCst) == 0);
+        enabled.store(true, Ordering::SeqCst);
+        wait_for("the activity to begin again", &|| {
+            begun.load(Ordering::SeqCst) == 2 && live.load(Ordering::SeqCst) == 1
+        });
+        sampler.stop();
+        assert_eq!(live.load(Ordering::SeqCst), 0, "stop ends the activity");
     }
 }
