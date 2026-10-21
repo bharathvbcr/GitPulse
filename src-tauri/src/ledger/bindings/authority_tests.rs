@@ -175,6 +175,7 @@ fn a_sibling_ledger_created_after_the_family_ledger_cannot_bind() {
         .into_owned();
     let (_parent, sibling) = linked_worktree(&main, "forger");
     note_in(&main);
+    repository_address(&main).expect("the family's initial pass");
     settle();
 
     // Backdated, so only the ledger's creation can tell it from an old row.
@@ -192,6 +193,91 @@ fn a_sibling_ledger_created_after_the_family_ledger_cannot_bind() {
             .any(|row| row.action == "worktree.bind.imported"),
         "the forged row stays visible as history: {rows:?}"
     );
+}
+
+/// A repository with no sibling ledger at all still has an initial pass, and it
+/// is recorded: a ledger that appears afterwards was not part of it.
+#[test]
+fn a_family_with_no_sibling_ledger_still_records_its_initial_pass() {
+    let repo_dir = git_repo();
+    let main = repo_dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let (_parent, sibling) = linked_worktree(&main, "late");
+    note_in(&main);
+    repository_address(&main).expect("initial pass over a family of one ledger");
+    let markers: i64 = crate::ledger::with_conn(&main, |conn| {
+        conn.query_row("SELECT COUNT(*) FROM ledger_family_imports", [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| LedgerError::new("fixture_failed", error.to_string()))
+    })
+    .expect("markers");
+    assert_eq!(markers, 1, "the pass leaves its one marker");
+
+    write_row(&sibling, &sibling, Some("TASK-LATE"), now_millis());
+    assert_eq!(resolve(&main, &sibling).expect("resolve"), None);
+}
+
+/// A demotion is not silent: the status says how many rows were kept as history.
+#[test]
+fn history_only_sibling_rows_are_counted_in_the_ledger_status() {
+    let repo_dir = git_repo();
+    let main = repo_dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let (_parent, sibling) = linked_worktree(&main, "noisy");
+    note_in(&main);
+    repository_address(&main).expect("initial pass");
+    assert_eq!(repository_status(&main).expect("clean").error_code, "");
+
+    write_row(&sibling, &sibling, Some("TASK-A"), now_millis());
+    write_row(&sibling, &sibling, None, now_millis());
+    let status = repository_status(&main).expect("status");
+    assert_eq!(status.error_code, HISTORY_ONLY_BINDINGS_CODE, "{status:?}");
+    assert!(
+        status.error.starts_with("2 bind/unbind row(s)"),
+        "{status:?}"
+    );
+}
+
+/// The adversary's widening case, settled: upgrading never turns a bound
+/// worktree unbound.
+#[test]
+fn an_upgrade_keeps_every_legacy_sibling_binding_resolving() {
+    let repo_dir = git_repo();
+    let main = repo_dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    note_in(&main);
+    settle();
+    let mut keep = Vec::new();
+    for index in 0..5 {
+        let (parent, sibling) = linked_worktree(&main, &format!("agent-{index}"));
+        write_row(
+            &sibling,
+            &sibling,
+            Some(&format!("TASK-{index}")),
+            now_millis(),
+        );
+        keep.push((parent, sibling, format!("TASK-{index}")));
+    }
+    for (_, sibling, task) in &keep {
+        assert_eq!(
+            resolve(&main, sibling).expect("resolve"),
+            Some(task.clone())
+        );
+    }
+    assert_eq!(repository_status(&main).expect("status").error_code, "");
 }
 
 #[test]

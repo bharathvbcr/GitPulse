@@ -2371,6 +2371,16 @@ pub(crate) fn binding_precedence_key(ts_utc: &str, ulid: &str) -> (String, Strin
     (ts, ulid.to_string())
 }
 
+/// How rows of different ledgers are ranked: any row dated believably outranks
+/// every far-future one, and rows of the same kind compare by
+/// [`binding_precedence_key`]. A far-future date is a runaway clock or a forgery;
+/// it must not beat an honest newer row from another sibling.
+pub(crate) type BindingRank = (bool, (String, String));
+
+pub(crate) fn binding_rank(ts_utc: &str, ulid: &str) -> BindingRank {
+    (!is_far_future(ts_utc), binding_precedence_key(ts_utc, ulid))
+}
+
 /// The newest bind/unbind row of a worktree (`?1`, `?2` its two spellings).
 pub(crate) const LATEST_BINDING_SQL: &str = concat!(
     "SELECT action, task_id, ts_utc FROM events
@@ -2383,21 +2393,28 @@ pub(crate) const LATEST_BINDING_SQL: &str = concat!(
 );
 
 /// [`LATEST_BINDING_SQL`] as of a moment (`?3`, a fixed-width `ts_utc`): the
-/// newest row at or before it. A row exactly at `?3` counts. A timeline query
-/// ("what held at that moment"), so it stays ordered by time, not authority.
-pub(crate) const BINDING_AS_OF_SQL: &str = "SELECT action, task_id FROM events
+/// row inserted last among those stamped at or before it. A row exactly at `?3`
+/// counts. Ordered by [`binding_order!`] like the live read, so ingest cannot
+/// attribute a call to a task the gate would not have enforced.
+pub(crate) const BINDING_AS_OF_SQL: &str = concat!(
+    "SELECT action, task_id FROM events
      WHERE action IN ('worktree.bind', 'worktree.unbind')
        AND worktree_path IN (?1, ?2)
        AND ts_utc <= ?3
-     ORDER BY ts_utc DESC, ulid DESC
-     LIMIT 1";
+     ",
+    binding_order!(),
+    "
+     LIMIT 1"
+);
 
-/// Every bind/unbind row of a worktree, newest first by time (see
-/// [`BINDING_AS_OF_SQL`]).
-pub(crate) const BINDING_HISTORY_SQL: &str = "SELECT ts_utc, action, task_id FROM events
+/// Every bind/unbind row of a worktree, newest insertion first.
+pub(crate) const BINDING_HISTORY_SQL: &str = concat!(
+    "SELECT ts_utc, action, task_id FROM events
      WHERE action IN ('worktree.bind', 'worktree.unbind')
        AND worktree_path IN (?1, ?2)
-     ORDER BY ts_utc DESC, ulid DESC";
+     ",
+    binding_order!()
+);
 
 /// The newest bind/unbind row of a worktree in one ledger, with the key
 /// [`NewestBinding`] ranks it by across ledgers.
@@ -2634,7 +2651,7 @@ pub(crate) fn binding_history(
 /// A binding's [`binding_precedence_key`] and the task it names, if any. The
 /// key is how rows of *different* ledgers are ranked: an `id` is local to its
 /// database, so it cannot order them.
-pub(crate) type NewestBinding = ((String, String), Option<String>);
+pub(crate) type NewestBinding = (BindingRank, Option<String>);
 
 /// The newest bind or unbind for a worktree in one *legacy sibling* ledger
 /// (newest by [`binding_order!`], the same order [`latest_binding`] uses), with
@@ -2657,7 +2674,7 @@ pub(crate) fn newest_binding_readonly(
                 let (ts_utc, ulid) = (row.get::<_, String>(0)?, row.get::<_, String>(1)?);
                 flag_far_future_binding(&action, &ts_utc);
                 Ok((
-                    binding_precedence_key(&ts_utc, &ulid),
+                    binding_rank(&ts_utc, &ulid),
                     task.filter(|_| action == bindings::BIND),
                 ))
             },
@@ -3008,44 +3025,173 @@ pub(crate) fn valid_utc_timestamp(value: &str) -> bool {
         })
 }
 
-/// Whether a sibling ledger's bind/unbind rows may still set a binding in the
-/// anchor: only rows from before the anchor ledger existed (the migration of
-/// per-worktree ledgers the import was written for). A sibling ledger created
-/// after the anchor, or a row dated after it, was written by something that
-/// could have written the anchor directly instead, and is history only.
-#[derive(Debug, Clone)]
+/// The `ledger_family_imports` key of the anchor's initial-pass marker. Not a
+/// git object id, so it can never collide with a source key.
+const FAMILY_EPOCH_KEY: &str = "family-initial-pass";
+
+/// Where the anchor's initial consolidation pass stands.
+///
+/// The first pass over a family takes the sibling ledgers that exist then, the
+/// per-worktree ledgers older builds wrote, as the history it is migrating: their
+/// bind/unbind rows keep setting bindings. Everything that arrives later was
+/// written by something that could have written the anchor instead, and is
+/// history only. The marker is data in a table the ledger already has, never a
+/// schema change: a source row means that source was imported; the epoch row
+/// (cursor 0 while the pass runs, 1 once it ends with no source row to speak for
+/// it) covers a family with no sibling ledger at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FamilyEpoch {
+    /// No pass has completed: siblings found now are the legacy ledgers.
+    Initial,
+    /// The initial pass is over: a sibling's binding rows are history only.
+    Settled,
+}
+
+fn marker_failed(error: rusqlite::Error) -> LedgerError {
+    LedgerError::new("legacy_marker_failed", error.to_string())
+}
+
+/// Whether some import marker other than the epoch row exists.
+fn has_source_markers(conn: &Connection) -> Result<bool, LedgerError> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM ledger_family_imports WHERE source_key != ?1)",
+        params![FAMILY_EPOCH_KEY],
+        |row| row.get(0),
+    )
+    .map_err(marker_failed)
+}
+
+/// The epoch, and whether its row is recorded.
+fn read_family_epoch(conn: &Connection) -> Result<(FamilyEpoch, bool), LedgerError> {
+    let epoch: Option<i64> = conn
+        .query_row(
+            "SELECT source_cursor FROM ledger_family_imports WHERE source_key = ?1",
+            params![FAMILY_EPOCH_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(marker_failed)?;
+    Ok(match epoch {
+        Some(0) => (FamilyEpoch::Initial, true),
+        Some(_) => (FamilyEpoch::Settled, true),
+        // Imported by a build that kept no epoch: those sources were the pass.
+        None if has_source_markers(conn)? => (FamilyEpoch::Settled, false),
+        None => (FamilyEpoch::Initial, false),
+    })
+}
+
+/// Where the family's initial pass stands, and whether its row is recorded.
+///
+/// A read: it opens the ledger read-only and never creates it, because every
+/// resolve passes here, including the read-only MCP tools and the agent hook. A
+/// ledger that does not exist yet, or one that has no import table, has had no
+/// pass.
+fn family_pass_state(anchor: &str) -> Result<(FamilyEpoch, bool), LedgerError> {
+    let none = (FamilyEpoch::Initial, false);
+    let Some(conn) = open_readonly(&ledger_path(anchor))? else {
+        return Ok(none);
+    };
+    if !has_table(&conn, "ledger_family_imports")? {
+        return Ok(none);
+    }
+    read_family_epoch(&conn)
+}
+
+/// Whether recording a marker in the anchor could succeed: a ledger the caller
+/// may not write (a read-only mount, a locked-down state directory) is left as
+/// it is, and its pass is recorded by the first caller that can write it.
+fn anchor_is_writable(anchor: &str) -> bool {
+    let db = ledger_path(anchor);
+    let directory_open = db
+        .parent()
+        .and_then(|dir| std::fs::metadata(dir).ok())
+        .is_some_and(|dir| !dir.permissions().readonly());
+    directory_open && std::fs::OpenOptions::new().write(true).open(&db).is_ok()
+}
+
+/// Records the initial pass as in progress, so a pass cut short resumes as the
+/// initial one instead of settling with sources unseen. Returns the epoch as
+/// the write transaction saw it.
+fn record_family_pass(anchor: &str) -> Result<FamilyEpoch, LedgerError> {
+    with_conn(anchor, |conn| {
+        let tx = write_tx(conn).map_err(marker_failed)?;
+        let (epoch, recorded) = read_family_epoch(&tx)?;
+        if epoch == FamilyEpoch::Initial && !recorded {
+            tx.execute(
+                "INSERT OR IGNORE INTO ledger_family_imports
+                     (source_key, source_label, source_cursor)
+                 VALUES (?1, 'initial consolidation pass', 0)",
+                params![FAMILY_EPOCH_KEY],
+            )
+            .map_err(marker_failed)?;
+        }
+        tx.commit().map_err(marker_failed)?;
+        Ok(epoch)
+    })
+}
+
+/// Ends the initial pass: the epoch row is dropped when a source row now speaks
+/// for it, and kept (settled) when none does.
+fn settle_family_pass(anchor: &str) -> Result<(), LedgerError> {
+    with_conn(anchor, |conn| {
+        let tx = write_tx(conn).map_err(marker_failed)?;
+        let sql = if has_source_markers(&tx)? {
+            "DELETE FROM ledger_family_imports WHERE source_key = ?1 AND source_cursor = 0"
+        } else {
+            "UPDATE ledger_family_imports SET source_cursor = 1 WHERE source_key = ?1"
+        };
+        tx.execute(sql, params![FAMILY_EPOCH_KEY])
+            .map_err(marker_failed)?;
+        tx.commit().map_err(marker_failed)
+    })
+}
+
+/// How many bind/unbind rows the anchor holds as history only (sibling rows
+/// imported after the initial pass). `None` when the ledger cannot be read: the
+/// caller must not read that as "none".
+pub(crate) fn history_only_binding_count(anchor: &str) -> Option<u64> {
+    let counted = || -> Result<Option<u64>, LedgerError> {
+        let Some(conn) = open_readonly(&ledger_path(anchor))? else {
+            return Ok(Some(0));
+        };
+        if !has_table(&conn, "events")? {
+            return Ok(Some(0));
+        }
+        conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE id > 0 AND action IN (?1, ?2)",
+            params![bindings::BIND_IMPORTED, bindings::UNBIND_IMPORTED],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| Some(count.max(0) as u64))
+        .map_err(|error| LedgerError::new("query_failed", error.to_string()))
+    };
+    counted().unwrap_or_else(|error| {
+        log::warn!(target: "ledger", "could not count history-only binding rows: {error}");
+        None
+    })
+}
+
+/// Whether a sibling ledger's bind/unbind rows may set a binding in the anchor.
+#[derive(Debug, Clone, Copy)]
 struct SourceAuthority {
-    /// This import reads rows the anchor has never imported from this sibling
-    /// (its first), and the sibling's database file was created no later than
-    /// the anchor's. A row that arrives in a later import was written after the
-    /// anchor had already taken this sibling's history, however it is dated.
-    /// False when a creation time is unknown: unknown is never "before".
-    predates_anchor: bool,
-    /// The anchor database's creation, as a fixed-width `ts_utc`.
-    anchor_created_ts: String,
+    /// This import is of a sibling the anchor's initial pass is taking for the
+    /// first time. A row that arrives in any later import (a sibling found after
+    /// the pass, or a row an already-imported sibling appended since) is history
+    /// only, however it is dated.
+    legacy: bool,
 }
 
 impl SourceAuthority {
-    fn of(source_db: &Path, anchor_db: &Path, first_import: bool) -> Self {
-        let created_ms = |path: &Path| {
-            std::fs::metadata(path)
-                .and_then(|metadata| metadata.created())
-                .ok()
-                .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|age| age.as_millis() as u64)
-        };
-        let (source, anchor) = (created_ms(source_db), created_ms(anchor_db));
+    fn of(epoch: FamilyEpoch, first_import: bool) -> Self {
         Self {
-            predates_anchor: first_import
-                && matches!((source, anchor), (Some(source), Some(anchor)) if source <= anchor),
-            anchor_created_ts: ids::iso8601_utc(anchor.unwrap_or(0)),
+            legacy: epoch == FamilyEpoch::Initial && first_import,
         }
     }
 
     /// `event`, with a bind or unbind this source may not set a binding by
     /// turned into its history-only spelling. Any other row is untouched.
     fn applied_to(&self, mut event: LedgerEvent) -> LedgerEvent {
-        if !(self.predates_anchor && event.ts_utc <= self.anchor_created_ts) {
+        if !self.legacy {
             if let Some(imported) = bindings::imported_action(&event.action) {
                 event.action = imported.to_string();
             }
@@ -3232,7 +3378,7 @@ fn superseded_binding(
         .optional()
         .map_err(|error| LedgerError::new("legacy_import_failed", error.to_string()))?;
     let outranked = in_force.is_some_and(|(ts_utc, ulid)| {
-        binding_precedence_key(&ts_utc, &ulid) > binding_precedence_key(&event.ts_utc, &event.ulid)
+        binding_rank(&ts_utc, &ulid) > binding_rank(&event.ts_utc, &event.ulid)
     });
     Ok(outranked.then(|| {
         let mut demoted = event.clone();
@@ -3413,6 +3559,15 @@ pub(crate) fn consolidate_worktree_ledgers(
     })?;
     let anchor = anchor_path.to_string_lossy().into_owned();
     let mut imported_total = 0usize;
+    let (mut epoch, mut recorded) = family_pass_state(&anchor)?;
+    if epoch == FamilyEpoch::Initial
+        && !recorded
+        && is_initialised(&anchor)
+        && anchor_is_writable(&anchor)
+    {
+        epoch = record_family_pass(&anchor)?;
+        recorded = epoch == FamilyEpoch::Initial;
+    }
 
     for source in members {
         if source == &anchor_path {
@@ -3432,8 +3587,16 @@ pub(crate) fn consolidate_worktree_ledgers(
         if consolidated::is_current(&anchor_path, file_id(&ledger_path(&anchor)), source, &stamp) {
             continue;
         }
-        imported_total += import_source(&anchor_path, &anchor, source, &source_db, members)?;
+        // The import creates the anchor if it is missing: the pass starts here.
+        if epoch == FamilyEpoch::Initial && !recorded {
+            epoch = record_family_pass(&anchor)?;
+            recorded = epoch == FamilyEpoch::Initial;
+        }
+        imported_total += import_source(&anchor_path, &anchor, source, &source_db, members, epoch)?;
         consolidated::record(&anchor_path, file_id(&ledger_path(&anchor)), source, stamp);
+    }
+    if epoch == FamilyEpoch::Initial && recorded {
+        settle_family_pass(&anchor)?;
     }
 
     Ok(imported_total)
@@ -3446,14 +3609,15 @@ fn import_source(
     source: &Path,
     source_db: &Path,
     members: &[PathBuf],
+    epoch: FamilyEpoch,
 ) -> Result<usize, LedgerError> {
     let mut imported_total = 0usize;
+    let mut demoted_total = 0usize;
     {
         let source_name = source.to_string_lossy().into_owned();
         let source_key = family_source_key(anchor_path, &source_name)?;
         let mut cursor = family_import_cursor(anchor, &source_key)?;
-        // After the cursor read, which is what creates the anchor database.
-        let authority = SourceAuthority::of(source_db, &ledger_path(anchor), cursor == 0);
+        let authority = SourceAuthority::of(epoch, cursor == 0);
         #[cfg(test)]
         tests::LEDGER_SIBLING_OPENS.with(|opens| opens.set(opens.get() + 1));
         let source_conn = Connection::open_with_flags(source_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -3527,6 +3691,10 @@ fn import_source(
                         .map(|event| authority.applied_to(event))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            demoted_total += normalized
+                .iter()
+                .filter(|event| bindings::base_action(&event.action) != event.action)
+                .count();
             let (imported, newest_cursor) =
                 import_legacy_page(anchor, &source_key, &source_name, &normalized, cursor)?;
             imported_total += imported;
@@ -3534,6 +3702,14 @@ fn import_source(
                 announce(anchor, newest_cursor);
             }
         }
+    }
+    if demoted_total > 0 {
+        log::warn!(
+            target: "ledger",
+            "{demoted_total} bind/unbind row(s) from sibling ledger {} were imported as history only: \
+             the family's initial consolidation pass is over, so a sibling cannot set a binding",
+            source.display()
+        );
     }
 
     Ok(imported_total)

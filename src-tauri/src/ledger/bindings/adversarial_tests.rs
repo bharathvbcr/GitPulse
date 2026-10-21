@@ -73,6 +73,13 @@ fn note_in(ledger_repo: &str) {
     .expect("ordinary row");
 }
 
+/// The family's initial consolidation pass: the epoch after which a sibling
+/// ledger is no longer legacy. The forgery tests below run it before the
+/// forger exists, which is what separates an attacker from an upgrade.
+fn initial_pass(main: &str) {
+    repository_address(main).expect("initial consolidation pass");
+}
+
 fn ledger_file(repo: &str) -> std::path::PathBuf {
     crate::ledger::ledger_path(repo)
 }
@@ -188,6 +195,7 @@ fn birth_ms(path: &std::path::Path) -> u64 {
 fn forgery_birthtime_rewind_with_touch_makes_a_post_anchor_sibling_row_authoritative() {
     let (_dir, main) = canonical_repo();
     note_in(&main);
+    initial_pass(&main);
     settle();
     let (_p, sibling) = linked(&main, "forger");
     write_row(
@@ -217,6 +225,7 @@ fn forgery_birthtime_rewind_with_touch_makes_a_post_anchor_sibling_row_authorita
 fn forgery_birthtime_rewind_with_setfile_makes_a_post_anchor_sibling_row_authoritative() {
     let (_dir, main) = canonical_repo();
     note_in(&main);
+    initial_pass(&main);
     settle();
     let (_p, sibling) = linked(&main, "forger2");
     write_row(
@@ -260,6 +269,7 @@ fn forgery_mv_of_an_old_ledger_file_into_a_new_sibling_keeps_its_old_birth() {
     );
     settle();
     note_in(&main);
+    initial_pass(&main);
     settle();
     let dest = ledger_file(&sibling);
     std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
@@ -309,6 +319,7 @@ fn forgery_backdated_row_in_an_already_imported_sibling_is_history_only() {
 fn forgery_first_import_after_a_crash_of_a_post_anchor_sibling_is_history_only() {
     let (_dir, main) = canonical_repo();
     note_in(&main);
+    initial_pass(&main);
     settle();
     let (_p, sibling) = linked(&main, "crash");
     write_row(&sibling, &main, Some("TASK-CRASH"), now_millis() - YEAR_MS);

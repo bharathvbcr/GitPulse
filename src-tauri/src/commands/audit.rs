@@ -474,8 +474,9 @@ mod catch_up_binding_tests {
     }
 
     /// Concurrent binds of one worktree: every row lands, the live read agrees
-    /// with the newest `(ts_utc, ulid)`, and each failed catch-up is counted
-    /// exactly once.
+    /// with the last row inserted (the highest id, which `write_tx` serialises;
+    /// the `(ts_utc, ulid)` of rows written in one millisecond decides nothing),
+    /// and each failed catch-up is counted exactly once.
     #[test]
     fn concurrent_binds_all_land_and_each_failed_catch_up_is_counted_once() {
         let (_dir, repo) = git_repo();
@@ -496,14 +497,17 @@ mod catch_up_binding_tests {
         });
         assert_eq!(ids.len(), 8);
         let rows = ledger::tail(&repo, 0, 100).unwrap();
-        let mut binds: Vec<_> = rows
+        let binds: Vec<_> = rows
             .iter()
             .filter(|event| event.action == bindings::BIND)
             .collect();
         assert_eq!(binds.len(), 8);
-        binds.sort_by(|a, b| (&a.ts_utc, &a.ulid).cmp(&(&b.ts_utc, &b.ulid)));
-        let newest = binds.last().unwrap().task_id.clone();
-        assert_eq!(bindings::resolve(&repo, &repo).unwrap(), newest);
+        let last_inserted = binds.iter().max_by_key(|event| event.id).unwrap();
+        assert_eq!(Some(last_inserted.id), ids.iter().copied().max());
+        assert_eq!(
+            bindings::resolve(&repo, &repo).unwrap(),
+            last_inserted.task_id
+        );
         assert_eq!(ledger::status(&repo).catch_up_failures, 4);
     }
 
