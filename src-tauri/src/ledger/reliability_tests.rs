@@ -108,7 +108,11 @@ fn status_readonly_opens_read_only_and_leaves_the_ledger_untouched() {
     let probe = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     let before = version(&probe);
     let status = status_readonly(&repo);
-    assert!(status.recording, "{}", status.error);
+    // A read-only open proves the ledger is readable, not that anything is
+    // writing it: `recording` is true only in the process that appends.
+    assert!(!status.recording, "a read-only open is not recording");
+    assert_eq!(status.recording_state, "readable", "{}", status.error);
+    assert!(status.error.is_empty(), "{}", status.error);
     assert_eq!(version(&probe), before, "data_version moved");
 
     // An existing database with no schema is reported, never conjured.

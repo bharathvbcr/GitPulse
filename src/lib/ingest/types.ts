@@ -14,6 +14,19 @@ export interface CatchUp {
    * reads fewer than it listed, so both numbers are carried.
    */
   transcripts_listed?: number;
+  /**
+   * Transcript files the walk saw and did not list (below its depth bound or
+   * past its file cap). They were not read: non-zero sets `truncated`, and
+   * `error` names the reasons. A floor when `unlisted_lower_bound`.
+   */
+  transcripts_unlisted?: number;
+  /** Of `transcripts_unlisted`, the files below the walk's depth bound. */
+  unlisted_depth?: number;
+  /** Of `transcripts_unlisted`, the files past the walk's file cap. */
+  unlisted_cap?: number;
+  unlisted_lower_bound?: boolean;
+  /** Whether the walk listed the whole corpus; null when no walk ran. */
+  walk_complete?: boolean | null;
   skipped_lines: number;
   /**
    * Calls whose worktree had no slot in this pass (past the participant cap).

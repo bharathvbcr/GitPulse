@@ -134,6 +134,8 @@ gitpulsed --interval 300 /path/to/repo
 
 Catch-up is idempotent against a ledger watermark; interrupting a cycle is safe.
 
+Each pass leaves its outcome in the ledger's `catch_up_state` table (one row per worktree), which is how a read-only process such as `gitpulse-mcp` reports `last_catch_up`, `stale` and what the pass covered. The transcript walk reads up to five directories below the root (the `slug/session/subagents/workflows/wf_*/` layout) and 5000 files; anything it sees past those bounds is counted as `transcripts_unlisted` (`unlisted_depth`, `unlisted_cap`), marks the pass `truncated`, and keeps the walk from forgetting any transcript offset.
+
 ## Profile tasks and workspaces
 
 Global, saved-workspace and repository boards share Manvi-owned task records.

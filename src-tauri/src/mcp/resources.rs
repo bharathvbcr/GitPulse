@@ -316,14 +316,45 @@ pub fn ledger_page(anchor: &str, cursor: i64, limit: u32) -> Result<Value, Strin
             limit,
             ..crate::ledger::EventQuery::default()
         },
+        None,
     )
+}
+
+/// What every ledger answer says about how current and how whole it is,
+/// merged into the page: the [`crate::ledger::Freshness`] fields (`as_of`,
+/// `last_catch_up`, `stale`, the last catch-up's counts including
+/// `skipped_lines`) and the legacy-unconsolidated caveat, which is the same
+/// text `status_readonly` carries (`caveat`, with its `caveat_code`; both
+/// empty when there is none). A page with rows and no such block reads as
+/// "this is everything, as of now", which nothing here can promise.
+fn with_freshness(mut page: Value, anchor: &str, caveat: Option<&str>) -> Value {
+    let freshness = json!(crate::ledger::freshness_readonly(anchor));
+    if let (Some(page), Some(fields)) = (page.as_object_mut(), freshness.as_object()) {
+        for (key, value) in fields {
+            page.insert(key.clone(), value.clone());
+        }
+        page.insert("caveat".into(), json!(caveat.unwrap_or_default()));
+        page.insert(
+            "caveat_code".into(),
+            json!(if caveat.is_some() {
+                crate::ledger::bindings::LEGACY_UNCONSOLIDATED_CODE
+            } else {
+                ""
+            }),
+        );
+    }
+    page
 }
 
 /// [`ledger_page`] for a filtered, ordered query: the same bounds and the same
 /// `truncated` / `next_cursor` contract, in the query's own order. In newest
 /// first order `next_cursor` is the lowest id returned, to be passed back as
 /// the next query's `before`.
-pub fn ledger_query_page(anchor: &str, query: &crate::ledger::EventQuery) -> Result<Value, String> {
+pub fn ledger_query_page(
+    anchor: &str,
+    query: &crate::ledger::EventQuery,
+    caveat: Option<&str>,
+) -> Result<Value, String> {
     match crate::ledger::query_readonly_page(anchor, query, crate::ledger::PAGE_MAX_BYTES)
         .map_err(|e| e.to_string())?
     {
@@ -348,22 +379,30 @@ pub fn ledger_query_page(anchor: &str, query: &crate::ledger::EventQuery) -> Res
                     row
                 })
                 .collect();
-            Ok(json!({
-                "ok": true,
-                "returned": events.len(),
-                "truncated": truncated,
-                "next_cursor": next_cursor,
-                "events": events,
-            }))
+            Ok(with_freshness(
+                json!({
+                    "ok": true,
+                    "returned": events.len(),
+                    "truncated": truncated,
+                    "next_cursor": next_cursor,
+                    "events": events,
+                }),
+                anchor,
+                caveat,
+            ))
         }
         // No ledger is not an empty ledger, and must not read as one.
-        None => Ok(json!({
-            "ok": false,
-            "error": "no ledger in this repository yet; nothing has been recorded",
-            "returned": 0,
-            "truncated": false,
-            "events": [],
-        })),
+        None => Ok(with_freshness(
+            json!({
+                "ok": false,
+                "error": "no ledger in this repository yet; nothing has been recorded",
+                "returned": 0,
+                "truncated": false,
+                "events": [],
+            }),
+            anchor,
+            caveat,
+        )),
     }
 }
 
@@ -428,7 +467,7 @@ pub fn status_document(repo: &str) -> Result<Value, String> {
     }))
 }
 
-fn repo_facet(facet: &str, repo: &str) -> Result<Value, ReadError> {
+pub(super) fn repo_facet(facet: &str, repo: &str) -> Result<Value, ReadError> {
     match facet {
         "insights" => Ok(json!(crate::insights::snapshot(repo))),
         "status" => status_document(repo).map_err(ReadError::Internal),
@@ -436,10 +475,17 @@ fn repo_facet(facet: &str, repo: &str) -> Result<Value, ReadError> {
         "changes" => Ok(json!(crate::insights::active_changes(repo, None, None))),
         "context" => Ok(json!(crate::insights::change_context(repo, None))),
         "ledger" => {
-            let address = crate::ledger::bindings::repository_address_readonly(repo)
+            let (address, caveat) = crate::ledger::bindings::repository_read_target(repo)
                 .map_err(|error| ReadError::Internal(error.to_string()))?;
-            ledger_page(&address.anchor, 0, super::LEDGER_DEFAULT_LIMIT)
-                .map_err(ReadError::Internal)
+            ledger_query_page(
+                &address.anchor,
+                &crate::ledger::EventQuery {
+                    limit: super::LEDGER_DEFAULT_LIMIT,
+                    ..crate::ledger::EventQuery::default()
+                },
+                caveat,
+            )
+            .map_err(ReadError::Internal)
         }
         "tasks" => {
             let address = crate::ledger::bindings::repository_address_readonly(repo)
@@ -820,5 +866,25 @@ mod tests {
         );
         assert!(status["worktrees"].is_object(), "{status}");
         assert!(status["codeintel"].is_object(), "{status}");
+        // A ledger that could not be read is never reported fresh.
+        assert_eq!(status["ledger"]["recording_state"], "unknown", "{status}");
+        assert_eq!(status["ledger"]["stale"], true, "{status}");
+        assert_eq!(status["ledger"]["freshness_ok"], false, "{status}");
+        assert!(status["ledger"]["as_of"].is_null(), "{status}");
+    }
+
+    #[test]
+    fn the_status_ledger_facet_is_readable_never_recording_and_labels_dropped() {
+        let (_dir, repo) = trusted_repo();
+        record_events(&repo, 1);
+
+        let status = status_document(&repo).expect("status");
+
+        let ledger = &status["ledger"];
+        assert_eq!(ledger["recording"], false, "{ledger}");
+        assert_eq!(ledger["recording_state"], "readable", "{ledger}");
+        assert_eq!(ledger["dropped_scope"], "this_process", "{ledger}");
+        assert!(ledger["as_of"].is_string(), "{ledger}");
+        assert_eq!(ledger["stale"], false, "{ledger}");
     }
 }

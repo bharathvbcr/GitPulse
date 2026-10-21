@@ -32,6 +32,7 @@ mod anchor;
 pub mod bindings;
 mod cap;
 mod consolidated;
+pub mod freshness;
 pub mod ids;
 pub mod redact;
 
@@ -41,6 +42,10 @@ pub(crate) use anchor::settle as settle_identity;
 pub use cap::ValueCut;
 pub(crate) use cap::{bound_evidence_json, ROW_FIELD_CAP_BYTES};
 use cap::{cap_object, ObjectCap, OBJECT_TRUNCATED_KEY};
+pub use freshness::{
+    freshness_readonly, freshness_readonly_at, record_catch_up, CatchUpRecord, CatchUpSummary,
+    Freshness, STALE_AFTER_SECS,
+};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -831,12 +836,26 @@ impl LedgerError {
 /// history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LedgerStatus {
-    /// True when the database for this repo is open and accepting writes.
+    /// True only when THIS process opened the database for writing and is
+    /// accepting appends. A read-only open (the MCP server, the insights
+    /// snapshot) is never `recording`: it can read what another process wrote
+    /// and says nothing about whether any process is writing now. See
+    /// `recording_state`.
     pub recording: bool,
+    /// `"recording"` (this process is writing), `"readable"` (the ledger opened
+    /// read-only: its rows can be read, who is recording is not known) or
+    /// `"unknown"` (no ledger, or it could not be opened: see `error`).
+    #[serde(default)]
+    pub recording_state: String,
     pub path: String,
     /// Appends this process failed to write, ever. Non-zero means the history
-    /// on disk is known to be incomplete.
+    /// on disk is known to be incomplete. Process-local: see `dropped_scope`.
     pub dropped: u64,
+    /// What `dropped` counts: `"this_process"`. Drops are counted in memory, so
+    /// a process that only reads (every MCP answer) reports 0 whatever another
+    /// process dropped; 0 here is never "nothing was dropped anywhere".
+    #[serde(default = "dropped_scope_this_process")]
+    pub dropped_scope: String,
     /// Bind/unbind writes, in this process, whose catch-up beforehand failed or
     /// was cut short. Nothing was dropped: the rows it would have recorded wait
     /// for a later pass. Not folded into `dropped`.
@@ -845,6 +864,15 @@ pub struct LedgerStatus {
     /// Empty when recording; otherwise why not.
     pub error: String,
     pub error_code: String,
+    /// When the rows were last appended and the last catch-up ran, and whether
+    /// that is stale. Flattened so `as_of`, `last_catch_up` and `stale` sit
+    /// beside `recording`; "not read" unless the producer computed it.
+    #[serde(flatten, default)]
+    pub freshness: Freshness,
+}
+
+fn dropped_scope_this_process() -> String {
+    "this_process".to_string()
 }
 
 /// The app handle used to announce appends, installed once at startup.
@@ -3933,34 +3961,57 @@ pub fn is_initialised(repo_path: &str) -> bool {
 /// and "there is no ledger yet" is a distinct, reported state rather than one
 /// conjured into existence so the answer can be "recording".
 pub fn status_readonly(repo_path: &str) -> LedgerStatus {
+    status_readonly_at(repo_path, ids::now_millis())
+}
+
+/// [`status_readonly`] at a given clock, so a test can age or rewind it.
+///
+/// `recording` is false here by construction: a read-only open proves the file
+/// can be read, not that anything is writing it. `recording_state` carries the
+/// distinction (`readable`, or `unknown` when it could not be opened).
+pub fn status_readonly_at(repo_path: &str, now_ms: u64) -> LedgerStatus {
     let path = ledger_path(repo_path);
-    let (recording, error, error_code) = if !is_initialised(repo_path) {
+    let (readable, error, error_code, freshness) = if !is_initialised(repo_path) {
+        let error = "no ledger in this repository yet; nothing has been recorded".to_string();
         (
             false,
-            "no ledger in this repository yet; nothing has been recorded".to_string(),
+            error.clone(),
             "not_initialised".to_string(),
+            Freshness::unavailable(error),
         )
     } else {
         match open_readonly_initialised(&path) {
-            Ok(_) => (true, String::new(), String::new()),
-            Err(e) => (false, e.message, e.code.to_string()),
+            Ok(conn) => {
+                let freshness = freshness::read(&conn, now_ms)
+                    .unwrap_or_else(|e| Freshness::unavailable(e.to_string()));
+                (true, String::new(), String::new(), freshness)
+            }
+            Err(e) => (
+                false,
+                e.message.clone(),
+                e.code.to_string(),
+                Freshness::unavailable(e.message),
+            ),
         }
     };
     LedgerStatus {
-        recording,
+        recording: false,
+        recording_state: if readable { "readable" } else { "unknown" }.to_string(),
         path: path.display().to_string(),
-        dropped: if recording {
+        dropped: if readable {
             dropped_appends(repo_path)
         } else {
             0
         },
-        catch_up_failures: if recording {
+        dropped_scope: dropped_scope_this_process(),
+        catch_up_failures: if readable {
             catch_up_failures(repo_path)
         } else {
             0
         },
         error,
         error_code,
+        freshness,
     }
 }
 
@@ -4029,19 +4080,25 @@ pub fn status(repo_path: &str) -> LedgerStatus {
     match with_conn(repo_path, |_| Ok(())) {
         Ok(()) => LedgerStatus {
             recording: true,
+            recording_state: "recording".to_string(),
             path: path.display().to_string(),
             dropped,
+            dropped_scope: dropped_scope_this_process(),
             catch_up_failures,
             error: String::new(),
             error_code: String::new(),
+            freshness: freshness_readonly(repo_path),
         },
         Err(e) => LedgerStatus {
             recording: false,
+            recording_state: "unknown".to_string(),
             path: path.display().to_string(),
             dropped,
+            dropped_scope: dropped_scope_this_process(),
             catch_up_failures,
             error: e.message,
             error_code: e.code.to_string(),
+            freshness: Freshness::unavailable("the ledger could not be opened"),
         },
     }
 }

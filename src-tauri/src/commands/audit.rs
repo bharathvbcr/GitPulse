@@ -155,6 +155,7 @@ fn catch_up_note(
         "partial": partial,
         "truncated": found.truncated,
         "recorded": found.recorded,
+        "transcripts_unlisted": found.transcripts_unlisted,
         "failed_records": found.failed_records,
         "reflog_pending": found.reflog_pending,
         "error": if nothing_to_read {

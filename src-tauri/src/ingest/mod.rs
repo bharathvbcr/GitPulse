@@ -56,6 +56,28 @@ pub struct CatchUp {
     /// partial pass from reading as a complete one.
     #[serde(default)]
     pub transcripts_listed: i64,
+    /// Transcript files the corpus walk saw and did not list: `unlisted_depth`
+    /// below the depth bound plus `unlisted_cap` past the file cap. They were
+    /// not read, so a non-zero count means the history is not whole; it sets
+    /// `truncated` and `error` names the reasons. Never offsets forgotten.
+    #[serde(default)]
+    pub transcripts_unlisted: i64,
+    /// Of `transcripts_unlisted`, the files in directories below the walk's
+    /// depth bound.
+    #[serde(default)]
+    pub unlisted_depth: i64,
+    /// Of `transcripts_unlisted`, the files past the walk's file cap.
+    #[serde(default)]
+    pub unlisted_cap: i64,
+    /// True when the walk stopped counting before it had seen everything it
+    /// left out: `transcripts_unlisted` is then a floor.
+    #[serde(default)]
+    pub unlisted_lower_bound: bool,
+    /// Whether the corpus walk listed the whole corpus: null when no walk ran
+    /// (no transcript root, or the pass was skipped), false when it was cut,
+    /// hit an unreadable directory, or left files unlisted.
+    #[serde(default)]
+    pub walk_complete: Option<bool>,
     /// Transcript lines this build could not read.
     ///
     /// Reported rather than swallowed: a parser that silently skipped
@@ -423,21 +445,74 @@ fn written_since(modified_ms: Option<u64>, since_ms: u64) -> bool {
     modified_ms.is_none_or(|modified| modified + 1000 >= since_ms)
 }
 
+/// Directories the corpus walk reads below its root. Five is what the deepest
+/// shape Claude Code writes needs: `slug/session/subagents/workflows/wf_*/` is
+/// five directories under the root, and the `agent-*.jsonl` files sit in the
+/// last. Deeper directories are not read for listing; they are counted.
+const MAX_WALK_DEPTH: usize = 5;
+
+/// Transcript files one walk lists. Past it files are counted, not listed.
+const MAX_WALK_FILES: usize = 5000;
+
+/// Directory entries the walk reads, after the file cap or the depth bound has
+/// stopped it listing, to count what it leaves out. Bounds a hostile or huge
+/// tree; past it the unlisted counts are a floor (`unlisted_lower_bound`).
+const MAX_UNLISTED_ENTRIES: usize = 100_000;
+
 /// Where a corpus walk ended.
-struct Walk {
+#[derive(Debug, Default)]
+pub(super) struct Walk {
     /// Whether the files listed are the whole corpus: false when a directory
-    /// could not be read, the file cap cut the walk short, or it was stopped.
-    /// Beyond the depth bound counts as complete — those files are never
-    /// listed, so never have an offset to lose.
-    complete: bool,
+    /// could not be read, the walk was stopped, or files were seen and left
+    /// unlisted (the file cap, or directories below the depth bound that hold
+    /// transcripts). Only a walk that is complete may forget a transcript's
+    /// offset: a file missing from a partial listing may still exist.
+    pub complete: bool,
     /// Whether `stop` ended the walk early.
-    cut: bool,
+    pub cut: bool,
+    /// Transcript files seen below the depth bound and not listed.
+    pub unlisted_depth: i64,
+    /// Transcript files seen past the file cap and not listed.
+    pub unlisted_cap: i64,
+    /// True when the walk stopped counting (a bound on entries read) before it
+    /// had seen everything it left out: the unlisted counts are a floor.
+    pub unlisted_lower_bound: bool,
 }
 
-/// Walks `dir` for `.jsonl` files, bounded in depth.
+/// The identity of a directory, so a walk can tell it has been in one before:
+/// a symlink pointing at an ancestor, or two links to one directory, would
+/// otherwise be walked as many times as the depth bound lets them.
+type DirId = (u64, u64);
+
+#[cfg(unix)]
+fn dir_id(meta: &std::fs::Metadata, _path: &std::path::Path) -> Option<DirId> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
+/// Without device and inode numbers the canonical path stands in for them.
+#[cfg(not(unix))]
+fn dir_id(_meta: &std::fs::Metadata, path: &std::path::Path) -> Option<DirId> {
+    use std::hash::{Hash, Hasher};
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    Some((0, hasher.finish()))
+}
+
+struct WalkState {
+    visited: std::collections::HashSet<DirId>,
+    counting_budget: usize,
+    incomplete: bool,
+    halted: bool,
+    walk: Walk,
+}
+
+/// Walks `dir` for `.jsonl` files, bounded in depth and count.
 ///
-/// The bound is not decoration: the transcript root is user-controlled, and a
-/// symlink loop under it would otherwise hang repo open forever.
+/// The bounds are not decoration: the transcript root is user-controlled, and a
+/// symlink loop under it would otherwise hang repo open forever. What the
+/// bounds leave out is counted, never dropped silently.
 #[cfg(test)]
 fn collect_jsonl(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth: usize) -> bool {
     collect_jsonl_until(dir, out, depth, &mut || false).complete
@@ -445,58 +520,113 @@ fn collect_jsonl(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>, depth
 
 /// [`collect_jsonl`] that asks `stop` before it reads each directory, so a deadline
 /// bounds the walk instead of waiting out up to 5000 files.
-fn collect_jsonl_until(
+///
+/// `depth` is the depth of `dir` below the root (0 for the root itself).
+pub(super) fn collect_jsonl_until(
     dir: &std::path::Path,
     out: &mut Vec<std::path::PathBuf>,
     depth: usize,
     stop: &mut dyn FnMut() -> bool,
 ) -> Walk {
-    const MAX_DEPTH: usize = 4;
-    const MAX_FILES: usize = 5000;
-    if depth > MAX_DEPTH {
-        return Walk {
-            complete: true,
-            cut: false,
-        };
+    let mut state = WalkState {
+        visited: std::collections::HashSet::new(),
+        counting_budget: MAX_UNLISTED_ENTRIES,
+        incomplete: false,
+        halted: false,
+        walk: Walk::default(),
+    };
+    visit_dir(dir, depth, depth <= MAX_WALK_DEPTH, out, stop, &mut state);
+    let walk = &mut state.walk;
+    walk.complete = !state.incomplete
+        && !walk.cut
+        && walk.unlisted_depth == 0
+        && walk.unlisted_cap == 0
+        && !walk.unlisted_lower_bound;
+    state.walk
+}
+
+/// Reads one directory. `listing` is false below the depth bound: transcripts
+/// found there are counted as unlisted and nothing is added to `out`.
+fn visit_dir(
+    dir: &std::path::Path,
+    depth: usize,
+    listing: bool,
+    out: &mut Vec<std::path::PathBuf>,
+    stop: &mut dyn FnMut() -> bool,
+    state: &mut WalkState,
+) {
+    if state.halted {
+        return;
+    }
+    match std::fs::metadata(dir) {
+        Ok(meta) => match dir_id(&meta, dir) {
+            Some(id) => {
+                if !state.visited.insert(id) {
+                    // Already walked, through another name for it: its files
+                    // are listed (or counted) once, wherever they were found.
+                    return;
+                }
+            }
+            None => {
+                state.incomplete = true;
+                return;
+            }
+        },
+        Err(_) => {
+            state.incomplete = true;
+            return;
+        }
     }
     if stop() {
-        return Walk {
-            complete: false,
-            cut: true,
-        };
+        state.walk.cut = true;
+        state.halted = true;
+        return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Walk {
-            complete: false,
-            cut: false,
-        };
-    };
-    let mut walk = Walk {
-        complete: true,
-        cut: false,
+        state.incomplete = true;
+        return;
     };
     for entry in entries {
+        if state.halted {
+            return;
+        }
         let Ok(entry) = entry else {
-            walk.complete = false;
+            state.incomplete = true;
             continue;
         };
         let path = entry.path();
-        if path.is_dir() {
-            let inner = collect_jsonl_until(&path, out, depth + 1, stop);
-            walk.complete &= inner.complete;
-            if inner.cut {
-                walk.cut = true;
-                return walk;
+        let is_dir = path.is_dir();
+        let is_transcript = !is_dir && path.extension().and_then(|e| e.to_str()) == Some("jsonl");
+        if !is_dir && !is_transcript {
+            continue;
+        }
+        let capped = out.len() >= MAX_WALK_FILES;
+        if !listing || capped {
+            if state.counting_budget == 0 {
+                state.walk.unlisted_lower_bound = true;
+                state.halted = true;
+                return;
             }
-        } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            if out.len() >= MAX_FILES {
-                walk.complete = false;
-                return walk;
-            }
+            state.counting_budget -= 1;
+        }
+        if is_dir {
+            let child_depth = depth + 1;
+            visit_dir(
+                &path,
+                child_depth,
+                listing && child_depth <= MAX_WALK_DEPTH,
+                out,
+                stop,
+                state,
+            );
+        } else if !listing {
+            state.walk.unlisted_depth += 1;
+        } else if capped {
+            state.walk.unlisted_cap += 1;
+        } else {
             out.push(path);
         }
     }
-    walk
 }
 
 /// Replays git's own reflog into the ledger.
@@ -1046,6 +1176,11 @@ impl CatchUp {
         self.recorded += transcripts.recorded;
         self.transcripts = transcripts.transcripts;
         self.transcripts_listed = transcripts.transcripts_listed;
+        self.transcripts_unlisted = transcripts.transcripts_unlisted;
+        self.unlisted_depth = transcripts.unlisted_depth;
+        self.unlisted_cap = transcripts.unlisted_cap;
+        self.unlisted_lower_bound = transcripts.unlisted_lower_bound;
+        self.walk_complete = transcripts.walk_complete;
         self.skipped_lines = transcripts.skipped_lines;
         self.rehosted_calls = transcripts.rehosted_calls;
         self.departed_overflow = transcripts.departed_overflow;
@@ -1199,6 +1334,7 @@ fn catch_up_with(
                 total.error
             );
         }
+        persist_pass(ledger_repo, worktree_path, &mut total);
         return total;
     }
 
@@ -1259,7 +1395,46 @@ fn catch_up_with(
             };
         }
     }
+    persist_pass(ledger_repo, worktree_path, &mut total);
     total
+}
+
+/// Leaves this pass's outcome in the ledger (`catch_up_state`, per worktree),
+/// so a read-only reader in another process can say when a catch-up last ran
+/// and what it covered.
+///
+/// A pass that did not run (the family could not be resolved, there was no
+/// transcript root, the ledger's identity could not be confirmed) is recorded
+/// with its counts and error but is not a completion: `completed_at` keeps its
+/// last value. A failure to write the state is added to the pass's own error
+/// rather than swallowed.
+fn persist_pass(ledger_repo: &str, worktree_path: &str, total: &mut CatchUp) {
+    let record = ledger::CatchUpRecord {
+        completed: !total.family_unresolved && (total.error.is_empty() || total.truncated),
+        truncated: total.truncated,
+        recorded: total.recorded,
+        transcripts: total.transcripts,
+        transcripts_listed: total.transcripts_listed,
+        transcripts_unlisted: total.transcripts_unlisted,
+        skipped_lines: total.skipped_lines,
+        reflog_entries: total.reflog_entries,
+        failed_records: total.failed_records,
+        duplicates_refused: total.duplicates_refused,
+        error: total.error.clone(),
+    };
+    if let Err(error) = ledger::record_catch_up(
+        ledger_repo,
+        worktree_path,
+        &record,
+        ledger::ids::now_millis(),
+    ) {
+        let note = format!("catch-up state could not be recorded: {error}");
+        total.error = if total.error.is_empty() {
+            note
+        } else {
+            format!("{}; {note}", total.error)
+        };
+    }
 }
 
 #[cfg(test)]
@@ -2049,3 +2224,5 @@ mod reflog_coverage_tests;
 mod reflog_replay_tests;
 #[cfg(test)]
 mod transcript_bench_tests;
+#[cfg(test)]
+mod walk_tests;

@@ -388,6 +388,13 @@ pub struct ChangeContext {
     /// `operation_ok: false` is "we did not look", not "nothing parked".
     pub operation_ok: bool,
     pub operation_error: String,
+    /// How current the ledger data this context read is (the bound task comes
+    /// from it): `ledger_freshness.as_of` is the `ts_utc` of the newest row
+    /// that could be seen, `stale` whether anything shows a recorder ran
+    /// recently. Unavailable (stale, with the reason) when the ledger could not
+    /// be read or was never consulted.
+    #[serde(default)]
+    pub ledger_freshness: crate::ledger::Freshness,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1060,11 +1067,14 @@ fn snapshot_observed(
         Ok(status) => status,
         Err(error) => crate::ledger::LedgerStatus {
             recording: false,
+            recording_state: "unknown".to_string(),
             path: String::new(),
             dropped: 0,
+            dropped_scope: "this_process".to_string(),
             catch_up_failures: 0,
             error: error.to_string(),
             error_code: error.code.to_string(),
+            freshness: crate::ledger::Freshness::unavailable(error.to_string()),
         },
     };
 
@@ -2044,6 +2054,9 @@ fn unresolved_context(repo_path: &str, requested: &str, error: String) -> Change
         operation: None,
         operation_ok: false,
         operation_error: error,
+        ledger_freshness: crate::ledger::Freshness::unavailable(
+            "the repository was not resolved, so the ledger was not read",
+        ),
     }
 }
 
@@ -2155,6 +2168,16 @@ pub fn change_context(repo_path: &str, worktree_path: Option<&str>) -> ChangeCon
         operation,
         operation_ok,
         operation_error,
+        ledger_freshness: ledger_freshness(repo_path),
+    }
+}
+
+/// The freshness of the ledger a read of `repo_path` consults: its anchor's,
+/// or unavailable with the reason when the anchor cannot be named.
+fn ledger_freshness(repo_path: &str) -> crate::ledger::Freshness {
+    match crate::ledger::bindings::repository_address_readonly(repo_path) {
+        Ok(address) => crate::ledger::freshness_readonly(&address.anchor),
+        Err(error) => crate::ledger::Freshness::unavailable(error.to_string()),
     }
 }
 

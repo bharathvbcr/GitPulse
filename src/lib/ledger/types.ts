@@ -41,9 +41,27 @@ export interface LedgerEvent {
  * repository with nothing in it returns.
  */
 export interface LedgerStatus {
+  /** True only when this process is writing the ledger; see `recording_state`. */
   recording: boolean;
+  /**
+   * `readable` is a ledger opened read-only (rows readable, writer unknown);
+   * `unknown` is no ledger, or one that could not be opened.
+   */
+  recording_state?: "recording" | "readable" | "unknown";
   path: string;
+  /** Appends dropped by this process only; see `dropped_scope`. */
   dropped: number;
+  dropped_scope?: "this_process";
+  /** `ts_utc` of the newest row the producer could see; null when none. */
+  as_of?: string | null;
+  last_catch_up?: string | null;
+  last_catch_up_basis?: "catch_up_state" | "newest_row" | "none";
+  /** No evidence of a recorder within `stale_after_secs`, or none at all. */
+  stale?: boolean;
+  stale_reason?: string;
+  stale_after_secs?: number;
+  freshness_ok?: boolean;
+  freshness_error?: string;
   /** Bind/unbind writes whose catch-up failed or was cut short; not a dropped append. */
   catch_up_failures?: number;
   error: string;

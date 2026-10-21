@@ -351,6 +351,11 @@ fn ingest_family(
         out.truncated = true;
     }
     out.transcripts_listed = i64::try_from(files.len()).unwrap_or(i64::MAX);
+    out.unlisted_depth = walk.unlisted_depth;
+    out.unlisted_cap = walk.unlisted_cap;
+    out.transcripts_unlisted = walk.unlisted_depth.saturating_add(walk.unlisted_cap);
+    out.unlisted_lower_bound = walk.unlisted_lower_bound;
+    out.walk_complete = Some(walk.complete);
     let mut listed = HashSet::new();
     for path in files {
         if expired(&out) {
@@ -615,7 +620,8 @@ fn ingest_family(
     // corpus: a file missing from a partial listing may still exist, and
     // forgetting its offset would replay it. Hosted owners hold cursors too,
     // for the files this pass met them in.
-    if walk.complete && !out.truncated {
+    let forgets = walk.complete && !out.truncated;
+    if forgets {
         for participant in participants.into_iter().chain(owners.hosted) {
             let gone: Vec<String> = participant
                 .offsets
@@ -626,6 +632,27 @@ fn ingest_family(
                 out.error = format!("vanished transcripts could not be forgotten: {e}");
             }
         }
+    }
+    // Files the walk saw and did not list were not read: the pass is a floor,
+    // however it ended, and says how much it left and why. After the forget
+    // decision above, which a walk that left any behind never reaches.
+    if out.transcripts_unlisted > 0 || out.unlisted_lower_bound {
+        out.truncated = true;
+        let at_least = if out.unlisted_lower_bound {
+            "at least "
+        } else {
+            ""
+        };
+        let note = format!(
+            "catch-up truncated: the transcript walk left {at_least}{} file(s) unlisted and unread \
+             ({} below the depth bound, {} past the file cap); {} listed",
+            out.transcripts_unlisted, out.unlisted_depth, out.unlisted_cap, out.transcripts_listed
+        );
+        out.error = if out.error.is_empty() {
+            note
+        } else {
+            format!("{}; {note}", out.error)
+        };
     }
     out
 }
