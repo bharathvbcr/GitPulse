@@ -8404,6 +8404,11 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
         );
     }
 
+    /// (name, is_remote, remote_name, ahead, behind, compared_to)
+    type BranchRow = (String, bool, Option<String>, usize, usize, Option<String>);
+    /// (name, commit_id, message, ahead, behind, compared_to)
+    type TagRow = (String, String, Option<String>, usize, usize, Option<String>);
+
     /// A repository whose refs stress every listing that measures against the
     /// default base: a slashed branch, a branch named with unicode and `@`,
     /// a diverged `main`, a remote-tracking ref, the remote's `HEAD` symref,
@@ -8451,7 +8456,7 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
     fn list_branches_pins_the_base_counts_of_every_row() {
         let (dir, oids) = ahead_behind_fixture();
         let listed = GitReader::list_branches(dir.path().to_str().unwrap()).unwrap();
-        let rows: Vec<(String, bool, Option<String>, usize, usize, Option<String>)> = listed
+        let rows: Vec<BranchRow> = listed
             .iter()
             .map(|b| {
                 (
@@ -8512,7 +8517,7 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
         let (dir, oids) = ahead_behind_fixture();
         let listed = GitReader::list_tags(dir.path().to_str().unwrap()).unwrap();
         assert!(!listed.truncated);
-        let mut rows: Vec<(String, String, Option<String>, usize, usize, Option<String>)> = listed
+        let mut rows: Vec<TagRow> = listed
             .tags
             .iter()
             .map(|t| {
