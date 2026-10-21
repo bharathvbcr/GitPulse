@@ -56,6 +56,7 @@ const DERIVED_ARGV = Object.freeze({
   cmd_reset: "shares reset_argv with the writer, so drift is impossible",
   cmd_set_git_identity: "shares GitWriter::identity_argv with set_identity, so the two judged `git config` lines are the lines that run",
   cmd_auto_fetch: "judges git_writer::AUTO_FETCH_ARGV, the same constant GitWriter::auto_fetch runs",
+  cmd_commit_graph_write: "GitWriter::commit_graph_write_argv builds the line the gate judges; commit_graph_write refuses any confirmed argv that is not that line and runs it; commands/parity_tests.rs asserts previewed == judged == spawned",
   cmd_remote_change: "argv varies by RemoteChange variant",
   cmd_submodule_change: "argv varies by SubmoduleChange variant",
   cmd_repo_operation_action: "argv varies by OperationAction variant",
@@ -165,8 +166,9 @@ describe("the command gate judges the command that actually runs", () => {
     // comparison below pass while examining nothing.
     // 14 since cmd_checkout_branch moved to a writer-built argv (DERIVED_ARGV),
     // 8 since the branch, tag and release commands moved to shared builders
-    // whose judged == spawned equality commands/parity_tests.rs asserts.
-    expect(compared.length, "no guarded commands were parsed for comparison").toBeGreaterThanOrEqual(8);
+    // whose judged == spawned equality commands/parity_tests.rs asserts, and
+    // 7 since cmd_stash_pop (the last hand-copied literal) was removed.
+    expect(compared.length, "no guarded commands were parsed for comparison").toBeGreaterThanOrEqual(7);
     for (const anchor of ["cmd_push", "cmd_commit", "cmd_fetch"]) {
       expect(compared.map((c) => c.name), `${anchor} must be compared`).toContain(anchor);
     }

@@ -106,9 +106,29 @@ fn catch_up_before_binding(
     )
 }
 
+/// Whether a catch-up is a PARTIAL result rather than a failure: it is
+/// `truncated` only because reflog entries are known and not yet recorded
+/// (more than a window since the last pass, a log longer than the first pass
+/// reads, a worktree past the per-pass bound), every write that was tried
+/// landed, and nothing else went wrong. The next pass carries on from where
+/// this one stopped, so a bind over a long log is not a failed one. A deadline
+/// that cut the pass, a failed write or any other error is not partial.
+fn is_partial(found: &crate::ingest::CatchUp) -> bool {
+    let backlog =
+        found.reflog_pending > 0 || found.reflog_unreached || found.reflog_refs_skipped > 0;
+    found.truncated
+        && backlog
+        && found.failed_records == 0
+        && found.error.split("; ").all(|part| {
+            part.starts_with("catch-up truncated: ") && !part.contains("deadline elapsed")
+        })
+}
+
 /// Runs `catch_up` for the address a binding change is about to be written at,
 /// and returns what it found as the `detail_json` of that row:
-/// `{"catch_up": {"ok", "truncated", "recorded", "error"}}`, plus a `note` when
+/// `{"catch_up": {"ok", "partial", "truncated", "recorded", "failed_records",
+/// "reflog_pending", "error"}}` (`partial`: see [`is_partial`]; it is `ok`),
+/// plus a `note` when
 /// there was nothing to read.
 ///
 /// The catch-up is best-effort. Whatever it does, the binding is written, and
@@ -124,14 +144,19 @@ fn catch_up_note(
 ) -> Option<String> {
     let found = catch_up(address);
     let nothing_to_read = found.error == crate::ingest::NO_TRANSCRIPT_ROOT;
-    let ok = (found.error.is_empty() || nothing_to_read) && !found.truncated;
+    let partial = is_partial(&found);
+    let ok = found.failed_records == 0
+        && (partial || ((found.error.is_empty() || nothing_to_read) && !found.truncated));
     if !ok {
         crate::ledger::record_catch_up_failure(&address.anchor);
     }
     let mut note = serde_json::json!({
         "ok": ok,
+        "partial": partial,
         "truncated": found.truncated,
         "recorded": found.recorded,
+        "failed_records": found.failed_records,
+        "reflog_pending": found.reflog_pending,
         "error": if nothing_to_read {
             String::new()
         } else {
@@ -250,6 +275,11 @@ mod catch_up_binding_tests {
     use crate::test_support::git_in;
 
     fn git_repo() -> (tempfile::TempDir, String) {
+        // Granting trust reads the config directory from the environment, which
+        // the test that removes HOME unsets under this lock: without it a
+        // sibling's fixture could run in that window and fail to resolve the
+        // trust store. Released before the repository is handed back.
+        let _env = crate::test_support::env::env_serial();
         let dir = tempfile::tempdir().expect("temp repository");
         let path = dir.path().canonicalize().expect("canonical path");
         git_in(&path, &["init", "-b", "main"]);
@@ -332,6 +362,69 @@ mod catch_up_binding_tests {
         .unwrap();
         assert_eq!(ledger::status(&repo).catch_up_failures, 2);
         assert_eq!(bindings::resolve(&repo, &repo).unwrap(), None);
+    }
+
+    /// A bind over a reflog longer than one pass reads is PARTIAL (`truncated`
+    /// with what is pending), never a failed catch-up: the next pass carries on.
+    #[test]
+    fn a_first_pass_over_a_long_reflog_is_partial_not_failed() {
+        let (dir, repo) = git_repo();
+        for n in 0..250 {
+            crate::test_support::commit_at(
+                dir.path(),
+                &format!("c{n}"),
+                1_790_000_000 + n,
+                "gitpulse@test.local",
+            );
+        }
+        let corpus = tempfile::tempdir().unwrap();
+        let serial = crate::test_support::env::env_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set("GITPULSE_TRANSCRIPT_ROOT", corpus.path());
+        let bound = bind_after_catch_up(&repo, &repo, "T-1", catch_up_before_binding).unwrap();
+        let row = ledger::tail(&repo, 0, 10_000)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.id == bound)
+            .unwrap();
+        let note = &detail(&row)["catch_up"];
+        assert_eq!(note["truncated"], true, "{note}");
+        assert_eq!(note["partial"], true, "{note}");
+        assert_eq!(
+            note["ok"], true,
+            "a partial result is not a failure: {note}"
+        );
+        assert_eq!(note["failed_records"], 0, "{note}");
+        assert_eq!(ledger::status(&repo).catch_up_failures, 0);
+    }
+
+    /// Partial is only the reflog backlog: a failed write, a deadline cut or any
+    /// other error beside it is still a failure.
+    #[test]
+    fn only_a_reflog_backlog_alone_is_partial() {
+        let backlog = |error: &str| CatchUp {
+            truncated: true,
+            reflog_pending: 50,
+            error: error.into(),
+            ..CatchUp::default()
+        };
+        let note = "catch-up truncated: HEAD: 50 entr(ies) not yet recorded";
+        assert!(is_partial(&backlog(note)));
+        assert!(!is_partial(&backlog(&format!(
+            "{note}; catch-up truncated: deadline elapsed after reflog"
+        ))));
+        assert!(!is_partial(&backlog(&format!(
+            "the ledger is locked; {note}"
+        ))));
+        assert!(!is_partial(&CatchUp {
+            failed_records: 1,
+            ..backlog(note)
+        }));
+        assert!(!is_partial(&CatchUp {
+            truncated: true,
+            error: "catch-up truncated: deadline elapsed".into(),
+            ..CatchUp::default()
+        }));
     }
 
     #[test]

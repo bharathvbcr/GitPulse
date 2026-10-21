@@ -209,3 +209,102 @@ Run on `e7fd6e48` (all lanes merged); the log is `tmp/build-1017/final-e7fd6e48.
 - **`gitpulse_add_task`'s related check pages 25 ids at a time** and needs the union of every listed id in one call. 41 were accepted (memory corrected).
 - **Disk** went from 246 to 111 GiB free mid-run, briefly hit 100% (other sessions plus lane targets), and recovered to 189 GiB.
 - **DevMap's own MCP server** failed to connect for most lanes. They used the gitpulse-mcp `devmap_*` tools or `rg -uu`, and said so. Impact answers carried `walk_incomplete` throughout, so they were treated as lower bounds.
+
+---
+
+# Continuation: 2026-10-19 / 20 (owner decisions approved, Waves A and B)
+
+**Trigger.** The owner approved every pending owner decision on 2026-10-19 ("I approve all, choose best"). The chosen options are in `tmp/build-1017/OWNER_DECISIONS_2026-10-19.md`. Two items were not acted on:
+- the v1.5.0 tag, because the standing rule is that agents never touch tags;
+- the DevCouncil `devmap --version` change, which is a sibling-repo change and was handed over.
+
+The owner then asked for two waves and, on 2026-10-20, to wrap up.
+
+**Process.** It was unchanged:
+- an Opus brief;
+- a Sonnet implementer working tests-first;
+- a separate Sonnet adversarial pass, with every break sent back;
+- Opus review;
+- Fable rulings on judgment calls;
+- a full gate on main after each merge.
+
+Every Wave B merge was a fast-forward of `main`. Nothing was pushed, and no tag was created or moved.
+
+## A1. Merged and moved to review
+
+| Card | What landed | Adversarial breaks fixed |
+|---|---|---|
+| **ft-adc5dca5** | Removed the dead `GitWriter::stash_pop` and `cmd_stash_pop`. UI pops go through `cmd_stash_action` with the listed OID. | (a pure deletion; the proof it was dead stood in for an adversarial pass) |
+| **ft-df6bf5ea + CARD 15** (ft-9cfa4d74) | `gitpulse_landed` follows Fable's semantics: `false` only when provable, otherwise null with a reason. New `engine/object_quarantine.rs` (OD 2): object writes go to a private temp dir with alternates. `confidence` is null when unverified (OD 5). Carry-over is declined and documented (OD 10). | 10: partial-clone promisor spellings; a net-empty cherry-pick; unrelated identical tree; **textconv writing objects and a notes ref**; merge revert target; deleted-file squash; revert-chain limit. Plus a stale-quarantine sweep and the tag/branch name case. |
+| **ft-8f398bb6 item 2** | New user files and folders follow the process umask, matching `git checkout`. Overwrites keep their mode. Temp files stay 0600. | Exec bits under umask 026/006/011. Umask tests now run in child processes so the shared test process is never touched. |
+| **OD 1** (host ft-9d043e74) | One additive ledger bump, WRITER_VERSION 1→2: `occurred_at`, `reflog_ordinal`, the `transcript_cursors.fingerprint` column, the `reflog_watermarks` and `catch_up_state` tables, and a partial UNIQUE reflog identity index. The migration is **non-destructive**: only duplicates get ordinals. | 6: second-opener busy timeout; same-pass duplicates; legacy import collapse; index trusted by name; refusal before WAL; live generation-1 writer (documented). |
+| **ft-723aab52** | Ledger lineage UUID plus a checkout **site** (inode, plus the APFS volume UUID on macOS) inside the existing anchor record. There is no new table and no write into `.git`. A sibling clone and a history-merging repo are refused. **`cmd_adopt_ledger`** heals an inode-changing move: trust check, OS confirmation, and an audit row in the same transaction. | 6: APFS `st_dev` renumbering; an old-binary strip resetting lineage; uuid format; occupancy recheck inside the transaction; manual-clock leak. |
+| **CARD 27** (ft-9d043f74) + **ft-cb252563** | Reflog replay by watermark, with `truncated` and pending/unreached counts (partial, not failed). `before_ref` is filled. Failed records are counted. Family worktree HEADs are read in a rotating window of 16, plus the default branch once. Rows and watermark go in one transaction. Transcript cursors get a v3 fingerprint (head and tail windows, with a len/mtime fast path); a prefixed file resumes after its old tail. | 4 fixed: a running generation-1 double-record; future-dated entries after a crash; worktrees past the bound; false-positive rotation. 2 kept as **known limits**: a backdated twin outside the window, and renumbering after `git reflog delete`. |
+| **CARD 18 part 2** (ft-9cfa4874) | A user-clicked, gated `git commit-graph write --reachable --changed-paths` (OD 3; the bench showed a material win). It previews the exact argv, makes no config writes, runs one write per common dir, and refuses git older than 2.27 and partial clones. **It never removes a lock.** | 4: **the sweep deleted a foreign lock**; a partial clone lazy-fetching; a cancel after publish reported as "nothing written"; three UI races. |
+| **CARD 9** (ft-9cfd4d74) | `merge_tree_candidate`, Clean / Conflict{paths} / Unknown, never a false clean. `is_branch_merged_by_tree` is tri-state. `WorktreeSummary` gains head/ahead/behind for detached worktrees, cached by (repo, head, base, shallow boundary), with zero spawns in steady state. New read tool `gitpulse_merge_conflicts`. OD 13: the git floor stays 2.23, with per-feature fallback (2.45.1 is a clone floor only). | 3: stale counts in a shallow clone; `ok:true` when every pair was unknown; non-UTF-8 paths collapsing. |
+| (found by the gate) | The `ref_cache` coalescing test flake was a **test race**, not a bug: the waiter thread became the leader. Fixed with a test-only follower count. | n/a |
+
+## A2. Fable's rulings this continuation
+
+- **Wave B order.** `ledger/mod.rs` had a single holder, so CARD 27 and ft-cb252563 were one lane. ft-723aab52 was confined to `anchor.rs`. CARD 29, CARD 28, CARD 23 and CARD 31 were deferred.
+- **ft-723aab52.** No WRITER_VERSION 3 and no file in `.git`. The inode-site veto was accepted only together with an explicit adopt action that writes an audit row.
+- **CARD 18.** `--changed-paths` accepted, on three conditions: git 2.27 or later, the preview says Bloom data persists (quoted from `man git-commit-graph`), and no speedup figures in the UI.
+- **CARD 9.**
+  - Three test-only lines in `hooks/mod.rs` were accepted as a narrow mechanical touch. ft-42081f16 holds that file, so a note was left on it.
+  - The narrowed "≤64 rev-list" invariant was rejected. A steady-state snapshot must spawn nothing.
+
+## A3. Benchmarks
+
+| Bench | Before → after | Verdict |
+|---|---|---|
+| Ledger append, branch vs main (min of 7, load 59-98) | session 0.977×, reflog 0.917× | no regression |
+| OD 1 migration, 1M rows | 9.4 s debug, about 5.4 s optimized-SQL replica | bounded; a second opener waits up to 120 s |
+| catch_up, 5k-entry reflog, steady state | 18.2 → 18.4 ms | within noise |
+| catch_up, 2,000 unchanged transcripts | **1.29×** (about 2 µs per file, no I/O) | **over 5%, accepted with justification:** it pays for rewrite detection; follow-up below |
+| merge_tree_candidate, 2,000-file repo | 33.6 ms per pair (raw merge-tree 9.5 ms) | new; recorded in `docs/PERFORMANCE.md` |
+
+## A4. Follow-ups found, not fixed (recorded here and on the cards)
+
+- **Transcript fingerprint cost (1.29×).** Cutting it needs a cursor-map shape change.
+- **`run_observed`** reports `cancelled` for a child that exited 0. It is handled in the commit-graph writer; `storage/hygiene/mod.rs:606` and `tool_install/mod.rs:1047` have the same race.
+- **Duplicate partial-clone check.** The commit-graph detector has a second partial-clone check beside `object_quarantine::is_partial_clone`. Converge the two.
+- **Adopt button.** It is offered on any history error. Narrow it to a typed `repository_mismatch` kind (needs `ledger/mod.rs`).
+- **Default-branch rows.** A main-worktree commit's `refs/heads/<default>` row is refused as a duplicate of its HEAD row, so a query by `ref == refs/heads/main` misses it.
+- **`catch_up_state`** is written by nothing yet. That is CARD 29, deferred.
+- **`analyzer::deps::adv_hardlink_to_an_outside_file_is_refused`** fails under `--ignored`. It is outside this run's scope.
+- **Ledger append bench.** Needs a re-run on a quiet machine for a figure under 5%.
+
+## A5. Still deferred
+
+- CARD 29 (ledger freshness over MCP; it is next now that CARD 27 has merged).
+- CARD 28 (Codex ingest, OD 8).
+- CARD 23 (lane integration in the object DB, OD 14).
+- CARD 31 interim (OD 16).
+- CARD 4, 6, 8, 30, 32, 33, 34; ft-45b8099a; ft-d902fcb4.
+
+Cards needing files held by in-progress ft-42081f16, ft-0ac24164, ft-329789a9, ft-2967fd9d or ft-626b25fc stay blocked.
+
+## A6. Owner actions
+
+1. **Rebuild GitPulse.app and run `bun run mcp:install` together, and restart a running `gitpulsed`.** The ledger is now WRITER_VERSION 2. The first new binary to open it migrates it, and from then on generation-1 binaries refuse to write. A running generation-1 process is not stopped by the stamp and must be restarted.
+2. **Reconnect the `gitpulse` MCP server (`/mcp`).** This session's server process is old, so Insights answered "deferred under load" all run.
+3. **Run `bash tmp/build-1017/cleanup-wave-b.sh`.** It removes this wave's six finished worktrees and their merged branches. Wave A's were cleaned by `cleanup-wave-a.sh`. The epic-volhard, graft-notify and vendor-devmap worktrees have live sessions and were kept. `seed` was kept as a seed source.
+4. **Remove the gate worktree:** `git worktree remove tmp/final-gate`. It is a clean detached checkout used for the final gate.
+5. **Another session's uncommitted dependency bump** (`package.json`, `bun.lock`, `Cargo.toml`, `Cargo.lock`, `deny.toml`, `.cargo/`) sits in the main checkout. It was not touched or committed, and it needs its owner's decision.
+
+## A7. Final verification
+
+This ran on **`d861f0e5`**, with every Wave A and Wave B lane merged. It used a clean detached worktree, `tmp/final-gate`, so the main checkout's foreign uncommitted dependency bump was excluded. Host load was 7-12 at the end. Logs: `tmp/build-1017/final-gate*.log`.
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo clippy --all-targets -D warnings` | clean |
+| `GITPULSE_TEST_WRITE_BUDGET=0 cargo test --tests --no-fail-fast` | **122 targets ok**, including `hermetic_contract` and `supervised_threads`. The lib target had 5282 passed and 2 failed: `assemble_tests::slow_command_is_visible…` and `git_reader::a_second_ownership_call…spawns_no_blame`. **Both pass when re-run alone.** They are known load flakes owned by ft-626b25fc and CARD 21. |
+| `bun run check` | 0 errors, 0 warnings |
+| Full vitest | **772 files, 10,829 passed**, 0 failed |
+| Browser harnesses | not re-run on the final tip. Lane 3 ran `test:browser:all` (60/60) on its merged tree. |
+| `ci:local`, `dev verify`, Manvi verification | not run, or no record exists, as in §9. Every card is held in **review**. |
+| Installed binaries | `mcp:install` ran on 2026-10-19 before OD 1. The app and binaries need the rebuild in A6.1. |
+
+Each merge also had its own full gate on `main` (`tmp/build-1017/gate-*.log`). Every failure was a load flake that passed when re-run alone, except the `ref_cache` coalescing race, which was fixed.

@@ -1801,6 +1801,37 @@ both benches to that list in the same change that seeds `ubuntu-latest` or
 `macos-latest`.
 
 
+## 2026-10-19: merge-tree per pair on a 2,000-file repository (ft-9cfd4d7403d5703225e3d7db97145421)
+
+`gitpulse_merge_conflicts` merges every pair of worktree HEADs, so its cost is the
+pair count (capped at 64) times one `merge_tree_candidate`. The figures below came
+from a harness bench (the same fixture and rows, since moved into the crate as an
+ignored test; the harness version printed p95 and the process count too). Run it
+now with `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --exact
+insights::merge_conflicts_bench_tests::bench_merge_tree_per_pair --nocapture`, which
+prints min and median per row and the load. 2,000 tracked files in
+50 directories, three one-file lanes off `main`, rows interleaved, N = 15 per row
+after 2 warm-up rounds, min-of-N. Load average at the start 17.15 (1 min) on 18 cores,
+16.60 at the end: the host was busy with other lanes throughout, so read the ratios
+and not the absolute milliseconds.
+
+| row | n | min ms | p50 ms | p95 ms | git processes |
+| --- | --- | --- | --- | --- | --- |
+| `merge_tree_candidate` clean pair | 15 | 33.26 | 49.03 | 68.39 | 5 |
+| `merge_tree_candidate` conflict pair | 15 | 33.18 | 54.22 | 85.76 | not counted |
+| raw `git merge-tree --write-tree` (control) | 15 | 9.99 | 11.99 | 13.38 | 1 |
+
+The five processes of a lone `merge_tree_candidate` are the two `git config` reads
+that tell a partial clone, two `rev-parse` operand resolutions and the merge. The
+conflict pair costs the same as the clean one: the merge itself is a few milliseconds
+on this tree, and the rest is process spawns. The tool does not pay the guard per
+pair: it tells a partial clone once per call and passes the worktrees' full HEAD
+oids, so each pair is one `merge-tree` (plus the quarantine directory's create and
+delete) through `merge_tree_resolved`. That per-pair figure is inferred from the
+code path and the 10 ms control, not measured: the bench reaches only the public
+entry point. The control writes its merged tree into the fixture's object store,
+which is the write the quarantine exists to prevent.
+
 ## 2026-10-16: word diff annotates a bounded window (ft-02b836b8)
 
 `DiffViewer` used to word-diff the whole del-run plus add-run of a replacement block
@@ -1823,7 +1854,7 @@ own JSON line, kept beside the harness until that harness can ingest it.
 
 ## 2026-10-16: commit-graph off, on, and with Bloom filters (ft-9cfa487403d331dc25e75cdb97176bf7, S4-05)
 
-GitPulse now reads whether a repository has a commit-graph (`storage/commit_graph.rs`, surfaced under Git internals in the Storage view with the command to run). It reads the graph files and HEAD from the git directory and spawns nothing; writing or refreshing a graph from the app is Owner Decision 3 and is not built. This section measures what a missing graph costs.
+GitPulse now reads whether a repository has a commit-graph (`storage/commit_graph.rs`, surfaced under Git internals in the Storage view with the command to run). It reads the graph files and HEAD from the git directory and spawns nothing; writing or refreshing a graph from the app was Owner Decision 3, approved 2026-10-19 and built as a user-clicked, gated action (see "Update" below). This section measures what a missing graph costs.
 
 `cargo bench --manifest-path src-tauri/Cargo.toml --bench commit_graph_history` (`-- --smoke`, `-- --json <path>`). Argv mirrors `engine/git_reader.rs` (topo-order history page, `--parents` path log, `for-each-ref %(ahead-behind:)`, `rev-list --count`, `blame --line-porcelain`), run through `git_cli::git_text` so the readers' caches do not hide the walk. Fixture: bare repositories built with `git fast-import`, 5k and 50k linear commits on `main`, a path (`rare/target.txt`) touched by 50 of them, and 20 branches three commits ahead of fork points along `main`. Each size is cloned three times (graph-off; `commit-graph write --reachable --no-changed-paths`; `--changed-paths`) and the 3 states are measured interleaved, 9 samples per row after 1 warm-up round, warm page cache. Each copy's state is asserted with the new detector, and each operation's output is asserted identical across the three, so a row cannot get faster by answering differently. The graph writes are fixture setup only.
 
@@ -1845,6 +1876,8 @@ Reading it: a missing graph costs a roughly linear walk, so it is invisible at 5
 Not measured: a repository where auto-maintenance keeps the graph fresh (this repository, 1,398 commits, topo 5000 in 29 ms, cannot show a gap); cold page cache; split chains versus a single file; the cost of writing a graph; repositories with many merges (the fixture is linear, which is the best case for the no-graph walk).
 
 **Not in the committed baseline.** `benches/baselines/` is untouched and the bench is not wired into the scheduled `benches.yml` gate; whether to baseline it is a separate decision. The numbers above are a one-off run.
+
+**Update 2026-10-19: the write (Owner Decision 3, approved; part 2 of this card).** The table above is the case for it: at 50k commits no graph costs about 10x on history pages and ahead/behind. The Storage panel now offers "Write commit-graph..." when the detector reports `missing`, `stale` or `no_bloom`, and runs exactly `git commit-graph write --reachable --changed-paths` after the person has seen that line and the common directory it writes under and confirmed it. `--changed-paths` is in the argv on these numbers: Bloom filters are another 3.0x on a path log (115.4 to 38.7 ms) and 2.0x on blame (91.1 to 44.5 ms) at 50k, file history and blame are screens GitPulse opens constantly, and without the flag a graph that lacks Bloom data (`no_bloom`) could never be fixed from the button. Blame's gain is 2x rather than 3x, so this is a judgement on a one-off, loaded-host run, not a measured need; dropping the flag is a one-line change to `COMMIT_GRAPH_WRITE_ARGV` and the contract that pins it. No `--split` (one file, no chain to maintain) and no git config write: `core.commitGraph` and `gc.writeCommitGraph` are untouched. The cost of the write itself is still not measured (listed under "Not measured" above); the run is bounded at 600 s, cancellable, and one per common directory.
 
 ## 2026-10-14: xterm WebGL renderer, built and NOT yet measured (ft-406d1f4a)
 

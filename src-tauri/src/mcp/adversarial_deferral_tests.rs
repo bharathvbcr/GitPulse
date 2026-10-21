@@ -165,6 +165,7 @@ fn every_wrapped_tool_under_forced_deferral_meets_its_output_schema() {
     for tool in [
         "gitpulse_insights",
         "gitpulse_collision_risk",
+        "gitpulse_merge_conflicts",
         "gitpulse_active_changes",
         "gitpulse_change_context",
     ] {
@@ -189,6 +190,7 @@ fn every_emitted_deferred_field_is_declared_in_the_advertised_schema() {
     let mut gaps = Vec::new();
     for tool in [
         "gitpulse_insights",
+        "gitpulse_merge_conflicts",
         "gitpulse_active_changes",
         "gitpulse_change_context",
     ] {
@@ -199,8 +201,8 @@ fn every_emitted_deferred_field_is_declared_in_the_advertised_schema() {
 }
 
 /// Write tools are never wrapped: the retry's only production callers are the
-/// six read tools (insights, active_changes, collision_risk, change_context,
-/// ledger_events, task_view).
+/// seven read tools (insights, active_changes, collision_risk, merge_conflicts,
+/// change_context, ledger_events, task_view).
 #[test]
 fn only_read_tools_call_the_production_retry() {
     let production = include_str!("mod.rs")
@@ -211,7 +213,7 @@ fn only_read_tools_call_the_production_retry() {
         .lines()
         .filter(|l| l.contains("with_production_retry("))
         .collect();
-    assert_eq!(sites.len(), 6, "{sites:#?}");
+    assert_eq!(sites.len(), 7, "{sites:#?}");
     for write in [
         "add_task",
         "complete_task",

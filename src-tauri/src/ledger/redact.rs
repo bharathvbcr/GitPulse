@@ -1937,7 +1937,10 @@ mod equivalence_tests {
         KEY,
         "AKIAIOSFODNN7EXAMPLE",
         "sk-ant-api03-0123456789abcdefghijklmnopqrstuvwxyz0123456789",
-        "xoxb-0123456789-0123456789012-abcdefghijklmnopqrstuvwx",
+        // Split so the source holds no whole Slack-token shape: GitHub push
+        // protection flags the literal, fake or not. The test input is
+        // unchanged.
+        concat!("xox", "b-0123456789-0123456789012-abcdefghijklmnopqrstuvwx"),
         "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk",
         "<redacted>",
         "password=<redacted>",

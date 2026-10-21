@@ -362,7 +362,8 @@ fn open_dir_chain(
         if fd < 0 && create && io::Error::last_os_error().kind() == io::ErrorKind::NotFound {
             // SAFETY: creates one name under the pinned parent. A raced entry
             // is inspected by the no-follow open below, never accepted blindly.
-            if unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o755) } == 0 {
+            // `0o777` so the process umask decides, as for `mkdir`.
+            if unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o777) } == 0 {
                 if let Some(created) = created.as_deref_mut() {
                     created.push(walked.join(part));
                 }

@@ -6,6 +6,7 @@ import {
   boardPrefs,
   deleteView,
   effectiveSwimlane,
+  isTaskOrder,
   sameSnapshot,
   sanitizeBoards,
   sanitizeSnapshot,
@@ -20,7 +21,7 @@ import {
 import { emptyFacet } from "../workbench/taskOrganize";
 
 const snapshot = (overrides: Partial<TaskViewSnapshot> = {}): TaskViewSnapshot => ({
-  layout: "board", density: "comfortable", swimlane: "none", hiddenColumns: [], cardFields: ["repo", "type", "owner", "due", "labels"], facet: emptyFacet(), search: "", ...overrides,
+  layout: "board", density: "comfortable", swimlane: "none", order: "priority", hiddenColumns: [], cardFields: ["repo", "type", "owner", "due", "labels"], facet: emptyFacet(), search: "", ...overrides,
 });
 let ids = 0;
 const nextId = () => `view-${++ids}`;
@@ -128,6 +129,15 @@ describe("saved views", () => {
     expect(sameSnapshot(snapshot({ hiddenColumns: ["done", "inbox"] }), snapshot({ hiddenColumns: ["inbox", "done"] }))).toBe(true);
     expect(sameSnapshot(snapshot({ search: "a" }), snapshot({ search: "b" }))).toBe(false);
     expect(sanitizeSnapshot(null)).toEqual(snapshot());
+  });
+  it("orders by priority unless a view says board order, including views saved before the order existed", () => {
+    expect(sanitizeSnapshot({}).order).toBe("priority");
+    expect(sanitizeSnapshot({ order: "board" }).order).toBe("board");
+    for (const hostile of ["Board", "relevance", 1, null, ["board"]]) {
+      expect(sanitizeSnapshot({ order: hostile }).order).toBe("priority");
+      expect(isTaskOrder(hostile)).toBe(false);
+    }
+    expect(sameSnapshot(snapshot({ order: "board" }), snapshot())).toBe(false);
   });
   it("collapses whitespace in names", () => {
     expect(viewName(" My \n view ")).toBe("My view");
