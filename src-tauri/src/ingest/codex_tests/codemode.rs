@@ -109,11 +109,23 @@ fn a_code_mode_patch_becomes_edit_rows_for_its_header_paths() {
 }
 
 #[test]
-fn a_typescript_annotation_does_not_lose_a_call_that_parses_whole() {
+fn a_tool_name_in_a_recorded_calls_own_text_or_a_comment_is_not_an_unplaced_mention() {
+    assert_code_mode(
+        "/* exec_command */ await tools.exec_command({cmd:'git log --grep apply_patch'}) // exec_command",
+        &["git log --grep apply_patch"],
+        0,
+    );
+    // A name in a string outside any call is counted: it may be eval'd.
+    assert_code_mode("const s = 'tools.exec_command'; 1", &[], 1);
+    assert_code_mode("throw 1; await tools.exec_command({cmd:'a'})", &[], 1);
+}
+
+#[test]
+fn a_typescript_annotation_is_a_syntax_error_so_its_call_is_counted() {
     assert_code_mode(
         "const n: number = 1; await tools.exec_command({cmd:'a'})",
-        &["a"],
-        0,
+        &[],
+        1,
     );
 }
 

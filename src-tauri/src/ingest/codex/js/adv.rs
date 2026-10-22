@@ -1,4 +1,3 @@
-//! Adversarial suite for lane W4-L4 (reviewer). Tests marked `#[ignore = "BROKEN ..."]`
 //! assert the contract and fail on this branch; run them with `-- --ignored`.
 
 use super::*;
@@ -71,7 +70,6 @@ fn a1_unconditional_forms_are_recorded() {
 /// (ECMA-262 OptionalChain evaluation), but the check only inspects a
 /// `call_expression` that itself carries `?.`.
 #[test]
-#[ignore = "BROKEN a1: arguments of a call inside an optional chain"]
 fn a1_optional_chain_arguments_are_conditional() {
     for src in [
         format!("a?.b({C})"),
@@ -88,7 +86,6 @@ fn a1_optional_chain_arguments_are_conditional() {
 /// BROKEN (documented limitation, but statically visible): code after a top-level
 /// `throw` or `return` never runs and is recorded.
 #[test]
-#[ignore = "BROKEN a1: unreachable code after top-level throw/return"]
 fn a1_code_after_throw_or_return_is_unreachable() {
     for src in [format!("throw 1; {C}"), format!("return; {C}")] {
         let (cmds, _) = cmds_of(&src);
@@ -101,7 +98,6 @@ fn a1_code_after_throw_or_return_is_unreachable() {
 /// operand deleted, or `if :x) call; else 1`) is recorded. 159 variants of 11
 /// wrappers do this; the mention heuristic stays quiet because mentions == candidates.
 #[test]
-#[ignore = "BROKEN a1: ERROR sibling leaves the call recorded"]
 fn a1_error_recovery_never_records_a_conditional_call() {
     let wrappers = [
         "if (x) {{ {C} }}",
@@ -200,7 +196,6 @@ fn a2_alias_forms_are_marked() {
 /// BROKEN: code reached by a string (eval, Function, timer string) or a computed
 /// global lookup mentions `tools` only inside a string literal; no marker, no skip.
 #[test]
-#[ignore = "BROKEN a2: tools reached through a string leaves no marker"]
 fn a2_string_reachable_tools_is_never_silently_lost() {
     for src in [
         "globalThis['tools'].exec_command({cmd:'Y'})",
@@ -436,7 +431,6 @@ fn a5_mention_heuristic_cases() {
 /// BROKEN: no syntax error, so the heuristic never runs; the only call is inside a
 /// string passed to eval.
 #[test]
-#[ignore = "BROKEN a5: heuristic gated on has_error"]
 fn a5_valid_program_mentions_without_candidates_are_counted() {
     let (cmds, skips) = cmds_of("eval(\"tools.exec_command({cmd:'a'})\")");
     assert!(cmds.is_empty() && !skips.is_empty(), "{cmds:?} {skips:?}");

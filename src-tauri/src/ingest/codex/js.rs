@@ -51,7 +51,8 @@ pub(super) const NODE_BUDGET: &str = "code-mode node budget";
 const PARSE_FAILED: &str = "code-mode parse failed";
 const NON_STRAIGHT_LINE: &str = "code-mode non-straight-line";
 const SYNTAX_ERROR: &str = "code-mode syntax error";
-const HIDDEN_BY_SYNTAX: &str = "code-mode syntax error hides calls";
+const UNREACHABLE: &str = "code-mode unreachable";
+const UNPLACED_MENTION: &str = "code-mode unplaced mention";
 const ALIASED: &str = "code-mode tools aliased";
 const COMPUTED_CALLEE: &str = "code-mode computed callee";
 const NON_LITERAL: &str = "code-mode non-literal argument";
@@ -110,7 +111,9 @@ pub(super) fn scan(source: &str, limits: &Limits) -> Program {
         src: source.as_bytes(),
         consumed: HashSet::new(),
         aliased: false,
-        candidates: 0,
+        broken: tree.root_node().has_error(),
+        dead_from: None,
+        ranges: Vec::new(),
         program: Program::default(),
     };
     if let Err(reason) = walk.run(&tree, limits.nodes) {
@@ -121,16 +124,38 @@ pub(super) fn scan(source: &str, limits: &Limits) -> Program {
     if walk.aliased {
         found.skips.push(ALIASED);
     }
-    // A program the grammar could not make whole may name a call it did not
-    // parse as one: more mentions than call nodes is counted, once.
-    if tree.root_node().has_error() && mentions(source) > walk.candidates {
-        found.skips.push(HIDDEN_BY_SYNTAX);
+    // A mention of a tool name that is no call node's callee and no comment
+    // may still be a call (inside a string that is eval'd, behind a spelling the
+    // grammar did not read as a call): counted, unless the alias marker already
+    // says calls here cannot be seen.
+    if !walk.aliased {
+        let unplaced = unplaced_mentions(source, walk.ranges);
+        found
+            .skips
+            .extend(std::iter::repeat_n(UNPLACED_MENTION, unplaced));
     }
     found
 }
 
-fn mentions(source: &str) -> usize {
-    source.matches("exec_command").count() + source.matches("apply_patch").count()
+/// Mentions of `exec_command` / `apply_patch` outside every `ranges` entry
+/// (comments, and the call nodes that account for what they hold).
+fn unplaced_mentions(source: &str, mut ranges: Vec<(usize, usize)>) -> usize {
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    ["exec_command", "apply_patch"]
+        .iter()
+        .flat_map(|name| source.match_indices(name).map(|(at, _)| at))
+        .filter(|at| {
+            let after = merged.partition_point(|&(start, _)| start <= *at);
+            !(after > 0 && *at < merged[after - 1].1)
+        })
+        .count()
 }
 
 /// A fresh parser per program, aborted at `limit`.
@@ -191,9 +216,14 @@ struct Walk<'s> {
     /// accounts for itself.
     consumed: HashSet<usize>,
     aliased: bool,
-    /// Call nodes whose callee has `tools` as its object and names (or may name)
-    /// one of the two tools.
-    candidates: usize,
+    /// The program has a syntax error, so it runs nothing: no call is recorded.
+    broken: bool,
+    /// Where an unconditional top-level `throw` / `return` ends; whatever starts
+    /// after it never runs.
+    dead_from: Option<usize>,
+    /// Byte ranges whose tool-name mentions are accounted for: comments and
+    /// candidate call nodes.
+    ranges: Vec<(usize, usize)>,
     program: Program,
 }
 
@@ -228,12 +258,31 @@ impl Walk<'_> {
     }
 
     fn visit(&mut self, node: Node<'_>, ancestors: &[Node<'_>]) {
+        if ancestors.len() == 1
+            && self.dead_from.is_none()
+            && matches!(
+                node.kind(),
+                "throw_statement" | "return_statement" | "break_statement" | "continue_statement"
+            )
+        {
+            self.dead_from = Some(node.end_byte());
+        }
         match node.kind() {
+            "comment" => self.ranges.push((node.start_byte(), node.end_byte())),
             "call_expression" => {
+                if self.runs_a_string(node) {
+                    self.aliased = true;
+                }
                 if let Some(callee) = self.callee(node) {
                     self.call(node, ancestors, callee);
                 }
             }
+            // Code and globals reached by a string: `eval`, `Function` (called,
+            // constructed or passed on), `globalThis['tools']`.
+            "identifier" if matches!(self.text(node), Some("eval" | "Function")) => {
+                self.aliased = true;
+            }
+            "subscript_expression" if self.reaches_tools_by_key(node) => self.aliased = true,
             "identifier"
             | "shorthand_property_identifier"
             | "shorthand_property_identifier_pattern" => {
@@ -359,26 +408,70 @@ impl Walk<'_> {
         matches!(key, Lit::Text(name) if name != "exec_command" && name != "apply_patch")
     }
 
+    /// `setTimeout("code")` / `setInterval("code")`: a string run as a program.
+    fn runs_a_string(&self, call: Node<'_>) -> bool {
+        let Some(function) = call.child_by_field_name("function").map(unwrap_parens) else {
+            return false;
+        };
+        let name = match function.kind() {
+            "identifier" => function,
+            "member_expression" => match function.child_by_field_name("property") {
+                Some(property) => property,
+                None => return false,
+            },
+            _ => return false,
+        };
+        if !matches!(self.text(name), Some("setTimeout" | "setInterval")) {
+            return false;
+        }
+        let Some(arguments) = call.child_by_field_name("arguments") else {
+            return false;
+        };
+        let mut cursor = arguments.walk();
+        let first = arguments
+            .named_children(&mut cursor)
+            .find(|node| node.kind() != "comment");
+        first.is_some_and(|node| matches!(node.kind(), "string" | "template_string"))
+    }
+
+    /// `globalThis['tools']`, `self["tools"]`, `window[`tools`]`, `this['tools']`.
+    fn reaches_tools_by_key(&self, node: Node<'_>) -> bool {
+        let Some(object) = node.child_by_field_name("object").map(unwrap_parens) else {
+            return false;
+        };
+        let global = object.kind() == "this"
+            || (object.kind() == "identifier"
+                && matches!(
+                    self.text(object),
+                    Some("globalThis" | "self" | "window" | "global")
+                ));
+        global
+            && node.child_by_field_name("index").is_some_and(
+                |index| matches!(self.literal(index), Lit::Text(key) if key == "tools"),
+            )
+    }
+
     fn skip(&mut self, reason: &'static str) {
         self.program.skips.push(reason);
     }
 
     fn call(&mut self, call: Node<'_>, ancestors: &[Node<'_>], callee: Callee) {
-        let tool = match callee {
-            Callee::Other => return,
-            Callee::Named(tool) => tool,
-            Callee::Computed => {
-                self.candidates += 1;
-                return self.skip(COMPUTED_CALLEE);
-            }
-            Callee::BadEscape => {
-                self.candidates += 1;
-                return self.skip(BAD_ESCAPE);
-            }
-        };
-        self.candidates += 1;
-        if call.has_error() {
+        if matches!(callee, Callee::Other) {
+            return;
+        }
+        self.ranges.push((call.start_byte(), call.end_byte()));
+        // A program with any syntax error runs nothing, wherever the error is.
+        if self.broken || call.has_error() {
             return self.skip(SYNTAX_ERROR);
+        }
+        let tool = match callee {
+            Callee::Named(tool) => tool,
+            Callee::Computed => return self.skip(COMPUTED_CALLEE),
+            Callee::BadEscape => return self.skip(BAD_ESCAPE),
+            Callee::Other => return,
+        };
+        if self.dead_from.is_some_and(|end| call.start_byte() >= end) {
+            return self.skip(UNREACHABLE);
         }
         if let Err(reason) = straight_line(call, ancestors) {
             return self.skip(reason);
@@ -528,8 +621,7 @@ fn straight_line(call: Node<'_>, ancestors: &[Node<'_>]) -> Result<(), &'static 
                 } else {
                     "object"
                 };
-                if has_optional_chain(*ancestor)
-                    && !same(ancestor.child_by_field_name(first), child)
+                if !same(ancestor.child_by_field_name(first), child) && in_optional_chain(*ancestor)
                 {
                     return Err(NON_STRAIGHT_LINE);
                 }
@@ -541,12 +633,37 @@ fn straight_line(call: Node<'_>, ancestors: &[Node<'_>]) -> Result<(), &'static 
     Err(NON_STRAIGHT_LINE)
 }
 
-fn has_optional_chain(node: Node<'_>) -> bool {
-    let mut cursor = node.walk();
-    let chained = node
-        .children(&mut cursor)
-        .any(|child| child.kind() == "optional_chain");
-    chained
+/// Whether `node` is part of an optional chain (`a?.b.c(d)`), where a nullish
+/// `a` skips everything after the `?.`, arguments and indexes included. The chain
+/// is the spine of first-evaluated operands (`object` / `function`); a
+/// parenthesized expression ends it. A spine too long to follow counts as one.
+fn in_optional_chain(mut node: Node<'_>) -> bool {
+    for _ in 0..MAX_ANCESTORS * 16 {
+        let mut cursor = node.walk();
+        let optional = node
+            .children(&mut cursor)
+            .any(|child| child.kind() == "optional_chain");
+        if optional {
+            return true;
+        }
+        let first = if node.kind() == "call_expression" {
+            "function"
+        } else {
+            "object"
+        };
+        match node.child_by_field_name(first) {
+            Some(next)
+                if matches!(
+                    next.kind(),
+                    "call_expression" | "member_expression" | "subscript_expression"
+                ) =>
+            {
+                node = next;
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

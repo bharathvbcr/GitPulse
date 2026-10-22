@@ -51,32 +51,37 @@ fn assert_read(script: &str, expect: &[&str], skipped: i64) {
 
 #[test]
 fn l01_the_scripts_that_fooled_the_lexer_are_read_correctly() {
-    for (script, expect) in [
-        ("const x = a / b / tools.exec_command({cmd:'real'});", vec!["real"]),
+    // The third column is the count of unplaced mentions: a name inside a regex
+    // or string is not a call, but it could be eval'd, so it is counted.
+    for (script, expect, skipped) in [
+        ("const x = a / b / tools.exec_command({cmd:'real'});", vec!["real"], 0),
         (
             "x = /tools.exec_command({cmd:'fake'})/; await tools.exec_command({cmd:'ok'})",
             vec!["ok"],
+            1,
         ),
-        ("n++ / 2; await tools.exec_command({cmd:'real'}); // done", vec!["real"]),
+        ("n++ / 2; await tools.exec_command({cmd:'real'}); // done", vec!["real"], 0),
         (
             "const h = {a:1}.a; const o = {a:4}\n/ 2; await tools.exec_command({cmd:'real'}); const r = 6 / 3;",
             vec!["real"],
+            0,
         ),
         // A regex literal holding a call is a regex, not a call.
-        ("(async()=>{ return /tools.exec_command({cmd:'fake'})/.test('x') })()", vec![]),
+        ("(async()=>{ return /tools.exec_command({cmd:'fake'})/.test('x') })()", vec![], 1),
         (
             "const f = () => { return /'/.test(s) }; await tools.exec_command({cmd:'real'}); const q = 'x'",
             vec!["real"],
+            0,
         ),
         // Division after the `}` of an object literal and after `)`.
-        ("x = {}\n/ 2; await tools.exec_command({cmd:'real'})", vec!["real"]),
-        ("const q = (a + b) / 2 / (c); await tools.exec_command({cmd:'real'})", vec!["real"]),
+        ("x = {}\n/ 2; await tools.exec_command({cmd:'real'})", vec!["real"], 0),
+        ("const q = (a + b) / 2 / (c); await tools.exec_command({cmd:'real'})", vec!["real"], 0),
         // `return /re/` is a regex, so the call inside is not a call.
-        ("function f() { return /tools.exec_command({cmd:'fake'})/ }", vec![]),
+        ("function f() { return /tools.exec_command({cmd:'fake'})/ }", vec![], 1),
         // `/'/.test(s); call`.
-        ("/'/.test(s); await tools.exec_command({cmd:'real'}); '/'", vec!["real"]),
+        ("/'/.test(s); await tools.exec_command({cmd:'real'}); '/'", vec!["real"], 0),
     ] {
-        assert_read(script, &expect, 0);
+        assert_read(script, &expect, skipped);
     }
 }
 
@@ -91,7 +96,7 @@ fn l02_templates_escapes_names_and_line_ends_are_read_correctly() {
         (
             "const s = `a \\` tools.exec_command({cmd:'fake'}) b`; await tools.exec_command({cmd:'real'})",
             vec!["real"],
-            0,
+            1,
         ),
         // Unicode-escaped names are the names they spell.
         ("await tools.exec_comman\\u0064({cmd:'rm x'})", vec!["rm x"], 0),
@@ -120,8 +125,10 @@ fn l02_templates_escapes_names_and_line_ends_are_read_correctly() {
 fn l02b_an_unterminated_comment_hides_nothing_and_fabricates_nothing() {
     let (cmds, skipped) =
         js("await tools.exec_command({cmd:'a'}); /* tools.exec_command({cmd:'b'})");
-    assert_eq!(cmds, vec!["a".to_string()]);
-    assert!(skipped >= 1, "the damaged tail is counted");
+    // A program with a syntax error runs nothing: the call before the damage is
+    // counted too, and the one in the comment text is never a row.
+    assert!(cmds.is_empty(), "{cmds:?}");
+    assert!(skipped >= 1, "the damaged program is counted");
 }
 
 #[test]

@@ -250,7 +250,7 @@ fn p07_code_mode_reads_real_calls_and_never_a_decoy() {
         (
             r#"console.log("tools.exec_command({cmd:'rm -rf /'})");"#,
             vec![],
-            0,
+            1,
         ),
         (
             r#"tools.exec_command({cmd:"echo 'tools.exec_command({cmd:\"y\"})'"})"#,
