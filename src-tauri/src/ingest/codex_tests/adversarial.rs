@@ -226,49 +226,118 @@ fn p06_argv_with_non_strings_is_counted_and_a_huge_argv_is_bounded_in_the_ledger
     assert!(stored < 64 * 1024, "stored object is {stored} bytes");
 }
 
-/// A code-mode `exec`: one counted skip, never a row, whatever the script says.
-fn js(script: &str) -> (Vec<transcript::ToolCall>, i64) {
+/// A code-mode `exec`, fed through the whole parser: the rows read and the
+/// calls counted unread.
+pub(super) fn js(script: &str) -> (Vec<transcript::ToolCall>, i64) {
     feed(&[session_meta("T", "/r"), exec(1, script)])
 }
 
-fn assert_one_code_mode_skip(script: &str) {
-    let (calls, skipped) = js(script);
-    assert!(calls.is_empty(), "a row from code mode: {script:?}");
-    assert_eq!(skipped, 1, "{script:?}");
+pub(super) fn assert_code_mode(script: &str, expect: &[&str], skipped: i64) {
+    let (calls, counted) = js(script);
+    let expect: Vec<String> = expect.iter().map(|c| c.to_string()).collect();
+    assert_eq!((commands(&calls), counted), (expect, skipped), "{script:?}");
 }
 
 #[test]
-fn p07_code_mode_is_one_counted_skip_and_never_a_row() {
-    // Round 1 (p07a-g): comments, strings, interpolation, spellings. By ruling
-    // none of it is read: the only honest answer is the count.
-    for script in [
-        "// tools.exec_command({cmd:'rm -rf /'})\nawait tools.exec_command({cmd:'ls'})",
-        r#"console.log("tools.exec_command({cmd:'rm -rf /'})");"#,
-        r#"tools.exec_command({cmd:"echo 'tools.exec_command({cmd:\"y\"})'"})"#,
-        "const x='a'; await tools.exec_command({cmd:`echo ${x}`, workdir:'/r'})",
-        "await tools.exec_command({cmd:`line1\nline2 \\` quoted`, workdir:'/r/x'})",
-        "tools.exec_command({cmd:'abc",
-        "const t = tools; await t.exec_command({cmd:'rm x'})",
-        "await tools['exec_command']({cmd:'rm x'})",
-        "await tools.exec_command?.({cmd:'rm x'})",
+fn p07_code_mode_reads_real_calls_and_never_a_decoy() {
+    // Round 1 (p07a-g): comments, strings, interpolation, spellings.
+    for (script, expect, skipped) in [
+        (
+            "// tools.exec_command({cmd:'rm -rf /'})\nawait tools.exec_command({cmd:'ls'})",
+            vec!["ls"],
+            0,
+        ),
+        (
+            r#"console.log("tools.exec_command({cmd:'rm -rf /'})");"#,
+            vec![],
+            1,
+        ),
+        (
+            r#"tools.exec_command({cmd:"echo 'tools.exec_command({cmd:\"y\"})'"})"#,
+            vec![r#"echo 'tools.exec_command({cmd:"y"})'"#],
+            0,
+        ),
+        // A substitution is not a literal: counted.
+        (
+            "const x='a'; await tools.exec_command({cmd:`echo ${x}`, workdir:'/r'})",
+            vec![],
+            1,
+        ),
+        (
+            "await tools.exec_command({cmd:`line1\nline2 \\` quoted`, workdir:'/r/x'})",
+            vec!["line1\nline2 ` quoted"],
+            0,
+        ),
+        // An alias: one marker, and the alias call is not read.
+        (
+            "const t = tools; await t.exec_command({cmd:'rm x'})",
+            vec![],
+            1,
+        ),
+        ("await tools['exec_command']({cmd:'rm x'})", vec!["rm x"], 0),
+        ("await tools.exec_command?.({cmd:'rm x'})", vec!["rm x"], 0),
+        ("await tools?.exec_command({cmd:'rm x'})", vec!["rm x"], 0),
     ] {
-        assert_one_code_mode_skip(script);
+        assert_code_mode(script, &expect, skipped);
     }
+    // The unterminated call is counted and never a row.
+    let (calls, skipped) = js("tools.exec_command({cmd:'abc");
+    assert!(calls.is_empty() && skipped >= 1, "{calls:?} {skipped}");
 }
 
 #[test]
-fn p09_a_hostile_script_costs_one_skip_and_no_time() {
+fn p07b_a_code_mode_workdir_is_placed_like_a_structured_one() {
+    let (calls, skipped) = js("await tools.exec_command({cmd:'ls', workdir:'sub'}); await tools.exec_command({cmd:'pwd', workdir:'/abs'}); await tools.exec_command({cmd:'id'})");
+    assert_eq!(skipped, 0);
+    let seen: Vec<_> = calls
+        .iter()
+        .map(|c| {
+            (
+                c.cwd.as_str(),
+                c.tool.as_str(),
+                c.command.as_deref().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            ("/r/sub", "Bash", "ls"),
+            ("/abs", "Bash", "pwd"),
+            ("/r", "Bash", "id")
+        ]
+    );
+}
+
+#[test]
+fn p09_a_hostile_script_costs_at_most_a_bounded_parse() {
+    // Over the cap: one skip, not parsed at all.
     for size in [8 << 20, 1 << 20] {
         let unit = "tools.exec_command({cmd:`";
         let script = unit.repeat(size / unit.len());
         let started = std::time::Instant::now();
-        assert_one_code_mode_skip(&script);
+        assert_code_mode(&script, &[], 1);
         let took = started.elapsed();
         assert!(
             took < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(2)),
             "a {size} byte script took {took:?}"
         );
     }
+    // Under it: parsed, bounded by the deadline, nothing recorded, and counted.
+    let unit = "tools.exec_command({cmd:`";
+    let script = unit.repeat((200 << 10) / unit.len());
+    let started = std::time::Instant::now();
+    let (calls, skipped) = js(&script);
+    let took = started.elapsed();
+    assert!(
+        calls.is_empty() && skipped >= 1,
+        "{} rows, {skipped} skipped",
+        calls.len()
+    );
+    assert!(
+        took < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(5)),
+        "a 200 KiB script took {took:?}"
+    );
 }
 
 // ------------------------------------------------------------ 2. attribution

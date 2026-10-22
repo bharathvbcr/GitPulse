@@ -1553,6 +1553,8 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tempfile",
  "tokio",
+ "tree-sitter",
+ "tree-sitter-javascript",
 ]
 
 [[package]]

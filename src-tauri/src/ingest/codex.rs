@@ -21,15 +21,17 @@
 //!   and every other `response_item` (messages, reasoning, tool outputs, calls to
 //!   tools that change nothing) cannot hold a call.
 //!
-//! # Code mode is counted, not parsed
+//! # Code mode is parsed, within bounds
 //!
 //! The Codex SDK's code mode writes a `custom_tool_call` named `exec` whose
-//! `input` is a JavaScript program (it calls `tools.exec_command(...)`). What a
-//! program runs cannot be read from its text: an earlier reader of that text was
-//! wrong both ways (real calls lost to a division it took for a regex, fake ones
-//! made of a regex literal), so it was deleted rather than hardened. Each such
-//! call is one skipped call (`CODE_MODE_SKIP`) and never a row. Codex sessions
-//! that run in code mode are therefore under-recorded by exactly that count.
+//! `input` is a JavaScript program that calls `tools.exec_command(...)` and
+//! `tools.apply_patch(...)`. An earlier hand-written reader of that text was wrong
+//! both ways (real calls lost to a division it took for a regex, fake ones made of
+//! a regex literal), so [`js`] reads the program with a real grammar instead.
+//! Straight-line calls with literal arguments become rows exactly as the
+//! structured shapes do; every other call, and every program too large, too slow
+//! or too deep to read, is counted with a reason and never a row. `js` states the
+//! whole contract.
 //!
 //! Anything else is counted too, never guessed at: a line that is not an envelope
 //! of a known `type`, a call to a shell or patch tool in a shape this reader does
@@ -47,6 +49,8 @@ use serde::Deserialize;
 
 use super::source::{Parsed, RecordParser, SourceRoot, TranscriptSource};
 use super::transcript::ToolCall;
+
+mod js;
 
 /// The variable that moves the Codex rollout directory, as
 /// `GITPULSE_TRANSCRIPT_ROOT` moves Claude's. It wins over `CODEX_HOME`.
@@ -371,8 +375,8 @@ impl CodexParser {
 ///   working_directory?}` (`LocalShellExecAction`);
 /// * `custom_tool_call` `apply_patch`, `input` the raw patch text
 ///   (`core/src/tools/handlers/apply_patch.rs`);
-/// * `custom_tool_call` `exec`, code mode, `input` JavaScript: one counted skip,
-///   never read ([`CODE_MODE_SKIP`]).
+/// * `custom_tool_call` `exec`, code mode, `input` JavaScript: the calls [`js`]
+///   reads, and one counted skip for each it cannot.
 ///
 /// A call to a shell or patch tool in any other shape (or one of these that does
 /// not parse) is counted unread. A call to a tool that changes nothing is not.
@@ -391,12 +395,20 @@ fn scan_payload(payload: &serde_json::Value) -> Option<Scanned> {
         None => unread(),
     };
     match (kind, name) {
-        // Code mode: the input is a program, and what it runs is not knowable
-        // from its text (see the module comment). One call, one skip.
-        ("custom_tool_call", "exec") => {
-            log::debug!("codex rollout: {CODE_MODE_SKIP}");
-            Some(unread())
-        }
+        ("custom_tool_call", "exec") => Some(match payload["input"].as_str() {
+            Some(input) => {
+                let program = js::scan(input, &js::LIMITS);
+                for reason in &program.skips {
+                    log::debug!("codex rollout: {reason}");
+                }
+                Scanned {
+                    commands: program.commands,
+                    patched: program.patched,
+                    unread: program.skips.len(),
+                }
+            }
+            None => unread(),
+        }),
         ("custom_tool_call", "apply_patch") => Some(match payload["input"].as_str() {
             Some(input) => {
                 let patched = patch_paths(input);
@@ -480,13 +492,11 @@ struct Scanned {
     unread: usize,
 }
 
+#[derive(Debug)]
 struct Command {
     cmd: String,
     workdir: Option<String>,
 }
-
-/// Why a code-mode `exec` call is counted and not read.
-const CODE_MODE_SKIP: &str = "code-mode not parsed";
 
 /// The files a freeform patch names: its `*** Add File:` / `*** Update File:` /
 /// `*** Delete File:` / `*** Move to:` header lines.
@@ -520,14 +530,30 @@ mod tests {
         assert_eq!(patch_paths(patch), vec!["a.rs", "/abs/b.rs", "c.rs"]);
     }
 
+    fn exec_scanned(input: &str) -> Scanned {
+        scan_payload(&serde_json::json!({
+            "type": "custom_tool_call", "name": "exec", "input": input
+        }))
+        .unwrap()
+    }
+
     #[test]
-    fn a_code_mode_exec_is_one_counted_skip_and_never_a_row() {
-        let payload = serde_json::json!({
-            "type": "custom_tool_call", "name": "exec",
-            "input": "await tools.exec_command({cmd:'ls'}); await tools.exec_command({cmd:'pwd'})"
-        });
-        let scanned = scan_payload(&payload).unwrap();
-        assert!(scanned.commands.is_empty() && scanned.patched.is_empty());
-        assert_eq!(scanned.unread, 1);
+    fn a_code_mode_exec_yields_its_straight_line_literal_calls() {
+        let scanned = exec_scanned(
+            "await tools.exec_command({cmd:'ls', workdir:'sub'}); await tools.exec_command({cmd:'pwd'})",
+        );
+        let cmds: Vec<_> = scanned
+            .commands
+            .iter()
+            .map(|c| (c.cmd.as_str(), c.workdir.as_deref()))
+            .collect();
+        assert_eq!(cmds, vec![("ls", Some("sub")), ("pwd", None)]);
+        assert_eq!(scanned.unread, 0);
+    }
+
+    #[test]
+    fn a_code_mode_exec_that_is_not_text_is_one_counted_skip() {
+        let payload = serde_json::json!({"type": "custom_tool_call", "name": "exec", "input": 7});
+        assert_eq!(scan_payload(&payload).unwrap().unread, 1);
     }
 }

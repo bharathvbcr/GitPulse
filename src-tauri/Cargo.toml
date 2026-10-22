@@ -162,6 +162,11 @@ dc-regress-store = { path = "vendored/dc-regress-store" }
 markdev-html = { path = "vendored/markdev-html", default-features = false }
 markdev-highlight = { path = "vendored/markdev-highlight" }
 markdev-vault = { path = "vendored/markdev-vault" }
+# Parse Codex code-mode rollouts (`src/ingest/codex/js.rs`). Same versions
+# markdev-highlight already resolves (Cargo.lock: 0.26.13 / 0.25.0); tree-sitter
+# is a `links` crate, so these must move with it.
+tree-sitter = "0.26"
+tree-sitter-javascript = "0.25"
 tauri-plugin-autostart = "2.7.0"
 
 # Process-group control for children we spawn (`src/procguard`).
