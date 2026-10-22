@@ -143,6 +143,79 @@ describe("the governor's lines", () => {
     expect(admissionLine(report())).toBe("Agent launches are admitted.");
   });
 
+  it("shows low disk and cache errors as advice beside an admitted launch, never as a refusal", () => {
+    const low = report(
+      {},
+      {
+        advisory: {
+          reason: "low_disk",
+          cause: "below_floor",
+          free_bytes: 1 << 30,
+          floor_bytes: 10 * 2 ** 30,
+          cap_bytes: null,
+          skipped: ["node_modules"],
+        },
+      },
+    );
+    expect(admissionLine(low)).toMatch(/^Agent launches are admitted\. Low disk advice: .*node_modules.*launches are not affected\.$/);
+    const failed = report({}, { advisory: { reason: "cache_error", message: "node_modules: boom" } });
+    expect(admissionLine(failed)).toMatch(/^Agent launches are admitted\. Advice: .*node_modules: boom/);
+    expect(admissionLine(report({}, { advisory: null }))).toBe("Agent launches are admitted.");
+  });
+
+  it("names an unreadable volume and carries every advisory of one launch", () => {
+    const several = report(
+      {},
+      {
+        advisory: {
+          reason: "several",
+          items: [
+            { reason: "disk_unknown" },
+            { reason: "cache_error", message: ".turbo: boom" },
+          ],
+        },
+      },
+    );
+    const line = admissionLine(several);
+    expect(line).toMatch(/free space could not be read/);
+    expect(line).toMatch(/\.turbo: boom/);
+  });
+
+  // adversarial W4-L3: the advice must not contradict a pressure refusal.
+  it("adv: advice beside a pressure refusal does not claim launches are unaffected", () => {
+    const low = {
+      reason: "low_disk" as const,
+      cause: "below_floor" as const,
+      free_bytes: 1 << 30,
+      floor_bytes: 10 * 2 ** 30,
+      cap_bytes: null,
+      skipped: ["node_modules"],
+    };
+    const refusing = report(
+      { admit: false, reason: "pressure", message: "memory pressure critical (kernel level 4): agent launches are refused until it clears" },
+      { refusing_for_s: 125, advisory: low },
+    );
+    expect(admissionLine(refusing)).not.toMatch(/launches are not affected/);
+  });
+
+  it("adv: an unreadable volume is named unknown, not omitted or shown as a number", () => {
+    const unknown = report(
+      {},
+      {
+        advisory: {
+          reason: "low_disk",
+          cause: "below_floor",
+          free_bytes: null,
+          floor_bytes: 10 * 2 ** 30,
+          cap_bytes: null,
+          skipped: ["node_modules"],
+        },
+      },
+    );
+    expect(admissionLine(unknown)).toMatch(/unknown free/);
+    expect(admissionLine(unknown)).not.toMatch(/\b0 B\b/);
+  });
+
   it("names the classes shed and the reason, with the stale warning", () => {
     const shedding = report({
       reason: "elevated",

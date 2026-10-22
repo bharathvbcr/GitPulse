@@ -26,9 +26,13 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
+
+use crate::sysload::{free_bytes, FreeSpace, LowDisk, LowDiskCause, Reading, Why, LOW_DISK_FLOOR};
 
 /// Deepest directory nesting one copy accepts. pnpm and nested npm installs
 /// go well past a dozen levels (`.pnpm/<pkg>/node_modules/@scope/<pkg>/...`).
@@ -36,18 +40,36 @@ pub const MAX_COW_DEPTH: usize = 64;
 /// Most entries (files, directories and links) one copy accepts. A large
 /// `node_modules` holds a few hundred thousand.
 pub const MAX_COW_ENTRIES: usize = 1_000_000;
+/// Most bytes one copy may physically write. A clone writes none; a tree this
+/// filesystem can only byte-copy (ext4, NTFS, a non-APFS volume) writes its
+/// whole size, which sixteen lanes of a few gigabytes each turns into a full
+/// disk.
+pub const MAX_COW_BYTES: u64 = 8 << 30;
 
-/// The bounds one copy runs under. A tree past either is not copied at all.
+/// Free space is read again after a byte-copy has written this many bytes, so
+/// a volume that fills during a long copy ends it instead of being read once
+/// beforehand and trusted.
+pub const RECHECK_EVERY_BYTES: u64 = 64 << 20;
+
+/// The bounds one copy runs under. A tree past any is not copied at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CowCaps {
     pub max_depth: usize,
     pub max_entries: usize,
+    /// Bytes the copy may write by byte-copying (cloned files cost none).
+    pub max_bytes: u64,
+    /// The destination volume's block size, when a caller knows it (a test
+    /// injecting a volume that rounds differently). `None` reads it from the
+    /// destination.
+    pub block_size: Option<u64>,
 }
 
 impl CowCaps {
     pub const DEFAULT: CowCaps = CowCaps {
         max_depth: MAX_COW_DEPTH,
         max_entries: MAX_COW_ENTRIES,
+        max_bytes: MAX_COW_BYTES,
+        block_size: None,
     };
 }
 
@@ -85,12 +107,13 @@ const MAX_BUILD_SCRIPTS: usize = 100_000;
 /// Cloned only when a caller opts in.
 pub const VIRTUALENV_DIRS: &[&str] = &[".venv", "venv"];
 
-/// Which caches [`reflink_ignored_caches`] considers, and the bounds each
-/// copy runs under.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which caches [`reflink_ignored_caches`] considers, the bounds each copy
+/// runs under, and how free space on the worktree's volume is read.
+#[derive(Debug, Clone, Copy)]
 pub struct CacheSelection {
     pub include_virtualenvs: bool,
     pub caps: CowCaps,
+    pub free_space: FreeSpace,
 }
 
 impl Default for CacheSelection {
@@ -98,6 +121,81 @@ impl Default for CacheSelection {
         Self {
             include_virtualenvs: false,
             caps: CowCaps::DEFAULT,
+            free_space: free_bytes,
+        }
+    }
+}
+
+/// What copying the caches produced: the copies made, the failures (each
+/// named), and, apart from them, what was skipped for want of disk. A skip is
+/// advice, not a failure: the worktree is as usable without its caches.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CacheReport {
+    pub copied: Vec<ReflinkResult>,
+    pub failures: Vec<String>,
+    pub low_disk: Option<LowDisk>,
+    /// The volume's free space could not be read, so nothing was skipped on
+    /// its account and nothing is known to be plentiful.
+    pub disk_unknown: bool,
+}
+
+impl CacheReport {
+    /// The failures as one message, `None` when there were none.
+    pub fn error(&self) -> Option<String> {
+        if self.failures.is_empty() {
+            return None;
+        }
+        let copied = if self.copied.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<&str> = self
+                .copied
+                .iter()
+                .filter_map(|r| Path::new(&r.destination).file_name()?.to_str())
+                .collect();
+            format!(" (copied: {})", names.join(", "))
+        };
+        Some(format!(
+            "{} of the build caches were not copied: {}{copied}",
+            self.failures.len(),
+            self.failures.join("; ")
+        ))
+    }
+}
+
+/// Why a copy stopped. The byte cap is a typed stop beside a failure, so the
+/// cache loop tells them apart from the value it was handed, on whatever
+/// thread the copy ran. The public entry points flatten it to the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CopyStop {
+    /// The tree would have written more than `cap` bytes by byte-copying.
+    CapHit {
+        cap: u64,
+    },
+    /// The volume's free space fell below the floor while the copy ran.
+    BelowFloor {
+        free: u64,
+    },
+    Failed(String),
+}
+
+impl From<String> for CopyStop {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl CopyStop {
+    /// The message every caller of the public entry points sees.
+    fn into_message(self) -> String {
+        match self {
+            Self::CapHit { cap } => {
+                format!("the copy would write more than {cap} bytes (the byte cap), so it was not copied")
+            }
+            Self::BelowFloor { free } => format!(
+                "free space fell to {free} bytes during the copy, below the floor, so it was not copied"
+            ),
+            Self::Failed(message) => message,
         }
     }
 }
@@ -142,8 +240,178 @@ struct Tally {
     is_cow: bool,
 }
 
+/// What a file occupies on disk: its length rounded up to the volume's block
+/// size, or the blocks the filesystem reports, whichever is more. Over-counts
+/// (a sparse file counts whole), never under-counts.
+#[cfg(unix)]
+fn allocated(meta: &fs::Metadata, block: Option<u64>) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let block = block.unwrap_or_else(|| meta.blksize()).max(512);
+    meta.len()
+        .div_ceil(block)
+        .saturating_mul(block)
+        .max(meta.blocks().saturating_mul(512))
+}
+
+#[cfg(not(unix))]
+fn allocated(meta: &fs::Metadata, _block: Option<u64>) -> u64 {
+    meta.len()
+}
+
+/// The block size files written under `path` are rounded to: the caller's,
+/// else the destination volume's (of `path` or its nearest existing
+/// ancestor).
+fn dest_block(caps: CowCaps, path: &Path) -> Option<u64> {
+    caps.block_size.or_else(|| {
+        path.ancestors()
+            .find(|p| p.exists())
+            .and_then(crate::sysload::block_size)
+    })
+}
+
+/// Copies one file's first `limit` bytes, in chunks of the re-check interval,
+/// calling `between` after each chunk that is not the last. A file that grew
+/// after it was measured is cut at the measured size, so the bytes charged are
+/// the bytes written; a `between` that fails stops the copy mid-file.
+fn copy_bounded(
+    src: &Path,
+    dst: &Path,
+    limit: u64,
+    between: &mut dyn FnMut() -> Result<(), CopyStop>,
+) -> Result<(), CopyStop> {
+    let fail =
+        |e: std::io::Error| CopyStop::from(format!("Could not copy '{}': {e}", src.display()));
+    let mut input = fs::File::open(src).map_err(fail)?;
+    let permissions = input.metadata().map_err(fail)?.permissions();
+    let mut output = fs::File::create_new(dst).map_err(fail)?;
+    let mut left = limit;
+    while left > 0 {
+        let chunk = left.min(RECHECK_EVERY_BYTES);
+        let copied = std::io::copy(&mut (&mut input).take(chunk), &mut output).map_err(fail)?;
+        if copied < chunk {
+            break;
+        }
+        left -= chunk;
+        if left > 0 {
+            between()?;
+        }
+    }
+    drop(output);
+    fs::set_permissions(dst, permissions).map_err(fail)
+}
+
+/// Stops the copy when free space, read again, is below the floor. A reading
+/// that cannot be taken lets it continue; the caller notes it as unknown.
+fn recheck_floor(recheck: Option<Recheck<'_>>) -> Result<(), CopyStop> {
+    if let Some(free) = recheck {
+        if let Reading::Value(left) = free() {
+            if left < LOW_DISK_FLOOR {
+                return Err(CopyStop::BelowFloor { free: left });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bytes the byte-copies running in this process have each been allowed to
+/// write, by volume. Concurrent lanes take their headroom from what is left
+/// after these, so they cannot jointly cross the floor.
+static RESERVED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// A share of a volume's headroom, held while one copy runs.
+struct Reservation {
+    volume: u64,
+    bytes: u64,
+    /// The volume's headroom would have covered the request, but copies
+    /// already running held part of it.
+    contended: bool,
+}
+
+impl Reservation {
+    /// Takes up to `want` of `headroom` bytes on `volume`, less what other
+    /// copies hold. Released when dropped, whether the copy finished, failed
+    /// or unwound.
+    fn take(volume: u64, headroom: u64, want: u64) -> Self {
+        let mut held = RESERVED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let others = held
+            .iter()
+            .filter(|(v, _)| *v == volume)
+            .map(|(_, b)| *b)
+            .fold(0u64, u64::saturating_add);
+        let bytes = want.min(headroom.saturating_sub(others));
+        held.push((volume, bytes));
+        Self {
+            volume,
+            bytes,
+            contended: want <= headroom && bytes < want,
+        }
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let mut held = RESERVED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(at) = held
+            .iter()
+            .position(|&(v, b)| v == self.volume && b == self.bytes)
+        {
+            held.swap_remove(at);
+        }
+    }
+}
+
+/// The volume a path is on, for reservations; one shared key where the
+/// platform gives none.
+fn volume_of(path: &Path) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // A worktree not yet made is on the volume of its nearest existing
+        // ancestor; only a path with none shares the key 0.
+        path.ancestors()
+            .find_map(|p| fs::metadata(p).ok())
+            .map_or(0, |meta| meta.dev())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        0
+    }
+}
+
+/// A free-space read that cannot take the caller down: a reader that panics
+/// is a volume that could not be read.
+fn read_free(reader: FreeSpace, path: &Path) -> Reading<u64> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reader(path))).unwrap_or_else(|_| {
+        log::warn!("the free-space reader panicked for '{}'", path.display());
+        Reading::Unavailable(Why::Failed)
+    })
+}
+
+/// Removes a staging tree when dropped armed, so a panic or an early return
+/// between creating it and renaming it never leaves it beside the destination.
+struct StagingGuard<'a> {
+    path: &'a Path,
+    armed: bool,
+}
+
+impl Drop for StagingGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_dir_all(self.path);
+        }
+    }
+}
+
 /// Work done on a finished staging tree before it is renamed into place.
 type Finish<'a> = &'a dyn Fn(&Path) -> Result<(), String>;
+
+/// Reads the volume's free space again as a byte-copy proceeds.
+type Recheck<'a> = &'a dyn Fn() -> Reading<u64>;
 
 /// What one copy demands beyond its bounds.
 #[derive(Clone, Copy, Default)]
@@ -161,38 +429,74 @@ pub fn reflink_copy_dir(src: &Path, dst: &Path) -> Result<ReflinkResult, String>
     reflink_copy_dir_bounded(src, dst, CowCaps::DEFAULT, CopyRules::default())
 }
 
-/// [`reflink_copy_dir`] under `caps` and `rules`.
+/// [`reflink_copy_dir`] under `caps` and `rules`, as a message.
 fn reflink_copy_dir_bounded(
     src: &Path,
     dst: &Path,
     caps: CowCaps,
     rules: CopyRules<'_>,
 ) -> Result<ReflinkResult, String> {
+    copy_dir_staged(src, dst, caps, rules).map_err(CopyStop::into_message)
+}
+
+/// [`reflink_copy_dir_bounded`], keeping why the copy stopped.
+fn copy_dir_staged(
+    src: &Path,
+    dst: &Path,
+    caps: CowCaps,
+    rules: CopyRules<'_>,
+) -> Result<ReflinkResult, CopyStop> {
+    copy_dir_rechecked(src, dst, caps, rules, None)
+}
+
+/// [`copy_dir_staged`] that reads free space again as it writes.
+fn copy_dir_rechecked(
+    src: &Path,
+    dst: &Path,
+    caps: CowCaps,
+    rules: CopyRules<'_>,
+    recheck: Option<Recheck<'_>>,
+) -> Result<ReflinkResult, CopyStop> {
     // Refused, not respelled: a lossy spelling names a different file, and
     // the clone and its cleanup would act on that one.
     let src_text = utf8_path(src, "Source")?;
     let dst_text = utf8_path(dst, "Destination")?;
     if !src.exists() {
-        return Err(format!("Source path '{src_text}' does not exist"));
+        return Err(CopyStop::from(format!(
+            "Source path '{src_text}' does not exist"
+        )));
     }
     if !src.is_dir() {
-        return Err(format!("Source path '{src_text}' is not a directory"));
+        return Err(CopyStop::from(format!(
+            "Source path '{src_text}' is not a directory"
+        )));
     }
     // `symlink_metadata`: a dangling link is still something in the way.
     if dst.symlink_metadata().is_ok() {
-        return Err(format!("Destination path '{dst_text}' already exists"));
+        return Err(CopyStop::from(format!(
+            "Destination path '{dst_text}' already exists"
+        )));
     }
 
     let start = Instant::now();
     let staging = staging_path(dst)?;
-    let copied = clone_tree(src, &staging, caps, rules.require_clone).and_then(|tally| {
+    let mut guard = StagingGuard {
+        path: &staging,
+        armed: true,
+    };
+    let copied = clone_tree(src, &staging, caps, rules, recheck).and_then(|tally| {
         if let Some(finish) = rules.finish {
             finish(&staging)?;
         }
-        fs::rename(&staging, dst)
-            .map(|()| tally)
-            .map_err(|e| format!("Could not move the finished copy into '{dst_text}': {e}"))
+        fs::rename(&staging, dst).map(|()| tally).map_err(|e| {
+            CopyStop::from(format!(
+                "Could not move the finished copy into '{dst_text}': {e}"
+            ))
+        })
     });
+    // Past a panic the guard has removed the tree; from here the removal is
+    // reported, not silent.
+    guard.armed = false;
     match copied {
         Ok(tally) => Ok(ReflinkResult {
             source: src_text.to_string(),
@@ -202,7 +506,17 @@ fn reflink_copy_dir_bounded(
             is_cow: tally.is_cow,
             duration_ms: start.elapsed().as_millis() as u64,
         }),
-        Err(error) => Err(discard_staging(&staging, error)),
+        Err(CopyStop::Failed(error)) => Err(CopyStop::Failed(discard_staging(&staging, error))),
+        Err(bound) => {
+            // The staging tree goes for a bound exactly as for a failure; the
+            // stop stays that bound unless its removal failed too.
+            let left = discard_staging(&staging, String::new());
+            Err(if left.is_empty() {
+                bound
+            } else {
+                CopyStop::Failed(format!("{}{left}", bound.into_message()))
+            })
+        }
     }
 }
 
@@ -284,10 +598,19 @@ fn clone_tree(
     src: &Path,
     staging: &Path,
     caps: CowCaps,
-    require_clone: bool,
-) -> Result<Tally, String> {
+    rules: CopyRules<'_>,
+    recheck: Option<Recheck<'_>>,
+) -> Result<Tally, CopyStop> {
+    let require_clone = rules.require_clone;
     #[cfg(target_os = "macos")]
     if !byte_copy_forced() {
+        if !require_clone {
+            // `copyfile(3)` clones where it can and writes bytes where it
+            // cannot (another volume), and does not say which. What it could
+            // write is counted first, against the same cap and floor.
+            let block = dest_block(caps, staging.parent().unwrap_or(staging));
+            estimate_allocated(src, caps, block)?;
+        }
         let src_c = CString::new(utf8_path(src, "Source")?)
             .map_err(|e| format!("Invalid source path: {e}"))?;
         let dst_c = CString::new(utf8_path(staging, "Destination")?)
@@ -321,18 +644,56 @@ fn clone_tree(
         // left goes before the walk starts over in the same place.
         if let Err(e) = fs::remove_dir_all(staging) {
             if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(format!(
+                return Err(CopyStop::from(format!(
                     "The clone failed and its partial copy at '{}' could not be removed: {e}",
                     staging.display()
-                ));
+                )));
             }
         }
         if require_clone {
-            return Err(NOT_CLONED.to_string());
+            return Err(CopyStop::from(NOT_CLONED.to_string()));
         }
     }
 
-    fallback_reflink_copy(src, staging, caps, require_clone)
+    walk_copy(src, staging, caps, rules, recheck)
+}
+
+/// What a byte-copy of `src` would occupy: its files' allocated sizes in
+/// `block`-sized units. Fails with the cap as soon as the total passes
+/// `caps.max_bytes`, so a huge tree is not walked to the end.
+fn estimate_allocated(src: &Path, caps: CowCaps, block: Option<u64>) -> Result<u64, CopyStop> {
+    let mut total = 0u64;
+    let mut entries = 0usize;
+    let mut stack = vec![src.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let read =
+            fs::read_dir(&dir).map_err(|e| format!("Cannot read '{}': {e}", dir.display()))?;
+        for entry in read {
+            let entry = entry.map_err(|e| format!("Cannot list '{}': {e}", dir.display()))?;
+            entries += 1;
+            if entries > caps.max_entries {
+                return Err(CopyStop::from(format!(
+                    "'{}' holds more than {} entries, so it was not copied",
+                    src.display(),
+                    caps.max_entries
+                )));
+            }
+            let meta = entry
+                .metadata()
+                .map_err(|e| format!("Cannot read '{}': {e}", entry.path().display()))?;
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                total = total.saturating_add(allocated(&meta, block));
+                if total > caps.max_bytes {
+                    return Err(CopyStop::CapHit {
+                        cap: caps.max_bytes,
+                    });
+                }
+            }
+        }
+    }
+    Ok(total)
 }
 
 /// One file cloned rather than copied, where this platform can.
@@ -351,17 +712,34 @@ fn try_clone_file(src: &Path, dst: &Path) -> bool {
     }
 }
 
-/// Recursive copier that attempts file-level FICLONE on Linux, or `fs::copy`
-/// elsewhere. Every entry is copied or the copy fails: an unreadable
-/// directory or file, a failed write, an entry that is none of file,
-/// directory or link, or a bound reached is an error naming it. With
-/// `require_clone`, a file that could not be cloned ends the copy.
+/// [`walk_copy`] as a message, for the callers and tests that read one.
+#[cfg(test)]
 fn fallback_reflink_copy(
     src: &Path,
     dst: &Path,
     caps: CowCaps,
     require_clone: bool,
 ) -> Result<Tally, String> {
+    let rules = CopyRules {
+        require_clone,
+        ..CopyRules::default()
+    };
+    walk_copy(src, dst, caps, rules, None).map_err(CopyStop::into_message)
+}
+
+/// Recursive copier that attempts file-level FICLONE on Linux, or `fs::copy`
+/// elsewhere. Every entry is copied or the copy fails: an unreadable
+/// directory or file, a failed write, an entry that is none of file,
+/// directory or link, or a bound reached is an error naming it. With
+/// `require_clone`, a file that could not be cloned ends the copy.
+fn walk_copy(
+    src: &Path,
+    dst: &Path,
+    caps: CowCaps,
+    rules: CopyRules<'_>,
+    recheck: Option<Recheck<'_>>,
+) -> Result<Tally, CopyStop> {
+    let require_clone = rules.require_clone;
     fs::create_dir(dst).map_err(|e| format!("Failed to create destination dir: {e}"))?;
 
     let mut tally = Tally {
@@ -370,6 +748,9 @@ fn fallback_reflink_copy(
         is_cow: false,
     };
     let mut entries = 0usize;
+    let mut written = 0u64;
+    let mut since_check = 0u64;
+    let block = dest_block(caps, dst);
     let mut stack: Vec<(PathBuf, PathBuf, usize)> = vec![(src.to_path_buf(), dst.to_path_buf(), 0)];
 
     while let Some((curr_src, curr_dst, depth)) = stack.pop() {
@@ -379,11 +760,11 @@ fn fallback_reflink_copy(
             let entry = entry.map_err(|e| format!("Cannot list '{}': {e}", curr_src.display()))?;
             entries += 1;
             if entries > caps.max_entries {
-                return Err(format!(
+                return Err(CopyStop::from(format!(
                     "'{}' holds more than {} entries, so it was not copied",
                     src.display(),
                     caps.max_entries
-                ));
+                )));
             }
             let entry_path = entry.path();
             let target_path = curr_dst.join(entry.file_name());
@@ -395,11 +776,11 @@ fn fallback_reflink_copy(
 
             if kind.is_dir() {
                 if depth + 1 > caps.max_depth {
-                    return Err(format!(
+                    return Err(CopyStop::from(format!(
                         "'{}' is nested more than {} directories deep, so it was not copied",
                         src.display(),
                         caps.max_depth
-                    ));
+                    )));
                 }
                 fs::create_dir(&target_path)
                     .map_err(|e| format!("Cannot create '{}': {e}", target_path.display()))?;
@@ -408,10 +789,29 @@ fn fallback_reflink_copy(
                 if try_clone_file(&entry_path, &target_path) {
                     tally.is_cow = true;
                 } else if require_clone {
-                    return Err(NOT_CLONED.to_string());
+                    return Err(CopyStop::from(NOT_CLONED.to_string()));
                 } else {
-                    fs::copy(&entry_path, &target_path)
-                        .map_err(|e| format!("Could not copy '{}': {e}", entry_path.display()))?;
+                    let cost = allocated(&meta, block);
+                    written = written.saturating_add(cost);
+                    if written > caps.max_bytes {
+                        return Err(CopyStop::CapHit {
+                            cap: caps.max_bytes,
+                        });
+                    }
+                    copy_bounded(&entry_path, &target_path, meta.len(), &mut || {
+                        recheck_floor(recheck)
+                    })?;
+                    // A file past the interval was checked between its
+                    // chunks; a small one adds to the run since the last check.
+                    since_check = if cost >= RECHECK_EVERY_BYTES {
+                        0
+                    } else {
+                        since_check.saturating_add(cost)
+                    };
+                    if since_check >= RECHECK_EVERY_BYTES {
+                        since_check = 0;
+                        recheck_floor(recheck)?;
+                    }
                 }
                 tally.files += 1;
                 tally.bytes += meta.len();
@@ -419,10 +819,10 @@ fn fallback_reflink_copy(
                 copy_link(&entry_path, &target_path)?;
                 tally.files += 1;
             } else {
-                return Err(format!(
+                return Err(CopyStop::from(format!(
                     "'{}' is not a file, directory or link, so the tree was not copied",
                     entry_path.display()
-                ));
+                )));
             }
         }
     }
@@ -685,11 +1085,32 @@ pub fn reflink_ignored_caches(
     worktree: &Path,
     selection: &CacheSelection,
 ) -> Result<Vec<ReflinkResult>, String> {
+    let report = clone_ignored_caches(anchor, worktree, selection)?;
+    if let Some(error) = report.error() {
+        return Err(error);
+    }
+    match report.low_disk {
+        Some(low) => Err(low.message()),
+        None => Ok(report.copied),
+    }
+}
+
+/// [`reflink_ignored_caches`], reporting a skip for want of disk apart from a
+/// failure. Free space is read on the worktree's volume before each cache: a
+/// volume below [`LOW_DISK_FLOOR`] gets no copy, and a byte-copied tree may
+/// write no more than the cap or what would leave the floor. A volume that
+/// cannot be read is unknown, never plentiful, and forces no skip.
+pub fn clone_ignored_caches(
+    anchor: &Path,
+    worktree: &Path,
+    selection: &CacheSelection,
+) -> Result<CacheReport, String> {
     if !anchor.exists() || !worktree.exists() {
         return Err("Both anchor and worktree paths must exist".to_string());
     }
+    let mut report = CacheReport::default();
     if anchor == worktree {
-        return Ok(Vec::new());
+        return Ok(report);
     }
 
     let virtualenvs: &[&str] = if selection.include_virtualenvs {
@@ -697,8 +1118,10 @@ pub fn reflink_ignored_caches(
     } else {
         &[]
     };
-    let mut results = Vec::new();
-    let mut failures = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut cause = LowDiskCause::BelowFloor;
+    let mut free_seen: Option<u64> = None;
+    let mut cap_seen: Option<u64> = None;
 
     for dir_name in STANDARD_CACHE_DIRS.iter().chain(virtualenvs) {
         let anchor_dir = anchor.join(dir_name);
@@ -716,43 +1139,110 @@ pub fn reflink_ignored_caches(
                 continue;
             }
             Err(err) => {
-                failures.push(format!("{dir_name}: {err}"));
+                report.failures.push(format!("{dir_name}: {err}"));
                 continue;
             }
         }
+        let mut caps = selection.caps;
+        let mut reservation = None;
+        let unknown_mid_copy = std::cell::Cell::new(false);
+        match read_free(selection.free_space, worktree) {
+            Reading::Value(free) => {
+                free_seen = Some(free);
+                if free < LOW_DISK_FLOOR {
+                    skipped.push((*dir_name).to_string());
+                    continue;
+                }
+                // What the copy may write is what the tree occupies on the
+                // destination volume; a clone-only copy (target/) writes none.
+                let planned = if *dir_name == CARGO_TARGET_DIR {
+                    0
+                } else {
+                    match estimate_allocated(&anchor_dir, caps, dest_block(caps, worktree)) {
+                        Ok(planned) => planned,
+                        Err(CopyStop::CapHit { .. }) => {
+                            cause = LowDiskCause::ByteCap;
+                            cap_seen = Some(caps.max_bytes);
+                            skipped.push((*dir_name).to_string());
+                            continue;
+                        }
+                        Err(stop) => {
+                            report
+                                .failures
+                                .push(format!("{dir_name}: {}", stop.into_message()));
+                            continue;
+                        }
+                    }
+                };
+                let held = Reservation::take(volume_of(worktree), free - LOW_DISK_FLOOR, planned);
+                if held.bytes < planned {
+                    cause = if held.contended {
+                        LowDiskCause::HeadroomReserved
+                    } else {
+                        LowDiskCause::BelowFloor
+                    };
+                    skipped.push((*dir_name).to_string());
+                    continue;
+                }
+                caps.max_bytes = held.bytes;
+                reservation = Some(held);
+            }
+            Reading::Unavailable(_) => report.disk_unknown = true,
+        }
+        let recheck = || {
+            let reading = read_free(selection.free_space, worktree);
+            if matches!(reading, Reading::Unavailable(_)) {
+                unknown_mid_copy.set(true);
+            }
+            reading
+        };
         let copied = if *dir_name == CARGO_TARGET_DIR {
-            clone_cargo_target(&anchor_dir, &worktree_dir, selection.caps)
+            clone_cargo_target(&anchor_dir, &worktree_dir, caps)
         } else {
-            reflink_copy_dir_bounded(
+            copy_dir_rechecked(
                 &anchor_dir,
                 &worktree_dir,
-                selection.caps,
+                caps,
                 CopyRules::default(),
+                Some(&recheck),
             )
         };
+        drop(reservation);
+        report.disk_unknown |= unknown_mid_copy.get();
         match copied {
-            Ok(res) => results.push(res),
-            Err(err) => failures.push(format!("{dir_name}: {err}")),
+            Ok(res) => report.copied.push(res),
+            Err(CopyStop::BelowFloor { free }) => {
+                cause = LowDiskCause::BelowFloor;
+                free_seen = Some(free);
+                skipped.push((*dir_name).to_string());
+            }
+            Err(CopyStop::CapHit { .. }) => {
+                // The cap, or the floor when the volume's headroom was the
+                // smaller bound: nothing was copied, and that is advice.
+                if caps.max_bytes < selection.caps.max_bytes {
+                    cause = LowDiskCause::BelowFloor;
+                } else {
+                    cause = LowDiskCause::ByteCap;
+                    cap_seen = Some(caps.max_bytes);
+                }
+                skipped.push((*dir_name).to_string());
+            }
+            Err(stop) => report
+                .failures
+                .push(format!("{dir_name}: {}", stop.into_message())),
         }
     }
 
-    if failures.is_empty() {
-        return Ok(results);
+    if !skipped.is_empty() {
+        report.low_disk = Some(LowDisk {
+            cause,
+            free_bytes: free_seen,
+            floor_bytes: LOW_DISK_FLOOR,
+            cap_bytes: cap_seen,
+            skipped,
+        });
     }
-    let copied = if results.is_empty() {
-        String::new()
-    } else {
-        let names: Vec<&str> = results
-            .iter()
-            .filter_map(|r| Path::new(&r.destination).file_name()?.to_str())
-            .collect();
-        format!(" (copied: {})", names.join(", "))
-    };
-    Err(format!(
-        "{} of the build caches were not copied: {}{copied}",
-        failures.len(),
-        failures.join("; ")
-    ))
+    Ok(report)
 }
 
 /// Clones the anchor's Cargo target directory: a real directory, under its
@@ -762,7 +1252,7 @@ fn clone_cargo_target(
     anchor_dir: &Path,
     worktree_dir: &Path,
     caps: CowCaps,
-) -> Result<ReflinkResult, String> {
+) -> Result<ReflinkResult, CopyStop> {
     let from = utf8_path(anchor_dir, "Source")?;
     let to = utf8_path(worktree_dir, "Destination")?;
     let is_link = anchor_dir
@@ -771,15 +1261,15 @@ fn clone_cargo_target(
         .file_type()
         .is_symlink();
     if is_link {
-        return Err(
+        return Err(CopyStop::from(
             "skipped: the anchor's target is a link to a shared build directory, which a clone would not follow"
                 .to_string(),
-        );
+        ));
     }
     let _held =
         hold_cargo_build_locks(anchor_dir).map_err(|reason| format!("skipped: {reason}"))?;
     let rewrite = |staging: &Path| rewrite_build_outputs(staging, from, to);
-    reflink_copy_dir_bounded(
+    copy_dir_staged(
         anchor_dir,
         worktree_dir,
         caps,
@@ -1337,4 +1827,713 @@ mod tests {
         assert!(copied.is_empty(), "{copied:?}");
         assert!(!worktree.join("target").exists());
     }
+
+    fn roomy(_: &Path) -> Reading<u64> {
+        Reading::Value(LOW_DISK_FLOOR + (400 << 30))
+    }
+    fn full(_: &Path) -> Reading<u64> {
+        Reading::Value(LOW_DISK_FLOOR - 1)
+    }
+    fn tight(_: &Path) -> Reading<u64> {
+        // Room for 4 bytes above the floor.
+        Reading::Value(LOW_DISK_FLOOR + 4)
+    }
+    fn unreadable(_: &Path) -> Reading<u64> {
+        Reading::Unavailable(crate::sysload::Why::Failed)
+    }
+
+    fn cache_with_file(anchor: &Path, bytes: usize) {
+        fs::create_dir_all(anchor.join("node_modules/pkg")).unwrap();
+        fs::write(anchor.join("node_modules/pkg/index.js"), vec![b'x'; bytes]).unwrap();
+    }
+
+    fn selection(free_space: FreeSpace) -> CacheSelection {
+        CacheSelection {
+            free_space,
+            ..CacheSelection::default()
+        }
+    }
+
+    /// Below the floor nothing is copied and nothing is left behind; the skip
+    /// is typed and is not a failure.
+    #[test]
+    fn a_volume_below_the_floor_gets_no_copy_and_a_typed_low_disk() {
+        let (main, _parent, worktree) = anchor_and_worktree(&["node_modules"]);
+        let anchor = main.path().canonicalize().unwrap();
+        cache_with_file(&anchor, 8);
+        let report = clone_ignored_caches(&anchor, &worktree, &selection(full)).unwrap();
+        assert!(
+            report.copied.is_empty() && report.failures.is_empty(),
+            "{report:?}"
+        );
+        let low = report.low_disk.expect("a typed low_disk");
+        assert_eq!(low.cause, LowDiskCause::BelowFloor);
+        assert_eq!(low.free_bytes, Some(LOW_DISK_FLOOR - 1));
+        assert_eq!(low.skipped, vec!["node_modules".to_string()]);
+        assert!(!worktree.join("node_modules").exists());
+        assert!(entries(&worktree).iter().all(|n| !n.contains("partial")));
+    }
+
+    #[test]
+    fn plenty_of_space_copies_and_reports_no_low_disk() {
+        let (main, _parent, worktree) = anchor_and_worktree(&["node_modules"]);
+        let anchor = main.path().canonicalize().unwrap();
+        cache_with_file(&anchor, 8);
+        let report = clone_ignored_caches(&anchor, &worktree, &selection(roomy)).unwrap();
+        assert_eq!(report.copied.len(), 1);
+        assert_eq!((report.low_disk, report.disk_unknown), (None, false));
+        assert!(worktree.join("node_modules/pkg/index.js").is_file());
+    }
+
+    /// Unknown is its own state: the copy proceeds, and the report says the
+    /// volume was not read rather than that it was fine.
+    #[test]
+    fn an_unreadable_volume_is_unknown_and_forces_no_skip() {
+        let (main, _parent, worktree) = anchor_and_worktree(&["node_modules"]);
+        let anchor = main.path().canonicalize().unwrap();
+        cache_with_file(&anchor, 8);
+        let report = clone_ignored_caches(&anchor, &worktree, &selection(unreadable)).unwrap();
+        assert_eq!(report.copied.len(), 1, "{report:?}");
+        assert!(report.low_disk.is_none());
+        assert!(report.disk_unknown);
+    }
+
+    /// A byte-copied tree past the cap is not copied at all, the cap is
+    /// named, and nothing is left behind.
+    #[test]
+    fn the_byte_cap_is_honoured_whole_or_nothing() {
+        let (main, _parent, worktree) = anchor_and_worktree(&["node_modules"]);
+        let anchor = main.path().canonicalize().unwrap();
+        cache_with_file(&anchor, 100);
+        let capped = CacheSelection {
+            caps: CowCaps {
+                max_bytes: 10,
+                ..CowCaps::DEFAULT
+            },
+            free_space: roomy,
+            ..CacheSelection::default()
+        };
+        let report =
+            with_forced_byte_copy(|| clone_ignored_caches(&anchor, &worktree, &capped)).unwrap();
+        assert!(
+            report.copied.is_empty() && report.failures.is_empty(),
+            "{report:?}"
+        );
+        let low = report.low_disk.expect("a typed low_disk");
+        assert_eq!(low.cause, LowDiskCause::ByteCap);
+        assert_eq!(low.cap_bytes, Some(10));
+        assert!(low.message().contains("byte cap"));
+        assert!(!worktree.join("node_modules").exists());
+        assert!(entries(&worktree).iter().all(|n| !n.contains("partial")));
+        // Under the cap the same tree copies.
+        let ok =
+            with_forced_byte_copy(|| clone_ignored_caches(&anchor, &worktree, &selection(roomy)))
+                .unwrap();
+        assert_eq!(ok.copied.len(), 1);
+    }
+
+    /// The cap is a typed stop, not state beside the copy: the same result
+    /// comes back when the copy runs on a spawned thread.
+    #[test]
+    fn the_byte_cap_is_detected_when_the_copy_runs_on_a_spawned_thread() {
+        let (main, _parent, worktree) = anchor_and_worktree(&["node_modules"]);
+        let anchor = main.path().canonicalize().unwrap();
+        cache_with_file(&anchor, 100);
+        let capped = CacheSelection {
+            caps: CowCaps {
+                max_bytes: 10,
+                ..CowCaps::DEFAULT
+            },
+            free_space: roomy,
+            ..CacheSelection::default()
+        };
+        let report = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    with_forced_byte_copy(|| clone_ignored_caches(&anchor, &worktree, &capped))
+                })
+                .join()
+                .unwrap()
+        })
+        .unwrap();
+        assert!(report.failures.is_empty(), "{report:?}");
+        let low = report.low_disk.expect("a typed low_disk");
+        assert_eq!(low.cause, LowDiskCause::ByteCap);
+    }
+
+    /// A copy that would leave the volume below the floor is skipped too,
+    /// and says the floor, not the cap, bound it.
+    #[test]
+    fn a_copy_that_would_cross_the_floor_is_skipped() {
+        let (main, _parent, worktree) = anchor_and_worktree(&["node_modules"]);
+        let anchor = main.path().canonicalize().unwrap();
+        cache_with_file(&anchor, 100);
+        let report =
+            with_forced_byte_copy(|| clone_ignored_caches(&anchor, &worktree, &selection(tight)))
+                .unwrap();
+        let low = report.low_disk.expect("a typed low_disk");
+        assert_eq!(low.cause, LowDiskCause::BelowFloor);
+        assert!(!worktree.join("node_modules").exists());
+    }
+
+    /// The legacy entry point reports a skip as an error, so a caller that
+    /// only reads `Result` still hears it.
+    #[test]
+    fn the_result_entry_point_does_not_hide_a_low_disk_skip() {
+        let (main, _parent, worktree) = anchor_and_worktree(&["node_modules"]);
+        let anchor = main.path().canonicalize().unwrap();
+        cache_with_file(&anchor, 8);
+        let error = reflink_ignored_caches(&anchor, &worktree, &selection(full)).unwrap_err();
+        assert!(error.contains("low disk"), "{error}");
+    }
+
+    // ---- adversarial W4-L3 (adv-w4l3) ----
+
+    fn staging_leftovers(dir: &Path) -> Vec<String> {
+        entries(dir)
+            .into_iter()
+            .filter(|n| n.contains("gitpulse-partial"))
+            .collect()
+    }
+
+    /// Attack 2: a panic mid-copy (here in the finish step) must not leave a
+    /// staging directory beside the destination.
+    #[test]
+    fn adv_a_panic_mid_copy_leaves_no_staging_dir() {
+        let parent = tempdir().unwrap();
+        let src = parent.path().join("src");
+        fs::create_dir_all(src.join("pkg")).unwrap();
+        fs::write(src.join("pkg/a.js"), "a").unwrap();
+        let dst = parent.path().join("dst");
+        let boom = |_: &Path| -> Result<(), String> { panic!("crash mid-copy") };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            copy_dir_staged(
+                &src,
+                &dst,
+                CowCaps::DEFAULT,
+                CopyRules {
+                    require_clone: false,
+                    finish: Some(&boom),
+                },
+            )
+        }));
+        assert!(outcome.is_err());
+        assert!(!dst.exists());
+        assert_eq!(staging_leftovers(parent.path()), Vec::<String>::new());
+    }
+
+    /// Attack 2: a cap hit after many files were already written leaves
+    /// neither destination nor staging.
+    #[test]
+    fn adv_a_cap_hit_after_many_files_leaves_nothing() {
+        let parent = tempdir().unwrap();
+        let src = parent.path().join("src");
+        fs::create_dir_all(src.join("d")).unwrap();
+        for i in 0..40 {
+            fs::write(src.join("d").join(format!("f{i}")), [b'x'; 10]).unwrap();
+        }
+        let dst = parent.path().join("dst");
+        let caps = CowCaps {
+            max_bytes: 250,
+            ..CowCaps::DEFAULT
+        };
+        let r = with_forced_byte_copy(|| copy_dir_staged(&src, &dst, caps, CopyRules::default()));
+        assert!(matches!(r, Err(CopyStop::CapHit { .. })), "{r:?}");
+        assert!(!dst.exists());
+        assert_eq!(staging_leftovers(parent.path()), Vec::<String>::new());
+    }
+
+    /// Attack 2: an entry that is neither file, dir nor link (a FIFO) fails
+    /// the copy after earlier files were written; nothing stays.
+    #[cfg(unix)]
+    #[test]
+    fn adv_an_error_after_partial_progress_leaves_nothing() {
+        let parent = tempdir().unwrap();
+        let src = parent.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        for i in 0..5 {
+            fs::write(src.join(format!("f{i}")), "x").unwrap();
+        }
+        let fifo = std::ffi::CString::new(src.join("zz-fifo").to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let dst = parent.path().join("dst");
+        let r = with_forced_byte_copy(|| {
+            copy_dir_staged(&src, &dst, CowCaps::DEFAULT, CopyRules::default())
+        });
+        assert!(r.is_err());
+        assert!(!dst.exists());
+        assert_eq!(staging_leftovers(parent.path()), Vec::<String>::new());
+    }
+
+    /// Attack 2: eight provisions race on the SAME destination (so the same
+    /// parent): at least one wins, the winner is complete, nothing is left.
+    #[test]
+    fn adv_racing_copies_to_one_destination_leave_one_whole_copy_and_no_staging() {
+        let parent = tempdir().unwrap();
+        let src = parent.path().join("src");
+        fs::create_dir_all(src.join("d")).unwrap();
+        for i in 0..200 {
+            fs::write(src.join("d").join(format!("f{i}")), [b'x'; 64]).unwrap();
+        }
+        let dst = parent.path().join("dst");
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        with_forced_byte_copy(|| {
+                            copy_dir_staged(&src, &dst, CowCaps::DEFAULT, CopyRules::default())
+                        })
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(
+            results.iter().filter(|r| r.is_ok()).count() >= 1,
+            "{results:?}"
+        );
+        assert_eq!(fs::read_dir(dst.join("d")).unwrap().count(), 200);
+        assert_eq!(staging_leftovers(parent.path()), Vec::<String>::new());
+    }
+
+    /// Attack 3, re-pointed when the cap became allocated-size accounting:
+    /// 2000 one-byte files occupy a block each (megabytes on disk), so a
+    /// 2000-byte cap REFUSES them, whole-or-nothing, rather than admitting a
+    /// copy that is far over it.
+    #[cfg(unix)]
+    #[test]
+    fn adv_the_cap_counts_physical_bytes_not_logical_length() {
+        let parent = tempdir().unwrap();
+        let src = parent.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        for i in 0..2000 {
+            fs::write(src.join(format!("f{i}")), "x").unwrap();
+        }
+        let dst = parent.path().join("dst");
+        let caps = CowCaps {
+            max_bytes: 2000,
+            ..CowCaps::DEFAULT
+        };
+        let r = with_forced_byte_copy(|| copy_dir_staged(&src, &dst, caps, CopyRules::default()));
+        assert!(matches!(r, Err(CopyStop::CapHit { cap: 2000 })), "{r:?}");
+        assert!(!dst.exists());
+        assert_eq!(staging_leftovers(parent.path()), Vec::<String>::new());
+    }
+
+    /// Attack 3, re-pointed to allocated units: hard links are each written,
+    /// so each name is counted. A cap just above two blocks admits the two
+    /// small names; a cap of one block refuses them.
+    #[cfg(unix)]
+    #[test]
+    fn adv_hard_links_are_counted_per_name() {
+        use std::os::unix::fs::MetadataExt;
+        let parent = tempdir().unwrap();
+        let src = parent.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("a"), [b'x'; 100]).unwrap();
+        fs::hard_link(src.join("a"), src.join("b")).unwrap();
+        let one_name = allocated(&fs::metadata(src.join("a")).unwrap(), None);
+        let tight = CowCaps {
+            max_bytes: one_name,
+            ..CowCaps::DEFAULT
+        };
+        let d1 = parent.path().join("d1");
+        let r = with_forced_byte_copy(|| copy_dir_staged(&src, &d1, tight, CopyRules::default()));
+        assert!(matches!(r, Err(CopyStop::CapHit { .. })), "{r:?}");
+        assert!(!d1.exists());
+        let roomy = CowCaps {
+            max_bytes: 2 * one_name,
+            ..CowCaps::DEFAULT
+        };
+        let d2 = parent.path().join("d2");
+        with_forced_byte_copy(|| copy_dir_staged(&src, &d2, roomy, CopyRules::default())).unwrap();
+        assert_ne!(
+            fs::metadata(d2.join("a")).unwrap().ino(),
+            fs::metadata(d2.join("b")).unwrap().ino()
+        );
+    }
+
+    /// Attack 3: a sparse file is counted by logical length (over-counts, the
+    /// safe direction), so a sparse 64 MiB file trips a 10 MiB cap.
+    #[cfg(unix)]
+    #[test]
+    fn adv_a_sparse_file_is_counted_by_logical_length() {
+        let parent = tempdir().unwrap();
+        let src = parent.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::File::create(src.join("s"))
+            .unwrap()
+            .set_len(64 << 20)
+            .unwrap();
+        let caps = CowCaps {
+            max_bytes: 10 << 20,
+            ..CowCaps::DEFAULT
+        };
+        let r = with_forced_byte_copy(|| {
+            copy_dir_staged(&src, &parent.path().join("d"), caps, CopyRules::default())
+        });
+        assert!(matches!(r, Err(CopyStop::CapHit { .. })), "{r:?}");
+    }
+
+    /// Attack 3: symlinks (absolute, relative-escaping, to a directory) are
+    /// copied as links: nothing outside the destination is written or read
+    /// into the copy, and the link adds no bytes.
+    #[cfg(unix)]
+    #[test]
+    fn adv_symlinks_in_a_cache_are_not_followed_and_nothing_escapes() {
+        let parent = tempdir().unwrap();
+        let outside = parent.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret"), [b'x'; 4096]).unwrap();
+        let src = parent.path().join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&outside, src.join("abs")).unwrap();
+        std::os::unix::fs::symlink("../outside", src.join("sub/rel")).unwrap();
+        std::os::unix::fs::symlink("sub", src.join("selfdir")).unwrap();
+        let dst = parent.path().join("dst");
+        let caps = CowCaps {
+            max_bytes: 10,
+            ..CowCaps::DEFAULT
+        };
+        with_forced_byte_copy(|| copy_dir_staged(&src, &dst, caps, CopyRules::default())).unwrap();
+        assert!(dst
+            .join("abs")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(entries(&outside), vec!["secret".to_string()]);
+        assert_eq!(fs::read_dir(&dst).unwrap().count(), 3);
+    }
+
+    /// Attack 3: a cache directory that is itself a symlink to an outside
+    /// tree is walked through (followed) as the cache root, still capped.
+    #[cfg(unix)]
+    #[test]
+    fn adv_a_symlinked_cache_root_is_followed_and_still_capped() {
+        let parent = tempdir().unwrap();
+        let outside = parent.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("big"), [b'x'; 100]).unwrap();
+        let src = parent.path().join("node_modules");
+        std::os::unix::fs::symlink(&outside, &src).unwrap();
+        let caps = CowCaps {
+            max_bytes: 10,
+            ..CowCaps::DEFAULT
+        };
+        let r = with_forced_byte_copy(|| {
+            copy_dir_staged(&src, &parent.path().join("d"), caps, CopyRules::default())
+        });
+        assert!(matches!(r, Err(CopyStop::CapHit { .. })), "{r:?}");
+    }
+
+    /// Attack 4: the free-space read is one snapshot per cache. A volume
+    /// that fills after that read is never re-checked: the reader answers
+    /// roomy once, then full, and the copy still runs to the end.
+    #[test]
+    fn adv_free_space_is_rechecked_during_a_copy() {
+        use std::sync::atomic::AtomicUsize;
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn fills_after_first_read(_: &Path) -> Reading<u64> {
+            if CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
+                Reading::Value(LOW_DISK_FLOOR + 10_000)
+            } else {
+                Reading::Value(0)
+            }
+        }
+        let (main, _parent, worktree) = anchor_and_worktree(&["node_modules"]);
+        let anchor = main.path().canonicalize().unwrap();
+        fs::create_dir_all(anchor.join("node_modules/p")).unwrap();
+        for i in 0..50 {
+            fs::write(anchor.join(format!("node_modules/p/f{i}")), [b'x'; 100]).unwrap();
+        }
+        let report = with_forced_byte_copy(|| {
+            clone_ignored_caches(&anchor, &worktree, &selection(fills_after_first_read))
+        })
+        .unwrap();
+        assert!(
+            report.copied.is_empty(),
+            "the copy ran to the end after the volume filled: free space is read once, not re-checked"
+        );
+    }
+
+    /// Attack 4: lanes provisioning at once each read the same headroom and
+    /// each spend all of it: 3 lanes x 800 B against 1000 B above the floor.
+    #[test]
+    fn adv_concurrent_lanes_cannot_jointly_cross_the_floor() {
+        use std::sync::atomic::AtomicUsize;
+        static ARRIVED: AtomicUsize = AtomicUsize::new(0);
+        fn rendezvous(_: &Path) -> Reading<u64> {
+            ARRIVED.fetch_add(1, Ordering::SeqCst);
+            for _ in 0..50_000_000u64 {
+                if ARRIVED.load(Ordering::SeqCst) >= 3 {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            Reading::Value(LOW_DISK_FLOOR + 1000)
+        }
+        let lanes: Vec<_> = (0..3)
+            .map(|_| anchor_and_worktree(&["node_modules"]))
+            .collect();
+        let written: u64 = std::thread::scope(|scope| {
+            let handles: Vec<_> = lanes
+                .iter()
+                .map(|(main, _p, worktree)| {
+                    scope.spawn(move || {
+                        let anchor = main.path().canonicalize().unwrap();
+                        cache_with_file(&anchor, 800);
+                        with_forced_byte_copy(|| {
+                            clone_ignored_caches(&anchor, worktree, &selection(rendezvous))
+                        })
+                        .unwrap()
+                        .copied
+                        .iter()
+                        .map(|r| r.bytes_cloned)
+                        .sum::<u64>()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+        assert!(
+            written <= 1000,
+            "{written} B written against 1000 B of headroom"
+        );
+    }
+
+    // ---- robustness and accounting (W4-L3 adversarial follow-up) ----
+
+    /// A file that grew after it was measured is cut at the measured size.
+    #[test]
+    fn a_file_is_copied_only_up_to_the_size_it_was_measured_at() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("grown"), [b'x'; 100]).unwrap();
+        copy_bounded(
+            &dir.path().join("grown"),
+            &dir.path().join("out"),
+            10,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(fs::metadata(dir.path().join("out")).unwrap().len(), 10);
+    }
+
+    /// Small files are charged what they occupy, so a cap in bytes is a cap
+    /// on disk: two 1-byte files do not fit a cap of 2 bytes.
+    #[cfg(unix)]
+    #[test]
+    fn small_files_are_charged_their_allocated_size() {
+        let parent = tempdir().unwrap();
+        let src = parent.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("a"), "x").unwrap();
+        fs::write(src.join("b"), "x").unwrap();
+        let caps = CowCaps {
+            max_bytes: 2,
+            ..CowCaps::DEFAULT
+        };
+        let r = with_forced_byte_copy(|| {
+            copy_dir_staged(&src, &parent.path().join("d"), caps, CopyRules::default())
+        });
+        assert!(matches!(r, Err(CopyStop::CapHit { .. })), "{r:?}");
+    }
+
+    /// Free space is read again as a long copy proceeds: a volume that fills
+    /// after the first read ends the copy, whole-or-nothing.
+    #[test]
+    fn a_volume_that_fills_during_a_long_copy_ends_it_with_nothing_left() {
+        use std::sync::atomic::AtomicUsize;
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn fills_after_first_read(_: &Path) -> Reading<u64> {
+            if CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
+                Reading::Value(LOW_DISK_FLOOR + (4 << 30))
+            } else {
+                Reading::Value(0)
+            }
+        }
+        let (main, _parent, worktree) = anchor_and_worktree(&["node_modules"]);
+        let anchor = main.path().canonicalize().unwrap();
+        fs::create_dir_all(anchor.join("node_modules/p")).unwrap();
+        let mib = vec![b'x'; 1 << 20];
+        for i in 0..70 {
+            fs::write(anchor.join(format!("node_modules/p/f{i}")), &mib).unwrap();
+        }
+        let report = with_forced_byte_copy(|| {
+            clone_ignored_caches(&anchor, &worktree, &selection(fills_after_first_read))
+        })
+        .unwrap();
+        assert!(
+            report.copied.is_empty() && report.failures.is_empty(),
+            "{report:?}"
+        );
+        let low = report.low_disk.expect("a typed low_disk");
+        assert_eq!(low.cause, LowDiskCause::BelowFloor);
+        assert_eq!(low.free_bytes, Some(0));
+        assert!(!worktree.join("node_modules").exists());
+        assert!(staging_leftovers(&worktree).is_empty());
+    }
+
+    /// A reader that panics is an unreadable volume: the copy proceeds and
+    /// the report says unknown.
+    #[test]
+    fn a_panicking_reader_is_an_unknown_volume() {
+        fn boom(_: &Path) -> Reading<u64> {
+            panic!("reader blew up")
+        }
+        let (main, _parent, worktree) = anchor_and_worktree(&["node_modules"]);
+        let anchor = main.path().canonicalize().unwrap();
+        cache_with_file(&anchor, 8);
+        let report = clone_ignored_caches(&anchor, &worktree, &selection(boom)).unwrap();
+        assert!(
+            report.disk_unknown && report.low_disk.is_none(),
+            "{report:?}"
+        );
+        assert_eq!(report.copied.len(), 1);
+    }
+
+    /// `copyfile(3)` can byte-copy across volumes without saying so; what it
+    /// could write is counted first, against the cap, with no destination
+    /// made.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_copyfile_path_is_held_to_the_cap_before_it_runs() {
+        let parent = tempdir().unwrap();
+        let src = parent.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("big"), [b'x'; 100]).unwrap();
+        let caps = CowCaps {
+            max_bytes: 10,
+            ..CowCaps::DEFAULT
+        };
+        let dst = parent.path().join("dst");
+        let r = copy_dir_staged(&src, &dst, caps, CopyRules::default());
+        assert!(matches!(r, Err(CopyStop::CapHit { .. })), "{r:?}");
+        assert!(!dst.exists());
+        assert!(staging_leftovers(parent.path()).is_empty());
+    }
+    // ---- round 2: dedupe-independent accounting, reservations, volumes ----
+
+    /// A worktree that does not exist yet is on its nearest existing
+    /// ancestor's volume, not on a shared key.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_worktree_takes_its_ancestors_volume() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("a/b/c");
+        assert_eq!(volume_of(&missing), volume_of(dir.path()));
+        assert_ne!(volume_of(&missing), 0);
+    }
+
+    /// Allocated size follows the DESTINATION's block size: the same one-byte
+    /// file is a 4 KiB charge on one volume and a 64 KiB charge on another.
+    #[cfg(unix)]
+    #[test]
+    fn allocated_size_uses_the_destination_block_size() {
+        let parent = tempdir().unwrap();
+        let src = parent.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("a"), "x").unwrap();
+        let meta = fs::metadata(src.join("a")).unwrap();
+        assert_eq!(allocated(&meta, Some(1 << 16)), 1 << 16);
+        assert!(allocated(&meta, Some(4096)) <= 4096.max(allocated(&meta, None)));
+        // Through the copy: a cap that fits one 4 KiB block refuses the file
+        // on a 64 KiB-block destination.
+        let cap = 8192;
+        let on_64k = CowCaps {
+            max_bytes: cap,
+            block_size: Some(1 << 16),
+            ..CowCaps::DEFAULT
+        };
+        let r = with_forced_byte_copy(|| {
+            copy_dir_staged(
+                &src,
+                &parent.path().join("d64"),
+                on_64k,
+                CopyRules::default(),
+            )
+        });
+        assert!(matches!(r, Err(CopyStop::CapHit { .. })), "{r:?}");
+        let on_4k = CowCaps {
+            block_size: Some(4096),
+            ..on_64k
+        };
+        with_forced_byte_copy(|| {
+            copy_dir_staged(&src, &parent.path().join("d4"), on_4k, CopyRules::default())
+        })
+        .unwrap();
+    }
+
+    /// Concurrent copies' reservations are what a later copy is short of, and
+    /// it says so rather than blaming the floor.
+    #[test]
+    fn a_shortfall_caused_by_concurrent_copies_names_that_reason() {
+        const V: u64 = u64::MAX - 21;
+        let first = Reservation::take(V, 1000, 800);
+        let second = Reservation::take(V, 1000, 800);
+        assert_eq!((first.bytes, first.contended), (800, false));
+        assert_eq!((second.bytes, second.contended), (200, true));
+        // A request the volume could never hold is the floor's, not a
+        // reservation's.
+        let third = Reservation::take(V, 100, 800);
+        assert!(!third.contended);
+        drop((first, second, third));
+    }
+
+    /// A clone-only tree (target/) writes nothing and so holds nothing.
+    #[test]
+    fn a_clone_only_copy_reserves_nothing() {
+        const V: u64 = u64::MAX - 22;
+        let held = Reservation::take(V, 1000, 0);
+        assert_eq!((held.bytes, held.contended), (0, false));
+        let other = Reservation::take(V, 1000, 1000);
+        assert_eq!(other.bytes, 1000);
+    }
+
+    /// Sparse source, so the source tree is cheap: the destination is not.
+    #[test]
+    fn a_huge_file_is_rechecked_between_chunks() {
+        use std::sync::atomic::AtomicU64;
+        let parent = tempdir().unwrap();
+        let src = parent.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::File::create(src.join("huge"))
+            .unwrap()
+            .set_len(3 * RECHECK_EVERY_BYTES)
+            .unwrap();
+        let dst = parent.path().join("dst");
+        let seen = AtomicU64::new(0);
+        let recheck = || {
+            // How much of the file is on disk when the volume is asked.
+            let written = fs::read_dir(parent.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .find(|e| e.file_name().to_string_lossy().contains("gitpulse-partial"))
+                .and_then(|e| fs::metadata(e.path().join("huge")).ok())
+                .map_or(0, |m| m.len());
+            seen.store(written, Ordering::SeqCst);
+            Reading::Value(0)
+        };
+        let r = with_forced_byte_copy(|| {
+            copy_dir_rechecked(
+                &src,
+                &dst,
+                CowCaps::DEFAULT,
+                CopyRules::default(),
+                Some(&recheck),
+            )
+        });
+        assert!(matches!(r, Err(CopyStop::BelowFloor { free: 0 })), "{r:?}");
+        let at_stop = seen.load(Ordering::SeqCst);
+        assert!(
+            at_stop > 0 && at_stop < 3 * RECHECK_EVERY_BYTES,
+            "stopped after {at_stop} of {} bytes",
+            3 * RECHECK_EVERY_BYTES
+        );
+        assert!(!dst.exists());
+        assert!(staging_leftovers(parent.path()).is_empty());
+    }
 }
+
+#[cfg(test)]
+mod adv2;

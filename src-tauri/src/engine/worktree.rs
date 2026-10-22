@@ -394,7 +394,7 @@ const MAX_DIRTY_SCANS: usize = 32;
 /// spawn gate's queue at once, ahead of everything else the app was asking.
 const DIRTY_SCAN_FAN_OUT: usize = 4;
 
-use crate::engine::cow_clone::reflink_ignored_caches;
+use crate::engine::cow_clone::clone_ignored_caches;
 use crate::engine::portless::{detect_worktree_routes, PortlessSnapshot, WorktreeRouteInfo};
 use crate::engine::worktree_hooks::run_repo_hooks;
 
@@ -1933,6 +1933,14 @@ pub struct WorktreeCreated {
     /// not be checked: each one named, with what was copied. A cache that
     /// failed is absent from the worktree, never half there.
     pub cache_error: Option<String>,
+    /// Caches skipped for want of disk (free space below the floor, or a copy
+    /// over the byte cap). Advice, not a failure: the worktree was made.
+    #[serde(default)]
+    pub low_disk: Option<crate::sysload::LowDisk>,
+    /// The volume's free space could not be read, so nothing was skipped on
+    /// its account and nothing is known to be plentiful.
+    #[serde(default)]
+    pub disk_unknown: bool,
     /// A `post_create` hook failed, timed out, or was refused.
     pub hook_error: Option<String>,
     /// Hooks were asked for and the repository's file lists some that were not
@@ -1953,21 +1961,48 @@ pub fn add_worktree_extended(
     cow_caches: bool,
     run_hooks: bool,
 ) -> Result<WorktreeCreated, String> {
+    let selection = crate::engine::cow_clone::CacheSelection::default();
+    add_worktree_cached(
+        repo_path,
+        target_path,
+        new_branch,
+        start_point,
+        detach,
+        cow_caches.then_some(&selection),
+        run_hooks,
+    )
+}
+
+/// [`add_worktree_extended`] with the cache copy's selection (bounds and
+/// free-space reader) given, or `None` for no caches.
+pub fn add_worktree_cached(
+    repo_path: &str,
+    target_path: &str,
+    new_branch: Option<&str>,
+    start_point: Option<&str>,
+    detach: bool,
+    caches: Option<&crate::engine::cow_clone::CacheSelection>,
+    run_hooks: bool,
+) -> Result<WorktreeCreated, String> {
     let path = add_worktree(repo_path, target_path, new_branch, start_point, detach)?;
     let mut created = WorktreeCreated {
         path,
         cache_error: None,
+        low_disk: None,
+        disk_unknown: false,
         hook_error: None,
         hook_notice: None,
     };
-    if cow_caches {
+    if let Some(selection) = caches {
         let repo = validate_repo(repo_path)?;
-        created.cache_error = reflink_ignored_caches(
-            &repo,
-            Path::new(target_path),
-            &crate::engine::cow_clone::CacheSelection::default(),
-        )
-        .err();
+        match clone_ignored_caches(&repo, Path::new(target_path), selection) {
+            Ok(report) => {
+                created.cache_error = report.error();
+                created.low_disk = report.low_disk;
+                created.disk_unknown = report.disk_unknown;
+            }
+            Err(error) => created.cache_error = Some(error),
+        }
     }
     if run_hooks {
         let repo = validate_repo(repo_path)?;

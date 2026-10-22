@@ -677,3 +677,100 @@ fn a_run_leaves_to_the_highest_tier_it_held_and_enters_with_its_binding() {
     assert_eq!(seen.verdict.tier, Tier::Elevated);
     assert_eq!(seen.verdict.binding, Some(Binding::MemoryPressure));
 }
+
+/// Low disk is advice only (owner decision 2026-10-21): with a low_disk
+/// advisory held, every gated site is still admitted, the verdict is the
+/// healthy one, and no deny binding names disk.
+#[test]
+fn low_disk_is_advice_only_at_every_gated_site() {
+    let repo = tempfile::tempdir().unwrap();
+    let repo_path = repo.path().to_str().unwrap();
+    let low = Advisory::LowDisk(LowDisk {
+        cause: crate::sysload::LowDiskCause::BelowFloor,
+        free_bytes: Some(1 << 30),
+        floor_bytes: crate::sysload::LOW_DISK_FLOOR,
+        cap_bytes: None,
+        skipped: vec!["node_modules".to_string()],
+    });
+    note_launch_advisory(repo_path, Some(low.clone()));
+    let report = report();
+    assert_eq!(report.advisory, Some(low));
+    for site in Site::ALL {
+        let admitted = admit_on(site, &report);
+        assert!(admitted.is_ok(), "low disk refused {}", site.name());
+    }
+    assert!(report.verdict.admit);
+    assert_eq!(report.verdict.binding, None);
+    // A pressure deny is unchanged beside it: compressor_thrash still refuses.
+    let mut governor = Governor::default();
+    let (seen, _) = feed(
+        &mut governor,
+        Instant::now(),
+        vec![thrashing(Level::Normal); 3],
+    );
+    assert!(!seen.verdict.admit);
+    assert_eq!(seen.verdict.binding, Some(Binding::CompressorThrash));
+    note_launch_advisory(repo_path, None);
+    assert_eq!(crate::sysload::governor_report().advisory, None);
+}
+
+// ---- adversarial W4-L3 (adv-w4l3) ----
+
+fn adv_low() -> Advisory {
+    Advisory::LowDisk(LowDisk {
+        cause: crate::sysload::LowDiskCause::BelowFloor,
+        free_bytes: Some(1 << 30),
+        floor_bytes: crate::sysload::LOW_DISK_FLOOR,
+        cap_bytes: None,
+        skipped: vec!["node_modules".to_string()],
+    })
+}
+
+fn adv_advisory_events(path: &str) -> usize {
+    crate::ledger::tail(path, 0, 5000)
+        .unwrap()
+        .iter()
+        .filter(|e| e.action == "host_load.advisory")
+        .count()
+}
+
+/// Attack 5: a low launch followed by a fine one clears the live advisory,
+/// but the ledger keeps the low one.
+#[test]
+fn adv_a_cleared_advisory_is_still_in_the_ledger() {
+    let repo = tempfile::tempdir().unwrap();
+    let path = repo.path().to_str().unwrap();
+    note_launch_advisory(path, Some(adv_low()));
+    note_launch_advisory(path, None);
+    assert_eq!(report().advisory, None);
+    assert_eq!(adv_advisory_events(path), 1);
+}
+
+/// Attack 5: the advisory slot is one for the process, not per repository, so
+/// a fine launch in repository B hides repository A's low disk.
+#[test]
+fn adv_one_repos_clean_launch_does_not_hide_anothers_advisory() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    note_launch_advisory(a.path().to_str().unwrap(), Some(adv_low()));
+    note_launch_advisory(b.path().to_str().unwrap(), None);
+    assert!(
+        report().advisory.is_some(),
+        "repository B's clean launch cleared repository A's advisory"
+    );
+}
+
+/// Attack 5: 1000 launches at low disk give a bounded number of events.
+#[test]
+fn adv_a_thousand_low_disk_launches_do_not_write_a_thousand_events() {
+    let repo = tempfile::tempdir().unwrap();
+    let path = repo.path().to_str().unwrap();
+    for _ in 0..1000 {
+        note_launch_advisory(path, Some(adv_low()));
+    }
+    let events = adv_advisory_events(path);
+    assert!(
+        events <= 100,
+        "{events} host_load.advisory events for 1000 identical launches"
+    );
+}

@@ -53,8 +53,9 @@
 //! [`OVERRIDE_WINDOW`], admits what pressure refuses. There is no agent
 //! override.
 
+use super::disk::LowDisk;
 use super::{Level, Platform, SensorReport, SensorState, Snapshot};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -603,6 +604,7 @@ impl Governor {
                 .as_ref()
                 .and_then(|(_, input)| input.largest_foreign),
             override_remaining_s: self.override_remaining(now).map(|d| d.as_secs().max(1)),
+            advisory: None,
         }
     }
 }
@@ -619,6 +621,9 @@ pub struct GovernorReport {
     pub largest_foreign: Option<u64>,
     /// Seconds left of a person's "Admit anyway", when one is live.
     pub override_remaining_s: Option<u64>,
+    /// What the latest worktree build advised: advice only, it never changes
+    /// the verdict or refuses anything.
+    pub advisory: Option<Advisory>,
 }
 
 impl GovernorReport {
@@ -640,6 +645,7 @@ impl GovernorReport {
             notice: false,
             largest_foreign: None,
             override_remaining_s: None,
+            advisory: None,
         }
     }
 }
@@ -671,6 +677,188 @@ impl GovernorPulse {
             largest_foreign: report.largest_foreign,
         }
     }
+}
+
+/// Advice a worktree build leaves for the launch surfaces. It is not a verdict:
+/// nothing here refuses a launch, a checkout or a worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum Advisory {
+    /// Build caches were not copied for want of disk.
+    LowDisk(LowDisk),
+    /// Build caches failed to copy (or could not be checked). The worktree
+    /// was made without them.
+    CacheError { message: String },
+    /// The volume's free space could not be read, so nothing was skipped on
+    /// its account and nothing is known to be plentiful.
+    DiskUnknown,
+    /// More than one of the above in one launch; none hides another.
+    Several { items: Vec<Advisory> },
+}
+
+impl Advisory {
+    /// One advisory from what a launch produced: none, itself, or all.
+    pub fn of(mut items: Vec<Advisory>) -> Option<Advisory> {
+        match items.len() {
+            0 => None,
+            1 => items.pop(),
+            _ => Some(Self::Several { items }),
+        }
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::LowDisk(low) => low.message(),
+            Self::CacheError { message } => format!("build caches were not copied: {message}"),
+            Self::DiskUnknown => "free space could not be read".to_string(),
+            Self::Several { items } => items
+                .iter()
+                .map(Self::message)
+                .collect::<Vec<_>>()
+                .join("; "),
+        }
+    }
+
+    fn name(&self) -> String {
+        match self {
+            Self::LowDisk(_) => "low_disk".to_string(),
+            Self::CacheError { .. } => "cache_error".to_string(),
+            Self::DiskUnknown => "disk_unknown".to_string(),
+            Self::Several { items } => items.iter().map(Self::name).collect::<Vec<_>>().join("+"),
+        }
+    }
+}
+
+/// An identical advisory in one repository is one ledger event per this
+/// interval, carrying how many repeats it stood in for.
+pub const ADVISORY_EVENT_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// Repositories whose advice is held at once; past it the oldest goes.
+const MAX_ADVICE_REPOS: usize = 64;
+
+/// What one repository's launches last advised.
+struct RepoAdvice {
+    repo: String,
+    /// When this repository's launches last noted advice (or none): the
+    /// eviction order.
+    used: Instant,
+    /// The advice now standing, and when it was set.
+    live: Option<(Instant, Advisory)>,
+    /// The last advisory written to the ledger, and when.
+    last_event: Option<(Instant, Advisory)>,
+    /// Identical advisories since then that wrote no event.
+    suppressed: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ADVICE: std::cell::RefCell<Vec<RepoAdvice>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(not(test))]
+static ADVICE: Mutex<Vec<RepoAdvice>> = Mutex::new(Vec::new());
+
+fn with_advice<T>(body: impl FnOnce(&mut Vec<RepoAdvice>) -> T) -> T {
+    #[cfg(test)]
+    return ADVICE.with(|slot| body(&mut slot.borrow_mut()));
+    #[cfg(not(test))]
+    body(
+        &mut ADVICE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// Whether two advisories are the same advice. The measured numbers (free
+/// bytes) move with every launch and are not part of it: they ride in the
+/// event that is written, not in what makes one event a repeat of another.
+fn same_advice(a: &Advisory, b: &Advisory) -> bool {
+    match (a, b) {
+        (Advisory::LowDisk(x), Advisory::LowDisk(y)) => {
+            x.cause == y.cause && x.skipped == y.skipped
+        }
+        (Advisory::Several { items: x }, Advisory::Several { items: y }) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| same_advice(p, q))
+        }
+        _ => a == b,
+    }
+}
+
+/// The most recently set advice across repositories: one repository's clean
+/// launch clears only its own.
+fn latest_advisory() -> Option<Advisory> {
+    with_advice(|all| {
+        all.iter()
+            .filter_map(|advice| advice.live.as_ref())
+            .max_by_key(|(set, _)| *set)
+            .map(|(_, advisory)| advisory.clone())
+    })
+}
+
+/// Records what the worktree build just advised in `repo_path`, or clears
+/// that repository's advice when it advised nothing. Advice only: it is shown
+/// in the report and, deduplicated, in the ledger (`host_load.advisory`), and
+/// never refuses anything.
+pub fn note_launch_advisory(repo_path: &str, advisory: Option<Advisory>) {
+    let now = Instant::now();
+    // One key per repository however its path is spelled (the ledger's own
+    // normalisation).
+    let key = crate::ledger::canonical_repo(repo_path);
+    let write = with_advice(|all| {
+        let at = match all.iter().position(|a| a.repo == key) {
+            Some(at) => at,
+            None => {
+                if all.len() >= MAX_ADVICE_REPOS {
+                    // The least recently used goes, never an active one.
+                    if let Some(oldest) = all
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, a)| a.used)
+                        .map(|(at, _)| at)
+                    {
+                        all.remove(oldest);
+                    }
+                }
+                all.push(RepoAdvice {
+                    repo: key.clone(),
+                    used: now,
+                    live: None,
+                    last_event: None,
+                    suppressed: 0,
+                });
+                all.len() - 1
+            }
+        };
+        let entry = &mut all[at];
+        entry.used = now;
+        entry.live = advisory.clone().map(|a| (now, a));
+        let advisory = advisory?;
+        if let Some((at, previous)) = &entry.last_event {
+            if same_advice(previous, &advisory)
+                && now.saturating_duration_since(*at) < ADVISORY_EVENT_INTERVAL
+            {
+                entry.suppressed += 1;
+                return None;
+            }
+        }
+        let repeats = std::mem::take(&mut entry.suppressed);
+        entry.last_event = Some((now, advisory.clone()));
+        Some((advisory, repeats))
+    });
+    let Some((advisory, repeats)) = write else {
+        return;
+    };
+    log::warn!(target: "host_load", "launch advisory ({}): {}", advisory.name(), advisory.message());
+    let detail = serde_json::json!({
+        "advisory": advisory,
+        "message": advisory.message(),
+        "repeats": repeats,
+    });
+    write_ledger(
+        repo_path,
+        "host_load.advisory",
+        &advisory.name(),
+        crate::ledger::Outcome::Ok,
+        detail,
+    );
 }
 
 /// The places [`admit`] is called: the only gated operations there are.
@@ -793,6 +981,13 @@ impl Input {
 /// process that does not sample (a CLI, the MCP server, a hook) nothing is
 /// governed here.
 pub fn report() -> GovernorReport {
+    GovernorReport {
+        advisory: latest_advisory(),
+        ..governed_report()
+    }
+}
+
+fn governed_report() -> GovernorReport {
     let now = Instant::now();
     #[cfg(test)]
     if let Some(report) = INJECTED.with(|slot| slot.borrow().as_ref().map(|(_, g)| g.report(now))) {
@@ -938,11 +1133,21 @@ fn record(
         "message": verdict.message,
         "warnings": verdict.warnings,
     });
+    write_ledger(repo_path, action, site.name(), outcome, detail);
+}
+
+fn write_ledger(
+    repo_path: &str,
+    action: &'static str,
+    object: &str,
+    outcome: crate::ledger::Outcome,
+    detail: serde_json::Value,
+) {
     let draft = crate::ledger::Draft {
         repo_path: repo_path.to_string(),
         actor_kind: Some(crate::ledger::ActorKind::System),
         action: action.to_string(),
-        object: Some(site.name().to_string()),
+        object: Some(object.to_string()),
         outcome: Some(outcome),
         detail_json: Some(detail.to_string()),
         ..crate::ledger::Draft::default()
@@ -963,5 +1168,7 @@ fn record(
     }
 }
 
+#[cfg(test)]
+mod adv2;
 #[cfg(test)]
 mod tests;

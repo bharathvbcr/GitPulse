@@ -1040,7 +1040,7 @@ fn dropped_appends(repo_path: &str) -> u64 {
 /// Falls back to the path as given when it cannot be canonicalised, which is
 /// what a removed repository needs: a caller still gets a stable answer rather
 /// than an error on a read.
-fn canonical_repo(repo_path: &str) -> String {
+pub(crate) fn canonical_repo(repo_path: &str) -> String {
     std::fs::canonicalize(repo_path)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| repo_path.trim_end_matches('/').to_string())

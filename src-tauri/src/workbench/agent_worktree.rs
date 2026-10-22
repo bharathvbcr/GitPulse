@@ -167,6 +167,23 @@ pub(super) fn provision(
     title: &str,
     accepted: bool,
 ) -> Result<Provisioned, WorkbenchError> {
+    provision_with(
+        selected,
+        run_id,
+        title,
+        accepted,
+        &crate::engine::cow_clone::CacheSelection::default(),
+    )
+}
+
+/// [`provision`] with the cache copy's bounds and free-space reader given.
+fn provision_with(
+    selected: &str,
+    run_id: &str,
+    title: &str,
+    accepted: bool,
+    caches: &crate::engine::cow_clone::CacheSelection,
+) -> Result<Provisioned, WorkbenchError> {
     let source = Path::new(selected);
     let root = main_checkout(source)?;
     let name = lane_name(title, run_id)?;
@@ -217,13 +234,13 @@ pub(super) fn provision(
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     crate::harness::guard_command(selected, &refs)
         .map_err(|e| WorkbenchError::new("policy_refused", e))?;
-    let created = crate::engine::worktree::add_worktree_extended(
+    let created = crate::engine::worktree::add_worktree_cached(
         selected,
         &path_text,
         Some(&branch),
         None,
         false,
-        true,
+        Some(caches),
         // Approved hooks only: an unapproved file is reported, not run.
         true,
     )
@@ -234,10 +251,27 @@ pub(super) fn provision(
         branch,
         created: true,
     };
-    if let Some(cache) = created.cache_error {
-        // Caches only save a rebuild; the agent can work without them.
+    // Caches only save a rebuild; the agent can work without them, so a
+    // skipped or failed copy is advice for the launch surfaces, never a
+    // refusal: Health and the ledger carry it.
+    // Every outcome is advised: a skipped cache never hides a failed one.
+    let mut advised = Vec::new();
+    if let Some(low) = &created.low_disk {
+        advised.push(crate::sysload::Advisory::LowDisk(low.clone()));
+    }
+    if let Some(message) = &created.cache_error {
+        advised.push(crate::sysload::Advisory::CacheError {
+            message: message.clone(),
+        });
+    }
+    if created.disk_unknown {
+        advised.push(crate::sysload::Advisory::DiskUnknown);
+    }
+    let advisory = crate::sysload::Advisory::of(advised);
+    if let Some(cache) = &created.cache_error {
         log::warn!(target: "workbench", "agent worktree {} has no copied build caches: {cache}", provisioned.path);
     }
+    crate::sysload::note_launch_advisory(selected, advisory);
     if let Some(notice) = created.hook_notice {
         log::warn!(target: "workbench", "agent worktree {}: {notice}", provisioned.path);
     }
@@ -508,8 +542,163 @@ pub(super) fn discard(provisioned: &Provisioned) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{provision, slug};
+    use super::{provision, provision_with, slug};
+    use crate::engine::cow_clone::CacheSelection;
     use crate::engine::git_cli::{git_global, git_text};
+    use crate::sysload::{Advisory, LowDiskCause, Reading, Why};
+    use std::path::Path;
+
+    fn plenty(_: &Path) -> Reading<u64> {
+        Reading::Value(500 << 30)
+    }
+    fn nearly_full(_: &Path) -> Reading<u64> {
+        Reading::Value(1 << 30)
+    }
+    fn unreadable(_: &Path) -> Reading<u64> {
+        Reading::Unavailable(Why::Failed)
+    }
+
+    /// A repository with an ignored `node_modules` holding one file.
+    fn repo_with_cache(dir: &Path) -> std::path::PathBuf {
+        let root = dir.join("repo");
+        git_global(&["init", "-b", "main", root.to_str().unwrap()]).unwrap();
+        crate::test_support::trust_repo(&root);
+        std::fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::write(root.join("README.md"), "x\n").unwrap();
+        git_text(&root, &["add", "."]).unwrap();
+        git_text(
+            &root,
+            &[
+                "-c",
+                "user.name=Workbench Test",
+                "-c",
+                "user.email=workbench@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "init",
+            ],
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(
+            root.join("node_modules/pkg/index.js"),
+            "module.exports = 1;\n",
+        )
+        .unwrap();
+        root
+    }
+
+    fn with_reader(free_space: crate::sysload::FreeSpace) -> CacheSelection {
+        CacheSelection {
+            free_space,
+            ..CacheSelection::default()
+        }
+    }
+
+    /// Low disk is advice: the worktree is made and the agent is admitted,
+    /// only the optional cache copy is skipped, and the advisory is typed.
+    #[test]
+    fn low_disk_skips_the_cache_clone_but_still_creates_the_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = repo_with_cache(dir.path());
+        let made = provision_with(
+            root.to_str().unwrap(),
+            "d15c0000-1",
+            "Low disk lane",
+            false,
+            &with_reader(nearly_full),
+        )
+        .expect("low disk must never refuse a worktree");
+        assert!(Path::new(&made.path).join("README.md").is_file());
+        assert!(
+            !Path::new(&made.path).join("node_modules").exists(),
+            "the cache was cloned onto a nearly full volume"
+        );
+        let report = crate::sysload::governor_report();
+        let Some(Advisory::LowDisk(low)) = report.advisory else {
+            panic!("no low_disk advisory: {:?}", report.advisory);
+        };
+        assert_eq!(low.cause, LowDiskCause::BelowFloor);
+        assert_eq!(low.free_bytes, Some(1 << 30));
+        assert_eq!(low.skipped, vec!["node_modules".to_string()]);
+        // Advice never changes the verdict.
+        assert!(report.verdict.admit);
+    }
+
+    #[test]
+    fn plenty_of_space_clones_the_cache_and_advises_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = repo_with_cache(dir.path());
+        let made = provision_with(
+            root.to_str().unwrap(),
+            "d15c0000-2",
+            "Roomy lane",
+            false,
+            &with_reader(plenty),
+        )
+        .unwrap();
+        assert!(Path::new(&made.path)
+            .join("node_modules/pkg/index.js")
+            .is_file());
+        assert_eq!(crate::sysload::governor_report().advisory, None);
+    }
+
+    /// An unreadable volume is unknown, not plenty and not full: nothing is
+    /// skipped on its account, and the advice says it could not be read.
+    #[test]
+    fn an_unreadable_volume_forces_no_skip_and_is_advised_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = repo_with_cache(dir.path());
+        let made = provision_with(
+            root.to_str().unwrap(),
+            "d15c0000-3",
+            "Unknown lane",
+            false,
+            &with_reader(unreadable),
+        )
+        .unwrap();
+        assert!(Path::new(&made.path)
+            .join("node_modules/pkg/index.js")
+            .is_file());
+        assert_eq!(
+            crate::sysload::governor_report().advisory,
+            Some(Advisory::DiskUnknown)
+        );
+    }
+
+    /// A cache that fails to copy is typed into the advisory, not only
+    /// logged, and the worktree is still made.
+    #[test]
+    fn a_cache_error_is_surfaced_as_an_advisory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = repo_with_cache(dir.path());
+        // A node_modules whose entries cannot be walked: a depth bound of
+        // zero fails the copy rather than skipping it.
+        let selection = CacheSelection {
+            caps: crate::engine::cow_clone::CowCaps {
+                max_depth: 0,
+                ..crate::engine::cow_clone::CowCaps::DEFAULT
+            },
+            free_space: plenty,
+            ..CacheSelection::default()
+        };
+        let made = provision_with(
+            root.to_str().unwrap(),
+            "d15c0000-4",
+            "Cache error lane",
+            false,
+            &selection,
+        )
+        .expect("a cache error must not refuse a worktree");
+        assert!(Path::new(&made.path).join("README.md").is_file());
+        let Some(Advisory::CacheError { message }) = crate::sysload::governor_report().advisory
+        else {
+            panic!("cache_error was only logged");
+        };
+        assert!(message.contains("node_modules"), "{message}");
+    }
 
     /// The repository's own setup failed in the new tree, so the agent does
     /// not start there, and the tree and branch made for it are removed. The
@@ -668,5 +857,69 @@ mod tests {
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'));
             assert!(!s.starts_with('-') && !s.contains("--"));
         }
+    }
+
+    // ---- adversarial W4-L3 (adv-w4l3) ----
+
+    fn panicking_reader(_: &Path) -> Reading<u64> {
+        panic!("statvfs reader blew up")
+    }
+
+    /// Attack 1: a panic in the free-space reader must not abort
+    /// provisioning: the worktree is still made.
+    #[test]
+    fn adv_a_panicking_free_space_reader_does_not_abort_provisioning() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = repo_with_cache(dir.path());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            provision_with(
+                root.to_str().unwrap(),
+                "adv-panic-1",
+                "Panic lane",
+                false,
+                &with_reader(panicking_reader),
+            )
+        }));
+        let made = outcome
+            .expect("the reader panic unwound out of provisioning")
+            .expect("provisioning refused");
+        assert!(Path::new(&made.path).join("README.md").is_file());
+    }
+
+    /// Attack 5: a skipped cache and a failed cache in one launch are both
+    /// advised; the low-disk advisory must not swallow the failure.
+    #[test]
+    fn adv_a_low_disk_skip_does_not_hide_a_cache_failure_in_the_same_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = repo_with_cache(dir.path());
+        std::fs::write(root.join(".git/info/exclude"), "node_modules/\n.turbo/\n").unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), vec![b'x'; 100]).unwrap();
+        std::fs::create_dir_all(root.join(".turbo/a/b")).unwrap();
+        std::fs::write(root.join(".turbo/a/b/f"), "x").unwrap();
+        let selection = CacheSelection {
+            caps: crate::engine::cow_clone::CowCaps {
+                max_bytes: 10,
+                max_depth: 1,
+                ..crate::engine::cow_clone::CowCaps::DEFAULT
+            },
+            free_space: plenty,
+            ..CacheSelection::default()
+        };
+        crate::engine::cow_clone::with_forced_byte_copy(|| {
+            provision_with(
+                root.to_str().unwrap(),
+                "adv-both-1",
+                "Both lane",
+                false,
+                &selection,
+            )
+        })
+        .unwrap();
+        let advisory = crate::sysload::governor_report().advisory.expect("advice");
+        let text = advisory.message();
+        assert!(
+            text.contains(".turbo") && text.contains("node_modules"),
+            "only one of the two cache outcomes is advised: {advisory:?}"
+        );
     }
 }
