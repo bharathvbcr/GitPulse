@@ -99,8 +99,17 @@ pub(super) trait TranscriptSource: Sync {
     fn recognises(&self, path: &Path) -> bool;
 
     /// A parser for the file at `path`, to be fed the lines from byte `start`.
-    fn open(&self, path: &Path, start: u64) -> Box<dyn RecordParser>;
+    ///
+    /// A parser that must replay the file's start to read what follows spends
+    /// `budget`, the bytes this pass may still replay across all its files.
+    /// `None` defers the file: its start cannot be replayed within what is left,
+    /// so the pass reads none of it, moves no cursor, and counts it; the next
+    /// pass has a full budget.
+    fn open(&self, path: &Path, start: u64, budget: &mut u64) -> Option<Box<dyn RecordParser>>;
 }
+
+/// Bytes of rollout start one pass may replay, across every file it resumes.
+pub(super) const RESUME_PASS_BYTES: u64 = 256 << 20;
 
 /// Claude Code: `~/.claude/projects/**/*.jsonl`.
 pub(super) struct ClaudeSource;
@@ -155,8 +164,8 @@ impl TranscriptSource for ClaudeSource {
         false
     }
 
-    fn open(&self, _path: &Path, _start: u64) -> Box<dyn RecordParser> {
-        Box::new(ClaudeParser)
+    fn open(&self, _path: &Path, _start: u64, _budget: &mut u64) -> Option<Box<dyn RecordParser>> {
+        Some(Box::new(ClaudeParser))
     }
 }
 

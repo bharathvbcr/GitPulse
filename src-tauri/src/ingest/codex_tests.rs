@@ -73,23 +73,34 @@ fn exec(second: u32, script: &str) -> String {
     )
 }
 
+/// A command, as the ordinary Codex CLI writes it: a `function_call` whose
+/// `arguments` are a JSON string.
 fn run(second: u32, cmd: &str, workdir: &str) -> String {
-    exec(
+    envelope(
         second,
-        &format!(
-            "const r = await tools.exec_command({{cmd:{}, workdir:{}, yield_time_ms:1000}});",
-            serde_json::to_string(cmd).unwrap(),
-            serde_json::to_string(workdir).unwrap()
-        ),
+        "response_item",
+        serde_json::json!({
+            "type": "function_call",
+            "name": "exec_command",
+            "call_id": format!("call_{second}"),
+            "arguments": serde_json::json!({
+                "cmd": cmd, "workdir": workdir, "yield_time_ms": 1000
+            }).to_string(),
+        }),
     )
 }
 
+/// A freeform patch, as the ordinary Codex CLI writes it.
 fn patch(second: u32, header: &str) -> String {
-    exec(
+    envelope(
         second,
-        &format!(
-            "const patch = `*** Begin Patch\n{header}\n+x\n*** End Patch`;\nprint(await tools.apply_patch(patch));"
-        ),
+        "response_item",
+        serde_json::json!({
+            "type": "custom_tool_call",
+            "name": "apply_patch",
+            "call_id": format!("call_{second}"),
+            "input": format!("*** Begin Patch\n{header}\n+x\n*** End Patch"),
+        }),
     )
 }
 

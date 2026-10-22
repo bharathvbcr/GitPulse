@@ -320,10 +320,13 @@ fn ingest_family(
     // A root that is absent where it should not be: the listing is then not the
     // whole corpus, whatever the roots that are there say.
     let mut missing_root = false;
-    // Optional sources whose default root is not there (ENOENT, nothing more).
-    // Whether that is "never installed" or "gone since the last pass" is told
-    // by the cursors, below.
-    let mut absent_optional: Vec<&'static dyn TranscriptSource> = Vec::new();
+    // Whether a saved offset may be forgotten at all this pass. An optional
+    // source's root problems only report: whether they hold anything back is
+    // `track_roots`'s call, from what the source has held before.
+    let mut blocks_forget = false;
+    // An optional source's default root that is not there (ENOENT, nothing more)
+    // is ordinary: "never installed" and "gone since the last pass" are told apart
+    // by the source's marker, below.
     let mut any_root = false;
     for source in source::sources() {
         let Some(root) = source.root() else { continue };
@@ -335,6 +338,7 @@ fn ingest_family(
         // directory the app happens to be in.
         if note && !root.path.is_absolute() {
             missing_root = true;
+            blocks_forget |= !source.optional();
             gaps.push(format!(
                 "the {name} transcript root {shown} is not an absolute path, so its transcripts were not read"
             ));
@@ -344,6 +348,7 @@ fn ingest_family(
             Ok(meta) if meta.is_dir() => active.push((source, root.path)),
             Ok(_) => {
                 missing_root = true;
+                blocks_forget |= !source.optional();
                 if note {
                     gaps.push(format!(
                         "the {name} transcript root {shown} is not a directory, so its transcripts were not read"
@@ -353,13 +358,12 @@ fn ingest_family(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if root.explicit || !source.optional() {
                     missing_root = true;
+                    blocks_forget |= !source.optional();
                     if root.explicit && note {
                         gaps.push(format!(
                             "the {name} transcript root {shown} does not exist, so its transcripts were not read"
                         ));
                     }
-                } else {
-                    absent_optional.push(source);
                 }
             }
             // Present, or not, but not to be told: a permission, a component
@@ -367,6 +371,7 @@ fn ingest_family(
             // with nothing in it.
             Err(e) => {
                 missing_root = true;
+                blocks_forget |= !source.optional();
                 if note {
                     gaps.push(format!(
                         "the {name} transcript root {shown} could not be read ({}), so its transcripts were not read",
@@ -412,40 +417,20 @@ fn ingest_family(
         .collect();
     let mut owners = Owners::default();
 
-    // An optional source's root being absent is ordinary until the source has
-    // been read: once it has, its root vanishing (an unmounted volume, a moved
-    // home) says nothing about its files, and forgetting their cursors would
-    // replay them as duplicate rows when it returns. A marker cursor, kept in
-    // the cursor table beside the others, records "has been read" per worktree,
-    // and is never itself forgotten.
-    let mut markers: HashSet<String> = HashSet::new();
-    for (source, _) in active.iter().filter(|(s, _)| s.optional()) {
-        let key = seen_key(*source);
-        for participant in &mut participants {
-            if !participant.offsets.contains_key(&key) {
-                participant.offsets.insert(key.clone(), 1);
-                participant.pending.push(ledger::TranscriptAdvance {
-                    file_key: key.clone(),
-                    from: None,
-                    to: 1,
-                    fingerprint: None,
-                    drafts: Vec::new(),
-                });
-            }
-        }
-        markers.insert(key);
-    }
-    for source in &absent_optional {
-        let key = seen_key(*source);
-        if participants.iter().any(|p| p.offsets.contains_key(&key)) {
-            missing_root = true;
-        }
-        markers.insert(key);
-    }
+    // Every optional source has one marker cursor per worktree, in the cursor
+    // table beside the file cursors, never listed by a walk and never forgotten.
+    // Its fingerprint text holds the roots (newline-separated, the latest eight)
+    // that held transcripts of that source. See `track_roots`.
+    let markers: HashSet<String> = source::sources()
+        .iter()
+        .filter(|source| source.optional())
+        .map(|source| seen_key(*source))
+        .collect();
 
     // Each source is walked on its own, under its own file cap and entry
     // budget: a source with a huge corpus cannot starve another of its listing.
     let mut files: Vec<(&'static dyn TranscriptSource, std::path::PathBuf)> = Vec::new();
+    let mut read_roots: Vec<(&'static dyn TranscriptSource, &std::path::Path, usize)> = Vec::new();
     let mut walk = Walk::none();
     for (source, root) in &active {
         let mut listed_here = Vec::new();
@@ -461,8 +446,18 @@ fn ingest_family(
             ));
         }
         walk.absorb(&walked);
+        read_roots.push((*source, root.as_path(), listed_here.len()));
         files.extend(listed_here.into_iter().map(|path| (*source, path)));
     }
+    track_roots(
+        &mut participants,
+        &active,
+        &read_roots,
+        &mut gaps,
+        &mut missing_root,
+        &mut blocks_forget,
+    );
+    let walks_complete = walk.complete;
     walk.complete &= !missing_root;
     if active.len() > 1 {
         files = single_owner(files, &active);
@@ -478,6 +473,7 @@ fn ingest_family(
     out.refused_outside_corpus = walk.refused_outside_corpus;
     out.walk_complete = Some(walk.complete);
     let mut listed = markers;
+    let mut resume_budget = source::RESUME_PASS_BYTES;
     for (source, path) in files {
         if expired(&out) {
             out.truncated = true;
@@ -527,7 +523,12 @@ fn ingest_family(
             }
         };
         out.transcripts += 1;
-        let mut parser = source.open(&path, start);
+        let Some(mut parser) = source.open(&path, start, &mut resume_budget) else {
+            // Its start cannot be replayed within this pass's budget: nothing is
+            // read and no cursor moves, so the next pass tries again. Counted.
+            out.skipped_lines += 1;
+            continue;
+        };
 
         let mut drafts: Vec<Vec<ledger::Draft>> = owed.iter().map(|_| Vec::new()).collect();
         let mut touched: HashSet<usize> = HashSet::new();
@@ -746,7 +747,7 @@ fn ingest_family(
     // corpus: a file missing from a partial listing may still exist, and
     // forgetting its offset would replay it. Hosted owners hold cursors too,
     // for the files this pass met them in.
-    let forgets = walk.complete && !out.truncated;
+    let forgets = walks_complete && !blocks_forget && !out.truncated;
     if forgets {
         for participant in participants.into_iter().chain(owners.hosted) {
             let gone: Vec<String> = participant
@@ -790,6 +791,89 @@ fn ingest_family(
         };
     }
     out
+}
+
+/// How many roots a marker remembers.
+const MAX_MARKER_ROOTS: usize = 8;
+
+/// Keeps each optional source's marker, and holds forgetting back when a root
+/// that held transcripts is not among the roots read now.
+///
+/// Cursors are keyed by a hash of the file's path, so a cursor cannot be told
+/// from another source's. A root that held transcripts and is not read this pass
+/// (an unmounted volume, a `CODEX_HOME` pointed elsewhere and back) may hold
+/// files the pass cannot list; forgetting their cursors would replay them as
+/// duplicate rows when the root returns. So a root recorded in a marker and
+/// absent now stops every forget this pass, with the root and the reason in
+/// `gaps`. A root that held nothing is never recorded, and never blocks.
+fn track_roots(
+    participants: &mut [Participant],
+    active: &[(&'static dyn TranscriptSource, std::path::PathBuf)],
+    read_roots: &[(&'static dyn TranscriptSource, &std::path::Path, usize)],
+    gaps: &mut Vec<String>,
+    missing_root: &mut bool,
+    blocks_forget: &mut bool,
+) {
+    for source in source::sources().iter().filter(|s| s.optional()) {
+        let key = seen_key(*source);
+        let mut recorded: Vec<String> = Vec::new();
+        for participant in participants.iter() {
+            for root in participant
+                .fingerprints
+                .get(&key)
+                .map(String::as_str)
+                .unwrap_or_default()
+                .lines()
+            {
+                if !recorded.iter().any(|known| known == root) {
+                    recorded.push(root.to_string());
+                }
+            }
+        }
+        for root in &recorded {
+            let read_now = active.iter().any(|(s, path)| {
+                s.actor_id() == source.actor_id() && path.to_string_lossy() == root.as_str()
+            });
+            if read_now {
+                continue;
+            }
+            *missing_root = true;
+            *blocks_forget = true;
+            if !gaps.iter().any(|gap| gap.contains(root.as_str())) {
+                gaps.push(format!(
+                    "the {} transcript root {root} held transcripts earlier and is not readable now, so no saved offset was forgotten",
+                    source.name()
+                ));
+            }
+        }
+        let mut roots = recorded.clone();
+        for (read, path, files) in read_roots {
+            let shown = path.to_string_lossy();
+            if read.actor_id() == source.actor_id()
+                && *files > 0
+                && !roots.iter().any(|known| known == shown.as_ref())
+            {
+                roots.push(shown.into_owned());
+            }
+        }
+        if roots.len() == recorded.len() {
+            continue;
+        }
+        let keep = roots.len().saturating_sub(MAX_MARKER_ROOTS);
+        let text = roots[keep..].join("\n");
+        for participant in participants.iter_mut() {
+            let from = participant.offsets.get(&key).copied();
+            participant.offsets.insert(key.clone(), 1);
+            participant.fingerprints.insert(key.clone(), text.clone());
+            participant.pending.push(ledger::TranscriptAdvance {
+                file_key: key.clone(),
+                from,
+                to: 1,
+                fingerprint: Some(text.clone()),
+                drafts: Vec::new(),
+            });
+        }
+    }
 }
 
 type Listed = Vec<(&'static dyn TranscriptSource, std::path::PathBuf)>;

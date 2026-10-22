@@ -10,7 +10,13 @@ fn parser() -> Box<dyn RecordParser> {
         .into_iter()
         .find(|s| s.actor_id() == "codex")
         .unwrap();
-    codex.open(std::path::Path::new("/nonexistent/rollout.jsonl"), 0)
+    codex
+        .open(
+            std::path::Path::new("/nonexistent/rollout.jsonl"),
+            0,
+            &mut 0,
+        )
+        .unwrap()
 }
 
 fn feed(lines: &[String]) -> (Vec<transcript::ToolCall>, i64) {
@@ -220,137 +226,49 @@ fn p06_argv_with_non_strings_is_counted_and_a_huge_argv_is_bounded_in_the_ledger
     assert!(stored < 64 * 1024, "stored object is {stored} bytes");
 }
 
+/// A code-mode `exec`: one counted skip, never a row, whatever the script says.
 fn js(script: &str) -> (Vec<transcript::ToolCall>, i64) {
     feed(&[session_meta("T", "/r"), exec(1, script)])
 }
 
-#[test]
-fn p07a_a_call_in_a_comment_is_not_a_call() {
-    let (calls, _) = js("// tools.exec_command({cmd:'rm -rf /'})\n/* tools.exec_command({cmd:'rm -rf ~'}) */\nawait tools.exec_command({cmd:'ls'})");
-    assert_eq!(
-        commands(&calls),
-        vec!["ls"],
-        "phantom commands from comments"
-    );
+fn assert_one_code_mode_skip(script: &str) {
+    let (calls, skipped) = js(script);
+    assert!(calls.is_empty(), "a row from code mode: {script:?}");
+    assert_eq!(skipped, 1, "{script:?}");
 }
 
 #[test]
-fn p07b_a_call_inside_a_string_literal_is_not_a_call() {
-    let (calls, _) = js(r#"console.log("tools.exec_command({cmd:'rm -rf /'})");"#);
-    assert!(
-        commands(&calls).is_empty(),
-        "phantom: {:?}",
-        commands(&calls)
-    );
-}
-
-#[test]
-fn p07c_a_call_inside_a_string_inside_a_call_is_one_command() {
-    let (calls, _) = js(r#"tools.exec_command({cmd:"echo 'tools.exec_command({cmd:\"y\"})'"})"#);
-    assert_eq!(calls.len(), 1, "{:?}", commands(&calls));
-    let (calls, _) = js(r#"tools.exec_command({cmd:"printf 'tools.exec_command({cmd:\'x\'})'"})"#);
-    assert_eq!(calls.len(), 1, "{:?}", commands(&calls));
-}
-
-#[test]
-fn p07d_a_template_with_interpolation_is_counted_not_guessed() {
-    let (calls, skipped) =
-        js("const x='a'; await tools.exec_command({cmd:`echo ${x}`, workdir:'/r'})");
-    assert!(calls.is_empty());
-    assert_eq!(skipped, 1);
-}
-
-#[test]
-fn p07e_a_backtick_literal_spanning_lines_is_read_whole() {
-    let (calls, _) =
-        js("await tools.exec_command({cmd:`line1\nline2 \\` quoted`, workdir:'/r/x'})");
-    assert_eq!(commands(&calls), vec!["line1\nline2 ` quoted"]);
-    assert_eq!(calls[0].cwd, "/r/x");
-}
-
-#[test]
-fn p07f_unterminated_and_escaped_literals_never_panic_and_are_counted() {
-    for src in [
+fn p07_code_mode_is_one_counted_skip_and_never_a_row() {
+    // Round 1 (p07a-g): comments, strings, interpolation, spellings. By ruling
+    // none of it is read: the only honest answer is the count.
+    for script in [
+        "// tools.exec_command({cmd:'rm -rf /'})\nawait tools.exec_command({cmd:'ls'})",
+        r#"console.log("tools.exec_command({cmd:'rm -rf /'})");"#,
+        r#"tools.exec_command({cmd:"echo 'tools.exec_command({cmd:\"y\"})'"})"#,
+        "const x='a'; await tools.exec_command({cmd:`echo ${x}`, workdir:'/r'})",
+        "await tools.exec_command({cmd:`line1\nline2 \\` quoted`, workdir:'/r/x'})",
         "tools.exec_command({cmd:'abc",
-        "tools.exec_command({cmd:\"abc\\",
-        "tools.exec_command({cmd:`abc${",
-        "tools.exec_command({cmd:'\\u{FFFFFFFFFF}'})",
-        "tools.exec_command({cmd:'\\ud83d\\ude00'})",
-        "tools.exec_command({cmd:'a'",
-        "tools.exec_command({cmd:'é\\é'})",
-    ] {
-        let (calls, skipped) = js(src);
-        assert!(calls.is_empty(), "{src}");
-        assert_eq!(skipped, 1, "{src}");
-    }
-    let (calls, _) = js(r#"tools.exec_command({cmd:"echo \"x\" 'y'"})"#);
-    assert_eq!(commands(&calls), vec![r#"echo "x" 'y'"#]);
-}
-
-#[test]
-fn p07g_other_spellings_of_the_call_are_counted_not_silently_missed() {
-    for src in [
         "const t = tools; await t.exec_command({cmd:'rm x'})",
-        "await tools.exec_command ({cmd:'rm x'})",
         "await tools['exec_command']({cmd:'rm x'})",
-        "const { exec_command } = tools; await exec_command({cmd:'rm x'})",
         "await tools.exec_command?.({cmd:'rm x'})",
     ] {
-        let (calls, skipped) = js(src);
-        assert!(
-            !calls.is_empty() || skipped > 0,
-            "silently dropped (neither read nor counted): {src}"
-        );
+        assert_one_code_mode_skip(script);
     }
 }
 
 #[test]
-fn p08_a_context_line_that_looks_like_a_patch_header_is_not_a_file() {
-    let patch = "*** Begin Patch\n*** Update File: real.rs\n@@\n *** Update File: phantom.rs\n-x\n+y\n+*** Add File: added-text.rs\n*** End Patch";
-    let (calls, _) = feed(&[
-        session_meta("T", "/r"),
-        envelope(
-            1,
-            "response_item",
-            serde_json::json!({"type":"custom_tool_call","name":"apply_patch","input":patch,"call_id":"c"}),
-        ),
-    ]);
-    let files: Vec<_> = calls.iter().filter_map(|c| c.file_path.clone()).collect();
-    assert_eq!(files, vec!["/r/real.rs"], "phantom edits: {files:?}");
-}
-
-#[test]
-fn p09_a_quadratic_hostile_script_is_bounded() {
-    // 8 MB of unterminated calls: each of the first 256 scans to the end.
-    let unit = "tools.exec_command({cmd:`";
-    let script = unit.repeat((8 << 20) / unit.len());
-    let started = std::time::Instant::now();
-    let (calls, skipped) = js(&script);
-    let took = started.elapsed();
-    eprintln!("p09 hostile 8MB script: {took:?}");
-    assert!(calls.is_empty());
-    assert!(skipped >= 1);
-    assert!(
-        took < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(2)),
-        "an 8 MB hostile script took {took:?}"
-    );
-}
-
-/// The scan is one linear pass: a script under the byte budget made of
-/// unterminated calls (each of which once rescanned to the end) is read fast.
-#[test]
-fn p09b_a_script_under_the_budget_of_unterminated_calls_is_linear() {
-    let unit = "tools.exec_command({cmd:`";
-    let script = unit.repeat((1 << 20) / unit.len());
-    let started = std::time::Instant::now();
-    let (calls, skipped) = js(&script);
-    let took = started.elapsed();
-    assert!(calls.is_empty());
-    assert!(skipped >= 1);
-    assert!(
-        took < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(2)),
-        "a 1 MB script took {took:?}"
-    );
+fn p09_a_hostile_script_costs_one_skip_and_no_time() {
+    for size in [8 << 20, 1 << 20] {
+        let unit = "tools.exec_command({cmd:`";
+        let script = unit.repeat(size / unit.len());
+        let started = std::time::Instant::now();
+        assert_one_code_mode_skip(&script);
+        let took = started.elapsed();
+        assert!(
+            took < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(2)),
+            "a {size} byte script took {took:?}"
+        );
+    }
 }
 
 // ------------------------------------------------------------ 2. attribution
@@ -388,10 +306,7 @@ fn a01_a_dotdot_workdir_is_attributed_to_where_it_resolves() {
             session_meta("A", w1),
             run(1, "absolute-dotdot", &format!("{w1}/../w2")),
             run(2, "relative-dotdot", "../w2"),
-            exec(
-                3,
-                "await tools.apply_patch(`*** Begin Patch\n*** Update File: ../w2/f.rs\n+x\n*** End Patch`)",
-            ),
+            patch(3, "*** Update File: ../w2/f.rs"),
         ],
     );
     assert_eq!(out.recorded, 3, "{out:?}");

@@ -346,6 +346,11 @@ fn under(path: &str, root: &str) -> bool {
     }
     let (path, root) = (lexical(path), lexical(root));
     let (path, root) = (path.as_ref(), root.as_ref());
+    // A root is an absolute path. A relative one (or one that resolves to
+    // nothing, like `.`) names no directory, so it owns nothing.
+    if !root.starts_with('/') {
+        return false;
+    }
     let root = root.trim_end_matches('/');
     if path == root {
         return true;

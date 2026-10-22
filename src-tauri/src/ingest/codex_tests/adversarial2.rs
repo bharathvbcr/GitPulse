@@ -10,7 +10,12 @@ fn parser() -> Box<dyn RecordParser> {
         .into_iter()
         .find(|s| s.actor_id() == "codex")
         .unwrap()
-        .open(std::path::Path::new("/nonexistent/rollout.jsonl"), 0)
+        .open(
+            std::path::Path::new("/nonexistent/rollout.jsonl"),
+            0,
+            &mut 0,
+        )
+        .unwrap()
 }
 
 /// `(commands read, lines/calls counted unread)` for one `exec` script.
@@ -25,154 +30,63 @@ fn js(script: &str) -> (Vec<String>, i64) {
     (cmds, skipped)
 }
 
-// ------------------------------------------------------------ 1. the lexer
+// ------------------------------------------------------- 1. code mode (ruled)
 
-#[test]
-fn l01a_division_then_a_real_call_is_a_call() {
-    let (cmds, skipped) = js("const x = a / b / tools.exec_command({cmd:'real'});");
-    assert_eq!((cmds, skipped), (vec!["real".to_string()], 0));
+/// Round 2 showed the code-mode scanner wrong both ways (a real call lost to a
+/// division it took for a regex; a fake one built from a regex literal). By
+/// ruling the scanner is gone: every one of these is one counted skip and no
+/// row, so none can be lost silently or fabricated.
+fn assert_one_skip(script: &str) {
+    let (cmds, skipped) = js(script);
+    assert_eq!((cmds, skipped), (Vec::new(), 1), "{script:?}");
 }
 
 #[test]
-fn l01b_a_regex_literal_holding_a_call_is_not_a_call_and_the_next_call_is_read() {
-    let (cmds, skipped) =
-        js("x = /tools.exec_command({cmd:'fake'})/; await tools.exec_command({cmd:'ok'})");
-    assert_eq!((cmds, skipped), (vec!["ok".to_string()], 0));
-}
-
-/// `n++ / 2` is a division; the lexer takes the `/` after `+` for a regex start
-/// and the regex runs to the next `/` on the line: the `//` of a trailing
-/// comment. The real call between them is swallowed and counted as "seen".
-#[test]
-fn l01c_a_real_call_is_not_hidden_by_a_division_after_a_postfix_increment() {
-    let (cmds, skipped) = js("n++ / 2; await tools.exec_command({cmd:'real'}); // done");
-    assert!(
-        cmds == vec!["real".to_string()] || skipped > 0,
-        "REAL CALL LOST SILENTLY: cmds={cmds:?} skipped={skipped}"
-    );
+fn l01_the_scripts_that_fooled_the_lexer_are_one_counted_skip_each() {
+    for script in [
+        "const x = a / b / tools.exec_command({cmd:'real'});",
+        "x = /tools.exec_command({cmd:'fake'})/; await tools.exec_command({cmd:'ok'})",
+        "n++ / 2; await tools.exec_command({cmd:'real'}); // done",
+        "const h = {a:1}.a; const o = {a:4}\n/ 2; await tools.exec_command({cmd:'real'}); const r = 6 / 3;",
+        "(async()=>{ return /tools.exec_command({cmd:'fake'})/.test('x') })()",
+        "const f = () => { return /'/.test(s) }; await tools.exec_command({cmd:'real'}); const q = 'x'",
+    ] {
+        assert_one_skip(script);
+    }
 }
 
 #[test]
-fn l01d_a_division_after_a_closing_brace_does_not_hide_a_real_call() {
-    let (cmds, skipped) = js("const h = {a:1}.a; const o = {a:4}\n/ 2; await tools.exec_command({cmd:'real'}); const r = 6 / 3;");
-    assert!(
-        cmds == vec!["real".to_string()] || skipped > 0,
-        "REAL CALL LOST SILENTLY: cmds={cmds:?} skipped={skipped}"
-    );
-}
-
-/// After `return`/`typeof`/`case` a `/` starts a regex; the lexer sees an
-/// identifier and takes it for division, so the regex body is lexed as code.
-#[test]
-fn l01e_a_regex_after_return_holding_a_call_is_not_a_fabricated_call() {
-    let (cmds, _) = js("(async()=>{ return /tools.exec_command({cmd:'fake'})/.test('x') })()");
-    assert!(cmds.is_empty(), "FABRICATED: {cmds:?}");
-}
-
-#[test]
-fn l01f_a_quote_inside_a_regex_after_return_does_not_swallow_the_next_real_call() {
-    let (cmds, skipped) =
-        js("const f = () => { return /'/.test(s) }; await tools.exec_command({cmd:'real'}); const q = 'x'");
-    assert!(
-        cmds == vec!["real".to_string()] || skipped > 0,
-        "REAL CALL LOST SILENTLY: cmds={cmds:?} skipped={skipped}"
-    );
-}
-
-#[test]
-fn l02a_nested_templates_keep_depth_and_the_next_call_is_read() {
-    let (cmds, skipped) = js(
+fn l02_templates_escapes_names_and_line_ends_are_one_counted_skip_each() {
+    for script in [
         "const s = `a ${ `inner ${ 1+1 } x` } b ${ {k:'}'}.k }`; await tools.exec_command({cmd:'after'})",
-    );
-    assert_eq!((cmds, skipped), (vec!["after".to_string()], 0));
-}
-
-#[test]
-fn l02b_an_escaped_backtick_does_not_end_a_template() {
-    let (cmds, skipped) = js(
         "const s = `a \\` tools.exec_command({cmd:'fake'}) b`; await tools.exec_command({cmd:'real'})",
-    );
-    assert_eq!((cmds, skipped), (vec!["real".to_string()], 0));
-}
-
-#[test]
-fn l02c_a_unicode_escaped_identifier_is_a_call_or_is_counted() {
-    let mut lost = Vec::new();
-    for src in [
         "await tools.exec_comman\\u0064({cmd:'rm x'})",
         "await tools.\\u0065xec_command({cmd:'rm x'})",
         "await tools['exec_' + 'command']({cmd:'rm x'})",
         "await tools[`exec_command`]({cmd:'rm x'})",
+        "const s = '</script>'; const t = 'a\\\r\nb'; await tools.exec_command({cmd:'real'})",
+        "// note\rawait tools.exec_command({cmd:'real'})",
+        "// note\u{2028}await tools.exec_command({cmd:'real'})",
+        "await tools.exec_command({cmd:'a'}); /* tools.exec_command({cmd:'b'})",
     ] {
-        let (cmds, skipped) = js(src);
-        if cmds.is_empty() && skipped == 0 {
-            lost.push(src);
-        }
+        assert_one_skip(script);
     }
-    assert!(lost.is_empty(), "REAL CALLS LOST SILENTLY: {lost:?}");
 }
 
 #[test]
-fn l02d_a_script_closing_tag_string_and_crlf_continuations_do_not_hide_a_call() {
-    let (cmds, skipped) =
-        js("const s = '</script>'; const t = 'a\\\r\nb'; await tools.exec_command({cmd:'real'})");
-    assert_eq!((cmds, skipped), (vec!["real".to_string()], 0));
-}
-
-/// JS ends a `//` comment at `\r` (and U+2028/U+2029) as well as `\n`.
-#[test]
-fn l02e_a_line_comment_ends_at_a_lone_carriage_return() {
-    let mut lost = Vec::new();
-    for sep in ["\r", "\u{2028}", "\u{2029}"] {
-        let (cmds, skipped) = js(&format!(
-            "// note{sep}await tools.exec_command({{cmd:'real'}})"
-        ));
-        if !(cmds == vec!["real".to_string()] || skipped > 0) {
-            lost.push(sep);
-        }
-    }
-    assert!(
-        lost.is_empty(),
-        "REAL CALL LOST SILENTLY after a comment ended by {lost:?}"
-    );
-}
-
-#[test]
-fn l02f_an_unterminated_comment_at_eof_hides_only_what_it_covers() {
-    let (cmds, skipped) =
-        js("await tools.exec_command({cmd:'a'}); /* tools.exec_command({cmd:'b'})");
-    assert_eq!((cmds, skipped), (vec!["a".to_string()], 0));
-}
-
-#[test]
-fn l03_a_script_over_two_mib_is_one_counted_skip_and_exactly_two_mib_is_read() {
+fn l03_a_script_of_any_size_is_one_counted_skip() {
     let unit = "await tools.exec_command({cmd:'real'});\n";
-    let over = unit.repeat((2 << 20) / unit.len() + 1);
-    assert!(over.len() > 2 << 20);
-    let started = std::time::Instant::now();
-    let (cmds, skipped) = js(&over);
-    eprintln!(
-        "l03: {} real calls in the script, counted skipped={skipped}, took {:?}",
-        over.matches("tools.exec_command").count(),
-        started.elapsed()
-    );
-    assert!(cmds.is_empty());
-    assert_eq!(skipped, 1);
-    let mut under = unit.repeat((2 << 20) / unit.len());
-    under.truncate(2 << 20);
-    let (cmds, skipped) = js(&under);
-    assert!(
-        !cmds.is_empty() && skipped > 0,
-        "a script at the bound was not scanned: {} cmds, skipped {skipped}",
-        cmds.len()
-    );
+    for len in [2 << 20, (2 << 20) + 1, 8 << 20] {
+        let mut script = unit.repeat(len / unit.len() + 1);
+        script.truncate(len);
+        assert_one_skip(&script);
+    }
 }
 
-/// A deterministic fuzz over the lexer's own alphabet: never panics, and the
-/// number of commands it reads never exceeds the number of occurrences of the
-/// call name in the text.
+/// A deterministic fuzz over the old lexer's alphabet: a code-mode call is one
+/// skip and never a row, never a panic.
 #[test]
-fn l04_the_lexer_never_panics_on_its_own_alphabet() {
+fn l04_any_script_is_one_counted_skip() {
     let atoms = [
         "tools",
         ".",
@@ -200,8 +114,8 @@ fn l04_the_lexer_never_panics_on_its_own_alphabet() {
         "cmd:",
         "workdir:",
         "a",
-        "é",
-        "😀",
+        "\u{e9}",
+        "\u{1f600}",
         "=",
         "+",
         "return ",
@@ -220,11 +134,7 @@ fn l04_the_lexer_never_panics_on_its_own_alphabet() {
         let script: String = (0..len)
             .map(|_| atoms[(next() % atoms.len() as u64) as usize])
             .collect();
-        let (cmds, _) = js(&script);
-        assert!(
-            cmds.len() <= script.matches("exec_command").count(),
-            "{script:?} -> {cmds:?}"
-        );
+        assert_one_skip(&script);
     }
 }
 
@@ -442,7 +352,8 @@ fn r03_bench_resume_replay_cost() {
     let mut times = Vec::new();
     for _ in 0..7 {
         let started = std::time::Instant::now();
-        let _ = codex.open(&path, len);
+        let mut budget = u64::MAX;
+        let _ = codex.open(&path, len, &mut budget);
         times.push(started.elapsed().as_secs_f64() * 1000.0);
     }
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());

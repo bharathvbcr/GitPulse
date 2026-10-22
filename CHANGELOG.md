@@ -17,13 +17,23 @@ before that tag is pushed.
   read only Claude Code transcripts, so work done by Codex, which GitPulse
   already hosts and counts live, never reached the ledger. Transcripts are now
   read through one source per agent. Codex rollouts
-  (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, or
-  `GITPULSE_CODEX_TRANSCRIPT_ROOT`) become `session.edit` and `session.command`
-  rows with `actor_id` `codex`, attributed to worktrees by the same path and
-  `cwd` rules as Claude's. Claude rows are unchanged.
-  - It reads the format Codex CLI 0.149.1 writes. A line in any other shape, a
-    shell or patch call in a shape it does not know, and a command that is not
-    a string literal are counted in `skipped_lines`, never guessed.
+  (`$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`, `CODEX_HOME` defaulting
+  to `~/.codex`, or `GITPULSE_CODEX_TRANSCRIPT_ROOT`, which wins) become
+  `session.edit` and `session.command` rows with `actor_id` `codex`, attributed
+  to worktrees by the same path and `cwd` rules as Claude's. Claude rows are
+  unchanged.
+  - It reads Codex's structured tool calls: `function_call` `exec_command` and
+    `shell`, `local_shell_call`, and `custom_tool_call` `apply_patch`. A line in
+    any other shape, and a shell or patch call in a shape it does not know, are
+    counted in `skipped_lines`, never guessed.
+  - **Code-mode rollouts are counted, not parsed.** A `custom_tool_call` named
+    `exec` (what the Codex SDK writes) is a JavaScript program, and what it runs
+    cannot be read from its text. Each one is a single skipped call and never a
+    row, so a session that runs in code mode is under-recorded by exactly that
+    count.
+  - A relative `CODEX_HOME` or override is refused with a reason. Paths are
+    resolved lexically (`.`/`..`) and compared by whole components for every
+    source, so a `../` call is attributed to where it lands.
   - Each source is walked under its own depth and file caps. `walk_complete`
     is true only when every walked source was whole, the unlisted counts add
     across sources, and a saved offset is forgotten only after such a walk.
