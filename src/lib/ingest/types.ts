@@ -30,6 +30,12 @@ export interface CatchUp {
    * root. Not unread transcripts, so not in `transcripts_unlisted`.
    */
   refused_outside_corpus: number;
+  /**
+   * Saved transcript offsets whose file this pass's walk did not list and that
+   * it did not forget (forgetting held back, or a forget that failed). Zero
+   * after a pass that forgot them.
+   */
+  stale_cursors?: number;
   /** Whether the walk listed the whole corpus; null when no walk ran. */
   walk_complete?: boolean | null;
   skipped_lines: number;

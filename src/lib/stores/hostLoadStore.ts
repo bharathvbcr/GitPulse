@@ -234,6 +234,18 @@ export interface GovernorVerdict {
   warnings: string[];
 }
 
+/** `sysload::LowDiskCause`: what bound the cache copy. */
+export type LowDiskCause = "below_floor" | "byte_cap" | "headroom_reserved";
+
+/** `sysload::LowDisk`: why caches were not copied for want of disk. */
+export interface LowDisk {
+  cause: LowDiskCause;
+  free_bytes: number | null;
+  floor_bytes: number;
+  cap_bytes: number | null;
+  skipped: string[];
+}
+
 /**
  * `sysload::Advisory`: what the latest worktree build advised. Advice only:
  * it never refuses a launch, a checkout or a worktree.
@@ -241,7 +253,7 @@ export interface GovernorVerdict {
 export type Advisory =
   | {
       reason: "low_disk";
-      cause: "below_floor" | "byte_cap" | "headroom_reserved";
+      cause: LowDiskCause;
       free_bytes: number | null;
       floor_bytes: number;
       cap_bytes: number | null;

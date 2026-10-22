@@ -7,13 +7,21 @@ fn cmds_of(src: &str) -> (Vec<String>, Vec<&'static str>) {
     (p.commands.iter().map(|c| c.cmd.clone()).collect(), p.skips)
 }
 
-#[allow(clippy::disallowed_methods)] // a read-only `ps` of this process, test only
+/// Peak resident set of this process in KiB, read in-process (no subprocess).
+/// A leak only ever raises the peak, so growth across a loop shows here.
 fn rss_kib() -> usize {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    // SAFETY: `rusage` is plain data and `getrusage` only writes into it.
+    let usage = unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        assert_eq!(libc::getrusage(libc::RUSAGE_SELF, &mut usage), 0);
+        usage
+    };
+    // macOS reports ru_maxrss in bytes, Linux in KiB.
+    if cfg!(target_os = "macos") {
+        usage.ru_maxrss as usize / 1024
+    } else {
+        usage.ru_maxrss as usize
+    }
 }
 
 const C: &str = "tools.exec_command({cmd:'X'})";

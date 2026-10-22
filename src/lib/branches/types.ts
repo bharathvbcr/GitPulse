@@ -1,3 +1,5 @@
+import type { LowDisk } from "../stores/hostLoadStore";
+
 export interface BranchInfo {
   name: string;
   is_current: boolean;
@@ -351,6 +353,10 @@ export interface WorktreeCreated {
   path: string;
   /** Some build cache could not be copied (or checked); each is named, and none is left half-copied. */
   cache_error: string | null;
+  /** Caches skipped for want of disk; advice, not a failure (the worktree was made). */
+  low_disk?: LowDisk | null;
+  /** The volume's free space could not be read, so nothing is known to be plentiful. */
+  disk_unknown?: boolean;
   /** A `post_create` hook failed, timed out, or was refused. */
   hook_error: string | null;
   /** Hooks were asked for but the repository's file was not approved, so none ran. */
