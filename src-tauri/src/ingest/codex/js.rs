@@ -683,6 +683,9 @@ fn decode_unicode(
 }
 
 #[cfg(test)]
+mod adv;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
