@@ -113,3 +113,71 @@ Found but not filed, as small residuals or in cards other lanes hold:
    - `git worktree remove` for each `.claude/worktrees/agent-*` from this run, plus `tmp/warm`, `tmp/gate`, `tmp/gate2` and `tmp/gate3`;
    - then `rm -rf` any leftover directories.
 5. **Process note.** Agent `isolation: worktree` lanes branch from `origin/main`, which is 76 commits behind the unpushed local `main`. Every lane merged local `main` before its results counted. Pushing `main` would remove this hazard.
+
+---
+
+# Wave 3 (2026-10-21): after the owner said "merge all, clean branches, next wave"
+
+**State.**
+- Waves 1–2 are merged: `main` fast-forwarded to `ec818492`.
+- 20 worktrees and 22 merged branches were removed. Free disk went from 42 to 183 GiB.
+- `gitpulse-mcp` and `gitpulse-hook` were reinstalled; `mcp:doctor` is OK.
+- Wave 3 is on **`b21/integrate`**: 36 files, about +7.3k / −0.3k lines against `ec818492`.
+- Merging it to `main` waits for the owner.
+
+**Owner decisions taken during wave 3:**
+- Bindings: the conservative fix, later replaced by **B+** after the adversary showed the first design widened access.
+- Accept the sensor card. Manvi held it in review because no verification record exists.
+- Codex ingest: **yes**.
+- File "unbound is unfenced" as its own card.
+
+## Cards moved to review
+
+| Card | What landed | Adversarial history |
+|---|---|---|
+| **ft-b93b397e**: red test `terminal_output_emits` hidden batching | **Not a code bug.** This host's 10 ms sleeps take about 66 ms, so the producer stretched to 10 s; the same code passed on 10-17. The test now paces by clock spin, with the 10× assertion unchanged. 10/10 pass. | Opus-reviewed (test-only change). The assertion stays meaningful. |
+| **ft-8db24db8**: macOS QoS tiering | Background-class children and `devmap build` are demoted from the parent with `setpriority(PRIO_DARWIN_PROCESS, pid, PRIO_DARWIN_BG)`, which keeps the posix_spawn fast path; `pre_exec` measured +35–95%. Rayon gets `RAYON_NUM_THREADS = ncpu/2`. Background scopes run at UTILITY QoS and are restored afterwards; user-facing scopes nested inside one are lifted back. The sampler's App Nap Activity is held only while `host_load.enabled`. | 1 break fixed: a nested user-facing scope stayed at UTILITY. MCP read latency showed no difference beyond noise (max 0.33 s). **Live ACs unmeasured** (load 12–118): soak, responsiveness harness, pmset. |
+| **ft-369f85a3**: governor 1c shedding | Closed by evidence: commit 73163a50 already implements every AC on main. No code change. | n/a |
+| **ft-ae3490e7**: binding authority | **B+**: insertion-order precedence everywhere, including ingest attribution history. A sibling's legacy status is decided once, at the anchor's initial pass; this is crash-safe, and an upgrade from an old build counts present siblings as legacy. Later siblings and appended rows are history-only. The demotion count surfaces on the MCP view and status. The birth-time check is gone. | Round 1: the approved design **widened access**, because unbound means unfenced; 0/5 legacy bindings resolved, and birth time was forgeable. Owner chose B+. Round 2: crash, no-epoch upgrade and fresh-install windows, plus notice reach; all fixed. The gate then found a **descriptor leak** (fresh SQLite connections per call) and bisected it here; fixed. |
+| **ft-9d044a74**: Codex transcript ingest | A `TranscriptSource` trait: Claude is unchanged (digest pinned), and Codex covers the structured shapes from the codex-rs source. **Code-mode JS is counted, not parsed** (Fable B): the hand lexer both lost and fabricated calls. So **this machine records 0 Codex rows today**, because all local rollouts are code-mode. | 3 rounds. Fixed: forget on an unreadable root, `..` attribution (a byte-prefix bug shared with Claude), phantom commands, a 153 s hostile line, resume cwd loss, root-switch replay, ownership. Round 3: the forget invariant HELD in 11/11 attacks. |
+| **Red reflog tests** (no card; filed under the gate) | **Not a code bug.** git 2.54's auto-maintenance expires reflog entries older than 30 days. The fixtures' fixed epoch 2026-09-21 crossed 30 days on 10-21. The hermetic test git config now disables it; production is unaffected. | Root cause shown with a git-only repro (51 vs 251 entries). |
+
+## Gate (verified)
+
+**Gate 5 on `b21/integrate` @ `45ec47b6`, all green:**
+- fmt, clippy `-D warnings`;
+- `cargo test --tests --no-fail-fast`: **125/125 binaries OK**;
+- `bun run check`, `check:ipc`;
+- full vitest: **772/772 files, 10834 passed**.
+
+The run was at host load 94–118.
+
+Gate 4 had caught the descriptor leak above. Its other failures were proven load flakes by interleaved runs against main:
+- `ten_thousand_binds`: min as_of 0.64 s on the lane vs 0.99 s on main;
+- the two vitest script tests pass 37/37 alone on both trees.
+
+## Benchmarks
+
+- **QoS:** +~0.5 ms per *background* spawn; non-background spawns add no syscall. MCP read p50/p95 shows no difference beyond noise. A heavy `git diff --stat` runs about 1.8× slower when banded.
+- **Codex ingest, Claude-only pass:** 20.7 ms on the lane vs 24.5 ms on base (min of 6), but host noise exceeded 5%, so no claim is made.
+
+## New cards filed
+
+- **ft-92734a91** (owner decision): an unbound worktree has no task-scope fence, so any path to "no binding" widens access.
+- **ft-001bf7fc**: the ledger does not dedup transcript rows after a cursor reset. Pre-existing; affects Claude too.
+- **ft-02a20716**: stale transcript cursors accumulate once a source has recorded 2 or more roots. Liveness only.
+- **ft-a2936457** (from wave 2): its reverted patch now lives in the card's logs.
+
+## Still open
+
+- **ft-d902fcb4** (governor 1b): every AC is met by main except S5-07, the low-disk check.
+- Blocked on held files (ft-42081f16 `hooks/mod.rs`; ft-0ac24164 `terminal/mod.rs`): ft-9cfd5574, ft-9cfd5474, the hook half of ft-da85cd55, ft-9cfd5374 and ft-a2936457.
+- **ft-cc4be67b** (translucency A/B): measurement-only, and meaningless at this host load.
+
+## Owner decisions pending
+
+1. **Merge `b21/integrate` to `main`.**
+2. **Codex code-mode:** approve a JS parser dependency (option C) if you want code-mode rollouts recorded. Today they are counted only.
+3. **ft-92734a91:** should unbound worktrees be fenced?
+4. **QoS behaviour to confirm:** every `gitpulse-mcp` and `gitpulsed` child is banded, because those processes' default class is Background.
+5. **Host:** an orphaned TERM-ignoring busy loop (pid 36903, from DevCouncil corpora) ran at 99% CPU for 5 h. It is not ours, and it was not killed. Host load reached 118 during this wave.
