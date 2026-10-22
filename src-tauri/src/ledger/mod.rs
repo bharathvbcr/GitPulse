@@ -3746,7 +3746,26 @@ fn import_legacy_page(
                 event.action = bindings::base_action(&event.action).to_string();
                 same_event_payload(&existing, &event)
             });
+            // A transcript row's ulid is derived from its identity, so two
+            // ledgers that each read one line hold it under one ulid, with
+            // their own `ts_utc`. The same identity is the same row, already
+            // here. A different identity under that ulid is a collision of its
+            // 80-bit body: the row is not imported, nothing is overwritten, and
+            // the lost row is counted as a failed write. Neither stops the
+            // consolidation of everything else.
+            let transcript_key =
+                |event: &LedgerEvent| event.detail_json.as_deref().and_then(transcript_row_of);
             if !same_row {
+                if let Some(incoming) = transcript_key(event) {
+                    if existing.as_ref().and_then(transcript_key).as_ref() != Some(&incoming) {
+                        log::warn!(
+                            "legacy transcript row {} collides with a different row",
+                            event.ulid
+                        );
+                        record_dropped_append(anchor);
+                    }
+                    continue;
+                }
                 return Err(LedgerError::new(
                     "legacy_ulid_conflict",
                     format!(

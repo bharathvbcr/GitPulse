@@ -1625,6 +1625,160 @@ mod tests {
         assert!(status.error.contains("legacy_ulid_conflict"));
     }
 
+    fn transcript_draft(worktree: &str, key: &str) -> Draft {
+        Draft {
+            repo_path: worktree.to_string(),
+            worktree_path: Some(worktree.to_string()),
+            actor_kind: Some(ActorKind::Agent),
+            actor_id: Some("claude-code".to_string()),
+            session_id: Some("S".to_string()),
+            action: "session.edit".to_string(),
+            outcome: Some(Outcome::Ok),
+            detail_json: Some(
+                serde_json::json!({"source": "transcript", crate::ledger::TRANSCRIPT_ROW_KEY: key})
+                    .to_string(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn advance(repo: &str, key: &str, from: Option<u64>) -> i64 {
+        super::super::advance_transcripts(
+            repo,
+            repo,
+            vec![super::super::TranscriptAdvance {
+                file_key: "f".to_string(),
+                from,
+                to: 1,
+                fingerprint: None,
+                drafts: vec![transcript_draft(repo, key)],
+            }],
+        )
+        .expect("advance")
+    }
+
+    fn stored_keys(repo: &str) -> Vec<String> {
+        tail(repo, 0, 100)
+            .expect("rows")
+            .iter()
+            .filter_map(|e| {
+                e.detail_json
+                    .as_deref()
+                    .and_then(super::super::transcript_row_of)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_ulid_held_by_a_different_transcript_identity_is_counted_and_never_overwritten() {
+        let repo = git_repo();
+        let repo_path = repo.path().to_str().expect("utf8 repository");
+        assert_eq!(advance(repo_path, "aa:0:0:01", None), 1);
+        // Force the collision: the row held under that ulid now names another line.
+        super::super::with_conn(repo_path, |conn| {
+            conn.execute(
+                "UPDATE events SET detail_json = json_set(detail_json, '$.transcript_row', 'bb:0:0:02')",
+                [],
+            )
+            .map_err(|e| LedgerError::new("fixture_failed", e.to_string()))?;
+            Ok(())
+        })
+        .expect("tamper");
+        let dropped = repository_status(repo_path).expect("status").dropped;
+        super::super::forget_transcripts(repo_path, repo_path, &["f".to_string()]).expect("forget");
+        assert_eq!(advance(repo_path, "aa:0:0:01", None), 0, "nothing recorded");
+        assert_eq!(
+            repository_status(repo_path).expect("status").dropped,
+            dropped + 1,
+            "the lost row is a counted failed write"
+        );
+        assert_eq!(
+            stored_keys(repo_path),
+            ["bb:0:0:02"],
+            "nothing overwritten, nothing added"
+        );
+    }
+
+    #[test]
+    fn one_transcript_row_in_two_sibling_ledgers_consolidates_once_whatever_its_ts_utc() {
+        let repo = git_repo();
+        let (_parent, worktree) = linked_worktree(repo.path());
+        let repo_path = repo.path().to_str().expect("utf8 repository");
+        assert_eq!(advance(&worktree, "aa:0:0:01", None), 1);
+        let legacy = tail(&worktree, 0, 10).expect("legacy source").remove(0);
+        // The anchor read the same line itself, a moment later.
+        super::super::with_conn(repo_path, |conn| {
+            conn.execute(
+                "INSERT INTO events (
+                     ulid, ts_utc, schema_version, repo_path, worktree_path,
+                     actor_kind, actor_id, session_id, action, outcome, detail_json
+                 ) VALUES (?1, '2030-01-01T00:00:00.000Z', 1, ?2, ?3, 'agent',
+                           'claude-code', 'S', 'session.edit', 'ok', ?4)",
+                rusqlite::params![
+                    legacy.ulid,
+                    super::super::canonical_repo(repo_path),
+                    worktree,
+                    legacy.detail_json
+                ],
+            )
+            .map_err(|e| LedgerError::new("fixture_failed", e.to_string()))?;
+            Ok(())
+        })
+        .expect("anchor row");
+        repository_address(repo_path).expect("consolidation must not fail on a repeated row");
+        let status = repository_status(repo_path).expect("status");
+        assert!(status.recording, "{status:?}");
+        assert_eq!(stored_keys(repo_path), ["aa:0:0:01"]);
+    }
+
+    #[test]
+    fn a_colliding_transcript_row_in_a_sibling_ledger_is_counted_and_consolidation_goes_on() {
+        let repo = git_repo();
+        let (_parent, worktree) = linked_worktree(repo.path());
+        let repo_path = repo.path().to_str().expect("utf8 repository");
+        assert_eq!(advance(&worktree, "aa:0:0:01", None), 1);
+        append(Draft {
+            repo_path: worktree.clone(),
+            worktree_path: Some(worktree.clone()),
+            action: "git.commit".to_string(),
+            actor_kind: Some(ActorKind::Human),
+            outcome: Some(Outcome::Ok),
+            ..Default::default()
+        })
+        .expect("another legacy row");
+        let legacy = tail(&worktree, 0, 10).expect("legacy source").remove(0);
+        super::super::with_conn(repo_path, |conn| {
+            conn.execute(
+                "INSERT INTO events (
+                     ulid, ts_utc, schema_version, repo_path, worktree_path,
+                     actor_kind, actor_id, session_id, action, outcome, detail_json
+                 ) VALUES (?1, ?2, 1, ?3, ?4, 'agent', 'claude-code', 'S',
+                           'session.edit', 'ok', ?5)",
+                rusqlite::params![
+                    legacy.ulid,
+                    legacy.ts_utc,
+                    super::super::canonical_repo(repo_path),
+                    worktree,
+                    serde_json::json!({crate::ledger::TRANSCRIPT_ROW_KEY: "bb:0:0:02"}).to_string()
+                ],
+            )
+            .map_err(|e| LedgerError::new("fixture_failed", e.to_string()))?;
+            Ok(())
+        })
+        .expect("colliding anchor row");
+        repository_address(repo_path).expect("a collision must not fail the consolidation");
+        let status = repository_status(repo_path).expect("status");
+        assert!(status.recording, "{status:?}");
+        assert!(status.dropped >= 1, "{status:?}");
+        assert_eq!(stored_keys(repo_path), ["bb:0:0:02"]);
+        let actions: Vec<String> = tail(repo_path, 0, 100)
+            .expect("rows")
+            .into_iter()
+            .map(|e| e.action)
+            .collect();
+        assert!(actions.iter().any(|a| a == "git.commit"), "{actions:?}");
+    }
+
     #[test]
     fn resolving_a_binding_never_creates_the_main_ledger_for_a_sibling_that_has_one() {
         let repo = git_repo();
