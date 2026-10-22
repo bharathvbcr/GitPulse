@@ -6933,3 +6933,6 @@ mod adversarial_cap_tests;
 
 #[cfg(test)]
 mod adv_l5_tests;
+
+#[cfg(test)]
+mod adv2_w4l1_tests;
