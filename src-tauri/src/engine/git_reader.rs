@@ -11550,9 +11550,9 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             "Canonical Person <canon@example.com> <old@example.com>\n",
         )
         .unwrap();
-        std::fs::write(
-            home.join(".gitconfig"),
-            format!("[mailmap]\n\tfile = {}\n", mailmap.display()),
+        crate::test_support::env::write_git_config(
+            &home.join(".gitconfig"),
+            &format!("[mailmap]\n\tfile = {}\n", mailmap.display()),
         )
         .unwrap();
         mailmap

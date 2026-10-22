@@ -1173,7 +1173,14 @@ fn closing_the_pool_ends_idle_workers() {
     pool.submit(Box::new(move || done.send(()).unwrap()))
         .unwrap();
     finished.recv_timeout(Duration::from_secs(5)).unwrap();
-    std::thread::sleep(Duration::from_millis(50));
+    let waited = Instant::now();
+    while pool.lock().idle < 1 {
+        assert!(
+            waited.elapsed() < coverage_relaxed(Duration::from_secs(5)),
+            "the worker never went back to waiting"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
     assert_eq!(pool.lock().idle, 1, "the worker should be waiting");
     pool.close();
     let waited = Instant::now();
