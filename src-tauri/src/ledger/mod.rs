@@ -1592,6 +1592,34 @@ fn with_conn<T>(
     }
 }
 
+/// Runs `f` on this process's already-open connection to the ledger, or returns
+/// `None` when there is none (never opened, or its file was replaced). It never
+/// opens, creates or caches anything.
+///
+/// For the small reads every resolve makes (the family's pass marker, the
+/// history-only count). Each used to open a fresh read-only connection, and
+/// SQLite keeps a descriptor of a connection closed while another connection to
+/// the same inode is open until that inode is fully released: a burst of
+/// concurrent resolves (a hundred terminal sessions) left one descriptor per
+/// concurrent open, for as long as the shared connection lived.
+fn with_live_conn<T>(
+    repo_path: &str,
+    f: impl FnOnce(&Connection) -> Result<T, LedgerError>,
+) -> Option<Result<T, LedgerError>> {
+    let db_path = ledger_path(repo_path);
+    let slot = registry().lock().ok()?.get(&db_path).cloned()?;
+    let guard = slot.conn.lock().ok()?;
+    let live = guard.as_ref()?;
+    if live.file.is_some() && file_id(&db_path) != live.file {
+        return None;
+    }
+    Some(f(&live.conn))
+}
+
+/// One read-only fallback connection at a time, for a process with no live one:
+/// it bounds the descriptors such opens can leave behind to one.
+static FALLBACK_OPEN: Mutex<()> = Mutex::new(());
+
 /// Begins a write transaction that takes the write lock up front.
 ///
 /// A deferred transaction that reads first and writes later must upgrade its
@@ -3077,13 +3105,21 @@ fn read_family_epoch(conn: &Connection) -> Result<(FamilyEpoch, bool), LedgerErr
 /// pass.
 fn family_pass_state(anchor: &str) -> Result<(FamilyEpoch, bool), LedgerError> {
     let none = (FamilyEpoch::Initial, false);
-    let Some(conn) = open_readonly(&ledger_path(anchor))? else {
-        return Ok(none);
+    let read = |conn: &Connection| {
+        if has_table(conn, "ledger_family_imports")? {
+            read_family_epoch(conn)
+        } else {
+            Ok(none)
+        }
     };
-    if !has_table(&conn, "ledger_family_imports")? {
-        return Ok(none);
+    if let Some(state) = with_live_conn(anchor, read) {
+        return state;
     }
-    read_family_epoch(&conn)
+    let _one_at_a_time = FALLBACK_OPEN.lock().unwrap_or_else(|e| e.into_inner());
+    match open_readonly(&ledger_path(anchor))? {
+        Some(conn) => read(&conn),
+        None => Ok(none),
+    }
 }
 
 /// Whether recording a marker in the anchor could succeed: a ledger the caller
@@ -3156,11 +3192,8 @@ pub(crate) fn settle_fresh_family(anchor: &str) -> Result<(), LedgerError> {
 /// imported after the initial pass). `None` when the ledger cannot be read: the
 /// caller must not read that as "none".
 pub(crate) fn history_only_binding_count(anchor: &str) -> Option<u64> {
-    let counted = || -> Result<Option<u64>, LedgerError> {
-        let Some(conn) = open_readonly(&ledger_path(anchor))? else {
-            return Ok(Some(0));
-        };
-        if !has_table(&conn, "events")? {
+    let count = |conn: &Connection| -> Result<Option<u64>, LedgerError> {
+        if !has_table(conn, "events")? {
             return Ok(Some(0));
         }
         conn.query_row(
@@ -3170,6 +3203,16 @@ pub(crate) fn history_only_binding_count(anchor: &str) -> Option<u64> {
         )
         .map(|count| Some(count.max(0) as u64))
         .map_err(|error| LedgerError::new("query_failed", error.to_string()))
+    };
+    let counted = || -> Result<Option<u64>, LedgerError> {
+        if let Some(found) = with_live_conn(anchor, count) {
+            return found;
+        }
+        let _one_at_a_time = FALLBACK_OPEN.lock().unwrap_or_else(|e| e.into_inner());
+        match open_readonly(&ledger_path(anchor))? {
+            Some(conn) => count(&conn),
+            None => Ok(Some(0)),
+        }
     };
     counted().unwrap_or_else(|error| {
         log::warn!(target: "ledger", "could not count history-only binding rows: {error}");
