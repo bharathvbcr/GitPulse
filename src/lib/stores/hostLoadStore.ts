@@ -241,7 +241,7 @@ export interface GovernorVerdict {
 export type Advisory =
   | {
       reason: "low_disk";
-      cause: "below_floor" | "byte_cap";
+      cause: "below_floor" | "byte_cap" | "headroom_reserved";
       free_bytes: number | null;
       floor_bytes: number;
       cap_bytes: number | null;

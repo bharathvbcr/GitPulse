@@ -192,6 +192,11 @@ function advice(advisory: Advisory, refused: boolean): string[] {
         return [`Low disk advice: ${names} was not copied into the last worktree (over ${cap}).`];
       }
       const free = advisory.free_bytes === null ? "unknown" : bytes(advisory.free_bytes);
+      if (advisory.cause === "headroom_reserved") {
+        return [
+          `Low disk advice: ${free} free, but the headroom is reserved by concurrent copies, so ${names} was not copied into the last worktree.`,
+        ];
+      }
       const unaffected = refused ? "." : "; launches are not affected.";
       return [`Low disk advice: ${free} free, so ${names} was not copied into the last worktree${unaffected}`];
     }

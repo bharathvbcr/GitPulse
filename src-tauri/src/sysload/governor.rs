@@ -738,6 +738,9 @@ const MAX_ADVICE_REPOS: usize = 64;
 /// What one repository's launches last advised.
 struct RepoAdvice {
     repo: String,
+    /// When this repository's launches last noted advice (or none): the
+    /// eviction order.
+    used: Instant,
     /// The advice now standing, and when it was set.
     live: Option<(Instant, Advisory)>,
     /// The last advisory written to the ledger, and when.
@@ -764,6 +767,21 @@ fn with_advice<T>(body: impl FnOnce(&mut Vec<RepoAdvice>) -> T) -> T {
     )
 }
 
+/// Whether two advisories are the same advice. The measured numbers (free
+/// bytes) move with every launch and are not part of it: they ride in the
+/// event that is written, not in what makes one event a repeat of another.
+fn same_advice(a: &Advisory, b: &Advisory) -> bool {
+    match (a, b) {
+        (Advisory::LowDisk(x), Advisory::LowDisk(y)) => {
+            x.cause == y.cause && x.skipped == y.skipped
+        }
+        (Advisory::Several { items: x }, Advisory::Several { items: y }) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| same_advice(p, q))
+        }
+        _ => a == b,
+    }
+}
+
 /// The most recently set advice across repositories: one repository's clean
 /// launch clears only its own.
 fn latest_advisory() -> Option<Advisory> {
@@ -781,15 +799,27 @@ fn latest_advisory() -> Option<Advisory> {
 /// never refuses anything.
 pub fn note_launch_advisory(repo_path: &str, advisory: Option<Advisory>) {
     let now = Instant::now();
+    // One key per repository however its path is spelled (the ledger's own
+    // normalisation).
+    let key = crate::ledger::canonical_repo(repo_path);
     let write = with_advice(|all| {
-        let at = match all.iter().position(|a| a.repo == repo_path) {
+        let at = match all.iter().position(|a| a.repo == key) {
             Some(at) => at,
             None => {
                 if all.len() >= MAX_ADVICE_REPOS {
-                    all.remove(0);
+                    // The least recently used goes, never an active one.
+                    if let Some(oldest) = all
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, a)| a.used)
+                        .map(|(at, _)| at)
+                    {
+                        all.remove(oldest);
+                    }
                 }
                 all.push(RepoAdvice {
-                    repo: repo_path.to_string(),
+                    repo: key.clone(),
+                    used: now,
                     live: None,
                     last_event: None,
                     suppressed: 0,
@@ -798,10 +828,12 @@ pub fn note_launch_advisory(repo_path: &str, advisory: Option<Advisory>) {
             }
         };
         let entry = &mut all[at];
+        entry.used = now;
         entry.live = advisory.clone().map(|a| (now, a));
         let advisory = advisory?;
         if let Some((at, previous)) = &entry.last_event {
-            if *previous == advisory && now.saturating_duration_since(*at) < ADVISORY_EVENT_INTERVAL
+            if same_advice(previous, &advisory)
+                && now.saturating_duration_since(*at) < ADVISORY_EVENT_INTERVAL
             {
                 entry.suppressed += 1;
                 return None;

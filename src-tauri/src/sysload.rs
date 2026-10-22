@@ -45,7 +45,7 @@ mod sampler;
 mod sensor;
 mod snapshot;
 
-pub use disk::{free_bytes, FreeSpace, LowDisk, LowDiskCause, LOW_DISK_FLOOR};
+pub use disk::{block_size, free_bytes, FreeSpace, LowDisk, LowDiskCause, LOW_DISK_FLOOR};
 pub use governor::{
     admit, admit_anyway, admit_on, decide, grant_override, note_launch_advisory,
     report as governor_report, shed, Admitted, Advisory, Binding, Governor, GovernorPulse,

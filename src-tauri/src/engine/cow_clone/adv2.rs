@@ -55,8 +55,10 @@ fn adv2_two_volumes_and_nested_do_not_deadlock() {
 
 #[test]
 fn adv2_volume_of_missing_path_collapses_to_shared_key_zero() {
+    // Re-pointed (round 2, item 7): a missing path takes the volume of its
+    // nearest existing ancestor; only a path with no ancestor shares key 0.
     let d = tempdir().unwrap();
-    assert_eq!(volume_of(&d.path().join("nope")), 0);
+    assert_eq!(volume_of(&d.path().join("nope")), volume_of(d.path()));
     assert_ne!(volume_of(d.path()), 0);
 }
 
@@ -77,8 +79,17 @@ fn adv2_one_huge_file_is_rechecked_only_after_it_is_fully_written() {
     f.set_len(200 << 20).unwrap();
     drop(f);
     let calls = AtomicUsize::new(0);
+    let written_at_stop = std::sync::atomic::AtomicU64::new(0);
+    let partial = parent.path().to_path_buf();
     let recheck = || {
         calls.fetch_add(1, Ordering::SeqCst);
+        let written = fs::read_dir(&partial)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| e.file_name().to_string_lossy().contains("gitpulse-partial"))
+            .and_then(|e| fs::metadata(e.path().join("huge")).ok())
+            .map_or(0, |m| m.len());
+        written_at_stop.store(written, Ordering::SeqCst);
         Reading::Value(0)
     };
     let r = with_forced_byte_copy(|| {
@@ -91,31 +102,50 @@ fn adv2_one_huge_file_is_rechecked_only_after_it_is_fully_written() {
         )
     });
     assert!(matches!(r, Err(CopyStop::BelowFloor { free: 0 })), "{r:?}");
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "checked once, after the whole 200 MiB"
+    // Re-pointed (round 2, item 4): the check runs between chunks, so the
+    // copy stops mid-file, not after all 200 MiB are written.
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let at_stop = written_at_stop.load(Ordering::SeqCst);
+    assert!(
+        at_stop > 0 && at_stop < (200 << 20),
+        "stopped after {at_stop} bytes of 200 MiB"
     );
     assert_eq!(leftovers(parent.path()), 0);
 }
 
 #[test]
 fn adv2_unreadable_recheck_continues_silently() {
-    let parent = tempdir().unwrap();
-    let src = parent.path().join("src");
-    fs::create_dir_all(&src).unwrap();
-    for i in 0..3 {
-        fs::write(src.join(format!("f{i}")), vec![1u8; 70 << 20]).unwrap();
+    // Re-pointed (round 2, item 5): an unreadable reading mid-copy lets the
+    // copy continue and sets `disk_unknown`.
+    use std::sync::atomic::AtomicUsize;
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn readable_once(_: &Path) -> Reading<u64> {
+        if CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
+            Reading::Value(LOW_DISK_FLOOR + (8 << 30))
+        } else {
+            Reading::Unavailable(Why::Failed)
+        }
     }
-    let recheck = || Reading::Unavailable(Why::Failed);
-    let r = with_forced_byte_copy(|| {
-        copy_dir_rechecked(
-            &src,
-            &parent.path().join("dst"),
-            CowCaps::DEFAULT,
-            CopyRules::default(),
-            Some(&recheck),
+    let (main, _parent, linked) = crate::test_support::repo_with_worktrees(1);
+    fs::create_dir_all(main.path().join(".git/info")).unwrap();
+    fs::write(main.path().join(".git/info/exclude"), "node_modules/\n").unwrap();
+    let worktree = linked.into_iter().next().unwrap();
+    let anchor = main.path().canonicalize().unwrap();
+    fs::create_dir_all(anchor.join("node_modules")).unwrap();
+    for i in 0..3 {
+        fs::write(
+            anchor.join(format!("node_modules/f{i}")),
+            vec![1u8; 70 << 20],
         )
-    });
-    assert!(r.is_ok(), "{r:?}");
+        .unwrap();
+    }
+    let selection = CacheSelection {
+        free_space: readable_once,
+        ..CacheSelection::default()
+    };
+    let report =
+        with_forced_byte_copy(|| clone_ignored_caches(&anchor, &worktree, &selection)).unwrap();
+    assert_eq!(report.copied.len(), 1, "{report:?}");
+    assert!(report.low_disk.is_none());
+    assert!(report.disk_unknown, "an unreadable re-check was not noted");
 }

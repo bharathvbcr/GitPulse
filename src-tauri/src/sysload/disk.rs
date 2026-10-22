@@ -54,6 +54,33 @@ fn available_bytes(avail_blocks: u64, frsize: u64, bsize: u64) -> u64 {
     avail_blocks.saturating_mul(unit)
 }
 
+/// The block size of the volume holding `path` (`statvfs` `f_bsize`), which
+/// is what a file written there is rounded up to. `None` when it cannot be
+/// read.
+#[cfg(unix)]
+pub fn block_size(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut fs = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: a NUL-terminated path and one statvfs buffer.
+    if unsafe { libc::statvfs(c_path.as_ptr(), fs.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: filled by the kernel.
+    let fs = unsafe { fs.assume_init() };
+    // `f_frsize` is the allocation unit; `f_bsize` is the preferred transfer
+    // size (1 MiB on APFS), which would charge a 100-byte file a megabyte.
+    #[allow(clippy::useless_conversion)]
+    let (frsize, bsize) = (u64::from(fs.f_frsize), u64::from(fs.f_bsize));
+    let size = if frsize == 0 { bsize } else { frsize };
+    (size > 0).then_some(size)
+}
+
+#[cfg(not(unix))]
+pub fn block_size(_path: &Path) -> Option<u64> {
+    None
+}
+
 /// Windows has no reader here: unknown, so nothing is skipped on a guess.
 #[cfg(not(unix))]
 pub fn free_bytes(_path: &Path) -> Reading<u64> {
@@ -69,6 +96,9 @@ pub enum LowDiskCause {
     BelowFloor,
     /// A copy would have written more than the byte cap.
     ByteCap,
+    /// The volume had the headroom, but concurrent copies in this process had
+    /// reserved it.
+    HeadroomReserved,
 }
 
 /// Why caches were not copied for want of disk. Advice: the worktree itself
@@ -93,6 +123,10 @@ impl LowDisk {
                 "low disk: {} free, below the {} the build caches must leave, so {what} was not copied into the new worktree",
                 self.free_bytes.map_or_else(|| "unknown".to_string(), gib),
                 gib(self.floor_bytes),
+            ),
+            LowDiskCause::HeadroomReserved => format!(
+                "low disk: {} free, but the headroom above the floor is reserved by concurrent copies, so {what} was not copied into the new worktree",
+                self.free_bytes.map_or_else(|| "unknown".to_string(), gib),
             ),
             LowDiskCause::ByteCap => format!(
                 "low disk: copying {what} would write more than the {} byte cap, so it was not copied into the new worktree",
