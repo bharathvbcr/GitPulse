@@ -585,11 +585,14 @@ pub const TRANSCRIPT_ROW_KEY: &str = "transcript_row";
 /// The [`TranscriptRow::key`] in a draft's `detail_json`, or `None` for any
 /// other row.
 fn transcript_row_of(detail: &str) -> Option<String> {
-    if !detail.contains(TRANSCRIPT_ROW_KEY) {
-        return None;
-    }
-    let value: serde_json::Value = serde_json::from_str(detail).ok()?;
-    Some(value.get(TRANSCRIPT_ROW_KEY)?.as_str()?.to_string())
+    // A key is hex digits and colons, so it holds nothing JSON would escape; a
+    // quote inside some other string value is escaped and cannot match here.
+    let marker = format!("\"{TRANSCRIPT_ROW_KEY}\":\"");
+    let start = detail.find(&marker)? + marker.len();
+    let key = &detail[start..start + detail[start..].find('"')?];
+    key.bytes()
+        .all(|b| b.is_ascii_hexdigit() || b == b':')
+        .then(|| key.to_string())
 }
 
 /// The three `detail_json` keys that carry event time: `occurred_at`,
@@ -1958,8 +1961,9 @@ fn insert_transcript_row(
     conn: &Connection,
     event: &Prepared,
 ) -> Result<TranscriptInsert, LedgerError> {
-    let sql = format!("{INSERT_SQL} ON CONFLICT(ulid) DO NOTHING");
-    if let Some(id) = insert_with(conn, event, &sql)? {
+    static SQL: OnceLock<String> = OnceLock::new();
+    let sql = SQL.get_or_init(|| format!("{INSERT_SQL} ON CONFLICT(ulid) DO NOTHING"));
+    if let Some(id) = insert_with(conn, event, sql)? {
         return Ok(TranscriptInsert::Recorded(id));
     }
     let held: Option<Option<String>> = conn
