@@ -26,11 +26,15 @@ before that tag is pushed.
     `shell`, `local_shell_call`, and `custom_tool_call` `apply_patch`. A line in
     any other shape, and a shell or patch call in a shape it does not know, are
     counted in `skipped_lines`, never guessed.
-  - **Code-mode rollouts are counted, not parsed.** A `custom_tool_call` named
-    `exec` (what the Codex SDK writes) is a JavaScript program, and what it runs
-    cannot be read from its text. Each one is a single skipped call and never a
-    row, so a session that runs in code mode is under-recorded by exactly that
-    count.
+  - **Code-mode rollouts are parsed, within bounds.** A `custom_tool_call` named
+    `exec` (what the Codex SDK writes) is a JavaScript program, read with
+    tree-sitter-javascript. A straight-line `tools.exec_command({cmd, workdir})`
+    or `tools.apply_patch(...)` with literal arguments (escapes decoded) becomes
+    a row like a structured call. Every other call, such as one in a function,
+    loop or conditional, with a computed name or a non-literal argument, or in a
+    program that aliases `tools`, is counted in `skipped_lines` and never a row.
+    A program over 256 KiB, a parse over 250 ms or a walk over 200,000 nodes is
+    one skip.
   - A relative `CODEX_HOME` or override is refused with a reason. Paths are
     resolved lexically (`.`/`..`) and compared by whole components for every
     source, so a `../` call is attributed to where it lands.
