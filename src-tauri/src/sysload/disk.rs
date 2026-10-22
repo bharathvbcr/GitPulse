@@ -38,8 +38,20 @@ pub fn free_bytes(path: &Path) -> Reading<u64> {
     // SAFETY: filled by the kernel.
     let fs = unsafe { fs.assume_init() };
     #[allow(clippy::useless_conversion)]
-    let bytes = u64::from(fs.f_bavail).saturating_mul(u64::from(fs.f_frsize));
-    Reading::Value(bytes)
+    let (avail, frsize, bsize) = (
+        u64::from(fs.f_bavail),
+        u64::from(fs.f_frsize),
+        u64::from(fs.f_bsize),
+    );
+    Reading::Value(available_bytes(avail, frsize, bsize))
+}
+
+/// Blocks available times the fragment size, or the block size where the
+/// filesystem reports no fragment size (`f_frsize == 0`): a zero there made
+/// every volume read as having no space.
+fn available_bytes(avail_blocks: u64, frsize: u64, bsize: u64) -> u64 {
+    let unit = if frsize == 0 { bsize } else { frsize };
+    avail_blocks.saturating_mul(unit)
 }
 
 /// Windows has no reader here: unknown, so nothing is skipped on a guess.
@@ -107,6 +119,14 @@ mod tests {
             free_bytes(&dir.path().join("absent")),
             Reading::Unavailable(_)
         ));
+    }
+
+    #[test]
+    fn a_zero_fragment_size_falls_back_to_the_block_size() {
+        assert_eq!(available_bytes(100, 4096, 512), 100 * 4096);
+        assert_eq!(available_bytes(100, 0, 512), 100 * 512);
+        assert_eq!(available_bytes(100, 0, 0), 0);
+        assert_eq!(available_bytes(u64::MAX, 4096, 4096), u64::MAX);
     }
 
     #[test]

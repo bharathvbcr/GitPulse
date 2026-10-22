@@ -163,6 +163,24 @@ describe("the governor's lines", () => {
     expect(admissionLine(report({}, { advisory: null }))).toBe("Agent launches are admitted.");
   });
 
+  it("names an unreadable volume and carries every advisory of one launch", () => {
+    const several = report(
+      {},
+      {
+        advisory: {
+          reason: "several",
+          items: [
+            { reason: "disk_unknown" },
+            { reason: "cache_error", message: ".turbo: boom" },
+          ],
+        },
+      },
+    );
+    const line = admissionLine(several);
+    expect(line).toMatch(/free space could not be read/);
+    expect(line).toMatch(/\.turbo: boom/);
+  });
+
   // adversarial W4-L3: the advice must not contradict a pressure refusal.
   it("adv: advice beside a pressure refusal does not claim launches are unaffected", () => {
     const low = {

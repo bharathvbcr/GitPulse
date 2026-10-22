@@ -254,13 +254,20 @@ fn provision_with(
     // Caches only save a rebuild; the agent can work without them, so a
     // skipped or failed copy is advice for the launch surfaces, never a
     // refusal: Health and the ledger carry it.
-    let advisory = match (&created.low_disk, &created.cache_error) {
-        (Some(low), _) => Some(crate::sysload::Advisory::LowDisk(low.clone())),
-        (None, Some(message)) => Some(crate::sysload::Advisory::CacheError {
+    // Every outcome is advised: a skipped cache never hides a failed one.
+    let mut advised = Vec::new();
+    if let Some(low) = &created.low_disk {
+        advised.push(crate::sysload::Advisory::LowDisk(low.clone()));
+    }
+    if let Some(message) = &created.cache_error {
+        advised.push(crate::sysload::Advisory::CacheError {
             message: message.clone(),
-        }),
-        (None, None) => None,
-    };
+        });
+    }
+    if created.disk_unknown {
+        advised.push(crate::sysload::Advisory::DiskUnknown);
+    }
+    let advisory = crate::sysload::Advisory::of(advised);
     if let Some(cache) = &created.cache_error {
         log::warn!(target: "workbench", "agent worktree {} has no copied build caches: {cache}", provisioned.path);
     }
@@ -639,9 +646,9 @@ mod tests {
     }
 
     /// An unreadable volume is unknown, not plenty and not full: nothing is
-    /// skipped on its account and no advisory claims a number.
+    /// skipped on its account, and the advice says it could not be read.
     #[test]
-    fn an_unreadable_volume_forces_no_skip_and_no_advisory() {
+    fn an_unreadable_volume_forces_no_skip_and_is_advised_as_unknown() {
         let dir = tempfile::tempdir().unwrap();
         let root = repo_with_cache(dir.path());
         let made = provision_with(
@@ -655,7 +662,10 @@ mod tests {
         assert!(Path::new(&made.path)
             .join("node_modules/pkg/index.js")
             .is_file());
-        assert_eq!(crate::sysload::governor_report().advisory, None);
+        assert_eq!(
+            crate::sysload::governor_report().advisory,
+            Some(Advisory::DiskUnknown)
+        );
     }
 
     /// A cache that fails to copy is typed into the advisory, not only

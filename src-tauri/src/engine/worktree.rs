@@ -1937,6 +1937,10 @@ pub struct WorktreeCreated {
     /// over the byte cap). Advice, not a failure: the worktree was made.
     #[serde(default)]
     pub low_disk: Option<crate::sysload::LowDisk>,
+    /// The volume's free space could not be read, so nothing was skipped on
+    /// its account and nothing is known to be plentiful.
+    #[serde(default)]
+    pub disk_unknown: bool,
     /// A `post_create` hook failed, timed out, or was refused.
     pub hook_error: Option<String>,
     /// Hooks were asked for and the repository's file lists some that were not
@@ -1985,6 +1989,7 @@ pub fn add_worktree_cached(
         path,
         cache_error: None,
         low_disk: None,
+        disk_unknown: false,
         hook_error: None,
         hook_notice: None,
     };
@@ -1994,6 +1999,7 @@ pub fn add_worktree_cached(
             Ok(report) => {
                 created.cache_error = report.error();
                 created.low_disk = report.low_disk;
+                created.disk_unknown = report.disk_unknown;
             }
             Err(error) => created.cache_error = Some(error),
         }

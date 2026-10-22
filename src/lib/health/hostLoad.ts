@@ -10,6 +10,7 @@
 import { humanBytes } from "../storage/format";
 import type {
   GovernorPulse,
+  Advisory,
   GovernorReport,
   HostLoadPulse,
   Level,
@@ -164,20 +165,37 @@ export function admissionLine(report: GovernorReport): string {
   return advice === null ? line : `${line} ${advice}`;
 }
 
-/** The latest worktree build's advice, which never changes whether launches are admitted. */
+/**
+ * The latest worktree build's advice. It never changes whether launches are
+ * admitted, and says "launches are not affected" only when they are not being
+ * refused for another reason.
+ */
 export function advisoryLine(report: GovernorReport): string | null {
   const advisory = report.advisory;
   if (!advisory) return null;
-  if (advisory.reason === "cache_error") {
-    return `Advice: the last worktree was made without its build caches (${advisory.message}).`;
+  const refused = !report.verdict.admit && report.override_remaining_s === null;
+  return advice(advisory, refused).join(" ");
+}
+
+function advice(advisory: Advisory, refused: boolean): string[] {
+  switch (advisory.reason) {
+    case "several":
+      return advisory.items.flatMap((item) => advice(item, refused));
+    case "cache_error":
+      return [`Advice: the last worktree was made without its build caches (${advisory.message}).`];
+    case "disk_unknown":
+      return ["Advice: free space could not be read, so no build cache was skipped on its account."];
+    case "low_disk": {
+      const names = advisory.skipped.join(", ");
+      if (advisory.cause === "byte_cap") {
+        const cap = advisory.cap_bytes === null ? "the byte cap" : `the ${bytes(advisory.cap_bytes)} byte cap`;
+        return [`Low disk advice: ${names} was not copied into the last worktree (over ${cap}).`];
+      }
+      const free = advisory.free_bytes === null ? "unknown" : bytes(advisory.free_bytes);
+      const unaffected = refused ? "." : "; launches are not affected.";
+      return [`Low disk advice: ${free} free, so ${names} was not copied into the last worktree${unaffected}`];
+    }
   }
-  const names = advisory.skipped.join(", ");
-  if (advisory.cause === "byte_cap") {
-    const cap = advisory.cap_bytes === null ? "the byte cap" : `the ${bytes(advisory.cap_bytes)} byte cap`;
-    return `Low disk advice: ${names} was not copied into the last worktree (over ${cap}).`;
-  }
-  const free = advisory.free_bytes === null ? "unknown" : bytes(advisory.free_bytes);
-  return `Low disk advice: ${free} free, so ${names} was not copied into the last worktree; launches are not affected.`;
 }
 
 function admissionVerdictLine(report: GovernorReport): string {

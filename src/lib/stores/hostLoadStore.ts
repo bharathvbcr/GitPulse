@@ -247,7 +247,9 @@ export type Advisory =
       cap_bytes: number | null;
       skipped: string[];
     }
-  | { reason: "cache_error"; message: string };
+  | { reason: "cache_error"; message: string }
+  | { reason: "disk_unknown" }
+  | { reason: "several"; items: Advisory[] };
 
 /** `sysload::GovernorReport`: the verdict, how long refusal has run, a live override. */
 export interface GovernorReport {

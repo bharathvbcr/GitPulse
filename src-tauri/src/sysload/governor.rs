@@ -689,71 +689,144 @@ pub enum Advisory {
     /// Build caches failed to copy (or could not be checked). The worktree
     /// was made without them.
     CacheError { message: String },
+    /// The volume's free space could not be read, so nothing was skipped on
+    /// its account and nothing is known to be plentiful.
+    DiskUnknown,
+    /// More than one of the above in one launch; none hides another.
+    Several { items: Vec<Advisory> },
 }
 
 impl Advisory {
+    /// One advisory from what a launch produced: none, itself, or all.
+    pub fn of(mut items: Vec<Advisory>) -> Option<Advisory> {
+        match items.len() {
+            0 => None,
+            1 => items.pop(),
+            _ => Some(Self::Several { items }),
+        }
+    }
+
     pub fn message(&self) -> String {
         match self {
             Self::LowDisk(low) => low.message(),
             Self::CacheError { message } => format!("build caches were not copied: {message}"),
+            Self::DiskUnknown => "free space could not be read".to_string(),
+            Self::Several { items } => items
+                .iter()
+                .map(Self::message)
+                .collect::<Vec<_>>()
+                .join("; "),
         }
     }
 
-    fn name(&self) -> &'static str {
+    fn name(&self) -> String {
         match self {
-            Self::LowDisk(_) => "low_disk",
-            Self::CacheError { .. } => "cache_error",
+            Self::LowDisk(_) => "low_disk".to_string(),
+            Self::CacheError { .. } => "cache_error".to_string(),
+            Self::DiskUnknown => "disk_unknown".to_string(),
+            Self::Several { items } => items.iter().map(Self::name).collect::<Vec<_>>().join("+"),
         }
     }
+}
+
+/// An identical advisory in one repository is one ledger event per this
+/// interval, carrying how many repeats it stood in for.
+pub const ADVISORY_EVENT_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// Repositories whose advice is held at once; past it the oldest goes.
+const MAX_ADVICE_REPOS: usize = 64;
+
+/// What one repository's launches last advised.
+struct RepoAdvice {
+    repo: String,
+    /// The advice now standing, and when it was set.
+    live: Option<(Instant, Advisory)>,
+    /// The last advisory written to the ledger, and when.
+    last_event: Option<(Instant, Advisory)>,
+    /// Identical advisories since then that wrote no event.
+    suppressed: u64,
 }
 
 #[cfg(test)]
 thread_local! {
-    static ADVISORY: std::cell::RefCell<Option<Advisory>> = const { std::cell::RefCell::new(None) };
+    static ADVICE: std::cell::RefCell<Vec<RepoAdvice>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 #[cfg(not(test))]
-static ADVISORY: Mutex<Option<Advisory>> = Mutex::new(None);
+static ADVICE: Mutex<Vec<RepoAdvice>> = Mutex::new(Vec::new());
 
-fn latest_advisory() -> Option<Advisory> {
+fn with_advice<T>(body: impl FnOnce(&mut Vec<RepoAdvice>) -> T) -> T {
     #[cfg(test)]
-    return ADVISORY.with(|slot| slot.borrow().clone());
+    return ADVICE.with(|slot| body(&mut slot.borrow_mut()));
     #[cfg(not(test))]
-    ADVISORY
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-}
-
-fn store_advisory(advisory: Option<Advisory>) {
-    #[cfg(test)]
-    ADVISORY.with(|slot| *slot.borrow_mut() = advisory);
-    #[cfg(not(test))]
-    {
-        *ADVISORY
+    body(
+        &mut ADVICE
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = advisory;
-    }
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
 }
 
-/// Records what the worktree build just advised, or clears the last advice
-/// when it advised nothing. Advice only: it is shown in the report and the
-/// ledger (`host_load.advisory`) and never refuses anything.
+/// The most recently set advice across repositories: one repository's clean
+/// launch clears only its own.
+fn latest_advisory() -> Option<Advisory> {
+    with_advice(|all| {
+        all.iter()
+            .filter_map(|advice| advice.live.as_ref())
+            .max_by_key(|(set, _)| *set)
+            .map(|(_, advisory)| advisory.clone())
+    })
+}
+
+/// Records what the worktree build just advised in `repo_path`, or clears
+/// that repository's advice when it advised nothing. Advice only: it is shown
+/// in the report and, deduplicated, in the ledger (`host_load.advisory`), and
+/// never refuses anything.
 pub fn note_launch_advisory(repo_path: &str, advisory: Option<Advisory>) {
-    if let Some(advisory) = &advisory {
-        log::warn!(target: "host_load", "launch advisory ({}): {}", advisory.name(), advisory.message());
-        let detail = serde_json::json!({
-            "advisory": advisory,
-            "message": advisory.message(),
-        });
-        write_ledger(
-            repo_path,
-            "host_load.advisory",
-            advisory.name(),
-            crate::ledger::Outcome::Ok,
-            detail,
-        );
-    }
-    store_advisory(advisory);
+    let now = Instant::now();
+    let write = with_advice(|all| {
+        let at = match all.iter().position(|a| a.repo == repo_path) {
+            Some(at) => at,
+            None => {
+                if all.len() >= MAX_ADVICE_REPOS {
+                    all.remove(0);
+                }
+                all.push(RepoAdvice {
+                    repo: repo_path.to_string(),
+                    live: None,
+                    last_event: None,
+                    suppressed: 0,
+                });
+                all.len() - 1
+            }
+        };
+        let entry = &mut all[at];
+        entry.live = advisory.clone().map(|a| (now, a));
+        let advisory = advisory?;
+        if let Some((at, previous)) = &entry.last_event {
+            if *previous == advisory && now.saturating_duration_since(*at) < ADVISORY_EVENT_INTERVAL
+            {
+                entry.suppressed += 1;
+                return None;
+            }
+        }
+        let repeats = std::mem::take(&mut entry.suppressed);
+        entry.last_event = Some((now, advisory.clone()));
+        Some((advisory, repeats))
+    });
+    let Some((advisory, repeats)) = write else {
+        return;
+    };
+    log::warn!(target: "host_load", "launch advisory ({}): {}", advisory.name(), advisory.message());
+    let detail = serde_json::json!({
+        "advisory": advisory,
+        "message": advisory.message(),
+        "repeats": repeats,
+    });
+    write_ledger(
+        repo_path,
+        "host_load.advisory",
+        &advisory.name(),
+        crate::ledger::Outcome::Ok,
+        detail,
+    );
 }
 
 /// The places [`admit`] is called: the only gated operations there are.
