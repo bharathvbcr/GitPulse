@@ -822,3 +822,4 @@ fn the_codex_root_is_the_override_then_codex_home_then_the_home_directory() {
 
 mod adversarial;
 mod adversarial2;
+mod adversarial3;
