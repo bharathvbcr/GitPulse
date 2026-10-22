@@ -2306,3 +2306,6 @@ mod tests {
         assert!(staging_leftovers(parent.path()).is_empty());
     }
 }
+
+#[cfg(test)]
+mod adv2;
