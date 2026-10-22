@@ -563,7 +563,8 @@ fn ingest_family(
             }
             let parsed = parser.parse(text);
             out.skipped_lines += parsed.skipped;
-            for call in parsed.calls {
+            let digest = ledger::ids::fnv1a64(body);
+            for (ordinal, call) in parsed.calls.into_iter().enumerate() {
                 // One owner per call, and the row is always the owner's:
                 // its path, its task. A removed worktree is found by
                 // its path alone, and only when the family is known (an
@@ -656,6 +657,12 @@ fn ingest_family(
                     ledger_repo,
                     worktree,
                     history,
+                    ledger::TranscriptRow {
+                        file_key: file_key.clone(),
+                        offset: line.offset,
+                        ordinal,
+                        digest,
+                    },
                 ));
                 out.rehosted_calls += i64::from(rehosted);
             }

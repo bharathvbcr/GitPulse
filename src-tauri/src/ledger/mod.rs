@@ -544,6 +544,54 @@ pub struct Draft {
     pub event_stamp: Option<EventStamp>,
 }
 
+/// The identity of one row derived from a transcript line: the transcript
+/// ([`transcript_key`]), the line's byte offset, the row's ordinal among the
+/// calls of that line, and an FNV-1a digest of the line's bytes.
+///
+/// Two lines that read alike are two identities (the offsets differ), so a
+/// command run twice is two rows. A transcript rewritten under the same name
+/// keeps the identity of every line that did not change and gets a new one for
+/// each line that did. A row recorded before this identity existed carries
+/// none, and is not recognised: the history that predates it can still be
+/// recorded again after a cursor reset.
+///
+/// A transcript row carries its identity in `detail_json` under
+/// [`TRANSCRIPT_ROW_KEY`], and [`advance_transcripts_family`] skips a row whose
+/// identity the ledger already holds for this worktree and session, so reading
+/// a transcript again after its cursor was lost records nothing twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptRow {
+    pub file_key: String,
+    pub offset: u64,
+    pub ordinal: usize,
+    pub digest: u64,
+}
+
+impl TranscriptRow {
+    /// The text kept in `detail_json` under [`TRANSCRIPT_ROW_KEY`].
+    pub fn key(&self) -> String {
+        format!(
+            "{}:{}:{}:{:016x}",
+            self.file_key, self.offset, self.ordinal, self.digest
+        )
+    }
+}
+
+/// The `detail_json` key that holds a transcript row's [`TranscriptRow::key`].
+pub const TRANSCRIPT_ROW_KEY: &str = "transcript_row";
+
+/// The [`TranscriptRow::key`] in a draft's `detail_json` and the line offset it
+/// names, or `None` for any other row (or a key not in the form `key` writes).
+fn transcript_row_of(detail: &str) -> Option<(String, u64)> {
+    if !detail.contains(TRANSCRIPT_ROW_KEY) {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(detail).ok()?;
+    let key = value.get(TRANSCRIPT_ROW_KEY)?.as_str()?;
+    let offset = key.split(':').nth(1)?.parse().ok()?;
+    Some((key.to_string(), offset))
+}
+
 /// The three `detail_json` keys that carry event time: `occurred_at`,
 /// `occurred_at_basis` and `task_basis`.
 ///
@@ -1732,6 +1780,8 @@ struct Prepared {
     occurred_at: Option<String>,
     /// `Some(0)` on a reflog row, `None` otherwise. See [`insert`].
     reflog_ordinal: Option<i64>,
+    /// [`TranscriptRow::key`] and the offset of the line, for a transcript row.
+    transcript_row: Option<(String, u64)>,
 }
 
 /// `contracts/event.schema.json`'s action pattern,
@@ -1816,6 +1866,7 @@ fn prepare(draft: &Draft) -> Result<Prepared, LedgerError> {
             .filter(|stamp| stamp.is_well_formed())
             .map(|stamp| stamp.occurred_at.clone()),
         reflog_ordinal: draft.action.starts_with("reflog.").then_some(0),
+        transcript_row: draft.detail_json.as_deref().and_then(transcript_row_of),
     })
 }
 
@@ -2220,7 +2271,18 @@ pub(crate) fn advance_transcripts_family(
                 if stored != advance.from {
                     continue;
                 }
+                let mut held = held_transcript_rows(&tx, advance.from, events).map_err(failed)?;
                 for event in events {
+                    if let Some((key, _)) = &event.transcript_row {
+                        let identity = (
+                            event.worktree_path.clone(),
+                            event.session_id.clone(),
+                            key.clone(),
+                        );
+                        if !held.insert(identity) {
+                            continue;
+                        }
+                    }
                     newest = Some(insert(&tx, event)?);
                     recorded += 1;
                 }
@@ -2257,6 +2319,54 @@ pub(crate) fn advance_transcripts_family(
             Err(e)
         }
     }
+}
+
+type HeldRows = std::collections::HashSet<(Option<String>, Option<String>, String)>;
+
+/// The transcript rows already recorded for the sessions of `events`, as
+/// `(worktree_path, session_id, row key)`, when this read can be a repeat of
+/// one that was recorded.
+///
+/// A read that resumes at the cursor (`from`) only meets lines past it, which
+/// the cursor's compare-and-set already keeps exactly-once, so nothing is
+/// looked up and an ordinary append pays nothing. A read that starts where no
+/// cursor stood, or reaches back before it (a rotated file read again from
+/// its start), may meet lines it recorded before the cursor was lost; those
+/// are found through `idx_events_session`, one scan per session.
+fn held_transcript_rows(
+    tx: &Connection,
+    from: Option<u64>,
+    events: &[Prepared],
+) -> rusqlite::Result<HeldRows> {
+    let repeats = events.iter().any(|event| {
+        event
+            .transcript_row
+            .as_ref()
+            .is_some_and(|(_, offset)| from.is_none_or(|from| *offset < from))
+    });
+    let mut held = HeldRows::new();
+    if !repeats {
+        return Ok(held);
+    }
+    let mut sessions: Vec<(&Option<String>, &Option<String>)> = events
+        .iter()
+        .filter(|event| event.transcript_row.is_some())
+        .map(|event| (&event.worktree_path, &event.session_id))
+        .collect();
+    sessions.sort();
+    sessions.dedup();
+    let mut stmt = tx.prepare_cached(&format!(
+        "SELECT json_extract(detail_json, '$.{TRANSCRIPT_ROW_KEY}') FROM events
+         WHERE session_id = ?1 AND worktree_path IS ?2 AND json_valid(detail_json)
+           AND json_extract(detail_json, '$.{TRANSCRIPT_ROW_KEY}') IS NOT NULL"
+    ))?;
+    for (worktree, session) in sessions {
+        let rows = stmt.query_map(params![session, worktree], |row| row.get::<_, String>(0))?;
+        for key in rows {
+            held.insert((worktree.clone(), session.clone(), key?));
+        }
+    }
+    Ok(held)
 }
 
 /// Forgets the offsets of transcripts that no longer exist, so the table is

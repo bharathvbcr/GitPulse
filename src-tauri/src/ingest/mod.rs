@@ -389,6 +389,7 @@ fn transcript_draft(
     ledger_repo: &str,
     worktree_path: &str,
     history: &ledger::bindings::BindingHistory,
+    row: ledger::TranscriptRow,
 ) -> Draft {
     let when = EventTime::at(
         "transcript",
@@ -401,6 +402,7 @@ fn transcript_draft(
         "tool": call.tool,
         "transcript_version": call.version,
         "git_branch": call.git_branch,
+        ledger::TRANSCRIPT_ROW_KEY: row.key(),
     })
     .to_string();
     Draft {
