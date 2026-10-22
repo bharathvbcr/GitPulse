@@ -118,7 +118,14 @@ fn a1b_a_rewrite_that_shifts_bytes_replays_the_unchanged_lines_stated_limit() {
     // by a read that resumes mid-file.
     assert_eq!(
         crows(w1),
-        ["a-much-longer-name.rs", "a.rs", "b.rs", "b.rs", "c.rs", "c2.rs"],
+        [
+            "a-much-longer-name.rs",
+            "a.rs",
+            "b.rs",
+            "b.rs",
+            "c.rs",
+            "c2.rs"
+        ],
         "an unchanged line whose offset moved is recorded again (stated limit)"
     );
 }

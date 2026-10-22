@@ -83,6 +83,13 @@ pub struct CatchUp {
     /// `transcripts_unlisted`.
     #[serde(default)]
     pub refused_outside_corpus: i64,
+    /// Saved transcript offsets whose file this pass's walk did not list and
+    /// that it did not forget: the cursors of files that are gone while
+    /// forgetting is held back (an unreadable or recently absent root, a walk
+    /// that was cut), or a forget that failed. Zero after a pass that forgot
+    /// them. Not stored with the catch-up state, which has no column for it.
+    #[serde(default)]
+    pub stale_cursors: i64,
     /// Whether the corpus walk listed the whole corpus: null when no walk ran
     /// (no transcript root, or the pass was skipped), false when it was cut,
     /// hit an unreadable directory, or left files unlisted.
@@ -1299,6 +1306,8 @@ impl CatchUp {
         self.unlisted_cap = transcripts.unlisted_cap;
         self.unlisted_lower_bound = transcripts.unlisted_lower_bound;
         self.refused_outside_corpus = transcripts.refused_outside_corpus;
+        self.stale_cursors = transcripts.stale_cursors;
+        self.duplicates_refused += transcripts.duplicates_refused;
         self.walk_complete = transcripts.walk_complete;
         self.skipped_lines = transcripts.skipped_lines;
         self.rehosted_calls = transcripts.rehosted_calls;
