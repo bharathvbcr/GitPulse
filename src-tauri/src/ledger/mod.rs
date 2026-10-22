@@ -556,9 +556,11 @@ pub struct Draft {
 /// recorded again after a cursor reset.
 ///
 /// A transcript row carries its identity in `detail_json` under
-/// [`TRANSCRIPT_ROW_KEY`], and [`advance_transcripts_family`] skips a row whose
-/// identity the ledger already holds for this worktree and session, so reading
-/// a transcript again after its cursor was lost records nothing twice.
+/// [`TRANSCRIPT_ROW_KEY`], and its `ulid` is derived from that identity, the
+/// repository, worktree, actor and session ([`prepare`]). The unique index on
+/// `ulid` then refuses a second copy on every path that can read a line twice
+/// (a lost or stale cursor, a forget, a second spelling of the root, another
+/// process), at the cost of one index probe per insert and no scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptRow {
     pub file_key: String,
@@ -580,16 +582,14 @@ impl TranscriptRow {
 /// The `detail_json` key that holds a transcript row's [`TranscriptRow::key`].
 pub const TRANSCRIPT_ROW_KEY: &str = "transcript_row";
 
-/// The [`TranscriptRow::key`] in a draft's `detail_json` and the line offset it
-/// names, or `None` for any other row (or a key not in the form `key` writes).
-fn transcript_row_of(detail: &str) -> Option<(String, u64)> {
+/// The [`TranscriptRow::key`] in a draft's `detail_json`, or `None` for any
+/// other row.
+fn transcript_row_of(detail: &str) -> Option<String> {
     if !detail.contains(TRANSCRIPT_ROW_KEY) {
         return None;
     }
     let value: serde_json::Value = serde_json::from_str(detail).ok()?;
-    let key = value.get(TRANSCRIPT_ROW_KEY)?.as_str()?;
-    let offset = key.split(':').nth(1)?.parse().ok()?;
-    Some((key.to_string(), offset))
+    Some(value.get(TRANSCRIPT_ROW_KEY)?.as_str()?.to_string())
 }
 
 /// The three `detail_json` keys that carry event time: `occurred_at`,
@@ -1780,8 +1780,9 @@ struct Prepared {
     occurred_at: Option<String>,
     /// `Some(0)` on a reflog row, `None` otherwise. See [`insert`].
     reflog_ordinal: Option<i64>,
-    /// [`TranscriptRow::key`] and the offset of the line, for a transcript row.
-    transcript_row: Option<(String, u64)>,
+    /// [`TranscriptRow::key`], for a transcript row: its `ulid` is derived from
+    /// it, and [`insert_transcript_row`] refuses a second row with the same one.
+    transcript_row: Option<String>,
 }
 
 /// `contracts/event.schema.json`'s action pattern,
@@ -1842,8 +1843,31 @@ fn prepare(draft: &Draft) -> Result<Prepared, LedgerError> {
     // Redact every caller-controlled string at the one write boundary. The
     // verdict repeats the judged command in `target`, so redacting only argv
     // leaves a second full copy of the same credential in the same row.
+    let transcript_row = draft.detail_json.as_deref().and_then(transcript_row_of);
+    let ulid = match &transcript_row {
+        Some(key) => {
+            // The time part is the line's own, so a re-read gives the same
+            // ulid; a row stamped at ingest time has none, and takes zero.
+            let event_ms = draft
+                .event_stamp
+                .as_ref()
+                .filter(|stamp| stamp.occurred_at_basis == "transcript" && stamp.is_well_formed())
+                .and_then(|stamp| ids::parse_event_time(&stamp.occurred_at))
+                .unwrap_or(0);
+            let identity = [
+                repo_path.as_str(),
+                draft.worktree_path.as_deref().unwrap_or(""),
+                draft.actor_id.as_deref().unwrap_or(""),
+                draft.session_id.as_deref().unwrap_or(""),
+                key.as_str(),
+            ]
+            .join("\0");
+            ids::identity_ulid(event_ms, identity.as_bytes())
+        }
+        None => ids::ulid(ms),
+    };
     Ok(Prepared {
-        ulid: ids::ulid(ms),
+        ulid,
         ts: ids::iso8601_utc(ms),
         repo_path: redact::text(&repo_path),
         worktree_path: draft.worktree_path.as_deref().map(redact::text),
@@ -1866,7 +1890,7 @@ fn prepare(draft: &Draft) -> Result<Prepared, LedgerError> {
             .filter(|stamp| stamp.is_well_formed())
             .map(|stamp| stamp.occurred_at.clone()),
         reflog_ordinal: draft.action.starts_with("reflog.").then_some(0),
-        transcript_row: draft.detail_json.as_deref().and_then(transcript_row_of),
+        transcript_row,
     })
 }
 
@@ -1904,48 +1928,98 @@ fn store_object_and_detail(
 /// order, and carries that numbering across passes through the watermark
 /// (`reflog_watermarks`, see `ingest::replay_ref`).
 fn insert(conn: &Connection, event: &Prepared) -> Result<i64, LedgerError> {
-    conn.execute(
-        "INSERT INTO events (
+    insert_with(conn, event, INSERT_SQL)?
+        .ok_or_else(|| LedgerError::new("insert_failed", "an insert changed no row"))
+}
+
+const INSERT_SQL: &str = "INSERT INTO events (
              ulid, ts_utc, schema_version, repo_path, worktree_path,
              actor_kind, actor_id, session_id, task_id, action, object,
              argv_json, outcome, verdict_json, before_ref, after_ref,
              duration_ms, detail_json, occurred_at, reflog_ordinal
-         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
-        params![
-            event.ulid,
-            event.ts,
-            SCHEMA_VERSION,
-            event.repo_path,
-            event.worktree_path,
-            event.actor_kind,
-            event.actor_id,
-            event.session_id,
-            event.task_id,
-            event.action,
-            event.object,
-            event.argv,
-            event.outcome,
-            event.verdict,
-            event.before_ref,
-            event.after_ref,
-            event.duration_ms,
-            event.detail,
-            event.occurred_at,
-            event.reflog_ordinal,
-        ],
-    )
-    .map_err(|e| match e {
-        // Another writer (the app and `gitpulsed` both replay the reflog)
-        // recorded this entry first. Not data loss, and not an insert failure.
-        rusqlite::Error::SqliteFailure(code, Some(message))
-            if code.code == rusqlite::ErrorCode::ConstraintViolation
-                && message.contains(REFLOG_IDENTITY_INDEX) =>
-        {
-            LedgerError::new("duplicate_reflog", message)
-        }
-        other => LedgerError::new("insert_failed", other.to_string()),
-    })?;
-    Ok(conn.last_insert_rowid())
+         ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)";
+
+/// What [`insert_transcript_row`] did.
+enum TranscriptInsert {
+    Recorded(i64),
+    /// The ledger already held this row.
+    Held,
+    /// The ulid is held by a different row.
+    Collision,
+}
+
+/// Inserts a transcript row, or finds it already held. Only the unique `ulid`
+/// is tolerated: a CHECK or NOT NULL failure is still an error. A held ulid
+/// is taken for the same row only if the row there names the same identity;
+/// a different one is a collision of the ulid's 80-bit body, reported as
+/// [`TranscriptInsert::Collision`] so the caller counts it as a failed write
+/// rather than dropping the row as a duplicate.
+fn insert_transcript_row(
+    conn: &Connection,
+    event: &Prepared,
+) -> Result<TranscriptInsert, LedgerError> {
+    let sql = format!("{INSERT_SQL} ON CONFLICT(ulid) DO NOTHING");
+    if let Some(id) = insert_with(conn, event, &sql)? {
+        return Ok(TranscriptInsert::Recorded(id));
+    }
+    let held: Option<Option<String>> = conn
+        .query_row(
+            &format!(
+                "SELECT json_extract(detail_json, '$.{TRANSCRIPT_ROW_KEY}') FROM events
+                 WHERE ulid = ?1 AND json_valid(detail_json)"
+            ),
+            params![event.ulid],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| LedgerError::new("insert_failed", e.to_string()))?;
+    match (held, &event.transcript_row) {
+        (Some(Some(held)), Some(key)) if held == *key => Ok(TranscriptInsert::Held),
+        _ => Ok(TranscriptInsert::Collision),
+    }
+}
+
+/// Runs `sql` (an [`INSERT_SQL`] with an optional conflict clause) for `event`;
+/// `None` when the conflict clause turned the insert into nothing.
+fn insert_with(conn: &Connection, event: &Prepared, sql: &str) -> Result<Option<i64>, LedgerError> {
+    let changed = conn
+        .execute(
+            sql,
+            params![
+                event.ulid,
+                event.ts,
+                SCHEMA_VERSION,
+                event.repo_path,
+                event.worktree_path,
+                event.actor_kind,
+                event.actor_id,
+                event.session_id,
+                event.task_id,
+                event.action,
+                event.object,
+                event.argv,
+                event.outcome,
+                event.verdict,
+                event.before_ref,
+                event.after_ref,
+                event.duration_ms,
+                event.detail,
+                event.occurred_at,
+                event.reflog_ordinal,
+            ],
+        )
+        .map_err(|e| match e {
+            // Another writer (the app and `gitpulsed` both replay the reflog)
+            // recorded this entry first. Not data loss, and not an insert failure.
+            rusqlite::Error::SqliteFailure(code, Some(message))
+                if code.code == rusqlite::ErrorCode::ConstraintViolation
+                    && message.contains(REFLOG_IDENTITY_INDEX) =>
+            {
+                LedgerError::new("duplicate_reflog", message)
+            }
+            other => LedgerError::new("insert_failed", other.to_string()),
+        })?;
+    Ok((changed == 1).then(|| conn.last_insert_rowid()))
 }
 
 // --- transcript catch-up progress --------------------------------------
@@ -2226,6 +2300,17 @@ pub(crate) fn advance_transcripts(
     advances: Vec<TranscriptAdvance>,
 ) -> Result<i64, LedgerError> {
     advance_transcripts_family(repo_path, vec![(worktree_path, advances)])
+        .map(|commit| commit.recorded)
+}
+
+/// What [`advance_transcripts_family`] did with the rows it was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TranscriptCommit {
+    /// Rows written.
+    pub recorded: i64,
+    /// Rows the ledger already held (same identity, so same `ulid`): a line read
+    /// again after its cursor was lost or went stale.
+    pub refused: i64,
 }
 
 /// [`advance_transcripts`] for several worktrees of one repository at once:
@@ -2235,7 +2320,7 @@ pub(crate) fn advance_transcripts(
 pub(crate) fn advance_transcripts_family(
     repo_path: &str,
     advances: Vec<(&str, Vec<TranscriptAdvance>)>,
-) -> Result<i64, LedgerError> {
+) -> Result<TranscriptCommit, LedgerError> {
     let advances: Vec<(String, Vec<TranscriptAdvance>)> = advances
         .into_iter()
         .map(|(path, advances)| (transcript_key(Path::new(path)), advances))
@@ -2255,6 +2340,7 @@ pub(crate) fn advance_transcripts_family(
         // second process cannot move it between the check and the write.
         let tx = write_tx(conn).map_err(failed)?;
         let mut recorded = 0i64;
+        let mut refused = 0i64;
         let mut newest = None;
         for ((worktree, advances), prepared) in advances.iter().zip(&prepared) {
             for (advance, events) in advances.iter().zip(prepared) {
@@ -2271,20 +2357,26 @@ pub(crate) fn advance_transcripts_family(
                 if stored != advance.from {
                     continue;
                 }
-                let mut held = held_transcript_rows(&tx, advance.from, events).map_err(failed)?;
                 for event in events {
-                    if let Some((key, _)) = &event.transcript_row {
-                        let identity = (
-                            event.worktree_path.clone(),
-                            event.session_id.clone(),
-                            key.clone(),
-                        );
-                        if !held.insert(identity) {
-                            continue;
+                    if event.transcript_row.is_none() {
+                        newest = Some(insert(&tx, event)?);
+                        recorded += 1;
+                        continue;
+                    }
+                    match insert_transcript_row(&tx, event)? {
+                        TranscriptInsert::Recorded(id) => {
+                            newest = Some(id);
+                            recorded += 1;
+                        }
+                        TranscriptInsert::Held => refused += 1,
+                        TranscriptInsert::Collision => {
+                            log::warn!(
+                                "transcript row {} collides with a different row",
+                                event.ulid
+                            );
+                            record_dropped_append(repo_path);
                         }
                     }
-                    newest = Some(insert(&tx, event)?);
-                    recorded += 1;
                 }
                 tx.execute(
                     "INSERT INTO transcript_cursors (worktree_key, file_key, byte_offset, fingerprint)
@@ -2303,14 +2395,14 @@ pub(crate) fn advance_transcripts_family(
             }
         }
         tx.commit().map_err(failed)?;
-        Ok((recorded, newest))
+        Ok((recorded, refused, newest))
     });
     match result {
-        Ok((recorded, newest)) => {
+        Ok((recorded, refused, newest)) => {
             if let Some(cursor) = newest {
                 announce(repo_path, cursor);
             }
-            Ok(recorded)
+            Ok(TranscriptCommit { recorded, refused })
         }
         Err(e) => {
             for _ in prepared.iter().flatten().flatten() {
@@ -2319,54 +2411,6 @@ pub(crate) fn advance_transcripts_family(
             Err(e)
         }
     }
-}
-
-type HeldRows = std::collections::HashSet<(Option<String>, Option<String>, String)>;
-
-/// The transcript rows already recorded for the sessions of `events`, as
-/// `(worktree_path, session_id, row key)`, when this read can be a repeat of
-/// one that was recorded.
-///
-/// A read that resumes at the cursor (`from`) only meets lines past it, which
-/// the cursor's compare-and-set already keeps exactly-once, so nothing is
-/// looked up and an ordinary append pays nothing. A read that starts where no
-/// cursor stood, or reaches back before it (a rotated file read again from
-/// its start), may meet lines it recorded before the cursor was lost; those
-/// are found through `idx_events_session`, one scan per session.
-fn held_transcript_rows(
-    tx: &Connection,
-    from: Option<u64>,
-    events: &[Prepared],
-) -> rusqlite::Result<HeldRows> {
-    let repeats = events.iter().any(|event| {
-        event
-            .transcript_row
-            .as_ref()
-            .is_some_and(|(_, offset)| from.is_none_or(|from| *offset < from))
-    });
-    let mut held = HeldRows::new();
-    if !repeats {
-        return Ok(held);
-    }
-    let mut sessions: Vec<(&Option<String>, &Option<String>)> = events
-        .iter()
-        .filter(|event| event.transcript_row.is_some())
-        .map(|event| (&event.worktree_path, &event.session_id))
-        .collect();
-    sessions.sort();
-    sessions.dedup();
-    let mut stmt = tx.prepare_cached(&format!(
-        "SELECT json_extract(detail_json, '$.{TRANSCRIPT_ROW_KEY}') FROM events
-         WHERE session_id = ?1 AND worktree_path IS ?2 AND json_valid(detail_json)
-           AND json_extract(detail_json, '$.{TRANSCRIPT_ROW_KEY}') IS NOT NULL"
-    ))?;
-    for (worktree, session) in sessions {
-        let rows = stmt.query_map(params![session, worktree], |row| row.get::<_, String>(0))?;
-        for key in rows {
-            held.insert((worktree.clone(), session.clone(), key?));
-        }
-    }
-    Ok(held)
 }
 
 /// Forgets the offsets of transcripts that no longer exist, so the table is

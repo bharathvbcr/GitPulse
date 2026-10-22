@@ -531,6 +531,7 @@ fn ingest_family(
         };
 
         let mut drafts: Vec<Vec<ledger::Draft>> = owed.iter().map(|_| Vec::new()).collect();
+        let mut row_file: Option<String> = None;
         let mut touched: HashSet<usize> = HashSet::new();
         let mut consumed = 0u64;
         loop {
@@ -564,6 +565,7 @@ fn ingest_family(
             let parsed = parser.parse(text);
             out.skipped_lines += parsed.skipped;
             let digest = ledger::ids::fnv1a64(body);
+            let row_file = row_file.get_or_insert_with(|| canonical_file_key(&path));
             for (ordinal, call) in parsed.calls.into_iter().enumerate() {
                 // One owner per call, and the row is always the owner's:
                 // its path, its task. A removed worktree is found by
@@ -658,7 +660,7 @@ fn ingest_family(
                     worktree,
                     history,
                     ledger::TranscriptRow {
-                        file_key: file_key.clone(),
+                        file_key: row_file.clone(),
                         offset: line.offset,
                         ordinal,
                         digest,
@@ -1199,6 +1201,15 @@ fn owed_on(
         .collect()
 }
 
+/// The file's name in a row's identity: the key of its canonical path, so one
+/// transcript reached through two spellings of its root (a symlink, `/var` and
+/// `/private/var`) is one file. The cursor keeps the key of the spelling it
+/// was read by; only the row identity is canonical. A path that cannot be
+/// canonicalized keeps its own spelling.
+fn canonical_file_key(path: &std::path::Path) -> String {
+    ledger::transcript_key(&std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+}
+
 /// Commits every participant's `pending` advances in one transaction, emptying
 /// them. False, with the error in `out`, when the ledger refused it — the pass
 /// stops there rather than read further into events it could not keep.
@@ -1223,8 +1234,9 @@ fn commit(
         return true;
     }
     match ledger::advance_transcripts_family(ledger_repo, advances) {
-        Ok(recorded) => {
-            out.recorded += recorded;
+        Ok(commit) => {
+            out.recorded += commit.recorded;
+            out.duplicates_refused += commit.refused;
             true
         }
         Err(e) => {

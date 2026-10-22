@@ -234,9 +234,33 @@ pub fn ulid(ms: u64) -> String {
     // half made each id's leading characters jump around, so ids from a single
     // millisecond sorted arbitrarily — which defeats the one property the ulid
     // exists for, since the integer `id` is already the paging cursor.
-    let hi = process_seed();
-    let lo = n;
+    encode_ulid(ms, process_seed(), n)
+}
 
+/// The ULID of a row whose identity is known before it is written: the same
+/// shape as [`ulid`], with the 80-bit body taken from `identity` instead of
+/// the process, so the same identity is the same ulid in every pass, process
+/// and database and the unique index on `ulid` refuses the second row.
+///
+/// `ms` should be a time the identity itself fixes (the row's own event time),
+/// or a constant: a clock reading would give each read a different ulid.
+/// The body is two FNV-1a 64 digests under different domain bytes, 40 bits
+/// of each. FNV is not collision-resistant against an adversary, so a caller
+/// that skips a row because its ulid is taken must check that the row held is
+/// the same one ([`crate::ledger`] does, by the identity stored in the row).
+pub(crate) fn identity_ulid(ms: u64, identity: &[u8]) -> String {
+    let digest = |domain: u8| {
+        let mut bytes = Vec::with_capacity(identity.len() + 1);
+        bytes.push(domain);
+        bytes.extend_from_slice(identity);
+        fnv1a64(&bytes)
+    };
+    encode_ulid(ms, digest(0x01), digest(0x02))
+}
+
+/// The 26 Crockford characters for a 48-bit time and an 80-bit body made of
+/// the low 40 bits of `hi` and of `lo`.
+fn encode_ulid(ms: u64, hi: u64, lo: u64) -> String {
     let mut out = [0u8; 26];
     // 48-bit timestamp -> 10 characters.
     let mut t = ms & 0xFFFF_FFFF_FFFF;

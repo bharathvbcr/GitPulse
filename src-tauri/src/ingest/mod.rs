@@ -130,8 +130,11 @@ pub struct CatchUp {
     pub reflog_entries: i64,
     /// Replayed entries the ledger refused because it already held them (the
     /// unique reflog identity index): another pass or process recorded them
-    /// first. `reflog_entries` is these plus the entries recorded plus any that
-    /// failed to write, so a shortfall is always accounted for.
+    /// first. `reflog_entries` is the reflog share of these plus the entries
+    /// recorded plus any that failed to write, so a shortfall is always
+    /// accounted for. Transcript rows the ledger already held (a line read
+    /// again after its cursor was lost or went stale; same `ulid`) are counted
+    /// here too, and are not reflog entries.
     #[serde(default)]
     pub duplicates_refused: i64,
     /// Reflog entries whose ledger write failed (counted by the ledger's dropped
