@@ -244,18 +244,16 @@ pub fn ulid(ms: u64) -> String {
 ///
 /// `ms` should be a time the identity itself fixes (the row's own event time),
 /// or a constant: a clock reading would give each read a different ulid.
-/// The body is two FNV-1a 64 digests under different domain bytes, 40 bits
-/// of each. FNV is not collision-resistant against an adversary, so a caller
-/// that skips a row because its ulid is taken must check that the row held is
-/// the same one ([`crate::ledger`] does, by the identity stored in the row).
+/// The body is the first 80 bits of the identity's SHA-256, so a transcript
+/// line (which the agent wrote) cannot be crafted to take another row's ulid
+/// short of a 2^80-work search. A caller that skips a row because its ulid is
+/// taken still checks that the row held is the same one ([`crate::ledger`]
+/// does, by the identity stored in the row).
 pub(crate) fn identity_ulid(ms: u64, identity: &[u8]) -> String {
-    let digest = |domain: u8| {
-        let mut bytes = Vec::with_capacity(identity.len() + 1);
-        bytes.push(domain);
-        bytes.extend_from_slice(identity);
-        fnv1a64(&bytes)
-    };
-    encode_ulid(ms, digest(0x01), digest(0x02))
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(identity);
+    let word = |bytes: &[u8]| bytes.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
+    encode_ulid(ms, word(&digest[..5]), word(&digest[5..10]))
 }
 
 /// The 26 Crockford characters for a 48-bit time and an 80-bit body made of
