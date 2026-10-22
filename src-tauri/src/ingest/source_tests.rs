@@ -104,6 +104,16 @@ fn claude_rows_digest() -> (String, u64) {
         .unwrap()
         .iter()
         .map(|e| {
+            // The row identity names the transcript by a digest of its path,
+            // which is a temporary directory here. Everything else in the
+            // detail stays pinned byte for byte.
+            let detail = e.detail_json.as_deref().map(|detail| {
+                let start = detail
+                    .find(&format!(",\"{}\":\"", ledger::TRANSCRIPT_ROW_KEY))
+                    .expect("a transcript row names its line");
+                let end = start + detail[start + 1..].find("\",").unwrap() + 2;
+                format!("{}{}", &detail[..start], &detail[end..])
+            });
             format!(
                 "{}|{:?}|{:?}|{}|{:?}|{}|{:?}|{:?}|{:?}",
                 e.action,
@@ -114,7 +124,7 @@ fn claude_rows_digest() -> (String, u64) {
                 e.outcome,
                 e.worktree_path,
                 e.task_id,
-                e.detail_json
+                detail
             )
             .replace(repo, "<repo>")
         })

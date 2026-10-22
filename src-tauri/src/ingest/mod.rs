@@ -83,6 +83,13 @@ pub struct CatchUp {
     /// `transcripts_unlisted`.
     #[serde(default)]
     pub refused_outside_corpus: i64,
+    /// Saved transcript offsets whose file this pass's walk did not list and
+    /// that it did not forget: the cursors of files that are gone while
+    /// forgetting is held back (an unreadable or recently absent root, a walk
+    /// that was cut), or a forget that failed. Zero after a pass that forgot
+    /// them. Not stored with the catch-up state, which has no column for it.
+    #[serde(default)]
+    pub stale_cursors: i64,
     /// Whether the corpus walk listed the whole corpus: null when no walk ran
     /// (no transcript root, or the pass was skipped), false when it was cut,
     /// hit an unreadable directory, or left files unlisted.
@@ -130,8 +137,11 @@ pub struct CatchUp {
     pub reflog_entries: i64,
     /// Replayed entries the ledger refused because it already held them (the
     /// unique reflog identity index): another pass or process recorded them
-    /// first. `reflog_entries` is these plus the entries recorded plus any that
-    /// failed to write, so a shortfall is always accounted for.
+    /// first. `reflog_entries` is the reflog share of these plus the entries
+    /// recorded plus any that failed to write, so a shortfall is always
+    /// accounted for. Transcript rows the ledger already held (a line read
+    /// again after its cursor was lost or went stale; same `ulid`) are counted
+    /// here too, and are not reflog entries.
     #[serde(default)]
     pub duplicates_refused: i64,
     /// Reflog entries whose ledger write failed (counted by the ledger's dropped
@@ -389,6 +399,7 @@ fn transcript_draft(
     ledger_repo: &str,
     worktree_path: &str,
     history: &ledger::bindings::BindingHistory,
+    row: ledger::TranscriptRow,
 ) -> Draft {
     let when = EventTime::at(
         "transcript",
@@ -401,6 +412,7 @@ fn transcript_draft(
         "tool": call.tool,
         "transcript_version": call.version,
         "git_branch": call.git_branch,
+        ledger::TRANSCRIPT_ROW_KEY: row.key(),
     })
     .to_string();
     Draft {
@@ -1294,6 +1306,8 @@ impl CatchUp {
         self.unlisted_cap = transcripts.unlisted_cap;
         self.unlisted_lower_bound = transcripts.unlisted_lower_bound;
         self.refused_outside_corpus = transcripts.refused_outside_corpus;
+        self.stale_cursors = transcripts.stale_cursors;
+        self.duplicates_refused += transcripts.duplicates_refused;
         self.walk_complete = transcripts.walk_complete;
         self.skipped_lines = transcripts.skipped_lines;
         self.rehosted_calls = transcripts.rehosted_calls;

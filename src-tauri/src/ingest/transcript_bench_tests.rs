@@ -70,3 +70,62 @@ fn bench_transcript_pass_over_two_thousand_unchanged_transcripts() {
         load()
     );
 }
+
+/// The append side: the first pass over `APPEND_FILES` transcripts of
+/// `APPEND_LINES` edits each, every row new, into a fresh ledger. Reports the
+/// minimum and median of `APPEND_PASSES` passes and the rows each recorded.
+#[test]
+#[ignore = "benchmark: run explicitly"]
+fn bench_first_pass_appends_every_row() {
+    const APPEND_FILES: usize = 100;
+    const APPEND_LINES: usize = 100;
+    const APPEND_PASSES: usize = 9;
+    let corpus = tempfile::tempdir().expect("corpus");
+    let slug = corpus.path().join("slug");
+    std::fs::create_dir_all(&slug).expect("slug");
+    let serial = crate::test_support::env::env_serial();
+    let _env =
+        crate::test_support::env::bind_env(&serial).set("GITPULSE_TRANSCRIPT_ROOT", corpus.path());
+    let mut times = Vec::new();
+    let mut recorded = Vec::new();
+    for _ in 0..APPEND_PASSES {
+        let repo_dir = tempfile::tempdir().expect("repo");
+        let repo = repo_dir
+            .path()
+            .canonicalize()
+            .expect("canonical")
+            .to_string_lossy()
+            .into_owned();
+        for i in 0..APPEND_FILES {
+            let lines: Vec<String> = (0..APPEND_LINES)
+                .map(|n| {
+                    serde_json::json!({
+                        "type": "assistant",
+                        "sessionId": format!("A{i}"),
+                        "timestamp": "2026-09-01T12:00:00.000Z",
+                        "version": "2.1.241",
+                        "cwd": repo,
+                        "message": { "content": [
+                            { "type": "tool_use", "name": "Edit",
+                              "input": { "file_path": format!("{repo}/f{i}_{n}.rs") } }
+                        ]}
+                    })
+                    .to_string()
+                })
+                .collect();
+            std::fs::write(slug.join(format!("A{i}.jsonl")), lines.join("\n") + "\n")
+                .expect("transcript");
+        }
+        let started = std::time::Instant::now();
+        let out = pass::ingest_family_until(&repo, &repo, &[], &mut |_| false);
+        times.push(started.elapsed().as_secs_f64() * 1000.0);
+        recorded.push(out.recorded);
+    }
+    times.sort_by(|x, y| x.partial_cmp(y).expect("finite"));
+    println!(
+        "BENCH first_pass_appends min_ms={:.2} median_ms={:.2} recorded={recorded:?} load={}",
+        times[0],
+        times[times.len() / 2],
+        load()
+    );
+}

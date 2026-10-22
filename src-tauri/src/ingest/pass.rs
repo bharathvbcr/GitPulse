@@ -531,6 +531,7 @@ fn ingest_family(
         };
 
         let mut drafts: Vec<Vec<ledger::Draft>> = owed.iter().map(|_| Vec::new()).collect();
+        let mut row_file: Option<String> = None;
         let mut touched: HashSet<usize> = HashSet::new();
         let mut consumed = 0u64;
         loop {
@@ -563,7 +564,9 @@ fn ingest_family(
             }
             let parsed = parser.parse(text);
             out.skipped_lines += parsed.skipped;
-            for call in parsed.calls {
+            let digest = ledger::ids::fnv1a64(body);
+            let row_file = row_file.get_or_insert_with(|| canonical_file_key(&path));
+            for (ordinal, call) in parsed.calls.into_iter().enumerate() {
                 // One owner per call, and the row is always the owner's:
                 // its path, its task. A removed worktree is found by
                 // its path alone, and only when the family is known (an
@@ -656,6 +659,12 @@ fn ingest_family(
                     ledger_repo,
                     worktree,
                     history,
+                    ledger::TranscriptRow {
+                        file_key: row_file.clone(),
+                        offset: line.offset,
+                        ordinal,
+                        digest,
+                    },
                 ));
                 out.rehosted_calls += i64::from(rehosted);
             }
@@ -748,6 +757,7 @@ fn ingest_family(
     // forgetting its offset would replay it. Hosted owners hold cursors too,
     // for the files this pass met them in.
     let forgets = walks_complete && !blocks_forget && !out.truncated;
+    let mut stale = 0usize;
     if forgets {
         for participant in participants.into_iter().chain(owners.hosted) {
             let gone: Vec<String> = participant
@@ -757,9 +767,18 @@ fn ingest_family(
                 .collect();
             if let Err(e) = ledger::forget_transcripts(ledger_repo, &participant.path, &gone) {
                 out.error = format!("vanished transcripts could not be forgotten: {e}");
+                stale += gone.len();
             }
         }
+    } else {
+        stale = participants
+            .iter()
+            .chain(&owners.hosted)
+            .flat_map(|participant| participant.offsets.keys())
+            .filter(|key| !listed.contains(*key))
+            .count();
     }
+    out.stale_cursors = i64::try_from(stale).unwrap_or(i64::MAX);
     // Files the walk saw and did not list were not read: the pass is a floor,
     // however it ended, and says how much it left and why. After the forget
     // decision above, which a walk that left any behind never reaches.
@@ -796,6 +815,77 @@ fn ingest_family(
 /// How many roots a marker remembers.
 const MAX_MARKER_ROOTS: usize = 8;
 
+/// How many passes in a row a recorded root must be confirmed absent
+/// (`ENOENT`, nothing else) before the marker retires it and forgetting is no
+/// longer held for it. A mount that is slow to return, a `CODEX_HOME` pointed
+/// elsewhere for a day: this long is how patient the pass is with them.
+pub(super) const RETIRE_ROOT_AFTER_ABSENT_PASSES: u32 = 5;
+
+/// How many unreadable recorded roots one pass names in its error; the rest
+/// are counted ("and K more"), so the text does not grow with the marker.
+const MAX_NAMED_ROOTS: usize = 3;
+
+/// Separates a root from its run of absent passes in a marker line. A marker
+/// line without it is a root absent for none.
+const ABSENT_COUNT_SEPARATOR: char = '\u{1f}';
+
+/// A marker's roots, each with the passes in a row it has been absent. The
+/// roots of every participant's marker, a root's count the largest any holds.
+fn marker_roots<'a>(texts: impl Iterator<Item = &'a str>) -> Vec<(String, u32)> {
+    let mut roots: Vec<(String, u32)> = Vec::new();
+    for text in texts {
+        for line in text.lines() {
+            let (root, count) = match line.rsplit_once(ABSENT_COUNT_SEPARATOR) {
+                Some((root, count)) => (root, run_of_absent_passes(root, count)),
+                None => (line, 0),
+            };
+            match roots.iter_mut().find(|(known, _)| known == root) {
+                Some((_, known)) => *known = (*known).max(count),
+                None => roots.push((root.to_string(), count)),
+            }
+        }
+    }
+    roots
+}
+
+/// A marker's run of absent passes, read back. A run that is not a number, or
+/// that is not below [`RETIRE_ROOT_AFTER_ABSENT_PASSES`] (a root is retired at
+/// that count, so no marker written by this code holds one), is a corrupt
+/// marker: the run restarts at 0 and the pass says so in the log.
+fn run_of_absent_passes(root: &str, text: &str) -> u32 {
+    match text.parse::<u32>() {
+        Ok(count) if count < RETIRE_ROOT_AFTER_ABSENT_PASSES => count,
+        _ => {
+            log::warn!(
+                "the transcript marker's run {text:?} for root {root} is not valid; restarted"
+            );
+            0
+        }
+    }
+}
+
+fn marker_text(roots: &[(String, u32)]) -> String {
+    let keep = roots.len().saturating_sub(MAX_MARKER_ROOTS);
+    roots[keep..]
+        .iter()
+        .map(|(root, count)| match count {
+            0 => root.clone(),
+            count => format!("{root}{ABSENT_COUNT_SEPARATOR}{count}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether `root` is confirmed gone: the filesystem says it does not exist.
+/// A permission error, a path component that is a file, or a root that exists
+/// but is not the one read this pass is not "gone".
+fn root_is_absent(root: &str) -> bool {
+    matches!(
+        std::fs::metadata(root),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 /// Keeps each optional source's marker, and holds forgetting back when a root
 /// that held transcripts is not among the roots read now.
 ///
@@ -806,6 +896,15 @@ const MAX_MARKER_ROOTS: usize = 8;
 /// duplicate rows when the root returns. So a root recorded in a marker and
 /// absent now stops every forget this pass, with the root and the reason in
 /// `gaps`. A root that held nothing is never recorded, and never blocks.
+///
+/// A held-back forget must not last forever, or the cursors of deleted
+/// transcripts pile up once a source has used two roots (only one is read per
+/// pass). A root confirmed absent ([`root_is_absent`]) for
+/// [`RETIRE_ROOT_AFTER_ABSENT_PASSES`] passes in a row is retired from the
+/// marker, and stops holding forgetting back. The run is kept in the marker, and
+/// any pass that finds the root present or readable (or fails to tell) restarts
+/// it. Retiring is safe because a transcript recorded again after its cursor
+/// was forgotten is recognised by its row identity and refused, not duplicated.
 fn track_roots(
     participants: &mut [Participant],
     active: &[(&'static dyn TranscriptSource, std::path::PathBuf)],
@@ -816,51 +915,67 @@ fn track_roots(
 ) {
     for source in source::sources().iter().filter(|s| s.optional()) {
         let key = seen_key(*source);
-        let mut recorded: Vec<String> = Vec::new();
-        for participant in participants.iter() {
-            for root in participant
-                .fingerprints
-                .get(&key)
-                .map(String::as_str)
-                .unwrap_or_default()
-                .lines()
-            {
-                if !recorded.iter().any(|known| known == root) {
-                    recorded.push(root.to_string());
-                }
-            }
-        }
-        for root in &recorded {
+        let texts = |participants: &[Participant]| -> Vec<String> {
+            participants
+                .iter()
+                .map(|p| p.fingerprints.get(&key).cloned().unwrap_or_default())
+                .collect()
+        };
+        let before = texts(participants);
+        let recorded = marker_roots(before.iter().map(String::as_str));
+        let mut roots: Vec<(String, u32)> = Vec::new();
+        let mut unread = 0usize;
+        for (root, count) in &recorded {
             let read_now = active.iter().any(|(s, path)| {
                 s.actor_id() == source.actor_id() && path.to_string_lossy() == root.as_str()
             });
             if read_now {
+                roots.push((root.clone(), 0));
                 continue;
             }
+            let absent_for = if root_is_absent(root) {
+                count.saturating_add(1)
+            } else {
+                0
+            };
+            if absent_for >= RETIRE_ROOT_AFTER_ABSENT_PASSES {
+                log::info!(
+                    "the {} transcript root {root} was absent for {absent_for} passes and is retired",
+                    source.name()
+                );
+                continue;
+            }
+            roots.push((root.clone(), absent_for));
             *missing_root = true;
             *blocks_forget = true;
-            if !gaps.iter().any(|gap| gap.contains(root.as_str())) {
+            unread += 1;
+            if unread <= MAX_NAMED_ROOTS && !gaps.iter().any(|gap| gap.contains(root.as_str())) {
                 gaps.push(format!(
                     "the {} transcript root {root} held transcripts earlier and is not readable now, so no saved offset was forgotten",
                     source.name()
                 ));
             }
         }
-        let mut roots = recorded.clone();
+        if unread > MAX_NAMED_ROOTS {
+            gaps.push(format!(
+                "and {} more {} transcript roots that held transcripts earlier are not readable now",
+                unread - MAX_NAMED_ROOTS,
+                source.name()
+            ));
+        }
         for (read, path, files) in read_roots {
             let shown = path.to_string_lossy();
             if read.actor_id() == source.actor_id()
                 && *files > 0
-                && !roots.iter().any(|known| known == shown.as_ref())
+                && !roots.iter().any(|(known, _)| known == shown.as_ref())
             {
-                roots.push(shown.into_owned());
+                roots.push((shown.into_owned(), 0));
             }
         }
-        if roots.len() == recorded.len() {
+        let text = marker_text(&roots);
+        if text == marker_text(&recorded) {
             continue;
         }
-        let keep = roots.len().saturating_sub(MAX_MARKER_ROOTS);
-        let text = roots[keep..].join("\n");
         for participant in participants.iter_mut() {
             let from = participant.offsets.get(&key).copied();
             participant.offsets.insert(key.clone(), 1);
@@ -1192,6 +1307,15 @@ fn owed_on(
         .collect()
 }
 
+/// The file's name in a row's identity: the key of its canonical path, so one
+/// transcript reached through two spellings of its root (a symlink, `/var` and
+/// `/private/var`) is one file. The cursor keeps the key of the spelling it
+/// was read by; only the row identity is canonical. A path that cannot be
+/// canonicalized keeps its own spelling.
+fn canonical_file_key(path: &std::path::Path) -> String {
+    ledger::transcript_key(&std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+}
+
 /// Commits every participant's `pending` advances in one transaction, emptying
 /// them. False, with the error in `out`, when the ledger refused it — the pass
 /// stops there rather than read further into events it could not keep.
@@ -1216,8 +1340,9 @@ fn commit(
         return true;
     }
     match ledger::advance_transcripts_family(ledger_repo, advances) {
-        Ok(recorded) => {
-            out.recorded += recorded;
+        Ok(commit) => {
+            out.recorded += commit.recorded;
+            out.duplicates_refused += commit.refused;
             true
         }
         Err(e) => {

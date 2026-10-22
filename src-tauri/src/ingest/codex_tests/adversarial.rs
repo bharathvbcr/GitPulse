@@ -807,7 +807,6 @@ fn e02_a_relative_codex_home_is_refused_not_resolved_against_the_process_directo
 // ------------------------------------------------------------- 5/6. dup, mix
 
 #[test]
-#[ignore = "pre-existing: ledger transcript dedup, ft-001bf7fc"]
 fn d01_a_cursor_reset_does_not_duplicate_rows_for_either_source() {
     let pair = Pair::new();
     let w1 = &pair.wt[0];
@@ -837,6 +836,84 @@ fn d01_a_cursor_reset_does_not_duplicate_rows_for_either_source() {
         (1, 1),
         "the ledger has no content dedup for transcript rows"
     );
+}
+
+fn claude_rows(w: &str) -> Vec<String> {
+    let mut objects: Vec<String> = rows(w)
+        .iter()
+        .filter(|e| e.actor_id.as_deref() == Some("claude-code"))
+        .filter_map(|e| e.object.clone())
+        .collect();
+    objects.sort();
+    objects
+}
+
+#[test]
+fn d01b_two_identical_lines_are_two_rows_and_stay_two_after_a_cursor_reset() {
+    let pair = Pair::new();
+    let w1 = &pair.wt[0];
+    let claude = tempfile::tempdir().unwrap();
+    let lpath = claude.path().join("slug/C.jsonl");
+    let line = claude_edit(w1, "C", 2, &format!("{w1}/same.rs"));
+    write_lines(&lpath, &[line.clone(), line]);
+    with_roots(Some(claude.path()), None, || {
+        pair.pass();
+        assert_eq!(claude_rows(w1).len(), 2, "two lines are two rows");
+        ledger::forget_transcripts(w1, w1, &[ledger::transcript_key(&lpath)]).unwrap();
+        pair.pass();
+    });
+    assert_eq!(claude_rows(w1).len(), 2, "a reset must not add a third");
+}
+
+#[test]
+fn d01c_a_rewritten_transcript_records_only_the_lines_that_changed() {
+    let pair = Pair::new();
+    let w1 = &pair.wt[0];
+    let claude = tempfile::tempdir().unwrap();
+    let lpath = claude.path().join("slug/C.jsonl");
+    let edit = |second: u32, name: &str| claude_edit(w1, "C", second, &format!("{w1}/{name}"));
+    write_lines(&lpath, &[edit(1, "a.rs"), edit(2, "b.rs"), edit(3, "c.rs")]);
+    with_roots(Some(claude.path()), None, || {
+        pair.pass();
+        ledger::forget_transcripts(w1, w1, &[ledger::transcript_key(&lpath)]).unwrap();
+        write_lines(&lpath, &[edit(1, "a.rs"), edit(2, "z.rs"), edit(3, "c.rs")]);
+        pair.pass();
+    });
+    let files: Vec<String> = claude_rows(w1)
+        .iter()
+        .map(|o| o.rsplit('/').next().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        files,
+        ["a.rs", "b.rs", "c.rs", "z.rs"],
+        "only the changed line is new (a same-length edit leaves every later offset in place)"
+    );
+}
+
+#[test]
+fn d01d_two_passes_racing_after_a_cursor_reset_record_each_row_once() {
+    let pair = Pair::new();
+    let w1 = &pair.wt[0];
+    let claude = tempfile::tempdir().unwrap();
+    let codex = tempfile::tempdir().unwrap();
+    let cpath = rollout_path(codex.path(), "R");
+    write_lines(&cpath, &[session_meta("R", w1), run(1, "codex-once", w1)]);
+    let lpath = claude.path().join("slug/C.jsonl");
+    write_lines(&lpath, &[claude_edit(w1, "C", 2, &format!("{w1}/c.rs"))]);
+    with_roots(Some(claude.path()), Some(codex.path()), || {
+        pair.pass();
+        let keys = [
+            ledger::transcript_key(&cpath),
+            ledger::transcript_key(&lpath),
+        ];
+        ledger::forget_transcripts(w1, w1, &keys).unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| pair.pass());
+            }
+        });
+    });
+    assert_eq!(rows(w1).len(), 2, "{:?}", owners(&pair));
 }
 
 #[test]

@@ -820,7 +820,10 @@ fn the_codex_root_is_the_override_then_codex_home_then_the_home_directory() {
     );
 }
 
+mod adv2_w4l1;
+mod adv_w4l1;
 mod adversarial;
 mod adversarial2;
 mod adversarial3;
+mod roots_retire;
 mod codemode;
