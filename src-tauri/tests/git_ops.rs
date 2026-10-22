@@ -21,8 +21,7 @@ use common::run_git;
 fn shared_fixture_can_commit_without_global_identity() {
     let dir = tempfile::TempDir::new().unwrap();
     run_git(dir.path(), &["init", "-b", "main"]);
-    let empty_global = dir.path().join(".git/empty-global-config");
-    std::fs::write(&empty_global, "").unwrap();
+    let empty_global = common::env::hermetic::pinned_git_config();
     std::fs::write(dir.path().join("file"), "content\n").unwrap();
     run_git(dir.path(), &["add", "file"]);
     let output = std::process::Command::new("git")

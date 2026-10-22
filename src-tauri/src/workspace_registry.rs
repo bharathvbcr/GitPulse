@@ -426,7 +426,10 @@ mod tests {
             .args(["init", "--quiet"])
             .current_dir(dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                crate::test_support::env::hermetic::pinned_git_config(),
+            )
             .status_locked()
             .expect("git init");
         assert!(status.success(), "git init failed in {}", dir.display());

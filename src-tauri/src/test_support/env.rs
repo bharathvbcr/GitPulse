@@ -253,6 +253,24 @@ impl Drop for EnvBinding<'_> {
     }
 }
 
+/// Git settings every test-owned git config carries.
+///
+/// Git 2.54's `commit` runs `maintenance run --auto`, whose reflog-expire task
+/// deletes reflog entries older than the expiry once 100 have aged out.
+/// Fixtures date their commits at fixed epochs that age past it, so the same
+/// test lost 200 of its 251 entries on the day the epoch turned 30 days old. A
+/// test that points `GIT_CONFIG_GLOBAL` at a config of its own (an empty file,
+/// `/dev/null`, a mailmap) drops the hermetic config and with it this pin, so
+/// every such config is written through [`write_git_config`], or points at
+/// [`hermetic::pinned_git_config`].
+pub(crate) const GIT_MAINTENANCE_PIN: &str = "[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n\treflogExpire = never\n\treflogExpireUnreachable = never\n";
+
+/// Writes `path` as a git config holding [`GIT_MAINTENANCE_PIN`] followed by
+/// `extra` (more git config text, or empty).
+pub(crate) fn write_git_config(path: &std::path::Path, extra: &str) -> std::io::Result<()> {
+    std::fs::write(path, format!("{GIT_MAINTENANCE_PIN}{extra}"))
+}
+
 /// Names the per-process root. Its presence means this process is already
 /// hermetic: either a second `include!` of this file in the same crate ran the
 /// constructor first, or this process was spawned by a hermetic test process
@@ -298,6 +316,15 @@ pub(crate) mod hermetic {
             std::env::var_os(super::ROOT_MARKER)
                 .expect("the hermetic constructor did not run in this test process"),
         )
+    }
+
+    /// The pinned global git config the constructor wrote, by path under the
+    /// root rather than by the live `GIT_CONFIG_GLOBAL`, which a scoped
+    /// `bind_env` may be pointing elsewhere at that moment. A test that wants an
+    /// identity-free, maintenance-free git config of its own passes this to
+    /// `GIT_CONFIG_GLOBAL` instead of `/dev/null` or an empty file.
+    pub(crate) fn pinned_git_config() -> PathBuf {
+        root().join("gitconfig")
     }
 
     /// The `HOME` the developer's shell had before the constructor replaced it.
@@ -385,16 +412,14 @@ pub(crate) mod hermetic {
                 .unwrap_or_else(|error| panic!("hermetic test root {}: {error}", dir.display()));
         }
         let gitconfig = root.join("gitconfig");
-        // Automatic maintenance is off: Git 2.54's `commit` runs `maintenance
-        // run --auto`, whose reflog-expire task deletes reflog entries older
-        // than the expiry once 100 have aged out. Fixtures date their commits
-        // at fixed epochs that age past it, so the same test lost 200 of its
-        // 251 entries on the day the epoch turned 30 days old.
-        std::fs::write(
-            &gitconfig,
-            "[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n\treflogExpire = never\n\treflogExpireUnreachable = never\n",
-        )
+        super::write_git_config(&gitconfig, "")
             .unwrap_or_else(|error| panic!("hermetic gitconfig {}: {error}", gitconfig.display()));
+        // The application's own git runs with `GIT_CONFIG_GLOBAL` stripped and
+        // reads `$HOME/.gitconfig` instead, so the pin has to be there too.
+        let home_config = home.join(".gitconfig");
+        super::write_git_config(&home_config, "").unwrap_or_else(|error| {
+            panic!("hermetic gitconfig {}: {error}", home_config.display())
+        });
 
         let real_home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))

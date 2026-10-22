@@ -284,3 +284,115 @@ fn the_wall_clock_matcher_sees_single_line_and_wrapped_limits_only() {
     );
     assert_eq!(flagged("// assert!(elapsed < Duration::from_secs(5));"), 0);
 }
+
+/// Commits `count` empty commits dated `epoch` in a fresh repository whose only
+/// global git config is the file at `global`, and returns how many entries
+/// `HEAD`'s reflog holds afterwards.
+fn reflog_entries_after_commits(global: &Path, epoch: u64, count: usize) -> usize {
+    use gitpulse_lib::procguard::LockedSpawn;
+    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    let dir = tempfile::TempDir::new().unwrap();
+    let date = format!("{epoch} +0000");
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .env("GIT_CONFIG_GLOBAL", global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Test User")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test User")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .output_locked()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    for i in 0..count {
+        git(&["commit", "-q", "--allow-empty", "-m", &format!("c{i}")]);
+    }
+    git(&["reflog", "show", "--format=%H", "HEAD"])
+        .lines()
+        .count()
+}
+
+/// Git 2.54's `commit` runs `maintenance run --auto`, which expires reflog
+/// entries older than the expiry once 100 of them have aged out, so a fixture
+/// dated at a fixed epoch loses its history the day the epoch turns old. The
+/// fixture here is dated a year before the epoch the suites use and carries
+/// more than 100 entries, so it is past every expiry git has.
+#[test]
+fn a_git_config_written_through_the_helper_keeps_a_year_old_reflog_whole() {
+    const A_YEAR: u64 = 365 * 24 * 60 * 60;
+    const FIXTURE_EPOCH: u64 = 1_790_000_000;
+    const COMMITS: usize = 130;
+    let scratch = tempfile::TempDir::new().unwrap();
+    let global = scratch.path().join("gitconfig");
+    common::env::write_git_config(&global, "").unwrap();
+    assert_eq!(
+        reflog_entries_after_commits(&global, FIXTURE_EPOCH - A_YEAR, COMMITS),
+        COMMITS,
+        "auto-maintenance expired reflog entries of a fixture config written through the helper"
+    );
+}
+
+/// The application's own git runs with `GIT_CONFIG_GLOBAL` stripped and reads
+/// `$HOME/.gitconfig`, so the hermetic home has to carry the same pin.
+#[test]
+fn the_hermetic_home_pins_git_maintenance_for_the_applications_own_git() {
+    for path in [
+        common::env::hermetic::pinned_git_config(),
+        PathBuf::from(std::env::var_os("HOME").unwrap()).join(".gitconfig"),
+    ] {
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            text.contains(common::env::GIT_MAINTENANCE_PIN),
+            "{} does not pin git maintenance",
+            path.display()
+        );
+    }
+}
+
+/// A test that points `GIT_CONFIG_GLOBAL` at a config of its own (`/dev/null`,
+/// an empty file) drops the hermetic config and with it the maintenance pin.
+/// Every file that assigns the variable goes through the helper.
+#[test]
+fn every_test_that_assigns_git_config_global_goes_through_the_pinning_helper() {
+    let mut files = Vec::new();
+    rust_files(&manifest("src"), &mut files);
+    rust_files(&manifest("tests"), &mut files);
+    let mut offenders = Vec::new();
+    for file in files {
+        if file.ends_with("test_support/env.rs") || file.ends_with("tests/hermetic_contract.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file).unwrap();
+        if assigns_git_config_global(&text)
+            && !text.contains("pinned_git_config")
+            && !text.contains("write_git_config")
+        {
+            offenders.push(file.display().to_string());
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these files assign GIT_CONFIG_GLOBAL without pinned_git_config()/write_git_config(): {offenders:?}"
+    );
+}
+
+/// Whether the text assigns `GIT_CONFIG_GLOBAL` (as an `.env(..)`, `.set(..)` or
+/// `set_var(..)` argument, possibly broken onto the next line by rustfmt), as
+/// opposed to reading it or listing it among variables to strip.
+fn assigns_git_config_global(text: &str) -> bool {
+    text.match_indices("\"GIT_CONFIG_GLOBAL\"").any(|(at, _)| {
+        let before = text[..at].trim_end();
+        before.ends_with(".env(") || before.ends_with(".set(") || before.ends_with("set_var(")
+    })
+}

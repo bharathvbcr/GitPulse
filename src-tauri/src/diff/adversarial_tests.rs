@@ -376,7 +376,10 @@ fn git(dir: &Path, args: &[&str]) {
         .args(["-c", "user.name=a", "-c", "user.email=a@example.invalid"])
         .args(args)
         .current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            crate::test_support::env::hermetic::pinned_git_config(),
+        )
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .output_locked()
         .unwrap();
