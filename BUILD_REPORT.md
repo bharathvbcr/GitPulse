@@ -181,3 +181,50 @@ Gate 4 had caught the descriptor leak above. Its other failures were proven load
 3. **ft-92734a91:** should unbound worktrees be fenced?
 4. **QoS behaviour to confirm:** every `gitpulse-mcp` and `gitpulsed` child is banded, because those processes' default class is Background.
 5. **Host:** an orphaned TERM-ignoring busy loop (pid 36903, from DevCouncil corpora) ran at 99% CPU for 5 h. It is not ours, and it was not killed. Host load reached 118 during this wave.
+
+---
+
+# Waves 3–4 landing and wave 4 (2026-10-22)
+
+**State.**
+- **Wave 3 is merged** (`main` → `795ca31d`). Another session's uncommitted work in the shared checkout (70 files, idle for 14 h) blocked the merge. With the owner's approval it was **parked byte-exact on `parked/other-session-1022`** (verified against the working tree) before the checkout was cleaned. Nothing of it was edited. Rebase that branch onto main to resume it; expect a conflict in `src-tauri/src/lib.rs`.
+- **Wave 4 is merged** (`main` → `a8fecaa6`).
+- Nothing is pushed. All wave-3 and wave-4 branches and worktrees are removed. Other sessions' branches are untouched.
+
+**Owner decisions in wave 4:**
+- Low disk is **advise-only**.
+- `compressor_thrash` stays a deny fact.
+- ft-d1c290f1 is **deferred**.
+- The tree-sitter JS parser is **approved**.
+- Adding **sha2** as a direct dependency is **approved**.
+- Parking the other session's work is **approved**.
+
+## Cards moved to review (all on main)
+
+| Card | What landed | Adversarial history |
+|---|---|---|
+| **ft-5c0f0262** test time bombs (filed this wave) | One `GIT_MAINTENANCE_PIN` helper (maintenance.auto=false, reflog expiry never) for every test that uses its own git config, plus `$HOME/.gitconfig`. A source-scan guard enforces it. A fixture dated one year back keeps its full reflog (130/130; 30/130 without the helper). 264 short sleeps were reviewed; one was converted. | Test infrastructure; Opus-reviewed. |
+| **ft-d902fcb4** governor 1b, S5-07 (low disk, advise-only) | An injectable free-space reader: a panicking or unreadable reader means unknown. Copy accounting uses allocated size and the destination's `f_frsize` (APFS reports `f_bsize` = 1 MiB). An 8 GiB cap and a 10 GiB floor, whole-or-nothing through a typed `CopyStop` and a staging drop guard. Free space is re-checked every 64 MiB, including mid-file. A per-volume in-process reservation stops concurrent copies from jointly crossing the floor. Advisories are kept per repo, deduped to one per 10 min, and a cache error is never hidden. No deny path exists anywhere. | 2 rounds: 11 breaks, then 8 more; all fixed. |
+| **ft-6a6432c1** Codex code-mode parsed (tree-sitter-javascript) | Two direct dependency lines; Cargo.lock gains edges only, no new packages. Only straight-line calls with literal arguments are recorded. Everything else is counted with a reason: conditionals, optional chains, unreachable code, syntax errors (nothing recorded), alias, eval or Function strings. Bounds: 256 KiB, 250 ms and 200k nodes. A 256 KiB program takes about 40 ms in release. | 1 round: 5 gaps fixed. |
+| **ft-001bf7fc** ledger transcript dedup | The transcript-row ULID is **deterministic**: the line's own time plus 80 bits of SHA-256 over a canonical identity. The existing UNIQUE index dedups every replay path at O(log n), replacing a 30 s full scan. A content mismatch is counted, never silently held. Consolidation no longer aborts on `legacy_ulid_conflict`. | 2 rounds; FNV replaced by SHA-256 (owner-approved sha2). |
+| **ft-02a20716** stale cursor growth | A recorded root confirmed absent (ENOENT only) for 5 passes is retired, and forgetting resumes. The marker stays bounded at 8 roots. A corrupted counter never panics. | Covered by both dedup rounds. |
+
+## Gates (verified)
+
+- **Gate 6, full suites on `b22/integrate` a4988026.** Only integration drift failed: rustfmt order, a test spawning outside the locked seams, three TS wire fields, the `LowDiskCause` union, and the documented field count. Fixed in a8fecaa6.
+- **Gate 7, on a8fecaa6.** fmt, clippy `-D warnings`, `spawn_seam` 14, `hermetic_contract` 13, `ingest` 327, `bun run check`, `check:types` (0 drift) and `check:ipc` all OK. vitest: 10837 passed, 1 failed. The failure is `markdevRender` "does not slow quadratically" at 8.9 vs 8: a load flake in a file wave 4 does not touch, which passes 3/3 alone.
+- The first gate 7 run died with **ENOSPC**: the disk was at 132 MiB free with about 10 lane worktrees and 3 gate trees alive. They were removed after verifying each was merged, freeing 102 GiB.
+
+## Benchmarks
+
+- **Dedup append path:** UNMEASURED. The host load stayed between 13 and 76; a noisy debug run showed +14% (min of 7), which is not claimed. A release run on a quiet host is still needed.
+- **tree-sitter:** a 256 KiB program takes a median of 42.6 ms in release.
+- **Low disk:** on macOS a byte copy now walks the source twice. Not measured.
+
+## Still open
+
+- **ft-92734a91** (owner decision): unbound worktrees have no task-scope fence.
+- **ft-b595921a** (owner decision): the typed-error migration.
+- Blocked on held hooks and terminal files: ft-9cfd5574, ft-9cfd5474, the hook half of ft-da85cd55 (the spawn-budget drain still blocks commands under load), ft-9cfd5374 and ft-a2936457.
+- ft-cc4be67b (translucency A/B): needs a quiet host.
+- The installed `gitpulse-mcp` and `gitpulse-hook` predate waves 3 and 4, since the owner chose not to reinstall. Run `bun run mcp:install` and then `mcp:doctor` when convenient.
