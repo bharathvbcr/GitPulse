@@ -1,6 +1,6 @@
 //! The family-wide transcript pass.
 //!
-//! Claude transcripts (the only source ingested; no Codex reader exists)
+//! Agent transcripts (Claude Code's and Codex's, one [`TranscriptSource`] each)
 //! belong to the machine, not to a worktree, yet
 //! progress is recorded per worktree (`transcript_cursors (worktree_key,
 //! file_key, byte_offset)`) and used to be replayed per worktree: with eighteen
@@ -29,7 +29,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::lines::LineReader;
-use super::{transcript, CatchUp};
+use super::source::{self, TranscriptSource};
+use super::{transcript, CatchUp, Walk};
 use crate::ledger;
 use crate::ledger::bindings::BindingHistory;
 
@@ -313,13 +314,84 @@ fn ingest_family(
             return out;
         }
     }
-    let Some(root) = super::transcript_root() else {
+    let mut active: Vec<(&'static dyn TranscriptSource, std::path::PathBuf)> = Vec::new();
+    // What could not be read of a source's root, for `error`.
+    let mut gaps: Vec<String> = Vec::new();
+    // A root that is absent where it should not be: the listing is then not the
+    // whole corpus, whatever the roots that are there say.
+    let mut missing_root = false;
+    // Whether a saved offset may be forgotten at all this pass. An optional
+    // source's root problems only report: whether they hold anything back is
+    // `track_roots`'s call, from what the source has held before.
+    let mut blocks_forget = false;
+    // An optional source's default root that is not there (ENOENT, nothing more)
+    // is ordinary: "never installed" and "gone since the last pass" are told apart
+    // by the source's marker, below.
+    let mut any_root = false;
+    for source in source::sources() {
+        let Some(root) = source.root() else { continue };
+        any_root = true;
+        let name = source.name();
+        let shown = root.path.display();
+        let note = source.reports_unwalkable_root();
+        // A root that is not an absolute path would be read against whatever
+        // directory the app happens to be in.
+        if note && !root.path.is_absolute() {
+            missing_root = true;
+            blocks_forget |= !source.optional();
+            gaps.push(format!(
+                "the {name} transcript root {shown} is not an absolute path, so its transcripts were not read"
+            ));
+            continue;
+        }
+        match std::fs::metadata(&root.path) {
+            Ok(meta) if meta.is_dir() => active.push((source, root.path)),
+            Ok(_) => {
+                missing_root = true;
+                blocks_forget |= !source.optional();
+                if note {
+                    gaps.push(format!(
+                        "the {name} transcript root {shown} is not a directory, so its transcripts were not read"
+                    ));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if root.explicit || !source.optional() {
+                    missing_root = true;
+                    blocks_forget |= !source.optional();
+                    if root.explicit && note {
+                        gaps.push(format!(
+                            "the {name} transcript root {shown} does not exist, so its transcripts were not read"
+                        ));
+                    }
+                }
+            }
+            // Present, or not, but not to be told: a permission, a component
+            // that is a file. Never "absent": an unreachable root is not a root
+            // with nothing in it.
+            Err(e) => {
+                missing_root = true;
+                blocks_forget |= !source.optional();
+                if note {
+                    gaps.push(format!(
+                        "the {name} transcript root {shown} could not be read ({}), so its transcripts were not read",
+                        e.kind()
+                    ));
+                }
+            }
+        }
+    }
+    if !any_root {
         out.error = super::NO_TRANSCRIPT_ROOT.into();
         return out;
-    };
-    if !root.is_dir() {
+    }
+    if active.is_empty() {
         // No transcripts is the ordinary case for a machine that has never run
-        // an agent. Not an error.
+        // an agent. Not an error, unless a root was named and is not there.
+        if !gaps.is_empty() {
+            out.walk_complete = Some(false);
+            out.error = gaps.join("; ");
+        }
         return out;
     }
 
@@ -345,8 +417,51 @@ fn ingest_family(
         .collect();
     let mut owners = Owners::default();
 
-    let mut files = Vec::new();
-    let walk = super::collect_jsonl_until(&root, &mut files, 0, &mut || expired(&out));
+    // Every optional source has one marker cursor per worktree, in the cursor
+    // table beside the file cursors, never listed by a walk and never forgotten.
+    // Its fingerprint text holds the roots (newline-separated, the latest eight)
+    // that held transcripts of that source. See `track_roots`.
+    let markers: HashSet<String> = source::sources()
+        .iter()
+        .filter(|source| source.optional())
+        .map(|source| seen_key(*source))
+        .collect();
+
+    // Each source is walked on its own, under its own file cap and entry
+    // budget: a source with a huge corpus cannot starve another of its listing.
+    let mut files: Vec<(&'static dyn TranscriptSource, std::path::PathBuf)> = Vec::new();
+    let mut read_roots: Vec<(&'static dyn TranscriptSource, &std::path::Path, usize)> = Vec::new();
+    let mut walk = Walk::none();
+    for (source, root) in &active {
+        let mut listed_here = Vec::new();
+        let walked = super::collect_jsonl_until(root, &mut listed_here, 0, &mut || expired(&out));
+        let counted_unlisted =
+            walked.unlisted_depth > 0 || walked.unlisted_cap > 0 || walked.unlisted_lower_bound;
+        if source.reports_unwalkable_root() && !walked.complete && !walked.cut && !counted_unlisted
+        {
+            gaps.push(format!(
+                "the {} transcript root {} could not be read in full",
+                source.name(),
+                root.display()
+            ));
+        }
+        walk.absorb(&walked);
+        read_roots.push((*source, root.as_path(), listed_here.len()));
+        files.extend(listed_here.into_iter().map(|path| (*source, path)));
+    }
+    track_roots(
+        &mut participants,
+        &active,
+        &read_roots,
+        &mut gaps,
+        &mut missing_root,
+        &mut blocks_forget,
+    );
+    let walks_complete = walk.complete;
+    walk.complete &= !missing_root;
+    if active.len() > 1 {
+        files = single_owner(files, &active);
+    }
     if walk.cut {
         out.truncated = true;
     }
@@ -357,8 +472,9 @@ fn ingest_family(
     out.unlisted_lower_bound = walk.unlisted_lower_bound;
     out.refused_outside_corpus = walk.refused_outside_corpus;
     out.walk_complete = Some(walk.complete);
-    let mut listed = HashSet::new();
-    for path in files {
+    let mut listed = markers;
+    let mut resume_budget = source::RESUME_PASS_BYTES;
+    for (source, path) in files {
         if expired(&out) {
             out.truncated = true;
             break;
@@ -377,7 +493,14 @@ fn ingest_family(
             now: stat,
             answers: HashMap::new(),
         };
-        let owed = owed_on(&participants, &file_key, len, modified_ms, &mut probe);
+        let owed = owed_on(
+            &participants,
+            &file_key,
+            len,
+            modified_ms,
+            source.legacy_floor(),
+            &mut probe,
+        );
         // Nothing appended since every participant's last read. This is what
         // keeps a corpus no agent touched from being re-read every call.
         let Some(start) = owed.iter().map(|o| o.start).min() else {
@@ -400,6 +523,12 @@ fn ingest_family(
             }
         };
         out.transcripts += 1;
+        let Some(mut parser) = source.open(&path, start, &mut resume_budget) else {
+            // Its start cannot be replayed within this pass's budget: nothing is
+            // read and no cursor moves, so the next pass tries again. Counted.
+            out.skipped_lines += 1;
+            continue;
+        };
 
         let mut drafts: Vec<Vec<ledger::Draft>> = owed.iter().map(|_| Vec::new()).collect();
         let mut touched: HashSet<usize> = HashSet::new();
@@ -432,106 +561,103 @@ fn ingest_family(
             if text.trim().is_empty() {
                 continue;
             }
-            match transcript::parse_record(text) {
-                transcript::LineOutcome::NoCalls => {}
-                transcript::LineOutcome::Unreadable => out.skipped_lines += 1,
-                transcript::LineOutcome::Calls(calls) => {
-                    for call in calls {
-                        // One owner per call, and the row is always the owner's:
-                        // its path, its task. A removed worktree is found by
-                        // its path alone, and only when the family is known (an
-                        // unresolved one may hold live worktrees this pass
-                        // cannot see). A worktree this pass has no room for
-                        // owns its rows just the same. Either is "hosted": the
-                        // bytes ride the transaction of the deepest root that
-                        // has a slot, whose cursor keeps them exactly-once.
-                        let departed = if resolved {
-                            transcript::departed_root(&call, &roots)
-                        } else {
-                            None
-                        };
-                        let (hosted_owner_root, live_host) = match &departed {
-                            Some(departed) => (Some((departed.root, false)), departed.host),
-                            None => match transcript::attribution_root(&call, &roots) {
-                                Some(root) if by_path.contains_key(root) => (None, root),
-                                Some(root) => (Some((root, true)), root),
-                                None => continue,
-                            },
-                        };
-                        let (index, rehosted) = match by_path.get(live_host) {
-                            Some(&index) => (index, false),
-                            None => {
-                                let owner = hosted_owner_root.map_or(live_host, |(root, _)| root);
-                                match transcript::deepest_root(owner, paths)
-                                    .and_then(|root| by_path.get(root))
-                                {
-                                    Some(&index) => (index, true),
-                                    None => continue,
-                                }
-                            }
-                        };
-                        // A host that owes nothing here has already consumed it.
-                        let Some(slot) = owed.iter().position(|o| o.participant == index) else {
-                            continue;
-                        };
-                        let owes = &owed[slot];
-                        // Bytes before a participant's own cursor are ones
-                        // it has already consumed.
-                        if line.offset < owes.start {
-                            continue;
-                        }
-                        let participant = &participants[index];
-                        // Compared as instants: a transcript's own spelling may
-                        // carry an offset, which does not order as text. A time
-                        // that cannot be read is not skipped; a duplicate row
-                        // is recoverable, a lost one is not.
-                        if owes.floored
-                            && participant.baseline_ms > 0
-                            && ledger::ids::parse_event_time(&call.ts_utc)
-                                .is_some_and(|at| at <= participant.baseline_ms)
+            let parsed = parser.parse(text);
+            out.skipped_lines += parsed.skipped;
+            for call in parsed.calls {
+                // One owner per call, and the row is always the owner's:
+                // its path, its task. A removed worktree is found by
+                // its path alone, and only when the family is known (an
+                // unresolved one may hold live worktrees this pass
+                // cannot see). A worktree this pass has no room for
+                // owns its rows just the same. Either is "hosted": the
+                // bytes ride the transaction of the deepest root that
+                // has a slot, whose cursor keeps them exactly-once.
+                let departed = if resolved {
+                    transcript::departed_root(&call, &roots)
+                } else {
+                    None
+                };
+                let (hosted_owner_root, live_host) = match &departed {
+                    Some(departed) => (Some((departed.root, false)), departed.host),
+                    None => match transcript::attribution_root(&call, &roots) {
+                        Some(root) if by_path.contains_key(root) => (None, root),
+                        Some(root) => (Some((root, true)), root),
+                        None => continue,
+                    },
+                };
+                let (index, rehosted) = match by_path.get(live_host) {
+                    Some(&index) => (index, false),
+                    None => {
+                        let owner = hosted_owner_root.map_or(live_host, |(root, _)| root);
+                        match transcript::deepest_root(owner, paths)
+                            .and_then(|root| by_path.get(root))
                         {
-                            continue;
+                            Some(&index) => (index, true),
+                            None => continue,
                         }
-                        let (worktree, history) = match hosted_owner_root {
-                            Some((root, live)) => {
-                                match hosted_owner(ledger_repo, root, live, &mut owners, &mut out) {
-                                    Some(owner) => {
-                                        // Consumed in a pass of its own, or
-                                        // hosted by an earlier one.
-                                        if consumed_by(
-                                            &owners.hosted[owner],
-                                            &file_key,
-                                            line.offset,
-                                            len,
-                                            &mut probe,
-                                        ) {
-                                            continue;
-                                        }
-                                        touched.insert(owner);
-                                        (root, &owners.hosted[owner].history)
-                                    }
-                                    // Past the bound on untrusted names: the
-                                    // row is still the owner's and the host's
-                                    // cursor still keeps it exactly-once, but
-                                    // the owner's own cursor is not touched,
-                                    // and its task is not looked up.
-                                    None => {
-                                        out.departed_overflow += 1;
-                                        (root, &NO_HISTORY)
-                                    }
-                                }
-                            }
-                            None => (participant.path.as_str(), &participant.history),
-                        };
-                        drafts[slot].push(super::transcript_draft(
-                            &call,
-                            ledger_repo,
-                            worktree,
-                            history,
-                        ));
-                        out.rehosted_calls += i64::from(rehosted);
                     }
+                };
+                // A host that owes nothing here has already consumed it.
+                let Some(slot) = owed.iter().position(|o| o.participant == index) else {
+                    continue;
+                };
+                let owes = &owed[slot];
+                // Bytes before a participant's own cursor are ones
+                // it has already consumed.
+                if line.offset < owes.start {
+                    continue;
                 }
+                let participant = &participants[index];
+                // Compared as instants: a transcript's own spelling may
+                // carry an offset, which does not order as text. A time
+                // that cannot be read is not skipped; a duplicate row
+                // is recoverable, a lost one is not.
+                if owes.floored
+                    && participant.baseline_ms > 0
+                    && ledger::ids::parse_event_time(&call.ts_utc)
+                        .is_some_and(|at| at <= participant.baseline_ms)
+                {
+                    continue;
+                }
+                let (worktree, history) = match hosted_owner_root {
+                    Some((root, live)) => {
+                        match hosted_owner(ledger_repo, root, live, &mut owners, &mut out) {
+                            Some(owner) => {
+                                // Consumed in a pass of its own, or
+                                // hosted by an earlier one.
+                                if consumed_by(
+                                    &owners.hosted[owner],
+                                    &file_key,
+                                    line.offset,
+                                    len,
+                                    &mut probe,
+                                ) {
+                                    continue;
+                                }
+                                touched.insert(owner);
+                                (root, &owners.hosted[owner].history)
+                            }
+                            // Past the bound on untrusted names: the
+                            // row is still the owner's and the host's
+                            // cursor still keeps it exactly-once, but
+                            // the owner's own cursor is not touched,
+                            // and its task is not looked up.
+                            None => {
+                                out.departed_overflow += 1;
+                                (root, &NO_HISTORY)
+                            }
+                        }
+                    }
+                    None => (participant.path.as_str(), &participant.history),
+                };
+                drafts[slot].push(super::transcript_draft(
+                    &call,
+                    source.actor_id(),
+                    ledger_repo,
+                    worktree,
+                    history,
+                ));
+                out.rehosted_calls += i64::from(rehosted);
             }
         }
         #[cfg(test)]
@@ -621,7 +747,7 @@ fn ingest_family(
     // corpus: a file missing from a partial listing may still exist, and
     // forgetting its offset would replay it. Hosted owners hold cursors too,
     // for the files this pass met them in.
-    let forgets = walk.complete && !out.truncated;
+    let forgets = walks_complete && !blocks_forget && !out.truncated;
     if forgets {
         for participant in participants.into_iter().chain(owners.hosted) {
             let gone: Vec<String> = participant
@@ -655,7 +781,176 @@ fn ingest_family(
             format!("{}; {note}", out.error)
         };
     }
+    // A root that was named and could not be read is a gap in the history, and
+    // is said whether or not anything else went wrong.
+    for gap in gaps {
+        out.error = if out.error.is_empty() {
+            gap
+        } else {
+            format!("{}; {gap}", out.error)
+        };
+    }
     out
+}
+
+/// How many roots a marker remembers.
+const MAX_MARKER_ROOTS: usize = 8;
+
+/// Keeps each optional source's marker, and holds forgetting back when a root
+/// that held transcripts is not among the roots read now.
+///
+/// Cursors are keyed by a hash of the file's path, so a cursor cannot be told
+/// from another source's. A root that held transcripts and is not read this pass
+/// (an unmounted volume, a `CODEX_HOME` pointed elsewhere and back) may hold
+/// files the pass cannot list; forgetting their cursors would replay them as
+/// duplicate rows when the root returns. So a root recorded in a marker and
+/// absent now stops every forget this pass, with the root and the reason in
+/// `gaps`. A root that held nothing is never recorded, and never blocks.
+fn track_roots(
+    participants: &mut [Participant],
+    active: &[(&'static dyn TranscriptSource, std::path::PathBuf)],
+    read_roots: &[(&'static dyn TranscriptSource, &std::path::Path, usize)],
+    gaps: &mut Vec<String>,
+    missing_root: &mut bool,
+    blocks_forget: &mut bool,
+) {
+    for source in source::sources().iter().filter(|s| s.optional()) {
+        let key = seen_key(*source);
+        let mut recorded: Vec<String> = Vec::new();
+        for participant in participants.iter() {
+            for root in participant
+                .fingerprints
+                .get(&key)
+                .map(String::as_str)
+                .unwrap_or_default()
+                .lines()
+            {
+                if !recorded.iter().any(|known| known == root) {
+                    recorded.push(root.to_string());
+                }
+            }
+        }
+        for root in &recorded {
+            let read_now = active.iter().any(|(s, path)| {
+                s.actor_id() == source.actor_id() && path.to_string_lossy() == root.as_str()
+            });
+            if read_now {
+                continue;
+            }
+            *missing_root = true;
+            *blocks_forget = true;
+            if !gaps.iter().any(|gap| gap.contains(root.as_str())) {
+                gaps.push(format!(
+                    "the {} transcript root {root} held transcripts earlier and is not readable now, so no saved offset was forgotten",
+                    source.name()
+                ));
+            }
+        }
+        let mut roots = recorded.clone();
+        for (read, path, files) in read_roots {
+            let shown = path.to_string_lossy();
+            if read.actor_id() == source.actor_id()
+                && *files > 0
+                && !roots.iter().any(|known| known == shown.as_ref())
+            {
+                roots.push(shown.into_owned());
+            }
+        }
+        if roots.len() == recorded.len() {
+            continue;
+        }
+        let keep = roots.len().saturating_sub(MAX_MARKER_ROOTS);
+        let text = roots[keep..].join("\n");
+        for participant in participants.iter_mut() {
+            let from = participant.offsets.get(&key).copied();
+            participant.offsets.insert(key.clone(), 1);
+            participant.fingerprints.insert(key.clone(), text.clone());
+            participant.pending.push(ledger::TranscriptAdvance {
+                file_key: key.clone(),
+                from,
+                to: 1,
+                fingerprint: Some(text.clone()),
+                drafts: Vec::new(),
+            });
+        }
+    }
+}
+
+type Listed = Vec<(&'static dyn TranscriptSource, std::path::PathBuf)>;
+
+/// Gives every listed file exactly one owning source.
+///
+/// Two sources list the same file when their roots overlap (one directory named
+/// as both, or one root inside the other). Reading it with both would record
+/// its lines twice or, worse, let the wrong parser's cursor advance win. The
+/// owner is the source that recognises the file by its first line, else the one
+/// whose root is deeper (the more specific claim), else the first listed.
+/// Files are matched by identity, so two spellings of one path are one file.
+/// Without overlapping roots nothing is looked at.
+fn single_owner(
+    files: Listed,
+    active: &[(&'static dyn TranscriptSource, std::path::PathBuf)],
+) -> Listed {
+    let canonical: Vec<Option<std::path::PathBuf>> = active
+        .iter()
+        .map(|(_, root)| std::fs::canonicalize(root).ok())
+        .collect();
+    let overlap = canonical.iter().enumerate().any(|(i, a)| {
+        canonical
+            .iter()
+            .enumerate()
+            .any(|(j, b)| i != j && matches!((a, b), (Some(a), Some(b)) if a.starts_with(b)))
+    });
+    if !overlap {
+        return files;
+    }
+    let depth = |source: &dyn TranscriptSource| {
+        active
+            .iter()
+            .zip(&canonical)
+            .find(|((s, _), _)| s.actor_id() == source.actor_id())
+            .and_then(|(_, root)| root.as_ref())
+            .map_or(0, |root| root.components().count())
+    };
+    let mut at: HashMap<super::DirId, usize> = HashMap::new();
+    let mut kept: Listed = Vec::new();
+    for (source, path) in files {
+        let id = std::fs::metadata(&path)
+            .ok()
+            .and_then(|meta| super::dir_id(&meta, &path));
+        let Some(id) = id else {
+            kept.push((source, path));
+            continue;
+        };
+        let Some(&held_at) = at.get(&id) else {
+            at.insert(id, kept.len());
+            kept.push((source, path));
+            continue;
+        };
+        let held = kept[held_at].0;
+        if held.actor_id() == source.actor_id() {
+            continue;
+        }
+        let (claims, held_claims) = (source.recognises(&path), held.recognises(&path));
+        let preferred = if claims == held_claims {
+            depth(source) > depth(held)
+        } else {
+            claims
+        };
+        if preferred {
+            kept[held_at] = (source, path);
+        }
+    }
+    kept
+}
+
+/// The cursor key that records that `source` has been read for a worktree. It
+/// names no file, so it is never listed by a walk, and the pass keeps it.
+fn seen_key(source: &dyn TranscriptSource) -> String {
+    ledger::transcript_key(std::path::Path::new(&format!(
+        "gitpulse-transcript-source-read:{}",
+        source.actor_id()
+    )))
 }
 
 /// The answer for a removed worktree's rows the pass did not look up: no task,
@@ -841,6 +1136,7 @@ fn owed_on(
     file_key: &str,
     len: u64,
     modified_ms: Option<u64>,
+    legacy_floor: bool,
     probe: &mut Probe<'_>,
 ) -> Vec<Owed> {
     participants
@@ -875,12 +1171,15 @@ fn owed_on(
                 // one is not.
                 Some(_) => (0, false),
                 // Untouched since the baseline: the old watermark already read it.
-                None if participant.baseline_ms > 0
+                // Only for a source the old watermark described: a source it
+                // never read has nothing before the line to be skipped.
+                None if legacy_floor
+                    && participant.baseline_ms > 0
                     && !super::written_since(modified_ms, participant.baseline_ms) =>
                 {
                     return None
                 }
-                None => (0, !participant.baseline.is_empty()),
+                None => (0, legacy_floor && !participant.baseline.is_empty()),
             };
             Some(Owed {
                 participant: index,

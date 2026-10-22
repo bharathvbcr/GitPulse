@@ -800,7 +800,9 @@ fn a_hostile_cwd_is_attributed_without_panic_or_a_departed_root() {
         write_lines(&nested.file("H1.jsonl"), &lines);
         let out = nested.pass(&nested.base, &[]);
         assert_eq!(out.error, "", "{out:?}");
-        assert_eq!(out.recorded, 5, "{out:?}");
+        // `{base}/../../etc` resolves to `/etc`, outside the worktree: it used to
+        // be attributed here by its byte prefix, and is now nobody's.
+        assert_eq!(out.recorded, 4, "{out:?}");
     });
     let rows = nested.rows();
     assert!(rows.iter().all(|row| row.0.is_none()), "{rows:?}");

@@ -4,9 +4,12 @@
 //! open, and both are things the system observed rather than things an agent
 //! reported about itself:
 //!
-//! * **Agent transcripts** — `~/.claude/projects/**/*.jsonl`, parsed by
-//!   [`transcript`]. Measured over the real corpus, 97.3% of mutating tool
-//!   calls in repositories that still exist attribute to a repository path.
+//! * **Agent transcripts** — Claude Code's `~/.claude/projects/**/*.jsonl`
+//!   (parsed by [`transcript`]) and Codex's
+//!   `~/.codex/sessions/**/rollout-*.jsonl` (parsed by [`codex`]), each a
+//!   [`source::TranscriptSource`]. Measured over the real Claude corpus, 97.3%
+//!   of mutating tool calls in repositories that still exist attribute to a
+//!   repository path.
 //! * **The reflog** — git's own record of every ref movement, which is
 //!   authoritative for commits and survives GitPulse being uninstalled.
 //!
@@ -36,9 +39,11 @@
 //! good. A worktree with no such row had no watermark at all and re-read the
 //! whole corpus on every call.
 
+mod codex;
 mod flight;
 mod lines;
 mod pass;
+mod source;
 pub mod transcript;
 
 use crate::ledger::{self, ActorKind, Draft, Outcome};
@@ -174,11 +179,14 @@ pub const CATCH_UP_DEADLINE: std::time::Duration = std::time::Duration::from_sec
 /// callers that count failures leave it out, and callers that show errors keep it.
 pub(crate) const NO_TRANSCRIPT_ROOT: &str = "no home directory, so transcripts cannot be located";
 
-/// Where Claude Code keeps its transcripts.
-pub(crate) fn transcript_root() -> Option<std::path::PathBuf> {
-    std::env::var_os("GITPULSE_TRANSCRIPT_ROOT")
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs_home().map(|h| h.join(".claude").join("projects")))
+/// Where each transcript source looks, by name, for the hermetic canary that
+/// checks every per-user directory resolves under the test process's own root.
+#[cfg(test)]
+pub(crate) fn source_roots() -> Vec<(&'static str, Option<std::path::PathBuf>)> {
+    source::sources()
+        .iter()
+        .map(|source| (source.name(), source.root().map(|root| root.path)))
+        .collect()
 }
 
 fn dirs_home() -> Option<std::path::PathBuf> {
@@ -377,6 +385,7 @@ impl EventTime {
 
 fn transcript_draft(
     call: &transcript::ToolCall,
+    actor_id: &str,
     ledger_repo: &str,
     worktree_path: &str,
     history: &ledger::bindings::BindingHistory,
@@ -404,7 +413,7 @@ fn transcript_draft(
         // Derived from observation, not self-reported: this row exists because
         // a transcript recorded the call, not because an agent announced it.
         actor_kind: Some(ActorKind::Agent),
-        actor_id: Some("claude-code".into()),
+        actor_id: Some(actor_id.into()),
         outcome: Some(Outcome::Ok),
         // No verdict: GitPulse's gate never saw this action. That is
         // emphatically not the same as an action that passed, and the absence
@@ -487,6 +496,30 @@ pub(super) struct Walk {
     /// followed. Not part of the corpus, so they do not make the walk
     /// incomplete.
     pub refused_outside_corpus: i64,
+}
+
+impl Walk {
+    /// What walking nothing found: complete, until a walk says otherwise.
+    pub(super) fn none() -> Self {
+        Walk {
+            complete: true,
+            ..Walk::default()
+        }
+    }
+
+    /// Folds in another root's walk. The caps are per root (each walk has its
+    /// own file cap and entry budget), so the counts add; the result is
+    /// complete only if every walk was.
+    pub(super) fn absorb(&mut self, other: &Walk) {
+        self.complete &= other.complete;
+        self.cut |= other.cut;
+        self.unlisted_depth = self.unlisted_depth.saturating_add(other.unlisted_depth);
+        self.unlisted_cap = self.unlisted_cap.saturating_add(other.unlisted_cap);
+        self.unlisted_lower_bound |= other.unlisted_lower_bound;
+        self.refused_outside_corpus = self
+            .refused_outside_corpus
+            .saturating_add(other.refused_outside_corpus);
+    }
 }
 
 /// The identity of a directory, so a walk can tell it has been in one before:
@@ -2325,6 +2358,8 @@ mod watermark_tests {
 }
 
 #[cfg(test)]
+mod codex_tests;
+#[cfg(test)]
 mod event_time_tests;
 #[cfg(test)]
 mod family_tests;
@@ -2339,9 +2374,13 @@ mod reflog_coverage_tests;
 #[cfg(test)]
 mod reflog_replay_tests;
 #[cfg(test)]
+mod source_tests;
+#[cfg(test)]
 mod transcript_bench_tests;
 #[cfg(test)]
 mod walk_tests;
 
+#[cfg(test)]
+mod adv2_bench_tests;
 #[cfg(test)]
 mod adv_l5_tests;

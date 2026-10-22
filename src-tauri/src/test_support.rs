@@ -704,11 +704,33 @@ mod hermetic_canary {
             "workbench::conversation::claude_home",
             crate::workbench::conversation::claude_home(),
         );
-        assert_under_root("ingest::transcript_root", crate::ingest::transcript_root());
+        // Every transcript source's root, each by its own name: a source
+        // added later is listed here without anyone remembering to.
+        for (source, root) in crate::ingest::source_roots() {
+            assert_under_root(&format!("ingest transcript root of {source}"), root);
+        }
         assert_under_root(
             "repository_trust::persistent_root",
             crate::repository_trust::persistent_root().ok(),
         );
+    }
+
+    /// The variables that would point a transcript source at the developer's own
+    /// agent history are gone from the test process: a root that resolves "under
+    /// the hermetic home" proves nothing if one of them is set.
+    #[test]
+    fn no_variable_names_the_developers_agent_history() {
+        let _serial = env_serial();
+        for key in [
+            "GITPULSE_TRANSCRIPT_ROOT",
+            "GITPULSE_CODEX_TRANSCRIPT_ROOT",
+            "CODEX_HOME",
+        ] {
+            assert!(
+                std::env::var_os(key).is_none(),
+                "{key} is set in the test process; a test reading it reads real transcripts"
+            );
+        }
     }
 
     #[test]
