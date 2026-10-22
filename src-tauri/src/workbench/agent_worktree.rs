@@ -848,4 +848,68 @@ mod tests {
             assert!(!s.starts_with('-') && !s.contains("--"));
         }
     }
+
+    // ---- adversarial W4-L3 (adv-w4l3) ----
+
+    fn panicking_reader(_: &Path) -> Reading<u64> {
+        panic!("statvfs reader blew up")
+    }
+
+    /// Attack 1: a panic in the free-space reader must not abort
+    /// provisioning: the worktree is still made.
+    #[test]
+    fn adv_a_panicking_free_space_reader_does_not_abort_provisioning() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = repo_with_cache(dir.path());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            provision_with(
+                root.to_str().unwrap(),
+                "adv-panic-1",
+                "Panic lane",
+                false,
+                &with_reader(panicking_reader),
+            )
+        }));
+        let made = outcome
+            .expect("the reader panic unwound out of provisioning")
+            .expect("provisioning refused");
+        assert!(Path::new(&made.path).join("README.md").is_file());
+    }
+
+    /// Attack 5: a skipped cache and a failed cache in one launch are both
+    /// advised; the low-disk advisory must not swallow the failure.
+    #[test]
+    fn adv_a_low_disk_skip_does_not_hide_a_cache_failure_in_the_same_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = repo_with_cache(dir.path());
+        std::fs::write(root.join(".git/info/exclude"), "node_modules/\n.turbo/\n").unwrap();
+        std::fs::write(root.join("node_modules/pkg/index.js"), vec![b'x'; 100]).unwrap();
+        std::fs::create_dir_all(root.join(".turbo/a/b")).unwrap();
+        std::fs::write(root.join(".turbo/a/b/f"), "x").unwrap();
+        let selection = CacheSelection {
+            caps: crate::engine::cow_clone::CowCaps {
+                max_bytes: 10,
+                max_depth: 1,
+                ..crate::engine::cow_clone::CowCaps::DEFAULT
+            },
+            free_space: plenty,
+            ..CacheSelection::default()
+        };
+        crate::engine::cow_clone::with_forced_byte_copy(|| {
+            provision_with(
+                root.to_str().unwrap(),
+                "adv-both-1",
+                "Both lane",
+                false,
+                &selection,
+            )
+        })
+        .unwrap();
+        let advisory = crate::sysload::governor_report().advisory.expect("advice");
+        let text = advisory.message();
+        assert!(
+            text.contains(".turbo") && text.contains("node_modules"),
+            "only one of the two cache outcomes is advised: {advisory:?}"
+        );
+    }
 }

@@ -163,6 +163,41 @@ describe("the governor's lines", () => {
     expect(admissionLine(report({}, { advisory: null }))).toBe("Agent launches are admitted.");
   });
 
+  // adversarial W4-L3: the advice must not contradict a pressure refusal.
+  it("adv: advice beside a pressure refusal does not claim launches are unaffected", () => {
+    const low = {
+      reason: "low_disk" as const,
+      cause: "below_floor" as const,
+      free_bytes: 1 << 30,
+      floor_bytes: 10 * 2 ** 30,
+      cap_bytes: null,
+      skipped: ["node_modules"],
+    };
+    const refusing = report(
+      { admit: false, reason: "pressure", message: "memory pressure critical (kernel level 4): agent launches are refused until it clears" },
+      { refusing_for_s: 125, advisory: low },
+    );
+    expect(admissionLine(refusing)).not.toMatch(/launches are not affected/);
+  });
+
+  it("adv: an unreadable volume is named unknown, not omitted or shown as a number", () => {
+    const unknown = report(
+      {},
+      {
+        advisory: {
+          reason: "low_disk",
+          cause: "below_floor",
+          free_bytes: null,
+          floor_bytes: 10 * 2 ** 30,
+          cap_bytes: null,
+          skipped: ["node_modules"],
+        },
+      },
+    );
+    expect(admissionLine(unknown)).toMatch(/unknown free/);
+    expect(admissionLine(unknown)).not.toMatch(/\b0 B\b/);
+  });
+
   it("names the classes shed and the reason, with the stale warning", () => {
     const shedding = report({
       reason: "elevated",

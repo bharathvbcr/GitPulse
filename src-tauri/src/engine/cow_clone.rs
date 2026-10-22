@@ -1657,4 +1657,322 @@ mod tests {
         let error = reflink_ignored_caches(&anchor, &worktree, &selection(full)).unwrap_err();
         assert!(error.contains("low disk"), "{error}");
     }
+
+    // ---- adversarial W4-L3 (adv-w4l3) ----
+
+    fn staging_leftovers(dir: &Path) -> Vec<String> {
+        entries(dir)
+            .into_iter()
+            .filter(|n| n.contains("gitpulse-partial"))
+            .collect()
+    }
+
+    /// Attack 2: a panic mid-copy (here in the finish step) must not leave a
+    /// staging directory beside the destination.
+    #[test]
+    fn adv_a_panic_mid_copy_leaves_no_staging_dir() {
+        let parent = tempdir().unwrap();
+        let src = parent.path().join("src");
+        fs::create_dir_all(src.join("pkg")).unwrap();
+        fs::write(src.join("pkg/a.js"), "a").unwrap();
+        let dst = parent.path().join("dst");
+        let boom = |_: &Path| -> Result<(), String> { panic!("crash mid-copy") };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            copy_dir_staged(
+                &src,
+                &dst,
+                CowCaps::DEFAULT,
+                CopyRules {
+                    require_clone: false,
+                    finish: Some(&boom),
+                },
+            )
+        }));
+        assert!(outcome.is_err());
+        assert!(!dst.exists());
+        assert_eq!(staging_leftovers(parent.path()), Vec::<String>::new());
+    }
+
+    /// Attack 2: a cap hit after many files were already written leaves
+    /// neither destination nor staging.
+    #[test]
+    fn adv_a_cap_hit_after_many_files_leaves_nothing() {
+        let parent = tempdir().unwrap();
+        let src = parent.path().join("src");
+        fs::create_dir_all(src.join("d")).unwrap();
+        for i in 0..40 {
+            fs::write(src.join("d").join(format!("f{i}")), [b'x'; 10]).unwrap();
+        }
+        let dst = parent.path().join("dst");
+        let caps = CowCaps {
+            max_bytes: 250,
+            ..CowCaps::DEFAULT
+        };
+        let r = with_forced_byte_copy(|| copy_dir_staged(&src, &dst, caps, CopyRules::default()));
+        assert!(matches!(r, Err(CopyStop::CapHit { .. })), "{r:?}");
+        assert!(!dst.exists());
+        assert_eq!(staging_leftovers(parent.path()), Vec::<String>::new());
+    }
+
+    /// Attack 2: an entry that is neither file, dir nor link (a FIFO) fails
+    /// the copy after earlier files were written; nothing stays.
+    #[cfg(unix)]
+    #[test]
+    fn adv_an_error_after_partial_progress_leaves_nothing() {
+        let parent = tempdir().unwrap();
+        let src = parent.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        for i in 0..5 {
+            fs::write(src.join(format!("f{i}")), "x").unwrap();
+        }
+        let fifo = std::ffi::CString::new(src.join("zz-fifo").to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let dst = parent.path().join("dst");
+        let r = with_forced_byte_copy(|| {
+            copy_dir_staged(&src, &dst, CowCaps::DEFAULT, CopyRules::default())
+        });
+        assert!(r.is_err());
+        assert!(!dst.exists());
+        assert_eq!(staging_leftovers(parent.path()), Vec::<String>::new());
+    }
+
+    /// Attack 2: eight provisions race on the SAME destination (so the same
+    /// parent): at least one wins, the winner is complete, nothing is left.
+    #[test]
+    fn adv_racing_copies_to_one_destination_leave_one_whole_copy_and_no_staging() {
+        let parent = tempdir().unwrap();
+        let src = parent.path().join("src");
+        fs::create_dir_all(src.join("d")).unwrap();
+        for i in 0..200 {
+            fs::write(src.join("d").join(format!("f{i}")), [b'x'; 64]).unwrap();
+        }
+        let dst = parent.path().join("dst");
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        with_forced_byte_copy(|| {
+                            copy_dir_staged(&src, &dst, CowCaps::DEFAULT, CopyRules::default())
+                        })
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(
+            results.iter().filter(|r| r.is_ok()).count() >= 1,
+            "{results:?}"
+        );
+        assert_eq!(fs::read_dir(dst.join("d")).unwrap().count(), 200);
+        assert_eq!(staging_leftovers(parent.path()), Vec::<String>::new());
+    }
+
+    /// Attack 3: the cap counts logical bytes, not blocks. 2000 one-byte
+    /// files fit a 2000-byte cap but occupy a block each.
+    #[cfg(unix)]
+    #[test]
+    fn adv_the_cap_counts_physical_bytes_not_logical_length() {
+        use std::os::unix::fs::MetadataExt;
+        let parent = tempdir().unwrap();
+        let src = parent.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        for i in 0..2000 {
+            fs::write(src.join(format!("f{i}")), "x").unwrap();
+        }
+        let dst = parent.path().join("dst");
+        let cap = 2000u64;
+        let caps = CowCaps {
+            max_bytes: cap,
+            ..CowCaps::DEFAULT
+        };
+        let r = with_forced_byte_copy(|| copy_dir_staged(&src, &dst, caps, CopyRules::default()));
+        assert!(r.is_ok(), "{r:?}");
+        let physical: u64 = fs::read_dir(&dst)
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().blocks() * 512)
+            .sum();
+        assert!(
+            physical <= cap * 2,
+            "cap {cap} B admitted a copy occupying {physical} B on disk"
+        );
+    }
+
+    /// Attack 3: hard links are each written, so each is counted.
+    #[cfg(unix)]
+    #[test]
+    fn adv_hard_links_are_counted_per_name() {
+        use std::os::unix::fs::MetadataExt;
+        let parent = tempdir().unwrap();
+        let src = parent.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("a"), [b'x'; 100]).unwrap();
+        fs::hard_link(src.join("a"), src.join("b")).unwrap();
+        let tight = CowCaps {
+            max_bytes: 150,
+            ..CowCaps::DEFAULT
+        };
+        let r = with_forced_byte_copy(|| {
+            copy_dir_staged(&src, &parent.path().join("d1"), tight, CopyRules::default())
+        });
+        assert!(matches!(r, Err(CopyStop::CapHit { .. })), "{r:?}");
+        let roomy = CowCaps {
+            max_bytes: 200,
+            ..CowCaps::DEFAULT
+        };
+        let d2 = parent.path().join("d2");
+        with_forced_byte_copy(|| copy_dir_staged(&src, &d2, roomy, CopyRules::default())).unwrap();
+        assert_ne!(
+            fs::metadata(d2.join("a")).unwrap().ino(),
+            fs::metadata(d2.join("b")).unwrap().ino()
+        );
+    }
+
+    /// Attack 3: a sparse file is counted by logical length (over-counts, the
+    /// safe direction), so a sparse 64 MiB file trips a 10 MiB cap.
+    #[cfg(unix)]
+    #[test]
+    fn adv_a_sparse_file_is_counted_by_logical_length() {
+        let parent = tempdir().unwrap();
+        let src = parent.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::File::create(src.join("s"))
+            .unwrap()
+            .set_len(64 << 20)
+            .unwrap();
+        let caps = CowCaps {
+            max_bytes: 10 << 20,
+            ..CowCaps::DEFAULT
+        };
+        let r = with_forced_byte_copy(|| {
+            copy_dir_staged(&src, &parent.path().join("d"), caps, CopyRules::default())
+        });
+        assert!(matches!(r, Err(CopyStop::CapHit { .. })), "{r:?}");
+    }
+
+    /// Attack 3: symlinks (absolute, relative-escaping, to a directory) are
+    /// copied as links: nothing outside the destination is written or read
+    /// into the copy, and the link adds no bytes.
+    #[cfg(unix)]
+    #[test]
+    fn adv_symlinks_in_a_cache_are_not_followed_and_nothing_escapes() {
+        let parent = tempdir().unwrap();
+        let outside = parent.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret"), [b'x'; 4096]).unwrap();
+        let src = parent.path().join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&outside, src.join("abs")).unwrap();
+        std::os::unix::fs::symlink("../outside", src.join("sub/rel")).unwrap();
+        std::os::unix::fs::symlink("sub", src.join("selfdir")).unwrap();
+        let dst = parent.path().join("dst");
+        let caps = CowCaps {
+            max_bytes: 10,
+            ..CowCaps::DEFAULT
+        };
+        with_forced_byte_copy(|| copy_dir_staged(&src, &dst, caps, CopyRules::default())).unwrap();
+        assert!(dst
+            .join("abs")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(entries(&outside), vec!["secret".to_string()]);
+        assert_eq!(fs::read_dir(&dst).unwrap().count(), 3);
+    }
+
+    /// Attack 3: a cache directory that is itself a symlink to an outside
+    /// tree is walked through (followed) as the cache root, still capped.
+    #[cfg(unix)]
+    #[test]
+    fn adv_a_symlinked_cache_root_is_followed_and_still_capped() {
+        let parent = tempdir().unwrap();
+        let outside = parent.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("big"), [b'x'; 100]).unwrap();
+        let src = parent.path().join("node_modules");
+        std::os::unix::fs::symlink(&outside, &src).unwrap();
+        let caps = CowCaps {
+            max_bytes: 10,
+            ..CowCaps::DEFAULT
+        };
+        let r = with_forced_byte_copy(|| {
+            copy_dir_staged(&src, &parent.path().join("d"), caps, CopyRules::default())
+        });
+        assert!(matches!(r, Err(CopyStop::CapHit { .. })), "{r:?}");
+    }
+
+    /// Attack 4: the free-space read is one snapshot per cache. A volume
+    /// that fills after that read is never re-checked: the reader answers
+    /// roomy once, then full, and the copy still runs to the end.
+    #[test]
+    fn adv_free_space_is_rechecked_during_a_copy() {
+        use std::sync::atomic::AtomicUsize;
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn fills_after_first_read(_: &Path) -> Reading<u64> {
+            if CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
+                Reading::Value(LOW_DISK_FLOOR + 10_000)
+            } else {
+                Reading::Value(0)
+            }
+        }
+        let (main, _parent, worktree) = anchor_and_worktree(&["node_modules"]);
+        let anchor = main.path().canonicalize().unwrap();
+        fs::create_dir_all(anchor.join("node_modules/p")).unwrap();
+        for i in 0..50 {
+            fs::write(anchor.join(format!("node_modules/p/f{i}")), [b'x'; 100]).unwrap();
+        }
+        let report = with_forced_byte_copy(|| {
+            clone_ignored_caches(&anchor, &worktree, &selection(fills_after_first_read))
+        })
+        .unwrap();
+        assert!(
+            report.copied.is_empty(),
+            "the copy ran to the end after the volume filled: free space is read once, not re-checked"
+        );
+    }
+
+    /// Attack 4: lanes provisioning at once each read the same headroom and
+    /// each spend all of it: 3 lanes x 800 B against 1000 B above the floor.
+    #[test]
+    fn adv_concurrent_lanes_cannot_jointly_cross_the_floor() {
+        use std::sync::atomic::AtomicUsize;
+        static ARRIVED: AtomicUsize = AtomicUsize::new(0);
+        fn rendezvous(_: &Path) -> Reading<u64> {
+            ARRIVED.fetch_add(1, Ordering::SeqCst);
+            for _ in 0..50_000_000u64 {
+                if ARRIVED.load(Ordering::SeqCst) >= 3 {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            Reading::Value(LOW_DISK_FLOOR + 1000)
+        }
+        let lanes: Vec<_> = (0..3)
+            .map(|_| anchor_and_worktree(&["node_modules"]))
+            .collect();
+        let written: u64 = std::thread::scope(|scope| {
+            let handles: Vec<_> = lanes
+                .iter()
+                .map(|(main, _p, worktree)| {
+                    scope.spawn(move || {
+                        let anchor = main.path().canonicalize().unwrap();
+                        cache_with_file(&anchor, 800);
+                        with_forced_byte_copy(|| {
+                            clone_ignored_caches(&anchor, worktree, &selection(rendezvous))
+                        })
+                        .unwrap()
+                        .copied
+                        .iter()
+                        .map(|r| r.bytes_cloned)
+                        .sum::<u64>()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+        assert!(
+            written <= 1000,
+            "{written} B written against 1000 B of headroom"
+        );
+    }
 }
