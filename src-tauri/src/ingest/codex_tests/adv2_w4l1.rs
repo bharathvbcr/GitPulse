@@ -141,7 +141,13 @@ fn m1_a_counter_at_u32_max_does_not_panic_the_pass() {
             ),
         );
         let out = with_roots(Some(claude.path()), Some(&b), || pair.pass());
-        assert_eq!(out.error, "", "{count}: {out:?}");
+        // The pass finishes. Root `a` is absent and recorded, so it legitimately
+        // reports itself; nothing else may be in the error.
+        assert!(
+            out.error.is_empty() || out.error.contains("held transcripts earlier"),
+            "{count}: {out:?}"
+        );
+        assert!(!out.error.contains("panic"), "{count}: {out:?}");
     }
 }
 
@@ -165,14 +171,20 @@ fn m2_a_marker_of_thousands_of_roots_is_bounded_and_the_pass_finishes() {
     );
     let started = std::time::Instant::now();
     let out = with_roots(Some(claude.path()), Some(&b), || pair.pass());
-    assert_eq!(out.error, "", "{out:?}");
+    // An absent recorded root legitimately reports, but the text names a few
+    // roots and counts the rest: it does not grow with the marker.
+    assert!(out.error.len() < 1500, "{} bytes", out.error.len());
+    assert!(out.error.contains("more"), "{out:?}");
     let stored = ledger::transcript_progress(w1, w1).unwrap().fingerprints[&key].clone();
     assert!(
         stored.lines().count() <= 8,
         "marker kept {} lines",
         stored.lines().count()
     );
-    assert!(started.elapsed() < std::time::Duration::from_secs(60));
+    assert!(
+        started.elapsed()
+            < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(60))
+    );
 }
 
 // Attack 5 flapping: absent 4 passes, present 1, absent 5: retired on exactly

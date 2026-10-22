@@ -821,6 +821,10 @@ const MAX_MARKER_ROOTS: usize = 8;
 /// elsewhere for a day: this long is how patient the pass is with them.
 pub(super) const RETIRE_ROOT_AFTER_ABSENT_PASSES: u32 = 5;
 
+/// How many unreadable recorded roots one pass names in its error; the rest
+/// are counted ("and K more"), so the text does not grow with the marker.
+const MAX_NAMED_ROOTS: usize = 3;
+
 /// Separates a root from its run of absent passes in a marker line. A marker
 /// line without it is a root absent for none.
 const ABSENT_COUNT_SEPARATOR: char = '\u{1f}';
@@ -832,7 +836,7 @@ fn marker_roots<'a>(texts: impl Iterator<Item = &'a str>) -> Vec<(String, u32)> 
     for text in texts {
         for line in text.lines() {
             let (root, count) = match line.rsplit_once(ABSENT_COUNT_SEPARATOR) {
-                Some((root, count)) => (root, count.parse().unwrap_or(0)),
+                Some((root, count)) => (root, run_of_absent_passes(root, count)),
                 None => (line, 0),
             };
             match roots.iter_mut().find(|(known, _)| known == root) {
@@ -842,6 +846,22 @@ fn marker_roots<'a>(texts: impl Iterator<Item = &'a str>) -> Vec<(String, u32)> 
         }
     }
     roots
+}
+
+/// A marker's run of absent passes, read back. A run that is not a number, or
+/// that is not below [`RETIRE_ROOT_AFTER_ABSENT_PASSES`] (a root is retired at
+/// that count, so no marker written by this code holds one), is a corrupt
+/// marker: the run restarts at 0 and the pass says so in the log.
+fn run_of_absent_passes(root: &str, text: &str) -> u32 {
+    match text.parse::<u32>() {
+        Ok(count) if count < RETIRE_ROOT_AFTER_ABSENT_PASSES => count,
+        _ => {
+            log::warn!(
+                "the transcript marker's run {text:?} for root {root} is not valid; restarted"
+            );
+            0
+        }
+    }
 }
 
 fn marker_text(roots: &[(String, u32)]) -> String {
@@ -904,6 +924,7 @@ fn track_roots(
         let before = texts(participants);
         let recorded = marker_roots(before.iter().map(String::as_str));
         let mut roots: Vec<(String, u32)> = Vec::new();
+        let mut unread = 0usize;
         for (root, count) in &recorded {
             let read_now = active.iter().any(|(s, path)| {
                 s.actor_id() == source.actor_id() && path.to_string_lossy() == root.as_str()
@@ -912,7 +933,11 @@ fn track_roots(
                 roots.push((root.clone(), 0));
                 continue;
             }
-            let absent_for = if root_is_absent(root) { count + 1 } else { 0 };
+            let absent_for = if root_is_absent(root) {
+                count.saturating_add(1)
+            } else {
+                0
+            };
             if absent_for >= RETIRE_ROOT_AFTER_ABSENT_PASSES {
                 log::info!(
                     "the {} transcript root {root} was absent for {absent_for} passes and is retired",
@@ -923,12 +948,20 @@ fn track_roots(
             roots.push((root.clone(), absent_for));
             *missing_root = true;
             *blocks_forget = true;
-            if !gaps.iter().any(|gap| gap.contains(root.as_str())) {
+            unread += 1;
+            if unread <= MAX_NAMED_ROOTS && !gaps.iter().any(|gap| gap.contains(root.as_str())) {
                 gaps.push(format!(
                     "the {} transcript root {root} held transcripts earlier and is not readable now, so no saved offset was forgotten",
                     source.name()
                 ));
             }
+        }
+        if unread > MAX_NAMED_ROOTS {
+            gaps.push(format!(
+                "and {} more {} transcript roots that held transcripts earlier are not readable now",
+                unread - MAX_NAMED_ROOTS,
+                source.name()
+            ));
         }
         for (read, path, files) in read_roots {
             let shown = path.to_string_lossy();

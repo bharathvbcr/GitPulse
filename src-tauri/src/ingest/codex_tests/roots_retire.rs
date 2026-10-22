@@ -154,3 +154,28 @@ fn r05_a_retired_root_that_returns_records_nothing_twice() {
     assert_eq!(out.duplicates_refused, 1, "{out:?}");
     assert_eq!(rows(&w1).len(), before);
 }
+
+#[test]
+fn r06_a_thousand_roots_over_time_leave_a_bounded_marker_and_a_bounded_error() {
+    let pair = Pair::new();
+    let w1 = pair.wt[0].clone();
+    let claude = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let mut last = CatchUp::default();
+    for i in 0..1000 {
+        let root = scratch.path().join(format!("r{i}"));
+        rollout(&root, &format!("T{i}"), &w1);
+        last = with_roots(Some(claude.path()), Some(&root), || pair.pass());
+        let markers = ledger::transcript_progress(&w1, &w1).unwrap().fingerprints;
+        let longest = markers
+            .values()
+            .map(|m| m.lines().count())
+            .max()
+            .unwrap_or(0);
+        assert!(longest <= 8, "root {i}: a marker names {longest} roots");
+    }
+    // Eight roots are remembered, none of them the one read now; three are
+    // named and the other five counted.
+    assert!(last.error.len() < 1500, "{} bytes", last.error.len());
+    assert!(last.error.contains("and 5 more"), "{}", last.error);
+}

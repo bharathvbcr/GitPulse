@@ -1857,9 +1857,16 @@ fn prepare(draft: &Draft) -> Result<Prepared, LedgerError> {
                 .filter(|stamp| stamp.occurred_at_basis == "transcript" && stamp.is_well_formed())
                 .and_then(|stamp| ids::parse_event_time(&stamp.occurred_at))
                 .unwrap_or(0);
+            // Spelled as the repository is: a trailing slash or a symlink is
+            // the same worktree.
+            let worktree_identity = draft
+                .worktree_path
+                .as_deref()
+                .map(canonical_repo)
+                .unwrap_or_default();
             let identity = [
                 repo_path.as_str(),
-                draft.worktree_path.as_deref().unwrap_or(""),
+                worktree_identity.as_str(),
                 draft.actor_id.as_deref().unwrap_or(""),
                 draft.session_id.as_deref().unwrap_or(""),
                 key.as_str(),
@@ -1966,19 +1973,29 @@ fn insert_transcript_row(
     if let Some(id) = insert_with(conn, event, sql)? {
         return Ok(TranscriptInsert::Recorded(id));
     }
-    let held: Option<Option<String>> = conn
+    // The held row is the same one only if it names the same line AND says the
+    // same thing about it: the action and object are functions of the line
+    // alone (unlike the task and its basis, which a later binding changes), so
+    // a row that differs in either is not what this read would have written.
+    let held: Option<(String, Option<String>, Option<String>)> = conn
         .query_row(
             &format!(
-                "SELECT json_extract(detail_json, '$.{TRANSCRIPT_ROW_KEY}') FROM events
-                 WHERE ulid = ?1 AND json_valid(detail_json)"
+                "SELECT action, object,
+                        CASE WHEN json_valid(detail_json)
+                             THEN json_extract(detail_json, '$.{TRANSCRIPT_ROW_KEY}') END
+                 FROM events WHERE ulid = ?1"
             ),
             params![event.ulid],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(|e| LedgerError::new("insert_failed", e.to_string()))?;
     match (held, &event.transcript_row) {
-        (Some(Some(held)), Some(key)) if held == *key => Ok(TranscriptInsert::Held),
+        (Some((action, object, Some(held))), Some(key))
+            if held == *key && action == event.action && object == event.object =>
+        {
+            Ok(TranscriptInsert::Held)
+        }
         _ => Ok(TranscriptInsert::Collision),
     }
 }
@@ -3757,7 +3774,15 @@ fn import_legacy_page(
                 |event: &LedgerEvent| event.detail_json.as_deref().and_then(transcript_row_of);
             if !same_row {
                 if let Some(incoming) = transcript_key(event) {
-                    if existing.as_ref().and_then(transcript_key).as_ref() != Some(&incoming) {
+                    // The same line AND the same content (action, object: see
+                    // `insert_transcript_row`) is the row already here.
+                    let same_line = existing.as_ref().is_some_and(|held| {
+                        transcript_key(held).as_ref() == Some(&incoming)
+                            && bindings::base_action(&held.action)
+                                == bindings::base_action(&event.action)
+                            && held.object == event.object
+                    });
+                    if !same_line {
                         log::warn!(
                             "legacy transcript row {} collides with a different row",
                             event.ulid
