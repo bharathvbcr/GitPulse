@@ -234,6 +234,21 @@ export interface GovernorVerdict {
   warnings: string[];
 }
 
+/**
+ * `sysload::Advisory`: what the latest worktree build advised. Advice only:
+ * it never refuses a launch, a checkout or a worktree.
+ */
+export type Advisory =
+  | {
+      reason: "low_disk";
+      cause: "below_floor" | "byte_cap";
+      free_bytes: number | null;
+      floor_bytes: number;
+      cap_bytes: number | null;
+      skipped: string[];
+    }
+  | { reason: "cache_error"; message: string };
+
 /** `sysload::GovernorReport`: the verdict, how long refusal has run, a live override. */
 export interface GovernorReport {
   verdict: GovernorVerdict;
@@ -241,6 +256,7 @@ export interface GovernorReport {
   notice: boolean;
   largest_foreign: number | null;
   override_remaining_s: number | null;
+  advisory?: Advisory | null;
 }
 
 /** `sysload::GovernorPulse`: the part of the report each tick carries. */

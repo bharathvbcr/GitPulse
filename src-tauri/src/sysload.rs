@@ -37,6 +37,7 @@
 //! been verified on a real Linux host. Windows reports unavailable. See
 //! [`Platform`].
 
+mod disk;
 mod governor;
 mod probe;
 pub(crate) mod procscan;
@@ -44,11 +45,12 @@ mod sampler;
 mod sensor;
 mod snapshot;
 
+pub use disk::{free_bytes, FreeSpace, LowDisk, LowDiskCause, LOW_DISK_FLOOR};
 pub use governor::{
-    admit, admit_anyway, admit_on, decide, grant_override, report as governor_report, shed,
-    Admitted, Binding, Governor, GovernorPulse, GovernorReport, GovernorVerdict,
-    Input as GovernorInput, Observation, Reason, Refused, Shed, Site, Tier, ENTER_SAMPLES,
-    EXIT_SAMPLES, OVERRIDE_WINDOW, REFUSAL_CODE, REFUSAL_NOTICE_AFTER,
+    admit, admit_anyway, admit_on, decide, grant_override, note_launch_advisory,
+    report as governor_report, shed, Admitted, Advisory, Binding, Governor, GovernorPulse,
+    GovernorReport, GovernorVerdict, Input as GovernorInput, Observation, Reason, Refused, Shed,
+    Site, Tier, ENTER_SAMPLES, EXIT_SAMPLES, OVERRIDE_WINDOW, REFUSAL_CODE, REFUSAL_NOTICE_AFTER,
 };
 #[cfg(test)]
 pub(crate) use governor::{inject as inject_governor, injected_input as injected_governor_input};

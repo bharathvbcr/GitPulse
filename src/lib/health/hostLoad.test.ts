@@ -143,6 +143,26 @@ describe("the governor's lines", () => {
     expect(admissionLine(report())).toBe("Agent launches are admitted.");
   });
 
+  it("shows low disk and cache errors as advice beside an admitted launch, never as a refusal", () => {
+    const low = report(
+      {},
+      {
+        advisory: {
+          reason: "low_disk",
+          cause: "below_floor",
+          free_bytes: 1 << 30,
+          floor_bytes: 10 * 2 ** 30,
+          cap_bytes: null,
+          skipped: ["node_modules"],
+        },
+      },
+    );
+    expect(admissionLine(low)).toMatch(/^Agent launches are admitted\. Low disk advice: .*node_modules.*launches are not affected\.$/);
+    const failed = report({}, { advisory: { reason: "cache_error", message: "node_modules: boom" } });
+    expect(admissionLine(failed)).toMatch(/^Agent launches are admitted\. Advice: .*node_modules: boom/);
+    expect(admissionLine(report({}, { advisory: null }))).toBe("Agent launches are admitted.");
+  });
+
   it("names the classes shed and the reason, with the stale warning", () => {
     const shedding = report({
       reason: "elevated",

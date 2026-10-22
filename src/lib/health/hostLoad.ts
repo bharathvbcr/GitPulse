@@ -159,6 +159,28 @@ function capitalise(text: string): string {
 
 /** Admission in a line: whether agent launches are being refused, for how long. */
 export function admissionLine(report: GovernorReport): string {
+  const line = admissionVerdictLine(report);
+  const advice = advisoryLine(report);
+  return advice === null ? line : `${line} ${advice}`;
+}
+
+/** The latest worktree build's advice, which never changes whether launches are admitted. */
+export function advisoryLine(report: GovernorReport): string | null {
+  const advisory = report.advisory;
+  if (!advisory) return null;
+  if (advisory.reason === "cache_error") {
+    return `Advice: the last worktree was made without its build caches (${advisory.message}).`;
+  }
+  const names = advisory.skipped.join(", ");
+  if (advisory.cause === "byte_cap") {
+    const cap = advisory.cap_bytes === null ? "the byte cap" : `the ${bytes(advisory.cap_bytes)} byte cap`;
+    return `Low disk advice: ${names} was not copied into the last worktree (over ${cap}).`;
+  }
+  const free = advisory.free_bytes === null ? "unknown" : bytes(advisory.free_bytes);
+  return `Low disk advice: ${free} free, so ${names} was not copied into the last worktree; launches are not affected.`;
+}
+
+function admissionVerdictLine(report: GovernorReport): string {
   const { verdict } = report;
   if (report.override_remaining_s !== null && !verdict.admit) {
     return `Launches are admitted for ${report.override_remaining_s} s more, on your say-so.`;

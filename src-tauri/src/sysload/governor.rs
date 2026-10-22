@@ -53,8 +53,9 @@
 //! [`OVERRIDE_WINDOW`], admits what pressure refuses. There is no agent
 //! override.
 
+use super::disk::LowDisk;
 use super::{Level, Platform, SensorReport, SensorState, Snapshot};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -603,6 +604,7 @@ impl Governor {
                 .as_ref()
                 .and_then(|(_, input)| input.largest_foreign),
             override_remaining_s: self.override_remaining(now).map(|d| d.as_secs().max(1)),
+            advisory: None,
         }
     }
 }
@@ -619,6 +621,9 @@ pub struct GovernorReport {
     pub largest_foreign: Option<u64>,
     /// Seconds left of a person's "Admit anyway", when one is live.
     pub override_remaining_s: Option<u64>,
+    /// What the latest worktree build advised: advice only, it never changes
+    /// the verdict or refuses anything.
+    pub advisory: Option<Advisory>,
 }
 
 impl GovernorReport {
@@ -640,6 +645,7 @@ impl GovernorReport {
             notice: false,
             largest_foreign: None,
             override_remaining_s: None,
+            advisory: None,
         }
     }
 }
@@ -671,6 +677,83 @@ impl GovernorPulse {
             largest_foreign: report.largest_foreign,
         }
     }
+}
+
+/// Advice a worktree build leaves for the launch surfaces. It is not a verdict:
+/// nothing here refuses a launch, a checkout or a worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum Advisory {
+    /// Build caches were not copied for want of disk.
+    LowDisk(LowDisk),
+    /// Build caches failed to copy (or could not be checked). The worktree
+    /// was made without them.
+    CacheError { message: String },
+}
+
+impl Advisory {
+    pub fn message(&self) -> String {
+        match self {
+            Self::LowDisk(low) => low.message(),
+            Self::CacheError { message } => format!("build caches were not copied: {message}"),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::LowDisk(_) => "low_disk",
+            Self::CacheError { .. } => "cache_error",
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ADVISORY: std::cell::RefCell<Option<Advisory>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(not(test))]
+static ADVISORY: Mutex<Option<Advisory>> = Mutex::new(None);
+
+fn latest_advisory() -> Option<Advisory> {
+    #[cfg(test)]
+    return ADVISORY.with(|slot| slot.borrow().clone());
+    #[cfg(not(test))]
+    ADVISORY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+fn store_advisory(advisory: Option<Advisory>) {
+    #[cfg(test)]
+    ADVISORY.with(|slot| *slot.borrow_mut() = advisory);
+    #[cfg(not(test))]
+    {
+        *ADVISORY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = advisory;
+    }
+}
+
+/// Records what the worktree build just advised, or clears the last advice
+/// when it advised nothing. Advice only: it is shown in the report and the
+/// ledger (`host_load.advisory`) and never refuses anything.
+pub fn note_launch_advisory(repo_path: &str, advisory: Option<Advisory>) {
+    if let Some(advisory) = &advisory {
+        log::warn!(target: "host_load", "launch advisory ({}): {}", advisory.name(), advisory.message());
+        let detail = serde_json::json!({
+            "advisory": advisory,
+            "message": advisory.message(),
+        });
+        write_ledger(
+            repo_path,
+            "host_load.advisory",
+            advisory.name(),
+            crate::ledger::Outcome::Ok,
+            detail,
+        );
+    }
+    store_advisory(advisory);
 }
 
 /// The places [`admit`] is called: the only gated operations there are.
@@ -793,6 +876,13 @@ impl Input {
 /// process that does not sample (a CLI, the MCP server, a hook) nothing is
 /// governed here.
 pub fn report() -> GovernorReport {
+    GovernorReport {
+        advisory: latest_advisory(),
+        ..governed_report()
+    }
+}
+
+fn governed_report() -> GovernorReport {
     let now = Instant::now();
     #[cfg(test)]
     if let Some(report) = INJECTED.with(|slot| slot.borrow().as_ref().map(|(_, g)| g.report(now))) {
@@ -938,11 +1028,21 @@ fn record(
         "message": verdict.message,
         "warnings": verdict.warnings,
     });
+    write_ledger(repo_path, action, site.name(), outcome, detail);
+}
+
+fn write_ledger(
+    repo_path: &str,
+    action: &'static str,
+    object: &str,
+    outcome: crate::ledger::Outcome,
+    detail: serde_json::Value,
+) {
     let draft = crate::ledger::Draft {
         repo_path: repo_path.to_string(),
         actor_kind: Some(crate::ledger::ActorKind::System),
         action: action.to_string(),
-        object: Some(site.name().to_string()),
+        object: Some(object.to_string()),
         outcome: Some(outcome),
         detail_json: Some(detail.to_string()),
         ..crate::ledger::Draft::default()
