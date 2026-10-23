@@ -1434,7 +1434,7 @@ fn open(db_path: &Path) -> Result<Connection, LedgerError> {
     // trades a fsync per commit for one per checkpoint; the ledger is a record
     // of actions that git has already made durable itself, so losing the last
     // few milliseconds to a power cut costs a re-derivable row, not data.
-    crate::sqlite_wal::enter_wal(&conn, crate::sqlite_wal::LEDGER_WAL_PATIENCE)
+    crate::engine::sqlite_wal::enter_wal(&conn, crate::engine::sqlite_wal::LEDGER_WAL_PATIENCE)
         .map_err(|e| LedgerError::new("pragma_failed", format!("journal_mode: {e}")))?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| LedgerError::new("pragma_failed", format!("synchronous: {e}")))?;

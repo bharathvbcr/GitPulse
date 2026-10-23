@@ -587,23 +587,23 @@ pub struct GitReader;
 
 /// How long an ownership report may spend blaming before it stops and says it
 /// is partial. A wall-clock bound on latency, so a report that runs past it is
-/// not kept: the next ask measures again.
-#[cfg(not(test))]
+/// not kept: the next ask measures again. The same value in every build; a test
+/// that must not race the machine sets its own with [`with_ownership_deadline`].
+const OWNERSHIP_DEADLINE: Duration = Duration::from_secs(10);
+
 fn ownership_deadline() -> Duration {
-    Duration::from_secs(10)
+    #[cfg(test)]
+    if let Some(deadline) = OWNERSHIP_DEADLINE_OVERRIDE.with(std::cell::Cell::get) {
+        return deadline;
+    }
+    OWNERSHIP_DEADLINE
 }
 
-/// Tests that count on a clean report being kept (`a clean report is kept`)
-/// were measuring the machine: 128 blames take over 10 s at load 30-60, the
-/// report came back partial, and the warm ask spawned all 131 blames again.
-/// They get a bound no loaded machine reaches; the one test of the bound
-/// itself sets it with [`with_ownership_deadline`].
+/// The bound for a test that counts on a clean report being kept. 128 blames
+/// take over 10 s at load 30-60, the report comes back partial, and the next
+/// ask measures them all again: such a test would be measuring the machine.
 #[cfg(test)]
-fn ownership_deadline() -> Duration {
-    OWNERSHIP_DEADLINE_OVERRIDE
-        .with(std::cell::Cell::get)
-        .unwrap_or(Duration::from_secs(30 * 60))
-}
+const UNHURRIED: Duration = Duration::from_secs(30 * 60);
 
 #[cfg(test)]
 thread_local! {
@@ -614,14 +614,13 @@ thread_local! {
 /// Runs `body` with the ownership deadline set to `deadline` on this thread.
 #[cfg(test)]
 fn with_ownership_deadline<T>(deadline: Duration, body: impl FnOnce() -> T) -> T {
-    struct Reset;
-    impl Drop for Reset {
+    struct Restore(Option<Duration>);
+    impl Drop for Restore {
         fn drop(&mut self) {
-            OWNERSHIP_DEADLINE_OVERRIDE.with(|cell| cell.set(None));
+            OWNERSHIP_DEADLINE_OVERRIDE.with(|cell| cell.set(self.0));
         }
     }
-    OWNERSHIP_DEADLINE_OVERRIDE.with(|cell| cell.set(Some(deadline)));
-    let _reset = Reset;
+    let _restore = Restore(OWNERSHIP_DEADLINE_OVERRIDE.with(|cell| cell.replace(Some(deadline))));
     body()
 }
 
@@ -6698,6 +6697,13 @@ mod tests {
     use super::*;
     use crate::procguard::LockedSpawn;
 
+    /// [`ref_cache::eager`] for a test that counts on an answer being kept,
+    /// with the ownership deadline lifted so a loaded machine cannot cut a
+    /// report short and make it unkeepable (see [`UNHURRIED`]).
+    fn eager_unhurried<T>(body: impl FnOnce() -> T) -> T {
+        ref_cache::eager(|| with_ownership_deadline(UNHURRIED, body))
+    }
+
     #[test]
     fn status_keeps_an_already_running_fsmonitor_daemon() {
         assert!(
@@ -7953,7 +7959,7 @@ mod tests {
         // The ref cache does not trust a stamp younger than its racy window,
         // and this repository was written a moment ago: run with no window.
         let _kept = ref_cache::retention();
-        ref_cache::eager(unchanged_state_resolves_once_per_change_body);
+        eager_unhurried(unchanged_state_resolves_once_per_change_body);
     }
 
     fn unchanged_state_resolves_once_per_change_body() {
@@ -8006,7 +8012,7 @@ mod tests {
         // No racy window, as above: a written-a-moment-ago repository is
         // otherwise never kept, and "a clean answer is memoized" is the claim.
         let _kept = ref_cache::retention();
-        ref_cache::eager(a_refused_default_base_is_not_memoized_body);
+        eager_unhurried(a_refused_default_base_is_not_memoized_body);
     }
 
     fn a_refused_default_base_is_not_memoized_body() {
@@ -8204,7 +8210,7 @@ mod tests {
             ],
         );
         git_in(&repo, &["update-ref", "refs/heads/release/main", "HEAD"]);
-        ref_cache::eager(|| {
+        eager_unhurried(|| {
             let warm = default_base(&repo);
             assert_eq!(
                 warm.base.as_ref().map(|(name, _)| name.as_str()),
@@ -8647,7 +8653,7 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
                 .filter(|argv| argv.iter().any(|a| a.contains("%(ahead-behind:")))
                 .count()
         };
-        ref_cache::eager(|| {
+        eager_unhurried(|| {
             let before = listings();
             GitReader::list_branches(path).unwrap();
             let counts = tip_counts_against(&root, &oids["main"]).unwrap();
@@ -11557,7 +11563,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
     #[test]
     fn a_second_ownership_call_with_no_ref_movement_spawns_no_blame() {
         let _kept = ref_cache::retention();
-        ref_cache::eager(|| {
+        eager_unhurried(|| {
             let dir = churn_fixture(5, 2);
             let root = dir.path().canonicalize().unwrap();
             let path = root.to_str().unwrap();
@@ -11641,7 +11647,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             .set("XDG_CONFIG_HOME", home.path().join("xdg"))
             .set("GIT_CONFIG_GLOBAL", home.path().join(".gitconfig"));
         let _kept = ref_cache::retention();
-        ref_cache::eager(|| {
+        eager_unhurried(|| {
             let dir = init_repo_with_remotes(&[], "main");
             assert!(!dir.path().join(".mailmap").exists());
             std::fs::write(dir.path().join("code.rs"), "fn a() {}\nfn b() {}\n").unwrap();
@@ -11760,7 +11766,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         assert_eq!(whole.len(), 30);
 
         let (first, second, before, middle) = with_history_chunk(10, || {
-            ref_cache::eager(|| {
+            eager_unhurried(|| {
                 let first =
                     GitReader::read_commit_history_paged(path, 0, 20, None, None, RefScope::Named)
                         .unwrap();
@@ -11824,7 +11830,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         .unwrap();
         let before = logs();
         let rows = with_history_chunk(10, || {
-            ref_cache::eager(|| {
+            eager_unhurried(|| {
                 GitReader::read_commit_history_paged(path, 0, 11, None, None, RefScope::Named)
             })
         })
@@ -11879,7 +11885,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         ];
         let mut seen = Vec::new();
         with_history_chunk(10, || {
-            ref_cache::eager(|| {
+            eager_unhurried(|| {
                 for (window, _) in expected {
                     let before = logs();
                     let rows = GitReader::read_commit_history_paged(
@@ -12587,7 +12593,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
     /// (metadata, then numstat), each waiting on the spawn gate.
     #[test]
     fn commit_details_first_load_spawns_one_git_process() {
-        ref_cache::eager(|| {
+        eager_unhurried(|| {
             let (_dir, repo, head) = repo_with_commit_of(3);
             let path = repo.to_string_lossy().into_owned();
             let before = crate::engine::git_cli::spawn_log::spawns_in(&repo).len();
@@ -12611,7 +12617,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         // The answer must stay in the process-wide table between the two
         // calls; the test that fills that table's byte budget evicts it.
         let _held = ref_cache::retention();
-        ref_cache::eager(|| {
+        eager_unhurried(|| {
             let (_dir, repo, head) = repo_with_commit_of(3);
             let path = repo.to_string_lossy().into_owned();
             let first = GitReader::get_commit_details(&path, &head).expect("first");
@@ -12629,7 +12635,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
     /// as objects arrive), so it is never a cache key: it is read each time.
     #[test]
     fn an_abbreviated_commit_id_is_not_cached() {
-        ref_cache::eager(|| {
+        eager_unhurried(|| {
             let (_dir, repo, head) = repo_with_commit_of(2);
             let path = repo.to_string_lossy().into_owned();
             let short = &head[..12];
@@ -12731,7 +12737,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
     /// invented, and the cut answer is not kept.
     #[test]
     fn oversized_numstat_is_flagged_and_never_cached() {
-        ref_cache::eager(|| {
+        eager_unhurried(|| {
             let (_dir, repo, head) = repo_with_commit_of(200);
             let path = repo.to_string_lossy().into_owned();
             let cap = 2048;
@@ -13472,7 +13478,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         let inc = include.path().join("inc.cfg");
         std::fs::write(&inc, "[checkout]\n\tdefaultRemote = origin\n").unwrap();
         git_in(&repo, &["config", "include.path", inc.to_str().unwrap()]);
-        ref_cache::eager(|| {
+        eager_unhurried(|| {
             assert_eq!(default_base(&repo).remote, "origin");
             assert_eq!(compute_default_base(&repo).remote, "origin");
             std::fs::write(&inc, "[checkout]\n\tdefaultRemote = upstream\n").unwrap();
@@ -13507,7 +13513,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             &repo,
             &["update-ref", "refs/remotes/origin/develop", "HEAD"],
         );
-        ref_cache::eager(|| {
+        eager_unhurried(|| {
             let name = |r: &Path| default_base(r).base.map(|(n, _)| n);
             git_in(&repo, &["remote", "set-head", "origin", "main"]);
             assert_eq!(name(&repo).as_deref(), Some("main"));
@@ -13587,7 +13593,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         crate::test_support::trust_repo(&linked);
         let linked = linked.canonicalize().unwrap();
         git_in(&repo, &["config", "branch.lane.remote", "upstream"]);
-        ref_cache::eager(|| {
+        eager_unhurried(|| {
             for _ in 0..2 {
                 let a = default_base(&repo);
                 let b = default_base(&linked);
@@ -13614,7 +13620,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         for needle in ["symbolic-ref", "for-each-ref", "config"] {
             let dir = init_repo_with_remotes(&["origin"], "main");
             let repo = dir.path().canonicalize().unwrap();
-            ref_cache::eager(|| {
+            eager_unhurried(|| {
                 let refused = crate::engine::git_cli::with_forced_spawn_failure_of(needle, || {
                     default_base(&repo)
                 });
@@ -13633,7 +13639,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         }
         let dir = init_repo_with_remotes(&[], "feature");
         let repo = dir.path().canonicalize().unwrap();
-        ref_cache::eager(|| {
+        eager_unhurried(|| {
             assert_eq!(default_base(&repo).base, None);
             git_in(&repo, &["branch", "main"]);
             assert_eq!(
@@ -13660,7 +13666,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
                 let barrier = std::sync::Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    ref_cache::eager(|| default_base(&repo))
+                    eager_unhurried(|| default_base(&repo))
                 })
             })
             .collect();
@@ -14370,7 +14376,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         #[test]
         fn awkward_paths_are_ranked_blamed_and_kept() {
             let _kept = ref_cache::retention();
-            ref_cache::eager(|| {
+            eager_unhurried(|| {
                 let dir = init_repo_with_remotes(&[], "main");
                 for n in 0..130 {
                     write(dir.path(), &format!("src/c{n:03}.rs"), "fn cold() {}\n");
@@ -14414,7 +14420,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         #[test]
         fn a_report_past_its_deadline_is_partial_and_not_kept() {
             let _kept = ref_cache::retention();
-            ref_cache::eager(|| {
+            eager_unhurried(|| {
                 let dir = init_repo_with_remotes(&[], "main");
                 for n in 0..5 {
                     write(dir.path(), &format!("src/f{n}.rs"), "fn f() {}\n");
@@ -14441,7 +14447,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         #[test]
         fn a_deleted_high_churn_file_is_not_sampled_and_does_not_fail_blame() {
             let _kept = ref_cache::retention();
-            ref_cache::eager(|| {
+            eager_unhurried(|| {
                 let dir = init_repo_with_remotes(&[], "main");
                 for n in 0..130 {
                     write(dir.path(), &format!("src/c{n:03}.rs"), "fn cold() {}\n");
@@ -14474,7 +14480,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         #[test]
         fn every_mailmap_input_invalidates_the_memo() {
             let _kept = ref_cache::retention();
-            ref_cache::eager(|| {
+            eager_unhurried(|| {
                 let dir = init_repo_with_remotes(&[], "main");
                 write(dir.path(), "code.rs", "fn a() {}\n");
                 commit_as(dir.path(), "feat: code", "Old <old@example.com>");
@@ -14546,7 +14552,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         #[test]
         fn two_worktrees_at_one_head_do_not_share_a_memo() {
             let _kept = ref_cache::retention();
-            ref_cache::eager(|| {
+            eager_unhurried(|| {
                 let dir = init_repo_with_remotes(&[], "main");
                 write(dir.path(), "code.rs", "fn a() {}\n");
                 commit_as(dir.path(), "feat: code", "Old <old@example.com>");
@@ -14707,7 +14713,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         #[test]
         fn a_submodule_does_not_defeat_the_memo_or_truncate_the_report() {
             let _kept = ref_cache::retention();
-            ref_cache::eager(|| {
+            eager_unhurried(|| {
                 let dir = init_repo_with_remotes(&[], "main");
                 write(dir.path(), "src/a.rs", "fn a() {}\n");
                 commit_as(dir.path(), "feat: a", "A <a@example.com>");
@@ -14741,7 +14747,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         #[test]
         fn concurrent_cold_calls_blame_once() {
             let _kept = ref_cache::retention();
-            ref_cache::eager(|| {
+            eager_unhurried(|| {
                 let dir = churn_fixture(40, 2);
                 let root = dir.path().canonicalize().unwrap();
                 let path = root.to_str().unwrap().to_string();
@@ -14801,7 +14807,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         #[test]
         fn a_mailmap_file_under_another_users_home_is_not_kept() {
             let _kept = ref_cache::retention();
-            ref_cache::eager(|| {
+            eager_unhurried(|| {
                 let dir = init_repo_with_remotes(&[], "main");
                 write(dir.path(), "code.rs", "fn a() {}\n");
                 commit_as(dir.path(), "feat: code", "A <a@example.com>");
@@ -14854,7 +14860,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         #[test]
         fn spawn_budget_on_a_two_thousand_file_repository() {
             let _kept = ref_cache::retention();
-            ref_cache::eager(|| {
+            eager_unhurried(|| {
                 let dir = init_repo_with_remotes(&[], "main");
                 let seed: Vec<(String, String)> = (0..2000)
                     .map(|n| {
@@ -15029,7 +15035,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         fn l4_cached_listings_are_fresh_after_every_kind_of_ref_move() {
             let _held = ref_cache::retention();
             let (_dir, root, wt, _p) = fixture();
-            ref_cache::eager(|| {
+            eager_unhurried(|| {
                 let warm = || {
                     check(&root, "warm-up");
                     check(&root, "warm-up again");
@@ -15101,7 +15107,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         fn l4_same_tick_double_and_triple_writes_are_seen() {
             let _held = ref_cache::retention();
             let (_dir, root, _wt, _p) = fixture();
-            ref_cache::eager(|| {
+            eager_unhurried(|| {
                 for round in 0..40 {
                     check(&root, "warm");
                     let tip = rev_parse(&root, "feat");
@@ -15133,7 +15139,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
             git_in(&root, &["update-ref", "refs/remotes/origin/twin", &f]);
             git_in(&root, &["branch", "twin", &f]);
             git_in(&root, &["tag", "tagtwin", &f]);
-            ref_cache::eager(|| {
+            eager_unhurried(|| {
                 let base = check(&root, "twins");
                 let tips = tip_counts_against(&root, &base).unwrap();
                 assert_eq!(tips[&f], (2, 1));
@@ -15304,7 +15310,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
             let _held = ref_cache::retention();
             let (_dir, root, _wt, _p) = fixture();
             let base = default_base(&root).base.unwrap().1;
-            ref_cache::eager(|| {
+            eager_unhurried(|| {
                 let stop = std::sync::atomic::AtomicBool::new(false);
                 std::thread::scope(|s| {
                     let mut readers = Vec::new();
@@ -15382,7 +15388,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         #[test]
         fn a_default_ownership_report_does_not_flush_other_repositories_answers() {
             let _kept = ref_cache::retention();
-            ref_cache::eager(|| {
+            eager_unhurried(|| {
                 let other = init_repo_with_remotes(&[], "main");
                 std::fs::write(other.path().join("a.txt"), "a\n").unwrap();
                 git_in(other.path(), &["add", "-A"]);

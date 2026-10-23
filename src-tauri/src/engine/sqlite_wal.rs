@@ -2,12 +2,17 @@
 //!
 //! `PRAGMA journal_mode=WAL` can answer `SQLITE_BUSY` immediately, without
 //! consulting the connection's busy handler, while another connection is
-//! switching the same file: two processes creating one store (the app and
-//! gitpulse-mcp opening a repository's ledger or the churn cache) lose one
-//! of them. That is contention that clears in milliseconds, so every store
-//! goes through [`enter_wal`], which retries it for a bound its caller chooses
-//! and returns contention that outlasts the bound as the original
-//! `rusqlite::Error`, for the caller to type as it sees fit.
+//! switching the same file. That is contention that clears in milliseconds,
+//! so every store goes through [`enter_wal`], which retries it for a bound its
+//! caller chooses and returns contention that outlasts the bound as the
+//! original `rusqlite::Error`, for the caller to type as it sees fit.
+//!
+//! Who races depends on the store. The ledger is opened by many processes (the
+//! app, gitpulse-mcp, hooks), so two of them can create it at once: that lost a
+//! writer 2 in 60 under load. The churn cache is written by the app alone, so
+//! the race there is two app processes on one cache directory (a relaunch while
+//! the previous process is still exiting) or two threads of one process opening
+//! it; the churn tests race threads, the only form one test process can make.
 
 use rusqlite::{Connection, ErrorCode};
 use std::time::{Duration, Instant};
@@ -19,13 +24,25 @@ pub(crate) const LEDGER_WAL_PATIENCE: Duration = Duration::from_secs(10);
 /// connection's one-statement switch.
 const RETRY_PAUSE: Duration = Duration::from_millis(5);
 
-/// Puts the database behind `conn` in WAL mode, retrying `SQLITE_BUSY` for up
-/// to `patience`.
+/// Puts the database behind `conn` in WAL mode, retrying `SQLITE_BUSY` for at
+/// most `patience` in total.
 ///
-/// An already-WAL file needs no switch, so it is only read, never written.
-/// Any error other than `SQLITE_BUSY` is returned at once; so is `SQLITE_BUSY`
-/// once `patience` has elapsed (one attempt is always made).
+/// The connection's own busy handler sleeps inside every attempt, so it would
+/// stack on top of `patience`: it is set to zero for the switch and put back,
+/// whatever the outcome. An already-WAL file needs no switch, so it is only
+/// read, never written. Any error other than `SQLITE_BUSY` is returned at once;
+/// so is `SQLITE_BUSY` once `patience` has elapsed (one attempt is always made).
 pub(crate) fn enter_wal(conn: &Connection, patience: Duration) -> rusqlite::Result<()> {
+    let handler_ms: i64 = conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))?;
+    conn.busy_timeout(Duration::ZERO)?;
+    let switched = switch_within(conn, patience);
+    let restored = conn.busy_timeout(Duration::from_millis(
+        u64::try_from(handler_ms).unwrap_or(0),
+    ));
+    switched.and(restored)
+}
+
+fn switch_within(conn: &Connection, patience: Duration) -> rusqlite::Result<()> {
     let deadline = Instant::now() + patience;
     loop {
         let switched = conn
@@ -130,6 +147,29 @@ mod tests {
             took < Duration::from_millis(100) + Duration::from_millis(500),
             "patience 100 ms, busy_timeout 1.5 s: took {took:?}"
         );
+    }
+
+    /// The connection's busy handler is only suspended for the switch: it is
+    /// back as it was after a switch, and after a refusal.
+    #[test]
+    fn the_connections_busy_handler_is_restored_on_every_path() {
+        let busy_ms = |conn: &Connection| -> i64 {
+            conn.pragma_query_value(None, "busy_timeout", |row| row.get(0))
+                .unwrap()
+        };
+        let (_dir, path) = rollback_file();
+        let conn = Connection::open(&path).unwrap();
+        conn.busy_timeout(Duration::from_millis(1234)).unwrap();
+        enter_wal(&conn, Duration::from_secs(5)).unwrap();
+        assert_eq!(busy_ms(&conn), 1234, "restored after a switch");
+
+        let (_dir2, path2) = rollback_file();
+        let holder = Connection::open(&path2).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let refused = Connection::open(&path2).unwrap();
+        refused.busy_timeout(Duration::from_millis(777)).unwrap();
+        enter_wal(&refused, Duration::from_millis(50)).expect_err("held");
+        assert_eq!(busy_ms(&refused), 777, "restored after a refusal");
     }
 
     /// ADVERSARIAL W6-L3 (held): every extended BUSY code maps to the primary

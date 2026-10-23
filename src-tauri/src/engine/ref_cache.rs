@@ -315,9 +315,27 @@ struct Kept {
     value: String,
 }
 
-fn kept() -> &'static Mutex<HashMap<Key, Kept>> {
-    static KEPT: OnceLock<Mutex<HashMap<Key, Kept>>> = OnceLock::new();
+type KeptTable = Mutex<HashMap<Key, Kept>>;
+
+#[cfg(not(test))]
+fn kept() -> &'static KeptTable {
+    static KEPT: OnceLock<KeptTable> = OnceLock::new();
     KEPT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// One table per test thread, and libtest runs each test on a thread of its
+/// own: the production table holds 64 answers for the whole process and evicts
+/// oldest first, so tests sharing it evicted each other's answers (under load a
+/// test outlives the racy window between writing its repository and reading it,
+/// and then its answers are stored too). A test that counts on an answer staying
+/// kept now has a table nobody else writes to. The table is leaked, once per
+/// test thread, to have the process-wide table's `'static` type.
+#[cfg(test)]
+fn kept() -> &'static KeptTable {
+    thread_local! {
+        static TABLE: &'static KeptTable = Box::leak(Box::new(Mutex::new(HashMap::new())));
+    }
+    TABLE.with(|table| *table)
 }
 
 /// [`git_cli::git_text_shared`] for a ref listing over `namespaces`.
@@ -396,7 +414,7 @@ pub(crate) fn through_stamped(
         }
     }
     let (value, keep) = run()?;
-    if let (Some(stamp), true) = (stamp, keep && value.len() <= MAX_ENTRY_BYTES && may_store()) {
+    if let (Some(stamp), true) = (stamp, keep && value.len() <= MAX_ENTRY_BYTES) {
         let mut table = kept().lock().unwrap_or_else(PoisonError::into_inner);
         table.remove(&key);
         // Oldest first, until both bounds hold with this answer added.
@@ -507,7 +525,6 @@ fn note_hit() {}
 thread_local! {
     static RACY_OVERRIDE: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
     static HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static HOLDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static CLOCK: std::cell::Cell<Option<(Instant, SystemTime)>> = const { std::cell::Cell::new(None) };
 }
 
@@ -595,43 +612,9 @@ fn note_hit() {
 /// process-wide table. Shared with the callers' own tests (provenance), whose
 /// kept answers live in the same table.
 #[cfg(test)]
-pub(crate) fn retention() -> Retention {
+pub(crate) fn retention() -> std::sync::MutexGuard<'static, ()> {
     static SERIAL: Mutex<()> = Mutex::new(());
-    let guard = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
-    HOLDING.with(|cell| cell.set(true));
-    Retention(guard)
-}
-
-/// [`retention`]'s guard. While a thread holds it, it is the only one whose
-/// answers are stored (see [`may_store`]).
-#[cfg(test)]
-pub(crate) struct Retention(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
-
-#[cfg(test)]
-impl Drop for Retention {
-    fn drop(&mut self) {
-        HOLDING.with(|cell| cell.set(false));
-    }
-}
-
-/// Whether this thread's answers may enter the shared table.
-///
-/// The table holds 64 answers for the whole process, evicting oldest first,
-/// and one ownership report stores 128. Under load a test that does not hold
-/// [`retention`] outlives the racy window between writing its repository and
-/// reading it, so its answers are stored too, and a few of those evicted every
-/// answer a holder had just kept: `a_clean_report_is_kept` and its siblings
-/// failed with the whole report measured again. Only a holder stores in a
-/// test build, so a test that counts on an answer staying kept is the only
-/// writer while it runs; production stores for everyone.
-#[cfg(test)]
-fn may_store() -> bool {
-    HOLDING.with(std::cell::Cell::get)
-}
-
-#[cfg(not(test))]
-fn may_store() -> bool {
-    true
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Runs `f` with no racy window, so every stamp is stored: what the oracle
@@ -1396,10 +1379,10 @@ mod tests {
 
     const MILLI: Duration = Duration::from_millis(1);
 
-    /// A test that holds [`retention`] counts on its answer staying kept. Another
-    /// test, which does not, stores a hundred settled answers beside it (as
-    /// every test does under load, once its repository outlives the racy
-    /// window): the holder's answer must survive them.
+    /// A test counts on its answer staying kept. Another test thread stores a
+    /// hundred settled answers beside it (as every test does under load, once
+    /// its repository outlives the racy window): in a test build each thread
+    /// has its own table, so the first answer must survive them.
     #[test]
     fn answers_stored_by_a_test_without_retention_do_not_evict_the_holders() {
         let _held = retention();

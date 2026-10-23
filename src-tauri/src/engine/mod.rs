@@ -13,6 +13,7 @@ pub mod provenance;
 pub mod ref_cache;
 pub mod remotes;
 pub mod repo_op;
+pub mod sqlite_wal;
 pub mod stash;
 pub mod submodules;
 pub mod text_shape;

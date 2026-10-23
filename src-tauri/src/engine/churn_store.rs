@@ -407,7 +407,7 @@ impl Store {
         conn.busy_timeout(BUSY_TIMEOUT).map_err(|e| {
             OpenFailure::new(format!("cannot configure {}: {e}", path.display()), &e)
         })?;
-        crate::sqlite_wal::enter_wal(&conn, wal_patience)
+        crate::engine::sqlite_wal::enter_wal(&conn, wal_patience)
             .map_err(|e| OpenFailure::new(format!("{} is not usable: {e}", path.display()), &e))?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(|e| OpenFailure::new(format!("{} is not usable: {e}", path.display()), &e))?;
