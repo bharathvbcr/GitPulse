@@ -77,7 +77,15 @@ fn dump_surfaces(repo: &str) -> Value {
             out.insert(format!("tool:{tool}:ERR"), doc);
         }
     }
-    for facet in ["insights", "status", "context", "ledger", "tasks", "collisions", "changes"] {
+    for facet in [
+        "insights",
+        "status",
+        "context",
+        "ledger",
+        "tasks",
+        "collisions",
+        "changes",
+    ] {
         let doc = match repo_facet(facet, repo) {
             Ok(doc) => doc,
             Err(e) => json!({ "ERR": format!("{e:?}").replace(repo, "<repo>") }),
@@ -131,7 +139,10 @@ fn wire_dump_corrupt_ledger() {
 fn wire_dump_stale_catch_up() {
     let (_dir, repo) = trusted_repo();
     let _ = crate::ledger::status(&repo);
-    let record = crate::ledger::CatchUpRecord { completed: true, ..Default::default() };
+    let record = crate::ledger::CatchUpRecord {
+        completed: true,
+        ..Default::default()
+    };
     let long_ago = crate::ledger::ids::now_millis().saturating_sub(3 * 3600 * 1000);
     crate::ledger::record_catch_up(&repo, &repo, &record, long_ago).expect("catch up");
     write_dump("stale", &dump_surfaces(&repo));
