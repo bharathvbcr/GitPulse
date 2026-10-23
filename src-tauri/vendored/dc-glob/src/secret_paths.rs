@@ -208,7 +208,7 @@ mod tests {
     }
 
     /// A case-insensitive filesystem opens `id_rſa` as `id_rsa`. The rows are
-    /// held by the Go gate too (policy/zfix_w6_fold_test.go reads the same file).
+    /// held by the Go gate too (policy/secret_fold_test.go reads the same file).
     #[test]
     fn folded_spellings_match_the_shared_fixture() {
         let fixture = include_str!("../../../testdata/secret-paths-fold.tsv");

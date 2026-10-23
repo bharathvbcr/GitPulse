@@ -952,8 +952,21 @@ pub type IndexedFiles = Vec<(String, String)>;
 pub struct FileEdges {
     pub generation: u32,
     pub file: StoredFile,
+    /// Edges written in this file (`source_file == file`): its dependencies.
     pub edges: Vec<StoredEdge>,
+    /// Edges from other files into this one, at the same confidence floor.
+    /// Not in `edges`; counted so an answer can say they were left out.
+    pub inbound_edges: usize,
     pub analysis: Option<AnalysisDisclosure>,
+}
+
+/// Which endpoint of an edge must be the file a per-file read names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EdgeSide {
+    /// `source` is the file: what the file depends on.
+    Outbound,
+    /// Either endpoint is the file.
+    Either,
 }
 
 /// Symbols declared in one file in the latest generation, with that
@@ -1429,13 +1442,26 @@ pub struct GenerationWriteOpts {
 /// `persist:write`; the remainder is real and unattributed, not missing.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WriteBreakdown {
-    /// `generation_file_rows` and the `file_payloads` behind it, including the
-    /// three JSON serializations a fresh payload needs.
+    /// JSON serialization: the three payload documents of every freshly
+    /// written file (parse outcome, engine, extraction -- 137 MB on a cold
+    /// build of this repository) and the `AnalysisSummary`. Measured as
+    /// 0.92 s of a 2.96 s cold `persist:write` before it had a name.
+    pub serialize: f64,
+    /// `ensure_payload_id`: the identity probe and the `file_payloads` insert
+    /// it falls through to.
+    pub payloads: f64,
+    /// The `generation_file_rows` membership rows, carried and fresh. The
+    /// payload behind a fresh row is [`Self::payloads`], its JSON
+    /// [`Self::serialize`].
     pub file_rows: f64,
     /// `generation_nodes`, carried and fresh.
     pub nodes: f64,
     /// `nodes_fts` and `nodes_fts_map`, carried and fresh.
     pub fts: f64,
+    /// `generation_literals`: the carry-forward `INSERT ... SELECT` and the
+    /// fresh inserts. The largest relation of a one-file edit (117k rows on
+    /// this repository) and, until it was named, most of `other`.
+    pub literals: f64,
     /// The edge delta: the scan of live rows, the closes and the inserts.
     pub edges: f64,
     /// The unresolved-call ledger delta, the same three passes.
@@ -1453,10 +1479,10 @@ pub struct WriteBreakdown {
     pub history: f64,
     /// `tx.commit()` -- the durability the whole write is waiting for.
     pub commit: f64,
-    /// Everything the ten spans above do not bracket, as a residual.
+    /// Everything the thirteen spans above do not bracket, as a residual.
     ///
     /// Set once by [`Self::attribute_residual`] at the end of the write, as
-    /// `total - (the ten named spans)`, so the split adds up to the write by
+    /// `total - (the thirteen named spans)`, so the split adds up to the write by
     /// construction rather than by anyone remembering to bracket a new
     /// statement.
     ///
@@ -1465,8 +1491,9 @@ pub struct WriteBreakdown {
     /// is 25% now, because the named spans got faster and this did not.
     ///
     /// What is in it, by reading the write rather than by measuring inside it:
-    /// the `serde_json` of the `AnalysisSummary` and the `generations` insert
-    /// that carries the ~1.09 MB of JSON it produces, the duplicate-path scan
+    /// the `generations` insert that carries the ~1.7 MB of `AnalysisSummary`
+    /// JSON (its serialization is [`Self::serialize`]; the insert itself
+    /// measured ~0.4 ms), the duplicate-path scan
     /// over every extraction, the transaction and `pending_state` setup, and --
     /// on an incremental write only -- the carry-forward decision, which reads
     /// the previous generation's file rows to choose what to reuse. The one
@@ -1489,9 +1516,12 @@ impl WriteBreakdown {
     /// out of the report is a compile-time omission rather than a silent one.
     pub fn parts(&self) -> Vec<(&'static str, f64)> {
         let Self {
+            serialize,
+            payloads,
             file_rows,
             nodes,
             fts,
+            literals,
             edges,
             unresolved,
             digests,
@@ -1502,9 +1532,12 @@ impl WriteBreakdown {
             other,
         } = *self;
         vec![
+            ("serialize", serialize),
+            ("payloads", payloads),
             ("file_rows", file_rows),
             ("nodes", nodes),
             ("fts", fts),
+            ("literals", literals),
             ("edges", edges),
             ("unresolved", unresolved),
             ("digests", digests),
@@ -1516,7 +1549,7 @@ impl WriteBreakdown {
         ]
     }
 
-    /// The ten bracketed spans, without the residual.
+    /// The thirteen bracketed spans, without the residual.
     ///
     /// Separate from [`Self::parts`] because the residual is *defined* as the
     /// total minus this, and a sum that included it would define `other` in

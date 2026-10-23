@@ -105,6 +105,11 @@ pub enum BlobIdentity {
     /// another `Unknown` — an unrecorded basis is not evidence that two things
     /// share one.
     Unknown,
+    /// The basis could not be *read* — git was unavailable, the read ran past
+    /// its deadline or its output cap. Not a statement about the repository,
+    /// so a caller reports the content as unavailable rather than as a basis
+    /// that disagrees. Never comparable with anything.
+    Unreadable { reason: String },
 }
 
 impl BlobIdentity {
@@ -122,7 +127,8 @@ impl BlobIdentity {
             // Two worktree reads are two different instants. Nothing says the
             // file did not change between them, so nothing here may assume it.
             (BlobIdentity::Worktree { .. }, BlobIdentity::Worktree { .. }) => false,
-            (BlobIdentity::Unknown, _) | (_, BlobIdentity::Unknown) => false,
+            (BlobIdentity::Unknown | BlobIdentity::Unreadable { .. }, _)
+            | (_, BlobIdentity::Unknown | BlobIdentity::Unreadable { .. }) => false,
         }
     }
 
@@ -132,6 +138,7 @@ impl BlobIdentity {
             BlobIdentity::Blob(oid) => format!("blob {oid}"),
             BlobIdentity::Worktree { digest } => format!("worktree digest {digest}"),
             BlobIdentity::Unknown => "an unrecorded basis".to_string(),
+            BlobIdentity::Unreadable { reason } => format!("an unreadable basis ({reason})"),
         }
     }
 }

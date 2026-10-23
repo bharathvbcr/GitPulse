@@ -20,11 +20,13 @@ cannot leave this record naming a commit that is no longer the vendored one). Th
 (below), and re-vendored with
 `node scripts/vendor-crates.mjs --crate=dc-store`, never edited here.
 
-Schema version is **13**. The 11 → 12 rung only adds refinement proposals
+Schema version is **14**. The 11 → 12 rung only adds refinement proposals
 (`kind`, and an `acceptance_criteria` lock) and moves the version; the 12 → 13
 rung only moves it too, fencing the short request receipts (a retry rebuilds its
-response from the event, which a schema 12 host would not do). The archive
-behaviour below is unchanged by either. The 10 → 11 rung (`workbench/items.sql`):
+response from the event, which a schema 12 host would not do); the 13 → 14 rung
+moves it again, because items gain a validated `scope` object in the body (no
+table changes) and a host that builds a body without it would erase every
+task's scope. The archive behaviour below is unchanged by any of them. The 10 → 11 rung (`workbench/items.sql`):
 
 - adds `archived` and `completed_at` to `work_items` as **VIRTUAL** generated
   columns over the body. The original plan said STORED, but SQLite cannot

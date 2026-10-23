@@ -31,7 +31,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::ExitCode;
 
-use dc_store::{AcquireRequest, Lease, LeaseCode, ScopeWrite, Store, StoreError};
+use dc_store::{AcquireRequest, Lease, LeaseCode, ReadyMode, ScopeWrite, Store, StoreError};
 
 // A disconnected consumer is a transport failure, not a Rust panic. Keep
 // diagnostics off this JSON protocol, including the error response path.
@@ -179,6 +179,8 @@ const KNOWN_FLAGS: &[&str] = &[
     // `gaps-replace`: one verification (run record and gap set) in the framing
     // dc_store::commit_wire documents.
     "wire",
+    // `ready`'s ordering: how a blocked task is treated, by gate mode.
+    "mode",
 ];
 
 /// The identity a caller checks to confirm it is talking to this store and not
@@ -432,6 +434,18 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
                         ),
                     ])))
                 }
+                // Not a fault: the item is gone, archived or not workable. A
+                // caller branches on the code instead of reading a message.
+                Err(StoreError::TaskUnavailable {
+                    task_id,
+                    code,
+                    detail,
+                }) => Err(Failure::Conflict(object(&[
+                    ("ok", &json_bool(false)),
+                    ("code", &quote(code)),
+                    ("task_id", &quote(&task_id)),
+                    ("error", &quote(&detail)),
+                ]))),
                 Err(e) => Err(Failure::Fatal(e.to_string())),
             }
         }
@@ -585,11 +599,36 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
             }
         }
 
+        // `ready` lists what may be checked out next, in the order the gate
+        // mode dictates: under enforce a task with a blocking gap is left out;
+        // under advisory or off it is listed after every unblocked one, flagged
+        // `ready_to_checkout: false`. The mode is the caller's (the host reads
+        // it from config) and defaults to enforce, so a caller that forgets it
+        // gets the strict answer; a mode that is not one of the three is
+        // refused rather than read as the permissive one.
         "ready" => {
-            let ids = store
-                .ready_tasks()
+            let mode = match flag("mode") {
+                None => ReadyMode::Enforce,
+                Some(raw) => ReadyMode::parse(raw).ok_or_else(|| {
+                    Failure::Fatal(format!(
+                        "--mode {raw:?} is not one of enforce, advisory, off"
+                    ))
+                })?,
+            };
+            let ready = store
+                .ready_tasks(mode)
                 .map_err(|e| Failure::Fatal(e.to_string()))?;
-            let items: Vec<String> = ids.iter().map(|id| quote(id)).collect();
+            let ids: Vec<String> = ready.iter().map(|t| quote(&t.id)).collect();
+            let detail: Vec<String> = ready
+                .iter()
+                .map(|t| {
+                    object(&[
+                        ("id", &quote(&t.id)),
+                        ("ready_to_checkout", &json_bool(t.ready_to_checkout())),
+                        ("blocking_gap_count", &t.blocking_gap_count.to_string()),
+                    ])
+                })
+                .collect();
             // Tasks held by a lease whose expiry cannot be read are left out of
             // `tasks` (they are not free) and named here, so an operator sees
             // why a task is missing instead of the whole store failing.
@@ -598,8 +637,25 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
                 .map_err(|e| Failure::Fatal(e.to_string()))?;
             Ok(object(&[
                 ("ok", &json_bool(true)),
-                ("tasks", &format!("[{}]", items.join(","))),
+                ("mode", &quote(mode.as_str())),
+                ("tasks", &format!("[{}]", ids.join(","))),
+                ("ready", &format!("[{}]", detail.join(","))),
                 ("unreadable_leases", &unreadable_json(&unreadable)),
+            ]))
+        }
+
+        // The repository row every item names as its primary. A host that
+        // creates items asks for it first rather than spelling its id.
+        "local-repository" => {
+            store
+                .ensure_local_repository()
+                .map_err(|e| Failure::Fatal(e.to_string()))?;
+            Ok(object(&[
+                ("ok", &json_bool(true)),
+                (
+                    "repository_id",
+                    &quote(dc_store::workbench::LOCAL_REPOSITORY_ID),
+                ),
             ]))
         }
 
@@ -1237,6 +1293,9 @@ fn task_json(t: &dc_store::Task) -> String {
         // boundary answered before, for every task.
         ("requirement_ids", &t.requirement_ids_json),
         ("acceptance_criterion_ids", &t.acceptance_criterion_ids_json),
+        // Derived from the task's gaps on every read. An explicit checkout of a
+        // blocked task still works; this is how it says why it is blocked.
+        ("blocking_gap_count", &t.blocking_gap_count.to_string()),
     ])
 }
 

@@ -1040,15 +1040,12 @@ mod scope_tests {
         let db = crate::tasks::store_path(repo);
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         let store = dc_store::Store::open(&db).unwrap();
-        store
-            .connection()
-            .execute(
-                "INSERT INTO tasks (id, title, description, planned_files_json, status)
-                 VALUES ('TASK-HOOK', 'Hook', '',
-                     '[{\"path\":\"src/planned.rs\",\"allowed_change\":\"modify\"}]', 'in_progress')",
-                [],
-            )
-            .unwrap();
+        crate::tasks::plant_task::plant(
+            &store,
+            "TASK-HOOK",
+            "in_progress",
+            r#"{"planned_files":[{"path":"src/planned.rs","allowed_change":"modify"}]}"#,
+        );
         crate::ledger::bindings::bind(repo, repo, "TASK-HOOK").expect("bind");
         // A hook is a fresh process: nothing cached.
         crate::ledger::tests_support::reset_registry_for(repo);
@@ -1151,15 +1148,12 @@ done
         let db = crate::tasks::store_path(repo);
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         let store = dc_store::Store::open(&db).unwrap();
-        store
-            .connection()
-            .execute(
-                "INSERT INTO tasks (id, title, description, planned_files_json, status)
-                 VALUES ('TASK-7', 'Ledger', '',
-                     '[{\"path\":\"src/planned.rs\",\"allowed_change\":\"modify\"}]', 'in_progress')",
-                [],
-            )
-            .unwrap();
+        crate::tasks::plant_task::plant(
+            &store,
+            "TASK-7",
+            "in_progress",
+            r#"{"planned_files":[{"path":"src/planned.rs","allowed_change":"modify"}]}"#,
+        );
 
         // Unbound, there is nothing to declare — the behaviour every existing
         // checkout keeps.
@@ -1256,15 +1250,17 @@ done
         let db = crate::tasks::store_path(repo);
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         let store = dc_store::Store::open(&db).unwrap();
+        crate::tasks::plant_task::plant(
+            &store,
+            "TASK-8",
+            "in_progress",
+            r#"{"planned_files":[{"path":"src/a.rs","allowed_change":"modify"}]}"#,
+        );
         store
             .connection()
             .execute(
-                "INSERT INTO tasks (id, title, description, planned_files_json,
-                     agent_appended_planned_files_json, status)
-                 VALUES ('TASK-8', 'Widened', '',
-                     '[{\"path\":\"src/a.rs\",\"allowed_change\":\"modify\"}]',
-                     '[{\"path\":\"src/b.rs\",\"allowed_change\":\"modify\"}]', 'in_progress')",
-                [],
+                "INSERT INTO task_scope_appends (task_id, planned_files_json) VALUES ('TASK-8', ?1)",
+                [r#"[{"path":"src/b.rs","allowed_change":"modify"}]"#],
             )
             .unwrap();
         crate::ledger::bindings::bind(repo, repo, "TASK-8").expect("bind");
@@ -1289,15 +1285,12 @@ done
         let db = crate::tasks::store_path(main_path);
         std::fs::create_dir_all(db.parent().expect("store parent")).expect("store directory");
         let store = dc_store::Store::open(&db).expect("task store");
-        store
-            .connection()
-            .execute(
-                "INSERT INTO tasks (id, title, description, planned_files_json, status)
-                 VALUES ('TASK-LINKED', 'Linked scope', '',
-                     '[{\"path\":\"src/planned.rs\",\"allowed_change\":\"modify\"}]', 'in_progress')",
-                [],
-            )
-            .expect("task row");
+        crate::tasks::plant_task::plant(
+            &store,
+            "TASK-LINKED",
+            "in_progress",
+            r#"{"planned_files":[{"path":"src/planned.rs","allowed_change":"modify"}]}"#,
+        );
 
         crate::ledger::bindings::bind(main_path, &worktree, "TASK-LINKED")
             .expect("bind linked worktree");
@@ -1352,15 +1345,12 @@ done
         std::fs::create_dir_all(db.parent().expect("store parent")).expect("store directory");
         {
             let store = dc_store::Store::open(&db).expect("task store");
-            store
-                .connection()
-                .execute(
-                    "INSERT INTO tasks (id, title, description, planned_files_json, status)
-                     VALUES ('TASK-VANISHED', 'Vanishing scope', '',
-                         '[{\"path\":\"src/planned.rs\",\"allowed_change\":\"modify\"}]', 'in_progress')",
-                    [],
-                )
-                .expect("task row");
+            crate::tasks::plant_task::plant(
+                &store,
+                "TASK-VANISHED",
+                "in_progress",
+                r#"{"planned_files":[{"path":"src/planned.rs","allowed_change":"modify"}]}"#,
+            );
         }
         crate::ledger::bindings::bind(main_path, &worktree, "TASK-VANISHED")
             .expect("bind linked worktree");

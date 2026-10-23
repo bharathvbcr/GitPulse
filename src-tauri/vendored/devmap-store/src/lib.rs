@@ -10,7 +10,7 @@ pub mod schema;
 pub use coverage::{
     add_manifest_refusals, discovery_refusals, over_limit_inventory, refusal_inventory,
     CoverageGapRow, CoverageGapSample, CoverageGaps, DiscoveryInventory, DiscoveryRefusal,
-    COVERAGE_GAP_SAMPLE, GAP_DISCOVERY_REFUSED, GAP_OVER_LIMIT,
+    PartialParseGap, COVERAGE_GAP_SAMPLE, GAP_DISCOVERY_REFUSED, GAP_OVER_LIMIT,
 };
 pub use db::{
     checked_min_confidence, current_git_head, BuildHistoryRow, CallersPage, DeadPage, FileEdges,

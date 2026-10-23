@@ -1,6 +1,7 @@
 //! End-to-end extraction cache integration for the build path (RP2.5).
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use devmap_extract::cache::{cache_admits, CacheKey};
 use devmap_extract::{detect_language, extract_file, Extraction};
@@ -55,7 +56,13 @@ pub fn extract_scanned_cached_with_progress(
     scanned: &devmap_extract::ScannedTree,
     progress: Option<&devmap_extract::progress::FileProgress>,
 ) -> anyhow::Result<Vec<Extraction>> {
-    extract_scanned_with_progress(store, scanned, progress, CacheAdmission::Immediate)
+    extract_scanned_with_progress(
+        store,
+        scanned,
+        progress,
+        CacheAdmission::Immediate,
+        BuildControl::default(),
+    )
 }
 
 /// Reuse committed extraction payloads while preparing the next generation.
@@ -66,12 +73,30 @@ pub fn extract_scanned_cached_with_progress(
 /// commit, forcing extra WAL writes and vacuum work on every cold build.
 /// An interrupted generation may repeat uncommitted extraction; it cannot lose
 /// a published generation or acknowledge pending work before commit.
+///
+/// `cancel` is the build's one cancellation flag (callers hold a
+/// `devmap_query::Cancel` and pass its `flag()`). It is read before each file
+/// of the parallel pass and before each file of the serial budget retry. A
+/// cancelled build returns [`devmap_extract::BuildCancelled`] (downcast the
+/// `anyhow::Error`) instead of extractions, so nothing downstream can commit a
+/// generation built from an incomplete set. A flag tripped after the last file
+/// was handled is not an error: the extraction was complete.
 pub fn extract_scanned_for_generation(
     store: &Store,
     scanned: &devmap_extract::ScannedTree,
     progress: Option<&devmap_extract::progress::FileProgress>,
+    cancel: Option<&AtomicBool>,
 ) -> anyhow::Result<Vec<Extraction>> {
-    extract_scanned_with_progress(store, scanned, progress, CacheAdmission::AtGenerationCommit)
+    extract_scanned_with_progress(
+        store,
+        scanned,
+        progress,
+        CacheAdmission::AtGenerationCommit,
+        BuildControl {
+            cancel,
+            ..BuildControl::default()
+        },
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -80,12 +105,41 @@ enum CacheAdmission {
     AtGenerationCommit,
 }
 
+/// What a build run is told beyond the files: the cancellation flag, and the
+/// extractor, budgets and retry observer that production leaves at their
+/// defaults and the unit tests replace to force a budget refusal on a chosen
+/// file without waiting on a real parse budget.
+struct BuildControl<'a> {
+    cancel: Option<&'a AtomicBool>,
+    extractor: fn(&str, &str) -> Extraction,
+    budgets: devmap_extract::ParseBudgets,
+    after_retry: &'a (dyn Fn(usize) + Sync),
+}
+
+impl Default for BuildControl<'_> {
+    fn default() -> Self {
+        Self {
+            cancel: None,
+            extractor: extract_file,
+            budgets: devmap_extract::ParseBudgets::default(),
+            after_retry: &|_| {},
+        }
+    }
+}
+
 fn extract_scanned_with_progress(
     store: &Store,
     scanned: &devmap_extract::ScannedTree,
     progress: Option<&devmap_extract::progress::FileProgress>,
     admission: CacheAdmission,
+    control: BuildControl<'_>,
 ) -> anyhow::Result<Vec<Extraction>> {
+    let BuildControl {
+        cancel,
+        extractor,
+        budgets,
+        after_retry,
+    } = control;
     if let Some(progress) = progress {
         progress.start(scanned.sources.len());
     }
@@ -93,7 +147,10 @@ fn extract_scanned_with_progress(
         .sources
         .par_iter()
         .map(|(path, src)| {
-            let result = extract_one_cached_with(store, path, src, admission, extract_file);
+            if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Err(anyhow::Error::new(devmap_extract::BuildCancelled));
+            }
+            let result = extract_one_cached_with(store, path, src, admission, extractor);
             if let Some(progress) = progress {
                 // A budget refusal is not final until the serial retry below
                 // has run, which then counts it.
@@ -115,13 +172,17 @@ fn extract_scanned_with_progress(
             source: src.as_str(),
         })
         .collect();
-    devmap_extract::retry_budget_refusals(
+    let report = devmap_extract::retry_budget_refusals_observing(
         &files,
         &mut extractions,
         progress,
-        devmap_extract::ParseBudgets::default(),
-        None,
+        budgets,
+        cancel,
+        &mut |index| after_retry(index),
     );
+    if report.was_cancelled() {
+        return Err(anyhow::Error::new(devmap_extract::BuildCancelled));
+    }
     Ok(extractions)
 }
 
@@ -438,5 +499,104 @@ mod tests {
         .unwrap();
         assert_eq!(second.0.file_path, "cached.py");
         assert!(second.1);
+    }
+
+    fn refused_first_pass(path: &str, source: &str) -> Extraction {
+        devmap_extract::extract_file_with_budget(path, source, std::time::Duration::ZERO)
+    }
+
+    fn five_python_files() -> devmap_extract::ScannedTree {
+        let mut scanned = devmap_extract::ScannedTree::default();
+        for index in 0..5 {
+            scanned.sources.push((
+                format!("f{index}.py"),
+                format!("def f{index}():\n    return {index}\n"),
+            ));
+        }
+        scanned
+    }
+
+    /// Every file is refused by the first pass and would be recovered by the
+    /// retry, so a cancel tripped after the second recovered file leaves three
+    /// unretried: the build must say it was cancelled, not hand back a result
+    /// with three refusals in it as if it were finished.
+    #[test]
+    fn a_cancel_mid_retry_returns_build_cancelled_not_a_partial_result() {
+        let store = Store::open_in_memory().unwrap();
+        let cancel = AtomicBool::new(false);
+        let retried = std::sync::atomic::AtomicUsize::new(0);
+        let trip = |_: usize| {
+            if retried.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                cancel.store(true, Ordering::SeqCst);
+                // A second cancel while the first is pending changes nothing.
+                cancel.store(true, Ordering::SeqCst);
+            }
+        };
+        let outcome = extract_scanned_with_progress(
+            &store,
+            &five_python_files(),
+            None,
+            CacheAdmission::AtGenerationCommit,
+            BuildControl {
+                cancel: Some(&cancel),
+                extractor: refused_first_pass,
+                budgets: devmap_extract::ParseBudgets {
+                    first_pass: std::time::Duration::ZERO,
+                    retry: std::time::Duration::from_secs(60),
+                },
+                after_retry: &trip,
+            },
+        );
+        let error = outcome.expect_err("a cancelled build must not return extractions");
+        assert!(error.is::<devmap_extract::BuildCancelled>(), "{error:#}");
+        assert_eq!(
+            retried.load(Ordering::SeqCst),
+            2,
+            "no file after the cancel"
+        );
+    }
+
+    /// A flag that trips only after the last retried file changes nothing: the
+    /// extraction was complete.
+    #[test]
+    fn a_cancel_after_the_last_file_is_a_complete_build() {
+        let store = Store::open_in_memory().unwrap();
+        let cancel = AtomicBool::new(false);
+        let retried = std::sync::atomic::AtomicUsize::new(0);
+        let trip = |_: usize| {
+            if retried.fetch_add(1, Ordering::SeqCst) + 1 == 5 {
+                cancel.store(true, Ordering::SeqCst);
+            }
+        };
+        let extractions = extract_scanned_with_progress(
+            &store,
+            &five_python_files(),
+            None,
+            CacheAdmission::AtGenerationCommit,
+            BuildControl {
+                cancel: Some(&cancel),
+                extractor: refused_first_pass,
+                budgets: devmap_extract::ParseBudgets {
+                    first_pass: std::time::Duration::ZERO,
+                    retry: std::time::Duration::from_secs(60),
+                },
+                after_retry: &trip,
+            },
+        )
+        .expect("a cancel after the last file must not discard a finished build");
+        assert_eq!(extractions.len(), 5);
+        assert!(extractions.iter().all(|e| !e.is_parse_failure()));
+    }
+
+    /// Cancelled before the first file: the parallel pass stops without
+    /// extracting anything.
+    #[test]
+    fn a_cancel_before_the_first_file_extracts_nothing() {
+        let store = Store::open_in_memory().unwrap();
+        let cancel = AtomicBool::new(true);
+        let error =
+            extract_scanned_for_generation(&store, &five_python_files(), None, Some(&cancel))
+                .expect_err("a pre-cancelled build must not return extractions");
+        assert!(error.is::<devmap_extract::BuildCancelled>(), "{error:#}");
     }
 }

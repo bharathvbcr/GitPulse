@@ -723,22 +723,22 @@ dependencies = [
 
 [[package]]
 name = "dc-glob"
-version = "0.2.4"
+version = "0.2.5"
 
 [[package]]
 name = "dc-proc"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "dc-redact"
-version = "0.2.4"
+version = "0.2.5"
 
 [[package]]
 name = "dc-regress"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "dc-proc",
  "devmap-extract",
@@ -748,7 +748,7 @@ dependencies = [
 
 [[package]]
 name = "dc-regress-store"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "dc-regress",
@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "dc-store"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "rusqlite",
 ]

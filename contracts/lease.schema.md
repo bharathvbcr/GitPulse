@@ -2,7 +2,7 @@
 
 **Canonical owner:** DevCouncil — `rust/dc-store/src/schema.rs` owns the DDL. Manvi builds the same crate through a symlink (`Manvi/crates/dc-store`); it does not own it.
 **Store location:** `.devcouncil/state.sqlite`, per repository.
-**Consumers:** DevCouncil and Manvi (`dc-store`), GitPulse (links `dc-store` directly).
+**Consumers:** DevCouncil and Manvi (`dc-store`), GitPulse (a vendored copy under `src-tauri/vendored/dc-store`, refreshed by `GitPulse/scripts/vendor-crates.mjs`).
 
 This document describes the tables as *implemented*, not as intended. Where a
 consumer's model disagrees with what follows, `schema.rs` wins and the consumer
@@ -21,50 +21,78 @@ passes while the invariant it exists to protect is broken.
 
 ---
 
-## `tasks`
+## Tasks are workbench items (schema 10)
+
+There is no `tasks` table. Until dc-store schema 10 this store kept a task
+table of its own, with no command that created a task or moved its status; it
+was retired in favour of the one task definition that already existed, the
+workbench item (`work_items`, the table GitPulse's board is built on). Opening
+an older store archives every legacy row as an item, drops the table and stamps
+schema 10, in one transaction, keeping each task's id so leases, gaps, evidence
+and runs still name their task. If any step is refused, the store is left at
+its old version with its tasks table, which an older reader still understands.
+A legacy table with no rows is dropped without creating or upgrading the
+workbench profile.
+
+A task is a live `work_items` row whose primary repository is
+`this-repo` (`dc_store::workbench::LOCAL_REPOSITORY_ID`) and whose body carries
+an optional, validated `scope` object:
+
+| `scope` field | Meaning |
+|---|---|
+| `planned_files` | paths, or `{path, allowed_change?, reason?}`; `allowed_change` is one of `create`, `modify`, `delete`, `read_only` |
+| `forbidden_changes` | globs the task must not touch |
+| `allowed_commands` | commands the task may run |
+| `expected_tests` | commands that prove the task |
+| `requirement_ids` | requirements the task answers to |
+| `acceptance_criterion_ids` | criteria the task must prove |
+| `difficulty` | free text, optional |
+
+`items.put` refuses an invalid scope with the code `invalid_scope`: an unknown
+key, an `allowed_change` outside the four, a planned path that is absolute, has
+a `..` segment, a backslash or a control character, or a list past 1024 entries
+or an entry past 4096 bytes. A request that omits `scope` keeps the stored one.
+
+A task is **ready** when its status is `ready`, it is not deleted or archived,
+its primary repository is this one, and nobody holds a live lease on it. Whether
+it is **blocked** is derived from its blocking gaps on every read; it is not a
+status.
+
+## `task_scope_appends`
 
 ```sql
-CREATE TABLE IF NOT EXISTS tasks (
-    id VARCHAR NOT NULL,
-    title VARCHAR NOT NULL,
-    description VARCHAR NOT NULL,
-    requirement_ids_json VARCHAR NOT NULL DEFAULT '[]',
-    acceptance_criterion_ids_json VARCHAR NOT NULL DEFAULT '[]',
+CREATE TABLE IF NOT EXISTS task_scope_appends (
+    task_id VARCHAR NOT NULL,
     planned_files_json VARCHAR NOT NULL DEFAULT '[]',
-    expected_tests_json VARCHAR NOT NULL DEFAULT '[]',
     allowed_commands_json VARCHAR NOT NULL DEFAULT '[]',
-    forbidden_changes_json VARCHAR NOT NULL DEFAULT '[]',
-    status VARCHAR NOT NULL DEFAULT 'planned',
-    difficulty VARCHAR,
-    agent_appended_expected_tests_json VARCHAR NOT NULL DEFAULT '[]',
-    agent_appended_allowed_commands_json VARCHAR NOT NULL DEFAULT '[]',
-    priority VARCHAR,
-    agent_appended_planned_files_json VARCHAR NOT NULL DEFAULT '[]',
-    PRIMARY KEY (id)
+    expected_tests_json VARCHAR NOT NULL DEFAULT '[]',
+    PRIMARY KEY (task_id)
 );
 ```
 
-### The `agent_appended_*` columns are not a second copy of scope
+### These columns are not a second copy of scope
 
-`planned_files_json` is what the *planner* declared before the work started.
-`agent_appended_planned_files_json` is scope an executor added to its own task
-while it worked, by arguing a blocked write through the override seam.
+The item's `scope.planned_files` is what the *planner* declared before the work
+started. `task_scope_appends.planned_files_json` is scope an executor added to
+its own task while it worked, by arguing a blocked write through the override
+seam.
 
 Both are in scope for the gate. They are stored apart because they answer
 different questions, and a single merged list cannot answer the second one at
 all: *was this write authorised by the plan, or by the worker's own judgement
-about itself?*
+about itself?* They are also stored apart so a board that rewrites an item can
+neither erase nor widen what an executor appended.
 
 **A consumer that merges these two lists destroys the distinction the
 `widened` field on a verdict exists to report.** GitPulse must read them
 separately and render a write authorised by appended scope as `widened`, not
 as `clean`. See `verdict.schema.json`, `$defs.classification`.
 
-There is deliberately **no** agent-appended counterpart for
-`requirement_ids_json`. An executor may widen its own *file* scope, because
-which files a change touches is discovered while making it. Which requirement
-a task satisfies is not discovered that way, and a task that could append there
-could discharge a requirement by asserting it had.
+There is deliberately **no** appended counterpart for `requirement_ids`. An
+executor may widen its own *file* scope, because which files a change touches is
+discovered while making it. Which requirement a task satisfies is not discovered
+that way, and a task that could append there could discharge a requirement by
+asserting it had.
 
 ---
 

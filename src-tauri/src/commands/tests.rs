@@ -760,16 +760,7 @@ fn many_task_scopes_authenticate_the_repository_once() {
     std::fs::create_dir_all(db.parent().unwrap()).unwrap();
     let store = dc_store::Store::open(&db).unwrap();
     for id in ["T1", "T2", "T3"] {
-        store
-            .connection()
-            .execute(
-                &format!(
-                    "INSERT INTO tasks (id, title, description, planned_files_json, status)
-                     VALUES ('{id}', 'title of {id}', '', '[]', 'in_progress')"
-                ),
-                [],
-            )
-            .unwrap();
+        crate::tasks::plant_task::plant(&store, id, "in_progress", "{}");
     }
     let listings = || {
         crate::engine::git_cli::spawn_log::spawns_in(&repo)
@@ -786,7 +777,7 @@ fn many_task_scopes_authenticate_the_repository_once() {
     let scopes = super::task_scopes(path, &ids).expect("scopes");
     assert_eq!(listings() - before, 1, "one authentication for the set");
     let titles: Vec<&str> = scopes.iter().map(|scope| scope.title.as_str()).collect();
-    assert_eq!(titles, ["title of T1", "title of T2", "title of T3"]);
+    assert_eq!(titles, ["planted T1", "planted T2", "planted T3"]);
 
     let before = listings();
     assert!(super::task_scopes(path, &[]).expect("empty").is_empty());

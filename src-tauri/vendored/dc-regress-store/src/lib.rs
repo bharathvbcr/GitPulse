@@ -39,6 +39,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use dc_regress::history::HistoryRefusal;
 use dc_regress::{AffectedTestFile, BlobIdentity, BlobReader, CodeGraph, ConeEntry, GraphSymbol};
 use devmap_query::model::Request;
 use devmap_query::StoreQueryEngine;
@@ -193,7 +194,13 @@ impl<'a> StoreGraph<'a> {
             // A file the indexed commit does not contain has no blob, and
             // `Unknown` compares equal to nothing — so the join refuses it by
             // name instead of reading its spans against someone else's lines.
-            Err(_) => BlobIdentity::Unknown,
+            Err(HistoryRefusal::GitRefused { .. }) => BlobIdentity::Unknown,
+            // git could not answer (gone, past its deadline, over its cap):
+            // that says nothing about the file, so it is a read failure and
+            // never a basis that disagrees.
+            Err(other) => BlobIdentity::Unreadable {
+                reason: other.describe(),
+            },
         }
     }
 }

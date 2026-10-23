@@ -363,7 +363,7 @@ fn admits(paths: &[String], languages: &[String], path: &str, language: &str) ->
 
 /// `path` is `prefix` or lies beneath it — a segment-boundary match, so
 /// `frontend` does not admit `frontend2/x.ts`.
-fn under_prefix(path: &str, prefix: &str) -> bool {
+pub(crate) fn under_prefix(path: &str, prefix: &str) -> bool {
     path == prefix
         || (path.len() > prefix.len()
             && path.starts_with(prefix)
@@ -396,7 +396,7 @@ fn normalise_prefix(raw: &str) -> anyhow::Result<String> {
 }
 
 /// An absolute prefix made relative to the indexed root; a relative one as is.
-fn relative_to_root(prefix: &str, repo_root: Option<&str>) -> anyhow::Result<String> {
+pub(crate) fn relative_to_root(prefix: &str, repo_root: Option<&str>) -> anyhow::Result<String> {
     if !prefix.starts_with('/') {
         return Ok(prefix.to_string());
     }
@@ -463,6 +463,18 @@ mod tests {
         let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
         let languages: Vec<String> = languages.iter().map(|l| l.to_string()).collect();
         SymbolScope::new(&paths, &languages).unwrap().unwrap()
+    }
+
+    /// AUDIT G17: `./` is stripped as a prefix, never as a character set, so a
+    /// dot-directory keeps its dot.
+    #[test]
+    fn g17_a_dot_directory_keeps_its_leading_dot() {
+        assert_eq!(
+            normalise_prefix("./.github/workflows").unwrap(),
+            ".github/workflows"
+        );
+        assert_eq!(normalise_prefix(".devcouncil/").unwrap(), ".devcouncil");
+        assert_eq!(normalise_prefix("././src").unwrap(), "src");
     }
 
     #[test]

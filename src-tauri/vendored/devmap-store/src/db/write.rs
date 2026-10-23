@@ -349,8 +349,11 @@ impl Store {
         // `dead_confident`/`dead_ambiguous` counts far below — and a summary of
         // this repository carries 4,927 dead-symbol rows, so the copy was
         // several thousand string allocations that existed to be dropped.
-        let analysis_json = serde_json::to_string(analysis)
-            .map_err(|error| refusal(format!("analysis serialization failed: {error}")))?;
+        let analysis_json = {
+            let _charge = charge(&mut spent.serialize);
+            serde_json::to_string(analysis)
+                .map_err(|error| refusal(format!("analysis serialization failed: {error}")))?
+        };
 
         tx.execute(
             "INSERT INTO generations (created_at, head_sha, analysis_json, repo_root)
@@ -501,45 +504,54 @@ impl Store {
             // SQLite has no unsigned integer type. Preserve all 64 bits using
             // the same two's-complement representation as the extraction cache.
             let content_hash = extraction.content_hash as i64;
-            let parse_json = serde_json::to_string(&extraction.parse_outcome).map_err(|error| {
-                refusal(format!(
-                    "parse outcome serialization failed for {}: {error}",
-                    extraction.file_path
-                ))
-            })?;
-            let engine_json = serde_json::to_string(&extraction.engine).map_err(|error| {
-                refusal(format!(
-                    "extraction engine serialization failed for {}: {error}",
-                    extraction.file_path
-                ))
-            })?;
-            let mut durable_extraction = extraction.for_durable_store();
-            durable_extraction.source_code = None;
-            let extraction_json = serde_json::to_string(&durable_extraction).map_err(|error| {
-                refusal(format!(
-                    "extraction serialization failed for {}: {error}",
-                    extraction.file_path
-                ))
-            })?;
+            let (parse_json, engine_json, extraction_json) = {
+                let _charge = charge(&mut spent.serialize);
+                let parse_json =
+                    serde_json::to_string(&extraction.parse_outcome).map_err(|error| {
+                        refusal(format!(
+                            "parse outcome serialization failed for {}: {error}",
+                            extraction.file_path
+                        ))
+                    })?;
+                let engine_json = serde_json::to_string(&extraction.engine).map_err(|error| {
+                    refusal(format!(
+                        "extraction engine serialization failed for {}: {error}",
+                        extraction.file_path
+                    ))
+                })?;
+                let mut durable_extraction = extraction.for_durable_store();
+                durable_extraction.source_code = None;
+                let extraction_json =
+                    serde_json::to_string(&durable_extraction).map_err(|error| {
+                        refusal(format!(
+                            "extraction serialization failed for {}: {error}",
+                            extraction.file_path
+                        ))
+                    })?;
+                (parse_json, engine_json, extraction_json)
+            };
             let file_id = Self::ensure_path_id_cached(&tx, &mut path_ids, &extraction.file_path)?;
             // The identity this payload was produced with, so a stored row is
             // usable as a cache fallback without discarding the staleness
             // guarantee the cache key exists to enforce (SC8). Since v17 it is
             // also the payload's own key.
             let identity = devmap_extract::cache::CacheKey::for_extraction(extraction);
-            let payload_id = Self::ensure_payload_id(
-                &tx,
-                StoredPayload {
-                    file_id,
-                    content_hash,
-                    language: &extraction.language,
-                    grammar_version: &identity.grammar_version,
-                    analyzer_version: &identity.analyzer_version,
-                    parse_outcome_json: &parse_json,
-                    engine_json: &engine_json,
-                    extraction_json: &extraction_json,
-                },
-            )?;
+            let payload_id = {
+                let _charge = charge(&mut spent.payloads);
+                Self::ensure_payload_id(
+                    &tx,
+                    StoredPayload {
+                        file_id,
+                        content_hash,
+                        language: &extraction.language,
+                        grammar_version: &identity.grammar_version,
+                        analyzer_version: &identity.analyzer_version,
+                        parse_outcome_json: &parse_json,
+                        engine_json: &engine_json,
+                        extraction_json: &extraction_json,
+                    },
+                )?
+            };
             {
                 let _charge = charge(&mut spent.file_rows);
                 tx.execute(
@@ -621,17 +633,26 @@ impl Store {
                 }
             }
             if !carry.is_empty() {
-                let mut literal_carry = tx.prepare(
+                // One statement for the whole carry set, handed over as a JSON
+                // array and expanded by `json_each`, rather than one execute
+                // per path. The row set is the one the per-path loop copied:
+                // every previous-generation literal whose file path is in
+                // `carry`.
+                let _charge = charge(&mut spent.literals);
+                let carried_paths = serde_json::to_string(&carry).map_err(|error| {
+                    refusal(format!("literal carry set serialization failed: {error}"))
+                })?;
+                tx.prepare_cached(
                     "INSERT INTO generation_literals
                         (generation_id, file_id, line, span_start, value, qualified_name, symbol_name)
                      SELECT ?1, l.file_id, l.line, l.span_start, l.value, l.qualified_name, l.symbol_name
                        FROM generation_literals l
-                       JOIN paths p ON p.id = l.file_id
-                      WHERE l.generation_id = ?2 AND p.path = ?3",
-                )?;
-                for path in &carry {
-                    literal_carry.execute(params![gen_id, prev, path])?;
-                }
+                      WHERE l.generation_id = ?2
+                        AND l.file_id IN (
+                            SELECT p.id FROM paths p
+                             WHERE p.path IN (SELECT j.value FROM json_each(?3) j))",
+                )?
+                .execute(params![gen_id, prev, carried_paths])?;
             }
         }
 
@@ -647,9 +668,11 @@ impl Store {
             for sym in &ext.symbols {
                 {
                     let _charge = charge(&mut spent.nodes);
-                    tx.execute(
+                    tx.prepare_cached(
                         "INSERT INTO generation_nodes (generation_id, ordinal, file_id, name, qualified_name, kind, span_start, span_end, is_exported, body_exact, body_structural, body_nodes)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    )?
+                    .execute(
                         params![
                             gen_id,
                             node_ord,
@@ -688,14 +711,17 @@ impl Store {
                 }
                 node_ord += 1;
             }
+            let _charge = charge(&mut spent.literals);
             for lit in &ext.literals {
                 if lit.value.is_empty() || lit.value.as_bytes().contains(&0) {
                     continue;
                 }
-                tx.execute(
+                tx.prepare_cached(
                     "INSERT OR IGNORE INTO generation_literals
                         (generation_id, file_id, line, span_start, value, qualified_name, symbol_name)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )?
+                .execute(
                     params![
                         gen_id,
                         file_id,

@@ -2,7 +2,7 @@ use super::{
     append_kinds, append_languages, append_narrowing, append_paths, checked_min_confidence,
     checked_span, decode_stored_outcome, distinct_kinds, fts_failure, fts_match_query,
     literal_predicate, lock_conn, refusal, sqlite_limit, stored_symbol_from_row, CallersPage,
-    DeadPage, FileEdges, IndexedFiles, KeywordNarrowing, LiteralPage, PathRanks, SearchNarrowing,
+    DeadPage, EdgeSide, FileEdges, IndexedFiles, KeywordNarrowing, LiteralPage, PathRanks, SearchNarrowing,
     SearchPage, Store, StoredEdge, StoredFile, StoredLiteral, StoredSymbol,
 };
 use crate::edge_index::{EdgeOrder, GenerationEdges, GenerationEdgesBuilder};
@@ -980,9 +980,18 @@ impl Store {
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(Vec::new());
         };
-        Self::edges_for_file_in(&snapshot, gen, path, min_confidence)
+        Self::edges_for_file_in(&snapshot, gen, path, min_confidence, EdgeSide::Either)
     }
 
+    /// A file's own *dependencies*: the edges written in it (`source` is the
+    /// file), plus a count of edges pointing at it from other files.
+    ///
+    /// Outbound only, because the question is "what does this depend on". The
+    /// either-endpoint read ([`Self::latest_edges_for_file`]), ordered by
+    /// confidence, put a file's callers first, so a budgeted page answered a
+    /// different question than the tool name asked. The inbound count is the
+    /// disclosure that those rows exist and were left out.
+    ///
     /// Dependencies must not attach an old parse outcome to a newer edge set.
     pub fn file_edges(&self, path: &str, min_confidence: f32) -> Result<Option<FileEdges>> {
         let min_confidence = checked_min_confidence(min_confidence)?;
@@ -996,9 +1005,42 @@ impl Store {
         Ok(Some(FileEdges {
             generation,
             file,
-            edges: Self::edges_for_file_in(&snapshot, generation, path, min_confidence)?,
+            edges: Self::edges_for_file_in(
+                &snapshot,
+                generation,
+                path,
+                min_confidence,
+                EdgeSide::Outbound,
+            )?,
+            inbound_edges: Self::inbound_edge_count_in(
+                &snapshot,
+                generation,
+                path,
+                min_confidence,
+            )?,
             analysis: Self::analysis_disclosure_in(&snapshot, generation)?,
         }))
+    }
+
+    /// Edges from other files into `path`, at or above `min_confidence`.
+    fn inbound_edge_count_in(
+        snapshot: &Connection,
+        gen: u32,
+        path: &str,
+        min_confidence: f32,
+    ) -> Result<usize> {
+        let count: i64 = snapshot.query_row(
+            "SELECT COUNT(*)
+             FROM generation_edges e
+             JOIN paths sp ON sp.id = e.source_file_id
+             JOIN paths tp ON tp.id = e.target_file_id
+             WHERE e.generation_id = ?1
+               AND tp.path = ?2 AND sp.path <> ?2
+               AND CAST(ROUND(e.confidence * 1000) AS INTEGER) >= CAST(ROUND(?3 * 1000) AS INTEGER)",
+            params![gen, path, min_confidence],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(count).unwrap_or(0))
     }
 
     fn edges_for_file_in(
@@ -1006,6 +1048,7 @@ impl Store {
         gen: u32,
         path: &str,
         min_confidence: f32,
+        side: EdgeSide,
     ) -> Result<Vec<StoredEdge>> {
         let mut stmt = snapshot.prepare(
             "SELECT sp.path, tp.path, e.source_symbol, e.target_symbol,
@@ -1014,12 +1057,12 @@ impl Store {
              JOIN paths sp ON sp.id = e.source_file_id
              JOIN paths tp ON tp.id = e.target_file_id
              WHERE e.generation_id = ?1
-               AND (sp.path = ?2 OR tp.path = ?2)
+               AND (sp.path = ?2 OR (?4 AND tp.path = ?2))
                AND CAST(ROUND(e.confidence * 1000) AS INTEGER) >= CAST(ROUND(?3 * 1000) AS INTEGER)
              ORDER BY e.confidence DESC, sp.path, tp.path,
                       e.source_symbol, e.target_symbol, e.edge_kind",
         )?;
-        let rows = stmt.query_map(params![gen, path, min_confidence], |row| {
+        let rows = stmt.query_map(params![gen, path, min_confidence, side == EdgeSide::Either], |row| {
             Ok(StoredEdge {
                 source_file: row.get(0)?,
                 target_file: row.get(1)?,

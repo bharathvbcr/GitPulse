@@ -140,6 +140,17 @@ pub struct Response<T> {
     /// form, so nothing changes for a query that ran to completion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub walk_incomplete: Option<String>,
+    /// Something a reader of a *complete* answer should know, as distinct from
+    /// `walk_incomplete`, which says the answer is partial.
+    ///
+    /// Set by `dependencies` alone so far: an empty list over a target that has
+    /// callers, a floor that hid every edge, a file whose name also spells a
+    /// symbol. Clients, the CLI's `warning:` line and the session report treat
+    /// `walk_incomplete` as the partial-answer flag, so none of this can live
+    /// there. Additive and omitted when `None`, so nothing changes for answers
+    /// that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     /// How the edges behind this answer were distributed across the resolution
     /// ladder, **before** any `min_rung` floor was applied.
     ///

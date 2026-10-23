@@ -43,7 +43,7 @@ use crate::change::{
     changes_between_with_program, ChangeSet, ChangeStatus, ChangedRange, FileChange,
 };
 use crate::history;
-use crate::{CodeGraph, ConeEntry, GraphSymbol, Unavailable};
+use crate::{BlobIdentity, CodeGraph, ConeEntry, GraphSymbol, Unavailable};
 
 /// How far the inbound walk goes by default.
 ///
@@ -667,6 +667,20 @@ fn place_file<G: CodeGraph>(
             &file.path,
             &file.ranges,
             UnattributedReason::FileNotIndexed,
+        );
+        return;
+    }
+
+    // A basis that could not be read is a read failure, not a basis that
+    // disagrees with the content: the first is retryable, the second is not.
+    if let BlobIdentity::Unreadable { reason } = &spans_basis {
+        push_all(
+            unattributed,
+            &file.path,
+            &file.ranges,
+            UnattributedReason::ContentUnavailable {
+                reason: reason.clone(),
+            },
         );
         return;
     }

@@ -138,6 +138,7 @@ pub fn semantic_snapshots(
         dead_clusters_incomplete: None,
         excluded: None,
         unresolved_namesakes: None,
+        note: None,
         scope: None,
     }
 }

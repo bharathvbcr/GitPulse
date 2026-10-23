@@ -14,15 +14,18 @@ use crate::model::*;
 // defined in this file: public ones are re-exported below, and private ones are
 // `pub(super)` there and imported here, so `engine::` names are unchanged.
 mod budget;
+mod dependencies;
 mod gaps;
 mod hits;
 mod in_memory;
 mod trace;
 mod traversal;
+mod verdict;
 mod workspace;
 
+use self::verdict::StoreVerdict;
 use self::budget::{
-    affected_test_tokens, atomic_budget_take, attach_source_freshness, blast_layer_tokens,
+    affected_test_tokens, atomic_budget_take, blast_layer_tokens,
     budget_page_size, edges_per_direction, explore_budget, explore_definition_tokens,
     record_test_hit, search_page_size, search_rank_pool_size, unavailable_response,
 };
@@ -44,6 +47,9 @@ use self::hits::{
 pub use self::hits::{EVIDENCE_TEST_BUDGET_SHARE, EVIDENCE_TEST_DEPTH};
 use self::trace::shortest_path;
 pub(crate) use self::trace::PathSearch;
+use self::dependencies::{
+    dependency_note, dependency_order, shadowed_symbol_count, DependencyFacts, InboundTarget,
+};
 use self::traversal::{
     bare_callee_name, blast_radius_from_edges, family_of_path, indexed_traversal_starts,
     indexed_traversed_edges, node_id_of, reached_by, BlastBand, BlastWalk, NamesakeRead,
@@ -91,6 +97,22 @@ pub const MAX_TOKEN_BUDGET: u32 = 100_000;
 /// clamp is actually applied, so this is where the number belongs.
 pub const MAX_TRAVERSAL_DEPTH: usize = 64;
 
+/// Keep `verdict` only when it describes the generation the answer was built
+/// from. A verified verdict naming a different generation than `read` is
+/// replaced by an explicit unverified one: the answer never claims fresh or
+/// stale for a generation it did not read. Unverified verdicts pass through.
+fn pin_verdict(read: Option<u32>, verdict: SourceFreshness) -> SourceFreshness {
+    match (verdict.generation_id, read) {
+        (Some(verdict_generation), Some(read)) if verdict_generation == read => verdict,
+        (Some(verdict_generation), read) => SourceFreshness::unverified(format!(
+            "the index moved from generation {} to {verdict_generation} while this answer was \
+             built; run `devmap status` for a verified verdict",
+            read.map_or_else(|| "none".to_string(), |g| g.to_string())
+        )),
+        (None, _) => verdict,
+    }
+}
+
 pub struct QueryEngine<'a> {
     extractions: &'a [Extraction],
     resolution: &'a ResolutionResult,
@@ -109,6 +131,10 @@ pub struct StoreQueryEngine<'a> {
     /// Consulted inside the long loops. Default is a flag nobody sets, so a
     /// caller that has no way to give up (the CLI) behaves exactly as before.
     cancel: Cancel,
+    /// Runs inside [`Self::exit`] after the answer is built and before the
+    /// verdict is read: the window a daemon commit or status refresh can land
+    /// in. Tests use it to force that interleaving deterministically.
+    interleave: Option<Box<dyn Fn() + Send + Sync + 'a>>,
 }
 
 impl<'a> StoreQueryEngine<'a> {
@@ -116,7 +142,17 @@ impl<'a> StoreQueryEngine<'a> {
         Self {
             store,
             cancel: Cancel::new(),
+            interleave: None,
         }
+    }
+
+    /// Run `hook` between building an answer and reading its freshness verdict.
+    /// Exists so a test can land a generation or refresh the verdict cache in
+    /// exactly that window; production callers never set it.
+    #[doc(hidden)]
+    pub fn with_interleave_hook(mut self, hook: impl Fn() + Send + Sync + 'a) -> Self {
+        self.interleave = Some(Box::new(hook));
+        self
     }
 
     /// Answer under a cancellation flag the caller can trip.
@@ -130,12 +166,36 @@ impl<'a> StoreQueryEngine<'a> {
         self
     }
 
-    fn finish<T>(&self, response: Response<T>) -> Response<T> {
-        attach_source_freshness(self.store, response)
-    }
-
-    fn unavailable<T>(&self, resolution: ResolutionAvailability) -> Response<T> {
-        self.finish(unavailable_response(resolution))
+    /// The one exit of every public method that returns a [`Response`] or a
+    /// report built of them.
+    ///
+    /// The store's freshness verdict is read once, after the answer is built,
+    /// and written onto every `Response` the answer holds — top level, nested
+    /// layer, per-definition walk, refusal or success alike. Parts are built in
+    /// many places (`budget_take` is shared with the in-memory engine, the
+    /// blast walk builds its own layers, refusals are built with
+    /// `unavailable_response`) and each of those used to need its own call, so
+    /// a part built somewhere that forgot kept the placeholder "not checked"
+    /// next to a real verdict. [`StoreVerdict`] has no blanket impl: a new
+    /// return type does not compile through here until it says where its
+    /// `Response`s are.
+    fn exit<R: StoreVerdict>(
+        &self,
+        answer: impl FnOnce() -> anyhow::Result<R>,
+    ) -> anyhow::Result<R> {
+        // Generation ids only grow, and every read path resolves "the latest
+        // generation" when it runs. So the generation an answer read lies in
+        // [before, the latest at verdict time], and the verdict -- which names
+        // the latest generation at the moment it is read -- describes the answer
+        // only when the two ends are the same generation.
+        let before = self.store.latest_generation_id().ok().flatten();
+        let mut answer = answer()?;
+        if let Some(hook) = &self.interleave {
+            hook();
+        }
+        let verdict = SourceFreshness::from_store(self.store.query_source_freshness());
+        answer.stamp(&pin_verdict(before, verdict));
+        Ok(answer)
     }
 
     pub fn search(&self, req: Request<String>) -> anyhow::Result<Response<SymbolHit>> {
@@ -153,8 +213,9 @@ impl<'a> StoreQueryEngine<'a> {
         req: Request<String>,
         filter: Option<&crate::scope::NameQueryFilter>,
     ) -> anyhow::Result<Response<SymbolHit>> {
+        self.exit(|| {
         if req.query.trim().is_empty() && filter.is_none() {
-            return Ok(self.finish(budget_take(Vec::new(), req.token_budget, |_| 0)));
+            return Ok(budget_take(Vec::new(), req.token_budget, |_| 0));
         }
         let page = search_page_size(req.token_budget);
         let pool = search_rank_pool_size(req.token_budget);
@@ -173,7 +234,7 @@ impl<'a> StoreQueryEngine<'a> {
         // one row — so the exact answer is affordable here, and an exact answer
         // beats a disclosed approximation whenever it can be had.
         let Some(snapshot) = self.keyword_page(&req.query, pool, filter)? else {
-            return Ok(self.unavailable(ResolutionAvailability::Unavailable {
+            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
             }));
         };
@@ -243,14 +304,16 @@ impl<'a> StoreQueryEngine<'a> {
             devmap_analyze::combine_reasons(coverage_gap, empty_result_gap(total, &req.query)),
         );
         if total == 0 {
-            if let Some(reason) =
-                self.outside_index_reason(filter.map_or(&[][..], |filter| filter.paths()))?
-            {
+            let outside = self.outside_index_reason(filter, &req.query)?;
+            response.walk_incomplete =
+                devmap_analyze::combine_reasons(response.walk_incomplete.take(), outside.note);
+            if let Some(reason) = outside.reason {
                 response.resolution = ResolutionAvailability::Unavailable { reason };
             }
         }
         response.scope = scope;
-        Ok(self.finish(response))
+        Ok(response)
+    })
     }
 
     /// One keyword page, pinned to the generation the filter was checked against.
@@ -308,14 +371,16 @@ impl<'a> StoreQueryEngine<'a> {
         req: Request<String>,
         min_rung: Option<crate::rung::Rung>,
     ) -> anyhow::Result<Response<ResolvedEdge>> {
+        self.exit(|| {
         self.cancel.check()?;
+        // An indexed file path is read first and wins a spelling collision with
+        // a symbol. Anything else is a symbol query and goes through the same
+        // resolution `impact` uses.
         let Some(snapshot) = self.store.file_edges(&req.query, req.min_confidence)? else {
-            return Ok(self.unavailable(ResolutionAvailability::Unavailable {
-                reason: format!("{} is not indexed", req.query),
-            }));
+            return self.symbol_dependencies(req, min_rung);
         };
         if matches!(snapshot.file.parse_outcome, ParseOutcome::Failed { .. }) {
-            return Ok(self.unavailable(ResolutionAvailability::Unavailable {
+            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                 reason: format!("{} could not be parsed", req.query),
             }));
         }
@@ -340,19 +405,180 @@ impl<'a> StoreQueryEngine<'a> {
             .into_iter()
             .map(stored_edge_to_resolved)
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let (edges, rungs) = crate::rung::narrow(edges, min_rung);
+        let outbound_before_rung = edges.len();
+        let (mut edges, rungs) = crate::rung::narrow(edges, min_rung);
+        edges.sort_by(dependency_order);
+        // Which symbols the file's spelling also names. Only a spelling with no
+        // path separator can, and the index is the same one a symbol query
+        // reads, so a warm daemon pays nothing for the check.
+        let shadowed_symbols = if req.query.contains(['/', '\\']) {
+            0
+        } else if let Some(index) = self.generation_edges()? {
+            let names: BTreeSet<&str> = index
+                .symbols(false)
+                .chain(index.symbols(true))
+                .map(|(name, _)| name)
+                .collect();
+            shadowed_symbol_count(&req.query, names.into_iter())
+        } else {
+            0
+        };
+        let note = dependency_note(&DependencyFacts {
+            query: &req.query,
+            outbound_before_rung,
+            outbound_after_rung: edges.len(),
+            inbound: snapshot.inbound_edges,
+            min_rung,
+            shadowed_symbols,
+        });
         let mut response = budget_take(edges, req.token_budget, |_| 25);
         response.rungs = Some(rungs);
+        response.note = note;
         // Composed, not assigned: `budget_take` may already have set a reason
         // of its own, and a reader deciding whether to act on this list needs
         // every qualification the answer holds, not the last one written.
         response.walk_incomplete =
             devmap_analyze::combine_reasons(response.walk_incomplete.take(), coverage_gap);
-        Ok(self.finish(response))
+        Ok(response)
+    })
+    }
+
+    /// `dependencies` for a query that is not an indexed file path: a symbol,
+    /// `Type.method`, `file::symbol`, or an unindexed path.
+    ///
+    /// Resolved by [`indexed_traversal_starts`], the function `impact` and
+    /// `trace` resolve their targets with, so the two cannot disagree about what
+    /// a name means — including refusing an ambiguous bare name and listing the
+    /// candidates. The answer is the resolved symbol's own outbound edges, one
+    /// hop, which is what the tool is documented to return; it is not a depth-1
+    /// `trace`, whose "stopped at depth 1, not the full blast radius" caveat
+    /// would ride on every answer.
+    ///
+    /// A symbol that is indexed but calls nothing answers `Available`, empty,
+    /// with its inbound edge count named. It is resolved from either side of the
+    /// index for that reason: a constant is only ever a target.
+    fn symbol_dependencies(
+        &self,
+        req: Request<String>,
+        min_rung: Option<crate::rung::Rung>,
+    ) -> anyhow::Result<Response<ResolvedEdge>> {
+        let min_confidence = devmap_store::checked_min_confidence(req.min_confidence)?;
+        let not_indexed = || {
+            unavailable_response(ResolutionAvailability::Unavailable {
+                reason: format!("{} is not indexed", req.query),
+            })
+        };
+        let Some(index) = self.generation_edges()? else {
+            return Ok(not_indexed());
+        };
+        let target = req.query.trim();
+        let outbound_starts =
+            indexed_traversal_starts(&index, target, false, min_confidence, &self.cancel)?;
+        let inbound_starts =
+            indexed_traversal_starts(&index, target, true, min_confidence, &self.cancel)?;
+        let named: BTreeSet<(String, String)> = outbound_starts
+            .iter()
+            .chain(inbound_starts.iter())
+            .cloned()
+            .collect();
+        if matches!(
+            crate::query_match::classify(target),
+            crate::query_match::StartQuery::Symbol(_)
+        ) {
+            // One side may hold a namesake the other does not: a callee-only
+            // `run` and a called-only `run` are two symbols.
+            traversal::refuse_ambiguous(target, &named.iter().cloned().collect::<Vec<_>>())?;
+        }
+        if named.is_empty() {
+            return Ok(not_indexed());
+        }
+        self.cancel.check()?;
+        let call_blind = self.call_blind_starts(named.iter().map(|(_, file)| file.as_str()))?;
+        let mut ids: Vec<u32> = Vec::new();
+        let sources: BTreeSet<&(String, String)> = outbound_starts.iter().collect();
+        for (symbol, file) in sources {
+            for id in index.from_source_symbol(symbol) {
+                if index.source_file(*id) == file
+                    && index.admits(*id, min_confidence)
+                    && index.confidence(*id) >= min_confidence
+                {
+                    ids.push(*id);
+                }
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let mut edges = Vec::with_capacity(ids.len());
+        for (checked, id) in ids.into_iter().enumerate() {
+            self.cancel.check_every(checked)?;
+            edges.push(stored_edge_to_resolved(index.stored_edge(id))?);
+        }
+        let outbound_before_rung = edges.len();
+        let (mut edges, rungs) = crate::rung::narrow(edges, min_rung);
+        edges.sort_by(dependency_order);
+        let coverage_gap = devmap_analyze::combine_reasons(
+            analysis_status_gap(index.analysis()),
+            self.radius_attribution_gap(
+                index.generation(),
+                index.analysis(),
+                &named,
+                RadiusSide::Callees,
+            )?,
+        );
+        // Distinct nodes, then distinct edges: a node named by several inbound
+        // edges is one start, and an edge reachable from two starts is one edge.
+        // Counting per `(start, edge)` made the figure quadratic in the number
+        // of callers.
+        let inbound_nodes: BTreeSet<(String, String)> = inbound_starts.into_iter().collect();
+        let inbound_target = InboundTarget::Symbols(&inbound_nodes);
+        let mut inbound_ids: BTreeSet<u32> = BTreeSet::new();
+        if edges.is_empty() {
+            for (symbol, _) in &inbound_nodes {
+                for id in index.into_target_symbol(symbol) {
+                    if index.admits(*id, min_confidence)
+                        && index.confidence(*id) >= min_confidence
+                        && inbound_target.admits(
+                            index.source_file(*id),
+                            index.source_symbol(*id),
+                            index.target_file(*id),
+                            index.target_symbol(*id),
+                        )
+                    {
+                        inbound_ids.insert(*id);
+                    }
+                }
+            }
+        }
+        // A target whose calls were never extracted has nothing measured:
+        // refused, as `impact` refuses it, rather than answered as a leaf.
+        if edges.is_empty() {
+            if let Some(reason) = call_blind.refusal_when_empty(&req.query) {
+                let mut response =
+                    unavailable_response(ResolutionAvailability::Unavailable { reason });
+                response.walk_incomplete = coverage_gap;
+                return Ok(response);
+            }
+        }
+        let note = dependency_note(&DependencyFacts {
+            query: &req.query,
+            outbound_before_rung,
+            outbound_after_rung: edges.len(),
+            inbound: inbound_ids.len(),
+            min_rung,
+            shadowed_symbols: 0,
+        });
+        let mut response = budget_take(edges, req.token_budget, |_| EDGE_TOKENS);
+        response.rungs = Some(rungs);
+        response.note = note;
+        response.walk_incomplete = devmap_analyze::combine_reasons(
+            devmap_analyze::combine_reasons(response.walk_incomplete.take(), coverage_gap),
+            call_blind.reason(),
+        );
+        Ok(response)
     }
 
     pub fn impact(&self, req: Request<String>) -> anyhow::Result<Response<ResolvedEdge>> {
-        self.traverse(req, true, None)
+        self.impact_at_rung(req, None)
     }
 
     /// [`Self::impact`], narrowed to a named rung. See
@@ -362,7 +588,9 @@ impl<'a> StoreQueryEngine<'a> {
         req: Request<String>,
         min_rung: Option<crate::rung::Rung>,
     ) -> anyhow::Result<Response<ResolvedEdge>> {
+        self.exit(|| {
         self.traverse(req, true, min_rung)
+    })
     }
 
     /// [`Self::impact`], with the reached symbols banded by distance.
@@ -391,6 +619,7 @@ impl<'a> StoreQueryEngine<'a> {
     /// remainder to the edges, as [`Self::affected_tests`] splits its own. A
     /// caller asking for 2,000 tokens is answered in 2,000.
     pub fn impact_layered(&self, req: Request<String>) -> anyhow::Result<LayeredImpact> {
+        self.exit(|| {
         devmap_store::checked_min_confidence(req.min_confidence)?;
         let layer_budget = req.token_budget / 2;
         let edge_budget = req.token_budget.saturating_sub(layer_budget);
@@ -440,6 +669,7 @@ impl<'a> StoreQueryEngine<'a> {
             edges,
             blast_radius,
         })
+    })
     }
 
     /// Answer both call-graph directions for several targets in one pass.
@@ -492,6 +722,7 @@ impl<'a> StoreQueryEngine<'a> {
         max_depth: usize,
         min_rung: Option<crate::rung::Rung>,
     ) -> anyhow::Result<Vec<Neighbors>> {
+        self.exit(|| {
         if targets.len() > MAX_NEIGHBOR_TARGETS {
             anyhow::bail!(
                 "neighbors accepts at most {} targets, got {}",
@@ -534,6 +765,7 @@ impl<'a> StoreQueryEngine<'a> {
                 }
             },
         )
+    })
     }
 
     /// Bound retry work without holding the writer's lock across a fan-out.
@@ -731,7 +963,7 @@ impl<'a> StoreQueryEngine<'a> {
     }
 
     pub fn trace(&self, req: Request<String>) -> anyhow::Result<Response<ResolvedEdge>> {
-        self.traverse(req, false, None)
+        self.trace_at_rung(req, None)
     }
 
     /// [`Self::trace`], narrowed to a named rung. See
@@ -741,7 +973,9 @@ impl<'a> StoreQueryEngine<'a> {
         req: Request<String>,
         min_rung: Option<crate::rung::Rung>,
     ) -> anyhow::Result<Response<ResolvedEdge>> {
+        self.exit(|| {
         self.traverse(req, false, min_rung)
+    })
     }
 
     /// Return one deterministic shortest path from `from` to `to`.
@@ -753,10 +987,11 @@ impl<'a> StoreQueryEngine<'a> {
         &self,
         req: Request<(String, String)>,
     ) -> anyhow::Result<Response<ResolvedEdge>> {
+        self.exit(|| {
         self.cancel.check()?;
         devmap_store::checked_min_confidence(req.min_confidence)?;
         let Some(index) = self.generation_edges()? else {
-            return Ok(self.unavailable(ResolutionAvailability::Unavailable {
+            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
             }));
         };
@@ -777,7 +1012,7 @@ impl<'a> StoreQueryEngine<'a> {
             response
         };
         if from.is_empty() || to.is_empty() {
-            return Ok(self.unavailable(ResolutionAvailability::Unavailable {
+            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                 reason: "scoped trace endpoints must not be empty".to_string(),
             }));
         }
@@ -787,7 +1022,7 @@ impl<'a> StoreQueryEngine<'a> {
         // for a question the walk cannot answer. Whether a cycle passes through
         // a symbol is `impact`'s question; a scoped trace needs two endpoints.
         if from == to {
-            return Ok(self.unavailable(ResolutionAvailability::Unavailable {
+            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                 reason: format!(
                     "{from:?} and {to:?} are the same symbol; a scoped trace needs two \
                      different endpoints (whether a cycle passes through it is an \
@@ -842,7 +1077,8 @@ impl<'a> StoreQueryEngine<'a> {
         };
         let mut response = atomic_budget_take(path, req.token_budget, |_| 25);
         response.walk_incomplete = coverage_gap;
-        Ok(self.finish(response))
+        Ok(response)
+    })
     }
 
     /// Every edge in the latest generation at or above `min_confidence`, in
@@ -904,7 +1140,7 @@ impl<'a> StoreQueryEngine<'a> {
         // abandoned traversal therefore cannot block the drain loop's writes
         // while it unwinds.
         let Some((generation, index)) = self.store.generation_edges_with_id()? else {
-            return Ok(self.unavailable(ResolutionAvailability::Unavailable {
+            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
             }));
         };
@@ -1387,23 +1623,11 @@ impl<'a> StoreQueryEngine<'a> {
         };
         for path in distinct.into_iter().take(MAX_CALL_BLIND_FILES_CHECKED) {
             self.cancel.check()?;
-            starts.checked += 1;
             let Some(file) = self.store.latest_file(path)? else {
+                starts.checked += 1;
                 continue;
             };
-            if matches!(
-                file.parse_outcome,
-                devmap_extract::model::ParseOutcome::Clean
-            ) {
-                starts.clean.insert(file.path.clone());
-            }
-            if devmap_extract::model::is_call_blind(
-                &file.language,
-                &file.engine,
-                &file.parse_outcome,
-            ) {
-                starts.blind.push((file.path, file.language));
-            }
+            starts.record(&file.path, &file.language, &file.engine, &file.parse_outcome);
         }
         Ok(starts)
     }
@@ -1453,6 +1677,7 @@ impl<'a> StoreQueryEngine<'a> {
         max_depth: usize,
         filter: Option<&crate::scope::NameQueryFilter>,
     ) -> anyhow::Result<ExploreReport> {
+        self.exit(|| {
         self.read_composed(
             || {
                 self.explore_once(
@@ -1473,6 +1698,7 @@ impl<'a> StoreQueryEngine<'a> {
                 }
             },
         )
+    })
     }
 
     fn explore_once(
@@ -1520,19 +1746,23 @@ impl<'a> StoreQueryEngine<'a> {
             .map(|narrowing| scope_report_from_narrowing(narrowing, snapshot.analysis.as_ref()));
         // No definition, over a generation with holes in it: the name may be
         // declared where nothing was indexed. See `outside_index_reason`.
+        let mut unchecked_note = None;
         if total == 0 {
-            if let Some(reason) =
-                self.outside_index_reason(filter.map_or(&[][..], |filter| filter.paths()))?
-            {
+            let outside = self.outside_index_reason(filter, query)?;
+            if let Some(reason) = outside.reason {
                 return Ok(ExploreReport {
                     scope,
                     ..empty(reason)
                 });
             }
+            unchecked_note = outside.note;
         }
         let coverage_gap = devmap_analyze::combine_reasons(
-            search_coverage_gap(analysis_status_gap(snapshot.analysis.as_ref())),
-            ranking_coverage_gap(total, pool),
+            devmap_analyze::combine_reasons(
+                search_coverage_gap(analysis_status_gap(snapshot.analysis.as_ref())),
+                ranking_coverage_gap(total, pool),
+            ),
+            unchecked_note,
         );
         let rows = snapshot.rows;
         let repo_root = snapshot.repo_root;
@@ -1685,6 +1915,7 @@ impl<'a> StoreQueryEngine<'a> {
         min_confidence: f32,
         max_depth: usize,
     ) -> anyhow::Result<AffectedTestsReport> {
+        self.exit(|| {
         devmap_store::checked_min_confidence(min_confidence)?;
         let layer_budget = token_budget / 2;
         let list_budget = token_budget.saturating_sub(layer_budget);
@@ -1769,6 +2000,7 @@ impl<'a> StoreQueryEngine<'a> {
             tests: response,
             blast_radius: walk.into_radius(layer_budget),
         })
+    })
     }
 
     /// Inbound reachability from `targets`, banded by distance.
@@ -1946,6 +2178,7 @@ impl<'a> StoreQueryEngine<'a> {
         &self,
         token_budget: u32,
     ) -> anyhow::Result<Response<devmap_analyze::DeadSymbolReport>> {
+        self.exit(|| {
         // One snapshot. This resolved the generation three times — an existence
         // check, the analysis, then the rows — so the coverage disclosure could
         // describe a different generation than the findings it was attached to.
@@ -1962,7 +2195,7 @@ impl<'a> StoreQueryEngine<'a> {
         let limit = (token_budget / DEAD_SYMBOL_TOKENS) as usize + 1;
         self.cancel.check()?;
         let Some(page) = self.store.dead_page(limit)? else {
-            return Ok(self.unavailable(ResolutionAvailability::Unavailable {
+            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
             }));
         };
@@ -2001,7 +2234,8 @@ impl<'a> StoreQueryEngine<'a> {
                 response.dead_clusters = Some(scan.clusters);
             }
         }
-        Ok(self.finish(response))
+        Ok(response)
+    })
     }
 
     /// Turn each unconfirmed row's first-site byte into a line, so a reader
@@ -2070,6 +2304,7 @@ impl<'a> StoreQueryEngine<'a> {
         kind: Option<devmap_analyze::CloneKind>,
         min_nodes: u32,
     ) -> anyhow::Result<CloneReport> {
+        self.exit(|| {
         if self.store.latest_generation_id()?.is_none() {
             return Ok(CloneReport {
                 groups: unavailable_response(ResolutionAvailability::Unavailable {
@@ -2096,6 +2331,7 @@ impl<'a> StoreQueryEngine<'a> {
             signed_symbols: summary.signed_symbols,
             unsigned_symbols: summary.unsigned_symbols,
         })
+    })
     }
 
     /// Definitions in one file as signature plus span — never the body.
@@ -2104,6 +2340,7 @@ impl<'a> StoreQueryEngine<'a> {
     /// envelopes ([`SkeletonPresence`]). When `signature` is absent the span
     /// is still returned and `signature_note` says so explicitly.
     pub fn skeleton(&self, path: &str, token_budget: u32) -> anyhow::Result<SkeletonReport> {
+        self.exit(|| {
         self.cancel.check()?;
         let path = resolve_skeleton_path(self.store, path)?;
         let freshness = SourceFreshness::from_store(self.store.query_source_freshness());
@@ -2227,6 +2464,7 @@ impl<'a> StoreQueryEngine<'a> {
             source_freshness: freshness,
             resolution: ResolutionAvailability::Available,
         })
+    })
     }
 
     /// Rank symbols by TF-IDF similarity of their names to `query`.
@@ -2272,9 +2510,10 @@ impl<'a> StoreQueryEngine<'a> {
         scope: Option<&crate::scope::SymbolScope>,
         kinds: &[String],
     ) -> anyhow::Result<Response<SymbolHit>> {
+        self.exit(|| {
         self.cancel.check()?;
         let Some((mut snapshot, resolved)) = self.ranking_corpus(scope)? else {
-            return Ok(self.unavailable(ResolutionAvailability::Unavailable {
+            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
             }));
         };
@@ -2352,6 +2591,7 @@ impl<'a> StoreQueryEngine<'a> {
         let mut response = self.search_semantic_over(query, token_budget, snapshot)?;
         response.scope = report;
         Ok(response)
+    })
     }
 
     /// Sites where a string value is written.
@@ -2474,7 +2714,7 @@ impl<'a> StoreQueryEngine<'a> {
         if symbols.is_empty() || query.trim().is_empty() {
             let mut response = budget_take(Vec::new(), token_budget, |_| 0);
             response.walk_incomplete = coverage_gap;
-            return Ok(self.finish(response));
+            return Ok(response);
         }
         // Both names, so a query can match either the bare symbol or the path
         // and type it sits under.
@@ -2529,7 +2769,7 @@ impl<'a> StoreQueryEngine<'a> {
                 .then(|| index.coverage_note(query, &head))
                 .flatten(),
         );
-        Ok(self.finish(response))
+        Ok(response)
     }
 
     /// Plain-language find: name+docstring TF-IDF seeds, re-ranked by
@@ -2561,9 +2801,11 @@ impl<'a> StoreQueryEngine<'a> {
         min_confidence: f32,
         scope: Option<&crate::scope::SymbolScope>,
     ) -> anyhow::Result<Response<SymbolHit>> {
+        self.exit(|| {
         Ok(self
             .ask_ranked(query, token_budget, min_confidence, false, scope)?
             .0)
+    })
     }
 
     /// [`Self::ask`], answered as an evidence pack: hits grouped by file in
@@ -2595,6 +2837,7 @@ impl<'a> StoreQueryEngine<'a> {
         min_confidence: f32,
         scope: Option<&crate::scope::SymbolScope>,
     ) -> anyhow::Result<crate::evidence::EvidencePack> {
+        self.exit(|| {
         let test_budget = token_budget / EVIDENCE_TEST_BUDGET_SHARE;
         let (response, qualified, resolved) = self.ask_ranked(
             query,
@@ -2622,7 +2865,7 @@ impl<'a> StoreQueryEngine<'a> {
                 resolved.as_ref(),
             )?,
             None => (
-                self.finish(budget_take(Vec::new(), test_budget, |_| 0)),
+                budget_take(Vec::new(), test_budget, |_| 0),
                 None,
                 0,
             ),
@@ -2662,6 +2905,7 @@ impl<'a> StoreQueryEngine<'a> {
             scope.related_tests_outside_scope = outside_scope;
         }
         Ok(pack)
+    })
     }
 
     /// Test files reaching the pack's implementation hits, nearest first.
@@ -2705,7 +2949,7 @@ impl<'a> StoreQueryEngine<'a> {
         }
         if targets.is_empty() {
             return Ok((
-                self.finish(budget_take(Vec::new(), token_budget, |_| 0)),
+                budget_take(Vec::new(), token_budget, |_| 0),
                 None,
                 0,
             ));
@@ -2745,7 +2989,7 @@ impl<'a> StoreQueryEngine<'a> {
         let mut related = budget_take(tests, token_budget, affected_test_tokens);
         related.walk_incomplete = walk.stop.reason(walk.depth_cap, TRAVERSAL_MAX_NODES);
         let outside_scope = u32::try_from(outside_scope.len()).unwrap_or(u32::MAX);
-        Ok((self.finish(related), walk.coverage_gap, outside_scope))
+        Ok((related, walk.coverage_gap, outside_scope))
     }
 
     /// The ask walk, with each shown hit's qualified name alongside it.
@@ -2778,7 +3022,7 @@ impl<'a> StoreQueryEngine<'a> {
         let min_confidence = devmap_store::checked_min_confidence(min_confidence)?;
         let Some((snapshot, resolved)) = self.ranking_corpus(scope)? else {
             return Ok((
-                self.unavailable(ResolutionAvailability::Unavailable {
+                unavailable_response(ResolutionAvailability::Unavailable {
                     reason: "no persisted generation is available".to_string(),
                 }),
                 Vec::new(),
@@ -2813,7 +3057,7 @@ impl<'a> StoreQueryEngine<'a> {
         if symbols.is_empty() || query.trim().is_empty() {
             let mut response = budget_take(Vec::new(), token_budget, |_| 0);
             response.walk_incomplete = coverage_gap;
-            return Ok((self.finish(response), Vec::new()));
+            return Ok((response, Vec::new()));
         }
 
         // The docstring read decodes every payload of the generation while
@@ -2840,7 +3084,7 @@ impl<'a> StoreQueryEngine<'a> {
             let mut response = budget_take(Vec::new(), token_budget, |_| 0);
             response.walk_incomplete =
                 devmap_analyze::combine_reasons(coverage_gap, empty_ask_gap(query));
-            return Ok((self.finish(response), Vec::new()));
+            return Ok((response, Vec::new()));
         }
 
         // Judged on the TF-IDF head, before the graph re-rank can move it: the
@@ -2917,7 +3161,7 @@ impl<'a> StoreQueryEngine<'a> {
                 coverage_gap,
                 Some(crate::ask::confidence_withheld_reason()),
             );
-            return Ok((self.finish(response), Vec::new()));
+            return Ok((response, Vec::new()));
         }
 
         let mut personalization = vec![0.0; nodes.len()];
@@ -3017,7 +3261,7 @@ impl<'a> StoreQueryEngine<'a> {
         response.walk_incomplete = devmap_analyze::combine_reasons(coverage_gap, extra_gap);
         // Both takes keep a prefix, so the names stay aligned by truncation.
         qualified.truncate(response.items.len());
-        Ok((self.finish(response), qualified))
+        Ok((response, qualified))
     }
 
     /// What the map cost against what reading files would have.
@@ -3121,6 +3365,7 @@ impl<'a> StoreQueryEngine<'a> {
         token_budget: u32,
         min_confidence: f32,
     ) -> anyhow::Result<PreviewReport> {
+        self.exit(|| {
         if new_source.len() as u64 > devmap_extract::MAX_SOURCE_BYTES {
             anyhow::bail!("preview source exceeds the 1 MiB source ceiling");
         }
@@ -3145,6 +3390,7 @@ impl<'a> StoreQueryEngine<'a> {
             dead_clusters_incomplete: None,
             excluded: None,
             unresolved_namesakes: None,
+            note: None,
             scope: None,
         };
 
@@ -3409,6 +3655,7 @@ against nothing and no symbol can be reported as removed; this is not a clean de
             ambiguous_callers,
             broken_callers: budget_take(callers, token_budget, |_| PREVIEW_CALLER_TOKENS),
         })
+    })
     }
 }
 

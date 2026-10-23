@@ -907,6 +907,26 @@ impl Store {
                 ))
             }
         };
+        // A remembered verdict describes the tree as `status` last walked it. Edits
+        // the watcher has queued since then end that verdict without changing the
+        // generation id, so a non-empty queue means the cache cannot speak.
+        let queued: Result<i64> = lock_conn(&self.conn).and_then(|conn| {
+            Ok(conn.query_row("SELECT COUNT(*) FROM pending_paths", [], |row| row.get(0))?)
+        });
+        match queued {
+            Ok(0) => {}
+            Ok(count) => {
+                return QuerySourceFreshness::unverified(format!(
+                    "{count} changed path(s) are queued and not yet indexed; the last verified \
+source freshness no longer describes the tree"
+                ))
+            }
+            Err(error) => {
+                return QuerySourceFreshness::unverified(format!(
+                    "source freshness unverified: could not read the pending queue ({error})"
+                ))
+            }
+        }
         let cache = self
             .source_freshness_cache
             .lock()
@@ -1260,6 +1280,75 @@ generation {latest}; run `devmap status` to re-verify",
         drop(stmt);
         drop(snapshot);
         Ok(inventory)
+    }
+
+    /// The partial-parse rows of the latest generation whose reason contains
+    /// `containing`, by path: at most `limit` of them, and the true count.
+    ///
+    /// The same rows `status` lists under `coverage_gaps.partial_parse`, but
+    /// not sampled at fifty by path: a name lookup has to say how many it did
+    /// not look at, and the file holding the hole may be the fifty-first.
+    /// `admit` narrows to a caller's scope; `None` admits every row and is
+    /// counted in SQL, so an unscoped lookup pays for `limit` rows and one
+    /// `COUNT`, not for a walk over the whole inventory. Each row carries the
+    /// language and the content hash the generation recorded for the file, so a
+    /// reader can tell a file edited since the build from the one that was
+    /// parsed.
+    pub fn latest_partial_parse_gaps(
+        &self,
+        containing: &str,
+        admit: Option<&dyn Fn(&str) -> bool>,
+        limit: usize,
+    ) -> Result<(Vec<crate::PartialParseGap>, usize)> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok((Vec::new(), 0));
+        };
+        let label = devmap_analyze::ExtractionGap::PartialParse.label();
+        let filter = "g.generation_id = ?1 AND g.gap = ?2 AND instr(g.reason, ?3) > 0";
+        let total_unscoped: Option<usize> = match admit {
+            None => Some(snapshot.query_row(
+                &format!("SELECT COUNT(*) FROM generation_coverage_gaps g WHERE {filter}"),
+                params![generation, label, containing],
+                |row| row.get::<_, i64>(0).map(|count| count as usize),
+            )?),
+            Some(_) => None,
+        };
+        let mut stmt = snapshot.prepare(&format!(
+            "SELECT g.path, g.reason, f.language, f.content_hash
+             FROM generation_coverage_gaps g
+             JOIN paths p ON p.path = g.path
+             JOIN generation_files f ON f.file_id = p.id AND f.generation_id = g.generation_id
+             WHERE {filter}
+             ORDER BY g.path ASC"
+        ))?;
+        let mut rows = stmt.query(params![generation, label, containing])?;
+        let mut kept = Vec::new();
+        let mut seen = 0usize;
+        while let Some(row) = rows.next()? {
+            let admitted = match admit {
+                Some(admit) => admit(row.get_ref(0)?.as_str()?),
+                None => true,
+            };
+            if !admitted {
+                continue;
+            }
+            seen += 1;
+            if kept.len() < limit {
+                kept.push(crate::PartialParseGap {
+                    path: row.get(0)?,
+                    reason: row.get(1)?,
+                    language: row.get(2)?,
+                    content_hash: row.get::<_, i64>(3)? as u64,
+                });
+            } else if total_unscoped.is_some() {
+                break;
+            }
+        }
+        drop(rows);
+        drop(stmt);
+        drop(snapshot);
+        Ok((kept, total_unscoped.unwrap_or(seen)))
     }
 
     /// Whether the latest generation's edges carry the resolution the resolver

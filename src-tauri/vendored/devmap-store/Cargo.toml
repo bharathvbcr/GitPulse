@@ -108,6 +108,11 @@ required-features = ["parse"]
 name = "a_budget_refusal_is_not_reused_from_a_generation"
 required-features = ["parse"]
 
+# Build-cancel probes extract real sources; need the grammars.
+[[test]]
+name = "attack_build_cancel"
+required-features = ["parse"]
+
 # A recovered file replaces its stored budget refusal; needs `save_generation`.
 [[test]]
 name = "a_recovered_file_replaces_its_stored_budget_refusal"
