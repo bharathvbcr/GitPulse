@@ -228,3 +228,86 @@ Gate 4 had caught the descriptor leak above. Its other failures were proven load
 - Blocked on held hooks and terminal files: ft-9cfd5574, ft-9cfd5474, the hook half of ft-da85cd55 (the spawn-budget drain still blocks commands under load), ft-9cfd5374 and ft-a2936457.
 - ft-cc4be67b (translucency A/B): needs a quiet host.
 - The installed `gitpulse-mcp` and `gitpulse-hook` predate waves 3 and 4, since the owner chose not to reinstall. Run `bun run mcp:install` and then `mcp:doctor` when convenient.
+
+---
+
+# Wave 5 (2026-10-23)
+
+**State.**
+- **Wave 5 is merged** (`main` → `68ef1882`, a fast-forward of `b23/integrate`).
+- Nothing is pushed (owner: no push this run).
+- **Installed binaries were NOT reinstalled**, by owner decision. dc-store 10 migrates stores on a read-write open, so the reinstall waits until Jarvis is re-pinned.
+
+**Owner decisions in wave 5:**
+- Stale holds freed: ft-42081f16 (hooks files), ft-0ac24164 (terminal/mod.rs), ft-626b25fc (flakes taken over).
+- Wave 5 was a fresh bug/perf audit plus finishing the taken-over cards.
+- Priorities were rewritten with a log entry.
+- The re-vendor reported its deltas before landing.
+- **dc-store 9→10: merge, hold the reinstall.**
+- The Manvi half of ft-329789a9 is run by the owner (`tmp/build-1020/manvi-handoff.md`).
+- Seven stale processes were killed with the owner's approval, by explicit PID:
+  - a 29 h orphaned `cargo test --lib browser::` and its test binary, which was holding a cargo slot;
+  - five wait loops that could never end, because they matched their own command line with `pgrep -f`.
+
+## Cards moved to review
+
+| Card | What landed | Adversarial history |
+|---|---|---|
+| **ft-42081f16** signal guard + hook on launched sessions | All ACs were already on main (8c03e89e, 6fc50cb2, 59858ec1), re-verified with file:line. **Partly met:** with the plugin enabled, the hook decision runs twice and only the advisory is deduped. | Card verification only. |
+| **ft-da85cd55** hook half, AC2 (spawn drain) | The worktree family is remembered across hook processes in a private per-user file. The file is an *order hint only*: membership must equal the live registry and the anchor is the metadata-proved primary. Opens use O_NOFOLLOW\|O_NONBLOCK with an fstat check; staging is exclusive; the directory is bounded at 256 records. Spawns: Bash gate 1→0; task-bound edit 5→0 with the app attached and 5→4 without (the scan floor; misses the ≤3 target). AC5 (live, 4 agents) is UNMEASURED. | 1 round, 13 tests, 5 breaks. The **security break** was a same-uid forged file moving the anchor and widening the family. Also: reorder, FIFO hang, staging pid reuse, unbounded directory. All fixed; 13/13 pass, plus a guard-path forgery test. |
+| **ft-626b25fc** full-suite flakes (taken over) | See the flake summary below. | 1 round, 7 targets, 4 gaps (a missing skipped counter, a missed routing mutation, the CPU ratio missing n²/64, a shared fixture identity). All fixed and shown by mutation. |
+| **ft-329789a9**, **ft-7e812b3f**, **ft-f8a297ff** | Already on main; re-verified per AC. The Manvi half of ft-329789a9 is the owner's handoff. ft-f8a297ff's push ACs are unmet (no push). | — |
+| **Re-vendor** (W5-L5) | DevCouncil crates moved to devmap store 27, **dc-store 10** and workbench 14. The six dc-* crates moved 0.2.4→0.2.5 (Cargo.lock: those 6 entries only). The Manvi serve contract was copied. Fixtures now plant tasks via workbench items. | Gate-verified. |
+
+**ft-626b25fc flake summary.** One flake was a **product bug**: two processes creating one ledger raced on `PRAGMA journal_mode=WAL`, which can answer BUSY without calling the busy handler, so the loser never opened. Fixed in `enter_wal` (bounded 10 s retry). Before/after:
+- WAL race test: 10/10 fail → 30/30 pass.
+- Reflog replay: 2/60 → 0/100.
+- `CatchUp.reflog_skipped` is new, so the reflog test asserts the exact sum again.
+- Instance broken-pipe: 1/60 → 0/100, now covered by two tests.
+- Trust-storage HOME race: replaced by a thread-local seam.
+- ten_thousand_binds: measured on thread CPU time; 6/20 → 20/20.
+- markdevRender: CPU ratio at 80k vs 320k; the quadratic mutation fails it 5/5, and unmutated passes 20/20.
+- Write budgets: entity_collision 484 → 156 MiB, storm 291 → 174 MiB at a reduced scale with the same shape.
+
+## dc-store 10, what it does to a store (read from the vendored 0.2.5)
+
+- **Read-write open** of a schema-9 store migrates it, in one transaction:
+  - each legacy `tasks` row becomes a workbench item with the same id;
+  - `DROP TABLE tasks`;
+  - the store is stamped 10.
+- A row that cannot convert refuses the whole migration.
+- **Backup** `<db>.pre-tasks-retire.bak` (VACUUM INTO) is written only when the table has rows. If the backup fails, the migration is refused.
+- **Read-only open** refuses a schema-9 store and changes nothing.
+- After migration, **older readers refuse the store**.
+- The real stores surveyed read-only are all at 9:
+  - DevCouncil: 17 rows
+  - Jarvis: 10 rows
+  - MLSystemsLab: 1 row
+  - the rest: 0 rows
+  - six stores would not open read-only (unknown state).
+- The Jarvis pin is stale (dc-store 9), so Jarvis would refuse a migrated store. Re-pin Jarvis before reinstalling GitPulse.
+
+## Gates (verified)
+
+**Gate 8, full suites on `b23/integrate` 496c64da.** fmt, clippy `-D warnings`, `bun run check`, `check:types`, `check:ipc` and `check:vendor-schema` all OK. Failures:
+- **cargo `--tests --no-fail-fast`: 2 failures.**
+  - `supervised_threads`: integration drift. The adversarial test module's name did not end in `tests.rs`, so the thread scan counted its raw spawns.
+  - `agent_layout_stays_linear_on_hostile_input`: 31 s under load 30–60, and 1.15 s alone. Its code is untouched by wave 5. Filed in ft-fbd79cba.
+- **vitest: 10837 passed, 1 failed.** The documented field count 1815 → 1816 (the new `reflog_skipped`).
+- **`check:schema-parity`: 4 match, 3 stale, 1 unverifiable.** Stale: gitpulse-mcp on PATH and GitPulse.app (reinstall held), and the Jarvis pin. Unverifiable: `devmap --version` does not print the extraction schema (DevCouncil).
+
+The drift fixes are in 68ef1882. Re-run on that tree: supervised_threads 9/9, documented-counts 20/20, worktree adversarial plus agent_layout 14/14.
+
+## Benchmarks
+
+- Hook spawn counts are asserted exactly by tests; see the table above.
+- No wall-clock benchmark was run, because the host load stayed at 13–100 throughout.
+
+## Still open
+
+- **Reinstall** (`bun run mcp:install`, `mcp:doctor`, rebuild the app) is held until Jarvis is re-pinned to a DevCouncil with dc-store 10. The Jarvis bump is a pin change in another repository and needs its own session.
+- **Manvi half of ft-329789a9**: the owner's handoff.
+- New cards:
+  - **ft-eb5034ce**: churn_store has the same WAL-switch race; one helper should own the WAL switch.
+  - **ft-fbd79cba**: the storm test misses coalesce and ignore regressions (pre-existing), plus load flakes in desktop::instance, git_reader memo and agent_layout.
+- Still waiting: ft-92734a91 and ft-b595921a (owner decisions); ft-9cfd5574 and ft-a2936457 (wave 6); terminal-side cards (wait for `term/integrate`); ft-cc4be67b (needs a quiet host).
