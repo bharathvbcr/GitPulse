@@ -286,3 +286,70 @@ fn full_event_storm_across_watched_repos_stays_bounded() {
         },
     );
 }
+
+/// The storm's own paths, classified by the real noise gate: everything the
+/// build tools and git write is dropped, the tracked rewrites still count. The
+/// storm test cannot see this: with filtering off the debounce alone keeps its
+/// emission count inside the bound, so it stayed green.
+#[test]
+fn the_paths_a_storm_writes_are_classified_as_noise_or_signal() {
+    let (_dir, root) = init_repo();
+    let rules = IgnoreRules::builtin();
+    let internal = vec![root.join(".git")];
+    let classify = |path: PathBuf| {
+        let event = notify::Event::new(notify::EventKind::Any).add_path(path);
+        event_has_signal(&event, &internal, &root, None, &rules)
+    };
+    for noise in [
+        root.join("target/debug/deps/f1.o"),
+        root.join("node_modules/pkg/f5.o"),
+        root.join(".git/index.lock"),
+    ] {
+        assert!(!classify(noise.clone()), "{} is noise", noise.display());
+    }
+    for signal in [root.join("tracked3.txt"), root.join("src/m3.rs")] {
+        assert!(classify(signal.clone()), "{} is signal", signal.display());
+    }
+}
+
+/// The coalesce window, driven on a clock the test owns: a write every 450 ms
+/// is quiet for 400 ms each time, so the quiet rule alone releases a scan after
+/// every write, and only the window keeps scans [`SCAN_COALESCE`] apart. The
+/// storm test cannot see this: `DEBOUNCE_MAX_WAIT` equals the window, so the
+/// max-wait rule spaces emissions the same way when the window is gone.
+#[test]
+fn scans_stay_a_coalesce_window_apart_under_writes_that_keep_going_quiet() {
+    let origin = Instant::now();
+    let step = Duration::from_millis(10);
+    let write_every = Duration::from_millis(450);
+    assert!(write_every > DEBOUNCE_QUIET && write_every < SCAN_COALESCE);
+    let (mut pending, mut last_event, mut first_pending, mut last_scan) =
+        (false, origin, None, None);
+    let mut scans: Vec<Instant> = Vec::new();
+    // 3,000 ticks of simulated time; nothing here waits on a real clock.
+    for tick in 0..3_000u32 {
+        let elapsed = step * tick;
+        let now = origin + elapsed;
+        if elapsed.as_millis().is_multiple_of(write_every.as_millis()) {
+            if !pending {
+                first_pending = Some(now);
+            }
+            pending = true;
+            last_event = now;
+        }
+        if scan_is_due(pending, last_event, first_pending, last_scan, now) {
+            scans.push(now);
+            pending = false;
+            first_pending = None;
+            last_scan = Some(now);
+        }
+    }
+    assert!(scans.len() >= 10, "writes must still announce: {scans:?}");
+    for pair in scans.windows(2) {
+        assert!(
+            pair[1] - pair[0] >= SCAN_COALESCE,
+            "scans {:?} apart, under the {SCAN_COALESCE:?} window",
+            pair[1] - pair[0]
+        );
+    }
+}

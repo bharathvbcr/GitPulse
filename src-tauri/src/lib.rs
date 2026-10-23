@@ -42,6 +42,7 @@ pub mod procguard;
 pub mod repository_trust;
 pub mod secrets;
 pub mod singleflight;
+pub mod sqlite_wal;
 pub mod stack;
 pub mod storage;
 pub mod supervisor;

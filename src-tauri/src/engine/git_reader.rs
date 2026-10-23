@@ -585,6 +585,46 @@ pub struct FileBlob {
 
 pub struct GitReader;
 
+/// How long an ownership report may spend blaming before it stops and says it
+/// is partial. A wall-clock bound on latency, so a report that runs past it is
+/// not kept: the next ask measures again.
+#[cfg(not(test))]
+fn ownership_deadline() -> Duration {
+    Duration::from_secs(10)
+}
+
+/// Tests that count on a clean report being kept (`a clean report is kept`)
+/// were measuring the machine: 128 blames take over 10 s at load 30-60, the
+/// report came back partial, and the warm ask spawned all 131 blames again.
+/// They get a bound no loaded machine reaches; the one test of the bound
+/// itself sets it with [`with_ownership_deadline`].
+#[cfg(test)]
+fn ownership_deadline() -> Duration {
+    OWNERSHIP_DEADLINE_OVERRIDE
+        .with(std::cell::Cell::get)
+        .unwrap_or(Duration::from_secs(30 * 60))
+}
+
+#[cfg(test)]
+thread_local! {
+    static OWNERSHIP_DEADLINE_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Runs `body` with the ownership deadline set to `deadline` on this thread.
+#[cfg(test)]
+fn with_ownership_deadline<T>(deadline: Duration, body: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            OWNERSHIP_DEADLINE_OVERRIDE.with(|cell| cell.set(None));
+        }
+    }
+    OWNERSHIP_DEADLINE_OVERRIDE.with(|cell| cell.set(Some(deadline)));
+    let _reset = Reset;
+    body()
+}
+
 impl GitReader {
     /// Hard ceiling for one history walk. Callers paginate past this instead
     /// of lifting it, so no single request can ask git for an unbounded log.
@@ -2322,7 +2362,7 @@ impl GitReader {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        let deadline = started + Duration::from_secs(10);
+        let deadline = started + ownership_deadline();
         let mut author_lines: HashMap<(String, String), usize> = HashMap::new();
         let mut author_last_seen: HashMap<String, i64> = HashMap::new();
         let mut line_ages_days: Vec<u32> = Vec::new();
@@ -14365,6 +14405,34 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
                 let cold = blame_spawns(&root);
                 GitReader::knowledge_report(path, None).expect("second");
                 assert_eq!(blame_spawns(&root), cold, "a clean report is kept");
+            });
+        }
+
+        /// The bound the kept-report tests no longer race: a report that ran
+        /// past its deadline is partial, says so, and is measured again; the
+        /// complete one after it is kept.
+        #[test]
+        fn a_report_past_its_deadline_is_partial_and_not_kept() {
+            let _kept = ref_cache::retention();
+            ref_cache::eager(|| {
+                let dir = init_repo_with_remotes(&[], "main");
+                for n in 0..5 {
+                    write(dir.path(), &format!("src/f{n}.rs"), "fn f() {}\n");
+                }
+                commit_as(dir.path(), "feat: seed", "A <a@example.com>");
+                let root = dir.path().canonicalize().unwrap();
+                let path = root.to_str().unwrap();
+                let cut = with_ownership_deadline(Duration::ZERO, || {
+                    GitReader::knowledge_report(path, None).expect("cut")
+                });
+                assert!(cut.truncated, "{cut:?}");
+                assert_eq!(cut.scanned_files, 0, "{cut:?}");
+                let measured = GitReader::knowledge_report(path, None).expect("measured again");
+                assert_eq!(measured.scanned_files, 5, "a partial report was served");
+                let spawned = blame_spawns(&root);
+                assert!(spawned >= 5, "{spawned} blames for 5 files");
+                GitReader::knowledge_report(path, None).expect("kept");
+                assert_eq!(blame_spawns(&root), spawned, "the complete report is kept");
             });
         }
 

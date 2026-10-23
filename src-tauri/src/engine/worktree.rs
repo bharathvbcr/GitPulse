@@ -4728,16 +4728,20 @@ some-future-field whatever
             format!("/repo/.claude/worktrees/{}", "x".repeat(200_000)),
             format!("/{}.claude/worktrees/s", "/".repeat(200_000)),
         ];
-        let started = std::time::Instant::now();
+        // Thread CPU time, not wall time: this took 31 s of wall clock against
+        // a scaled 5 s budget at load 30-60 (1.15 s alone) while the thread
+        // did the same work. The wall clock measures the machine's load; the
+        // thread's CPU time measures the normalisation.
+        let started = crate::sysload::thread_cpu();
         for _ in 0..20 {
             for path in &hostile {
                 let _ = agent_layout(path);
             }
         }
-        let elapsed = started.elapsed();
+        let elapsed = crate::sysload::thread_cpu() - started;
         assert!(
             elapsed < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(5)),
-            "hostile paths took {elapsed:?}"
+            "hostile paths took {elapsed:?} of CPU"
         );
     }
 

@@ -1,0 +1,113 @@
+//! The one place a GitPulse-owned SQLite file is switched to WAL.
+//!
+//! `PRAGMA journal_mode=WAL` can answer `SQLITE_BUSY` immediately, without
+//! consulting the connection's busy handler, while another connection is
+//! switching the same file: two processes creating one store (the app and
+//! gitpulse-mcp opening a repository's ledger or the churn cache) lose one
+//! of them. That is contention that clears in milliseconds, so every store
+//! goes through [`enter_wal`], which retries it for a bound its caller chooses
+//! and returns contention that outlasts the bound as the original
+//! `rusqlite::Error`, for the caller to type as it sees fit.
+
+use rusqlite::{Connection, ErrorCode};
+use std::time::{Duration, Instant};
+
+/// How long the ledger keeps trying while another connection holds its file.
+pub(crate) const LEDGER_WAL_PATIENCE: Duration = Duration::from_secs(10);
+
+/// Pause between attempts. Short: the contention being waited out is another
+/// connection's one-statement switch.
+const RETRY_PAUSE: Duration = Duration::from_millis(5);
+
+/// Puts the database behind `conn` in WAL mode, retrying `SQLITE_BUSY` for up
+/// to `patience`.
+///
+/// An already-WAL file needs no switch, so it is only read, never written.
+/// Any error other than `SQLITE_BUSY` is returned at once; so is `SQLITE_BUSY`
+/// once `patience` has elapsed (one attempt is always made).
+pub(crate) fn enter_wal(conn: &Connection, patience: Duration) -> rusqlite::Result<()> {
+    let deadline = Instant::now() + patience;
+    loop {
+        let switched = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+            .and_then(|mode| {
+                if mode.eq_ignore_ascii_case("wal") {
+                    Ok(())
+                } else {
+                    conn.pragma_update(None, "journal_mode", "WAL")
+                }
+            });
+        match switched {
+            Err(error)
+                if error.sqlite_error_code() == Some(ErrorCode::DatabaseBusy)
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(RETRY_PAUSE);
+            }
+            other => return other,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rollback_file() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t(v INTEGER);").unwrap();
+        (dir, path)
+    }
+
+    fn impatient(path: &std::path::Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.busy_timeout(Duration::ZERO).unwrap();
+        conn
+    }
+
+    fn mode(conn: &Connection) -> String {
+        conn.pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_rollback_file_is_switched_and_a_wal_file_is_left_alone() {
+        let (_dir, path) = rollback_file();
+        let conn = Connection::open(&path).unwrap();
+        enter_wal(&conn, Duration::ZERO).unwrap();
+        assert_eq!(mode(&conn), "wal");
+        // Already WAL: read-only, so a holder of the write lock cannot block it.
+        let holder = Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        enter_wal(&impatient(&path), Duration::ZERO).unwrap();
+    }
+
+    #[test]
+    fn contention_that_clears_within_the_bound_is_waited_out() {
+        let (_dir, path) = rollback_file();
+        let holder = Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(holder);
+        });
+        let conn = impatient(&path);
+        enter_wal(&conn, Duration::from_secs(30)).expect("the switch waits for the holder");
+        release.join().unwrap();
+        assert_eq!(mode(&conn), "wal");
+    }
+
+    #[test]
+    fn contention_that_outlasts_the_bound_is_the_busy_error() {
+        let (_dir, path) = rollback_file();
+        let holder = Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let started = Instant::now();
+        let error = enter_wal(&impatient(&path), Duration::from_millis(100))
+            .expect_err("the holder never lets go");
+        assert_eq!(error.sqlite_error_code(), Some(ErrorCode::DatabaseBusy));
+        assert!(started.elapsed() >= Duration::from_millis(100));
+    }
+}

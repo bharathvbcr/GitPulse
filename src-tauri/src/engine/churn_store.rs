@@ -95,6 +95,11 @@ const PERSISTED_ROWS: usize = 50_000;
 const MEMORY_ROWS: usize = 8_192;
 /// How long a write waits for another GitPulse process holding the file.
 const BUSY_TIMEOUT: Duration = Duration::from_millis(100);
+/// How long an open waits for another process switching the file to WAL. The
+/// first open of a session runs under the pinned store's initialiser, so this
+/// is short; past it the session keeps churn in memory and the file is left
+/// alone.
+const WAL_PATIENCE: Duration = Duration::from_secs(2);
 /// How long a git version probe is believed: a git upgraded under a running
 /// app is noticed within this.
 const PROBE_TTL: Duration = Duration::from_secs(60);
@@ -259,7 +264,10 @@ fn pinned_store() -> &'static Mutex<Store> {
     static STORE: OnceLock<Mutex<Store>> = OnceLock::new();
     STORE.get_or_init(|| {
         let store = if PERSIST.load(Ordering::Relaxed) {
-            match default_path().and_then(|path| Store::open(&path, PERSISTED_ROWS)) {
+            match default_path()
+                .map_err(OpenError::Failed)
+                .and_then(|path| Store::open(&path, PERSISTED_ROWS))
+            {
                 Ok(store) => store,
                 Err(reason) => {
                     log::warn!(
@@ -287,9 +295,27 @@ fn default_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "no per-user cache directory (HOME / LOCALAPPDATA unset)".to_string())
 }
 
+/// Why [`Store::open`] failed. Neither kind has touched the file's contents.
+#[derive(Debug)]
+pub(crate) enum OpenError {
+    /// Another connection held the file for longer than the open waits: the
+    /// file is fine and in use, so it is kept, never recreated.
+    Busy(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::Busy(message) | Self::Failed(message)) = self;
+        f.write_str(message)
+    }
+}
+
 /// Why an open failed, and whether the file itself is to blame.
 struct OpenFailure {
     message: String,
+    /// The file is held by another connection (`SQLITE_BUSY`/`LOCKED`).
+    busy: bool,
     /// The file is not a database, or is corrupt: only then is deleting it a
     /// repair rather than an attack on whoever else has it open.
     unreadable: bool,
@@ -307,7 +333,16 @@ impl OpenFailure {
         );
         Self {
             message,
+            busy: is_busy(error),
             unreadable,
+        }
+    }
+
+    fn into_error(self) -> OpenError {
+        if self.busy {
+            OpenError::Busy(self.message)
+        } else {
+            OpenError::Failed(self.message)
         }
     }
 }
@@ -326,14 +361,18 @@ impl Store {
     /// Anything else — above all `SQLITE_BUSY` from another process using the
     /// file, or a permission error — says nothing about the file's contents, so
     /// it fails this open and leaves the file alone for the process that has it.
-    pub(crate) fn open(path: &Path, cap: usize) -> Result<Self, String> {
+    pub(crate) fn open(path: &Path, cap: usize) -> Result<Self, OpenError> {
+        Self::open_within(path, cap, WAL_PATIENCE)
+    }
+
+    fn open_within(path: &Path, cap: usize, wal_patience: Duration) -> Result<Self, OpenError> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
-                .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+                .map_err(|e| OpenError::Failed(format!("cannot create {}: {e}", dir.display())))?;
         }
-        match Self::open_once(path, cap) {
+        match Self::open_once(path, cap, wal_patience) {
             Ok(store) => Ok(store),
-            Err(first) if !first.unreadable => Err(first.message),
+            Err(first) if !first.unreadable => Err(first.into_error()),
             Err(first) => {
                 let first = first.message;
                 for suffix in ["", "-wal", "-shm"] {
@@ -343,20 +382,21 @@ impl Store {
                         Ok(()) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                         Err(e) => {
-                            return Err(format!(
+                            return Err(OpenError::Failed(format!(
                                 "{first}; and it could not be replaced: {}: {e}",
                                 PathBuf::from(&doomed).display()
-                            ))
+                            )))
                         }
                     }
                 }
-                Self::open_once(path, cap)
-                    .map_err(|second| format!("{first}; recreated, and then {}", second.message))
+                Self::open_once(path, cap, wal_patience).map_err(|second| {
+                    OpenError::Failed(format!("{first}; recreated, and then {}", second.message))
+                })
             }
         }
     }
 
-    fn open_once(path: &Path, cap: usize) -> Result<Self, OpenFailure> {
+    fn open_once(path: &Path, cap: usize, wal_patience: Duration) -> Result<Self, OpenFailure> {
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -367,7 +407,7 @@ impl Store {
         conn.busy_timeout(BUSY_TIMEOUT).map_err(|e| {
             OpenFailure::new(format!("cannot configure {}: {e}", path.display()), &e)
         })?;
-        conn.pragma_update(None, "journal_mode", "WAL")
+        crate::sqlite_wal::enter_wal(&conn, wal_patience)
             .map_err(|e| OpenFailure::new(format!("{} is not usable: {e}", path.display()), &e))?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(|e| OpenFailure::new(format!("{} is not usable: {e}", path.display()), &e))?;
@@ -400,7 +440,17 @@ impl Store {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version != SCHEMA_VERSION {
-            self.conn.execute_batch(
+            // One writer rebuilds; a concurrent opener waits for it (the busy
+            // handler) and then finds the version current. Without the
+            // transaction two openers interleave DROP and CREATE.
+            let tx = self
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            if version == SCHEMA_VERSION {
+                return Ok(());
+            }
+            tx.execute_batch(
                 "DROP TABLE IF EXISTS churn;
                  CREATE TABLE churn (
                      repo INTEGER NOT NULL,
@@ -417,8 +467,8 @@ impl Store {
                  ) WITHOUT ROWID;
                  CREATE INDEX churn_stored ON churn (stored);",
             )?;
-            self.conn
-                .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
         }
         Ok(())
     }
@@ -1759,7 +1809,8 @@ mod tests {
         std::fs::write(&blocker, "").unwrap();
         let err = Store::open(&blocker.join(FILE_NAME), 10)
             .err()
-            .expect("cannot open");
+            .expect("cannot open")
+            .to_string();
         assert!(err.contains("cannot create"), "{err}");
     }
 
@@ -1779,12 +1830,52 @@ mod tests {
         holder
             .execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE;")
             .unwrap();
-        let busy = Store::open(&path, 10).err().expect("the file is locked");
-        assert!(!busy.contains("recreated"), "{busy}");
+        let busy = Store::open_within(&path, 10, Duration::from_millis(200))
+            .err()
+            .expect("the file is locked");
+        assert!(matches!(busy, OpenError::Busy(_)), "{busy:?}");
+        assert!(!busy.to_string().contains("recreated"), "{busy}");
         assert!(path.exists(), "a busy cache was deleted");
         drop(holder);
 
         let store = Store::open(&path, 10).expect("the cache is usable again");
         assert_eq!(store.rows(), 1, "the rows survived a busy open");
+    }
+
+    /// Several openers create one cache at the same instant, as the app and
+    /// gitpulse-mcp can. Every one must get a usable store: `journal_mode=WAL`
+    /// answers `SQLITE_BUSY` at once, without the busy handler, while a sibling
+    /// is switching the same file.
+    #[test]
+    fn openers_racing_to_create_one_cache_all_get_a_store() {
+        const OPENERS: usize = 6;
+        let mut failures = Vec::new();
+        for round in 0..40 {
+            let cache = tempfile::tempdir().unwrap();
+            let path = cache.path().join(FILE_NAME);
+            let gate = std::sync::Barrier::new(OPENERS);
+            let outcomes: Vec<Result<(), String>> = std::thread::scope(|scope| {
+                let openers: Vec<_> = (0..OPENERS)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            gate.wait();
+                            Store::open(&path, 10).map(drop).map_err(|e| e.to_string())
+                        })
+                    })
+                    .collect();
+                openers.into_iter().map(|o| o.join().unwrap()).collect()
+            });
+            failures.extend(
+                outcomes
+                    .into_iter()
+                    .filter_map(Result::err)
+                    .map(|e| format!("round {round}: {e}")),
+            );
+        }
+        assert!(
+            failures.is_empty(),
+            "{} openers failed: {failures:#?}",
+            failures.len()
+        );
     }
 }

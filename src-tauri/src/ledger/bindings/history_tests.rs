@@ -7,6 +7,7 @@ use super::*;
 
 use crate::ledger::ids::{iso8601_utc, parse_event_time};
 use crate::ledger::{latest_binding, with_conn};
+use crate::sysload::thread_cpu;
 
 /// Year 9999: later than any row a test writes, standing in for "now".
 const FOREVER_MS: u64 = 253_402_300_799_999;
@@ -448,18 +449,6 @@ fn a_clock_that_went_backwards_orders_history_and_the_live_read_by_insertion() {
         latest_binding(&repo, &repo, &repo).unwrap(),
         Some(Some("APPENDED-SECOND".to_string()))
     );
-}
-
-/// CPU time the calling thread has used, immune to how long it waited to run.
-fn thread_cpu() -> std::time::Duration {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `ts` is a valid out-pointer for the call's duration.
-    let status = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
-    assert_eq!(status, 0, "the thread CPU clock must be readable");
-    std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
 }
 
 #[test]

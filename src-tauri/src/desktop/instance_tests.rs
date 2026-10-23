@@ -300,15 +300,36 @@ fn listening_fake(dir: &Path) -> (File, std::thread::JoinHandle<Vec<u8>>) {
         crate::procguard::with_inheritance_lock(|| UnixListener::bind(&paths.socket)).unwrap();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        stream.write_all(b"{\"v\":1,\"pid\":7}\n").unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_millis(500)))
-            .unwrap();
+        // The client under test may refuse its request and hang up before this
+        // thread has run: macOS then answers `setsockopt` with EINVAL and the
+        // greeting write with EPIPE. Both mean "the peer left", which is what
+        // is recorded below as nothing sent; neither is a failure of the fake.
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        let _ = stream.write_all(b"{\"v\":1,\"pid\":7}\n");
         let mut sent = Vec::new();
         let _ = stream.read_to_end(&mut sent);
         sent
     });
     (held, server)
+}
+
+/// The race `a_launch_never_sends_what_the_owner_would_refuse` lost 1 run in
+/// 100 under load: a client that hangs up before the fake owner's thread has
+/// run. Forced here by hanging up before the owner is ever scheduled.
+#[test]
+fn the_fake_owner_survives_a_client_that_hung_up_first() {
+    for _ in 0..50 {
+        let dir = profile();
+        let (_held, server) = listening_fake(dir.path());
+        drop(UnixStream::connect(dir.path().join(SOCKET_FILE)).expect("connect"));
+        assert!(
+            server
+                .join()
+                .expect("the fake owner must not panic")
+                .is_empty(),
+            "a client that sent nothing was recorded as sending"
+        );
+    }
 }
 
 #[test]
