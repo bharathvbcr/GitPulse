@@ -10,7 +10,7 @@ import {
 } from "../harnessStore";
 import { MAX_AGENT_ACTIONS } from "../../agents/activity";
 import type { CatchUp } from "../../ingest/types";
-import type { LedgerEvent, LedgerStatus } from "../../ledger/types";
+import { ledgerStatus, type LedgerEvent, type LedgerStatus } from "../../ledger/types";
 
 function verdict(overrides: Partial<PolicyVerdict>): PolicyVerdict {
   return {
@@ -52,13 +52,14 @@ const caughtUp = (recorded = 0): CatchUp => ({
   error: "",
 });
 
-const recording = (repoPath: string): LedgerStatus => ({
-  recording: true,
-  path: `${repoPath}/.devcouncil/ledger.sqlite`,
-  dropped: 0,
-  error: "",
-  error_code: "",
-});
+const recording = (repoPath: string): LedgerStatus =>
+  ledgerStatus({
+    recording: true,
+    path: `${repoPath}/.devcouncil/ledger.sqlite`,
+    dropped: 0,
+    error: "",
+    error_code: "",
+  });
 
 function ledgerEvent(
   repoPath: string,

@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
+import { ledgerStatus } from "../ledger/types";
 import { functionBody } from "../stores/sourceScan";
 import { render } from "svelte/server";
 import ManviHarnessPane, {
@@ -162,13 +163,13 @@ describe("ManviHarnessPane capability truth", () => {
   });
 
   it("surfaces refresh, durable-ledger, and catch-up completeness independently", () => {
-    const healthyLedger = {
+    const healthyLedger = ledgerStatus({
       recording: true,
       path: "/repo/.devcouncil/ledger.sqlite",
       dropped: 0,
       error: "",
       error_code: "",
-    };
+    });
 
     expect(activityHistoryPresentations(null, null, null)).toEqual([
       expect.objectContaining({ label: "Activity history not checked", tone: "neutral" }),
@@ -226,7 +227,8 @@ describe("ManviHarnessPane capability truth", () => {
   });
 
   it("offers adoption whenever the history reports an error, without reading which", () => {
-    const ledger = (error: string) => ({ recording: false, path: "", dropped: 0, error, error_code: "x" });
+    const ledger = (error: string) =>
+      ledgerStatus({ recording: false, path: "", dropped: 0, error, error_code: "x" });
     expect(adoptionOffered(null, null)).toBe(false);
     expect(adoptionOffered(ledger(""), { error: "" })).toBe(false);
     expect(adoptionOffered(ledger("the ledger could not be opened"), null)).toBe(true);

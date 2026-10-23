@@ -1067,11 +1067,15 @@ fn snapshot_observed(
         Ok(status) => status,
         Err(error) => crate::ledger::LedgerStatus {
             recording: false,
+            recording_state: crate::ledger::STATE_UNKNOWN.to_string(),
             path: String::new(),
             dropped: 0,
+            dropped_scope: crate::ledger::DROPPED_SCOPE.to_string(),
             catch_up_failures: 0,
+            history_only_bindings: 0,
             error: error.to_string(),
             error_code: error.code.to_string(),
+            freshness: crate::ledger::Freshness::unavailable(error.to_string()),
         },
     };
 
