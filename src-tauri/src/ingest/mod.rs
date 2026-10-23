@@ -144,6 +144,15 @@ pub struct CatchUp {
     /// here too, and are not reflog entries.
     #[serde(default)]
     pub duplicates_refused: i64,
+    /// Replayed entries the pass saw as already recorded when it looked, so it
+    /// never offered them to the ledger: those at or before the ref's watermark
+    /// (a pass that ran first recorded them) and those whose identity an older
+    /// build's untimed row already holds. Distinct from `duplicates_refused`,
+    /// where the ledger itself refused a copy: a replay that starts after
+    /// another has finished reports its whole share here, one that races it
+    /// reports the contested share there. Not part of `reflog_entries`.
+    #[serde(default)]
+    pub reflog_skipped: i64,
     /// Reflog entries whose ledger write failed (counted by the ledger's dropped
     /// total too). The pass stops at the first, so everything after it in that
     /// ref is `reflog_pending`; the next pass retries from the same place.
@@ -1125,6 +1134,9 @@ fn replay_ref(
     };
     // The rows and the watermark are one transaction (`record_steps`).
     let (settled, mut out) = record_steps(ledger_repo, worktree_path, ref_name, steps, seen, out);
+    // The entries at and before the watermark are the ones a pass that ran
+    // first already recorded; this one read them and offered none.
+    out.reflog_skipped += i64::try_from(first.saturating_sub(laid.start)).unwrap_or(i64::MAX);
     pending += steps.len() - settled;
     out.reflog_pending = i64::try_from(pending).unwrap_or(i64::MAX);
     out.reflog_unreached = unreached;
@@ -1199,6 +1211,7 @@ fn record_steps(
         // Compared as stored: redacted, and cut to the ledger's `object` cap,
         // or an identity past the cap would never match its own row.
         if seen.contains(&ledger::stored_object(&identity)) {
+            out.reflog_skipped += 1;
             rows.push(ledger::ReflogRow {
                 draft: None,
                 ordinal: step.ordinal,
@@ -1307,6 +1320,7 @@ impl CatchUp {
         self.recorded += other.recorded;
         self.reflog_entries += other.reflog_entries;
         self.duplicates_refused += other.duplicates_refused;
+        self.reflog_skipped += other.reflog_skipped;
         self.failed_records += other.failed_records;
         self.reflog_pending += other.reflog_pending;
         self.reflog_refs_skipped += other.reflog_refs_skipped;

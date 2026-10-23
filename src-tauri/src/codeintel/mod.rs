@@ -3093,6 +3093,18 @@ pub(crate) mod tests {
         let db = map_path(repo);
         std::fs::create_dir_all(db.parent().expect("db parent")).expect("mkdir codeintel");
         std::fs::copy(template, &db).expect("clone the template store");
+        // `pending_state.epoch` is the store's identity, minted by `randomblob`
+        // when the schema is created: a clone must not share its template's, or
+        // two fixtures would acknowledge each other's claims. Same minting.
+        let conn = rusqlite::Connection::open(&db).expect("open the cloned store");
+        let changed = conn
+            .execute(
+                "UPDATE pending_state SET epoch = lower(hex(randomblob(16))) WHERE singleton = 1",
+                [],
+            )
+            .expect("give the clone its own identity");
+        assert_eq!(changed, 1, "the template store has one identity row");
+        conn.close().expect("close the cloned store");
     }
 
     /// Adversarial review of `install_empty_fixture_store` (W5-L3). A store

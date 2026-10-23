@@ -73,6 +73,9 @@ describe("markdevRender IPC", () => {
   });
 });
 
+/** Linear is 4 for a 4x input; measured 3.8-4.4 under load. 5.5 leaves a third. */
+const LINEAR_RATIO_LIMIT = 5.5;
+
 describe("markdevRender — document stats stay linear", () => {
   it("does not slow quadratically on unmatched brackets", () => {
     // Fastest of three per size. A single sample made this fail under a
@@ -81,18 +84,34 @@ describe("markdevRender — document stats stay linear", () => {
     // that ran during an idle one produced a budget nothing could meet. The
     // minimum is the sample least disturbed by other load, and a genuine
     // regression still slows it.
-    const texts = [20000, 40000, 80000].map((n) => "[".repeat(n));
-    const timings = texts.map((text) => fastestOf(3, () => void calculateDocumentStats(text)));
-    expectWithinBudget(timings[2]!, 400, "stats on unmatched brackets");
-    // 4x the input must not cost ~16x. Measured on this tree the ratio is a
-    // flat 3.9-4.0, so 8 sits midway between linear and quadratic: tight enough
-    // to catch the regression, loose enough never to depend on the weather.
-    // The ratio is taken over CPU time, not wall time: at host load 70 the wall
-    // ratio of this linear pass read 8.8, 9.6, 13 and 16 in 4 of 20 runs,
+    const small = "[".repeat(80000);
+    const large = "[".repeat(320000);
+    expectWithinBudget(
+      fastestOf(3, () => void calculateDocumentStats(small)),
+      400,
+      "stats on unmatched brackets",
+    );
+    // 4x the input must not cost much more than 4x. Both sizes are large
+    // because a quadratic term only shows where it dominates: with a term worth
+    // +50% at 80k chars (inside the wall budget above) the 4x ratio reads
+    // 7.2-8.7 against a linear 3.8-4.4, while at 20k-vs-80k it read 5.2-7.4
+    // against a noisy linear 3.9-5.4, which no limit separated. The small
+    // sizes were the noise: CPU time at 5-20k chars varied by a third between
+    // runs, at 80k+ by a tenth.
+    // The ratio is taken over CPU time, not wall time: at host load 70 a
+    // wall ratio of this linear pass read 2x its true value in 4 of 20 runs,
     // because the two sizes waited for the CPU for different lengths of time.
-    // More samples per size, since the minimum is what the ratio is taken of.
-    const cpu = texts.map((text) => fastestCpuOf(7, () => void calculateDocumentStats(text)));
-    expect(cpu[2]! / cpu[0]!).toBeLessThan(8);
+    // CPU time covers only this thread's work, so work moved off-thread would
+    // not be seen; this is a synchronous pure function. Rounds alternate the
+    // sizes so a drift in clock speed lands on both, and the minimum of each is
+    // what the ratio is taken of.
+    let cpuSmall = Number.POSITIVE_INFINITY;
+    let cpuLarge = Number.POSITIVE_INFINITY;
+    for (let round = 0; round < 7; round += 1) {
+      cpuSmall = Math.min(cpuSmall, fastestCpuOf(1, () => void calculateDocumentStats(small)));
+      cpuLarge = Math.min(cpuLarge, fastestCpuOf(1, () => void calculateDocumentStats(large)));
+    }
+    expect(cpuLarge / cpuSmall).toBeLessThan(LINEAR_RATIO_LIMIT);
   }, STRESS_TIMEOUT_MS);
 });
 
