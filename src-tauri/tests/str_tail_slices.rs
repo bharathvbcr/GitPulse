@@ -8,15 +8,24 @@
 //! gains a slice of that subtractive shape that is not listed below with the
 //! reason it is safe, and when a listed entry has gone stale.
 //!
-//! It matches the shape, not the type: a `Vec`/slice index of the same shape is
-//! listed too. It does not see an offset computed into a variable first; those
-//! sites were swept by hand against `clippy::string_slice` (147 sites crate
-//! wide, too many to allow-list), so a new such site is for review.
+//! The scanner is `tests/common/slice_guard.rs` (shared with the adversarial
+//! tests, so there is one copy). It matches the shape, not the type: a
+//! `Vec`/slice index of the same shape is listed too. It reads multi-line
+//! indexes, nested indexes and `saturating_sub`/`checked_sub`, but not an offset
+//! computed into a variable first; those sites were swept by hand against
+//! `clippy::string_slice` (too many sites to allow-list), so a new such site is
+//! for review.
+//!
+//! Vendored DevCouncil crates are scanned in report mode: they are not ours to
+//! edit, so each hit is listed in `VENDORED_ALLOWED` with a verdict until
+//! DevCouncil fixes it upstream.
 
 mod common;
-use regex::Regex;
+#[path = "common/slice_guard.rs"]
+mod slice_guard;
+
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// file (relative to `src/`) -> (matches allowed, why each is safe).
 const ALLOWED: &[(&str, usize, &str)] = &[
@@ -27,104 +36,48 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ("analyzer/language.rs", 1, "slice of a Vec<&str>, not a str"),
     ("workspace_registry.rs", 1, "slice of a Vec<&str>, not a str"),
     ("analyzer/cargo_supply.rs", 1, "slice of a Vec<u8> read window, not a str"),
-    ("engine/git_writer.rs", 1, "slice of a Vec<String> (`prefix[1..prefix.len() - 1].iter()`), not a str"),
+    ("engine/git_writer.rs", 2, "both slice a Vec: `lines[lines.len().saturating_sub(20)..]` (Vec<&str>) and `prefix[1..prefix.len() - 1]` (Vec<String>)"),
+    ("secrets/report.rs", 1, "slice of a Vec<&str> (`parts`), not a str"),
+    ("terminal/ring.rs", 1, "slice of a `&[u8]` ring chunk, not a str"),
 ];
 
-const SHAPES: &[&str] = &[
-    // `[.. x.len() - n]`, `[a..x.len() - n]`
-    r"\[[^\[\]]*\.\.[^\[\]]*\.len\(\)\s*-[^\[\]]*\]",
-    // `[x.len() - n..]`, `[x.len() - n..m]`
-    r"\[[^\[\]]*\.len\(\)\s*-[^\[\]]*\.\.[^\[\]]*\]",
+/// file (relative to `vendored/`) -> (matches, "upstream DevCouncil" verdict).
+/// Vendored code is DevCouncil's and is not edited here; every site below was
+/// read and none is both unguarded and reachable with untrusted input.
+const VENDORED_ALLOWED: &[(&str, usize, &str)] = &[
+    ("dc-glob/src/lib.rs", 1, "upstream DevCouncil: slice of a Vec of chunks (`chunks[k - 1][..len - 1]`), not a str"),
+    ("dc-redact/src/lib.rs", 1, "upstream DevCouncil: guarded, `head` ends in a matched ASCII quote char so `len - 1` is a boundary"),
+    ("devmap-extract/src/frameworks.rs", 2, "upstream DevCouncil: guarded, `[1..len - 1]` after the first char is an ASCII quote and ends_with(open); and a slice of a Vec<(usize, &str)>"),
+    ("devmap-extract/src/languages.rs", 1, "upstream DevCouncil: slice of a Vec<&str>, not a str"),
+    ("devmap-extract/src/markup.rs", 1, "upstream DevCouncil: guarded, first byte b'[' and ends_with(']')"),
+    ("devmap-extract/src/rustsig.rs", 1, "upstream DevCouncil: guarded, `matching_close` returned the index of an ASCII close bracket equal to len - 1"),
+    ("devmap-extract/src/wiring.rs", 1, "upstream DevCouncil: slice of a Vec<&str>, not a str"),
+    ("devmap-query/src/cypher.rs", 1, "upstream DevCouncil: guarded, `ends_with(open)` so the `len - open.len_utf8()` tail is exactly one char"),
 ];
 
-fn src() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
-}
-
-fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).expect("read src") {
-        let path = entry.expect("entry").path();
-        if path.is_dir() {
-            rust_files(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-}
-
-fn is_test_file(rel: &str) -> bool {
-    let name = rel.rsplit('/').next().unwrap_or(rel);
-    name.ends_with("tests.rs")
-        || name.ends_with("_tests.rs")
-        || name == "test_support.rs"
-        || rel.starts_with("test_support/")
-}
-
-/// Matches in the production part of a file: everything before its first
-/// top-level `#[cfg(test)]` that opens a module (files keep their test modules
-/// last), minus comment lines.
-fn matches_in(text: &str, shapes: &[Regex]) -> usize {
-    let mut count = 0;
-    let lines: Vec<&str> = text.lines().collect();
-    for (at, line) in lines.iter().enumerate() {
-        let opens_module = |next: Option<&&str>| {
-            next.is_some_and(|n| {
-                let n = n
-                    .trim_start_matches("pub(crate) ")
-                    .trim_start_matches("pub ");
-                n.starts_with("mod ")
-            })
-        };
-        if line.starts_with("#[cfg(test)]") && opens_module(lines.get(at + 1)) {
-            break;
-        }
-        if line.trim_start().starts_with("//") {
-            continue;
-        }
-        if shapes.iter().any(|shape| shape.is_match(line)) {
-            count += 1;
-        }
-    }
-    count
-}
-
-fn shapes() -> Vec<Regex> {
-    SHAPES
-        .iter()
-        .map(|s| Regex::new(s).expect("shape"))
-        .collect()
-}
-
-#[test]
-fn no_production_str_is_sliced_by_len_minus_n_unlisted() {
-    let shapes = shapes();
-    let mut files = Vec::new();
-    rust_files(&src(), &mut files);
-    assert!(files.len() > 100, "the scan found {} files", files.len());
-    let allowed: BTreeMap<&str, usize> = ALLOWED.iter().map(|(f, n, _)| (*f, *n)).collect();
-    let mut found: BTreeMap<String, usize> = BTreeMap::new();
-    for path in files {
-        let rel = path
-            .strip_prefix(src())
-            .unwrap()
-            .to_string_lossy()
-            .replace('\\', "/");
-        if is_test_file(&rel) {
-            continue;
-        }
-        let n = matches_in(&std::fs::read_to_string(&path).expect("read"), &shapes);
-        if n > 0 {
-            found.insert(rel, n);
-        }
-    }
+fn check(
+    root: &Path,
+    allowed: &[(&str, usize, &str)],
+    min_files: usize,
+    unlisted: &str,
+) -> Vec<String> {
+    let (found, walked) = slice_guard::scan_tree(root);
+    assert!(
+        walked > min_files,
+        "the scan of {} found {walked} files",
+        root.display()
+    );
+    let allowed: BTreeMap<&str, usize> = allowed.iter().map(|(f, n, _)| (*f, *n)).collect();
+    let found: BTreeMap<String, Vec<usize>> = found.into_iter().collect();
     let mut problems = Vec::new();
-    for (file, n) in &found {
+    for (file, lines) in &found {
+        let n = lines.len();
         match allowed.get(file.as_str()) {
-            None => problems.push(format!(
-                "{file}: {n} slice(s) cut by len() - N; use fs_entry::strip_suffix_ascii_ci or prove the cut is a boundary and list it"
-            )),
-            Some(max) if n > max => problems.push(format!("{file}: {n} slices, {max} allowed")),
-            Some(max) if n < max => problems.push(format!(
+            None => problems.push(format!("{file}:{lines:?}: {unlisted}")),
+            Some(max) if n > *max => {
+                problems.push(format!("{file}:{lines:?}: {n} slices, {max} allowed"))
+            }
+            Some(max) if n < *max => problems.push(format!(
                 "{file}: only {n} slices; lower its allowance from {max}"
             )),
             Some(_) => {}
@@ -137,6 +90,30 @@ fn no_production_str_is_sliced_by_len_minus_n_unlisted() {
             ));
         }
     }
+    problems
+}
+
+#[test]
+fn no_production_str_is_sliced_by_len_minus_n_unlisted() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let problems = check(
+        &src,
+        ALLOWED,
+        100,
+        "slice cut by len() - N; use fs_entry::strip_suffix_ascii_ci or prove the cut is a boundary and list it",
+    );
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn vendored_devcouncil_slices_are_all_reported_with_a_verdict() {
+    let vendored = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendored");
+    let problems = check(
+        &vendored,
+        VENDORED_ALLOWED,
+        50,
+        "new vendored slice cut by len() - N; give it a verdict (upstream DevCouncil)",
+    );
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
@@ -144,24 +121,25 @@ fn no_production_str_is_sliced_by_len_minus_n_unlisted() {
 /// are flagged, safe shapes and test code are not.
 #[test]
 fn the_scan_flags_the_shapes_that_panicked_and_skips_test_code() {
-    let shapes = shapes();
     for bad in [
         "if path[path.len() - 4..].eq_ignore_ascii_case(\".git\") {",
         "let stem = &name[..name.len() - 3];",
         "name[name.len() - 3..].eq_ignore_ascii_case(\".md\")",
         "let t = &s[1..s.len() - 1];",
     ] {
-        assert_eq!(matches_in(bad, &shapes), 1, "{bad}");
+        assert_eq!(slice_guard::hits(bad).len(), 1, "{bad}");
     }
     for fine in [
         "let head = &text[..text.floor_char_boundary(cap)];",
         "&sha[..sha.len().min(12)]",
         "// name[name.len() - 3..] is the shape this guards against",
         "let n = v.len() - 3;",
+        "let m = \"s[s.len() - 3..]\";",
     ] {
-        assert_eq!(matches_in(fine, &shapes), 0, "{fine}");
+        assert!(slice_guard::hits(fine).is_empty(), "{fine}");
     }
-    let after_tests =
-        "fn a() {}\n#[cfg(test)]\nmod tests { fn t(s: &str) { &s[s.len() - 1..]; } }\n";
-    assert_eq!(matches_in(after_tests, &shapes), 0);
+    let inline = "fn a() {}\n#[cfg(test)]\nmod tests { fn t(s: &str) { &s[s.len() - 1..]; } }\n";
+    assert!(slice_guard::hits(inline).is_empty());
+    let out_of_line = "#[cfg(test)]\nmod tests;\nfn p(s: &str) -> &str { &s[s.len() - 1..] }\n";
+    assert_eq!(slice_guard::hits(out_of_line), [3]);
 }

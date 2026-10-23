@@ -8,6 +8,7 @@
 //! coverage `.py` stem has no public seam and is covered by reasoning in the
 //! review report (same helper, same shape as scan_briefs' `.md`).
 
+mod common;
 use gitpulse_lib::github::parse_github_remote_url;
 use gitpulse_lib::tasks::scan_briefs;
 use proptest::prelude::*;

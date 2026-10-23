@@ -1,7 +1,6 @@
 //! W6-L4 adversarial review of `tests/str_tail_slices.rs` (ft-181d43a9).
 //!
-//! The guard's own source is included, unmodified, so the attacks run against
-//! its real `matches_in`, `SHAPES` and `is_test_file`. Tests named
+//! The attacks run against the guard's real scanner (`tests/common/slice_guard.rs`). Tests named
 //! `held_*` pass (attack failed). Tests named `BREAK_*` are EXPECTED TO FAIL on
 //! the reviewed commit: each asserts what the guard's doc comment promises
 //! ("fails when a production file gains a slice of that subtractive shape")
@@ -9,94 +8,23 @@
 //! documented gap (offset computed into a variable first) and pass.
 #![allow(non_snake_case)]
 
-use regex::Regex;
-use std::path::{Path, PathBuf};
+mod common;
+use std::path::Path;
+
+#[path = "common/slice_guard.rs"]
+mod slice_guard;
 
 mod guard {
     use super::*;
 
-    // Mirror of the guard's `SHAPES`, `matches_in`, `is_test_file` and
-    // `rust_files` (include! cannot be used: the guard starts with inner doc
-    // comments). `the_mirror_matches_the_guard_source` pins that the guard's
-    // own text still contains each load-bearing line, so drift fails loudly.
-    pub const SHAPES: &[&str] = &[
-        r"\[[^\[\]]*\.\.[^\[\]]*\.len\(\)\s*-[^\[\]]*\]",
-        r"\[[^\[\]]*\.len\(\)\s*-[^\[\]]*\.\.[^\[\]]*\]",
-    ];
-
-    pub fn shapes() -> Vec<Regex> {
-        SHAPES.iter().map(|s| Regex::new(s).unwrap()).collect()
-    }
-
-    pub fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                rust_files(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
-    }
-
-    pub fn is_test_file(rel: &str) -> bool {
-        let name = rel.rsplit('/').next().unwrap_or(rel);
-        name.ends_with("tests.rs")
-            || name.ends_with("_tests.rs")
-            || name == "test_support.rs"
-            || rel.starts_with("test_support/")
-    }
-
-    pub fn matches_in(text: &str, shapes: &[Regex]) -> usize {
-        let mut count = 0;
-        let lines: Vec<&str> = text.lines().collect();
-        for (at, line) in lines.iter().enumerate() {
-            let opens_module = |next: Option<&&str>| {
-                next.is_some_and(|n| {
-                    let n = n
-                        .trim_start_matches("pub(crate) ")
-                        .trim_start_matches("pub ");
-                    n.starts_with("mod ")
-                })
-            };
-            if line.starts_with("#[cfg(test)]") && opens_module(lines.get(at + 1)) {
-                break;
-            }
-            if line.trim_start().starts_with("//") {
-                continue;
-            }
-            if shapes.iter().any(|shape| shape.is_match(line)) {
-                count += 1;
-            }
-        }
-        count
-    }
-
-    #[test]
-    fn the_mirror_matches_the_guard_source() {
-        let guard = include_str!("str_tail_slices.rs");
-        for must in [
-            SHAPES[0],
-            SHAPES[1],
-            "if line.starts_with(\"#[cfg(test)]\") && opens_module(lines.get(at + 1)) {",
-            "break;",
-            "name.ends_with(\"tests.rs\")",
-            "if line.trim_start().starts_with(\"//\") {",
-            "let lines: Vec<&str> = text.lines().collect();",
-            "rust_files(&src(), &mut files);",
-        ] {
-            assert!(
-                guard.contains(must),
-                "guard changed; refresh the mirror: {must}"
-            );
-        }
-    }
+    // The guard's own scanner, shared from tests/common (no mirror to drift).
+    pub use super::slice_guard::{hits, is_test_file, scan_tree};
 
     mod attacks {
         use super::*;
 
         fn caught(src: &str) -> bool {
-            matches_in(src, &shapes()) > 0
+            !hits(src).is_empty()
         }
 
         #[test]
@@ -209,30 +137,14 @@ mod guard {
             }
         }
 
-        /// The walk covers `src-tauri/src` only. The vendored devmap/dc crates
-        /// are linked into the shipped binary and hold unlisted tail slices.
+        /// The walk covers the vendored devmap/dc crates too (report mode; the
+        /// verdicts live in `str_tail_slices.rs`'s `VENDORED_ALLOWED`).
         #[test]
         fn BREAK_vendored_crates_linked_into_the_binary_are_not_scanned() {
             let vendored = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendored");
-            let mut files = Vec::new();
-            rust_files(&vendored, &mut files);
-            let shapes = shapes();
-            let mut hits = Vec::new();
-            for path in files {
-                let rel = path
-                    .strip_prefix(&vendored)
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                if rel.contains("/tests/") || is_test_file(&rel) {
-                    continue;
-                }
-                let n = matches_in(&std::fs::read_to_string(&path).unwrap(), &shapes);
-                if n > 0 {
-                    hits.push(format!("{rel}: {n}"));
-                }
-            }
-            assert!(hits.is_empty(), "unscanned vendored tail slices: {hits:?}");
+            let (found, walked) = scan_tree(&vendored);
+            assert!(walked > 50, "walked {walked} vendored files");
+            assert!(!found.is_empty(), "the vendored scan reaches its sites");
         }
     }
 }

@@ -75,7 +75,7 @@ fn valid_heads_resolve_identically_in_either_case_for_sha1_and_sha256() {
         for head in [
             format!("{oid}\n"),
             format!("{}\n", oid.to_uppercase()),
-            format!("{oid}"),
+            oid.clone(),
         ] {
             assert_eq!(
                 state_with_head(dir.path(), &head),
