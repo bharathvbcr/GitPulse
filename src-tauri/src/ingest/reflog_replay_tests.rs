@@ -218,6 +218,10 @@ fn replay_child() {
     };
     crate::test_support::trust_repo(std::path::Path::new(&repo));
     if let Ok(go) = std::env::var(ENV_GO) {
+        // Tell the parent this process is at its poll loop, so the parent
+        // releases both together instead of guessing how long a start takes.
+        std::fs::write(format!("{go}.ready-{}", std::process::id()), b"")
+            .expect("announce readiness");
         let deadline = std::time::Instant::now()
             + crate::test_support::coverage_relaxed(std::time::Duration::from_secs(60));
         while !std::path::Path::new(&go).exists() {
@@ -230,9 +234,10 @@ fn replay_child() {
     }
     let out = ingest_reflog_into(&repo, &repo, 200);
     println!(
-        "REPLAY recorded={} duplicates={} failed={}",
-        out.recorded, out.duplicates_refused, out.failed_records
+        "REPLAY recorded={} duplicates={} skipped={} failed={}",
+        out.recorded, out.duplicates_refused, out.reflog_skipped, out.failed_records
     );
+    println!("REPLAY-DETAIL {out:?}");
 }
 
 /// A command that runs [`replay_child`] from a private copy of this harness.
@@ -332,6 +337,45 @@ fn a_replay_killed_mid_pass_leaves_no_duplicates_and_no_gaps() {
     );
 }
 
+/// Every replayed entry is accounted for by exactly one of recorded, refused by
+/// the ledger as a duplicate, or skipped because the pass saw it already
+/// recorded: the three are what the two-process test sums, and this pins each
+/// one on its own, with no timing in it.
+#[test]
+fn a_replayed_entry_is_recorded_refused_or_skipped_and_never_lost() {
+    let (dir, repo) = seeded_repo();
+    for n in 0..5 {
+        commit_at(
+            dir.path(),
+            &format!("c{n}"),
+            T0 + 1 + n,
+            "gitpulse@test.local",
+        );
+    }
+    let entries = crate::engine::git_reader::GitReader::get_reflog(&repo, 200).expect("reflog");
+    let total = i64::try_from(entries.len()).unwrap();
+    let replay = |seen: std::collections::HashSet<String>| {
+        replay_reflog(&repo, &repo, entries.clone(), Ok(seen), CatchUp::default())
+    };
+    let tally = |out: &CatchUp| (out.recorded, out.duplicates_refused, out.reflog_skipped);
+
+    let first = replay(std::collections::HashSet::new());
+    assert_eq!(tally(&first), (total, 0, 0), "{first:?}");
+    // A pass that built its seen-set before the first one wrote: the ledger
+    // itself refuses every copy.
+    let raced = replay(std::collections::HashSet::new());
+    assert_eq!(tally(&raced), (0, total, 0), "{raced:?}");
+    // A pass that found their identities already held (an older build's untimed
+    // rows are what that set holds): it never offers them.
+    let seen = entries
+        .iter()
+        .map(|entry| ledger::stored_object(&format!("{} {}", entry.commit_id, entry.message)))
+        .collect();
+    let late = replay(seen);
+    assert_eq!(tally(&late), (0, 0, total), "{late:?}");
+    assert_eq!(reflog_rows(&repo).len(), entries.len(), "one row per entry");
+}
+
 /// S6-10: two processes replaying one reflog at the same moment record exactly
 /// one row per entry; the unique identity index refuses the other's copy.
 #[cfg(unix)]
@@ -362,8 +406,33 @@ fn two_processes_replaying_at_once_record_exactly_one_row_per_entry() {
             (child, harness)
         })
         .unzip();
-    // Let both reach their poll loop before releasing them together.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // Release them together once both are at their poll loop. A fixed sleep
+    // here let a child that started late (a loaded host) begin after the other
+    // had finished, which is a sequential replay and not the contest this test
+    // is about.
+    let ready_prefix = format!("{}.ready-", go.file_name().unwrap().to_string_lossy());
+    let ready = || {
+        std::fs::read_dir(signal.path())
+            .expect("read the signal dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&ready_prefix)
+            })
+            .count()
+    };
+    let waiting_until = std::time::Instant::now()
+        + crate::test_support::coverage_relaxed(std::time::Duration::from_secs(60));
+    while ready() < 2 {
+        assert!(
+            std::time::Instant::now() < waiting_until,
+            "only {} of 2 replay children reached their poll loop",
+            ready()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     std::fs::write(&go, b"go").expect("release the children");
     let outputs: Vec<_> = children
         .into_iter()
@@ -372,6 +441,7 @@ fn two_processes_replaying_at_once_record_exactly_one_row_per_entry() {
 
     let mut recorded = 0;
     let mut duplicates = 0;
+    let mut skipped = 0;
     for output in &outputs {
         assert!(
             output.status.success(),
@@ -380,14 +450,25 @@ fn two_processes_replaying_at_once_record_exactly_one_row_per_entry() {
         );
         recorded += parsed(&output.stdout, "recorded");
         duplicates += parsed(&output.stdout, "duplicates");
+        skipped += parsed(&output.stdout, "skipped");
         assert_eq!(parsed(&output.stdout, "failed"), 0);
     }
     let total = i64::try_from(total).unwrap();
     assert_eq!(recorded, total, "every entry once across both processes");
+    // Every entry is handled once by each process, and exactly one of three
+    // things happens to it: recorded, refused by the ledger as a duplicate (a
+    // raced copy), or skipped because the process saw it already recorded when
+    // it looked. Which of the last two a loser reports depends on timing, so
+    // they are summed; the total is not.
     assert_eq!(
-        recorded + duplicates,
+        recorded + duplicates + skipped,
         2 * total,
-        "every entry accounted for"
+        "every entry accounted for: recorded {recorded} + duplicates {duplicates} + skipped {skipped}\n{}",
+        outputs
+            .iter()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     assert_eq!(
         i64::try_from(reflog_rows(&repo).len()).unwrap(),

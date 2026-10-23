@@ -78,6 +78,12 @@ export interface CatchUp {
    */
   duplicates_refused?: number;
   /**
+   * Reflog entries the pass saw as already recorded when it looked, so it never
+   * offered them to the ledger (as opposed to `duplicates_refused`, where the
+   * ledger refused a copy). Not part of `reflog_entries`.
+   */
+  reflog_skipped?: number;
+  /**
    * Reflog entries whose ledger write failed. The pass stops at the first, so
    * everything after it in that ref is `reflog_pending`; the next pass retries
    * from the same place. Non-zero is never a complete pass.

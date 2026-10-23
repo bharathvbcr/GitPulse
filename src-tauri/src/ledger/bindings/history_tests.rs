@@ -450,6 +450,18 @@ fn a_clock_that_went_backwards_orders_history_and_the_live_read_by_insertion() {
     );
 }
 
+/// CPU time the calling thread has used, immune to how long it waited to run.
+fn thread_cpu() -> std::time::Duration {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid out-pointer for the call's duration.
+    let status = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    assert_eq!(status, 0, "the thread CPU clock must be readable");
+    std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+}
+
 #[test]
 fn ten_thousand_binds_load_and_answer_within_a_pass_budget() {
     let (_dir, repo) = repo();
@@ -475,21 +487,28 @@ fn ten_thousand_binds_load_and_answer_within_a_pass_budget() {
         Ok(())
     })
     .unwrap();
-    let loaded = std::time::Instant::now();
+    let loaded = thread_cpu();
     let history = BindingHistory::load(&repo, &repo).unwrap();
-    let load = loaded.elapsed();
-    let asked = std::time::Instant::now();
+    let load = thread_cpu() - loaded;
+    let asked = thread_cpu();
     let mut resolved = 0u64;
     for call in 0..1_000_000u64 {
         let at = T0 + (call * 7_919) % 100_000;
         resolved += u64::from(history.as_of(at).task_id().is_some());
     }
-    let ask = asked.elapsed();
+    let ask = thread_cpu() - asked;
     eprintln!("10k binds: load {load:?}, 1M as_of {ask:?}, resolved {resolved}");
     assert_eq!(history.as_of(T0 + 9_999 * 10 + 5), bound("T9999"));
-    assert!(load < std::time::Duration::from_secs(2), "load {load:?}");
+    // CPU time this thread spent, not the wall clock: the budget is about the
+    // work (a pass over 10k rows, a million lookups), and a loaded host
+    // stretches wall time by the queue the thread waits in without changing
+    // that work. Still scaled, because instrumentation does change the work.
     assert!(
-        ask < std::time::Duration::from_secs(5),
+        load < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(2)),
+        "load {load:?}"
+    );
+    assert!(
+        ask < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(5)),
         "1M as_of took {ask:?}"
     );
 }

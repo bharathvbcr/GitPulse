@@ -3063,6 +3063,117 @@ pub(crate) mod tests {
         dir
     }
 
+    /// Puts an empty, fully migrated map database at `repo`'s store path.
+    ///
+    /// Creating the schema is the dominant write of a seeded fixture (about
+    /// 2 MiB of pages per database), and the property tests in
+    /// `insights::entity_collision` seed one per party per generated case: 484
+    /// MiB for a single test, enough to trip the suite's write watchdog. The
+    /// schema does not depend on the repository, so it is created once per test
+    /// process and each fixture gets a clone of that file (`fs::copy` clones on
+    /// APFS, and is a plain copy elsewhere; neither re-runs the migrations).
+    fn install_empty_fixture_store(repo: &Path) {
+        static TEMPLATE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        let template = TEMPLATE.get_or_init(|| {
+            let dir = crate::test_support::env::hermetic::root().join("devmap-store-template");
+            std::fs::create_dir_all(&dir).expect("mkdir store template");
+            // Unique per process, so two test binaries never share one file.
+            let path = dir.join(format!("{}.sqlite", std::process::id()));
+            drop(Store::open(&path).expect("store opens and creates its schema"));
+            for sidecar in ["-wal", "-shm"] {
+                let mut name = path.clone().into_os_string();
+                name.push(sidecar);
+                assert!(
+                    !Path::new(&name).exists(),
+                    "the template must be a single checkpointed file"
+                );
+            }
+            path
+        });
+        let db = map_path(repo);
+        std::fs::create_dir_all(db.parent().expect("db parent")).expect("mkdir codeintel");
+        std::fs::copy(template, &db).expect("clone the template store");
+        // `pending_state.epoch` is the store's identity, minted by `randomblob`
+        // when the schema is created: a clone must not share its template's, or
+        // two fixtures would acknowledge each other's claims. Same minting.
+        let conn = rusqlite::Connection::open(&db).expect("open the cloned store");
+        let changed = conn
+            .execute(
+                "UPDATE pending_state SET epoch = lower(hex(randomblob(16))) WHERE singleton = 1",
+                [],
+            )
+            .expect("give the clone its own identity");
+        assert_eq!(changed, 1, "the template store has one identity row");
+        conn.close().expect("close the cloned store");
+    }
+
+    /// Adversarial review of `install_empty_fixture_store` (W5-L3). A store
+    /// that one test writes to must not reach the template or a sibling clone.
+    #[test]
+    fn fixture_store_clones_do_not_share_writes() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        install_empty_fixture_store(a.path());
+        install_empty_fixture_store(b.path());
+        let (db_a, db_b) = (map_path(a.path()), map_path(b.path()));
+        let conn = rusqlite::Connection::open(&db_a).unwrap();
+        conn.execute(
+            "INSERT INTO paths (id, path) VALUES (1, 'only-in-a.rs')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let count = |db: &Path| -> i64 {
+            rusqlite::Connection::open(db)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM paths", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(count(&db_a), 1);
+        assert_eq!(count(&db_b), 0, "a sibling clone saw another test's write");
+        let c = tempfile::tempdir().unwrap();
+        install_empty_fixture_store(c.path());
+        assert_eq!(
+            count(&map_path(c.path())),
+            0,
+            "the template was written through"
+        );
+        assert_ne!(
+            std::fs::metadata(&db_a).unwrap().len(),
+            0,
+            "the clone is a real file"
+        );
+    }
+
+    /// Each fixture store should be its own store: `pending_state.epoch` is the
+    /// store identity ("a claim from one store must not acknowledge another's
+    /// identically named path"), minted by `randomblob` at migration time. A
+    /// clone of one template gives every fixture the SAME epoch, so a test
+    /// that seeds two parties cannot tell them apart by identity.
+    ///
+    /// FAILS on the lane (known break, low severity: nothing in GitPulse reads
+    /// the epoch of a fixture store today).
+    #[test]
+    fn fixture_stores_have_distinct_store_identities() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        install_empty_fixture_store(a.path());
+        install_empty_fixture_store(b.path());
+        let epoch = |repo: &Path| -> String {
+            rusqlite::Connection::open(map_path(repo))
+                .unwrap()
+                .query_row(
+                    "SELECT epoch FROM pending_state WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_ne!(
+            epoch(a.path()),
+            epoch(b.path()),
+            "two fixtures share one store epoch"
+        );
+    }
+
     /// One indexed symbol for [`seed_file_symbols`]: `(name, qualified_name,
     /// kind, first_line, last_line)`, lines 1-based and inclusive.
     pub(crate) type SeedSymbol<'a> = (&'a str, &'a str, &'a str, u32, u32);
@@ -3092,7 +3203,7 @@ pub(crate) mod tests {
         };
         let line_start = |line: u32| line_starts[(line - 1) as usize];
 
-        drop(open_fixture_store(repo));
+        install_empty_fixture_store(repo);
         let conn = rusqlite::Connection::open(map_path(repo)).expect("open fixture db");
         conn.execute("INSERT INTO paths (id, path) VALUES (1, ?1)", [file])
             .expect("insert path");

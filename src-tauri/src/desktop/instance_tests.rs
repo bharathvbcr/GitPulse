@@ -487,9 +487,19 @@ fn a_peer_that_sent_bytes_and_left_before_the_greeting_is_still_refused() {
 
 #[test]
 fn a_broken_pipe_while_answering_a_real_request_is_refused_at_warn() {
-    // A complete, valid request from a sender that has stopped listening: the
-    // greeting reaches it, then it closes its read side before sending, so the
-    // ack write is the EPIPE. That is after the first frame, so not a probe.
+    // A complete, valid request whose answer cannot be delivered: the greeting
+    // reaches the peer, the request arrives whole, and the ack write is the
+    // EPIPE. That is after the first frame, so not a probe.
+    //
+    // The EPIPE is made on the server's own socket (its write half shut down
+    // while the answer is held back), not by the peer leaving. On macOS only a
+    // full `close` of the peer's end gives the other side EPIPE (`shutdown` of
+    // either half does not, verified), and a full close is not in the test's
+    // hands: a concurrent test that forks holds a copy of the peer's
+    // descriptor until its child execs, so the peer had "left" and the write
+    // still succeeded, which is the failure this test showed in parallel runs.
+    // Holding the inbox lock, which `admit` takes right before the ack, orders
+    // the shutdown before the write.
     let (mut server, client) = UnixStream::pair().unwrap();
     // SAFETY: `getuid` has no preconditions.
     let shared = Shared::new(unsafe { libc::getuid() });
@@ -498,15 +508,87 @@ fn a_broken_pipe_while_answering_a_real_request_is_refused_at_warn() {
         request: Request::Reveal,
     })
     .unwrap();
-    let peer = std::thread::spawn(move || {
+    let control = server.try_clone().unwrap();
+    let held = shared.inbox.lock().unwrap();
+    let outcome = std::thread::scope(|scope| {
+        let served = scope.spawn(|| answer(&mut server, &shared));
         let mut writer = client.try_clone().unwrap();
-        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut reader = BufReader::new(client);
         read_frame(&mut reader).unwrap().expect("greeting");
-        client.shutdown(std::net::Shutdown::Read).unwrap();
         writer.write_all(format!("{line}\n").as_bytes()).unwrap();
+        control.shutdown(std::net::Shutdown::Write).unwrap();
+        drop(held);
+        served.join().unwrap()
     });
-    let outcome = answer(&mut server, &shared);
-    peer.join().unwrap();
+    let Err(ended) = outcome else {
+        panic!("an unanswerable request is not a served one")
+    };
+    assert!(
+        matches!(&ended, Ended::Refused(reason) if reason.starts_with("write:")),
+        "{ended:?}"
+    );
+    assert_eq!(ended.log_line().0, log::Level::Warn);
+}
+
+/// Adversarial review of W5-L3: the pre-lane shape of the broken-pipe test,
+/// where the PEER fully leaves (every descriptor of its end closes) after
+/// sending a whole frame. `peer_hung_up_silently` reads true for such a peer,
+/// so an ack failure routed through `Ended::before_first_frame` would be
+/// logged as a probe. The lane's rewritten test keeps the peer connected, so
+/// that recv answers `EAGAIN` and the same misrouting still reads as Refused.
+/// It waits for the hang-up before the ack, so a forking test's copy of the
+/// peer's descriptor cannot make it flaky; it is the only shape that catches
+/// routing `answer`'s ack write through
+/// `Ended::before_first_frame` (shown: the rewritten test passes under it).
+#[test]
+fn a_full_frame_from_a_peer_that_then_left_is_refused_not_probed() {
+    let (mut server, client) = UnixStream::pair().unwrap();
+    // SAFETY: `getuid` has no preconditions.
+    let shared = Shared::new(unsafe { libc::getuid() });
+    let line = serde_json::to_string(&Envelope {
+        v: PROTOCOL,
+        request: Request::Reveal,
+    })
+    .unwrap();
+    // The ack is held back (the inbox lock `admit` takes just before it) until
+    // the server's socket reports the hang-up. Joining the peer thread is not
+    // enough: a concurrent test that forks holds a copy of the peer's
+    // descriptor until its child execs, so the peer has "left" while the socket
+    // is still open and the ack write succeeds. POLLHUP is the kernel saying
+    // every copy is gone, and it is waited for, bounded.
+    let control = server.try_clone().unwrap();
+    let held = shared.inbox.lock().unwrap();
+    let outcome = std::thread::scope(|scope| {
+        let served = scope.spawn(|| answer(&mut server, &shared));
+        let peer = scope.spawn(move || {
+            let mut writer = client.try_clone().unwrap();
+            let mut reader = BufReader::new(client.try_clone().unwrap());
+            read_frame(&mut reader).unwrap().expect("greeting");
+            client.shutdown(std::net::Shutdown::Read).unwrap();
+            writer.write_all(format!("{line}\n").as_bytes()).unwrap();
+        });
+        peer.join().unwrap();
+        let until = std::time::Instant::now()
+            + crate::test_support::coverage_relaxed(Duration::from_secs(30));
+        loop {
+            let mut watched = libc::pollfd {
+                fd: std::os::fd::AsRawFd::as_raw_fd(&control),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one initialised `pollfd` for a descriptor `control` owns.
+            unsafe { libc::poll(&mut watched, 1, 10) };
+            if watched.revents & libc::POLLHUP != 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "the peer's descriptors were never all closed, so it never hung up"
+            );
+        }
+        drop(held);
+        served.join().unwrap()
+    });
     let Err(ended) = outcome else {
         panic!("an unanswerable request is not a served one")
     };

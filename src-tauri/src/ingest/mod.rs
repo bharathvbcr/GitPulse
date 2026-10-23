@@ -144,6 +144,15 @@ pub struct CatchUp {
     /// here too, and are not reflog entries.
     #[serde(default)]
     pub duplicates_refused: i64,
+    /// Replayed entries the pass saw as already recorded when it looked, so it
+    /// never offered them to the ledger: those at or before the ref's watermark
+    /// (a pass that ran first recorded them) and those whose identity an older
+    /// build's untimed row already holds. Distinct from `duplicates_refused`,
+    /// where the ledger itself refused a copy: a replay that starts after
+    /// another has finished reports its whole share here, one that races it
+    /// reports the contested share there. Not part of `reflog_entries`.
+    #[serde(default)]
+    pub reflog_skipped: i64,
     /// Reflog entries whose ledger write failed (counted by the ledger's dropped
     /// total too). The pass stops at the first, so everything after it in that
     /// ref is `reflog_pending`; the next pass retries from the same place.
@@ -200,7 +209,45 @@ pub(crate) fn source_roots() -> Vec<(&'static str, Option<std::path::PathBuf>)> 
 }
 
 fn dirs_home() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    if home_hidden::on_this_thread() {
+        return None;
+    }
     std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
+/// A test's way to say "this machine has no home directory" to the transcript
+/// walk without unsetting `HOME`, which is one slot for the whole test process:
+/// every parallel test that resolves the config directory (the repository trust
+/// store among them) reads it, and none of them holds the environment lock, so
+/// a test that removed it made unrelated tests fail with "Cannot resolve ...
+/// trust storage". The walk reads its roots on the calling thread, so a
+/// thread-local answers it exactly.
+#[cfg(test)]
+pub(crate) mod home_hidden {
+    use std::cell::Cell;
+
+    thread_local! {
+        static HIDDEN: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn on_this_thread() -> bool {
+        HIDDEN.with(Cell::get)
+    }
+
+    /// Restores on drop, so a failing test does not leave the thread hidden.
+    pub(crate) struct Hidden(());
+
+    pub(crate) fn hide() -> Hidden {
+        HIDDEN.with(|hidden| hidden.set(true));
+        Hidden(())
+    }
+
+    impl Drop for Hidden {
+        fn drop(&mut self) {
+            HIDDEN.with(|hidden| hidden.set(false));
+        }
+    }
 }
 
 fn event_belongs_to_worktree(
@@ -1087,6 +1134,9 @@ fn replay_ref(
     };
     // The rows and the watermark are one transaction (`record_steps`).
     let (settled, mut out) = record_steps(ledger_repo, worktree_path, ref_name, steps, seen, out);
+    // The entries at and before the watermark are the ones a pass that ran
+    // first already recorded; this one read them and offered none.
+    out.reflog_skipped += i64::try_from(first.saturating_sub(laid.start)).unwrap_or(i64::MAX);
     pending += steps.len() - settled;
     out.reflog_pending = i64::try_from(pending).unwrap_or(i64::MAX);
     out.reflog_unreached = unreached;
@@ -1161,6 +1211,7 @@ fn record_steps(
         // Compared as stored: redacted, and cut to the ledger's `object` cap,
         // or an identity past the cap would never match its own row.
         if seen.contains(&ledger::stored_object(&identity)) {
+            out.reflog_skipped += 1;
             rows.push(ledger::ReflogRow {
                 draft: None,
                 ordinal: step.ordinal,
@@ -1269,6 +1320,7 @@ impl CatchUp {
         self.recorded += other.recorded;
         self.reflog_entries += other.reflog_entries;
         self.duplicates_refused += other.duplicates_refused;
+        self.reflog_skipped += other.reflog_skipped;
         self.failed_records += other.failed_records;
         self.reflog_pending += other.reflog_pending;
         self.reflog_refs_skipped += other.reflog_refs_skipped;
