@@ -206,7 +206,6 @@ fn adv_readers_do_not_write_or_panic_on_a_read_only_ledger_directory() {
     let started = Instant::now();
     let f = freshness_readonly_at(&repo, ids::now_millis());
     let s = status_readonly(&repo);
-    let view = LedgerView::from_readonly(s, f.clone());
     let page = query_readonly_page(&repo, &EventQuery::default(), PAGE_MAX_BYTES);
     let elapsed = started.elapsed();
 
@@ -217,7 +216,7 @@ fn adv_readers_do_not_write_or_panic_on_a_read_only_ledger_directory() {
     }
     assert_eq!(before, after, "a reader changed the ledger directory");
     assert!(elapsed.as_secs() < 10, "{elapsed:?}");
-    assert!(!view.recording);
+    assert!(!s.recording);
     if !f.freshness_ok {
         assert!(f.stale && !f.freshness_error.is_empty(), "{f:?}");
     }

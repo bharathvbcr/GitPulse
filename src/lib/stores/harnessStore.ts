@@ -2,7 +2,7 @@ import { writable, get } from "svelte/store";
 import { invoke } from "../ipc/invoke";
 import { formatDiagnosticFailure } from "../diagnostics/diagnostics";
 import { mergeEvents } from "../ledger/projection";
-import type { LedgerEvent, LedgerStatus } from "../ledger/types";
+import { ledgerStatus, type LedgerEvent, type LedgerStatus } from "../ledger/types";
 import type { CatchUp } from "../ingest/types";
 import {
   identityKey,
@@ -650,14 +650,14 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
           actions: mergeEvents(bucket.actions, matching, MAX_AGENT_ACTIONS),
           ledgerCursor: Math.max(bucket.ledgerCursor, nextCursor),
           ledger: repositoryMismatch
-            ? {
+            ? ledgerStatus({
                 recording: false,
                 path: bucket.ledger?.path ?? "",
                 dropped: bucket.ledger?.dropped ?? 0,
                 error:
                   "The ledger returned rows for a different repository; those rows were not displayed.",
                 error_code: "repository_mismatch",
-              }
+              })
             : bucket.ledger,
         }),
         currentRun.generation,
@@ -669,13 +669,13 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
         currentRun.key,
         (bucket) => ({
           ...bucket,
-          ledger: {
+          ledger: ledgerStatus({
             recording: false,
             path: bucket.ledger?.path ?? "",
             dropped: bucket.ledger?.dropped ?? 0,
             error: formatDiagnosticFailure(e),
             error_code: "read_failed",
-          },
+          }),
         }),
         currentRun.generation,
       );

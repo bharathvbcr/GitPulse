@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { InsightsSnapshot, WorktreeSummary } from "../insights/types";
+import { ledgerStatus } from "../ledger/types";
 import {
   MAX_AGENT_ROWS,
   applyAgentFilter,
@@ -53,7 +54,7 @@ function snapshot(fields: Partial<InsightsSnapshot> = {}): InsightsSnapshot {
       ok: true, error: "", overlapping_files: 0, worktrees_involved: 0, scanned_worktrees: 1,
       unscanned_worktrees: 0, failed_worktrees: 0, truncated: false, shared_worktree_files: 0, shared_worktrees: [], sessions_ok: true, sessions_error: "", items: [],
     },
-    ledger: { recording: true, path: "", dropped: 0, error: "", error_code: "" },
+    ledger: ledgerStatus({ recording: true, path: "", dropped: 0, error: "", error_code: "" }),
     codeintel: { available: false, db_path: "" },
     ...fields,
     worktrees,

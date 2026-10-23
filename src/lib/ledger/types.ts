@@ -39,15 +39,86 @@ export interface LedgerEvent {
  * The UI must be able to say "this history is incomplete". A repository whose
  * ledger cannot be opened returns no events, and no events is exactly what a
  * repository with nothing in it returns.
+ *
+ * Extends `Freshness` because Rust flattens it into the same object: the
+ * freshness fields sit beside `recording`, not under a key of their own. The
+ * app's creating status does not read freshness and carries the "not read"
+ * default (`stale: true`, `freshness_ok: false`).
  */
-export interface LedgerStatus {
+export interface LedgerStatus extends Freshness {
+  /** True only when this process is writing the ledger; never from a read-only open. */
   recording: boolean;
+  /** `recording`, `readable` (opened read-only; who records is not known) or `unknown`. */
+  recording_state: string;
   path: string;
+  /** Appends dropped by THIS process; see `dropped_scope`. */
   dropped: number;
+  /** What `dropped` counts: `this_process`. */
+  dropped_scope: string;
   /** Bind/unbind writes whose catch-up failed or was cut short; not a dropped append. */
   catch_up_failures?: number;
+  /** Sibling-worktree bind/unbind rows the ledger keeps as history only. */
+  history_only_bindings: number;
   error: string;
   error_code: string;
+}
+
+/** Mirrors `ledger::freshness::Freshness`. */
+export interface Freshness {
+  as_of: string | null;
+  last_catch_up: string | null;
+  last_catch_up_basis: string;
+  stale: boolean;
+  stale_reason: string;
+  stale_after_secs: number;
+  freshness_ok: boolean;
+  freshness_error: string;
+  catch_up: CatchUpSummary | null;
+}
+
+/** Mirrors `ledger::freshness::CatchUpSummary`. */
+export interface CatchUpSummary {
+  worktrees: number;
+  truncated: boolean;
+  recorded: number;
+  transcripts: number;
+  transcripts_listed: number;
+  transcripts_unlisted: number;
+  skipped_lines: number;
+  failed_records: number;
+  error: string;
+  stale_worktrees: number;
+  future_dated_worktrees: number;
+}
+
+/** The freshness block of a ledger that was not read: stale, with the reason. */
+export const FRESHNESS_NOT_READ: Freshness = {
+  as_of: null,
+  last_catch_up: null,
+  last_catch_up_basis: "none",
+  stale: true,
+  stale_reason: "freshness was not read for this answer",
+  stale_after_secs: 600,
+  freshness_ok: false,
+  freshness_error: "freshness was not read for this answer",
+  catch_up: null,
+};
+
+/**
+ * A complete `LedgerStatus` from the fields a caller actually knows. The rest
+ * are what the app's creating status reports: `recording_state` follows
+ * `recording`, drops are this process's, and freshness was not read.
+ */
+export function ledgerStatus(
+  known: Pick<LedgerStatus, "recording" | "path" | "dropped" | "error" | "error_code">,
+): LedgerStatus {
+  return {
+    ...FRESHNESS_NOT_READ,
+    ...known,
+    recording_state: known.recording ? "recording" : "unknown",
+    dropped_scope: "this_process",
+    history_only_bindings: 0,
+  };
 }
 
 /** Payload of the `ledger-appended` event. */

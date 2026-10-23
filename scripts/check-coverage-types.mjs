@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 104 contracts over
- * 256 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 105 contracts over
+ * 258 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -133,7 +133,9 @@ export const CONTRACTS = Object.freeze([
   { label: "apple-intelligence", rustPath: rust("ai", "apple.rs"), tsPath: ts("ai", "appleIntelligence.ts"), structs: ["AppleIntelligenceStatus", "AppleIntelligenceRequest", "AppleIntelligenceDraft", "AppleIntelligenceError"] },
   { label: "harness", rustPath: rust("harness", "mod.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["HarnessStatus"] },
   { label: "policy", rustPath: rust("harness", "policy.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["PolicyVerdict"] },
-  { label: "ledger", rustPath: rust("ledger", "mod.rs"), tsPath: ts("ledger", "types.ts"), structs: ["LedgerEvent", "LedgerStatus", "LedgerAppended"] },
+  { label: "ledger", rustPath: rust("ledger", "mod.rs"), tsPath: ts("ledger", "types.ts"), structs: ["LedgerEvent", "LedgerStatus", "LedgerAppended"], flattenFrom: rust("ledger", "freshness.rs") },
+  // Flattened into `LedgerStatus`, and the `ledger_freshness` of a change context.
+  { label: "ledger-freshness", rustPath: rust("ledger", "freshness.rs"), tsPath: ts("ledger", "types.ts"), structs: ["Freshness", "CatchUpSummary"] },
   { label: "ingest", rustPath: rust("ingest", "mod.rs"), tsPath: ts("ingest", "types.ts"), structs: ["CatchUp"] },
   { label: "grants", rustPath: rust("grants", "mod.rs"), tsPath: ts("grants", "types.ts"), structs: ["Grant", "Grantor", "GrantScope", "GrantView"] },
   { label: "local-scan", rustPath: rust("harness", "protocol.rs"), tsPath: ts("ai", "scan.ts"), structs: ["ScanModel", "ScanServer", "ScanResult"] },
@@ -536,8 +538,9 @@ function normalizeTsType(type) {
  *
  * @param {string} body comment-stripped struct body
  * @param {string | undefined} [renameAll] struct-level serde rename_all rule
- * @returns {{ fields: Map<string, { type: string, optional: boolean }>, unparseable: string[] }}
- *          wire-name -> normalized wire type/presence; unparseable segments verbatim
+ * @returns {{ fields: Map<string, { type: string, optional: boolean }>, unparseable: string[], flattened: string[] }}
+ *          wire-name -> normalized wire type/presence; unparseable segments verbatim;
+ *          the type names of `#[serde(flatten)]` fields
  */
 function parseRustFields(body, renameAll) {
   /** @type {string[]} */
@@ -559,6 +562,8 @@ function parseRustFields(body, renameAll) {
   /** @type {Map<string, { type: string, optional: boolean }>} */
   const fields = new Map();
   const unparseable = [];
+  /** @type {string[]} */
+  const flattened = [];
   for (const rawSegment of segments) {
     const segment = rawSegment.trim();
     if (segment === "") continue;
@@ -586,6 +591,13 @@ function parseRustFields(body, renameAll) {
       const options = serdeOptions(attr);
       if (!options) continue;
       if (options.has("skip")) skipped = true;
+      // A flattened field is not a key on the wire: its struct's fields are
+      // written beside this struct's own. They are merged in by `runTypeCheck`
+      // from the contract's `flattenFrom` source.
+      if (options.has("flatten")) {
+        skipped = true;
+        flattened.push(rest.trim().slice(rest.trim().indexOf(":") + 1).trim());
+      }
       if (options.has("skip_serializing_if")) skipIf = options.get("skip_serializing_if");
       // `skip_serializing_if` alone decides wire presence. `#[serde(default)]`
       // is a *deserialization* attribute — it supplies a value when a field is
@@ -612,7 +624,7 @@ function parseRustFields(body, renameAll) {
       });
     }
   }
-  return { fields, unparseable };
+  return { fields, unparseable, flattened };
 }
 
 /**
@@ -623,7 +635,7 @@ function parseRustFields(body, renameAll) {
  * @param {{ requirePub?: boolean }} [options] `requirePub: false` reads structs
  *        that never cross IPC on their own, such as the `gh` JSON DTOs
  * @returns {{
- *   structs: Map<string, { fields: Map<string, { type: string, optional: boolean }>, line: number }>,
+ *   structs: Map<string, { fields: Map<string, { type: string, optional: boolean }>, line: number, flattened: string[] }>,
  *   unparseable: Array<{ struct: string, segment: string }>,
  *   violations: string[],
  * }}
@@ -675,7 +687,7 @@ export function parseRustStructs(rustSource, checked = CHECKED_STRUCTS, { requir
       for (const segment of parsed.unparseable) {
         unparseable.push({ struct: name, segment });
       }
-      structs.set(name, { fields: parsed.fields, line: lineOf(rustSource, decl.index) });
+      structs.set(name, { fields: parsed.fields, line: lineOf(rustSource, decl.index), flattened: parsed.flattened });
     } catch (err) {
       violations.push(`rust: could not parse struct ${name}: ${/** @type {Error} */ (err).message}`);
     }
@@ -837,10 +849,27 @@ export function compareTypes(rust, ts, checked = CHECKED_STRUCTS) {
 }
 
 /**
- * @param {{ rustPath: string, tsPath: string, structs?: readonly string[] }} input
+ * @param {{ rustPath: string, tsPath: string, structs?: readonly string[], flattenFrom?: string }} input
+ *        `flattenFrom`: the Rust source declaring the structs that checked
+ *        structs `#[serde(flatten)]` (default: `rustPath`)
  */
-export function runTypeCheck({ rustPath, tsPath, structs = CHECKED_STRUCTS }) {
+export function runTypeCheck({ rustPath, tsPath, structs = CHECKED_STRUCTS, flattenFrom }) {
   const rust = parseRustStructs(readFileSync(rustPath, "utf8"), structs);
+  // `#[serde(flatten)]` writes the inner struct's fields into the outer object.
+  for (const [outer, parsed] of rust.structs) {
+    for (const inner of parsed.flattened) {
+      const source = readFileSync(flattenFrom ?? rustPath, "utf8");
+      const found = parseRustStructs(source, [inner]);
+      const innerStruct = found.structs.get(inner);
+      if (!innerStruct) {
+        rust.violations.push(
+          `rust: ${outer} flattens ${inner}, which is not a struct in ${flattenFrom ?? rustPath} (name it in the contract's flattenFrom)`,
+        );
+        continue;
+      }
+      for (const [name, field] of innerStruct.fields) parsed.fields.set(name, field);
+    }
+  }
   const ts = parseTsInterfaces(readFileSync(tsPath, "utf8"), structs);
   const { drifts, typeDrifts, fieldCount } = compareTypes(rust, ts, structs);
 

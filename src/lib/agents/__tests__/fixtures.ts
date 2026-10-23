@@ -4,6 +4,7 @@
  */
 
 import type { InsightsSnapshot, WorktreeSummary } from "../../insights/types";
+import { ledgerStatus } from "../../ledger/types";
 import {
   projectAgentPlane,
   type PlaneInput,
@@ -62,7 +63,7 @@ export function snapshot(fields: Partial<InsightsSnapshot> = {}): InsightsSnapsh
       unscanned_worktrees: 0, failed_worktrees: 0, truncated: false, items: [],
       shared_worktree_files: 0, shared_worktrees: [], sessions_ok: true, sessions_error: "",
     },
-    ledger: { recording: true, path: "", dropped: 0, error: "", error_code: "" },
+    ledger: ledgerStatus({ recording: true, path: "", dropped: 0, error: "", error_code: "" }),
     codeintel: { available: false, db_path: "" },
     ...fields,
     worktrees,

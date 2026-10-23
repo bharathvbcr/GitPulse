@@ -364,7 +364,6 @@ fn readonly_paths_never_write_the_marker() {
     let (_p, s) = linked(&main, "s");
     let _ = repository_status_readonly(&main);
     let _ = resolve_binding_readonly(&s, &s);
-    let _ = repository_ledger_view(&main);
     let after: i64 = raw(&main)
         .query_row("SELECT COUNT(*) FROM ledger_family_imports", [], |r| {
             r.get(0)
@@ -475,7 +474,7 @@ fn demotion_notice_reach() {
         .count();
     let writable = repository_status(&main).unwrap();
     let readonly = repository_status_readonly(&main).unwrap();
-    let view = repository_ledger_view(&main).unwrap();
+    let view = &readonly;
     eprintln!("DEMOTED_ROWS_IN_EVENTS={demoted}");
     eprintln!("WRITABLE_STATUS code={:?}", writable.error_code);
     eprintln!("READONLY_STATUS code={:?}", readonly.error_code);

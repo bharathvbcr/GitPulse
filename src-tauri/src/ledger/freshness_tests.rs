@@ -25,8 +25,8 @@ fn repo_dir() -> (tempfile::TempDir, String) {
 }
 
 /// What an MCP surface serialises for the ledger of `repo` at `now_ms`.
-fn view_at(repo: &str, now_ms: u64) -> LedgerView {
-    LedgerView::from_readonly(status_readonly(repo), freshness_readonly_at(repo, now_ms))
+fn view_at(repo: &str, now_ms: u64) -> LedgerStatus {
+    status_readonly_at(repo, now_ms)
 }
 
 fn minutes(n: u64) -> u64 {
@@ -183,9 +183,7 @@ fn a_read_only_open_is_readable_never_recording_in_the_mcp_view() {
     let (_dir, repo) = repo_dir();
     append(draft(&repo)).unwrap();
 
-    // The base status says the file opened; the view must not call that
-    // recording.
-    assert!(status_readonly(&repo).recording, "base status semantics");
+    // The file opened, which is not recording.
     let view = view_at(&repo, ids::now_millis());
 
     assert!(

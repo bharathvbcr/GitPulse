@@ -112,6 +112,24 @@ describe("check:types coverage contract", () => {
     );
   });
 
+  it("holds a flattened struct's fields to the outer struct's TS twin", async () => {
+    const ledger = CONTRACTS.find((c) => c.label === "ledger");
+    expect(ledger?.flattenFrom, "LedgerStatus flattens Freshness").toBeTruthy();
+    const ok = runTypeCheck(ledger!);
+    expect(ok.violations).toEqual([]);
+
+    const freshnessCopy = await scratchCopy(ledger!.flattenFrom!, "flatten-rename");
+    const source = await readFile(freshnessCopy, "utf8");
+    await writeFile(freshnessCopy, source.replace("pub stale_reason: String,", "pub stale_why: String,"));
+    const drifted = runTypeCheck({ ...ledger!, flattenFrom: freshnessCopy });
+    expect(drifted.violations.join("\n")).toMatch(
+      /LedgerStatus\.stale_why exists in Rust but has no TS property/,
+    );
+    expect(drifted.violations.join("\n")).toMatch(
+      /LedgerStatus\.stale_reason exists in TS but Rust never sends it/,
+    );
+  });
+
   it("fails when a Rust field is renamed away from its TS twin", async () => {
     const rustCopy = await scratchCopy(DEFAULT_RUST_SOURCE, "rust-rename");
     const source = await readFile(rustCopy, "utf8");

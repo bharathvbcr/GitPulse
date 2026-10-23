@@ -197,12 +197,15 @@ pub(crate) fn repository_status(repo_path: &str) -> Result<super::LedgerStatus, 
     match super::consolidate_worktree_ledgers(&family.address.anchor, &family.members) {
         Ok(_) => {
             let mut status = super::status(&family.address.anchor);
-            note_history_only_bindings(&mut status, &family.address.anchor);
+            status.history_only_bindings =
+                super::history_only_binding_count(&family.address.anchor).unwrap_or(0);
+            note_history_only_bindings(&mut status);
             Ok(status)
         }
         Err(error) => {
             let mut status = super::status(&family.address.anchor);
             status.recording = false;
+            status.recording_state = super::STATE_UNKNOWN.to_string();
             status.error = format!("legacy worktree ledger could not be consolidated: {error}");
             status.error_code = "legacy_migration_failed".to_string();
             Ok(status)
@@ -243,11 +246,11 @@ fn readonly_status_of(family: &FamilyAddress) -> super::LedgerStatus {
     // A repository whose siblings still carry pre-consolidation ledgers has
     // rows this read cannot see. Saying so beats silently under-reporting, and
     // beats running the migration from a read to make the number right.
-    if status.recording && legacy_unconsolidated(family) {
+    if status.recording_state == super::STATE_READABLE && legacy_unconsolidated(family) {
         status.error = LEGACY_UNCONSOLIDATED_MESSAGE.to_string();
         status.error_code = LEGACY_UNCONSOLIDATED_CODE.to_string();
     }
-    note_history_only_bindings(&mut status, &family.address.anchor);
+    note_history_only_bindings(&mut status);
     status
 }
 
@@ -259,13 +262,14 @@ pub(crate) const HISTORY_ONLY_BINDINGS_CODE: &str = "binding_rows_history_only";
 ///
 /// The error slot takes the notice when it is free or holds only the
 /// legacy-unconsolidated caveat (which the message then keeps); a real failure
-/// keeps the slot. The MCP view carries the count in its own field
-/// (`LedgerView::history_only_bindings`), so it also reaches that surface next to
-/// a failure; `LedgerStatus` has no such field.
-fn note_history_only_bindings(status: &mut super::LedgerStatus, anchor: &str) {
-    let Some(count @ 1..) = super::history_only_binding_count(anchor) else {
+/// keeps the slot. The count is also its own field
+/// (`LedgerStatus::history_only_bindings`, set by the caller), so it reaches
+/// every surface next to a failure.
+fn note_history_only_bindings(status: &mut super::LedgerStatus) {
+    let count = status.history_only_bindings;
+    if count == 0 {
         return;
-    };
+    }
     let notice = format!(
         "{count} bind/unbind row(s) written by sibling worktrees were kept as history only: \
          only GitPulse and the bind/unbind commands writing the primary ledger can set a \
@@ -282,17 +286,6 @@ fn note_history_only_bindings(status: &mut super::LedgerStatus, anchor: &str) {
         }
         _ => {}
     }
-}
-
-/// [`repository_status_readonly`] as an MCP surface reports it: a
-/// [`super::LedgerView`] (never `recording`, scoped `dropped`) with the
-/// ledger's freshness, from one family resolution.
-pub(crate) fn repository_ledger_view(repo_path: &str) -> Result<super::LedgerView, LedgerError> {
-    let family = resolve_address(repo_path, repo_path)?;
-    let status = readonly_status_of(&family);
-    let freshness = super::freshness_readonly(&family.address.anchor);
-    Ok(super::LedgerView::from_readonly(status, freshness)
-        .with_history_only_bindings(&family.address.anchor))
 }
 
 /// The `error_code` of a read that cannot see rows a sibling worktree's own

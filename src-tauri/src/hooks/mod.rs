@@ -1692,6 +1692,18 @@ pub fn session_brief(snapshot: &InsightsSnapshot, here: &str, source: &str) -> S
             } else {
                 "recording".to_string()
             }
+        } else if snapshot.ledger.recording_state == crate::ledger::STATE_READABLE {
+            // The snapshot is a read, so a healthy ledger is "readable", never
+            // "recording" (nothing here writes) and never "NOT recording" (it
+            // opened fine). Freshness says how much to trust what it holds.
+            format!(
+                "readable (this session only reads it; {})",
+                if snapshot.ledger.freshness.stale {
+                    or_unknown(&snapshot.ledger.freshness.stale_reason)
+                } else {
+                    "a catch-up ran recently".to_string()
+                }
+            )
         } else {
             format!("NOT recording ({})", or_unknown(&snapshot.ledger.error))
         }
@@ -2331,11 +2343,15 @@ mod tests {
             }]),
             ledger: LedgerStatus {
                 recording: true,
+                recording_state: "recording".to_string(),
                 path: "/repo/.gitpulse/ledger.sqlite".to_string(),
                 dropped: 0,
+                dropped_scope: "this_process".to_string(),
                 catch_up_failures: 0,
+                history_only_bindings: 0,
                 error: String::new(),
                 error_code: String::new(),
+                freshness: Default::default(),
             },
             codeintel: CodeintelStatus {
                 available: true,
@@ -4296,6 +4312,49 @@ done
         assert!(
             !brief.contains("uncommitted here: 0 file(s)"),
             "a facet that did not run must never be briefed as a zero"
+        );
+    }
+
+    #[test]
+    fn a_read_only_ledger_is_briefed_as_readable_not_as_not_recording_or_recording() {
+        let mut snapshot = snapshot_fixture();
+        snapshot.ledger.recording = false;
+        snapshot.ledger.recording_state = "readable".to_string();
+        snapshot.ledger.freshness.stale = true;
+        snapshot.ledger.freshness.stale_reason = "no catch-up newer than 600s".to_string();
+
+        let stale = session_brief(&snapshot, "/repo", "startup");
+        assert!(
+            stale.contains(
+                "ledger: readable (this session only reads it; no catch-up newer than 600s)"
+            ),
+            "{stale}"
+        );
+        assert!(!stale.contains("NOT recording"), "{stale}");
+        assert!(!stale.contains("ledger: recording"), "{stale}");
+
+        snapshot.ledger.freshness.stale = false;
+        snapshot.ledger.freshness.stale_reason = String::new();
+        let fresh = session_brief(&snapshot, "/repo", "startup");
+        assert!(
+            fresh
+                .contains("ledger: readable (this session only reads it; a catch-up ran recently)"),
+            "{fresh}"
+        );
+        assert!(!fresh.contains("NOT recording"), "{fresh}");
+    }
+
+    #[test]
+    fn a_ledger_that_could_not_be_opened_is_still_briefed_as_not_recording() {
+        let mut snapshot = snapshot_fixture();
+        snapshot.ledger.recording = false;
+        snapshot.ledger.recording_state = "unknown".to_string();
+        snapshot.ledger.error = "no ledger in this repository yet".to_string();
+
+        let brief = session_brief(&snapshot, "/repo", "startup");
+        assert!(
+            brief.contains("ledger: NOT recording (no ledger in this repository yet)"),
+            "{brief}"
         );
     }
 

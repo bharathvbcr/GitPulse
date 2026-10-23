@@ -60,9 +60,8 @@ fn page_block(page: Value) -> Value {
 }
 
 fn surfaces(repo: &str) -> Value {
-    let tool = |name: &str| {
-        crate::mcp::handle_tool_call(name, &json!({ "repo_path": repo })).expect(name)
-    };
+    let tool =
+        |name: &str| crate::mcp::handle_tool_call(name, &json!({ "repo_path": repo })).expect(name);
     let facet = |name: &str| repo_facet(name, repo).expect(name);
     json!({
         "tool_insights_ledger": normalised(tool("gitpulse_insights")["ledger"].clone()),
