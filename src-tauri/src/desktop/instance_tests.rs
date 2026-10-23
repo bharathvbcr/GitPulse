@@ -530,6 +530,45 @@ fn a_broken_pipe_while_answering_a_real_request_is_refused_at_warn() {
     assert_eq!(ended.log_line().0, log::Level::Warn);
 }
 
+/// Adversarial review of W5-L3: the pre-lane shape of the broken-pipe test,
+/// where the PEER fully leaves (every descriptor of its end closes) after
+/// sending a whole frame. `peer_hung_up_silently` reads true for such a peer,
+/// so an ack failure routed through `Ended::before_first_frame` would be
+/// logged as a probe. The lane's rewritten test keeps the peer connected, so
+/// that recv answers `EAGAIN` and the same misrouting still reads as Refused.
+/// Can flake in a parallel run when a forking test holds a copy of the peer's
+/// descriptor (the reason the lane rewrote the original); it is the only
+/// shape that catches routing `answer`'s ack write through
+/// `Ended::before_first_frame` (shown: the rewritten test passes under it).
+#[test]
+fn a_full_frame_from_a_peer_that_then_left_is_refused_not_probed() {
+    let (mut server, client) = UnixStream::pair().unwrap();
+    // SAFETY: `getuid` has no preconditions.
+    let shared = Shared::new(unsafe { libc::getuid() });
+    let line = serde_json::to_string(&Envelope {
+        v: PROTOCOL,
+        request: Request::Reveal,
+    })
+    .unwrap();
+    let peer = std::thread::spawn(move || {
+        let mut writer = client.try_clone().unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        read_frame(&mut reader).unwrap().expect("greeting");
+        client.shutdown(std::net::Shutdown::Read).unwrap();
+        writer.write_all(format!("{line}\n").as_bytes()).unwrap();
+    });
+    let outcome = answer(&mut server, &shared);
+    peer.join().unwrap();
+    let Err(ended) = outcome else {
+        panic!("an unanswerable request is not a served one")
+    };
+    assert!(
+        matches!(&ended, Ended::Refused(reason) if reason.starts_with("write:")),
+        "{ended:?}"
+    );
+    assert_eq!(ended.log_line().0, log::Level::Warn);
+}
+
 #[test]
 fn a_valid_frame_is_handled_and_logs_nothing() {
     let (mut server, client) = UnixStream::pair().unwrap();

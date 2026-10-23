@@ -3095,6 +3095,73 @@ pub(crate) mod tests {
         std::fs::copy(template, &db).expect("clone the template store");
     }
 
+    /// Adversarial review of `install_empty_fixture_store` (W5-L3). A store
+    /// that one test writes to must not reach the template or a sibling clone.
+    #[test]
+    fn fixture_store_clones_do_not_share_writes() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        install_empty_fixture_store(a.path());
+        install_empty_fixture_store(b.path());
+        let (db_a, db_b) = (map_path(a.path()), map_path(b.path()));
+        let conn = rusqlite::Connection::open(&db_a).unwrap();
+        conn.execute(
+            "INSERT INTO paths (id, path) VALUES (1, 'only-in-a.rs')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let count = |db: &Path| -> i64 {
+            rusqlite::Connection::open(db)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM paths", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(count(&db_a), 1);
+        assert_eq!(count(&db_b), 0, "a sibling clone saw another test's write");
+        let c = tempfile::tempdir().unwrap();
+        install_empty_fixture_store(c.path());
+        assert_eq!(
+            count(&map_path(c.path())),
+            0,
+            "the template was written through"
+        );
+        assert_ne!(
+            std::fs::metadata(&db_a).unwrap().len(),
+            0,
+            "the clone is a real file"
+        );
+    }
+
+    /// Each fixture store should be its own store: `pending_state.epoch` is the
+    /// store identity ("a claim from one store must not acknowledge another's
+    /// identically named path"), minted by `randomblob` at migration time. A
+    /// clone of one template gives every fixture the SAME epoch, so a test
+    /// that seeds two parties cannot tell them apart by identity.
+    ///
+    /// FAILS on the lane (known break, low severity: nothing in GitPulse reads
+    /// the epoch of a fixture store today).
+    #[test]
+    fn fixture_stores_have_distinct_store_identities() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        install_empty_fixture_store(a.path());
+        install_empty_fixture_store(b.path());
+        let epoch = |repo: &Path| -> String {
+            rusqlite::Connection::open(map_path(repo))
+                .unwrap()
+                .query_row(
+                    "SELECT epoch FROM pending_state WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_ne!(
+            epoch(a.path()),
+            epoch(b.path()),
+            "two fixtures share one store epoch"
+        );
+    }
+
     /// One indexed symbol for [`seed_file_symbols`]: `(name, qualified_name,
     /// kind, first_line, last_line)`, lines 1-based and inclusive.
     pub(crate) type SeedSymbol<'a> = (&'a str, &'a str, &'a str, u32, u32);
