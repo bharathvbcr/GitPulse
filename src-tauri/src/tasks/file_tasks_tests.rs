@@ -600,3 +600,47 @@ fn priority_parse_matches_the_shared_corpus() {
         assert_eq!(got, want, "priority {input:?}");
     }
 }
+
+/// A name whose third byte from the end is inside a multi-byte character used
+/// to panic the whole scan on `name[name.len() - 3..]`.
+#[test]
+fn a_non_ascii_file_name_is_skipped_not_fatal() {
+    let dir = repo_with(&[
+        ("naïve", b"not a brief"),
+        ("ok.md", b"---\ntitle: T\n---\n"),
+        ("日ab", b"x"),
+        ("über.MD", b"---\ntitle: U\n---\n"),
+    ]);
+    let scan = scan(&dir);
+    assert_eq!(scan.found, 2, "{scan:?}");
+    assert_eq!(scan.files.len(), 2);
+}
+
+mod never_panics {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn an_arbitrary_file_name_never_panics_the_scan(raw in any::<String>()) {
+            let name: String = raw
+                .chars()
+                .filter(|c| !matches!(c, '/' | '\\' | '\0') && !c.is_control())
+                .take(40)
+                .collect();
+            prop_assume!(!name.is_empty() && name != "." && name != "..");
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("tasks")).unwrap();
+            // Some file systems refuse some names; refusal is not the property.
+            if std::fs::write(dir.path().join("tasks").join(&name), b"---\ntitle: T\n---\n").is_ok() {
+                let _ = scan_briefs(dir.path().to_str().unwrap(), None);
+            }
+        }
+    }
+}
