@@ -19,6 +19,7 @@
 use devmap_extract::model::{EdgeKind, Extraction};
 use devmap_resolve::model::{Resolution, ResolutionResult, ResolvedEdge, UnresolvedReference};
 use serde::{Deserialize, Serialize};
+use devmap_extract::wiring::is_vendored_path;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Permille rather than a float, and `Option` rather than a sentinel.
@@ -80,7 +81,10 @@ pub struct LanguageResolution {
     /// Of those, the ones that are explained rather than failed: `Builtin`,
     /// `HostGlobal`, `External`. See [`ResolutionRate::net_permille`].
     pub explained_sites: usize,
+    /// `None` when `extracts_calls` is false: a language with no call extractor
+    /// attributed no call, so a figure here would score missing work as perfect.
     pub gross_permille: Permille,
+    /// `None` when `extracts_calls` is false, for the same reason.
     pub net_permille: Permille,
 }
 
@@ -114,8 +118,46 @@ pub struct ResolutionRate {
     /// is something the kernel could in principle bind, to that declaration;
     /// excluding it would flatter a number whose whole purpose is to be
     /// ratcheted upward.
+    ///
+    /// Both corpus permille figures cover **measured** work only: languages
+    /// with a call extractor, outside vendored paths. The site counts above
+    /// stay raw totals so `unresolved_sites` keeps equalling
+    /// `unresolved_calls`, which the attribution-coverage disclosure checks.
     pub net_permille: Permille,
     pub by_language: BTreeMap<String, LanguageResolution>,
+    /// Attribution sites (resolved plus unresolved) in vendored files, per
+    /// `devmap_extract::wiring::is_vendored_path`. Counted in the totals,
+    /// absent from `by_language` and from both permille figures: a vendored
+    /// file is not this repository's code.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub vendored_sites: usize,
+    /// Grammar-read files under vendored paths.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub vendored_files: usize,
+    /// Attribution sites (resolved plus unresolved) in languages with no call
+    /// extractor. Counted in the totals, excluded from both permille figures.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub call_blind_sites: usize,
+    /// The headline's own counts: the sums over measured languages that
+    /// `net_permille` and `gross_permille` are computed from, so a reader can
+    /// reproduce them. `net = measured_resolved / (measured_resolved +
+    /// measured_unresolved - measured_explained)`. Absent or null reads as 0
+    /// on a row stored before they existed.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub measured_resolved_sites: usize,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub measured_unresolved_sites: usize,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub measured_explained_sites: usize,
+}
+
+/// An explicit `null` reads as the type's default, the same as an absent field.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// Structural edges are not attributions.
@@ -145,8 +187,9 @@ fn is_attribution(kind: EdgeKind) -> bool {
 fn resolved_sites_by_language<'a>(
     edges: &'a [ResolvedEdge],
     language_of: &HashMap<&str, &'a str>,
-) -> (usize, BTreeMap<String, usize>) {
+) -> (usize, BTreeMap<String, usize>, usize) {
     let mut total = 0usize;
+    let mut vendored = 0usize;
     let mut by_language: BTreeMap<String, usize> = BTreeMap::new();
     let mut seen_fanouts: HashSet<*const Resolution> = HashSet::new();
 
@@ -172,18 +215,32 @@ fn resolved_sites_by_language<'a>(
             }
         }
         total += 1;
+        if is_vendored_path(&edge.source_file) {
+            vendored += 1;
+            continue;
+        }
         let language = language_of
             .get(edge.source_file.as_str())
             .copied()
             .unwrap_or("unknown");
         *by_language.entry(language.to_string()).or_default() += 1;
     }
-    (total, by_language)
+    (total, by_language, vendored)
 }
 
 /// Whether this miss has affirmative evidence that no edge was ever findable.
 fn is_explained(row: &UnresolvedReference) -> bool {
     row.class.is_explained()
+}
+
+/// Whether a grammar (or notebook kernel) read the file, as opposed to prose
+/// and data formats that attempt no attribution.
+fn is_grammar_read(ext: &Extraction) -> bool {
+    matches!(
+        ext.engine,
+        devmap_extract::model::ExtractionEngine::TreeSitter { .. }
+            | devmap_extract::model::ExtractionEngine::Notebook { .. }
+    )
 }
 
 /// The key `ext` is reported under. See [`devmap_extract::languages::report_language`].
@@ -203,17 +260,22 @@ pub fn resolution_rate(
         .map(|ext| (ext.file_path.as_str(), reported(ext)))
         .collect();
 
-    let (resolved_sites, resolved_by_language) =
+    let (resolved_sites, resolved_by_language, vendored_resolved) =
         resolved_sites_by_language(&resolution.edges, &language_of);
 
     let mut unresolved_sites = 0usize;
     let mut explained_sites = 0usize;
+    let mut vendored_unresolved = 0usize;
     let mut unresolved_by_language: BTreeMap<String, (usize, usize)> = BTreeMap::new();
     for row in &resolution.unresolved {
         unresolved_sites += 1;
         let explained = is_explained(row);
         if explained {
             explained_sites += 1;
+        }
+        if is_vendored_path(&row.source_file) {
+            vendored_unresolved += 1;
+            continue;
         }
         let language = language_of
             .get(row.source_file.as_str())
@@ -256,13 +318,7 @@ pub fn resolution_rate(
 
     let mut present: std::collections::BTreeSet<String> = extractions
         .iter()
-        .filter(|ext| {
-            matches!(
-                ext.engine,
-                devmap_extract::model::ExtractionEngine::TreeSitter { .. }
-                    | devmap_extract::model::ExtractionEngine::Notebook { .. }
-            )
-        })
+        .filter(|ext| !is_vendored_path(&ext.file_path) && is_grammar_read(ext))
         .map(|ext| reported(ext).to_string())
         .collect();
     present.extend(resolved_by_language.keys().cloned());
@@ -295,22 +351,51 @@ pub fn resolution_rate(
                 resolved_sites: resolved,
                 unresolved_sites: unresolved,
                 explained_sites: explained,
-                gross_permille: permille(resolved, resolved + unresolved),
-                net_permille: permille(resolved, resolved + unresolved.saturating_sub(explained)),
+                gross_permille: extracts_calls
+                    .then(|| permille(resolved, resolved + unresolved))
+                    .flatten(),
+                net_permille: extracts_calls
+                    .then(|| permille(resolved, resolved + unresolved.saturating_sub(explained)))
+                    .flatten(),
             },
         );
+    }
+
+    let vendored_files = extractions
+        .iter()
+        .filter(|ext| is_vendored_path(&ext.file_path) && is_grammar_read(ext))
+        .count();
+
+    // The headline is the sum of the measured rows, so it cannot disagree with
+    // the breakdown beneath it.
+    let (mut measured_resolved, mut measured_unresolved, mut measured_explained) = (0, 0, 0);
+    let mut call_blind_sites = 0usize;
+    for row in by_language.values() {
+        if row.extracts_calls {
+            measured_resolved += row.resolved_sites;
+            measured_unresolved += row.unresolved_sites;
+            measured_explained += row.explained_sites;
+        } else {
+            call_blind_sites += row.resolved_sites + row.unresolved_sites;
+        }
     }
 
     ResolutionRate {
         resolved_sites,
         unresolved_sites,
         explained_sites,
-        gross_permille: permille(resolved_sites, resolved_sites + unresolved_sites),
+        gross_permille: permille(measured_resolved, measured_resolved + measured_unresolved),
         net_permille: permille(
-            resolved_sites,
-            resolved_sites + unresolved_sites.saturating_sub(explained_sites),
+            measured_resolved,
+            measured_resolved + measured_unresolved.saturating_sub(measured_explained),
         ),
         by_language,
+        vendored_sites: vendored_resolved + vendored_unresolved,
+        vendored_files,
+        call_blind_sites,
+        measured_resolved_sites: measured_resolved,
+        measured_unresolved_sites: measured_unresolved,
+        measured_explained_sites: measured_explained,
     }
 }
 

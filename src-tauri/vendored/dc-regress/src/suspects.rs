@@ -254,6 +254,14 @@ pub fn suspects_bounded<G: CodeGraph>(
             continue;
         }
 
+        if let crate::BlobIdentity::Unreadable { reason } = &spans_basis {
+            unavailable.push(Unavailable::BlameRefused {
+                path: (*file).to_string(),
+                reason: reason.clone(),
+            });
+            continue;
+        }
+
         let resolved = match blobs.read(&until_oid, file) {
             Ok(resolved) => resolved,
             Err(refusal) => {

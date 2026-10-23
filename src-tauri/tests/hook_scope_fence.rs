@@ -50,6 +50,9 @@
 // store, rewritten before `main`. See `src/test_support/env.rs`.
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
+// dc-store schema 10 retired the `tasks` table; a task is a workbench item.
+#[path = "../src/test_support/plant_task.rs"]
+mod plant_task;
 
 use gitpulse_lib::procguard::LockedSpawn;
 use std::io::Write;
@@ -135,16 +138,12 @@ fn a_task_bound_session_cannot_write_outside_its_plan_through_any_tool() {
     gitpulse_lib::repository_trust::grant(repo, &preview.identity, true).expect("trust");
     let db = gitpulse_lib::tasks::store_path(repo);
     std::fs::create_dir_all(db.parent().unwrap()).unwrap();
-    dc_store::Store::open(&db)
-        .expect("task store")
-        .connection()
-        .execute(
-            "INSERT INTO tasks (id, title, description, planned_files_json, status)
-             VALUES ('TASK-FENCE', 'Fence', '',
-                 '[{\"path\":\"src/planned.rs\",\"allowed_change\":\"modify\"}]', 'in_progress')",
-            [],
-        )
-        .expect("task row");
+    plant_task::plant(
+        &dc_store::Store::open(&db).expect("task store"),
+        "TASK-FENCE",
+        "in_progress",
+        r#"{"planned_files":[{"path":"src/planned.rs","allowed_change":"modify"}]}"#,
+    );
     gitpulse_lib::ledger::bindings::bind(repo, repo, "TASK-FENCE").expect("bind");
 
     let bash = |command: &str| {

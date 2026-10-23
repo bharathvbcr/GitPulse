@@ -3264,15 +3264,12 @@ done
             let db = crate::tasks::store_path(&repo);
             std::fs::create_dir_all(db.parent().expect("store parent")).expect("store dir");
             let store = dc_store::Store::open(&db).expect("task store");
-            store
-                .connection()
-                .execute(
-                    "INSERT INTO tasks (id, title, description, planned_files_json, status)
-                     VALUES ('TASK-HOOK', 'Hook scope', '',
-                         '[{\"path\":\"src/planned.rs\",\"allowed_change\":\"modify\"}]', 'in_progress')",
-                    [],
-                )
-                .expect("task row");
+            crate::tasks::plant_task::plant(
+                &store,
+                "TASK-HOOK",
+                "in_progress",
+                r#"{"planned_files":[{"path":"src/planned.rs","allowed_change":"modify"}]}"#,
+            );
             crate::ledger::bindings::bind(&repo, &repo, "TASK-HOOK").expect("bind");
         }
         let requests = dir.path().join("requests.ndjson");

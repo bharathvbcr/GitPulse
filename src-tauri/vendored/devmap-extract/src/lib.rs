@@ -829,6 +829,11 @@ pub struct BudgetRetryReport {
     /// Refused files never re-run: past [`treesitter::MAX_BUDGET_RETRIES`], or
     /// the retry was cancelled first. They stay refused.
     pub not_retried: usize,
+    /// Of `not_retried`, files skipped because the build was cancelled, not
+    /// because the retry cap was reached. Non-zero means the result is
+    /// incomplete at the caller's own request and must not be committed as a
+    /// finished build; see [`BuildCancelled`].
+    pub cancelled: usize,
     /// Files refused for budget in the final result: `first_pass_refused -
     /// recovered`. The number to alarm on.
     pub still_refused_total: usize,
@@ -838,14 +843,41 @@ pub struct BudgetRetryReport {
 
 #[cfg(feature = "parse")]
 impl BudgetRetryReport {
+    /// Whether the retry stopped early because the build was cancelled.
+    pub fn was_cancelled(&self) -> bool {
+        self.cancelled > 0
+    }
+
     /// Whether `still_refused` names every still-refused file.
     pub fn names_all(&self) -> bool {
         self.still_refused.len() == self.still_refused_total
     }
 }
 
+/// A build stopped because its caller cancelled it (Ctrl-C, daemon shutdown).
+///
+/// The extractions of a cancelled build are incomplete, so a caller that sees
+/// this must not persist a generation from them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildCancelled;
+
+impl std::fmt::Display for BuildCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "build was cancelled before extraction finished; no generation was written"
+        )
+    }
+}
+
+impl std::error::Error for BuildCancelled {}
+
 /// [`extract_all_with_progress`] with explicit budgets, a cancellation flag
 /// for the retry, and the retry's report.
+///
+/// Only the serial retry observes `cancel`: the parallel pass runs every file
+/// regardless, each bounded by `budgets.first_pass`, so its worst case is that
+/// budget times the files per core rather than the retry's serial sum.
 ///
 /// Pass one is the parallel extraction under `budgets.first_pass`. Pass two,
 /// [`retry_budget_refusals`], re-runs serially every file pass one refused for
@@ -878,6 +910,11 @@ pub fn extract_all_with_budgets(
     (extractions, report)
 }
 
+/// [`retry_budget_refusals`] with a callback after each re-run file, given its
+/// index. The seam lets a caller (or a test) act at a deterministic point of
+/// the serial retry, such as tripping `cancel` after the Nth file, without
+/// racing a real parse's wall time.
+///
 /// Re-run, serially and under `budgets.retry`, every file whose extraction was
 /// refused for budget, replacing that extraction in place.
 ///
@@ -893,12 +930,13 @@ pub fn extract_all_with_budgets(
 /// `progress` is given, every budget-refused file is counted here (the first
 /// pass withholds it), as failed only if it is still refused.
 #[cfg(feature = "parse")]
-pub fn retry_budget_refusals(
+pub fn retry_budget_refusals_observing(
     files: &[FileRef],
     extractions: &mut [Extraction],
     progress: Option<&progress::FileProgress>,
     budgets: ParseBudgets,
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    after_retry: &mut dyn FnMut(usize),
 ) -> BudgetRetryReport {
     debug_assert_eq!(files.len(), extractions.len());
     let refused: Vec<usize> = extractions
@@ -915,20 +953,25 @@ pub fn retry_budget_refusals(
         let cancelled = cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
         // What the final reason says happened after the first pass, so a
         // reader of `parse_failed` can tell the three refusals apart.
-        let verdict = if cancelled {
-            report.not_retried += 1;
-            "; not retried: the build was cancelled before the serial retry reached this file"
-                .to_string()
-        } else if report.retried >= treesitter::MAX_BUDGET_RETRIES {
+        // The cap is decided first: a file past it was never going to be
+        // retried, so a cancel arriving after the last slot was used must not
+        // turn it into a cancelled file and discard a finished build.
+        let verdict = if report.retried >= treesitter::MAX_BUDGET_RETRIES {
             report.not_retried += 1;
             format!(
                 "; not retried: more than {} files were refused for budget, the cap on serial retries",
                 treesitter::MAX_BUDGET_RETRIES
             )
+        } else if cancelled {
+            report.not_retried += 1;
+            report.cancelled += 1;
+            "; not retried: the build was cancelled before the serial retry reached this file"
+                .to_string()
         } else {
             report.retried += 1;
             let file = &files[index];
             extractions[index] = extract_file_with_budget(file.path, file.source, budgets.retry);
+            after_retry(index);
             if !extractions[index].is_budget_refusal() {
                 report.recovered += 1;
             }
@@ -963,6 +1006,19 @@ pub fn retry_budget_refusals(
         });
     }
     report
+}
+
+/// Re-run, serially and under `budgets.retry`, every budget-refused file; see
+/// [`retry_budget_refusals_observing`] for the semantics.
+#[cfg(feature = "parse")]
+pub fn retry_budget_refusals(
+    files: &[FileRef],
+    extractions: &mut [Extraction],
+    progress: Option<&progress::FileProgress>,
+    budgets: ParseBudgets,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> BudgetRetryReport {
+    retry_budget_refusals_observing(files, extractions, progress, budgets, cancel, &mut |_| {})
 }
 
 #[cfg(test)]

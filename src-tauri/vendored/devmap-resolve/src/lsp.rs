@@ -236,12 +236,12 @@ pub fn location_byte_in_source(source: &str, line: u32, character: u32) -> usize
 /// Turning a site into an LSP position used to count newlines in everything
 /// before it, once per site — quadratic in a file with many unresolved sites.
 /// With the index it is a binary search plus the width of the one line.
-struct LineIndex {
+pub struct LineIndex {
     starts: Vec<usize>,
 }
 
 impl LineIndex {
-    fn new(source: &str) -> Self {
+    pub fn new(source: &str) -> Self {
         let mut starts = vec![0];
         starts.extend(
             source
@@ -255,7 +255,7 @@ impl LineIndex {
 
     /// The zero-based line and UTF-16 column of `byte`, clamped to the source
     /// and moved back to the nearest character boundary.
-    fn position(&self, source: &str, byte: usize) -> (u32, u32) {
+    pub fn position(&self, source: &str, byte: usize) -> (u32, u32) {
         let mut byte = byte.min(source.len());
         while !source.is_char_boundary(byte) {
             byte -= 1;
@@ -812,8 +812,174 @@ struct LspClient {
     next_id: u64,
     server_version: Option<String>,
     deadline: Instant,
+    /// How long one request waits for its reply before the session is killed.
+    request_budget: Duration,
     open_files: BTreeSet<String>,
     repo_root: PathBuf,
+}
+
+/// How a session differs from the build pass's. The default is the build
+/// pass: [`LSP_REQUEST_BUDGET`], no server options, no status notifications.
+#[derive(Debug, Clone)]
+pub struct LspSessionOptions {
+    /// Per-request reply deadline, also bounding `initialize`.
+    pub request_budget: Duration,
+    /// Sent as `initializationOptions`, for a server that reads its settings
+    /// there (rust-analyzer's `cargo.targetDir`, for one).
+    pub initialization_options: Option<Value>,
+    /// Declare `experimental/serverStatus`, so [`LspSession::wait_quiescent`]
+    /// can tell a finished load from one still running.
+    pub server_status: bool,
+}
+
+impl Default for LspSessionOptions {
+    fn default() -> Self {
+        Self {
+            request_budget: LSP_REQUEST_BUDGET,
+            initialization_options: None,
+            server_status: false,
+        }
+    }
+}
+
+/// The question put to a server about the symbol at a position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LspQuery {
+    Definition,
+    Implementation,
+    /// Where an item is declared, as opposed to defined: for a trait
+    /// implementation's method, the trait's own method.
+    Declaration,
+}
+
+impl LspQuery {
+    fn method(self) -> &'static str {
+        match self {
+            LspQuery::Definition => "textDocument/definition",
+            LspQuery::Implementation => "textDocument/implementation",
+            LspQuery::Declaration => "textDocument/declaration",
+        }
+    }
+}
+
+/// A server's answer to one [`LspQuery`]: the in-repository locations, and how
+/// many it named that were dropped. An empty answer with `outside_repo > 0` is
+/// "defined elsewhere"; an empty answer with neither is "no answer".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LspAnswer {
+    pub locations: Vec<LspLocation>,
+    pub undecodable: usize,
+    pub outside_repo: usize,
+}
+
+/// What a server's last `experimental/serverStatus` said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspServerHealth {
+    pub health: String,
+    pub message: Option<String>,
+}
+
+/// One language-server session for a tool that asks about positions itself
+/// rather than about the resolver's unresolved ledger. It is the build pass's
+/// own client (same framing, caps, process-group kill), so there is one owner
+/// of the wire protocol.
+pub struct LspSession {
+    client: LspClient,
+}
+
+impl LspSession {
+    /// Start `binary` for `spec` in `repo_root` and complete the handshake
+    /// within `deadline`.
+    pub fn start(
+        spec: &LspServerSpec,
+        binary: &Path,
+        repo_root: &Path,
+        deadline: Instant,
+        options: &LspSessionOptions,
+    ) -> Result<Self, LspDidNotRun> {
+        LspClient::spawn_with(spec, binary, repo_root, deadline, options)
+            .map(|client| Self { client })
+    }
+
+    /// The server's own `name version`, or `unknown`.
+    pub fn server_version(&self) -> Option<&str> {
+        self.client.server_version.as_deref()
+    }
+
+    /// False once any bound ended the session: a timeout, an exit, an
+    /// oversized or malformed frame, or [`LspSession::shutdown`]. A JSON-RPC
+    /// error reply to one request leaves it usable.
+    pub fn is_usable(&self) -> bool {
+        self.client.outgoing.is_some()
+    }
+
+    /// Block until the server reports `quiescent: true`, or `deadline`.
+    /// Needs [`LspSessionOptions::server_status`].
+    pub fn wait_quiescent(&mut self, deadline: Instant) -> Result<LspServerHealth, LspDidNotRun> {
+        let deadline = deadline.min(self.client.deadline);
+        loop {
+            let message = self.client.read_message(deadline)?;
+            if message.get("method").and_then(Value::as_str) != Some("experimental/serverStatus") {
+                continue;
+            }
+            let params = message.get("params");
+            if params
+                .and_then(|p| p.get("quiescent"))
+                .and_then(Value::as_bool)
+                != Some(true)
+            {
+                continue;
+            }
+            let text = |key: &str| {
+                params
+                    .and_then(|p| p.get(key))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            };
+            return Ok(LspServerHealth {
+                health: text("health").unwrap_or_else(|| "unknown".into()),
+                message: text("message"),
+            });
+        }
+    }
+
+    /// Ask `query` at the zero-based `line` and UTF-16 `character` of
+    /// `relative`, whose text is `source`.
+    pub fn query(
+        &mut self,
+        query: LspQuery,
+        relative: &str,
+        source: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<LspAnswer, LspDidNotRun> {
+        let uri =
+            uri_for_repo_file(&self.client.repo_root, relative).map_err(LspDidNotRun::Protocol)?;
+        let (locations, drops) = self
+            .client
+            .locate(query, relative, &uri, source, line, character)?;
+        Ok(LspAnswer {
+            locations,
+            undecodable: drops.undecodable,
+            outside_repo: drops.outside_repo,
+        })
+    }
+
+    /// End the session: `shutdown`, `exit`, then the process group.
+    pub fn shutdown(&mut self) {
+        let _ = self.client.shutdown();
+    }
+}
+
+/// Where `name` is on `path_var`, refused when it is inside `repo_root` (see
+/// [`which_binary`]), for a caller that starts a server through
+/// [`LspSession`].
+pub fn find_server_binary(
+    name: &str,
+    path_var: Option<&std::ffi::OsStr>,
+    repo_root: &Path,
+) -> Result<PathBuf, LspDidNotRun> {
+    which_binary(name, path_var, repo_root)
 }
 
 /// One frame from `reader`: headers, then a body of at most
@@ -874,6 +1040,22 @@ impl LspClient {
         repo_root: &Path,
         deadline: Instant,
     ) -> Result<Self, LspDidNotRun> {
+        Self::spawn_with(
+            spec,
+            binary,
+            repo_root,
+            deadline,
+            &LspSessionOptions::default(),
+        )
+    }
+
+    fn spawn_with(
+        spec: &LspServerSpec,
+        binary: &Path,
+        repo_root: &Path,
+        deadline: Instant,
+        options: &LspSessionOptions,
+    ) -> Result<Self, LspDidNotRun> {
         let mut command = subprocess::session_command(binary);
         command.args(spec.args).current_dir(repo_root);
         let spawn_budget = deadline.saturating_duration_since(Instant::now());
@@ -928,21 +1110,29 @@ impl LspClient {
             next_id: 1,
             server_version: None,
             deadline,
+            request_budget: options.request_budget,
             open_files: BTreeSet::new(),
             repo_root,
         };
-        let init = client.request(
-            "initialize",
-            json!({
-                "processId": std::process::id(),
-                "rootUri": root_uri,
-                "capabilities": {
-                    "textDocument": {
-                        "definition": { "linkSupport": false }
-                    }
-                }
-            }),
-        )?;
+        let mut capabilities = json!({
+            "textDocument": {
+                "definition": { "linkSupport": false },
+                "implementation": { "linkSupport": false },
+                "declaration": { "linkSupport": false }
+            }
+        });
+        if options.server_status {
+            capabilities["experimental"] = json!({ "serverStatusNotification": true });
+        }
+        let mut params = json!({
+            "processId": std::process::id(),
+            "rootUri": root_uri,
+            "capabilities": capabilities,
+        });
+        if let Some(initialization_options) = &options.initialization_options {
+            params["initializationOptions"] = initialization_options.clone();
+        }
+        let init = client.request("initialize", params)?;
         if let Some(server_info) = init.get("serverInfo") {
             let name = server_info
                 .get("name")
@@ -971,6 +1161,18 @@ impl LspClient {
         line: u32,
         character: u32,
     ) -> Result<(Vec<LspLocation>, LocationDrops), LspDidNotRun> {
+        self.locate(LspQuery::Definition, relative, uri, source, line, character)
+    }
+
+    fn locate(
+        &mut self,
+        query: LspQuery,
+        relative: &str,
+        uri: &str,
+        source: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<(Vec<LspLocation>, LocationDrops), LspDidNotRun> {
         if !self.open_files.contains(relative) {
             self.notify(
                 "textDocument/didOpen",
@@ -986,7 +1188,7 @@ impl LspClient {
             self.open_files.insert(relative.to_string());
         }
         let result = self.request(
-            "textDocument/definition",
+            query.method(),
             json!({
                 "textDocument": { "uri": uri },
                 "position": { "line": line, "character": character }
@@ -1023,7 +1225,7 @@ impl LspClient {
         });
         self.write_message(&payload)?;
         let request_deadline = Instant::now()
-            .checked_add(LSP_REQUEST_BUDGET)
+            .checked_add(self.request_budget)
             .unwrap_or(self.deadline)
             .min(self.deadline);
         loop {
@@ -1852,7 +2054,7 @@ mod session_bounds {
     /// and answers each with one location in the URI `$2`, at line 0
     /// character 3. Bodies are read with `dd bs=1`, which never reads past
     /// the frame the way a buffered `head -c` can.
-    const FAKE_SERVER: &str = r#"#!/bin/sh
+    pub(super) const FAKE_SERVER: &str = r#"#!/bin/sh
 log="$1"
 answer="$2"
 while :; do
@@ -1877,6 +2079,8 @@ while :; do
       c=$(printf '%s' "$body" | sed -n 's/.*"character":\([0-9][0-9]*\).*/\1/p')
       printf '%s:%s\n' "$l" "$c" >> "$log"
       result='[{"uri":"'"$answer"'","range":{"start":{"line":0,"character":3},"end":{"line":0,"character":9}}}]' ;;
+    *'"method":"textDocument/implementation"'*)
+      result='[{"uri":"'"$answer"'","range":{"start":{"line":5,"character":1},"end":{"line":5,"character":4}}},{"uri":"file:///nowhere/else.rs","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}]' ;;
     *) result='null' ;;
   esac
   resp='{"jsonrpc":"2.0","id":'"$id"',"result":'"$result"'}'
@@ -1980,5 +2184,181 @@ done
                 .any(|edge| edge.target_file == "main.rs" && edge.target_symbol == "target"),
             "{lsp_edges:?}"
         );
+    }
+}
+
+/// The session API a dev-only labeller drives (`rust/tools/rustlabel`). Every
+/// case here is a fake server in `sh`, so none needs a language server.
+#[cfg(all(test, unix))]
+mod labelling_session {
+    use super::*;
+
+    fn leak(text: String) -> &'static str {
+        Box::leak(text.into_boxed_str())
+    }
+
+    fn sh_spec(script: &str) -> LspServerSpec {
+        LspServerSpec {
+            binary: "sh",
+            args: Box::leak(vec!["-c", leak(script.to_string())].into_boxed_slice()),
+            extensions: &[".rs"],
+        }
+    }
+
+    /// Answers `initialize`, then reports the two `experimental/serverStatus`
+    /// states a loading server goes through, then reads forever.
+    fn status_script(final_state: Option<&str>) -> String {
+        let last = final_state.map_or(String::new(), |state| {
+            format!("\"$(printf '%s' '{state}')\"")
+        });
+        format!(
+            r#"
+init='{{"jsonrpc":"2.0","id":1,"result":{{"serverInfo":{{"name":"fake","version":"1"}}}}}}'
+busy='{{"jsonrpc":"2.0","method":"experimental/serverStatus","params":{{"health":"ok","quiescent":false,"message":"loading"}}}}'
+for body in "$init" "$busy" {last}; do
+  printf 'Content-Length: %s\r\n\r\n%s' "${{#body}}" "$body"
+done
+cat > /dev/null
+"#
+        )
+    }
+
+    const QUIESCENT: &str = r#"{"jsonrpc":"2.0","method":"experimental/serverStatus","params":{"health":"warning","quiescent":true,"message":"proc macros off"}}"#;
+
+    /// A server that reads everything and never answers: the session's own
+    /// per-request budget, not the build pass's eight seconds, must end it.
+    #[test]
+    fn a_session_request_budget_shorter_than_the_default_ends_a_silent_server() {
+        let options = LspSessionOptions {
+            request_budget: Duration::from_millis(300),
+            ..LspSessionOptions::default()
+        };
+        let started = Instant::now();
+        let result = LspSession::start(
+            &sh_spec("cat > /dev/null"),
+            Path::new("sh"),
+            &std::env::temp_dir(),
+            started + Duration::from_secs(60),
+            &options,
+        );
+        assert!(
+            matches!(result, Err(LspDidNotRun::TimedOut)),
+            "got {:?}",
+            result.err()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "took {:?} against a 300ms request budget",
+            started.elapsed()
+        );
+    }
+
+    /// `experimental/serverStatus` with `quiescent: true` is how rust-analyzer
+    /// says it has finished loading; a definition asked before it is a guess.
+    #[test]
+    fn a_session_waits_for_the_server_to_report_quiescence() {
+        let options = LspSessionOptions {
+            server_status: true,
+            ..LspSessionOptions::default()
+        };
+        let mut session = LspSession::start(
+            &sh_spec(&status_script(Some(QUIESCENT))),
+            Path::new("sh"),
+            &std::env::temp_dir(),
+            Instant::now() + Duration::from_secs(10),
+            &options,
+        )
+        .unwrap_or_else(|e| panic!("initialize was answered: {e:?}"));
+        assert_eq!(session.server_version(), Some("fake 1"));
+        let status = session
+            .wait_quiescent(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(status.health, "warning");
+        assert_eq!(status.message.as_deref(), Some("proc macros off"));
+        session.shutdown();
+        assert!(!session.is_usable());
+    }
+
+    /// A server that announces `quiescent: false` and never `true` is a load
+    /// that did not finish; the wait must say so at its own deadline.
+    #[test]
+    fn waiting_for_quiescence_is_bounded() {
+        let mut session = LspSession::start(
+            &sh_spec(&status_script(None)),
+            Path::new("sh"),
+            &std::env::temp_dir(),
+            Instant::now() + Duration::from_secs(10),
+            &LspSessionOptions {
+                server_status: true,
+                ..LspSessionOptions::default()
+            },
+        )
+        .unwrap();
+        let started = Instant::now();
+        let result = session.wait_quiescent(started + Duration::from_millis(400));
+        assert!(
+            matches!(result, Err(LspDidNotRun::TimedOut)),
+            "got {result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(!session.is_usable(), "a timed-out session is killed");
+    }
+
+    /// Definition and implementation are separate questions with separate
+    /// answers, and a location outside the repository is counted, not lost.
+    #[test]
+    fn a_session_asks_definition_and_implementation_and_counts_outside_locations() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = super::uris_and_positions::Scratch::new("labelling");
+        let root = scratch.0.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let server = scratch.0.join("fake-lsp");
+        std::fs::write(&server, super::session_bounds::FAKE_SERVER).unwrap();
+        std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let source = "fn a() {}\nfn b() { a(); }\n";
+        std::fs::write(root.join("main.rs"), source).unwrap();
+        let log = scratch.0.join("asked.log");
+        let inside = file_uri(&root.canonicalize().unwrap().join("main.rs")).unwrap();
+        let spec = LspServerSpec {
+            binary: "fake-lsp",
+            args: Box::leak(vec![leak(log.display().to_string()), leak(inside)].into_boxed_slice()),
+            extensions: &[".rs"],
+        };
+        let mut session = LspSession::start(
+            &spec,
+            &server,
+            &root,
+            Instant::now() + Duration::from_secs(20),
+            &LspSessionOptions::default(),
+        )
+        .unwrap_or_else(|e| panic!("initialize was answered: {e:?}"));
+
+        let definition = session
+            .query(LspQuery::Definition, "main.rs", source, 1, 11)
+            .unwrap();
+        assert_eq!(
+            definition.locations,
+            vec![LspLocation {
+                file: "main.rs".into(),
+                line: 0,
+                character: 3
+            }]
+        );
+        assert_eq!((definition.undecodable, definition.outside_repo), (0, 0));
+
+        let implementation = session
+            .query(LspQuery::Implementation, "main.rs", source, 0, 3)
+            .unwrap();
+        assert_eq!(implementation.locations.len(), 1, "{implementation:?}");
+        assert_eq!(implementation.outside_repo, 1, "{implementation:?}");
+
+        // The fake server has nothing to say about declarations: the request
+        // is sent and answered `null`, which is an empty answer, not an error.
+        let declaration = session
+            .query(LspQuery::Declaration, "main.rs", source, 0, 3)
+            .unwrap();
+        assert_eq!(declaration, LspAnswer::default());
+        session.shutdown();
     }
 }

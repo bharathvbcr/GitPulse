@@ -298,19 +298,27 @@ pub(super) fn indexed_traversal_starts(
     // Bare names only. A file seed expanding to every member, or a qualified
     // `file::symbol`, is a deliberate scope — unioning those is correct.
     if symbol_fallback || matches!(query, crate::query_match::StartQuery::Symbol(_)) {
-        let unique: BTreeSet<&(String, String)> = starts.iter().collect();
-        if unique.len() > 1 {
-            let candidates: Vec<String> = unique
-                .into_iter()
-                .map(|(symbol, file)| node_id_of(file, symbol))
-                .collect();
-            anyhow::bail!(
-                "ambiguous symbol '{target}'; use an exact ID or file::symbol; candidates: {}",
-                candidates.join(", ")
-            );
-        }
+        refuse_ambiguous(target, &starts)?;
     }
     Ok(starts)
+}
+
+/// The one rule for a bare name that resolves to several symbols: refuse and
+/// list the candidates. Shared so the store-backed and in-memory engines, and
+/// every verb, cannot disagree about when a name is ambiguous.
+pub(super) fn refuse_ambiguous(target: &str, starts: &[(String, String)]) -> anyhow::Result<()> {
+    let unique: BTreeSet<&(String, String)> = starts.iter().collect();
+    if unique.len() > 1 {
+        let candidates: Vec<String> = unique
+            .into_iter()
+            .map(|(symbol, file)| node_id_of(file, symbol))
+            .collect();
+        anyhow::bail!(
+            "ambiguous symbol '{target}'; use an exact ID or file::symbol; candidates: {}",
+            candidates.join(", ")
+        );
+    }
+    Ok(())
 }
 
 pub fn traversal_starts(

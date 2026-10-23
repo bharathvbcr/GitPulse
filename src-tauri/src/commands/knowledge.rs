@@ -253,19 +253,14 @@ done
 
         let db = crate::tasks::store_path(&repo);
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
-        dc_store::Store::open(&db)
-            .unwrap()
-            .connection()
-            .execute(
-                "INSERT INTO tasks (id, title, description, planned_files_json,
-                     forbidden_changes_json, status)
-                 VALUES ('TASK-DOC', 'Docs', '',
-                     '[{\"path\":\"README.md\",\"allowed_change\":\"modify\"},
-                       {\"path\":\"docs/Roadmap.md\",\"allowed_change\":\"modify\"}]',
-                     '[\"docs/Guide.md\"]', 'in_progress')",
-                [],
-            )
-            .unwrap();
+        crate::tasks::plant_task::plant(
+            &dc_store::Store::open(&db).unwrap(),
+            "TASK-DOC",
+            "in_progress",
+            r#"{"planned_files":[{"path":"README.md","allowed_change":"modify"},
+                                {"path":"docs/Roadmap.md","allowed_change":"modify"}],
+                "forbidden_changes":["docs/Guide.md"]}"#,
+        );
         crate::ledger::bindings::bind(&repo, &repo, "TASK-DOC").expect("bind");
 
         let requests = dir.path().join("requests.ndjson");

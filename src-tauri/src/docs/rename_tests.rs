@@ -822,14 +822,12 @@ fn state_repo(name: &'static str, planned: Option<&[String]>, ledger_events: usi
             .iter()
             .map(|p| serde_json::json!({"path": p, "allowed_change": "modify"}))
             .collect();
-        store
-            .connection()
-            .execute(
-                "INSERT INTO tasks (id, title, description, planned_files_json, status)
-                 VALUES ('TASK-B', 'Bench', '', ?1, 'in_progress')",
-                [serde_json::to_string(&files).unwrap()],
-            )
-            .unwrap();
+        crate::tasks::plant_task::plant(
+            &store,
+            "TASK-B",
+            "in_progress",
+            &serde_json::json!({ "planned_files": files }).to_string(),
+        );
         crate::ledger::bindings::bind(&path, &path, "TASK-B").expect("bind the task");
     }
     let started = Instant::now();

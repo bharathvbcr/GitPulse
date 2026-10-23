@@ -10,11 +10,14 @@ mod decisions;
 mod enhancements;
 mod input;
 mod items;
+mod legacy;
 mod notifications;
 mod refine;
 mod runs;
+mod scope;
 
 pub use briefs::{AGENT_GUIDANCE, AGENT_GUIDANCE_HEADING};
+pub(crate) use legacy::{require_retired as require_legacy_retired, retire as retire_legacy_tasks};
 pub use runs::{DEFAULT_ACTIVE_RUNS, MAX_ACTIVE_RUNS_CEILING};
 
 use crate::Store;
@@ -27,11 +30,18 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// version is refused, so every host sharing a profile must be built at the
 /// same one; `dcstore --version` reports it so a host can check that before
 /// handing a profile to a store it did not build.
-pub const WORKBENCH_SCHEMA: i64 = 13;
+pub const WORKBENCH_SCHEMA: i64 = 14;
 const MAX_INTEGER: i64 = 9_007_199_254_740_990;
 // Reserve envelope/cursor space within a 2 MiB response. The collector stops
 // fetching rows at this bound, including for full revision and event documents.
 const MAX_PAGE_DOCUMENTS: usize = 2 * 1024 * 1024 - 4096;
+/// The repository an item must name as its primary for this store's host to
+/// work it. A repository-local store holds one repository's tasks, so "this
+/// repo" is a fixed id rather than a lookup by checkout path: a board that syncs
+/// items in addresses them to it, and an item whose primary is any other
+/// repository is somebody else's work and never offered here.
+pub const LOCAL_REPOSITORY_ID: &str = "this-repo";
+const LOCAL_REPOSITORY_IDENTITY: &str = "devcouncil:this-repo";
 const STATUSES: &[&str] = &["inbox", "backlog", "ready", "in_progress", "review", "done"];
 
 #[derive(Debug)]
@@ -140,6 +150,17 @@ impl Store {
             });
         }
         ensure_schema(&self.conn, true)
+    }
+
+    /// Registers [`LOCAL_REPOSITORY_ID`] if the profile does not hold it, so an
+    /// item can name it as its primary repository. Idempotent: the request is
+    /// receipted, and a repository that already exists answers the same.
+    pub fn ensure_local_repository(&self) -> Result<()> {
+        match self.workbench_request("repositories.put", &local_repository_request()) {
+            Ok(_) => Ok(()),
+            Err(error) if error.code == "revision_conflict" => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Shared CLI/served boundary for the workbench. The Go host supplies a
@@ -288,20 +309,33 @@ impl Store {
 /// cannot be made refuses the upgrade; one already made for this version (an
 /// earlier, interrupted upgrade) is kept, not overwritten.
 fn backup_before_upgrade(conn: &Connection, version: i64) -> Result<Option<String>> {
+    let refusal = |backup: &std::path::Path, detail: String| {
+        format!(
+            "the workbench profile is at schema {version} and cannot be upgraded to {WORKBENCH_SCHEMA} \
+             because its backup {} could not be written: {detail}",
+            backup.display()
+        )
+    };
+    backup_profile(conn, &format!("pre-schema-{version}"), refusal)
+}
+
+/// The shared `VACUUM INTO` copy: `<profile>.<stamp>.bak`, written beside the
+/// profile and renamed into place only when complete.
+fn backup_profile(
+    conn: &Connection,
+    stamp: &str,
+    refusal: impl Fn(&std::path::Path, String) -> String,
+) -> Result<Option<String>> {
     let Some(path) = conn.path().filter(|path| !path.is_empty()) else {
         return Ok(None);
     };
-    let backup = std::path::PathBuf::from(format!("{path}.pre-schema-{version}.bak"));
+    let backup = std::path::PathBuf::from(format!("{path}.{stamp}.bak"));
     if backup.exists() {
         return Ok(Some(backup.display().to_string()));
     }
     let fail = |detail: String| Error {
         code: "backup_failed",
-        message: format!(
-            "the workbench profile is at schema {version} and cannot be upgraded to {WORKBENCH_SCHEMA} \
-             because its backup {} could not be written: {detail}",
-            backup.display()
-        ),
+        message: refusal(&backup, detail),
     };
     let partial = backup.with_extension("bak.partial");
     let _ = std::fs::remove_file(&partial);
@@ -312,6 +346,12 @@ fn backup_before_upgrade(conn: &Connection, version: i64) -> Result<Option<Strin
         .map_err(|error| fail(error.to_string()))?;
     std::fs::rename(&partial, &backup).map_err(|error| fail(error.to_string()))?;
     Ok(Some(backup.display().to_string()))
+}
+
+fn local_repository_request() -> String {
+    format!(
+        r#"{{"request_id":"local-repository","id":"{LOCAL_REPOSITORY_ID}","expected_revision":0,"name":"this repository","identity_key":"{LOCAL_REPOSITORY_IDENTITY}"}}"#
+    )
 }
 
 /// What [`Store::upgrade_workbench_profile`] did.
@@ -408,6 +448,14 @@ fn migrate_step(conn: &Connection, from: i64) -> Result<()> {
             // response, so older hosts must refuse this profile. Receipts
             // already stored in full keep replaying as written.
             conn.execute("UPDATE work_meta SET version=13 WHERE id=1", [])?;
+        }
+        13 => {
+            // Items gain a validated `scope` (planned files, forbidden changes,
+            // allowed commands, expected tests, requirement links): the gate's
+            // one definition of a task's authority. No table changes. A host
+            // that builds an item body without it would erase the scope of
+            // every task it saves, so older hosts must refuse this profile.
+            conn.execute("UPDATE work_meta SET version=14 WHERE id=1", [])?;
         }
         other => {
             return Err(Error {
@@ -1013,6 +1061,7 @@ fn put_item(input: &Input<'_>, id: &str, revision: i64, now: i64, now_ms: i64) -
         "archived",
         "checklist",
         "links",
+        "scope",
         "scan_sequence",
     ])?;
     // Optimistic guard for a host that decided to create this task from a scan
@@ -1100,6 +1149,7 @@ fn put_item(input: &Input<'_>, id: &str, revision: i64, now: i64, now_ms: i64) -
         ));
     }
     let (body, links) = items::apply(input, id, &status, body, now)?;
+    let body = scope::apply(input, id, body)?;
     let text_changed: bool = input.conn.query_row(
         "SELECT NOT EXISTS(SELECT 1 FROM work_items WHERE id=?1 AND title=?2 AND description=?3)",
         params![id, title, description],
@@ -1616,7 +1666,8 @@ fn list_items(input: &Input<'_>) -> Result<String> {
 }
 
 /// Body fields a card leaves out: read in full with `items.get`.
-const CARD_OMITS: &str = "'$.description','$.acceptance_criteria','$.logs','$.checklist','$.links'";
+const CARD_OMITS: &str =
+    "'$.description','$.acceptance_criteria','$.logs','$.checklist','$.links','$.scope'";
 
 /// The filters a task list applies besides its scope and search.
 #[derive(Clone, Copy)]

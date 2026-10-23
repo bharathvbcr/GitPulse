@@ -24,23 +24,18 @@ use rusqlite::{Connection, OptionalExtension};
 
 /// Idempotent DDL for the tables the harness touches.
 pub const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS tasks (
-    id VARCHAR NOT NULL,
-    title VARCHAR NOT NULL,
-    description VARCHAR NOT NULL,
-    requirement_ids_json VARCHAR NOT NULL DEFAULT '[]',
-    acceptance_criterion_ids_json VARCHAR NOT NULL DEFAULT '[]',
+-- A task is a workbench item (`work_items`, see the `workbench` module); the
+-- legacy `tasks` table was retired at schema 10 and its rows archived as items.
+-- What an executor adds to its own plan while it holds a lease is execution
+-- state, not part of the item the planner or the board owns, so it lives here:
+-- a board sync that rewrites an item can never erase or widen it, and widening
+-- never bumps the item's revision.
+CREATE TABLE IF NOT EXISTS task_scope_appends (
+    task_id VARCHAR NOT NULL,
     planned_files_json VARCHAR NOT NULL DEFAULT '[]',
-    expected_tests_json VARCHAR NOT NULL DEFAULT '[]',
     allowed_commands_json VARCHAR NOT NULL DEFAULT '[]',
-    forbidden_changes_json VARCHAR NOT NULL DEFAULT '[]',
-    status VARCHAR NOT NULL DEFAULT 'planned',
-    difficulty VARCHAR,
-    agent_appended_expected_tests_json VARCHAR NOT NULL DEFAULT '[]',
-    agent_appended_allowed_commands_json VARCHAR NOT NULL DEFAULT '[]',
-    priority VARCHAR,
-    agent_appended_planned_files_json VARCHAR NOT NULL DEFAULT '[]',
-    PRIMARY KEY (id)
+    expected_tests_json VARCHAR NOT NULL DEFAULT '[]',
+    PRIMARY KEY (task_id)
 );
 
 CREATE TABLE IF NOT EXISTS task_leases (
@@ -442,16 +437,7 @@ fn migrate_inner(
 
     conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|e| format!("migration could not take the write lock: {e}"))?;
-    let outcome = (|| {
-        // Re-read under the lock: another process may have migrated, or a
-        // newer binary may have stamped a higher version, since the look above.
-        if let Some(v) = read_version(conn)? {
-            check_version(v, known)?;
-        }
-        add_missing_columns(conn, budget)?;
-        spend(budget)?;
-        ensure_schema_version(conn, known)
-    })();
+    let outcome = bring_current(conn, known, budget);
     match outcome {
         Ok(()) => conn
             .execute_batch("COMMIT")
@@ -461,6 +447,39 @@ fn migrate_inner(
             Err(e)
         }
     }
+}
+
+/// Adds the missing columns and stamps `known`, inside a write transaction the
+/// caller already holds, so the stamp commits with whatever else that
+/// transaction carries — the columns here, and the legacy tasks retirement when
+/// it runs — or not at all.
+pub(crate) fn bring_current(
+    conn: &Connection,
+    known: u32,
+    budget: &mut Option<usize>,
+) -> std::result::Result<(), String> {
+    // Re-read under the lock: another process may have migrated, or a newer
+    // binary may have stamped a higher version, since the caller last looked.
+    check_stored_version(conn, known)?;
+    add_missing_columns(conn, budget)?;
+    spend(budget)?;
+    ensure_schema_version(conn, known)
+}
+
+/// Refuses a stored `schema_version` newer than `known`, touching nothing.
+pub(crate) fn check_stored_version(
+    conn: &Connection,
+    known: u32,
+) -> std::result::Result<(), String> {
+    let stored: Option<i64> = conn
+        .query_row(
+            "SELECT version FROM schema_version WHERE id = 'singleton'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("schema_version could not be read: {e}"))?;
+    stored.map_or(Ok(()), |found| check_version(found, known))
 }
 
 pub(crate) fn gaps_has_column(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
@@ -476,8 +495,8 @@ pub(crate) fn gaps_has_column(conn: &Connection, name: &str) -> rusqlite::Result
 
 /// Ensures `schema_version` matches this build, refusing a newer unknown row.
 ///
-/// Aligns with Python `storage/db.py` (`SCHEMA_VERSION = 9`): create/upgrade
-/// when missing or behind; fail closed when the file is ahead of this binary.
+/// Creates or upgrades the row when it is missing or behind
+/// (`crate::SCHEMA_VERSION`); fails closed when the file is ahead of this binary.
 pub fn ensure_schema_version(conn: &Connection, known: u32) -> std::result::Result<(), String> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_version (

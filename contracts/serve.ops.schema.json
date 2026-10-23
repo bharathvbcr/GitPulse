@@ -15,6 +15,7 @@
     "optional": [
       "devmap.query",
       "devmap.status",
+      "harness.resolve",
       "work.attention.get",
       "work.attention.list",
       "work.attention.update",
@@ -70,8 +71,10 @@
       "work.runs.get",
       "work.runs.list",
       "work.runs.managed.activate",
+      "work.runs.managed.follow",
       "work.runs.managed.prepare",
       "work.runs.managed.stop",
+      "work.runs.managed.wake",
       "work.runs.prepare",
       "work.runs.protocol",
       "work.runs.started",
@@ -300,6 +303,152 @@
         }
       }
     },
+    "HarnessResolveParams": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "provider": {
+          "type": "string",
+          "required": true
+        },
+        "root": {
+          "type": "string",
+          "required": false
+        },
+        "session_id": {
+          "type": "string",
+          "required": true
+        },
+        "spec": {
+          "type": "object",
+          "required": true,
+          "fields": {
+            "inline": {
+              "type": "any",
+              "required": false
+            },
+            "kind": {
+              "type": "string",
+              "required": true
+            },
+            "name": {
+              "type": "string",
+              "required": false
+            }
+          }
+        }
+      }
+    },
+    "HarnessResolveResult": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "digest": {
+          "type": "string",
+          "required": true
+        },
+        "notes": {
+          "type": "array",
+          "required": false,
+          "items": {
+            "type": "string",
+            "required": false
+          }
+        },
+        "rejected": {
+          "type": "array",
+          "required": true,
+          "items": {
+            "type": "object",
+            "required": false,
+            "fields": {
+              "name": {
+                "type": "string",
+                "required": true
+              },
+              "reason": {
+                "type": "string",
+                "required": true
+              }
+            }
+          }
+        },
+        "roles": {
+          "type": "array",
+          "required": true,
+          "items": {
+            "type": "object",
+            "required": false,
+            "fields": {
+              "allowed_tools": {
+                "type": "array",
+                "required": false,
+                "items": {
+                  "type": "string",
+                  "required": false
+                }
+              },
+              "description": {
+                "type": "string",
+                "required": true
+              },
+              "name": {
+                "type": "string",
+                "required": true
+              },
+              "read_only": {
+                "type": "boolean",
+                "required": false
+              },
+              "system_prompt": {
+                "type": "string",
+                "required": false
+              }
+            }
+          }
+        },
+        "sections": {
+          "type": "array",
+          "required": true,
+          "items": {
+            "type": "object",
+            "required": false,
+            "fields": {
+              "name": {
+                "type": "string",
+                "required": true
+              },
+              "order": {
+                "type": "integer",
+                "required": true
+              },
+              "text": {
+                "type": "string",
+                "required": true
+              }
+            }
+          }
+        },
+        "skills": {
+          "type": "array",
+          "required": true,
+          "items": {
+            "type": "object",
+            "required": false,
+            "fields": {
+              "description": {
+                "type": "string",
+                "required": true
+              },
+              "name": {
+                "type": "string",
+                "required": true
+              }
+            }
+          }
+        }
+      }
+    },
     "HelloParams": {
       "type": "object",
       "required": false,
@@ -412,10 +561,51 @@
         }
       }
     },
+    "ManagedPrepareParams": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "expected_revision": {
+          "type": "integer",
+          "required": true
+        },
+        "harness": {
+          "type": "object",
+          "required": false,
+          "nullable": true,
+          "fields": {
+            "kind": {
+              "type": "string",
+              "required": true
+            },
+            "name": {
+              "type": "string",
+              "required": true
+            }
+          }
+        },
+        "id": {
+          "type": "string",
+          "required": true
+        },
+        "request_id": {
+          "type": "string",
+          "required": true
+        }
+      }
+    },
     "ManagedPrepared": {
       "type": "object",
       "required": false,
       "fields": {
+        "harness_digest": {
+          "type": "string",
+          "required": false
+        },
+        "harness_recovery": {
+          "type": "string",
+          "required": false
+        },
         "id": {
           "type": "string",
           "required": true
@@ -529,6 +719,174 @@
         },
         "lane": {
           "type": "string",
+          "required": true
+        }
+      }
+    },
+    "PrepareParams": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "context_window": {
+          "type": "integer",
+          "required": true
+        },
+        "harness_digest": {
+          "type": "string",
+          "required": false
+        },
+        "messages": {
+          "type": "array",
+          "required": true,
+          "items": {
+            "type": "object",
+            "required": false,
+            "fields": {
+              "role": {
+                "type": "string",
+                "required": true
+              },
+              "text": {
+                "type": "string",
+                "required": false
+              },
+              "tool_call_id": {
+                "type": "string",
+                "required": false
+              },
+              "tool_calls": {
+                "type": "array",
+                "required": false,
+                "items": {
+                  "type": "object",
+                  "required": false,
+                  "fields": {
+                    "arguments": {
+                      "type": "string",
+                      "required": false
+                    },
+                    "id": {
+                      "type": "string",
+                      "required": false
+                    },
+                    "name": {
+                      "type": "string",
+                      "required": true
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "observed_prompt_tokens": {
+          "type": "integer",
+          "required": false
+        },
+        "overhead": {
+          "type": "integer",
+          "required": false
+        },
+        "reserved_output": {
+          "type": "integer",
+          "required": false
+        },
+        "session_id": {
+          "type": "string",
+          "required": true
+        },
+        "system": {
+          "type": "string",
+          "required": false
+        },
+        "tools": {
+          "type": "array",
+          "required": false,
+          "items": {
+            "type": "object",
+            "required": false,
+            "fields": {
+              "description": {
+                "type": "string",
+                "required": false
+              },
+              "input_schema": {
+                "type": "any",
+                "required": false
+              },
+              "name": {
+                "type": "string",
+                "required": true
+              }
+            }
+          }
+        }
+      }
+    },
+    "PrepareResult": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "after_tokens": {
+          "type": "integer",
+          "required": true
+        },
+        "before_tokens": {
+          "type": "integer",
+          "required": true
+        },
+        "calibration_ratio": {
+          "type": "number",
+          "required": true
+        },
+        "calibration_samples": {
+          "type": "integer",
+          "required": true
+        },
+        "insufficient": {
+          "type": "boolean",
+          "required": true
+        },
+        "prefix_moved": {
+          "type": "boolean",
+          "required": false
+        },
+        "prefix_note": {
+          "type": "string",
+          "required": false
+        },
+        "steps": {
+          "type": "array",
+          "required": true,
+          "items": {
+            "type": "object",
+            "required": false,
+            "fields": {
+              "from_bytes": {
+                "type": "integer",
+                "required": true
+              },
+              "text": {
+                "type": "string",
+                "required": true
+              },
+              "to_bytes": {
+                "type": "integer",
+                "required": true
+              },
+              "tool_call_id": {
+                "type": "string",
+                "required": true
+              }
+            }
+          }
+        },
+        "target_tokens": {
+          "type": "integer",
+          "required": true
+        },
+        "threshold_tokens": {
+          "type": "integer",
           "required": true
         }
       }

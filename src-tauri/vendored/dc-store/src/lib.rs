@@ -35,19 +35,24 @@ pub mod commit_wire;
 pub mod json;
 pub mod records;
 pub mod schema;
+mod tasks;
 pub mod workbench;
+
+pub use tasks::{ReadyMode, ReadyTask};
 
 /// The state-schema revision this build understands.
 ///
-/// Aligned with Python `storage/db.py` (`SCHEMA_VERSION = 9`) so a store
-/// written by either side reports one number. It is asserted by the Go
-/// client's health check rather than merely reported. A harness binary and a
+/// Began aligned with Python `storage/db.py` (`SCHEMA_VERSION = 9`) so a store
+/// written by either side reported one number; it moved past it at 10, when the
+/// legacy `tasks` table was retired into workbench items. It is asserted by the
+/// Go client's health check rather than merely reported. A harness binary and a
 /// store binary that disagree about the schema is the failure that produces a
-/// confident wrong answer — a lease read through the wrong column layout — so
-/// the mismatch is caught at the boundary instead of surfacing later as data
-/// that looks valid. Opening a database whose `schema_version` row is *newer*
-/// than this constant fails closed.
-pub const SCHEMA_VERSION: u32 = 9;
+/// confident wrong answer — a task read through the wrong layout — so the
+/// mismatch is caught at the boundary instead of surfacing later as data that
+/// looks valid. Opening a database whose `schema_version` row is *newer* than
+/// this constant fails closed, which is what keeps a build from before 10 from
+/// reading a store whose tasks it cannot find.
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// The ceiling on one task's agent-appended scope.
 ///
@@ -124,6 +129,17 @@ pub enum StoreError {
     /// `schema_version` could not be read or written. Distinct from Sql so a
     /// caller sees the precondition failure rather than a generic SQLite line.
     SchemaVersion { detail: String },
+    /// The task cannot be leased: no such item, or it is archived or not in a
+    /// workable status. A normal answer a caller branches on, decided inside
+    /// the acquire transaction so an item archived between `ready` and
+    /// `acquire` is refused rather than leased.
+    TaskUnavailable {
+        task_id: String,
+        code: &'static str,
+        detail: String,
+    },
+    /// The workbench (the task source) refused or failed. Carries its own code.
+    Workbench { code: &'static str, message: String },
 }
 
 /// The longest TTL this store will mint, in seconds. Long enough for any real
@@ -168,6 +184,8 @@ impl std::fmt::Display for StoreError {
             StoreError::SchemaVersion { detail } => {
                 write!(f, "schema_version precondition failed: {detail}")
             }
+            StoreError::TaskUnavailable { detail, .. } => f.write_str(detail),
+            StoreError::Workbench { code, message } => write!(f, "workbench {code}: {message}"),
         }
     }
 }
@@ -384,6 +402,8 @@ impl Store {
                 known: SCHEMA_VERSION,
             });
         }
+        workbench::require_legacy_retired(&conn)
+            .map_err(|detail| StoreError::SchemaVersion { detail })?;
         Ok(Store {
             conn,
             now_fn: None,
@@ -397,6 +417,10 @@ impl Store {
     }
 
     fn prepare(conn: Connection) -> Result<Self> {
+        Self::prepare_with(conn, &mut None)
+    }
+
+    fn prepare_with(conn: Connection, stamp_budget: &mut Option<usize>) -> Result<Self> {
         // WAL lets readers proceed while a writer holds the write lock, and the
         // busy timeout absorbs the contention two builders produce. Both are
         // set before any statement runs.
@@ -415,7 +439,7 @@ impl Store {
         // comment into a precondition.
         schema::verify_exclusion_index(&conn)
             .map_err(|detail| StoreError::ExclusionIndex { detail })?;
-        schema::migrate(&conn, SCHEMA_VERSION).map_err(|detail| {
+        let too_new = |detail: String| {
             if let Some(rest) = detail.strip_prefix("unsupported DevCouncil schema version ") {
                 let found = rest
                     .split(';')
@@ -429,12 +453,34 @@ impl Store {
             } else {
                 StoreError::SchemaVersion { detail }
             }
-        })?;
-        Ok(Store {
+        };
+        // A store newer than this build is refused before anything is moved.
+        schema::check_stored_version(&conn, SCHEMA_VERSION).map_err(too_new)?;
+        let store = Store {
             conn,
             now_fn: None,
             workbench_upgrades: true,
-        })
+        };
+        // The legacy tasks table becomes workbench items and the version is
+        // stamped in one transaction: a refusal leaves the store as found, at
+        // the old version with its tasks table, which an older reader still
+        // understands.
+        workbench::retire_legacy_tasks(&store, SCHEMA_VERSION, stamp_budget).map_err(|e| {
+            StoreError::Workbench {
+                code: e.code,
+                message: e.message,
+            }
+        })?;
+        schema::migrate(&store.conn, SCHEMA_VERSION).map_err(too_new)?;
+        Ok(store)
+    }
+
+    /// Opens `path` like [`Store::open`], but fails the schema stamp that
+    /// commits with the legacy tasks retirement after `steps` write steps, so a
+    /// test can check the store is left exactly as it was found.
+    #[doc(hidden)]
+    pub fn open_failing_stamp_after(path: impl AsRef<Path>, steps: usize) -> Result<Self> {
+        Self::prepare_with(Connection::open(path)?, &mut Some(steps))
     }
 
     /// Stops this handle from upgrading an older workbench profile. A request
@@ -551,6 +597,10 @@ impl Store {
         if let Some(ttl) = req.ttl_seconds {
             validate_ttl(ttl)?;
         }
+
+        // Decided inside this transaction, so an item archived or retired
+        // between `ready` and here is refused rather than leased.
+        self.require_acquirable(&req.task_id)?;
 
         let mut retired = None;
         match self.active_lease(&req.task_id) {
@@ -867,41 +917,57 @@ impl Store {
     /// Reads a task's scope: the planned files, commands, and prohibitions the
     /// gate enforces.
     ///
+    /// A task is a workbench item whose primary repository is this one
+    /// ([`workbench::LOCAL_REPOSITORY_ID`]), and its scope is the item body's
+    /// validated `scope` object. Any status reads, so a task keeps its scope
+    /// while it is in progress, in review or done; a deleted item, or one that
+    /// belongs to another repository, is unknown.
+    ///
     /// Agent-appended fields are merged into the base ones rather than
     /// returned separately. DevCouncil lets an executor widen its own scope
-    /// through `agent_appended_*`, and the write gate has to see the union or
+    /// through `task_scope_appends`, and the write gate has to see the union or
     /// it would deny a write the task itself authorised — the split matters to
     /// whoever reviews the plan afterwards, not to the check.
     pub fn task(&self, task_id: &str) -> Result<Option<Task>> {
-        // The last two have no `agent_appended_*` sibling, and that asymmetry
-        // is deliberate rather than an omission. An executor may widen its own
+        if !tasks::items_present(&self.conn)? {
+            return Ok(None);
+        }
+        // The last two have no appended sibling, and that asymmetry is
+        // deliberate rather than an omission. An executor may widen its own
         // *file* scope by arguing a blocked write through the override seam,
         // because which files a change touches is discovered while doing it.
         // Which requirement a task satisfies is not discovered that way — it is
         // the planner's judgement about why the task exists — and a task able
         // to append to this list could discharge a requirement by claiming it.
         const COLUMNS: [&str; 9] = [
-            "planned_files_json",
-            "agent_appended_planned_files_json",
-            "allowed_commands_json",
-            "agent_appended_allowed_commands_json",
-            "expected_tests_json",
-            "agent_appended_expected_tests_json",
-            "forbidden_changes_json",
-            "requirement_ids_json",
-            "acceptance_criterion_ids_json",
+            "scope.planned_files",
+            "task_scope_appends.planned_files_json",
+            "scope.allowed_commands",
+            "task_scope_appends.allowed_commands_json",
+            "scope.expected_tests",
+            "task_scope_appends.expected_tests_json",
+            "scope.forbidden_changes",
+            "scope.requirement_ids",
+            "scope.acceptance_criterion_ids",
         ];
         let row = self
             .conn
             .query_row(
-                "SELECT id, title, status, difficulty, \
-                 planned_files_json, agent_appended_planned_files_json, \
-                 allowed_commands_json, agent_appended_allowed_commands_json, \
-                 expected_tests_json, agent_appended_expected_tests_json, \
-                 forbidden_changes_json, \
-                 requirement_ids_json, acceptance_criterion_ids_json \
-                 FROM tasks WHERE id = ?1",
-                params![task_id],
+                "SELECT i.id, i.title, i.status, json_extract(i.body, '$.scope.difficulty'),
+                        coalesce(json_extract(i.body, '$.scope.planned_files'), '[]'),
+                        coalesce(a.planned_files_json, '[]'),
+                        coalesce(json_extract(i.body, '$.scope.allowed_commands'), '[]'),
+                        coalesce(a.allowed_commands_json, '[]'),
+                        coalesce(json_extract(i.body, '$.scope.expected_tests'), '[]'),
+                        coalesce(a.expected_tests_json, '[]'),
+                        coalesce(json_extract(i.body, '$.scope.forbidden_changes'), '[]'),
+                        coalesce(json_extract(i.body, '$.scope.requirement_ids'), '[]'),
+                        coalesce(json_extract(i.body, '$.scope.acceptance_criterion_ids'), '[]'),
+                        (SELECT count(*) FROM gaps g WHERE g.task_id = i.id AND g.blocking = 1)
+                 FROM work_items i
+                 LEFT JOIN task_scope_appends a ON a.task_id = i.id
+                 WHERE i.id = ?1 AND i.deleted = 0 AND i.primary_repository_id = ?2",
+                params![task_id, workbench::LOCAL_REPOSITORY_ID],
                 |r| {
                     let mut scope: Vec<String> = Vec::with_capacity(COLUMNS.len());
                     for index in 4..4 + COLUMNS.len() {
@@ -913,12 +979,13 @@ impl Store {
                         r.get::<_, String>(2)?,
                         r.get::<_, Option<String>>(3)?,
                         scope,
+                        r.get::<_, i64>(13)?,
                     ))
                 },
             )
             .optional()
             .map_err(StoreError::Sql)?;
-        let Some((id, title, status, difficulty, scope)) = row else {
+        let Some((id, title, status, difficulty, scope, blocking_gap_count)) = row else {
             return Ok(None);
         };
 
@@ -927,8 +994,8 @@ impl Store {
         // that is not a well-formed JSON array is a document this store would
         // otherwise emit broken, or worse, emit with an extra key spliced into
         // it. The write path refuses such a value, but this store shares its
-        // file with DevCouncil and with anything else holding the path, so the
-        // read asserts it too rather than trusting that every writer did.
+        // file with other writers (a board that syncs items in), so the read
+        // asserts it too rather than trusting that every writer did.
         for (column, value) in COLUMNS.iter().zip(scope.iter()) {
             if let Err(why) = json::check_array(value) {
                 return Err(StoreError::BadScope {
@@ -949,6 +1016,7 @@ impl Store {
             agent_appended_planned_files_json: scope[1].clone(),
             requirement_ids_json: scope[7].clone(),
             acceptance_criterion_ids_json: scope[8].clone(),
+            blocking_gap_count,
         }))
     }
 
@@ -1038,13 +1106,7 @@ impl Store {
         expected: &str,
         replacement: &str,
     ) -> Result<ScopeWrite> {
-        let exists: Option<i64> = self
-            .conn
-            .query_row("SELECT 1 FROM tasks WHERE id = ?1", params![task_id], |r| {
-                r.get(0)
-            })
-            .optional()?;
-        if exists.is_none() {
+        if !tasks::is_local_item(&self.conn, task_id)? {
             return Ok(ScopeWrite::NoTask);
         }
 
@@ -1053,6 +1115,13 @@ impl Store {
             return Ok(ScopeWrite::NotLeased(code));
         }
 
+        // The row is created empty on first widening so there is one thing to
+        // compare against; a failed or refused swap leaves it empty, which reads
+        // exactly as no row.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO task_scope_appends (task_id) VALUES (?1)",
+            params![task_id],
+        )?;
         let updated = self.conn.execute(
             // Compared trimmed of JSON whitespace — the same four characters
             // `json::trim_ws` strips, spelled out because SQLite's one-argument
@@ -1061,14 +1130,14 @@ impl Store {
             // the whitespace around it, so a column stored with padding would
             // never compare equal to what any caller can send back — the swap
             // would refuse forever and the widening could never be written.
-            "UPDATE tasks SET agent_appended_planned_files_json = ?1
-             WHERE id = ?2
-               AND trim(agent_appended_planned_files_json, char(32, 9, 10, 13)) = ?3",
+            "UPDATE task_scope_appends SET planned_files_json = ?1
+             WHERE task_id = ?2
+               AND trim(planned_files_json, char(32, 9, 10, 13)) = ?3",
             params![replacement, task_id, expected],
         )?;
         if updated == 0 {
             let current: String = self.conn.query_row(
-                "SELECT agent_appended_planned_files_json FROM tasks WHERE id = ?1",
+                "SELECT planned_files_json FROM task_scope_appends WHERE task_id = ?1",
                 params![task_id],
                 |r| r.get(0),
             )?;
@@ -1086,41 +1155,6 @@ impl Store {
             return Ok(ScopeWrite::Stale { current });
         }
         Ok(ScopeWrite::Written)
-    }
-
-    /// Lists tasks that are ready to be worked, excluding any already held.
-    ///
-    /// "Ready" is a status question and "held" is a lease question, and they
-    /// are answered together here so a caller cannot act on a task that was
-    /// claimed between the two reads.
-    ///
-    /// Like every other read of a lease in this store, it is a *writing* read:
-    /// expiry is applied first. Without that, "held" meant `status = 'active'`
-    /// as stored, so a builder that crashed left its task hidden from the ready
-    /// list forever — the TTL had passed, but nothing had touched the row to
-    /// notice. `devcouncil_next_task` calls this and nothing else, so the
-    /// answer an agent got after a crash was "no unheld ready tasks".
-    pub fn ready_tasks(&self) -> Result<Vec<String>> {
-        self.sweep_expired()?;
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT t.id FROM tasks t \
-                 WHERE t.status IN ('planned', 'ready', 'blocked') \
-                 AND NOT EXISTS ( \
-                   SELECT 1 FROM task_leases l \
-                   WHERE l.task_id = t.id AND l.status = 'active' \
-                 ) ORDER BY t.id",
-            )
-            .map_err(StoreError::Sql)?;
-        let rows = stmt
-            .query_map([], |r| r.get::<_, String>(0))
-            .map_err(StoreError::Sql)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(StoreError::Sql)?);
-        }
-        Ok(out)
     }
 
     /// Appends one evidence row. See [`records::evidence_append`].
@@ -1422,6 +1456,11 @@ pub struct Task {
     /// This is *what* must hold, and a criterion no task owns is a behaviour
     /// nobody is accountable for building.
     pub acceptance_criterion_ids_json: String,
+    /// How many blocking gaps this task has right now. Derived, never stored:
+    /// whether a task is blocked is a fact about its gaps, and a status that
+    /// said so could disagree with them. Carried on the task so an explicit
+    /// checkout of a blocked one still tells the agent why it is blocked.
+    pub blocking_gap_count: i64,
 }
 
 /// Concatenates two JSON arrays textually.
@@ -1564,12 +1603,13 @@ mod tests {
 
     #[test]
     fn test_schema_version() {
-        assert_eq!(SCHEMA_VERSION, 9);
+        assert_eq!(SCHEMA_VERSION, 10);
     }
 
     #[test]
     fn test_acquire_mutual_exclusion_and_release() {
         let store = Store::open_in_memory().expect("open store");
+        plant_task(&store, "TASK-001", "[]", "[]");
 
         // First agent acquires lease
         let lease1 = store
@@ -1638,6 +1678,7 @@ mod tests {
         let clock_clone = clock.clone();
 
         let mut store = Store::open_in_memory().expect("open store");
+        plant_task(&store, "TASK-001", "[]", "[]");
         store.set_clock(move || clock_clone.load(Ordering::SeqCst));
 
         let lease = store
@@ -1668,6 +1709,7 @@ mod tests {
         let clock_clone = clock.clone();
 
         let mut store = Store::open_in_memory().expect("open store");
+        plant_task(&store, "TASK-001", "[]", "[]");
         store.set_clock(move || clock_clone.load(Ordering::SeqCst));
 
         let lease = store
@@ -1708,17 +1750,35 @@ mod tests {
         assert_eq!(parsed_space, epoch);
     }
 
-    /// Inserts the minimum row `task` reads, with the scope columns a test names.
+    /// Registers the minimum item `task` reads, with the scope columns a test
+    /// names. Goes through `items.put`, the one way an item comes to exist.
     fn plant_task(store: &Store, id: &str, planned: &str, appended: &str) {
+        store.ensure_local_repository().expect("local repository");
+        let request = format!(
+            r#"{{"request_id":"plant-{id}","id":"{id}","expected_revision":0,"title":"planted","status":"ready","repository_ids":["{repo}"],"primary_repository_id":"{repo}","scope":{{"planned_files":{planned}}}}}"#,
+            repo = workbench::LOCAL_REPOSITORY_ID
+        );
         store
-            .conn
-            .execute(
-                "INSERT INTO tasks (id, title, description, planned_files_json,
-                                    agent_appended_planned_files_json, status)
-                 VALUES (?1, 'planted', '', ?2, ?3, 'ready')",
-                params![id, planned, appended],
-            )
+            .workbench_request("items.put", &request)
             .expect("plant task");
+        if appended != "[]" {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO task_scope_appends (task_id, planned_files_json) VALUES (?1, ?2)",
+                    params![id, appended],
+                )
+                .expect("plant appended scope");
+        }
+    }
+
+    fn ready_ids(store: &Store) -> Vec<String> {
+        store
+            .ready_tasks(ReadyMode::Enforce)
+            .expect("ready")
+            .into_iter()
+            .map(|t| t.id)
+            .collect()
     }
 
     fn lease_for(store: &Store, id: &str) -> String {
@@ -1903,7 +1963,7 @@ mod tests {
         match store.task("TASK-1") {
             Err(StoreError::BadScope { reason }) => {
                 assert!(
-                    reason.contains("agent_appended_planned_files_json"),
+                    reason.contains("task_scope_appends.planned_files_json"),
                     "the refusal does not name the column: {reason}"
                 );
             }
@@ -1924,7 +1984,7 @@ mod tests {
         store.set_clock(move || clock.load(Ordering::SeqCst));
         plant_task(&store, "TASK-1", "[]", "[]");
 
-        assert_eq!(store.ready_tasks().expect("ready"), vec!["TASK-1"]);
+        assert_eq!(ready_ids(&store), vec!["TASK-1"]);
         store
             .acquire(&AcquireRequest {
                 task_id: "TASK-1".to_string(),
@@ -1933,13 +1993,13 @@ mod tests {
                 ..Default::default()
             })
             .expect("acquire");
-        assert!(store.ready_tasks().expect("ready").is_empty());
+        assert!(ready_ids(&store).is_empty());
 
         // The holder is gone and its TTL has passed. Nothing else has looked at
         // the row — that is the point.
         now.store(1_700_000_000 + 61, Ordering::SeqCst);
         assert_eq!(
-            store.ready_tasks().expect("ready"),
+            ready_ids(&store),
             vec!["TASK-1"],
             "a task whose lease expired is still hidden from the ready list"
         );
@@ -1954,6 +2014,7 @@ mod tests {
     #[test]
     fn a_refused_ttl_does_not_cost_the_incumbent_its_lease() {
         let store = Store::open_in_memory().expect("open store");
+        plant_task(&store, "TASK-1", "[]", "[]");
         let held = store
             .acquire(&AcquireRequest {
                 task_id: "TASK-1".to_string(),

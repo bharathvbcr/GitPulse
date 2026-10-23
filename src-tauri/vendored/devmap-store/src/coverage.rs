@@ -71,6 +71,16 @@ pub struct CoverageGapRow {
     pub reason: String,
 }
 
+/// One partial-parse row with what the generation recorded about its file:
+/// the grammar key it was extracted under and the hash of the bytes it parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialParseGap {
+    pub path: String,
+    pub reason: String,
+    pub language: String,
+    pub content_hash: u64,
+}
+
 /// A capped listing and the total it was drawn from.
 ///
 /// Never just the rows: a list that stops at fifty and does not say so reads

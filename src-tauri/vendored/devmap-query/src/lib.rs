@@ -8,6 +8,7 @@
 pub mod api_routes;
 pub mod artifacts;
 pub mod ast;
+pub mod bounded;
 pub mod cancel;
 pub mod code_graph;
 pub mod cypher;
@@ -47,6 +48,7 @@ pub use artifacts::{
     should_regenerate, write_atomic, writer_identity, ArtifactFingerprint, ArtifactRecord,
     ArtifactStamp,
 };
+pub use bounded::{bounded_reason, bounded_text, MAX_REASON_COMPONENT_BYTES};
 pub use cancel::{cancelled_queries, Cancel, QueryCancelled};
 pub use code_graph::{
     build_code_graph_value, build_graph_core_value, decode_compact, encode_compact,

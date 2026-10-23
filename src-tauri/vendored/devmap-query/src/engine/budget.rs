@@ -4,7 +4,6 @@ use crate::model::{
     SourceFreshness,
 };
 use devmap_extract::model::Span;
-use devmap_store::Store;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Divide one caller-supplied budget across `explore`'s four parts.
@@ -108,10 +107,18 @@ pub(super) fn record_test_hit(
     entry.1.insert(symbol.to_string());
 }
 
+/// A refusal with no freshness verdict of its own.
+///
+/// It says "not checked", never "no generation": whether a generation exists is
+/// the store's to say, and only `StoreQueryEngine::finish` asks it. A refusal
+/// that read a generation yet stamped "none is persisted" contradicted the
+/// `generation_id` beside it. Store-backed callers route the result through
+/// `finish`; the in-memory engine has no store and keeps this sentence, which
+/// is the one its answers already carry.
 pub(super) fn unavailable_response<T>(resolution: ResolutionAvailability) -> Response<T> {
     Response {
         source_freshness: SourceFreshness::unverified(
-            "no persisted generation is available to verify against the working tree",
+            "whole-tree source freshness was not checked for this answer",
         ),
         items: Vec::new(),
         shown: 0,
@@ -127,13 +134,9 @@ pub(super) fn unavailable_response<T>(resolution: ResolutionAvailability) -> Res
         dead_clusters_incomplete: None,
         excluded: None,
         unresolved_namesakes: None,
+        note: None,
         scope: None,
     }
-}
-
-pub(super) fn attach_source_freshness<T>(store: &Store, mut response: Response<T>) -> Response<T> {
-    response.source_freshness = SourceFreshness::from_store(store.query_source_freshness());
-    response
 }
 
 pub(crate) fn byte_span_to_line_range(source: &str, span: &Span) -> (u32, u32) {
@@ -308,6 +311,7 @@ where
         dead_clusters_incomplete: None,
         excluded: None,
         unresolved_namesakes: None,
+        note: None,
         scope: None,
     }
 }
@@ -339,6 +343,7 @@ where
             dead_clusters_incomplete: None,
             excluded: None,
             unresolved_namesakes: None,
+            note: None,
             scope: None,
         };
     }
@@ -360,6 +365,7 @@ where
         dead_clusters_incomplete: None,
         excluded: None,
         unresolved_namesakes: None,
+        note: None,
         scope: None,
     }
 }

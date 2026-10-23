@@ -1,3 +1,7 @@
+use super::dependencies::{
+    dependency_note, dependency_order, shadowed_symbol_count, DependencyFacts, InboundTarget,
+};
+use super::gaps::CallBlindStarts;
 use super::{
     attribution_coverage_gap, budget_take, byte_span_to_line_range, cap_source_span,
     empty_result_gap, file_edge_coverage_gap, reached_by, search_coverage_gap,
@@ -47,6 +51,7 @@ impl<'a> QueryEngine<'a> {
                 dead_clusters_incomplete: None,
                 excluded: None,
                 unresolved_namesakes: None,
+                note: None,
                 scope: None,
             };
         }
@@ -153,69 +158,151 @@ impl<'a> QueryEngine<'a> {
         response
     }
 
+    /// What the target depends on: its outbound edges.
+    ///
+    /// An indexed file path answers the edges written in that file. Any other
+    /// query is a symbol (`name`, `Type.method`, `file::symbol`) resolved by the
+    /// same matcher `impact` uses, and answers that symbol's own outbound
+    /// edges. A bare name with several namesakes is refused with its candidates,
+    /// as the store-backed engine refuses it. Inbound edges are never listed
+    /// here; when they are all there is, the answer says how many there were.
     pub fn dependencies(&self, req: Request<String>) -> Response<ResolvedEdge> {
         if let Err(error) = devmap_store::checked_min_confidence(req.min_confidence) {
             return unavailable_response(ResolutionAvailability::Unavailable {
                 reason: error.to_string(),
             });
         }
-        let file_path = &req.query;
-        let availability = match self
+        let query = &req.query;
+        let extraction = self
             .extractions
             .iter()
-            .find(|extraction| &extraction.file_path == file_path)
-        {
-            None => ResolutionAvailability::Unavailable {
-                reason: format!("{file_path} is not indexed"),
-            },
-            Some(extraction) if matches!(extraction.parse_outcome, ParseOutcome::Failed { .. }) => {
-                ResolutionAvailability::Unavailable {
-                    reason: format!("{file_path} could not be parsed"),
-                }
+            .find(|extraction| &extraction.file_path == query);
+        if let Some(extraction) = extraction {
+            if matches!(extraction.parse_outcome, ParseOutcome::Failed { .. }) {
+                return unavailable_response(ResolutionAvailability::Unavailable {
+                    reason: format!("{query} could not be parsed"),
+                });
             }
-            Some(_) => ResolutionAvailability::Available,
-        };
-        if !matches!(availability, ResolutionAvailability::Available) {
-            return unavailable_response(availability);
         }
-        // The same statement the store-backed engine makes, from the same
-        // owner: a file whose calls and imports were never extracted answers
-        // here in the exact shape of one that genuinely has none.
-        let file_gap = self
-            .extractions
-            .iter()
-            .find(|extraction| &extraction.file_path == file_path)
-            .and_then(|extraction| file_edge_coverage_gap(&extraction.parse_outcome));
-        let file_sites = self.radius_attribution_gap(
-            &BTreeSet::from([(file_path.clone(), file_path.clone())]),
-            RadiusSide::FileCallees,
-        );
+        let target = query.trim();
+        // A file query reads every edge written in the file; a symbol query reads
+        // the edges leaving the `(symbol, file)` nodes it names.
+        let mut outbound_nodes: Option<BTreeSet<(String, String)>> = None;
+        let mut inbound_nodes: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut call_blind = CallBlindStarts::default();
+        let (file_gap, sites, side, shadowed_symbols) = match extraction {
+            Some(extraction) => {
+                let symbols = self.resolution.edges.iter().flat_map(|edge| {
+                    [edge.source_symbol.as_str(), edge.target_symbol.as_str()]
+                });
+                (
+                    file_edge_coverage_gap(&extraction.parse_outcome),
+                    BTreeSet::from([(query.clone(), query.clone())]),
+                    RadiusSide::FileCallees,
+                    shadowed_symbol_count(query, symbols),
+                )
+            }
+            None => {
+                let outbound: BTreeSet<(String, String)> =
+                    super::traversal_starts(&self.resolution.edges, target, false)
+                        .into_iter()
+                        .collect();
+                inbound_nodes = super::traversal_starts(&self.resolution.edges, target, true)
+                    .into_iter()
+                    .collect();
+                let named: BTreeSet<(String, String)> = outbound
+                    .iter()
+                    .cloned()
+                    .chain(inbound_nodes.iter().cloned())
+                    .collect();
+                if matches!(
+                    crate::query_match::classify(target),
+                    crate::query_match::StartQuery::Symbol(_)
+                ) {
+                    if let Err(error) = super::traversal::refuse_ambiguous(
+                        target,
+                        &named.iter().cloned().collect::<Vec<_>>(),
+                    ) {
+                        return unavailable_response(ResolutionAvailability::Unavailable {
+                            reason: error.to_string(),
+                        });
+                    }
+                }
+                if named.is_empty() {
+                    return unavailable_response(ResolutionAvailability::Unavailable {
+                        reason: format!("{query} is not indexed"),
+                    });
+                }
+                let files: BTreeSet<&str> = named.iter().map(|(_, file)| file.as_str()).collect();
+                for path in files {
+                    match self.extractions.iter().find(|e| e.file_path == path) {
+                        Some(e) => {
+                            call_blind.record(&e.file_path, &e.language, &e.engine, &e.parse_outcome)
+                        }
+                        None => call_blind.checked += 1,
+                    }
+                }
+                outbound_nodes = Some(outbound);
+                (None, named, RadiusSide::Callees, 0)
+            }
+        };
+        let file_sites = self.radius_attribution_gap(&sites, side);
         let coverage_gap = devmap_analyze::combine_reasons(
             file_gap,
             devmap_analyze::combine_reasons(self.coverage_gap.clone(), file_sites),
         );
+        let inbound_target = match &outbound_nodes {
+            None => InboundTarget::File(query),
+            Some(_) => InboundTarget::Symbols(&inbound_nodes),
+        };
         let mut deps = Vec::new();
-
+        let mut inbound = 0usize;
         for edge in &self.resolution.edges {
-            if (&edge.source_file == file_path || &edge.target_file == file_path)
-                && edge.confidence.0 >= req.min_confidence
-            {
+            if edge.confidence.0 < req.min_confidence {
+                continue;
+            }
+            let outbound = match &outbound_nodes {
+                None => &edge.source_file == query,
+                Some(nodes) => {
+                    nodes.contains(&(edge.source_symbol.clone(), edge.source_file.clone()))
+                }
+            };
+            if outbound {
                 deps.push(edge.clone());
+            } else if inbound_target.admits(
+                &edge.source_file,
+                &edge.source_symbol,
+                &edge.target_file,
+                &edge.target_symbol,
+            ) {
+                inbound += 1;
             }
         }
 
-        deps.sort_by(|a, b| {
-            b.confidence
-                .0
-                .total_cmp(&a.confidence.0)
-                .then_with(|| a.source_file.cmp(&b.source_file))
-                .then_with(|| a.target_file.cmp(&b.target_file))
-                .then_with(|| a.target_symbol.cmp(&b.target_symbol))
+        let outbound_before_rung = deps.len();
+        deps.sort_by(dependency_order);
+        if outbound_nodes.is_some() && deps.is_empty() {
+            if let Some(reason) = call_blind.refusal_when_empty(query) {
+                let mut response = unavailable_response(ResolutionAvailability::Unavailable { reason });
+                response.walk_incomplete = coverage_gap;
+                return response;
+            }
+        }
+        // `dependencies` here takes no rung floor, so the cut never empties it.
+        let note = dependency_note(&DependencyFacts {
+            query,
+            outbound_before_rung,
+            outbound_after_rung: deps.len(),
+            inbound,
+            min_rung: None,
+            shadowed_symbols,
         });
-
         let mut response = budget_take(deps, req.token_budget, |_| 25);
-        response.walk_incomplete =
-            devmap_analyze::combine_reasons(response.walk_incomplete.take(), coverage_gap);
+        response.note = note;
+        response.walk_incomplete = devmap_analyze::combine_reasons(
+            devmap_analyze::combine_reasons(response.walk_incomplete.take(), coverage_gap),
+            call_blind.reason(),
+        );
         response
     }
 

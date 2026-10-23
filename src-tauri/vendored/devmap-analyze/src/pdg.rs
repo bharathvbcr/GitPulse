@@ -1110,6 +1110,40 @@ mod tests {
         })
     }
 
+    /// AUDIT G2: the statement that leads a branch owns its own line, so a
+    /// variable used only in the `if` condition still receives a def-use edge
+    /// from the definition that reaches it.
+    #[test]
+    fn g2_a_branch_condition_use_is_a_data_edge_from_its_definition() {
+        let input = function(
+            &[],
+            vec![
+                statement(2, &["flag"], &[], PdgStatementKind::Basic),
+                statement(
+                    3,
+                    &[],
+                    &["flag"],
+                    PdgStatementKind::Branch {
+                        then_body: vec![statement(4, &[], &[], PdgStatementKind::Basic)],
+                        elif_arms: Vec::new(),
+                        else_body: Vec::new(),
+                    },
+                ),
+            ],
+        );
+        let pdg = build_function_pdg(&input).unwrap();
+        assert!(
+            pdg.edges.iter().any(|edge| {
+                edge.source_node == node_at(&pdg, 2)
+                    && edge.target_node == node_at(&pdg, 3)
+                    && edge.edge_kind == "data"
+                    && edge.variable.as_deref() == Some("flag")
+            }),
+            "the condition's use of `flag` is invisible to def-use: {:#?}",
+            pdg.edges
+        );
+    }
+
     fn sink(line: u32, variable: &str) -> PdgStatement {
         let mut statement = statement(line, &[], &[variable], PdgStatementKind::Basic);
         statement.taint_sinks = vec![variable.to_string()];

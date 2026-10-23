@@ -69,23 +69,16 @@ pub struct LinkedRequirements {
 /// a caller passes: which requirements a task answers to is the planner's
 /// judgement, and an argument would let a caller choose them.
 pub fn task_requirements(conn: &Connection, task_id: &str) -> Result<Option<LinkedRequirements>> {
-    let exists: Option<i64> = conn
-        .query_row(
-            "SELECT 1 FROM tasks WHERE id = ?1",
-            params![task_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if exists.is_none() {
+    if !crate::tasks::is_local_item(conn, task_id)? {
         return Ok(None);
     }
     let limit = (MAX_LIST_ROWS + 1) as i64;
     let mut stmt = conn.prepare(
         "SELECT j.value, r.id, r.title, r.description, r.priority, r.source,
                 r.acceptance_criteria_json
-         FROM tasks t, json_each(t.requirement_ids_json) j
+         FROM work_items t, json_each(t.body, '$.scope.requirement_ids') j
          LEFT JOIN requirements r ON r.id = j.value
-         WHERE t.id = ?1
+         WHERE t.id = ?1 AND t.deleted = 0
          ORDER BY CAST(j.key AS INTEGER)
          LIMIT ?2",
     )?;

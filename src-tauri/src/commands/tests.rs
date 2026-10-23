@@ -760,16 +760,7 @@ fn many_task_scopes_authenticate_the_repository_once() {
     std::fs::create_dir_all(db.parent().unwrap()).unwrap();
     let store = dc_store::Store::open(&db).unwrap();
     for id in ["T1", "T2", "T3"] {
-        store
-            .connection()
-            .execute(
-                &format!(
-                    "INSERT INTO tasks (id, title, description, planned_files_json, status)
-                     VALUES ('{id}', 'title of {id}', '', '[]', 'in_progress')"
-                ),
-                [],
-            )
-            .unwrap();
+        crate::tasks::plant_task::plant(&store, id, "in_progress", "{}");
     }
     let listings = || {
         crate::engine::git_cli::spawn_log::spawns_in(&repo)

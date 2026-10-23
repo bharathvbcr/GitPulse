@@ -422,8 +422,15 @@ fn scope_in(store: &dc_store::Store, task_id: &str) -> Result<Option<TaskScope>,
     }))
 }
 
+/// Plants fixture tasks as workbench items (dc-store schema 10 retired the
+/// legacy `tasks` table). Shared with the other test modules in this crate.
+#[cfg(test)]
+#[path = "../test_support/plant_task.rs"]
+pub(crate) mod plant_task;
+
 #[cfg(test)]
 mod tests {
+    use super::plant_task::plant;
     use super::*;
 
     #[test]
@@ -457,17 +464,13 @@ mod tests {
         // Written through dc-store itself, so this exercises the real schema
         // rather than a hand-rolled table that could drift from it.
         let store = dc_store::Store::open(&db).unwrap();
-        store
-            .connection()
-            .execute(
-                "INSERT INTO tasks (id, title, description, planned_files_json,
-                     forbidden_changes_json, allowed_commands_json, status)
-                 VALUES ('TASK-1', 'Wire the ledger', '',
-                     '[{\"path\":\"src/a.rs\",\"allowed_change\":\"modify\"}]',
-                     '[\"src/secret.rs\"]', '[\"cargo test*\"]', 'in_progress')",
-                [],
-            )
-            .unwrap();
+        plant(
+            &store,
+            "TASK-1",
+            "in_progress",
+            r#"{"planned_files":[{"path":"src/a.rs","allowed_change":"modify"}],
+                "forbidden_changes":["src/secret.rs"],"allowed_commands":["cargo test*"]}"#,
+        );
 
         let s = scope(repo, "TASK-1").unwrap().expect("task");
         assert_eq!(s.id, "TASK-1");
@@ -787,12 +790,13 @@ mod tests {
         let db = store_path(repo);
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         let store = dc_store::Store::open(&db).unwrap();
+        plant(&store, "TASK-2", "in_progress", "{}");
+        // `items.put` refuses a malformed scope, so the damage is written the
+        // way another writer sharing the file could: past the validator.
         store
             .connection()
             .execute(
-                "INSERT INTO tasks (id, title, description, planned_files_json,
-                     forbidden_changes_json, allowed_commands_json, status)
-                 VALUES ('TASK-2', 'Damaged', '', '[]', '[\"secrets/**\"', '[]', 'in_progress')",
+                "UPDATE work_items SET body = json_set(body, '$.scope.forbidden_changes', '[\"secrets/**\"') WHERE id = 'TASK-2'",
                 [],
             )
             .unwrap();
@@ -809,38 +813,40 @@ mod tests {
         let db = store_path(repo);
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         let store = dc_store::Store::open(&db).unwrap();
-        for (id, column, value) in [
-            (
-                "TASK-A",
-                "planned_files_json",
-                r#"[{"path":"a.rs","allowed_change":"rewrite"}]"#,
-            ),
-            (
-                "TASK-B",
-                "agent_appended_planned_files_json",
-                r#"[{"path":"a.rs","allowed_change":7}]"#,
-            ),
+        // `items.put` refuses a bad entry, so the damage is written the way
+        // another writer sharing the file could: past the validator.
+        plant(&store, "TASK-A", "in_progress", "{}");
+        store
+            .connection()
+            .execute(
+                "UPDATE work_items SET body = json_set(body, '$.scope.planned_files', json(?1)) WHERE id = 'TASK-A'",
+                [r#"[{"path":"a.rs","allowed_change":"rewrite"}]"#],
+            )
+            .unwrap();
+        plant(&store, "TASK-B", "in_progress", "{}");
+        store
+            .connection()
+            .execute(
+                "INSERT INTO task_scope_appends (task_id, planned_files_json) VALUES ('TASK-B', ?1)",
+                [r#"[{"path":"a.rs","allowed_change":7}]"#],
+            )
+            .unwrap();
+        for (id, column) in [
+            ("TASK-A", "scope.planned_files"),
+            ("TASK-B", "task_scope_appends.planned_files_json"),
         ] {
-            store
-                .connection()
-                .execute(
-                    &format!("INSERT INTO tasks (id, title, description, {column}, status) VALUES (?1, 't', '', ?2, 'in_progress')"),
-                    rusqlite::params![id, value],
-                )
-                .unwrap();
             // The store hands back the union of the planned and agent-appended
             // columns as `planned_files_json`, so that is the column named.
             let err = scope(repo, id).unwrap_err();
             assert!(err.contains("planned_files_json"), "{column}: {err}");
         }
         // The four names the Go decoder accepts, and a task with none, still read.
-        store
-            .connection()
-            .execute(
-                "INSERT INTO tasks (id, title, description, planned_files_json, status) VALUES ('TASK-C', 't', '', ?1, 'in_progress')",
-                [r#"[{"path":"a","allowed_change":"create"},{"path":"b","allowed_change":"read_only"},{"path":"c"},"d"]"#],
-            )
-            .unwrap();
+        plant(
+            &store,
+            "TASK-C",
+            "in_progress",
+            r#"{"planned_files":[{"path":"a","allowed_change":"create"},{"path":"b","allowed_change":"read_only"},{"path":"c"},"d"]}"#,
+        );
         assert_eq!(
             scope(repo, "TASK-C").unwrap().unwrap().planned_files,
             ["a", "b", "c", "d"]
@@ -977,15 +983,7 @@ mod tests {
         let db = store_path(repo);
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         let store = dc_store::Store::open(&db).unwrap();
-        store
-            .connection()
-            .execute(
-                "INSERT INTO tasks (id, title, description, planned_files_json,
-                     forbidden_changes_json, allowed_commands_json, status)
-                 VALUES ('TASK-7', 'Read only', '', '[\"a.rs\"]', '[]', '[]', 'in_progress')",
-                [],
-            )
-            .unwrap();
+        plant(&store, "TASK-7", "in_progress", r#"{"planned_files":["a.rs"]}"#);
         drop(store);
         let mut permissions = std::fs::metadata(&db).unwrap().permissions();
         permissions.set_readonly(true);

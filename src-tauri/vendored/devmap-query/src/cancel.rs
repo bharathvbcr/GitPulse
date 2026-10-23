@@ -82,6 +82,12 @@ impl Cancel {
         self.0.store(true, Ordering::Relaxed);
     }
 
+    /// The underlying flag, for lower crates (extraction, the store) that take
+    /// a plain `&AtomicBool` because they cannot depend on this crate.
+    pub fn flag(&self) -> &AtomicBool {
+        &self.0
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Relaxed)
     }

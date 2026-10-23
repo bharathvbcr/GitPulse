@@ -68,6 +68,10 @@ name = "go_function_value_liveness"
 required-features = ["parse"]
 
 [[test]]
+name = "go_type_use_liveness"
+required-features = ["parse"]
+
+[[test]]
 name = "module_private_widening"
 required-features = ["parse"]
 
@@ -180,6 +184,10 @@ name = "python_constant_liveness"
 required-features = ["parse"]
 
 [[test]]
+name = "python_script_entry_liveness"
+required-features = ["parse"]
+
+[[test]]
 name = "cfg_variants_are_one_dead_row"
 required-features = ["parse"]
 
@@ -209,4 +217,44 @@ required-features = ["parse"]
 
 [[test]]
 name = "python_heritage_attack3"
+required-features = ["parse"]
+
+[[test]]
+name = "python_residue_attack"
+required-features = ["parse"]
+
+[[test]]
+name = "go_type_use_attack"
+required-features = ["parse"]
+
+[[test]]
+name = "a_budget_refused_file_caps_the_dead_answer"
+required-features = ["parse"]
+
+[[test]]
+name = "budget_refusal_attack"
+required-features = ["parse"]
+
+[[test]]
+name = "resolution_rate_attack"
+required-features = ["parse"]
+
+[[test]]
+name = "resolution_rate_attack_head"
+required-features = ["parse"]
+
+[[test]]
+name = "attack_script_probe"
+required-features = ["parse"]
+
+[[test]]
+name = "attack_script_probe2"
+required-features = ["parse"]
+
+[[test]]
+name = "attack_script_probe3"
+required-features = ["parse"]
+
+[[test]]
+name = "ts_namespace_module_scope_read"
 required-features = ["parse"]

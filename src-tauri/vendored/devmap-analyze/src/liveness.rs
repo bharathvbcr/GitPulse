@@ -2,7 +2,7 @@ use crate::model::*;
 use devmap_extract::languages::{capabilities_for_language, Capability};
 use devmap_extract::model::*;
 use devmap_resolve::model::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Symbol identity relative to its file, so that `file_path` + `symbol_name`
 /// reconstructs the graph id exactly. A method must report as `MyClass.execute`
@@ -46,11 +46,51 @@ fn dead_symbol_identity(symbol: &ExtractedSymbol, file_path: &str) -> String {
         .unwrap_or_else(|| symbol.name.clone())
 }
 
+/// Whether a file-scoped `ScriptEntry` still exempts every symbol of the file.
+///
+/// A script's entry *file* is a claim about the file, not about what is in it.
+/// It stops sparing symbols where something else keeps the entry live:
+///
+/// * Go and Rust: the entry function is exempt by name at symbol level.
+/// * Python, JavaScript, TypeScript: see [`script_entry_exempts_callables`].
+///
+/// Every other language keeps the file-level exemption: no probe established
+/// that its entry reaches a call edge at symbol level (shell, Ruby, PHP, Lua,
+/// R and the JVM/Apple script dialects either hold only exported top-level
+/// symbols or are call-blind at module scope), and the fail-open direction is
+/// one more finding unseen rather than a live function reported dead.
+fn script_entry_exempts_its_symbols(language: &str) -> bool {
+    !matches!(
+        language,
+        "go" | "rust" | "python" | "javascript" | "typescript"
+    )
+}
+
+/// Python, JavaScript and TypeScript scripts keep the file-level claim for
+/// everything callable or type-like (functions, methods, classes) and give it
+/// up for module-level variables only.
+///
+/// This is a scope decision, not a proof that the callables are dead or live.
+/// Narrowing them too exposed resolver gaps that scripts lean on harder than
+/// libraries do: dispatch tables (`COMMANDS[cmd]()`), `getattr` dispatch,
+/// object-literal members, `nn.Module.forward`, methods reached through
+/// attribute receivers. Measured on real repositories, 16 of 16 and at least
+/// 12 of 57 newly reported callables were live. A module-level variable is a
+/// name with readers or none, and an uncalled one in a script is as dead as
+/// anywhere else (the `F_POSITIONS` shape).
+fn script_entry_exempts_callables(language: &str) -> bool {
+    matches!(language, "python" | "javascript" | "typescript")
+}
+
 /// Directory owning a path, used as half of a Go package identity. Two packages
 /// with the same name in different directories are unrelated, so the name alone
 /// cannot key the interface join.
+///
+/// Splits on the last `/` or `\`. The indexed pipeline stores forward slashes,
+/// but this is a boundary: a caller handing in a Windows-spelled path must not
+/// have a whole directory collapse into the root package.
 fn parent_dir(path: &str) -> &str {
-    path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("")
+    path.rfind(['/', '\\']).map_or("", |at| &path[..at])
 }
 
 /// Go package identity of an extraction: `(directory, package clause)`.
@@ -169,6 +209,46 @@ pub const GO_BUILD_VARIANT_REASON: &str =
 /// so the index cannot show that nothing uses it.
 pub const GO_VALUE_MENTION_REASON: &str =
     "Named as a value in its own Go package — the mention is a bare identifier the ladder declines";
+
+/// Why a Go type is exempt rather than reported dead while its own file names it
+/// in type position.
+///
+/// A statement about the evidence, like [`GO_VALUE_MENTION_REASON`]: the
+/// extraction holds a `Type` reference to this name that the resolver did not
+/// bind, so the index cannot show that nothing uses the type.
+pub const GO_TYPE_MENTION_REASON: &str =
+    "Named in type position in its own Go file — the reference is one the resolver left unbound";
+
+/// `(file, type name)` pairs a Go file names in type position from *outside* the
+/// type's own body, each carrying the qualified names of the symbols that wrote
+/// the mention.
+///
+/// The resolver binds `var x T` through the same-file rung, but a `Type`
+/// reference is keyed by the *variable* it annotates and read back through a
+/// file-wide `@mod` slot, so one `params json.RawMessage` elsewhere in the file
+/// sends every `var params T` down the qualified-type path and the bare type is
+/// never bound (`toolsCallParams` in `mcp/server.go`). This reads the extraction
+/// fact directly so that failure cannot turn a used type into a confident
+/// finding. Same file only: that is the scope the same-file rung is entitled to,
+/// and the one a Go type's unqualified name is exact in.
+fn go_type_mentions(extractions: &[Extraction]) -> HashMap<(&str, &str), HashSet<&str>> {
+    let mut mentions: HashMap<(&str, &str), HashSet<&str>> = HashMap::new();
+    for ext in extractions {
+        if ext.language != "go" {
+            continue;
+        }
+        for reference in &ext.references {
+            if reference.kind != ReferenceKind::Type {
+                continue;
+            }
+            mentions
+                .entry((ext.file_path.as_str(), reference.name.as_str()))
+                .or_default()
+                .insert(reference.enclosing_symbol.as_deref().unwrap_or(""));
+        }
+    }
+    mentions
+}
 
 /// Bare value-position identifiers named in a Go package, keyed by
 /// `(directory, package clause, name)` and carrying the files that named them.
@@ -331,6 +411,12 @@ pub struct ExtractionCoverage {
     /// build of every real repository as degraded, and a degraded flag that is
     /// always on carries no information at all.
     pub parse_failed_files: usize,
+    /// The subset of [`Self::parse_failed_files`] refused for overrunning the
+    /// parse budget (`BUDGET_REFUSAL_PREFIX`). A different fact from a grammar
+    /// failure: it is the machine's load, not the file, and the next build
+    /// re-extracts it. Not a separate cap input; `parse_failed_files` already
+    /// charges it.
+    pub budget_refused_files: usize,
     /// Files whose declarations were recovered by line pattern.
     ///
     /// A `.proto` or `.ps1` this build cannot parse is a genuine gap in call
@@ -584,6 +670,49 @@ impl ExtractionCoverage {
             .saturating_add(self.not_parsed_files)
     }
 
+    /// Which languages the cap reaches, said in the terms [`Self::cap_for`]
+    /// decides it: a language is capped exactly when
+    /// [`Self::is_complete_for`] is false for it, so this sentence cannot claim
+    /// the confident tier is shut while a row of an eligible language sits at
+    /// 0.9. Languages come from the per-language maps; with none (aggregate
+    /// counters only, or a discovery refusal that reaches every language) every
+    /// language is capped.
+    fn confident_tier_clause(&self) -> String {
+        // Every language in the corpus, plus the members of every family, so a
+        // language capped only through a sibling's blindness is named too.
+        let present: BTreeSet<&str> = self
+            .covered_by_language
+            .keys()
+            .chain(self.blind_by_language.keys())
+            .map(String::as_str)
+            .collect();
+        let candidates: BTreeSet<&str> = present
+            .iter()
+            .copied()
+            .chain(LANGUAGE_FAMILIES.iter().flat_map(|(_, m)| m.iter().copied()))
+            .collect();
+        let mut capped: Vec<&str> = Vec::new();
+        let mut eligible: Vec<&str> = Vec::new();
+        for language in candidates {
+            // Capped exactly when `cap_for` cannot return the full confidence:
+            // its ceilings never exceed `HIGHEST_DEGRADED_CONFIDENCE`.
+            if self.cap_for(language, 1.0) <= HIGHEST_DEGRADED_CONFIDENCE {
+                capped.push(language);
+            } else if present.contains(language) && confident_tier_eligible(language) {
+                eligible.push(language);
+            }
+        }
+        if eligible.is_empty() {
+            return "findings in every language are capped below the confident tier".to_string();
+        }
+        format!(
+            "findings are capped below the confident tier only for {}; {} remain eligible \
+             for it",
+            bounded_names(&capped),
+            bounded_names(&eligible)
+        )
+    }
+
     /// Why the corpus-level scan is incomplete, or `None` when it is complete.
     ///
     /// `None` on a clean corpus is the whole point: this string is what
@@ -597,9 +726,11 @@ impl ExtractionCoverage {
         let mut reason = format!(
             "call extraction did not cover the whole corpus: {} file(s) failed to parse, \
              {} recovered by pattern (no calls extracted), {} refused by discovery and never \
-             read at all — dead-code and unwired findings are a lower bound and are capped \
-             below the confident tier",
-            self.parse_failed_files, self.pattern_recovered_files, self.discovery_refused_files
+             read at all — dead-code and unwired findings are a lower bound; {}",
+            self.parse_failed_files,
+            self.pattern_recovered_files,
+            self.discovery_refused_files,
+            self.confident_tier_clause()
         );
         // Appended rather than folded into the sentence above, because it is a
         // different kind of fact and a permanent one. The other three describe
@@ -612,6 +743,17 @@ impl ExtractionCoverage {
                 "; {} file(s) in a language with no call extractor at all \
                  (permanent for this build, not a transient failure)",
                 self.call_blind_files
+            ));
+        }
+        // Named apart from grammar failures: these were refused for the
+        // machine's load, and re-running the build is exactly the fix.
+        // Clamped to its parent: a hand-built aggregate record can set the
+        // subset above the whole, and "5 of 1" must not be printed.
+        let budget_refused = self.budget_refused_files.min(self.parse_failed_files);
+        if budget_refused > 0 {
+            reason.push_str(&format!(
+                "; {budget_refused} of the parse failure(s) are budget-refused (the parse \
+                 overran its wall-clock budget under load; the next build re-extracts them)"
             ));
         }
         // Its own clause for the same reason: the fix is to split or shrink
@@ -932,23 +1074,47 @@ pub fn language_can_reference(from: &str, to: &str) -> bool {
 }
 
 fn language_family(language: &str) -> Option<&'static str> {
-    Some(match language {
-        "javascript" | "typescript" | "tsx" | "arkts" | "svelte" | "vue" | "astro" | "liquid" => {
-            "js"
-        }
-        "c" | "cpp" | "objc" | "cuda" | "metal" => "c",
-        "java" | "kotlin" | "scala" => "jvm",
-        "csharp" | "vbnet" => "clr",
-        "python" => "python",
-        "go" => "go",
-        "rust" => "rust",
-        "swift" => "swift",
-        "ruby" => "ruby",
-        "php" => "php",
-        "dart" => "dart",
-        _ => return None,
-    })
+    LANGUAGE_FAMILIES
+        .iter()
+        .find(|(_, members)| members.contains(&language))
+        .map(|(family, _)| *family)
 }
+
+/// Most language names the degraded sentence lists before saying "and K more".
+const SENTENCE_NAME_LIMIT: usize = 8;
+
+/// `names` joined for a sentence, bounded by count so a corpus of dozens of
+/// languages cannot make `degraded_reason` unbounded.
+fn bounded_names(names: &[&str]) -> String {
+    if names.len() <= SENTENCE_NAME_LIMIT {
+        return names.join(", ");
+    }
+    format!(
+        "{} and {} more",
+        names[..SENTENCE_NAME_LIMIT].join(", "),
+        names.len() - SENTENCE_NAME_LIMIT
+    )
+}
+
+/// Languages whose files can call one another, by family. The one table
+/// [`language_family`] reads, and what the degraded sentence walks to find
+/// languages capped through a sibling's blindness (Kotlin blind caps Java).
+const LANGUAGE_FAMILIES: &[(&str, &[&str])] = &[
+    (
+        "js",
+        &["javascript", "typescript", "tsx", "arkts", "svelte", "vue", "astro", "liquid"],
+    ),
+    ("c", &["c", "cpp", "objc", "cuda", "metal"]),
+    ("jvm", &["java", "kotlin", "scala"]),
+    ("clr", &["csharp", "vbnet"]),
+    ("python", &["python"]),
+    ("go", &["go"]),
+    ("rust", &["rust"]),
+    ("swift", &["swift"]),
+    ("ruby", &["ruby"]),
+    ("php", &["php"]),
+    ("dart", &["dart"]),
+];
 
 /// How many members the cluster ceiling compounds over before it stops caring.
 ///
@@ -1106,8 +1272,8 @@ pub const COVERAGE_LOSS_REASON: &str =
 /// (2026-10-10.) Each listed language has zero confident-tier false positives
 /// on its committed fixture, every fixture `truly_dead` marker in the confident
 /// branch, at least one labelled row in the corpus record, and at most 5% false
-/// on every corpus of it (`testdata/accuracy/record.json`: 20 local
-/// repositories, every language each holds listed — `rows: 0` where its
+/// on every corpus of it (`testdata/accuracy/record.json`: 21 corpora
+/// (17 pinned by `commit`, 4 by `corpus_commit`), every language each holds listed — `rows: 0` where its
 /// confident branch was empty). Measured there: Go 0/17 (all from one corpus),
 /// TypeScript 0/29, TSX 0/14, Rust 0/3.
 ///
@@ -1183,6 +1349,18 @@ pub const EXTERNAL_SUPERTYPE: &str = "external_supertype";
 
 /// The machine token a row starts with when it is a member of an object literal.
 pub const OBJECT_LITERAL_MEMBER: &str = "object_literal_member";
+
+/// The reason an unreferenced, unexported TypeScript `namespace`/`module` is
+/// unconfirmed rather than confidently dead.
+///
+/// The extractor files a namespace's own name as a file-scope *local*
+/// (`is_symbol_binding` has no `internal_module` arm), so `name_is_shadowed_by_local`
+/// drops every non-call read of it written at file scope — `console.log(NS.a)`
+/// emits no reference to `NS` or `a`. The facts that would identify such a read
+/// do not exist in an `Extraction`, so the cap applies to every namespace with
+/// no inbound evidence. Lifts when extract-v98 stops shadowing the name.
+pub const NAMESPACE_READ_UNEXTRACTED: &str =
+    "namespace member reads at module scope are not extracted (ft-260158ce, extract-v98)";
 
 /// Languages where a subclass overrides a base method with no keyword saying so.
 ///
@@ -1291,12 +1469,11 @@ fn external_supertypes<'e>(
         }
         for (declarer, _, segments) in bases {
             let base = segments[0].rsplit('.').next().unwrap_or(segments[0]);
-            // A base no name denotes is a marker for the resolver's MRO walk,
-            // not a supertype this report can name.
-            if base.is_empty()
-                || base == devmap_extract::model::OPAQUE_BASE
-                || supertype_dispatches_nothing(base)
-            {
+            // A base no name denotes (`make_base()`, `*mixins`) is still a
+            // base the corpus does not declare: the class's methods may be
+            // called by whatever that expression evaluates to. It is kept,
+            // under the marker, as the external supertype it is.
+            if base.is_empty() || supertype_dispatches_nothing(base) {
                 continue;
             }
             // A Python base is the member first and then the qualifier from
@@ -1372,6 +1549,79 @@ fn import_qualified(ext: &Extraction, written: &[&str]) -> String {
     qualified
 }
 
+/// The methods of a Python class whose written base is a framework class with a
+/// known dispatch contract, keyed by the method's qualified name.
+///
+/// The extractor exempts these from the base *text* (`autograd.Function`), so a
+/// base it cannot read as text — `(torch.autograd.Function)`, `torch.autograd.
+/// Function[int]` — earns no exemption there. The heritage references carry
+/// the same base as segments whatever the punctuation around it, so the same
+/// contract table ([`devmap_extract::wiring::python_base_dispatch_reason`]) is
+/// asked here with the base resolved through the file's imports. A root the
+/// file rebinds at module scope is not the import's, so it is not read.
+fn python_contract_exemptions(ext: &Extraction) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    if ext.code_language() != "python" {
+        return out;
+    }
+    let mut bases: Vec<(&str, usize, Vec<&str>)> = Vec::new();
+    for reference in &ext.references {
+        if reference.kind != ReferenceKind::Heritage {
+            continue;
+        }
+        let Some(declarer) = reference.enclosing_symbol.as_deref() else {
+            continue;
+        };
+        let start = reference.span.start_byte;
+        match bases
+            .iter_mut()
+            .find(|(owner, at, _)| *owner == declarer && *at == start)
+        {
+            Some((_, _, segments)) => segments.push(reference.name.as_str()),
+            None => bases.push((declarer, start, vec![reference.name.as_str()])),
+        }
+    }
+    for (declarer, _, segments) in bases {
+        let written: Vec<&str> = segments[1..]
+            .iter()
+            .chain(&segments[..1])
+            .copied()
+            .collect();
+        let root = written[0];
+        if root == OPAQUE_BASE
+            || ext
+                .scope_locals
+                .iter()
+                .any(|(scope, name)| scope == &ext.file_path && name == root)
+            || ext.symbols.iter().any(|symbol| {
+                symbol.name == root
+                    && symbol.kind != SymbolKind::File
+                    && symbol.parent_symbol.as_deref() == Some(ext.file_path.as_str())
+            })
+        {
+            continue;
+        }
+        // Matched exactly: the reason table matches on a tail, which a local
+        // `local.autograd.Function` also has.
+        let qualified = import_qualified(ext, &written);
+        if !devmap_extract::wiring::known_dispatch_contract(&qualified) {
+            continue;
+        }
+        for symbol in &ext.symbols {
+            if symbol.kind == SymbolKind::Method
+                && symbol.parent_symbol.as_deref() == Some(declarer)
+            {
+                if let Some(reason) =
+                    devmap_extract::wiring::python_base_dispatch_reason(&qualified, &symbol.name)
+                {
+                    out.insert(symbol.qualified_name.clone(), reason.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The external supertype `declaring_type` inherits from, directly or through
 /// in-corpus ancestors, walked as [`reached_through_a_supertype`] walks them.
 fn external_supertype_of<'e>(
@@ -1424,6 +1674,9 @@ fn unconfirmed_dispatch_reason(
     external: &HashMap<(&str, &str), &str>,
 ) -> Option<String> {
     let language = ext.code_language();
+    if sym.kind == SymbolKind::Module && matches!(language, "typescript" | "tsx" | "javascript") {
+        return Some(NAMESPACE_READ_UNEXTRACTED.to_string());
+    }
     if sym.kind != SymbolKind::Method || !overrides_without_keyword(language) {
         return None;
     }
@@ -1443,8 +1696,13 @@ fn unconfirmed_dispatch_reason(
     }
     let (declaring_type, _) = identity.rsplit_once('.')?;
     let base = external_supertype_of(&ext.file_path, declaring_type, supertypes, external)?;
+    let base = if base == OPAQUE_BASE {
+        "a base class written as an expression no name denotes".to_string()
+    } else {
+        format!("`{base}`")
+    };
     Some(format!(
-        "{EXTERNAL_SUPERTYPE}: its class inherits from `{base}`, which the corpus does not \
+        "{EXTERNAL_SUPERTYPE}: its class inherits from {base}, which the corpus does not \
          declare, and a base class calls a subclass's methods by name — no call names it, \
          which is not evidence nothing calls it"
     ))
@@ -1490,6 +1748,8 @@ pub fn exemption_token(reason: &str) -> &'static str {
         "go_build_variant"
     } else if reason == GO_VALUE_MENTION_REASON {
         "go_value_mention"
+    } else if reason == GO_TYPE_MENTION_REASON {
+        "go_type_mention"
     } else if reason == "Symbol overlaps a tree-sitter parse error" {
         "parse_error_overlap"
     } else if reason == FILE_EXEMPT_REASON {
@@ -2669,7 +2929,18 @@ pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
         .collect();
     for entry in extraction_gaps(extractions) {
         match entry.gap {
-            ExtractionGap::ParseFailed => coverage.parse_failed_files += 1,
+            ExtractionGap::ParseFailed => {
+                coverage.parse_failed_files += 1;
+                // The entry's own reason, so one decision per entry: a path that
+                // appears twice is judged twice, and this can never exceed
+                // `parse_failed_files`.
+                if entry
+                    .reason
+                    .starts_with(devmap_extract::model::BUDGET_REFUSAL_PREFIX)
+                {
+                    coverage.budget_refused_files += 1;
+                }
+            }
             ExtractionGap::PatternRecovered => coverage.pattern_recovered_files += 1,
             ExtractionGap::CallBlind => coverage.call_blind_files += 1,
             ExtractionGap::ImportBlind => coverage.import_blind_files += 1,
@@ -2954,6 +3225,7 @@ fn symbol_exemption_index(
     let c_header_exports = c_header_exported_names(extractions);
     let go_build_variants = go_build_variant_identities(extractions);
     let go_value_mentions = go_value_mentioned_names(extractions);
+    let go_type_mentions = go_type_mentions(extractions);
     let go_exported_specs = go_exported_interface_specs(extractions);
     let swift_conforming = swift_types_with_supertypes(extractions);
 
@@ -3005,6 +3277,8 @@ fn symbol_exemption_index(
             })
             .map(|w| (w.target_symbol.as_str(), w.details.as_str()))
             .collect();
+
+        let python_contracts = python_contract_exemptions(ext);
 
         // Read by the corpus-wide exported-interface arm below; empty for
         // every other language, which never reaches it.
@@ -3074,6 +3348,7 @@ fn symbol_exemption_index(
             let reason: Option<String> = wired
                 .get(sym.qualified_name.as_str())
                 .map(|details| (*details).to_string())
+                .or_else(|| python_contracts.get(&sym.qualified_name).cloned())
                 // An explicit declaration in a manifest, ahead of every
                 // inference below it: `pip` writes the launcher that calls this
                 // function, and the launcher is generated at install time and
@@ -3181,6 +3456,28 @@ fn symbol_exemption_index(
                                 files.iter().any(|file| *file != ext.file_path.as_str())
                             }))
                     .then(|| GO_VALUE_MENTION_REASON.to_string())
+                })
+                // A Go type its own file writes in type position. A mention
+                // from inside the type (`func (t T) m()`, a self-referential
+                // field) is the type's own body and is not evidence of use.
+                .or_else(|| {
+                    (ext.language == "go"
+                        && matches!(
+                            sym.kind,
+                            SymbolKind::Struct | SymbolKind::Interface | SymbolKind::Class
+                        )
+                        && go_type_mentions
+                            .get(&(ext.file_path.as_str(), sym.name.as_str()))
+                            .is_some_and(|writers| {
+                                writers.iter().any(|writer| {
+                                    *writer != sym.qualified_name
+                                        && !writer.starts_with(&format!(
+                                            "{}.",
+                                            sym.qualified_name
+                                        ))
+                                })
+                            }))
+                    .then(|| GO_TYPE_MENTION_REASON.to_string())
                 })
                 // An exported Go method whose shape some interface declares.
                 //
@@ -3396,8 +3693,10 @@ pub fn analyze_liveness_with_coverage(
             // package's next file was. The rule this list states — a
             // file-level claim is not a claim about the symbols in it —
             // applies, so for these two the annotation stays a claim about
-            // the file.
-            (w.kind == WiringKind::ScriptEntry && !matches!(ext.language.as_str(), "go" | "rust"))
+            // the file — and so for Python, JavaScript and TypeScript, whose
+            // entry is a call edge; see `script_entry_exempts_its_symbols`.
+            (w.kind == WiringKind::ScriptEntry
+                && script_entry_exempts_its_symbols(ext.language.as_str()))
                 || matches!(
                     w.kind,
                     WiringKind::Vendored
@@ -3423,6 +3722,11 @@ pub fn analyze_liveness_with_coverage(
         let is_file_exempt = is_parse_failed
             || matches!(ext.file_liveness(), FileLiveness::NotCode { .. })
             || exempting_wiring.is_some();
+        // What survives of a script's file-level claim for Python, JavaScript
+        // and TypeScript: every symbol but module-level variables.
+        let script_callable_claim = file_wiring.iter().copied().find(|w| {
+            w.kind == WiringKind::ScriptEntry && script_entry_exempts_callables(ext.language.as_str())
+        });
 
         // Per-symbol exemptions: a runtime, framework, or harness reaches the
         // symbol without an explicit call site, or the language forbids the
@@ -3512,7 +3816,11 @@ pub fn analyze_liveness_with_coverage(
             // Nothing else spares it: not its file, not a recorded exemption,
             // not a parse error over its span. Every report branch below
             // requires this; the exempt branch is what is left.
-            let unspared = !is_file_exempt && symbol_exemption.is_none() && !overlaps_parse_error;
+            let script_spared = script_callable_claim.is_some() && sym.kind != SymbolKind::Variable;
+            let unspared = !is_file_exempt
+                && !script_spared
+                && symbol_exemption.is_none()
+                && !overlaps_parse_error;
             let identity = dead_symbol_identity(sym, &ext.file_path);
             let language = ext.code_language();
             let dispatch_reason = (!is_called && !is_exported && unspared)
@@ -3654,6 +3962,11 @@ pub fn analyze_liveness_with_coverage(
                             .map(str::to_string)
                             .or_else(|| file_reason.clone())
                             .or_else(|| {
+                                script_callable_claim
+                                    .filter(|_| script_spared)
+                                    .map(|w| w.details.clone())
+                            })
+                            .or_else(|| {
                                 Some(if is_exported {
                                     EXPORTED_NOT_EXAMINED_REASON.to_string()
                                 } else {
@@ -3691,6 +4004,19 @@ mod tests {
         assert_eq!(parent_dir("a/b/c/d.go"), "a/b/c");
         // Two files in different directories must not share a key.
         assert_ne!(parent_dir("a/x.go"), parent_dir("b/x.go"));
+    }
+
+    /// A Windows-spelled path used to key as the root package, so every Go
+    /// package written that way collapsed into one identity.
+    #[test]
+    fn parent_dir_splits_on_either_separator() {
+        assert_eq!(parent_dir("a\\b.go"), "a");
+        assert_eq!(parent_dir("a/b\\c.go"), "a/b");
+        assert_eq!(parent_dir("a\\b/c.go"), "a\\b");
+        assert_eq!(parent_dir("pkg\\svc\\node.go"), "pkg\\svc");
+        assert_eq!(parent_dir("pkg/svc/node.go"), "pkg/svc");
+        assert_eq!(parent_dir("node.go"), "");
+        assert_ne!(parent_dir("a\\x.go"), parent_dir("b\\x.go"));
     }
 
     fn symbol(name: &str, start: usize, end: usize) -> ExtractedSymbol {
