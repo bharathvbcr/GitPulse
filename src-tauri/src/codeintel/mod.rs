@@ -3063,6 +3063,38 @@ pub(crate) mod tests {
         dir
     }
 
+    /// Puts an empty, fully migrated map database at `repo`'s store path.
+    ///
+    /// Creating the schema is the dominant write of a seeded fixture (about
+    /// 2 MiB of pages per database), and the property tests in
+    /// `insights::entity_collision` seed one per party per generated case: 484
+    /// MiB for a single test, enough to trip the suite's write watchdog. The
+    /// schema does not depend on the repository, so it is created once per test
+    /// process and each fixture gets a clone of that file (`fs::copy` clones on
+    /// APFS, and is a plain copy elsewhere; neither re-runs the migrations).
+    fn install_empty_fixture_store(repo: &Path) {
+        static TEMPLATE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        let template = TEMPLATE.get_or_init(|| {
+            let dir = crate::test_support::env::hermetic::root().join("devmap-store-template");
+            std::fs::create_dir_all(&dir).expect("mkdir store template");
+            // Unique per process, so two test binaries never share one file.
+            let path = dir.join(format!("{}.sqlite", std::process::id()));
+            drop(Store::open(&path).expect("store opens and creates its schema"));
+            for sidecar in ["-wal", "-shm"] {
+                let mut name = path.clone().into_os_string();
+                name.push(sidecar);
+                assert!(
+                    !Path::new(&name).exists(),
+                    "the template must be a single checkpointed file"
+                );
+            }
+            path
+        });
+        let db = map_path(repo);
+        std::fs::create_dir_all(db.parent().expect("db parent")).expect("mkdir codeintel");
+        std::fs::copy(template, &db).expect("clone the template store");
+    }
+
     /// One indexed symbol for [`seed_file_symbols`]: `(name, qualified_name,
     /// kind, first_line, last_line)`, lines 1-based and inclusive.
     pub(crate) type SeedSymbol<'a> = (&'a str, &'a str, &'a str, u32, u32);
@@ -3092,7 +3124,7 @@ pub(crate) mod tests {
         };
         let line_start = |line: u32| line_starts[(line - 1) as usize];
 
-        drop(open_fixture_store(repo));
+        install_empty_fixture_store(repo);
         let conn = rusqlite::Connection::open(map_path(repo)).expect("open fixture db");
         conn.execute("INSERT INTO paths (id, path) VALUES (1, ?1)", [file])
             .expect("insert path");

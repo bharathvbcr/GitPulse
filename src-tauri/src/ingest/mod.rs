@@ -200,7 +200,45 @@ pub(crate) fn source_roots() -> Vec<(&'static str, Option<std::path::PathBuf>)> 
 }
 
 fn dirs_home() -> Option<std::path::PathBuf> {
+    #[cfg(test)]
+    if home_hidden::on_this_thread() {
+        return None;
+    }
     std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
+/// A test's way to say "this machine has no home directory" to the transcript
+/// walk without unsetting `HOME`, which is one slot for the whole test process:
+/// every parallel test that resolves the config directory (the repository trust
+/// store among them) reads it, and none of them holds the environment lock, so
+/// a test that removed it made unrelated tests fail with "Cannot resolve ...
+/// trust storage". The walk reads its roots on the calling thread, so a
+/// thread-local answers it exactly.
+#[cfg(test)]
+pub(crate) mod home_hidden {
+    use std::cell::Cell;
+
+    thread_local! {
+        static HIDDEN: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn on_this_thread() -> bool {
+        HIDDEN.with(Cell::get)
+    }
+
+    /// Restores on drop, so a failing test does not leave the thread hidden.
+    pub(crate) struct Hidden(());
+
+    pub(crate) fn hide() -> Hidden {
+        HIDDEN.with(|hidden| hidden.set(true));
+        Hidden(())
+    }
+
+    impl Drop for Hidden {
+        fn drop(&mut self) {
+            HIDDEN.with(|hidden| hidden.set(false));
+        }
+    }
 }
 
 fn event_belongs_to_worktree(

@@ -520,11 +520,21 @@ mod catch_up_binding_tests {
     fn a_catch_up_that_had_nothing_to_read_does_not_read_as_a_dropped_append() {
         let (_dir, repo) = git_repo();
         let serial = crate::test_support::env::env_serial();
-        let _env = crate::test_support::env::bind_env(&serial)
-            .remove("HOME")
-            .remove("GITPULSE_TRANSCRIPT_ROOT");
+        let _env = crate::test_support::env::bind_env(&serial).remove("GITPULSE_TRANSCRIPT_ROOT");
+        // Not `.remove("HOME")`: that is process-wide, and unlocked readers in
+        // parallel tests (the trust store) lose their home while it is gone.
+        let _no_home = crate::ingest::home_hidden::hide();
+        assert!(
+            crate::repository_trust::persistent_root().is_ok(),
+            "hiding the home from the transcript walk must not unset the process's HOME"
+        );
         let before = ledger::status(&repo);
-        let bound = bind_after_catch_up(&repo, &repo, "T-1", catch_up_before_binding).unwrap();
+        // The unbounded pass: a deadline-bounded one runs on a worker thread,
+        // where this thread's hidden home does not reach.
+        let bound = bind_after_catch_up(&repo, &repo, "T-1", |address| {
+            crate::ingest::catch_up_into_bounded(&address.anchor, &address.worktree, None)
+        })
+        .unwrap();
         let row = ledger::tail(&repo, 0, 100)
             .unwrap()
             .into_iter()

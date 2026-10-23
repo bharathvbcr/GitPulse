@@ -2956,7 +2956,10 @@ done
     /// The harness runs a model-driven tool loop in a repository the user may
     /// not trust, so it gets an allowlisted environment: ambient credentials
     /// (`GITHUB_TOKEN`, `AWS_*`, provider API keys) never reach it. The canary
-    /// is a variable cargo guarantees is in this process's environment.
+    /// is planted by the test itself: `CARGO_MANIFEST_DIR` is only present when
+    /// cargo launched the binary, so a harness that runs the test binary
+    /// directly (`scripts/test-disk-writes.mjs`) left the old canary absent and
+    /// failed the test on an environment it did not own.
     #[cfg(unix)]
     #[test]
     fn sidecar_child_environment_is_an_allowlist_not_the_ambient_one() {
@@ -2965,8 +2968,11 @@ done
         let script = dir.path().join("dump-env");
         std::fs::write(&script, "#!/bin/sh\nenv\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        const CANARY: &str = "GITPULSE_TEST_AMBIENT_CANARY";
+        let serial = crate::test_support::env::env_serial();
+        let _canary = crate::test_support::env::bind_env(&serial).set(CANARY, "ambient");
         assert!(
-            std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+            std::env::var_os(CANARY).is_some(),
             "the canary must be ambient for this test to mean anything"
         );
         use crate::procguard::LockedSpawn;
@@ -2975,7 +2981,7 @@ done
             .expect("run the env dump");
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(
-            !text.contains("CARGO_MANIFEST_DIR="),
+            !text.contains(&format!("{CANARY}=")),
             "ambient variables must not reach the sidecar:\n{text}"
         );
         assert!(text.contains("PATH="), "PATH must still be set:\n{text}");

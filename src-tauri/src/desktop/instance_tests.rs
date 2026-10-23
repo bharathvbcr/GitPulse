@@ -487,9 +487,19 @@ fn a_peer_that_sent_bytes_and_left_before_the_greeting_is_still_refused() {
 
 #[test]
 fn a_broken_pipe_while_answering_a_real_request_is_refused_at_warn() {
-    // A complete, valid request from a sender that has stopped listening: the
-    // greeting reaches it, then it closes its read side before sending, so the
-    // ack write is the EPIPE. That is after the first frame, so not a probe.
+    // A complete, valid request whose answer cannot be delivered: the greeting
+    // reaches the peer, the request arrives whole, and the ack write is the
+    // EPIPE. That is after the first frame, so not a probe.
+    //
+    // The EPIPE is made on the server's own socket (its write half shut down
+    // while the answer is held back), not by the peer leaving. On macOS only a
+    // full `close` of the peer's end gives the other side EPIPE (`shutdown` of
+    // either half does not, verified), and a full close is not in the test's
+    // hands: a concurrent test that forks holds a copy of the peer's
+    // descriptor until its child execs, so the peer had "left" and the write
+    // still succeeded, which is the failure this test showed in parallel runs.
+    // Holding the inbox lock, which `admit` takes right before the ack, orders
+    // the shutdown before the write.
     let (mut server, client) = UnixStream::pair().unwrap();
     // SAFETY: `getuid` has no preconditions.
     let shared = Shared::new(unsafe { libc::getuid() });
@@ -498,15 +508,18 @@ fn a_broken_pipe_while_answering_a_real_request_is_refused_at_warn() {
         request: Request::Reveal,
     })
     .unwrap();
-    let peer = std::thread::spawn(move || {
+    let control = server.try_clone().unwrap();
+    let held = shared.inbox.lock().unwrap();
+    let outcome = std::thread::scope(|scope| {
+        let served = scope.spawn(|| answer(&mut server, &shared));
         let mut writer = client.try_clone().unwrap();
-        let mut reader = BufReader::new(client.try_clone().unwrap());
+        let mut reader = BufReader::new(client);
         read_frame(&mut reader).unwrap().expect("greeting");
-        client.shutdown(std::net::Shutdown::Read).unwrap();
         writer.write_all(format!("{line}\n").as_bytes()).unwrap();
+        control.shutdown(std::net::Shutdown::Write).unwrap();
+        drop(held);
+        served.join().unwrap()
     });
-    let outcome = answer(&mut server, &shared);
-    peer.join().unwrap();
     let Err(ended) = outcome else {
         panic!("an unanswerable request is not a served one")
     };

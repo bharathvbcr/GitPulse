@@ -112,6 +112,29 @@ export function fastestOf(samples: number, body: () => void): number {
 }
 
 /**
+ * CPU milliseconds (user + system) for the fastest of `samples` runs of `body`.
+ *
+ * For scaling RATIOS between two input sizes. A wall-clock ratio compares two
+ * measurements that were each stretched by a different amount of waiting for
+ * the CPU: under load (average 70 on 18 cores) the 4x-input ratio of a linear
+ * pass read 8.8, 9.6, 13 and 16 against a limit of 8 in 4 of 20 runs. CPU time
+ * is the work the process was actually given, so waiting drops out; what stays
+ * is GC and cache effects, which `fastest` filters the same way it does for
+ * wall time. Process-wide, which is the test's own work because vitest runs
+ * each file in its own forked process.
+ */
+export function fastestCpuOf(samples: number, body: () => void): number {
+  let best = Number.POSITIVE_INFINITY;
+  for (let sample = 0; sample < samples; sample += 1) {
+    const before = process.cpuUsage();
+    body();
+    const spent = process.cpuUsage(before);
+    best = Math.min(best, (spent.user + spent.system) / 1000);
+  }
+  return best;
+}
+
+/**
  * Timeout for stress and fuzz cases whose assertions are invariants, not speed.
  *
  * Vitest's 5s default is an infrastructure limit, not a guard: these cases

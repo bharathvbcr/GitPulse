@@ -218,6 +218,10 @@ fn replay_child() {
     };
     crate::test_support::trust_repo(std::path::Path::new(&repo));
     if let Ok(go) = std::env::var(ENV_GO) {
+        // Tell the parent this process is at its poll loop, so the parent
+        // releases both together instead of guessing how long a start takes.
+        std::fs::write(format!("{go}.ready-{}", std::process::id()), b"")
+            .expect("announce readiness");
         let deadline = std::time::Instant::now()
             + crate::test_support::coverage_relaxed(std::time::Duration::from_secs(60));
         while !std::path::Path::new(&go).exists() {
@@ -362,8 +366,33 @@ fn two_processes_replaying_at_once_record_exactly_one_row_per_entry() {
             (child, harness)
         })
         .unzip();
-    // Let both reach their poll loop before releasing them together.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // Release them together once both are at their poll loop. A fixed sleep
+    // here let a child that started late (a loaded host) begin after the other
+    // had finished, which is a sequential replay and not the contest this test
+    // is about.
+    let ready_prefix = format!("{}.ready-", go.file_name().unwrap().to_string_lossy());
+    let ready = || {
+        std::fs::read_dir(signal.path())
+            .expect("read the signal dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&ready_prefix)
+            })
+            .count()
+    };
+    let waiting_until = std::time::Instant::now()
+        + crate::test_support::coverage_relaxed(std::time::Duration::from_secs(60));
+    while ready() < 2 {
+        assert!(
+            std::time::Instant::now() < waiting_until,
+            "only {} of 2 replay children reached their poll loop",
+            ready()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
     std::fs::write(&go, b"go").expect("release the children");
     let outputs: Vec<_> = children
         .into_iter()
@@ -384,10 +413,15 @@ fn two_processes_replaying_at_once_record_exactly_one_row_per_entry() {
     }
     let total = i64::try_from(total).unwrap();
     assert_eq!(recorded, total, "every entry once across both processes");
-    assert_eq!(
-        recorded + duplicates,
-        2 * total,
-        "every entry accounted for"
+    // Each entry is recorded once, and a loser's copy is refused and counted.
+    // An entry the loser had already seen as recorded when it looked is skipped
+    // without being counted, so the sum is not always 2 * total: it is exactly
+    // that only when both processes were between "look" and "insert" together,
+    // which no outside observer can force. What always holds is that every
+    // entry was handled at least once and never more than once per process.
+    assert!(
+        (total..=2 * total).contains(&(recorded + duplicates)),
+        "every entry accounted for: recorded {recorded} + duplicates {duplicates}, total {total}"
     );
     assert_eq!(
         i64::try_from(reflog_rows(&repo).len()).unwrap(),

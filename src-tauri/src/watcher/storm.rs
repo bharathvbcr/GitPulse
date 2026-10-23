@@ -248,17 +248,25 @@ fn isolated(test: &str, scale: Scale) {
     );
 }
 
-/// Reduced storm: 3 watched repositories, 10k ignored-directory writes, 1k
-/// tracked and 400 object writes each.
+/// Reduced storm: 3 watched repositories, 6k ignored-directory writes, 600
+/// tracked and 240 object writes each (the full storm's 50:5:2 shape).
+///
+/// Sized by what it writes, not only by what it proves: every tiny file costs a
+/// filesystem block, each repository is written twice (watched, and the
+/// unwatched baseline), and at 10k/1k/400 the child process wrote 290.6 MiB,
+/// over the 256 MiB per-test budget `scripts/test-disk-writes.mjs` holds every
+/// test to. The bounds asserted (emissions per second of storm, CPU against
+/// the unwatched baseline, RSS growth) are ratios of the storm to itself, so
+/// they hold at any size long enough to span several coalesce windows.
 #[test]
 fn event_storm_across_watched_repos_stays_bounded() {
     isolated(
         "watcher::storm::event_storm_across_watched_repos_stays_bounded",
         Scale {
             repos: 3,
-            ignored: 10_000,
-            tracked: 1_000,
-            objects: 400,
+            ignored: 6_000,
+            tracked: 600,
+            objects: 240,
         },
     );
 }

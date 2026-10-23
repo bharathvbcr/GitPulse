@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { STRESS_TIMEOUT_MS, expectWithinBudget, fastestOf } from "../__tests__/perfBudget";
+import { STRESS_TIMEOUT_MS, expectWithinBudget, fastestCpuOf, fastestOf } from "../__tests__/perfBudget";
 import {
   MAX_RENDER_BYTES,
   EMPTY_RENDER,
@@ -81,18 +81,18 @@ describe("markdevRender — document stats stay linear", () => {
     // that ran during an idle one produced a budget nothing could meet. The
     // minimum is the sample least disturbed by other load, and a genuine
     // regression still slows it.
-    const timings = [20000, 40000, 80000].map((n) => {
-      const text = "[".repeat(n);
-      return fastestOf(3, () => void calculateDocumentStats(text));
-    });
+    const texts = [20000, 40000, 80000].map((n) => "[".repeat(n));
+    const timings = texts.map((text) => fastestOf(3, () => void calculateDocumentStats(text)));
     expectWithinBudget(timings[2]!, 400, "stats on unmatched brackets");
     // 4x the input must not cost ~16x. Measured on this tree the ratio is a
     // flat 3.9-4.0, so 8 sits midway between linear and quadratic: tight enough
     // to catch the regression, loose enough never to depend on the weather.
-    // No `Math.max` floor is needed — `fastestOf` reports sub-millisecond time,
-    // where the old `Date.now()` truncated ~13.6ms work toward a whole number
-    // and a genuinely fast case to 0.
-    expect(timings[2]! / timings[0]!).toBeLessThan(8);
+    // The ratio is taken over CPU time, not wall time: at host load 70 the wall
+    // ratio of this linear pass read 8.8, 9.6, 13 and 16 in 4 of 20 runs,
+    // because the two sizes waited for the CPU for different lengths of time.
+    // More samples per size, since the minimum is what the ratio is taken of.
+    const cpu = texts.map((text) => fastestCpuOf(7, () => void calculateDocumentStats(text)));
+    expect(cpu[2]! / cpu[0]!).toBeLessThan(8);
   }, STRESS_TIMEOUT_MS);
 });
 
