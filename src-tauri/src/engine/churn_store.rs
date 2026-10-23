@@ -1878,4 +1878,129 @@ mod tests {
             failures.len()
         );
     }
+
+    fn aged_cache(rows: usize, version: i64) -> (tempfile::TempDir, PathBuf) {
+        let cache = tempfile::tempdir().unwrap();
+        let path = cache.path().join(FILE_NAME);
+        drop(Store::open(&path, 10).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i + 1 < {rows})
+             INSERT INTO churn SELECT 1, 1, 'tip' || i, 'base', 1, 1, 1, 1, 1, i FROM n;"
+        ))
+        .unwrap();
+        conn.pragma_update(None, "user_version", version).unwrap();
+        (cache, path)
+    }
+
+    /// ADVERSARIAL W6-L3: openers racing to rebuild an OLD-version cache
+    /// that has rows to drop (the first racing test starts from an empty
+    /// file, where the rebuild is instant). The loser waits only
+    /// `BUSY_TIMEOUT` (100 ms) for the IMMEDIATE lock.
+    #[test]
+    fn openers_racing_to_rebuild_an_old_cache_all_get_a_store() {
+        const OPENERS: usize = 6;
+        let (_cache, path) = aged_cache(300_000, SCHEMA_VERSION - 1);
+        let gate = std::sync::Barrier::new(OPENERS);
+        let outcomes: Vec<Result<(), String>> = std::thread::scope(|scope| {
+            let openers: Vec<_> = (0..OPENERS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        gate.wait();
+                        Store::open(&path, 10).map(drop).map_err(|e| e.to_string())
+                    })
+                })
+                .collect();
+            openers.into_iter().map(|o| o.join().unwrap()).collect()
+        });
+        let failures: Vec<_> = outcomes.into_iter().filter_map(Result::err).collect();
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// ADVERSARIAL W6-L3 (held): a WAL reader with an open snapshot does not
+    /// block the rebuild, and the reader still sees its snapshot.
+    #[test]
+    fn a_wal_reader_does_not_block_the_schema_rebuild() {
+        let (_cache, path) = aged_cache(10, SCHEMA_VERSION - 1);
+        let reader = Connection::open(&path).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM churn;")
+            .unwrap();
+        let store = Store::open(&path, 10).expect("rebuild beside a reader");
+        assert_eq!(store.rows(), 0);
+        let seen: i64 = reader
+            .query_row("SELECT count(*) FROM churn", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(seen, 10, "the reader's snapshot");
+    }
+
+    /// ADVERSARIAL W6-L3 (held): a rebuild that fails half way leaves nothing
+    /// behind: the DROP and the first CREATE roll back with the failing one.
+    #[test]
+    fn a_failed_rebuild_leaves_no_partial_schema() {
+        let (_cache, path) = aged_cache(3, SCHEMA_VERSION - 1);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP INDEX churn_stored; CREATE TABLE other (stored INTEGER); \
+             CREATE INDEX churn_stored ON other (stored);",
+        )
+        .unwrap();
+        drop(conn);
+        let opened = Store::open_within(&path, 10, Duration::from_millis(200));
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        let churn: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'churn'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        match opened {
+            Ok(_) => assert_eq!((version, churn), (SCHEMA_VERSION, 1)),
+            Err(_) => assert!(
+                (version, churn) == (SCHEMA_VERSION - 1, 1)
+                    || (version, churn) == (SCHEMA_VERSION, 1),
+                "half-built: version {version}, churn tables {churn}"
+            ),
+        }
+    }
+
+    /// ADVERSARIAL W6-L3 (held): a cache stamped by a NEWER version is still
+    /// rebuilt exactly as before the change (the open cannot tell newer
+    /// from older), and its rows are dropped, not misread.
+    #[test]
+    fn a_newer_cache_is_rebuilt_as_before() {
+        let (_cache, path) = aged_cache(4, SCHEMA_VERSION + 7);
+        let store = Store::open(&path, 10).unwrap();
+        assert_eq!(store.rows(), 0);
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// ADVERSARIAL W6-L3 (held): a reader on a rollback-journal cache makes
+    /// the WAL switch busy; the file is kept and the error is `Busy`.
+    #[test]
+    fn a_rollback_mode_reader_gives_busy_and_the_file_is_kept() {
+        let cache = tempfile::tempdir().unwrap();
+        let path = cache.path().join(FILE_NAME);
+        let seed = Connection::open(&path).unwrap();
+        seed.execute_batch("CREATE TABLE seed(v); INSERT INTO seed VALUES (1);")
+            .unwrap();
+        drop(seed);
+        let reader = Connection::open(&path).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM seed;")
+            .unwrap();
+        let busy = Store::open_within(&path, 10, Duration::from_millis(150))
+            .err()
+            .expect("a live reader prevents the switch");
+        assert!(matches!(busy, OpenError::Busy(_)), "{busy:?}");
+        assert!(path.exists());
+    }
 }

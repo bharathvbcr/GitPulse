@@ -110,4 +110,62 @@ mod tests {
         assert_eq!(error.sqlite_error_code(), Some(ErrorCode::DatabaseBusy));
         assert!(started.elapsed() >= Duration::from_millis(100));
     }
+
+    /// ADVERSARIAL W6-L3, FAILS BY DESIGN: a connection with the ordinary
+    /// busy handler (rusqlite's default is 5 s; the ledger never lowers it)
+    /// sleeps inside every attempt, so `patience` is not the bound: the
+    /// busy timeout stacks on top of it.
+    #[test]
+    fn a_sleeping_busy_handler_does_not_stretch_the_patience_bound() {
+        let (_dir, path) = rollback_file();
+        let holder = Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.busy_timeout(Duration::from_millis(1500)).unwrap();
+        let started = Instant::now();
+        let error = enter_wal(&conn, Duration::from_millis(100)).expect_err("never released");
+        assert_eq!(error.sqlite_error_code(), Some(ErrorCode::DatabaseBusy));
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(100) + Duration::from_millis(500),
+            "patience 100 ms, busy_timeout 1.5 s: took {took:?}"
+        );
+    }
+
+    /// ADVERSARIAL W6-L3 (held): every extended BUSY code maps to the primary
+    /// `DatabaseBusy` that `enter_wal` retries; LOCKED is a different primary
+    /// code and is returned at once.
+    #[test]
+    fn extended_busy_codes_are_retried_and_locked_is_not() {
+        for extended in [
+            rusqlite::ffi::SQLITE_BUSY,
+            rusqlite::ffi::SQLITE_BUSY_RECOVERY,
+            rusqlite::ffi::SQLITE_BUSY_SNAPSHOT,
+            rusqlite::ffi::SQLITE_BUSY_TIMEOUT,
+        ] {
+            let error = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(extended), None);
+            assert_eq!(error.sqlite_error_code(), Some(ErrorCode::DatabaseBusy));
+        }
+        let locked = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED_SHAREDCACHE),
+            None,
+        );
+        assert_eq!(locked.sqlite_error_code(), Some(ErrorCode::DatabaseLocked));
+    }
+
+    /// ADVERSARIAL W6-L3 (held): a reader holding a SHARED lock on a
+    /// rollback-journal file blocks the switch; it is the busy error after the
+    /// bound, never a hang or a deadlock.
+    #[test]
+    fn a_rollback_mode_reader_is_waited_on_and_then_reported_busy() {
+        let (_dir, path) = rollback_file();
+        let reader = Connection::open(&path).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM t;")
+            .unwrap();
+        let error = enter_wal(&impatient(&path), Duration::from_millis(150))
+            .expect_err("a live reader prevents the switch");
+        assert_eq!(error.sqlite_error_code(), Some(ErrorCode::DatabaseBusy));
+        assert_eq!(mode(&reader), "delete");
+    }
 }

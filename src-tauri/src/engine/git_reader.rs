@@ -15355,4 +15355,64 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
             });
         }
     }
+
+    /// ADVERSARIAL W6-L3: the production configuration of the two test-only
+    /// forks (`ownership_deadline`, `ref_cache::may_store`).
+    mod adv_w6l3 {
+        use super::*;
+
+        /// FAILS BY DESIGN: the 10 s production bound lives in a
+        /// `cfg(not(test))` fn, so no test build ever sees it. The deadline
+        /// is not injectable through a parameter; only a thread-local override
+        /// exists, and the default under test is 30 min.
+        #[test]
+        fn the_production_ownership_deadline_is_ten_seconds() {
+            assert_eq!(
+                ownership_deadline(),
+                Duration::from_secs(10),
+                "tests run with a different deadline from the shipped app"
+            );
+        }
+
+        /// HELD (passes): the premise of `ref_cache::may_store`'s doc, "one
+        /// ownership report stores 128 answers", is false. Blames go through
+        /// `git_cli::git_text_capped`, uncached; the report is ONE memo entry.
+        /// Run by a holder (which stores, as every thread does in production),
+        /// a 100-blame report does not evict another repository's answer.
+        #[test]
+        fn a_default_ownership_report_does_not_flush_other_repositories_answers() {
+            let _kept = ref_cache::retention();
+            ref_cache::eager(|| {
+                let other = init_repo_with_remotes(&[], "main");
+                std::fs::write(other.path().join("a.txt"), "a\n").unwrap();
+                git_in(other.path(), &["add", "-A"]);
+                git_in(other.path(), &["commit", "-m", "feat: a"]);
+                let other_root = other.path().canonicalize().unwrap();
+                let asks = |root: &Path| {
+                    git_cli::spawn_log::spawns_in(root)
+                        .iter()
+                        .filter(|argv| argv.iter().any(|a| a == "rev-parse"))
+                        .count()
+                };
+                let ask = || {
+                    ref_cache::git_text(&other_root, &["refs/heads"], &["rev-parse", "HEAD"])
+                        .expect("rev-parse")
+                };
+                ask();
+                ask();
+                assert_eq!(asks(&other_root), 1, "precondition: the answer is kept");
+
+                let big = churn_fixture(100, 1);
+                let big_root = big.path().canonicalize().unwrap();
+                GitReader::knowledge_report(big_root.to_str().unwrap(), None).expect("report");
+
+                ask();
+                assert_eq!(
+                    asks(&other_root),
+                    1,
+                    "a 100-blame report evicted another repository's kept answer"
+                );
+            });
+        }
+    }
 }
