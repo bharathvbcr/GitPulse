@@ -311,3 +311,51 @@ The drift fixes are in 68ef1882. Re-run on that tree: supervised_threads 9/9, do
   - **ft-eb5034ce**: churn_store has the same WAL-switch race; one helper should own the WAL switch.
   - **ft-fbd79cba**: the storm test misses coalesce and ignore regressions (pre-existing), plus load flakes in desktop::instance, git_reader memo and agent_layout.
 - Still waiting: ft-92734a91 and ft-b595921a (owner decisions); ft-9cfd5574 and ft-a2936457 (wave 6); terminal-side cards (wait for `term/integrate`); ft-cc4be67b (needs a quiet host).
+
+---
+
+# Wave 6, part 1 (2026-10-23)
+
+**State.**
+- **Merged:** `main` → `95a1f515`, a fast-forward of `b24/integrate`, carrying lanes W6-L1, W6-L2 and W6-L4.
+- **Split out:** W6-L3 (WAL owner plus the test residue) is still in its second adversarial round and lands separately.
+- Nothing is pushed, and the installed binaries are still not reinstalled (held until Jarvis is re-pinned).
+
+**Coordinator rulings this wave (Fable authority):**
+- `gitpulse_collision_risk` without `path` now omits the `Option` `entity` verdict instead of attaching one computed for row 0. This is a correctness fix inside the existing contract, not a shape break.
+- Vendored DevCouncil code is never edited here. The slice guard scans it in report-only mode.
+- No `cfg(test)` forks of production timing or caching. Applied to W6-L3, which is now being reworked.
+
+## Cards moved to review
+
+| Card | What landed | Adversarial history |
+|---|---|---|
+| **ft-9cfd5574** pre-edit collision blind spot (high) | One owner, `insights::collision_for_path`: a pathspec-limited `status -z -u -- :(literal)` per other worktree, used by the hook, change_context and preflight. One shared `STATUS_ARGV` with showUntrackedFiles=all pinned. Optional `path` on `gitpulse_collision_risk`. No row-0 fallback. The incoming Edit/Write is placed on HEAD lines, and an unlocatable edit asks. | 30 tests; 4 breaks, all fixed: **(security)** a binary or unparsed diff read as Disjoint, now fails closed; a case-variant untracked file on APFS; a target under a gitlink; the scan cap's unread tail, now INCOMPLETE. The 18-worktree slow-git deadline answered in 4.25 s with a partial notice. |
+| **ft-a2936457** ledger honesty fold | `LedgerView` folded into `LedgerStatus`. `status_readonly` reports `recording:false`. The MCP wire is byte-identical against a golden captured on base. check:types learned `serde(flatten)`. session_brief briefs "readable (…)" from the actual freshness basis, keeps drops and caveats, and the unreachable branch was deleted with callers cited. | 5 breaks, all in the brief: a false catch-up claim, drops hidden, caveats hidden, the dead branch. All fixed. The wire and checker held (16 mutations caught). |
+| **ft-181d43a9** non-ASCII slice panics (filed from the W6-A audit) | `fs_entry::strip_suffix_ascii_ci`, plus a third panic found in commit_graph `decode_hex` (non-ASCII `.git/HEAD`). `tests/str_tail_slices.rs` guards the class, and scans the vendored crates in report-only mode. | 8 guard breaks, all fixed. The oracle proptest against the old implementation is identical. |
+
+## W6-A audit (read-only)
+
+- 4 findings. Opus verified the byte arithmetic of both panics.
+- Filed as **ft-181d43a9** (done above) and **ft-eeb28bf6**: storage walks drop non-UTF-8 and non-permission errors uncounted, and mcp_info hides a malformed template.
+
+## Gates (verified)
+
+**Gate 9, full suites on `b24/integrate` 95a1f515.** fmt, clippy `-D warnings`, `bun run check`, `check:types`, `check:ipc` and `check:vendor-schema` all OK. vitest **10855 passed, 0 failed**.
+
+- **cargo `--tests --no-fail-fast`:** 1 failure, `adversarial_repos::ref_name_validation_rejects_hostile_branch_names_without_side_effects`. It is the git spawn-rate limit deferring under load ("local bucket: 0 token(s)"), in a test wave 6 does not touch. The rerun on the same tree passed 16/16 (load 42).
+- **`check:schema-parity`:** the same expected stale rows (installed gitpulse-mcp and app, Jarvis pin) and devmap unverifiable.
+
+## Still open
+
+- **W6-L3** (ft-eb5034ce WAL owner, ft-fbd79cba residue) is in its second round:
+  - an injectable production ownership deadline;
+  - `enter_wal` patience as a total bound (a busy handler currently stacks on top of it, so the ledger worst case is about 15 s against the stated 10 s);
+  - the ref_cache test-build fork to be removed;
+  - which thread runs the churn store initialiser.
+- **ft-eeb28bf6:** storage partial totals and mcp_info.
+- **Load-sensitive tests seen this wave:**
+  - `adversarial_repos` ref-name (spawn bucket under load);
+  - `entity_collision::the_join_over_256…`;
+  - `git_reader` `a_carried_answer_is_not_spent_against_the_time_budget` and `adv_l4` torn-answer (both fail on base too).
+- Carried from wave 5: the reinstall (after the Jarvis re-pin), the Manvi half of ft-329789a9, ft-92734a91 and ft-b595921a (owner decisions), the terminal-side cards (waiting on `term/integrate`), and ft-cc4be67b (needs a quiet host).
