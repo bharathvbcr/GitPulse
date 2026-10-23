@@ -32,6 +32,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod commit_graph;
 pub mod hygiene;
+#[cfg(test)]
+mod walk_adversarial;
+#[cfg(test)]
+mod walk_bench;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;

@@ -9,6 +9,8 @@ mod collision_memo;
 mod entity_collision;
 #[cfg(test)]
 mod head_divergence_tests;
+#[cfg(test)]
+mod mcp_info_adversarial;
 pub(crate) mod live_sessions;
 #[cfg(test)]
 mod merge_adv_tests;
