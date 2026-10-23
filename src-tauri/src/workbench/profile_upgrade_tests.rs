@@ -1,4 +1,4 @@
-//! Upgrading a real profile to the current dc-store schema (13; the 10 → 11
+//! Upgrading a real profile to the current dc-store schema (14; the 10 → 11
 //! step archives Done tasks, 11 → 12 adds refinement proposals, 12 → 13 shortens
 //! request receipts), end to end,
 //! through the host GitPulse runs.
@@ -196,7 +196,7 @@ fn a_real_profile_upgrades_to_the_current_schema_and_keeps_everything_it_held() 
         .query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, crate::workbench::WORKBENCH_SCHEMA);
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
 
     // Every Done task, and only those, is in the archive, most recently
     // completed first, with the completion its own history records.
@@ -401,7 +401,7 @@ fn a_schema_11_profile_upgrades_to_13_and_keeps_its_tasks() {
         .unwrap();
         placed.item.unwrap()
     };
-    assert_eq!(profile_version(&path), 13);
+    assert_eq!(profile_version(&path), crate::workbench::WORKBENCH_SCHEMA);
 
     Connection::open(&path)
         .unwrap()
@@ -409,7 +409,7 @@ fn a_schema_11_profile_upgrades_to_13_and_keeps_its_tasks() {
         .unwrap();
     let upgraded = host_on(&path);
     let listed = list_inbox(&upgraded).unwrap();
-    assert_eq!(profile_version(&path), 13);
+    assert_eq!(profile_version(&path), crate::workbench::WORKBENCH_SCHEMA);
     let titles: Vec<&str> = listed["items"]
         .as_array()
         .unwrap()

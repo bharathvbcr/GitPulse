@@ -69,7 +69,7 @@ fn the_app_upgrades_an_older_profile_once_and_reports_when_it_cannot() {
     std::fs::remove_dir(&blocker).unwrap();
     let listed = host.board_request("items.list", "{}").unwrap();
     assert!(listed["items"].is_array(), "{listed}");
-    assert_eq!(version(&path), 13);
+    assert_eq!(version(&path), crate::workbench::WORKBENCH_SCHEMA);
     assert!(backup.exists(), "the pre-upgrade copy is kept");
     assert!(
         degraded_now(&path).is_none(),

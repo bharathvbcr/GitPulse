@@ -801,9 +801,9 @@ mod tests {
             )
             .unwrap();
         let err = scope(repo, "TASK-2").unwrap_err();
-        assert!(err.contains("forbidden_changes_json"), "{err}");
+        assert!(err.contains("scope.forbidden_changes"), "{err}");
         let err = scopes(repo, &["TASK-2".to_string()]).unwrap_err();
-        assert!(err.contains("forbidden_changes_json"), "{err}");
+        assert!(err.contains("scope.forbidden_changes"), "{err}");
     }
 
     #[test]
@@ -983,7 +983,12 @@ mod tests {
         let db = store_path(repo);
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         let store = dc_store::Store::open(&db).unwrap();
-        plant(&store, "TASK-7", "in_progress", r#"{"planned_files":["a.rs"]}"#);
+        plant(
+            &store,
+            "TASK-7",
+            "in_progress",
+            r#"{"planned_files":["a.rs"]}"#,
+        );
         drop(store);
         let mut permissions = std::fs::metadata(&db).unwrap().permissions();
         permissions.set_readonly(true);

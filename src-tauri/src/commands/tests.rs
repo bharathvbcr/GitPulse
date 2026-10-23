@@ -777,7 +777,7 @@ fn many_task_scopes_authenticate_the_repository_once() {
     let scopes = super::task_scopes(path, &ids).expect("scopes");
     assert_eq!(listings() - before, 1, "one authentication for the set");
     let titles: Vec<&str> = scopes.iter().map(|scope| scope.title.as_str()).collect();
-    assert_eq!(titles, ["title of T1", "title of T2", "title of T3"]);
+    assert_eq!(titles, ["planted T1", "planted T2", "planted T3"]);
 
     let before = listings();
     assert!(super::task_scopes(path, &[]).expect("empty").is_empty());
