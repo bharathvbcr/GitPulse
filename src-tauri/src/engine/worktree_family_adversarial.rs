@@ -4,7 +4,9 @@
 //! that fails shows the cache believing something Git would not. Tests marked
 //! BREAK in their doc comment fail against the lane's code on purpose.
 
-use super::worktree::{admit_worktree_pair, family_disk_dir, forget_in_process, read_worktree_entries};
+use super::worktree::{
+    admit_worktree_pair, family_disk_dir, forget_in_process, read_worktree_entries,
+};
 use super::worktree_family_disk as disk;
 use crate::test_support::{git_in, repo_with_worktrees, trust_repo};
 use std::os::unix::fs::PermissionsExt;
@@ -57,6 +59,7 @@ impl Fx {
         admit_worktree_pair(repo, worktree)?.authenticate()
     }
     /// What the pair gets with nothing remembered anywhere: Git decides.
+    #[allow(clippy::wrong_self_convention)]
     fn from_git(
         &self,
         repo: &str,
@@ -81,7 +84,9 @@ impl Fx {
     }
     /// The registry entry directory of linked worktree `index`.
     fn entry(&self, index: usize) -> PathBuf {
-        self.common().join("worktrees").join(format!("wt-{index:02}"))
+        self.common()
+            .join("worktrees")
+            .join(format!("wt-{index:02}"))
     }
 }
 
@@ -108,7 +113,10 @@ fn a_worktree_whose_registry_pointer_vanished_is_not_believed() {
     let cold = fx.from_git(&repo, &live);
     assert!(cold.is_err(), "Git denies it: {cold:?}");
     let warm = fx.fresh(&repo, &live);
-    assert!(warm.is_err(), "the cache believed a deregistered worktree: {warm:?}");
+    assert!(
+        warm.is_err(),
+        "the cache believed a deregistered worktree: {warm:?}"
+    );
 }
 
 /// BREAK (security): as above, but the registry pointer is re-pointed at a path
@@ -142,8 +150,16 @@ fn a_file_with_widened_members_cannot_move_the_anchor() {
     members.extend(stored.members.clone());
     disk::store(&fx.common(), &stored.registry, &members);
     let forged = fx.fresh(&repo, &live).expect("still answers");
-    assert_eq!(forged.anchor, honest.anchor, "anchor moved to {:?}", forged.anchor);
-    assert!(!forged.members.contains(&foreign), "family widened: {:?}", forged.members);
+    assert_eq!(
+        forged.anchor, honest.anchor,
+        "anchor moved to {:?}",
+        forged.anchor
+    );
+    assert!(
+        !forged.members.contains(&foreign),
+        "family widened: {:?}",
+        forged.members
+    );
 }
 
 /// BREAK (correctness): a record whose registry equals the current one but
@@ -169,17 +185,26 @@ fn registry_changes_are_seen_by_the_next_process() {
     let fx = fx(2);
     let repo = fx.repo();
     let (a, b) = (fx.linked[0].clone(), fx.linked[1].clone());
-    let (a_s, b_s) = (a.to_str().unwrap().to_owned(), b.to_str().unwrap().to_owned());
+    let (a_s, b_s) = (
+        a.to_str().unwrap().to_owned(),
+        b.to_str().unwrap().to_owned(),
+    );
     fx.fresh(&repo, &a_s).unwrap();
     fx.fresh(&repo, &b_s).unwrap();
 
     // move
     let moved = a.parent().unwrap().join("moved-a");
-    git_in(fx.main.path(), &["worktree", "move", &a_s, moved.to_str().unwrap()]);
+    git_in(
+        fx.main.path(),
+        &["worktree", "move", &a_s, moved.to_str().unwrap()],
+    );
     let moved_c = std::fs::canonicalize(&moved).unwrap();
     trust_repo(&moved_c);
     assert!(fx.fresh(&repo, moved_c.to_str().unwrap()).is_ok());
-    assert!(fx.fresh(&repo, &a_s).is_err(), "old path of a moved worktree");
+    assert!(
+        fx.fresh(&repo, &a_s).is_err(),
+        "old path of a moved worktree"
+    );
 
     // remove
     git_in(fx.main.path(), &["worktree", "remove", "--force", &b_s]);
@@ -193,7 +218,10 @@ fn registry_changes_are_seen_by_the_next_process() {
 
     // prune: delete the directory behind Git's back
     std::fs::remove_dir_all(&moved_c).unwrap();
-    assert!(fx.fresh(&repo, moved_c.to_str().unwrap()).is_err(), "pruned");
+    assert!(
+        fx.fresh(&repo, moved_c.to_str().unwrap()).is_err(),
+        "pruned"
+    );
 }
 
 /// HELD: nothing in the fingerprint is a timestamp or inode, so a registry
@@ -204,7 +232,10 @@ fn registry_changes_are_seen_by_the_next_process() {
 fn a_registry_rewritten_in_place_is_compared_by_content() {
     let fx = fx(2);
     let repo = fx.repo();
-    let (a, b) = (fx.linked[0].to_str().unwrap().to_owned(), fx.linked[1].to_str().unwrap().to_owned());
+    let (a, b) = (
+        fx.linked[0].to_str().unwrap().to_owned(),
+        fx.linked[1].to_str().unwrap().to_owned(),
+    );
     fx.fresh(&repo, &a).unwrap();
     // Swap the two pointers in one instant, then put worktree b elsewhere.
     let (ga, gb) = (fx.entry(0).join("gitdir"), fx.entry(1).join("gitdir"));
@@ -279,7 +310,13 @@ fn a_fifo_in_place_of_the_file_is_a_miss_not_a_hang() {
     });
     let verdict = rx.recv_timeout(std::time::Duration::from_secs(3));
     // Release the blocked reader whatever happened so the test can end.
-    let _ = std::fs::OpenOptions::new().write(true).open(&file);
+    // O_NONBLOCK: with no reader a plain write-open of a FIFO blocks forever,
+    // which is exactly what happens once `load` correctly returned a miss.
+    let _ = std::os::unix::fs::OpenOptionsExt::custom_flags(
+        std::fs::OpenOptions::new().write(true),
+        libc::O_NONBLOCK,
+    )
+    .open(&file);
     reader.join().unwrap();
     assert_eq!(verdict, Ok(true), "load did not return a miss within 3s");
 }
@@ -309,7 +346,10 @@ fn a_symlinked_cache_directory_and_loose_modes_are_misses() {
     let link = holder.path().join("via-link");
     std::os::unix::fs::symlink(real.path(), &link).unwrap();
     let _scope = family_disk_dir::set(&link);
-    assert!(disk::load(&fx.common()).is_none(), "followed a symlinked directory");
+    assert!(
+        disk::load(&fx.common()).is_none(),
+        "followed a symlinked directory"
+    );
 }
 
 /// HELD: truncated, empty, nested-deep and type-confused JSON are misses and a
@@ -333,12 +373,22 @@ fn partial_and_malformed_records_are_misses() {
         bodies.push(good[..cut].to_vec());
     }
     let text = String::from_utf8(good.clone()).unwrap();
-    bodies.push(text.replace("\"members\":[", "\"members\":{\"x\":[").into_bytes());
-    bodies.push(text.replace("\"version\":1", "\"version\":\"1\"").into_bytes());
+    bodies.push(
+        text.replace("\"members\":[", "\"members\":{\"x\":[")
+            .into_bytes(),
+    );
+    bodies.push(
+        text.replace("\"version\":1", "\"version\":\"1\"")
+            .into_bytes(),
+    );
     for body in bodies {
         std::fs::write(&file, &body).unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(disk::load(&fx.common()).is_none(), "{:?}", String::from_utf8_lossy(&body));
+        assert!(
+            disk::load(&fx.common()).is_none(),
+            "{:?}",
+            String::from_utf8_lossy(&body)
+        );
     }
 }
 
@@ -349,7 +399,9 @@ fn concurrent_writers_never_tear_a_record() {
     let memory = private_dir();
     let common = PathBuf::from("/r/.git");
     let variant = |n: usize| -> Vec<PathBuf> {
-        (0..=n * 7).map(|i| PathBuf::from(format!("/r/wt-{n}-{i}"))).collect()
+        (0..=n * 7)
+            .map(|i| PathBuf::from(format!("/r/wt-{n}-{i}")))
+            .collect()
     };
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut writers = Vec::new();
@@ -370,7 +422,10 @@ fn concurrent_writers_never_tear_a_record() {
             let mut seen = 0usize;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Some(stored) = disk::load(&common) {
-                    assert_eq!(stored.registry, stored.members, "registry and members from different writers");
+                    assert_eq!(
+                        stored.registry, stored.members,
+                        "registry and members from different writers"
+                    );
                     let n = (stored.members.len() - 1) / 7;
                     assert_eq!(stored.members, variant(n), "mixed record");
                     seen += 1;
@@ -403,14 +458,24 @@ fn a_stale_staging_file_with_this_pid_does_not_lose_the_write() {
     let common = PathBuf::from("/r/.git");
     let family = vec![PathBuf::from("/r")];
     disk::store(&common, &family, &family);
-    let json = std::fs::read_dir(memory.path()).unwrap().next().unwrap().unwrap().file_name();
+    let json = std::fs::read_dir(memory.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name();
     std::fs::remove_file(memory.path().join(&json)).unwrap();
-    let stale = memory
-        .path()
-        .join(format!(".{}.{}.tmp", json.to_string_lossy(), std::process::id()));
+    let stale = memory.path().join(format!(
+        ".{}.{}.tmp",
+        json.to_string_lossy(),
+        std::process::id()
+    ));
     std::fs::write(&stale, b"left by a crashed process").unwrap();
     disk::store(&common, &family, &family);
-    assert!(disk::load(&common).is_some(), "the write was lost to a stale staging file");
+    assert!(
+        disk::load(&common).is_some(),
+        "the write was lost to a stale staging file"
+    );
 }
 
 /// Quantifies growth: one file per repository ever authenticated, never
@@ -422,10 +487,22 @@ fn the_cache_directory_is_bounded() {
     let _scope = family_disk_dir::set(memory.path());
     let family = vec![PathBuf::from("/Users/someone/Code/devtools/GitPulse")];
     for n in 0..1500 {
-        disk::store(&PathBuf::from(format!("/Users/someone/repo-{n}/.git")), &family, &family);
+        disk::store(
+            &PathBuf::from(format!("/Users/someone/repo-{n}/.git")),
+            &family,
+            &family,
+        );
     }
     let files: Vec<_> = std::fs::read_dir(memory.path()).unwrap().collect();
-    let bytes: u64 = files.iter().map(|e| e.as_ref().unwrap().metadata().unwrap().len()).sum();
-    eprintln!("{} files, {} bytes of content ({} per file)", files.len(), bytes, bytes / files.len() as u64);
+    let bytes: u64 = files
+        .iter()
+        .map(|e| e.as_ref().unwrap().metadata().unwrap().len())
+        .sum();
+    eprintln!(
+        "{} files, {} bytes of content ({} per file)",
+        files.len(),
+        bytes,
+        bytes / files.len() as u64
+    );
     assert!(files.len() <= 1024, "{} files and no pruning", files.len());
 }

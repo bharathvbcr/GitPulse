@@ -154,7 +154,10 @@ fn load_in(dir: &Path, common: &Path) -> Option<Stored> {
     }
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        // Never follow a link, and never block on a FIFO or device planted at
+        // the name: the kind is read from the opened descriptor (no gap between
+        // check and use) before a byte of it is read.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(dir.join(file_name(common)))
         .ok()?;
     let meta = file.metadata().ok()?;
@@ -216,15 +219,104 @@ fn store_in(dir: &Path, common: &Path, registry: &[PathBuf], members: &[PathBuf]
     // Written whole under a name of its own and renamed over the target, so a
     // reader sees the old file or the new one and never half of either.
     let name = file_name(common);
-    let staging = dir.join(format!(".{name}.{}.tmp", std::process::id()));
-    let written = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&staging)
-        .and_then(|mut file| file.write_all(&body).and_then(|()| file.sync_data()));
+    // A staging name no other writer, thread or crashed process can hold: pid,
+    // clock and a counter, created exclusively, and tried again on the rare
+    // collision rather than taking over or deleting what is there.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut staged = None;
+    for _ in 0..STAGING_ATTEMPTS {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let staging = dir.join(format!(
+            ".{name}.{}.{nanos}.{count}{STAGING_SUFFIX}",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&staging)
+        {
+            Ok(file) => {
+                staged = Some((staging, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return,
+        }
+    }
+    let Some((staging, mut file)) = staged else {
+        return;
+    };
+    let written = file.write_all(&body).and_then(|()| file.sync_data());
     if written.is_err() || std::fs::rename(&staging, dir.join(&name)).is_err() {
         let _ = std::fs::remove_file(&staging);
+        return;
+    }
+    prune(dir, &name);
+}
+
+/// Staging files are `.<name>.<pid>.<nanos>.<n>.tmp`.
+#[cfg(unix)]
+const STAGING_SUFFIX: &str = ".tmp";
+
+/// Tries at a staging name before the write is given up (the next call
+/// writes it).
+#[cfg(unix)]
+const STAGING_ATTEMPTS: usize = 8;
+
+/// Most remembered families kept. One file per repository, a few hundred bytes
+/// each; past this the least recently written go.
+#[cfg(unix)]
+const MAX_FILES: usize = 256;
+
+/// A staging file older than this belongs to a writer that is gone.
+#[cfg(unix)]
+const STAGING_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Directory entries one prune looks at, so a directory something else filled
+/// is bounded work.
+#[cfg(unix)]
+const PRUNE_SCAN: usize = 4 * MAX_FILES;
+
+/// Keeps the directory bounded after a store: removes staging leftovers older
+/// than [`STAGING_MAX_AGE`] and, over [`MAX_FILES`], the oldest records by
+/// modification time, never `keep` (the one just written). Stores happen only
+/// when Git was asked, so this is not on the hot path. Errors are ignored:
+/// a record that stays costs bytes, and one that goes costs one Git call.
+#[cfg(unix)]
+fn prune(dir: &Path, keep: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    let mut records = Vec::new();
+    for entry in entries.take(PRUNE_SCAN).flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let modified = meta.modified().unwrap_or(now);
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if file_name.ends_with(STAGING_SUFFIX) {
+            let age = now.duration_since(modified).unwrap_or_default();
+            if age > STAGING_MAX_AGE {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        } else if file_name.ends_with(".json") && file_name != keep {
+            records.push((modified, entry.path()));
+        }
+    }
+    // `keep` is one of the MAX_FILES the directory may hold.
+    if records.len() < MAX_FILES {
+        return;
+    }
+    records.sort();
+    let excess = records.len() + 1 - MAX_FILES;
+    for (_, path) in records.into_iter().take(excess) {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -320,6 +412,63 @@ mod tests {
             std::fs::read_dir(open.path()).unwrap().next().is_none(),
             "wrote into a directory others can write"
         );
+    }
+
+    /// The guard path. The anchor `resolve_worktree_family` returns is where the
+    /// ledger and the task store are read, so a file that could move it would
+    /// let a same-user writer make a guard judge this checkout against another
+    /// repository's task. Whatever the file says, the anchor is the primary
+    /// checkout the repository's own metadata proves, and the family is only
+    /// what the registry names.
+    #[test]
+    fn a_forged_file_cannot_point_the_guard_at_another_repositorys_anchor() {
+        use crate::engine::worktree::{
+            family_disk_dir, forget_in_process, resolve_worktree_family,
+        };
+        use crate::test_support::{git_in, repo_with_worktrees, trust_repo};
+
+        let (main, _parent, linked) = repo_with_worktrees(2);
+        trust_repo(main.path());
+        let memory = private_dir();
+        let _remembering = family_disk_dir::set(memory.path());
+        let other = tempfile::tempdir().expect("another repository");
+        git_in(other.path(), &["init", "-b", "main"]);
+        trust_repo(other.path());
+        let other = other.path().canonicalize().unwrap();
+
+        let repo = main.path().canonicalize().unwrap();
+        let common = repo.join(".git");
+        let (repo_s, worktree_s) = (repo.to_str().unwrap(), linked[0].to_str().unwrap());
+        let honest = resolve_worktree_family(repo_s, worktree_s).expect("registered");
+        let stored = load_in(memory.path(), &common).expect("stored");
+
+        let mut widened = vec![other.clone()];
+        widened.extend(stored.members.clone());
+        let swapped: Vec<PathBuf> = stored
+            .members
+            .iter()
+            .map(|m| {
+                if *m == honest.anchor {
+                    other.clone()
+                } else {
+                    m.clone()
+                }
+            })
+            .collect();
+        let mut reversed = stored.members.clone();
+        reversed.reverse();
+        for forged in [widened, swapped, reversed] {
+            store_in(memory.path(), &common, &stored.registry, &forged);
+            forget_in_process(&common);
+            let family = resolve_worktree_family(repo_s, worktree_s).expect("still answers");
+            assert_eq!(family.anchor, honest.anchor, "forged {forged:?}");
+            assert!(!family.members.contains(&other), "{:?}", family.members);
+            let mut got = family.members.clone();
+            got.sort();
+            let mut want = honest.members.clone();
+            want.sort();
+            assert_eq!(got, want);
+        }
     }
 
     #[test]
