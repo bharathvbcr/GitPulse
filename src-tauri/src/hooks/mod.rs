@@ -1683,31 +1683,7 @@ pub fn session_brief(snapshot: &InsightsSnapshot, here: &str, source: &str) -> S
         ));
     }
 
-    out.push_str(&format!(
-        "ledger: {}\n",
-        if snapshot.ledger.recording {
-            let dropped = snapshot.ledger.dropped;
-            if dropped > 0 {
-                format!("recording ({dropped} append(s) dropped — history incomplete)")
-            } else {
-                "recording".to_string()
-            }
-        } else if snapshot.ledger.recording_state == crate::ledger::STATE_READABLE {
-            // The snapshot is a read, so a healthy ledger is "readable", never
-            // "recording" (nothing here writes) and never "NOT recording" (it
-            // opened fine). Freshness says how much to trust what it holds.
-            format!(
-                "readable (this session only reads it; {})",
-                if snapshot.ledger.freshness.stale {
-                    or_unknown(&snapshot.ledger.freshness.stale_reason)
-                } else {
-                    "a catch-up ran recently".to_string()
-                }
-            )
-        } else {
-            format!("NOT recording ({})", or_unknown(&snapshot.ledger.error))
-        }
-    ));
+    out.push_str(&format!("ledger: {}\n", ledger_brief(&snapshot.ledger)));
 
     out.push_str(&format!(
         "code graph: {}\n",
@@ -1906,6 +1882,71 @@ fn session_env() -> Option<String> {
     std::env::var(crate::alerts::bridge::SESSION_ENV)
         .ok()
         .filter(|session| !session.is_empty())
+}
+
+/// The most of a ledger caveat the brief carries: the brief is read by an
+/// agent at session start, and these texts come from the ledger and the
+/// filesystem, not from this crate.
+const LEDGER_CAVEAT_BYTES: usize = 240;
+
+/// One line of untrusted text: whitespace runs (newlines included) become one
+/// space, control characters go, and the rest is cut to `limit` bytes with `…`.
+fn one_bounded_line(text: &str, limit: usize) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if flat.len() <= limit {
+        return flat;
+    }
+    format!("{}…", clip(&flat, limit.saturating_sub('…'.len_utf8())))
+}
+
+/// What the brief says about the ledger, from what the snapshot's open proved.
+///
+/// The snapshot is a read (`insights::snapshot` is its only constructor, and
+/// the only thing `run_session_brief` briefs from), so a ledger here is
+/// `readable` or `unknown`, never `recording`: nothing in this process writes
+/// it. A readable one says what its freshness rests on (a catch-up pass, only
+/// the newest event row, or nothing), never "a catch-up ran" without one. Drops
+/// are this process's count and are said whenever there are any. A caveat
+/// (`error`: rows a read cannot see, demoted bindings) is carried in every
+/// state, bounded.
+fn ledger_brief(ledger: &crate::ledger::LedgerStatus) -> String {
+    let mut line = if ledger.recording_state == crate::ledger::STATE_READABLE {
+        let freshness = &ledger.freshness;
+        let basis = if freshness.stale {
+            or_unknown(&freshness.stale_reason)
+        } else {
+            match freshness.last_catch_up_basis.as_str() {
+                "catch_up_state" => "a catch-up ran recently".to_string(),
+                "newest_row" => "no catch-up recorded; the newest event row is recent".to_string(),
+                _ => "no catch-up recorded".to_string(),
+            }
+        };
+        format!("readable (this session only reads it; {basis})")
+    } else {
+        format!(
+            "NOT recording ({})",
+            one_bounded_line(&or_unknown(&ledger.error), LEDGER_CAVEAT_BYTES)
+        )
+    };
+    if ledger.dropped > 0 {
+        line.push_str(&format!(
+            " ({} append(s) dropped by this process, history incomplete)",
+            ledger.dropped
+        ));
+    }
+    if ledger.recording_state == crate::ledger::STATE_READABLE && !ledger.error.trim().is_empty() {
+        line.push_str(&format!(
+            "; caveat: {}",
+            one_bounded_line(&ledger.error, LEDGER_CAVEAT_BYTES)
+        ));
+    }
+    line
 }
 
 /// The most of an agent's own text one report carries. The socket refuses a
@@ -2342,8 +2383,8 @@ mod tests {
                 entity: None,
             }]),
             ledger: LedgerStatus {
-                recording: true,
-                recording_state: "recording".to_string(),
+                recording: false,
+                recording_state: "readable".to_string(),
                 path: "/repo/.gitpulse/ledger.sqlite".to_string(),
                 dropped: 0,
                 dropped_scope: "this_process".to_string(),
@@ -4176,7 +4217,7 @@ done
         assert!(brief.contains("feature"));
         assert!(brief.contains("session feature-a1b2"));
         assert!(brief.contains("collisions: 1 file(s)"));
-        assert!(brief.contains("ledger: recording"));
+        assert!(brief.contains("ledger: readable"));
         assert!(brief.contains("11294 symbols"));
     }
 
@@ -4300,6 +4341,7 @@ done
             sessions_error: String::new(),
         };
         snapshot.ledger.recording = false;
+        snapshot.ledger.recording_state = "unknown".to_string();
         snapshot.ledger.error = "database locked".to_string();
         snapshot.codeintel.available = false;
         snapshot.codeintel.reason = Some("no index".to_string());
@@ -4335,13 +4377,49 @@ done
 
         snapshot.ledger.freshness.stale = false;
         snapshot.ledger.freshness.stale_reason = String::new();
-        let fresh = session_brief(&snapshot, "/repo", "startup");
+        for (basis, said) in [
+            ("catch_up_state", "a catch-up ran recently"),
+            (
+                "newest_row",
+                "no catch-up recorded; the newest event row is recent",
+            ),
+            ("none", "no catch-up recorded"),
+        ] {
+            snapshot.ledger.freshness.last_catch_up_basis = basis.to_string();
+            let fresh = session_brief(&snapshot, "/repo", "startup");
+            assert!(
+                fresh.contains(&format!(
+                    "ledger: readable (this session only reads it; {said})"
+                )),
+                "{basis}: {fresh}"
+            );
+            assert!(!fresh.contains("NOT recording"), "{fresh}");
+        }
+    }
+
+    #[test]
+    fn a_ledger_brief_carries_drops_and_a_bounded_one_line_caveat_in_every_state() {
+        let mut snapshot = snapshot_fixture();
+        snapshot.ledger.dropped = 3;
+        snapshot.ledger.error = format!("sibling rows\nnot shown\u{7} {}", "x".repeat(1000));
+        let readable = ledger_brief(&snapshot.ledger);
+        assert!(readable.starts_with("readable"), "{readable}");
+        assert!(readable.contains("(3 append(s) dropped by this process, history incomplete)"));
         assert!(
-            fresh
-                .contains("ledger: readable (this session only reads it; a catch-up ran recently)"),
-            "{fresh}"
+            readable.contains("caveat: sibling rows not shown "),
+            "{readable}"
         );
-        assert!(!fresh.contains("NOT recording"), "{fresh}");
+        assert!(!readable.contains(['\n', '\u{7}']), "{readable:?}");
+        assert!(readable.len() < 700, "unbounded: {}", readable.len());
+
+        snapshot.ledger.recording_state = "unknown".to_string();
+        let unknown = ledger_brief(&snapshot.ledger);
+        assert!(
+            unknown.starts_with("NOT recording (sibling rows not shown"),
+            "{unknown}"
+        );
+        assert!(unknown.contains("3 append(s) dropped"), "{unknown}");
+        assert!(!unknown.contains("readable"), "{unknown}");
     }
 
     #[test]

@@ -1,6 +1,6 @@
-//! Adversarial probes (W6-L2 reviewer) for `session_brief`'s new "readable"
-//! branch and for LedgerStatus serde. Tests named `BREAK_*` are expected to FAIL
-//! on the reviewed head: each asserts what an honest brief must say.
+//! Adversarial probes (W6-L2 reviewer) for `session_brief`'s "readable" branch
+//! and for LedgerStatus serde, against real snapshots. Each asserts what an
+//! honest brief must say.
 
 use crate::insights::InsightsSnapshot;
 
@@ -35,9 +35,13 @@ fn ledger_line(brief: &str) -> String {
 /// stale, and the brief says "a catch-up ran recently". No catch-up ran: the
 /// freshness came from the newest event row.
 #[test]
-fn break_brief_claims_a_catch_up_ran_when_only_an_event_row_is_recent() {
+fn brief_claims_a_catch_up_ran_when_only_an_event_row_is_recent() {
     let (_dir, snapshot) = real_snapshot_with_one_event();
-    assert_eq!(snapshot.ledger.recording_state, "readable", "{:?}", snapshot.ledger);
+    assert_eq!(
+        snapshot.ledger.recording_state, "readable",
+        "{:?}",
+        snapshot.ledger
+    );
     assert_eq!(snapshot.ledger.freshness.last_catch_up_basis, "newest_row");
     assert!(snapshot.ledger.freshness.catch_up.is_none());
     let line = ledger_line(&crate::hooks::session_brief(&snapshot, "/repo", "startup"));
@@ -51,9 +55,11 @@ fn break_brief_claims_a_catch_up_ran_when_only_an_event_row_is_recent() {
 /// read cannot see) and the history-only-bindings notice never reach the brief,
 /// which says only "readable (...; a catch-up ran recently)".
 #[test]
-fn break_readable_brief_hides_the_legacy_unconsolidated_caveat() {
+fn readable_brief_hides_the_legacy_unconsolidated_caveat() {
     let (_dir, mut snapshot) = real_snapshot_with_one_event();
-    snapshot.ledger.error = "legacy worktree ledgers are not consolidated; rows from siblings are not shown".to_string();
+    snapshot.ledger.error =
+        "legacy worktree ledgers are not consolidated; rows from siblings are not shown"
+            .to_string();
     snapshot.ledger.error_code = "legacy_ledger_unconsolidated".to_string();
     let line = ledger_line(&crate::hooks::session_brief(&snapshot, "/repo", "startup"));
     assert!(
@@ -63,10 +69,11 @@ fn break_readable_brief_hides_the_legacy_unconsolidated_caveat() {
 }
 
 #[test]
-fn break_readable_brief_hides_the_history_only_bindings_notice() {
+fn readable_brief_hides_the_history_only_bindings_notice() {
     let (_dir, mut snapshot) = real_snapshot_with_one_event();
     snapshot.ledger.history_only_bindings = 2;
-    snapshot.ledger.error = "2 bind/unbind row(s) written by sibling worktrees were kept as history only".to_string();
+    snapshot.ledger.error =
+        "2 bind/unbind row(s) written by sibling worktrees were kept as history only".to_string();
     snapshot.ledger.error_code = "binding_rows_history_only".to_string();
     let line = ledger_line(&crate::hooks::session_brief(&snapshot, "/repo", "startup"));
     assert!(
@@ -78,7 +85,7 @@ fn break_readable_brief_hides_the_history_only_bindings_notice() {
 /// The old brief said "recording (N append(s) dropped - history incomplete)"
 /// whenever dropped > 0; the readable branch drops that warning entirely.
 #[test]
-fn break_readable_brief_hides_dropped_appends() {
+fn readable_brief_hides_dropped_appends() {
     let (_dir, mut snapshot) = real_snapshot_with_one_event();
     snapshot.ledger.dropped = 3;
     let line = ledger_line(&crate::hooks::session_brief(&snapshot, "/repo", "startup"));
@@ -114,21 +121,34 @@ fn brief_matrix_never_says_readable_for_unknown_and_never_drops_a_hard_error() {
                     snapshot.ledger.recording = recording;
                     snapshot.ledger.recording_state = state.to_string();
                     snapshot.ledger.freshness.stale = stale;
-                    snapshot.ledger.freshness.stale_reason =
-                        if stale { "no catch-up newer than 600s".to_string() } else { String::new() };
+                    snapshot.ledger.freshness.stale_reason = if stale {
+                        "no catch-up newer than 600s".to_string()
+                    } else {
+                        String::new()
+                    };
                     snapshot.ledger.error = error.to_string();
-                    let line = ledger_line(&crate::hooks::session_brief(&snapshot, "/repo", "startup"));
+                    let line =
+                        ledger_line(&crate::hooks::session_brief(&snapshot, "/repo", "startup"));
                     if state == "unknown" {
-                        assert!(!line.contains("readable"), "unknown briefed as readable: {line}");
+                        assert!(
+                            !line.contains("readable"),
+                            "unknown briefed as readable: {line}"
+                        );
                     }
                     if !error.is_empty() && !line.contains(error) {
-                        hidden.push(format!("recording={recording} state={state} stale={stale} -> {line}"));
+                        hidden.push(format!(
+                            "recording={recording} state={state} stale={stale} -> {line}"
+                        ));
                     }
                 }
             }
         }
     }
-    assert!(hidden.is_empty(), "an error vanished from the brief:\n{}", hidden.join("\n"));
+    assert!(
+        hidden.is_empty(),
+        "an error vanished from the brief:\n{}",
+        hidden.join("\n")
+    );
 }
 
 /// Stored or cached LedgerStatus JSON from before the fold (no freshness, no
@@ -147,7 +167,8 @@ fn an_older_stored_ledger_status_still_deserialises() {
         "recording": false, "path": "", "dropped": 0, "error": "x", "error_code": "y",
         "some_future_field": 1
     });
-    serde_json::from_value::<crate::ledger::LedgerStatus>(with_unknown_field).expect("unknown field");
+    serde_json::from_value::<crate::ledger::LedgerStatus>(with_unknown_field)
+        .expect("unknown field");
 }
 
 /// The creating `status()` serialises `recording_state: recording` next to a
@@ -159,12 +180,20 @@ fn the_creating_status_of_a_healthy_ledger_carries_the_not_read_default() {
     let dir = tempfile::tempdir().expect("tempdir");
     crate::test_support::git_in(dir.path(), &["init", "-q"]);
     crate::test_support::trust_repo(dir.path());
-    let repo = dir.path().canonicalize().expect("canonical").to_string_lossy().into_owned();
+    let repo = dir
+        .path()
+        .canonicalize()
+        .expect("canonical")
+        .to_string_lossy()
+        .into_owned();
     let status = crate::ledger::status(&repo);
     assert!(status.recording, "{status:?}");
     let wire = serde_json::to_value(&status).expect("wire");
     assert_eq!(wire["recording_state"], "recording");
     assert_eq!(wire["stale"], true);
     assert_eq!(wire["freshness_ok"], false);
-    assert_eq!(wire["freshness_error"], "freshness was not read for this answer");
+    assert_eq!(
+        wire["freshness_error"],
+        "freshness was not read for this answer"
+    );
 }
