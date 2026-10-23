@@ -237,6 +237,7 @@ fn replay_child() {
         "REPLAY recorded={} duplicates={} skipped={} failed={}",
         out.recorded, out.duplicates_refused, out.reflog_skipped, out.failed_records
     );
+    println!("REPLAY-DETAIL {out:?}");
 }
 
 /// A command that runs [`replay_child`] from a private copy of this harness.
@@ -462,7 +463,12 @@ fn two_processes_replaying_at_once_record_exactly_one_row_per_entry() {
     assert_eq!(
         recorded + duplicates + skipped,
         2 * total,
-        "every entry accounted for: recorded {recorded} + duplicates {duplicates} + skipped {skipped}"
+        "every entry accounted for: recorded {recorded} + duplicates {duplicates} + skipped {skipped}\n{}",
+        outputs
+            .iter()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     assert_eq!(
         i64::try_from(reflog_rows(&repo).len()).unwrap(),

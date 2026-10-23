@@ -524,3 +524,31 @@ fn future_stamped_events_are_never_pruned() {
     assert_eq!(prune_events(&repo, 1, 5).unwrap(), 0);
     assert_eq!(event_count(&repo), 30);
 }
+
+/// Several writers meeting a ledger that does not exist yet all open it. The
+/// journal-mode switch to WAL can answer `database is locked` at once, without
+/// consulting the busy handler, when another connection is switching the same
+/// file; a writer that gave up there left its caller (a replay child, in the
+/// two-process reflog test) with an error and no work done.
+#[test]
+fn writers_racing_to_create_one_ledger_all_open_it() {
+    const WRITERS: usize = 8;
+    for round in 0..25 {
+        let (_dir, repo) = repo_dir();
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(WRITERS));
+        let opened: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                let (gate, repo) = (gate.clone(), repo.clone());
+                std::thread::spawn(move || {
+                    gate.wait();
+                    open(&ledger_path(&repo))
+                        .map(drop)
+                        .map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        for result in opened {
+            assert_eq!(result.join().unwrap(), Ok(()), "round {round}");
+        }
+    }
+}
