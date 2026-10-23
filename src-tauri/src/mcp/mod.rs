@@ -7694,3 +7694,6 @@ mod ledger_honesty_tests;
 
 #[cfg(test)]
 mod adv_l5_tests;
+
+#[cfg(test)]
+mod ledger_wire_golden_tests;
