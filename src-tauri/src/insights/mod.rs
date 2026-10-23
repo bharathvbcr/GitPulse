@@ -2018,6 +2018,10 @@ pub fn collision_row_for_path(repo_path: &str, path: &str) -> CollisionRisk {
 
 /// [`collision_for_path`] without the symbol verdict: who holds `path`, and how
 /// much of the family was read to say so.
+///
+/// The bound is [`MAX_COLLISION_SCANS`] status reads, one per worktree, the
+/// same cap as the repo-wide scan: a family past it has its tail counted in
+/// `unscanned_worktrees` and the answer is partial, never clean.
 pub fn scan_holders_of_path(
     repo_path: &str,
     path: &str,

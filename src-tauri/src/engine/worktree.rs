@@ -864,26 +864,91 @@ pub const MAX_CHANGED_PATHS: usize = 256;
 /// than git's 90 s command timeout. Either way the caller gets an error that
 /// says why, which is how a worktree it could not read stays "unknown".
 ///
-/// `only` limits the read to one path (a `:(literal)` pathspec, so `*?[` in a
-/// name never widen it): the answer to "is this file dirty here" without
-/// walking the rest of the tree's changes.
+/// `only` limits the read to some paths (`:(literal)` pathspecs, so `*?[` in a
+/// name never widen them; `icase` too when the volume ignores case): the
+/// answer to "is this file dirty here" without walking the rest of the tree's
+/// changes.
 fn read_porcelain(
     dir: &Path,
     deadline: Option<&ScanDeadline>,
-    only: Option<&str>,
+    only: Option<OnlyPaths<'_>>,
 ) -> Result<String, String> {
     #[cfg(test)]
     status_probes::fire(dir);
-    let spec = only.map(|path| format!(":(literal){path}"));
+    let magic = match only {
+        Some(only) if only.ignore_case => ":(literal,icase)",
+        _ => ":(literal)",
+    };
+    let specs: Vec<String> = only
+        .iter()
+        .flat_map(|only| only.paths.iter())
+        .map(|path| format!("{magic}{path}"))
+        .collect();
     let mut args: Vec<&str> = crate::engine::git_cli::STATUS_ARGV.to_vec();
-    if let Some(spec) = spec.as_deref() {
-        args.extend(["--", spec]);
+    if !specs.is_empty() {
+        args.push("--");
+        args.extend(specs.iter().map(String::as_str));
     }
     match deadline {
         None => git_text(dir, &args),
         Some(deadline) if deadline.expired() => Err(DEADLINE_PASSED.to_string()),
         Some(deadline) => git_text_with_timeout(dir, &args, deadline.remaining().max(STATUS_GRACE)),
     }
+}
+
+/// The paths a limited status read is about.
+#[derive(Clone, Copy)]
+struct OnlyPaths<'a> {
+    paths: &'a [&'a str],
+    /// The worktree's volume treats `a` and `A` as one name.
+    ignore_case: bool,
+}
+
+/// Whether the volume `repo` lives on ignores case, measured on the volume
+/// itself: `.git` is there in every worktree, and under a case-insensitive
+/// volume `.GIT` is the same file. Git's own `core.ignorecase` is probed the
+/// same way at `init`, but reading it would cost a process per worktree.
+fn volume_ignores_case(repo: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (
+            std::fs::metadata(repo.join(".git")),
+            std::fs::metadata(repo.join(".GIT")),
+        ) {
+            (Ok(real), Ok(flipped)) => (real.dev(), real.ino()) == (flipped.dev(), flipped.ino()),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows volumes ignore case unless a directory opted out.
+        let _ = repo;
+        true
+    }
+}
+
+/// The proper ancestors of `path` that are nested repositories in `repo`
+/// (a submodule, or any directory with its own `.git`). A status of the file
+/// inside one reports nothing, because the superproject sees only the gitlink
+/// row, so the gitlink is asked about as well.
+fn nested_repository_ancestors(repo: &Path, path: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut prefix = String::new();
+    let mut parts = path.split('/').peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            break;
+        }
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(part);
+        if repo.join(&prefix).join(".git").exists() {
+            found.push(prefix.clone());
+        }
+    }
+    found
 }
 
 /// Why a status that never started did not.
@@ -986,8 +1051,36 @@ pub fn changed_paths_only(
             repo.display()
         ));
     }
-    let stdout = read_porcelain(&repo, deadline, Some(path))?;
-    Ok(bounded_status_paths(stdout.as_bytes()))
+    let ignore_case = volume_ignores_case(&repo);
+    let nested = nested_repository_ancestors(&repo, path);
+    let mut asked: Vec<&str> = vec![path];
+    asked.extend(nested.iter().map(String::as_str));
+    let stdout = read_porcelain(
+        &repo,
+        deadline,
+        Some(OnlyPaths {
+            paths: &asked,
+            ignore_case,
+        }),
+    )?;
+    let (mut paths, truncated) = bounded_status_paths(stdout.as_bytes());
+    // A row for the file under another spelling of its name, or for the nested
+    // repository that contains it, is a row for this file: the caller matches
+    // rows by the path it asked about.
+    for entry in &mut paths {
+        let same = |other: &str| {
+            if ignore_case {
+                entry.eq_ignore_ascii_case(other)
+            } else {
+                entry == other
+            }
+        };
+        if same(path) || nested.iter().any(|ancestor| same(ancestor)) {
+            *entry = path.to_string();
+        }
+    }
+    paths.dedup();
+    Ok((paths, truncated))
 }
 
 /// The changed paths of one status read, cut at [`MAX_CHANGED_PATHS`], and

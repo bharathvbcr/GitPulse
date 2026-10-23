@@ -54,7 +54,7 @@ fn w6_own_hunks_above_the_target_never_shift_the_edit_into_a_disjoint_symbol() {
     }
     for from in [1usize, 2, 15, 16, 17, 19] {
         for n in 1..=3usize {
-            if from + n - 1 >= 20 {
+            if from + n > 20 {
                 continue;
             }
             let mut del = base.clone();

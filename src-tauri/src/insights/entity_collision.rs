@@ -576,6 +576,16 @@ fn old_side_diff(repo: &Path, file_path: &str) -> Result<(Vec<OldSideHunk>, Stri
         args.extend(["--no-textconv", "--unified=0", "HEAD", "--", spec.as_str()]);
         let text =
             git_text(repo, &args).map_err(|e| format!("git diff against HEAD failed: {e}"))?;
+        // A diff that says the file differs but prints no hunk header (binary,
+        // or anything this parser was not written for) is not "no edits": the
+        // working lines cannot be numbered, so no edit can be placed against
+        // HEAD. It fails the party, which asks.
+        if !text.trim().is_empty() && !text.lines().any(|line| line.starts_with("@@")) {
+            return Err(
+                "the diff against HEAD has no hunks to number lines by (binary or unparsed), so the edit cannot be placed"
+                    .into(),
+            );
+        }
         hunks.extend(parse_old_side_ranges(&text));
         if !staged {
             head_diff = text;

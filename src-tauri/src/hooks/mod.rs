@@ -4097,6 +4097,50 @@ done
         assert_eq!((cost.worktree_list, cost.status), (1, 2), "{cost:?}");
     }
 
+    /// The scan cap does apply to the path-limited read: at most
+    /// `MAX_COLLISION_SCANS` (16) worktrees get their status read, the rest are
+    /// counted unscanned and the answer says so. A holder in the unread tail is
+    /// therefore reported as a partial scan, not as a finding, and never as
+    /// silence; a holder inside the cap is a finding.
+    #[cfg(unix)]
+    #[test]
+    fn the_scan_cap_leaves_a_tail_unread_and_says_so() {
+        let farm = farm_bound(false, false, 18);
+        let held = |n: usize| {
+            std::fs::write(farm.sibling_dirs[n].join("seed.txt"), "theirs").unwrap();
+            let output = guard_here(&edit_call(&farm.repo, &format!("{}/seed.txt", farm.repo)));
+            crate::test_support::git_in(&farm.sibling_dirs[n], &["checkout", "--", "seed.txt"]);
+            output
+        };
+        let inside = held(2);
+        assert!(asks(&inside), "{:?}", inside.render());
+        let risk = insights::scan_holders_of_path(&farm.repo, "seed.txt", None);
+        assert_eq!(risk.scanned_worktrees, 16, "{risk:?}");
+        assert_eq!(
+            risk.unscanned_worktrees, 3,
+            "19 worktrees, 16 reads: {risk:?}"
+        );
+        assert!(risk.truncated);
+        // The last worktree in git's listing order is one of the three unread.
+        let listing = crate::engine::worktree::list_worktrees_lite(&farm.repo).expect("listing");
+        let last = listing.last().expect("a listing").path.clone();
+        let last_sibling = farm
+            .sibling_dirs
+            .iter()
+            .position(|dir| same_path(dir, &last))
+            .expect("the last worktree is a sibling");
+        let tail = held(last_sibling);
+        assert!(
+            !asks(&tail),
+            "the unread tail cannot have produced a finding"
+        );
+        let text = tail.system_message.unwrap_or_default();
+        assert!(
+            text.contains("INCOMPLETE") && text.contains("3 worktree(s) were not scanned"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn the_incoming_edit_is_read_from_the_tool_input() {
         let parse = |tool: &str, input: Value| {
