@@ -2565,4 +2565,6 @@ class C:
             "nested = {nest:?}"
         );
     }
+
+    mod adv_w6_entity_tests;
 }

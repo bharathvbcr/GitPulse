@@ -4144,6 +4144,8 @@ done
         assert_eq!(parse("Bash", json!({"command": "ls"})), None);
     }
 
+    mod adv_w6_tests;
+
     /// A contended file is still reported on every edit, with the same decision
     /// the unmemoized scan makes, and the symbol check — a DevMap open and git
     /// reads per party — is paid once for the burst.
