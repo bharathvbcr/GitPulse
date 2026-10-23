@@ -449,7 +449,7 @@ pub fn classify_overlapping_path(item: &CollisionItem) -> EntityCollisionVerdict
     let mut failures = Vec::new();
 
     for party in &item.worktrees {
-        match party_old_side_symbols(&item.path, party) {
+        match party_old_side_symbols(&item.path, party, None) {
             Ok(edits) => parties.push(edits),
             Err(failure) => failures.push(PartyFailure {
                 reason: format!("{}: {}", short_party(party), failure.reason),
@@ -469,9 +469,15 @@ fn short_party(party: &CollisionParty) -> String {
         .to_string()
 }
 
+/// One party's edits to `file_path`, joined to its symbols. With `incoming`,
+/// the text the tool call is about to replace is folded into the party's
+/// hunks first: the edit is this party's too, and a party whose dirty edits
+/// are elsewhere would otherwise read as disjoint from a symbol it is about to
+/// change.
 fn party_old_side_symbols(
     file_path: &str,
     party: &CollisionParty,
+    incoming: Option<&[String]>,
 ) -> Result<PartyEdits, PartyFailure> {
     let repo = validate_repo(&party.path).map_err(PartyFailure::other)?;
     let repo_str = repo.to_string_lossy();
@@ -519,7 +525,20 @@ fn party_old_side_symbols(
         return Err(PartyFailure::other("no indexed symbols for path at HEAD"));
     }
 
-    let hunks = old_side_hunks(&repo, file_path).map_err(PartyFailure::other)?;
+    let (mut hunks, head_diff) = old_side_diff(&repo, file_path).map_err(PartyFailure::other)?;
+    if let Some(replaced) = incoming {
+        let content = read_working_text(&repo, file_path).map_err(PartyFailure::other)?;
+        for old in replaced {
+            hunks.push(incoming_hunk(&content, old, &head_diff).map_err(PartyFailure::other)?);
+        }
+        hunks.sort();
+        hunks.dedup();
+    }
+    if hunks.is_empty() {
+        return Err(PartyFailure::other(
+            "no hunks in the worktree diff (binary, mode-only or empty)",
+        ));
+    }
     party_edits(file_path, &spans.items, &hunks).map_err(PartyFailure::other)
 }
 
@@ -535,15 +554,20 @@ fn party_old_side_symbols(
 /// show is counted once. HEAD missing (an unborn branch) makes git fail, which
 /// fails the party.
 ///
-/// The hunk cap and the zero-hunk check apply to the union: no hunks at all (a
-/// binary or mode-only change, or an empty diff) means there is no edit to
-/// place, so no clean split to report.
-fn old_side_hunks(repo: &Path, file_path: &str) -> Result<Vec<OldSideHunk>, String> {
+/// The hunk cap applies to the union. The caller decides what no hunks at all
+/// (a binary or mode-only change, or an empty diff) means: with no incoming
+/// edit there is nothing to place, so no clean split to report.
+///
+/// The text of the `git diff HEAD` half comes back with the hunks: it is the
+/// only one that also numbers the working-tree side, which is what places an
+/// incoming edit in HEAD's coordinates.
+fn old_side_diff(repo: &Path, file_path: &str) -> Result<(Vec<OldSideHunk>, String), String> {
     // `:(literal)` stops `*?[` in a filename from widening the pathspec.
     // `--no-textconv` keeps a configured textconv filter from rewriting the
     // diff into something whose line numbers are not the file's.
     let spec = format!(":(literal){file_path}");
     let mut hunks = Vec::new();
+    let mut head_diff = String::new();
     for staged in [true, false] {
         let mut args = vec!["-c", "core.quotepath=off", "diff"];
         if staged {
@@ -553,16 +577,206 @@ fn old_side_hunks(repo: &Path, file_path: &str) -> Result<Vec<OldSideHunk>, Stri
         let text =
             git_text(repo, &args).map_err(|e| format!("git diff against HEAD failed: {e}"))?;
         hunks.extend(parse_old_side_ranges(&text));
+        if !staged {
+            head_diff = text;
+        }
     }
     hunks.sort();
     hunks.dedup();
     if hunks.len() > MAX_HUNKS_PER_PARTY {
         return Err(format!("too many hunks (more than {MAX_HUNKS_PER_PARTY})"));
     }
-    if hunks.is_empty() {
-        return Err("no hunks in the worktree diff (binary, mode-only or empty)".into());
+    Ok((hunks, head_diff))
+}
+
+/// The largest working file an incoming edit is located in. A source file past
+/// this is not read, and an edit that cannot be located is asked about.
+const MAX_INCOMING_FILE_BYTES: usize = 4 * 1024 * 1024;
+
+fn read_working_text(repo: &Path, file_path: &str) -> Result<String, String> {
+    let bytes =
+        crate::fs_entry::read_bounded_nofollow(&repo.join(file_path), MAX_INCOMING_FILE_BYTES)
+            .map_err(|error| format!("the file could not be read to place the edit ({error:?})"))?;
+    String::from_utf8(bytes)
+        .map_err(|_| "the file is not UTF-8, so the edit cannot be placed".into())
+}
+
+/// One `@@ -old +new @@` header of `git diff HEAD --unified=0`, both sides.
+#[derive(Clone, Copy)]
+struct DiffHeader {
+    old_start: u32,
+    old_lines: u32,
+    new_start: u32,
+    new_lines: u32,
+}
+
+fn parse_diff_headers(diff: &str) -> Result<Vec<DiffHeader>, String> {
+    let side = |token: &str, mark: char| -> Option<(u32, u32)> {
+        let body = token.strip_prefix(mark)?;
+        match body.split_once(',') {
+            Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
+            None => Some((body.parse().ok()?, 1)),
+        }
+    };
+    diff.lines()
+        .filter(|line| line.starts_with("@@"))
+        .map(|line| {
+            let mut tokens = line
+                .strip_prefix("@@ ")
+                .unwrap_or_default()
+                .split_whitespace();
+            let old = tokens.next().and_then(|t| side(t, '-'));
+            let new = tokens.next().and_then(|t| side(t, '+'));
+            match (old, new) {
+                (Some((old_start, old_lines)), Some((new_start, new_lines))) => Ok(DiffHeader {
+                    old_start,
+                    old_lines,
+                    new_start,
+                    new_lines,
+                }),
+                _ => Err(
+                    "a diff hunk header could not be parsed, so the edit cannot be placed"
+                        .to_string(),
+                ),
+            }
+        })
+        .collect()
+}
+
+/// Where a working-tree line sits against HEAD.
+enum Placed {
+    /// An unchanged line, at this HEAD line.
+    Unchanged(u32),
+    /// A line inside one of the party's own hunks.
+    Inside(DiffHeader),
+}
+
+fn place_line(line: u32, headers: &[DiffHeader]) -> Placed {
+    let mut delta: i64 = 0;
+    for header in headers {
+        // A pure deletion's `new_start` is the line before it.
+        let first = if header.new_lines == 0 {
+            header.new_start + 1
+        } else {
+            header.new_start
+        };
+        if line < first {
+            break;
+        }
+        if header.new_lines > 0 && line < header.new_start + header.new_lines {
+            return Placed::Inside(*header);
+        }
+        delta += i64::from(header.new_lines) - i64::from(header.old_lines);
     }
-    Ok(hunks)
+    Placed::Unchanged(u32::try_from(i64::from(line) - delta).unwrap_or(0))
+}
+
+/// The HEAD-side hunk an incoming `old_string` occupies, found in the
+/// working-tree file `content`.
+///
+/// The text must be found exactly once: none means the edit will not apply as
+/// described, and several means which one it hits is a guess. Either is
+/// reported as an error, which fails the party and so asks the user, rather
+/// than guessing a range that could read as disjoint.
+fn incoming_hunk(content: &str, old: &str, head_diff: &str) -> Result<OldSideHunk, String> {
+    if old.is_empty() {
+        return Err("the edit names no text to replace, so it cannot be placed".into());
+    }
+    let mut found = content.match_indices(old).map(|(at, _)| at);
+    let (Some(at), None) = (found.next(), found.next()) else {
+        return Err(
+            "the edit's old_string is not found exactly once in the file, so it cannot be placed"
+                .into(),
+        );
+    };
+    let line_of = |offset: usize| -> Result<u32, String> {
+        u32::try_from(content[..offset].matches('\n').count() + 1)
+            .map_err(|_| "the file has too many lines to place the edit".to_string())
+    };
+    let first = line_of(at)?;
+    // A trailing newline ends the last line rather than starting another.
+    let body = old.strip_suffix('\n').unwrap_or(old);
+    let last = line_of(at + body.len())?.max(first);
+
+    let headers = parse_diff_headers(head_diff)?;
+    let lower = match place_line(first, &headers) {
+        Placed::Unchanged(line) => line,
+        Placed::Inside(h) if h.old_lines > 0 => h.old_start,
+        Placed::Inside(h) => h.old_start + 1,
+    };
+    let upper = match place_line(last, &headers) {
+        Placed::Unchanged(line) => line,
+        Placed::Inside(h) if h.old_lines > 0 => h.old_start + h.old_lines - 1,
+        Placed::Inside(h) => h.old_start,
+    };
+    if lower == 0 || upper == 0 {
+        return Err("the edit could not be placed against HEAD".into());
+    }
+    Ok(if lower <= upper {
+        OldSideHunk::Modified(LineRange {
+            start: lower,
+            end: upper,
+        })
+    } else {
+        // Wholly inside lines this party has already added: no old line of
+        // its own, an insertion after the one above.
+        OldSideHunk::Insertion { after: upper }
+    })
+}
+
+/// The tool call a hook is judging, as far as its payload says what it does to
+/// the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncomingEdit {
+    /// `Write` or `NotebookEdit`: the file, or a cell of it, is replaced, so
+    /// there is no narrower range to compare.
+    WholeFile,
+    /// `Edit` or `MultiEdit`: each `old_string` is located in the file.
+    Replacing(Vec<String>),
+}
+
+/// The verdict for an edit of `path` that `here` is about to make, against the
+/// edits `others` already hold.
+///
+/// `here` is a party whether or not it is dirty: the incoming edit is folded
+/// into its hunks, so an edit into a symbol another party changed is a shared
+/// symbol even when everything `here` has changed so far is elsewhere. A whole
+/// file write is file-level without reading anything. An edit that cannot be
+/// located fails `here`, which is file-level and so asks, never disjoint.
+pub fn classify_incoming(
+    path: &str,
+    others: &[CollisionParty],
+    here: &CollisionParty,
+    incoming: &IncomingEdit,
+) -> EntityCollisionVerdict {
+    let replaced = match incoming {
+        IncomingEdit::WholeFile => {
+            return EntityCollisionVerdict {
+                path: path.to_string(),
+                kind: EntityCollisionKind::FileLevel,
+                reason: "this write replaces the whole file".into(),
+                shared_symbols: Vec::new(),
+                stale: false,
+            }
+        }
+        IncomingEdit::Replacing(replaced) => replaced.as_slice(),
+    };
+    let mut parties = Vec::new();
+    let mut failures = Vec::new();
+    for (party, edit) in others
+        .iter()
+        .map(|party| (party, None))
+        .chain(std::iter::once((here, Some(replaced))))
+    {
+        match party_old_side_symbols(path, party, edit) {
+            Ok(edits) => parties.push(edits),
+            Err(failure) => failures.push(PartyFailure {
+                reason: format!("{}: {}", short_party(party), failure.reason),
+                stale: failure.stale,
+            }),
+        }
+    }
+    classify_parties(path, &parties, &failures)
 }
 
 /// Parse every `@@ -old_start[,old_lines] +… @@` header into one old-side hunk.
@@ -597,20 +811,20 @@ fn parse_hunk_header(line: &str) -> Option<OldSideHunk> {
     }
 }
 
-/// Attach a symbol verdict to one overlapping path: `focus` when it names a
-/// row, else the first row.
+/// Attach a symbol verdict to the row `focus` names, and to no other.
 ///
 /// One path only, because classifying costs git diffs and a DevMap open per
-/// party. The hook that asks about an edit passes the edited path: enriching the
-/// first row (sorted by path) spent that cost on an unrelated file and left the
-/// edited one without a symbol verdict.
+/// party. A `focus` that names no row, or no `focus` at all, classifies nothing:
+/// falling back to the first row (sorted by path) spent that cost on a file
+/// nobody asked about and attached its verdict to the wrong answer. A row held
+/// by one worktree has nothing to compare, so it is left unclassified too.
 pub fn enrich_item(
     mut risk: crate::insights::CollisionRisk,
     focus: Option<&str>,
 ) -> crate::insights::CollisionRisk {
     let index = focus
         .and_then(|path| risk.items.iter().position(|item| item.path == path))
-        .or(if risk.items.is_empty() { None } else { Some(0) });
+        .filter(|&index| risk.items[index].worktrees.len() > 1);
     if let Some(index) = index {
         let verdict = classify_overlapping_path(&risk.items[index]);
         risk.items[index].entity = Some(verdict);
@@ -861,7 +1075,14 @@ mod tests {
                 .iter()
                 .map(|path| crate::insights::CollisionItem {
                     path: (*path).to_string(),
-                    worktrees: Vec::new(),
+                    worktrees: ["/nonexistent/gp-a", "/nonexistent/gp-b"]
+                        .iter()
+                        .map(|path| crate::insights::CollisionParty {
+                            path: (*path).to_string(),
+                            branch: None,
+                            agent_kind: String::new(),
+                        })
+                        .collect(),
                     entity: None,
                 })
                 .collect(),
@@ -880,12 +1101,34 @@ mod tests {
         let enriched = enrich_item(risk_with(&["a.rs", "b.rs", "c.rs"]), Some("b.rs"));
         let entities: Vec<bool> = enriched.items.iter().map(|i| i.entity.is_some()).collect();
         assert_eq!(entities, vec![false, true, false]);
-        // No focus, or a focus naming no row, keeps the old first-row behaviour.
-        let first = enrich_item(risk_with(&["a.rs", "b.rs"]), None);
-        assert!(first.items[0].entity.is_some() && first.items[1].entity.is_none());
-        let unknown = enrich_item(risk_with(&["a.rs", "b.rs"]), Some("zzz.rs"));
-        assert!(unknown.items[0].entity.is_some() && unknown.items[1].entity.is_none());
+        // No focus, or a focus naming no row, classifies nothing: it never
+        // falls back to row 0.
+        for focus in [None, Some("zzz.rs"), Some("")] {
+            let absent = enrich_item(risk_with(&["a.rs", "b.rs"]), focus);
+            assert!(
+                absent.items.iter().all(|item| item.entity.is_none()),
+                "focus {focus:?} classified a row it did not name"
+            );
+        }
         assert!(enrich_item(risk_with(&[]), Some("a.rs")).items.is_empty());
+    }
+
+    /// The row the caller asked about is far past the cap's worth of rows, and
+    /// a row held by one worktree has nothing to compare: neither is
+    /// classified by falling back to another row.
+    #[test]
+    fn an_absent_focus_over_the_row_cap_and_a_lone_holder_classify_nothing() {
+        let names: Vec<String> = (0..40).map(|n| format!("f{n:02}.rs")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let absent = enrich_item(risk_with(&refs), Some("f39.rs-not-kept"));
+        assert!(absent.items.iter().all(|item| item.entity.is_none()));
+        let mut lone = risk_with(&["only.rs"]);
+        lone.items[0].worktrees.truncate(1);
+        let lone = enrich_item(lone, Some("only.rs"));
+        assert!(
+            lone.items[0].entity.is_none(),
+            "one holder, nothing to compare"
+        );
     }
 
     /* ── Real git worktrees + seeded DevMap stores ────────────────────────── */
@@ -999,6 +1242,165 @@ class C:
 
     fn rust_edit(symbols: &[codeintel_tests::SeedSymbol<'_>], edited: &str) -> tempfile::TempDir {
         worktree(RUST_TEXT, symbols, edited)
+    }
+
+    fn party_of(dir: &tempfile::TempDir) -> CollisionParty {
+        CollisionParty {
+            path: dir.path().to_string_lossy().into_owned(),
+            branch: None,
+            agent_kind: "claude".into(),
+        }
+    }
+
+    fn replacing(old: &str) -> IncomingEdit {
+        IncomingEdit::Replacing(vec![old.to_string()])
+    }
+
+    /// The folded 2026-10-14 finding. The other party changed `foo`; this one
+    /// has only changed `bar`, and its incoming edit is into `foo`. Judged on
+    /// the edits already dirty the two are disjoint and the first edit into
+    /// `foo` is a notice; with the incoming edit folded in, it is the shared
+    /// symbol, which asks.
+    #[test]
+    fn an_incoming_edit_into_another_partys_symbol_is_shared_though_this_partys_edits_are_elsewhere(
+    ) {
+        let syms = rust_symbols();
+        let other = rust_edit(&syms, &replace_line(RUST_TEXT, 17, "    let x = 9;"));
+        let here = rust_edit(&syms, &replace_line(RUST_TEXT, 21, "    let y = 9;"));
+        assert_eq!(
+            verdict(&other, &here).kind,
+            EntityCollisionKind::DisjointSymbols,
+            "without the incoming edit the parties read as disjoint"
+        );
+        let v = classify_incoming(
+            FILE,
+            &[party_of(&other)],
+            &party_of(&here),
+            &replacing("    let x = 1;"),
+        );
+        assert_eq!(v.kind, EntityCollisionKind::SharedSymbol, "{v:?}");
+        assert_eq!(v.shared_symbols, vec!["foo".to_string()]);
+    }
+
+    /// The incoming edit is located in the working file and placed against
+    /// HEAD: this party has inserted a line above, so `bar` sits one line
+    /// lower than at HEAD, where the other party edited it.
+    #[test]
+    fn an_incoming_edit_is_placed_against_head_through_this_partys_own_shift() {
+        let syms = rust_symbols();
+        let other = rust_edit(&syms, &replace_line(RUST_TEXT, 21, "    let y = 9;"));
+        let here = rust_edit(&syms, &insert_after(RUST_TEXT, 17, "    let extra = 0;"));
+        assert_eq!(
+            verdict(&other, &here).kind,
+            EntityCollisionKind::DisjointSymbols
+        );
+        let v = classify_incoming(
+            FILE,
+            &[party_of(&other)],
+            &party_of(&here),
+            &replacing("    let y = 2;"),
+        );
+        assert_eq!(v.kind, EntityCollisionKind::SharedSymbol, "{v:?}");
+        assert_eq!(v.shared_symbols, vec!["bar".to_string()]);
+    }
+
+    #[test]
+    fn an_incoming_edit_into_a_different_symbol_stays_disjoint() {
+        let syms = rust_symbols();
+        let other = rust_edit(&syms, &replace_line(RUST_TEXT, 17, "    let x = 9;"));
+        let here = rust_edit(&syms, &replace_line(RUST_TEXT, 7, "        A // x"));
+        let v = classify_incoming(
+            FILE,
+            &[party_of(&other)],
+            &party_of(&here),
+            &replacing("    let y = 2;"),
+        );
+        assert_eq!(v.kind, EntityCollisionKind::DisjointSymbols, "{v:?}");
+    }
+
+    /// An edit whose target cannot be located is never disjoint: it asks.
+    #[test]
+    fn an_incoming_edit_that_cannot_be_located_fails_closed() {
+        let syms = rust_symbols();
+        let other = rust_edit(&syms, &replace_line(RUST_TEXT, 17, "    let x = 9;"));
+        let here = rust_edit(&syms, &replace_line(RUST_TEXT, 21, "    let y = 9;"));
+        for (what, old) in [
+            ("absent", "    let nowhere = 1;"),
+            ("ambiguous", "    let "),
+            ("empty", ""),
+        ] {
+            let v = classify_incoming(FILE, &[party_of(&other)], &party_of(&here), &replacing(old));
+            assert_eq!(v.kind, EntityCollisionKind::FileLevel, "{what}: {v:?}");
+            assert!(!v.index_stale(), "{what}: {v:?}");
+            assert!(
+                v.reason.contains("cannot be placed"),
+                "{what}: {}",
+                v.reason
+            );
+        }
+        // A file that is not there to be read fails the same way.
+        let missing = tempfile::TempDir::new().unwrap();
+        let v = classify_incoming(
+            FILE,
+            &[party_of(&other)],
+            &party_of(&missing),
+            &replacing("    let x = 1;"),
+        );
+        assert_eq!(v.kind, EntityCollisionKind::FileLevel, "{v:?}");
+    }
+
+    /// A `Write` replaces the file, so there is no narrower range to compare,
+    /// and nothing is read to say so.
+    #[test]
+    fn an_incoming_whole_file_write_is_file_level_without_reading_anything() {
+        let nowhere = CollisionParty {
+            path: "/nonexistent/gp-write".into(),
+            branch: None,
+            agent_kind: String::new(),
+        };
+        let v = classify_incoming(
+            FILE,
+            std::slice::from_ref(&nowhere),
+            &nowhere,
+            &IncomingEdit::WholeFile,
+        );
+        assert_eq!(v.kind, EntityCollisionKind::FileLevel);
+        assert!(!v.index_stale());
+        assert!(v.reason.contains("whole file"), "{}", v.reason);
+    }
+
+    fn lines(n: u32) -> String {
+        (1..=n).map(|i| format!("l{i}\n")).collect()
+    }
+
+    #[test]
+    fn an_incoming_range_is_numbered_in_head_lines() {
+        let text = lines(12);
+        // No edits of this party's own: the working lines are HEAD's.
+        assert_eq!(incoming_hunk(&text, "l10\n", "").unwrap(), modified(10, 10));
+        assert_eq!(
+            incoming_hunk(&text, "l3\nl4\nl5", "").unwrap(),
+            modified(3, 5)
+        );
+        // Two HEAD lines (5-6) deleted above: working line 10 is HEAD's 12.
+        let deleted = "@@ -5,2 +4,0 @@\n-l5\n-l6\n";
+        assert_eq!(
+            incoming_hunk(&text, "l10\n", deleted).unwrap(),
+            modified(12, 12)
+        );
+        // A line of this party's own insertion has no HEAD line: an insertion.
+        let inserted = "@@ -3,0 +4,2 @@\n+l4\n+l5\n";
+        assert_eq!(
+            incoming_hunk(&text, "l4\n", inserted).unwrap(),
+            OldSideHunk::Insertion { after: 3 }
+        );
+        // Starting in this party's own change and running past it.
+        let changed = "@@ -4,2 +4,2 @@\n-a\n-b\n+l4\n+l5\n";
+        assert_eq!(
+            incoming_hunk(&text, "l5\nl6\nl7", changed).unwrap(),
+            modified(4, 7)
+        );
+        assert!(incoming_hunk(&text, "l1\n", "@@ nonsense @@\n").is_err());
     }
 
     #[test]

@@ -1092,14 +1092,7 @@ impl GitReader {
     /// Hygiene walks do, because a repository hook must not run there. A
     /// status refresh should use the fsmonitor daemon when the repository
     /// already has one, so `status` does not walk `target/` itself.
-    pub const STATUS_ARGV: &'static [&'static str] = &[
-        "-c",
-        "core.quotepath=off",
-        "status",
-        "--porcelain=v1",
-        "-u",
-        "-z",
-    ];
+    pub const STATUS_ARGV: &'static [&'static str] = crate::engine::git_cli::STATUS_ARGV;
 
     pub fn get_status(repo_path: &str) -> Result<Vec<FileStatus>, String> {
         let repo = validate_repo(repo_path)?;

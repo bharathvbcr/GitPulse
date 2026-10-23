@@ -755,6 +755,12 @@
   "gitpulse_collision_risk": {
     "additionalProperties": false,
     "properties": {
+      "path": {
+        "description": "A repo-relative file about to be edited. Answers who else holds exactly this file dirty, including a single other worktree, and returns only that row plus the scan's coverage counts; omit it for the repo-wide overlap list",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
       "repo_path": {
         "description": "Absolute path to a git repository",
         "maxLength": 4096,

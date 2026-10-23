@@ -816,6 +816,24 @@ const PINNED_GIT_CONFIG: &[&str] = &[
     "color.branch=never",
     "diff.noprefix=false",
     "diff.mnemonicPrefix=false",
+    // A user's `status.showUntrackedFiles=no` would hide a new file from every
+    // status read, and `normal` collapses a new directory to `dir/`. Both make
+    // a file another worktree is holding invisible to a collision check.
+    "status.showUntrackedFiles=all",
+];
+
+/// The one porcelain status read: NUL-separated records, raw UTF-8 paths, and
+/// every untracked file listed individually (`-u`) rather than collapsed into
+/// its directory. `GitReader::STATUS_ARGV` and the worktree scans both read
+/// status through this, so a collision check and a file list cannot disagree
+/// about what a new directory contains. A pathspec goes after a trailing `--`.
+pub const STATUS_ARGV: &[&str] = &[
+    "-c",
+    "core.quotepath=off",
+    "status",
+    "--porcelain=v1",
+    "-u",
+    "-z",
 ];
 
 /// Subcommands that print a patch, where `diff.external` (a config key, which
@@ -5943,6 +5961,27 @@ pub fn repo_name_from_url(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::procguard::LockedSpawn;
+    /// S3-08. One status argv, shared by the file list and the worktree scans,
+    /// and `status.showUntrackedFiles=all` pinned beside the other settings a
+    /// developer's own config must not change.
+    #[test]
+    fn every_status_read_shares_one_argv_and_the_untracked_setting_is_pinned() {
+        assert_eq!(
+            crate::engine::git_reader::GitReader::STATUS_ARGV,
+            super::STATUS_ARGV
+        );
+        assert!(super::STATUS_ARGV.contains(&"-u") && super::STATUS_ARGV.contains(&"-z"));
+        assert!(super::PINNED_GIT_CONFIG.contains(&"status.showUntrackedFiles=all"));
+        assert!(
+            include_str!("git_reader.rs").contains("= crate::engine::git_cli::STATUS_ARGV;"),
+            "GitReader::STATUS_ARGV must alias the shared constant, not restate it"
+        );
+        assert!(
+            include_str!("worktree.rs").contains("crate::engine::git_cli::STATUS_ARGV.to_vec()"),
+            "the worktree scans must read status through the shared constant"
+        );
+    }
+
     #[test]
     fn background_priority_restores_after_nested_work_errors_and_panic() {
         use super::{current_admission, Admission};

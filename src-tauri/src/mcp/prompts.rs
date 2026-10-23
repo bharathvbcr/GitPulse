@@ -42,9 +42,9 @@ const CATALOG: &[Prompt] = &[
     Prompt {
         name: "gitpulse_preflight",
         title: "Preflight before editing",
-        description: "What is in flight in this repository right now — other worktrees, their uncommitted work, and whether anything overlaps what you are about to touch. Run before the first edit of a session.",
+        description: "What is in flight in this repository right now — other worktrees, their uncommitted files, and the files already dirty in more than one worktree. It cannot know which file you will edit, so a clean worktree shows no overlap even when another worktree holds the file you are about to touch: read the other worktrees' files below, and ask gitpulse_collision_risk with the file's path before editing it. Run before the first edit of a session.",
         arguments: &[REPO_ARG],
-        facets: &["context", "collisions"],
+        facets: &["context", "collisions", "elsewhere"],
     },
     Prompt {
         name: "gitpulse_collision_triage",
@@ -237,10 +237,13 @@ mod tests {
         )
         .expect("resolves even when the repository does not");
         let content = resolved["messages"][0]["content"].as_array().unwrap();
-        assert_eq!(content.len(), 3);
+        // The instruction, then context, collisions and the other worktrees'
+        // dirty files.
+        assert_eq!(content.len(), 4);
         assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[1]["type"], "resource");
-        assert_eq!(content[2]["type"], "resource");
+        for block in &content[1..] {
+            assert_eq!(block["type"], "resource");
+        }
         assert_eq!(resolved["messages"][0]["role"], "user");
     }
 

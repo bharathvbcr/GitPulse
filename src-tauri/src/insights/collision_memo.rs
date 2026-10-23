@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     collision_from_list_reading, empty_collisions, entity_collision, live_in, live_sessions,
-    CollisionRisk, PathsRead,
+    CollisionRisk, CollisionScope, PathsRead,
 };
 use crate::engine::worktree::{self, changed_paths_within, WorktreeInfo};
 
@@ -195,14 +195,16 @@ impl CollisionMemo {
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|_| repo_path.to_string());
         let oldest = AtomicU64::new(0);
-        let (mut risk, list_age) = self.assemble(&key, repo_path, observation, &oldest);
+        let (mut risk, list_age) = self.assemble(&key, repo_path, focus, observation, &oldest);
 
         // A failure beside a listing served from memory may be the listing
         // itself being out of date. One scan from scratch settles it; a failure
         // that survives is real and is reported as it always was.
         if !risk.ok && list_age > Duration::ZERO {
             self.lists.forget(&key);
-            risk = self.assemble(&key, repo_path, observation, &oldest).0;
+            risk = self
+                .assemble(&key, repo_path, focus, observation, &oldest)
+                .0;
         }
 
         // A positive is re-read where it was found before it is believed.
@@ -216,14 +218,20 @@ impl CollisionMemo {
             for path in &contended {
                 self.reads.forget(path);
             }
-            risk = self.assemble(&key, repo_path, observation, &oldest).0;
+            risk = self
+                .assemble(&key, repo_path, focus, observation, &oldest)
+                .0;
         }
 
         // The symbol verdict costs a DevMap open and two diffs per party. The
         // file-level positive above was just re-read, so what is kept here is
         // only the refinement of it (shared symbol, or disjoint symbols), and
         // only while the same worktrees are the parties.
-        if let Some(item) = risk.items.iter_mut().find(|item| item.path == focus) {
+        if let Some(item) = risk
+            .items
+            .iter_mut()
+            .find(|item| item.path == focus && item.worktrees.len() > 1)
+        {
             let mut parties: Vec<&str> = item.worktrees.iter().map(|p| p.path.as_str()).collect();
             parties.sort_unstable();
             let verdict_key = format!("{key}\0{focus}\0{}", parties.join("\0"));
@@ -244,6 +252,7 @@ impl CollisionMemo {
         &self,
         key: &str,
         repo_path: &str,
+        focus: &str,
         observation: &live_sessions::Observation,
         oldest: &AtomicU64,
     ) -> (CollisionRisk, Duration) {
@@ -266,7 +275,16 @@ impl CollisionMemo {
         };
         let live = live_in(observation, &list);
         (
-            collision_from_list_reading(&list, &live, None, &read),
+            collision_from_list_reading(
+                &list,
+                &live,
+                None,
+                &read,
+                CollisionScope {
+                    focus: Some(focus),
+                    involving: None,
+                },
+            ),
             list_age,
         )
     }
@@ -277,10 +295,10 @@ fn shared() -> &'static CollisionMemo {
     MEMO.get_or_init(|| CollisionMemo::new(TTL))
 }
 
-/// [`super::collision_risk_for_path`], answered from the app's memory where it
+/// [`super::collision_for_path`], answered from the app's memory where it
 /// is young enough. Only the running app calls this: a hook process has no
 /// memory between calls, so for it this would be the unmemoized scan.
-pub fn collision_risk_for_path_memoized(repo_path: &str, path: &str) -> MemoizedCollision {
+pub fn collision_for_path_memoized(repo_path: &str, path: &str) -> MemoizedCollision {
     shared().risk_for_path(repo_path, path, &live_sessions::observe())
 }
 
