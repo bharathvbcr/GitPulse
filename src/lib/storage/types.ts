@@ -107,8 +107,15 @@ export interface ScanStats {
   files_visited: number;
   permission_denied: number;
   /**
-   * True when any budget cut the scan short: totals are floors then,
-   * never render them as complete.
+   * Locations a non-permission IO error kept the walk from reading. Their
+   * bytes are in no total, and `truncated` is set whenever this is above zero.
+   */
+  unreadable: number;
+  /** Entries with a non-UTF-8 name. Walked and counted; informational only. */
+  non_utf8: number;
+  /**
+   * True when any budget cut the scan short, or `unreadable` locations were
+   * left out: totals are floors then, never render them as complete.
    */
   truncated: boolean;
 }

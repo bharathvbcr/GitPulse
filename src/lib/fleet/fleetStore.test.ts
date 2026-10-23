@@ -189,7 +189,7 @@ describe("scanning one repository", () => {
           largest_files: [],
           worktrees: [],
           branches: {},
-          scan: { elapsed_ms: 1, files_visited: 1, permission_denied: 0, truncated: false },
+          scan: { elapsed_ms: 1, files_visited: 1, permission_denied: 0, unreadable: 0, non_utf8: 0, truncated: false },
         };
       },
       cmd_fleet_record_metrics: () => undefined,
@@ -306,7 +306,7 @@ describe("sweeping a family across the workspace", () => {
           largest_files: [],
           worktrees: [],
           branches: {},
-          scan: { elapsed_ms: 1, files_visited: 1, permission_denied: 0, truncated: false },
+          scan: { elapsed_ms: 1, files_visited: 1, permission_denied: 0, unreadable: 0, non_utf8: 0, truncated: false },
         };
       },
       cmd_fleet_record_metrics: () => undefined,
