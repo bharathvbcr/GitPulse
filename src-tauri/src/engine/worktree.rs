@@ -114,6 +114,17 @@ impl AdmittedPair {
     /// or an oversized registry — so a caller falls back to Git rather than
     /// act on a partial list.
     pub fn metadata_checkouts(&self) -> Option<Vec<PathBuf>> {
+        self.scan_checkouts(true)
+    }
+
+    /// [`Self::metadata_checkouts`] without the admitted pair: the primary
+    /// working tree first, then each linked worktree the registry names. What
+    /// the metadata says is registered, whatever the caller asked about.
+    fn registered_checkouts(&self) -> Option<Vec<PathBuf>> {
+        self.scan_checkouts(false)
+    }
+
+    fn scan_checkouts(&self, with_pair: bool) -> Option<Vec<PathBuf>> {
         // Git lists the primary working tree first: the directory holding
         // `.git`, or the repository itself when it is bare. The candidate is
         // proved the way `repository_trust` proves a main checkout — its own
@@ -133,7 +144,11 @@ impl AdmittedPair {
         if config_mentions_worktree(&self.common).unwrap_or(true) {
             return None;
         }
-        let mut checkouts = vec![primary, self.repo.clone(), self.worktree.clone()];
+        let mut checkouts = vec![primary];
+        if with_pair {
+            checkouts.push(self.repo.clone());
+            checkouts.push(self.worktree.clone());
+        }
 
         let entries = match std::fs::read_dir(self.common.join("worktrees")) {
             Ok(entries) => entries,
@@ -176,31 +191,70 @@ impl AdmittedPair {
     /// directory are checked by [`admit_worktree_pair`] on every call, before
     /// this one: a revoked grant is refused whatever is remembered here.
     pub fn authenticate(self) -> Result<WorktreeFamily, String> {
-        let registry = self.registry_fingerprint();
-        if let Some(registry) = &registry {
+        // The registered checkouts, never including the pair asked about: a
+        // worktree whose registration is gone must change the fingerprint, not
+        // be written into it. The first is the primary working tree.
+        let registered = self.registered_checkouts();
+        let registry = registered.as_ref().map(|checkouts| {
+            let mut sorted = checkouts.clone();
+            sorted.sort();
+            sorted.dedup();
+            sorted
+        });
+        if let (Some(registered), Some(registry)) = (&registered, &registry) {
             if let Some(family) =
                 remembered_family(&self.common, registry, &self.repo, &self.worktree)
             {
+                return Ok(family);
+            }
+            // A fresh process has no memory of its own; an earlier one may have
+            // left Git's answer for this very registry (`worktree_family_disk`).
+            if let Some(family) = self.family_from_disk(registered, registry) {
+                remember_family(self.common.clone(), registry.clone(), &family);
                 return Ok(family);
             }
         }
         let common = self.common.clone();
         let family = self.authenticate_with_git()?;
         if let Some(registry) = registry {
+            super::worktree_family_disk::store(&common, &registry, &family.members);
             remember_family(common, registry, &family);
         }
         Ok(family)
     }
 
-    /// The registry as the metadata view names it: sorted, without repeats, so
-    /// two reads of an unchanged registry are equal whatever order the
-    /// directory listed its entries in. `None` when the metadata cannot
-    /// account for the whole family.
-    fn registry_fingerprint(&self) -> Option<Vec<PathBuf>> {
-        let mut checkouts = self.metadata_checkouts()?;
-        checkouts.sort();
-        checkouts.dedup();
-        Some(checkouts)
+    /// The family for this pair from what an earlier process stored, with
+    /// nothing in the file trusted as a source of membership. The stored list
+    /// is only Git's *order*: it is used when, as a set, it equals the registry
+    /// the metadata names right now, and both paths of the pair are in that
+    /// registry. The anchor is the primary working tree the metadata proved to
+    /// hold this common directory (`registered[0]`): the checkout
+    /// [`Self::authenticate_with_git`] takes from Git's first entry and then
+    /// checks belongs to this repository, which is how [`Self::scan_checkouts`]
+    /// found it. Anything else is a miss.
+    fn family_from_disk(
+        &self,
+        registered: &[PathBuf],
+        registry: &[PathBuf],
+    ) -> Option<WorktreeFamily> {
+        let anchor = registered.first()?.clone();
+        if !registry.contains(&self.repo) || !registry.contains(&self.worktree) {
+            return None;
+        }
+        let stored = super::worktree_family_disk::load(&self.common)?;
+        let mut as_set = stored.members.clone();
+        as_set.sort();
+        as_set.dedup();
+        if stored.registry != registry || as_set != registry {
+            return None;
+        }
+        let mut members = vec![anchor.clone()];
+        members.extend(stored.members.into_iter().filter(|path| path != &anchor));
+        Some(WorktreeFamily {
+            anchor,
+            worktree: self.worktree.clone(),
+            members,
+        })
     }
 
     fn authenticate_with_git(self) -> Result<WorktreeFamily, String> {
@@ -303,6 +357,25 @@ fn remembered_family(
         members: remembered.members.clone(),
     })
 }
+
+/// Makes the next call in this process ask the disk, as a new process would.
+#[cfg(test)]
+pub(crate) fn forget_in_process(common: &Path) {
+    remembered_families()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(
+            common.to_path_buf(),
+            Remembered {
+                registry: Vec::new(),
+                members: Vec::new(),
+            },
+        );
+}
+
+/// Remembers families on disk, under test, in a directory on this thread.
+#[cfg(test)]
+pub(crate) use super::worktree_family_disk::test_dir as family_disk_dir;
 
 fn remember_family(common: PathBuf, registry: Vec<PathBuf>, family: &WorktreeFamily) {
     let mut held = remembered_families()
