@@ -1424,44 +1424,6 @@ pub(crate) fn read_checked_state_file(
     Ok(Some(raw))
 }
 
-/// How long [`enter_wal`] keeps trying while another connection holds the file.
-const WAL_SWITCH_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Puts the ledger in WAL mode.
-///
-/// The switch can answer `SQLITE_BUSY` immediately, without consulting the busy
-/// handler, when another connection is switching the same file (two processes
-/// creating a ledger, or opening one a process still holds in rollback mode).
-/// That is contention that clears in milliseconds, not a refusal, so it is
-/// retried for [`WAL_SWITCH_PATIENCE`]; any other error, or contention that
-/// outlasts it, is returned as before. An already-WAL file needs no switch.
-fn enter_wal(conn: &Connection) -> Result<(), LedgerError> {
-    let failed =
-        |e: rusqlite::Error| LedgerError::new("pragma_failed", format!("journal_mode: {e}"));
-    let deadline = std::time::Instant::now() + WAL_SWITCH_PATIENCE;
-    loop {
-        let switched = conn
-            .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
-            .and_then(|mode| {
-                if mode.eq_ignore_ascii_case("wal") {
-                    Ok(())
-                } else {
-                    conn.pragma_update(None, "journal_mode", "WAL")
-                }
-            });
-        match switched {
-            Ok(()) => return Ok(()),
-            Err(rusqlite::Error::SqliteFailure(code, _))
-                if code.code == rusqlite::ErrorCode::DatabaseBusy
-                    && std::time::Instant::now() < deadline =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Err(e) => return Err(failed(e)),
-        }
-    }
-}
-
 fn open(db_path: &Path) -> Result<Connection, LedgerError> {
     #[cfg(test)]
     tests::LEDGER_WRITE_OPENS.with(|opens| opens.set(opens.get() + 1));
@@ -1513,7 +1475,8 @@ fn open(db_path: &Path) -> Result<Connection, LedgerError> {
     // trades a fsync per commit for one per checkpoint; the ledger is a record
     // of actions that git has already made durable itself, so losing the last
     // few milliseconds to a power cut costs a re-derivable row, not data.
-    enter_wal(&conn)?;
+    crate::engine::sqlite_wal::enter_wal(&conn, crate::engine::sqlite_wal::LEDGER_WAL_PATIENCE)
+        .map_err(|e| LedgerError::new("pragma_failed", format!("journal_mode: {e}")))?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| LedgerError::new("pragma_failed", format!("synchronous: {e}")))?;
     // Before the schema batch: a refused writer must not alter anything.

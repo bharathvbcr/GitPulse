@@ -315,9 +315,27 @@ struct Kept {
     value: String,
 }
 
-fn kept() -> &'static Mutex<HashMap<Key, Kept>> {
-    static KEPT: OnceLock<Mutex<HashMap<Key, Kept>>> = OnceLock::new();
+type KeptTable = Mutex<HashMap<Key, Kept>>;
+
+#[cfg(not(test))]
+fn kept() -> &'static KeptTable {
+    static KEPT: OnceLock<KeptTable> = OnceLock::new();
     KEPT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// One table per test thread, and libtest runs each test on a thread of its
+/// own: the production table holds 64 answers for the whole process and evicts
+/// oldest first, so tests sharing it evicted each other's answers (under load a
+/// test outlives the racy window between writing its repository and reading it,
+/// and then its answers are stored too). A test that counts on an answer staying
+/// kept now has a table nobody else writes to. The table is leaked, once per
+/// test thread, to have the process-wide table's `'static` type.
+#[cfg(test)]
+fn kept() -> &'static KeptTable {
+    thread_local! {
+        static TABLE: &'static KeptTable = Box::leak(Box::new(Mutex::new(HashMap::new())));
+    }
+    TABLE.with(|table| *table)
 }
 
 /// [`git_cli::git_text_shared`] for a ref listing over `namespaces`.
@@ -1360,6 +1378,38 @@ mod tests {
     }
 
     const MILLI: Duration = Duration::from_millis(1);
+
+    /// A test counts on its answer staying kept. Another test thread stores a
+    /// hundred settled answers beside it (as every test does under load, once
+    /// its repository outlives the racy window): in a test build each thread
+    /// has its own table, so the first answer must survive them.
+    #[test]
+    fn answers_stored_by_a_test_without_retention_do_not_evict_the_holders() {
+        let _held = retention();
+        let fx = fixture(None).unwrap();
+        let settled = Stamp(RefStamp {
+            entries: Vec::new(),
+            newest: SystemTime::UNIX_EPOCH,
+        });
+        let args = ["log", "held-answer"];
+        assert!(computed(&fx, &args, &settled), "first ask computes");
+        let repo = fx.main.clone();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for n in 0..100 {
+                    let noise = format!("noise-{n}");
+                    through_stamped(&repo, &["log", noise.as_str()], Some(&settled), || {
+                        Ok(("x".to_string(), true))
+                    })
+                    .unwrap();
+                }
+            });
+        });
+        assert!(
+            !computed(&fx, &args, &settled),
+            "another test's answers evicted the holder's"
+        );
+    }
 
     /// The TTL is the safety net for inputs no stamp sees: an unchanged stamp
     /// is served until the entry is exactly `TTL` old, and recomputed from then.

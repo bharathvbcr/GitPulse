@@ -73,6 +73,16 @@ pub use snapshot::{
 
 use serde::{Deserialize, Serialize};
 
+/// CPU time the calling thread has used, immune to how long it waited to run.
+/// For tests whose budget is work, not wall time: a loaded machine stretches
+/// the wall clock by tens of times and the thread's CPU time by almost none.
+#[cfg(test)]
+pub(crate) fn thread_cpu() -> std::time::Duration {
+    std::time::Duration::from_nanos(
+        probe::thread_cpu_ns().expect("the thread CPU clock must be readable"),
+    )
+}
+
 /// The environment variable a launched task attempt carries: its run id.
 ///
 /// Set on the PTY spawn path from the launch table in
