@@ -407,7 +407,11 @@ fn valid_ref_name(name: &str) -> bool {
 }
 
 fn decode_hex(hex: &str) -> Option<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) {
+    // Callers hand over repository-controlled text. A multi-byte character puts
+    // a two-byte window inside itself, so only ASCII is sliced.
+    // Callers hand over repository-controlled text. A multi-byte character puts
+    // a two-byte window inside itself, so only ASCII is sliced.
+    if !hex.is_ascii() || !hex.len().is_multiple_of(2) {
         return None;
     }
     (0..hex.len() / 2)

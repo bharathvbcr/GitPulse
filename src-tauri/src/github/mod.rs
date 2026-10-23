@@ -341,11 +341,7 @@ pub struct CodeScanningReport {
 /// Drops a trailing `.git` the way git itself does: case-insensitively
 /// (`Repo.GIT` and `repo.git` both clone into `repo`).
 fn trim_git_suffix(path: &str) -> &str {
-    if path.len() >= 4 && path[path.len() - 4..].eq_ignore_ascii_case(".git") {
-        &path[..path.len() - 4]
-    } else {
-        path
-    }
+    crate::fs_entry::strip_suffix_ascii_ci(path, ".git").unwrap_or(path)
 }
 
 /// Parses GitHub / GHES clone URLs (HTTPS, SSH, git protocol).
@@ -4988,5 +4984,69 @@ esac
         .unwrap();
         assert!(fetched.partial_tiers.is_empty());
         assert_eq!(rows_in(&fetched).len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod non_ascii_tail_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// A remote whose last bytes are multi-byte used to put the `len - 4`
+    /// slice inside a character and panic before any validation ran.
+    #[test]
+    fn a_non_ascii_tail_is_refused_without_panicking() {
+        for url in [
+            "https://github.com/acme/Mülle",
+            "git@github.com:acme/Zoë123",
+            "https://github.com/acme/日ab",
+        ] {
+            assert_eq!(parse_github_remote_url(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_dot_git_suffix_still_trims_in_any_case() {
+        for url in [
+            "https://github.com/o/r.git",
+            "https://github.com/o/r.GIT",
+            "git@github.com:o/r.Git",
+        ] {
+            let parsed = parse_github_remote_url(url).expect(url);
+            assert_eq!((parsed.owner.as_str(), parsed.name.as_str()), ("o", "r"));
+        }
+    }
+
+    #[test]
+    fn an_odd_extra_remote_cannot_hide_a_valid_origin() {
+        let output = "upstream\thttps://example.com/acme/Mülle (fetch)\n\
+                      upstream\thttps://example.com/acme/Mülle (push)\n\
+                      origin\thttps://github.com/o/r.git (fetch)\n\
+                      origin\thttps://github.com/o/r.git (push)\n";
+        let picked = pick_github_remote(output).expect("origin survives");
+        assert_eq!((picked.owner.as_str(), picked.name.as_str()), ("o", "r"));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 512,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn arbitrary_text_never_panics_the_remote_parsers(
+            tail in any::<String>(),
+            head in prop::sample::select(vec![
+                "https://github.com/acme/",
+                "git@github.com:acme/",
+                "ssh://git@github.com/acme/",
+                "",
+            ]),
+        ) {
+            let url = format!("{head}{tail}");
+            let _ = parse_github_remote_url(&url);
+            let _ = pick_github_remote(&format!("origin\t{url} (fetch)\n{tail}"));
+        }
     }
 }

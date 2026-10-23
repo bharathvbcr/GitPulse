@@ -390,6 +390,24 @@ fn a_hostile_head_is_unresolved_not_followed() {
     assert_eq!(report.head_covered, None);
 }
 
+/// `.git/HEAD` is repository-controlled. An even-length, non-ASCII one used to
+/// reach `decode_hex`'s two-byte slices and panic inside a character.
+#[test]
+fn a_non_ascii_head_is_unresolved_not_a_panic() {
+    let _g = serial();
+    let dir = repo_with_commits(2);
+    run_git(
+        dir.path(),
+        &["commit-graph", "write", "--reachable", "--changed-paths"],
+    );
+    let git_dir = dir.path().join(".git");
+    for head in ["日日\n", "aé\n", "é\n"] {
+        std::fs::write(git_dir.join("HEAD"), head).unwrap();
+        let report = inspect(dir.path(), &git_dir, &git_dir);
+        assert_state(&report, CommitGraphState::Unknown);
+    }
+}
+
 /// The detector reads files, plus the shared config snapshot. Git's own trace2
 /// log is the witness: a positive control proves the log would have recorded a
 /// spawn, then the detector runs with the log armed. Its only spawn may be the

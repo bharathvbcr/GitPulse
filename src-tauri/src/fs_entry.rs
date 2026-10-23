@@ -4,6 +4,40 @@
 use std::io;
 use std::path::Path;
 
+/// Strips an ASCII `suffix` from the end of `text`, comparing ASCII
+/// case-insensitively, and returns what is left.
+///
+/// Both file names and remote-URL paths are untrusted and may end in a
+/// multi-byte character, so `text[text.len() - N..]` panics on them. This
+/// compares bytes, and the cut it returns sits in front of a tail that matched
+/// ASCII bytes, so it is always a character boundary. `suffix` must be ASCII;
+/// anything else never matches.
+pub(crate) fn strip_suffix_ascii_ci<'a>(text: &'a str, suffix: &str) -> Option<&'a str> {
+    let cut = text.len().checked_sub(suffix.len())?;
+    if !suffix.is_ascii() || !text.as_bytes()[cut..].eq_ignore_ascii_case(suffix.as_bytes()) {
+        return None;
+    }
+    text.get(..cut)
+}
+
+#[cfg(test)]
+mod suffix_tests {
+    use super::strip_suffix_ascii_ci;
+
+    #[test]
+    fn strips_in_any_case_and_refuses_the_rest() {
+        assert_eq!(strip_suffix_ascii_ci("Repo.GIT", ".git"), Some("Repo"));
+        assert_eq!(strip_suffix_ascii_ci("a.md", ".md"), Some("a"));
+        assert_eq!(strip_suffix_ascii_ci(".md", ".md"), Some(""));
+        assert_eq!(strip_suffix_ascii_ci("md", ".md"), None);
+        assert_eq!(strip_suffix_ascii_ci("naïve", ".md"), None);
+        assert_eq!(strip_suffix_ascii_ci("Mülle", ".git"), None);
+        assert_eq!(strip_suffix_ascii_ci("日ab", ".git"), None);
+        assert_eq!(strip_suffix_ascii_ci("x.git", "é"), None);
+        assert_eq!(strip_suffix_ascii_ci("x", ""), Some("x"));
+    }
+}
+
 #[cfg(unix)]
 pub(crate) fn rename_noreplace_at(
     source_parent: &std::fs::File,

@@ -1129,8 +1129,8 @@ pub fn scan_briefs(repo_path: &str, tasks_dir: Option<&str>) -> Result<BriefScan
             });
             continue;
         };
-        let is_brief = name.len() > 3
-            && name[name.len() - 3..].eq_ignore_ascii_case(".md")
+        let is_brief = crate::fs_entry::strip_suffix_ascii_ci(name, ".md")
+            .is_some_and(|stem| !stem.is_empty())
             && !name.starts_with('.');
         if is_brief {
             names.push(name.to_string());
@@ -1143,7 +1143,7 @@ pub fn scan_briefs(repo_path: &str, tasks_dir: Option<&str>) -> Result<BriefScan
 
     for name in &names {
         let file = format!("{display_dir}/{name}");
-        let stem = &name[..name.len() - 3];
+        let stem = crate::fs_entry::strip_suffix_ascii_ci(name, ".md").unwrap_or(name);
         let path = resolved.join(name);
         // `O_NOFOLLOW` is the race-free guard, but it exists on unix only; this
         // check is what refuses a link on every platform.

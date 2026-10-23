@@ -3903,10 +3903,9 @@ fn is_python_test_path(rel: &str) -> bool {
     if lower_name == "conftest.py" || lower_name == "pytest.ini" {
         return true;
     }
-    if !lower_name.ends_with(".py") {
+    let Some(stem) = crate::fs_entry::strip_suffix_ascii_ci(&lower_name, ".py") else {
         return false;
-    }
-    let stem = &lower_name[..lower_name.len() - 3];
+    };
     stem.starts_with("test_")
         || stem.ends_with("_test")
         || rel.split('/').any(|c| c.eq_ignore_ascii_case("tests"))
