@@ -17,6 +17,7 @@ pub mod stash;
 pub mod submodules;
 pub mod text_shape;
 pub mod worktree;
+mod worktree_family_disk;
 pub mod worktree_hooks;
 
 pub use cow_clone::{reflink_copy_dir, reflink_ignored_caches, ReflinkResult};

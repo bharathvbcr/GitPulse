@@ -183,13 +183,41 @@ impl AdmittedPair {
             {
                 return Ok(family);
             }
+            // A fresh process has no memory of its own; an earlier one may have
+            // left Git's answer for this very registry (`worktree_family_disk`).
+            if let Some(family) = self.family_from_disk(registry) {
+                remember_family(self.common.clone(), registry.clone(), &family);
+                return Ok(family);
+            }
         }
         let common = self.common.clone();
         let family = self.authenticate_with_git()?;
         if let Some(registry) = registry {
+            super::worktree_family_disk::store(&common, &registry, &family.members);
             remember_family(common, registry, &family);
         }
         Ok(family)
+    }
+
+    /// The family an earlier process stored for exactly this registry, under
+    /// the rule [`remembered_family`] applies in memory: the registry is the
+    /// one Git was asked about and both paths are among its members.
+    fn family_from_disk(&self, registry: &[PathBuf]) -> Option<WorktreeFamily> {
+        let stored = super::worktree_family_disk::load(&self.common)?;
+        if stored.registry != registry {
+            return None;
+        }
+        let anchor = stored.members.first()?.clone();
+        if !stored.members.iter().any(|path| path == &self.repo)
+            || !stored.members.iter().any(|path| path == &self.worktree)
+        {
+            return None;
+        }
+        Some(WorktreeFamily {
+            anchor,
+            worktree: self.worktree.clone(),
+            members: stored.members,
+        })
     }
 
     /// The registry as the metadata view names it: sorted, without repeats, so
@@ -303,6 +331,25 @@ fn remembered_family(
         members: remembered.members.clone(),
     })
 }
+
+/// Makes the next call in this process ask the disk, as a new process would.
+#[cfg(test)]
+pub(crate) fn forget_in_process(common: &Path) {
+    remembered_families()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(
+            common.to_path_buf(),
+            Remembered {
+                registry: Vec::new(),
+                members: Vec::new(),
+            },
+        );
+}
+
+/// Remembers families on disk, under test, in a directory on this thread.
+#[cfg(test)]
+pub(crate) use super::worktree_family_disk::test_dir as family_disk_dir;
 
 fn remember_family(common: PathBuf, registry: Vec<PathBuf>, family: &WorktreeFamily) {
     let mut held = remembered_families()

@@ -3246,6 +3246,21 @@ while IFS= read -r line; do
 done
 "#;
 
+    /// A `manvi serve` stand-in that allows everything inside a declared scope:
+    /// what the harness says to a write the task planned.
+    #[cfg(unix)]
+    const FAKE_ALLOWING_MANVI: &str = r#"#!/bin/sh
+reply() {
+  id=$(printf '%s' "$1" | sed -n 's/^{"id":"\([0-9]*\)".*/\1/p')
+  printf '{"id":"%s","ok":true,"result":%s}\n' "$id" "$2"
+}
+IFS= read -r line || exit 1
+reply "$line" '{"protocol":1,"ops":["hello","policy.check.command","policy.check.file"],"posture":"host"}'
+while IFS= read -r line; do
+  reply "$line" '{"action":"allow","rule":"scope.planned","severity":"soft","reason":"inside the plan","target":"src/planned.rs","task_id":"TASK-HOOK","demoted":"","degraded":[]}'
+done
+"#;
+
     #[cfg(unix)]
     fn scoped_hook_fixture(bind: bool) -> (tempfile::TempDir, String, std::path::PathBuf) {
         use crate::test_support::git_in;
@@ -3302,9 +3317,19 @@ done
         requests: &Path,
         serial: &crate::harness::sidecar::SidecarTestGuard,
     ) -> crate::harness::sidecar::TestBinaryBinding {
-        use std::os::unix::fs::PermissionsExt;
-        let script = dir.join("scoped-manvi");
         let body = FAKE_SCOPED_MANVI.replace("@REQUESTS@", &requests.display().to_string());
+        install_manvi(dir, "scoped-manvi", &body, serial)
+    }
+
+    #[cfg(unix)]
+    fn install_manvi(
+        dir: &Path,
+        name: &str,
+        body: &str,
+        serial: &crate::harness::sidecar::SidecarTestGuard,
+    ) -> crate::harness::sidecar::TestBinaryBinding {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join(name);
         std::fs::write(&script, body).expect("write fake sidecar");
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         crate::harness::sidecar::bind_test_binary(serial, script.to_string_lossy())
@@ -3546,13 +3571,20 @@ done
 
     #[cfg(unix)]
     fn farm(contended: bool) -> Farm {
+        farm_bound(contended, false, SIBLINGS)
+    }
+
+    /// [`farm`] with `count` worktrees and, with `bind`, the main checkout
+    /// bound to a task, so a ledger exists and the scope lookup has work to do.
+    #[cfg(unix)]
+    fn farm_bound(contended: bool, bind: bool, count: usize) -> Farm {
         use crate::test_support::git_in;
-        let (repo_dir, repo, _requests) = scoped_hook_fixture(false);
+        let (repo_dir, repo, _requests) = scoped_hook_fixture(bind);
         let siblings = tempfile::tempdir().expect("sibling worktrees");
         let root = siblings.path().canonicalize().expect("canonical farm");
         let mut dirs = vec![std::path::PathBuf::from(&repo)];
         let mut sibling_dirs = Vec::new();
-        for n in 0..SIBLINGS {
+        for n in 0..count {
             let wt = root.join(format!("sibling-{n}"));
             git_in(
                 Path::new(&repo),
@@ -3630,6 +3662,165 @@ done
             _owner: owner,
             _registered: registered,
         }
+    }
+
+    /// One task-bound repository with `siblings` linked worktrees, the harness
+    /// stand-in installed, and a place on this thread to remember the family.
+    /// The first `call` is a cold process; after `fresh_process` the next one is
+    /// what a new hook process is: its own memory empty, whatever an earlier
+    /// one left on disk still there.
+    #[cfg(unix)]
+    struct BoundFarm {
+        farm: Farm,
+        _serial: crate::harness::sidecar::SidecarTestGuard,
+        _binary: crate::harness::sidecar::TestBinaryBinding,
+        _memory: tempfile::TempDir,
+        _remembering: crate::engine::worktree::family_disk_dir::Reset,
+    }
+
+    #[cfg(unix)]
+    impl BoundFarm {
+        fn new(siblings: usize) -> BoundFarm {
+            use std::os::unix::fs::PermissionsExt;
+            let farm = farm_bound(false, true, siblings);
+            let serial = crate::harness::sidecar::test_serial();
+            let binary = install_manvi(
+                farm._repo.path(),
+                "allowing-manvi",
+                FAKE_ALLOWING_MANVI,
+                &serial,
+            );
+            let memory = tempfile::tempdir().expect("family memory");
+            std::fs::set_permissions(memory.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("private memory");
+            let remembering = crate::engine::worktree::family_disk_dir::set(memory.path());
+            BoundFarm {
+                farm,
+                _serial: serial,
+                _binary: binary,
+                _memory: memory,
+                _remembering: remembering,
+            }
+        }
+
+        fn fresh_process(&self) {
+            let common = Path::new(&self.farm.repo).join(".git");
+            crate::engine::worktree::forget_in_process(&common);
+        }
+
+        /// Git children `run` started, by call site.
+        fn cost(&self, label: &str, run: impl FnOnce(&Farm) -> HookOutput) -> SpawnCost {
+            let marks = spawn_marks(&self.farm.dirs);
+            let _ = run(&self.farm);
+            let cost = spawn_cost(&self.farm.dirs, &marks);
+            eprintln!(
+                "{label}: {} worktrees: {} git children {cost:?}",
+                self.farm.dirs.len(),
+                cost.total()
+            );
+            cost
+        }
+    }
+
+    /// ft-da85cd55 AC1/AC2, the task-bound Bash call. Every Bash call an agent
+    /// makes is a fresh `command-gate` process, and in a repository with a
+    /// ledger each one authenticated the checkout's family with a `git worktree
+    /// list` before it judged anything: the spend that left `sleep` refused at
+    /// an empty shared bucket. The first process asks Git; the next ones, while
+    /// the registry is unchanged, do not.
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_command_gate_process_does_not_re_authenticate_a_known_family() {
+        let bound = BoundFarm::new(2);
+        let call = |farm: &Farm| gate_here(&bash_call(&farm.repo, "ls"));
+        let cold = bound.cost("bash, cold process", call);
+        assert_eq!(
+            cold.worktree_list, 1,
+            "the first process asks Git: {cold:?}"
+        );
+        for _ in 0..3 {
+            bound.fresh_process();
+            let warm = bound.cost("bash, later process", call);
+            assert_eq!(warm.total(), 0, "{warm:?}");
+        }
+    }
+
+    /// What a later process believes is only ever what the registry still says:
+    /// a worktree added since is seen, by asking Git again.
+    #[cfg(unix)]
+    #[test]
+    fn a_changed_registry_makes_the_next_process_ask_git_again() {
+        let bound = BoundFarm::new(2);
+        let call = |farm: &Farm| gate_here(&bash_call(&farm.repo, "ls"));
+        let _ = bound.cost("bash, cold process", call);
+        bound.fresh_process();
+        assert_eq!(bound.cost("bash, unchanged", call).total(), 0);
+        let added = tempfile::tempdir().expect("new worktree parent");
+        crate::test_support::git_in(
+            Path::new(&bound.farm.repo),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "late",
+                &added.path().join("late").to_string_lossy(),
+            ],
+        );
+        bound.fresh_process();
+        let after = bound.cost("bash, registry changed", call);
+        assert_eq!(after.worktree_list, 1, "{after:?}");
+    }
+
+    /// The same for the task-bound Edit with no app to ask. What is left is the
+    /// collision scan's own: one listing and one `git status` per worktree, the
+    /// dirty state being live data that nothing may remember. With an app
+    /// attached the scan is the app's, from memory, and the edit costs the hook
+    /// nothing (`a_task_bound_edit_with_the_app_attached_spends_no_git_spawn`).
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_collision_guard_process_pays_only_for_its_scan_when_the_family_is_known() {
+        let bound = BoundFarm::new(2);
+        // A planned file: an unplanned one is refused by the scope before any scan.
+        let call = |farm: &Farm| {
+            guard_here(&edit_call(
+                &farm.repo,
+                &format!("{}/src/planned.rs", farm.repo),
+            ))
+        };
+        let cold = bound.cost("edit, cold process", call);
+        bound.fresh_process();
+        let warm = bound.cost("edit, later process", call);
+        assert_eq!(
+            warm.total() + 1,
+            cold.total(),
+            "the scope lookup's listing is the one spawn a later process saves: {cold:?} {warm:?}"
+        );
+        // One listing and a status per worktree (3): the scan's floor with no app.
+        assert_eq!(
+            (warm.worktree_list, warm.status, warm.other),
+            (1, 3, 0),
+            "{warm:?}"
+        );
+    }
+
+    /// With the app attached and the family known, a task-bound edit costs the
+    /// hook no git spawn at all: the scope is read from the remembered family
+    /// and the scan is the app's, from its memory.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_task_bound_edit_with_the_app_attached_spends_no_git_spawn() {
+        let bound = BoundFarm::new(2);
+        let _app = app_for(&bound.farm.repo, true);
+        let call = |farm: &Farm| {
+            guard_here(&edit_call(
+                &farm.repo,
+                &format!("{}/src/planned.rs", farm.repo),
+            ))
+        };
+        let _ = bound.cost("edit, app, cold", call);
+        bound.fresh_process();
+        let warm = bound.cost("edit, app, later process", call);
+        assert_eq!(warm.total(), 0, "{warm:?}");
     }
 
     /// Every Edit/Write in an agent runs `collision-guard` as a fresh process,
