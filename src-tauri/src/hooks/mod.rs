@@ -159,6 +159,10 @@ pub struct HookInput {
     pub tool_subject: String,
     /// `tool_input`, said in a line: `Bash: cargo test`.
     pub tool_summary: String,
+    /// What an editing tool is about to do to its file, when the payload says:
+    /// `Edit`/`MultiEdit` name the text they replace, `Write` and
+    /// `NotebookEdit` replace the file. `None` for every other tool.
+    pub incoming: Option<insights::IncomingEdit>,
     /// Set inside a subagent (`agent_id`).
     pub agent_id: String,
     /// `Stop`'s `last_assistant_message`: what the agent ended its turn on.
@@ -198,6 +202,7 @@ impl HookInput {
             cwd,
             tool_name: string_at(Some(value), "tool_name"),
             file_path,
+            incoming: incoming_edit(value),
             command: string_at(tool_input, "command"),
             source: string_at(Some(value), "source"),
             is_cursor: is_cursor_payload(value),
@@ -209,6 +214,35 @@ impl HookInput {
             error: string_at(Some(value), "error"),
             tool_use_id: string_at(Some(value), "tool_use_id"),
         }
+    }
+}
+
+/// The change an editing tool call is about to make, from its `tool_input`.
+///
+/// An `Edit` or `MultiEdit` whose `old_string` is missing or not a string is
+/// still an edit: it reads as an empty string, which cannot be located and so
+/// is asked about, rather than as no edit at all.
+fn incoming_edit(value: &Value) -> Option<insights::IncomingEdit> {
+    let input = value.get("tool_input");
+    match string_at(Some(value), "tool_name").as_str() {
+        "Write" | "NotebookEdit" => Some(insights::IncomingEdit::WholeFile),
+        "Edit" => Some(insights::IncomingEdit::Replacing(vec![string_at(
+            input,
+            "old_string",
+        )])),
+        "MultiEdit" => {
+            let edits = input
+                .and_then(|input| input.get("edits"))
+                .and_then(Value::as_array);
+            Some(insights::IncomingEdit::Replacing(match edits {
+                Some(edits) if !edits.is_empty() => edits
+                    .iter()
+                    .map(|edit| string_at(Some(edit), "old_string"))
+                    .collect(),
+                _ => vec![String::new()],
+            }))
+        }
+        _ => None,
     }
 }
 
@@ -823,9 +857,18 @@ fn collision_guard_with(
     };
 
     let remaining = BUDGET.saturating_sub(started.elapsed());
+    // The scan stops starting worktree reads a margin before the budget ends,
+    // so a slow family comes back as a partial answer rather than as a scan
+    // that did not finish.
+    let deadline = insights::ScanDeadline::after(
+        std::time::Instant::now(),
+        remaining.saturating_sub(SCAN_DEADLINE_MARGIN),
+    );
+    let classified_here = input.incoming.is_some();
     let scanned = within_budget(remaining, {
         let target = target.clone();
-        move || scan_collisions(&root_arg, &target)
+        let root_arg = root_arg.clone();
+        move || scan_collisions(&root_arg, &target, &deadline, !classified_here)
     });
     let Some(risk) = scanned else {
         return merge_outputs(
@@ -837,9 +880,17 @@ fn collision_guard_with(
         );
     };
 
-    let facts = collision_facts(&risk, &root, &target, &|path| {
+    let mut facts = collision_facts(&risk, &root, &target, &|path| {
         agent_session_slug(path).unwrap_or_default()
     });
+    if let (Some(incoming), false) = (input.incoming.clone(), facts.others.is_empty()) {
+        facts.entity = Some(classify_incoming_edit(
+            &root_arg,
+            &facts,
+            incoming,
+            BUDGET.saturating_sub(started.elapsed()),
+        ));
+    }
     log::debug!(
         target: "hooks",
         "collision guard: target={} ok={} others={} partial={} scanned={}",
@@ -851,6 +902,49 @@ fn collision_guard_with(
     );
     let output = merge_outputs(scoped, collision_decision(&facts));
     announce_unscoped(output, unscoped, Judged::Write, input)
+}
+
+/// How long before the hook's budget ends the collision scan stops starting
+/// worktree reads. Longer than the grace a read already begun is given, so the
+/// answer is back, partial, before the wait on it is abandoned.
+const SCAN_DEADLINE_MARGIN: Duration = Duration::from_millis(1_500);
+
+/// The symbol verdict for the edit about to be made, with that edit folded in.
+///
+/// Run only when another worktree holds the file, so an edit nobody contends
+/// pays nothing for it. A check that does not finish in `budget` is a
+/// file-level verdict that says so, which asks: it is never read as disjoint.
+fn classify_incoming_edit(
+    root: &str,
+    facts: &CollisionFacts,
+    incoming: insights::IncomingEdit,
+    budget: Duration,
+) -> insights::EntityCollisionVerdict {
+    let others: Vec<insights::CollisionParty> = facts
+        .others
+        .iter()
+        .map(|other| insights::CollisionParty {
+            path: other.worktree.clone(),
+            branch: (!other.branch.is_empty()).then(|| other.branch.clone()),
+            agent_kind: other.agent_kind.clone(),
+        })
+        .collect();
+    let here = insights::CollisionParty {
+        path: root.to_string(),
+        branch: None,
+        agent_kind: String::new(),
+    };
+    let target = facts.target.clone();
+    within_budget(budget, move || {
+        insights::classify_incoming(&target, &others, &here, &incoming)
+    })
+    .unwrap_or_else(|| insights::EntityCollisionVerdict {
+        path: facts.target.clone(),
+        kind: insights::EntityCollisionKind::FileLevel,
+        reason: "the symbol check for this edit did not finish in time".into(),
+        shared_symbols: Vec::new(),
+        stale: false,
+    })
 }
 
 /// The write-gate operation a file tool performs, in the harness's words.
@@ -1230,7 +1324,7 @@ const COLLISION_APP_DEADLINE: Duration = Duration::from_secs(2);
 const COLLISION_MAX_AGE_MS: u64 = 2 * insights::COLLISION_MEMO_TTL.as_millis() as u64;
 
 /// The app's half of collision-guard: the scan for an edit of `path` in the
-/// worktree `repo`, from the memory in [`insights::collision_risk_for_path_memoized`].
+/// worktree `repo`, from the memory in [`insights::collision_for_path_memoized`].
 ///
 /// Trimmed to what the hook reads (the row for `path`, and the counts that make
 /// a negative answer qualified) so a reply fits one mailbox frame however many
@@ -1239,7 +1333,7 @@ const COLLISION_MAX_AGE_MS: u64 = 2 * insights::COLLISION_MEMO_TTL.as_millis() a
 /// reports with no app, so "could not look" cannot be turned into anything by
 /// crossing the socket.
 pub fn serve_collision(repo: &str, path: &str) -> Result<Value, String> {
-    let mut answer = insights::collision_risk_for_path_memoized(repo, path);
+    let mut answer = insights::collision_for_path_memoized(repo, path);
     if answer.risk.scanned_worktrees == 0 {
         return Err(format!(
             "the scan read no worktree: {}",
@@ -1256,12 +1350,26 @@ pub fn serve_collision(repo: &str, path: &str) -> Result<Value, String> {
 /// itself, as it always did. Either way the result is a full scan with its
 /// partial-coverage fields filled in — never an empty list standing in for one
 /// that could not run — and the one that was not the app's says why.
-fn scan_collisions(root: &str, target: &str) -> CollisionRisk {
+///
+/// `classify` is false when the caller places the edit in its symbols itself
+/// ([`classify_incoming_edit`]): the symbol verdict of the edits already dirty
+/// would be computed and thrown away. The app's answer arrives classified
+/// either way, from its memory.
+fn scan_collisions(
+    root: &str,
+    target: &str,
+    deadline: &insights::ScanDeadline,
+    classify: bool,
+) -> CollisionRisk {
     match scanned_by_app(root, target) {
         Ok(risk) => risk,
         Err(why) => {
             log::debug!(target: "hooks", "collision guard: scanning here, the app did not: {why}");
-            insights::collision_risk_for_path(root, target)
+            if classify {
+                insights::collision_for_path(root, target, Some(deadline))
+            } else {
+                insights::scan_holders_of_path(root, target, Some(deadline))
+            }
         }
     }
 }
@@ -3925,6 +4033,219 @@ done
         assert_eq!(cost.status, EDITS * (SIBLINGS + 1), "{cost:?}");
         assert_eq!(cost.worktree_list, EDITS, "{cost:?}");
     }
+
+    #[cfg(unix)]
+    fn reason_of(output: &HookOutput) -> String {
+        output
+            .hook_specific_output
+            .as_ref()
+            .and_then(|specific| specific.permission_decision_reason.clone())
+            .unwrap_or_default()
+    }
+
+    /// S3-01. The editor's worktree is clean and another holds the file dirty:
+    /// the edit that would have been the first to dirty it here is asked about,
+    /// naming the holder. Before, the pre-edit check read only the overlap of
+    /// two dirty parties, found no row, and said nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_another_worktree_holds_dirty_is_asked_about_before_this_one_dirties_it() {
+        let farm = farm_bound(false, false, 1);
+        std::fs::write(farm.sibling_dirs[0].join("seed.txt"), "theirs").unwrap();
+        let output = guard_here(&edit_call(&farm.repo, &format!("{}/seed.txt", farm.repo)));
+        assert!(asks(&output), "{:?}", output.render());
+        assert!(
+            reason_of(&output).contains("sibling-0"),
+            "{}",
+            reason_of(&output)
+        );
+        // A file nobody holds stays silent.
+        let quiet = guard_here(&edit_call(&farm.repo, &format!("{}/README.md", farm.repo)));
+        assert!(quiet.is_silent(), "{:?}", quiet.render());
+    }
+
+    /// S3-08. The holder's file is new and untracked in a new directory, and
+    /// absent from the asker: status without `-u` named `new/`, so the exact
+    /// path never matched.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_untracked_file_another_worktree_holds_is_found_by_its_path() {
+        let farm = farm_bound(false, false, 1);
+        let held = farm.sibling_dirs[0].join("new/dir");
+        std::fs::create_dir_all(&held).unwrap();
+        std::fs::write(held.join("x.rs"), "fn x() {}").unwrap();
+        let output = guard_here(&edit_call(
+            &farm.repo,
+            &format!("{}/new/dir/x.rs", farm.repo),
+        ));
+        assert!(asks(&output), "{:?}", output.render());
+        assert!(
+            reason_of(&output).contains("sibling-0"),
+            "{}",
+            reason_of(&output)
+        );
+    }
+
+    /// A `Write` over a file another worktree has dirty asks, whatever this
+    /// worktree has or has not changed: there is no range to compare.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_over_a_file_another_worktree_holds_asks_at_file_level() {
+        let farm = farm_bound(false, false, 1);
+        std::fs::write(farm.sibling_dirs[0].join("seed.txt"), "theirs").unwrap();
+        let mut call = edit_call(&farm.repo, &format!("{}/seed.txt", farm.repo));
+        call.tool_name = "Write".to_string();
+        call.incoming = Some(insights::IncomingEdit::WholeFile);
+        let output = guard_here(&call);
+        assert!(asks(&output), "{:?}", output.render());
+        assert!(
+            reason_of(&output).contains("whole file"),
+            "{}",
+            reason_of(&output)
+        );
+    }
+
+    /// An `Edit` that cannot be placed in the file is asked about, never read
+    /// as clear of the other party's symbols.
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_that_cannot_be_located_asks_when_another_worktree_holds_the_file() {
+        let farm = farm_bound(false, false, 1);
+        std::fs::write(farm.sibling_dirs[0].join("seed.txt"), "theirs").unwrap();
+        let mut call = edit_call(&farm.repo, &format!("{}/seed.txt", farm.repo));
+        call.incoming = Some(insights::IncomingEdit::Replacing(vec![
+            "text that is not in the file".to_string(),
+        ]));
+        let output = guard_here(&call);
+        assert!(asks(&output), "{:?}", output.render());
+    }
+
+    /// The cost of placing the incoming edit is paid only by an edit another
+    /// worktree contends, and an uncontended one spends what it always did.
+    #[cfg(unix)]
+    #[test]
+    fn placing_the_incoming_edit_costs_nothing_for_an_uncontended_file() {
+        let farm = farm(false);
+        let marks = spawn_marks(&farm.dirs);
+        let mut call = edit_call(&farm.repo, &format!("{}/seed.txt", farm.repo));
+        call.incoming = Some(insights::IncomingEdit::Replacing(vec!["seed".to_string()]));
+        assert!(guard_here(&call).is_silent());
+        let cost = spawn_cost(&farm.dirs, &marks);
+        assert_eq!(
+            (cost.worktree_list, cost.status, cost.other),
+            (1, SIBLINGS + 1, 0),
+            "{cost:?}"
+        );
+    }
+
+    /// The contended case, measured: one listing and one pathspec-limited
+    /// status per worktree, then the symbol check of each party.
+    #[cfg(unix)]
+    #[test]
+    fn a_contended_edit_spends_its_scan_and_one_symbol_check_per_party() {
+        let farm = farm_bound(false, false, 1);
+        std::fs::write(farm.sibling_dirs[0].join("seed.txt"), "theirs").unwrap();
+        let marks = spawn_marks(&farm.dirs);
+        let mut call = edit_call(&farm.repo, &format!("{}/seed.txt", farm.repo));
+        call.incoming = Some(insights::IncomingEdit::Replacing(vec!["seed".to_string()]));
+        assert!(asks(&guard_here(&call)));
+        let cost = spawn_cost(&farm.dirs, &marks);
+        eprintln!("contended edit with the incoming range: {cost:?}");
+        assert_eq!((cost.worktree_list, cost.status), (1, 2), "{cost:?}");
+    }
+
+    /// The scan cap does apply to the path-limited read: at most
+    /// `MAX_COLLISION_SCANS` (16) worktrees get their status read, the rest are
+    /// counted unscanned and the answer says so. A holder in the unread tail is
+    /// therefore reported as a partial scan, not as a finding, and never as
+    /// silence; a holder inside the cap is a finding.
+    #[cfg(unix)]
+    #[test]
+    fn the_scan_cap_leaves_a_tail_unread_and_says_so() {
+        let farm = farm_bound(false, false, 18);
+        let held = |n: usize| {
+            std::fs::write(farm.sibling_dirs[n].join("seed.txt"), "theirs").unwrap();
+            let output = guard_here(&edit_call(&farm.repo, &format!("{}/seed.txt", farm.repo)));
+            crate::test_support::git_in(&farm.sibling_dirs[n], &["checkout", "--", "seed.txt"]);
+            output
+        };
+        let inside = held(2);
+        assert!(asks(&inside), "{:?}", inside.render());
+        let risk = insights::scan_holders_of_path(&farm.repo, "seed.txt", None);
+        assert_eq!(risk.scanned_worktrees, 16, "{risk:?}");
+        assert_eq!(
+            risk.unscanned_worktrees, 3,
+            "19 worktrees, 16 reads: {risk:?}"
+        );
+        assert!(risk.truncated);
+        // The last worktree in git's listing order is one of the three unread.
+        let listing = crate::engine::worktree::list_worktrees_lite(&farm.repo).expect("listing");
+        let last = listing.last().expect("a listing").path.clone();
+        let last_sibling = farm
+            .sibling_dirs
+            .iter()
+            .position(|dir| same_path(dir, &last))
+            .expect("the last worktree is a sibling");
+        let tail = held(last_sibling);
+        assert!(
+            !asks(&tail),
+            "the unread tail cannot have produced a finding"
+        );
+        let text = tail.system_message.unwrap_or_default();
+        assert!(
+            text.contains("INCOMPLETE") && text.contains("3 worktree(s) were not scanned"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_incoming_edit_is_read_from_the_tool_input() {
+        let parse = |tool: &str, input: Value| {
+            HookInput::from_value(&json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": tool,
+                "cwd": "/r",
+                "tool_input": input,
+            }))
+            .incoming
+        };
+        assert_eq!(
+            parse(
+                "Edit",
+                json!({"file_path": "/r/a", "old_string": "x", "new_string": "y"})
+            ),
+            Some(insights::IncomingEdit::Replacing(vec!["x".into()]))
+        );
+        assert_eq!(
+            parse(
+                "MultiEdit",
+                json!({"file_path": "/r/a", "edits": [
+                    {"old_string": "a", "new_string": "b"},
+                    {"old_string": "c", "new_string": "d"}
+                ]})
+            ),
+            Some(insights::IncomingEdit::Replacing(vec![
+                "a".into(),
+                "c".into()
+            ]))
+        );
+        // An edit with no old_string is still an edit, and cannot be placed.
+        assert_eq!(
+            parse("Edit", json!({"file_path": "/r/a"})),
+            Some(insights::IncomingEdit::Replacing(vec![String::new()]))
+        );
+        assert_eq!(
+            parse("MultiEdit", json!({"file_path": "/r/a", "edits": []})),
+            Some(insights::IncomingEdit::Replacing(vec![String::new()]))
+        );
+        assert_eq!(
+            parse("Write", json!({"file_path": "/r/a", "content": "c"})),
+            Some(insights::IncomingEdit::WholeFile)
+        );
+        assert_eq!(parse("Bash", json!({"command": "ls"})), None);
+    }
+
+    mod adv_w6_tests;
 
     /// A contended file is still reported on every edit, with the same decision
     /// the unmemoized scan makes, and the symbol check — a DevMap open and git

@@ -387,6 +387,15 @@ tool_args! {
 }
 
 tool_args! {
+    struct CollisionRiskArgs {
+        repo_path: String = repo_spec(),
+        path: Option<String> = path_spec(
+            "A repo-relative file about to be edited. Answers who else holds exactly this file dirty, including a single other worktree, and returns only that row plus the scan's coverage counts; omit it for the repo-wide overlap list",
+        ),
+    }
+}
+
+tool_args! {
     struct ChangeContextArgs {
         repo_path: String = repo_spec(),
         worktree_path: Option<String> = path_spec("Worktree to describe; defaults to repo_path"),
@@ -952,9 +961,9 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_collision_risk",
             "Collision risk",
-            "Files with uncommitted changes in more than one worktree — parallel agent checkouts editing the same path — and, in shared_worktrees, the dirty files of any worktree two or more live agent sessions share, which overlapping_files cannot see. Unscanned worktrees are counted, never implied clean; sessions_ok is false when an agent kind could not be observed.",
-            RepoArgs::properties(),
-            &RepoArgs::required(),
+            "Files with uncommitted changes in more than one worktree — parallel agent checkouts editing the same path — and, in shared_worktrees, the dirty files of any worktree two or more live agent sessions share, which overlapping_files cannot see. Unscanned worktrees are counted, never implied clean; sessions_ok is false when an agent kind could not be observed. With the optional path (a repo-relative file you are about to edit) it instead answers whether any other worktree holds exactly that file dirty, a single one included, and returns only that row plus the scan coverage counts; ok is false and truncated is true when a worktree could not be read, so an empty list is absence only when ok is true.",
+            CollisionRiskArgs::properties(),
+            &CollisionRiskArgs::required(),
             collision_risk_output(),
         ),
         tool(
@@ -1774,9 +1783,15 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             }))
         }
         "gitpulse_collision_risk" => {
-            let a: RepoArgs = parse(name, arguments)?;
+            let a: CollisionRiskArgs = parse(name, arguments)?;
             Ok(with_production_retry(|retry| {
-                read_insights(|| json!(insights::collision_risk(&a.repo_path)), retry)
+                read_insights(
+                    || match a.path.as_deref() {
+                        Some(path) => json!(insights::collision_row_for_path(&a.repo_path, path)),
+                        None => json!(insights::collision_risk(&a.repo_path)),
+                    },
+                    retry,
+                )
             }))
         }
         "gitpulse_merge_conflicts" => {
@@ -6544,7 +6559,7 @@ mod tests {
             ("gitpulse_insights", RepoArgs),
             ("gitpulse_status", RepoArgs),
             ("gitpulse_active_changes", ActiveChangesArgs),
-            ("gitpulse_collision_risk", RepoArgs),
+            ("gitpulse_collision_risk", CollisionRiskArgs),
             ("gitpulse_merge_conflicts", RepoArgs),
             ("gitpulse_change_context", ChangeContextArgs),
             ("gitpulse_ledger_events", LedgerEventsArgs),
@@ -6646,7 +6661,7 @@ mod tests {
                 ("gitpulse_insights", RepoArgs),
                 ("gitpulse_status", RepoArgs),
                 ("gitpulse_active_changes", ActiveChangesArgs),
-                ("gitpulse_collision_risk", RepoArgs),
+                ("gitpulse_collision_risk", CollisionRiskArgs),
                 ("gitpulse_merge_conflicts", RepoArgs),
                 ("gitpulse_change_context", ChangeContextArgs),
                 ("gitpulse_ledger_events", LedgerEventsArgs),
@@ -7672,6 +7687,91 @@ mod deferral_retry_tests {
         )
         .unwrap();
         assert!(answer["ledger"].get("deferred").is_none(), "{answer}");
+    }
+
+    /// A trusted repository with one linked worktree that holds `held.txt`
+    /// dirty, and the asking checkout (the repository itself) clean.
+    fn repo_with_a_holder() -> (tempfile::TempDir, std::path::PathBuf) {
+        let repo = crate::test_support::git_repo();
+        let holder = repo.path().join(".claude/worktrees/holder");
+        std::fs::create_dir_all(holder.parent().unwrap()).unwrap();
+        crate::engine::worktree::add_worktree(
+            repo.path().to_str().unwrap(),
+            holder.to_str().unwrap(),
+            Some("agent/holder"),
+            None,
+            false,
+        )
+        .expect("add worktree");
+        crate::test_support::trust_repo(&holder);
+        std::fs::write(holder.join("held.txt"), "theirs").unwrap();
+        (repo, holder)
+    }
+
+    /// S3-09. `path` is additive: a call without it answers exactly as it did,
+    /// and one with it returns only that file's row plus the coverage counts.
+    #[test]
+    fn collision_risk_with_a_path_answers_for_that_file_and_without_one_is_unchanged() {
+        let (repo, _holder) = repo_with_a_holder();
+        let repo_path = repo.path().to_str().unwrap();
+
+        let wide = handle_tool_call(
+            "gitpulse_collision_risk",
+            &json!({ "repo_path": repo_path }),
+        )
+        .expect("repo-wide");
+        assert_eq!(wide, json!(insights::collision_risk(repo_path)));
+        assert_eq!(wide["items"], json!([]), "no overlap: {wide}");
+
+        let held = handle_tool_call(
+            "gitpulse_collision_risk",
+            &json!({ "repo_path": repo_path, "path": "held.txt" }),
+        )
+        .expect("held");
+        assert_eq!(held["ok"], true, "{held}");
+        assert_eq!(held["items"].as_array().map(Vec::len), Some(1), "{held}");
+        assert_eq!(held["items"][0]["path"], "held.txt");
+        assert_eq!(
+            held["items"][0]["worktrees"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            held["scanned_worktrees"], 2,
+            "coverage counts ride along: {held}"
+        );
+        assert_eq!(held["shared_worktrees"], json!([]));
+
+        let free = handle_tool_call(
+            "gitpulse_collision_risk",
+            &json!({ "repo_path": repo_path, "path": "nobody-has-this.txt" }),
+        )
+        .expect("free");
+        assert_eq!(free["items"], json!([]));
+        assert_eq!(free["ok"], true, "{free}");
+
+        for bad in [
+            json!({ "repo_path": repo_path, "path": "" }),
+            json!({ "repo_path": repo_path, "paths": "x" }),
+        ] {
+            assert!(
+                handle_tool_call("gitpulse_collision_risk", &bad).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// S3-01. Preflight from a clean worktree lists the other worktrees' dirty
+    /// files, and its description says what it can establish.
+    #[test]
+    fn preflight_from_a_clean_worktree_lists_what_other_worktrees_hold() {
+        let (repo, _holder) = repo_with_a_holder();
+        let repo_path = repo.path().to_str().unwrap();
+        let prompt = prompts::get("gitpulse_preflight", &json!({ "repo_path": repo_path }))
+            .expect("preflight");
+        let text = prompt.to_string();
+        assert!(text.contains("held.txt"), "{text}");
+        assert!(text.contains("cannot know which file"), "{text}");
+        assert!(text.contains("gitpulse_collision_risk"), "{text}");
     }
 
     /// The ledger read resolves its address through the same retry: a shed

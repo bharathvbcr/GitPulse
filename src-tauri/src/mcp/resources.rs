@@ -62,6 +62,11 @@ const FACETS: &[Facet] = &[
         description: "Files with uncommitted changes in more than one worktree, and dirty files in any worktree two or more live agent sessions share. Unscanned worktrees are counted, never implied clean.",
     },
     Facet {
+        name: "elsewhere",
+        title: "Other worktrees' dirty files",
+        description: "The uncommitted files of every other worktree, for a worktree that is itself clean. It cannot know which file you will edit; ask gitpulse_collision_risk with a path for that. A worktree with scanned false was not read.",
+    },
+    Facet {
         name: "changes",
         title: "Active changes",
         description: "Working-tree file list for the repository's main worktree (path, staged, conflicted, churn), capped.",
@@ -483,6 +488,7 @@ pub(super) fn repo_facet(facet: &str, repo: &str) -> Result<Value, ReadError> {
         "insights" => Ok(insights_document(repo)),
         "status" => status_document(repo).map_err(ReadError::Internal),
         "collisions" => Ok(json!(crate::insights::collision_risk(repo))),
+        "elsewhere" => Ok(json!(crate::insights::dirty_elsewhere(repo))),
         "changes" => Ok(json!(crate::insights::active_changes(repo, None, None))),
         "context" => Ok(json!(crate::insights::change_context(repo, None))),
         "ledger" => {

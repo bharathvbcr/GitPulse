@@ -863,15 +863,92 @@ pub const MAX_CHANGED_PATHS: usize = 256;
 /// one in flight is given the time left (at least [`STATUS_GRACE`]) rather
 /// than git's 90 s command timeout. Either way the caller gets an error that
 /// says why, which is how a worktree it could not read stays "unknown".
-fn read_porcelain(dir: &Path, deadline: Option<&ScanDeadline>) -> Result<String, String> {
+///
+/// `only` limits the read to some paths (`:(literal)` pathspecs, so `*?[` in a
+/// name never widen them; `icase` too when the volume ignores case): the
+/// answer to "is this file dirty here" without walking the rest of the tree's
+/// changes.
+fn read_porcelain(
+    dir: &Path,
+    deadline: Option<&ScanDeadline>,
+    only: Option<OnlyPaths<'_>>,
+) -> Result<String, String> {
     #[cfg(test)]
     status_probes::fire(dir);
-    let args = ["status", "--porcelain", "-z"];
+    let magic = match only {
+        Some(only) if only.ignore_case => ":(literal,icase)",
+        _ => ":(literal)",
+    };
+    let specs: Vec<String> = only
+        .iter()
+        .flat_map(|only| only.paths.iter())
+        .map(|path| format!("{magic}{path}"))
+        .collect();
+    let mut args: Vec<&str> = crate::engine::git_cli::STATUS_ARGV.to_vec();
+    if !specs.is_empty() {
+        args.push("--");
+        args.extend(specs.iter().map(String::as_str));
+    }
     match deadline {
         None => git_text(dir, &args),
         Some(deadline) if deadline.expired() => Err(DEADLINE_PASSED.to_string()),
         Some(deadline) => git_text_with_timeout(dir, &args, deadline.remaining().max(STATUS_GRACE)),
     }
+}
+
+/// The paths a limited status read is about.
+#[derive(Clone, Copy)]
+struct OnlyPaths<'a> {
+    paths: &'a [&'a str],
+    /// The worktree's volume treats `a` and `A` as one name.
+    ignore_case: bool,
+}
+
+/// Whether the volume `repo` lives on ignores case, measured on the volume
+/// itself: `.git` is there in every worktree, and under a case-insensitive
+/// volume `.GIT` is the same file. Git's own `core.ignorecase` is probed the
+/// same way at `init`, but reading it would cost a process per worktree.
+fn volume_ignores_case(repo: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (
+            std::fs::metadata(repo.join(".git")),
+            std::fs::metadata(repo.join(".GIT")),
+        ) {
+            (Ok(real), Ok(flipped)) => (real.dev(), real.ino()) == (flipped.dev(), flipped.ino()),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows volumes ignore case unless a directory opted out.
+        let _ = repo;
+        true
+    }
+}
+
+/// The proper ancestors of `path` that are nested repositories in `repo`
+/// (a submodule, or any directory with its own `.git`). A status of the file
+/// inside one reports nothing, because the superproject sees only the gitlink
+/// row, so the gitlink is asked about as well.
+fn nested_repository_ancestors(repo: &Path, path: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut prefix = String::new();
+    let mut parts = path.split('/').peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            break;
+        }
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(part);
+        if repo.join(&prefix).join(".git").exists() {
+            found.push(prefix.clone());
+        }
+    }
+    found
 }
 
 /// Why a status that never started did not.
@@ -955,8 +1032,55 @@ pub fn changed_paths_within(
             repo.display()
         ));
     }
-    let stdout = read_porcelain(&repo, deadline)?;
+    let stdout = read_porcelain(&repo, deadline, None)?;
     Ok(bounded_status_paths(stdout.as_bytes()))
+}
+
+/// [`changed_paths_within`] for one path: the entries of a pathspec-limited
+/// status of `worktree_path`. Empty means `path` is clean here; an error means
+/// unknown, never clean.
+pub fn changed_paths_only(
+    worktree_path: &str,
+    path: &str,
+    deadline: Option<&ScanDeadline>,
+) -> Result<(Vec<String>, bool), String> {
+    let repo = validate_repo(worktree_path)?;
+    if !repo.is_dir() {
+        return Err(format!(
+            "worktree path is not a directory: {}",
+            repo.display()
+        ));
+    }
+    let ignore_case = volume_ignores_case(&repo);
+    let nested = nested_repository_ancestors(&repo, path);
+    let mut asked: Vec<&str> = vec![path];
+    asked.extend(nested.iter().map(String::as_str));
+    let stdout = read_porcelain(
+        &repo,
+        deadline,
+        Some(OnlyPaths {
+            paths: &asked,
+            ignore_case,
+        }),
+    )?;
+    let (mut paths, truncated) = bounded_status_paths(stdout.as_bytes());
+    // A row for the file under another spelling of its name, or for the nested
+    // repository that contains it, is a row for this file: the caller matches
+    // rows by the path it asked about.
+    for entry in &mut paths {
+        let same = |other: &str| {
+            if ignore_case {
+                entry.eq_ignore_ascii_case(other)
+            } else {
+                entry == other
+            }
+        };
+        if same(path) || nested.iter().any(|ancestor| same(ancestor)) {
+            *entry = path.to_string();
+        }
+    }
+    paths.dedup();
+    Ok((paths, truncated))
 }
 
 /// The changed paths of one status read, cut at [`MAX_CHANGED_PATHS`], and
@@ -1864,7 +1988,7 @@ fn scan_worktree(
     // failure counter is what says whether one was a refusal rather than a
     // real absence (no upstream, no main branch).
     let failures = crate::engine::git_cli::process_failures();
-    let status = match read_porcelain(dir, deadline) {
+    let status = match read_porcelain(dir, deadline, None) {
         Ok(status) => status,
         Err(reason) if reason == DEADLINE_PASSED => return WorktreeScan::cut_off(),
         Err(reason) => {
@@ -4859,6 +4983,77 @@ some-future-field whatever
         ] {
             assert_eq!(refuse_gitpulse_lane_target(target), Ok(()), "{target}");
         }
+    }
+
+    fn dirty_repo() -> tempfile::TempDir {
+        use crate::test_support::git_in;
+        let dir = tempfile::tempdir().expect("repo");
+        git_in(dir.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.path().join("tracked.txt"), "t").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-q", "-m", "init"]);
+        dir
+    }
+
+    /// S3-08. A new directory is listed by its files, whatever the user's
+    /// config says: `status.showUntrackedFiles=no` hid them, and the default
+    /// collapsed them to `new/`, which no exact-path match can find.
+    #[test]
+    fn untracked_files_are_listed_individually_whatever_the_users_config_says() {
+        let repo = dirty_repo();
+        crate::test_support::git_in(repo.path(), &["config", "status.showUntrackedFiles", "no"]);
+        std::fs::create_dir_all(repo.path().join("new/dir")).unwrap();
+        std::fs::write(repo.path().join("new/dir/x.rs"), "x").unwrap();
+        std::fs::write(repo.path().join("new/y.rs"), "y").unwrap();
+        let (paths, truncated) = changed_paths_within(repo.path().to_str().unwrap(), None).unwrap();
+        assert!(!truncated);
+        let mut paths = paths;
+        paths.sort();
+        assert_eq!(paths, ["new/dir/x.rs", "new/y.rs"]);
+    }
+
+    /// S3-08. A tree of untracked files far past the path cap stays within it,
+    /// and says it was cut.
+    #[test]
+    fn a_huge_untracked_tree_stays_within_the_path_cap_and_says_it_was_cut() {
+        let repo = dirty_repo();
+        let dir = repo.path().join("gen");
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in 0..(MAX_CHANGED_PATHS * 8) {
+            std::fs::write(dir.join(format!("f{n:05}.txt")), "").unwrap();
+        }
+        let (paths, truncated) = changed_paths_within(repo.path().to_str().unwrap(), None).unwrap();
+        assert_eq!(paths.len(), MAX_CHANGED_PATHS);
+        assert!(truncated);
+    }
+
+    /// The path-limited read is limited to exactly that path: glob characters
+    /// in a name never widen it, and another dirty file is not reported.
+    #[test]
+    fn a_path_limited_status_names_only_that_literal_path() {
+        let repo = dirty_repo();
+        for name in ["a[1].txt", "a1.txt", "other.txt"] {
+            std::fs::write(repo.path().join(name), "x").unwrap();
+        }
+        std::fs::write(repo.path().join("tracked.txt"), "changed").unwrap();
+        let dir = repo.path().to_str().unwrap();
+        for (ask, expect) in [
+            ("a[1].txt", vec!["a[1].txt"]),
+            ("a1.txt", vec!["a1.txt"]),
+            ("tracked.txt", vec!["tracked.txt"]),
+            ("clean-and-absent.txt", vec![]),
+        ] {
+            let (paths, truncated) = changed_paths_only(dir, ask, None).unwrap();
+            assert_eq!(
+                (paths, truncated),
+                (expect.iter().map(|s| s.to_string()).collect(), false),
+                "{ask}"
+            );
+        }
+        // A deadline already passed reads nothing and says why, never "clean".
+        let expired = ScanDeadline::after(Instant::now(), Duration::ZERO);
+        let error = changed_paths_only(dir, "tracked.txt", Some(&expired)).unwrap_err();
+        assert_eq!(error, DEADLINE_PASSED);
     }
 
     #[test]

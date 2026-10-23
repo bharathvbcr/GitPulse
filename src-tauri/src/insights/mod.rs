@@ -16,12 +16,13 @@ pub mod merge_conflicts;
 #[cfg(test)]
 mod merge_conflicts_bench_tests;
 
+pub use crate::engine::worktree::ScanDeadline;
 pub use collision_memo::{
-    collision_risk_for_path_memoized, MemoizedCollision, TTL as COLLISION_MEMO_TTL,
+    collision_for_path_memoized, MemoizedCollision, TTL as COLLISION_MEMO_TTL,
 };
 pub use entity_collision::{
-    classify_overlapping_path, parse_old_side_ranges, EntityCollisionKind, EntityCollisionVerdict,
-    LineRange, OldSideHunk,
+    classify_incoming, classify_overlapping_path, parse_old_side_ranges, EntityCollisionKind,
+    EntityCollisionVerdict, IncomingEdit, LineRange, OldSideHunk,
 };
 
 use crate::codeintel::{self, CodeintelStatus};
@@ -239,8 +240,9 @@ pub struct CollisionParty {
 pub struct CollisionItem {
     pub path: String,
     pub worktrees: Vec<CollisionParty>,
-    /// Symbol classification for this path. Populated only for the first
-    /// overlapping row after the porcelain scan — never inside that scan.
+    /// Symbol classification for this path. Populated only for the row the
+    /// caller asked about, and only when two or more worktrees hold it, after
+    /// the porcelain scan — never inside that scan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entity: Option<EntityCollisionVerdict>,
 }
@@ -1668,7 +1670,26 @@ fn collision_from_list(
     live: &LiveSessionFacet,
     deadline: Option<&worktree::ScanDeadline>,
 ) -> CollisionRisk {
-    collision_from_list_reading(list, live, deadline, &changed_paths_within)
+    collision_from_list_reading(
+        list,
+        live,
+        deadline,
+        &changed_paths_within,
+        CollisionScope::default(),
+    )
+}
+
+/// What a collision read is asked about, beyond "every file two worktrees
+/// share". Both narrow the answer *before* the row cap, so the one row a caller
+/// wants cannot be cut for being the thirty-third.
+#[derive(Debug, Clone, Copy, Default)]
+struct CollisionScope<'a> {
+    /// A path about to be edited. Its row is kept when ONE worktree holds it
+    /// dirty: the editor is not dirty there yet, and "no overlap" would be the
+    /// wrong answer to "is anyone else on this file".
+    focus: Option<&'a str>,
+    /// Keep only rows this worktree is a party to.
+    involving: Option<&'a str>,
 }
 
 /// One worktree's changed paths, and whether the list was cut at its cap: the
@@ -1685,6 +1706,7 @@ fn collision_from_list_reading(
     live: &LiveSessionFacet,
     deadline: Option<&worktree::ScanDeadline>,
     read: &(dyn Fn(&str, Option<&worktree::ScanDeadline>) -> PathsRead + Sync),
+    scope: CollisionScope<'_>,
 ) -> CollisionRisk {
     let shared = shared_paths(live);
     // A worktree that two sessions share is scanned ahead of the cap: it is
@@ -1781,7 +1803,12 @@ fn collision_from_list_reading(
 
     let mut items: Vec<CollisionItem> = by_path
         .into_iter()
-        .filter(|(_, parties)| parties.len() > 1)
+        .filter(|(path, parties)| parties.len() > 1 || scope.focus == Some(path.as_str()))
+        .filter(|(_, parties)| {
+            scope
+                .involving
+                .is_none_or(|target| parties.iter().any(|party| same_path(&party.path, target)))
+        })
         .map(|(path, worktrees)| CollisionItem {
             path,
             worktrees,
@@ -1789,10 +1816,21 @@ fn collision_from_list_reading(
         })
         .collect();
     items.sort_by(|a, b| a.path.cmp(&b.path));
-    let overlapping_files = items.len() as u32;
+    // The focus row is not an overlap unless a second worktree holds it.
+    let overlapping_files = items.iter().filter(|item| item.worktrees.len() > 1).count() as u32;
     let truncated =
         items.len() > MAX_COLLISION_ITEMS || paths_truncated || unscanned > 0 || failed > 0;
     if items.len() > MAX_COLLISION_ITEMS {
+        // The row the caller asked about outranks the alphabet: moved to the
+        // front, it survives the cut however many paths sort before it.
+        if let Some(at) = items
+            .iter()
+            .position(|item| scope.focus == Some(item.path.as_str()))
+            .filter(|&at| at >= MAX_COLLISION_ITEMS)
+        {
+            let focus = items.remove(at);
+            items.insert(0, focus);
+        }
         items.truncate(MAX_COLLISION_ITEMS);
     }
     let mut involved = std::collections::BTreeSet::new();
@@ -1857,33 +1895,187 @@ fn collision_from_list_reading(
     }
 }
 
+/// Who else holds `path` dirty, ahead of an edit of it.
+///
+/// The one owner of the pre-edit question, answered by what it asks rather than
+/// by the repo-wide overlap list: the worktree listing is read once, then each
+/// worktree answers one pathspec-limited `status -u` for `path` alone, in the
+/// caller's admission class and under `deadline`. Any worktree holding it is a
+/// row, including a lone one, because the editor is not dirty there yet. A
+/// worktree that could not be read, or was not read before the deadline, makes
+/// the answer partial (`ok: false`, `truncated`, and the counts): an empty
+/// `items` is evidence of absence only when those say the scan was complete.
+/// The symbol verdict is attached when two or more worktrees hold the file; a
+/// caller that classifies the edit itself asks [`scan_holders_of_path`].
+pub fn collision_for_path(
+    repo_path: &str,
+    path: &str,
+    deadline: Option<&worktree::ScanDeadline>,
+) -> CollisionRisk {
+    entity_collision::enrich_item(scan_holders_of_path(repo_path, path, deadline), Some(path))
+}
+
+/// What one other worktree holds dirty, for [`dirty_elsewhere`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirtyElsewhereWorktree {
+    pub path: String,
+    pub branch: Option<String>,
+    /// Dirty paths, repo-relative, cut at the per-worktree path cap.
+    pub files: Vec<String>,
+    /// Whether this worktree's status was read. `files` empty with `false` is
+    /// "not looked at", never "nothing dirty".
+    pub scanned: bool,
+    /// Why it was not read; empty when it was.
+    pub error: String,
+    /// `files` stopped at the path cap.
+    pub truncated: bool,
+}
+
+/// Every other worktree's dirty files, for a caller that has not chosen a file
+/// yet. See [`dirty_elsewhere`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirtyElsewhere {
+    /// Every other worktree was read in full.
+    pub ok: bool,
+    pub error: String,
+    pub worktrees: Vec<DirtyElsewhereWorktree>,
+    /// Worktrees past the scan cap, never read.
+    pub unscanned_worktrees: u32,
+    /// What this answer can establish, and what it cannot.
+    pub establishes: String,
+}
+
+const DIRTY_ELSEWHERE_ESTABLISHES: &str = "Lists the uncommitted files of every other worktree, so you can see whether a file you mean to edit is held. It cannot know which file you will edit: a clean worktree has no overlap with anyone yet. Before editing a file, ask gitpulse_collision_risk with its path; a worktree with scanned false was not read and says nothing.";
+
+/// The dirty files of every worktree of `repo_path` except `repo_path`'s own.
+///
+/// The pre-edit view for a worktree that is itself clean, where the overlap
+/// list is empty by construction. Capped like the collision scan
+/// ([`MAX_COLLISION_SCANS`] worktrees, [`worktree::MAX_CHANGED_PATHS`] paths
+/// each) and read in the caller's admission class; a worktree that could not be
+/// read is listed with its error, and makes `ok` false.
+pub fn dirty_elsewhere(repo_path: &str) -> DirtyElsewhere {
+    let failed = |error: String| DirtyElsewhere {
+        ok: false,
+        error,
+        worktrees: Vec::new(),
+        unscanned_worktrees: 0,
+        establishes: DIRTY_ELSEWHERE_ESTABLISHES.to_string(),
+    };
+    let list = match worktree::list_worktrees_lite(repo_path) {
+        Ok(list) => list,
+        Err(error) => return failed(error),
+    };
+    let others: Vec<&WorktreeInfo> = list
+        .iter()
+        .filter(|w| !w.is_bare && !same_path(&w.path, repo_path))
+        .collect();
+    let unscanned = others.len().saturating_sub(MAX_COLLISION_SCANS);
+    let class = current_admission();
+    let worktrees: Vec<DirtyElsewhereWorktree> = others
+        .into_iter()
+        .take(MAX_COLLISION_SCANS)
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|wt| {
+            let read = with_admission(class, || changed_paths_within(&wt.path, None));
+            let (files, truncated, error) = match read {
+                Ok((files, truncated)) => (files, truncated, String::new()),
+                Err(error) => (Vec::new(), false, error),
+            };
+            DirtyElsewhereWorktree {
+                path: wt.path.clone(),
+                branch: wt.branch.clone(),
+                scanned: error.is_empty(),
+                files,
+                error,
+                truncated,
+            }
+        })
+        .collect();
+    let unread = worktrees.iter().filter(|w| !w.scanned).count();
+    let error = worktrees
+        .iter()
+        .find(|w| !w.scanned)
+        .map(|w| w.error.clone())
+        .unwrap_or_default();
+    DirtyElsewhere {
+        ok: unread == 0 && unscanned == 0,
+        error,
+        worktrees,
+        unscanned_worktrees: unscanned as u32,
+        establishes: DIRTY_ELSEWHERE_ESTABLISHES.to_string(),
+    }
+}
+
+/// [`collision_for_path`] as the `gitpulse_collision_risk {path}` answer: the
+/// one row for `path` (a lone holder included) and the scan's coverage counts,
+/// and nothing else. The shared-worktree list is a repo-wide fact the
+/// path-limited read did not gather, so it is left empty rather than reported
+/// from a scan that only looked at one file.
+pub fn collision_row_for_path(repo_path: &str, path: &str) -> CollisionRisk {
+    let mut risk = collision_for_path(repo_path, path, None);
+    risk.shared_worktrees.clear();
+    risk.shared_worktree_files = 0;
+    risk
+}
+
+/// [`collision_for_path`] without the symbol verdict: who holds `path`, and how
+/// much of the family was read to say so.
+///
+/// The bound is [`MAX_COLLISION_SCANS`] status reads, one per worktree, the
+/// same cap as the repo-wide scan: a family past it has its tail counted in
+/// `unscanned_worktrees` and the answer is partial, never clean.
+pub fn scan_holders_of_path(
+    repo_path: &str,
+    path: &str,
+    deadline: Option<&worktree::ScanDeadline>,
+) -> CollisionRisk {
+    scan_holders_observed(repo_path, path, &live_sessions::observe(), deadline)
+}
+
+fn scan_holders_observed(
+    repo_path: &str,
+    path: &str,
+    observation: &live_sessions::Observation,
+    deadline: Option<&worktree::ScanDeadline>,
+) -> CollisionRisk {
+    match worktree::list_worktrees_lite(repo_path) {
+        Ok(list) => {
+            let read = |worktree: &str, deadline: Option<&worktree::ScanDeadline>| -> PathsRead {
+                worktree::changed_paths_only(worktree, path, deadline)
+            };
+            collision_from_list_reading(
+                &list,
+                &live_in(observation, &list),
+                deadline,
+                &read,
+                CollisionScope {
+                    focus: Some(path),
+                    involving: None,
+                },
+            )
+        }
+        Err(error) => empty_collisions(error),
+    }
+}
+
 /// Overlapping dirty files across worktrees of `repo_path`, and dirty files
 /// in any worktree two live agent sessions share.
 ///
-/// The porcelain path scan stays bounded and cheap. Symbol classification runs
-/// afterwards on the first overlapping path only — see
-/// [`entity_collision::enrich_item`].
+/// The repo-wide view: porcelain paths only, no symbol verdict. A caller that
+/// is about to edit one file asks [`collision_for_path`] instead.
 pub fn collision_risk(repo_path: &str) -> CollisionRisk {
-    collision_risk_observed(repo_path, &live_sessions::observe(), None)
-}
-
-/// [`collision_risk`] whose symbol verdict is computed for `path`, the file
-/// being edited, instead of the first overlapping row.
-pub fn collision_risk_for_path(repo_path: &str, path: &str) -> CollisionRisk {
-    collision_risk_observed(repo_path, &live_sessions::observe(), Some(path))
+    collision_risk_observed(repo_path, &live_sessions::observe())
 }
 
 /// [`collision_risk`] over a live-session observation the caller made.
 fn collision_risk_observed(
     repo_path: &str,
     observation: &live_sessions::Observation,
-    focus: Option<&str>,
 ) -> CollisionRisk {
     match worktree::list_worktrees_lite(repo_path) {
-        Ok(list) => entity_collision::enrich_item(
-            collision_from_list(&list, &live_in(observation, &list), None),
-            focus,
-        ),
+        Ok(list) => collision_from_list(&list, &live_in(observation, &list), None),
         Err(error) => empty_collisions(error),
     }
 }
@@ -2075,7 +2267,7 @@ fn collisions_involving(risk: CollisionRisk, target: &str) -> CollisionRisk {
         .filter(|item| {
             item.worktrees
                 .iter()
-                .any(|party| Path::new(&party.path) == Path::new(target))
+                .any(|party| same_path(&party.path, target))
         })
         .collect();
     let mut involved = std::collections::BTreeSet::new();
@@ -2087,7 +2279,7 @@ fn collisions_involving(risk: CollisionRisk, target: &str) -> CollisionRisk {
     let shared_worktrees: Vec<SharedWorktree> = risk
         .shared_worktrees
         .into_iter()
-        .filter(|w| Path::new(&w.path) == Path::new(target))
+        .filter(|w| same_path(&w.path, target))
         .collect();
     CollisionRisk {
         overlapping_files: items.len() as u32,
@@ -2123,7 +2315,28 @@ pub fn change_context(repo_path: &str, worktree_path: Option<&str>) -> ChangeCon
 
     // Only the target's dirty count is read, so only the target is scanned:
     // a full listing scanned up to 32 worktrees to describe one.
-    let (worktree, worktree_ok, worktree_error) = match worktree::list_worktrees_lite(repo_path) {
+    //
+    // The listing is read once and also answers the collision question: the
+    // rows are cut to this worktree's before the row cap, so one of its files
+    // cannot be dropped for sorting after thirty-two others'.
+    let listed = worktree::list_worktrees_lite(repo_path);
+    let collisions = match &listed {
+        Ok(list) => collisions_involving(
+            collision_from_list_reading(
+                list,
+                &live_in(&live_sessions::observe(), list),
+                None,
+                &changed_paths_within,
+                CollisionScope {
+                    focus: None,
+                    involving: Some(&target),
+                },
+            ),
+            &target,
+        ),
+        Err(error) => empty_collisions(error.clone()),
+    };
+    let (worktree, worktree_ok, worktree_error) = match listed {
         Ok(list) => match list.into_iter().find(|w| same_path(&w.path, &target)) {
             Some(mut found) => {
                 worktree::scan_dirty(&mut found);
@@ -2165,7 +2378,7 @@ pub fn change_context(repo_path: &str, worktree_path: Option<&str>) -> ChangeCon
         task_error,
         // The family was resolved above, so the target needs no second proof.
         changes: changes_in(repo_path, &target, None),
-        collisions: collisions_involving(collision_risk(repo_path), &target),
+        collisions,
         operation,
         operation_ok,
         operation_error,
@@ -2661,7 +2874,7 @@ mod tests {
         let claude = observation.iter().find(|k| k.kind == "claude").unwrap();
         assert_eq!(claude.live.len(), 2, "both stand-ins are alive: {claude:?}");
 
-        let risk = collision_risk_observed(repo, &observation, None);
+        let risk = collision_risk_observed(repo, &observation);
         assert!(risk.ok, "{risk:?}");
         assert_eq!(risk.overlapping_files, 0, "one worktree overlaps nothing");
         assert_eq!(risk.shared_worktree_files, 1, "{risk:?}");
@@ -2719,7 +2932,7 @@ mod tests {
             &crate::workbench::process_birth::running_since,
         );
 
-        let risk = collision_risk_observed(repo, &observation, None);
+        let risk = collision_risk_observed(repo, &observation);
         assert!(risk.ok, "{risk:?}");
         assert!(risk.shared_worktrees.is_empty(), "{risk:?}");
         assert_eq!(risk.shared_worktree_files, 0);
@@ -2921,11 +3134,21 @@ mod tests {
             .flat_map(|i| i.worktrees.iter())
             .find(|p| p.agent_kind == "claude");
         assert!(agent.is_some(), "agent worktree must be labelled: {risk:?}");
-        // Symbol classification runs on the first overlapping path *after*
-        // the porcelain scan — the row must carry a verdict (typically
+        // The repo-wide view classifies nothing: a verdict costs git diffs per
+        // party, and it is the edited file's, which only a path-scoped read
+        // knows. Asked about the file, the same overlap carries one (typically
         // file_level here: no DevMap store in the fixture).
-        let first = risk.items.first().expect("at least one overlap");
-        let entity = first.entity.as_ref().expect("first overlap is classified");
+        assert!(
+            risk.items.iter().all(|item| item.entity.is_none()),
+            "{risk:?}"
+        );
+        let scoped = collision_for_path(repo, "shared.txt", None);
+        let first = scoped.items.first().expect("the row for shared.txt");
+        assert_eq!(first.path, "shared.txt");
+        let entity = first
+            .entity
+            .as_ref()
+            .expect("the asked-about row is classified");
         assert_eq!(entity.path, first.path);
         assert!(
             matches!(
@@ -2936,6 +3159,216 @@ mod tests {
             ),
             "{entity:?}"
         );
+    }
+
+    /// S3-09, at the seam the app's memory reads through: full path lists (not
+    /// path-limited reads) cut at the row cap, so the focus row has to be kept
+    /// ahead of the alphabet or the fortieth file reads as "no collision".
+    #[test]
+    fn a_full_list_read_keeps_the_focus_row_past_the_row_cap() {
+        let list = vec![
+            bare_listing("/gp-test/a", "a"),
+            bare_listing("/gp-test/b", "b"),
+        ];
+        let read = |_: &str, _: Option<&worktree::ScanDeadline>| -> PathsRead {
+            Ok(((0..40).map(|n| format!("f{n:02}.txt")).collect(), false))
+        };
+        let live = live_in(&Vec::new(), &list);
+        let focused = collision_from_list_reading(
+            &list,
+            &live,
+            None,
+            &read,
+            CollisionScope {
+                focus: Some("f39.txt"),
+                involving: None,
+            },
+        );
+        assert_eq!(focused.items.len(), MAX_COLLISION_ITEMS);
+        assert_eq!(focused.overlapping_files, 40);
+        assert!(focused.truncated);
+        assert!(
+            focused.items.iter().any(|item| item.path == "f39.txt"),
+            "{focused:?}"
+        );
+        let unfocused =
+            collision_from_list_reading(&list, &live, None, &read, CollisionScope::default());
+        assert!(!unfocused.items.iter().any(|item| item.path == "f39.txt"));
+    }
+
+    /// `repo` and one linked worktree of it, both trusted, on a repository
+    /// whose `shared.txt` is committed.
+    fn repo_with_one_worktree(slug: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let main = init_repo();
+        let repo = main.path().to_str().unwrap();
+        fs::create_dir_all(main.path().join(".claude/worktrees")).unwrap();
+        let wt = main.path().join(".claude/worktrees").join(slug);
+        worktree::add_worktree(
+            repo,
+            wt.to_str().unwrap(),
+            Some(&format!("agent/{slug}")),
+            Some("main"),
+            false,
+        )
+        .expect("add worktree");
+        crate::test_support::trust_repo(&wt);
+        (main, wt)
+    }
+
+    /// S3-01. The editor's own worktree is clean, so the repo-wide overlap list
+    /// (two dirty parties or none) is empty by construction while another
+    /// worktree holds the file. The path-scoped read says who.
+    #[test]
+    fn a_file_one_other_worktree_holds_dirty_is_a_row_when_asked_about_that_file() {
+        let (main, wt) = repo_with_one_worktree("holder");
+        let repo = main.path().to_str().unwrap();
+        fs::write(wt.join("shared.txt"), "theirs").unwrap();
+
+        let wide = collision_risk(repo);
+        assert!(wide.items.is_empty(), "no overlap: {wide:?}");
+
+        let risk = collision_for_path(repo, "shared.txt", None);
+        assert!(risk.ok, "{risk:?}");
+        let row = risk.items.first().expect("a row for the held file");
+        assert_eq!(row.path, "shared.txt");
+        assert_eq!(row.worktrees.len(), 1, "{row:?}");
+        assert!(same_path(&row.worktrees[0].path, &wt), "{row:?}");
+        assert_eq!(risk.overlapping_files, 0, "one holder is not an overlap");
+        assert!(row.entity.is_none(), "one holder has nothing to compare");
+
+        let untouched = collision_for_path(repo, "not-held.txt", None);
+        assert!(untouched.ok && untouched.items.is_empty(), "{untouched:?}");
+    }
+
+    /// S3-01/S3-08. A new file in a new directory, untracked in the holder and
+    /// absent from the asker: the path is the file, not `new/`.
+    #[test]
+    fn an_untracked_file_in_a_new_directory_is_found_by_its_own_path() {
+        let (main, wt) = repo_with_one_worktree("newdir");
+        let repo = main.path().to_str().unwrap();
+        fs::create_dir_all(wt.join("new/dir")).unwrap();
+        fs::write(wt.join("new/dir/x.rs"), "fn x() {}").unwrap();
+
+        let risk = collision_for_path(repo, "new/dir/x.rs", None);
+        assert!(risk.ok, "{risk:?}");
+        assert_eq!(risk.items.len(), 1, "{risk:?}");
+        assert_eq!(risk.items[0].path, "new/dir/x.rs");
+        assert!(same_path(&risk.items[0].worktrees[0].path, &wt));
+
+        // Two worktrees each holding it: one row for the file, never `new/`.
+        fs::create_dir_all(main.path().join("new/dir")).unwrap();
+        fs::write(main.path().join("new/dir/x.rs"), "fn y() {}").unwrap();
+        let wide = collision_risk(repo);
+        let paths: Vec<&str> = wide.items.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(paths, ["new/dir/x.rs"], "{wide:?}");
+    }
+
+    /// S3-08. A user's `status.showUntrackedFiles=no` must not hide a new file
+    /// from the check.
+    #[test]
+    fn a_users_untracked_files_setting_does_not_hide_a_held_new_file() {
+        let (main, wt) = repo_with_one_worktree("quiet");
+        let repo = main.path().to_str().unwrap();
+        git_in(main.path(), &["config", "status.showUntrackedFiles", "no"]);
+        fs::write(wt.join("fresh.rs"), "fn f() {}").unwrap();
+        let risk = collision_for_path(repo, "fresh.rs", None);
+        assert_eq!(risk.items.len(), 1, "{risk:?}");
+        let (paths, _) = changed_paths_within(wt.to_str().unwrap(), None).unwrap();
+        assert_eq!(paths, ["fresh.rs"]);
+    }
+
+    /// S3-01. A worktree that was not read before the deadline, or could not be
+    /// read at all, makes the answer partial: never an empty, clean-looking one.
+    #[test]
+    fn a_worktree_that_was_not_read_makes_the_path_answer_partial() {
+        let (main, wt) = repo_with_one_worktree("late");
+        let repo = main.path().to_str().unwrap();
+        fs::write(wt.join("shared.txt"), "theirs").unwrap();
+
+        let expired = worktree::ScanDeadline::after(Instant::now(), Duration::ZERO);
+        let risk = collision_for_path(repo, "shared.txt", Some(&expired));
+        assert!(!risk.ok, "{risk:?}");
+        assert!(risk.truncated && risk.unscanned_worktrees > 0, "{risk:?}");
+        assert!(risk.error.contains("ran out of time"), "{}", risk.error);
+        assert!(risk.items.is_empty(), "nothing was read: {risk:?}");
+
+        // One that cannot be read (its directory is gone) is counted failed.
+        fs::remove_dir_all(&wt).unwrap();
+        let gone = collision_for_path(repo, "shared.txt", None);
+        assert!(!gone.ok && gone.failed_worktrees == 1, "{gone:?}");
+        assert!(gone.truncated, "{gone:?}");
+    }
+
+    /// S3-09. Forty files dirty in both worktrees: the row cap is 32, and the
+    /// fortieth must still be found when it is the one being edited.
+    #[test]
+    fn the_file_being_edited_is_found_past_the_row_cap() {
+        let (main, wt) = repo_with_one_worktree("forty");
+        let repo = main.path().to_str().unwrap();
+        for n in 0..40 {
+            fs::write(main.path().join(format!("f{n:02}.txt")), "m").unwrap();
+            fs::write(wt.join(format!("f{n:02}.txt")), "w").unwrap();
+        }
+        let wide = collision_risk(repo);
+        assert_eq!(wide.items.len(), MAX_COLLISION_ITEMS, "{wide:?}");
+        assert!(wide.truncated && wide.overlapping_files == 40, "{wide:?}");
+        assert!(!wide.items.iter().any(|i| i.path == "f39.txt"));
+
+        let risk = collision_for_path(repo, "f39.txt", None);
+        assert!(risk.ok, "{risk:?}");
+        assert_eq!(risk.items.len(), 1, "{risk:?}");
+        assert_eq!(risk.items[0].path, "f39.txt");
+        assert_eq!(risk.items[0].worktrees.len(), 2);
+    }
+
+    /// The same cap, in a worktree's context: its own rows are chosen before
+    /// the cut, so thirty-two overlaps elsewhere cannot hide its one.
+    #[test]
+    fn a_worktrees_context_keeps_its_own_collision_when_others_fill_the_cap() {
+        let (main, wt) = repo_with_one_worktree("busy");
+        let repo = main.path().to_str().unwrap();
+        let third = main.path().join(".claude/worktrees/third");
+        worktree::add_worktree(
+            repo,
+            third.to_str().unwrap(),
+            Some("agent/third"),
+            Some("main"),
+            false,
+        )
+        .expect("add third");
+        crate::test_support::trust_repo(&third);
+        for n in 0..40 {
+            fs::write(wt.join(format!("aa{n:02}.txt")), "w").unwrap();
+            fs::write(third.join(format!("aa{n:02}.txt")), "t").unwrap();
+        }
+        fs::write(main.path().join("zz.txt"), "m").unwrap();
+        fs::write(wt.join("zz.txt"), "w").unwrap();
+
+        let context = change_context(repo, None);
+        let paths: Vec<&str> = context
+            .collisions
+            .items
+            .iter()
+            .map(|i| i.path.as_str())
+            .collect();
+        assert_eq!(paths, ["zz.txt"], "{:?}", context.collisions);
+    }
+
+    #[test]
+    fn dirty_elsewhere_lists_the_other_worktrees_files_and_says_what_it_cannot_establish() {
+        let (main, wt) = repo_with_one_worktree("elsewhere");
+        let repo = main.path().to_str().unwrap();
+        fs::write(wt.join("theirs.txt"), "t").unwrap();
+        fs::write(main.path().join("mine.txt"), "m").unwrap();
+        let view = dirty_elsewhere(repo);
+        assert!(view.ok, "{view:?}");
+        assert_eq!(view.worktrees.len(), 1, "{view:?}");
+        assert!(same_path(&view.worktrees[0].path, &wt));
+        assert_eq!(view.worktrees[0].files, ["theirs.txt"]);
+        assert!(view.establishes.contains("cannot know which file"));
+        fs::remove_dir_all(&wt).unwrap();
+        let broken = dirty_elsewhere(repo);
+        assert!(!broken.ok && !broken.worktrees[0].scanned, "{broken:?}");
     }
 
     #[test]

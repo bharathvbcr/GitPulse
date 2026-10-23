@@ -525,14 +525,20 @@ fn test_only_files(src_root: &Path, files: &[PathBuf]) -> BTreeSet<PathBuf> {
             if !file_is_test && !decl.test_gated() {
                 continue;
             }
-            let resolved =
-                locate_module(src_root, &file, decl.name, &decl.attrs).unwrap_or_else(|| {
-                    panic!(
-                        "{}: test-only `mod {};` resolves to no file",
-                        file.display(),
-                        decl.name
-                    )
-                });
+            let resolved = locate_module(
+                src_root,
+                &file,
+                decl.name,
+                &decl.attrs,
+                decl.inline.map(|(module, _)| module),
+            )
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: test-only `mod {};` resolves to no file",
+                    file.display(),
+                    decl.name
+                )
+            });
             assert!(
                 walked.contains(&resolved),
                 "{} declares test-only `mod {};` at {}, which the walk of \
@@ -557,7 +563,13 @@ fn test_only_files(src_root: &Path, files: &[PathBuf]) -> BTreeSet<PathBuf> {
             }
             // A production declaration that names no file is the compiler's
             // error to report, not this scan's.
-            let Some(target) = locate_module(src_root, file, decl.name, &decl.attrs) else {
+            let Some(target) = locate_module(
+                src_root,
+                file,
+                decl.name,
+                &decl.attrs,
+                decl.inline.map(|(module, _)| module),
+            ) else {
                 continue;
             };
             assert!(
@@ -578,12 +590,30 @@ fn test_only_files(src_root: &Path, files: &[PathBuf]) -> BTreeSet<PathBuf> {
 struct ModDecl<'a> {
     name: &'a str,
     attrs: Vec<&'a str>,
+    /// The inline module the declaration sits in, when it is indented inside
+    /// one, and whether that module is itself test-gated.
+    inline: Option<(&'a str, bool)>,
 }
 
 impl ModDecl<'_> {
+    /// Gated by its own attributes, or by the inline module around it.
     fn test_gated(&self) -> bool {
         self.attrs.iter().any(|a| cfg_requires_test(a))
+            || self.inline.is_some_and(|(_, gated)| gated)
     }
+}
+
+/// The name of an inline module opened on `line` (`mod tests {`).
+fn inline_mod(line: &str) -> Option<&str> {
+    let mut rest = line.trim();
+    if let Some(after) = rest.strip_prefix("pub") {
+        rest = after.trim_start();
+        if rest.starts_with('(') {
+            rest = rest[rest.find(')')? + 1..].trim_start();
+        }
+    }
+    let name = rest.strip_prefix("mod ")?.strip_suffix('{')?.trim();
+    (!name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')).then_some(name)
 }
 
 /// Every out-of-line module declaration in `text`, with its attribute run.
@@ -592,6 +622,10 @@ impl ModDecl<'_> {
 fn out_of_line_decls<'a>(file: &Path, text: &'a str) -> Vec<ModDecl<'a>> {
     let mut decls = Vec::new();
     let mut attrs: Vec<&str> = Vec::new();
+    // The last inline module opened at column 0, which rustfmt guarantees is
+    // where a top-level one starts: a declaration indented four spaces belongs
+    // to it. Anything deeper stops the scan, as every nested one used to.
+    let mut enclosing: Option<(&str, bool)> = None;
     for raw in text.lines() {
         let line = raw.trim_start();
         if line.starts_with("#[") {
@@ -602,22 +636,38 @@ fn out_of_line_decls<'a>(file: &Path, text: &'a str) -> Vec<ModDecl<'a>> {
             continue;
         }
         let item_attrs = std::mem::take(&mut attrs);
+        if !raw.starts_with(char::is_whitespace) {
+            if let Some(name) = inline_mod(line) {
+                let gated = item_attrs.iter().any(|a| cfg_requires_test(a));
+                enclosing = Some((name, gated));
+                continue;
+            }
+        }
         let Some(name) = out_of_line_mod(line) else {
             continue;
         };
         // Nested in an inline module, the file sits under that module's
-        // directory too. None exist; placing one wrongly could exempt — or
-        // fail to see — the wrong file, so it stops the scan instead.
-        assert!(
-            !raw.starts_with(char::is_whitespace),
-            "{}: `{}` is an out-of-line module inside an inline one, which \
-             this resolver does not place; extend it rather than guess",
-            file.display(),
-            line.trim()
-        );
+        // directory too. One level, under a module opened at column 0, is
+        // placed; anything else could exempt — or fail to see — the wrong
+        // file, so it stops the scan instead.
+        let indent = raw.len() - line.len();
+        let inline = if indent == 0 {
+            None
+        } else {
+            assert!(
+                indent == 4 && enclosing.is_some(),
+                "{}: `{}` is an out-of-line module nested deeper than one \
+                 inline module, which this resolver does not place; extend it \
+                 rather than guess",
+                file.display(),
+                line.trim()
+            );
+            enclosing
+        };
         decls.push(ModDecl {
             name,
             attrs: item_attrs,
+            inline,
         });
     }
     decls
@@ -627,7 +677,13 @@ fn out_of_line_decls<'a>(file: &Path, text: &'a str) -> Vec<ModDecl<'a>> {
 /// `#[path]` is relative to the declaring file's directory; otherwise a crate
 /// root or `mod.rs` owns its own directory, and any other file a directory
 /// named after its stem. `None` when no such file exists.
-fn locate_module(src_root: &Path, parent: &Path, name: &str, attrs: &[&str]) -> Option<PathBuf> {
+fn locate_module(
+    src_root: &Path,
+    parent: &Path,
+    name: &str,
+    attrs: &[&str],
+    inline: Option<&str>,
+) -> Option<PathBuf> {
     let dir = parent.parent().expect("a source file has a directory");
     let explicit = attrs.iter().find_map(|a| {
         let compact: String = a.chars().filter(|c| !c.is_whitespace()).collect();
@@ -644,10 +700,15 @@ fn locate_module(src_root: &Path, parent: &Path, name: &str, attrs: &[&str]) -> 
     let crate_root = parent == src_root.join("lib.rs")
         || parent == src_root.join("main.rs")
         || dir == src_root.join("bin");
-    let base = if crate_root || stem == "mod" {
+    let owned = if crate_root || stem == "mod" {
         dir.to_path_buf()
     } else {
         dir.join(stem)
+    };
+    // Inside an inline module the file sits under that module's directory too.
+    let base = match inline {
+        Some(module) => owned.join(module),
+        None => owned,
     };
     [
         base.join(format!("{name}.rs")),

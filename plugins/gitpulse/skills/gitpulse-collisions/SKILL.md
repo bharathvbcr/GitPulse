@@ -19,6 +19,8 @@ Coding agents isolate work under `<repo>/.<agent>/worktrees/<slug>`. GitPulse la
 
 If `unscanned_worktrees` is non-zero, the overlap list is incomplete. Do not treat it as "no collision".
 
+The overlap list needs two dirty worktrees, so from a clean worktree it is empty even when another worktree holds the file you are about to edit. Before the first edit of a file, call `gitpulse_collision_risk` with `path` (repo-relative): it returns the one row for that file, including a single other worktree holding it, plus the scan coverage counts. `ok: false` or `truncated: true` means a worktree was not read, and an empty `items` is then not evidence that nobody holds the file.
+
 If `sessions_ok` is false, some agent kind could not be observed (the process table could not be read, a session's directory was unreadable, or — on a platform with no process scan — Codex, which keeps no registry of running sessions), so an empty `shared_worktrees` is not proof you are alone in your checkout. Each kind in `agents.live.kinds` says whether it was observed; one with `ok: false` is unknown, not zero.
 
 A parked merge, rebase, cherry-pick or revert (`operation_kind` on a worktree, or `operation` on change context) is blocked on a person. Do not push more edits into that worktree until it is continued or aborted in GitPulse's Resolve view.

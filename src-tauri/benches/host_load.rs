@@ -133,9 +133,10 @@ fn one_shot() -> bool {
                     .unwrap_or_else(|| env!("CARGO_MANIFEST_DIR").to_string())
             });
             let started = std::time::Instant::now();
-            let risk = gitpulse_lib::insights::collision_risk_for_path(
+            let risk = gitpulse_lib::insights::collision_for_path(
                 &repo,
                 "src-tauri/src/sysload/procscan.rs",
+                None,
             );
             let us = started.elapsed().as_micros();
             println!(
