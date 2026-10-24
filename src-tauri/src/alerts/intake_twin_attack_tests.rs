@@ -98,18 +98,11 @@ fn a_late_twin_does_not_turn_a_real_report_between_the_copies_stale() {
     );
 }
 
-/// Two real, distinct, identical-digest events (two identical parallel calls
-/// finishing 200 ms apart) cannot be told from a twin by this key. Expected to
-/// fail by design: documents that a real second report is folded.
-#[test]
-fn two_real_identical_events_inside_the_window_are_both_offered() {
-    let (intake, receiver, _) = rig();
-    let at = 4_000 * MS;
-    let first = intake.offer_stamped(report_about("tool_finished", S, A), at);
-    let second = intake.offer_stamped(report_about("tool_finished", S, A), at + 200 * MS);
-    assert_eq!((first, second), (Offer::Accepted, Offer::Accepted));
-    assert_eq!(queued(&receiver), 2);
-}
+// `two_real_identical_events_inside_the_window_are_both_offered` asserted that
+// two identical reports 200 ms apart are both queued. That requirement was
+// rejected (Fable, round 2): identical state and resolve reports are idempotent
+// and a repeated banner inside the window is noise. The test now lives in
+// `intake_tests` as `two_identical_reports_inside_the_window_leave_the_state_of_one`.
 
 /// A subagent's report and its parent's, same event and digest: `subagent` is
 /// not part of the key, so the subagent's flag is lost when it is second.
@@ -197,6 +190,9 @@ fn the_totals_reconcile_across_mixed_twins_and_stale_reports() {
     assert_eq!(accepted + stale + full + coalesced, offers.len());
     assert_eq!(counters.stale.load(Ordering::Relaxed) as usize, stale);
     assert_eq!(queued(&receiver), accepted);
-    assert_eq!(counters.dropped_queue.load(Ordering::Relaxed) as usize, full);
+    assert_eq!(
+        counters.dropped_queue.load(Ordering::Relaxed) as usize,
+        full
+    );
     assert!(coalesced > 0 && stale > 0);
 }

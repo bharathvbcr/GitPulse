@@ -72,6 +72,21 @@ const INJECTED_EVENTS: [&str; 7] = [
     "SessionEnd",
 ];
 
+/// The `timeout` of the injected `SessionEnd` hook, in seconds.
+///
+/// The hooks reference (<https://code.claude.com/docs/en/hooks>) says:
+/// "`SessionEnd` hooks share a 1.5-second budget; if your settings set a longer
+/// per-hook `timeout`, Claude Code raises the budget to match, up to 60
+/// seconds." The plugin manifest's `timeout: 5` on `SessionEnd` is therefore
+/// a promise to hold every exit of that session open for up to 5 s whenever
+/// the hook is slow. The docs do not say `SessionEnd` takes `async: true`
+/// (they say an async hook is killed at teardown in `-p` mode and give no
+/// list of events), so this does not rely on it: the injected copy asks for
+/// less than the default budget, so it never raises it. The report is a few
+/// milliseconds when GitPulse is up; a slow one is lost, and the process-exit
+/// `session_ended` GitPulse records itself covers the session.
+pub(crate) const SESSION_END_TIMEOUT_SECS: u64 = 1;
+
 /// The name the plugin manifest invokes the hook by.
 const HOOK_NAME: &str = "gitpulse-hook";
 
@@ -214,6 +229,9 @@ pub(crate) fn settings_hooks(binary: &Path) -> Result<Value, String> {
                 let command = hook.get("command").and_then(Value::as_str).unwrap_or("");
                 if let Some(rest) = command.strip_prefix(&prefix) {
                     hook["command"] = json!(format!("{quoted} {rest}"));
+                    if event == "SessionEnd" {
+                        hook["timeout"] = json!(SESSION_END_TIMEOUT_SECS);
+                    }
                     rewritten += 1;
                 }
             }

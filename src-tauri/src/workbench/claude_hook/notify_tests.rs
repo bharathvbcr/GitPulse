@@ -104,6 +104,27 @@ fn a_launch_without_the_plugin_delivers_the_notification_events() {
     }
 }
 
+/// The hooks reference: "`SessionEnd` hooks share a 1.5-second budget; if your
+/// settings set a longer per-hook `timeout`, Claude Code raises the budget to
+/// match". The injected `SessionEnd` must not raise it, or every exit of every
+/// launched claude can be held open by it.
+#[test]
+fn the_injected_session_end_hook_does_not_raise_the_exit_budget() {
+    let hooks = settings_hooks(Path::new("/opt/gitpulse/gitpulse-hook")).unwrap();
+    let mut seen = 0;
+    for group in hooks["SessionEnd"].as_array().unwrap() {
+        for hook in group["hooks"].as_array().unwrap() {
+            let timeout = hook["timeout"].as_f64().expect("a timeout");
+            assert!(timeout <= 1.5, "{hook}");
+            seen += 1;
+        }
+    }
+    assert_eq!(seen, 1);
+    // The plugin's own copy is a different matter and is not rewritten.
+    let manifest: Value = serde_json::from_str(PLUGIN_HOOKS).unwrap();
+    assert_eq!(manifest["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 5);
+}
+
 /// Only the reporting hooks are added beside the gate: no banner matcher, and
 /// no hook that could answer the host.
 #[test]

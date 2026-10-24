@@ -6,16 +6,20 @@
 //! response is large. Every other subcommand judges the call from the payload
 //! and stays on [`super::read_input`] and its 4 MiB limit.
 //!
-//! The payload is read once, bounded by [`MAX_READ_BYTES`], and walked as a
-//! stream of tokens: fields `HookInput::from_value` reads are kept, everything
-//! else is skipped where it lies and never built into a value. What is kept is
-//! then read by `from_value`, the one owner of what each field means.
+//! Accept and reject are the old path's (`parse_input`): the bytes must be
+//! UTF-8, `str::trim` is stripped from both ends, and one JSON object must fill
+//! the rest, to the same nesting limit of 128. Only the 4 MiB refusal is
+//! gone, because nothing here is built from the whole payload: fields
+//! `HookInput::from_value` reads are kept and everything else is walked and
+//! dropped. A skipped field is still validated (a number out of range or a
+//! string with a bad escape refuses the payload as it always did); it is only
+//! not built, which is what makes it linear and allocation-free. What is kept
+//! is then read by `from_value`, the one owner of what each field means.
 //!
-//! Why the bytes are read first and the walk is over the slice rather than over
-//! the pipe: `serde_json`'s reader walk takes the bytes one at a time, which
-//! measured at twice the cost of the whole process at 4 MiB (see
-//! `docs/PERFORMANCE.md`), where the slice walk costs nothing a process start
-//! does not.
+//! The bytes are read first, bounded by [`MAX_READ_BYTES`], and the walk is
+//! over the slice rather than the pipe: `serde_json`'s reader walk takes the
+//! bytes one at a time, which measured at twice the cost of the whole process
+//! at 4 MiB (see `docs/PERFORMANCE.md`).
 //!
 //! Two bounds, and they differ on purpose:
 //!
@@ -24,11 +28,30 @@
 //!   still true, and they are what state and resolution need.
 //! * Malformed JSON is not that. A payload that does not parse says nothing
 //!   about what the host meant, so nothing is reported, as before.
+//!
+//! The read is also bounded in time, by [`NOTIFY_READ_BUDGET`], which is what
+//! is left of the host's timeout after the socket report and the host's own
+//! margin ([`NOTIFY_HOST_TIMEOUT`]).
 
-use super::{within_budget, HookInput, BUDGET};
-use serde::de::{Deserializer as _, IgnoredAny, MapAccess, Visitor};
+use super::{within_budget, HookInput, HOST_TIMEOUT_MARGIN, NOTIFY_BUDGET};
+use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 use std::io::Read;
+use std::time::Duration;
+
+/// The `timeout` the plugin manifest gives every `notify` hook, in the host's
+/// terms: when Claude Code kills the hook, and with it any report not yet
+/// delivered. The one owner: the manifest must say it (a test reads both), and
+/// the whole run is derived from it.
+pub const NOTIFY_HOST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What the read may take: the host's timeout, less its margin for the process
+/// to print, reap and exit, less the socket report that follows. The whole run
+/// is then done [`HOST_TIMEOUT_MARGIN`] before the host would kill it, even
+/// when the writer dribbles to the last moment.
+pub const NOTIFY_READ_BUDGET: Duration = NOTIFY_HOST_TIMEOUT
+    .saturating_sub(HOST_TIMEOUT_MARGIN)
+    .saturating_sub(NOTIFY_BUDGET);
 
 /// The most of one payload that is read. Four times the limit the other
 /// subcommands hold, because only what `notify` keeps is built.
@@ -54,6 +77,55 @@ pub(super) const KEPT_FIELDS: [&str; 14] = [
     "tool_use_id",
 ];
 
+/// A value that is checked and not built.
+///
+/// `IgnoredAny` would skip without checking, so a number out of range or a
+/// malformed escape inside a skipped field would be accepted where the whole
+/// parse refused it. This goes through the same `deserialize_any` the whole
+/// parse does, so the same checks (and the same nesting limit) apply, and
+/// builds nothing.
+struct Skipped;
+
+impl<'de> Deserialize<'de> for Skipped {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(Skipped)
+    }
+}
+
+impl<'de> Visitor<'de> for Skipped {
+    type Value = Skipped;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<Skipped, E> {
+        Ok(Skipped)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<Skipped, E> {
+        Ok(Skipped)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<Skipped, E> {
+        Ok(Skipped)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<Skipped, E> {
+        Ok(Skipped)
+    }
+    fn visit_str<E>(self, _: &str) -> Result<Skipped, E> {
+        Ok(Skipped)
+    }
+    fn visit_unit<E>(self) -> Result<Skipped, E> {
+        Ok(Skipped)
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Skipped, A::Error> {
+        while seq.next_element::<Skipped>()?.is_some() {}
+        Ok(Skipped)
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Skipped, A::Error> {
+        while map.next_entry::<Skipped, Skipped>()?.is_some() {}
+        Ok(Skipped)
+    }
+}
+
 /// The kept fields of one JSON object, in a `Value`.
 struct Kept;
 
@@ -70,24 +142,26 @@ impl<'de> Visitor<'de> for Kept {
             if KEPT_FIELDS.contains(&key.as_str()) {
                 kept.insert(key, map.next_value::<Value>()?);
             } else {
-                map.next_value::<IgnoredAny>()?;
+                map.next_value::<Skipped>()?;
             }
         }
         Ok(Value::Object(kept))
     }
 }
 
-/// The fields `notify` uses, out of `bytes`: one JSON object, anything after it
-/// ignored.
+/// The fields `notify` uses, out of `bytes`, accepting and refusing what the
+/// whole-document parse did.
 fn kept_fields(bytes: &[u8]) -> Result<HookInput, String> {
-    // Not `end()`: what follows the object is not this hook's business.
-    serde_json::Deserializer::from_slice(bytes)
+    let text = std::str::from_utf8(bytes).map_err(|e| format!("hook stdin is not UTF-8: {e}"))?;
+    let mut de = serde_json::Deserializer::from_str(text.trim());
+    let value = de
         .deserialize_map(Kept)
-        .map(|value| HookInput::from_value(&value))
-        .map_err(|error| format!("hook stdin is not a readable JSON object: {error}"))
+        .and_then(|value| de.end().map(|()| value))
+        .map_err(|e| format!("hook stdin is not valid JSON: {e}"))?;
+    Ok(HookInput::from_value(&value))
 }
 
-/// Reads the fields `notify` uses from `reader`, within [`BUDGET`], reading at
+/// Reads the fields `notify` uses from `reader`, within [`NOTIFY_READ_BUDGET`], reading at
 /// most `limit` bytes.
 ///
 /// `Ok` with an empty input when the payload is longer than `limit`. `Err` for
@@ -96,7 +170,7 @@ pub fn read_notify_input(
     reader: impl Read + Send + 'static,
     limit: u64,
 ) -> Result<HookInput, String> {
-    within_budget(BUDGET, move || {
+    within_budget(NOTIFY_READ_BUDGET, move || {
         let mut bytes = Vec::new();
         reader
             .take(limit.saturating_add(1))

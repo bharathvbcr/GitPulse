@@ -156,7 +156,15 @@ fn write_all(body: Vec<u8>) -> impl FnOnce(std::process::ChildStdin) + Send + 's
 #[test]
 fn empty_and_odd_session_ids_exit_quietly() {
     let socket = Socket::start();
-    for session in ["", " ", "\t", "a b", "../../x", "\u{202e}", &"s".repeat(10_000)] {
+    for session in [
+        "",
+        " ",
+        "\t",
+        "a b",
+        "../../x",
+        "\u{202e}",
+        &"s".repeat(10_000),
+    ] {
         for event in ["tool_finished", "session_ended", "turn_finished"] {
             let ran = run(
                 &socket,
@@ -186,7 +194,11 @@ fn an_empty_session_id_reads_no_stdin_and_does_not_block_the_writer() {
     assert_eq!(ran.code, Some(0));
     assert!(ran.writer_finished, "the writer was left blocked");
     assert!(ran.stdout.is_empty());
-    assert!(ran.stderr.is_empty(), "{:?}", String::from_utf8_lossy(&ran.stderr));
+    assert!(
+        ran.stderr.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
     assert!(socket.reports().is_empty());
 }
 
@@ -248,7 +260,12 @@ fn per_call_cost_of_the_injected_notify_hook() {
         );
         assert_eq!(ran.code, Some(0));
         inside.push(ran.elapsed);
-        let ran = run(&socket, "tool_finished", None, write_all(small_post_tool_use()));
+        let ran = run(
+            &socket,
+            "tool_finished",
+            None,
+            write_all(small_post_tool_use()),
+        );
         outside.push(ran.elapsed);
     }
     inside.sort();

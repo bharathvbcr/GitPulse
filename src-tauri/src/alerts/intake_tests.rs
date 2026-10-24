@@ -590,19 +590,67 @@ fn a_duplicated_permission_request_leaves_one_standing() {
 }
 
 /// The copy may stamp earlier than the report that got here first: the two
-/// processes start in either order.
+/// processes start in either order. It is older than what the session already
+/// has, so the order rule refuses it as stale (the hook counts that as
+/// delivered) rather than folding it; either way the worker sees one report.
 #[cfg(unix)]
 #[test]
-fn the_twin_that_stamped_first_is_still_a_twin() {
+fn a_twin_that_stamped_first_is_refused_as_stale_not_applied() {
     let rig = Rig::new();
     let first = rig
         .intake
         .offer_stamped(report_about("turn_finished", S, None), 2_000 * MS);
-    let late_twin = rig
+    let early_twin = rig
         .intake
         .offer_stamped(report_about("turn_finished", S, None), 2_000 * MS - 6 * MS);
-    assert_eq!((first, late_twin), (Offer::Accepted, Offer::Coalesced));
-    rig.finish();
+    assert_eq!((first, early_twin), (Offer::Accepted, Offer::Stale));
+    let ended = rig.finish();
+    assert_eq!(ended.stale, 1);
+    assert_eq!(ended.standing.len(), 1);
+}
+
+/// Two real, identical reports 200 ms apart cannot be told from a twin, and
+/// need not be: what the session stands asking after both is what it stands
+/// asking after one, a repeated banner inside the window is noise, and the fold
+/// is counted (a banner as `coalesced`; a state or a resolution is answered
+/// `Coalesced` and has no outcome of its own to count).
+#[cfg(unix)]
+#[test]
+fn two_identical_reports_inside_the_window_leave_the_state_of_one() {
+    let call = Some("00000000000000aa");
+    for event in ["permission_request", "turn_finished", "permission_prompt"] {
+        let once = Rig::new();
+        once.intake
+            .offer_stamped(report_about(event, S, call), 4_000 * MS);
+        let once = once.finish();
+
+        let twice = Rig::new();
+        let first = twice
+            .intake
+            .offer_stamped(report_about(event, S, call), 4_000 * MS);
+        let second = twice
+            .intake
+            .offer_stamped(report_about(event, S, call), 4_000 * MS + 200 * MS);
+        assert_eq!(
+            (first, second),
+            (Offer::Accepted, Offer::Coalesced),
+            "{event}"
+        );
+        let twice = twice.finish();
+
+        // Not `age_ms`, which is the clock.
+        let shape = |ended: &Ended| {
+            ended
+                .standing
+                .iter()
+                .map(|s| (s.session.clone(), s.event.clone(), s.detail.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&once), shape(&twice), "{event}");
+        assert_eq!(once.delivered, twice.delivered, "{event}");
+        let banner = event == "permission_prompt";
+        assert_eq!(twice.coalesced, u64::from(banner), "{event}");
+    }
 }
 
 /// What is not the same report is not folded: another call, another event,

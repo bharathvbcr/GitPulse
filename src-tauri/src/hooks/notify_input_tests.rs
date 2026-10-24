@@ -93,13 +93,61 @@ fn what_is_not_a_json_object_is_refused() {
     }
 }
 
-/// What follows the object is not this hook's business, whatever it is.
+/// Accept and reject are the old path's: whitespace after the object is fine,
+/// anything else (a second document, a NUL) refuses the payload.
 #[test]
-fn what_follows_the_object_is_ignored() {
-    let mut body = post_tool_use(10).into_bytes();
-    body.extend_from_slice(b"\n{not json at all");
-    let input = read_notify_input(Cursor::new(body), MAX_READ_BYTES).unwrap();
-    assert_eq!(input.tool_use_id, "toolu_1");
+fn only_whitespace_may_follow_the_object() {
+    for tail in ["\n", "  \t\r\n", "\u{3000}"] {
+        let mut body = post_tool_use(10).into_bytes();
+        body.extend_from_slice(tail.as_bytes());
+        let input = read_notify_input(Cursor::new(body), MAX_READ_BYTES).unwrap();
+        assert_eq!(input.tool_use_id, "toolu_1", "{tail:?}");
+    }
+    for tail in [&b"\n{not json at all"[..], b"\0", b" x", b"{}"] {
+        let mut body = post_tool_use(10).into_bytes();
+        body.extend_from_slice(tail);
+        assert!(
+            read_notify_input(Cursor::new(body), MAX_READ_BYTES).is_err(),
+            "{tail:?}"
+        );
+    }
+}
+
+/// The hook's whole run (the read, the socket report, the margin the host
+/// needs to see it exit) fits inside the `timeout` the manifest gives every
+/// notify hook, so a writer that dribbles to the last moment cannot get the
+/// hook killed by the host mid-report. The manifest is read, not restated.
+#[test]
+fn the_whole_run_ends_a_margin_before_the_host_timeout() {
+    use super::notify_input::{NOTIFY_HOST_TIMEOUT, NOTIFY_READ_BUDGET};
+    assert!(
+        NOTIFY_READ_BUDGET + NOTIFY_BUDGET + HOST_TIMEOUT_MARGIN <= NOTIFY_HOST_TIMEOUT,
+        "{NOTIFY_READ_BUDGET:?} + {NOTIFY_BUDGET:?} + {HOST_TIMEOUT_MARGIN:?} > {NOTIFY_HOST_TIMEOUT:?}"
+    );
+    assert!(NOTIFY_READ_BUDGET > Duration::ZERO);
+    assert!(
+        NOTIFY_READ_BUDGET < BUDGET,
+        "the general read budget is no longer what notify uses"
+    );
+
+    let manifest: Value =
+        serde_json::from_str(include_str!("../../../plugins/gitpulse/hooks/hooks.json")).unwrap();
+    let mut seen = 0;
+    for groups in manifest["hooks"].as_object().unwrap().values() {
+        for group in groups.as_array().unwrap() {
+            for hook in group["hooks"].as_array().unwrap() {
+                if hook["command"].as_str().unwrap().contains(" notify ") {
+                    assert_eq!(
+                        hook["timeout"].as_u64(),
+                        Some(NOTIFY_HOST_TIMEOUT.as_secs()),
+                        "{hook}"
+                    );
+                    seen += 1;
+                }
+            }
+        }
+    }
+    assert!(seen >= 10, "only {seen} notify entries read");
 }
 
 /// A reader that fails is an error, not an empty payload.

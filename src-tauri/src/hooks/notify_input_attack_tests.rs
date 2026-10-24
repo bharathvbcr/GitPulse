@@ -21,7 +21,8 @@ fn old_path(body: &[u8]) -> Result<HookInput, String> {
 /// A payload of exactly `total` bytes: a kept field then padding in an ignored
 /// one.
 fn payload_of(total: usize) -> Vec<u8> {
-    let head = br#"{"session_id":"s-exact","tool_name":"Bash","tool_input":{"command":"ls"},"pad":""#;
+    let head =
+        br#"{"session_id":"s-exact","tool_name":"Bash","tool_input":{"command":"ls"},"pad":""#;
     let tail = br#""}"#;
     let mut body = head.to_vec();
     body.extend(std::iter::repeat(b'p').take(total - head.len() - tail.len()));
@@ -68,15 +69,33 @@ fn a_writer_that_dribbles_past_the_deadline_is_an_error_at_the_deadline() {
 #[test]
 fn the_new_reader_agrees_with_the_old_path_on_edge_payloads() {
     let mut cases: Vec<(&str, Vec<u8>)> = vec![
-        ("nul byte outside a string", b"{\"session_id\":\"a\"}\0".to_vec()),
+        (
+            "nul byte outside a string",
+            b"{\"session_id\":\"a\"}\0".to_vec(),
+        ),
         ("nul inside a string", b"{\"session_id\":\"a\0b\"}".to_vec()),
         ("escaped nul", br#"{"session_id":"a\u0000b"}"#.to_vec()),
-        ("duplicate kept key, last wins", br#"{"session_id":"first","session_id":"second"}"#.to_vec()),
-        ("duplicate, second is a non-string", br#"{"session_id":"first","session_id":7}"#.to_vec()),
+        (
+            "duplicate kept key, last wins",
+            br#"{"session_id":"first","session_id":"second"}"#.to_vec(),
+        ),
+        (
+            "duplicate, second is a non-string",
+            br#"{"session_id":"first","session_id":7}"#.to_vec(),
+        ),
         ("escaped key spelling", br#"{"session_id":"esc"}"#.to_vec()),
-        ("workspaceRoots only", br#"{"workspaceRoots":[" ","/r"]}"#.to_vec()),
-        ("both workspace spellings", br#"{"workspace_roots":["/a"],"workspaceRoots":["/b"]}"#.to_vec()),
-        ("cursor_version null", br#"{"cursor_version":null,"cwd":"/c"}"#.to_vec()),
+        (
+            "workspaceRoots only",
+            br#"{"workspaceRoots":[" ","/r"]}"#.to_vec(),
+        ),
+        (
+            "both workspace spellings",
+            br#"{"workspace_roots":["/a"],"workspaceRoots":["/b"]}"#.to_vec(),
+        ),
+        (
+            "cursor_version null",
+            br#"{"cursor_version":null,"cwd":"/c"}"#.to_vec(),
+        ),
         ("leading whitespace", b"  \n\t{\"cwd\":\"/c\"}\n".to_vec()),
         ("bom", b"\xef\xbb\xbf{\"cwd\":\"/c\"}".to_vec()),
         ("array", b"[1,2]".to_vec()),
@@ -84,11 +103,26 @@ fn the_new_reader_agrees_with_the_old_path_on_edge_payloads() {
         ("null", b"null".to_vec()),
         ("empty", Vec::new()),
         ("whitespace only", b"  ".to_vec()),
-        ("invalid utf8 in an ignored string", b"{\"x\":\"\xff\",\"cwd\":\"/c\"}".to_vec()),
-        ("huge exponent in an ignored field", br#"{"x":1e999,"cwd":"/c"}"#.to_vec()),
-        ("tool_input is a scalar", br#"{"tool_name":"Bash","tool_input":5}"#.to_vec()),
-        ("tool_input null", br#"{"tool_name":"Bash","tool_input":null}"#.to_vec()),
-        ("float keys order", br#"{"tool_name":"X","tool_input":{"b":1.50,"a":[1e2,-0.0]}}"#.to_vec()),
+        (
+            "invalid utf8 in an ignored string",
+            b"{\"x\":\"\xff\",\"cwd\":\"/c\"}".to_vec(),
+        ),
+        (
+            "huge exponent in an ignored field",
+            br#"{"x":1e999,"cwd":"/c"}"#.to_vec(),
+        ),
+        (
+            "tool_input is a scalar",
+            br#"{"tool_name":"Bash","tool_input":5}"#.to_vec(),
+        ),
+        (
+            "tool_input null",
+            br#"{"tool_name":"Bash","tool_input":null}"#.to_vec(),
+        ),
+        (
+            "float keys order",
+            br#"{"tool_name":"X","tool_input":{"b":1.50,"a":[1e2,-0.0]}}"#.to_vec(),
+        ),
     ];
     // What the old path did that the new one is documented to differ on are
     // asserted separately below.
@@ -136,7 +170,10 @@ fn nesting_is_limited_the_same_way_and_never_overflows_the_stack() {
     // recursively by the digest.
     let mut differing = Vec::new();
     for (field, depths) in [
-        ("deep", vec![50usize, 120, 126, 127, 128, 129, 200, 5_000, 2_000_000]),
+        (
+            "deep",
+            vec![50usize, 120, 126, 127, 128, 129, 200, 5_000, 2_000_000],
+        ),
         ("tool_input", vec![100usize, 126, 127, 128, 129, 5_000]),
     ] {
         for depth in depths {
@@ -173,7 +210,18 @@ fn old_path_unbounded(body: &[u8]) -> Result<HookInput, String> {
 fn the_new_reader_equals_from_value_over_a_corpus_of_real_shaped_payloads() {
     let long = "é漢🙂 line one\nline two \"quoted\" \\ back".repeat(50);
     let mut corpus: Vec<Value> = Vec::new();
-    for tool in ["Bash", "Edit", "MultiEdit", "Write", "NotebookEdit", "Read", "Task", "WebFetch", "mcp__x__y", ""] {
+    for tool in [
+        "Bash",
+        "Edit",
+        "MultiEdit",
+        "Write",
+        "NotebookEdit",
+        "Read",
+        "Task",
+        "WebFetch",
+        "mcp__x__y",
+        "",
+    ] {
         for input in [
             json!({"command": "cargo test\nsecond", "description": long}),
             json!({"file_path": "/a/b.rs", "old_string": "a", "new_string": long}),
@@ -183,7 +231,12 @@ fn the_new_reader_equals_from_value_over_a_corpus_of_real_shaped_payloads() {
             json!("scalar"),
             json!({}),
         ] {
-            for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest"] {
+            for event in [
+                "PreToolUse",
+                "PostToolUse",
+                "PostToolUseFailure",
+                "PermissionRequest",
+            ] {
                 corpus.push(json!({
                     "session_id": "sess-1", "transcript_path": "/t.jsonl", "cwd": "/w",
                     "permission_mode": "default", "hook_event_name": event,
@@ -207,7 +260,10 @@ fn the_new_reader_equals_from_value_over_a_corpus_of_real_shaped_payloads() {
     }
     assert!(corpus.len() > 250);
     for (index, value) in corpus.iter().enumerate() {
-        for text in [value.to_string(), serde_json::to_string_pretty(value).unwrap()] {
+        for text in [
+            value.to_string(),
+            serde_json::to_string_pretty(value).unwrap(),
+        ] {
             let (old, new) = (old_path(text.as_bytes()), new_path(text.as_bytes()));
             assert_eq!(old, new, "payload {index}: {text:.200}");
         }
@@ -258,7 +314,9 @@ fn distinct_tool_inputs_get_distinct_digests() {
 /// cleared early.)
 #[test]
 fn digest_separates_one_from_one_point_zero_and_ignores_key_order() {
-    let d = |input: Value| HookInput::from_value(&json!({"tool_name": "T", "tool_input": input})).tool_subject;
+    let d = |input: Value| {
+        HookInput::from_value(&json!({"tool_name": "T", "tool_input": input})).tool_subject
+    };
     assert_ne!(d(json!({"n": 1})), d(json!({"n": 1.0})));
     assert_eq!(
         d(serde_json::from_str(r#"{"a":1,"b":2}"#).unwrap()),
