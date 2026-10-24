@@ -355,6 +355,91 @@ fn accept_next(
     crate::procguard::with_inheritance_lock(|| listener.accept())
 }
 
+/// The order stamp: nanoseconds on `CLOCK_MONOTONIC`.
+///
+/// One system-wide clock, so a stamp taken in the hook process and one taken
+/// here compare. The bridge takes it when it accepts a connection, before the
+/// connection is handed to a worker, and the hub drops a report older than the
+/// newest already seen for its session. A hook that stamps its own report at
+/// entry with this same function (the planned `seq` field) is ordered by when
+/// it ran rather than when its connection happened to be accepted.
+///
+/// `pub` rather than `pub(crate)` because `gitpulse-hook` is a separate crate.
+#[cfg(unix)]
+pub fn order_stamp_ns() -> u64 {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a valid, writable `timespec` for the call's duration.
+    let read = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+    if read != 0 {
+        return 0;
+    }
+    u64::try_from(now.tv_sec)
+        .unwrap_or(0)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::try_from(now.tv_nsec).unwrap_or(0))
+}
+
+/// The error text an accept loop has put in the status, so that it takes down
+/// that text and never another's: a bridge error from elsewhere (a failed
+/// start, a message from the user's own action) outlives a backoff, and a loop
+/// that has been retired writes nothing at all.
+#[cfg(unix)]
+struct LoopNote {
+    state: &'static State,
+    generation: u64,
+    text: Option<String>,
+}
+
+#[cfg(unix)]
+impl LoopNote {
+    fn new(state: &'static State, generation: u64) -> Self {
+        Self {
+            state,
+            generation,
+            text: None,
+        }
+    }
+
+    /// Shows `text`. With `overwrite` false it yields to an error already
+    /// there. The generation is checked under the status lock, which `stop`
+    /// takes after it bumps the generation, so a retired loop cannot write
+    /// after `stop` has cleared the slot.
+    fn set(&mut self, text: String, overwrite: bool) {
+        let Ok(mut slot) = self.state.error.lock() else {
+            return;
+        };
+        if self.state.generation.load(Ordering::SeqCst) != self.generation {
+            return;
+        }
+        if !overwrite && slot.is_some() {
+            return;
+        }
+        *slot = Some(text.clone());
+        self.text = Some(text);
+    }
+
+    /// Takes down this loop's own text, if it is still what the status shows.
+    fn clear(&mut self) {
+        let Some(text) = self.text.take() else { return };
+        let Ok(mut slot) = self.state.error.lock() else {
+            return;
+        };
+        if self.state.generation.load(Ordering::SeqCst) == self.generation
+            && slot.as_deref() == Some(text.as_str())
+        {
+            *slot = None;
+        }
+    }
+
+    /// Leaves the text in the status for good: the loop is ending with it.
+    fn keep(&mut self) {
+        self.text = None;
+    }
+}
+
 /// What an `accept` error asks of the loop.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,9 +473,12 @@ fn classify_accept_error(error: &std::io::Error) -> AcceptFault {
 /// [`ACCEPT_BACKOFF_FIRST`], doubling, never past [`ACCEPT_BACKOFF_MAX`].
 #[cfg(unix)]
 fn accept_backoff(attempt: u32) -> std::time::Duration {
-    ACCEPT_BACKOFF_FIRST
+    let delay = ACCEPT_BACKOFF_FIRST
         .saturating_mul(1u32 << attempt.min(16))
-        .min(ACCEPT_BACKOFF_MAX)
+        .min(ACCEPT_BACKOFF_MAX);
+    #[cfg(test)]
+    let delay = delay.max(tests::backoff_floor());
+    delay
 }
 
 /// Sleeps `delay` in short slices, so retiring the loop is noticed within one
@@ -467,7 +555,7 @@ impl Drop for Slot {
 /// says nothing holds a worker for its deadline and never the accept loop. At
 /// the cap the connection is answered and closed here without being read.
 #[cfg(unix)]
-fn serve(state: &'static State, stream: std::os::unix::net::UnixStream) {
+fn serve(state: &'static State, stream: std::os::unix::net::UnixStream, stamp: u64) {
     use std::io::Write;
     let Some(slot) = Slot::acquire(state) else {
         super::count_bridge_rejection();
@@ -483,7 +571,9 @@ fn serve(state: &'static State, stream: std::os::unix::net::UnixStream) {
         "alert bridge connection",
         move || {
             let _slot = slot;
-            let outcome = handle_into(stream, budget, &mut super::offer);
+            let outcome = handle_into(stream, budget, &mut |notice| {
+                super::offer_stamped(notice, stamp)
+            });
             if let Outcome::Refused(refusal) = outcome {
                 log::debug!(target: "alerts", "hook report refused: {}", refusal.describe());
             }
@@ -523,6 +613,7 @@ fn accept_loop(
     // Consecutive failures of each kind, each reset by a connection accepted.
     let mut transient = 0u32;
     let mut fatal = 0u32;
+    let mut note = LoopNote::new(state, generation);
     loop {
         if state.generation.load(Ordering::SeqCst) != generation {
             break;
@@ -541,39 +632,51 @@ fn accept_loop(
         }
         match accept_next(&listener) {
             Ok((stream, _)) => {
+                // Before anything that can take time: this is the order the
+                // reports arrived in, whichever worker finishes first.
+                let stamp = order_stamp_ns();
                 transient = 0;
                 fatal = 0;
                 if crate::local_socket::peer_uid(&stream) != Some(own) {
                     super::count_bridge_rejection();
                     continue;
                 }
-                serve(state, stream);
+                serve(state, stream, stamp);
             }
             Err(error) => match classify_accept_error(&error) {
                 AcceptFault::Retry => {}
                 AcceptFault::Transient => {
                     // The listener is untouched and so is its socket file: a
                     // short supply of descriptors is not a reason to go dark.
-                    set_error(Some(format!(
-                        "Hook bridge is backing off after an accept error: {error}"
-                    )));
+                    note.set(
+                        format!("Hook bridge is backing off after an accept error: {error}"),
+                        false,
+                    );
                     let kept_on = back_off(state, generation, accept_backoff(transient));
                     transient = transient.saturating_add(1);
+                    note.clear();
                     if !kept_on {
                         break;
                     }
-                    set_error(None);
                 }
                 AcceptFault::Fatal => {
                     fatal += 1;
                     if fatal > ACCEPT_REBIND_LIMIT {
-                        if state.generation.load(Ordering::SeqCst) == generation {
-                            set_error(Some(format!(
+                        note.set(
+                            format!(
                                 "Hook bridge stopped accepting after {ACCEPT_REBIND_LIMIT} rebinds: {error}"
-                            )));
-                        }
+                            ),
+                            true,
+                        );
+                        note.keep();
                         break;
                     }
+                    // The listener is not trusted from here, so say so for as
+                    // long as it takes to replace it.
+                    note.set(
+                        format!("Hook bridge is rebinding after an accept error: {error}"),
+                        true,
+                    );
                     if !back_off(state, generation, accept_backoff(fatal - 1)) {
                         break;
                     }
@@ -584,16 +687,15 @@ fn accept_loop(
                     match rebound {
                         Ok(Some(fresh)) => {
                             listener = fresh;
-                            set_error(None);
+                            note.clear();
                         }
                         Ok(None) => break,
-                        Err(cause) => {
-                            if state.generation.load(Ordering::SeqCst) == generation {
-                                set_error(Some(format!(
-                                    "Hook bridge could not rebind after an accept error ({error}): {cause}"
-                                )));
-                            }
-                        }
+                        Err(cause) => note.set(
+                            format!(
+                                "Hook bridge could not rebind after an accept error ({error}): {cause}"
+                            ),
+                            true,
+                        ),
                     }
                 }
             },
@@ -1959,6 +2061,174 @@ mod tests {
         assert_eq!(offered.len(), 1);
     }
 
+    /// A floor under every accept backoff, long enough for a test to look at
+    /// the status while the loop waits. Reset however the test ends.
+    #[cfg(unix)]
+    static BACKOFF_FLOOR_MS: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(unix)]
+    pub(super) fn backoff_floor() -> std::time::Duration {
+        std::time::Duration::from_millis(BACKOFF_FLOOR_MS.load(Ordering::SeqCst))
+    }
+
+    #[cfg(unix)]
+    struct SlowBackoff;
+
+    #[cfg(unix)]
+    impl SlowBackoff {
+        fn new(ms: u64) -> Self {
+            BACKOFF_FLOOR_MS.store(ms, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for SlowBackoff {
+        fn drop(&mut self) {
+            BACKOFF_FLOOR_MS.store(0, Ordering::SeqCst);
+        }
+    }
+
+    /// While a fatal error waits out its backoff the listener is not trusted,
+    /// and the status must not claim a clean bill of health.
+    #[cfg(unix)]
+    #[test]
+    fn status_says_rebinding_while_a_fatal_error_waits_and_clears_when_it_is_done() {
+        let _own = own_listener();
+        let _clear = ClearInjected;
+        let _slow = SlowBackoff::new(400);
+        let dir = ShortDir::new("rebnote");
+        apply_at(true, Some(dir.socket()));
+        assert!(status().listening, "{:?}", status().error);
+        inject_accept_errors(&[libc::EBADF]);
+        poke_until(&dir.socket(), || injected_remaining() == 0);
+        let during = status();
+        assert!(during.listening);
+        let note = during.error.unwrap_or_default();
+        assert!(
+            note.contains("rebinding after an accept error"),
+            "status during the backoff: {note:?}"
+        );
+        assert!(
+            within(
+                crate::test_support::coverage_relaxed(std::time::Duration::from_secs(10)),
+                || status().error.is_none()
+            ),
+            "the rebinding note outlived the rebind: {:?}",
+            status().error
+        );
+        assert!(status().listening);
+        apply_at(false, None);
+        assert!(within(std::time::Duration::from_secs(5), || live_loops() == 0));
+    }
+
+    struct QuietHost;
+
+    impl crate::alerts::Host for QuietHost {
+        fn submit(&self, _: &str, _: &str, _: &str, _: bool) -> Result<bool, String> {
+            Ok(true)
+        }
+        fn attended(&self, _: &str) -> bool {
+            false
+        }
+    }
+
+    #[cfg(unix)]
+    fn hook_report(event: &str, session: &str) -> Notice {
+        let json = format!(r#"{{"v":1,"event":"{event}","agent":"claude","session":"{session}"}}"#);
+        parse_report(json.as_bytes()).expect("a well-formed report")
+    }
+
+    #[cfg(unix)]
+    fn finished_stands_for(session: &str) -> bool {
+        crate::alerts::standing()
+            .iter()
+            .any(|s| s.session == session && s.event.as_deref() == Some("turn_finished"))
+    }
+
+    /// Two reports from one session reach the hub in the wrong order. The
+    /// older one is dropped, not applied late over the newer, and counted.
+    #[cfg(unix)]
+    #[test]
+    fn a_report_older_than_one_already_applied_is_dropped_and_counted() {
+        let _own = own_listener();
+        crate::alerts::start(std::sync::Arc::new(QuietHost));
+        let stale = || crate::alerts::status().stale;
+
+        // `tool_finished` was accepted second but offered first; the
+        // `turn_finished` accepted first arrives behind it and is stale.
+        let before = stale();
+        crate::alerts::offer_stamped(hook_report("tool_finished", "stamp-rev"), 2);
+        crate::alerts::offer_stamped(hook_report("turn_finished", "stamp-rev"), 1);
+        assert_eq!(stale() - before, 1);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            !finished_stands_for("stamp-rev"),
+            "a report older than the one applied before it was applied late"
+        );
+
+        // The same pair in the order it happened: nothing is stale, and the
+        // session stands finished, so the check above can tell the two apart.
+        let before = stale();
+        crate::alerts::offer_stamped(hook_report("tool_finished", "stamp-fwd"), 10);
+        crate::alerts::offer_stamped(hook_report("turn_finished", "stamp-fwd"), 11);
+        assert_eq!(stale() - before, 0);
+        assert!(
+            within(std::time::Duration::from_secs(5), || {
+                finished_stands_for("stamp-fwd")
+            }),
+            "the in-order pair did not leave the session finished"
+        );
+
+        // Another session is not held to this one's stamps.
+        let before = stale();
+        crate::alerts::offer_stamped(hook_report("turn_finished", "stamp-other"), 3);
+        assert_eq!(stale() - before, 0);
+        assert!(within(std::time::Duration::from_secs(5), || {
+            finished_stands_for("stamp-other")
+        }));
+    }
+
+    /// The order book remembers a bounded number of sessions: an ended
+    /// session's entry goes at once, and a full book makes room by forgetting
+    /// the one with the oldest stamp.
+    #[cfg(unix)]
+    #[test]
+    fn the_order_book_is_bounded_and_forgets_an_ended_session() {
+        let mut book = crate::alerts::OrderBook::default();
+        assert!(book.admit("a", 5, false));
+        assert!(!book.admit("a", 4, false), "an older stamp was admitted");
+        assert!(book.admit("a", 5, false), "an equal stamp is not older");
+        assert!(book.admit("a", 9, true));
+        assert!(book.newest.is_empty(), "an ended session was kept");
+        assert!(
+            book.admit("a", 1, false),
+            "an ended session still bound a stamp"
+        );
+
+        let cap = crate::alerts::ORDER_BOOK_CAP;
+        for n in 0..cap * 2 {
+            assert!(book.admit(&format!("s{n}"), 100 + n as u64, false));
+            assert!(book.newest.len() <= cap, "{} entries", book.newest.len());
+        }
+        assert_eq!(book.newest.len(), cap);
+        let newest = format!("s{}", cap * 2 - 1);
+        assert!(book.newest.contains_key(&newest), "the newest was evicted");
+        assert!(!book.newest.contains_key("s0"), "the oldest was kept");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_order_stamp_never_goes_backwards() {
+        let mut last = order_stamp_ns();
+        assert!(last > 0);
+        for _ in 0..10_000 {
+            let now = order_stamp_ns();
+            assert!(now >= last);
+            last = now;
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn accept_errors_are_classified_and_the_backoff_is_bounded() {
@@ -2081,7 +2351,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    mod order;
-    #[cfg(unix)]
     mod adv;
+    #[cfg(unix)]
+    mod order;
 }

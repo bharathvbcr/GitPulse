@@ -107,10 +107,15 @@ fn reorder_count(shape: Shape, trials: usize, tag: &str) -> usize {
         // slow worker is not mistaken for a reorder.
         if batch.len() == 16 || n + 1 == trials {
             for s in batch.drain(..) {
-                if !within(std::time::Duration::from_millis(700), || finished_stands(&s)) {
+                if !within(std::time::Duration::from_millis(700), || {
+                    finished_stands(&s)
+                }) {
                     reversed += 1;
                     if reversed <= 3 {
-                        eprintln!("not standing: {s}; standing={:?}", crate::alerts::standing());
+                        eprintln!(
+                            "not standing: {s}; standing={:?}",
+                            crate::alerts::standing()
+                        );
                     }
                 }
             }
@@ -139,7 +144,10 @@ fn measure_reorder_rate() {
 #[test]
 fn sequential_hook_reports_from_one_session_are_never_reordered() {
     let reversed = reorder_count(Shape::Sequential, 200, "seq");
-    assert_eq!(reversed, 0, "{reversed}/200 tool_finished/turn_finished pairs arrived reversed");
+    assert_eq!(
+        reversed, 0,
+        "{reversed}/200 tool_finished/turn_finished pairs arrived reversed"
+    );
 }
 
 #[test]

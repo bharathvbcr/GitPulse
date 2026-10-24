@@ -120,6 +120,7 @@ fn drive(offered: Vec<Notice>, threads: usize) -> (SessionAlertStatus, usize) {
         dropped_scan: 0,
         failed: c.failed.load(Ordering::Relaxed),
         bridge_rejected: 0,
+        stale: 0,
         bridge_listening: false,
         bridge_path: None,
         last_error: None,
@@ -140,6 +141,7 @@ fn accounted(status: &SessionAlertStatus) -> u64 {
         + status.rate_limited
         + status.failed
         + status.dropped_queue
+        + status.stale
 }
 
 #[test]

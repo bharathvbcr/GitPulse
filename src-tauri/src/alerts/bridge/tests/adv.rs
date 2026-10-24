@@ -200,7 +200,10 @@ fn an_emfile_storm_with_a_pending_connection_does_not_spin() {
     let wall = started.elapsed();
     apply_at(false, None);
     eprintln!("EMFILE storm: {calls} accept attempts, {cpu:?} cpu in {wall:?}");
-    assert!(calls < 40, "{calls} accept attempts in {wall:?}: the loop is spinning");
+    assert!(
+        calls < 40,
+        "{calls} accept attempts in {wall:?}: the loop is spinning"
+    );
     assert!(cpu < Duration::from_millis(150), "{cpu:?} cpu in {wall:?}");
 }
 
@@ -226,5 +229,8 @@ fn a_report_without_half_close_is_dropped_and_the_client_sees_eof_in_time() {
         waited < crate::hooks::NOTIFY_BUDGET,
         "EOF after {waited:?}, past the hook's budget"
     );
-    assert!(reply.is_empty() || reply == b"{\"ok\":false}\n", "{reply:?}");
+    assert!(
+        reply.is_empty() || reply == b"{\"ok\":false}\n",
+        "{reply:?}"
+    );
 }

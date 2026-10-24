@@ -353,6 +353,13 @@ pub struct SessionAlertStatus {
     pub failed: u64,
     /// Rejected at the socket: malformed, oversized, or from another user.
     pub bridge_rejected: u64,
+    /// A hook report that reached the worker behind a later one from the same
+    /// session (stamped at accept, applied out of order by the parallel
+    /// readers) and was dropped rather than applied late. Counted apart from
+    /// `bridge_rejected` because the report was well formed. Not on the wire
+    /// yet: the TypeScript mirror lives in a file another session holds.
+    #[serde(skip)]
+    pub stale: u64,
     pub bridge_listening: bool,
     pub bridge_path: Option<String>,
     pub last_error: Option<String>,
@@ -374,6 +381,7 @@ struct Counters {
     dropped_scan: AtomicU64,
     failed: AtomicU64,
     bridge_rejected: AtomicU64,
+    stale: AtomicU64,
 }
 
 impl Counters {
@@ -435,6 +443,9 @@ struct Hub {
     /// listening — at start-up, across a reload — is gone. This is what a
     /// page that has just started listening reads to catch up.
     standing: Arc<Mutex<Vec<StandingAttention>>>,
+    /// The newest accept stamp seen per hook session. See [`OrderBook`].
+    #[cfg(unix)]
+    order: Mutex<OrderBook>,
 }
 
 static HUB: OnceLock<Hub> = OnceLock::new();
@@ -458,6 +469,8 @@ pub fn start(host: Arc<dyn Host>) {
         visible,
         last_error: last_error.clone(),
         standing: standing.clone(),
+        #[cfg(unix)]
+        order: Mutex::new(OrderBook::default()),
     };
     if HUB.set(installed).is_err() {
         return;
@@ -490,6 +503,89 @@ pub fn offer(notice: Notice) {
     let Some(hub) = hub() else { return };
     if hub.sender.try_send(notice).is_err() {
         hub.counters.dropped_queue.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Offers a hook report together with the stamp it was given at accept
+/// ([`bridge::order_stamp_ns`]).
+///
+/// The bridge reads connections in parallel, so two reports from one session
+/// that arrive back to back can reach here in either order, and a late
+/// `tool_finished` erases the "Finished" a `turn_finished` just set. The stamp
+/// is the order they arrived in; a report older than the newest one already
+/// seen for its session is dropped and counted as `stale`, never applied late
+/// and never waited for.
+#[cfg(unix)]
+pub(crate) fn offer_stamped(notice: Notice, stamp: u64) {
+    let Some(hub) = hub() else { return };
+    // The check, the high-water update and the hand-off to the queue are one
+    // step under the lock, so no report with a lower stamp can slip in between
+    // a higher one being admitted and queued.
+    let mut book = hub
+        .order
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let ends = notice.event == Some("session_ended");
+    if !book.admit(&notice.key, stamp, ends) {
+        hub.counters.stale.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if hub.sender.try_send(notice).is_err() {
+        hub.counters.dropped_queue.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Most sessions the order book remembers. The same bound as the notifier's
+/// own tracking, which is what a report is about to be tracked against.
+#[cfg(unix)]
+pub(crate) const ORDER_BOOK_CAP: usize = MAX_TRACKED;
+
+/// The newest accept stamp admitted per session key.
+///
+/// Every report the bridge offers is state-bearing: each event in
+/// [`bridge::EVENTS`] is a banner (`permission_prompt`, `idle_prompt`,
+/// `agent_needs_input`, `agent_completed`, the two elicitation dialogs,
+/// `error`), a state (`permission_request`, `turn_finished`) or a resolution
+/// (`prompt_submitted`, `tool_finished`, `session_ended`). Bells carry no
+/// stamp and never come through here, nor does the renderer's own
+/// `answered`.
+///
+/// Bounded two ways: a session's entry goes when its `session_ended` is
+/// admitted, and the map never holds more than [`ORDER_BOOK_CAP`] entries, the
+/// one with the oldest stamp making room for a new session. Forgetting a
+/// session costs at most one reordered report for it.
+#[cfg(unix)]
+#[derive(Default)]
+struct OrderBook {
+    newest: HashMap<String, u64>,
+}
+
+#[cfg(unix)]
+impl OrderBook {
+    /// Whether a report with `stamp` for `key` is current, and if so records it.
+    fn admit(&mut self, key: &str, stamp: u64, ends_session: bool) -> bool {
+        if let Some(newest) = self.newest.get_mut(key) {
+            if stamp < *newest {
+                return false;
+            }
+            *newest = stamp;
+        } else {
+            if self.newest.len() >= ORDER_BOOK_CAP {
+                let oldest = self
+                    .newest
+                    .iter()
+                    .min_by_key(|(_, seen)| **seen)
+                    .map(|(key, _)| key.clone());
+                if let Some(oldest) = oldest {
+                    self.newest.remove(&oldest);
+                }
+            }
+            self.newest.insert(key.to_owned(), stamp);
+        }
+        if ends_session {
+            self.newest.remove(key);
+        }
+        true
     }
 }
 
@@ -582,6 +678,7 @@ pub fn status() -> SessionAlertStatus {
         dropped_scan: c.dropped_scan.load(Ordering::Relaxed),
         failed: c.failed.load(Ordering::Relaxed),
         bridge_rejected: c.bridge_rejected.load(Ordering::Relaxed),
+        stale: c.stale.load(Ordering::Relaxed),
         bridge_listening: bridge.listening,
         bridge_path: bridge.path,
         last_error: hub
