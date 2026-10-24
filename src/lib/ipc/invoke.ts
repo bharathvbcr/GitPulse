@@ -21,6 +21,7 @@ export const IPC_ERROR_KINDS = [
   "stale_stash",
   "ledger_not_initialised",
   "ledger_failed",
+  "ai_endpoint_unconfirmed",
 ] as const;
 
 export type IpcErrorKind = (typeof IPC_ERROR_KINDS)[number];

@@ -56,6 +56,39 @@ struct NativeModelEntry {
     name: String,
 }
 
+/// Who a base URL most likely is, for asking the user before anything is sent.
+/// The runtime is a guess from the port it conventionally binds, and the label
+/// says so by always carrying the address that will actually receive the data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointIdentity {
+    pub runtime: String,
+    pub host: String,
+    pub port: u16,
+    /// "Ollama on 127.0.0.1:11434".
+    pub label: String,
+}
+
+pub fn identify(base_url: &str) -> EndpointIdentity {
+    let (host, port) = match http::parse_base_url(base_url) {
+        Ok(endpoint) => (endpoint.host, endpoint.port),
+        Err(_) => (base_url.to_string(), 0),
+    };
+    let runtime = match port {
+        11434 => "Ollama",
+        8000 => "vLLM",
+        1234 => "LM Studio",
+        8080 => "llama.cpp",
+        1337 => "Jan",
+        _ => "Local model server",
+    };
+    EndpointIdentity {
+        runtime: runtime.to_string(),
+        label: format!("{runtime} on {host}:{port}"),
+        host,
+        port,
+    }
+}
+
 /// Asks one endpoint what it serves.
 pub fn list_models(base_url: &str) -> DiscoveredEndpoint {
     let endpoint = match http::parse_base_url(base_url) {
@@ -223,6 +256,21 @@ mod tests {
     fn choose_reports_nothing_when_no_endpoint_is_reachable() {
         let endpoints = vec![endpoint("http://127.0.0.1:8000/v1", &[], false)];
         assert!(choose(&endpoints, None).is_none());
+    }
+
+    #[test]
+    fn identify_names_the_runtime_and_port() {
+        let ollama = identify("http://127.0.0.1:11434/v1");
+        assert_eq!(ollama.label, "Ollama on 127.0.0.1:11434");
+        assert_eq!((ollama.runtime.as_str(), ollama.port), ("Ollama", 11434));
+        assert_eq!(
+            identify("http://127.0.0.1:1234/v1").label,
+            "LM Studio on 127.0.0.1:1234"
+        );
+        assert_eq!(
+            identify("http://127.0.0.1:9999/v1").label,
+            "Local model server on 127.0.0.1:9999"
+        );
     }
 
     #[test]

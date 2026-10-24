@@ -1,5 +1,6 @@
 import { writable, get } from "svelte/store";
-import { invoke } from "../ipc/invoke";
+import { invoke, readIpcError } from "../ipc/invoke";
+import { askConfirm, type ConfirmPromptOptions } from "./modalStore";
 import { formatDiagnosticFailure } from "../diagnostics/diagnostics";
 import { mergeEvents } from "../ledger/projection";
 import { ledgerStatus, type LedgerEvent, type LedgerStatus } from "../ledger/types";
@@ -325,10 +326,38 @@ function savePreferred(selection: AiSelection | null) {
 export interface HarnessStoreDeps {
   /** The object-argument subset of Tauri invoke used by this store. */
   invoke?: <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
+  /** Asks the user a yes/no question. Defaults to the in-app confirm dialog. */
+  confirm?: (options: Omit<ConfirmPromptOptions, "mode">) => Promise<boolean>;
+}
+
+/** A model server the backend found but the user has not chosen. */
+export interface UnconfirmedEndpoint {
+  selection: AiSelection;
+  /** "Ollama on 127.0.0.1:11434": the runtime and the address that would receive the data. */
+  label: string;
+}
+
+/**
+ * Reads the backend's "confirm this endpoint first" refusal. Only the typed
+ * kind counts; nothing inside the message is read. Null for any other failure,
+ * and for a detail that does not name an endpoint and a model.
+ */
+export function unconfirmedEndpoint(error: unknown): UnconfirmedEndpoint | null {
+  const typed = readIpcError(error);
+  if (typed?.kind !== "ai_endpoint_unconfirmed") return null;
+  const detail = typed.detail;
+  if (detail === null || typeof detail !== "object") return null;
+  const { base_url, model, label } = detail as Record<string, unknown>;
+  if (typeof base_url !== "string" || typeof model !== "string" || typeof label !== "string") {
+    return null;
+  }
+  if (!base_url || !model) return null;
+  return { selection: { base_url, model }, label };
 }
 
 export function createHarnessStore(deps: HarnessStoreDeps = {}) {
   const invokeFn = deps.invoke ?? invoke;
+  const confirmFn = deps.confirm ?? askConfirm;
   const pathIdentityOptions: PathIdentityOptions = {
     caseInsensitive: isCaseInsensitiveFs(),
   };
@@ -576,6 +605,35 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
 
   function currentPreferred(): AiSelection | null {
     return get({ subscribe }).preferred;
+  }
+
+  /**
+   * Runs one AI call with the saved selection. With none saved the backend
+   * finds a server but sends nothing, answering `ai_endpoint_unconfirmed`; this
+   * asks the user about exactly that runtime and address, saves the choice
+   * through the same path as picking a model (`selectModel`), and asks again.
+   * Declining rethrows the refusal, so nothing is ever sent unconfirmed.
+   */
+  async function withEndpointConsent<T>(call: (preferred: AiSelection | null) => Promise<T>): Promise<T> {
+    try {
+      return await call(currentPreferred());
+    } catch (err: unknown) {
+      const found = unconfirmedEndpoint(err);
+      if (!found) throw err;
+      const confirmed = await confirmFn({
+        title: "Send to this local model server?",
+        message:
+          `${found.label}\n` +
+          `Model: ${found.selection.model}\n\n` +
+          "GitPulse found this server running on this machine. Your staged changes or commit " +
+          "will be sent to it. Nothing has been sent yet.",
+        confirmLabel: "Send and remember",
+        cancelLabel: "Don't send",
+      });
+      if (!confirmed) throw err;
+      void store.selectModel(found.selection);
+      return call(found.selection);
+    }
   }
 
   async function probeAi(token: number): Promise<AiStatus | null> {
@@ -914,53 +972,58 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
     syncLedger,
 
     generateCommitMessage: async (repoPath: string): Promise<AiGeneration> => {
-      const preferred = currentPreferred();
-      return invokeFn<AiGeneration>("cmd_ai_generate_commit_message", {
-        repoPath,
-        baseUrl: preferred?.base_url ?? null,
-        model: preferred?.model ?? null,
-      });
+      return withEndpointConsent((preferred) =>
+        invokeFn<AiGeneration>("cmd_ai_generate_commit_message", {
+          repoPath,
+          baseUrl: preferred?.base_url ?? null,
+          model: preferred?.model ?? null,
+        }),
+      );
     },
 
     explainCommit: async (repoPath: string, commitId: string): Promise<AiGeneration> => {
-      const preferred = currentPreferred();
-      return invokeFn<AiGeneration>("cmd_ai_explain_commit", {
-        repoPath,
-        commitId,
-        baseUrl: preferred?.base_url ?? null,
-        model: preferred?.model ?? null,
-      });
+      return withEndpointConsent((preferred) =>
+        invokeFn<AiGeneration>("cmd_ai_explain_commit", {
+          repoPath,
+          commitId,
+          baseUrl: preferred?.base_url ?? null,
+          model: preferred?.model ?? null,
+        }),
+      );
     },
 
     suggestBranchName: async (repoPath: string): Promise<AiGeneration> => {
-      const preferred = currentPreferred();
-      return invokeFn<AiGeneration>("cmd_ai_suggest_branch_name", {
-        repoPath,
-        baseUrl: preferred?.base_url ?? null,
-        model: preferred?.model ?? null,
-      });
+      return withEndpointConsent((preferred) =>
+        invokeFn<AiGeneration>("cmd_ai_suggest_branch_name", {
+          repoPath,
+          baseUrl: preferred?.base_url ?? null,
+          model: preferred?.model ?? null,
+        }),
+      );
     },
 
     /** Turns a rendered dependency-health report into a remediation plan. */
     fixHealth: async (repoPath: string, report: string): Promise<AiGeneration> => {
-      const preferred = currentPreferred();
-      return invokeFn<AiGeneration>("cmd_ai_fix_health", {
-        repoPath,
-        report,
-        baseUrl: preferred?.base_url ?? null,
-        model: preferred?.model ?? null,
-      });
+      return withEndpointConsent((preferred) =>
+        invokeFn<AiGeneration>("cmd_ai_fix_health", {
+          repoPath,
+          report,
+          baseUrl: preferred?.base_url ?? null,
+          model: preferred?.model ?? null,
+        }),
+      );
     },
 
     /** Turns a rendered coverage report into a local-model analysis. */
     coverageReport: async (repoPath: string, report: string): Promise<AiGeneration> => {
-      const preferred = currentPreferred();
-      return invokeFn<AiGeneration>("cmd_ai_coverage_report", {
-        repoPath,
-        report,
-        baseUrl: preferred?.base_url ?? null,
-        model: preferred?.model ?? null,
-      });
+      return withEndpointConsent((preferred) =>
+        invokeFn<AiGeneration>("cmd_ai_coverage_report", {
+          repoPath,
+          report,
+          baseUrl: preferred?.base_url ?? null,
+          model: preferred?.model ?? null,
+        }),
+      );
     },
   };
 

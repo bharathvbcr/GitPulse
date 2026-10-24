@@ -69,12 +69,16 @@ pub enum IpcErrorKind {
     LedgerNotInitialised,
     /// Any other ledger failure; the ledger's own code is in `detail.code`.
     LedgerFailed,
+    /// An AI action found a model server nobody has chosen yet. Nothing was
+    /// sent; `detail` names the runtime, host, port, base URL and model the
+    /// frontend asks the user to confirm.
+    AiEndpointUnconfirmed,
 }
 
 impl IpcErrorKind {
     /// Every kind, in wire spelling order. The round-trip tests walk this so a
     /// new kind cannot be added without being serialised and read back.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Unclassified,
         Self::DeferredUnderLoad,
         Self::RepositoryTrustRequired,
@@ -82,6 +86,7 @@ impl IpcErrorKind {
         Self::StaleStash,
         Self::LedgerNotInitialised,
         Self::LedgerFailed,
+        Self::AiEndpointUnconfirmed,
     ];
 }
 
@@ -178,6 +183,7 @@ pub(crate) struct Records {
     trust: Option<(String, Option<serde_json::Value>)>,
     identity: Option<String>,
     stale: Option<String>,
+    ai_endpoint: Option<(String, Option<serde_json::Value>)>,
     deferrals: Vec<String>,
     /// More distinct deferrals than [`MAX_DEFERRALS`] were written.
     overflowed: bool,
@@ -189,6 +195,9 @@ impl Records {
             IpcErrorKind::RepositoryTrustRequired => self.trust = Some((text.to_string(), detail)),
             IpcErrorKind::IdentityMissing => self.identity = Some(text.to_string()),
             IpcErrorKind::StaleStash => self.stale = Some(text.to_string()),
+            IpcErrorKind::AiEndpointUnconfirmed => {
+                self.ai_endpoint = Some((text.to_string(), detail));
+            }
             IpcErrorKind::DeferredUnderLoad => {
                 if self.deferrals.iter().any(|written| written == text) {
                     return;
@@ -219,6 +228,11 @@ impl Records {
         if self.stale.as_deref() == Some(text) {
             return (IpcErrorKind::StaleStash, None);
         }
+        if let Some((written, detail)) = &self.ai_endpoint {
+            if written == text {
+                return (IpcErrorKind::AiEndpointUnconfirmed, detail.clone());
+            }
+        }
         if self.deferrals.iter().any(|written| written == text) {
             return (IpcErrorKind::DeferredUnderLoad, None);
         }
@@ -236,6 +250,9 @@ impl Records {
         }
         if other.stale.is_some() {
             self.stale = other.stale;
+        }
+        if other.ai_endpoint.is_some() {
+            self.ai_endpoint = other.ai_endpoint;
         }
         for text in other.deferrals {
             self.write(IpcErrorKind::DeferredUnderLoad, &text, None);
@@ -276,6 +293,7 @@ pub(crate) fn kind_was_written(kind: IpcErrorKind) -> bool {
             IpcErrorKind::RepositoryTrustRequired => typed.trust.is_some(),
             IpcErrorKind::IdentityMissing => typed.identity.is_some(),
             IpcErrorKind::StaleStash => typed.stale.is_some(),
+            IpcErrorKind::AiEndpointUnconfirmed => typed.ai_endpoint.is_some(),
             IpcErrorKind::DeferredUnderLoad => !typed.deferrals.is_empty(),
             IpcErrorKind::Unclassified
             | IpcErrorKind::LedgerNotInitialised

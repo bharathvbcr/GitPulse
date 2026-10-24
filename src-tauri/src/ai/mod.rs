@@ -387,6 +387,55 @@ pub fn status(explicit_base_url: Option<&str>, preferred_model: Option<&str>) ->
     }
 }
 
+/// Where a request may go.
+enum Target {
+    /// The user's own choice: the one the caller passed in.
+    Confirmed(AiSelection),
+    /// Nothing was chosen and nothing answered; what the sweep saw.
+    NoServer(Vec<discovery::DiscoveredEndpoint>),
+}
+
+/// The one gate between "a model server is running" and "send it the diff".
+///
+/// With no usable selection the sweep may find a server, and finding one is
+/// not consent: on a shared host the listener on 8080 can be someone else's.
+/// The answer is a typed [`IpcErrorKind::AiEndpointUnconfirmed`] naming the
+/// runtime and port, which the frontend shows as a question and, once the user
+/// confirms, persists as the selection and asks again. The sweep itself only
+/// reads `/models`; no prompt or diff has been sent when this returns.
+fn resolve_target(
+    selection: Option<AiSelection>,
+    sweep: impl FnOnce() -> Vec<discovery::DiscoveredEndpoint>,
+) -> Result<Target, String> {
+    if let Some(selection) = usable_selection(selection) {
+        return Ok(Target::Confirmed(selection));
+    }
+    let endpoints = sweep();
+    match discovery::choose(&endpoints, None) {
+        Some((endpoint, model)) => Err(unconfirmed_endpoint(&endpoint.base_url, &model)),
+        None => Ok(Target::NoServer(endpoints)),
+    }
+}
+
+fn unconfirmed_endpoint(base_url: &str, model: &str) -> String {
+    let identity = discovery::identify(base_url);
+    crate::ipc_error::typed_text_with_detail(
+        crate::ipc_error::IpcErrorKind::AiEndpointUnconfirmed,
+        format!(
+            "Confirm where to send this: {} serving {model}. Nothing has been sent.",
+            identity.label
+        ),
+        serde_json::json!({
+            "base_url": base_url,
+            "model": model,
+            "runtime": identity.runtime,
+            "host": identity.host,
+            "port": identity.port,
+            "label": identity.label,
+        }),
+    )
+}
+
 /// One assembled request, before it goes out.
 struct Turn {
     system: String,
@@ -405,26 +454,20 @@ fn run(
     let mut warnings: Vec<String> = Vec::new();
     let feature_output_cap = feature.max_output_tokens();
 
-    // 1. Where to send it.
-    let selection = match selection.filter(|s| !s.base_url.is_empty() && !s.model.is_empty()) {
-        Some(s) => s,
-        None => {
-            let endpoints = discovery::sweep(None);
-            let (endpoint, model) = discovery::choose(&endpoints, None).ok_or_else(|| {
-                let tried: Vec<String> = endpoints
-                    .iter()
-                    .map(|e| format!("{} ({})", e.base_url, e.detail))
-                    .collect();
-                format!(
-                    "No local model server is running. Tried: {}. Start Ollama, LM Studio, \
-                     llama.cpp, vLLM or Jan, then try again.",
-                    tried.join(", ")
-                )
-            })?;
-            AiSelection {
-                base_url: endpoint.base_url.clone(),
-                model,
-            }
+    // 1. Where to send it: only where the user chose. A discovered server is
+    //    offered for confirmation, never used.
+    let selection = match resolve_target(selection, || discovery::sweep(None))? {
+        Target::Confirmed(selection) => selection,
+        Target::NoServer(endpoints) => {
+            let tried: Vec<String> = endpoints
+                .iter()
+                .map(|e| format!("{} ({})", e.base_url, e.detail))
+                .collect();
+            return Err(format!(
+                "No local model server is running. Tried: {}. Start Ollama, LM Studio, \
+                 llama.cpp, vLLM or Jan, then try again.",
+                tried.join(", ")
+            ));
         }
     };
 
@@ -821,17 +864,11 @@ fn should_ask_on_device(
     no_server && ready && !patch_truncated && !high_confidence
 }
 
-/// A server the caller named wins, then one found on loopback, then the
-/// on-device model, then the message already written from the patch.
-fn choose_commit_engine(
-    explicit: Option<AiSelection>,
-    discovered: Option<AiSelection>,
-    on_device: bool,
-) -> CommitEngine {
+/// A server the caller named wins, then the on-device model, then the message
+/// already written from the patch. A server merely found on loopback is not an
+/// option here: [`resolve_target`] refuses it until the user confirms it.
+fn choose_commit_engine(explicit: Option<AiSelection>, on_device: bool) -> CommitEngine {
     if let Some(selection) = usable_selection(explicit) {
-        return CommitEngine::Local(selection);
-    }
-    if let Some(selection) = usable_selection(discovered) {
         return CommitEngine::Local(selection);
     }
     if on_device {
@@ -876,6 +913,16 @@ fn working_diff(repo_path: &str) -> Result<String, String> {
 pub fn generate_commit_message(
     repo_path: &str,
     selection: Option<AiSelection>,
+) -> Result<AiGeneration, String> {
+    generate_commit_message_with(repo_path, selection, || discovery::sweep(None))
+}
+
+/// [`generate_commit_message`] with the discovery sweep injected, so a test can
+/// point it at a server it controls instead of the fixed loopback ports.
+fn generate_commit_message_with(
+    repo_path: &str,
+    selection: Option<AiSelection>,
+    sweep: impl FnOnce() -> Vec<discovery::DiscoveredEndpoint>,
 ) -> Result<AiGeneration, String> {
     let started = Instant::now();
     let (patch, patch_truncated) = read_staged_patch(repo_path)?;
@@ -947,28 +994,22 @@ pub fn generate_commit_message(
     // thread. With both Lappi settings off it reads only the cached config.
     crate::lappi::consult_on_commit_type(repo_path, &patch, &mut draft);
 
-    let explicit = usable_selection(selection);
-    let (discovered, on_device) = if explicit.is_some() {
-        (None, false)
-    } else {
-        let discovered =
-            discovery::choose(&discovery::sweep(None), None).map(|(endpoint, model)| AiSelection {
-                base_url: endpoint.base_url.clone(),
-                model,
-            });
+    let (explicit, on_device) = match resolve_target(selection, sweep)? {
+        Target::Confirmed(selection) => (Some(selection), false),
         // A cut patch is not something the small model should phrase: the brief
         // would be missing files and the subject would overclaim.
-        let on_device = discovered.is_none()
-            && should_ask_on_device(
+        Target::NoServer(_) => (
+            None,
+            should_ask_on_device(
                 true,
                 !patch_truncated && !draft.high_confidence && apple::status().ready(),
                 patch_truncated,
                 draft.high_confidence,
-            );
-        (discovered, on_device)
+            ),
+        ),
     };
 
-    match choose_commit_engine(explicit, discovered, on_device) {
+    match choose_commit_engine(explicit, on_device) {
         CommitEngine::Local(selection) => Ok(finish_with_local_model(
             repo_path, selection, &draft, &style, &branch, &diff, started,
         )),
@@ -1613,35 +1654,130 @@ mod tests {
         assert!(error.contains("Nothing is staged"), "{error}");
     }
 
+    /// A loopback server that answers every request, listing one model on GET
+    /// and counting what else arrives. Returns its base URL and the counters
+    /// `(gets, posts)`.
+    fn counting_model_server() -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let gets = std::sync::Arc::new(AtomicUsize::new(0));
+        let posts = std::sync::Arc::new(AtomicUsize::new(0));
+        let (g, p) = (gets.clone(), posts.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                if head.starts_with("POST") {
+                    p.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    g.fetch_add(1, Ordering::SeqCst);
+                }
+                let body = r#"{"data":[{"id":"m"}]}"#;
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        (format!("http://127.0.0.1:{port}/v1"), gets, posts)
+    }
+
     #[test]
-    fn commit_engine_prefers_a_named_server_then_discovery_then_on_device() {
+    fn a_discovered_server_gets_nothing_until_the_user_confirms_it() {
+        use std::sync::atomic::Ordering;
+        let _clear = ClearFakeProbe;
+        let _no_harness = NoHarness::install();
+        let (url, gets, posts) = counting_model_server();
+        let repo = repo_with_staged_change();
+        let sweep = || vec![discovery::list_models(&url)];
+
+        let error = crate::ipc_error::run_command(|| {
+            with_isolated_tools_config(|| {
+                generate_commit_message_with(&repo.path().to_string_lossy(), None, sweep)
+            })
+        })
+        .expect_err("no preferred selection: the first send needs confirmation");
+
+        assert_eq!(
+            error.kind,
+            crate::ipc_error::IpcErrorKind::AiEndpointUnconfirmed
+        );
+        let detail = error.detail.expect("the confirmation carries its subject");
+        assert_eq!(detail["base_url"], url.as_str());
+        assert_eq!(detail["model"], "m");
+        let port = url.rsplit_once(':').unwrap().1.split('/').next().unwrap();
+        assert_eq!(
+            detail["label"],
+            format!("Local model server on 127.0.0.1:{port}").as_str()
+        );
+        assert!(gets.load(Ordering::SeqCst) >= 1, "the sweep itself ran");
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            0,
+            "a diff was sent unconfirmed"
+        );
+    }
+
+    #[test]
+    fn every_ai_action_refuses_a_discovered_server_the_same_way() {
+        use std::sync::atomic::Ordering;
+        let (url, _gets, posts) = counting_model_server();
+        let found = vec![discovery::list_models(&url)];
+        assert!(matches!(
+            resolve_target(None, || found.clone()),
+            Err(message) if message.contains("Nothing has been sent")
+        ));
+        // An empty selection is no selection.
+        assert!(resolve_target(Some(AiSelection::default()), || found.clone()).is_err());
+        // A chosen one is used as given, and the sweep is never consulted.
+        let chosen = AiSelection {
+            base_url: url.clone(),
+            model: "m".into(),
+        };
+        assert!(matches!(
+            resolve_target(Some(chosen), || panic!("swept despite a chosen endpoint")),
+            Ok(Target::Confirmed(_))
+        ));
+        // Nothing found is a plain "no server", not a confirmation.
+        assert!(matches!(
+            resolve_target(None, Vec::new),
+            Ok(Target::NoServer(_))
+        ));
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn commit_engine_prefers_a_named_server_then_on_device() {
         let named = AiSelection {
             base_url: "http://127.0.0.1:9/v1".into(),
             model: "named".into(),
         };
-        let found = AiSelection {
-            base_url: "http://127.0.0.1:10/v1".into(),
-            model: "found".into(),
-        };
-        match choose_commit_engine(Some(named), Some(found.clone()), true) {
+        match choose_commit_engine(Some(named), true) {
             CommitEngine::Local(selection) => assert_eq!(selection.model, "named"),
             other => panic!("a named server must win: {other:?}"),
         }
-        match choose_commit_engine(None, Some(found), true) {
-            CommitEngine::Local(selection) => assert_eq!(selection.model, "found"),
-            other => panic!("a discovered server must beat the on-device model: {other:?}"),
-        }
         assert!(matches!(
-            choose_commit_engine(None, None, true),
+            choose_commit_engine(None, true),
             CommitEngine::OnDevice
         ));
         assert!(matches!(
-            choose_commit_engine(None, None, false),
+            choose_commit_engine(None, false),
             CommitEngine::Patch
         ));
         // An empty selection is "none", not a server with a blank name.
         assert!(matches!(
-            choose_commit_engine(Some(AiSelection::default()), None, false),
+            choose_commit_engine(Some(AiSelection::default()), false),
             CommitEngine::Patch
         ));
     }

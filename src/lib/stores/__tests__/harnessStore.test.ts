@@ -1,7 +1,9 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import { IpcError } from "../../ipc/invoke";
 import { get } from "svelte/store";
 import {
   createHarnessStore,
+  unconfirmedEndpoint,
   verdictDetail,
   verdictLabel,
   type AiStatus,
@@ -809,5 +811,85 @@ describe("policy verdict rendering", () => {
     });
     expect(verdictLabel(blocked)).toContain("blocked");
     expect(verdictDetail(blocked)).toBe("command.force_push: Force pushes are not allowed.");
+  });
+});
+
+describe("AI endpoint consent", () => {
+  const unconfirmed = () =>
+    new IpcError(
+      "ai_endpoint_unconfirmed",
+      "Confirm where to send this: Ollama on 127.0.0.1:11434 serving gemma. Nothing has been sent.",
+      {
+        base_url: "http://127.0.0.1:11434/v1",
+        model: "gemma",
+        runtime: "Ollama",
+        host: "127.0.0.1",
+        port: 11434,
+        label: "Ollama on 127.0.0.1:11434",
+      },
+    );
+
+  /** A backend that refuses to send until it is given a selection. */
+  function backend() {
+    const sends: Array<Record<string, unknown>> = [];
+    const invokeFn = (async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "cmd_ai_status") return { ready: true };
+      if (cmd !== "cmd_ai_generate_commit_message") throw new Error(`unexpected ${cmd}`);
+      if (!args?.baseUrl) throw unconfirmed();
+      sends.push(args);
+      return { text: "feat: x" };
+    }) as <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
+    return { invokeFn, sends };
+  }
+
+  it("asks with the runtime and port, and sends nothing until the user says yes", async () => {
+    const { invokeFn, sends } = backend();
+    const asked: Array<{ title: string; message?: string }> = [];
+    const answer = deferred<boolean>();
+    const store = createHarnessStore({
+      invoke: invokeFn,
+      confirm: (options) => {
+        asked.push(options);
+        return answer.promise;
+      },
+    });
+
+    const pending = store.generateCommitMessage("/repo");
+    await vi.waitFor(() => expect(asked).toHaveLength(1));
+    expect(asked[0].message).toContain("Ollama on 127.0.0.1:11434");
+    expect(asked[0].message).toContain("Nothing has been sent yet");
+    expect(sends).toEqual([]);
+    expect(get(store).preferred).toBeNull();
+
+    answer.resolve(true);
+    await expect(pending).resolves.toEqual({ text: "feat: x" });
+    expect(sends).toEqual([
+      { repoPath: "/repo", baseUrl: "http://127.0.0.1:11434/v1", model: "gemma" },
+    ]);
+    // Persisted through the preferred-selection path, so the next call asks nothing.
+    expect(get(store).preferred).toEqual({ base_url: "http://127.0.0.1:11434/v1", model: "gemma" });
+    await store.generateCommitMessage("/repo");
+    expect(asked).toHaveLength(1);
+    expect(sends).toHaveLength(2);
+  });
+
+  it("declining sends nothing and keeps nothing", async () => {
+    const { invokeFn, sends } = backend();
+    const store = createHarnessStore({ invoke: invokeFn, confirm: async () => false });
+    await expect(store.generateCommitMessage("/repo")).rejects.toMatchObject({
+      kind: "ai_endpoint_unconfirmed",
+    });
+    expect(sends).toEqual([]);
+    expect(get(store).preferred).toBeNull();
+  });
+
+  it("reads only the typed kind, never a look-alike message", () => {
+    expect(unconfirmedEndpoint(unconfirmed())?.label).toBe("Ollama on 127.0.0.1:11434");
+    expect(unconfirmedEndpoint(new Error("Confirm where to send this: x"))).toBeNull();
+    const detail = { base_url: "u", model: "m", label: "l" };
+    expect(unconfirmedEndpoint(new IpcError("unclassified", "m", detail))).toBeNull();
+    expect(
+      unconfirmedEndpoint(new IpcError("ai_endpoint_unconfirmed", "m", { ...detail, base_url: "" })),
+    ).toBeNull();
   });
 });
