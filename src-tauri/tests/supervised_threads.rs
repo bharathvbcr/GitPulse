@@ -54,13 +54,54 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// A source file compiled only for tests: exactly `tests.rs`, `*_tests.rs`,
+/// exactly `test_support.rs`, and anything under a directory named exactly
+/// `test_support`. A bare `ends_with("tests.rs")` would also skip a production
+/// `contests.rs`, and a prefix match a production `test_supports/pool.rs`.
 fn is_test_file(rel: &str) -> bool {
-    let name = rel.rsplit('/').next().unwrap_or(rel);
-    name.ends_with("tests.rs")
+    let mut parts = rel.rsplit('/');
+    let name = parts.next().unwrap_or(rel);
+    name == "tests.rs"
         || name.ends_with("_tests.rs")
         || name == "test_support.rs"
-        || rel.starts_with("test_support/")
+        || parts.any(|dir| dir == "test_support")
         || TEST_ONLY.iter().any(|(file, _)| *file == rel)
+}
+
+#[test]
+fn only_the_named_shapes_are_test_files() {
+    for test in [
+        "tests.rs",
+        "alerts/tests.rs",
+        "diff/adversarial_tests.rs",
+        "test_support.rs",
+        "test_support/env.rs",
+        "alerts/stress.rs",
+    ] {
+        assert!(is_test_file(test), "{test} is test-only");
+    }
+    for production in [
+        "contests.rs",
+        "a/contests.rs",
+        "latests.rs",
+        "supervisor.rs",
+    ] {
+        assert!(!is_test_file(production), "{production} is production");
+    }
+}
+
+/// FAILS BY DESIGN (severity low): the "exact" matcher still skips any file or
+/// directory whose name merely STARTS with `test_support`, so a production
+/// `test_supports/pool.rs` or `test_support_bridge.rs` escapes the raw-spawn
+/// scan the way `contests.rs` used to.
+#[test]
+fn a_test_support_prefix_alone_does_not_make_a_production_file_test_only() {
+    for production in ["test_supports/pool.rs", "test_support_bridge.rs"] {
+        assert!(
+            !is_test_file(production),
+            "{production} is skipped by the raw thread::spawn lint"
+        );
+    }
 }
 
 const NEEDLES: &[&str] = &[
