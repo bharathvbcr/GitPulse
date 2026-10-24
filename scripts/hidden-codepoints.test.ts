@@ -1,6 +1,5 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-// @ts-expect-error - a plain ES module with no declaration file
 import { TABLE_PATH, generate } from "./hidden-codepoints.mjs";
 
 /**

@@ -21,7 +21,11 @@ export const TABLE_PATH = fileURLToPath(new URL("./fixtures/hidden-codepoints.js
 const DROP = /^[\p{Cf}\p{Co}]$/u;
 const SEPARATOR = /^[\p{Cc}\s]$/u;
 
-/** Inclusive `[lo, hi]` ranges of the code points `matches` accepts. */
+/**
+ * Inclusive `[lo, hi]` ranges of the code points `matches` accepts.
+ * @param {(ch: string) => boolean} matches
+ * @returns {number[][]}
+ */
 function ranges(matches) {
   const out = [];
   for (let cp = 0; cp <= 0x10ffff; cp += 1) {
@@ -36,12 +40,13 @@ function ranges(matches) {
 
 export function generate() {
   return {
-    unicode: process.versions.unicode,
+    unicode: String(process.versions.unicode),
     drop: ranges((ch) => DROP.test(ch)),
     space: ranges((ch) => SEPARATOR.test(ch) && !DROP.test(ch)),
   };
 }
 
+/** @param {{ unicode: string, drop: number[][], space: number[][] }} table */
 export function render(table) {
   return `${JSON.stringify(table)}\n`;
 }
