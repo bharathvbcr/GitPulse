@@ -2302,11 +2302,7 @@ fn refusal_text(reply: Option<&Value>) -> String {
         // anything that is not printable and past a length no token has.
         None => format!(
             "GitPulse refused the report: {}",
-            token
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(64)
-                .collect::<String>()
+            crate::alerts::bridge::printable(token, 64)
         ),
     }
 }

@@ -76,6 +76,21 @@ fn refusals() -> Vec<(&'static str, Vec<u8>, &'static str)> {
             "unknown_agent",
         ),
         (
+            "numeric session",
+            br#"{"v":1,"event":"error","session":5}"#.to_vec(),
+            "malformed_field",
+        ),
+        (
+            "numeric cwd",
+            br#"{"v":1,"event":"error","cwd":5}"#.to_vec(),
+            "malformed_field",
+        ),
+        (
+            "array message",
+            br#"{"v":1,"event":"error","message":["x"]}"#.to_vec(),
+            "malformed_field",
+        ),
+        (
             "state without a session",
             br#"{"v":1,"event":"tool_finished"}"#.to_vec(),
             "state_outside_session",

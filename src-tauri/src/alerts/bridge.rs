@@ -77,7 +77,7 @@
 mod reason;
 
 use super::{Notice, Offer, Origin};
-pub use reason::Reason;
+pub use reason::{is_invisible_or_reordering, printable, Reason};
 #[cfg(unix)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1090,6 +1090,15 @@ pub fn parse_report_stamped(bytes: &[u8]) -> Result<(Notice, Option<u64>), Reaso
         ),
     };
     let text = |key: &str| -> Option<&str> { object.get(key).and_then(serde_json::Value::as_str) };
+    // An optional text field is absent (or null) or it is a string. Anything
+    // else is refused: reading a number as "no session" or "no message" would
+    // quietly turn a malformed report into a different, valid one.
+    let optional_text = |key: &str| -> Result<Option<&str>, Reason> {
+        match object.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(value) => value.as_str().map(Some).ok_or(Reason::MalformedField),
+        }
+    };
 
     let event = event(text("event").ok_or(Reason::NoEvent)?).ok_or(Reason::UnknownEvent)?;
     // Which tool call a permission or a tool result is about, as a digest the
@@ -1110,7 +1119,14 @@ pub fn parse_report_stamped(bytes: &[u8]) -> Result<(Notice, Option<u64>), Reaso
         None | Some(serde_json::Value::Null) => false,
         Some(value) => value.as_bool().ok_or(Reason::MalformedSubagent)?,
     };
-    let agent = text("agent").unwrap_or("claude");
+    // An `agent` that is not a string is not a known name either.
+    let agent = match object.get("agent") {
+        None | Some(serde_json::Value::Null) => "claude",
+        Some(value) => value.as_str().ok_or(Reason::UnknownAgent)?,
+    };
+    let session_text = optional_text("session")?;
+    let cwd_text = optional_text("cwd")?;
+    let message_text = optional_text("message")?;
     let label = AGENTS
         .iter()
         .find(|(name, _)| *name == agent)
@@ -1119,7 +1135,7 @@ pub fn parse_report_stamped(bytes: &[u8]) -> Result<(Notice, Option<u64>), Reaso
     // A state or a resolution is about a session GitPulse can show. With no
     // GitPulse session there is nothing for it to change, and accepting it
     // would only spend the rate limit.
-    let session_named = text("session").is_some_and(valid_key);
+    let session_named = session_text.is_some_and(valid_key);
     if event.role != Role::Banner && !session_named {
         return Err(Reason::StateOutsideSession);
     }
@@ -1127,8 +1143,8 @@ pub fn parse_report_stamped(bytes: &[u8]) -> Result<(Notice, Option<u64>), Reaso
     // The GitPulse PTY this hook is running under, when it is running under
     // one. Keying to it is what lets "you are looking at this tab" suppress
     // the banner, and what makes a later report replace the earlier one.
-    let session = text("session").filter(|s| valid_key(s));
-    let place = text("cwd")
+    let session = session_text.filter(|s| valid_key(s));
+    let place = cwd_text
         .filter(|cwd| cwd.len() <= 4096)
         .and_then(|cwd| {
             std::path::Path::new(cwd)
@@ -1137,7 +1153,7 @@ pub fn parse_report_stamped(bytes: &[u8]) -> Result<(Notice, Option<u64>), Reaso
         })
         .map(|name| super::scan::sanitize(&name))
         .filter(|name| !name.is_empty());
-    let detail = text("message")
+    let detail = message_text
         .map(super::scan::sanitize)
         .filter(|m| !m.is_empty());
 

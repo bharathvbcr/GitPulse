@@ -9,14 +9,23 @@
 //!
 //! Three rules live here and nowhere else:
 //!
-//! * **Bells are the cheap class.** A bare bell restates "something happened"
-//!   and the worker coalesces it anyway, so it is coalesced here first (one
-//!   queued bell per session and content) and may only ever occupy
-//!   [`BELL_SLOTS`] of the queue. The rest is reserved for hook reports and the
-//!   renderer's answers, which say something a bell cannot. Without the
-//!   reservation, one program writing `BEL` in a loop fills the queue and every
-//!   report from every other session is refused.
-//! * **Hook reports are ordered** by a stamp (see [`OrderBook`]).
+//! * **Queue classes.** The queue holds [`QUEUE`] notices, split by what a
+//!   flood of each would cost:
+//!   - *bells* (a bare `BEL`, which restates "something happened") may occupy
+//!     [`BELL_SLOTS`] between them, one per session and content;
+//!   - *answers* (the renderer's "the user typed", one per keystroke, of which
+//!     only the latest per session matters) may occupy [`ANSWER_SLOTS`], one
+//!     per session;
+//!   - *everything else*, which is hook reports and a PTY's own exit, may use
+//!     any slot the other two are not holding, and [`RESERVED_SLOTS`] are
+//!     theirs alone: no bell or answer flood can take them.
+//!
+//!   Bells and answers are coalesced here, at the producer, before they cost a
+//!   slot, and the worker releases each as it takes it off the queue
+//!   ([`LowGate`]). The bounds add up to the queue exactly (checked below).
+//! * **Hook reports are ordered** by a stamp (see [`OrderBook`]), and every
+//!   `session_ended` from any producer goes through that one place, so the end
+//!   of a session leaves one tombstone however it was reported.
 //! * **A refusal is counted** in `dropped_queue` or `stale`, so offered and
 //!   accounted-for still reconcile.
 
@@ -27,25 +36,30 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc, Mutex};
 
-/// Queue slots no bell may take, kept for hook reports and answers.
-pub(super) const RESERVED_SLOTS: usize = 16;
-
 /// Queue slots bells may occupy between them.
-pub(super) const BELL_SLOTS: usize = QUEUE - RESERVED_SLOTS;
+pub(super) const BELL_SLOTS: usize = 32;
+
+/// Queue slots answers may occupy between them.
+pub(super) const ANSWER_SLOTS: usize = 16;
+
+/// Queue slots no bell or answer may take, kept for hook reports.
+pub(super) const RESERVED_SLOTS: usize = QUEUE - BELL_SLOTS - ANSWER_SLOTS;
+
+const _: () = assert!(RESERVED_SLOTS >= 16, "the hook reserve shrank");
 
 /// What became of a notice offered to the worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Offer {
     /// Queued for the worker.
     Accepted,
-    /// Folded into an identical bell already queued for the session.
+    /// Folded into an identical bell or answer already queued for the session.
     Coalesced,
     /// Older than a report already applied for its session; dropped, counted
     /// as `stale`.
     Stale,
     /// No room in the queue; dropped, counted as `dropped_queue`.
     QueueFull,
-    /// No worker has been started.
+    /// There is no worker to take it: none was started, or it is gone.
     NotRunning,
 }
 
@@ -57,33 +71,46 @@ impl Offer {
     }
 }
 
-/// A bell's identity for coalescing: the session, the convention that carried
-/// it and what it said. Two bells that differ in any of these are different
-/// requests, and folding one into the other would lose the newer words.
-type BellKey = (String, &'static str, Option<String>);
-
-fn bell_key(notice: &Notice) -> BellKey {
-    (notice.key.clone(), notice.channel, notice.detail.clone())
+/// What a low-class notice is coalesced on. A bell is its session, the
+/// convention that carried it and what it said (two that differ in any are
+/// different requests, and folding one into the other would lose the newer
+/// words); an answer is its session alone, because it says nothing else.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Low {
+    Bell(String, &'static str, Option<String>),
+    Answer(String),
 }
 
-/// The bells currently in the queue, shared by the producers (which add) and
-/// the worker (which removes one as it takes it off the queue).
+fn low(notice: &Notice) -> Option<Low> {
+    if notice.is_bare_signal() {
+        return Some(Low::Bell(
+            notice.key.clone(),
+            notice.channel,
+            notice.detail.clone(),
+        ));
+    }
+    (notice.origin == super::Origin::Reader && notice.event == Some("prompt_submitted"))
+        .then(|| Low::Answer(notice.key.clone()))
+}
+
+/// The bells and answers currently in the queue, shared by the producers
+/// (which add) and the worker (which removes one as it takes it off the
+/// queue).
 #[derive(Default)]
-pub(super) struct BellGate {
-    queued: Mutex<HashSet<BellKey>>,
+pub(super) struct LowGate {
+    queued: Mutex<HashSet<Low>>,
 }
 
-impl BellGate {
+impl LowGate {
     /// The worker has taken `notice` off the queue. A no-op for anything that
-    /// was not a bell.
+    /// was not a bell or an answer.
     pub(super) fn release(&self, notice: &Notice) {
-        if !notice.is_bare_signal() {
-            return;
+        if let Some(low) = low(notice) {
+            self.queued
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&low);
         }
-        self.queued
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&bell_key(notice));
     }
 }
 
@@ -169,7 +196,7 @@ impl OrderBook {
 pub(super) struct Intake {
     sender: mpsc::SyncSender<Notice>,
     counters: Arc<Counters>,
-    bells: Arc<BellGate>,
+    low: Arc<LowGate>,
     /// Held across the check, the high-water update and the hand-off to the
     /// queue, so no report with a lower stamp can slip in between a higher one
     /// being admitted and queued.
@@ -184,7 +211,7 @@ impl Intake {
         let intake = Self {
             sender,
             counters,
-            bells: Arc::default(),
+            low: Arc::default(),
             #[cfg(unix)]
             order: Mutex::default(),
         };
@@ -192,47 +219,71 @@ impl Intake {
     }
 
     /// What the worker calls as it takes a bell off the queue.
-    pub(super) fn bells(&self) -> Arc<BellGate> {
-        self.bells.clone()
+    pub(super) fn bells(&self) -> Arc<LowGate> {
+        self.low.clone()
     }
 
     /// Offers a notice without ever blocking the caller.
     pub(super) fn offer(&self, notice: Notice) -> Offer {
-        if notice.is_bare_signal() {
-            return self.offer_bell(notice);
+        // The end of a session, from whoever reports it (the hook, or the PTY
+        // exiting), is ordered by the one book, stamped now when it carries no
+        // stamp of its own: any report from before it is then stale.
+        #[cfg(unix)]
+        if notice.event == Some("session_ended") {
+            return self.offer_stamped(notice, super::bridge::order_stamp_ns());
         }
-        self.enqueue(notice)
+        match low(&notice) {
+            Some(low) => self.offer_low(low, notice),
+            None => self.enqueue(notice),
+        }
     }
 
     fn enqueue(&self, notice: Notice) -> Offer {
-        if self.sender.try_send(notice).is_err() {
-            self.counters.dropped_queue.fetch_add(1, Ordering::Relaxed);
-            return Offer::QueueFull;
+        match self.sender.try_send(notice) {
+            Ok(()) => Offer::Accepted,
+            Err(refused) => {
+                self.counters.dropped_queue.fetch_add(1, Ordering::Relaxed);
+                match refused {
+                    mpsc::TrySendError::Full(_) => Offer::QueueFull,
+                    mpsc::TrySendError::Disconnected(_) => Offer::NotRunning,
+                }
+            }
         }
-        Offer::Accepted
     }
 
-    fn offer_bell(&self, notice: Notice) -> Offer {
-        let key = bell_key(&notice);
+    fn offer_low(&self, low: Low, notice: Notice) -> Offer {
+        let (is_bell, cap) = match low {
+            Low::Bell(..) => (true, BELL_SLOTS),
+            Low::Answer(_) => (false, ANSWER_SLOTS),
+        };
         let mut queued = self
-            .bells
+            .low
             .queued
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if queued.contains(&key) {
-            self.counters.coalesced.fetch_add(1, Ordering::Relaxed);
+        if queued.contains(&low) {
+            // A bell has an outcome of its own (a banner, or a count), so a
+            // folded one is counted. An answer, like any resolution, has none
+            // unless it is refused, so a folded one is not.
+            if is_bell {
+                self.counters.coalesced.fetch_add(1, Ordering::Relaxed);
+            }
             return Offer::Coalesced;
         }
-        if queued.len() >= BELL_SLOTS {
+        let held = queued
+            .iter()
+            .filter(|other| matches!(other, Low::Bell(..)) == is_bell)
+            .count();
+        if held >= cap {
             self.counters.dropped_queue.fetch_add(1, Ordering::Relaxed);
             return Offer::QueueFull;
         }
         // Recorded before the send, under the lock the worker's `release` also
         // takes, so a worker that dequeues it at once finds it recorded.
-        queued.insert(key.clone());
+        queued.insert(low.clone());
         let offer = self.enqueue(notice);
         if offer != Offer::Accepted {
-            queued.remove(&key);
+            queued.remove(&low);
         }
         offer
     }

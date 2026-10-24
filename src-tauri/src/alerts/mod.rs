@@ -31,7 +31,7 @@ pub mod policy;
 pub mod scan;
 
 pub use intake::Offer;
-use intake::{BellGate, Intake};
+use intake::{Intake, LowGate};
 #[cfg(all(unix, test))]
 pub(crate) use intake::{OrderBook, ORDER_BOOK_CAP};
 use policy::Verdict;
@@ -796,7 +796,7 @@ impl Bucket {
 
 fn run(
     receiver: mpsc::Receiver<Notice>,
-    bells: Arc<BellGate>,
+    bells: Arc<LowGate>,
     host: Arc<dyn Host>,
     counters: Arc<Counters>,
     last_error: Arc<Mutex<Option<String>>>,

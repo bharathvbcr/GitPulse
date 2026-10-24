@@ -397,8 +397,8 @@ fn order_stamp(n: u64) -> u64 {
 }
 
 /// With nothing draining, the queue is exactly full: bells from many sessions
-/// take [`BELL_SLOTS`] and no more, and a hook report still has the
-/// [`RESERVED_SLOTS`] that remain, every one.
+/// take [`BELL_SLOTS`] and no more, and a hook report still has every slot
+/// they leave, which includes the reserve.
 #[test]
 fn bells_leave_the_reserved_slots_to_hook_reports() {
     let counters = Arc::new(Counters::default());
@@ -419,7 +419,7 @@ fn bells_leave_the_reserved_slots_to_hook_reports() {
         counters.dropped_queue.load(Ordering::Relaxed),
         (500 - intake::BELL_SLOTS) as u64
     );
-    for n in 0..intake::RESERVED_SLOTS {
+    for n in 0..QUEUE - intake::BELL_SLOTS {
         let (notice, _) = report("agent_completed", &format!("term-r-{n}"), None);
         assert_eq!(
             intake.offer_stamped(notice, order_stamp(n as u64)),
@@ -438,8 +438,9 @@ fn bells_leave_the_reserved_slots_to_hook_reports() {
     drop(receiver);
 }
 
-/// The renderer's answer is in the reserved class too, and `answered()` says
-/// false rather than true when the queue could not take it.
+/// The renderer's answers have their own bound ([`ANSWER_SLOTS`], one per
+/// session): the next session's answer is refused, and that is `taken() ==
+/// false`, which is what makes `answered()` say so.
 #[test]
 fn an_answer_the_queue_cannot_take_is_not_reported_as_answered() {
     let counters = Arc::new(Counters::default());
@@ -450,11 +451,17 @@ fn an_answer_the_queue_cannot_take_is_not_reported_as_answered() {
         event: Some("prompt_submitted"),
         ..bell("term-1")
     };
-    for _ in 0..QUEUE {
-        assert!(intake.offer(answer()).taken());
+    let of = |n: usize| Notice {
+        key: format!("term-{n}"),
+        ..answer()
+    };
+    for n in 0..intake::ANSWER_SLOTS {
+        assert_eq!(intake.offer(of(n)), Offer::Accepted);
     }
-    assert_eq!(intake.offer(answer()), Offer::QueueFull);
-    assert!(!intake.offer(answer()).taken());
+    // The same session again is folded, not refused: only its latest matters.
+    assert_eq!(intake.offer(of(0)), Offer::Coalesced);
+    assert_eq!(intake.offer(of(intake::ANSWER_SLOTS)), Offer::QueueFull);
+    assert!(!intake.offer(of(intake::ANSWER_SLOTS)).taken());
     drop(receiver);
 }
 
@@ -493,10 +500,10 @@ fn a_bell_the_worker_has_taken_can_be_rung_again() {
 }
 
 #[test]
-fn a_closed_queue_refuses_like_a_full_one() {
+fn a_closed_queue_says_not_running_not_full() {
     let counters = Arc::new(Counters::default());
     let (intake, receiver) = Intake::channel(counters);
     drop(receiver);
-    // A closed queue refuses like a full one: nobody will take it.
-    assert_eq!(intake.offer(bell("a")), Offer::QueueFull);
+    // Nobody will ever drain it, which is not the same as being full.
+    assert_eq!(intake.offer(bell("a")), Offer::NotRunning);
 }

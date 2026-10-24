@@ -243,5 +243,5 @@ fn a_report_with_every_field_stays_inside_the_field_limit() {
     let fields = json.as_object().unwrap().len();
     assert!(fields <= 10, "{fields} fields: {json}");
     // `seq` is the one that would be added with a started deadline.
-    assert!(fields + 1 <= 12);
+    assert!(fields < 12);
 }

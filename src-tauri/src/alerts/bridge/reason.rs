@@ -32,6 +32,8 @@ pub enum Reason {
     /// `seq` is present and not a positive integer.
     MalformedSeq,
     UnknownAgent,
+    /// `session`, `cwd` or `message` is present and not a string.
+    MalformedField,
     StateOutsideSession,
     /// Older than a report already applied for its session.
     Stale,
@@ -44,7 +46,7 @@ pub enum Reason {
 impl Reason {
     /// Every reason, so a test can prove the tokens are distinct and a caller
     /// can look one up without a second table.
-    pub const ALL: [Reason; 17] = [
+    pub const ALL: [Reason; 18] = [
         Reason::Oversized,
         Reason::Unreadable,
         Reason::AtCapacity,
@@ -58,6 +60,7 @@ impl Reason {
         Reason::MalformedSubagent,
         Reason::MalformedSeq,
         Reason::UnknownAgent,
+        Reason::MalformedField,
         Reason::StateOutsideSession,
         Reason::Stale,
         Reason::QueueFull,
@@ -80,6 +83,7 @@ impl Reason {
             Reason::MalformedSubagent => "malformed_subagent",
             Reason::MalformedSeq => "malformed_seq",
             Reason::UnknownAgent => "unknown_agent",
+            Reason::MalformedField => "malformed_field",
             Reason::StateOutsideSession => "state_outside_session",
             Reason::Stale => "stale",
             Reason::QueueFull => "queue_full",
@@ -109,10 +113,49 @@ impl Reason {
             Reason::MalformedSubagent => "malformed subagent",
             Reason::MalformedSeq => "malformed seq",
             Reason::UnknownAgent => "unknown agent",
+            Reason::MalformedField => "malformed field",
             Reason::StateOutsideSession => "state report outside a session",
             Reason::Stale => "older than a report already applied for the session",
             Reason::QueueFull => "the notification queue is full",
             Reason::NotRunning => "the notification worker is not running",
         }
     }
+}
+
+/// Whether `c` could change what a terminal or a reader sees of the text around
+/// it without being visible itself: a control character (C0, DEL, C1),
+/// whitespace of any kind (a newline starts a new line), the line and paragraph
+/// separators, and the format characters (Unicode `Cf`) that reorder text or
+/// hide it: bidirectional marks, embeddings, overrides and isolates,
+/// zero-width space, joiners and the word joiner, the byte-order mark, the
+/// soft hyphen, the Arabic letter mark, the Mongolian vowel separator,
+/// interlinear annotation anchors and the tag block.
+///
+/// Rust's standard library has no `Cf` predicate, so this is the list, kept
+/// here because this is the one place text from a peer is made fit to print.
+/// Anything printing text a peer sent should filter it with [`printable`].
+pub fn is_invisible_or_reordering(c: char) -> bool {
+    c.is_control()
+        || c.is_whitespace()
+        || matches!(
+            c,
+            '\u{ad}'
+                | '\u{61c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{feff}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{e0000}'..='\u{e007f}'
+        )
+}
+
+/// `text` as something safe to print on one line: every character that
+/// [`is_invisible_or_reordering`] removed, and cut to `max` characters.
+pub fn printable(text: &str, max: usize) -> String {
+    text.chars()
+        .filter(|c| !is_invisible_or_reordering(*c))
+        .take(max)
+        .collect()
 }
