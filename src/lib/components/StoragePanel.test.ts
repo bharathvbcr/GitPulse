@@ -88,6 +88,7 @@ describe("StoragePanel source contracts & async hygiene", () => {
     expect(source).toContain("partial scan");
     expect(source).toContain("Scan hit a safety budget or skipped unreadable locations; totals are floors.");
     expect(source).toContain("report.scan.unreadable > 0");
+    expect(source).toContain("report.scan.unaudited > 0");
     expect(source).toContain("failed to read and are not counted");
   });
 });

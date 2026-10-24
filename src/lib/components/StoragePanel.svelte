@@ -800,10 +800,11 @@
             </div>
           </div>
         {/if}
-        {#if report.scan.permission_denied > 0 || report.scan.unreadable > 0 || report.scan.non_utf8 > 0 || report.scan.truncated}
+        {#if report.scan.permission_denied > 0 || report.scan.unreadable > 0 || report.scan.unaudited > 0 || report.scan.non_utf8 > 0 || report.scan.truncated}
           <p class="text-[11px] text-amber-300">
             {report.scan.permission_denied > 0 ? `${report.scan.permission_denied} location(s) unreadable. ` : ""}
             {report.scan.unreadable > 0 ? `${report.scan.unreadable} location(s) failed to read and are not counted. ` : ""}
+            {report.scan.unaudited > 0 ? `${report.scan.unaudited} item(s) were beyond an audit cap and not examined. ` : ""}
             {report.scan.non_utf8 > 0 ? `${report.scan.non_utf8} name(s) are not valid UTF-8 (measured, shown approximately). ` : ""}
             {report.scan.truncated ? "Scan hit a safety budget or skipped unreadable locations; totals are floors." : ""}
           </p>

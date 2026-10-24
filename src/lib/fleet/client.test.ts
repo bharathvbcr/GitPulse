@@ -141,7 +141,7 @@ describe("metricsFromStorage", () => {
         build_artifacts_bytes: 30,
         cache_artifacts_bytes: 20,
       },
-      scan: { elapsed_ms: 5, files_visited: 9, permission_denied: 0, unreadable: 0, non_utf8: 0, truncated: false },
+      scan: { elapsed_ms: 5, files_visited: 9, permission_denied: 0, unreadable: 0, non_utf8: 0, unaudited: 0, truncated: false },
       ...overrides,
     }) as never;
 
@@ -156,7 +156,7 @@ describe("metricsFromStorage", () => {
 
   it("carries a truncated walk through as a floor", () => {
     const metrics = metricsFromStorage(
-      report({ scan: { elapsed_ms: 5, files_visited: 9, permission_denied: 0, unreadable: 0, non_utf8: 0, truncated: true } }),
+      report({ scan: { elapsed_ms: 5, files_visited: 9, permission_denied: 0, unreadable: 0, non_utf8: 0, unaudited: 0, truncated: true } }),
     );
     expect(metrics.storage_truncated).toBe(true);
   });
@@ -280,7 +280,7 @@ describe("the IPC seam", () => {
           build_artifacts_bytes: 0,
           cache_artifacts_bytes: 0,
         },
-        scan: { elapsed_ms: 0, files_visited: 0, permission_denied: 0, unreadable: 0, non_utf8: 0, truncated: false },
+        scan: { elapsed_ms: 0, files_visited: 0, permission_denied: 0, unreadable: 0, non_utf8: 0, unaudited: 0, truncated: false },
       },
       cmd_scan_deps_health: {
         audit: { info: 0, low: 0, moderate: 0, high: 0, critical: 0, total: 0 },

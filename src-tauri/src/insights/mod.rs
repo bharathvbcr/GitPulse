@@ -9,9 +9,9 @@ mod collision_memo;
 mod entity_collision;
 #[cfg(test)]
 mod head_divergence_tests;
+pub(crate) mod live_sessions;
 #[cfg(test)]
 mod mcp_info_adversarial;
-pub(crate) mod live_sessions;
 #[cfg(test)]
 mod merge_adv_tests;
 pub mod merge_conflicts;
@@ -2652,7 +2652,13 @@ pub fn mcp_info() -> McpInfo {
             };
             let manifest = read(".codex-plugin/plugin.json");
             let mcp_template = read(".mcp.json");
-            let hooks_template = read("hooks/hooks.json");
+            // The resolver does not require the hooks manifest, so its absence
+            // is no error; a file that is there and cannot be read or parsed is.
+            let hooks_path = root.join("hooks/hooks.json");
+            let hooks_template = match std::fs::metadata(&hooks_path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                _ => Some(read("hooks/hooks.json")),
+            };
             // What Settings copies is the command that will run, so it is built
             // from the path just resolved. Nothing is offered for a binary that
             // was not found: a copy naming a bare command is the bug. The
@@ -2673,17 +2679,20 @@ pub fn mcp_info() -> McpInfo {
                 ),
                 mcp.found,
             );
-            let hooks_config = check(
-                hooks_config_with(
-                    &hooks_template,
-                    if hook.found {
-                        &hook.path
-                    } else {
-                        "gitpulse-hook"
-                    },
+            let hooks_config = match &hooks_template {
+                Some(template) => check(
+                    hooks_config_with(
+                        template,
+                        if hook.found {
+                            &hook.path
+                        } else {
+                            "gitpulse-hook"
+                        },
+                    ),
+                    hook.found,
                 ),
-                hook.found,
-            );
+                None => String::new(),
+            };
             if let Some(error) = first_error {
                 plugin_error = error;
             }
@@ -4821,9 +4830,11 @@ mod tests {
         );
         drop(_env);
 
-        // A missing hooks manifest is a read error, not an empty file.
+        // A hooks manifest that is there but cannot be read is a read error,
+        // not an empty file.
         let package = plugin_package(r#"{"mcpServers":{"gitpulse":{}}}"#, "{}");
         fs::remove_file(package.path().join("hooks/hooks.json")).unwrap();
+        fs::create_dir(package.path().join("hooks/hooks.json")).unwrap();
         let _env = crate::test_support::env::bind_env(&serial)
             .set("GITPULSE_PLUGIN_ROOT", package.path().to_str().unwrap())
             .set("GITPULSE_MCP_PATH", exe.to_str().unwrap())
