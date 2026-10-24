@@ -407,3 +407,64 @@ The drift fixes are in 68ef1882. Re-run on that tree: supervised_threads 9/9, do
   - ft-92734a91 and ft-b595921a, which are owner decisions;
   - the terminal-side cards;
   - ft-cc4be67b, which needs a quiet host.
+
+---
+
+# Wave 7 (2026-10-24): the hook-report path
+
+**State.**
+- **Merged:** three lanes in sequence, each fast-forwarded after a full gate:
+  - W7-L1 → `3944fb16` (gate 13);
+  - W7-L2 → `6446002e` (gate 14);
+  - W7-L3 → `46b40ea7` (gate 16).
+- All three change the agent hook bridge (`alerts/bridge.rs`, `alerts/mod.rs`, the new `alerts/intake.rs`), so they ran one at a time, each on top of the last.
+- Nothing is pushed. The reinstall is still held until Jarvis is re-pinned.
+
+**Coordinator rulings (Fable authority):**
+- **Ordering is kept by dropping, never by waiting.** Every report carries one order stamp from a system-wide monotonic clock: the hook's entry stamp, capped at the accept stamp. A report older than its session's newest is dropped and counted `stale`. A silent connection never delays another.
+- **A superseded report is delivered.** It is `{"ok":false,"reason":"stale"}` on the wire, and Ok in the hook, with no warning.
+- **Two identical reports inside the 500 ms twin window** may fold. The state after both equals the state after one, and the fold is counted.
+- **`src-tauri/Cargo.toml` is held.** Benchmarks are ignored integration tests run with `--release --ignored`. The `[[bench]]` registration waits in the term/integrate handoff.
+
+## Cards moved to review
+
+| Card | What landed | Adversarial history |
+|---|---|---|
+| **ft-bdb253cf** half 2: hook bridge accept loop | Accept errors are classified. Transient errors back off, 10 ms doubling to 1 s, and keep the socket. Fatal errors rebind up to 3 times, then report `listening:false` with the cause. Each connection is read on its own supervisor worker, at most 100 open, and the 101st is refused unread. The per-connection ceiling is 1.2 s, under the hook's 1.5 s budget. Accept stamps and a per-session order book restore arrival order. | Round 1 BROKE ordering: same-session reports reversed 11–27 per 200 on the lane, 0 of 600 on base. It also broke two backoff status bugs. All fixed; the order tests pass 200/200 per shape. Held: slot leaks (8 threads × 300 connections of mixed churn), rebind against stop (80 rounds), an EMFILE storm (9 accepts in 3 s; a planted spin fails at 4000). |
+| **ft-9cfd5474** hook-report protocol honesty | An optional `seq` in v1, capped at accept. One owner, `alerts/intake.rs`: the order book, bounded tombstones for every `session_ended` (PTY exit included), and typed `Offer` results. Queue class caps: bells 32 and answers 16, both coalesced per session, leaving 16 reserved for hook reports. Closed-set refusal `reason` plus `max_v`. The hook prints reasons through a bidi- and zero-width-safe filter. Clipping is by serialized size. | 20 adversarial tests, 5 BROKE and all fixed: PTY exit left no tombstone, answers could starve hook reports, a dead worker read as "queue full", a wrong-typed `agent` was accepted, and bidi characters reached hook stderr. Held: wire compatibility both ways, a forged `seq` capped, 10k-session eviction, counters reconcile, 400 clip cases. |
+| **ft-9cfd5174** notify hook coverage | Six report-only notify events are injected into every GitPulse-launched claude through the existing `--settings` seam. Plugin and injected twins fold at intake, over the last 8 queued reports per session, keyed by the whole `Notice`. A twin never moves the high-water mark. notify quiet-exits before reading stdin when it has nothing to say. It extracts only its fields, with accept/reject identical to the old path. A 5 MiB `tool_response` still reports. Run budgets are per event, from the injected timeout (SessionEnd 1 s, so it never raises Claude Code's exit budget). | 6 BROKE and all fixed: interleaved parallel twins, `subagent` missing from the key, a refused report remembered, a late twin making a real report stale, the reader more lenient than before, and the read budget equal to the host timeout. Held: no second PreToolUse decision path, and every injected event name is valid in the current Claude Code hooks docs. Cost: an injected hook is 6.6 / 11.2 ms (min / median), async, and does not block the agent. |
+
+## Benchmarks (committed, min-of-N)
+
+- **`tests/alerts_worker_throughput.rs`:** 449k hook state reports/s and 545k renderer answers/s, N=9, release. There is no main baseline, because this path did not exist before.
+- **`tests/notify_stdin_bench.rs`:** A (base) → B, release, 9×20.
+  - Outside a session, 4 MiB: 7.40 → 5.79 ms.
+  - Inside a session, 4 MiB: 9.03 → 8.99 ms. This is within noise, so no win is claimed.
+  - 0 B and 100 KiB: no difference.
+
+## Gates (verified)
+
+- **Gate 13:**
+  - cargo had 2 failures. supervised_threads was real: the adversary's test files were not named `*_tests.rs`, and a drift fix renamed them. assemble_tests was a load flake.
+  - Everything else was green.
+- **Gate 14:**
+  - cargo had 1 failure, `assemble_tests::slow_command…`, which also failed in gate 13. A concurrent global `performance::flush` wrote an "unfinished at exit" line while the test's 1.1 s call was running (`oldest_ms=982`), and the loose selector picked it.
+  - The drift fix selects the completion record (`outcome=`). It did not reproduce in isolation (0/12), so the fix rests on the log evidence.
+- **Gate 15** (first W7-L3 candidate): cargo fully green (134 suites); vitest failed 2 in `scripts/plugin-contract.test.ts`, which reads the hook budget out of the Rust source and could not parse the new per-event budget. Fixed by plain per-class budget constants (`NOTIFY_BUDGET`, `SESSION_END_NOTIFY_BUDGET`) that both the Rust test and the contract read. Lanes now run full vitest when touching hooks, IPC or plugin files.
+- **Gate 16** (`46b40ea7`): fully green. fmt, clippy, cargo `--tests --no-fail-fast` (134 suites, 0 failures), bun check, check:types, check:ipc, check:vendor-schema, vitest (10855 passed, 0 failed).
+- **Throughout:** vitest 10855 passed, 0 failed. `check:schema-parity` shows only the expected stale installed rows (gitpulse-mcp and the app at dc-store 9, the Jarvis pin) and devmap's missing extraction schema.
+
+## Still open
+
+- **Hook-less bell opt-in (ft-9cfd5174 S1-07):** the count is `asksForReader` in `sessionActivity.ts`, but the opt-in setting can only live in held settings files. It is in the term/integrate handoff.
+- **`stale` stays off the wire** until the held `sessionAlertsStore.ts` is free.
+- **The plugin's own `hooks.json` SessionEnd entry has `timeout: 5`.** That raises Claude Code's exit budget to 5 s for plugin sessions. The hook ends within 1 s, but the host still waits up to 5 s if it hangs. Lowering it to 1 is a one-line plugin change to make with a plugin-contract test.
+- **Cursor hooks.json loading is unverified;** its docs do not state the path or format. Codex is verified (it loads from the plugin root after a trust step).
+- **ft-d1c290f1 (outbound data controls)** is blocked on two owner decisions: private registries, and consent for the AI endpoint.
+- **Carried:**
+  - the reinstall;
+  - the term/integrate handoff;
+  - the Manvi half of ft-329789a9;
+  - ft-92734a91 and ft-b595921a (owner decisions);
+  - ft-cc4be67b (needs a quiet host);
+  - 21 integration suites without the unmetered spawn call.
