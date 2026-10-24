@@ -2518,6 +2518,8 @@ fn truncate_marked(mut text: String, limit: usize) -> String {
 }
 
 #[cfg(test)]
+mod hidden_channel_tests;
+#[cfg(test)]
 mod notify_adv_tests;
 #[cfg(test)]
 mod notify_input_attack_tests;

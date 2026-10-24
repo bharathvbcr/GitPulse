@@ -1200,4 +1200,6 @@ mod stress;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod sanitize_parity_tests;
+#[cfg(test)]
 mod text_tests;
