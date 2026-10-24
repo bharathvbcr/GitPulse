@@ -2079,4 +2079,7 @@ mod tests {
             assert!(report(&format!(r#"{{"v":1,"event":"{}"}}"#, event.name)).is_ok());
         }
     }
+
+    #[cfg(unix)]
+    mod order;
 }
