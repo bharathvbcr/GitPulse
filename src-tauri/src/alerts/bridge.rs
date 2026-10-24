@@ -1737,8 +1737,9 @@ mod tests {
                     // may be refused by the shared `hook-…` rate bucket that
                     // other tests in the process also draw on. Any `{"ok":…}`
                     // reply is a loop answering.
-                    serde_json::from_str::<serde_json::Value>(reply.trim())
-                        .is_ok_and(|value| value.get("ok").is_some_and(serde_json::Value::is_boolean))
+                    serde_json::from_str::<serde_json::Value>(reply.trim()).is_ok_and(|value| {
+                        value.get("ok").is_some_and(serde_json::Value::is_boolean)
+                    })
                 });
             let consistent = settled
                 && if listening {
