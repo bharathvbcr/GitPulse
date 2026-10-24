@@ -92,31 +92,16 @@ pub fn identify(base_url: &str) -> EndpointIdentity {
     }
 }
 
-/// `text` as safe to show a person: control, bidi, zero-width and line/paragraph
-/// separator characters removed, and at most `max_chars` characters, cut with an
-/// ellipsis. Used on names a listener chose. (W8-L1's shared sanitizer is not in
-/// main yet; swap this for it when it lands.)
+/// `text` as safe to show a person, by the shared sanitizer's table
+/// (`alerts::text::printable`: hidden characters and separators removed), and
+/// at most `max_chars` characters, cut with an ellipsis. Used on names a
+/// listener chose.
 pub fn display_safe(text: &str, max_chars: usize) -> String {
-    let kept: Vec<char> = text
-        .chars()
-        .filter(|c| {
-            !c.is_control()
-                && !matches!(
-                    *c,
-                    '\u{200b}'..='\u{200f}'
-                        | '\u{202a}'..='\u{202e}'
-                        | '\u{2028}'..='\u{2029}'
-                        | '\u{2060}'..='\u{2064}'
-                        | '\u{2066}'..='\u{2069}'
-                        | '\u{061c}'
-                        | '\u{feff}'
-                )
-        })
-        .collect();
-    if kept.len() <= max_chars {
-        return kept.into_iter().collect();
+    let cleaned = crate::alerts::text::printable(text, max_chars.saturating_add(1));
+    if cleaned.chars().count() <= max_chars {
+        return cleaned;
     }
-    let mut cut: String = kept.into_iter().take(max_chars).collect();
+    let mut cut: String = cleaned.chars().take(max_chars).collect();
     cut.push('\u{2026}');
     cut
 }

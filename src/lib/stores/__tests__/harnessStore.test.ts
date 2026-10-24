@@ -1068,7 +1068,7 @@ describe("AI endpoint consent, shared and stale", () => {
   });
 
   it("promptSafe strips controls, bidi and zero-width characters and bounds the length", () => {
-    expect(promptSafe("a\nb‮c​d⁦e\u0000f")).toBe("abcdef");
+    expect(promptSafe("a\nb‮c​d⁦e\u0000f")).toBe("a bcde f");
     const long = promptSafe("m".repeat(1_000_000));
     expect(Array.from(long)).toHaveLength(121);
     expect(long.endsWith("…")).toBe(true);

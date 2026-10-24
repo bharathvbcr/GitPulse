@@ -1,6 +1,7 @@
 import { writable, get } from "svelte/store";
 import { invoke, readIpcError } from "../ipc/invoke";
 import { askConfirm, type ConfirmPromptOptions } from "./modalStore";
+import { clean } from "../terminal/sessionActivity";
 import { formatDiagnosticFailure } from "../diagnostics/diagnostics";
 import { mergeEvents } from "../ledger/projection";
 import {
@@ -350,20 +351,15 @@ export interface UnconfirmedEndpoint {
 const MAX_PROMPT_NAME = 120;
 
 /**
- * Text from a listener nobody vetted, made safe to show: control, bidi,
- * zero-width and line/paragraph separator characters removed, and bounded.
- * (W8-L1's shared `clean()` is not in main yet; swap it in when it lands.)
+ * Text from a listener nobody vetted, made safe to show: the shared `clean()`
+ * (hidden characters dropped, controls collapsed), bounded with an ellipsis.
  */
 export function promptSafe(text: string): string {
-  const kept = Array.from(text).filter(
-    (ch) =>
-      !/[\p{Cc}\u200B-\u200F\u202A-\u202E\u2028\u2029\u2060-\u2064\u2066-\u2069\u061C\uFEFF]/u.test(
-        ch,
-      ),
-  );
-  return kept.length <= MAX_PROMPT_NAME
-    ? kept.join("")
-    : `${kept.slice(0, MAX_PROMPT_NAME).join("")}\u2026`;
+  const cleaned = clean(text, MAX_PROMPT_NAME + 1) ?? "";
+  const chars = Array.from(cleaned);
+  return chars.length <= MAX_PROMPT_NAME
+    ? cleaned
+    : `${chars.slice(0, MAX_PROMPT_NAME).join("")}\u2026`;
 }
 
 /**
