@@ -39,6 +39,7 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ("engine/git_writer.rs", 2, "both slice a Vec: `lines[lines.len().saturating_sub(20)..]` (Vec<&str>) and `prefix[1..prefix.len() - 1]` (Vec<String>)"),
     ("secrets/report.rs", 1, "slice of a Vec<&str> (`parts`), not a str"),
     ("terminal/ring.rs", 1, "slice of a `&[u8]` ring chunk, not a str"),
+    ("storage/mod.rs", 1, "slice of a Vec<Component> (`parts`), not a str"),
 ];
 
 /// file (relative to `vendored/`) -> (matches, "upstream DevCouncil" verdict).
