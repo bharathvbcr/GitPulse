@@ -6,6 +6,8 @@
 //! and asks for the environment lock. This lints the one place the order can
 //! be seen: within a single function, retention() must not follow an env lock.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -24,17 +26,30 @@ fn takes_env_lock(line: &str) -> bool {
     if code.starts_with("//") || code.starts_with("use ") {
         return false;
     }
-    ["env_serial()", "bind_env_owned(", "bind_env(", "UseStore::file(", "BackupStore::new("]
-        .iter()
-        .any(|needle| code.contains(needle))
+    [
+        "env_serial()",
+        "bind_env_owned(",
+        "bind_env(",
+        "UseStore::file(",
+        "BackupStore::new(",
+    ]
+    .iter()
+    .any(|needle| code.contains(needle))
         || (code.contains("unhurried(") && !code.contains("fn "))
 }
 
 #[test]
 fn retention_is_never_taken_after_the_environment_lock_in_one_function() {
     let mut files = Vec::new();
-    rust_files(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
-    assert!(files.len() > 100, "the walk found only {} files", files.len());
+    rust_files(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
+    );
+    assert!(
+        files.len() > 100,
+        "the walk found only {} files",
+        files.len()
+    );
     let mut inversions = Vec::new();
     let mut retention_calls = 0usize;
     for file in files {
@@ -65,5 +80,9 @@ fn retention_is_never_taken_after_the_environment_lock_in_one_function() {
         }
     }
     assert!(retention_calls > 50, "only {retention_calls} calls seen");
-    assert!(inversions.is_empty(), "lock-order inversions:\n{}", inversions.join("\n"));
+    assert!(
+        inversions.is_empty(),
+        "lock-order inversions:\n{}",
+        inversions.join("\n")
+    );
 }

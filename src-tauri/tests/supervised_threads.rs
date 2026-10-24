@@ -55,15 +55,16 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// A source file compiled only for tests: exactly `tests.rs`, `*_tests.rs`,
-/// and anything named `test_support*` (a file, or a directory above the file).
-/// A bare `ends_with("tests.rs")` would also skip a production `contests.rs`.
+/// exactly `test_support.rs`, and anything under a directory named exactly
+/// `test_support`. A bare `ends_with("tests.rs")` would also skip a production
+/// `contests.rs`, and a prefix match a production `test_supports/pool.rs`.
 fn is_test_file(rel: &str) -> bool {
     let mut parts = rel.rsplit('/');
     let name = parts.next().unwrap_or(rel);
     name == "tests.rs"
         || name.ends_with("_tests.rs")
-        || name.starts_with("test_support")
-        || parts.any(|dir| dir.starts_with("test_support"))
+        || name == "test_support.rs"
+        || parts.any(|dir| dir == "test_support")
         || TEST_ONLY.iter().any(|(file, _)| *file == rel)
 }
 

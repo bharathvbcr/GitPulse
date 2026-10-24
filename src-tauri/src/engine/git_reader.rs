@@ -6764,11 +6764,16 @@ mod tests {
     /// and never leaks to another bound.
     #[test]
     fn a_test_replaces_each_wall_clock_bound_on_its_own_thread_only() {
-        assert_eq!(lang_stats_deadline(), LANG_STATS_DEADLINE);
-        assert_eq!(ownership_deadline(), OWNERSHIP_DEADLINE);
+        // The shipped values, as literals: changing one is a product decision,
+        // not a test edit, and comparing a constant with itself would pass.
+        assert_eq!(LANG_STATS_DEADLINE, Duration::from_secs(10));
+        assert_eq!(OWNERSHIP_DEADLINE, Duration::from_secs(10));
+        assert_eq!(BRANCH_STATS_CALL_BUDGET, Duration::from_secs(5));
+        assert_eq!(lang_stats_deadline(), Duration::from_secs(10));
+        assert_eq!(ownership_deadline(), Duration::from_secs(10));
         assert_eq!(
             deadline_for(Bound::BranchStats, BRANCH_STATS_CALL_BUDGET),
-            BRANCH_STATS_CALL_BUDGET
+            Duration::from_secs(5)
         );
 
         let dir = tempfile::TempDir::new().unwrap();
@@ -7002,6 +7007,11 @@ mod tests {
     /// their own read of the whole tree.
     #[test]
     fn concurrent_language_stats_calls_share_one_scan() {
+        // The test thread holds the locks across spawn and join; the callers
+        // must not take the environment lock themselves, or they would run one
+        // after another and share nothing.
+        let _kept = ref_cache::retention();
+        let _stable_env = crate::test_support::env::env_serial();
         let dir = tempfile::TempDir::new().unwrap();
         churn_repo(dir.path(), 3000);
         let root = dir.path().to_path_buf();
@@ -13802,6 +13812,10 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
     #[test]
     fn adv_sixteen_threads_one_computation_no_torn_answer() {
         let _kept = ref_cache::retention();
+        // The ref stamp reads `$HOME/.gitconfig`, so a neighbour rebinding HOME
+        // mid-run would make a second thread recompute. The test thread holds
+        // the environment lock across spawn and join; the sixteen never take it.
+        let _stable_env = crate::test_support::env::env_serial();
         let dir = init_repo_with_remotes(&["origin"], "main");
         let repo = dir.path().canonicalize().unwrap();
         let expected = compute_default_base(&repo);
@@ -15467,44 +15481,84 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
             let base = default_base(&root).base.unwrap().1;
             eager_unhurried(|| {
                 let stop = std::sync::atomic::AtomicBool::new(false);
-                // Commits the writer has begun publishing to `feat`.
-                let landed = std::sync::atomic::AtomicUsize::new(0);
+                // Every state `feat` has been published in, in order: its tip
+                // and that tip's (ahead, behind), the pure function of the tip
+                // and the fixed base. A state is pushed just before the ref is
+                // moved, so the last entry may be one the ref has not reached.
+                let first = rev_parse(&root, "feat");
+                let published =
+                    std::sync::Mutex::new(vec![(first.clone(), counts_of(&root, &base, &first))]);
+                let states = || published.lock().unwrap().len();
+                let state_of_tip = |tip: &str| {
+                    published
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .position(|(published_tip, _)| published_tip == tip)
+                };
+                let state_of_counts = |counts: (usize, usize)| {
+                    published
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .position(|(_, published_counts)| *published_counts == counts)
+                };
                 std::thread::scope(|s| {
                     let mut readers = Vec::new();
                     for _ in 0..8 {
                         readers.push(s.spawn(|| {
                             let mut n = 0;
+                            // The latest published state the listing has shown
+                            // this reader: the ref only moves forward.
+                            let mut seen = 0usize;
                             while !stop.load(std::sync::atomic::Ordering::Relaxed) || n < 3 {
                                 let listed =
                                     GitReader::list_branches(root.to_str().unwrap()).unwrap();
                                 let tips = tip_counts_against(&root, &base).unwrap();
-                                // git pairs a moving ref's printed oid with counts of the
-                                // oid it re-read (see the ignored raw probe). The re-read
-                                // happens later, so the writer may have moved the ref any
-                                // number of commits on in between: a loaded host stretches
-                                // that gap from one commit to several. The row can be ahead
-                                // of its oid by at most the commits published so far, and
-                                // never behind it; every other row is exact.
-                                let close = |got: (usize, usize), want: (usize, usize)| {
-                                    got == want
-                                        || (got.1 == want.1
-                                            && got.0 > want.0
-                                            && got.0 - want.0
-                                                <= landed.load(std::sync::atomic::Ordering::SeqCst))
-                                };
+                                let published_by_now = states() - 1;
+                                // git pairs a moving ref's printed oid with the
+                                // counts of the oid it re-read (see the ignored raw
+                                // probe), so `feat`'s row is a pair of two published
+                                // states, never a made-up one: its tip is state `i`,
+                                // its counts are state `j`, and the counts are never
+                                // of an older state than the tip (`i <= j`) nor of
+                                // one not yet published (`j <= published_by_now`),
+                                // however far a loaded host let the writer run
+                                // between git's two reads. Every other row is exact.
+                                let mut observe =
+                                    |source: usize, tip: &str, got: (usize, usize)| -> bool {
+                                        let Some(i) = state_of_tip(tip) else {
+                                            return false;
+                                        };
+                                        let j = state_of_counts(got).unwrap_or_else(|| {
+                                            panic!("feat counts {got:?} are of no published state")
+                                        });
+                                        assert!(
+                                            i <= j && j <= published_by_now,
+                                            "torn feat row: tip is state {i}, counts {got:?} are \
+                                         state {j}, {published_by_now} published"
+                                        );
+                                        // Only the branch listing names `feat`; a bare
+                                        // tip row may belong to any ref at that oid.
+                                        if source == 1 {
+                                            assert!(
+                                                i >= seen,
+                                                "feat went back from state {seen} to {i}"
+                                            );
+                                            seen = i;
+                                        }
+                                        true
+                                    };
                                 for (tip, c) in &tips {
-                                    let want = counts_of(&root, &base, tip);
-                                    assert!(
-                                        close(*c, want),
-                                        "mixed tip row {tip}: {c:?} vs {want:?}"
-                                    );
+                                    if !observe(0, tip, *c) {
+                                        let want = counts_of(&root, &base, tip);
+                                        assert_eq!(*c, want, "mixed tip row {tip}");
+                                    }
                                 }
                                 for b in &listed {
-                                    let want = counts_of(&root, &base, &b.tip_commit_id);
                                     let got = (b.commits_ahead_of_base, b.commits_behind_base);
-                                    if b.name == "feat" {
-                                        assert!(close(got, want), "torn feat {got:?} vs {want:?}");
-                                    } else {
+                                    if b.name != "feat" || !observe(1, &b.tip_commit_id, got) {
+                                        let want = counts_of(&root, &base, &b.tip_commit_id);
                                         assert_eq!(got, want, "torn row {}", b.name);
                                     }
                                 }
@@ -15512,10 +15566,11 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
                             }
                         }));
                     }
-                    let mut tip = rev_parse(&root, "feat");
+                    let mut tip = first;
                     for i in 0..25 {
                         tip = mk(&root, &tip, &format!("w{i}"));
-                        landed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let counts = counts_of(&root, &base, &tip);
+                        published.lock().unwrap().push((tip.clone(), counts));
                         git_in(&root, &["update-ref", "refs/heads/feat", &tip]);
                     }
                     stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -15610,8 +15665,8 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
             let mut turn = 0usize;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 let serial = crate::test_support::env::env_serial();
-                let _env = crate::test_support::env::bind_env(&serial)
-                    .set("HOME", homes[turn % 2].path());
+                let _env =
+                    crate::test_support::env::bind_env(&serial).set("HOME", homes[turn % 2].path());
                 turn += 1;
                 std::thread::sleep(Duration::from_millis(2));
             }
@@ -15632,6 +15687,9 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
                 let binder = scope.spawn(|| rebind_home_until(&stop));
                 let mut worst = 0usize;
                 for _ in 0..6 {
+                    // Held for the round's spawn and join, as in the sixteen
+                    // threads test: the neighbour waits its turn between rounds.
+                    let _stable_env = crate::test_support::env::env_serial();
                     let dir = init_repo_with_remotes(&["origin"], "main");
                     let repo = dir.path().canonicalize().unwrap();
                     let before = adv_lookups(&repo);
@@ -15657,6 +15715,5 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
             });
             assert_eq!(extra, 1, "a HOME rebind brought back extra computations");
         }
-
     }
 }
