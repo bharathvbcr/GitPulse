@@ -495,19 +495,56 @@ describe("hook budgets sit inside the host's timeouts", () => {
    * to `within_budget` is the answer — rather than listed here, because a list
    * would go stale exactly when a handler changed its mind.
    */
-  function budgetSecondsFor(subcommand: string): number {
+  function budgetSecondsFor(subcommand: string, argument = ""): number {
+    if (subcommand === "notify") return notifyRunSeconds(argument);
     const handler = new RegExp(
       `fn run_${subcommand.replaceAll("-", "_")}\\b[\\s\\S]*?within_budget\\(\\s*([A-Z_]+)`,
     ).exec(hookSource);
     if (!handler) return hookBudgetSeconds();
     const constant = handler[1];
     if (constant === "BUDGET") return hookBudgetSeconds();
+    return durationSeconds(constant);
+  }
+
+  /** A `const NAME: Duration = Duration::from_secs|millis(N)` in hooks/mod.rs, in seconds. */
+  function durationSeconds(constant: string): number {
     const declared = new RegExp(
       `const ${constant}: Duration = Duration::from_(secs|millis)\\((\\d+)\\)`,
     ).exec(hookSource);
     expect(declared, `${constant} is not a plain Duration constant; update this contract`).toBeTruthy();
     const value = Number(declared![2]);
     return declared![1] === "secs" ? value : value / 1000;
+  }
+
+  const notifyInputSource = readFileSync(
+    path.join(ROOT, "src-tauri", "src", "hooks", "notify_input.rs"),
+    "utf8",
+  );
+
+  /**
+   * What one `notify` run waits out for `event`: the read and then the socket
+   * report, each for the budget `notify_input::budgets_for` gives that event.
+   * Derived from the source, never listed here: the function is read, the two
+   * constants it names (one for `session_ended`, one for everything else) are
+   * resolved to their plain `Duration`s, and the handlers are checked to take
+   * their budgets from it, so a handler that stopped doing so fails this
+   * rather than being measured against a number it no longer uses.
+   */
+  function notifyRunSeconds(event: string): number {
+    expect(
+      /fn run_notify\b[\s\S]*?budgets_for\(/.exec(hookSource),
+      "run_notify no longer takes its send budget from budgets_for; update this contract",
+    ).toBeTruthy();
+    expect(
+      /pub fn read_for\b[\s\S]*?budgets_for\(/.exec(hookSource),
+      "read_for no longer takes notify's read budget from budgets_for; update this contract",
+    ).toBeTruthy();
+    const classes = /fn budgets_for\b[\s\S]*?"session_ended"\s*=>\s*([A-Z_]+),\s*_\s*=>\s*([A-Z_]+),/.exec(
+      notifyInputSource,
+    );
+    expect(classes, "budgets_for no longer maps session_ended and the rest to two constants; update this contract").toBeTruthy();
+    const each = durationSeconds(event === "session_ended" ? classes![1] : classes![2]);
+    return each * 2;
   }
 
   function declaredTimeouts(): Array<{ event: string; command: string; timeout: number }> {
@@ -536,8 +573,8 @@ describe("hook budgets sit inside the host's timeouts", () => {
 
   it("gives every hook longer than the work inside it is allowed to take", () => {
     for (const { event, command, timeout } of declaredTimeouts()) {
-      const subcommand = command.split(/\s+/)[1] ?? "";
-      const budget = budgetSecondsFor(subcommand);
+      const [, subcommand = "", argument = ""] = command.split(/\s+/);
+      const budget = budgetSecondsFor(subcommand, argument);
       expect(Number.isFinite(timeout), `${event} ${command} has no numeric timeout`).toBe(true);
       expect(
         timeout,
@@ -575,7 +612,10 @@ describe("hook budgets sit inside the host's timeouts", () => {
     // Guards the derivation itself: if the regex stopped matching, every
     // subcommand would silently fall back to BUDGET and this contract would
     // check the wrong number while still passing.
-    expect(budgetSecondsFor("notify")).toBeLessThan(hookBudgetSeconds());
+    expect(budgetSecondsFor("notify", "tool_finished")).toBeLessThan(hookBudgetSeconds());
+    // SessionEnd's report has its own, shorter one: the injected copy is held to 1 s.
+    expect(budgetSecondsFor("notify", "session_ended")).toBeLessThan(budgetSecondsFor("notify", "tool_finished"));
+    expect(budgetSecondsFor("notify", "session_ended")).toBeLessThan(1);
     expect(budgetSecondsFor("collision-guard")).toBe(hookBudgetSeconds());
   });
 });

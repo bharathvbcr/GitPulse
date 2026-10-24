@@ -1993,6 +1993,11 @@ pub const AGENT_KIND_ENV: &str = "GITPULSE_AGENT_KIND";
 /// on the same machine; if it does not answer within this, it is not there.
 pub(crate) const NOTIFY_BUDGET: Duration = Duration::from_millis(1500);
 
+/// [`NOTIFY_BUDGET`] for `session_ended`, which is held to the injected
+/// `SessionEnd` hook's 1 s host timeout ([`SESSION_END_HOST_TIMEOUT`]): the
+/// read and the report, 0.3 s each, end 0.4 s before it.
+pub(crate) const SESSION_END_NOTIFY_BUDGET: Duration = Duration::from_millis(300);
+
 /// Tells the running GitPulse that this agent wants the user.
 ///
 /// The argument, not the payload, carries the reason. The plugin registers

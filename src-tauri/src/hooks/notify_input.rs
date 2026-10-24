@@ -33,7 +33,7 @@
 //! run with ([`budgets_for`]), so that the read and the socket report together
 //! end a margin before the host would kill the hook.
 
-use super::{within_budget, HookInput};
+use super::{within_budget, HookInput, NOTIFY_BUDGET, SESSION_END_NOTIFY_BUDGET};
 use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 use std::io::Read;
@@ -43,6 +43,7 @@ use std::time::Duration;
 /// terms: when Claude Code kills the hook, and with it any report not yet
 /// delivered. The one owner for every event but `session_ended`; the manifest
 /// must say it (a test reads both).
+#[cfg(test)]
 pub const NOTIFY_HOST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The `timeout` the injected `SessionEnd` hook is given
@@ -52,6 +53,7 @@ pub const NOTIFY_HOST_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SESSION_END_HOST_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The host timeout a `notify` for `event` must finish inside.
+#[cfg(test)]
 pub fn host_timeout(event: &str) -> Duration {
     if event == "session_ended" {
         SESSION_END_HOST_TIMEOUT
@@ -60,23 +62,20 @@ pub fn host_timeout(event: &str) -> Duration {
     }
 }
 
-/// What the read and, separately, the socket report may each take of a host
-/// `timeout`: 30% apiece, which leaves 40% for the process to print, reap and
-/// exit and for the host to see it do so (2 s of 5, 0.4 s of 1). Each run is
-/// then over a margin before the host would kill it, even when the writer
-/// dribbles to the last moment and the socket answers at its deadline.
-pub const fn run_share(timeout: Duration) -> Duration {
-    Duration::from_millis(timeout.as_millis() as u64 * 3 / 10)
-}
-
 /// The read budget under [`NOTIFY_HOST_TIMEOUT`].
 #[cfg(test)]
-pub const NOTIFY_READ_BUDGET: Duration = run_share(NOTIFY_HOST_TIMEOUT);
+pub const NOTIFY_READ_BUDGET: Duration = NOTIFY_BUDGET;
 
-/// The read and the send budgets for a `notify` of `event`, from the timeout
-/// that event is run with.
+/// What the read and, separately, the socket report may each take for a
+/// `notify` of `event`: one plain constant per class of event, declared next to
+/// [`NOTIFY_BUDGET`] so `scripts/plugin-contract.test.ts` reads the same two
+/// numbers and checks every `hooks.json` entry against the one for its event.
+/// The run is the two together, over a margin before the host's timeout.
 pub fn budgets_for(event: &str) -> (Duration, Duration) {
-    let share = run_share(host_timeout(event));
+    let share = match event {
+        "session_ended" => SESSION_END_NOTIFY_BUDGET,
+        _ => NOTIFY_BUDGET,
+    };
     (share, share)
 }
 
