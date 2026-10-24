@@ -8781,3 +8781,7 @@ mod fail_closed_tests {
         assert!(!report.audit_complete);
     }
 }
+
+#[cfg(test)]
+#[path = "registry_refusal_adversarial_tests.rs"]
+mod registry_refusal_adversarial_tests;
