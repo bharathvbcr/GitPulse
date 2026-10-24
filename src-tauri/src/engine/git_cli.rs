@@ -11379,7 +11379,11 @@ mod tests {
             })
             .collect();
         let names: Vec<&str> = seen.keys().map(String::as_str).collect();
-        assert_eq!(names, ["EXPLICIT", "HOME", "HTTPS_PROXY", "LC_ALL"], "{seen:?}");
+        assert_eq!(
+            names,
+            ["EXPLICIT", "HOME", "HTTPS_PROXY", "LC_ALL"],
+            "{seen:?}"
+        );
         // A PATH the builder removed is not resurrected from the inherited one.
         assert!(!seen.contains_key("PATH"));
         assert_eq!(seen["HOME"].as_deref(), Some("/h"));
