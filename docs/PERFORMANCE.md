@@ -2114,7 +2114,7 @@ Shared reads (`src/lib/ipc/sharedReads.ts`, the map in `invoke.ts`) join an in-f
 
 | row | min | p50 | notices/s at min |
 | --- | --- | --- | --- |
-| hook state reports (`turn_finished` / `tool_finished` alternating) | 108.78 ms | 110.68 ms | **459,648** |
-| renderer answers (`prompt_submitted`) | 34.58 ms | 34.76 ms | **1,445,943** |
+| hook state reports (`turn_finished` / `tool_finished` alternating) | 111.29 ms | 112.68 ms | **449,280** |
+| renderer answers (`prompt_submitted`) | 91.72 ms | 92.59 ms | **545,151** |
 
 The rate to compare between builds is `50000 / min`. The producer retries a full queue (millions of retries across the samples; it outruns the worker), so the figure is the worker's own rate, less the last 64 notices still queued when the span ends (under 0.2%). One machine's reading; there is no row from before the intake change, because the test calls `try_offer`, which that change introduced.
