@@ -2082,4 +2082,6 @@ mod tests {
 
     #[cfg(unix)]
     mod order;
+    #[cfg(unix)]
+    mod adv;
 }
