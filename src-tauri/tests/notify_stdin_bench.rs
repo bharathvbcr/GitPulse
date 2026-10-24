@@ -31,6 +31,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use gitpulse_lib::procguard::LockedSpawn;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;

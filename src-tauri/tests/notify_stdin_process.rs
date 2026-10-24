@@ -6,6 +6,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use gitpulse_lib::alerts::bridge::{SESSION_ENV, SOCKET_ENV};
 use gitpulse_lib::procguard::LockedSpawn;
 use serde_json::{json, Value};
