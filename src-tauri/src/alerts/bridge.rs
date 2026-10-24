@@ -2455,4 +2455,6 @@ mod tests {
     mod order_tests;
     #[cfg(unix)]
     mod protocol_tests;
+    #[cfg(unix)]
+    mod wire_adv_tests;
 }
