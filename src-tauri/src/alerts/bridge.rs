@@ -31,18 +31,53 @@
 //!   connection had sent when it ran out is dropped, never applied late. Each
 //!   connection is read by its own worker, so a peer that says nothing holds
 //!   that worker and never the accept loop; at most 100 are open at once and
-//!   the next is answered `{"ok":false}` and closed unread. Every field is
-//!   validated against a closed vocabulary before it reaches the hub, where
-//!   the global rate limit applies to it as well.
+//!   the next is answered `{"ok":false,"reason":"at_capacity"}` and closed
+//!   unread. Every field is validated against a closed vocabulary before it
+//!   reaches the hub, where the global rate limit applies to it as well.
+//! * The reply is the truth about the report: `{"ok":true}` only when the
+//!   notification worker took it. A refusal says why, from the closed set in
+//!   [`Reason`], so a full queue or a report older than one already applied is
+//!   never acknowledged as delivered.
 //! * An `accept` that fails for want of descriptors or memory is waited out
 //!   with a growing delay and the socket is left alone. A listener that fails
 //!   outright is rebound a bounded number of times; past that the bridge
 //!   reports that it is not listening and why.
 //!
+//! ## The protocol
+//!
+//! One report per connection, JSON, at most [`MAX_REPORT_BYTES`] serialized;
+//! the peer half-closes and reads one line back.
+//!
+//! * **Report, v1.** `v` (must be [`PROTOCOL_VERSION`]) and `event` (a name in
+//!   [`EVENTS`]) are required. Optional: `agent`, `session`, `cwd`, `message`,
+//!   `subject`, `subagent`, and `seq`. Fields not listed are ignored, which is
+//!   what lets a field be added without a new version.
+//! * **`seq`** is the order stamp: the hook reads [`order_stamp_ns`] at process
+//!   entry, before it reads stdin, so reports from one session are ordered by
+//!   when their hooks began and not by which connection happened to be accepted
+//!   or read first. A report without `seq` is ordered by its accept stamp, as
+//!   before; see [`order_for`] for why the two compare and for the cap. A report
+//!   older than one already applied for its session is refused as `stale`
+//!   on the wire (nothing was applied), which the hook treats as delivered and
+//!   superseded, not as a failure.
+//! * **Reply.** `{"ok":true}` if the notification worker took the report, with
+//!   nothing else in it. Otherwise `{"ok":false,"reason":"<token>"}`, the token
+//!   one of [`Reason`]'s closed set (never text the peer sent), plus `"max_v"`
+//!   (the newest version this bridge speaks) when the refusal is
+//!   `unsupported_version`. A peer that reads only `ok` is unaffected; a hook
+//!   that reads `reason` from an older bridge that sends none must say the
+//!   reason is missing, not guess at one.
+//! * **Message size.** A hook clips `message` against the *serialized* size, so
+//!   a message full of control characters (six bytes each once escaped) is
+//!   delivered clipped, not refused for size.
+//!
 //! On Windows the socket is not offered. The hook path there is a documented
 //! gap rather than a silently missing feature.
 
-use super::{Notice, Origin};
+mod reason;
+
+use super::{Notice, Offer, Origin};
+pub use reason::{is_invisible_or_reordering, printable, Reason};
 #[cfg(unix)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -562,7 +597,9 @@ fn serve(state: &'static State, stream: std::os::unix::net::UnixStream, stamp: u
         // A fresh socket's buffer is empty, so these few bytes cannot block;
         // non-blocking makes that a guarantee rather than an argument.
         let _ = stream.set_nonblocking(true);
-        let _ = (&stream).write_all(Outcome::Refused(Refusal::AtCapacity).reply());
+        if let Some(reply) = Outcome::Refused(Reason::AtCapacity).reply() {
+            let _ = (&stream).write_all(reply.as_bytes());
+        }
         return;
     };
     let budget = connection_budget();
@@ -571,11 +608,11 @@ fn serve(state: &'static State, stream: std::os::unix::net::UnixStream, stamp: u
         "alert bridge connection",
         move || {
             let _slot = slot;
-            let outcome = handle_into(stream, budget, &mut |notice| {
-                super::offer_stamped(notice, stamp)
+            let outcome = handle_into(stream, budget, &mut |notice, seq| {
+                super::offer_stamped(notice, order_for(seq, stamp))
             });
-            if let Outcome::Refused(refusal) = outcome {
-                log::debug!(target: "alerts", "hook report refused: {}", refusal.describe());
+            if let Outcome::Refused(reason) = outcome {
+                log::debug!(target: "alerts", "hook report refused: {}", reason.message());
             }
         },
     );
@@ -730,56 +767,55 @@ fn accept_loop(
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
-    /// The report parsed and was offered to the hub.
+    /// The report parsed and the hub took it.
     Accepted,
-    /// The report was not offered, and why.
-    Refused(Refusal),
+    /// The report was not taken, and why. The peer is told.
+    Refused(Reason),
     /// The deadline passed before the peer finished. Whatever it had sent is
     /// dropped: a half-read report is never applied, and never applied late.
     TimedOut,
 }
 
 #[cfg(unix)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Refusal {
-    /// More than [`MAX_REPORT_BYTES`].
-    TooLarge,
-    /// The read failed for a reason other than the deadline.
-    Unreadable,
-    /// The bytes are not a report GitPulse understands.
-    Invalid(&'static str),
-    /// [`MAX_OPEN_CONNECTIONS`] were already open; nothing was read.
-    AtCapacity,
-}
-
-#[cfg(unix)]
-impl Refusal {
-    fn describe(self) -> &'static str {
+impl Outcome {
+    /// What the peer is told, one line. `{"ok":true}` for an accepted report,
+    /// exactly as before; a refusal adds `reason` (a [`Reason`] token) and, for
+    /// a version this bridge does not speak, `max_v`, the newest it does. Both
+    /// are additions: a peer that reads only `ok` sees what it always saw.
+    /// `None` when there is nobody to tell.
+    fn reply(self) -> Option<String> {
         match self {
-            Refusal::TooLarge => "larger than the report cap",
-            Refusal::Unreadable => "unreadable",
-            Refusal::Invalid(reason) => reason,
-            Refusal::AtCapacity => "too many connections open",
+            Outcome::Accepted => Some("{\"ok\":true}\n".to_owned()),
+            Outcome::Refused(Reason::UnsupportedVersion) => Some(format!(
+                "{{\"ok\":false,\"reason\":\"{}\",\"max_v\":{PROTOCOL_VERSION}}}\n",
+                Reason::UnsupportedVersion.token()
+            )),
+            Outcome::Refused(reason) => Some(format!(
+                "{{\"ok\":false,\"reason\":\"{}\"}}\n",
+                reason.token()
+            )),
+            Outcome::TimedOut => None,
         }
     }
 }
 
+/// What the hub's answer to an offered report means for the connection.
 #[cfg(unix)]
-impl Outcome {
-    /// What the peer is told. Unchanged by the typed outcome: a refusal's
-    /// reason stays server-side.
-    fn reply(self) -> &'static [u8] {
-        match self {
-            Outcome::Accepted => b"{\"ok\":true}\n",
-            Outcome::Refused(_) | Outcome::TimedOut => b"{\"ok\":false}\n",
-        }
+fn outcome_of(offer: Offer) -> Outcome {
+    match offer {
+        Offer::Accepted | Offer::Coalesced => Outcome::Accepted,
+        Offer::Stale => Outcome::Refused(Reason::Stale),
+        Offer::QueueFull => Outcome::Refused(Reason::QueueFull),
+        Offer::NotRunning => Outcome::Refused(Reason::NotRunning),
     }
 }
 
 /// [`handle_into`] with the real ceiling and the real hub.
 #[cfg(all(unix, test))]
 fn handle(stream: std::os::unix::net::UnixStream) -> Outcome {
-    handle_into(stream, CONNECTION_TIMEOUT, &mut super::offer)
+    handle_into(stream, CONNECTION_TIMEOUT, &mut |notice, _| {
+        super::try_offer(notice)
+    })
 }
 
 /// Reads one connection to the end, under one deadline, and answers it. The
@@ -789,7 +825,7 @@ fn handle(stream: std::os::unix::net::UnixStream) -> Outcome {
 fn handle_into(
     stream: std::os::unix::net::UnixStream,
     budget: std::time::Duration,
-    deliver: &mut dyn FnMut(Notice),
+    deliver: &mut dyn FnMut(Notice, Option<u64>) -> Offer,
 ) -> Outcome {
     use crate::deadline::DeadlineStream;
     use std::io::{Read, Write};
@@ -803,23 +839,20 @@ fn handle_into(
         .take(MAX_REPORT_BYTES as u64 + 1)
         .read_to_end(&mut bytes);
     let outcome = match read {
-        Ok(_) if bytes.len() > MAX_REPORT_BYTES => Outcome::Refused(Refusal::TooLarge),
-        Ok(_) => match parse_report(&bytes) {
-            Ok(notice) => {
-                deliver(notice);
-                Outcome::Accepted
-            }
-            Err(reason) => Outcome::Refused(Refusal::Invalid(reason)),
+        Ok(_) if bytes.len() > MAX_REPORT_BYTES => Outcome::Refused(Reason::Oversized),
+        Ok(_) => match parse_report_stamped(&bytes) {
+            Ok((notice, seq)) => outcome_of(deliver(notice, seq)),
+            Err(reason) => Outcome::Refused(reason),
         },
         // `bytes` may hold part of a report. It is dropped with this frame.
         Err(error) if error.kind() == std::io::ErrorKind::TimedOut => Outcome::TimedOut,
-        Err(_) => Outcome::Refused(Refusal::Unreadable),
+        Err(_) => Outcome::Refused(Reason::Unreadable),
     };
     if outcome != Outcome::Accepted {
         super::count_bridge_rejection();
     }
-    if outcome != Outcome::TimedOut {
-        let _ = stream.write_all(outcome.reply());
+    if let Some(reply) = outcome.reply() {
+        let _ = stream.write_all(reply.as_bytes());
         let _ = stream.flush();
     }
     outcome
@@ -1001,25 +1034,73 @@ pub(crate) fn valid_key(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// The protocol version this bridge speaks, and the newest it will accept. A
+/// refusal for any other `v` carries it back as `max_v`.
+pub const PROTOCOL_VERSION: u64 = 1;
+
 /// Turns one report into a notice, or refuses it.
 ///
-/// Every refusal is a plain `Err` because the peer learns nothing from the
-/// distinction and the counter is what a person reads.
+/// The refusal is a plain string, the [`Reason::message`] of what went wrong.
+/// The socket does not use this: it calls [`parse_report_stamped`], which keeps
+/// the typed [`Reason`] so the reply can carry it.
 pub fn parse_report(bytes: &[u8]) -> Result<Notice, &'static str> {
-    if bytes.len() > MAX_REPORT_BYTES {
-        return Err("oversized");
-    }
-    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| "not json")?;
-    let object = value.as_object().ok_or("not an object")?;
-    if object.len() > 12 {
-        return Err("too many fields");
-    }
-    if object.get("v").and_then(serde_json::Value::as_u64) != Some(1) {
-        return Err("unsupported protocol version");
-    }
-    let text = |key: &str| -> Option<&str> { object.get(key).and_then(serde_json::Value::as_str) };
+    parse_report_stamped(bytes)
+        .map(|(notice, _)| notice)
+        .map_err(Reason::message)
+}
 
-    let event = event(text("event").ok_or("no event")?).ok_or("unknown event")?;
+/// The stamp a report is ordered by: its own `seq` when it carries one, else
+/// the stamp taken when its connection was accepted.
+///
+/// The two are comparable because both are [`order_stamp_ns`], one reading of
+/// the one system-wide monotonic clock, the hook's taken at process entry and
+/// the bridge's at accept. A `seq` is capped at the accept stamp: the hook took
+/// its reading before it connected, so a larger one is a report claiming to be
+/// from the future, and honouring it would let any peer of this user raise a
+/// session's high-water mark past everything that follows and have the real
+/// reports dropped as stale.
+#[cfg(unix)]
+pub fn order_for(seq: Option<u64>, accepted: u64) -> u64 {
+    seq.map_or(accepted, |seq| seq.min(accepted))
+}
+
+/// [`parse_report`] with the typed refusal and the report's own `seq`, if any.
+pub fn parse_report_stamped(bytes: &[u8]) -> Result<(Notice, Option<u64>), Reason> {
+    if bytes.len() > MAX_REPORT_BYTES {
+        return Err(Reason::Oversized);
+    }
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| Reason::NotJson)?;
+    let object = value.as_object().ok_or(Reason::NotAnObject)?;
+    if object.len() > 12 {
+        return Err(Reason::TooManyFields);
+    }
+    if object.get("v").and_then(serde_json::Value::as_u64) != Some(PROTOCOL_VERSION) {
+        return Err(Reason::UnsupportedVersion);
+    }
+    // When the hook began, on the clock `order_stamp_ns` reads. Optional, so an
+    // older hook's report is still one; a present one must be a positive
+    // integer, because zero is what a failed clock reads as and orders nothing.
+    let seq = match object.get("seq") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .filter(|seq| *seq > 0)
+                .ok_or(Reason::MalformedSeq)?,
+        ),
+    };
+    let text = |key: &str| -> Option<&str> { object.get(key).and_then(serde_json::Value::as_str) };
+    // An optional text field is absent (or null) or it is a string. Anything
+    // else is refused: reading a number as "no session" or "no message" would
+    // quietly turn a malformed report into a different, valid one.
+    let optional_text = |key: &str| -> Result<Option<&str>, Reason> {
+        match object.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(value) => value.as_str().map(Some).ok_or(Reason::MalformedField),
+        }
+    };
+
+    let event = event(text("event").ok_or(Reason::NoEvent)?).ok_or(Reason::UnknownEvent)?;
     // Which tool call a permission or a tool result is about, as a digest the
     // hook computed. Optional; a malformed one is refused rather than dropped,
     // because a report that cannot be matched to its request would clear the
@@ -1030,33 +1111,40 @@ pub fn parse_report(bytes: &[u8]) -> Result<Notice, &'static str> {
             value
                 .as_str()
                 .filter(|s| valid_subject(s))
-                .ok_or("malformed subject")?
+                .ok_or(Reason::MalformedSubject)?
                 .to_owned(),
         ),
     };
     let subagent = match object.get("subagent") {
         None | Some(serde_json::Value::Null) => false,
-        Some(value) => value.as_bool().ok_or("malformed subagent")?,
+        Some(value) => value.as_bool().ok_or(Reason::MalformedSubagent)?,
     };
-    let agent = text("agent").unwrap_or("claude");
+    // An `agent` that is not a string is not a known name either.
+    let agent = match object.get("agent") {
+        None | Some(serde_json::Value::Null) => "claude",
+        Some(value) => value.as_str().ok_or(Reason::UnknownAgent)?,
+    };
+    let session_text = optional_text("session")?;
+    let cwd_text = optional_text("cwd")?;
+    let message_text = optional_text("message")?;
     let label = AGENTS
         .iter()
         .find(|(name, _)| *name == agent)
         .map(|(_, display)| *display)
-        .ok_or("unknown agent")?;
+        .ok_or(Reason::UnknownAgent)?;
     // A state or a resolution is about a session GitPulse can show. With no
     // GitPulse session there is nothing for it to change, and accepting it
     // would only spend the rate limit.
-    let session_named = text("session").is_some_and(valid_key);
+    let session_named = session_text.is_some_and(valid_key);
     if event.role != Role::Banner && !session_named {
-        return Err("state report outside a session");
+        return Err(Reason::StateOutsideSession);
     }
 
     // The GitPulse PTY this hook is running under, when it is running under
     // one. Keying to it is what lets "you are looking at this tab" suppress
     // the banner, and what makes a later report replace the earlier one.
-    let session = text("session").filter(|s| valid_key(s));
-    let place = text("cwd")
+    let session = session_text.filter(|s| valid_key(s));
+    let place = cwd_text
         .filter(|cwd| cwd.len() <= 4096)
         .and_then(|cwd| {
             std::path::Path::new(cwd)
@@ -1065,7 +1153,7 @@ pub fn parse_report(bytes: &[u8]) -> Result<Notice, &'static str> {
         })
         .map(|name| super::scan::sanitize(&name))
         .filter(|name| !name.is_empty());
-    let detail = text("message")
+    let detail = message_text
         .map(super::scan::sanitize)
         .filter(|m| !m.is_empty());
 
@@ -1087,7 +1175,7 @@ pub fn parse_report(bytes: &[u8]) -> Result<Notice, &'static str> {
         }
     };
 
-    Ok(Notice {
+    let notice = Notice {
         key,
         origin: Origin::Hook,
         label: label.to_owned(),
@@ -1099,7 +1187,8 @@ pub fn parse_report(bytes: &[u8]) -> Result<Notice, &'static str> {
         channel: "hook",
         subject,
         subagent,
-    })
+    };
+    Ok((notice, seq))
 }
 
 #[cfg(test)]
@@ -1211,6 +1300,9 @@ mod tests {
 
     #[cfg(unix)]
     fn own_listener() -> std::sync::MutexGuard<'static, ()> {
+        // A report is acknowledged only if the worker took it, so a test that
+        // expects `{"ok":true}` needs a worker to take it.
+        crate::alerts::start(std::sync::Arc::new(QuietHost));
         LISTENER
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1300,19 +1392,20 @@ mod tests {
         let report = br#"{"v":1,"event":"permission_prompt","agent":"claude","session":"term-1","cwd":"/w/GitPulse"}"#;
         assert_eq!(send(&dir.socket(), report).trim(), r#"{"ok":true}"#);
 
-        for bad in [
-            &b"not json"[..],
-            &b"{}"[..],
-            br#"{"v":1,"event":"launch a missile"}"#,
+        for (bad, reason) in [
+            (&b"not json"[..], "not_json"),
+            (&b"{}"[..], "unsupported_version"),
+            (br#"{"v":1,"event":"launch a missile"}"#, "unknown_event"),
             // One byte past the cap: large enough to be refused, small enough
             // that the whole thing still fits in a socket buffer, so what is
             // being tested is the limit rather than a write race.
-            &vec![b'x'; MAX_REPORT_BYTES + 1][..],
+            (&vec![b'x'; MAX_REPORT_BYTES + 1][..], "oversized"),
         ] {
-            assert_eq!(
-                send(&dir.socket(), bad).trim(),
-                r#"{"ok":false}"#,
-                "accepted {} bytes of nonsense",
+            let reply = send(&dir.socket(), bad);
+            assert!(
+                reply.starts_with(r#"{"ok":false,"reason":""#)
+                    && reply.contains(&format!(r#""reason":"{reason}""#)),
+                "{} bytes of nonsense were not refused as {reason}: {reply}",
                 bad.len()
             );
         }
@@ -2013,7 +2106,11 @@ mod tests {
         let started = std::time::Instant::now();
         let mut reply = String::new();
         let _ = over.read_to_string(&mut reply);
-        assert_eq!(reply.trim(), r#"{"ok":false}"#, "the 101st was not refused");
+        assert_eq!(
+            reply.trim(),
+            r#"{"ok":false,"reason":"at_capacity"}"#,
+            "the 101st was not refused"
+        );
         assert!(started.elapsed() < relaxed(1000), "{:?}", started.elapsed());
         assert_eq!(open_connections(), MAX_OPEN_CONNECTIONS);
 
@@ -2039,14 +2136,20 @@ mod tests {
         // The whole report, but the peer never closes its write half.
         let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
         client.write_all(REPORT).unwrap();
-        let outcome = handle_into(server, budget, &mut |notice| offered.push(notice));
+        let outcome = handle_into(server, budget, &mut |notice, _| {
+            offered.push(notice);
+            Offer::Accepted
+        });
         assert_eq!(outcome, Outcome::TimedOut);
         assert!(offered.is_empty(), "a timed-out report was applied");
 
         // Half a report, then silence.
         let (mut client2, server2) = std::os::unix::net::UnixStream::pair().unwrap();
         client2.write_all(&REPORT[..REPORT.len() / 2]).unwrap();
-        let outcome = handle_into(server2, budget, &mut |notice| offered.push(notice));
+        let outcome = handle_into(server2, budget, &mut |notice, _| {
+            offered.push(notice);
+            Offer::Accepted
+        });
         assert_eq!(outcome, Outcome::TimedOut);
         assert!(offered.is_empty(), "a partial report was applied");
         drop((client, client2));
@@ -2056,7 +2159,10 @@ mod tests {
         let (mut client3, server3) = std::os::unix::net::UnixStream::pair().unwrap();
         client3.write_all(REPORT).unwrap();
         client3.shutdown(std::net::Shutdown::Write).unwrap();
-        let outcome = handle_into(server3, budget, &mut |notice| offered.push(notice));
+        let outcome = handle_into(server3, budget, &mut |notice, _| {
+            offered.push(notice);
+            Offer::Accepted
+        });
         assert_eq!(outcome, Outcome::Accepted);
         assert_eq!(offered.len(), 1);
     }
@@ -2201,10 +2307,19 @@ mod tests {
         assert!(book.admit("a", 5, false), "an equal stamp is not older");
         assert!(book.admit("a", 9, true));
         assert!(book.newest.is_empty(), "an ended session was kept");
+        // The live entry is gone, but the end is remembered (a tombstone): a
+        // report stamped before the session ended, arriving after it, is stale
+        // and does not bring the session back. See `OrderBook`.
         assert!(
-            book.admit("a", 1, false),
-            "an ended session still bound a stamp"
+            !book.admit("a", 1, false),
+            "a report older than the session's end was admitted after it"
         );
+        assert!(
+            book.newest.is_empty(),
+            "a stale report re-created the entry"
+        );
+        assert!(book.admit("a", 10, false), "a newer run was refused");
+        assert!(book.ended.is_empty(), "a new run kept the old tombstone");
 
         let cap = crate::alerts::ORDER_BOOK_CAP;
         for n in 0..cap * 2 {
@@ -2354,4 +2469,8 @@ mod tests {
     mod adv_tests;
     #[cfg(unix)]
     mod order_tests;
+    #[cfg(unix)]
+    mod protocol_tests;
+    #[cfg(unix)]
+    mod wire_adv_tests;
 }

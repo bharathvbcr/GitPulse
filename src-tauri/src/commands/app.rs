@@ -410,11 +410,7 @@ pub async fn cmd_session_attention_standing(
 /// notification centre asking it.
 #[tauri::command(async)]
 pub async fn cmd_session_attention_answered(session_id: String) -> Result<(), IpcError> {
-    if crate::alerts::answered(&session_id) {
-        Ok(())
-    } else {
-        Err("Not a terminal session id.".into())
-    }
+    crate::alerts::answer(&session_id).map_err(Into::into)
 }
 
 #[tauri::command(async)]

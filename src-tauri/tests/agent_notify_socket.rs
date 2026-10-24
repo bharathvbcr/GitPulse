@@ -70,6 +70,38 @@ fn report_through_socket(
     session: Option<&str>,
     agent: Option<&str>,
 ) -> Option<Vec<u8>> {
+    exchange(
+        event,
+        payload,
+        session,
+        agent,
+        b"{\"ok\":true}\n",
+        Duration::ZERO,
+    )
+    .sent
+}
+
+/// What one run of the real hook binary did.
+struct Exchange {
+    /// What reached the socket, or `None` when the hook never connected.
+    sent: Option<Vec<u8>>,
+    stdout: Vec<u8>,
+    stderr: String,
+    /// When the test gave the hook its stdin, on the bridge's clock.
+    stdin_at: u64,
+}
+
+/// [`report_through_socket`] answering with `reply` instead of an
+/// acknowledgement, holding back the hook's stdin for `stdin_delay`, and
+/// keeping what the hook wrote to stdout and stderr.
+fn exchange(
+    event: &str,
+    payload: &str,
+    session: Option<&str>,
+    agent: Option<&str>,
+    reply: &'static [u8],
+    stdin_delay: Duration,
+) -> Exchange {
     let dir = ShortDir::new(event);
     let listener = UnixListener::bind(dir.socket()).expect("bind");
     listener.set_nonblocking(false).unwrap();
@@ -87,8 +119,8 @@ fn report_through_socket(
         .env_remove(gitpulse_lib::alerts::bridge::SESSION_ENV)
         .env_remove(gitpulse_lib::hooks::AGENT_KIND_ENV)
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if let Some(session) = session {
         command.env(gitpulse_lib::alerts::bridge::SESSION_ENV, session);
     }
@@ -96,6 +128,10 @@ fn report_through_socket(
         command.env(gitpulse_lib::hooks::AGENT_KIND_ENV, agent);
     }
     let mut child = command.spawn_locked().expect("spawn gitpulse-hook");
+    // The hook is blocked reading stdin for this long, so anything it stamps
+    // "at entry" must be older than `stdin_at`, taken just before the write.
+    std::thread::sleep(stdin_delay);
+    let stdin_at = gitpulse_lib::alerts::bridge::order_stamp_ns();
     child
         .stdin
         .take()
@@ -141,7 +177,7 @@ fn report_through_socket(
         stream.read_to_end(&mut bytes).ok()?;
         // Answer as the app would, so the hook's half of the exchange is the
         // one it will really see.
-        let _ = stream.write_all(b"{\"ok\":true}\n");
+        let _ = stream.write_all(reply);
         Some(bytes)
     });
 
@@ -152,7 +188,28 @@ fn report_through_socket(
         Some(0),
         "a hook must never block a user's turn, whatever happened"
     );
-    accepted.join().unwrap()
+    // A hook writes a line or two, far under a pipe's buffer, so reading after
+    // the exit loses nothing and cannot have blocked it.
+    let mut stdout = Vec::new();
+    let mut stderr = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut stdout)
+        .unwrap();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    Exchange {
+        sent: accepted.join().unwrap(),
+        stdout,
+        stderr,
+        stdin_at,
+    }
 }
 
 /// The payload shape Claude Code documents for every hook event.
@@ -309,5 +366,185 @@ fn a_socket_that_is_not_there_costs_the_turn_nothing() {
         started.elapsed() < hermetic_env::coverage_relaxed(Duration::from_secs(10)),
         "an absent socket held the turn for {:?}",
         started.elapsed()
+    );
+}
+
+/// What the app's own parser reads as a report's `seq`.
+fn seq_of(bytes: &[u8]) -> u64 {
+    gitpulse_lib::alerts::bridge::parse_report_stamped(bytes)
+        .expect("the app's own parser accepts what the binary sent")
+        .1
+        .expect("the report carries a seq")
+}
+
+#[test]
+fn two_real_hook_spawns_produce_a_monotone_seq_on_the_bridges_clock() {
+    let before = gitpulse_lib::alerts::bridge::order_stamp_ns();
+    let first = report_through_socket(
+        "turn_finished",
+        &claude_payload("/Users/me/GitPulse"),
+        Some("term-7-1a"),
+        Some("claude"),
+    )
+    .expect("the first report reached the socket");
+    let second = report_through_socket(
+        "tool_finished",
+        &claude_payload("/Users/me/GitPulse"),
+        Some("term-7-1a"),
+        Some("claude"),
+    )
+    .expect("the second report reached the socket");
+    let after = gitpulse_lib::alerts::bridge::order_stamp_ns();
+    let (first, second) = (seq_of(&first), seq_of(&second));
+    assert!(
+        before <= first && first < second && second <= after,
+        "seq is not monotone on the bridge's clock: {before} {first} {second} {after}"
+    );
+}
+
+#[test]
+fn the_hook_stamps_seq_before_it_reads_stdin() {
+    // The hook sits in a stdin read for 300 ms. A stamp taken after the read
+    // would be newer than the moment the test gave it its input.
+    let run = exchange(
+        "turn_finished",
+        &claude_payload("/Users/me/GitPulse"),
+        Some("term-7-1a"),
+        Some("claude"),
+        b"{\"ok\":true}\n",
+        Duration::from_millis(300),
+    );
+    let seq = seq_of(&run.sent.expect("a report reached the socket"));
+    assert!(
+        seq < run.stdin_at,
+        "seq {seq} was taken after stdin was given at {}",
+        run.stdin_at
+    );
+}
+
+/// The app's refusal, as it reaches the hook's stderr; stdout stays empty.
+fn refused_with(reply: &'static [u8]) -> Exchange {
+    let run = exchange(
+        "agent_completed",
+        &claude_payload("/Users/me/GitPulse"),
+        None,
+        Some("claude"),
+        reply,
+        Duration::ZERO,
+    );
+    assert!(run.sent.is_some(), "the report was not sent");
+    assert!(
+        run.stdout.is_empty(),
+        "a refusal wrote onto the decision channel: {:?}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    run
+}
+
+#[test]
+fn the_hook_prints_the_apps_reason_verbatim_and_blames_no_version() {
+    for token in ["queue_full", "not_running", "unknown_agent"] {
+        let reply: &'static [u8] = Box::leak(
+            format!("{{\"ok\":false,\"reason\":\"{token}\"}}\n")
+                .into_bytes()
+                .into_boxed_slice(),
+        );
+        let run = refused_with(reply);
+        assert!(
+            run.stderr.contains(token),
+            "{token} missing from {:?}",
+            run.stderr
+        );
+        assert!(
+            !run.stderr.contains("different versions"),
+            "{token} was blamed on versions: {:?}",
+            run.stderr
+        );
+    }
+}
+
+/// A new hook talking to an app that predates reasons: a bare `ok:false`. The
+/// hook says it was refused with no reason, and does not guess at versions.
+#[test]
+fn a_new_hook_talking_to_an_app_that_gives_no_reason_guesses_nothing() {
+    let run = refused_with(b"{\"ok\":false}\n");
+    assert!(run.stderr.contains("refused"), "{:?}", run.stderr);
+    assert!(run.stderr.contains("no reason"), "{:?}", run.stderr);
+    assert!(
+        !run.stderr.contains("different versions"),
+        "{:?}",
+        run.stderr
+    );
+}
+
+#[test]
+fn a_version_refusal_is_the_one_refusal_that_talks_about_versions() {
+    let run = refused_with(b"{\"ok\":false,\"reason\":\"unsupported_version\",\"max_v\":9}\n");
+    assert!(
+        run.stderr.contains("unsupported_version"),
+        "{:?}",
+        run.stderr
+    );
+    assert!(run.stderr.contains("v9"), "{:?}", run.stderr);
+}
+
+/// A new hook against an app that acknowledges as the old one did: success is
+/// success, the seq it sent is simply an unknown field to that app.
+#[test]
+fn a_new_hook_talking_to_an_app_that_ignores_seq_still_succeeds() {
+    let run = exchange(
+        "agent_completed",
+        &claude_payload("/Users/me/GitPulse"),
+        None,
+        Some("claude"),
+        b"{\"ok\":true}\n",
+        Duration::ZERO,
+    );
+    assert!(run.sent.is_some());
+    assert!(run.stdout.is_empty());
+    assert!(
+        !run.stderr.contains("refused") && !run.stderr.contains("not delivered"),
+        "{:?}",
+        run.stderr
+    );
+}
+
+/// ft-6060bbd7: a report writes nothing to stdout, even when its input is
+/// malformed, so nothing a host could read as a decision ever appears.
+#[test]
+fn malformed_input_writes_nothing_to_stdout() {
+    let run = exchange(
+        "agent_completed",
+        "this is not json",
+        None,
+        Some("claude"),
+        b"{\"ok\":true}\n",
+        Duration::ZERO,
+    );
+    assert!(
+        run.stdout.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+}
+
+/// A report the app refused as stale was superseded by a newer one from its
+/// session: delivered, so the real hook warns about nothing.
+#[test]
+fn a_report_refused_as_stale_is_not_a_warning() {
+    let run = exchange(
+        "agent_completed",
+        &claude_payload("/Users/me/GitPulse"),
+        None,
+        Some("claude"),
+        b"{\"ok\":false,\"reason\":\"stale\"}\n",
+        Duration::ZERO,
+    );
+    assert!(run.sent.is_some());
+    assert!(run.stdout.is_empty());
+    assert!(
+        !run.stderr.contains("refused") && !run.stderr.contains("not delivered"),
+        "{:?}",
+        run.stderr
     );
 }
