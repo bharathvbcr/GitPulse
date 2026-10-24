@@ -2422,9 +2422,9 @@ mod tests {
     }
 
     #[cfg(unix)]
-    mod adv;
+    mod adv_tests;
     #[cfg(unix)]
-    mod order;
+    mod order_tests;
     #[cfg(unix)]
     mod protocol_tests;
 }
