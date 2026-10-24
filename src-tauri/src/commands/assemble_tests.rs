@@ -13,7 +13,11 @@ fn slow_command_is_visible_in_diagnostics_without_recording_its_payload() {
     assert_eq!(result.unwrap_err().message, "private command payload");
     let lines = crate::logging::diagnostic_tail(500);
     let line = lines.iter().find(|line| {
-        line.contains("[performance]") && line.contains("slow_command_is_visible_in_diagnostics")
+        // The completion record: a concurrent global flush (teardown, the
+        // exit-flush test) also names a still-running call, without an outcome.
+        line.contains("[performance]")
+            && line.contains("slow_command_is_visible_in_diagnostics")
+            && line.contains("outcome=")
     });
     let line = line.expect("a slow failed command must leave a timing record");
     assert!(line.contains("outcome=error"), "{line}");
