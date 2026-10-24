@@ -1190,6 +1190,8 @@ fn prune(now: Instant, tracked: &mut HashMap<String, Tracked>) {
 mod intake_adv_tests;
 #[cfg(all(test, unix))]
 mod intake_tests;
+#[cfg(all(test, unix))]
+mod intake_twin_attack_tests;
 #[cfg(test)]
 mod stress;
 #[cfg(test)]
