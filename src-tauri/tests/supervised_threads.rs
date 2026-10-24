@@ -54,13 +54,39 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// A source file compiled only for tests: exactly `tests.rs`, `*_tests.rs`,
+/// and anything named `test_support*` (a file, or a directory above the file).
+/// A bare `ends_with("tests.rs")` would also skip a production `contests.rs`.
 fn is_test_file(rel: &str) -> bool {
-    let name = rel.rsplit('/').next().unwrap_or(rel);
-    name.ends_with("tests.rs")
+    let mut parts = rel.rsplit('/');
+    let name = parts.next().unwrap_or(rel);
+    name == "tests.rs"
         || name.ends_with("_tests.rs")
-        || name == "test_support.rs"
-        || rel.starts_with("test_support/")
+        || name.starts_with("test_support")
+        || parts.any(|dir| dir.starts_with("test_support"))
         || TEST_ONLY.iter().any(|(file, _)| *file == rel)
+}
+
+#[test]
+fn only_the_named_shapes_are_test_files() {
+    for test in [
+        "tests.rs",
+        "alerts/tests.rs",
+        "diff/adversarial_tests.rs",
+        "test_support.rs",
+        "test_support/env.rs",
+        "alerts/stress.rs",
+    ] {
+        assert!(is_test_file(test), "{test} is test-only");
+    }
+    for production in [
+        "contests.rs",
+        "a/contests.rs",
+        "latests.rs",
+        "supervisor.rs",
+    ] {
+        assert!(!is_test_file(production), "{production} is production");
+    }
 }
 
 const NEEDLES: &[&str] = &[

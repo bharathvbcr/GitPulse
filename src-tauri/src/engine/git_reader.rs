@@ -344,6 +344,12 @@ pub struct RepoLanguageStat {
 /// report says so instead of presenting a capped sample as complete coverage.
 pub const LANG_STATS_DEADLINE: Duration = Duration::from_secs(10);
 
+/// [`LANG_STATS_DEADLINE`] as this thread should apply it: the constant, or the
+/// bound a test set with [`with_deadline`].
+fn lang_stats_deadline() -> Duration {
+    deadline_for(Bound::LangStats, LANG_STATS_DEADLINE)
+}
+
 /// Candidates one language scan reads at most; see
 /// [`LanguageDetector::prioritize_for_stats`].
 const LANG_STATS_MAX_FILES: usize = 10_000;
@@ -588,15 +594,35 @@ pub struct GitReader;
 /// How long an ownership report may spend blaming before it stops and says it
 /// is partial. A wall-clock bound on latency, so a report that runs past it is
 /// not kept: the next ask measures again. The same value in every build; a test
-/// that must not race the machine sets its own with [`with_ownership_deadline`].
+/// that must not race the machine sets its own with [`with_deadline`].
 const OWNERSHIP_DEADLINE: Duration = Duration::from_secs(10);
 
 fn ownership_deadline() -> Duration {
+    deadline_for(Bound::Ownership, OWNERSHIP_DEADLINE)
+}
+
+/// The wall-clock bounds a test may replace on its own thread. Each has one
+/// constant; this names the seam, not a second value.
+#[derive(Clone, Copy)]
+enum Bound {
+    Ownership,
+    LangStats,
+    BranchStats,
+}
+
+/// How many [`Bound`]s there are: the size of a thread's override table.
+#[cfg(test)]
+const BOUNDS: usize = 3;
+
+/// `shipped`, unless this thread's test replaced it. Thread-local, so a test
+/// that lifts a bound cannot lift it for its neighbours.
+fn deadline_for(bound: Bound, shipped: Duration) -> Duration {
     #[cfg(test)]
-    if let Some(deadline) = OWNERSHIP_DEADLINE_OVERRIDE.with(std::cell::Cell::get) {
+    if let Some(deadline) = DEADLINE_OVERRIDES.with(|cell| cell.get()[bound as usize]) {
         return deadline;
     }
-    OWNERSHIP_DEADLINE
+    let _ = bound;
+    shipped
 }
 
 /// The bound for a test that counts on a clean report being kept. 128 blames
@@ -607,20 +633,24 @@ const UNHURRIED: Duration = Duration::from_secs(30 * 60);
 
 #[cfg(test)]
 thread_local! {
-    static OWNERSHIP_DEADLINE_OVERRIDE: std::cell::Cell<Option<Duration>> =
-        const { std::cell::Cell::new(None) };
+    static DEADLINE_OVERRIDES: std::cell::Cell<[Option<Duration>; BOUNDS]> =
+        const { std::cell::Cell::new([None; BOUNDS]) };
 }
 
-/// Runs `body` with the ownership deadline set to `deadline` on this thread.
+/// Runs `body` with `bound` set to `deadline` on this thread.
 #[cfg(test)]
-fn with_ownership_deadline<T>(deadline: Duration, body: impl FnOnce() -> T) -> T {
-    struct Restore(Option<Duration>);
+fn with_deadline<T>(bound: Bound, deadline: Duration, body: impl FnOnce() -> T) -> T {
+    struct Restore([Option<Duration>; BOUNDS]);
     impl Drop for Restore {
         fn drop(&mut self) {
-            OWNERSHIP_DEADLINE_OVERRIDE.with(|cell| cell.set(self.0));
+            DEADLINE_OVERRIDES.with(|cell| cell.set(self.0));
         }
     }
-    let _restore = Restore(OWNERSHIP_DEADLINE_OVERRIDE.with(|cell| cell.replace(Some(deadline))));
+    let before = DEADLINE_OVERRIDES.with(std::cell::Cell::get);
+    let _restore = Restore(before);
+    let mut next = before;
+    next[bound as usize] = Some(deadline);
+    DEADLINE_OVERRIDES.with(|cell| cell.set(next));
     body()
 }
 
@@ -744,7 +774,10 @@ impl GitReader {
     /// during) list_branches so the list renders immediately, and memoizes
     /// through the oid-keyed churn cache so repeat calls are cheap.
     pub fn branch_stats(repo_path: &str) -> Result<BranchStatsReport, String> {
-        Self::branch_stats_within(repo_path, BRANCH_STATS_CALL_BUDGET)
+        Self::branch_stats_within(
+            repo_path,
+            deadline_for(Bound::BranchStats, BRANCH_STATS_CALL_BUDGET),
+        )
     }
 
     /// [`Self::branch_stats`] with the walking budget named, so a test can
@@ -1996,7 +2029,7 @@ impl GitReader {
             git_cli::current_admission(),
         );
         FLIGHTS.get_or_init(Flights::default).run(key, || {
-            Self::get_repo_language_stats_bounded(repo_path, Some(LANG_STATS_DEADLINE))
+            Self::get_repo_language_stats_bounded(repo_path, Some(lang_stats_deadline()))
         })
     }
 
@@ -6694,7 +6727,93 @@ mod tests {
     /// with the ownership deadline lifted so a loaded machine cannot cut a
     /// report short and make it unkeepable (see [`UNHURRIED`]).
     fn eager_unhurried<T>(body: impl FnOnce() -> T) -> T {
-        ref_cache::eager(|| with_ownership_deadline(UNHURRIED, body))
+        ref_cache::eager(|| unhurried(body))
+    }
+
+    /// `body` with every wall-clock bound on this thread lifted (see
+    /// [`UNHURRIED`]): for a test whose claim is about the answer a complete
+    /// call gives, not about how fast the machine made it. A test of a bound
+    /// itself sets that one with [`with_deadline`] instead.
+    ///
+    /// It also holds the environment lock for `body`. A kept or carried answer
+    /// is stamped with the git config and home it was measured under, so a
+    /// neighbour that rebinds `HOME` or `GIT_CONFIG_GLOBAL` (the user-level
+    /// mailmap test) between two calls makes the second miss the first's answer,
+    /// or reads a mailmap the test never wrote. Holding the lock keeps every
+    /// such neighbour out until `body` is done. Take `retention()` before this,
+    /// never after.
+    fn unhurried<T>(body: impl FnOnce() -> T) -> T {
+        let _stable_env = crate::test_support::env::env_serial();
+        unbounded(body)
+    }
+
+    /// [`unhurried`] without the environment lock, for a body that runs on
+    /// several threads at once: the lock would serialize them, and the test is
+    /// about what they do concurrently.
+    fn unbounded<T>(body: impl FnOnce() -> T) -> T {
+        with_deadline(Bound::Ownership, UNHURRIED, || {
+            with_deadline(Bound::BranchStats, UNHURRIED, || {
+                with_deadline(Bound::LangStats, UNHURRIED, body)
+            })
+        })
+    }
+
+    /// Each wall-clock bound is one shipped constant that a test replaces on
+    /// its own thread through [`with_deadline`], and that nothing else touches:
+    /// the replacement reaches the public entry point, ends with the closure,
+    /// and never leaks to another bound.
+    #[test]
+    fn a_test_replaces_each_wall_clock_bound_on_its_own_thread_only() {
+        assert_eq!(lang_stats_deadline(), LANG_STATS_DEADLINE);
+        assert_eq!(ownership_deadline(), OWNERSHIP_DEADLINE);
+        assert_eq!(
+            deadline_for(Bound::BranchStats, BRANCH_STATS_CALL_BUDGET),
+            BRANCH_STATS_CALL_BUDGET
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        init_stats_repo(dir.path());
+        let path = dir.path().to_str().unwrap();
+        let cut = with_deadline(Bound::LangStats, Duration::ZERO, || {
+            assert_eq!(lang_stats_deadline(), Duration::ZERO);
+            assert_eq!(
+                ownership_deadline(),
+                OWNERSHIP_DEADLINE,
+                "other bounds stay"
+            );
+            let elsewhere = std::thread::spawn(lang_stats_deadline).join().unwrap();
+            assert_eq!(elsewhere, LANG_STATS_DEADLINE, "another thread keeps it");
+            GitReader::get_repo_language_stats(path).expect("cut")
+        });
+        assert!(cut.truncated, "a spent bound reaches the scan: {cut:?}");
+        assert_eq!(lang_stats_deadline(), LANG_STATS_DEADLINE, "restored");
+        let whole = unhurried(|| GitReader::get_repo_language_stats(path).expect("whole"));
+        assert!(!whole.truncated, "{whole:?}");
+
+        let repo = init_repo_with_remotes(&[], "main");
+        let root = repo.path().canonicalize().unwrap();
+        for n in 0..2 {
+            git_in(
+                &root,
+                &["checkout", "-q", "-b", &format!("topic-{n}"), "main"],
+            );
+            git_in(
+                &root,
+                &["commit", "-q", "--allow-empty", "-m", &format!("t{n}")],
+            );
+        }
+        git_in(&root, &["checkout", "-q", "main"]);
+        let path = root.to_str().unwrap();
+        let capped = with_deadline(Bound::BranchStats, Duration::ZERO, || {
+            GitReader::branch_stats(path).expect("capped")
+        });
+        assert_eq!(
+            (capped.computed, capped.capped),
+            (1, true),
+            "a spent bound reaches branch_stats, which still makes progress"
+        );
+        let rest = unhurried(|| GitReader::branch_stats(path).expect("rest"));
+        assert_eq!((rest.computed, rest.cached, rest.capped), (1, 1, false));
     }
 
     #[test]
@@ -6893,7 +7012,12 @@ mod tests {
                 let (barrier, root) = (barrier.clone(), root.clone());
                 std::thread::spawn(move || {
                     barrier.wait();
-                    GitReader::get_repo_language_stats(root.to_str().unwrap()).unwrap()
+                    // Whichever caller leads runs the scan, so each lifts the
+                    // bound: a scan the host cut short would be a different
+                    // report from the one a second, uncut scan gives.
+                    unbounded(|| {
+                        GitReader::get_repo_language_stats(root.to_str().unwrap()).unwrap()
+                    })
                 })
             })
             .collect();
@@ -7452,10 +7576,25 @@ mod tests {
         }
     }
 
+    /// A fixture command reads the pinned hermetic config and home, named
+    /// outright, not whatever `HOME` and `GIT_CONFIG_GLOBAL` hold at the
+    /// moment. Those are process-wide and other tests rebind them to a
+    /// directory they delete when they finish, and one test rewrites the shared
+    /// `$HOME/.gitconfig`; a git that opens a config file another thread has
+    /// just removed or replaced dies with "unknown error occurred while reading
+    /// the configuration files", which is how `git add` failed in an unrelated
+    /// test. Only the product call under test should see a rebound environment.
     fn git_output(dir: &Path, args: &[&str]) -> std::process::Output {
+        let root = crate::test_support::env::hermetic::root();
         std::process::Command::new("git")
             .args(args)
             .current_dir(dir)
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                crate::test_support::env::hermetic::pinned_git_config(),
+            )
+            .env("HOME", root.join("home"))
+            .env("XDG_CONFIG_HOME", root.join("home").join(".config"))
             .env("GIT_AUTHOR_NAME", "Test User")
             .env("GIT_AUTHOR_EMAIL", "test@example.com")
             .env("GIT_COMMITTER_NAME", "Test User")
@@ -8862,82 +9001,84 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
 
     #[test]
     fn identical_tips_share_compute_and_base_equals_tip_is_zero() {
-        use std::io::Write;
-        let dir = init_repo_with_remotes(&[], "main");
-        std::fs::write(dir.path().join("base.txt"), "one\n").unwrap();
-        git_in(dir.path(), &["add", "base.txt"]);
-        git_in(dir.path(), &["commit", "-m", "base"]);
-        let main_oid = rev_parse_at(dir.path(), "HEAD");
+        unhurried(|| {
+            use std::io::Write;
+            let dir = init_repo_with_remotes(&[], "main");
+            std::fs::write(dir.path().join("base.txt"), "one\n").unwrap();
+            git_in(dir.path(), &["add", "base.txt"]);
+            git_in(dir.path(), &["commit", "-m", "base"]);
+            let main_oid = rev_parse_at(dir.path(), "HEAD");
 
-        git_in(dir.path(), &["checkout", "-q", "-b", "topic"]);
-        std::fs::write(dir.path().join("feat.txt"), "a\nb\nc\n").unwrap();
-        git_in(dir.path(), &["add", "feat.txt"]);
-        git_in(dir.path(), &["commit", "-m", "topic"]);
-        let topic_oid = rev_parse_at(dir.path(), "HEAD");
-        git_in(dir.path(), &["checkout", "-q", "main"]);
+            git_in(dir.path(), &["checkout", "-q", "-b", "topic"]);
+            std::fs::write(dir.path().join("feat.txt"), "a\nb\nc\n").unwrap();
+            git_in(dir.path(), &["add", "feat.txt"]);
+            git_in(dir.path(), &["commit", "-m", "topic"]);
+            let topic_oid = rev_parse_at(dir.path(), "HEAD");
+            git_in(dir.path(), &["checkout", "-q", "main"]);
 
-        let mut stdin_cmd = std::process::Command::new("git")
-            .args(["update-ref", "--stdin"])
-            .current_dir(dir.path())
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn_locked()
-            .expect("spawn update-ref");
-        {
-            let mut stdin = stdin_cmd.stdin.take().expect("stdin");
+            let mut stdin_cmd = std::process::Command::new("git")
+                .args(["update-ref", "--stdin"])
+                .current_dir(dir.path())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn_locked()
+                .expect("spawn update-ref");
+            {
+                let mut stdin = stdin_cmd.stdin.take().expect("stdin");
+                for i in 0..16 {
+                    writeln!(stdin, "create refs/heads/shared-{i:02} {topic_oid}").unwrap();
+                }
+                for i in 0..8 {
+                    writeln!(stdin, "create refs/heads/pointer-{i:02} {main_oid}").unwrap();
+                }
+            }
+            assert!(stdin_cmd.wait().unwrap().success());
+
+            let path = dir.path().to_str().unwrap();
+            let first = GitReader::branch_stats(path).expect("stats 1");
+            assert!(!first.capped);
+            assert_eq!(first.updates.len(), 16 + 8 + 1); // shared + pointer + topic
+            assert_eq!(first.computed, first.updates.len());
+            assert_eq!(first.cached, 0);
+            let topic_churn = first
+                .updates
+                .iter()
+                .find(|u| u.name == "topic")
+                .expect("topic");
+            assert_eq!(topic_churn.files_changed, 1);
+            assert!(topic_churn.additions > 0);
             for i in 0..16 {
-                writeln!(stdin, "create refs/heads/shared-{i:02} {topic_oid}").unwrap();
+                let u = first
+                    .updates
+                    .iter()
+                    .find(|u| u.name == format!("shared-{i:02}"))
+                    .unwrap_or_else(|| panic!("shared-{i:02}"));
+                assert_eq!(u.tip_commit_id, topic_oid);
+                assert_eq!(u.additions, topic_churn.additions);
+                assert_eq!(u.files_changed, 1);
             }
             for i in 0..8 {
-                writeln!(stdin, "create refs/heads/pointer-{i:02} {main_oid}").unwrap();
+                let u = first
+                    .updates
+                    .iter()
+                    .find(|u| u.name == format!("pointer-{i:02}"))
+                    .unwrap_or_else(|| panic!("pointer-{i:02}"));
+                assert_eq!(u.tip_commit_id, main_oid);
+                assert_eq!(
+                    (u.additions, u.deletions, u.commits_ahead_of_base),
+                    (0, 0, 0)
+                );
             }
-        }
-        assert!(stdin_cmd.wait().unwrap().success());
 
-        let path = dir.path().to_str().unwrap();
-        let first = GitReader::branch_stats(path).expect("stats 1");
-        assert!(!first.capped);
-        assert_eq!(first.updates.len(), 16 + 8 + 1); // shared + pointer + topic
-        assert_eq!(first.computed, first.updates.len());
-        assert_eq!(first.cached, 0);
-        let topic_churn = first
-            .updates
-            .iter()
-            .find(|u| u.name == "topic")
-            .expect("topic");
-        assert_eq!(topic_churn.files_changed, 1);
-        assert!(topic_churn.additions > 0);
-        for i in 0..16 {
-            let u = first
-                .updates
-                .iter()
-                .find(|u| u.name == format!("shared-{i:02}"))
-                .unwrap_or_else(|| panic!("shared-{i:02}"));
-            assert_eq!(u.tip_commit_id, topic_oid);
-            assert_eq!(u.additions, topic_churn.additions);
-            assert_eq!(u.files_changed, 1);
-        }
-        for i in 0..8 {
-            let u = first
-                .updates
-                .iter()
-                .find(|u| u.name == format!("pointer-{i:02}"))
-                .unwrap_or_else(|| panic!("pointer-{i:02}"));
-            assert_eq!(u.tip_commit_id, main_oid);
+            let second = GitReader::branch_stats(path).expect("stats 2");
+            assert_eq!(second.computed, 0);
+            assert_eq!(second.cached, first.updates.len());
             assert_eq!(
-                (u.additions, u.deletions, u.commits_ahead_of_base),
-                (0, 0, 0)
+                serde_json::to_string(&first.updates).unwrap(),
+                serde_json::to_string(&second.updates).unwrap()
             );
-        }
-
-        let second = GitReader::branch_stats(path).expect("stats 2");
-        assert_eq!(second.computed, 0);
-        assert_eq!(second.cached, first.updates.len());
-        assert_eq!(
-            serde_json::to_string(&first.updates).unwrap(),
-            serde_json::to_string(&second.updates).unwrap()
-        );
+        });
     }
 
     #[test]
@@ -10992,53 +11133,55 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
     }
     #[test]
     fn branch_stats_counts_failed_walks_instead_of_hiding_them() {
-        // A repo with one healthy branch off the default and one "ghost" branch
-        // whose tip object does not exist: the ghost's churn walk errors, which
-        // previously vanished silently — now it must surface as compute_failures
-        // while the healthy branch still gets its update.
-        fn run_git(dir: &std::path::Path, args: &[&str]) {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .env("GIT_TERMINAL_PROMPT", "0")
-                .output_locked()
-                .expect("git spawn");
-            assert!(
-                out.status.success(),
-                "git {:?}: {}",
-                args,
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        let dir = init_repo_with_remotes(&[], "main");
-        run_git(dir.path(), &["branch", "healthy"]);
-        // Ghost branch: a real tip whose object file is then deleted from the
-        // store — ref resolves to valid-format hex, but every churn walk fails.
-        run_git(dir.path(), &["commit", "--allow-empty", "-m", "doomed"]);
-        let ghost_oid = String::from_utf8_lossy(
-            &std::process::Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(dir.path())
-                .output_locked()
-                .expect("rev-parse")
-                .stdout,
-        )
-        .trim()
-        .to_string();
-        assert_eq!(ghost_oid.len(), 40);
-        run_git(dir.path(), &["branch", "ghost"]);
-        run_git(dir.path(), &["reset", "--hard", "HEAD~1"]);
-        let obj_path = dir
-            .path()
-            .join(".git/objects")
-            .join(&ghost_oid[..2])
-            .join(&ghost_oid[2..]);
-        std::fs::remove_file(&obj_path).expect("delete ghost object");
+        unhurried(|| {
+            // A repo with one healthy branch off the default and one "ghost" branch
+            // whose tip object does not exist: the ghost's churn walk errors, which
+            // previously vanished silently — now it must surface as compute_failures
+            // while the healthy branch still gets its update.
+            fn run_git(dir: &std::path::Path, args: &[&str]) {
+                let out = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .output_locked()
+                    .expect("git spawn");
+                assert!(
+                    out.status.success(),
+                    "git {:?}: {}",
+                    args,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            let dir = init_repo_with_remotes(&[], "main");
+            run_git(dir.path(), &["branch", "healthy"]);
+            // Ghost branch: a real tip whose object file is then deleted from the
+            // store — ref resolves to valid-format hex, but every churn walk fails.
+            run_git(dir.path(), &["commit", "--allow-empty", "-m", "doomed"]);
+            let ghost_oid = String::from_utf8_lossy(
+                &std::process::Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .current_dir(dir.path())
+                    .output_locked()
+                    .expect("rev-parse")
+                    .stdout,
+            )
+            .trim()
+            .to_string();
+            assert_eq!(ghost_oid.len(), 40);
+            run_git(dir.path(), &["branch", "ghost"]);
+            run_git(dir.path(), &["reset", "--hard", "HEAD~1"]);
+            let obj_path = dir
+                .path()
+                .join(".git/objects")
+                .join(&ghost_oid[..2])
+                .join(&ghost_oid[2..]);
+            std::fs::remove_file(&obj_path).expect("delete ghost object");
 
-        let report = GitReader::branch_stats(dir.path().to_str().unwrap()).unwrap();
-        let names: Vec<&str> = report.updates.iter().map(|u| u.name.as_str()).collect();
-        assert!(names.contains(&"healthy"), "healthy branch got churn");
-        assert_eq!(report.compute_failures, 1, "ghost walk counted as failure");
+            let report = GitReader::branch_stats(dir.path().to_str().unwrap()).unwrap();
+            let names: Vec<&str> = report.updates.iter().map(|u| u.name.as_str()).collect();
+            assert!(names.contains(&"healthy"), "healthy branch got churn");
+            assert_eq!(report.compute_failures, 1, "ghost walk counted as failure");
+        });
     }
 
     #[test]
@@ -11632,6 +11775,9 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
     #[test]
     fn a_user_level_mailmap_file_names_the_author_the_same_on_pulse_and_ownership() {
         use crate::test_support::env::{bind_env, env_serial};
+        // Retention before the environment lock, the order every other test
+        // takes them in through `unhurried`: the reverse deadlocks against it.
+        let _kept = ref_cache::retention();
         let serial = env_serial();
         let home = tempfile::TempDir::new().unwrap();
         let mailmap = user_level_mailmap(home.path());
@@ -11639,7 +11785,6 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             .set("HOME", home.path())
             .set("XDG_CONFIG_HOME", home.path().join("xdg"))
             .set("GIT_CONFIG_GLOBAL", home.path().join(".gitconfig"));
-        let _kept = ref_cache::retention();
         eager_unhurried(|| {
             let dir = init_repo_with_remotes(&[], "main");
             assert!(!dir.path().join(".mailmap").exists());
@@ -12302,96 +12447,98 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
     /// answer the listing gets the same numbers from the walks.
     #[test]
     fn branch_stats_reads_counts_from_one_listing_and_falls_back_to_walks() {
-        let build = || {
-            let dir = tempfile::tempdir().unwrap();
-            let root = dir.path().canonicalize().unwrap();
-            crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
-            std::fs::write(root.join("base.txt"), "0\n").unwrap();
-            crate::test_support::git_in(&root, &["add", "."]);
-            crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
-            for (n, extra) in [(1, 1), (2, 3), (3, 2)] {
-                let branch = format!("topic-{n}");
-                crate::test_support::git_in(&root, &["checkout", "-q", "-b", &branch, "main"]);
-                for c in 0..extra {
-                    std::fs::write(root.join(format!("{branch}-{c}.txt")), "x\ny\n").unwrap();
-                    crate::test_support::git_in(&root, &["add", "."]);
-                    crate::test_support::git_in(
-                        &root,
-                        &["commit", "-q", "-m", &format!("{branch} {c}")],
-                    );
+        unhurried(|| {
+            let build = || {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path().canonicalize().unwrap();
+                crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+                std::fs::write(root.join("base.txt"), "0\n").unwrap();
+                crate::test_support::git_in(&root, &["add", "."]);
+                crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+                for (n, extra) in [(1, 1), (2, 3), (3, 2)] {
+                    let branch = format!("topic-{n}");
+                    crate::test_support::git_in(&root, &["checkout", "-q", "-b", &branch, "main"]);
+                    for c in 0..extra {
+                        std::fs::write(root.join(format!("{branch}-{c}.txt")), "x\ny\n").unwrap();
+                        crate::test_support::git_in(&root, &["add", "."]);
+                        crate::test_support::git_in(
+                            &root,
+                            &["commit", "-q", "-m", &format!("{branch} {c}")],
+                        );
+                    }
                 }
-            }
-            crate::test_support::git_in(&root, &["checkout", "-q", "main"]);
-            std::fs::write(root.join("base.txt"), "1\n").unwrap();
-            crate::test_support::git_in(&root, &["commit", "-q", "-am", "main moves"]);
-            (dir, root)
-        };
-        let walked_counts = |root: &Path, branch: &str| -> (usize, usize) {
-            let text = git_cli::git_text(
-                root,
-                &[
-                    "rev-list",
-                    "--left-right",
-                    "--count",
-                    &format!("main...{branch}"),
-                ],
-            )
-            .unwrap();
-            let (behind, ahead) = git_cli::parse_left_right_count(&text);
-            (ahead, behind)
-        };
-        let summary = |report: &BranchStatsReport| -> Vec<(String, usize, usize, usize)> {
-            let mut rows: Vec<_> = report
-                .updates
-                .iter()
-                .map(|u| {
-                    (
-                        u.name.clone(),
-                        u.commits_ahead_of_base,
-                        u.commits_behind_base,
-                        u.additions,
-                    )
-                })
-                .collect();
-            rows.sort();
-            rows
-        };
-        let rev_lists = |root: &Path| {
-            git_cli::spawn_log::spawns_in(root)
-                .iter()
-                .filter(|argv| argv.iter().any(|a| a == "rev-list"))
-                .count()
-        };
+                crate::test_support::git_in(&root, &["checkout", "-q", "main"]);
+                std::fs::write(root.join("base.txt"), "1\n").unwrap();
+                crate::test_support::git_in(&root, &["commit", "-q", "-am", "main moves"]);
+                (dir, root)
+            };
+            let walked_counts = |root: &Path, branch: &str| -> (usize, usize) {
+                let text = git_cli::git_text(
+                    root,
+                    &[
+                        "rev-list",
+                        "--left-right",
+                        "--count",
+                        &format!("main...{branch}"),
+                    ],
+                )
+                .unwrap();
+                let (behind, ahead) = git_cli::parse_left_right_count(&text);
+                (ahead, behind)
+            };
+            let summary = |report: &BranchStatsReport| -> Vec<(String, usize, usize, usize)> {
+                let mut rows: Vec<_> = report
+                    .updates
+                    .iter()
+                    .map(|u| {
+                        (
+                            u.name.clone(),
+                            u.commits_ahead_of_base,
+                            u.commits_behind_base,
+                            u.additions,
+                        )
+                    })
+                    .collect();
+                rows.sort();
+                rows
+            };
+            let rev_lists = |root: &Path| {
+                git_cli::spawn_log::spawns_in(root)
+                    .iter()
+                    .filter(|argv| argv.iter().any(|a| a == "rev-list"))
+                    .count()
+            };
 
-        let (_one, listed_root) = build();
-        let listed = GitReader::branch_stats(listed_root.to_str().unwrap()).unwrap();
-        assert_eq!(listed.computed, 3);
-        assert_eq!(
-            rev_lists(&listed_root),
-            0,
-            "a cold tip walked for its counts"
-        );
-        for (name, ahead, behind, _) in summary(&listed) {
+            let (_one, listed_root) = build();
+            let listed = GitReader::branch_stats(listed_root.to_str().unwrap()).unwrap();
+            assert_eq!(listed.computed, 3);
             assert_eq!(
-                (ahead, behind),
-                walked_counts(&listed_root, &name),
-                "{name}"
+                rev_lists(&listed_root),
+                0,
+                "a cold tip walked for its counts"
             );
-        }
+            for (name, ahead, behind, _) in summary(&listed) {
+                assert_eq!(
+                    (ahead, behind),
+                    walked_counts(&listed_root, &name),
+                    "{name}"
+                );
+            }
 
-        let (_two, walked_root) = build();
-        let base = git_cli::git_text(&walked_root, &["rev-parse", "main"]).unwrap();
-        let format = format!("--format=%(objectname)%00%(ahead-behind:{})", base.trim());
-        let walked = git_cli::with_forced_spawn_failure_of(&format, || {
-            GitReader::branch_stats(walked_root.to_str().unwrap())
-        })
-        .unwrap();
-        assert_eq!(
-            rev_lists(&walked_root),
-            3,
-            "one walk per tip when the listing fails"
-        );
-        assert_eq!(summary(&listed), summary(&walked));
+            let (_two, walked_root) = build();
+            let base = git_cli::git_text(&walked_root, &["rev-parse", "main"]).unwrap();
+            let format = format!("--format=%(objectname)%00%(ahead-behind:{})", base.trim());
+            let walked = git_cli::with_forced_spawn_failure_of(&format, || {
+                GitReader::branch_stats(walked_root.to_str().unwrap())
+            })
+            .unwrap();
+            assert_eq!(
+                rev_lists(&walked_root),
+                3,
+                "one walk per tip when the listing fails"
+            );
+            assert_eq!(summary(&listed), summary(&walked));
+        });
     }
 
     /// A cold pass is bounded by time, not only by the target cap: a call that
@@ -12400,52 +12547,54 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
     /// the computed / cached / capped counts add up across calls.
     #[test]
     fn branch_stats_stops_at_its_time_budget_and_resumes_next_call() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
-        std::fs::write(root.join("base.txt"), "0\n").unwrap();
-        crate::test_support::git_in(&root, &["add", "."]);
-        crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
-        for n in 0..6 {
-            let branch = format!("topic-{n}");
-            crate::test_support::git_in(&root, &["checkout", "-q", "-b", &branch, "main"]);
-            std::fs::write(root.join(format!("{branch}.txt")), "x\n").unwrap();
+        unhurried(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+            std::fs::write(root.join("base.txt"), "0\n").unwrap();
             crate::test_support::git_in(&root, &["add", "."]);
-            crate::test_support::git_in(&root, &["commit", "-q", "-m", &branch]);
-        }
-        crate::test_support::git_in(&root, &["checkout", "-q", "main"]);
+            crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+            for n in 0..6 {
+                let branch = format!("topic-{n}");
+                crate::test_support::git_in(&root, &["checkout", "-q", "-b", &branch, "main"]);
+                std::fs::write(root.join(format!("{branch}.txt")), "x\n").unwrap();
+                crate::test_support::git_in(&root, &["add", "."]);
+                crate::test_support::git_in(&root, &["commit", "-q", "-m", &branch]);
+            }
+            crate::test_support::git_in(&root, &["checkout", "-q", "main"]);
 
-        let path = root.to_str().unwrap();
-        let mut computed_total = 0;
-        for call in 1..=6 {
-            // A zero budget leaves room for exactly the first tip.
-            let report = GitReader::branch_stats_within(path, Duration::ZERO).unwrap();
-            assert_eq!(report.computed, 1, "call {call} makes progress, one tip");
-            assert_eq!(
-                report.cached,
-                call - 1,
-                "call {call} rides the tips already done"
-            );
-            assert_eq!(
-                report.updates.len(),
-                call,
-                "call {call} reports every tip it has"
-            );
-            assert_eq!(
-                report.compute_failures, 0,
-                "unstarted tips are not failures"
-            );
-            assert_eq!(
-                report.capped,
-                call < 6,
-                "call {call}: more remain until the sixth"
-            );
-            computed_total += report.computed;
-        }
-        assert_eq!(computed_total, 6);
+            let path = root.to_str().unwrap();
+            let mut computed_total = 0;
+            for call in 1..=6 {
+                // A zero budget leaves room for exactly the first tip.
+                let report = GitReader::branch_stats_within(path, Duration::ZERO).unwrap();
+                assert_eq!(report.computed, 1, "call {call} makes progress, one tip");
+                assert_eq!(
+                    report.cached,
+                    call - 1,
+                    "call {call} rides the tips already done"
+                );
+                assert_eq!(
+                    report.updates.len(),
+                    call,
+                    "call {call} reports every tip it has"
+                );
+                assert_eq!(
+                    report.compute_failures, 0,
+                    "unstarted tips are not failures"
+                );
+                assert_eq!(
+                    report.capped,
+                    call < 6,
+                    "call {call}: more remain until the sixth"
+                );
+                computed_total += report.computed;
+            }
+            assert_eq!(computed_total, 6);
 
-        let warm = GitReader::branch_stats(path).unwrap();
-        assert_eq!((warm.computed, warm.cached, warm.capped), (0, 6, false));
+            let warm = GitReader::branch_stats(path).unwrap();
+            assert_eq!((warm.computed, warm.cached, warm.capped), (0, 6, false));
+        });
     }
 
     /// A base that moved leaves every answer standing with a spent budget:
@@ -12454,41 +12603,46 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
     /// says `capped` for the rest.
     #[test]
     fn a_carried_answer_is_not_spent_against_the_time_budget() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
-        crate::test_support::git_in(&root, &["config", "user.email", "t@example.invalid"]);
-        crate::test_support::git_in(&root, &["config", "user.name", "t"]);
-        std::fs::write(root.join("base.txt"), "0\n").unwrap();
-        crate::test_support::git_in(&root, &["add", "."]);
-        crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
-        let topic = |n: usize| {
-            let branch = format!("topic-{n}");
-            crate::test_support::git_in(&root, &["checkout", "-q", "-b", &branch, "main"]);
-            std::fs::write(root.join(format!("{branch}.txt")), "x\n").unwrap();
+        unhurried(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+            crate::test_support::git_in(&root, &["config", "user.email", "t@example.invalid"]);
+            crate::test_support::git_in(&root, &["config", "user.name", "t"]);
+            std::fs::write(root.join("base.txt"), "0\n").unwrap();
             crate::test_support::git_in(&root, &["add", "."]);
-            crate::test_support::git_in(&root, &["commit", "-q", "-m", &branch]);
-        };
-        topic(0);
-        topic(1);
-        crate::test_support::git_in(&root, &["checkout", "-q", "main"]);
-        let path = root.to_str().unwrap();
-        let warm = GitReader::branch_stats(path).unwrap();
-        assert_eq!((warm.computed, warm.capped), (2, false));
+            crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+            let topic = |n: usize| {
+                let branch = format!("topic-{n}");
+                crate::test_support::git_in(&root, &["checkout", "-q", "-b", &branch, "main"]);
+                std::fs::write(root.join(format!("{branch}.txt")), "x\n").unwrap();
+                crate::test_support::git_in(&root, &["add", "."]);
+                crate::test_support::git_in(&root, &["commit", "-q", "-m", &branch]);
+            };
+            topic(0);
+            topic(1);
+            crate::test_support::git_in(&root, &["checkout", "-q", "main"]);
+            let path = root.to_str().unwrap();
+            let warm = GitReader::branch_stats(path).unwrap();
+            assert_eq!((warm.computed, warm.capped), (2, false));
 
-        crate::test_support::git_in(&root, &["commit", "-q", "--allow-empty", "-m", "unrelated"]);
-        topic(2);
-        topic(3);
-        crate::test_support::git_in(&root, &["checkout", "-q", "main"]);
-        let report = GitReader::branch_stats_within(path, Duration::ZERO).unwrap();
-        assert_eq!(report.cached, 2, "the stored answers were carried");
-        assert_eq!(report.computed, 1, "one new tip, for progress");
-        assert!(
-            report.capped,
-            "the second new tip is left for the next call"
-        );
-        assert_eq!(report.updates.len(), 3);
-        assert_eq!(report.compute_failures, 0);
+            crate::test_support::git_in(
+                &root,
+                &["commit", "-q", "--allow-empty", "-m", "unrelated"],
+            );
+            topic(2);
+            topic(3);
+            crate::test_support::git_in(&root, &["checkout", "-q", "main"]);
+            let report = GitReader::branch_stats_within(path, Duration::ZERO).unwrap();
+            assert_eq!(report.cached, 2, "the stored answers were carried");
+            assert_eq!(report.computed, 1, "one new tip, for progress");
+            assert!(
+                report.capped,
+                "the second new tip is left for the next call"
+            );
+            assert_eq!(report.updates.len(), 3);
+            assert_eq!(report.compute_failures, 0);
+        });
     }
 
     /// What `git remote` would say, read from one config listing: a legacy
@@ -13659,7 +13813,10 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
                 let barrier = std::sync::Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    eager_unhurried(|| default_base(&repo))
+                    // Not `eager_unhurried`: its environment lock would run
+                    // the sixteen one after another, and the test is about
+                    // what they do at once.
+                    ref_cache::eager(|| unbounded(|| default_base(&repo)))
                 })
             })
             .collect();
@@ -14421,7 +14578,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
                 commit_as(dir.path(), "feat: seed", "A <a@example.com>");
                 let root = dir.path().canonicalize().unwrap();
                 let path = root.to_str().unwrap();
-                let cut = with_ownership_deadline(Duration::ZERO, || {
+                let cut = with_deadline(Bound::Ownership, Duration::ZERO, || {
                     GitReader::knowledge_report(path, None).expect("cut")
                 });
                 assert!(cut.truncated, "{cut:?}");
@@ -14493,12 +14650,17 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
                 std::fs::remove_file(root.join(".mailmap")).unwrap();
                 assert_eq!(email(), "old@example.com", "deleted .mailmap");
 
-                write(&root, "../f1.mailmap", &map("f1a@example.com"));
-                write(&root, "../f2.mailmap", &map("f2@example.com"));
+                // Beside the repository, in a directory of its own: the
+                // repository's parent is the shared temp directory, where two
+                // runs of this test (two lanes' gates) overwrite each other's
+                // fixed-name files and read the other's map.
+                let side = tempfile::TempDir::new().unwrap();
                 let (f1, f2) = (
-                    root.parent().unwrap().join("f1.mailmap"),
-                    root.parent().unwrap().join("f2.mailmap"),
+                    side.path().join("f1.mailmap"),
+                    side.path().join("f2.mailmap"),
                 );
+                std::fs::write(&f1, map("f1a@example.com")).unwrap();
+                std::fs::write(&f2, map("f2@example.com")).unwrap();
                 git_in(&root, &["config", "mailmap.file", f1.to_str().unwrap()]);
                 assert_eq!(email(), "f1a@example.com", "mailmap.file");
                 std::fs::write(&f1, map("f1b@example.com")).unwrap();
@@ -15305,6 +15467,8 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
             let base = default_base(&root).base.unwrap().1;
             eager_unhurried(|| {
                 let stop = std::sync::atomic::AtomicBool::new(false);
+                // Commits the writer has begun publishing to `feat`.
+                let landed = std::sync::atomic::AtomicUsize::new(0);
                 std::thread::scope(|s| {
                     let mut readers = Vec::new();
                     for _ in 0..8 {
@@ -15315,10 +15479,18 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
                                     GitReader::list_branches(root.to_str().unwrap()).unwrap();
                                 let tips = tip_counts_against(&root, &base).unwrap();
                                 // git pairs a moving ref's printed oid with counts of the
-                                // oid it re-read (see the ignored raw probe): that ref may
-                                // be one commit ahead; every other row is exact.
+                                // oid it re-read (see the ignored raw probe). The re-read
+                                // happens later, so the writer may have moved the ref any
+                                // number of commits on in between: a loaded host stretches
+                                // that gap from one commit to several. The row can be ahead
+                                // of its oid by at most the commits published so far, and
+                                // never behind it; every other row is exact.
                                 let close = |got: (usize, usize), want: (usize, usize)| {
-                                    got == want || (got.0 == want.0 + 1 && got.1 == want.1)
+                                    got == want
+                                        || (got.1 == want.1
+                                            && got.0 > want.0
+                                            && got.0 - want.0
+                                                <= landed.load(std::sync::atomic::Ordering::SeqCst))
                                 };
                                 for (tip, c) in &tips {
                                     let want = counts_of(&root, &base, tip);
@@ -15343,6 +15515,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
                     let mut tip = rev_parse(&root, "feat");
                     for i in 0..25 {
                         tip = mk(&root, &tip, &format!("w{i}"));
+                        landed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         git_in(&root, &["update-ref", "refs/heads/feat", &tip]);
                     }
                     stop.store(true, std::sync::atomic::Ordering::Relaxed);

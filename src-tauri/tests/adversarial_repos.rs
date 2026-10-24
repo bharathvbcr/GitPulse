@@ -23,7 +23,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+/// These tests are about hostile repository shapes, not the production spawn
+/// rate. Every fixture starts at `git_in`, and the binary's tests share one
+/// process gate with a 192-token burst, so a loaded parallel run drains it and
+/// defers a `GitReader` call mid-test ("local bucket: 0 token(s)"). The switch
+/// is order-independent and idempotent, like the other integration suites'.
+fn unmetered_spawns() {
+    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+}
+
 fn git_in(dir: &Path, args: &[&str]) {
+    unmetered_spawns();
     let output = Command::new("git")
         .args([
             "-c",
@@ -68,6 +78,31 @@ fn init_empty_repo() -> TempDir {
     git_in(dir.path(), &["config", "user.email", "gitpulse@test.local"]);
     git_in(dir.path(), &["config", "commit.gpgsign", "false"]);
     dir
+}
+
+/// The fixtures switch this binary's spawn gate to unlimited, so a loaded run
+/// cannot drain the production burst (192 spawns, then 8 a second) and have a
+/// `GitReader` call refused mid-test. 640 gated spawns from 16 threads is
+/// several times the burst however slowly each one starts.
+#[test]
+fn a_fixture_built_binary_does_not_spend_the_production_spawn_burst() {
+    let repo = init_repo();
+    let path = repo.path();
+    thread::scope(|scope| {
+        let workers: Vec<_> = (0..16)
+            .map(|_| {
+                scope.spawn(|| {
+                    for n in 0..40 {
+                        gitpulse_lib::engine::git_cli::git_text(path, &["rev-parse", "HEAD"])
+                            .unwrap_or_else(|error| panic!("spawn {n} was refused: {error}"));
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
 }
 
 const FAKE_OID: &str = "0123456789abcdef0123456789abcdef01234567";
