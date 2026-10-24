@@ -8966,6 +8966,51 @@ mod fail_closed_tests {
         };
         assert!(!user_config_referenced_vars(&env_view).contains(&"GITHUB_TOKEN".to_string()));
     }
+
+    #[test]
+    fn parse_npmrc_reads_keys_the_way_npm_does() {
+        let keys =
+            |text: &str| -> Vec<String> { parse_npmrc(text).into_iter().map(|(k, _)| k).collect() };
+        assert_eq!(
+            keys("\u{feff}Proxy=x\rFund=false\r\nca[]=y\n"),
+            ["proxy", "fund", "ca"]
+        );
+        assert_eq!(
+            keys("\"registry\"=x\n'Https-Proxy' = y\n"),
+            ["registry", "https-proxy"]
+        );
+        assert_eq!(keys("; c=1\n# d=2\n[sec]\nbare\n"), ["bare"]);
+    }
+
+    #[test]
+    fn bunfig_is_refused_on_any_mention_and_a_plain_one_is_not() {
+        for text in [
+            "[ install . scopes ]\n",
+            "install.registry = \"x\"\n",
+            "# registry was here\n",
+            "[install]\nca = \"pem\"\n",
+            "[install]\ncafile = \"p\"\n",
+        ] {
+            assert!(bunfig_overrides_network(text), "{text:?}");
+        }
+        assert!(!bunfig_overrides_network(
+            "[install]\nexact = true\n[test]\nroot = \"src\"\n"
+        ));
+    }
+
+    #[test]
+    fn transport_trust_and_credential_keys_are_refused() {
+        for text in [
+            "strict-ssl=false\n",
+            "//r.example/:certfile=/c\n",
+            "//r.example/:keyfile=/k\n",
+            "//r.example/:tokenHelper=/h\n",
+            "//r.example/:email=a@b\n",
+            "noproxy=x\n",
+        ] {
+            assert!(npmrc_overrides_network(text), "{text:?}");
+        }
+    }
 }
 
 #[cfg(test)]

@@ -57,7 +57,10 @@ fn control_plain_registry_forms_are_refused() {
 
 #[test]
 fn control_comment_only_lines_do_not_refuse() {
-    let dir = repo_with(&[(".npmrc", b"; registry=http://evil.test/\n# proxy=x\nfund=false\n")]);
+    let dir = repo_with(&[(
+        ".npmrc",
+        b"; registry=http://evil.test/\n# proxy=x\nfund=false\n",
+    )]);
     assert!(refusal(&dir, "", false).is_none());
 }
 
@@ -191,9 +194,11 @@ fn fifo_npmrc_does_not_hang_and_is_refused() {
 fn unreadable_npmrc_is_refused() {
     use std::os::unix::fs::PermissionsExt;
     let dir = repo_with(&[(".npmrc", b"registry=http://evil.test/\n")]);
-    fs::set_permissions(dir.path().join(".npmrc"), fs::Permissions::from_mode(0o000)).expect("chmod");
+    fs::set_permissions(dir.path().join(".npmrc"), fs::Permissions::from_mode(0o000))
+        .expect("chmod");
     let got = refusal(&dir, "", false);
-    fs::set_permissions(dir.path().join(".npmrc"), fs::Permissions::from_mode(0o600)).expect("chmod");
+    fs::set_permissions(dir.path().join(".npmrc"), fs::Permissions::from_mode(0o600))
+        .expect("chmod");
     assert!(got.is_some(), "an unreadable .npmrc was treated as empty");
 }
 
@@ -247,7 +252,10 @@ fn bunfig_top_level_dotted_keys() {
 #[test]
 fn bunfig_in_package_dir_and_root() {
     let dir = repo_with(&[
-        ("pkg/bunfig.toml", b"[install]\nregistry = \"http://evil.test/\"\n"),
+        (
+            "pkg/bunfig.toml",
+            b"[install]\nregistry = \"http://evil.test/\"\n",
+        ),
         ("pkg/package.json", b"{}"),
     ]);
     assert!(refusal(&dir, "pkg", true).is_some());
@@ -264,6 +272,9 @@ fn no_config_means_no_refusal_for_npm_and_bun() {
 
 #[test]
 fn benign_npmrc_does_not_refuse() {
-    let dir = repo_with(&[(".npmrc", b"fund=false\naudit-level=high\nengine-strict=true\n")]);
+    let dir = repo_with(&[(
+        ".npmrc",
+        b"fund=false\naudit-level=high\nengine-strict=true\n",
+    )]);
     assert!(refusal(&dir, "", false).is_none());
 }

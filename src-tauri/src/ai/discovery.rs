@@ -19,6 +19,9 @@ use super::http::{self, Endpoint};
 /// Ports probed when the user has named no endpoint.
 pub const CANDIDATE_PORTS: [u16; 5] = [11434, 8000, 1234, 8080, 1337];
 
+/// Longest model name offered to the user.
+pub const MAX_NAME_CHARS: usize = 120;
+
 /// How long one candidate may take. Long enough for a loaded server to answer
 /// a listing, short enough that a five-port sweep is not felt.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1200);
@@ -87,6 +90,35 @@ pub fn identify(base_url: &str) -> EndpointIdentity {
         host,
         port,
     }
+}
+
+/// `text` as safe to show a person: control, bidi, zero-width and line/paragraph
+/// separator characters removed, and at most `max_chars` characters, cut with an
+/// ellipsis. Used on names a listener chose. (W8-L1's shared sanitizer is not in
+/// main yet; swap this for it when it lands.)
+pub fn display_safe(text: &str, max_chars: usize) -> String {
+    let kept: Vec<char> = text
+        .chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(
+                    *c,
+                    '\u{200b}'..='\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2028}'..='\u{2029}'
+                        | '\u{2060}'..='\u{2064}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{061c}'
+                        | '\u{feff}'
+                )
+        })
+        .collect();
+    if kept.len() <= max_chars {
+        return kept.into_iter().collect();
+    }
+    let mut cut: String = kept.into_iter().take(max_chars).collect();
+    cut.push('\u{2026}');
+    cut
 }
 
 /// Asks one endpoint what it serves.
@@ -211,10 +243,15 @@ pub fn choose<'a>(
             return Some((ep, model.to_string()));
         }
     }
-    endpoints
-        .iter()
-        .find(|e| e.reachable && !e.models.is_empty())
-        .map(|e| (e, e.models[0].clone()))
+    // A name that would need cleaning to be shown is not offered: confirming it
+    // could not name what the user saw.
+    let shown_as_is = |m: &&String| display_safe(m, MAX_NAME_CHARS) == **m;
+    endpoints.iter().find_map(|e| {
+        e.reachable
+            .then(|| e.models.iter().find(shown_as_is))
+            .flatten()
+            .map(|m| (e, m.clone()))
+    })
 }
 
 #[cfg(test)]

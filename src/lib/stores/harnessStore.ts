@@ -3,7 +3,11 @@ import { invoke, readIpcError } from "../ipc/invoke";
 import { askConfirm, type ConfirmPromptOptions } from "./modalStore";
 import { formatDiagnosticFailure } from "../diagnostics/diagnostics";
 import { mergeEvents } from "../ledger/projection";
-import { ledgerStatus, type LedgerEvent, type LedgerStatus } from "../ledger/types";
+import {
+  ledgerStatus,
+  type LedgerEvent,
+  type LedgerStatus,
+} from "../ledger/types";
 import type { CatchUp } from "../ingest/types";
 import {
   identityKey,
@@ -283,7 +287,11 @@ function loadPreferred(): AiSelection | null {
     const raw = localStorage.getItem(STORAGE_KEY_MODEL);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed.base_url === "string" && typeof parsed.model === "string") {
+    if (
+      parsed &&
+      typeof parsed.base_url === "string" &&
+      typeof parsed.model === "string"
+    ) {
       return parsed;
     }
   } catch {
@@ -333,8 +341,29 @@ export interface HarnessStoreDeps {
 /** A model server the backend found but the user has not chosen. */
 export interface UnconfirmedEndpoint {
   selection: AiSelection;
+  /** The saved selection's server no longer serves its model; nothing to confirm. */
+  stale: boolean;
   /** "Ollama on 127.0.0.1:11434": the runtime and the address that would receive the data. */
   label: string;
+}
+
+const MAX_PROMPT_NAME = 120;
+
+/**
+ * Text from a listener nobody vetted, made safe to show: control, bidi,
+ * zero-width and line/paragraph separator characters removed, and bounded.
+ * (W8-L1's shared `clean()` is not in main yet; swap it in when it lands.)
+ */
+export function promptSafe(text: string): string {
+  const kept = Array.from(text).filter(
+    (ch) =>
+      !/[\p{Cc}\u200B-\u200F\u202A-\u202E\u2028\u2029\u2060-\u2064\u2066-\u2069\u061C\uFEFF]/u.test(
+        ch,
+      ),
+  );
+  return kept.length <= MAX_PROMPT_NAME
+    ? kept.join("")
+    : `${kept.slice(0, MAX_PROMPT_NAME).join("")}\u2026`;
 }
 
 /**
@@ -342,17 +371,27 @@ export interface UnconfirmedEndpoint {
  * kind counts; nothing inside the message is read. Null for any other failure,
  * and for a detail that does not name an endpoint and a model.
  */
-export function unconfirmedEndpoint(error: unknown): UnconfirmedEndpoint | null {
+export function unconfirmedEndpoint(
+  error: unknown,
+): UnconfirmedEndpoint | null {
   const typed = readIpcError(error);
   if (typed?.kind !== "ai_endpoint_unconfirmed") return null;
   const detail = typed.detail;
   if (detail === null || typeof detail !== "object") return null;
-  const { base_url, model, label } = detail as Record<string, unknown>;
-  if (typeof base_url !== "string" || typeof model !== "string" || typeof label !== "string") {
+  const { base_url, model, label, stale } = detail as Record<string, unknown>;
+  if (
+    typeof base_url !== "string" ||
+    typeof model !== "string" ||
+    typeof label !== "string"
+  ) {
     return null;
   }
   if (!base_url || !model) return null;
-  return { selection: { base_url, model }, label };
+  return {
+    selection: { base_url, model: promptSafe(model) },
+    stale: stale === true,
+    label: promptSafe(label),
+  };
 }
 
 export function createHarnessStore(deps: HarnessStoreDeps = {}) {
@@ -397,7 +436,10 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
    * Unicode, and host filesystem case) so one canonical repository cannot
    * acquire two frontend cursors.
    */
-  function rawRepositoryAddress(repoPath: string): { key: string; path: string } {
+  function rawRepositoryAddress(repoPath: string): {
+    key: string;
+    path: string;
+  } {
     const path = normalizeRepoPath(repoPath) ?? repoPath;
     const identity = identityKey(path, pathIdentityOptions);
     return { key: `repo:${identity || path}`, path };
@@ -497,8 +539,8 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
       ),
       ledgerCursor: Math.max(source.ledgerCursor, target.ledgerCursor),
       catchUp: sourceCatchUpIsNewer
-        ? source.catchUp ?? target.catchUp
-        : target.catchUp ?? source.catchUp,
+        ? (source.catchUp ?? target.catchUp)
+        : (target.catchUp ?? source.catchUp),
       lastVerdict: sourceVerdictIsNewer
         ? source.lastVerdict
         : target.lastVerdict,
@@ -529,7 +571,10 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
     generation?: number,
   ): boolean {
     const current = ledgerBuckets.get(key);
-    if (!current || (generation !== undefined && current.generation !== generation)) {
+    if (
+      !current ||
+      (generation !== undefined && current.generation !== generation)
+    ) {
       return false;
     }
     const next = mutate(current);
@@ -608,18 +653,18 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
   }
 
   /**
-   * Runs one AI call with the saved selection. With none saved the backend
-   * finds a server but sends nothing, answering `ai_endpoint_unconfirmed`; this
-   * asks the user about exactly that runtime and address, saves the choice
-   * through the same path as picking a model (`selectModel`), and asks again.
-   * Declining rethrows the refusal, so nothing is ever sent unconfirmed.
+   * One confirmation shared by every AI call that is refused while it is open:
+   * a second concurrent action joins the dialog already on screen instead of
+   * raising another. Cleared when no call is left waiting, so a later action
+   * asks afresh.
    */
-  async function withEndpointConsent<T>(call: (preferred: AiSelection | null) => Promise<T>): Promise<T> {
-    try {
-      return await call(currentPreferred());
-    } catch (err: unknown) {
-      const found = unconfirmedEndpoint(err);
-      if (!found) throw err;
+  let consentFlight: Promise<AiSelection | null> | null = null;
+  let consentWaiters = 0;
+
+  function askEndpointConsent(
+    found: UnconfirmedEndpoint,
+  ): Promise<AiSelection | null> {
+    consentFlight ??= (async () => {
       const confirmed = await confirmFn({
         title: "Send to this local model server?",
         message:
@@ -630,9 +675,44 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
         confirmLabel: "Send and remember",
         cancelLabel: "Don't send",
       });
-      if (!confirmed) throw err;
+      if (!confirmed) return null;
       void store.selectModel(found.selection);
-      return call(found.selection);
+      return found.selection;
+    })();
+    return consentFlight;
+  }
+
+  /**
+   * Runs one AI call with the saved selection. With none saved the backend
+   * finds a server but sends nothing, answering `ai_endpoint_unconfirmed`; this
+   * asks the user about exactly that runtime and address, saves the choice
+   * through the same path as picking a model (`selectModel`), and asks again.
+   * A saved selection whose server no longer serves its model is refused the
+   * same way, marked stale: the saved choice is dropped and the refusal shown,
+   * with no prompt about a server that is not there.
+   * Declining rethrows the refusal, so nothing is ever sent unconfirmed.
+   */
+  async function withEndpointConsent<T>(
+    call: (preferred: AiSelection | null) => Promise<T>,
+  ): Promise<T> {
+    consentWaiters += 1;
+    try {
+      try {
+        return await call(currentPreferred());
+      } catch (err: unknown) {
+        const found = unconfirmedEndpoint(err);
+        if (!found) throw err;
+        if (found.stale) {
+          if (currentPreferred() !== null) void store.selectModel(null);
+          throw err;
+        }
+        const chosen = await askEndpointConsent(found);
+        if (!chosen) throw err;
+        return await call(chosen);
+      }
+    } finally {
+      consentWaiters -= 1;
+      if (consentWaiters === 0) consentFlight = null;
     }
   }
 
@@ -697,8 +777,7 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
       // stored canonical path as well means a corrupt/misrouted row cannot
       // cross the final UI projection boundary.
       const matching = events.filter(
-        (event) =>
-          repositoryAddress(event.repo_path).key === currentRun.key,
+        (event) => repositoryAddress(event.repo_path).key === currentRun.key,
       );
       const repositoryMismatch = matching.length !== events.length;
       mutateBucket(
@@ -752,7 +831,10 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
    * sync reads from the stored cursor, so that one re-run collects every row
    * the joined requests announced, and every joined caller resolves after it.
    */
-  const ledgerSyncs = new Map<string, { again: boolean; done: Promise<void> }>();
+  const ledgerSyncs = new Map<
+    string,
+    { again: boolean; done: Promise<void> }
+  >();
 
   function syncLedger(repoPath: string): Promise<void> {
     if (!repoPath) return Promise.resolve();
@@ -897,7 +979,8 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
       if (key === UNSCOPED_REPOSITORY || !ledgerBuckets.has(key)) return;
       ledgerBuckets.delete(key);
       for (const [alias, destination] of [...repositoryAliases]) {
-        if (alias === key || destination === key) repositoryAliases.delete(alias);
+        if (alias === key || destination === key)
+          repositoryAliases.delete(alias);
       }
       repositoryAliases.delete(rawRepositoryAddress(repoPath).key);
       if (activeRepositoryKey === key) activateRepository(null);
@@ -942,21 +1025,18 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
         mutateCatchUpBucket(run, (bucket) => ({ ...bucket, catchUp: summary }));
       } catch (e) {
         if (!isCurrentCatchUpRun(run)) return null;
-        mutateCatchUpBucket(
-          run,
-          (bucket) => ({
-            ...bucket,
-            catchUp: {
-              recorded: 0,
-              transcripts: 0,
-              skipped_lines: 0,
-              reflog_entries: 0,
-              refused_outside_corpus: 0,
-              truncated: false,
-              error: formatDiagnosticFailure(e),
-            },
-          }),
-        );
+        mutateCatchUpBucket(run, (bucket) => ({
+          ...bucket,
+          catchUp: {
+            recorded: 0,
+            transcripts: 0,
+            skipped_lines: 0,
+            reflog_entries: 0,
+            refused_outside_corpus: 0,
+            truncated: false,
+            error: formatDiagnosticFailure(e),
+          },
+        }));
       }
       if (isCurrentCatchUpRun(run)) await syncLedger(run.repoPath);
       return summary;
@@ -981,7 +1061,10 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
       );
     },
 
-    explainCommit: async (repoPath: string, commitId: string): Promise<AiGeneration> => {
+    explainCommit: async (
+      repoPath: string,
+      commitId: string,
+    ): Promise<AiGeneration> => {
       return withEndpointConsent((preferred) =>
         invokeFn<AiGeneration>("cmd_ai_explain_commit", {
           repoPath,
@@ -1003,7 +1086,10 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
     },
 
     /** Turns a rendered dependency-health report into a remediation plan. */
-    fixHealth: async (repoPath: string, report: string): Promise<AiGeneration> => {
+    fixHealth: async (
+      repoPath: string,
+      report: string,
+    ): Promise<AiGeneration> => {
       return withEndpointConsent((preferred) =>
         invokeFn<AiGeneration>("cmd_ai_fix_health", {
           repoPath,
@@ -1015,7 +1101,10 @@ export function createHarnessStore(deps: HarnessStoreDeps = {}) {
     },
 
     /** Turns a rendered coverage report into a local-model analysis. */
-    coverageReport: async (repoPath: string, report: string): Promise<AiGeneration> => {
+    coverageReport: async (
+      repoPath: string,
+      report: string,
+    ): Promise<AiGeneration> => {
       return withEndpointConsent((preferred) =>
         invokeFn<AiGeneration>("cmd_ai_coverage_report", {
           repoPath,

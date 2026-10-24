@@ -395,20 +395,130 @@ enum Target {
     NoServer(Vec<discovery::DiscoveredEndpoint>),
 }
 
+/// How long a check that a selection's server still serves its model stays
+/// good. Short, so a listener that took the port over is noticed.
+const SELECTION_RECHECK_TTL: Duration = Duration::from_secs(60);
+
+static VERIFIED_SELECTIONS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+fn selection_key(selection: &AiSelection) -> String {
+    format!("{}\n{}", selection.base_url, selection.model)
+}
+
+/// Whether the selected base URL still lists the selected model. One bounded
+/// GET (`discovery::PROBE_TIMEOUT`), the same one discovery makes.
+fn serves_selected_model(selection: &AiSelection) -> bool {
+    #[cfg(test)]
+    if test_url_is_trusted(&selection.base_url) {
+        return true;
+    }
+    let endpoint = discovery::list_models(&selection.base_url);
+    endpoint.reachable && endpoint.models.iter().any(|m| *m == selection.model)
+}
+
+/// A persisted selection is a statement about a server that may since have quit
+/// and been replaced by someone else's listener on the same port. Before the
+/// first send of a session, and again once the last check is older than
+/// [`SELECTION_RECHECK_TTL`], it is checked against the server itself.
+fn selection_still_served(
+    selection: &AiSelection,
+    check: impl FnOnce(&AiSelection) -> bool,
+) -> bool {
+    let key = selection_key(selection);
+    let cache = VERIFIED_SELECTIONS.get_or_init(Default::default);
+    let fresh = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .is_some_and(|checked| checked.elapsed() < SELECTION_RECHECK_TTL);
+    if fresh {
+        return true;
+    }
+    let served = check(selection);
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if served {
+        cache.insert(key, Instant::now());
+    } else {
+        cache.remove(&key);
+    }
+    served
+}
+
+/// Base URLs whose fake servers answer a fixed script (one `/chat/completions`,
+/// or nothing at all) and so cannot also answer the model-listing check.
+#[cfg(test)]
+static TRUSTED_TEST_URLS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn trust_test_url(url: &str) {
+    TRUSTED_TEST_URLS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(url.to_string());
+}
+
+#[cfg(test)]
+fn test_url_is_trusted(url: &str) -> bool {
+    url == "http://127.0.0.1:1/v1"
+        || TRUSTED_TEST_URLS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|trusted| trusted == url)
+}
+
+/// Records `selection` as just verified, for a test whose fake server answers
+/// exactly one request and so cannot also answer the check.
+#[cfg(test)]
+fn mark_selection_verified_in_test(selection: &AiSelection) {
+    VERIFIED_SELECTIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(selection_key(selection), Instant::now());
+}
+
 /// The one gate between "a model server is running" and "send it the diff".
 ///
 /// With no usable selection the sweep may find a server, and finding one is
 /// not consent: on a shared host the listener on 8080 can be someone else's.
 /// The answer is a typed [`IpcErrorKind::AiEndpointUnconfirmed`] naming the
 /// runtime and port, which the frontend shows as a question and, once the user
-/// confirms, persists as the selection and asks again. The sweep itself only
-/// reads `/models`; no prompt or diff has been sent when this returns.
+/// confirms, persists as the selection and asks again. A chosen selection is
+/// re-verified against its server (see [`selection_still_served`]); one that no
+/// longer lists its model is refused the same way, never sent to. The sweep and
+/// the check only read `/models`; no prompt or diff has been sent when this
+/// returns an error.
 fn resolve_target(
     selection: Option<AiSelection>,
     sweep: impl FnOnce() -> Vec<discovery::DiscoveredEndpoint>,
 ) -> Result<Target, String> {
+    resolve_target_checked(selection, sweep, serves_selected_model)
+}
+
+fn resolve_target_checked(
+    selection: Option<AiSelection>,
+    sweep: impl FnOnce() -> Vec<discovery::DiscoveredEndpoint>,
+    check: impl FnOnce(&AiSelection) -> bool,
+) -> Result<Target, String> {
     if let Some(selection) = usable_selection(selection) {
-        return Ok(Target::Confirmed(selection));
+        if selection_still_served(&selection, check) {
+            return Ok(Target::Confirmed(selection));
+        }
+        // Stale: offer whatever answers now, else say the selection is stale.
+        let endpoints = sweep();
+        return Err(
+            match discovery::choose(&endpoints, Some(&selection.model)).filter(
+                |(endpoint, model)| {
+                    endpoint.base_url != selection.base_url || *model != selection.model
+                },
+            ) {
+                Some((endpoint, model)) => unconfirmed_endpoint(&endpoint.base_url, &model),
+                None => typed_unconfirmed(&selection.base_url, &selection.model, true),
+            },
+        );
     }
     let endpoints = sweep();
     match discovery::choose(&endpoints, None) {
@@ -418,13 +528,29 @@ fn resolve_target(
 }
 
 fn unconfirmed_endpoint(base_url: &str, model: &str) -> String {
+    typed_unconfirmed(base_url, model, false)
+}
+
+/// The typed refusal. The model name comes from a listener nobody has vetted
+/// and is shown to the user, so control, bidi and zero-width characters are
+/// stripped and the length bounded before it reaches the message or the detail.
+fn typed_unconfirmed(base_url: &str, model: &str, stale: bool) -> String {
     let identity = discovery::identify(base_url);
-    crate::ipc_error::typed_text_with_detail(
-        crate::ipc_error::IpcErrorKind::AiEndpointUnconfirmed,
+    let model = discovery::display_safe(model, discovery::MAX_NAME_CHARS);
+    let message = if stale {
+        format!(
+            "{} no longer serves {model}. Nothing has been sent.",
+            identity.label
+        )
+    } else {
         format!(
             "Confirm where to send this: {} serving {model}. Nothing has been sent.",
             identity.label
-        ),
+        )
+    };
+    crate::ipc_error::typed_text_with_detail(
+        crate::ipc_error::IpcErrorKind::AiEndpointUnconfirmed,
+        message,
         serde_json::json!({
             "base_url": base_url,
             "model": model,
@@ -432,6 +558,7 @@ fn unconfirmed_endpoint(base_url: &str, model: &str) -> String {
             "host": identity.host,
             "port": identity.port,
             "label": identity.label,
+            "stale": stale,
         }),
     )
 }
@@ -1423,6 +1550,7 @@ mod tests {
     fn fake_model_server(content: &str) -> (String, std::sync::mpsc::Receiver<String>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
+        trust_test_url(&format!("http://127.0.0.1:{port}/v1"));
         let (tx, rx) = std::sync::mpsc::channel();
         let body = serde_json::json!({
             "choices": [{
@@ -2309,6 +2437,63 @@ mod tests {
                 .filter(|warning| warning.starts_with("attempt "))
                 .count(),
             2
+        );
+    }
+
+    fn selection_for(url: &str, model: &str) -> AiSelection {
+        AiSelection {
+            base_url: url.into(),
+            model: model.into(),
+        }
+    }
+
+    #[test]
+    fn a_selection_is_rechecked_once_then_trusted_for_the_ttl() {
+        let sel = selection_for("http://127.0.0.1:9/v1", "ttl-model");
+        let mut checks = 0;
+        for _ in 0..3 {
+            let target = resolve_target_checked(Some(sel.clone()), Vec::new, |_| {
+                checks += 1;
+                true
+            });
+            assert!(matches!(target, Ok(Target::Confirmed(_))));
+        }
+        assert_eq!(checks, 1, "the check is cached inside the TTL");
+    }
+
+    #[test]
+    fn a_selection_its_server_no_longer_serves_is_refused_as_stale() {
+        let sel = selection_for("http://127.0.0.1:9/v1", "gone-model");
+        let error = crate::ipc_error::run_command(|| {
+            resolve_target_checked(Some(sel.clone()), Vec::new, |_| false).map(|_| ())
+        })
+        .expect_err("a stale selection must not be used");
+        assert_eq!(
+            error.kind,
+            crate::ipc_error::IpcErrorKind::AiEndpointUnconfirmed
+        );
+        let detail = error.detail.expect("detail");
+        assert_eq!(detail["stale"], true);
+        assert_eq!(detail["model"], "gone-model");
+    }
+
+    #[test]
+    fn a_hostile_model_name_is_never_offered_for_confirmation() {
+        let hostile = discovery::DiscoveredEndpoint {
+            base_url: "http://127.0.0.1:8080/v1".into(),
+            models: vec!["bad\u{202e}name".into(), "good".into()],
+            reachable: true,
+            detail: String::new(),
+        };
+        let found = vec![hostile];
+        let (_, model) = discovery::choose(&found, None).expect("one safe name");
+        assert_eq!(model, "good");
+        assert_eq!(discovery::display_safe("a\nb\u{200b}c", 10), "abc");
+        assert_eq!(
+            discovery::display_safe(&"x".repeat(500), 120)
+                .chars()
+                .count(),
+            121
         );
     }
 }
