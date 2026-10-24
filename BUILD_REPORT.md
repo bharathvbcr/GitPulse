@@ -468,3 +468,51 @@ The drift fixes are in 68ef1882. Re-run on that tree: supervised_threads 9/9, do
   - ft-92734a91 and ft-b595921a (owner decisions);
   - ft-cc4be67b (needs a quiet host);
   - 21 integration suites without the unmetered spawn call.
+
+---
+
+# Wave 8 (2026-10-24): notify boundary and outbound data, and the run's wrap-up
+
+**State.**
+- **Merged:**
+  - W8-L1 → `5b3c82b9` (gate 17).
+  - W8-L2 and W8-L3 together → `9be2dbf8` (fixes to `d99c8072`) (gate 18).
+- **Owner decisions this wave** (AskUserQuestion, 2026-10-24):
+  - S1-09: approved as hardening.
+  - Private registries: refuse and report.
+  - AI endpoint: confirm before the first send.
+- **Wrap-up.** The owner asked to wrap up: finish the running lanes, start no new agents, have Opus verify, merge, and clean every branch. W8-L2 therefore got an Opus review instead of an adversarial Sonnet pass.
+
+## Cards
+
+| Card | What landed | Verification |
+|---|---|---|
+| **ft-9cfd5074** S1-13 and S1-14 (W8-L1) | **Notify routes are guarded both ways** from one fixture (`scripts/fixtures/notify-routes.json`), read by Rust and by plugin-contract.test.ts; 12 kinds of hooks.json mutation were all caught. **One generated hidden-character table:** `scripts/hidden-codepoints.mjs` writes `fixtures/hidden-codepoints.json` (Unicode 17, Cc/Cf/Co), which drives both Rust `alerts::text` and TS `clean()`, with parity over all 1,112,064 scalars and a drift test. **Every display channel goes through the owner:** banner heading (a U+202E cwd now renders in order), session brief, menu, tray, commit-graph note, process name, model excerpt. `parseAttention` of an unknown event gives null, with a capped warning and a rate-limited summary. Plugin SessionEnd timeout went from 5 to 1. | Adversarial pass, 3 breaks fixed: 32 unassigned code points diverged between Rust and TS, two channels bypassed the owner, and warnings went silent after the cap. Held: no over-stripping; SessionEnd delivered 100/100 under a CPU hog. The held `tabs.ts` gap is pinned as `it.fails`. |
+| **ft-9cfd5074** S1-09 (W8-L2) | `Host::knows` checks against the live terminal registry (`SessionHost` → `terminal::list_sessions`, failing closed). Hook reports for unknown sessions are refused as `unknown_session` and counted in `bridge_rejected`. A per-session token bucket (burst 256, 64/s, LRU-capped) refuses as `rate_limited`. Reports keyed `hook-…` share one bucket (32, 4/s). The registration-window and post-exit cases are defined and tested. **Security-impact statement:** reports for unknown sessions are refused, each session is rate-limited, same-uid remains the connection boundary, and nobody gains access. | Opus review in lieu of an adversary, per the owner. 6 of 9 new tests failed with screening disabled. **Accepted gap:** `knows()` can block up to the terminal host's 10 s `CALL_DEADLINE` when the host is hung. |
+| **ft-d1c290f1** outbound data (W8-L3) | Scanner children run on an allowlisted environment (`capture_command_scrubbed`). Only `${VAR}` names that the pinned user `.npmrc` references pass through. npm userconfig, globalconfig and registry are pinned. `parse_npmrc` parses as npm does, and every directory up to the repo root is checked. A repo-set registry, token, proxy, TLS (`strict-ssl`/`ca`/`cafile`/`certfile`/`keyfile`) or `noproxy`/`tokenHelper` setting is refused as "registry overridden by repository config". bunfig fails closed (no TOML dependency). AI: `resolve_target` is the one gate, raising `ai_endpoint_unconfirmed`; the confirmation names the runtime and port; the saved selection is re-checked (60 s TTL); there is one shared pending confirmation; model names are cleaned through the shared owner. | Adversarial pass: 14 Rust and 2 vitest breaks, all fixed (several confirmed against real npm 11.20). Held: the env allowlist drops NODE_OPTIONS, npm_config_* and DYLD_*; real `npm audit` never touched a lockfile's `resolved` host. Lappi is confirmed to be an explicit opt-in, defaulting to false. |
+
+## Gates
+- **Gate 17** (W8-L1): green apart from three load flakes in untouched code, all of which passed alone (`adv_w3l2` 10/10, `vite-watch` 5/5).
+- **Gate 18** (W8-L2 and W8-L3): fmt, clippy, bun check, check:types, check:ipc, check:vendor-schema and vitest (10884 passed, 0 failed) were green, and cargo passed 133 of 134 suites. The one failure was a real interaction with S1-09: `alerts::bridge::tests::concurrent_apply_leaves_listening_and_the_socket_in_agreement` failed 16 of 300 rounds with `answers=false`. Its probe is a session-less report, which now draws on the process-wide `hook-…` rate bucket (32, 4/s) that other tests also drain, so a live loop correctly answered `rate_limited`. The test asserted acceptance where it meant liveness; it now accepts any `{"ok":bool}` reply (d1969a12, rustfmt d99c8072). Rechecked: fmt, clippy, the guard suites and alerts:: 199/0. Other bridge tests that expect `ok:true` for session-less reports share the same latent exposure; it is recorded on ft-e7c644de.
+
+## Wrap-up actions (owner-directed)
+- **Branches deleted:**
+  - 15 term-session agent branches, all contained in `term/integrate`;
+  - `fix/bypass-gate`, already in main;
+  - `parked/other-session-1022` (1c5b3ea1);
+  - `term/fable-diffs` and `term/fable-host` (abcc6b76), with their uncommitted edits saved as patches;
+  - `term/integrate` (849f8133; 111 commits not in main).
+  Every SHA is in `tmp/build-1020/branch-audit-pre-cleanup.txt`.
+- **term/integrate is not preserved.** It was bundled and its worktree edits saved as patches, and then the owner had those backups deleted too. Its commits (849f8133, abcc6b76) exist only as unreachable objects until git garbage-collects them.
+- **Gap cards filed:**
+  - ft-67f95e2d: fixes deferred while the files were held, which are now free on main;
+  - ft-24c70de8: reinstall and re-pin;
+  - ft-e7c644de: load-sensitive tests and 21 suites without the unmetered spawn gate;
+  - ft-878db72b: hook coverage gaps.
+
+## Incident: the board went down mid-wrap-up
+- **Symptom:** from about 16:25 every gitpulse MCP board call (read or write) failed with `unsupported DevCouncil schema version 10; this binary knows 9`.
+- **What did not change:** the installed `gitpulse-mcp`, `dcstore` and `devmap` binaries (all Oct 21), and every DevCouncil `state.sqlite` on disk (main files from Oct 7–11, empty WALs).
+- **Not identified:** which store reports 10. The command gate blocks reading a store's schema version.
+- **Fix:** the reinstall in ft-24c70de8 (a dc-store-10 gitpulse-mcp), or finding the store.
+- **Board writes owed:** listed in `tmp/build-1020/pending-board-ops.md`.
