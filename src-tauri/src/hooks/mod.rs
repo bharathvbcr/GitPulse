@@ -43,6 +43,8 @@ use crate::harness::{self, PolicyStatus, ScopedVerdict};
 use crate::insights::{self, same_path, CollisionRisk, InsightsSnapshot};
 
 pub mod advisory_once;
+mod notify_input;
+pub use notify_input::SESSION_END_HOST_TIMEOUT;
 pub mod signal_guard;
 
 /// Wall-clock ceiling for the work behind one hook invocation.
@@ -138,6 +140,43 @@ pub fn read_input(reader: impl std::io::Read + Send + 'static) -> Result<HookInp
     .ok_or_else(|| {
         "hook stdin deadline exceeded or reader could not run; no decision".to_string()
     })?
+}
+
+/// Reads the payload `subcommand` is about to judge, or none at all.
+///
+/// `notify` is a report, not a check, and the plugin runs it for every tool
+/// call of every Claude Code session on the machine, so it is the one
+/// subcommand that sometimes has nothing to say before it has seen stdin:
+/// an unknown event is an error whatever the payload, and a state or a
+/// resolution outside a GitPulse terminal is refused by the socket. Those
+/// read nothing (an empty input), and the host, finding the pipe closed,
+/// stops writing. What `notify` does read, it reads once, bounded, and keeps
+/// only the fields it uses ([`notify_input::read_notify_input`]).
+///
+/// Every other subcommand judges the call from the whole payload and reads it
+/// whole, within [`MAX_INPUT_BYTES`].
+pub fn read_for(
+    subcommand: &str,
+    argument: Option<&str>,
+    reader: impl std::io::Read + Send + 'static,
+) -> Result<HookInput, String> {
+    if subcommand != "notify" {
+        return read_input(reader);
+    }
+    if !notify_wants_input(argument) {
+        return Ok(HookInput::default());
+    }
+    let (read_budget, _) = notify_input::budgets_for(argument.unwrap_or_default());
+    notify_input::read_notify_input_within(reader, notify_input::MAX_READ_BYTES, read_budget)
+}
+
+/// Whether a `notify` for `argument` has anything to read stdin for. See
+/// [`read_for`].
+fn notify_wants_input(argument: Option<&str>) -> bool {
+    match argument.and_then(crate::alerts::bridge::event) {
+        None => false,
+        Some(event) => event.role == crate::alerts::bridge::Role::Banner || session_env().is_some(),
+    }
 }
 
 /// Hard cap on the SessionStart brief, in bytes.
@@ -1954,6 +1993,11 @@ pub const AGENT_KIND_ENV: &str = "GITPULSE_AGENT_KIND";
 /// on the same machine; if it does not answer within this, it is not there.
 pub(crate) const NOTIFY_BUDGET: Duration = Duration::from_millis(1500);
 
+/// [`NOTIFY_BUDGET`] for `session_ended`, which is held to the injected
+/// `SessionEnd` hook's 1 s host timeout ([`SESSION_END_HOST_TIMEOUT`]): the
+/// read and the report, 0.3 s each, end 0.4 s before it.
+pub(crate) const SESSION_END_NOTIFY_BUDGET: Duration = Duration::from_millis(300);
+
 /// Tells the running GitPulse that this agent wants the user.
 ///
 /// The argument, not the payload, carries the reason. The plugin registers
@@ -2005,7 +2049,8 @@ fn run_notify(
     let payload = notify_payload(event, input);
     // Detached at the deadline. A hook the host is waiting on must not be held
     // by a socket that is not answering, and the report is worth nothing late.
-    match within_budget(NOTIFY_BUDGET, move || send(&path, &payload)) {
+    let (_, send_budget) = notify_input::budgets_for(event.name);
+    match within_budget(send_budget, move || send(&path, &payload)) {
         Some(Ok(())) => Ok(HookOutput::silent()),
         Some(Err(error)) => Err(format!("notification report not delivered: {error}")),
         None => Err("notification report exceeded its deadline; not retried".into()),
@@ -2474,6 +2519,10 @@ fn truncate_marked(mut text: String, limit: usize) -> String {
 
 #[cfg(test)]
 mod notify_adv_tests;
+#[cfg(test)]
+mod notify_input_attack_tests;
+#[cfg(test)]
+mod notify_input_tests;
 #[cfg(test)]
 mod notify_protocol_tests;
 #[cfg(test)]

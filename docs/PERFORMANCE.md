@@ -690,6 +690,57 @@ hook's critical path but not removed); the conditional follow-on of replacing
 `git worktree list` with a registry read is not needed to reach 15 ms and was not
 taken.
 
+### `gitpulse-hook notify` by stdin size (S1-15)
+
+The plugin runs `notify` on every tool call of every Claude Code session, and
+GitPulse now injects the same notification hooks into every `claude` it
+launches, so what `notify` costs before it has anything to say is paid a lot.
+It used to read and parse up to 4 MiB of stdin first, and refused anything
+larger, losing the `tool_finished` that answers a question. It now reads no
+stdin at all when the event is unknown or is a state or a resolution outside a
+GitPulse terminal, and otherwise reads once (up to 16 MiB) and builds only the
+fields it uses.
+
+**Measured** (`src-tauri/tests/notify_stdin_bench.rs`, an `#[ignore]`d test,
+release hooks, A is the hook built from the tree before the change and B the
+one after, interleaved and rotated per round, 9 rounds x 20 calls per case, min
+and median of the per-round medians, load average 4 to 5, macOS):
+
+```text
+cargo build --release --bin gitpulse-hook    # on the tree before the change
+cp target/release/gitpulse-hook /tmp/gitpulse-hook-base
+# apply the change, rebuild
+GITPULSE_BENCH_BASE_HOOK=/tmp/gitpulse-hook-base \
+GITPULSE_BENCH_HOOK=target/release/gitpulse-hook \
+cargo test --release --test notify_stdin_bench -- --ignored --nocapture
+```
+
+| case | A min median | B min median | A median median | B median median |
+| --- | --- | --- | --- | --- |
+| `outside`, 0 B | 5.92 ms | 5.75 ms | 6.37 ms | 5.98 ms |
+| `outside`, 100 KiB | 5.84 ms | 5.73 ms | 6.01 ms | 5.97 ms |
+| `outside`, 4 MiB | 7.40 ms | 5.79 ms | 7.51 ms | 5.83 ms |
+| `inside`, 0 B | 6.06 ms | 6.01 ms | 6.45 ms | 6.16 ms |
+| `inside`, 100 KiB | 8.99 ms | 8.90 ms | 9.00 ms | 9.02 ms |
+| `inside`, 4 MiB | 9.03 ms | 8.99 ms | 9.11 ms | 9.03 ms |
+
+These are the numbers for the code that ships: B validates every skipped field
+(a number out of range or a bad escape refuses the payload, as the whole parse
+did), measured after that change, load average 5, same N, A first. `outside` is
+a `tool_finished` with no `GITPULSE_SESSION_ID`; `inside` is the same from a
+GitPulse terminal, delivered to a socket that acknowledges it. At 4 MiB
+`outside` saves about 1.6 ms per call (the 4 MiB of stdin A read), to the
+process-start floor of about 5.8 ms; at 0 B and 100 KiB there is nothing to
+save, and the 0.1 to 0.2 ms B leads by there is within the spread of A against
+itself. `inside` at 4 MiB agrees to 0.04 ms, so validation costs the delivered
+case nothing measurable at this resolution and no win is claimed there. The
+`inside` rows at 100 KiB and 4 MiB are dominated by the bench socket's accept
+loop (1 ms poll), not by the hook. A first version of B that walked the pipe
+byte by byte through `serde_json`'s reader measured 17.5 ms at `inside`, 4
+MiB, twice A, and was replaced by reading once and walking the slice. Not
+measured: a payload past 4 MiB on A, which A refuses and so has no
+delivered-report cost to compare.
+
 ## Security impact: who may speak on the mailbox
 
 The mailbox already accepted `Open`, `Reveal` and `Notification` from any

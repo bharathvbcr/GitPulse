@@ -574,7 +574,6 @@ fn a_fleet_doing_everything_at_once_keeps_every_promise() {
 #[cfg(unix)]
 #[test]
 fn a_fleet_whose_reports_arrive_out_of_order_still_accounts_for_every_one() {
-    use std::collections::HashSet;
     for seed in [3u64, 11, 0x5eed] {
         let mut rng = Rng(seed);
         let sessions = 24u64;
@@ -603,33 +602,6 @@ fn a_fleet_whose_reports_arrive_out_of_order_still_accounts_for_every_one() {
             "the shuffle left everything in order"
         );
 
-        // The order rule, stated again from its description rather than copied
-        // from `OrderBook`: a report older than the newest for its session is
-        // stale; one older than the session's end is stale; a session that
-        // ended and is heard from again after its end is a new run.
-        let mut newest: HashMap<String, u64> = HashMap::new();
-        let mut ended: HashMap<String, u64> = HashMap::new();
-        let mut model_stale = HashSet::new();
-        for &index in &arrival {
-            let (stamp, session, event) = &happened[index];
-            let behind_end = ended.get(session).is_some_and(|end| stamp < end);
-            let behind_newest = newest.get(session).is_some_and(|seen| stamp < seen);
-            if behind_end || behind_newest {
-                model_stale.insert(index);
-                continue;
-            }
-            ended.remove(session);
-            newest.insert(session.clone(), *stamp);
-            if event.name == "session_ended" {
-                ended.insert(session.clone(), newest.remove(session).unwrap_or(*stamp));
-            }
-        }
-        assert!(
-            model_stale.len() > total / 50,
-            "seed {seed}: only {} reports were stale, so ordering was barely exercised",
-            model_stale.len()
-        );
-
         let counters = Arc::new(Counters::default());
         let (intake, receiver) = Intake::channel(counters.clone());
         let bells = intake.bells();
@@ -655,20 +627,71 @@ fn a_fleet_whose_reports_arrive_out_of_order_still_accounts_for_every_one() {
         };
         let mut banners = 0u64;
         let mut non_banners_lost = 0u64;
+        // The order rule, stated again from its description rather than copied
+        // from `OrderBook`, and judged as the reports arrive because whether a
+        // report is remembered as a source of twins depends on whether the
+        // queue took it: a report older than the newest for its session is
+        // stale; one older than the session's end is stale; a session that
+        // ended and is heard from again after its end is a new run. A report
+        // that is not stale and is the same event as one the queue took for
+        // its session within the window (the last eight) is a twin: folded, and
+        // moving nothing.
+        let mut newest: HashMap<String, u64> = HashMap::new();
+        let mut ended: HashMap<String, u64> = HashMap::new();
+        let mut taken: HashMap<String, Vec<(u64, &'static str)>> = HashMap::new();
+        let (mut model_stale, mut model_twins) = (0u64, 0u64);
         for &index in &arrival {
             let (stamp, session, event) = &happened[index];
+            let behind_end = ended.get(session).is_some_and(|end| stamp < end);
+            let behind_newest = newest.get(session).is_some_and(|seen| stamp < seen);
+            let twin = !(behind_end || behind_newest)
+                && taken.get(session).is_some_and(|queued| {
+                    queued.iter().any(|(at, name)| {
+                        *name == event.name
+                            && at.abs_diff(*stamp) <= super::intake::DUPLICATE_WINDOW_NS
+                    })
+                });
             let json = format!(
                 r#"{{"v":1,"event":"{}","agent":"claude","session":"{session}"}}"#,
                 event.name
             );
             let (notice, _) = bridge::parse_report_stamped(json.as_bytes()).unwrap();
             let offer = intake.offer_stamped(notice, *stamp);
-            assert_eq!(
-                offer == Offer::Stale,
-                model_stale.contains(&index),
-                "seed {seed}: report {index} ({} for {session} at {stamp}) disagrees with the model: {offer:?}",
-                event.name
-            );
+            if behind_end || behind_newest {
+                model_stale += 1;
+                assert_eq!(
+                    offer,
+                    Offer::Stale,
+                    "seed {seed}: report {index} ({} for {session} at {stamp}) disagrees with the model",
+                    event.name
+                );
+            } else if twin {
+                model_twins += 1;
+                assert_eq!(
+                    offer,
+                    Offer::Coalesced,
+                    "seed {seed}: report {index} ({} for {session} at {stamp}) is a twin",
+                    event.name
+                );
+            } else {
+                assert!(
+                    matches!(offer, Offer::Accepted | Offer::QueueFull),
+                    "seed {seed}: report {index} ({} for {session} at {stamp}): {offer:?}",
+                    event.name
+                );
+                ended.remove(session);
+                newest.insert(session.clone(), *stamp);
+                if event.name == "session_ended" {
+                    ended.insert(session.clone(), newest.remove(session).unwrap_or(*stamp));
+                }
+                if offer == Offer::Accepted {
+                    let queued = taken.entry(session.clone()).or_default();
+                    if queued.len() >= super::intake::RECENT_PER_SESSION {
+                        queued.remove(0);
+                    }
+                    queued.push((*stamp, event.name));
+                }
+            }
             if event.role == bridge::Role::Banner {
                 banners += 1;
             } else if !offer.taken() {
@@ -693,7 +716,15 @@ fn a_fleet_whose_reports_arrive_out_of_order_still_accounts_for_every_one() {
             stale: c.stale.load(Ordering::Relaxed),
             ..SessionAlertStatus::default()
         };
-        assert_eq!(status.stale, model_stale.len() as u64, "seed {seed}");
+        assert_eq!(status.stale, model_stale, "seed {seed}");
+        assert!(
+            model_stale > total as u64 / 200,
+            "seed {seed}: only {model_stale} reports were stale, so ordering was barely exercised"
+        );
+        assert!(
+            model_twins > 0,
+            "seed {seed}: no twin was offered, so folding was not exercised"
+        );
         // A banner ends in exactly one outcome, whatever became of it; a state
         // or a resolution has no outcome of its own, so only losing one shows.
         assert_eq!(
