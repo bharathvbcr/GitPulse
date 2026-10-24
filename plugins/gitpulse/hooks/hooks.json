@@ -110,7 +110,7 @@
           {
             "type": "command",
             "command": "gitpulse-hook notify session_ended",
-            "timeout": 5
+            "timeout": 1
           }
         ]
       }

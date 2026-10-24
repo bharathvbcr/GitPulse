@@ -35,8 +35,10 @@ export const ATTENTION_EVENT = "gitpulse-session-attention";
 
 /**
  * The hook events the notifier names (`alerts::bridge::EVENTS`), and what
- * each asks of the reader. `sessionActivity.contract.test.ts` reads the Rust
- * table and fails if one is missing here.
+ * each asks of the reader. The guard is the first test in
+ * `sessionActivity.test.ts` ("the attention vocabulary matches the native
+ * notifier's"), which reads the Rust table and fails if a name or its kind
+ * differs here; `parseAttention` drops an event outside this table.
  */
 export const ATTENTION_EVENTS = {
   permission_prompt: { kind: "needs-you", label: "Needs your permission" },
@@ -91,10 +93,22 @@ const MAX_TITLE = 120;
 const MAX_DETAIL = 240;
 const SESSION_ID = /^[\w-]{1,128}$/;
 
-/** Strips control characters and bounds text that came from a program. */
-function clean(value: unknown, max: number): string | null {
+/**
+ * Format characters (`Cf`: bidirectional overrides and isolates, zero-width
+ * characters, the byte-order mark, the tag block) and private-use code points.
+ * Invisible or reordering, so dropped without leaving a space.
+ */
+const HIDDEN = /[\p{Cf}\p{Co}]/gu;
+
+/**
+ * Cleans and bounds text that came from a program: hidden characters dropped,
+ * controls and whitespace collapsed to single spaces. Mirrors Rust's
+ * `alerts::text::sanitize`; `scripts/fixtures/sanitize-cases.json` is the table
+ * both are tested against, row by row.
+ */
+export function clean(value: unknown, max: number): string | null {
   if (typeof value !== "string") return null;
-  const text = Array.from(value.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").replace(/\s+/g, " ").trim()).slice(0, max).join("");
+  const text = Array.from(value.replace(HIDDEN, "").replace(/[\p{Cc}\s]+/gu, " ").trim()).slice(0, max).join("");
   return text || null;
 }
 
@@ -122,6 +136,17 @@ export function isReaderInput(data: string): boolean {
   return data.replace(TERMINAL_REPLY, "").length > 0;
 }
 
+/** Unknown event names already logged: each is said once, and the set is bounded. */
+const loggedUnknown = new Set<string>();
+const MAX_LOGGED_UNKNOWN = 16;
+
+function logUnknownEvent(event: unknown): void {
+  const name = typeof event === "string" ? clean(event, 64) ?? "" : `<${typeof event}>`;
+  if (loggedUnknown.has(name) || loggedUnknown.size >= MAX_LOGGED_UNKNOWN) return;
+  loggedUnknown.add(name);
+  console.warn(`[gitpulse-alerts] ignored an attention event this window does not know: ${JSON.stringify(name)}`);
+}
+
 /**
  * Validates an announcement at the boundary. A malformed one is no
  * announcement: it came over IPC, from a native side that may be newer.
@@ -133,9 +158,18 @@ export function parseAttention(raw: unknown, now: number): { session: string; at
   if (typeof row.session !== "string" || !SESSION_ID.test(row.session)) return null;
   if (typeof row.channel !== "string" || !row.channel) return null;
   const detail = clean(row.detail, MAX_DETAIL);
-  const event = typeof row.event === "string" && Object.hasOwn(ATTENTION_EVENTS, row.event)
-    ? ATTENTION_EVENTS[row.event as keyof typeof ATTENTION_EVENTS]
-    : null;
+  // No event is a bell or an OSC notice: it says only that the program wanted
+  // attention. An event this table does not name is a native side newer than
+  // this window; counting it as a bell would put an unknown meaning on the
+  // board as a request, so it is no announcement.
+  let event: (typeof ATTENTION_EVENTS)[keyof typeof ATTENTION_EVENTS] | null = null;
+  if (row.event !== undefined && row.event !== null) {
+    if (typeof row.event !== "string" || !Object.hasOwn(ATTENTION_EVENTS, row.event)) {
+      logUnknownEvent(row.event);
+      return null;
+    }
+    event = ATTENTION_EVENTS[row.event as keyof typeof ATTENTION_EVENTS];
+  }
   if (event?.kind === "clear") return { session: row.session, attention: null };
   const attention: SessionAttention = event
     ? { kind: event.kind, label: event.label, detail, at: now }

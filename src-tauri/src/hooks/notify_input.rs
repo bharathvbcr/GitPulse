@@ -46,10 +46,11 @@ use std::time::Duration;
 #[cfg(test)]
 pub const NOTIFY_HOST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The `timeout` the injected `SessionEnd` hook is given
-/// (`workbench::claude_hook`), so that it never raises Claude Code's 1.5 s exit
-/// budget. The plugin's own copy has [`NOTIFY_HOST_TIMEOUT`]; the hook cannot
-/// tell which copy it is, so a `session_ended` run is held to the shorter.
+/// The `timeout` of `SessionEnd`'s `notify`, in both copies: the plugin
+/// manifest's and the one injected (`workbench::claude_hook`). Claude Code
+/// raises its 1.5 s exit budget to any longer per-hook `SessionEnd` timeout, so
+/// neither may ask for more than the default. A test reads the manifest and
+/// `plugin-contract.test.ts` checks it.
 pub const SESSION_END_HOST_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The host timeout a `notify` for `event` must finish inside.

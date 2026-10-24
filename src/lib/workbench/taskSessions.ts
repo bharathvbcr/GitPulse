@@ -214,7 +214,7 @@ export function attemptUrgency(
  * hooks says it is blocked.
  */
 export function asksForReader(tone: GlanceTone | null): boolean {
-  return (tone === "needs-you" || tone === "error" || tone === "signalled" || tone === "finished") && attentionAsks(tone);
+  return (tone === "needs-you" || tone === "error" || tone === "signalled") && attentionAsks(tone);
 }
 
 // ---- One attempt, as every surface sees it --------------------------------
