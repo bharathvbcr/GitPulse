@@ -32,6 +32,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod commit_graph;
 pub mod hygiene;
+#[cfg(test)]
+mod walk_adversarial;
+#[cfg(test)]
+mod walk_bench;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -247,9 +251,31 @@ pub struct ReclaimSummary {
 pub struct ScanStats {
     pub elapsed_ms: u128,
     pub files_visited: u64,
+    /// Locations a permission refusal kept the walk out of. Counted apart so
+    /// the UI can say why, but their bytes are in no total either, so any
+    /// value above zero also sets `truncated`.
     pub permission_denied: u64,
-    /// True when any budget (time/files/entries/depth) cut the scan short.
-    /// Totals are floors then, not ceilings — never render them as complete.
+    /// Locations any other IO error (EIO, ESTALE, ENAMETOOLONG, a walk root
+    /// that does not exist, ...) kept the walk from reading, or a git probe
+    /// that gave no answer. Their bytes are in no total, so any value above
+    /// zero also sets `truncated`. An entry deleted mid-walk is not counted:
+    /// nothing is missing from the total.
+    #[serde(default)]
+    pub unreadable: u64,
+    /// Entries whose name is not valid UTF-8. They are walked by their real
+    /// path and their bytes counted (only display labels are lossy), so this
+    /// is informational: it does not make the totals a floor.
+    #[serde(default)]
+    pub non_utf8: u64,
+    /// Items an audit cap kept from being examined (linked worktrees beyond
+    /// the sizing cap, orphan-audit entries beyond its cap). Any value above
+    /// zero also sets `truncated`.
+    #[serde(default)]
+    pub unaudited: u64,
+    /// True when any budget (time/files/entries/depth) cut the scan short, or
+    /// when any location was left out (`permission_denied`, `unreadable`,
+    /// `unaudited`). Totals are floors then, not ceilings — never render them
+    /// as complete.
     pub truncated: bool,
 }
 
@@ -295,8 +321,18 @@ struct WalkBudget {
     deadline: Instant,
     truncated: bool,
     permission_denied: u64,
+    /// Non-permission, non-vanished IO errors: an uncounted location, so it
+    /// also truncates.
+    unreadable: u64,
+    non_utf8: u64,
+    /// Items a cap kept the audit from examining; also truncates.
+    unaudited: u64,
     files_visited: u64,
     max_files: usize,
+    /// Test-only fault injection: paths whose read fails with `EIO` instead of
+    /// touching the filesystem (the walkers have no other fs seam).
+    #[cfg(test)]
+    fail_paths: Vec<PathBuf>,
 }
 
 impl WalkBudget {
@@ -310,8 +346,162 @@ impl WalkBudget {
             deadline,
             truncated: false,
             permission_denied: 0,
+            unreadable: 0,
+            non_utf8: 0,
+            unaudited: 0,
             files_visited: 0,
             max_files,
+            #[cfg(test)]
+            fail_paths: Vec::new(),
+        }
+    }
+
+    /// A budget for re-reading a location an enclosing walk already covered
+    /// (the `.git` subdirectories, `.git/index`, the orphan audit). It shares
+    /// the deadline and limits; its counters are NOT merged back, so a bad
+    /// location is counted once, by the walk that owns it. Only the partial
+    /// flag is carried over, with [`Self::absorb_partial`].
+    fn child(&self) -> Self {
+        #[cfg(test)]
+        return Self {
+            fail_paths: self.fail_paths.clone(),
+            ..Self::with_limits(self.deadline, self.max_files)
+        };
+        #[cfg(not(test))]
+        Self::with_limits(self.deadline, self.max_files)
+    }
+
+    fn absorb_partial(&mut self, child: &Self) {
+        self.truncated |= child.truncated;
+    }
+
+    /// A location whose bytes could not be read and are in no total.
+    fn note_unread(&mut self) {
+        self.unreadable += 1;
+        self.truncated = true;
+    }
+
+    /// Classifies one IO error. Every walker error arm calls this (or
+    /// propagates): a permission refusal is counted on its own, anything else
+    /// is an uncounted location and marks the scan partial.
+    fn note_io_error(&mut self, e: &io::Error) {
+        if e.kind() == io::ErrorKind::PermissionDenied {
+            // Counted on its own for the UI's wording, and a floor all the same.
+            self.permission_denied += 1;
+            self.truncated = true;
+        } else if e.kind() == io::ErrorKind::NotFound {
+            // The entry was deleted between listing and reading: its bytes
+            // are gone, not missing from the total.
+        } else {
+            self.note_unread();
+        }
+    }
+
+    #[cfg(test)]
+    fn injected(&self, path: &Path) -> Option<io::Error> {
+        self.fail_paths
+            .iter()
+            .any(|p| p == path)
+            .then(|| io::Error::from_raw_os_error(5))
+    }
+
+    /// `read_dir`, with the failure classified. `None` means skip the subtree.
+    fn read_dir(&mut self, dir: &Path) -> Option<fs::ReadDir> {
+        self.open_dir(dir, false)
+    }
+
+    /// `read_dir` of a walk ROOT. A root the caller expected to exist and that
+    /// is gone (a stale mount, a pruned worktree) is unreadable, not an empty
+    /// tree; `NotFound` further down is still a delete mid-walk.
+    fn read_root(&mut self, dir: &Path) -> Option<fs::ReadDir> {
+        self.open_dir(dir, true)
+    }
+
+    fn open_dir(&mut self, dir: &Path, root: bool) -> Option<fs::ReadDir> {
+        #[cfg(test)]
+        if let Some(e) = self.injected(dir) {
+            self.note_io_error(&e);
+            return None;
+        }
+        match fs::read_dir(dir) {
+            Ok(read) => Some(read),
+            Err(e) if root && e.kind() == io::ErrorKind::NotFound => {
+                self.note_unread();
+                None
+            }
+            Err(e) => {
+                self.note_io_error(&e);
+                None
+            }
+        }
+    }
+
+    /// `metadata` / `symlink_metadata` of an entry, with the failure classified.
+    fn stat(&mut self, path: &Path, follow: bool) -> Option<fs::Metadata> {
+        #[cfg(test)]
+        if let Some(e) = self.injected(path) {
+            self.note_io_error(&e);
+            return None;
+        }
+        match if follow {
+            fs::metadata(path)
+        } else {
+            fs::symlink_metadata(path)
+        } {
+            Ok(meta) => Some(meta),
+            Err(e) => {
+                self.note_io_error(&e);
+                None
+            }
+        }
+    }
+
+    /// One `read_dir` item. A failed read means an unknown number of entries
+    /// were lost, so it is counted as one unreadable location.
+    fn entry(&mut self, item: io::Result<fs::DirEntry>) -> Option<fs::DirEntry> {
+        match item {
+            Ok(entry) => Some(entry),
+            Err(e) => {
+                self.note_io_error(&e);
+                None
+            }
+        }
+    }
+
+    fn file_type(&mut self, entry: &fs::DirEntry) -> Option<fs::FileType> {
+        match entry.file_type() {
+            Ok(t) => Some(t),
+            Err(e) => {
+                self.note_io_error(&e);
+                None
+            }
+        }
+    }
+
+    /// The entry's name for display and name matching. A name that is not
+    /// valid UTF-8 is counted and rendered lossily; the walk itself uses
+    /// `entry.path()` and the raw name, which keep the exact bytes. The valid
+    /// case reuses the allocation `file_name()` already made.
+    fn name(&mut self, entry: &fs::DirEntry) -> String {
+        match entry.file_name().into_string() {
+            Ok(name) => name,
+            Err(raw) => self.label(&raw).text,
+        }
+    }
+
+    /// A display label that still knows which name it came from: two labels
+    /// compare equal only when the underlying names do.
+    fn label(&mut self, raw: &std::ffi::OsStr) -> Label {
+        let text = match raw.to_str() {
+            Some(name) => name.to_string(),
+            None => {
+                self.non_utf8 += 1;
+                raw.to_string_lossy().into_owned()
+            }
+        };
+        Label {
+            text,
+            raw: raw.to_os_string(),
         }
     }
 
@@ -321,6 +511,55 @@ impl WalkBudget {
 
     fn mark_exhausted(&mut self) {
         self.truncated = true;
+    }
+}
+
+/// A name as shown, plus the name as it is. Display and `==` against a string
+/// use the text; `==` against another label uses the exact bytes, so distinct
+/// non-UTF-8 names never collapse into one lossy rendering.
+#[derive(Debug, Clone)]
+struct Label {
+    text: String,
+    raw: std::ffi::OsString,
+}
+
+impl std::fmt::Display for Label {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl PartialEq for Label {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+
+impl PartialEq<&str> for Label {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
+/// What every walk of one scan counted, summed for `ScanStats`.
+#[derive(Default)]
+struct WalkTally {
+    files_visited: u64,
+    permission_denied: u64,
+    unreadable: u64,
+    non_utf8: u64,
+    unaudited: u64,
+}
+
+impl WalkTally {
+    fn add(&mut self, budget: &WalkBudget) {
+        self.files_visited = self.files_visited.saturating_add(budget.files_visited);
+        self.permission_denied = self
+            .permission_denied
+            .saturating_add(budget.permission_denied);
+        self.unreadable = self.unreadable.saturating_add(budget.unreadable);
+        self.non_utf8 = self.non_utf8.saturating_add(budget.non_utf8);
+        self.unaudited = self.unaudited.saturating_add(budget.unaudited);
     }
 }
 
@@ -520,13 +759,13 @@ fn size_tree_scoped(root: &Path, budget: &mut WalkBudget, is_git: bool) -> (u64,
             budget.mark_exhausted();
             return (total, true);
         }
-        let read = match fs::read_dir(&dir) {
-            Ok(read) => read,
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                budget.permission_denied += 1;
-                continue;
-            }
-            Err(_) => continue,
+        let opened = if depth == 0 {
+            budget.read_root(&dir)
+        } else {
+            budget.read_dir(&dir)
+        };
+        let Some(read) = opened else {
+            continue;
         };
 
         let max_entries = if in_artifact || is_git {
@@ -536,21 +775,22 @@ fn size_tree_scoped(root: &Path, budget: &mut WalkBudget, is_git: bool) -> (u64,
         };
 
         let mut entries_seen = 0usize;
-        for entry in read.flatten() {
+        for item in read {
             entries_seen += 1;
             if entries_seen > max_entries {
                 local_truncated = true;
                 break;
             }
-            let Ok(file_type) = entry.file_type() else {
+            let Some(entry) = budget.entry(item) else {
                 continue;
             };
-            let Ok(name) = entry.file_name().into_string() else {
-                continue; // non-UTF8 name: skipped, never panics
+            let Some(file_type) = budget.file_type(&entry) else {
+                continue;
             };
+            let name = budget.name(&entry);
             if file_type.is_symlink() {
                 // Count the link's own size, never its target's.
-                if let Ok(meta) = fs::symlink_metadata(entry.path()) {
+                if let Some(meta) = budget.stat(&entry.path(), false) {
                     total += meta.len();
                 }
                 continue;
@@ -573,26 +813,20 @@ fn size_tree_scoped(root: &Path, budget: &mut WalkBudget, is_git: bool) -> (u64,
                 stack.push((entry.path(), depth + 1, child_in_artifact));
             } else if file_type.is_file() {
                 budget.files_visited += 1;
-                match fs::metadata(entry.path()) {
-                    Ok(meta) => {
-                        let logical_len = meta.len();
-                        #[cfg(unix)]
-                        let is_dup = if meta.nlink() > 1 {
-                            !seen_inodes.insert((meta.dev(), meta.ino()))
-                        } else {
-                            false
-                        };
-                        #[cfg(not(unix))]
-                        let is_dup = false;
+                if let Some(meta) = budget.stat(&entry.path(), true) {
+                    let logical_len = meta.len();
+                    #[cfg(unix)]
+                    let is_dup = if meta.nlink() > 1 {
+                        !seen_inodes.insert((meta.dev(), meta.ino()))
+                    } else {
+                        false
+                    };
+                    #[cfg(not(unix))]
+                    let is_dup = false;
 
-                        if !is_dup {
-                            total += logical_len;
-                        }
+                    if !is_dup {
+                        total += logical_len;
                     }
-                    Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                        budget.permission_denied += 1;
-                    }
-                    Err(_) => {}
                 }
             }
         }
@@ -620,22 +854,23 @@ fn collect_large_files(
             budget.mark_exhausted();
             break;
         }
-        let Ok(read) = fs::read_dir(&dir) else {
+        let Some(read) = budget.read_dir(&dir) else {
             continue;
         };
         let mut entries_seen = 0usize;
-        for entry in read.flatten() {
+        for item in read {
             entries_seen += 1;
             if entries_seen > MAX_ENTRIES_PER_DIR {
                 truncated = true;
                 break;
             }
-            let Ok(file_type) = entry.file_type() else {
+            let Some(entry) = budget.entry(item) else {
                 continue;
             };
-            let Ok(name) = entry.file_name().into_string() else {
+            let Some(file_type) = budget.file_type(&entry) else {
                 continue;
             };
+            let name = budget.name(&entry);
             if file_type.is_symlink() {
                 continue;
             }
@@ -653,7 +888,7 @@ fn collect_large_files(
                 stack.push((entry.path(), depth + 1));
             } else if file_type.is_file() {
                 budget.files_visited += 1;
-                let len = fs::metadata(entry.path()).map(|m| m.len()).unwrap_or(0);
+                let len = budget.stat(&entry.path(), true).map_or(0, |m| m.len());
                 if len >= LARGE_FILE_THRESHOLD {
                     let rel = entry
                         .path()
@@ -680,8 +915,11 @@ fn collect_large_files(
 /// (loose_count, loose_kib, pack_file_count, pack_kib). Values carry git's
 /// own unit suffix ("24 KiB"), so only the leading integer is taken.
 /// Malformed lines degrade to zero, matching reader conventions elsewhere.
-fn parse_count_objects(stdout: &str) -> (u64, u64, u64, u64) {
-    let mut out = (0u64, 0u64, 0u64, 0u64);
+///
+/// `None` unless every one of the four figures was present and numeric, so a
+/// reader never takes a missing figure for a measured zero.
+fn parse_count_objects(stdout: &str) -> Option<(u64, u64, u64, u64)> {
+    let mut out = [None::<u64>; 4];
     for line in stdout.lines() {
         let Some((key, value)) = line.split_once(':') else {
             continue;
@@ -691,24 +929,36 @@ fn parse_count_objects(stdout: &str) -> (u64, u64, u64, u64) {
             .chars()
             .take_while(|c| c.is_ascii_digit())
             .collect();
-        let value = digits.parse::<u64>().unwrap_or(0);
-        match key.trim() {
-            "count" => out.0 = value,
-            "size" => out.1 = value,
-            "packs" => out.2 = value,
-            "size-pack" => out.3 = value,
-            _ => {}
-        }
+        let slot = match key.trim() {
+            "count" => 0,
+            "size" => 1,
+            "packs" => 2,
+            "size-pack" => 3,
+            _ => continue,
+        };
+        out[slot] = digits.parse::<u64>().ok();
     }
-    out
+    Some((out[0]?, out[1]?, out[2]?, out[3]?))
 }
 
 /// Sizes the named subdirectory of the git dir, tolerating absence.
 fn git_subdir_bytes(git_dir: &Path, name: &str, budget: &mut WalkBudget) -> u64 {
     let path = git_dir.join(name);
     match fs::symlink_metadata(&path) {
-        Ok(meta) if meta.is_dir() => size_tree(&path, budget).0,
-        _ => 0,
+        // The `.git` walk already visited this tree and counted whatever it
+        // could not read; this pass only measures it again for the breakdown.
+        Ok(meta) if meta.is_dir() => {
+            let mut again = budget.child();
+            let (bytes, _) = size_tree(&path, &mut again);
+            budget.absorb_partial(&again);
+            bytes
+        }
+        Ok(_) => 0,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+        Err(e) => {
+            budget.note_io_error(&e);
+            0
+        }
     }
 }
 
@@ -746,9 +996,9 @@ fn is_check_ignore_exit_one(reason: &str) -> bool {
 /// a status code that was never returned must not win.
 fn census_from_check_ignore(
     result: Result<Vec<u8>, String>,
-) -> GitProbe<std::collections::HashSet<String>> {
+) -> GitProbe<std::collections::HashSet<Vec<u8>>> {
     match result {
-        Ok(out) => GitProbe::Answered(parse_check_ignore_z(&String::from_utf8_lossy(&out))),
+        Ok(out) => GitProbe::Answered(parse_check_ignore_z(&out)),
         Err(reason) if is_deferred_under_load(&reason) => GitProbe::Unexamined,
         Err(reason) if is_check_ignore_exit_one(&reason) => {
             GitProbe::Answered(std::collections::HashSet::new())
@@ -769,8 +1019,8 @@ fn census_from_check_ignore(
 /// [`GitProbe::Unexamined`]: the directory is not reported as unignored.
 fn batch_check_ignore(
     repo: &Path,
-    candidates: &[String],
-) -> GitProbe<std::collections::HashSet<String>> {
+    candidates: &[std::ffi::OsString],
+) -> GitProbe<std::collections::HashSet<Vec<u8>>> {
     if candidates.is_empty() {
         return GitProbe::Answered(std::collections::HashSet::new());
     }
@@ -779,7 +1029,7 @@ fn batch_check_ignore(
     // no argv-length limit, and `-z` framing survives any byte except NUL.
     let mut stdin_bytes = Vec::with_capacity(candidates.iter().map(|c| c.len() + 2).sum());
     for candidate in candidates {
-        stdin_bytes.extend_from_slice(candidate.as_bytes());
+        stdin_bytes.extend_from_slice(candidate.as_encoded_bytes());
         stdin_bytes.push(b'/');
         stdin_bytes.push(0);
     }
@@ -808,16 +1058,19 @@ fn batch_check_ignore(
 /// real source and pattern mean "ignored"; anything malformed is skipped.
 /// Trailing slashes are stripped from echoed names (candidates are fed with
 /// one to activate directory-only patterns).
-fn parse_check_ignore_z(stdout: &str) -> std::collections::HashSet<String> {
+fn parse_check_ignore_z(stdout: &[u8]) -> std::collections::HashSet<Vec<u8>> {
+    let blank = |field: &[u8]| field.iter().all(u8::is_ascii_whitespace);
     let mut ignored = std::collections::HashSet::new();
-    let fields: Vec<&str> = stdout.split('\0').collect();
+    let fields: Vec<&[u8]> = stdout.split(|b| *b == 0).collect();
     let mut i = 0;
     while i + 3 < fields.len() {
-        let source = fields[i];
-        let pattern = fields[i + 2];
-        let pathname = fields[i + 3].trim_end_matches('/');
-        if !source.trim().is_empty() && !pattern.trim().is_empty() && !pathname.is_empty() {
-            ignored.insert(pathname.to_string());
+        let (source, pattern) = (fields[i], fields[i + 2]);
+        let mut pathname = fields[i + 3];
+        while let Some((b'/', rest)) = pathname.split_last() {
+            pathname = rest;
+        }
+        if !blank(source) && !blank(pattern) && !pathname.is_empty() {
+            ignored.insert(pathname.to_vec());
         }
         i += 4;
     }
@@ -828,31 +1081,35 @@ fn parse_check_ignore_z(stdout: &str) -> std::collections::HashSet<String> {
 /// `git ls-files` call. Candidate prefixes get `:(literal)` pathspec magic so
 /// glob characters inside user-named intermediate directories cannot widen
 /// what is counted.
-fn batch_tracked_counts(repo: &Path, candidates: &[String]) -> GitProbe<HashMap<String, u64>> {
-    let mut counts: HashMap<String, u64> = HashMap::new();
+fn batch_tracked_counts(
+    repo: &Path,
+    candidates: &[std::ffi::OsString],
+) -> GitProbe<HashMap<Vec<u8>, u64>> {
+    let mut counts: HashMap<Vec<u8>, u64> = HashMap::new();
     if candidates.is_empty() {
         return GitProbe::Answered(counts);
     }
-    let literal: Vec<String> = candidates
+    let mut argv: Vec<&str> = vec!["-c", "core.fsmonitor=false", "ls-files", "-z"];
+    // A pathspec travels in argv, which here is text. When every candidate is
+    // text, ask git only about them; when one is not, list the whole index and
+    // match the exact bytes ourselves, so a tracked file under a non-UTF-8
+    // directory is counted instead of being skipped.
+    let literal: Option<Vec<String>> = candidates
         .iter()
-        .map(|c| format!(":(literal){c}"))
+        .map(|c| c.to_str().map(|c| format!(":(literal){c}")))
         .collect();
-    let mut argv: Vec<&str> = vec!["-c", "core.fsmonitor=false", "ls-files", "-z", "--"];
-    argv.extend(literal.iter().map(String::as_str));
+    if let Some(literal) = &literal {
+        argv.push("--");
+        argv.extend(literal.iter().map(String::as_str));
+    }
     let Ok(bytes) = crate::engine::git_cli::git_with_stdin(repo, &argv, &[]) else {
         return GitProbe::Unexamined;
     };
-    for raw in bytes.split(|b| *b == 0) {
-        let Ok(path) = std::str::from_utf8(raw) else {
-            continue;
-        };
-        if path.is_empty() {
-            continue;
-        }
+    for raw in bytes.split(|b| *b == 0).filter(|raw| !raw.is_empty()) {
         for candidate in candidates {
-            let prefix = format!("{candidate}/");
-            if path.starts_with(prefix.as_str()) || path == candidate {
-                *counts.entry(candidate.to_string()).or_insert(0) += 1;
+            let prefix = candidate.as_encoded_bytes();
+            if raw.starts_with(prefix) && matches!(raw.get(prefix.len()), None | Some(b'/')) {
+                *counts.entry(prefix.to_vec()).or_insert(0) += 1;
                 break;
             }
         }
@@ -865,8 +1122,10 @@ fn batch_tracked_counts(repo: &Path, candidates: &[String]) -> GitProbe<HashMap<
 /// each byte exactly once. Monolithic containers (like `target`) roll up all
 /// nested compilation output (e.g. `debug/build/.../out`) without fragmentation.
 struct ArtifactCollector {
-    /// (rel path, kind, abs path, bytes attributed to THIS scope only)
-    found: Vec<(String, ArtifactKind, PathBuf, u64)>,
+    /// (rel path, kind, abs path, bytes attributed to THIS scope only). The
+    /// rel path is the real one (`/`-joined, exact bytes): it is what git is
+    /// asked about, never a lossy label.
+    found: Vec<(std::ffi::OsString, ArtifactKind, PathBuf, u64)>,
     /// Indices into `found` for scopes currently being walked.
     open: Vec<usize>,
     build_total: u64,
@@ -897,18 +1156,32 @@ impl ArtifactCollector {
         // 1. The enclosing scope is a monolithic container (e.g. `target`, `node_modules`, `.venv`).
         // 2. The child directory is a generic build output directory (e.g. `build`, `out`, `dist`).
         if let Some(&top) = self.open.last() {
-            let enclosing_rel = &self.found[top].0;
-            let enclosing_name = enclosing_rel
-                .rsplit('/')
-                .next()
-                .unwrap_or(enclosing_rel.as_str());
-            if is_container_artifact(enclosing_name) || is_generic_build_subdir(name) {
+            let enclosing_name = self.found[top]
+                .2
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if is_container_artifact(&enclosing_name) || is_generic_build_subdir(name) {
                 return;
             }
         }
 
-        self.found
-            .push((rel.to_string(), kind, abs.to_path_buf(), 0));
+        // `rel` is a display string (lossy for a non-UTF-8 ancestor); the real
+        // repo-relative path is the same number of trailing components of
+        // `abs`.
+        let depth = Path::new(rel).components().count();
+        let parts: Vec<_> = abs.components().collect();
+        let mut real = std::ffi::OsString::new();
+        for (i, part) in parts[parts.len().saturating_sub(depth)..]
+            .iter()
+            .enumerate()
+        {
+            if i > 0 {
+                real.push("/");
+            }
+            real.push(part.as_os_str());
+        }
+        self.found.push((real, kind, abs.to_path_buf(), 0));
         self.open.push(self.found.len() - 1);
     }
 
@@ -935,7 +1208,7 @@ struct WorktreeWalkContext<'a> {
     seen_inodes: &'a mut std::collections::HashSet<(u64, u64)>,
     large_collector: &'a mut LargeFileCollector,
     linked_worktrees: &'a std::collections::HashSet<PathBuf>,
-    ancestor_names: &'a mut Vec<String>,
+    ancestor_names: &'a mut Vec<std::ffi::OsString>,
     #[cfg(unix)]
     seen_dir_inodes: &'a mut std::collections::HashSet<(u64, u64)>,
 }
@@ -953,15 +1226,15 @@ fn walk_worktree(
         budget.mark_exhausted();
         return 0;
     }
-    let read = match fs::read_dir(dir) {
-        Ok(read) => read,
-        // An unreadable subtree is skipped and counted — never fatal, and
-        // never silently treated as "empty" in the stats.
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-            budget.permission_denied += 1;
-            return 0;
-        }
-        Err(_) => return 0,
+    // An unreadable subtree is skipped and counted — never fatal, and never
+    // silently treated as "empty" in the stats.
+    let opened = if depth == 0 {
+        budget.read_root(dir)
+    } else {
+        budget.read_dir(dir)
+    };
+    let Some(read) = opened else {
+        return 0;
     };
     let mut total = 0u64;
     let mut subdirs: Vec<(PathBuf, String)> = Vec::new();
@@ -980,18 +1253,19 @@ fn walk_worktree(
         .to_string_lossy()
         .replace('\\', "/");
 
-    for entry in read.flatten() {
+    for item in read {
         entries_seen += 1;
         if entries_seen > max_entries {
             budget.mark_exhausted();
             break;
         }
-        let Ok(file_type) = entry.file_type() else {
+        let Some(entry) = budget.entry(item) else {
             continue;
         };
-        let Ok(name) = entry.file_name().into_string() else {
+        let Some(file_type) = budget.file_type(&entry) else {
             continue;
         };
+        let name = budget.name(&entry);
         let child_rel = if rel_dir.is_empty() {
             name.clone()
         } else {
@@ -999,9 +1273,7 @@ fn walk_worktree(
         };
 
         if file_type.is_symlink() {
-            let bytes = fs::symlink_metadata(entry.path())
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let bytes = budget.stat(&entry.path(), false).map_or(0, |m| m.len());
             ctx.collector.on_file(bytes);
             total += bytes;
         } else if file_type.is_dir() {
@@ -1017,28 +1289,22 @@ fn walk_worktree(
             subdirs.push((entry.path(), child_rel));
         } else if file_type.is_file() {
             budget.files_visited += 1;
-            match fs::metadata(entry.path()) {
-                Ok(meta) => {
-                    let logical_len = meta.len();
-                    #[cfg(unix)]
-                    let is_dup = if meta.nlink() > 1 {
-                        !ctx.seen_inodes.insert((meta.dev(), meta.ino()))
-                    } else {
-                        false
-                    };
-                    #[cfg(not(unix))]
-                    let is_dup = false;
+            if let Some(meta) = budget.stat(&entry.path(), true) {
+                let logical_len = meta.len();
+                #[cfg(unix)]
+                let is_dup = if meta.nlink() > 1 {
+                    !ctx.seen_inodes.insert((meta.dev(), meta.ino()))
+                } else {
+                    false
+                };
+                #[cfg(not(unix))]
+                let is_dup = false;
 
-                    if !is_dup {
-                        ctx.collector.on_file(logical_len);
-                        total += logical_len;
-                        ctx.large_collector.consider(logical_len, &child_rel);
-                    }
+                if !is_dup {
+                    ctx.collector.on_file(logical_len);
+                    total += logical_len;
+                    ctx.large_collector.consider(logical_len, &child_rel);
                 }
-                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                    budget.permission_denied += 1;
-                }
-                Err(_) => {}
             }
         }
     }
@@ -1048,11 +1314,27 @@ fn walk_worktree(
         // Linked worktrees (e.g. .claude/worktrees/*, .cursor/worktrees/*, or worktrees/*)
         // or submodules with their own git pointers: skip descending. They are sized
         // individually in collect_worktree_usage, never as part of the main worktree.
-        let is_linked_worktree = ctx.linked_worktrees.contains(&child_path)
-            || fs::canonicalize(&child_path)
-                .map(|c| ctx.linked_worktrees.contains(&c))
-                .unwrap_or(false)
-            || child_path.join(".git").exists();
+        let mut is_linked_worktree = ctx.linked_worktrees.contains(&child_path);
+        if !is_linked_worktree {
+            match fs::canonicalize(&child_path) {
+                Ok(canonical) => is_linked_worktree = ctx.linked_worktrees.contains(&canonical),
+                Err(e) => budget.note_io_error(&e),
+            }
+        }
+        if !is_linked_worktree {
+            match fs::metadata(child_path.join(".git")) {
+                Ok(_) => is_linked_worktree = true,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    // Cannot tell whether this is a worktree of its own, so it
+                    // is neither descended into (it could be counted twice)
+                    // nor passed over silently: counted, which marks the
+                    // totals a floor.
+                    budget.note_io_error(&e);
+                    continue;
+                }
+            }
+        }
         if is_linked_worktree {
             continue;
         }
@@ -1066,6 +1348,8 @@ fn walk_worktree(
 
         let child_depth = depth + 1;
         let child_name = child_rel.rsplit('/').next().unwrap_or_default().to_string();
+        // Identity is the real name, not its lossy rendering.
+        let child_key = child_path.file_name().unwrap_or_default().to_os_string();
 
         // Rogue nesting / recursive loop heuristic: if a directory component name
         // appears >= 2 times in its active parent chain (e.g. backend/go_orchestrator/backend/go_orchestrator/backend),
@@ -1073,14 +1357,14 @@ fn walk_worktree(
         let repetition_count = ctx
             .ancestor_names
             .iter()
-            .filter(|&a| a == &child_name)
+            .filter(|&a| a == &child_key)
             .count();
         if repetition_count >= 2 {
             budget.mark_exhausted();
             continue;
         }
 
-        ctx.ancestor_names.push(child_name.clone());
+        ctx.ancestor_names.push(child_key);
         let scopes_before = ctx.collector.open.len();
         ctx.collector
             .on_dir_enter(&child_path, &child_rel, &child_name);
@@ -1115,10 +1399,9 @@ fn walk_worktree(
 fn collect_worktree_usage(
     infos: &[crate::engine::WorktreeInfo],
     deadline: Instant,
-) -> (Vec<WorktreeUsage>, u64, u64, bool) {
+) -> (Vec<WorktreeUsage>, WalkTally, bool) {
     let mut out = Vec::new();
-    let mut total_files = 0u64;
-    let mut total_perms = 0u64;
+    let mut tally = WalkTally::default();
     let mut any_truncated = false;
 
     for info in infos
@@ -1129,8 +1412,7 @@ fn collect_worktree_usage(
         let path = PathBuf::from(&info.path);
         let mut wt_budget = WalkBudget::with_limits(deadline, MAX_FILES_PER_WORKTREE);
         let (bytes, truncated) = size_tree(&path, &mut wt_budget);
-        total_files = total_files.saturating_add(wt_budget.files_visited);
-        total_perms = total_perms.saturating_add(wt_budget.permission_denied);
+        tally.add(&wt_budget);
         let is_trunc = truncated || wt_budget.truncated;
         if is_trunc {
             any_truncated = true;
@@ -1143,7 +1425,16 @@ fn collect_worktree_usage(
             truncated: is_trunc,
         });
     }
-    (out, total_files, total_perms, any_truncated)
+    let listed = infos.iter().filter(|i| !i.is_main).count();
+    if listed > MAX_SIZED_WORKTREES {
+        // Worktrees past the cap are not sized: say how many, never imply the
+        // listed ones are all of them.
+        tally.unaudited = tally
+            .unaudited
+            .saturating_add((listed - MAX_SIZED_WORKTREES) as u64);
+        any_truncated = true;
+    }
+    (out, tally, any_truncated)
 }
 
 fn branch_summary(repo_path: &str) -> BranchStorageSummary {
@@ -1214,32 +1505,87 @@ const RECLAIM_REFLOG_FLOOR: u64 = 32 * 1024 * 1024;
 /// Nothing in the previous report noticed this. `worktrees_admin_bytes` counted
 /// the space and attributed it to live worktrees.
 fn orphaned_worktree_admin(git_dir: &Path, budget: &mut WalkBudget) -> Vec<(String, u64)> {
+    const CAP: usize = MAX_SIZED_WORKTREES * 8;
     let mut found = Vec::new();
-    let Ok(entries) = fs::read_dir(git_dir.join("worktrees")) else {
+    // The `.git` walk already read this tree and counted what it could not;
+    // the audit works on a child budget so those locations are not counted
+    // again, and keeps the partial flag. Reads only the audit makes (each
+    // `gitdir` file's contents, its target) are counted on `budget`.
+    let mut audit = budget.child();
+    // `NotFound` here means no linked worktree was ever added.
+    let Some(entries) = audit.read_dir(&git_dir.join("worktrees")) else {
+        budget.absorb_partial(&audit);
         return found;
     };
-    for entry in entries.flatten().take(MAX_SIZED_WORKTREES * 8) {
-        if budget.exhausted() {
-            break;
-        }
-        let admin = entry.path();
-        if !admin.is_dir() {
-            continue;
-        }
-        let Ok(gitdir) = fs::read_to_string(admin.join("gitdir")) else {
-            // No gitdir file at all: git itself treats this as prunable.
-            let (bytes, _) = size_tree(&admin, budget);
-            found.push((entry.file_name().to_string_lossy().into_owned(), bytes));
+    let mut audited = 0usize;
+    for item in entries {
+        let Some(entry) = audit.entry(item) else {
             continue;
         };
-        let target = PathBuf::from(gitdir.trim());
-        if target.as_os_str().is_empty() || target.exists() {
+        if audited >= CAP || budget.exhausted() {
+            // A capped audit is a sample: say how much it left out.
+            budget.unaudited += 1;
+            budget.truncated = true;
             continue;
         }
-        let (bytes, _) = size_tree(&admin, budget);
-        found.push((entry.file_name().to_string_lossy().into_owned(), bytes));
+        audited += 1;
+        let Some(file_type) = audit.file_type(&entry) else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let admin = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // An orphan is claimed only on positive evidence: the `gitdir` file is
+        // absent, or it names a path that is absent. Anything that could not
+        // be read is unknown, and unknown is never offered as reclaimable.
+        let orphaned = match fs::read(admin.join("gitdir")) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+            Err(e) => {
+                budget.note_io_error(&e);
+                false
+            }
+            Ok(raw) => match gitdir_target(raw) {
+                None => {
+                    budget.note_unread();
+                    false
+                }
+                Some(target) => match fs::metadata(&target) {
+                    Ok(_) => false,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+                    Err(e) => {
+                        budget.note_io_error(&e);
+                        false
+                    }
+                },
+            },
+        };
+        if orphaned {
+            let (bytes, _) = size_tree(&admin, &mut audit);
+            found.push((name, bytes));
+        }
     }
+    budget.absorb_partial(&audit);
     found
+}
+
+/// The path a `gitdir` file names: its trimmed bytes, exactly. `None` when the
+/// file is empty or (off Unix) not UTF-8, so it cannot be judged.
+fn gitdir_target(raw: Vec<u8>) -> Option<PathBuf> {
+    let trimmed = raw.trim_ascii();
+    if trimmed.is_empty() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(trimmed)))
+    }
+    #[cfg(not(unix))]
+    {
+        std::str::from_utf8(trimmed).ok().map(PathBuf::from)
+    }
 }
 
 /// Builds the reclaim audit from measurements the scan already took.
@@ -1450,7 +1796,7 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
     if !resolved.is_bare {
         let mut entered_depths: Vec<(usize, usize)> = Vec::new();
         let mut large_collector = LargeFileCollector::new();
-        let mut ancestor_names: Vec<String> = Vec::new();
+        let mut ancestor_names: Vec<std::ffi::OsString> = Vec::new();
         #[cfg(unix)]
         let mut seen_inodes = std::collections::HashSet::new();
         #[cfg(unix)]
@@ -1477,25 +1823,32 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
     }
 
     // ---- Object store: authoritative counters ----------------------------
-    let (loose_objects, loose_kib, pack_files, pack_kib) =
-        match git_text(&repo, &["count-objects", "-v"]) {
-            Ok(text) => parse_count_objects(&text),
-            Err(_) => (0, 0, 0, 0),
-        };
+    // git said nothing usable: the object figures below are unknown, not
+    // zero, so the scan is marked partial once the git budget exists.
+    let counted = git_text(&repo, &["count-objects", "-v"])
+        .ok()
+        .and_then(|text| parse_count_objects(&text));
+    let count_objects_unread = counted.is_none();
+    let (loose_objects, loose_kib, pack_files, pack_kib) = counted.unwrap_or_default();
 
     // ---- Git directory walk ----------------------------------------------
     // Dedicated budget: even if the worktree walk reached its file cap, the .git
     // directory sizing starts with a fresh budget up to MAX_FILES_GIT.
     let mut git_budget = WalkBudget::with_limits(deadline, MAX_FILES_GIT);
+    if count_objects_unread {
+        git_budget.note_unread();
+    }
     let (raw_git_dir_bytes, git_truncated) = size_tree_scoped(&git_dir, &mut git_budget, true);
     let refs_bytes = git_subdir_bytes(&git_dir, "refs", &mut git_budget);
     let reflog_bytes = git_subdir_bytes(&git_dir, "logs", &mut git_budget);
     let lfs_bytes = git_subdir_bytes(&git_dir, "lfs", &mut git_budget);
     let modules_bytes = git_subdir_bytes(&git_dir, "modules", &mut git_budget);
     let worktrees_admin_bytes = git_subdir_bytes(&git_dir, "worktrees", &mut git_budget);
-    let index_bytes = fs::symlink_metadata(git_dir.join("index"))
-        .map(|m| m.len())
-        .unwrap_or(0);
+    // Already visited by the `.git` walk above, which counted any failure.
+    let index_bytes = git_budget
+        .child()
+        .stat(&git_dir.join("index"), false)
+        .map_or(0, |m| m.len());
 
     let pack_bytes = pack_kib.saturating_mul(1024);
     let loose_bytes = loose_kib.saturating_mul(1024);
@@ -1532,43 +1885,56 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
     };
 
     // ---- Artifacts: hygiene cross-check ----------------------------------
-    let mut artifacts: Vec<ArtifactDir> = collector
+    // Each artifact travels with its real repo-relative path: `path` is only
+    // what is shown, git is always asked about the exact bytes.
+    let mut keyed: Vec<(std::ffi::OsString, ArtifactDir)> = collector
         .found
         .iter()
         .filter(|(_, _, _, bytes)| *bytes > 0)
-        .map(|(rel, kind, _, bytes)| ArtifactDir {
-            path: rel.clone(),
-            bytes: *bytes,
-            kind: *kind,
-            unignored: false,
-            tracked_files: 0,
-            checks_unexamined: false,
+        .map(|(rel, kind, _, bytes)| {
+            (
+                rel.clone(),
+                ArtifactDir {
+                    path: rel.to_string_lossy().into_owned(),
+                    bytes: *bytes,
+                    kind: *kind,
+                    unignored: false,
+                    tracked_files: 0,
+                    checks_unexamined: false,
+                },
+            )
         })
         .collect();
-    artifacts.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
-    let artifacts_truncated = artifacts.len() > MAX_ARTIFACT_DIRS;
+    keyed.sort_by(|a, b| {
+        b.1.bytes
+            .cmp(&a.1.bytes)
+            .then_with(|| a.1.path.cmp(&b.1.path))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let artifacts_truncated = keyed.len() > MAX_ARTIFACT_DIRS;
     if artifacts_truncated {
-        artifacts.truncate(MAX_ARTIFACT_DIRS);
+        keyed.truncate(MAX_ARTIFACT_DIRS);
     }
+    let (candidates, mut artifacts): (Vec<std::ffi::OsString>, Vec<ArtifactDir>) =
+        keyed.into_iter().unzip();
 
-    let candidates: Vec<String> = artifacts.iter().map(|a| a.path.clone()).collect();
     let ignored = batch_check_ignore(&repo, &candidates);
     let tracked = batch_tracked_counts(&repo, &candidates);
     let checks_unexamined =
         matches!(ignored, GitProbe::Unexamined) || matches!(tracked, GitProbe::Unexamined);
-    for artifact in &mut artifacts {
+    for (artifact, key) in artifacts.iter_mut().zip(&candidates) {
+        let bytes = key.as_encoded_bytes();
         artifact.checks_unexamined = checks_unexamined;
         if let GitProbe::Answered(ignored) = &ignored {
-            artifact.unignored = !ignored.contains(&artifact.path);
+            artifact.unignored = !ignored.contains(bytes);
         }
         if let GitProbe::Answered(tracked) = &tracked {
-            artifact.tracked_files = tracked.get(&artifact.path).copied().unwrap_or(0);
+            artifact.tracked_files = tracked.get(bytes).copied().unwrap_or(0);
         }
     }
 
     // ---- Linked worktrees + branches -------------------------------------
-    let (worktrees, wt_files, wt_perms, wt_truncated) =
-        collect_worktree_usage(&worktree_infos, deadline);
+    let (worktrees, wt_tally, wt_truncated) = collect_worktree_usage(&worktree_infos, deadline);
     let branches = branch_summary(repo_path);
 
     // Category totals can exceed the walked tree only through budget skew;
@@ -1577,24 +1943,20 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
     let cache_total = collector.cache_total.min(worktree_bytes);
     let grand = worktree_bytes.saturating_add(git_dir_bytes);
 
-    let total_files = worktree_budget
-        .files_visited
-        .saturating_add(git_budget.files_visited)
-        .saturating_add(wt_files);
-    let total_perms = worktree_budget
-        .permission_denied
-        .saturating_add(git_budget.permission_denied)
-        .saturating_add(wt_perms);
+    // The deep audit. Derived from what the walks already measured, plus one
+    // cheap read_dir for prunable worktree admin. It runs before the totals
+    // below so an error it counts reaches them.
+    let orphaned_admin = orphaned_worktree_admin(&git_dir, &mut git_budget);
+
+    let mut tally = wt_tally;
+    tally.add(&worktree_budget);
+    tally.add(&git_budget);
     let is_truncated = artifacts_truncated
         || worktrees_unexamined
         || worktree_budget.truncated
         || git_truncated
         || git_budget.truncated
         || wt_truncated;
-
-    // The deep audit. Derived from what the walks already measured, plus one
-    // cheap read_dir for prunable worktree admin.
-    let orphaned_admin = orphaned_worktree_admin(&git_dir, &mut git_budget);
     let (reclaim, reclaim_summary) = build_reclaim(
         &artifacts,
         &git_storage,
@@ -1646,8 +2008,11 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
         },
         scan: ScanStats {
             elapsed_ms: started.elapsed().as_millis(),
-            files_visited: total_files,
-            permission_denied: total_perms,
+            files_visited: tally.files_visited,
+            permission_denied: tally.permission_denied,
+            unreadable: tally.unreadable,
+            non_utf8: tally.non_utf8,
+            unaudited: tally.unaudited,
             truncated: is_truncated,
         },
     })
@@ -1669,7 +2034,7 @@ mod tests {
         entered: &'a mut Vec<(usize, usize)>,
         large: &'a mut LargeFileCollector,
         linked: &'a std::collections::HashSet<PathBuf>,
-        ancestors: &'a mut Vec<String>,
+        ancestors: &'a mut Vec<std::ffi::OsString>,
         #[cfg(unix)] seen_inodes: &'a mut std::collections::HashSet<(u64, u64)>,
         #[cfg(unix)] seen_dir_inodes: &'a mut std::collections::HashSet<(u64, u64)>,
     ) -> WorktreeWalkContext<'a> {
@@ -1736,20 +2101,29 @@ mod tests {
     fn parse_count_objects_handles_real_output() {
         let text =
             "count: 17\nsize: 24 KiB\nin-pack: 300\npacks: 2\nsize-pack: 50000 KiB\ngarbage: 1\n";
-        assert_eq!(parse_count_objects(text), (17, 24, 2, 50_000));
-        assert_eq!(parse_count_objects("").0, 0);
-        assert_eq!(parse_count_objects("garbage").0, 0);
+        assert_eq!(parse_count_objects(text), Some((17, 24, 2, 50_000)));
+        assert_eq!(parse_count_objects(""), None);
+        assert_eq!(parse_count_objects("garbage"), None);
+        // One figure missing or non-numeric is unknown, not a measured zero.
+        assert_eq!(
+            parse_count_objects("count: 1\nsize: 2 KiB\npacks: 3\n"),
+            None
+        );
+        assert_eq!(
+            parse_count_objects("count: x\nsize: 2\npacks: 3\nsize-pack: 4\n"),
+            None
+        );
     }
 
     #[test]
     fn check_ignore_parser_reads_verbose_z_records() {
         // \x00 keeps the NUL explicit: "\012" would read as an octal escape.
-        let ignored = parse_check_ignore_z(".gitignore\x0012\0/build/\0build\0::\0src\0");
-        assert!(ignored.contains("build"));
-        assert!(!ignored.contains("src"));
-        assert!(parse_check_ignore_z("").is_empty());
+        let ignored = parse_check_ignore_z(b".gitignore\x0012\0/build/\0build\0::\0src\0");
+        assert!(ignored.contains(b"build".as_slice()));
+        assert!(!ignored.contains(b"src".as_slice()));
+        assert!(parse_check_ignore_z(b"").is_empty());
         // Truncated trailing record must not panic or half-match.
-        assert!(parse_check_ignore_z("x\x001\0/p\0").is_empty());
+        assert!(parse_check_ignore_z(b"x\x001\0/p\0").is_empty());
     }
 
     fn artifact(path: &str, unexamined: bool, unignored: bool) -> ArtifactDir {
@@ -1814,7 +2188,7 @@ mod tests {
         let answered =
             census_from_check_ignore(Ok(b".gitignore\x001\0/target/\0target\0".to_vec()));
         match answered {
-            GitProbe::Answered(set) => assert!(set.contains("target")),
+            GitProbe::Answered(set) => assert!(set.contains(b"target".as_slice())),
             GitProbe::Unexamined => panic!("stdout is a measurement"),
         }
     }
@@ -1935,7 +2309,7 @@ mod tests {
         let mut by_path: HashMap<String, (u64, ArtifactKind)> = collector
             .found
             .iter()
-            .map(|(rel, kind, _, bytes)| (rel.clone(), (*bytes, *kind)))
+            .map(|(rel, kind, _, bytes)| (rel.to_string_lossy().into_owned(), (*bytes, *kind)))
             .collect();
         assert_eq!(by_path.remove("build"), Some((100, ArtifactKind::Build)));
         assert_eq!(
@@ -2171,5 +2545,192 @@ mod tests {
         assert!(!budget.exhausted());
         budget.files_visited = 5;
         assert!(budget.exhausted());
+    }
+
+    fn walk_total(root: &Path, budget: &mut WalkBudget) -> u64 {
+        let mut collector = ArtifactCollector::new();
+        let mut entered = Vec::new();
+        let mut large = LargeFileCollector::new();
+        let linked = std::collections::HashSet::new();
+        let mut ancestors = Vec::new();
+        #[cfg(unix)]
+        let mut seen = std::collections::HashSet::new();
+        #[cfg(unix)]
+        let mut seen_dirs = std::collections::HashSet::new();
+        let mut ctx = test_walk_ctx(
+            root,
+            &mut collector,
+            &mut entered,
+            &mut large,
+            &linked,
+            &mut ancestors,
+            #[cfg(unix)]
+            &mut seen,
+            #[cfg(unix)]
+            &mut seen_dirs,
+        );
+        walk_worktree(&mut ctx, root, 0, budget)
+    }
+
+    /// A Latin-1 export or a zip extract names a directory with bytes that are
+    /// not UTF-8. The walkers used to skip it, so its megabyte vanished from
+    /// the total while `truncated` stayed false.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_directory_is_walked_and_counted() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let odd = tmp
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"caf\xe9-export"));
+        // APFS and HFS+ refuse a name that is not valid UTF-8 (EILSEQ), so no
+        // walker can meet one there; the naming rule is covered below without
+        // a filesystem. Anywhere else the 1 MiB directory must be measured.
+        match std::fs::create_dir(&odd) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(92) && cfg!(target_os = "macos") => {
+                let mut budget = WalkBudget::new();
+                let name = budget.label(std::ffi::OsStr::from_bytes(b"caf\xe9-export"));
+                assert_eq!(name, "caf\u{fffd}-export");
+                assert_eq!(budget.non_utf8, 1);
+                assert_eq!(budget.label(std::ffi::OsStr::new("plain")), "plain");
+                assert_eq!(budget.non_utf8, 1, "valid names are not counted");
+                return;
+            }
+            Err(e) => panic!("create_dir: {e}"),
+        }
+        std::fs::write(odd.join("data.bin"), vec![b'x'; 1 << 20]).unwrap();
+        write_file(&tmp.path().join("plain.txt"), 10);
+
+        let mut budget = WalkBudget::new();
+        let (bytes, truncated) = size_tree(tmp.path(), &mut budget);
+        assert_eq!(
+            bytes,
+            (1 << 20) + 10,
+            "size_tree must walk the non-UTF-8 dir"
+        );
+        assert!(!truncated);
+        assert_eq!(budget.non_utf8, 1);
+        assert!(!budget.truncated, "a walked name is not a missing subtree");
+
+        let mut budget = WalkBudget::new();
+        assert_eq!(walk_total(tmp.path(), &mut budget), (1 << 20) + 10);
+        assert_eq!(budget.non_utf8, 1);
+        assert_eq!(budget.unreadable, 0);
+
+        let mut budget = WalkBudget::new();
+        let _ = collect_large_files(tmp.path(), &mut budget, &[]);
+        assert_eq!(budget.non_utf8, 1);
+        assert_eq!(budget.unreadable, 0);
+    }
+
+    /// EIO, ESTALE and ENAMETOOLONG are not permission errors. Each used to
+    /// drop its subtree with `truncated == false`.
+    #[test]
+    fn injected_non_permission_errors_are_counted_and_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_file(&root.join("ok/a.bin"), 100);
+        write_file(&root.join("bad/b.bin"), 1_000);
+        write_file(&root.join("ok/c.bin"), 7);
+
+        // A directory that cannot be listed.
+        let mut budget = WalkBudget::new();
+        budget.fail_paths = vec![root.join("bad")];
+        let (bytes, _) = size_tree(root, &mut budget);
+        assert_eq!(bytes, 107);
+        assert_eq!(budget.unreadable, 1);
+        assert_eq!(budget.permission_denied, 0);
+        assert!(
+            budget.truncated,
+            "an uncounted subtree must mark the walk partial"
+        );
+
+        let mut budget = WalkBudget::new();
+        budget.fail_paths = vec![root.join("bad")];
+        assert_eq!(walk_total(root, &mut budget), 107);
+        assert_eq!(budget.unreadable, 1);
+        assert!(budget.truncated);
+
+        // A file whose metadata cannot be read.
+        let mut budget = WalkBudget::new();
+        budget.fail_paths = vec![root.join("ok/a.bin")];
+        assert_eq!(walk_total(root, &mut budget), 1_007);
+        assert_eq!(budget.unreadable, 1);
+        assert!(budget.truncated);
+
+        let mut budget = WalkBudget::new();
+        budget.fail_paths = vec![root.join("ok/a.bin")];
+        let (bytes, _) = size_tree(root, &mut budget);
+        assert_eq!(bytes, 1_007);
+        assert!(budget.truncated);
+
+        // Nothing injected: a complete walk stays complete.
+        let mut budget = WalkBudget::new();
+        assert_eq!(walk_total(root, &mut budget), 1_107);
+        assert_eq!((budget.unreadable, budget.non_utf8), (0, 0));
+        assert!(!budget.truncated);
+    }
+
+    #[test]
+    fn deleted_mid_walk_is_not_an_uncounted_subtree() {
+        let mut budget = WalkBudget::new();
+        budget.note_io_error(&io::Error::from(io::ErrorKind::NotFound));
+        assert_eq!(budget.unreadable, 0);
+        assert!(!budget.truncated);
+        budget.note_io_error(&io::Error::from(io::ErrorKind::PermissionDenied));
+        assert_eq!((budget.permission_denied, budget.unreadable), (1, 0));
+        assert!(
+            budget.truncated,
+            "a refused subtree is missing from the total: its own counter, and a floor"
+        );
+    }
+
+    /// A capped orphan audit says how many entries it did not examine, and an
+    /// orphan is claimed only on positive evidence (an absent gitdir target).
+    #[test]
+    fn orphan_audit_counts_what_its_cap_left_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join(".git");
+        let total = MAX_SIZED_WORKTREES * 8 + 3;
+        for i in 0..total {
+            let admin = git_dir.join(format!("worktrees/wt{i:03}"));
+            std::fs::create_dir_all(&admin).unwrap();
+            let target = tmp.path().join(format!("gone{i}"));
+            std::fs::write(admin.join("gitdir"), target.to_str().unwrap()).unwrap();
+        }
+        let mut budget = WalkBudget::new();
+        let found = orphaned_worktree_admin(&git_dir, &mut budget);
+        assert_eq!(found.len(), MAX_SIZED_WORKTREES * 8);
+        assert_eq!(budget.unaudited, 3);
+        assert!(budget.truncated);
+        assert_eq!((budget.unreadable, budget.permission_denied), (0, 0));
+    }
+
+    #[test]
+    fn orphan_audit_does_not_claim_a_worktree_whose_target_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join(".git");
+        let live = tmp.path().join("live-checkout");
+        std::fs::create_dir_all(&live).unwrap();
+        for (name, target) in [("live", live.clone()), ("gone", tmp.path().join("gone"))] {
+            let admin = git_dir.join("worktrees").join(name);
+            std::fs::create_dir_all(&admin).unwrap();
+            std::fs::write(admin.join("gitdir"), target.to_str().unwrap()).unwrap();
+        }
+        let mut budget = WalkBudget::new();
+        let found = orphaned_worktree_admin(&git_dir, &mut budget);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "gone");
+        assert!(!budget.truncated);
+    }
+
+    #[test]
+    fn scan_stats_from_an_older_payload_reads_zero_skips() {
+        let stats: ScanStats = serde_json::from_str(
+            r#"{"elapsed_ms":1,"files_visited":2,"permission_denied":0,"truncated":false}"#,
+        )
+        .unwrap();
+        assert_eq!((stats.unreadable, stats.non_utf8), (0, 0));
     }
 }

@@ -86,7 +86,10 @@ describe("StoragePanel source contracts & async hygiene", () => {
   it("honestly flags truncated/budgeted scans instead of presenting as complete", () => {
     expect(source).toContain("report.scan.truncated");
     expect(source).toContain("partial scan");
-    expect(source).toContain("Scan hit a safety budget; totals are floors.");
+    expect(source).toContain("Scan hit a safety budget or skipped unreadable locations; totals are floors.");
+    expect(source).toContain("report.scan.unreadable > 0");
+    expect(source).toContain("report.scan.unaudited > 0");
+    expect(source).toContain("failed to read and are not counted");
   });
 });
 

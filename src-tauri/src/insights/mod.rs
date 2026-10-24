@@ -11,6 +11,8 @@ mod entity_collision;
 mod head_divergence_tests;
 pub(crate) mod live_sessions;
 #[cfg(test)]
+mod mcp_info_adversarial;
+#[cfg(test)]
 mod merge_adv_tests;
 pub mod merge_conflicts;
 #[cfg(test)]
@@ -2634,28 +2636,66 @@ fn resolve_plugin_root() -> (bool, String, String) {
 pub fn mcp_info() -> McpInfo {
     let mcp = resolve_bundled_binary("GITPULSE_MCP_PATH", "gitpulse-mcp");
     let hook = resolve_bundled_binary("GITPULSE_HOOK_PATH", "gitpulse-hook");
-    let (plugin_found, plugin_path, plugin_error) = resolve_plugin_root();
+    let (plugin_found, plugin_path, mut plugin_error) = resolve_plugin_root();
     let (plugin_manifest_json, plugin_mcp_json, mcp_config_json, hooks_config_json) =
         if plugin_found {
             let root = Path::new(&plugin_path);
-            let manifest =
-                std::fs::read_to_string(root.join(".codex-plugin/plugin.json")).unwrap_or_default();
-            let mcp_template = std::fs::read_to_string(root.join(".mcp.json")).unwrap_or_default();
-            let hooks_template =
-                std::fs::read_to_string(root.join("hooks/hooks.json")).unwrap_or_default();
+            // The first thing wrong with the package is the reason Settings
+            // shows; an empty config with no reason is what this replaces.
+            let mut first_error: Option<String> = None;
+            let mut read = |relative: &str| {
+                let path = root.join(relative);
+                std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                    first_error.get_or_insert(format!("could not read {}: {e}", path.display()));
+                    String::new()
+                })
+            };
+            let manifest = read(".codex-plugin/plugin.json");
+            let mcp_template = read(".mcp.json");
+            // The resolver does not require the hooks manifest, so its absence
+            // is no error; a file that is there and cannot be read or parsed is.
+            let hooks_path = root.join("hooks/hooks.json");
+            let hooks_template = match std::fs::metadata(&hooks_path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                _ => Some(read("hooks/hooks.json")),
+            };
             // What Settings copies is the command that will run, so it is built
             // from the path just resolved. Nothing is offered for a binary that
-            // was not found: a copy naming a bare command is the bug.
-            let mcp_config = if mcp.found {
-                mcp_config_with(&mcp_template, &mcp.path).unwrap_or_default()
-            } else {
-                String::new()
+            // was not found: a copy naming a bare command is the bug. The
+            // template is still checked against the bare name so a malformed
+            // one is reported either way.
+            let mut check = |built: Result<String, String>, offered: bool| match built {
+                Ok(config) if offered => config,
+                Ok(_) => String::new(),
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                    String::new()
+                }
             };
-            let hooks_config = if hook.found {
-                hooks_config_with(&hooks_template, &hook.path).unwrap_or_default()
-            } else {
-                String::new()
+            let mcp_config = check(
+                mcp_config_with(
+                    &mcp_template,
+                    if mcp.found { &mcp.path } else { "gitpulse-mcp" },
+                ),
+                mcp.found,
+            );
+            let hooks_config = match &hooks_template {
+                Some(template) => check(
+                    hooks_config_with(
+                        template,
+                        if hook.found {
+                            &hook.path
+                        } else {
+                            "gitpulse-hook"
+                        },
+                    ),
+                    hook.found,
+                ),
+                None => String::new(),
             };
+            if let Some(error) = first_error {
+                plugin_error = error;
+            }
             (manifest, mcp_template, mcp_config, hooks_config)
         } else {
             (String::new(), String::new(), String::new(), String::new())
@@ -4739,6 +4779,76 @@ mod tests {
             info.hook_error
         );
         assert!(info.hooks_config_json.is_empty());
+    }
+
+    fn plugin_package(mcp: &str, hooks: &str) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".codex-plugin")).unwrap();
+        fs::create_dir_all(root.path().join("hooks")).unwrap();
+        fs::write(root.path().join(".codex-plugin/plugin.json"), "{}").unwrap();
+        fs::write(root.path().join(".mcp.json"), mcp).unwrap();
+        fs::write(root.path().join("hooks/hooks.json"), hooks).unwrap();
+        root
+    }
+
+    /// A plugin template that cannot be turned into a config used to read as
+    /// `plugin_error: ""` and an empty config: Settings showed a blank "copy
+    /// this config" with no reason.
+    #[test]
+    fn mcp_info_reports_a_malformed_plugin_template() {
+        let exe = std::env::current_exe().unwrap();
+        let serial = crate::harness::sidecar::test_serial();
+
+        let package = plugin_package("{}", r#"{"hooks":{}}"#);
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set("GITPULSE_PLUGIN_ROOT", package.path().to_str().unwrap())
+            .set("GITPULSE_MCP_PATH", exe.to_str().unwrap())
+            .set("GITPULSE_HOOK_PATH", "/no/such/gitpulse-hook");
+        let info = mcp_info();
+        assert!(info.plugin_found);
+        assert!(info.binary_found);
+        assert!(info.mcp_config_json.is_empty());
+        assert!(
+            info.plugin_error.contains("no gitpulse server"),
+            "{:?}",
+            info.plugin_error
+        );
+        drop(_env);
+
+        // Not JSON at all, and the binary was not found: still reported.
+        let package = plugin_package("not json", r#"{"hooks":{}}"#);
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set("GITPULSE_PLUGIN_ROOT", package.path().to_str().unwrap())
+            .set("GITPULSE_MCP_PATH", "/no/such/gitpulse-mcp")
+            .set("GITPULSE_HOOK_PATH", "/no/such/gitpulse-hook");
+        let info = mcp_info();
+        assert!(!info.binary_found);
+        assert!(
+            info.plugin_error.contains("is not JSON"),
+            "{:?}",
+            info.plugin_error
+        );
+        drop(_env);
+
+        // A hooks manifest that is there but cannot be read is a read error,
+        // not an empty file.
+        let package = plugin_package(r#"{"mcpServers":{"gitpulse":{}}}"#, "{}");
+        fs::remove_file(package.path().join("hooks/hooks.json")).unwrap();
+        fs::create_dir(package.path().join("hooks/hooks.json")).unwrap();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set("GITPULSE_PLUGIN_ROOT", package.path().to_str().unwrap())
+            .set("GITPULSE_MCP_PATH", exe.to_str().unwrap())
+            .set("GITPULSE_HOOK_PATH", "/no/such/gitpulse-hook");
+        let info = mcp_info();
+        assert!(
+            info.plugin_error.contains("could not read"),
+            "{:?}",
+            info.plugin_error
+        );
+        assert!(
+            !info.mcp_config_json.is_empty(),
+            "a good template still yields a config"
+        );
     }
 
     #[test]
