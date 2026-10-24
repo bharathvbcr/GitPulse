@@ -15587,4 +15587,76 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
             });
         }
     }
+
+    /// ADVERSARIAL W6-L6: the tests the lane left lock-free (`unbounded`) while
+    /// they still depend on the process environment.
+    mod adv_w6l6 {
+        use super::*;
+
+        /// A neighbour that rebinds `HOME` the way every `tool_config`, `lappi`
+        /// or sidecar test does: it holds the environment lock but NOT
+        /// `retention()`, so `retention()` alone does not exclude it.
+        fn rebind_home_until(stop: &std::sync::atomic::AtomicBool) {
+            let homes: Vec<tempfile::TempDir> = (0..2)
+                .map(|n| {
+                    let home = tempfile::TempDir::new().unwrap();
+                    if n == 0 {
+                        std::fs::write(home.path().join(".gitconfig"), "[user]\n\tname = X\n")
+                            .unwrap();
+                    }
+                    home
+                })
+                .collect();
+            let mut turn = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let serial = crate::test_support::env::env_serial();
+                let _env = crate::test_support::env::bind_env(&serial)
+                    .set("HOME", homes[turn % 2].path());
+                turn += 1;
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        /// FAILS BY DESIGN (severity medium): `adv_sixteen_threads_one_
+        /// computation_no_torn_answer` was moved from `eager_unhurried` (which
+        /// now takes the environment lock) to a lock-free `unbounded`, "so the
+        /// sixteen run at once". The ref stamp reads `$HOME/.gitconfig`
+        /// (ref_cache::user_config_paths), so any HOME rebinder that does not
+        /// hold `retention()` makes the second thread recompute. The test
+        /// thread itself could hold `env_serial()` (children never take it).
+        #[test]
+        fn sixteen_threads_one_lookup_while_a_neighbour_rebinds_home() {
+            let _kept = ref_cache::retention();
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            let extra = std::thread::scope(|scope| {
+                let binder = scope.spawn(|| rebind_home_until(&stop));
+                let mut worst = 0usize;
+                for _ in 0..6 {
+                    let dir = init_repo_with_remotes(&["origin"], "main");
+                    let repo = dir.path().canonicalize().unwrap();
+                    let before = adv_lookups(&repo);
+                    let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+                    let handles: Vec<_> = (0..16)
+                        .map(|_| {
+                            let repo = repo.clone();
+                            let barrier = std::sync::Arc::clone(&barrier);
+                            std::thread::spawn(move || {
+                                barrier.wait();
+                                ref_cache::eager(|| unbounded(|| default_base(&repo)))
+                            })
+                        })
+                        .collect();
+                    for h in handles {
+                        h.join().unwrap();
+                    }
+                    worst = worst.max(adv_lookups(&repo) - before);
+                }
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                binder.join().unwrap();
+                worst
+            });
+            assert_eq!(extra, 1, "a HOME rebind brought back extra computations");
+        }
+
+    }
 }

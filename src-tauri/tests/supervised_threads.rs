@@ -89,6 +89,20 @@ fn only_the_named_shapes_are_test_files() {
     }
 }
 
+/// FAILS BY DESIGN (severity low): the "exact" matcher still skips any file or
+/// directory whose name merely STARTS with `test_support`, so a production
+/// `test_supports/pool.rs` or `test_support_bridge.rs` escapes the raw-spawn
+/// scan the way `contests.rs` used to.
+#[test]
+fn a_test_support_prefix_alone_does_not_make_a_production_file_test_only() {
+    for production in ["test_supports/pool.rs", "test_support_bridge.rs"] {
+        assert!(
+            !is_test_file(production),
+            "{production} is skipped by the raw thread::spawn lint"
+        );
+    }
+}
+
 const NEEDLES: &[&str] = &[
     "thread::spawn(",
     "thread::Builder::new(",
