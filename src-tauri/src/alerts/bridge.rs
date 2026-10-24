@@ -1732,7 +1732,13 @@ mod tests {
                     let _ = stream.shutdown(std::net::Shutdown::Write);
                     let mut reply = String::new();
                     let _ = stream.read_to_string(&mut reply);
-                    reply.trim() == r#"{"ok":true}"#
+                    // Liveness, not acceptance: a live loop answers every
+                    // well-formed report, and since S1-09 a session-less probe
+                    // may be refused by the shared `hook-…` rate bucket that
+                    // other tests in the process also draw on. Any `{"ok":…}`
+                    // reply is a loop answering.
+                    serde_json::from_str::<serde_json::Value>(reply.trim())
+                        .is_ok_and(|value| value.get("ok").is_some_and(serde_json::Value::is_boolean))
                 });
             let consistent = settled
                 && if listening {
