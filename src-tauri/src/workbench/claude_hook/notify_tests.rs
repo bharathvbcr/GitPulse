@@ -120,9 +120,14 @@ fn the_injected_session_end_hook_does_not_raise_the_exit_budget() {
         }
     }
     assert_eq!(seen, 1);
-    // The plugin's own copy is a different matter and is not rewritten.
+    // The plugin's own copy asks for the same, so a session that enables the
+    // plugin as well does not raise the budget through it either (and the
+    // injected copy is not a rewrite of a longer one).
     let manifest: Value = serde_json::from_str(PLUGIN_HOOKS).unwrap();
-    assert_eq!(manifest["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 5);
+    assert_eq!(
+        manifest["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"],
+        SESSION_END_TIMEOUT_SECS
+    );
 }
 
 /// Only the reporting hooks are added beside the gate: no banner matcher, and
