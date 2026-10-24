@@ -1925,7 +1925,7 @@ pub const AGENT_KIND_ENV: &str = "GITPULSE_AGENT_KIND";
 /// Much shorter than [`BUDGET`]: a `Notification` hook runs while the user is
 /// already waiting, and there is nothing here worth waiting for. The socket is
 /// on the same machine; if it does not answer within this, it is not there.
-const NOTIFY_BUDGET: Duration = Duration::from_millis(1500);
+pub(crate) const NOTIFY_BUDGET: Duration = Duration::from_millis(1500);
 
 /// Tells the running GitPulse that this agent wants the user.
 ///

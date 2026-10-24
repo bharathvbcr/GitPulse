@@ -26,9 +26,18 @@
 //!   matches this process's. On a Unix where neither `getpeereid` nor
 //!   `SO_PEERCRED` is available the socket is **not bound at all** — a check
 //!   that cannot run must not be reported as a check that passed.
-//! * Reads are bounded in bytes and in wall-clock time, one connection at a
-//!   time, and every field is validated against a closed vocabulary before it
-//!   reaches the hub, where the global rate limit applies to it as well.
+//! * Reads are bounded in bytes and in wall-clock time: one deadline for the
+//!   whole connection, shorter than the hook's own budget, and what a
+//!   connection had sent when it ran out is dropped, never applied late. Each
+//!   connection is read by its own worker, so a peer that says nothing holds
+//!   that worker and never the accept loop; at most 100 are open at once and
+//!   the next is answered `{"ok":false}` and closed unread. Every field is
+//!   validated against a closed vocabulary before it reaches the hub, where
+//!   the global rate limit applies to it as well.
+//! * An `accept` that fails for want of descriptors or memory is waited out
+//!   with a growing delay and the socket is left alone. A listener that fails
+//!   outright is rebound a bounded number of times; past that the bridge
+//!   reports that it is not listening and why.
 //!
 //! On Windows the socket is not offered. The hook path there is a documented
 //! gap rather than a silently missing feature.
@@ -53,12 +62,51 @@ pub const SESSION_ENV: &str = "GITPULSE_SESSION_ID";
 /// Largest report accepted from one connection.
 pub const MAX_REPORT_BYTES: usize = 8 * 1024;
 
-/// Wall-clock ceiling on one connection.
+/// Wall-clock ceiling on one connection, from accept to the last byte read.
+///
+/// Under the hook's own `NOTIFY_BUDGET` (`hooks::NOTIFY_BUDGET`), which a test
+/// checks: a connection still being read after the hook gave up serves nobody,
+/// and its bytes would otherwise arrive as a report the hook already reported
+/// as failed.
 ///
 /// Only the Unix accept loop reads this. On Windows the socket is not offered,
 /// and a constant with no caller fails `clippy -D warnings` there.
 #[cfg(unix)]
-const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1200);
+
+/// Connections open at once, being read or waiting to be. The next one is
+/// refused at the door. A hook is one short exchange, so a hundred at a time is
+/// far above any real load and far below what could exhaust descriptors or
+/// threads.
+#[cfg(unix)]
+const MAX_OPEN_CONNECTIONS: usize = 100;
+
+/// Consecutive fatal `accept` errors the loop answers by binding a fresh
+/// listener before it gives up and reports why.
+#[cfg(unix)]
+const ACCEPT_REBIND_LIMIT: u32 = 3;
+
+/// How long the accept loop waits after its first transient `accept` error:
+/// doubling per consecutive error up to the maximum, reset by a connection.
+#[cfg(unix)]
+const ACCEPT_BACKOFF_FIRST: std::time::Duration = std::time::Duration::from_millis(10);
+
+#[cfg(unix)]
+const ACCEPT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A backoff is slept in slices this long, so a retired loop leaves promptly.
+#[cfg(unix)]
+const ACCEPT_BACKOFF_SLICE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The wall-clock ceiling a connection is given, a test's override included.
+#[cfg(unix)]
+fn connection_budget() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(over) = tests::budget_override() {
+        return over;
+    }
+    CONNECTION_TIMEOUT
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct BridgeStatus {
@@ -94,6 +142,9 @@ struct State {
     /// Accept loops that have started and not yet finished their exit work.
     #[cfg(unix)]
     live_loops: AtomicUsize,
+    /// Connections accepted and not yet finished, across generations.
+    #[cfg(unix)]
+    open_connections: AtomicUsize,
 }
 
 fn state() -> &'static State {
@@ -110,6 +161,8 @@ fn state() -> &'static State {
         accept_wakes: Mutex::new((0, 0)),
         #[cfg(unix)]
         live_loops: AtomicUsize::new(0),
+        #[cfg(unix)]
+        open_connections: AtomicUsize::new(0),
     })
 }
 
@@ -284,9 +337,259 @@ fn count_wake(state: &State, generation: u64) {
     }
 }
 
+/// One `accept`. The accepted descriptor is made close-on-exec only after
+/// `accept` returns; the inheritance lock keeps a concurrent spawn from copying
+/// it in between. Non-blocking, so the lock covers one syscall. A test can
+/// queue errors for it to return first.
+#[cfg(unix)]
+fn accept_next(
+    listener: &std::os::unix::net::UnixListener,
+) -> std::io::Result<(
+    std::os::unix::net::UnixStream,
+    std::os::unix::net::SocketAddr,
+)> {
+    #[cfg(test)]
+    if let Some(error) = tests::injected_accept_error() {
+        return Err(error);
+    }
+    crate::procguard::with_inheritance_lock(|| listener.accept())
+}
+
+/// The order stamp: nanoseconds on `CLOCK_MONOTONIC`.
+///
+/// One system-wide clock, so a stamp taken in the hook process and one taken
+/// here compare. The bridge takes it when it accepts a connection, before the
+/// connection is handed to a worker, and the hub drops a report older than the
+/// newest already seen for its session. A hook that stamps its own report at
+/// entry with this same function (the planned `seq` field) is ordered by when
+/// it ran rather than when its connection happened to be accepted.
+///
+/// `pub` rather than `pub(crate)` because `gitpulse-hook` is a separate crate.
+#[cfg(unix)]
+pub fn order_stamp_ns() -> u64 {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a valid, writable `timespec` for the call's duration.
+    let read = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+    if read != 0 {
+        return 0;
+    }
+    u64::try_from(now.tv_sec)
+        .unwrap_or(0)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::try_from(now.tv_nsec).unwrap_or(0))
+}
+
+/// The error text an accept loop has put in the status, so that it takes down
+/// that text and never another's: a bridge error from elsewhere (a failed
+/// start, a message from the user's own action) outlives a backoff, and a loop
+/// that has been retired writes nothing at all.
+#[cfg(unix)]
+struct LoopNote {
+    state: &'static State,
+    generation: u64,
+    text: Option<String>,
+}
+
+#[cfg(unix)]
+impl LoopNote {
+    fn new(state: &'static State, generation: u64) -> Self {
+        Self {
+            state,
+            generation,
+            text: None,
+        }
+    }
+
+    /// Shows `text`. With `overwrite` false it yields to an error already
+    /// there. The generation is checked under the status lock, which `stop`
+    /// takes after it bumps the generation, so a retired loop cannot write
+    /// after `stop` has cleared the slot.
+    fn set(&mut self, text: String, overwrite: bool) {
+        let Ok(mut slot) = self.state.error.lock() else {
+            return;
+        };
+        if self.state.generation.load(Ordering::SeqCst) != self.generation {
+            return;
+        }
+        if !overwrite && slot.is_some() {
+            return;
+        }
+        *slot = Some(text.clone());
+        self.text = Some(text);
+    }
+
+    /// Takes down this loop's own text, if it is still what the status shows.
+    fn clear(&mut self) {
+        let Some(text) = self.text.take() else { return };
+        let Ok(mut slot) = self.state.error.lock() else {
+            return;
+        };
+        if self.state.generation.load(Ordering::SeqCst) == self.generation
+            && slot.as_deref() == Some(text.as_str())
+        {
+            *slot = None;
+        }
+    }
+
+    /// Leaves the text in the status for good: the loop is ending with it.
+    fn keep(&mut self) {
+        self.text = None;
+    }
+}
+
+/// What an `accept` error asks of the loop.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptFault {
+    /// Nothing went wrong: no connection was ready, or a signal interrupted.
+    Retry,
+    /// The system is short of something that comes back (descriptors, memory,
+    /// buffers) or the peer left before it was accepted. The listener and its
+    /// socket file are fine; wait a growing moment and ask again.
+    Transient,
+    /// The listener itself is not usable. Bind a fresh one.
+    Fatal,
+}
+
+#[cfg(unix)]
+fn classify_accept_error(error: &std::io::Error) -> AcceptFault {
+    use std::io::ErrorKind;
+    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) {
+        return AcceptFault::Retry;
+    }
+    match error.raw_os_error() {
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::ENOBUFS | libc::ECONNABORTED) => {
+            AcceptFault::Transient
+        }
+        Some(libc::EINTR | libc::EAGAIN) => AcceptFault::Retry,
+        _ => AcceptFault::Fatal,
+    }
+}
+
+/// The delay before the `attempt`th consecutive retry (counting from zero):
+/// [`ACCEPT_BACKOFF_FIRST`], doubling, never past [`ACCEPT_BACKOFF_MAX`].
+#[cfg(unix)]
+fn accept_backoff(attempt: u32) -> std::time::Duration {
+    let delay = ACCEPT_BACKOFF_FIRST
+        .saturating_mul(1u32 << attempt.min(16))
+        .min(ACCEPT_BACKOFF_MAX);
+    #[cfg(test)]
+    let delay = delay.max(tests::backoff_floor());
+    delay
+}
+
+/// Sleeps `delay` in short slices, so retiring the loop is noticed within one
+/// slice rather than after the whole backoff. False once `generation` is no
+/// longer current.
+#[cfg(unix)]
+fn back_off(state: &State, generation: u64, delay: std::time::Duration) -> bool {
+    let until = std::time::Instant::now() + delay;
+    loop {
+        if state.generation.load(Ordering::SeqCst) != generation {
+            return false;
+        }
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        std::thread::sleep(left.min(ACCEPT_BACKOFF_SLICE));
+    }
+}
+
+/// A fresh listener on the path the old one held. Under `State::control`, so a
+/// `stop` that retires this loop either finishes before the check, and nothing
+/// is bound, or after the bind, and unlinks it. `Ok(None)` means retired.
+#[cfg(unix)]
+fn rebind(
+    state: &State,
+    generation: u64,
+    path: &std::path::Path,
+) -> Result<Option<std::os::unix::net::UnixListener>, String> {
+    let _control = state
+        .control
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.generation.load(Ordering::SeqCst) != generation {
+        return Ok(None);
+    }
+    crate::local_socket::bind_private(path, "notification socket").map(Some)
+}
+
+/// One of the [`MAX_OPEN_CONNECTIONS`]. Released when the connection's worker
+/// ends, or is never started, or panics.
+#[cfg(unix)]
+struct Slot(&'static State);
+
+#[cfg(unix)]
+impl Slot {
+    fn acquire(state: &'static State) -> Option<Slot> {
+        let mut open = state.open_connections.load(Ordering::SeqCst);
+        loop {
+            if open >= MAX_OPEN_CONNECTIONS {
+                return None;
+            }
+            match state.open_connections.compare_exchange_weak(
+                open,
+                open + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return Some(Slot(state)),
+                Err(now) => open = now,
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.open_connections.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Hands one accepted, uid-checked connection to its own worker, so a peer that
+/// says nothing holds a worker for its deadline and never the accept loop. At
+/// the cap the connection is answered and closed here without being read.
+#[cfg(unix)]
+fn serve(state: &'static State, stream: std::os::unix::net::UnixStream, stamp: u64) {
+    use std::io::Write;
+    let Some(slot) = Slot::acquire(state) else {
+        super::count_bridge_rejection();
+        // A fresh socket's buffer is empty, so these few bytes cannot block;
+        // non-blocking makes that a guarantee rather than an argument.
+        let _ = stream.set_nonblocking(true);
+        let _ = (&stream).write_all(Outcome::Refused(Refusal::AtCapacity).reply());
+        return;
+    };
+    let budget = connection_budget();
+    let spawned = crate::supervisor::spawn_one_of_many(
+        "gitpulse-alert-conn",
+        "alert bridge connection",
+        move || {
+            let _slot = slot;
+            let outcome = handle_into(stream, budget, &mut |notice| {
+                super::offer_stamped(notice, stamp)
+            });
+            if let Outcome::Refused(refusal) = outcome {
+                log::debug!(target: "alerts", "hook report refused: {}", refusal.describe());
+            }
+        },
+    );
+    if let Err(error) = spawned {
+        // The closure went with the error: the slot is released and the peer
+        // sees the connection close.
+        super::count_bridge_rejection();
+        log::warn!(target: "alerts", "hook bridge could not start a connection worker: {error}");
+    }
+}
+
 #[cfg(unix)]
 fn accept_loop(
-    listener: std::os::unix::net::UnixListener,
+    mut listener: std::os::unix::net::UnixListener,
     generation: u64,
     wake: &crate::local_socket::Wake,
 ) {
@@ -303,6 +606,14 @@ fn accept_loop(
     let _running = Running(state);
     // SAFETY: `getuid` reads this process's real user id and cannot fail.
     let own = unsafe { libc::getuid() };
+    let path = listener
+        .local_addr()
+        .ok()
+        .and_then(|addr| addr.as_pathname().map(std::path::Path::to_path_buf));
+    // Consecutive failures of each kind, each reset by a connection accepted.
+    let mut transient = 0u32;
+    let mut fatal = 0u32;
+    let mut note = LoopNote::new(state, generation);
     loop {
         if state.generation.load(Ordering::SeqCst) != generation {
             break;
@@ -319,28 +630,75 @@ fn accept_loop(
         if !ready.listener {
             continue;
         }
-        // The accepted descriptor is made close-on-exec only after `accept`
-        // returns; the inheritance lock keeps a concurrent spawn from copying
-        // it in between. Non-blocking, so the lock covers one syscall.
-        match crate::procguard::with_inheritance_lock(|| listener.accept()) {
+        match accept_next(&listener) {
             Ok((stream, _)) => {
+                // Before anything that can take time: this is the order the
+                // reports arrived in, whichever worker finishes first.
+                let stamp = order_stamp_ns();
+                transient = 0;
+                fatal = 0;
                 if crate::local_socket::peer_uid(&stream) != Some(own) {
                     super::count_bridge_rejection();
                     continue;
                 }
-                handle(stream);
+                serve(state, stream, stamp);
             }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                ) => {}
-            Err(error) => {
-                if state.generation.load(Ordering::SeqCst) == generation {
-                    set_error(Some(format!("Hook bridge stopped accepting: {error}")));
+            Err(error) => match classify_accept_error(&error) {
+                AcceptFault::Retry => {}
+                AcceptFault::Transient => {
+                    // The listener is untouched and so is its socket file: a
+                    // short supply of descriptors is not a reason to go dark.
+                    note.set(
+                        format!("Hook bridge is backing off after an accept error: {error}"),
+                        false,
+                    );
+                    let kept_on = back_off(state, generation, accept_backoff(transient));
+                    transient = transient.saturating_add(1);
+                    note.clear();
+                    if !kept_on {
+                        break;
+                    }
                 }
-                break;
-            }
+                AcceptFault::Fatal => {
+                    fatal += 1;
+                    if fatal > ACCEPT_REBIND_LIMIT {
+                        note.set(
+                            format!(
+                                "Hook bridge stopped accepting after {ACCEPT_REBIND_LIMIT} rebinds: {error}"
+                            ),
+                            true,
+                        );
+                        note.keep();
+                        break;
+                    }
+                    // The listener is not trusted from here, so say so for as
+                    // long as it takes to replace it.
+                    note.set(
+                        format!("Hook bridge is rebinding after an accept error: {error}"),
+                        true,
+                    );
+                    if !back_off(state, generation, accept_backoff(fatal - 1)) {
+                        break;
+                    }
+                    let rebound = match path.as_deref() {
+                        Some(path) => rebind(state, generation, path),
+                        None => Err("the listener has no path to rebind".into()),
+                    };
+                    match rebound {
+                        Ok(Some(fresh)) => {
+                            listener = fresh;
+                            note.clear();
+                        }
+                        Ok(None) => break,
+                        Err(cause) => note.set(
+                            format!(
+                                "Hook bridge could not rebind after an accept error ({error}): {cause}"
+                            ),
+                            true,
+                        ),
+                    }
+                }
+            },
         }
     }
     // Only if this loop is still the current one. `listening` and the error
@@ -367,39 +725,104 @@ fn accept_loop(
     }
 }
 
+/// How one connection ended. The single value a handler returns, so what is
+/// said back to the peer and what is counted both follow from one place.
 #[cfg(unix)]
-fn handle(stream: std::os::unix::net::UnixStream) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// The report parsed and was offered to the hub.
+    Accepted,
+    /// The report was not offered, and why.
+    Refused(Refusal),
+    /// The deadline passed before the peer finished. Whatever it had sent is
+    /// dropped: a half-read report is never applied, and never applied late.
+    TimedOut,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// More than [`MAX_REPORT_BYTES`].
+    TooLarge,
+    /// The read failed for a reason other than the deadline.
+    Unreadable,
+    /// The bytes are not a report GitPulse understands.
+    Invalid(&'static str),
+    /// [`MAX_OPEN_CONNECTIONS`] were already open; nothing was read.
+    AtCapacity,
+}
+
+#[cfg(unix)]
+impl Refusal {
+    fn describe(self) -> &'static str {
+        match self {
+            Refusal::TooLarge => "larger than the report cap",
+            Refusal::Unreadable => "unreadable",
+            Refusal::Invalid(reason) => reason,
+            Refusal::AtCapacity => "too many connections open",
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Outcome {
+    /// What the peer is told. Unchanged by the typed outcome: a refusal's
+    /// reason stays server-side.
+    fn reply(self) -> &'static [u8] {
+        match self {
+            Outcome::Accepted => b"{\"ok\":true}\n",
+            Outcome::Refused(_) | Outcome::TimedOut => b"{\"ok\":false}\n",
+        }
+    }
+}
+
+/// [`handle_into`] with the real ceiling and the real hub.
+#[cfg(all(unix, test))]
+fn handle(stream: std::os::unix::net::UnixStream) -> Outcome {
+    handle_into(stream, CONNECTION_TIMEOUT, &mut super::offer)
+}
+
+/// Reads one connection to the end, under one deadline, and answers it. The
+/// budget and the destination of an accepted report are named so the deadline
+/// and the "never applied late" rule can be driven in a test.
+#[cfg(unix)]
+fn handle_into(
+    stream: std::os::unix::net::UnixStream,
+    budget: std::time::Duration,
+    deliver: &mut dyn FnMut(Notice),
+) -> Outcome {
     use crate::deadline::DeadlineStream;
     use std::io::{Read, Write};
     let _ = stream.set_nonblocking(false);
     // One deadline for the whole exchange, not a timeout per read: a peer that
     // keeps a byte in flight inside each read timeout would otherwise hold
-    // this loop, and every other agent's report, for as long as it likes.
-    let mut stream = DeadlineStream::new(stream, std::time::Instant::now() + CONNECTION_TIMEOUT);
+    // this connection for as long as it likes.
+    let mut stream = DeadlineStream::new(stream, std::time::Instant::now() + budget);
     let mut bytes = Vec::new();
     let read = (&mut stream)
         .take(MAX_REPORT_BYTES as u64 + 1)
         .read_to_end(&mut bytes);
-    let accepted = match read {
-        Ok(_) if bytes.len() <= MAX_REPORT_BYTES => match parse_report(&bytes) {
+    let outcome = match read {
+        Ok(_) if bytes.len() > MAX_REPORT_BYTES => Outcome::Refused(Refusal::TooLarge),
+        Ok(_) => match parse_report(&bytes) {
             Ok(notice) => {
-                super::offer(notice);
-                true
+                deliver(notice);
+                Outcome::Accepted
             }
-            Err(_) => false,
+            Err(reason) => Outcome::Refused(Refusal::Invalid(reason)),
         },
-        _ => false,
+        // `bytes` may hold part of a report. It is dropped with this frame.
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => Outcome::TimedOut,
+        Err(_) => Outcome::Refused(Refusal::Unreadable),
     };
-    if !accepted {
+    if outcome != Outcome::Accepted {
         super::count_bridge_rejection();
     }
-    let reply = if accepted {
-        b"{\"ok\":true}\n".as_slice()
-    } else {
-        b"{\"ok\":false}\n".as_slice()
-    };
-    let _ = stream.write_all(reply);
-    let _ = stream.flush();
+    if outcome != Outcome::TimedOut {
+        let _ = stream.write_all(outcome.reply());
+        let _ = stream.flush();
+    }
+    outcome
 }
 
 /// What an event asks of the user. The renderer's `ATTENTION_EVENTS` maps each
@@ -1311,6 +1734,549 @@ mod tests {
         );
     }
 
+    /* ── accept-error survival and per-connection handling ────────────────── */
+
+    /// OS error numbers the next `accept` calls return instead of accepting.
+    #[cfg(unix)]
+    static INJECTED: std::sync::Mutex<std::collections::VecDeque<i32>> =
+        std::sync::Mutex::new(std::collections::VecDeque::new());
+
+    #[cfg(unix)]
+    pub(super) fn injected_accept_error() -> Option<std::io::Error> {
+        INJECTED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+            .map(std::io::Error::from_raw_os_error)
+    }
+
+    #[cfg(unix)]
+    fn inject_accept_errors(codes: &[i32]) {
+        INJECTED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(codes.iter().copied());
+    }
+
+    #[cfg(unix)]
+    fn injected_remaining() -> usize {
+        INJECTED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// Empties the injected queue however the test ends.
+    #[cfg(unix)]
+    struct ClearInjected;
+
+    #[cfg(unix)]
+    impl Drop for ClearInjected {
+        fn drop(&mut self) {
+            INJECTED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+    }
+
+    /// A budget longer than any test, for a connection that must stay open
+    /// while the test looks at the others. Reset however the test ends.
+    #[cfg(unix)]
+    static BUDGET_OVERRIDE_MS: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(unix)]
+    pub(super) fn budget_override() -> Option<std::time::Duration> {
+        match BUDGET_OVERRIDE_MS.load(Ordering::SeqCst) {
+            0 => None,
+            ms => Some(std::time::Duration::from_millis(ms)),
+        }
+    }
+
+    #[cfg(unix)]
+    struct LongBudget;
+
+    #[cfg(unix)]
+    impl LongBudget {
+        fn new() -> Self {
+            BUDGET_OVERRIDE_MS.store(60_000, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for LongBudget {
+        fn drop(&mut self) {
+            BUDGET_OVERRIDE_MS.store(0, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(unix)]
+    fn open_connections() -> usize {
+        state().open_connections.load(Ordering::SeqCst)
+    }
+
+    #[cfg(unix)]
+    const REPORT: &[u8] = br#"{"v":1,"event":"idle_prompt","agent":"claude","session":"term-9"}"#;
+
+    /// Connects now and then until `done`, so an `accept` that is waiting for a
+    /// connection has one to take.
+    #[cfg(unix)]
+    fn poke_until(path: &std::path::Path, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now()
+            + crate::test_support::coverage_relaxed(std::time::Duration::from_secs(10));
+        while !done() && std::time::Instant::now() < deadline {
+            let _ = std::os::unix::net::UnixStream::connect(path);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// A transient accept failure (descriptor exhaustion, an aborted peer) used
+    /// to end the loop, switch every hook report off and delete the socket
+    /// until the user toggled the setting.
+    #[cfg(unix)]
+    #[test]
+    fn a_transient_accept_error_does_not_end_the_loop_or_remove_the_socket() {
+        let _own = own_listener();
+        let _clear = ClearInjected;
+        let dir = ShortDir::new("emfile");
+        apply_at(true, Some(dir.socket()));
+        assert!(status().listening, "{:?}", status().error);
+        assert!(within(std::time::Duration::from_secs(5), || live_loops() == 1));
+        inject_accept_errors(&[
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+            libc::ECONNABORTED,
+            libc::ENOBUFS,
+        ]);
+        assert_eq!(send(&dir.socket(), REPORT).trim(), r#"{"ok":true}"#);
+        assert_eq!(injected_remaining(), 0, "the injected errors were not hit");
+        assert!(status().listening, "{:?}", status().error);
+        assert!(
+            dir.socket().exists(),
+            "a transient error removed the socket"
+        );
+        assert_eq!(status().error, None, "the backoff left an error behind");
+        apply_at(false, None);
+        assert!(within(std::time::Duration::from_secs(5), || live_loops() == 0));
+    }
+
+    /// A loop backing off must still stop when told to, not after the backoff.
+    #[cfg(unix)]
+    #[test]
+    fn stop_ends_a_loop_that_is_backing_off_promptly() {
+        let _own = own_listener();
+        let _clear = ClearInjected;
+        let dir = ShortDir::new("backoff");
+        apply_at(true, Some(dir.socket()));
+        assert!(within(std::time::Duration::from_secs(5), || live_loops() == 1));
+        inject_accept_errors(&[libc::EMFILE; 64]);
+        let _ = std::os::unix::net::UnixStream::connect(dir.socket());
+        // Let it fail a few times, so the delay has grown.
+        assert!(within(std::time::Duration::from_secs(10), || {
+            injected_remaining() < 60
+        }));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let stopped = std::time::Instant::now();
+        apply_at(false, None);
+        assert!(
+            within(
+                crate::test_support::coverage_relaxed(std::time::Duration::from_millis(250)),
+                || live_loops() == 0
+            ),
+            "the loop was still backing off {:?} after stop",
+            stopped.elapsed()
+        );
+    }
+
+    /// A fatal error is rebound, and a loop that rebinds and then works is
+    /// healthy again: the allowance is for consecutive failures.
+    #[cfg(unix)]
+    #[test]
+    fn a_fatal_accept_error_is_rebound_up_to_the_limit_and_the_loop_survives() {
+        let _own = own_listener();
+        let _clear = ClearInjected;
+        let dir = ShortDir::new("rebind");
+        apply_at(true, Some(dir.socket()));
+        assert!(status().listening, "{:?}", status().error);
+        inject_accept_errors(&vec![libc::EBADF; ACCEPT_REBIND_LIMIT as usize]);
+        poke_until(&dir.socket(), || injected_remaining() == 0);
+        assert_eq!(injected_remaining(), 0);
+        assert!(status().listening, "{:?}", status().error);
+        assert!(
+            within(std::time::Duration::from_secs(5), || dir.socket().exists()),
+            "the rebound socket is missing"
+        );
+        // A report sent in the instant before the fresh listener replaces the
+        // old one goes down with the old one; the next lands.
+        assert!(
+            within(
+                crate::test_support::coverage_relaxed(std::time::Duration::from_secs(10)),
+                || send(&dir.socket(), REPORT).trim() == r#"{"ok":true}"#
+            ),
+            "the rebound listener never answered"
+        );
+        apply_at(false, None);
+        assert!(within(std::time::Duration::from_secs(5), || live_loops() == 0));
+    }
+
+    /// One failure more than the limit, in a row: stop, and say why.
+    #[cfg(unix)]
+    #[test]
+    fn a_fatal_accept_error_past_the_limit_reports_not_listening_with_its_cause() {
+        let _own = own_listener();
+        let _clear = ClearInjected;
+        let dir = ShortDir::new("giveup");
+        apply_at(true, Some(dir.socket()));
+        assert!(status().listening, "{:?}", status().error);
+        inject_accept_errors(&vec![libc::EBADF; ACCEPT_REBIND_LIMIT as usize + 1]);
+        poke_until(&dir.socket(), || !status().listening);
+        assert!(
+            within(
+                crate::test_support::coverage_relaxed(std::time::Duration::from_secs(10)),
+                || !status().listening
+            ),
+            "the bridge still claims to be listening"
+        );
+        assert_eq!(
+            injected_remaining(),
+            0,
+            "gave up before using its rebinds, or used more than the limit"
+        );
+        let error = status().error.unwrap_or_default();
+        let cause = std::io::Error::from_raw_os_error(libc::EBADF).to_string();
+        assert!(error.contains(&cause), "status names no cause: {error}");
+        assert!(within(std::time::Duration::from_secs(5), || live_loops() == 0));
+    }
+
+    /// The loop used to serve one connection at a time, so a client that
+    /// connected and said nothing held every other report for its whole
+    /// deadline.
+    #[cfg(unix)]
+    #[test]
+    fn a_silent_client_does_not_delay_a_well_formed_report() {
+        let _own = own_listener();
+        let _long = LongBudget::new();
+        let dir = ShortDir::new("silent");
+        apply_at(true, Some(dir.socket()));
+        assert!(status().listening, "{:?}", status().error);
+        let fastest = |rounds: usize| {
+            (0..rounds)
+                .map(|_| {
+                    let started = std::time::Instant::now();
+                    assert_eq!(send(&dir.socket(), REPORT).trim(), r#"{"ok":true}"#);
+                    started.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        let alone = fastest(5);
+        let silent = std::os::unix::net::UnixStream::connect(dir.socket()).unwrap();
+        assert!(within(std::time::Duration::from_secs(5), || {
+            open_connections() == 1
+        }));
+        let beside = fastest(5);
+        drop(silent);
+        apply_at(false, None);
+        let slack = crate::test_support::coverage_relaxed(std::time::Duration::from_millis(50));
+        assert!(
+            beside <= alone + slack,
+            "a silent client delayed a report from {alone:?} to {beside:?}"
+        );
+    }
+
+    /// A hundred open connections is the cap. The next is refused at once, and
+    /// once one closes a real report lands.
+    #[cfg(unix)]
+    #[test]
+    fn the_hundred_and_first_connection_is_refused_and_a_real_report_still_lands() {
+        use std::io::Read;
+        let _own = own_listener();
+        let _long = LongBudget::new();
+        let dir = ShortDir::new("cap");
+        apply_at(true, Some(dir.socket()));
+        assert!(status().listening, "{:?}", status().error);
+        let mut silent = (0..MAX_OPEN_CONNECTIONS)
+            .map(|_| std::os::unix::net::UnixStream::connect(dir.socket()).unwrap())
+            .collect::<Vec<_>>();
+        let relaxed =
+            |ms| crate::test_support::coverage_relaxed(std::time::Duration::from_millis(ms));
+        assert!(
+            within(relaxed(5000), || open_connections() == MAX_OPEN_CONNECTIONS),
+            "{} connections open",
+            open_connections()
+        );
+
+        let mut over = std::os::unix::net::UnixStream::connect(dir.socket()).unwrap();
+        over.set_read_timeout(Some(relaxed(5000))).unwrap();
+        let started = std::time::Instant::now();
+        let mut reply = String::new();
+        let _ = over.read_to_string(&mut reply);
+        assert_eq!(reply.trim(), r#"{"ok":false}"#, "the 101st was not refused");
+        assert!(started.elapsed() < relaxed(1000), "{:?}", started.elapsed());
+        assert_eq!(open_connections(), MAX_OPEN_CONNECTIONS);
+
+        drop(silent.pop());
+        assert!(within(relaxed(5000), || {
+            open_connections() == MAX_OPEN_CONNECTIONS - 1
+        }));
+        assert_eq!(send(&dir.socket(), REPORT).trim(), r#"{"ok":true}"#);
+        drop(silent);
+        apply_at(false, None);
+        assert!(within(relaxed(5000), || open_connections() == 0));
+    }
+
+    /// A report that was still arriving when the deadline passed is not a
+    /// report. It is dropped, and it is not offered afterwards either.
+    #[cfg(unix)]
+    #[test]
+    fn bytes_from_a_connection_that_hit_its_deadline_are_never_offered() {
+        use std::io::Write;
+        let budget = std::time::Duration::from_millis(150);
+        let mut offered = Vec::new();
+
+        // The whole report, but the peer never closes its write half.
+        let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        client.write_all(REPORT).unwrap();
+        let outcome = handle_into(server, budget, &mut |notice| offered.push(notice));
+        assert_eq!(outcome, Outcome::TimedOut);
+        assert!(offered.is_empty(), "a timed-out report was applied");
+
+        // Half a report, then silence.
+        let (mut client2, server2) = std::os::unix::net::UnixStream::pair().unwrap();
+        client2.write_all(&REPORT[..REPORT.len() / 2]).unwrap();
+        let outcome = handle_into(server2, budget, &mut |notice| offered.push(notice));
+        assert_eq!(outcome, Outcome::TimedOut);
+        assert!(offered.is_empty(), "a partial report was applied");
+        drop((client, client2));
+
+        // The same bytes, finished in time: the sink is wired, so the empty
+        // results above mean something.
+        let (mut client3, server3) = std::os::unix::net::UnixStream::pair().unwrap();
+        client3.write_all(REPORT).unwrap();
+        client3.shutdown(std::net::Shutdown::Write).unwrap();
+        let outcome = handle_into(server3, budget, &mut |notice| offered.push(notice));
+        assert_eq!(outcome, Outcome::Accepted);
+        assert_eq!(offered.len(), 1);
+    }
+
+    /// A floor under every accept backoff, long enough for a test to look at
+    /// the status while the loop waits. Reset however the test ends.
+    #[cfg(unix)]
+    static BACKOFF_FLOOR_MS: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(unix)]
+    pub(super) fn backoff_floor() -> std::time::Duration {
+        std::time::Duration::from_millis(BACKOFF_FLOOR_MS.load(Ordering::SeqCst))
+    }
+
+    #[cfg(unix)]
+    struct SlowBackoff;
+
+    #[cfg(unix)]
+    impl SlowBackoff {
+        fn new(ms: u64) -> Self {
+            BACKOFF_FLOOR_MS.store(ms, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for SlowBackoff {
+        fn drop(&mut self) {
+            BACKOFF_FLOOR_MS.store(0, Ordering::SeqCst);
+        }
+    }
+
+    /// While a fatal error waits out its backoff the listener is not trusted,
+    /// and the status must not claim a clean bill of health.
+    #[cfg(unix)]
+    #[test]
+    fn status_says_rebinding_while_a_fatal_error_waits_and_clears_when_it_is_done() {
+        let _own = own_listener();
+        let _clear = ClearInjected;
+        let _slow = SlowBackoff::new(400);
+        let dir = ShortDir::new("rebnote");
+        apply_at(true, Some(dir.socket()));
+        assert!(status().listening, "{:?}", status().error);
+        inject_accept_errors(&[libc::EBADF]);
+        poke_until(&dir.socket(), || injected_remaining() == 0);
+        let during = status();
+        assert!(during.listening);
+        let note = during.error.unwrap_or_default();
+        assert!(
+            note.contains("rebinding after an accept error"),
+            "status during the backoff: {note:?}"
+        );
+        assert!(
+            within(
+                crate::test_support::coverage_relaxed(std::time::Duration::from_secs(10)),
+                || status().error.is_none()
+            ),
+            "the rebinding note outlived the rebind: {:?}",
+            status().error
+        );
+        assert!(status().listening);
+        apply_at(false, None);
+        assert!(within(std::time::Duration::from_secs(5), || live_loops() == 0));
+    }
+
+    struct QuietHost;
+
+    impl crate::alerts::Host for QuietHost {
+        fn submit(&self, _: &str, _: &str, _: &str, _: bool) -> Result<bool, String> {
+            Ok(true)
+        }
+        fn attended(&self, _: &str) -> bool {
+            false
+        }
+    }
+
+    #[cfg(unix)]
+    fn hook_report(event: &str, session: &str) -> Notice {
+        let json = format!(r#"{{"v":1,"event":"{event}","agent":"claude","session":"{session}"}}"#);
+        parse_report(json.as_bytes()).expect("a well-formed report")
+    }
+
+    #[cfg(unix)]
+    fn finished_stands_for(session: &str) -> bool {
+        crate::alerts::standing()
+            .iter()
+            .any(|s| s.session == session && s.event.as_deref() == Some("turn_finished"))
+    }
+
+    /// Two reports from one session reach the hub in the wrong order. The
+    /// older one is dropped, not applied late over the newer, and counted.
+    #[cfg(unix)]
+    #[test]
+    fn a_report_older_than_one_already_applied_is_dropped_and_counted() {
+        let _own = own_listener();
+        crate::alerts::start(std::sync::Arc::new(QuietHost));
+        let stale = || crate::alerts::status().stale;
+
+        // `tool_finished` was accepted second but offered first; the
+        // `turn_finished` accepted first arrives behind it and is stale.
+        let before = stale();
+        crate::alerts::offer_stamped(hook_report("tool_finished", "stamp-rev"), 2);
+        crate::alerts::offer_stamped(hook_report("turn_finished", "stamp-rev"), 1);
+        assert_eq!(stale() - before, 1);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            !finished_stands_for("stamp-rev"),
+            "a report older than the one applied before it was applied late"
+        );
+
+        // The same pair in the order it happened: nothing is stale, and the
+        // session stands finished, so the check above can tell the two apart.
+        let before = stale();
+        crate::alerts::offer_stamped(hook_report("tool_finished", "stamp-fwd"), 10);
+        crate::alerts::offer_stamped(hook_report("turn_finished", "stamp-fwd"), 11);
+        assert_eq!(stale() - before, 0);
+        assert!(
+            within(std::time::Duration::from_secs(5), || {
+                finished_stands_for("stamp-fwd")
+            }),
+            "the in-order pair did not leave the session finished"
+        );
+
+        // Another session is not held to this one's stamps.
+        let before = stale();
+        crate::alerts::offer_stamped(hook_report("turn_finished", "stamp-other"), 3);
+        assert_eq!(stale() - before, 0);
+        assert!(within(std::time::Duration::from_secs(5), || {
+            finished_stands_for("stamp-other")
+        }));
+    }
+
+    /// The order book remembers a bounded number of sessions: an ended
+    /// session's entry goes at once, and a full book makes room by forgetting
+    /// the one with the oldest stamp.
+    #[cfg(unix)]
+    #[test]
+    fn the_order_book_is_bounded_and_forgets_an_ended_session() {
+        let mut book = crate::alerts::OrderBook::default();
+        assert!(book.admit("a", 5, false));
+        assert!(!book.admit("a", 4, false), "an older stamp was admitted");
+        assert!(book.admit("a", 5, false), "an equal stamp is not older");
+        assert!(book.admit("a", 9, true));
+        assert!(book.newest.is_empty(), "an ended session was kept");
+        assert!(
+            book.admit("a", 1, false),
+            "an ended session still bound a stamp"
+        );
+
+        let cap = crate::alerts::ORDER_BOOK_CAP;
+        for n in 0..cap * 2 {
+            assert!(book.admit(&format!("s{n}"), 100 + n as u64, false));
+            assert!(book.newest.len() <= cap, "{} entries", book.newest.len());
+        }
+        assert_eq!(book.newest.len(), cap);
+        let newest = format!("s{}", cap * 2 - 1);
+        assert!(book.newest.contains_key(&newest), "the newest was evicted");
+        assert!(!book.newest.contains_key("s0"), "the oldest was kept");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_order_stamp_never_goes_backwards() {
+        let mut last = order_stamp_ns();
+        assert!(last > 0);
+        for _ in 0..10_000 {
+            let now = order_stamp_ns();
+            assert!(now >= last);
+            last = now;
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accept_errors_are_classified_and_the_backoff_is_bounded() {
+        use std::io::Error;
+        for code in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOMEM,
+            libc::ENOBUFS,
+            libc::ECONNABORTED,
+        ] {
+            assert_eq!(
+                classify_accept_error(&Error::from_raw_os_error(code)),
+                AcceptFault::Transient,
+                "{}",
+                Error::from_raw_os_error(code)
+            );
+        }
+        for code in [libc::EINTR, libc::EAGAIN] {
+            assert_eq!(
+                classify_accept_error(&Error::from_raw_os_error(code)),
+                AcceptFault::Retry
+            );
+        }
+        for code in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
+            assert_eq!(
+                classify_accept_error(&Error::from_raw_os_error(code)),
+                AcceptFault::Fatal
+            );
+        }
+        let delays = (0..40).map(accept_backoff).collect::<Vec<_>>();
+        assert_eq!(delays[0], ACCEPT_BACKOFF_FIRST);
+        assert!(delays.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(delays[39], ACCEPT_BACKOFF_MAX);
+    }
+
+    /// The hook gives up after `NOTIFY_BUDGET`. A connection the bridge is still
+    /// reading after that is serving nobody.
+    #[cfg(unix)]
+    #[test]
+    fn the_connection_ceiling_does_not_exceed_the_hooks_budget() {
+        assert!(
+            CONNECTION_TIMEOUT <= crate::hooks::NOTIFY_BUDGET,
+            "the bridge waits {CONNECTION_TIMEOUT:?} for a peer that gives up after {:?}",
+            crate::hooks::NOTIFY_BUDGET
+        );
+    }
+
     #[test]
     fn the_event_and_agent_vocabularies_have_no_duplicates() {
         for (mut names, what) in [
@@ -1383,4 +2349,9 @@ mod tests {
             assert!(report(&format!(r#"{{"v":1,"event":"{}"}}"#, event.name)).is_ok());
         }
     }
+
+    #[cfg(unix)]
+    mod adv;
+    #[cfg(unix)]
+    mod order;
 }
