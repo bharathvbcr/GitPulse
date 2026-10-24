@@ -1,0 +1,18 @@
+{
+  "about": "Every notify entry the plugin manifest (plugins/gitpulse/hooks/hooks.json) registers: the host hook event, its matcher (Notification only), and the alerts::bridge::EVENTS name it reports. `injected` marks the entries GitPulse also puts on a session it launches (workbench::claude_hook::INJECTED_EVENTS). Rust (hooks::notify_routes_tests) and scripts/plugin-contract.test.ts both require the manifest to carry exactly these routes, the routed event names to equal EVENTS in both directions, and the injected set to equal the flagged rows, so deleting or retargeting any one entry fails both.",
+  "routes": [
+    { "hook": "PermissionRequest", "matcher": null, "event": "permission_request", "injected": true },
+    { "hook": "PostToolUse", "matcher": null, "event": "tool_finished", "injected": true },
+    { "hook": "PostToolUseFailure", "matcher": null, "event": "tool_finished", "injected": true },
+    { "hook": "UserPromptSubmit", "matcher": null, "event": "prompt_submitted", "injected": true },
+    { "hook": "Stop", "matcher": null, "event": "turn_finished", "injected": true },
+    { "hook": "StopFailure", "matcher": null, "event": "error", "injected": false },
+    { "hook": "SessionEnd", "matcher": null, "event": "session_ended", "injected": true },
+    { "hook": "Notification", "matcher": "permission_prompt", "event": "permission_prompt", "injected": false },
+    { "hook": "Notification", "matcher": "idle_prompt", "event": "idle_prompt", "injected": false },
+    { "hook": "Notification", "matcher": "agent_needs_input", "event": "agent_needs_input", "injected": false },
+    { "hook": "Notification", "matcher": "agent_completed", "event": "agent_completed", "injected": false },
+    { "hook": "Notification", "matcher": "elicitation_dialog", "event": "elicitation_dialog", "injected": false },
+    { "hook": "Notification", "matcher": "elicitation_url_dialog", "event": "elicitation_url_dialog", "injected": false }
+  ]
+}

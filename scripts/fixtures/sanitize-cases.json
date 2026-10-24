@@ -1,0 +1,22 @@
+{
+  "about": "One table for the notification text cleaner. Rust (alerts::text::sanitize and printable, also driven through OSC 9, OSC 777, OSC 99 and a hook report's message / last_assistant_message) and the renderer (sessionActivity.ts clean) are both tested against every row. `input` is what a program or peer sent; `clean` is what sanitize returns (hidden characters dropped, separators collapsed to one space, trimmed); `printable` is what Rust's printable returns with no length cut. `wire` false marks rows that cannot ride an OSC string (NUL, ESC) or that clean to nothing, so only the direct functions run them.",
+  "cases": [
+    { "name": "plain text is untouched", "input": "hello world", "clean": "hello world", "printable": "helloworld", "wire": true },
+    { "name": "U+202E right-to-left override", "input": "evil‮txt.exe", "clean": "eviltxt.exe", "printable": "eviltxt.exe", "wire": true },
+    { "name": "U+202A to U+202D embeddings", "input": "a‪b‫c‬d‭e", "clean": "abcde", "printable": "abcde", "wire": true },
+    { "name": "U+2066 to U+2069 isolates", "input": "a⁦b⁧c⁨d⁩e", "clean": "abcde", "printable": "abcde", "wire": true },
+    { "name": "U+200B to U+200F zero-width and direction marks", "input": "a​b‌c‍d‎e‏f", "clean": "abcdef", "printable": "abcdef", "wire": true },
+    { "name": "U+FEFF byte-order mark", "input": "﻿start", "clean": "start", "printable": "start", "wire": true },
+    { "name": "tag characters U+E0001 and U+E0041", "input": "x󠀁󠁁y", "clean": "xy", "printable": "xy", "wire": true },
+    { "name": "private use in all three planes", "input": "abc󰀀d􏿽e", "clean": "abcde", "printable": "abcde", "wire": true },
+    { "name": "soft hyphen and word joiner", "input": "a­b⁠c", "clean": "abc", "printable": "abc", "wire": true },
+    { "name": "a hidden character is not a word break", "input": "pass​word reset", "clean": "password reset", "printable": "passwordreset", "wire": true },
+    { "name": "newline tab and NEL collapse to one space", "input": "line one\nline\ttwo\u0085three", "clean": "line one line two three", "printable": "lineonelinetwothree", "wire": true },
+    { "name": "line and paragraph separators", "input": "a b c", "clean": "a b c", "printable": "abc", "wire": true },
+    { "name": "runs of whitespace collapse and trim", "input": "  a   b  ", "clean": "a b", "printable": "ab", "wire": true },
+    { "name": "overrides cannot dress a heading", "input": "Claude‮⁦ needs you", "clean": "Claude needs you", "printable": "Claudeneedsyou", "wire": true },
+    { "name": "NUL and ESC are controls", "input": "a\u0000b\u001B[31mred", "clean": "a b [31mred", "printable": "ab[31mred", "wire": false },
+    { "name": "only hidden characters", "input": "‮​﻿", "clean": "", "printable": "", "wire": false },
+    { "name": "letters, CJK and emoji survive", "input": "日本語 ✓ 🙂", "clean": "日本語 ✓ 🙂", "printable": "日本語✓🙂", "wire": true }
+  ]
+}

@@ -34,6 +34,8 @@
 //! notification form and it is the single loudest thing this module must not
 //! mistake for a message.
 
+use super::text::sanitize;
+
 /// What a CLI asked the terminal to tell the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Signal {
@@ -86,9 +88,6 @@ const MAX_CHUNKS: usize = 64;
 /// How many part-assembled kitty notifications are tracked at once. A CLI that
 /// starts notifications and never finishes them cannot grow this map.
 const MAX_PENDING_CHUNKED: usize = 4;
-
-/// Longest text this module will hand to an OS banner, in characters.
-const MAX_TEXT_CHARS: usize = 240;
 
 /// Signals returned from a single [`Scanner::feed`].
 ///
@@ -490,38 +489,9 @@ fn text_of(bytes: &[u8]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Strips control characters and collapses runs of whitespace.
-///
-/// What reaches this point is attacker-adjacent by construction: any program
-/// the user runs can write it. A notification body is rendered by the OS, so
-/// the bytes that matter are the ones that could move a cursor, start another
-/// escape sequence, or turn one line into forty.
-pub fn sanitize(text: &str) -> String {
-    let mut out = String::with_capacity(text.len().min(512));
-    let mut chars = 0usize;
-    let mut space = false;
-    for ch in text.chars() {
-        if ch.is_control() || ch.is_whitespace() || ch == '\u{2028}' || ch == '\u{2029}' {
-            space = true;
-            continue;
-        }
-        if space && chars > 0 {
-            out.push(' ');
-            chars += 1;
-        }
-        space = false;
-        if chars >= MAX_TEXT_CHARS {
-            out.push('…');
-            break;
-        }
-        out.push(ch);
-        chars += 1;
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::text::MAX_TEXT_CHARS;
     use super::*;
 
     fn scan(input: &[u8]) -> Vec<Signal> {
