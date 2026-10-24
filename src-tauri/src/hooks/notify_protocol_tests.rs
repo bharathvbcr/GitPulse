@@ -118,6 +118,9 @@ fn a_report_carries_no_seq_when_the_process_never_took_an_entry_stamp() {
 #[test]
 fn every_reason_is_printed_verbatim_and_none_blames_a_version() {
     for reason in Reason::ALL {
+        if reason == Reason::Stale {
+            continue;
+        }
         let reply = format!(r#"{{"ok":false,"reason":"{}"}}"#, reason.token());
         let said = acknowledged(reply.as_bytes()).unwrap_err();
         assert!(said.contains(reason.token()), "{said}");
@@ -125,6 +128,29 @@ fn every_reason_is_printed_verbatim_and_none_blames_a_version() {
             assert!(!said.contains("version"), "{said}");
         }
     }
+}
+
+/// A report superseded by a newer one from its session was delivered: the hook
+/// does not warn. Every other reason still does.
+#[cfg(unix)]
+#[test]
+fn a_superseded_report_is_delivered_not_a_warning() {
+    assert_eq!(
+        acknowledged(br#"{"ok":false,"reason":"stale"}"#),
+        Ok(()),
+        "stale is the system working"
+    );
+    for reason in Reason::ALL.into_iter().filter(|r| *r != Reason::Stale) {
+        let reply = format!(r#"{{"ok":false,"reason":"{}"}}"#, reason.token());
+        assert!(
+            acknowledged(reply.as_bytes()).is_err(),
+            "{}",
+            reason.token()
+        );
+    }
+    // A bare refusal and a reason this build does not know are still refusals.
+    assert!(acknowledged(br#"{"ok":false}"#).is_err());
+    assert!(acknowledged(br#"{"ok":false,"reason":"stale_ish"}"#).is_err());
 }
 
 /// Only a refusal about the version talks about versions, and it gives both.

@@ -443,7 +443,7 @@ fn refused_with(reply: &'static [u8]) -> Exchange {
 
 #[test]
 fn the_hook_prints_the_apps_reason_verbatim_and_blames_no_version() {
-    for token in ["queue_full", "stale", "not_running", "unknown_agent"] {
+    for token in ["queue_full", "not_running", "unknown_agent"] {
         let reply: &'static [u8] = Box::leak(
             format!("{{\"ok\":false,\"reason\":\"{token}\"}}\n")
                 .into_bytes()
@@ -525,5 +525,26 @@ fn malformed_input_writes_nothing_to_stdout() {
         run.stdout.is_empty(),
         "{:?}",
         String::from_utf8_lossy(&run.stdout)
+    );
+}
+
+/// A report the app refused as stale was superseded by a newer one from its
+/// session: delivered, so the real hook warns about nothing.
+#[test]
+fn a_report_refused_as_stale_is_not_a_warning() {
+    let run = exchange(
+        "agent_completed",
+        &claude_payload("/Users/me/GitPulse"),
+        None,
+        Some("claude"),
+        b"{\"ok\":false,\"reason\":\"stale\"}\n",
+        Duration::ZERO,
+    );
+    assert!(run.sent.is_some());
+    assert!(run.stdout.is_empty());
+    assert!(
+        !run.stderr.contains("refused") && !run.stderr.contains("not delivered"),
+        "{:?}",
+        run.stderr
     );
 }

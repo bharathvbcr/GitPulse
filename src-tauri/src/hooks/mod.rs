@@ -2247,12 +2247,26 @@ fn acknowledged(reply: &[u8]) -> Result<(), String> {
         .and_then(|value| value.get("ok").and_then(Value::as_bool))
     {
         Some(true) => Ok(()),
+        // Superseded by a newer report from the same session: the report was
+        // delivered, and the app correctly applied the newer one instead. The
+        // wire says `ok:false` because nothing was applied, which is honest;
+        // for the hook it is the system working, so it is not a warning.
+        Some(false) if refused_as_stale(value.as_ref()) => Ok(()),
         Some(false) => Err(refusal_text(value.as_ref())),
         None => Err(format!(
             "GitPulse answered with something other than an acknowledgement: {:?}",
             String::from_utf8_lossy(reply)
         )),
     }
+}
+
+/// Whether the refusal's reason is `stale`.
+#[cfg(unix)]
+fn refused_as_stale(reply: Option<&Value>) -> bool {
+    reply
+        .and_then(|reply| reply.get("reason"))
+        .and_then(Value::as_str)
+        == Some(crate::alerts::bridge::Reason::Stale.token())
 }
 
 /// What the hook says about a refusal. Versions are mentioned only for the

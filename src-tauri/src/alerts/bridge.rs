@@ -57,7 +57,9 @@
 //!   when their hooks began and not by which connection happened to be accepted
 //!   or read first. A report without `seq` is ordered by its accept stamp, as
 //!   before; see [`order_for`] for why the two compare and for the cap. A report
-//!   older than one already applied for its session is refused as `stale`.
+//!   older than one already applied for its session is refused as `stale`
+//!   on the wire (nothing was applied), which the hook treats as delivered and
+//!   superseded, not as a failure.
 //! * **Reply.** `{"ok":true}` if the notification worker took the report, with
 //!   nothing else in it. Otherwise `{"ok":false,"reason":"<token>"}`, the token
 //!   one of [`Reason`]'s closed set (never text the peer sent), plus `"max_v"`
