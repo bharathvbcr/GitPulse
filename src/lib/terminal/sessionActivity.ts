@@ -28,6 +28,7 @@
  */
 
 import { writable, type Readable } from "svelte/store";
+import hiddenCodepoints from "../../../scripts/fixtures/hidden-codepoints.json";
 import { MAX_TERMINAL_SESSIONS } from "./sessionLimit";
 
 /** The renderer event the native notifier announces attention on. */
@@ -94,21 +95,30 @@ const MAX_DETAIL = 240;
 const SESSION_ID = /^[\w-]{1,128}$/;
 
 /**
- * Format characters (`Cf`: bidirectional overrides and isolates, zero-width
- * characters, the byte-order mark, the tag block) and private-use code points.
- * Invisible or reordering, so dropped without leaving a space.
+ * The code points the cleaner drops (format characters `Cf`: bidirectional
+ * overrides and isolates, zero-width characters, the byte-order mark, the tag
+ * block; and private use `Co`) and the ones it turns into a space (controls and
+ * whitespace). Read from the table `scripts/hidden-codepoints.mjs` generates,
+ * which Rust's `alerts::text` reads too, rather than from the running engine's
+ * `\p{…}` classes, so both sides are pinned to one Unicode version.
  */
-const HIDDEN = /[\p{Cf}\p{Co}]/gu;
+function rangeClass(ranges: ReadonlyArray<readonly [number, number]>): string {
+  const at = (cp: number) => `\\u{${cp.toString(16)}}`;
+  return `[${ranges.map(([lo, hi]) => (lo === hi ? at(lo) : `${at(lo)}-${at(hi)}`)).join("")}]`;
+}
+const HIDDEN = new RegExp(rangeClass(hiddenCodepoints.drop as Array<[number, number]>), "gu");
+const SEPARATORS = new RegExp(`${rangeClass(hiddenCodepoints.space as Array<[number, number]>)}+`, "gu");
 
 /**
  * Cleans and bounds text that came from a program: hidden characters dropped,
  * controls and whitespace collapsed to single spaces. Mirrors Rust's
- * `alerts::text::sanitize`; `scripts/fixtures/sanitize-cases.json` is the table
- * both are tested against, row by row.
+ * `alerts::text::sanitize` over the same generated table;
+ * `scripts/fixtures/sanitize-cases.json` is the readable table both are also
+ * tested against, row by row.
  */
 export function clean(value: unknown, max: number): string | null {
   if (typeof value !== "string") return null;
-  const text = Array.from(value.replace(HIDDEN, "").replace(/[\p{Cc}\s]+/gu, " ").trim()).slice(0, max).join("");
+  const text = Array.from(value.replace(HIDDEN, "").replace(SEPARATORS, " ").trim()).slice(0, max).join("");
   return text || null;
 }
 
@@ -136,15 +146,33 @@ export function isReaderInput(data: string): boolean {
   return data.replace(TERMINAL_REPLY, "").length > 0;
 }
 
-/** Unknown event names already logged: each is said once, and the set is bounded. */
+/**
+ * Unknown event names already logged: each of the first 16 is said once. Past
+ * that the memory is a counter and a timestamp, not a set, so a newer native
+ * side that names many events cannot grow it; the counter is what keeps a new
+ * name from vanishing, because it is said in the next summary warning (at most
+ * one a minute, carrying the total and the latest name).
+ */
 const loggedUnknown = new Set<string>();
 const MAX_LOGGED_UNKNOWN = 16;
+const SUMMARY_EVERY_MS = 60_000;
+let pastCap = 0;
+let lastSummaryAt = -Infinity;
 
-function logUnknownEvent(event: unknown): void {
+function logUnknownEvent(event: unknown, now: number): void {
   const name = typeof event === "string" ? clean(event, 64) ?? "" : `<${typeof event}>`;
-  if (loggedUnknown.has(name) || loggedUnknown.size >= MAX_LOGGED_UNKNOWN) return;
-  loggedUnknown.add(name);
-  console.warn(`[gitpulse-alerts] ignored an attention event this window does not know: ${JSON.stringify(name)}`);
+  if (loggedUnknown.has(name)) return;
+  if (loggedUnknown.size < MAX_LOGGED_UNKNOWN) {
+    loggedUnknown.add(name);
+    console.warn(`[gitpulse-alerts] ignored an attention event this window does not know: ${JSON.stringify(name)}`);
+    return;
+  }
+  pastCap += 1;
+  if (now - lastSummaryAt < SUMMARY_EVERY_MS) return;
+  lastSummaryAt = now;
+  console.warn(
+    `[gitpulse-alerts] ignored ${pastCap} more attention events past the first ${MAX_LOGGED_UNKNOWN} unknown names; latest: ${JSON.stringify(name)}`,
+  );
 }
 
 /**
@@ -165,7 +193,7 @@ export function parseAttention(raw: unknown, now: number): { session: string; at
   let event: (typeof ATTENTION_EVENTS)[keyof typeof ATTENTION_EVENTS] | null = null;
   if (row.event !== undefined && row.event !== null) {
     if (typeof row.event !== "string" || !Object.hasOwn(ATTENTION_EVENTS, row.event)) {
-      logUnknownEvent(row.event);
+      logUnknownEvent(row.event, now);
       return null;
     }
     event = ATTENTION_EVENTS[row.event as keyof typeof ATTENTION_EVENTS];

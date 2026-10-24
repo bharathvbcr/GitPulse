@@ -155,8 +155,8 @@ pub struct CommitGraphWriteOutcome {
 const MAX_NOTE_CHARS: usize = 240;
 
 fn tidy_note(note: &str) -> String {
-    note.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+    crate::alerts::text::sanitize(note)
+        .chars()
         .take(MAX_NOTE_CHARS)
         .collect()
 }
@@ -828,4 +828,17 @@ pub fn inspect(repo: &Path, git_dir: &Path, common_dir: &Path) -> CommitGraphRep
         }
     }
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tidy_note;
+
+    #[test]
+    fn a_note_quoting_a_ref_cannot_carry_hidden_text() {
+        assert_eq!(
+            tidy_note("ref refs/heads/a\u{202e}gnp.exe\u{200b} is odd\n"),
+            "ref refs/heads/agnp.exe is odd"
+        );
+    }
 }

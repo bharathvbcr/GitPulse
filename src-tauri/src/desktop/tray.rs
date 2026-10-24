@@ -47,9 +47,13 @@ pub fn tray_tooltip(state: &MenuState) -> String {
         1 => "1 agent needs you\n".into(),
         n => format!("{n} agents need you\n"),
     };
+    // The detail and the summary carry repository and branch names, which a
+    // repository controls: each is cleaned to one line, and the newlines here
+    // are the tooltip's own.
     format!(
         "GitPulse\n{agents}{}\n{}",
-        state.tray_detail, state.tray_summary.text
+        crate::alerts::text::sanitize(&state.tray_detail),
+        crate::alerts::text::sanitize(&state.tray_summary.text)
     )
 }
 
@@ -360,7 +364,8 @@ pub fn apply<R: Runtime>(app: &AppHandle<R>, state: &MenuState) -> Result<(), St
     // title is what actually clears the button, and it is what `None` already
     // means on the other two platforms (GTK maps it to `""`; Windows ignores
     // titles entirely), so this is the value every platform gets.
-    let title = state.tray_title.as_deref().unwrap_or_default();
+    let title = crate::alerts::text::sanitize(state.tray_title.as_deref().unwrap_or_default());
+    let title = title.as_str();
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         // Never leave a menu attached at rest — that is what steals left clicks on macOS.
         tray.set_menu(None::<Menu<R>>)
@@ -556,6 +561,17 @@ mod tests {
         assert_eq!(glyph_variant(&state), GlyphVariant::Attention);
         state.agents_waiting = 0;
         assert_eq!(glyph_variant(&state), GlyphVariant::Plain);
+    }
+
+    #[test]
+    fn the_tooltip_keeps_its_own_lines_and_drops_hidden_text_from_names() {
+        let mut state = MenuState::default();
+        state.tray_detail = "repo\u{202e}gnp.exe · main".into();
+        state.tray_summary.text = "Clean\u{2066}\nsecond line".into();
+        assert_eq!(
+            tray_tooltip(&state),
+            "GitPulse\nrepognp.exe · main\nClean second line"
+        );
     }
 
     #[test]

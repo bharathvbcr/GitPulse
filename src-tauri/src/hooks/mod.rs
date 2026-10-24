@@ -2069,16 +2069,11 @@ fn session_env() -> Option<String> {
 /// filesystem, not from this crate.
 const LEDGER_CAVEAT_BYTES: usize = 240;
 
-/// One line of untrusted text: whitespace runs (newlines included) become one
-/// space, control characters go, and the rest is cut to `limit` bytes with `…`.
+/// One line of untrusted text: cleaned by `alerts::text::sanitize` (whitespace
+/// runs, newlines included, become one space; controls, bidi and zero-width
+/// characters and private use go), then cut to `limit` bytes with `…`.
 fn one_bounded_line(text: &str, limit: usize) -> String {
-    let flat: String = text
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let flat = crate::alerts::text::sanitize(text);
     if flat.len() <= limit {
         return flat;
     }

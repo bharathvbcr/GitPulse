@@ -25,9 +25,8 @@ pub(super) struct ProcessView {
 /// An empty result is `None`: a blank name is not a name.
 #[cfg(unix)]
 pub(super) fn clean_process_name(raw: &str) -> Option<String> {
-    let cleaned: String = raw
+    let cleaned: String = crate::alerts::text::sanitize(raw)
         .chars()
-        .filter(|c| !c.is_control())
         .take(MAX_PROCESS_NAME_CHARS)
         .collect();
     let trimmed = cleaned.trim();
@@ -202,6 +201,15 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn a_process_name_cannot_carry_hidden_characters_into_the_tab() {
+        assert_eq!(
+            clean_process_name("evil\u{202e}txt.exe\u{2066}"),
+            Some("eviltxt.exe".into())
+        );
+        assert_eq!(clean_process_name("\u{200b}\u{feff}"), None);
+    }
+
     #[test]
     fn process_names_are_printable_bounded_and_never_blank() {
         assert_eq!(clean_process_name("vim"), Some("vim".into()));
