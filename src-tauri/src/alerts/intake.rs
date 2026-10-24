@@ -26,10 +26,20 @@
 //! * **Hook reports are ordered** by a stamp (see [`OrderBook`]), and every
 //!   `session_ended` from any producer goes through that one place, so the end
 //!   of a session leaves one tombstone however it was reported.
-//! * **A refusal is counted** in `dropped_queue` or `stale`, so offered and
-//!   accounted-for still reconcile.
+//! * **A hook report is about a session that exists, and arrives at a rate a
+//!   session can produce.** A report that names a terminal session the
+//!   registry does not hold is refused before it touches the order book, the
+//!   twin memory or the queue, so an invented key creates nothing and evicts
+//!   nothing. The one exception is order: a report older than the end of a
+//!   session the book remembers is `stale`, as it has always been, whether or
+//!   not the registry still lists the session. Then a per-session token bucket
+//!   ([`super::limits`]) refuses what a session cannot have sent.
+//! * **A refusal is counted** in `dropped_queue`, `stale` or (the socket, for
+//!   the two above) `bridge_rejected`, so offered and accounted-for still
+//!   reconcile.
 
-use super::{Counters, Notice, QUEUE};
+use super::limits::Limits;
+use super::{Counters, Host, Notice, Origin, QUEUE};
 #[cfg(unix)]
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -63,6 +73,13 @@ pub enum Offer {
     QueueFull,
     /// There is no worker to take it: none was started, or it is gone.
     NotRunning,
+    /// A hook report for a session key the live terminal registry does not
+    /// hold ([`Host::knows`]); nothing was recorded for it. The socket counts
+    /// it as `bridge_rejected`.
+    UnknownSession,
+    /// A hook report from a session sending faster than [`super::limits`]
+    /// allows; nothing was recorded for it. Counted as `bridge_rejected`.
+    RateLimited,
 }
 
 impl Offer {
@@ -293,6 +310,11 @@ pub(super) struct Intake {
     /// being admitted and queued.
     #[cfg(unix)]
     order: Mutex<OrderBook>,
+    /// Asked whether a hook report's session exists. `None` (a bare intake,
+    /// as most tests build) knows every key.
+    host: Option<Arc<dyn Host>>,
+    #[cfg(unix)]
+    limits: Mutex<Limits>,
 }
 
 impl Intake {
@@ -305,8 +327,17 @@ impl Intake {
             low: Arc::default(),
             #[cfg(unix)]
             order: Mutex::default(),
+            host: None,
+            #[cfg(unix)]
+            limits: Mutex::default(),
         };
         (intake, receiver)
+    }
+
+    /// Has hook reports checked against `host`'s [`Host::knows`].
+    pub(super) fn guarded_by(mut self, host: Arc<dyn Host>) -> Self {
+        self.host = Some(host);
+        self
     }
 
     /// What the worker calls as it takes a bell off the queue.
@@ -388,6 +419,22 @@ impl Intake {
     /// counted as `stale`, never applied late and never waited for.
     #[cfg(unix)]
     pub(super) fn offer_stamped(&self, notice: Notice, stamp: u64) -> Offer {
+        self.offer_stamped_at(notice, stamp, std::time::Instant::now())
+    }
+
+    /// [`Intake::offer_stamped`] at a stated time, which the rate limit reads.
+    #[cfg(unix)]
+    pub(super) fn offer_stamped_at(
+        &self,
+        notice: Notice,
+        stamp: u64,
+        now: std::time::Instant,
+    ) -> Offer {
+        if notice.origin == Origin::Hook {
+            if let Some(refused) = self.screen(&notice, stamp, now) {
+                return refused;
+            }
+        }
         let mut book = self
             .order
             .lock()
@@ -422,10 +469,53 @@ impl Intake {
         // one the queue refused must try the queue itself, and is not answered
         // as taken for a report that was dropped.
         let remembered = notice.event.is_some().then(|| notice.clone());
+        let ended_key = ends.then(|| notice.key.clone());
         let offer = self.enqueue(notice);
         if let (Offer::Accepted, Some(notice)) = (offer, remembered) {
             book.remember(&notice, stamp);
         }
+        if let Some(key) = ended_key {
+            self.limits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .forget(&key);
+        }
         offer
+    }
+
+    /// The checks a peer's report meets before it can leave a trace: order
+    /// (only to keep a late report from a finished session `stale`, as ever),
+    /// then whether the session exists, then the rate. Changes nothing when it
+    /// refuses for the second or third reason.
+    ///
+    /// A key `hook-…` names no terminal: it is what the bridge makes of a report
+    /// from outside one, and a peer may also choose it. It is not asked of the
+    /// registry, and draws on the shared bucket of such reports instead.
+    #[cfg(unix)]
+    fn screen(&self, notice: &Notice, stamp: u64, now: std::time::Instant) -> Option<Offer> {
+        let stale = self
+            .order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_stale(&notice.key, stamp);
+        if stale {
+            self.counters.stale.fetch_add(1, Ordering::Relaxed);
+            return Some(Offer::Stale);
+        }
+        let outside = notice.key.starts_with("hook-");
+        if !outside
+            && self
+                .host
+                .as_ref()
+                .is_some_and(|host| !host.knows(&notice.key))
+        {
+            return Some(Offer::UnknownSession);
+        }
+        let admitted = self
+            .limits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .admit(&notice.key, outside, now);
+        (!admitted).then_some(Offer::RateLimited)
     }
 }

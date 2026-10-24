@@ -181,12 +181,26 @@ fn an_app_that_gives_no_reason_is_not_assumed_to_be_a_different_version() {
 #[cfg(unix)]
 #[test]
 fn a_reason_from_a_newer_app_is_shown_as_sent() {
-    let said = acknowledged(br#"{"ok":false,"reason":"rate_limited"}"#).unwrap_err();
-    assert!(said.ends_with("rate_limited"), "{said}");
+    let said = acknowledged(br#"{"ok":false,"reason":"quota_exhausted_v2"}"#).unwrap_err();
+    assert!(said.ends_with("quota_exhausted_v2"), "{said}");
     let said = acknowledged(b"{\"ok\":false,\"reason\":\"a\\u001b[31mb\"}").unwrap_err();
     assert!(!said.contains('\u{1b}'), "{said:?}");
     let long = format!(r#"{{"ok":false,"reason":"{}"}}"#, "z".repeat(500));
     assert!(acknowledged(long.as_bytes()).unwrap_err().len() < 200);
+}
+
+/// The two reasons the bridge gained for owner decision 6 are in the closed
+/// set, so a hook prints GitPulse's own sentence for them.
+#[cfg(unix)]
+#[test]
+fn the_session_and_rate_refusals_print_the_bridges_own_words() {
+    let said = acknowledged(br#"{"ok":false,"reason":"unknown_session"}"#).unwrap_err();
+    assert!(said.contains("no terminal session has that id"), "{said}");
+    let said = acknowledged(br#"{"ok":false,"reason":"rate_limited"}"#).unwrap_err();
+    assert!(
+        said.contains("reporting faster than a session can"),
+        "{said}"
+    );
 }
 
 /// Fields the hook has not heard of change nothing on success, so a newer app

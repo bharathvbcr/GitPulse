@@ -652,6 +652,23 @@ impl crate::alerts::Host for SessionHost {
             .is_some_and(|window| window.is_focused().unwrap_or(false))
     }
 
+    /// The live terminal registry, in process or in the terminal host, lists
+    /// the session (one still ending counts: its last reports are real). A
+    /// registry that cannot be asked answers no: a check that could not run is
+    /// not one that passed.
+    fn knows(&self, key: &str) -> bool {
+        let Some(sessions) = self.app.try_state::<crate::terminal::TerminalSessions>() else {
+            return false;
+        };
+        match crate::terminal::list_sessions(&sessions) {
+            Ok(listed) => listed.iter().any(|session| session.id == key),
+            Err(error) => {
+                log::warn!(target: "alerts", "terminal registry unreadable, hook report refused: {error}");
+                false
+            }
+        }
+    }
+
     /// A failed emit is logged, not retried: the next notice from the session
     /// replaces this one, and the pane's own activity reading still stands.
     fn announce(&self, attention: &crate::alerts::Attention) {

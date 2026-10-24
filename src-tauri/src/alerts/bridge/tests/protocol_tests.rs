@@ -132,6 +132,8 @@ fn every_refusal_carries_its_own_closed_set_reason() {
                     | Reason::Stale
                     | Reason::QueueFull
                     | Reason::NotRunning
+                    | Reason::UnknownSession
+                    | Reason::RateLimited
             )
         })
         .map(Reason::token)
@@ -252,6 +254,14 @@ fn the_reply_follows_what_the_hub_did_with_the_report() {
         (Offer::Stale, r#"{"ok":false,"reason":"stale"}"#),
         (Offer::QueueFull, r#"{"ok":false,"reason":"queue_full"}"#),
         (Offer::NotRunning, r#"{"ok":false,"reason":"not_running"}"#),
+        (
+            Offer::UnknownSession,
+            r#"{"ok":false,"reason":"unknown_session"}"#,
+        ),
+        (
+            Offer::RateLimited,
+            r#"{"ok":false,"reason":"rate_limited"}"#,
+        ),
     ] {
         let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
         client.write_all(report).unwrap();

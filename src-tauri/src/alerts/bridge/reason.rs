@@ -41,12 +41,18 @@ pub enum Reason {
     QueueFull,
     /// There is no notification worker to take it.
     NotRunning,
+    /// `session` names a key the live terminal registry does not hold, so no
+    /// GitPulse session exists for the report to be about.
+    UnknownSession,
+    /// The session (or, for a report from outside any terminal, the class of
+    /// them) is sending faster than a real agent does.
+    RateLimited,
 }
 
 impl Reason {
     /// Every reason, so a test can prove the tokens are distinct and a caller
     /// can look one up without a second table.
-    pub const ALL: [Reason; 18] = [
+    pub const ALL: [Reason; 20] = [
         Reason::Oversized,
         Reason::Unreadable,
         Reason::AtCapacity,
@@ -65,6 +71,8 @@ impl Reason {
         Reason::Stale,
         Reason::QueueFull,
         Reason::NotRunning,
+        Reason::UnknownSession,
+        Reason::RateLimited,
     ];
 
     /// The wire token: lowercase, `_`-separated, never changed once shipped.
@@ -88,6 +96,8 @@ impl Reason {
             Reason::Stale => "stale",
             Reason::QueueFull => "queue_full",
             Reason::NotRunning => "not_running",
+            Reason::UnknownSession => "unknown_session",
+            Reason::RateLimited => "rate_limited",
         }
     }
 
@@ -118,6 +128,8 @@ impl Reason {
             Reason::Stale => "older than a report already applied for the session",
             Reason::QueueFull => "the notification queue is full",
             Reason::NotRunning => "the notification worker is not running",
+            Reason::UnknownSession => "no terminal session has that id",
+            Reason::RateLimited => "reporting faster than a session can",
         }
     }
 }
