@@ -2426,5 +2426,5 @@ mod tests {
     #[cfg(unix)]
     mod order;
     #[cfg(unix)]
-    mod protocol;
+    mod protocol_tests;
 }

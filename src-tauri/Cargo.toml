@@ -340,6 +340,11 @@ harness = false
 test = false
 
 [[bench]]
+name = "alerts_worker"
+harness = false
+test = false
+
+[[bench]]
 name = "idle_wakeups"
 harness = false
 test = false
