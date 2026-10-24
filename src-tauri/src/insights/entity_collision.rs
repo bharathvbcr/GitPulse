@@ -2489,12 +2489,17 @@ class C:
         out
     }
 
+    /// The least CPU time of three runs of `f` on this thread. CPU time, not
+    /// wall time: the join is pure computation and the budgets below are about
+    /// work. A loaded host stretches the wall clock of a 50 ms run by tens of
+    /// times, and the longer run is the likelier to be descheduled, so a wall
+    /// clock turns the 8000-over-4000 ratio into a measurement of the machine.
     fn min_of_3(mut f: impl FnMut()) -> std::time::Duration {
         (0..3)
             .map(|_| {
-                let t = std::time::Instant::now();
+                let t = crate::sysload::thread_cpu();
                 f();
-                t.elapsed()
+                crate::sysload::thread_cpu() - t
             })
             .min()
             .unwrap()

@@ -808,13 +808,26 @@ mod tests {
         (report, churn)
     }
 
-    /// Makes this thread's pinned answers go to `store` until dropped.
-    struct UseStore;
+    /// Makes this thread's pinned answers go to `store` until dropped, and
+    /// holds the environment lock meanwhile. An answer is stored under a
+    /// fingerprint of the git config, home and attributes it was measured
+    /// with, so a neighbouring test that rebinds `HOME` or `GIT_CONFIG_GLOBAL`
+    /// between two calls changes the fingerprint and the second call measures
+    /// again where these tests count that it did not.
+    struct UseStore {
+        _stable_env: crate::test_support::env::EnvGuard,
+    }
     impl UseStore {
         fn file(path: &Path) -> (Self, Arc<Mutex<Store>>) {
+            let stable_env = crate::test_support::env::env_serial();
             let store = Arc::new(Mutex::new(Store::open(path, PERSISTED_ROWS).unwrap()));
             TEST_STORE.with(|cell| *cell.borrow_mut() = Some(Arc::clone(&store)));
-            (Self, store)
+            (
+                Self {
+                    _stable_env: stable_env,
+                },
+                store,
+            )
         }
     }
     impl Drop for UseStore {
