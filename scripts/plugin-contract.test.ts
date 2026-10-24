@@ -618,4 +618,139 @@ describe("hook budgets sit inside the host's timeouts", () => {
     expect(budgetSecondsFor("notify", "session_ended")).toBeLessThan(1);
     expect(budgetSecondsFor("collision-guard")).toBe(hookBudgetSeconds());
   });
+
+  it("never lets SessionEnd's timeout raise Claude Code's 1.5 s exit budget", () => {
+    // https://code.claude.com/docs/en/hooks, the `timeout` row: "`SessionEnd`
+    // hooks share a 1.5-second budget; if your settings set a longer per-hook
+    // `timeout`, Claude Code raises the budget to match, up to 60 seconds".
+    // So a longer one holds every exit of the session open.
+    const DEFAULT_SESSION_END_BUDGET_S = 1.5;
+    const declared = /pub const SESSION_END_HOST_TIMEOUT: Duration = Duration::from_secs\((\d+)\)/.exec(notifyInputSource);
+    expect(declared, "SESSION_END_HOST_TIMEOUT is no longer whole seconds; update this contract").toBeTruthy();
+    const hostTimeout = Number(declared![1]);
+    expect(hostTimeout).toBeLessThanOrEqual(DEFAULT_SESSION_END_BUDGET_S);
+    const marginMs = /const EXIT_MARGIN: Duration = Duration::from_millis\((\d+)\)/.exec(
+      readFileSync(path.join(ROOT, "src-tauri", "src", "hooks", "notify_input_tests.rs"), "utf8"),
+    );
+    expect(marginMs, "EXIT_MARGIN is no longer plain milliseconds; update this contract").toBeTruthy();
+    expect(Number(marginMs![1])).toBeGreaterThanOrEqual(250);
+    const rows = declaredTimeouts().filter((row) => row.event === "SessionEnd");
+    expect(rows.length).toBeGreaterThan(0);
+    for (const { command, timeout } of rows) {
+      expect(timeout, `SessionEnd "${command}" raises the exit budget`).toBeLessThanOrEqual(DEFAULT_SESSION_END_BUDGET_S);
+      expect(timeout, `SessionEnd "${command}" differs from the injected copy's timeout`).toBe(hostTimeout);
+      const [, subcommand = "", argument = ""] = command.split(/\s+/);
+      if (subcommand === "notify") {
+        expect(
+          budgetSecondsFor(subcommand, argument) + Number(marginMs![1]) / 1000,
+          `SessionEnd "${command}" runs past its ${timeout}s less the exit margin`,
+        ).toBeLessThanOrEqual(timeout);
+      }
+    }
+  });
+});
+
+/**
+ * Which host hook reports which event. `fixtures/notify-routes.json` is the
+ * table; `hooks::notify_routes_tests` in Rust holds the manifest and the
+ * injected settings to the same one. The manifest must carry exactly those
+ * routes and the routed names must equal `alerts::bridge::EVENTS` both ways,
+ * so deleting or retargeting any one entry fails here, which a count of
+ * entries could not do. Mutations run on copies, never the shipped file.
+ */
+describe("notify routes", () => {
+  type Hooks = Record<string, Array<{ matcher?: string; hooks: Array<{ command?: string; timeout?: number }> }>>;
+  const fixture = JSON.parse(readFileSync(path.join(ROOT, "scripts", "fixtures", "notify-routes.json"), "utf8")) as {
+    routes: Array<{ hook: string; matcher: string | null; event: string; injected: boolean }>;
+  };
+  const shipped = (JSON.parse(readFileSync(path.join(PLUGIN, "hooks", "hooks.json"), "utf8")) as { hooks: Hooks }).hooks;
+  const bridge = readFileSync(path.join(ROOT, "src-tauri", "src", "alerts", "bridge.rs"), "utf8");
+  const table = bridge.slice(bridge.indexOf("pub const EVENTS"), bridge.indexOf("];", bridge.indexOf("pub const EVENTS")));
+  const EVENTS = [...table.matchAll(/name: "([a-z_]+)"/g)].map((match) => match[1]);
+
+  const key = (hook: string, matcher: string | null | undefined, event: string) => `${hook}|${matcher ?? ""}|${event}`;
+  const wanted = fixture.routes.map((row) => key(row.hook, row.matcher, row.event)).sort();
+
+  function routesOf(hooks: Hooks): string[] {
+    const found: string[] = [];
+    for (const [hook, groups] of Object.entries(hooks)) {
+      for (const group of groups) {
+        for (const handler of group.hooks) {
+          const [, event] = String(handler.command).split(" notify ");
+          if (event !== undefined) found.push(key(hook, group.matcher, event.trim()));
+        }
+      }
+    }
+    return found.sort();
+  }
+
+  function problems(hooks: Hooks): string[] {
+    const have = routesOf(hooks);
+    const out: string[] = [];
+    for (const route of wanted) if (!have.includes(route)) out.push(`missing ${route}`);
+    for (const route of have) if (!wanted.includes(route)) out.push(`unexpected ${route}`);
+    if (have.length !== wanted.length && out.length === 0) out.push("a route is registered twice");
+    const routed = new Set(have.map((route) => route.split("|")[2]));
+    for (const name of EVENTS) if (!routed.has(name)) out.push(`EVENTS has ${name}, which nothing routes`);
+    for (const name of routed) if (!EVENTS.includes(name)) out.push(`a route reports ${name}, which EVENTS lacks`);
+    for (const route of have) {
+      const [hook, matcher, event] = route.split("|");
+      if (hook === "Notification" && matcher !== event) out.push(`Notification matcher ${matcher} reports ${event}`);
+    }
+    return out;
+  }
+
+  /** Every notify handler as [hook, group index, handler index]. */
+  function positions(hooks: Hooks): Array<[string, number, number]> {
+    const at: Array<[string, number, number]> = [];
+    for (const [hook, groups] of Object.entries(hooks)) {
+      groups.forEach((group, g) => group.hooks.forEach((handler, h) => {
+        if (String(handler.command).includes(" notify ")) at.push([hook, g, h]);
+      }));
+    }
+    return at;
+  }
+
+  it("reads the events and the routes it checks against", () => {
+    expect(EVENTS.length).toBeGreaterThanOrEqual(12);
+    expect(fixture.routes.length).toBe(13);
+  });
+
+  it("routes exactly the events the socket serves, through exactly the table's entries", () => {
+    expect(problems(shipped)).toEqual([]);
+  });
+
+  it("injects exactly the table's flagged hooks (plus PreToolUse's guards)", () => {
+    const claudeHook = readFileSync(path.join(ROOT, "src-tauri", "src", "workbench", "claude_hook.rs"), "utf8");
+    const list = /const INJECTED_EVENTS: \[&str; \d+\] = \[([^\]]*)\]/.exec(claudeHook)?.[1] ?? "";
+    const injected = [...list.matchAll(/"([A-Za-z]+)"/g)].map((match) => match[1]);
+    const flagged = [...new Set(fixture.routes.filter((row) => row.injected).map((row) => row.hook))];
+    expect([...flagged, "PreToolUse"].sort()).toEqual([...injected].sort());
+  });
+
+  it("fails when any notify entry is deleted", () => {
+    const at = positions(shipped);
+    expect(at.length).toBe(13);
+    for (const [hook, g, h] of at) {
+      const copy = structuredClone(shipped);
+      copy[hook][g].hooks.splice(h, 1);
+      expect(problems(copy), `deleting ${hook}[${g}][${h}] went unnoticed`).not.toEqual([]);
+    }
+  });
+
+  it("fails when any notify entry is retargeted to another event", () => {
+    for (const [hook, g, h] of positions(shipped)) {
+      for (const event of EVENTS) {
+        const copy = structuredClone(shipped);
+        const head = String(copy[hook][g].hooks[h].command).split(" notify ")[0];
+        copy[hook][g].hooks[h].command = `${head} notify ${event}`;
+        if (routesOf(copy).join() === routesOf(shipped).join()) continue;
+        expect(problems(copy), `${hook}[${g}][${h}] retargeted to ${event} went unnoticed`).not.toEqual([]);
+      }
+    }
+    // The retarget a count cannot see: SessionEnd reporting turn_finished.
+    const copy = structuredClone(shipped);
+    copy.SessionEnd[0].hooks[0].command = "gitpulse-hook notify turn_finished";
+    expect(problems(copy)).toContain("EVENTS has session_ended, which nothing routes");
+  });
 });

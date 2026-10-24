@@ -145,7 +145,7 @@ fn notify_timeouts(hooks: &Value) -> Vec<(String, f64)> {
 /// copies of the same events, read from the manifest: neither is restated.
 #[test]
 fn the_whole_run_ends_a_margin_before_the_host_timeout() {
-    use super::notify_input::{budgets_for, host_timeout, NOTIFY_HOST_TIMEOUT, NOTIFY_READ_BUDGET};
+    use super::notify_input::{budgets_for, host_timeout, NOTIFY_READ_BUDGET};
     assert_eq!(
         NOTIFY_READ_BUDGET, NOTIFY_BUDGET,
         "the 5 s case is the old budgets"
@@ -193,15 +193,31 @@ fn the_whole_run_ends_a_margin_before_the_host_timeout() {
         shipped.len()
     );
     for (argument, timeout) in &shipped {
-        // The plugin's copy of an event may allow more than the hook holds
-        // itself to (`session_ended` is held to the injected copy's 1 s), never
-        // less.
+        // The plugin's copy asks for exactly what the hook holds itself to.
+        // `session_ended` is the 1 s of the injected copy: a longer
+        // per-hook `SessionEnd` timeout makes Claude Code raise its 1.5 s exit
+        // budget to match, holding every exit of the session open.
         assert_eq!(
             *timeout,
-            NOTIFY_HOST_TIMEOUT.as_secs_f64(),
+            host_timeout(argument).as_secs_f64(),
             "plugin notify {argument}"
         );
         fits(argument, *timeout, "plugin");
+    }
+    // Claude Code's `SessionEnd` budget is 1.5 s unless a hook asks for more
+    // (https://code.claude.com/docs/en/hooks, the `timeout` row), so no
+    // `SessionEnd` handler, notify or otherwise, may ask for more.
+    for handler in manifest["hooks"]["SessionEnd"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|group| group["hooks"].as_array().unwrap())
+    {
+        let timeout = handler["timeout"].as_f64().expect("timeout");
+        assert!(
+            timeout <= 1.5,
+            "a SessionEnd timeout of {timeout} s raises Claude Code's 1.5 s exit budget"
+        );
     }
 }
 

@@ -2069,16 +2069,11 @@ fn session_env() -> Option<String> {
 /// filesystem, not from this crate.
 const LEDGER_CAVEAT_BYTES: usize = 240;
 
-/// One line of untrusted text: whitespace runs (newlines included) become one
-/// space, control characters go, and the rest is cut to `limit` bytes with `…`.
+/// One line of untrusted text: cleaned by `alerts::text::sanitize` (whitespace
+/// runs, newlines included, become one space; controls, bidi and zero-width
+/// characters and private use go), then cut to `limit` bytes with `…`.
 fn one_bounded_line(text: &str, limit: usize) -> String {
-    let flat: String = text
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let flat = crate::alerts::text::sanitize(text);
     if flat.len() <= limit {
         return flat;
     }
@@ -2347,7 +2342,7 @@ fn refusal_text(reply: Option<&Value>) -> String {
         // anything that is not printable and past a length no token has.
         None => format!(
             "GitPulse refused the report: {}",
-            crate::alerts::bridge::printable(token, 64)
+            crate::alerts::text::printable(token, 64)
         ),
     }
 }
@@ -2518,6 +2513,8 @@ fn truncate_marked(mut text: String, limit: usize) -> String {
 }
 
 #[cfg(test)]
+mod hidden_channel_tests;
+#[cfg(test)]
 mod notify_adv_tests;
 #[cfg(test)]
 mod notify_input_attack_tests;
@@ -2525,6 +2522,8 @@ mod notify_input_attack_tests;
 mod notify_input_tests;
 #[cfg(test)]
 mod notify_protocol_tests;
+#[cfg(test)]
+mod notify_routes_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5248,6 +5247,45 @@ done
         (result, seen)
     }
 
+    /// `Stop`'s `last_assistant_message` is model output, so it is the
+    /// likeliest carrier of hidden text. It travels as the report's `message`
+    /// and is cleaned by the one cleaner the other channels use: every row of
+    /// the shared table, from the hook's side through the socket's parser.
+    #[test]
+    fn a_last_assistant_message_is_cleaned_like_every_other_channel() {
+        let table: Value = serde_json::from_str(include_str!(
+            "../../../scripts/fixtures/sanitize-cases.json"
+        ))
+        .unwrap();
+        let serial = crate::test_support::env::env_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(AGENT_KIND_ENV, "claude")
+            .set(crate::alerts::bridge::SESSION_ENV, "term-4-1")
+            .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
+        let mut checked = 0;
+        for row in table["cases"].as_array().unwrap() {
+            if row["wire"] != json!(true) {
+                continue;
+            }
+            let mut input = notify_input();
+            input.hook_event_name = "Stop".into();
+            input.message = String::new();
+            input.last_assistant_message = row["input"].as_str().unwrap().to_owned();
+            let (result, seen) = captured("turn_finished", &input);
+            result.unwrap();
+            let payload = seen.lock().unwrap().clone().unwrap();
+            let notice = crate::alerts::bridge::parse_report(payload.as_bytes()).unwrap();
+            assert_eq!(
+                notice.detail.as_deref(),
+                row["clean"].as_str(),
+                "{}",
+                row["name"]
+            );
+            checked += 1;
+        }
+        assert!(checked >= 10, "only {checked} rows ran");
+    }
+
     /// The report a hook sends and the report the socket accepts are two
     /// halves of one protocol that live in different modules. This asserts
     /// they are the same protocol by feeding one to the other, which a schema
@@ -5426,12 +5464,10 @@ done
                 }
             }
         }
-        assert!(
-            notify_entries >= known.len(),
-            "{notify_entries} manifest entries for {} known events: an event the binary \
-             serves that nothing routes to it is a sentence no user can ever see",
-            known.len()
-        );
+        // That every event the binary serves is routed, and that no entry was
+        // retargeted, is `notify_routes_tests`' job: it compares the routed
+        // set to `EVENTS` in both directions, which a count of entries cannot.
+        assert!(notify_entries > 0, "no notify entry was read");
     }
 
     /// What the host sends for one tool call, in `PermissionRequest` and

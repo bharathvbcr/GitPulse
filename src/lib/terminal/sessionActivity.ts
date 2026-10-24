@@ -28,6 +28,7 @@
  */
 
 import { writable, type Readable } from "svelte/store";
+import hiddenCodepoints from "../../../scripts/fixtures/hidden-codepoints.json";
 import { MAX_TERMINAL_SESSIONS } from "./sessionLimit";
 
 /** The renderer event the native notifier announces attention on. */
@@ -35,8 +36,10 @@ export const ATTENTION_EVENT = "gitpulse-session-attention";
 
 /**
  * The hook events the notifier names (`alerts::bridge::EVENTS`), and what
- * each asks of the reader. `sessionActivity.contract.test.ts` reads the Rust
- * table and fails if one is missing here.
+ * each asks of the reader. The guard is the first test in
+ * `sessionActivity.test.ts` ("the attention vocabulary matches the native
+ * notifier's"), which reads the Rust table and fails if a name or its kind
+ * differs here; `parseAttention` drops an event outside this table.
  */
 export const ATTENTION_EVENTS = {
   permission_prompt: { kind: "needs-you", label: "Needs your permission" },
@@ -91,10 +94,31 @@ const MAX_TITLE = 120;
 const MAX_DETAIL = 240;
 const SESSION_ID = /^[\w-]{1,128}$/;
 
-/** Strips control characters and bounds text that came from a program. */
-function clean(value: unknown, max: number): string | null {
+/**
+ * The code points the cleaner drops (format characters `Cf`: bidirectional
+ * overrides and isolates, zero-width characters, the byte-order mark, the tag
+ * block; and private use `Co`) and the ones it turns into a space (controls and
+ * whitespace). Read from the table `scripts/hidden-codepoints.mjs` generates,
+ * which Rust's `alerts::text` reads too, rather than from the running engine's
+ * `\p{…}` classes, so both sides are pinned to one Unicode version.
+ */
+function rangeClass(ranges: ReadonlyArray<readonly [number, number]>): string {
+  const at = (cp: number) => `\\u{${cp.toString(16)}}`;
+  return `[${ranges.map(([lo, hi]) => (lo === hi ? at(lo) : `${at(lo)}-${at(hi)}`)).join("")}]`;
+}
+const HIDDEN = new RegExp(rangeClass(hiddenCodepoints.drop as Array<[number, number]>), "gu");
+const SEPARATORS = new RegExp(`${rangeClass(hiddenCodepoints.space as Array<[number, number]>)}+`, "gu");
+
+/**
+ * Cleans and bounds text that came from a program: hidden characters dropped,
+ * controls and whitespace collapsed to single spaces. Mirrors Rust's
+ * `alerts::text::sanitize` over the same generated table;
+ * `scripts/fixtures/sanitize-cases.json` is the readable table both are also
+ * tested against, row by row.
+ */
+export function clean(value: unknown, max: number): string | null {
   if (typeof value !== "string") return null;
-  const text = Array.from(value.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").replace(/\s+/g, " ").trim()).slice(0, max).join("");
+  const text = Array.from(value.replace(HIDDEN, "").replace(SEPARATORS, " ").trim()).slice(0, max).join("");
   return text || null;
 }
 
@@ -123,6 +147,35 @@ export function isReaderInput(data: string): boolean {
 }
 
 /**
+ * Unknown event names already logged: each of the first 16 is said once. Past
+ * that the memory is a counter and a timestamp, not a set, so a newer native
+ * side that names many events cannot grow it; the counter is what keeps a new
+ * name from vanishing, because it is said in the next summary warning (at most
+ * one a minute, carrying the total and the latest name).
+ */
+const loggedUnknown = new Set<string>();
+const MAX_LOGGED_UNKNOWN = 16;
+const SUMMARY_EVERY_MS = 60_000;
+let pastCap = 0;
+let lastSummaryAt = -Infinity;
+
+function logUnknownEvent(event: unknown, now: number): void {
+  const name = typeof event === "string" ? clean(event, 64) ?? "" : `<${typeof event}>`;
+  if (loggedUnknown.has(name)) return;
+  if (loggedUnknown.size < MAX_LOGGED_UNKNOWN) {
+    loggedUnknown.add(name);
+    console.warn(`[gitpulse-alerts] ignored an attention event this window does not know: ${JSON.stringify(name)}`);
+    return;
+  }
+  pastCap += 1;
+  if (now - lastSummaryAt < SUMMARY_EVERY_MS) return;
+  lastSummaryAt = now;
+  console.warn(
+    `[gitpulse-alerts] ignored ${pastCap} more attention events past the first ${MAX_LOGGED_UNKNOWN} unknown names; latest: ${JSON.stringify(name)}`,
+  );
+}
+
+/**
  * Validates an announcement at the boundary. A malformed one is no
  * announcement: it came over IPC, from a native side that may be newer.
  * `attention: null` is a valid announcement: whatever stood was answered.
@@ -133,9 +186,18 @@ export function parseAttention(raw: unknown, now: number): { session: string; at
   if (typeof row.session !== "string" || !SESSION_ID.test(row.session)) return null;
   if (typeof row.channel !== "string" || !row.channel) return null;
   const detail = clean(row.detail, MAX_DETAIL);
-  const event = typeof row.event === "string" && Object.hasOwn(ATTENTION_EVENTS, row.event)
-    ? ATTENTION_EVENTS[row.event as keyof typeof ATTENTION_EVENTS]
-    : null;
+  // No event is a bell or an OSC notice: it says only that the program wanted
+  // attention. An event this table does not name is a native side newer than
+  // this window; counting it as a bell would put an unknown meaning on the
+  // board as a request, so it is no announcement.
+  let event: (typeof ATTENTION_EVENTS)[keyof typeof ATTENTION_EVENTS] | null = null;
+  if (row.event !== undefined && row.event !== null) {
+    if (typeof row.event !== "string" || !Object.hasOwn(ATTENTION_EVENTS, row.event)) {
+      logUnknownEvent(row.event, now);
+      return null;
+    }
+    event = ATTENTION_EVENTS[row.event as keyof typeof ATTENTION_EVENTS];
+  }
   if (event?.kind === "clear") return { session: row.session, attention: null };
   const attention: SessionAttention = event
     ? { kind: event.kind, label: event.label, detail, at: now }

@@ -29,6 +29,7 @@ pub mod bridge;
 mod intake;
 pub mod policy;
 pub mod scan;
+pub mod text;
 
 pub use intake::Offer;
 use intake::{Intake, LowGate};
@@ -154,7 +155,9 @@ impl Notice {
     /// than echoing agent-supplied text, so a program cannot dress its
     /// notification up as something else.
     fn heading(&self) -> String {
-        match &self.place {
+        // The place is a directory name a program chose; cleaned here too, so
+        // no door it came in by can reorder GitPulse's own heading.
+        match self.place.as_deref().map(text::sanitize) {
             Some(place) if !place.is_empty() => format!("{} · {place}", self.label),
             _ => self.label.clone(),
         }
@@ -170,7 +173,7 @@ impl Notice {
             (_, false) => detail.to_owned(),
             _ => "This session is asking for your attention.".to_owned(),
         };
-        scan::sanitize(&text)
+        text::sanitize(&text)
     }
 
     /// The identifier macOS files the banner under.
@@ -248,7 +251,7 @@ impl Attention {
             return None;
         }
         let bound = |text: &str| -> Option<String> {
-            let clean = scan::sanitize(text);
+            let clean = text::sanitize(text);
             let clipped: String = clean.chars().take(ANNOUNCE_DETAIL_CHARS).collect();
             (!clipped.trim().is_empty()).then_some(clipped)
         };
@@ -1193,6 +1196,10 @@ mod intake_tests;
 #[cfg(all(test, unix))]
 mod intake_twin_attack_tests;
 #[cfg(test)]
+mod sanitize_parity_tests;
+#[cfg(test)]
 mod stress;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod text_tests;

@@ -12,8 +12,9 @@
 //! A `SOCK_STREAM` endpoint in GitPulse's own config directory, present only
 //! while the app is running and only while the user has the bridge enabled.
 //! Anything a peer sends can cause exactly one thing: a notification banner
-//! whose heading GitPulse writes, whose body is stripped of control characters
-//! and truncated, and whose activation focuses a GitPulse tab. It cannot open
+//! whose heading GitPulse writes, whose body is stripped of control, format
+//! (bidi, zero-width, tag) and private-use characters by [`super::text`] and
+//! truncated, and whose activation focuses a GitPulse tab. It cannot open
 //! a file, run a command, or read anything back.
 //!
 //! Every defence is here because the peer is not authenticated by anything
@@ -77,7 +78,7 @@
 mod reason;
 
 use super::{Notice, Offer, Origin};
-pub use reason::{is_invisible_or_reordering, printable, Reason};
+pub use reason::Reason;
 #[cfg(unix)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1151,10 +1152,10 @@ pub fn parse_report_stamped(bytes: &[u8]) -> Result<(Notice, Option<u64>), Reaso
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
         })
-        .map(|name| super::scan::sanitize(&name))
+        .map(|name| super::text::sanitize(&name))
         .filter(|name| !name.is_empty());
     let detail = message_text
-        .map(super::scan::sanitize)
+        .map(super::text::sanitize)
         .filter(|m| !m.is_empty());
 
     let key = match session {

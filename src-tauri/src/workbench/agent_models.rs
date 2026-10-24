@@ -172,12 +172,10 @@ fn excerpt(bytes: &[u8]) -> String {
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with("Fetching available models"))
         .unwrap_or("");
-    let line: String = line
+    crate::alerts::text::sanitize(line)
         .chars()
-        .filter(|c| !c.is_control())
         .take(MAX_ERROR_EXCERPT)
-        .collect();
-    line
+        .collect()
 }
 
 /// `agy models`' answer as a catalog. Pure, so every shape of answer — a
@@ -353,6 +351,14 @@ fn list_with_cli(launcher: &str) -> Result<CapturedOutput, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_error_excerpt_drops_hidden_characters_a_cli_printed() {
+        assert_eq!(
+            excerpt("failed\u{202e}: sign\u{200b}in\n".as_bytes()),
+            "failed: signin"
+        );
+    }
 
     fn answer(
         stdout: &str,

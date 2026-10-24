@@ -175,12 +175,7 @@ pub fn checkable(id: &str) -> bool {
 
 pub fn menu_text(text: &str) -> String {
     // Muda uses ampersands for mnemonics off macOS. Escaping works on every platform.
-    let cleaned: String = text
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .take(240)
-        .collect();
-    cleaned.replace('&', "&&")
+    crate::alerts::text::sanitize(text).replace('&', "&&")
 }
 
 impl MenuState {
@@ -377,6 +372,8 @@ mod tests {
         state.tray_details = vec!["line".into(); 17];
         assert!(state.validate().is_err());
         assert_eq!(menu_text("A\tB\nC & D"), "A B C && D");
+        // A repository name chooses its own text: no override reorders the menu.
+        assert_eq!(menu_text("repo\u{202e}gnp.exe\u{200b}"), "repognp.exe");
         state = MenuState::default();
         state.status.operation = Some("x".repeat(2049));
         assert!(state.validate().is_err());

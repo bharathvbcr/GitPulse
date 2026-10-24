@@ -3,7 +3,7 @@ import { get } from "svelte/store";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ACTIVITY_PUBLISH_MS, ATTENTION_EVENTS, MAX_TRACKED_ACTIVITY, asksForReader, bindAttention, createSessionActivity, isReaderInput, parseAttention } from "./sessionActivity";
+import { ACTIVITY_PUBLISH_MS, ATTENTION_EVENTS, MAX_TRACKED_ACTIVITY, asksForReader, bindAttention, clean, createSessionActivity, isReaderInput, parseAttention } from "./sessionActivity";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -88,10 +88,29 @@ describe("parseAttention", () => {
     expect(parseAttention({ session: "t", channel: "hook", event: "error" }, 5)?.attention?.kind).toBe("error");
   });
 
-  it("calls a terminal signal, or an event it does not know, signalled — never needs-you", () => {
+  it("calls a terminal signal with no event signalled — never needs-you", () => {
     expect(parseAttention({ session: "t", channel: "bell" }, 5)?.attention).toEqual({ kind: "signalled", label: "Signalled", detail: null, at: 5 });
-    expect(parseAttention({ session: "t", channel: "hook", event: "constructor" }, 5)?.attention?.kind).toBe("signalled");
-    expect(parseAttention({ session: "t", channel: "hook", event: "future_event" }, 5)?.attention?.kind).toBe("signalled");
+    expect(parseAttention({ session: "t", channel: "bell", event: null }, 5)?.attention?.kind).toBe("signalled");
+  });
+
+  it("drops an event the table does not name, saying so once, instead of counting it as asking", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(parseAttention({ session: "t", channel: "hook", event: "not_in_table" }, 5)).toBeNull();
+      expect(parseAttention({ session: "t", channel: "hook", event: "not_in_table" }, 6)).toBeNull();
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0][0])).toContain("not_in_table");
+      // Inherited names are not table entries, and neither is a non-string.
+      expect(parseAttention({ session: "t", channel: "hook", event: "constructor" }, 5)).toBeNull();
+      expect(parseAttention({ session: "t", channel: "hook", event: 7 }, 5)).toBeNull();
+      // A replayed row with one is skipped, and the pane never shows it.
+      const activity = createSessionActivity(() => 100);
+      activity.announce({ session: "term-1", channel: "hook", event: "future_event" });
+      expect(get(activity).has("term-1")).toBe(false);
+      expect(activity.replay([{ session: "term-1", channel: "hook", event: "future_event", age_ms: 1 }], 0)).toBe(0);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("refuses a malformed announcement rather than guessing", () => {
@@ -255,6 +274,30 @@ describe("what answers a request", () => {
     const kept = await bindAttention(listen, activity, async () => { throw new Error("host gone"); }, (error) => { reported = error; });
     expect(typeof kept).toBe("function");
     expect(String(reported)).toContain("host gone");
+  });
+
+  it("cleans every row of the shared table exactly as the Rust cleaner does", () => {
+    // `src-tauri/src/alerts/text_tests.rs` reads the same file and asserts the
+    // same `clean` column against `alerts::text::sanitize`.
+    const table = JSON.parse(readFileSync(join(here, "../../../scripts/fixtures/sanitize-cases.json"), "utf8")) as {
+      cases: Array<{ name: string; input: string; clean: string }>;
+    };
+    expect(table.cases.length).toBeGreaterThanOrEqual(15);
+    for (const row of table.cases) {
+      expect(clean(row.input, 240) ?? "", row.name).toBe(row.clean);
+    }
+    const names = table.cases.map((row) => row.input).join("");
+    for (const probe of ["‮", "⁦", "⁩", "​", "‏", "﻿", "\u{e0001}", ""]) {
+      expect(names.includes(probe), `no row exercises U+${probe.codePointAt(0)!.toString(16)}`).toBe(true);
+    }
+  });
+
+  it("holds every attention and title path to that cleaner", () => {
+    const activity = createSessionActivity(() => 10);
+    activity.announce({ session: "term-1", channel: "hook", event: "permission_prompt", detail: "rm‮ -rf​ /" });
+    expect(get(activity).get("term-1")?.attention?.detail).toBe("rm -rf /");
+    activity.title("term-1", "⁦build⁩﻿ ok");
+    expect(get(activity).get("term-1")?.title).toBe("build ok");
   });
 
   it("counts a bell as asking and a finished agent as not", () => {
