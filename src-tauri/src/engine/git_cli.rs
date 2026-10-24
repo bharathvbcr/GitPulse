@@ -2138,6 +2138,131 @@ pub fn capture_command(
     )
 }
 
+/// Names a scrubbed child may inherit (compared upper-cased). An allowlist, not
+/// a denylist: a token variable nobody has heard of yet is dropped by default.
+/// Proxy and CA variables are the user's own transport settings, not
+/// credentials a repository's config can ask npm to expand into a request.
+const SCRUBBED_ENV_ALLOWLIST: &[&str] = &[
+    "HOME",
+    "USERPROFILE",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LANGUAGE",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "BUN_INSTALL",
+    "VOLTA_HOME",
+    "ASDF_DIR",
+    "ASDF_DATA_DIR",
+    "NVM_DIR",
+    "NVM_BIN",
+    "FNM_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "ALL_PROXY",
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMFILES",
+    "PROGRAMDATA",
+    "HOMEDRIVE",
+    "HOMEPATH",
+];
+
+fn scrubbed_env_allows(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper == "PATH" || upper.starts_with("LC_") || SCRUBBED_ENV_ALLOWLIST.contains(&upper.as_str())
+}
+
+/// Replaces `cmd`'s environment with the allowlisted part of `inherited` plus
+/// everything the builder set explicitly (PATH, the git pins, `extra_env`).
+/// A variable the builder explicitly removed stays removed. `also_allowed`
+/// names further inherited variables to keep (the ones the user's own npm
+/// config references). This form keeps only the fixed allowlist; production
+/// goes through [`restrict_env_to_allowlist_plus`].
+#[cfg(test)]
+fn restrict_env_to_allowlist<I>(cmd: &mut Command, inherited: I, home: Option<&std::ffi::OsStr>)
+where
+    I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+{
+    restrict_env_to_allowlist_plus(cmd, inherited, home, &[]);
+}
+
+/// [`restrict_env_to_allowlist`] that also keeps the inherited variables named
+/// in `also_allowed`.
+fn restrict_env_to_allowlist_plus<I>(
+    cmd: &mut Command,
+    inherited: I,
+    home: Option<&std::ffi::OsStr>,
+    also_allowed: &[String],
+) where
+    I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+{
+    let mut explicit = Vec::new();
+    let mut removed = Vec::new();
+    for (key, value) in cmd.get_envs() {
+        match value {
+            Some(value) => explicit.push((key.to_os_string(), value.to_os_string())),
+            None => removed.push(key.to_os_string()),
+        }
+    }
+    cmd.env_clear();
+    for (key, value) in inherited {
+        let allowed = key.to_str().is_some_and(|name| {
+            scrubbed_env_allows(name) || also_allowed.iter().any(|n| n == name)
+        });
+        if allowed && !removed.contains(&key) {
+            cmd.env(key, value);
+        }
+    }
+    if let Some(home) = home {
+        cmd.env(if cfg!(windows) { "USERPROFILE" } else { "HOME" }, home);
+    }
+    for (key, value) in explicit {
+        cmd.env(key, value);
+    }
+}
+
+/// [`capture_command_with_env`] for a tool that reads repository-controlled
+/// config (npm, bun): the child gets an allowlisted environment instead of the
+/// process's, so `NPM_TOKEN`, `GITHUB_TOKEN`, `AWS_*` and the like cannot be
+/// expanded into a request. Git variables are still pinned as for any capture.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn capture_command_scrubbed(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    timeout: Duration,
+    extra_env: &[(&str, &str)],
+    path_var: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    source: PathSource,
+    also_allowed: &[String],
+) -> Result<CapturedOutput, String> {
+    let mut cmd = build_capture_command_in(program, args, cwd, extra_env, path_var, home, source);
+    restrict_env_to_allowlist_plus(&mut cmd, std::env::vars_os(), home, also_allowed);
+    let out = run_bounded(cmd, program, timeout, None)?.require_complete(program)?;
+    Ok(CapturedOutput {
+        stdout: out.stdout,
+        stderr: out.stderr,
+        success: out.success,
+        status_code: out.status_code,
+    })
+}
+
 /// [`capture_command`] with injectable `PATH`/home lookups — the seam its
 /// callers fill from the process environment by default. Tests use it to run
 /// the exact production spawn path under a simulated GUI-minimal environment
@@ -11249,6 +11374,47 @@ mod tests {
     }
 
     #[test]
+    fn a_scrubbed_child_keeps_only_allowlisted_inherited_variables() {
+        use std::ffi::OsString;
+        let inherited = [
+            ("PATH", "/usr/bin"),
+            ("LC_ALL", "C"),
+            ("HTTPS_PROXY", "http://p:1"),
+            ("NPM_TOKEN", "t1"),
+            ("GITHUB_TOKEN", "t2"),
+            ("AWS_SESSION_TOKEN", "t3"),
+            ("MY_API_KEY", "t4"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let mut cmd = Command::new("true");
+        cmd.env("EXPLICIT", "yes").env_remove("PATH");
+        restrict_env_to_allowlist_plus(
+            &mut cmd,
+            inherited,
+            Some(std::ffi::OsStr::new("/h")),
+            &["MY_API_KEY".to_string()],
+        );
+        let seen: std::collections::BTreeMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        let names: Vec<&str> = seen.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            ["EXPLICIT", "HOME", "HTTPS_PROXY", "LC_ALL", "MY_API_KEY"],
+            "{seen:?}"
+        );
+        // A PATH the builder removed is not resurrected from the inherited one.
+        assert!(!seen.contains_key("PATH"));
+        assert_eq!(seen["HOME"].as_deref(), Some("/h"));
+    }
+
+    #[test]
     fn sandbox_join_canonical_resolves_and_stays_inside() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -13193,3 +13359,7 @@ mod qos_band_tests {
         .expect("qos thread");
     }
 }
+
+#[cfg(test)]
+#[path = "scrubbed_env_adversarial_tests.rs"]
+mod scrubbed_env_adversarial_tests;

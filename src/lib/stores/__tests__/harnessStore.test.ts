@@ -1,7 +1,10 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import { IpcError } from "../../ipc/invoke";
 import { get } from "svelte/store";
 import {
   createHarnessStore,
+  promptSafe,
+  unconfirmedEndpoint,
   verdictDetail,
   verdictLabel,
   type AiStatus,
@@ -10,7 +13,11 @@ import {
 } from "../harnessStore";
 import { MAX_AGENT_ACTIONS } from "../../agents/activity";
 import type { CatchUp } from "../../ingest/types";
-import { ledgerStatus, type LedgerEvent, type LedgerStatus } from "../../ledger/types";
+import {
+  ledgerStatus,
+  type LedgerEvent,
+  type LedgerStatus,
+} from "../../ledger/types";
 
 function verdict(overrides: Partial<PolicyVerdict>): PolicyVerdict {
   return {
@@ -102,9 +109,13 @@ function ledgerInvoke(
       const cursor = Number(args?.cursor ?? 0);
       const limit = Number(args?.limit ?? 200);
       tailCalls.push({ repoPath, cursor });
-      const after = (ledgers.get(repoPath) ?? []).filter((event) => event.id > cursor);
+      const after = (ledgers.get(repoPath) ?? []).filter(
+        (event) => event.id > cursor,
+      );
       // `newest` is `ledger::tail_newest`: the last `limit` rows, oldest first.
-      return args?.newest === true ? after.slice(-limit) : after.slice(0, limit);
+      return args?.newest === true
+        ? after.slice(-limit)
+        : after.slice(0, limit);
     }
     throw new Error(`unexpected ${cmd}`);
   }) as <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
@@ -116,12 +127,19 @@ describe("ledger sync cost", () => {
     // 29,573-row ledger 200 rows at a time was ~148 of them at launch.
     const repo = "/repos/long";
     const row = (id: number) => ({
-      ...ledgerEvent(repo, id, `01L${String(id).padStart(23, "0")}`, `row ${id}`),
+      ...ledgerEvent(
+        repo,
+        id,
+        `01L${String(id).padStart(23, "0")}`,
+        `row ${id}`,
+      ),
       ts_utc: new Date(Date.UTC(2026, 8, 1) + id * 1000).toISOString(),
     });
     const rows = Array.from({ length: 1000 }, (_, i) => row(i + 1));
     const calls: Array<{ repoPath: string; cursor: number }> = [];
-    const store = createHarnessStore({ invoke: ledgerInvoke(new Map([[repo, rows]]), calls) });
+    const store = createHarnessStore({
+      invoke: ledgerInvoke(new Map([[repo, rows]]), calls),
+    });
 
     await store.catchUp(repo);
     expect(calls).toEqual([{ repoPath: repo, cursor: 0 }]);
@@ -146,8 +164,9 @@ describe("ledger sync cost", () => {
     const backend = ledgerInvoke(new Map([[repo, rows]]), calls);
     // Both ledger commands authenticate the repository in the backend.
     let authenticated = 0;
-    const invoke = (<T,>(cmd: string, args?: Record<string, unknown>) => {
-      if (cmd === "cmd_ledger_status" || cmd === "cmd_ledger_tail") authenticated += 1;
+    const invoke = (<T>(cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "cmd_ledger_status" || cmd === "cmd_ledger_tail")
+        authenticated += 1;
       return backend<T>(cmd, args);
     }) as typeof backend;
     const store = createHarnessStore({ invoke });
@@ -155,7 +174,14 @@ describe("ledger sync cost", () => {
 
     const first = store.syncLedger(repo);
     for (let id = 2; id <= 11; id += 1) {
-      rows.push(ledgerEvent(repo, id, `01B${String(id).padStart(23, "0")}`, `row ${id}`));
+      rows.push(
+        ledgerEvent(
+          repo,
+          id,
+          `01B${String(id).padStart(23, "0")}`,
+          `row ${id}`,
+        ),
+      );
       void store.syncLedger(repo);
     }
     const last = store.syncLedger(repo);
@@ -163,14 +189,24 @@ describe("ledger sync cost", () => {
 
     expect(authenticated).toBe(4); // two syncs, a status and a tail each
     expect(get(store).ledgerCursor).toBe(11);
-    expect(get(store).actions.map((action) => action.label)).toContain("row 11");
+    expect(get(store).actions.map((action) => action.label)).toContain(
+      "row 11",
+    );
 
     await store.syncLedger(repo);
     expect(authenticated).toBe(6); // a later request, after the burst, still runs
   });
 });
 
-const harnessOk = { available: true, binary: "manvi", protocol: 1, posture: "host", ops: [], error: "", error_code: "" } as HarnessStatus;
+const harnessOk = {
+  available: true,
+  binary: "manvi",
+  protocol: 1,
+  posture: "host",
+  ops: [],
+  error: "",
+  error_code: "",
+} as HarnessStatus;
 
 function aiWith(model: string, harness: HarnessStatus = harnessOk): AiStatus {
   return {
@@ -186,7 +222,8 @@ function aiWith(model: string, harness: HarnessStatus = harnessOk): AiStatus {
 
 describe("probe token staleness", () => {
   it("ignores a late resolution from an older overlapping probe", async () => {
-    const calls: Array<{ cmd: string; d: ReturnType<typeof deferred<never>> }> = [];
+    const calls: Array<{ cmd: string; d: ReturnType<typeof deferred<never>> }> =
+      [];
     const store = createHarnessStore({
       invoke: (async (cmd: string) => {
         const d = deferred<never>();
@@ -213,7 +250,8 @@ describe("probe token staleness", () => {
   });
 
   it("a stale error resolution does not clobber fresh state", async () => {
-    const calls: Array<{ cmd: string; d: ReturnType<typeof deferred<never>> }> = [];
+    const calls: Array<{ cmd: string; d: ReturnType<typeof deferred<never>> }> =
+      [];
     const store = createHarnessStore({
       invoke: (async (cmd: string) => {
         const d = deferred<never>();
@@ -234,7 +272,8 @@ describe("probe token staleness", () => {
   });
 
   it("reconnect's sidecar handshake cannot be overwritten by a stale refresh", async () => {
-    const calls: Array<{ cmd: string; d: ReturnType<typeof deferred<never>> }> = [];
+    const calls: Array<{ cmd: string; d: ReturnType<typeof deferred<never>> }> =
+      [];
     const store = createHarnessStore({
       invoke: (async (cmd: string) => {
         const d = deferred<never>();
@@ -250,7 +289,10 @@ describe("probe token staleness", () => {
     const reconnect = store.reconnect();
     // refresh() is still waiting on its sidecar handshake, so only two
     // commands are in flight so far.
-    expect(calls.map((c) => c.cmd)).toEqual(["cmd_harness_status", "cmd_harness_reconnect"]);
+    expect(calls.map((c) => c.cmd)).toEqual([
+      "cmd_harness_status",
+      "cmd_harness_reconnect",
+    ]);
 
     // Reconnect finishes its handshake, which chains into its own AI probe.
     calls[1].d.resolve({ ...harnessOk, posture: "reconnected" } as never);
@@ -262,7 +304,12 @@ describe("probe token staleness", () => {
     ]);
     // The probe payload carries the restarted sidecar's status, as the real
     // command does.
-    calls[2].d.resolve(aiWith("reconnected-model", { ...harnessOk, posture: "reconnected" }) as never);
+    calls[2].d.resolve(
+      aiWith("reconnected-model", {
+        ...harnessOk,
+        posture: "reconnected",
+      }) as never,
+    );
     await reconnect;
     expect(get(store).harness?.posture).toBe("reconnected");
     expect(get(store).ai?.selected?.model).toBe("reconnected-model");
@@ -305,7 +352,8 @@ describe("harness error retention", () => {
       invoke: (async (cmd: string) => {
         if (failing) {
           throw new Error(
-            cmd + " transport unavailable; Authorization: Bearer opaque-status-secret",
+            cmd +
+              " transport unavailable; Authorization: Bearer opaque-status-secret",
           );
         }
         if (cmd === "cmd_harness_status") return harnessOk;
@@ -322,7 +370,9 @@ describe("harness error retention", () => {
 
     expect(get(store).harness?.available).toBe(false);
     expect(get(store).harness?.error).toContain("transport unavailable");
-    expect(get(store).harness?.error).toContain("Authorization: Bearer <redacted>");
+    expect(get(store).harness?.error).toContain(
+      "Authorization: Bearer <redacted>",
+    );
     expect(get(store).harness?.error).not.toContain("opaque-status-secret");
     expect(get(store).error).toContain("transport unavailable");
   });
@@ -414,9 +464,13 @@ describe("repository-scoped ledger projection", () => {
     ]);
     await lateA;
 
-    expect(get(store).actions.map((action) => action.label)).toEqual(["B active"]);
+    expect(get(store).actions.map((action) => action.label)).toEqual([
+      "B active",
+    ]);
     store.activateRepository(repoA);
-    expect(get(store).actions.map((action) => action.label)).toEqual(["A late"]);
+    expect(get(store).actions.map((action) => action.label)).toEqual([
+      "A late",
+    ]);
   });
 
   it("rejects rapid A/B/A catch-up responses that arrive out of order", async () => {
@@ -425,7 +479,10 @@ describe("repository-scoped ledger projection", () => {
       response: ReturnType<typeof deferred<CatchUp>>;
     }> = [];
     const ledgers = new Map([
-      [repoA, [ledgerEvent(repoA, 10, "01A00000000000000000000010", "A fresh")]],
+      [
+        repoA,
+        [ledgerEvent(repoA, 10, "01A00000000000000000000010", "A fresh")],
+      ],
       [repoB, [ledgerEvent(repoB, 3, "01B00000000000000000000003", "B stale")]],
     ]);
     const store = createHarnessStore({
@@ -439,7 +496,9 @@ describe("repository-scoped ledger projection", () => {
         if (cmd === "cmd_ledger_status") return recording(repoPath);
         if (cmd === "cmd_ledger_tail") {
           const cursor = Number(args?.cursor ?? 0);
-          return (ledgers.get(repoPath) ?? []).filter((event) => event.id > cursor);
+          return (ledgers.get(repoPath) ?? []).filter(
+            (event) => event.id > cursor,
+          );
         }
         throw new Error(`unexpected ${cmd}`);
       }) as never,
@@ -453,7 +512,9 @@ describe("repository-scoped ledger projection", () => {
     pending[2].response.resolve(caughtUp(30));
     await secondA;
     expect(get(store).catchUp?.recorded).toBe(30);
-    expect(get(store).actions.map((action) => action.label)).toEqual(["A fresh"]);
+    expect(get(store).actions.map((action) => action.label)).toEqual([
+      "A fresh",
+    ]);
 
     pending[1].response.resolve(caughtUp(20));
     await middleB;
@@ -462,13 +523,18 @@ describe("repository-scoped ledger projection", () => {
 
     expect(get(store).catchUp?.recorded).toBe(30);
     expect(get(store).ledgerCursor).toBe(10);
-    expect(get(store).actions.map((action) => action.label)).toEqual(["A fresh"]);
+    expect(get(store).actions.map((action) => action.label)).toEqual([
+      "A fresh",
+    ]);
   });
 
   it("keeps catch-up metadata when its own append notification starts a ledger sync", async () => {
     const catchUpResponse = deferred<CatchUp>();
     const ledgers = new Map([
-      [repoA, [ledgerEvent(repoA, 4, "01A00000000000000000000004", "caught up")]],
+      [
+        repoA,
+        [ledgerEvent(repoA, 4, "01A00000000000000000000004", "caught up")],
+      ],
     ]);
     const invokeLedger = ledgerInvoke(ledgers);
     const store = createHarnessStore({
@@ -485,7 +551,9 @@ describe("repository-scoped ledger projection", () => {
 
     expect(get(store).catchUp?.recorded).toBe(4);
     expect(get(store).ledgerCursor).toBe(4);
-    expect(get(store).actions.map((action) => action.label)).toEqual(["caught up"]);
+    expect(get(store).actions.map((action) => action.label)).toEqual([
+      "caught up",
+    ]);
   });
 
   it("does not collide an ephemeral action with a durable row using the same numeric id", async () => {
@@ -505,7 +573,9 @@ describe("repository-scoped ledger projection", () => {
       "durable",
       "ephemeral",
     ]);
-    expect(new Set(state.actions.map((action) => action.identity)).size).toBe(2);
+    expect(new Set(state.actions.map((action) => action.identity)).size).toBe(
+      2,
+    );
   });
 
   it("uses one bucket for normalized spellings of the active canonical path", () => {
@@ -515,7 +585,9 @@ describe("repository-scoped ledger projection", () => {
 
     store.activateRepository(repoA);
 
-    expect(get(store).actions.map((action) => action.label)).toEqual(["canonical"]);
+    expect(get(store).actions.map((action) => action.label)).toEqual([
+      "canonical",
+    ]);
   });
 
   it("does not republish the journal when the active repository is already that key", () => {
@@ -614,13 +686,17 @@ describe("repository-scoped ledger projection", () => {
     });
 
     await store.catchUp(linked);
-    expect(get(store).actions.map((action) => action.label)).toEqual(["linked edit"]);
+    expect(get(store).actions.map((action) => action.label)).toEqual([
+      "linked edit",
+    ]);
     expect(get(store).ledgerCursor).toBe(12);
 
     // A main-checkout notification tails from the shared cursor, rather than
     // replaying the linked row into a second frontend bucket.
     await store.syncLedger(main);
-    expect(get(store).actions.map((action) => action.label)).toEqual(["linked edit"]);
+    expect(get(store).actions.map((action) => action.label)).toEqual([
+      "linked edit",
+    ]);
     expect(tailCalls).toContainEqual({ repoPath: main, cursor: 12 });
 
     store.activateRepository(linked);
@@ -640,7 +716,9 @@ describe("repository-scoped ledger projection", () => {
       invoke: (async (cmd: string, args?: Record<string, unknown>) => {
         const repoPath = String(args?.repoPath ?? "");
         if (cmd === "cmd_ledger_status") {
-          return repoPath === alias ? aliasStatus.promise : canonicalStatus.promise;
+          return repoPath === alias
+            ? aliasStatus.promise
+            : canonicalStatus.promise;
         }
         if (cmd === "cmd_ledger_tail") {
           tailCalls += 1;
@@ -761,7 +839,10 @@ describe("repository-scoped ledger projection", () => {
 
   it("refuses a backend row whose stored repository identity crosses buckets", async () => {
     const ledgers = new Map([
-      [repoA, [ledgerEvent(repoB, 9, "01B00000000000000000000009", "wrong repo")]],
+      [
+        repoA,
+        [ledgerEvent(repoB, 9, "01B00000000000000000000009", "wrong repo")],
+      ],
     ]);
     const store = createHarnessStore({ invoke: ledgerInvoke(ledgers) });
 
@@ -796,7 +877,9 @@ describe("policy verdict rendering", () => {
       severity: "soft",
       demoted: "serve.posture=host: allowlist not enforced",
     });
-    expect(verdictLabel(demoted)).not.toBe(verdictLabel(verdict({ status: "allowed" })));
+    expect(verdictLabel(demoted)).not.toBe(
+      verdictLabel(verdict({ status: "allowed" })),
+    );
     expect(verdictDetail(demoted)).toContain("allowlist not enforced");
   });
 
@@ -808,6 +891,186 @@ describe("policy verdict rendering", () => {
       reason: "Force pushes are not allowed.",
     });
     expect(verdictLabel(blocked)).toContain("blocked");
-    expect(verdictDetail(blocked)).toBe("command.force_push: Force pushes are not allowed.");
+    expect(verdictDetail(blocked)).toBe(
+      "command.force_push: Force pushes are not allowed.",
+    );
+  });
+});
+
+describe("AI endpoint consent", () => {
+  const unconfirmed = () =>
+    new IpcError(
+      "ai_endpoint_unconfirmed",
+      "Confirm where to send this: Ollama on 127.0.0.1:11434 serving gemma. Nothing has been sent.",
+      {
+        base_url: "http://127.0.0.1:11434/v1",
+        model: "gemma",
+        runtime: "Ollama",
+        host: "127.0.0.1",
+        port: 11434,
+        label: "Ollama on 127.0.0.1:11434",
+      },
+    );
+
+  /** A backend that refuses to send until it is given a selection. */
+  function backend() {
+    const sends: Array<Record<string, unknown>> = [];
+    const invokeFn = (async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "cmd_ai_status") return { ready: true };
+      if (cmd !== "cmd_ai_generate_commit_message")
+        throw new Error(`unexpected ${cmd}`);
+      if (!args?.baseUrl) throw unconfirmed();
+      sends.push(args);
+      return { text: "feat: x" };
+    }) as <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
+    return { invokeFn, sends };
+  }
+
+  it("asks with the runtime and port, and sends nothing until the user says yes", async () => {
+    const { invokeFn, sends } = backend();
+    const asked: Array<{ title: string; message?: string }> = [];
+    const answer = deferred<boolean>();
+    const store = createHarnessStore({
+      invoke: invokeFn,
+      confirm: (options) => {
+        asked.push(options);
+        return answer.promise;
+      },
+    });
+
+    const pending = store.generateCommitMessage("/repo");
+    await vi.waitFor(() => expect(asked).toHaveLength(1));
+    expect(asked[0].message).toContain("Ollama on 127.0.0.1:11434");
+    expect(asked[0].message).toContain("Nothing has been sent yet");
+    expect(sends).toEqual([]);
+    expect(get(store).preferred).toBeNull();
+
+    answer.resolve(true);
+    await expect(pending).resolves.toEqual({ text: "feat: x" });
+    expect(sends).toEqual([
+      {
+        repoPath: "/repo",
+        baseUrl: "http://127.0.0.1:11434/v1",
+        model: "gemma",
+      },
+    ]);
+    // Persisted through the preferred-selection path, so the next call asks nothing.
+    expect(get(store).preferred).toEqual({
+      base_url: "http://127.0.0.1:11434/v1",
+      model: "gemma",
+    });
+    await store.generateCommitMessage("/repo");
+    expect(asked).toHaveLength(1);
+    expect(sends).toHaveLength(2);
+  });
+
+  it("declining sends nothing and keeps nothing", async () => {
+    const { invokeFn, sends } = backend();
+    const store = createHarnessStore({
+      invoke: invokeFn,
+      confirm: async () => false,
+    });
+    await expect(store.generateCommitMessage("/repo")).rejects.toMatchObject({
+      kind: "ai_endpoint_unconfirmed",
+    });
+    expect(sends).toEqual([]);
+    expect(get(store).preferred).toBeNull();
+  });
+
+  it("reads only the typed kind, never a look-alike message", () => {
+    expect(unconfirmedEndpoint(unconfirmed())?.label).toBe(
+      "Ollama on 127.0.0.1:11434",
+    );
+    expect(
+      unconfirmedEndpoint(new Error("Confirm where to send this: x")),
+    ).toBeNull();
+    const detail = { base_url: "u", model: "m", label: "l" };
+    expect(
+      unconfirmedEndpoint(new IpcError("unclassified", "m", detail)),
+    ).toBeNull();
+    expect(
+      unconfirmedEndpoint(
+        new IpcError("ai_endpoint_unconfirmed", "m", {
+          ...detail,
+          base_url: "",
+        }),
+      ),
+    ).toBeNull();
+  });
+});
+
+describe("AI endpoint consent, shared and stale", () => {
+  const detail = (extra: Record<string, unknown> = {}) => ({
+    base_url: "http://127.0.0.1:8080/v1",
+    model: "m",
+    runtime: "llama.cpp",
+    host: "127.0.0.1",
+    port: 8080,
+    label: "llama.cpp on 127.0.0.1:8080",
+    ...extra,
+  });
+
+  it("concurrent refused actions share one dialog and all send after one yes", async () => {
+    const sends: Array<Record<string, unknown>> = [];
+    const invokeFn = (async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "cmd_ai_status") return { ready: true };
+      if (!args?.baseUrl)
+        throw new IpcError("ai_endpoint_unconfirmed", "confirm", detail());
+      sends.push(args);
+      return { text: "ok" };
+    }) as <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
+    const answer = deferred<boolean>();
+    let asked = 0;
+    const store = createHarnessStore({
+      invoke: invokeFn,
+      confirm: () => {
+        asked += 1;
+        return answer.promise;
+      },
+    });
+    const a = store.generateCommitMessage("/a");
+    const b = store.suggestBranchName("/b");
+    await vi.waitFor(() => expect(asked).toBe(1));
+    answer.resolve(true);
+    await Promise.all([a, b]);
+    expect(asked).toBe(1);
+    expect(sends).toHaveLength(2);
+  });
+
+  it("a stale selection is dropped without a prompt about a server that is gone", async () => {
+    const invokeFn = (async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "cmd_ai_status") return { ready: true };
+      if (args?.baseUrl)
+        throw new IpcError(
+          "ai_endpoint_unconfirmed",
+          "stale",
+          detail({ stale: true }),
+        );
+      return { text: "ok" };
+    }) as <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
+    let asked = 0;
+    const store = createHarnessStore({
+      invoke: invokeFn,
+      confirm: async () => {
+        asked += 1;
+        return true;
+      },
+    });
+    await store.selectModel({
+      base_url: "http://127.0.0.1:8080/v1",
+      model: "old",
+    });
+    await expect(store.generateCommitMessage("/repo")).rejects.toMatchObject({
+      kind: "ai_endpoint_unconfirmed",
+    });
+    expect(asked).toBe(0);
+    expect(get(store).preferred).toBeNull();
+  });
+
+  it("promptSafe strips controls, bidi and zero-width characters and bounds the length", () => {
+    expect(promptSafe("a\nb‮c​d⁦e\u0000f")).toBe("a bcde f");
+    const long = promptSafe("m".repeat(1_000_000));
+    expect(Array.from(long)).toHaveLength(121);
+    expect(long.endsWith("…")).toBe(true);
   });
 });

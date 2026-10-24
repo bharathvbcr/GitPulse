@@ -387,6 +387,171 @@ pub fn status(explicit_base_url: Option<&str>, preferred_model: Option<&str>) ->
     }
 }
 
+/// Where a request may go.
+enum Target {
+    /// The user's own choice: the one the caller passed in.
+    Confirmed(AiSelection),
+    /// Nothing was chosen and nothing answered; what the sweep saw.
+    NoServer(Vec<discovery::DiscoveredEndpoint>),
+}
+
+/// How long a check that a selection's server still serves its model stays
+/// good. Short, so a listener that took the port over is noticed.
+const SELECTION_RECHECK_TTL: Duration = Duration::from_secs(60);
+
+static VERIFIED_SELECTIONS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+fn selection_key(selection: &AiSelection) -> String {
+    format!("{}\n{}", selection.base_url, selection.model)
+}
+
+/// Whether the selected base URL still lists the selected model. One bounded
+/// GET (`discovery::PROBE_TIMEOUT`), the same one discovery makes.
+fn serves_selected_model(selection: &AiSelection) -> bool {
+    #[cfg(test)]
+    if test_url_is_trusted(&selection.base_url) {
+        return true;
+    }
+    let endpoint = discovery::list_models(&selection.base_url);
+    endpoint.reachable && endpoint.models.contains(&selection.model)
+}
+
+/// A persisted selection is a statement about a server that may since have quit
+/// and been replaced by someone else's listener on the same port. Before the
+/// first send of a session, and again once the last check is older than
+/// [`SELECTION_RECHECK_TTL`], it is checked against the server itself.
+fn selection_still_served(
+    selection: &AiSelection,
+    check: impl FnOnce(&AiSelection) -> bool,
+) -> bool {
+    let key = selection_key(selection);
+    let cache = VERIFIED_SELECTIONS.get_or_init(Default::default);
+    let fresh = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .is_some_and(|checked| checked.elapsed() < SELECTION_RECHECK_TTL);
+    if fresh {
+        return true;
+    }
+    let served = check(selection);
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if served {
+        cache.insert(key, Instant::now());
+    } else {
+        cache.remove(&key);
+    }
+    served
+}
+
+/// Base URLs whose fake servers answer a fixed script (one `/chat/completions`,
+/// or nothing at all) and so cannot also answer the model-listing check.
+#[cfg(test)]
+static TRUSTED_TEST_URLS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn trust_test_url(url: &str) {
+    TRUSTED_TEST_URLS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(url.to_string());
+}
+
+#[cfg(test)]
+fn test_url_is_trusted(url: &str) -> bool {
+    url == "http://127.0.0.1:1/v1"
+        || TRUSTED_TEST_URLS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|trusted| trusted == url)
+}
+
+/// The one gate between "a model server is running" and "send it the diff".
+///
+/// With no usable selection the sweep may find a server, and finding one is
+/// not consent: on a shared host the listener on 8080 can be someone else's.
+/// The answer is a typed [`IpcErrorKind::AiEndpointUnconfirmed`] naming the
+/// runtime and port, which the frontend shows as a question and, once the user
+/// confirms, persists as the selection and asks again. A chosen selection is
+/// re-verified against its server (see [`selection_still_served`]); one that no
+/// longer lists its model is refused the same way, never sent to. The sweep and
+/// the check only read `/models`; no prompt or diff has been sent when this
+/// returns an error.
+fn resolve_target(
+    selection: Option<AiSelection>,
+    sweep: impl FnOnce() -> Vec<discovery::DiscoveredEndpoint>,
+) -> Result<Target, String> {
+    resolve_target_checked(selection, sweep, serves_selected_model)
+}
+
+fn resolve_target_checked(
+    selection: Option<AiSelection>,
+    sweep: impl FnOnce() -> Vec<discovery::DiscoveredEndpoint>,
+    check: impl FnOnce(&AiSelection) -> bool,
+) -> Result<Target, String> {
+    if let Some(selection) = usable_selection(selection) {
+        if selection_still_served(&selection, check) {
+            return Ok(Target::Confirmed(selection));
+        }
+        // Stale: offer whatever answers now, else say the selection is stale.
+        let endpoints = sweep();
+        return Err(
+            match discovery::choose(&endpoints, Some(&selection.model)).filter(
+                |(endpoint, model)| {
+                    endpoint.base_url != selection.base_url || *model != selection.model
+                },
+            ) {
+                Some((endpoint, model)) => unconfirmed_endpoint(&endpoint.base_url, &model),
+                None => typed_unconfirmed(&selection.base_url, &selection.model, true),
+            },
+        );
+    }
+    let endpoints = sweep();
+    match discovery::choose(&endpoints, None) {
+        Some((endpoint, model)) => Err(unconfirmed_endpoint(&endpoint.base_url, &model)),
+        None => Ok(Target::NoServer(endpoints)),
+    }
+}
+
+fn unconfirmed_endpoint(base_url: &str, model: &str) -> String {
+    typed_unconfirmed(base_url, model, false)
+}
+
+/// The typed refusal. The model name comes from a listener nobody has vetted
+/// and is shown to the user, so control, bidi and zero-width characters are
+/// stripped and the length bounded before it reaches the message or the detail.
+fn typed_unconfirmed(base_url: &str, model: &str, stale: bool) -> String {
+    let identity = discovery::identify(base_url);
+    let model = discovery::display_safe(model, discovery::MAX_NAME_CHARS);
+    let message = if stale {
+        format!(
+            "{} no longer serves {model}. Nothing has been sent.",
+            identity.label
+        )
+    } else {
+        format!(
+            "Confirm where to send this: {} serving {model}. Nothing has been sent.",
+            identity.label
+        )
+    };
+    crate::ipc_error::typed_text_with_detail(
+        crate::ipc_error::IpcErrorKind::AiEndpointUnconfirmed,
+        message,
+        serde_json::json!({
+            "base_url": base_url,
+            "model": model,
+            "runtime": identity.runtime,
+            "host": identity.host,
+            "port": identity.port,
+            "label": identity.label,
+            "stale": stale,
+        }),
+    )
+}
+
 /// One assembled request, before it goes out.
 struct Turn {
     system: String,
@@ -405,26 +570,20 @@ fn run(
     let mut warnings: Vec<String> = Vec::new();
     let feature_output_cap = feature.max_output_tokens();
 
-    // 1. Where to send it.
-    let selection = match selection.filter(|s| !s.base_url.is_empty() && !s.model.is_empty()) {
-        Some(s) => s,
-        None => {
-            let endpoints = discovery::sweep(None);
-            let (endpoint, model) = discovery::choose(&endpoints, None).ok_or_else(|| {
-                let tried: Vec<String> = endpoints
-                    .iter()
-                    .map(|e| format!("{} ({})", e.base_url, e.detail))
-                    .collect();
-                format!(
-                    "No local model server is running. Tried: {}. Start Ollama, LM Studio, \
-                     llama.cpp, vLLM or Jan, then try again.",
-                    tried.join(", ")
-                )
-            })?;
-            AiSelection {
-                base_url: endpoint.base_url.clone(),
-                model,
-            }
+    // 1. Where to send it: only where the user chose. A discovered server is
+    //    offered for confirmation, never used.
+    let selection = match resolve_target(selection, || discovery::sweep(None))? {
+        Target::Confirmed(selection) => selection,
+        Target::NoServer(endpoints) => {
+            let tried: Vec<String> = endpoints
+                .iter()
+                .map(|e| format!("{} ({})", e.base_url, e.detail))
+                .collect();
+            return Err(format!(
+                "No local model server is running. Tried: {}. Start Ollama, LM Studio, \
+                 llama.cpp, vLLM or Jan, then try again.",
+                tried.join(", ")
+            ));
         }
     };
 
@@ -821,17 +980,11 @@ fn should_ask_on_device(
     no_server && ready && !patch_truncated && !high_confidence
 }
 
-/// A server the caller named wins, then one found on loopback, then the
-/// on-device model, then the message already written from the patch.
-fn choose_commit_engine(
-    explicit: Option<AiSelection>,
-    discovered: Option<AiSelection>,
-    on_device: bool,
-) -> CommitEngine {
+/// A server the caller named wins, then the on-device model, then the message
+/// already written from the patch. A server merely found on loopback is not an
+/// option here: [`resolve_target`] refuses it until the user confirms it.
+fn choose_commit_engine(explicit: Option<AiSelection>, on_device: bool) -> CommitEngine {
     if let Some(selection) = usable_selection(explicit) {
-        return CommitEngine::Local(selection);
-    }
-    if let Some(selection) = usable_selection(discovered) {
         return CommitEngine::Local(selection);
     }
     if on_device {
@@ -876,6 +1029,16 @@ fn working_diff(repo_path: &str) -> Result<String, String> {
 pub fn generate_commit_message(
     repo_path: &str,
     selection: Option<AiSelection>,
+) -> Result<AiGeneration, String> {
+    generate_commit_message_with(repo_path, selection, || discovery::sweep(None))
+}
+
+/// [`generate_commit_message`] with the discovery sweep injected, so a test can
+/// point it at a server it controls instead of the fixed loopback ports.
+fn generate_commit_message_with(
+    repo_path: &str,
+    selection: Option<AiSelection>,
+    sweep: impl FnOnce() -> Vec<discovery::DiscoveredEndpoint>,
 ) -> Result<AiGeneration, String> {
     let started = Instant::now();
     let (patch, patch_truncated) = read_staged_patch(repo_path)?;
@@ -947,28 +1110,22 @@ pub fn generate_commit_message(
     // thread. With both Lappi settings off it reads only the cached config.
     crate::lappi::consult_on_commit_type(repo_path, &patch, &mut draft);
 
-    let explicit = usable_selection(selection);
-    let (discovered, on_device) = if explicit.is_some() {
-        (None, false)
-    } else {
-        let discovered =
-            discovery::choose(&discovery::sweep(None), None).map(|(endpoint, model)| AiSelection {
-                base_url: endpoint.base_url.clone(),
-                model,
-            });
+    let (explicit, on_device) = match resolve_target(selection, sweep)? {
+        Target::Confirmed(selection) => (Some(selection), false),
         // A cut patch is not something the small model should phrase: the brief
         // would be missing files and the subject would overclaim.
-        let on_device = discovered.is_none()
-            && should_ask_on_device(
+        Target::NoServer(_) => (
+            None,
+            should_ask_on_device(
                 true,
                 !patch_truncated && !draft.high_confidence && apple::status().ready(),
                 patch_truncated,
                 draft.high_confidence,
-            );
-        (discovered, on_device)
+            ),
+        ),
     };
 
-    match choose_commit_engine(explicit, discovered, on_device) {
+    match choose_commit_engine(explicit, on_device) {
         CommitEngine::Local(selection) => Ok(finish_with_local_model(
             repo_path, selection, &draft, &style, &branch, &diff, started,
         )),
@@ -1340,6 +1497,8 @@ const LOCAL_SCAN_TIMEOUT_MS: i64 = 1_500;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod consent_adversarial_tests;
     use crate::procguard::LockedSpawn;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1379,6 +1538,7 @@ mod tests {
     fn fake_model_server(content: &str) -> (String, std::sync::mpsc::Receiver<String>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
+        trust_test_url(&format!("http://127.0.0.1:{port}/v1"));
         let (tx, rx) = std::sync::mpsc::channel();
         let body = serde_json::json!({
             "choices": [{
@@ -1613,35 +1773,130 @@ mod tests {
         assert!(error.contains("Nothing is staged"), "{error}");
     }
 
+    /// A loopback server that answers every request, listing one model on GET
+    /// and counting what else arrives. Returns its base URL and the counters
+    /// `(gets, posts)`.
+    fn counting_model_server() -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        let gets = std::sync::Arc::new(AtomicUsize::new(0));
+        let posts = std::sync::Arc::new(AtomicUsize::new(0));
+        let (g, p) = (gets.clone(), posts.clone());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                if head.starts_with("POST") {
+                    p.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    g.fetch_add(1, Ordering::SeqCst);
+                }
+                let body = r#"{"data":[{"id":"m"}]}"#;
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        (format!("http://127.0.0.1:{port}/v1"), gets, posts)
+    }
+
     #[test]
-    fn commit_engine_prefers_a_named_server_then_discovery_then_on_device() {
+    fn a_discovered_server_gets_nothing_until_the_user_confirms_it() {
+        use std::sync::atomic::Ordering;
+        let _clear = ClearFakeProbe;
+        let _no_harness = NoHarness::install();
+        let (url, gets, posts) = counting_model_server();
+        let repo = repo_with_staged_change();
+        let sweep = || vec![discovery::list_models(&url)];
+
+        let error = crate::ipc_error::run_command(|| {
+            with_isolated_tools_config(|| {
+                generate_commit_message_with(&repo.path().to_string_lossy(), None, sweep)
+            })
+        })
+        .expect_err("no preferred selection: the first send needs confirmation");
+
+        assert_eq!(
+            error.kind,
+            crate::ipc_error::IpcErrorKind::AiEndpointUnconfirmed
+        );
+        let detail = error.detail.expect("the confirmation carries its subject");
+        assert_eq!(detail["base_url"], url.as_str());
+        assert_eq!(detail["model"], "m");
+        let port = url.rsplit_once(':').unwrap().1.split('/').next().unwrap();
+        assert_eq!(
+            detail["label"],
+            format!("Local model server on 127.0.0.1:{port}").as_str()
+        );
+        assert!(gets.load(Ordering::SeqCst) >= 1, "the sweep itself ran");
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            0,
+            "a diff was sent unconfirmed"
+        );
+    }
+
+    #[test]
+    fn every_ai_action_refuses_a_discovered_server_the_same_way() {
+        use std::sync::atomic::Ordering;
+        let (url, _gets, posts) = counting_model_server();
+        let found = vec![discovery::list_models(&url)];
+        assert!(matches!(
+            resolve_target(None, || found.clone()),
+            Err(message) if message.contains("Nothing has been sent")
+        ));
+        // An empty selection is no selection.
+        assert!(resolve_target(Some(AiSelection::default()), || found.clone()).is_err());
+        // A chosen one is used as given, and the sweep is never consulted.
+        let chosen = AiSelection {
+            base_url: url.clone(),
+            model: "m".into(),
+        };
+        assert!(matches!(
+            resolve_target(Some(chosen), || panic!("swept despite a chosen endpoint")),
+            Ok(Target::Confirmed(_))
+        ));
+        // Nothing found is a plain "no server", not a confirmation.
+        assert!(matches!(
+            resolve_target(None, Vec::new),
+            Ok(Target::NoServer(_))
+        ));
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn commit_engine_prefers_a_named_server_then_on_device() {
         let named = AiSelection {
             base_url: "http://127.0.0.1:9/v1".into(),
             model: "named".into(),
         };
-        let found = AiSelection {
-            base_url: "http://127.0.0.1:10/v1".into(),
-            model: "found".into(),
-        };
-        match choose_commit_engine(Some(named), Some(found.clone()), true) {
+        match choose_commit_engine(Some(named), true) {
             CommitEngine::Local(selection) => assert_eq!(selection.model, "named"),
             other => panic!("a named server must win: {other:?}"),
         }
-        match choose_commit_engine(None, Some(found), true) {
-            CommitEngine::Local(selection) => assert_eq!(selection.model, "found"),
-            other => panic!("a discovered server must beat the on-device model: {other:?}"),
-        }
         assert!(matches!(
-            choose_commit_engine(None, None, true),
+            choose_commit_engine(None, true),
             CommitEngine::OnDevice
         ));
         assert!(matches!(
-            choose_commit_engine(None, None, false),
+            choose_commit_engine(None, false),
             CommitEngine::Patch
         ));
         // An empty selection is "none", not a server with a blank name.
         assert!(matches!(
-            choose_commit_engine(Some(AiSelection::default()), None, false),
+            choose_commit_engine(Some(AiSelection::default()), false),
             CommitEngine::Patch
         ));
     }
@@ -2170,6 +2425,63 @@ mod tests {
                 .filter(|warning| warning.starts_with("attempt "))
                 .count(),
             2
+        );
+    }
+
+    fn selection_for(url: &str, model: &str) -> AiSelection {
+        AiSelection {
+            base_url: url.into(),
+            model: model.into(),
+        }
+    }
+
+    #[test]
+    fn a_selection_is_rechecked_once_then_trusted_for_the_ttl() {
+        let sel = selection_for("http://127.0.0.1:9/v1", "ttl-model");
+        let mut checks = 0;
+        for _ in 0..3 {
+            let target = resolve_target_checked(Some(sel.clone()), Vec::new, |_| {
+                checks += 1;
+                true
+            });
+            assert!(matches!(target, Ok(Target::Confirmed(_))));
+        }
+        assert_eq!(checks, 1, "the check is cached inside the TTL");
+    }
+
+    #[test]
+    fn a_selection_its_server_no_longer_serves_is_refused_as_stale() {
+        let sel = selection_for("http://127.0.0.1:9/v1", "gone-model");
+        let error = crate::ipc_error::run_command(|| {
+            resolve_target_checked(Some(sel.clone()), Vec::new, |_| false).map(|_| ())
+        })
+        .expect_err("a stale selection must not be used");
+        assert_eq!(
+            error.kind,
+            crate::ipc_error::IpcErrorKind::AiEndpointUnconfirmed
+        );
+        let detail = error.detail.expect("detail");
+        assert_eq!(detail["stale"], true);
+        assert_eq!(detail["model"], "gone-model");
+    }
+
+    #[test]
+    fn a_hostile_model_name_is_never_offered_for_confirmation() {
+        let hostile = discovery::DiscoveredEndpoint {
+            base_url: "http://127.0.0.1:8080/v1".into(),
+            models: vec!["bad\u{202e}name".into(), "good".into()],
+            reachable: true,
+            detail: String::new(),
+        };
+        let found = vec![hostile];
+        let (_, model) = discovery::choose(&found, None).expect("one safe name");
+        assert_eq!(model, "good");
+        assert_eq!(discovery::display_safe("a\nb\u{200b}c", 10), "abc");
+        assert_eq!(
+            discovery::display_safe(&"x".repeat(500), 120)
+                .chars()
+                .count(),
+            121
         );
     }
 }

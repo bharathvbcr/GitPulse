@@ -23,9 +23,9 @@ use crate::analyzer::cargo_supply::{
 use crate::analyzer::language::LanguageDetector;
 use crate::deadline::{ScanDeadline, AUDIT_TIMEOUT};
 use crate::engine::git_cli::{
-    capture_command_with_env, classify_tool_probe, git_text, is_timed_out,
-    resolve_spawn_program_in, sandbox_join, sandbox_join_canonical, validate_repo, CapturedOutput,
-    PathSource, ToolProbe,
+    capture_command_scrubbed, capture_command_with_env, classify_tool_probe, git_text,
+    is_timed_out, resolve_spawn_program_in, sandbox_join, sandbox_join_canonical, validate_repo,
+    CapturedOutput, PathSource, ToolProbe,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1148,6 +1148,20 @@ fn enrich_npm(repo: &Path, report: &mut DepsHealthReport, env: &ScanEnv) -> JsCl
             }
         };
         let label = package_label(&rel_dir);
+        // Neither npm nor bun can be told to ignore the repository's own
+        // registry config, so a repository that sets one is refused, loudly.
+        let lock_is_bun = report.manifests.iter().any(|manifest| {
+            manifest
+                .lockfile_dir
+                .clone()
+                .unwrap_or_else(|| dir_of(&manifest.path))
+                == rel_dir
+                && js_lock_kind(manifest.lockfile.as_deref()) == JsLockKind::Bun
+        });
+        if let Some((code, message)) = repo_config_refusal(repo, &rel_dir, lock_is_bun) {
+            push_issue(&mut report.issues, "error", code, message, Some(label));
+            continue;
+        }
         // Owned before the dispatch: those calls borrow `report` mutably.
         let lock_name = report
             .manifests
@@ -2530,7 +2544,14 @@ fn run_npm_json(cwd: &Path, args: &[&str], env: &ScanEnv) -> Result<String, Stri
 /// success: `npm audit` and `bun audit` both exit 1 when they find advisories.
 /// Empty stdout on failure is an error, never a clean report.
 fn run_json_cli(cwd: &Path, program: &str, args: &[&str], env: &ScanEnv) -> Result<String, String> {
-    let out = capture_scanner_command(env, program, args, Some(cwd), AUDIT_TIMEOUT, NPM_SAFE_ENV)?;
+    let pinned = if program == npm_program() {
+        npm_pinned_config(env)
+    } else {
+        Vec::new()
+    };
+    let mut extra: Vec<(&str, &str)> = NPM_SAFE_ENV.to_vec();
+    extra.extend(pinned.iter().map(|(k, v)| (*k, v.as_str())));
+    let out = capture_scanner_command(env, program, args, Some(cwd), AUDIT_TIMEOUT, &extra)?;
     let stdout = out.stdout_text();
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
@@ -2629,6 +2650,272 @@ fn npm_missing_message(npm_probe: &ToolProbe, node_probe: &ToolProbe, env: &Scan
     format!("{base}{node_note}")
 }
 
+/// The programs whose children run with the allowlisted environment.
+fn is_js_toolchain_program(program: &str) -> bool {
+    matches!(
+        program,
+        "npm" | "npm.cmd" | "bun" | "bun.exe" | "node" | "node.exe"
+    )
+}
+
+/// The npm config a scan pins explicitly, so a repository's `.npmrc` cannot
+/// choose it: the user's own userconfig and globalconfig files, and the
+/// registry the user-level config names (npm's default when it names none).
+/// Environment variables outrank a project `.npmrc` in npm's precedence.
+fn npm_pinned_config(env: &ScanEnv) -> Vec<(&'static str, String)> {
+    let (userconfig, globalconfig) = user_npm_config_paths(env);
+    let registry = userconfig
+        .as_deref()
+        .and_then(user_registry)
+        .unwrap_or_else(|| NPM_DEFAULT_REGISTRY.to_string());
+    let mut pinned = vec![("npm_config_registry", registry)];
+    if let Some(path) = userconfig {
+        pinned.push(("npm_config_userconfig", path.to_string_lossy().into_owned()));
+    }
+    if let Some(path) = globalconfig {
+        pinned.push((
+            "npm_config_globalconfig",
+            path.to_string_lossy().into_owned(),
+        ));
+    }
+    pinned
+}
+
+/// Names `${NAME}` references in the pinned user-level npmrc and globalconfig.
+/// The user's own config is trusted, so a token it asks npm to expand
+/// (`//my.registry/:_authToken=${NPM_TOKEN}`) is forwarded to the child;
+/// nothing is taken from the repository's `.npmrc` or `bunfig.toml`, and a
+/// variable no pinned file mentions stays scrubbed.
+fn user_config_referenced_vars(env: &ScanEnv) -> Vec<String> {
+    let (userconfig, globalconfig) = user_npm_config_paths(env);
+    let mut names = Vec::new();
+    for path in [userconfig, globalconfig].into_iter().flatten() {
+        let Ok(bytes) = crate::fs_entry::read_bounded_nofollow(&path, MAX_MANIFEST_BYTES as usize)
+        else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        for line in text.lines().map(str::trim) {
+            if line.starts_with(';') || line.starts_with('#') {
+                continue;
+            }
+            let mut rest = line;
+            while let Some((_, after)) = rest.split_once("${") {
+                let name: String = after
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() && !names.contains(&name) {
+                    names.push(name);
+                }
+                rest = after;
+            }
+        }
+    }
+    names
+}
+
+/// The user's own userconfig and globalconfig files: their environment
+/// overrides, else `~/.npmrc` and `<node prefix>/etc/npmrc`.
+fn user_npm_config_paths(env: &ScanEnv) -> (Option<PathBuf>, Option<PathBuf>) {
+    let user_override = |key: &str| std::env::var_os(key).filter(|v| !v.is_empty());
+    let userconfig = user_override("npm_config_userconfig")
+        .map(PathBuf::from)
+        .or_else(|| env.home().map(|home| Path::new(home).join(".npmrc")));
+    // npm's builtin globalconfig is `<prefix>/etc/npmrc`, the prefix being two
+    // levels above the node binary it runs under.
+    let globalconfig = user_override("npm_config_globalconfig")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let node = resolve_spawn_program_in("node", env.path(), env.home(), env.path_source);
+            let node = Path::new(&node).canonicalize().ok()?;
+            Some(node.parent()?.parent()?.join("etc").join("npmrc"))
+        });
+    (userconfig, globalconfig)
+}
+
+const NPM_DEFAULT_REGISTRY: &str = "https://registry.npmjs.org/";
+
+/// `registry=` from the user's own `.npmrc`, if it sets a plain URL.
+fn user_registry(userconfig: &Path) -> Option<String> {
+    let bytes =
+        crate::fs_entry::read_bounded_nofollow(userconfig, MAX_MANIFEST_BYTES as usize).ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    parse_npmrc(&text)
+        .into_iter()
+        .rev()
+        .find(|(key, _)| key == "registry")
+        .map(|(_, value)| value)
+        .filter(|value| value.starts_with("http") && !value.contains("${"))
+}
+
+/// Parses an `.npmrc` the way npm's `ini` reader does, for what the refusal
+/// needs: keys, lower-cased and unquoted, with their raw values.
+///
+/// Lines split on `\r\n`, a lone `\r` and a lone `\n` (npm splits on
+/// `[\r\n]+`); a leading BOM is dropped; a key wrapped in single or double
+/// quotes is unquoted; a trailing `[]` (npm's array form) is dropped; a line
+/// with no `=` is a key set to true; `;` and `#` start a comment line and
+/// `[section]` headers carry no key.
+fn parse_npmrc(text: &str) -> Vec<(String, String)> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    text.split(['\r', '\n'])
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && !line.starts_with(';')
+                && !line.starts_with('#')
+                && !(line.starts_with('[') && line.ends_with(']'))
+        })
+        .map(|line| {
+            let (key, value) = line.split_once('=').unwrap_or((line, ""));
+            let mut key = key.trim();
+            for quote in ['"', '\''] {
+                if let Some(inner) = key
+                    .strip_prefix(quote)
+                    .and_then(|rest| rest.strip_suffix(quote))
+                {
+                    key = inner.trim();
+                    break;
+                }
+            }
+            let key = key.strip_suffix("[]").unwrap_or(key);
+            (
+                key.trim().to_ascii_lowercase(),
+                value.trim().trim_matches(['"', '\'']).to_string(),
+            )
+        })
+        .collect()
+}
+
+/// True when a repository `.npmrc` sets repo-controlled transport or credential
+/// config: a registry (default or scoped), the proxy family, TLS trust
+/// (`strict-ssl`, `ca`, `cafile`, `certfile`, `keyfile`), or a credential
+/// (`_auth*`, `_password`, `username`, a scoped `email`, `tokenHelper`).
+/// Those decide where a scan sends the dependency tree and what rides along.
+///
+/// npm 11.20.0 contains no `tokenHelper` code (checked against the installed
+/// package), so npm does not execute it; pnpm and yarn do, and a refusal costs
+/// nothing here, so it stays.
+fn npmrc_overrides_network(text: &str) -> bool {
+    parse_npmrc(text).iter().any(|(key, _)| {
+        let key = key.as_str();
+        key.ends_with("registry")
+            || matches!(
+                key,
+                "proxy"
+                    | "https-proxy"
+                    | "http-proxy"
+                    | "noproxy"
+                    | "strict-ssl"
+                    | "ca"
+                    | "username"
+            )
+            || [
+                "cafile",
+                "certfile",
+                "keyfile",
+                "tokenhelper",
+                ":ca",
+                ":username",
+            ]
+            .iter()
+            .any(|suffix| key.ends_with(suffix))
+            || (key.starts_with("//") && key.ends_with(":email"))
+            || key.contains("_auth")
+            || key.contains("_password")
+    })
+}
+
+/// [`npmrc_overrides_network`] for `bunfig.toml`.
+///
+/// No TOML parser is a direct dependency of this crate, so this fails closed
+/// instead of parsing: the text is lower-cased and stripped of whitespace and
+/// quotes (so `[ install . scopes ]`, `"registry"` and dotted top-level keys
+/// all normalise), and the file is refused if it mentions a registry, a scope,
+/// a credential, a proxy or TLS trust anywhere, comments included.
+fn bunfig_overrides_network(text: &str) -> bool {
+    let flat: String = text
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
+        .flat_map(char::to_lowercase)
+        .collect();
+    const MENTIONS: [&str; 12] = [
+        "registry", "scopes", "token", "password", "username", "proxy", "cafile", "certfile",
+        "keyfile", "tls", "ssl", "email",
+    ];
+    if MENTIONS.iter().any(|needle| flat.contains(needle)) {
+        return true;
+    }
+    // `ca = "..."` is too short to match by substring: look for it as a key.
+    text.split(['\r', '\n', ',', '{'])
+        .filter_map(|piece| piece.split_once('='))
+        .any(|(key, _)| {
+            let key: String = key
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
+                .collect();
+            key.rsplit('.')
+                .next()
+                .is_some_and(|k| k.eq_ignore_ascii_case("ca"))
+        })
+}
+
+/// Why a package root's scan must not run: the repository's own config would
+/// choose the registry, a credential, a proxy or TLS trust. `Some` carries the
+/// code and message of the issue to report; the scan is never reported clean.
+///
+/// Every directory from the package dir up to the repo root is read (a
+/// workspace root or an intermediate parent can hold the `.npmrc` npm honours),
+/// through [`read_manifest_bytes`] (sandboxed, bounded, non-following). A config
+/// that cannot be read is refused too: unread is not "sets nothing".
+fn repo_config_refusal(repo: &Path, rel_dir: &str, bun: bool) -> Option<(&'static str, String)> {
+    let mut files = vec![".npmrc"];
+    if bun {
+        files.push("bunfig.toml");
+    }
+    let mut dirs: Vec<String> = Vec::new();
+    let mut current = rel_dir.trim_matches('/').trim_start_matches("./");
+    while !current.is_empty() && current != "." {
+        dirs.push(current.to_string());
+        current = current.rsplit_once('/').map_or("", |(parent, _)| parent);
+    }
+    dirs.push(String::new());
+    for dir in dirs {
+        for name in &files {
+            let rel = if dir.is_empty() {
+                (*name).to_string()
+            } else {
+                format!("{dir}/{name}")
+            };
+            match read_manifest_bytes(repo, &rel) {
+                Ok(None) => {}
+                Ok(Some(bytes)) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    let overrides = if *name == "bunfig.toml" {
+                        bunfig_overrides_network(&text)
+                    } else {
+                        npmrc_overrides_network(&text)
+                    };
+                    if overrides {
+                        return Some(("registry_overridden", REGISTRY_OVERRIDDEN.to_string()));
+                    }
+                }
+                Err(e) => {
+                    return Some((
+                        "repo_config_unreadable",
+                        format!("{e}; the scan did not run because the repository config could not be checked"),
+                    ))
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The issue text for a scan refused because of repository registry config.
+const REGISTRY_OVERRIDDEN: &str = "registry overridden by repository config";
+
 /// Single choke point for every dependency-scanner spawn so the injectable
 /// PATH/home seams apply uniformly — probes and audits resolve identically.
 fn capture_scanner_command(
@@ -2654,16 +2941,32 @@ fn capture_scanner_command(
         },
         None => (timeout, false),
     };
-    let outcome = capture_command_with_env(
-        program,
-        args,
-        cwd,
-        timeout,
-        extra_env,
-        env.path(),
-        env.home(),
-        env.path_source,
-    );
+    // npm and bun read repository-controlled config and expand `${VAR}` from
+    // their environment, so every JS-toolchain child gets an allowlisted one.
+    let outcome = if is_js_toolchain_program(program) {
+        capture_command_scrubbed(
+            program,
+            args,
+            cwd,
+            timeout,
+            extra_env,
+            env.path(),
+            env.home(),
+            env.path_source,
+            &user_config_referenced_vars(env),
+        )
+    } else {
+        capture_command_with_env(
+            program,
+            args,
+            cwd,
+            timeout,
+            extra_env,
+            env.path(),
+            env.home(),
+            env.path_source,
+        )
+    };
     if let Some(scan) = env.scan.as_ref() {
         scan.note_finished(&outcome, what.trim_end(), shortened);
     }
@@ -8319,4 +8622,397 @@ mod fail_closed_tests {
         );
         assert_eq!(ok.unwrap().verified, 1);
     }
+
+    // -- outbound data: scrubbed environment, pinned config, refusal ---------------
+
+    /// A stub `npm` that records its argv and its whole environment on `audit`.
+    #[cfg(unix)]
+    fn recording_npm(dump: &Path) -> String {
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 10.9.0 ;;\n  audit) echo \"$@\" >> '{d}.argv'; env >> '{d}.env'; echo '{{\"auditReportVersion\":2,\"vulnerabilities\":{{}},\"metadata\":{{\"vulnerabilities\":{{\"total\":0}}}}}}' ;;\n  outdated) echo '{{}}' ;;\nesac\n",
+            d = dump.display()
+        )
+    }
+
+    #[cfg(unix)]
+    fn node_stub() -> (&'static str, String) {
+        (
+            "node",
+            "#!/bin/sh\nif [ \"$1\" = -v ]; then echo v20.0.0; fi\n".to_string(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn scan_with_home(repo: &Path, scripts: &[(&str, String)], home: &Path) -> DepsHealthReport {
+        use std::os::unix::fs::PermissionsExt;
+        let stubs = tempfile::TempDir::new().unwrap();
+        for (name, body) in scripts {
+            let path = stubs.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path_var =
+            std::env::join_paths([stubs.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        DepsScanner::scan_with(
+            repo.to_str().unwrap(),
+            ScanOptions {
+                run_cli: true,
+                path_var: Some(path_var),
+                home: Some(home.as_os_str().to_owned()),
+            },
+        )
+        .expect("scan")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_scan_child_sees_no_tokens_and_a_pinned_config() {
+        let serial = crate::test_support::env::env_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set("NPM_TOKEN", "npm-secret-1")
+            .set("NODE_AUTH_TOKEN", "node-secret-2")
+            .set("GITHUB_TOKEN", "gh-secret-3")
+            .set("AWS_SECRET_ACCESS_KEY", "aws-secret-4")
+            .set("npm_config_registry", "https://env-chosen.invalid/")
+            .set("HTTPS_PROXY", "http://user-proxy.invalid:3128")
+            .remove("npm_config_userconfig")
+            .remove("npm_config_globalconfig");
+        let repo = npm_repo(&[("package.json", PKG), ("package-lock.json", LOCK)]);
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            home.path().join(".npmrc"),
+            "registry=https://user-level.example/\n",
+        )
+        .unwrap();
+        let dump = tempfile::TempDir::new().unwrap();
+        let dump = dump.path().join("npm");
+        let report = scan_with_home(
+            repo.path(),
+            &[node_stub(), ("npm", recording_npm(&dump))],
+            home.path(),
+        );
+        assert!(report.audit_complete, "{:?}", report.issues);
+        let env = std::fs::read_to_string(format!("{}.env", dump.display())).unwrap();
+        for leaked in [
+            "npm-secret-1",
+            "node-secret-2",
+            "gh-secret-3",
+            "aws-secret-4",
+        ] {
+            assert!(
+                !env.contains(leaked),
+                "{leaked} reached the scanner:\n{env}"
+            );
+        }
+        for name in ["NPM_TOKEN=", "NODE_AUTH_TOKEN=", "GITHUB_TOKEN=", "AWS_"] {
+            assert!(!env.contains(name), "{name} reached the scanner:\n{env}");
+        }
+        // The user's own proxy survives; the environment's registry does not
+        // outrank the pin.
+        assert!(
+            env.contains("HTTPS_PROXY=http://user-proxy.invalid:3128"),
+            "{env}"
+        );
+        assert!(
+            env.lines()
+                .any(|l| l == "npm_config_registry=https://user-level.example/"),
+            "{env}"
+        );
+        let userconfig = format!("npm_config_userconfig={}/.npmrc", home.path().display());
+        assert!(env.lines().any(|l| l == userconfig), "{env}");
+        assert!(
+            env.lines()
+                .any(|l| l.starts_with("npm_config_globalconfig=")),
+            "{env}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn registry_refusal_issues(report: &DepsHealthReport) -> Vec<&HealthIssue> {
+        report
+            .issues
+            .iter()
+            .filter(|i| i.code == "registry_overridden")
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repo_npmrc_naming_a_registry_is_refused_and_no_request_is_made() {
+        use std::io::ErrorKind;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let npmrc = format!(
+            "registry=http://127.0.0.1:{port}/\n//127.0.0.1:{port}/:_authToken=${{NPM_TOKEN}}\n"
+        );
+        let repo = npm_repo(&[
+            ("package.json", PKG),
+            ("package-lock.json", LOCK),
+            (".npmrc", &npmrc),
+        ]);
+        let home = tempfile::TempDir::new().unwrap();
+        let dump = tempfile::TempDir::new().unwrap();
+        let dump = dump.path().join("npm");
+        let report = scan_with_home(
+            repo.path(),
+            &[node_stub(), ("npm", recording_npm(&dump))],
+            home.path(),
+        );
+        let refusals = registry_refusal_issues(&report);
+        assert_eq!(refusals.len(), 1, "{:?}", report.issues);
+        assert_eq!(
+            refusals[0].message,
+            "registry overridden by repository config"
+        );
+        assert_eq!(refusals[0].severity, "error");
+        assert!(
+            !report.audit_complete,
+            "a refused scan must not read as clean"
+        );
+        assert!(
+            !Path::new(&format!("{}.argv", dump.display())).exists(),
+            "npm audit ran despite the refusal"
+        );
+        match listener.accept() {
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+            other => panic!("the repo registry received a connection: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_registry_credential_and_proxy_spelling_is_refused() {
+        for body in [
+            "registry=https://evil.example/\n",
+            "@acme:registry=https://evil.example/\n",
+            "//evil.example/:_authToken=${NPM_TOKEN}\n",
+            "_auth=abc\n",
+            "//evil.example/:_password=eHg=\n",
+            "proxy=http://evil.example:8080\n",
+            "https-proxy=http://evil.example:8080\n",
+            "  Registry = https://evil.example/\n",
+        ] {
+            assert!(npmrc_overrides_network(body), "accepted: {body}");
+        }
+        for body in [
+            "save-exact=true\n",
+            "# registry=x\n",
+            "; proxy=x\n",
+            "engine-strict=true\n",
+        ] {
+            assert!(!npmrc_overrides_network(body), "refused: {body}");
+        }
+        assert!(bunfig_overrides_network(
+            "[install]\nregistry = \"https://evil.example\"\n"
+        ));
+        assert!(bunfig_overrides_network(
+            "[install.scopes]\nacme = { url = \"https://x\" }\n"
+        ));
+        assert!(bunfig_overrides_network(
+            "[install]\nregistry = { url = \"u\", token = \"t\" }\n"
+        ));
+        assert!(!bunfig_overrides_network("[install]\nexact = true\n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_root_npmrc_refuses_the_nested_package_and_a_plain_npmrc_does_not() {
+        let nested = npm_repo(&[
+            ("package.json", PKG),
+            (".npmrc", "registry=https://evil.example/\n"),
+            ("pkg/package.json", PKG),
+            ("pkg/package-lock.json", LOCK),
+        ]);
+        let home = tempfile::TempDir::new().unwrap();
+        let dump = tempfile::TempDir::new().unwrap();
+        let dump = dump.path().join("npm");
+        let report = scan_with_home(
+            nested.path(),
+            &[node_stub(), ("npm", recording_npm(&dump))],
+            home.path(),
+        );
+        assert!(
+            !registry_refusal_issues(&report).is_empty(),
+            "{:?}",
+            report.issues
+        );
+        assert!(!Path::new(&format!("{}.argv", dump.display())).exists());
+
+        let plain = npm_repo(&[
+            ("package.json", PKG),
+            ("package-lock.json", LOCK),
+            (".npmrc", "save-exact=true\n"),
+        ]);
+        let report = scan_with_home(
+            plain.path(),
+            &[node_stub(), ("npm", recording_npm(&dump))],
+            home.path(),
+        );
+        assert!(
+            registry_refusal_issues(&report).is_empty(),
+            "{:?}",
+            report.issues
+        );
+        assert!(report.audit_complete, "{:?}", report.issues);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repo_bunfig_naming_a_registry_is_refused_and_bun_does_not_run() {
+        let repo = crate::test_support::git_repo();
+        crate::test_support::write(
+            repo.path(),
+            "package.json",
+            r#"{"name":"demo","version":"1.0.0","packageManager":"bun@1.4.2"}"#,
+        );
+        crate::test_support::write(repo.path(), "bun.lock", "{}\n");
+        crate::test_support::write(
+            repo.path(),
+            "bunfig.toml",
+            "[install]\nregistry = \"https://evil.example\"\n",
+        );
+        git_add_all(repo.path());
+        let home = tempfile::TempDir::new().unwrap();
+        let ran = home.path().join("bun-ran");
+        let bun = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 1.4.2 ;;\n  audit) echo ran >> '{}'; echo '{{}}' ;;\nesac\n",
+            ran.display()
+        );
+        let report = scan_with_home(
+            repo.path(),
+            &[
+                node_stub(),
+                ("npm", "#!/bin/sh\necho 10.9.0\n".to_string()),
+                ("bun", bun),
+            ],
+            home.path(),
+        );
+        let refusals = registry_refusal_issues(&report);
+        assert_eq!(refusals.len(), 1, "{:?}", report.issues);
+        assert_eq!(
+            refusals[0].message,
+            "registry overridden by repository config"
+        );
+        assert!(!ran.exists(), "bun audit ran despite the refusal");
+        assert!(!report.audit_complete);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_variables_the_user_level_npmrc_references_reach_the_child() {
+        let serial = crate::test_support::env::env_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set("NPM_TOKEN", "user-token-1")
+            .set("GITHUB_TOKEN", "gh-secret-3")
+            .set("AWS_SECRET_ACCESS_KEY", "aws-secret-4")
+            .remove("npm_config_userconfig")
+            .remove("npm_config_globalconfig");
+        let repo = npm_repo(&[("package.json", PKG), ("package-lock.json", LOCK)]);
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            home.path().join(".npmrc"),
+            "; ${COMMENTED_OUT}\n//my.registry/:_authToken=${NPM_TOKEN}\n",
+        )
+        .unwrap();
+        let dump = tempfile::TempDir::new().unwrap();
+        let dump = dump.path().join("npm");
+        let report = scan_with_home(
+            repo.path(),
+            &[node_stub(), ("npm", recording_npm(&dump))],
+            home.path(),
+        );
+        assert!(report.audit_complete, "{:?}", report.issues);
+        let env = std::fs::read_to_string(format!("{}.env", dump.display())).unwrap();
+        assert!(env.lines().any(|l| l == "NPM_TOKEN=user-token-1"), "{env}");
+        assert!(!env.contains("gh-secret-3"), "{env}");
+        assert!(!env.contains("aws-secret-4"), "{env}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repo_npmrc_cannot_widen_the_allowlist() {
+        let serial = crate::test_support::env::env_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set("GITHUB_TOKEN", "gh-secret-3")
+            .remove("npm_config_userconfig")
+            .remove("npm_config_globalconfig");
+        let repo = npm_repo(&[
+            ("package.json", PKG),
+            ("package-lock.json", LOCK),
+            (".npmrc", "//evil.example/:_authToken=${GITHUB_TOKEN}\n"),
+        ]);
+        let home = tempfile::TempDir::new().unwrap();
+        let dump = tempfile::TempDir::new().unwrap();
+        let dump = dump.path().join("npm");
+        let report = scan_with_home(
+            repo.path(),
+            &[node_stub(), ("npm", recording_npm(&dump))],
+            home.path(),
+        );
+        assert_eq!(
+            registry_refusal_issues(&report).len(),
+            1,
+            "{:?}",
+            report.issues
+        );
+        // The refused scan started no audit, so the token reached no audit child.
+        assert!(!Path::new(&format!("{}.env", dump.display())).exists());
+        // The referenced names come from the user's files only.
+        let env_view = ScanEnv {
+            path_var: None,
+            path_source: PathSource::Inherited,
+            home: Some(home.path().as_os_str().to_owned()),
+            scan: None,
+        };
+        assert!(!user_config_referenced_vars(&env_view).contains(&"GITHUB_TOKEN".to_string()));
+    }
+
+    #[test]
+    fn parse_npmrc_reads_keys_the_way_npm_does() {
+        let keys =
+            |text: &str| -> Vec<String> { parse_npmrc(text).into_iter().map(|(k, _)| k).collect() };
+        assert_eq!(
+            keys("\u{feff}Proxy=x\rFund=false\r\nca[]=y\n"),
+            ["proxy", "fund", "ca"]
+        );
+        assert_eq!(
+            keys("\"registry\"=x\n'Https-Proxy' = y\n"),
+            ["registry", "https-proxy"]
+        );
+        assert_eq!(keys("; c=1\n# d=2\n[sec]\nbare\n"), ["bare"]);
+    }
+
+    #[test]
+    fn bunfig_is_refused_on_any_mention_and_a_plain_one_is_not() {
+        for text in [
+            "[ install . scopes ]\n",
+            "install.registry = \"x\"\n",
+            "# registry was here\n",
+            "[install]\nca = \"pem\"\n",
+            "[install]\ncafile = \"p\"\n",
+        ] {
+            assert!(bunfig_overrides_network(text), "{text:?}");
+        }
+        assert!(!bunfig_overrides_network(
+            "[install]\nexact = true\n[test]\nroot = \"src\"\n"
+        ));
+    }
+
+    #[test]
+    fn transport_trust_and_credential_keys_are_refused() {
+        for text in [
+            "strict-ssl=false\n",
+            "//r.example/:certfile=/c\n",
+            "//r.example/:keyfile=/k\n",
+            "//r.example/:tokenHelper=/h\n",
+            "//r.example/:email=a@b\n",
+            "noproxy=x\n",
+        ] {
+            assert!(npmrc_overrides_network(text), "{text:?}");
+        }
+    }
 }
+
+#[cfg(test)]
+#[path = "registry_refusal_adversarial_tests.rs"]
+mod registry_refusal_adversarial_tests;

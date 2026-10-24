@@ -92,7 +92,8 @@ fn the_kind_list_is_the_whole_enum() {
             | IpcErrorKind::IdentityMissing
             | IpcErrorKind::StaleStash
             | IpcErrorKind::LedgerNotInitialised
-            | IpcErrorKind::LedgerFailed => {}
+            | IpcErrorKind::LedgerFailed
+            | IpcErrorKind::AiEndpointUnconfirmed => {}
         }
     }
     let mut names: Vec<String> = IpcErrorKind::ALL.into_iter().map(kind_name).collect();
