@@ -11,11 +11,43 @@
 //!
 //! A `SOCK_STREAM` endpoint in GitPulse's own config directory, present only
 //! while the app is running and only while the user has the bridge enabled.
-//! Anything a peer sends can cause exactly one thing: a notification banner
-//! whose heading GitPulse writes, whose body is stripped of control, format
-//! (bidi, zero-width, tag) and private-use characters by [`super::text`] and
-//! truncated, and whose activation focuses a GitPulse tab. It cannot open
-//! a file, run a command, or read anything back.
+//!
+//! **The full set of effects a connected peer can cause.** The peer is the same
+//! user (below), and a report is one of [`EVENTS`], so what it can do is:
+//!
+//! 1. raise a notification banner, whose heading GitPulse writes, whose body is
+//!    stripped of control, format (bidi, zero-width, tag) and private-use
+//!    characters by [`super::text`] and truncated, and whose activation focuses
+//!    a GitPulse tab;
+//! 2. set or clear what a session *stands asking for* (the pane's attention
+//!    state and the tray's count), and take down that session's banner;
+//! 3. advance that session's order stamp, which makes a report with an older
+//!    stamp `stale`, and end its entry (`session_ended`);
+//! 4. for a report from outside any terminal, create a `hook-<agent>-<place>`
+//!    entry, `place` being a name the peer chooses;
+//! 5. spend the global banner rate limit and the notification queue's hook
+//!    reserve.
+//!
+//! Effects 1 to 3 apply only to a session the live terminal registry holds
+//! ([`super::Host::knows`]); a report for any other terminal key is refused as
+//! `unknown_session` and leaves nothing behind (no entry, no order stamp, no
+//! twin memory). Effect 4 is bounded by one shared token bucket for the whole
+//! class and goes first when tracking is full, so it cannot push a terminal
+//! session out. A session's reports are also held to a token bucket
+//! ([`super::limits`]); past it a report is refused as `rate_limited`. Both
+//! refusals are counted as `bridge_rejected`. It cannot open a file, run a
+//! command, or read anything back.
+//!
+//! **Security-impact statement (owner decision 6, 2026-10-24: approved as
+//! hardening).** Who may connect is unchanged: same uid, socket `0600` in a
+//! `0700` directory, peer credentials checked. Nobody gains access, and no
+//! code path that accepted a report before accepts one it did not. The change
+//! only narrows what a connected same-uid peer can do: it can no longer
+//! invent sessions, create tracking entries for them, evict real sessions'
+//! standing, or raise banners for them, and it cannot report faster than a
+//! session can. A peer that knows a live session's id (`term-{pid}-{hex}`, in
+//! that process's environment, readable by the same user) can still report
+//! for that session within the rate limit, which is the declared boundary.
 //!
 //! Every defence is here because the peer is not authenticated by anything
 //! stronger than being the same user:
@@ -808,6 +840,8 @@ fn outcome_of(offer: Offer) -> Outcome {
         Offer::Stale => Outcome::Refused(Reason::Stale),
         Offer::QueueFull => Outcome::Refused(Reason::QueueFull),
         Offer::NotRunning => Outcome::Refused(Reason::NotRunning),
+        Offer::UnknownSession => Outcome::Refused(Reason::UnknownSession),
+        Offer::RateLimited => Outcome::Refused(Reason::RateLimited),
     }
 }
 
@@ -2472,6 +2506,8 @@ mod tests {
     mod order_tests;
     #[cfg(unix)]
     mod protocol_tests;
+    #[cfg(unix)]
+    mod unknown_session_tests;
     #[cfg(unix)]
     mod wire_adv_tests;
 }

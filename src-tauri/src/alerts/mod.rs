@@ -27,6 +27,7 @@
 
 pub mod bridge;
 mod intake;
+mod limits;
 pub mod policy;
 pub mod scan;
 pub mod text;
@@ -418,6 +419,16 @@ pub trait Host: Send + Sync + 'static {
     fn submit(&self, native: &str, heading: &str, body: &str, sound: bool) -> Result<bool, String>;
     /// Whether the user is looking at this exact session right now.
     fn attended(&self, key: &str) -> bool;
+    /// Whether `key` names a terminal session that exists right now, asked of
+    /// the live PTY registry. A hook report for a key this refuses is refused
+    /// itself (`unknown_session`) before it is tracked, ordered or queued.
+    ///
+    /// The default is `true`: a host with no registry to ask (every test host)
+    /// keeps what the worker did before the question existed. The production
+    /// host overrides it and fails closed.
+    fn knows(&self, _key: &str) -> bool {
+        true
+    }
     /// The user's current preferences. Re-read per delivery so a setting
     /// change takes effect without a restart.
     fn config(&self) -> crate::tool_config::SessionAlertSettings {
@@ -464,6 +475,7 @@ fn hub() -> Option<&'static Hub> {
 pub fn start(host: Arc<dyn Host>) {
     let counters = Arc::new(Counters::default());
     let (intake, receiver) = Intake::channel(counters.clone());
+    let intake = intake.guarded_by(host.clone());
     let bells = intake.bells();
     let visible = Arc::new(Mutex::new(Vec::new()));
     let last_error = Arc::new(Mutex::new(None));
@@ -899,14 +911,23 @@ fn admit(
 ) -> Option<Attention> {
     let mut farewell = None;
     if tracked.len() >= MAX_TRACKED && !tracked.contains_key(&notice.key) {
-        // Evict an idle session before a waiting one, and a session asking
+        // A report from outside any terminal (`hook-…`, which a peer can mint
+        // at will) goes before any terminal session. Then: evict an idle
+        // session before a waiting one, and a session asking
         // for nothing before one that still is. An entry with nothing pending
         // costs one extra banner to lose; an entry still holding a notice
         // costs the notice itself, and that one is counted as the fault it is
         // rather than vanishing into the gap between two totals.
         let victim = tracked
             .iter()
-            .min_by_key(|(_, entry)| (entry.holds_work(), entry.standing.is_some(), entry.touched))
+            .min_by_key(|(key, entry)| {
+                (
+                    !key.starts_with("hook-"),
+                    entry.holds_work(),
+                    entry.standing.is_some(),
+                    entry.touched,
+                )
+            })
             .map(|(key, _)| key.clone());
         if let Some(stale) = victim {
             if let Some(evicted) = tracked.remove(&stale) {
@@ -1195,6 +1216,8 @@ mod intake_adv_tests;
 mod intake_tests;
 #[cfg(all(test, unix))]
 mod intake_twin_attack_tests;
+#[cfg(all(test, unix))]
+mod limits_tests;
 #[cfg(test)]
 mod sanitize_parity_tests;
 #[cfg(test)]
