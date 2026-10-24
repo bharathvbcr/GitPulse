@@ -29,11 +29,11 @@
 //! * Malformed JSON is not that. A payload that does not parse says nothing
 //!   about what the host meant, so nothing is reported, as before.
 //!
-//! The read is also bounded in time, by [`NOTIFY_READ_BUDGET`], which is what
-//! is left of the host's timeout after the socket report and the host's own
-//! margin ([`NOTIFY_HOST_TIMEOUT`]).
+//! The read is also bounded in time, by a share of the timeout the event is
+//! run with ([`budgets_for`]), so that the read and the socket report together
+//! end a margin before the host would kill the hook.
 
-use super::{within_budget, HookInput, HOST_TIMEOUT_MARGIN, NOTIFY_BUDGET};
+use super::{within_budget, HookInput};
 use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 use std::io::Read;
@@ -41,17 +41,44 @@ use std::time::Duration;
 
 /// The `timeout` the plugin manifest gives every `notify` hook, in the host's
 /// terms: when Claude Code kills the hook, and with it any report not yet
-/// delivered. The one owner: the manifest must say it (a test reads both), and
-/// the whole run is derived from it.
+/// delivered. The one owner for every event but `session_ended`; the manifest
+/// must say it (a test reads both).
 pub const NOTIFY_HOST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// What the read may take: the host's timeout, less its margin for the process
-/// to print, reap and exit, less the socket report that follows. The whole run
-/// is then done [`HOST_TIMEOUT_MARGIN`] before the host would kill it, even
-/// when the writer dribbles to the last moment.
-pub const NOTIFY_READ_BUDGET: Duration = NOTIFY_HOST_TIMEOUT
-    .saturating_sub(HOST_TIMEOUT_MARGIN)
-    .saturating_sub(NOTIFY_BUDGET);
+/// The `timeout` the injected `SessionEnd` hook is given
+/// (`workbench::claude_hook`), so that it never raises Claude Code's 1.5 s exit
+/// budget. The plugin's own copy has [`NOTIFY_HOST_TIMEOUT`]; the hook cannot
+/// tell which copy it is, so a `session_ended` run is held to the shorter.
+pub const SESSION_END_HOST_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The host timeout a `notify` for `event` must finish inside.
+pub fn host_timeout(event: &str) -> Duration {
+    if event == "session_ended" {
+        SESSION_END_HOST_TIMEOUT
+    } else {
+        NOTIFY_HOST_TIMEOUT
+    }
+}
+
+/// What the read and, separately, the socket report may each take of a host
+/// `timeout`: 30% apiece, which leaves 40% for the process to print, reap and
+/// exit and for the host to see it do so (2 s of 5, 0.4 s of 1). Each run is
+/// then over a margin before the host would kill it, even when the writer
+/// dribbles to the last moment and the socket answers at its deadline.
+pub const fn run_share(timeout: Duration) -> Duration {
+    Duration::from_millis(timeout.as_millis() as u64 * 3 / 10)
+}
+
+/// The read budget under [`NOTIFY_HOST_TIMEOUT`].
+#[cfg(test)]
+pub const NOTIFY_READ_BUDGET: Duration = run_share(NOTIFY_HOST_TIMEOUT);
+
+/// The read and the send budgets for a `notify` of `event`, from the timeout
+/// that event is run with.
+pub fn budgets_for(event: &str) -> (Duration, Duration) {
+    let share = run_share(host_timeout(event));
+    (share, share)
+}
 
 /// The most of one payload that is read. Four times the limit the other
 /// subcommands hold, because only what `notify` keeps is built.
@@ -161,16 +188,26 @@ fn kept_fields(bytes: &[u8]) -> Result<HookInput, String> {
     Ok(HookInput::from_value(&value))
 }
 
-/// Reads the fields `notify` uses from `reader`, within [`NOTIFY_READ_BUDGET`], reading at
-/// most `limit` bytes.
-///
-/// `Ok` with an empty input when the payload is longer than `limit`. `Err` for
-/// one that is not a JSON object, cannot be read, or did not arrive in time.
+/// [`read_notify_input_within`] under [`NOTIFY_READ_BUDGET`].
+#[cfg(test)]
 pub fn read_notify_input(
     reader: impl Read + Send + 'static,
     limit: u64,
 ) -> Result<HookInput, String> {
-    within_budget(NOTIFY_READ_BUDGET, move || {
+    read_notify_input_within(reader, limit, NOTIFY_READ_BUDGET)
+}
+
+/// Reads the fields `notify` uses from `reader`, within `budget`, reading at
+/// most `limit` bytes.
+///
+/// `Ok` with an empty input when the payload is longer than `limit`. `Err` for
+/// one that is not a JSON object, cannot be read, or did not arrive in time.
+pub fn read_notify_input_within(
+    reader: impl Read + Send + 'static,
+    limit: u64,
+    budget: Duration,
+) -> Result<HookInput, String> {
+    within_budget(budget, move || {
         let mut bytes = Vec::new();
         reader
             .take(limit.saturating_add(1))

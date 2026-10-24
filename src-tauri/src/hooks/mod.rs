@@ -44,6 +44,7 @@ use crate::insights::{self, same_path, CollisionRisk, InsightsSnapshot};
 
 pub mod advisory_once;
 mod notify_input;
+pub use notify_input::SESSION_END_HOST_TIMEOUT;
 pub mod signal_guard;
 
 /// Wall-clock ceiling for the work behind one hook invocation.
@@ -165,7 +166,8 @@ pub fn read_for(
     if !notify_wants_input(argument) {
         return Ok(HookInput::default());
     }
-    notify_input::read_notify_input(reader, notify_input::MAX_READ_BYTES)
+    let (read_budget, _) = notify_input::budgets_for(argument.unwrap_or_default());
+    notify_input::read_notify_input_within(reader, notify_input::MAX_READ_BYTES, read_budget)
 }
 
 /// Whether a `notify` for `argument` has anything to read stdin for. See
@@ -2042,7 +2044,8 @@ fn run_notify(
     let payload = notify_payload(event, input);
     // Detached at the deadline. A hook the host is waiting on must not be held
     // by a socket that is not answering, and the report is worth nothing late.
-    match within_budget(NOTIFY_BUDGET, move || send(&path, &payload)) {
+    let (_, send_budget) = notify_input::budgets_for(event.name);
+    match within_budget(send_budget, move || send(&path, &payload)) {
         Some(Ok(())) => Ok(HookOutput::silent()),
         Some(Err(error)) => Err(format!("notification report not delivered: {error}")),
         None => Err("notification report exceeded its deadline; not retried".into()),

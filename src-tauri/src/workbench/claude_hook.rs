@@ -85,7 +85,7 @@ const INJECTED_EVENTS: [&str; 7] = [
 /// less than the default budget, so it never raises it. The report is a few
 /// milliseconds when GitPulse is up; a slow one is lost, and the process-exit
 /// `session_ended` GitPulse records itself covers the session.
-pub(crate) const SESSION_END_TIMEOUT_SECS: u64 = 1;
+pub(crate) const SESSION_END_TIMEOUT_SECS: u64 = crate::hooks::SESSION_END_HOST_TIMEOUT.as_secs();
 
 /// The name the plugin manifest invokes the hook by.
 const HOOK_NAME: &str = "gitpulse-hook";

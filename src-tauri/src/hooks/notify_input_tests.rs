@@ -113,41 +113,96 @@ fn only_whitespace_may_follow_the_object() {
     }
 }
 
-/// The hook's whole run (the read, the socket report, the margin the host
-/// needs to see it exit) fits inside the `timeout` the manifest gives every
-/// notify hook, so a writer that dribbles to the last moment cannot get the
-/// hook killed by the host mid-report. The manifest is read, not restated.
-#[test]
-fn the_whole_run_ends_a_margin_before_the_host_timeout() {
-    use super::notify_input::{NOTIFY_HOST_TIMEOUT, NOTIFY_READ_BUDGET};
-    assert!(
-        NOTIFY_READ_BUDGET + NOTIFY_BUDGET + HOST_TIMEOUT_MARGIN <= NOTIFY_HOST_TIMEOUT,
-        "{NOTIFY_READ_BUDGET:?} + {NOTIFY_BUDGET:?} + {HOST_TIMEOUT_MARGIN:?} > {NOTIFY_HOST_TIMEOUT:?}"
-    );
-    assert!(NOTIFY_READ_BUDGET > Duration::ZERO);
-    assert!(
-        NOTIFY_READ_BUDGET < BUDGET,
-        "the general read budget is no longer what notify uses"
-    );
+/// The least the host needs between the hook's last act and its own timeout to
+/// see the process exit.
+const EXIT_MARGIN: Duration = Duration::from_millis(250);
 
-    let manifest: Value =
-        serde_json::from_str(include_str!("../../../plugins/gitpulse/hooks/hooks.json")).unwrap();
-    let mut seen = 0;
-    for groups in manifest["hooks"].as_object().unwrap().values() {
+/// Every `(notify argument, timeout in seconds)` among `hooks`, a `hooks`
+/// object as the plugin manifest or the generated settings carry it.
+fn notify_timeouts(hooks: &Value) -> Vec<(String, f64)> {
+    let mut found = Vec::new();
+    for groups in hooks.as_object().unwrap().values() {
         for group in groups.as_array().unwrap() {
             for hook in group["hooks"].as_array().unwrap() {
-                if hook["command"].as_str().unwrap().contains(" notify ") {
-                    assert_eq!(
-                        hook["timeout"].as_u64(),
-                        Some(NOTIFY_HOST_TIMEOUT.as_secs()),
-                        "{hook}"
-                    );
-                    seen += 1;
+                if let Some((_, argument)) =
+                    hook["command"].as_str().unwrap().split_once(" notify ")
+                {
+                    found.push((
+                        argument.to_owned(),
+                        hook["timeout"].as_f64().expect("timeout"),
+                    ));
                 }
             }
         }
     }
-    assert!(seen >= 10, "only {seen} notify entries read");
+    found
+}
+
+/// The read and the socket report end a margin before the host's `timeout`
+/// for the event, so a writer that dribbles to the last moment cannot get the
+/// hook killed mid-report. Checked against every notify hook the launch
+/// injects, read from the generated settings, and against the plugin's own
+/// copies of the same events, read from the manifest: neither is restated.
+#[test]
+fn the_whole_run_ends_a_margin_before_the_host_timeout() {
+    use super::notify_input::{budgets_for, host_timeout, NOTIFY_HOST_TIMEOUT, NOTIFY_READ_BUDGET};
+    assert_eq!(
+        NOTIFY_READ_BUDGET, NOTIFY_BUDGET,
+        "the 5 s case is the old budgets"
+    );
+    assert!(
+        NOTIFY_READ_BUDGET < BUDGET,
+        "the general read budget is no longer what notify uses"
+    );
+    let fits = |argument: &str, timeout: f64, whose: &str| {
+        let (read, send) = budgets_for(argument);
+        assert!(read > Duration::ZERO && send > Duration::ZERO);
+        let run = read + send;
+        let timeout = Duration::from_secs_f64(timeout);
+        assert!(
+            run + EXIT_MARGIN <= timeout,
+            "{whose} notify {argument}: read {read:?} + send {send:?} leaves under {EXIT_MARGIN:?} of its {timeout:?}"
+        );
+    };
+
+    let injected = crate::workbench::claude_hook::settings_hooks(std::path::Path::new(
+        "/opt/gitpulse/gitpulse-hook",
+    ))
+    .unwrap();
+    let entries = notify_timeouts(&injected);
+    assert!(entries.len() >= 6, "{entries:?}");
+    for (argument, timeout) in &entries {
+        // What the launch asks for is what the hook budgets for.
+        assert!(
+            *timeout <= host_timeout(argument).as_secs_f64(),
+            "injected notify {argument} is given {timeout} s, more than the {:?} its run is held to",
+            host_timeout(argument)
+        );
+        fits(argument, *timeout, "injected");
+    }
+    assert!(entries
+        .iter()
+        .any(|(a, t)| a == "session_ended" && *t <= 1.0));
+
+    let manifest: Value =
+        serde_json::from_str(include_str!("../../../plugins/gitpulse/hooks/hooks.json")).unwrap();
+    let shipped = notify_timeouts(&manifest["hooks"]);
+    assert!(
+        shipped.len() >= 10,
+        "only {} notify entries read",
+        shipped.len()
+    );
+    for (argument, timeout) in &shipped {
+        // The plugin's copy of an event may allow more than the hook holds
+        // itself to (`session_ended` is held to the injected copy's 1 s), never
+        // less.
+        assert_eq!(
+            *timeout,
+            NOTIFY_HOST_TIMEOUT.as_secs_f64(),
+            "plugin notify {argument}"
+        );
+        fits(argument, *timeout, "plugin");
+    }
 }
 
 /// A reader that fails is an error, not an empty payload.
