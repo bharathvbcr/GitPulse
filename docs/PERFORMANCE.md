@@ -888,6 +888,7 @@ Committed baselines: `local-macos-aarch64` (below, re-seeded after the lag-audit
 | `repo_read` | `get_status` at 1k and 10k files, clean and dirty, with git processes | A-git-05; git-status-assist-spike |
 | `command_timings` | insights snapshot, `list_worktrees listing`, `list_worktrees full`, language stats, docs refresh, `catch_up` (steady and cold), commit details on an 18-worktree fixture | the lag audit's snapshot / listing / stats / docs / catch-up / commit-details cards; `list_worktrees listing` (`list_worktrees_scanned` at `ScanDepth::Listing`, the `cmd_list_worktrees` default) is the baseline for ft-28c58695 (card 4), and `list_worktrees full` (`ScanDepth::Full`, the Worktrees panel's explicit opt-in) is the baseline for the Worktrees panel path |
 | `terminal_pty` | MB/s through a real PTY, IPC messages per MiB, keystroke echo p50 idle and during a flood in another session | terminal-output-channel; terminal-reader-kqueue |
+| `alerts_worker` | sustained notices/s through the intake, the 64-slot queue and the real notification worker: hook state reports and renderer answers over 64 sessions, 50,000 per sample, a full queue retried and counted | ft-9cfd5474 (S1-08; row in ft-c0d9313f) |
 | `idle_wakeups` | process interrupt wakeups/s with 0, 1, 8, 32 idle terminal sessions, an idle mailbox, 8 / 24 idle watches, an idle alerts bridge and the host-load sampler | terminal-reader-kqueue; always-on-pollers; ft-79394019 (Wave 0) |
 | `live_index` | duty cycle of the live index under a 40-tick, 250 ms-cadence edit storm against a stub `devmap` | live-index-duty-cycle |
 | `worktree_teardown` | `remove_worktree` (lock-held) and `merge_and_teardown_worktree` on a worktree with 100k ignored files, and the merge with 0 entries as the control; `contender_wait_ns` of a `lock_worktree` issued mid-teardown | CARD 22 S5-11 (ft-9d04447403db7f9525dce4db970e4b8a) |
@@ -2106,3 +2107,14 @@ Shared reads (`src/lib/ipc/sharedReads.ts`, the map in `invoke.ts`) join an in-f
 ### Footprint parser
 
 `node scripts/memory-footprint.mjs --footprint <file>` prints phys_footprint, peak, and WebKit Malloc dirty, reclaimable, and regions. It does not need `--expose-gc` and it does not run the microbench. A category the file does not contain is reported absent, not as zero. Covered by `scripts/footprint-summary.test.ts`.
+
+## 2026-10-24: notification worker msgs/sec (ft-9cfd547403d57c1725e3ccdb97144170, S1-08; row in ft-c0d9313f)
+
+`alerts_worker` (N = 9, not time-gated, release, load 5.3 on 18 cpus): 50,000 notices per sample over 64 sessions through `alerts::try_offer`, the 64-slot queue and the real worker, a full queue retried.
+
+| row | min | p50 | p95 | notices/s at min |
+| --- | --- | --- | --- | --- |
+| hook state reports (`turn_finished` / `tool_finished` alternating) | 111.19 ms | 112.61 ms | 121.47 ms | **449,700** |
+| renderer answers (`prompt_submitted`) | 34.91 ms | 35.19 ms | 38.51 ms | **1,432,000** |
+
+The rate to compare between builds is `50000 / min`. A producer retries a full queue (about 750k retries a sample on the state-report row; the producer outruns the worker), so the figure is the worker's own rate, less the last 64 notices that are still queued when the span ends (under 0.2%). It is one machine's reading. There is no row from before the intake change, because the bench calls `try_offer`, which that change introduced. Baseline entry: `src-tauri/benches/baselines/local-macos-aarch64.json`.

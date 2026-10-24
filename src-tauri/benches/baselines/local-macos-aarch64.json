@@ -665,6 +665,32 @@
           }
         }
       }
+    },
+    "alerts_worker": {
+      "commit": "540be2c566e6738170a288351192857b6ee8390e",
+      "smoke": false,
+      "cpu_count": 18,
+      "load1": 5.3,
+      "rows": {
+        "hook state reports": {
+          "n": 9,
+          "time_gated": false,
+          "min_ns": 111190000,
+          "counters": {
+            "notices": 50000,
+            "sessions": 64
+          }
+        },
+        "renderer answers": {
+          "n": 9,
+          "time_gated": false,
+          "min_ns": 34910000,
+          "counters": {
+            "notices": 50000,
+            "sessions": 64
+          }
+        }
+      }
     }
   }
 }

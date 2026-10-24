@@ -43,6 +43,32 @@
 //!   outright is rebound a bounded number of times; past that the bridge
 //!   reports that it is not listening and why.
 //!
+//! ## The protocol
+//!
+//! One report per connection, JSON, at most [`MAX_REPORT_BYTES`] serialized;
+//! the peer half-closes and reads one line back.
+//!
+//! * **Report, v1.** `v` (must be [`PROTOCOL_VERSION`]) and `event` (a name in
+//!   [`EVENTS`]) are required. Optional: `agent`, `session`, `cwd`, `message`,
+//!   `subject`, `subagent`, and `seq`. Fields not listed are ignored, which is
+//!   what lets a field be added without a new version.
+//! * **`seq`** is the order stamp: the hook reads [`order_stamp_ns`] at process
+//!   entry, before it reads stdin, so reports from one session are ordered by
+//!   when their hooks began and not by which connection happened to be accepted
+//!   or read first. A report without `seq` is ordered by its accept stamp, as
+//!   before; see [`order_for`] for why the two compare and for the cap. A report
+//!   older than one already applied for its session is refused as `stale`.
+//! * **Reply.** `{"ok":true}` if the notification worker took the report, with
+//!   nothing else in it. Otherwise `{"ok":false,"reason":"<token>"}`, the token
+//!   one of [`Reason`]'s closed set (never text the peer sent), plus `"max_v"`
+//!   (the newest version this bridge speaks) when the refusal is
+//!   `unsupported_version`. A peer that reads only `ok` is unaffected; a hook
+//!   that reads `reason` from an older bridge that sends none must say the
+//!   reason is missing, not guess at one.
+//! * **Message size.** A hook clips `message` against the *serialized* size, so
+//!   a message full of control characters (six bytes each once escaped) is
+//!   delivered clipped, not refused for size.
+//!
 //! On Windows the socket is not offered. The hook path there is a documented
 //! gap rather than a silently missing feature.
 
