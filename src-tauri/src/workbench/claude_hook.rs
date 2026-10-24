@@ -3,10 +3,10 @@
 //! The shipped plugin (`plugins/gitpulse/hooks/hooks.json`) runs the hook, but
 //! only in a Claude Code configuration directory that enables the plugin. A
 //! session launched under `CLAUDE_CONFIG_DIR=~/.claude-chandra` has no hooks at
-//! all, so the command gate never sees what that agent runs. GitPulse already
-//! passes every launch a session-scoped `--settings` object
-//! ([`super::terminal_command::notify_flags`]); this adds the same PreToolUse
-//! hooks to it.
+//! all, so the command gate never sees what that agent runs and the notifier
+//! hears only a bell. GitPulse already passes every launch a session-scoped
+//! `--settings` object ([`super::terminal_command::notify_flags`]); this adds
+//! the plugin's gate and notification hooks ([`INJECTED_EVENTS`]) to it.
 //!
 //! What Claude Code's documentation says, and what follows from it
 //! (<https://code.claude.com/docs/en/cli-reference> and `/hooks`):
@@ -24,8 +24,9 @@
 //!   guess that the plugin is enabled leaves the session ungated — the very
 //!   case this exists for. So the hook always goes on, and the hook itself
 //!   makes the second run harmless: every check is a read, both copies reach
-//!   the same decision, and an identical warning for one call is said once
-//!   (`hooks::advisory_once`).
+//!   the same decision, an identical warning for one call is said once
+//!   (`hooks::advisory_once`), and a notification said twice is folded by the
+//!   order book (`alerts::intake::OrderBook::repeats`).
 //!
 //! The hook entries are not written out a second time here: they are the
 //! plugin manifest's own `PreToolUse` entries with the bare `gitpulse-hook`
@@ -41,9 +42,35 @@ use serde_json::{json, Map, Value};
 /// The plugin's hook manifest: the one owner of which hooks run and when.
 const PLUGIN_HOOKS: &str = include_str!("../../../plugins/gitpulse/hooks/hooks.json");
 
-/// The hook events injected. The safety gate is `PreToolUse`; the plugin's
-/// notification and session-brief hooks stay the plugin's.
-const INJECTED_EVENTS: [&str; 1] = ["PreToolUse"];
+/// The hook events injected, by the plugin manifest's own name for each.
+///
+/// `PreToolUse` is the safety gate. The rest are the notification hooks that
+/// say what a session is doing: a question asked (`PermissionRequest`), a tool
+/// run (`PostToolUse`, `PostToolUseFailure`), a prompt answered
+/// (`UserPromptSubmit`), a turn ended (`Stop`) and a session ended
+/// (`SessionEnd`). Without them a Claude launched under a configuration that
+/// does not enable the plugin reports only a bell, which says something
+/// happened and never what, and stays "signalled" until someone types. They
+/// only report: `gitpulse-hook notify` writes nothing to stdout, so it can
+/// neither allow nor deny anything.
+///
+/// Left to the plugin: the `Notification` matchers and `StopFailure`, which
+/// are banners, and `SessionStart`'s brief. A session without the plugin gets
+/// its banners from the bell it already rings.
+///
+/// A session that does enable the plugin runs both copies of each. The
+/// `PreToolUse` copies are made harmless by `hooks::advisory_once`; the
+/// notification copies by the order book (`alerts::intake`), which folds one
+/// event reported twice into one report.
+const INJECTED_EVENTS: [&str; 7] = [
+    "PreToolUse",
+    "PermissionRequest",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "UserPromptSubmit",
+    "Stop",
+    "SessionEnd",
+];
 
 /// The name the plugin manifest invokes the hook by.
 const HOOK_NAME: &str = "gitpulse-hook";
@@ -223,6 +250,9 @@ pub(crate) fn merge_hooks(existing: Option<&Value>, addition: Value) -> Value {
     Value::Object(merged)
 }
 
+#[cfg(all(test, unix))]
+mod notify_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,18 +316,18 @@ mod tests {
         assert!(decision.binary().is_none());
     }
 
-    /// Lockstep with the hook: the subcommands injected here are exactly the
-    /// ones the hook deduplicates advisories for. One injected but not
-    /// deduplicated would print every warning twice; one deduplicated but not
-    /// injected is dead.
+    /// Lockstep with the hook: the checking subcommands injected here are
+    /// exactly the ones the hook deduplicates advisories for. One injected but
+    /// not deduplicated would print every warning twice; one deduplicated but
+    /// not injected is dead. (`notify` is a report, folded by the order book
+    /// instead; see `notify_tests`.)
     #[test]
     fn the_injected_subcommands_are_the_ones_the_hook_deduplicates() {
         let hooks = settings_hooks(&hook().unwrap()).unwrap();
-        let mut injected: Vec<String> = hooks
-            .as_object()
+        let mut injected: Vec<String> = hooks["PreToolUse"]
+            .as_array()
             .unwrap()
-            .values()
-            .flat_map(|groups| groups.as_array().unwrap().clone())
+            .iter()
             .flat_map(|group| group["hooks"].as_array().unwrap().clone())
             .map(|hook| {
                 let command = hook["command"].as_str().unwrap().to_owned();
@@ -349,10 +379,16 @@ mod tests {
     fn the_injected_hooks_are_the_manifests_pre_tool_use_by_absolute_path() {
         let binary = Path::new("/Applications/Git Pulse.app/Contents/MacOS/gitpulse-hook");
         let hooks = settings_hooks(binary).unwrap();
-        assert_eq!(
-            hooks.as_object().unwrap().keys().collect::<Vec<_>>(),
-            ["PreToolUse"]
-        );
+        let mut keys: Vec<&str> = hooks
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        let mut events = INJECTED_EVENTS.to_vec();
+        events.sort_unstable();
+        assert_eq!(keys, events);
         let manifest: Value = serde_json::from_str(PLUGIN_HOOKS).unwrap();
         let shipped = manifest["hooks"]["PreToolUse"].as_array().unwrap();
         let injected = hooks["PreToolUse"].as_array().unwrap();

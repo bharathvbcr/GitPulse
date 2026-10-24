@@ -610,12 +610,28 @@ fn a_fleet_whose_reports_arrive_out_of_order_still_accounts_for_every_one() {
         let mut newest: HashMap<String, u64> = HashMap::new();
         let mut ended: HashMap<String, u64> = HashMap::new();
         let mut model_stale = HashSet::new();
+        // One event said twice (the plugin's hook and the injected one) is one
+        // report: the same event for the same session, stamped within the
+        // window of the last one admitted. A twin is not stale whatever its
+        // stamp, but what it says about order still counts.
+        let mut last: HashMap<String, (u64, &'static str)> = HashMap::new();
+        let mut model_twins = HashSet::new();
         for &index in &arrival {
             let (stamp, session, event) = &happened[index];
+            let twin = last.get(session).is_some_and(|(at, name)| {
+                *name == event.name && at.abs_diff(*stamp) <= super::intake::DUPLICATE_WINDOW_NS
+            });
             let behind_end = ended.get(session).is_some_and(|end| stamp < end);
             let behind_newest = newest.get(session).is_some_and(|seen| stamp < seen);
-            if behind_end || behind_newest {
+            let behind = behind_end || behind_newest;
+            if behind && !twin {
                 model_stale.insert(index);
+                continue;
+            }
+            if twin {
+                model_twins.insert(index);
+            }
+            if behind {
                 continue;
             }
             ended.remove(session);
@@ -623,7 +639,14 @@ fn a_fleet_whose_reports_arrive_out_of_order_still_accounts_for_every_one() {
             if event.name == "session_ended" {
                 ended.insert(session.clone(), newest.remove(session).unwrap_or(*stamp));
             }
+            if !twin {
+                last.insert(session.clone(), (*stamp, event.name));
+            }
         }
+        assert!(
+            !model_twins.is_empty(),
+            "seed {seed}: no twin was offered, so folding was not exercised"
+        );
         assert!(
             model_stale.len() > total / 50,
             "seed {seed}: only {} reports were stale, so ordering was barely exercised",
@@ -667,6 +690,12 @@ fn a_fleet_whose_reports_arrive_out_of_order_still_accounts_for_every_one() {
                 offer == Offer::Stale,
                 model_stale.contains(&index),
                 "seed {seed}: report {index} ({} for {session} at {stamp}) disagrees with the model: {offer:?}",
+                event.name
+            );
+            assert_eq!(
+                offer == Offer::Coalesced,
+                model_twins.contains(&index),
+                "seed {seed}: report {index} ({} for {session} at {stamp}): {offer:?}",
                 event.name
             );
             if event.role == bridge::Role::Banner {

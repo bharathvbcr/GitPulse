@@ -507,3 +507,132 @@ fn a_closed_queue_says_not_running_not_full() {
     // Nobody will ever drain it, which is not the same as being full.
     assert_eq!(intake.offer(bell("a")), Offer::NotRunning);
 }
+
+/// A hook report carrying the digest of the tool call it is about.
+#[cfg(unix)]
+fn report_about(event: &str, session: &str, subject: Option<&str>) -> Notice {
+    let subject = subject.map_or(String::new(), |s| format!(r#","subject":"{s}""#));
+    let json =
+        format!(r#"{{"v":1,"event":"{event}","agent":"claude","session":"{session}"{subject}}}"#);
+    bridge::parse_report_stamped(json.as_bytes())
+        .expect("a well-formed report")
+        .0
+}
+
+const MS: u64 = 1_000_000;
+
+/// The plugin's hook and the one GitPulse injects both fire for one event, and
+/// each stamps its own entry a few milliseconds apart. The second is the same
+/// report said again: it is folded, not offered to the worker as a second one.
+#[cfg(unix)]
+#[test]
+fn one_event_said_by_the_plugin_and_the_injected_hook_is_one_report() {
+    let call = Some("00000000deadbeef");
+    for (event, subject) in [
+        ("permission_request", call),
+        ("turn_finished", None),
+        ("tool_finished", call),
+        ("session_ended", None),
+    ] {
+        let rig = Rig::new();
+        let first = rig
+            .intake
+            .offer_stamped(report_about(event, S, subject), 1_000 * MS);
+        let second = rig
+            .intake
+            .offer_stamped(report_about(event, S, subject), 1_000 * MS + 7 * MS);
+        assert_eq!(first, Offer::Accepted, "{event}");
+        assert_eq!(second, Offer::Coalesced, "{event}");
+        assert!(second.taken());
+        let ended = rig.finish();
+        // A state or a resolution has no outcome of its own to count.
+        assert_eq!(ended.coalesced, 0, "{event}");
+        assert_eq!(ended.stale, 0, "{event}");
+    }
+}
+
+/// A banner twice is one banner, and its folded copy is counted as the
+/// coalesced notice it is.
+#[cfg(unix)]
+#[test]
+fn a_banner_said_twice_is_counted_as_coalesced() {
+    let rig = Rig::new();
+    let first = rig
+        .intake
+        .offer_stamped(report_about("permission_prompt", S, None), 3_000 * MS);
+    let second = rig.intake.offer_stamped(
+        report_about("permission_prompt", S, None),
+        3_000 * MS + 5 * MS,
+    );
+    assert_eq!((first, second), (Offer::Accepted, Offer::Coalesced));
+    assert_eq!(rig.finish().coalesced, 1);
+}
+
+/// One standing, one announcement: the second `permission_request` neither
+/// restands the question nor announces it again.
+#[cfg(unix)]
+#[test]
+fn a_duplicated_permission_request_leaves_one_standing() {
+    let rig = Rig::new();
+    let call = Some("00000000deadbeef");
+    rig.intake
+        .offer_stamped(report_about("permission_request", S, call), 5_000 * MS);
+    rig.intake.offer_stamped(
+        report_about("permission_request", S, call),
+        5_000 * MS + 4 * MS,
+    );
+    let ended = rig.finish();
+    assert_eq!(ended.standing.len(), 1, "{:?}", ended.standing);
+    assert_eq!(
+        ended.standing_event(S).as_deref(),
+        Some("permission_request")
+    );
+}
+
+/// The copy may stamp earlier than the report that got here first: the two
+/// processes start in either order.
+#[cfg(unix)]
+#[test]
+fn the_twin_that_stamped_first_is_still_a_twin() {
+    let rig = Rig::new();
+    let first = rig
+        .intake
+        .offer_stamped(report_about("turn_finished", S, None), 2_000 * MS);
+    let late_twin = rig
+        .intake
+        .offer_stamped(report_about("turn_finished", S, None), 2_000 * MS - 6 * MS);
+    assert_eq!((first, late_twin), (Offer::Accepted, Offer::Coalesced));
+    rig.finish();
+}
+
+/// What is not the same report is not folded: another call, another event,
+/// another session, or the same event much later.
+#[cfg(unix)]
+#[test]
+fn only_the_same_event_for_the_same_call_close_in_time_is_folded() {
+    let rig = Rig::new();
+    let at = 9_000 * MS;
+    let a = Some("00000000000000aa");
+    let b = Some("00000000000000bb");
+    let offers = [
+        rig.intake
+            .offer_stamped(report_about("permission_request", S, a), at),
+        // Another call.
+        rig.intake
+            .offer_stamped(report_about("permission_request", S, b), at + MS),
+        // Another event.
+        rig.intake
+            .offer_stamped(report_about("turn_finished", S, None), at + 2 * MS),
+        // Another session.
+        rig.intake.offer_stamped(
+            report_about("turn_finished", "term-9-2b", None),
+            at + 3 * MS,
+        ),
+        // The same event again, a real second one.
+        rig.intake
+            .offer_stamped(report_about("turn_finished", S, None), at + 2_000 * MS),
+    ];
+    assert_eq!(offers, [Offer::Accepted; 5]);
+    let ended = rig.finish();
+    assert_eq!(ended.coalesced, 0);
+}

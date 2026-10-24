@@ -141,7 +141,38 @@ impl LowGate {
 pub(crate) struct OrderBook {
     pub(crate) newest: HashMap<String, u64>,
     pub(crate) ended: HashMap<String, u64>,
+    /// The last report admitted per session, for [`OrderBook::repeats`].
+    last: HashMap<String, Reported>,
 }
+
+/// What [`OrderBook::repeats`] remembers of the last report admitted for a
+/// session.
+#[cfg(unix)]
+struct Reported {
+    stamp: u64,
+    event: &'static str,
+    subject: Option<String>,
+}
+
+/// How far apart two reports of one event may be stamped and still be one
+/// event said twice.
+///
+/// A Claude Code session that enables the plugin *and* carries the hooks
+/// GitPulse injects (`workbench::claude_hook`) runs both for one event. Claude
+/// starts matching handlers together, so the two processes stamp their entry
+/// within the time it takes to start a process: milliseconds, tens under
+/// load. A payload says nothing that tells the copies apart from two real
+/// events: `PermissionRequest`, `Stop` and `SessionEnd` carry no id of their
+/// own (only `PostToolUse` has `tool_use_id`, and
+/// <https://code.claude.com/docs/en/hooks> lists none for the others). So the
+/// key is what the report says (session, event, tool-call digest) plus
+/// closeness of the hook's own entry stamp. Half a second is far above
+/// process-start jitter and far below the shortest gap between two real
+/// repeats of one event for one call, and a copy that falls outside it is
+/// still harmless: a state restands what already stands and a resolution
+/// resolves nothing twice.
+#[cfg(unix)]
+pub(crate) const DUPLICATE_WINDOW_NS: u64 = 500_000_000;
 
 /// Most sessions the order book remembers, live and ended alike. The same bound
 /// as the notifier's own tracking, which is what a report is about to be
@@ -162,6 +193,51 @@ fn evict_oldest(map: &mut HashMap<String, u64>) {
 
 #[cfg(unix)]
 impl OrderBook {
+    /// Whether `event` for `key` is the report last admitted, said a second
+    /// time by another hook ([`DUPLICATE_WINDOW_NS`]).
+    pub(crate) fn repeats(
+        &self,
+        key: &str,
+        stamp: u64,
+        event: &str,
+        subject: Option<&str>,
+    ) -> bool {
+        self.last.get(key).is_some_and(|last| {
+            last.event == event
+                && last.subject.as_deref() == subject
+                && last.stamp.abs_diff(stamp) <= DUPLICATE_WINDOW_NS
+        })
+    }
+
+    /// Records an admitted report as the one [`OrderBook::repeats`] compares
+    /// the next against. Bounded like the rest of the book.
+    pub(crate) fn remember(
+        &mut self,
+        key: &str,
+        stamp: u64,
+        event: &'static str,
+        subject: Option<&str>,
+    ) {
+        if !self.last.contains_key(key) && self.last.len() >= ORDER_BOOK_CAP {
+            let oldest = self
+                .last
+                .iter()
+                .min_by_key(|(_, reported)| reported.stamp)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.last.remove(&oldest);
+            }
+        }
+        self.last.insert(
+            key.to_owned(),
+            Reported {
+                stamp,
+                event,
+                subject: subject.map(str::to_owned),
+            },
+        );
+    }
+
     /// Whether a report with `stamp` for `key` is current, and if so records it.
     pub(crate) fn admit(&mut self, key: &str, stamp: u64, ends_session: bool) -> bool {
         if let Some(&ended_at) = self.ended.get(key) {
@@ -302,9 +378,33 @@ impl Intake {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let ends = notice.event == Some("session_ended");
+        let subject = notice.subject.as_deref();
+        // One event, said by two hooks: the second is not a second report.
+        // Folded before it can restate a standing question or announce again,
+        // and answered as taken, because it was. Counted as the notices it
+        // folds into are: a banner has an outcome of its own, so a folded one
+        // is; a state or a resolution has none unless it is refused, so a
+        // folded one is not (the offered-and-accounted-for total holds).
+        if let Some(event) = notice.event {
+            if book.repeats(&notice.key, stamp, event, subject) {
+                // What it says about order still counts: a later stamp moves
+                // the session's high-water mark, so a report between the two
+                // copies is judged against it as it would have been.
+                let _ = book.admit(&notice.key, stamp, ends);
+                if notice.role() == super::bridge::Role::Banner {
+                    self.counters.coalesced.fetch_add(1, Ordering::Relaxed);
+                }
+                return Offer::Coalesced;
+            }
+        }
         if !book.admit(&notice.key, stamp, ends) {
             self.counters.stale.fetch_add(1, Ordering::Relaxed);
             return Offer::Stale;
+        }
+        // Remembered whatever the queue says: a full queue refuses the twin
+        // as it refused this one.
+        if let Some(event) = notice.event {
+            book.remember(&notice.key, stamp, event, subject);
         }
         self.enqueue(notice)
     }

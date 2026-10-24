@@ -43,6 +43,7 @@ use crate::harness::{self, PolicyStatus, ScopedVerdict};
 use crate::insights::{self, same_path, CollisionRisk, InsightsSnapshot};
 
 pub mod advisory_once;
+mod notify_input;
 pub mod signal_guard;
 
 /// Wall-clock ceiling for the work behind one hook invocation.
@@ -138,6 +139,42 @@ pub fn read_input(reader: impl std::io::Read + Send + 'static) -> Result<HookInp
     .ok_or_else(|| {
         "hook stdin deadline exceeded or reader could not run; no decision".to_string()
     })?
+}
+
+/// Reads the payload `subcommand` is about to judge, or none at all.
+///
+/// `notify` is a report, not a check, and the plugin runs it for every tool
+/// call of every Claude Code session on the machine, so it is the one
+/// subcommand that sometimes has nothing to say before it has seen stdin:
+/// an unknown event is an error whatever the payload, and a state or a
+/// resolution outside a GitPulse terminal is refused by the socket. Those
+/// read nothing (an empty input), and the host, finding the pipe closed,
+/// stops writing. What `notify` does read, it reads once, bounded, and keeps
+/// only the fields it uses ([`notify_input::read_notify_input`]).
+///
+/// Every other subcommand judges the call from the whole payload and reads it
+/// whole, within [`MAX_INPUT_BYTES`].
+pub fn read_for(
+    subcommand: &str,
+    argument: Option<&str>,
+    reader: impl std::io::Read + Send + 'static,
+) -> Result<HookInput, String> {
+    if subcommand != "notify" {
+        return read_input(reader);
+    }
+    if !notify_wants_input(argument) {
+        return Ok(HookInput::default());
+    }
+    notify_input::read_notify_input(reader, notify_input::MAX_READ_BYTES)
+}
+
+/// Whether a `notify` for `argument` has anything to read stdin for. See
+/// [`read_for`].
+fn notify_wants_input(argument: Option<&str>) -> bool {
+    match argument.and_then(crate::alerts::bridge::event) {
+        None => false,
+        Some(event) => event.role == crate::alerts::bridge::Role::Banner || session_env().is_some(),
+    }
 }
 
 /// Hard cap on the SessionStart brief, in bytes.
@@ -2474,6 +2511,8 @@ fn truncate_marked(mut text: String, limit: usize) -> String {
 
 #[cfg(test)]
 mod notify_adv_tests;
+#[cfg(test)]
+mod notify_input_tests;
 #[cfg(test)]
 mod notify_protocol_tests;
 #[cfg(test)]

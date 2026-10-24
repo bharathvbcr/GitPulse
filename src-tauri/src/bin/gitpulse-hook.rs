@@ -101,7 +101,12 @@ fn decide() {
     // decision from input we could not read would be the worst of both worlds:
     // neither a check that ran nor an admission that one did not. Exiting 0
     // with no stdout leaves the host's own permission flow exactly as it was.
-    let input = match hooks::read_input(io::stdin()) {
+    //
+    // `notify` takes the matcher's name as a second argument, because a
+    // `Notification` payload does not say which matcher routed it. It is taken
+    // first because it also decides whether stdin is read at all.
+    let argument = std::env::args().nth(2);
+    let input = match hooks::read_for(&subcommand, argument.as_deref(), io::stdin()) {
         Ok(input) => input,
         Err(error) => {
             log::warn!(target: "hook", "gitpulse-hook {subcommand}: {error}");
@@ -109,9 +114,6 @@ fn decide() {
         }
     };
 
-    // `notify` takes the matcher's name as a second argument, because a
-    // `Notification` payload does not say which matcher routed it.
-    let argument = std::env::args().nth(2);
     match hooks::dispatch(&subcommand, argument.as_deref(), &input) {
         Ok(output) => {
             // GitPulse injects the PreToolUse gates into every session it
