@@ -3,7 +3,7 @@
 //! parse `notify` used before the change; the differential tests hold the new
 //! reader to it.
 
-use super::notify_input::{read_notify_input, MAX_READ_BYTES};
+use super::notify_input::{read_notify_input, MAX_READ_BYTES, NOTIFY_READ_BUDGET};
 use super::*;
 use serde_json::json;
 use std::io::Cursor;
@@ -25,7 +25,7 @@ fn payload_of(total: usize) -> Vec<u8> {
         br#"{"session_id":"s-exact","tool_name":"Bash","tool_input":{"command":"ls"},"pad":""#;
     let tail = br#""}"#;
     let mut body = head.to_vec();
-    body.extend(std::iter::repeat(b'p').take(total - head.len() - tail.len()));
+    body.extend(std::iter::repeat_n(b'p', total - head.len() - tail.len()));
     body.extend_from_slice(tail);
     assert_eq!(body.len(), total);
     body
@@ -59,8 +59,11 @@ fn a_writer_that_dribbles_past_the_deadline_is_an_error_at_the_deadline() {
     let elapsed = started.elapsed();
     assert!(result.is_err(), "{result:?}");
     assert!(
-        elapsed < BUDGET + Duration::from_secs(2),
-        "took {elapsed:?} for a {BUDGET:?} budget"
+        elapsed
+            < crate::test_support::env::coverage_relaxed(
+                NOTIFY_READ_BUDGET + Duration::from_secs(2)
+            ),
+        "took {elapsed:?} for a {NOTIFY_READ_BUDGET:?} budget"
     );
 }
 
@@ -178,8 +181,8 @@ fn nesting_is_limited_the_same_way_and_never_overflows_the_stack() {
     ] {
         for depth in depths {
             let mut body = format!(r#"{{"tool_name":"Bash","{field}":"#).into_bytes();
-            body.extend(std::iter::repeat(b'[').take(depth));
-            body.extend(std::iter::repeat(b']').take(depth));
+            body.extend(std::iter::repeat_n(b'[', depth));
+            body.extend(std::iter::repeat_n(b']', depth));
             body.push(b'}');
             let (old, new) = (old_path_unbounded(&body), new_path(&body));
             if old.is_ok() != new.is_ok() {

@@ -208,18 +208,21 @@ fn an_empty_session_id_reads_no_stdin_and_does_not_block_the_writer() {
 fn a_banner_without_a_session_reads_a_bounded_amount_and_releases_the_writer() {
     let socket = Socket::start();
     let mut body = br#"{"cwd":"/c","message":"m","pad":""#.to_vec();
-    body.extend(std::iter::repeat(b'p').take(20 * 1024 * 1024));
+    body.extend(std::iter::repeat_n(b'p', 20 * 1024 * 1024));
     body.extend_from_slice(b"\"}");
     let ran = run(&socket, "permission_prompt", None, write_all(body));
     assert_eq!(ran.code, Some(0));
     assert!(ran.stdout.is_empty());
     assert!(ran.writer_finished, "the writer was left blocked");
-    assert!(ran.elapsed < Duration::from_secs(4), "{:?}", ran.elapsed);
+    assert!(
+        ran.elapsed < common::env::coverage_relaxed(Duration::from_secs(4)),
+        "{:?}",
+        ran.elapsed
+    );
 }
 
-/// A banner whose host dribbles stdin forever: the hook gives up inside its
-/// own 5 s budget with exit 0, quiet. (The plugin's timeout for these sync
-/// entries is also 5 s, so the host may cut it first.)
+/// A banner whose host dribbles stdin forever: the hook gives up at its read
+/// budget, a margin before the manifest's 5 s timeout, with exit 0, quiet.
 #[test]
 fn a_dribbling_writer_ends_in_a_quiet_exit_zero_inside_the_hook_timeout() {
     let socket = Socket::start();
@@ -235,8 +238,8 @@ fn a_dribbling_writer_ends_in_a_quiet_exit_zero_inside_the_hook_timeout() {
     assert_eq!(ran.code, Some(0));
     assert!(ran.stdout.is_empty());
     assert!(
-        ran.elapsed < Duration::from_millis(5_000),
-        "the hook ran {:?}, past the 5 s the manifest allows it",
+        ran.elapsed < common::env::coverage_relaxed(Duration::from_secs(3)),
+        "the hook ran {:?}, past the 3 s that leaves the host margin under its 5 s timeout",
         ran.elapsed
     );
 }
