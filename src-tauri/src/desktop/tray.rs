@@ -565,8 +565,10 @@ mod tests {
 
     #[test]
     fn the_tooltip_keeps_its_own_lines_and_drops_hidden_text_from_names() {
-        let mut state = MenuState::default();
-        state.tray_detail = "repo\u{202e}gnp.exe · main".into();
+        let mut state = MenuState {
+            tray_detail: "repo\u{202e}gnp.exe · main".into(),
+            ..MenuState::default()
+        };
         state.tray_summary.text = "Clean\u{2066}\nsecond line".into();
         assert_eq!(
             tray_tooltip(&state),
