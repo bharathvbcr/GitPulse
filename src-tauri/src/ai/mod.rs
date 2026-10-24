@@ -1498,7 +1498,6 @@ const LOCAL_SCAN_TIMEOUT_MS: i64 = 1_500;
 mod tests {
     use super::*;
 
-    #[path = "consent_adversarial_tests.rs"]
     mod consent_adversarial_tests;
     use crate::procguard::LockedSpawn;
     use std::sync::atomic::{AtomicUsize, Ordering};
