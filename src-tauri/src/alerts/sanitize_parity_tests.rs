@@ -30,7 +30,9 @@ fn sanitize_matches_the_unicode_derived_table_for_every_code_point() {
     let within = |rs: &[(u32, u32)], cp: u32| rs.iter().any(|(lo, hi)| cp >= *lo && cp <= *hi);
     let mut bad = Vec::new();
     for cp in 0..=0x10ffffu32 {
-        let Some(ch) = char::from_u32(cp) else { continue };
+        let Some(ch) = char::from_u32(cp) else {
+            continue;
+        };
         let got = sanitize(&format!("a{ch}b"));
         let kind = if got == "ab" {
             "drop"
@@ -63,7 +65,9 @@ fn sanitize_matches_the_unicode_derived_table_for_every_code_point() {
 #[test]
 fn printable_and_is_hidden_agree_with_sanitize_on_every_code_point() {
     for cp in 0..=0x10ffffu32 {
-        let Some(ch) = char::from_u32(cp) else { continue };
+        let Some(ch) = char::from_u32(cp) else {
+            continue;
+        };
         let s = ch.to_string();
         let removed = printable(&s, 8).is_empty();
         let collapsed = sanitize(&s).is_empty();

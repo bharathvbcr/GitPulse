@@ -1196,10 +1196,10 @@ mod intake_tests;
 #[cfg(all(test, unix))]
 mod intake_twin_attack_tests;
 #[cfg(test)]
+mod sanitize_parity_tests;
+#[cfg(test)]
 mod stress;
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod sanitize_parity_tests;
 #[cfg(test)]
 mod text_tests;
