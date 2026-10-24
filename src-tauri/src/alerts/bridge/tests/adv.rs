@@ -5,17 +5,6 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-fn cpu_time() -> Duration {
-    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
-    // SAFETY: `getrusage` fills the struct it is given.
-    let usage = unsafe {
-        libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr());
-        usage.assume_init()
-    };
-    let tv = |t: libc::timeval| Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1000);
-    tv(usage.ru_utime) + tv(usage.ru_stime)
-}
-
 /// Closes with a reset instead of a FIN.
 fn reset(stream: UnixStream) {
     use std::os::unix::io::AsRawFd;
@@ -188,23 +177,33 @@ fn an_emfile_storm_with_a_pending_connection_does_not_spin() {
     let dir = ShortDir::new("advemfile");
     apply_at(true, Some(dir.socket()));
     assert!(within(Duration::from_secs(5), || live_loops() == 1));
+    // Counted on this loop alone: accept attempts are the injected errors it
+    // consumed, poll wakes are this generation's own counter. Process CPU is
+    // not used, because any concurrent test's CPU would count against it. The
+    // baseline is taken while the loop is idle and before the connection that
+    // starts the storm, so a spin that eats all 4000 errors at once is seen.
     inject_accept_errors(&[libc::EMFILE; 4000]);
-    let _pending = UnixStream::connect(dir.socket()).unwrap();
-    std::thread::sleep(Duration::from_millis(100));
-    let before_cpu = cpu_time();
+    let before_wakes = loop_wakes();
     let before_left = injected_remaining();
     let started = Instant::now();
+    let _pending = UnixStream::connect(dir.socket()).unwrap();
     std::thread::sleep(Duration::from_secs(3));
-    let cpu = cpu_time() - before_cpu;
+    let wakes = loop_wakes() - before_wakes;
     let calls = before_left - injected_remaining();
     let wall = started.elapsed();
     apply_at(false, None);
-    eprintln!("EMFILE storm: {calls} accept attempts, {cpu:?} cpu in {wall:?}");
+    eprintln!("EMFILE storm: {calls} accept attempts, {wakes} poll wakes in {wall:?}");
+    // A loop that retried at its first backoff and never grew it would still
+    // stay under this; a spin does thousands per second.
+    let bound = 2 * wall.as_millis() as u64 / ACCEPT_BACKOFF_FIRST.as_millis() as u64;
     assert!(
-        calls < 40,
+        calls < 40 && calls as u64 <= bound,
         "{calls} accept attempts in {wall:?}: the loop is spinning"
     );
-    assert!(cpu < Duration::from_millis(150), "{cpu:?} cpu in {wall:?}");
+    assert!(
+        wakes <= bound,
+        "{wakes} poll wakes in {wall:?} (bound {bound}): the loop is spinning"
+    );
 }
 
 /// A full report with no half-close is dropped at the deadline and the peer
