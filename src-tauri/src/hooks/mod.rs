@@ -78,7 +78,34 @@ static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::n
 /// first instant. A process that never calls it (the unit tests, the library
 /// embedded elsewhere) is bounded by [`BUDGET`] per wait only.
 pub fn start_deadline() {
+    // The order stamp, taken before anything that can block or be slow: stdin
+    // is read after this, and a `PostToolUse` and the `Stop` that follows it
+    // differ by a few milliseconds that an unlucky read can reverse. It rides
+    // in a notify report as `seq`. See `alerts::bridge::order_for`.
+    #[cfg(unix)]
+    {
+        let _ = ENTRY_SEQ.set(crate::alerts::bridge::order_stamp_ns());
+    }
     let _ = STARTED.set(std::time::Instant::now());
+}
+
+/// When this process began, on the clock `alerts::bridge::order_stamp_ns`
+/// reads. Unset in anything that never called [`start_deadline`] (the unit
+/// tests, the library embedded elsewhere), whose reports then carry no `seq`.
+#[cfg(unix)]
+static ENTRY_SEQ: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// The `seq` a report carries: the entry stamp, when there is a usable one.
+/// Zero is what a failed clock reads as, and orders nothing.
+fn entry_seq() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        ENTRY_SEQ.get().copied().filter(|seq| *seq > 0)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 /// `budget`, cut to what is left of [`TOTAL_BUDGET`] since `started`.
@@ -2057,11 +2084,40 @@ fn ledger_brief(ledger: &crate::ledger::LedgerStatus) -> String {
     line
 }
 
-/// The most of an agent's own text one report carries. The socket refuses a
-/// report over [`crate::alerts::bridge::MAX_REPORT_BYTES`] whole, and the
-/// board shows a line of it, so a long final message must be cut here rather
-/// than cost the report.
+/// The most of an agent's own text one report carries. The board shows a line
+/// of it. Also cut to what the serialized report can hold; see
+/// [`clip_to_json`].
 const NOTIFY_MESSAGE_BYTES: usize = 1024;
+
+/// What `c` costs inside a JSON string, as `serde_json` writes it.
+fn json_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if c < ' ' => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// `text` cut at a character boundary to at most `raw` bytes and at most
+/// `json` bytes once serialized.
+///
+/// The socket refuses a report over [`crate::alerts::bridge::MAX_REPORT_BYTES`]
+/// whole, and escaping is what makes the serialized size differ from the raw
+/// one: 1024 bytes of U+001B serialize to 6144. Cutting by raw bytes alone
+/// therefore cost the whole report to a message that merely had a lot of
+/// control characters in it.
+fn clip_to_json(text: &str, raw: usize, json: usize) -> &str {
+    let mut raw_used = 0;
+    let mut json_used = 0;
+    for (index, c) in text.char_indices() {
+        raw_used += c.len_utf8();
+        json_used += json_len(c);
+        if raw_used > raw || json_used > json {
+            return &text[..index];
+        }
+    }
+    text
+}
 
 fn clip(text: &str, bytes: usize) -> &str {
     if text.len() <= bytes {
@@ -2092,14 +2148,34 @@ fn notify_payload(event: &crate::alerts::bridge::Event, input: &HookInput) -> St
         _ => "claude".to_string(),
     };
     let mut report = serde_json::Map::new();
-    report.insert("v".into(), json!(1));
+    report.insert("v".into(), json!(crate::alerts::bridge::PROTOCOL_VERSION));
     report.insert("event".into(), json!(event.name));
     report.insert("agent".into(), json!(agent));
     if let Some(session) = session_env() {
         report.insert("session".into(), json!(session));
     }
+    if let Some(seq) = entry_seq() {
+        report.insert("seq".into(), json!(seq));
+    }
+    if !input.tool_subject.is_empty() {
+        report.insert("subject".into(), json!(input.tool_subject));
+    }
+    if !input.agent_id.is_empty() {
+        report.insert("subagent".into(), json!(true));
+    }
+    // What is left once the fixed fields are in: the place and the message
+    // share it, the place first because it names the session and the message
+    // is the part that can be cut.
+    let cap = crate::alerts::bridge::MAX_REPORT_BYTES;
+    let serialized =
+        |report: &serde_json::Map<String, Value>| Value::Object(report.clone()).to_string().len();
     if !input.cwd.is_empty() && input.cwd.len() <= 4096 {
         report.insert("cwd".into(), json!(input.cwd));
+        if serialized(&report) > cap {
+            // Escaping alone can push a long path over the cap. The report is
+            // worth more than its place.
+            report.remove("cwd");
+        }
     }
     // What the agent said with it: the host's notification text, or for an
     // event that has none, the field that says the same thing.
@@ -2114,13 +2190,12 @@ fn notify_payload(event: &crate::alerts::bridge::Event, input: &HookInput) -> St
     .unwrap_or_default();
     // A resolution says nothing the board shows.
     if !message.is_empty() && event.role != crate::alerts::bridge::Role::Resolve {
-        report.insert("message".into(), json!(clip(message, NOTIFY_MESSAGE_BYTES)));
-    }
-    if !input.tool_subject.is_empty() {
-        report.insert("subject".into(), json!(input.tool_subject));
-    }
-    if !input.agent_id.is_empty() {
-        report.insert("subagent".into(), json!(true));
+        // `,"message":""` is what the key costs around the text.
+        let room = cap.saturating_sub(serialized(&report) + ",\"message\":\"\"".len());
+        let message = clip_to_json(message, NOTIFY_MESSAGE_BYTES, room);
+        if !message.is_empty() {
+            report.insert("message".into(), json!(message));
+        }
     }
     Value::Object(report).to_string()
 }
@@ -2156,22 +2231,69 @@ fn notify_send(path: &std::path::Path, payload: &str) -> Result<(), String> {
     acknowledged(&reply)
 }
 
-/// Whether the socket's one-line answer accepted the report.
+/// Whether the socket's one-line answer accepted the report, and if not, why in
+/// the socket's own terms.
+///
+/// An accepted report is `{"ok":true}` and nothing else. A refusal adds
+/// `reason`, one of [`crate::alerts::bridge::Reason`]'s tokens, and for a
+/// version the app does not speak `max_v`. An app that predates reasons sends a
+/// bare `{"ok":false}`, which is reported as exactly that: it names no version
+/// difference, because nothing in it says there is one.
 #[cfg(unix)]
 fn acknowledged(reply: &[u8]) -> Result<(), String> {
-    match serde_json::from_slice::<Value>(reply)
-        .ok()
+    let value = serde_json::from_slice::<Value>(reply).ok();
+    match value
+        .as_ref()
         .and_then(|value| value.get("ok").and_then(Value::as_bool))
     {
         Some(true) => Ok(()),
-        Some(false) => Err(
-            "GitPulse refused the report; this gitpulse-hook and the running app may be different versions"
-                .into(),
-        ),
+        Some(false) => Err(refusal_text(value.as_ref())),
         None => Err(format!(
             "GitPulse answered with something other than an acknowledgement: {:?}",
             String::from_utf8_lossy(reply)
         )),
+    }
+}
+
+/// What the hook says about a refusal. Versions are mentioned only for the
+/// refusal that is about them.
+#[cfg(unix)]
+fn refusal_text(reply: Option<&Value>) -> String {
+    use crate::alerts::bridge::{Reason, PROTOCOL_VERSION};
+    let Some(token) = reply
+        .and_then(|reply| reply.get("reason"))
+        .and_then(Value::as_str)
+    else {
+        return "GitPulse refused the report and gave no reason".into();
+    };
+    match Reason::from_token(token) {
+        Some(Reason::UnsupportedVersion) => {
+            let theirs = match reply
+                .and_then(|reply| reply.get("max_v"))
+                .and_then(Value::as_u64)
+            {
+                Some(max_v) => format!("the running app speaks protocol v{max_v} at most"),
+                None => "the running app did not say which protocol it speaks".to_owned(),
+            };
+            format!(
+                "GitPulse refused the report: {token} (this gitpulse-hook sends protocol v{PROTOCOL_VERSION}; {theirs})"
+            )
+        }
+        Some(known) => format!(
+            "GitPulse refused the report: {} ({})",
+            known.token(),
+            known.message()
+        ),
+        // A reason from an app newer than this hook. Shown as sent, minus
+        // anything that is not printable and past a length no token has.
+        None => format!(
+            "GitPulse refused the report: {}",
+            token
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(64)
+                .collect::<String>()
+        ),
     }
 }
 
@@ -2340,6 +2462,8 @@ fn truncate_marked(mut text: String, limit: usize) -> String {
     text
 }
 
+#[cfg(test)]
+mod notify_protocol_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

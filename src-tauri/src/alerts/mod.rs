@@ -26,9 +26,14 @@
 //! distinguishes working-as-intended from broken.
 
 pub mod bridge;
+mod intake;
 pub mod policy;
 pub mod scan;
 
+pub use intake::Offer;
+use intake::{BellGate, Intake};
+#[cfg(all(unix, test))]
+pub(crate) use intake::{OrderBook, ORDER_BOOK_CAP};
 use policy::Verdict;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -428,7 +433,8 @@ pub trait Host: Send + Sync + 'static {
 }
 
 struct Hub {
-    sender: mpsc::SyncSender<Notice>,
+    /// Every producer's way into the worker's queue. See [`Intake`].
+    intake: Intake,
     counters: Arc<Counters>,
     running: Arc<std::sync::atomic::AtomicBool>,
     /// The sessions the renderer last reported as on screen — plural, because
@@ -443,9 +449,6 @@ struct Hub {
     /// listening — at start-up, across a reload — is gone. This is what a
     /// page that has just started listening reads to catch up.
     standing: Arc<Mutex<Vec<StandingAttention>>>,
-    /// The newest accept stamp seen per hook session. See [`OrderBook`].
-    #[cfg(unix)]
-    order: Mutex<OrderBook>,
 }
 
 static HUB: OnceLock<Hub> = OnceLock::new();
@@ -456,27 +459,26 @@ fn hub() -> Option<&'static Hub> {
 
 /// Starts the delivery worker. Idempotent; a second call is a no-op.
 pub fn start(host: Arc<dyn Host>) {
-    let (sender, receiver) = mpsc::sync_channel(QUEUE);
     let counters = Arc::new(Counters::default());
+    let (intake, receiver) = Intake::channel(counters.clone());
+    let bells = intake.bells();
     let visible = Arc::new(Mutex::new(Vec::new()));
     let last_error = Arc::new(Mutex::new(None));
     let standing = Arc::new(Mutex::new(Vec::new()));
     let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let installed = Hub {
-        sender,
+        intake,
         counters: counters.clone(),
         running: running.clone(),
         visible,
         last_error: last_error.clone(),
         standing: standing.clone(),
-        #[cfg(unix)]
-        order: Mutex::new(OrderBook::default()),
     };
     if HUB.set(installed).is_err() {
         return;
     }
     match crate::supervisor::spawn_once("gitpulse-alerts", "notification worker", move || {
-        run(receiver, host, counters, last_error, standing)
+        run(receiver, bells, host, counters, last_error, standing)
     }) {
         Ok(_) => running.store(true, Ordering::SeqCst),
         Err(error) => {
@@ -493,99 +495,35 @@ pub fn start(host: Arc<dyn Host>) {
     }
 }
 
-/// Offers a notice to the worker without ever blocking the caller.
+/// Offers a notice to the worker without ever blocking the caller, and says
+/// what became of it.
 ///
 /// The callers are a PTY reader thread and a socket accept loop. Neither may
 /// wait on a notification: a reader that blocks stops draining the terminal,
 /// which is a visible hang for a feature nobody asked to be interrupted by.
-/// A full queue is counted and dropped.
+/// A full queue is counted and dropped, and so is a bell that only repeats one
+/// already queued; see [`Intake`] for the room reserved for hook reports.
+pub fn try_offer(notice: Notice) -> Offer {
+    match hub() {
+        Some(hub) => hub.intake.offer(notice),
+        None => Offer::NotRunning,
+    }
+}
+
+/// [`try_offer`] for a producer with no one to tell: the PTY readers, whose
+/// refusals are already counted in `dropped_queue` and `coalesced`.
 pub fn offer(notice: Notice) {
-    let Some(hub) = hub() else { return };
-    if hub.sender.try_send(notice).is_err() {
-        hub.counters.dropped_queue.fetch_add(1, Ordering::Relaxed);
-    }
+    let _ = try_offer(notice);
 }
 
-/// Offers a hook report together with the stamp it was given at accept
-/// ([`bridge::order_stamp_ns`]).
-///
-/// The bridge reads connections in parallel, so two reports from one session
-/// that arrive back to back can reach here in either order, and a late
-/// `tool_finished` erases the "Finished" a `turn_finished` just set. The stamp
-/// is the order they arrived in; a report older than the newest one already
-/// seen for its session is dropped and counted as `stale`, never applied late
-/// and never waited for.
+/// Offers a hook report together with the stamp that orders it among its
+/// session's reports ([`bridge::order_stamp_ns`]; a report's own `seq` when it
+/// carries one). See [`Intake::offer_stamped`].
 #[cfg(unix)]
-pub(crate) fn offer_stamped(notice: Notice, stamp: u64) {
-    let Some(hub) = hub() else { return };
-    // The check, the high-water update and the hand-off to the queue are one
-    // step under the lock, so no report with a lower stamp can slip in between
-    // a higher one being admitted and queued.
-    let mut book = hub
-        .order
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let ends = notice.event == Some("session_ended");
-    if !book.admit(&notice.key, stamp, ends) {
-        hub.counters.stale.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    if hub.sender.try_send(notice).is_err() {
-        hub.counters.dropped_queue.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-/// Most sessions the order book remembers. The same bound as the notifier's
-/// own tracking, which is what a report is about to be tracked against.
-#[cfg(unix)]
-pub(crate) const ORDER_BOOK_CAP: usize = MAX_TRACKED;
-
-/// The newest accept stamp admitted per session key.
-///
-/// Every report the bridge offers is state-bearing: each event in
-/// [`bridge::EVENTS`] is a banner (`permission_prompt`, `idle_prompt`,
-/// `agent_needs_input`, `agent_completed`, the two elicitation dialogs,
-/// `error`), a state (`permission_request`, `turn_finished`) or a resolution
-/// (`prompt_submitted`, `tool_finished`, `session_ended`). Bells carry no
-/// stamp and never come through here, nor does the renderer's own
-/// `answered`.
-///
-/// Bounded two ways: a session's entry goes when its `session_ended` is
-/// admitted, and the map never holds more than [`ORDER_BOOK_CAP`] entries, the
-/// one with the oldest stamp making room for a new session. Forgetting a
-/// session costs at most one reordered report for it.
-#[cfg(unix)]
-#[derive(Default)]
-struct OrderBook {
-    newest: HashMap<String, u64>,
-}
-
-#[cfg(unix)]
-impl OrderBook {
-    /// Whether a report with `stamp` for `key` is current, and if so records it.
-    fn admit(&mut self, key: &str, stamp: u64, ends_session: bool) -> bool {
-        if let Some(newest) = self.newest.get_mut(key) {
-            if stamp < *newest {
-                return false;
-            }
-            *newest = stamp;
-        } else {
-            if self.newest.len() >= ORDER_BOOK_CAP {
-                let oldest = self
-                    .newest
-                    .iter()
-                    .min_by_key(|(_, seen)| **seen)
-                    .map(|(key, _)| key.clone());
-                if let Some(oldest) = oldest {
-                    self.newest.remove(&oldest);
-                }
-            }
-            self.newest.insert(key.to_owned(), stamp);
-        }
-        if ends_session {
-            self.newest.remove(key);
-        }
-        true
+pub(crate) fn offer_stamped(notice: Notice, stamp: u64) -> Offer {
+    match hub() {
+        Some(hub) => hub.intake.offer_stamped(notice, stamp),
+        None => Offer::NotRunning,
     }
 }
 
@@ -594,12 +532,13 @@ impl OrderBook {
 /// The renderer clears its own pane at once; this tells the worker, so the
 /// question is not replayed to the next page that asks what stands, a banner
 /// still waiting out its window is not shown, and one already shown is taken
-/// down. Returns false for a key that cannot be a session.
-pub fn answered(session: &str) -> bool {
+/// down. Fails for a key that cannot be a session, and for an answer the
+/// worker did not take.
+pub fn answer(session: &str) -> Result<(), &'static str> {
     if !bridge::valid_key(session) {
-        return false;
+        return Err("Not a terminal session id.");
     }
-    offer(Notice {
+    let taken = try_offer(Notice {
         key: session.to_owned(),
         origin: Origin::Reader,
         label: String::new(),
@@ -610,8 +549,19 @@ pub fn answered(session: &str) -> bool {
         channel: "reader",
         subject: None,
         subagent: false,
-    });
-    true
+    })
+    .taken();
+    if taken {
+        Ok(())
+    } else {
+        Err("The notifier did not take the answer; its queue is full or it is not running.")
+    }
+}
+
+/// [`answer`] as a yes or no: false for a key that cannot be a session and for
+/// an answer that was dropped.
+pub fn answered(session: &str) -> bool {
+    answer(session).is_ok()
 }
 
 /// What every agent session in a GitPulse terminal stands asking for now.
@@ -846,6 +796,7 @@ impl Bucket {
 
 fn run(
     receiver: mpsc::Receiver<Notice>,
+    bells: Arc<BellGate>,
     host: Arc<dyn Host>,
     counters: Arc<Counters>,
     last_error: Arc<Mutex<Option<String>>>,
@@ -864,6 +815,8 @@ fn run(
         let closed = matches!(received, Err(mpsc::RecvTimeoutError::Disconnected));
         let now = Instant::now();
         if let Ok(notice) = received {
+            // Off the queue, so the next identical bell may be queued.
+            bells.release(&notice);
             if let Some(last) = admit(notice, now, &mut tracked, &counters) {
                 host.announce(&last);
             }
@@ -1233,6 +1186,8 @@ fn prune(now: Instant, tracked: &mut HashMap<String, Tracked>) {
     });
 }
 
+#[cfg(all(test, unix))]
+mod intake_tests;
 #[cfg(test)]
 mod stress;
 #[cfg(test)]

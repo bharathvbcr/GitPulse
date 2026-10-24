@@ -60,8 +60,10 @@ fn notice(key: &str, channel: &'static str) -> Notice {
 /// Runs the real worker loop over a bounded stream of notices and returns the
 /// counters it produced, with the queue depth it actually needed.
 fn drive(offered: Vec<Notice>, threads: usize) -> (SessionAlertStatus, usize) {
-    let (sender, receiver) = mpsc::sync_channel(QUEUE);
     let counters = Arc::new(Counters::default());
+    let (intake, receiver) = Intake::channel(counters.clone());
+    let bells = intake.bells();
+    let intake = Arc::new(intake);
     let last_error = Arc::new(Mutex::new(None));
     let host: Arc<dyn Host> = Arc::new(Sink {
         delivered: Mutex::new(Vec::new()),
@@ -72,11 +74,10 @@ fn drive(offered: Vec<Notice>, threads: usize) -> (SessionAlertStatus, usize) {
             ..SessionAlertSettings::default()
         },
     });
-    let dropped = Arc::new(AtomicU64::new(0));
     let worker = {
         let counters = counters.clone();
         let last_error = last_error.clone();
-        std::thread::spawn(move || run(receiver, host, counters, last_error, Arc::default()))
+        std::thread::spawn(move || run(receiver, bells, host, counters, last_error, Arc::default()))
     };
 
     let work: Vec<Vec<Notice>> = offered
@@ -85,14 +86,11 @@ fn drive(offered: Vec<Notice>, threads: usize) -> (SessionAlertStatus, usize) {
         .collect();
     let mut handles = Vec::new();
     for chunk in work {
-        let sender = sender.clone();
-        let dropped = dropped.clone();
+        let intake = intake.clone();
         handles.push(std::thread::spawn(move || {
             for notice in chunk {
                 // Exactly what `offer` does, including its refusal to block.
-                if sender.try_send(notice).is_err() {
-                    dropped.fetch_add(1, Ordering::Relaxed);
-                }
+                intake.offer(notice);
             }
         }));
     }
@@ -100,7 +98,7 @@ fn drive(offered: Vec<Notice>, threads: usize) -> (SessionAlertStatus, usize) {
         handle.join().unwrap();
     }
     // Closing the channel ends the loop once it has drained what it holds.
-    drop(sender);
+    drop(intake);
     worker.join().unwrap();
 
     let c = &counters;
@@ -116,11 +114,11 @@ fn drive(offered: Vec<Notice>, threads: usize) -> (SessionAlertStatus, usize) {
         displaced: c.displaced.load(Ordering::Relaxed),
         rate_limited: c.rate_limited.load(Ordering::Relaxed),
         deferred: c.deferred.load(Ordering::Relaxed),
-        dropped_queue: dropped.load(Ordering::Relaxed),
+        dropped_queue: c.dropped_queue.load(Ordering::Relaxed),
         dropped_scan: 0,
         failed: c.failed.load(Ordering::Relaxed),
         bridge_rejected: 0,
-        stale: 0,
+        stale: c.stale.load(Ordering::Relaxed),
         bridge_listening: false,
         bridge_path: None,
         last_error: None,
@@ -561,5 +559,147 @@ fn a_fleet_doing_everything_at_once_keeps_every_promise() {
                 "seed {seed}: a fleet past the bound displaced nothing, so eviction was not exercised"
             );
         }
+    }
+}
+
+// ---- The same fleet, with its hook reports arriving out of order ------------
+//
+// The fleet above feeds the worker's decisions directly. This one goes in at
+// the door every hook report uses (`Intake::offer_stamped`) with each report
+// carrying the stamp its hook took, delivered in a shuffled order: neighbours
+// swapped, and a few held back a long way. An independent model of the order
+// rule says which reports are stale; the intake must agree on every one, and
+// the totals must still reconcile with `accounted()`.
+
+#[cfg(unix)]
+#[test]
+fn a_fleet_whose_reports_arrive_out_of_order_still_accounts_for_every_one() {
+    use std::collections::HashSet;
+    for seed in [3u64, 11, 0x5eed] {
+        let mut rng = Rng(seed);
+        let sessions = 24u64;
+        let total = 6_000usize;
+        // What happened, in the order it happened: (stamp, session, event).
+        let happened: Vec<(u64, String, &'static bridge::Event)> = (0..total)
+            .map(|at| {
+                let session = format!("term-{}", 2 + rng.below(sessions));
+                let event = &bridge::EVENTS[rng.below(bridge::EVENTS.len() as u64) as usize];
+                (at as u64 + 1, session, event)
+            })
+            .collect();
+        // What arrived, in the order it arrived.
+        let mut arrival: Vec<usize> = (0..total).collect();
+        for at in 0..total - 1 {
+            if rng.below(4) == 0 {
+                arrival.swap(at, at + 1);
+            }
+        }
+        for at in (0..total - 24).step_by(37) {
+            arrival.swap(at, at + 1 + rng.below(23) as usize);
+        }
+        assert_ne!(
+            arrival,
+            (0..total).collect::<Vec<_>>(),
+            "the shuffle left everything in order"
+        );
+
+        // The order rule, stated again from its description rather than copied
+        // from `OrderBook`: a report older than the newest for its session is
+        // stale; one older than the session's end is stale; a session that
+        // ended and is heard from again after its end is a new run.
+        let mut newest: HashMap<String, u64> = HashMap::new();
+        let mut ended: HashMap<String, u64> = HashMap::new();
+        let mut model_stale = HashSet::new();
+        for &index in &arrival {
+            let (stamp, session, event) = &happened[index];
+            let behind_end = ended.get(session).is_some_and(|end| stamp < end);
+            let behind_newest = newest.get(session).is_some_and(|seen| stamp < seen);
+            if behind_end || behind_newest {
+                model_stale.insert(index);
+                continue;
+            }
+            ended.remove(session);
+            newest.insert(session.clone(), *stamp);
+            if event.name == "session_ended" {
+                ended.insert(session.clone(), newest.remove(session).unwrap_or(*stamp));
+            }
+        }
+        assert!(
+            model_stale.len() > total / 50,
+            "seed {seed}: only {} reports were stale, so ordering was barely exercised",
+            model_stale.len()
+        );
+
+        let counters = Arc::new(Counters::default());
+        let (intake, receiver) = Intake::channel(counters.clone());
+        let bells = intake.bells();
+        let host: Arc<dyn Host> = Arc::new(Sink {
+            delivered: Mutex::new(Vec::new()),
+            config: SessionAlertSettings {
+                enabled: true,
+                ..SessionAlertSettings::default()
+            },
+        });
+        let worker = {
+            let (counters, host) = (counters.clone(), host.clone());
+            std::thread::spawn(move || {
+                run(
+                    receiver,
+                    bells,
+                    host,
+                    counters,
+                    Arc::default(),
+                    Arc::default(),
+                )
+            })
+        };
+        let mut banners = 0u64;
+        let mut non_banners_lost = 0u64;
+        for &index in &arrival {
+            let (stamp, session, event) = &happened[index];
+            let json = format!(
+                r#"{{"v":1,"event":"{}","agent":"claude","session":"{session}"}}"#,
+                event.name
+            );
+            let (notice, _) = bridge::parse_report_stamped(json.as_bytes()).unwrap();
+            let offer = intake.offer_stamped(notice, *stamp);
+            assert_eq!(
+                offer == Offer::Stale,
+                model_stale.contains(&index),
+                "seed {seed}: report {index} ({} for {session} at {stamp}) disagrees with the model: {offer:?}",
+                event.name
+            );
+            if event.role == bridge::Role::Banner {
+                banners += 1;
+            } else if !offer.taken() {
+                non_banners_lost += 1;
+            }
+        }
+        drop(intake);
+        worker.join().unwrap();
+        let c = &counters;
+        let status = SessionAlertStatus {
+            delivered: c.delivered.load(Ordering::Relaxed),
+            suppressed_disabled: c.suppressed_disabled.load(Ordering::Relaxed),
+            suppressed_not_agent: c.suppressed_not_agent.load(Ordering::Relaxed),
+            suppressed_attended: c.suppressed_attended.load(Ordering::Relaxed),
+            suppressed_quiet: c.suppressed_quiet.load(Ordering::Relaxed),
+            coalesced: c.coalesced.load(Ordering::Relaxed),
+            resolved: c.resolved.load(Ordering::Relaxed),
+            displaced: c.displaced.load(Ordering::Relaxed),
+            rate_limited: c.rate_limited.load(Ordering::Relaxed),
+            failed: c.failed.load(Ordering::Relaxed),
+            dropped_queue: c.dropped_queue.load(Ordering::Relaxed),
+            stale: c.stale.load(Ordering::Relaxed),
+            ..SessionAlertStatus::default()
+        };
+        assert_eq!(status.stale, model_stale.len() as u64, "seed {seed}");
+        // A banner ends in exactly one outcome, whatever became of it; a state
+        // or a resolution has no outcome of its own, so only losing one shows.
+        assert_eq!(
+            accounted(&status),
+            banners + non_banners_lost,
+            "seed {seed}: a report went unaccounted for: {status:?}"
+        );
     }
 }
