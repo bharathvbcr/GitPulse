@@ -359,3 +359,51 @@ The drift fixes are in 68ef1882. Re-run on that tree: supervised_threads 9/9, do
   - `entity_collision::the_join_over_256…`;
   - `git_reader` `a_carried_answer_is_not_spent_against_the_time_budget` and `adv_l4` torn-answer (both fail on base too).
 - Carried from wave 5: the reinstall (after the Jarvis re-pin), the Manvi half of ft-329789a9, ft-92734a91 and ft-b595921a (owner decisions), the terminal-side cards (waiting on `term/integrate`), and ft-cc4be67b (needs a quiet host).
+
+---
+
+# Wave 6, part 2 (2026-10-23 to 2026-10-24)
+
+**State.**
+- **Merged:** three lanes, each fast-forwarded on its own after a full gate:
+  - W6-L3 → `1900229e` (gate 10);
+  - W6-L5 → `08875ad4` (gate 11);
+  - W6-L6 → `4b640edd` (gate 12).
+- Nothing is pushed. The installed binaries are still not reinstalled; that waits on the Jarvis re-pin.
+- **Held files are now checked mechanically.** `tmp/build-1020/held-check.sh` intersects each lane's diff with `term-files.txt` before integration.
+  - It refused W6-L3's `lib.rs` edit, which moved to `engine::sqlite_wal`.
+  - It deferred one W6-L5 item, because `SettingsModal.svelte` is held.
+  - Earlier waves had already changed 5 held files on main. The term/integrate handoff (`tmp/build-1020/term-integrate-conflicts.md`) lists them, along with how to resolve each.
+
+**Coordinator rulings (Fable authority):**
+- No `cfg(test)` forks of production timing or caching. Isolating a global per test thread is allowed.
+- An unreadable location is never `ReclaimSafety::Safe`.
+- Any subtree that was not counted marks a storage total as partial.
+- Multi-threaded tests: the test thread holds `retention()` and then `env_serial()` across spawn and join, and the children stay lock-free. `tests/lock_order.rs` lints this order.
+
+## Cards moved to review
+
+| Card | What landed | Adversarial history |
+|---|---|---|
+| **ft-eb5034ce** churn WAL switch, plus **ft-fbd79cba** residue | One owner for the WAL switch, `engine::sqlite_wal::enter_wal`: ledger patience 10 s, churn 2 s. Patience is now a total bound, with busy_timeout at 0 during the switch and restored on every path. The churn `ensure_schema` runs in one IMMEDIATE transaction, which was the second root cause. `OpenError::Busy` keeps the cache. The ownership deadline is a constant with a per-thread test override. | 2 rounds. Breaks found: the production ownership deadline could not be tested (a cfg fork), and busy_timeout stacked on top of the patience, a worst case of about 15 s against the stated 10 s. Both fixed. The ref_cache premise was refuted. |
+| **ft-eeb28bf6** storage partial totals, mcp_info | `WalkBudget` owns walker errors: unreadable and non-UTF-8 entries are counted, and `ScanStats.unaudited` is added. Paths stay `OsString`, so labels are never used as git paths. An unreadable gitdir is never offered as Safe to reclaim. The orphan audit's ordering bug is fixed. `mcp_info` carries `plugin_error`. | 9 breaks. **HIGH:** an unreadable gitdir was offered as Safe to reclaim. The others: an orphan cap with no notice, EACCES not marked partial, a missing root reported complete, a non-UTF-8 label used as a git path, a double count, a false error for an optional hooks.json, and silent count-objects/tracked/canonicalize arms. 8 fixed. The Settings display of `plugin_error` is deferred, because SettingsModal is held (see the handoff). |
+| **ft-d31af555** wave-6 load flakes and wall-clock bounds | Root cause: the user-level mailmap test rebound `HOME` for seconds without the environment lock, so neighbours missed their stored answers or read a mailmap they never wrote. Fixes: `unhurried()` and churn's `UseStore` hold the env lock; there is one injectable `Bound` seam for the three wall-clock bounds (the shipped constants are unchanged and asserted as literals); the mailmap test gets per-run temp files; git_reader fixtures read the pinned hermetic config; the entity_collision join is timed on thread CPU; the adversarial_repos spawn gate is unlimited; `supervised_threads::is_test_file` is exact. | 1 round, 4 breaks, all fixed. `sixteen_threads` called `unbounded()` without the env lock (7 lookups against 1). The `l4` tolerance admitted a transient +2; the test now checks every row against states the writer actually published, and a planted +2 fails it. The `test_support` prefix match was too loose. The constants test compared constants with themselves. Held: lock order, the seam being a no-op in production, the mailmap test, and the unmetered spawns. The mix battery went from 0/100 on base to 110/110 in round 1 and 50/50 under 40 CPU hogs in round 2. |
+
+## Gates (verified)
+
+- **Gate 10** (`1900229e`): all steps green.
+- **Gate 11** (`08875ad4`): green after one drift fix. The str tail-slice guard flagged a `Vec<Component>` slice in `storage/mod.rs`, which is now allow-listed. A docs 200 ms timing test failed at load 100 and passes alone.
+- **Gate 12** (`4b640edd`): fmt, clippy `-D warnings`, cargo `--tests --no-fail-fast` (130 suites, 0 failures; no load flake this time), `bun run check`, `check:types`, `check:ipc`, `check:vendor-schema` all OK. vitest **10855 passed, 0 failed**. `check:schema-parity`: the same expected stale rows (installed gitpulse-mcp and app at dc-store 9, Jarvis pin), and devmap does not report devmap-extract.
+
+## Still open
+
+- The reinstall, after Jarvis is re-pinned.
+- The term/integrate handoff: 5 held-file conflicts, plus the SettingsModal `plugin_error` display (its test is in `21607735`).
+- `ScanStats` is not in a check:types contract, because the script is held. The TS mirror was checked by hand only.
+- 21 integration suites still lack the unmetered spawn call. Only adversarial_repos was switched.
+- The env.rs `EnvBinding` fix (env.rs is held).
+- Carried from earlier waves:
+  - the Manvi half of ft-329789a9;
+  - ft-92734a91 and ft-b595921a, which are owner decisions;
+  - the terminal-side cards;
+  - ft-cc4be67b, which needs a quiet host.
