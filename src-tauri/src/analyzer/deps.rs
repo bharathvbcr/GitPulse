@@ -8967,3 +8967,7 @@ mod fail_closed_tests {
         assert!(!user_config_referenced_vars(&env_view).contains(&"GITHUB_TOKEN".to_string()));
     }
 }
+
+#[cfg(test)]
+#[path = "registry_refusal_adversarial_tests.rs"]
+mod registry_refusal_adversarial_tests;

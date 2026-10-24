@@ -13357,3 +13357,7 @@ mod qos_band_tests {
         .expect("qos thread");
     }
 }
+
+#[cfg(test)]
+#[path = "scrubbed_env_adversarial_tests.rs"]
+mod scrubbed_env_adversarial_tests;
