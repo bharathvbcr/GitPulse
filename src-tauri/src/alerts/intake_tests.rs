@@ -406,7 +406,15 @@ fn bells_leave_the_reserved_slots_to_hook_reports() {
     let accepted_bells = (0..500)
         .filter(|n| intake.offer(bell(&format!("term-{n}"))) == Offer::Accepted)
         .count();
+    // The contract is at least this many slots kept back, stated here as a
+    // number so that shrinking the reservation fails this test rather than
+    // moving the goalposts with it.
+    const AT_LEAST_RESERVED: usize = 16;
     assert_eq!(accepted_bells, intake::BELL_SLOTS);
+    assert!(
+        intake::RESERVED_SLOTS >= AT_LEAST_RESERVED && accepted_bells <= QUEUE - AT_LEAST_RESERVED,
+        "bells took {accepted_bells} of {QUEUE} slots"
+    );
     assert_eq!(
         counters.dropped_queue.load(Ordering::Relaxed),
         (500 - intake::BELL_SLOTS) as u64
