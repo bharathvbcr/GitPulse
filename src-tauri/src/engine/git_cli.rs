@@ -2191,7 +2191,9 @@ fn scrubbed_env_allows(name: &str) -> bool {
 /// everything the builder set explicitly (PATH, the git pins, `extra_env`).
 /// A variable the builder explicitly removed stays removed. `also_allowed`
 /// names further inherited variables to keep (the ones the user's own npm
-/// config references).
+/// config references). This form keeps only the fixed allowlist; production
+/// goes through [`restrict_env_to_allowlist_plus`].
+#[cfg(test)]
 fn restrict_env_to_allowlist<I>(cmd: &mut Command, inherited: I, home: Option<&std::ffi::OsStr>)
 where
     I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,

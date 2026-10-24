@@ -413,7 +413,7 @@ fn serves_selected_model(selection: &AiSelection) -> bool {
         return true;
     }
     let endpoint = discovery::list_models(&selection.base_url);
-    endpoint.reachable && endpoint.models.iter().any(|m| *m == selection.model)
+    endpoint.reachable && endpoint.models.contains(&selection.model)
 }
 
 /// A persisted selection is a statement about a server that may since have quit
@@ -467,17 +467,6 @@ fn test_url_is_trusted(url: &str) -> bool {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .any(|trusted| trusted == url)
-}
-
-/// Records `selection` as just verified, for a test whose fake server answers
-/// exactly one request and so cannot also answer the check.
-#[cfg(test)]
-fn mark_selection_verified_in_test(selection: &AiSelection) {
-    VERIFIED_SELECTIONS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(selection_key(selection), Instant::now());
 }
 
 /// The one gate between "a model server is running" and "send it the diff".
