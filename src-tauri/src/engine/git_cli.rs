@@ -2189,9 +2189,24 @@ fn scrubbed_env_allows(name: &str) -> bool {
 
 /// Replaces `cmd`'s environment with the allowlisted part of `inherited` plus
 /// everything the builder set explicitly (PATH, the git pins, `extra_env`).
-/// A variable the builder explicitly removed stays removed.
+/// A variable the builder explicitly removed stays removed. `also_allowed`
+/// names further inherited variables to keep (the ones the user's own npm
+/// config references).
 fn restrict_env_to_allowlist<I>(cmd: &mut Command, inherited: I, home: Option<&std::ffi::OsStr>)
 where
+    I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+{
+    restrict_env_to_allowlist_plus(cmd, inherited, home, &[]);
+}
+
+/// [`restrict_env_to_allowlist`] that also keeps the inherited variables named
+/// in `also_allowed`.
+fn restrict_env_to_allowlist_plus<I>(
+    cmd: &mut Command,
+    inherited: I,
+    home: Option<&std::ffi::OsStr>,
+    also_allowed: &[String],
+) where
     I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 {
     let mut explicit = Vec::new();
@@ -2204,7 +2219,9 @@ where
     }
     cmd.env_clear();
     for (key, value) in inherited {
-        let allowed = key.to_str().is_some_and(scrubbed_env_allows);
+        let allowed = key.to_str().is_some_and(|name| {
+            scrubbed_env_allows(name) || also_allowed.iter().any(|n| n == name)
+        });
         if allowed && !removed.contains(&key) {
             cmd.env(key, value);
         }
@@ -2231,9 +2248,10 @@ pub(crate) fn capture_command_scrubbed(
     path_var: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
     source: PathSource,
+    also_allowed: &[String],
 ) -> Result<CapturedOutput, String> {
     let mut cmd = build_capture_command_in(program, args, cwd, extra_env, path_var, home, source);
-    restrict_env_to_allowlist(&mut cmd, std::env::vars_os(), home);
+    restrict_env_to_allowlist_plus(&mut cmd, std::env::vars_os(), home, also_allowed);
     let out = run_bounded(cmd, program, timeout, None)?.require_complete(program)?;
     Ok(CapturedOutput {
         stdout: out.stdout,
@@ -11368,7 +11386,12 @@ mod tests {
         .map(|(k, v)| (OsString::from(k), OsString::from(v)));
         let mut cmd = Command::new("true");
         cmd.env("EXPLICIT", "yes").env_remove("PATH");
-        restrict_env_to_allowlist(&mut cmd, inherited, Some(std::ffi::OsStr::new("/h")));
+        restrict_env_to_allowlist_plus(
+            &mut cmd,
+            inherited,
+            Some(std::ffi::OsStr::new("/h")),
+            &["MY_API_KEY".to_string()],
+        );
         let seen: std::collections::BTreeMap<String, Option<String>> = cmd
             .get_envs()
             .map(|(k, v)| {
@@ -11381,7 +11404,7 @@ mod tests {
         let names: Vec<&str> = seen.keys().map(String::as_str).collect();
         assert_eq!(
             names,
-            ["EXPLICIT", "HOME", "HTTPS_PROXY", "LC_ALL"],
+            ["EXPLICIT", "HOME", "HTTPS_PROXY", "LC_ALL", "MY_API_KEY"],
             "{seen:?}"
         );
         // A PATH the builder removed is not resurrected from the inherited one.
