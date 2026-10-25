@@ -3579,7 +3579,7 @@ release pipeline that can finish after GitHub detaches a draft tag.
 - Add real Git regressions, Tauri IPC round trips, clone races, bounded batch
   stress, and stash overflow tests. Gate the expanded Git-client browser harness
   in local CI and the Chrome/WebKit workflow.
-- See [the release audit](docs/archive/GIT_CLIENT_RELEASE_AUDIT.md) for measured
+- See [the release audit](https://github.com/bharathvbcr/GitPulse/blob/16483b7de2b5c74003c7e7af046f7142ece7699b/docs/archive/GIT_CLIENT_RELEASE_AUDIT.md) for measured
   results, inherited work, security impact, evidence limits, and remaining
   release gates.
 

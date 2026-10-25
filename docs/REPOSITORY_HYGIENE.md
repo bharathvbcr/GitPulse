@@ -263,7 +263,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib \
 
 ### Audit and verification
 
-See [the archived implementation audit](archive/REPOSITORY_HYGIENE_AUDIT.md) for reproduced
+See [the archived implementation audit](https://github.com/bharathvbcr/GitPulse/blob/16483b7de2b5c74003c7e7af046f7142ece7699b/docs/archive/REPOSITORY_HYGIENE_AUDIT.md) for reproduced
 failures, fixes, test evidence and remaining platform/install gates. A passing
 fixture or mocked IPC test is not proof of unattended operation in an installed
 application. No existing user cache was removed or cleanup schedule enabled

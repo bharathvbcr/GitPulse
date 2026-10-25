@@ -1,6 +1,6 @@
 # Dependency health — 2026-09-10
 
-Current follow-up: [2026-09-13 remediation and all 57 candidate references](DEPENDENCY_HEALTH_2026-09-13.md).
+Current follow-up: [2026-09-13 remediation and all 57 candidate references](https://github.com/bharathvbcr/GitPulse/blob/16483b7de2b5c74003c7e7af046f7142ece7699b/docs/DEPENDENCY_HEALTH_2026-09-13.md).
 CI and release hardening, and the latest framework port re-check:
 [2026-10-08](#ci-and-release-hardening--2026-10-08).
 Lucide is now 1.45.0; the dated results below describe the earlier migration.

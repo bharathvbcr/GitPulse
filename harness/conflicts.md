@@ -33,5 +33,5 @@ cargo test --manifest-path src-tauri/Cargo.toml --test conflict_hardening --test
 Browser fixtures do not prove IPC delivery or the installed Tauri application's
 behavior. This preview performs no writes to a real Git repository.
 WebKit uses the system WKWebView; the fixture flushes browser tasks without
-depending on background timer rates. See [the archived audit](../docs/archive/CONFLICT_RESOLUTION_AUDIT.md)
+depending on background timer rates. See [the archived audit](https://github.com/bharathvbcr/GitPulse/blob/16483b7de2b5c74003c7e7af046f7142ece7699b/docs/archive/CONFLICT_RESOLUTION_AUDIT.md)
 for native evidence and platform limits.

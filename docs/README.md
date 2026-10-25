@@ -58,7 +58,8 @@ local-first desktop workspace with 18 specialized sections across 4 views. This 
 [Open qualification](QUALIFICATION.md) tracks remaining verification gates.
 The [agentic workspace plan](AGENTIC_WORKSPACES_PLAN.md) is an implementation
 and acceptance ledger: a planned item is not a shipped capability. Dated audits,
-benchmarks, and migration records live in the [archive](archive/README.md).
+benchmarks, and migration records are not kept on `main`; they are preserved at
+[commit 16483b7d](https://github.com/bharathvbcr/GitPulse/blob/16483b7de2b5c74003c7e7af046f7142ece7699b/docs/archive/README.md).
 [Archive separation](ARCHIVE_SEPARATION.md) explains that boundary.
 
 Use user guides for current workflows and architecture for implementation

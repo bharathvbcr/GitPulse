@@ -57,7 +57,8 @@ not published upstream releases.
   `C-unwind` ABI so native AppKit exceptions can reach AppKit's event handler.
   `native_event_unwind` exercises both real callbacks with injected Objective-C
   exceptions, normal forwarding, and subsequent dispatch. See
-  `../../docs/archive/DIAGNOSTICS_HARDENING.md` for the crash evidence and limits.
+  [DIAGNOSTICS_HARDENING.md](https://github.com/bharathvbcr/GitPulse/blob/16483b7de2b5c74003c7e7af046f7142ece7699b/docs/archive/DIAGNOSTICS_HARDENING.md)
+  (archived at commit 16483b7d) for the crash evidence and limits.
 - The macOS platform modules of WRY and TAO carry the same scoped lint
   allows the GTK consumers already had. Muda 0.20 adopted the current bindings
   and builds without warnings in both profiles, so its allow was retired with

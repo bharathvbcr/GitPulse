@@ -72,6 +72,18 @@ rust-coverage-summary.txt
 /docs/assets/*.fig
 /docs/assets/*.ai
 /docs/assets/*.xcf
+# Dated audits and snapshots; history up to 16483b7d still has them
+/docs/archive/
+/docs/DEPENDENCY_HEALTH_20*.md
+
+# Session audit, build, branch and release reports, and idea dumps
+/AUDIT_REPORT*.md
+/BRANCH_REPORT*.md
+/BUILD_REPORT*.md
+/RELEASE_REPORT*.md
+/IDEAS-*.md
+# Superseded by docs/FEATURES.md
+/FEATURES.md
 
 # Local markdown notes, plans, release drafts, and scratchpads
 TODO.md
