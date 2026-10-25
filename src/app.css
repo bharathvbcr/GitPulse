@@ -1718,9 +1718,14 @@ html.light .gp-markdown {
   overflow-x: auto;
   border-collapse: collapse;
 }
+/* `anywhere`, inherited from `.gp-markdown`, lets a cell's minimum width fall
+   to one character, so a wide table squeezes its columns until every word
+   splits instead of scrolling. `break-word` sizes a column to its longest
+   word; what does not fit scrolls inside the table. */
 .gp-markdown :is(th, td) {
-  padding: 0.35em 0.75em;
+  padding: 0.4em 0.8em;
   border: 1px solid rgb(var(--c-border) / 0.6);
+  overflow-wrap: break-word;
 }
 .gp-markdown th {
   font-weight: 650;

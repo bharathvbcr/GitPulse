@@ -185,6 +185,48 @@
       check("a commit message's relative link is refused, with the reason", () => /nothing to resolve against/.test(notice(commit())));
       check("a commit message renders compact", () => commit().classList.contains("gp-markdown-compact") && px(commit().querySelector("h1"), "font-size") < px(h1, "font-size"));
 
+      // --- a table wider than the page ------------------------------------
+      // One prose column beside single-word ones, cells holding links, code
+      // and emphasis, and one token longer than any pane: the table must keep
+      // every word whole and scroll sideways, not squeeze columns until words
+      // split or push the page wider. The same table at the top level, inside
+      // a list item and inside a callout, in the viewer and the commit body.
+      const words = ["Dependency", "Installed", "Latest", "Maintenance", "Advisories", "Audited", "Covered by"];
+      const prose = "This column holds a long sentence of ordinary prose that would happily take every pixel the table is given and then ask for more. ".repeat(3);
+      const digest = "sha256:" + "0123456789abcdef".repeat(10);
+      const row = cells => `<tr>${cells.map(c => `<td>${c}</td>`).join("")}</tr>`;
+      const wide = `<table><thead><tr>${[...words, "Notes"].map(w => `<th>${w}</th>`).join("")}</tr></thead><tbody>
+${row(['<a href="https://crates.io/crates/serde_json">serde_json</a>', "<code>1.0.128</code>", "1.0.132", "<strong>unmaintained_upstream_since_2024</strong>", "RUSTSEC-2026-0001", "2026-10-24", "<code>preview_many_walks_at_most_the_fanout_cap</code>", prose])}
+${row(["tokio", "1.40.0", "1.41.1", "maintained", "none", "", "cancelling_the_token_stops_preview_many", `pinned by ${digest}`])}
+</tbody></table>`;
+      answer = () => ({ ...rendered, headings: [], frontmatter: [], html: `${wide}
+<ul><li><p>In a list item:</p>${wide}</li></ul>
+<div class="callout" data-callout="note" data-callout-type="note"><div class="callout-title"><span class="callout-title-inner">Note</span></div><div class="callout-content">${wide}</div></div>` });
+      host.update({ text: "wide table", commitBody: "wide table" });
+      await until(() => [page(), commit()].every(root => root.querySelectorAll("table").length === 3), 2000); await settle();
+      const brokenWords = root => [...root.querySelectorAll("table :is(th, td)")].flatMap(cell => {
+        const out = [], walker = document.createTreeWalker(cell, NodeFilter.SHOW_TEXT);
+        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+          // A line may break after a hyphen, as anywhere in text; never inside a run.
+          for (const m of node.textContent.matchAll(/[^\s-]+-?/g)) {
+            const range = document.createRange();
+            range.setStart(node, m.index); range.setEnd(node, m.index + m[0].length);
+            if (new Set([...range.getClientRects()].map(r => Math.round(r.top))).size > 1) out.push(m[0].slice(0, 40));
+          }
+        }
+        return out;
+      });
+      for (const [where, root] of [["the viewer", page()], ["a commit body", commit()]]) {
+        const tables = [...root.querySelectorAll("table")];
+        check(`${where}: the wide table rendered top level, in a list item and in a callout`, () =>
+          tables.length === 3 && root.querySelector("li > table") && root.querySelector(".callout-content > table"));
+        check(`${where}: a wide table keeps every word on one line (split: ${brokenWords(root).join(", ") || "none"})`, () => brokenWords(root).length === 0);
+        check(`${where}: a wide table scrolls inside itself, nested or not`, () => tables.every(t => t.scrollWidth > t.clientWidth + 1 && css(t, "overflow-x") === "auto"));
+        check(`${where}: a wide table stays inside the block that holds it`, () =>
+          tables.every(t => t.getBoundingClientRect().right <= t.parentElement.getBoundingClientRect().right + 1));
+        check(`${where}: a wide table leaves the page its width`, () => root.scrollWidth <= root.clientWidth + 1);
+      }
+
       // --- render failures and the cap -------------------------------------
       // In place, on the same mounted viewer: what a re-render leaves behind
       // is the point, and a fresh mount has nothing to leave.
