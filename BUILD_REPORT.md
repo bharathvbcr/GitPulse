@@ -502,8 +502,13 @@ The drift fixes are in 68ef1882. Re-run on that tree: supervised_threads 9/9, do
   - `parked/other-session-1022` (1c5b3ea1);
   - `term/fable-diffs` and `term/fable-host` (abcc6b76), with their uncommitted edits saved as patches;
   - `term/integrate` (849f8133; 111 commits not in main).
-  Every SHA is in `tmp/build-1020/branch-audit-pre-cleanup.txt`.
-- **term/integrate is not preserved.** It was bundled and its worktree edits saved as patches, and then the owner had those backups deleted too. Its commits (849f8133, abcc6b76) exist only as unreachable objects until git garbage-collects them.
+  The SHA audit (`tmp/build-1020/branch-audit-pre-cleanup.txt`) was deleted with the rest of `tmp/` later the same evening.
+- **term/integrate was recovered, then dropped.** It was bundled and its worktree edits saved as patches, and then the owner had those backups deleted too.
+  - Another session recovered it on the owner's "Recover and land" choice. It passed full gates at `b6bb352f`: 115 commits, 134 files, +30,319/−294.
+  - It was held back from landing because three of its files overlap main's uncommitted docs.
+  - Late on 2026-10-24 the owner had the branch, the `keep/term-integrate` tag and a verified bundle of both deleted. Seven term follow-up briefs in `tmp/term-tasks/` (never on the board) went with `tmp/`.
+  - None of that work is in main. Tip `b6bb352f` survives only as unreachable objects until git garbage-collects them.
+- **`tmp/` was emptied** at the owner's direction, along with both old stashes (`216b22e3` and `de250041`).
 - **Gap cards filed:**
   - ft-67f95e2d: fixes deferred while the files were held, which are now free on main;
   - ft-24c70de8: reinstall and re-pin;
@@ -515,4 +520,8 @@ The drift fixes are in 68ef1882. Re-run on that tree: supervised_threads 9/9, do
 - **What did not change:** the installed `gitpulse-mcp`, `dcstore` and `devmap` binaries (all Oct 21), and every DevCouncil `state.sqlite` on disk (main files from Oct 7–11, empty WALs).
 - **Not identified:** which store reports 10. The command gate blocks reading a store's schema version.
 - **Fix:** the reinstall in ft-24c70de8 (a dc-store-10 gitpulse-mcp), or finding the store.
-- **Board writes owed:** listed in `tmp/build-1020/pending-board-ops.md`.
+- **Board writes owed,** to apply once the board answers again:
+  1. **Overwrite ft-67f95e2d.** Drop part A (the term/integrate merge-conflict table, which is moot now that the branch is dropped). Add B8: S1-09 `knows()` can block for up to the terminal host's 10 s `CALL_DEADLINE`; bound it by the connection budget in `terminal/host/client.rs`.
+  2. **Move ft-9cfd5074 to review.** S1-13/14 merged at 5b3c82b9 and S1-09 at 8d921144. Include the security statement and the accepted `knows()` latency gap from this wave.
+  3. **Move ft-d1c290f1 to review.** It merged at 9be2dbf8.
+  4. **Add to ft-e7c644de:** the bridge tests that expect `{"ok":true}` for session-less reports draw on the process-wide `hook-…` bucket (32, 4/s). The affected files are `alerts/bridge/tests/wire_adv_tests.rs`, `adv_tests.rs:72` and `protocol_tests.rs`. Give each a session key or a per-test bucket.
