@@ -8,14 +8,6 @@ use super::*;
 use crate::alerts::bridge::Reason;
 use std::io::{Read, Write};
 
-fn unique(tag: &str) -> String {
-    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    format!(
-        "proto-{tag}-{}",
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    )
-}
-
 fn reply_json(reply: &str) -> serde_json::Value {
     serde_json::from_str(reply.trim()).unwrap_or_else(|e| panic!("not JSON ({e}): {reply:?}"))
 }

@@ -9,17 +9,6 @@ use super::*;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 
-struct NullHost;
-
-impl crate::alerts::Host for NullHost {
-    fn submit(&self, _: &str, _: &str, _: &str, _: bool) -> Result<bool, String> {
-        Ok(true)
-    }
-    fn attended(&self, _: &str) -> bool {
-        false
-    }
-}
-
 fn payload(event: &str, session: &str) -> Vec<u8> {
     format!(r#"{{"v":1,"event":"{event}","agent":"claude","session":"{session}"}}"#).into_bytes()
 }
@@ -93,7 +82,6 @@ fn finish_free(mut s: UnixStream, body: &[u8]) -> UnixStream {
 /// Runs `trials` and returns how many ended without "Finished" standing.
 fn reorder_count(shape: Shape, trials: usize, tag: &str) -> usize {
     let _own = own_listener();
-    crate::alerts::start(std::sync::Arc::new(NullHost));
     let dir = ShortDir::new(tag);
     apply_at(true, Some(dir.socket()));
     assert!(status().listening, "{:?}", status().error);
