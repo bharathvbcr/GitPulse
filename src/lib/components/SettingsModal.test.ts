@@ -252,6 +252,19 @@ describe("SettingsModal automatic GitHub alerts", () => {
   });
 });
 
+describe("SettingsModal bell toggle", () => {
+  it("offers counting a terminal bell as waiting, on by default, and says what off means", () => {
+    const agents = panel(open(), "agents");
+    const start = agents.indexOf('data-setting="bell-asks"');
+    expect(start, "no bell-asks row in the agents panel").toBeGreaterThan(-1);
+    const row = prose(agents.slice(start, start + 2500));
+    expect(row).toContain("Count a terminal bell as waiting for you");
+    expect(row).toMatch(/role="switch"[^>]*aria-checked="true"|aria-checked="true"[^>]*role="switch"/);
+    expect(row).toContain("On by default");
+    expect(row).toContain("menu-bar count");
+  });
+});
+
 describe("SettingsModal automatic coverage toggle", () => {
   it("offers automatic coverage generation as an explicit opt-in, off by default", () => {
     const body = open();

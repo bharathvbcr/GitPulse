@@ -63,13 +63,28 @@ export const ATTENTION_EVENTS = {
 export type AttentionKind = "needs-you" | "finished" | "error" | "signalled";
 
 /**
+ * Whether a bell or OSC notice counts as an ask (the "Count a terminal bell
+ * as waiting for you" setting). On until the reader turns it off. This module
+ * owns the flag rather than importing the setting: `interfaceStore` imports
+ * `tabs`, which imports this module, so reading the store here would close a
+ * cycle that fails at load. The store pushes every change in.
+ */
+let signalledAsks = true;
+
+export function setSignalledAsksForReader(on: boolean): void {
+  signalledAsks = on;
+}
+
+/**
  * Whether a kind is the agent waiting on the reader rather than reporting
- * what it did. A bell counts: it is how an agent with no hooks says it is
- * blocked. Finished does not: it is worth showing, not worth chasing. The one
- * rule every surface — the task pane, the board chip, the tray — counts by.
+ * what it did. A bell counts while the setting above is on: it is how an
+ * agent with no hooks says it is blocked, and with the setting off those asks
+ * stop counting. Finished does not: it is worth showing, not worth chasing.
+ * The one rule every surface — the task pane, the board chip, the tray —
+ * counts by.
  */
 export function asksForReader(kind: AttentionKind | null | undefined): boolean {
-  return kind === "needs-you" || kind === "error" || kind === "signalled";
+  return kind === "needs-you" || kind === "error" || (kind === "signalled" && signalledAsks);
 }
 
 export interface SessionAttention {

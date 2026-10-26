@@ -3,7 +3,7 @@ import { get } from "svelte/store";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ACTIVITY_PUBLISH_MS, ATTENTION_EVENTS, MAX_TRACKED_ACTIVITY, asksForReader, bindAttention, clean, createSessionActivity, isReaderInput, parseAttention } from "./sessionActivity";
+import { ACTIVITY_PUBLISH_MS, ATTENTION_EVENTS, MAX_TRACKED_ACTIVITY, asksForReader, bindAttention, clean, createSessionActivity, isReaderInput, parseAttention, setSignalledAsksForReader } from "./sessionActivity";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -303,5 +303,17 @@ describe("what answers a request", () => {
   it("counts a bell as asking and a finished agent as not", () => {
     expect([..."needs-you error signalled finished".split(" "), null].map((kind) => asksForReader(kind as never)))
       .toEqual([true, true, true, false, false]);
+  });
+
+  describe("the bell setting", () => {
+    afterEach(() => setSignalledAsksForReader(true));
+
+    it("with the bell setting off, signalled is not an ask; needs-you/error still are", () => {
+      setSignalledAsksForReader(false);
+      expect([..."needs-you error signalled finished".split(" "), null].map((kind) => asksForReader(kind as never)))
+        .toEqual([true, true, false, false, false]);
+      setSignalledAsksForReader(true);
+      expect(asksForReader("signalled")).toBe(true);
+    });
   });
 });

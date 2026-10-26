@@ -366,9 +366,8 @@ pub struct SessionAlertStatus {
     /// A hook report that reached the worker behind a later one from the same
     /// session (stamped at accept, applied out of order by the parallel
     /// readers) and was dropped rather than applied late. Counted apart from
-    /// `bridge_rejected` because the report was well formed. Not on the wire
-    /// yet: the TypeScript mirror lives in a file another session holds.
-    #[serde(skip)]
+    /// `bridge_rejected` because the report was well formed. Mirrored in
+    /// `sessionAlertsStore.ts`, which `check:types` holds to this struct.
     pub stale: u64,
     pub bridge_listening: bool,
     pub bridge_path: Option<String>,
