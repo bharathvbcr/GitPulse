@@ -27,6 +27,8 @@ struct FakeHost {
     /// `Forget` that the app sends without waiting for an answer.
     calls: Arc<AtomicUsize>,
     hung: Arc<AtomicBool>,
+    /// How many of the next lists are answered with something that is not one.
+    garbage_lists: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     writers: Arc<Mutex<Vec<Writer>>>,
 }
@@ -50,13 +52,15 @@ impl FakeHost {
             accepts: Arc::default(),
             calls: Arc::default(),
             hung: Arc::default(),
+            garbage_lists: Arc::default(),
             stop: Arc::default(),
             writers: Arc::default(),
         };
-        let (accepts, calls, hung, stop, writers) = (
+        let (accepts, calls, hung, garbage, stop, writers) = (
             fake.accepts.clone(),
             fake.calls.clone(),
             fake.hung.clone(),
+            fake.garbage_lists.clone(),
             fake.stop.clone(),
             fake.writers.clone(),
         );
@@ -70,8 +74,8 @@ impl FakeHost {
                 accepts.fetch_add(1, Ordering::AcqRel);
                 let writer: Writer = Arc::new(Mutex::new(stream.try_clone().unwrap()));
                 writers.lock().unwrap().push(writer.clone());
-                let (calls, hung) = (calls.clone(), hung.clone());
-                std::thread::spawn(move || serve(stream, writer, &calls, &hung));
+                let (calls, hung, garbage) = (calls.clone(), hung.clone(), garbage.clone());
+                std::thread::spawn(move || serve(stream, writer, &calls, &hung, &garbage));
             }
         });
         fake
@@ -132,7 +136,13 @@ impl Drop for FakeHost {
     }
 }
 
-fn serve(stream: UnixStream, writer: Writer, calls: &AtomicUsize, hung: &AtomicBool) {
+fn serve(
+    stream: UnixStream,
+    writer: Writer,
+    calls: &AtomicUsize,
+    hung: &AtomicBool,
+    garbage: &AtomicUsize,
+) {
     let mut input = BufReader::new(stream);
     while let Ok(Some((header, _))) = read_frame(&mut input) {
         let Ok(Envelope { id, request }) = decode::<Envelope>(&header) else {
@@ -151,16 +161,23 @@ fn serve(stream: UnixStream, writer: Writer, calls: &AtomicUsize, hung: &AtomicB
             }
             Request::List => {
                 calls.fetch_add(1, Ordering::AcqRel);
-                serde_json::to_value([TerminalListing {
-                    id: "term-live".into(),
-                    shell: "sh".into(),
-                    cwd: "/".into(),
-                    repo: "/".into(),
-                    launcher: None,
-                    run_id: None,
-                    detached: false,
-                    ending: false,
-                }])
+                if garbage
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                    .is_ok()
+                {
+                    serde_json::to_value("not a list of sessions")
+                } else {
+                    serde_json::to_value([TerminalListing {
+                        id: "term-live".into(),
+                        shell: "sh".into(),
+                        cwd: "/".into(),
+                        repo: "/".into(),
+                        launcher: None,
+                        run_id: None,
+                        detached: false,
+                        ending: false,
+                    }])
+                }
             }
             Request::Receipts => {
                 calls.fetch_add(1, Ordering::AcqRel);
@@ -272,6 +289,25 @@ fn a_session_that_exited_is_no_longer_known() {
     assert!(!known, "an ended session is not known");
     assert!(took < PROMPT, "the check took {took:?}");
     assert_eq!(fake.calls(), before);
+}
+
+/// A listing that fails is tried again without anyone asking: until it
+/// succeeds the check refuses, and it must not stay refusing for the life of a
+/// connection that nothing re-lists on.
+#[test]
+fn a_failed_first_listing_is_retried_in_the_background() {
+    let fake = FakeHost::start();
+    fake.garbage_lists.store(1, Ordering::Release);
+    let app = fixture(&fake);
+    assert!(app.sessions.connect_host().is_err());
+    assert!(!app.host.knows("term-live"), "nothing has been listed");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !app.host.knows("term-live") {
+        assert!(Instant::now() < deadline, "the listing was never retried");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(fake.accepts(), 2, "one failed connection, one retry");
 }
 
 /// With the sessions in this process there is no host to ask, and no connection

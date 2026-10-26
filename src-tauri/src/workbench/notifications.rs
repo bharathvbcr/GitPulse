@@ -657,10 +657,10 @@ impl<R: tauri::Runtime> crate::alerts::Host for SessionHost<R> {
     /// intake slot, so it is answered from this app's own snapshot of what the
     /// terminal host holds and never asks the host: a hung host would
     /// otherwise fill every slot, and a report would be applied long after its
-    /// hook gave up. The snapshot lags the host by an exit not yet delivered,
-    /// and by what ended while the connection was down until it reconnects. A
-    /// registry that cannot tell (the host has not been listed yet) answers
-    /// no: a check that could not run is not one that passed.
+    /// hook gave up. The snapshot lags the host only by an exit not yet read.
+    /// A registry that cannot tell (the host has not been listed yet, the
+    /// connection is down, or the app has let the host go) answers no: a check
+    /// that could not run is not one that passed.
     fn knows(&self, key: &str) -> bool {
         let Some(sessions) = self.app.try_state::<crate::terminal::TerminalSessions>() else {
             return false;
