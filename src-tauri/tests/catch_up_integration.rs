@@ -19,6 +19,8 @@ use std::process::Command;
 
 #[test]
 fn catch_up_attributes_real_history() {
+    // `ingest` and `ledger` reach the library's git gate in this process.
+    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let repo = temp_dir.path().to_str().expect("repo path").to_string();
 

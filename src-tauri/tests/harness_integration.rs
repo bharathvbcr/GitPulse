@@ -14,6 +14,7 @@ use gitpulse_lib::harness::{check_command, check_file, HarnessStatus, PolicyStat
 use tempfile::TempDir;
 
 fn git(dir: &std::path::Path, args: &[&str]) {
+    common::unmetered_spawns();
     let status = Command::new("git")
         .args(args)
         .current_dir(dir)

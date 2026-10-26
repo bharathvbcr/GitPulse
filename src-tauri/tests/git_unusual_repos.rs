@@ -10,6 +10,7 @@ use gitpulse_lib::graph::{list_ref_decorations, LaneSolver, RefKind, RefScope};
 use std::path::Path;
 
 fn repo() -> tempfile::TempDir {
+    common::unmetered_spawns();
     let dir = tempfile::tempdir().expect("tempdir");
     run_git(dir.path(), &["init", "-q", "-b", "main"]);
     run_git(dir.path(), &["config", "commit.gpgsign", "false"]);

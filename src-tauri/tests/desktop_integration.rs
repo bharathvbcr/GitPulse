@@ -26,6 +26,7 @@ fn run_git(dir: &Path, args: &[&str]) {
 }
 
 fn init_repo(dir: &Path) {
+    common::unmetered_spawns();
     run_git(dir, &["init", "-b", "main"]);
     run_git(dir, &["config", "user.email", "test@example.com"]);
     run_git(dir, &["config", "user.name", "Test User"]);
@@ -74,6 +75,7 @@ fn stops_at_the_innermost_repository_rather_than_the_outer_one() {
 
 #[test]
 fn a_directory_outside_any_repository_is_an_error_not_a_guess() {
+    common::unmetered_spawns();
     let dir = TempDir::new().expect("tempdir");
     let error = cmd_resolve_git_root(dir.path().to_string_lossy().into_owned())
         .expect_err("a plain directory is not a repository");
@@ -85,6 +87,7 @@ fn a_directory_outside_any_repository_is_an_error_not_a_guess() {
 
 #[test]
 fn a_nonexistent_path_is_an_error() {
+    common::unmetered_spawns();
     let dir = TempDir::new().expect("tempdir");
     let missing = dir.path().join("no/such/place");
     assert!(cmd_resolve_git_root(missing.to_string_lossy().into_owned()).is_err());

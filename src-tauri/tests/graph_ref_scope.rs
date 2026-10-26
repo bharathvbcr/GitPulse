@@ -27,6 +27,7 @@ use gitpulse_lib::graph::{
 use tempfile::TempDir;
 
 fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    common::unmetered_spawns();
     let out = Command::new("git")
         .args(args)
         .current_dir(dir)

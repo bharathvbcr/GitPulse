@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 /// Creates a plain (no commits needed) git repo so `validate_repo` accepts it.
 fn init_repo(dir: &std::path::Path) {
+    common::unmetered_spawns();
     let output = std::process::Command::new("git")
         .arg("init")
         .current_dir(dir)
@@ -208,6 +209,7 @@ fn working_tree_reads_refuse_symlink_escape() {
 #[cfg(unix)]
 #[test]
 fn hung_gh_probe_is_bounded() {
+    common::unmetered_spawns();
     let fake_bin = tempfile::TempDir::new().unwrap();
     let fake_gh = fake_bin.path().join("gh");
     std::fs::write(&fake_gh, "#!/bin/sh\nsleep 300\n").unwrap();

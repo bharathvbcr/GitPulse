@@ -588,6 +588,9 @@ fn repository_with_a_heavy_ledger() -> (tempfile::TempDir, String) {
         .status_locked()
         .expect("spawn git");
     assert!(status.success(), "git init");
+    // The trust read below reaches the library's git gate in this process; the
+    // server processes it drives have gates of their own.
+    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
     let preview = gitpulse_lib::repository_trust::inspect(&repo).expect("inspect");
     gitpulse_lib::repository_trust::grant(&repo, &preview.identity, true).expect("trust");
     for n in 0..320 {
@@ -666,6 +669,9 @@ fn a_task_with_logs_near_the_cap_is_returned_over_stdio_not_refused_as_too_large
         .status_locked()
         .expect("spawn git");
     assert!(init.success(), "git init");
+    // The trust read below reaches the library's git gate in this process; the
+    // server processes it drives have gates of their own.
+    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
     let preview = gitpulse_lib::repository_trust::inspect(&repo).expect("inspect");
     gitpulse_lib::repository_trust::grant(&repo, &preview.identity, true).expect("trust");
 

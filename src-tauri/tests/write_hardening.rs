@@ -23,6 +23,7 @@ fn saving_a_hard_link_leaves_the_other_file_unchanged() {
 }
 
 fn fixture() -> tempfile::TempDir {
+    common::unmetered_spawns();
     let repo = tempfile::tempdir().unwrap();
     common::run_git(repo.path(), &["init", "-q"]);
     repo

@@ -184,3 +184,134 @@ fn no_shipped_source_lifts_the_spawn_rate_cap() {
         "shipped sources lift the spawn rate cap: {callers:?}"
     );
 }
+
+/// Integration suites that name the library but do not lift the spawn rate cap,
+/// and why each one need not: it measures the gate, runs in a child process of
+/// its own (its own gate), or calls only library code that spawns nothing
+/// through it. A suite that calls a module that does spawn through
+/// `git_cli`'s gate (`engine`, `graph`, `repo_op`, `worktree`, `stash`,
+/// `submodules`, `analyzer::{coverage, deps}`, `storage`, `desktop::
+/// cmd_resolve_git_root`, `repository_trust`, `harness`, `devmap`, `ops`,
+/// `ingest`, `ledger`, `terminal::run_terminal`) belongs in neither this list
+/// nor outside the switch.
+const UNMETERED_ALLOWLIST: &[(&str, &str)] = &[
+    ("adv_notify_process.rs", "subprocess-only: drives gitpulse-hook; the library supplies constants and LockedSpawn"),
+    ("adv_w6l4_ascii_oracle.rs", "no git spawn: pure parsers (github::parse_github_remote_url, tasks::scan_briefs)"),
+    ("agent_notify_socket.rs", "subprocess-only: the socket protocol against built binaries; alerts::bridge parsers"),
+    ("ai_transport_integration.rs", "no git spawn: ai::http URL parsing"),
+    ("alerts_worker_throughput.rs", "no git spawn: the alerts worker behind a stub host"),
+    ("cli_io_process.rs", "subprocess-only: drives built binaries; hooks and mcp parsers"),
+    ("codeintel_real_store.rs", "no git spawn: codeintel reads a store; validate_repo only reads the filesystem"),
+    ("command_rendering_integration.rs", "no git spawn: harness::render_command renders text"),
+    ("conflict_hardening.rs", "no git spawn: diff::ConflictResolver transforms text"),
+    ("desktop_menu_integration.rs", "no in-process git: menu events are emitted to the webview; its git is test-side"),
+    ("github_integration.rs", "no spawn: builds `gh` argv without running it"),
+    ("gitpulsed_single_owner.rs", "subprocess-only: drives the daemon binary; daemon_lock::running reads a lock"),
+    ("gtk_runtime.rs", "no git spawn: desktop runtime probing"),
+    ("hook_deadline_reap.rs", "subprocess-only: drives gitpulse-hook"),
+    ("hook_gate_app.rs", "no git spawn: desktop::instance claim and hooks::serve_gate resolve paths through find_git_root, which reads the filesystem"),
+    ("hook_gate_bench.rs", "no git spawn: desktop::instance claim and hooks::serve_gate resolve paths through find_git_root, which reads the filesystem"),
+    ("host_load_sampler_scope.rs", "no git spawn: samples host load"),
+    ("host_load_soak.rs", "no git spawn: samples host load (sysload)"),
+    ("lane_solver_fuzz.rs", "no git spawn: graph::LaneSolver over synthetic commits"),
+    ("lane_solver_stress.rs", "no git spawn: graph::LaneSolver over synthetic commits"),
+    ("lane_stability.rs", "no git spawn: graph::LaneSolver over synthetic commits"),
+    ("language_classification_integration.rs", "no git spawn: analyzer::LanguageDetector and LocCounter classify text"),
+    ("local_ai_live.rs", "no git spawn: ai against a local model server"),
+    ("logging_process.rs", "subprocess-only: the logging module in processes of their own"),
+    ("mcp_background_wait.rs", "measures the metered gate: background spawns waiting for budget"),
+    ("mcp_stdio.rs", "subprocess-only: drives gitpulse-mcp over stdio"),
+    ("native_event_unwind.rs", "subprocess-only: native event-loop fault injection in a child process"),
+    ("native_menu_main_thread.rs", "no git spawn: builds desktop menus"),
+    ("native_quit_guard.rs", "no git spawn: quit guard over empty terminal sessions"),
+    ("native_status_material.rs", "no git spawn: desktop window material"),
+    ("native_watcher_faults.rs", "child-process gate: RepoFileWatcher::watch runs in a re-executed child, which has a gate of its own"),
+    ("notify_stdin_bench.rs", "subprocess-only: times the hook binary; alerts::bridge env names"),
+    ("notify_stdin_process.rs", "subprocess-only: drives the hook binary; alerts::bridge env names"),
+    ("process_admission.rs", "measures the process-wide admission switches and the per-user budget; lifting the cap would change what it measures"),
+    ("process_admission_stress.rs", "measures the admission gate under load; lifting the cap would change what it measures"),
+    ("process_spawn_timing.rs", "measures the timing contract of the production spawn seam"),
+    ("procguard_signals.rs", "subprocess-only: signals against child processes; procguard only"),
+    ("signal_guard_hook.rs", "subprocess-only: drives gitpulse-hook"),
+    ("signal_guard_live.rs", "no git spawn: hooks::signal_guard reads the process table"),
+    ("signal_teardown.rs", "subprocess-only: signal teardown of child processes; procguard only"),
+    ("spawn_budget_isolation.rs", "builds the gate once from its first spawn and must stay off the shared record; lifting the cap would defeat it"),
+    ("terminal_pty_stress.rs", "no git spawn: PTY sessions run a shell, not git through the gate"),
+    ("updates_integration.rs", "no spawn: updates::{evaluate, latest_stable_tag} parse text handed to them"),
+];
+
+/// The statements in `source` that lift the spawn rate cap for the process:
+/// the library call itself, or the `unmetered_spawns()` wrapper of it. A line
+/// holding a quote is a string naming the call (a search pattern), not a call.
+fn lifts_the_cap(source: &str) -> bool {
+    source.lines().map(str::trim).any(|line| {
+        !line.starts_with("//")
+            && !line.contains('"')
+            && (line.ends_with("run_process_with_unlimited_spawn_rate();")
+                || line.ends_with("unmetered_spawns();"))
+    })
+}
+
+/// Every integration suite that calls the library in-process lifts the spawn
+/// rate cap, or is listed above with the reason it need not. Each of these
+/// crates links the library without `cfg(test)`, so it runs under the production
+/// spawn rate: a loaded parallel run drains the 192-token burst and defers a
+/// `GitReader` call mid-test, for a reason that has nothing to do with the code
+/// under test. Derived from the directory, so a new suite is held to it.
+#[test]
+fn every_integration_suite_that_calls_the_library_lifts_the_spawn_rate_cap_or_says_why_not() {
+    let tests = manifest_dir().join("tests");
+    let mut unswitched = Vec::new();
+    let mut contradicted = Vec::new();
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&tests).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|ext| ext != "rs") || !path.is_file() {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let source = std::fs::read_to_string(&path).unwrap();
+        if !source.contains("gitpulse_lib") {
+            continue;
+        }
+        checked += 1;
+        let lifted = lifts_the_cap(&source);
+        let listed = UNMETERED_ALLOWLIST
+            .iter()
+            .any(|(listed, _)| *listed == name);
+        match (lifted, listed) {
+            (false, false) => unswitched.push(name),
+            (true, true) => contradicted.push(name),
+            _ => {}
+        }
+    }
+    assert!(checked > 60, "walked only {checked} suites");
+    assert!(
+        unswitched.is_empty(),
+        "these suites call the library without lifting the spawn rate cap and are not in \
+         UNMETERED_ALLOWLIST: {unswitched:?}\nCall `common::unmetered_spawns()` first in each \
+         fixture entry point, or list the suite with its reason"
+    );
+    assert!(
+        contradicted.is_empty(),
+        "these suites lift the cap and are also in UNMETERED_ALLOWLIST, so one of the two is \
+         stale: {contradicted:?}"
+    );
+}
+
+/// The allowlist cannot rot: every entry names a suite that exists and calls
+/// the library, carries a reason, and appears once.
+#[test]
+fn the_unmetered_allowlist_names_real_suites_with_reasons() {
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, reason) in UNMETERED_ALLOWLIST {
+        assert!(seen.insert(*name), "{name} is listed twice");
+        assert!(!reason.trim().is_empty(), "{name} has no reason");
+        let source = std::fs::read_to_string(manifest_dir().join("tests").join(name))
+            .unwrap_or_else(|e| panic!("{name} is listed but cannot be read: {e}"));
+        assert!(
+            source.contains("gitpulse_lib"),
+            "{name} no longer calls the library, so it needs no entry"
+        );
+    }
+}
