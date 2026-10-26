@@ -24,6 +24,14 @@ before that tag is pushed.
   the sessions that chose it. Every other mode, and a payload without one, is
   gated exactly as before. When the guard and the harness are both waived on
   one command, the answer now keeps what each told the model.
+- **Out-of-repo operands are left to the host's rules.** A command whose only
+  refusal is `command.operand.unverifiable` — a program the harness does not
+  model handed a path outside the repository, such as `jq . ../x/package.json`,
+  `cargo test --manifest-path ../x/Cargo.toml` or `go build -o /tmp/x` — is now
+  reported and left to the session's own permission rules in an unbound
+  checkout, like `cd`, heredocs and substitutions. It needs a `manvi` that marks
+  the refusal `policy.unreadable_only`; against an older one it refuses as
+  before.
 
 - **Codex sessions are recorded in the ledger.** Transcript catch-up used to
   read only Claude Code transcripts, so work done by Codex, which GitPulse

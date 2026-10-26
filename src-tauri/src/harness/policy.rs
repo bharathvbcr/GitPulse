@@ -40,6 +40,7 @@ pub const UNREADABLE_CONSTRUCT_RULES: &[&str] = &[
     "command.directory_change",
     "command.heredoc",
     "command.substitution",
+    "command.operand.unverifiable",
 ];
 
 /// The `degraded` entry the harness adds to a refusal when every refusal in
@@ -236,7 +237,13 @@ impl PolicyVerdict {
     ///
     /// Each rule in [`UNREADABLE_CONSTRUCT_RULES`] is a statement about the
     /// gate's own reach: a `cd` moves where relative paths land, a heredoc body
-    /// has no static end, a substitution span could not be bounded. DevCouncil
+    /// has no static end, a substitution span could not be bounded, and a
+    /// program the gate does not model was handed a path outside the root
+    /// (`jq . ../other/package.json`, `cargo --manifest-path`, `go build -o
+    /// /tmp/x`), where it cannot tell a read from a write — DevCouncil's own
+    /// note on that rule says a host softening unreadable refusals may soften
+    /// it. A path outside the root that a modelled program writes stays
+    /// `path.outside_root`, which does not soften. DevCouncil
     /// classes them hard because, enforcing an agent it hosts itself, it cannot
     /// let an unexamined line run. GitPulse's agent hook judges someone else's
     /// agent, whose host has its own permission rules and owns the working
