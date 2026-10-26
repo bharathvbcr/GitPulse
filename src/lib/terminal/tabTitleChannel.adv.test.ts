@@ -28,6 +28,25 @@ describe("channel bypass: tab titles are cleaned by the one owner", () => {
     expect(title).toBe("");
   });
 
+  // ADVERSARIAL (L1): `clean()` keeps a lone surrogate that is not the trailing
+  // one the pre-bound drops. A program can emit one through OSC 0/2 (xterm hands
+  // the renderer a JS string); it renders as U+FFFD and `JSON.stringify` escapes
+  // it as `\ud800`, which serde_json refuses, so a title that is later sent to
+  // the backend would fail to deserialise.
+  it("a lone surrogate in the middle of a title is not kept", () => {
+    for (const title of ["a\ud800b", "a\udc00b", "\udc00x", "ab\ud800\ud800cd"]) {
+      expect(cleanTabName(title, 64).isWellFormed(), JSON.stringify(title)).toBe(true);
+    }
+  });
+
+  // ADVERSARIAL (L1): the code-unit pre-bound runs before the hidden characters
+  // are dropped, so enough of them ahead of the title push the visible text out
+  // of the window and the tab falls back to the launcher label.
+  it("hidden characters ahead of the title do not push it out of the bound", () => {
+    expect(cleanTabName(`${"\u200b".repeat(200)}visible`, 64)).toBe("visible");
+    expect(cleanTabName(`${" ".repeat(600)}visible`, 256)).toBe("visible");
+  });
+
   it("a megabyte title stays bounded and a title of hidden characters is empty", () => {
     expect(Array.from(cleanTabName("x".repeat(1_000_000), 256)).length).toBe(256);
     expect(cleanTabName("​‮\u{E0041}", 256)).toBe("");
