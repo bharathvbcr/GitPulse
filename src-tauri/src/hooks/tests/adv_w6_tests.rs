@@ -318,7 +318,7 @@ fn w6_a_slow_git_over_eighteen_worktrees_answers_inside_the_budget_and_partial()
     let output = crate::engine::worktree::status_probes::with_probe(
         &dirs,
         |_| std::thread::sleep(Duration::from_millis(4_000)),
-        || guard_here(&target(&farm, "seed.txt")),
+        || guard_on_budget(&target(&farm, "seed.txt")),
     );
     let took = started.elapsed();
     eprintln!("slow git x18: {took:?} -> {}", say(&output));
@@ -352,6 +352,23 @@ fn w6_a_holder_past_the_scan_cap_is_not_silent() {
         say(&output)
     );
     not_silent("the only holder is the 18th worktree", &output);
+}
+
+/// A scan slower than the hook's budget is a machine that is slow, not a file
+/// nobody holds: the guard the finding tests use is given time to finish, so a
+/// holder behind a status read longer than [`BUDGET`] is still asked about.
+#[cfg(unix)]
+#[test]
+fn w6_a_status_slower_than_the_hook_budget_still_finds_the_holder() {
+    let farm = farm_bound(false, false, 1);
+    std::fs::write(sib(&farm, 0).join("seed.txt"), "theirs").unwrap();
+    let dirs = farm.dirs.clone();
+    let output = crate::engine::worktree::status_probes::with_probe(
+        &dirs,
+        |_| std::thread::sleep(BUDGET + Duration::from_millis(500)),
+        || guard_here(&target(&farm, "seed.txt")),
+    );
+    assert!(asks(&output), "{}", say(&output));
 }
 
 /// The contended cost on an 18-worktree farm, measured.

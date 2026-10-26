@@ -866,7 +866,7 @@ pub fn collision_facts(
 /// timeout, so two checks each given the full budget could add up to a silent
 /// skip.
 pub fn run_collision_guard(input: &HookInput) -> HookOutput {
-    collision_guard_with(input, |job| within_budget(BUDGET, job))
+    collision_guard_with(input, BUDGET, |job| within_budget(BUDGET, job))
 }
 
 /// The `permission_mode` Claude Code sends while the person has told it to stop
@@ -933,16 +933,21 @@ fn under_bypass(input: &HookInput, output: HookOutput) -> HookOutput {
 /// on whichever thread `run` chooses (see [`command_gate_with`] for why).
 type WriteJob = Box<dyn FnOnce() -> harness::FileScopeCheck + Send>;
 
+/// The collision guard with its wait bounded by `budget`: [`BUDGET`] in the
+/// hook, longer only for tests that judge what the scan finds rather than how
+/// long it may take.
 fn collision_guard_with(
     input: &HookInput,
+    budget: Duration,
     run: impl FnOnce(WriteJob) -> Option<harness::FileScopeCheck>,
 ) -> HookOutput {
-    under_bypass(input, collision_guard_decided(input, run))
+    under_bypass(input, collision_guard_decided(input, budget, run))
 }
 
 /// [`collision_guard_with`] before the permission mode is applied.
 fn collision_guard_decided(
     input: &HookInput,
+    budget: Duration,
     run: impl FnOnce(WriteJob) -> Option<harness::FileScopeCheck>,
 ) -> HookOutput {
     let started = std::time::Instant::now();
@@ -981,7 +986,7 @@ fn collision_guard_decided(
         return HookOutput::notice(format!(
             "GitPulse could not check this write against the task scope within {}s, and \
              did not run the collision check either. It ran UNGATED.",
-            BUDGET.as_secs()
+            budget.as_secs()
         ));
     };
     let (scoped, unscoped) = match &scope {
@@ -999,7 +1004,7 @@ fn collision_guard_decided(
         harness::FileScopeCheck::Unbound { unscoped } => (HookOutput::silent(), *unscoped),
     };
 
-    let remaining = BUDGET.saturating_sub(started.elapsed());
+    let remaining = budget.saturating_sub(started.elapsed());
     // The scan stops starting worktree reads a margin before the budget ends,
     // so a slow family comes back as a partial answer rather than as a scan
     // that did not finish.
@@ -1018,7 +1023,7 @@ fn collision_guard_decided(
             scoped,
             unchecked(
                 &target,
-                &format!("the scan did not finish within {}s", BUDGET.as_secs()),
+                &format!("the scan did not finish within {}s", budget.as_secs()),
             ),
         );
     };
@@ -1031,7 +1036,7 @@ fn collision_guard_decided(
             &root_arg,
             &facts,
             incoming,
-            BUDGET.saturating_sub(started.elapsed()),
+            budget.saturating_sub(started.elapsed()),
         ));
     }
     log::debug!(
@@ -1533,6 +1538,7 @@ fn scanned_by_app(root: &str, target: &str) -> Result<CollisionRisk, String> {
         scan_profile(root).ok_or("no profile directory to find the app in")?,
         root,
         target,
+        COLLISION_APP_DEADLINE,
     )
 }
 
@@ -1584,9 +1590,15 @@ mod test_apps {
     }
 }
 
-/// [`scanned_by_app`] against the app that owns profile directory `dir`.
+/// [`scanned_by_app`] against the app that owns profile directory `dir`, given
+/// `deadline` to answer ([`COLLISION_APP_DEADLINE`] from the hook).
 #[cfg(target_os = "macos")]
-fn scanned_by_app_in(dir: PathBuf, root: &str, target: &str) -> Result<CollisionRisk, String> {
+fn scanned_by_app_in(
+    dir: PathBuf,
+    root: &str,
+    target: &str,
+    deadline: Duration,
+) -> Result<CollisionRisk, String> {
     use crate::desktop::instance::{reach_owner, Request};
 
     let request = Request::CollisionScan {
@@ -1595,14 +1607,11 @@ fn scanned_by_app_in(dir: PathBuf, root: &str, target: &str) -> Result<Collision
         path: target.to_string(),
     };
     // Detached at the deadline, like every other wait on another process here.
-    let answer = within_budget(
-        COLLISION_APP_DEADLINE + Duration::from_millis(100),
-        move || {
-            reach_owner(&dir, COLLISION_APP_DEADLINE)
-                .ok_or_else(|| "no GitPulse is answering".to_string())?
-                .collisions(&request, COLLISION_APP_DEADLINE)
-        },
-    )
+    let answer = within_budget(deadline + Duration::from_millis(100), move || {
+        reach_owner(&dir, deadline)
+            .ok_or_else(|| "no GitPulse is answering".to_string())?
+            .collisions(&request, deadline)
+    })
     .ok_or("the app missed its deadline")??;
     let answer: insights::MemoizedCollision = serde_json::from_value(answer)
         .map_err(|error| format!("the answer is malformed: {error}"))?;
@@ -4113,10 +4122,28 @@ done
         }
     }
 
-    /// The production collision guard, its scope judged on this thread.
+    /// What a test that judges what the guard finds gives it in place of
+    /// [`BUDGET`]. Eight test threads on a three-core runner spent the whole
+    /// production budget on one eighteen-worktree scan (5.08 s, test-parallel on
+    /// fec1e008), and the guard then rightly said it had not run: the answer the
+    /// budget tests pin through [`guard_on_budget`], not one to judge a finding by.
+    #[cfg(unix)]
+    fn unhurried() -> Duration {
+        crate::test_support::coverage_relaxed(BUDGET * 6)
+    }
+
+    /// The production collision guard, its scope judged on this thread, given
+    /// [`unhurried`] to finish.
     #[cfg(unix)]
     fn guard_here(input: &HookInput) -> HookOutput {
-        collision_guard_with(input, |job| Some(job()))
+        collision_guard_with(input, unhurried(), |job| Some(job()))
+    }
+
+    /// [`guard_here`] held to the hook's own [`BUDGET`], for the tests of what
+    /// happens when it runs out.
+    #[cfg(unix)]
+    fn guard_on_budget(input: &HookInput) -> HookOutput {
+        collision_guard_with(input, BUDGET, |job| Some(job()))
     }
 
     /// Where each directory's spawn log stood, to count only what follows.
@@ -4794,7 +4821,12 @@ done
                 tamper(&mut reply);
                 Ok(reply)
             }));
-            scanned_by_app_in(profile.path().to_path_buf(), &farm.repo, "seed.txt")
+            scanned_by_app_in(
+                profile.path().to_path_buf(),
+                &farm.repo,
+                "seed.txt",
+                unhurried(),
+            )
         };
         assert!(ask(|_| {}).is_ok(), "an honest answer is believed");
         let stale = ask(|reply| reply["age_ms"] = json!(COLLISION_MAX_AGE_MS + 1));
