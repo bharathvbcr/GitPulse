@@ -3,6 +3,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { declaredBinaryNames } from "./check-release-assets.mjs";
 
 /**
  * Agent Plugins 1.0.0 compatibility surface in the canonical GitPulse plugin.
@@ -434,12 +435,23 @@ describe("the package's executables are installable", () => {
     // A `--bin` naming a target that does not exist fails the install outright,
     // which would leave the other binary uninstalled too.
     const cargo = readFileSync(path.join(ROOT, "src-tauri", "Cargo.toml"), "utf8");
-    const targets = new Set(
-      [...cargo.matchAll(/\[\[bin\]\]\s*\nname\s*=\s*"([^"]+)"/g)].map((match) => match[1]),
-    );
+    const targets = new Set(declaredBinaryNames(cargo));
     expect(targets.size).toBeGreaterThan(0);
     for (const bin of installedExecutables()) {
       expect(targets, `mcp:install names ${bin}, which is not a [[bin]] in Cargo.toml`).toContain(bin);
+    }
+  });
+
+  it("pins the five [[bin]] names the release bundles must hold, and every executable the manifests spawn is one", () => {
+    // release.yml's verify step requires exactly these names inside each
+    // installer (check-release-assets.mjs reads them from this same manifest),
+    // so a binary a plugin spawns that is not a [[bin]] would never ship, and a
+    // new [[bin]] becomes required in every bundle the moment it is declared.
+    const cargo = readFileSync(path.join(ROOT, "src-tauri", "Cargo.toml"), "utf8");
+    const bins = declaredBinaryNames(cargo);
+    expect([...bins].sort()).toEqual(["gitpulse", "gitpulse-hook", "gitpulse-mcp", "gitpulse-ptyd", "gitpulsed"]);
+    for (const bin of spawnedExecutables()) {
+      expect(bins, `a manifest spawns ${bin}, which no [[bin]] builds`).toContain(bin);
     }
   });
 

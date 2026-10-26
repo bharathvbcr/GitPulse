@@ -372,7 +372,14 @@ jobs:
     # release that looks finished while silently missing a platform.
     if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Seven bundles are downloaded and opened before the notes are written.
+    # That check has one 10-minute budget (BUNDLE_CHECK_BUDGET_MS in
+    # scripts/release-state.mjs) and refuses by name when it runs out; with
+    # 3 minutes of setup and
+    # 10 minutes for the 10 bounded gh/git calls finalize makes around it, it
+    # fits here with 2 minutes to spare (release-workflow.test.ts counts the
+    # calls). Ten minutes was sized for the metadata check.
+    timeout-minutes: 25
     permissions:
       # `contents: write` is the *minimum* that works here, not a convenience:
       # the REST releases API only lists draft releases for callers with push
@@ -407,12 +414,23 @@ jobs:
         with:
           node-version: 22
 
+      # The bundle check opens MSI and NSIS installers with 7-Zip, which the
+      # ubuntu-24.04 image ships (p7zip-full, a transitional package that
+      # pulls in 7zip). Nothing is installed here: a missing tool must fail
+      # this step by name, not be papered over.
+      - name: Confirm Bundle Inspection Tools
+        run: |
+          set -euo pipefail
+          command -v 7z
+          command -v gh
+
       - name: Verify Draft Assets And Apply Changelog Notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
           RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+          RELEASE_DOWNLOAD_DIR: ${{ runner.temp }}/bundles
         run: |
           set -euo pipefail
           node scripts/release-state.mjs finalize
@@ -420,5 +438,6 @@ jobs:
             echo "### Release $RELEASE_TAG — draft verified"
             echo
             echo "All twelve installers, both SBOMs and the SHA-256 manifest have uploaded with matching SHA-256 metadata; the tag, commit, draft ID, and changelog notes agree."
+            echo "Seven installers were downloaded, matched to GitHub's SHA-256 and opened: the macOS app archive, both debs, both MSIs and both NSIS installers each hold every [[bin]] in src-tauri/Cargo.toml for their architecture. The dmg, both rpms and both AppImages are not opened."
             echo "The release remains a **draft** for manual publication."
           } >> "$GITHUB_STEP_SUMMARY"

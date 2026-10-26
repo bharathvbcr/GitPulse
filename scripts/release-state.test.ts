@@ -1,18 +1,23 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
-import { expectedAssetNames, expectedInstallerNames, supplementNames } from "./check-release-assets.mjs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterAll, describe, expect, it } from "vitest";
+import { bundleSpecs, expectedAssetNames, expectedInstallerNames, supplementNames } from "./check-release-assets.mjs";
 import { runReleaseStage, runCommand, main, resolveReleaseContext, type Runner } from "./release-state.mjs";
 
 const commit = "a".repeat(40);
 const tag = "v1.2.3";
 const options = { stage: "prepare", repo: "owner/repo", tag, commit };
+/** The bytes the stub download writes for an asset; the draft's size and digest describe exactly these. */
+const stubBytes = (name: string) => Buffer.from(`bytes:${name}`);
+const stubDigest = (name: string) => `sha256:${createHash("sha256").update(stubBytes(name)).digest("hex")}`;
 function draft() {
   return {id: 42, tag_name: tag, name: `GitPulse ${tag}`, target_commitish: commit, draft: true, prerelease: false,
     immutable: false, published_at: null, body: "pending",
     upload_url: "https://uploads.github.com/repos/owner/repo/releases/42/assets{?name,label}",
     assets: expectedAssetNames("1.2.3")
-      .map((name, index) => ({id: index + 1, name, size: 123, state: "uploaded", digest: `sha256:${"b".repeat(64)}`}))};
+      .map((name, index) => ({id: index + 1, name, size: stubBytes(name).length, state: "uploaded", digest: stubDigest(name)}))};
 }
 function fixture(change: {
   release?: Record<string, unknown> | null;
@@ -81,6 +86,38 @@ function fixture(change: {
     return release ? respond(release) : respond({message: "Not Found"}, 404);
   };
   return {run, calls, patches};
+}
+
+const binaries = ["gitpulse", "gitpulse-hook", "gitpulse-mcp", "gitpulse-ptyd", "gitpulsed"];
+const scratch: string[] = [];
+afterAll(() => { for (const dir of scratch) rmSync(dir, {recursive: true, force: true}); });
+
+/**
+ * The download and the inspection, stubbed: the draft's sizes and digests
+ * describe `stubBytes`, so an honest fetch passes and each fault changes
+ * exactly one thing. `fetched` and `inspected` record what ran.
+ */
+type Verdict = {ok: boolean; invalid: boolean; violations: string[]; opened: string[]; coverage: string};
+function bundleDeps(fault: {corrupt?: string; short?: string; fail?: string; order?: string[]; swapDuringInspect?: boolean; verdict?: Verdict} = {}) {
+  const downloadDir = path.join(mkdtempSync(path.join(tmpdir(), "gitpulse-release-state-")), "bundles");
+  scratch.push(path.dirname(downloadDir));
+  const fetched: string[] = [];
+  const inspected: {binaries: string[]; files: Record<string, string | undefined>}[] = [];
+  return {
+    downloadDir, binaries, fetched, inspected,
+    fetchAsset: ({asset, dest}: {asset: {name: string}; dest: string}) => {
+      fetched.push(asset.name);
+      if (fault.fail === asset.name) throw new Error("download refused");
+      const bytes = stubBytes(asset.name);
+      writeFileSync(dest, fault.corrupt === asset.name ? Buffer.from(bytes.toString().toUpperCase()) : fault.short === asset.name ? bytes.subarray(1) : bytes);
+    },
+    inspect: (request: {binaries: string[]; files: Record<string, string | undefined>}) => {
+      inspected.push(request);
+      fault.order?.push("inspect");
+      if (fault.swapDuringInspect) writeFileSync(String(Object.values(request.files)[0]), "swapped");
+      return fault.verdict ?? {ok: true, invalid: false, violations: [], opened: Object.keys(request.files), coverage: "opened 7 of 12 installers; AppImage, dmg and rpm are not opened"};
+    },
+  };
 }
 
 describe("remote release lifecycle", () => {
@@ -281,9 +318,105 @@ describe("remote release lifecycle", () => {
   it("checks the prepared release ID before uploads", () => {
     expect(() => runReleaseStage({...options, stage: "check", releaseId: "43"}, fixture().run)).toThrow(/ID changed/);
   });
-  const finalize = {...options, stage: "finalize", releaseId: "42", notes: "notes\n".repeat(9_000)};
+  const finalize = {...options, stage: "finalize", releaseId: "42", notes: "notes\n".repeat(9_000), ...bundleDeps()};
   it("round trips large notes without environment variables and leaves a draft", () => {
     expect(runReleaseStage(finalize, fixture().run).stage).toBe("finalize");
+  });
+  it("downloads and opens every bundled installer before the notes are written, and reports what was not opened", () => {
+    const order: string[] = [];
+    const {run} = fixture();
+    const spy: Runner = (program, args, input) => { if (args[3] === "PATCH") order.push("patch"); return run(program, args, input); };
+    const deps = bundleDeps({order});
+    const result = runReleaseStage({...finalize, ...deps}, spy);
+    expect(deps.fetched.sort()).toEqual(bundleSpecs("1.2.3").map(spec => spec.asset).sort());
+    expect(order).toEqual(["inspect", "patch"]);
+    expect(deps.inspected[0].binaries).toEqual(binaries);
+    expect(result.bundles).toBe("opened 7 of 12 installers; AppImage, dmg and rpm are not opened");
+    expect(existsSync(deps.downloadDir) && readdirSync(deps.downloadDir)).toEqual([]);
+  });
+  it.each([
+    ["a digest that is not GitHub's", {corrupt: "GitPulse_1.2.3_amd64.deb"}, /does not match GitHub's SHA-256/],
+    ["a short download", {short: "GitPulse_1.2.3_x64_en-US.msi"}, /downloaded \d+ bytes, expected \d+/],
+    ["a download that fails", {fail: "GitPulse_1.2.3_universal.app.tar.gz"}, /download refused/],
+  ])("refuses %s before opening anything or writing notes", (_label, fault, expected) => {
+    const {run, patches} = fixture();
+    const deps = bundleDeps(fault);
+    expect(() => runReleaseStage({...finalize, ...deps}, run)).toThrow(expected);
+    expect(patches).toHaveLength(0);
+    expect(deps.inspected).toHaveLength(0);
+  });
+  it("gives each download min(120 s, the time left) and refuses by name when the budget is used up, on a fake clock", () => {
+    let clock = 0;
+    const {run, patches} = fixture();
+    const deps = bundleDeps();
+    const timeouts: (number | undefined)[] = [];
+    const slow = {
+      ...deps,
+      fetchAsset: (request: {asset: {name: string}; dest: string; timeoutMs?: number}) => {
+        timeouts.push(request.timeoutMs);
+        clock += 200_000;
+        deps.fetchAsset(request);
+      },
+    };
+    const request = {...finalize, ...slow, now: () => clock, bundleBudgetMs: 700_000};
+    expect(() => runReleaseStage(request, run)).toThrow("bundle check budget exhausted after 4 of 7 bundles");
+    // 700 s: three full 120 s caps, then the 4th gets the 100 s left, and the 5th starts with none.
+    expect(timeouts).toEqual([120_000, 120_000, 120_000, 100_000]);
+    expect(patches).toHaveLength(0);
+    expect(deps.inspected).toHaveLength(0);
+    expect(readdirSync(deps.downloadDir)).toEqual([]);
+  });
+  it("names the budget when a download is killed by the limit the budget clamped it to", () => {
+    let clock = 0;
+    const {run} = fixture();
+    const deps = bundleDeps();
+    const killed = {...deps, fetchAsset: () => { clock += 130_000; throw new Error("Download of x failed: spawnSync gh ETIMEDOUT"); }};
+    expect(() => runReleaseStage({...finalize, ...killed, now: () => clock, bundleBudgetMs: 130_000}, run))
+      .toThrow("bundle check budget exhausted after 0 of 7 bundles");
+  });
+  it("hands the same budget to the inspection, and surfaces its exhaustion as a refusal", () => {
+    let clock = 0;
+    const {run, patches} = fixture();
+    const deps = bundleDeps();
+    let handed: {callTimeout: (cap: number) => number} | undefined;
+    const inspect = (input: {budget?: {callTimeout: (cap: number) => number}}) => {
+      handed = input.budget;
+      clock += 500_000;
+      return {ok: false, invalid: true, violations: ["bundle check budget exhausted after 5 of 7 bundles"], opened: [], coverage: "opened 5 of 12 installers"};
+    };
+    expect(() => runReleaseStage({...finalize, ...deps, inspect, now: () => clock, bundleBudgetMs: 400_000}, run))
+      .toThrow(/bundle check budget exhausted after 5 of 7 bundles/);
+    // The inspector was given the one deadline, and the fake clock has passed it.
+    expect(handed).toBeDefined();
+    expect(() => handed?.callTimeout(1)).toThrow();
+    expect(patches).toHaveLength(0);
+  });
+  it("refuses an asset that is larger than the download bound", () => {
+    const release = draft();
+    release.assets = release.assets.map(asset => asset.name === "GitPulse_1.2.3_amd64.deb" ? {...asset, size: 513 * 1024 * 1024} : asset);
+    const {run} = fixture({release});
+    const deps = bundleDeps();
+    expect(() => runReleaseStage({...finalize, ...deps}, run)).toThrow(/size outside/);
+    expect(deps.fetched).toEqual([]);
+  });
+  it("writes no notes when a binary is missing from a bundle, and says which", () => {
+    const {run, patches} = fixture();
+    const deps = bundleDeps({verdict: {ok: false, invalid: false, violations: ["GitPulse_1.2.3_amd64.deb: missing: gitpulse-hook"], opened: [], coverage: "opened 7 of 12 installers"}});
+    expect(() => runReleaseStage({...finalize, ...deps}, run)).toThrow(/GitPulse_1\.2\.3_amd64\.deb: missing: gitpulse-hook/);
+    expect(patches).toHaveLength(0);
+  });
+  it("refuses a bundle whose bytes change while they are being opened", () => {
+    const {run, patches} = fixture();
+    const deps = bundleDeps({swapDuringInspect: true});
+    expect(() => runReleaseStage({...finalize, ...deps}, run)).toThrow(/changed while it was being inspected/);
+    expect(patches).toHaveLength(0);
+  });
+  it("refuses to finalize without a download directory or the declared binaries, before any GitHub call", () => {
+    for (const missing of [{downloadDir: undefined}, {downloadDir: ""}, {binaries: undefined}, {binaries: []}]) {
+      const {run, calls} = fixture();
+      expect(() => runReleaseStage({...finalize, ...missing}, run)).toThrow(/finalize needs/);
+      expect(calls).toHaveLength(0);
+    }
   });
   it("writes the intended tag name back when GitHub left the draft untagged", () => {
     const {run, patches} = fixture({release: {...draft(), tag_name: "untagged-f782e62dab083869a408"}});
@@ -332,7 +465,7 @@ describe("remote release lifecycle", () => {
       ...draft(),
       assets: draft().assets.map(asset => ({
         ...asset,
-        digest: `sha256:${"B".repeat(64)}`,
+        digest: `sha256:${stubDigest(asset.name).slice("sha256:".length).toUpperCase()}`,
       })),
     };
     const { run } = fixture({ release: uppercaseDraft, list: [uppercaseDraft] });
@@ -437,7 +570,7 @@ describe("attest stage", () => {
     runReleaseStage(attest, spy);
     const lines = manifest.trimEnd().split("\n");
     expect(lines).toHaveLength(expectedInstallerNames("1.2.3").length + 2);
-    expect(lines).toContain(`${"b".repeat(64)}  GitPulse_1.2.3_arm64_en-US.msi`);
+    expect(lines).toContain(`${stubDigest("GitPulse_1.2.3_arm64_en-US.msi").slice("sha256:".length)}  GitPulse_1.2.3_arm64_en-US.msi`);
     expect(lines).toContain(`${sha(sboms.spdx)}  ${names.spdx}`);
     expect(lines).toContain(`${sha(sboms.cargo)}  ${names.cargo}`);
     expect(lines.every(line => /^[a-f0-9]{64} {2}GitPulse[-_]1\.2\.3[-_]/.test(line))).toBe(true);
@@ -486,8 +619,56 @@ describe("attest stage", () => {
 
   it("leaves finalize an exact inventory of installers plus supplements", () => {
     const {run} = fixture({release: installersOnly()});
-    expect(() => runReleaseStage({...attest, stage: "finalize", notes: "notes"}, run)).toThrow(/missing: GitPulse_1\.2\.3_SHA256SUMS\.txt/);
+    const finalizing = {...attest, stage: "finalize", notes: "notes", ...bundleDeps()};
+    expect(() => runReleaseStage(finalizing, run)).toThrow(/missing: GitPulse_1\.2\.3_SHA256SUMS\.txt/);
     runReleaseStage(attest, run);
-    expect(runReleaseStage({...attest, stage: "finalize", notes: "notes"}, run).release_id).toBe("42");
+    expect(runReleaseStage(finalizing, run).release_id).toBe("42");
+  });
+});
+
+/**
+ * Adversarial cases for ft-ac3bba92 (adversary pass, build run 2026-10-26):
+ * the real `fetchReleaseAsset` against a stand-in `gh` on PATH. Both held.
+ */
+describe.skipIf(process.platform === "win32")("finalize with the real download and a misbehaving gh", () => {
+  const withGh = (mode: string, body: () => void) => {
+    const bin = mkdtempSync(path.join(tmpdir(), "gitpulse-fake-gh-"));
+    scratch.push(bin);
+    const gh = path.join(bin, "gh");
+    writeFileSync(gh, [
+      "#!/bin/bash",
+      'case "$FAKE_GH_MODE" in',
+      '  notfound) echo \'{"message":"Not Found"}\'; echo "gh: Not Found (HTTP 404)" >&2; exit 1;;',
+      "  partial) printf abc; exit 0;;",
+      "  redirect-page) echo '<html><body>Found. Redirecting to https://objects.example/x</body></html>'; exit 0;;",
+      "esac",
+      "",
+    ].join("\n"), {mode: 0o755});
+    const previous = {path: process.env.PATH, mode: process.env.FAKE_GH_MODE};
+    process.env.PATH = `${bin}${path.delimiter}${process.env.PATH ?? ""}`;
+    process.env.FAKE_GH_MODE = mode;
+    try {
+      body();
+    } finally {
+      process.env.PATH = previous.path;
+      if (previous.mode === undefined) delete process.env.FAKE_GH_MODE;
+      else process.env.FAKE_GH_MODE = previous.mode;
+    }
+  };
+
+  it.each([
+    ["a 404 from the download", "notfound", /Download of GitPulse_1\.2\.3_\S+ failed: .*404/],
+    ["a body that stops after three bytes", "partial", /downloaded 3 bytes, expected \d+/],
+    ["an HTML page where the bytes should be", "redirect-page", /downloaded \d+ bytes, expected \d+|does not match GitHub's SHA-256/],
+  ])("HOLDS: refuses %s before any inspection or notes, and leaves no file behind", (_label, mode, expected) => {
+    const {run, patches} = fixture();
+    const deps = bundleDeps();
+    const inspected: unknown[] = [];
+    const request = {...options, stage: "finalize", releaseId: "42", notes: "notes", downloadDir: deps.downloadDir, binaries,
+      inspect: (input: unknown) => { inspected.push(input); throw new Error("must not be reached"); }};
+    withGh(mode, () => expect(() => runReleaseStage(request, run)).toThrow(expected));
+    expect(patches).toHaveLength(0);
+    expect(inspected).toHaveLength(0);
+    expect(readdirSync(deps.downloadDir)).toEqual([]);
   });
 });

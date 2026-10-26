@@ -2,6 +2,12 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { expectedAssetNames } from "./check-release-assets.mjs";
+import { BUNDLE_CHECK_BUDGET_MS, COMMAND_TIMEOUT_MS, DOWNLOAD_TIMEOUT_MS, runReleaseStage, type Runner } from "./release-state.mjs";
 
 const stateScript = readFileSync(new URL("./release-state.mjs", import.meta.url), "utf8");
 const workflow = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
@@ -139,6 +145,103 @@ it("builds Linux aarch64 and Windows arm64 on native runners with the Linux depe
     expect(release).toContain(`- platform: '${platform}'`);
   }
   expect(release).toContain("if: startsWith(matrix.platform, 'ubuntu-')");
+});
+
+it("opens the bundled installers in verify, with the tools the runner image already has", () => {
+  const verify = workflow.slice(workflow.indexOf("\n  verify:"));
+  const finalize = verify.indexOf("node scripts/release-state.mjs finalize");
+  expect(finalize).toBeGreaterThan(0);
+  // finalize refuses to run without a download directory, so it must be set
+  // in the same step; and ten minutes was sized before seven downloads.
+  const step = verify.slice(verify.lastIndexOf("      - name:", finalize), finalize);
+  expect(step).toContain("RELEASE_DOWNLOAD_DIR: ${{ runner.temp }}/bundles");
+  expect(verify).toContain("timeout-minutes: 25");
+  expect(verify).not.toContain("timeout-minutes: 10");
+  // 7-Zip opens MSI and NSIS; it ships on the image (p7zip-full pulls in
+  // 7zip), so nothing is installed and a missing tool fails by name.
+  expect(verify).not.toMatch(/apt-get|apt install|msitools/);
+  // One `command -v` per tool: `command -v a b` exits 0 when only one is found.
+  expect(verify.slice(0, finalize)).toMatch(/command -v 7z\n\s+command -v gh\n/);
+  expect(verify).toContain("The dmg, both rpms and both AppImages are not opened.");
+  // The names it requires come from Cargo.toml, not from this workflow.
+  expect(verify).not.toContain("gitpulse-hook");
+  expect(stateScript).toContain("declaredBinaryNames(readFileSync(path.join(\"src-tauri\", \"Cargo.toml\")");
+  expect(stateScript).toContain("downloadDir: process.env.RELEASE_DOWNLOAD_DIR");
+});
+
+/**
+ * The `gh` and `git` calls `finalize` makes through its runner, counted by
+ * running it against a fake one with the download and the inspection stubbed:
+ * the check's own budget is spent elsewhere, so these are the calls that sit
+ * around it and each can take COMMAND_TIMEOUT_MS.
+ */
+function boundedCallsInFinalize(): number {
+  const commit = "a".repeat(40);
+  const stubBytes = (name: string) => Buffer.from(`bytes:${name}`);
+  const digest = (name: string) => `sha256:${createHash("sha256").update(stubBytes(name)).digest("hex")}`;
+  let release: Record<string, unknown> = {
+    id: 42, tag_name: "v1.2.3", name: "GitPulse v1.2.3", target_commitish: commit, draft: true, prerelease: false,
+    immutable: false, published_at: null, body: "pending",
+    assets: expectedAssetNames("1.2.3").map((name, index) => ({id: index + 1, name, size: stubBytes(name).length, state: "uploaded", digest: digest(name)})),
+  };
+  let calls = 0;
+  const run: Runner = (program, args, input) => {
+    calls += 1;
+    if (program === "git") return {status: 0, failed: false, stdout: args[0] === "rev-parse" ? commit : `${commit}\trefs/tags/v1.2.3\n`};
+    if (args[3] === "PATCH") release = {...release, ...JSON.parse(input ?? "{}")};
+    return {status: 0, failed: false, stdout: `HTTP/2.0 200 Status\nContent-Type: application/json\r\n\r\n${JSON.stringify(release)}`};
+  };
+  const downloadDir = mkdtempSync(path.join(tmpdir(), "gitpulse-finalize-calls-"));
+  try {
+    const result = runReleaseStage({
+      stage: "finalize", repo: "owner/repo", tag: "v1.2.3", commit, releaseId: "42", notes: "notes", downloadDir,
+      binaries: ["gitpulse", "gitpulse-hook", "gitpulse-mcp", "gitpulse-ptyd", "gitpulsed"],
+      fetchAsset: ({asset, dest}) => writeFileSync(dest, stubBytes(asset.name)),
+      inspect: ({files}) => ({ok: true, invalid: false, violations: [], opened: Object.keys(files), coverage: "opened 7 of 12 installers"}),
+    }, run);
+    expect(result.stage).toBe("finalize");
+  } finally {
+    rmSync(downloadDir, {recursive: true, force: true});
+  }
+  return calls;
+}
+
+it("sizes the bundle-check budget so it and the rest of the verify job fit inside timeout-minutes", () => {
+  const verify = workflow.slice(workflow.indexOf("\n  verify:"));
+  const limit = Number(/timeout-minutes:\s*(\d+)/.exec(verify)?.[1]);
+  expect(limit).toBeGreaterThan(0);
+  // The job spends, besides the budget: 3 min of checkout, setup-node and the
+  // tool check (an allowance, not measured), and COMMAND_TIMEOUT_MS for each
+  // bounded call finalize makes. The call count is measured, so a new call
+  // fails this until the budget or the allowance is revisited.
+  const calls = boundedCallsInFinalize();
+  expect(calls).toBeGreaterThan(0);
+  const budgetMinutes = BUNDLE_CHECK_BUDGET_MS / 60_000;
+  const setupMinutes = 3;
+  const callMinutes = (calls * COMMAND_TIMEOUT_MS) / 60_000;
+  const total = budgetMinutes + setupMinutes + callMinutes;
+  expect(limit - total, `${budgetMinutes} + ${setupMinutes} + ${callMinutes} = ${total} min of ${limit}`).toBeGreaterThanOrEqual(2);
+  // The documented sum is the measured one.
+  expect(stateScript).toContain(`${budgetMinutes} min + ${setupMinutes} min + ${callMinutes} min = ${total} min`);
+  expect(workflow).toContain(`${budgetMinutes}-minute budget`);
+  expect(workflow).toContain(`${callMinutes} minutes for the ${calls} bounded gh/git calls`);
+  // Per call, 120 s caps stay: the budget is the overall bound, the cap is per call.
+  expect(DOWNLOAD_TIMEOUT_MS).toBe(120_000);
+});
+
+it("tells whoever rolls a release back how to delete its tag, and what the pre-push hook does about it", () => {
+  const contributing = readFileSync(new URL("../CONTRIBUTING.md", import.meta.url), "utf8");
+  const section = contributing.slice(contributing.indexOf("### Releasing and rolling back"));
+  expect(section).toContain("git push origin :refs/tags/vX.Y.Z");
+  expect(section).toContain("git tag -d vX.Y.Z");
+  expect(section).toContain(".githooks/pre-push");
+  expect(section).toMatch(/does not object to this/);
+  expect(section).toMatch(/already\s+exists/);
+  expect(section).toMatch(/\*\*unverified:\*\*[\s\S]*immutable releases[\s\S]*tag ruleset/);
+  // The claim is about the hook's code: it skips a deletion and never reads the remote tag.
+  const hook = readFileSync(new URL("../.githooks/pre-push", import.meta.url), "utf8");
+  expect(hook).toContain('[ "$local_sha" = "$zero" ] && continue');
+  expect(hook).not.toMatch(/ls-remote|fetch|refs\/tags\/[^\n]*\$remote_sha/);
 });
 
 it("attaches checksums and SBOMs after every installer and before finalize", () => {

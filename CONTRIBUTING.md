@@ -312,7 +312,9 @@ and `bun run release:ready` asks the same question without creating anything.
 Push the branch, wait for both workflows to go green on that commit, then push
 that one tag (`git push origin vX.Y.Z`; never `--tags`). The workflow builds
 a **draft**. Nothing is public until a person publishes it, after `verify`
-reports the complete asset set.
+reports the complete asset set and has opened the macOS app archive, both debs,
+both MSIs and both NSIS installers to confirm each holds every `[[bin]]` in
+`src-tauri/Cargo.toml` (the dmg, rpms and AppImages are not opened).
 
 The opt-in update check (`src-tauri/src/updates`) announces a version only
 once its `GitPulse_X.Y.Z_SHA256SUMS.txt` asset answers an anonymous request,
@@ -329,6 +331,26 @@ which a draft's assets do not. That decides how to take a release back:
   exist (they announce any tag on origin without checking for a published
   release); for newer clients, deleting the tag is optional once the release is
   gone.
+
+To delete the tag from origin, and the local copy so it is not pushed back:
+
+```sh
+git push origin :refs/tags/vX.Y.Z
+git tag -d vX.Y.Z
+```
+
+`.githooks/pre-push` does not object to this, and it does not stand between you
+and moving a published tag either. It skips a deletion before any tag logic
+(the `[ "$local_sha" = "$zero" ] && continue` line), and it never reads the tag
+already on the remote: the remote's old oid is used only to exclude commits from
+the fixture-author scan. A forced push of a moved tag therefore still runs the
+hook's other gates (tag at HEAD, version manifests, changelog section, green CI
+on that commit) and, if they pass, goes through. A plain push of a tag that
+already exists is refused by git itself (`! [rejected] vX.Y.Z -> vX.Y.Z (already
+exists)`), not by the hook. This was reproduced against a scratch bare
+repository with the hook active; **unverified:** GitHub's immutable releases or
+a tag ruleset may still refuse the same push on the server, which a local bare
+repository does not model.
 
 Builds older than 1.4.0's update check announce the newest tag, published or
 not, so those users can see a version from the moment its tag is pushed. Publish
