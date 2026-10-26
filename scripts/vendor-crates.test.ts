@@ -3,9 +3,48 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { expect, it } from "vitest";
+import { pathToFileURL } from "node:url";
+import { expect, it, vi } from "vitest";
 
-function fixture() {
+type Invocation = { status: number; stdout: string; stderr: string };
+type VendorCli = { main: (argv: string[]) => number };
+
+/**
+ * The fixture's own copy of the script. Each fixture root is a distinct path,
+ * so each import is a fresh module whose `REPO` is that root.
+ *
+ * Most of these tests drive `main` in this process rather than through
+ * `node vendor-crates.mjs`: a test makes up to 40 invocations, and a node start
+ * plus its git children per call is what ran past vitest's timeouts on a loaded
+ * host. The command-line entry point keeps one spawned test of its own.
+ */
+async function loadCli(root: string): Promise<VendorCli> {
+  const href = pathToFileURL(path.join(root, "scripts/vendor-crates.mjs")).href;
+  return (await import(/* @vite-ignore */ href)) as VendorCli;
+}
+
+/** Runs `main` with the environment a command line would have had, console captured. */
+function invoke(cli: VendorCli, args: string[], env: Record<string, string>): Invocation {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const log = vi.spyOn(console, "log").mockImplementation((...parts: unknown[]) => { stdout.push(`${parts.join(" ")}\n`); });
+  const error = vi.spyOn(console, "error").mockImplementation((...parts: unknown[]) => { stderr.push(`${parts.join(" ")}\n`); });
+  const saved = new Map(Object.keys(env).map(key => [key, process.env[key]]));
+  Object.assign(process.env, env);
+  try {
+    const status = cli.main(args);
+    return { status, stdout: stdout.join(""), stderr: stderr.join("") };
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    log.mockRestore();
+    error.mockRestore();
+  }
+}
+
+async function fixture() {
   const root = realpathSync(mkdtempSync(path.join(tmpdir(), "gitpulse-vendor-regression-")));
   const upstream = path.join(root, "upstream");
   for (const dir of ["scripts", "src-tauri/vendored", "upstream/rust/dc-redact/src"]) mkdirSync(path.join(root, dir), { recursive: true });
@@ -15,17 +54,17 @@ function fixture() {
   writeFileSync(path.join(upstream, "rust/dc-redact/src/lib.rs"), "pub const VALUE: u8 = 7;\n");
   const manifest = path.join(root, "src-tauri/vendored/VENDOR.json");
   writeFileSync(manifest, '{"crates":[]}');
-  const run = (...args: string[]) => spawnSync(process.execPath, [path.join(root, "scripts/vendor-crates.mjs"), ...args, "--json"], {
-    encoding: "utf8", timeout: 15_000,
-    env: { ...process.env, GITPULSE_ALLOW_DRIFT: "0", GITPULSE_DEVCOUNCIL_ROOT: upstream, GITPULSE_MARKDEV_ROOT: "/missing" },
-  });
+  const cli = await loadCli(root);
+  const env = { GITPULSE_ALLOW_DRIFT: "0", GITPULSE_DEVCOUNCIL_ROOT: upstream, GITPULSE_MARKDEV_ROOT: "/missing" };
+  const runWith = (over: Record<string, string>, ...args: string[]) => invoke(cli, [...args, "--json"], { ...env, ...over });
+  const run = (...args: string[]) => runWith({}, ...args);
   const initial = run("--crate=dc-redact");
   expect(initial.status, initial.stderr).toBe(0);
-  return { root, upstream, manifest, run, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  return { root, upstream, manifest, env, run, runWith, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
-it("detects upstream deletions and inherited manifest changes", () => {
-  const f = fixture();
+it("detects upstream deletions and inherited manifest changes", async () => {
+  const f = await fixture();
   try {
     rmSync(path.join(f.upstream, "rust/dc-redact/src/lib.rs"));
     writeFileSync(path.join(f.upstream, "rust/Cargo.toml"), '[workspace]\n[workspace.package]\nversion = "2.0.0"\n');
@@ -38,8 +77,24 @@ it("detects upstream deletions and inherited manifest changes", () => {
   } finally { f.cleanup(); }
 });
 
-it.each(["edited", "missing", "extra"])("checks locally maintained framework snapshots for %s files", (mode) => {
-  const f = fixture();
+// The one test that starts the script as a process: the exit code and stdout a
+// caller of `node scripts/vendor-crates.mjs` sees are what `main` returns.
+it("exits with the status main returns when started as a command", async () => {
+  const f = await fixture();
+  try {
+    rmSync(path.join(f.upstream, "rust/dc-redact/src/lib.rs"));
+    const inProcess = f.run("--check");
+    const spawned = spawnSync(process.execPath, [path.join(f.root, "scripts/vendor-crates.mjs"), "--check", "--json"], {
+      encoding: "utf8", timeout: 30_000, env: { ...process.env, ...f.env },
+    });
+    expect(spawned.status, spawned.stderr).toBe(1);
+    expect(spawned.status).toBe(inProcess.status);
+    expect(JSON.parse(spawned.stdout)).toEqual(JSON.parse(inProcess.stdout));
+  } finally { f.cleanup(); }
+}, 30_000);
+
+it.each(["edited", "missing", "extra"])("checks locally maintained framework snapshots for %s files", async (mode) => {
+  const f = await fixture();
   try {
     const dir = path.join(f.root, "src-tauri/framework/gtk-consumer");
     mkdirSync(dir, { recursive: true });
@@ -61,8 +116,8 @@ it.each(["edited", "missing", "extra"])("checks locally maintained framework sna
   } finally { f.cleanup(); }
 });
 
-it("refuses a missing framework tree required by the application manifest", () => {
-  const f = fixture();
+it("refuses a missing framework tree required by the application manifest", async () => {
+  const f = await fixture();
   try {
     writeFileSync(path.join(f.root, "src-tauri/Cargo.toml"), '[dependencies]\ntauri = { path = "framework/tauri" }\n');
     const result = f.run("--check", "--allow-drift");
@@ -71,8 +126,8 @@ it("refuses a missing framework tree required by the application manifest", () =
   } finally { f.cleanup(); }
 });
 
-it.each(["--crate=dc-redact", "full"])("preserves every old byte when %s preparation fails", (mode) => {
-  const f = fixture();
+it.each(["--crate=dc-redact", "full"])("preserves every old byte when %s preparation fails", async (mode) => {
+  const f = await fixture();
   try {
     const oldManifest = readFileSync(f.manifest, "utf8");
     const library = path.join(f.root, "src-tauri/vendored/dc-redact/src/lib.rs");
@@ -86,8 +141,8 @@ it.each(["--crate=dc-redact", "full"])("preserves every old byte when %s prepara
   } finally { f.cleanup(); }
 });
 
-it("refuses a concurrent refresh and leaves the old snapshot intact", () => {
-  const f = fixture();
+it("refuses a concurrent refresh and leaves the old snapshot intact", async () => {
+  const f = await fixture();
   try {
     const oldManifest = readFileSync(f.manifest, "utf8");
     mkdirSync(path.join(f.root, "src-tauri/.vendor-lock"));
@@ -98,8 +153,8 @@ it("refuses a concurrent refresh and leaves the old snapshot intact", () => {
   } finally { f.cleanup(); }
 });
 
-it.runIf(process.platform !== "win32")("rejects source symlinks instead of copying content outside the module", () => {
-  const f = fixture();
+it.runIf(process.platform !== "win32")("rejects source symlinks instead of copying content outside the module", async () => {
+  const f = await fixture();
   try {
     writeFileSync(path.join(f.root, "outside.rs"), "external bytes");
     symlinkSync(path.join(f.root, "outside.rs"), path.join(f.upstream, "rust/dc-redact/src/escape.rs"));
@@ -111,8 +166,8 @@ it.runIf(process.platform !== "win32")("rejects source symlinks instead of copyi
   } finally { f.cleanup(); }
 });
 
-it("keeps repeated source, manifest, and deletion updates coherent", () => {
-  const f = fixture();
+it("keeps repeated source, manifest, and deletion updates coherent", async () => {
+  const f = await fixture();
   try {
     for (let generation = 0; generation < 12; generation++) {
       const source = path.join(f.upstream, "rust/dc-redact");
@@ -134,8 +189,8 @@ it("keeps repeated source, manifest, and deletion updates coherent", () => {
   } finally { f.cleanup(); }
 }, 30_000);
 
-it("excludes local state and upstream tests from both snapshot and comparison", () => {
-  const f = fixture();
+it("excludes local state and upstream tests from both snapshot and comparison", async () => {
+  const f = await fixture();
   try {
     const source = path.join(f.upstream, "rust/dc-redact");
     mkdirSync(path.join(source, "src/.devcouncil"));
@@ -149,7 +204,7 @@ it("excludes local state and upstream tests from both snapshot and comparison", 
   } finally { f.cleanup(); }
 });
 
-it("updates one crate without reading or rewriting unrelated upstreams", () => {
+it("updates one crate without reading or rewriting unrelated upstreams", async () => {
   const root = realpathSync(mkdtempSync(path.join(tmpdir(), "gitpulse-vendor-scope-")));
   try {
     for (const dir of ["scripts", "src-tauri/vendored/untouched", "upstream/rust/dc-redact/src"]) mkdirSync(path.join(root, dir), { recursive: true });
@@ -161,8 +216,9 @@ it("updates one crate without reading or rewriting unrelated upstreams", () => {
     writeFileSync(path.join(root, "src-tauri/vendored/untouched/lib.rs"), "original bytes");
     const manifestPath = path.join(root, "src-tauri/vendored/VENDOR.json");
     writeFileSync(manifestPath, JSON.stringify({ crates: [untouched] }));
-    const run = (crate: string) => spawnSync(process.execPath, [path.join(root, "scripts/vendor-crates.mjs"), `--crate=${crate}`, "--json"], {
-      encoding: "utf8", env: { ...process.env, GITPULSE_DEVCOUNCIL_ROOT: path.join(root, "upstream"), GITPULSE_MARKDEV_ROOT: "/missing" },
+    const cli = await loadCli(root);
+    const run = (crate: string) => invoke(cli, [`--crate=${crate}`, "--json"], {
+      GITPULSE_DEVCOUNCIL_ROOT: path.join(root, "upstream"), GITPULSE_MARKDEV_ROOT: "/missing",
     });
     const result = run("dc-redact");
     expect(result.status, result.stderr).toBe(0);
@@ -176,14 +232,14 @@ it("updates one crate without reading or rewriting unrelated upstreams", () => {
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-it("says so when a crate was vendored from an uncommitted tree", () => {
+it("says so when a crate was vendored from an uncommitted tree", async () => {
   // `commit` on its own is a claim that the vendored bytes can be recovered by
   // checking that commit out. Vendoring from a dirty tree makes that false, and
   // it is the normal case rather than an exotic one: a crate is vendored right
   // after it is changed and before the change is committed. Without the flag a
   // later `--check` reports drift against the recorded commit that nobody can
   // explain — or an operator checks it out and does not find the code.
-  const f = fixture();
+  const f = await fixture();
   try {
     const git = (...args: string[]) =>
       spawnSync("git", args, {
@@ -239,8 +295,8 @@ it("says so when a crate was vendored from an uncommitted tree", () => {
  * and CHECKSUMS hours earlier and every consumer still reported "ok". These
  * hold the copy to upstream through the same check the crates use.
  */
-function withContracts() {
-  const f = fixture();
+async function withContracts() {
+  const f = await fixture();
   const upstreamContracts = path.join(f.upstream, "backend/contracts");
   mkdirSync(path.join(upstreamContracts, "tools"), { recursive: true });
   writeFileSync(path.join(upstreamContracts, "verdict.schema.json"), "{\"v\":1}\n");
@@ -253,8 +309,8 @@ function withContracts() {
   return { ...f, upstreamContracts, contracts, contractsOf };
 }
 
-it("vendors the shared contracts, but not their machinery, and checks them clean", () => {
-  const f = withContracts();
+it("vendors the shared contracts, but not their machinery, and checks them clean", async () => {
+  const f = await withContracts();
   try {
     const vendored = f.run("--contracts");
     expect(vendored.status, vendored.stderr).toBe(0);
@@ -270,8 +326,8 @@ it("vendors the shared contracts, but not their machinery, and checks them clean
   } finally { f.cleanup(); }
 });
 
-it("reports a vendored contract copy that is consistent with itself but behind upstream", () => {
-  const f = withContracts();
+it("reports a vendored contract copy that is consistent with itself but behind upstream", async () => {
+  const f = await withContracts();
   try {
     expect(f.run("--contracts").status).toBe(0);
     writeFileSync(path.join(f.upstreamContracts, "verdict.schema.json"), "{\"v\":2}\n");
@@ -289,8 +345,8 @@ it("reports a vendored contract copy that is consistent with itself but behind u
   } finally { f.cleanup(); }
 });
 
-it.each(["edited", "missing", "extra"])("reports a contract %s here rather than upstream", (mode) => {
-  const f = withContracts();
+it.each(["edited", "missing", "extra"])("reports a contract %s here rather than upstream", async (mode) => {
+  const f = await withContracts();
   try {
     expect(f.run("--contracts").status).toBe(0);
     if (mode === "edited") writeFileSync(path.join(f.contracts, "verdict.schema.json"), "patched here\n");
@@ -304,8 +360,8 @@ it.each(["edited", "missing", "extra"])("reports a contract %s here rather than 
   } finally { f.cleanup(); }
 });
 
-it("keeps a contract Manvi owns through a refresh and does not call it a local edit", () => {
-  const f = withContracts();
+it("keeps a contract Manvi owns through a refresh and does not call it a local edit", async () => {
+  const f = await withContracts();
   try {
     expect(f.run("--contracts").status).toBe(0);
     writeFileSync(path.join(f.contracts, "serve.ops.schema.json"), "{}\n");
@@ -317,22 +373,19 @@ it("keeps a contract Manvi owns through a refresh and does not call it a local e
   } finally { f.cleanup(); }
 });
 
-it("never reports contracts as matching when DevCouncil is not there to compare", () => {
-  const f = withContracts();
+it("never reports contracts as matching when DevCouncil is not there to compare", async () => {
+  const f = await withContracts();
   try {
     expect(f.run("--contracts").status).toBe(0);
-    const check = spawnSync(process.execPath, [path.join(f.root, "scripts/vendor-crates.mjs"), "--check", "--json"], {
-      encoding: "utf8", timeout: 15_000,
-      env: { ...process.env, GITPULSE_ALLOW_DRIFT: "0", GITPULSE_DEVCOUNCIL_ROOT: "/missing", GITPULSE_MARKDEV_ROOT: "/missing" },
-    });
+    const check = f.runWith({ GITPULSE_DEVCOUNCIL_ROOT: "/missing" }, "--check");
     const report = JSON.parse(check.stdout);
     expect(f.contractsOf(check.stdout)).toMatchObject({ upstream: "unavailable", edited: [] });
     expect(report.comparable).toBe(false);
   } finally { f.cleanup(); }
 });
 
-it("treats a contracts directory the manifest never recorded as a local edit", () => {
-  const f = withContracts();
+it("treats a contracts directory the manifest never recorded as a local edit", async () => {
+  const f = await withContracts();
   try {
     mkdirSync(f.contracts, { recursive: true });
     writeFileSync(path.join(f.contracts, "verdict.schema.json"), "{\"v\":1}\n");
@@ -342,8 +395,8 @@ it("treats a contracts directory the manifest never recorded as a local edit", (
   } finally { f.cleanup(); }
 });
 
-it("keeps the recorded contracts through a scoped crate refresh", () => {
-  const f = withContracts();
+it("keeps the recorded contracts through a scoped crate refresh", async () => {
+  const f = await withContracts();
   try {
     expect(f.run("--contracts").status).toBe(0);
     const before = JSON.parse(readFileSync(f.manifest, "utf8")).contracts;

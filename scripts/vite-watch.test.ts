@@ -12,16 +12,6 @@ const TSCONFIG_RELOAD = "changed tsconfig file detected";
 /** Vite and chokidar report every path with `/`, whatever the platform joins with. */
 const posix = (file: string) => file.split(sep).join("/");
 
-/** Polls `seen` until it holds, failing loudly at the deadline. */
-async function waitFor(seen: () => boolean, what: string, budgetMs: number): Promise<number> {
-  const started = Date.now();
-  while (!seen()) {
-    if (Date.now() - started > budgetMs) throw new Error(`${what} not observed within ${budgetMs}ms`);
-    await new Promise(resolve => setTimeout(resolve, 25));
-  }
-  return Date.now() - started;
-}
-
 const servers: ViteDevServer[] = [];
 const dirs: string[] = [];
 
@@ -87,8 +77,27 @@ describe.each(["vite.config.ts", "vite.harness.config.ts"])("%s file watcher", c
     mkdirSync(root, { recursive: true });
     writeFileSync(join(root, "index.html"), "<!doctype html><title>watch</title>");
     const lines: string[] = [];
+    // Every logged line re-checks the pending waits, so a control is awaited
+    // by the event that proves it rather than by a clock. Delivery latency of
+    // the OS file-event stream is the host's, and an overloaded host has shown
+    // more than the ten seconds a fixed attempt budget allowed; the test's own
+    // timeout is the only deadline.
+    const pending = new Set<() => void>();
     const logger = createLogger("info", { allowClearScreen: false });
-    logger.info = message => { lines.push(message); };
+    logger.info = message => {
+      lines.push(message);
+      for (const check of pending) check();
+    };
+    const until = (seen: () => boolean) =>
+      new Promise<void>(resolve => {
+        const check = () => {
+          if (!seen()) return;
+          pending.delete(check);
+          resolve();
+        };
+        pending.add(check);
+        check();
+      });
     const server = await createServer({
       configFile: join(repo, configName),
       root,
@@ -107,12 +116,14 @@ describe.each(["vite.config.ts", "vite.harness.config.ts"])("%s file watcher", c
     // Positive control: the watcher is live and reaches tsconfig detection.
     // Rewritten until seen, because chokidar's `ready` can fire before
     // createServer returns and an initial write may land before the scan.
+    // The rewrite interval paces the writes; it does not bound the wait.
     const control = join(root, "tsconfig.json");
-    let latency = 0;
-    for (let attempt = 0; reloadsFor(control) === 0; attempt += 1) {
-      if (attempt === 40) throw new Error(`control reload never observed; log: ${JSON.stringify(lines)}`);
+    const controlSeen = until(() => reloadsFor(control) > 0);
+    let controlObserved = false;
+    void controlSeen.then(() => { controlObserved = true; });
+    for (let attempt = 0; !controlObserved; attempt += 1) {
       writeFileSync(control, JSON.stringify({ attempt }));
-      try { latency = await waitFor(() => reloadsFor(control) > 0, "control reload", 250); } catch { /* rewrite */ }
+      await Promise.race([controlSeen, new Promise(resolve => setTimeout(resolve, 250))]);
     }
 
     // What the sibling session did: a fresh worktree directory, created after
@@ -124,12 +135,14 @@ describe.each(["vite.config.ts", "vite.harness.config.ts"])("%s file watcher", c
 
     // A second control written after the nested file: once it is seen, the
     // watcher has had at least as long as the nested write needed, plus a
-    // settle window scaled by the latency this host just showed.
+    // settle window as long as the delivery just measured. The first control's
+    // wait is not that measure: it includes the event stream starting up.
     const later = join(root, "packages", "tsconfig.json");
     mkdirSync(dirname(later), { recursive: true });
+    const laterWritten = Date.now();
     writeFileSync(later, "{}");
-    await waitFor(() => reloadsFor(later) > 0, "second control reload", 10_000);
-    await new Promise(resolve => setTimeout(resolve, Math.max(500, latency * 4)));
+    await until(() => reloadsFor(later) > 0);
+    await new Promise(resolve => setTimeout(resolve, Math.max(500, Date.now() - laterWritten)));
 
     expect(reloadsFor(nested), JSON.stringify(lines)).toBe(0);
     const watchedDirs = Object.keys(server.watcher.getWatched());
