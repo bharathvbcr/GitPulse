@@ -1,4 +1,7 @@
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { GATES } from "./ci-local.mjs";
@@ -262,6 +265,98 @@ describe("check:workflows", () => {
         expect(block, name).toContain('RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}');
         expect(block, name).toContain("$GITHUB_ENV");
       }
+    }
+  });
+});
+
+/**
+ * Adversarial cases for ft-ac3bba92 (adversary pass, build run 2026-10-26).
+ * Each `it` says whether it broke the implementation (BREAKS) or documents a
+ * case that held (HOLDS).
+ */
+describe("check:workflows adversarial: downloads run without a check", () => {
+  const run = (script: string) => `        run: ${script}`;
+  const block = (...lines: string[]) => ["        run: |", ...lines.map((line) => `          ${line}`)].join("\n");
+
+  describe("BREAKS: shapes that execute a download unchecked and are not flagged", () => {
+    it.each([
+      ["source <(curl ...)", run("source <(curl -fsSL https://x.example/i.sh)")],
+      ["bash < <(curl ...)", run("bash < <(curl -fsSL https://x.example/i.sh)")],
+      ['bash -c "$(curl ...)"', run('bash -c "$(curl -fsSL https://x.example/i.sh)"')],
+      ['eval "$(curl ...)"', run('eval "$(curl -fsSL https://x.example/i.sh)"')],
+      ["curl ... | /bin/bash", run("curl -fsSL https://x.example/i.sh | /bin/bash")],
+      ["curl ... | sudo -E bash", run("curl -fsSL https://x.example/i.sh | sudo -E bash")],
+      ["curl ... | tee i.sh | bash", run("curl -fsSL https://x.example/i.sh | tee i.sh | bash")],
+      ["a backslash continuation before the pipe", block("curl -fsSL https://x.example/i.sh \\", "  | bash")],
+      ["a pipe that ends the line", block("curl -fsSL https://x.example/i.sh |", "  bash")],
+      ["a URL on the continuation line", block("curl -fsSL \\", "  https://x.example/i.sh | bash")],
+    ])("flags %s", (_label, yaml) => {
+      expect(pipedDownloads(yaml)).not.toEqual([]);
+    });
+  });
+
+  describe("BREAKS: lines that run no downloaded code and are flagged", () => {
+    it.each([
+      ["a download, then an unrelated pipe to sh after a semicolon", run("curl -fsSL -o x.tgz https://x.example/x.tgz; echo ok | sh -c 'cat'")],
+      ["a download, then an unrelated pipe to bash after &&", run("curl -fsSL -o x.tgz https://x.example/x.tgz && echo ok | bash -c 'cat'")],
+    ])("leaves alone %s", (_label, yaml) => {
+      expect(pipedDownloads(yaml)).toEqual([]);
+    });
+  });
+
+  it("HOLDS: a pipe into bash that carries no download, and a download piped into a non-shell, are left alone", () => {
+    const yaml = [
+      run('echo "ls -la" | bash -c "cat"'),
+      run("curl -fsSL https://api.example/x | jq .name"),
+      run("curl -fsSL https://x.example/i.sh | shellcheck -"),
+      run('curl -fsSL -o t.tgz https://x.example/t.tgz && echo "abc  t.tgz" | sha256sum -c -'),
+    ].join("\n");
+    expect(pipedDownloads(yaml)).toEqual([]);
+  });
+
+  it("HOLDS: the common spellings are found, in a multi-line block too", () => {
+    for (const script of [
+      "curl -fsSL https://x.example/i.sh | sudo bash",
+      "wget -qO- https://x.example/i.sh | sh",
+      "bash <(curl -fsSL https://x.example/i.sh)",
+      "curl -fsSL https://x.example/i.sh | bash -s -- --yes",
+    ]) {
+      expect(pipedDownloads(block("set -e", script, "echo done")), script).toHaveLength(1);
+    }
+  });
+
+  const hasSha256sum = spawnSync("sha256sum", ["--version"], { stdio: "ignore" }).error === undefined;
+  it.skipIf(process.platform === "win32" || !hasSha256sum)("HOLDS: a tampered actionlint tarball stops the install step before anything is extracted", () => {
+    const ci = readFileSync(fileURLToPath(new URL("../.github/workflows/ci.yml", import.meta.url)), "utf8");
+    const step = ci.slice(ci.indexOf("- name: Install actionlint"), ci.indexOf("- name: Workflow Lint"));
+    const lines = step.split("\n");
+    const start = lines.findIndex((line) => /^\s+run: \|\s*$/.test(line));
+    expect(start).toBeGreaterThan(-1);
+    const indent = /^\s*/.exec(lines[start + 1])?.[0].length ?? 0;
+    const script = lines.slice(start + 1).filter((line) => /^\s+\S/.test(line) && !/^\s+shell:/.test(line)).map((line) => line.slice(indent)).join("\n");
+    const root = mkdtempSync(path.join(tmpdir(), "gitpulse-actionlint-"));
+    try {
+      const evil = path.join(root, "evil");
+      mkdirSync(evil);
+      writeFileSync(path.join(evil, "actionlint"), "#!/bin/sh\ntouch PWNED\n");
+      chmodSync(path.join(evil, "actionlint"), 0o755);
+      const tarball = path.join(root, "tampered.tgz");
+      expect(spawnSync("tar", ["-czf", tarball, "-C", evil, "actionlint"]).status).toBe(0);
+      const bin = path.join(root, "bin");
+      mkdirSync(bin);
+      // A curl that honours `-o <file>` and serves the tampered tarball.
+      writeFileSync(path.join(bin, "curl"), `#!/bin/bash\nwhile [ $# -gt 0 ]; do if [ "$1" = "-o" ]; then out="$2"; shift; fi; shift; done\ncp "${tarball}" "$out"\n`);
+      chmodSync(path.join(bin, "curl"), 0o755);
+      const work = path.join(root, "work");
+      mkdirSync(work);
+      const result = spawnSync("bash", ["--noprofile", "--norc", "-eo", "pipefail", "-c", script], {
+        cwd: work, encoding: "utf8", env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}` },
+      });
+      expect(result.status, `${result.stdout}${result.stderr}`).not.toBe(0);
+      expect(`${result.stdout}${result.stderr}`).toMatch(/FAILED|did NOT match/);
+      expect(existsSync(path.join(work, "actionlint"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });

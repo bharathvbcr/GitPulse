@@ -1,4 +1,4 @@
-import { linkSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -621,5 +621,181 @@ describe("bundle contents", () => {
     expect(absent.code).toBe(1);
     expect(String(absent.stderr)).toContain(`missing: ${MSI} was not provided`);
     expect(String(absent.stdout)).toContain("opened 3 of 12 installers");
+  });
+});
+
+/**
+ * Adversarial cases for ft-ac3bba92 (adversary pass, build run 2026-10-26).
+ * Fixtures for the same cases, run through the CLI, are under
+ * tmp/build-1026/l2-adv/. Each `it` says whether it broke the implementation
+ * (`BREAKS`) or documents a case that held (`HOLDS`).
+ */
+describe("bundle contents: adversarial bundles", () => {
+  /** What real v1.3.1 Windows installers extract to: every binary at the root of the tree (checked with 7z 23.01 on both). */
+  const windowsExtract = (place: (bin: string, id: string) => string, extraFile?: (outDir: string) => void) => (archive: string, outDir: string) => {
+    const msi = archive.endsWith(".msi");
+    const machine = archive.includes("arm64") ? 0xaa64 : 0x8664;
+    for (const bin of BINS) {
+      const id = msi ? (bin === "gitpulse" ? "Path" : `Bin_${bin.replaceAll("-", "_")}`) : `${bin}.exe`;
+      const dest = path.join(outDir, place(bin, id));
+      mkdirSync(path.dirname(dest), { recursive: true });
+      writeFileSync(dest, pe(machine));
+    }
+    extraFile?.(outDir);
+  };
+  const runWindows = async (extract: (archive: string, outDir: string) => void, extra: Record<string, unknown> = {}) =>
+    inspectBundleContents({ version: VERSION, binaries: BINS, files: (await bundles()).files, extract, ...extra });
+
+  /** A header with a ustar `prefix`, the way GNU tar splits a path longer than 100 bytes. */
+  function prefixedEntry(prefix: string, name: string, data: Buffer): Buffer {
+    const header = Buffer.from(tarHeader(name, data.length));
+    header.write(prefix, 345, 155, "utf8");
+    header.write("        ", 148, "latin1");
+    let sum = 0;
+    for (const byte of header) sum += byte;
+    header.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148, "latin1");
+    return Buffer.concat([header, padded(data)]);
+  }
+
+  describe("a symlinked ancestor directory (BREAKS)", () => {
+    // An extractor writes a regular file named under a symlinked directory
+    // through the link, so the installed binary does not live in the app.
+    it.each([
+      ["the macOS MacOS directory", "GitPulse.app/Contents/MacOS"],
+      ["the macOS Contents directory", "GitPulse.app/Contents"],
+    ])("fails a bundle whose binaries sit under %s when it is a symlink", async (_label, link) => {
+      const result = check(await bundles({ [MAC]: macTar(tarEntry(link, Buffer.alloc(0), { type: "2" }), ...allMacBins()) }));
+      expect(result.ok).toBe(false);
+    });
+
+    it("fails a deb whose usr/bin is a symlink", async () => {
+      const link = tarEntry("./usr/bin", Buffer.alloc(0), { type: "2" });
+      const deb = debOf("data.tar.gz", gzipSync(tarball(link, ...BINS.map((bin) => tarEntry(`./usr/bin/${bin}`, elf(0x3e))))));
+      const result = check(await bundles({ [DEB]: deb }));
+      expect(result.ok).toBe(false);
+    });
+  });
+
+  describe("a binary only in the wrong place in a Windows installer (BREAKS)", () => {
+    // 7-Zip lays both real v1.3.1 installers out with every binary at the
+    // root; an NSIS `$PLUGINSDIR` copy is a temp file the installer never installs.
+    it("accepts the layout the real installers have: every binary at the root of the extracted tree", async () => {
+      const result = await runWindows(windowsExtract((_bin, id) => id));
+      expect(result.violations).toEqual([]);
+    });
+
+    it.each([
+      ["NSIS", NSIS, "$PLUGINSDIR"],
+      ["MSI", MSI, "somewhere/else"],
+    ])("fails %s when gitpulse-hook is found only inside a subdirectory", async (_label, asset, dir) => {
+      const result = await runWindows(windowsExtract((bin, id) => (bin === "gitpulse-hook" ? `${dir}/${id}` : id)));
+      expect(result.ok).toBe(false);
+      expect(result.violations.some((violation) => violation.startsWith(`${asset}:`) && violation.includes("gitpulse-hook"))).toBe(true);
+    });
+  });
+
+  it("bounds what 7z may unpack, not only what gunzip may (BREAKS)", async () => {
+    // maxUnpackedBytes is the one extraction ceiling, but only the gzip path applies it.
+    const extract = windowsExtract((_bin, id) => id, (outDir) => {
+      const big = path.join(outDir, "big.dat");
+      writeFileSync(big, Buffer.alloc(1));
+      truncateSync(big, 10 * 1024 * 1024);
+    });
+    const result = await runWindows(extract, { maxUnpackedBytes: 64 * 1024 });
+    expect(result.ok).toBe(false);
+  });
+
+  it("does not pass a fat Mach-O whose slices lie past the end of the file (BREAKS)", async () => {
+    const lying = universal();
+    lying.writeUInt32BE(0x4000, 16);
+    lying.writeUInt32BE(0x4000_0000, 20);
+    lying.writeUInt32BE(0x8000, 36);
+    lying.writeUInt32BE(0x4000_0000, 40);
+    const result = check(await bundles({ [MAC]: macTar(...allMacBins("gitpulsed"), macBin("gitpulsed", lying)) }));
+    expect(result.ok).toBe(false);
+  });
+
+  describe("declaredBinaryNames never drops a [[bin]] quietly (BREAKS)", () => {
+    // Either spelling is fine: read the name, or throw. A silent omission
+    // makes that binary optional in every bundle.
+    it.each([
+      ["a TOML literal string", "[[bin]]\nname = 'alpha'\npath = 'a.rs'\n"],
+      ["whitespace inside the table header", '[[ bin ]]\nname = "alpha"\n'],
+      ["an inline bin array", 'bin = [{ name = "alpha", path = "a.rs" }]\n'],
+    ])("reads %s or refuses it", (_label, toml) => {
+      let names: string[];
+      try {
+        names = declaredBinaryNames(toml);
+      } catch {
+        return;
+      }
+      expect(names).toContain("alpha");
+    });
+  });
+
+  describe("cases that hold", () => {
+    it("HOLDS: a suffixed, prefixed or wrongly placed copy of a binary does not stand in for it", async () => {
+      for (const entry of [
+        macBin("gitpulse-hook.bak"),
+        macBin("xgitpulse-hook"),
+        tarEntry("GitPulse.app/Contents/Resources/gitpulse-hook", universal()),
+        tarEntry("GitPulse.app//Contents/MacOS/gitpulse-hook", universal()),
+      ]) {
+        const result = check(await bundles({ [MAC]: macTar(...allMacBins("gitpulse-hook"), entry) }));
+        expect(result.violations).toEqual([`${MAC}: missing: gitpulse-hook`]);
+      }
+    });
+
+    it("HOLDS: a path with spaces and non-ASCII names, and a ustar prefix split, are read", async () => {
+      const body = macTar(
+        ...allMacBins("gitpulse-hook"),
+        prefixedEntry("GitPulse.app/Contents", "MacOS/gitpulse-hook", universal()),
+        tarEntry("GitPulse.app/Contents/Resources/é file 日本.txt", Buffer.from("x"), { mode: 0o644 }),
+      );
+      expect(check(await bundles({ [MAC]: body })).violations).toEqual([]);
+    });
+
+    it("HOLDS: a truncated gzip, a corrupted gzip and an uncompressed tar are refused as unreadable", async () => {
+      const good = macTar(...allMacBins());
+      const flipped = Buffer.from(good);
+      flipped[Math.floor(good.length / 2)] ^= 0xff;
+      for (const body of [good.subarray(0, Math.floor(good.length / 2)), flipped, tarball(...allMacBins())]) {
+        const result = check(await bundles({ [MAC]: body }));
+        expect(result.invalid).toBe(true);
+        expect(result.ok).toBe(false);
+      }
+    });
+
+    it("HOLDS: a bundle that is zero bytes is refused as unreadable, not as missing", async () => {
+      const result = check(await bundles({ [MAC]: Buffer.alloc(0) }));
+      expect(result.invalid).toBe(true);
+      expect(result.violations[0]).toContain("bundle size 0");
+    });
+
+    it("HOLDS: a 7z that exits 0 and extracts nothing is a refusal for every binary", async () => {
+      const result = await runWindows(() => undefined);
+      expect(result.ok).toBe(false);
+      expect(result.violations.filter((violation) => violation.startsWith(NSIS))).toHaveLength(BINS.length);
+    });
+
+    it.skipIf(process.platform === "win32")("HOLDS: the scratch directory is removed whether the extractor succeeds, fails or throws", async () => {
+      const made = await bundles();
+      const scratch = mkdtempSync(path.join(tmpdir(), "gitpulse-adv-tmp-"));
+      tempDirs.push(scratch);
+      const previous = process.env.TMPDIR;
+      process.env.TMPDIR = scratch;
+      try {
+        inspectBundleContents({ version: VERSION, binaries: BINS, files: made.files, extract: made.extract });
+        inspectBundleContents({ version: VERSION, binaries: BINS, files: made.files, extract: () => { throw new Error("7z exited 2"); } });
+        inspectBundleContents({
+          version: VERSION, binaries: BINS, files: made.files,
+          extract: (_archive, outDir) => { writeFileSync(path.join(outDir, "partial"), "x"); throw new Error("7z hung"); },
+        });
+      } finally {
+        if (previous === undefined) delete process.env.TMPDIR;
+        else process.env.TMPDIR = previous;
+      }
+      expect(readdirSync(scratch)).toEqual([]);
+    });
   });
 });

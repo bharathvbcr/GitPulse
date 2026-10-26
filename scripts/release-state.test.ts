@@ -579,3 +579,50 @@ describe("attest stage", () => {
     expect(runReleaseStage(finalizing, run).release_id).toBe("42");
   });
 });
+
+/**
+ * Adversarial cases for ft-ac3bba92 (adversary pass, build run 2026-10-26):
+ * the real `fetchReleaseAsset` against a stand-in `gh` on PATH. Both held.
+ */
+describe.skipIf(process.platform === "win32")("finalize with the real download and a misbehaving gh", () => {
+  const withGh = (mode: string, body: () => void) => {
+    const bin = mkdtempSync(path.join(tmpdir(), "gitpulse-fake-gh-"));
+    scratch.push(bin);
+    const gh = path.join(bin, "gh");
+    writeFileSync(gh, [
+      "#!/bin/bash",
+      'case "$FAKE_GH_MODE" in',
+      '  notfound) echo \'{"message":"Not Found"}\'; echo "gh: Not Found (HTTP 404)" >&2; exit 1;;',
+      "  partial) printf abc; exit 0;;",
+      "  redirect-page) echo '<html><body>Found. Redirecting to https://objects.example/x</body></html>'; exit 0;;",
+      "esac",
+      "",
+    ].join("\n"), {mode: 0o755});
+    const previous = {path: process.env.PATH, mode: process.env.FAKE_GH_MODE};
+    process.env.PATH = `${bin}${path.delimiter}${process.env.PATH ?? ""}`;
+    process.env.FAKE_GH_MODE = mode;
+    try {
+      body();
+    } finally {
+      process.env.PATH = previous.path;
+      if (previous.mode === undefined) delete process.env.FAKE_GH_MODE;
+      else process.env.FAKE_GH_MODE = previous.mode;
+    }
+  };
+
+  it.each([
+    ["a 404 from the download", "notfound", /Download of GitPulse_1\.2\.3_\S+ failed: .*404/],
+    ["a body that stops after three bytes", "partial", /downloaded 3 bytes, expected \d+/],
+    ["an HTML page where the bytes should be", "redirect-page", /downloaded \d+ bytes, expected \d+|does not match GitHub's SHA-256/],
+  ])("HOLDS: refuses %s before any inspection or notes, and leaves no file behind", (_label, mode, expected) => {
+    const {run, patches} = fixture();
+    const deps = bundleDeps();
+    const inspected: unknown[] = [];
+    const request = {...options, stage: "finalize", releaseId: "42", notes: "notes", downloadDir: deps.downloadDir, binaries,
+      inspect: (input: unknown) => { inspected.push(input); throw new Error("must not be reached"); }};
+    withGh(mode, () => expect(() => runReleaseStage(request, run)).toThrow(expected));
+    expect(patches).toHaveLength(0);
+    expect(inspected).toHaveLength(0);
+    expect(readdirSync(deps.downloadDir)).toEqual([]);
+  });
+});
