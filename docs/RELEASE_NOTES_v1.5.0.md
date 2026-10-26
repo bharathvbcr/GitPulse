@@ -74,7 +74,7 @@ GitPulse 1.5.0 is a large release: agents that run in the background with a pane
 
 ## Breaking changes
 
-- **The task profile is migrated one way, to dc-store store schema 10 and workbench schema 14.** A host built against an older schema refuses a migrated profile. Rebuild GitPulse, Manvi and DevCouncil from the same dc-store before any of them opens the profile. (`3a7de123`, `c6b92930`, `6c0e1faa`, `0fdab295`)
+- **The task profile is migrated one way, to dc-store store schema 11 and workbench schema 14.** A host built against an older schema refuses a migrated profile. Rebuild GitPulse, Manvi and DevCouncil from the same dc-store before any of them opens the profile. (`3a7de123`, `c6b92930`, `6c0e1faa`, `0fdab295`)
 - **The ledger schema bumps to writer generation 2 (OD 1).** Additive columns and tables for occurred time, reflog ordinals, and deduplication indexes. Older generation 1 binaries (`gitpulsed`, `gitpulse-mcp`) refuse to write a migrated ledger and must be rebuilt and reinstalled together. (`f053e297`)
 - **Dead `cmd_stash_pop` IPC command removed.** `GitWriter::stash_pop` and `cmd_stash_pop` are removed in favor of `cmd_stash_action` with target OID. Registry stands at 284 handlers. (`6869235a`)
 - **Reinstall `gitpulse-mcp` and `gitpulse-hook`** (`bun run mcp:install`). An older binary carries an older `devmap-store` and cannot read a store a current `devmap` has built. `bun run check:schema-parity` asks every installed reader which schemas it reads. (`710aa9e0`, `650a587a`)

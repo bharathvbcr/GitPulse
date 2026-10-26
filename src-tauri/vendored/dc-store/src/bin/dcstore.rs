@@ -134,6 +134,8 @@ const KNOWN_FLAGS: &[&str] = &[
     "type",
     "requirement-id",
     "acceptance-criterion-id",
+    "subject-hash",
+    "record",
     "data",
     "id",
     "from-agent",
@@ -773,6 +775,63 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
             ]))
         }
 
+        // One independent review of a task's change against an llm_review
+        // criterion. The answer's key is `review_id`, not `id`: one envelope
+        // decodes every reply on the Go side, and `id` is already the
+        // evidence row's.
+        "review-append" => {
+            let id = store
+                .review_append(
+                    required("task")?,
+                    required("acceptance-criterion-id")?,
+                    required("subject-hash")?,
+                    required("record")?,
+                )
+                .map_err(|e| Failure::Fatal(e.to_string()))?;
+            Ok(object(&[
+                ("ok", &json_bool(true)),
+                ("review_id", &id.to_string()),
+            ]))
+        }
+
+        // A task's reviews, newest first. The record is embedded as the JSON
+        // object it was validated as on the way in; one that no longer parses
+        // is carried as null beside a `record_error`, never as a reply that
+        // does not parse.
+        "reviews" => {
+            let (rows, truncated) = store
+                .reviews_list(required("task")?, flag("acceptance-criterion-id"))
+                .map_err(|e| Failure::Fatal(e.to_string()))?;
+            let items: Vec<String> = rows
+                .iter()
+                .map(|r| {
+                    let (record, record_error) =
+                        embed_raw(&r.record_json, dc_store::json::check_container, "null");
+                    with_error(
+                        object(&[
+                            ("id", &r.id.to_string()),
+                            ("task_id", &quote(&r.task_id)),
+                            (
+                                "acceptance_criterion_id",
+                                &quote(&r.acceptance_criterion_id),
+                            ),
+                            ("subject_hash", &quote(&r.subject_hash)),
+                            ("record", &record),
+                            ("recorded_at", &quote(&r.recorded_at)),
+                        ]),
+                        "record_error",
+                        record_error,
+                    )
+                })
+                .collect();
+            Ok(object(&[
+                ("ok", &json_bool(true)),
+                ("reviews", &format!("[{}]", items.join(","))),
+                ("truncated", &json_bool(truncated)),
+                ("shown", &rows.len().to_string()),
+            ]))
+        }
+
         // The requirement rows a task links to, which the verifier dispatches
         // on by verification method. `acceptance_criteria_json` is carried as a
         // string, not embedded: the column is not validated here, and a
@@ -1022,7 +1081,7 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
         }
 
         other => Err(Failure::Fatal(format!(
-            "unknown command {other:?} (acquire, diagnose, release, renew, active, list, task, ready, scope-append, health, serve, evidence-append, evidence-list, gaps, gaps-clear, gaps-replace, gap-history, gap-upsert, run-record, handoff, work)"
+            "unknown command {other:?} (acquire, diagnose, release, renew, active, list, task, ready, scope-append, health, serve, local-repository, evidence-append, evidence-list, requirements, review-append, reviews, gaps, gaps-clear, gaps-replace, gap-history, gap-upsert, run-record, handoff, work)"
         ))),
     }
 }

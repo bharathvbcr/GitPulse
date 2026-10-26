@@ -140,7 +140,7 @@ that it could not check, rather than claiming the app is up to date.
 **Upgrading a profile that has opened a newer task store.** The DevCouncil task
 store (dc-store) migrates one way: a profile migrated to a newer schema cannot be
 read back by a host built against an older one. (The dc-store vendored in this
-tree is store schema 10 with workbench schema 14.) GitPulse, Manvi and DevCouncil
+tree is store schema 11 with workbench schema 14.) GitPulse, Manvi and DevCouncil
 share that profile, so update all three together, built from the same dc-store
 schema, before any of them opens it. Reinstall the `gitpulse-mcp` and `gitpulse-hook` binaries too
 (`bun run mcp:install`); a binary built against an older schema refuses the

@@ -825,6 +825,139 @@ pub fn handoff_get(conn: &Connection, id: &str) -> Result<Option<AgentHandoff>> 
     .map_err(StoreError::from)
 }
 
+/// Ceiling on one review record. A record carries reviewer runs and findings,
+/// each bounded by the writer; a megabyte is far past any honest review and
+/// short of a row that would flood a reply.
+pub const MAX_REVIEW_RECORD_BYTES: usize = 1 << 20;
+
+/// Ceiling on a task or criterion identifier, and on a subject hash.
+const MAX_REVIEW_KEY_BYTES: usize = 256;
+
+/// One row of the `reviews` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewRow {
+    pub id: i64,
+    pub task_id: String,
+    pub acceptance_criterion_id: String,
+    pub subject_hash: String,
+    /// The record as stored: a JSON object, validated by the reader that
+    /// dispatches on it.
+    pub record_json: String,
+    pub recorded_at: String,
+}
+
+fn require_review_key(field: &str, value: &str) -> Result<()> {
+    if value.trim().is_empty() || value.len() > MAX_REVIEW_KEY_BYTES {
+        return Err(StoreError::BadScope {
+            reason: format!("review {field} must be 1-{MAX_REVIEW_KEY_BYTES} bytes and not blank"),
+        });
+    }
+    if value.chars().any(char::is_control) {
+        return Err(StoreError::BadScope {
+            reason: format!("review {field} carries a control character"),
+        });
+    }
+    Ok(())
+}
+
+/// Appends one review. Returns the new row id.
+///
+/// The task must be a live item of this repository: a review recorded against
+/// a task that does not exist is a typo that would otherwise sit in the table
+/// vouching for nothing. The subject hash is restricted to the alphabet the
+/// host's tree-id form uses, so it is compared byte for byte and never needs
+/// normalising. The record must be one JSON object; its fields are the
+/// reader's to validate, because the reader is where a field is acted on.
+pub fn review_append(
+    conn: &Connection,
+    task_id: &str,
+    acceptance_criterion_id: &str,
+    subject_hash: &str,
+    record_json: &str,
+    recorded_at: &str,
+) -> Result<i64> {
+    require_review_key("task id", task_id)?;
+    require_review_key("acceptance criterion id", acceptance_criterion_id)?;
+    require_review_key("subject hash", subject_hash)?;
+    if !subject_hash
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b':' || b == b'-')
+    {
+        return Err(StoreError::BadScope {
+            reason: "review subject hash may hold only a-z, 0-9, ':' and '-'".into(),
+        });
+    }
+    if record_json.len() > MAX_REVIEW_RECORD_BYTES {
+        return Err(StoreError::BadScope {
+            reason: format!("review record is over {MAX_REVIEW_RECORD_BYTES} bytes"),
+        });
+    }
+    require_json("review record", record_json, crate::json::check_container)?;
+    if !record_json.trim_start().starts_with('{') {
+        return Err(StoreError::BadScope {
+            reason: "review record must be a JSON object".into(),
+        });
+    }
+    if !crate::tasks::is_local_item(conn, task_id)? {
+        return Err(StoreError::BadScope {
+            reason: format!("no task {task_id:?} in this repository to record a review against"),
+        });
+    }
+    conn.execute(
+        "INSERT INTO reviews
+            (task_id, acceptance_criterion_id, subject_hash, record_json, recorded_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            task_id,
+            acceptance_criterion_id,
+            subject_hash,
+            record_json,
+            recorded_at
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Lists a task's reviews, newest first, optionally for one criterion.
+///
+/// `truncated` is true when more than [`MAX_LIST_ROWS`] matched.
+pub fn reviews_list(
+    conn: &Connection,
+    task_id: &str,
+    acceptance_criterion_id: Option<&str>,
+) -> Result<(Vec<ReviewRow>, bool)> {
+    let limit = (MAX_LIST_ROWS + 1) as i64;
+    let map_row = |row: &rusqlite::Row<'_>| {
+        Ok(ReviewRow {
+            id: row.get(0)?,
+            task_id: row.get(1)?,
+            acceptance_criterion_id: row.get(2)?,
+            subject_hash: row.get(3)?,
+            record_json: row.get(4)?,
+            recorded_at: row.get(5)?,
+        })
+    };
+    let rows: Vec<ReviewRow> = match acceptance_criterion_id {
+        Some(criterion) => conn
+            .prepare(
+                "SELECT id, task_id, acceptance_criterion_id, subject_hash, record_json, recorded_at
+                 FROM reviews WHERE task_id = ?1 AND acceptance_criterion_id = ?2
+                 ORDER BY id DESC LIMIT ?3",
+            )?
+            .query_map(params![task_id, criterion, limit], map_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        None => conn
+            .prepare(
+                "SELECT id, task_id, acceptance_criterion_id, subject_hash, record_json, recorded_at
+                 FROM reviews WHERE task_id = ?1 ORDER BY id DESC LIMIT ?2",
+            )?
+            .query_map(params![task_id, limit], map_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+    };
+    let truncated = rows.len() > MAX_LIST_ROWS;
+    Ok((rows.into_iter().take(MAX_LIST_ROWS).collect(), truncated))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{SCHEMA_VERSION, Store, schema};

@@ -175,6 +175,28 @@ CREATE TABLE IF NOT EXISTS verification_runs (
     PRIMARY KEY (id)
 );
 CREATE INDEX IF NOT EXISTS ix_verification_runs_task_id ON verification_runs (task_id);
+
+-- One independent review of a task's change against one acceptance criterion
+-- whose verification_method is llm_review. Added at schema 11.
+--
+-- Written by the harness that ran the reviewers — never by the agent whose work
+-- was reviewed, which is why the host refuses the recording command in agent
+-- shells and serves no MCP tool for it. Rows are append-only: a later review is
+-- a new row, so what was recorded is never rewritten. subject_hash names the
+-- exact working-tree content reviewed; verify discharges a criterion only from
+-- the newest row whose subject_hash is the content it is looking at, so a review
+-- of an earlier change can never vouch for a later one. record_json is the
+-- whole record (reviewers, rubric, isolation probe, findings), validated by the
+-- reader that dispatches on it.
+CREATE TABLE IF NOT EXISTS reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id VARCHAR NOT NULL,
+    acceptance_criterion_id VARCHAR NOT NULL,
+    subject_hash VARCHAR NOT NULL,
+    record_json VARCHAR NOT NULL,
+    recorded_at VARCHAR NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_reviews_task_criterion ON reviews (task_id, acceptance_criterion_id);
 "#;
 
 /// The name of the partial unique index the lease's mutual exclusion rests on.

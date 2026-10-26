@@ -108,6 +108,11 @@ before that tag is pushed.
   Git lacks, and force push now sends `--force-with-lease --force-if-includes`
   so a background fetch can no longer defeat the lease; the fleet commit
   rhythm walk falls back to a count-bounded `git log` below Git 2.37.
+- dc-store is re-vendored at DevCouncil `95021ef1`: the task store is schema
+  11 (a `reviews` table, which `llm_review` acceptance criteria are discharged
+  from); workbench stays 14. A store a schema 11 host has opened is refused by
+  a schema 10 build, so GitPulse, Manvi, DevCouncil and the installed
+  `gitpulse-mcp`/`gitpulse-hook` move to 11 together.
 
 ## [1.5.0] - 2026-10-20
 

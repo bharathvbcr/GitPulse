@@ -52,7 +52,13 @@ pub use tasks::{ReadyMode, ReadyTask};
 /// looks valid. Opening a database whose `schema_version` row is *newer* than
 /// this constant fails closed, which is what keeps a build from before 10 from
 /// reading a store whose tasks it cannot find.
-pub const SCHEMA_VERSION: u32 = 10;
+///
+/// 11 added the `reviews` table, which `llm_review` acceptance criteria are
+/// discharged from. The table alone needs no migration step, but the number
+/// moved anyway: a host that verifies `llm_review` against a dcstore that
+/// cannot record or list reviews must be refused at the health check, not fail
+/// later on an "unknown command" that reads like a store outage.
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// The ceiling on one task's agent-appended scope.
 ///
@@ -1184,6 +1190,34 @@ impl Store {
         records::evidence_list(&self.conn, task_id)
     }
 
+    /// Appends one review, stamped now. See [`records::review_append`].
+    pub fn review_append(
+        &self,
+        task_id: &str,
+        acceptance_criterion_id: &str,
+        subject_hash: &str,
+        record_json: &str,
+    ) -> Result<i64> {
+        let recorded_at = self.iso(self.now_epoch());
+        records::review_append(
+            &self.conn,
+            task_id,
+            acceptance_criterion_id,
+            subject_hash,
+            record_json,
+            &recorded_at,
+        )
+    }
+
+    /// Lists a task's reviews, newest first. See [`records::reviews_list`].
+    pub fn reviews_list(
+        &self,
+        task_id: &str,
+        acceptance_criterion_id: Option<&str>,
+    ) -> Result<(Vec<records::ReviewRow>, bool)> {
+        records::reviews_list(&self.conn, task_id, acceptance_criterion_id)
+    }
+
     /// Reads the requirements a task links to. See
     /// [`records::task_requirements`].
     pub fn task_requirements(&self, task_id: &str) -> Result<Option<records::LinkedRequirements>> {
@@ -1603,7 +1637,69 @@ mod tests {
 
     #[test]
     fn test_schema_version() {
-        assert_eq!(SCHEMA_VERSION, 10);
+        assert_eq!(SCHEMA_VERSION, 11);
+    }
+
+    const REVIEW: &str = r#"{"schema":1,"reviewers":[]}"#;
+    const SUBJECT: &str = "git-tree:4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+    #[test]
+    fn reviews_are_appended_and_listed_newest_first_per_criterion() {
+        let store = Store::open_in_memory().expect("open store");
+        plant_task(&store, "TASK-R", "[]", "[]");
+        let first = store
+            .review_append("TASK-R", "AC-1", SUBJECT, REVIEW)
+            .expect("first");
+        let other = store
+            .review_append("TASK-R", "AC-2", SUBJECT, REVIEW)
+            .expect("other criterion");
+        let second = store
+            .review_append("TASK-R", "AC-1", "git-tree:00", REVIEW)
+            .expect("second");
+        assert!(first < other && other < second);
+
+        let (rows, truncated) = store.reviews_list("TASK-R", Some("AC-1")).expect("list");
+        assert!(!truncated);
+        assert_eq!(
+            rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+            [second, first],
+            "newest first, one criterion only"
+        );
+        assert_eq!(rows[0].subject_hash, "git-tree:00");
+        assert_eq!(rows[1].record_json, REVIEW);
+        assert!(parse_iso_utc(&rows[0].recorded_at).is_some(), "{rows:?}");
+
+        let (all, _) = store.reviews_list("TASK-R", None).expect("list all");
+        assert_eq!(all.len(), 3);
+        let (none, _) = store.reviews_list("TASK-OTHER", None).expect("list");
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn a_review_that_could_vouch_for_nothing_is_refused() {
+        let store = Store::open_in_memory().expect("open store");
+        plant_task(&store, "TASK-R", "[]", "[]");
+        let huge = format!(r#"{{"x":"{}"}}"#, "a".repeat(records::MAX_REVIEW_RECORD_BYTES));
+        for (task, criterion, subject, record, why) in [
+            ("TASK-NONE", "AC-1", SUBJECT, REVIEW, "no task"),
+            ("", "AC-1", SUBJECT, REVIEW, "task id"),
+            ("TASK-R", " ", SUBJECT, REVIEW, "acceptance criterion id"),
+            ("TASK-R", "AC\n1", SUBJECT, REVIEW, "control character"),
+            ("TASK-R", "AC-1", "", REVIEW, "subject hash"),
+            ("TASK-R", "AC-1", "GIT-TREE:AB", REVIEW, "a-z, 0-9"),
+            ("TASK-R", "AC-1", "git-tree:ab cd", REVIEW, "a-z, 0-9"),
+            ("TASK-R", "AC-1", SUBJECT, "[1,2]", "JSON object"),
+            ("TASK-R", "AC-1", SUBJECT, "{\"a\":1}{}", "well-formed"),
+            ("TASK-R", "AC-1", SUBJECT, "{\"a\":", "well-formed"),
+            ("TASK-R", "AC-1", SUBJECT, huge.as_str(), "bytes"),
+        ] {
+            let err = store
+                .review_append(task, criterion, subject, record)
+                .expect_err(why);
+            assert!(err.to_string().contains(why), "{why}: {err}");
+        }
+        let (rows, _) = store.reviews_list("TASK-R", None).expect("list");
+        assert!(rows.is_empty(), "a refused review left a row: {rows:?}");
     }
 
     #[test]
