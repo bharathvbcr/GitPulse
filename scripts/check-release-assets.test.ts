@@ -1,12 +1,23 @@
-import { readFileSync } from "node:fs";
+import { linkSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { gzipSync } from "node:zlib";
 import { afterAll, describe, expect, it } from "vitest";
-import { PLATFORM_INSTALLERS, expectedAssetNames, expectedInstallerNames, inspectBundles, inspectReleaseAssets, supplementNames } from "./check-release-assets.mjs";
+import {
+  PLATFORM_INSTALLERS,
+  bundleSpecs,
+  declaredBinaryNames,
+  expectedAssetNames,
+  expectedInstallerNames,
+  inspectBundleContents,
+  inspectBundles,
+  inspectReleaseAssets,
+  supplementNames,
+} from "./check-release-assets.mjs";
 
 const execFileAsync = promisify(execFile);
 const scriptPath = fileURLToPath(new URL("./check-release-assets.mjs", import.meta.url));
@@ -225,5 +236,390 @@ describe("local bundle names", () => {
       .rejects.toMatchObject({ code: 1 });
     await expect(execFileAsync(process.execPath, [scriptPath, "--bundles", "[]", "--platform", "macos-latest", "--tag", "v1.0.0"]))
       .rejects.toMatchObject({ code: 2 });
+  });
+});
+
+describe("declared binaries", () => {
+  it("reads every [[bin]] name wherever its key sits, and ignores comments and other tables", () => {
+    const toml = [
+      "[package]",
+      'name = "not-a-bin"',
+      "[[bin]]",
+      'path = "src/main.rs"   # the key order is the author\'s',
+      'name = "alpha"',
+      "# [[bin]]",
+      '# name = "commented-out"',
+      "[[bin]]  # trailing comment",
+      'name = "beta-two" # and here',
+      "required-features = []",
+      "[[test]]",
+      'name = "a-test-not-a-bin"',
+      "[[bin]]",
+      'name="gamma"',
+      "[dependencies]",
+      'name = "dep"',
+    ].join("\r\n");
+    expect(declaredBinaryNames(toml)).toEqual(["alpha", "beta-two", "gamma"]);
+  });
+
+  it("finds the five executables this crate builds, so a sixth would be required automatically", () => {
+    const cargo = readFileSync(new URL("../src-tauri/Cargo.toml", import.meta.url), "utf8");
+    expect(declaredBinaryNames(cargo).sort()).toEqual(["gitpulse", "gitpulse-hook", "gitpulse-mcp", "gitpulse-ptyd", "gitpulsed"]);
+  });
+});
+
+/** Builders for the installer layouts the bundle check opens. */
+const VERSION = "1.2.3";
+const BINS = ["gitpulse", "gitpulse-hook", "gitpulse-mcp", "gitpulse-ptyd", "gitpulsed"];
+const ARM64 = 0x0100000c;
+const X86_64 = 0x01000007;
+
+function fat(cpus: number[]): Buffer {
+  const head = Buffer.alloc(8 + cpus.length * 20 + 16);
+  head.writeUInt32BE(0xcafebabe, 0);
+  head.writeUInt32BE(cpus.length, 4);
+  cpus.forEach((cpu, index) => head.writeUInt32BE(cpu, 8 + index * 20));
+  return head;
+}
+const universal = () => fat([ARM64, X86_64]);
+function elf(machine: number): Buffer {
+  const out = Buffer.alloc(64);
+  out.writeUInt32BE(0x7f454c46, 0);
+  out[4] = 2;
+  out[5] = 1;
+  out.writeUInt16LE(machine, 18);
+  return out;
+}
+function pe(machine: number): Buffer {
+  const out = Buffer.alloc(0x100);
+  out.write("MZ", 0, "latin1");
+  out.writeUInt32LE(0x80, 0x3c);
+  out.write("PE\0\0", 0x80, "latin1");
+  out.writeUInt16LE(machine, 0x84);
+  return out;
+}
+
+function octal(value: number, width: number): string {
+  return `${value.toString(8).padStart(width - 1, "0")}\0`;
+}
+function tarHeader(name: string, size: number, type = "0", mode = 0o755): Buffer {
+  const header = Buffer.alloc(512);
+  header.write(name, 0, 100, "utf8");
+  header.write(octal(mode, 8), 100, "latin1");
+  header.write(octal(0, 8), 108, "latin1");
+  header.write(octal(0, 8), 116, "latin1");
+  header.write(octal(size, 12), 124, "latin1");
+  header.write(octal(0, 12), 136, "latin1");
+  header.write("        ", 148, "latin1");
+  header.write(type, 156, "latin1");
+  header.write("ustar\0" + "00", 257, "latin1");
+  let sum = 0;
+  for (const byte of header) sum += byte;
+  header.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148, "latin1");
+  return header;
+}
+const padded = (data: Buffer) => Buffer.concat([data, Buffer.alloc((512 - (data.length % 512)) % 512)]);
+function tarEntry(name: string, data: Buffer, opts: { type?: string; mode?: number; declaredSize?: number } = {}): Buffer {
+  const size = opts.declaredSize ?? data.length;
+  return Buffer.concat([tarHeader(name, size, opts.type ?? "0", opts.mode ?? 0o755), padded(data)]);
+}
+function paxRecord(key: string, value: string): string {
+  const body = ` ${key}=${value}\n`;
+  let length = body.length + 1;
+  while (String(length).length + body.length !== length) length = String(length).length + body.length;
+  return `${length}${body}`;
+}
+function paxEntry(records: Record<string, string>, realName: string, data: Buffer, mode = 0o755): Buffer {
+  const text = Buffer.from(Object.entries(records).map(([key, value]) => paxRecord(key, value)).join(""));
+  return Buffer.concat([tarEntry("PaxHeader/x", text, { type: "x", mode: 0o644 }), tarEntry(realName, data, { mode })]);
+}
+const tarball = (...entries: Buffer[]) => Buffer.concat([...entries, Buffer.alloc(1024)]);
+
+function arMember(name: string, data: Buffer): Buffer {
+  const header = Buffer.from(`${name.padEnd(16)}${"0".padEnd(12)}${"0".padEnd(6)}${"0".padEnd(6)}${"100644".padEnd(8)}${String(data.length).padEnd(10)}\`\n`, "latin1");
+  return Buffer.concat([header, data, data.length % 2 ? Buffer.from("\n") : Buffer.alloc(0)]);
+}
+const debOf = (dataName: string, data: Buffer) =>
+  Buffer.concat([Buffer.from("!<arch>\n"), arMember("debian-binary", Buffer.from("2.0\n")), arMember("control.tar.gz", gzipSync(tarball())), arMember(dataName, data)]);
+
+type Extracted = Record<string, Buffer | { symlink: string } | { hardlink: string }>;
+
+/** A scratch dir holding all seven bundled installers, with per-asset overrides. */
+async function bundles(overrides: Record<string, Buffer | Extracted> = {}, bins = BINS) {
+  const dir = await mkdtemp(path.join(tmpdir(), "gitpulse-bundles-"));
+  tempDirs.push(dir);
+  const files: Record<string, string> = {};
+  const windows = new Map<string, Extracted>();
+  for (const spec of bundleSpecs(VERSION)) {
+    const target = path.join(dir, spec.asset);
+    files[spec.asset] = target;
+    const override = overrides[spec.asset];
+    if (spec.format === "app-tar") {
+      const body = override instanceof Buffer ? override
+        : gzipSync(tarball(...bins.map((bin) => tarEntry(`./GitPulse.app/Contents/MacOS/${bin}`, universal()))));
+      writeFileSync(target, body);
+    } else if (spec.format === "deb") {
+      const machine = spec.arch === "arm64" ? 0xb7 : 0x3e;
+      const body = override instanceof Buffer ? override
+        : debOf("data.tar.gz", gzipSync(tarball(...bins.map((bin) => tarEntry(`./usr/bin/${bin}`, elf(machine))))));
+      writeFileSync(target, body);
+    } else {
+      writeFileSync(target, "installer");
+      const machine = spec.arch === "arm64" ? 0xaa64 : 0x8664;
+      const id = (bin: string) => (spec.format === "msi" ? (bin === "gitpulse" ? "Path" : `Bin_${bin.replaceAll("-", "_")}`) : `${bin}.exe`);
+      const layout = override === undefined || Buffer.isBuffer(override) ? undefined : override;
+      windows.set(target, layout ?? Object.fromEntries(bins.map((bin) => [id(bin), pe(machine)])));
+    }
+  }
+  const extract = (archive: string, outDir: string) => {
+    const layout = windows.get(archive);
+    if (!layout) throw new Error(`unexpected archive ${archive}`);
+    for (const [name, content] of Object.entries(layout)) {
+      const dest = path.join(outDir, "nested", name);
+      mkdirSync(path.dirname(dest), { recursive: true });
+      if (Buffer.isBuffer(content)) writeFileSync(dest, content);
+      else if ("symlink" in content) symlinkSync(content.symlink, dest);
+      else linkSync(path.join(outDir, "nested", content.hardlink), dest);
+    }
+  };
+  return { files, extract, dir };
+}
+const check = (made: Awaited<ReturnType<typeof bundles>>, binaries = BINS, extra: Record<string, unknown> = {}) =>
+  inspectBundleContents({ version: VERSION, binaries, files: made.files, extract: made.extract, ...extra });
+const MAC = `GitPulse_${VERSION}_universal.app.tar.gz`;
+const DEB = `GitPulse_${VERSION}_amd64.deb`;
+const DEB_ARM = `GitPulse_${VERSION}_arm64.deb`;
+const MSI = `GitPulse_${VERSION}_x64_en-US.msi`;
+const MSI_ARM = `GitPulse_${VERSION}_arm64_en-US.msi`;
+const NSIS = `GitPulse_${VERSION}_x64-setup.exe`;
+const NSIS_ARM = `GitPulse_${VERSION}_arm64-setup.exe`;
+const macTar = (...entries: Buffer[]) => gzipSync(tarball(...entries));
+const macBin = (bin: string, data = universal(), opts = {}) => tarEntry(`GitPulse.app/Contents/MacOS/${bin}`, data, opts);
+const allMacBins = (skip = "") => BINS.filter((bin) => bin !== skip).map((bin) => macBin(bin));
+
+describe("bundle contents", () => {
+  it("opens exactly the seven bundled installers, derived from the release matrix", () => {
+    const specs = bundleSpecs(VERSION);
+    expect(specs.map((spec) => spec.asset).sort()).toEqual([MAC, DEB, DEB_ARM, MSI, MSI_ARM, NSIS, NSIS_ARM].sort());
+    for (const spec of specs) expect(expectedInstallerNames(VERSION)).toContain(spec.asset);
+    expect(specs.filter((spec) => spec.arch === "arm64")).toHaveLength(3);
+  });
+
+  it("passes when every installer holds every binary, and states what was not opened", async () => {
+    const result = check(await bundles());
+    expect(result.violations).toEqual([]);
+    expect(result.ok).toBe(true);
+    expect(result.opened).toHaveLength(7);
+    expect(result.coverage).toBe("opened 7 of 12 installers; AppImage, dmg and rpm are not opened");
+  });
+
+  it("names the binary and the installer when one is missing from each format", async () => {
+    const made = await bundles({
+      [MAC]: macTar(...allMacBins("gitpulse-hook")),
+      [DEB]: debOf("data.tar.gz", gzipSync(tarball(...BINS.filter((bin) => bin !== "gitpulse-hook").map((bin) => tarEntry(`./usr/bin/${bin}`, elf(0x3e)))))),
+      [MSI]: Object.fromEntries(BINS.filter((bin) => bin !== "gitpulse-hook").map((bin) => [bin === "gitpulse" ? "Path" : `Bin_${bin.replaceAll("-", "_")}`, pe(0x8664)])),
+      [NSIS_ARM]: Object.fromEntries(BINS.filter((bin) => bin !== "gitpulse-hook").map((bin) => [`${bin}.exe`, pe(0xaa64)])),
+    });
+    const result = check(made);
+    expect(result.ok).toBe(false);
+    expect(result.invalid).toBe(false);
+    expect(result.violations).toEqual([
+      `${MAC}: missing: gitpulse-hook`,
+      `${DEB}: missing: gitpulse-hook`,
+      `${MSI}: missing: gitpulse-hook`,
+      `${NSIS_ARM}: missing: gitpulse-hook`,
+    ]);
+  });
+
+  it("requires a sixth [[bin]] the moment one is declared", async () => {
+    const result = check(await bundles(), [...BINS, "gitpulse-newtool"]);
+    expect(result.violations).toHaveLength(7);
+    expect(result.violations.every((violation) => violation.endsWith(": missing: gitpulse-newtool"))).toBe(true);
+  });
+
+  it("refuses an installer that was not provided rather than skipping it", async () => {
+    const made = await bundles();
+    const { [DEB]: _omitted, ...rest } = made.files;
+    const result = inspectBundleContents({ version: VERSION, binaries: BINS, files: rest, extract: made.extract });
+    expect(result.ok).toBe(false);
+    expect(result.violations).toEqual([`missing: ${DEB} was not provided for inspection`]);
+    expect(result.opened).toHaveLength(6);
+  });
+
+  describe("architecture", () => {
+    it("fails a thin Mach-O in the universal archive, in either arch", async () => {
+      for (const thin of [fat([ARM64]), fat([X86_64]), fat([ARM64, X86_64, 7]), fat([ARM64, ARM64]), elf(0x3e)]) {
+        const result = check(await bundles({ [MAC]: macTar(...allMacBins("gitpulsed"), macBin("gitpulsed", thin)) }));
+        expect(result.violations, String(thin.subarray(0, 12).toString("hex"))).toEqual([`${MAC}: wrong-arch: gitpulsed`]);
+      }
+    });
+
+    it("fails an amd64 ELF in the arm64 deb, an arm64 ELF in the amd64 deb, and a non-ELF", async () => {
+      const deb = (machine: number, bin = "gitpulsed") => debOf("data.tar.gz", gzipSync(tarball(
+        ...BINS.filter((name) => name !== bin).map((name) => tarEntry(`./usr/bin/${name}`, elf(machine === 0x3e ? 0xb7 : 0x3e))), tarEntry(`./usr/bin/${bin}`, elf(machine)))));
+      const wrongArm = check(await bundles({ [DEB_ARM]: deb(0x3e) }));
+      expect(wrongArm.violations).toEqual([`${DEB_ARM}: wrong-arch: gitpulsed`]);
+      const wrongX64 = check(await bundles({ [DEB]: deb(0xb7) }));
+      expect(wrongX64.violations).toEqual([`${DEB}: wrong-arch: gitpulsed`]);
+      const notElf = check(await bundles({ [DEB]: debOf("data.tar.gz", gzipSync(tarball(...BINS.map((name) => tarEntry(`./usr/bin/${name}`, name === "gitpulsed" ? pe(0x8664) : elf(0x3e)))))) }));
+      expect(notElf.violations).toEqual([`${DEB}: wrong-arch: gitpulsed`]);
+    });
+
+    it("fails an x64 PE in an arm64 installer and an arm64 PE in an x64 one, in MSI and NSIS", async () => {
+      const layout = (machine: number, msi: boolean, bad: number) => Object.fromEntries(BINS.map((bin) =>
+        [msi ? (bin === "gitpulse" ? "Path" : `Bin_${bin.replaceAll("-", "_")}`) : `${bin}.exe`, pe(bin === "gitpulsed" ? bad : machine)]));
+      const result = check(await bundles({
+        [MSI_ARM]: layout(0xaa64, true, 0x8664), [NSIS_ARM]: layout(0xaa64, false, 0x8664),
+        [MSI]: layout(0x8664, true, 0xaa64), [NSIS]: layout(0x8664, false, 0xaa64),
+      }));
+      expect(result.violations).toEqual([NSIS, MSI, NSIS_ARM, MSI_ARM].map((asset) => `${asset}: wrong-arch: gitpulsed`));
+    });
+  });
+
+  describe("tar entries", () => {
+    const only = (entry: Buffer, skip = "gitpulse-hook") => macTar(...allMacBins(skip), entry);
+
+    it("fails a symlink, a hardlink, an empty file, a non-executable file and a directory named as the binary", async () => {
+      const cases: [string, Buffer][] = [
+        ["symlink", tarEntry("GitPulse.app/Contents/MacOS/gitpulse-hook", Buffer.alloc(0), { type: "2" })],
+        ["hardlink", tarEntry("GitPulse.app/Contents/MacOS/gitpulse-hook", Buffer.alloc(0), { type: "1" })],
+        ["empty", macBin("gitpulse-hook", Buffer.alloc(0))],
+        ["not-executable", macBin("gitpulse-hook", universal(), { mode: 0o644 })],
+        ["not-regular", tarEntry("GitPulse.app/Contents/MacOS/gitpulse-hook", Buffer.alloc(0), { type: "5" })],
+      ];
+      for (const [violation, entry] of cases) {
+        expect(check(await bundles({ [MAC]: only(entry) })).violations, violation).toEqual([`${MAC}: ${violation}: gitpulse-hook`]);
+      }
+    });
+
+    it("fails a binary listed twice, however the second copy is spelled", async () => {
+      const dup = check(await bundles({ [MAC]: macTar(...allMacBins(), tarEntry("./GitPulse.app/Contents/MacOS/gitpulse-hook", universal())) }));
+      expect(dup.violations).toEqual([`${MAC}: duplicate: gitpulse-hook`]);
+    });
+
+    it("fails a path that climbs out of the archive", async () => {
+      const result = check(await bundles({ [MAC]: macTar(...allMacBins(), tarEntry("GitPulse.app/../../evil", universal())) }));
+      expect(result.violations).toEqual([`${MAC}: unsafe-path: GitPulse.app/../../evil`]);
+    });
+
+    it("counts the path an extractor would write: a pax path counts, and a decoy header name does not", async () => {
+      const smuggled = paxEntry({ path: "GitPulse.app/Contents/MacOS/gitpulse-hook" }, "decoy", universal());
+      expect(check(await bundles({ [MAC]: macTar(...allMacBins("gitpulse-hook"), smuggled) })).violations).toEqual([]);
+      const redirected = paxEntry({ path: "somewhere/else" }, "GitPulse.app/Contents/MacOS/gitpulse-hook", universal());
+      expect(check(await bundles({ [MAC]: macTar(...allMacBins("gitpulse-hook"), redirected) })).violations).toEqual([`${MAC}: missing: gitpulse-hook`]);
+    });
+
+    it("reads a GNU long name", async () => {
+      const longName = `GitPulse.app/Contents/MacOS/${"x".repeat(120)}`;
+      const entry = Buffer.concat([
+        tarEntry("././@LongLink", Buffer.from(`GitPulse.app/Contents/MacOS/gitpulse-hook\0`), { type: "L", mode: 0o644 }),
+        tarEntry(longName.slice(0, 100), universal()),
+      ]);
+      expect(check(await bundles({ [MAC]: macTar(...allMacBins("gitpulse-hook"), entry) })).violations).toEqual([]);
+    });
+
+    it("refuses an archive whose sizes lie, whose checksum is wrong, or that never ends", async () => {
+      const lying = macTar(...allMacBins("gitpulse-hook"), tarEntry("GitPulse.app/Contents/MacOS/gitpulse-hook", universal(), { declaredSize: 4_000_000 }));
+      const corrupt = Buffer.from(tarball(...allMacBins()));
+      corrupt[0] ^= 0xff;
+      const unterminated = Buffer.concat(allMacBins());
+      for (const body of [lying, gzipSync(corrupt), gzipSync(unterminated)]) {
+        const result = check(await bundles({ [MAC]: body }));
+        expect(result.invalid).toBe(true);
+        expect(result.ok).toBe(false);
+        expect(result.violations[0]).toContain(`${MAC}: cannot be opened`);
+      }
+    });
+
+    it("refuses a size on an entry that carries no data", async () => {
+      const entry = tarEntry("GitPulse.app/Contents/MacOS/gitpulse-hook", Buffer.alloc(0), { type: "2", declaredSize: 600 });
+      const result = check(await bundles({ [MAC]: macTar(...allMacBins("gitpulse-hook"), entry) }));
+      expect(result.invalid).toBe(true);
+    });
+
+    it("bounds what a gzip stream may unpack to", async () => {
+      const result = check(await bundles(), BINS, { maxUnpackedBytes: 2048 });
+      expect(result.invalid).toBe(true);
+      expect(result.violations.some((violation) => violation.startsWith(`${MAC}: cannot be opened`))).toBe(true);
+    });
+  });
+
+  describe("deb", () => {
+    it("fails closed on a data member it cannot decompress", async () => {
+      for (const name of ["data.tar.xz", "data.tar.zst"]) {
+        const result = check(await bundles({ [DEB]: debOf(name, Buffer.from("not read")) }));
+        expect(result.invalid, name).toBe(true);
+        expect(result.violations).toEqual([`${DEB}: cannot be opened: deb data member is ${name}; only data.tar.gz can be opened`]);
+      }
+    });
+
+    it("refuses a deb with no data member, two of them, or no ar magic", async () => {
+      const data = gzipSync(tarball(...BINS.map((bin) => tarEntry(`./usr/bin/${bin}`, elf(0x3e)))));
+      const none = Buffer.concat([Buffer.from("!<arch>\n"), arMember("debian-binary", Buffer.from("2.0\n"))]);
+      const two = Buffer.concat([debOf("data.tar.gz", data), arMember("data.tar.gz", data)]);
+      for (const body of [none, two, Buffer.from("not an archive at all")]) {
+        expect(check(await bundles({ [DEB]: body })).invalid).toBe(true);
+      }
+    });
+
+    it("walks ar members past odd-length padding", async () => {
+      const data = gzipSync(tarball(...BINS.map((bin) => tarEntry(`./usr/bin/${bin}`, elf(0x3e)))));
+      const odd = Buffer.concat([Buffer.from("!<arch>\n"), arMember("debian-binary", Buffer.from("2.0")), arMember("control.tar.gz", Buffer.from("abc")), arMember("data.tar.gz", data)]);
+      expect(check(await bundles({ [DEB]: odd })).violations).toEqual([]);
+    });
+  });
+
+  describe("windows installers", () => {
+    const msiLayout = (change: (layout: Extracted) => void) => {
+      const layout: Extracted = Object.fromEntries(BINS.map((bin) => [bin === "gitpulse" ? "Path" : `Bin_${bin.replaceAll("-", "_")}`, pe(0x8664)]));
+      change(layout);
+      return layout;
+    };
+
+    it("fails a symlink, a hardlink, an empty file and a duplicate", async () => {
+      const cases: [string, (layout: Extracted) => void][] = [
+        ["symlink", (layout) => { layout.Bin_gitpulse_hook = { symlink: "Path" }; }],
+        ["hardlink", (layout) => { delete layout.Bin_gitpulse_hook; layout.Spare = pe(0x8664); layout.Bin_gitpulse_hook = { hardlink: "Spare" }; }],
+        ["empty", (layout) => { layout.Bin_gitpulse_hook = Buffer.alloc(0); }],
+        ["duplicate", (layout) => { layout.Bin_gitpulse_hook_1 = pe(0x8664); }],
+        ["wrong-arch", (layout) => { layout.Bin_gitpulse_hook = Buffer.from("MZ not a pe"); }],
+      ];
+      for (const [violation, change] of cases) {
+        const result = check(await bundles({ [MSI]: msiLayout(change) }));
+        expect(result.violations, violation).toEqual([`${MSI}: ${violation}: gitpulse-hook`]);
+      }
+    });
+
+    it("finds NSIS binaries by their own file names and fails a duplicate there too", async () => {
+      const layout = (extra: Extracted = {}): Extracted => ({ ...Object.fromEntries(BINS.map((bin) => [`${bin}.exe`, pe(0x8664)])), ...extra });
+      expect(check(await bundles({ [NSIS]: layout() })).violations).toEqual([]);
+      expect(check(await bundles({ [NSIS]: layout({ "gitpulse-mcp_1.exe": pe(0x8664) }) })).violations).toEqual([`${NSIS}: duplicate: gitpulse-mcp`]);
+      const { "gitpulse-ptyd.exe": _gone, ...without } = layout();
+      expect(check(await bundles({ [NSIS]: without })).violations).toEqual([`${NSIS}: missing: gitpulse-ptyd`]);
+    });
+
+    it("exits through a thrown error, never a pass, when 7z is missing", async () => {
+      const made = await bundles();
+      const missing = Object.assign(new Error("spawn 7z ENOENT"), { code: "ENOENT" });
+      const result = inspectBundleContents({ version: VERSION, binaries: BINS, files: made.files, extract: () => { throw missing; } });
+      expect(result.ok).toBe(false);
+      expect(result.invalid).toBe(true);
+      expect(result.violations).toHaveLength(4);
+      expect(result.violations[0]).toContain("cannot be opened: spawn 7z ENOENT");
+    });
+  });
+
+  it("exits 2 from the CLI when the extraction tool is absent, and 1 when installers are not there", async () => {
+    const made = await bundles();
+    const env = { ...process.env, PATH: path.join(made.dir, "no-tools") };
+    const args = ["--contents", made.dir, "--tag", `v${VERSION}`];
+    const noSevenZip = await execFileAsync(process.execPath, [scriptPath, ...args], { env }).catch((error) => error);
+    expect(noSevenZip.code).toBe(2);
+    expect(String(noSevenZip.stderr)).toContain("7z could not run");
+    for (const asset of [MSI, MSI_ARM, NSIS, NSIS_ARM]) await rm(path.join(made.dir, asset));
+    const absent = await execFileAsync(process.execPath, [scriptPath, ...args], { env }).catch((error) => error);
+    expect(absent.code).toBe(1);
+    expect(String(absent.stderr)).toContain(`missing: ${MSI} was not provided`);
+    expect(String(absent.stdout)).toContain("opened 3 of 12 installers");
   });
 });

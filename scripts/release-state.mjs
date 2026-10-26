@@ -2,11 +2,11 @@
 /** One owner for remote release identity, CI provenance, and draft finalization. */
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseTag } from "./check-release-version.mjs";
-import { expectedInstallerNames, inspectReleaseAssets, supplementNames } from "./check-release-assets.mjs";
+import { bundleSpecs, declaredBinaryNames, expectedInstallerNames, inspectBundleContents, inspectReleaseAssets, supplementNames } from "./check-release-assets.mjs";
 import { extractNotes } from "./release-notes.mjs";
 import { formatUsage, wantsHelp } from "./usage.mjs";
 
@@ -20,6 +20,44 @@ export function runCommand(program, args, input) {
   return { status: result.status, stdout: result.stdout ?? "", failed: !!result.error || !!result.signal };
 }
 
+/** One installer download may take this long and be this large; both bound the verify job. */
+export const DOWNLOAD_TIMEOUT_MS = 120_000;
+export const MAX_ASSET_BYTES = 512 * 1024 * 1024;
+
+/**
+ * @typedef {{id: number, name: string, size: number, digest: string}} DraftAsset
+ * @typedef {(request: {repo: string, asset: DraftAsset, dest: string}) => void} AssetFetcher
+ */
+
+/**
+ * Streams one draft asset's bytes to `dest` through `gh api`, by asset ID:
+ * `/releases/tags/{tag}` cannot see a draft, and `--include` would put the
+ * response headers in front of the binary. The file descriptor is the child's
+ * stdout, so the bytes never pass through a buffer here. Size and digest are
+ * checked by the caller, which owns the bound on what it will open.
+ *
+ * @type {AssetFetcher}
+ */
+export function fetchReleaseAsset({repo, asset, dest}) {
+  const fd = openSync(dest, "wx", 0o600);
+  try {
+    const result = spawnSync("gh", ["api", "-H", "Accept: application/octet-stream", `repos/${repo}/releases/assets/${asset.id}`], {
+      stdio: ["ignore", fd, "pipe"], encoding: "utf8", timeout: DOWNLOAD_TIMEOUT_MS, maxBuffer: 1024 * 1024,
+      env: { ...process.env, GH_PROMPT_DISABLED: "1" },
+    });
+    if (result.error || result.signal || result.status !== 0) {
+      throw new Error(`Download of ${asset.name} failed: ${result.error?.message ?? result.signal ?? (result.stderr ?? "").trim().slice(0, 200)}`);
+    }
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** @param {string} file */
+function sha256File(file) {
+  return createHash("sha256").update(readFileSync(file)).digest("hex");
+}
+
 /** @param {unknown} value @returns {Record<string, unknown>} */
 function record(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Expected a JSON object");
@@ -28,19 +66,27 @@ function record(value) {
 
 /**
  * `sboms` carries the two SBOM documents the attest stage uploads, as text.
+ * `finalize` downloads the bundled installers into `downloadDir` and opens them
+ * for every name in `binaries`; it refuses to run without either. `fetchAsset`
+ * and `inspect` are the download and the inspection, injectable so a test needs
+ * neither the network nor 7-Zip.
  *
- * @param {{stage: string, repo: string, tag: string, commit: string, releaseId?: string, notes?: string, sboms?: {spdx: string, cargo: string}}} options
+ * @param {{stage: string, repo: string, tag: string, commit: string, releaseId?: string, notes?: string, sboms?: {spdx: string, cargo: string},
+ *   downloadDir?: string, binaries?: string[], fetchAsset?: AssetFetcher, inspect?: typeof inspectBundleContents}} options
  * @param {Runner} [run]
  */
 export function runReleaseStage(options, run = runCommand) {
-  const { stage, repo, tag, commit, releaseId, notes, sboms } = options;
+  const { stage, repo, tag, commit, releaseId, notes, sboms, downloadDir, binaries, fetchAsset = fetchReleaseAsset, inspect = inspectBundleContents } = options;
   if (!["prepare", "check", "attest", "finalize", "ready"].includes(stage)) throw new Error("Expected prepare, check, attest, finalize, or ready");
   if (!/^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(repo)) throw new Error("Invalid repository");
   const parsed = parseTag(tag);
   if (!parsed.ok) throw new Error(parsed.reason);
+  const releaseVersion = parsed.version;
   if (!/^[a-f0-9]{40}$/.test(commit)) throw new Error("Expected the full preflight commit SHA");
   if (stage !== "prepare" && stage !== "ready" && !/^[1-9]\d*$/.test(releaseId ?? "")) throw new Error("Expected the prepared release ID");
   if (stage === "finalize" && (!notes || Buffer.byteLength(notes) > 125_000)) throw new Error("Missing or oversized release notes");
+  if (stage === "finalize" && (typeof downloadDir !== "string" || downloadDir === "")) throw new Error("finalize needs RELEASE_DOWNLOAD_DIR to open the bundles");
+  if (stage === "finalize" && (!Array.isArray(binaries) || binaries.length === 0)) throw new Error("finalize needs the declared [[bin]] names to look for");
   if (stage === "attest" && ![sboms?.spdx, sboms?.cargo].every(text => typeof text === "string" && text.length > 0 && Buffer.byteLength(text) <= 32 * 1024 * 1024)) {
     throw new Error("Missing, empty or oversized SBOM");
   }
@@ -189,6 +235,51 @@ export function runReleaseStage(options, run = runCommand) {
     return assets;
   }
   /**
+   * Downloads each bundled installer by asset ID, proves the bytes are the ones
+   * GitHub holds (size and SHA-256 from the draft's metadata) before opening
+   * them, requires every declared binary inside, and proves the files did not
+   * change while being read. Returns the coverage statement.
+   * @param {Record<string, unknown>} release
+   */
+  function checkBundleContents(release) {
+    const byName = new Map(assetDigests(release).map(asset => [asset.name, asset]));
+    mkdirSync(String(downloadDir), {recursive: true});
+    const work = mkdtempSync(path.join(String(downloadDir), "bundles-"));
+    try {
+      /** @type {Record<string, string>} */
+      const files = {};
+      /** @type {Record<string, string>} */
+      const digests = {};
+      // Every size is judged before the first byte is fetched.
+      const wanted = bundleSpecs(releaseVersion).map(spec => {
+        const asset = byName.get(spec.asset);
+        if (!asset) throw new Error(`Bundle ${spec.asset} is not on the draft`);
+        const {id, size, digest} = asset;
+        if (typeof size !== "number" || !Number.isSafeInteger(size) || size <= 0 || size > MAX_ASSET_BYTES) {
+          throw new Error(`Bundle ${spec.asset} has a size outside 1..${MAX_ASSET_BYTES}`);
+        }
+        return {spec, id, size, digest};
+      });
+      for (const {spec, id, size, digest} of wanted) {
+        const dest = path.join(work, spec.asset);
+        fetchAsset({repo, asset: {id, name: spec.asset, size, digest}, dest});
+        const got = statSync(dest).size;
+        if (got !== size) throw new Error(`Bundle ${spec.asset} downloaded ${got} bytes, expected ${size}`);
+        if (`sha256:${sha256File(dest)}` !== digest) throw new Error(`Bundle ${spec.asset} does not match GitHub's SHA-256`);
+        files[spec.asset] = dest;
+        digests[spec.asset] = digest;
+      }
+      const result = inspect({version: releaseVersion, binaries: binaries ?? [], files, workDir: work});
+      if (!result.ok) throw new Error(`Bundle contents are wrong: ${result.violations.join("; ")} (${result.coverage})`);
+      for (const [name, file] of Object.entries(files)) {
+        if (`sha256:${sha256File(file)}` !== digests[name]) throw new Error(`Bundle ${name} changed while it was being inspected`);
+      }
+      return result.coverage;
+    } finally {
+      rmSync(work, {recursive: true, force: true});
+    }
+  }
+  /**
    * `/releases/tags/{tag}` only returns published releases. A draft created for
    * this tag is invisible there, and after installer uploads GitHub can also
    * rewrite `tag_name` to `untagged-<hex>`. Looking up only by tag then POSTs
@@ -307,9 +398,12 @@ export function runReleaseStage(options, run = runCommand) {
     }
     checkTag();
   }
+  /** @type {string | undefined} */
+  let coverage;
   if (stage === "finalize") {
     const assets = assetSnapshot(release);
     checkTag();
+    coverage = checkBundleContents(release);
     checkDraft(record(api(`releases/${releaseId}`)));
     checkDraft(record(api(`releases/${releaseId}`, "PATCH", { tag_name: tag, body: notes })));
     const confirmed = checkDraft(record(api(`releases/${releaseId}`)));
@@ -321,7 +415,7 @@ export function runReleaseStage(options, run = runCommand) {
     if (assetSnapshot(confirmed) !== assets) throw new Error("Release assets changed during finalization");
     checkTag();
   }
-  return { release_id: String(release.id), commit, tag, stage };
+  return { release_id: String(release.id), commit, tag, stage, ...(coverage ? { bundles: coverage } : {}) };
 }
 
 /**
@@ -373,7 +467,7 @@ export function resolveReleaseContext(env = process.env, run = runCommand) {
 export function main(argv = process.argv.slice(2)) {
   if (wantsHelp(argv)) {
     console.log(formatUsage({name: "release-state", summary: "Verify remote release provenance and manage its draft lifecycle.",
-      flags: [{flag: "prepare|check|attest|finalize|ready", description: "stage to run; uses GH_REPO, RELEASE_TAG, RELEASE_COMMIT and RELEASE_ID. attest also reads the SBOM files named by RELEASE_SBOM_SPDX and RELEASE_SBOM_CARGO. ready checks CI without mutating the draft or requiring the tag to already point here"}],
+      flags: [{flag: "prepare|check|attest|finalize|ready", description: "stage to run; uses GH_REPO, RELEASE_TAG, RELEASE_COMMIT and RELEASE_ID. attest also reads the SBOM files named by RELEASE_SBOM_SPDX and RELEASE_SBOM_CARGO. finalize also downloads the bundled installers into RELEASE_DOWNLOAD_DIR and opens them (needs gh and 7z). ready checks CI without mutating the draft or requiring the tag to already point here"}],
       exits: "0 stage verified; 1 release refused or verification unavailable"}));
     return 0;
   }
@@ -386,6 +480,10 @@ export function main(argv = process.argv.slice(2)) {
       if (!section.found) throw new Error("Changelog has no notes for release tag");
       notes = section.body;
     }
+    let binaries;
+    if (argv[0] === "finalize") {
+      binaries = declaredBinaryNames(readFileSync(path.join("src-tauri", "Cargo.toml"), "utf8"));
+    }
     let sboms;
     if (argv[0] === "attest") {
       const spdx = process.env.RELEASE_SBOM_SPDX;
@@ -394,7 +492,7 @@ export function main(argv = process.argv.slice(2)) {
       sboms = {spdx: readFileSync(spdx, "utf8"), cargo: readFileSync(cargo, "utf8")};
     }
     const result = runReleaseStage({stage: argv[0], repo, tag,
-      commit, releaseId: process.env.RELEASE_ID, notes, sboms});
+      commit, releaseId: process.env.RELEASE_ID, notes, sboms, binaries, downloadDir: process.env.RELEASE_DOWNLOAD_DIR});
     if (process.env.GITHUB_OUTPUT && result.release_id) appendFileSync(process.env.GITHUB_OUTPUT, `release_id=${result.release_id}\n`);
     console.log(JSON.stringify(result));
     return 0;

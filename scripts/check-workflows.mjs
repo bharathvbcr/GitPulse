@@ -12,9 +12,10 @@
  * binary exits 2 (checker could not run) and is reported differently from
  * workflows that were checked and found faulty, which exits 1.
  *
- * Two rules are read here without actionlint, because a release job holds a
- * write token: every third-party `uses:` is pinned to a commit SHA, and every
- * checkout sets `persist-credentials: false`.
+ * Three rules are read here without actionlint, because a release job holds a
+ * write token: every third-party `uses:` is pinned to a commit SHA, every
+ * checkout sets `persist-credentials: false`, and no step pipes a download
+ * straight into a shell.
  *
  * Exit codes: 0 workflows are clean · 1 actionlint or a pinning rule found
  * problems · 2 the check could not run
@@ -108,7 +109,24 @@ export function checkoutsPersistingCredentials(yaml) {
 }
 
 /**
- * Both rules over every workflow in `dir`, one line per finding.
+ * Lines that run a download without looking at it first: `bash <(curl ...)` or
+ * `curl ... | bash`. A tag-addressed script is whatever its owner last pushed
+ * under that name, so the job executes unreviewed code with its own token.
+ * Download to a file, check a pinned SHA-256, then run it. Comments are skipped.
+ *
+ * @param {string} yaml
+ * @returns {string[]}
+ */
+export function pipedDownloads(yaml) {
+  return yaml
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*#/.test(line))
+    .filter((line) => /\b(?:ba|z|da|k)?sh\s+<\(\s*(?:curl|wget)\b/.test(line) || /\b(?:curl|wget)\b[^|\n]*\|\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b/.test(line))
+    .map((line) => line.trim());
+}
+
+/**
+ * Every rule over every workflow in `dir`, one line per finding.
  *
  * @param {string} dir
  * @returns {string[]}
@@ -117,6 +135,7 @@ export function workflowPolicyFindings(dir) {
   return workflowFiles(dir).flatMap((name) => {
     const text = readFileSync(path.join(dir, name), "utf8");
     return [
+      ...pipedDownloads(text).map((line) => `${name}: runs a download without checking it (${line})`),
       ...unpinnedActions(text).map((ref) => `${name}: ${ref} is not pinned to a 40-character commit SHA`),
       ...checkoutsPersistingCredentials(text).map(
         (index) => `${name}: checkout #${index + 1} does not set persist-credentials: false`,
@@ -160,7 +179,7 @@ export function main() {
   // A rule that was checked and broken outranks an actionlint that could not run.
   if (findings.length) return 1;
   if (code === 0) {
-    console.log(`OK: ${files.length} workflow files lint clean, every action pinned to a commit, no checkout keeps its token (${files.join(", ")})`);
+    console.log(`OK: ${files.length} workflow files lint clean, every action pinned to a commit, no checkout keeps its token, no download is piped into a shell (${files.join(", ")})`);
   }
   return code;
 }

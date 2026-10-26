@@ -141,6 +141,43 @@ it("builds Linux aarch64 and Windows arm64 on native runners with the Linux depe
   expect(release).toContain("if: startsWith(matrix.platform, 'ubuntu-')");
 });
 
+it("opens the bundled installers in verify, with the tools the runner image already has", () => {
+  const verify = workflow.slice(workflow.indexOf("\n  verify:"));
+  const finalize = verify.indexOf("node scripts/release-state.mjs finalize");
+  expect(finalize).toBeGreaterThan(0);
+  // finalize refuses to run without a download directory, so it must be set
+  // in the same step; and ten minutes was sized before seven downloads.
+  const step = verify.slice(verify.lastIndexOf("      - name:", finalize), finalize);
+  expect(step).toContain("RELEASE_DOWNLOAD_DIR: ${{ runner.temp }}/bundles");
+  expect(verify).toContain("timeout-minutes: 25");
+  expect(verify).not.toContain("timeout-minutes: 10");
+  // 7-Zip opens MSI and NSIS; it ships on the image (p7zip-full pulls in
+  // 7zip), so nothing is installed and a missing tool fails by name.
+  expect(verify).not.toMatch(/apt-get|apt install|msitools/);
+  // One `command -v` per tool: `command -v a b` exits 0 when only one is found.
+  expect(verify.slice(0, finalize)).toMatch(/command -v 7z\n\s+command -v gh\n/);
+  expect(verify).toContain("The dmg, both rpms and both AppImages are not opened.");
+  // The names it requires come from Cargo.toml, not from this workflow.
+  expect(verify).not.toContain("gitpulse-hook");
+  expect(stateScript).toContain("declaredBinaryNames(readFileSync(path.join(\"src-tauri\", \"Cargo.toml\")");
+  expect(stateScript).toContain("downloadDir: process.env.RELEASE_DOWNLOAD_DIR");
+});
+
+it("tells whoever rolls a release back how to delete its tag, and what the pre-push hook does about it", () => {
+  const contributing = readFileSync(new URL("../CONTRIBUTING.md", import.meta.url), "utf8");
+  const section = contributing.slice(contributing.indexOf("### Releasing and rolling back"));
+  expect(section).toContain("git push origin :refs/tags/vX.Y.Z");
+  expect(section).toContain("git tag -d vX.Y.Z");
+  expect(section).toContain(".githooks/pre-push");
+  expect(section).toMatch(/does not object to this/);
+  expect(section).toMatch(/already\s+exists/);
+  expect(section).toMatch(/\*\*unverified:\*\*[\s\S]*immutable releases[\s\S]*tag ruleset/);
+  // The claim is about the hook's code: it skips a deletion and never reads the remote tag.
+  const hook = readFileSync(new URL("../.githooks/pre-push", import.meta.url), "utf8");
+  expect(hook).toContain('[ "$local_sha" = "$zero" ] && continue');
+  expect(hook).not.toMatch(/ls-remote|fetch|refs\/tags\/[^\n]*\$remote_sha/);
+});
+
 it("attaches checksums and SBOMs after every installer and before finalize", () => {
   const attest = workflow.slice(workflow.indexOf("\n  attest:"), workflow.indexOf("\n  verify:"));
   expect(attest).toContain("needs: [preflight, prepare, release]");

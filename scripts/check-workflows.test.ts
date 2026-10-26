@@ -7,6 +7,7 @@ import {
   checkoutsPersistingCredentials,
   hasWorkflowLevelPermissions,
   interpret,
+  pipedDownloads,
   unpinnedActions,
   workflowFiles,
   workflowPolicyFindings,
@@ -108,9 +109,37 @@ describe("check:workflows", () => {
     expect(checkoutsPersistingCredentials(yaml)).toEqual([0, 2]);
   });
 
-  it("holds every workflow in this repository to both rules", () => {
+  it("holds every workflow in this repository to every rule", () => {
     const dir = fileURLToPath(new URL("../.github/workflows", import.meta.url));
     expect(workflowPolicyFindings(dir)).toEqual([]);
+  });
+
+  it("finds a download piped or process-substituted into a shell, and ignores comments", () => {
+    const yaml = [
+      "        run: bash <(curl -fsSL https://example.com/install.sh) 1.0",
+      "        run: curl -fsSL https://example.com/install.sh | sudo bash",
+      "        run: wget -qO- https://example.com/install.sh | sh -s --",
+      "        run: sh <(wget -qO- https://example.com/install.sh)",
+      "        # run: bash <(curl -fsSL https://example.com/install.sh)",
+      "        run: curl -fsSL -o tool.tgz https://example.com/tool.tgz",
+      "        run: echo abc | sha256sum -c -",
+    ].join("\n");
+    expect(pipedDownloads(yaml)).toHaveLength(4);
+  });
+
+  it("installs actionlint from a tarball checked against a pinned SHA-256, not a script piped into bash", () => {
+    const ci = readFileSync(fileURLToPath(new URL("../.github/workflows/ci.yml", import.meta.url)), "utf8");
+    // v1.7.12's linux_amd64 tarball; the digest is in the release's
+    // checksums.txt and in GitHub's asset metadata.
+    expect(ci).toContain("8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint_1.7.12_linux_amd64.tar.gz");
+    expect(ci).toContain("sha256sum -c -");
+    expect(ci).toContain("tar -xzf actionlint_1.7.12_linux_amd64.tar.gz actionlint");
+    // ci:local matches the lint step by this exact command.
+    expect(ci).toContain("run: ./actionlint -color");
+    const dir = fileURLToPath(new URL("../.github/workflows", import.meta.url));
+    for (const name of workflowFiles(dir)) {
+      expect(pipedDownloads(readFileSync(`${dir}/${name}`, "utf8")), name).toEqual([]);
+    }
   });
 
   it("prints the rust coverage summary without rerunning the tests", () => {
