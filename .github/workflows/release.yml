@@ -373,10 +373,12 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     # Seven bundles are downloaded and opened before the notes are written.
-    # That check has one 12-minute budget (BUNDLE_CHECK_BUDGET_MS in
+    # That check has one 10-minute budget (BUNDLE_CHECK_BUDGET_MS in
     # scripts/release-state.mjs) and refuses by name when it runs out; with
-    # 3 minutes of setup and 8 minutes of bounded API calls around it, it fits
-    # here with 2 minutes to spare. Ten minutes was sized for the metadata check.
+    # 3 minutes of setup and
+    # 10 minutes for the 10 bounded gh/git calls finalize makes around it, it
+    # fits here with 2 minutes to spare (release-workflow.test.ts counts the
+    # calls). Ten minutes was sized for the metadata check.
     timeout-minutes: 25
     permissions:
       # `contents: write` is the *minimum* that works here, not a convenience:

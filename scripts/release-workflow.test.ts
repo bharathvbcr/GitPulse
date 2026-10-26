@@ -2,7 +2,12 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { BUNDLE_CHECK_BUDGET_MS, DOWNLOAD_TIMEOUT_MS } from "./release-state.mjs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { expectedAssetNames } from "./check-release-assets.mjs";
+import { BUNDLE_CHECK_BUDGET_MS, COMMAND_TIMEOUT_MS, DOWNLOAD_TIMEOUT_MS, runReleaseStage, type Runner } from "./release-state.mjs";
 
 const stateScript = readFileSync(new URL("./release-state.mjs", import.meta.url), "utf8");
 const workflow = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
@@ -164,20 +169,64 @@ it("opens the bundled installers in verify, with the tools the runner image alre
   expect(stateScript).toContain("downloadDir: process.env.RELEASE_DOWNLOAD_DIR");
 });
 
+/**
+ * The `gh` and `git` calls `finalize` makes through its runner, counted by
+ * running it against a fake one with the download and the inspection stubbed:
+ * the check's own budget is spent elsewhere, so these are the calls that sit
+ * around it and each can take COMMAND_TIMEOUT_MS.
+ */
+function boundedCallsInFinalize(): number {
+  const commit = "a".repeat(40);
+  const stubBytes = (name: string) => Buffer.from(`bytes:${name}`);
+  const digest = (name: string) => `sha256:${createHash("sha256").update(stubBytes(name)).digest("hex")}`;
+  let release: Record<string, unknown> = {
+    id: 42, tag_name: "v1.2.3", name: "GitPulse v1.2.3", target_commitish: commit, draft: true, prerelease: false,
+    immutable: false, published_at: null, body: "pending",
+    assets: expectedAssetNames("1.2.3").map((name, index) => ({id: index + 1, name, size: stubBytes(name).length, state: "uploaded", digest: digest(name)})),
+  };
+  let calls = 0;
+  const run: Runner = (program, args, input) => {
+    calls += 1;
+    if (program === "git") return {status: 0, failed: false, stdout: args[0] === "rev-parse" ? commit : `${commit}\trefs/tags/v1.2.3\n`};
+    if (args[3] === "PATCH") release = {...release, ...JSON.parse(input ?? "{}")};
+    return {status: 0, failed: false, stdout: `HTTP/2.0 200 Status\nContent-Type: application/json\r\n\r\n${JSON.stringify(release)}`};
+  };
+  const downloadDir = mkdtempSync(path.join(tmpdir(), "gitpulse-finalize-calls-"));
+  try {
+    const result = runReleaseStage({
+      stage: "finalize", repo: "owner/repo", tag: "v1.2.3", commit, releaseId: "42", notes: "notes", downloadDir,
+      binaries: ["gitpulse", "gitpulse-hook", "gitpulse-mcp", "gitpulse-ptyd", "gitpulsed"],
+      fetchAsset: ({asset, dest}) => writeFileSync(dest, stubBytes(asset.name)),
+      inspect: ({files}) => ({ok: true, invalid: false, violations: [], opened: Object.keys(files), coverage: "opened 7 of 12 installers"}),
+    }, run);
+    expect(result.stage).toBe("finalize");
+  } finally {
+    rmSync(downloadDir, {recursive: true, force: true});
+  }
+  return calls;
+}
+
 it("sizes the bundle-check budget so it and the rest of the verify job fit inside timeout-minutes", () => {
   const verify = workflow.slice(workflow.indexOf("\n  verify:"));
   const limit = Number(/timeout-minutes:\s*(\d+)/.exec(verify)?.[1]);
   expect(limit).toBeGreaterThan(0);
-  // release-state.mjs documents the arithmetic: the budget, 3 min for checkout,
-  // setup-node and the tool check, and 8 min for the eight 60 s-bounded API and
-  // git calls finalize makes outside the check.
+  // The job spends, besides the budget: 3 min of checkout, setup-node and the
+  // tool check (an allowance, not measured), and COMMAND_TIMEOUT_MS for each
+  // bounded call finalize makes. The call count is measured, so a new call
+  // fails this until the budget or the allowance is revisited.
+  const calls = boundedCallsInFinalize();
+  expect(calls).toBeGreaterThan(0);
   const budgetMinutes = BUNDLE_CHECK_BUDGET_MS / 60_000;
-  const aroundTheCheck = 3 + 8;
-  expect(budgetMinutes + aroundTheCheck).toBeLessThan(limit);
-  expect(limit - (budgetMinutes + aroundTheCheck)).toBeGreaterThanOrEqual(2);
+  const setupMinutes = 3;
+  const callMinutes = (calls * COMMAND_TIMEOUT_MS) / 60_000;
+  const total = budgetMinutes + setupMinutes + callMinutes;
+  expect(limit - total, `${budgetMinutes} + ${setupMinutes} + ${callMinutes} = ${total} min of ${limit}`).toBeGreaterThanOrEqual(2);
+  // The documented sum is the measured one.
+  expect(stateScript).toContain(`${budgetMinutes} min + ${setupMinutes} min + ${callMinutes} min = ${total} min`);
+  expect(workflow).toContain(`${budgetMinutes}-minute budget`);
+  expect(workflow).toContain(`${callMinutes} minutes for the ${calls} bounded gh/git calls`);
   // Per call, 120 s caps stay: the budget is the overall bound, the cap is per call.
   expect(DOWNLOAD_TIMEOUT_MS).toBe(120_000);
-  expect(stateScript).toContain("12 min + 3 min + 8 min = 23 min");
 });
 
 it("tells whoever rolls a release back how to delete its tag, and what the pre-push hook does about it", () => {

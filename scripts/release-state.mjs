@@ -11,10 +11,13 @@ import { extractNotes } from "./release-notes.mjs";
 import { formatUsage, wantsHelp } from "./usage.mjs";
 
 /** @typedef {(program: string, args: string[], input?: string) => {status: number | null, stdout: string, failed: boolean}} Runner */
+/** Every `gh` and `git` call a stage makes through `runCommand` is killed after this long. */
+export const COMMAND_TIMEOUT_MS = 60_000;
+
 /** @type {Runner} */
 export function runCommand(program, args, input) {
   const result = spawnSync(program, args, {
-    input, encoding: "utf8", timeout: 60_000, maxBuffer: 4 * 1024 * 1024,
+    input, encoding: "utf8", timeout: COMMAND_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024,
     env: { ...process.env, GH_PROMPT_DISABLED: "1", GIT_TERMINAL_PROMPT: "0" },
   });
   return { status: result.status, stdout: result.stdout ?? "", failed: !!result.error || !!result.signal };
@@ -31,14 +34,18 @@ export const MAX_ASSET_BYTES = 512 * 1024 * 1024;
  * `timeout-minutes: 25` (1500 s), and around this check the job spends, at
  * worst:
  *   3 min  checkout, setup-node and the tool check;
- *   8 min  the eight bounded `gh`/`git` calls finalize makes outside the check
- *          (assetSnapshot, two tag checks, three draft reads, the PATCH and
- *          the confirming read), each capped at 60 s by `runCommand`.
- * 12 min + 3 min + 8 min = 23 min, which leaves 2 min of margin inside 25.
+ *   10 min the ten bounded `gh`/`git` calls finalize makes outside the check,
+ *          each capped at COMMAND_TIMEOUT_MS (60 s) by `runCommand`: three tag
+ *          checks (each a `git rev-parse` and a `git ls-remote`) and four
+ *          GitHub API calls (the draft read, the read before the PATCH, the
+ *          PATCH and the confirming read).
+ * 10 min + 3 min + 10 min = 23 min, which leaves 2 min of margin inside 25.
  * Hashing and gunzip are CPU work of a few seconds and are not drawn from it.
- * release-workflow.test.ts re-derives this sum from the workflow file.
+ * release-workflow.test.ts counts those calls by running finalize against a
+ * fake runner and re-derives this sum from the workflow file, so adding a
+ * call fails it until the budget or this comment is revisited.
  */
-export const BUNDLE_CHECK_BUDGET_MS = 12 * 60 * 1000;
+export const BUNDLE_CHECK_BUDGET_MS = 10 * 60 * 1000;
 
 /**
  * @typedef {{id: number, name: string, size: number, digest: string}} DraftAsset
