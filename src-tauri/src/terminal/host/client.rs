@@ -34,6 +34,8 @@ use std::time::{Duration, Instant};
 
 /// What a call that lost its connection is told.
 const LOST: &str = "The connection to the terminal host was lost; the terminal kept running there.";
+/// What a connect that the app's quit overtook is told.
+const QUIT: &str = "GitPulse is quitting and has let the terminal host go.";
 /// The longest an ordinary request waits for its answer.
 const CALL_DEADLINE: Duration = Duration::from_secs(10);
 /// A spawn checks the repository and its trust and forks.
@@ -322,12 +324,54 @@ struct Vouched {
     /// Sessions whose exit has been reported, newest last: a listing taken
     /// before the exit must not bring one back.
     exited: VecDeque<String>,
+    /// `exited` has dropped its oldest: an id absent from it may be one that
+    /// ended long ago, so a later listing is trusted only for ids already held.
+    wrapped: bool,
+    /// A connection has listed the host's sessions at least once.
+    listed_once: bool,
+    /// An `adopt` is between asking for the listing and finishing.
+    adopting: bool,
+    /// Spawns the host confirmed while `adopting`: the listing was taken
+    /// before them, so neither publishing it nor reconciling against it may
+    /// drop them.
+    late: HashSet<String>,
 }
 
 impl Vouched {
+    /// Nothing is vouched for until a connection lists again. `held` stays as
+    /// the ids a stricter later listing may be checked against.
     fn revoke(&mut self) {
         self.live = false;
-        self.held.clear();
+    }
+}
+
+/// An `adopt` is under way: spawns confirmed meanwhile are kept apart, however
+/// it ends.
+struct AdoptionWindow<'a>(&'a Inner);
+
+impl<'a> AdoptionWindow<'a> {
+    fn open(inner: &'a Inner) -> Self {
+        let mut vouched = lock(&inner.vouched);
+        vouched.adopting = true;
+        vouched.late.clear();
+        Self(inner)
+    }
+}
+
+impl Drop for AdoptionWindow<'_> {
+    fn drop(&mut self) {
+        let mut vouched = lock(&self.0.vouched);
+        vouched.adopting = false;
+        vouched.late.clear();
+    }
+}
+
+/// Clears `retrying` when the retry ends, even by a panic.
+struct Retrying<'a>(&'a AtomicBool);
+
+impl Drop for Retrying<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -503,6 +547,9 @@ impl HostClient {
             vouched.starting.remove(&session);
             if deferred.is_none() && !vouched.exited.contains(&session) {
                 vouched.held.insert(session.clone());
+                if vouched.adopting {
+                    vouched.late.insert(session.clone());
+                }
             }
         }
         if let Some(ended) = deferred {
@@ -930,7 +977,7 @@ impl Inner {
             return Ok(conn);
         }
         if self.leaving.load(Ordering::Acquire) {
-            return Err("GitPulse is quitting and has let the terminal host go.".into());
+            return Err(QUIT.into());
         }
         let _connecting = lock(&self.connecting);
         if let Some(conn) = self.current() {
@@ -958,7 +1005,17 @@ impl Inner {
             }
         };
         let conn = self.open(stream)?;
-        *lock(&self.conn) = Some(conn.clone());
+        {
+            // Under the lock `disconnect` takes: a quit that came while this
+            // was connecting either is seen here or finds this connection.
+            let mut current = lock(&self.conn);
+            if self.leaving.load(Ordering::Acquire) {
+                drop(current);
+                conn.close();
+                return Err(QUIT.into());
+            }
+            *current = Some(conn.clone());
+        }
         let limit = self.limit.load(Ordering::Acquire);
         if limit > 0 {
             let _ = conn.send(Request::Limit { limit }, &[], None);
@@ -974,7 +1031,7 @@ impl Inner {
             // connection kept would be reused without ever listing again.
             if !lock(&self.vouched).live {
                 self.drop_connection(&conn);
-                if retry {
+                if retry && !self.leaving.load(Ordering::Acquire) {
                     self.retry_adoption();
                 }
             }
@@ -1073,10 +1130,11 @@ impl Inner {
     /// this app was away is recorded now; a proxy whose session the host no
     /// longer holds, and that no receipt accounts for, is ended.
     fn adopt(self: &Arc<Self>, conn: &Arc<Connection>) -> Result<(), String> {
+        let _window = AdoptionWindow::open(self);
         let listed: Vec<TerminalListing> =
             serde_json::from_value(conn.call(Request::List, &[], CALL_DEADLINE)?)
                 .map_err(|e| e.to_string())?;
-        self.publish_listing(conn, &listed)?;
+        let exited = self.publish_listing(conn, &listed)?;
         let reattach: Vec<String> = {
             let mut proxies = lock(&self.proxies);
             let mut reattach = Vec::new();
@@ -1089,6 +1147,8 @@ impl Inner {
                         reattach.push(listing.id.clone());
                     }
                     Some(_) => {}
+                    // Its exit was reported after the listing was taken.
+                    None if exited.contains(&listing.id) => {}
                     None => {
                         let observer = listing
                             .run_id
@@ -1104,18 +1164,32 @@ impl Inner {
             reattach
         };
         self.adopted.store(true, Ordering::Release);
-        let receipts: Vec<WireEnded> =
-            serde_json::from_value(conn.call(Request::Receipts, &[], CALL_DEADLINE)?)
-                .map_err(|e| e.to_string())?;
-        if !receipts.is_empty() {
-            log::info!(target: "terminal", "{} terminal session(s) ended while this app was not connected; recording them", receipts.len());
-        }
-        for ended in receipts {
-            self.record_exit(ended);
-        }
+        let receipts: Result<Vec<WireEnded>, String> = conn
+            .call(Request::Receipts, &[], CALL_DEADLINE)
+            .and_then(|value| serde_json::from_value(value).map_err(|e| e.to_string()));
+        // Receipts that cannot be read do not leave proxies for sessions the
+        // host no longer holds: they are ended below as when none accounts for
+        // them, and the call still reports the failure.
+        let receipts_error = match receipts {
+            Ok(receipts) => {
+                if !receipts.is_empty() {
+                    log::info!(target: "terminal", "{} terminal session(s) ended while this app was not connected; recording them", receipts.len());
+                }
+                for ended in receipts {
+                    self.record_exit(ended);
+                }
+                None
+            }
+            Err(error) => Some(error),
+        };
+        let confirmed_meanwhile = lock(&self.vouched).late.clone();
         let gone: Vec<String> = lock(&self.proxies)
             .iter()
-            .filter(|(id, p)| !p.starting && !listed.iter().any(|l| &l.id == *id))
+            .filter(|(id, p)| {
+                !p.starting
+                    && !confirmed_meanwhile.contains(*id)
+                    && !listed.iter().any(|l| &l.id == *id)
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for id in gone {
@@ -1138,31 +1212,44 @@ impl Inner {
         for id in reattach {
             self.reattach(conn, &id);
         }
-        Ok(())
+        receipts_error.map_or(Ok(()), Err)
     }
 
     /// What the host just listed becomes what `holds_session` vouches for, as
-    /// long as `conn` is still the open connection: a listing read on one that
-    /// has since been lost is not current. Sessions whose exit has been
-    /// reported are left out, because the listing may predate it. Done before
+    /// long as `conn` is still the open connection and the app has not let the
+    /// host go: a listing read on one that has since been lost is not current.
+    /// The listing was taken before any exit reported since, so those ids are
+    /// left out (and returned, so no proxy is made for them), and before any
+    /// spawn confirmed since, which are kept. Once the record of exits has
+    /// wrapped, a reconnect vouches only for ids it already held. Done before
     /// the observers are read from the store, so the answer never waits on that.
     fn publish_listing(
         &self,
         conn: &Arc<Connection>,
         listed: &[TerminalListing],
-    ) -> Result<(), String> {
+    ) -> Result<HashSet<String>, String> {
         let current = lock(&self.conn);
+        if self.leaving.load(Ordering::Acquire) {
+            return Err(QUIT.into());
+        }
         if !current.as_ref().is_some_and(|open| Arc::ptr_eq(open, conn)) {
             return Err(LOST.into());
         }
         let mut vouched = lock(&self.vouched);
-        vouched.held = listed
-            .iter()
-            .filter(|listing| !vouched.exited.contains(&listing.id))
-            .map(|listing| listing.id.clone())
-            .collect();
+        let strict = vouched.wrapped && vouched.listed_once;
+        let mut next = vouched.late.clone();
+        let mut exited = HashSet::new();
+        for listing in listed {
+            if vouched.exited.contains(&listing.id) {
+                exited.insert(listing.id.clone());
+            } else if !strict || vouched.held.contains(&listing.id) {
+                next.insert(listing.id.clone());
+            }
+        }
+        vouched.held = next;
         vouched.live = true;
-        Ok(())
+        vouched.listed_once = true;
+        Ok(exited)
     }
 
     /// Takes `conn` out of use if it is still the open connection, and says
@@ -1232,11 +1319,13 @@ impl Inner {
         {
             let mut vouched = lock(&self.vouched);
             vouched.held.remove(&id);
+            vouched.late.remove(&id);
             vouched.starting.remove(&id);
             if !vouched.exited.contains(&id) {
                 vouched.exited.push_back(id.clone());
                 while vouched.exited.len() > REMEMBERED_EXITS {
                     vouched.exited.pop_front();
+                    vouched.wrapped = true;
                 }
             }
         }
@@ -1419,7 +1508,7 @@ impl Inner {
         let spawned = crate::supervisor::spawn_one_of_many(
             "terminal-host-reconnect",
             "terminal host reconnect",
-            move || inner.reconnect(&RECONNECT_DELAYS),
+            move || inner.reconnect(&RECONNECT_DELAYS, true),
         );
         if let Err(error) = spawned {
             log::warn!(target: "terminal", "terminal host reconnect did not start: {error}");
@@ -1427,7 +1516,8 @@ impl Inner {
     }
 
     /// One attempt after each of `delays`, until one connects and adopts.
-    fn reconnect(self: &Arc<Self>, delays: &[Duration]) {
+    /// `retry`: an attempt whose listing fails starts the adoption retry.
+    fn reconnect(self: &Arc<Self>, delays: &[Duration], retry: bool) {
         for delay in delays {
             if !delay.is_zero() {
                 std::thread::sleep(*delay);
@@ -1435,7 +1525,7 @@ impl Inner {
             if self.leaving.load(Ordering::Acquire) {
                 return;
             }
-            match self.connect(false) {
+            match self.connect(retry) {
                 Ok(_) => return,
                 Err(error) => {
                     log::warn!(target: "terminal", "terminal host reconnect failed: {error}")
@@ -1456,8 +1546,8 @@ impl Inner {
             "terminal-host-adopt-retry",
             "terminal host adoption retry",
             move || {
-                inner.reconnect(&ADOPTION_RETRY_DELAYS);
-                inner.retrying.store(false, Ordering::Release);
+                let _retrying = Retrying(&inner.retrying);
+                inner.reconnect(&ADOPTION_RETRY_DELAYS, false);
             },
         );
         if let Err(error) = spawned {
