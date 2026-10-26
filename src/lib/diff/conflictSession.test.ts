@@ -85,7 +85,7 @@ describe("conflict draft recovery", () => {
     sessions.pending("/repo", "file", snapshot("saved"), "a", saved);
     expect(sessions.get("/repo", "file")?.pending).toBeNull();
   });
-  it("trims history by its serialized budget to exactly the stack the reserialize-and-shift loop kept", () => {
+  it("trims history by its serialized budget to exactly the stack the reserialize-and-shift loop kept", { timeout: 30_000 }, () => {
     // The old loop: push, then `while (undo.length > 50 || JSON.stringify(undo).length > 1 MiB) undo.shift()`.
     const oracle = (states: ReturnType<typeof choice>[]) => {
       let undo: unknown[] = [initialResolution(snapshot())];

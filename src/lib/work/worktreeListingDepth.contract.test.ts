@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync } from "node:fs";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
@@ -32,7 +32,7 @@ function listingCalls(): Array<{ location: string; args: string | null }> {
     for (const match of source.matchAll(/"cmd_list_worktrees"\s*,/g)) {
       const line = source.slice(0, match.index).split("\n").length;
       const literal = /^\s*(\{[^}]*\})/.exec(source.slice((match.index ?? 0) + match[0].length));
-      calls.push({ location: `${relative(srcRoot, path)}:${line}`, args: literal ? literal[1] : null });
+      calls.push({ location: `${relative(srcRoot, path).split(sep).join("/")}:${line}`, args: literal ? literal[1] : null });
     }
   }
   return calls;

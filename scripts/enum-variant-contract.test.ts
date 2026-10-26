@@ -294,7 +294,7 @@ function tsUnion(name: string, tag?: string, root = TS_ROOT): { literals: Set<st
     if (literals === null) continue;
     return {
       literals,
-      file: path.relative(root, file),
+      file: path.relative(root, file).split(path.sep).join("/"),
     };
   }
   return null;

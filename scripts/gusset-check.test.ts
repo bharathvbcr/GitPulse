@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { wallClockBudget } from "../src/lib/testing/wallClock";
 import {
@@ -54,7 +55,9 @@ describe("gusset:check checkout resolution", () => {
         "",
         `use "${nested}"`,
         "",
-        'replace github.com/bharathvbcr/DevCouncil/backend/go_orchestrator => "/Code/devtools/DevCouncil/backend/go_orchestrator"',
+        // The module directory is joined with the host's separator, as go.work
+        // takes it on each platform; the checkout roots pass through as given.
+        `replace github.com/bharathvbcr/DevCouncil/backend/go_orchestrator => ${JSON.stringify(join("/Code/devtools/DevCouncil", "backend", "go_orchestrator"))}`,
         'replace github.com/bharathvbcr/gusset => "/Code/devtools/gusset"',
         "",
       ].join("\n"),

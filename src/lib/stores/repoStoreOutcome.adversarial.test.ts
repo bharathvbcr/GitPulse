@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { codeOnly, svelteFiles, tsSourceFiles } from "./sourceScan";
@@ -105,7 +105,7 @@ describe("attack 3: the repository scan is blind where the real discards are", (
     const files = [...svelteFiles(SRC), ...tsSourceFiles(join(SRC, "lib"))];
     const offenders = files.flatMap((file) => {
       const text = readFileSync(file, "utf8");
-      return [...text.matchAll(call)].map((m) => `${relative(SRC, file)}:${text.slice(0, m.index).split("\n").length}: ${m[0].trim()}`);
+      return [...text.matchAll(call)].map((m) => `${relative(SRC, file).split(sep).join("/")}:${text.slice(0, m.index).split("\n").length}: ${m[0].trim()}`);
     });
     expect(offenders).toEqual([]);
   });

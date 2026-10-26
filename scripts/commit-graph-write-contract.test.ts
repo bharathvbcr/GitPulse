@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { readCommandsSource } from "./commands-source";
@@ -48,9 +48,9 @@ describe("the frontend reaches the write from one place", () => {
   it("only the write flow invokes cmd_commit_graph_write, and only the component builds the flow", () => {
     const code = (file: string) => read(file).replace(/\/\*[\s\S]*?\*\/|<!--[\s\S]*?-->|\/\/.*/g, "");
     const invokers = frontend.filter((file) => WRITE.test(code(file)));
-    expect(invokers.map((file) => relative("src", file))).toEqual(["lib/health/commitGraphWrite.ts"]);
+    expect(invokers.map((file) => relative("src", file).split(sep).join("/"))).toEqual(["lib/health/commitGraphWrite.ts"]);
     const builders = frontend.filter((file) => read(file).includes("createCommitGraphWriteFlow("));
-    expect(builders.map((file) => relative("src", file)).sort()).toEqual([
+    expect(builders.map((file) => relative("src", file).split(sep).join("/")).sort()).toEqual([
       "lib/components/CommitGraphWrite.svelte",
       "lib/health/commitGraphWrite.ts",
     ]);

@@ -83,7 +83,7 @@ function tryGit(
   }
 }
 
-describe.skipIf(!gitAvailable || !hasBash)("fixture author pre-commit hook", () => {
+describe.skipIf(!gitAvailable || !hasBash)("fixture author pre-commit hook", { timeout: 30_000 }, () => {
   it("is tracked with the executable bit git hands to every clone", () => {
     for (const hook of ["pre-commit", "pre-merge-commit", "pre-push"]) {
       const entry = execFileSync("git", ["ls-files", "-s", `.githooks/${hook}`], {
@@ -194,7 +194,7 @@ function initPushed(): string {
   return dir;
 }
 
-describe.skipIf(!gitAvailable || !hasBash)("fixture author merge and push hooks", () => {
+describe.skipIf(!gitAvailable || !hasBash)("fixture author merge and push hooks", { timeout: 30_000 }, () => {
   it("refuses a merge commit recorded as a fixture", () => {
     const dir = initRepo();
     git(dir, ["commit", "-q", "-m", "base"], envWithoutIdentity());

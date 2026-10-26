@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
@@ -47,7 +47,7 @@ describe("recurring UI timers stop while the window is hidden", () => {
   it("no component or module calls bare setInterval unless it guards itself", () => {
     const offenders: string[] = [];
     for (const file of sources(SRC)) {
-      const name = relative(SRC, file);
+      const name = relative(SRC, file).split(sep).join("/");
       if (SELF_GUARDED.has(name)) continue;
       const lines = bareIntervalCalls(readFileSync(file, "utf8"));
       if (lines.length > 0) offenders.push(`${name}:${lines.join(",")}`);

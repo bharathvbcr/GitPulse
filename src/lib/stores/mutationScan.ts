@@ -1,4 +1,4 @@
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse } from "svelte/compiler";
 import ts from "typescript";
@@ -14,7 +14,10 @@ import ts from "typescript";
  */
 
 const STORES = dirname(fileURLToPath(import.meta.url));
-const STORE_PATH = join(STORES, "repoStore.ts");
+// In `/` form: the compiler hands its host `/`-separated names on every
+// platform, so a `\` path from `join` would never match the override below on
+// Windows and a synthetic store source would silently be read from disk.
+const STORE_PATH = join(STORES, "repoStore.ts").split(sep).join("/");
 const ROOT = join(STORES, "..", "..", "..");
 
 /** The position of the trailing `target` parameter of each member that takes one. */

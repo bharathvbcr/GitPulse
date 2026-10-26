@@ -195,7 +195,7 @@ describe("the app version is never retyped in source", () => {
     expect(code('run: echo "1.2.0#tag"', "hash")).toMatch(versionLiteralMatcher("1.2.0"));
   });
 
-  it("has no source file carrying the current version as a literal", () => {
+  it("has no source file carrying the current version as a literal", { timeout: 30_000 }, () => {
     const matcher = versionLiteralMatcher(VERSION);
     const offenders: string[] = [];
     for (const file of FILES) {

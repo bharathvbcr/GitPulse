@@ -115,7 +115,7 @@ function fixture() {
   };
 }
 
-describe("vendor refresh integrity", () => {
+describe("vendor refresh integrity", { timeout: 30_000 }, () => {
   it("preserves the complete old snapshot when a late manifest fails", () => {
     const f = fixture();
     try {

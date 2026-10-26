@@ -75,7 +75,10 @@ describe("isNestedAgentWorktree", () => {
 // ignore list back.
 describe.each(["vite.config.ts", "vite.harness.config.ts"])("%s file watcher", configName => {
   it("does not reload when a nested agent worktree gains a tsconfig.json", async () => {
-    const scratch = realpathSync(mkdtempSync(join(tmpdir(), "gp-vite-watch-")));
+    // `.native`: Windows runners hand out an 8.3 short temp path
+    // (`RUNNER~1`), which only the native realpath expands to the long name
+    // vite reports, so the log lines would never match the controls.
+    const scratch = realpathSync.native(mkdtempSync(join(tmpdir(), "gp-vite-watch-")));
     dirs.push(scratch);
     // The checkout under test is itself an agent worktree, as every sibling
     // session's is. The controls below then also prove the exclusion did not
