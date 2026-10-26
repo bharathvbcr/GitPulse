@@ -6,7 +6,7 @@ import { appendFileSync, closeSync, mkdirSync, mkdtempSync, openSync, readFileSy
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseTag } from "./check-release-version.mjs";
-import { bundleSpecs, declaredBinaryNames, expectedInstallerNames, inspectBundleContents, inspectReleaseAssets, supplementNames } from "./check-release-assets.mjs";
+import { BudgetExhausted, bundleSpecs, createBudget, declaredBinaryNames, expectedInstallerNames, inspectBundleContents, inspectReleaseAssets, supplementNames } from "./check-release-assets.mjs";
 import { extractNotes } from "./release-notes.mjs";
 import { formatUsage, wantsHelp } from "./usage.mjs";
 
@@ -25,8 +25,24 @@ export const DOWNLOAD_TIMEOUT_MS = 120_000;
 export const MAX_ASSET_BYTES = 512 * 1024 * 1024;
 
 /**
+ * One deadline for the whole bundle check (seven downloads plus every 7z
+ * call). Each call gets min(its own cap, what is left), so the check refuses by
+ * name instead of the job being killed. release.yml's verify job has
+ * `timeout-minutes: 25` (1500 s), and around this check the job spends, at
+ * worst:
+ *   3 min  checkout, setup-node and the tool check;
+ *   8 min  the eight bounded `gh`/`git` calls finalize makes outside the check
+ *          (assetSnapshot, two tag checks, three draft reads, the PATCH and
+ *          the confirming read), each capped at 60 s by `runCommand`.
+ * 12 min + 3 min + 8 min = 23 min, which leaves 2 min of margin inside 25.
+ * Hashing and gunzip are CPU work of a few seconds and are not drawn from it.
+ * release-workflow.test.ts re-derives this sum from the workflow file.
+ */
+export const BUNDLE_CHECK_BUDGET_MS = 12 * 60 * 1000;
+
+/**
  * @typedef {{id: number, name: string, size: number, digest: string}} DraftAsset
- * @typedef {(request: {repo: string, asset: DraftAsset, dest: string}) => void} AssetFetcher
+ * @typedef {(request: {repo: string, asset: DraftAsset, dest: string, timeoutMs?: number}) => void} AssetFetcher
  */
 
 /**
@@ -38,11 +54,11 @@ export const MAX_ASSET_BYTES = 512 * 1024 * 1024;
  *
  * @type {AssetFetcher}
  */
-export function fetchReleaseAsset({repo, asset, dest}) {
+export function fetchReleaseAsset({repo, asset, dest, timeoutMs = DOWNLOAD_TIMEOUT_MS}) {
   const fd = openSync(dest, "wx", 0o600);
   try {
     const result = spawnSync("gh", ["api", "-H", "Accept: application/octet-stream", `repos/${repo}/releases/assets/${asset.id}`], {
-      stdio: ["ignore", fd, "pipe"], encoding: "utf8", timeout: DOWNLOAD_TIMEOUT_MS, maxBuffer: 1024 * 1024,
+      stdio: ["ignore", fd, "pipe"], encoding: "utf8", timeout: Math.min(timeoutMs, DOWNLOAD_TIMEOUT_MS), maxBuffer: 1024 * 1024,
       env: { ...process.env, GH_PROMPT_DISABLED: "1" },
     });
     if (result.error || result.signal || result.status !== 0) {
@@ -72,11 +88,12 @@ function record(value) {
  * neither the network nor 7-Zip.
  *
  * @param {{stage: string, repo: string, tag: string, commit: string, releaseId?: string, notes?: string, sboms?: {spdx: string, cargo: string},
- *   downloadDir?: string, binaries?: string[], fetchAsset?: AssetFetcher, inspect?: typeof inspectBundleContents}} options
+ *   downloadDir?: string, binaries?: string[], fetchAsset?: AssetFetcher, inspect?: typeof inspectBundleContents,
+ *   now?: () => number, bundleBudgetMs?: number}} options
  * @param {Runner} [run]
  */
 export function runReleaseStage(options, run = runCommand) {
-  const { stage, repo, tag, commit, releaseId, notes, sboms, downloadDir, binaries, fetchAsset = fetchReleaseAsset, inspect = inspectBundleContents } = options;
+  const { stage, repo, tag, commit, releaseId, notes, sboms, downloadDir, binaries, fetchAsset = fetchReleaseAsset, inspect = inspectBundleContents, now = Date.now, bundleBudgetMs = BUNDLE_CHECK_BUDGET_MS } = options;
   if (!["prepare", "check", "attest", "finalize", "ready"].includes(stage)) throw new Error("Expected prepare, check, attest, finalize, or ready");
   if (!/^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(repo)) throw new Error("Invalid repository");
   const parsed = parseTag(tag);
@@ -260,16 +277,34 @@ export function runReleaseStage(options, run = runCommand) {
         }
         return {spec, id, size, digest};
       });
-      for (const {spec, id, size, digest} of wanted) {
+      const budget = createBudget({totalMs: bundleBudgetMs, now});
+      for (const [done, {spec, id, size, digest}] of wanted.entries()) {
         const dest = path.join(work, spec.asset);
-        fetchAsset({repo, asset: {id, name: spec.asset, size, digest}, dest});
+        /** @type {number} */
+        let timeoutMs;
+        try {
+          timeoutMs = budget.callTimeout(DOWNLOAD_TIMEOUT_MS);
+        } catch (error) {
+          if (error instanceof BudgetExhausted) throw new Error(`bundle check budget exhausted after ${done} of ${wanted.length} bundles`);
+          throw error;
+        }
+        try {
+          fetchAsset({repo, asset: {id, name: spec.asset, size, digest}, dest, timeoutMs});
+        } catch (error) {
+          // A download killed by the clamped limit is the budget running out.
+          try { budget.callTimeout(1); } catch (exhausted) {
+            if (exhausted instanceof BudgetExhausted) throw new Error(`bundle check budget exhausted after ${done} of ${wanted.length} bundles`);
+            throw exhausted;
+          }
+          throw error;
+        }
         const got = statSync(dest).size;
         if (got !== size) throw new Error(`Bundle ${spec.asset} downloaded ${got} bytes, expected ${size}`);
         if (`sha256:${sha256File(dest)}` !== digest) throw new Error(`Bundle ${spec.asset} does not match GitHub's SHA-256`);
         files[spec.asset] = dest;
         digests[spec.asset] = digest;
       }
-      const result = inspect({version: releaseVersion, binaries: binaries ?? [], files, workDir: work});
+      const result = inspect({version: releaseVersion, binaries: binaries ?? [], files, workDir: work, budget});
       if (!result.ok) throw new Error(`Bundle contents are wrong: ${result.violations.join("; ")} (${result.coverage})`);
       for (const [name, file] of Object.entries(files)) {
         if (`sha256:${sha256File(file)}` !== digests[name]) throw new Error(`Bundle ${name} changed while it was being inspected`);

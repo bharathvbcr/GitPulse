@@ -345,6 +345,52 @@ describe("remote release lifecycle", () => {
     expect(patches).toHaveLength(0);
     expect(deps.inspected).toHaveLength(0);
   });
+  it("gives each download min(120 s, the time left) and refuses by name when the budget is used up, on a fake clock", () => {
+    let clock = 0;
+    const {run, patches} = fixture();
+    const deps = bundleDeps();
+    const timeouts: (number | undefined)[] = [];
+    const slow = {
+      ...deps,
+      fetchAsset: (request: {asset: {name: string}; dest: string; timeoutMs?: number}) => {
+        timeouts.push(request.timeoutMs);
+        clock += 200_000;
+        deps.fetchAsset(request);
+      },
+    };
+    const request = {...finalize, ...slow, now: () => clock, bundleBudgetMs: 700_000};
+    expect(() => runReleaseStage(request, run)).toThrow("bundle check budget exhausted after 4 of 7 bundles");
+    // 700 s: three full 120 s caps, then the 4th gets the 100 s left, and the 5th starts with none.
+    expect(timeouts).toEqual([120_000, 120_000, 120_000, 100_000]);
+    expect(patches).toHaveLength(0);
+    expect(deps.inspected).toHaveLength(0);
+    expect(readdirSync(deps.downloadDir)).toEqual([]);
+  });
+  it("names the budget when a download is killed by the limit the budget clamped it to", () => {
+    let clock = 0;
+    const {run} = fixture();
+    const deps = bundleDeps();
+    const killed = {...deps, fetchAsset: () => { clock += 130_000; throw new Error("Download of x failed: spawnSync gh ETIMEDOUT"); }};
+    expect(() => runReleaseStage({...finalize, ...killed, now: () => clock, bundleBudgetMs: 130_000}, run))
+      .toThrow("bundle check budget exhausted after 0 of 7 bundles");
+  });
+  it("hands the same budget to the inspection, and surfaces its exhaustion as a refusal", () => {
+    let clock = 0;
+    const {run, patches} = fixture();
+    const deps = bundleDeps();
+    let handed: {callTimeout: (cap: number) => number} | undefined;
+    const inspect = (input: {budget?: {callTimeout: (cap: number) => number}}) => {
+      handed = input.budget;
+      clock += 500_000;
+      return {ok: false, invalid: true, violations: ["bundle check budget exhausted after 5 of 7 bundles"], opened: [], coverage: "opened 5 of 12 installers"};
+    };
+    expect(() => runReleaseStage({...finalize, ...deps, inspect, now: () => clock, bundleBudgetMs: 400_000}, run))
+      .toThrow(/bundle check budget exhausted after 5 of 7 bundles/);
+    // The inspector was given the one deadline, and the fake clock has passed it.
+    expect(handed).toBeDefined();
+    expect(() => handed?.callTimeout(1)).toThrow();
+    expect(patches).toHaveLength(0);
+  });
   it("refuses an asset that is larger than the download bound", () => {
     const release = draft();
     release.assets = release.assets.map(asset => asset.name === "GitPulse_1.2.3_amd64.deb" ? {...asset, size: 513 * 1024 * 1024} : asset);

@@ -372,8 +372,11 @@ jobs:
     # release that looks finished while silently missing a platform.
     if: always()
     runs-on: ubuntu-latest
-    # Seven bundles are downloaded (120 s each at most) and opened before the
-    # notes are written; ten minutes was sized for the metadata check alone.
+    # Seven bundles are downloaded and opened before the notes are written.
+    # That check has one 12-minute budget (BUNDLE_CHECK_BUDGET_MS in
+    # scripts/release-state.mjs) and refuses by name when it runs out; with
+    # 3 minutes of setup and 8 minutes of bounded API calls around it, it fits
+    # here with 2 minutes to spare. Ten minutes was sized for the metadata check.
     timeout-minutes: 25
     permissions:
       # `contents: write` is the *minimum* that works here, not a convenience:

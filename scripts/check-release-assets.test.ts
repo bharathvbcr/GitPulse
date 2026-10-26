@@ -1,4 +1,4 @@
-import { linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -8,10 +8,13 @@ import { promisify } from "node:util";
 import { gzipSync } from "node:zlib";
 import { afterAll, describe, expect, it } from "vitest";
 import {
+  BudgetExhausted,
   PLATFORM_INSTALLERS,
   bundleSpecs,
   checkSevenZipListing,
+  createBudget,
   declaredBinaryNames,
+  extractWithSevenZip,
   expectedAssetNames,
   expectedInstallerNames,
   inspectBundleContents,
@@ -427,7 +430,7 @@ const allMacBins = (skip = "") => BINS.filter((bin) => bin !== skip).map((bin) =
 describe("7z listing", () => {
   const listing = (...entries: string[]) => `\nListing archive: x\n\n--\nPath = /a/x.msi\nType = Compound\n----------\n${entries.join("\n\n")}\n`;
   it("accepts entries inside the output directory within the size bound", () => {
-    expect(() => checkSevenZipListing(listing("Path = gitpulse.exe\nSize = 10", "Path = $PLUGINSDIR\\System.dll\nSize = 5", "Path = dir\nFolder = +", "Path = [NSIS].nsi\nSize = \nPacked Size = "), 100)).not.toThrow();
+    expect(() => checkSevenZipListing(listing("Path = gitpulse.exe\nSize = 10", "Path = $PLUGINSDIR\\System.dll\nSize = 5", "Path = dir\nFolder = +", "Path = [NSIS].nsi\nSize = \nPacked Size = "), 100, "msi")).not.toThrow();
   });
   it.each([
     ["an absolute path", "Path = /etc/passwd\nSize = 1", /leaves the output directory/],
@@ -436,11 +439,11 @@ describe("7z listing", () => {
     ["a size that is not a number", "Path = a\nSize = lots", /not a number/],
     ["declared sizes over the bound", "Path = a\nSize = 101", /more than 100 bytes/],
   ])("refuses %s before anything is extracted", (_label, entry, expected) => {
-    expect(() => checkSevenZipListing(listing(entry), 100)).toThrow(expected);
+    expect(() => checkSevenZipListing(listing(entry), 100, "msi")).toThrow(expected);
   });
   it("refuses a listing with no entries", () => {
-    expect(() => checkSevenZipListing("Listing archive: x\n", 100)).toThrow(/no entries/);
-    expect(() => checkSevenZipListing(listing(), 100)).toThrow(/no entries/);
+    expect(() => checkSevenZipListing("Listing archive: x\n", 100, "msi")).toThrow(/no entries/);
+    expect(() => checkSevenZipListing(listing(), 100, "msi")).toThrow(/no entries/);
   });
   it("refuses an extraction that left a link pointing outside its directory", async () => {
     const outside = await bundles();
@@ -450,6 +453,116 @@ describe("7z listing", () => {
     });
     expect(link.invalid).toBe(true);
     expect(link.violations.some((violation) => violation.includes("outside its directory"))).toBe(true);
+  });
+
+  describe("links and archive type, as 7z prints them", () => {
+    // Field names and values as printed by 7-Zip 23.01 for a tar holding a
+    // symlink and a hardlink, and for the real v1.3.1 installers.
+    const entry = (extra: string) => `Path = x\nFolder = -\nSize = 5\n${extra}\nCharacteristics = 0`;
+    it.each([
+      ["a symlink", "Mode = lrwxrwxrwx\nSymbolic Link = real.txt\nHard Link = "],
+      ["a symlink known only by its mode", "Mode = lrwxrwxrwx\nSymbolic Link = \nHard Link = "],
+      ["a hardlink", "Mode = -rw-r--r--\nSymbolic Link = \nHard Link = real.txt"],
+    ])("refuses %s before anything is extracted", (_label, fields) => {
+      expect(() => checkSevenZipListing(listing(entry(fields)), 100, "msi")).toThrow(/holds a link/);
+      expect(() => checkSevenZipListing(listing(entry(fields)).replace("Compound", "Nsis"), 100, "nsis")).toThrow(/holds a link/);
+    });
+    it("accepts regular entries whose link fields are empty", () => {
+      expect(() => checkSevenZipListing(listing(entry("Mode = -rw-r--r--\nSymbolic Link = \nHard Link = ")), 100, "msi")).not.toThrow();
+    });
+
+    const header = (...types: string[]) => `\nListing archive: x\n\n--\nPath = /a/x\n${types.map((type) => `Type = ${type}`).join("\n----\nPath = app.cab\n")}\n----------\nPath = a\nSize = 1\n`;
+    it.each([
+      ["msi", ["Compound"]], ["msi", ["Compound", "Cab"]], ["nsis", ["Nsis"]],
+    ] as const)("accepts a %s installer 7z opens as %j", (format, types) => {
+      expect(() => checkSevenZipListing(header(...types), 100, format)).not.toThrow();
+    });
+    it.each([
+      ["a tar renamed .msi", "msi", ["tar"]],
+      ["a zip renamed .exe", "nsis", ["zip"]],
+      ["an NSIS installer in an MSI slot", "msi", ["Nsis"]],
+      ["an MSI in an NSIS slot", "nsis", ["Compound", "Cab"]],
+      ["a Compound file that holds a tar", "msi", ["Compound", "tar"]],
+    ] as const)("refuses %s", (_label, format, types) => {
+      expect(() => checkSevenZipListing(header(...types), 100, format)).toThrow(/opens this (?:msi|nsis) installer as/);
+    });
+    it("refuses a header with no Type at all", () => {
+      expect(() => checkSevenZipListing("\nListing archive: x\n\n--\nPath = /a/x\n----------\nPath = a\nSize = 1\n", 100, "msi")).toThrow(/as nothing/);
+    });
+
+    it.skipIf(process.platform === "win32")("never runs the extraction when the real listing step refuses (stub 7z on PATH)", () => {
+      const dir = mkdtempSync(path.join(tmpdir(), "gitpulse-stub-7z-"));
+      tempDirs.push(dir);
+      const mark = path.join(dir, "extracted");
+      writeFileSync(path.join(dir, "7z"), `#!/bin/bash\nif [ "$1" = "l" ]; then cat "$FAKE_7Z_LISTING"; exit 0; fi\ntouch "${mark}"\n`, { mode: 0o755 });
+      const previous = { path: process.env.PATH, listing: process.env.FAKE_7Z_LISTING };
+      process.env.PATH = `${dir}${path.delimiter}${process.env.PATH ?? ""}`;
+      try {
+        for (const [format, body, expected] of [
+          ["msi", header("Compound").replace("Path = a", entry("Mode = lrwxrwxrwx\nSymbolic Link = t\nHard Link = ")), /holds a link/],
+          ["msi", header("tar"), /opens this msi installer as tar/],
+          ["nsis", header("Compound"), /opens this nsis installer as Compound/],
+        ] as const) {
+          writeFileSync(path.join(dir, "listing.txt"), body);
+          process.env.FAKE_7Z_LISTING = path.join(dir, "listing.txt");
+          expect(() => extractWithSevenZip(path.join(dir, "a.bin"), path.join(dir, "out"), { format })).toThrow(expected);
+        }
+        expect(existsSync(mark)).toBe(false);
+        writeFileSync(path.join(dir, "listing.txt"), header("Nsis"));
+        extractWithSevenZip(path.join(dir, "a.bin"), path.join(dir, "out"), { format: "nsis" });
+        expect(existsSync(mark)).toBe(true);
+      } finally {
+        process.env.PATH = previous.path;
+        if (previous.listing === undefined) delete process.env.FAKE_7Z_LISTING;
+        else process.env.FAKE_7Z_LISTING = previous.listing;
+      }
+    });
+  });
+});
+
+describe("one time budget for the bundle check", () => {
+  it("hands each call min(its cap, the time left) and refuses once nothing is left, on an injected clock", () => {
+    let now = 5_000;
+    const budget = createBudget({ totalMs: 1_000, now: () => now });
+    expect(budget.callTimeout(120_000)).toBe(1_000);
+    now += 400;
+    expect(budget.callTimeout(120_000)).toBe(600);
+    expect(budget.callTimeout(100)).toBe(100);
+    now += 600;
+    expect(() => budget.callTimeout(1)).toThrow(BudgetExhausted);
+    now += 10_000;
+    expect(() => budget.callTimeout(1)).toThrow(BudgetExhausted);
+  });
+
+  it("stops inspecting, by name and as unreadable, when the 7z calls use the budget up", async () => {
+    const made = await bundles();
+    let now = 0;
+    const granted: number[] = [];
+    const result = inspectBundleContents({
+      version: VERSION, binaries: BINS, files: made.files,
+      budget: createBudget({ totalMs: 500, now: () => now }),
+      extract: (archive, outDir, options) => {
+        granted.push(options.budget?.callTimeout(120_000) ?? -1);
+        now += 300;
+        made.extract(archive, outDir);
+      },
+    });
+    // The two tar bundles and the first deb need no 7z; NSIS and MSI x64 take
+    // 300 ms each of the 500, so the third Windows installer finds nothing left.
+    expect(granted).toEqual([500, 200]);
+    expect(result.ok).toBe(false);
+    expect(result.invalid).toBe(true);
+    expect(result.opened).toHaveLength(5);
+    expect(result.violations).toEqual(["bundle check budget exhausted after 5 of 7 bundles"]);
+  });
+
+  it("calls a 7z killed by a budget-clamped timeout the budget running out, not an unreadable installer", async () => {
+    const made = await bundles();
+    const result = inspectBundleContents({
+      version: VERSION, binaries: BINS, files: made.files,
+      extract: () => { throw new BudgetExhausted(); },
+    });
+    expect(result.violations).toEqual(["bundle check budget exhausted after 3 of 7 bundles"]);
   });
 });
 

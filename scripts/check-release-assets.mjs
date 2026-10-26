@@ -302,6 +302,33 @@ const MAIN_BINARY = "gitpulse";
 /** The check could not read a bundle at all, which is not the same as reading it and finding it wrong. */
 class UnreadableBundle extends Error {}
 
+/** The overall time budget ran out; callers say how far they got. */
+export class BudgetExhausted extends Error {}
+
+/**
+ * @typedef {{ callTimeout: (capMs: number) => number }} Budget
+ */
+
+/**
+ * One deadline for a whole check. `callTimeout(cap)` is what one download or
+ * 7z call may take: `min(cap, time left)`, and it throws `BudgetExhausted`
+ * when nothing is left, so no call starts after the deadline. The clock is a
+ * parameter, so a test advances it instead of sleeping.
+ *
+ * @param {{ totalMs: number, now?: () => number }} options
+ * @returns {Budget}
+ */
+export function createBudget({ totalMs, now = Date.now }) {
+  const started = now();
+  return {
+    callTimeout(capMs) {
+      const left = totalMs - (now() - started);
+      if (!(left > 0)) throw new BudgetExhausted();
+      return Math.min(capMs, left);
+    },
+  };
+}
+
 /**
  * @param {Buffer} block
  * @param {number} start
@@ -564,37 +591,58 @@ function peMachine(file) {
  * fit `maxBytes`. `inspectWindowsInstaller` then checks what was actually
  * written.
  *
+ * Each 7z call gets `min(per-call cap, what is left of the budget)`, and a
+ * call that the clamped limit kills is reported as the budget running out.
+ *
  * @param {string} archive
  * @param {string} outDir
- * @param {number} [maxBytes]
+ * @param {{ format: "msi" | "nsis", maxBytes?: number, budget?: Budget }} options
  */
-export function extractWithSevenZip(archive, outDir, maxBytes = MAX_UNPACKED_BYTES) {
-  const listing = spawnSync("7z", ["l", "-slt", "-bd", archive], {
-    encoding: "utf8", timeout: EXTRACT_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
-  });
-  if (listing.error) throw new UnreadableBundle(`7z could not run: ${listing.error.message}`);
+export function extractWithSevenZip(archive, outDir, { format, maxBytes = MAX_UNPACKED_BYTES, budget }) {
+  /** @param {string[]} args @param {import("node:child_process").SpawnSyncOptionsWithStringEncoding} spawnOptions */
+  const sevenZip = (args, spawnOptions) => {
+    const timeout = budget ? budget.callTimeout(EXTRACT_TIMEOUT_MS) : EXTRACT_TIMEOUT_MS;
+    const result = spawnSync("7z", args, { ...spawnOptions, timeout });
+    if (result.error) {
+      if (timeout < EXTRACT_TIMEOUT_MS && /** @type {NodeJS.ErrnoException} */ (result.error).code === "ETIMEDOUT") throw new BudgetExhausted();
+      throw new UnreadableBundle(`7z could not run: ${result.error.message}`);
+    }
+    return result;
+  };
+  const listing = sevenZip(["l", "-slt", "-bd", archive], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
   if (listing.status !== 0) throw new UnreadableBundle(`7z could not list the installer (exit ${listing.status}): ${(listing.stderr || listing.stdout).trim().slice(-300)}`);
-  checkSevenZipListing(listing.stdout, maxBytes);
+  checkSevenZipListing(listing.stdout, maxBytes, format);
   // -aou keeps a second entry of the same name beside the first (as `name_1`)
   // instead of overwriting it, so a duplicate is visible in the output.
-  const result = spawnSync("7z", ["x", "-aou", "-bd", "-bso0", "-bsp0", `-o${outDir}`, archive], {
-    stdio: ["ignore", "ignore", "pipe"], encoding: "utf8", timeout: EXTRACT_TIMEOUT_MS, maxBuffer: 1024 * 1024,
+  const result = sevenZip(["x", "-aou", "-bd", "-bso0", "-bsp0", `-o${outDir}`, archive], {
+    stdio: ["ignore", "ignore", "pipe"], encoding: "utf8", maxBuffer: 1024 * 1024,
   });
-  if (result.error) throw new UnreadableBundle(`7z could not run: ${result.error.message}`);
   if (result.status !== 0) throw new UnreadableBundle(`7z exited ${result.status}: ${(result.stderr ?? "").trim().slice(0, 300)}`);
 }
 
+/** What `7z l -slt` prints as `Type =` for each installer kind: an MSI is a Compound file holding a Cab. */
+const SEVEN_ZIP_TYPES = Object.freeze({ msi: ["Compound", "Msi", "Cab"], nsis: ["Nsis"] });
+
 /**
- * Judges the entries of a `7z l -slt` listing (the blocks after its last
- * `----------` line): no absolute or drive-letter path, no `..` segment, and a
- * total declared size within `maxBytes`.
+ * Judges a `7z l -slt` listing. Before the last `----------` line it is the
+ * archive's own header: every `Type` must be one this installer kind opens as,
+ * so a tar or zip renamed `.msi` is refused rather than extracted. After it,
+ * each entry must not be a symlink or hardlink, must have no absolute or
+ * drive-letter path or `..` segment, and the declared sizes must total at most
+ * `maxBytes`.
  *
  * @param {string} listing
  * @param {number} maxBytes
+ * @param {"msi" | "nsis"} format
  */
-export function checkSevenZipListing(listing, maxBytes) {
+export function checkSevenZipListing(listing, maxBytes, format) {
   const marker = listing.lastIndexOf("\n----------\n");
   if (marker === -1) throw new UnreadableBundle("7z listing has no entries");
+  const types = [...listing.slice(0, marker).matchAll(/^Type = (.*)$/gm)].map((match) => match[1].trim());
+  const allowed = SEVEN_ZIP_TYPES[format];
+  if (types.length === 0 || !types.every((type) => allowed.includes(type))) {
+    throw new UnreadableBundle(`7z opens this ${format} installer as ${types.join(", ") || "nothing"}, not ${allowed.join("/")}`);
+  }
   let total = 0;
   let entries = 0;
   for (const block of listing.slice(marker + "\n----------\n".length).split(/\r?\n\r?\n/)) {
@@ -603,6 +651,9 @@ export function checkSevenZipListing(listing, maxBytes) {
     if (entryPath === undefined) continue;
     entries += 1;
     if (entries > MAX_ARCHIVE_ENTRIES) throw new UnreadableBundle("installer lists too many files");
+    if (fields.get("Symbolic Link") || fields.get("Hard Link") || /^l/.test(fields.get("Mode") ?? "")) {
+      throw new UnreadableBundle(`installer holds a link, which is not extracted: ${entryPath}`);
+    }
     if (/^(?:[\\/]|[A-Za-z]:)/.test(entryPath) || entryPath.split(/[\\/]/).includes("..")) {
       throw new UnreadableBundle(`installer holds a path that leaves the output directory: ${entryPath}`);
     }
@@ -660,14 +711,15 @@ function msiFileId(binary) {
  * @param {"x64" | "arm64"} arch
  * @param {string[]} binaries
  * @param {string} workDir
- * @param {(archive: string, outDir: string, maxBytes: number) => void} extract
+ * @param {Extractor} extract
  * @param {number} maxBytes
+ * @param {Budget | undefined} budget
  * @returns {string[]}
  */
-function inspectWindowsInstaller(archive, format, arch, binaries, workDir, extract, maxBytes) {
+function inspectWindowsInstaller(archive, format, arch, binaries, workDir, extract, maxBytes, budget) {
   const outDir = mkdtempSync(path.join(workDir, "unpack-"));
   try {
-    extract(archive, outDir, maxBytes);
+    extract(archive, outDir, { format, maxBytes, budget });
     const files = walkExtracted(outDir);
     const total = files.reduce((sum, file) => sum + (file.regular ? file.size : 0), 0);
     if (total > maxBytes) throw new UnreadableBundle(`installer unpacked to ${total} bytes, over the ${maxBytes} bound`);
@@ -700,6 +752,10 @@ function inspectWindowsInstaller(archive, format, arch, binaries, workDir, extra
     rmSync(outDir, { recursive: true, force: true });
   }
 }
+
+/**
+ * @typedef {(archive: string, outDir: string, options: { format: "msi" | "nsis", maxBytes: number, budget?: Budget }) => void} Extractor
+ */
 
 /**
  * @typedef {{ asset: string, format: "app-tar" | "deb" | "msi" | "nsis", arch: "universal" | "x64" | "arm64" }} BundleSpec
@@ -749,10 +805,14 @@ function coverageSummary(version, opened) {
  * the expected assets, so an installer that was not provided is a violation,
  * not a skipped row. A bundle that cannot be read at all sets `invalid`.
  *
- * @param {{ version: string, binaries: string[], files: Record<string, string | undefined>, workDir?: string, extract?: (archive: string, outDir: string, maxBytes: number) => void, maxUnpackedBytes?: number }} input
+ * `budget` is the overall deadline shared with the downloads: every 7z call
+ * draws its timeout from it, and when it runs out the check stops, reports
+ * `bundle check budget exhausted after N of M bundles` and is `invalid`.
+ *
+ * @param {{ version: string, binaries: string[], files: Record<string, string | undefined>, workDir?: string, extract?: Extractor, maxUnpackedBytes?: number, budget?: Budget }} input
  * @returns {ContentCheck}
  */
-export function inspectBundleContents({ version, binaries, files, workDir, extract = extractWithSevenZip, maxUnpackedBytes = MAX_UNPACKED_BYTES }) {
+export function inspectBundleContents({ version, binaries, files, workDir, extract = extractWithSevenZip, maxUnpackedBytes = MAX_UNPACKED_BYTES, budget }) {
   if (!Array.isArray(binaries) || binaries.length === 0 || !binaries.every((name) => typeof name === "string" && /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name))) {
     throw new Error("binaries must be a non-empty list of binary names");
   }
@@ -765,7 +825,8 @@ export function inspectBundleContents({ version, binaries, files, workDir, extra
   const opened = [];
   let invalid = false;
   try {
-    for (const spec of bundleSpecs(version)) {
+    const specs = bundleSpecs(version);
+    for (const spec of specs) {
       const file = files[spec.asset];
       if (!file) { violations.push(`missing: ${spec.asset} was not provided for inspection`); continue; }
       try {
@@ -784,12 +845,16 @@ export function inspectBundleContents({ version, binaries, files, workDir, extra
               spec.format === "deb" ? judgeElf(/** @type {"x64" | "arm64"} */ (spec.arch)) : judgeUniversalMachO));
           }
         } else {
-          found = inspectWindowsInstaller(file, spec.format, /** @type {"x64" | "arm64"} */ (spec.arch), binaries, root, extract, maxUnpackedBytes);
+          found = inspectWindowsInstaller(file, spec.format, /** @type {"x64" | "arm64"} */ (spec.arch), binaries, root, extract, maxUnpackedBytes, budget);
         }
         opened.push(spec.asset);
         violations.push(...found.map((violation) => `${spec.asset}: ${violation}`));
       } catch (error) {
         invalid = true;
+        if (error instanceof BudgetExhausted) {
+          violations.push(`bundle check budget exhausted after ${opened.length} of ${specs.length} bundles`);
+          break;
+        }
         violations.push(`${spec.asset}: cannot be opened: ${errorMessage(error)}`);
       }
     }

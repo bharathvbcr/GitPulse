@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { BUNDLE_CHECK_BUDGET_MS, DOWNLOAD_TIMEOUT_MS } from "./release-state.mjs";
 
 const stateScript = readFileSync(new URL("./release-state.mjs", import.meta.url), "utf8");
 const workflow = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
@@ -161,6 +162,22 @@ it("opens the bundled installers in verify, with the tools the runner image alre
   expect(verify).not.toContain("gitpulse-hook");
   expect(stateScript).toContain("declaredBinaryNames(readFileSync(path.join(\"src-tauri\", \"Cargo.toml\")");
   expect(stateScript).toContain("downloadDir: process.env.RELEASE_DOWNLOAD_DIR");
+});
+
+it("sizes the bundle-check budget so it and the rest of the verify job fit inside timeout-minutes", () => {
+  const verify = workflow.slice(workflow.indexOf("\n  verify:"));
+  const limit = Number(/timeout-minutes:\s*(\d+)/.exec(verify)?.[1]);
+  expect(limit).toBeGreaterThan(0);
+  // release-state.mjs documents the arithmetic: the budget, 3 min for checkout,
+  // setup-node and the tool check, and 8 min for the eight 60 s-bounded API and
+  // git calls finalize makes outside the check.
+  const budgetMinutes = BUNDLE_CHECK_BUDGET_MS / 60_000;
+  const aroundTheCheck = 3 + 8;
+  expect(budgetMinutes + aroundTheCheck).toBeLessThan(limit);
+  expect(limit - (budgetMinutes + aroundTheCheck)).toBeGreaterThanOrEqual(2);
+  // Per call, 120 s caps stay: the budget is the overall bound, the cap is per call.
+  expect(DOWNLOAD_TIMEOUT_MS).toBe(120_000);
+  expect(stateScript).toContain("12 min + 3 min + 8 min = 23 min");
 });
 
 it("tells whoever rolls a release back how to delete its tag, and what the pre-push hook does about it", () => {
