@@ -2438,21 +2438,34 @@ pub(crate) fn refuses(output: &HookOutput) -> bool {
 }
 
 /// One answer from the guard and the harness gate. A refusal from either wins,
-/// then the guard's question; both notices are kept.
+/// then the guard's question; both notices are kept, and so is what each told
+/// the model — two waived refusals in bypass mode are both context, and the
+/// decision chosen here must not drop the other side's.
 pub(crate) fn combine(guard: HookOutput, gate: HookOutput) -> HookOutput {
     if guard.is_silent() {
         return gate;
     }
-    let message = match (guard.system_message.clone(), gate.system_message.clone()) {
+    let joined = |a: Option<String>, b: Option<String>| match (a, b) {
         (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
         (a, b) => a.or(b),
     };
+    let message = joined(guard.system_message.clone(), gate.system_message.clone());
+    let context = |output: &HookOutput| {
+        output
+            .hook_specific_output
+            .as_ref()
+            .and_then(|specific| specific.additional_context.clone())
+    };
+    let context = joined(context(&guard), context(&gate));
     let mut chosen = if refuses(&gate) || guard.hook_specific_output.is_none() {
         gate
     } else {
         guard
     };
     chosen.system_message = message;
+    if let Some(specific) = chosen.hook_specific_output.as_mut() {
+        specific.additional_context = context;
+    }
     chosen
 }
 

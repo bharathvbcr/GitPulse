@@ -13,6 +13,18 @@ before that tag is pushed.
 
 ### Added
 
+- **Bypass permissions mode waives the PreToolUse gates.** In a Claude Code
+  session the person put in bypass permissions mode (`permission_mode:
+  bypassPermissions` on the hook payload), `command-gate` and
+  `collision-guard` still run every check — the MANVI harness, the task scope,
+  the collision scan and the signal guard — but what they would have refused or
+  asked about is said instead of enforced: a notice to the person and the
+  reason as context for the model, with no permission decision, so the host's
+  own bypass rules decide. It plays the part of Manvi's yolo posture, scoped to
+  the sessions that chose it. Every other mode, and a payload without one, is
+  gated exactly as before. When the guard and the harness are both waived on
+  one command, the answer now keeps what each told the model.
+
 - **Codex sessions are recorded in the ledger.** Transcript catch-up used to
   read only Claude Code transcripts, so work done by Codex, which GitPulse
   already hosts and counts live, never reached the ledger. Transcripts are now

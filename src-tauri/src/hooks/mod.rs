@@ -238,6 +238,10 @@ pub struct HookInput {
     /// The host's id for one tool call (`tool_use_id`). Two copies of this
     /// hook judging the same call see the same id ([`advisory_once`]).
     pub tool_use_id: String,
+    /// The host's permission mode for this call (`permission_mode`), as Claude
+    /// Code sends it. Only [`BYPASS_PERMISSIONS`] changes what a gate does
+    /// ([`under_bypass`]); every other value, and its absence, is ignored.
+    pub permission_mode: String,
 }
 
 impl HookInput {
@@ -279,6 +283,11 @@ impl HookInput {
             last_assistant_message: string_at(Some(value), "last_assistant_message"),
             error: string_at(Some(value), "error"),
             tool_use_id: string_at(Some(value), "tool_use_id"),
+            // Claude spells it `permission_mode`; Grok, whose `--permission-mode`
+            // takes the same values, writes camelCase payload fields.
+            permission_mode: Some(string_at(Some(value), "permission_mode"))
+                .filter(|mode| !mode.is_empty())
+                .unwrap_or_else(|| string_at(Some(value), "permissionMode")),
         }
     }
 }
@@ -860,11 +869,79 @@ pub fn run_collision_guard(input: &HookInput) -> HookOutput {
     collision_guard_with(input, |job| within_budget(BUDGET, job))
 }
 
+/// The `permission_mode` Claude Code sends while the person has told it to stop
+/// asking.
+pub const BYPASS_PERMISSIONS: &str = "bypassPermissions";
+
+/// A gate's answer in a session the person put in bypass permissions mode: the
+/// checks have all run, and what they would have refused or asked about is said
+/// instead of enforced, so the host's own bypass rules decide.
+///
+/// Bypass mode is the host's "stop asking me", and only a person enters it — a
+/// session cannot switch itself into it — so it plays the part Manvi's yolo
+/// posture plays inside the harness, scoped to the sessions that chose it rather
+/// than to every session on the machine. It is applied after a guard has
+/// decided, not inside it, so the scope rung, the harness ladder, the collision
+/// ask and the signal guard ([`run_command_gate`]) are waived by one rule, and
+/// nothing they found goes unsaid: the person gets a notice and the model gets
+/// the reason as context. A waived refusal therefore never reads as a check
+/// that passed.
+fn under_bypass(input: &HookInput, output: HookOutput) -> HookOutput {
+    if input.permission_mode != BYPASS_PERMISSIONS {
+        return output;
+    }
+    let Some(decision) = output
+        .hook_specific_output
+        .as_ref()
+        .and_then(|specific| specific.permission_decision)
+    else {
+        return output;
+    };
+    let HookOutput {
+        hook_specific_output,
+        system_message,
+    } = output;
+    let specific = hook_specific_output.unwrap_or_default();
+    let verb = match decision {
+        PermissionDecision::Deny => "would have refused",
+        PermissionDecision::Ask => "would have asked you about",
+    };
+    let note = format!(
+        "GitPulse {verb} this call and did not, because the session is in bypass permissions \
+         mode: {}",
+        specific
+            .permission_decision_reason
+            .as_deref()
+            .unwrap_or_default()
+    );
+    let joined = |prior: Option<String>| match prior {
+        Some(prior) => format!("{prior}\n{note}"),
+        None => note.clone(),
+    };
+    HookOutput {
+        hook_specific_output: Some(HookSpecificOutput {
+            hook_event_name: specific.hook_event_name,
+            permission_decision: None,
+            permission_decision_reason: None,
+            additional_context: Some(joined(specific.additional_context)),
+        }),
+        system_message: Some(joined(system_message)),
+    }
+}
+
 /// One scope judgement for a file write, built on the caller's thread and run
 /// on whichever thread `run` chooses (see [`command_gate_with`] for why).
 type WriteJob = Box<dyn FnOnce() -> harness::FileScopeCheck + Send>;
 
 fn collision_guard_with(
+    input: &HookInput,
+    run: impl FnOnce(WriteJob) -> Option<harness::FileScopeCheck>,
+) -> HookOutput {
+    under_bypass(input, collision_guard_decided(input, run))
+}
+
+/// [`collision_guard_with`] before the permission mode is applied.
+fn collision_guard_decided(
     input: &HookInput,
     run: impl FnOnce(WriteJob) -> Option<harness::FileScopeCheck>,
 ) -> HookOutput {
@@ -1214,13 +1291,23 @@ fn gate_decision(judged: &ScopedVerdict, what: Judged) -> HookOutput {
 /// A command that signals processes is first measured by [`signal_guard`],
 /// which refuses one whose reach includes an agent session or GitPulse; a
 /// refusal there is final, and anything else is combined with the harness's
-/// answer.
+/// answer. Bypass mode waives both, and says what each found
+/// ([`under_bypass`]).
 pub fn run_command_gate(input: &HookInput) -> HookOutput {
-    let guard = signal_guard::run(input);
+    command_gate_call(input, |job| within_budget(BUDGET, job))
+}
+
+/// [`run_command_gate`] with the harness's runner injected, for the same reason
+/// [`command_gate_with`] takes one.
+fn command_gate_call(
+    input: &HookInput,
+    run: impl FnOnce(CommandJob) -> Option<ScopedVerdict>,
+) -> HookOutput {
+    let guard = under_bypass(input, signal_guard::run(input));
     if signal_guard::refuses(&guard) {
         return guard;
     }
-    let gate = command_gate_with(input, |job| within_budget(BUDGET, job));
+    let gate = command_gate_with(input, run);
     signal_guard::combine(guard, gate)
 }
 
@@ -1556,6 +1643,14 @@ type CommandJob = Box<dyn FnOnce() -> ScopedVerdict + Send>;
 /// reentrant only on the thread that holds it — the budget's worker thread
 /// would wait on it until the budget expired.
 fn command_gate_with(
+    input: &HookInput,
+    run: impl FnOnce(CommandJob) -> Option<ScopedVerdict>,
+) -> HookOutput {
+    under_bypass(input, command_gate_decided(input, run))
+}
+
+/// [`command_gate_with`] before the permission mode is applied.
+fn command_gate_decided(
     input: &HookInput,
     run: impl FnOnce(CommandJob) -> Option<ScopedVerdict>,
 ) -> HookOutput {
@@ -3723,6 +3818,175 @@ done
         assert!(rendered.contains("scope.unplanned"), "{rendered}");
     }
 
+    #[cfg(unix)]
+    fn in_mode(mut input: HookInput, mode: &str) -> HookInput {
+        input.permission_mode = mode.to_string();
+        input
+    }
+
+    /// The refusal above, in a session the person put in bypass permissions
+    /// mode: the harness is still asked, and what it refused is still said to
+    /// the person and to the model, but no decision is taken. Every other mode
+    /// keeps the refusal.
+    #[cfg(unix)]
+    #[test]
+    fn bypass_mode_reports_a_refused_command_without_enforcing_it() {
+        let (dir, repo, requests) = scoped_hook_fixture(true);
+        let serial = crate::harness::sidecar::test_serial();
+        let _binary = install_scoped_manvi(dir.path(), &requests, &serial);
+        let call = bash_call(&repo, "echo x > docs/elsewhere.md");
+
+        let output = gate_here(&in_mode(call.clone(), BYPASS_PERMISSIONS));
+        let rendered = output.render().unwrap_or_default();
+        assert!(
+            std::fs::read_to_string(&requests)
+                .unwrap_or_default()
+                .contains("policy.check.command"),
+            "bypass mode must still ask the harness: {rendered}"
+        );
+        let specific = output
+            .hook_specific_output
+            .as_ref()
+            .unwrap_or_else(|| panic!("the waived refusal must still be said: {rendered}"));
+        assert_eq!(specific.permission_decision, None, "{rendered}");
+        let context = specific.additional_context.as_deref().unwrap_or_default();
+        assert!(context.contains("scope.unplanned"), "{rendered}");
+        assert!(context.contains("bypass permissions mode"), "{rendered}");
+        let message = output.system_message.as_deref().unwrap_or_default();
+        assert!(message.contains("would have refused"), "{rendered}");
+        assert!(message.contains("scope.unplanned"), "{rendered}");
+
+        for mode in [
+            "",
+            "default",
+            "acceptEdits",
+            "plan",
+            "dontAsk",
+            "auto",
+            "bypass",
+        ] {
+            let output = gate_here(&in_mode(call.clone(), mode));
+            assert_eq!(
+                output
+                    .hook_specific_output
+                    .and_then(|specific| specific.permission_decision),
+                Some(PermissionDecision::Deny),
+                "permission_mode {mode:?} must not waive the refusal"
+            );
+        }
+    }
+
+    /// The same for an editing tool: a write outside the bound task's plan is
+    /// said, not refused, in bypass permissions mode.
+    #[cfg(unix)]
+    #[test]
+    fn bypass_mode_reports_a_refused_write_without_enforcing_it() {
+        let (dir, repo, requests) = scoped_hook_fixture(true);
+        let serial = crate::harness::sidecar::test_serial();
+        let _binary = install_scoped_manvi(dir.path(), &requests, &serial);
+        let call = edit_call(&repo, &format!("{repo}/docs/elsewhere.md"));
+
+        let enforced = guard_here(&call);
+        assert_eq!(
+            enforced
+                .hook_specific_output
+                .as_ref()
+                .and_then(|specific| specific.permission_decision),
+            Some(PermissionDecision::Deny),
+            "the fixture must refuse this write outside bypass mode: {:?}",
+            enforced.render()
+        );
+
+        let output = guard_here(&in_mode(call, BYPASS_PERMISSIONS));
+        let rendered = output.render().unwrap_or_default();
+        let specific = output
+            .hook_specific_output
+            .as_ref()
+            .unwrap_or_else(|| panic!("the waived refusal must still be said: {rendered}"));
+        assert_eq!(specific.permission_decision, None, "{rendered}");
+        assert!(
+            specific
+                .additional_context
+                .as_deref()
+                .unwrap_or_default()
+                .contains("scope.unplanned"),
+            "{rendered}"
+        );
+        assert!(
+            output
+                .system_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("bypass permissions mode"),
+            "{rendered}"
+        );
+    }
+
+    /// The signal guard's refusal is waived and said like every other: in
+    /// bypass mode a whole-machine kill is reported, not refused, and the
+    /// harness still judges the line; outside it the guard's refusal stands
+    /// before any harness is asked.
+    #[cfg(unix)]
+    #[test]
+    fn bypass_mode_reports_a_signal_guard_refusal_without_enforcing_it() {
+        let (dir, repo, _requests) = scoped_hook_fixture(false);
+        let serial = crate::harness::sidecar::test_serial();
+        let _binary = install_manvi(dir.path(), "allowing-manvi", FAKE_ALLOWING_MANVI, &serial);
+        let call = bash_call(&repo, "kill -- -1");
+
+        let enforced = command_gate_call(&call, |job| Some(job()));
+        assert!(
+            signal_guard::refuses(&enforced),
+            "the fixture must be refused outside bypass mode: {:?}",
+            enforced.render()
+        );
+        let reason = enforced
+            .hook_specific_output
+            .and_then(|specific| specific.permission_decision_reason)
+            .unwrap_or_default();
+        assert!(!reason.is_empty());
+
+        let waived = command_gate_call(&in_mode(call, BYPASS_PERMISSIONS), |job| Some(job()));
+        let rendered = waived.render().unwrap_or_default();
+        assert!(!signal_guard::refuses(&waived), "{rendered}");
+        let specific = waived
+            .hook_specific_output
+            .as_ref()
+            .unwrap_or_else(|| panic!("the waived refusal must still be said: {rendered}"));
+        assert_eq!(specific.permission_decision, None, "{rendered}");
+        let context = specific.additional_context.as_deref().unwrap_or_default();
+        assert!(context.contains(&reason), "{rendered}");
+        assert!(context.contains("bypass permissions mode"), "{rendered}");
+    }
+
+    /// Both halves of the command gate waived in one call: the answer keeps
+    /// what each half told the model, not only the half whose output survives.
+    #[test]
+    fn combining_two_waived_answers_keeps_both_contexts() {
+        let said = |context: &str, message: &str| HookOutput {
+            hook_specific_output: Some(HookSpecificOutput {
+                hook_event_name: PRE_TOOL_USE.to_string(),
+                permission_decision: None,
+                permission_decision_reason: None,
+                additional_context: Some(context.to_string()),
+            }),
+            system_message: Some(message.to_string()),
+        };
+        let combined = signal_guard::combine(
+            said("guard context", "guard notice"),
+            said("gate context", "gate notice"),
+        );
+        let specific = combined.hook_specific_output.expect("said");
+        assert_eq!(
+            specific.additional_context.as_deref(),
+            Some("guard context\ngate context")
+        );
+        assert_eq!(
+            combined.system_message.as_deref(),
+            Some("guard notice\ngate notice")
+        );
+    }
+
     /// Which commands count as writing a file is the harness's call, not the
     /// hook's: the hook must not pre-filter by program name and must not alter
     /// what it sends. Every argument-writing program the fence is asked about
@@ -4696,6 +4960,64 @@ done
         assert!(output.is_silent(), "{:?}", output.render());
         let sent = std::fs::read_to_string(&requests).unwrap_or_default();
         assert!(!sent.contains("\"scope\""), "{sent}");
+    }
+
+    /// An `ask` is waived the same way as a refusal, and an answer that took no
+    /// decision — silence, or a notice — is left exactly as it was.
+    #[test]
+    fn bypass_mode_waives_only_decisions() {
+        let bypass = HookInput {
+            permission_mode: BYPASS_PERMISSIONS.to_string(),
+            ..Default::default()
+        };
+        let ask = HookOutput {
+            hook_specific_output: Some(decision(
+                PRE_TOOL_USE,
+                PermissionDecision::Ask,
+                "src/lib.rs is contended".to_string(),
+            )),
+            system_message: Some("scan was incomplete".to_string()),
+        };
+        let waived = under_bypass(&bypass, ask.clone());
+        let specific = waived.hook_specific_output.as_ref().expect("still said");
+        assert_eq!(specific.permission_decision, None);
+        assert_eq!(specific.permission_decision_reason, None);
+        let context = specific.additional_context.as_deref().unwrap_or_default();
+        assert!(context.contains("would have asked you about"), "{context}");
+        assert!(context.contains("src/lib.rs is contended"), "{context}");
+        let message = waived.system_message.as_deref().unwrap_or_default();
+        assert!(message.starts_with("scan was incomplete\n"), "{message}");
+        assert!(message.contains("src/lib.rs is contended"), "{message}");
+
+        let notice = HookOutput::notice("It ran UNGATED.");
+        assert_eq!(under_bypass(&bypass, notice.clone()), notice);
+        assert_eq!(
+            under_bypass(&bypass, HookOutput::silent()),
+            HookOutput::silent()
+        );
+        let manual = HookInput {
+            permission_mode: "default".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(under_bypass(&manual, ask.clone()), ask);
+    }
+
+    #[test]
+    fn the_permission_mode_is_read_from_the_payload() {
+        let input = HookInput::from_value(&json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "permission_mode": "bypassPermissions",
+        }));
+        assert_eq!(input.permission_mode, BYPASS_PERMISSIONS);
+        let input = HookInput::from_value(&json!({"tool_name": "Bash", "permission_mode": 7}));
+        assert_eq!(input.permission_mode, "");
+        let input = HookInput::from_value(&json!({
+            "toolName": "Bash",
+            "permissionMode": "bypassPermissions",
+        }));
+        assert_eq!(input.permission_mode, BYPASS_PERMISSIONS);
     }
 
     #[test]
