@@ -1,6 +1,6 @@
-import { asksForReader as sharedAsksForReader } from "../terminal/sessionActivity";
-import { describe, expect, it } from "vitest";
-import { ACTIVE_WINDOW_MS, GLANCE_RANK, agentGlance, asksForReader, attemptTerminalView, attemptUrgency, checkoutChanges, mostUrgent, orderMonitored, pendingRequests, releasedNote, requestsLine, shortSpan, waitingLabel, type AttemptSession } from "./taskSessions";
+import { asksForReader as sharedAsksForReader, setSignalledAsksForReader } from "../terminal/sessionActivity";
+import { afterEach, describe, expect, it } from "vitest";
+import { ACTIVE_WINDOW_MS, GLANCE_RANK, agentGlance, asksForReader, attemptStage, attemptTerminalView, attemptUrgency, checkoutChanges, monitorAttempt, mostUrgent, orderMonitored, pendingRequests, releasedNote, requestsLine, shortSpan, taskAgentSummaries, waitingLabel, type AttemptSession, type MonitorContext } from "./taskSessions";
 import type { SessionActivity } from "../terminal/sessionActivity";
 import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
 import type { TaskTerminalRequest } from "../terminal/taskLaunches";
@@ -258,5 +258,29 @@ describe("orderMonitored", () => {
     const ordered = orderMonitored(rows);
     expect(ordered).not.toBe(rows);
     expect(rows.map((r) => r.id)).toEqual(["b", "a"]);
+  });
+});
+
+describe("the bell setting reaches the board and the pane through one rule", () => {
+  const NOW = 1_800_000_000_000;
+  const SECONDS = NOW / 1000;
+  const attempt: TaskRun = {
+    id: "a", revision: 1, updated_at: SECONDS, kind: "external_terminal", task_id: "t1", source_revision: 1, task_title: "Fix",
+    repository_id: "r1", provider: "claude", permission_mode: "ask", state: "running", cwd: "/work/a", created_at: SECONDS,
+    expires_at: SECONDS + 600, session_id: null, exit_code: null, reason: "", outcome_uncertain: false,
+  };
+  const bell: SessionActivity = { lastOutputAt: NOW, title: null, attention: { kind: "signalled", label: "Signalled", detail: null, at: NOW } };
+  const context = (): MonitorContext => ({
+    records: [record({ key: "k", taskRunId: "a", sessionId: "term-a" })], requests: [], capacityFull: false,
+    activity: () => bell, pending: () => undefined, now: NOW, clock: NOW,
+  });
+  afterEach(() => setSignalledAsksForReader(true));
+
+  it("counts a bell by default and stops counting it with the setting off", () => {
+    expect(taskAgentSummaries([attempt], context()).get("t1")).toEqual({ working: 1, asking: 1, tone: "signalled" });
+    expect(attemptStage(monitorAttempt(attempt, context()), NOW)).toMatchObject({ stage: "needs-you" });
+    setSignalledAsksForReader(false);
+    expect(taskAgentSummaries([attempt], context()).get("t1")).toMatchObject({ working: 1, asking: 0 });
+    expect(attemptStage(monitorAttempt(attempt, context()), NOW)).toMatchObject({ stage: "running" });
   });
 });

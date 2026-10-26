@@ -219,6 +219,16 @@ describe("agents waiting on the reader", () => {
     expect(countAgentsWaiting(new Map([["done", session("finished")], ["quiet", session(null)]]))).toBe(0);
   });
 
+  it("does not count a signalled-only session once the bell setting is off, and still counts a needs-you one", () => {
+    interfaceStore.setBellAsksForReader(false);
+    try {
+      expect(countAgentsWaiting(new Map([["bell", session("signalled")]]))).toBe(0);
+      expect(countAgentsWaiting(new Map([["bell", session("signalled")], ["needs", session("needs-you")], ["broke", session("error")]]))).toBe(2);
+    } finally {
+      interfaceStore.reset();
+    }
+  });
+
   it("emits zero when nobody is waiting, so an older caller's payload is unchanged", () => {
     expect(model().agentsWaiting).toBe(0);
     expect(model(loaded()).agentsWaiting).toBe(0);

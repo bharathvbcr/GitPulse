@@ -8,6 +8,7 @@
 
 import { currentSessionLimit, MAX_TERMINAL_SESSIONS } from "./sessionLimit";
 import { isImeComposition } from "../keyboard/imeGuard";
+import { clean } from "./sessionActivity";
 import type { PermissionMode } from "./agentDefaults";
 
 /** What a tab runs. `shell` is the user's own login shell; the rest are agent CLIs. */
@@ -346,9 +347,27 @@ export function terminalTabDestination(state: TabState, key: string): string | n
   return null;
 }
 
-/** Titles are display data, never terminal control sequences or unbounded state. */
+/**
+ * The most raw code units of a title that `cleanTabName` reads. A megabyte
+ * title costs one slice of this, not a pass over all of it; hidden characters
+ * and blanks are dropped from inside it, so a long run of them ahead of the
+ * visible text still leaves room for the text.
+ */
+const MAX_RAW_TITLE = 65_536;
+
+/** A surrogate with no partner: a high one not followed by a low, or a low not preceded by a high. */
+const UNPAIRED_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+
+/**
+ * Titles are display data, never terminal control sequences or unbounded
+ * state. What counts as hidden is `clean()`'s to say, so a program-set title
+ * cannot carry what a notification could not. The result is well-formed
+ * UTF-16: an unpaired surrogate (one the raw bound cut in two, or one the
+ * program sent) is dropped before `clean()`, since `JSON.stringify` escapes it
+ * as `\udXXX` and the backend's JSON reader refuses that.
+ */
 export function cleanTabName(value: string, limit = 64): string {
-  return Array.from(value.slice(0, limit * 2).replace(/[\x00-\x1f\x7f-\x9f]/g, "").trim()).slice(0, limit).join("");
+  return clean(value.slice(0, MAX_RAW_TITLE).replace(UNPAIRED_SURROGATE, ""), limit) ?? "";
 }
 
 export function renameTab(state: TabState, id: string, name: string): TabState {

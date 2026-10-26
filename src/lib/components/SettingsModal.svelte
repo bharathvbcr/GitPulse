@@ -1253,6 +1253,9 @@
                           <div class="text-textMuted text-[10px] mt-1">
                             {#if mcpInfo.plugin_found}
                               Plugin: {mcpInfo.plugin_path}
+                              {#if mcpInfo.plugin_error.trim()}
+                                <span class="text-amber-600 dark:text-amber-400 break-all" data-testid="plugin-error">{mcpInfo.plugin_error.trim()}</span>
+                              {/if}
                             {:else}
                               {mcpInfo.plugin_error}
                             {/if}
@@ -1336,6 +1339,15 @@
                      its parent and so hid it too, leaving an empty panel. -->
                 <div class="border-border/70 mt-3 border-t pt-3" data-setting="session-alerts" hidden={!shown("session-alerts")}>
                   <SessionAlertSettings active={isOpen && activeSection === "agents"} />
+                </div>
+                <div class="border-border/70 mt-3 border-t pt-3" data-setting="bell-asks" hidden={!shown("bell-asks")}>
+                  <SettingToggle
+                    label="Count a terminal bell as waiting for you"
+                    description="On by default: an agent without hooks can only ask for you by ringing the bell, so turning this off stops those asks from counting on the board, the task pane, the Agents view and the menu-bar count. The Agents view also stops listing a bell as a reason, so a row no longer shows that one rang. Requests an agent reports through its hooks, and errors, always count."
+                    ariaLabel="Count a terminal bell as waiting for you"
+                    checked={$interfaceStore.bellAsksForReader}
+                    onchange={(next) => interfaceStore.setBellAsksForReader(next)}
+                  />
                 </div>
                 <div class="border-border/70 mt-3 border-t pt-3" data-setting="agent-defaults" hidden={!shown("agent-defaults")}>
                   <AgentDefaultsSettings active={isOpen && activeSection === "agents"} />

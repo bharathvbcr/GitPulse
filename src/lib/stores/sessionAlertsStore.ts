@@ -39,6 +39,8 @@ export interface SessionAlertStatus {
   dropped_scan: number;
   failed: number;
   bridge_rejected: number;
+  /** Well-formed hook reports that arrived behind a later one from the same session and were dropped. */
+  stale: number;
   bridge_listening: boolean;
   bridge_path: string | null;
   last_error: string | null;
@@ -84,6 +86,7 @@ const EMPTY_STATUS: SessionAlertStatus = {
   dropped_scan: 0,
   failed: 0,
   bridge_rejected: 0,
+  stale: 0,
   bridge_listening: false,
   bridge_path: null,
   last_error: null,

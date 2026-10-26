@@ -8,6 +8,7 @@ import {
   TERMINAL_SCROLLBACK_DEFAULT,
 } from "../terminal/viewControls";
 import { LAUNCHERS, type LauncherKind } from "../terminal/tabs";
+import { setSignalledAsksForReader } from "../terminal/sessionActivity";
 import {
   isGraphWidthMode,
   type GraphWidthMode,
@@ -325,6 +326,18 @@ export interface InterfacePrefs {
    * not. Stored `false` stays off.
    */
   autoScanGithubAlerts: boolean;
+  /**
+   * Whether a terminal bell or OSC notice counts as an agent waiting on the
+   * reader, on the board, the task pane, the Agents view and the menu-bar
+   * count. On by default: an agent without hooks can only ask by ringing the
+   * bell, so turning this off stops those asks from counting. The Agents view
+   * also stops listing a bell as a reason (the task pane and the board still
+   * show the bell and only stop counting it). A request an agent reports
+   * through its hooks (`needs-you`, `error`) counts either way. Owned by
+   * `sessionActivity`, which cannot import this store, so every change is
+   * pushed to it from here.
+   */
+  bellAsksForReader: boolean;
 }
 
 const STORAGE_KEY = "gitpulse_interface_prefs";
@@ -387,6 +400,7 @@ const DEFAULTS: InterfacePrefs = {
   dismissedUpdateVersion: "",
   autoRunCoverage: false,
   autoScanGithubAlerts: true,
+  bellAsksForReader: true,
 };
 
 /**
@@ -564,6 +578,7 @@ function readPrefs(): InterfacePrefs {
         parsed.autoScanGithubAlerts,
         DEFAULTS.autoScanGithubAlerts,
       ),
+      bellAsksForReader: bool(parsed.bellAsksForReader, DEFAULTS.bellAsksForReader),
       lastUpdateCheckAt:
         typeof parsed.lastUpdateCheckAt === "number" &&
         Number.isFinite(parsed.lastUpdateCheckAt) &&
@@ -601,6 +616,7 @@ export const INTERFACE_PERSIST_DELAY_MS = 250;
 
 function createInterfaceStore() {
   let current = readPrefs();
+  setSignalledAsksForReader(current.bellAsksForReader);
   const { subscribe, set } = writable<InterfacePrefs>(current);
   const pendingSave = createDeferredWrite(() => persist(current), INTERFACE_PERSIST_DELAY_MS);
   flushOnPageHide(() => pendingSave.flush());
@@ -609,6 +625,7 @@ function createInterfaceStore() {
     pendingSave.cancel();
     current = next;
     persist(next);
+    setSignalledAsksForReader(next.bellAsksForReader);
     set(next);
   }
 
@@ -631,6 +648,7 @@ function createInterfaceStore() {
     const keys = Object.keys(partial) as (keyof InterfacePrefs)[];
     if (keys.every((key) => Object.is(current[key], partial[key]))) return;
     current = { ...current, ...partial };
+    setSignalledAsksForReader(current.bellAsksForReader);
     set(current);
     pendingSave.schedule();
   }
@@ -812,6 +830,7 @@ function createInterfaceStore() {
     dismissCoachMark: (id: string) =>
       patch((prefs) => ({ seenCoachMarks: { ...prefs.seenCoachMarks, [id]: true } })),
     resetCoachMarks: () => patch({ seenCoachMarks: {} }),
+    setBellAsksForReader: (on: boolean) => patch({ bellAsksForReader: on }),
     reset: () => commit(freshDefaults()),
   };
 }

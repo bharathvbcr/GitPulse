@@ -44,6 +44,7 @@ function viewWith(overrides: Partial<{ enabled: boolean; delivered: number }> = 
       dropped_scan: 0,
       failed: 0,
       bridge_rejected: 0,
+      stale: 0,
       bridge_listening: true,
       bridge_path: "/tmp/bridge.sock",
       last_error: null,
