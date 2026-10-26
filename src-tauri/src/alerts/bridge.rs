@@ -1335,14 +1335,34 @@ mod tests {
     #[cfg(unix)]
     static LISTENER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// The listener, held by one test and stopped when that test ends, however
+    /// it ends. `start` keeps a listener that is already up, so a test that
+    /// panicked before its own `apply_at(false, None)` would otherwise leave
+    /// its socket bound and the next test would be served at that path: one
+    /// failure read as three (test-parallel on fec1e008).
     #[cfg(unix)]
-    fn own_listener() -> std::sync::MutexGuard<'static, ()> {
+    struct OwnedListener {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl Drop for OwnedListener {
+        fn drop(&mut self) {
+            // Before the lock is released: the field drops after this body.
+            apply_at(false, None);
+        }
+    }
+
+    #[cfg(unix)]
+    fn own_listener() -> OwnedListener {
         // A report is acknowledged only if the worker took it, so a test that
         // expects `{"ok":true}` needs a worker to take it.
         crate::alerts::start(std::sync::Arc::new(QuietHost));
-        LISTENER
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        OwnedListener {
+            _lock: LISTENER
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        }
     }
 
     /// A temporary directory short enough to hold a socket.
@@ -1508,13 +1528,18 @@ mod tests {
         apply_at(true, Some(dir.socket()));
         assert!(status().listening, "{:?}", status().error);
         let started = std::time::Instant::now();
+        let full = r#"{"ok":false,"reason":"queue_full"}"#;
         for index in 0..200 {
             let report = format!(
                 r#"{{"v":1,"event":"idle_prompt","agent":"claude","session":"term-{index}"}}"#
             );
-            assert_eq!(
-                send(&dir.socket(), report.as_bytes()).trim(),
-                r#"{"ok":true}"#
+            // The queue is the process's, shared with every terminal test
+            // offering notices beside this one, so a full queue is an answer
+            // too: the bound refusing promptly, which is what is under test.
+            let reply = send(&dir.socket(), report.as_bytes());
+            assert!(
+                [r#"{"ok":true}"#, full].contains(&reply.trim()),
+                "report {index}: {reply}"
             );
         }
         // Serialised on purpose — one connection at a time is the bound — but
@@ -1530,14 +1555,40 @@ mod tests {
             started.elapsed()
         );
         // A peer that connects and says nothing is bounded by the read timeout
-        // and does not wedge the loop: the next report still gets through.
+        // and does not wedge the loop: the next report still gets through, and
+        // the worker is still draining, so once the queue has room it is taken.
         let quiet = std::os::unix::net::UnixStream::connect(dir.socket()).unwrap();
         drop(quiet);
-        assert_eq!(
-            send(&dir.socket(), br#"{"v":1,"event":"error","agent":"codex"}"#).trim(),
-            r#"{"ok":true}"#
+        assert!(
+            within(
+                crate::test_support::coverage_relaxed(std::time::Duration::from_secs(5)),
+                || send(&dir.socket(), br#"{"v":1,"event":"error","agent":"codex"}"#).trim()
+                    == r#"{"ok":true}"#
+            ),
+            "the worker never took a report after the flood"
         );
         apply_at(false, None);
+    }
+
+    /// A test that fails while it holds the listener does not hand the next
+    /// one a socket bound at its own path.
+    #[cfg(unix)]
+    #[test]
+    fn a_test_that_panics_holding_the_listener_leaves_it_stopped() {
+        let dir = ShortDir::new("panic");
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _own = own_listener();
+            apply_at(true, Some(dir.socket()));
+            assert!(status().listening, "{:?}", status().error);
+            panic!("a test failing with its listener up");
+        }));
+        assert!(failed.is_err());
+        let _own = own_listener();
+        assert!(
+            !status().listening,
+            "a panicked test left {:?} listening",
+            status().path
+        );
     }
 
     /// Polls `ready` every few milliseconds until it holds or `within` passes.
