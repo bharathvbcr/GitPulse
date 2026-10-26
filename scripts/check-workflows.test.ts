@@ -314,6 +314,28 @@ describe("check:workflows adversarial: downloads run without a check", () => {
     expect(pipedDownloads(yaml)).toEqual([]);
   });
 
+  it("follows a download through redirections, wrappers and a step-level run: prefix, and ignores words that are not commands", () => {
+    for (const yaml of [
+      run("curl -fsSL https://x.example/i.sh 2>&1 | bash"),
+      "      - run: curl -fsSL https://x.example/i.sh | sudo -u root bash",
+      run("FOO=1 curl -fsSL https://x.example/i.sh | env X=1 /usr/bin/bash -s"),
+      run("if curl -fsSL https://x.example/i.sh | bash; then echo ok; fi"),
+      run("curl -fsSL https://x.example/i.sh | zsh"),
+      block("curl -fsSL https://x.example/i.sh \\", "  --retry 3 \\", "  | sh"),
+    ]) expect(pipedDownloads(yaml), yaml).toHaveLength(1);
+    for (const yaml of [
+      run('echo "curl -fsSL https://x.example/i.sh | bash"'),
+      run("printf '%s\\n' 'curl x | bash'"),
+      "        name: Install curl | bash helper",
+      "        # run: curl x | bash",
+      run("curl -fsSL https://x.example/i.sh # | bash"),
+      run("curl -fsSL -o i.sh https://x.example/i.sh && sha256sum -c sums.txt && bash i.sh"),
+      block("curl -fsSL -o i.sh https://x.example/i.sh", "echo \"$HASH  i.sh\" | sha256sum -c -", "bash i.sh"),
+      block("run: |", "  set -e"),
+      run("bash -c 'echo hi' | cat"),
+    ]) expect(pipedDownloads(yaml), yaml).toEqual([]);
+  });
+
   it("HOLDS: the common spellings are found, in a multi-line block too", () => {
     for (const script of [
       "curl -fsSL https://x.example/i.sh | sudo bash",

@@ -10,6 +10,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import {
   PLATFORM_INSTALLERS,
   bundleSpecs,
+  checkSevenZipListing,
   declaredBinaryNames,
   expectedAssetNames,
   expectedInstallerNames,
@@ -262,6 +263,26 @@ describe("declared binaries", () => {
     expect(declaredBinaryNames(toml)).toEqual(["alpha", "beta-two", "gamma"]);
   });
 
+  it("reads TOML literal strings, quoted keys and a spaced header", () => {
+    expect(declaredBinaryNames("[[bin]]\nname = 'alpha'\n[[ bin ]]\n\"name\" = \"beta\"\n[[\"bin\"]]\nname = 'gamma' # c\n")).toEqual(["alpha", "beta", "gamma"]);
+  });
+
+  it.each([
+    ["a [[bin]] without a name", "[[bin]]\npath = \"a.rs\"\n[[bin]]\nname = \"b\"\n"],
+    ["a name that is not a plain string", "[[bin]]\nname = 5\n"],
+    ["two names in one table", "[[bin]]\nname = \"a\"\nname = \"b\"\n"],
+    ["an inline bin array", 'bin = [{ name = "alpha", path = "a.rs" }]\n'],
+    ["a dotted bin table", '[bin.alpha]\nname = "alpha"\n'],
+    ["a manifest with no [[bin]] at all", '[package]\nname = "x"\n'],
+    ["an empty manifest", ""],
+  ])("refuses %s rather than returning a shorter list", (_label, toml) => {
+    expect(() => declaredBinaryNames(toml)).toThrow(/Cargo\.toml/);
+  });
+
+  it("does not mistake a dependency named bin for a binary table", () => {
+    expect(declaredBinaryNames('[dependencies]\nbin = "1"\n[[bin]]\nname = "alpha"\n')).toEqual(["alpha"]);
+  });
+
   it("finds the five executables this crate builds, so a sixth would be required automatically", () => {
     const cargo = readFileSync(new URL("../src-tauri/Cargo.toml", import.meta.url), "utf8");
     expect(declaredBinaryNames(cargo).sort()).toEqual(["gitpulse", "gitpulse-hook", "gitpulse-mcp", "gitpulse-ptyd", "gitpulsed"]);
@@ -274,11 +295,17 @@ const BINS = ["gitpulse", "gitpulse-hook", "gitpulse-mcp", "gitpulse-ptyd", "git
 const ARM64 = 0x0100000c;
 const X86_64 = 0x01000007;
 
+/** A fat header whose slices each hold 8 bytes, laid out after the header. */
 function fat(cpus: number[]): Buffer {
-  const head = Buffer.alloc(8 + cpus.length * 20 + 16);
+  const headerEnd = 8 + cpus.length * 20;
+  const head = Buffer.alloc(headerEnd + cpus.length * 8);
   head.writeUInt32BE(0xcafebabe, 0);
   head.writeUInt32BE(cpus.length, 4);
-  cpus.forEach((cpu, index) => head.writeUInt32BE(cpu, 8 + index * 20));
+  cpus.forEach((cpu, index) => {
+    head.writeUInt32BE(cpu, 8 + index * 20);
+    head.writeUInt32BE(headerEnd + index * 8, 8 + index * 20 + 8);
+    head.writeUInt32BE(8, 8 + index * 20 + 12);
+  });
   return head;
 }
 const universal = () => fat([ARM64, X86_64]);
@@ -375,11 +402,11 @@ async function bundles(overrides: Record<string, Buffer | Extracted> = {}, bins 
     const layout = windows.get(archive);
     if (!layout) throw new Error(`unexpected archive ${archive}`);
     for (const [name, content] of Object.entries(layout)) {
-      const dest = path.join(outDir, "nested", name);
+      const dest = path.join(outDir, name);
       mkdirSync(path.dirname(dest), { recursive: true });
       if (Buffer.isBuffer(content)) writeFileSync(dest, content);
       else if ("symlink" in content) symlinkSync(content.symlink, dest);
-      else linkSync(path.join(outDir, "nested", content.hardlink), dest);
+      else linkSync(path.join(outDir, content.hardlink), dest);
     }
   };
   return { files, extract, dir };
@@ -396,6 +423,35 @@ const NSIS_ARM = `GitPulse_${VERSION}_arm64-setup.exe`;
 const macTar = (...entries: Buffer[]) => gzipSync(tarball(...entries));
 const macBin = (bin: string, data = universal(), opts = {}) => tarEntry(`GitPulse.app/Contents/MacOS/${bin}`, data, opts);
 const allMacBins = (skip = "") => BINS.filter((bin) => bin !== skip).map((bin) => macBin(bin));
+
+describe("7z listing", () => {
+  const listing = (...entries: string[]) => `\nListing archive: x\n\n--\nPath = /a/x.msi\nType = Compound\n----------\n${entries.join("\n\n")}\n`;
+  it("accepts entries inside the output directory within the size bound", () => {
+    expect(() => checkSevenZipListing(listing("Path = gitpulse.exe\nSize = 10", "Path = $PLUGINSDIR\\System.dll\nSize = 5", "Path = dir\nFolder = +", "Path = [NSIS].nsi\nSize = \nPacked Size = "), 100)).not.toThrow();
+  });
+  it.each([
+    ["an absolute path", "Path = /etc/passwd\nSize = 1", /leaves the output directory/],
+    ["a drive-letter path", "Path = C:\\Windows\\x.dll\nSize = 1", /leaves the output directory/],
+    ["a parent segment", "Path = a\\..\\..\\x\nSize = 1", /leaves the output directory/],
+    ["a size that is not a number", "Path = a\nSize = lots", /not a number/],
+    ["declared sizes over the bound", "Path = a\nSize = 101", /more than 100 bytes/],
+  ])("refuses %s before anything is extracted", (_label, entry, expected) => {
+    expect(() => checkSevenZipListing(listing(entry), 100)).toThrow(expected);
+  });
+  it("refuses a listing with no entries", () => {
+    expect(() => checkSevenZipListing("Listing archive: x\n", 100)).toThrow(/no entries/);
+    expect(() => checkSevenZipListing(listing(), 100)).toThrow(/no entries/);
+  });
+  it("refuses an extraction that left a link pointing outside its directory", async () => {
+    const outside = await bundles();
+    const link = inspectBundleContents({
+      version: VERSION, binaries: BINS, files: outside.files,
+      extract: (archive, outDir) => { outside.extract(archive, outDir); symlinkSync("/etc", path.join(outDir, "escape")); },
+    });
+    expect(link.invalid).toBe(true);
+    expect(link.violations.some((violation) => violation.includes("outside its directory"))).toBe(true);
+  });
+});
 
 describe("bundle contents", () => {
   it("opens exactly the seven bundled installers, derived from the release matrix", () => {

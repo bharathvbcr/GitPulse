@@ -10,7 +10,7 @@
  * 2 malformed input or invalid asset metadata.
  */
 import { spawnSync } from "node:child_process";
-import { closeSync, existsSync, lstatSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, rmSync, statSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, readlinkSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -238,7 +238,13 @@ export function inspectReleaseAssets({ tag, json }) {
  * The executables the app crate builds, read from its Cargo manifest so no
  * second list can drift from it: a sixth `[[bin]]` becomes required here the
  * moment it is declared. Walks lines, not one regex, so the key may sit
- * anywhere in its block and a commented-out block counts for nothing.
+ * anywhere in its block and a commented-out block counts for nothing. Reads
+ * basic and literal strings, quoted keys and a spaced `[[ bin ]]` header.
+ *
+ * It fails closed: a binary it cannot read would silently become optional in
+ * every bundle, so a `[[bin]]` table without a readable name, an inline
+ * `bin = [...]` array or any other `bin` table form it does not parse throws,
+ * and so does a manifest that declares no binary at all.
  *
  * @param {string} cargoToml
  * @returns {string[]}
@@ -247,17 +253,34 @@ export function declaredBinaryNames(cargoToml) {
   /** @type {string[]} */
   const names = [];
   let inBin = false;
+  let atRoot = true;
+  /** @type {string | null} */
+  let blockName = null;
+  const closeBlock = () => {
+    if (inBin && blockName === null) throw new Error("Cargo.toml has a [[bin]] table whose name could not be read");
+    inBin = false;
+    blockName = null;
+  };
   for (const raw of cargoToml.split(/\r?\n/)) {
     const line = raw.trim();
     if (line === "" || line.startsWith("#")) continue;
     if (line.startsWith("[")) {
-      inBin = /^\[\[bin\]\]\s*(?:#.*)?$/.test(line);
+      closeBlock();
+      atRoot = false;
+      if (/^\[\[\s*(?:bin|"bin"|'bin')\s*\]\]\s*(?:#.*)?$/.test(line)) inBin = true;
+      else if (/^\[\[?\s*(?:bin|"bin"|'bin')\s*[.\]]/.test(line)) throw new Error(`Cargo.toml declares binaries as ${line}, which is not understood`);
       continue;
     }
-    if (!inBin) continue;
-    const match = /^name\s*=\s*"([^"]+)"\s*(?:#.*)?$/.exec(line);
-    if (match) names.push(match[1]);
+    if (atRoot && /^(?:bin|"bin"|'bin')\s*[.=]/.test(line)) throw new Error("Cargo.toml declares binaries as an inline bin value, which is not understood");
+    if (!inBin || !/^(?:name|"name"|'name')\s*=/.test(line)) continue;
+    const match = /^(?:name|"name"|'name')\s*=\s*(?:"([^"\\]+)"|'([^']+)')\s*(?:#.*)?$/.exec(line);
+    if (!match) throw new Error(`Cargo.toml has a [[bin]] name that could not be read: ${line}`);
+    if (blockName !== null) throw new Error("Cargo.toml has a [[bin]] table with two names");
+    blockName = match[1] ?? match[2];
+    names.push(blockName);
   }
+  closeBlock();
+  if (names.length === 0) throw new Error("Cargo.toml declares no [[bin]] tables");
   return names;
 }
 
@@ -455,14 +478,46 @@ function unsafeTarPaths(entries) {
     .map((entry) => `unsafe-path: ${entry.path}`);
 }
 
-/** A universal Mach-O must carry exactly an arm64 and an x86_64 slice. @param {TarEntry} entry */
+/**
+ * An extractor writes a file named under a symlinked or hard-linked directory
+ * through the link, so the binary would not be inside the bundle. Every
+ * ancestor of a required path that has an entry of its own must be a real
+ * directory; an ancestor with no entry is an implicit directory.
+ *
+ * @param {TarEntry[]} entries
+ * @param {string[]} required  normalized paths of the required binaries
+ * @returns {string[]}
+ */
+function judgeTarParents(entries, required) {
+  const parents = new Set(required.flatMap((target) => {
+    const parts = target.split("/");
+    return parts.slice(0, -1).map((_part, index) => parts.slice(0, index + 1).join("/"));
+  }));
+  return entries
+    .filter((entry) => entry.type !== "dir" && parents.has(normalizeTarPath(entry.path)))
+    .map((entry) => `${entry.type}-parent: ${normalizeTarPath(entry.path)} is not a directory`);
+}
+
+/**
+ * A universal Mach-O must carry exactly an arm64 and an x86_64 slice, each
+ * inside the file and past the fat header.
+ *
+ * @param {TarEntry} entry
+ */
 function judgeUniversalMachO(entry) {
   const { data } = entry;
   if (data.length < 8 || data.readUInt32BE(0) !== MACHO_FAT_MAGIC) return "wrong-arch";
   const count = data.readUInt32BE(4);
-  if (count === 0 || count > 8 || 8 + count * 20 > data.length) return "wrong-arch";
+  const headerEnd = 8 + count * 20;
+  if (count === 0 || count > 8 || headerEnd > data.length) return "wrong-arch";
   const cpus = [];
-  for (let index = 0; index < count; index += 1) cpus.push(data.readUInt32BE(8 + index * 20));
+  for (let index = 0; index < count; index += 1) {
+    const at = 8 + index * 20;
+    const offset = data.readUInt32BE(at + 8);
+    const size = data.readUInt32BE(at + 12);
+    if (size === 0 || offset < headerEnd || offset + size > data.length) return "wrong-arch";
+    cpus.push(data.readUInt32BE(at));
+  }
   const unique = new Set(cpus);
   return unique.size === 2 && unique.has(MACHO_CPU_ARM64) && unique.has(MACHO_CPU_X86_64) && cpus.length === 2 ? null : "wrong-arch";
 }
@@ -501,10 +556,25 @@ function peMachine(file) {
  * ships on the runner image the release `verify` job uses. A missing `7z`
  * throws, so it can never read as an installer that held everything.
  *
+ * 7-Zip has no switch that caps what it writes, and its extraction path
+ * handling is not a documented guarantee (`7z --help` lists no such option;
+ * `-spf` only widens paths). So the archive is listed first (`l -slt`, which
+ * also lists what an MSI's embedded CAB holds), and extraction starts only if
+ * every entry's path stays inside the output directory and the declared sizes
+ * fit `maxBytes`. `inspectWindowsInstaller` then checks what was actually
+ * written.
+ *
  * @param {string} archive
  * @param {string} outDir
+ * @param {number} [maxBytes]
  */
-export function extractWithSevenZip(archive, outDir) {
+export function extractWithSevenZip(archive, outDir, maxBytes = MAX_UNPACKED_BYTES) {
+  const listing = spawnSync("7z", ["l", "-slt", "-bd", archive], {
+    encoding: "utf8", timeout: EXTRACT_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
+  });
+  if (listing.error) throw new UnreadableBundle(`7z could not run: ${listing.error.message}`);
+  if (listing.status !== 0) throw new UnreadableBundle(`7z could not list the installer (exit ${listing.status}): ${(listing.stderr || listing.stdout).trim().slice(-300)}`);
+  checkSevenZipListing(listing.stdout, maxBytes);
   // -aou keeps a second entry of the same name beside the first (as `name_1`)
   // instead of overwriting it, so a duplicate is visible in the output.
   const result = spawnSync("7z", ["x", "-aou", "-bd", "-bso0", "-bsp0", `-o${outDir}`, archive], {
@@ -512,6 +582,40 @@ export function extractWithSevenZip(archive, outDir) {
   });
   if (result.error) throw new UnreadableBundle(`7z could not run: ${result.error.message}`);
   if (result.status !== 0) throw new UnreadableBundle(`7z exited ${result.status}: ${(result.stderr ?? "").trim().slice(0, 300)}`);
+}
+
+/**
+ * Judges the entries of a `7z l -slt` listing (the blocks after its last
+ * `----------` line): no absolute or drive-letter path, no `..` segment, and a
+ * total declared size within `maxBytes`.
+ *
+ * @param {string} listing
+ * @param {number} maxBytes
+ */
+export function checkSevenZipListing(listing, maxBytes) {
+  const marker = listing.lastIndexOf("\n----------\n");
+  if (marker === -1) throw new UnreadableBundle("7z listing has no entries");
+  let total = 0;
+  let entries = 0;
+  for (const block of listing.slice(marker + "\n----------\n".length).split(/\r?\n\r?\n/)) {
+    const fields = new Map(block.split(/\r?\n/).map((line) => /^([^=]+?) = (.*)$/.exec(line)).filter((match) => match !== null).map((match) => [match[1], match[2]]));
+    const entryPath = fields.get("Path");
+    if (entryPath === undefined) continue;
+    entries += 1;
+    if (entries > MAX_ARCHIVE_ENTRIES) throw new UnreadableBundle("installer lists too many files");
+    if (/^(?:[\\/]|[A-Za-z]:)/.test(entryPath) || entryPath.split(/[\\/]/).includes("..")) {
+      throw new UnreadableBundle(`installer holds a path that leaves the output directory: ${entryPath}`);
+    }
+    const size = fields.get("Size");
+    // An entry whose size 7z does not know (it prints `Size = `) adds nothing
+    // here; the walk after extraction bounds what was actually written.
+    if (size !== undefined && size !== "") {
+      if (!/^\d+$/.test(size)) throw new UnreadableBundle(`7z listing has a size that is not a number: ${size}`);
+      total += Number(size);
+      if (total > maxBytes) throw new UnreadableBundle(`installer declares more than ${maxBytes} bytes unpacked`);
+    }
+  }
+  if (entries === 0) throw new UnreadableBundle("7z listing has no entries");
 }
 
 /**
@@ -556,24 +660,35 @@ function msiFileId(binary) {
  * @param {"x64" | "arm64"} arch
  * @param {string[]} binaries
  * @param {string} workDir
- * @param {(archive: string, outDir: string) => void} extract
+ * @param {(archive: string, outDir: string, maxBytes: number) => void} extract
+ * @param {number} maxBytes
  * @returns {string[]}
  */
-function inspectWindowsInstaller(archive, format, arch, binaries, workDir, extract) {
+function inspectWindowsInstaller(archive, format, arch, binaries, workDir, extract, maxBytes) {
   const outDir = mkdtempSync(path.join(workDir, "unpack-"));
   try {
-    extract(archive, outDir);
+    extract(archive, outDir, maxBytes);
     const files = walkExtracted(outDir);
+    const total = files.reduce((sum, file) => sum + (file.regular ? file.size : 0), 0);
+    if (total > maxBytes) throw new UnreadableBundle(`installer unpacked to ${total} bytes, over the ${maxBytes} bound`);
+    const root = path.resolve(outDir);
+    for (const file of files.filter((candidate) => candidate.symlink)) {
+      const target = path.resolve(path.dirname(file.full), readlinkSync(file.full));
+      if (target !== root && !target.startsWith(root + path.sep)) throw new UnreadableBundle(`extraction left a link pointing outside its directory: ${file.name}`);
+    }
     /** @type {string[]} */
     const violations = [];
+    const atRoot = new Set(files.filter((file) => path.dirname(file.full) === root).map((file) => file.name));
     for (const binary of binaries) {
+      // Both real installers extract with every binary at the root of the
+      // tree. A same-named file elsewhere (an NSIS `$PLUGINSDIR` temp file, a
+      // plugin resource) is not the installed binary.
       const wanted = format === "msi" ? msiFileId(binary) : `${binary}.exe`;
-      const matches = files.filter((file) => file.name === wanted);
       const stem = wanted.replace(/\.exe$/, "");
-      const renamed = files.filter((file) => new RegExp(`^${stem.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}_\\d+(?:\\.exe)?$`).test(file.name));
-      if (matches.length === 0) { violations.push(`missing: ${binary}`); continue; }
-      if (matches.length > 1 || renamed.length > 0) { violations.push(`duplicate: ${binary}`); continue; }
-      const [file] = matches;
+      const renamed = new RegExp(`^${stem.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}_\\d+(?:\\.exe)?$`);
+      const file = files.find((candidate) => candidate.full === path.join(root, wanted));
+      if (!file) { violations.push(`missing: ${binary}`); continue; }
+      if ([...atRoot].some((name) => renamed.test(name))) { violations.push(`duplicate: ${binary}`); continue; }
       if (file.symlink) violations.push(`symlink: ${binary}`);
       else if (!file.regular) violations.push(`not-regular: ${binary}`);
       else if (file.hardlink) violations.push(`hardlink: ${binary}`);
@@ -634,7 +749,7 @@ function coverageSummary(version, opened) {
  * the expected assets, so an installer that was not provided is a violation,
  * not a skipped row. A bundle that cannot be read at all sets `invalid`.
  *
- * @param {{ version: string, binaries: string[], files: Record<string, string | undefined>, workDir?: string, extract?: (archive: string, outDir: string) => void, maxUnpackedBytes?: number }} input
+ * @param {{ version: string, binaries: string[], files: Record<string, string | undefined>, workDir?: string, extract?: (archive: string, outDir: string, maxBytes: number) => void, maxUnpackedBytes?: number }} input
  * @returns {ContentCheck}
  */
 export function inspectBundleContents({ version, binaries, files, workDir, extract = extractWithSevenZip, maxUnpackedBytes = MAX_UNPACKED_BYTES }) {
@@ -662,14 +777,14 @@ export function inspectBundleContents({ version, binaries, files, workDir, extra
           const archive = readFileSync(file);
           const packed = spec.format === "deb" ? readDebData(archive) : archive;
           const entries = readTar(gunzipSync(packed, { maxOutputLength: maxUnpackedBytes }));
-          found = unsafeTarPaths(entries);
-          for (const binary of binaries) {
-            found.push(...(spec.format === "deb"
-              ? judgeTarBinary(entries, `usr/bin/${binary}`, binary, judgeElf(/** @type {"x64" | "arm64"} */ (spec.arch)))
-              : judgeTarBinary(entries, `GitPulse.app/Contents/MacOS/${binary}`, binary, judgeUniversalMachO)));
+          const wanted = binaries.map((binary) => (spec.format === "deb" ? `usr/bin/${binary}` : `GitPulse.app/Contents/MacOS/${binary}`));
+          found = [...unsafeTarPaths(entries), ...judgeTarParents(entries, wanted)];
+          for (const [index, binary] of binaries.entries()) {
+            found.push(...judgeTarBinary(entries, wanted[index], binary,
+              spec.format === "deb" ? judgeElf(/** @type {"x64" | "arm64"} */ (spec.arch)) : judgeUniversalMachO));
           }
         } else {
-          found = inspectWindowsInstaller(file, spec.format, /** @type {"x64" | "arm64"} */ (spec.arch), binaries, root, extract);
+          found = inspectWindowsInstaller(file, spec.format, /** @type {"x64" | "arm64"} */ (spec.arch), binaries, root, extract, maxUnpackedBytes);
         }
         opened.push(spec.asset);
         violations.push(...found.map((violation) => `${spec.asset}: ${violation}`));
