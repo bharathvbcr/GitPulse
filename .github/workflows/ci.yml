@@ -21,7 +21,11 @@ jobs:
   test:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    # fec1e008: ubuntu reached the serial 6,099-test lib suite at 39 min and
+    # was cancelled; macOS reached it at 33 min (after the WKWebView harness)
+    # and was cancelled at 40. The same suite took 20 min at eight threads on
+    # the macOS runner, so serial it needs well over that.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:

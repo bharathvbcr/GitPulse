@@ -25,7 +25,9 @@ jobs:
     permissions:
       contents: read
       actions: write
-    timeout-minutes: 45
+    # fec1e008: the instrumented serial lib suite ran ~3,160 tests in 17 min
+    # after a 14 min build, so the whole suite needs ~50 min before tests/.
+    timeout-minutes: 90
     steps:
       - name: Checkout Repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

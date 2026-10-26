@@ -28,7 +28,9 @@ jobs:
   rust-parallel:
     name: Rust tests, 8 threads (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    # fec1e008: macOS finished the lib suite (20 min) and was cancelled at
+    # 40 min in tests/terminal_ipc_latency.rs.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
