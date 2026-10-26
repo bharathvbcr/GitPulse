@@ -700,9 +700,10 @@ mod tests {
             // the compressor, thermal or power readings: there `compressor`
             // reads `Unavailable(Unsupported)`, which is the named reason this
             // test allows. On bare metal they must be readable.
+            use crate::procguard::LockedSpawn;
             let virtualised = std::process::Command::new("/usr/sbin/sysctl")
                 .args(["-n", "kern.hv_vmm_present"])
-                .output()
+                .output_locked()
                 .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "1");
             assert!(matches!(sample.pressure, Reading::Value(_)), "{sample:?}");
             if !virtualised {
