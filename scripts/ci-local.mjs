@@ -26,6 +26,7 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { rmSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatUsage, wantsHelp } from "./usage.mjs";
@@ -46,9 +47,16 @@ const CARGO_MANIFEST = "src-tauri/Cargo.toml";
  * `local: true` marks a gate CI does not run — those are exempt from the
  * coverage contract but still run here.
  *
+ * `produces` lists the reports a gate writes (repository-relative), which a
+ * later gate reads. Each is removed before its gate runs. `cargo llvm-cov`
+ * writes no report when a test fails, so without that the coverage floor read
+ * the last run's `lcov.info` — nine days old on 2026-10-25 — and passed on it:
+ * a check that could not run, reading like one that ran.
+ *
  * @typedef {{
  *   id: string, name: string, program: string, args: string[],
  *   covers?: string[], onlyOn?: NodeJS.Platform, local?: boolean, why?: string,
+ *   produces?: string[],
  * }} Gate
  * @type {Gate[]}
  */
@@ -120,6 +128,7 @@ export const GATES = [
     // `coverage` is `vitest run --coverage`: the same suite CI runs as
     // `bun run test`, plus the report coverage.yml gates on.
     covers: ["bun run test", "bun run coverage"],
+    produces: ["coverage/lcov.info"],
   },
   {
     id: "browser-regressions",
@@ -181,6 +190,7 @@ export const GATES = [
     covers: [
       `cargo test --manifest-path ${CARGO_MANIFEST} --locked --no-fail-fast -- --nocapture --test-threads=1`,
     ],
+    produces: ["lcov.info"],
   },
   {
     // The terminal suites again, every registry backed by a real
@@ -246,14 +256,17 @@ function runGate(gate) {
 }
 
 /**
- * Run every gate, continuing past failures.
+ * Run every gate, continuing past failures. With `root`, each gate's
+ * `produces` reports under it are removed before the gate runs; `main` passes
+ * the repository root, and a caller without one leaves files alone.
  *
  * @param {Gate[]} gates
  * @param {{ run?: (gate: Gate) => { ok: boolean, detail: string, ms: number },
- *           platform?: NodeJS.Platform, log?: (line: string) => void }} [options]
+ *           platform?: NodeJS.Platform, log?: (line: string) => void,
+ *           root?: string }} [options]
  */
 export function runGates(gates, options = {}) {
-  const { run = runGate, platform = process.platform, log = console.log } = options;
+  const { run = runGate, platform = process.platform, log = console.log, root } = options;
   const outcomes = [];
   for (const gate of gates) {
     const skipped = skipReason(gate, platform);
@@ -263,6 +276,9 @@ export function runGates(gates, options = {}) {
       continue;
     }
     log(`\n▶ ${gate.name}\n  ${commandLine(gate)}`);
+    if (root !== undefined) {
+      for (const report of gate.produces ?? []) rmSync(path.join(root, report), { force: true });
+    }
     const { ok, detail, ms } = run(gate);
     outcomes.push({ gate, status: ok ? "passed" : "failed", detail, ms });
     if (!ok) log(`✗ ${gate.name} failed (${detail}) — continuing so the rest still report`);
@@ -332,7 +348,7 @@ export function main(argv = process.argv.slice(2)) {
     console.error(usage());
     return 2;
   }
-  const outcomes = runGates(GATES);
+  const outcomes = runGates(GATES, { root: REPO_ROOT });
   console.log(summarize(outcomes));
   return outcomes.some((o) => o.status === "failed") ? 1 : 0;
 }

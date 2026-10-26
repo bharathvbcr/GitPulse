@@ -1,4 +1,6 @@
-import { readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { GATES, commandLine, runGates, skipReason, summarize } from "./ci-local.mjs";
 
@@ -188,5 +190,72 @@ describe("a gate that could not run never reads like one that passed", () => {
     const report = summarize(outcomes);
     expect(report).toContain(`${GATES.length - 1} passed`);
     expect(report).not.toContain(`${GATES.length} passed`);
+  });
+});
+
+describe("a report left by an earlier run is not read as this run's", () => {
+  const withRoot = (body: (root: string) => void) => {
+    const root = mkdtempSync(join(tmpdir(), "ci-local-reports-"));
+    try {
+      body(root);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+  const plant = (root: string, report: string) => {
+    mkdirSync(join(root, report, ".."), { recursive: true });
+    writeFileSync(join(root, report), "TN:\nend_of_record\n");
+  };
+
+  it("removes a gate's reports before it runs, so a run that writes none leaves none for the floor", () => {
+    withRoot((root) => {
+      plant(root, "lcov.info");
+      plant(root, join("coverage", "lcov.info"));
+      const seenByFloor: boolean[] = [];
+      runGates(GATES, {
+        platform: "darwin",
+        log: () => {},
+        root,
+        // Every gate "fails" without writing, as cargo llvm-cov does when a test fails.
+        run: (gate) => {
+          if (gate.id === "coverage-floor") {
+            seenByFloor.push(existsSync(join(root, "lcov.info")), existsSync(join(root, "coverage", "lcov.info")));
+          }
+          return { ok: gate.id === "coverage-floor", detail: "exit 101", ms: 1 };
+        },
+      });
+      expect(seenByFloor).toEqual([false, false]);
+    });
+  });
+
+  it("keeps the report the gate itself writes", () => {
+    withRoot((root) => {
+      plant(root, "lcov.info");
+      runGates(GATES, {
+        platform: "darwin",
+        log: () => {},
+        root,
+        run: (gate) => {
+          if (gate.id === "cargo-tests") plant(root, "lcov.info");
+          return { ok: true, detail: "exit 0", ms: 1 };
+        },
+      });
+      expect(existsSync(join(root, "lcov.info"))).toBe(true);
+    });
+  });
+
+  it("declares, before the floor, every report check:coverage reads", () => {
+    const floor = GATES.findIndex((gate) => gate.id === "coverage-floor");
+    const produced = GATES.slice(0, floor).flatMap((gate) => gate.produces ?? []);
+    // scripts/check-coverage-floor.mjs's defaults.
+    expect(produced).toEqual(expect.arrayContaining(["coverage/lcov.info", "lcov.info"]));
+  });
+
+  it("leaves files alone when no root is given", () => {
+    withRoot((root) => {
+      plant(root, "lcov.info");
+      runGates(GATES, { platform: "darwin", log: () => {}, run: () => ({ ok: true, detail: "exit 0", ms: 1 }) });
+      expect(existsSync(join(root, "lcov.info"))).toBe(true);
+    });
   });
 });
