@@ -194,6 +194,23 @@ reinstalling.
     OSC 7700 (`frames-start` / `frames-stop`). The terminal answers it with
     frame-interval statistics only. See `docs/TERMINAL.md`.
 - Host load governor, cards 1b and 1c: one verdict (`sysload::governor`) from the host-load sensor now decides what GitPulse does under memory pressure. Agent launches are refused at severe pressure (kernel level critical, or a thrashing memory compressor) before their checkout probes, capacity check and PTY open, with a typed `host_pressure` refusal that names the resource and value; the user's own shell is never gated, and stop, kill, cancel, save, commit, release and reconcile are never gated. GitPulse's own work is shed through the spawn gate's existing classes with the existing "deferred under load" marker: background work at `warn`, background and reactive work at critical or thrash, never a user action, resuming when the pressure clears. A stale-old or dead sensor admits with a warning and a `host_load.sensor_unavailable` ledger event and sheds nothing; Health shows it as ungoverned. Overrides are human only: **Admit anyway** (Health, and beside Retry on a refused launch) asks in a native dialog, then admits for two minutes. After 30 minutes of continuous refusal a toast offers one click to stop refusing; the refusal never lifts on its own. New setting `host_load.govern_launches`, new command `cmd_host_load_admit_anyway` (granted to the main window; 279 handlers). See `docs/LOAD_GOVERNOR.md`.
+- Tasks board: a repository row in the Tasks sidebar can be hidden. Its tasks
+  leave the All and workspace boards, and its own board still shows
+  everything; a task goes by the repository an agent runs in. Hiding is a
+  reader preference: store totals and per-column paging do not account for
+  hidden tasks, and the archive, inbox, badges and suggestions still include
+  them.
+- Manvi can run on Claude: a "Manvi's model" card points Manvi's own model at
+  a Claude model through the Anthropic API, with the key held in the login
+  Keychain. The key travels on stdin, never argv, and is read only after
+  `manvi version --json` promises to withhold `ANTHROPIC_API_KEY` from every
+  child; the handshake checks it again, and a Claude selection may not name a
+  base URL.
+- Delivered banners are also offered to Graft's local socket, best effort
+  inside a hard 1 s budget on their own thread, so an absent or hung Graft
+  never delays a banner.
+- Host load governor: low free disk space is advice only, with a byte cap and
+  typed `low_disk` / `cache_error` advisories for worktree caches.
 
 ### Changed
 
@@ -235,8 +252,9 @@ reinstalling.
   `NotMerged`, where it used to read as an unreadable failure, and the check
   now writes its trees to the quarantine instead of the repository. A partial
   clone is refused once per scan.
-- The git floor stays 2.23 (owner decision 13): the clone floor (2.45.1) is a
-  feature floor that gates cloning only, so the app runs on older gits. A git
+- The clone floor (2.45.1) is a feature floor that gates cloning only (owner
+  decision 13); the app's own floor is 2.36 (see the minimum supported Git
+  entry above, which superseded the 2.23 floor this decision kept). A git
   before 2.38 makes the conflict engine answer `unknown` for its
   `merge-tree --write-tree`, per feature.
 - The ledger moves to writer generation 2 (owner decision 1), one additive
@@ -693,6 +711,41 @@ reinstalling.
   is not published", so the check reported nothing newer. Now only a "not
   found" means not published; anything else fails the check and says why. The
   prebuilt-install option reports the same way.
+- Size walks count what they could not read: Storage and Insights walks count
+  unreadable and non-UTF-8 entries, a permission refusal or missing root makes
+  a total a floor, and unread worktree admin is never offered as reclaimable.
+- A wide Markdown table keeps its words whole and scrolls inside itself
+  instead of squeezing every column to a character.
+- A transcript row is recorded once however often its line is read: rows get a
+  deterministic id from their identity, so a stale cursor, a forget or a
+  second root spelling cannot duplicate them, and a transcript root confirmed
+  absent for five passes is retired.
+- The pre-edit collision check asks about the file, not the repository-wide
+  overlap list. It reads one path-limited status per worktree, fails closed on
+  a binary diff, matches case-insensitive volumes and nested repositories, and
+  ask-gates an edit it cannot locate.
+- The hook bridge survives accept errors: transient errors (EMFILE and the
+  like) back off and keep the socket, each connection is read on its own
+  supervised worker (at most 100 open, a 1.2 s ceiling under the hook's
+  budget), and reports are ordered by accept stamp.
+- An agent's MCP read waits a bounded time for the shared spawn budget instead
+  of being shed at 0 s; a load-shed worktree resolution answers
+  `deferred_worktree` with `retry_after_ms` and is retried once, and a refusal
+  names its bucket and level.
+- A command run with hooks retries only on git's own `index.lock` failure,
+  never on a hook's or a network command's output.
+- A command's error is `{ kind, message, detail? }`, typed by the code that
+  raised it: the retry, stash refresh, identity and trust prompts read `kind`
+  instead of matching message text, and only reviewed reads are retried.
+- A busy database no longer fails or restarts the ledger and churn cache: one
+  owner switches them to WAL with a bounded total wait, and the churn schema
+  rebuilds in a single transaction.
+- A sidecar farewell larger than its output queue no longer gets the child
+  killed in its own shutdown grace.
+- Resolving a worktree no longer leaks a file descriptor each time, which a
+  burst of 100 terminal sessions turned into hundreds.
+- Non-ASCII names no longer panic the remote URL parser, the `tasks/` scan or
+  the commit-graph HEAD reader.
 
 ### Security
 
@@ -707,6 +760,42 @@ reinstalling.
   version from `package.json`, and pins the SBOM tool's version.
   `bun run check:workflows` now fails on an action that is not pinned to a
   commit, and on a checkout that keeps its token.
+- Hook reports must name a session the terminal registry knows, and each
+  session is rate-limited: a report for an unknown session is refused as
+  `unknown_session` and a flood as `rate_limited`. A Claude session outside a
+  GitPulse terminal no longer raises banners or attention through the hook
+  bridge.
+- The hook-report protocol says what it did: the socket acks only what the
+  worker took, every refusal carries a reason from a closed set, a tombstone
+  covers each ended session, the queue is capped per class, and a clip is
+  measured on the serialized size.
+- Notify text has one cleaner and one hidden-character table: every display
+  channel goes through `alerts::text`, Rust and TypeScript share one generated
+  table of hidden code points, route guards catch a retargeted notify entry,
+  and the plugin's SessionEnd hook timeout is 1 s so it cannot raise Claude
+  Code's exit budget.
+- Notify events ride into every GitPulse-launched Claude: PermissionRequest,
+  PostToolUse, UserPromptSubmit, Stop and SessionEnd are injected beside
+  PreToolUse (report-only), a twin report from plugin and injection folds into
+  one, and `notify` reads no stdin when it has nothing to report.
+- Outbound data goes only where you chose: npm and bun scanners run with an
+  allowlisted environment and a pinned npm config, and a repository-set
+  registry, token, proxy or TLS setting refuses the scan. With no chosen AI
+  endpoint, a discovered local server is offered for confirmation and nothing
+  is sent until you confirm.
+- A sibling worktree can no longer author a binding the gate honours: the
+  newest binding is the highest row id, not the latest clock stamp, and
+  bindings imported from a sibling after the anchor are history only.
+- The file sandbox also refuses nested git directories and spelling tricks: a
+  delete or move of a folder holding a nested gitdir, HFS and backslash `.git`
+  spellings, and a symlinked `.gitmodules`.
+- Remote credentials stay out of the webview: remotes list display URLs plus
+  `has_credentials`, the judge, verdict and ledger see only display URLs, and
+  fetch, pull and push refuse a name that is not a configured remote.
+- Manifest and lockfile reads are bounded and no-follow, and the XML entity
+  decoder is linear.
+- Ledger event strings are bounded, and every cut is recorded in a sibling
+  field.
 
 ## [1.4.0] - 2026-10-11
 
