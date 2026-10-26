@@ -617,11 +617,11 @@ fn run(
 /// permission with activity banners — there is only one of each per
 /// application — so they are posted through this module rather than through a
 /// second bridge that would need its own delegate and its own authorization.
-struct SessionHost {
-    app: tauri::AppHandle,
+struct SessionHost<R: tauri::Runtime = tauri::Wry> {
+    app: tauri::AppHandle<R>,
 }
 
-impl crate::alerts::Host for SessionHost {
+impl<R: tauri::Runtime> crate::alerts::Host for SessionHost<R> {
     fn submit(&self, native: &str, heading: &str, body: &str, sound: bool) -> Result<bool, String> {
         let accepted = platform::post(native, heading, body, sound, platform::SESSION_CATEGORY)
             .map_err(|error| error.message)?;
@@ -652,21 +652,29 @@ impl crate::alerts::Host for SessionHost {
             .is_some_and(|window| window.is_focused().unwrap_or(false))
     }
 
-    /// The live terminal registry, in process or in the terminal host, lists
-    /// the session (one still ending counts: its last reports are real). A
-    /// registry that cannot be asked answers no: a check that could not run is
-    /// not one that passed.
+    /// The terminal registry holds the session (one still ending counts: its
+    /// last reports are real). This runs on a bridge worker that holds an
+    /// intake slot, so it is answered from this app's own snapshot of what the
+    /// terminal host holds and never asks the host: a hung host would
+    /// otherwise fill every slot, and a report would be applied long after its
+    /// hook gave up. The snapshot lags the host by an exit not yet delivered,
+    /// and by what ended while the connection was down until it reconnects. A
+    /// registry that cannot tell (the host has not been listed yet) answers
+    /// no: a check that could not run is not one that passed.
     fn knows(&self, key: &str) -> bool {
         let Some(sessions) = self.app.try_state::<crate::terminal::TerminalSessions>() else {
             return false;
         };
-        match crate::terminal::list_sessions(&sessions) {
-            Ok(listed) => listed.iter().any(|session| session.id == key),
-            Err(error) => {
-                log::warn!(target: "alerts", "terminal registry unreadable, hook report refused: {error}");
-                false
-            }
-        }
+        #[cfg(unix)]
+        let held = crate::terminal::host::client::registry_holds(&sessions, key);
+        #[cfg(not(unix))]
+        let held = crate::terminal::list_sessions(&sessions)
+            .ok()
+            .map(|listed| listed.iter().any(|session| session.id == key));
+        held.unwrap_or_else(|| {
+            log::debug!(target: "alerts", "terminal registry cannot tell; hook report refused");
+            false
+        })
     }
 
     /// A failed emit is logged, not retried: the next notice from the session
@@ -679,7 +687,9 @@ impl crate::alerts::Host for SessionHost {
 }
 
 /// The delivery host for [`crate::alerts::start`].
-pub(crate) fn session_host(app: &tauri::AppHandle) -> Arc<dyn crate::alerts::Host> {
+pub(crate) fn session_host<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Arc<dyn crate::alerts::Host> {
     Arc::new(SessionHost { app: app.clone() })
 }
 

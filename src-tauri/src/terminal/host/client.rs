@@ -699,6 +699,22 @@ impl HostClient {
             .any(|p| p.run_id.as_deref() == Some(run_id))
     }
 
+    /// Whether this app holds a proxy for `session`, which is every session
+    /// the host held when it was last listed, plus any this app is starting
+    /// (a proxy exists before the spawn's reply) and any ending (it goes at
+    /// `record_exit`). `None` until the host has been asked: whether it holds
+    /// the session is not known then. Answered from the snapshot alone, with
+    /// no request to the host, no reconnect and no host start, so it never
+    /// waits on a host that is slow or gone; the snapshot lags only by the
+    /// host's `Exit` frames, and, while the connection is down, by what ended
+    /// meanwhile until the next `adopt` reconciles it.
+    pub fn holds_session(&self, session: &str) -> Option<bool> {
+        if !self.inner.adopted.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(lock(&self.inner.proxies).contains_key(session))
+    }
+
     pub fn set_background(&self, sessions: &[String]) {
         if let Some(conn) = self.inner.current() {
             if let Err(error) = conn.send(
@@ -1540,3 +1556,25 @@ fn read_loop(inner: Weak<Inner>, conn: Arc<Connection>, mut reader: BufReader<Un
         conn.close();
     }
 }
+
+/// Whether the registry holds the session `key`, asked without waiting on
+/// anything: a host is answered from this app's own snapshot
+/// ([`HostClient::holds_session`]), and an in-process registry from its own
+/// map, a local lock with no connection behind it. `None` when the registry
+/// cannot tell (a host not yet listed, or an unreadable list): the caller
+/// decides what that means.
+///
+/// Its natural home is beside `tracks_run` in `terminal/mod.rs`; it lives here
+/// because a descendant module can read that file's private `host` field.
+pub(crate) fn registry_holds(state: &crate::terminal::TerminalSessions, key: &str) -> Option<bool> {
+    match &state.host {
+        Some(host) => host.holds_session(key),
+        None => crate::terminal::list_sessions(state)
+            .ok()
+            .map(|listed| listed.iter().any(|session| session.id == key)),
+    }
+}
+
+#[cfg(test)]
+#[path = "client_tests.rs"]
+mod tests;
