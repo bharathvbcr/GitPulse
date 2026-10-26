@@ -29,6 +29,7 @@ import { identityKey, type PathIdentityOptions } from "../repos/paths";
 import { agentKind } from "../work/agentWorktree";
 import { nearestContaining } from "./cwd";
 import { plural } from "../format";
+import { asksForReader } from "../terminal/sessionActivity";
 
 /** Repositories one sweep will read. The rest are reported as skipped. */
 export const MAX_AGENT_REPOS = 64;
@@ -453,7 +454,9 @@ function checkoutReasons(item: WorktreeSummary, collisions: Set<string> | null, 
 function terminalReasons(terminal: PlaneTerminal): AttentionReason[] {
   if (terminal.attention === "needs-you") return ["needs-you"];
   if (terminal.attention === "error") return ["error"];
-  if (terminal.attention === "signalled") return ["signalled"];
+  // A bell is an ask only while the setting that counts it is on, the same
+  // rule the tray, the board and the task pane count by.
+  if (terminal.attention === "signalled") return asksForReader("signalled") ? ["signalled"] : [];
   // A live agent that finished is waiting for its next instruction.
   if (terminal.attention === "finished") return ["finished"];
   return [];
@@ -465,7 +468,7 @@ function taskReasons(task: PlaneTask): AttentionReason[] {
   // `problem` is also how a running attempt with no session here is ranked.
   // That fact is `disconnected`. Calling it an error says the attempt stopped.
   if (task.tone === "error" || (task.tone === "problem" && !task.disconnected)) reasons.push("error");
-  if (task.tone === "signalled") reasons.push("signalled");
+  if (task.tone === "signalled" && asksForReader("signalled")) reasons.push("signalled");
   if (task.tone === "finished") reasons.push("finished");
   // A capped page that reported no rows still has requests behind it.
   // `pendingCount === 0` is then a floor, not an empty queue.

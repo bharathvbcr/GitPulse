@@ -1253,8 +1253,8 @@
                           <div class="text-textMuted text-[10px] mt-1">
                             {#if mcpInfo.plugin_found}
                               Plugin: {mcpInfo.plugin_path}
-                              {#if mcpInfo.plugin_error}
-                                <span class="text-amber-600 dark:text-amber-400" data-testid="plugin-error">{mcpInfo.plugin_error}</span>
+                              {#if mcpInfo.plugin_error.trim()}
+                                <span class="text-amber-600 dark:text-amber-400 break-all" data-testid="plugin-error">{mcpInfo.plugin_error.trim()}</span>
                               {/if}
                             {:else}
                               {mcpInfo.plugin_error}

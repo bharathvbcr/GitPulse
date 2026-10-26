@@ -22,10 +22,17 @@ describe("channel bypass: tab titles are cleaned by the one owner", () => {
     expect(Array.from(title).length).toBeLessThanOrEqual(64);
   });
 
-  it("a cut that lands inside a pair after hidden characters leaves no lone surrogate", () => {
-    // 127 hidden units fill the pre-bound up to the emoji's high surrogate.
+  it("hidden characters ahead of an emoji neither hide it nor split it", () => {
+    // Hidden characters are dropped from inside the raw bound, so the emoji
+    // survives whole however many of them come first.
     const title = cleanTabName(`${"​".repeat(127)}\u{1F600}`, 64);
-    expect(title).toBe("");
+    expect(title).toBe("\u{1F600}");
+  });
+
+  it("a pair the raw bound cuts in two is dropped whole, not left as a lone surrogate", () => {
+    const title = cleanTabName(`${"x".repeat(65_535)}\u{1F600}`, 100_000);
+    expect(title.isWellFormed()).toBe(true);
+    expect(title).toBe("x".repeat(65_535));
   });
 
   // ADVERSARIAL (L1): `clean()` keeps a lone surrogate that is not the trailing

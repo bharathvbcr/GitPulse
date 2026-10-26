@@ -348,15 +348,26 @@ export function terminalTabDestination(state: TabState, key: string): string | n
 }
 
 /**
+ * The most raw code units of a title that `cleanTabName` reads. A megabyte
+ * title costs one slice of this, not a pass over all of it; hidden characters
+ * and blanks are dropped from inside it, so a long run of them ahead of the
+ * visible text still leaves room for the text.
+ */
+const MAX_RAW_TITLE = 65_536;
+
+/** A surrogate with no partner: a high one not followed by a low, or a low not preceded by a high. */
+const UNPAIRED_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+
+/**
  * Titles are display data, never terminal control sequences or unbounded
  * state. What counts as hidden is `clean()`'s to say, so a program-set title
- * cannot carry what a notification could not. The code-unit pre-bound keeps a
- * megabyte title cheap; a pair the cut splits is dropped whole.
+ * cannot carry what a notification could not. The result is well-formed
+ * UTF-16: an unpaired surrogate (one the raw bound cut in two, or one the
+ * program sent) is dropped before `clean()`, since `JSON.stringify` escapes it
+ * as `\udXXX` and the backend's JSON reader refuses that.
  */
 export function cleanTabName(value: string, limit = 64): string {
-  let bounded = value.slice(0, limit * 2);
-  if (/[\ud800-\udbff]$/.test(bounded)) bounded = bounded.slice(0, -1);
-  return clean(bounded, limit) ?? "";
+  return clean(value.slice(0, MAX_RAW_TITLE).replace(UNPAIRED_SURROGATE, ""), limit) ?? "";
 }
 
 export function renameTab(state: TabState, id: string, name: string): TabState {
