@@ -220,7 +220,7 @@ fn serve(stream: UnixStream, writer: Writer, shared: &Shared) {
                 }
                 let garbage = shared
                     .garbage_lists
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
                     .is_ok();
                 if garbage {
                     Ok(serde_json::json!("this is not a list of sessions"))
