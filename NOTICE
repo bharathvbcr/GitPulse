@@ -1,0 +1,31 @@
+GitPulse
+Copyright (c) 2026 Bharath Chandra Vaddaram
+
+Third-Party Notices & Vendored Upstream Projects
+------------------------------------------------
+GitPulse includes patched/vendored Rust framework crates under `src-tauri/framework/`
+and builds on the following open-source projects:
+
+1. Tauri Framework (`tauri`, `wry`, `tao`, `muda`, `tauri-runtime-wry`, `tauri-build`, `tauri-codegen`, `tauri-macros`, `tauri-utils`)
+   https://github.com/tauri-apps/tauri
+   Copyright (c) 2017 - Present, The Tauri Programme within The Commons Conservancy.
+   Copyright (c) 2020 - Present, Ngo Iok Ui (`wry`), Pierre Krieger & The Rust Windowing contributors (`tao`).
+   Licensed under Apache-2.0 OR MIT (see individual LICENSE files under `src-tauri/framework/`).
+
+2. libappindicator-rs (`src-tauri/framework/libappindicator`)
+   https://github.com/qDot/libappindicator-rs
+   Copyright (c) 2017 Kyle Machulis (qDot)
+   Licensed under MIT OR Apache-2.0.
+
+3. notify (`src-tauri/framework/notify`)
+   https://github.com/notify-rs/notify
+   Copyright (c) Félix Saparelli and notify contributors (CC0-1.0 / Artistic-2.0).
+
+4. webkit2gtk-rs (`src-tauri/framework/webkit2gtk`)
+   https://github.com/tauri-apps/webkit2gtk-rs
+   Copyright (c) 2015-2020 The Gtk-rs Project Developers, Antoni Boucher.
+   Licensed under MIT.
+
+5. MarkDev Renderer Crates (`src-tauri/vendor/markdev/crates/`)
+   https://github.com/bharathvbcr/MarkDev
+   Copyright (c) 2026 Bharath Chandra Vaddaram (MIT License).

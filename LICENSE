@@ -1,6 +1,7 @@
 MIT License
 
 Copyright (c) 2026 Bharath Chandra Vaddaram
+Third-party vendored crates under src-tauri/framework/ retain their original licenses (see NOTICE).
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
