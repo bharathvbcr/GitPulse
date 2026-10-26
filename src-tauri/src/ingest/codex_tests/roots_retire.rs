@@ -4,6 +4,7 @@
 //! be retired. Every fixture is synthetic.
 
 use super::*;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -88,6 +89,7 @@ fn r01_a_root_absent_for_n_passes_is_retired_and_forgetting_resumes() {
     assert_eq!(out.stale_cursors, 0, "{out:?}");
 }
 
+#[cfg(unix)]
 #[test]
 fn r02_an_unreadable_root_is_never_retired_and_never_permits_forgetting() {
     let f = fixture();

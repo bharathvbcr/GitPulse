@@ -145,7 +145,7 @@ pub(crate) use env::coverage_relaxed;
 /// The command is run exactly as built: binary, environment and working
 /// directory are the caller's. Only stdin is closed. The exit status is left
 /// to the caller.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn run_within(
     cmd: Command,
     label: &str,
@@ -537,7 +537,9 @@ pub(crate) fn verifier_spawns(dir: &TempDir) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{coverage_relaxed, isolated_libtest_command, run_within};
+    #[cfg(unix)]
+    use super::run_within;
+    use super::{coverage_relaxed, isolated_libtest_command};
     use std::time::Duration;
 
     /// A helper process that never exits fails the test with its label and the

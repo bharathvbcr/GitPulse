@@ -72,7 +72,7 @@ fn directory() -> Option<PathBuf> {
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) mod test_dir {
     use std::cell::RefCell;
     use std::path::{Path, PathBuf};

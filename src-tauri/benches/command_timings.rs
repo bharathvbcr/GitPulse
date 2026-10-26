@@ -170,6 +170,7 @@ const VERIFIER_DELAY_MS: u32 = 20;
 /// Set to time a build that still verifies in the bulk walk. Without it a
 /// walk that starts the signing program at all aborts the run: the row would
 /// otherwise time the verifier instead of the walk.
+#[cfg(unix)]
 const ALLOW_VERIFIER_ENV: &str = "GITPULSE_BENCH_ALLOW_VERIFIER";
 
 /// Writes one object of `kind` and returns its id.
@@ -320,6 +321,7 @@ fn pulse_signed_cases(_root: &Path, _only: Option<&str>) -> Vec<Case<'static>> {
 
 /// Whether the row `name` is selected by `GITPULSE_BENCH_ONLY` (all of them
 /// when it is unset).
+#[cfg(unix)]
 fn wanted(only: Option<&str>, name: &str) -> bool {
     only.is_none_or(|only| only == name)
 }
@@ -345,11 +347,6 @@ fn peak_rss_mb() -> f64 {
         peak * 1024.0
     };
     bytes / (1024.0 * 1024.0)
-}
-
-#[cfg(not(unix))]
-fn peak_rss_mb() -> f64 {
-    0.0
 }
 
 /// A chain of `commits` unsigned empty-tree commits, written by one

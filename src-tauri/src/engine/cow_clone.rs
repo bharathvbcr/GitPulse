@@ -601,9 +601,9 @@ fn clone_tree(
     rules: CopyRules<'_>,
     recheck: Option<Recheck<'_>>,
 ) -> Result<Tally, CopyStop> {
-    let require_clone = rules.require_clone;
     #[cfg(target_os = "macos")]
     if !byte_copy_forced() {
+        let require_clone = rules.require_clone;
         if !require_clone {
             // `copyfile(3)` clones where it can and writes bytes where it
             // cannot (another volume), and does not say which. What it could

@@ -12982,6 +12982,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
     }
 
     /// The pulse row for `sha`.
+    #[cfg(unix)]
     fn signature_of(report: &PulseReport, sha: &str) -> CommitSignature {
         report
             .commits

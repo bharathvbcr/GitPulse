@@ -20,11 +20,14 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::time::Duration;
+use std::time::Instant;
 
 use common::fixture::{git, trust_repo};
 use common::{interleave, Case, Report, Sample};
 use gitpulse_lib::analyzer::coverage::{CoverageScanner, ScanLimits};
+#[cfg(unix)]
 use gitpulse_lib::analyzer::deps::{DepsScanner, ScanOptions};
 
 const HIT_FILES: usize = 2_000;
@@ -173,38 +176,42 @@ fn main() {
         COLD_SOURCE_BYTES / 1024
     ));
 
-    let (deps_repo, stubs) = deps_fixture(temp.path());
-    trust_repo(&deps_repo);
-    let deps_path = deps_repo.to_str().expect("UTF-8 path").to_string();
-    let path_var =
-        std::env::join_paths([stubs.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
-            .expect("PATH");
-    cases.push(Case::new("deps scan, hung auditor", move || {
-        let options = ScanOptions {
-            run_cli: true,
-            path_var: Some(path_var.clone()),
-            home: None,
-        };
-        let started = Instant::now();
-        let report = DepsScanner::scan_within(&deps_path, options, Duration::from_secs(1))
-            .expect("deps scan");
-        let elapsed = started.elapsed();
-        std::hint::black_box(&report);
-        Sample::default()
-            .counter("audit_complete", u64::from(report.audit_complete))
-            .elapsed(elapsed)
-    }));
-    report.note(
-        "deps scan: one npm root whose `npm audit` sleeps 5 s, scan deadline 1 s (builds without a \
-         deadline have no such row; their time for the same fixture is the 5 s the auditor takes)"
-            .to_string(),
-    );
+    #[cfg(unix)]
+    {
+        let (deps_repo, stubs) = deps_fixture(temp.path());
+        trust_repo(&deps_repo);
+        let deps_path = deps_repo.to_str().expect("UTF-8 path").to_string();
+        let path_var =
+            std::env::join_paths([stubs.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
+                .expect("PATH");
+        cases.push(Case::new("deps scan, hung auditor", move || {
+            let options = ScanOptions {
+                run_cli: true,
+                path_var: Some(path_var.clone()),
+                home: None,
+            };
+            let started = Instant::now();
+            let report = DepsScanner::scan_within(&deps_path, options, Duration::from_secs(1))
+                .expect("deps scan");
+            let elapsed = started.elapsed();
+            std::hint::black_box(&report);
+            Sample::default()
+                .counter("audit_complete", u64::from(report.audit_complete))
+                .elapsed(elapsed)
+        }));
+        report.note(
+            "deps scan: one npm root whose `npm audit` sleeps 5 s, scan deadline 1 s (builds without a \
+             deadline have no such row; their time for the same fixture is the 5 s the auditor takes)"
+                .to_string(),
+        );
+    }
 
     let rows = interleave(cases, report.opts.samples(9), report.opts.warmup(1));
     report.extend(rows);
     report.finish();
 }
 
+#[cfg(unix)]
 fn deps_fixture(root: &Path) -> (PathBuf, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
     let main = root.join("deps");

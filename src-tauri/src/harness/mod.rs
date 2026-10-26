@@ -15,7 +15,7 @@ pub mod protocol;
 pub(crate) mod review;
 pub mod sidecar;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod concurrent_tests;
 
 use serde::{Deserialize, Serialize};
@@ -967,6 +967,7 @@ mod scope_tests {
     }
 
     /// `git worktree list` children spawned in `cwd` while `f` ran.
+    #[cfg(unix)]
     fn family_resolutions<T>(cwd: &str, f: impl FnOnce() -> T) -> (T, usize) {
         let cwd = std::path::Path::new(cwd);
         let before = crate::engine::git_cli::spawn_log::spawns_in(cwd).len();

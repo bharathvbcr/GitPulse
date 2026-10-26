@@ -78,7 +78,7 @@ impl Keychain {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn at(program: PathBuf) -> Self {
         Self { program }
     }

@@ -1052,6 +1052,7 @@ fn a_graph_missing_a_required_chunk_is_unknown() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_loose_ref_wins_over_packed_refs_and_packed_refs_is_not_opened_for_it() {
     let _g = serial();

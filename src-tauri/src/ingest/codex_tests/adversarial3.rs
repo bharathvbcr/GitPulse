@@ -5,6 +5,7 @@
 //! held invariant.
 
 use super::*;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -43,10 +44,12 @@ fn filler(root: &Path, dir: &str, count: usize) {
     }
 }
 
+#[cfg(unix)]
 fn lock(dir: &Path) {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
 }
 
+#[cfg(unix)]
 fn unlock(dir: &Path) {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
@@ -82,6 +85,7 @@ fn f01_claude_over_the_file_cap_with_codex_whole_forgets_no_claude_cursor() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn f02_claude_with_an_unreadable_subdir_and_codex_whole_forgets_no_claude_cursor() {
     let pair = Pair::new();
@@ -122,6 +126,7 @@ fn f03_claude_entry_budget_and_depth_bound_forget_no_claude_cursor() {
     assert!(has_cursor(&pair, &kept), "{out:?}");
 }
 
+#[cfg(unix)]
 #[test]
 fn f04_codex_incomplete_with_claude_whole_forgets_no_codex_cursor() {
     let pair = Pair::new();

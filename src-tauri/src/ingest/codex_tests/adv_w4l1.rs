@@ -187,6 +187,7 @@ fn a1c_forget_then_the_file_returns_with_one_more_line_records_exactly_that_line
 }
 
 // 2a. One file reached through two spellings of its root.
+#[cfg(unix)]
 #[test]
 fn a2a_one_file_through_a_symlinked_root_is_not_recorded_twice() {
     let pair = Pair::new();

@@ -27,6 +27,7 @@
 
 pub mod bridge;
 mod intake;
+#[cfg(unix)]
 mod limits;
 pub mod policy;
 pub mod scan;

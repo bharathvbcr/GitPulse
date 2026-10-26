@@ -248,6 +248,7 @@ fn clock_forward_then_back_does_not_pay_more_than_always_write() {
 }
 
 /// ATTACK 1d. Refill anchor at the edge of u64.
+#[cfg(unix)]
 #[test]
 fn anchor_near_u64_max_mints_nothing_and_does_not_panic() {
     for anchor in [

@@ -238,6 +238,7 @@ struct RunObserver<R: tauri::Runtime> {
 ///
 /// `None` for a run the store cannot read or that has no owner: nothing can
 /// be recorded for it, and reconciliation decides it instead.
+#[cfg(unix)]
 pub(crate) fn adopted_observer<R: tauri::Runtime>(
     app: &AppHandle<R>,
     host: &WorkbenchState,

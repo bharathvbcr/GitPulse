@@ -80,6 +80,7 @@ fn initial_pass(main: &str) {
     repository_address(main).expect("initial consolidation pass");
 }
 
+#[cfg(unix)]
 fn ledger_file(repo: &str) -> std::path::PathBuf {
     crate::ledger::ledger_path(repo)
 }
@@ -168,6 +169,7 @@ fn upgrade_family_quantified_binds_in_later_born_siblings() {
 
 // ---------------------------------------------------------------- attack 3
 
+#[cfg(unix)]
 fn backdate_birth(path: &std::path::Path, stamp: &str) {
     // On macOS, setting an mtime earlier than the birth time lowers it too.
     let status = std::process::Command::new("touch")
@@ -178,6 +180,7 @@ fn backdate_birth(path: &std::path::Path, stamp: &str) {
     assert!(status.success());
 }
 
+#[cfg(unix)]
 fn birth_ms(path: &std::path::Path) -> u64 {
     std::fs::metadata(path)
         .unwrap()

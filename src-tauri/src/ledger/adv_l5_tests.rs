@@ -2,6 +2,7 @@
 
 use crate::ledger::*;
 use crate::procguard::LockedSpawn as _;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Barrier};
 use std::time::Instant;
@@ -127,6 +128,7 @@ fn adv_pass_rows_of_another_worktree_are_reported_and_a_removed_worktrees_failur
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn adv_basis_falls_back_honestly_when_catch_up_state_is_absent_in_a_read_only_db() {
     let (_dir, repo) = repo_dir();
@@ -164,6 +166,7 @@ fn adv_basis_falls_back_honestly_when_catch_up_state_is_absent_in_a_read_only_db
     }
 }
 
+#[cfg(unix)]
 fn snapshot_tree(dir: &std::path::Path) -> Vec<(String, u64, std::time::SystemTime, Vec<u8>)> {
     let mut out = Vec::new();
     for e in std::fs::read_dir(dir).unwrap() {
@@ -182,6 +185,7 @@ fn snapshot_tree(dir: &std::path::Path) -> Vec<(String, u64, std::time::SystemTi
     out
 }
 
+#[cfg(unix)]
 #[test]
 fn adv_readers_do_not_write_or_panic_on_a_read_only_ledger_directory() {
     let (_dir, repo) = repo_dir();

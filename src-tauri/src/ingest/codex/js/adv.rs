@@ -9,6 +9,7 @@ fn cmds_of(src: &str) -> (Vec<String>, Vec<&'static str>) {
 
 /// Peak resident set of this process in KiB, read in-process (no subprocess).
 /// A leak only ever raises the peak, so growth across a loop shows here.
+#[cfg(unix)]
 fn rss_kib() -> usize {
     // SAFETY: `rusage` is plain data and `getrusage` only writes into it.
     let usage = unsafe {
@@ -396,6 +397,7 @@ fn a4_deep_nesting_does_not_overflow() {
 
 /// Fresh parser per program: memory does not grow across thousands of programs,
 /// including aborted ones.
+#[cfg(unix)]
 #[test]
 #[ignore = "process-wide RSS: only meaningful alone, run with --test-threads=1"]
 fn a4_many_programs_do_not_grow_memory() {

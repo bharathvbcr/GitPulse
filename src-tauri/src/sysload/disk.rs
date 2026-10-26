@@ -49,6 +49,7 @@ pub fn free_bytes(path: &Path) -> Reading<u64> {
 /// Blocks available times the fragment size, or the block size where the
 /// filesystem reports no fragment size (`f_frsize == 0`): a zero there made
 /// every volume read as having no space.
+#[cfg(any(unix, test))]
 fn available_bytes(avail_blocks: u64, frsize: u64, bsize: u64) -> u64 {
     let unit = if frsize == 0 { bsize } else { frsize };
     avail_blocks.saturating_mul(unit)

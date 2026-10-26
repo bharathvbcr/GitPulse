@@ -5,11 +5,13 @@
 //! shared record. The measurement tests print their numbers (`--nocapture`).
 
 use super::{
-    refusal_message, refusal_message_at, shared_budget, spawn_log, subcommand, with_admission,
-    with_background_processes, Admission, BucketLevel, Refusal, RefusingBucket, RunError,
-    SpawnGate,
+    refusal_message, refusal_message_at, shared_budget, with_admission, with_background_processes,
+    Admission, BucketLevel, Refusal, RefusingBucket, RunError, SpawnGate,
 };
+#[cfg(unix)]
+use super::{spawn_log, subcommand};
 use crate::test_support::coverage_relaxed;
+#[cfg(unix)]
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -25,6 +27,7 @@ fn level(bucket: RefusingBucket, tokens: u32, floor: u32, burst: u32) -> BucketL
 /// A repository with `siblings` linked worktrees, each dirty in a file of its
 /// own, and the files the edit is of: the ordinary state of a machine running
 /// parallel agents.
+#[cfg(unix)]
 struct Farm {
     _repo: tempfile::TempDir,
     _siblings: tempfile::TempDir,
@@ -32,6 +35,7 @@ struct Farm {
     dirs: Vec<std::path::PathBuf>,
 }
 
+#[cfg(unix)]
 fn farm(siblings: usize) -> Farm {
     use crate::test_support::git_in;
     let repo_dir = tempfile::tempdir().expect("repository");

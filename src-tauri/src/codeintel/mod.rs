@@ -4389,6 +4389,7 @@ pub(crate) mod tests {
     }
 
     /// Threads in this process, from the kernel's own count.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn process_thread_count() -> usize {
         #[cfg(target_os = "macos")]
         {
@@ -4417,6 +4418,7 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn a_thousand_instantly_finished_queries_leave_no_threads_behind() {
         // Warm the shared timer so its one long-lived thread is in the baseline.

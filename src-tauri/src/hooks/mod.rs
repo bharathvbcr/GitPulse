@@ -4137,6 +4137,7 @@ done
         other: usize,
     }
 
+    #[cfg(unix)]
     impl SpawnCost {
         fn total(&self) -> usize {
             self.worktree_list + self.status + self.other
@@ -4163,7 +4164,9 @@ done
         }
     }
 
+    #[cfg(unix)]
     const SIBLINGS: usize = 6;
+    #[cfg(unix)]
     const EDITS: usize = 5;
 
     /// A repository and `SIBLINGS` worktrees of it, each dirty in a file of its
@@ -4693,6 +4696,7 @@ done
         assert_eq!(parse("Bash", json!({"command": "ls"})), None);
     }
 
+    #[cfg(unix)]
     mod adv_w6_tests;
 
     /// A contended file is still reported on every edit, with the same decision

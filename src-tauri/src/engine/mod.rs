@@ -18,7 +18,7 @@ pub mod stash;
 pub mod submodules;
 pub mod text_shape;
 pub mod worktree;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod worktree_family_adversarial_tests;
 mod worktree_family_disk;
 pub mod worktree_hooks;

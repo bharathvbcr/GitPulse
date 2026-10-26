@@ -109,7 +109,9 @@
 
 mod reason;
 
-use super::{Notice, Offer, Origin};
+#[cfg(unix)]
+use super::Offer;
+use super::{Notice, Origin};
 pub use reason::Reason;
 #[cfg(unix)]
 use std::sync::atomic::AtomicUsize;
@@ -2270,8 +2272,10 @@ mod tests {
         assert!(within(std::time::Duration::from_secs(5), || live_loops() == 0));
     }
 
+    #[cfg(unix)]
     struct QuietHost;
 
+    #[cfg(unix)]
     impl crate::alerts::Host for QuietHost {
         fn submit(&self, _: &str, _: &str, _: &str, _: bool) -> Result<bool, String> {
             Ok(true)

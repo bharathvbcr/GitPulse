@@ -3227,7 +3227,7 @@ fn note_band_outcome(label: &str, outcome: std::io::Result<crate::procguard::Ban
 
 /// `(entered, failed)`: children demoted into the background band, and
 /// demotions the OS refused, since process start.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn band_outcomes() -> (u64, u64) {
     use std::sync::atomic::Ordering;
     (
@@ -12084,6 +12084,7 @@ mod tests {
         assert!(refuse_nested_gitdir_below(&repo.join("sub/lib.txt"), "sub/lib.txt").is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_downward_walk_never_follows_a_symlink() {
         let (_dir, raw) = nested_repo_with_separate_gitdir();

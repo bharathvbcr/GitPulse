@@ -2,6 +2,7 @@
 //! passes). Tests only.
 
 use super::*;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 fn with_transcript_root<T>(root: &std::path::Path, f: impl FnOnce() -> T) -> T {
@@ -37,6 +38,7 @@ fn do_walk(root: &std::path::Path) -> (Vec<std::path::PathBuf>, Walk) {
     (files, walk)
 }
 
+#[cfg(unix)]
 fn cursor_count(repo: &str) -> i64 {
     let db = rusqlite::Connection::open_with_flags(
         ledger::ledger_path(repo),
@@ -61,6 +63,7 @@ fn seeded_repo() -> (tempfile::TempDir, String) {
     (repo_dir, repo)
 }
 
+#[cfg(unix)]
 #[test]
 fn adv_walk_symlink_to_slash_terminates_and_stays_inside_the_corpus() {
     let root = tempfile::tempdir().unwrap();
@@ -88,6 +91,7 @@ fn adv_walk_symlink_to_slash_terminates_and_stays_inside_the_corpus() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn adv_walk_symlink_to_an_ancestor_does_not_list_files_outside_the_corpus() {
     let top = tempfile::tempdir().unwrap();
@@ -112,6 +116,7 @@ fn adv_walk_symlink_to_an_ancestor_does_not_list_files_outside_the_corpus() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn adv_walk_two_symlinks_to_one_dir_list_each_distinct_file_once() {
     // AMENDED (item 7): the shared directory is inside the corpus. A link to a
@@ -131,6 +136,7 @@ fn adv_walk_two_symlinks_to_one_dir_list_each_distinct_file_once() {
 /// The dedup remembers the first name a directory was reached by, whatever
 /// depth that was. A directory reached first below the depth bound (counted,
 /// not listed) and again by a shallow link is never listed.
+#[cfg(unix)]
 #[test]
 fn adv_walk_dedup_does_not_hide_a_shallow_directory_behind_a_deep_alias() {
     for (deep_name, shallow_name) in [("a-deep", "z-shallow"), ("z-deep", "a-shallow")] {
@@ -246,6 +252,7 @@ fn adv_walk_unicode_and_very_long_names() {
     assert!(walk.complete);
 }
 
+#[cfg(unix)]
 #[test]
 fn adv_permission_denied_directory_is_incomplete_and_forgets_nothing() {
     let (_repo_dir, repo) = seeded_repo();
@@ -279,6 +286,7 @@ fn adv_permission_denied_directory_is_incomplete_and_forgets_nothing() {
 /// A directory that can be listed but not searched (mode 0444): `read_dir`
 /// succeeds, every `stat` of its entries fails, and `Path::is_dir` reports
 /// false for a failed stat.
+#[cfg(unix)]
 #[test]
 fn adv_listable_but_unsearchable_directory_must_not_forget_what_is_below_it() {
     let (_repo_dir, repo) = seeded_repo();
@@ -304,6 +312,7 @@ fn adv_listable_but_unsearchable_directory_must_not_forget_what_is_below_it() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn adv_vanished_or_dangling_transcript_keeps_its_offset_and_is_counted() {
     let (_repo_dir, repo) = seeded_repo();

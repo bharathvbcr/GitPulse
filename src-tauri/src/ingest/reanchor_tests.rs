@@ -484,6 +484,7 @@ fn moving_back_and_moving_twice_are_each_reported_once() {
     assert_eq!(count_action(&back, "ledger.reanchor"), 3);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_symlink_left_at_the_old_path_does_not_make_it_look_occupied() {
     let parent = tempfile::tempdir().unwrap();

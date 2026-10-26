@@ -38,8 +38,11 @@
 //!   the two above) `bridge_rejected`, so offered and accounted-for still
 //!   reconcile.
 
+#[cfg(unix)]
 use super::limits::Limits;
-use super::{Counters, Host, Notice, Origin, QUEUE};
+#[cfg(unix)]
+use super::Origin;
+use super::{Counters, Host, Notice, QUEUE};
 #[cfg(unix)]
 use std::collections::HashMap;
 use std::collections::HashSet;

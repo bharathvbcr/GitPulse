@@ -7456,6 +7456,7 @@ mod tests {
 
     /// A directory, a symlink and a dangling symlink are paths git can stage;
     /// each is reported as the index shows it.
+    #[cfg(unix)]
     #[test]
     fn directories_and_symlinks_are_reported_as_the_index_shows_them() {
         let dir = init_repo_with_commit();

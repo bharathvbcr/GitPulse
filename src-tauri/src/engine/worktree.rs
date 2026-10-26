@@ -359,7 +359,7 @@ fn remembered_family(
 }
 
 /// Makes the next call in this process ask the disk, as a new process would.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn forget_in_process(common: &Path) {
     remembered_families()
         .lock()
@@ -374,7 +374,7 @@ pub(crate) fn forget_in_process(common: &Path) {
 }
 
 /// Remembers families on disk, under test, in a directory on this thread.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use super::worktree_family_disk::test_dir as family_disk_dir;
 
 fn remember_family(common: PathBuf, registry: Vec<PathBuf>, family: &WorktreeFamily) {

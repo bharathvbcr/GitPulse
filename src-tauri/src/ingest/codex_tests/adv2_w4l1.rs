@@ -61,6 +61,7 @@ fn u1_pre_change_random_ulid_rows_rerecord_once_then_never() {
 }
 
 // Attack 2: one transcript read through two spellings of its root.
+#[cfg(unix)]
 #[test]
 fn i1_a_symlinked_root_spelling_records_nothing_twice() {
     let pair = Pair::new();

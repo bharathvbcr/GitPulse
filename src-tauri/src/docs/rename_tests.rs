@@ -782,6 +782,7 @@ fn docs_rename_live_sidecar_benchmark() {
 
 /// One repository of the realistic-state benchmark: the 5,000-note hub corpus
 /// in a given state of task binding and ledger history.
+#[cfg(unix)]
 struct StateRepo {
     name: &'static str,
     _dir: tempfile::TempDir,
@@ -795,6 +796,7 @@ struct StateRepo {
 /// paths, `ledger_events` appends that many prior events to its ledger. The
 /// repository is canonicalised first so the binding and the checks agree on
 /// its address.
+#[cfg(unix)]
 fn state_repo(name: &'static str, planned: Option<&[String]>, ledger_events: usize) -> StateRepo {
     use std::time::Instant;
     let dir = git_repo();
@@ -873,6 +875,7 @@ fn state_repo(name: &'static str, planned: Option<&[String]>, ledger_events: usi
 /// `GITPULSE_MANVI_BIN=$(command -v manvi) cargo test --release
 /// --manifest-path src-tauri/Cargo.toml --lib
 /// docs::rename_tests::docs_rename_realistic_state_benchmark -- --ignored --nocapture`
+#[cfg(unix)]
 #[test]
 #[ignore = "needs a real manvi (GITPULSE_MANVI_BIN); a measurement, not a check"]
 fn docs_rename_realistic_state_benchmark() {

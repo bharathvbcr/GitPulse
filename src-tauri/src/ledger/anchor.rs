@@ -2737,6 +2737,7 @@ mod tests {
         assert_eq!(out.unwrap(), Some(vec![before]));
     }
 
+    #[cfg(unix)]
     #[test]
     fn adv_symlinked_path_to_a_moved_checkout_keeps_the_ledger() {
         let (parent, _) = home();

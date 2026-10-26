@@ -6,6 +6,7 @@
 //! an attack that did not land.
 
 use super::*;
+#[cfg(unix)]
 use std::ffi::OsStr;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;

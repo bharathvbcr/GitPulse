@@ -9,6 +9,8 @@
 //! 2. **It is safe to run many at once**, as several agents' hooks are.
 //! 3. **It stays inside its deadline** on a table of this machine's size.
 
+#![cfg(unix)]
+
 // The hermetic test environment: a per-process home, git config and trust
 // store, rewritten before `main`. See `src/test_support/env.rs`.
 #[path = "../src/test_support/env.rs"]

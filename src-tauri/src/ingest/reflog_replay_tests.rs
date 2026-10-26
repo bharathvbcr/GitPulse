@@ -6,12 +6,15 @@
 use super::*;
 use crate::procguard::LockedSpawn;
 use crate::test_support::{commit_at, git_in};
+#[cfg(unix)]
 use std::process::Stdio;
 
 pub(super) const T0: i64 = 1_790_000_000;
+#[cfg(unix)]
 const CHILD: &str = "ingest::reflog_replay_tests::replay_child";
 const ENV_REPO: &str = "GITPULSE_TEST_REPLAY_REPO";
 const ENV_GO: &str = "GITPULSE_TEST_REPLAY_GO";
+#[cfg(unix)]
 const ENV_KILL: &str = "GITPULSE_TEST_KILL_AFTER_RECORDED";
 
 /// `git` in `dir` with author and committer dated `epoch`.
@@ -242,6 +245,7 @@ fn replay_child() {
 
 /// A command that runs [`replay_child`] from a private copy of this harness.
 /// The guard is returned: it deletes the copy, so it must outlive the child.
+#[cfg(unix)]
 fn child_command(
     repo: &str,
 ) -> (
@@ -259,6 +263,7 @@ fn child_command(
     (command, harness)
 }
 
+#[cfg(unix)]
 fn parsed(stdout: &[u8], key: &str) -> i64 {
     let text = String::from_utf8_lossy(stdout);
     text.split("REPLAY ")

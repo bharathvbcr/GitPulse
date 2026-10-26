@@ -2,7 +2,9 @@
 //! awkward, and what it says when the app refuses.
 
 use super::*;
-use crate::alerts::bridge::{self, Reason, MAX_REPORT_BYTES};
+#[cfg(unix)]
+use crate::alerts::bridge::Reason;
+use crate::alerts::bridge::{self, MAX_REPORT_BYTES};
 
 fn sent(event: &str, input: &HookInput) -> String {
     let serial = crate::test_support::env::env_serial();

@@ -3,6 +3,7 @@
 use super::budget::{self, TRUNCATION_KEY};
 use super::*;
 use crate::procguard::LockedSpawn as _;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::time::Instant;
 
@@ -219,6 +220,7 @@ fn adv_a_budget_cut_page_keeps_its_freshness_and_stays_in_budget() {
     }
 }
 
+#[cfg(unix)]
 fn lock_down(repo: &str) -> Vec<std::path::PathBuf> {
     let db = crate::ledger::ledger_path(repo);
     {
@@ -237,6 +239,7 @@ fn lock_down(repo: &str) -> Vec<std::path::PathBuf> {
     paths
 }
 
+#[cfg(unix)]
 fn unlock(paths: &[std::path::PathBuf]) {
     for p in paths.iter().rev() {
         let mode = if p.is_dir() { 0o755 } else { 0o644 };
@@ -244,6 +247,7 @@ fn unlock(paths: &[std::path::PathBuf]) {
     }
 }
 
+#[cfg(unix)]
 fn tree_bytes(dir: &std::path::Path) -> Vec<(String, Vec<u8>, std::time::SystemTime)> {
     let mut v: Vec<_> = std::fs::read_dir(dir)
         .unwrap()
@@ -260,6 +264,7 @@ fn tree_bytes(dir: &std::path::Path) -> Vec<(String, Vec<u8>, std::time::SystemT
     v
 }
 
+#[cfg(unix)]
 #[test]
 fn adv_every_mcp_read_path_on_a_read_only_ledger_never_writes_and_never_hangs() {
     let (_dir, repo) = trusted_repo();

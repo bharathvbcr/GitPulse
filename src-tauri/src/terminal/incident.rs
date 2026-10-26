@@ -61,12 +61,16 @@ const MAX_ATTRIBUTIONS: usize = 2;
 /// out on every query, including the integration test's. The query runs on
 /// its own thread and delays only the incident's event, never a session or
 /// the UI, so 12 s buys the answer at no cost to anything waiting.
+#[cfg(target_os = "macos")]
 const QUERY_DEADLINE: Duration = Duration::from_secs(12);
 /// How much query output is kept, and the longest single line parsed.
+#[cfg(target_os = "macos")]
 const QUERY_OUTPUT_CAP: usize = 4 * 1024 * 1024;
 const MAX_LINE_BYTES: usize = 256 * 1024;
 /// How far before the first death, and after the last, the log is searched.
+#[cfg(target_os = "macos")]
 const LOOKBACK_MS: u64 = 2_000;
+#[cfg(target_os = "macos")]
 const LOOKAHEAD_MS: u64 = 3_000;
 
 /// One session's end, as the terminal's reader thread reports it.

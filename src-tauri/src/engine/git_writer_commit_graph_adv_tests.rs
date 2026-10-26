@@ -175,6 +175,7 @@ fn adv_a_cancel_after_publish_is_not_reported_as_nothing_written() {
 
 /// A linked worktree and the main checkout share one common dir, so they must
 /// share one write; the same repository through a symlinked path must too.
+#[cfg(unix)]
 #[test]
 fn adv_a_linked_worktree_and_a_symlinked_path_join_one_write() {
     let (_dir, repo) = large_history(30_000);

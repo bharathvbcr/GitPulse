@@ -388,6 +388,7 @@ fn a01_a_dotdot_workdir_is_attributed_to_where_it_resolves() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a02_a_symlinked_workdir_is_attributed_by_path_as_documented() {
     let pair = Pair::new();
@@ -569,6 +570,7 @@ fn cursor_kept(pair: &Pair, path: &std::path::Path) -> bool {
         .contains_key(&ledger::transcript_key(path))
 }
 
+#[cfg(unix)]
 #[test]
 fn w01_a_symlink_loop_in_the_codex_root_is_walked_once() {
     let pair = Pair::new();
@@ -585,6 +587,7 @@ fn w01_a_symlink_loop_in_the_codex_root_is_walked_once() {
     assert_eq!((out.recorded, out.transcripts_listed), (1, 1), "{out:?}");
 }
 
+#[cfg(unix)]
 #[test]
 fn w02_a_symlink_out_of_the_codex_root_is_refused_and_counted() {
     let pair = Pair::new();
@@ -662,6 +665,7 @@ fn w05_a_walk_over_the_file_cap_never_forgets_a_codex_cursor() {
     });
 }
 
+#[cfg(unix)]
 #[test]
 fn w06_an_unreadable_codex_root_between_passes_forgets_nothing_with_claude_whole() {
     use std::os::unix::fs::PermissionsExt;
@@ -699,6 +703,7 @@ fn with_codex_home<T>(
     f()
 }
 
+#[cfg(unix)]
 #[test]
 fn w07_a_codex_home_that_becomes_unreachable_between_passes_forgets_nothing() {
     use std::os::unix::fs::PermissionsExt;

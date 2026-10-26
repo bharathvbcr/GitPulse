@@ -533,9 +533,14 @@ fn create_private_dir() -> Result<PathBuf, QuarantineError> {
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         );
         let path = base.join(name);
-        let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        let builder = {
+            let mut builder = std::fs::DirBuilder::new();
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
         match builder.create(&path) {
             Ok(()) => return Ok(path),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = e.to_string(),
@@ -556,6 +561,6 @@ fn create_private_dir() -> Result<PathBuf, QuarantineError> {
 #[path = "object_quarantine_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "object_quarantine_adv_tests.rs"]
 mod adv_tests;

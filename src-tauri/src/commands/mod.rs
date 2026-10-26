@@ -168,7 +168,7 @@ where
 
 #[cfg(test)]
 mod assemble_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod parity_tests;
 #[cfg(test)]
 mod tests;

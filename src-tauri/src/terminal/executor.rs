@@ -166,6 +166,7 @@ impl Executor {
     /// the terminal host, whose replies go back over a socket rather than to a
     /// future. Queued in call order, refused at once when the queue is full,
     /// and a panic in `body` is contained like one in [`Executor::run`]'s.
+    #[cfg(unix)]
     pub(crate) fn spawn<F>(&self, operation: &'static str, body: F) -> Result<(), String>
     where
         F: FnOnce() -> Result<(), String> + Send + 'static,

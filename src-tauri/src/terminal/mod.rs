@@ -268,6 +268,7 @@ const HIDDEN_MAX_HOLD: Duration = Duration::from_millis(250);
 /// reaps meanwhile), and must ask soon after the close is over rather than
 /// sleep until the next event: with no more output and no hangup, there may
 /// not be one.
+#[cfg(unix)]
 const CLOSING_LAP: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2661,6 +2662,7 @@ pub(crate) fn start_session(
             // holds.
             cwd: start.to_string_lossy().into_owned(),
         },
+        #[cfg(unix)]
         process: identity,
     })
 }
@@ -2670,6 +2672,7 @@ pub(crate) struct Started {
     pub spawned: TerminalSpawned,
     /// The process's id and creation identity (`process_birth`), or why they
     /// could not be read.
+    #[cfg(unix)]
     pub process: Result<(u32, String), String>,
 }
 
@@ -4432,9 +4435,11 @@ pub(crate) fn validate_manvi_paths(
 mod tests {
     use super::*;
     use crate::procguard::LockedSpawn;
+    #[cfg(unix)]
     use base64::Engine;
     use tempfile::TempDir;
 
+    #[cfg(unix)]
     const BASE64_STANDARD: base64::engine::general_purpose::GeneralPurpose =
         base64::engine::general_purpose::STANDARD;
 
@@ -4938,6 +4943,7 @@ mod tests {
     }
 
     /// A sink whose messages are kept, raw, in order.
+    #[cfg(unix)]
     fn recording() -> (OutputSink, Arc<Mutex<Vec<Vec<u8>>>>) {
         let log: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
         let into = log.clone();
