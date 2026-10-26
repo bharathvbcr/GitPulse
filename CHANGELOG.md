@@ -11,6 +11,15 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-10-25
+
+1.5.0 is the first release published since 1.3.1. 1.3.5 was withdrawn and
+1.4.0 was never published, so upgrading from 1.3.1 also brings everything in
+the 1.4.0 section of `CHANGELOG.md`. Read its **Upgrade** steps first: the task
+profile is migrated one way (to dc-store store schema 11 and workbench
+schema 14), and `gitpulse-mcp` and `gitpulse-hook` need
+reinstalling.
+
 ### Added
 
 - **Bypass permissions mode waives the PreToolUse gates.** In a Claude Code
@@ -67,62 +76,6 @@ before that tag is pushed.
   - The first read of a Codex rollout is not held to the baseline the older
     per-worktree watermark drew for Claude transcripts, so Codex history older
     than a worktree's newest Claude row is recorded rather than dropped.
-
-### Fixed
-
-- **Ledger answers over MCP say how current and how whole they are.** Added
-  fields only; nothing is renamed or retyped.
-  - `gitpulse_ledger_events`, the `ledger` resource, `gitpulse_status` and the
-    insights ledger facet carry `as_of` (when the newest row was appended),
-    `last_catch_up` with its `last_catch_up_basis`, and `stale` with
-    `stale_reason` (no catch-up or recorded event within `stale_after_secs`,
-    600). An empty or unreadable ledger has `as_of: null` and is stale with the
-    reason; a clock set backwards is never reported fresh.
-  - `catch_up` carries what the last passes covered, including `skipped_lines`
-    and `transcripts_unlisted`. Each pass now leaves its outcome in the ledger's
-    existing `catch_up_state` table, so a read-only process can report it.
-  - `recording` is true only for a process that is writing. A read-only open
-    reports `recording: false` and `recording_state: "readable"`; `"unknown"`
-    means no ledger or one that could not be opened.
-  - `dropped` is labelled `dropped_scope: "this_process"`: a reader reports 0
-    whatever another process dropped.
-  - The ledger tool and resource carry the same `legacy_ledger_unconsolidated`
-    caveat as the status facets (`caveat`, `caveat_code`), and
-    `gitpulse_change_context` names the `as_of` of the ledger it read
-    (`ledger_freshness`).
-- **The transcript walk counts what it leaves out.** It now reads the
-  `slug/session/subagents/workflows/wf_*/agent-*.jsonl` layout (five
-  directories deep), guards against symlink loops by device and inode, and
-  reports `transcripts_listed`, `transcripts_unlisted` (split into `unlisted_depth` and
-  `unlisted_cap`) and `walk_complete`. A tree past the depth bound or the
-  5000-file cap marks the pass `truncated` with the reasons in `error`, in
-  `gitpulsed` output and in `gitpulse_status`, instead of reporting a complete
-  walk. A transcript's saved offset is still forgotten only after a walk that
-  listed everything.
-
-### Changed
-
-- The minimum supported Git is now 2.36, up from 2.23, because worktree
-  listing uses `git worktree list -z` with no fallback (Ubuntu 22.04 and
-  Debian 11 ship older Git). The version check names every feature an older
-  Git lacks, and force push now sends `--force-with-lease --force-if-includes`
-  so a background fetch can no longer defeat the lease; the fleet commit
-  rhythm walk falls back to a count-bounded `git log` below Git 2.37.
-- dc-store is re-vendored at DevCouncil `95021ef1`: the task store is schema
-  11 (a `reviews` table, which `llm_review` acceptance criteria are discharged
-  from); workbench stays 14. A store a schema 11 host has opened is refused by
-  a schema 10 build, so GitPulse, Manvi, DevCouncil and the installed
-  `gitpulse-mcp`/`gitpulse-hook` move to 11 together.
-
-## [1.5.0] - 2026-10-20
-
-1.5.0 is the first release published since 1.3.1. 1.3.5 was withdrawn and
-1.4.0 was never published, so upgrading from 1.3.1 also brings everything in
-the 1.4.0 section of `CHANGELOG.md`. Read its **Upgrade** steps first: the task
-profile is migrated one way, and `gitpulse-mcp` and `gitpulse-hook` need
-reinstalling.
-
-### Added
 
 - Tasks board: order the Tasks board by priority by default
   (`interfaceStore.taskOrder`, default "priority") in the View menu, saved with
@@ -244,7 +197,17 @@ reinstalling.
 
 ### Changed
 
-### Changed
+- The minimum supported Git is now 2.36, up from 2.23, because worktree
+  listing uses `git worktree list -z` with no fallback (Ubuntu 22.04 and
+  Debian 11 ship older Git). The version check names every feature an older
+  Git lacks, and force push now sends `--force-with-lease --force-if-includes`
+  so a background fetch can no longer defeat the lease; the fleet commit
+  rhythm walk falls back to a count-bounded `git log` below Git 2.37.
+- dc-store is re-vendored at DevCouncil `95021ef1`: the task store is schema
+  11 (a `reviews` table, which `llm_review` acceptance criteria are discharged
+  from); workbench stays 14. A store a schema 11 host has opened is refused by
+  a schema 10 build, so GitPulse, Manvi, DevCouncil and the installed
+  `gitpulse-mcp`/`gitpulse-hook` move to 11 together.
 
 - A ledger is bound to the directory it was anchored in (OD 1). The identity
   record's detail JSON now also carries a lineage UUID and the checkout
@@ -486,6 +449,45 @@ reinstalling.
 
 ### Fixed
 
+- **Ledger answers over MCP say how current and how whole they are.** Added
+  fields only; nothing is renamed or retyped.
+  - `gitpulse_ledger_events`, the `ledger` resource, `gitpulse_status` and the
+    insights ledger facet carry `as_of` (when the newest row was appended),
+    `last_catch_up` with its `last_catch_up_basis`, and `stale` with
+    `stale_reason` (no catch-up or recorded event within `stale_after_secs`,
+    600). An empty or unreadable ledger has `as_of: null` and is stale with the
+    reason; a clock set backwards is never reported fresh.
+  - `catch_up` carries what the last passes covered, including `skipped_lines`
+    and `transcripts_unlisted`. Each pass now leaves its outcome in the ledger's
+    existing `catch_up_state` table, so a read-only process can report it.
+  - `recording` is true only for a process that is writing. A read-only open
+    reports `recording: false` and `recording_state: "readable"`; `"unknown"`
+    means no ledger or one that could not be opened.
+  - `dropped` is labelled `dropped_scope: "this_process"`: a reader reports 0
+    whatever another process dropped.
+  - The ledger tool and resource carry the same `legacy_ledger_unconsolidated`
+    caveat as the status facets (`caveat`, `caveat_code`), and
+    `gitpulse_change_context` names the `as_of` of the ledger it read
+    (`ledger_freshness`).
+- **The transcript walk counts what it leaves out.** It now reads the
+  `slug/session/subagents/workflows/wf_*/agent-*.jsonl` layout (five
+  directories deep), guards against symlink loops by device and inode, and
+  reports `transcripts_listed`, `transcripts_unlisted` (split into `unlisted_depth` and
+  `unlisted_cap`) and `walk_complete`. A tree past the depth bound or the
+  5000-file cap marks the pass `truncated` with the reasons in `error`, in
+  `gitpulsed` output and in `gitpulse_status`, instead of reporting a complete
+  walk. A transcript's saved offset is still forgotten only after a walk that
+  listed everything.
+
+- CI: the suites that failed only on GitHub's runners now run there. A
+  macOS-only QoS test module no longer breaks the Linux test build; a test
+  that spawned `rg` (absent on runners) walks the tree itself; path
+  comparisons normalise `\` to `/` on Windows; the vite watcher test
+  expands the runner's 8.3 temp path; git- and bash-spawning tests that ran
+  past vitest's 5 s default on Windows have explicit timeouts; the wide-table
+  word check ignores collapsed zero-width rects; and the host-probe test
+  accepts a named reason for VM-only readings while bare metal stays strict.
+
 - The Edit/Write hook (`gitpulse-hook collision-guard`) asks the running app for
   its collision scan instead of reading `git status` in every worktree itself.
   The app keeps the scan for 5 s, so a burst of edits over 7 worktrees spawns 8
@@ -693,6 +695,11 @@ reinstalling.
   prebuilt-install option reports the same way.
 
 ### Security
+
+- A withheld Markdown picture loads only from text that parses as an https
+  URL, and the parsed URL, not the attribute's text, is what reaches `src`.
+- The release build and the ARM bundle build pass `--locked` to cargo, so the
+  installers are built from exactly the committed `Cargo.lock`.
 
 - **The release job no longer runs package install scripts with the GitHub
   token, and no checkout keeps its credentials.** Every workflow pins each
