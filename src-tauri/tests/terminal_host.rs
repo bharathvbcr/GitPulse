@@ -92,7 +92,11 @@ fn trust_is_checked_in_the_host_and_a_session_grant_does_not_reach_it() {
         app.sink(),
     )
     .unwrap_err();
-    assert!(refused.contains("REPOSITORY_TRUST_REQUIRED"), "{refused}");
+    assert!(
+        refused.contains("REPOSITORY_TRUST_REQUIRED"),
+        "{refused}",
+        refused = refused.message()
+    );
     assert!(list_sessions(&app.state).unwrap().is_empty());
 }
 

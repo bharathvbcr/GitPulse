@@ -338,7 +338,7 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
     // so unlike the app it cannot assume they were already checked.
     let address = validate_repo(repo).and_then(|canonical| {
         gitpulse_lib::ledger::bindings::repository_address(&canonical.to_string_lossy())
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string().into())
     });
     let address = match address {
         Ok(address) => address,
@@ -363,7 +363,7 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
                 truncated: false,
                 pruned: 0,
                 recording: false,
-                error: reason,
+                error: reason.into_message(),
                 elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             };
         }

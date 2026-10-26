@@ -325,5 +325,9 @@ fn a_branch_held_by_a_linked_worktree_is_marked_and_refused() {
 
     let err = clean_branches(&repo.path_str(), &["feature/held".to_string()], true, false)
         .expect_err("a worktree's branch is refused");
-    assert!(err.contains("linked worktree"), "{err}");
+    assert!(
+        err.contains("linked worktree"),
+        "{err}",
+        err = err.message()
+    );
 }

@@ -1,6 +1,7 @@
 //! Branch, tag and release commands, plus the cleanup planners that act on refs.
 
 use super::*;
+use crate::ipc_error::CommandError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleasePublishResult {
@@ -169,7 +170,8 @@ pub async fn cmd_deadbranch_restore(
 pub async fn cmd_branch_cleanup_plan(
     repo_path: String,
 ) -> Result<crate::ops::BranchCleanupPlan, IpcError> {
-    off_thread(move || crate::ops::branch_cleanup_plan(&repo_path)).await
+    off_thread(move || crate::ops::branch_cleanup_plan(&repo_path).map_err(CommandError::from))
+        .await
 }
 
 /// The half of ref retention `cmd_branch_cleanup_plan` cannot see: a commit
@@ -178,14 +180,15 @@ pub async fn cmd_branch_cleanup_plan(
 pub async fn cmd_tag_cleanup_plan(
     repo_path: String,
 ) -> Result<crate::ops::TagCleanupPlan, IpcError> {
-    off_thread(move || crate::ops::tag_cleanup_plan(&repo_path)).await
+    off_thread(move || crate::ops::tag_cleanup_plan(&repo_path).map_err(CommandError::from)).await
 }
 
 #[tauri::command(async)]
 pub async fn cmd_review_outgoing_commits(
     repo_path: String,
 ) -> Result<crate::ops::CommitReviewReport, IpcError> {
-    off_thread(move || crate::ops::review_outgoing_commits(&repo_path)).await
+    off_thread(move || crate::ops::review_outgoing_commits(&repo_path).map_err(CommandError::from))
+        .await
 }
 
 #[tauri::command(async)]
@@ -256,7 +259,7 @@ pub async fn cmd_publish_release(
             GitWriter::push_tag(&repo_path, &plan.remote, &plan.tag).map_err(|error| {
                 format!(
                     "Release tag '{}' exists locally but could not be pushed: {}. Retry the release action after fixing connectivity.",
-                    plan.tag, error
+                    plan.tag, error.message()
                 )
             })?;
         Ok(Guarded {

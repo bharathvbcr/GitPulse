@@ -3,6 +3,7 @@ use super::{
     prepare_with_activity, providers, tree, HygienePlan, EXECUTION, INVENTORY, MAX_PLANS,
     PREPARATION, TTL,
 };
+use crate::ipc_error::CommandError;
 use std::fs::{self, File, FileTimes};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -215,7 +216,11 @@ fn cancellation_and_concurrent_execution_are_enforced_during_policy_review() {
         |_| Ok(()),
     )
     .unwrap_err();
-    assert!(error.contains("Cancelled"), "{error}");
+    assert!(
+        error.contains("Cancelled"),
+        "{error}",
+        error = error.message()
+    );
     assert!(repo.join("target/debug/output").exists());
     assert!(!plans().lock().unwrap().active.contains_key(&view.id));
 }
@@ -252,7 +257,11 @@ fn index_and_ignore_changes_during_policy_review_preserve_output() {
         |_| Ok(()),
     )
     .unwrap_err();
-    assert!(error.contains("Tracked"), "{error}");
+    assert!(
+        error.contains("Tracked"),
+        "{error}",
+        error = error.message()
+    );
     crate::engine::git_cli::git_text(&repo, &["rm", "--cached", "target/debug/output"]).unwrap();
     let view = preview(&repo);
     let error = execute_with_activity(
@@ -265,7 +274,7 @@ fn index_and_ignore_changes_during_policy_review_preserve_output() {
         |_| Ok(()),
     )
     .unwrap_err();
-    assert!(error.contains("ignore"), "{error}");
+    assert!(error.contains("ignore"), "{error}", error = error.message());
     assert!(repo.join("target/debug/output").exists());
 }
 
@@ -597,7 +606,13 @@ fn a_panic_under_any_hygiene_lock_does_not_disable_cleanup() {
             let taken = exclusive(lock, busy);
             assert!(taken.is_ok(), "{busy}: a poisoned lock was refused");
             // Genuine contention is still contention.
-            assert_eq!(exclusive(lock, busy).err().as_deref(), Some(busy));
+            assert_eq!(
+                exclusive(lock, busy)
+                    .err()
+                    .map(CommandError::into_message)
+                    .as_deref(),
+                Some(busy)
+            );
         }
         lock.clear_poison();
     }

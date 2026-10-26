@@ -9,7 +9,7 @@ use crate::engine::git_cli::{refusal_message, Refusal};
 use crate::procguard::LockedSpawn;
 
 fn shed(label: &str) -> String {
-    refusal_message(label, Refusal::Shed)
+    refusal_message(label, Refusal::Shed).into_message()
 }
 
 /// A read that is on the replay-safe list.

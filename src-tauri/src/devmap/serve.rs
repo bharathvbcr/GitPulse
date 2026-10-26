@@ -41,6 +41,7 @@
 
 use super::cli::resolve_binary;
 use crate::engine::git_cli::validate_repo;
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -172,7 +173,7 @@ pub(crate) fn bind_test_endpoint(endpoint: impl Into<String>) -> TestEndpointBin
 /// `--print-socket-path` is documented to return before opening a store or
 /// creating any file, which is what makes it safe to call on a path that has
 /// never been indexed.
-pub fn socket_path(repo: &Path) -> Result<String, String> {
+pub fn socket_path(repo: &Path) -> Result<String, CommandError> {
     if let Some(hit) = SOCKETS
         .lock()
         .ok()
@@ -197,7 +198,7 @@ pub(crate) fn clear_socket_cache() {
     }
 }
 
-fn resolve_socket_path_uncached(repo: &Path) -> Result<String, String> {
+fn resolve_socket_path_uncached(repo: &Path) -> Result<String, CommandError> {
     #[cfg(all(test, unix))]
     {
         if let Some(canned) = TEST_ENDPOINT
@@ -226,7 +227,8 @@ fn resolve_socket_path_uncached(repo: &Path) -> Result<String, String> {
         return Err(format!(
             "devmap serve --print-socket-path printed nothing (exit {:?})",
             run.status_code
-        ));
+        )
+        .into());
     }
     Ok(path)
 }
@@ -349,11 +351,11 @@ pub fn interpret_reply(reply: &[u8], socket: Option<String>) -> DaemonState {
 /// Is a daemon maintaining this repository's index right now?
 ///
 /// Trust-gated like every other path that runs a tool against a repository.
-pub fn probe(repo_path: &str) -> Result<DaemonState, String> {
+pub fn probe(repo_path: &str) -> Result<DaemonState, CommandError> {
     let repo = validate_repo(repo_path)?;
     match socket_path(&repo) {
         Ok(socket) => Ok(probe_socket(&socket)),
-        Err(reason) => Ok(DaemonState::absent(None, reason)),
+        Err(reason) => Ok(DaemonState::absent(None, reason.into_message())),
     }
 }
 

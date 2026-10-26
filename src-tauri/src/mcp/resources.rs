@@ -469,7 +469,7 @@ pub fn status_document(repo: &str) -> Result<Value, String> {
         // `ok: true` would read as "this repository has no worktrees".
         Err(error) => json!({
             "ok": false,
-            "error": error,
+            "error": error.message(),
             "count": 0,
             "truncated": false,
             "items": [],

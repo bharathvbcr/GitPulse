@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::engine::worktree::MergeTeardownError;
+use crate::ipc_error::CommandError;
 
 // ---------------------------------------------------------------------------
 // Linked worktrees: how agents parallelize, so they are first-class here.
@@ -22,7 +23,11 @@ pub async fn cmd_list_worktrees(
     // Past `listing` it spawns git per worktree (capped), so it belongs on
     // the blocking pool like every other reader.
     let depth = depth.unwrap_or(crate::engine::worktree::ScanDepth::Listing);
-    off_thread(move || crate::engine::worktree::list_worktrees_scanned(&repo_path, depth)).await
+    off_thread(move || {
+        crate::engine::worktree::list_worktrees_scanned(&repo_path, depth)
+            .map_err(CommandError::from)
+    })
+    .await
 }
 
 /// Creates a linked worktree, after the command gate has judged the exact
@@ -114,6 +119,7 @@ pub async fn cmd_remove_worktree(
             force,
             &|repo, argv| guard(repo, argv),
         )
+        .map_err(CommandError::from)
     })
     .await
 }
@@ -131,7 +137,7 @@ pub(crate) fn remove_worktree_guarded(
     target_path: &str,
     force: bool,
     gate: WorktreeGate<'_>,
-) -> Result<Guarded<crate::engine::worktree::WorktreeRemoval>, String> {
+) -> Result<Guarded<crate::engine::worktree::WorktreeRemoval>, CommandError> {
     // A task run's agent, a dock tab's agent or any process may be working in
     // it; removal would pull its files out from under it.
     workbench.refuse_if_in_use(target_path)?;
@@ -236,7 +242,7 @@ pub(crate) fn merge_teardown_guarded(
     // doc). The verdict reported is the merge's: the first mutation, and
     // the one the rest depend on.
     let mut policy = None;
-    let mut gate = |args: &[&str]| -> Result<(), String> {
+    let mut gate = |args: &[&str]| -> Result<(), CommandError> {
         let argv: Vec<&str> = std::iter::once("git").chain(args.iter().copied()).collect();
         let verdict = judge(repo_path, &argv)?;
         policy.get_or_insert(verdict);
@@ -305,7 +311,11 @@ pub async fn cmd_worktree_ai_summary(
     worktree_path: String,
     branch: Option<String>,
 ) -> Result<String, IpcError> {
-    off_thread(move || worktree_ai_summary(&repo_path, &worktree_path, branch.as_deref())).await
+    off_thread(move || {
+        worktree_ai_summary(&repo_path, &worktree_path, branch.as_deref())
+            .map_err(CommandError::from)
+    })
+    .await
 }
 
 /// Body of [`cmd_worktree_ai_summary`].
@@ -313,10 +323,10 @@ pub(super) fn worktree_ai_summary(
     repo_path: &str,
     worktree_path: &str,
     branch: Option<&str>,
-) -> Result<String, String> {
+) -> Result<String, CommandError> {
     let wt = std::path::Path::new(worktree_path);
     if !wt.exists() {
-        return Err("Worktree path does not exist".to_string());
+        return Err("Worktree path does not exist".into());
     }
     // Each measurement below reads a failed git as "absent", and with all
     // three absent the summary used to say "Worktree clean". A read that

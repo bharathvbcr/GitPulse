@@ -225,7 +225,8 @@ fn a_release_is_refused_when_the_working_tree_is_dirty() {
         .expect_err("a dirty tree must block a release");
     assert!(
         error.contains("clean working tree"),
-        "the refusal should name the reason: {error}"
+        "the refusal should name the reason: {error}",
+        error = error.message()
     );
 }
 
@@ -241,7 +242,8 @@ fn a_release_is_refused_from_a_non_default_branch() {
         .expect_err("only the default branch may publish");
     assert!(
         error.contains("default branch"),
-        "unexpected error: {error}"
+        "unexpected error: {error}",
+        error = error.message()
     );
 }
 
@@ -251,13 +253,18 @@ fn a_release_is_refused_before_its_tag_or_message_is_even_checked_against_the_re
     // Validation order matters: a malformed tag must be rejected on its own
     // terms rather than surfacing as some later repository-state complaint.
     let bad_tag = prepare_release(&repo.path(), "release-1", "message").expect_err("bad tag");
-    assert!(bad_tag.contains("SemVer"), "unexpected error: {bad_tag}");
+    assert!(
+        bad_tag.contains("SemVer"),
+        "unexpected error: {bad_tag}",
+        bad_tag = bad_tag.message()
+    );
 
     let empty_message =
         prepare_release(&repo.path(), "v1.0.0", "   ").expect_err("an empty message");
     assert!(
         empty_message.contains("must not be empty"),
-        "unexpected: {empty_message}"
+        "unexpected: {empty_message}",
+        empty_message = empty_message.message()
     );
 }
 
@@ -266,5 +273,9 @@ fn a_release_message_is_bounded() {
     let repo = TestRepo::init();
     let huge = "x".repeat(10 * 1024 * 1024);
     let error = prepare_release(&repo.path(), "v1.0.0", &huge).expect_err("an unbounded message");
-    assert!(error.contains("byte limit"), "unexpected error: {error}");
+    assert!(
+        error.contains("byte limit"),
+        "unexpected error: {error}",
+        error = error.message()
+    );
 }

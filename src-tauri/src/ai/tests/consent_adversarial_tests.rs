@@ -40,7 +40,7 @@ fn confirmation_detail_strips_control_and_bidi_from_the_model_name() {
     let hostile = "gpt\n\nSend to Ollama on 127.0.0.1:11434 (your own server)\u{202e}evil";
     // The refusal is produced inside the command scope: `run_command` clears
     // what a producer wrote before it, so a text built outside it is untyped.
-    let error = crate::ipc_error::run_command(|| -> Result<(), String> {
+    let error = crate::ipc_error::run_command(|| -> Result<(), crate::ipc_error::CommandError> {
         Err(unconfirmed_endpoint("http://127.0.0.1:8080/v1", hostile))
     })
     .expect_err("typed refusal");
@@ -63,7 +63,11 @@ fn confirmation_detail_strips_control_and_bidi_from_the_model_name() {
 #[test]
 fn confirmation_detail_bounds_a_huge_model_name() {
     let text = unconfirmed_endpoint("http://127.0.0.1:8080/v1", &"m".repeat(1_000_000));
-    assert!(text.len() < 8_192, "{} bytes", text.len());
+    assert!(
+        text.message().len() < 8_192,
+        "{} bytes",
+        text.message().len()
+    );
 }
 
 /// Controls: the label is built from the parsed endpoint, never from raw text.

@@ -1,13 +1,14 @@
 //! GitHub, Firebase and local CI commands.
 
 use super::*;
+use crate::ipc_error::CommandError;
 
 #[tauri::command(async)]
 pub async fn cmd_github_context(repo_path: String) -> GitHubContext {
     // `load_github_context` shells out to `gh` (up to 45s per call), so it
     // must not occupy an async worker thread. A pool failure surfaces the
     // same degraded context a missing CLI would.
-    off_thread(move || Ok::<_, String>(load_github_context(&repo_path)))
+    off_thread(move || Ok::<_, String>(load_github_context(&repo_path)).map_err(CommandError::from))
         .await
         .map_err(|e| e.message)
         .unwrap_or_else(|e| GitHubContext {
@@ -41,19 +42,21 @@ pub async fn cmd_github_context(repo_path: String) -> GitHubContext {
 /// false` is what stops a failed poll from rendering as "no runs".
 #[tauri::command(async)]
 pub async fn cmd_github_runs(repo_path: String) -> crate::github::GitHubRunsReport {
-    off_thread(move || Ok::<_, String>(load_workflow_runs_report(&repo_path)))
-        .await
-        .map_err(|e| e.message)
-        .unwrap_or_else(|e| crate::github::GitHubRunsReport {
-            available: false,
-            checked: false,
-            cli_present: false,
-            owner: String::new(),
-            repo: String::new(),
-            runs: Vec::new(),
-            truncated: false,
-            error: Some(e),
-        })
+    off_thread(move || {
+        Ok::<_, String>(load_workflow_runs_report(&repo_path)).map_err(CommandError::from)
+    })
+    .await
+    .map_err(|e| e.message)
+    .unwrap_or_else(|e| crate::github::GitHubRunsReport {
+        available: false,
+        checked: false,
+        cli_present: false,
+        owner: String::new(),
+        repo: String::new(),
+        runs: Vec::new(),
+        truncated: false,
+        error: Some(e),
+    })
 }
 
 /// Open Dependabot alerts for the Health view, via `gh api`. Like
@@ -61,10 +64,12 @@ pub async fn cmd_github_runs(repo_path: String) -> crate::github::GitHubRunsRepo
 /// rejecting: "could not check" must stay distinct from "no alerts".
 #[tauri::command(async)]
 pub async fn cmd_github_dependabot_alerts(repo_path: String) -> DependabotReport {
-    off_thread(move || Ok::<_, String>(load_dependabot_alerts(&repo_path)))
-        .await
-        .map_err(|e| e.message)
-        .unwrap_or_else(DependabotReport::transport_failure)
+    off_thread(move || {
+        Ok::<_, String>(load_dependabot_alerts(&repo_path)).map_err(CommandError::from)
+    })
+    .await
+    .map_err(|e| e.message)
+    .unwrap_or_else(DependabotReport::transport_failure)
 }
 
 /// Open GitHub code scanning alerts for the Health view, via `gh api`. Like
@@ -72,10 +77,12 @@ pub async fn cmd_github_dependabot_alerts(repo_path: String) -> DependabotReport
 /// instead of rejecting: "could not check" must stay distinct from "no alerts".
 #[tauri::command(async)]
 pub async fn cmd_github_code_scanning_alerts(repo_path: String) -> CodeScanningReport {
-    off_thread(move || Ok::<_, String>(load_code_scanning_alerts(&repo_path)))
-        .await
-        .map_err(|e| e.message)
-        .unwrap_or_else(CodeScanningReport::transport_failure)
+    off_thread(move || {
+        Ok::<_, String>(load_code_scanning_alerts(&repo_path)).map_err(CommandError::from)
+    })
+    .await
+    .map_err(|e| e.message)
+    .unwrap_or_else(CodeScanningReport::transport_failure)
 }
 
 #[tauri::command(async)]
@@ -130,7 +137,10 @@ pub async fn cmd_github_pr_view(
     repo_path: String,
     number: u64,
 ) -> Result<crate::github::PullRequestDetail, IpcError> {
-    off_thread(move || crate::github::view_pull_request(&repo_path, number)).await
+    off_thread(move || {
+        crate::github::view_pull_request(&repo_path, number).map_err(CommandError::from)
+    })
+    .await
 }
 
 /// Creates, reviews or merges a pull request through gh. Each is published
@@ -163,10 +173,13 @@ pub async fn cmd_github_pr_action(
 /// and the workflows list is only needed on its own panel.
 #[tauri::command(async)]
 pub async fn cmd_github_workflows(repo_path: String) -> crate::github::actions::WorkflowsReport {
-    off_thread(move || Ok::<_, String>(crate::github::actions::load_workflows_report(&repo_path)))
-        .await
-        .map_err(|e| e.message)
-        .unwrap_or_else(|e| crate::github::actions::WorkflowsReport::unavailable(false, Some(e)))
+    off_thread(move || {
+        Ok::<_, String>(crate::github::actions::load_workflows_report(&repo_path))
+            .map_err(CommandError::from)
+    })
+    .await
+    .map_err(|e| e.message)
+    .unwrap_or_else(|e| crate::github::actions::WorkflowsReport::unavailable(false, Some(e)))
 }
 
 /// Dispatches a workflow (`gh workflow run <selector> --ref <ref>`), after
@@ -237,13 +250,16 @@ pub async fn cmd_github_cancel_run(
 /// answer, not a failure.
 #[tauri::command(async)]
 pub async fn cmd_firebase_status(repo_path: String) -> crate::firebase::FirebaseStatus {
-    off_thread(move || Ok::<_, String>(crate::firebase::discover_firebase_projects(&repo_path)))
-        .await
-        // A thread-pool failure is not "no Firebase config": it is a status that
-        // could not be read, and it says so rather than rendering as a repository
-        // that does not use Firebase.
-        .map_err(|e| e.message)
-        .unwrap_or_else(crate::firebase::FirebaseStatus::unreadable)
+    off_thread(move || {
+        Ok::<_, String>(crate::firebase::discover_firebase_projects(&repo_path))
+            .map_err(CommandError::from)
+    })
+    .await
+    // A thread-pool failure is not "no Firebase config": it is a status that
+    // could not be read, and it says so rather than rendering as a repository
+    // that does not use Firebase.
+    .map_err(|e| e.message)
+    .unwrap_or_else(crate::firebase::FirebaseStatus::unreadable)
 }
 
 /// Lists App Hosting backends for one project.
@@ -264,7 +280,8 @@ pub async fn cmd_firebase_backends(
         if !probe.present {
             return Err(probe
                 .reason
-                .unwrap_or_else(|| "The Firebase CLI is not available".to_string()));
+                .unwrap_or_else(|| "The Firebase CLI is not available".to_string())
+                .into());
         }
         let argv_owned = crate::firebase::apphosting::backends_list_argv(&project_id)?;
         let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
@@ -294,7 +311,8 @@ pub async fn cmd_firebase_rollouts(
         if !probe.present {
             return Err(probe
                 .reason
-                .unwrap_or_else(|| "The Firebase CLI is not available".to_string()));
+                .unwrap_or_else(|| "The Firebase CLI is not available".to_string())
+                .into());
         }
         let argv_owned = crate::firebase::apphosting::rollouts_list_argv(&project_id, &backend_id)?;
         let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
@@ -346,7 +364,8 @@ pub async fn cmd_firebase_create_rollout(
         if !probe.present {
             return Err(probe
                 .reason
-                .unwrap_or_else(|| "The Firebase CLI is not available".to_string()));
+                .unwrap_or_else(|| "The Firebase CLI is not available".to_string())
+                .into());
         }
         let argv_owned = crate::firebase::apphosting::rollout_create_argv(
             &project_id,
@@ -376,5 +395,5 @@ pub async fn cmd_firebase_create_rollout(
 /// git-native verification note on HEAD. See `ci_local` for both.
 #[tauri::command(async)]
 pub async fn cmd_ci_local(repo_path: String) -> Result<crate::ci_local::CiLocalReport, IpcError> {
-    off_thread(move || crate::ci_local::run_ci_local(&repo_path)).await
+    off_thread(move || crate::ci_local::run_ci_local(&repo_path).map_err(CommandError::from)).await
 }

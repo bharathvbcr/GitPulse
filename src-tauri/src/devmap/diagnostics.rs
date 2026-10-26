@@ -133,7 +133,7 @@ impl CommandLog {
 
     pub(super) fn finish(
         mut self,
-        result: &Result<BoundedRun, String>,
+        result: &Result<BoundedRun, crate::ipc_error::CommandError>,
         protocol_error: Option<&str>,
     ) {
         if !self.pending.is_empty() || self.oversized {
@@ -187,7 +187,7 @@ impl CommandLog {
             }
             Err(error) => {
                 event["ok"] = json!(false);
-                event["error"] = json!(error);
+                event["error"] = json!(error.message());
                 event["exit_code"] = Value::Null;
                 // The runner returns no BoundedRun on timeout/spawn failure.
                 // Retain the observed prefix and state exactly what it covers.

@@ -15,6 +15,7 @@ use crate::engine::git_writer::is_full_oid;
 use crate::engine::git_writer::validate_oid_or_revision;
 use crate::engine::git_writer::validate_ref_name;
 use crate::engine::git_writer::{GitWriter, MergeMode, SquashFailure};
+use crate::ipc_error::CommandError;
 use crate::lru_map::LruMap;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -47,7 +48,7 @@ pub struct WorktreeFamily {
 pub fn resolve_worktree_family(
     repo_path: &str,
     worktree_path: &str,
-) -> Result<WorktreeFamily, String> {
+) -> Result<WorktreeFamily, CommandError> {
     admit_worktree_pair(repo_path, worktree_path)?.authenticate()
 }
 
@@ -72,7 +73,10 @@ const MAX_GITDIR_POINTER: u64 = 4096;
 
 /// The trust and common-directory checks of [`resolve_worktree_family`],
 /// which run before it spawns Git and fail with the same messages.
-pub fn admit_worktree_pair(repo_path: &str, worktree_path: &str) -> Result<AdmittedPair, String> {
+pub fn admit_worktree_pair(
+    repo_path: &str,
+    worktree_path: &str,
+) -> Result<AdmittedPair, CommandError> {
     let repo = validate_repo(repo_path)?;
     let worktree = if Path::new(worktree_path) == repo {
         repo.clone()
@@ -91,7 +95,8 @@ pub fn admit_worktree_pair(repo_path: &str, worktree_path: &str) -> Result<Admit
             "Worktree '{}' does not belong to repository '{}'",
             worktree.display(),
             repo.display()
-        ));
+        )
+        .into());
     }
     Ok(AdmittedPair {
         repo,
@@ -190,7 +195,7 @@ impl AdmittedPair {
     /// remembered and asks Git every time, as before. Trust and the common
     /// directory are checked by [`admit_worktree_pair`] on every call, before
     /// this one: a revoked grant is refused whatever is remembered here.
-    pub fn authenticate(self) -> Result<WorktreeFamily, String> {
+    pub fn authenticate(self) -> Result<WorktreeFamily, CommandError> {
         // The registered checkouts, never including the pair asked about: a
         // worktree whose registration is gone must change the fingerprint, not
         // be written into it. The first is the primary working tree.
@@ -257,7 +262,7 @@ impl AdmittedPair {
         })
     }
 
-    fn authenticate_with_git(self) -> Result<WorktreeFamily, String> {
+    fn authenticate_with_git(self) -> Result<WorktreeFamily, CommandError> {
         let AdmittedPair {
             repo,
             worktree,
@@ -276,20 +281,24 @@ impl AdmittedPair {
         }
 
         let Some(anchor) = registered.first().cloned() else {
-            return Err("Git returned no active worktrees for this repository".to_string());
+            return Err("Git returned no active worktrees for this repository"
+                .to_string()
+                .into());
         };
         if !registered.iter().any(|path| path == &repo) {
             return Err(format!(
                 "Repository '{}' is not a registered worktree",
                 repo.display()
-            ));
+            )
+            .into());
         }
         if !registered.iter().any(|path| path == &worktree) {
             return Err(format!(
                 "Worktree '{}' is not registered with repository '{}'",
                 worktree.display(),
                 repo.display()
-            ));
+            )
+            .into());
         }
 
         // The pair shares one common directory (admission checked it), so only a
@@ -300,7 +309,9 @@ impl AdmittedPair {
             resolve_git_common_dir(&anchor)?
         };
         if anchor_common != repo_common {
-            return Err("Git's primary worktree belongs to a different repository".to_string());
+            return Err("Git's primary worktree belongs to a different repository"
+                .to_string()
+                .into());
         }
 
         Ok(WorktreeFamily {
@@ -543,7 +554,7 @@ pub enum StatusRead {
     /// `truncated` saying so.
     Read { paths: Vec<String>, truncated: bool },
     /// The read ran and failed, or was refused; the reason is the scan note.
-    Failed(String),
+    Failed(CommandError),
 }
 
 /// One point in time past which a scan stops starting work and stops waiting
@@ -592,7 +603,7 @@ pub(crate) struct ParsedWorktree {
 /// here. Without `-z` a path containing a newline split into two fields (the
 /// second read as an unknown line, or as a bogus entry), and a trailing space
 /// was trimmed into a different directory.
-pub(crate) fn read_worktree_entries(repo: &Path) -> Result<Vec<ParsedWorktree>, String> {
+pub(crate) fn read_worktree_entries(repo: &Path) -> Result<Vec<ParsedWorktree>, CommandError> {
     let run =
         crate::engine::git_cli::git_captured(repo, &["worktree", "list", "--porcelain", "-z"])
             .and_then(|run| run.require_complete("Worktree listing"))?;
@@ -600,7 +611,8 @@ pub(crate) fn read_worktree_entries(repo: &Path) -> Result<Vec<ParsedWorktree>, 
         return Err(format!(
             "Could not list this repository's worktrees: {}",
             String::from_utf8_lossy(&run.stderr).trim()
-        ));
+        )
+        .into());
     }
     Ok(parse_worktree_porcelain_z(&String::from_utf8_lossy(
         &run.stdout,
@@ -842,11 +854,11 @@ pub fn gitpulse_lane_container(main_checkout: &Path) -> PathBuf {
 /// there by hand got none of that — `git add -A` in the main checkout would
 /// stage it — and was then labelled "GitPulse task" with no task behind it.
 /// Read from the path text, so it holds whether or not the target exists yet.
-pub fn refuse_gitpulse_lane_target(target_path: &str) -> Result<(), String> {
+pub fn refuse_gitpulse_lane_target(target_path: &str) -> Result<(), CommandError> {
     match agent_layout(target_path) {
         Some(layout) if is_gitpulse_lane(&layout.kind) => Err(format!(
             "{target_path} is inside {GITPULSE_LANE_DIR}/, where GitPulse places the worktrees it creates for task attempts. Start the task from the task board to get one, or choose a path outside {GITPULSE_LANE_DIR}/."
-        )),
+        ).into()),
         _ => Ok(()),
     }
 }
@@ -872,7 +884,7 @@ fn read_porcelain(
     dir: &Path,
     deadline: Option<&ScanDeadline>,
     only: Option<OnlyPaths<'_>>,
-) -> Result<String, String> {
+) -> Result<String, CommandError> {
     #[cfg(test)]
     status_probes::fire(dir);
     let magic = match only {
@@ -891,7 +903,7 @@ fn read_porcelain(
     }
     match deadline {
         None => git_text(dir, &args),
-        Some(deadline) if deadline.expired() => Err(DEADLINE_PASSED.to_string()),
+        Some(deadline) if deadline.expired() => Err(DEADLINE_PASSED.to_string().into()),
         Some(deadline) => git_text_with_timeout(dir, &args, deadline.remaining().max(STATUS_GRACE)),
     }
 }
@@ -1015,7 +1027,7 @@ pub(crate) mod status_probes {
 /// Porcelain only — no numstat — so collision scans stay cheap enough to run
 /// across many worktrees. Past [`MAX_CHANGED_PATHS`] the vector is cut and
 /// the caller sees `truncated`.
-pub fn changed_paths(worktree_path: &str) -> Result<(Vec<String>, bool), String> {
+pub fn changed_paths(worktree_path: &str) -> Result<(Vec<String>, bool), CommandError> {
     changed_paths_within(worktree_path, None)
 }
 
@@ -1024,13 +1036,10 @@ pub fn changed_paths(worktree_path: &str) -> Result<(Vec<String>, bool), String>
 pub fn changed_paths_within(
     worktree_path: &str,
     deadline: Option<&ScanDeadline>,
-) -> Result<(Vec<String>, bool), String> {
+) -> Result<(Vec<String>, bool), CommandError> {
     let repo = validate_repo(worktree_path)?;
     if !repo.is_dir() {
-        return Err(format!(
-            "worktree path is not a directory: {}",
-            repo.display()
-        ));
+        return Err(format!("worktree path is not a directory: {}", repo.display()).into());
     }
     let stdout = read_porcelain(&repo, deadline, None)?;
     Ok(bounded_status_paths(stdout.as_bytes()))
@@ -1043,13 +1052,10 @@ pub fn changed_paths_only(
     worktree_path: &str,
     path: &str,
     deadline: Option<&ScanDeadline>,
-) -> Result<(Vec<String>, bool), String> {
+) -> Result<(Vec<String>, bool), CommandError> {
     let repo = validate_repo(worktree_path)?;
     if !repo.is_dir() {
-        return Err(format!(
-            "worktree path is not a directory: {}",
-            repo.display()
-        ));
+        return Err(format!("worktree path is not a directory: {}", repo.display()).into());
     }
     let ignore_case = volume_ignores_case(&repo);
     let nested = nested_repository_ancestors(&repo, path);
@@ -1140,7 +1146,7 @@ fn status_paths_up_to(bytes: &[u8], limit: usize) -> Vec<String> {
 /// Every entry comes back with `dirty_files: None`, which already means "not
 /// scanned" in this type — so a caller cannot mistake an unscanned worktree
 /// for a clean one.
-pub fn list_worktrees_lite(repo_path: &str) -> Result<Vec<WorktreeInfo>, String> {
+pub fn list_worktrees_lite(repo_path: &str) -> Result<Vec<WorktreeInfo>, CommandError> {
     list_worktrees_scanned(repo_path, ScanDepth::Listing)
 }
 
@@ -1197,7 +1203,7 @@ pub fn parse_shortstat(text: &str) -> Option<WorktreeDiffStat> {
 /// candidate resolves, `Err` when the lookup itself could not be answered.
 /// The one owner is [`crate::engine::git_reader::default_base`], the same
 /// answer the branch list measures against.
-type BaseRead = Result<Option<(String, String)>, String>;
+type BaseRead = Result<Option<(String, String)>, CommandError>;
 
 fn read_base(repo: &Path) -> BaseRead {
     crate::engine::git_reader::default_base(repo)
@@ -1408,7 +1414,8 @@ pub(crate) fn measure_head_divergence_capped(
         }
         Err(reason) => {
             out.unread = Some(format!(
-                "unmeasured: the default base could not be read: {reason}"
+                "unmeasured: the default base could not be read: {reason}",
+                reason = reason.message()
             ));
             return out;
         }
@@ -1455,7 +1462,7 @@ pub(crate) fn measure_head_divergence_capped(
                     out.by_head.insert((*head).to_string(), counts);
                     continue;
                 }
-                Err(reason) => reason,
+                Err(reason) => reason.into_message(),
             }
         };
         unread += 1;
@@ -1475,7 +1482,7 @@ fn left_right_counts(
     base_oid: &str,
     head_oid: &str,
     timeout: Duration,
-) -> Result<HeadDivergence, String> {
+) -> Result<HeadDivergence, CommandError> {
     let stdout = git_text_with_timeout(
         repo,
         &[
@@ -1491,13 +1498,13 @@ fn left_right_counts(
     let ahead = parts.next().and_then(|n| n.parse().ok());
     match (ahead, behind) {
         (Some(ahead), Some(behind)) => Ok(HeadDivergence { ahead, behind }),
-        _ => Err(format!("unreadable rev-list counts: {:?}", stdout.trim())),
+        _ => Err(format!("unreadable rev-list counts: {:?}", stdout.trim()).into()),
     }
 }
 
 /// Lists every worktree of the repository, main entry first, with dirty-file
 /// counts, diff deltas, and detected portless routes for the worktrees closest to the front.
-pub fn list_worktrees(repo_path: &str) -> Result<Vec<WorktreeInfo>, String> {
+pub fn list_worktrees(repo_path: &str) -> Result<Vec<WorktreeInfo>, CommandError> {
     list_worktrees_scanned(repo_path, ScanDepth::Full)
 }
 
@@ -1514,7 +1521,7 @@ pub fn list_worktrees(repo_path: &str) -> Result<Vec<WorktreeInfo>, String> {
 pub fn list_worktrees_scanned(
     repo_path: &str,
     depth: ScanDepth,
-) -> Result<Vec<WorktreeInfo>, String> {
+) -> Result<Vec<WorktreeInfo>, CommandError> {
     if depth == ScanDepth::Listing {
         return scan_listing(repo_path, depth);
     }
@@ -1572,7 +1579,7 @@ pub fn list_worktrees_scanned(
     struct Land<'a> {
         key: &'a FlightKey,
         flight: &'a Arc<Flight>,
-        outcome: Option<Result<Vec<WorktreeInfo>, String>>,
+        outcome: Option<Result<Vec<WorktreeInfo>, CommandError>>,
     }
     impl Drop for Land<'_> {
         fn drop(&mut self) {
@@ -1638,7 +1645,7 @@ struct Flight {
 
 struct FlightState {
     depth: ScanDepth,
-    result: Option<Result<Vec<WorktreeInfo>, String>>,
+    result: Option<Result<Vec<WorktreeInfo>, CommandError>>,
 }
 
 impl Flight {
@@ -1652,7 +1659,7 @@ impl Flight {
         }
     }
 
-    fn wait(&self) -> Result<Vec<WorktreeInfo>, String> {
+    fn wait(&self) -> Result<Vec<WorktreeInfo>, CommandError> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         while state.result.is_none() {
             state = self
@@ -1666,7 +1673,7 @@ impl Flight {
             .unwrap_or_else(|| Err("the shared worktree listing was lost".into()))
     }
 
-    fn publish(&self, outcome: Result<Vec<WorktreeInfo>, String>) {
+    fn publish(&self, outcome: Result<Vec<WorktreeInfo>, CommandError>) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.result = Some(outcome);
         self.done.notify_all();
@@ -1706,7 +1713,7 @@ fn before_publish_hook() {
 }
 
 /// One listing with no sharing: what [`list_worktrees_scanned`] runs.
-fn scan_listing(repo_path: &str, depth: ScanDepth) -> Result<Vec<WorktreeInfo>, String> {
+fn scan_listing(repo_path: &str, depth: ScanDepth) -> Result<Vec<WorktreeInfo>, CommandError> {
     let repo = validate_repo(repo_path)?;
     let parsed = read_worktree_entries(&repo)?;
     if depth == ScanDepth::Listing {
@@ -1979,7 +1986,7 @@ fn scan_worktree(
     if !dir.is_dir() {
         let note = "the worktree directory is missing".to_string();
         return WorktreeScan {
-            status_read: StatusRead::Failed(note.clone()),
+            status_read: StatusRead::Failed(note.clone().into()),
             note: Some(note),
             ..WorktreeScan::default()
         };
@@ -1994,7 +2001,10 @@ fn scan_worktree(
         Err(reason) => {
             return WorktreeScan {
                 status_read: StatusRead::Failed(reason.clone()),
-                note: Some(format!("status could not be read: {reason}")),
+                note: Some(format!(
+                    "status could not be read: {reason}",
+                    reason = reason.message()
+                )),
                 ..WorktreeScan::default()
             }
         }
@@ -2048,12 +2058,16 @@ fn scan_worktree(
     // failure window, so it is named here or not at all. Without the base no
     // branch is known to be it, so every branch's divergence is unmeasured.
     if let (Err(reason), Some(_)) = (&base.default, branch) {
-        scan.note = Some(format!("some measurements were not taken: {reason}"));
+        scan.note = Some(format!(
+            "some measurements were not taken: {reason}",
+            reason = reason.message()
+        ));
     }
     if crate::engine::git_cli::process_failures() != failures {
         scan.note = Some(format!(
             "some measurements were not taken: {}",
             crate::engine::git_cli::last_process_failure()
+                .map(CommandError::into_message)
                 .unwrap_or_else(|| "a git read produced no answer".into())
         ));
     }
@@ -2082,7 +2096,7 @@ pub fn add_worktree(
     new_branch: Option<&str>,
     start_point: Option<&str>,
     detach: bool,
-) -> Result<String, String> {
+) -> Result<String, CommandError> {
     let repo = validate_repo(repo_path)?;
     let _repo_lock = repo_mutation_lock(&repo);
     let _guard = _repo_lock
@@ -2157,7 +2171,7 @@ pub fn add_worktree_extended(
     detach: bool,
     cow_caches: bool,
     run_hooks: bool,
-) -> Result<WorktreeCreated, String> {
+) -> Result<WorktreeCreated, CommandError> {
     let selection = crate::engine::cow_clone::CacheSelection::default();
     add_worktree_cached(
         repo_path,
@@ -2180,7 +2194,7 @@ pub fn add_worktree_cached(
     detach: bool,
     caches: Option<&crate::engine::cow_clone::CacheSelection>,
     run_hooks: bool,
-) -> Result<WorktreeCreated, String> {
+) -> Result<WorktreeCreated, CommandError> {
     let path = add_worktree(repo_path, target_path, new_branch, start_point, detach)?;
     let mut created = WorktreeCreated {
         path,
@@ -2198,7 +2212,7 @@ pub fn add_worktree_cached(
                 created.low_disk = report.low_disk;
                 created.disk_unknown = report.disk_unknown;
             }
-            Err(error) => created.cache_error = Some(error),
+            Err(error) => created.cache_error = Some(error.into_message()),
         }
     }
     if run_hooks {
@@ -2214,7 +2228,7 @@ pub fn add_worktree_cached(
             ],
         ) {
             Ok(outcome) => created.hook_notice = outcome.skipped,
-            Err(e) => created.hook_error = Some(e),
+            Err(e) => created.hook_error = Some(e.into_message()),
         }
     }
     Ok(created)
@@ -2329,54 +2343,64 @@ impl From<String> for MergeTeardownError {
     }
 }
 
+/// This error is its own wire type (`{code, message, ...}`), never an
+/// `IpcError`, so a kind has nowhere to go: the text is what it carries.
+impl From<CommandError> for MergeTeardownError {
+    fn from(error: CommandError) -> Self {
+        Self::Refused {
+            message: error.into_message(),
+        }
+    }
+}
+
 /// Written into a lane's private Git directory when it is provisioned: the
 /// branch it was cut from and that branch's tip then, as `<branch>\n<oid>\n`.
 pub const BASE_RECORD: &str = "gitpulse-base";
 
 /// Records where `worktree` was cut from, next to the other per-worktree
 /// state, never in its files where `git status` would show it.
-pub fn write_base_record(worktree: &Path, branch: &str, oid: &str) -> Result<(), String> {
+pub fn write_base_record(worktree: &Path, branch: &str, oid: &str) -> Result<(), CommandError> {
     validate_ref_name(branch)?;
     if !is_full_oid(oid) {
-        return Err(format!(
-            "{oid} is not a full commit id, so it is not recorded as a base"
-        ));
+        return Err(
+            format!("{oid} is not a full commit id, so it is not recorded as a base").into(),
+        );
     }
     let dir = resolve_git_dir(worktree)?;
-    std::fs::write(dir.join(BASE_RECORD), format!("{branch}\n{oid}\n")).map_err(|e| {
-        format!(
-            "could not write {BASE_RECORD} for {}: {e}",
-            worktree.display()
-        )
-    })
+    std::fs::write(dir.join(BASE_RECORD), format!("{branch}\n{oid}\n"))
+        .map_err(|e| {
+            format!(
+                "could not write {BASE_RECORD} for {}: {e}",
+                worktree.display()
+            )
+        })
+        .map_err(CommandError::from)
 }
 
 /// The `(branch, oid)` [`write_base_record`] recorded. `None` when there is
 /// no record (a lane made before it existed, or by the Worktrees panel). A
 /// record that is there and cannot be read is an error, not "no record": a
 /// check that could not run must not pass as one that did.
-fn read_base_record(worktree: &Path) -> Result<Option<(String, String)>, String> {
+fn read_base_record(worktree: &Path) -> Result<Option<(String, String)>, CommandError> {
     let path = resolve_git_dir(worktree)?.join(BASE_RECORD);
     let raw = match std::fs::read(&path) {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+        Err(e) => return Err(format!("could not read {}: {e}", path.display()).into()),
     };
     let corrupt = |why: &str| format!("{} is not a branch and a commit id: {why}", path.display());
     if raw.len() > 4096 {
-        return Err(corrupt("it is far larger than it should be"));
+        return Err(corrupt("it is far larger than it should be").into());
     }
     let text = String::from_utf8(raw).map_err(|_| corrupt("it is not text"))?;
     let mut lines = text.lines().map(str::trim);
     let (Some(branch), Some(oid), None) = (lines.next(), lines.next(), lines.next()) else {
-        return Err(corrupt("it does not have exactly two lines"));
+        return Err(corrupt("it does not have exactly two lines").into());
     };
-    validate_ref_name(branch).map_err(|e| corrupt(&e))?;
+    validate_ref_name(branch).map_err(|e| corrupt(e.message()))?;
     // A full id only: an abbreviation is whatever git resolves it to today.
     if !is_full_oid(oid) {
-        return Err(corrupt(
-            "the commit id is not a full 40 or 64 character hex id",
-        ));
+        return Err(corrupt("the commit id is not a full 40 or 64 character hex id").into());
     }
     Ok(Some((branch.to_string(), oid.to_ascii_lowercase())))
 }
@@ -2424,7 +2448,7 @@ pub fn merge_and_teardown_worktree(
     target_branch: Option<&str>,
     squash: bool,
     expected_tip: Option<&str>,
-    gate: &mut dyn FnMut(&[&str]) -> Result<(), String>,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
 ) -> Result<MergeTeardownResult, MergeTeardownError> {
     merge_and_teardown_with(
         repo_path,
@@ -2445,7 +2469,7 @@ fn merge_and_teardown_with(
     target_branch: Option<&str>,
     squash: bool,
     expected_tip: Option<&str>,
-    gate: &mut dyn FnMut(&[&str]) -> Result<(), String>,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
     sleep: &mut dyn FnMut(Duration),
 ) -> Result<MergeTeardownResult, MergeTeardownError> {
     merge_and_teardown_with_seams(
@@ -2470,7 +2494,7 @@ fn merge_and_teardown_with_seams(
     target_branch: Option<&str>,
     squash: bool,
     expected_tip: Option<&str>,
-    gate: &mut dyn FnMut(&[&str]) -> Result<(), String>,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
     sleep: &mut dyn FnMut(Duration),
     delete_aside: &mut dyn FnMut(&Path) -> std::io::Result<()>,
 ) -> Result<MergeTeardownResult, MergeTeardownError> {
@@ -2524,7 +2548,10 @@ fn merge_and_teardown_with_seams(
             let default = crate::engine::git_reader::compute_default_base(&repo)
                 .checked()
                 .map_err(|reason| {
-                    format!("The default branch could not be read: {reason}. Nothing was merged.")
+                    format!(
+                        "The default branch could not be read: {reason}. Nothing was merged.",
+                        reason = reason.message()
+                    )
                 })?;
             let (name, _) = default.base.ok_or_else(|| {
                 "No default branch could be resolved; name a target branch. Nothing was merged."
@@ -2539,7 +2566,7 @@ fn merge_and_teardown_with_seams(
     // The merge runs in the main checkout, onto whatever it has checked out.
     // It used to run there regardless and then report `target`: a main
     // checkout on another branch took the merge, and the panel said "main".
-    let main_is_on_target = || -> Result<(), String> {
+    let main_is_on_target = || -> Result<(), CommandError> {
         // A refused read is an error, not "a detached HEAD": naming the wrong
         // reason would send the user to fix the wrong thing.
         let current = crate::engine::git_reader::head_branch(&repo)?.unwrap_or_default();
@@ -2547,7 +2574,8 @@ fn merge_and_teardown_with_seams(
             return Err(format!(
                 "The main checkout is on {}, not {target}. Switch it to {target} first; nothing was merged.",
                 if current.is_empty() { "a detached HEAD".to_string() } else { current }
-            ));
+            )
+            .into());
         }
         Ok(())
     };
@@ -2630,7 +2658,8 @@ fn merge_and_teardown_with_seams(
     let (unmerged, unmerged_total) =
         crate::engine::repo_op::conflicted_paths(&repo).map_err(|e| {
             format!(
-                "The main checkout's unmerged files could not be checked: {e}. Nothing was merged."
+                "The main checkout's unmerged files could not be checked: {e}. Nothing was merged.",
+                e = e.message()
             )
         })?;
     if unmerged_total > 0 {
@@ -2676,7 +2705,9 @@ fn merge_and_teardown_with_seams(
     // The target the merge lands on. An unborn one has no tip to merge onto.
     let target_ref = format!("refs/heads/{target}");
     let before_oid = git_text(&repo, &["rev-parse", "--verify", target_ref.as_str()])
-        .map_err(|e| format!("{target} has no commits to merge onto ({e}); nothing was merged."))?
+        .map_err(|e| {
+            e.wrap(|e| format!("{target} has no commits to merge onto ({e}); nothing was merged."))
+        })?
         .trim()
         .to_string();
 
@@ -2751,13 +2782,18 @@ fn merge_and_teardown_with_seams(
         // discarded, and the next steps removed the worktree and
         // force-deleted the branch whose work was never committed.
         GitWriter::squash_merge_locked(&repo, &branch, gate).map_err(|failure| match failure {
-            SquashFailure::Merge(e) => MergeTeardownError::Refused { message: e },
+            SquashFailure::Merge(e) => MergeTeardownError::Refused {
+                message: e.into_message(),
+            },
             SquashFailure::Conflict(e) => {
-                failed_merge_error(gate, &repo, &branch, target, &merged_tip, e)
+                failed_merge_error(gate, &repo, &branch, target, &merged_tip, e.into_message())
             }
             // Staged, not rolled back: `git reset --merge` is the user's call.
             SquashFailure::Commit(e) => MergeTeardownError::SquashParked {
-                message: format!("{e} The worktree and the branch {branch} were kept on {target}."),
+                message: format!(
+                    "{} The worktree and the branch {branch} were kept on {target}.",
+                    e.message()
+                ),
             },
         })?;
     } else {
@@ -2784,7 +2820,11 @@ fn merge_and_teardown_with_seams(
                     &branch,
                     target,
                     &merged_tip,
-                    format!("Merge failed (ff error: {ff_err}): {e}"),
+                    format!(
+                        "Merge failed (ff error: {}): {}",
+                        ff_err.message(),
+                        e.message()
+                    ),
                 ));
             }
         }
@@ -2798,34 +2838,38 @@ fn merge_and_teardown_with_seams(
             Err(e) => (
                 None,
                 Some(format!(
-                    "the new tip of {target} could not be read ({e}), so the worktree and the branch were kept"
+                    "the new tip of {target} could not be read ({}), so the worktree and the branch were kept",
+                    e.message()
                 )),
             ),
         };
 
     // What the destructive steps below may destroy is what was merged.
-    let unchanged_since_merge = |repo: &Path, worktree_present: bool| -> Result<(), String> {
+    let unchanged_since_merge = |repo: &Path, worktree_present: bool| -> Result<(), CommandError> {
         let kept = format!(
             "The merge of {branch} into {target} is done; the worktree and the branch were kept"
         );
         if worktree_present {
             let (changed, _) = changed_paths(&worktree_text).map_err(|e| {
-                format!("{kept}, because the worktree could not be re-checked: {e}")
+                e.wrap(|e| format!("{kept}, because the worktree could not be re-checked: {e}"))
             })?;
             if !changed.is_empty() {
                 return Err(format!(
                     "{kept}: {} file change(s) appeared in the worktree after the merge was checked.",
                     changed.len()
-                ));
+                )
+                .into());
             }
         }
-        let tip = git_text(repo, &["rev-parse", "--verify", branch_ref.as_str()])
-            .map_err(|e| format!("{kept}, because the branch could not be re-read: {e}"))?;
+        let tip = git_text(repo, &["rev-parse", "--verify", branch_ref.as_str()]).map_err(|e| {
+            e.wrap(|e| format!("{kept}, because the branch could not be re-read: {e}"))
+        })?;
         if tip.trim() != merged_tip {
             return Err(format!(
                 "{kept}: {branch} moved from {merged_tip} to {} after the merge was checked.",
                 tip.trim()
-            ));
+            )
+            .into());
         }
         Ok(())
     };
@@ -2838,7 +2882,7 @@ fn merge_and_teardown_with_seams(
     // rename: the effect is the same (the lane is gone from the checkout and
     // from git's list) and no new git verb runs.
     let removal = match after_error {
-        Some(kept) => Err(kept),
+        Some(kept) => Err(CommandError::from(kept)),
         None => gate(&remove)
             .and_then(|()| unchanged_since_merge(&repo, true))
             .and_then(|()| {
@@ -2849,7 +2893,7 @@ fn merge_and_teardown_with_seams(
     };
     let (worktree_removed, removal_error, aside) = match removal {
         Ok(aside) => (true, None, aside),
-        Err(e) => (false, Some(e), None),
+        Err(e) => (false, Some(e.into_message()), None),
     };
 
     // 6. Delete merged branch. A branch checked out in a worktree that is
@@ -2860,13 +2904,13 @@ fn merge_and_teardown_with_seams(
             .and_then(|()| unchanged_since_merge(&repo, false))
             .and_then(|()| git_text(&repo, &delete).map(drop))
     } else {
-        Err(format!(
+        Err(CommandError::from(format!(
             "{branch} was kept because its worktree is still there"
-        ))
+        )))
     };
     let (branch_deleted, branch_error) = match branch_result {
         Ok(()) => (true, None),
-        Err(e) => (false, Some(e)),
+        Err(e) => (false, Some(e.into_message())),
     };
     drop(_guard);
 
@@ -2885,7 +2929,7 @@ fn merge_and_teardown_with_seams(
         ],
     ) {
         Ok(outcome) => hook_notices.extend(outcome.skipped),
-        Err(e) => hook_error = Some(e),
+        Err(e) => hook_error = Some(e.into_message()),
     }
 
     Ok(MergeTeardownResult {
@@ -2915,7 +2959,7 @@ fn merge_and_teardown_with_seams(
 /// with the checkout restored, or, when git failed for a reason that changed
 /// nothing, a plain refusal. Runs under the repository lock.
 fn failed_merge_error(
-    gate: &mut dyn FnMut(&[&str]) -> Result<(), String>,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
     repo: &Path,
     branch: &str,
     target: &str,
@@ -2951,7 +2995,7 @@ fn failed_merge_error(
     };
     let (rolled_back, rollback_error) = match rollback {
         Ok(()) => (true, None),
-        Err(e) => (false, Some(e)),
+        Err(e) => (false, Some(e.into_message())),
     };
     let outcome = match &rollback_error {
         None => "It was rolled back; nothing was merged and the worktree and the branch were kept."
@@ -2962,7 +3006,12 @@ fn failed_merge_error(
         ),
     };
     let listing_note = listing_error
-        .map(|e| format!(" The conflicted files could not be listed: {e}."))
+        .map(|e| {
+            format!(
+                " The conflicted files could not be listed: {}.",
+                e.message()
+            )
+        })
         .unwrap_or_default();
     MergeTeardownError::Conflict {
         message: format!("Merging {branch} into {target} {what}. {outcome}{listing_note}"),
@@ -2987,7 +3036,7 @@ fn lane_identity(path: &Path) -> PathBuf {
 }
 
 /// Whether git still lists `worktree_text` as a worktree of `repo`.
-fn still_listed(repo: &Path, worktree_text: &str) -> Result<bool, String> {
+fn still_listed(repo: &Path, worktree_text: &str) -> Result<bool, CommandError> {
     let wanted = lane_identity(Path::new(worktree_text));
     Ok(read_worktree_entries(repo)?
         .iter()
@@ -3000,23 +3049,20 @@ fn still_listed(repo: &Path, worktree_text: &str) -> Result<bool, String> {
 /// repository, including a lane on a volume that is unmounted right now. The
 /// record is found by its `gitdir` file pointing at this worktree, and a
 /// locked one is left, since a lock is somebody's statement that it stays.
-fn remove_own_worktree_record(repo: &Path, worktree_text: &str) -> Result<(), String> {
+fn remove_own_worktree_record(repo: &Path, worktree_text: &str) -> Result<(), CommandError> {
     let Some(record) = find_own_worktree_record(repo, worktree_text)? else {
         return Ok(());
     };
     if record.join("locked").exists() {
-        return Err(format!(
-            "its record {} is locked, so it was left",
-            record.display()
-        ));
+        return Err(format!("its record {} is locked, so it was left", record.display()).into());
     }
     std::fs::remove_dir_all(&record)
-        .map_err(|e| format!("could not remove its record {}: {e}", record.display()))
+        .map_err(|e| format!("could not remove its record {}: {e}", record.display()).into())
 }
 
 /// The directories of `<common>/worktrees` (one record per linked worktree)
 /// with the path each one's `gitdir` file points at, which is `<worktree>/.git`.
-fn worktree_records(repo: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+fn worktree_records(repo: &Path) -> Result<Vec<(PathBuf, PathBuf)>, CommandError> {
     let records = resolve_git_common_dir(repo)?.join("worktrees");
     let listing = std::fs::read_dir(&records)
         .map_err(|e| format!("could not read {}: {e}", records.display()))?;
@@ -3031,10 +3077,9 @@ fn worktree_records(repo: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
             Ok(pointer) => pointer,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
-                return Err(format!(
-                    "could not read {}: {e}",
-                    record.join("gitdir").display()
-                ))
+                return Err(
+                    format!("could not read {}: {e}", record.join("gitdir").display()).into(),
+                )
             }
         };
         if pointer.len() > 4096 {
@@ -3049,7 +3094,10 @@ fn worktree_records(repo: &Path) -> Result<Vec<(PathBuf, PathBuf)>, String> {
 /// The record `<common>/worktrees/<id>` of the linked worktree at
 /// `worktree_text`, found by its `gitdir` file pointing there. `None` for a
 /// path no record names (the main checkout, a stranger).
-fn find_own_worktree_record(repo: &Path, worktree_text: &str) -> Result<Option<PathBuf>, String> {
+fn find_own_worktree_record(
+    repo: &Path,
+    worktree_text: &str,
+) -> Result<Option<PathBuf>, CommandError> {
     let wanted = lane_identity(Path::new(worktree_text));
     Ok(worktree_records(repo)?
         .into_iter()
@@ -3180,7 +3228,7 @@ fn try_rename_aside(
     repo: &Path,
     target_text: &str,
     force: bool,
-) -> Result<Option<TeardownAside>, String> {
+) -> Result<Option<TeardownAside>, CommandError> {
     try_rename_aside_with(
         repo,
         target_text,
@@ -3197,9 +3245,9 @@ fn try_rename_aside_with(
     repo: &Path,
     target_text: &str,
     force: bool,
-    remove_record: &mut dyn FnMut(&Path, &str) -> Result<(), String>,
+    remove_record: &mut dyn FnMut(&Path, &str) -> Result<(), CommandError>,
     rename_back: &mut dyn FnMut(&Path, &Path) -> std::io::Result<()>,
-) -> Result<Option<TeardownAside>, String> {
+) -> Result<Option<TeardownAside>, CommandError> {
     let target = Path::new(target_text);
     // A relative path would resolve against the working directory, here and
     // wherever a sweep later reads it back.
@@ -3289,16 +3337,16 @@ fn try_rename_aside_with(
     if held.marker.is_some() {
         let sentinel = format!("{}\n{token}", common.to_string_lossy());
         if let Err(e) = std::fs::write(held.path.join(SENTINEL_FILE), sentinel) {
-            return Err(put_back(format!("could not mark the aside as ours: {e}")));
+            return Err(put_back(format!("could not mark the aside as ours: {e}")).into());
         }
     }
     if let Err(e) = remove_record(repo, target_text) {
-        return Err(put_back(e));
+        return Err(e.wrap(|why| put_back(why.to_string())));
     }
     match still_listed(repo, target_text) {
         Ok(false) => Ok(Some(held)),
-        Ok(true) => Err(put_back(format!("git still lists {target_text}"))),
-        Err(e) => Err(put_back(e)),
+        Ok(true) => Err(put_back(format!("git still lists {target_text}")).into()),
+        Err(e) => Err(e.wrap(|why| put_back(why.to_string()))),
     }
 }
 
@@ -3315,8 +3363,8 @@ fn remove_worktree_split(
     repo: &Path,
     target_text: &str,
     force: bool,
-    fallback: &mut dyn FnMut() -> Result<(), String>,
-) -> Result<Option<TeardownAside>, String> {
+    fallback: &mut dyn FnMut() -> Result<(), CommandError>,
+) -> Result<Option<TeardownAside>, CommandError> {
     match try_rename_aside(repo, target_text, force)? {
         Some(aside) => Ok(Some(aside)),
         None => fallback().map(|()| None),
@@ -3485,7 +3533,8 @@ fn sweep_teardown_asides_from(
         Ok(common) => common.join(TEARDOWN_DIR),
         Err(e) => {
             report.problems.push(format!(
-                "leftover teardown directories were not checked: {e}"
+                "leftover teardown directories were not checked: {e}",
+                e = e.message()
             ));
             return report;
         }
@@ -3542,7 +3591,7 @@ fn sweep_teardown_asides_from(
             });
             if !no_records {
                 report.problems.push(format!(
-                    "the worktree records could not be read, so no leftover was deleted this time: {e}"
+                    "the worktree records could not be read, so no leftover was deleted this time: {e}", e = e.message()
                 ));
                 return report;
             }
@@ -3716,8 +3765,8 @@ fn remove_with_retry(
     repo: &Path,
     worktree_text: &str,
     sleep: &mut dyn FnMut(Duration),
-) -> Result<(), String> {
-    let mut last = String::new();
+) -> Result<(), CommandError> {
+    let mut last = CommandError::plain(String::new());
     for attempt in 0..MAX_REMOVE_ATTEMPTS {
         if attempt > 0 {
             sleep(REMOVE_BACKOFF[attempt - 1]);
@@ -3725,7 +3774,7 @@ fn remove_with_retry(
         match remove_worktree_locked(repo, worktree_text, true) {
             Ok(()) => {
                 return if still_listed(repo, worktree_text)? {
-                    Err(format!("git removed {worktree_text} but still lists it"))
+                    Err(format!("git removed {worktree_text} but still lists it").into())
                 } else {
                     Ok(())
                 };
@@ -3733,18 +3782,20 @@ fn remove_with_retry(
             Err(e) => last = e,
         }
         if !Path::new(worktree_text).exists() {
-            remove_own_worktree_record(repo, worktree_text)
-                .map_err(|e| format!("{last}; finishing the removal failed: {e}"))?;
+            remove_own_worktree_record(repo, worktree_text).map_err(|e| {
+                last.clone()
+                    .wrap(|last| format!("{last}; finishing the removal failed: {}", e.message()))
+            })?;
             return if still_listed(repo, worktree_text)? {
-                Err(format!("{last}; git still lists {worktree_text}"))
+                Err(last.wrap(|last| format!("{last}; git still lists {worktree_text}")))
             } else {
                 Ok(())
             };
         }
     }
-    Err(format!(
-        "The worktree could not be removed after {MAX_REMOVE_ATTEMPTS} attempts: {last}"
-    ))
+    Err(last.wrap(|last| {
+        format!("The worktree could not be removed after {MAX_REMOVE_ATTEMPTS} attempts: {last}")
+    }))
 }
 
 /// Git's arguments for the merge step of [`merge_and_teardown_worktree`].
@@ -3783,7 +3834,7 @@ pub fn remove_worktree(
     repo_path: &str,
     target_path: &str,
     force: bool,
-) -> Result<WorktreeRemoval, String> {
+) -> Result<WorktreeRemoval, CommandError> {
     remove_worktree_with(repo_path, target_path, force, &mut delete_dir_tree)
 }
 
@@ -3796,7 +3847,7 @@ pub fn remove_worktree_with(
     target_path: &str,
     force: bool,
     delete_aside: &mut dyn FnMut(&Path) -> std::io::Result<()>,
-) -> Result<WorktreeRemoval, String> {
+) -> Result<WorktreeRemoval, CommandError> {
     let repo = validate_repo(repo_path)?;
     let sweep_problems = sweep_teardown_asides(&repo).notes();
     let aside = {
@@ -3830,7 +3881,7 @@ pub fn remove_worktree_with(
 /// if so removes its record (and nothing else), under the lock the caller
 /// holds. `false` for a path that exists, or that no record names, which the
 /// removal then handles as it always did.
-fn finish_vanished_worktree(repo: &Path, target_path: &str) -> Result<bool, String> {
+fn finish_vanished_worktree(repo: &Path, target_path: &str) -> Result<bool, CommandError> {
     let text = plain_path_text(target_path);
     let missing = matches!(
         std::fs::symlink_metadata(&text),
@@ -3841,16 +3892,14 @@ fn finish_vanished_worktree(repo: &Path, target_path: &str) -> Result<bool, Stri
     }
     remove_own_worktree_record(repo, &text)?;
     if still_listed(repo, &text)? {
-        return Err(format!(
-            "git still lists {text} after its record was removed"
-        ));
+        return Err(format!("git still lists {text} after its record was removed").into());
     }
     Ok(true)
 }
 
 /// [`remove_worktree`] for a caller that already holds `repo`'s mutation lock
 /// (the merge-and-teardown span, which checks and removes under one lock).
-fn remove_worktree_locked(repo: &Path, target_path: &str, force: bool) -> Result<(), String> {
+fn remove_worktree_locked(repo: &Path, target_path: &str, force: bool) -> Result<(), CommandError> {
     validate_target_path(target_path)?;
     // Git scans the target's status internally. Its config.worktree helpers
     // can execute even though the parent is the process's current directory.
@@ -3874,7 +3923,7 @@ pub fn lock_worktree(
     repo_path: &str,
     target_path: &str,
     reason: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     let repo = validate_repo(repo_path)?;
     let _repo_lock = repo_mutation_lock(&repo);
     let _guard = _repo_lock
@@ -3895,7 +3944,7 @@ pub fn lock_worktree(
 }
 
 /// Unlocks a locked linked worktree.
-pub fn unlock_worktree(repo_path: &str, target_path: &str) -> Result<(), String> {
+pub fn unlock_worktree(repo_path: &str, target_path: &str) -> Result<(), CommandError> {
     let repo = validate_repo(repo_path)?;
     let _repo_lock = repo_mutation_lock(&repo);
     let _guard = _repo_lock
@@ -3908,7 +3957,7 @@ pub fn unlock_worktree(repo_path: &str, target_path: &str) -> Result<(), String>
 }
 
 /// Prunes stale worktree administrative data where worktree directory no longer exists.
-pub fn prune_worktree(repo_path: &str) -> Result<(), String> {
+pub fn prune_worktree(repo_path: &str) -> Result<(), CommandError> {
     let repo = validate_repo(repo_path)?;
     let _repo_lock = repo_mutation_lock(&repo);
     let _guard = _repo_lock
@@ -4976,7 +5025,11 @@ some-future-field whatever
         ] {
             let refused = refuse_gitpulse_lane_target(target)
                 .expect_err(&format!("{target} must be refused"));
-            assert!(refused.contains(GITPULSE_LANE_DIR), "{refused}");
+            assert!(
+                refused.contains(GITPULSE_LANE_DIR),
+                "{refused}",
+                refused = refused.message()
+            );
         }
         for target in [
             "/repo-feature",
@@ -5161,7 +5214,7 @@ some-future-field whatever
         (dir, wt)
     }
 
-    fn allow_all(_: &[&str]) -> Result<(), String> {
+    fn allow_all(_: &[&str]) -> Result<(), CommandError> {
         Ok(())
     }
 
@@ -5548,7 +5601,7 @@ some-future-field whatever
     ) {
         let (dir, wt) = teardown_fixture(None);
         let wt_path = wt.path().to_path_buf();
-        let mut gate = |argv: &[&str]| -> Result<(), String> {
+        let mut gate = |argv: &[&str]| -> Result<(), CommandError> {
             if argv.first() == Some(&"worktree") && argv.get(1) == Some(&"remove") {
                 outside_write(&wt_path);
             }
@@ -6356,7 +6409,11 @@ some-future-field whatever
         std::fs::remove_dir_all(wt.path()).unwrap();
         let refused =
             remove_with_retry(dir.path(), wt.path().to_str().unwrap(), &mut |_| {}).unwrap_err();
-        assert!(refused.contains("locked"), "{refused}");
+        assert!(
+            refused.contains("locked"),
+            "{refused}",
+            refused = refused.message()
+        );
         assert_eq!(
             list_worktrees(dir.path().to_str().unwrap()).unwrap().len(),
             2,
@@ -6801,7 +6858,7 @@ some-future-field whatever
         root: &Path,
         depth: ScanDepth,
         window: Duration,
-    ) -> std::thread::JoinHandle<Result<Vec<WorktreeInfo>, String>> {
+    ) -> std::thread::JoinHandle<Result<Vec<WorktreeInfo>, CommandError>> {
         let path = root.to_str().unwrap().to_string();
         std::thread::spawn(move || {
             GATHER_OVERRIDE.with(|cell| cell.set(Some(window)));
@@ -7370,7 +7427,7 @@ some-future-field whatever
         assert!(repo.join("b.txt").exists());
     }
 
-    fn adv_with_base_record(content: &[u8]) -> Result<Option<(String, String)>, String> {
+    fn adv_with_base_record(content: &[u8]) -> Result<Option<(String, String)>, CommandError> {
         let (_dir, wt) = teardown_fixture(None);
         std::fs::write(adv_base_file(wt.path()), content).unwrap();
         read_base_record(wt.path())
@@ -7794,7 +7851,7 @@ some-future-field whatever
     #[test]
     fn adv_gate_refusing_removal_and_branch_delete_is_ok_with_reasons() {
         let (dir, wt) = teardown_fixture(None);
-        let mut gate = |argv: &[&str]| -> Result<(), String> {
+        let mut gate = |argv: &[&str]| -> Result<(), CommandError> {
             if argv.first() == Some(&"worktree") || argv.first() == Some(&"branch") {
                 Err("policy: denied".into())
             } else {
@@ -7819,7 +7876,7 @@ some-future-field whatever
     #[test]
     fn adv_branch_delete_refused_after_removal() {
         let (dir, wt) = teardown_fixture(None);
-        let mut gate = |argv: &[&str]| -> Result<(), String> {
+        let mut gate = |argv: &[&str]| -> Result<(), CommandError> {
             if argv.first() == Some(&"branch") {
                 Err("policy: no branch delete".into())
             } else {
@@ -7928,7 +7985,7 @@ some-future-field whatever
         crate::test_support::git_in(repo, &["worktree", "lock", &lane]);
         let wt_dir = wt.path().to_path_buf();
         let mut asked: Vec<String> = Vec::new();
-        let mut gate = |argv: &[&str]| -> Result<(), String> {
+        let mut gate = |argv: &[&str]| -> Result<(), CommandError> {
             asked.push(argv.join(" "));
             Ok(())
         };
@@ -7976,7 +8033,7 @@ some-future-field whatever
         let (dir, wt) = conflicting_fixture();
         let repo = dir.path();
         let mut asked: Vec<String> = Vec::new();
-        let mut allow = |argv: &[&str]| -> Result<(), String> {
+        let mut allow = |argv: &[&str]| -> Result<(), CommandError> {
             asked.push(argv.join(" "));
             Ok(())
         };
@@ -8069,7 +8126,7 @@ some-future-field whatever
             .current_dir(repo)
             .output_locked();
         std::fs::write(repo.join("README.md"), "hand resolved\n").unwrap();
-        let mut gate = |argv: &[&str]| -> Result<(), String> {
+        let mut gate = |argv: &[&str]| -> Result<(), CommandError> {
             if argv.first() == Some(&"reset") {
                 Err("policy: reset denied".into())
             } else {
@@ -8099,7 +8156,7 @@ some-future-field whatever
     fn adv_a_file_added_to_the_lane_by_the_gate_is_not_destroyed() {
         let (dir, wt) = teardown_fixture(None);
         let lane = wt.path().to_path_buf();
-        let mut gate = |argv: &[&str]| -> Result<(), String> {
+        let mut gate = |argv: &[&str]| -> Result<(), CommandError> {
             if argv.first() == Some(&"worktree") {
                 std::fs::write(lane.join("late.txt"), "written after the check\n").unwrap();
             }
@@ -8322,7 +8379,7 @@ some-future-field whatever
             },
         )
         .unwrap_err();
-        assert!(!refused.is_empty());
+        assert!(!refused.message().is_empty());
         assert!(deleted.is_empty(), "{deleted:?}");
         assert!(wt.path().join("scratch.txt").exists());
         assert!(teardown_entries(dir.path()).is_empty());
@@ -8674,14 +8731,15 @@ some-future-field whatever
                 // The record goes, then the check that follows fails: the
                 // rename path must undo its rename, and cannot.
                 remove_own_worktree_record(repo, lane)?;
-                Err("injected: the record check failed".to_string())
+                Err("injected: the record check failed".into())
             },
             &mut |_, _| Err(std::io::Error::other("injected: put back failed")),
         );
         let why = held.err().expect("the rename path reports the failure");
         assert!(
             why.contains("not swept") && why.contains("put back"),
-            "{why}"
+            "{why}",
+            why = why.message()
         );
         let entries = teardown_entries(repo);
         assert_eq!(entries.len(), 1, "{entries:?}");
@@ -8772,7 +8830,7 @@ some-future-field whatever
         repo: &Path,
         lane: &Path,
         force: bool,
-    ) -> (Result<WorktreeRemoval, String>, Vec<PathBuf>) {
+    ) -> (Result<WorktreeRemoval, CommandError>, Vec<PathBuf>) {
         let mut asides = Vec::new();
         let result = remove_worktree_with(
             repo.to_str().unwrap(),
@@ -10115,7 +10173,7 @@ some-future-field whatever
             ],
         );
         let mut moved = false;
-        let mut gate = |argv: &[&str]| -> Result<(), String> {
+        let mut gate = |argv: &[&str]| -> Result<(), CommandError> {
             if !moved && argv.first() == Some(&"merge") {
                 moved = true;
                 git_in(

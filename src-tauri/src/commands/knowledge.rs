@@ -1,6 +1,7 @@
 //! Markdown rendering, docs vault and path move/delete commands.
 
 use super::*;
+use crate::ipc_error::CommandError;
 
 /// Renders markdown for embedding through MarkDev's renderer. With a note
 /// location (`repo_path` + repo-relative `file_path`) relative pictures are
@@ -17,9 +18,13 @@ pub async fn cmd_markdown_render(
         let note = match (repo_path.as_deref(), file_path.as_deref()) {
             (Some(repo), Some(file)) => Some((repo, file)),
             (None, None) => None,
-            _ => return Err("a note location needs both repo_path and file_path".to_string()),
+            _ => {
+                return Err("a note location needs both repo_path and file_path"
+                    .to_string()
+                    .into())
+            }
         };
-        crate::markdown::render(&text, note)
+        crate::markdown::render(&text, note).map_err(CommandError::from)
     })
     .await
 }
@@ -33,13 +38,13 @@ pub async fn cmd_docs_refresh(
     if background.unwrap_or(false) {
         off_thread_background(move || crate::docs::refresh(&repo_path)).await
     } else {
-        off_thread(move || crate::docs::refresh(&repo_path)).await
+        off_thread(move || crate::docs::refresh(&repo_path).map_err(CommandError::from)).await
     }
 }
 
 #[tauri::command(async)]
 pub async fn cmd_docs_status(repo_path: String) -> Result<crate::docs::DocsStatus, IpcError> {
-    off_thread(move || crate::docs::status(&repo_path)).await
+    off_thread(move || crate::docs::status(&repo_path).map_err(CommandError::from)).await
 }
 
 #[tauri::command(async)]
@@ -54,6 +59,7 @@ pub async fn cmd_docs_search(
             &query,
             limit.unwrap_or(crate::docs::DEFAULT_SEARCH_LIMIT as u32) as usize,
         )
+        .map_err(CommandError::from)
     })
     .await
 }
@@ -62,7 +68,7 @@ pub async fn cmd_docs_search(
 pub async fn cmd_docs_broken_links(
     repo_path: String,
 ) -> Result<Vec<crate::docs::BrokenLink>, IpcError> {
-    off_thread(move || crate::docs::broken_links(&repo_path)).await
+    off_thread(move || crate::docs::broken_links(&repo_path).map_err(CommandError::from)).await
 }
 
 #[tauri::command(async)]
@@ -70,7 +76,7 @@ pub async fn cmd_docs_backlinks(
     repo_path: String,
     path: String,
 ) -> Result<Vec<markdev_vault::Backlink>, IpcError> {
-    off_thread(move || crate::docs::backlinks(&repo_path, &path)).await
+    off_thread(move || crate::docs::backlinks(&repo_path, &path).map_err(CommandError::from)).await
 }
 
 #[tauri::command(async)]
@@ -89,6 +95,7 @@ pub async fn cmd_docs_graph(
             tag.as_deref(),
             folder.as_deref(),
         )
+        .map_err(CommandError::from)
     })
     .await
 }
@@ -100,7 +107,8 @@ pub async fn cmd_docs_rename(
     from: String,
     to: String,
 ) -> Result<Guarded<crate::docs::DocRenameOutcome>, IpcError> {
-    off_thread(move || docs_rename_guarded(&repo_path, &from, &to)).await
+    off_thread(move || docs_rename_guarded(&repo_path, &from, &to).map_err(CommandError::from))
+        .await
 }
 
 /// The body of [`cmd_docs_rename`]. Every path the rename will write is judged
@@ -111,7 +119,7 @@ pub(super) fn docs_rename_guarded(
     repo_path: &str,
     from: &str,
     to: &str,
-) -> Result<Guarded<crate::docs::DocRenameOutcome>, String> {
+) -> Result<Guarded<crate::docs::DocRenameOutcome>, CommandError> {
     let fold = VerdictFold::default();
     let outcome = crate::docs::rename_doc(repo_path, from, to, |plan| {
         fold.record(guard_move(repo_path, plan.mv)?);

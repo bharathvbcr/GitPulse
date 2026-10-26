@@ -31,6 +31,7 @@
 //! An unreachable server must not be able to render as "you are up to date".
 
 use crate::engine::git_cli::git_global_with_timeout;
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -236,7 +237,7 @@ pub fn release_marker_asset(version: Version) -> String {
 /// minutes after the tag lands, may fail, and publishes only when green, so
 /// announcing every tag told every user about builds nobody could install (and
 /// a mistaken `v9.0.0` stayed announced until someone deleted it).
-fn release_is_published(tag: &str, version: Version) -> Result<bool, String> {
+fn release_is_published(tag: &str, version: Version) -> Result<bool, CommandError> {
     let url = format!(
         "{}/releases/download/{}/{}",
         REPOSITORY_URL.trim_end_matches(".git"),
@@ -260,7 +261,7 @@ fn release_is_published(tag: &str, version: Version) -> Result<bool, String> {
 pub fn evaluate(
     current_version: &str,
     ls_remote_output: &str,
-    published: &dyn Fn(&str, Version) -> Result<bool, String>,
+    published: &dyn Fn(&str, Version) -> Result<bool, CommandError>,
 ) -> UpdateCheck {
     let Some(current) = parse_version(current_version) else {
         // Unreachable via CURRENT_VERSION (Cargo would reject a non-semver
@@ -311,7 +312,8 @@ pub fn evaluate(
             Ok(false) => {}
             Err(error) => {
                 return UpdateCheck::failed(format!(
-                    "could not confirm that {tag} is a published release: {error}"
+                    "could not confirm that {tag} is a published release: {error}",
+                    error = error.message()
                 ))
             }
         }
@@ -334,7 +336,7 @@ pub fn check_for_update() -> UpdateCheck {
             &String::from_utf8_lossy(&bytes),
             &release_is_published,
         ),
-        Err(error) => UpdateCheck::failed(error),
+        Err(error) => UpdateCheck::failed(error.into_message()),
     }
 }
 

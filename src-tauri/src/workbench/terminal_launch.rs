@@ -96,7 +96,7 @@ fn native_path(path: &Path) -> Result<String, WorkbenchError> {
 fn observed(repo: &Path, args: &[&str]) -> Result<(i32, String), WorkbenchError> {
     let output = git_captured(repo, args)
         .and_then(|r| r.require_complete("Terminal checkout probe"))
-        .map_err(unavailable)?;
+        .map_err(|e| unavailable(e.into_message()))?;
     if output.cancelled {
         return Err(unavailable("Checkout validation was cancelled."));
     }
@@ -145,7 +145,7 @@ struct Checkout {
 /// directory itself, canonical, where the agent will start.
 fn checkout(repo_path: &str) -> Result<Checkout, WorkbenchError> {
     let (dir, root, _) = crate::terminal::checkout_root(repo_path).map_err(unavailable)?;
-    let resolved = resolve_repo(&native_path(&root)?).map_err(unavailable)?;
+    let resolved = resolve_repo(&native_path(&root)?).map_err(|e| unavailable(e.into_message()))?;
     if resolved.is_bare {
         return Err(unavailable(
             "A terminal task requires a working checkout; this repository is bare.",
@@ -164,8 +164,9 @@ fn checkout(repo_path: &str) -> Result<Checkout, WorkbenchError> {
             "Git does not report this directory's checkout as its working tree.",
         ));
     }
-    let git_dir = native_path(&resolve_git_dir(root).map_err(unavailable)?)?;
-    let git_common_dir = native_path(&resolve_git_common_dir(root).map_err(unavailable)?)?;
+    let git_dir = native_path(&resolve_git_dir(root).map_err(|e| unavailable(e.into_message()))?)?;
+    let git_common_dir =
+        native_path(&resolve_git_common_dir(root).map_err(|e| unavailable(e.into_message()))?)?;
     let head_oid = head(root)?;
     let (status, branch) = observed(root, &["symbolic-ref", "--quiet", "HEAD"])?;
     let head_ref = match status {
@@ -377,7 +378,7 @@ fn prepare_kind(state: &WorkbenchState, input: &str, kind: &str) -> Result<Value
                 &refusal.code,
                 format!(
                     "{} The worktree made for it could not be removed and is still at {} on branch {}: {cleanup}",
-                    refusal.message, provisioned.path, provisioned.branch
+                    refusal.message, provisioned.path, provisioned.branch, cleanup = cleanup.message()
                 ),
             ),
         });

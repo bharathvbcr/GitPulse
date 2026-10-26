@@ -17,6 +17,7 @@ use crate::engine::git_cli::{
     sandbox_join_canonical, validate_repo,
 };
 use crate::fs_entry::BoundedRead;
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
@@ -466,12 +467,12 @@ fn lookup_folded(maps: &FileHitMaps, rel: &str) -> Option<HitMap> {
 pub struct CoverageScanner;
 
 impl CoverageScanner {
-    pub fn scan(repo_path: &str) -> Result<CoverageReport, String> {
+    pub fn scan(repo_path: &str) -> Result<CoverageReport, CommandError> {
         Self::scan_with_limits(repo_path, ScanLimits::default().with_audit_deadline())
             .map(|(report, _)| report)
     }
 
-    pub fn file_coverage(repo_path: &str, file_path: &str) -> Result<FileCoverage, String> {
+    pub fn file_coverage(repo_path: &str, file_path: &str) -> Result<FileCoverage, CommandError> {
         let repo = validate_repo(repo_path)?;
         // Lexical containment first: `../` and absolute paths stay errors.
         sandbox_join(&repo, file_path)?;
@@ -488,7 +489,7 @@ impl CoverageScanner {
                 // warning is the dump that listed dcverify.rs twelve times.
                 file_path.replace('\\', "/")
             }
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         };
         let rel = LanguageDetector::normalize_rel_path(&rel);
         if rel.is_empty() {
@@ -532,7 +533,7 @@ impl CoverageScanner {
     pub fn scan_with_limits(
         repo_path: &str,
         limits: ScanLimits,
-    ) -> Result<(CoverageReport, Arc<FileHitMaps>), String> {
+    ) -> Result<(CoverageReport, Arc<FileHitMaps>), CommandError> {
         let repo = validate_repo(repo_path)?;
         let mut detected = detect_families(&repo)?;
         let mut families = std::mem::take(&mut detected.families);
@@ -2817,7 +2818,7 @@ struct FamilyScan {
 /// seeding from a partial path list is still useful. The caller surfaces the
 /// partial flag through the report's `truncated` so the UI says "scan capped"
 /// rather than presenting a silently reduced view as complete.
-fn detect_families(repo: &Path) -> Result<FamilyScan, String> {
+fn detect_families(repo: &Path) -> Result<FamilyScan, CommandError> {
     let (stdout, mut listing_partial) = git_text_partial(
         repo,
         &[
@@ -8671,7 +8672,7 @@ mod mapping_tests {
             let _forced = crate::deadline::tests::ExpireAfterChecks::new(after);
             let (report, _) =
                 CoverageScanner::scan_with_limits(repo.path().to_str().unwrap(), limits)
-                    .unwrap_or_else(|e| panic!("after {after} checks: {e}"));
+                    .unwrap_or_else(|e| panic!("after {after} checks: {e}", e = e.message()));
             let got: Vec<String> = report.files.iter().map(|f| f.path.clone()).collect();
             if report.truncated {
                 saw_cut = true;

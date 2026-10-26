@@ -1,6 +1,7 @@
 //! Embedded terminal commands and Manvi run actions.
 
 use super::*;
+use crate::ipc_error::CommandError;
 
 // ---------------------------------------------------------------------------
 // Terminal: interactive PTY sessions plus bounded one-shot execution.
@@ -81,6 +82,7 @@ pub async fn cmd_terminal_spawn(
             env,
             crate::terminal::OutputSink::channel(on_output),
         )
+        .map_err(CommandError::from)
     })
     .await
 }
@@ -211,7 +213,10 @@ pub async fn cmd_terminal_incidents(
 pub async fn cmd_terminal_conversations(
     session_ids: Vec<String>,
 ) -> Result<Vec<crate::workbench::conversation::ConversationTranscript>, IpcError> {
-    off_thread(move || crate::workbench::conversation::transcripts(&session_ids)).await
+    off_thread(move || {
+        crate::workbench::conversation::transcripts(&session_ids).map_err(CommandError::from)
+    })
+    .await
 }
 
 /// Which backend holds this app's terminals, and what is wrong with the
@@ -286,7 +291,10 @@ pub async fn cmd_terminal_run(
     args: Vec<String>,
     timeout_secs: Option<u64>,
 ) -> Result<crate::terminal::TerminalRunResult, IpcError> {
-    off_thread(move || crate::terminal::run_terminal(&repo_path, &args, timeout_secs)).await
+    off_thread(move || {
+        crate::terminal::run_terminal(&repo_path, &args, timeout_secs).map_err(CommandError::from)
+    })
+    .await
 }
 
 /// Runs one model-authored health or coverage command through the app's
@@ -304,6 +312,7 @@ pub async fn cmd_manvi_run_action(
 ) -> Result<crate::terminal::TerminalRunResult, IpcError> {
     off_thread(move || {
         crate::terminal::run_manvi_action(&repo_path, &args, action_kind, timeout_secs)
+            .map_err(CommandError::from)
     })
     .await
 }

@@ -33,6 +33,7 @@ use crate::engine::git_reader::{FileStatus, GitReader};
 use crate::engine::repo_op::{self, RepoOperation};
 use crate::engine::validate_repo;
 use crate::engine::worktree::{self, agent_layout, changed_paths_within, StatusRead, WorktreeInfo};
+use crate::ipc_error::CommandError;
 use crate::ledger::{FleetMetrics, LedgerStatus};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -716,7 +717,7 @@ fn fill_head_divergence(
     let measured = match validate_repo(repo_path) {
         Ok(repo) => worktree::measure_head_divergence(&repo, &asked, clock),
         Err(error) => worktree::HeadDivergences {
-            unread: Some(error),
+            unread: Some(error.into_message()),
             ..Default::default()
         },
     };
@@ -987,7 +988,7 @@ fn snapshot_observed(
     // in the 65th worktree is still a session in this repository.
     let live = match &listed {
         Ok(list) => live_in(observation, list),
-        Err(error) => live_sessions::unattributed(error),
+        Err(error) => live_sessions::unattributed(error.message()),
     };
 
     let changes = match GitReader::get_status(repo_path) {
@@ -995,7 +996,7 @@ fn snapshot_observed(
         // in memory: count every file. Counting only the first
         // `MAX_ACTIVE_FILES` made every total a floor on a busy tree.
         Ok(files) => changes_from_status(&files, false),
-        Err(error) => empty_changes(error),
+        Err(error) => empty_changes(error.into_message()),
     };
 
     // The only `git status` of each worktree this snapshot makes, and the last
@@ -1037,7 +1038,10 @@ fn snapshot_observed(
             let agents = agent_summary(true, truncated, &facet.items, live.clone());
             (facet, agents)
         }
-        Err(error) => (empty_worktrees(error.clone()), unknown_agents(error)),
+        Err(error) => (
+            empty_worktrees(error.message().to_string()),
+            unknown_agents(error.message()),
+        ),
     };
 
     let collisions = match &listed {
@@ -1051,7 +1055,7 @@ fn snapshot_observed(
             // `overlapping_files: 0` for a scan that did not look.
             collision_from_list(list, &live, Some(&clock))
         }
-        Err(error) => empty_collisions(error.clone()),
+        Err(error) => empty_collisions(error.message().to_string()),
     };
 
     let main_worktree = worktrees.items.iter().find(|w| w.is_main);
@@ -1328,7 +1332,7 @@ fn fleet_commit_stats(
     repo: &Path,
     anchor_epoch: i64,
     window_days: u32,
-) -> Result<FleetCommitStats, String> {
+) -> Result<FleetCommitStats, CommandError> {
     fleet_commit_stats_walking(
         repo,
         anchor_epoch,
@@ -1370,7 +1374,7 @@ fn fleet_commit_stats_walking(
     anchor_epoch: i64,
     window_days: u32,
     since_as_filter: bool,
-) -> Result<FleetCommitStats, String> {
+) -> Result<FleetCommitStats, CommandError> {
     let since_epoch = anchor_epoch.saturating_sub(i64::from(window_days) * BUCKET_SECONDS);
     let args = fleet_log_args(since_as_filter, since_epoch);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -1477,7 +1481,7 @@ fn unreadable_facet(repo_path: &str, error: String) -> FleetRepoFacet {
 /// An empty repository has no HEAD, and `git log` fails there. That is a
 /// readable answer — "no commits yet" — rather than a broken probe, so it
 /// comes back as `Ok(0)` and only a genuine failure becomes `Err`.
-fn last_commit_epoch(repo: &Path) -> Result<i64, String> {
+fn last_commit_epoch(repo: &Path) -> Result<i64, CommandError> {
     match git_text(repo, &["log", "-1", "--format=%ct", "--"]) {
         Ok(text) => Ok(text.trim().parse::<i64>().unwrap_or(0)),
         Err(error) => {
@@ -1507,7 +1511,7 @@ fn fleet_facet(
 ) -> FleetRepoFacet {
     let repo = match validate_repo(repo_path) {
         Ok(path) => path,
-        Err(error) => return unreadable_facet(repo_path, error),
+        Err(error) => return unreadable_facet(repo_path, error.into_message()),
     };
 
     let (worktrees_ok, worktrees_error, worktree_count, agents) =
@@ -1532,15 +1536,15 @@ fn fleet_facet(
                 )
             }
             Err(error) => {
-                let agents = unknown_agents(&error);
-                (false, error, 0, agents)
+                let agents = unknown_agents(error.message());
+                (false, error.into_message(), 0, agents)
             }
         };
 
     let (commits_ok, commits_error, commits) =
         match fleet_commit_stats(&repo, anchor_epoch, window_days) {
             Ok(stats) => (true, String::new(), Some(stats)),
-            Err(error) => (false, error, None),
+            Err(error) => (false, error.into_message(), None),
         };
 
     // The window probe already read the newest commit whenever the window has
@@ -1696,7 +1700,7 @@ struct CollisionScope<'a> {
 
 /// One worktree's changed paths, and whether the list was cut at its cap: the
 /// answer of [`changed_paths_within`], or of a memo standing in for it.
-type PathsRead = Result<(Vec<String>, bool), String>;
+type PathsRead = Result<(Vec<String>, bool), CommandError>;
 
 /// [`collision_from_list`] reading each unread worktree through `read`.
 ///
@@ -1764,7 +1768,7 @@ fn collision_from_list_reading(
     let mut paths_truncated = false;
     let mut shared_scans: HashMap<&str, (Vec<String>, bool)> = HashMap::new();
     for (wt, result) in scans {
-        match result.unwrap_or_else(|| Err("the worktree was not read".to_string())) {
+        match result.unwrap_or_else(|| Err("the worktree was not read".to_string().into())) {
             Ok((paths, truncated)) => {
                 scanned += 1;
                 paths_truncated |= truncated;
@@ -1787,7 +1791,7 @@ fn collision_from_list_reading(
                 // keeps that absence distinguishable from "it had nothing".
                 failed += 1;
                 if scan_error.is_empty() {
-                    scan_error = error;
+                    scan_error = error.into_message();
                 }
             }
         }
@@ -1966,7 +1970,7 @@ pub fn dirty_elsewhere(repo_path: &str) -> DirtyElsewhere {
     };
     let list = match worktree::list_worktrees_lite(repo_path) {
         Ok(list) => list,
-        Err(error) => return failed(error),
+        Err(error) => return failed(error.into_message()),
     };
     let others: Vec<&WorktreeInfo> = list
         .iter()
@@ -1983,7 +1987,7 @@ pub fn dirty_elsewhere(repo_path: &str) -> DirtyElsewhere {
             let read = with_admission(class, || changed_paths_within(&wt.path, None));
             let (files, truncated, error) = match read {
                 Ok((files, truncated)) => (files, truncated, String::new()),
-                Err(error) => (Vec::new(), false, error),
+                Err(error) => (Vec::new(), false, error.into_message()),
             };
             DirtyElsewhereWorktree {
                 path: wt.path.clone(),
@@ -2058,7 +2062,7 @@ fn scan_holders_observed(
                 },
             )
         }
-        Err(error) => empty_collisions(error),
+        Err(error) => empty_collisions(error.into_message()),
     }
 }
 
@@ -2078,7 +2082,7 @@ fn collision_risk_observed(
 ) -> CollisionRisk {
     match worktree::list_worktrees_lite(repo_path) {
         Ok(list) => collision_from_list(&list, &live_in(observation, &list), None),
-        Err(error) => empty_collisions(error),
+        Err(error) => empty_collisions(error.into_message()),
     }
 }
 
@@ -2129,7 +2133,7 @@ pub(crate) fn same_path(left: impl AsRef<Path>, right: impl AsRef<Path>) -> bool
 /// the same gate. The returned path is the canonical one git registered, so
 /// later comparisons against the worktree listing are not defeated by
 /// symlinks or a trailing slash.
-fn resolve_target(repo_path: &str, worktree_path: Option<&str>) -> Result<String, String> {
+fn resolve_target(repo_path: &str, worktree_path: Option<&str>) -> Result<String, CommandError> {
     let Some(requested) = worktree_path else {
         // No worktree named: the repository itself is the target, and there is
         // no second identity to authenticate.
@@ -2155,7 +2159,7 @@ pub fn active_changes(
     let requested = worktree_path.unwrap_or(repo_path);
     match resolve_target(repo_path, worktree_path) {
         Ok(target) => changes_in(repo_path, &target, limit),
-        Err(error) => failed_changes(repo_path, requested, error),
+        Err(error) => failed_changes(repo_path, requested, error.into_message()),
     }
 }
 
@@ -2190,7 +2194,7 @@ fn changes_in(repo_path: &str, target: &str, limit: Option<u32>) -> ActiveChange
                 churn_overflowed: counts.churn_overflowed,
             }
         }
-        Err(error) => failed_changes(repo_path, target, error),
+        Err(error) => failed_changes(repo_path, target, error.into_message()),
     }
 }
 
@@ -2302,13 +2306,13 @@ pub fn change_context(repo_path: &str, worktree_path: Option<&str>) -> ChangeCon
     let requested = worktree_path.unwrap_or(repo_path).to_string();
     let target = match resolve_target(repo_path, worktree_path) {
         Ok(path) => path,
-        Err(error) => return unresolved_context(repo_path, &requested, error),
+        Err(error) => return unresolved_context(repo_path, &requested, error.into_message()),
     };
 
     let (operation, operation_ok, operation_error) =
         match validate_repo(&target).and_then(|repo| repo_op::detect(&repo)) {
             Ok(found) => (found, true, String::new()),
-            Err(error) => (None, false, error),
+            Err(error) => (None, false, error.into_message()),
         };
     let operation_kind = operation
         .as_ref()
@@ -2336,7 +2340,7 @@ pub fn change_context(repo_path: &str, worktree_path: Option<&str>) -> ChangeCon
             ),
             &target,
         ),
-        Err(error) => empty_collisions(error.clone()),
+        Err(error) => empty_collisions(error.message().to_string()),
     };
     let (worktree, worktree_ok, worktree_error) = match listed {
         Ok(list) => match list.into_iter().find(|w| same_path(&w.path, &target)) {
@@ -2360,7 +2364,7 @@ pub fn change_context(repo_path: &str, worktree_path: Option<&str>) -> ChangeCon
         Err(error) => (
             unlisted_worktree(&target, operation_kind, operation_ok),
             false,
-            error,
+            error.into_message(),
         ),
     };
 

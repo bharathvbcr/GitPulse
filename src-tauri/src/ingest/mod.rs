@@ -46,6 +46,7 @@ mod pass;
 mod source;
 pub mod transcript;
 
+use crate::ipc_error::CommandError;
 use crate::ledger::{self, ActorKind, Draft, Outcome};
 use flight::{Budget, Phase, Progress};
 
@@ -355,7 +356,7 @@ fn family_siblings(ledger_repo: &str, worktree_path: &str) -> Result<Vec<String>
                 .filter(|member| member != worktree_path)
                 .collect()
         })
-        .map_err(|e| e.to_string())
+        .map_err(CommandError::into_message)
 }
 
 /// Whether `path` is a Git checkout, by the one definition the engine uses.
@@ -894,7 +895,10 @@ fn ingest_reflogs(
             Err(reason) => {
                 total.reflog_refs_skipped += 1;
                 total.absorb_reflog(CatchUp {
-                    error: format!("the default branch could not be read: {reason}"),
+                    error: format!(
+                        "the default branch could not be read: {reason}",
+                        reason = reason.message()
+                    ),
                     ..CatchUp::default()
                 });
             }
@@ -1077,7 +1081,7 @@ fn replay_ref(
     let mut entries = match read(limit) {
         Ok(entries) => entries,
         Err(e) => {
-            out.error = e;
+            out.error = e.into_message();
             return out;
         }
     };
@@ -1093,7 +1097,7 @@ fn replay_ref(
         entries = match read(limit) {
             Ok(entries) => entries,
             Err(e) => {
-                out.error = e;
+                out.error = e.into_message();
                 return out;
             }
         };

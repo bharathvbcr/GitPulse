@@ -23,6 +23,7 @@
 
 use crate::analyzer::deps::npm_program;
 use crate::engine::git_cli::{capture_command, git_text, validate_repo, CapturedOutput};
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -637,7 +638,7 @@ fn output_tail(stdout: &[u8], stderr: &[u8]) -> String {
 /// failed" are different facts that happen to share a colour.
 fn step_result(
     step: &CiStep,
-    outcome: Result<CapturedOutput, String>,
+    outcome: Result<CapturedOutput, CommandError>,
     duration_ms: u64,
 ) -> CiStepResult {
     let (status, detail) = match outcome {
@@ -660,7 +661,7 @@ fn step_result(
             };
             ("failed", detail)
         }
-        Err(e) => ("failed", format!("{COULD_NOT_RUN}{e}")),
+        Err(e) => ("failed", format!("{COULD_NOT_RUN}{e}", e = e.message())),
     };
     CiStepResult {
         name: step.name.to_string(),
@@ -687,7 +688,7 @@ fn skipped_result(step: &CiStep) -> CiStepResult {
     }
 }
 
-pub fn run_ci_local(repo_path: &str) -> Result<CiLocalReport, String> {
+pub fn run_ci_local(repo_path: &str) -> Result<CiLocalReport, CommandError> {
     let repo = validate_repo(repo_path)?;
     let started = Instant::now();
     let seeds = match crate::engine::git_reader::GitReader::get_status(repo_path) {
@@ -702,7 +703,10 @@ pub fn run_ci_local(repo_path: &str) -> Result<CiLocalReport, String> {
                         .into(),
                 );
             }
-            let reason = format!("could not read git status to seed affected tests: {e}");
+            let reason = format!(
+                "could not read git status to seed affected tests: {e}",
+                e = e.message()
+            );
             annotate_full_suite_steps(&mut steps, &reason);
             let plan = CiPlan {
                 steps,
@@ -754,7 +758,7 @@ fn finish_run(repo: &Path, plan: CiPlan, started: Instant) -> CiLocalReport {
             // A refusal is not a step that failed: it is a step that never ran.
             // `COULD_NOT_RUN` is the same marker a spawn failure carries, so a
             // reader is never told a check passed when it did not happen.
-            return (Err(refusal), duration_ms);
+            return (Err(refusal.into()), duration_ms);
         }
 
         let outcome = capture_command(
@@ -788,7 +792,7 @@ fn finish_run(repo: &Path, plan: CiPlan, started: Instant) -> CiLocalReport {
 /// out to npm and cargo.
 fn run_plan(
     plan: Vec<CiStep>,
-    mut run: impl FnMut(&CiStep) -> (Result<CapturedOutput, String>, u64),
+    mut run: impl FnMut(&CiStep) -> (Result<CapturedOutput, CommandError>, u64),
 ) -> Vec<CiStepResult> {
     let mut results: Vec<CiStepResult> = Vec::with_capacity(plan.len());
     let mut failed_early = false;
@@ -847,14 +851,14 @@ fn run_verdict(report: &CiLocalReport) -> &'static str {
 /// `Err` when the question could not be answered, which is deliberately not
 /// the same as `Ok(false)`: a note must never be written on the strength of a
 /// cleanliness check that did not run.
-fn working_tree_is_dirty(repo: &Path) -> Result<bool, String> {
+fn working_tree_is_dirty(repo: &Path) -> Result<bool, CommandError> {
     // Through the engine, not a bare `Command`: these two calls used to spawn
     // git directly and so inherited none of the shared guarantees -- no
     // timeout, no output cap, none of the GIT_CONFIG/askpass stripping every
     // other call gets, and no place in the spawn gate that bounds how many
     // children exist at once.
     let out = git_text(repo, &["status", "--porcelain", "--untracked-files=no"])
-        .map_err(|e| format!("could not run git status: {e}"))?;
+        .map_err(|e| e.wrap(|e| format!("could not run git status: {e}")))?;
     Ok(!out.trim().is_empty())
 }
 
@@ -868,10 +872,10 @@ struct TestedTree {
 impl TestedTree {
     /// `Err` when either question could not be answered, which is never the
     /// same as an answer: a note must not be written on a check that did not run.
-    fn capture(repo: &Path) -> Result<Self, String> {
+    fn capture(repo: &Path) -> Result<Self, CommandError> {
         let dirty = working_tree_is_dirty(repo)?;
         let head = git_text(repo, &["rev-parse", "HEAD"])
-            .map_err(|e| format!("could not resolve HEAD: {e}"))?
+            .map_err(|e| e.wrap(|e| format!("could not resolve HEAD: {e}")))?
             .trim()
             .to_string();
         Ok(Self { head, dirty })
@@ -903,12 +907,12 @@ impl TestedTree {
 fn record_verification(
     repo: &Path,
     report: &CiLocalReport,
-    tested: &Result<TestedTree, String>,
+    tested: &Result<TestedTree, CommandError>,
 ) -> (String, String) {
     let repo_str = repo.to_string_lossy().to_string();
 
     let tested = match tested {
-        Err(e) => return (String::new(), e.clone()),
+        Err(e) => return (String::new(), e.message().to_string()),
         Ok(tested) if tested.dirty => {
             return (
                 String::new(),
@@ -920,7 +924,7 @@ fn record_verification(
         Ok(tested) => tested,
     };
     match TestedTree::capture(repo) {
-        Err(e) => return (String::new(), e),
+        Err(e) => return (String::new(), e.into_message()),
         Ok(now) if now != *tested => {
             return (
                 String::new(),
@@ -952,7 +956,10 @@ fn record_verification(
 
     match crate::engine::provenance::write_verification_note(&repo_str, &head, &note) {
         Ok(()) => (head, String::new()),
-        Err(e) => (String::new(), format!("could not write the note: {e}")),
+        Err(e) => (
+            String::new(),
+            format!("could not write the note: {e}", e = e.message()),
+        ),
     }
 }
 
@@ -1106,7 +1113,7 @@ mod tests {
             } else {
                 Ok(captured(true, 0, "", ""))
             };
-            (outcome, 3)
+            (outcome.map_err(CommandError::from), 3)
         });
         assert!(results[0].detail.starts_with(COULD_NOT_RUN));
         assert_eq!(results[1].status, "skipped");
@@ -1263,7 +1270,8 @@ mod tests {
         let err = run_ci_local(dir.path().to_str().unwrap()).unwrap_err();
         assert!(
             err.contains("No supported CI manifests"),
-            "empty plan should name the reason, got: {err}"
+            "empty plan should name the reason, got: {err}",
+            err = err.message()
         );
     }
 

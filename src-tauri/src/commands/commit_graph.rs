@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::engine::git_reader::FirstParentChain;
+use crate::ipc_error::CommandError;
 use crate::stack::StackedBranchNode;
 use std::path::Path;
 
@@ -365,11 +366,12 @@ pub async fn cmd_get_commit_graph(
         let head_id = match head {
             Ok(Ok(id)) => Some(id),
             Ok(Err(err)) => {
-                if head_is_unborn(Path::new(&repo_path), &err) {
+                if head_is_unborn(Path::new(&repo_path), err.message()) {
                     notes.notices.push(UNBORN_HEAD_NOTICE.into());
                 } else {
                     notes.warnings.push(format!(
-                        "HEAD unavailable ({err}); commit graph may lack the HEAD marker"
+                        "HEAD unavailable ({err}); commit graph may lack the HEAD marker",
+                        err = err.message()
                     ));
                 }
                 None
@@ -397,7 +399,8 @@ pub async fn cmd_get_commit_graph(
             }
             Ok(Err(err)) => {
                 notes.warnings.push(format!(
-                    "ref decorations unavailable ({err}); branches/tags will not be labeled"
+                    "ref decorations unavailable ({err}); branches/tags will not be labeled",
+                    err = err.message()
                 ));
                 Vec::new()
             }
@@ -418,7 +421,8 @@ pub async fn cmd_get_commit_graph(
             Ok(Err(err)) => {
                 notes.warnings.push(format!(
                     "default branch unresolved ({err}); the straight mainline column is \
-                     anchored on a conventional branch name or HEAD"
+                     anchored on a conventional branch name or HEAD",
+                    err = err.message()
                 ));
                 None
             }
@@ -445,7 +449,8 @@ pub async fn cmd_get_commit_graph(
             Ok(Ok(None)) => {}
             Ok(Err(err)) => notes.warnings.push(format!(
                 "hidden-ref probe failed ({err}); refs outside branches, remotes and tags may \
-                 hold history this graph does not draw"
+                 hold history this graph does not draw",
+                err = err.message()
             )),
             Err(_) => notes.warnings.push(
                 "background task failed (thread panic): hidden-ref probe died; refs outside \
@@ -516,6 +521,7 @@ pub async fn cmd_get_stack_hierarchy(
             STACK_HISTORY_WINDOW,
             StackWalkBudget::PRODUCTION,
         )
+        .map_err(CommandError::from)
     })
     .await
 }
@@ -524,7 +530,7 @@ pub(super) fn stack_hierarchy(
     repo_path: &str,
     window: usize,
     budget: StackWalkBudget,
-) -> Result<crate::stack::StackHierarchyPayload, String> {
+) -> Result<crate::stack::StackHierarchyPayload, CommandError> {
     let branches = GitReader::list_branches(repo_path)?;
     // Ground truth for the root designation comes from the backend, not a
     // frontend guess: list_branches already resolved the default branch

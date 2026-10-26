@@ -191,6 +191,29 @@ fn shutting_down() -> bool {
     SHUTTING_DOWN.load(Ordering::SeqCst)
 }
 
+/// The repository trust refusal, carried inside the `io::Error` a refused
+/// spawn returns. It reads as the refusal's own text, as the plain message it
+/// replaced did, and [`trust_refusal`] gives the runner that words the spawn
+/// failure the typed error back, so the kind survives the `io::Error`.
+#[derive(Debug)]
+struct TrustRefused(crate::ipc_error::CommandError);
+
+impl std::fmt::Display for TrustRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.message())
+    }
+}
+
+impl std::error::Error for TrustRefused {}
+
+/// The trust refusal a failed [`spawn`] carries, when that is why it failed.
+pub(crate) fn trust_refusal(error: &io::Error) -> Option<&crate::ipc_error::CommandError> {
+    error
+        .get_ref()?
+        .downcast_ref::<TrustRefused>()
+        .map(|refused| &refused.0)
+}
+
 fn refused(label: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::Interrupted,
@@ -521,7 +544,7 @@ pub fn spawn(cmd: &mut Command, label: &str) -> io::Result<(Child, Registration)
     // run in, and releasing that pin before `spawn` would hand the resolution
     // back to the path it was checked against.
     let _admitted = crate::repository_trust::check_command(cmd)
-        .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
+        .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, TrustRefused(error)))?;
     sys::prepare(cmd);
     // The seam every production child passes through: the one call to
     // `Command::spawn` that `clippy.toml` permits outside `LockedSpawn`.

@@ -10,6 +10,7 @@
 //! that for the walk and this listing together, so the graph can never draw a
 //! lane this module has no name for.
 
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 
 use crate::engine::git_cli::{git_text, validate_repo};
@@ -120,7 +121,7 @@ pub const HIDDEN_REF_SCAN_CAP: usize = 5_000;
 /// something: with no refs outside the named set every tip is immediately
 /// uninteresting and `rev-list` returns at once, so the common repository pays
 /// one cheap process and never the full ref scan.
-pub fn probe_hidden_history(repo_path: &str) -> Result<HiddenHistory, String> {
+pub fn probe_hidden_history(repo_path: &str) -> Result<HiddenHistory, CommandError> {
     let repo = validate_repo(repo_path)?;
     let max_count = format!("--max-count={}", HIDDEN_PROBE_CAP);
     let mut args: Vec<&str> = vec!["rev-list", max_count.as_str(), "--all", "--not"];
@@ -156,7 +157,7 @@ pub fn probe_hidden_history(repo_path: &str) -> Result<HiddenHistory, String> {
 }
 
 /// Reads the refs `scope` covers, and marks the checked-out one.
-pub fn list_ref_decorations(repo_path: &str, scope: RefScope) -> Result<RefListing, String> {
+pub fn list_ref_decorations(repo_path: &str, scope: RefScope) -> Result<RefListing, CommandError> {
     let repo = validate_repo(repo_path)?;
 
     // A branch name can contain anything but the ASCII control characters and a
@@ -478,7 +479,11 @@ mod tests {
             list_ref_decorations(path, RefScope::Named)
         });
         let error = refused.expect_err("no current branch was learned");
-        assert!(error.contains("forced by test"), "{error}");
+        assert!(
+            error.contains("forced by test"),
+            "{error}",
+            error = error.message()
+        );
         let listing = list_ref_decorations(path, RefScope::Named).unwrap();
         assert!(listing
             .decorations

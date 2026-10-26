@@ -26,6 +26,7 @@
 use crate::engine::git_cli::{
     git_captured, is_deferred_under_load, resolve_git_common_dir, validate_repo,
 };
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -117,7 +118,7 @@ fn state_dir_paths(repo: &Path) -> Option<StateDirPaths> {
 /// when the directory does not exist yet — which is exactly the case before
 /// the first build. `--no-index` so a state directory someone once committed
 /// still reports the rule that covers it rather than its tracked status.
-fn ignore_source(repo: &Path, query: &str) -> Result<Option<String>, String> {
+fn ignore_source(repo: &Path, query: &str) -> Result<Option<String>, CommandError> {
     let run = git_captured(repo, &["check-ignore", "-v", "--no-index", "--", query])?;
     match run.status_code {
         0 => {
@@ -133,7 +134,8 @@ fn ignore_source(repo: &Path, query: &str) -> Result<Option<String>, String> {
         other => Err(format!(
             "git check-ignore exited {other}: {}",
             String::from_utf8_lossy(&run.stderr).trim()
-        )),
+        )
+        .into()),
     }
 }
 
@@ -232,11 +234,19 @@ fn exclude_verified(repo: &Path, paths: StateDirPaths, marker: &str) -> ExcludeO
     match ignore_source(repo, &paths.query) {
         Ok(Some(source)) => return ExcludeOutcome::AlreadyIgnored { source },
         Ok(None) => {}
-        Err(reason) => return ExcludeOutcome::Refused { reason },
+        Err(reason) => {
+            return ExcludeOutcome::Refused {
+                reason: reason.into_message(),
+            }
+        }
     }
     let common = match resolve_git_common_dir(repo) {
         Ok(dir) => dir,
-        Err(reason) => return ExcludeOutcome::Refused { reason },
+        Err(reason) => {
+            return ExcludeOutcome::Refused {
+                reason: reason.into_message(),
+            }
+        }
     };
     let exclude = common.join("info").join("exclude");
     if let Err(reason) = append_exclude(&exclude, &paths.pattern, marker) {
@@ -257,7 +267,9 @@ fn exclude_verified(repo: &Path, paths: StateDirPaths, marker: &str) -> ExcludeO
                 exclude.display()
             ),
         },
-        Err(reason) => ExcludeOutcome::Refused { reason },
+        Err(reason) => ExcludeOutcome::Refused {
+            reason: reason.into_message(),
+        },
     }
 }
 
@@ -316,7 +328,7 @@ pub struct InitReport {
 /// registry this repository hosts is made to match it, which is what gives
 /// cross-repository search and import links anything to read. Passing an empty
 /// set skips the registry without touching it.
-pub fn initialize(repo_path: &str, open_repos: &[String]) -> Result<InitReport, String> {
+pub fn initialize(repo_path: &str, open_repos: &[String]) -> Result<InitReport, CommandError> {
     let repo = validate_repo(repo_path)?;
     let state_dir = devmap_extract::paths::state_dir(&repo);
     let exclude = ensure_state_dir_excluded(&repo);
@@ -345,7 +357,7 @@ pub fn initialize(repo_path: &str, open_repos: &[String]) -> Result<InitReport, 
                 skipped_untrusted = snapshot.skipped_untrusted;
                 skipped_unavailable = snapshot.skipped_unavailable;
             }
-            Err(reason) => workspace_reason = Some(reason),
+            Err(reason) => workspace_reason = Some(reason.into_message()),
         }
     }
 

@@ -68,7 +68,7 @@ fn make_lane(repo: &Repo, root: &Path, name: &str, dirs: usize) -> PathBuf {
         None,
         false,
     )
-    .unwrap_or_else(|error| panic!("add_worktree {name} failed: {error}"));
+    .unwrap_or_else(|error| panic!("add_worktree {name} failed: {error:?}"));
     std::fs::write(lane.join(format!("{name}.txt")), name).expect("write lane file");
     git(&lane, &["add", "-A"]);
     git(&lane, &["commit", "-q", "-m", &format!("feat: {name}")]);

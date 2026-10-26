@@ -15,6 +15,7 @@ use super::{
 };
 use crate::engine::git_cli::{capture_command, validate_repo};
 use crate::engine::git_writer::validate_ref_name;
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -116,7 +117,7 @@ fn workflow_file_label(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
-pub fn list_workflows(remote: &GitHubRepoRef) -> Result<(Vec<WorkflowInfo>, bool), String> {
+pub fn list_workflows(remote: &GitHubRepoRef) -> Result<(Vec<WorkflowInfo>, bool), CommandError> {
     let fetch_limit = (WORKFLOW_DISPLAY_LIMIT + 1).to_string();
     let mut args = workflow_list_leading_args(&fetch_limit);
     args.extend(super::gh_repo_flags(remote));
@@ -125,12 +126,12 @@ pub fn list_workflows(remote: &GitHubRepoRef) -> Result<(Vec<WorkflowInfo>, bool
     if !stdout.success {
         let err = crate::engine::git_cli::byte_tail(&stdout.stderr, MAX_GH_ERROR_BYTES);
         return Err(if err.is_empty() {
-            format!("gh exited {}", stdout.status_code)
+            format!("gh exited {}", stdout.status_code).into()
         } else {
-            err.trim().to_string()
+            err.trim().to_string().into()
         });
     }
-    parse_workflow_list(&stdout.stdout, WORKFLOW_DISPLAY_LIMIT)
+    parse_workflow_list(&stdout.stdout, WORKFLOW_DISPLAY_LIMIT).map_err(CommandError::from)
 }
 
 /// Upper bound for a workflow selector passed to `gh workflow run`. Real
@@ -169,7 +170,7 @@ pub fn trigger_workflow_argv(
     remote: &GitHubRepoRef,
     selector: &str,
     r#ref: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, CommandError> {
     let selector = validate_workflow_selector(selector)?;
     // A ref reaches gh as `--ref <value>`; git's own ref rules are the right
     // vocabulary here and already refuse flag-shaped or malformed names.
@@ -191,7 +192,7 @@ pub fn trigger_workflow(
     remote: &GitHubRepoRef,
     selector: &str,
     r#ref: &str,
-) -> Result<String, String> {
+) -> Result<String, CommandError> {
     let args = trigger_workflow_argv(remote, selector, r#ref)?;
     run_gh_in(repo_path, &args)
 }
@@ -213,7 +214,7 @@ pub fn rerun_workflow_run(
     repo_path: &str,
     remote: &GitHubRepoRef,
     run_id: u64,
-) -> Result<String, String> {
+) -> Result<String, CommandError> {
     let args = rerun_run_argv(remote, run_id)?;
     run_gh_in(repo_path, &args)
 }
@@ -235,7 +236,7 @@ pub fn cancel_workflow_run(
     repo_path: &str,
     remote: &GitHubRepoRef,
     run_id: u64,
-) -> Result<String, String> {
+) -> Result<String, CommandError> {
     let args = cancel_run_argv(remote, run_id)?;
     run_gh_in(repo_path, &args)
 }
@@ -252,7 +253,7 @@ fn validate_run_id(run_id: u64) -> Result<(), String> {
 /// `args` is a full argv line starting with the program name; everything
 /// after it is passed to gh verbatim. Non-zero exits surface gh's stderr,
 /// tail-capped so a chatty failure cannot flood a report.
-pub(crate) fn run_gh_in(repo_path: &str, args: &[String]) -> Result<String, String> {
+pub(crate) fn run_gh_in(repo_path: &str, args: &[String]) -> Result<String, CommandError> {
     debug_assert!(
         args.first().map(String::as_str) == Some("gh"),
         "argv builders must include the program name"
@@ -263,9 +264,9 @@ pub(crate) fn run_gh_in(repo_path: &str, args: &[String]) -> Result<String, Stri
     if !output.success {
         let err = crate::engine::git_cli::byte_tail(&output.stderr, MAX_GH_ERROR_BYTES);
         return Err(if err.is_empty() {
-            format!("gh exited {}", output.status_code)
+            format!("gh exited {}", output.status_code).into()
         } else {
-            err.trim().to_string()
+            err.trim().to_string().into()
         });
     }
     Ok(output.stdout_text().trim().to_string())
@@ -285,7 +286,7 @@ pub fn load_workflows_report(repo_path: &str) -> WorkflowsReport {
                 Some("No GitHub remote configured".into()),
             )
         }
-        Err(e) => return WorkflowsReport::unavailable(cli_present, Some(e)),
+        Err(e) => return WorkflowsReport::unavailable(cli_present, Some(e.into_message())),
     };
     if let Some(reason) = gh_unavailable_reason(&gh) {
         return WorkflowsReport::unavailable(cli_present, Some(reason));
@@ -298,7 +299,7 @@ pub fn load_workflows_report(repo_path: &str) -> WorkflowsReport {
             truncated,
             error: None,
         },
-        Err(e) => WorkflowsReport::unavailable(true, Some(e)),
+        Err(e) => WorkflowsReport::unavailable(true, Some(e.into_message())),
     }
 }
 

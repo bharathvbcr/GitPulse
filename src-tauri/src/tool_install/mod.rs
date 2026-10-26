@@ -13,6 +13,7 @@ pub mod components;
 pub mod release;
 
 use crate::engine::git_cli::{self, BoundedRun};
+use crate::ipc_error::CommandError;
 use crate::ipc_error::IpcErrorKind;
 use crate::tool_capability;
 use crate::tool_config;
@@ -988,7 +989,7 @@ fn bytes_to_string(bytes: Vec<u8>) -> String {
 enum InstallRun {
     Finished(BoundedRun),
     Cancelled { stdout: String, stderr: String },
-    Failed(String),
+    Failed(CommandError),
 }
 
 struct InstallProgress {
@@ -1064,15 +1065,12 @@ pub fn install(tool: ExternalTool) -> InstallOutcome {
 /// Says whether a failed install was the repository trust refusal, for the
 /// desktop to read instead of the wording of `reason`.
 ///
-/// The answer is the one the typed source gave on this thread while the
-/// install ran (see `crate::ipc_error`): the refusal is wrapped in a spawn
-/// error before it reaches `reason`, so the text is not searched, and a
-/// checkout whose path spells the marker cannot raise it.
-fn with_reason_kind(mut outcome: InstallOutcome) -> InstallOutcome {
-    let refused =
-        !outcome.ok && crate::ipc_error::kind_was_written(IpcErrorKind::RepositoryTrustRequired);
-    outcome.reason_kind = refused.then_some(IpcErrorKind::RepositoryTrustRequired);
-    outcome
+/// The answer is the error's own origin (see `crate::ipc_error`): the refusal
+/// is wrapped in a spawn error before it reaches `reason`, so the text is not
+/// searched, and a checkout whose path spells the marker cannot raise it.
+fn reason_kind_of(error: &CommandError) -> Option<IpcErrorKind> {
+    (error.origin() == Some(IpcErrorKind::RepositoryTrustRequired))
+        .then_some(IpcErrorKind::RepositoryTrustRequired)
 }
 
 pub fn install_with_rung(tool: ExternalTool, preferred: Option<InstallRung>) -> InstallOutcome {
@@ -1106,7 +1104,7 @@ pub fn install_with_rung(tool: ExternalTool, preferred: Option<InstallRung>) -> 
         *guard = Some(tool);
     }
 
-    let outcome = with_reason_kind(install_inner(tool, preferred));
+    let outcome = install_inner(tool, preferred);
 
     *install_guard()
         .lock()
@@ -1278,10 +1276,10 @@ fn install_prebuilt_rung(tool: ExternalTool) -> InstallOutcome {
         tool_config::set_binary(tool, &path.display().to_string())
             .map(|()| path)
             .map_err(|e| {
-                format!(
+                CommandError::from(format!(
                     "{} installed but its path could not be saved: {e}",
                     tool.as_str()
-                )
+                ))
             })
     });
     match installed {
@@ -1307,12 +1305,12 @@ fn install_prebuilt_rung(tool: ExternalTool) -> InstallOutcome {
             command: "download + verify checksum".into(),
             exit_code: None,
             stdout: String::new(),
-            stderr: reason.clone(),
+            stderr: reason.message().to_string(),
             timed_out: false,
             cancelled: cancelled(),
-            reason: Some(reason),
+            reason_kind: reason_kind_of(&reason),
+            reason: Some(reason.into_message()),
             rung: Some(InstallRung::PrebuiltRelease),
-            reason_kind: None,
         },
     }
 }
@@ -1454,12 +1452,12 @@ fn install_toolchain_remote(tool: ExternalTool) -> InstallOutcome {
             command,
             exit_code: None,
             stdout: String::new(),
-            stderr: err.clone(),
-            timed_out: git_cli::is_run_timeout(&err),
+            stderr: err.message().to_string(),
+            timed_out: git_cli::is_run_timeout(err.message()),
             cancelled: cancelled(),
-            reason: Some(err),
+            reason_kind: reason_kind_of(&err),
+            reason: Some(err.into_message()),
             rung: Some(InstallRung::ToolchainRemote),
-            reason_kind: None,
         },
         InstallRun::Finished(run) => {
             let stdout = bytes_to_string(run.stdout);
@@ -1659,10 +1657,10 @@ fn install_from_checkout(tool: ExternalTool) -> InstallOutcome {
             reason_kind: None,
         },
         InstallRun::Failed(err) => {
-            let was_timeout = git_cli::is_run_timeout(&err);
+            let was_timeout = git_cli::is_run_timeout(err.message());
             // The source module may itself be a nested checkout. The approval
             // flow must name the same repository that process admission checks.
-            let source = if crate::repository_trust::refused(&err) {
+            let source = if crate::repository_trust::refused(err.message()) {
                 git_cli::find_git_root(&target).unwrap_or_else(|| root.clone())
             } else {
                 root.clone()
@@ -1677,12 +1675,12 @@ fn install_from_checkout(tool: ExternalTool) -> InstallOutcome {
                 command,
                 exit_code: None,
                 stdout: String::new(),
-                stderr: err.clone(),
+                stderr: err.message().to_string(),
                 timed_out: was_timeout,
                 cancelled: cancelled(),
-                reason: Some(err),
+                reason_kind: reason_kind_of(&err),
+                reason: Some(err.into_message()),
                 rung: Some(InstallRung::LocalCheckout),
-                reason_kind: None,
             }
         }
         InstallRun::Finished(run) => {
@@ -1960,7 +1958,7 @@ fn verify_devmap() -> VerifyReport {
                 tool: ExternalTool::Devmap,
                 ok: false,
                 binary: Some(binary),
-                detail: e,
+                detail: e.into_message(),
                 store_schema: None,
                 expected_store_schema: Some(expected_store),
                 code_graph_schema: None,
@@ -2101,7 +2099,7 @@ pub fn clone_source(tool: ExternalTool, parent_dir: &str) -> CloneSourceOutcome 
             tool,
             ok: false,
             path: None,
-            reason: Some(e),
+            reason: Some(e.into_message()),
         },
     }
 }
@@ -2420,7 +2418,7 @@ mod tests {
             // The desktop retries after approval on this kind, not on the
             // wording of `reason`.
             assert_eq!(
-                with_reason_kind(denied.clone()).reason_kind,
+                denied.reason_kind,
                 Some(IpcErrorKind::RepositoryTrustRequired)
             );
             assert!(denied

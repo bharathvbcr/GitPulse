@@ -164,7 +164,7 @@ fn the_spawn_gate_reclaims_permits_from_failures_timeouts_and_panics() {
     for _ in 0..8 {
         let err = git_cli::run_command("sh", &["-c", "sleep 5"], Duration::from_millis(80))
             .expect_err("must time out");
-        assert!(err.contains("timed out"), "got: {err}");
+        assert!(err.contains("timed out"), "got: {err}", err = err.message());
     }
     // Panics inside a caller that is mid-permit are covered by the unit test
     // in git_cli; here we prove the budget is intact afterwards by doing real

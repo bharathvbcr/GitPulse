@@ -30,6 +30,7 @@ use crate::engine::git_cli::{
     git_captured, git_captured_quarantined, git_text_with_timeout, is_run_timeout,
     resolve_git_common_dir, BoundedRun, DEFAULT_TIMEOUT,
 };
+use crate::ipc_error::CommandError;
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -48,7 +49,7 @@ pub enum QuarantineError {
     Unsupported(String),
     /// git could not be spawned (the gate refused it, or it is missing), was
     /// cut by the output cap, or failed with a status that is not an answer.
-    Git(String),
+    Git(CommandError),
 }
 
 impl fmt::Display for QuarantineError {
@@ -57,7 +58,7 @@ impl fmt::Display for QuarantineError {
             Self::Setup(reason) => write!(f, "object quarantine unavailable: {reason}"),
             Self::DeadlineExceeded => write!(f, "object quarantine deadline exceeded"),
             Self::Unsupported(reason) => write!(f, "merge-tree --write-tree unavailable: {reason}"),
-            Self::Git(reason) => write!(f, "{reason}"),
+            Self::Git(reason) => f.write_str(reason.message()),
         }
     }
 }
@@ -121,7 +122,7 @@ impl ObjectQuarantine {
     /// temporary directory, reading through to the repository's objects.
     pub fn new(repo: &Path) -> Result<Self, QuarantineError> {
         let objects = resolve_git_common_dir(repo)
-            .map_err(QuarantineError::Setup)?
+            .map_err(|e| QuarantineError::Setup(e.into_message()))?
             .join("objects");
         if !objects.is_absolute() || !objects.is_dir() {
             return Err(QuarantineError::Setup(format!(
@@ -165,7 +166,7 @@ impl ObjectQuarantine {
         let timeout = remaining.min(DEFAULT_TIMEOUT);
         let run = git_captured_quarantined(repo, args, &self.dir, &self.alternates, timeout)
             .map_err(|e| {
-                if is_run_timeout(&e) {
+                if is_run_timeout(e.message()) {
                     QuarantineError::DeadlineExceeded
                 } else {
                     QuarantineError::Git(e)
@@ -187,9 +188,9 @@ impl ObjectQuarantine {
     ) -> Result<MergeOutcome, QuarantineError> {
         for operand in [ours, theirs] {
             if !is_object_name(operand) {
-                return Err(QuarantineError::Git(format!(
-                    "merge-tree operand {operand:?} is not a full object name"
-                )));
+                return Err(QuarantineError::Git(
+                    format!("merge-tree operand {operand:?} is not a full object name").into(),
+                ));
             }
         }
         // `-z` makes the output NUL-terminated, so a path with a newline or a
@@ -229,7 +230,7 @@ impl ObjectQuarantine {
                 // act on, and it is not a clean merge either.
                 if named.is_empty() {
                     return Err(QuarantineError::Git(
-                        "git merge-tree reported a conflict and named no path".to_string(),
+                        "git merge-tree reported a conflict and named no path".into(),
                     ));
                 }
                 let paths_total = named.len();
@@ -276,7 +277,7 @@ fn classify_failure(status_code: i32, stderr: &str) -> QuarantineError {
     {
         QuarantineError::Unsupported(stderr.to_string())
     } else {
-        QuarantineError::Git(format!("git merge-tree exited {status_code}: {stderr}"))
+        QuarantineError::Git(format!("git merge-tree exited {status_code}: {stderr}").into())
     }
 }
 
@@ -303,24 +304,26 @@ pub fn merge_tree_candidate(
         let head = resolve_commit(repo, head, deadline)?;
         Ok(merge_resolved(repo, &base, &head, deadline))
     })
-    .unwrap_or_else(|reason: String| MergeCandidate::Unknown { reason })
+    .unwrap_or_else(|reason: CommandError| MergeCandidate::Unknown {
+        reason: reason.into_message(),
+    })
 }
 
 /// Err when `repo` is a partial clone, or when that could not be told: a merge
 /// there reads file contents, and git would fetch the missing ones from the
 /// remote. A caller that merges many pairs asks once and then calls
 /// [`merge_tree_resolved`].
-pub(crate) fn refuse_partial_clone(repo: &Path) -> Result<(), String> {
+pub(crate) fn refuse_partial_clone(repo: &Path) -> Result<(), CommandError> {
     match is_partial_clone(repo) {
         Ok(false) => Ok(()),
         Ok(true) => Err(
             "this repository is a partial clone: a merge reads file contents \
              and git would fetch missing ones from the remote; nothing was run"
-                .to_string(),
+                .into(),
         ),
-        Err(reason) => Err(format!(
-            "could not tell whether this is a partial clone, so nothing was run: {reason}"
-        )),
+        Err(reason) => Err(reason.wrap(|reason| {
+            format!("could not tell whether this is a partial clone, so nothing was run: {reason}")
+        })),
     }
 }
 
@@ -351,13 +354,13 @@ fn merge_resolved(repo: &Path, base: &str, head: &str, deadline: Instant) -> Mer
 }
 
 /// The full commit name `operand` names in `repo`.
-fn resolve_commit(repo: &Path, operand: &str, deadline: Instant) -> Result<String, String> {
+fn resolve_commit(repo: &Path, operand: &str, deadline: Instant) -> Result<String, CommandError> {
     if operand.is_empty() || operand.starts_with('-') {
-        return Err(format!("{operand:?} is not a commit name"));
+        return Err(format!("{operand:?} is not a commit name").into());
     }
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return Err(QuarantineError::DeadlineExceeded.to_string());
+        return Err(QuarantineError::DeadlineExceeded.to_string().into());
     }
     let text = git_text_with_timeout(
         repo,
@@ -370,23 +373,26 @@ fn resolve_commit(repo: &Path, operand: &str, deadline: Instant) -> Result<Strin
         remaining.min(DEFAULT_TIMEOUT),
     )
     .map_err(|e| {
-        if is_run_timeout(&e) {
+        if is_run_timeout(e.message()) {
             QuarantineError::DeadlineExceeded.to_string()
         } else {
-            format!("could not resolve {operand:?} to a commit: {e}")
+            format!(
+                "could not resolve {operand:?} to a commit: {e}",
+                e = e.message()
+            )
         }
     })?;
     let oid = text.trim();
     if is_object_name(oid) {
         Ok(oid.to_string())
     } else {
-        Err(format!("{operand:?} did not resolve to a commit"))
+        Err(format!("{operand:?} did not resolve to a commit").into())
     }
 }
 
 /// Whether the repository is a partial clone (`extensions.partialclone` or a
 /// promisor remote). Read from configuration only, so it fetches nothing.
-pub(crate) fn is_partial_clone(repo: &Path) -> Result<bool, String> {
+pub(crate) fn is_partial_clone(repo: &Path) -> Result<bool, CommandError> {
     // Git decides what a boolean is (`true`, `yes`, `on`, `1`, any case, and a
     // bare key), so it is asked with `--type=bool` rather than parsed here.
     // A value it cannot read as a boolean is a failed read, which refuses: a
@@ -416,7 +422,8 @@ pub(crate) fn is_partial_clone(repo: &Path) -> Result<bool, String> {
             return Err(format!(
                 "git config failed: {}",
                 String::from_utf8_lossy(&promisors.stderr).trim()
-            ))
+            )
+            .into())
         }
     }
     // `extensions.partialclone` names the promisor remote: set means partial.
@@ -428,7 +435,8 @@ pub(crate) fn is_partial_clone(repo: &Path) -> Result<bool, String> {
         _ => Err(format!(
             "git config failed: {}",
             String::from_utf8_lossy(&extension.stderr).trim()
-        )),
+        )
+        .into()),
     }
 }
 

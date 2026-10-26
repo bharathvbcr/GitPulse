@@ -20,6 +20,7 @@
 //! NOT granted in `capabilities/default.json`; they take an absolute path
 //! straight from the webview and would make this gate optional.
 
+use crate::ipc_error::CommandError;
 use std::path::{Path, PathBuf};
 
 use tauri::AppHandle;
@@ -140,7 +141,7 @@ fn prepare_open(
     repo: &str,
     relative: &str,
     confirm: &dyn Fn(&str, &str) -> bool,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, CommandError> {
     let target = resolve_worktree_path(repo, relative)?;
     crate::repository_trust::require(Path::new(repo))?;
     if let Some(risk) = execution_risk(&target) {
@@ -148,9 +149,9 @@ fn prepare_open(
             "{relative} is {risk}. Opening it can run code from this repository.\n\nOpen it anyway?"
         );
         if !confirm("Open a file that can run code?", &message) {
-            return Err(format!(
-                "Not opened: {relative} can run code and was not confirmed"
-            ));
+            return Err(
+                format!("Not opened: {relative} can run code and was not confirmed").into(),
+            );
         }
     }
     Ok(target)
@@ -163,7 +164,9 @@ pub fn cmd_open_worktree_path(
     repo: String,
     relative: String,
 ) -> Result<(), String> {
-    let target = prepare_open(&repo, &relative, &super::confirm::native)?;
+    // This command answers in plain text, as it always has: no kind to keep.
+    let target = prepare_open(&repo, &relative, &super::confirm::native)
+        .map_err(CommandError::into_message)?;
     app.opener()
         .open_path(target.to_string_lossy().into_owned(), None::<&str>)
         .map_err(|e| format!("Could not open {relative}: {e}"))
@@ -185,7 +188,7 @@ pub fn cmd_reveal_worktree_path(
 /// Reveal the canonical repository root, including linked worktrees and bare repositories.
 #[tauri::command(async)]
 pub fn cmd_reveal_repository(app: AppHandle, repo: String) -> Result<(), String> {
-    let resolved = crate::engine::resolve_repo(&repo)?;
+    let resolved = crate::engine::resolve_repo(&repo).map_err(CommandError::into_message)?;
     app.opener()
         .reveal_item_in_dir(std::path::Path::new(&resolved.path))
         .map_err(|error| format!("Could not reveal repository: {error}"))
@@ -366,7 +369,11 @@ mod tests {
         let root = dir.path().to_string_lossy().into_owned();
         let err = prepare_open(&root, "notes.txt", &|_, _| panic!("must not prompt"))
             .expect_err("untrusted");
-        assert!(err.contains(crate::repository_trust::REQUIRED), "{err}");
+        assert!(
+            err.contains(crate::repository_trust::REQUIRED),
+            "{err}",
+            err = err.message()
+        );
     }
 
     /// Launchers and executables need a native Yes; a No refuses; plain
@@ -395,7 +402,11 @@ mod tests {
             })
             .expect_err(risky);
             assert!(asked.get(), "{risky} must raise a confirmation");
-            assert!(refused.contains("not confirmed"), "{refused}");
+            assert!(
+                refused.contains("not confirmed"),
+                "{refused}",
+                refused = refused.message()
+            );
             prepare_open(&root, risky, &|_, _| true).expect("confirmed");
         }
         assert!(execution_risk(&repo.path().join("Tool.APP")).is_some());

@@ -70,7 +70,9 @@ pub fn load_code_graph_viz(
 ) -> GraphVizLoad {
     let repo = match validate_repo(repo_path) {
         Ok(repo) => repo,
-        Err(e) => return GraphVizLoad::unavailable(GraphVizKind::CodeGraph, e, None),
+        Err(e) => {
+            return GraphVizLoad::unavailable(GraphVizKind::CodeGraph, e.into_message(), None)
+        }
     };
     let path = code_graph_path(&repo);
     let path_str = path.to_string_lossy().into_owned();
@@ -110,7 +112,9 @@ pub fn load_code_graph_viz(
 pub fn load_map_preview(repo_path: &str) -> GraphVizLoad {
     let repo = match validate_repo(repo_path) {
         Ok(repo) => repo,
-        Err(e) => return GraphVizLoad::unavailable(GraphVizKind::MapPreview, e, None),
+        Err(e) => {
+            return GraphVizLoad::unavailable(GraphVizKind::MapPreview, e.into_message(), None)
+        }
     };
     let path = super::repo_map::repo_map_path(&repo);
     let path_str = path.to_string_lossy().into_owned();

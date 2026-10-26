@@ -2,6 +2,7 @@
 //! capability guard.
 
 use super::*;
+use crate::ipc_error::CommandError;
 use crate::test_support::{git_in, git_repo, trust_repo};
 
 struct Pair {
@@ -34,7 +35,7 @@ fn tip(dir: &Path) -> String {
         .to_string()
 }
 
-fn run(pair: &Pair, args: &[&str]) -> Result<String, String> {
+fn run(pair: &Pair, args: &[&str]) -> Result<String, CommandError> {
     let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
     GitWriter::push_planned(&path(&pair.work), &args)
 }
@@ -150,7 +151,7 @@ fn adv_l1_push_planned_accepts_harmless_reorderings() {
         ],
         vec!["push", "-u", "-u", "origin", "main"],
     ] {
-        run(&pair, &case).unwrap_or_else(|err| panic!("{case:?}: {err}"));
+        run(&pair, &case).unwrap_or_else(|err| panic!("{case:?}: {err}", err = err.message()));
     }
 }
 
@@ -211,7 +212,11 @@ fn adv_l1_plan_push_refuses_a_plus_branch() {
             // the one that carries the refspec explanation; `:` is refused
             // earlier as a character git forbids in ref names.
             if branch.starts_with('+') {
-                assert!(message.contains("refspec"), "{branch}: {message}");
+                assert!(
+                    message.contains("refspec"),
+                    "{branch}: {message}",
+                    message = message.message()
+                );
             }
         }
     }
@@ -230,14 +235,34 @@ fn adv_l1_the_force_refusal_cannot_tell_an_old_git_from_an_unprobed_one() {
     };
     let old =
         require_force_if_includes(&answer(GitPreflightStatus::Outdated, "too old")).unwrap_err();
-    assert!(old.contains("2.30") && old.contains("Update Git"), "{old}");
-    assert!(!old.contains("could not be checked"), "{old}");
+    assert!(
+        old.contains("2.30") && old.contains("Update Git"),
+        "{old}",
+        old = old.message()
+    );
+    assert!(
+        !old.contains("could not be checked"),
+        "{old}",
+        old = old.message()
+    );
 
     for status in [GitPreflightStatus::Broken, GitPreflightStatus::Missing] {
         let unknown = require_force_if_includes(&answer(status, "xcrun: error")).unwrap_err();
-        assert!(unknown.contains("could not be checked"), "{unknown}");
-        assert!(!unknown.contains("older"), "{unknown}");
-        assert!(!is_deferred_under_load(&unknown), "{unknown}");
+        assert!(
+            unknown.contains("could not be checked"),
+            "{unknown}",
+            unknown = unknown.message()
+        );
+        assert!(
+            !unknown.contains("older"),
+            "{unknown}",
+            unknown = unknown.message()
+        );
+        assert!(
+            !is_deferred_under_load(unknown.message()),
+            "{unknown}",
+            unknown = unknown.message()
+        );
     }
 
     let shed = "git version deferred under load after 1.500s: too many git processes";
@@ -246,5 +271,9 @@ fn adv_l1_the_force_refusal_cannot_tell_an_old_git_from_an_unprobed_one() {
         &format!("Git could not be checked yet: {shed}"),
     ))
     .unwrap_err();
-    assert!(is_deferred_under_load(&deferred), "{deferred}");
+    assert!(
+        is_deferred_under_load(deferred.message()),
+        "{deferred}",
+        deferred = deferred.message()
+    );
 }

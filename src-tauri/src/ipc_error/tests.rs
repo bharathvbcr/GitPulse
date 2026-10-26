@@ -226,7 +226,10 @@ fn an_engine_prefixed_deferral_from_a_read_is_typed_retryable() {
                 waited: Duration::from_millis(2000),
             },
         );
-        Err::<(), _>(format!("Blame unavailable: {written}"))
+        Err::<(), _>(format!(
+            "Blame unavailable: {written}",
+            written = written.message()
+        ))
     })
     .expect_err("failed");
     assert_eq!(error.kind, IpcErrorKind::DeferredUnderLoad, "{error}");
@@ -245,7 +248,10 @@ fn the_same_wrapper_from_a_mutation_is_unclassified() {
                 waited: Duration::from_millis(2000),
             },
         );
-        Err::<(), _>(format!("Blame unavailable: {written}"))
+        Err::<(), _>(format!(
+            "Blame unavailable: {written}",
+            written = written.message()
+        ))
     })
     .expect_err("failed");
     assert_eq!(error.kind, IpcErrorKind::Unclassified, "{error}");
@@ -319,7 +325,10 @@ fn a_command_off_the_replay_safe_list_is_never_typed_by_the_loose_rule() {
                     waited: Duration::from_millis(2000),
                 },
             );
-            Err::<(), _>(format!("Could not finish: {written}"))
+            Err::<(), _>(format!(
+                "Could not finish: {written}",
+                written = written.message()
+            ))
         })
         .expect_err("failed");
         assert_eq!(

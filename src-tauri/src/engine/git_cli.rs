@@ -1,4 +1,5 @@
 use crate::diff::{Expect, WriteFailure};
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -74,7 +75,7 @@ pub struct ResolvedRepo {
 }
 
 /// Admits an explicitly trusted Git work tree or bare repository.
-pub fn validate_repo(repo_path: &str) -> Result<PathBuf, String> {
+pub fn validate_repo(repo_path: &str) -> Result<PathBuf, CommandError> {
     let canonical = validate_repo_path(repo_path)?;
     crate::repository_trust::require(&canonical)?;
     Ok(canonical)
@@ -127,17 +128,17 @@ fn rev_parse_is_bare(path: &Path) -> bool {
 }
 
 /// Resolves the private Git directory from bounded filesystem metadata.
-pub fn resolve_git_dir(repo: &Path) -> Result<PathBuf, String> {
+pub fn resolve_git_dir(repo: &Path) -> Result<PathBuf, CommandError> {
     crate::repository_trust::git_directories(repo).map(|(private, _)| private)
 }
 
 /// Resolves the common Git directory without executing sibling configuration.
-pub fn resolve_git_common_dir(repo: &Path) -> Result<PathBuf, String> {
+pub fn resolve_git_common_dir(repo: &Path) -> Result<PathBuf, CommandError> {
     crate::repository_trust::git_directories(repo).map(|(_, common)| common)
 }
 
 /// Canonicalizes `repo_path` and reports whether it is a bare repository.
-pub fn resolve_repo(repo_path: &str) -> Result<ResolvedRepo, String> {
+pub fn resolve_repo(repo_path: &str) -> Result<ResolvedRepo, CommandError> {
     let canonical = validate_repo(repo_path)?;
     let is_bare = rev_parse_is_bare(&canonical)
         || (!canonical.join(".git").exists() && has_bare_layout(&canonical));
@@ -410,7 +411,7 @@ fn inside_nested_git_directory(root: &Path, resolved: &Path) -> bool {
 /// It follows a symlink at the final component, which is what a save wants
 /// (the bytes go to what the name resolves to). A create, move or delete acts
 /// on the entry itself and uses [`sandbox_join_write_entry`].
-pub fn sandbox_join_write(repo: &Path, file_path: &str) -> Result<PathBuf, String> {
+pub fn sandbox_join_write(repo: &Path, file_path: &str) -> Result<PathBuf, CommandError> {
     let resolved = sandbox_join_canonical(repo, file_path)?;
     guard_write_target(repo, file_path, resolved)
 }
@@ -425,12 +426,12 @@ pub fn sandbox_join_write(repo: &Path, file_path: &str) -> Result<PathBuf, Strin
 /// link whose TARGET is in `.git` can be moved or deleted as a link, which
 /// never touches `.git`. The repository root is never a target, however it is
 /// spelled.
-pub fn sandbox_join_write_entry(repo: &Path, file_path: &str) -> Result<PathBuf, String> {
+pub fn sandbox_join_write_entry(repo: &Path, file_path: &str) -> Result<PathBuf, CommandError> {
     if Path::new(file_path)
         .components()
         .all(|component| matches!(component, Component::CurDir))
     {
-        return Err(root_message(file_path));
+        return Err(root_message(file_path).into());
     }
     let resolved = sandbox_join_entry(repo, file_path)?;
     guard_write_target(repo, file_path, resolved)
@@ -442,22 +443,26 @@ fn root_message(file_path: &str) -> String {
 
 /// What no write target may be: the repository root, or anything at or under
 /// its private or common git directory.
-fn guard_write_target(repo: &Path, file_path: &str, resolved: PathBuf) -> Result<PathBuf, String> {
+fn guard_write_target(
+    repo: &Path,
+    file_path: &str,
+    resolved: PathBuf,
+) -> Result<PathBuf, CommandError> {
     let root = repo
         .canonicalize()
         .map_err(|e| format!("Cannot resolve repository path '{}': {}", repo.display(), e))?;
     if resolved == root {
-        return Err(root_message(file_path));
+        return Err(root_message(file_path).into());
     }
     let (private, common) = crate::repository_trust::git_directories(repo)?;
     for dir in [private, common] {
         let dir = dir.canonicalize().unwrap_or(dir);
         if resolved.starts_with(&dir) {
-            return Err(git_metadata_message(file_path));
+            return Err(git_metadata_message(file_path).into());
         }
     }
     if inside_nested_git_directory(&root, &resolved) {
-        return Err(git_metadata_message(file_path));
+        return Err(git_metadata_message(file_path).into());
     }
     Ok(resolved)
 }
@@ -547,7 +552,7 @@ pub fn sandbox_join_entry(repo: &Path, file_path: &str) -> Result<PathBuf, Strin
     Ok(parent.join(name))
 }
 
-pub fn sandbox_write(repo_path: &str, file_path: &str, content: &str) -> Result<(), String> {
+pub fn sandbox_write(repo_path: &str, file_path: &str, content: &str) -> Result<(), CommandError> {
     sandbox_write_expecting(repo_path, file_path, None, content).map(|_| ())
 }
 
@@ -561,19 +566,19 @@ pub fn sandbox_write_expecting(
     file_path: &str,
     expected: Option<&str>,
     content: &str,
-) -> Result<bool, String> {
+) -> Result<bool, CommandError> {
     let dest = write_target(repo_path, file_path)?;
     let expect = expected.map_or(Expect::Any, |bytes| Expect::Bytes(bytes.as_bytes()));
     match crate::diff::write_regular_expecting(&dest, expect, |_| Ok(content.as_bytes().to_vec())) {
         Ok(_) => Ok(true),
         Err(WriteFailure::Changed { .. }) => Ok(false),
-        Err(failure) => Err(failure.to_string()),
+        Err(failure) => Err(failure.to_string().into()),
     }
 }
 
 /// The sandboxed target of a write: inside the repository, through no symlink
 /// that leaves it, and not git's own metadata.
-fn write_target(repo_path: &str, file_path: &str) -> Result<PathBuf, String> {
+fn write_target(repo_path: &str, file_path: &str) -> Result<PathBuf, CommandError> {
     let repo = validate_repo(repo_path)?;
     sandbox_join_write(&repo, file_path)
 }
@@ -639,6 +644,16 @@ impl std::error::Error for FileWriteError {}
 impl From<String> for FileWriteError {
     fn from(message: String) -> Self {
         Self::Refused { message }
+    }
+}
+
+/// A path the save could not resolve: this error is its own wire type, so the
+/// text is what it carries.
+impl From<CommandError> for FileWriteError {
+    fn from(error: CommandError) -> Self {
+        Self::Refused {
+            message: error.into_message(),
+        }
     }
 }
 
@@ -977,7 +992,7 @@ fn git_command_with_env(
 /// that runs repository hooks (`commit`, `merge`, `rebase`, `am`, …): a
 /// slow `pre-commit` is the repository owner's program working, not git
 /// hanging.
-pub fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+pub fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>, CommandError> {
     git_timeout(
         Some(repo),
         args,
@@ -986,7 +1001,7 @@ pub fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     )
 }
 
-pub fn git_text(repo: &Path, args: &[&str]) -> Result<String, String> {
+pub fn git_text(repo: &Path, args: &[&str]) -> Result<String, CommandError> {
     let bytes = git(repo, args)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
@@ -995,7 +1010,7 @@ pub fn git_text(repo: &Path, args: &[&str]) -> Result<String, String> {
 /// returns what arrived plus the truncation flag. For callers whose input
 /// tolerates a prefix (coverage family detection), where failing the whole
 /// scan would be worse than reading part of the listing.
-pub fn git_text_partial(repo: &Path, args: &[&str]) -> Result<(String, bool), String> {
+pub fn git_text_partial(repo: &Path, args: &[&str]) -> Result<(String, bool), CommandError> {
     let (bytes, incomplete) = git_run(Some(repo), args, DEFAULT_TIMEOUT, None)?;
     Ok((
         String::from_utf8_lossy(&bytes).into_owned(),
@@ -1014,7 +1029,7 @@ pub fn git_text_capped(
     repo: &Path,
     args: &[&str],
     cap: usize,
-) -> Result<(String, Option<Incomplete>), String> {
+) -> Result<(String, Option<Incomplete>), CommandError> {
     let (bytes, incomplete) = git_bytes_capped(repo, args, cap)?;
     Ok((String::from_utf8_lossy(&bytes).into_owned(), incomplete))
 }
@@ -1027,7 +1042,7 @@ pub fn git_bytes_capped(
     repo: &Path,
     args: &[&str],
     cap: usize,
-) -> Result<(Vec<u8>, Option<Incomplete>), String> {
+) -> Result<(Vec<u8>, Option<Incomplete>), CommandError> {
     git_run_capped(Some(repo), args, DEFAULT_TIMEOUT, None, cap)
 }
 
@@ -1040,7 +1055,7 @@ pub fn git_bytes_capped(
 /// while failing to spawn at all is not. [`git`] flattens both into one
 /// `Err(String)`, and a caller that cannot tell them apart ends up reporting a
 /// commit it could not look at as a commit it looked at and found nothing on.
-pub(crate) fn git_captured(repo: &Path, args: &[&str]) -> Result<BoundedRun, String> {
+pub(crate) fn git_captured(repo: &Path, args: &[&str]) -> Result<BoundedRun, CommandError> {
     git_captured_inner(repo, args, None, MAX_OUTPUT_BYTES)
 }
 
@@ -1050,7 +1065,7 @@ pub(crate) fn git_captured_with_stdin(
     repo: &Path,
     args: &[&str],
     stdin_bytes: &[u8],
-) -> Result<BoundedRun, String> {
+) -> Result<BoundedRun, CommandError> {
     git_captured_inner(repo, args, Some(stdin_bytes), MAX_OUTPUT_BYTES)
 }
 
@@ -1083,8 +1098,8 @@ pub(crate) fn read_objects_batch<T: Clone>(
     object: BatchObject,
     budget: usize,
     extract: &dyn Fn(&[u8]) -> T,
-) -> HashMap<String, Result<T, String>> {
-    let mut answers: HashMap<String, Result<T, String>> = HashMap::new();
+) -> HashMap<String, Result<T, CommandError>> {
+    let mut answers: HashMap<String, Result<T, CommandError>> = HashMap::new();
     // Git answers with an object's lowercase name whatever case it was asked
     // by, and the stream is matched to its questions by that name, so every
     // question is lowercased; the answer is given back under the spelling the
@@ -1098,7 +1113,7 @@ pub(crate) fn read_objects_batch<T: Clone>(
         if !shaped {
             answers
                 .entry(oid.clone())
-                .or_insert_with(|| Err(format!("{oid:?} is not a {} id", object.noun)));
+                .or_insert_with(|| Err(format!("{oid:?} is not a {} id", object.noun).into()));
             continue;
         }
         let lower = oid.to_ascii_lowercase();
@@ -1111,9 +1126,7 @@ pub(crate) fn read_objects_batch<T: Clone>(
         if sent.len() == MAX_BATCH_OBJECTS {
             answers.insert(
                 lower,
-                Err(format!(
-                    "more than {MAX_BATCH_OBJECTS} objects were asked for at once"
-                )),
+                Err(format!("more than {MAX_BATCH_OBJECTS} objects were asked for at once").into()),
             );
             continue;
         }
@@ -1150,7 +1163,7 @@ fn fetch_objects<T>(
     object: BatchObject,
     budget: usize,
     extract: &dyn Fn(&[u8]) -> T,
-    answers: &mut HashMap<String, Result<T, String>>,
+    answers: &mut HashMap<String, Result<T, CommandError>>,
 ) {
     let run = git_captured_inner(
         repo,
@@ -1161,7 +1174,11 @@ fn fetch_objects<T>(
     let run = match run {
         Ok(run) => run,
         Err(e) => {
-            mark_unread(answers, sent, &format!("could not run git cat-file: {e}"));
+            mark_unread(
+                answers,
+                sent,
+                e.wrap(|e| format!("could not run git cat-file: {e}")),
+            );
             return;
         }
     };
@@ -1173,7 +1190,7 @@ fn fetch_objects<T>(
         mark_unread(
             answers,
             sent,
-            &format!("git cat-file --batch failed: {stderr}"),
+            format!("git cat-file --batch failed: {stderr}").into(),
         );
         return;
     }
@@ -1193,9 +1210,13 @@ fn body_end(out: &[u8], pos: usize, size: &str) -> Option<usize> {
 }
 
 /// Marks every object in `rest` unread for the same reason.
-fn mark_unread<T>(answers: &mut HashMap<String, Result<T, String>>, rest: &[&str], why: &str) {
+fn mark_unread<T>(
+    answers: &mut HashMap<String, Result<T, CommandError>>,
+    rest: &[&str],
+    why: CommandError,
+) {
     for oid in rest {
-        answers.insert((*oid).to_string(), Err(why.to_string()));
+        answers.insert((*oid).to_string(), Err(why.clone()));
     }
 }
 
@@ -1209,7 +1230,7 @@ pub(crate) fn read_batch_answers<T>(
     object: BatchObject,
     extract: &dyn Fn(&[u8]) -> T,
     cut: Option<&str>,
-    answers: &mut HashMap<String, Result<T, String>>,
+    answers: &mut HashMap<String, Result<T, CommandError>>,
 ) {
     let noun = object.noun;
     let mut pos = 0usize;
@@ -1219,7 +1240,7 @@ pub(crate) fn read_batch_answers<T>(
                 || format!("git cat-file answered nothing for this {noun}"),
                 |cut| format!("{cut} before this {noun} was read"),
             );
-            mark_unread(answers, &sent[index..], &why);
+            mark_unread(answers, &sent[index..], why.into());
             return;
         };
         let header = String::from_utf8_lossy(&out[pos..pos + end]).into_owned();
@@ -1230,7 +1251,7 @@ pub(crate) fn read_batch_answers<T>(
             mark_unread(
                 answers,
                 &sent[index..],
-                &format!("git cat-file answered {header:?} for {noun} {oid}"),
+                format!("git cat-file answered {header:?} for {noun} {oid}").into(),
             );
             return;
         }
@@ -1246,27 +1267,29 @@ pub(crate) fn read_batch_answers<T>(
                         || format!("git cat-file cut the {noun} {oid} short"),
                         |cut| format!("{cut} inside the {noun} {oid}"),
                     );
-                    mark_unread(answers, &sent[index..], &why);
+                    mark_unread(answers, &sent[index..], why.into());
                     return;
                 }
             },
-            [_, "missing"] => Err(format!("the {noun} {oid} is missing from this repository")),
+            [_, "missing"] => {
+                Err(format!("the {noun} {oid} is missing from this repository").into())
+            }
             [_, kind, size] => match body_end(out, pos, size) {
                 // Skipped by its size so the next answer stays in step.
                 Some(end) => {
                     pos = end + 1;
-                    Err(format!("{oid} is a {kind}, not a {noun}"))
+                    Err(format!("{oid} is a {kind}, not a {noun}").into())
                 }
                 None => {
                     mark_unread(
                         answers,
                         &sent[index..],
-                        &format!("git cat-file answered {header:?}"),
+                        format!("git cat-file answered {header:?}").into(),
                     );
                     return;
                 }
             },
-            _ => Err(format!("git cat-file answered {header:?} for {noun} {oid}")),
+            _ => Err(format!("git cat-file answered {header:?} for {noun} {oid}").into()),
         };
         answers.insert((*oid).to_string(), answer);
     }
@@ -1277,7 +1300,7 @@ fn git_captured_inner(
     args: &[&str],
     stdin_bytes: Option<&[u8]>,
     stdout_cap: usize,
-) -> Result<BoundedRun, String> {
+) -> Result<BoundedRun, CommandError> {
     crate::repository_trust::require(repo)?;
     let label = format!("git {}", subcommand(args));
     run_bounded_capped(
@@ -1301,7 +1324,7 @@ pub(crate) fn git_observed(
     timeout: Duration,
     stdout_cap: usize,
     observer: &mut dyn ProcessObserver,
-) -> Result<BoundedRun, String> {
+) -> Result<BoundedRun, CommandError> {
     crate::repository_trust::require(repo)?;
     let label = format!("git {}", subcommand(args));
     let mut cmd = git_command(Some(repo), args);
@@ -1317,17 +1340,21 @@ pub(crate) fn git_global_observed(
     args: &[&str],
     timeout: Duration,
     observer: &mut dyn ProcessObserver,
-) -> Result<BoundedRun, String> {
+) -> Result<BoundedRun, CommandError> {
     let label = format!("git {}", subcommand(args));
     let mut cmd = git_command(None, args);
     run_observed(&mut cmd, &label, timeout, None, MAX_OUTPUT_BYTES, observer)
 }
 
-pub fn git_global(args: &[&str]) -> Result<Vec<u8>, String> {
+pub fn git_global(args: &[&str]) -> Result<Vec<u8>, CommandError> {
     git_timeout(None, args, DEFAULT_TIMEOUT, None)
 }
 
-pub fn git_with_stdin(repo: &Path, args: &[&str], stdin_bytes: &[u8]) -> Result<Vec<u8>, String> {
+pub fn git_with_stdin(
+    repo: &Path,
+    args: &[&str],
+    stdin_bytes: &[u8],
+) -> Result<Vec<u8>, CommandError> {
     git_timeout(
         Some(repo),
         args,
@@ -1343,7 +1370,7 @@ pub(crate) fn git_with_index(
     index: &Path,
     args: &[&str],
     stdin_bytes: &[u8],
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, CommandError> {
     crate::repository_trust::require(repo)?;
     let mut command = git_command(Some(repo), args);
     // Canonical paths carry the Windows verbatim prefix, which Git rejects
@@ -1361,13 +1388,14 @@ pub(crate) fn git_with_index(
         Some(stdin_bytes),
     )?;
     if let Some(reason) = output.incomplete {
-        return Err(format!("Index transaction output {}", reason.describe()));
+        return Err(format!("Index transaction output {}", reason.describe()).into());
     }
     if !output.success {
         return Err(format!(
             "Index transaction failed: {}",
             String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(2000)])
-        ));
+        )
+        .into());
     }
     Ok(output.stdout)
 }
@@ -1387,7 +1415,7 @@ pub(crate) fn git_captured_quarantined(
     object_dir: &Path,
     alternates: &std::ffi::OsStr,
     timeout: Duration,
-) -> Result<BoundedRun, String> {
+) -> Result<BoundedRun, CommandError> {
     crate::repository_trust::require(repo)?;
     let label = format!("git {}", subcommand(args));
     let mut command = git_command(Some(repo), args);
@@ -1401,12 +1429,16 @@ pub(crate) fn git_captured_quarantined(
 ///
 /// Use for network-bound work (`clone`, `fetch`, `push`) where a multi-gigabyte
 /// transfer is legitimate and a short default cap would kill healthy traffic.
-pub fn git_with_timeout(repo: &Path, args: &[&str], timeout: Duration) -> Result<Vec<u8>, String> {
+pub fn git_with_timeout(
+    repo: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<Vec<u8>, CommandError> {
     git_timeout(Some(repo), args, timeout, None)
 }
 
 /// Like [`git_with_timeout`], but for repo-less global invocations.
-pub fn git_global_with_timeout(args: &[&str], timeout: Duration) -> Result<Vec<u8>, String> {
+pub fn git_global_with_timeout(args: &[&str], timeout: Duration) -> Result<Vec<u8>, CommandError> {
     git_timeout(None, args, timeout, None)
 }
 
@@ -1415,13 +1447,13 @@ pub fn git_text_with_timeout(
     repo: &Path,
     args: &[&str],
     timeout: Duration,
-) -> Result<String, String> {
+) -> Result<String, CommandError> {
     let bytes = git_with_timeout(repo, args, timeout)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Runs network-bound git plumbing in `repo` under [`NETWORK_TIMEOUT`].
-pub fn git_text_network(repo: &Path, args: &[&str]) -> Result<String, String> {
+pub fn git_text_network(repo: &Path, args: &[&str]) -> Result<String, CommandError> {
     git_text_with_timeout(repo, args, NETWORK_TIMEOUT)
 }
 
@@ -1449,7 +1481,11 @@ impl CapturedOutput {
 }
 
 /// Runs an external command with the same timeout and output caps as `git`.
-pub fn run_command(program: &str, args: &[&str], timeout: Duration) -> Result<Vec<u8>, String> {
+pub fn run_command(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<Vec<u8>, CommandError> {
     run_command_in(program, args, timeout, None)
 }
 
@@ -1459,19 +1495,16 @@ pub fn run_command_in(
     args: &[&str],
     timeout: Duration,
     cwd: Option<&Path>,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, CommandError> {
     let output = capture_command(program, args, cwd, timeout, &[])?;
     if output.success {
         return Ok(output.stdout);
     }
     let err = output.stderr_text();
     if err.is_empty() {
-        return Err(format!(
-            "{} failed with status {}",
-            program, output.status_code
-        ));
+        return Err(format!("{} failed with status {}", program, output.status_code).into());
     }
-    Err(err)
+    Err(err.into())
 }
 
 /// Fallback directories searched when a bare tool name is missing from the
@@ -2123,7 +2156,7 @@ pub fn capture_command(
     cwd: Option<&Path>,
     timeout: Duration,
     extra_env: &[(&str, &str)],
-) -> Result<CapturedOutput, String> {
+) -> Result<CapturedOutput, CommandError> {
     let path_var = std::env::var_os("PATH");
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     capture_command_with_env(
@@ -2251,7 +2284,7 @@ pub(crate) fn capture_command_scrubbed(
     home: Option<&std::ffi::OsStr>,
     source: PathSource,
     also_allowed: &[String],
-) -> Result<CapturedOutput, String> {
+) -> Result<CapturedOutput, CommandError> {
     let mut cmd = build_capture_command_in(program, args, cwd, extra_env, path_var, home, source);
     restrict_env_to_allowlist_plus(&mut cmd, std::env::vars_os(), home, also_allowed);
     let out = run_bounded(cmd, program, timeout, None)?.require_complete(program)?;
@@ -2278,7 +2311,7 @@ pub(crate) fn capture_command_with_env(
     path_var: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
     source: PathSource,
-) -> Result<CapturedOutput, String> {
+) -> Result<CapturedOutput, CommandError> {
     let cmd = build_capture_command_in(program, args, cwd, extra_env, path_var, home, source);
 
     let out = run_bounded(cmd, program, timeout, None)?.require_complete(program)?;
@@ -2342,7 +2375,7 @@ pub fn run_captured(
     timeout: Duration,
     extra_env: &[(&str, &str)],
     tail_cap: usize,
-) -> Result<RunOutcome, String> {
+) -> Result<RunOutcome, CommandError> {
     let path_var = std::env::var_os("PATH");
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     let cmd = build_capture_command(
@@ -2379,7 +2412,7 @@ pub fn run_captured(
                 truncation_reason,
             }))
         }
-        Err(e) if is_timeout_error(program, &e) => Ok(RunOutcome::TimedOut(timeout)),
+        Err(e) if is_timeout_error(program, e.message()) => Ok(RunOutcome::TimedOut(timeout)),
         Err(e) => Err(e),
     }
 }
@@ -2535,9 +2568,11 @@ impl ToolProbe {
 /// seam over it) returned for `program`.
 pub(crate) fn classify_tool_probe(
     program: &str,
-    result: Result<CapturedOutput, String>,
+    result: Result<CapturedOutput, CommandError>,
 ) -> ToolProbe {
-    match result {
+    // A probe's answer is a status the caller shows, not a command's error, so
+    // the text is all it keeps.
+    match result.map_err(CommandError::into_message) {
         Ok(out) => {
             let stdout = out.stdout_text();
             let line = stdout.lines().next().unwrap_or("").trim();
@@ -2614,7 +2649,7 @@ impl BucketLevel {
 }
 
 #[cfg(test)]
-pub(crate) fn refusal_message(label: &str, refusal: Refusal) -> String {
+pub(crate) fn refusal_message(label: &str, refusal: Refusal) -> CommandError {
     refusal_message_at(label, refusal, None)
 }
 
@@ -2626,20 +2661,22 @@ pub(crate) fn refusal_message_at(
     label: &str,
     refusal: Refusal,
     level: Option<BucketLevel>,
-) -> String {
+) -> CommandError {
     let by = level.map_or_else(String::new, |level| format!(" ({})", level.describe()));
     // A deferral is typed where it is written (see `crate::ipc_error`): the
-    // command that returns this exact text carries the kind, and nothing reads
-    // the marker back out of a message.
+    // error carries the kind to the command's edge, and nothing reads the
+    // marker back out of a message.
     let deferred = |text: String| {
-        crate::ipc_error::typed_text(crate::ipc_error::IpcErrorKind::DeferredUnderLoad, text)
+        let kind = crate::ipc_error::IpcErrorKind::DeferredUnderLoad;
+        CommandError::typed(kind, crate::ipc_error::typed_text(kind, text))
     };
     match refusal {
-        Refusal::Cancelled => format!("{label} cancelled before spawn"),
+        Refusal::Cancelled => format!("{label} cancelled before spawn").into(),
         Refusal::TimedOut { deadline } => format!(
             "{label}{TIMEOUT_MARKER}{:.3}{SLOT_WAIT_SUFFIX}",
             deadline.as_secs_f64()
-        ),
+        )
+        .into(),
         Refusal::Refused { waited } => deferred(format!(
             "{label}{DEFERRED_MARKER}{:.3}s: the git spawn rate limit admitted nothing sooner{by}",
             waited.as_secs_f64()
@@ -2896,13 +2933,13 @@ pub(crate) struct BoundedRun {
 
 impl BoundedRun {
     /// Parsers must establish completeness before interpreting a prefix.
-    pub(crate) fn require_complete(self, label: &str) -> Result<Self, String> {
+    pub(crate) fn require_complete(self, label: &str) -> Result<Self, CommandError> {
         for (stream, reason) in [
             ("output", &self.incomplete),
             ("stderr", &self.stderr_incomplete),
         ] {
             if let Some(reason) = reason {
-                return Err(format!("{label} {stream} {}", reason.describe()));
+                return Err(format!("{label} {stream} {}", reason.describe()).into());
             }
         }
         Ok(self)
@@ -3294,7 +3331,9 @@ pub(crate) fn mark_user_action(repo_path: &str) {
 ///   frontend asks for next is admitted like the action that caused it,
 ///   rather than deferred behind the refresh traffic the action itself set
 ///   off. See [`POST_ACTION_CREDIT_SPAWNS`].
-pub(crate) fn run_command_scope<T>(body: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+pub(crate) fn run_command_scope<T>(
+    body: impl FnOnce() -> Result<T, CommandError>,
+) -> Result<T, CommandError> {
     struct Scope {
         previous: Admission,
         previous_repo: Option<PathBuf>,
@@ -3317,7 +3356,7 @@ pub(crate) fn run_command_scope<T>(body: impl FnOnce() -> Result<T, String>) -> 
     if let Some(repo) = MARKED_REPO.with(|slot| slot.borrow_mut().take()) {
         grant_post_action_credit(&repo, Instant::now());
     }
-    result.map_err(not_retryable)
+    result.map_err(|error| error.map_message(not_retryable))
 }
 
 /// Rewrites a deferral so it no longer reads as one. The cause stays in the
@@ -3389,7 +3428,7 @@ fn grant_post_action_credit(repo: &Path, now: Instant) {
 /// at. The same bounded credit keeps a scripted stream of activations from
 /// becoming unmetered: [`POST_ACTION_CREDIT_SPAWNS`] per activation, for
 /// [`POST_ACTION_CREDIT_WINDOW`], and only in that one repository.
-pub(crate) fn note_tab_activated(repo_path: &str) -> Result<(), String> {
+pub(crate) fn note_tab_activated(repo_path: &str) -> Result<(), CommandError> {
     let repo = validate_repo(repo_path)?;
     grant_post_action_credit(&repo, Instant::now());
     Ok(())
@@ -4396,7 +4435,7 @@ struct SharedReadKey {
 /// arrives after that point may be asking because of a write the running
 /// child cannot have seen, so it starts its own.
 struct SharedRead {
-    result: Mutex<Option<Result<BoundedRun, String>>>,
+    result: Mutex<Option<Result<BoundedRun, CommandError>>>,
     done: Condvar,
     /// Where this flight's joiners go when its leader's deadline passed
     /// before theirs: the one flight that asks again for all of them, set by
@@ -4437,7 +4476,7 @@ fn run_read_shared(
     timeout: Duration,
     stdout_cap: usize,
     gate: &'static SpawnGate,
-) -> Result<BoundedRun, String> {
+) -> Result<BoundedRun, CommandError> {
     let deadline = Instant::now() + timeout;
     let mut attempt = timeout;
     // The flight whose leader timed out last, and the longest prefix any such
@@ -4484,7 +4523,7 @@ fn run_read_shared(
 
 /// How one pass through the shared-read queue ended.
 enum SharedAttempt {
-    Done(Result<BoundedRun, String>),
+    Done(Result<BoundedRun, CommandError>),
     /// The leader this caller joined ran out of its own time while this
     /// caller's deadline has not come. Its timeout is not this caller's
     /// answer, so the caller asks again, on `flight`'s retry. `printed` is
@@ -4501,11 +4540,11 @@ enum SharedAttempt {
 /// longest prefix it saw, since a solo call over the same budget would have
 /// read at least that much.
 fn as_the_callers_deadline(
-    outcome: Result<BoundedRun, String>,
+    outcome: Result<BoundedRun, CommandError>,
     prefix: Option<BoundedRun>,
     label: &str,
     timeout: Duration,
-) -> Result<BoundedRun, String> {
+) -> Result<BoundedRun, CommandError> {
     if !is_deadline_outcome(&outcome) {
         return outcome;
     }
@@ -4521,16 +4560,16 @@ fn as_the_callers_deadline(
         Err(error) if !longer(0) => {
             // A refusal to wait any longer for a slot says so; only the bare
             // timeout is rewritten.
-            Err(if error.ends_with(SLOT_WAIT_SUFFIX) {
+            Err(if error.message().ends_with(SLOT_WAIT_SUFFIX) {
                 error
             } else {
-                message
+                message.into()
             })
         }
         // The leader's prefix outweighs this caller's own.
         _ => match prefix {
             Some(kept) => Ok(rename_deadline(kept, message)),
-            None => Err(message),
+            None => Err(message.into()),
         },
     }
 }
@@ -4543,17 +4582,17 @@ fn rename_deadline(mut run: BoundedRun, message: String) -> BoundedRun {
 }
 
 /// Whether a flight's outcome is its leader's deadline rather than an answer.
-fn is_deadline_outcome(outcome: &Result<BoundedRun, String>) -> bool {
+fn is_deadline_outcome(outcome: &Result<BoundedRun, CommandError>) -> bool {
     match outcome {
         Ok(run) => matches!(run.incomplete, Some(Incomplete::Deadline { .. })),
-        Err(message) => is_timed_out(message),
+        Err(error) => is_timed_out(error.message()),
     }
 }
 
 /// What a solo call that ran out of `timeout` reports: the prefix form for a
 /// caller keeping deadline prefixes, the error otherwise (see
 /// [`run_admitted`]).
-fn deadline_expired(label: &str, timeout: Duration) -> Result<BoundedRun, String> {
+fn deadline_expired(label: &str, timeout: Duration) -> Result<BoundedRun, CommandError> {
     let message = format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs_f64());
     if keeping_deadline_prefix() {
         return Ok(BoundedRun {
@@ -4569,8 +4608,9 @@ fn deadline_expired(label: &str, timeout: Duration) -> Result<BoundedRun, String
             cancelled: false,
         });
     }
-    note_process_failure(&message);
-    Err(message)
+    let error = CommandError::from(message);
+    note_process_failure(&error);
+    Err(error)
 }
 
 fn run_read_shared_once(
@@ -4670,8 +4710,8 @@ fn run_read_shared_once(
         }
         // The leader counted its own failure on its thread; a joiner that
         // received it saw no answer either.
-        if let Err(message) = &shared {
-            note_process_failure(message);
+        if let Err(error) = &shared {
+            note_process_failure(error);
         }
         return SharedAttempt::Done(shared);
     }
@@ -4682,13 +4722,13 @@ fn run_read_shared_once(
         key: &'a SharedReadKey,
         flight: &'a Arc<SharedRead>,
         label: &'a str,
-        outcome: Option<Result<BoundedRun, String>>,
+        outcome: Option<Result<BoundedRun, CommandError>>,
     }
     impl Drop for Publish<'_> {
         fn drop(&mut self) {
             close_shared_read(self.key, self.flight);
             let outcome = self.outcome.take().unwrap_or_else(|| {
-                Err(format!("{} shared read ended without a result", self.label))
+                Err(format!("{} shared read ended without a result", self.label).into())
             });
             *self
                 .flight
@@ -4852,7 +4892,7 @@ pub(crate) fn run_bounded(
     label: &str,
     timeout: Duration,
     stdin_bytes: Option<&[u8]>,
-) -> Result<BoundedRun, String> {
+) -> Result<BoundedRun, CommandError> {
     run_bounded_capped(cmd, label, timeout, stdin_bytes, MAX_OUTPUT_BYTES)
 }
 
@@ -4870,7 +4910,7 @@ pub(crate) fn run_bounded_capped(
     timeout: Duration,
     stdin_bytes: Option<&[u8]>,
     stdout_cap: usize,
-) -> Result<BoundedRun, String> {
+) -> Result<BoundedRun, CommandError> {
     run_observed(&mut cmd, label, timeout, stdin_bytes, stdout_cap, &mut ())
 }
 
@@ -4881,7 +4921,7 @@ pub(crate) fn run_observed(
     stdin_bytes: Option<&[u8]>,
     stdout_cap: usize,
     observer: &mut dyn ProcessObserver,
-) -> Result<BoundedRun, String> {
+) -> Result<BoundedRun, CommandError> {
     run_with_gate(
         cmd,
         label,
@@ -4901,7 +4941,7 @@ fn run_with_gate(
     stdout_cap: usize,
     observer: &mut dyn ProcessObserver,
     gate: &'static SpawnGate,
-) -> Result<BoundedRun, String> {
+) -> Result<BoundedRun, CommandError> {
     run_admitted(
         cmd,
         label,
@@ -4941,7 +4981,7 @@ thread_local! {
     /// it unset and still receives a timeout error.
     static KEEP_DEADLINE_PREFIX: Cell<bool> = const { Cell::new(false) };
     static PROCESS_FAILURES: Cell<u64> = const { Cell::new(0) };
-    static LAST_PROCESS_FAILURE: std::cell::RefCell<Option<String>> =
+    static LAST_PROCESS_FAILURE: std::cell::RefCell<Option<CommandError>> =
         const { std::cell::RefCell::new(None) };
     #[cfg(test)]
     static FORCE_SPAWN_FAILURE: Cell<bool> = const { Cell::new(false) };
@@ -4982,15 +5022,15 @@ pub(crate) fn process_failures() -> u64 {
 
 /// What the newest failure counted by [`process_failures`] said. A caller
 /// that compared the counter and found a failure it swallowed can report the
-/// cause instead of an empty field — and keep the deferral marker, so the
-/// frontend knows the answer is worth asking for again.
-pub(crate) fn last_process_failure() -> Option<String> {
+/// cause instead of an empty field — and keep its kind, so the frontend knows
+/// a deferred answer is worth asking for again.
+pub(crate) fn last_process_failure() -> Option<CommandError> {
     LAST_PROCESS_FAILURE.with(|slot| slot.borrow().clone())
 }
 
-fn note_process_failure(message: &str) {
+fn note_process_failure(error: &CommandError) {
     PROCESS_FAILURES.set(PROCESS_FAILURES.get().wrapping_add(1));
-    LAST_PROCESS_FAILURE.with(|slot| *slot.borrow_mut() = Some(message.to_string()));
+    LAST_PROCESS_FAILURE.with(|slot| *slot.borrow_mut() = Some(error.clone()));
 }
 
 /// While alive on this thread, a child killed at its runtime deadline is a
@@ -5163,7 +5203,7 @@ fn run_admitted(
     observer: &mut dyn ProcessObserver,
     gate: &'static SpawnGate,
     on_admitted: &dyn Fn(),
-) -> Result<BoundedRun, String> {
+) -> Result<BoundedRun, CommandError> {
     #[cfg(test)]
     SPAWN_LABELS.with(|labels| labels.borrow_mut().push(label.to_string()));
     #[cfg(test)]
@@ -5177,9 +5217,9 @@ fn run_admitted(
                 hook();
             }
         });
-        let message = format!("Failed to spawn {label}: forced by test");
-        note_process_failure(&message);
-        return Err(message);
+        let error = CommandError::from(format!("Failed to spawn {label}: forced by test"));
+        note_process_failure(&error);
+        return Err(error);
     }
     let result = run_admitted_inner(
         cmd,
@@ -5201,12 +5241,12 @@ fn run_admitted(
             let Some(Incomplete::Deadline { message, .. }) = run.incomplete else {
                 unreachable!("matched Deadline above");
             };
-            Err(message)
+            Err(message.into())
         }
         other => other,
     };
-    if let Err(message) = &result {
-        note_process_failure(message);
+    if let Err(error) = &result {
+        note_process_failure(error);
     }
     result
 }
@@ -5221,26 +5261,25 @@ fn run_admitted_inner(
     observer: &mut dyn ProcessObserver,
     gate: &'static SpawnGate,
     on_admitted: &dyn Fn(),
-) -> Result<BoundedRun, String> {
+) -> Result<BoundedRun, CommandError> {
     if timeout > NETWORK_TIMEOUT {
-        return Err(format!(
-            "{label} deadline exceeds {}s",
-            NETWORK_TIMEOUT.as_secs()
-        ));
+        return Err(format!("{label} deadline exceeds {}s", NETWORK_TIMEOUT.as_secs()).into());
     }
     if timeout.is_zero() {
         return Err(format!(
             "{label}{TIMEOUT_MARKER}{}s: deadline must be positive and at most {}s",
             timeout.as_secs_f64(),
             NETWORK_TIMEOUT.as_secs()
-        ));
+        )
+        .into());
     }
     if stdout_cap > MAX_OUTPUT_BYTES
         || stdin_bytes.is_some_and(|bytes| bytes.len() > MAX_OUTPUT_BYTES)
     {
         return Err(format!(
             "{label} input/output budget exceeds the {MAX_OUTPUT_BYTES} byte limit"
-        ));
+        )
+        .into());
     }
     let queue_deadline = Instant::now() + timeout;
     if stdin_bytes.is_some() {
@@ -5290,8 +5329,15 @@ fn run_admitted_inner(
     // this process — or the deliberate `process::exit` on `gitpulse-mcp`'s
     // shutdown path — takes this child and everything it forked down with it
     // instead of orphaning them. See [`crate::procguard`].
-    let (mut child, guard) =
-        crate::procguard::spawn(cmd, label).map_err(|e| spawn_error(label, &e))?;
+    let (mut child, guard) = crate::procguard::spawn(cmd, label).map_err(|e| {
+        let message = spawn_error(label, &e);
+        // A trust refusal keeps its kind in other words, which is what a
+        // caller that only holds the spawn error asks about.
+        match crate::procguard::trust_refusal(&e) {
+            Some(refusal) => refusal.clone().wrap(|_| message),
+            None => message.into(),
+        }
+    })?;
     // Applied after the spawn so `std` keeps its `posix_spawn` fast path; the
     // child runs unthrottled for the instant before this call. A refusal is
     // logged and the child carries on at normal priority: failing a read
@@ -5311,7 +5357,7 @@ fn run_admitted_inner(
             Ok(output) => output,
             Err(error) => {
                 guard.stop_and_reap(&mut child, Duration::ZERO).ok();
-                return Err(format!("Failed to prepare {label} output: {error}"));
+                return Err(format!("Failed to prepare {label} output: {error}").into());
             }
         };
     #[cfg(not(unix))]
@@ -5336,7 +5382,7 @@ fn run_admitted_inner(
             Ok(input) => input,
             Err(error) => {
                 guard.stop_and_reap(&mut child, Duration::ZERO).ok();
-                return Err(format!("Failed to prepare {label} stdin: {error}"));
+                return Err(format!("Failed to prepare {label} stdin: {error}").into());
             }
         };
     #[cfg(not(unix))]
@@ -5410,14 +5456,14 @@ fn run_admitted_inner(
         }
     };
     let (status, cancelled, deadline_message) = match halt {
-        Halt::Failed(error) => return Err(error),
+        Halt::Failed(error) => return Err(error.into()),
         Halt::Exited(status, cancelled) => (Some(status), cancelled, None),
         Halt::Deadline(message) => (None, false, Some(message)),
     };
     if let Err(error) = input.finish() {
         if deadline_message.is_none() && status.is_some_and(|status| status.success()) && !cancelled
         {
-            return Err(format!("Failed to deliver {label} {error}"));
+            return Err(format!("Failed to deliver {label} {error}").into());
         }
     }
     // Normal exit: EOF is imminent unless something else is holding a
@@ -5450,7 +5496,7 @@ fn run_admitted_inner(
     let mut unread: Option<String> = None;
     match stdout.stop.take() {
         Some(Stop::Broken(e)) if deadline_message.is_none() => {
-            return Err(format!("Failed to read {label} output: {e}"));
+            return Err(format!("Failed to read {label} output: {e}").into());
         }
         Some(Stop::Broken(e) | Stop::Undelivered(e)) => {
             stderr
@@ -5739,7 +5785,7 @@ fn git_run(
     args: &[&str],
     timeout: Duration,
     stdin_bytes: Option<&[u8]>,
-) -> Result<(Vec<u8>, Option<Incomplete>), String> {
+) -> Result<(Vec<u8>, Option<Incomplete>), CommandError> {
     git_run_capped(repo, args, timeout, stdin_bytes, MAX_OUTPUT_BYTES)
 }
 
@@ -5749,14 +5795,14 @@ fn git_run_capped(
     timeout: Duration,
     stdin_bytes: Option<&[u8]>,
     stdout_cap: usize,
-) -> Result<(Vec<u8>, Option<Incomplete>), String> {
+) -> Result<(Vec<u8>, Option<Incomplete>), CommandError> {
     git_run_inner(repo, args, timeout, stdin_bytes, stdout_cap, false)
 }
 
 /// [`git_text`] for a read-only command on a refresh path: identical reads
 /// still queued at the spawn gate share one child (see [`run_read_shared`]).
 /// Never for a command that can write — refs, index, config or worktree.
-pub(crate) fn git_text_shared(repo: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn git_text_shared(repo: &Path, args: &[&str]) -> Result<String, CommandError> {
     let sub = subcommand(args);
     let (bytes, incomplete) = git_run_inner(
         Some(repo),
@@ -5767,7 +5813,7 @@ pub(crate) fn git_text_shared(repo: &Path, args: &[&str]) -> Result<String, Stri
         true,
     )?;
     if let Some(reason) = incomplete {
-        return Err(incomplete_is_failure(sub, reason));
+        return Err(incomplete_is_failure(sub, reason).into());
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
@@ -5780,7 +5826,7 @@ pub(crate) fn git_text_capped_shared(
     repo: &Path,
     args: &[&str],
     cap: usize,
-) -> Result<(String, Option<Incomplete>), String> {
+) -> Result<(String, Option<Incomplete>), CommandError> {
     let (bytes, incomplete) = git_run_inner(Some(repo), args, DEFAULT_TIMEOUT, None, cap, true)?;
     Ok((String::from_utf8_lossy(&bytes).into_owned(), incomplete))
 }
@@ -5792,7 +5838,7 @@ fn git_run_inner(
     stdin_bytes: Option<&[u8]>,
     stdout_cap: usize,
     shared: bool,
-) -> Result<(Vec<u8>, Option<Incomplete>), String> {
+) -> Result<(Vec<u8>, Option<Incomplete>), CommandError> {
     if let Some(repo) = repo {
         crate::repository_trust::require(repo)?;
     }
@@ -5815,7 +5861,7 @@ fn git_run_inner(
         let cmd = git_command(repo, args);
         let remaining = timeout.saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            return Err(format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs_f64()));
+            return Err(format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs_f64()).into());
         }
         // A hook-running command is cancellable and can write, so it is
         // never shared whatever the caller asked: the shared path has no
@@ -5838,7 +5884,7 @@ fn git_run_inner(
         };
         if let Some((repo, _)) = &hooked {
             if out.cancelled {
-                return Err(hooks::cancelled_message(repo, sub));
+                return Err(hooks::cancelled_message(repo, sub).into());
             }
             if let Some(Incomplete::Deadline { message, .. }) = &mut out.incomplete {
                 *message = hooks::timeout_message(repo, sub, message);
@@ -5866,12 +5912,9 @@ fn git_run_inner(
                 );
                 continue;
             }
-            return Err(clamp_failure_message(diagnosis, sub));
+            return Err(clamp_failure_message(diagnosis, sub).into());
         }
-        return Err(format!(
-            "git {} failed with status {}",
-            sub, out.status_code
-        ));
+        return Err(format!("git {} failed with status {}", sub, out.status_code).into());
     }
 }
 
@@ -5890,11 +5933,11 @@ fn git_timeout(
     args: &[&str],
     timeout: Duration,
     stdin_bytes: Option<&[u8]>,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, CommandError> {
     let sub = subcommand(args);
     let (stdout, incomplete) = git_run(repo, args, timeout, stdin_bytes)?;
     if let Some(reason) = incomplete {
-        return Err(incomplete_is_failure(sub, reason));
+        return Err(incomplete_is_failure(sub, reason).into());
     }
     Ok(stdout)
 }
@@ -5911,7 +5954,7 @@ fn incomplete_is_failure(sub: &str, reason: Incomplete) -> String {
             message,
             over_cap: None,
         } => {
-            note_process_failure(&message);
+            note_process_failure(&CommandError::from(message.as_str()));
             message
         }
         other => format!("git {sub} output {}", other.describe()),
@@ -6334,8 +6377,16 @@ mod tests {
         assert_eq!(reactive(), Some(Refusal::Pressure { reactive: true }));
         assert_eq!(interactive(), None, "a click is never shed");
         let message = refusal_message("git status", Refusal::Pressure { reactive: true });
-        assert!(is_deferred_under_load(&message), "{message}");
-        assert!(message.contains("memory pressure"), "{message}");
+        assert!(
+            is_deferred_under_load(message.message()),
+            "{message}",
+            message = message.message()
+        );
+        assert!(
+            message.contains("memory pressure"),
+            "{message}",
+            message = message.message()
+        );
         let counters = gate.counters();
         assert_eq!(counters[Admission::Background.index()].shed, 2);
         assert_eq!(counters[Admission::Reactive.index()].shed, 1);
@@ -6427,10 +6478,18 @@ mod tests {
                 Refusal::Pressure { reactive: true },
             ] {
                 let message = refusal_message(label, refusal);
-                assert!(is_deferred_under_load(&message), "{message}");
                 assert!(
-                    is_deferred_under_load(&format!("[deferred_worktree] {message}")),
-                    "{message}"
+                    is_deferred_under_load(message.message()),
+                    "{message}",
+                    message = message.message()
+                );
+                assert!(
+                    is_deferred_under_load(&format!(
+                        "[deferred_worktree] {message}",
+                        message = message.message()
+                    )),
+                    "{message}",
+                    message = message.message()
                 );
             }
         }
@@ -6459,12 +6518,28 @@ mod tests {
         };
         let waited = std::time::Duration::from_millis(2_013);
         let deferred = refusal_message("git status", Refusal::Refused { waited });
-        assert!(deferred.contains("2.013s"), "{deferred}");
+        assert!(
+            deferred.contains("2.013s"),
+            "{deferred}",
+            deferred = deferred.message()
+        );
         let shed = refusal_message("git status", Refusal::Shed);
         for message in [&deferred, &shed] {
-            assert!(is_deferred_under_load(message), "{message}");
-            assert!(!is_slot_wait_timeout(message), "{message}");
-            assert!(!is_timeout_error("git status", message), "{message}");
+            assert!(
+                is_deferred_under_load(message.message()),
+                "{message}",
+                message = message.message()
+            );
+            assert!(
+                !is_slot_wait_timeout(message.message()),
+                "{message}",
+                message = message.message()
+            );
+            assert!(
+                !is_timeout_error("git status", message.message()),
+                "{message}",
+                message = message.message()
+            );
         }
         let timed_out = refusal_message(
             "git status",
@@ -6472,11 +6547,26 @@ mod tests {
                 deadline: std::time::Duration::from_secs(90),
             },
         );
-        assert!(is_slot_wait_timeout(&timed_out), "{timed_out}");
-        assert!(is_timeout_error("git status", &timed_out), "{timed_out}");
-        assert!(!is_deferred_under_load(&timed_out), "{timed_out}");
+        assert!(
+            is_slot_wait_timeout(timed_out.message()),
+            "{timed_out}",
+            timed_out = timed_out.message()
+        );
+        assert!(
+            is_timeout_error("git status", timed_out.message()),
+            "{timed_out}",
+            timed_out = timed_out.message()
+        );
+        assert!(
+            !is_deferred_under_load(timed_out.message()),
+            "{timed_out}",
+            timed_out = timed_out.message()
+        );
         let cancelled = refusal_message("git status", Refusal::Cancelled);
-        assert!(!is_deferred_under_load(&cancelled) && !is_slot_wait_timeout(&cancelled));
+        assert!(
+            !is_deferred_under_load(cancelled.message())
+                && !is_slot_wait_timeout(cancelled.message())
+        );
         let report = super::format_gate_report(
             &[super::AdmissionCounters::default(); 3],
             "budget=per-process",
@@ -6843,9 +6933,9 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            error.len() < MAX_FAILURE_MESSAGE_BYTES + 100,
+            error.message().len() < MAX_FAILURE_MESSAGE_BYTES + 100,
             "unbounded failure message: {} bytes",
-            error.len()
+            error.message().len()
         );
         assert!(error.contains("output truncated"));
     }
@@ -6868,11 +6958,15 @@ mod tests {
             1024,
         )
         .unwrap_err();
-        assert!(error.starts_with("chatter"), "{error}");
         assert!(
-            error.ends_with("error: failed to push some refs"),
+            error.message().starts_with("chatter"),
+            "{error}",
+            error = error.message()
+        );
+        assert!(
+            error.message().ends_with("error: failed to push some refs"),
             "failing tail dropped: …{}",
-            &error[error.len().saturating_sub(120)..]
+            &error.message()[error.message().len().saturating_sub(120)..]
         );
     }
     #[test]
@@ -6922,7 +7016,11 @@ mod tests {
             started.elapsed()
         );
         match capped {
-            Err(error) => assert!(error.contains("timed out"), "{error}"),
+            Err(error) => assert!(
+                error.contains("timed out"),
+                "{error}",
+                error = error.message()
+            ),
             Ok((_, Some(Incomplete::Deadline { message, .. }))) => {
                 assert!(message.contains("timed out"), "{message}")
             }
@@ -6931,7 +7029,8 @@ mod tests {
         let error = whole.expect_err("a caller that needs the whole stream cannot accept a prefix");
         assert!(
             error.contains("timed out"),
-            "deadline expiry must be explicit: {error}"
+            "deadline expiry must be explicit: {error}",
+            error = error.message()
         );
     }
 
@@ -6957,7 +7056,11 @@ mod tests {
         );
         let error = git_timeout(Some(dir.path()), &args, Duration::from_millis(100), None)
             .expect_err("whole-stream callers fail a deadline");
-        assert!(error.contains("timed out"), "{error}");
+        assert!(
+            error.contains("timed out"),
+            "{error}",
+            error = error.message()
+        );
     }
 
     #[cfg(unix)]
@@ -7235,8 +7338,16 @@ mod tests {
         let started = Instant::now();
         let error = git_text(dir.path(), &["update-ref", "refs/heads/a/b", "HEAD"])
             .expect_err("a/b cannot coexist with a");
-        assert!(error.contains("exists; cannot create"), "{error}");
-        assert!(!is_transient_git_lock_error(&error), "{error}");
+        assert!(
+            error.contains("exists; cannot create"),
+            "{error}",
+            error = error.message()
+        );
+        assert!(
+            !is_transient_git_lock_error(error.message()),
+            "{error}",
+            error = error.message()
+        );
         assert!(
             started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5)),
             "a permanent failure is not retried with backoff"
@@ -7273,7 +7384,11 @@ mod tests {
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let error = git_text(dir.path(), &["commit", "-m", "x"]).expect_err("hook rejects");
-        assert!(is_transient_git_lock_error(&error), "{error}");
+        assert!(
+            is_transient_git_lock_error(error.message()),
+            "{error}",
+            error = error.message()
+        );
         let runs = std::fs::read_to_string(&counter).unwrap().lines().count();
         assert_eq!(runs, 1, "the hook ran {runs} times");
     }
@@ -7393,9 +7508,12 @@ mod tests {
             RunError::SlotWaitTimeout
         );
         assert_eq!(RunError::classify(&slot), RunError::SlotWaitTimeout);
-        assert_eq!(RunError::classify(&deferred), RunError::Deferred);
+        assert_eq!(RunError::classify(deferred.message()), RunError::Deferred);
         assert_eq!(
-            RunError::classify(&format!("[deferred_worktree] {deferred}")),
+            RunError::classify(&format!(
+                "[deferred_worktree] {deferred}",
+                deferred = deferred.message()
+            )),
             RunError::Deferred
         );
         assert_eq!(RunError::classify(hostile), RunError::SpawnFailed);
@@ -7406,7 +7524,7 @@ mod tests {
             RunError::Other
         );
         assert!(is_run_timeout(&ran_out));
-        for not_timeout in [&slot, &deferred, &not_found] {
+        for not_timeout in [slot.as_str(), deferred.message(), not_found.as_str()] {
             assert!(!is_run_timeout(not_timeout), "{not_timeout}");
         }
         assert!(!is_run_timeout(hostile));
@@ -7537,8 +7655,8 @@ mod tests {
             ],
         )
         .unwrap_err();
-        assert!(err.contains("git rev-parse"), "{err}");
-        assert!(!err.contains("git -c"), "{err}");
+        assert!(err.contains("git rev-parse"), "{err}", err = err.message());
+        assert!(!err.contains("git -c"), "{err}", err = err.message());
     }
 
     #[test]
@@ -7648,7 +7766,8 @@ mod tests {
                     classify_tool_probe("gh", Err(error.clone())),
                     ToolProbe::NotRun(_)
                 ),
-                "{error}"
+                "{error}",
+                error = error.message()
             );
         }
 
@@ -7661,7 +7780,7 @@ mod tests {
             assert!(!is_spawn_not_found(error), "{error}");
             assert!(
                 matches!(
-                    classify_tool_probe("gh", Err(error.to_string())),
+                    classify_tool_probe("gh", Err(error.to_string().into())),
                     ToolProbe::NotRun(_)
                 ),
                 "{error}"
@@ -7681,7 +7800,7 @@ mod tests {
         // Started and then ran out of time: found, and failed.
         let hung = format!("gh{TIMEOUT_MARKER}10s");
         assert!(matches!(
-            classify_tool_probe("gh", Err(hung)),
+            classify_tool_probe("gh", Err(hung.into())),
             ToolProbe::FoundButFailed(_)
         ));
     }
@@ -9247,7 +9366,8 @@ mod tests {
         .expect_err("unresolvable tool must error");
         assert!(
             err.contains("gitpulse-no-such-tool-xyz"),
-            "error must keep the bare tool name, got: {err}"
+            "error must keep the bare tool name, got: {err}",
+            err = err.message()
         );
     }
 
@@ -9437,7 +9557,7 @@ mod tests {
         let (a, b, c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
         let sent = [a.as_str(), b.as_str(), c.as_str()];
         let run = |stream: &[u8]| {
-            let mut answers: HashMap<String, Result<usize, String>> = HashMap::new();
+            let mut answers: HashMap<String, Result<usize, CommandError>> = HashMap::new();
             read_batch_answers(
                 stream,
                 &sent,
@@ -9458,7 +9578,11 @@ mod tests {
         assert_eq!(inside[&a], Ok(2));
         for oid in [&b, &c] {
             let err = inside[oid].as_ref().unwrap_err();
-            assert!(err.contains("exceeded 64") && err.contains(&b), "{err}");
+            assert!(
+                err.contains("exceeded 64") && err.contains(&b),
+                "{err}",
+                err = err.message()
+            );
         }
     }
 
@@ -9585,7 +9709,7 @@ mod tests {
         let Err(err) = outcome else {
             panic!("slow command must hit the deadline");
         };
-        assert!(err.contains("timed out"), "got: {err}");
+        assert!(err.contains("timed out"), "got: {err}", err = err.message());
         assert!(
             started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
             "kill must be prompt, took {:?}",
@@ -9603,7 +9727,11 @@ mod tests {
             &[],
         )
         .expect_err("must time out");
-        assert!(err.contains("timed out after"), "got: {err}");
+        assert!(
+            err.contains("timed out after"),
+            "got: {err}",
+            err = err.message()
+        );
     }
 
     #[test]
@@ -9621,7 +9749,9 @@ mod tests {
         assert!(!is_deferred_under_load(&err), "{err}");
         assert_eq!(process_failures(), before + 1);
         assert_eq!(
-            last_process_failure().as_deref(),
+            last_process_failure()
+                .map(CommandError::into_message)
+                .as_deref(),
             Some("git log timed out after 90s")
         );
         let capped = incomplete_is_failure(
@@ -9697,8 +9827,16 @@ mod tests {
             None,
         )
         .expect_err("a caller that needs the whole stream still fails");
-        assert!(discarded.contains("timed out after"), "{discarded}");
-        assert!(!discarded.contains("pulse-prefix"), "{discarded}");
+        assert!(
+            discarded.contains("timed out after"),
+            "{discarded}",
+            discarded = discarded.message()
+        );
+        assert!(
+            !discarded.contains("pulse-prefix"),
+            "{discarded}",
+            discarded = discarded.message()
+        );
     }
 
     /// A non-zero exit that printed something is the child failing, not a
@@ -9996,11 +10134,13 @@ mod tests {
         .expect_err("a stdout of unknown completeness must not pass as complete");
         assert!(
             !err.contains("exceeded"),
-            "nothing was printed, so nothing exceeded any cap: {err}"
+            "nothing was printed, so nothing exceeded any cap: {err}",
+            err = err.message()
         );
         assert!(
             err.contains("could not be read to the end"),
-            "the error must name the real cause: {err}"
+            "the error must name the real cause: {err}",
+            err = err.message()
         );
     }
 
@@ -10037,7 +10177,7 @@ mod tests {
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "sleep 30 & sleep 30"]);
         let err = run_bounded(cmd, "sh", Duration::from_secs(1), None).expect_err("timeout");
-        assert!(err.contains("timed out"), "got: {err}");
+        assert!(err.contains("timed out"), "got: {err}", err = err.message());
         assert!(
             started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(15)),
             "timeout handling must stay bounded (one shared grace window), took {:?}",
@@ -10213,8 +10353,16 @@ mod tests {
         let error = result
             .expect("queue wait must obey the command deadline")
             .expect_err("the queued command must not start");
-        assert!(error.contains("waiting for a process slot"), "{error}");
-        assert!(error.contains(TIMEOUT_MARKER), "{error}");
+        assert!(
+            error.contains("waiting for a process slot"),
+            "{error}",
+            error = error.message()
+        );
+        assert!(
+            error.contains(TIMEOUT_MARKER),
+            "{error}",
+            error = error.message()
+        );
     }
 
     /// Deterministic, dependency-free generator for the stress tests: a fixed
@@ -10647,7 +10795,7 @@ mod tests {
             &self,
             script: &str,
             timeout: Duration,
-        ) -> thread::JoinHandle<(Result<super::BoundedRun, String>, Duration)> {
+        ) -> thread::JoinHandle<(Result<super::BoundedRun, CommandError>, Duration)> {
             self.read_as(script, timeout, false)
         }
 
@@ -10657,7 +10805,7 @@ mod tests {
             &self,
             script: &str,
             timeout: Duration,
-        ) -> thread::JoinHandle<(Result<super::BoundedRun, String>, Duration)> {
+        ) -> thread::JoinHandle<(Result<super::BoundedRun, CommandError>, Duration)> {
             self.read_as(script, timeout, true)
         }
 
@@ -10666,7 +10814,7 @@ mod tests {
             script: &str,
             timeout: Duration,
             keep_prefix: bool,
-        ) -> thread::JoinHandle<(Result<super::BoundedRun, String>, Duration)> {
+        ) -> thread::JoinHandle<(Result<super::BoundedRun, CommandError>, Duration)> {
             let (gate, cwd, script) = (self.gate, self.cwd.clone(), script.to_string());
             thread::spawn(move || {
                 let _kept = keep_prefix.then(KeepDeadlinePrefix::enter);
@@ -10721,7 +10869,7 @@ mod tests {
         let (joined, waited) = joiner.join().unwrap();
         let error = joined.expect_err("the joiner's 200 ms ran out");
         assert_eq!(error, format!("joined-read{TIMEOUT_MARKER}0.2s"));
-        assert!(is_timed_out(&error));
+        assert!(is_timed_out(error.message()));
         assert!(
             waited < crate::test_support::coverage_relaxed(Duration::from_millis(1200)),
             "the joiner sat for {waited:?}"
@@ -10746,7 +10894,11 @@ mod tests {
         rig.release();
         let (led, _) = leader.join().unwrap();
         let error = led.expect_err("the leader's 300 ms ran out");
-        assert!(is_timed_out(&error), "{error}");
+        assert!(
+            is_timed_out(error.message()),
+            "{error}",
+            error = error.message()
+        );
         let (joined, _) = joiner.join().unwrap();
         let run = joined.expect("the joiner had budget to run its own read");
         assert!(run.success && run.incomplete.is_none(), "{run:?}");
@@ -10765,10 +10917,14 @@ mod tests {
         rig.wait_for_joins(1);
         rig.release();
         let (led, _) = leader.join().unwrap();
-        assert!(is_timed_out(&led.expect_err("leader deadline")));
+        assert!(is_timed_out(led.expect_err("leader deadline").message()));
         let (joined, waited) = joiner.join().unwrap();
         let error = joined.expect_err("joiner deadline");
-        assert!(is_timed_out(&error), "{error}");
+        assert!(
+            is_timed_out(error.message()),
+            "{error}",
+            error = error.message()
+        );
         assert!(
             waited < crate::test_support::coverage_relaxed(Duration::from_secs(2)),
             "{waited:?}"
@@ -10797,7 +10953,11 @@ mod tests {
         for (ms, joiner) in short {
             let (joined, waited) = joiner.join().unwrap();
             let error = joined.expect_err("a short joiner outlasted by the child");
-            assert!(is_timed_out(&error), "{error}");
+            assert!(
+                is_timed_out(error.message()),
+                "{error}",
+                error = error.message()
+            );
             assert!(
                 waited
                     < Duration::from_millis(ms)
@@ -10852,7 +11012,11 @@ mod tests {
         let (joined, waited) = joiner.join().unwrap();
         leader.join().unwrap();
         let error = joined.expect_err("a panicked leader has no answer");
-        assert!(error.contains("ended without a result"), "{error}");
+        assert!(
+            error.contains("ended without a result"),
+            "{error}",
+            error = error.message()
+        );
         assert!(waited < Duration::from_secs(4), "{waited:?}");
     }
 
@@ -10868,7 +11032,7 @@ mod tests {
         rig.wait_for_joins(1);
         rig.release();
         let (joined, waited) = joiner.join().unwrap();
-        assert!(is_timed_out(&joined.expect_err("1 ms")));
+        assert!(is_timed_out(joined.expect_err("1 ms").message()));
         assert!(
             waited < crate::test_support::coverage_relaxed(Duration::from_millis(800)),
             "{waited:?}"
@@ -10894,7 +11058,11 @@ mod tests {
             let (joined, waited) = joiner.join().unwrap();
             match joined {
                 Ok(run) => assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "raced"),
-                Err(error) => assert!(is_timed_out(&error), "{error}"),
+                Err(error) => assert!(
+                    is_timed_out(error.message()),
+                    "{error}",
+                    error = error.message()
+                ),
             }
             assert!(waited < Duration::from_secs(3), "{waited:?}");
             assert!(leader.join().unwrap().0.expect("leader").success);
@@ -10969,10 +11137,16 @@ mod tests {
         let joiner = rig.read("sleep 5", Duration::from_millis(900));
         rig.wait_for_joins(1);
         rig.release();
-        assert!(is_timed_out(&leader.join().unwrap().0.expect_err("leader")));
+        assert!(is_timed_out(
+            leader.join().unwrap().0.expect_err("leader").message()
+        ));
         let (joined, waited) = joiner.join().unwrap();
         let error = joined.expect_err("joiner deadline");
-        assert!(is_timed_out(&error), "{error}");
+        assert!(
+            is_timed_out(error.message()),
+            "{error}",
+            error = error.message()
+        );
         assert!(
             waited < crate::test_support::coverage_relaxed(Duration::from_millis(1900)),
             "{waited:?}"
@@ -11002,10 +11176,14 @@ mod tests {
                 .collect();
             rig.wait_for_joins(12);
             rig.release();
-            assert!(is_timed_out(&leader.join().unwrap().0.expect_err("leader")));
+            assert!(is_timed_out(
+                leader.join().unwrap().0.expect_err("leader").message()
+            ));
             for joiner in joiners {
                 let (joined, _) = joiner.join().unwrap();
-                assert!(is_timed_out(&joined.expect_err("every rerun hung")));
+                assert!(is_timed_out(
+                    joined.expect_err("every rerun hung").message()
+                ));
             }
             let started = std::fs::read_to_string(rig.cwd.join("pids")).unwrap();
             assert_eq!(
@@ -11028,7 +11206,9 @@ mod tests {
         let joiner = rig.read(script, Duration::from_secs(10));
         rig.wait_for_joins(1);
         rig.release();
-        assert!(is_timed_out(&leader.join().unwrap().0.expect_err("leader")));
+        assert!(is_timed_out(
+            leader.join().unwrap().0.expect_err("leader").message()
+        ));
         assert!(joiner.join().unwrap().0.expect("rerun").success);
         let counters = rig.gate.counters()[super::Admission::Reactive.index()];
         assert_eq!(counters.admitted, 3, "the rig's held slot and two children");
@@ -11085,9 +11265,17 @@ mod tests {
         let started = Instant::now();
         let error =
             git_text_shared(&repo, &["commit", "--allow-empty", "-m", "x"]).expect_err("cancelled");
-        assert!(marker.exists(), "the hook never ran: {error}");
+        assert!(
+            marker.exists(),
+            "the hook never ran: {error}",
+            error = error.message()
+        );
         assert_eq!(canceller.join().unwrap(), 1, "the run was registered");
-        assert!(is_hooked_git_cancelled(&error), "{error}");
+        assert!(
+            is_hooked_git_cancelled(error.message()),
+            "{error}",
+            error = error.message()
+        );
         assert!(
             started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(15)),
             "{:?}",
@@ -11141,18 +11329,23 @@ mod tests {
         );
         for error in &refusals {
             let reported: f64 = error
+                .message()
                 .split(" deferred under load after ")
                 .nth(1)
                 .and_then(|rest| rest.split('s').next())
                 .and_then(|number| number.parse().ok())
-                .unwrap_or_else(|| panic!("no deferral and wait in {error}"));
+                .unwrap_or_else(|| {
+                    panic!("no deferral and wait in {error}", error = error.message())
+                });
             assert!(
                 (1.5..6.0).contains(&reported),
-                "reported {reported}s from {error}; the command deadline is 30s"
+                "reported {reported}s from {error}; the command deadline is 30s",
+                error = error.message()
             );
             assert!(
                 !error.contains(TIMEOUT_MARKER),
-                "a deferral is not a timeout: {error}"
+                "a deferral is not a timeout: {error}",
+                error = error.message()
             );
         }
     }
@@ -11226,7 +11419,7 @@ mod tests {
         let error = result
             .expect("stdin must have a bounded settle window")
             .expect_err("undelivered stdin cannot report success");
-        assert!(error.contains("stdin"), "{error}");
+        assert!(error.contains("stdin"), "{error}", error = error.message());
     }
 
     #[cfg(unix)]
@@ -11505,7 +11698,7 @@ mod tests {
         let raw = dir.path().to_string_lossy().into_owned();
         let err = sandbox_write(&raw, "link/sub.txt", "escaped")
             .expect_err("write through a directory symlink must fail");
-        assert!(err.contains("escapes"), "got: {err}");
+        assert!(err.contains("escapes"), "got: {err}", err = err.message());
         assert!(
             !outside.path().join("sub.txt").exists(),
             "nothing may be written through the link"
@@ -11530,11 +11723,11 @@ mod tests {
         dir: &Path,
         file: &str,
         edit: impl Fn(&str) -> String,
-    ) -> Result<(), String> {
+    ) -> Result<(), CommandError> {
         let raw = dir.to_string_lossy().into_owned();
         let blob = crate::engine::GitReader::get_file_blob(&raw, file, None)?;
         let shown = textarea_value(blob.text.as_deref().expect("text file"));
-        sandbox_write_edited_text(&raw, file, &edit(&shown))
+        sandbox_write_edited_text(&raw, file, &edit(&shown)).map_err(CommandError::from)
     }
 
     #[test]
@@ -11589,7 +11782,8 @@ mod tests {
             .expect_err("a lossy decode must not be saved");
         assert!(
             err.contains("2 byte(s)") && err.contains("not valid UTF-8"),
-            "got: {err}"
+            "got: {err}",
+            err = err.message()
         );
 
         assert_eq!(
@@ -11611,7 +11805,11 @@ mod tests {
 
         let err = editor_round_trip(dir.path(), "mixed.txt", |text| text.replace("two", "TWO"))
             .expect_err("mixed endings cannot be kept per line");
-        assert!(err.contains("mixes line endings"), "got: {err}");
+        assert!(
+            err.contains("mixes line endings"),
+            "got: {err}",
+            err = err.message()
+        );
         assert_eq!(
             std::fs::read(dir.path().join("mixed.txt")).unwrap(),
             original
@@ -12033,7 +12231,8 @@ mod tests {
         assert!(!repo.join(".modules/sub/hooks/pre-commit").exists());
         // A neighbouring ordinary file and the nested work tree stay writable.
         for target in ["sub/lib.txt", ".modules/notes.txt", "sub/new.txt"] {
-            sandbox_join_write(repo, target).unwrap_or_else(|e| panic!("{target}: {e}"));
+            sandbox_join_write(repo, target)
+                .unwrap_or_else(|e| panic!("{target}: {e}", e = e.message()));
         }
         sandbox_write(&raw, "sub/lib.txt", "y\n").unwrap();
     }
@@ -12516,7 +12715,7 @@ mod tests {
         stream: &[u8],
         ids: &[&str],
         cut: Option<&str>,
-    ) -> HashMap<String, Result<usize, String>> {
+    ) -> HashMap<String, Result<usize, CommandError>> {
         const OBJECT: BatchObject = BatchObject {
             kind: "commit",
             noun: "commit",
@@ -13029,7 +13228,7 @@ mod admission_scope_tests {
         assert!(report.contains(&path.display().to_string()), "{report}");
     }
 
-    fn deferral() -> String {
+    fn deferral() -> CommandError {
         refusal_message(
             "git status",
             Refusal::Refused {
@@ -13040,27 +13239,36 @@ mod admission_scope_tests {
 
     #[test]
     fn a_read_commands_deferral_stays_retryable() {
-        let out: Result<(), String> = run_command_scope(|| Err(deferral()));
-        assert!(is_deferred_under_load(&out.unwrap_err()));
+        let out: Result<(), CommandError> = run_command_scope(|| Err(deferral()));
+        assert!(is_deferred_under_load(out.unwrap_err().message()));
     }
 
     #[test]
     fn a_user_actions_deferral_is_never_handed_out_as_retryable() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().to_str().unwrap().to_string();
-        let out: Result<(), String> = run_command_scope(|| {
+        let out: Result<(), CommandError> = run_command_scope(|| {
             mark_user_action(&repo);
             Err(deferral())
         });
         let message = out.unwrap_err();
-        assert!(!is_deferred_under_load(&message), "{message}");
+        assert!(
+            !is_deferred_under_load(message.message()),
+            "{message}",
+            message = message.message()
+        );
         assert!(
             message.contains("deferred under load"),
-            "the cause stays: {message}"
+            "the cause stays: {message}",
+            message = message.message()
         );
-        assert!(message.contains("2.013"), "{message}");
+        assert!(
+            message.contains("2.013"),
+            "{message}",
+            message = message.message()
+        );
         // Other failures pass through untouched.
-        let plain: Result<(), String> = run_command_scope(|| {
+        let plain: Result<(), CommandError> = run_command_scope(|| {
             mark_user_action(&repo);
             Err("fatal: bad revision".into())
         });
@@ -13073,7 +13281,7 @@ mod admission_scope_tests {
         let repo = dir.path().to_str().unwrap().to_string();
         assert_eq!(current_admission(), Admission::Reactive);
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _: Result<(), String> = run_command_scope(|| {
+            let _: Result<(), CommandError> = run_command_scope(|| {
                 mark_user_action(&repo);
                 panic!("expected");
             });
@@ -13087,7 +13295,7 @@ mod admission_scope_tests {
     }
 
     #[cfg(unix)]
-    fn reactive_spawn_in(gate: &'static SpawnGate, cwd: &Path) -> Result<BoundedRun, String> {
+    fn reactive_spawn_in(gate: &'static SpawnGate, cwd: &Path) -> Result<BoundedRun, CommandError> {
         let mut cmd = Command::new("/bin/sh");
         cmd.args(["-c", "true"]).current_dir(cwd);
         run_with_gate(
@@ -13113,23 +13321,24 @@ mod admission_scope_tests {
         reactive_spawn_in(gate, &repo).expect("the one token");
         let starved = reactive_spawn_in(gate, &repo).unwrap_err();
         assert!(
-            is_deferred_under_load(&starved) || is_slot_wait_timeout(&starved),
-            "{starved}"
+            is_deferred_under_load(starved.message()) || is_slot_wait_timeout(starved.message()),
+            "{starved}",
+            starved = starved.message()
         );
 
-        let acted: Result<(), String> = run_command_scope(|| {
+        let acted: Result<(), CommandError> = run_command_scope(|| {
             mark_user_action(repo.to_str().unwrap());
             Ok(())
         });
         acted.unwrap();
         // The credit is per repository, and a read command never earns one.
-        let read: Result<(), String> = run_command_scope(|| Ok(()));
+        let read: Result<(), CommandError> = run_command_scope(|| Ok(()));
         read.unwrap();
         assert!(reactive_spawn_in(gate, &other).is_err());
         hold_credit_open(&repo);
         for i in 0..POST_ACTION_CREDIT_SPAWNS {
             reactive_spawn_in(gate, &repo)
-                .unwrap_or_else(|e| panic!("credited spawn {i} refused: {e}"));
+                .unwrap_or_else(|e| panic!("credited spawn {i} refused: {e}", e = e.message()));
         }
         // Spent, and the bucket cannot refill: nothing more is admitted.
         let extra = (0..6)
@@ -13157,7 +13366,7 @@ mod admission_scope_tests {
         hold_credit_open(&repo);
         for i in 0..POST_ACTION_CREDIT_SPAWNS {
             reactive_spawn_in(gate, &repo)
-                .unwrap_or_else(|e| panic!("activation read {i} refused: {e}"));
+                .unwrap_or_else(|e| panic!("activation read {i} refused: {e}", e = e.message()));
         }
     }
 
@@ -13195,7 +13404,11 @@ mod admission_scope_tests {
             .expect("git init");
         assert!(status.success());
         let refused = note_tab_activated(untrusted.to_str().unwrap()).unwrap_err();
-        assert!(crate::repository_trust::refused(&refused), "{refused}");
+        assert!(
+            crate::repository_trust::refused(refused.message()),
+            "{refused}",
+            refused = refused.message()
+        );
         assert!(!take_post_action_credit(&untrusted, Instant::now()));
 
         let missing = untrusted.join("gone");
@@ -13238,7 +13451,7 @@ mod admission_scope_tests {
             (process_failures() - before, last_process_failure())
         });
         assert_eq!(failures, 1);
-        assert!(message.unwrap_or_default().contains("forced by test"));
+        assert!(message.is_some_and(|message| message.contains("forced by test")));
     }
 }
 

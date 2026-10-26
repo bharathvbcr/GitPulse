@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::codeintel::WalkBounds;
+use crate::ipc_error::CommandError;
 
 // --- code intelligence (devmap in-process) ----------------------------
 
@@ -157,6 +158,7 @@ pub async fn cmd_codeintel_neighbors(
             min_rung.as_deref(),
             WalkBounds::default(),
         )
+        .map_err(CommandError::from)
     })
     .await
 }
@@ -293,7 +295,7 @@ pub async fn cmd_codeintel_cancel(cancel_token: String) -> Result<bool, IpcError
 pub async fn cmd_devmap_build(repo_path: String) -> Result<crate::devmap::BuildOutcome, IpcError> {
     off_thread(move || {
         crate::devmap::clear_live_echo_cooldown(&repo_path);
-        crate::devmap::build(&repo_path)
+        crate::devmap::build(&repo_path).map_err(CommandError::from)
     })
     .await
 }
@@ -305,7 +307,7 @@ pub async fn cmd_devmap_refresh(
 ) -> Result<crate::devmap::BuildOutcome, IpcError> {
     off_thread(move || {
         crate::devmap::clear_live_echo_cooldown(&repo_path);
-        crate::devmap::refresh(&repo_path)
+        crate::devmap::refresh(&repo_path).map_err(CommandError::from)
     })
     .await
 }
@@ -432,6 +434,7 @@ pub async fn cmd_workspace_register(
 ) -> Result<crate::workspace_registry::WorkspaceRegisterResult, IpcError> {
     off_thread(move || {
         crate::workspace_registry::register(&registry_root, &repo_path, name.as_deref())
+            .map_err(CommandError::from)
     })
     .await
 }
@@ -442,7 +445,10 @@ pub async fn cmd_workspace_unregister(
     registry_root: String,
     name: String,
 ) -> Result<crate::workspace_registry::WorkspaceUnregisterResult, IpcError> {
-    off_thread(move || crate::workspace_registry::unregister(&registry_root, &name)).await
+    off_thread(move || {
+        crate::workspace_registry::unregister(&registry_root, &name).map_err(CommandError::from)
+    })
+    .await
 }
 
 /// List repositories in the workspace registry.
@@ -450,7 +456,8 @@ pub async fn cmd_workspace_unregister(
 pub async fn cmd_workspace_list(
     registry_root: String,
 ) -> Result<crate::workspace_registry::WorkspaceSnapshot, IpcError> {
-    off_thread(move || crate::workspace_registry::list(&registry_root)).await
+    off_thread(move || crate::workspace_registry::list(&registry_root).map_err(CommandError::from))
+        .await
 }
 
 /// Initialize one opened repository for DevCouncil: ignore hygiene for the
@@ -464,7 +471,10 @@ pub async fn cmd_devcouncil_init(
     repo_path: String,
     open_repos: Vec<String>,
 ) -> Result<crate::devmap::InitReport, IpcError> {
-    off_thread(move || crate::devmap::initialize_repository(&repo_path, &open_repos)).await
+    off_thread(move || {
+        crate::devmap::initialize_repository(&repo_path, &open_repos).map_err(CommandError::from)
+    })
+    .await
 }
 
 /// What of DevCouncil is installed, plus the installation warnings `devmap
@@ -524,7 +534,11 @@ pub async fn cmd_workspace_sync(
     registry_root: String,
     repo_paths: Vec<String>,
 ) -> Result<crate::workspace_registry::WorkspaceSnapshot, IpcError> {
-    off_thread(move || crate::workspace_registry::sync_open_tabs(&registry_root, &repo_paths)).await
+    off_thread(move || {
+        crate::workspace_registry::sync_open_tabs(&registry_root, &repo_paths)
+            .map_err(CommandError::from)
+    })
+    .await
 }
 
 /// Cross-repo symbol search. `semantic: true` uses TF-IDF name ranking — not AI.
@@ -542,6 +556,7 @@ pub async fn cmd_workspace_search(
             token_budget,
             semantic.unwrap_or(false),
         )
+        .map_err(CommandError::from)
     })
     .await
 }
@@ -551,7 +566,10 @@ pub async fn cmd_workspace_search(
 pub async fn cmd_workspace_link_candidates(
     registry_root: String,
 ) -> Result<crate::workspace_registry::WorkspaceLinksResult, IpcError> {
-    off_thread(move || crate::workspace_registry::link_candidates(&registry_root)).await
+    off_thread(move || {
+        crate::workspace_registry::link_candidates(&registry_root).map_err(CommandError::from)
+    })
+    .await
 }
 
 /// One-shot Work-view snapshot: worktrees, agent sessions, collisions, ledger, code graph.
@@ -603,6 +621,7 @@ pub async fn cmd_fleet_record_metrics(
         let repo = validate_repo(&repo_path)?;
         crate::ledger::save_fleet_metrics(&repo.to_string_lossy(), &metrics)
             .map_err(|e| e.to_string())
+            .map_err(CommandError::from)
     })
     .await
 }

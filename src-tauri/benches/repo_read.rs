@@ -80,7 +80,11 @@ fn main() {
 
     let status = |repo: &Repo| {
         GitReader::get_status(repo.path()).unwrap_or_else(|error| {
-            panic!("get_status failed on {}: {error}", repo.path());
+            panic!(
+                "get_status failed on {}: {error}",
+                repo.path(),
+                error = error.message()
+            );
         })
     };
 

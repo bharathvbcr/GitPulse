@@ -8,6 +8,7 @@
 //! itself. The desktop is the only IPC surface that can grant trust; MCP and
 //! repository-local policy cannot.
 
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -187,7 +188,7 @@ fn sessions() -> &'static Mutex<HashMap<PathBuf, Grant>> {
     GRANTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn directory(path: &Path) -> Result<DirectoryIdentity, String> {
+fn directory(path: &Path) -> Result<DirectoryIdentity, CommandError> {
     let path = path
         .canonicalize()
         .map_err(|e| format!("Cannot resolve {}: {e}", path.display()))?;
@@ -200,7 +201,7 @@ fn directory(path: &Path) -> Result<DirectoryIdentity, String> {
     let metadata =
         fs::metadata(&path).map_err(|e| format!("Cannot inspect {}: {e}", path.display()))?;
     if !metadata.is_dir() {
-        return Err(format!("Not a directory: {}", path.display()));
+        return Err(format!("Not a directory: {}", path.display()).into());
     }
     // Birth time distinguishes a replacement even when an inode is recycled.
     // Filesystems that cannot supply identity fail closed rather than creating
@@ -232,7 +233,7 @@ fn directory(path: &Path) -> Result<DirectoryIdentity, String> {
 
 /// Reads a regular file of at most `limit` bytes, refusing a larger one rather
 /// than returning a prefix, and refusing anything that is not a regular file.
-pub(crate) fn bounded_text(path: &Path, limit: u64) -> Result<String, String> {
+pub(crate) fn bounded_text(path: &Path, limit: u64) -> Result<String, CommandError> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -245,19 +246,19 @@ pub(crate) fn bounded_text(path: &Path, limit: u64) -> Result<String, String> {
         .open(path)
         .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
     if !file.metadata().map_err(|e| e.to_string())?.is_file() {
-        return Err(format!("Expected a regular file: {}", path.display()));
+        return Err(format!("Expected a regular file: {}", path.display()).into());
     }
     let mut text = String::new();
     file.take(limit + 1)
         .read_to_string(&mut text)
         .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
     if text.len() as u64 > limit {
-        return Err(format!("File exceeds {limit} bytes: {}", path.display()));
+        return Err(format!("File exceeds {limit} bytes: {}", path.display()).into());
     }
     Ok(text)
 }
 
-fn metadata_target(base: &Path, raw: &str) -> Result<PathBuf, String> {
+fn metadata_target(base: &Path, raw: &str) -> Result<PathBuf, CommandError> {
     let raw = raw.trim_end_matches(['\r', '\n']);
     if raw.is_empty() || raw.chars().any(char::is_control) {
         return Err("Invalid Git directory pointer".into());
@@ -270,7 +271,7 @@ fn metadata_target(base: &Path, raw: &str) -> Result<PathBuf, String> {
     })
 }
 
-fn identity(repo_path: &str) -> Result<Identity, String> {
+fn identity(repo_path: &str) -> Result<Identity, CommandError> {
     let checkout = directory(&crate::engine::git_cli::validate_repo_path(repo_path)?)?;
     let dotgit = checkout.path.join(".git");
     let git_path = if dotgit.is_dir() {
@@ -292,7 +293,7 @@ fn identity(repo_path: &str) -> Result<Identity, String> {
             &bounded_text(&common_pointer, MAX_METADATA)?,
         )?)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => git_dir.clone(),
-        Err(error) => return Err(format!("Cannot inspect common Git directory: {error}")),
+        Err(error) => return Err(format!("Cannot inspect common Git directory: {error}").into()),
     };
     if !git_dir.path.join("HEAD").is_file() || !common_dir.path.join("objects").is_dir() {
         return Err("Incomplete Git repository metadata".into());
@@ -390,10 +391,10 @@ fn legacy_record(root: &Path, checkout: &Path) -> PathBuf {
 }
 
 /// Reads a stored record, refusing anything that is not a plain regular file.
-fn stored<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, String> {
+fn stored<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, CommandError> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("Cannot read repository trust: {error}")),
+        Err(error) => return Err(format!("Cannot read repository trust: {error}").into()),
         Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
             return Err("Repository trust record is not a regular file".into())
         }
@@ -402,13 +403,14 @@ fn stored<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, Stri
     serde_json::from_str(&bounded_text(path, MAX_RECORD)?)
         .map(Some)
         .map_err(|e| format!("Invalid repository trust record: {e}"))
+        .map_err(CommandError::from)
 }
 
 /// The `-v1` names the *storage layout* — a directory of per-record JSON files
 /// — which has not changed; what a record contains carries its own version.
 /// Renaming this would orphan the approvals [`legacy_record`] deliberately
 /// still reads, which is the whole of the upgrade path.
-pub(crate) fn persistent_root() -> Result<PathBuf, String> {
+pub(crate) fn persistent_root() -> Result<PathBuf, CommandError> {
     crate::tool_config::default_config_dir()
         .map(|dir| dir.join("repository-trust-v1"))
         .ok_or_else(|| "Cannot resolve GitPulse repository trust storage".into())
@@ -455,7 +457,9 @@ fn legacy_records(root: &Path, checkout: &Path) -> Vec<PathBuf> {
 
 /// Reads the stable filename first. A damaged stable record fails closed;
 /// the previous `DefaultHasher` name is only used when the stable one is absent.
-fn stored_first<T: serde::de::DeserializeOwned>(paths: &[PathBuf]) -> Result<Option<T>, String> {
+fn stored_first<T: serde::de::DeserializeOwned>(
+    paths: &[PathBuf],
+) -> Result<Option<T>, CommandError> {
     for path in paths {
         match stored::<T>(path)? {
             Some(value) => return Ok(Some(value)),
@@ -536,7 +540,7 @@ fn warn_legacy_mismatch(saved: &Identity, current: &Identity) {
     }
 }
 
-fn read_grant(root: &Path, current: &Identity) -> Result<TrustScope, String> {
+fn read_grant(root: &Path, current: &Identity) -> Result<TrustScope, CommandError> {
     if let Some(grant) = stored_first::<Grant>(&repository_records(root, &current.common_dir.path))?
     {
         if covers(&grant, current) {
@@ -560,7 +564,7 @@ fn read_grant(root: &Path, current: &Identity) -> Result<TrustScope, String> {
     }
 }
 
-fn scope(current: &Identity) -> Result<TrustScope, String> {
+fn scope(current: &Identity) -> Result<TrustScope, CommandError> {
     let session = sessions()
         .lock()
         .map_err(|_| "Repository trust state is unavailable")?
@@ -572,7 +576,7 @@ fn scope(current: &Identity) -> Result<TrustScope, String> {
     read_grant(&persistent_root()?, current)
 }
 
-fn trusted(current: &Identity) -> Result<bool, String> {
+fn trusted(current: &Identity) -> Result<bool, CommandError> {
     scope(current).map(TrustScope::admits)
 }
 
@@ -581,7 +585,7 @@ fn trusted(current: &Identity) -> Result<bool, String> {
 /// own store is empty; this mirrors the developer's approvals without writing
 /// to their store.
 #[cfg(test)]
-pub(crate) fn trusted_by_store_at(root: &Path, repo_path: &str) -> Result<bool, String> {
+pub(crate) fn trusted_by_store_at(root: &Path, repo_path: &str) -> Result<bool, CommandError> {
     read_grant(root, &identity(repo_path)?).map(TrustScope::admits)
 }
 
@@ -607,7 +611,7 @@ fn worktree_count(current: &Identity) -> u32 {
     linked.try_into().unwrap_or(u32::MAX).saturating_add(main)
 }
 
-pub fn inspect(repo_path: &str) -> Result<TrustPreview, String> {
+pub fn inspect(repo_path: &str) -> Result<TrustPreview, CommandError> {
     let current = identity(repo_path)?;
     Ok(TrustPreview {
         path: current.checkout.path.to_string_lossy().into_owned(),
@@ -621,13 +625,13 @@ pub fn inspect(repo_path: &str) -> Result<TrustPreview, String> {
 
 /// Metadata-only family resolution must not execute an unapproved sibling's
 /// Git configuration merely to discover a shared ledger or watch directory.
-pub(crate) fn git_directories(repo: &Path) -> Result<(PathBuf, PathBuf), String> {
+pub(crate) fn git_directories(repo: &Path) -> Result<(PathBuf, PathBuf), CommandError> {
     let current = identity(repo.to_str().ok_or("Repository path is not UTF-8")?)?;
     Ok((current.git_dir.path, current.common_dir.path))
 }
 
 /// Require a current grant. Called at admission and again at process spawn.
-pub fn require(repo: &Path) -> Result<(), String> {
+pub fn require(repo: &Path) -> Result<(), CommandError> {
     require_identified(repo).map(|_| ())
 }
 
@@ -638,7 +642,7 @@ pub fn require(repo: &Path) -> Result<(), String> {
 /// will be anchored to. Re-reading the path for that would be one more lookup a
 /// rename could redirect, so the single sample that was approved is the one
 /// that gets compared.
-fn require_identified(repo: &Path) -> Result<Identity, String> {
+fn require_identified(repo: &Path) -> Result<Identity, CommandError> {
     let current = identity(repo.to_str().ok_or("Repository path is not UTF-8")?)?;
     if trusted(&current)? {
         return Ok(current);
@@ -687,14 +691,13 @@ fn require_identified(repo: &Path) -> Result<Identity, String> {
     // The detail names the repository the refusal is about, so a command that
     // touched more than one cannot have the wrong tab flagged: the frontend can
     // compare `detail.path` with the tab it is acting on.
-    Err(crate::ipc_error::typed_text_with_detail(
-        crate::ipc_error::IpcErrorKind::RepositoryTrustRequired,
-        refusal,
-        serde_json::json!({
-            "path": current.checkout.path.display().to_string(),
-            "common_dir": current.common_dir.path.display().to_string(),
-        }),
-    ))
+    let kind = crate::ipc_error::IpcErrorKind::RepositoryTrustRequired;
+    let detail = serde_json::json!({
+        "path": current.checkout.path.display().to_string(),
+        "common_dir": current.common_dir.path.display().to_string(),
+    });
+    let refusal = crate::ipc_error::typed_text_with_detail(kind, refusal, detail.clone());
+    Err(CommandError::typed_with_detail(kind, refusal, detail))
 }
 
 /// Whether this repository's own main checkout carries a pre-repository
@@ -763,7 +766,10 @@ pub fn refused(message: &str) -> bool {
 /// survives it and the repository is trusted again. One lock around each whole
 /// act makes them take turns. It is an `flock` on a hidden file inside the
 /// directory, so another process (a second app instance) takes turns too.
-fn with_store_lock<T>(root: &Path, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+fn with_store_lock<T>(
+    root: &Path,
+    f: impl FnOnce() -> Result<T, CommandError>,
+) -> Result<T, CommandError> {
     // Windows has no `flock` here, so threads of one process take turns on a
     // process-wide mutex instead; Unix needs only the file lock, which already
     // separates two descriptors in one process, and must not serialise
@@ -776,11 +782,11 @@ fn with_store_lock<T>(root: &Path, f: impl FnOnce() -> Result<T, String>) -> Res
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     };
     let _file = lock_directory(root)?;
-    f()
+    f().map_err(CommandError::from)
 }
 
 #[cfg(unix)]
-fn lock_directory(root: &Path) -> Result<Option<File>, String> {
+fn lock_directory(root: &Path) -> Result<Option<File>, CommandError> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
     let lock = match OpenOptions::new()
@@ -794,7 +800,7 @@ fn lock_directory(root: &Path) -> Result<Option<File>, String> {
         Ok(file) => file,
         // A directory that is not there holds no records to race over.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("Cannot lock repository trust storage: {error}")),
+        Err(error) => return Err(format!("Cannot lock repository trust storage: {error}").into()),
     };
     loop {
         // SAFETY: the descriptor is open for the duration of the call.
@@ -803,13 +809,13 @@ fn lock_directory(root: &Path) -> Result<Option<File>, String> {
         }
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(format!("Cannot lock repository trust storage: {error}"));
+            return Err(format!("Cannot lock repository trust storage: {error}").into());
         }
     }
 }
 
 #[cfg(not(unix))]
-fn lock_directory(_root: &Path) -> Result<Option<File>, String> {
+fn lock_directory(_root: &Path) -> Result<Option<File>, CommandError> {
     Ok(None)
 }
 
@@ -871,12 +877,12 @@ fn rename_no_replace(source: &Path, dest: &Path) -> std::io::Result<()> {
     fs::remove_file(source)
 }
 
-fn save_grant(root: &Path, current: &Grant) -> Result<(), String> {
+fn save_grant(root: &Path, current: &Grant) -> Result<(), CommandError> {
     fs::create_dir_all(root).map_err(|e| format!("Cannot create repository trust storage: {e}"))?;
     with_store_lock(root, || save_grant_locked(root, current))
 }
 
-fn save_grant_locked(root: &Path, current: &Grant) -> Result<(), String> {
+fn save_grant_locked(root: &Path, current: &Grant) -> Result<(), CommandError> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let path = repository_record(root, &current.repository.path);
@@ -927,7 +933,7 @@ fn save_grant_locked(root: &Path, current: &Grant) -> Result<(), String> {
 /// The exact inspected identity must accompany a deliberate approval. A
 /// session grant is useful to callers with an in-process approval UI and tests;
 /// it uses the same identity checks and never grants another process authority.
-pub fn grant(repo_path: &str, expected_identity: &str, remember: bool) -> Result<(), String> {
+pub fn grant(repo_path: &str, expected_identity: &str, remember: bool) -> Result<(), CommandError> {
     if expected_identity.len() as u64 > MAX_RECORD {
         return Err("Repository identity is too large".into());
     }
@@ -967,7 +973,7 @@ pub fn grant_confirmed(
     repo_path: &str,
     expected_identity: &str,
     confirm: &dyn Fn(&str, &str) -> bool,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     let preview = inspect(repo_path)?;
     let message = format!(
         "Trust the repository at:\n\n{}\n\nGitPulse and its agents will be allowed to run \
@@ -998,11 +1004,11 @@ fn default_hasher_digest(path: &Path) -> u64 {
 /// record stay where they are. A stable name that already holds a different
 /// repository's record is not replaced. The desktop calls this once, off the
 /// main thread. MCP and `gitpulsed` stay read-only and must not call it.
-pub fn migrate_store(root: &Path) -> Result<(), String> {
+pub fn migrate_store(root: &Path) -> Result<(), CommandError> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("Cannot migrate repository trust: {error}")),
+        Err(error) => return Err(format!("Cannot migrate repository trust: {error}").into()),
     };
     // Snapshot first. Renaming while `read_dir` is still yielding is
     // unspecified, and a migrated name would otherwise be visited twice or
@@ -1026,7 +1032,7 @@ pub fn migrate_store(root: &Path) -> Result<(), String> {
         }
         Ok(())
     }) {
-        log::warn!(target: "trust", "repository trust migration did not run: {error}");
+        log::warn!(target: "trust", "repository trust migration did not run: {error}", error = error.message());
     }
     if stopped_early {
         log::warn!(
@@ -1090,7 +1096,7 @@ fn migrate_entry(root: &Path, path: &Path) {
             log::warn!(
                 target: "trust",
                 "skipping unreadable repository trust entry {}: {error}",
-                path.display()
+                path.display(), error = error.message()
             );
         }
     }
@@ -1124,11 +1130,11 @@ fn relocate_record(source: &Path, dest: &Path) {
 /// tree approved because it was approved under an older scheme, or before its
 /// siblings, would make "revoked" mean "revoked except where you forgot" —
 /// so every record naming this repository goes, not only the one keyed by it.
-pub fn revoke(repo_path: &str) -> Result<(), String> {
+pub fn revoke(repo_path: &str) -> Result<(), CommandError> {
     revoke_at(&persistent_root()?, repo_path)
 }
 
-fn revoke_at(root: &Path, repo_path: &str) -> Result<(), String> {
+fn revoke_at(root: &Path, repo_path: &str) -> Result<(), CommandError> {
     let repo = crate::engine::git_cli::validate_repo_path(repo_path)?;
     // A checkout that has already been removed cannot name its family any
     // more; revoking then falls back to the path itself, which is all that is
@@ -1149,11 +1155,15 @@ fn revoke_at(root: &Path, repo_path: &str) -> Result<(), String> {
 /// is one [`read_grant`] cannot parse either, so it authorizes nothing and
 /// removing it would only be tidying. A directory that cannot be listed is a
 /// different matter — the revocation would be silently partial, so it fails.
-fn forget_records(root: &Path, repository: Option<&Path>, checkout: &Path) -> Result<(), String> {
+fn forget_records(
+    root: &Path,
+    repository: Option<&Path>,
+    checkout: &Path,
+) -> Result<(), CommandError> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("Cannot revoke repository trust: {error}")),
+        Err(error) => return Err(format!("Cannot revoke repository trust: {error}").into()),
     };
     for entry in entries {
         let path = entry
@@ -1178,7 +1188,7 @@ fn forget_records(root: &Path, repository: Option<&Path>, checkout: &Path) -> Re
         }
         if let Err(error) = fs::remove_file(&path) {
             if error.kind() != std::io::ErrorKind::NotFound {
-                return Err(format!("Cannot revoke repository trust: {error}"));
+                return Err(format!("Cannot revoke repository trust: {error}").into());
             }
         }
     }
@@ -1212,7 +1222,7 @@ pub(crate) struct AdmittedCwd {
 /// directory is pinned, not only one already inside a repository — otherwise
 /// the same substitution turns an unremarkable working directory into a
 /// repository after the point where admission decided none was involved.
-pub(crate) fn check_command(cmd: &mut std::process::Command) -> Result<AdmittedCwd, String> {
+pub(crate) fn check_command(cmd: &mut std::process::Command) -> Result<AdmittedCwd, CommandError> {
     if cmd.get_current_dir().is_none() {
         let executable = std::env::current_exe()
             .and_then(|path| path.canonicalize())
@@ -1237,7 +1247,7 @@ pub(crate) fn check_command(cmd: &mut std::process::Command) -> Result<AdmittedC
 /// exactly it, and they differ only in what they can do about a path that
 /// another principal could still substitute afterwards.
 #[cfg(unix)]
-fn pin_and_admit(cwd: &Path) -> Result<crate::fs_entry::PinnedDir, String> {
+fn pin_and_admit(cwd: &Path) -> Result<crate::fs_entry::PinnedDir, CommandError> {
     use std::os::unix::fs::MetadataExt;
     // Canonicalize first. A canonical path holds no symlink by construction,
     // so the no-follow walk below accepts every legitimate location — macOS
@@ -1297,7 +1307,7 @@ fn pin_and_admit(cwd: &Path) -> Result<crate::fs_entry::PinnedDir, String> {
 /// long-lived interactive session in a directory that may have been swapped
 /// between approval and launch is the one outcome the gate exists to prevent,
 /// and there is no correcting hook to fall back on.
-pub(crate) fn require_unsubstitutable_dir(dir: &Path) -> Result<AdmittedCwd, String> {
+pub(crate) fn require_unsubstitutable_dir(dir: &Path) -> Result<AdmittedCwd, CommandError> {
     #[cfg(unix)]
     {
         let pinned = pin_and_admit(dir)?;
@@ -1309,7 +1319,8 @@ pub(crate) fn require_unsubstitutable_dir(dir: &Path) -> Result<AdmittedCwd, Str
                  and other write access from that directory, or set its sticky bit.",
                 dir.display(),
                 holder.display()
-            ));
+            )
+            .into());
         }
         Ok(AdmittedCwd {})
     }
@@ -1331,7 +1342,10 @@ pub(crate) fn require_unsubstitutable_dir(dir: &Path) -> Result<AdmittedCwd, Str
 /// component moved between the two resolutions and neither answer describes
 /// what would run.
 #[cfg(unix)]
-fn admit_directory(cmd: &mut std::process::Command, cwd: &Path) -> Result<AdmittedCwd, String> {
+fn admit_directory(
+    cmd: &mut std::process::Command,
+    cwd: &Path,
+) -> Result<AdmittedCwd, CommandError> {
     use std::os::fd::AsRawFd;
     use std::os::unix::process::CommandExt;
     let pinned = pin_and_admit(cwd)?;
@@ -1362,12 +1376,15 @@ fn admit_directory(cmd: &mut std::process::Command, cwd: &Path) -> Result<Admitt
 }
 
 #[cfg(windows)]
-fn admit_directory(_cmd: &mut std::process::Command, cwd: &Path) -> Result<AdmittedCwd, String> {
+fn admit_directory(
+    _cmd: &mut std::process::Command,
+    cwd: &Path,
+) -> Result<AdmittedCwd, CommandError> {
     admit_directory_windows(cwd)
 }
 
 #[cfg(windows)]
-fn admit_directory_windows(cwd: &Path) -> Result<AdmittedCwd, String> {
+fn admit_directory_windows(cwd: &Path) -> Result<AdmittedCwd, CommandError> {
     // Canonical first, for the reason the Unix arm gives: `pin_directory`
     // refuses a reparse point, and a junction anywhere in the caller's spelling
     // is ordinary, not hostile.
@@ -1398,7 +1415,10 @@ fn admit_directory_windows(cwd: &Path) -> Result<AdmittedCwd, String> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn admit_directory(_cmd: &mut std::process::Command, _cwd: &Path) -> Result<AdmittedCwd, String> {
+fn admit_directory(
+    _cmd: &mut std::process::Command,
+    _cwd: &Path,
+) -> Result<AdmittedCwd, CommandError> {
     Err("Process admission cannot pin a directory on this platform".into())
 }
 
@@ -1448,7 +1468,11 @@ mod tests {
             false
         })
         .expect_err("declined");
-        assert!(refused.contains("not confirmed"), "{refused}");
+        assert!(
+            refused.contains("not confirmed"),
+            "{refused}",
+            refused = refused.message()
+        );
         assert!(shown.borrow().contains(&inspect(&path).unwrap().path));
         assert!(
             require(repo.path()).is_err(),
@@ -1740,13 +1764,18 @@ mod tests {
         assert!(refusal.contains("linked worktree"));
         assert!(
             !refusal.contains(EXTEND_TRUST_CONTROL),
-            "must not claim an earlier approval that does not exist: {refusal}"
+            "must not claim an earlier approval that does not exist: {refusal}",
+            refusal = refusal.message()
         );
 
         // The main checkout is not a linked worktree, so it never gets the
         // worktree half of the message at all.
         let refusal = require(&main.checkout.path).unwrap_err();
-        assert!(!refusal.contains("linked worktree"), "{refusal}");
+        assert!(
+            !refusal.contains("linked worktree"),
+            "{refusal}",
+            refusal = refusal.message()
+        );
     }
     /// The wire spelling the desktop switches on. A rename here silently turns
     /// every `scope` comparison in `repositoryTrust.ts` into a false, which
@@ -2226,7 +2255,8 @@ mod tests {
                 let _admission = check_command(&mut cmd).unwrap_or_else(|error| {
                     panic!(
                         "attempt {attempt} refused a trusted checkout at {}: {error}",
-                        cwd.display()
+                        cwd.display(),
+                        error = error.message()
                     )
                 });
                 let output = cmd.output_locked().expect("spawn pwd");

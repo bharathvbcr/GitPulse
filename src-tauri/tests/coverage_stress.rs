@@ -559,7 +559,7 @@ fn oversized_git_stream_errors_for_git_text_but_degrades_for_git_text_partial() 
         big.as_bytes(),
     )
     .expect_err("oversized input must be refused before spawning");
-    assert!(error.contains("input/output budget exceeds"), "{error}");
+    assert!(error.contains("input/output budget exceeds"), "{error:?}");
     write(repo.path(), "huge.bin", &big);
     let sha = git_text(repo.path(), &["hash-object", "-w", "huge.bin"])
         .expect("hash-object")

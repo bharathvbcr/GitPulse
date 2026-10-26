@@ -7,6 +7,7 @@
 //! typo behind whatever else is installed.
 
 use crate::engine::git_cli::{self, validate_repo, BoundedRun};
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -491,7 +492,7 @@ fn run_devmap(
     args: &[&str],
     stdin: Option<&[u8]>,
     deadline: Duration,
-) -> Result<BoundedRun, String> {
+) -> Result<BoundedRun, CommandError> {
     let mut cmd = Command::new(&binary.path);
     cmd.current_dir(repo);
     cmd.args(args);
@@ -551,7 +552,7 @@ fn run_devmap(
         });
     diagnostic.finish(&result, protocol_error.as_deref());
     if let Some(error) = protocol_error {
-        return Err(error);
+        return Err(error.into());
     }
     result?.require_complete("devmap")
 }
@@ -567,7 +568,7 @@ pub(super) fn run_devmap_public(
     repo: &Path,
     args: &[&str],
     deadline: Duration,
-) -> Result<BoundedRun, String> {
+) -> Result<BoundedRun, CommandError> {
     run_devmap(binary, repo, args, None, deadline)
 }
 
@@ -602,8 +603,11 @@ pub(super) fn failure_detail(stdout: &str, stderr: &str, fallback: String) -> St
 /// load, or that never spawned did not run out of time; it stays an `Err` so
 /// the caller can tell "never ran" from "hung" (see
 /// [`git_cli::RunError::classify`]).
-fn timed_out_outcome(binary: &ResolvedDevmap, err: String) -> Result<BuildOutcome, String> {
-    if !git_cli::is_run_timeout(&err) {
+fn timed_out_outcome(
+    binary: &ResolvedDevmap,
+    err: CommandError,
+) -> Result<BuildOutcome, CommandError> {
+    if !git_cli::is_run_timeout(err.message()) {
         return Err(err);
     }
     Ok(BuildOutcome {
@@ -612,7 +616,7 @@ fn timed_out_outcome(binary: &ResolvedDevmap, err: String) -> Result<BuildOutcom
         lookup: binary.lookup.clone(),
         exit_code: None,
         stdout: String::new(),
-        stderr: err,
+        stderr: err.into_message(),
         timed_out: true,
         report: None,
     })
@@ -732,7 +736,7 @@ pub struct BuildPermit {
 
 /// Claim `repo_path`'s writer slot, refusing (never queueing) when it is held.
 pub fn claim_build(repo_path: &str) -> Result<BuildPermit, ClaimRefusal> {
-    let repo = validate_repo(repo_path).map_err(ClaimRefusal::Invalid)?;
+    let repo = validate_repo(repo_path).map_err(|e| ClaimRefusal::Invalid(e.into_message()))?;
     let guard = BuildGuard::try_acquire(&repo).map_err(ClaimRefusal::Busy)?;
     Ok(BuildPermit { repo, guard })
 }
@@ -786,7 +790,8 @@ impl PreparedBuild {
             Ok(run) => Ok(build_outcome_from_run(&binary, run)),
             Err(e) => timed_out_outcome(&binary, e),
         };
-        let settled = settle(outcome);
+        // The build's caller reads the text; no kind reaches a command from here.
+        let settled = settle(outcome.map_err(CommandError::into_message));
         drop(guard);
         settled
     }
@@ -924,7 +929,7 @@ pub fn doctor(repo_path: &str) -> DoctorReport {
     };
     let repo = match validate_repo(repo_path) {
         Ok(repo) => repo,
-        Err(e) => return unavailable(e, None),
+        Err(e) => return unavailable(e.into_message(), None),
     };
     let binary = match resolve_binary() {
         Ok(b) => b,
@@ -932,7 +937,7 @@ pub fn doctor(repo_path: &str) -> DoctorReport {
     };
     let run = match run_devmap(&binary, &repo, &["doctor", "--json"], None, STATUS_DEADLINE) {
         Ok(run) => run,
-        Err(e) => return unavailable(e, Some(binary.path)),
+        Err(e) => return unavailable(e.into_message(), Some(binary.path)),
     };
     let stdout = bytes_to_string(run.stdout);
     let stderr = bytes_to_string(run.stderr);
@@ -1065,7 +1070,7 @@ pub fn status(repo_path: &str) -> CliStatus {
                 available: false,
                 binary: None,
                 lookup: None,
-                reason: Some(e),
+                reason: Some(e.into_message()),
                 status: None,
             }
         }
@@ -1089,7 +1094,7 @@ pub fn status(repo_path: &str) -> CliStatus {
                 available: false,
                 binary: Some(binary.path),
                 lookup: Some(binary.lookup),
-                reason: Some(e),
+                reason: Some(e.into_message()),
                 status: None,
             }
         }
@@ -1147,7 +1152,7 @@ pub fn preview(repo_path: &str, file_path: &str, content: &str) -> PreviewFileRe
             return PreviewFileResult {
                 file_path: file_path.to_string(),
                 available: false,
-                reason: Some(e),
+                reason: Some(e.into_message()),
                 report: None,
             }
         }
@@ -1209,7 +1214,7 @@ pub fn preview(repo_path: &str, file_path: &str, content: &str) -> PreviewFileRe
             return PreviewFileResult {
                 file_path: file_path.to_string(),
                 available: false,
-                reason: Some(e),
+                reason: Some(e.into_message()),
                 report: None,
             }
         }
@@ -2377,7 +2382,7 @@ exit 2
             },
         ] {
             let declined = refusal_message("devmap", refusal);
-            devmap.set_status(unavailable_status(&declined));
+            devmap.set_status(unavailable_status(declined.message()));
             let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), true);
             assert_eq!(
                 serde_json::to_value(outcome.decision).unwrap(),
@@ -2385,7 +2390,7 @@ exit 2
                 "{refusal:?}: {outcome:?}"
             );
             assert!(outcome.build.is_none(), "{outcome:?}");
-            assert_eq!(outcome.reason.as_deref(), Some(declined.as_str()));
+            assert_eq!(outcome.reason.as_deref(), Some(declined.message()));
             // Nothing was examined, so nothing may be claimed about the store.
             assert!(
                 !outcome.facts.available && !outcome.facts.is_fresh,
@@ -2415,7 +2420,11 @@ exit 2
 
         let slot = "devmap timed out after 0.5s waiting for a process slot";
         let err = timed_out_outcome(&binary, slot.into()).expect_err("never started");
-        assert!(is_slot_wait_timeout(&err), "{err}");
+        assert!(
+            is_slot_wait_timeout(err.message()),
+            "{err}",
+            err = err.message()
+        );
 
         let deferred = refusal_message(
             "devmap",

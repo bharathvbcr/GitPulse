@@ -47,6 +47,7 @@ pub mod resources;
 pub mod uri;
 pub mod validate;
 
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -1946,7 +1947,9 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             )
             .map_err(workbench_message)
         }
-        name if name.starts_with("devmap_") => devmap_parity::handle(name, arguments),
+        name if name.starts_with("devmap_") => {
+            devmap_parity::handle(name, arguments).map_err(CommandError::into_message)
+        }
         "gitpulse_codeintel_search" => {
             let a: SearchArgs = parse(name, arguments)?;
             Ok(json!(crate::codeintel::search(

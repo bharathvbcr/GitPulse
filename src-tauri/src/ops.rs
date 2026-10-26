@@ -4,6 +4,7 @@
 //! the command gate. Cleanup plans are conservative: only local branches Git
 //! itself reports as merged into the default branch are eligible.
 
+use crate::ipc_error::CommandError;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
@@ -89,7 +90,7 @@ pub struct TagCleanupPlan {
 /// Deliberately no total commit count: two tags on the same lane share commits,
 /// so summing their ahead counts would report more commits than exist. Each row
 /// carries its own exact count instead.
-pub fn tag_cleanup_plan(repo_path: &str) -> Result<TagCleanupPlan, String> {
+pub fn tag_cleanup_plan(repo_path: &str) -> Result<TagCleanupPlan, CommandError> {
     let listed = GitReader::list_tags(repo_path)?;
 
     let mut compared_to: Option<String> = None;
@@ -141,7 +142,7 @@ pub fn tag_cleanup_plan(repo_path: &str) -> Result<TagCleanupPlan, String> {
     })
 }
 
-pub fn branch_cleanup_plan(repo_path: &str) -> Result<BranchCleanupPlan, String> {
+pub fn branch_cleanup_plan(repo_path: &str) -> Result<BranchCleanupPlan, CommandError> {
     let repo = validate_repo(repo_path)?;
     let branches = GitReader::list_branches(repo_path)?;
     let local: Vec<&BranchInfo> = branches.iter().filter(|branch| !branch.is_remote).collect();
@@ -352,7 +353,7 @@ fn analyze_commit_messages(
     }
 }
 
-pub fn review_outgoing_commits(repo_path: &str) -> Result<CommitReviewReport, String> {
+pub fn review_outgoing_commits(repo_path: &str) -> Result<CommitReviewReport, CommandError> {
     let repo = validate_repo(repo_path)?;
     let branches = GitReader::list_branches(repo_path)?;
     let current = branches
@@ -420,7 +421,7 @@ fn release_tag_regex() -> &'static Regex {
     })
 }
 
-pub fn validate_release_tag(tag: &str) -> Result<(), String> {
+pub fn validate_release_tag(tag: &str) -> Result<(), CommandError> {
     if !release_tag_regex().is_match(tag) {
         return Err("Release tag must use vMAJOR.MINOR.PATCH SemVer syntax".into());
     }
@@ -440,7 +441,11 @@ pub struct ReleasePlan {
     pub create_tag: bool,
 }
 
-pub fn prepare_release(repo_path: &str, tag: &str, message: &str) -> Result<ReleasePlan, String> {
+pub fn prepare_release(
+    repo_path: &str,
+    tag: &str,
+    message: &str,
+) -> Result<ReleasePlan, CommandError> {
     validate_release_tag(tag)?;
     let message = message.trim();
     if message.is_empty() {
@@ -450,7 +455,8 @@ pub fn prepare_release(repo_path: &str, tag: &str, message: &str) -> Result<Rele
         return Err(format!(
             "Release message exceeds the {} byte limit",
             MAX_RELEASE_MESSAGE_BYTES
-        ));
+        )
+        .into());
     }
     let repo = validate_repo(repo_path)?;
     if !GitReader::get_status(repo_path)?.is_empty() {

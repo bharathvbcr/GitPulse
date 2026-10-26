@@ -2,6 +2,7 @@
 //! what refuses it, what bounds it, and that nothing else can reach it.
 
 use super::*;
+use crate::ipc_error::CommandError;
 use crate::storage::commit_graph::{inspect, CommitGraphState};
 use crate::test_support::{git_in, git_repo};
 
@@ -63,7 +64,7 @@ fn text(path: &Path) -> String {
 /// A click as the command makes it: the gate promotes the calling thread to a
 /// user action before the writer spawns, so a busy host defers refresh traffic,
 /// not the person's write. Marked per call because the mark is thread-local.
-fn click(repo: &str, confirmed: &[String]) -> Result<CommitGraphWriteOutcome, String> {
+fn click(repo: &str, confirmed: &[String]) -> Result<CommitGraphWriteOutcome, CommandError> {
     crate::engine::git_cli::mark_user_action(repo);
     GitWriter::commit_graph_write(repo, confirmed)
 }
@@ -121,7 +122,11 @@ fn a_click_on_a_repository_without_a_graph_writes_one_and_the_detector_agrees() 
 
     // Hidden when fresh: no plan, no second write.
     let refused = GitWriter::commit_graph_write_plan(&text(&repo)).expect_err("fresh graph");
-    assert!(refused.contains("Present"), "{refused}");
+    assert!(
+        refused.contains("Present"),
+        "{refused}",
+        refused = refused.message()
+    );
 }
 
 #[test]
@@ -146,11 +151,17 @@ fn an_untrusted_repository_is_refused_before_anything_runs() {
     let argv = GitWriter::commit_graph_write_argv();
     for refused in [
         GitWriter::commit_graph_write_plan(&text(&repo)).map(|_| ()),
-        click(&text(&repo), &argv).map(|_| ()),
+        click(&text(&repo), &argv)
+            .map(|_| ())
+            .map_err(CommandError::from),
         GitWriter::commit_graph_write_cancel(&text(&repo)).map(|_| ()),
     ] {
         let error = refused.expect_err("untrusted");
-        assert!(error.contains(crate::repository_trust::REQUIRED), "{error}");
+        assert!(
+            error.contains(crate::repository_trust::REQUIRED),
+            "{error}",
+            error = error.message()
+        );
     }
     assert!(graph_files(&repo).is_empty());
 }
@@ -178,7 +189,11 @@ fn a_command_other_than_the_previewed_one_does_not_run() {
         .to_vec(),
     ] {
         let error = click(&text(&repo), &confirmed).expect_err("mismatch");
-        assert!(error.contains("nothing ran"), "{error}");
+        assert!(
+            error.contains("nothing ran"),
+            "{error}",
+            error = error.message()
+        );
     }
     assert!(graph_files(&repo).is_empty());
 }
@@ -188,7 +203,11 @@ fn a_repository_with_no_history_is_not_offered_a_write() {
     let dir = git_repo();
     let error = GitWriter::commit_graph_write_plan(&text(&dir.path().canonicalize().unwrap()))
         .expect_err("nothing to accelerate");
-    assert!(error.contains("NoHistory"), "{error}");
+    assert!(
+        error.contains("NoHistory"),
+        "{error}",
+        error = error.message()
+    );
 }
 
 #[test]
@@ -235,7 +254,11 @@ fn a_timeout_kills_the_write_and_leaves_no_lock_or_graph() {
         std::time::Duration::from_millis(5),
     )
     .expect_err("a 5 ms budget cannot write 30k commits");
-    assert!(crate::engine::git_cli::is_timed_out(&error), "{error}");
+    assert!(
+        crate::engine::git_cli::is_timed_out(error.message()),
+        "{error}",
+        error = error.message()
+    );
     let common = crate::repository_trust::git_directories(&repo).unwrap().1;
     assert!(commit_graph_locks(&common).is_empty(), "a lock was left");
     assert!(graph_files(&repo).is_empty(), "a partial graph was kept");
@@ -289,11 +312,27 @@ fn a_lock_held_by_another_git_is_never_removed_and_blocks_the_write() {
     std::fs::write(&lock, b"").unwrap();
     let error =
         click(&text(&repo), &GitWriter::commit_graph_write_argv()).expect_err("a held lock");
-    assert!(error.contains("Another git process holds"), "{error}");
+    assert!(
+        error.contains("Another git process holds"),
+        "{error}",
+        error = error.message()
+    );
     // The message names the lock, how old it is and who may delete it.
-    assert!(error.contains(&lock.display().to_string()), "{error}");
-    assert!(error.contains("last modified"), "{error}");
-    assert!(error.contains("delete that file yourself"), "{error}");
+    assert!(
+        error.contains(&lock.display().to_string()),
+        "{error}",
+        error = error.message()
+    );
+    assert!(
+        error.contains("last modified"),
+        "{error}",
+        error = error.message()
+    );
+    assert!(
+        error.contains("delete that file yourself"),
+        "{error}",
+        error = error.message()
+    );
     assert!(lock.exists(), "someone else's lock was removed");
 }
 
@@ -303,11 +342,15 @@ fn an_old_git_is_refused_by_the_plan_and_the_writer_and_nothing_runs() {
     commits(dir.path(), 2);
     let repo = text(&dir.path().canonicalize().unwrap());
     let plan = GitWriter::commit_graph_write_plan_with(&repo, false).expect_err("old git");
-    assert!(plan.contains("2.27"), "{plan}");
+    assert!(plan.contains("2.27"), "{plan}", plan = plan.message());
     let written =
         GitWriter::commit_graph_write_checked(&repo, &GitWriter::commit_graph_write_argv(), false)
             .expect_err("old git");
-    assert!(written.contains("2.27"), "{written}");
+    assert!(
+        written.contains("2.27"),
+        "{written}",
+        written = written.message()
+    );
     assert!(graph_files(&dir.path().canonicalize().unwrap()).is_empty());
     // The same repository is offered the write by a git that can run it.
     GitWriter::commit_graph_write_plan_with(&repo, true).expect("a capable git");
@@ -384,7 +427,11 @@ fn a_running_write_is_reported_and_no_second_write_is_planned() {
         std::thread::sleep(std::time::Duration::from_micros(200));
     }
     let refused = GitWriter::commit_graph_write_plan(&text(&repo)).expect_err("already running");
-    assert!(refused.contains("already running"), "{refused}");
+    assert!(
+        refused.contains("already running"),
+        "{refused}",
+        refused = refused.message()
+    );
     assert_eq!(GitWriter::commit_graph_write_cancel(&text(&repo)), Ok(true));
     let _ = running.join().unwrap();
     assert!(!commit_graph_write_running(&common));
@@ -415,7 +462,11 @@ fn a_partial_clone_is_not_offered_a_write_by_the_detector_or_the_plan() {
     assert_eq!(report.state, CommitGraphState::Unknown, "{report:?}");
     assert!(report.note.unwrap().contains("partial clone"));
     let refused = GitWriter::commit_graph_write_plan(&text(&clone)).expect_err("partial");
-    assert!(refused.contains("partial clone"), "{refused}");
+    assert!(
+        refused.contains("partial clone"),
+        "{refused}",
+        refused = refused.message()
+    );
 }
 
 /// Every non-test source file that names the writer, the command or the

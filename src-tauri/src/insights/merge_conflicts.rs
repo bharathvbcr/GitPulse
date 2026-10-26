@@ -105,16 +105,16 @@ pub(crate) fn merge_conflicts_within(
     let overall = started.checked_add(budget).unwrap_or(started);
     let repo = match validate_repo(repo_path) {
         Ok(repo) => repo,
-        Err(error) => return MergeConflicts::failed(error),
+        Err(error) => return MergeConflicts::failed(error.into_message()),
     };
     let listing = match worktree::list_worktrees_lite(repo_path) {
         Ok(listing) => listing,
-        Err(error) => return MergeConflicts::failed(error),
+        Err(error) => return MergeConflicts::failed(error.into_message()),
     };
     // Told once for the call: a merge in a partial clone would make git fetch
     // blobs, and every pair would say so separately.
     if let Err(reason) = refuse_partial_clone(&repo) {
-        return MergeConflicts::failed(reason);
+        return MergeConflicts::failed(reason.into_message());
     }
     let cut_listing = listing.len() > MAX_MERGE_WORKTREES;
     let lanes: Vec<&WorktreeInfo> = listing

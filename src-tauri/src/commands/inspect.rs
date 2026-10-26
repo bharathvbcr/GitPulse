@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::engine::commit_signature::{verify_commit_signature, CommitSignatureCheck};
+use crate::ipc_error::CommandError;
 
 #[tauri::command(async)]
 pub fn cmd_pick_folder() -> Option<String> {
@@ -212,7 +213,7 @@ pub async fn cmd_syntax_highlight(
     language: String,
     code: String,
 ) -> Result<Vec<crate::syntax::SyntaxHighlightSpan>, IpcError> {
-    off_thread(move || crate::syntax::highlight(&language, &code)).await
+    off_thread(move || crate::syntax::highlight(&language, &code).map_err(CommandError::from)).await
 }
 
 #[tauri::command(async)]

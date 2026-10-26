@@ -15,6 +15,7 @@ mod rename;
 use crate::engine::git_cli::{
     git_text, resolve_git_dir, sandbox_join, sandbox_join_canonical, validate_repo,
 };
+use crate::ipc_error::CommandError;
 use markdev_vault::note::{has_markdown_extension, MARKDOWN_EXTENSIONS};
 use markdev_vault::{Backlink, Graph, GraphQuery, Note, SearchHit, Vault, DEFAULT_MAX_NOTE_BYTES};
 pub use rename::{rename_doc, DocRenameFailure, DocRenameOutcome, DocRenamePlan};
@@ -231,7 +232,7 @@ fn vault_slot(repo: &Path) -> Arc<VaultSlot> {
 /// instead of each running its own after the last, because a scan reads the
 /// files after every request that queued before it started. A failed build
 /// publishes nothing.
-fn load_vault(repo_path: &str, force: bool) -> Result<Arc<CachedVault>, String> {
+fn load_vault(repo_path: &str, force: bool) -> Result<Arc<CachedVault>, CommandError> {
     use std::sync::atomic::Ordering;
     let repo = validate_repo(repo_path)?;
     let slot = vault_slot(&repo);
@@ -289,7 +290,7 @@ pub struct DocsStatus {
 }
 
 /// Builds (or rebuilds) the vault for `repo_path` from tracked markdown files.
-pub fn refresh(repo_path: &str) -> Result<DocsStatus, String> {
+pub fn refresh(repo_path: &str) -> Result<DocsStatus, CommandError> {
     Ok(load_vault(repo_path, true)?.status.clone())
 }
 
@@ -304,19 +305,19 @@ pub fn invalidate(repo_path: &str) {
     cache.remove(&repo);
 }
 
-fn with_vault<T>(repo_path: &str, f: impl FnOnce(&Vault) -> T) -> Result<T, String> {
+fn with_vault<T>(repo_path: &str, f: impl FnOnce(&Vault) -> T) -> Result<T, CommandError> {
     let cached = load_vault(repo_path, false)?;
     Ok(f(&cached.vault))
 }
 
 /// Repo-wide markdown full-text search.
-pub fn search(repo_path: &str, query: &str, limit: usize) -> Result<Vec<SearchHit>, String> {
+pub fn search(repo_path: &str, query: &str, limit: usize) -> Result<Vec<SearchHit>, CommandError> {
     let limit = limit.clamp(1, 200);
     with_vault(repo_path, |vault| vault.search(query, limit))
 }
 
 /// Every unresolved note link in the vault.
-pub fn broken_links(repo_path: &str) -> Result<Vec<BrokenLink>, String> {
+pub fn broken_links(repo_path: &str) -> Result<Vec<BrokenLink>, CommandError> {
     with_vault(repo_path, |vault| {
         vault
             .broken_links()
@@ -327,7 +328,7 @@ pub fn broken_links(repo_path: &str) -> Result<Vec<BrokenLink>, String> {
 }
 
 /// Notes that link at `path`.
-pub fn backlinks(repo_path: &str, path: &str) -> Result<Vec<Backlink>, String> {
+pub fn backlinks(repo_path: &str, path: &str) -> Result<Vec<Backlink>, CommandError> {
     with_vault(repo_path, |vault| vault.backlinks(path))
 }
 
@@ -338,7 +339,7 @@ pub fn graph(
     depth: u32,
     tag: Option<&str>,
     folder: Option<&str>,
-) -> Result<Graph, String> {
+) -> Result<Graph, CommandError> {
     with_vault(repo_path, |vault| {
         let query = GraphQuery {
             focus,
@@ -350,7 +351,7 @@ pub fn graph(
     })
 }
 
-pub fn status(repo_path: &str) -> Result<DocsStatus, String> {
+pub fn status(repo_path: &str) -> Result<DocsStatus, CommandError> {
     // Preserve the actual build's partial/skipped status on a cache hit.
     Ok(load_vault(repo_path, false)?.status.clone())
 }
@@ -381,7 +382,7 @@ fn normalize_rel(path: &str) -> Result<String, String> {
 fn build_vault(
     repo: &Path,
     previous: Option<&Arc<CachedVault>>,
-) -> Result<Arc<CachedVault>, String> {
+) -> Result<Arc<CachedVault>, CommandError> {
     let started = Instant::now();
     let scan_started = scan_clock();
     let previous = previous.filter(|cached| cached.vault.root() == repo);
@@ -649,7 +650,7 @@ fn index_key(repo: &Path) -> Option<(PathBuf, StatKey)> {
 }
 
 /// Tracked markdown paths from `git ls-files`, never a filesystem walk.
-fn list_markdown_paths(repo: &Path) -> Result<Vec<String>, String> {
+fn list_markdown_paths(repo: &Path) -> Result<Vec<String>, CommandError> {
     #[cfg(test)]
     probe::note_listing();
     ls_files_markdown(repo, &[])
@@ -661,11 +662,11 @@ fn list_markdown_paths(repo: &Path) -> Result<Vec<String>, String> {
 /// extension patterns). Only the output stream is bounded, by `git_text`'s cap,
 /// which fails the call when exceeded; unlike the tracked listing there is no
 /// file-count ceiling, since the result is only counted.
-fn list_untracked_markdown_paths(repo: &Path) -> Result<Vec<String>, String> {
+fn list_untracked_markdown_paths(repo: &Path) -> Result<Vec<String>, CommandError> {
     ls_files_markdown(repo, &["--others", "--exclude-standard"])
 }
 
-fn ls_files_markdown(repo: &Path, selection: &[&str]) -> Result<Vec<String>, String> {
+fn ls_files_markdown(repo: &Path, selection: &[&str]) -> Result<Vec<String>, CommandError> {
     let patterns: Vec<String> = MARKDOWN_EXTENSIONS
         .iter()
         .map(|extension| format!(":(icase)*.{extension}"))

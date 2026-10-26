@@ -1,13 +1,17 @@
 //! Merge conflict sessions: snapshot, save, preview.
 
 use super::*;
+use crate::ipc_error::CommandError;
 
 #[tauri::command(async)]
 pub async fn cmd_conflict_snapshot(
     repo_path: String,
     file_path: String,
 ) -> Result<ConflictSnapshot, IpcError> {
-    off_thread(move || conflict_session::snapshot(&repo_path, &file_path)).await
+    off_thread(move || {
+        conflict_session::snapshot(&repo_path, &file_path).map_err(CommandError::from)
+    })
+    .await
 }
 
 #[tauri::command(async)]
@@ -22,6 +26,7 @@ pub async fn cmd_save_conflict(
             |file, op| guard_file(&repo_path, file, op),
             |argv| guard(&repo_path, argv),
         )
+        .map_err(CommandError::from)
     })
     .await
 }
@@ -35,7 +40,7 @@ pub(super) fn save_conflict_folded(
     request: &ConflictSaveRequest,
     judge_file: impl Fn(&str, &str) -> Result<crate::harness::PolicyVerdict, String>,
     judge_command: impl Fn(&[&str]) -> Result<crate::harness::PolicyVerdict, String>,
-) -> Result<Guarded<ConflictSaveOutcome>, String> {
+) -> Result<Guarded<ConflictSaveOutcome>, CommandError> {
     let fold = VerdictFold::default();
     let output = conflict_session::save_with_gate(
         repo_path,

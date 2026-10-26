@@ -320,7 +320,7 @@ pub fn parse_repo_map(text: &str) -> Result<RepoMapDocument, String> {
 pub fn load_repo_map(repo_path: &str) -> RepoMapLoad {
     let repo = match validate_repo(repo_path) {
         Ok(repo) => repo,
-        Err(e) => return RepoMapLoad::unavailable(e, None, None),
+        Err(e) => return RepoMapLoad::unavailable(e.into_message(), None, None),
     };
     let path = repo_map_path(&repo);
     let path_str = path.to_string_lossy().into_owned();

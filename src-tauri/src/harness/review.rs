@@ -13,6 +13,7 @@
 //! alike. A `git merge` typed into some other terminal is not; the record still
 //! shows which ranges were landed without one.
 
+use crate::ipc_error::CommandError;
 use std::path::Path;
 
 use serde_json::{json, Value};
@@ -100,7 +101,10 @@ pub(crate) struct Landed {
 /// attempt's commit by its id, or by a range ending in it, is caught as well as
 /// landing it by name. Every lookup that fails is an error: a gate that could
 /// not tell must not answer "no attempt involved".
-pub(crate) fn attempts_landed(repo: &Path, revisions: &[String]) -> Result<Vec<Landed>, String> {
+pub(crate) fn attempts_landed(
+    repo: &Path,
+    revisions: &[String],
+) -> Result<Vec<Landed>, CommandError> {
     let listing = git_cli::git_text(
         repo,
         &[
@@ -125,7 +129,8 @@ pub(crate) fn attempts_landed(repo: &Path, revisions: &[String]) -> Result<Vec<L
             "this repository has {} attempt branches, more than the {MAX_ATTEMPT_BRANCHES} \
              the review gate judges",
             attempts.len()
-        ));
+        )
+        .into());
     }
     let mut landed: Vec<Landed> = Vec::new();
     for revision in revisions {
@@ -152,7 +157,7 @@ pub(crate) fn attempts_landed(repo: &Path, revisions: &[String]) -> Result<Vec<L
                 &format!("{end}^{{commit}}"),
             ],
         )
-        .map_err(|e| format!("could not resolve {end}: {e}"))?;
+        .map_err(|e| e.wrap(|e| format!("could not resolve {end}: {e}")))?;
         let commit = commit.trim();
         if contains(repo, "HEAD", commit)? {
             continue;
@@ -174,7 +179,7 @@ fn push_unique(landed: &mut Vec<Landed>, attempt: &Landed) {
 
 /// Whether `tip` contains `commit`. Git answers 0 for yes and 1 for no; any
 /// other outcome is an error, not a no.
-pub(crate) fn contains(repo: &Path, tip: &str, commit: &str) -> Result<bool, String> {
+pub(crate) fn contains(repo: &Path, tip: &str, commit: &str) -> Result<bool, CommandError> {
     let run = git_cli::git_captured(repo, &["merge-base", "--is-ancestor", commit, tip])?;
     match (run.cancelled, run.status_code) {
         (false, 0) => Ok(true),
@@ -182,7 +187,8 @@ pub(crate) fn contains(repo: &Path, tip: &str, commit: &str) -> Result<bool, Str
         (_, code) => Err(format!(
             "could not tell whether {tip} contains {commit} (git exited {code}): {}",
             String::from_utf8_lossy(&run.stderr).trim()
-        )),
+        )
+        .into()),
     }
 }
 
@@ -206,7 +212,8 @@ pub(crate) fn gate(repo_path: &str, argv: &[&str]) -> Result<(), Box<super::Poli
     let repo = Path::new(repo_path);
     let target = super::render_command(argv);
     let refuse = |rule: &str, reason: String| refusal(rule, &target, reason);
-    let enabled = common_dir(repo).and_then(|dir| crate::tool_config::review_gate_enabled(&dir));
+    let enabled = common_dir(repo)
+        .and_then(|dir| crate::tool_config::review_gate_enabled(&dir).map_err(CommandError::from));
     if matches!(enabled, Ok(false)) {
         return Ok(());
     }
@@ -218,7 +225,10 @@ pub(crate) fn gate(repo_path: &str, argv: &[&str]) -> Result<(), Box<super::Poli
         Err(error) => {
             return Err(refuse(
                 RULE_UNAVAILABLE,
-                format!("could not tell whether this lands an agent attempt's commits: {error}"),
+                format!(
+                    "could not tell whether this lands an agent attempt's commits: {error}",
+                    error = error.message()
+                ),
             ))
         }
     };
@@ -228,7 +238,7 @@ pub(crate) fn gate(repo_path: &str, argv: &[&str]) -> Result<(), Box<super::Poli
     if let Err(error) = enabled {
         return Err(refuse(
             RULE_UNAVAILABLE,
-            format!("this lands an agent attempt, and whether the review gate is on could not be read: {error}"),
+            format!("this lands an agent attempt, and whether the review gate is on could not be read: {error}", error = error.message()),
         ));
     }
     let state = crate::workbench::review::store();
@@ -338,7 +348,7 @@ fn refusal(rule: &str, target: &str, reason: String) -> Box<super::PolicyVerdict
 
 /// The key the review gate setting is stored under: the repository's
 /// canonical common Git directory, shared by every linked worktree.
-pub(crate) fn common_dir(repo: &Path) -> Result<String, String> {
+pub(crate) fn common_dir(repo: &Path) -> Result<String, CommandError> {
     let dir = git_cli::resolve_git_common_dir(repo)?;
     let dir = dir.canonicalize().unwrap_or(dir);
     Ok(dir.to_string_lossy().into_owned())
@@ -352,7 +362,7 @@ pub(crate) fn review_payload(
     branch: &str,
     base_oid: &str,
     head_oid: &str,
-) -> Result<Value, String> {
+) -> Result<Value, CommandError> {
     let range = format!("{base_oid}..{head_oid}");
     let names = git_cli::git_text(repo, &["diff", "--name-only", "-z", &range])?;
     let files_changed = names.split('\0').filter(|name| !name.is_empty()).count();

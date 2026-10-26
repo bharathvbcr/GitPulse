@@ -39,6 +39,7 @@ pub mod apphosting;
 use crate::engine::git_cli::{
     capture_command, sandbox_join_canonical, validate_repo, CapturedOutput,
 };
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -241,7 +242,10 @@ pub fn firebase_cli_probe() -> FirebaseCliProbe {
             program,
             version: None,
             reason: Some(if overridden {
-                format!("{FIREBASE_BIN_ENV} is set but could not be run: {error}")
+                format!(
+                    "{FIREBASE_BIN_ENV} is set but could not be run: {error}",
+                    error = error.message()
+                )
             } else {
                 // Naming the nvm case here is the difference between a user
                 // reinstalling a tool they already have and one setting an
@@ -249,7 +253,8 @@ pub fn firebase_cli_probe() -> FirebaseCliProbe {
                 format!(
                     "The Firebase CLI could not be run ({error}). If it is installed under nvm, \
                      fnm or volta, a windowed launch does not inherit that PATH — set \
-                     {FIREBASE_BIN_ENV} to its absolute path."
+                     {FIREBASE_BIN_ENV} to its absolute path.",
+                    error = error.message()
                 )
             }),
         },
@@ -303,7 +308,7 @@ const ROLLOUTS_GROUP_HELP: &[&str] = &["apphosting:rollouts", "--help"];
 
 fn probe_rollout_listing(cli_present: bool) -> FirebaseCapability {
     probe_rollout_listing_with(cli_present, |program, args| {
-        capture_command(program, args, None, PROBE_TIMEOUT, &[])
+        capture_command(program, args, None, PROBE_TIMEOUT, &[]).map_err(CommandError::into_message)
     })
 }
 
@@ -357,30 +362,32 @@ fn probe_rollout_listing_with(
 /// are repository-controlled paths, and `.firebaserc` symlinked at
 /// `~/.config/configstore/firebase-tools.json` would otherwise read the user's
 /// own refresh token into a payload bound for the UI.
-fn read_repo_config(repo_path: &str, name: &str) -> Result<Option<String>, String> {
+fn read_repo_config(repo_path: &str, name: &str) -> Result<Option<String>, CommandError> {
     let repo = validate_repo(repo_path)?;
     let path = sandbox_join_canonical(&repo, name)?;
     let meta = match std::fs::symlink_metadata(&path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("Cannot read {name}: {error}")),
+        Err(error) => return Err(format!("Cannot read {name}: {error}").into()),
     };
     if !meta.is_file() {
-        return Err(format!("{name} is not a regular file"));
+        return Err(format!("{name} is not a regular file").into());
     }
     if meta.len() > MAX_CONFIG_BYTES {
         return Err(format!(
             "{name} is {} bytes, past the {MAX_CONFIG_BYTES} byte limit",
             meta.len()
-        ));
+        )
+        .into());
     }
     let bytes = std::fs::read(&path).map_err(|error| format!("Cannot read {name}: {error}"))?;
     if bytes.contains(&0) {
-        return Err(format!("{name} contains NUL bytes and is not text"));
+        return Err(format!("{name} contains NUL bytes and is not text").into());
     }
     String::from_utf8(bytes)
         .map(Some)
         .map_err(|_| format!("{name} is not valid UTF-8"))
+        .map_err(CommandError::from)
 }
 
 /// Upper bound on aliases offered from one `.firebaserc`.
@@ -482,7 +489,7 @@ pub fn discover_firebase_projects(repo_path: &str) -> FirebaseStatus {
             }
         }
         Ok(None) => {}
-        Err(error) => status.firebaserc_error = Some(error),
+        Err(error) => status.firebaserc_error = Some(error.into_message()),
     }
 
     match read_repo_config(repo_path, "firebase.json") {
@@ -494,7 +501,7 @@ pub fn discover_firebase_projects(repo_path: &str) -> FirebaseStatus {
             }
         }
         Ok(None) => {}
-        Err(error) => status.firebasejson_error = Some(error),
+        Err(error) => status.firebasejson_error = Some(error.into_message()),
     }
 
     status

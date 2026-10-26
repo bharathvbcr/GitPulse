@@ -10,6 +10,7 @@ use crate::engine::git_cli::{
     sandbox_join_canonical, validate_repo, RunOutcome,
 };
 use crate::harness::{guard_command, PolicyVerdict};
+use crate::ipc_error::CommandError;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 pub mod events;
 mod executor;
@@ -1294,7 +1295,7 @@ pub fn spawn_session<R: tauri::Runtime>(
     args: Option<Vec<String>>,
     env: Option<HashMap<String, String>>,
     output: OutputSink,
-) -> Result<TerminalSpawned, String> {
+) -> Result<TerminalSpawned, CommandError> {
     spawn_session_in(
         app, state, repo_path, None, rows, cols, program, args, env, output,
     )
@@ -1318,7 +1319,7 @@ pub fn spawn_session_in<R: tauri::Runtime>(
     args: Option<Vec<String>>,
     env: Option<HashMap<String, String>>,
     output: OutputSink,
-) -> Result<TerminalSpawned, String> {
+) -> Result<TerminalSpawned, CommandError> {
     spawn_session_inner(
         app, state, repo_path, start_dir, rows, cols, program, args, env, output, None,
     )
@@ -1825,7 +1826,7 @@ pub(crate) fn spawn_tracked_session<R: tauri::Runtime>(
     args: Vec<String>,
     output: OutputSink,
     observer: Arc<dyn SessionObserver>,
-) -> Result<TerminalSpawned, String> {
+) -> Result<TerminalSpawned, CommandError> {
     spawn_at(
         app,
         state,
@@ -1861,7 +1862,7 @@ impl Place {
     /// The canonical repository and the directory inside it to start in,
     /// checked the way every spawn is: a git work tree, and a start directory
     /// that resolves inside it.
-    fn resolve(&self) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+    fn resolve(&self) -> Result<(std::path::PathBuf, std::path::PathBuf), CommandError> {
         let (root, start_dir) = match self {
             Place::Repo {
                 repo_path,
@@ -1942,7 +1943,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
     env: Option<HashMap<String, String>>,
     output: OutputSink,
     observer: Option<Arc<dyn SessionObserver>>,
-) -> Result<TerminalSpawned, String> {
+) -> Result<TerminalSpawned, CommandError> {
     spawn_at(
         app,
         state,
@@ -1975,7 +1976,7 @@ fn spawn_at<R: tauri::Runtime>(
     env: Option<HashMap<String, String>>,
     output: OutputSink,
     observer: Option<Arc<dyn SessionObserver>>,
-) -> Result<TerminalSpawned, String> {
+) -> Result<TerminalSpawned, CommandError> {
     validate_pty_options(program.as_deref(), args.as_deref(), env.as_ref())?;
     let (repo, _) = place.resolve()?;
     // An agent CLI is a launch the load governor may refuse under severe
@@ -2035,7 +2036,7 @@ pub(crate) fn start_session(
     output: OutputSink,
     events: Arc<dyn SessionEvents>,
     observer: Option<Arc<dyn SessionObserver>>,
-) -> Result<Started, String> {
+) -> Result<Started, CommandError> {
     let SpawnRequest {
         session_id,
         place,
@@ -2057,7 +2058,7 @@ pub(crate) fn start_session(
     validate_pty_options(program.as_deref(), args.as_deref(), env.as_ref())?;
     let (repo, start) = place.resolve()?;
     if state.lock_sessions().contains_key(&session_id) {
-        return Err(format!("Terminal session '{session_id}' already exists"));
+        return Err(format!("Terminal session '{session_id}' already exists").into());
     }
     let reservation = reserve_session(state)?;
     let pty_system = native_pty_system();
@@ -2087,7 +2088,7 @@ pub(crate) fn start_session(
     if cfg!(windows) {
         if let Some(refusal) = batch_reparse_refusal(&resolved, args.as_deref().unwrap_or_default())
         {
-            return Err(refusal);
+            return Err(refusal.into());
         }
     }
     if run_id.is_some() {
@@ -2162,12 +2163,13 @@ pub(crate) fn start_session(
         crate::repository_trust::require_unsubstitutable_dir(&repo).and_then(|_anchored| {
             crate::procguard::with_inheritance_lock(|| pair.slave.spawn_command(cmd))
                 .map_err(|error| format!("Failed to spawn process '{shell}': {error}"))
+                .map_err(CommandError::from)
         });
     let child = match spawn_result {
         Ok(child) => child,
         Err(reason) => {
             if let Some(observer) = &observer {
-                observer.spawn_failed(&session_id, &reason);
+                observer.spawn_failed(&session_id, reason.message());
             }
             return Err(reason);
         }
@@ -2230,7 +2232,7 @@ pub(crate) fn start_session(
             if let Err(error) = terminate_pty_child(&child, &master, &closing) {
                 log::error!(target: "terminal", "could not stop a duplicate session: {error}");
             }
-            return Err(format!("Terminal session '{session_id}' already exists"));
+            return Err(format!("Terminal session '{session_id}' already exists").into());
         }
         guard.insert(session_id.clone(), entry);
     }
@@ -2644,10 +2646,10 @@ pub(crate) fn start_session(
         if let Some(observer) = &observer {
             observer.finished(&reader_failure_payload(&session_id, exit, &e));
         }
-        return Err(format!("Failed to spawn PTY reader thread: {e}"));
+        return Err(format!("Failed to spawn PTY reader thread: {e}").into());
     }
     if let Some(error) = start_error {
-        return Err(format!("Task process bookkeeping failed; the child was asked to stop. Inspect the run before another attempt: {error}"));
+        return Err(format!("Task process bookkeeping failed; the child was asked to stop. Inspect the run before another attempt: {error}").into());
     }
 
     Ok(Started {
@@ -3391,7 +3393,7 @@ pub fn run_terminal(
     repo_path: &str,
     args: &[String],
     timeout_secs: Option<u64>,
-) -> Result<TerminalRunResult, String> {
+) -> Result<TerminalRunResult, CommandError> {
     run_terminal_inner(repo_path, args, timeout_secs, None)
 }
 
@@ -3407,7 +3409,7 @@ pub fn run_manvi_action(
     args: &[String],
     action_kind: ManviActionKind,
     timeout_secs: Option<u64>,
-) -> Result<TerminalRunResult, String> {
+) -> Result<TerminalRunResult, CommandError> {
     validate_manvi_action(args, action_kind)?;
     let repo = validate_repo(repo_path)?;
     validate_manvi_paths(&repo, args, action_kind)?;
@@ -3419,7 +3421,7 @@ fn run_terminal_inner(
     args: &[String],
     timeout_secs: Option<u64>,
     manvi_action: Option<ManviActionKind>,
-) -> Result<TerminalRunResult, String> {
+) -> Result<TerminalRunResult, CommandError> {
     if args.is_empty() {
         return Err("No command provided".into());
     }
@@ -3448,7 +3450,7 @@ fn run_terminal_inner(
             Ok(verdict) => (Some(verdict), true),
             Err(refusal) => {
                 // Return honest refusal/failure if blocked or gate failed.
-                return Err(refusal);
+                return Err(refusal.into());
             }
         }
     } else {
@@ -4595,6 +4597,7 @@ mod tests {
             }
             fn before_spawn(&self, _: &str) -> Result<(), String> {
                 crate::repository_trust::revoke(self.repo.to_str().unwrap())
+                    .map_err(CommandError::into_message)
             }
             fn started(&self, _: &str, _: Result<(u32, String), String>) -> Result<(), String> {
                 panic!("revoked launch started")
@@ -4674,9 +4677,14 @@ mod tests {
         let refusal = agent(&state).unwrap_err();
         assert!(
             refusal.contains("Agent launch refused (pty_spawn)"),
-            "{refusal}"
+            "{refusal}",
+            refusal = refusal.message()
         );
-        assert!(refusal.contains("critical (kernel level 4)"), "{refusal}");
+        assert!(
+            refusal.contains("critical (kernel level 4)"),
+            "{refusal}",
+            refusal = refusal.message()
+        );
         assert_eq!(
             state.active_sessions.load(Ordering::SeqCst),
             0,
@@ -5964,7 +5972,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn try_pty_launch(repo: &std::path::Path, marker: &str) -> Result<TerminalSpawned, String> {
+    fn try_pty_launch(
+        repo: &std::path::Path,
+        marker: &str,
+    ) -> Result<TerminalSpawned, CommandError> {
         let app = tauri::test::mock_builder().build(crate::context()).unwrap();
         let state = TerminalSessions::default();
         spawn_session_inner(
@@ -5996,18 +6007,21 @@ mod tests {
             .expect_err("a substitutable holder must not start an interactive session");
         assert!(
             error.contains(crate::repository_trust::SHARED_DIRECTORY),
-            "refusal must name this specific cause, not an incidental failure: {error}"
+            "refusal must name this specific cause, not an incidental failure: {error}",
+            error = error.message()
         );
         // Granting trust cannot fix a writable holder, so this must not carry
         // the marker the desktop reacts to by prompting for approval — that
         // would send the user round a loop whose every turn ends here.
         assert!(
             !error.contains(crate::repository_trust::REQUIRED),
-            "refusal invites a trust prompt that cannot resolve it: {error}"
+            "refusal invites a trust prompt that cannot resolve it: {error}",
+            error = error.message()
         );
         assert!(
             error.contains("holder"),
-            "a refusal has to name the directory to change: {error}"
+            "a refusal has to name the directory to change: {error}",
+            error = error.message()
         );
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(
@@ -6035,12 +6049,16 @@ mod tests {
                 .expect_err("attempt {attempt} started a session in a substitutable checkout");
             assert!(
                 refusal.contains(crate::repository_trust::SHARED_DIRECTORY),
-                "attempt {attempt} refused for the wrong reason: {refusal}"
+                "attempt {attempt} refused for the wrong reason: {refusal}",
+                refusal = refusal.message()
             );
         }
         for attempt in 0..25 {
             try_pty_launch(&sticky, &format!("sticky-{attempt}")).unwrap_or_else(|e| {
-                panic!("attempt {attempt} wrongly refused a sticky holder: {e}")
+                panic!(
+                    "attempt {attempt} wrongly refused a sticky holder: {e}",
+                    e = e.message()
+                )
             });
         }
     }
@@ -7521,7 +7539,8 @@ mod tests {
                     || err.contains("blocked")
                     || err.contains("refused")
                     || err.contains("MANVI"),
-                "refusal should name why it was refused, got: {err}"
+                "refusal should name why it was refused, got: {err}",
+                err = err.message()
             ),
             // No harness to answer: it may proceed, but it must still be
             // recorded as having gone through the gate, with the verdict kept.

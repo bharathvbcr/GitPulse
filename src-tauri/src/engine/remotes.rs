@@ -18,6 +18,7 @@
 
 use crate::engine::git_cli::{git_captured, git_text, git_text_network, validate_repo};
 use crate::engine::git_writer::{repo_mutation_lock, validate_clone_url, validate_ref_name};
+use crate::ipc_error::CommandError;
 use crate::ledger::redact::url_for_display;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -210,7 +211,7 @@ fn assemble(records: &[(String, String)], tracking_refs: &[String]) -> RemoteLis
 }
 
 /// Lists configured remotes with their URLs and tracking-ref counts.
-pub fn list(repo_path: &str) -> Result<RemoteList, String> {
+pub fn list(repo_path: &str) -> Result<RemoteList, CommandError> {
     let repo = validate_repo(repo_path)?;
     // `--get-regexp` exits 1 with nothing on stderr when no key matches: a
     // repository with no remotes, an honest empty answer. Any other outcome (a
@@ -231,13 +232,14 @@ pub fn list(repo_path: &str) -> Result<RemoteList, String> {
                 Some(reason) => format!("git config {}", reason.describe()),
                 None => String::from_utf8_lossy(&run.stderr).trim().to_string(),
             }
-        ));
+        )
+        .into());
     };
     let tracking: Vec<String> = git_text(
         repo.as_path(),
         &["for-each-ref", "--format=%(refname)", "refs/remotes/"],
     )
-    .map_err(|e| format!("Could not list remote-tracking branches: {e}"))?
+    .map_err(|e| e.wrap(|e| format!("Could not list remote-tracking branches: {e}")))?
     .lines()
     .map(str::trim)
     .map(str::to_string)
@@ -353,7 +355,7 @@ impl RemoteChange {
     /// Remote names go through the ref-name validator: they become path
     /// components under `refs/remotes/`, so the rules that protect a branch
     /// name protect a remote name for the same reasons.
-    fn validate(&self) -> Result<(), String> {
+    fn validate(&self) -> Result<(), CommandError> {
         match self {
             RemoteChange::Add { name, url } => {
                 validate_ref_name(name)?;
@@ -381,9 +383,9 @@ pub fn apply_with<J, V>(
     repo_path: &str,
     change: &RemoteChange,
     judge: J,
-) -> Result<(V, String), String>
+) -> Result<(V, String), CommandError>
 where
-    J: FnOnce(&[&str]) -> Result<V, String>,
+    J: FnOnce(&[&str]) -> Result<V, CommandError>,
 {
     let repo = validate_repo(repo_path)?;
     change.validate()?;
@@ -399,22 +401,22 @@ where
     match change {
         RemoteChange::Add { name, .. } => {
             if existing.iter().any(|e| e == name) {
-                return Err(format!("A remote named '{name}' already exists"));
+                return Err(format!("A remote named '{name}' already exists").into());
             }
         }
         RemoteChange::Rename { name, new_name } => {
             if !existing.iter().any(|e| e == name) {
-                return Err(format!("No remote named '{name}'"));
+                return Err(format!("No remote named '{name}'").into());
             }
             if existing.iter().any(|e| e == new_name) {
-                return Err(format!("A remote named '{new_name}' already exists"));
+                return Err(format!("A remote named '{new_name}' already exists").into());
             }
         }
         RemoteChange::Remove { name }
         | RemoteChange::SetUrl { name, .. }
         | RemoteChange::Prune { name } => {
             if !existing.iter().any(|e| e == name) {
-                return Err(format!("No remote named '{name}'"));
+                return Err(format!("No remote named '{name}'").into());
             }
         }
     }
@@ -440,7 +442,7 @@ where
     }
     // git can echo the URL in a failure; the caller's error text is not a
     // place for the credentialed form.
-    .map_err(|e| crate::ledger::redact::text(&e))?;
+    .map_err(|e| crate::ledger::redact::text(e.message()))?;
     let output = match warning {
         Some(warning) if output.trim().is_empty() => warning.to_string(),
         Some(warning) => format!("{output}\n{warning}"),
@@ -459,7 +461,7 @@ const CREDENTIAL_WARNING: &str = "Warning: this URL embeds a password or token, 
 fn keep_stored_credentials(
     repo: &Path,
     change: &RemoteChange,
-) -> Result<Option<RemoteChange>, String> {
+) -> Result<Option<RemoteChange>, CommandError> {
     let RemoteChange::SetUrl {
         name,
         url,
@@ -476,8 +478,8 @@ fn keep_stored_credentials(
         // the user edited was showing.
         Err(_) if *push => git_text(repo, &["config", "--get", &format!("remote.{name}.url")])
             .map(|value| value.trim().to_string())
-            .map_err(|e| format!("Could not read the stored URL of '{name}': {e}"))?,
-        Err(e) => return Err(format!("Could not read the stored URL of '{name}': {e}")),
+            .map_err(|e| e.wrap(|e| format!("Could not read the stored URL of '{name}': {e}")))?,
+        Err(e) => return Err(e.wrap(|e| format!("Could not read the stored URL of '{name}': {e}"))),
     };
     let shown = url_for_display(&stored);
     if shown.has_credentials && shown.display == *url {
@@ -496,7 +498,7 @@ fn keep_stored_credentials(
 /// Refuses `name` unless it is a configured remote, so a path or an arbitrary
 /// word can never reach git's remote argument (git reads a path there as a
 /// repository to fetch from or push to). Checked before any network spawn.
-pub(crate) fn require_configured(repo: &Path, name: &str) -> Result<(), String> {
+pub(crate) fn require_configured(repo: &Path, name: &str) -> Result<(), CommandError> {
     if list_names(repo)?
         .iter()
         .any(|configured| configured == name)
@@ -505,11 +507,11 @@ pub(crate) fn require_configured(repo: &Path, name: &str) -> Result<(), String> 
     } else {
         Err(format!(
             "{name:?} is not a configured remote. Add it with Add remote, or pick one that is configured."
-        ))
+        ).into())
     }
 }
 
-pub(crate) fn list_names(repo: &Path) -> Result<Vec<String>, String> {
+pub(crate) fn list_names(repo: &Path) -> Result<Vec<String>, CommandError> {
     let raw = git_text(repo, &["remote"])?;
     Ok(raw
         .lines()

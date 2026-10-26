@@ -9,6 +9,7 @@
 use gitpulse_lib::engine::stash::{self, StashAction};
 use gitpulse_lib::engine::submodules::{self, SubmoduleChange};
 use gitpulse_lib::engine::{remotes, RemoteChange};
+use gitpulse_lib::ipc_error::CommandError;
 use gitpulse_lib::procguard::LockedSpawn;
 use std::collections::HashSet;
 use std::fs;
@@ -55,7 +56,7 @@ fn push_stash(dir: &Path, message: &str, content: &str) {
     run_git(dir, &["stash", "push", "-u", "-m", message]);
 }
 
-fn allow(argv: &[&str]) -> Result<Vec<String>, String> {
+fn allow(argv: &[&str]) -> Result<Vec<String>, CommandError> {
     Ok(argv.iter().map(|a| a.to_string()).collect())
 }
 
@@ -160,7 +161,8 @@ fn concurrent_drops_never_destroy_an_unselected_entry() {
     for (_, err) in results.iter().filter_map(|r| r.as_ref().err()) {
         assert!(
             err.contains("Refresh the stash list"),
-            "unexpected failure mode: {err}"
+            "unexpected failure mode: {err}",
+            err = err.message()
         );
     }
 }
@@ -382,7 +384,7 @@ fn awkward_but_legal_remote_urls_round_trip() {
             },
             allow,
         )
-        .unwrap_or_else(|e| panic!("{name} ({url}) was refused: {e}"));
+        .unwrap_or_else(|e| panic!("{name} ({url}) was refused: {e}", e = e.message()));
     }
 
     let listed = remotes::list(&path).unwrap();
@@ -433,7 +435,11 @@ fn renaming_onto_an_existing_name_is_refused_and_leaves_both() {
         allow,
     )
     .unwrap_err();
-    assert!(err.contains("already exists"), "got: {err}");
+    assert!(
+        err.contains("already exists"),
+        "got: {err}",
+        err = err.message()
+    );
 
     let listed = remotes::list(&path).unwrap();
     let names: HashSet<&str> = listed.remotes.iter().map(|r| r.name.as_str()).collect();
@@ -527,10 +533,11 @@ fn deinit_without_force_refuses_uncommitted_submodule_work() {
         allow,
     )
     .unwrap_err();
-    let lower = err.to_lowercase();
+    let lower = err.message().to_lowercase();
     assert!(
         lower.contains("local modifications") || lower.contains("dirty") || lower.contains("force"),
-        "refused deinit must name the dirty tree, got: {err}"
+        "refused deinit must name the dirty tree, got: {err}",
+        err = err.message()
     );
     assert!(
         fs::read_to_string(sub.join("l.txt"))

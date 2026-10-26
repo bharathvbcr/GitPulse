@@ -10,6 +10,7 @@
 
 use super::{ExternalTool, PUBLIC_DEVMAP_REPO, PUBLIC_MANVI_REPO};
 use crate::engine::git_cli;
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::fs;
 #[cfg(test)]
@@ -248,7 +249,11 @@ pub fn probe_release(tool: ExternalTool) -> ReleaseAvailability {
             ),
         },
         Err(e) => ReleaseAvailability::Unavailable {
-            reason: format!("could not check releases for {}: {e}", tool.as_str()),
+            reason: format!(
+                "could not check releases for {}: {e}",
+                tool.as_str(),
+                e = e.message()
+            ),
         },
     }
 }
@@ -326,7 +331,7 @@ fn curl_download_args(url: &str, dest: &Path) -> Vec<String> {
     args
 }
 
-pub(crate) fn http_head_ok(url: &str) -> Result<bool, String> {
+pub(crate) fn http_head_ok(url: &str) -> Result<bool, CommandError> {
     #[cfg(test)]
     NETWORK_PROBES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let curl =
@@ -337,9 +342,10 @@ pub(crate) fn http_head_ok(url: &str) -> Result<bool, String> {
         git_cli::run_bounded_capped(cmd, "curl head", Duration::from_secs(20), None, 64 * 1024)?;
     head_verdict(run.success, &run.stdout)
         .map_err(|e| format!("{e} (curl exit {})", run.status_code))
+        .map_err(CommandError::from)
 }
 
-fn download_to(url: &str, dest: &Path) -> Result<(), String> {
+fn download_to(url: &str, dest: &Path) -> Result<(), CommandError> {
     let curl =
         git_cli::find_external_tool("curl").ok_or_else(|| "curl is not installed".to_string())?;
     if let Some(parent) = dest.parent() {
@@ -355,10 +361,11 @@ fn download_to(url: &str, dest: &Path) -> Result<(), String> {
             "download failed (exit {}): {}",
             run.status_code,
             err.chars().take(240).collect::<String>()
-        ));
+        )
+        .into());
     }
     if !dest.is_file() {
-        return Err(format!("download produced no file at {}", dest.display()));
+        return Err(format!("download produced no file at {}", dest.display()).into());
     }
     Ok(())
 }
@@ -397,18 +404,18 @@ pub fn parse_checksum_file(text: &str) -> Result<String, String> {
 }
 
 /// Compute SHA-256 of a file via `shasum` / `sha256sum` (no new crate).
-pub fn file_sha256_hex(path: &Path) -> Result<String, String> {
+pub fn file_sha256_hex(path: &Path) -> Result<String, CommandError> {
     sha256_with(Some(path), None)
 }
 
 /// Compute SHA-256 of `bytes`, fed on stdin to the same tools as
 /// [`file_sha256_hex`].
-pub fn bytes_sha256_hex(bytes: &[u8]) -> Result<String, String> {
+pub fn bytes_sha256_hex(bytes: &[u8]) -> Result<String, CommandError> {
     sha256_with(None, Some(bytes))
 }
 
-fn sha256_with(path: Option<&Path>, stdin: Option<&[u8]>) -> Result<String, String> {
-    let try_cmd = |program: &str, args: &[&str]| -> Result<String, String> {
+fn sha256_with(path: Option<&Path>, stdin: Option<&[u8]>) -> Result<String, CommandError> {
+    let try_cmd = |program: &str, args: &[&str]| -> Result<String, CommandError> {
         let bin =
             git_cli::find_external_tool(program).ok_or_else(|| format!("{program} not found"))?;
         let mut cmd = Command::new(&bin);
@@ -423,24 +430,26 @@ fn sha256_with(path: Option<&Path>, stdin: Option<&[u8]>) -> Result<String, Stri
     try_cmd("shasum", &["-a", "256"]).or_else(|_| try_cmd("sha256sum", &[]))
 }
 
-fn digest_from_run(run: git_cli::BoundedRun, program: &str) -> Result<String, String> {
+fn digest_from_run(run: git_cli::BoundedRun, program: &str) -> Result<String, CommandError> {
     let run = run.require_complete(program)?;
     if !run.success {
-        return Err(format!("{program} failed"));
+        return Err(format!("{program} failed").into());
     }
     let out = String::from_utf8_lossy(&run.stdout);
-    parse_checksum_file(&out).map_err(|error| format!("{program}: {error}"))
+    parse_checksum_file(&out)
+        .map_err(|error| format!("{program}: {error}"))
+        .map_err(CommandError::from)
 }
 
 /// Verify `path`'s digest equals `expected_hex`. Mismatch is a hard error.
-pub fn verify_checksum(path: &Path, expected_hex: &str) -> Result<(), String> {
+pub fn verify_checksum(path: &Path, expected_hex: &str) -> Result<(), CommandError> {
     let actual = file_sha256_hex(path)?;
     let expected = expected_hex.to_ascii_lowercase();
     if actual != expected {
         return Err(format!(
             "checksum mismatch for {}: expected {expected}, got {actual} — refusing to install (will not fall back)",
             path.display()
-        ));
+        ).into());
     }
     Ok(())
 }
@@ -464,7 +473,7 @@ fn extract_binary_from_tar_gz(
     archive: &Path,
     tool: ExternalTool,
     dest: &Path,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     let tar =
         git_cli::find_external_tool("tar").ok_or_else(|| "tar is not installed".to_string())?;
     let tmp = archive
@@ -491,7 +500,8 @@ fn extract_binary_from_tar_gz(
         return Err(format!(
             "tar extract failed: {}",
             String::from_utf8_lossy(&run.stderr)
-        ));
+        )
+        .into());
     }
     let want = binary_name(tool);
     let found = find_named_file(&tmp, want)?;
@@ -542,7 +552,7 @@ pub fn install_work_dir() -> Result<PathBuf, String> {
 /// Download the pinned asset, verify it against the digest recorded in this
 /// repository (refuse on mismatch), refuse a downgrade, install into the app
 /// bin dir.
-pub fn install_prebuilt(tool: ExternalTool) -> Result<PathBuf, String> {
+pub fn install_prebuilt(tool: ExternalTool) -> Result<PathBuf, CommandError> {
     let availability = probe_release(tool);
     let ReleaseAvailability::Available {
         asset_url,
@@ -554,7 +564,7 @@ pub fn install_prebuilt(tool: ExternalTool) -> Result<PathBuf, String> {
         let ReleaseAvailability::Unavailable { reason } = availability else {
             unreachable!()
         };
-        return Err(reason);
+        return Err(reason.into());
     };
 
     let dest = app_bin_dir()?.join(binary_name(tool));
@@ -582,7 +592,7 @@ pub fn install_bytes_with_checksum(
     bytes: &[u8],
     expected_hex: &str,
     dest: &Path,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     use std::io::Write;
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -669,9 +679,17 @@ mod tests {
             "0000000000000000000000000000000000000000000000000000000000000000",
         )
         .unwrap_err();
-        assert!(err.contains("checksum mismatch"), "{err}");
-        assert!(err.contains("refusing"), "{err}");
-        assert!(err.contains("will not fall back"), "{err}");
+        assert!(
+            err.contains("checksum mismatch"),
+            "{err}",
+            err = err.message()
+        );
+        assert!(err.contains("refusing"), "{err}", err = err.message());
+        assert!(
+            err.contains("will not fall back"),
+            "{err}",
+            err = err.message()
+        );
     }
 
     #[test]
@@ -684,7 +702,11 @@ mod tests {
             &dest,
         )
         .unwrap_err();
-        assert!(err.contains("checksum mismatch"), "{err}");
+        assert!(
+            err.contains("checksum mismatch"),
+            "{err}",
+            err = err.message()
+        );
         // File may exist on disk but must not be treated as installed success.
         assert!(err.contains("refusing"));
     }

@@ -11,6 +11,7 @@
 //! many repositories. The standalone `devmap mcp` server accepts the same
 //! argument and refuses first-wins when more than one store is in scope.
 
+use crate::ipc_error::CommandError;
 use serde_json::{json, Value};
 
 use crate::codeintel::WalkBounds;
@@ -434,7 +435,7 @@ fn bounds(depth: Option<usize>, min_confidence: Option<f32>) -> WalkBounds {
 }
 
 /// Dispatch one DevMap-parity tool through the in-process codeintel layer.
-pub fn handle(name: &str, arguments: &Value) -> Result<Value, String> {
+pub fn handle(name: &str, arguments: &Value) -> Result<Value, CommandError> {
     match name {
         "devmap_status" => {
             let a: RepoArgs = parse(name, arguments)?;
@@ -533,7 +534,7 @@ pub fn handle(name: &str, arguments: &Value) -> Result<Value, String> {
                 bounds(a.depth, a.min_confidence)
             )))
         }
-        _ => Err(format!("Unknown tool: {name}")),
+        _ => Err(format!("Unknown tool: {name}").into()),
     }
 }
 
@@ -678,7 +679,7 @@ mod tests {
     }
 
     fn ask(name: &str, arguments: Value) -> Value {
-        handle(name, &arguments).unwrap_or_else(|e| panic!("{name} errored: {e}"))
+        handle(name, &arguments).unwrap_or_else(|e| panic!("{name} errored: {e}", e = e.message()))
     }
 
     #[test]

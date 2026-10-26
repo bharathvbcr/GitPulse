@@ -71,7 +71,7 @@ fn concurrent_mutations_from_linked_worktrees_all_land() {
             barrier.wait();
             for i in 0..PER_SIDE {
                 GitWriter::create_branch(&path, &format!("main-tab-{i}"), None)
-                    .unwrap_or_else(|e| panic!("main create_branch {i}: {e}"));
+                    .unwrap_or_else(|e| panic!("main create_branch {i}: {e}", e = e.message()));
             }
         })
     };
@@ -81,7 +81,7 @@ fn concurrent_mutations_from_linked_worktrees_all_land() {
             barrier.wait();
             for i in 0..PER_SIDE {
                 GitWriter::create_branch(&path, &format!("wt-tab-{i}"), None)
-                    .unwrap_or_else(|e| panic!("worktree create_branch {i}: {e}"));
+                    .unwrap_or_else(|e| panic!("worktree create_branch {i}: {e}", e = e.message()));
             }
         })
     };

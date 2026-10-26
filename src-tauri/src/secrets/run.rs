@@ -5,6 +5,7 @@ use super::report::{assemble, git_view, RunFacts};
 use crate::engine::git_cli::{
     run_observed, validate_repo, Incomplete, OutputStream, ProcessObserver,
 };
+use crate::ipc_error::CommandError;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -171,14 +172,19 @@ pub(crate) fn report_from_run(
     stdout: &[u8],
     version: Option<String>,
     root: &Path,
-    view: impl FnOnce() -> Result<super::report::GitView, String>,
+    view: impl FnOnce() -> Result<super::report::GitView, CommandError>,
     facts: RunFacts,
 ) -> SecretsReport {
     if !SUCCESS_EXITS.contains(&status) {
         return failed_report(&exit_reason(status), version);
     }
     match parse_kingfisher_json(stdout, version.clone()) {
-        Ok(envelope) => assemble(envelope, root, view(), facts),
+        Ok(envelope) => assemble(
+            envelope,
+            root,
+            view().map_err(CommandError::into_message),
+            facts,
+        ),
         Err(reason) => failed_report(&reason, version),
     }
 }
@@ -317,7 +323,7 @@ fn now_ms() -> u64 {
 }
 
 /// Probe version, scan the working tree, parse by allowlist, drop stdout.
-pub fn scan_secrets(repo_path: &str) -> Result<SecretsReport, String> {
+pub fn scan_secrets(repo_path: &str) -> Result<SecretsReport, CommandError> {
     // Validate before claiming: a request the trust gate refuses must not
     // cancel a trusted repository's scan on its way out.
     let repo = validate_repo(repo_path)?;
@@ -362,7 +368,7 @@ pub fn scan_with_binary(
     ) {
         Ok(run) => run,
         Err(err) => {
-            let reason = runner_failure_reason(&err, deadline);
+            let reason = runner_failure_reason(err.message(), deadline);
             let diag = current_diagnostic(
                 version.as_deref(),
                 binary,

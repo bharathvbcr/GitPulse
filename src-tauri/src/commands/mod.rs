@@ -37,6 +37,7 @@ use crate::graph::{
     mainline_chain_ids, simplify_history_reporting, BezierGeometryCalculator, CubicBezierCurve,
     LaneSolver, MainlineHint, RawCommitNode, RefDecoration, RefKind, RefScope, VisualCommitRow,
 };
+use crate::ipc_error::CommandError;
 use crate::ipc_error::IpcError;
 use crate::stack::StackTreeEngine;
 use crate::watcher::{start_watch, unwatch, WatcherState};
@@ -95,7 +96,7 @@ pub use worktrees::*;
 /// deferral never leaves a user action as a retryable kind.
 async fn off_thread<F, T>(body: F) -> Result<T, IpcError>
 where
-    F: FnOnce() -> Result<T, String> + Send + 'static,
+    F: FnOnce() -> Result<T, crate::ipc_error::CommandError> + Send + 'static,
     T: Send + 'static,
 {
     let mut timing = crate::logging::performance::CommandTiming::queue(std::any::type_name::<F>());
@@ -148,7 +149,7 @@ fn pool_limit(class: crate::engine::git_cli::Admission) -> Option<usize> {
 /// while it waits.
 async fn off_thread_background<F, T>(body: F) -> Result<T, IpcError>
 where
-    F: FnOnce() -> Result<T, String> + Send + 'static,
+    F: FnOnce() -> Result<T, CommandError> + Send + 'static,
     T: Send + 'static,
 {
     use crate::engine::git_cli::Admission;

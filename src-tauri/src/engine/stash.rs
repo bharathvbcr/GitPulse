@@ -21,6 +21,7 @@
 use crate::engine::git_cli::{git_text, validate_repo};
 use crate::engine::git_reader::DiffPayload;
 use crate::engine::git_writer::{repo_mutation_lock, validate_oid};
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -29,8 +30,9 @@ pub(crate) const STALE_STACK_HINT: &str = "Refresh the stash list and try again.
 
 /// A stale-stack refusal, typed where it is written (see `crate::ipc_error`):
 /// the panel refreshes on the `StaleStash` kind and never reads the sentence.
-fn stale(message: String) -> String {
-    crate::ipc_error::typed_text(crate::ipc_error::IpcErrorKind::StaleStash, message)
+fn stale(message: String) -> CommandError {
+    let kind = crate::ipc_error::IpcErrorKind::StaleStash;
+    CommandError::typed(kind, crate::ipc_error::typed_text(kind, message))
 }
 
 /// Upper bound on entries returned in one listing. A stash stack this deep is
@@ -154,12 +156,12 @@ fn parse_stash_list(raw: &str) -> StashList {
 }
 
 /// Lists the stash stack, newest first.
-pub fn list(repo_path: &str) -> Result<StashList, String> {
+pub fn list(repo_path: &str) -> Result<StashList, CommandError> {
     let repo = validate_repo(repo_path)?;
     list_in(&repo)
 }
 
-fn list_in(repo: &Path) -> Result<StashList, String> {
+fn list_in(repo: &Path) -> Result<StashList, CommandError> {
     let (raw, incomplete) = crate::engine::ref_cache::git_text_capped(
         repo,
         &["refs/stash", "logs/refs/stash"],
@@ -182,7 +184,7 @@ fn list_in(repo: &Path) -> Result<StashList, String> {
 ///
 /// Addressed by object id, so a shifting stack cannot make this show the wrong
 /// entry — it is a read, and a read of the wrong thing is still wrong.
-pub fn show(repo_path: &str, oid: &str) -> Result<DiffPayload, String> {
+pub fn show(repo_path: &str, oid: &str) -> Result<DiffPayload, CommandError> {
     let repo = validate_repo(repo_path)?;
     validate_oid(oid)?;
     // `-u` includes files the stash captured as untracked, which are otherwise
@@ -231,9 +233,9 @@ pub fn run_action_with<J, V>(
     index: usize,
     expected_oid: &str,
     judge: J,
-) -> Result<(V, String), String>
+) -> Result<(V, String), CommandError>
 where
-    J: FnOnce(&[&str]) -> Result<V, String>,
+    J: FnOnce(&[&str]) -> Result<V, CommandError>,
 {
     let repo = validate_repo(repo_path)?;
     validate_oid(expected_oid)?;

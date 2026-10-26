@@ -21,6 +21,7 @@
 
 use super::terminal_command::{self, validate_model_id};
 use crate::engine::git_cli::CapturedOutput;
+use crate::ipc_error::CommandError;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -180,14 +181,14 @@ fn excerpt(bytes: &[u8]) -> String {
 
 /// `agy models`' answer as a catalog. Pure, so every shape of answer — a
 /// failure, a garbled line, a flood — is testable without the CLI.
-pub(crate) fn agy_catalog(answer: Result<CapturedOutput, String>) -> AgentModelCatalog {
+pub(crate) fn agy_catalog(answer: Result<CapturedOutput, CommandError>) -> AgentModelCatalog {
     let mut out = catalog("agy", "listed", Some("agy models"));
     let output = match answer {
         Ok(output) => output,
         Err(error) => {
             out.error = Some(format!(
                 "agy models could not run: {}",
-                excerpt(error.as_bytes())
+                excerpt(error.message().as_bytes())
             ));
             return out;
         }
@@ -283,14 +284,14 @@ const FAILURE_TTL: Duration = Duration::from_secs(5);
 /// [`FAILURE_TTL`]) unless `refresh`. The cache lock is held only to read or
 /// write an entry, never across the CLI: concurrent requests for one launcher
 /// share a single run, and a slow listing blocks nothing else.
-pub(crate) fn models_for(launcher: &str, refresh: bool) -> Result<AgentModelCatalog, String> {
+pub(crate) fn models_for(launcher: &str, refresh: bool) -> Result<AgentModelCatalog, CommandError> {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     match listing_kind(launcher) {
         Some("known") => Ok(claude_catalog(
             read_claude_settings(home.as_deref()).as_deref(),
         )),
         Some("listed") => Ok(listed_models(launcher, refresh, || list_with_cli(launcher))),
-        _ => Err(format!("{launcher} has no model list GitPulse can read.")),
+        _ => Err(format!("{launcher} has no model list GitPulse can read.").into()),
     }
 }
 
@@ -298,7 +299,7 @@ pub(crate) fn models_for(launcher: &str, refresh: bool) -> Result<AgentModelCata
 fn listed_models(
     launcher: &str,
     refresh: bool,
-    list: impl FnOnce() -> Result<CapturedOutput, String>,
+    list: impl FnOnce() -> Result<CapturedOutput, CommandError>,
 ) -> AgentModelCatalog {
     static FLIGHTS: std::sync::OnceLock<
         crate::singleflight::SingleFlight<String, AgentModelCatalog>,
@@ -337,7 +338,7 @@ fn cached(launcher: &str) -> Option<AgentModelCatalog> {
 
 /// Runs the CLI's own listing command from the temporary directory: never the
 /// open repository, because an agent CLI may write project files where it runs.
-fn list_with_cli(launcher: &str) -> Result<CapturedOutput, String> {
+fn list_with_cli(launcher: &str) -> Result<CapturedOutput, CommandError> {
     let program = terminal_command::program(launcher).map_err(|error| error.message)?;
     crate::engine::git_cli::capture_command(
         &program,
@@ -365,7 +366,7 @@ mod tests {
         stderr: &str,
         success: bool,
         code: i32,
-    ) -> Result<CapturedOutput, String> {
+    ) -> Result<CapturedOutput, CommandError> {
         Ok(CapturedOutput {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
@@ -380,7 +381,9 @@ mod tests {
 
     #[test]
     fn an_antigravity_listing_becomes_its_slugs_and_labels() {
-        let out = agy_catalog(answer(AGY, "Fetching available models...\n", true, 0));
+        let out = agy_catalog(
+            answer(AGY, "Fetching available models...\n", true, 0).map_err(CommandError::from),
+        );
         assert_eq!(out.error, None);
         assert_eq!(out.listing, "listed");
         assert_eq!(out.command.as_deref(), Some("agy models"));
@@ -406,7 +409,7 @@ mod tests {
     #[test]
     fn a_garbled_line_is_skipped_and_counted_never_offered() {
         let text = "good-1\tGood\n-flag\tLooks like an option\n\tNo slug\nhas space\tX\na,b\tComma\ngood-2\n\u{1b}[31mred\tEscape\ngood-1\tDuplicate\n   \n";
-        let out = agy_catalog(answer(text, "", true, 0));
+        let out = agy_catalog(answer(text, "", true, 0).map_err(CommandError::from));
         assert_eq!(
             out.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
             ["good-1", "good-2"]
@@ -439,7 +442,7 @@ mod tests {
                 answer("-x\n--y\n", "", true, 0),
                 "none of them a model name",
             ),
-            (Err("timed out after 20s".to_owned()), "timed out"),
+            (Err("timed out after 20s".into()), "timed out"),
             (
                 Ok(CapturedOutput {
                     stdout: vec![0xff, 0xfe],
@@ -450,7 +453,7 @@ mod tests {
                 "not UTF-8",
             ),
         ] {
-            let out = agy_catalog(result);
+            let out = agy_catalog(result.map_err(CommandError::from));
             assert!(out.models.is_empty());
             let error = out.error.expect("a failed listing reported no error");
             assert!(error.contains(says), "{error:?} should say {says:?}");
@@ -463,17 +466,20 @@ mod tests {
         let text: String = (0..MAX_CATALOG_MODELS + 50)
             .map(|i| format!("m-{i}\tModel {i}\n"))
             .collect();
-        let out = agy_catalog(answer(&text, "", true, 0));
+        let out = agy_catalog(answer(&text, "", true, 0).map_err(CommandError::from));
         assert_eq!(out.models.len(), MAX_CATALOG_MODELS);
         assert!(out.truncated);
         assert_eq!(out.error, None);
         let long_label = format!("x\t{}\n", "L".repeat(MAX_LABEL_LEN + 1));
         assert_eq!(
-            agy_catalog(answer(&long_label, "", true, 0)).models[0].label,
+            agy_catalog(answer(&long_label, "", true, 0).map_err(CommandError::from)).models[0]
+                .label,
             None
         );
         let noisy = format!("bad\t{}\n", "e".repeat(10_000));
-        let failed = agy_catalog(answer("", &noisy, false, 2)).error.unwrap();
+        let failed = agy_catalog(answer("", &noisy, false, 2).map_err(CommandError::from))
+            .error
+            .unwrap();
         assert!(failed.len() < MAX_ERROR_EXCERPT + 80);
     }
 
@@ -540,8 +546,8 @@ mod tests {
         assert_eq!(read_claude_settings(None), None);
     }
 
-    fn good_listing() -> Result<CapturedOutput, String> {
-        answer("gemini-3-pro\ngemini-3-flash\n", "", true, 0)
+    fn good_listing() -> Result<CapturedOutput, CommandError> {
+        answer("gemini-3-pro\ngemini-3-flash\n", "", true, 0).map_err(CommandError::from)
     }
 
     /// The defect: the cache lock was held across the CLI call (up to 20 s),

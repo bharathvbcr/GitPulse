@@ -8,6 +8,7 @@
 
 use crate::codeintel::DEFAULT_CODEINTEL_BUDGET;
 use crate::engine::git_cli::validate_repo;
+use crate::ipc_error::CommandError;
 use devmap_query::workspace::{
     name_for, workspace_path, FederatedSearch, LinkCandidate, RepoUnavailable, Workspace,
     WorkspaceRepo, WORKSPACE_VERSION,
@@ -101,11 +102,11 @@ pub struct WorkspaceLinksResult {
     pub repos_considered: usize,
 }
 
-fn resolve_registry_root(registry_root: &str) -> Result<PathBuf, String> {
+fn resolve_registry_root(registry_root: &str) -> Result<PathBuf, CommandError> {
     validate_repo(registry_root)
 }
 
-fn resolve_member_root(repo_path: &str) -> Result<PathBuf, String> {
+fn resolve_member_root(repo_path: &str) -> Result<PathBuf, CommandError> {
     validate_repo(repo_path)
 }
 
@@ -227,7 +228,7 @@ fn suffix_label(root: &Path, depth: usize) -> String {
 }
 
 /// Read the registry rooted at `registry_root` (empty when the file is absent).
-pub fn list(registry_root: &str) -> Result<WorkspaceSnapshot, String> {
+pub fn list(registry_root: &str) -> Result<WorkspaceSnapshot, CommandError> {
     let root = resolve_registry_root(registry_root)?;
     let workspace = Workspace::load(&root).map_err(|e| e.to_string())?;
     Ok(snapshot_of(&root, &workspace, Vec::new(), Vec::new()))
@@ -238,7 +239,7 @@ pub fn register(
     registry_root: &str,
     repo_path: &str,
     name: Option<&str>,
-) -> Result<WorkspaceRegisterResult, String> {
+) -> Result<WorkspaceRegisterResult, CommandError> {
     let root = resolve_registry_root(registry_root)?;
     let member = resolve_member_root(repo_path)?;
     let label = name
@@ -262,7 +263,10 @@ pub fn register(
 }
 
 /// Remove a repository by registry name.
-pub fn unregister(registry_root: &str, name: &str) -> Result<WorkspaceUnregisterResult, String> {
+pub fn unregister(
+    registry_root: &str,
+    name: &str,
+) -> Result<WorkspaceUnregisterResult, CommandError> {
     let label = name.trim();
     if label.is_empty() {
         return Err("name must not be blank".into());
@@ -300,7 +304,7 @@ pub fn unregister(registry_root: &str, name: &str) -> Result<WorkspaceUnregister
 pub fn sync_open_tabs(
     registry_root: &str,
     repo_paths: &[String],
-) -> Result<WorkspaceSnapshot, String> {
+) -> Result<WorkspaceSnapshot, CommandError> {
     let root = resolve_registry_root(registry_root)?;
     let mut members = Vec::with_capacity(repo_paths.len());
     let mut seen = HashSet::new();
@@ -319,10 +323,10 @@ pub fn sync_open_tabs(
                 if !skipped_keys.insert(path.to_lowercase()) {
                     continue;
                 }
-                if crate::repository_trust::refused(&error) {
+                if crate::repository_trust::refused(error.message()) {
                     skipped_untrusted.push(path.clone());
                 } else {
-                    skipped_unavailable.push(format!("{path}: {error}"));
+                    skipped_unavailable.push(format!("{path}: {error}", error = error.message()));
                 }
             }
         }
@@ -367,7 +371,7 @@ pub fn search(
     query: &str,
     token_budget: Option<u32>,
     semantic: bool,
-) -> Result<WorkspaceSearchResult, String> {
+) -> Result<WorkspaceSearchResult, CommandError> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return Err("query must not be blank".into());
@@ -381,7 +385,7 @@ pub fn search(
 }
 
 /// Declared cross-repo import links among registered repositories.
-pub fn link_candidates(registry_root: &str) -> Result<WorkspaceLinksResult, String> {
+pub fn link_candidates(registry_root: &str) -> Result<WorkspaceLinksResult, CommandError> {
     let root = resolve_registry_root(registry_root)?;
     let workspace = Workspace::load(&root).map_err(|e| e.to_string())?;
     let found = devmap_query::link_candidates(&workspace).map_err(|e| e.to_string())?;
@@ -637,7 +641,11 @@ mod tests {
             &[kept.to_string_lossy().into_owned()],
         )
         .expect_err("the file lives in the host, so a missing host writes nothing");
-        assert!(!crate::repository_trust::refused(&err), "{err}");
+        assert!(
+            !crate::repository_trust::refused(err.message()),
+            "{err}",
+            err = err.message()
+        );
         let _ = fs::remove_dir_all(&host);
         let _ = fs::remove_dir_all(&kept);
     }
@@ -649,8 +657,9 @@ mod tests {
         let err =
             sync_open_tabs(host.to_str().unwrap(), &[]).expect_err("the registry host is required");
         assert!(
-            crate::repository_trust::refused(&err),
-            "a refused host is not a skipped member: {err}"
+            crate::repository_trust::refused(err.message()),
+            "a refused host is not a skipped member: {err}",
+            err = err.message()
         );
         assert!(!workspace_path(&host).is_file());
         let _ = fs::remove_dir_all(&host);
@@ -661,7 +670,7 @@ mod tests {
         let host = scratch("search-blank");
         init_git_repo(&host);
         let err = search(host.to_str().unwrap(), "   ", None, false).unwrap_err();
-        assert!(err.contains("blank"), "{err}");
+        assert!(err.contains("blank"), "{err}", err = err.message());
         let _ = fs::remove_dir_all(&host);
     }
 
@@ -714,7 +723,8 @@ mod tests {
         let err = register(host.to_str().unwrap(), other.to_str().unwrap(), None).unwrap_err();
         assert!(
             err.contains("Not a Git repository") || err.contains("Git"),
-            "{err}"
+            "{err}",
+            err = err.message()
         );
         let _ = fs::remove_dir_all(&host);
         let _ = fs::remove_dir_all(&other);

@@ -1,13 +1,14 @@
 //! Index and commit commands: staging, selective patches, committing, discarding changes.
 
 use super::*;
+use crate::ipc_error::CommandError;
 
 #[tauri::command(async)]
 pub async fn cmd_stage_file(repo_path: String, file_path: String) -> Result<Guarded<()>, IpcError> {
     off_thread(move || {
         let (verdicts, _) =
             GitWriter::change_index_with(&repo_path, &[file_path], IndexAction::Stage, |argv| {
-                guard(&repo_path, argv)
+                guard(&repo_path, argv).map_err(CommandError::from)
             })?;
         let policy = verdicts
             .into_iter()
@@ -26,7 +27,7 @@ pub async fn cmd_unstage_file(
     off_thread(move || {
         let (verdicts, _) =
             GitWriter::change_index_with(&repo_path, &[file_path], IndexAction::Unstage, |argv| {
-                guard(&repo_path, argv)
+                guard(&repo_path, argv).map_err(CommandError::from)
             })?;
         let policy = verdicts
             .into_iter()
@@ -47,7 +48,7 @@ pub async fn cmd_change_index(
     off_thread(move || {
         let (verdicts, output) =
             GitWriter::change_index_with(&repo_path, &file_paths, action, |argv| {
-                guard(&repo_path, argv)
+                guard(&repo_path, argv).map_err(CommandError::from)
             })?;
         let policy = verdicts
             .into_iter()

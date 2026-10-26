@@ -19,6 +19,7 @@
 
 use crate::engine::git_cli::{git_text, validate_repo};
 use crate::engine::git_writer::repo_mutation_lock;
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -199,23 +200,23 @@ fn assemble(status_raw: &str, gitmodules_raw: &str) -> SubmoduleList {
 }
 
 /// Lists the superproject's submodules and their states.
-pub fn list(repo_path: &str) -> Result<SubmoduleList, String> {
+pub fn list(repo_path: &str) -> Result<SubmoduleList, CommandError> {
     let repo = validate_repo(repo_path)?;
     list_in(&repo)
 }
 
-fn list_in(repo: &Path) -> Result<SubmoduleList, String> {
+fn list_in(repo: &Path) -> Result<SubmoduleList, CommandError> {
     // `submodule status` succeeds with no output on a repository without
     // submodules, so a failure is a read that did not happen (a refused or
     // timed-out spawn, a broken `.gitmodules`) and is reported: it used to
     // read as "this repository has no submodules".
     let status = git_text(repo, &["submodule", "status"])
-        .map_err(|e| format!("Could not read the submodule status: {e}"))?;
+        .map_err(|e| e.wrap(|e| format!("Could not read the submodule status: {e}")))?;
     // A missing `.gitmodules` is absence, and only that: a file that is there
     // and unreadable or malformed fails the listing.
     let gitmodules = if repo.join(".gitmodules").exists() {
         git_text(repo, &["config", "-f", ".gitmodules", "--list", "-z"])
-            .map_err(|e| format!("Could not read .gitmodules: {e}"))?
+            .map_err(|e| e.wrap(|e| format!("Could not read .gitmodules: {e}")))?
     } else {
         String::new()
     };
@@ -321,7 +322,7 @@ fn is_rooted(path: &str) -> bool {
     bytes.first().is_some_and(u8::is_ascii_alphabetic) && bytes.get(1) == Some(&b':')
 }
 
-fn validate_submodule_path(path: &str) -> Result<(), String> {
+fn validate_submodule_path(path: &str) -> Result<(), CommandError> {
     if path.is_empty() || path.contains('\0') || path.chars().any(char::is_control) {
         return Err("Invalid submodule path".into());
     }
@@ -347,9 +348,9 @@ pub fn apply_with<J, V>(
     repo_path: &str,
     change: &SubmoduleChange,
     judge: J,
-) -> Result<(V, String), String>
+) -> Result<(V, String), CommandError>
 where
-    J: FnOnce(&[&str]) -> Result<V, String>,
+    J: FnOnce(&[&str]) -> Result<V, CommandError>,
 {
     let repo = validate_repo(repo_path)?;
     if let Some(path) = change.target_path() {
@@ -366,7 +367,7 @@ where
     if let Some(path) = change.target_path() {
         let known = list_in(&repo)?;
         if !known.submodules.iter().any(|s| s.path == path) {
-            return Err(format!("No submodule at '{path}'"));
+            return Err(format!("No submodule at '{path}'").into());
         }
     }
 

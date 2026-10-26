@@ -55,12 +55,12 @@ fn pack(dir: &Path, rows: &[(&str, Vec<u8>)]) {
     std::fs::write(dir.join(".git").join("packed-refs"), bytes).unwrap();
 }
 
-fn names(path: &str) -> Result<Vec<String>, String> {
+fn names(path: &str) -> Result<Vec<String>, gitpulse_lib::ipc_error::CommandError> {
     GitReader::list_branches(path).map(|b| b.into_iter().map(|b| b.name).collect())
 }
 
 fn assert_survives(path: &str, expect_extra: &[&str]) {
-    let got = names(path).unwrap_or_else(|e| panic!("list_branches failed: {e}"));
+    let got = names(path).unwrap_or_else(|e| panic!("list_branches failed: {e}", e = e.message()));
     for n in ["main", "good"].iter().chain(expect_extra) {
         assert!(got.iter().any(|g| g == n), "{n} missing from {got:?}");
     }
@@ -107,7 +107,8 @@ fn l4_a_non_utf8_ref_name_does_not_break_the_listing() {
     pack(dir.path(), &[(oid.as_str(), name)]);
     let r = names(&path);
     eprintln!("NONUTF8 list_branches -> {r:?}");
-    let got = r.unwrap_or_else(|e| panic!("one odd ref broke the whole listing: {e}"));
+    let got =
+        r.unwrap_or_else(|e| panic!("one odd ref broke the whole listing: {e}", e = e.message()));
     assert!(got.iter().any(|g| g == "main"));
 }
 
@@ -139,7 +140,12 @@ fn l4_refs_pointing_at_a_tree_or_a_blob_do_not_break_the_listing() {
             ))
             .collect::<Vec<_>>())
     );
-    let listed = r.unwrap_or_else(|e| panic!("a non-commit ref broke the whole listing: {e}"));
+    let listed = r.unwrap_or_else(|e| {
+        panic!(
+            "a non-commit ref broke the whole listing: {e}",
+            e = e.message()
+        )
+    });
     for n in ["main", "good"] {
         assert!(listed.iter().any(|b| b.name == n), "{n} missing");
     }
@@ -170,7 +176,8 @@ fn l4_tags_at_a_tree_or_a_blob_do_not_break_the_tag_listing() {
             .map(|t| (t.name.clone(), t.compared_to.clone()))
             .collect::<Vec<_>>())
     );
-    let listed = r.unwrap_or_else(|e| panic!("a non-commit tag broke the listing: {e}"));
+    let listed =
+        r.unwrap_or_else(|e| panic!("a non-commit tag broke the listing: {e}", e = e.message()));
     assert!(listed.tags.iter().any(|t| t.name == "ok"));
 }
 

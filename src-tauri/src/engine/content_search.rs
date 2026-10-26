@@ -11,6 +11,7 @@
 use crate::engine::git_cli::{
     self, validate_repo, BoundedRun, Incomplete, OutputStream, ProcessObserver,
 };
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
@@ -103,14 +104,12 @@ impl ProcessObserver for SearchObserver<'_> {
     }
 }
 
-fn validate_pattern(pattern: &str) -> Result<(), String> {
+fn validate_pattern(pattern: &str) -> Result<(), CommandError> {
     if pattern.is_empty() {
         return Err("Enter something to search for".into());
     }
     if pattern.len() > MAX_PATTERN_BYTES {
-        return Err(format!(
-            "The search pattern exceeds {MAX_PATTERN_BYTES} bytes"
-        ));
+        return Err(format!("The search pattern exceeds {MAX_PATTERN_BYTES} bytes").into());
     }
     if pattern.chars().any(|c| c == '\0' || c == '\n' || c == '\r') {
         return Err("The search pattern must be a single line".into());
@@ -212,14 +211,14 @@ fn parse_u64(bytes: &[u8]) -> Option<u64> {
 }
 
 /// Peels a revision to a commit oid, refusing anything that is not one.
-fn peel_commit(repo: &Path, revision: &str) -> Result<String, String> {
+fn peel_commit(repo: &Path, revision: &str) -> Result<String, CommandError> {
     crate::engine::git_writer::validate_oid_or_revision(revision)?;
     let spec = format!("{revision}^{{commit}}");
     let oid = git_cli::git_text(repo, &["rev-parse", "--verify", "--quiet", spec.as_str()])
         .map_err(|_| format!("'{revision}' does not name a commit"))?;
     let oid = oid.trim().to_string();
     if !matches!(oid.len(), 40 | 64) || !oid.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(format!("'{revision}' does not name a commit"));
+        return Err(format!("'{revision}' does not name a commit").into());
     }
     Ok(oid)
 }
@@ -232,7 +231,7 @@ pub fn search(
     pattern: &str,
     options: &ContentSearchOptions,
     cancelled: &dyn Fn() -> bool,
-) -> Result<ContentSearchReport, String> {
+) -> Result<ContentSearchReport, CommandError> {
     validate_pattern(pattern)?;
     let repo = validate_repo(repo_path)?;
     let limit = options
@@ -288,7 +287,7 @@ fn report_from_run(
     limit: usize,
     over_limit: bool,
     user_cancelled: bool,
-) -> Result<ContentSearchReport, String> {
+) -> Result<ContentSearchReport, CommandError> {
     // Exit 1 with nothing on stderr is git grep's "no match". A run we
     // stopped exits by signal, so its status says nothing; anything else
     // non-zero (a bad regex, a missing revision) is git's error.
@@ -296,9 +295,9 @@ fn report_from_run(
         let stderr = String::from_utf8_lossy(&run.stderr).trim().to_string();
         if !(run.status_code == 1 && stderr.is_empty()) {
             return Err(if stderr.is_empty() {
-                format!("git grep failed (exit {})", run.status_code)
+                format!("git grep failed (exit {})", run.status_code).into()
             } else {
-                format!("Search failed: {stderr}")
+                format!("Search failed: {stderr}").into()
             });
         }
     }

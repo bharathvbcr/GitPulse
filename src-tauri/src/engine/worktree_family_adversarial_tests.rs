@@ -8,6 +8,7 @@ use super::worktree::{
     admit_worktree_pair, family_disk_dir, forget_in_process, read_worktree_entries,
 };
 use super::worktree_family_disk as disk;
+use crate::ipc_error::CommandError;
 use crate::test_support::{git_in, repo_with_worktrees, trust_repo};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -54,7 +55,11 @@ impl Fx {
         self.main.path().canonicalize().unwrap().join(".git")
     }
     /// What a brand new hook process answers for the pair, disk memory included.
-    fn fresh(&self, repo: &str, worktree: &str) -> Result<super::worktree::WorktreeFamily, String> {
+    fn fresh(
+        &self,
+        repo: &str,
+        worktree: &str,
+    ) -> Result<super::worktree::WorktreeFamily, CommandError> {
         forget_in_process(&self.common());
         admit_worktree_pair(repo, worktree)?.authenticate()
     }
@@ -64,7 +69,7 @@ impl Fx {
         &self,
         repo: &str,
         worktree: &str,
-    ) -> Result<super::worktree::WorktreeFamily, String> {
+    ) -> Result<super::worktree::WorktreeFamily, CommandError> {
         forget_in_process(&self.common());
         let empty = private_dir();
         let _scope = family_disk_dir::set(empty.path());

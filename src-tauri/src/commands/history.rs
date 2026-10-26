@@ -1,6 +1,7 @@
 //! History-rewriting commands: rebase, merge, restack, stash, cherry-pick, revert, reset.
 
 use super::*;
+use crate::ipc_error::CommandError;
 
 #[tauri::command(async)]
 pub async fn cmd_rebase_interactive(
@@ -160,7 +161,7 @@ pub async fn cmd_stash_action(
             action,
             index,
             &expected_oid,
-            |argv| guard(&repo_path, argv),
+            |argv| guard(&repo_path, argv).map_err(CommandError::from),
         )?;
         Ok(Guarded { policy, output })
     })
@@ -251,7 +252,7 @@ pub(super) fn rebase_planned_commands(
     repo_path: &str,
     onto_commit: &str,
     steps: &[RebaseStep],
-) -> Result<Vec<Vec<String>>, String> {
+) -> Result<Vec<Vec<String>>, CommandError> {
     let repo = validate_repo(repo_path)?;
     validate_oid_or_revision(onto_commit)?;
     if steps.is_empty() {
@@ -272,7 +273,8 @@ pub(super) fn rebase_planned_commands(
                     _ => "fixup",
                 },
                 first.commit_id
-            ));
+            )
+            .into());
         }
     }
     for step in steps {

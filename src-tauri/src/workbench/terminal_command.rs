@@ -6,6 +6,7 @@ use super::WorkbenchError;
 use crate::engine::git_cli::{
     capture_command, extended_child_path, resolve_spawn_program_with, CapturedOutput,
 };
+use crate::ipc_error::CommandError;
 use crate::tool_config::ModelChoice;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -792,7 +793,7 @@ pub(super) fn check(
     // launch, and used to run serially before every agent launch. They are
     // kept per binary (path, size, mtime), so an upgrade is seen at once.
     static PROBES: crate::tool_capability::BinaryProbeCache<
-        Result<(CapturedOutput, CapturedOutput), String>,
+        Result<(CapturedOutput, CapturedOutput), CommandError>,
     > = crate::tool_capability::BinaryProbeCache::new();
     let probed = PROBES.get_or_probe(program, || {
         let probe = |arg: &str| {
@@ -810,7 +811,7 @@ pub(super) fn check(
         let cacheable = outcome.as_ref().is_ok_and(|(v, h)| v.success && h.success);
         (outcome, cacheable)
     });
-    let (version, help) = probed.map_err(|e| error("capability_error", e))?;
+    let (version, help) = probed.map_err(|e| error("capability_error", e.into_message()))?;
     advertises(provider, mode, options, &version, &help)
 }
 

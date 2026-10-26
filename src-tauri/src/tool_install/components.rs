@@ -38,6 +38,7 @@
 
 use super::ExternalTool;
 use crate::engine::git_cli;
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 use std::time::Duration;
@@ -231,9 +232,10 @@ fn run_probe(path: &str, id: &str, args: &[&str]) -> Result<(bool, String), Stri
     let mut cmd = Command::new(path);
     cmd.args(args);
     cmd.current_dir(probe_dir());
+    // A component probe is a status line, not a command's error.
     let run = git_cli::run_bounded_capped(cmd, id, PROBE_TIMEOUT, None, PROBE_CAP)
-        .map_err(|e| e.to_string())?
-        .require_complete(id)?;
+        .and_then(|run| run.require_complete(id))
+        .map_err(CommandError::into_message)?;
     let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
     let combined = if stdout.trim().is_empty() {

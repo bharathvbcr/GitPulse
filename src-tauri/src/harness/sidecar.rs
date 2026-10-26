@@ -1191,7 +1191,10 @@ fn claude_key_for(binary: &str) -> Result<String, HarnessError> {
     )
     .and_then(|run| run.require_complete("manvi version"))
     .map_err(|e| {
-        HarnessError::Unavailable(format!("could not ask `{binary}` what it withholds: {e}"))
+        HarnessError::Unavailable(format!(
+            "could not ask `{binary}` what it withholds: {e}",
+            e = e.message()
+        ))
     })?;
     let version: Value = serde_json::from_slice(&run.stdout).unwrap_or(Value::Null);
     let withheld: Option<Vec<String>> = version
@@ -1213,7 +1216,7 @@ fn claude_key_for(binary: &str) -> Result<String, HarnessError> {
     let keychain = super::claude_key::Keychain::system().map_err(HarnessError::Unavailable)?;
     keychain
         .load()
-        .map_err(HarnessError::Unavailable)?
+        .map_err(|e| HarnessError::Unavailable(e.into_message()))?
         .ok_or_else(|| {
             HarnessError::Unavailable(
                 "Manvi is set to use Claude, but no Claude API key is saved. Add one in the \

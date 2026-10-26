@@ -23,6 +23,7 @@
 use crate::engine::git_cli::{
     git_text, is_deferred_under_load, resolve_git_common_dir, validate_repo,
 };
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -995,12 +996,12 @@ fn is_check_ignore_exit_one(reason: &str) -> bool {
 /// when it also mentions exit status 1: the gate's sentence is the cause, and
 /// a status code that was never returned must not win.
 fn census_from_check_ignore(
-    result: Result<Vec<u8>, String>,
+    result: Result<Vec<u8>, CommandError>,
 ) -> GitProbe<std::collections::HashSet<Vec<u8>>> {
     match result {
         Ok(out) => GitProbe::Answered(parse_check_ignore_z(&out)),
-        Err(reason) if is_deferred_under_load(&reason) => GitProbe::Unexamined,
-        Err(reason) if is_check_ignore_exit_one(&reason) => {
+        Err(reason) if is_deferred_under_load(reason.message()) => GitProbe::Unexamined,
+        Err(reason) if is_check_ignore_exit_one(reason.message()) => {
             GitProbe::Answered(std::collections::HashSet::new())
         }
         Err(_) => GitProbe::Unexamined,
@@ -1442,7 +1443,7 @@ fn branch_summary(repo_path: &str) -> BranchStorageSummary {
     let branches = match crate::engine::GitReader::list_branches(repo_path) {
         Ok(b) => b,
         Err(e) => {
-            summary.error = Some(e);
+            summary.error = Some(e.into_message());
             return summary;
         }
     };
@@ -1475,7 +1476,7 @@ fn branch_summary(repo_path: &str) -> BranchStorageSummary {
                 .map(|c| c.name.clone())
                 .collect();
         }
-        Err(e) => summary.error = Some(e),
+        Err(e) => summary.error = Some(e.into_message()),
     }
     summary
 }
@@ -1759,7 +1760,7 @@ fn build_reclaim(
     (items, summary)
 }
 
-pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
+pub fn scan_storage(repo_path: &str) -> Result<StorageReport, CommandError> {
     let started = Instant::now();
     let repo = validate_repo(repo_path)?;
     let resolved = crate::engine::git_cli::resolve_repo(repo_path)?;
@@ -1775,7 +1776,7 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
     let (worktree_infos, worktrees_unexamined) =
         match crate::engine::worktree::list_worktrees_lite(repo_path) {
             Ok(infos) => (infos, false),
-            Err(reason) if is_deferred_under_load(&reason) => (Vec::new(), true),
+            Err(reason) if is_deferred_under_load(reason.message()) => (Vec::new(), true),
             Err(reason) => return Err(reason),
         };
     let mut linked_worktrees = std::collections::HashSet::new();
@@ -2002,7 +2003,10 @@ pub fn scan_storage(repo_path: &str) -> Result<StorageReport, String> {
                 report
             }
             Err(reason) => commit_graph::CommitGraphReport {
-                note: Some(format!("the git directory could not be resolved: {reason}")),
+                note: Some(format!(
+                    "the git directory could not be resolved: {reason}",
+                    reason = reason.message()
+                )),
                 ..commit_graph::CommitGraphReport::default()
             },
         },

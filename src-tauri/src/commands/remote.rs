@@ -1,6 +1,7 @@
 //! Remote commands: clone, identity, fetch, pull, push, remotes, submodules, repository operations.
 
 use super::*;
+use crate::ipc_error::CommandError;
 
 /// One step of a clone, sent as the `clone-progress` event while
 /// [`cmd_clone_repo`] runs. `id` is the caller's, so a window can tell its
@@ -209,7 +210,7 @@ pub async fn cmd_remote_change(
 ) -> Result<Guarded<String>, IpcError> {
     off_thread(move || {
         let (policy, output) = crate::engine::remotes::apply_with(&repo_path, &change, |argv| {
-            guard(&repo_path, argv)
+            guard(&repo_path, argv).map_err(CommandError::from)
         })?;
         Ok(Guarded { policy, output })
     })
@@ -233,7 +234,7 @@ pub async fn cmd_submodule_change(
     off_thread(move || {
         let (policy, output) =
             crate::engine::submodules::apply_with(&repo_path, &change, |argv| {
-                guard(&repo_path, argv)
+                guard(&repo_path, argv).map_err(CommandError::from)
             })?;
         Ok(Guarded { policy, output })
     })
@@ -254,7 +255,7 @@ pub async fn cmd_repo_operation(repo_path: String) -> Result<Option<RepoOperatio
 }
 
 /// mtime of `FETCH_HEAD` in the shared git dir (worktrees share one), as epoch ms.
-pub(crate) fn last_fetch_at_ms(repo: &std::path::Path) -> Result<Option<i64>, String> {
+pub(crate) fn last_fetch_at_ms(repo: &std::path::Path) -> Result<Option<i64>, CommandError> {
     use crate::engine::git_cli::resolve_git_common_dir;
     use std::time::UNIX_EPOCH;
 
@@ -272,7 +273,7 @@ pub(crate) fn last_fetch_at_ms(repo: &std::path::Path) -> Result<Option<i64>, St
             Ok(Some(millis as i64))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("Could not read FETCH_HEAD: {error}")),
+        Err(error) => Err(format!("Could not read FETCH_HEAD: {error}").into()),
     }
 }
 
@@ -281,14 +282,17 @@ pub(crate) fn last_fetch_at_ms(repo: &std::path::Path) -> Result<Option<i64>, St
 /// refreshes. Trust-checked like any read; runs no Git.
 #[tauri::command(async)]
 pub async fn cmd_note_tab_activated(repo_path: String) -> Result<(), IpcError> {
-    off_thread(move || crate::engine::git_cli::note_tab_activated(&repo_path)).await
+    off_thread(move || {
+        crate::engine::git_cli::note_tab_activated(&repo_path).map_err(CommandError::from)
+    })
+    .await
 }
 
 #[tauri::command(async)]
 pub async fn cmd_last_fetch_at(repo_path: String) -> Result<Option<i64>, IpcError> {
     off_thread(move || {
         let repo = validate_repo(&repo_path)?;
-        last_fetch_at_ms(&repo)
+        last_fetch_at_ms(&repo).map_err(CommandError::from)
     })
     .await
 }
@@ -314,7 +318,7 @@ pub async fn cmd_repo_operation_action(
         // what actually ran.
         let (policy, output) =
             crate::engine::repo_op::run_action_with(&repo_path, action, |argv| {
-                guard(&repo_path, argv)
+                guard(&repo_path, argv).map_err(CommandError::from)
             })?;
         Ok(Guarded { policy, output })
     })

@@ -212,7 +212,7 @@ fn start<R: tauri::Runtime>(
         output,
         observer,
     )
-    .map_err(|e| WorkbenchError::new("launch_error", e))
+    .map_err(|e| WorkbenchError::new("launch_error", e.into_message()))
 }
 
 struct RunObserver<R: tauri::Runtime> {

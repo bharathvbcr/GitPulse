@@ -4,7 +4,7 @@ use super::*;
 use crate::engine::git_cli::{refusal_message, Refusal};
 
 fn shed(label: &str) -> String {
-    refusal_message(label, Refusal::Shed)
+    refusal_message(label, Refusal::Shed).into_message()
 }
 
 fn read<T>(body: impl FnOnce() -> Result<T, String>) -> Result<T, IpcError> {

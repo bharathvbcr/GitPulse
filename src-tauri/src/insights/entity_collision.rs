@@ -12,6 +12,7 @@ use crate::engine::git_cli::git_text;
 use crate::engine::git_reader::GitReader;
 use crate::engine::validate_repo;
 use crate::insights::{CollisionItem, CollisionParty};
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -479,7 +480,7 @@ fn party_old_side_symbols(
     party: &CollisionParty,
     incoming: Option<&[String]>,
 ) -> Result<PartyEdits, PartyFailure> {
-    let repo = validate_repo(&party.path).map_err(PartyFailure::other)?;
+    let repo = validate_repo(&party.path).map_err(|e| PartyFailure::other(e.into_message()))?;
     let repo_str = repo.to_string_lossy();
 
     if !GitReader::is_tracked(&repo_str, file_path).unwrap_or(false) {
@@ -488,7 +489,7 @@ fn party_old_side_symbols(
         ));
     }
 
-    let head = GitReader::head_id(&repo_str).map_err(PartyFailure::other)?;
+    let head = GitReader::head_id(&repo_str).map_err(|e| PartyFailure::other(e.into_message()))?;
     let spans = codeintel::symbols_for_file(&repo_str, file_path, &head);
     if !spans.available {
         return Err(PartyFailure::other(
@@ -525,7 +526,8 @@ fn party_old_side_symbols(
         return Err(PartyFailure::other("no indexed symbols for path at HEAD"));
     }
 
-    let (mut hunks, head_diff) = old_side_diff(&repo, file_path).map_err(PartyFailure::other)?;
+    let (mut hunks, head_diff) =
+        old_side_diff(&repo, file_path).map_err(|e| PartyFailure::other(e.into_message()))?;
     if let Some(replaced) = incoming {
         let content = read_working_text(&repo, file_path).map_err(PartyFailure::other)?;
         for old in replaced {
@@ -561,7 +563,7 @@ fn party_old_side_symbols(
 /// The text of the `git diff HEAD` half comes back with the hunks: it is the
 /// only one that also numbers the working-tree side, which is what places an
 /// incoming edit in HEAD's coordinates.
-fn old_side_diff(repo: &Path, file_path: &str) -> Result<(Vec<OldSideHunk>, String), String> {
+fn old_side_diff(repo: &Path, file_path: &str) -> Result<(Vec<OldSideHunk>, String), CommandError> {
     // `:(literal)` stops `*?[` in a filename from widening the pathspec.
     // `--no-textconv` keeps a configured textconv filter from rewriting the
     // diff into something whose line numbers are not the file's.
@@ -574,8 +576,8 @@ fn old_side_diff(repo: &Path, file_path: &str) -> Result<(Vec<OldSideHunk>, Stri
             args.push("--cached");
         }
         args.extend(["--no-textconv", "--unified=0", "HEAD", "--", spec.as_str()]);
-        let text =
-            git_text(repo, &args).map_err(|e| format!("git diff against HEAD failed: {e}"))?;
+        let text = git_text(repo, &args)
+            .map_err(|e| e.wrap(|e| format!("git diff against HEAD failed: {e}")))?;
         // A diff that says the file differs but prints no hunk header (binary,
         // or anything this parser was not written for) is not "no edits": the
         // working lines cannot be numbered, so no edit can be placed against
@@ -594,7 +596,7 @@ fn old_side_diff(repo: &Path, file_path: &str) -> Result<(Vec<OldSideHunk>, Stri
     hunks.sort();
     hunks.dedup();
     if hunks.len() > MAX_HUNKS_PER_PARTY {
-        return Err(format!("too many hunks (more than {MAX_HUNKS_PER_PARTY})"));
+        return Err(format!("too many hunks (more than {MAX_HUNKS_PER_PARTY})").into());
     }
     Ok((hunks, head_diff))
 }

@@ -11,6 +11,7 @@ use gitpulse_lib::engine::repo_op;
 use gitpulse_lib::engine::stash::{self, StashAction};
 use gitpulse_lib::engine::submodules::{self, SubmoduleChange, SubmoduleState};
 use gitpulse_lib::engine::{remotes, GitWriter, RemoteChange, ResetMode};
+use gitpulse_lib::ipc_error::CommandError;
 use gitpulse_lib::procguard::LockedSpawn;
 use std::fs;
 use std::path::Path;
@@ -84,7 +85,7 @@ fn commit(dir: &Path, file: &str, content: &str, message: &str) {
 }
 
 /// Approves whatever argv it is given, recording it.
-fn allow(argv: &[&str]) -> Result<Vec<String>, String> {
+fn allow(argv: &[&str]) -> Result<Vec<String>, CommandError> {
     Ok(argv.iter().map(|a| a.to_string()).collect())
 }
 
@@ -203,7 +204,8 @@ fn a_stale_index_is_refused_rather_than_dropping_the_wrong_entry() {
     .unwrap_err();
     assert!(
         err.contains("Refresh the stash list"),
-        "refusal must tell the caller what to do, got: {err}"
+        "refusal must tell the caller what to do, got: {err}",
+        err = err.message()
     );
 
     // Both entries survive: nothing was destroyed.
@@ -229,7 +231,11 @@ fn an_index_past_the_end_of_the_stack_is_refused() {
         allow,
     )
     .unwrap_err();
-    assert!(err.contains("no longer exists"), "got: {err}");
+    assert!(
+        err.contains("no longer exists"),
+        "got: {err}",
+        err = err.message()
+    );
     assert_eq!(
         stash::list(&dir.to_string_lossy()).unwrap().entries.len(),
         1
@@ -250,7 +256,7 @@ fn a_refused_gate_leaves_the_stash_stack_untouched() {
         StashAction::Drop,
         entry.index,
         &entry.oid,
-        |_argv| Err::<(), String>("blocked by policy".into()),
+        |_argv| Err::<(), CommandError>("blocked by policy".into()),
     )
     .unwrap_err();
     assert_eq!(err, "blocked by policy");
@@ -479,7 +485,11 @@ fn adding_a_remote_that_already_exists_is_refused_by_name() {
         allow,
     )
     .unwrap_err();
-    assert!(err.contains("already exists"), "got: {err}");
+    assert!(
+        err.contains("already exists"),
+        "got: {err}",
+        err = err.message()
+    );
     // The original URL survives the refusal.
     assert_eq!(
         remotes::list(&path).unwrap().remotes[0]
@@ -502,7 +512,11 @@ fn acting_on_a_remote_that_does_not_exist_is_refused() {
         allow,
     )
     .unwrap_err();
-    assert!(err.contains("No remote named"), "got: {err}");
+    assert!(
+        err.contains("No remote named"),
+        "got: {err}",
+        err = err.message()
+    );
 }
 
 #[test]
@@ -526,7 +540,8 @@ fn a_hostile_remote_url_never_reaches_git() {
         .unwrap_err();
         assert!(
             !err.contains("already exists"),
-            "must fail validation, got: {err}"
+            "must fail validation, got: {err}",
+            err = err.message()
         );
     }
     assert!(!Path::new("/tmp/gitpulse-remote-pwn").exists());
@@ -722,7 +737,8 @@ fn a_refused_submodule_transport_is_reported_rather_than_swallowed() {
     .unwrap_err();
     assert!(
         err.contains("transport 'file' not allowed"),
-        "the real cause must reach the caller, got: {err}"
+        "the real cause must reach the caller, got: {err}",
+        err = err.message()
     );
     // And the submodule is still honestly reported as uninitialized.
     assert_eq!(
@@ -754,7 +770,11 @@ fn naming_a_path_that_is_not_a_submodule_is_refused() {
         allow,
     )
     .unwrap_err();
-    assert!(err.contains("No submodule at"), "got: {err}");
+    assert!(
+        err.contains("No submodule at"),
+        "got: {err}",
+        err = err.message()
+    );
 }
 
 #[test]
@@ -809,7 +829,7 @@ fn a_conflicting_cherry_pick_parks_the_repository_for_the_recovery_banner() {
     commit(dir, "f.txt", "main\n", "main");
 
     let err = GitWriter::cherry_pick(&dir.to_string_lossy(), &[picked], false).unwrap_err();
-    assert!(!err.is_empty());
+    assert!(!err.message().is_empty());
     // The parked state is the supported outcome — the banner offers the exit.
     let parked = repo_op::detect(dir).unwrap().expect("must be parked");
     assert_eq!(parked.kind, repo_op::OperationKind::CherryPick);
@@ -842,7 +862,11 @@ fn a_replay_refuses_to_start_on_top_of_a_parked_operation() {
     try_git(dir, &["merge", "--no-edit", "side"]);
 
     let err = GitWriter::cherry_pick(&dir.to_string_lossy(), &[picked], false).unwrap_err();
-    assert!(err.contains("merge is in progress"), "got: {err}");
+    assert!(
+        err.contains("merge is in progress"),
+        "got: {err}",
+        err = err.message()
+    );
     // The merge is untouched.
     assert_eq!(
         repo_op::detect(dir).unwrap().unwrap().kind,
@@ -855,7 +879,11 @@ fn an_empty_commit_list_is_refused() {
     let repo = init_repo();
     commit(repo.path(), "f.txt", "a\n", "c1");
     let err = GitWriter::cherry_pick(&repo.path().to_string_lossy(), &[], false).unwrap_err();
-    assert!(err.contains("No commits"), "got: {err}");
+    assert!(
+        err.contains("No commits"),
+        "got: {err}",
+        err = err.message()
+    );
 }
 
 #[test]
@@ -916,7 +944,11 @@ fn a_reset_refuses_while_an_operation_is_parked() {
     try_git(dir, &["merge", "--no-edit", "side"]);
 
     let err = GitWriter::reset(&dir.to_string_lossy(), ResetMode::Hard, "HEAD").unwrap_err();
-    assert!(err.contains("merge is in progress"), "got: {err}");
+    assert!(
+        err.contains("merge is in progress"),
+        "got: {err}",
+        err = err.message()
+    );
     assert!(repo_op::detect(dir).unwrap().is_some());
 }
 

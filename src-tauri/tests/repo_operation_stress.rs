@@ -286,8 +286,12 @@ fn corrupt_control_files_never_panic_and_never_lose_the_escape() {
         }
         fs::write(&target, bytes).unwrap();
 
-        let detected = repo_op::detect(dir)
-            .unwrap_or_else(|e| panic!("{relative} corruption produced a hard error: {e}"));
+        let detected = repo_op::detect(dir).unwrap_or_else(|e| {
+            panic!(
+                "{relative} corruption produced a hard error: {e}",
+                e = e.message()
+            )
+        });
         let op =
             detected.unwrap_or_else(|| panic!("{relative} corruption hid the operation entirely"));
         assert!(
@@ -440,7 +444,10 @@ fn a_bare_repository_reports_idle_rather_than_failing() {
     match repo_op::detect(dir.path()) {
         Ok(None) => {}
         Ok(Some(op)) => panic!("a bare repository cannot be parked, got {:?}", op.kind),
-        Err(e) => panic!("a bare repository must not fail detection: {e}"),
+        Err(e) => panic!(
+            "a bare repository must not fail detection: {e}",
+            e = e.message()
+        ),
     }
 }
 

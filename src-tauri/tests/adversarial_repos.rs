@@ -94,7 +94,9 @@ fn a_fixture_built_binary_does_not_spend_the_production_spawn_burst() {
                 scope.spawn(|| {
                     for n in 0..40 {
                         gitpulse_lib::engine::git_cli::git_text(path, &["rev-parse", "HEAD"])
-                            .unwrap_or_else(|error| panic!("spawn {n} was refused: {error}"));
+                            .unwrap_or_else(|error| {
+                                panic!("spawn {n} was refused: {error}", error = error.message())
+                            });
                     }
                 })
             })
@@ -203,7 +205,8 @@ fn binary_blob_and_oversize_cap_fail_closed_not_fatal() {
     let err = GitReader::get_file_blob(path, "big.bin", None).unwrap_err();
     assert!(
         err.contains("size limit"),
-        "expected size-cap error, got: {err}"
+        "expected size-cap error, got: {err}",
+        err = err.message()
     );
     assert!(
         started.elapsed() < common::env::coverage_relaxed(Duration::from_secs(10)),
@@ -446,7 +449,7 @@ fn eight_thread_stage_commit_hammer_finishes_without_deadlock() {
         for result in results {
             match result {
                 Ok(_) => committed += 1,
-                Err(err) => panic!("unexpected hammer failure: {err}"),
+                Err(err) => panic!("unexpected hammer failure: {err}", err = err.message()),
             }
         }
     }

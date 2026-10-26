@@ -226,7 +226,11 @@ fn commit_on_a_held_lock_is_retried_then_fails_with_gits_message() {
     std::fs::write(&lock, b"").unwrap();
     let started = Instant::now();
     let error = git_text(path, &["commit", "-m", "two"]).expect_err("lock held");
-    assert!(is_transient_git_lock_error(&error), "{error}");
+    assert!(
+        is_transient_git_lock_error(error.message()),
+        "{error}",
+        error = error.message()
+    );
     assert!(
         started.elapsed() >= Duration::from_millis(450),
         "no backoff happened: {:?}",
@@ -404,7 +408,10 @@ fn run_error_message_shapes() {
         "one code prefix is stripped, for every anchored check alike"
     );
     assert_eq!(
-        RunError::classify(&format!("[a] [b] {deferred}")),
+        RunError::classify(&format!(
+            "[a] [b] {deferred}",
+            deferred = deferred.message()
+        )),
         RunError::Other,
         "nested code prefix is not stripped by is_deferred_under_load"
     );
@@ -421,7 +428,7 @@ fn run_error_message_shapes() {
         "exit-failure text that merely contains the marker is not the runner's deadline"
     );
     assert_eq!(RunError::classify(&slot), RunError::SlotWaitTimeout);
-    assert_eq!(RunError::classify(&deferred), RunError::Deferred);
+    assert_eq!(RunError::classify(deferred.message()), RunError::Deferred);
 }
 
 /// BREAK: a caller-prefixed spawn failure whose program path spells the timeout
@@ -465,8 +472,13 @@ fn a_real_slow_child_is_classified_as_a_timeout_by_both_runners() {
         None,
     )
     .expect_err("slow child must time out");
-    assert!(is_run_timeout(&err), "{err}");
-    assert_eq!(RunError::classify(&err), RunError::Timeout, "{err}");
+    assert!(is_run_timeout(err.message()), "{err}", err = err.message());
+    assert_eq!(
+        RunError::classify(err.message()),
+        RunError::Timeout,
+        "{err}",
+        err = err.message()
+    );
 
     let mut cmd = Command::new(&bin);
     let err = run_observed(
@@ -478,7 +490,7 @@ fn a_real_slow_child_is_classified_as_a_timeout_by_both_runners() {
         &mut (),
     )
     .expect_err("slow child must time out");
-    assert!(is_run_timeout(&err), "{err}");
+    assert!(is_run_timeout(err.message()), "{err}", err = err.message());
 
     let missing = run_bounded(
         Command::new(dir.path().join("nope")),
@@ -488,16 +500,19 @@ fn a_real_slow_child_is_classified_as_a_timeout_by_both_runners() {
     )
     .expect_err("missing binary");
     assert_eq!(
-        RunError::classify(&missing),
+        RunError::classify(missing.message()),
         RunError::SpawnNotFound,
-        "{missing}"
+        "{missing}",
+        missing = missing.message()
     );
 }
 
 // ---- unborn HEAD -------------------------------------------------------------
 
 fn head_error(repo: &Path) -> String {
-    git_text(repo, &["log", "-n1", "--format=%H"]).expect_err("HEAD does not resolve")
+    git_text(repo, &["log", "-n1", "--format=%H"])
+        .expect_err("HEAD does not resolve")
+        .into_message()
 }
 
 #[test]
@@ -597,8 +612,9 @@ fn a_fresh_reftable_repo_is_unborn() {
     // any read, so the classifier is never asked: the git probe itself says so.
     let error = git_text(dir.path(), &["log", "-n1", "--format=%H"]).expect_err("no commits");
     assert!(
-        error.contains("REPOSITORY_TRUST_REQUIRED") || head_is_unborn(dir.path(), &error),
-        "{error}"
+        error.contains("REPOSITORY_TRUST_REQUIRED") || head_is_unborn(dir.path(), error.message()),
+        "{error}",
+        error = error.message()
     );
 }
 

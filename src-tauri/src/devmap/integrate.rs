@@ -30,6 +30,7 @@
 
 use super::cli::{resolve_binary, run_devmap_public, ResolvedDevmap, STATUS_DEADLINE};
 use crate::engine::git_cli::validate_repo;
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
@@ -301,7 +302,7 @@ fn run(
     repo: &Path,
     host: IntegrationHost,
     apply: bool,
-) -> Result<Value, String> {
+) -> Result<Value, CommandError> {
     let mut args: Vec<&str> = vec!["integrate", host.as_str(), "--json"];
     if !apply {
         args.push("--dry-run");
@@ -320,17 +321,18 @@ fn run(
             &stderr,
             format!("devmap integrate exited {}", run.status_code),
         );
-        return Err(detail.chars().take(400).collect());
+        return Err(detail.chars().take(400).collect::<String>().into());
     }
     serde_json::from_str::<Value>(stdout.trim())
         .map_err(|e| format!("devmap integrate returned non-JSON stdout: {e}"))
+        .map_err(CommandError::from)
 }
 
 /// What integrating `host` into `repo_path` would change. Writes nothing.
 pub fn preview(repo_path: &str, host: IntegrationHost) -> IntegrationPlan {
     let repo = match validate_repo(repo_path) {
         Ok(repo) => repo,
-        Err(e) => return IntegrationPlan::unavailable(host, repo_path, e),
+        Err(e) => return IntegrationPlan::unavailable(host, repo_path, e.into_message()),
     };
     let binary = match resolve_binary() {
         Ok(binary) => binary,
@@ -338,7 +340,7 @@ pub fn preview(repo_path: &str, host: IntegrationHost) -> IntegrationPlan {
     };
     match run(&binary, &repo, host, false) {
         Ok(payload) => parse_plan(host, &repo, &payload, false),
-        Err(e) => IntegrationPlan::unavailable(host, repo_path, e),
+        Err(e) => IntegrationPlan::unavailable(host, repo_path, e.into_message()),
     }
 }
 
@@ -350,7 +352,7 @@ pub fn preview(repo_path: &str, host: IntegrationHost) -> IntegrationPlan {
 pub fn apply(repo_path: &str, host: IntegrationHost) -> IntegrationPlan {
     let repo = match validate_repo(repo_path) {
         Ok(repo) => repo,
-        Err(e) => return IntegrationPlan::unavailable(host, repo_path, e),
+        Err(e) => return IntegrationPlan::unavailable(host, repo_path, e.into_message()),
     };
     let binary = match resolve_binary() {
         Ok(binary) => binary,
@@ -364,7 +366,7 @@ pub fn apply(repo_path: &str, host: IntegrationHost) -> IntegrationPlan {
             let _ = super::init::ensure_state_dir_excluded(&repo);
             parse_plan(host, &repo, &payload, true)
         }
-        Err(e) => IntegrationPlan::unavailable(host, repo_path, e),
+        Err(e) => IntegrationPlan::unavailable(host, repo_path, e.into_message()),
     }
 }
 

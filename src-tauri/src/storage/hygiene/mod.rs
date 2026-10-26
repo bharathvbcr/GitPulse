@@ -9,6 +9,7 @@ use crate::engine::git_cli::{
     build_capture_command, capture_command, git_with_stdin, run_observed, validate_repo,
     ProcessObserver,
 };
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -122,7 +123,7 @@ fn lock_plans() -> std::sync::MutexGuard<'static, Plans> {
 fn exclusive(
     lock: &'static Mutex<()>,
     busy: &'static str,
-) -> Result<std::sync::MutexGuard<'static, ()>, String> {
+) -> Result<std::sync::MutexGuard<'static, ()>, CommandError> {
     match lock.try_lock() {
         Ok(guard) => Ok(guard),
         Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
@@ -136,14 +137,16 @@ fn now() -> u64 {
         .as_secs()
 }
 
-fn home_dir() -> Result<PathBuf, String> {
+fn home_dir() -> Result<PathBuf, CommandError> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .ok_or("Home directory unavailable")?;
-    crate::engine::git_cli::canonicalize_plain(Path::new(&home)).map_err(|e| e.to_string())
+    crate::engine::git_cli::canonicalize_plain(Path::new(&home))
+        .map_err(|e| e.to_string())
+        .map_err(CommandError::from)
 }
 
-fn tool(program: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
+fn tool(program: &str, args: &[&str], cwd: &Path) -> Result<String, CommandError> {
     let result = capture_command(
         program,
         args,
@@ -157,10 +160,7 @@ fn tool(program: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
         ],
     )?;
     if !result.success {
-        return Err(format!(
-            "{program} discovery failed (exit {})",
-            result.status_code
-        ));
+        return Err(format!("{program} discovery failed (exit {})", result.status_code).into());
     }
     if result.stdout.len() > 8192 {
         return Err("Tool discovery output exceeded its budget".into());
@@ -168,9 +168,10 @@ fn tool(program: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
     String::from_utf8(result.stdout)
         .map(|s| s.trim().to_owned())
         .map_err(|e| e.to_string())
+        .map_err(CommandError::from)
 }
 
-fn cache_path(id: &str, home: &Path) -> Result<PathBuf, String> {
+fn cache_path(id: &str, home: &Path) -> Result<PathBuf, CommandError> {
     let raw = match id {
         "cargo" => {
             return Ok(std::env::var_os("CARGO_HOME")
@@ -190,7 +191,7 @@ fn cache_path(id: &str, home: &Path) -> Result<PathBuf, String> {
     Ok(PathBuf::from(raw))
 }
 
-fn managed_cache_path(path: &Path, home: &Path) -> Result<PathBuf, String> {
+fn managed_cache_path(path: &Path, home: &Path) -> Result<PathBuf, CommandError> {
     let resolved = crate::engine::git_cli::canonicalize_plain(path).map_err(|e| e.to_string())?;
     let home = crate::engine::git_cli::canonicalize_plain(home).map_err(|e| e.to_string())?;
     // macOS aliases /var to /private/var. Resolve that platform prefix, but
@@ -229,7 +230,7 @@ fn managed_cache_path(path: &Path, home: &Path) -> Result<PathBuf, String> {
     Ok(resolved)
 }
 
-fn invocation(id: &str, path: &Path, home: &Path) -> Result<Invocation, String> {
+fn invocation(id: &str, path: &Path, home: &Path) -> Result<Invocation, CommandError> {
     let path = path.to_str().ok_or("Cache path is not UTF-8")?;
     let (argv, mut environment): (Vec<&str>, Vec<(String, String)>) = match id {
         "go" => (
@@ -258,7 +259,7 @@ fn invocation(id: &str, path: &Path, home: &Path) -> Result<Invocation, String> 
     })
 }
 
-pub fn cache_inventory() -> Result<CacheInventory, String> {
+pub fn cache_inventory() -> Result<CacheInventory, CommandError> {
     let _lock = exclusive(&INVENTORY, "A shared-cache scan is already running")?;
     let home = home_dir()?;
     let mut entries = Vec::new();
@@ -290,9 +291,9 @@ pub fn cache_inventory() -> Result<CacheInventory, String> {
                 item.bytes = Some(measured.bytes);
                 if action.is_some() { managed_cache_path(&path, &home)?; }
             }
-            Ok::<(), String>(())
+            Ok::<(), CommandError>(())
         })();
-        if let Err(error) = result { item.error = Some(error); item.action = None; }
+        if let Err(error) = result { item.error = Some(error.into_message()); item.action = None; }
         entries.push(item);
     }
     Ok(CacheInventory {
@@ -301,7 +302,7 @@ pub fn cache_inventory() -> Result<CacheInventory, String> {
     })
 }
 
-fn local_checks(repo: &Path, relative: &str) -> Result<PathBuf, String> {
+fn local_checks(repo: &Path, relative: &str) -> Result<PathBuf, CommandError> {
     let path = repo.join(tree::relative_path(relative)?);
     tree::no_symlinks(&path)?;
     if !path.is_dir() || !path.starts_with(repo) || path == repo {
@@ -350,7 +351,7 @@ fn local_checks(repo: &Path, relative: &str) -> Result<PathBuf, String> {
 /// `cargo`, `uv`, `npm`, ...; five long-lived `uvx` MCP proxies then blocked
 /// every cleanup regardless of what they touched. The path-scoped scan is the
 /// check that says whether this directory is in use, so it is the only one.
-fn activity_check(path: &Path) -> Result<(), String> {
+fn activity_check(path: &Path) -> Result<(), CommandError> {
     open_files_under(path)
 }
 
@@ -358,7 +359,7 @@ fn activity_check(path: &Path) -> Result<(), String> {
 /// `path`. Only a completed `lsof` scan that found nothing is `Ok`: a scan
 /// that reported problems, timed out, or cannot run here is an error, never
 /// "nothing is open".
-pub(crate) fn open_files_under(path: &Path) -> Result<(), String> {
+pub(crate) fn open_files_under(path: &Path) -> Result<(), CommandError> {
     #[cfg(unix)]
     {
         let path = path.to_str().ok_or("Non-UTF-8 path")?;
@@ -390,7 +391,11 @@ pub(crate) fn open_files_under(path: &Path) -> Result<(), String> {
     }
 }
 
-pub fn prepare(repo_path: &str, target: &str, min_age_days: u32) -> Result<HygienePlan, String> {
+pub fn prepare(
+    repo_path: &str,
+    target: &str,
+    min_age_days: u32,
+) -> Result<HygienePlan, CommandError> {
     prepare_with_activity(repo_path, target, min_age_days, activity_check)
 }
 
@@ -398,8 +403,8 @@ fn prepare_with_activity(
     repo_path: &str,
     target: &str,
     min_age_days: u32,
-    activity: impl Fn(&Path) -> Result<(), String>,
-) -> Result<HygienePlan, String> {
+    activity: impl Fn(&Path) -> Result<(), CommandError>,
+) -> Result<HygienePlan, CommandError> {
     let _lock = exclusive(&PREPARATION, "Another cleanup preview is being inspected")?;
     let repo = validate_repo(repo_path)?;
     devmap_query::hygiene::validate_retention(min_age_days, false)?;
@@ -480,7 +485,7 @@ fn prepare_with_activity(
     Ok(view)
 }
 
-pub fn cancel(repo_path: &str, id: &str) -> Result<(), String> {
+pub fn cancel(repo_path: &str, id: &str) -> Result<(), CommandError> {
     let repo = crate::engine::git_cli::validate_repo_path(repo_path)?
         .to_string_lossy()
         .into_owned();
@@ -504,8 +509,8 @@ pub fn cancel(repo_path: &str, id: &str) -> Result<(), String> {
 pub fn execute<T>(
     repo_path: &str,
     id: &str,
-    mut gate: impl FnMut(Option<&[String]>, &str) -> Result<T, String>,
-) -> Result<(T, HygieneOutcome), String> {
+    mut gate: impl FnMut(Option<&[String]>, &str) -> Result<T, CommandError>,
+) -> Result<(T, HygieneOutcome), CommandError> {
     let _lock = global::mutation_lock()?;
     execute_with_activity(repo_path, id, &mut gate, activity_check)
 }
@@ -513,9 +518,9 @@ pub fn execute<T>(
 fn execute_with_activity<T>(
     repo_path: &str,
     id: &str,
-    mut gate: impl FnMut(Option<&[String]>, &str) -> Result<T, String>,
-    activity: impl Fn(&Path) -> Result<(), String>,
-) -> Result<(T, HygieneOutcome), String> {
+    mut gate: impl FnMut(Option<&[String]>, &str) -> Result<T, CommandError>,
+    activity: impl Fn(&Path) -> Result<(), CommandError>,
+) -> Result<(T, HygieneOutcome), CommandError> {
     let _lock = exclusive(
         &EXECUTION,
         "Another hygiene operation is running; wait for it to finish",
@@ -584,7 +589,7 @@ fn execute_with_activity<T>(
     activity(path)?;
     let started = Instant::now();
     let result = match &plan.invocation {
-        None => tree::remove_reviewed(path, &current, &plan.cancel),
+        None => tree::remove_reviewed(path, &current, &plan.cancel).map_err(CommandError::from),
         Some(invocation) => {
             let args: Vec<&str> = invocation.argv[1..].iter().map(String::as_str).collect();
             let env: Vec<(&str, &str)> = invocation
@@ -606,7 +611,7 @@ fn execute_with_activity<T>(
                 Ok(out) if out.cancelled => Err("Cancelled; the owning tool may already have removed some entries".into()),
                 Ok(out) if out.success && out.incomplete.is_none() && out.stderr_incomplete.is_none() => Ok(()),
                 Ok(out) if out.success => Err("Tool completed but its output was incomplete; verify the cache before retrying".into()),
-                Ok(out) => Err(format!("Maintenance tool failed (exit {}); cache contents may have changed. Inspect the tool locally for details.", out.status_code)),
+                Ok(out) => Err(format!("Maintenance tool failed (exit {}); cache contents may have changed. Inspect the tool locally for details.", out.status_code).into()),
                 Err(error) => Err(error),
             }
         }
@@ -619,7 +624,7 @@ fn execute_with_activity<T>(
             .map(|s| s.bytes)
     };
     let success = result.is_ok();
-    let message = match result { Ok(()) => "Maintenance completed. Sizes show logical bytes before and after; other processes and shared file storage can affect disk-space savings.".into(), Err(error) => format!("Maintenance did not complete: {error}") };
+    let message = match result { Ok(()) => "Maintenance completed. Sizes show logical bytes before and after; other processes and shared file storage can affect disk-space savings.".into(), Err(error) => format!("Maintenance did not complete: {error}", error = error.message()) };
     Ok((
         policy,
         HygieneOutcome {

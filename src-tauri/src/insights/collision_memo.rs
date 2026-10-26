@@ -39,6 +39,7 @@
 //! - Concurrent callers for one key share one read: the slot is held while it
 //!   is filled, so a burst of hooks costs one scan, not one each.
 
+use crate::ipc_error::CommandError;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -129,8 +130,8 @@ impl<T: Clone> Memo<T> {
         &self,
         key: &str,
         ttl: Duration,
-        fill: impl FnOnce() -> Result<T, String>,
-    ) -> (Result<T, String>, Duration) {
+        fill: impl FnOnce() -> Result<T, CommandError>,
+    ) -> (Result<T, CommandError>, Duration) {
         let slot = self.slot(key);
         // Held across the fill: a second caller for this key waits for the
         // first and then finds its answer, which is the single flight.
@@ -262,7 +263,7 @@ impl CollisionMemo {
         oldest.fetch_max(list_age.as_millis() as u64, Ordering::Relaxed);
         let list = match listed {
             Ok(list) => list,
-            Err(error) => return (empty_collisions(error), list_age),
+            Err(error) => return (empty_collisions(error.into_message()), list_age),
         };
         let read = |path: &str, _deadline: Option<&worktree::ScanDeadline>| -> PathsRead {
             // No deadline: a memoized read is shared, so one caller's clock must
@@ -271,7 +272,7 @@ impl CollisionMemo {
                 .reads
                 .get_or_fill(path, self.ttl, || changed_paths_within(path, None));
             oldest.fetch_max(age.as_millis() as u64, Ordering::Relaxed);
-            read
+            read.map_err(CommandError::from)
         };
         let live = live_in(observation, &list);
         (
@@ -316,27 +317,42 @@ mod tests {
         };
         let ttl = Duration::from_secs(60);
 
-        assert_eq!(memo.get_or_fill("a", ttl, || fill(Ok(1))).0, Ok(1));
-        let (again, age) = memo.get_or_fill("a", ttl, || fill(Ok(2)));
+        assert_eq!(
+            memo.get_or_fill("a", ttl, || fill(Ok(1)).map_err(CommandError::from))
+                .0,
+            Ok(1)
+        );
+        let (again, age) = memo.get_or_fill("a", ttl, || fill(Ok(2)).map_err(CommandError::from));
         assert_eq!(again, Ok(1), "served from memory");
         assert!(age < ttl);
         assert_eq!(fills.get(), 1);
 
         // Past its age it is read again.
         assert_eq!(
-            memo.get_or_fill("a", Duration::ZERO, || fill(Ok(3))).0,
+            memo.get_or_fill("a", Duration::ZERO, || fill(Ok(3))
+                .map_err(CommandError::from))
+                .0,
             Ok(3)
         );
 
         // A failure is returned, not kept, and drops what was there.
         assert!(memo
-            .get_or_fill("a", Duration::ZERO, || fill(Err("x".into())))
+            .get_or_fill("a", Duration::ZERO, || fill(Err("x".into()))
+                .map_err(CommandError::from))
             .0
             .is_err());
-        assert_eq!(memo.get_or_fill("a", ttl, || fill(Ok(4))).0, Ok(4));
+        assert_eq!(
+            memo.get_or_fill("a", ttl, || fill(Ok(4)).map_err(CommandError::from))
+                .0,
+            Ok(4)
+        );
 
         memo.forget("a");
-        assert_eq!(memo.get_or_fill("a", ttl, || fill(Ok(5))).0, Ok(5));
+        assert_eq!(
+            memo.get_or_fill("a", ttl, || fill(Ok(5)).map_err(CommandError::from))
+                .0,
+            Ok(5)
+        );
     }
 
     #[test]

@@ -42,6 +42,7 @@ use super::{
     firebase_program, validate_project_id, FIREBASE_CALL_TIMEOUT, MAX_FIREBASE_ERROR_BYTES,
 };
 use crate::engine::git_cli::{byte_tail, capture_command, validate_repo};
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 
 /// Upper bound on rollouts shown. One extra row is fetched so a capped list
@@ -607,7 +608,7 @@ pub fn parse_backends(
 ///
 /// `args` is a full argv line starting with the program name; everything after
 /// it is passed verbatim, so the line the gate judged is the line that runs.
-pub(crate) fn run_firebase_in(repo_path: &str, args: &[String]) -> Result<Vec<u8>, String> {
+pub(crate) fn run_firebase_in(repo_path: &str, args: &[String]) -> Result<Vec<u8>, CommandError> {
     let program = firebase_program();
     debug_assert!(
         args.first() == Some(&program),
@@ -622,7 +623,8 @@ pub(crate) fn run_firebase_in(repo_path: &str, args: &[String]) -> Result<Vec<u8
             &output.stderr,
             output.status_code,
             args.get(1).map(String::as_str).unwrap_or("firebase"),
-        ));
+        )
+        .into());
     }
     Ok(output.stdout)
 }
@@ -720,7 +722,7 @@ pub fn create_rollout(
     backend_id: &str,
     git_commit: &str,
     argv: &[String],
-) -> Result<RolloutCreateOutcome, String> {
+) -> Result<RolloutCreateOutcome, CommandError> {
     let stdout = run_firebase_in(repo_path, argv)?;
     Ok(RolloutCreateOutcome {
         project_id: project_id.to_string(),
@@ -788,7 +790,7 @@ pub fn load_backends_report(
             return FirebaseBackendsReport::unavailable(
                 cli_present,
                 project_id.to_string(),
-                Some(error),
+                Some(error.into_message()),
             )
         }
     };
@@ -844,7 +846,7 @@ pub fn load_rollouts_report(
     };
     let stdout = match run_firebase_in(repo_path, argv) {
         Ok(stdout) => stdout,
-        Err(error) => return unavailable(error),
+        Err(error) => return unavailable(error.into_message()),
     };
     let result = match unwrap_envelope(&stdout) {
         Ok(result) => result,

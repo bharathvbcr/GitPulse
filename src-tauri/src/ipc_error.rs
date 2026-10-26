@@ -166,6 +166,198 @@ impl IpcError {
     }
 }
 
+/// A failure on its way from the code that produced it to a command's edge,
+/// carrying the kind its producer gave it.
+///
+/// `origin` is set once, by the producer, and survives every layer that puts
+/// its own words around the message ([`CommandError::wrap`]). Wrapping only
+/// marks the text as no longer the producer's: the edge types an unwrapped
+/// error by its origin, and a wrapped one only by the loose deferral rule (see
+/// [`REPLAY_SAFE_READS`]).
+///
+/// There is deliberately no `Display`, `Deref<Target = str>` or conversion to
+/// `String`: each would let `format!("…: {e}")` or `e.to_string()` turn the
+/// error back into text and drop its origin without a word. Reading the text
+/// is [`CommandError::message`]; giving the origin up on purpose, where an
+/// error leaves for a caller that has no use for kinds, is
+/// [`CommandError::into_message`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct CommandError {
+    message: String,
+    origin: Option<(IpcErrorKind, Option<serde_json::Value>)>,
+    wrapped: bool,
+}
+
+impl CommandError {
+    /// A failure nobody typed: what a plain `String` error was.
+    pub fn plain(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            origin: None,
+            wrapped: false,
+        }
+    }
+
+    /// A failure of `kind`, written by the one module that produces it.
+    pub(crate) fn typed(kind: IpcErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            origin: Some((kind, None)),
+            wrapped: false,
+        }
+    }
+
+    /// [`CommandError::typed`] with structured detail the frontend can read,
+    /// such as which repository a refusal is about.
+    pub(crate) fn typed_with_detail(
+        kind: IpcErrorKind,
+        message: impl Into<String>,
+        detail: serde_json::Value,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            origin: Some((kind, Some(detail))),
+            wrapped: false,
+        }
+    }
+
+    /// The text a person reads.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The text alone, for a caller outside any command (a log line, an MCP
+    /// reply, a status field) that has no use for the kind.
+    pub fn into_message(self) -> String {
+        self.message
+    }
+
+    /// The same failure in another layer's words: `words` gets the current
+    /// text and returns the new one. The origin is kept, so a deferral the
+    /// engine explained is still a deferral to the loose rule, but the text is
+    /// no longer the producer's, so no exact kind is read from it. Words that
+    /// hand the text back unchanged (a cleanup note that had nothing to add)
+    /// leave it the producer's.
+    pub fn wrap(self, words: impl FnOnce(&str) -> String) -> Self {
+        let message = words(&self.message);
+        let wrapped = self.wrapped || message != self.message;
+        Self {
+            message,
+            origin: self.origin,
+            wrapped,
+        }
+    }
+
+    /// [`CommandError::wrap`] for a rewrite that keeps the producer's text
+    /// and only edits it in place (the runner's `not_retryable`): the edge
+    /// still reads the origin, so nothing is typed by the new words.
+    pub(crate) fn map_message(self, edit: impl FnOnce(String) -> String) -> Self {
+        Self {
+            message: edit(self.message),
+            ..self
+        }
+    }
+
+    /// The kind its producer gave it, whatever words were put around it since.
+    pub(crate) fn origin(&self) -> Option<IpcErrorKind> {
+        self.origin.as_ref().map(|(kind, _)| *kind)
+    }
+
+    /// The kind of this exact text: the origin while nobody has wrapped it.
+    pub(crate) fn kind(&self) -> IpcErrorKind {
+        match &self.origin {
+            Some((kind, _)) if !self.wrapped => *kind,
+            _ => IpcErrorKind::Unclassified,
+        }
+    }
+
+    /// True when the message contains `needle`.
+    pub fn contains(&self, needle: &str) -> bool {
+        self.message.contains(needle)
+    }
+
+    /// The error a command sends: typed by its producer unless wrapped, and
+    /// never retryable when the command was a user action.
+    fn into_ipc(self, replay_safe: bool, user_action: bool) -> IpcError {
+        let exact = self.kind();
+        let kind = if user_action {
+            // A user action may already have changed something, so it is never
+            // asked again: not for its own deferral, not for a wrapped one.
+            match exact {
+                IpcErrorKind::DeferredUnderLoad => IpcErrorKind::Unclassified,
+                kind => kind,
+            }
+        } else if replay_safe
+            && exact == IpcErrorKind::Unclassified
+            && self.origin() == Some(IpcErrorKind::DeferredUnderLoad)
+        {
+            // A READ that the spawn gate declined, whatever words the engine
+            // put around the refusal on the way out. Only a command on
+            // `REPLAY_SAFE_READS` gets this: asking it again is harmless, and
+            // the frontend bounds it (`MAX_DEFERRED_RETRIES`). Every other
+            // command's deferral is typed by its unwrapped origin or not at all.
+            IpcErrorKind::DeferredUnderLoad
+        } else {
+            exact
+        };
+        let detail = match self.origin {
+            Some((_, detail)) if kind != IpcErrorKind::Unclassified && !self.wrapped => detail,
+            _ => None,
+        };
+        let error = IpcError::new(kind, self.message);
+        match detail {
+            Some(detail) => error.with_detail(detail),
+            None => error,
+        }
+    }
+}
+
+/// The text, with the origin beside it, so a test failure says both.
+impl fmt::Debug for CommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = f.debug_tuple("CommandError");
+        debug.field(&self.message);
+        if let Some(kind) = self.origin() {
+            debug.field(&kind);
+        }
+        if self.wrapped {
+            debug.field(&"wrapped");
+        }
+        debug.finish()
+    }
+}
+
+/// A plain string says nothing about its cause.
+impl From<String> for CommandError {
+    fn from(message: String) -> Self {
+        Self::plain(message)
+    }
+}
+
+impl From<&str> for CommandError {
+    fn from(message: &str) -> Self {
+        Self::plain(message)
+    }
+}
+
+impl PartialEq<str> for CommandError {
+    fn eq(&self, other: &str) -> bool {
+        self.message == other
+    }
+}
+
+impl PartialEq<&str> for CommandError {
+    fn eq(&self, other: &&str) -> bool {
+        self.message == *other
+    }
+}
+
+impl PartialEq<String> for CommandError {
+    fn eq(&self, other: &String) -> bool {
+        &self.message == other
+    }
+}
+
 /// How many distinct deferral texts a command remembers. A read that fails more
 /// distinct spawns than this has seen the gate refuse a lot, and past the cap the
 /// loose retry rule is switched off for that command (see [`Records::overflowed`])
@@ -418,7 +610,9 @@ pub(crate) fn command_name(type_name: &str) -> Option<&str> {
 /// [`run_command_as`] for a body that is not a named command: nothing is replay
 /// safe about it.
 #[cfg(test)]
-pub(crate) fn run_command<T>(body: impl FnOnce() -> Result<T, String>) -> Result<T, IpcError> {
+pub(crate) fn run_command<T, E: Into<CommandError>>(
+    body: impl FnOnce() -> Result<T, E>,
+) -> Result<T, IpcError> {
     run_command_as(None, body)
 }
 
@@ -428,19 +622,20 @@ pub(crate) fn run_command<T>(body: impl FnOnce() -> Result<T, String>) -> Result
 /// one after: the remembered messages are cleared on entry and on exit.
 /// `command` is the command's name when it has one; it decides whether the
 /// loose deferral rule may apply (see [`REPLAY_SAFE_READS`]).
-pub(crate) fn run_command_as<T>(
+pub(crate) fn run_command_as<T, E: Into<CommandError>>(
     command: Option<&str>,
-    body: impl FnOnce() -> Result<T, String>,
+    body: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, IpcError> {
     let replay_safe = command.is_some_and(|name| REPLAY_SAFE_READS.contains(&name));
     let _scope = TypedScope::enter();
     let mut user_action = false;
     let result = git_cli::run_command_scope(|| {
-        let result = body();
+        let result = body().map_err(Into::into);
         user_action = git_cli::current_admission() == Admission::Interactive;
         result
     });
-    result.map_err(|text| IpcError::from_scope_text(text, replay_safe, user_action))
+    result
+        .map_err(|error| IpcError::from_scope_text(error.into_message(), replay_safe, user_action))
 }
 
 impl fmt::Display for IpcError {

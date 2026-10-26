@@ -532,7 +532,7 @@ fn commit_bodies_with_multibyte_text_at_every_offset_are_read_without_panicking(
         // The assertion is that this returns at all: before the fix the same
         // call aborted the blocking thread with a char-boundary panic.
         let details = GitReader::get_commit_details(&repo_arg, id)
-            .unwrap_or_else(|e| panic!("commit {id} must be readable, got {e}"));
+            .unwrap_or_else(|e| panic!("commit {id} must be readable, got {e}", e = e.message()));
         assert_eq!(
             &details.id, id,
             "the reader must return the commit asked for"
@@ -615,7 +615,10 @@ fn randomized_multibyte_commit_bodies_never_panic() {
     let ids = import_commits(repo, &bodies);
     for (round, (id, body)) in ids.iter().zip(&bodies).enumerate() {
         let details = GitReader::get_commit_details(&repo_arg, id).unwrap_or_else(|e| {
-            panic!("round {round} (seed {seed:#x}) body {body:?} must be readable, got {e}")
+            panic!(
+                "round {round} (seed {seed:#x}) body {body:?} must be readable, got {e}",
+                e = e.message()
+            )
         });
         // Every generated body opens with this subject, so a fixture that
         // imported nothing readable cannot look like a passing sweep.
