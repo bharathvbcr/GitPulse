@@ -160,6 +160,17 @@ describe("handleMarkdownClick", () => {
       handleMarkdownClick(event(element(held, ["img[data-withheld-src]"])), context());
       expect(held.src, bad).toBe("#");
     }
+
+    // An https prefix is not an address: only text that parses as an https
+    // URL reaches `src`, and it arrives as the parsed URL, not the raw text.
+    for (const unparsable of ["https://exa mple.com/p.png", "https://[::1/p.png"]) {
+      const held = { src: "#", "data-withheld-src": unparsable };
+      handleMarkdownClick(event(element(held, ["img[data-withheld-src]"])), context());
+      expect(held.src, unparsable).toBe("#");
+    }
+    const spaced = { src: "#", "data-withheld-src": "https://cdn.example/a picture.png" };
+    handleMarkdownClick(event(element(spaced, ["img[data-withheld-src]"])), context());
+    expect(spaced.src).toBe("https://cdn.example/a%20picture.png");
   });
 
   it("loads a withheld picture from the keyboard with Enter or Space, and ignores other keys", () => {

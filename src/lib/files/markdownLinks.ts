@@ -150,12 +150,20 @@ function loadWithheldImage(image: Element): void {
  * The address a withheld picture may load from, or null. Only https reaches
  * the network. A scheme-relative address would resolve against the app's own
  * scheme, so it is read as https; plain http is not loaded, as the renderer
- * never lets an http picture through either.
+ * never lets an http picture through either. What reaches `src` is the
+ * parsed URL, never the attribute's text: text that does not parse is not an
+ * address, whatever it starts with.
  */
 function withheldAddress(raw: string): string | null {
   const trimmed = raw.trim();
   const address = trimmed.startsWith("//") ? `https:${trimmed}` : trimmed;
-  return /^https:\/\/[^/]/i.test(address) ? address : null;
+  if (!/^https:\/\/[^/]/i.test(address)) return null;
+  try {
+    const url = new URL(address);
+    return url.protocol === "https:" ? url.href : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Enter or Space on a withheld picture loads it, as a click does. */
