@@ -599,7 +599,7 @@ fn desc_paging_with_a_filter_matches_ascending_reversed() {
 /// two indexes, and into one that had them dropped (the old schema). Prints
 /// the per-append delta; asserts only that the indexes are what differs.
 #[test]
-#[ignore = "bench: 60 000 real appends exceed the suite's 40 MiB/s disk-write guard; run alone with GITPULSE_TEST_WRITE_BUDGET=0 and --nocapture"]
+#[ignore = "bench: 60 000 real appends exceed the suite's disk-write guard; run alone with GITPULSE_TEST_WRITE_BUDGET=0 and --nocapture"]
 fn append_cost_of_the_new_indexes() {
     fn run(with_indexes: bool, rows: usize) -> std::time::Duration {
         let dir = tempfile::tempdir().unwrap();

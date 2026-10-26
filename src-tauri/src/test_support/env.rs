@@ -592,9 +592,11 @@ mod relaxed_tests {
 /// byte budget instead:
 ///
 /// * [`bytes_written`] reads the kernel's per-process counter
-///   (`ri_diskio_byteswritten` from `proc_pid_rusage` on macOS, `write_bytes`
-///   from `/proc/self/io` on Linux). It counts what reached the block layer
-///   from this process, so a loop rewriting one file counts every rewrite.
+///   (`ri_diskio_byteswritten` from `proc_pid_rusage` on macOS, `ru_oublock`
+///   from `getrusage(RUSAGE_SELF)` on Linux). It counts what reached the block
+///   layer from this process and not its children, so a loop rewriting one
+///   file counts every rewrite and a spawned `git` counts against its own
+///   process, which runs no watchdog of its own; a re-executed test binary does.
 /// * A watchdog thread samples it and, when the process averages more than
 ///   [`MAX_WRITE_RATE`] over [`RATE_WINDOW`] or has written more than
 ///   [`MAX_TOTAL_WRITES`] in all, prints the numbers and aborts the process:
@@ -607,8 +609,11 @@ mod relaxed_tests {
 pub(crate) mod diskio {
     use std::time::{Duration, Instant};
 
-    /// Sustained write rate that fails the process.
-    pub(crate) const MAX_WRITE_RATE: u64 = 40 * 1024 * 1024;
+    /// Sustained write rate that fails the process. The whole suite at eight
+    /// test threads averaged up to 41 MiB/s over 30 s of its own writes on
+    /// macOS and Linux (fec1e008), so 40 failed healthy runs; 80 still stops
+    /// the 96 MiB/s runaway this guard was written for.
+    pub(crate) const MAX_WRITE_RATE: u64 = 80 * 1024 * 1024;
     /// How long the rate is averaged over, so a legitimate burst (a fixture
     /// repository, a build of a cache) is not mistaken for a runaway.
     pub(crate) const RATE_WINDOW: Duration = Duration::from_secs(30);
@@ -685,13 +690,21 @@ pub(crate) mod diskio {
         (status == 0).then_some(info.diskio_byteswritten)
     }
 
+    /// `ru_oublock` is the kernel's `write_bytes` in 512-byte units, for this
+    /// process alone: reaped children go to `RUSAGE_CHILDREN`. `/proc/self/io`
+    /// adds them in, which charged a test for every `git` it ran.
     #[cfg(target_os = "linux")]
     pub(crate) fn bytes_written() -> Option<u64> {
-        std::fs::read_to_string("/proc/self/io")
-            .ok()?
-            .lines()
-            .find_map(|line| line.strip_prefix("write_bytes:"))
-            .and_then(|value| value.trim().parse().ok())
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        // SAFETY: `usage` is a writable `rusage`; the kernel fills it for
+        // this process and returns 0, or leaves it and returns -1.
+        let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        if status != 0 {
+            return None;
+        }
+        // SAFETY: zeroed and then filled by a successful `getrusage`.
+        let blocks = unsafe { usage.assume_init() }.ru_oublock;
+        u64::try_from(blocks).ok().map(|blocks| blocks * 512)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]

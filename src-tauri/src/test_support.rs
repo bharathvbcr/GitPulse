@@ -952,6 +952,36 @@ mod diskio_guard {
         );
     }
 
+    /// The counter is this process's own, as the budget says: what a child it
+    /// started and waited for writes is the child's, held to the child's own
+    /// watchdog. Linux's `/proc/self/io` folds every reaped child into its
+    /// parent, so a suite that spawns git and itself was charged for all of it
+    /// and aborted at 40 MiB/s on CI (fec1e008). The threshold is half the
+    /// child's write because tests beside this one write too.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_os_counter_does_not_charge_this_process_for_its_children() {
+        use crate::procguard::LockedSpawn;
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("child-payload");
+        let before = diskio::bytes_written().expect("this platform has a write counter");
+        let status = std::process::Command::new("/bin/dd")
+            .arg("if=/dev/zero")
+            .arg(format!("of={}", payload.display()))
+            .args(["bs=1048576", "count=128"])
+            .stderr(std::process::Stdio::null())
+            .status_locked()
+            .expect("run dd");
+        let after = diskio::bytes_written().expect("counter still readable");
+        assert!(status.success(), "dd failed: {status:?}");
+        assert_eq!(std::fs::metadata(&payload).unwrap().len(), 128 * MIB);
+        assert!(
+            after.saturating_sub(before) < 64 * MIB,
+            "a child's 128 MiB was charged to this process: the counter moved {} bytes",
+            after.saturating_sub(before)
+        );
+    }
+
     /// Runs only as the child of the test below: writes until something stops it.
     #[test]
     #[ignore = "child of a_runaway_writer_is_aborted_by_the_watchdog"]

@@ -13,7 +13,7 @@
  *
  * What it cannot see: a test whose writes depend on state an earlier test left
  * behind. The in-process watchdog in the same module covers that (it aborts a
- * run that averages more than 40 MiB/s over 30 s, or writes more than 8 GiB).
+ * run that averages more than 80 MiB/s over 30 s, or writes more than 8 GiB).
  *
  * Usage: node scripts/test-disk-writes.mjs [--budget-mib N] [--jobs N] [--top N] [--filter TEXT]
  *   --budget-mib  per-test budget; a test writing more fails the run (default 256)
