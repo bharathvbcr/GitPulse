@@ -34,9 +34,11 @@ Re-checked 2026-10-08 against the code, item by item.
 ### Task fields against the plan
 
 Checked 2026-10-08 against the plan's section 2 and against what the store
-accepts: `put_item` in `src-tauri/vendored/dc-store/src/workbench/mod.rs`
-takes exactly 22 named fields (schema 11 added `archived`, `checklist` and
-`links`) and refuses any other, so a field the store does not name cannot ride
+accepts (the field count re-read 2026-10-23): `put_item` in
+`src-tauri/vendored/dc-store/src/workbench/mod.rs` takes exactly 24 named fields
+(that list includes the request envelope `request_id`, `id` and
+`expected_revision`; schema 11 added `archived`, `checklist` and `links`) and
+refuses any other, so a field the store does not name cannot ride
 along in a task — not even as extra JSON.
 
 | Plan field | Store | Task sheet | State |

@@ -19,7 +19,7 @@ flowchart TB
     end
 
     subgraph IPC["Tauri 2 IPC"]
-        Bridge["invoke('cmd_*') — 241 handlers, check:ipc"]
+        Bridge["invoke('cmd_*') — 291 handlers, check:ipc"]
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
@@ -55,7 +55,7 @@ flowchart TB
     Backend --> LocalBox
 ```
 
-The 241-handler count is the registered `tauri::generate_handler!` list in `src-tauri/src/lib.rs`, enforced by `bun run check:ipc`.
+The 291-handler count is the registered `tauri::generate_handler!` list in `src-tauri/src/lib.rs`, enforced by `bun run check:ipc`.
 
 ## Layout
 
@@ -75,9 +75,9 @@ GitPulse/
     ├── secrets/          Kingfisher secrets scanner
     ├── ai/               commit briefs & on-device phrasing
     ├── harness/          MANVI policy gate
-    ├── mcp/              read-only MCP surface
+    ├── mcp/              MCP surface (reads, plus the task-board tools)
     ├── ledger/           durable WAL
-    └── bin/              gitpulse-mcp, gitpulsed, gitpulse-hook
+    └── bin/              gitpulsed, gitpulse-mcp, gitpulse-hook, gitpulse-ptyd
 ```
 
 There is no virtual-DOM router. View ids are the `ViewTab` union in `src/lib/repos/persist.ts`, registered in `src/lib/views/viewRegistry.ts`, rendered from `App.svelte`. Adding a view means changing all three.
@@ -124,9 +124,10 @@ flowchart LR
 
 | Binary | Transport | Role |
 | --- | --- | --- |
-| `gitpulse-mcp` | MCP JSON-RPC over stdio | **Read** the control plane. Never mutates git. |
+| `gitpulse-mcp` | MCP JSON-RPC over stdio | **Read** the control plane. Never mutates git; its only writes are the task-board tools. |
 | `gitpulsed` | NDJSON, interval loop | **Write** attribution catch-up into the ledger when the GUI is closed. Serves no requests and never takes a lease. |
 | `gitpulse-hook` | Host hook JSON on stdin/stdout | Agent hook dispatcher; failures report no decision and leave host permissions in control. |
+| `gitpulse-ptyd` | Unix socket to the app | Optional terminal host: holds terminal sessions when "Keep terminals running when GitPulse quits" is on. See [Terminal host](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TERMINAL_HOST.md). |
 
 ```sh
 gitpulsed --interval 300 /path/to/repo

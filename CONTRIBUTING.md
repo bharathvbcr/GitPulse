@@ -365,7 +365,7 @@ GitPulse/
     ├── github/           gh CLI integration (PRs, issues, runs, Dependabot, code scanning)
     ├── updates/          Opt-in release check
     ├── ledger/ tasks/ grants/ ingest/  Control plane: durable log, leases, overrides, attribution
-    ├── mcp/              Read-only MCP tool surface and control-plane snapshots
+    ├── mcp/              MCP tool surface (reads, plus the task-board tools) and control-plane snapshots
     ├── bin/              Headless entry points (see below)
     ├── vendored/         Copies of selected DevCouncil and MarkDev crates (see below)
     └── terminal/ diff/ storage/ watcher/ stack/ ai/ desktop/
@@ -373,14 +373,15 @@ GitPulse/
 
 ### Headless binaries
 
-The desktop app is not the only way into the control plane. Three helper binaries build
+The desktop app is not the only way into the control plane. Four helper binaries build
 from the same crate and reuse its modules:
 
 | Binary | Shape | What it is for |
 | --- | --- | --- |
 | `gitpulse-hook` | Host hook JSON on stdin/stdout | Runs the shared hook dispatcher for agent integrations; failures yield no decision plus diagnostics, leaving the host permission flow in control. |
-| `gitpulse-mcp` | JSON-RPC over stdio (MCP 2026-07-28) | Lets an agent *read* the control plane: insights snapshot, collisions, change context, ledger, task view, code graph, provenance. Dual-era: modern per-request `_meta` plus legacy `initialize`. Packaged for Codex, Claude Code, and Agent Plugins 1.0 under `plugins/gitpulse/`. |
+| `gitpulse-mcp` | JSON-RPC over stdio (MCP 2026-07-28) | Lets an agent *read* the control plane: insights snapshot, collisions, change context, ledger, task view, code graph, provenance. Never mutates git; its only writes are the task-board tools (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_delete_task`, `gitpulse_merge_tasks`). Dual-era: modern per-request `_meta` plus legacy `initialize`. Packaged for Codex, Claude Code, and Agent Plugins 1.0 under `plugins/gitpulse/`. |
 | `gitpulsed` | NDJSON on stdout, interval loop | *Writes* what nothing else was writing. Attribution catch-up — transcripts and reflog into the ledger — used to run only when the desktop app opened a repository, so hours of agent work with GitPulse closed left a hole in the record that nothing on screen reported. |
+| `gitpulse-ptyd` | Length-prefixed frames over a Unix socket | Not a control-plane entry: the optional terminal host. With "Keep terminals running when GitPulse quits" on (off by default), it owns the PTYs so sessions survive a quit or crash. See [docs/TERMINAL_HOST.md](docs/TERMINAL_HOST.md). |
 
 `gitpulsed` deliberately serves no requests (that is `gitpulse-mcp`'s job, and
 a second surface answering the same questions from the same store would be a
@@ -399,9 +400,9 @@ whatever an interrupted one did not finish and writes it exactly once.
 
 ### Vendored crates
 
-GitPulse links selected crates it does not own — `dc-store`, `dc-redact`,
+GitPulse links selected crates it does not own — `dc-glob`, `dc-store`, `dc-redact`,
 `dc-proc`, and `dc-regress`/`dc-regress-store` from DevCouncil, five `devmap-*` crates from
-DevCouncil, and `markdev` from MarkDev (parse/highlight with default features off).
+DevCouncil, and four `markdev-*` crates from MarkDev (parse/highlight with default features off).
 Manvi is the wrap around those DevCouncil components at runtime (`manvi serve`);
 its analysis crates are not a vendor origin. They used to
 be reached by relative path (`../../../../../Manvi/crates/…`), which meant a

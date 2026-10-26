@@ -111,7 +111,7 @@ Intelligence for task titles and descriptions. These are distinct execution path
 
 Repository trust is an execution decision. A worktree is not an OS sandbox.
 Policy verdicts preserve **unchecked** separately from **allowed**, and the
-read-only MCP server cannot grant repository trust. Read the
+MCP server cannot grant repository trust. Read the
 [security and trust model](docs/SECURITY.md) before configuring agents.
 
 ## Architecture
@@ -139,7 +139,7 @@ flowchart TB
         LaneSolver["Topological Lane Solver"]
         Analyzers["Coverage, Health & LOC"]
         Ledger["Durable WAL Event Ledger"]
-        Headless["Headless Binaries<br/>(gitpulse-mcp · gitpulsed · gitpulse-hook)"]
+        Headless["Headless Binaries<br/>(gitpulse-mcp · gitpulsed · gitpulse-hook · gitpulse-ptyd)"]
     end
 
     subgraph Integrations["Modular Integrations & Local Tools"]

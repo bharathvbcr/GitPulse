@@ -1,6 +1,6 @@
 # MCP and Agents
 
-`gitpulse-mcp` is GitPulse's **read-only** control plane for coding agents. It never checks out a branch, writes a file, or takes a task lease. Ask it what is true; mutate through the agent that already holds the writer lease.
+`gitpulse-mcp` is GitPulse's control plane for coding agents. It answers read questions and never mutates git: it never checks out a branch, writes a repository file, or takes a task lease. Its only writes are the task-board tools below, which write the GitPulse task profile behind the repository trust gate. Ask it what is true; mutate through the agent that already holds the writer lease.
 
 It exposes GitPulse-owned surfaces (worktrees, ledger, collisions) and selected **DevCouncil** modules (in-process DevMap code graph, task/lease reads). Policy and agent hosting go through **Manvi**, not this server.
 
@@ -36,17 +36,18 @@ Portable MCP config (`plugins/gitpulse/.mcp.json`):
 
 ## Hooks
 
-`plugins/gitpulse/hooks/hooks.json` registers nine hooks, all spawning `gitpulse-hook`:
+`plugins/gitpulse/hooks/hooks.json` registers sixteen hooks, all spawning `gitpulse-hook`:
 
 | Event | Subcommand | What it does |
 | --- | --- | --- |
-| `PreToolUse` on `Edit` / `Write` / `NotebookEdit` | `collision-guard` | Escalates to the user (`ask`) when another worktree holds uncommitted changes to the same file. |
+| `PreToolUse` on `Edit` / `MultiEdit` / `Write` / `NotebookEdit` | `collision-guard` | Escalates to the user (`ask`) when another worktree holds uncommitted changes to the same file. |
 | `PreToolUse` on `Bash` | `command-gate` | Refuses (`deny`) a command the MANVI harness blocks, such as a force push. |
 | `SessionStart` | `session-brief` | Adds a repository snapshot to the session's context. |
 | `Notification`, one entry per matcher | `notify <matcher>` | Tells a running GitPulse that this agent wants the user, and why. |
 | `StopFailure` | `notify error` | Same, for a turn that ended on an error. |
+| `PermissionRequest`, `PostToolUse` and `PostToolUseFailure`, `UserPromptSubmit`, `Stop`, `SessionEnd` | `notify permission_request`, `tool_finished`, `prompt_submitted`, `turn_finished`, `session_ended` | State reports for a running GitPulse: an approval is pending or a turn finished, and the resolutions that clear them (the user answered, a tool ran, the session ended). |
 
-The reason travels as the subcommand's argument, not in the payload: the hook reference documents `Notification`'s matchers (`permission_prompt`, `idle_prompt`, `agent_needs_input`, `agent_completed`, `elicitation_dialog`) but publishes no input field naming which one fired. Registering one entry per matcher makes the reason a fact about which hook the host chose to run rather than a string parsed out of a message.
+The reason travels as the subcommand's argument, not in the payload: the hook reference documents `Notification`'s matchers (`permission_prompt`, `idle_prompt`, `agent_needs_input`, `agent_completed`, `elicitation_dialog`, `elicitation_url_dialog`) but publishes no input field naming which one fired. Registering one entry per matcher makes the reason a fact about which hook the host chose to run rather than a string parsed out of a message.
 
 Four properties are deliberate:
 
@@ -60,7 +61,7 @@ Four properties are deliberate:
 `notify` writes one small JSON report to a Unix socket in GitPulse's own configuration directory (`agent-notify.sock`; `GITPULSE_NOTIFY_SOCKET` overrides the path, `GITPULSE_SESSION_ID` names the terminal tab it is running in). It exists only while GitPulse is running and only while **Accept reports from agent hooks** is on; it is not a platform GitPulse offers on Windows, which has no Unix socket.
 
 - The directory is `0700` and the socket `0600`, and every peer's uid is checked — a connection whose uid cannot be read is refused, not trusted.
-- A report is a closed vocabulary: a protocol version, one of six event names, one of six agent names, and an optional session key, working directory and message. Anything else is refused and counted.
+- A report is a closed vocabulary: a protocol version, one of twelve event names, one of six agent names, and an optional session key, working directory and message. Anything else is refused and counted.
 - Reports are rate limited and coalesced per session alongside every other signal, and the most a report can do is raise a banner and focus a terminal tab.
 - The budget is 1.5 s, well inside a host's own hook timeout, and a socket that is not there costs the turn nothing.
 
@@ -99,7 +100,10 @@ Pass an **absolute** `repo_path` on every call.
 | `gitpulse_merge_conflicts` | Whether the worktrees' committed work would merge, pair by pair (`clean`, `conflict` with paths, `unknown` with a reason; detached worktrees included). Read-only: the merge runs in an object quarantine deleted afterwards. `ok: false` with `truncated` above 64 pairs: the counts are a floor |
 | `gitpulse_ledger_events` | Policy verdicts and recorded mutations |
 | `gitpulse_task_view` | DevCouncil tasks/leases, when a store exists |
-| `gitpulse_codeintel_search` / `_impact` / `_dependencies` / `_trace` / `_dead_symbols` | In-process DevMap code graph (schema 20). The GUI also exposes neighbors, explore, affected tests, clones, and layered impact — those are Tauri commands today, not MCP tools. |
+| `gitpulse_codeintel_search` / `_impact` / `_dependencies` / `_trace` / `_dead_symbols` / `_suspects` | In-process DevMap code graph (vendored store schema 27). The same graph is also served by the `devmap_*` tools on this server (status, search, dependencies, impact, trace, neighbors, dead_symbols, clones, preview, explore, affected_tests). |
+| `gitpulse_list_tasks` / `_get_task` | Read the GitPulse task board and a task's brief |
+| `gitpulse_add_task` / `_import_tasks` / `_complete_task` | Write the task board: file a task, import a `tasks/` folder, mark the launched task done. The only writes this server makes |
+| `gitpulse_delete_task` / `_merge_tasks` | Destructive board writes (both end in the store's soft delete) and annotated `destructiveHint: true` |
 | `gitpulse_provenance` | Verification freshness for a commit, and where it sits relative to the base (`landed_on_base`, `ahead`, `behind`). `confidence` is null (and `verified` false) when the commit has no verification note. A verification is keyed to the commit's sha and does not survive a rewrite: a rebased, amended or squashed commit is a new commit with none, even when `gitpulse_landed` finds its work on the base |
 | `gitpulse_landed` | Whether a commit's work reached a base, and how (`ff`, `merge`, `squash`, `rebase`, `tree`). `landed: false` only when absence is provable; otherwise null with a `reason` (`partial_clone_fetch_required`, `search_depth_exceeded`, `content_not_provable`, ...). `reverted` is true only when a revert commit is found by ancestry; `landed_at` comes from the base branch's own reflog (never `HEAD`'s). Never writes to the repository: the content comparison (`git merge-tree --write-tree`) runs in a quarantined object directory deleted afterwards |
 

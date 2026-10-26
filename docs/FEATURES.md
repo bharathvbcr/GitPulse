@@ -452,7 +452,7 @@ rather than presenting a floor as a total.
   - `bundler-audit` (Ruby)
   - GitHub Dependabot and code scanning alerts (via local `gh` CLI), fetched when a repository opens. Critical and high findings raise a warning. Turn off under Settings → Analysis. The Health **Scan local** button still does not call GitHub.
 - **Supply-Chain Security Parsers**: Integrates `cargo deny` (SARIF) and `cargo crev` (JSONL) report parsers alongside `cargo audit` in dependency health for thorough Rust crate vetting.
-- **Code map status & dead symbols**: When a DevMap store is present (schema 20), Health surfaces graph availability and budgeted dead-symbol candidates. A query that stopped at its token budget is a floor, not an all-clear; a missing or schema-mismatched map is named rather than shown as empty-and-fine.
+- **Code map status & dead symbols**: When a DevMap store is present (the vendored reader is schema 27), Health surfaces graph availability and budgeted dead-symbol candidates. A query that stopped at its token budget is a floor, not an all-clear; a missing or schema-mismatched map is named rather than shown as empty-and-fine.
 - **AI Remediation**: Generates step-by-step upgrade plans with dependency version bump recommendations.
 - **Health Verdict**: Evaluates multi-ecosystem audit findings, code scanning alerts, and repository health signals into a single explicit verdict with one canonical owner per repeated decision.
 
@@ -503,7 +503,7 @@ Health remediation plan, a failing test, the diff you are about to commit.
 
 - **Protocol**: `gitpulse-mcp` implements [MCP 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28) — `server/discover`, per-request `_meta`, `resultType` on results, cacheable tool lists. Dual-era: legacy `initialize` (2024-11-05 / 2025-11-25) still works.
 - **Package**: one canonical package at `plugins/gitpulse/` — native Codex `.codex-plugin/plugin.json` + `.mcp.json`, Claude Code compatibility files, closed Agent Plugins 1.0 manifests, and one shared `skills/` tree. The Tauri app copies this package into `Contents/Resources/plugin`.
-- **Tools**: `gitpulse_insights`, `gitpulse_collision_risk`, `gitpulse_merge_conflicts` (would the lanes' committed work merge, pair by pair, in a deleted-afterwards object quarantine), `gitpulse_change_context`, `gitpulse_active_changes`, plus ledger, tasks, codeintel, provenance. Read-only.
+- **Tools**: `gitpulse_insights`, `gitpulse_collision_risk`, `gitpulse_merge_conflicts` (would the lanes' committed work merge, pair by pair, in a deleted-afterwards object quarantine), `gitpulse_change_context`, `gitpulse_active_changes`, plus ledger, tasks, codeintel, provenance. The server never mutates git; its only writes are the task-board tools (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_delete_task`, `gitpulse_merge_tasks`).
 - **Work view**: insight strip (worktrees, agent sessions, blocked operations) and a collision banner that never treats a failed scan as “no overlap”.
 - **Settings**: copies `.codex-plugin/plugin.json` / `.mcp.json` and names the binary path, or why it could not be found.
 
