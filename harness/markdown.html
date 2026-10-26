@@ -211,7 +211,10 @@ ${row(["tokio", "1.40.0", "1.41.1", "maintained", "none", "", "cancelling_the_to
           for (const m of node.textContent.matchAll(/[^\s-]+-?/g)) {
             const range = document.createRange();
             range.setStart(node, m.index); range.setEnd(node, m.index + m[0].length);
-            if (new Set([...range.getClientRects()].map(r => Math.round(r.top))).size > 1) out.push(m[0].slice(0, 40));
+            // Zero-width rects are left out: at a break after a hyphen some
+            // WebKit builds add a collapsed rect at the next line's start
+            // for a run that did not wrap, which read as a split word.
+            if (new Set([...range.getClientRects()].filter(r => r.width > 0).map(r => Math.round(r.top))).size > 1) out.push(m[0].slice(0, 40));
           }
         }
         return out;
