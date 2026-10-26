@@ -162,7 +162,7 @@ fn serve(
             Request::List => {
                 calls.fetch_add(1, Ordering::AcqRel);
                 if garbage
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
                     .is_ok()
                 {
                     serde_json::to_value("not a list of sessions")
