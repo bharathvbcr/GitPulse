@@ -211,7 +211,10 @@ mod imp {
                 .metric(NAMES.1, after.1.saturating_sub(before.1) as f64 / secs)
                 .elapsed(elapsed)
         };
+        // The mailbox is the macOS app's single-instance channel.
+        #[cfg(target_os = "macos")]
         let profile = temp.path().join("profile");
+        #[cfg(target_os = "macos")]
         let idle_mailbox = || -> Sample {
             use gitpulse_lib::desktop::instance::{claim, Claim};
             let Claim::Primary(owner) = claim(&profile, Duration::from_secs(2)) else {
@@ -329,6 +332,7 @@ mod imp {
             })
             .ungated(),
         );
+        #[cfg(target_os = "macos")]
         cases.push(Case::new("idle mailbox", idle_mailbox).ungated());
         cases.push(Case::new("idle alerts bridge", idle_alerts_bridge).ungated());
         cases.push(Case::new("idle host-load sampler", idle_host_load).ungated());

@@ -169,7 +169,7 @@ fn upgrade_family_quantified_binds_in_later_born_siblings() {
 
 // ---------------------------------------------------------------- attack 3
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn backdate_birth(path: &std::path::Path, stamp: &str) {
     // On macOS, setting an mtime earlier than the birth time lowers it too.
     let status = std::process::Command::new("touch")
@@ -180,7 +180,7 @@ fn backdate_birth(path: &std::path::Path, stamp: &str) {
     assert!(status.success());
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn birth_ms(path: &std::path::Path) -> u64 {
     std::fs::metadata(path)
         .unwrap()

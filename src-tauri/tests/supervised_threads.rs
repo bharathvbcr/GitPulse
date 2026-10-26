@@ -236,10 +236,31 @@ fn test_only_modules_are_declared_under_cfg_test() {
             .position(|l| l.trim() == format!("mod {module};"))
             .unwrap_or_else(|| panic!("{parent} no longer declares {module}"));
         assert!(
-            lines[at - 1].trim() == "#[cfg(test)]",
+            requires_test(lines[at - 1]),
             "{file} is exempt as test-only but {parent} declares it without #[cfg(test)]"
         );
     }
+}
+
+/// Whether a `cfg` attribute can only hold in a test build: `test` itself, or
+/// an `all(..)` with `test` among its terms. `any(test, ..)` holds outside one.
+fn requires_test(attribute: &str) -> bool {
+    let attribute = attribute.trim();
+    attribute == "#[cfg(test)]"
+        || attribute
+            .strip_prefix("#[cfg(all(")
+            .and_then(|rest| rest.strip_suffix("))]"))
+            .is_some_and(|terms| terms.split(',').any(|term| term.trim() == "test"))
+}
+
+#[test]
+fn a_test_only_cfg_is_test_or_all_of_test_and_more() {
+    assert!(requires_test("#[cfg(test)]"));
+    assert!(requires_test("    #[cfg(all(test, unix))]"));
+    assert!(requires_test("#[cfg(all(unix, test))]"));
+    assert!(!requires_test("#[cfg(any(test, unix))]"));
+    assert!(!requires_test("#[cfg(unix)]"));
+    assert!(!requires_test("#[cfg(all(testing, unix))]"));
 }
 
 /// A test module nested in a platform `cfg` module hides nothing after it: the

@@ -3227,7 +3227,7 @@ fn note_band_outcome(label: &str, outcome: std::io::Result<crate::procguard::Ban
 
 /// `(entered, failed)`: children demoted into the background band, and
 /// demotions the OS refused, since process start.
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) fn band_outcomes() -> (u64, u64) {
     use std::sync::atomic::Ordering;
     (
