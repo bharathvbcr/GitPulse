@@ -207,6 +207,14 @@ fn ask(argv: &[&str], known: &Snapshot) -> (BTreeSet<i32>, BTreeSet<i32>) {
     (wanted, got.into_iter().collect())
 }
 
+/// Whether the guard is held to `pgrep`'s exact answer on this platform. It
+/// models the macOS tools, which match a name against `argv[0]`'s last
+/// component. Linux procps matches the kernel's 15-character `comm` instead,
+/// so a long name `pgrep` cannot see is one the guard still counts: there it is
+/// held only to reaching at least every process `pgrep` reaches, the direction
+/// that can never let a signal through unasked.
+const EXACT: bool = cfg!(target_os = "macos");
+
 #[test]
 fn the_guard_picks_exactly_the_processes_pgrep_picks() {
     let marked = Marked::spawn(12);
@@ -234,7 +242,14 @@ fn the_guard_picks_exactly_the_processes_pgrep_picks() {
         }
         // The marked children live throughout, so they are in or out of both
         // answers together, whatever else is running.
-        let marked_agree = wanted.intersection(&ours).eq(gotten.intersection(&ours));
+        let marked_agree = if EXACT {
+            wanted.intersection(&ours).eq(gotten.intersection(&ours))
+        } else {
+            wanted.intersection(&ours).all(|pid| gotten.contains(pid))
+        };
+        if !EXACT {
+            differ.retain(|(_, side)| *side == "pgrep");
+        }
         // `unexplained` excuses the running process either way, so a guard that
         // stopped leaving itself out of `-v`/`-a` would agree with `pgrep` and
         // go unseen; the modelled behaviour is that it is never in the answer.
@@ -362,11 +377,16 @@ fn a_disagreement_that_is_asked_again_is_excused_only_if_it_does_not_repeat() {
 
 #[test]
 fn killall_by_name_picks_what_an_exact_name_match_picks() {
-    // killall matches a name exactly against the process name, which is
-    // `pgrep -x`; `killall -d` was read against it by hand and agrees.
+    // macOS killall matches a name exactly against the process name, which is
+    // `pgrep -x`; `killall -d` was read against it by hand and agrees. Linux
+    // `pgrep -x` reads the 15-character `comm` and finds no long name (see
+    // [`EXACT`]), so the equivalence is macOS's; the children are every
+    // platform's answer.
     let marked = Marked::spawn(5);
     let got = live_match_pids("killall", &[&marked.marker]).expect("evaluates");
-    assert_eq!(got, pgrep(&["-x", &marked.marker]));
+    if EXACT {
+        assert_eq!(got, pgrep(&["-x", &marked.marker]));
+    }
     assert_eq!(got, marked.pids());
 }
 

@@ -974,9 +974,11 @@ fn dropped_write_futures_are_skipped_or_run_once_and_give_their_slots_back() {
     let id = start_late_cat_to_file(&app, &state, &output, dir.path(), &file, "1");
     let handle = app.handle().clone();
 
-    // More than the tty holds, so this write is still spinning on the lane
-    // when everything below is queued and dropped behind it.
-    let first = format!("[0:0]{}", ".".repeat(1500));
+    // More than the tty holds on any platform (macOS's input queue is ~1 KiB,
+    // a Linux pty buffers tens of KiB) and under the 64 KiB one write may
+    // carry, so this write is still spinning on the lane when everything below
+    // is queued and dropped behind it.
+    let first = format!("[0:0]{}", ".".repeat(60 * 1024));
     let stuck = {
         let (handle, id, first) = (handle.clone(), id.clone(), first.clone());
         std::thread::spawn(move || write_now(&handle, &id, first))

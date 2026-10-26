@@ -173,21 +173,37 @@ fn symlinks_to_a_nested_gitdir_are_never_written_through() {
     assert!(sandbox_write(&f.repo_str, "lnk3/HEAD", "x").is_err());
 }
 
-/// APFS is case- and normalization-insensitive: other spellings of the
-/// ancestor names must still be refused.
+/// Other spellings of the ancestor names never write into the nested gitdir.
+/// Where the filesystem folds case or Unicode normalization (APFS does, ext4
+/// does not) a spelling *is* the gitdir and must be refused; where it does
+/// not, it names an ordinary path beside it, and the gitdir is still
+/// untouched. `.` and `..` resolve to the gitdir everywhere.
 #[test]
 fn case_and_unicode_variants_of_a_nested_gitdir_path_are_refused() {
     let f = fixture();
     separate_gitdir(&f);
-    for target in [
-        ".MODULES/sub/HEAD",
-        ".modules/SUB/HEAD",
-        ".Modules/Sub/config",
-        ".modules/sub/./HEAD",
-        "sub/../.modules/sub/HEAD",
+    let gitdir = f.repo.join(".modules/sub");
+    let before = |name: &str| std::fs::read(gitdir.join(name)).unwrap();
+    let (head, config) = (before("HEAD"), before("config"));
+    let folds_case = f.repo.join(".MODULES").exists();
+    for (target, aliases) in [
+        (".MODULES/sub/HEAD", folds_case),
+        (".modules/SUB/HEAD", folds_case),
+        (".Modules/Sub/config", folds_case),
+        (".modules/sub/./HEAD", true),
+        ("sub/../.modules/sub/HEAD", true),
     ] {
-        assert!(sandbox_write(&f.repo_str, target, "x").is_err(), "{target}");
+        let written = sandbox_write(&f.repo_str, target, "x");
+        if aliases {
+            assert!(written.is_err(), "{target}");
+        }
     }
+    assert_eq!(before("HEAD"), head, "a spelling wrote the nested HEAD");
+    assert_eq!(
+        before("config"),
+        config,
+        "a spelling wrote the nested config"
+    );
     // NFC vs NFD directory name.
     let nfc = "caf\u{e9}.d";
     let nfd = "cafe\u{301}.d";
@@ -195,10 +211,18 @@ fn case_and_unicode_variants_of_a_nested_gitdir_path_are_refused() {
     std::fs::create_dir_all(dir.join("objects")).unwrap();
     std::fs::create_dir_all(dir.join("refs")).unwrap();
     std::fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-    for name in [nfc, nfd] {
+    let folds_normalization = f.repo.join(nfd).exists();
+    for (name, aliases) in [(nfc, true), (nfd, folds_normalization)] {
         let target = format!("{name}/config");
-        assert!(sandbox_write(&f.repo_str, &target, "x").is_err(), "{name}");
+        let written = sandbox_write(&f.repo_str, &target, "x");
+        if aliases {
+            assert!(written.is_err(), "{name}");
+        }
     }
+    assert!(
+        !dir.join("config").exists(),
+        "a spelling wrote a config into the gitdir {nfc}"
+    );
 }
 
 /// BREAK: git's `is_ntfs_dotgit` stops at a backslash too (core.protectNTFS is

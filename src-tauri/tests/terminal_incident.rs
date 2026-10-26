@@ -147,8 +147,10 @@ fn four_sessions_sigtermed_from_outside_are_one_incident_and_leave_nothing_behin
     ids.sort();
     assert_eq!(members, ids, "all four, by terminal session id");
     assert_eq!(exited, ids);
-    assert!(
-        got[0]["signal"].as_str().unwrap().contains("15"),
+    // macOS's strsignal says "Terminated: 15", glibc's "Terminated".
+    assert_eq!(
+        gitpulse_lib::terminal::incident::launchd_signal_name(got[0]["signal"].as_str().unwrap()),
+        Some("SIGTERM"),
         "{}",
         got[0]
     );

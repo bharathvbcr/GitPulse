@@ -3,6 +3,17 @@ use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
 use std::process::Command;
 
+/// The variables every platform reads GitPulse's profile from, pointed into
+/// `home`. A process that should see an [`approve`]d repository needs all of
+/// them: Linux prefers `XDG_CONFIG_HOME` to `HOME`, and CI runners set it.
+pub fn profile_env(home: &Path) -> [(&'static str, std::path::PathBuf); 3] {
+    [
+        ("HOME", home.to_path_buf()),
+        ("APPDATA", home.join("AppData")),
+        ("XDG_CONFIG_HOME", home.join(".config")),
+    ]
+}
+
 pub fn approve(repo: &Path, home: &Path) {
     std::fs::create_dir_all(home).unwrap();
     let status = Command::new(std::env::current_exe().unwrap())
@@ -11,9 +22,7 @@ pub fn approve(repo: &Path, home: &Path) {
             "process_trust::approve_subprocess_fixture",
             "--ignored",
         ])
-        .env("HOME", home)
-        .env("APPDATA", home.join("AppData"))
-        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .envs(profile_env(home))
         .env("GITPULSE_TEST_GRANT_REPO", repo)
         .status_locked()
         .unwrap();

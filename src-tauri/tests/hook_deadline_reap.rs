@@ -83,7 +83,7 @@ fn a_stalled_child_is_reaped_and_the_total_stays_under_the_host_timeout() {
     let mut child = Command::new(HOOK)
         .arg("session-brief")
         .env("PATH", &path)
-        .env("HOME", home.path())
+        .envs(process_trust::profile_env(home.path()))
         .env(gitpulse_lib::logging::LOG_DIR_ENV, logs.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
