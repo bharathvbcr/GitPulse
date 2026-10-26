@@ -47,6 +47,7 @@ import {
   type TaskDensity,
 } from "../ui/taskView";
 import type { TaskStatus } from "../workbench/vocabulary";
+import { sanitizeHiddenRepositories, toggleHiddenRepository } from "../workbench/taskHiddenRepositories";
 import {
   deleteView,
   isSwimlane,
@@ -192,6 +193,13 @@ export interface InterfacePrefs {
    * value that would hide every column.
    */
   taskHiddenColumns: TaskStatus[];
+  /**
+   * Repositories whose tasks the global and workspace boards leave out, by
+   * repository id (`taskHiddenRepositories.ts`). A task goes by its primary
+   * repository; the repository's own board still shows everything, and the
+   * board says how many tasks it is keeping off screen.
+   */
+  taskHiddenRepositories: string[];
   /**
    * Chips a board card carries. Title and the priority pip are not optional —
    * a card without them cannot be read or triaged at a glance.
@@ -357,6 +365,7 @@ const DEFAULTS: InterfacePrefs = {
   taskLayout: "board",
   taskDensity: "comfortable",
   taskHiddenColumns: [],
+  taskHiddenRepositories: [],
   taskCardFields: [...DEFAULT_TASK_CARD_FIELDS],
   taskSwimlane: "none",
   taskOrder: "priority",
@@ -392,6 +401,7 @@ function freshDefaults(): InterfacePrefs {
     fleetHiddenColumns: [...DEFAULTS.fleetHiddenColumns],
     agentsHiddenColumns: [...DEFAULTS.agentsHiddenColumns],
     taskHiddenColumns: [...DEFAULTS.taskHiddenColumns],
+    taskHiddenRepositories: [...DEFAULTS.taskHiddenRepositories],
     taskCardFields: [...DEFAULTS.taskCardFields],
     taskBoards: {},
     taskHandoff: { ...DEFAULTS.taskHandoff },
@@ -507,6 +517,7 @@ function readPrefs(): InterfacePrefs {
       // Both sanitizers bound and normalize the stored array; neither can
       // return a board with no columns or a card shape the board cannot draw.
       taskHiddenColumns: sanitizeHiddenStatuses(parsed.taskHiddenColumns),
+      taskHiddenRepositories: sanitizeHiddenRepositories(parsed.taskHiddenRepositories),
       taskCardFields: sanitizeCardFields(parsed.taskCardFields),
       taskSwimlane: isSwimlane(parsed.taskSwimlane) ? parsed.taskSwimlane : DEFAULTS.taskSwimlane,
       taskOrder: isTaskOrder(parsed.taskOrder) ? parsed.taskOrder : DEFAULTS.taskOrder,
@@ -704,6 +715,10 @@ function createInterfaceStore() {
     toggleTaskColumn: (status: TaskStatus) =>
       patch((prefs) => ({ taskHiddenColumns: toggleHiddenStatus(prefs.taskHiddenColumns, status) })),
     showAllTaskColumns: () => patch({ taskHiddenColumns: [] }),
+    /** Hides one repository's tasks from the global and workspace boards, or shows them again. */
+    toggleTaskRepositoryHidden: (repositoryId: string) =>
+      patch((prefs) => ({ taskHiddenRepositories: toggleHiddenRepository(prefs.taskHiddenRepositories, repositoryId) })),
+    showAllTaskRepositories: () => patch({ taskHiddenRepositories: [] }),
     setTaskCardFields: (fields: readonly TaskCardField[]) =>
       patch({ taskCardFields: sanitizeCardFields([...fields]) }),
     toggleTaskCardField: (field: TaskCardField) =>
@@ -762,7 +777,9 @@ function createInterfaceStore() {
         taskHiddenColumns: [],
         taskCardFields: [...DEFAULT_TASK_CARD_FIELDS],
         // Saved views and limits are the reader's records, not a view
-        // setting, so resetting the view keeps them.
+        // setting, so resetting the view keeps them. So are hidden
+        // repositories: a reset about layout must not put back a list of
+        // repositories the reader took off the board one by one.
         taskSwimlane: DEFAULTS.taskSwimlane,
         taskOrder: DEFAULTS.taskOrder,
         taskShowArchivedWorkspaces: DEFAULTS.taskShowArchivedWorkspaces,

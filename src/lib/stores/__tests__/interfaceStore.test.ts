@@ -871,6 +871,42 @@ describe("tasks board view preferences", () => {
     });
   });
 
+  it("hides repositories one at a time and shows them all again in one action", () => {
+    expect(get(interfaceStore).taskHiddenRepositories).toEqual([]);
+    interfaceStore.toggleTaskRepositoryHidden("repo-1");
+    interfaceStore.toggleTaskRepositoryHidden("repo-0");
+    expect(get(interfaceStore).taskHiddenRepositories).toEqual(["repo-1", "repo-0"]);
+    interfaceStore.toggleTaskRepositoryHidden("repo-1");
+    expect(get(interfaceStore).taskHiddenRepositories).toEqual(["repo-0"]);
+    interfaceStore.showAllTaskRepositories();
+    expect(get(interfaceStore).taskHiddenRepositories).toEqual([]);
+  });
+
+  it("keeps hidden repositories through a board view reset, which is about layout", () => {
+    interfaceStore.toggleTaskRepositoryHidden("repo-0");
+    interfaceStore.resetTaskView();
+    expect(get(interfaceStore).taskHiddenRepositories).toEqual(["repo-0"]);
+  });
+
+  it("reads stored hidden repositories through the sanitizer", async () => {
+    const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+    try {
+      const storage = memoryStorage({
+        gitpulse_interface_prefs: JSON.stringify({ taskHiddenRepositories: [" repo-0 ", 7, "", "repo-0", "repo-1"] }),
+      });
+      Object.defineProperty(globalThis, "window", { value: { localStorage: storage }, configurable: true, writable: true });
+      vi.resetModules();
+      expect(get((await import("../interfaceStore")).interfaceStore).taskHiddenRepositories).toEqual(["repo-0", "repo-1"]);
+      storage.setItem("gitpulse_interface_prefs", JSON.stringify({ taskHiddenRepositories: "repo-0" }));
+      vi.resetModules();
+      expect(get((await import("../interfaceStore")).interfaceStore).taskHiddenRepositories).toEqual([]);
+    } finally {
+      if (restore) Object.defineProperty(globalThis, "window", restore);
+      else Reflect.deleteProperty(globalThis, "window");
+      vi.resetModules();
+    }
+  });
+
   it("refuses stored board preferences that would empty the board or blank a card", async () => {
     const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
     try {

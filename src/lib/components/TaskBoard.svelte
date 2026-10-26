@@ -4,7 +4,7 @@
   import { liquidSelection } from "../ui/transitions";
   import { onMount, untrack } from "svelte";
   import { invoke } from "../ipc/invoke";
-  import { AlertTriangle, Archive, Bot, ChevronDown, ChevronUp, Clipboard, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Merge, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
+  import { AlertTriangle, Archive, Bot, ChevronDown, ChevronRight, ChevronUp, Clipboard, Eye, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Merge, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
   import { isMacOS } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
@@ -31,6 +31,7 @@
   import { applyMove, moveWrites, navigatorOrder } from "../workbench/workspaceOrder";
   import { importSummary, importTabGroups, tabGroups } from "../workbench/workspaceImport";
   import { workspaceMembershipLabel } from "../workbench/taskRepositories";
+  import { hiddenByRepository, hiddenRepositoryNote, hidesRepositories } from "../workbench/taskHiddenRepositories";
   import { cardsById, contextMenuAnchor, duplicateTitle, flattenVisibleIds, isContextMenuKey, rangeSelect, taskMenuItems, toggleSelection, type TaskMenuItem } from "../workbench/taskMenu";
   import { checkoutCandidates, handoffFromTarget, type HandoffSettings } from "../workbench/taskHandoff";
   import { linkTaskToIssue, MAX_TASK_ISSUE_BATCH, prepareTaskIssues, runTaskIssues, summarizeTaskIssues, taskIssuesConfirmation, type TaskIssueResult, type TaskIssueTarget } from "../workbench/taskIssue";
@@ -149,13 +150,29 @@
   const parsedQuery = $derived(parseTaskQuery(search));
   /** The Filters bar's choices: applied with the search's filters by `cardVisible`, kept by saved views. */
   let facet = $state<TaskFacet>(emptyFacet());
+  // ---- Hidden repositories (`taskHiddenRepositories.ts`) ------------------
+  // A reader preference: the global and workspace boards leave out the tasks
+  // whose primary repository is hidden, and say how many they left out.
+  const hiddenRepositories = $derived($interfaceStore.taskHiddenRepositories);
+  const hiddenRepositorySet = $derived(new Set(hiddenRepositories));
+  const hidingRepositories = $derived(hidesRepositories(scope, hiddenRepositories));
+  /** Whether the navigator's Hidden group is open. */
+  let showHiddenRepositories = $state(false);
+  /** Hidden ids the loaded catalog has no row for: a later page, or a repository no longer registered. */
+  const hiddenUnloaded = $derived(hiddenRepositories.filter((id) => !repositoryById.has(id)).length);
   /**
    * A search or a Filters choice switches the board from per-column pages to
    * one candidate set for the scope, ranked and filtered here. The fetch key
    * changes only with what the store is asked, so typing re-ranks and
-   * re-filters what is loaded without a request.
+   * re-filters what is loaded without a request. Hiding a repository does the
+   * same: a column page would count tasks the board cannot show.
    */
-  const plan = $derived(planSearch(scope, parsedQuery, facet, repositories, repositoryCursor === null));
+  const plan = $derived(planSearch(scope, parsedQuery, facet, repositories, repositoryCursor === null, hidingRepositories));
+  /** A repository the reader narrowed the board to; its tasks show even while it is hidden. */
+  const narrowedTo = $derived(plan.scope.kind === "repository" ? plan.scope.id : facet.repository !== "all" ? facet.repository : null);
+  function hiddenHere(card: TaskCard): boolean {
+    return hidingRepositories && hiddenByRepository(card, hiddenRepositorySet, narrowedTo);
+  }
   const searching = $derived(plan.mode === "search");
   let sort = $state<SearchOrder>("relevance");
   /** How a column is drawn when no search ranks it: the most urgent first (the default), or the board's own order. A reader preference; positions are never written. */
@@ -471,7 +488,7 @@
   const queryContext = $derived<QueryContext>({ repository: (id) => repositoryById.get(id), nowSec: now });
   /** The Filters bar and the search box's filters: what the words are ranked over. */
   function filtersHold(card: TaskCard): boolean {
-    return cardMatchesFacet(card, facet, now) && cardMatchesQuery(card, parsedQuery, queryContext);
+    return !hiddenHere(card) && cardMatchesFacet(card, facet, now) && cardMatchesQuery(card, parsedQuery, queryContext);
   }
   /** Relevance reorders only a search with words; filters alone keep board order. */
   const order = $derived<SearchOrder>(searching && parsedQuery.words ? sort : "board");
@@ -529,6 +546,12 @@
     return describeSearch({ matched: visibleCount, set: candidates, word: plan.word, relaxed: ranking?.relaxed ?? false, ranked: order === "relevance" });
   });
   const moreCandidates = $derived(searching && candidates !== null && loadedKey === boardKey && canLoadMore(candidates));
+  /** What hidden repositories keep off this board, counted over the loaded tasks; null when nothing is hidden here. */
+  const hiddenRepositoryReport = $derived.by(() => {
+    if (!hidingRepositories || !initialized || !candidates || loadedKey !== boardKey) return null;
+    const tasks = loadedCards.filter(hiddenHere).length;
+    return { tasks, line: hiddenRepositoryNote({ tasks, repositories: hiddenRepositories.length, complete: candidatesComplete(candidates) }) };
+  });
   /** Completions for the search box: the loaded values, and every registered repository. */
   const suggestionSources = $derived.by<SuggestionSources>(() => ({
     kind: facetOptions.kinds,
@@ -600,7 +623,8 @@
         const set = mergeCandidates(null, broad, text);
         const pages = bucketByStatus(set.cards);
         candidates = set; columns = keepUnchanged(pages); loadedKey = key; loadedScope = JSON.stringify(target); archivedCount = archive.total;
-        if (candidatesComplete(set) && JSON.stringify(current.scope) === JSON.stringify(target)) inProgressCount = pages.in_progress?.total ?? 0;
+        // A hidden repository's tasks are not this board's work in progress.
+        if (candidatesComplete(set) && JSON.stringify(current.scope) === JSON.stringify(target)) inProgressCount = (pages.in_progress?.items ?? []).filter((card) => !hiddenHere(card)).length;
         keepSelected(pages);
         settled(quiet);
         return true;
@@ -2197,6 +2221,12 @@
     </div>
   {/if}
 {/snippet}
+{#snippet repositoryRow(repo: Repository, hidden: boolean)}
+  {@const health = checkouts.get(repo.id)}
+  <div class="nav-row" data-repository-row={repo.id} data-hidden={hidden || undefined} data-checkout={health?.state ?? "unread"}><button type="button" class="gp-seg-btn" class:selected={scope.kind === "repository" && scope.id === repo.id} aria-pressed={scope.kind === "repository" && scope.id === repo.id} data-active={scope.kind === "repository" && scope.id === repo.id} onclick={() => { scope = { kind: "repository", id: repo.id }; }} title={health && health.state !== "available" ? health.detail : repo.identity_key}>
+  {@render scopeSelection(scope.kind === "repository" && scope.id === repo.id)}<span>{repo.name}{#if health?.state === "missing"}<span class="checkout-mark" data-testid="repository-checkout-missing"> · <AlertTriangle size={10} aria-hidden="true" /> Missing</span>{:else if health?.state === "remote"}<span class="checkout-mark" data-testid="repository-remote-only"> · Remote only</span>{:else if health?.state === "unknown"}<span class="checkout-mark" data-testid="repository-checkout-unknown"> · Not checked</span>{/if}</span>
+  </button>{#if hidden}<button type="button" class="icon gp-icon-btn" data-testid="repository-show" aria-label={`Show ${repo.name}'s tasks on the board`} title={`Show ${repo.name}'s tasks on the All and workspace boards again`} onclick={() => interfaceStore.toggleTaskRepositoryHidden(repo.id)}><Eye size={12} /></button>{:else}<span class="row-action"><button type="button" class="icon gp-icon-btn" data-testid="repository-hide" aria-label={`Hide ${repo.name}'s tasks from the board`} title={`Hide ${repo.name}'s tasks from the All and workspace boards — its own board still shows them`} onclick={() => interfaceStore.toggleTaskRepositoryHidden(repo.id)}><EyeOff size={12} /></button></span>{/if}{#if health?.state === "remote"}<button type="button" class="icon gp-icon-btn" aria-label={`Link ${repo.name} to a local checkout`} title={`Link ${repo.name} to a checkout on this machine — its tasks, workspaces and history keep their place`} disabled={relinking || busy} onclick={() => void relinkRepo(repo)}><FolderSync size={12} /></button>{:else}<button type="button" class="icon gp-icon-btn" class:urgent={health?.state === "missing"} aria-label={`Relink ${repo.name} to a moved checkout`} title={health?.state === "missing" ? health.detail : `Relink ${repo.name} — its checkout moved or was cloned again`} disabled={relinking || busy} onclick={() => void relinkRepo(repo)}><FolderSync size={12} /></button>{/if}</div>
+{/snippet}
 {#snippet scopeSelection(selected: boolean)}
   {#if macos && selected}<span class="gp-liquid-selection gp-gpu" aria-hidden="true" in:receiveScope={{ key: "task-scope" }} out:sendScope={{ key: "task-scope" }}></span>{/if}
 {/snippet}
@@ -2261,13 +2291,26 @@
         </div>
       {/if}
       {#each repositories as repo (repo.id)}
-        {@const health = checkouts.get(repo.id)}
-        {#if navShowsRepository(repo)}
-        <div class="nav-row" data-repository-row={repo.id} data-checkout={health?.state ?? "unread"}><button type="button" class="gp-seg-btn" class:selected={scope.kind === "repository" && scope.id === repo.id} aria-pressed={scope.kind === "repository" && scope.id === repo.id} data-active={scope.kind === "repository" && scope.id === repo.id} onclick={() => { scope = { kind: "repository", id: repo.id }; }} title={health && health.state !== "available" ? health.detail : repo.identity_key}>
-        {@render scopeSelection(scope.kind === "repository" && scope.id === repo.id)}<span>{repo.name}{#if health?.state === "missing"}<span class="checkout-mark" data-testid="repository-checkout-missing"> · <AlertTriangle size={10} aria-hidden="true" /> Missing</span>{:else if health?.state === "remote"}<span class="checkout-mark" data-testid="repository-remote-only"> · Remote only</span>{:else if health?.state === "unknown"}<span class="checkout-mark" data-testid="repository-checkout-unknown"> · Not checked</span>{/if}</span>
-      </button>{#if health?.state === "remote"}<button type="button" class="icon gp-icon-btn" aria-label={`Link ${repo.name} to a local checkout`} title={`Link ${repo.name} to a checkout on this machine — its tasks, workspaces and history keep their place`} disabled={relinking || busy} onclick={() => void relinkRepo(repo)}><FolderSync size={12} /></button>{:else}<button type="button" class="icon gp-icon-btn" class:urgent={health?.state === "missing"} aria-label={`Relink ${repo.name} to a moved checkout`} title={health?.state === "missing" ? health.detail : `Relink ${repo.name} — its checkout moved or was cloned again`} disabled={relinking || busy} onclick={() => void relinkRepo(repo)}><FolderSync size={12} /></button>{/if}</div>
-        {/if}
+        {#if !hiddenRepositorySet.has(repo.id) && navShowsRepository(repo)}{@render repositoryRow(repo, false)}{/if}
       {/each}
+      <!-- Hidden repositories keep their rows: their own boards still open
+           from here, and Show is one click away. Collapsed unless the reader
+           opened it, is on one of their boards, or is searching the navigator. -->
+      {#if hiddenRepositories.length}
+        {@const expanded = showHiddenRepositories || navFiltering || (scope.kind === "repository" && hiddenRepositorySet.has(scope.id))}
+        <div class="nav-heading" data-testid="task-hidden-repositories">
+          <button type="button" class="hidden-toggle" aria-expanded={expanded} aria-controls="task-hidden-repository-rows" onclick={() => { showHiddenRepositories = !expanded; }}>{#if expanded}<ChevronDown size={11} />{:else}<ChevronRight size={11} />{/if}Hidden ({hiddenRepositories.length})</button>
+          <button type="button" class="icon gp-icon-btn" title="Show every hidden repository's tasks on the board" aria-label="Show every hidden repository" onclick={() => interfaceStore.showAllTaskRepositories()}><Eye size={12} /></button>
+        </div>
+        {#if expanded}
+          <div id="task-hidden-repository-rows">
+            {#each repositories as repo (repo.id)}
+              {#if hiddenRepositorySet.has(repo.id) && navShowsRepository(repo)}{@render repositoryRow(repo, true)}{/if}
+            {/each}
+            {#if hiddenUnloaded > 0}<p class="nav-empty">{plural(hiddenUnloaded, "hidden repository is", "hidden repositories are")} not among the loaded rows.</p>{/if}
+          </div>
+        {/if}
+      {/if}
       {#if navFiltering && navRepositoryMatches === 0}<p class="nav-empty" data-testid="task-nav-no-repositories">No repository matches “{navFilter.trim()}”{repositoryCursor ? " in the loaded rows" : ""}.</p>{/if}
       {#if repositoryCursor}<button type="button" onclick={moreRepositories}>More ({repositories.length}/{repositoryTotal}){navFiltering ? " — search covers loaded rows" : ""}</button>{/if}
     </nav>
@@ -2437,6 +2480,17 @@
         />
       </div>
     {/if}
+    {#if hiddenRepositoryReport}
+      <!-- Like a hidden column: the reader chose to hide the repositories,
+           not to lose count of their work. Without a search the Filters bar
+           is closed, so the next page of tasks is offered here. -->
+      <p class="hidden-note" role="status" data-testid="task-hidden-repository-note">
+        <EyeOff size={11} />
+        {hiddenRepositoryReport.line}
+        {#if moreCandidates && !filtering}<button type="button" class="link" disabled={loading} onclick={() => void loadMoreCandidates()}>Load more tasks</button>{/if}
+        <button type="button" class="link" onclick={() => interfaceStore.showAllTaskRepositories()}>Show hidden repositories</button>
+      </p>
+    {/if}
     {#if hiddenWork}
       <!-- Hiding a column is a layout choice. Hiding the work in it is not one
            this board makes on the reader's behalf, so the cost is named. -->
@@ -2545,6 +2599,9 @@
       <div class="pad"><Skeleton variant="card" count={4} /></div>
     {:else if initialized && error && loadedKey !== boardKey}
       <EmptyState icon={Inbox} title="Tasks unavailable" hint="Retry to load this scope." action={{label:"Retry loading tasks",onClick:()=>void loadBoard(),variant:"secondary"}} />
+    {:else if initialized && !loading && listCards.length === 0 && !filtering && (hiddenRepositoryReport?.tasks ?? 0) > 0}
+      <!-- Not "No tasks yet": there are tasks, the reader hid where they live. -->
+      <EmptyState icon={EyeOff} title="Every loaded task is in a hidden repository" hint={hiddenRepositoryReport?.line ?? ""} action={moreCandidates ? { label: "Load more tasks", onClick: () => void loadMoreCandidates(), variant: "secondary" } : { label: "Show hidden repositories", onClick: () => interfaceStore.showAllTaskRepositories(), variant: "secondary" }} />
     {:else if initialized && !loading && total === 0 && !filtering}
       <!-- Gated on the same decision as the header button. Offering New task
            here where the header refuses it opened a sheet that could never be
@@ -2798,6 +2855,9 @@
   .heading-actions{display:inline-flex;gap:2px}
   .heading-actions>button{width:26px;height:26px;padding:0;display:inline-flex;align-items:center;justify-content:center}
   .nav-row>button:first-child{min-width:0;flex:1}
+  .nav-row .row-action{display:none;flex-shrink:0}
+  .nav-row:hover .row-action,.nav-row:focus-within .row-action{display:inline-flex}
+  .navigator .hidden-toggle{display:inline-flex;align-items:center;gap:2px;width:auto;padding:0;font:inherit;letter-spacing:inherit;text-transform:inherit;color:inherit}
   .archive-toggle{display:flex;align-items:center;gap:6px;padding:6px 8px;font-size:11px;color:rgb(var(--c-text-muted))}
   .board-main{flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden}
   header{padding:10px 14px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;border-bottom:1px solid rgb(var(--c-border) / 0.65)}

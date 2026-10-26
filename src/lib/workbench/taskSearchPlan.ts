@@ -80,15 +80,22 @@ function narrowedRepository(parsed: ParsedTaskQuery, facet: TaskFacet, repositor
   return named.length === 1 ? named[0].id : null;
 }
 
-/** The fetch a search needs. Inside a workspace or repository board the scope is kept: a repository read there could reach past the workspace. */
+/**
+ * The fetch a search needs. Inside a workspace or repository board the scope is kept: a repository read there could reach past the workspace.
+ *
+ * `hidingRepositories` is a filter like any other (`taskHiddenRepositories.ts`):
+ * a column page that holds a hidden repository's tasks would count them in a
+ * total the board cannot show, so the board reads candidates instead.
+ */
 export function planSearch(
   scope: Scope,
   parsed: ParsedTaskQuery,
   facet: TaskFacet,
   repositories: readonly Pick<Repository, "id" | "name" | "identity_key">[],
   catalogComplete: boolean,
+  hidingRepositories = false,
 ): SearchPlan {
-  if (isEmptyQuery(parsed) && !facetActive(facet)) return { mode: "browse", scope, word: null, key: "browse" };
+  if (isEmptyQuery(parsed) && !facetActive(facet) && !hidingRepositories) return { mode: "browse", scope, word: null, key: "browse" };
   const narrowed = scope.kind === "global" ? narrowedRepository(parsed, facet, repositories, catalogComplete) : null;
   const target: Scope = narrowed ? { kind: "repository", id: narrowed } : scope;
   const word = serverWord(parsed);

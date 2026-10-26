@@ -1179,6 +1179,44 @@ if (params.has("check")) {
     navSearch.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); await settle(100);
     check("Escape clears the navigator search", navSearch.value === "" && Boolean(root.querySelector('[data-repository-row="repo-0"]')) && Boolean(workspaceTab("Developer tools")));
 
+    // Hiding a repository is a reader preference over the global and
+    // workspace boards. A task goes by its primary repository: task-2 is
+    // GitPulse's and also links Manvi, so hiding Manvi leaves it on the board.
+    {
+    const navRow = id => root.querySelector(`[data-repository-row="${id}"]`);
+    const hiddenRepoNote = () => root.querySelector('[data-testid="task-hidden-repository-note"]');
+    const queriesBeforeHide = listQueries.length;
+    navRow("repo-1").querySelector('[data-testid="repository-hide"]').click();
+    await wait(() => !card("task-3") && Boolean(hiddenRepoNote()));
+    check(`hiding a repository takes its tasks off the All board and says so (${hiddenRepoNote()?.textContent.trim()})`,
+      !card("task-3") && Boolean(card("task-2")) && Boolean(card("task-1"))
+        && hiddenRepoNote().textContent.includes("1 task from 1 hidden repository is not on this board"));
+    check("hiding never asks the store to filter", listQueries.slice(queriesBeforeHide).every(query => !query));
+    check("a hidden repository leaves the list for a collapsed Hidden group",
+      !navRow("repo-1") && root.querySelector('[data-testid="task-hidden-repositories"]')?.textContent.includes("Hidden (1)"));
+    button("Hidden (1)").click(); await settle(100);
+    check("the Hidden group lists the repository with a way to show it again",
+      navRow("repo-1")?.dataset.hidden === "true" && Boolean(navRow("repo-1").querySelector('[data-testid="repository-show"]')));
+    navRow("repo-1").querySelector("button").click();
+    await wait(() => Boolean(card("task-3")) && !card("task-1"));
+    check("a hidden repository's own board still shows its tasks", Boolean(card("task-3")) && !hiddenRepoNote());
+    await click("Developer tools"); await wait(() => Boolean(card("task-2")) && !card("task-1"));
+    check("a workspace board leaves out its hidden repository's tasks too", !card("task-3") && Boolean(hiddenRepoNote()));
+    button("All", root.querySelector('nav[aria-label="Task scopes"]'))?.click(); await wait(() => Boolean(card("task-1")));
+    check("the Hidden group stays open once the reader opened it", button("Hidden (1)")?.getAttribute("aria-expanded") === "true");
+    navRow("repo-1").querySelector('[data-testid="repository-show"]').click();
+    await wait(() => Boolean(card("task-3")));
+    check("Show puts the repository and its tasks back",
+      Boolean(card("task-3")) && !hiddenRepoNote() && !root.querySelector('[data-testid="task-hidden-repositories"]') && !navRow("repo-1")?.dataset.hidden);
+    navRow("repo-0").querySelector('[data-testid="repository-hide"]').click();
+    await wait(() => !card("task-1") && Boolean(hiddenRepoNote()));
+    check(`hiding the repository a multi-repository task calls primary hides that task (${hiddenRepoNote()?.textContent.trim()})`,
+      !card("task-1") && !card("task-2") && Boolean(card("task-3")) && hiddenRepoNote().textContent.includes(`${tasks.filter(task => task.primary_repository_id === "repo-0" && !task.archived && !deleted.has(task.id)).length} tasks from 1 hidden repository are not on this board`));
+    button("Show hidden repositories", hiddenRepoNote()).click();
+    await wait(() => Boolean(card("task-1")));
+    check("the note's Show hidden repositories brings every task back", Boolean(card("task-1")) && Boolean(card("task-2")) && !hiddenRepoNote());
+    }
+
     await click("Developer tools"); await wait(() => Boolean(card("task-3")) && !card("task-1"));
     await click("New task");
     // The picker owns both halves now, so "which repository is primary" is
