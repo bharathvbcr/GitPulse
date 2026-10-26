@@ -1578,3 +1578,7 @@ pub(crate) fn registry_holds(state: &crate::terminal::TerminalSessions, key: &st
 #[cfg(test)]
 #[path = "client_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "client_adversarial_tests.rs"]
+mod adversarial;
