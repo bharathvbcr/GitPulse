@@ -1,5 +1,4 @@
-import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
@@ -125,9 +124,18 @@ describe("glass that floats over content is blurred", () => {
     "App.svelte", "StatusPopover.svelte", "TaskBoard.svelte", "StatusBar.svelte", "AttentionInbox.svelte", "RepoTabBar.svelte",
     "TaskEditor.svelte", "TaskArchive.svelte", "Sidebar.svelte", "WorkspaceEditor.svelte",
   ];
+  // Every `.svelte` file under src/ that names gp-glass, as a root-relative
+  // path with `/` separators. Read with node:fs rather than a search tool the
+  // CI runners do not have.
+  const glassUsers = (root: string, dir = "src"): string[] =>
+    readdirSync(join(root, dir), { withFileTypes: true }).flatMap((entry) => {
+      const path = `${dir}/${entry.name}`;
+      if (entry.isDirectory()) return glassUsers(root, path);
+      return entry.name.endsWith(".svelte") && readFileSync(join(root, path), "utf8").includes("gp-glass") ? [path] : [];
+    });
   it("every gp-glass user is either float-tier or in the page's flow", () => {
     const root = join(here, "../../..");
-    const files = execFileSync("rg", ["-l", "--no-config", "gp-glass", "src", "-g", "*.svelte"], { cwd: root, encoding: "utf8" }).split("\n").filter(Boolean);
+    const files = glassUsers(root);
     expect(files.length).toBeGreaterThan(10);
     for (const file of files) {
       const name = file.split("/").pop()!;
@@ -139,7 +147,7 @@ describe("glass that floats over content is blurred", () => {
     // by a Tailwind utility, by one of its own classes in the file's style, or
     // portaled out of its parent: any of those lays it over other content.
     const root = join(here, "../../..");
-    const files = execFileSync("rg", ["-l", "--no-config", "gp-glass", "src", "-g", "*.svelte"], { cwd: root, encoding: "utf8" }).split("\n").filter(Boolean);
+    const files = glassUsers(root);
     const offenders: string[] = [];
     for (const file of files) {
       const source = readFileSync(join(root, file), "utf8");
