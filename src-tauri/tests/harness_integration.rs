@@ -149,9 +149,13 @@ fn harness_refuses_the_commands_it_exists_to_refuse() {
     assert_eq!(force_push.rule, "command.force_push");
     assert_eq!(force_push.severity, "hard");
 
-    let bypass = check_command(&root, "git commit --no-verify -m x", None);
+    // Since Manvi's 2026-10-24 owner decision the ladder allows `--no-verify`
+    // and still refuses `--no-gpg-sign` as a bypass.
+    let bypass = check_command(&root, "git commit --no-gpg-sign -m x", None);
     assert_eq!(bypass.status, PolicyStatus::Blocked);
     assert_eq!(bypass.rule, "command.bypass_flag");
+    let unhooked = check_command(&root, "git commit --no-verify -m x", None);
+    assert!(!unhooked.blocks(), "{}: {}", unhooked.rule, unhooked.detail);
 
     // An ordinary commit is allowed — but under the host posture it is a
     // demoted allow, and the verdict must say so rather than reading clean.
