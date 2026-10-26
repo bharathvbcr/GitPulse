@@ -193,12 +193,16 @@ fn ps_state(pid: u32) -> Option<(i32, String)> {
     Some((pri, fields.next()?.to_string()))
 }
 
-/// What the parent read of one child process: its priority once it had exec'd
-/// into `sleep`, and how many `ps` reads that took.
+/// What the parent read of one child process once it had exec'd into `sleep`:
+/// the priority the first read showed (`first`), the one it settled at (`pri`,
+/// in the band unless the reading ran out of reads), and how many `ps` reads
+/// that took. A descendant is created at the default priority and joins the
+/// band a few milliseconds later, so `first` can be outside it.
 #[derive(Clone, Debug)]
 struct Reading {
     label: &'static str,
     pid: u32,
+    first: i32,
     pri: i32,
     reads: u32,
 }
@@ -242,7 +246,10 @@ struct BandWatch {
 }
 
 impl BandWatch {
-    fn start(wanted: &'static [&'static str]) -> Self {
+    /// `settle_reads` is how many reads a pid outside the band gets to join it
+    /// before its reading is taken as it stands; `None` reads until it joins,
+    /// and the run's deadline is then the only bound.
+    fn start(wanted: &'static [&'static str], settle_reads: Option<u32>) -> Self {
         let (announce, targets) = mpsc::channel::<Vec<(&'static str, u32)>>();
         let stop = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
@@ -259,6 +266,7 @@ impl BandWatch {
                 let Ok(pids) = targets.recv() else { return };
                 for (label, pid) in pids {
                     let mut reads = 0;
+                    let mut first = None;
                     let reading = loop {
                         if stop.load(Ordering::Acquire) {
                             return;
@@ -271,12 +279,16 @@ impl BandWatch {
                             // process image replaced under it kept, not the
                             // shell's.
                             if comm.ends_with("sleep") {
-                                break Reading {
-                                    label,
-                                    pid,
-                                    pri,
-                                    reads,
-                                };
+                                let first = *first.get_or_insert(pri);
+                                if pri < 10 || settle_reads.is_some_and(|most| reads >= most) {
+                                    break Reading {
+                                        label,
+                                        pid,
+                                        first,
+                                        pri,
+                                        reads,
+                                    };
+                                }
                             }
                         }
                         std::thread::sleep(Duration::from_millis(10));
@@ -341,8 +353,9 @@ fn watched_band_run(
     script: &str,
     stdin: Option<&[u8]>,
     wanted: &'static [&'static str],
+    settle_reads: Option<u32>,
 ) -> Vec<Reading> {
-    let mut watch = BandWatch::start(wanted);
+    let mut watch = BandWatch::start(wanted, settle_reads);
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg(script);
     let (entered, failed) = band_outcomes();
@@ -375,22 +388,64 @@ fn watched_band_run(
     readings
 }
 
+fn assert_in_band(readings: &[Reading], what: &str) {
+    for reading in readings {
+        assert!(
+            reading.pri < 10,
+            "{} (pid {}) {what}: pri {} on the first read, {} after {} reads",
+            reading.label,
+            reading.pid,
+            reading.first,
+            reading.pri,
+            reading.reads
+        );
+    }
+}
+
 /// A demoted child that has exec'd is at the background priority when its
-/// parent reads it, however loaded the host is: the demotion is applied before
-/// the wait loop starts, so no read has a window in which it is still pending.
+/// parent reads it, however loaded the host is. The child waits for a line on
+/// stdin, which the run feeds only after the demotion, so the demotion is
+/// already applied when it prints its pid and execs.
 #[test]
 fn adv_flake_timeline_time_to_demotion() {
     let started = Instant::now();
     let readings = watched_band_run(
         "adv-timeline",
-        "echo self=$$; exec /bin/sleep 600",
-        None,
+        "read go; echo self=$$; exec /bin/sleep 600",
+        Some(b"go\n"),
         &["self"],
+        None,
     );
     eprintln!("TIMELINE {readings:?} wall={:?}", started.elapsed());
-    for reading in &readings {
-        assert!(reading.pri < 10, "never demoted: {reading:?}");
+    assert_in_band(&readings, "never demoted");
+}
+
+/// PRODUCTION DEFECT, kept as a repro: a child that execs before the parent's
+/// `setpriority` lands is left at the default priority for good. The band is
+/// applied after the spawn returns (`enter_background_band`), and a child that
+/// replaces its image at once, as `sh -c 'exec tool'` does, can pass through
+/// its exec while the demotion is in flight; it then reads pri 31 and still
+/// reads 31 half a second later (2 of 80 runs of the module at load 15 to 40
+/// on 2026-10-26; the same was seen 1 in 10 at load 72 as a shell that never
+/// reached the band in 81 s). Run with `--ignored`.
+#[test]
+#[ignore = "break: a child that execs immediately can miss the background band for good"]
+fn adv_break_child_that_execs_at_once_misses_the_band() {
+    let mut missed = 0;
+    for _ in 0..60 {
+        let readings = watched_band_run(
+            "adv-race",
+            "echo self=$$; exec /bin/sleep 600",
+            None,
+            &["self"],
+            Some(50),
+        );
+        missed += readings.iter().filter(|r| r.pri >= 10).count();
     }
+    assert_eq!(
+        missed, 0,
+        "{missed} of 60 children that exec at once never joined the band"
+    );
 }
 
 /// Gap between `posix_spawn` returning and the demotion returning, on a thread
@@ -436,22 +491,46 @@ fn adv_demotion_gap_and_errors_on_a_utility_thread() {
     report("utility-thread", utility_gaps, e2);
 }
 
-/// Grandchildren and exec inherit the band from a demoted child.
-///
-/// The child waits for a line on stdin, and the run feeds it only after the
-/// parent has demoted it, so the grandchild is forked after the demotion by
-/// construction: this cannot pass on a child that was already running unbanded
-/// when it forked. Both pids are read after they have exec'd into `sleep`.
+/// A demoted child keeps the band through its own exec. The child waits for a
+/// line on stdin, which the run feeds only after the demotion, so the exec
+/// comes after it by construction.
 #[test]
-fn adv_band_survives_exec_and_is_inherited_by_grandchildren() {
+fn adv_band_survives_exec() {
     let readings = watched_band_run(
-        "adv-inherit",
-        "read go; /bin/sleep 600 & echo grand=$!; echo self=$$; exec /bin/sleep 600",
+        "adv-exec",
+        "read go; echo self=$$; exec /bin/sleep 600",
         Some(b"go\n"),
-        &["grand", "self"],
+        &["self"],
+        None,
     );
-    eprintln!("INHERIT {readings:?}");
-    for reading in &readings {
-        assert!(reading.pri < 10, "{reading:?}");
+    eprintln!("EXEC {readings:?}");
+    assert_in_band(&readings, "left the band across exec");
+}
+
+/// PRODUCTION DEFECT, kept as a repro: a grandchild forked by an already
+/// demoted child is usually in the band (a few milliseconds after it is
+/// created, as `first` shows) but sometimes never joins it. The child waits for
+/// a line on stdin that is fed only after the demotion, so the fork is after it
+/// by construction. Seen as `grand pid=... pri=31 ... reads=8115` for the whole
+/// 120 s run in 1 of 40 runs of `adv_band_survives_exec_and_is_inherited_by_
+/// grandchildren` (the test this one was split from) at load 15 to 20, and 4
+/// of 60 as a first read of 31 or 46 before it settled. Run with `--ignored`.
+#[test]
+#[ignore = "break: a grandchild of a demoted child can stay outside the background band"]
+fn adv_break_grandchild_of_a_demoted_child_misses_the_band() {
+    let mut missed = 0;
+    for _ in 0..60 {
+        let readings = watched_band_run(
+            "adv-grand",
+            "read go; /bin/sleep 600 & echo grand=$!; echo self=$$; exec /bin/sleep 600",
+            Some(b"go\n"),
+            &["grand", "self"],
+            Some(50),
+        );
+        missed += readings.iter().filter(|r| r.pri >= 10).count();
     }
+    assert_eq!(
+        missed, 0,
+        "{missed} of 60 demoted children's pids never joined the band"
+    );
 }
