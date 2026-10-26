@@ -420,7 +420,8 @@ fn adv_flake_timeline_time_to_demotion() {
     assert_in_band(&readings, "never demoted");
 }
 
-/// PRODUCTION DEFECT, kept as a repro: a child that execs before the parent's
+/// PRODUCTION DEFECT ft-b597add5 (gp-b26-background-band-race), kept as a
+/// repro: a child that execs before the parent's
 /// `setpriority` lands is left at the default priority for good. The band is
 /// applied after the spawn returns (`enter_background_band`), and a child that
 /// replaces its image at once, as `sh -c 'exec tool'` does, can pass through
@@ -507,7 +508,8 @@ fn adv_band_survives_exec() {
     assert_in_band(&readings, "left the band across exec");
 }
 
-/// PRODUCTION DEFECT, kept as a repro: a grandchild forked by an already
+/// PRODUCTION DEFECT ft-b597add5 (gp-b26-background-band-race), kept as a
+/// repro: a grandchild forked by an already
 /// demoted child is usually in the band (a few milliseconds after it is
 /// created, as `first` shows) but sometimes never joins it. The child waits for
 /// a line on stdin that is fed only after the demotion, so the fork is after it

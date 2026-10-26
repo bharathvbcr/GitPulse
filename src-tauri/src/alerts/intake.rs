@@ -486,6 +486,21 @@ impl Intake {
         offer
     }
 
+    /// Spends every token of the bucket that session-less reports share, and
+    /// says whether it ended empty. Reads and writes that bucket and nothing
+    /// else: no queue slot, order book entry, twin memory or counter, so a test
+    /// that empties it cannot disturb another test's reports.
+    #[cfg(all(test, unix))]
+    pub(super) fn exhaust_outside_bucket(&self) -> bool {
+        let mut limits = self
+            .limits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = std::time::Instant::now();
+        (0..super::limits::OUTSIDE_BURST as usize + 1)
+            .any(|_| !limits.admit("hook-exhaust", true, now))
+    }
+
     /// The checks a peer's report meets before it can leave a trace: order
     /// (only to keep a late report from a finished session `stale`, as ever),
     /// then whether the session exists, then the rate. Changes nothing when it

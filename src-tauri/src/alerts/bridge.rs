@@ -1403,17 +1403,16 @@ mod tests {
     /// every one of them from empty makes the exposure deterministic: a probe
     /// that names no session is refused as `rate_limited` here every time, not
     /// once in a few hundred runs under load.
+    ///
+    /// It spends the bucket's tokens directly. Offering reports to the hub
+    /// instead would put notices in the queue every test shares, and in the
+    /// order book, twin memory and counters other tests read.
     #[cfg(unix)]
     fn drain_outside_bucket() {
-        let outside = parse_report(br#"{"v":1,"event":"error","agent":"codex"}"#)
-            .expect("a well-formed report");
-        let drained = (0..64).any(|_| {
-            matches!(
-                crate::alerts::offer_stamped(outside.clone(), order_stamp_ns()),
-                Offer::RateLimited
-            )
-        });
-        assert!(drained, "64 session-less reports did not empty the bucket");
+        assert!(
+            crate::alerts::exhaust_outside_bucket(),
+            "the outside bucket could not be emptied"
+        );
     }
 
     #[cfg(unix)]
