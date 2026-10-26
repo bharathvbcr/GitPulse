@@ -47,6 +47,16 @@ struct Shared {
     garbage_lists: AtomicUsize,
     /// How long a list waits before it is answered.
     list_delay_ms: AtomicU64,
+    /// A list is answered from the sessions as they are when it is asked,
+    /// this long afterwards, on its own thread: other requests are answered
+    /// in the meantime, and the answer is older than they are.
+    list_late_ms: AtomicU64,
+    /// How long the hello waits before it is answered.
+    hello_delay_ms: AtomicU64,
+    /// A spawn is answered as a host would: the session is listed from then on.
+    spawn_ok: AtomicBool,
+    /// A spawn is refused, this long after it is asked.
+    spawn_reject_ms: AtomicU64,
     /// Accepting; false drops the listener, so a connect is refused.
     listening: AtomicBool,
     stop: AtomicBool,
@@ -205,13 +215,19 @@ fn serve(stream: UnixStream, writer: Writer, shared: &Shared) {
         };
         let answer: Result<serde_json::Value, String> = match request {
             Request::Limit { .. } | Request::Stall { .. } | Request::Forget { .. } => continue,
-            Request::Hello { .. } => Ok(serde_json::to_value(Hello {
-                protocol: PROTOCOL,
-                build: crate::updates::CURRENT_VERSION.to_owned(),
-                pid: std::process::id(),
-                sessions: shared.sessions.lock().unwrap().len(),
-            })
-            .unwrap()),
+            Request::Hello { .. } => {
+                let delay = shared.hello_delay_ms.load(Ordering::Acquire);
+                if delay > 0 {
+                    std::thread::sleep(Duration::from_millis(delay));
+                }
+                Ok(serde_json::to_value(Hello {
+                    protocol: PROTOCOL,
+                    build: crate::updates::CURRENT_VERSION.to_owned(),
+                    pid: std::process::id(),
+                    sessions: shared.sessions.lock().unwrap().len(),
+                })
+                .unwrap())
+            }
             Request::List => {
                 shared.lists.fetch_add(1, Ordering::AcqRel);
                 let delay = shared.list_delay_ms.load(Ordering::Acquire);
@@ -222,7 +238,7 @@ fn serve(stream: UnixStream, writer: Writer, shared: &Shared) {
                     .garbage_lists
                     .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
                     .is_ok();
-                if garbage {
+                let answer = if garbage {
                     Ok(serde_json::json!("this is not a list of sessions"))
                 } else {
                     let listed: Vec<TerminalListing> = shared
@@ -242,7 +258,22 @@ fn serve(stream: UnixStream, writer: Writer, shared: &Shared) {
                         })
                         .collect();
                     Ok(serde_json::to_value(listed).unwrap())
+                };
+                let late = shared.list_late_ms.load(Ordering::Acquire);
+                if let (true, Ok(value)) = (late > 0, &answer) {
+                    let (writer, value) = (writer.clone(), value.clone());
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(late));
+                        let reply = HostFrame::Reply {
+                            id,
+                            ok: Some(value),
+                            error: None,
+                        };
+                        let _ = write_frame(&mut *writer.lock().unwrap(), &reply, &[]);
+                    });
+                    continue;
                 }
+                answer
             }
             Request::Receipts => {
                 shared.receipts.fetch_add(1, Ordering::AcqRel);
@@ -252,11 +283,28 @@ fn serve(stream: UnixStream, writer: Writer, shared: &Shared) {
                     Ok(serde_json::to_value(Vec::<WireEnded>::new()).unwrap())
                 }
             }
-            Request::Spawn { .. } => {
+            Request::Spawn { request } => {
                 if shared.hang_spawn.load(Ordering::Acquire) {
                     continue;
                 }
-                Ok(serde_json::Value::Null)
+                let reject = shared.spawn_reject_ms.load(Ordering::Acquire);
+                if reject > 0 {
+                    std::thread::sleep(Duration::from_millis(reject));
+                    Err("the host refused to start the session".to_owned())
+                } else if shared.spawn_ok.load(Ordering::Acquire) {
+                    shared
+                        .sessions
+                        .lock()
+                        .unwrap()
+                        .push((request.session_id.clone(), None));
+                    Ok(serde_json::json!({
+                        "spawned": {"id": request.session_id, "shell": "sh", "cwd": "/"},
+                        "process": [4242, "born"],
+                        "process_error": null,
+                    }))
+                } else {
+                    Ok(serde_json::Value::Null)
+                }
             }
             _ => Ok(serde_json::Value::Null),
         };
@@ -863,4 +911,425 @@ fn an_output_flood_does_not_stall_the_check() {
         let worst = asker.join().unwrap();
         assert!(worst < PROMPT, "a check waited {worst:?} behind the flood");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Round 2: the `Inner.vouched` design (16e46225). `knows` reads `vouched`
+// alone; `proxies` is kept for everything else, so the two can disagree.
+// ---------------------------------------------------------------------------
+
+/// A host that is not listing at all, every time: the retry attempts fail too.
+const ALWAYS: usize = usize::MAX / 2;
+
+fn the_client(app: &Fixture) -> HostClient {
+    app.sessions.host.clone().unwrap()
+}
+
+/// A spawn the host answers while the adoption's list is still on its way, as
+/// it can on a connection that is already usable before it has listed: the
+/// list was taken before the spawn, so it does not name the session. `adopt`
+/// publishes that list over `held` (client.rs `publish_listing` assigns, it
+/// does not merge), which drops the confirmed spawn; and its `gone` pass then
+/// ends the proxy of a session the host holds, because it is not in the list.
+///
+/// Predicted: BREAK. The session is alive and was confirmed by the host, and
+/// is never vouched for.
+#[test]
+fn a_spawn_confirmed_while_the_adoption_is_listing_is_still_vouched_for() {
+    let fake = FakeHost::start(&[]);
+    fake.shared.list_late_ms.store(1000, Ordering::Release);
+    let app = fixture(fake.config());
+    let sessions = app.sessions.clone();
+    let connecting = std::thread::spawn(move || sessions.connect_host());
+    until("the list requested", Duration::from_secs(5), || {
+        fake.shared.lists.load(Ordering::Acquire) >= 1
+    });
+    fake.shared.spawn_ok.store(true, Ordering::Release);
+
+    let host = the_client(&app);
+    let spawned = host
+        .spawn(
+            Arc::new(NullEvents),
+            spawn_request("term-8-a"),
+            nowhere(),
+            None,
+        )
+        .map(|_| ());
+    assert!(spawned.is_ok(), "the spawn was answered: {spawned:?}");
+    connecting.join().unwrap().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+
+    assert!(
+        app.host.knows("term-8-a"),
+        "a live session the host confirmed during the adoption is not vouched for"
+    );
+}
+
+/// The app quits while a connect is in flight (the hello is slow). `disconnect`
+/// finds no connection to close and revokes; the connect then stores its
+/// connection (client.rs `connect` does not look at `leaving` again), lists,
+/// and `publish_listing` sets `live`. From then on the quit's connection is
+/// open and vouched for.
+///
+/// Predicted: BREAK. The same race leaves a connection open after the quit.
+#[test]
+fn a_quit_during_a_connect_is_not_undone_by_the_connect_finishing() {
+    let fake = FakeHost::start(&[("term-live", None)]);
+    fake.shared.hello_delay_ms.store(800, Ordering::Release);
+    let app = fixture(fake.config());
+    let sessions = app.sessions.clone();
+    let connecting = std::thread::spawn(move || sessions.connect_host());
+    until("the connection accepted", Duration::from_secs(5), || {
+        fake.accepts() >= 1
+    });
+    std::thread::sleep(Duration::from_millis(100));
+
+    app.sessions.disconnect_host();
+    let _ = connecting.join().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert!(
+        !app.host.knows("term-live"),
+        "the app let the host go, and a connect that was already under way vouched for it again"
+    );
+}
+
+/// A host whose listing is never readable: the first attempt and three retries
+/// (about 1, 3 and 7 s after the first), and then no more, however long it
+/// waits. A fresh `connect_host` after it starts working again recovers.
+///
+/// Predicted: pass.
+#[test]
+fn a_failing_listing_is_retried_three_times_and_then_left_alone() {
+    let fake = FakeHost::start(&[("term-live", None)]);
+    fake.shared.garbage_lists.store(ALWAYS, Ordering::Release);
+    let app = fixture(fake.config());
+    assert!(app.sessions.connect_host().is_err());
+    assert_eq!(fake.accepts(), 1);
+
+    std::thread::sleep(Duration::from_secs(9));
+    assert_eq!(
+        fake.accepts(),
+        4,
+        "the first attempt and three retries, by 9 s"
+    );
+    assert!(!app.host.knows("term-live"));
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(fake.accepts(), 4, "the retries went on");
+    assert!(
+        !the_client(&app).inner.retrying.load(Ordering::Acquire),
+        "the retry loop finished but still claims to be running, so no later failure is retried"
+    );
+
+    fake.shared.garbage_lists.store(0, Ordering::Release);
+    app.sessions.connect_host().unwrap();
+    assert!(app.host.knows("term-live"));
+}
+
+/// A caller reconnects while a retry is waiting, and its listing fails as well.
+/// There is one retry loop, not two: the caller's failure does not start
+/// another, and the one that runs finds the host working.
+///
+/// Predicted: pass.
+#[test]
+fn a_reconnect_by_a_caller_during_a_retry_does_not_double_the_retries() {
+    let fake = FakeHost::start(&[("term-live", None)]);
+    fake.shared.garbage_lists.store(2, Ordering::Release);
+    let app = fixture(fake.config());
+    assert!(app.sessions.connect_host().is_err());
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        app.sessions.connect_host().is_err(),
+        "the second list is unreadable too"
+    );
+
+    until("the retry adopted", Duration::from_secs(5), || {
+        app.host.knows("term-live")
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        fake.accepts(),
+        3,
+        "the first attempt, the caller's, and one retry"
+    );
+    assert!(!the_client(&app).inner.retrying.load(Ordering::Acquire));
+}
+
+/// The app quits while an adoption retry is waiting: the retry ends without
+/// connecting, and nothing is vouched for.
+///
+/// Predicted: pass.
+#[test]
+fn a_quit_during_a_retry_stops_it() {
+    let fake = FakeHost::start(&[("term-live", None)]);
+    fake.shared.garbage_lists.store(ALWAYS, Ordering::Release);
+    let app = fixture(fake.config());
+    assert!(app.sessions.connect_host().is_err());
+    std::thread::sleep(Duration::from_millis(300));
+
+    app.sessions.disconnect_host();
+    std::thread::sleep(Duration::from_secs(2));
+
+    assert_eq!(fake.accepts(), 1, "a retry connected after the quit");
+    assert!(!app.host.knows("term-live"));
+    assert!(
+        !the_client(&app).inner.retrying.load(Ordering::Acquire),
+        "the retry never ended"
+    );
+}
+
+/// A spawn the host refuses, after a delay shorter than the grace. While it is
+/// pending the session is vouched for (the grace); the moment the refusal is
+/// read it is not, and nothing keeps it.
+///
+/// Predicted: pass.
+#[test]
+fn a_spawn_the_host_refuses_is_not_vouched_for_once_it_is_refused() {
+    let fake = FakeHost::start(&[]);
+    let app = fixture(fake.config());
+    app.sessions.connect_host().unwrap();
+    fake.shared.spawn_reject_ms.store(700, Ordering::Release);
+
+    let host = the_client(&app);
+    let spawner = std::thread::spawn(move || {
+        host.spawn(
+            Arc::new(NullEvents),
+            spawn_request("term-9-a"),
+            nowhere(),
+            None,
+        )
+        .map(|_| ())
+    });
+    until("the pending spawn", Duration::from_secs(5), || {
+        app.host.knows("term-9-a")
+    });
+    assert!(spawner.join().unwrap().is_err(), "the host refused");
+
+    assert!(
+        !app.host.knows("term-9-a"),
+        "a session the host refused is still vouched for"
+    );
+    std::thread::sleep(Duration::from_millis(1200));
+    assert!(!app.host.knows("term-9-a"));
+}
+
+/// Thousands of exits, none of them a session this app ever held, and 50 live
+/// sessions the host keeps: the record of ended sessions and the vouched set
+/// stay bounded, and the live sessions are not lost to them.
+///
+/// Predicted: pass.
+#[test]
+fn thousands_of_exits_leave_the_records_bounded() {
+    let live: Vec<String> = (0..50).map(|n| format!("term-1-{n:x}")).collect();
+    let listed: Vec<(&str, Option<&str>)> = live.iter().map(|id| (id.as_str(), None)).collect();
+    let fake = FakeHost::start(&listed);
+    let app = fixture(fake.config());
+    app.sessions.connect_host().unwrap();
+    let client = the_client(&app);
+
+    for n in 0..2500 {
+        fake.end(&format!("term-2-{n:x}"));
+    }
+    until("the exits recorded", Duration::from_secs(60), || {
+        lock(&client.inner.ended).len() >= REMEMBERED_EXITS
+    });
+    std::thread::sleep(Duration::from_secs(1));
+
+    assert!(lock(&client.inner.ended).len() <= REMEMBERED_EXITS);
+    assert!(lock(&client.inner.vouched).exited.len() <= REMEMBERED_EXITS);
+    assert_eq!(lock(&client.inner.vouched).held.len(), 50);
+    assert_eq!(client.known_sessions(), 50);
+    assert!(app.host.knows(&live[0]));
+}
+
+/// "Ended ids are never resurrected" holds only as long as the id is
+/// remembered: `exited` keeps the newest 1024. A session whose exit has since
+/// been pushed out by 1100 others is brought back by a listing that still
+/// names it.
+///
+/// Predicted: BREAK, low severity: the bound is the price of bounded memory,
+/// and the listing must be older than 1100 exits to do it. It documents that
+/// the guarantee is a window, not "never".
+#[test]
+fn an_exit_pushed_out_of_the_record_is_not_resurrected_by_an_old_listing() {
+    let fake = FakeHost::start(&[("term-live", None)]);
+    let app = fixture(fake.config());
+    app.sessions.connect_host().unwrap();
+    let client = the_client(&app);
+
+    fake.end("term-live");
+    until("the exit recorded", Duration::from_secs(10), || {
+        !app.host.knows("term-live")
+    });
+    for n in 0..1100 {
+        fake.end(&format!("term-3-{n:x}"));
+    }
+    until("the later exits recorded", Duration::from_secs(60), || {
+        lock(&client.inner.ended).len() >= REMEMBERED_EXITS
+    });
+    std::thread::sleep(Duration::from_secs(1));
+
+    // The host still lists it: a listing older than all of that.
+    fake.drop_connections();
+    until("the second connection", Duration::from_secs(10), || {
+        fake.accepts() >= 2
+    });
+    until("the second adoption", Duration::from_secs(10), || {
+        fake.receipts() >= 2
+    });
+    std::thread::sleep(Duration::from_millis(300));
+
+    assert!(
+        !app.host.knows("term-live"),
+        "an ended session came back once its exit left the record"
+    );
+}
+
+/// The exit arrives while the adoption's list, which still names the session,
+/// is on its way. Whichever the app handles first, the session ends up not
+/// vouched for and stays so.
+///
+/// Predicted: pass.
+#[test]
+fn an_exit_racing_the_listing_never_leaves_the_session_vouched() {
+    let fake = FakeHost::start(&[("term-live", None)]);
+    fake.shared.list_late_ms.store(400, Ordering::Release);
+    let app = fixture(fake.config());
+    let sessions = app.sessions.clone();
+    let connecting = std::thread::spawn(move || sessions.connect_host());
+    until("the list requested", Duration::from_secs(5), || {
+        fake.shared.lists.load(Ordering::Acquire) >= 1
+    });
+
+    fake.end("term-live");
+    connecting.join().unwrap().unwrap();
+    until(
+        "the session not vouched for",
+        Duration::from_secs(3),
+        || !app.host.knows("term-live"),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!app.host.knows("term-live"));
+}
+
+/// The two sets `vouched` and `proxies` after a restart that is reconciled
+/// completely: they name the same sessions.
+///
+/// Predicted: pass.
+#[test]
+fn vouched_and_proxies_name_the_same_sessions_after_a_clean_restart() {
+    let fake = FakeHost::start(&[("term-a", None), ("term-b", None), ("term-c", None)]);
+    let app = fixture(fake.config());
+    app.sessions.connect_host().unwrap();
+    let client = the_client(&app);
+
+    fake.end("term-b");
+    fake.forget("term-b");
+    until("b recorded", Duration::from_secs(10), || {
+        !app.host.knows("term-b")
+    });
+    fake.set_sessions(&[("term-a", None), ("term-c", None), ("term-d", None)]);
+    fake.drop_connections();
+    until("d adopted", Duration::from_secs(10), || {
+        app.host.knows("term-d")
+    });
+    std::thread::sleep(Duration::from_millis(500));
+
+    let mut proxies: Vec<String> = lock(&client.inner.proxies).keys().cloned().collect();
+    proxies.sort();
+    let mut vouched: Vec<String> = lock(&client.inner.vouched).held.iter().cloned().collect();
+    vouched.sort();
+    assert_eq!(vouched, ["term-a", "term-c", "term-d"]);
+    assert_eq!(proxies, vouched);
+}
+
+/// The same restart with receipts that cannot be read. `knows` is right (the
+/// listing alone feeds `vouched`), but `adopt` returned before it ended the
+/// proxies the host no longer holds, so `proxies` keeps a session `vouched`
+/// does not: `tracks_run` and `known_sessions` still count it.
+///
+/// Predicted: BREAK. The two sets diverge, and the stale one is the one that
+/// decides whether a run is released.
+#[test]
+fn proxies_do_not_keep_a_session_vouched_does_not_hold() {
+    let fake = FakeHost::start(&[("term-old", None)]);
+    let app = fixture(fake.config());
+    app.sessions.connect_host().unwrap();
+    let client = the_client(&app);
+
+    fake.set_sessions(&[("term-new", None)]);
+    fake.shared.receipts_fail.store(true, Ordering::Release);
+    fake.drop_connections();
+    until("new adopted", Duration::from_secs(10), || {
+        app.host.knows("term-new")
+    });
+    std::thread::sleep(Duration::from_millis(500));
+
+    assert!(!app.host.knows("term-old"), "the answer `knows` gives");
+    let mut proxies: Vec<String> = lock(&client.inner.proxies).keys().cloned().collect();
+    proxies.sort();
+    assert_eq!(
+        proxies,
+        ["term-new"],
+        "a proxy for a session the host no longer holds stays, and counts for `tracks_run`"
+    );
+}
+
+/// 100 threads ask while an adoption keeps failing and is retried, then
+/// succeeds. No deadlock, no wrong answer while nothing
+/// is vouched for, no call that waits, and the retry's success is seen.
+///
+/// Predicted: pass.
+#[test]
+fn a_hundred_threads_ask_through_failing_listings_and_their_retries() {
+    let fake = FakeHost::start(&[("term-live", None), ("term-b", None)]);
+    fake.shared.garbage_lists.store(3, Ordering::Release);
+    let app = fixture(fake.config());
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let worst = Arc::new(AtomicU64::new(0));
+    let violations = Arc::new(AtomicUsize::new(0));
+    let (finished, done) = mpsc::channel();
+    for thread in 0..100usize {
+        let (host, stop, worst, violations, finished) = (
+            app.host.clone(),
+            stop.clone(),
+            worst.clone(),
+            violations.clone(),
+            finished.clone(),
+        );
+        std::thread::spawn(move || {
+            let keys = ["term-live", "term-b", "term-404", "", "hook-x"];
+            let mut next = thread;
+            while !stop.load(Ordering::Acquire) {
+                let key = keys[next % keys.len()];
+                next += 1;
+                let started = Instant::now();
+                let known = host.knows(key);
+                worst.fetch_max(started.elapsed().as_micros() as u64, Ordering::AcqRel);
+                if known && matches!(key, "term-404" | "" | "hook-x") {
+                    violations.fetch_add(1, Ordering::AcqRel);
+                }
+                std::thread::yield_now();
+            }
+            let _ = finished.send(());
+        });
+    }
+
+    // Three unreadable lists: the first attempt and the retries at about 1 s
+    // and 3 s; the retry at about 7 s reads the host.
+    assert!(app.sessions.connect_host().is_err());
+    until("the retry adopted", Duration::from_secs(15), || {
+        app.host.knows("term-live")
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    stop.store(true, Ordering::Release);
+
+    for _ in 0..100 {
+        done.recv_timeout(Duration::from_secs(30))
+            .expect("a thread asking `knows` never finished: deadlock");
+    }
+    assert_eq!(violations.load(Ordering::Acquire), 0, "an answer was wrong");
+    let worst = Duration::from_micros(worst.load(Ordering::Acquire));
+    assert!(worst < PROMPT, "the slowest check took {worst:?}");
 }
