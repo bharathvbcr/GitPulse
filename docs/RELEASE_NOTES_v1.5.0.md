@@ -121,7 +121,7 @@ GitPulse 1.5.0 is a large release: agents that run in the background with a pane
 ## Known issues
 
 - **The GPU terminal renderer shipped before its deciding benchmark ran.** It is on by default. The TUI-redraw A/B in `docs/PERFORMANCE.md` has not been run. A lost context falls back to the DOM renderer, and the setting turns it off. (`75bee0f9`)
-- **Installed readers lag the dc-store 11 vendor.** At the vendoring commit the installed `gitpulse-mcp` and the app's bundled copy, and the Manvi and Jarvis pins, still read older schemas, and a store a schema 11 host has opened is refused by an older one. Until `bun run mcp:install` is run, GitPulse.app is rebuilt and the pins move, the task board over MCP refuses the profile. (`ad799955`)
+- **A `gitpulse-mcp` or `gitpulse-hook` older than this build refuses a task store this build has opened.** Reinstall them together with the app (see Breaking changes). (`ad799955`)
 - **Hiding a repository's tasks is a reader preference with gaps.** Store totals and per-column paging do not account for hidden tasks, and the archive, inbox, badges and suggestions still include them. Closing these, and a real remove, needs a DevCouncil workbench schema bump. (`2b56f3bf`)
 - **Prebuilt remote installs are unavailable.** None are pinned yet, so that install option reports itself unavailable and installs build from source. (`3f09e029`)
 - **Collision risk cannot see running Codex sessions where there is no process scan.** On Windows a kind with no detector is reported as unknown rather than zero; macOS and Linux count Codex by process. Codex history reaches the ledger only afterwards, from its rollout files. (`f27fc1ae`, `83c1ea6c`)

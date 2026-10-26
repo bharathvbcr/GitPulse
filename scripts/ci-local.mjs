@@ -50,7 +50,7 @@ const CARGO_MANIFEST = "src-tauri/Cargo.toml";
  * `produces` lists the reports a gate writes (repository-relative), which a
  * later gate reads. Each is removed before its gate runs. `cargo llvm-cov`
  * writes no report when a test fails, so without that the coverage floor read
- * the last run's `lcov.info` — nine days old on 2026-10-25 — and passed on it:
+ * the last run's `lcov.info` — eight days old on 2026-10-25 — and passed on it:
  * a check that could not run, reading like one that ran.
  *
  * @typedef {{
