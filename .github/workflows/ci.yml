@@ -269,6 +269,9 @@ jobs:
       - name: Build Tauri Bundles
         id: tauri
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
+        with:
+          # As the release build: cargo resolves the committed Cargo.lock.
+          args: -- --locked
 
       - name: Installer Names Match The Release Manifest
         shell: bash

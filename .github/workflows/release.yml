@@ -286,7 +286,9 @@ jobs:
           # A 20-to-90-minute build should not be thrown away by one flaky
           # asset upload.
           retryAttempts: 3
-          args: ${{ matrix.args }}
+          # `--` hands the rest to cargo: the shipping build resolves exactly
+          # the committed Cargo.lock, not whatever it would resolve today.
+          args: ${{ matrix.args }} -- --locked
 
   # Every installer is on the draft. Add the SHA-256 manifest and the two
   # SBOMs, checked against GitHub's own asset digests, before finalize demands
