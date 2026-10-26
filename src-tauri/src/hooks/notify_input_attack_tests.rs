@@ -3,7 +3,7 @@
 //! parse `notify` used before the change; the differential tests hold the new
 //! reader to it.
 
-use super::notify_input::{read_notify_input, MAX_READ_BYTES, NOTIFY_READ_BUDGET};
+use super::notify_input::{kept_fields, read_notify_input, MAX_READ_BYTES, NOTIFY_READ_BUDGET};
 use super::*;
 use serde_json::json;
 use std::io::Cursor;
@@ -328,7 +328,10 @@ fn digest_separates_one_from_one_point_zero_and_ignores_key_order() {
 }
 
 /// Cost: a 5 MiB `tool_input` (a Write of a big file) through the new reader.
-/// Bounded in time; prints the figure.
+/// Bounded in work, not in wall time: the parse is timed as this thread's CPU
+/// time, which a loaded host barely stretches, where its wall clock has been
+/// stretched past the budget by tens of times. The whole reader, with its worker
+/// thread, still runs once for the answer.
 #[test]
 fn a_five_mib_tool_input_costs_well_under_the_hook_timeout() {
     let body = json!({
@@ -337,13 +340,14 @@ fn a_five_mib_tool_input_costs_well_under_the_hook_timeout() {
         "tool_response": {"ok": true},
     })
     .to_string();
+    assert_eq!(new_path(body.as_bytes()).unwrap().tool_subject.len(), 16);
     let mut best = Duration::MAX;
     for _ in 0..5 {
-        let started = Instant::now();
-        let input = new_path(body.as_bytes()).unwrap();
-        best = best.min(started.elapsed());
+        let started = crate::sysload::thread_cpu();
+        let input = kept_fields(body.as_bytes()).unwrap();
+        best = best.min(crate::sysload::thread_cpu() - started);
         assert_eq!(input.tool_subject.len(), 16);
     }
-    eprintln!("5 MiB tool_input: min of 5 = {best:?}");
+    eprintln!("5 MiB tool_input: min of 5 = {best:?} of CPU");
     assert!(best < Duration::from_millis(1_000), "{best:?}");
 }

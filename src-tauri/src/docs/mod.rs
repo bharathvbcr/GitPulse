@@ -941,20 +941,24 @@ mod tests {
         let querying = {
             let path = path.clone();
             std::thread::spawn(move || {
-                let started = Instant::now();
-                let hits = search(&path, "rebuilt-snapshot-token", 5);
-                let _ = sent.send(started.elapsed());
-                hits
+                let _ = sent.send(search(&path, "rebuilt-snapshot-token", 5));
             })
         };
-        let waited = answered.recv_timeout(Duration::from_millis(200));
+        // Order, not elapsed time: the rebuild is held at its file pass, so an
+        // answer that arrives while the pause is armed did not wait for it. A
+        // search blocked behind the rebuild never answers until the release
+        // below, and is caught by the same hang detector as `wait_entered`.
+        let answer = answered.recv_timeout(Duration::from_secs(60));
+        let rebuild_still_paused = !refreshing.is_finished();
         pause.release();
-        let hits = querying.join().unwrap().unwrap();
+        querying.join().unwrap();
         refreshing.join().unwrap().unwrap();
-        let waited = waited.expect("docs_search waited behind the rebuild for more than 200 ms");
+        let hits = answer
+            .expect("docs_search did not answer while the rebuild was paused")
+            .unwrap();
         assert!(
-            waited < Duration::from_millis(200),
-            "search took {waited:?}"
+            rebuild_still_paused,
+            "the rebuild finished before the query answered, so the answer proves nothing"
         );
         assert!(
             hits.is_empty(),
