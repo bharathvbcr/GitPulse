@@ -80,8 +80,10 @@ export function setSignalledAsksForReader(on: boolean): void {
  * what it did. A bell counts while the setting above is on: it is how an
  * agent with no hooks says it is blocked, and with the setting off those asks
  * stop counting. Finished does not: it is worth showing, not worth chasing.
- * The one rule every surface — the task pane, the board chip, the tray —
- * counts by.
+ * The one rule every surface — the task pane, the board chip, the Agents
+ * view, the tray — counts by. The task pane and the board still show a bell
+ * with the setting off and only stop counting it; the Agents view also drops
+ * the bell as a reason, so a row there no longer shows that one rang.
  */
 export function asksForReader(kind: AttentionKind | null | undefined): boolean {
   return kind === "needs-you" || kind === "error" || (kind === "signalled" && signalledAsks);

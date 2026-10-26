@@ -328,10 +328,12 @@ export interface InterfacePrefs {
   autoScanGithubAlerts: boolean;
   /**
    * Whether a terminal bell or OSC notice counts as an agent waiting on the
-   * reader, on the board, the task pane and the menu-bar count. On by
-   * default: an agent without hooks can only ask by ringing the bell, so
-   * turning this off stops those asks from counting. A request an agent
-   * states in words (`needs-you`, `error`) counts either way. Owned by
+   * reader, on the board, the task pane, the Agents view and the menu-bar
+   * count. On by default: an agent without hooks can only ask by ringing the
+   * bell, so turning this off stops those asks from counting. The Agents view
+   * also stops listing a bell as a reason (the task pane and the board still
+   * show the bell and only stop counting it). A request an agent reports
+   * through its hooks (`needs-you`, `error`) counts either way. Owned by
    * `sessionActivity`, which cannot import this store, so every change is
    * pushed to it from here.
    */

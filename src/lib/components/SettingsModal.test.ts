@@ -262,6 +262,10 @@ describe("SettingsModal bell toggle", () => {
     expect(row).toMatch(/role="switch"[^>]*aria-checked="true"|aria-checked="true"[^>]*role="switch"/);
     expect(row).toContain("On by default");
     expect(row).toContain("menu-bar count");
+    // The Agents view stops counting a bell too, and stops listing it as a reason.
+    expect(row).toContain("the Agents view and the menu-bar count");
+    expect(row).toContain("The Agents view also stops listing a bell as a reason");
+    expect(row).toContain("reports through its hooks");
   });
 });
 
