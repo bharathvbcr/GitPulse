@@ -325,10 +325,8 @@ struct Vouched {
     /// before the exit must not bring one back.
     exited: VecDeque<String>,
     /// `exited` has dropped its oldest: an id absent from it may be one that
-    /// ended long ago, so a later listing is trusted only for ids already held.
+    /// ended long ago, so a listing is trusted only for ids already held.
     wrapped: bool,
-    /// A connection has listed the host's sessions at least once.
-    listed_once: bool,
     /// An `adopt` is between asking for the listing and finishing.
     adopting: bool,
     /// Spawns the host confirmed while `adopting`: the listing was taken
@@ -532,6 +530,20 @@ impl HostClient {
         let start_error = observer
             .as_ref()
             .and_then(|observer| observer.started(&session, process.clone()).err());
+        {
+            // The host has confirmed the session, unless its exit has been
+            // reported: that one is not held. Before the proxy stops being
+            // `starting`, so an adoption that reads the proxies meanwhile
+            // already finds it in `late`.
+            let mut vouched = lock(&self.inner.vouched);
+            vouched.starting.remove(&session);
+            if !vouched.exited.contains(&session) {
+                vouched.held.insert(session.clone());
+                if vouched.adopting {
+                    vouched.late.insert(session.clone());
+                }
+            }
+        }
         // Started: an exit that overtook the reply is recorded now.
         let deferred = {
             let mut proxies = lock(&self.inner.proxies);
@@ -540,18 +552,6 @@ impl HostClient {
                 proxy.deferred_exit.take()
             })
         };
-        {
-            // The host has confirmed the session, unless its exit overtook the
-            // reply: that one is not held.
-            let mut vouched = lock(&self.inner.vouched);
-            vouched.starting.remove(&session);
-            if deferred.is_none() && !vouched.exited.contains(&session) {
-                vouched.held.insert(session.clone());
-                if vouched.adopting {
-                    vouched.late.insert(session.clone());
-                }
-            }
-        }
         if let Some(ended) = deferred {
             self.inner.record_exit(ended);
         } else if let Some(error) = start_error.as_ref() {
@@ -1014,6 +1014,9 @@ impl Inner {
                 conn.close();
                 return Err(QUIT.into());
             }
+            // Nothing is vouched for on a connection that has not listed,
+            // whatever an earlier one listed: its loss may not have been seen.
+            lock(&self.vouched).revoke();
             *current = Some(conn.clone());
         }
         let limit = self.limit.load(Ordering::Acquire);
@@ -1236,7 +1239,7 @@ impl Inner {
             return Err(LOST.into());
         }
         let mut vouched = lock(&self.vouched);
-        let strict = vouched.wrapped && vouched.listed_once;
+        let strict = vouched.wrapped;
         let mut next = vouched.late.clone();
         let mut exited = HashSet::new();
         for listing in listed {
@@ -1248,7 +1251,6 @@ impl Inner {
         }
         vouched.held = next;
         vouched.live = true;
-        vouched.listed_once = true;
         Ok(exited)
     }
 
@@ -1309,26 +1311,30 @@ impl Inner {
         }
     }
 
+    /// The host has said `id` ended: not held from now, however long recording
+    /// it takes, and not again from a listing taken earlier. Idempotent; done
+    /// on the delivery thread before the recording is handed off, so a recording
+    /// that is slow or never starts cannot leave the session vouched for.
+    fn note_ended(&self, id: &str) {
+        let mut vouched = lock(&self.vouched);
+        vouched.held.remove(id);
+        vouched.late.remove(id);
+        vouched.starting.remove(id);
+        if !vouched.exited.iter().any(|ended| ended == id) {
+            vouched.exited.push_back(id.to_owned());
+            while vouched.exited.len() > REMEMBERED_EXITS {
+                vouched.exited.pop_front();
+                vouched.wrapped = true;
+            }
+        }
+    }
+
     /// Records one session's exit: its run's receipt, the incident record and
     /// `terminal-exit`, then lets the host forget it. Called once per session;
     /// a second report of the same exit only clears the host's copy.
     fn record_exit(&self, ended: WireEnded) {
         let id = ended.payload.id.clone();
-        // Not held from the moment the host says so, however long the run's
-        // receipt takes to write, and not again from a listing taken earlier.
-        {
-            let mut vouched = lock(&self.vouched);
-            vouched.held.remove(&id);
-            vouched.late.remove(&id);
-            vouched.starting.remove(&id);
-            if !vouched.exited.contains(&id) {
-                vouched.exited.push_back(id.clone());
-                while vouched.exited.len() > REMEMBERED_EXITS {
-                    vouched.exited.pop_front();
-                    vouched.wrapped = true;
-                }
-            }
-        }
+        self.note_ended(&id);
         {
             let mut proxies = lock(&self.proxies);
             if let Some(proxy) = proxies.get_mut(&id).filter(|p| p.starting) {
@@ -1458,6 +1464,7 @@ impl Inner {
             // Off this thread too: a run's receipt is a store write, and the
             // output of every other session waits behind delivery.
             HostFrame::Exit { ended } => {
+                self.note_ended(&ended.payload.id);
                 let inner = self.clone();
                 if let Err(error) = crate::supervisor::spawn_one_of_many(
                     "terminal-host-exit",

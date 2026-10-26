@@ -29,6 +29,8 @@ struct FakeHost {
     hung: Arc<AtomicBool>,
     /// How many of the next lists are answered with something that is not one.
     garbage_lists: Arc<AtomicUsize>,
+    /// The sessions a list names.
+    listed: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     writers: Arc<Mutex<Vec<Writer>>>,
 }
@@ -53,14 +55,16 @@ impl FakeHost {
             calls: Arc::default(),
             hung: Arc::default(),
             garbage_lists: Arc::default(),
+            listed: Arc::new(Mutex::new(vec!["term-live".to_owned()])),
             stop: Arc::default(),
             writers: Arc::default(),
         };
-        let (accepts, calls, hung, garbage, stop, writers) = (
+        let (accepts, calls, hung, garbage, listed, stop, writers) = (
             fake.accepts.clone(),
             fake.calls.clone(),
             fake.hung.clone(),
             fake.garbage_lists.clone(),
+            fake.listed.clone(),
             fake.stop.clone(),
             fake.writers.clone(),
         );
@@ -74,8 +78,9 @@ impl FakeHost {
                 accepts.fetch_add(1, Ordering::AcqRel);
                 let writer: Writer = Arc::new(Mutex::new(stream.try_clone().unwrap()));
                 writers.lock().unwrap().push(writer.clone());
-                let (calls, hung, garbage) = (calls.clone(), hung.clone(), garbage.clone());
-                std::thread::spawn(move || serve(stream, writer, &calls, &hung, &garbage));
+                let (calls, hung, garbage, listed) =
+                    (calls.clone(), hung.clone(), garbage.clone(), listed.clone());
+                std::thread::spawn(move || serve(stream, writer, &calls, &hung, &garbage, &listed));
             }
         });
         fake
@@ -142,6 +147,7 @@ fn serve(
     calls: &AtomicUsize,
     hung: &AtomicBool,
     garbage: &AtomicUsize,
+    listed: &Mutex<Vec<String>>,
 ) {
     let mut input = BufReader::new(stream);
     while let Ok(Some((header, _))) = read_frame(&mut input) {
@@ -167,16 +173,22 @@ fn serve(
                 {
                     serde_json::to_value("not a list of sessions")
                 } else {
-                    serde_json::to_value([TerminalListing {
-                        id: "term-live".into(),
-                        shell: "sh".into(),
-                        cwd: "/".into(),
-                        repo: "/".into(),
-                        launcher: None,
-                        run_id: None,
-                        detached: false,
-                        ending: false,
-                    }])
+                    let sessions: Vec<TerminalListing> = listed
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|id| TerminalListing {
+                            id: id.clone(),
+                            shell: "sh".into(),
+                            cwd: "/".into(),
+                            repo: "/".into(),
+                            launcher: None,
+                            run_id: None,
+                            detached: false,
+                            ending: false,
+                        })
+                        .collect();
+                    serde_json::to_value(sessions)
                 }
             }
             Request::Receipts => {
@@ -319,4 +331,100 @@ fn an_in_process_registry_knows_only_what_it_holds() {
     let host = crate::workbench::notifications::session_host(app.handle());
     assert!(!host.knows("term-live"));
     assert!(!host.knows(""));
+}
+
+/// A connection that was marked closed by a failed write is not yet known to
+/// have been lost: its reader has not returned, so `lost` has not run. A
+/// connect in that gap stores a new connection; the old listing must not be
+/// vouched for on it, and a connection whose own listing fails must not be kept.
+#[test]
+fn a_new_connection_does_not_inherit_the_old_listing_when_its_own_fails() {
+    let fake = FakeHost::start();
+    let app = fixture(&fake);
+    app.sessions.connect_host().unwrap();
+    assert!(app.host.knows("term-live"));
+    let client = app.sessions.host.clone().unwrap();
+
+    // Closed as a failed write closes it: no shutdown, so the reader never wakes.
+    client
+        .inner
+        .current()
+        .unwrap()
+        .closed
+        .store(true, Ordering::Release);
+    fake.garbage_lists.store(1, Ordering::Release);
+    assert!(
+        client.connect().is_err(),
+        "the second listing is unreadable"
+    );
+
+    assert!(
+        !app.host.knows("term-live"),
+        "a connection that never listed vouched for an earlier connection's sessions"
+    );
+}
+
+/// Exit frames that have been delivered leave their sessions unknown at once,
+/// whether or not the thread that records each has started. (Before the fix the
+/// check raced those threads, so this failed only some of the time.)
+#[test]
+fn delivered_exits_are_not_vouched_for_while_their_recording_is_pending() {
+    let fake = FakeHost::start();
+    let ids: Vec<String> = (0..60).map(|n| format!("term-9-{n:x}")).collect();
+    *fake.listed.lock().unwrap() = ids.clone();
+    let app = fixture(&fake);
+    app.sessions.connect_host().unwrap();
+    let client = app.sessions.host.clone().unwrap();
+    let conn = client.inner.current().unwrap();
+    let before = *lock(&conn.delivered);
+
+    for id in &ids {
+        fake.end(id);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while *lock(&conn.delivered) < before + ids.len() as u64 {
+        assert!(Instant::now() < deadline, "the exits were not delivered");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let still: Vec<&String> = ids.iter().filter(|id| app.host.knows(id)).collect();
+    assert!(
+        still.is_empty(),
+        "{} delivered exits were still vouched for",
+        still.len()
+    );
+}
+
+/// `knows` against the old way, a `List` to a host that answers at once, in a
+/// release build: `cargo test --release --lib -- --ignored --nocapture
+/// terminal::host::client::tests::timing`. The old path is the body `knows`
+/// had at fa89a7e6. Numbers are for this fake host and this machine only.
+#[test]
+#[ignore = "a measurement: run in release mode with --ignored --nocapture"]
+fn timing_knows_against_the_list_it_replaced() {
+    let fake = FakeHost::start();
+    let app = fixture(&fake);
+    app.sessions.connect_host().unwrap();
+    let n = 200;
+    let (mut old, mut new) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    for _ in 0..n {
+        let started = Instant::now();
+        let held = crate::terminal::list_sessions(&app.sessions)
+            .map(|listed| listed.iter().any(|session| session.id == "term-live"));
+        old.push(started.elapsed());
+        assert_eq!(held, Ok(true));
+        let started = Instant::now();
+        assert!(app.host.knows("term-live"));
+        new.push(started.elapsed());
+    }
+    for (name, mut samples) in [("old list_sessions", old), ("new knows", new)] {
+        samples.sort();
+        eprintln!(
+            "TIMING {name}: n={} min={:?} median={:?} max={:?}",
+            samples.len(),
+            samples[0],
+            samples[samples.len() / 2],
+            samples[samples.len() - 1]
+        );
+    }
 }
