@@ -87,7 +87,7 @@ pub const MAX_READ_BYTES: u64 = 16 * 1024 * 1024;
 /// The top-level fields `HookInput::from_value` reads. A field added there and
 /// not here is read as empty; `the_walk_reads_what_a_whole_parse_reads` fails
 /// on it.
-pub(super) const KEPT_FIELDS: [&str; 14] = [
+pub(super) const KEPT_FIELDS: [&str; 16] = [
     "hook_event_name",
     "session_id",
     "cwd",
@@ -102,6 +102,8 @@ pub(super) const KEPT_FIELDS: [&str; 14] = [
     "last_assistant_message",
     "error",
     "tool_use_id",
+    "permission_mode",
+    "permissionMode",
 ];
 
 /// A value that is checked and not built.
