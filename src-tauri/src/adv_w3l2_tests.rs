@@ -1,12 +1,16 @@
 //! Adversarial tests for lane W3-L2 (macOS QoS tiering). Test-only.
 
 use crate::engine::git_cli::{
-    run_bounded, with_admission, with_background_band, with_background_budget_wait,
-    with_background_processes, Admission,
+    band_outcomes, run_bounded, run_observed, with_admission, with_background_band,
+    with_background_budget_wait, with_background_processes, Admission, OutputStream,
+    ProcessObserver, MAX_OUTPUT_BYTES,
 };
 use crate::pools::{current_thread_qos, QOS_UTILITY};
+use crate::procguard::LockedSpawn;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 fn qos_class() -> u32 {
@@ -176,27 +180,217 @@ fn child_priority(waits: u32, class: Admission) -> i32 {
         .expect("pri")
 }
 
-/// Records, once per 25 ms, the priority of the child and how long the parent
-/// took to demote it. Prints the timeline: used to tell "demotion landed late"
-/// from "demotion never happened".
-#[test]
-fn adv_flake_timeline_time_to_demotion() {
-    let script = "t=0; while [ $t -lt 1200 ]; do \
-        p=$(/bin/ps -o pri= -p $$ | tr -d ' '); \
-        if [ \"$p\" -lt 10 ]; then echo demoted_after_samples=$t pri=$p; exit 0; fi; \
-        sleep 0.025; t=$((t+1)); done; echo NEVER pri=$p";
+/// `ps`'s priority and command name for `pid`, or `None` while `ps` cannot
+/// answer or the process is gone.
+fn ps_state(pid: u32) -> Option<(i32, String)> {
+    let out = Command::new("/bin/ps")
+        .args(["-o", "pri=,comm=", "-p", &pid.to_string()])
+        .output_locked()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut fields = text.split_whitespace();
+    let pri = fields.next()?.parse().ok()?;
+    Some((pri, fields.next()?.to_string()))
+}
+
+/// What the parent read of one child process: its priority once it had exec'd
+/// into `sleep`, and how many `ps` reads that took.
+#[derive(Clone, Debug)]
+struct Reading {
+    label: &'static str,
+    pid: u32,
+    pri: i32,
+    reads: u32,
+}
+
+/// The pid a child printed as `label=<pid>` on a line of its own.
+fn announced(text: &str, label: &str) -> Option<u32> {
+    text.split_inclusive('\n')
+        .filter(|line| line.ends_with('\n'))
+        .find_map(|line| {
+            line.trim_end()
+                .strip_prefix(label)?
+                .strip_prefix('=')?
+                .parse()
+                .ok()
+        })
+}
+
+/// Reads, from this process, the scheduler priority of the pids a demoted
+/// child announces on stdout.
+///
+/// The band is applied by the parent right after the spawn and before the wait
+/// loop begins, so by the time a child's output reaches the loop its demotion
+/// has already been decided. The old tests had the child watch itself with a
+/// shell loop that forked `ps` and `tr` up to 1200 times, from a process the
+/// band had just put at the lowest CPU and I/O priority: on a saturated host
+/// the observer was the starved process, and the run ended at its 120 s
+/// deadline. Here the reads come from a sampler thread that is started before
+/// the admission scope (so it is not itself at UTILITY QoS), is told the pids
+/// once every one is announced, and posts its readings for `cancelled` to see.
+/// The 120 s run deadline is only a hang backstop: nothing asserted depends on
+/// it.
+struct BandWatch {
+    wanted: &'static [&'static str],
+    seen: String,
+    announce: Option<mpsc::Sender<Vec<(&'static str, u32)>>>,
+    stop: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+    readings: Arc<Mutex<Vec<Reading>>>,
+    last_read: Arc<Mutex<String>>,
+    sampler: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BandWatch {
+    fn start(wanted: &'static [&'static str]) -> Self {
+        let (announce, targets) = mpsc::channel::<Vec<(&'static str, u32)>>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let readings = Arc::new(Mutex::new(Vec::new()));
+        let last_read = Arc::new(Mutex::new(String::from("nothing was announced")));
+        let sampler = {
+            let (stop, done, readings, last_read) = (
+                stop.clone(),
+                done.clone(),
+                readings.clone(),
+                last_read.clone(),
+            );
+            std::thread::spawn(move || {
+                let Ok(pids) = targets.recv() else { return };
+                for (label, pid) in pids {
+                    let mut reads = 0;
+                    let reading = loop {
+                        if stop.load(Ordering::Acquire) {
+                            return;
+                        }
+                        if let Some((pri, comm)) = ps_state(pid) {
+                            reads += 1;
+                            *last_read.lock().unwrap() =
+                                format!("{label} pid={pid} pri={pri} comm={comm} reads={reads}");
+                            // After the exec, so what is read is the band a
+                            // process image replaced under it kept, not the
+                            // shell's.
+                            if comm.ends_with("sleep") {
+                                break Reading {
+                                    label,
+                                    pid,
+                                    pri,
+                                    reads,
+                                };
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    };
+                    readings.lock().unwrap().push(reading);
+                }
+                done.store(true, Ordering::Release);
+            })
+        };
+        Self {
+            wanted,
+            seen: String::new(),
+            announce: Some(announce),
+            stop,
+            done,
+            readings,
+            last_read,
+            sampler: Some(sampler),
+        }
+    }
+}
+
+impl ProcessObserver for BandWatch {
+    /// False until every wanted pid has been announced and read, so the run
+    /// is also not cancelled while it is still queued for admission.
+    fn cancelled(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+
+    fn output(&mut self, stream: OutputStream, bytes: &[u8]) {
+        if !matches!(stream, OutputStream::Stdout) {
+            return;
+        }
+        self.seen.push_str(&String::from_utf8_lossy(bytes));
+        let pids: Vec<_> = self
+            .wanted
+            .iter()
+            .filter_map(|label| announced(&self.seen, label).map(|pid| (*label, pid)))
+            .collect();
+        if pids.len() == self.wanted.len() {
+            if let Some(announce) = self.announce.take() {
+                let _ = announce.send(pids);
+            }
+        }
+    }
+}
+
+impl Drop for BandWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.announce.take();
+        if let Some(sampler) = self.sampler.take() {
+            let _ = sampler.join();
+        }
+    }
+}
+
+/// Runs `script` as a background-band child, feeding it `stdin` after the
+/// demotion, and returns what the parent read of each pid in `wanted`.
+fn watched_band_run(
+    label: &str,
+    script: &str,
+    stdin: Option<&[u8]>,
+    wanted: &'static [&'static str],
+) -> Vec<Reading> {
+    let mut watch = BandWatch::start(wanted);
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg(script);
-    let started = Instant::now();
-    let run = with_admission(Admission::Background, || {
+    let (entered, failed) = band_outcomes();
+    let run = with_background_processes(|| {
         with_background_budget_wait(true, || {
-            run_bounded(cmd, "adv-timeline", Duration::from_secs(120), None)
+            run_observed(
+                &mut cmd,
+                label,
+                Duration::from_secs(120),
+                stdin,
+                MAX_OUTPUT_BYTES,
+                &mut watch,
+            )
         })
-    })
-    .expect("run");
-    let out = String::from_utf8_lossy(&run.stdout).to_string();
-    eprintln!("TIMELINE {} wall={:?}", out.trim(), started.elapsed());
-    assert!(out.contains("demoted"), "never demoted: {out}");
+    });
+    let (entered_after, failed_after) = band_outcomes();
+    let last = watch.last_read.lock().unwrap().clone();
+    let run = run.unwrap_or_else(|e| panic!("{e}; last read by the parent: {last}"));
+    assert!(run.cancelled, "{label} ended on its own; last read: {last}");
+    assert_eq!(
+        failed_after, failed,
+        "{label}: the OS refused a demotion; last read: {last}"
+    );
+    assert!(
+        entered_after > entered,
+        "{label}: no child entered the band; last read: {last}"
+    );
+    let readings = watch.readings.lock().unwrap().clone();
+    assert_eq!(readings.len(), wanted.len(), "{label}: {readings:?}");
+    readings
+}
+
+/// A demoted child that has exec'd is at the background priority when its
+/// parent reads it, however loaded the host is: the demotion is applied before
+/// the wait loop starts, so no read has a window in which it is still pending.
+#[test]
+fn adv_flake_timeline_time_to_demotion() {
+    let started = Instant::now();
+    let readings = watched_band_run(
+        "adv-timeline",
+        "echo self=$$; exec /bin/sleep 600",
+        None,
+        &["self"],
+    );
+    eprintln!("TIMELINE {readings:?} wall={:?}", started.elapsed());
+    for reading in &readings {
+        assert!(reading.pri < 10, "never demoted: {reading:?}");
+    }
 }
 
 /// Gap between `posix_spawn` returning and the demotion returning, on a thread
@@ -243,25 +437,21 @@ fn adv_demotion_gap_and_errors_on_a_utility_thread() {
 }
 
 /// Grandchildren and exec inherit the band from a demoted child.
+///
+/// The child waits for a line on stdin, and the run feeds it only after the
+/// parent has demoted it, so the grandchild is forked after the demotion by
+/// construction: this cannot pass on a child that was already running unbanded
+/// when it forked. Both pids are read after they have exec'd into `sleep`.
 #[test]
 fn adv_band_survives_exec_and_is_inherited_by_grandchildren() {
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c").arg(
-        "i=0; while [ $i -lt 1200 ]; do p=$(/bin/ps -o pri= -p $$ | tr -d ' '); \
-         [ \"$p\" -lt 10 ] && break; sleep 0.05; i=$((i+1)); done; \
-         /bin/sh -c 'echo grand=$(/bin/ps -o pri= -p $$ | tr -d \" \")'; \
-         exec /bin/sh -c 'echo execd=$(/bin/ps -o pri= -p $$ | tr -d \" \")'",
+    let readings = watched_band_run(
+        "adv-inherit",
+        "read go; /bin/sleep 600 & echo grand=$!; echo self=$$; exec /bin/sleep 600",
+        Some(b"go\n"),
+        &["grand", "self"],
     );
-    let run = with_background_processes(|| {
-        with_background_budget_wait(true, || {
-            run_bounded(cmd, "adv-inherit", Duration::from_secs(120), None)
-        })
-    })
-    .expect("run");
-    let out = String::from_utf8_lossy(&run.stdout).to_string();
-    eprintln!("INHERIT {}", out.replace('\n', " "));
-    for part in out.split_whitespace() {
-        let n: i32 = part.split('=').nth(1).unwrap().parse().unwrap();
-        assert!(n < 10, "{part}");
+    eprintln!("INHERIT {readings:?}");
+    for reading in &readings {
+        assert!(reading.pri < 10, "{reading:?}");
     }
 }
