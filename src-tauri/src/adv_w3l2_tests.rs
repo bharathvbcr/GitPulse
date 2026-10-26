@@ -193,6 +193,12 @@ fn ps_state(pid: u32) -> Option<(i32, String)> {
     Some((pri, fields.next()?.to_string()))
 }
 
+/// How many reads a pid outside the band gets to join it before its reading is
+/// taken as it stands. A descendant is created outside the band and joins it
+/// within milliseconds, so a few reads settle it; a count, not a duration, so
+/// that a loaded host, whose reads are slower, waits correspondingly longer.
+const SETTLE_READS: u32 = 100;
+
 /// What the parent read of one child process once it had exec'd into `sleep`:
 /// the priority the first read showed (`first`), the one it settled at (`pri`,
 /// in the band unless the reading ran out of reads), and how many `ps` reads
@@ -246,10 +252,7 @@ struct BandWatch {
 }
 
 impl BandWatch {
-    /// `settle_reads` is how many reads a pid outside the band gets to join it
-    /// before its reading is taken as it stands; `None` reads until it joins,
-    /// and the run's deadline is then the only bound.
-    fn start(wanted: &'static [&'static str], settle_reads: Option<u32>) -> Self {
+    fn start(wanted: &'static [&'static str]) -> Self {
         let (announce, targets) = mpsc::channel::<Vec<(&'static str, u32)>>();
         let stop = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
@@ -280,7 +283,7 @@ impl BandWatch {
                             // shell's.
                             if comm.ends_with("sleep") {
                                 let first = *first.get_or_insert(pri);
-                                if pri < 10 || settle_reads.is_some_and(|most| reads >= most) {
+                                if pri < 10 || reads >= SETTLE_READS {
                                     break Reading {
                                         label,
                                         pid,
@@ -353,9 +356,8 @@ fn watched_band_run(
     script: &str,
     stdin: Option<&[u8]>,
     wanted: &'static [&'static str],
-    settle_reads: Option<u32>,
 ) -> Vec<Reading> {
-    let mut watch = BandWatch::start(wanted, settle_reads);
+    let mut watch = BandWatch::start(wanted);
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg(script);
     let (entered, failed) = band_outcomes();
@@ -414,7 +416,6 @@ fn adv_flake_timeline_time_to_demotion() {
         "read go; echo self=$$; exec /bin/sleep 600",
         Some(b"go\n"),
         &["self"],
-        None,
     );
     eprintln!("TIMELINE {readings:?} wall={:?}", started.elapsed());
     assert_in_band(&readings, "never demoted");
@@ -428,7 +429,12 @@ fn adv_flake_timeline_time_to_demotion() {
 /// its exec while the demotion is in flight; it then reads pri 31 and still
 /// reads 31 half a second later (2 of 80 runs of the module at load 15 to 40
 /// on 2026-10-26; the same was seen 1 in 10 at load 72 as a shell that never
-/// reached the band in 81 s). Run with `--ignored`.
+/// reached the band in 81 s). It also hits a child that waits for stdin before
+/// it execs (`adv_band_survives_exec`, `adv_flake_timeline_time_to_demotion`
+/// failed 5 of 80 runs of the module at load 10 to 50 with 18 hogs): the band
+/// was never in effect at all. Alone these repros pass (0 of 180 children); the
+/// other tests' concurrent spawns are what trigger it, so run them together:
+/// `--lib adv_w3l2_tests:: -- --include-ignored` (3 of 6 runs failed).
 #[test]
 #[ignore = "break: a child that execs immediately can miss the background band for good"]
 fn adv_break_child_that_execs_at_once_misses_the_band() {
@@ -439,7 +445,6 @@ fn adv_break_child_that_execs_at_once_misses_the_band() {
             "echo self=$$; exec /bin/sleep 600",
             None,
             &["self"],
-            Some(50),
         );
         missed += readings.iter().filter(|r| r.pri >= 10).count();
     }
@@ -502,7 +507,6 @@ fn adv_band_survives_exec() {
         "read go; echo self=$$; exec /bin/sleep 600",
         Some(b"go\n"),
         &["self"],
-        None,
     );
     eprintln!("EXEC {readings:?}");
     assert_in_band(&readings, "left the band across exec");
@@ -516,7 +520,9 @@ fn adv_band_survives_exec() {
 /// by construction. Seen as `grand pid=... pri=31 ... reads=8115` for the whole
 /// 120 s run in 1 of 40 runs of `adv_band_survives_exec_and_is_inherited_by_
 /// grandchildren` (the test this one was split from) at load 15 to 20, and 4
-/// of 60 as a first read of 31 or 46 before it settled. Run with `--ignored`.
+/// of 60 as a first read of 31 or 46 before it settled. Like its sibling it
+/// needs the module's other tests spawning beside it: `--lib adv_w3l2_tests::
+/// -- --include-ignored`.
 #[test]
 #[ignore = "break: a grandchild of a demoted child can stay outside the background band"]
 fn adv_break_grandchild_of_a_demoted_child_misses_the_band() {
@@ -527,7 +533,6 @@ fn adv_break_grandchild_of_a_demoted_child_misses_the_band() {
             "read go; /bin/sleep 600 & echo grand=$!; echo self=$$; exec /bin/sleep 600",
             Some(b"go\n"),
             &["grand", "self"],
-            Some(50),
         );
         missed += readings.iter().filter(|r| r.pri >= 10).count();
     }
