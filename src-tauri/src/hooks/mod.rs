@@ -43,8 +43,14 @@ use crate::harness::{self, PolicyStatus, ScopedVerdict};
 use crate::insights::{self, same_path, CollisionRisk, InsightsSnapshot};
 
 pub mod advisory_once;
+mod notify_drops;
 mod notify_input;
+mod notify_outcome;
+pub use notify_drops::{DropSnapshot, NotifyDrops};
 pub use notify_input::SESSION_END_HOST_TIMEOUT;
+#[cfg(not(unix))]
+use notify_outcome::send_unsupported as notify_send;
+pub use notify_outcome::{diagnostic, Diagnostic, HookError, SendError};
 pub mod signal_guard;
 
 /// Wall-clock ceiling for the work behind one hook invocation.
@@ -2069,7 +2075,7 @@ pub fn dispatch(
     subcommand: &str,
     argument: Option<&str>,
     input: &HookInput,
-) -> Result<HookOutput, String> {
+) -> Result<HookOutput, HookError> {
     match subcommand {
         "collision-guard" => Ok(run_collision_guard(input)),
         "command-gate" => Ok(run_command_gate(input)),
@@ -2078,8 +2084,16 @@ pub fn dispatch(
         other => Err(format!(
             "unknown subcommand '{other}'; expected one of {}",
             SUBCOMMANDS.join(", ")
-        )),
+        )
+        .into()),
     }
+}
+
+/// What this process has abandoned at a report's deadline so far. A hook is
+/// one-shot, so this is that run's count and nothing wider
+/// ([`notify_drops`] says why).
+pub fn notify_drops() -> DropSnapshot {
+    notify_drops::PROCESS_DROPS.snapshot()
 }
 
 /* ── notify ───────────────────────────────────────────────────────────────── */
@@ -2121,8 +2135,23 @@ pub(crate) const SESSION_END_NOTIFY_BUDGET: Duration = Duration::from_millis(300
 fn run_notify(
     argument: Option<&str>,
     input: &HookInput,
-    send: impl FnOnce(&std::path::Path, &str) -> Result<(), String> + Send + 'static,
-) -> Result<HookOutput, String> {
+    send: impl FnOnce(&std::path::Path, &str) -> Result<(), SendError> + Send + 'static,
+) -> Result<HookOutput, HookError> {
+    run_notify_within(argument, input, send, &notify_drops::PROCESS_DROPS, None)
+}
+
+/// [`run_notify`] with the two things a test must be able to name: where an
+/// abandoned report is counted, and the send budget. `None` is the production
+/// budget for the event ([`notify_input::budgets_for`]); a test passes a few
+/// milliseconds and a send that waits on a channel, so the give-up path runs
+/// without the suite sitting out a real deadline.
+fn run_notify_within(
+    argument: Option<&str>,
+    input: &HookInput,
+    send: impl FnOnce(&std::path::Path, &str) -> Result<(), SendError> + Send + 'static,
+    drops: &NotifyDrops,
+    send_budget: Option<Duration>,
+) -> Result<HookOutput, HookError> {
     let Some(event) = argument.and_then(crate::alerts::bridge::event) else {
         // An Err rather than silence: an unknown reason means the plugin
         // manifest and this binary have drifted, which is exactly the kind of
@@ -2135,7 +2164,8 @@ fn run_notify(
                 .map(|event| event.name)
                 .collect::<Vec<_>>()
                 .join(", ")
-        ));
+        )
+        .into());
     };
     // A state or a resolution is about a GitPulse terminal, and the socket
     // refuses one that names none. Outside a GitPulse terminal — the common
@@ -2153,11 +2183,22 @@ fn run_notify(
     let payload = notify_payload(event, input);
     // Detached at the deadline. A hook the host is waiting on must not be held
     // by a socket that is not answering, and the report is worth nothing late.
-    let (_, send_budget) = notify_input::budgets_for(event.name);
+    let send_budget = send_budget.unwrap_or_else(|| notify_input::budgets_for(event.name).1);
     match within_budget(send_budget, move || send(&path, &payload)) {
         Some(Ok(())) => Ok(HookOutput::silent()),
-        Some(Err(error)) => Err(format!("notification report not delivered: {error}")),
-        None => Err("notification report exceeded its deadline; not retried".into()),
+        Some(Err(error)) => Err(error.into()),
+        None => {
+            // Counted where the give-up is decided: this is the one place that
+            // knows the reply missed its bound. A reply that arrives in time
+            // never reaches this arm.
+            let dropped = drops.record();
+            Err(HookError::Failed(format!(
+                "notification report ({}) exceeded its deadline; not retried \
+                 ({dropped} dropped by this process, scope {})",
+                event.name,
+                crate::ledger::DROPPED_SCOPE
+            )))
+        }
     }
 }
 
@@ -2344,8 +2385,16 @@ fn notify_payload(event: &crate::alerts::bridge::Event, input: &HookInput) -> St
     Value::Object(report).to_string()
 }
 
+/// Sends one report down the notification socket. On a platform with no such
+/// transport the stand-in is [`notify_outcome::send_unsupported`], which says so
+/// instead of failing.
 #[cfg(unix)]
-fn notify_send(path: &std::path::Path, payload: &str) -> Result<(), String> {
+fn notify_send(path: &std::path::Path, payload: &str) -> Result<(), SendError> {
+    exchange(path, payload).map_err(SendError::Failed)
+}
+
+#[cfg(unix)]
+fn exchange(path: &std::path::Path, payload: &str) -> Result<(), String> {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     let mut stream = UnixStream::connect(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -2449,11 +2498,6 @@ fn refusal_text(reply: Option<&Value>) -> String {
             crate::alerts::text::printable(token, 64)
         ),
     }
-}
-
-#[cfg(not(unix))]
-fn notify_send(_path: &std::path::Path, _payload: &str) -> Result<(), String> {
-    Err("agent notification reports need a Unix socket, which this platform does not offer".into())
 }
 
 /* ── Shared helpers ───────────────────────────────────────────────────────── */
@@ -5530,7 +5574,8 @@ done
     #[test]
     fn an_unknown_subcommand_is_an_error_the_binary_reports_not_a_silent_no_op() {
         let err = dispatch("collision-gaurd", None, &HookInput::default())
-            .expect_err("a typo must not pass for a check");
+            .expect_err("a typo must not pass for a check")
+            .to_string();
         assert!(err.contains("unknown subcommand"));
         for name in SUBCOMMANDS {
             assert!(err.contains(name), "the error should list {name}");
@@ -5550,7 +5595,9 @@ done
         for name in SUBCOMMANDS {
             let outcome = dispatch(name, None, &HookInput::default());
             if REPORTERS.contains(&name) {
-                let error = outcome.expect_err("a reporter with no argument has nothing to send");
+                let error = outcome
+                    .expect_err("a reporter with no argument has nothing to send")
+                    .to_string();
                 assert!(
                     !error.contains("unknown subcommand"),
                     "{name} is advertised but was not routed: {error}"
@@ -5593,7 +5640,7 @@ done
         event: &str,
         input: &HookInput,
     ) -> (
-        Result<HookOutput, String>,
+        Result<HookOutput, HookError>,
         std::sync::Arc<std::sync::Mutex<Option<String>>>,
     ) {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -5701,7 +5748,9 @@ done
             let result = run_notify(Some(event), &notify_input(), |_, _| {
                 panic!("an unknown event reached the socket")
             });
-            let error = result.expect_err(&format!("{event:?} was accepted"));
+            let error = result
+                .expect_err(&format!("{event:?} was accepted"))
+                .to_string();
             assert!(error.contains("unknown notify event"), "{error}");
         }
         assert!(run_notify(None, &notify_input(), |_, _| Ok(())).is_err());
@@ -5748,13 +5797,104 @@ done
             thread::sleep(Duration::from_secs(30));
             Ok(())
         })
-        .expect_err("a hung socket must not report success");
+        .expect_err("a hung socket must not report success")
+        .to_string();
         assert!(error.contains("deadline"), "{error}");
         assert!(
             started.elapsed() < NOTIFY_BUDGET * 4,
             "waited {:?}",
             started.elapsed()
         );
+    }
+
+    /// A `SessionEnd` report whose reply misses its bound is counted, once,
+    /// in the snapshot shape the ledger gives its own drops. The fake host
+    /// cannot answer until the test lets it, so the deadline always passes
+    /// first: no sleep races it.
+    #[test]
+    fn a_session_end_report_whose_reply_misses_its_bound_is_counted_once() {
+        let serial = crate::test_support::env::env_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(crate::alerts::bridge::SESSION_ENV, "term-4-1")
+            .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
+        let drops = NotifyDrops::new();
+        assert_eq!(drops.snapshot().dropped, 0);
+        let (release, held) = mpsc::channel::<()>();
+        let error = run_notify_within(
+            Some("session_ended"),
+            &notify_input(),
+            move |_, _| {
+                // Blocks until the sender is dropped, which is after the
+                // assertions below.
+                let _ = held.recv();
+                Ok(())
+            },
+            &drops,
+            Some(Duration::from_millis(20)),
+        )
+        .expect_err("a reply that never came must not report success");
+        assert!(error.to_string().contains("deadline"), "{error}");
+        assert_eq!(
+            drops.snapshot(),
+            DropSnapshot {
+                dropped: 1,
+                dropped_scope: crate::ledger::DROPPED_SCOPE.to_string(),
+            }
+        );
+        assert_eq!(drops.snapshot().dropped_scope, "this_process");
+        drop(release);
+    }
+
+    /// A reply that arrives in time is not a drop, whatever it says: accepted,
+    /// refused, or a transport this platform does not have.
+    #[test]
+    fn a_reply_that_arrives_in_time_is_never_counted() {
+        let serial = crate::test_support::env::env_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(crate::alerts::bridge::SESSION_ENV, "term-4-1")
+            .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
+        let drops = NotifyDrops::new();
+        let in_time = Some(Duration::from_secs(30));
+        let delivered = run_notify_within(
+            Some("session_ended"),
+            &notify_input(),
+            |_, _| Ok(()),
+            &drops,
+            in_time,
+        );
+        assert!(delivered.expect("delivered").is_silent());
+        let refused = run_notify_within(
+            Some("session_ended"),
+            &notify_input(),
+            |_, _| Err(SendError::Failed("refused".into())),
+            &drops,
+            in_time,
+        )
+        .expect_err("a refusal is an error");
+        assert!(matches!(refused, HookError::Failed(_)), "{refused:?}");
+        let unsupported = run_notify_within(
+            Some("session_ended"),
+            &notify_input(),
+            |_, _| Err(SendError::Unsupported),
+            &drops,
+            in_time,
+        )
+        .expect_err("an absent transport is not a delivery");
+        assert!(
+            matches!(unsupported, HookError::Unsupported(_)),
+            "{unsupported:?}"
+        );
+        assert_eq!(drops.snapshot().dropped, 0);
+    }
+
+    /// The count is per process and each run is its own: a second miss on the
+    /// same sink is the second, not a reset.
+    #[test]
+    fn each_missed_reply_adds_exactly_one() {
+        let drops = NotifyDrops::new();
+        assert_eq!(drops.record(), 1);
+        assert_eq!(drops.record(), 2);
+        assert_eq!(drops.snapshot().dropped, 2);
     }
 
     /// The shipped plugin manifest and this binary have to agree twice over:
