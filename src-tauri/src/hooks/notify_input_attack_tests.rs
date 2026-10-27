@@ -341,19 +341,25 @@ fn a_five_mib_tool_input_costs_well_under_the_hook_timeout() {
         "tool_response": {"ok": true},
     })
     .to_string();
+    if crate::sysload::try_thread_cpu().is_none() {
+        // No per-thread CPU clock on this platform (there is one on macOS and
+        // Linux): the work of the reader is not measurable, and this says so
+        // instead of passing.
+        eprintln!("5 MiB tool_input: skipped, no thread CPU clock on this platform");
+        return;
+    }
     let mut best = Duration::MAX;
     for _ in 0..5 {
+        // Cleared first, so a reading that never arrives (the reader no longer
+        // runs on `within_budget`'s worker, or the seam stopped recording)
+        // cannot be mistaken for the previous round's.
+        super::LAST_WORKER_CPU.set(None);
         let input = new_path(body.as_bytes()).unwrap();
         assert_eq!(input.tool_subject.len(), 16);
-        if let Some(cpu) = super::LAST_WORKER_CPU.get() {
-            best = best.min(cpu);
-        }
-    }
-    if best == Duration::MAX {
-        // No per-thread CPU clock here (it exists on macOS and Linux): the
-        // reader ran and answered above, and its work is not measurable.
-        eprintln!("5 MiB tool_input: no thread CPU clock on this platform");
-        return;
+        let cpu = super::LAST_WORKER_CPU.get().expect(
+            "the reader reported no worker CPU although this platform has a thread CPU clock",
+        );
+        best = best.min(cpu);
     }
     eprintln!("5 MiB tool_input: min of 5 = {best:?} of worker CPU");
     assert!(best < Duration::from_millis(1_000), "{best:?}");
