@@ -187,6 +187,146 @@ fn main() {
 
     #[cfg(target_os = "macos")]
     git_binaries(&cwd);
+    #[cfg(target_os = "macos")]
+    background_band(&resident);
+    drop(resident);
+    // Again with nothing held, the cheapest `fork` this process can make.
+    #[cfg(target_os = "macos")]
+    background_band(&[]);
+}
+
+/// What a spawn costs a child that must run in the macOS background band, and
+/// what each way of putting it there costs. Rows are interleaved, one spawn of
+/// each per round, and `min` is the least load-sensitive figure on a shared
+/// host. `spawn` is the time `spawn` itself holds the inheritance lock (every
+/// child waits behind it); `total` adds the child's run and its reap.
+///
+/// * `procguard::spawn`: a foreground child through the production seam.
+/// * `procguard::spawn_background`: a background child through the production
+///   seam, which enters the band in a `pre_exec` hook before the exec and pays
+///   for losing `std`'s `posix_spawn` fast path.
+/// * `process_group(0) + setpriority(pid) after spawn`: how the band used to be
+///   applied, from the parent after the spawn. It kept the fast path and
+///   missed any child that exec'd at once; kept as a row so the price of the
+///   fix is measured against what it replaced rather than against nothing.
+///
+/// Run twice: with the parent holding a 128 MiB resident block, because `fork`
+/// copies the page tables of the process it runs in and a GUI process is far
+/// larger than this one would otherwise be, and with nothing held.
+#[cfg(target_os = "macos")]
+fn background_band(resident: &[u8]) {
+    use gitpulse_lib::procguard;
+    use std::os::unix::process::CommandExt;
+
+    std::hint::black_box(resident);
+    let trivial_in = |cmd: &mut Command| {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    };
+    type Round<'a> = Box<dyn FnMut() -> (Duration, Duration) + 'a>;
+    let timed =
+        |spawn: &mut dyn FnMut() -> (std::process::Child, Option<procguard::Registration>)| {
+            let started = Instant::now();
+            let (mut child, registration) = spawn();
+            let spawned = started.elapsed();
+            // Reaped through its registration when it has one, so the sweep that
+            // runs when the registration drops never signals a pid already waited.
+            let _ = match registration {
+                Some(registration) => registration.reap(|| child.wait()),
+                None => child.wait(),
+            };
+            (spawned, started.elapsed())
+        };
+    let mut rows: Vec<(&str, Round)> = vec![
+        (
+            "procguard::spawn  [foreground]",
+            Box::new(|| {
+                timed(&mut || {
+                    let mut cmd = Command::new("/usr/bin/true");
+                    trivial_in(&mut cmd);
+                    let (child, registration) = procguard::spawn(&mut cmd, "bench").expect("spawn");
+                    (child, Some(registration))
+                })
+            }),
+        ),
+        (
+            "process_group(0) + setpriority(pid) after  [old band]",
+            Box::new(|| {
+                timed(&mut || {
+                    let mut cmd = Command::new("/usr/bin/true");
+                    trivial_in(&mut cmd);
+                    cmd.process_group(0);
+                    let child = cmd.spawn_locked().expect("spawn");
+                    // SAFETY: a plain syscall on integers.
+                    let rc = unsafe {
+                        libc::setpriority(
+                            libc::PRIO_DARWIN_PROCESS,
+                            libc::id_t::from(child.id()),
+                            libc::PRIO_DARWIN_BG,
+                        )
+                    };
+                    assert!(
+                        rc == 0
+                            || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                    );
+                    (child, None)
+                })
+            }),
+        ),
+        (
+            "procguard::spawn_background  [background, pre_exec]",
+            Box::new(|| {
+                timed(&mut || {
+                    let mut cmd = Command::new("/usr/bin/true");
+                    trivial_in(&mut cmd);
+                    let (child, registration) =
+                        procguard::spawn_background(&mut cmd, "bench").expect("spawn");
+                    (child, Some(registration))
+                })
+            }),
+        ),
+    ];
+    for (_, round) in rows.iter_mut() {
+        for _ in 0..WARMUP {
+            round();
+        }
+    }
+    let mut samples: Vec<Vec<(Duration, Duration)>> = vec![Vec::with_capacity(SAMPLES); rows.len()];
+    for _ in 0..SAMPLES {
+        for (index, (_, round)) in rows.iter_mut().enumerate() {
+            samples[index].push(round());
+        }
+    }
+    println!(
+        "\nbackground-band spawn cost, {SAMPLES} interleaved rounds, {} MiB held by the parent\n",
+        resident.len() / (1024 * 1024)
+    );
+    println!(
+        "{:<56}  {:>10}  {:>10}  {:>10}  {:>10}",
+        "", "spawn min", "spawn p50", "total min", "total p50"
+    );
+    let figures = |pick: fn(&(Duration, Duration)) -> Duration, row: &[(Duration, Duration)]| {
+        let mut sorted: Vec<Duration> = row.iter().map(pick).collect();
+        sorted.sort_unstable();
+        (sorted[0], sorted[sorted.len() / 2])
+    };
+    let (old_min, old_p50) = figures(|s| s.0, &samples[1]);
+    for ((name, _), row) in rows.iter().zip(&samples) {
+        let (spawn_min, spawn_p50) = figures(|s| s.0, row);
+        let (total_min, total_p50) = figures(|s| s.1, row);
+        println!(
+            "{:<56}  {:>10.3?}  {:>10.3?}  {:>10.3?}  {:>10.3?}   spawn min {:+.1}% / p50 {:+.1}% vs old band",
+            name,
+            spawn_min,
+            spawn_p50,
+            total_min,
+            total_p50,
+            (spawn_min.as_secs_f64() / old_min.as_secs_f64() - 1.0) * 100.0,
+            (spawn_p50.as_secs_f64() / old_p50.as_secs_f64() - 1.0) * 100.0
+        );
+    }
+    println!();
 }
 
 /// Apple's `/usr/bin/git` against the binaries `git_command` now picks past

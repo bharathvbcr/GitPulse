@@ -3237,38 +3237,35 @@ pub(crate) fn with_background_band<T>(body: impl FnOnce() -> T) -> T {
     body()
 }
 
-static BAND_ENTERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static BAND_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    /// `(entered, failed)` for the spawns made on this thread, see
+    /// [`band_outcomes`].
+    static BAND_OUTCOMES: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+}
 
-/// Logs and counts what putting a child in the background band did, so a
-/// refused demotion is visible to a test as well as to the log.
-fn note_band_outcome(label: &str, outcome: std::io::Result<crate::procguard::BandOutcome>) {
-    use crate::procguard::BandOutcome;
-    use std::sync::atomic::Ordering;
-    match outcome {
-        Ok(BandOutcome::Entered) => {
-            BAND_ENTERED.fetch_add(1, Ordering::Relaxed);
+/// Counts what the spawn of a background-band child did, so a refused band is
+/// visible to a test as well as in the error the caller gets. A refusal is not
+/// logged here: it is the spawn's failure, and travels to the caller as one.
+#[cfg(all(test, target_os = "macos"))]
+fn count_band_spawn<T>(spawned: &std::io::Result<T>) {
+    let (entered, failed) = BAND_OUTCOMES.get();
+    match spawned {
+        Ok(_) => BAND_OUTCOMES.set((entered + 1, failed)),
+        Err(error) if crate::procguard::band_refusal(error) => {
+            BAND_OUTCOMES.set((entered, failed + 1));
         }
-        Ok(BandOutcome::ChildGone | BandOutcome::NotApplicable) => {}
-        Err(error) => {
-            BAND_FAILED.fetch_add(1, Ordering::Relaxed);
-            log::warn!(
-                target: "git_cli",
-                "{label}: could not enter the background band: {error}"
-            );
-        }
+        Err(_) => {}
     }
 }
 
-/// `(entered, failed)`: children demoted into the background band, and
-/// demotions the OS refused, since process start.
+/// `(entered, failed)`: background-band children that started in the band, and
+/// spawns that failed because the band could not be entered, counted for the
+/// calling thread. Per thread, not per process, so a test that makes the band
+/// fail cannot show up in another test's difference.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn band_outcomes() -> (u64, u64) {
-    use std::sync::atomic::Ordering;
-    (
-        BAND_ENTERED.load(Ordering::Relaxed),
-        BAND_FAILED.load(Ordering::Relaxed),
-    )
+    BAND_OUTCOMES.get()
 }
 
 /// Whether a child spawned under `class` on this thread goes into the macOS
@@ -5327,7 +5324,23 @@ fn run_admitted_inner(
     // this process — or the deliberate `process::exit` on `gitpulse-mcp`'s
     // shutdown path — takes this child and everything it forked down with it
     // instead of orphaning them. See [`crate::procguard`].
-    let (mut child, guard) = crate::procguard::spawn(cmd, label).map_err(|e| {
+    //
+    // A background-band child enters the band itself, before it execs: applied
+    // from here after the spawn, the band missed any child that exec'd at once
+    // (every `sh -c`, and the `git` shims), and a child that cannot enter it
+    // fails the spawn rather than silently running at normal priority. See
+    // [`crate::procguard::spawn_background`] for the mechanism and its cost.
+    let in_band = runs_in_background_band(class);
+    let spawned = if in_band {
+        crate::procguard::spawn_background(cmd, label)
+    } else {
+        crate::procguard::spawn(cmd, label)
+    };
+    #[cfg(all(test, target_os = "macos"))]
+    if in_band {
+        count_band_spawn(&spawned);
+    }
+    let (mut child, guard) = spawned.map_err(|e| {
         let message = spawn_error(label, &e);
         // A trust refusal keeps its kind in other words, which is what a
         // caller that only holds the spawn error asks about.
@@ -5336,13 +5349,6 @@ fn run_admitted_inner(
             None => message.into(),
         }
     })?;
-    // Applied after the spawn so `std` keeps its `posix_spawn` fast path; the
-    // child runs unthrottled for the instant before this call. A refusal is
-    // logged and the child carries on at normal priority: failing a read
-    // because it could not be demoted would trade a result for a hint.
-    if runs_in_background_band(class) {
-        note_band_outcome(label, crate::procguard::enter_background_band(&child));
-    }
     #[cfg(test)]
     spawn_log::record(cmd);
 
@@ -13466,16 +13472,16 @@ mod admission_scope_tests {
 mod qos_band_tests {
     use super::*;
 
-    /// Polls of 50 ms a child waits for its demotion. The parent applies it
-    /// right after the spawn, but a parent starved on a loaded host can take a
-    /// long while to get there (one run at load 20+ read "not demoted" after
-    /// a 10 s budget), and a probe that gives up first proves nothing.
+    /// Polls of 50 ms a probe child waits to see itself in the band. The child
+    /// enters it before it execs, so what is waited for is `ps` showing it
+    /// (a new image can read a transient higher priority first); the polls are
+    /// also a hang backstop for a host so loaded that `ps` itself is starved,
+    /// and a probe that gives up first proves nothing.
     const POLLS_TO_BE_DEMOTED: u32 = 1200;
 
-    /// A child that reports its own scheduler priority once the parent has
-    /// demoted it (the demotion lands just after the spawn), or after `waits`
-    /// polls of 50 ms when it never is. `ps` reports the background band as 4
-    /// and a default process far above 10.
+    /// A child that reports its own scheduler priority once it reads as being
+    /// in the band, or after `waits` polls of 50 ms when it never does. `ps`
+    /// reports the background band as 4 and a default process far above 10.
     fn priority_probe(waits: u32) -> Command {
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg(format!(
@@ -13526,7 +13532,7 @@ mod qos_band_tests {
 
     /// The mis-classed write must never be starved: a user action and a plain
     /// read both stay at default priority. The probe waits long enough that a
-    /// demotion applied after the spawn would have landed.
+    /// late demotion would have shown.
     #[test]
     fn a_user_action_child_is_not_in_the_background_band() {
         for class in [Admission::Interactive, Admission::Reactive] {

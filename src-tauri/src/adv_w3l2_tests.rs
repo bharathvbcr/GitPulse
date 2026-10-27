@@ -234,9 +234,8 @@ fn announced(text: &str, label: &str) -> Option<u32> {
 /// Reads, from this process, the scheduler priority of the pids a demoted
 /// child announces on stdout.
 ///
-/// The band is applied by the parent right after the spawn and before the wait
-/// loop begins, so by the time a child's output reaches the loop its demotion
-/// has already been decided. The old tests had the child watch itself with a
+/// The child enters the band itself, before it execs, so by the time it prints
+/// anything the band is in effect. The old tests had the child watch itself with a
 /// shell loop that forked `ps` and `tr` up to 1200 times, from a process the
 /// band had just put at the lowest CPU and I/O priority: on a saturated host
 /// the observer was the starved process, and the run ended at its 120 s
@@ -430,22 +429,21 @@ fn adv_flake_timeline_time_to_demotion() {
     assert_in_band(&readings, "never demoted");
 }
 
-/// PRODUCTION DEFECT ft-b597add5 (gp-b26-background-band-race), kept as a
-/// repro: a child that execs before the parent's
-/// `setpriority` lands is left at the default priority for good. The band is
-/// applied after the spawn returns (`enter_background_band`), and a child that
-/// replaces its image at once, as `sh -c 'exec tool'` does, can pass through
-/// its exec while the demotion is in flight; it then reads pri 31 and still
-/// reads 31 half a second later (2 of 80 runs of the module at load 15 to 40
-/// on 2026-10-26; the same was seen 1 in 10 at load 72 as a shell that never
-/// reached the band in 81 s). It also hits a child that waits for stdin before
+/// Regression for ft-b597add5 (gp-b26-background-band-race): a child that
+/// execs at once is in the band. The band used to be applied from the parent
+/// after the spawn returned, and a child that replaced its image at once, as
+/// `sh -c 'exec tool'` does, could pass through its exec while the demotion was
+/// in flight; the demotion then marked the task the exec discarded, and the
+/// child read pri 31 for good (2 of 80 runs of the module at load 15 to 40 on
+/// 2026-10-26; the same was seen 1 in 10 at load 72 as a shell that never
+/// reached the band in 81 s). It also hit a child that waits for stdin before
 /// it execs (`adv_band_survives_exec`, `adv_flake_timeline_time_to_demotion`
-/// failed 5 of 80 runs of the module at load 10 to 50 with 18 hogs): the band
-/// was never in effect at all. Alone these repros pass (0 of 180 children); the
-/// other tests' concurrent spawns are what trigger it, so run them together:
-/// `--lib adv_w3l2_tests:: -- --include-ignored` (3 of 6 runs failed).
+/// failed 5 of 80 runs of the module at load 10 to 50 with 18 hogs). Alone it
+/// passed on the old code (0 of 180 children); the other tests' concurrent
+/// spawns are what triggered it, so it is only a regression test when run with
+/// them: `--lib adv_w3l2_tests::`. The band is now entered in the child before
+/// the exec, so there is no window.
 #[test]
-#[ignore = "break: a child that execs immediately can miss the background band for good"]
 fn adv_break_child_that_execs_at_once_misses_the_band() {
     let mut missed = 0;
     for _ in 0..60 {
@@ -463,47 +461,105 @@ fn adv_break_child_that_execs_at_once_misses_the_band() {
     );
 }
 
-/// Gap between `posix_spawn` returning and the demotion returning, on a thread
-/// at UTILITY (what `with_admission(Background)` makes it) versus a default
-/// thread, and every error `enter_background_band` surfaces. Under load the
-/// gap is the window in which the child is NOT demoted.
+/// A background child settles into the band whichever thread class spawned it,
+/// a thread at UTILITY (what `with_admission(Background)` makes it) or a
+/// default one, and does not depend on the parent doing anything after the
+/// spawn: the parent here only reads. The first few reads of a new image can
+/// show a transient priority (46 and 31 were seen, at load above 40, before the
+/// band showed), so a child is read until it shows the band, a count of reads
+/// as `SETTLE_READS` is, and a child that never does is reported with the last
+/// priority read.
 #[test]
-fn adv_demotion_gap_and_errors_on_a_utility_thread() {
-    use crate::procguard::{enter_background_band, spawn};
+fn adv_a_background_child_settles_into_the_band_on_every_thread_class() {
+    use crate::procguard::spawn_background;
     use std::process::Stdio;
-    fn gaps(n: usize) -> (Vec<Duration>, usize) {
-        let mut out = Vec::new();
-        let mut errors = 0;
+    fn never_settled(n: usize) -> Vec<(u32, i32)> {
+        let mut outside = Vec::new();
         for _ in 0..n {
             let mut cmd = Command::new("/bin/sleep");
             cmd.arg("5").stdin(Stdio::null()).stdout(Stdio::null());
-            let (mut child, guard) = spawn(&mut cmd, "adv-gap").expect("spawn");
-            let t = Instant::now();
-            if enter_background_band(&child).is_err() {
-                errors += 1;
+            let (mut child, guard) = spawn_background(&mut cmd, "adv-band").expect("spawn");
+            let mut last = -1;
+            let mut settled = false;
+            for _ in 0..SETTLE_READS {
+                if let Some((pri, _)) = ps_state(child.id()) {
+                    last = pri;
+                    if pri < 10 {
+                        settled = true;
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
             }
-            out.push(t.elapsed());
+            if !settled {
+                outside.push((child.id(), last));
+            }
             guard.kill_tree(&mut child);
             let _ = guard.reap(|| child.wait());
         }
-        (out, errors)
+        outside
     }
-    let report = |name: &str, mut v: Vec<Duration>, errors: usize| {
-        v.sort();
-        eprintln!(
-            "GAP {name}: n={} p50={:?} p95={:?} max={:?} errors={errors}",
-            v.len(),
-            v[v.len() / 2],
-            v[v.len() * 95 / 100],
-            v[v.len() - 1]
-        );
-        assert_eq!(errors, 0);
+    let on_default = on_fresh_thread(|| never_settled(40));
+    assert!(on_default.is_empty(), "default thread: {on_default:?}");
+    let on_utility =
+        on_fresh_thread(|| with_admission(Admission::Background, || never_settled(40)));
+    assert!(on_utility.is_empty(), "utility thread: {on_utility:?}");
+}
+
+fn band_refused_with_eperm() -> Result<(), libc::c_int> {
+    Err(libc::EPERM)
+}
+
+/// ft-b597add5: a background run whose band cannot be applied fails, and what
+/// the caller reads says why, instead of the child running in the normal band
+/// behind a log line. The failure is injected into the child's hook, so nothing
+/// depends on the OS refusing. The same call outside the band-hook override
+/// still runs, so the failure is the band's and not the command's.
+#[test]
+fn adv_a_background_run_whose_band_is_refused_fails_with_the_reason() {
+    let (_, failed) = band_outcomes();
+    let refused = with_background_processes(|| {
+        with_background_budget_wait(true, || {
+            crate::procguard::with_band_hook(band_refused_with_eperm, || {
+                run_bounded(
+                    Command::new("/usr/bin/true"),
+                    "adv-refused-band",
+                    Duration::from_secs(120),
+                    None,
+                )
+            })
+        })
+    });
+    let Err(refusal) = refused else {
+        panic!("a child that could not enter the band must not run");
     };
-    let (default_gaps, e1) = on_fresh_thread(|| gaps(100));
-    report("default-thread", default_gaps, e1);
-    let (utility_gaps, e2) =
-        on_fresh_thread(|| with_admission(Admission::Background, || gaps(100)));
-    report("utility-thread", utility_gaps, e2);
+    let message = refusal.message().to_string();
+    assert!(
+        message.contains("could not enter the background band: Operation not permitted"),
+        "{message}"
+    );
+    assert!(
+        message.starts_with("Failed to spawn adv-refused-band"),
+        "{message}"
+    );
+    let (_, failed_after) = band_outcomes();
+    assert!(failed_after > failed, "the refusal was not counted");
+
+    let ran = with_background_processes(|| {
+        with_background_budget_wait(true, || {
+            run_bounded(
+                Command::new("/usr/bin/true"),
+                "adv-banded",
+                Duration::from_secs(120),
+                None,
+            )
+        })
+    });
+    assert!(
+        ran.is_ok(),
+        "{:?}",
+        ran.err().map(|e| e.message().to_string())
+    );
 }
 
 /// A demoted child keeps the band through its own exec. The child waits for a
@@ -521,19 +577,18 @@ fn adv_band_survives_exec() {
     assert_in_band(&readings, "left the band across exec");
 }
 
-/// PRODUCTION DEFECT ft-b597add5 (gp-b26-background-band-race), kept as a
-/// repro: a grandchild forked by an already
-/// demoted child is usually in the band (a few milliseconds after it is
-/// created, as `first` shows) but sometimes never joins it. The child waits for
-/// a line on stdin that is fed only after the demotion, so the fork is after it
-/// by construction. Seen as `grand pid=... pri=31 ... reads=8115` for the whole
-/// 120 s run in 1 of 40 runs of `adv_band_survives_exec_and_is_inherited_by_
-/// grandchildren` (the test this one was split from) at load 15 to 20, and 4
-/// of 60 as a first read of 31 or 46 before it settled. Like its sibling it
-/// needs the module's other tests spawning beside it: `--lib adv_w3l2_tests::
-/// -- --include-ignored`.
+/// Regression for ft-b597add5 (gp-b26-background-band-race): a grandchild
+/// forked by a banded child is in the band. It used to be usually in the band
+/// (a few milliseconds after it was created, as `first` shows) but sometimes
+/// never joined it, because the parent's after-spawn demotion had marked a
+/// task the child's exec discarded. The child waits for a line on stdin, so the
+/// fork is after the spawn by construction. Seen as `grand pid=... pri=31 ...
+/// reads=8115` for the whole 120 s run in 1 of 40 runs of
+/// `adv_band_survives_exec_and_is_inherited_by_grandchildren` (the test this
+/// one was split from) at load 15 to 20, and 4 of 60 as a first read of 31 or
+/// 46 before it settled. Like its sibling it only failed with the module's
+/// other tests spawning beside it: `--lib adv_w3l2_tests::`.
 #[test]
-#[ignore = "break: a grandchild of a demoted child can stay outside the background band"]
 fn adv_break_grandchild_of_a_demoted_child_misses_the_band() {
     let mut missed = 0;
     for _ in 0..60 {
