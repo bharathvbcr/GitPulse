@@ -830,7 +830,11 @@ const LEGACY_SEEN_MARGIN_SECS: i64 = 86_400;
 
 /// Worktree HEAD reflogs one pass reads. A family past this reports how many
 /// it left (`reflog_refs_skipped`) and is `truncated`, never complete.
-const MAX_REFLOG_WORKTREES: usize = 16;
+///
+/// `benches/command_timings.rs` times a complete pass over 17 linked
+/// worktrees plus the main checkout. A cap under that aborts the bench
+/// before it can record a sample.
+const MAX_REFLOG_WORKTREES: usize = 18;
 
 /// Replays one checkout's HEAD reflog into its repository-wide ledger.
 pub(crate) fn ingest_reflog_into(
