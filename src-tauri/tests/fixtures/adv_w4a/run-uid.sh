@@ -43,6 +43,6 @@ while read -r label pid; do
 done < "$L/pids"
 BIN=$(ls -t /target/debug/deps/adv_w4a_signal_guard-* | grep -v '\.d$' | head -1)
 echo "--- as 1001 (the ordinary hook)"
-setpriv --reuid=1001 --regid=1001 --clear-groups env ADV_UID_LAB="$L" "$BIN" the_kill_rule --nocapture --test-threads=1
+setpriv --reuid=1001 --regid=1001 --clear-groups env ADV_UID_LAB="$L" "$BIN" the_kill_rule --ignored --nocapture --test-threads=1
 echo "--- as root (the hook run as root)"
-env ADV_UID_LAB="$L" "$BIN" the_kill_rule --nocapture --test-threads=1
+env ADV_UID_LAB="$L" "$BIN" the_kill_rule --ignored --nocapture --test-threads=1

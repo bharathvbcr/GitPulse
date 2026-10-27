@@ -2,7 +2,14 @@
 # W4a adversary: run a command in a podman Linux image against a source tree.
 #
 #   run.sh <src-dir> <command...>
-#   run.sh /path/to/scratch-copy-of-the-repo cargo test --test adv_w4a_signal_guard -- --test-threads=1
+#   run.sh /path/to/scratch-copy-of-the-repo suite
+#   run.sh /path/to/scratch-copy-of-the-repo cargo test --test adv_w4a_signal_guard -- --ignored --test-threads=1
+#
+# `suite` is the whole differential suite: every test in the file is #[ignore]d
+# (an ordinary `cargo test` reports them as not run, never as passed), so it runs
+# `--ignored` and skips by name the four `known_hole_*` tests (they assert what
+# the guard should do and fail today, each with its own ignore reason) and the
+# uid-model test (it needs the lab run-uid.sh builds).
 #   ADV_USER=0 run.sh <src-dir> bash /adv/run-uid.sh     # the uid-model lab, as root
 #
 # The tests in tests/adv_w4a_signal_guard.rs send real signals to every process
@@ -18,6 +25,10 @@
 # A cargo build compares file mtimes only: after switching <src-dir> between two
 # revisions that share the target volume, touch every .rs file first.
 SRC="$1"; shift
+if [ "${1:-}" = "suite" ]; then
+  set -- cargo test --test adv_w4a_signal_guard -- --ignored --test-threads=1 \
+    --skip known_hole_ --skip the_kill_rule_over_real
+fi
 ADV="$(cd "$(dirname "$0")" && pwd)"
 EXTRA=(-e ADV_W4A_CONTAINER=1)
 [ -n "${ADV_USER:-}" ] && EXTRA+=(--user "$ADV_USER")

@@ -34,18 +34,21 @@ const SINK_SOURCE: &str = include_str!("fixtures/adv_w4a_sink.c");
 /// These tests send real signals (always `TERM`, which every process of the run
 /// ignores or logs) to every process of the user that a pattern reaches, up to
 /// `pkill -u $USER`. That is safe only inside the throwaway container
-/// `tests/fixtures/adv_w4a/run.sh` starts, which sets this variable; anywhere
-/// else they do nothing, because a developer's or a CI runner's own session
-/// would be among the processes reached.
-fn enabled() -> bool {
-    let on = std::env::var_os("ADV_W4A_CONTAINER").is_some();
-    if on {
-        // Every test starts here: the guard and the process helpers below are
-        // the library calls of this suite, and a deferral by the spawn rate cap
-        // would be noise in a differential run.
-        common::unmetered_spawns();
-    }
-    on
+/// `tests/fixtures/adv_w4a/run.sh` starts, which sets this variable. Every test
+/// is `#[ignore]`d, so an ordinary run reports them as not run, never as
+/// passed; and a test forced with `--ignored` outside the container panics
+/// here rather than signal anything, because a developer's or a CI runner's own
+/// session would be among the processes reached.
+fn container_only() {
+    assert!(
+        std::env::var_os("ADV_W4A_CONTAINER").is_some(),
+        "this test sends real signals and runs only inside the W4a container \
+         (tests/fixtures/adv_w4a/run.sh sets ADV_W4A_CONTAINER); refusing to run here"
+    );
+    // Every test starts here: the guard and the process helpers below are the
+    // library calls of this suite, and a deferral by the spawn rate cap would
+    // be noise in a differential run.
+    common::unmetered_spawns();
 }
 
 /// What the guard said about a command line.
@@ -589,10 +592,9 @@ fn run_named(name: &str, cases: Vec<(&'static str, Vec<String>)>) {
 }
 
 #[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
 fn comm_is_cut_at_fifteen_bytes_and_names_straddle_it() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     run_named(
         "comm-cut",
         vec![
@@ -631,10 +633,9 @@ fn comm_is_cut_at_fifteen_bytes_and_names_straddle_it() {
 }
 
 #[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
 fn a_comm_cut_inside_a_utf8_character_is_still_matched_by_the_tools_prefix_rule() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     // `gitpulse-x` + three two-byte characters is 16 bytes; the kernel keeps 15,
     // cutting the last character in half. psmisc compares the first 15 bytes
     // of the name with them, so a different name with the same 15 bytes is
@@ -657,10 +658,9 @@ fn a_comm_cut_inside_a_utf8_character_is_still_matched_by_the_tools_prefix_rule(
 }
 
 #[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
 fn login_shells_titles_renamed_comms_and_argv0_paths() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     run_named(
         "names",
         vec![
@@ -714,10 +714,9 @@ fn login_shells_titles_renamed_comms_and_argv0_paths() {
 }
 
 #[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
 fn full_command_lines_with_newlines_spaces_empties_and_over_a_mebibyte() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     run_named(
         "cmdline",
         vec![
@@ -756,9 +755,7 @@ fn full_command_lines_with_newlines_spaces_empties_and_over_a_mebibyte() {
 #[test]
 #[ignore = "known hole, BROKE on the base too: newline, empty argument, blank command line"]
 fn known_hole_newline_empty_argument_and_blank_command_line() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     run_named(
         "cmdline-known-hole",
         vec![
@@ -774,10 +771,9 @@ fn known_hole_newline_empty_argument_and_blank_command_line() {
 }
 
 #[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
 fn options_after_the_pattern_are_still_asked_about() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     run_named(
         "late-options",
         vec![
@@ -841,10 +837,9 @@ fn options_after_the_pattern_are_still_asked_about() {
 /// `gitpulse-short` decoy (checked against the real `pgrep` first), so none may
 /// be silent.
 #[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
 fn the_same_kill_in_every_shell_shape_is_not_silent() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     let decoy = lab()
         .decoys
         .iter()
@@ -922,9 +917,7 @@ fn the_same_kill_in_every_shell_shape_is_not_silent() {
 #[test]
 #[ignore = "known hole, BROKE on the base too: a program the shell reader does not resolve"]
 fn known_hole_a_pkill_the_shell_reader_does_not_see() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     let mut quiet = Vec::new();
     for command in [
         "busybox pkill -f gitpulse-short",
@@ -949,10 +942,9 @@ fn known_hole_a_pkill_the_shell_reader_does_not_see() {
 /// and the sets are compared pid by pid (a refusal for other reasons does not
 /// hide a decoy the guard's own set lacks).
 #[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
 fn glibc_and_rust_regular_expressions_pick_the_same_decoys() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     let patterns = [
         r"gitpulse-short",
         r"gitpulse-sh.rt",
@@ -1055,9 +1047,7 @@ fn glibc_and_rust_regular_expressions_pick_the_same_decoys() {
 #[test]
 #[ignore = "known hole, BROKE on the base too: the regex engines read these patterns differently"]
 fn known_hole_regular_expressions_glibc_reads_differently() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     let patterns = [
         r"\d", r"\W", r"\.", r"\?", r"\a", r"\n", r"\t", r"[^]a]", r"[\d]", r"[\n]", r".*", r".+",
     ];
@@ -1122,10 +1112,9 @@ fn regex_diffs(patterns: &[&str]) -> Vec<String> {
 }
 
 #[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
 fn kill_of_a_pidof_substitution_by_name() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     let mut tally = Tally::default();
     for args in [
         vec!["gitpulse-short".to_string()],
@@ -1161,9 +1150,7 @@ fn kill_of_a_pidof_substitution_by_name() {
 #[test]
 #[ignore = "known hole, BROKE on the base too: pidof with an executable path"]
 fn known_hole_kill_of_a_pidof_substitution_by_executable_path() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     let dir = lab().dir.to_string_lossy().into_owned();
     let path = |name: &str| format!("{dir}/{name}");
     let mut tally = Tally::default();
@@ -1182,10 +1169,9 @@ fn known_hole_kill_of_a_pidof_substitution_by_executable_path() {
 }
 
 #[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
 fn kill_of_a_pgrep_substitution_and_pgrep_alone() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     run_named(
         "pgrep-subst",
         vec![
@@ -1214,10 +1200,9 @@ fn kill_of_a_pgrep_substitution_and_pgrep_alone() {
 }
 
 #[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
 fn pkill_alone_with_every_selector_and_no_pattern() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     run_named(
         "selectors",
         vec![
@@ -1295,10 +1280,9 @@ fn pkill_alone_with_every_selector_and_no_pattern() {
 }
 
 #[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
 fn killall_alone_with_every_option() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     run_named(
         "killall-options",
         vec![
@@ -1348,10 +1332,9 @@ fn killall_alone_with_every_option() {
 }
 
 #[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
 fn a_pkill_that_reaches_its_callers_ancestors_is_counted_unless_a_is_given() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     let lab = lab();
     assert!(
         !lab.ancestors.is_empty(),
@@ -1561,10 +1544,9 @@ fn fuzz(prog: &'static str, seed: u64, count: usize, options: &[&[&str]], signal
 }
 
 #[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
 fn fuzz_pkill_option_grammar() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     for seed in [
         0x9E37_79B9_7F4A_7C15_u64,
         0xD1B5_4A32_D192_ED03,
@@ -1575,10 +1557,9 @@ fn fuzz_pkill_option_grammar() {
 }
 
 #[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
 fn fuzz_pgrep_option_grammar_under_kill_substitution() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     fuzz("pgrep", 0xA5A5_5A5A_1357_9BDF, 1200, PKILL_OPTIONS, &[]);
 }
 
@@ -1648,10 +1629,9 @@ const KILLALL_NAMES: &[&str] = &[
 ];
 
 #[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
 fn fuzz_killall_option_grammar() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     let mut rng = Rng(0xC0FF_EE00_DEAD_BEEF);
     let mut tally = Tally::default();
     let mut seen = BTreeSet::new();
@@ -1898,28 +1878,25 @@ fn real_signal_word_test(prog: &'static str) {
 }
 
 #[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
 fn every_word_the_real_pkill_reads_as_a_nonzero_signal_is_not_silent_to_the_guard() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     real_signal_word_test("pkill");
 }
 
 #[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
 fn every_word_the_real_killall_reads_as_a_nonzero_signal_is_not_silent_to_the_guard() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     real_signal_word_test("killall");
 }
 
 // ───────────────────────────── newest / oldest ──────────────────────────────
 
 #[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
 fn newest_and_oldest_pick_the_process_the_real_tool_picks_even_among_equal_start_times() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     let lab = lab();
     let decoy_exe = lab.dir.join("gitpulse-tie");
     let plain_exe = lab.dir.join("plainsink2");
@@ -1998,10 +1975,9 @@ fn newest_and_oldest_pick_the_process_the_real_tool_picks_even_among_equal_start
 /// owner, `status` or `cmdline` vanishes between two reads must neither
 /// panic nor make a decoy that is alive throughout fall out of the answer.
 #[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
 fn a_table_read_while_processes_come_and_go_still_counts_the_decoys() {
-    if !enabled() {
-        return;
-    }
+    container_only();
     let decoy = lab()
         .decoys
         .iter()
@@ -2058,14 +2034,12 @@ fn a_table_read_while_processes_come_and_go_still_counts_the_decoys() {
 /// (`pkill -e` lists only a signal that was delivered, so `kill(2)`'s own rule
 /// is the oracle), and the guard is asked about the same lines.
 #[test]
+#[ignore = "sends real signals; runs only inside the W4a container, and only under tests/fixtures/adv_w4a/run-uid.sh, which builds the uid lab"]
 fn the_kill_rule_over_real_effective_and_saved_uids_against_the_real_tools() {
-    if !enabled() {
-        return;
-    }
-    let Some(dir) = std::env::var_os("ADV_UID_LAB") else {
-        eprintln!("uid model: ADV_UID_LAB not set, skipped");
-        return;
-    };
+    container_only();
+    let dir = std::env::var_os("ADV_UID_LAB").expect(
+        "ADV_UID_LAB is not set: this test needs the uid lab tests/fixtures/adv_w4a/run-uid.sh builds",
+    );
     let table = read(&format!("{}/pids", dir.to_string_lossy()));
     let lab: Vec<(String, i32)> = table
         .lines()

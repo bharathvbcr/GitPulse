@@ -71,9 +71,17 @@
 //!   anywhere in the line; one pattern only; an option the guard does not model
 //!   (`-s`, `-r`, `-g`, a path to `killall`, …) is asked about rather than read
 //!   with its macOS meaning. When options follow the first operand the macOS
-//!   reading is counted too, so the set is the union of the two. That can
-//!   refuse a command Linux would have run narrower, never pass one macOS
-//!   refused.
+//!   reading is counted too, so the set is the union of the two, which can
+//!   refuse a command Linux would have run narrower. A command line is silent
+//!   on Linux where the macOS reading would have counted it only when the real
+//!   Linux tool refuses or ignores it and signals nothing: more than one
+//!   pattern, no pattern and no criterion, `-h`/`-V` and `killall -l`/`-V`,
+//!   `-L` without `-F`, a missing option argument, signal 0. Those classes do
+//!   not consult the macOS reading. They were checked against the real
+//!   tools in a differential over 3849 command lines (`tests/adv_w4a_signal_guard.rs`,
+//!   adversary report w4a-adv): of the 160 lines the Linux model passes where
+//!   the macOS reading did not, none reaches a decoy process. Everything else
+//!   is the union of the Linux and macOS readings.
 //! * A process is the user's by the `kill(2)` rule over the real, effective and
 //!   saved uids in `/proc/<pid>/status` (Linux), not by the owner of
 //!   `/proc/<pid>`, which the kernel makes root's for a process that is not
