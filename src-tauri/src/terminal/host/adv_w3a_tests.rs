@@ -214,3 +214,47 @@ fn adv_w3a_a_late_spawn_the_host_then_loses_is_ended_by_the_next_adoption() {
         "{exits:?}"
     );
 }
+
+/// Rework round 1, fix (a): `record_exit` is once per session by construction.
+/// Two reporters of one exit race: the first is held inside its run's
+/// bookkeeping (`finished`), the second runs to the end meanwhile. The second
+/// must not run the bookkeeping or announce the exit again.
+#[test]
+fn two_concurrent_record_exits_for_one_session_run_finished_once() {
+    let fake = FakeHost::start(&[]);
+    let app = fixture(fake.config());
+    let host = the_client(&app);
+    let log = Arc::new(ExitLog::default());
+    host.set_events(log.clone());
+    let observer = SlowFinish::new();
+    lock(&host.inner.proxies).insert(
+        "term-9-twice".into(),
+        Proxy::new(nowhere(), Some(observer.clone()), None, false, false),
+    );
+    let first = {
+        let inner = host.inner.clone();
+        std::thread::spawn(move || inner.record_exit(exit_of("term-9-twice", Some(0))))
+    };
+    until(
+        "the first exit's bookkeeping",
+        Duration::from_secs(5),
+        || observer.started.load(Ordering::Acquire) >= 1,
+    );
+
+    host.inner.record_exit(exit_of("term-9-twice", Some(0)));
+    observer.open.store(true, Ordering::Release);
+    first.join().unwrap();
+
+    let exits = log.exits.lock().unwrap().clone();
+    assert_eq!(
+        observer.started.load(Ordering::Acquire),
+        1,
+        "the run's bookkeeping ran more than once for one session: {exits:?}"
+    );
+    assert_eq!(
+        exits.iter().filter(|(id, _)| id == "term-9-twice").count(),
+        1,
+        "one session, one exit announcement: {exits:?}"
+    );
+    assert!(!lock(&host.inner.proxies).contains_key("term-9-twice"));
+}

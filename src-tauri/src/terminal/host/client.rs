@@ -383,7 +383,8 @@ struct Inner {
     proxies: Mutex<HashMap<String, Proxy>>,
     events: Mutex<Option<Arc<dyn SessionEvents>>>,
     adopter: Mutex<Option<Adopter>>,
-    /// Sessions whose exit this app has recorded, newest last.
+    /// Sessions whose exit this app has recorded or is recording, newest last:
+    /// the claim `record_exit` makes before it runs any bookkeeping.
     ended: Mutex<VecDeque<String>>,
     /// Every session the host holds has a proxy here: set once a connection
     /// has listed them. Until then, whether a run's terminal is held is not
@@ -1200,16 +1201,32 @@ impl Inner {
             }
             Err(error) => Some(error),
         };
-        // The order of the next two reads is the guard, and must not be
-        // swapped. `spawn` writes `vouched.late` (under `vouched`) before it
-        // clears `proxy.starting` (under `proxies`), so a scan that sees a
-        // proxy not `starting` has, by the `proxies` mutex's release and
-        // acquire, seen that spawn's `late` write too: the read of `late`
-        // after the scan then holds the id. A spawn the scan saw `starting`
-        // is not a candidate, and one that began after it has no proxy in
-        // the scan. `late` cannot lose the id in between: only a reported
-        // exit (which means it is not held) removes it, and the window that
-        // clears it is this `adopt`'s own, open until it returns.
+        // A proxy is ended here only if the host neither listed it nor
+        // confirmed it nor reported its exit. The order of the next two reads
+        // is the guard, and must not be swapped; `late` and `exited` are read
+        // together, in one `vouched` critical section, after the scan.
+        //
+        // `spawn` runs, in this program order: (A) under `vouched`, remove
+        // `starting`, and unless `exited` already holds the id, insert it in
+        // `held` and, while `adopting`, in `late`; unlock; (B) under `proxies`,
+        // clear `proxy.starting` and take any deferred exit; unlock; (C) record
+        // that deferred exit. So a scan that sees a proxy not `starting` has
+        // seen B, and through the `proxies` mutex A happens-before the later
+        // `vouched` read: the id is then in `late`, or in `exited` (A skipped
+        // it because the host had reported its exit, which C records), unless
+        // it has since left one of them. Between A and the read `late` loses
+        // an id only through `note_ended`, which puts it in `exited` first;
+        // the window that clears `late` is this `adopt`'s own and stays open
+        // until it returns, and `adopt` runs under the `connecting` lock, so
+        // no other window clears it. `exited` loses an id only once
+        // `REMEMBERED_EXITS` newer exits have pushed it out. A spawn the scan
+        // saw `starting` is not a candidate, and one that began after the scan
+        // has no proxy in it. Skipping `exited` ids matters beyond a spawn: an
+        // exit the host reported is being recorded by its own reporter (B to C
+        // above, or `record_exit` itself), and ending the proxy here would
+        // announce the host's loss in place of the real status.
+        // `record_exit` claims an id in `ended` before it runs, so were both to
+        // run, the bookkeeping and the announcement still happen once.
         let unaccounted: Vec<String> = lock(&self.proxies)
             .iter()
             .filter(|(id, p)| !p.starting && !listed.iter().any(|l| &l.id == *id))
@@ -1217,10 +1234,13 @@ impl Inner {
             .collect();
         #[cfg(test)]
         self.adopt_seam();
-        let confirmed_meanwhile = lock(&self.vouched).late.clone();
-        let gone = unaccounted
-            .into_iter()
-            .filter(|id| !confirmed_meanwhile.contains(id));
+        let gone: Vec<String> = {
+            let vouched = lock(&self.vouched);
+            unaccounted
+                .into_iter()
+                .filter(|id| !vouched.late.contains(id) && !vouched.exited.contains(id))
+                .collect()
+        };
         for id in gone {
             let run_id = lock(&self.proxies).get(&id).and_then(|p| p.run_id.clone());
             self.record_exit(WireEnded {
@@ -1356,8 +1376,10 @@ impl Inner {
     }
 
     /// Records one session's exit: its run's receipt, the incident record and
-    /// `terminal-exit`, then lets the host forget it. Called once per session;
-    /// a second report of the same exit only clears the host's copy.
+    /// `terminal-exit`, then lets the host forget it. The bookkeeping runs for
+    /// one report per session: whichever reporter first finds the id absent
+    /// from `ended` puts it there in the same critical section, so a second
+    /// report, even one that overlaps the first, only clears the host's copy.
     fn record_exit(&self, ended: WireEnded) {
         let id = ended.payload.id.clone();
         self.note_ended(&id);
@@ -1368,16 +1390,28 @@ impl Inner {
                 return;
             }
         }
-        let already = lock(&self.ended).contains(&id);
-        if !already {
-            let (observer, slot) = {
-                let proxies = lock(&self.proxies);
-                let proxy = proxies.get(&id);
-                (
-                    proxy.and_then(|p| p.observer.clone()),
-                    proxy.filter(|p| !p.end_sent).map(|p| p.output.clone()),
-                )
-            };
+        // Taken before the claim: the claim's loser removes the proxy, and the
+        // winner must not find it gone.
+        let (observer, slot) = {
+            let proxies = lock(&self.proxies);
+            let proxy = proxies.get(&id);
+            (
+                proxy.and_then(|p| p.observer.clone()),
+                proxy.filter(|p| !p.end_sent).map(|p| p.output.clone()),
+            )
+        };
+        let first = {
+            let mut remembered = lock(&self.ended);
+            let first = !remembered.contains(&id);
+            if first {
+                remembered.push_back(id.clone());
+                while remembered.len() > REMEMBERED_EXITS {
+                    remembered.pop_front();
+                }
+            }
+            first
+        };
+        if first {
             let observer = observer.or_else(|| {
                 ended
                     .run_id
@@ -1391,13 +1425,6 @@ impl Inner {
                     catch_unwind(AssertUnwindSafe(|| observer.finished(&ended.payload)))
                 {
                     crate::supervisor::note_stopped("terminal observer panic", panic.as_ref());
-                }
-            }
-            {
-                let mut remembered = lock(&self.ended);
-                remembered.push_back(id.clone());
-                while remembered.len() > REMEMBERED_EXITS {
-                    remembered.pop_front();
                 }
             }
             lock(&self.proxies).remove(&id);
