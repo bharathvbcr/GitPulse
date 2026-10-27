@@ -246,77 +246,55 @@ fn parse_answer(answer: &[u8]) -> Outcome {
 
 #[cfg(unix)]
 fn exchange(path: &Path, request: &[u8], budget: Duration) -> Outcome {
-    use std::io::{ErrorKind, Read, Write};
+    use std::io::ErrorKind;
     use std::os::unix::net::UnixStream;
-    use std::time::Instant;
 
-    let deadline = Instant::now() + budget;
+    let deadline = std::time::Instant::now() + budget;
     // std offers no connect timeout. On macOS a listener whose backlog is full
     // refuses at once rather than blocking, and a missing or dead socket fails
     // at once on every platform, so the budget below governs what follows.
-    let mut stream = match UnixStream::connect(path) {
-        Ok(stream) => stream,
+    match UnixStream::connect(path) {
+        Ok(stream) => converse(stream, request, deadline),
         Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => {
-            return Outcome::Absent
+            Outcome::Absent
         }
-        Err(_) => return Outcome::Io,
-    };
-    // Each pass re-derives the timeout from what is left, so a peer that
-    // accepts a byte at a time cannot stretch the exchange past the budget.
-    let remaining = || {
-        deadline
-            .checked_duration_since(Instant::now())
-            .filter(|left| !left.is_zero())
-    };
-    let timed_out =
-        |e: &std::io::Error| matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut);
-    // macOS refuses `setsockopt` (EINVAL, kind `InvalidInput`) on a Unix socket
-    // whose peer has already closed — which is what a Graft that answers
-    // quickly looks like by the time we get here (probed on macOS for a fully
-    // closed peer; half-closed peers are inferred, not probed). A closed peer
-    // should not make a read block, so that refusal is not a fault: the read
-    // that follows returns the answer already buffered, or end of file, and
-    // the deadline check still bounds a peer that is not closed. Any other failure
-    // means the timeout is not in force, and the exchange stops.
-    let bound = |result: std::io::Result<()>| match result {
-        Err(e) if e.kind() != ErrorKind::InvalidInput => Err(()),
-        _ => Ok(()),
-    };
-    let Some(left) = remaining() else {
-        return Outcome::TimedOut;
-    };
-    if bound(stream.set_write_timeout(Some(left))).is_err()
-        || bound(stream.set_read_timeout(Some(left))).is_err()
-    {
-        return Outcome::Io;
+        Err(_) => Outcome::Io,
     }
+}
 
-    let mut sent = 0;
-    while sent < request.len() {
-        let Some(left) = remaining() else {
-            return Outcome::TimedOut;
-        };
-        if bound(stream.set_write_timeout(Some(left))).is_err() {
-            return Outcome::Io;
-        }
-        match stream.write(&request[sent..]) {
-            Ok(0) => return Outcome::Io,
-            Ok(n) => sent += n,
-            Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(e) if timed_out(&e) => return Outcome::TimedOut,
-            Err(_) => return Outcome::Io,
-        }
+/// How an exchange that failed after connecting ended: out of its deadline, or
+/// any other I/O error. `DeadlineStream` reports an expired timeout as
+/// `TimedOut` on every platform, so that one kind is the deadline.
+fn failed(error: &std::io::Error) -> Outcome {
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        Outcome::TimedOut
+    } else {
+        Outcome::Io
+    }
+}
+
+/// One request and its answer over a connected socket, inside one deadline.
+///
+/// The deadline, and its macOS tolerance, are `crate::deadline::DeadlineStream`'s,
+/// the one owner of "every read and write of a socket gets what is left of one
+/// deadline": a peer that accepts or sends a byte at a time cannot stretch the
+/// exchange past the budget, and a peer that has already answered and closed
+/// (macOS refuses the timeout with `EINVAL` on such a socket) still yields the
+/// answer it left buffered, or end of file.
+fn converse<S>(stream: S, request: &[u8], deadline: std::time::Instant) -> Outcome
+where
+    S: crate::deadline::Timed + std::io::Read + std::io::Write,
+{
+    use std::io::{ErrorKind, Read, Write};
+
+    let mut stream = crate::deadline::DeadlineStream::new(stream, deadline);
+    if let Err(e) = stream.write_all(request) {
+        return failed(&e);
     }
 
     let mut answer = Vec::with_capacity(64);
     let mut chunk = [0u8; 128];
     loop {
-        let Some(left) = remaining() else {
-            return Outcome::TimedOut;
-        };
-        if bound(stream.set_read_timeout(Some(left))).is_err() {
-            return Outcome::Io;
-        }
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
@@ -330,8 +308,7 @@ fn exchange(path: &Path, request: &[u8], budget: Duration) -> Outcome {
                 }
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(e) if timed_out(&e) => return Outcome::TimedOut,
-            Err(_) => return Outcome::Io,
+            Err(e) => return failed(&e),
         }
     }
     parse_answer(&answer)

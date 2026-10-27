@@ -2,7 +2,9 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
+import { wallClockBudget } from "../src/lib/testing/wallClock";
 import {
   SCHEMAS,
   SERVE_CONTRACT,
@@ -313,6 +315,32 @@ describe("contractRow", () => {
     const { copy, owner } = fixture("{}\n", null);
     expect(contractRow("serve", copy, owner).verdict).toBe("unverifiable");
     expect(contractRow("serve", copy, null).verdict).toBe("absent");
+  });
+});
+
+describe("GITPULSE_VENDOR_GIT_TIMEOUT_MS", () => {
+  // Both checkouts point at directories that do not exist, so a run that is not
+  // refused for the bound ends at "no DevCouncil checkout" without touching git.
+  function run(bound: string) {
+    const missing = path.join(tmpdir(), "gitpulse-no-such-checkout");
+    return spawnSync(process.execPath, [fileURLToPath(new URL("./check-schema-parity.mjs", import.meta.url))], {
+      encoding: "utf8",
+      timeout: wallClockBudget(30_000),
+      env: { ...process.env, GITPULSE_VENDOR_GIT_TIMEOUT_MS: bound, GITPULSE_DEVCOUNCIL_ROOT: missing },
+    });
+  }
+
+  it.each(["0", "abc", "-5", "600001", "1.5", ""])("refuses %j with a FAIL line that names it, and exits 2", (bound) => {
+    const result = run(bound);
+    expect(result.stderr).toContain("FAIL: GITPULSE_VENDOR_GIT_TIMEOUT_MS=");
+    expect(result.status).toBe(2);
+  });
+
+  it("does not refuse a usable bound", () => {
+    const result = run("5000");
+    expect(result.stderr).not.toContain("GITPULSE_VENDOR_GIT_TIMEOUT_MS");
+    expect(result.stderr).toContain("no DevCouncil checkout");
+    expect(result.status).toBe(1);
   });
 });
 

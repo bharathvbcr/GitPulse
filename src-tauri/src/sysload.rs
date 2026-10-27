@@ -73,20 +73,48 @@ pub use snapshot::{
 
 use serde::{Deserialize, Serialize};
 
-/// CPU time the calling thread has used, immune to how long it waited to run.
-/// For tests whose budget is work, not wall time: a loaded machine stretches
-/// the wall clock by tens of times and the thread's CPU time by almost none.
-#[cfg(test)]
-pub(crate) fn thread_cpu() -> std::time::Duration {
-    try_thread_cpu().expect("the thread CPU clock must be readable")
-}
-
-/// [`thread_cpu`] where the platform may have no per-thread CPU clock (it has
-/// one on macOS and Linux only): `None` there, instead of a panic, for a caller
-/// that must not break a test build on the other targets.
+/// CPU time the calling thread has used, immune to how long it waited to run,
+/// or `None` where the platform has no per-thread CPU clock (it has one on
+/// macOS and Linux only). For tests whose budget is work, not wall time: a
+/// loaded machine stretches the wall clock by tens of times and the thread's CPU
+/// time by almost none. A test that bounds CPU starts with [`clock_or_skip`]
+/// and reads the end of its measurement with [`cpu_since`].
 #[cfg(test)]
 pub(crate) fn try_thread_cpu() -> Option<std::time::Duration> {
     probe::thread_cpu_ns().map(std::time::Duration::from_nanos)
+}
+
+/// The line a CPU-bounded test prints when it cannot measure anything, naming
+/// the test so a skip is visible in the run rather than passing as a check.
+#[cfg(test)]
+fn skip_notice(test: &str) -> String {
+    format!("{test}: skipped, no thread CPU clock on this platform")
+}
+
+/// `clock`, the reading [`try_thread_cpu`] gave, for a test that needs one: a
+/// reading is passed through, and `None` prints [`skip_notice`] and stays
+/// `None`, so the test returns instead of failing or passing unmeasured. Takes
+/// the reading rather than calling the clock so the skip path is checked on any
+/// host, not only one that lacks the clock.
+#[cfg(test)]
+pub(crate) fn clock_or_skip(
+    test: &str,
+    clock: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    if clock.is_none() {
+        eprintln!("{}", skip_notice(test));
+    }
+    clock
+}
+
+/// CPU the calling thread has spent since `started`, a reading [`clock_or_skip`]
+/// returned. A platform's clock is there for the whole run or not at all, so
+/// one that answered at the start and does not now is a fault, not a skip.
+#[cfg(test)]
+pub(crate) fn cpu_since(started: std::time::Duration) -> std::time::Duration {
+    try_thread_cpu()
+        .expect("the thread CPU clock answered at the start of the measurement and not now")
+        - started
 }
 
 /// The environment variable a launched task attempt carries: its run id.
@@ -260,6 +288,41 @@ fn age_ms(written: Clock, now: Clock) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn a_missing_thread_cpu_clock_skips_naming_the_test_on_any_host() {
+        assert_eq!(clock_or_skip("some_test", None), None);
+        let notice = skip_notice("some_test");
+        assert!(notice.starts_with("some_test: skipped"), "{notice}");
+        assert!(notice.contains("no thread CPU clock"), "{notice}");
+    }
+
+    #[test]
+    fn a_thread_cpu_reading_is_never_skipped() {
+        for reading in [
+            Duration::ZERO,
+            Duration::from_nanos(1),
+            Duration::from_secs(3),
+        ] {
+            assert_eq!(clock_or_skip("some_test", Some(reading)), Some(reading));
+        }
+    }
+
+    #[test]
+    fn cpu_since_measures_the_work_between_two_readings() {
+        let Some(started) = clock_or_skip(
+            "cpu_since_measures_the_work_between_two_readings",
+            try_thread_cpu(),
+        ) else {
+            return;
+        };
+        let mut sum = 0u64;
+        while cpu_since(started) < Duration::from_millis(20) {
+            sum = std::hint::black_box(sum.wrapping_add(1));
+        }
+        assert!(cpu_since(started) >= Duration::from_millis(20), "{sum}");
+    }
 
     #[test]
     fn the_four_states_split_exactly_at_their_bounds() {

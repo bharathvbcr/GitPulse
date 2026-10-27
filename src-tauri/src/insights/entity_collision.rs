@@ -2494,12 +2494,16 @@ class C:
     /// work. A loaded host stretches the wall clock of a 50 ms run by tens of
     /// times, and the longer run is the likelier to be descheduled, so a wall
     /// clock turns the 8000-over-4000 ratio into a measurement of the machine.
+    ///
+    /// Only after [`crate::sysload::clock_or_skip`] returned a reading: the
+    /// test that calls it has already returned where there is no clock.
     fn min_of_3(mut f: impl FnMut()) -> std::time::Duration {
         (0..3)
             .map(|_| {
-                let t = crate::sysload::thread_cpu();
+                let t = crate::sysload::try_thread_cpu()
+                    .expect("the test checked for a thread CPU clock before measuring");
                 f();
-                crate::sysload::thread_cpu() - t
+                crate::sysload::cpu_since(t)
             })
             .min()
             .unwrap()
@@ -2507,6 +2511,14 @@ class C:
 
     #[test]
     fn the_join_over_256_symbols_and_4000_hunks_stays_cheap_and_scales_linearly() {
+        if crate::sysload::clock_or_skip(
+            "the_join_over_256_symbols_and_4000_hunks_stays_cheap_and_scales_linearly",
+            crate::sysload::try_thread_cpu(),
+        )
+        .is_none()
+        {
+            return;
+        }
         let symbols: Vec<CodeintelFileSymbol> =
             std::iter::once(sym_q("f", "x.rs::", "File", 1, 2000))
                 .chain((0..255u32).map(|i| {

@@ -18,16 +18,6 @@ fn alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
-fn thread_cpu() -> Duration {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: ts is a valid out-pointer.
-    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
-    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
-}
-
 struct CancelWhenExists(PathBuf);
 impl ProcessObserver for CancelWhenExists {
     fn cancelled(&self) -> bool {
@@ -62,7 +52,10 @@ fn grace_is_bounded_when_stdout_is_closed_and_stderr_floods() {
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("m");
     let script = r#"trap '' TERM; exec 1>&-; touch "$1"; while :; do echo yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy >&2; done"#;
-    let cpu = thread_cpu();
+    // Reported, not asserted: where the platform has no thread CPU clock the
+    // wall-time and `Incomplete` assertions below still run, and the line says
+    // the CPU was not measured.
+    let cpu = crate::sysload::try_thread_cpu();
     let started = Instant::now();
     let run = run_bounded(
         sh(script, &[&marker]),
@@ -72,8 +65,10 @@ fn grace_is_bounded_when_stdout_is_closed_and_stderr_floods() {
     )
     .expect("deadline keeps prefix");
     let wall = started.elapsed();
-    let cpu = thread_cpu() - cpu;
-    eprintln!("wall {wall:?} waiter cpu {cpu:?}");
+    match cpu.map(crate::sysload::cpu_since) {
+        Some(cpu) => eprintln!("wall {wall:?} waiter cpu {cpu:?}"),
+        None => eprintln!("wall {wall:?} waiter cpu not measured, no thread CPU clock"),
+    }
     assert!(
         wall < crate::test_support::coverage_relaxed(Duration::from_millis(300) + BOUND),
         "{wall:?}"

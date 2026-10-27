@@ -7,7 +7,7 @@ use super::*;
 
 use crate::ledger::ids::{iso8601_utc, parse_event_time};
 use crate::ledger::{latest_binding, with_conn};
-use crate::sysload::thread_cpu;
+use crate::sysload::{clock_or_skip, cpu_since, try_thread_cpu};
 
 /// Year 9999: later than any row a test writes, standing in for "now".
 const FOREVER_MS: u64 = 253_402_300_799_999;
@@ -476,16 +476,20 @@ fn ten_thousand_binds_load_and_answer_within_a_pass_budget() {
         Ok(())
     })
     .unwrap();
-    let loaded = thread_cpu();
+    let Some(started) = clock_or_skip(
+        "ten_thousand_binds_load_and_answer_within_a_pass_budget",
+        try_thread_cpu(),
+    ) else {
+        return;
+    };
     let history = BindingHistory::load(&repo, &repo).unwrap();
-    let load = thread_cpu() - loaded;
-    let asked = thread_cpu();
+    let load = cpu_since(started);
     let mut resolved = 0u64;
     for call in 0..1_000_000u64 {
         let at = T0 + (call * 7_919) % 100_000;
         resolved += u64::from(history.as_of(at).task_id().is_some());
     }
-    let ask = thread_cpu() - asked;
+    let ask = cpu_since(started) - load;
     eprintln!("10k binds: load {load:?}, 1M as_of {ask:?}, resolved {resolved}");
     assert_eq!(history.as_of(T0 + 9_999 * 10 + 5), bound("T9999"));
     // CPU time this thread spent, not the wall clock: the budget is about the

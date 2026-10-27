@@ -4856,13 +4856,18 @@ some-future-field whatever
         // a scaled 5 s budget at load 30-60 (1.15 s alone) while the thread
         // did the same work. The wall clock measures the machine's load; the
         // thread's CPU time measures the normalisation.
-        let started = crate::sysload::thread_cpu();
+        let Some(started) = crate::sysload::clock_or_skip(
+            "agent_layout_stays_linear_on_hostile_input",
+            crate::sysload::try_thread_cpu(),
+        ) else {
+            return;
+        };
         for _ in 0..20 {
             for path in &hostile {
                 let _ = agent_layout(path);
             }
         }
-        let elapsed = crate::sysload::thread_cpu() - started;
+        let elapsed = crate::sysload::cpu_since(started);
         assert!(
             elapsed < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(5)),
             "hostile paths took {elapsed:?} of CPU"

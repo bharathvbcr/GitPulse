@@ -110,6 +110,29 @@ export function gitTimeoutMs(env = process.env) {
 }
 
 /**
+ * What a script that finds its sibling checkouts through {@link findSibling}
+ * says, and exits with, when `GITPULSE_VENDOR_GIT_TIMEOUT_MS` is not a usable
+ * bound: the one `FAIL:` line this file's own `main` prints for it, and exit
+ * code 2, or `null` when the setting is fine. `findSibling` only reads the
+ * setting when it falls back to `git`, so a script asks here first, at the top
+ * of its `main`, or a typo goes unnoticed whenever the siblings are found by
+ * walking up.
+ *
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {number | null} the exit code, after printing, or `null`
+ */
+export function refuseBadGitBound(env = process.env) {
+  try {
+    gitTimeoutMs(env);
+    return null;
+  } catch (error) {
+    if (!(error instanceof GitBoundError)) throw error;
+    console.error(`FAIL: ${error.message}`);
+    return 2;
+  }
+}
+
+/**
  * Runs `git` with a bound, and reports a timeout as an error that names the
  * command. Any other failure is the caller's to interpret.
  *
