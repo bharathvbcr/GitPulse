@@ -305,6 +305,11 @@ harness = false
 test = false
 
 [[bench]]
+name = "adv_w4b_fork_aftermath"
+harness = false
+test = false
+
+[[bench]]
 name = "host_load"
 harness = false
 test = false

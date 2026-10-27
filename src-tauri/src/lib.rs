@@ -2,6 +2,8 @@
 // Darwin's, and `pools::current_thread_qos` exists only there.
 #[cfg(all(test, target_os = "macos"))]
 mod adv_w3l2_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod adv_w4b_tests;
 pub mod ai;
 pub mod alerts;
 pub mod analyzer;
