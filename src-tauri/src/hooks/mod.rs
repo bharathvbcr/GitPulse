@@ -2240,7 +2240,8 @@ fn missed_reply(event: &str, drops: &NotifyDrops) -> HookError {
         dropped_scope,
     } = drops.snapshot();
     HookError::Failed(format!(
-        "notification report ({event}) exceeded its deadline; not retried \
+        "notification report ({event}) got no reply (the deadline passed or the peer closed \
+         without one); not retried \
          ({dropped} dropped, scope {dropped_scope})"
     ))
 }
@@ -2477,7 +2478,22 @@ fn exchange(
     let mut reply = Vec::with_capacity(16);
     let read = (&mut stream).take(64).read_to_end(&mut reply);
     match (read, sent) {
+        // The peer is gone and said nothing: no reply came, and none will. Not
+        // confirmed delivered is the one fact the count is about, so it is a
+        // missed reply, like a silent peer that is still there.
+        (Ok(_), Ok(())) if reply.is_empty() => Err(SendError::NoReply),
         (Ok(_), Ok(())) => acknowledged(&reply).map_err(SendError::Failed),
+        (Ok(_), Err(error))
+            if reply.is_empty()
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::NotConnected
+                ) =>
+        {
+            Err(SendError::NoReply)
+        }
         (Ok(_), Err(error)) if reply.is_empty() => {
             Err(SendError::from_io("could not send the report", &error))
         }
@@ -6000,10 +6016,7 @@ done
             Some(Duration::from_secs(30)),
         )
         .expect_err("no reply is not a delivery");
-        assert!(
-            error.to_string().contains("exceeded its deadline"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("got no reply"), "{error}");
         assert_eq!(drops.snapshot().dropped, 1);
         let (release, held) = mpsc::channel::<()>();
         run_notify_within(
@@ -6141,15 +6154,16 @@ done
         );
     }
 
-    /// A peer that closed with nothing to say is a failure that says so, and a
-    /// peer that is still there and silent is a missed reply.
+    /// A peer that closed with nothing to say and a peer that is still there and
+    /// silent are both a missed reply: not confirmed delivered, counted once. A
+    /// peer that closed with a reply is the test above, and is that reply.
     #[cfg(unix)]
     #[test]
-    fn a_closed_peer_with_no_reply_fails_and_a_silent_open_one_is_a_missed_reply() {
+    fn a_closed_peer_with_no_reply_and_a_silent_open_one_are_both_missed_replies() {
         let (hook_end, bridge_end) = std::os::unix::net::UnixStream::pair().unwrap();
         drop(bridge_end);
         let error = exchange(hook_end, "{}", NOTIFY_BUDGET).expect_err("nobody answered");
-        assert!(matches!(error, SendError::Failed(_)), "{error:?}");
+        assert_eq!(error, SendError::NoReply);
 
         let (hook_end, _bridge_end) = std::os::unix::net::UnixStream::pair().unwrap();
         let error = exchange(hook_end, "{}", Duration::from_millis(50))

@@ -39,8 +39,9 @@ pub const TRANSPORT_AVAILABLE: bool = cfg!(unix);
 pub enum SendError {
     /// This platform has no transport for the bridge. Nothing was attempted.
     Unsupported,
-    /// The transport exists and no reply came within its bound. Counted as a
-    /// missed reply by the caller; not confirmed delivered, not retried.
+    /// The transport exists and no reply came: the bound passed, or the peer
+    /// closed without one. Counted as a missed reply by the caller; not
+    /// confirmed delivered, not retried.
     NoReply,
     /// The transport exists and the report was not delivered.
     Failed(String),
