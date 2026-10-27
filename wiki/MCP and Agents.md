@@ -64,6 +64,9 @@ Four properties are deliberate:
 - A report is a closed vocabulary: a protocol version, one of twelve event names, one of six agent names, and an optional session key, working directory and message. Anything else is refused and counted.
 - Reports are rate limited and coalesced per session alongside every other signal, and the most a report can do is raise a banner and focus a terminal tab.
 - The budget is 1.5 s, well inside a host's own hook timeout, and a socket that is not there costs the turn nothing.
+- **A reply that misses its budget is counted, not retried.** The hook gives up at the budget (300 ms for `SessionEnd`, the report that clears a pending approval) and abandons the send; the report may or may not have arrived. The hook process counts it in `dropped` / `dropped_scope` (`this_process`), the shape the ledger uses for its own drops, and says so on stderr. A hook is a one-shot process, so that count is that run's and nothing wider: **no person sees it yet.** Showing it beside "reports accepted" in Settings needs a durable hook-side record and the app's counters (`alerts/bridge.rs`), which this change does not touch.
+
+Where the transport does not exist (Windows has no Unix socket), `notify` reports `unsupported` once per invocation at info and exits 0. That is a third outcome, not a delivery and not a failure; the bridge is not offered on Windows (ft-959d4d26).
 
 Off macOS the report would have nowhere to go even if the socket existed: desktop notifications are a macOS implementation, and every other platform's arm returns `unsupported`. The hooks stay installed and harmless, and GitPulse says so rather than offering a switch that does nothing. See [platform coverage](https://github.com/bharathvbcr/GitPulse/blob/main/docs/QUALIFICATION.md#platform-coverage).
 
@@ -82,6 +85,7 @@ In a checkout bound to a task, both hooks judge writes against the task's plan. 
 One canonical package: [`plugins/gitpulse/`](https://github.com/bharathvbcr/GitPulse/tree/main/plugins/gitpulse)
 
 - Codex: `.codex-plugin/plugin.json` + `.mcp.json`
+- Cursor: `.cursor-plugin/plugin.json` (identity and logo only; no hooks entry, because Cursor's documented plugin `hooks/hooks.json` is a different format from ours and the fields ours rely on are undocumented there: [plugin hooks per agent host](https://github.com/bharathvbcr/GitPulse/blob/main/docs/QUALIFICATION.md#plugin-hooks-per-agent-host))
 - Claude Code compatibility files
 - Agent Plugins 1.0 manifests
 - Shared `skills/`

@@ -88,7 +88,7 @@ collapsing them is how a limitation turns into a surprise:
 | Surface | What happens | Why |
 | --- | --- | --- |
 | Desktop notifications (activity **and** agent sessions) | No banner is delivered; the in-app inbox and the settings counters still work, and the settings panel names the platform rather than showing a dead switch | `workbench::notifications` has a macOS implementation and a `not(target_os = "macos")` arm that returns `unsupported` |
-| Agent hook reports (`gitpulse-hook notify`) | The **Accept reports from agent hooks** switch is disabled and explains why; the hook exits 0 and costs the agent's turn nothing | The bridge is a Unix domain socket. `bridge_supported` is `cfg!(unix)`, and `notify_send` has a `not(unix)` arm |
+| Agent hook reports (`gitpulse-hook notify`) | The **Accept reports from agent hooks** switch is disabled and explains why; the hook exits 0 and costs the agent's turn nothing. It reports the transport as unsupported, once per invocation at info (not a warning), and never as a delivery | The bridge is a Unix domain socket. `bridge_supported` is `cfg!(unix)`, and the `not(unix)` transport returns `SendError::Unsupported` (`hooks/notify_outcome.rs`), a third outcome beside delivered and failed. **Gap:** the bridge is not offered on Windows at all; a Windows transport is a feature, not a fix, and is tracked in ft-959d4d26. The outcome-to-log mapping is tested on every host; the `not(unix)` arm itself was compiled for `x86_64-pc-windows-msvc` from a scratch crate holding that one file, and never run on Windows |
 | Menu-bar status item, macOS menus and appearance, Apple Intelligence enhancements | Hidden rather than removed | Documented in [MACOS_MENUS.md](MACOS_MENUS.md) and [MACOS_APPEARANCE.md](MACOS_APPEARANCE.md) |
 
 On Windows an agent session in a terminal tab therefore still *sounds* — the
@@ -135,6 +135,21 @@ time: the `x86_64-pc-windows-msvc` target fails to cross-check here because
 `libsqlite3-sys` needs a Windows toolchain. Platform-specific code is therefore
 written with `cfg` inversion — a `not(unix)` arm compiled on macOS — rather than
 trusted to a build nobody ran.
+
+### Plugin hooks per agent host
+
+`plugins/gitpulse/hooks/hooks.json` is written in Claude Code's format: PascalCase
+events (`PreToolUse`, `SessionEnd`, `Notification`), each entry a `matcher` and a
+nested `hooks` array of `{type, command, timeout, async}`. Whether another host
+reads that file, and what it makes of it, is a separate question per host.
+
+| Host | State | Evidence |
+| --- | --- | --- |
+| Cursor plugin | **Not shipped, by design: Cursor's documented plugin hooks format differs from ours, and the fields our hooks rely on are not documented for it.** The Cursor manifest (`.cursor-plugin/plugin.json`) carries identity and logo only. | Docs read 2026-10-26, not recalled. <https://cursor.com/docs/reference/plugins>: the plugin tree lists `hooks/` with `hooks.json`; the discovery table gives `Hooks` as `hooks/hooks.json`; the manifest `hooks` field is "Path to hooks config file, or inline hook config", and a manifest path "**replaces** folder discovery for that component". Its example is flat and camelCase: `"afterFileEdit": [ { "command": "./scripts/format-code.sh" } ]`, `"beforeShellExecution": [ { "command": "...", "matcher": "rm\|curl\|wget" } ]`, `"sessionEnd": [ { "command": "./scripts/audit.sh" } ]`. <https://cursor.com/docs/hooks>: "Each definition currently supports a `command` property"; `version` "Must be a positive integer (use `1`)"; other per-script options are `type`, `timeout`, `loop_limit`, `failClosed`, `matcher`; "Plugin hooks run command hooks only"; plugin hooks run from the plugin's install directory (`CURSOR_PLUGIN_ROOT`). <https://cursor.com/docs/reference/third-party-hooks>: Claude Code hooks are read from `.claude/settings.local.json`, `.claude/settings.json` and `~/.claude/settings.json` and their names mapped (`PreToolUse` to `preToolUse`, `SessionEnd` to `sessionEnd`, ...); `Notification` and `PermissionRequest` are "not supported"; the page does not say a plugin's `hooks/hooks.json` is read in Claude's format. |
+| Cursor plugin, the unverified fields | **Unverified** | Not in any page read: whether `async` (five of our entries) is honoured; the unit of `timeout`; whether a plugin `matcher` on `preToolUse` matches Claude's tool names (`Edit`, `MultiEdit`, `NotebookEdit`, `Write`, `Bash`) or Cursor's; whether a plugin's `hooks.json` needs `version` (the plugin example omits it, the project example has it); and what `gitpulse-hook` should print for Cursor's `preToolUse` decision. `Notification`, `PermissionRequest` and `StopFailure` have no Cursor event at all. A Cursor-form file would therefore be a feature with an unverified contract, not a copy of ours. Also unverified: what Cursor does with our Claude-format `hooks/hooks.json`, which sits at the plugin root where its default discovery looks ("Parsed for hook event names"; ours are PascalCase). Setting the manifest `hooks` field would replace that discovery, but the pages read do not say whether an empty inline config is valid. |
+| Codex | **Unverified for hooks.** The Codex manifest and `.mcp.json` ship; no verification of `hooks/hooks.json` under Codex is recorded anywhere in this repository. | `devmap integrate` notes "Codex hooks require trust via `/hooks` after install" (`src-tauri/src/devmap/integrate.rs`). |
+
+An unverified row is not a claim that it works.
 
 ### Native PTY, Linux and macOS hardware runs
 
