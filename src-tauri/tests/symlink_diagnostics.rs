@@ -6,6 +6,7 @@ use common::run_git;
 use gitpulse_lib::engine::git_reader::GitReader;
 
 fn repo() -> tempfile::TempDir {
+    common::unmetered_spawns();
     let dir = tempfile::tempdir().unwrap();
     run_git(dir.path(), &["init"]);
     run_git(dir.path(), &["config", "commit.gpgsign", "false"]);

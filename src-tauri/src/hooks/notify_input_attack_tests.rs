@@ -328,7 +328,11 @@ fn digest_separates_one_from_one_point_zero_and_ignores_key_order() {
 }
 
 /// Cost: a 5 MiB `tool_input` (a Write of a big file) through the new reader.
-/// Bounded in time; prints the figure.
+/// Bounded in work, not in wall time: the whole reader (the read and the parse,
+/// on the worker thread `within_budget` runs them on) is timed as the CPU that
+/// worker spent, which a loaded host barely stretches, where its wall clock has
+/// been stretched past the budget by tens of times. A CPU spin anywhere in the
+/// reader, as well as a slow parse, fails it.
 #[test]
 fn a_five_mib_tool_input_costs_well_under_the_hook_timeout() {
     let body = json!({
@@ -337,13 +341,26 @@ fn a_five_mib_tool_input_costs_well_under_the_hook_timeout() {
         "tool_response": {"ok": true},
     })
     .to_string();
+    if crate::sysload::try_thread_cpu().is_none() {
+        // No per-thread CPU clock on this platform (there is one on macOS and
+        // Linux): the work of the reader is not measurable, and this says so
+        // instead of passing.
+        eprintln!("5 MiB tool_input: skipped, no thread CPU clock on this platform");
+        return;
+    }
     let mut best = Duration::MAX;
     for _ in 0..5 {
-        let started = Instant::now();
+        // Cleared first, so a reading that never arrives (the reader no longer
+        // runs on `within_budget`'s worker, or the seam stopped recording)
+        // cannot be mistaken for the previous round's.
+        super::LAST_WORKER_CPU.set(None);
         let input = new_path(body.as_bytes()).unwrap();
-        best = best.min(started.elapsed());
         assert_eq!(input.tool_subject.len(), 16);
+        let cpu = super::LAST_WORKER_CPU.get().expect(
+            "the reader reported no worker CPU although this platform has a thread CPU clock",
+        );
+        best = best.min(cpu);
     }
-    eprintln!("5 MiB tool_input: min of 5 = {best:?}");
+    eprintln!("5 MiB tool_input: min of 5 = {best:?} of worker CPU");
     assert!(best < Duration::from_millis(1_000), "{best:?}");
 }

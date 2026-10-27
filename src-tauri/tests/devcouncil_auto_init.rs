@@ -45,6 +45,8 @@ fn one_live_build_at_a_time() -> MutexGuard<'static, ()> {
 }
 
 fn git(repo: &Path, args: &[&str]) {
+    // `devmap` reaches the library's git gate in this process.
+    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
     let out = Command::new("git")
         .args(args)
         .current_dir(repo)

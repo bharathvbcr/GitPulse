@@ -14,6 +14,7 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 fn git_repo() -> TempDir {
+    common::unmetered_spawns();
     let dir = TempDir::new().expect("tempdir");
     let status = Command::new("git")
         .args(["init", "-b", "main"])
@@ -34,6 +35,7 @@ fn write(dir: &Path, rel: &str, content: &str) {
 }
 
 fn scan(dir: &Path) -> gitpulse_lib::analyzer::coverage::CoverageReport {
+    common::unmetered_spawns();
     CoverageScanner::scan(dir.to_str().unwrap()).expect("scan should not error")
 }
 

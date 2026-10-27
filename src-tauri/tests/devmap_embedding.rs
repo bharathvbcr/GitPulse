@@ -8,6 +8,7 @@ use std::fs;
 use std::path::Path;
 
 fn repository() -> tempfile::TempDir {
+    common::unmetered_spawns();
     let root = tempfile::tempdir().unwrap();
     let result = std::process::Command::new("git")
         .args(["init", "-b", "main"])

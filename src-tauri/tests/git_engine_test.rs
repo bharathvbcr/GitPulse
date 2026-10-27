@@ -7,6 +7,7 @@ use std::process::Command;
 use tempfile::TempDir;
 
 fn create_temp_git_repo() -> TempDir {
+    common::unmetered_spawns();
     let dir = TempDir::new().expect("Failed to create tempdir");
     let path = dir.path().to_str().unwrap();
 

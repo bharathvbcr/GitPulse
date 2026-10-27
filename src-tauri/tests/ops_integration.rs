@@ -18,6 +18,8 @@ use std::process::Command;
 use tempfile::TempDir;
 
 fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+    // `ops` reaches the library's git gate in this process.
+    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
     Command::new("git")
         .args(args)
         .current_dir(dir)

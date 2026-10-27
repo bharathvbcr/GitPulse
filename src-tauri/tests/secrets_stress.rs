@@ -32,6 +32,7 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 }
 
 fn repo() -> (TempDir, PathBuf) {
+    common::unmetered_spawns();
     let dir = TempDir::new().expect("tempdir");
     common::run_git(dir.path(), &["init", "-q", "-b", "main"]);
     let path = validate_repo(dir.path().to_str().unwrap()).expect("trusted fixture");

@@ -15,6 +15,7 @@ use std::process::Command;
 use tempfile::TempDir;
 
 fn git(dir: &Path, args: &[&str]) {
+    common::unmetered_spawns();
     let out = Command::new("git")
         .args(args)
         .current_dir(dir)

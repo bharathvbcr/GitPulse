@@ -34,6 +34,7 @@ fn git_in(dir: &Path, args: &[&str]) {
 }
 
 fn init_repo() -> TempDir {
+    common::unmetered_spawns();
     let dir = TempDir::new().unwrap();
     git_in(dir.path(), &["init", "-b", "main"]);
     git_in(dir.path(), &["config", "user.name", "GitPulse"]);

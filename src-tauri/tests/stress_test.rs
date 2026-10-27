@@ -11,6 +11,7 @@ use std::process::Command as StdCommand;
 use std::time::Instant;
 
 fn init_repo_with_base_file() -> tempfile::TempDir {
+    common::unmetered_spawns();
     let dir = tempfile::TempDir::new().expect("tempdir");
     let git = |args: &[&str]| {
         let out = StdCommand::new("git")
@@ -655,6 +656,7 @@ fn entries_named(root: &std::path::Path, name: &str, found: &mut Vec<std::path::
 /// any layer ever ran it through a shell.
 #[test]
 fn shell_metacharacter_ref_names_are_inert_through_the_git_writer() {
+    common::unmetered_spawns();
     let repo = init_repo_with_base_file();
     let path = repo
         .path()
@@ -847,6 +849,7 @@ fn test_stack_tree_cyclic_ancestry_safety() {
 /// command exists to avoid.
 #[test]
 fn commit_file_diff_stays_scoped_on_a_5000_file_commit() {
+    common::unmetered_spawns();
     let dir = tempfile::TempDir::new().expect("tempdir");
     let git = |args: &[&str]| {
         let out = StdCommand::new("git")
@@ -926,6 +929,7 @@ fn commit_file_diff_stays_scoped_on_a_5000_file_commit() {
 /// once the lock is released, and not leak the stale lock itself.
 #[test]
 fn discard_changes_reports_err_while_index_lock_is_held_and_recovers() {
+    common::unmetered_spawns();
     let dir = init_repo_with_base_file();
     let path = dir.path().to_str().unwrap().to_string();
 

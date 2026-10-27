@@ -16,6 +16,7 @@ use std::path::Path;
 use std::process::Command;
 
 fn repo() -> tempfile::TempDir {
+    common::unmetered_spawns();
     let dir = tempfile::tempdir().expect("tempdir");
     run_git(dir.path(), &["init", "-q", "-b", "main"]);
     run_git(dir.path(), &["config", "commit.gpgsign", "false"]);

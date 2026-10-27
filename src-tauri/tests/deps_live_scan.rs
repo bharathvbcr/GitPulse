@@ -14,6 +14,7 @@ use std::process::Command;
 use tempfile::TempDir;
 
 fn git_repo() -> TempDir {
+    common::unmetered_spawns();
     let dir = TempDir::new().expect("tempdir");
     let status = Command::new("git")
         .args(["init", "-b", "main"])

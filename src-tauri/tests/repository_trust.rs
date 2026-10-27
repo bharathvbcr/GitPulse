@@ -15,6 +15,10 @@ use std::path::Path;
 use std::process::Command;
 
 fn git(repo: &Path, args: &[&str]) {
+    // This suite is about trust admission, which is decided before the spawn
+    // gate; a loaded parallel run must not defer a fixture's read at the gate
+    // and fail it for a reason that is not trust.
+    git_cli::run_process_with_unlimited_spawn_rate();
     let output = Command::new("git")
         .args(args)
         .current_dir(repo)

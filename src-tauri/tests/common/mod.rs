@@ -26,6 +26,20 @@ use std::path::Path;
 pub mod env;
 use std::process::Command;
 
+/// Lifts the spawn rate cap for this test process, so a fixture that reaches
+/// the library's git gate is not deferred by it.
+///
+/// A `tests/*.rs` crate links the library without `cfg(test)`, so it runs under
+/// the production spawn rate: a 192-token burst a loaded parallel run drains,
+/// which defers a `GitReader` call mid-test ("local bucket: 0 token(s)") for a
+/// reason that has nothing to do with the code under test. Call it first in
+/// every fixture entry point of a suite that calls the library in-process.
+/// Order-independent and idempotent. Not for the suites that measure the gate
+/// itself (`tests/process_admission.rs` lists them).
+pub fn unmetered_spawns() {
+    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+}
+
 /// Runs `git` in `cwd` and asserts it succeeded.
 ///
 /// Identity is supplied to setup commands and persisted after initialization
