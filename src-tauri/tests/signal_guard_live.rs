@@ -5,7 +5,12 @@
 //!
 //! 1. **It picks the same processes `pgrep` does** for the same arguments —
 //!    including the arguments macOS reads differently from what a person means,
-//!    where an option after the first operand is another pattern.
+//!    where an option after the first operand is another pattern. On Linux the
+//!    same holds where the guard and the tool read a command the same way. Where
+//!    the guard deliberately counts more (an option after the first operand,
+//!    which procps reads as an option and macOS as a pattern, and a name whose
+//!    `argv[0]` differs from the executable's) it is held to reaching at least
+//!    what `pgrep` reaches, and the difference is asserted to be there.
 //! 2. **It is safe to run many at once**, as several agents' hooks are.
 //! 3. **It stays inside its deadline** on a table of this machine's size.
 
@@ -20,20 +25,141 @@ mod marked_children;
 
 use gitpulse_lib::hooks::signal_guard::{check_command, live_match_pids};
 use gitpulse_lib::procguard::LockedSpawn;
-use marked_children::{pgrep, Marked};
+use marked_children::Marked;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
+
+/// The real `pgrep`, read-only, with exactly the arguments given. The pid is
+/// the first word of each line: procps `-a` is `--list-full` and prints
+/// `<pid> <command line>`, where a word of the command line (`600`) is not a
+/// pid, while macOS `-a` prints bare pids.
+fn pgrep(args: &[&str]) -> Vec<i32> {
+    let output = std::process::Command::new("/usr/bin/pgrep")
+        .args(args)
+        .output_locked()
+        .expect("run pgrep");
+    let mut pids: Vec<i32> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+        .collect();
+    pids.sort_unstable();
+    pids
+}
+
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
+#[cfg(target_os = "linux")]
+use std::process::{Child, Command, Stdio};
+
+#[cfg(not(target_os = "linux"))]
+use Marked as Sleepers;
+/// The sleepers the equivalence cases run against. On macOS that is
+/// [`Marked`]: `pgrep` matches `argv[0]`, which is the marker. On Linux procps
+/// matches `comm`, the name of the executable file, so [`Marked`] children are
+/// all `sleep` there; [`NamedSleepers`] are sleepers whose `comm` is their
+/// marker, where the guard's name match and the tool's are the same set.
+#[cfg(target_os = "linux")]
+use NamedSleepers as Sleepers;
+
+/// Sleepers whose kernel name is their marker: each is `/bin/sleep` run
+/// through a symlink named by the marker, with the marker as `argv[0]` too.
+/// The marker is at most 15 bytes so `comm` is not cut.
+#[cfg(target_os = "linux")]
+struct NamedSleepers {
+    marker: String,
+    dir: std::path::PathBuf,
+    children: Vec<Child>,
+}
+
+#[cfg(target_os = "linux")]
+impl NamedSleepers {
+    fn spawn(count: usize) -> Self {
+        static SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let marker = format!(
+            "gp{:x}n{:x}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        assert!(marker.len() <= 15, "{marker} would be cut as a comm");
+        let dir = std::env::temp_dir().join(format!("gpsg-{marker}"));
+        std::fs::create_dir_all(&dir).expect("a directory for the symlink");
+        let link = dir.join(&marker);
+        std::os::unix::fs::symlink("/bin/sleep", &link).expect("link sleep under the marker");
+        let children = (0..count)
+            .map(|_| {
+                Command::new(&link)
+                    .arg0(&marker)
+                    .arg("600")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn_locked()
+                    .expect("spawn a named sleeper")
+            })
+            .collect::<Vec<_>>();
+        let sleepers = Self {
+            marker,
+            dir,
+            children,
+        };
+        let started = Instant::now();
+        while started.elapsed() < hermetic_env::coverage_relaxed(Duration::from_secs(20)) {
+            if pgrep(&["-x", &sleepers.marker]).len() == count {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        sleepers
+    }
+
+    fn pids(&self) -> Vec<i32> {
+        let mut pids: Vec<i32> = self
+            .children
+            .iter()
+            .filter_map(|c| i32::try_from(c.id()).ok())
+            .collect();
+        pids.sort_unstable();
+        pids
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for NamedSleepers {
+    fn drop(&mut self) {
+        for child in &mut self.children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
 
 fn user_id() -> String {
     // SAFETY: `getuid` has no preconditions and cannot fail.
     unsafe { libc::getuid() }.to_string()
 }
 
-fn cases(marker: &str) -> Vec<Vec<String>> {
+/// One set of `pgrep` arguments. `late` is set when an option follows the
+/// first operand: procps reads it as an option, macOS as one more pattern, and
+/// on Linux the guard counts what either reading would.
+struct Case {
+    args: Vec<String>,
+    late: bool,
+}
+
+fn cases(marker: &str) -> Vec<Case> {
     let uid = user_id();
     let upper = marker.to_ascii_uppercase();
-    let case = |args: &[&str]| args.iter().map(|a| (*a).to_string()).collect::<Vec<_>>();
-    vec![
+    let case = |args: &[&str]| Case {
+        args: args.iter().map(|a| (*a).to_string()).collect::<Vec<_>>(),
+        late: false,
+    };
+    let late = |args: &[&str]| Case {
+        late: true,
+        ..case(args)
+    };
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut cases = vec![
         case(&[marker]),
         case(&["-f", marker]),
         case(&["-fx", &format!("{marker} 600")]),
@@ -59,19 +185,34 @@ fn cases(marker: &str) -> Vec<Vec<String>> {
         case(&["-f", &format!("^{marker} 6")]),
         case(&["-P", &std::process::id().to_string(), marker]),
         case(&["-a", "-f", marker]),
-        // `-a` puts this process's ancestors back in the answer, and they are
-        // not marked, so a guard that dropped them differs over the whole table.
+        // `-a` puts this process's ancestors back in the answer on macOS, and
+        // they are not marked, so a guard that dropped them differs over the
+        // whole table. On Linux `-a` only lists, and ancestors are always in.
         case(&["-a", "-u", &uid]),
         // An option after the first operand is one more pattern, OR'd with it:
         // the shape of the incident. These select by something other than the
         // marker, so they run over the whole table, which other sessions keep
         // changing; `unexplained` is what tells that churn from a real difference.
-        case(&["-f", marker, "-u", &uid]),
-        case(&[marker, "-f"]),
-        case(&["-f", "600", "-x"]),
+        late(&["-f", marker, "-u", &uid]),
+        late(&[marker, "-f"]),
+        late(&["-f", "600", "-x"]),
         case(&["-v", "-f", marker]),
         case(&["-u", &uid]),
-    ]
+    ];
+    // Spellings only procps has: long options (a macOS `pgrep` has none, and
+    // the guard's macOS reading calls them illegal options), a signal-free
+    // `--euid`, and the empty pattern, which matches every process there.
+    #[cfg(target_os = "linux")]
+    cases.extend([
+        case(&["--full", marker]),
+        case(&["--ignore-case", "--exact", &upper]),
+        case(&["--euid", &uid, "--full", marker]),
+        case(&["--uid=0", "--full", marker]),
+        case(&["--inverse", "--full", marker]),
+        case(&["--ignore-case", &upper]),
+        case(&[""]),
+    ]);
+    cases
 }
 
 /// What identifies a process across two reads of the table: when it started
@@ -207,23 +348,30 @@ fn ask(argv: &[&str], known: &Snapshot) -> (BTreeSet<i32>, BTreeSet<i32>) {
     (wanted, got.into_iter().collect())
 }
 
-/// Whether the guard is held to `pgrep`'s exact answer on this platform. It
-/// models the macOS tools, which match a name against `argv[0]`'s last
-/// component. Linux procps matches the kernel's 15-character `comm` instead,
-/// so a long name `pgrep` cannot see is one the guard still counts: there it is
-/// held only to reaching at least every process `pgrep` reaches, the direction
-/// that can never let a signal through unasked.
-const EXACT: bool = cfg!(target_os = "macos");
+/// Whether a case is held to `pgrep`'s exact answer. Every one is, except on
+/// Linux where an option follows the first operand: procps reads it as an
+/// option, macOS as one more pattern, and the guard counts what either reading
+/// would signal, so there it is held to reaching at least every process
+/// `pgrep` reaches, the direction that can never let a signal through unasked.
+fn exact(case: &Case) -> bool {
+    !(cfg!(target_os = "linux") && case.late)
+}
 
 #[test]
 fn the_guard_picks_exactly_the_processes_pgrep_picks() {
-    let marked = Marked::spawn(12);
+    let marked = Sleepers::spawn(12);
     let ours: BTreeSet<i32> = marked.pids().into_iter().collect();
     let own = i32::try_from(std::process::id()).expect("a pid fits an i32");
     let mut failures = Vec::new();
-    for args in cases(&marked.marker) {
-        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        let models_self = argv.iter().any(|a| *a == "-v" || *a == "-a");
+    for case in cases(&marked.marker) {
+        let exact = exact(&case);
+        let argv: Vec<&str> = case.args.iter().map(String::as_str).collect();
+        // The guard never returns its own pid. macOS `pgrep` leaves out its
+        // ancestors, this process among them, except with `-v` or `-a`; procps
+        // leaves out only itself, so this process is in its answer whenever it
+        // matches, in every case.
+        let models_self =
+            cfg!(target_os = "linux") || argv.iter().any(|a| *a == "-v" || *a == "-a");
         let own_pid = models_self.then_some(own);
         // `pgrep` lists every user's processes; only this user's can be
         // signalled, so those are the ones the guard counts.
@@ -242,12 +390,12 @@ fn the_guard_picks_exactly_the_processes_pgrep_picks() {
         }
         // The marked children live throughout, so they are in or out of both
         // answers together, whatever else is running.
-        let marked_agree = if EXACT {
+        let marked_agree = if exact {
             wanted.intersection(&ours).eq(gotten.intersection(&ours))
         } else {
             wanted.intersection(&ours).all(|pid| gotten.contains(pid))
         };
-        if !EXACT {
+        if !exact {
             differ.retain(|(_, side)| *side == "pgrep");
         }
         // `unexplained` excuses the running process either way, so a guard that
@@ -377,17 +525,151 @@ fn a_disagreement_that_is_asked_again_is_excused_only_if_it_does_not_repeat() {
 
 #[test]
 fn killall_by_name_picks_what_an_exact_name_match_picks() {
-    // macOS killall matches a name exactly against the process name, which is
-    // `pgrep -x`; `killall -d` was read against it by hand and agrees. Linux
-    // `pgrep -x` reads the 15-character `comm` and finds no long name (see
-    // [`EXACT`]), so the equivalence is macOS's; the children are every
-    // platform's answer.
-    let marked = Marked::spawn(5);
+    // killall matches a name exactly against the process name, which is
+    // `pgrep -x`: macOS `killall -d` was read against it by hand and agrees,
+    // and on Linux psmisc and procps both read `comm`, which for these
+    // sleepers is the marker.
+    let marked = Sleepers::spawn(5);
     let got = live_match_pids("killall", &[&marked.marker]).expect("evaluates");
-    if EXACT {
-        assert_eq!(got, pgrep(&["-x", &marked.marker]));
-    }
+    assert_eq!(got, pgrep(&["-x", &marked.marker]));
     assert_eq!(got, marked.pids());
+}
+
+/// Linux procps and psmisc match a name against `comm`, the executable's
+/// name, never `argv[0]`. These sleepers are `sleep` to them and the marker to
+/// the guard's macOS reading; the guard tries both, so what `pgrep` finds by
+/// the executable's name (the login shell `-zsh` is `zsh` to it, the same
+/// shape) is found by the guard, and what only `argv[0]` names is counted
+/// beyond `pgrep`: the direction that never lets a signal through unasked.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_process_whose_argv0_differs_from_its_executable_is_counted_by_either_name() {
+    let marked = Marked::spawn(6);
+    let parent = std::process::id().to_string();
+    let mine: BTreeSet<i32> = marked.pids().into_iter().collect();
+    // Both tools over the children of this process, which is where the
+    // sleepers are (other tests' sleepers are too, all `sleep`).
+    let ask = |name: &[&str]| -> (BTreeSet<i32>, BTreeSet<i32>) {
+        let mut args: Vec<&str> = name.to_vec();
+        args.extend(["-P", &parent]);
+        let wanted = pgrep(&args).into_iter().collect();
+        let got = live_match_pids("pgrep", &args)
+            .expect("the guard evaluates it")
+            .into_iter()
+            .collect();
+        (wanted, got)
+    };
+    // By the executable's name: `pgrep -x sleep` finds all of them, and so
+    // must the guard, whose macOS reading looked at `argv[0]` only and saw none.
+    let (wanted, got) = ask(&["-x", "sleep"]);
+    assert!(mine.is_subset(&wanted), "pgrep -x sleep: {wanted:?}");
+    assert!(
+        wanted.is_subset(&got),
+        "pgrep -x sleep reached {wanted:?}, the guard only {got:?}"
+    );
+    // By `argv[0]`: procps finds none, the guard counts them all.
+    let (wanted, got) = ask(&["-x", &marked.marker]);
+    assert!(wanted.is_empty(), "procps matched argv[0]: {wanted:?}");
+    assert_eq!(got, mine, "the guard also tries argv[0]");
+}
+
+/// A process that is not dumpable (`ssh-agent` marks itself so, set-uid
+/// programs are, `prctl(PR_SET_DUMPABLE, 0)` does it by hand) is still this
+/// user's: `pgrep` reads its uid from `/proc/<pid>/status` and so does the
+/// guard. (The kernel hands the files inside `/proc/<pid>` to root for such a
+/// process but keeps the directory itself the effective uid's, `task_dump_owner`
+/// in `fs/proc/base.c`, so this does not fail on the owner-of-`/proc/<pid>`
+/// read the table used; it pins the behaviour.) The child is this test binary
+/// again, running only the test below that marks itself.
+#[cfg(target_os = "linux")]
+const NON_DUMPABLE_CHILD: &str = "GITPULSE_TEST_NON_DUMPABLE_CHILD";
+
+#[cfg(target_os = "linux")]
+#[test]
+fn non_dumpable_child_body() {
+    if std::env::var_os(NON_DUMPABLE_CHILD).is_none() {
+        return;
+    }
+    // SAFETY: `prctl(PR_SET_DUMPABLE, 0)` takes no pointers and changes only
+    // this process's dumpable flag.
+    let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    assert_eq!(rc, 0, "prctl(PR_SET_DUMPABLE, 0)");
+    std::thread::sleep(Duration::from_secs(600));
+}
+
+#[cfg(target_os = "linux")]
+struct NonDumpable(Child);
+
+#[cfg(target_os = "linux")]
+impl Drop for NonDumpable {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_not_dumpable_process_of_this_user_is_counted() {
+    // SAFETY: `getuid` has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    if uid == 0 {
+        // Root can read every process's files whether or not it is dumpable.
+        eprintln!("skipped: running as root, where dumpable changes nothing visible");
+        return;
+    }
+    let child = NonDumpable(
+        std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args(["--exact", "non_dumpable_child_body", "--test-threads=1"])
+            .env(NON_DUMPABLE_CHILD, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn_locked()
+            .expect("start the not-dumpable child"),
+    );
+    let pid = i32::try_from(child.0.id()).expect("a pid fits an i32");
+    // The child is not dumpable once its own environment is closed to its
+    // own user (the kernel's ptrace check on `/proc/<pid>/environ`).
+    let started = Instant::now();
+    loop {
+        let environ = std::fs::read(format!("/proc/{pid}/environ"));
+        if environ
+            .as_ref()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+        {
+            break;
+        }
+        assert!(
+            started.elapsed() < hermetic_env::coverage_relaxed(Duration::from_secs(30)),
+            "the child never became not dumpable: environ read {:?}",
+            environ.map(|e| e.len())
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Its real, effective and saved uids are still this user's.
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("status");
+    let ids = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "));
+    assert!(
+        ids.as_deref()
+            .is_some_and(|ids| ids.starts_with(&format!("{uid} {uid} {uid}"))),
+        "{ids:?}"
+    );
+    let own = std::process::id().to_string();
+    let uid_text = uid.to_string();
+    for args in [vec!["-P", &own], vec!["-u", &uid_text, "-P", &own]] {
+        let wanted = pgrep(&args);
+        assert!(wanted.contains(&pid), "pgrep {args:?}: {wanted:?}");
+        let got = live_match_pids("pgrep", &args).expect("the guard evaluates it");
+        assert!(
+            got.contains(&pid),
+            "pgrep {args:?} reaches the not-dumpable child {pid}; the guard counted {got:?}"
+        );
+        assert_eq!(got, wanted, "pgrep {args:?}");
+    }
 }
 
 #[test]

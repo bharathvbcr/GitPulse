@@ -339,6 +339,11 @@ pub(crate) trait ProcSource: Send {
     fn fd_path(&self, pid: i32, fd: i32) -> Reading<String>;
     /// The user this process runs as.
     fn me_uid(&self) -> u32;
+    /// A process's real, effective and saved uids, for the signal table. The
+    /// default is "not reported": the scan's one uid stands for all three.
+    fn creds(&self, _pid: i32) -> Option<Creds> {
+        None
+    }
 }
 
 /// Launched and observed sessions of one kind.
@@ -1304,7 +1309,13 @@ pub(crate) fn cwd_of(pid: i32) -> Option<PathBuf> {
 pub struct TableRow {
     pub pid: i32,
     pub ppid: i32,
+    /// The effective uid (what `pgrep -u` matches). Where the OS reports only
+    /// one id, that one, and [`TableRow::ruid`] / [`TableRow::suid`] are `None`.
     pub uid: u32,
+    /// The real uid, when the OS reported it (`Uid:` in `/proc/<pid>/status`).
+    pub ruid: Option<u32>,
+    /// The saved set-user-id, when the OS reported it.
+    pub suid: Option<u32>,
     /// Microseconds since the Unix epoch; 0 when the OS would not say.
     pub start_us: u64,
     /// The process name the OS reports.
@@ -1321,6 +1332,48 @@ pub struct TableRow {
     pub hosted: bool,
 }
 
+impl TableRow {
+    /// The real uid; the effective one when the OS did not report it.
+    pub fn real_uid(&self) -> u32 {
+        self.ruid.unwrap_or(self.uid)
+    }
+
+    /// The saved set-user-id; the effective uid when the OS did not report it.
+    pub fn saved_uid(&self) -> u32 {
+        self.suid.unwrap_or(self.uid)
+    }
+}
+
+/// The three ids `kill(2)` and `pgrep` tell apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Creds {
+    pub real: u32,
+    pub effective: u32,
+    pub saved: u32,
+}
+
+impl Creds {
+    fn any_is(&self, uid: u32) -> bool {
+        self.real == uid || self.effective == uid || self.saved == uid
+    }
+}
+
+/// The `Uid:` line of `/proc/<pid>/status` (`real effective saved filesystem`),
+/// which the kernel fills from the process's credentials. Unlike the owner of
+/// `/proc/<pid>`, which the kernel makes root's for a process that is not
+/// dumpable (`ssh-agent`, a set-uid program, `prctl(PR_SET_DUMPABLE, 0)`), it
+/// is the user the process runs as. `None` when the line is absent or short.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn parse_status_uids(status: &str) -> Option<Creds> {
+    let line = status.lines().find_map(|l| l.strip_prefix("Uid:"))?;
+    let mut ids = line.split_whitespace().map(|v| v.parse::<u32>().ok());
+    Some(Creds {
+        real: ids.next()??,
+        effective: ids.next()??,
+        saved: ids.next()??,
+    })
+}
+
 /// The whole table, with the user it was read as.
 #[derive(Debug, Clone)]
 pub struct Table {
@@ -1331,7 +1384,9 @@ pub struct Table {
 impl Scanner {
     /// Reads the whole table once as [`TableRow`]s. The arguments are not part
     /// of a scan's identities (only memguard's are kept), so `argv_of` supplies
-    /// them, for this user's processes only.
+    /// them, for this user's processes only. Where the OS reports a process's
+    /// real, effective and saved uids they replace the single uid a scan
+    /// carries, which on Linux is the owner of `/proc/<pid>`.
     pub(crate) fn table(
         &mut self,
         mut argv_of: impl FnMut(i32) -> Option<Vec<String>>,
@@ -1347,20 +1402,22 @@ impl Scanner {
             .facts
             .iter()
             .enumerate()
-            .map(|(i, f)| TableRow {
-                pid: f.pid,
-                ppid: f.ppid,
-                uid: f.uid,
-                start_us: f.start_us,
-                name: f.ident.name.clone(),
-                exec: f.ident.exec.clone(),
-                argv: if f.uid == me_uid {
-                    argv_of(f.pid)
-                } else {
-                    None
-                },
-                agent: f.ident.kind,
-                hosted: self.tree_of.get(i).copied().flatten().is_some(),
+            .map(|(i, f)| {
+                let creds = self.source.creds(f.pid);
+                let mine = f.uid == me_uid || creds.is_some_and(|c| c.any_is(me_uid));
+                TableRow {
+                    pid: f.pid,
+                    ppid: f.ppid,
+                    uid: creds.map_or(f.uid, |c| c.effective),
+                    ruid: creds.map(|c| c.real),
+                    suid: creds.map(|c| c.saved),
+                    start_us: f.start_us,
+                    name: f.ident.name.clone(),
+                    exec: f.ident.exec.clone(),
+                    argv: if mine { argv_of(f.pid) } else { None },
+                    agent: f.ident.kind,
+                    hosted: self.tree_of.get(i).copied().flatten().is_some(),
+                }
             })
             .collect();
         Ok(Table { rows, me_uid })
@@ -2172,6 +2229,11 @@ mod os {
 
         fn me_uid(&self) -> u32 {
             self.me
+        }
+
+        fn creds(&self, pid: i32) -> Option<super::Creds> {
+            let raw = read_bounded(&format!("/proc/{pid}/status"), 8192).ok()?;
+            super::parse_status_uids(&String::from_utf8_lossy(&raw))
         }
     }
 
@@ -3428,5 +3490,135 @@ pub(crate) mod tests {
         }));
         let error = scan.table(|_| None).expect_err("a refused read");
         assert!(error.contains("the kernel said no"), "{error}");
+    }
+
+    #[test]
+    fn the_uid_line_of_proc_status_gives_real_effective_and_saved() {
+        let status = "Name:\tssh-agent\nUmask:\t0077\nState:\tS (sleeping)\n\
+                      Uid:\t1001\t1002\t1003\t1002\nGid:\t1001\t1001\t1001\t1001\n";
+        assert_eq!(
+            parse_status_uids(status),
+            Some(Creds {
+                real: 1001,
+                effective: 1002,
+                saved: 1003
+            })
+        );
+        for bad in [
+            "",
+            "Name:\tx\n",
+            "Uid:\n",
+            "Uid:\t1\t2\n",
+            "Uid:\t1\tx\t3\t4\n",
+            "Uid:\t-1\t2\t3\t4\n",
+        ] {
+            assert_eq!(parse_status_uids(bad), None, "{bad:?}");
+        }
+    }
+
+    /// A source that reports credentials for some pids.
+    struct WithCreds {
+        inner: Fixture,
+        creds: HashMap<i32, Creds>,
+    }
+
+    impl ProcSource for WithCreds {
+        fn read(&mut self, out: &mut Vec<ProcFacts>) -> Result<(), String> {
+            self.inner.read(out)
+        }
+        fn cwd(&self, pid: i32) -> Option<PathBuf> {
+            self.inner.cwd(pid)
+        }
+        fn fd_path(&self, pid: i32, fd: i32) -> Reading<String> {
+            self.inner.fd_path(pid, fd)
+        }
+        fn me_uid(&self) -> u32 {
+            self.inner.me_uid()
+        }
+        fn creds(&self, pid: i32) -> Option<Creds> {
+            self.creds.get(&pid).copied()
+        }
+    }
+
+    /// The kernel makes `/proc/<pid>` root's for a process that is not
+    /// dumpable, so a scan sees this user's own process as root's. The signal
+    /// table takes the ids from the credentials instead, and reads the
+    /// arguments of a process that is this user's by them.
+    #[test]
+    fn the_signal_table_takes_uids_from_credentials_not_from_the_proc_directory_owner() {
+        let facts = Arc::new(Mutex::new(facts_of(vec![
+            P {
+                uid: 0,
+                ..p(50, 1, "/usr/bin/ssh-agent")
+            },
+            P {
+                uid: 0,
+                ..p(51, 1, "/usr/libexec/logd")
+            },
+            p(52, 1, "/bin/sleep"),
+        ])));
+        let mut scan = Scanner::new(Box::new(WithCreds {
+            inner: Fixture {
+                facts,
+                cwds: HashMap::new(),
+                fds: HashMap::new(),
+                fail: None,
+            },
+            creds: HashMap::from([
+                (
+                    50,
+                    Creds {
+                        real: ME,
+                        effective: ME,
+                        saved: ME,
+                    },
+                ),
+                (
+                    51,
+                    Creds {
+                        real: 0,
+                        effective: 0,
+                        saved: 0,
+                    },
+                ),
+                (
+                    52,
+                    Creds {
+                        real: ME,
+                        effective: 7,
+                        saved: 9,
+                    },
+                ),
+            ]),
+        }));
+        let table = scan
+            .table(|pid| Some(vec![format!("argv-of-{pid}")]))
+            .expect("the fixture table reads");
+        let row = |pid: i32| table.rows.iter().find(|r| r.pid == pid).unwrap();
+        assert_eq!(row(50).uid, ME, "the owner of /proc/50 was root's");
+        assert_eq!((row(50).ruid, row(50).suid), (Some(ME), Some(ME)));
+        assert!(
+            row(50).argv.is_some(),
+            "this user's, so its arguments are read"
+        );
+        assert_eq!(row(51).uid, 0);
+        assert!(row(51).argv.is_none(), "root's stay unread");
+        assert_eq!(
+            (row(52).uid, row(52).ruid, row(52).suid),
+            (7, Some(ME), Some(9)),
+            "uid is the effective id; the real and saved ids are kept apart"
+        );
+        assert!(
+            row(52).argv.is_some(),
+            "a real uid of this user is this user's"
+        );
+    }
+
+    #[test]
+    fn a_source_that_reports_no_credentials_leaves_the_one_uid_it_has() {
+        let (mut scan, _) = scanner(vec![p(60, 1, "/bin/sleep")]);
+        let table = scan.table(|_| None).expect("reads");
+        assert_eq!(table.rows[0].uid, ME);
+        assert_eq!((table.rows[0].ruid, table.rows[0].suid), (None, None));
     }
 }
