@@ -39,7 +39,7 @@
   import { openExternal } from "../desktop/openExternal";
   import { cardMatchesQuery, parseTaskQuery, queryChips, queryHas, removeQueryTerm, repositoryMatches, toggleQueryTerm, QUERY_HELP, type QueryContext, type SuggestionSources } from "../workbench/taskQuery";
   import { describeMatch, searchCards, type RankContext, type RankedCard, type SearchOrder } from "../workbench/taskRank";
-  import { CANDIDATE_PAGE, bucketByStatus, canLoadMore, candidatesComplete, describeSearch, mergeCandidates, planSearch, type CandidateSet, type SearchPlan } from "../workbench/taskSearchPlan";
+  import { CANDIDATE_PAGE, MAX_CANDIDATES, bucketByStatus, canLoadMore, candidatesComplete, describeSearch, nextCandidates, planSearch, readAllCandidates, reloadCandidates, type CandidateRead, type CandidateSet, type SearchPlan } from "../workbench/taskSearchPlan";
   import TaskSearchField from "./TaskSearchField.svelte";
   import { cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, priorityLabel, reorderPlan, partitionLanes, listRows, sortByPriority, type TaskFacet, type TaskLane } from "../workbench/taskOrganize";
   import { plural } from "../format";
@@ -186,6 +186,8 @@
   let suggestTicket = 0;
   /** The search's candidates; null while the board browses columns. */
   let candidates = $state.raw<CandidateSet | null>(null);
+  /** "Load all tasks" is walking the candidate pages; Stop sets the flag it checks between them. */
+  let loadingAll = $state(false); let stopLoadingAll = false;
   const boardKey = $derived(JSON.stringify([scope, plan.key]));
   /**
    * A new search on the same scope while its candidates load, or a cleared
@@ -603,6 +605,9 @@
    * overwritten by an answer read before it.
    */
   async function loadBoard(target: Scope = scope, current: SearchPlan = plan, quiet = false): Promise<boolean> {
+    // Before the revision moves: a quiet read that bumped it under a running
+    // "Load more" discarded that load's pages and left the board loading.
+    if (quiet && (loading || moving)) return false;
     const generation = ++revision, key = JSON.stringify([target, current.key]), touched = interactions;
     if (!quiet) { loading = true; error = ""; refreshError = false; }
     const stale = () => generation !== revision || disposed || key !== boardKey || (quiet && (loading || moving || touched !== interactions));
@@ -613,14 +618,14 @@
       const archived = listTasks(target, null, "", undefined, 1, { archived: true });
       if (current.mode === "search") {
         // One status-less candidate set, filtered and ranked here, and one
-        // full-text read for the word descriptions may hold (`taskSearchPlan.ts`).
-        const [broad, text, archive] = await Promise.all([
-          listTasks(current.scope, null, "", undefined, CANDIDATE_PAGE, BOARD),
-          current.word ? listTasks(current.scope, null, current.word, undefined, CANDIDATE_PAGE, BOARD) : null,
+        // full-text read for the word descriptions may hold (`taskSearchPlan.ts`),
+        // each re-read as far as the reader had loaded it.
+        const kept = candidates !== null && loadedKey === key ? candidates : null;
+        const [set, archive] = await Promise.all([
+          reloadCandidates((query, cursor) => listTasks(current.scope, null, query, cursor, CANDIDATE_PAGE, BOARD), current.word, kept),
           archived,
         ]);
         if (stale()) return false;
-        const set = mergeCandidates(null, broad, text);
         const pages = bucketByStatus(set.cards);
         candidates = set; columns = keepUnchanged(pages); loadedKey = key; loadedScope = JSON.stringify(target); archivedCount = archive.total;
         // A hidden repository's tasks are not this board's work in progress.
@@ -1181,23 +1186,29 @@
     taskTabs = openTaskTab(taskTabs, { id: task.id, title: task.title, status: task.status, draft: false });
     session = { tabId: task.id, pane: task.id, value: task };
   }
-  /** The next page of a search's candidates (and of its description hits). */
-  async function loadMoreCandidates() {
+  /**
+   * The next page of a search's candidates (and of its description hits), or
+   * with `all` every page after it up to `MAX_CANDIDATES`, drawn as each one
+   * lands. Stop, a new search or a new scope ends an `all` walk between pages.
+   */
+  async function loadMoreCandidates(all = false) {
     const set = candidates, current = plan;
     if (!set || loading || moving || loadedKey !== boardKey || !canLoadMore(set)) return;
     const generation = revision, key = boardKey;
-    interactions++; loading = true; error = ""; refreshError = false;
-    try {
-      const [broad, text] = await Promise.all([
-        set.broad.cursor ? listTasks(current.scope, null, "", set.broad.cursor, CANDIDATE_PAGE, BOARD) : null,
-        set.text?.cursor && current.word ? listTasks(current.scope, null, current.word, set.text.cursor, CANDIDATE_PAGE, BOARD) : null,
-      ]);
-      if (generation !== revision || disposed || key !== boardKey) return;
-      const next = mergeCandidates(set, broad, text);
+    const stale = () => generation !== revision || disposed || key !== boardKey;
+    interactions++; loading = true; loadingAll = all; stopLoadingAll = false; error = ""; refreshError = false;
+    const read: CandidateRead = (query, cursor) => listTasks(current.scope, null, query, cursor, CANDIDATE_PAGE, BOARD);
+    const show = (next: CandidateSet) => {
+      if (stale()) return false;
       candidates = next; columns = bucketByStatus(next.cards);
       announce = `Searched ${next.broad.loaded} of ${next.broad.total} tasks.`;
+      return !stopLoadingAll;
+    };
+    try {
+      if (all) await readAllCandidates(set, current.word, read, show);
+      else show(await nextCandidates(set, current.word, read));
     } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
-    finally { if (generation === revision && !disposed) loading = false; }
+    finally { loadingAll = false; if (generation === revision && !disposed) loading = false; }
   }
   /** Whether a column has cards beyond the loaded ones, so the end of what is loaded is not its end. */
   function tailUnknown(status: TaskStatus): boolean {
@@ -2438,6 +2449,11 @@
         {/if}
         {#if moreCandidates}
           <button type="button" class="gp-btn quick" disabled={loading} onclick={() => void loadMoreCandidates()}>Load more tasks</button>
+          {#if loadingAll}
+            <button type="button" class="gp-btn quick" onclick={() => { stopLoadingAll = true; }}>Stop loading</button>
+          {:else}
+            <button type="button" class="gp-btn quick" disabled={loading} title={`Read every remaining page, ${CANDIDATE_PAGE} tasks at a time, up to ${MAX_CANDIDATES.toLocaleString("en-US")}`} onclick={() => void loadMoreCandidates(true)}>Load all tasks</button>
+          {/if}
         {/if}
         {#if searching && parsedQuery.words}
           <div class="gp-segmented" role="group" aria-label="Order matches">
@@ -2487,7 +2503,11 @@
       <p class="hidden-note" role="status" data-testid="task-hidden-repository-note">
         <EyeOff size={11} />
         {hiddenRepositoryReport.line}
-        {#if moreCandidates && !filtering}<button type="button" class="link" disabled={loading} onclick={() => void loadMoreCandidates()}>Load more tasks</button>{/if}
+        {#if moreCandidates && !filtering}
+          <button type="button" class="link" disabled={loading} onclick={() => void loadMoreCandidates()}>Load more tasks</button>
+          {#if loadingAll}<button type="button" class="link" onclick={() => { stopLoadingAll = true; }}>Stop loading</button>
+          {:else}<button type="button" class="link" disabled={loading} onclick={() => void loadMoreCandidates(true)}>Load all tasks</button>{/if}
+        {/if}
         <button type="button" class="link" onclick={() => interfaceStore.showAllTaskRepositories()}>Show hidden repositories</button>
       </p>
     {/if}

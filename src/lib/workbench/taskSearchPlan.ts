@@ -20,11 +20,21 @@ import { STATUSES, type TaskStatus } from "./vocabulary";
 import { isEmptyQuery, repositoryMatches, type ParsedTaskQuery } from "./taskQuery";
 import { stem, STOPWORDS } from "./taskLexicon";
 import { facetActive, type TaskFacet } from "./taskOrganize";
+import { MAX_COLUMN_PAGES, reloadPaged } from "./boardPaging";
 import { plural } from "../format";
 
-/** One candidate page: the store's maximum. */
+/**
+ * One candidate page: the store's maximum. dc-store clamps `items.list` to
+ * 200 rows (and about 2 MiB) a page, so every task past it is another
+ * request with the cursor the page before it returned.
+ */
 export const CANDIDATE_PAGE = 200;
-/** Where loading more candidates stops; past it the reader narrows instead. */
+/**
+ * Where loading more candidates stops; past it the reader narrows instead.
+ * Every loaded card is drawn (the board does not virtualize) and re-ranked
+ * on each keystroke; ranking is held to a frame budget at this size
+ * (`taskRank.test.ts`), rendering beyond it is not measured.
+ */
 export const MAX_CANDIDATES = 2000;
 
 export interface SearchPlan {
@@ -147,6 +157,52 @@ export function candidatesComplete(set: CandidateSet): boolean {
 /** Whether another page can be read without passing `MAX_CANDIDATES`. */
 export function canLoadMore(set: CandidateSet): boolean {
   return (set.broad.cursor !== null || set.text?.cursor != null) && set.cards.length < MAX_CANDIDATES;
+}
+
+/** One candidate page: `query` is "" for the scope's tasks, or the server word. */
+export type CandidateRead = (query: string, cursor: string | undefined) => Promise<Page<TaskCard>>;
+
+/**
+ * The candidates read again as far as they were loaded (`reloadPaged`), so a
+ * refresh after any write — an agent's over MCP included — keeps the pages
+ * the reader asked for instead of snapping back to the first one.
+ * `MAX_RELOAD_PAGES` pages of `CANDIDATE_PAGE` reach past `MAX_CANDIDATES`.
+ */
+export async function reloadCandidates(read: CandidateRead, word: string | null, previous: CandidateSet | null): Promise<CandidateSet> {
+  const [broad, text] = await Promise.all([
+    reloadPaged((cursor) => read("", cursor), previous?.broad.loaded ?? 0, CANDIDATE_PAGE),
+    word ? reloadPaged((cursor) => read(word, cursor), previous?.text?.loaded ?? 0, CANDIDATE_PAGE) : null,
+  ]);
+  return mergeCandidates(null, broad, text);
+}
+
+/** The next page of each source that has one, folded into `set`. */
+export async function nextCandidates(set: CandidateSet, word: string | null, read: CandidateRead): Promise<CandidateSet> {
+  const [broad, text] = await Promise.all([
+    set.broad.cursor ? read("", set.broad.cursor) : null,
+    set.text?.cursor && word ? read(word, set.text.cursor) : null,
+  ]);
+  return mergeCandidates(set, broad, text);
+}
+
+/**
+ * Every remaining page, one after another, until the scope is loaded or
+ * `MAX_CANDIDATES` is reached. Sequential by necessity — a cursor only comes
+ * back with the page before it — and it keeps the load to one request per
+ * source at a time. `onPage` sees each step as it lands, so the board fills
+ * as it goes; it returns false to stop (the scope changed, or the reader
+ * stopped). A store whose cursors stop advancing ends the walk, and so does
+ * `MAX_COLUMN_PAGES`, so a misbehaving store cannot spin it.
+ */
+export async function readAllCandidates(set: CandidateSet, word: string | null, read: CandidateRead, onPage: (next: CandidateSet) => boolean): Promise<CandidateSet> {
+  let current = set;
+  for (let pages = 0; canLoadMore(current) && pages < MAX_COLUMN_PAGES; pages++) {
+    const next = await nextCandidates(current, word, read);
+    const advanced = next.broad.cursor !== current.broad.cursor || next.text?.cursor !== current.text?.cursor;
+    current = next;
+    if (!onPage(next) || !advanced) break;
+  }
+  return current;
 }
 
 /**
