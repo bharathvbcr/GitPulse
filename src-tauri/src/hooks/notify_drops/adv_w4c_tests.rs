@@ -112,7 +112,7 @@ fn adv_a1_a_name_flipping_to_a_symlink_never_carries_the_chmod_or_the_line_to_th
             let budget = coverage_relaxed(Duration::from_secs(30));
             while !stop.load(Ordering::Acquire) && began.elapsed() < budget {
                 let staged = dir.path().join(format!("staged-{n}"));
-                if n % 2 == 0 {
+                if n.is_multiple_of(2) {
                     std::os::unix::fs::symlink(&victim, &staged).unwrap();
                 } else {
                     put(&staged, b"", 0o644);
@@ -235,11 +235,15 @@ fn adv_a1_a_directory_or_fifo_for_either_generation_is_reported_untouched_and_ne
 
 // Attack 1c: a record this user does not own. The reader must not try to
 // chmod it (it would fail and withhold the count), and must still read it.
-// `/etc/hosts` is root's and 0644 on macOS and Linux.
+// `/etc/hosts` is root's and 0644 on macOS and Linux. CONDITIONAL: a host where
+// it is missing, owned by this user or not readable by others makes this test a
+// no-op, so it is verified on the machine that ran it, not on every runner.
 #[test]
 fn adv_a1_a_generation_another_user_owns_is_read_and_left_alone_by_the_reader() {
     let hosts = Path::new("/etc/hosts");
-    let meta = std::fs::metadata(hosts).expect("/etc/hosts");
+    let Ok(meta) = std::fs::metadata(hosts) else {
+        return;
+    };
     // SAFETY: geteuid has no preconditions and cannot fail.
     if meta.uid() == unsafe { libc::geteuid() } || meta.mode() & 0o044 == 0 {
         return;
@@ -264,7 +268,7 @@ fn adv_a1_a_wide_append_only_record_still_takes_the_line_the_hook_could_write() 
     let socket = socket_in(dir.path());
     let record = record_path(&socket);
     put(&record, b"", 0o644);
-    let _flag = Flagged::new(&record, libc::UF_APPEND as u32);
+    let _flag = Flagged::new(&record, libc::UF_APPEND);
 
     let appended = DropRecord::with_clock(clock).append(&socket, "session_ended", None);
 
@@ -284,7 +288,7 @@ fn adv_a1_a_wide_generation_whose_chmod_is_refused_still_counts_its_lines() {
     let record = record_path(&socket);
     let now = wall();
     put(&record, line(now - HOUR, "session_ended").as_bytes(), 0o644);
-    let _flag = Flagged::new(&record, libc::UF_APPEND as u32);
+    let _flag = Flagged::new(&record, libc::UF_APPEND);
 
     let report = read_record(&socket, now);
 
@@ -301,7 +305,7 @@ fn adv_a1_a_refused_chmod_on_the_reader_is_reported_not_shown_as_a_clean_zero() 
     let record = record_path(&socket);
     let now = wall();
     put(&record, line(now - HOUR, "session_ended").as_bytes(), 0o644);
-    let _flag = Flagged::new(&record, libc::UF_APPEND as u32);
+    let _flag = Flagged::new(&record, libc::UF_APPEND);
 
     let report = read_record(&socket, now);
 
