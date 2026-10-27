@@ -1,7 +1,7 @@
 //! Optional per-user launchd registration. No shell, privileged job or keep-alive.
 //! Registration is a host concern; DevCouncil's policy stays portable.
-#[cfg(any(target_os = "macos", test))]
 use crate::ipc_error::CommandError;
+#[cfg(any(target_os = "macos", test))]
 use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;

@@ -214,7 +214,7 @@ fn the_reflog_spawn_count_is_bounded_and_a_larger_family_is_reported() {
     assert!(!whole.truncated, "{whole:?}");
     // The command-timings bench builds 18 worktrees and refuses a truncated
     // pass. A cap under that makes the bench fail before it measures anything.
-    assert!(
+    const _: () = assert!(
         MAX_REFLOG_WORKTREES >= 18,
         "command_timings fixture does not fit one catch-up pass"
     );
