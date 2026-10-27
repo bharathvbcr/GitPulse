@@ -4856,16 +4856,32 @@ some-future-field whatever
         // a scaled 5 s budget at load 30-60 (1.15 s alone) while the thread
         // did the same work. The wall clock measures the machine's load; the
         // thread's CPU time measures the normalisation.
-        let started = crate::sysload::thread_cpu();
+        // The work runs with or without a clock, so a panic on hostile input
+        // is still seen; only the CPU bound is skipped.
+        let started = crate::sysload::try_thread_cpu();
         for _ in 0..20 {
             for path in &hostile {
                 let _ = agent_layout(path);
             }
         }
-        let elapsed = crate::sysload::thread_cpu() - started;
-        assert!(
-            elapsed < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(5)),
-            "hostile paths took {elapsed:?} of CPU"
+        crate::sysload::if_clock(
+            "agent_layout_stays_linear_on_hostile_input",
+            started.map(crate::sysload::cpu_since),
+            |elapsed| {
+                assert!(
+                    elapsed
+                        < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(5)),
+                    "hostile paths took {elapsed:?} of CPU"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn agent_layout_skips_its_cpu_bound_where_there_is_no_thread_cpu_clock() {
+        crate::sysload::no_clock::assert_skips(
+            "agent_layout_stays_linear_on_hostile_input",
+            agent_layout_stays_linear_on_hostile_input,
         );
     }
 

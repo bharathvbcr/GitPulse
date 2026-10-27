@@ -51,7 +51,7 @@ import { fileURLToPath } from "node:url";
 import { formatUsage, wantsHelp } from "./usage.mjs";
 import { readCliSchema } from "./check-vendor-schema.mjs";
 import { DEFAULT_TIMEOUT_MS, SERVER_BIN, probeServer, resolveOnPath } from "./check-mcp-install.mjs";
-import { findSibling } from "./vendor-crates.mjs";
+import { failOnGitBound, findSibling } from "./vendor-crates.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -496,6 +496,11 @@ export async function main(argv = process.argv.slice(2)) {
     console.error(usage());
     return 2;
   }
+  return failOnGitBound(() => report(args));
+}
+
+/** @param {{ app: string, timeoutMs: number, json: boolean }} args */
+async function report(args) {
   const result = await collect(args);
   if (result.owner === null) {
     if (args.json) console.log(JSON.stringify({ ok: false, error: result.ownerError, rows: [] }));

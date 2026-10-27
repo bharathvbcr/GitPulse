@@ -60,6 +60,16 @@ impl<S: Timed> DeadlineStream<S> {
         &self.stream
     }
 
+    /// Puts both timeouts in force before the first read or write, so a socket
+    /// that cannot take one fails here, with nothing sent, rather than after a
+    /// request is already out. Applies the same tolerance as every operation, so
+    /// a peer that has already closed is not a failure.
+    pub fn arm(&self) -> io::Result<()> {
+        let left = self.remaining()?;
+        apply(self.stream.set_write(Some(left)))?;
+        apply(self.stream.set_read(Some(left)))
+    }
+
     fn remaining(&self) -> io::Result<Duration> {
         let left = self.deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {

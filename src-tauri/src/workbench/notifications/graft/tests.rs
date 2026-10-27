@@ -260,6 +260,118 @@ fn a_server_that_drips_bytes_cannot_stretch_the_budget() {
     );
 }
 
+/// A connected socket whose timeouts can be made to fail, for `converse`: what
+/// it reads is `answer`, what it is written is kept in `written`, and every
+/// timeout it is asked to set is counted in `timeouts_set`.
+struct Scripted {
+    refuse_timeouts_with: Option<std::io::ErrorKind>,
+    timeouts_set: std::cell::Cell<usize>,
+    answer: std::io::Cursor<Vec<u8>>,
+    written: Vec<u8>,
+}
+
+impl Scripted {
+    fn answering(answer: &str, refuse_timeouts_with: Option<std::io::ErrorKind>) -> Self {
+        Self {
+            refuse_timeouts_with,
+            timeouts_set: std::cell::Cell::new(0),
+            answer: std::io::Cursor::new(answer.as_bytes().to_vec()),
+            written: Vec::new(),
+        }
+    }
+    fn set(&self) -> std::io::Result<()> {
+        self.timeouts_set.set(self.timeouts_set.get() + 1);
+        self.refuse_timeouts_with
+            .map_or(Ok(()), |kind| Err(std::io::Error::from(kind)))
+    }
+}
+
+/// Implemented on the borrow so a test keeps the socket after `converse` has
+/// wrapped it, and can read what was written and how many timeouts were set.
+impl crate::deadline::Timed for &mut Scripted {
+    fn set_read(&self, _: Option<Duration>) -> std::io::Result<()> {
+        self.set()
+    }
+    fn set_write(&self, _: Option<Duration>) -> std::io::Result<()> {
+        self.set()
+    }
+}
+
+impl std::io::Read for Scripted {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.answer.read(buf)
+    }
+}
+
+impl std::io::Write for Scripted {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.written.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// macOS refuses a socket timeout with `EINVAL` (`InvalidInput`) once the peer
+/// has closed, which is what a Graft that writes its answer and closes looks
+/// like by the time the timeout is set. That refusal is not a fault: the answer
+/// it left is read. Deterministic where the fake-server race is not: the socket
+/// refuses every timeout, on every host.
+#[test]
+fn a_peer_that_answered_and_closed_before_the_timeout_was_set_still_yields_its_answer() {
+    let mut socket = Scripted::answering(
+        "{\"ok\":true,\"sent\":true}\n",
+        Some(std::io::ErrorKind::InvalidInput),
+    );
+    let outcome = converse(&mut socket, b"request\n", Instant::now() + BUDGET);
+    assert_eq!(outcome, Outcome::Accepted { sent: true });
+    assert_eq!(socket.written, b"request\n", "the request was written");
+    assert!(
+        socket.timeouts_set.get() >= 2,
+        "a timeout was tried for each side"
+    );
+
+    // Closing without an answer is garbled, not a hang and not an I/O fault.
+    let mut closed = Scripted::answering("", Some(std::io::ErrorKind::InvalidInput));
+    assert_eq!(
+        converse(&mut closed, b"request\n", Instant::now() + BUDGET),
+        Outcome::Garbled
+    );
+}
+
+/// Only that one refusal is tolerated: any other failure means the timeout is
+/// not in force, and the exchange stops before it can block.
+#[test]
+fn a_timeout_that_cannot_be_set_for_any_other_reason_is_an_io_failure() {
+    for kind in [
+        std::io::ErrorKind::PermissionDenied,
+        std::io::ErrorKind::BrokenPipe,
+        std::io::ErrorKind::Other,
+    ] {
+        let mut socket = Scripted::answering("{\"ok\":true}\n", Some(kind));
+        assert_eq!(
+            converse(&mut socket, b"request\n", Instant::now() + BUDGET),
+            Outcome::Io,
+            "{kind:?}"
+        );
+        assert!(
+            socket.written.is_empty(),
+            "nothing was sent unbounded: {kind:?}"
+        );
+    }
+}
+
+/// A deadline that has passed is a timeout without touching the socket.
+#[test]
+fn a_deadline_already_past_is_timed_out_without_touching_the_socket() {
+    let mut socket = Scripted::answering("{\"ok\":true}\n", None);
+    let past = Instant::now() - Duration::from_millis(1);
+    assert_eq!(converse(&mut socket, b"request\n", past), Outcome::TimedOut);
+    assert_eq!(socket.timeouts_set.get(), 0);
+    assert!(socket.written.is_empty());
+}
+
 /// Starts a forwarder on `socket` and returns it with the outcomes it reports.
 fn forwarder_on(socket: Option<PathBuf>, capacity: usize) -> (Forwarder, mpsc::Receiver<Outcome>) {
     let (reported, outcomes) = mpsc::channel();
@@ -458,3 +570,5 @@ fn the_process_wide_entry_points_reach_the_socket_named_by_the_environment() {
     }
     assert!(fake.next_request(Duration::from_millis(200)).is_none());
 }
+
+mod adv_w3b_graft_differential;
