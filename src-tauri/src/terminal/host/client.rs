@@ -395,6 +395,10 @@ struct Inner {
     leaving: AtomicBool,
     /// What is wrong with the host, said plainly, when something is.
     trouble: Mutex<Vec<String>>,
+    /// Run once by `adopt`, between its scan of `proxies` and its read of
+    /// `vouched.late`, so a test can confirm a spawn exactly there.
+    #[cfg(test)]
+    adopt_seam: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// The app's handle on the terminal host. Cheap to clone.
@@ -421,6 +425,8 @@ impl HostClient {
                 stall_ms: AtomicU64::new(0),
                 leaving: AtomicBool::new(false),
                 trouble: Mutex::default(),
+                #[cfg(test)]
+                adopt_seam: Mutex::default(),
             }),
         }
     }
@@ -935,6 +941,15 @@ impl Inner {
         lock(&self.events).clone()
     }
 
+    /// Runs the test's hook, if one is set, holding no lock.
+    #[cfg(test)]
+    fn adopt_seam(&self) {
+        let seam = lock(&self.adopt_seam).take();
+        if let Some(seam) = seam {
+            seam();
+        }
+    }
+
     fn adopt_observer(&self, run_id: &str) -> Option<Arc<dyn SessionObserver>> {
         let adopter = lock(&self.adopter).clone()?;
         adopter(run_id)
@@ -1185,16 +1200,27 @@ impl Inner {
             }
             Err(error) => Some(error),
         };
-        let confirmed_meanwhile = lock(&self.vouched).late.clone();
-        let gone: Vec<String> = lock(&self.proxies)
+        // The order of the next two reads is the guard, and must not be
+        // swapped. `spawn` writes `vouched.late` (under `vouched`) before it
+        // clears `proxy.starting` (under `proxies`), so a scan that sees a
+        // proxy not `starting` has, by the `proxies` mutex's release and
+        // acquire, seen that spawn's `late` write too: the read of `late`
+        // after the scan then holds the id. A spawn the scan saw `starting`
+        // is not a candidate, and one that began after it has no proxy in
+        // the scan. `late` cannot lose the id in between: only a reported
+        // exit (which means it is not held) removes it, and the window that
+        // clears it is this `adopt`'s own, open until it returns.
+        let unaccounted: Vec<String> = lock(&self.proxies)
             .iter()
-            .filter(|(id, p)| {
-                !p.starting
-                    && !confirmed_meanwhile.contains(*id)
-                    && !listed.iter().any(|l| &l.id == *id)
-            })
+            .filter(|(id, p)| !p.starting && !listed.iter().any(|l| &l.id == *id))
             .map(|(id, _)| id.clone())
             .collect();
+        #[cfg(test)]
+        self.adopt_seam();
+        let confirmed_meanwhile = lock(&self.vouched).late.clone();
+        let gone = unaccounted
+            .into_iter()
+            .filter(|id| !confirmed_meanwhile.contains(id));
         for id in gone {
             let run_id = lock(&self.proxies).get(&id).and_then(|p| p.run_id.clone());
             self.record_exit(WireEnded {
