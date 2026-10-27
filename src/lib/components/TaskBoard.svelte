@@ -31,7 +31,7 @@
   import { applyMove, moveWrites, navigatorOrder } from "../workbench/workspaceOrder";
   import { importSummary, importTabGroups, tabGroups } from "../workbench/workspaceImport";
   import { workspaceMembershipLabel } from "../workbench/taskRepositories";
-  import { hiddenByRepository, hiddenRepositoryNote, hidesRepositories } from "../workbench/taskHiddenRepositories";
+  import { hiddenByRepository, hiddenRepositoryNote, hiddenRepositoryPhrase, hidesRepositories } from "../workbench/taskHiddenRepositories";
   import { cardsById, contextMenuAnchor, duplicateTitle, flattenVisibleIds, isContextMenuKey, rangeSelect, taskMenuItems, toggleSelection, type TaskMenuItem } from "../workbench/taskMenu";
   import { checkoutCandidates, handoffFromTarget, type HandoffSettings } from "../workbench/taskHandoff";
   import { linkTaskToIssue, MAX_TASK_ISSUE_BATCH, prepareTaskIssues, runTaskIssues, summarizeTaskIssues, taskIssuesConfirmation, type TaskIssueResult, type TaskIssueTarget } from "../workbench/taskIssue";
@@ -485,6 +485,15 @@
   }
   function repoName(id: string) { return repositories.find((repo) => repo.id === id)?.name; }
   const repositoryById = $derived(new Map(repositories.map((repo) => [repo.id, repo])));
+  /** Names of hidden repositories the catalog has loaded, in the stored order. */
+  const hiddenRepositoryLabels = $derived(hiddenRepositories.flatMap((id) => {
+    const name = repositoryById.get(id)?.name?.trim();
+    return name ? [name] : [];
+  }));
+  /** Collapsed heading. Names the repositories; a count only when none of them are loaded. */
+  const hiddenGroupLabel = $derived(hiddenRepositoryLabels.length > 0
+    ? `Hidden · ${hiddenRepositoryPhrase(hiddenRepositoryLabels, hiddenRepositories.length)}`
+    : `Hidden (${hiddenRepositories.length})`);
   const queryContext = $derived<QueryContext>({ repository: (id) => repositoryById.get(id), nowSec: now });
   /** The Filters bar and the search box's filters: what the words are ranked over. */
   function filtersHold(card: TaskCard): boolean {
@@ -550,7 +559,7 @@
   const hiddenRepositoryReport = $derived.by(() => {
     if (!hidingRepositories || !initialized || !candidates || loadedKey !== boardKey) return null;
     const tasks = loadedCards.filter(hiddenHere).length;
-    return { tasks, line: hiddenRepositoryNote({ tasks, repositories: hiddenRepositories.length, complete: candidatesComplete(candidates) }) };
+    return { tasks, line: hiddenRepositoryNote({ tasks, repositories: hiddenRepositories.length, complete: candidatesComplete(candidates) }, hiddenRepositoryLabels) };
   });
   /** Completions for the search box: the loaded values, and every registered repository. */
   const suggestionSources = $derived.by<SuggestionSources>(() => ({
@@ -2299,7 +2308,7 @@
       {#if hiddenRepositories.length}
         {@const expanded = showHiddenRepositories || navFiltering || (scope.kind === "repository" && hiddenRepositorySet.has(scope.id))}
         <div class="nav-heading" data-testid="task-hidden-repositories">
-          <button type="button" class="hidden-toggle" aria-expanded={expanded} aria-controls="task-hidden-repository-rows" onclick={() => { showHiddenRepositories = !expanded; }}>{#if expanded}<ChevronDown size={11} />{:else}<ChevronRight size={11} />{/if}Hidden ({hiddenRepositories.length})</button>
+          <button type="button" class="hidden-toggle" aria-expanded={expanded} aria-controls="task-hidden-repository-rows" onclick={() => { showHiddenRepositories = !expanded; }}>{#if expanded}<ChevronDown size={11} />{:else}<ChevronRight size={11} />{/if}<span class="hidden-label">{hiddenGroupLabel}</span></button>
           <button type="button" class="icon gp-icon-btn" title="Show every hidden repository's tasks on the board" aria-label="Show every hidden repository" onclick={() => interfaceStore.showAllTaskRepositories()}><Eye size={12} /></button>
         </div>
         {#if expanded}
@@ -2836,7 +2845,10 @@
   .navigator.gp-liquid-tabs button.selected{background:transparent}
   .navigator .gp-seg-btn > span:not(:global(.gp-liquid-selection)){display:block;overflow:hidden;text-overflow:ellipsis}
   .nav-heading{position:relative;display:flex;align-items:center;justify-content:space-between;padding:10px 8px 4px;color:rgb(var(--c-text-muted));font-size:10px;font-weight:650;letter-spacing:.04em;text-transform:uppercase}
-  .nav-heading > button,.icon,.nav-row>button:last-child{width:26px;height:26px;padding:0;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center}
+  /* Icon buttons have to beat `.navigator button { width: 100% }`. Show, on a
+     hidden repository, is not the row's last child, so a bare `.icon` rule
+     lost and the button took the row — the name collapsed to nothing. */
+  .nav-heading > button,.nav-row>button:last-child,.navigator button.icon{width:26px;height:26px;padding:0;flex-shrink:0;display:inline-flex;align-items:center;justify-content:center}
   /* Portaled: `fixed` + the popover owner set left/top. Width and height are
      viewport-capped so a long path or a long registered list cannot grow the
      panel off the window the way the old 260px-in-188px absolute menu did.
@@ -2857,7 +2869,9 @@
   .nav-row>button:first-child{min-width:0;flex:1}
   .nav-row .row-action{display:none;flex-shrink:0}
   .nav-row:hover .row-action,.nav-row:focus-within .row-action{display:inline-flex}
-  .navigator .hidden-toggle{display:inline-flex;align-items:center;gap:2px;width:auto;padding:0;font:inherit;letter-spacing:inherit;text-transform:inherit;color:inherit}
+  .navigator .hidden-toggle{display:inline-flex;align-items:center;justify-content:flex-start;gap:2px;width:auto;min-width:0;flex:1;padding:0;overflow:hidden;font:inherit;letter-spacing:inherit;text-transform:inherit;color:inherit}
+  .navigator .hidden-toggle :global(svg){flex-shrink:0}
+  .hidden-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .archive-toggle{display:flex;align-items:center;gap:6px;padding:6px 8px;font-size:11px;color:rgb(var(--c-text-muted))}
   .board-main{flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden}
   header{padding:10px 14px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;border-bottom:1px solid rgb(var(--c-border) / 0.65)}

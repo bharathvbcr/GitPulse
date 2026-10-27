@@ -1190,20 +1190,32 @@ if (params.has("check")) {
     await wait(() => !card("task-3") && Boolean(hiddenRepoNote()));
     check(`hiding a repository takes its tasks off the All board and says so (${hiddenRepoNote()?.textContent.trim()})`,
       !card("task-3") && Boolean(card("task-2")) && Boolean(card("task-1"))
-        && hiddenRepoNote().textContent.includes("1 task from 1 hidden repository is not on this board"));
+        && hiddenRepoNote().textContent.includes("1 task from Manvi is not on this board"));
     check("hiding never asks the store to filter", listQueries.slice(queriesBeforeHide).every(query => !query));
-    check("a hidden repository leaves the list for a collapsed Hidden group",
-      !navRow("repo-1") && root.querySelector('[data-testid="task-hidden-repositories"]')?.textContent.includes("Hidden (1)"));
-    button("Hidden (1)").click(); await settle(100);
+    const hiddenToggle = () => root.querySelector('[data-testid="task-hidden-repositories"] .hidden-toggle');
+    const hiddenLabel = () => hiddenToggle()?.querySelector(".hidden-label");
+    check("a hidden repository leaves the list for a collapsed Hidden group that still names it",
+      !navRow("repo-1")
+        && (hiddenLabel()?.textContent ?? "").includes("Manvi")
+        && (hiddenLabel()?.getBoundingClientRect().width ?? 0) >= 24);
+    hiddenToggle()?.click(); await settle(100);
     check("the Hidden group lists the repository with a way to show it again",
       navRow("repo-1")?.dataset.hidden === "true" && Boolean(navRow("repo-1").querySelector('[data-testid="repository-show"]')));
+    {
+      const nameEl = navRow("repo-1")?.querySelector(".gp-seg-btn span");
+      const showEl = navRow("repo-1")?.querySelector('[data-testid="repository-show"]');
+      const nameWidth = nameEl?.getBoundingClientRect().width ?? 0;
+      const showWidth = showEl?.getBoundingClientRect().width ?? 0;
+      check(`a hidden repository keeps its name beside Show (${Math.round(nameWidth)}px name, ${Math.round(showWidth)}px show)`,
+        (nameEl?.textContent ?? "").includes("Manvi") && nameWidth >= 24 && showWidth > 0 && showWidth <= 36);
+    }
     navRow("repo-1").querySelector("button").click();
     await wait(() => Boolean(card("task-3")) && !card("task-1"));
     check("a hidden repository's own board still shows its tasks", Boolean(card("task-3")) && !hiddenRepoNote());
     await click("Developer tools"); await wait(() => Boolean(card("task-2")) && !card("task-1"));
     check("a workspace board leaves out its hidden repository's tasks too", !card("task-3") && Boolean(hiddenRepoNote()));
     button("All", root.querySelector('nav[aria-label="Task scopes"]'))?.click(); await wait(() => Boolean(card("task-1")));
-    check("the Hidden group stays open once the reader opened it", button("Hidden (1)")?.getAttribute("aria-expanded") === "true");
+    check("the Hidden group stays open once the reader opened it", hiddenToggle()?.getAttribute("aria-expanded") === "true");
     navRow("repo-1").querySelector('[data-testid="repository-show"]').click();
     await wait(() => Boolean(card("task-3")));
     check("Show puts the repository and its tasks back",
@@ -1211,7 +1223,7 @@ if (params.has("check")) {
     navRow("repo-0").querySelector('[data-testid="repository-hide"]').click();
     await wait(() => !card("task-1") && Boolean(hiddenRepoNote()));
     check(`hiding the repository a multi-repository task calls primary hides that task (${hiddenRepoNote()?.textContent.trim()})`,
-      !card("task-1") && !card("task-2") && Boolean(card("task-3")) && hiddenRepoNote().textContent.includes(`${tasks.filter(task => task.primary_repository_id === "repo-0" && !task.archived && !deleted.has(task.id)).length} tasks from 1 hidden repository are not on this board`));
+      !card("task-1") && !card("task-2") && Boolean(card("task-3")) && hiddenRepoNote().textContent.includes(`${tasks.filter(task => task.primary_repository_id === "repo-0" && !task.archived && !deleted.has(task.id)).length} tasks from GitPulse are not on this board`));
     button("Show hidden repositories", hiddenRepoNote()).click();
     await wait(() => Boolean(card("task-1")));
     check("the note's Show hidden repositories brings every task back", Boolean(card("task-1")) && Boolean(card("task-2")) && !hiddenRepoNote());

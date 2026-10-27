@@ -3,6 +3,7 @@ import {
   MAX_HIDDEN_REPOSITORIES,
   hiddenByRepository,
   hiddenRepositoryNote,
+  hiddenRepositoryPhrase,
   hidesRepositories,
   sanitizeHiddenRepositories,
   toggleHiddenRepository,
@@ -79,9 +80,25 @@ describe("hiddenByRepository", () => {
   });
 });
 
+describe("hiddenRepositoryPhrase", () => {
+  it("writes one or two names, and counts the rest", () => {
+    expect(hiddenRepositoryPhrase(["Manvi"], 1)).toBe("Manvi");
+    expect(hiddenRepositoryPhrase(["Manvi", "GitPulse"], 2)).toBe("Manvi and GitPulse");
+    expect(hiddenRepositoryPhrase(["Manvi", "GitPulse", "Jarvis"], 3)).toBe("Manvi, GitPulse and 1 other");
+    expect(hiddenRepositoryPhrase([" Manvi ", "Manvi"], 1)).toBe("Manvi");
+  });
+
+  it("counts a hidden repository whose name is not loaded", () => {
+    expect(hiddenRepositoryPhrase(["Manvi"], 3)).toBe("Manvi and 2 others");
+    expect(hiddenRepositoryPhrase([], 2)).toBe("");
+  });
+});
+
 describe("hiddenRepositoryNote", () => {
   it("names the tasks and repositories kept off the board", () => {
     expect(hiddenRepositoryNote({ tasks: 3, repositories: 1, complete: true })).toBe("3 tasks from 1 hidden repository are not on this board.");
+    expect(hiddenRepositoryNote({ tasks: 3, repositories: 1, complete: true }, ["Manvi"])).toBe("3 tasks from Manvi are not on this board.");
+    expect(hiddenRepositoryNote({ tasks: 1, repositories: 2, complete: true }, ["Manvi", "GitPulse"])).toBe("1 task from Manvi and GitPulse is not on this board.");
   });
 
   it("says when the count covers only the tasks loaded so far", () => {
@@ -90,6 +107,8 @@ describe("hiddenRepositoryNote", () => {
 
   it("still says repositories are hidden when no loaded task belongs to them", () => {
     expect(hiddenRepositoryNote({ tasks: 0, repositories: 2, complete: true })).toBe("2 repositories are hidden; none of this board's tasks belong to them.");
+    expect(hiddenRepositoryNote({ tasks: 0, repositories: 1, complete: true }, ["Manvi"])).toBe("Manvi is hidden; none of this board's tasks belong to it.");
+    expect(hiddenRepositoryNote({ tasks: 0, repositories: 2, complete: false }, ["Manvi", "GitPulse"])).toBe("Manvi and GitPulse are hidden; none of this board's loaded tasks belong to them.");
   });
 });
 

@@ -658,7 +658,7 @@
       }
       check("No unrelated shell was started",report.shellSpawns===0);
       check("The remembered handoff never carries bypass into storage",sanitizeHandoff({provider:"codex",kind:"managed",permission:"bypass"}).permission==="ask");
-      check("No browser runtime errors after every handoff path",report.errors.length===0);
+      check(`No browser runtime errors after every handoff path${report.errors.length?` (${report.errors.join(" | ")})`:""}`,report.errors.length===0);
       document.documentElement.dataset.gpTaskRunsResult="passed";
     }catch(error){
       if(!results.some(row=>row.pass===false))results.push({name:error.message,stack:error.stack,pass:false});
