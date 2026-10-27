@@ -53,13 +53,12 @@ fn adv_l5_a_send_that_panics_is_not_counted_as_a_missed_reply() {
 /// only: `fetch_add` has already wrapped the stored one, so the next snapshot
 /// reads 0 and a count that reached `u64::MAX` reports that nothing was dropped.
 /// Unreachable in a one-shot hook, so this is the claim in the code, not a
-/// production fault. The sink is built at `u64::MAX` by layout (a one-field
-/// wrapper of an `AtomicU64`), as the field is private to its module.
+/// production fault. The count is built at `u64::MAX` through the test
+/// constructor, as its field is private to its module (and no longer the only
+/// one, so it can no longer be built by layout).
 #[test]
 fn adv_l5_the_drop_count_saturates_instead_of_wrapping_to_zero() {
-    // SAFETY: `NotifyDrops` is a one-field tuple struct over `AtomicU64`,
-    // which has the size and bit validity of `u64`.
-    let drops: NotifyDrops = unsafe { std::mem::transmute::<u64, NotifyDrops>(u64::MAX) };
+    let drops = NotifyDrops::starting_at(u64::MAX);
     assert_eq!(drops.snapshot().dropped, u64::MAX);
     drops.record();
     assert_eq!(

@@ -322,7 +322,9 @@ pub fn native_session_key(native: &str) -> Option<&str> {
     ok.then_some(key)
 }
 
-/// What this subsystem did, and did not do, since the app started.
+/// What this subsystem did, and did not do, since the app started — except the
+/// three `hook_*` fields, which read the hook's own record of replies it
+/// stopped waiting for and so reach back before the app started (seven days).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct SessionAlertStatus {
     /// The worker is running and able to receive notices.
@@ -369,6 +371,19 @@ pub struct SessionAlertStatus {
     /// `bridge_rejected` because the report was well formed. Mirrored in
     /// `sessionAlertsStore.ts`, which `check:types` holds to this struct.
     pub stale: u64,
+    /// Hook reports in the last 7 days that got no reply from GitPulse before
+    /// the hook's own deadline, as the hook wrote them down beside the socket
+    /// (`hooks::notify_drops`). The hook's count, never part of
+    /// `bridge_rejected`, and not "lost": the app may have applied a report the
+    /// hook had stopped waiting for. A torn or malformed line still counts. A
+    /// missed `SessionEnd` can leave that agent's banner standing, and hooks do
+    /// not retry. A floor when `hook_drop_record_error` is set.
+    pub hook_replies_missed: u64,
+    /// The newest of them whose line could be read, as `<event> at <UTC time>`.
+    pub hook_reply_missed_last: Option<String>,
+    /// Why that record could not be read in full: unknown is never shown as 0.
+    /// An absent record is 0 with no error.
+    pub hook_drop_record_error: Option<String>,
     pub bridge_listening: bool,
     pub bridge_path: Option<String>,
     pub last_error: Option<String>,
@@ -638,12 +653,48 @@ pub fn session_is_visible(key: &str) -> bool {
         .is_some_and(|visible| visible.iter().any(|seen| seen == key))
 }
 
+/// The hook's record of replies it stopped waiting for, read beside the socket
+/// the bridge is bound to, or the one it would bind when it is not.
+///
+/// The record is a file the hooks write whether or not this process has a hub,
+/// so it is read whatever the hub's state: a worker that never started is
+/// exactly when reports go unanswered.
+fn hook_drop_record(bound: Option<&str>, now_ms: u64) -> crate::hooks::notify_drops::DropReport {
+    match bound
+        .map(std::path::PathBuf::from)
+        .or_else(bridge::socket_path)
+    {
+        Some(socket) => crate::hooks::notify_drops::read_record(&socket, now_ms),
+        None => crate::hooks::notify_drops::DropReport::default(),
+    }
+}
+
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| u64::try_from(since.as_millis()).ok())
+        // An unreadable clock reads as the epoch, so every line is inside the
+        // window: a count that is too high, never one that hides a miss.
+        .unwrap_or(0)
+}
+
 pub fn status() -> SessionAlertStatus {
+    status_from(bridge::status(), unix_now_ms())
+}
+
+/// [`status`] for a bridge state and a clock the caller names.
+fn status_from(bridge: bridge::BridgeStatus, now_ms: u64) -> SessionAlertStatus {
+    let record = hook_drop_record(bridge.path.as_deref(), now_ms);
     let Some(hub) = hub() else {
-        return SessionAlertStatus::default();
+        return SessionAlertStatus {
+            hook_replies_missed: record.missed,
+            hook_reply_missed_last: record.last,
+            hook_drop_record_error: record.error,
+            ..SessionAlertStatus::default()
+        };
     };
     let c = &hub.counters;
-    let bridge = bridge::status();
     SessionAlertStatus {
         running: hub.running.load(Ordering::SeqCst),
         delivered: c.delivered.load(Ordering::Relaxed),
@@ -661,6 +712,9 @@ pub fn status() -> SessionAlertStatus {
         failed: c.failed.load(Ordering::Relaxed),
         bridge_rejected: c.bridge_rejected.load(Ordering::Relaxed),
         stale: c.stale.load(Ordering::Relaxed),
+        hook_replies_missed: record.missed,
+        hook_reply_missed_last: record.last,
+        hook_drop_record_error: record.error,
         bridge_listening: bridge.listening,
         bridge_path: bridge.path,
         last_error: hub
@@ -1227,6 +1281,8 @@ fn prune(now: Instant, tracked: &mut HashMap<String, Tracked>) {
     });
 }
 
+#[cfg(test)]
+mod hook_drop_tests;
 #[cfg(all(test, unix))]
 mod intake_adv_tests;
 #[cfg(all(test, unix))]

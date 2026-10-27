@@ -20,6 +20,7 @@
   import { desktopNotificationsSupported, notificationUnavailableReason } from "../ui/platformCopy";
   import { explainError, nativeNotificationStatus, type NativeNotificationStatus } from "../workbench/client";
   import {
+    hookReplyMisses,
     loadSessionAlerts,
     refreshSessionAlerts,
     saveSessionAlerts,
@@ -73,6 +74,9 @@
   const lost = $derived(
     view.status.dropped_queue + view.status.dropped_scan + view.status.displaced,
   );
+
+  /** The hook's own count of replies it stopped waiting for; see `hookReplyMisses`. */
+  const misses = $derived(hookReplyMisses(view.status));
 
   async function load() {
     if (busy) return;
@@ -217,6 +221,10 @@
         {#if view.status.deferred > 0}
           <p>{view.status.deferred} notifications were delayed by the rate limit and sent when it allowed.</p>
         {/if}
+      {/if}
+      {#if view.bridge_supported}
+        {#if misses.line}<p data-testid="session-alerts-hook-misses">{misses.line}</p>{/if}
+        {#if misses.error}<p role="alert" data-testid="session-alerts-hook-record-error">{misses.error}</p>{/if}
       {/if}
       {#if view.status.last_error}<p role="alert">{view.status.last_error}</p>{/if}
     </div>
