@@ -12,6 +12,7 @@ use crate::engine::remotes;
 use crate::engine::text_shape::{self, LineEnding};
 use crate::graph::lane_solver::RawCommitNode;
 use crate::graph::RefScope;
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -659,7 +660,7 @@ impl GitReader {
     /// of lifting it, so no single request can ask git for an unbounded log.
     pub const MAX_HISTORY_COMMITS: usize = 100_000;
 
-    pub fn list_branches(repo_path: &str) -> Result<Vec<BranchInfo>, String> {
+    pub fn list_branches(repo_path: &str) -> Result<Vec<BranchInfo>, CommandError> {
         let repo = validate_repo(repo_path)?;
         // The default branch follows the primary remote's HEAD, and the
         // primary remote is not always named "origin" (upstream, gitlab,
@@ -773,7 +774,7 @@ impl GitReader {
     /// MAX_BRANCH_STAT_TARGETS branches x 2 git processes. It runs after (not
     /// during) list_branches so the list renders immediately, and memoizes
     /// through the oid-keyed churn cache so repeat calls are cheap.
-    pub fn branch_stats(repo_path: &str) -> Result<BranchStatsReport, String> {
+    pub fn branch_stats(repo_path: &str) -> Result<BranchStatsReport, CommandError> {
         Self::branch_stats_within(
             repo_path,
             deadline_for(Bound::BranchStats, BRANCH_STATS_CALL_BUDGET),
@@ -782,7 +783,10 @@ impl GitReader {
 
     /// [`Self::branch_stats`] with the walking budget named, so a test can
     /// exhaust it without a repository that takes five seconds to walk.
-    fn branch_stats_within(repo_path: &str, budget: Duration) -> Result<BranchStatsReport, String> {
+    fn branch_stats_within(
+        repo_path: &str,
+        budget: Duration,
+    ) -> Result<BranchStatsReport, CommandError> {
         let repo = validate_repo(repo_path)?;
         let DefaultBase {
             remote,
@@ -893,7 +897,7 @@ impl GitReader {
         })
     }
 
-    pub fn head_id(repo_path: &str) -> Result<String, String> {
+    pub fn head_id(repo_path: &str) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
         Ok(
             ref_cache::git_text(&repo, &["refs/heads"], &["rev-parse", "HEAD"])?
@@ -907,7 +911,7 @@ impl GitReader {
     /// (`main`, `master`, `trunk`, `develop`) that exists locally or on that
     /// remote — or `None` when nothing resolves. Config and ref probes only,
     /// no history walk, so the graph load can run it alongside the walk.
-    pub fn default_branch_name(repo_path: &str) -> Result<Option<String>, String> {
+    pub fn default_branch_name(repo_path: &str) -> Result<Option<String>, CommandError> {
         let repo = validate_repo(repo_path)?;
         Ok(default_base(&repo).checked()?.base.map(|(name, _)| name))
     }
@@ -916,7 +920,7 @@ impl GitReader {
         repo_path: &str,
         max_count: usize,
         revision: Option<&str>,
-    ) -> Result<Vec<RawCommitNode>, String> {
+    ) -> Result<Vec<RawCommitNode>, CommandError> {
         // Named scope: stack hierarchies and AI commit-message context are
         // both about the branches a person works on. Machine-written
         // namespaces (agent turn checkpoints, prefetch mirrors) would supply
@@ -952,7 +956,7 @@ impl GitReader {
         revision: Option<&str>,
         path: Option<&str>,
         scope: RefScope,
-    ) -> Result<Vec<RawCommitNode>, String> {
+    ) -> Result<Vec<RawCommitNode>, CommandError> {
         let repo = validate_repo(repo_path)?;
         let count = Self::page_count_limit(max_count);
         let skipped = skip.min(Self::MAX_HISTORY_COMMITS);
@@ -1016,7 +1020,7 @@ impl GitReader {
         revision: Option<&str>,
         spec: Option<&str>,
         scope: RefScope,
-    ) -> Result<Vec<RawCommitNode>, String> {
+    ) -> Result<Vec<RawCommitNode>, CommandError> {
         let count_arg = format!("-n{count}");
         let skip_arg = format!("--skip={skip}");
         let mut args: Vec<&str> = Vec::new();
@@ -1126,7 +1130,7 @@ impl GitReader {
         tips: &[String],
         max_commits: usize,
         deadline: Duration,
-    ) -> Result<FirstParentPass, String> {
+    ) -> Result<FirstParentPass, CommandError> {
         let repo = validate_repo(repo_path)?;
         let mut unique: Vec<&str> = tips.iter().map(String::as_str).collect();
         unique.sort_unstable();
@@ -1136,7 +1140,8 @@ impl GitReader {
                 "{} branch tips exceed the {} one first-parent pass takes",
                 unique.len(),
                 Self::MAX_PASS_TIPS
-            ));
+            )
+            .into());
         }
         for tip in &unique {
             validate_oid(tip)?;
@@ -1166,7 +1171,7 @@ impl GitReader {
     /// already has one, so `status` does not walk `target/` itself.
     pub const STATUS_ARGV: &'static [&'static str] = crate::engine::git_cli::STATUS_ARGV;
 
-    pub fn get_status(repo_path: &str) -> Result<Vec<FileStatus>, String> {
+    pub fn get_status(repo_path: &str) -> Result<Vec<FileStatus>, CommandError> {
         let repo = validate_repo(repo_path)?;
         // -z disables path quoting outright; core.quotepath=off is kept as
         // belt-and-braces so a future non-z invocation still gets raw UTF-8.
@@ -1296,7 +1301,7 @@ impl GitReader {
         repo_path: &str,
         file_path: &str,
         revision: Option<&str>,
-    ) -> Result<Vec<BlameLine>, String> {
+    ) -> Result<Vec<BlameLine>, CommandError> {
         let repo = validate_repo(repo_path)?;
         if let Some(revision) = revision {
             return blame_at_revision(&repo, file_path, revision);
@@ -1362,7 +1367,7 @@ impl GitReader {
             }
         };
         if let Some(reason) = incomplete {
-            return Err(format!("Blame unavailable: {}", reason.describe()));
+            return Err(format!("Blame unavailable: {}", reason.describe()).into());
         }
         Ok(parse_blame_porcelain(&stdout))
     }
@@ -1379,7 +1384,7 @@ impl GitReader {
     /// `core.quotepath=off` delivers raw UTF-8 paths NUL-separated, the same
     /// belt-and-braces pairing as [`GitReader::get_status`], so spaces,
     /// quotes, glob characters, and non-ASCII names survive verbatim.
-    pub fn list_repo_files(repo_path: &str) -> Result<Vec<String>, String> {
+    pub fn list_repo_files(repo_path: &str) -> Result<Vec<String>, CommandError> {
         let repo = validate_repo(repo_path)?;
         let stdout = git_text(
             &repo,
@@ -1397,7 +1402,7 @@ impl GitReader {
         if files.len() > MAX_REPO_FILES {
             return Err(format!(
                 "File explorer unavailable: this repository contains more than {MAX_REPO_FILES} files"
-            ));
+            ).into());
         }
         Ok(files)
     }
@@ -1422,7 +1427,7 @@ impl GitReader {
         file_path: &str,
         is_staged: bool,
         ignore_whitespace: bool,
-    ) -> Result<DiffPayload, String> {
+    ) -> Result<DiffPayload, CommandError> {
         let repo = validate_repo(repo_path)?;
         if is_staged {
             sandbox_join(&repo, file_path)?;
@@ -1452,7 +1457,7 @@ impl GitReader {
     }
 
     /// Every diff read funnels here so no reader can forget the budget.
-    fn capped_diff(repo: &Path, args: &[&str]) -> Result<DiffPayload, String> {
+    fn capped_diff(repo: &Path, args: &[&str]) -> Result<DiffPayload, CommandError> {
         let (text, cut_by_engine) = git_text_capped(repo, args, budget::MAX_DIFF_BYTES)?;
         if let Some(reason) = cut_by_engine {
             // The drain stopped at a byte offset, so the last row is a
@@ -1521,7 +1526,7 @@ impl GitReader {
         repo: &Path,
         commit_id: &str,
         path: &str,
-    ) -> Result<(Vec<String>, Option<String>), String> {
+    ) -> Result<(Vec<String>, Option<String>), CommandError> {
         let mut args = vec!["show", "--name-status", "--diff-filter=RC", "-z"];
         args.extend_from_slice(Self::merge_render_args_here());
         args.push("--format=");
@@ -1533,7 +1538,7 @@ impl GitReader {
         ))
     }
 
-    pub fn get_commit_diff(repo_path: &str, commit_id: &str) -> Result<DiffPayload, String> {
+    pub fn get_commit_diff(repo_path: &str, commit_id: &str) -> Result<DiffPayload, CommandError> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
         Self::capped_diff(&repo, &Self::commit_show_args(commit_id, &[], None))
@@ -1543,7 +1548,7 @@ impl GitReader {
         repo_path: &str,
         commit_id: &str,
         file_path: &str,
-    ) -> Result<DiffPayload, String> {
+    ) -> Result<DiffPayload, CommandError> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
         sandbox_join(&repo, file_path)?;
@@ -1601,7 +1606,11 @@ impl GitReader {
         payload
     }
 
-    pub fn get_range_diff(repo_path: &str, from: &str, to: &str) -> Result<DiffPayload, String> {
+    pub fn get_range_diff(
+        repo_path: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<DiffPayload, CommandError> {
         let repo = validate_repo(repo_path)?;
         validate_ref_name(from)?;
         validate_ref_name(to)?;
@@ -1615,7 +1624,7 @@ impl GitReader {
     pub fn get_commit_files(
         repo_path: &str,
         commit_id: &str,
-    ) -> Result<Vec<CommitFileChange>, String> {
+    ) -> Result<Vec<CommitFileChange>, CommandError> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
         let mut args = vec!["show", "--pretty=format:", "--numstat", "-z"];
@@ -1634,7 +1643,7 @@ impl GitReader {
         repo_path: &str,
         file_path: &str,
         commit_id: Option<&str>,
-    ) -> Result<String, String> {
+    ) -> Result<String, CommandError> {
         let blob = Self::get_file_blob_view(repo_path, file_path, commit_id)?;
         if let Some(text) = blob.text {
             Ok(text)
@@ -1650,7 +1659,7 @@ impl GitReader {
         repo_path: &str,
         file_path: &str,
         commit_id: Option<&str>,
-    ) -> Result<FileBlob, String> {
+    ) -> Result<FileBlob, CommandError> {
         Self::read_file_blob(repo_path, file_path, commit_id, true)
     }
 
@@ -1661,7 +1670,7 @@ impl GitReader {
         repo_path: &str,
         file_path: &str,
         commit_id: Option<&str>,
-    ) -> Result<FileBlob, String> {
+    ) -> Result<FileBlob, CommandError> {
         Self::read_file_blob(repo_path, file_path, commit_id, false)
     }
 
@@ -1670,7 +1679,7 @@ impl GitReader {
         file_path: &str,
         commit_id: Option<&str>,
         with_base: bool,
-    ) -> Result<FileBlob, String> {
+    ) -> Result<FileBlob, CommandError> {
         let repo = validate_repo(repo_path)?;
         sandbox_join(&repo, file_path)?;
         let mut disk_base = None;
@@ -1705,7 +1714,7 @@ impl GitReader {
                         .into_os_string()
                         .into_encoded_bytes()
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(err.into()),
             }
         };
 
@@ -1749,7 +1758,10 @@ impl GitReader {
     /// is kept in [`ref_cache`] and re-selecting the commit spawns nothing. An
     /// abbreviated id is not a stable name (it can become ambiguous as objects
     /// arrive), so it is read every time rather than keyed.
-    pub fn get_commit_details(repo_path: &str, commit_id: &str) -> Result<CommitDetails, String> {
+    pub fn get_commit_details(
+        repo_path: &str,
+        commit_id: &str,
+    ) -> Result<CommitDetails, CommandError> {
         Self::commit_details_capped(repo_path, commit_id, budget::MAX_COMMIT_NUMSTAT_BYTES)
     }
 
@@ -1757,7 +1769,7 @@ impl GitReader {
         repo_path: &str,
         commit_id: &str,
         cap: usize,
-    ) -> Result<CommitDetails, String> {
+    ) -> Result<CommitDetails, CommandError> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
         let mut args = vec!["show", "--numstat", "-z"];
@@ -1784,7 +1796,7 @@ impl GitReader {
         tip_counts_against(&repo, base_oid).map(|counts| counts.len())
     }
 
-    pub fn list_tags(repo_path: &str) -> Result<TagList, String> {
+    pub fn list_tags(repo_path: &str) -> Result<TagList, CommandError> {
         let repo = validate_repo(repo_path)?;
         // A tag row could name a commit but never say where that commit stood.
         // Work parked on a tag (`retired/...`) sits on no branch, so the branch
@@ -1836,7 +1848,10 @@ impl GitReader {
         Ok(TagList { tags, truncated })
     }
 
-    pub fn get_reflog(repo_path: &str, max_entries: usize) -> Result<Vec<ReflogEntry>, String> {
+    pub fn get_reflog(
+        repo_path: &str,
+        max_entries: usize,
+    ) -> Result<Vec<ReflogEntry>, CommandError> {
         Self::get_reflog_within(repo_path, "HEAD", max_entries, None)
     }
 
@@ -1854,7 +1869,7 @@ impl GitReader {
         ref_name: &str,
         max_entries: usize,
         timeout: Option<std::time::Duration>,
-    ) -> Result<Vec<ReflogEntry>, String> {
+    ) -> Result<Vec<ReflogEntry>, CommandError> {
         let repo = validate_repo(repo_path)?;
         validate_ref_name(ref_name)?;
         let limit = format!("-n{}", max_entries.clamp(1, 10_000));
@@ -1923,7 +1938,7 @@ impl GitReader {
     ///
     /// Exit 1 is git's answer "HEAD is detached"; any other failure is a read
     /// that did not happen and is an error, never reported as detached.
-    pub fn current_branch(repo_path: &str) -> Result<Option<String>, String> {
+    pub fn current_branch(repo_path: &str) -> Result<Option<String>, CommandError> {
         head_branch(&validate_repo(repo_path)?)
     }
 
@@ -1931,7 +1946,7 @@ impl GitReader {
     ///
     /// Read-only and ungated: it answers the question the confirmation must
     /// ask before the guarded `cmd_reset` runs.
-    pub fn reset_preview(repo_path: &str, target: &str) -> Result<ResetPreview, String> {
+    pub fn reset_preview(repo_path: &str, target: &str) -> Result<ResetPreview, CommandError> {
         let repo = validate_repo(repo_path)?;
         crate::engine::git_writer::validate_oid_or_revision(target)?;
         let peel = |rev: &str| -> Result<String, String> {
@@ -1946,10 +1961,10 @@ impl GitReader {
         let head = peel("HEAD")?;
         let branch = Self::current_branch(repo_path)?;
 
-        let count = |args: &[&str]| -> Result<usize, String> {
+        let count = |args: &[&str]| -> Result<usize, CommandError> {
             let text = git_text(&repo, args)?;
             git_cli::parse_count_saturating(text.trim())
-                .ok_or_else(|| format!("git rev-list returned an unreadable count: {text}"))
+                .ok_or_else(|| format!("git rev-list returned an unreadable count: {text}").into())
         };
         let not_target = format!("^{target_oid}");
         let leaving_total = count(&["rev-list", "--count", &head, &not_target])?;
@@ -2017,10 +2032,10 @@ impl GitReader {
     /// routinely ask at once, and each used to start its own read of the
     /// whole tree. The key carries the admission class so a reactive caller
     /// never inherits a refusal that only a background leader could get.
-    pub fn get_repo_language_stats(repo_path: &str) -> Result<LanguageStatsReport, String> {
+    pub fn get_repo_language_stats(repo_path: &str) -> Result<LanguageStatsReport, CommandError> {
         type Flights = crate::singleflight::SingleFlight<
             (std::path::PathBuf, git_cli::Admission),
-            Result<LanguageStatsReport, String>,
+            Result<LanguageStatsReport, CommandError>,
         >;
         static FLIGHTS: OnceLock<Flights> = OnceLock::new();
         let repo = validate_repo(repo_path)?;
@@ -2043,7 +2058,7 @@ impl GitReader {
     pub fn get_repo_language_stats_bounded(
         repo_path: &str,
         deadline: Option<Duration>,
-    ) -> Result<LanguageStatsReport, String> {
+    ) -> Result<LanguageStatsReport, CommandError> {
         let started = Instant::now();
         let repo = validate_repo(repo_path)?;
         #[cfg(test)]
@@ -2143,7 +2158,7 @@ impl GitReader {
     pub fn pulse_report(
         repo_path: &str,
         max_commits: Option<usize>,
-    ) -> Result<PulseReport, String> {
+    ) -> Result<PulseReport, CommandError> {
         let started = Instant::now();
         let repo = validate_repo(repo_path)?;
         let has_mailmap = repo.join(".mailmap").is_file();
@@ -2198,7 +2213,7 @@ impl GitReader {
         let (stdout, payload_incomplete) = match log {
             Ok(out) => out,
             Err(e) => {
-                if head_is_unborn(&repo, &e) {
+                if head_is_unborn(&repo, e.message()) {
                     return Ok(PulseReport {
                         commits: Vec::new(),
                         top_files_by_churn: Vec::new(),
@@ -2246,7 +2261,7 @@ impl GitReader {
     /// ordinary `Ok(false)` rather than an error to be interpreted. The
     /// listed path must equal the request: a leaked glob match must not
     /// answer for a different file.
-    pub fn is_tracked(repo_path: &str, file_path: &str) -> Result<bool, String> {
+    pub fn is_tracked(repo_path: &str, file_path: &str) -> Result<bool, CommandError> {
         let repo = validate_repo(repo_path)?;
         let spec = literal_pathspec(file_path);
         let stdout = git_text(&repo, &["ls-files", "-z", "--", spec.as_str()])?;
@@ -2256,7 +2271,7 @@ impl GitReader {
     pub fn knowledge_report(
         repo_path: &str,
         max_files: Option<usize>,
-    ) -> Result<KnowledgeReport, String> {
+    ) -> Result<KnowledgeReport, CommandError> {
         Self::knowledge_report_with(repo_path, max_files, budget::MAX_BLAME_BYTES)
     }
 
@@ -2266,7 +2281,7 @@ impl GitReader {
         repo_path: &str,
         max_files: Option<usize>,
         blame_cap: usize,
-    ) -> Result<KnowledgeReport, String> {
+    ) -> Result<KnowledgeReport, CommandError> {
         let started = Instant::now();
         let repo = validate_repo(repo_path)?;
         let cap = max_files.unwrap_or(128).clamp(1, 512);
@@ -2275,7 +2290,7 @@ impl GitReader {
         // blamed at that oid, so the oid is the content half of the memo key.
         let head = match git_text(&repo, &["log", "-n1", "--format=%H"]) {
             Ok(out) => out.trim().to_string(),
-            Err(e) if head_is_unborn(&repo, &e) => {
+            Err(e) if head_is_unborn(&repo, e.message()) => {
                 return Ok(KnowledgeReport {
                     scanned_files: 0,
                     candidate_files: 0,
@@ -2320,7 +2335,7 @@ impl GitReader {
             Ok((text, complete && mailmap.is_some()))
         })?;
         serde_json::from_str(&answered)
-            .map_err(|e| format!("could not decode the kept ownership report: {e}"))
+            .map_err(|e| format!("could not decode the kept ownership report: {e}").into())
     }
 
     /// Blames the sample of `head`'s files and folds it into the report. The
@@ -2332,7 +2347,7 @@ impl GitReader {
         cap: usize,
         blame_cap: usize,
         started: Instant,
-    ) -> Result<(KnowledgeReport, bool), String> {
+    ) -> Result<(KnowledgeReport, bool), CommandError> {
         let stdout = git_text(repo, &["ls-tree", "-r", "-z", head])?;
         let entries = parse_ls_tree_z(stdout.as_bytes())?;
         // A gitlink is a pointer into another repository: blame cannot read
@@ -2547,7 +2562,10 @@ impl GitReader {
         Ok((report, complete))
     }
 
-    pub fn dora_report(repo_path: &str, window_days: Option<u32>) -> Result<DoraReport, String> {
+    pub fn dora_report(
+        repo_path: &str,
+        window_days: Option<u32>,
+    ) -> Result<DoraReport, CommandError> {
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -2579,7 +2597,7 @@ impl GitReader {
         max_scan_commits: usize,
         now_secs: i64,
         walk: DateWalk,
-    ) -> Result<DoraReport, String> {
+    ) -> Result<DoraReport, CommandError> {
         let repo = validate_repo(repo_path)?;
         let started = Instant::now();
         let window = window_days.unwrap_or(90).clamp(7, 365);
@@ -2596,7 +2614,7 @@ impl GitReader {
         ) {
             Ok(out) => out,
             Err(e) => {
-                if head_is_unborn(&repo, &e) {
+                if head_is_unborn(&repo, e.message()) {
                     return Ok(DoraReport {
                         deploy_frequency_per_week: 0.0,
                         deploy_rating: "Low".to_string(),
@@ -2684,7 +2702,8 @@ impl GitReader {
                         "DORA tag lookup answered {} lines for {} commits",
                         names.len(),
                         commits.len()
-                    ));
+                    )
+                    .into());
                 }
                 for ((_, commit_ts), name) in commits.iter().zip(names) {
                     let tag_ref = name
@@ -2915,7 +2934,7 @@ fn ownership_churn(repo: &Path, head: &str) -> OwnershipChurn {
     let (stdout, cut) = match git_text_capped(repo, &args, budget::MAX_PULSE_BYTES) {
         Ok(out) => out,
         Err(e) => {
-            log::warn!(target: "pulse", "ownership churn for {}: {e}", repo.display());
+            log::warn!(target: "pulse", "ownership churn for {}: {e}", repo.display(), e = e.message());
             return OwnershipChurn {
                 unavailable: true,
                 ..OwnershipChurn::default()
@@ -3155,7 +3174,7 @@ fn dora_commit_scan(
     walk: DateWalk,
     since_secs: i64,
     cap: usize,
-) -> Result<DoraCommitScan, String> {
+) -> Result<DoraCommitScan, CommandError> {
     let parse = |stdout: &str| -> Vec<(String, i64)> {
         stdout
             .lines()
@@ -3225,13 +3244,13 @@ fn dora_commit_scan(
 /// classifier at all; the only evidence is that `HEAD` itself will not resolve
 /// while its branch exists. An unborn branch (ref absent) is a real empty
 /// history and passes.
-fn verify_empty_history_is_real(repo: &Path) -> Result<(), String> {
+fn verify_empty_history_is_real(repo: &Path) -> Result<(), CommandError> {
     match git_text(repo, &["rev-parse", "--verify", "--quiet", "HEAD"]) {
         Ok(_) => Ok(()),
         Err(_) if head_ref_is_absent(repo) => Ok(()),
-        Err(error) => Err(format!(
+        Err(error) => Err(error.wrap(|error| format!(
             "History is empty but HEAD does not resolve: the branch ref is present and unreadable ({error})"
-        )),
+        ))),
     }
 }
 
@@ -3243,7 +3262,12 @@ const DORA_DEADLINE: Duration = Duration::from_secs(60);
 /// step: the report used to swallow it (`unwrap_or_default`), so an empty
 /// answer from a read that never ran looked like a repository with no
 /// commits and published a 0% failure rate and no lead time.
-fn dora_git(repo: &Path, started: Instant, args: &[&str], step: &str) -> Result<String, String> {
+fn dora_git(
+    repo: &Path,
+    started: Instant,
+    args: &[&str],
+    step: &str,
+) -> Result<String, CommandError> {
     let left = DORA_DEADLINE
         .checked_sub(started.elapsed())
         .filter(|left| !left.is_zero())
@@ -3255,8 +3279,8 @@ fn dora_git(repo: &Path, started: Instant, args: &[&str], step: &str) -> Result<
         })?;
     match git_text_with_timeout(repo, args, left) {
         Ok(text) => Ok(text),
-        Err(error) if head_is_unborn(repo, &error) => Ok(String::new()),
-        Err(error) => Err(format!("DORA {step} failed: {error}")),
+        Err(error) if head_is_unborn(repo, error.message()) => Ok(String::new()),
+        Err(error) => Err(error.wrap(|error| format!("DORA {step} failed: {error}"))),
     }
 }
 
@@ -3337,7 +3361,7 @@ fn assemble_pulse_capture(
     stdout: &str,
     incomplete: Option<Incomplete>,
     cap: usize,
-) -> Result<PulseCapture, String> {
+) -> Result<PulseCapture, CommandError> {
     let (mut commits, top_files, extensions) = parse_pulse_stream(stdout);
     let payload_truncated = incomplete.is_some();
     if payload_truncated && !commits.is_empty() {
@@ -3349,7 +3373,7 @@ fn assemble_pulse_capture(
             over_cap: None,
         }) = &incomplete
         {
-            return Err(message.clone());
+            return Err(message.clone().into());
         }
     }
     let commit_capped = commits.len() > cap;
@@ -3515,8 +3539,8 @@ pub(crate) fn resolve_default_remote(repo: &Path) -> String {
 /// produced no answer (config, the current branch, the remote list). The name
 /// is then a guess built from "not set"; a caller guarding a destructive
 /// action refuses on the reason instead of trusting the guess.
-fn default_remote_reads(repo: &Path, reads: Reads) -> (String, Option<String>) {
-    let mut unread: Option<String> = None;
+fn default_remote_reads(repo: &Path, reads: Reads) -> (String, Option<CommandError>) {
+    let mut unread: Option<CommandError> = None;
     // One read of the effective config answers what used to be two
     // `config --get` processes and, usually, `git remote` too.
     let config = match config_snapshot_with(repo, reads) {
@@ -3575,7 +3599,7 @@ fn default_remote_reads(repo: &Path, reads: Reads) -> (String, Option<String>) {
 /// The effective config as `git config --list -z` prints it, last value of a
 /// key winning as it does for `git config --get`. Section and variable names
 /// arrive lowercased; a subsection keeps its case (`branch.Feature.remote`).
-pub(crate) fn config_snapshot(repo: &Path) -> Result<HashMap<String, String>, String> {
+pub(crate) fn config_snapshot(repo: &Path) -> Result<HashMap<String, String>, CommandError> {
     config_snapshot_with(repo, Reads::Cached)
 }
 
@@ -3596,7 +3620,7 @@ enum Reads {
 }
 
 impl Reads {
-    fn head_branch(self, repo: &Path) -> Result<Option<String>, String> {
+    fn head_branch(self, repo: &Path) -> Result<Option<String>, CommandError> {
         match self {
             Self::Cached => head_branch_cached(repo),
             Self::Fresh => head_branch_name(repo),
@@ -3604,7 +3628,10 @@ impl Reads {
     }
 }
 
-fn config_snapshot_with(repo: &Path, reads: Reads) -> Result<HashMap<String, String>, String> {
+fn config_snapshot_with(
+    repo: &Path,
+    reads: Reads,
+) -> Result<HashMap<String, String>, CommandError> {
     let args = ["config", "--list", "-z"];
     let text = match reads {
         Reads::Cached => ref_cache::git_text(repo, &[], &args)?,
@@ -3664,7 +3691,7 @@ pub(crate) fn configured_remote_names(repo: &Path) -> Vec<String> {
 /// The configured remote names read straight from git, never from the cache,
 /// and an unreadable config is an error rather than "no remotes". For a caller
 /// that creates or moves a branch on the answer.
-pub(crate) fn configured_remote_names_fresh(repo: &Path) -> Result<Vec<String>, String> {
+pub(crate) fn configured_remote_names_fresh(repo: &Path) -> Result<Vec<String>, CommandError> {
     config_snapshot_with(repo, Reads::Fresh).map(|config| configured_remotes(&config))
 }
 
@@ -3692,14 +3719,14 @@ pub(crate) struct DefaultBase {
     /// deferred by the spawn gate, killed at its deadline), naming why. The
     /// fields are then a guess built from "not set" readings, so callers go
     /// through [`DefaultBase::checked`] rather than present the guess.
-    pub incomplete: Option<String>,
+    pub incomplete: Option<CommandError>,
 }
 
 impl DefaultBase {
     /// The answer, or the reason it is not one. A missing default branch read
     /// through a refusal used to render as a repository with no default
     /// branch; with the reason, a deferral is retried instead.
-    pub(crate) fn checked(self) -> Result<Self, String> {
+    pub(crate) fn checked(self) -> Result<Self, CommandError> {
         match self.incomplete {
             Some(reason) => Err(reason),
             None => Ok(self),
@@ -3916,14 +3943,14 @@ fn compute_default_base_with(repo: &Path, reads: Reads) -> DefaultBase {
         }
     };
     let base = resolve_default_base_on(repo, &remote, remote_head.as_deref());
-    let incomplete = if git_cli::process_failures() != failures_before {
-        Some(
-            git_cli::last_process_failure()
-                .unwrap_or_else(|| "a default-branch lookup produced no answer".into()),
-        )
-    } else {
-        unread
-    };
+    let incomplete =
+        if git_cli::process_failures() != failures_before {
+            Some(git_cli::last_process_failure().unwrap_or_else(|| {
+                CommandError::from("a default-branch lookup produced no answer")
+            }))
+        } else {
+            unread
+        };
     DefaultBase {
         remote,
         remote_head,
@@ -3980,7 +4007,10 @@ const TAG_LIST_FORMAT: &str =
 /// read that did not happen (a refused spawn, a deadline, an unreadable ref
 /// file) and is an `Err`, never "not set": callers that guard a destructive
 /// action on the answer must not take an unreadable ref for an absent one.
-pub(crate) fn symbolic_ref_target(repo: &Path, refname: &str) -> Result<Option<String>, String> {
+pub(crate) fn symbolic_ref_target(
+    repo: &Path,
+    refname: &str,
+) -> Result<Option<String>, CommandError> {
     let run = git_cli::git_captured(repo, &["symbolic-ref", "--quiet", refname])?;
     match run.status_code {
         0 => {
@@ -3991,7 +4021,8 @@ pub(crate) fn symbolic_ref_target(repo: &Path, refname: &str) -> Result<Option<S
         code => Err(format!(
             "Could not read {refname} (git exited {code}): {}",
             String::from_utf8_lossy(&run.stderr).trim()
-        )),
+        )
+        .into()),
     }
 }
 
@@ -4001,7 +4032,7 @@ pub(crate) fn symbolic_ref_target(repo: &Path, refname: &str) -> Result<Option<S
 /// to the shortest *unambiguous* name, which is `heads/main` when a tag is
 /// also called `main`. The canonical owner of the question: a failed read is
 /// an `Err` (see [`symbolic_ref_target`]) and never "detached".
-pub(crate) fn head_branch(repo: &Path) -> Result<Option<String>, String> {
+pub(crate) fn head_branch(repo: &Path) -> Result<Option<String>, CommandError> {
     let branch = head_branch_name(repo)?;
     if let Some(name) = &branch {
         validate_ref_name(name)?;
@@ -4013,7 +4044,7 @@ pub(crate) fn head_branch(repo: &Path) -> Result<Option<String>, String> {
 /// only *show* the branch (the graph's HEAD chip, the remote lookup): a branch
 /// the writers would refuse to name in a command, `fix(ui)` among them, is
 /// still the one HEAD is on.
-fn head_branch_name(repo: &Path) -> Result<Option<String>, String> {
+fn head_branch_name(repo: &Path) -> Result<Option<String>, CommandError> {
     symbolic_ref_target(repo, "HEAD")?
         .map(|target| branch_of_head_target(&target))
         .transpose()
@@ -4023,18 +4054,18 @@ fn head_branch_name(repo: &Path) -> Result<Option<String>, String> {
 /// ask on every refresh. The cached read cannot tell a detached HEAD (exit 1,
 /// an answer) from a refusal, so a failed cached read is asked again, uncached,
 /// and that one decides.
-pub(crate) fn head_branch_cached(repo: &Path) -> Result<Option<String>, String> {
+pub(crate) fn head_branch_cached(repo: &Path) -> Result<Option<String>, CommandError> {
     match ref_cache::git_text(repo, &["refs/heads"], &["symbolic-ref", "--quiet", "HEAD"]) {
         Ok(target) => branch_of_head_target(target.trim()).map(Some),
         Err(_) => head_branch_name(repo),
     }
 }
 
-fn branch_of_head_target(target: &str) -> Result<String, String> {
+fn branch_of_head_target(target: &str) -> Result<String, CommandError> {
     target
         .strip_prefix("refs/heads/")
         .map(str::to_string)
-        .ok_or_else(|| format!("HEAD points at {target}, which is not a local branch"))
+        .ok_or_else(|| format!("HEAD points at {target}, which is not a local branch").into())
 }
 
 /// What a branch listing over `refs/heads/` and `refs/remotes/` reads.
@@ -4109,7 +4140,7 @@ pub(crate) fn list_against(
     query: &RefQuery<'_>,
     base_oid: Option<&str>,
     retry: bool,
-) -> Result<AheadBehindListing, String> {
+) -> Result<AheadBehindListing, CommandError> {
     let fields = query.fields.split("%00").count();
     let run = |format: &str, cached: bool| {
         let format_arg = format!("--format={format}");
@@ -4145,7 +4176,12 @@ pub(crate) fn list_against(
                 measured: false,
             })
             .map_err(|retry_err| {
-                format!("{err}; retry without ahead-behind also failed: {retry_err}")
+                err.wrap(|err| {
+                    format!(
+                        "{err}; retry without ahead-behind also failed: {}",
+                        retry_err.message()
+                    )
+                })
             }),
         Err(err) => Err(err),
     }
@@ -4161,7 +4197,7 @@ impl AheadBehindListing {
     /// contain one). A row with any other number of fields is an error naming
     /// it: dropping it would turn a ref git did list into one that was never
     /// there.
-    pub(crate) fn rows(&self) -> Result<Vec<ListedRow<'_>>, String> {
+    pub(crate) fn rows(&self) -> Result<Vec<ListedRow<'_>>, CommandError> {
         let expected = self.fields + usize::from(self.measured);
         self.text
             .lines()
@@ -4171,7 +4207,8 @@ impl AheadBehindListing {
                     return Err(format!(
                         "ref listing row has {} fields, expected {expected}: {line:?}",
                         parts.len()
-                    ));
+                    )
+                    .into());
                 }
                 let counts = if self.measured {
                     parse_ahead_behind_pair(parts.pop().unwrap_or(""))
@@ -4598,7 +4635,7 @@ const MALFORMED_INDEX_RECORD: &str = "Malformed ls-files --stage record";
 const MALFORMED_TREE_RECORD: &str = "Malformed ls-tree record";
 
 /// Parses `git ls-files -z --stage` records: `<mode> SP <oid> SP <stage> TAB <path> NUL`.
-fn parse_ls_files_stage_z(raw: &[u8]) -> Result<Vec<IndexStageEntry>, String> {
+fn parse_ls_files_stage_z(raw: &[u8]) -> Result<Vec<IndexStageEntry>, CommandError> {
     let mut entries = Vec::new();
     for record in raw.split(|&b| b == 0) {
         if record.is_empty() {
@@ -4639,7 +4676,7 @@ fn parse_ls_files_stage_z(raw: &[u8]) -> Result<Vec<IndexStageEntry>, String> {
 }
 
 /// Parses `git ls-tree -z --full-name` records: `<mode> SP <type> SP <oid> TAB <path> NUL`.
-fn parse_ls_tree_z(raw: &[u8]) -> Result<Vec<TreeEntry>, String> {
+fn parse_ls_tree_z(raw: &[u8]) -> Result<Vec<TreeEntry>, CommandError> {
     let mut entries = Vec::new();
     for record in raw.split(|&b| b == 0) {
         if record.is_empty() {
@@ -4678,12 +4715,12 @@ fn parse_ls_tree_z(raw: &[u8]) -> Result<Vec<TreeEntry>, String> {
     Ok(entries)
 }
 
-fn reject_non_file_git_mode(mode: &str, path: &str) -> Result<(), String> {
+fn reject_non_file_git_mode(mode: &str, path: &str) -> Result<(), CommandError> {
     if mode == "160000" {
-        return Err(format!("Cannot display gitlink: {path}"));
+        return Err(format!("Cannot display gitlink: {path}").into());
     }
     if mode == "040000" {
-        return Err(file_not_found(path));
+        return Err(file_not_found(path).into());
     }
     Ok(())
 }
@@ -4691,39 +4728,42 @@ fn reject_non_file_git_mode(mode: &str, path: &str) -> Result<(), String> {
 fn stage0_blob<'a>(
     entries: &'a [IndexStageEntry],
     file_path: &str,
-) -> Result<&'a IndexStageEntry, String> {
+) -> Result<&'a IndexStageEntry, CommandError> {
     if entries.iter().any(|entry| entry.path != file_path) {
         return Err("ls-files returned a path other than the requested file".into());
     }
     let stage0: Vec<_> = entries.iter().filter(|entry| entry.stage == 0).collect();
     if stage0.is_empty() {
-        return Err(file_not_found(file_path));
+        return Err(file_not_found(file_path).into());
     }
     if stage0.len() != 1 {
-        return Err(format!("Ambiguous index entry for '{file_path}'"));
+        return Err(format!("Ambiguous index entry for '{file_path}'").into());
     }
     let entry = stage0[0];
     reject_non_file_git_mode(&entry.mode, file_path)?;
     Ok(entry)
 }
 
-fn tree_file_blob<'a>(entries: &'a [TreeEntry], file_path: &str) -> Result<&'a TreeEntry, String> {
+fn tree_file_blob<'a>(
+    entries: &'a [TreeEntry],
+    file_path: &str,
+) -> Result<&'a TreeEntry, CommandError> {
     if entries.iter().any(|entry| entry.path != file_path) {
         return Err("ls-tree returned a path other than the requested file".into());
     }
     if entries.is_empty() {
-        return Err(file_not_found(file_path));
+        return Err(file_not_found(file_path).into());
     }
     if entries.len() != 1 {
-        return Err(format!("Ambiguous tree entry for '{file_path}'"));
+        return Err(format!("Ambiguous tree entry for '{file_path}'").into());
     }
     let entry = &entries[0];
     reject_non_file_git_mode(&entry.mode, file_path)?;
     if entry.kind == "commit" {
-        return Err(format!("Cannot display gitlink: {file_path}"));
+        return Err(format!("Cannot display gitlink: {file_path}").into());
     }
     if entry.kind != "blob" {
-        return Err(file_not_found(file_path));
+        return Err(file_not_found(file_path).into());
     }
     Ok(entry)
 }
@@ -4731,21 +4771,24 @@ fn tree_file_blob<'a>(entries: &'a [TreeEntry], file_path: &str) -> Result<&'a T
 /// Lists one index path. `:(literal)` is the common path; Git for Windows
 /// still rejects `X:rest` as drive-relative, so that fatal retries against
 /// the whole `ls-files --stage` listing and keeps only the requested path.
-fn index_entries_named(raw: &[u8], file_path: &str) -> Result<Vec<IndexStageEntry>, String> {
+fn index_entries_named(raw: &[u8], file_path: &str) -> Result<Vec<IndexStageEntry>, CommandError> {
     Ok(parse_ls_files_stage_z(raw)?
         .into_iter()
         .filter(|entry| entry.path == file_path)
         .collect())
 }
 
-fn tree_entries_named(raw: &[u8], file_path: &str) -> Result<Vec<TreeEntry>, String> {
+fn tree_entries_named(raw: &[u8], file_path: &str) -> Result<Vec<TreeEntry>, CommandError> {
     Ok(parse_ls_tree_z(raw)?
         .into_iter()
         .filter(|entry| entry.path == file_path)
         .collect())
 }
 
-fn ls_files_stage_records(repo: &Path, file_path: &str) -> Result<Vec<IndexStageEntry>, String> {
+fn ls_files_stage_records(
+    repo: &Path,
+    file_path: &str,
+) -> Result<Vec<IndexStageEntry>, CommandError> {
     if listing_must_match_path_exactly(file_path) {
         let raw = git(repo, &["ls-files", "-z", "--stage"])?;
         return index_entries_named(&raw, file_path);
@@ -4753,7 +4796,7 @@ fn ls_files_stage_records(repo: &Path, file_path: &str) -> Result<Vec<IndexStage
     let spec = literal_pathspec(file_path);
     match git(repo, &["ls-files", "-z", "--stage", "--", spec.as_str()]) {
         Ok(raw) => parse_ls_files_stage_z(&raw),
-        Err(err) if git_pathspec_rejected_as_outside_repo(&err) => {
+        Err(err) if git_pathspec_rejected_as_outside_repo(err.message()) => {
             let raw = git(repo, &["ls-files", "-z", "--stage"])?;
             index_entries_named(&raw, file_path)
         }
@@ -4763,7 +4806,7 @@ fn ls_files_stage_records(repo: &Path, file_path: &str) -> Result<Vec<IndexStage
 
 /// Peels `rev` to a tree object so `ls-tree` never sees a symbolic name that
 /// could collide with a blob named `HEAD` / `@`.
-fn peel_revision_to_tree(repo: &Path, rev: &str) -> Result<String, String> {
+fn peel_revision_to_tree(repo: &Path, rev: &str) -> Result<String, CommandError> {
     let spec = format!("{rev}^{{tree}}");
     let oid = git_text(repo, &["rev-parse", "--verify", spec.as_str()])?;
     let oid = oid.trim();
@@ -4774,14 +4817,18 @@ fn peel_revision_to_tree(repo: &Path, rev: &str) -> Result<String, String> {
 /// Full recursive listing. `--full-tree` is required: without it Git for
 /// Windows treats `0:foo.py` as a drive-relative path and omits it from a
 /// cwd-scoped listing even when the tree object contains that name.
-fn ls_tree_full_z(repo: &Path, tree: &str) -> Result<Vec<u8>, String> {
+fn ls_tree_full_z(repo: &Path, tree: &str) -> Result<Vec<u8>, CommandError> {
     git(
         repo,
         &["ls-tree", "-z", "--full-tree", "--full-name", "-r", tree],
     )
 }
 
-fn ls_tree_records(repo: &Path, rev: &str, file_path: &str) -> Result<Vec<TreeEntry>, String> {
+fn ls_tree_records(
+    repo: &Path,
+    rev: &str,
+    file_path: &str,
+) -> Result<Vec<TreeEntry>, CommandError> {
     let tree = peel_revision_to_tree(repo, rev)?;
     if listing_must_match_path_exactly(file_path) {
         return tree_entries_named(&ls_tree_full_z(repo, &tree)?, file_path);
@@ -4800,7 +4847,7 @@ fn ls_tree_records(repo: &Path, rev: &str, file_path: &str) -> Result<Vec<TreeEn
         ],
     ) {
         Ok(raw) => parse_ls_tree_z(&raw),
-        Err(err) if git_pathspec_rejected_as_outside_repo(&err) => {
+        Err(err) if git_pathspec_rejected_as_outside_repo(err.message()) => {
             tree_entries_named(&ls_tree_full_z(repo, &tree)?, file_path)
         }
         Err(err) => Err(err),
@@ -4810,7 +4857,7 @@ fn ls_tree_records(repo: &Path, rev: &str, file_path: &str) -> Result<Vec<TreeEn
 /// Index blob for a missing working-tree path. Never concatenates the path
 /// into a `git show` object name (`:path` / `:0:path`): those DWIM globs and
 /// revisions, and a missing glob exits 0 with empty stdout.
-fn read_index_blob(repo: &Path, file_path: &str) -> Result<Vec<u8>, String> {
+fn read_index_blob(repo: &Path, file_path: &str) -> Result<Vec<u8>, CommandError> {
     let entries = ls_files_stage_records(repo, file_path)?;
     let entry = stage0_blob(&entries, file_path)?;
     read_sized_blob(repo, &entry.oid)
@@ -4818,13 +4865,13 @@ fn read_index_blob(repo: &Path, file_path: &str) -> Result<Vec<u8>, String> {
 
 /// Commit blob for `file_path` at `rev`. Uses `ls-tree` + `cat-file` rather
 /// than `git show {rev}:{path}`, which treats `*?[` in the path as globs.
-fn read_commit_blob(repo: &Path, rev: &str, file_path: &str) -> Result<Vec<u8>, String> {
+fn read_commit_blob(repo: &Path, rev: &str, file_path: &str) -> Result<Vec<u8>, CommandError> {
     let entries = ls_tree_records(repo, rev, file_path)?;
     let entry = tree_file_blob(&entries, file_path)?;
     read_sized_blob(repo, &entry.oid)
 }
 
-fn read_sized_blob(repo: &Path, oid: &str) -> Result<Vec<u8>, String> {
+fn read_sized_blob(repo: &Path, oid: &str) -> Result<Vec<u8>, CommandError> {
     validate_oid(oid)?;
     let size: u64 = git_text(repo, &["cat-file", "-s", oid])?
         .trim()
@@ -4834,7 +4881,8 @@ fn read_sized_blob(repo: &Path, oid: &str) -> Result<Vec<u8>, String> {
         return Err(format!(
             "file exceeds the {} MB working-tree size limit",
             MAX_WORKING_TREE_BYTES / (1024 * 1024)
-        ));
+        )
+        .into());
     }
     let bytes = git(repo, &["cat-file", "blob", oid])?;
     if bytes.len() as u64 != size {
@@ -4955,7 +5003,7 @@ pub(crate) fn undecodable_path_warning(path: &str) -> Option<String> {
 ///
 /// `Ok(empty)` only when there is no such file. A file that exists and cannot
 /// be read fails the page: its commits would be drawn as roots.
-fn shallow_commits(repo: &Path) -> Result<HashSet<String>, String> {
+fn shallow_commits(repo: &Path) -> Result<HashSet<String>, CommandError> {
     let (_private, common) = crate::repository_trust::git_directories(repo)?;
     match std::fs::read_to_string(common.join("shallow")) {
         Ok(text) => Ok(text
@@ -4965,13 +5013,13 @@ fn shallow_commits(repo: &Path) -> Result<HashSet<String>, String> {
             .map(str::to_string)
             .collect()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HashSet::new()),
-        Err(error) => Err(format!("Could not read the shallow boundary: {error}")),
+        Err(error) => Err(format!("Could not read the shallow boundary: {error}").into()),
     }
 }
 
 /// Gives each shallow-boundary commit the unknown parent it is missing, so it
 /// is drawn as a stub rather than as the root of the history.
-fn mark_shallow_boundary(repo: &Path, commits: &mut [RawCommitNode]) -> Result<(), String> {
+fn mark_shallow_boundary(repo: &Path, commits: &mut [RawCommitNode]) -> Result<(), CommandError> {
     if !commits.iter().any(|commit| commit.parent_ids.is_empty()) {
         return Ok(());
     }
@@ -5043,7 +5091,7 @@ fn parse_history_record(record: &str) -> Option<RawCommitNode> {
 /// [`MAX_WORKING_TREE_BYTES`]), and text content is rendered exactly like
 /// `git diff` would: header lines, `@@ -0,0 +1,N @@`, one `+{line}` per line,
 /// and `\ No newline at end of file` when the last byte is not a newline.
-fn untracked_new_file_diff(repo: &Path, file_path: &str) -> Result<Option<String>, String> {
+fn untracked_new_file_diff(repo: &Path, file_path: &str) -> Result<Option<String>, CommandError> {
     let spec = literal_pathspec(file_path);
     let stdout = git_text(
         repo,
@@ -5159,7 +5207,7 @@ fn quote_diff_path(path: &str) -> String {
     quoted
 }
 
-fn validate_oid(oid: &str) -> Result<(), String> {
+fn validate_oid(oid: &str) -> Result<(), CommandError> {
     if oid.is_empty() || oid.len() > 64 || !oid.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("Invalid commit id".into());
     }
@@ -5232,7 +5280,7 @@ fn count_untracked_file_lines(full_path: &Path) -> (usize, usize) {
 /// Rejects files larger than `max_bytes` BEFORE their bytes are read.
 ///
 /// Metadata-only check so an oversized file never enters memory at all.
-fn check_working_tree_size(path: &Path, max_bytes: u64) -> Result<(), String> {
+fn check_working_tree_size(path: &Path, max_bytes: u64) -> Result<(), CommandError> {
     let len = std::fs::metadata(path)
         .map_err(|e| format!("Failed to stat '{}': {}", path.display(), e))?
         .len();
@@ -5240,7 +5288,8 @@ fn check_working_tree_size(path: &Path, max_bytes: u64) -> Result<(), String> {
         return Err(format!(
             "file exceeds the {} MB working-tree size limit",
             max_bytes / (1024 * 1024)
-        ));
+        )
+        .into());
     }
     Ok(())
 }
@@ -5248,7 +5297,7 @@ fn check_working_tree_size(path: &Path, max_bytes: u64) -> Result<(), String> {
 /// Read a regular file with a hard allocation bound, including if it grows
 /// after stat. Never open a FIFO in blocking mode on Unix, and recheck the
 /// opened handle so replacing a file cannot bypass the metadata check.
-pub(crate) fn read_working_tree_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
+pub(crate) fn read_working_tree_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, CommandError> {
     let meta = std::fs::symlink_metadata(path)
         .map_err(|e| format!("Cannot inspect '{}': {e}", path.display()))?;
     if !meta.is_file() {
@@ -5280,7 +5329,8 @@ pub(crate) fn read_working_tree_file(path: &Path, max_bytes: u64) -> Result<Vec<
         return Err(format!(
             "file exceeds the {} MB working-tree size limit",
             max_bytes / (1024 * 1024)
-        ));
+        )
+        .into());
     }
     Ok(bytes)
 }
@@ -5384,7 +5434,7 @@ fn blame_at_revision(
     repo: &Path,
     file_path: &str,
     revision: &str,
-) -> Result<Vec<BlameLine>, String> {
+) -> Result<Vec<BlameLine>, CommandError> {
     crate::engine::git_writer::validate_oid_or_revision(revision)?;
     // Lexical containment only: the path is read from a tree object, never
     // from disk, so a symlinked directory in the checkout cannot redirect it.
@@ -5403,14 +5453,14 @@ fn blame_at_revision(
         budget::MAX_BLAME_BYTES,
     )?;
     if let Some(reason) = incomplete {
-        return Err(format!("Blame unavailable: {}", reason.describe()));
+        return Err(format!("Blame unavailable: {}", reason.describe()).into());
     }
     Ok(parse_blame_porcelain(&stdout))
 }
 
 /// A new file has content but no committed author. Preserve every line while
 /// using the same zero-OID convention as Git's uncommitted porcelain records.
-fn uncommitted_file_blame(repo: &Path, path: &Path) -> Result<Vec<BlameLine>, String> {
+fn uncommitted_file_blame(repo: &Path, path: &Path) -> Result<Vec<BlameLine>, CommandError> {
     use std::io::Read;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -5999,7 +6049,10 @@ const COMMIT_SHOW_FIELDS: usize = 10;
 /// written when it stopped is dropped (it may be a rename missing its second
 /// path, or a count missing a digit), and everything derived from the records
 /// is then a lower bound that the payload says is one.
-fn parse_commit_show(stdout: &str, cut: Option<&Incomplete>) -> Result<CommitDetails, String> {
+fn parse_commit_show(
+    stdout: &str,
+    cut: Option<&Incomplete>,
+) -> Result<CommitDetails, CommandError> {
     let mut parts = stdout.splitn(COMMIT_SHOW_FIELDS + 1, '\0');
     let fields: Vec<&str> = parts.by_ref().take(COMMIT_SHOW_FIELDS).collect();
     if fields.len() < COMMIT_SHOW_FIELDS {
@@ -6007,7 +6060,8 @@ fn parse_commit_show(stdout: &str, cut: Option<&Incomplete>) -> Result<CommitDet
             Some(why) => format!(
                 "Commit metadata was cut short: git output {}",
                 why.describe()
-            ),
+            )
+            .into(),
             None => "Failed to parse commit metadata format".into(),
         });
     }
@@ -6119,7 +6173,7 @@ fn record_lang(
 /// Git can list one conflicted path in several index stages; the listing is
 /// deduplicated, and each path keeps its exact bytes for disk access, since
 /// normalization is only for classification.
-fn language_candidates(repo: &Path) -> Result<Vec<(String, LanguageInfo)>, String> {
+fn language_candidates(repo: &Path) -> Result<Vec<(String, LanguageInfo)>, CommandError> {
     let stdout = git_text(
         repo,
         &[
@@ -6152,7 +6206,7 @@ fn language_candidates(repo: &Path) -> Result<Vec<(String, LanguageInfo)>, Strin
 fn linguist_attributes(
     repo: &Path,
     paths: &[String],
-) -> Result<HashMap<String, crate::analyzer::LinguistAttrs>, String> {
+) -> Result<HashMap<String, crate::analyzer::LinguistAttrs>, CommandError> {
     let mut attrs: HashMap<String, crate::analyzer::LinguistAttrs> = HashMap::new();
     if paths.is_empty() {
         return Ok(attrs);
@@ -7936,19 +7990,25 @@ mod tests {
             Err(err) => {
                 assert!(
                     !err.contains("ambiguous argument"),
-                    "{path}: git DWIM leaked: {err}"
+                    "{path}: git DWIM leaked: {err}",
+                    err = err.message()
                 );
                 assert!(
                     !err.contains("unknown revision or path"),
-                    "{path}: git DWIM leaked: {err}"
+                    "{path}: git DWIM leaked: {err}",
+                    err = err.message()
                 );
                 assert!(
-                    !err.to_lowercase().contains("does not have any commits"),
-                    "{path}: empty-repo HEAD fatal leaked: {err}"
+                    !err.message()
+                        .to_lowercase()
+                        .contains("does not have any commits"),
+                    "{path}: empty-repo HEAD fatal leaked: {err}",
+                    err = err.message()
                 );
                 assert!(
                     err.contains(&format!("File not found: {path}")),
-                    "{path}: expected File not found, got: {err}"
+                    "{path}: expected File not found, got: {err}",
+                    err = err.message()
                 );
             }
         }
@@ -8175,7 +8235,11 @@ mod tests {
             .incomplete
             .clone()
             .expect("the guess says it is one");
-        assert!(reason.contains("forced by test"), "{reason}");
+        assert!(
+            reason.contains("forced by test"),
+            "{reason}",
+            reason = reason.message()
+        );
         assert_eq!(refused.clone().checked(), Err(reason));
         let before = lookups();
         let seen = default_base(&repo);
@@ -8209,7 +8273,11 @@ mod tests {
             GitReader::default_branch_name(&path)
         });
         let error = refused.expect_err("a refusal is not an absent default branch");
-        assert!(error.contains("forced by test"), "{error}");
+        assert!(
+            error.contains("forced by test"),
+            "{error}",
+            error = error.message()
+        );
         assert_eq!(
             GitReader::default_branch_name(&path).unwrap().as_deref(),
             Some("main")
@@ -8832,7 +8900,11 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
         assert_eq!(rows[0].counts, None, "an unparsed count is uncompared");
         for bad in ["a\n", "a\0b\0c\n", "a\0b\nc\n"] {
             let err = two(bad, false).rows().map(|_| ()).unwrap_err();
-            assert!(err.contains("expected 2"), "{bad:?}: {err}");
+            assert!(
+                err.contains("expected 2"),
+                "{bad:?}: {err}",
+                err = err.message()
+            );
         }
         assert!(two("a\0b\n", true).rows().is_err());
     }
@@ -9117,7 +9189,11 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
             .set_len(MAX_WORKING_TREE_BYTES + 1)
             .unwrap();
         let err = check_working_tree_size(&sparse, MAX_WORKING_TREE_BYTES).unwrap_err();
-        assert!(err.contains("working-tree size limit"), "got: {err}");
+        assert!(
+            err.contains("working-tree size limit"),
+            "got: {err}",
+            err = err.message()
+        );
     }
 
     #[test]
@@ -9140,7 +9216,11 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
             .unwrap();
         let err = GitReader::get_file_blob(&dir.path().to_string_lossy(), "big.bin", None)
             .expect_err("oversized working-tree file");
-        assert!(err.contains("working-tree size limit"), "got: {err}");
+        assert!(
+            err.contains("working-tree size limit"),
+            "got: {err}",
+            err = err.message()
+        );
     }
 
     /// Coverage.py reports `SF:__main__.py` for `python -m` runs. That path is
@@ -9163,15 +9243,18 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
             .expect_err("synthetic coverage.py path is not in this repo");
         assert!(
             !err.contains("ambiguous argument"),
-            "index fallback must not pass :__main__.py to git show; got: {err}"
+            "index fallback must not pass :__main__.py to git show; got: {err}",
+            err = err.message()
         );
         assert!(
             !err.contains("unknown revision or path"),
-            "git DWIM fatals must not leak as file-content errors; got: {err}"
+            "git DWIM fatals must not leak as file-content errors; got: {err}",
+            err = err.message()
         );
         assert!(
             err.contains("File not found: __main__.py"),
-            "missing index blob must be a stable not-found error; got: {err}"
+            "missing index blob must be a stable not-found error; got: {err}",
+            err = err.message()
         );
     }
 
@@ -9320,7 +9403,7 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
             let want = format!("body-{i}\n");
             assert_eq!(
                 GitReader::get_file_blob(&repo, path, Some("HEAD"))
-                    .unwrap_or_else(|e| panic!("HEAD {path}: {e}; tree={trees:?}"))
+                    .unwrap_or_else(|e| panic!("HEAD {path}: {e}; tree={trees:?}", e = e.message()))
                     .text
                     .as_deref(),
                 Some(want.as_str()),
@@ -9330,7 +9413,7 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
                 unlink_if_present(dir.path(), path);
                 assert_eq!(
                     GitReader::get_file_blob(&repo, path, None)
-                        .unwrap_or_else(|e| panic!("index {path}: {e}"))
+                        .unwrap_or_else(|e| panic!("index {path}: {e}", e = e.message()))
                         .text
                         .as_deref(),
                     Some(want.as_str()),
@@ -9415,7 +9498,11 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
         seed_commit(dir.path());
         let err = GitReader::get_file_content(&dir.path().to_string_lossy(), "foo*.py", None)
             .expect_err("Coverage reads missing globs via get_file_content");
-        assert!(err.contains("File not found: foo*.py"), "got: {err}");
+        assert!(
+            err.contains("File not found: foo*.py"),
+            "got: {err}",
+            err = err.message()
+        );
     }
 
     #[test]
@@ -9464,7 +9551,8 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
             GitReader::get_file_blob(&repo, "big.bin", None).expect_err("oversized index blob");
         assert!(
             index_err.contains("working-tree size limit"),
-            "got: {index_err}"
+            "got: {index_err}",
+            index_err = index_err.message()
         );
 
         write_and_add_literal(dir.path(), "big.bin", &oversized);
@@ -9473,7 +9561,8 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
             .expect_err("oversized commit blob");
         assert!(
             commit_err.contains("working-tree size limit"),
-            "got: {commit_err}"
+            "got: {commit_err}",
+            commit_err = commit_err.message()
         );
     }
 
@@ -9495,9 +9584,14 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
             .expect_err("gitlink is not a file blob");
         assert!(
             err.contains("gitlink"),
-            "gitlink must not be displayed as an empty file; got: {err}"
+            "gitlink must not be displayed as an empty file; got: {err}",
+            err = err.message()
         );
-        assert!(!err.contains("ambiguous argument"), "got: {err}");
+        assert!(
+            !err.contains("ambiguous argument"),
+            "got: {err}",
+            err = err.message()
+        );
     }
 
     #[cfg(unix)]
@@ -11330,8 +11424,11 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
         let err = GitReader::list_repo_files(&dir.path().to_string_lossy())
             .expect_err("plain directory is not a repository");
         assert!(
-            err.to_lowercase().contains("not a git repository"),
-            "got: {err}"
+            err.message()
+                .to_lowercase()
+                .contains("not a git repository"),
+            "got: {err}",
+            err = err.message()
         );
     }
 
@@ -11364,10 +11461,17 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
         let err = GitReader::list_repo_files(&dir.path().to_string_lossy())
             .expect_err("over-cap listing must fail loudly");
         assert!(
-            err.to_lowercase().contains("file explorer unavailable"),
-            "got: {err}"
+            err.message()
+                .to_lowercase()
+                .contains("file explorer unavailable"),
+            "got: {err}",
+            err = err.message()
         );
-        assert!(err.contains(&MAX_REPO_FILES.to_string()), "got: {err}");
+        assert!(
+            err.contains(&MAX_REPO_FILES.to_string()),
+            "got: {err}",
+            err = err.message()
+        );
     }
 
     #[test]
@@ -12235,7 +12339,11 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             GitReader::dora_report(path, Some(90))
         })
         .expect_err("a failed commit scan must fail the report");
-        assert!(error.contains("commit scan"), "{error}");
+        assert!(
+            error.contains("commit scan"),
+            "{error}",
+            error = error.message()
+        );
     }
 
     /// Seeds `count` commits whose subjects alternate so the scan has both
@@ -12945,8 +13053,8 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
     fn metadata_cut_before_the_body_is_an_error_that_names_the_cut() {
         let cut = Incomplete::OverCap(1024);
         let err = parse_commit_show("abc\0def\0", Some(&cut)).unwrap_err();
-        assert!(err.contains("cut short"), "{err}");
-        assert!(err.contains("exceeded"), "{err}");
+        assert!(err.contains("cut short"), "{err}", err = err.message());
+        assert!(err.contains("exceeded"), "{err}", err = err.message());
         assert_eq!(
             parse_commit_show("abc\0def\0", None).unwrap_err(),
             "Failed to parse commit metadata format"
@@ -12977,7 +13085,11 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
 
     /// [`GitReader::dora_report_scanning`] at the real clock on the git this
     /// machine has, for the tests whose commits are made "now".
-    fn dora_scanning(path: &str, window: Option<u32>, cap: usize) -> Result<DoraReport, String> {
+    fn dora_scanning(
+        path: &str,
+        window: Option<u32>,
+        cap: usize,
+    ) -> Result<DoraReport, CommandError> {
         GitReader::dora_report_scanning(path, window, cap, system_now(), DateWalk::from_preflight())
     }
 
@@ -13911,7 +14023,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             let one = match GitReader::get_commit_file_diff(path, oid, &row.path) {
                 Ok(one) => one,
                 Err(err) => {
-                    problems.push(format!("{:?}: error {err}", row.path));
+                    problems.push(format!("{:?}: error {err}", row.path, err = err.message()));
                     continue;
                 }
             };
@@ -14271,7 +14383,8 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         adv_commit(dir.path(), "move the directory");
         let oid = rev_parse_at(dir.path(), "HEAD");
         let one = GitReader::get_commit_file_diff(path, &oid, "pkg2");
-        let one = one.unwrap_or_else(|err| panic!("directory request failed: {err}"));
+        let one = one
+            .unwrap_or_else(|err| panic!("directory request failed: {err}", err = err.message()));
         assert_eq!(
             adv_section_counts(&one.text).len(),
             6000,

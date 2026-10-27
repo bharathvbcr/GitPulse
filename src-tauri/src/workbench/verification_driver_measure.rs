@@ -35,6 +35,7 @@
 //! ```
 
 use super::{held_cards, target_of, verification_base, Backend, Driver, Report, SWEEP_PERIOD};
+use crate::ipc_error::CommandError;
 use crate::workbench::verification_gate as gate;
 use crate::workbench::WorkbenchError;
 use dc_store::Store;
@@ -58,7 +59,7 @@ impl Backend for Measured {
         self.starts.set(self.starts.get() + 1);
         Ok(json!({"ok": true, "stub": "measure"}))
     }
-    fn head_of(&self, worktree: &str) -> Result<String, String> {
+    fn head_of(&self, worktree: &str) -> Result<String, CommandError> {
         self.heads.set(self.heads.get() + 1);
         let head = gate::current_head(worktree);
         if let Err(error) = &head {
@@ -66,12 +67,12 @@ impl Backend for Measured {
             let mut errors = self.errors.borrow_mut();
             // A few distinct causes, each cut short: enough to name why.
             if errors.len() < 8 {
-                errors.insert(error.chars().take(120).collect());
+                errors.insert(error.message().chars().take(120).collect());
             }
         }
         head
     }
-    fn base_of(&self, worktree: &str, head: &str) -> Result<String, String> {
+    fn base_of(&self, worktree: &str, head: &str) -> Result<String, CommandError> {
         verification_base(Path::new(worktree), head)
     }
     fn now(&self) -> Instant {

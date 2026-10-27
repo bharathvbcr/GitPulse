@@ -3,6 +3,7 @@ use crate::engine::git_cli::{
     capture_command, classify_tool_probe, git_text, run_command_in, validate_repo, CapturedOutput,
     ToolProbe,
 };
+use crate::ipc_error::CommandError;
 pub mod actions;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -204,7 +205,9 @@ pub fn load_workflow_runs_report(repo_path: &str) -> GitHubRunsReport {
                 "No GitHub remote configured".to_string(),
             );
         }
-        Err(error) => return GitHubRunsReport::unavailable(cli_present, None, error),
+        Err(error) => {
+            return GitHubRunsReport::unavailable(cli_present, None, error.into_message())
+        }
     };
     if let Some(reason) = gh_unavailable_reason(&gh) {
         return GitHubRunsReport::unavailable(cli_present, Some(&remote), reason);
@@ -220,7 +223,7 @@ pub fn load_workflow_runs_report(repo_path: &str) -> GitHubRunsReport {
             truncated,
             error: None,
         },
-        Err(error) => GitHubRunsReport::unavailable(true, Some(&remote), error),
+        Err(error) => GitHubRunsReport::unavailable(true, Some(&remote), error.into_message()),
     }
 }
 
@@ -618,7 +621,7 @@ pub fn pick_github_remote(remote_v_output: &str) -> Option<GitHubRepoRef> {
     origin.or(first)
 }
 
-pub fn discover_github_remote(repo_path: &str) -> Result<Option<GitHubRepoRef>, String> {
+pub fn discover_github_remote(repo_path: &str) -> Result<Option<GitHubRepoRef>, CommandError> {
     let repo = validate_repo(repo_path)?;
     let stdout = git_text(&repo, &["remote", "-v"])?;
     Ok(pick_github_remote(&stdout))
@@ -785,10 +788,10 @@ fn run_gh(
     leading: &[&str],
     timeout: Duration,
     cwd: Option<&Path>,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, CommandError> {
     let args = gh_argv(remote, leading);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_command_in("gh", &refs, timeout, cwd).map_err(bounded_error)
+    run_command_in("gh", &refs, timeout, cwd).map_err(|e| e.wrap(|e| bounded_error(e.to_string())))
 }
 
 #[derive(Debug, Deserialize)]
@@ -814,7 +817,7 @@ struct GhIssue {
     author: Option<GhAuthor>,
 }
 
-fn list_issues(remote: &GitHubRepoRef) -> Result<(Vec<IssueInfo>, bool), String> {
+fn list_issues(remote: &GitHubRepoRef) -> Result<(Vec<IssueInfo>, bool), CommandError> {
     const DISPLAY_LIMIT: usize = 50;
     let fetch_limit = (DISPLAY_LIMIT + 1).to_string();
     let stdout = run_gh(
@@ -832,7 +835,7 @@ fn list_issues(remote: &GitHubRepoRef) -> Result<(Vec<IssueInfo>, bool), String>
         Duration::from_secs(45),
         None,
     )?;
-    parse_issue_list(&stdout, DISPLAY_LIMIT)
+    parse_issue_list(&stdout, DISPLAY_LIMIT).map_err(CommandError::from)
 }
 
 fn parse_issue_list(stdout: &[u8], display_limit: usize) -> Result<(Vec<IssueInfo>, bool), String> {
@@ -859,7 +862,9 @@ fn parse_issue_list(stdout: &[u8], display_limit: usize) -> Result<(Vec<IssueInf
 /// result is flagged instead of silently looking complete.
 const PR_DISPLAY_LIMIT: usize = 50;
 
-fn list_pull_requests(remote: &GitHubRepoRef) -> Result<(Vec<PullRequestInfo>, bool), String> {
+fn list_pull_requests(
+    remote: &GitHubRepoRef,
+) -> Result<(Vec<PullRequestInfo>, bool), CommandError> {
     let fetch_limit = (PR_DISPLAY_LIMIT + 1).to_string();
     let stdout = run_gh(
         remote,
@@ -879,7 +884,7 @@ fn list_pull_requests(remote: &GitHubRepoRef) -> Result<(Vec<PullRequestInfo>, b
         Duration::from_secs(45),
         None,
     )?;
-    parse_pr_list(&stdout, PR_DISPLAY_LIMIT)
+    parse_pr_list(&stdout, PR_DISPLAY_LIMIT).map_err(CommandError::from)
 }
 
 #[derive(Debug, Deserialize)]
@@ -913,7 +918,9 @@ struct GhWorkflowRun {
 /// capping is reported, matching every other section's convention.
 const RUN_DISPLAY_LIMIT: usize = 20;
 
-fn list_workflow_runs(remote: &GitHubRepoRef) -> Result<(Vec<WorkflowRunInfo>, bool), String> {
+fn list_workflow_runs(
+    remote: &GitHubRepoRef,
+) -> Result<(Vec<WorkflowRunInfo>, bool), CommandError> {
     let fetch_limit = (RUN_DISPLAY_LIMIT + 1).to_string();
     let stdout = run_gh(
         remote,
@@ -928,7 +935,7 @@ fn list_workflow_runs(remote: &GitHubRepoRef) -> Result<(Vec<WorkflowRunInfo>, b
         Duration::from_secs(45),
         None,
     )?;
-    parse_workflow_runs(&stdout, RUN_DISPLAY_LIMIT)
+    parse_workflow_runs(&stdout, RUN_DISPLAY_LIMIT).map_err(CommandError::from)
 }
 
 fn parse_pr_list(
@@ -1034,12 +1041,13 @@ fn release_list_leading_args(fetch_limit: &str) -> Vec<String> {
     .collect()
 }
 
-fn list_releases(remote: &GitHubRepoRef) -> Result<(Vec<ReleaseInfo>, bool), String> {
+fn list_releases(remote: &GitHubRepoRef) -> Result<(Vec<ReleaseInfo>, bool), CommandError> {
     let fetch_limit = (RELEASE_DISPLAY_LIMIT + 1).to_string();
     let leading = release_list_leading_args(&fetch_limit);
     let refs: Vec<&str> = leading.iter().map(String::as_str).collect();
     let stdout = run_gh(remote, &refs, Duration::from_secs(45), None)?;
     parse_release_list(&stdout, &remote.html_url(), RELEASE_DISPLAY_LIMIT)
+        .map_err(CommandError::from)
 }
 
 /// Percent-encodes every byte outside a URL-safe tag vocabulary so a
@@ -1186,7 +1194,7 @@ report_from_outcome!(CodeScanningReport, CodeScanningAlertInfo);
 /// explicit reason, never as an empty success.
 fn load_alert_outcome<T>(
     repo_path: &str,
-    list: impl FnOnce(&GitHubRepoRef) -> Result<AlertList<T>, String>,
+    list: impl FnOnce(&GitHubRepoRef) -> Result<AlertList<T>, CommandError>,
 ) -> AlertOutcome<T> {
     let gh = probe_gh_cli();
     let cli_present = gh_cli_reported_present(&gh);
@@ -1194,7 +1202,14 @@ fn load_alert_outcome<T>(
         Ok(Some(r)) => r,
         // Not an error: a local-only repository simply has no alert data.
         Ok(None) => return unavailable_alert_outcome(cli_present, false, String::new(), None),
-        Err(e) => return unavailable_alert_outcome(cli_present, false, String::new(), Some(e)),
+        Err(e) => {
+            return unavailable_alert_outcome(
+                cli_present,
+                false,
+                String::new(),
+                Some(e.into_message()),
+            )
+        }
     };
     if let Some(reason) = gh_unavailable_reason(&gh) {
         return unavailable_alert_outcome(cli_present, true, remote.slug(), Some(reason));
@@ -1211,7 +1226,7 @@ fn load_alert_outcome<T>(
             error: None,
             unavailable_reason: None,
         },
-        Err(e) => unavailable_alert_outcome(true, true, remote.slug(), Some(e)),
+        Err(e) => unavailable_alert_outcome(true, true, remote.slug(), Some(e.into_message())),
     }
 }
 
@@ -1261,7 +1276,7 @@ impl<T> AlertList<T> {
 
 fn list_dependabot_alerts(
     remote: &GitHubRepoRef,
-) -> Result<AlertList<DependabotAlertInfo>, String> {
+) -> Result<AlertList<DependabotAlertInfo>, CommandError> {
     let endpoint = format!(
         "repos/{}/{}/dependabot/alerts?state=open",
         remote.owner, remote.name
@@ -1294,7 +1309,8 @@ struct AlertFetch {
 
 /// One page of alerts: the `query` suffix (`""` or `&severity=high`), the page
 /// size, and the longest the request may take.
-type AlertPageFetch<'a> = dyn Fn(&str, usize, Duration) -> Result<Vec<Value>, String> + Sync + 'a;
+type AlertPageFetch<'a> =
+    dyn Fn(&str, usize, Duration) -> Result<Vec<Value>, CommandError> + Sync + 'a;
 
 /// The worst open alerts of one family: every alert when they fit one page,
 /// else the worst [`ALERT_DISPLAY_LIMIT`] + 1.
@@ -1314,22 +1330,23 @@ fn fetch_alerts_worst_first(
     remote: &GitHubRepoRef,
     endpoint: &str,
     tiers: &[&str],
-) -> Result<AlertFetch, String> {
-    let page = |query: &str, per_page: usize, timeout: Duration| -> Result<Vec<Value>, String> {
-        let out = capture_gh_api(
-            remote,
-            &format!("{endpoint}&per_page={per_page}{query}"),
-            timeout,
-        )?;
-        if !out.success {
-            return Err(gh_api_error_message(&out));
-        }
-        match serde_json::from_str::<Value>(out.stdout_text().trim()) {
-            Ok(Value::Array(rows)) => Ok(rows),
-            Ok(_) => Err("alerts payload must be an array".to_string()),
-            Err(error) => Err(format!("could not parse gh alerts output: {error}")),
-        }
-    };
+) -> Result<AlertFetch, CommandError> {
+    let page =
+        |query: &str, per_page: usize, timeout: Duration| -> Result<Vec<Value>, CommandError> {
+            let out = capture_gh_api(
+                remote,
+                &format!("{endpoint}&per_page={per_page}{query}"),
+                timeout,
+            )?;
+            if !out.success {
+                return Err(gh_api_error_message(&out).into());
+            }
+            match serde_json::from_str::<Value>(out.stdout_text().trim()) {
+                Ok(Value::Array(rows)) => Ok(rows),
+                Ok(_) => Err("alerts payload must be an array".into()),
+                Err(error) => Err(format!("could not parse gh alerts output: {error}").into()),
+            }
+        };
     collect_alerts_worst_first(&page, tiers, Instant::now() + ALERT_FETCH_DEADLINE)
 }
 
@@ -1338,7 +1355,7 @@ fn collect_alerts_worst_first(
     page: &AlertPageFetch<'_>,
     tiers: &[&str],
     deadline: Instant,
-) -> Result<AlertFetch, String> {
+) -> Result<AlertFetch, CommandError> {
     let remaining = || deadline.saturating_duration_since(Instant::now());
     let json = |rows: &[Value]| serde_json::to_string(rows).map_err(|e| e.to_string());
     let first = page("", ALERT_PAGE_MAX, remaining())?;
@@ -1362,7 +1379,7 @@ fn collect_alerts_worst_first(
         }
         let wave = &tiers[next..tiers.len().min(next + ALERT_TIER_CONCURRENCY)];
         next += wave.len();
-        let answers: Vec<Result<Vec<Value>, String>> = std::thread::scope(|scope| {
+        let answers: Vec<Result<Vec<Value>, CommandError>> = std::thread::scope(|scope| {
             let handles: Vec<_> = wave
                 .iter()
                 .map(|tier| {
@@ -1375,7 +1392,7 @@ fn collect_alerts_worst_first(
                 .map(|handle| {
                     handle
                         .join()
-                        .unwrap_or_else(|_| Err("alert tier worker panicked".to_string()))
+                        .unwrap_or_else(|_| Err("alert tier worker panicked".into()))
                 })
                 .collect()
         });
@@ -1389,7 +1406,7 @@ fn collect_alerts_worst_first(
                     }
                 }
                 Err(error) => {
-                    log::warn!(target: "github", "alert tier {tier} not fetched: {error}");
+                    log::warn!(target: "github", "alert tier {tier} not fetched: {error}", error = error.message());
                     partial_tiers.push((*tier).to_string());
                 }
             }
@@ -1429,7 +1446,7 @@ fn capture_gh_api(
     remote: &GitHubRepoRef,
     endpoint: &str,
     timeout: Duration,
-) -> Result<CapturedOutput, String> {
+) -> Result<CapturedOutput, CommandError> {
     let mut args: Vec<String> = vec!["api".to_string(), endpoint.to_string()];
     args.extend(api_host_flags(remote));
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -1736,7 +1753,7 @@ pub fn load_code_scanning_alerts(repo_path: &str) -> CodeScanningReport {
 
 fn list_code_scanning_alerts(
     remote: &GitHubRepoRef,
-) -> Result<AlertList<CodeScanningAlertInfo>, String> {
+) -> Result<AlertList<CodeScanningAlertInfo>, CommandError> {
     // Official REST: GET /repos/{owner}/{repo}/code-scanning/alerts
     // Query params confirmed: state, per_page (max 100), ref, tool_name,
     // severity, page. We request open alerts, worst first when there are more
@@ -1867,15 +1884,15 @@ pub fn checkout_pull_request(
     repo_path: &str,
     remote: &GitHubRepoRef,
     number: u64,
-) -> Result<String, String> {
+) -> Result<String, CommandError> {
     let repo = validate_repo(repo_path)?;
     if let Some(reason) = gh_unavailable_reason(&probe_gh_cli()) {
-        return Err(reason);
+        return Err(reason.into());
     }
     let args = pr_checkout_argv(remote, number)?;
     let refs: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
-    let stdout =
-        run_command_in("gh", &refs, Duration::from_secs(90), Some(&repo)).map_err(bounded_error)?;
+    let stdout = run_command_in("gh", &refs, Duration::from_secs(90), Some(&repo))
+        .map_err(|e| e.wrap(|e| bounded_error(e.to_string())))?;
     Ok(String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
@@ -2002,17 +2019,17 @@ pub fn create_issue(
     title: &str,
     body: &str,
     labels: &[String],
-) -> Result<String, String> {
+) -> Result<String, CommandError> {
     validate_issue_payload(title, body, labels)?;
     let repo = validate_repo(repo_path)?;
     if let Some(reason) = gh_unavailable_reason(&probe_gh_cli()) {
-        return Err(reason);
+        return Err(reason.into());
     }
 
     let args = issue_create_argv(remote, title, body, labels);
     let refs: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
-    let stdout =
-        run_command_in("gh", &refs, Duration::from_secs(90), Some(&repo)).map_err(bounded_error)?;
+    let stdout = run_command_in("gh", &refs, Duration::from_secs(90), Some(&repo))
+        .map_err(|e| e.wrap(|e| bounded_error(e.to_string())))?;
     Ok(String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
@@ -2131,13 +2148,13 @@ fn parse_pr_view(stdout: &[u8]) -> Result<PullRequestDetail, String> {
 }
 
 /// Reads one pull request with `gh pr view`. Read-only, like the listings.
-pub fn view_pull_request(repo_path: &str, number: u64) -> Result<PullRequestDetail, String> {
+pub fn view_pull_request(repo_path: &str, number: u64) -> Result<PullRequestDetail, CommandError> {
     if number == 0 {
         return Err("Invalid pull request number".into());
     }
     let repo = validate_repo(repo_path)?;
     if let Some(reason) = gh_unavailable_reason(&probe_gh_cli()) {
-        return Err(reason);
+        return Err(reason.into());
     }
     let remote = discover_github_remote(repo_path)?
         .ok_or_else(|| "No GitHub remote configured".to_string())?;
@@ -2148,7 +2165,7 @@ pub fn view_pull_request(repo_path: &str, number: u64) -> Result<PullRequestDeta
         Duration::from_secs(45),
         Some(&repo),
     )?;
-    parse_pr_view(&stdout)
+    parse_pr_view(&stdout).map_err(CommandError::from)
 }
 
 /// What a review says.
@@ -2203,7 +2220,7 @@ pub fn pr_action_argv(
     remote: &GitHubRepoRef,
     action: &PrAction,
     head_branch: Option<&str>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, CommandError> {
     let mut args: Vec<String> = vec!["gh".into(), "pr".into()];
     match action {
         PrAction::Create {
@@ -2215,13 +2232,13 @@ pub fn pr_action_argv(
             validate_gh_title("Pull request", title)?;
             validate_gh_body("Pull request", body)?;
             crate::engine::git_writer::validate_ref_name(base)
-                .map_err(|e| format!("Base branch: {e}"))?;
+                .map_err(|e| e.wrap(|e| format!("Base branch: {e}")))?;
             let head =
                 head_branch.ok_or("A pull request is opened from a branch; HEAD is detached")?;
             crate::engine::git_writer::validate_ref_name(head)
-                .map_err(|e| format!("Head branch: {e}"))?;
+                .map_err(|e| e.wrap(|e| format!("Head branch: {e}")))?;
             if head == base {
-                return Err(format!("The head and base branch are both {head}"));
+                return Err(format!("The head and base branch are both {head}").into());
             }
             args.extend(
                 [
@@ -2304,7 +2321,7 @@ pub fn pr_action_argv(
 
 /// Runs an argv [`pr_action_argv`] built — the same value the gate judged,
 /// never a rebuild of it.
-pub fn run_pr_action(repo_path: &str, argv: &[String]) -> Result<String, String> {
+pub fn run_pr_action(repo_path: &str, argv: &[String]) -> Result<String, CommandError> {
     let repo = validate_repo(repo_path)?;
     if argv.first().map(String::as_str) != Some("gh")
         || argv.get(1).map(String::as_str) != Some("pr")
@@ -2312,11 +2329,11 @@ pub fn run_pr_action(repo_path: &str, argv: &[String]) -> Result<String, String>
         return Err("Not a pull-request command".into());
     }
     if let Some(reason) = gh_unavailable_reason(&probe_gh_cli()) {
-        return Err(reason);
+        return Err(reason.into());
     }
     let refs: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
     let stdout = run_command_in("gh", &refs, Duration::from_secs(120), Some(&repo))
-        .map_err(bounded_error)?;
+        .map_err(|e| e.wrap(|e| bounded_error(e.to_string())))?;
     Ok(String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
@@ -2367,7 +2384,7 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
                 releases: Vec::new(),
                 releases_truncated: false,
                 releases_error: None,
-                error: Some(e),
+                error: Some(e.into_message()),
                 warnings: Vec::new(),
             };
         }
@@ -2455,17 +2472,27 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
     if !every_section_failed {
         if let Some(ref pr_err) = pr_error {
             warnings.push(format!(
-                "Pull request listing failed: {pr_err}. The list may be incomplete."
+                "Pull request listing failed: {pr_err}. The list may be incomplete.",
+                pr_err = pr_err.message()
             ));
         }
         if let Some(ref issue_error) = issues_error {
-            warnings.push(format!("Issue listing failed: {issue_error}"));
+            warnings.push(format!(
+                "Issue listing failed: {issue_error}",
+                issue_error = issue_error.message()
+            ));
         }
         if let Some(ref release_error) = releases_error {
-            warnings.push(format!("Release listing failed: {release_error}"));
+            warnings.push(format!(
+                "Release listing failed: {release_error}",
+                release_error = release_error.message()
+            ));
         }
         if let Some(ref run_error) = runs_error {
-            warnings.push(format!("Workflow run listing failed: {run_error}"));
+            warnings.push(format!(
+                "Workflow run listing failed: {run_error}",
+                run_error = run_error.message()
+            ));
         }
     }
 
@@ -2494,14 +2521,14 @@ pub fn load_github_context(repo_path: &str) -> GitHubContext {
         prs_truncated,
         issues,
         issues_truncated,
-        issues_error,
+        issues_error: issues_error.map(CommandError::into_message),
         workflow_runs,
-        runs_error,
+        runs_error: runs_error.map(CommandError::into_message),
         runs_truncated,
         releases,
         releases_truncated,
-        releases_error,
-        error,
+        releases_error: releases_error.map(CommandError::into_message),
+        error: error.map(CommandError::into_message),
         warnings,
     }
 }
@@ -4823,8 +4850,8 @@ esac
 
     /// A full first page, then per-tier answers from `tier`.
     fn tiered_fetch<'a>(
-        tier: impl Fn(&str) -> Result<Vec<Value>, String> + Sync + 'a,
-    ) -> impl Fn(&str, usize, Duration) -> Result<Vec<Value>, String> + Sync + 'a {
+        tier: impl Fn(&str) -> Result<Vec<Value>, CommandError> + Sync + 'a,
+    ) -> impl Fn(&str, usize, Duration) -> Result<Vec<Value>, CommandError> + Sync + 'a {
         move |query, _per_page, _timeout| {
             if query.is_empty() {
                 Ok((1..=ALERT_PAGE_MAX as u64).map(page_row).collect())
@@ -4910,7 +4937,7 @@ esac
     fn a_tier_error_keeps_the_rows_of_the_tiers_that_answered() {
         let fetch = tiered_fetch(|query| match query {
             "&severity=critical" => Ok(vec![page_row(9001)]),
-            "&severity=high" => Err("HTTP 502".to_string()),
+            "&severity=high" => Err("HTTP 502".into()),
             _ => Ok(Vec::new()),
         });
         let fetched = collect_alerts_worst_first(
@@ -4935,7 +4962,7 @@ esac
     /// Every tier failing is a short, loudly partial list, never an empty one.
     #[test]
     fn all_tiers_failing_is_partial_with_the_newest_page_not_empty() {
-        let fetch = tiered_fetch(|_| Err("HTTP 500".to_string()));
+        let fetch = tiered_fetch(|_| Err("HTTP 500".into()));
         let fetched = collect_alerts_worst_first(
             &fetch,
             &["critical", "high", "medium", "low"],
@@ -4953,8 +4980,8 @@ esac
     /// is nothing to be partial about.
     #[test]
     fn a_failing_first_page_fails_the_fetch() {
-        let fetch = |_: &str, _: usize, _: Duration| -> Result<Vec<Value>, String> {
-            Err("HTTP 401".to_string())
+        let fetch = |_: &str, _: usize, _: Duration| -> Result<Vec<Value>, CommandError> {
+            Err("HTTP 401".into())
         };
         let error = collect_alerts_worst_first(
             &fetch,
@@ -4969,7 +4996,7 @@ esac
     /// A page that is not full is the whole answer, with no tier requests.
     #[test]
     fn a_short_first_page_asks_for_no_tiers() {
-        let fetch = |query: &str, _: usize, _: Duration| -> Result<Vec<Value>, String> {
+        let fetch = |query: &str, _: usize, _: Duration| -> Result<Vec<Value>, CommandError> {
             assert!(
                 query.is_empty(),
                 "no tier request for a short page: {query}"

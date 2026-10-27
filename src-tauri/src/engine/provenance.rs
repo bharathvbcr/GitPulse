@@ -22,6 +22,7 @@ use crate::engine::git_cli::{
     git, git_captured, git_captured_with_stdin, read_objects_batch, validate_repo, BatchObject,
     BoundedRun, MAX_OUTPUT_BYTES,
 };
+use crate::ipc_error::CommandError;
 // The one partial-clone probe lives with the quarantine; `git_writer` reaches it here.
 pub(crate) use crate::engine::object_quarantine::is_partial_clone;
 use crate::engine::object_quarantine::{MergeOutcome, ObjectQuarantine};
@@ -164,14 +165,19 @@ fn ref_arg(notes_ref: &str) -> String {
 ///
 /// Both note kinds share this: two copies of the same `git notes add` is two
 /// places for a flag or a failure check to be got wrong in only one of them.
-fn write_note(repo: &Path, notes_ref: &str, commit_sha: &str, payload: &str) -> Result<(), String> {
+fn write_note(
+    repo: &Path,
+    notes_ref: &str,
+    commit_sha: &str,
+    payload: &str,
+) -> Result<(), CommandError> {
     let ref_arg = ref_arg(notes_ref);
     git(
         repo,
         &["notes", &ref_arg, "add", "-f", "-m", payload, commit_sha],
     )
     .map(|_| ())
-    .map_err(|e| format!("git notes add failed: {e}"))
+    .map_err(|e| e.wrap(|e| format!("git notes add failed: {e}")))
 }
 
 /// Reads and decodes `commit_sha`'s note on `notes_ref`.
@@ -191,7 +197,7 @@ fn read_note<T: DeserializeOwned>(
     repo: &Path,
     notes_ref: &str,
     commit_sha: &str,
-) -> Result<Option<T>, String> {
+) -> Result<Option<T>, CommandError> {
     let ref_arg = ref_arg(notes_ref);
     let run = git_captured(repo, &["notes", &ref_arg, "show", commit_sha])?;
     if !run.success {
@@ -203,9 +209,9 @@ fn read_note<T: DeserializeOwned>(
             return Ok(None);
         }
         return Err(if stderr.is_empty() {
-            format!("git notes show exited with status {}", run.status_code)
+            format!("git notes show exited with status {}", run.status_code).into()
         } else {
-            stderr
+            stderr.into()
         });
     }
     if let Some(reason) = &run.incomplete {
@@ -216,7 +222,8 @@ fn read_note<T: DeserializeOwned>(
             "the note on {notes_ref} for {commit_sha} is incomplete (git notes show {}); \
              a prefix of it is not the note",
             reason.describe()
-        ));
+        )
+        .into());
     }
     decode_note(notes_ref, commit_sha, &run.stdout)
 }
@@ -227,11 +234,12 @@ fn decode_note<T: DeserializeOwned>(
     notes_ref: &str,
     commit_sha: &str,
     bytes: &[u8],
-) -> Result<Option<T>, String> {
+) -> Result<Option<T>, CommandError> {
     let text = String::from_utf8_lossy(bytes);
     serde_json::from_str::<T>(text.trim())
         .map(Some)
         .map_err(|e| format!("the note on {notes_ref} for {commit_sha} did not decode: {e}"))
+        .map_err(CommandError::from)
 }
 
 /// What [`read_note_blobs`] expects at each id it is asked for.
@@ -245,7 +253,11 @@ const NOTE_BLOB: BatchObject = BatchObject {
 /// failure shape belong to [`read_objects_batch`], which the commit-signature
 /// reader shares; this only says what a note blob is.
 fn read_note_blobs(repo: &Path, oids: &[String]) -> HashMap<String, Result<Vec<u8>, String>> {
+    // A note that could not be read is a row's text, never a command's error.
     read_objects_batch(repo, oids, NOTE_BLOB, MAX_OUTPUT_BYTES, &<[u8]>::to_vec)
+        .into_iter()
+        .map(|(oid, answer)| (oid, answer.map_err(CommandError::into_message)))
+        .collect()
 }
 
 /// Appends or replaces a verification note for a commit.
@@ -253,7 +265,7 @@ pub fn write_verification_note(
     repo_path: &str,
     commit_sha: &str,
     note: &VerificationNote,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     let repo = validate_repo(repo_path)?;
     let payload = serde_json::to_string(note).map_err(|e| e.to_string())?;
     write_note(&repo, VERIFICATION_NOTES_REF, commit_sha, &payload)
@@ -264,7 +276,7 @@ pub fn write_verification_note(
 pub fn read_verification_note(
     repo_path: &str,
     commit_sha: &str,
-) -> Result<Option<VerificationNote>, String> {
+) -> Result<Option<VerificationNote>, CommandError> {
     let repo = validate_repo(repo_path)?;
     read_note(&repo, VERIFICATION_NOTES_REF, commit_sha)
 }
@@ -274,7 +286,7 @@ pub fn write_session_note(
     repo_path: &str,
     commit_sha: &str,
     note: &SessionEpisodeNote,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     let repo = validate_repo(repo_path)?;
     let payload = serde_json::to_string(note).map_err(|e| e.to_string())?;
     write_note(&repo, SESSION_NOTES_REF, commit_sha, &payload)
@@ -284,7 +296,7 @@ pub fn write_session_note(
 pub fn read_session_note(
     repo_path: &str,
     commit_sha: &str,
-) -> Result<Option<SessionEpisodeNote>, String> {
+) -> Result<Option<SessionEpisodeNote>, CommandError> {
     let repo = validate_repo(repo_path)?;
     read_note(&repo, SESSION_NOTES_REF, commit_sha)
 }
@@ -362,7 +374,7 @@ pub fn compute_freshness(
 ) -> ProvenanceFreshness {
     let repo = match validate_repo(repo_path) {
         Ok(repo) => repo,
-        Err(e) => return ProvenanceFreshness::unexamined(commit_sha, e),
+        Err(e) => return ProvenanceFreshness::unexamined(commit_sha, e.into_message()),
     };
 
     // The batch's own rows, asked for one revision, with a commit that
@@ -704,7 +716,7 @@ fn resolve_revisions(repo: &Path, revs: &[String], limit: usize) -> Vec<Result<S
         Ok(run) => run,
         Err(e) => {
             for row in sent {
-                answers[row] = Err(format!("could not run git cat-file: {e}"));
+                answers[row] = Err(format!("could not run git cat-file: {}", e.message()));
             }
             return answers;
         }
@@ -752,11 +764,11 @@ fn resolve_revisions(repo: &Path, revs: &[String], limit: usize) -> Vec<Result<S
 /// anew, and the branch and pull-request lists ask on every refresh. A
 /// failure, a cut-off listing and a missing ref an older git refuses to load
 /// are never kept.
-fn noted_commits(repo: &Path, notes_ref: &str) -> Result<HashMap<String, String>, String> {
+fn noted_commits(repo: &Path, notes_ref: &str) -> Result<HashMap<String, String>, CommandError> {
     let ref_arg = ref_arg(notes_ref);
     let args = ["notes", ref_arg.as_str(), "list"];
     let listing = ref_cache::through(repo, &[notes_ref], &args, || {
-        notes_listing(&git_captured(repo, &args)?, notes_ref)
+        notes_listing(&git_captured(repo, &args)?, notes_ref).map_err(CommandError::from)
     })?;
 
     // `<note blob> <annotated commit>`, one per line.
@@ -846,7 +858,10 @@ fn resolve_base(repo: &Path, base_branch: Option<&str>) -> Result<String, String
 fn measure_distance(repo: &Path, commit_sha: &str, base: &str) -> (Option<u32>, String) {
     let range = format!("{commit_sha}..{base}");
     match git_captured(repo, &["rev-list", "--count", &range, "--"]) {
-        Err(e) => (None, format!("could not run git rev-list: {e}")),
+        Err(e) => (
+            None,
+            format!("could not run git rev-list: {e}", e = e.message()),
+        ),
         Ok(run) if !run.success => (
             None,
             format!(
@@ -868,20 +883,21 @@ fn measure_distance(repo: &Path, commit_sha: &str, base: &str) -> (Option<u32>, 
 ///
 /// A prefix of a stream cut at the output cap is an error here, never a
 /// shorter answer: every caller below interprets the whole text.
-fn git_complete_text(repo: &Path, args: &[&str], label: &str) -> Result<String, String> {
+fn git_complete_text(repo: &Path, args: &[&str], label: &str) -> Result<String, CommandError> {
     let run = git_captured(repo, args)?.require_complete(label)?;
     if !run.success {
         return Err(format!(
             "{label} failed: {}",
             String::from_utf8_lossy(&run.stderr).trim()
-        ));
+        )
+        .into());
     }
     Ok(String::from_utf8_lossy(&run.stdout).into_owned())
 }
 
 /// `(ahead, behind)` of `commit` against `base`: one
 /// `rev-list --left-right --count commit...base`.
-fn left_right_count(repo: &Path, commit: &str, base: &str) -> Result<(u32, u32), String> {
+fn left_right_count(repo: &Path, commit: &str, base: &str) -> Result<(u32, u32), CommandError> {
     let range = format!("{commit}...{base}");
     let text = git_complete_text(
         repo,
@@ -894,11 +910,12 @@ fn left_right_count(repo: &Path, commit: &str, base: &str) -> Result<(u32, u32),
         _ => Err(format!(
             "git rev-list --left-right --count returned {:?}, not two counts",
             text.trim()
-        )),
+        )
+        .into()),
     }
 }
 
-fn is_shallow(repo: &Path) -> Result<bool, String> {
+fn is_shallow(repo: &Path) -> Result<bool, CommandError> {
     git_complete_text(
         repo,
         &["rev-parse", "--is-shallow-repository"],
@@ -922,11 +939,15 @@ fn base_relation(repo: &Path, commit: &str, base: &str) -> BaseRelation {
     };
     let reachable = match crate::harness::review::contains(repo, base, commit) {
         Ok(reachable) => reachable,
-        Err(reason) => return unmeasured(format!("not measured: {reason}")),
+        Err(reason) => {
+            return unmeasured(format!("not measured: {reason}", reason = reason.message()))
+        }
     };
     let (ahead, behind) = match left_right_count(repo, commit, base) {
         Ok(counts) => counts,
-        Err(reason) => return unmeasured(format!("not measured: {reason}")),
+        Err(reason) => {
+            return unmeasured(format!("not measured: {reason}", reason = reason.message()))
+        }
     };
     if reachable != (ahead == 0) {
         return unmeasured(format!(
@@ -945,7 +966,9 @@ fn base_relation(repo: &Path, commit: &str, base: &str) -> BaseRelation {
                         .to_string(),
                 )
             }
-            Err(reason) => return unmeasured(format!("not measured: {reason}")),
+            Err(reason) => {
+                return unmeasured(format!("not measured: {reason}", reason = reason.message()))
+            }
         }
     }
     let merge_base = if reachable {
@@ -963,7 +986,9 @@ fn base_relation(repo: &Path, commit: &str, base: &str) -> BaseRelation {
                     String::from_utf8_lossy(&run.stderr).trim()
                 ))
             }
-            Err(reason) => return unmeasured(format!("not measured: {reason}")),
+            Err(reason) => {
+                return unmeasured(format!("not measured: {reason}", reason = reason.message()))
+            }
         }
     };
     BaseRelation {
@@ -1132,7 +1157,7 @@ struct Reachable {
 /// through `sha`. Merge-commit ancestry is decided before fast-forward: a
 /// non-tip commit of a `--no-ff` branch is on the base's first-parent line
 /// only through the merge.
-fn reachable_route(repo: &Path, sha: &str, base: &str) -> Result<Reachable, String> {
+fn reachable_route(repo: &Path, sha: &str, base: &str) -> Result<Reachable, CommandError> {
     let ff = || Reachable {
         via: LandedVia::Ff,
         merge_commit: None,
@@ -1170,7 +1195,8 @@ fn reachable_route(repo: &Path, sha: &str, base: &str) -> Result<Reachable, Stri
     else {
         return Err(format!(
             "{sha} is reachable from {base} but no commit on its first-parent line descends from it"
-        ));
+        )
+        .into());
     };
     let parents = git_complete_text(
         repo,
@@ -1206,15 +1232,16 @@ fn squash_commit(
     merge_base: &str,
     commit: &str,
     base: &str,
-) -> Result<Search, String> {
-    let patch_id = |bytes: &[u8]| -> Result<Vec<(String, String)>, String> {
+) -> Result<Search, CommandError> {
+    let patch_id = |bytes: &[u8]| -> Result<Vec<(String, String)>, CommandError> {
         let run = git_captured_with_stdin(repo, &["patch-id", "--stable"], bytes)?
             .require_complete("git patch-id")?;
         if !run.success {
             return Err(format!(
                 "git patch-id failed: {}",
                 String::from_utf8_lossy(&run.stderr).trim()
-            ));
+            )
+            .into());
         }
         Ok(String::from_utf8_lossy(&run.stdout)
             .lines()
@@ -1281,7 +1308,8 @@ fn squash_commit(
         return Err(format!(
             "git log -p failed: {}",
             String::from_utf8_lossy(&log.stderr).trim()
-        ));
+        )
+        .into());
     }
     Ok(
         match patch_id(&log.stdout)?
@@ -1297,7 +1325,7 @@ fn squash_commit(
 
 /// True when every commit of `sha` not on `base` has its patch on the base
 /// under another id (`git cherry`: all `-`), and there is at least one.
-fn is_rebased(repo: &Path, sha: &str, base: &str) -> Result<bool, String> {
+fn is_rebased(repo: &Path, sha: &str, base: &str) -> Result<bool, CommandError> {
     let text = git_complete_text(repo, &["cherry", base, sha], "git cherry")?;
     let mut lines = text.lines().peekable();
     Ok(lines.peek().is_some() && lines.all(|line| line.starts_with('-')))
@@ -1305,7 +1333,7 @@ fn is_rebased(repo: &Path, sha: &str, base: &str) -> Result<bool, String> {
 
 /// The base's commits whose patches `sha`'s commits were rebased into
 /// (`rev-list --cherry-mark`: the `=` rows of the base side).
-fn rebase_equivalents(repo: &Path, sha: &str, base: &str) -> Result<Vec<String>, String> {
+fn rebase_equivalents(repo: &Path, sha: &str, base: &str) -> Result<Vec<String>, CommandError> {
     let range = format!("{sha}...{base}");
     let text = git_complete_text(
         repo,
@@ -1357,7 +1385,7 @@ fn tree_route(repo: &Path, sha: &str, base: &str) -> TreeRoute {
             match base_tree {
                 Ok(text) if text.trim() == tree => TreeRoute::Present,
                 Ok(_) => TreeRoute::Absent,
-                Err(e) => TreeRoute::Failed(e),
+                Err(e) => TreeRoute::Failed(e.into_message()),
             }
         }
         Ok(MergeOutcome::Conflicted { .. }) => TreeRoute::Conflicted,
@@ -1366,7 +1394,11 @@ fn tree_route(repo: &Path, sha: &str, base: &str) -> TreeRoute {
 }
 
 /// Whether `commit` and `merge_base` have the same tree: nothing to land.
-fn has_no_content_to_land(repo: &Path, commit: &str, merge_base: &str) -> Result<bool, String> {
+fn has_no_content_to_land(
+    repo: &Path,
+    commit: &str,
+    merge_base: &str,
+) -> Result<bool, CommandError> {
     let text = git_complete_text(
         repo,
         &[
@@ -1386,7 +1418,7 @@ fn has_no_content_to_land(repo: &Path, commit: &str, merge_base: &str) -> Result
 /// The oldest revert commit naming `target` in the base's history after it,
 /// found by the message `git revert` writes and by ancestry (`target..base`
 /// restricted to descendants of `target`).
-fn first_revert(repo: &Path, target: &str, base: &str) -> Result<Option<String>, String> {
+fn first_revert(repo: &Path, target: &str, base: &str) -> Result<Option<String>, CommandError> {
     let needle = format!("This reverts commit {target}");
     let range = format!("{target}..{base}");
     let text = git_complete_text(
@@ -1445,7 +1477,7 @@ fn revert_state(
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    failure = Some(e);
+                    failure = Some(e.into_message());
                     break;
                 }
             }
@@ -1479,7 +1511,7 @@ fn revert_state(
 /// speak for: `HEAD` means the branch it is on, never `HEAD`'s own reflog
 /// (which records every checkout). `None` for a detached HEAD, a tag or a raw
 /// commit id, which have no reflog of their own.
-fn base_ref_name(repo: &Path, base_name: &str) -> Result<Option<String>, String> {
+fn base_ref_name(repo: &Path, base_name: &str) -> Result<Option<String>, CommandError> {
     if base_name == "HEAD" {
         let run = git_captured(repo, &["symbolic-ref", "--quiet", "HEAD"])?;
         return match (run.success, run.status_code) {
@@ -1490,7 +1522,8 @@ fn base_ref_name(repo: &Path, base_name: &str) -> Result<Option<String>, String>
             _ => Err(format!(
                 "git symbolic-ref failed: {}",
                 String::from_utf8_lossy(&run.stderr).trim()
-            )),
+            )
+            .into()),
         };
     }
     if base_name.starts_with('-') {
@@ -1504,7 +1537,8 @@ fn base_ref_name(repo: &Path, base_name: &str) -> Result<Option<String>, String>
         return Err(format!(
             "git rev-parse --symbolic-full-name failed: {}",
             String::from_utf8_lossy(&run.stderr).trim()
-        ));
+        )
+        .into());
     }
     let full = String::from_utf8_lossy(&run.stdout).trim().to_string();
     Ok((full.starts_with("refs/heads/") || full.starts_with("refs/remotes/")).then_some(full))
@@ -1529,7 +1563,7 @@ impl Placement {
 
 fn place_in_time(repo: &Path, base_name: &str, target: &str) -> Placement {
     match base_ref_name(repo, base_name) {
-        Err(reason) => Placement::unplaced(reason),
+        Err(reason) => Placement::unplaced(reason.into_message()),
         Ok(Some(full_ref)) => reflog_landed_at(repo, &full_ref, target),
         Ok(None) => match git_complete_text(
             repo,
@@ -1547,7 +1581,7 @@ fn place_in_time(repo: &Path, base_name: &str, target: &str) -> Placement {
                 },
                 Err(_) => Placement::unplaced(format!("git show answered {:?}", text.trim())),
             },
-            Err(reason) => Placement::unplaced(reason),
+            Err(reason) => Placement::unplaced(reason.into_message()),
         },
     }
 }
@@ -1578,7 +1612,12 @@ fn reflog_landed_at(repo: &Path, full_ref: &str, target: &str) -> Placement {
         "git reflog show",
     ) {
         Ok(text) => text,
-        Err(reason) => return Placement::unplaced(format!("no reflog for {full_ref:?}: {reason}")),
+        Err(reason) => {
+            return Placement::unplaced(format!(
+                "no reflog for {full_ref:?}: {reason}",
+                reason = reason.message()
+            ))
+        }
     };
     let mut lines: Vec<&str> = text.lines().collect();
     // One more than the window was asked for: that extra row is how a log of
@@ -1644,7 +1683,8 @@ fn reflog_landed_at(repo: &Path, full_ref: &str, target: &str) -> Placement {
         }
         Err(reason) => {
             return Placement::unplaced(format!(
-                "could not place the landing in the reflog: {reason}"
+                "could not place the landing in the reflog: {reason}",
+                reason = reason.message()
             ))
         }
     };
@@ -1714,7 +1754,14 @@ fn landed_unfenced(repo_path: &str, commit: &str, base_branch: Option<&str>) -> 
     let base_name = base_branch.unwrap_or(DEFAULT_BASE);
     let repo = match validate_repo(repo_path) {
         Ok(repo) => repo,
-        Err(error) => return Landed::unknown(commit, None, LandedReason::Unresolvable, error),
+        Err(error) => {
+            return Landed::unknown(
+                commit,
+                None,
+                LandedReason::Unresolvable,
+                error.into_message(),
+            )
+        }
     };
     match is_partial_clone(&repo) {
         Ok(false) => {}
@@ -1734,7 +1781,8 @@ fn landed_unfenced(repo_path: &str, commit: &str, base_branch: Option<&str>) -> 
                 None,
                 LandedReason::ComparisonFailed,
                 format!(
-                    "could not tell whether this is a partial clone, so nothing was run: {reason}"
+                    "could not tell whether this is a partial clone, so nothing was run: {reason}",
+                    reason = reason.message()
                 ),
             )
         }
@@ -1793,7 +1841,10 @@ fn landed_unfenced(repo_path: &str, commit: &str, base_branch: Option<&str>) -> 
             }
             Err(reason) => {
                 answer.reason = Some(LandedReason::ComparisonFailed);
-                answer.error = format!("landed, but how was not determined: {reason}");
+                answer.error = format!(
+                    "landed, but how was not determined: {reason}",
+                    reason = reason.message()
+                );
                 revert_targets.clear();
             }
         }
@@ -1877,9 +1928,12 @@ fn unreachable_landing(
     base: &str,
     merge_base: Option<&str>,
 ) -> Unreachable {
-    let failed = |what: &str, reason: String| Unreachable::Unknown {
+    let failed = |what: &str, reason: CommandError| Unreachable::Unknown {
         reason: LandedReason::ComparisonFailed,
-        error: format!("could not tell whether the base already holds this work: {what}: {reason}"),
+        error: format!(
+            "could not tell whether the base already holds this work: {what}: {}",
+            reason.message()
+        ),
     };
     let mut squash_incomplete = false;
     if let Some(fork) = merge_base {
@@ -1963,7 +2017,7 @@ fn unreachable_landing(
                     be shown present or absent"
                 .to_string(),
         },
-        TreeRoute::Failed(reason) => failed("content comparison", reason),
+        TreeRoute::Failed(reason) => failed("content comparison", reason.into()),
     }
 }
 
@@ -1972,9 +2026,12 @@ fn unreachable_landing(
 /// commits (an import of a snapshot lands as exactly that tree); no match is
 /// null, because the content may have come in under other ids.
 fn unrelated_landing(repo: &Path, sha: &str, base: &str) -> Unreachable {
-    let failed = |reason: String| Unreachable::Unknown {
+    let failed = |reason: CommandError| Unreachable::Unknown {
         reason: LandedReason::ComparisonFailed,
-        error: format!("could not tell whether the base already holds this work: {reason}"),
+        error: format!(
+            "could not tell whether the base already holds this work: {}",
+            reason.message()
+        ),
     };
     let tree = match git_complete_text(
         repo,
@@ -2036,7 +2093,7 @@ fn base_touched_branch_paths(
     fork: &str,
     sha: &str,
     base: &str,
-) -> Result<Touched, String> {
+) -> Result<Touched, CommandError> {
     let own = git_complete_text(
         repo,
         &[
@@ -2122,7 +2179,7 @@ pub fn freshness_batch_within(
         Err(e) => {
             return revisions
                 .iter()
-                .map(|rev| ProvenanceFreshness::unexamined(rev.clone(), e.clone()))
+                .map(|rev| ProvenanceFreshness::unexamined(rev.clone(), e.message().to_string()))
                 .collect()
         }
     };
@@ -2217,7 +2274,7 @@ fn freshness_rows(
                 (Some(err), Unnoted::Skip) => {
                     return RowPlan::Done(Box::new(ProvenanceFreshness::unexamined(
                         sha,
-                        err.clone(),
+                        err.message().to_string(),
                     )))
                 }
                 (Some(_), Unnoted::Measure) => (NoteSource::Ask, NoteSource::Ask),
@@ -2325,7 +2382,7 @@ fn freshness_rows(
                     verified: verification.is_some(),
                     verification,
                     session,
-                    ..ProvenanceFreshness::unexamined(sha, reason)
+                    ..ProvenanceFreshness::unexamined(sha, reason.into_message())
                 }
                 .with_relation(relation);
             }
@@ -2425,7 +2482,7 @@ impl NoteSource {
         notes_ref: &str,
         sha: &str,
         blobs: &HashMap<String, Result<Vec<u8>, String>>,
-    ) -> Result<Option<T>, String> {
+    ) -> Result<Option<T>, CommandError> {
         match self {
             Self::Absent => Ok(None),
             Self::Ask => read_note(repo, notes_ref, sha),
@@ -2433,10 +2490,12 @@ impl NoteSource {
                 Some(Ok(bytes)) => decode_note(notes_ref, sha, bytes),
                 Some(Err(reason)) => Err(format!(
                     "the note on {notes_ref} for {sha} could not be read: {reason}"
-                )),
+                )
+                .into()),
                 None => Err(format!(
                     "the note on {notes_ref} for {sha} was not read: its blob was never asked for"
-                )),
+                )
+                .into()),
             },
         }
     }
@@ -3093,7 +3152,11 @@ mod batch_tests {
         assert_eq!(answers[&a], Ok(b"hi".to_vec()));
         for oid in [&b, &c] {
             let err = answers[oid].as_ref().unwrap_err();
-            assert!(err.contains("answered") && err.contains(&c), "{oid}: {err}");
+            assert!(
+                err.contains("answered") && err.contains(&c),
+                "{oid}: {err}",
+                err = err.message()
+            );
         }
 
         let huge = format!("{a} blob {}\nhi\n", usize::MAX);

@@ -15,7 +15,6 @@
 //! health. Scanner advisory databases are never refreshed implicitly — a stale
 //! DB is the user's call, not a background write outside the repo.
 
-#[allow(unused_imports)]
 use crate::analyzer::cargo_supply::{
     self, classify_bin_audit, crev_summary, file_contains_auditable_section,
     parse_cargo_crev_jsonl, parse_cargo_deny_sarif, BinAuditKind,
@@ -27,6 +26,8 @@ use crate::engine::git_cli::{
     is_timed_out, resolve_spawn_program_in, sandbox_join, sandbox_join_canonical, validate_repo,
     CapturedOutput, PathSource, ToolProbe,
 };
+#[allow(unused_imports)]
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -430,8 +431,8 @@ impl ScanClock {
     /// A command is cut by the deadline only if the deadline shortened its
     /// timeout and it then timed out. One that failed for its own reason —
     /// however close to the deadline — is reported by its own failure.
-    fn note_finished<T>(&self, outcome: &Result<T, String>, what: &str, shortened: bool) {
-        if shortened && outcome.as_ref().is_err_and(|e| is_timed_out(e)) {
+    fn note_finished<T>(&self, outcome: &Result<T, CommandError>, what: &str, shortened: bool) {
+        if shortened && outcome.as_ref().is_err_and(|e| is_timed_out(e.message())) {
             self.note_not_run(&format!("{what} (cut off at the deadline)"));
         }
     }
@@ -524,12 +525,15 @@ impl ScanEnv {
 pub struct DepsScanner;
 
 impl DepsScanner {
-    pub fn scan(repo_path: &str) -> Result<DepsHealthReport, String> {
+    pub fn scan(repo_path: &str) -> Result<DepsHealthReport, CommandError> {
         Self::scan_with(repo_path, ScanOptions::default())
     }
 
     /// One scan under one [`AUDIT_TIMEOUT`] deadline.
-    pub fn scan_with(repo_path: &str, options: ScanOptions) -> Result<DepsHealthReport, String> {
+    pub fn scan_with(
+        repo_path: &str,
+        options: ScanOptions,
+    ) -> Result<DepsHealthReport, CommandError> {
         Self::scan_with_deadline(repo_path, options, ScanDeadline::audit())
     }
 
@@ -539,7 +543,7 @@ impl DepsScanner {
         repo_path: &str,
         options: ScanOptions,
         budget: Duration,
-    ) -> Result<DepsHealthReport, String> {
+    ) -> Result<DepsHealthReport, CommandError> {
         Self::scan_with_deadline(repo_path, options, ScanDeadline::after(budget))
     }
 
@@ -550,7 +554,7 @@ impl DepsScanner {
         repo_path: &str,
         options: ScanOptions,
         deadline: ScanDeadline,
-    ) -> Result<DepsHealthReport, String> {
+    ) -> Result<DepsHealthReport, CommandError> {
         let repo = validate_repo(repo_path)?;
         let clock = Arc::new(ScanClock::new(deadline));
         let mut env = ScanEnv::from_options(&options);
@@ -649,7 +653,7 @@ impl DepsScanner {
     }
 }
 
-fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTargets), String> {
+fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTargets), CommandError> {
     let (listed, file_limit) = list_repo_files(repo)?;
     let mut limit_notices = file_limit.into_iter().collect::<Vec<_>>();
     let mut other: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -1237,7 +1241,7 @@ fn dispatch_npm_audit(
             }
             Err(e) => fail(report, e),
         },
-        Err(e) => fail(report, e),
+        Err(e) => fail(report, e.into_message()),
     }
 }
 
@@ -1271,7 +1275,7 @@ fn dispatch_bun_audit(
             }
             Err(e) => fail(report, e),
         },
-        Err(e) => fail(report, e),
+        Err(e) => fail(report, e.into_message()),
     }
 }
 
@@ -1301,7 +1305,7 @@ fn dispatch_npm_outdated(
             &mut report.issues,
             "warning",
             "outdated_failed",
-            e,
+            e.into_message(),
             Some(label.to_string()),
         ),
     }
@@ -1391,7 +1395,7 @@ fn enrich_cargo(
                     &mut report.issues,
                     "warning",
                     "cargo_audit_failed",
-                    e,
+                    e.into_message(),
                     Some(rel.clone()),
                 );
             }
@@ -1579,7 +1583,7 @@ fn enrich_cargo_deny(
                     &mut report.issues,
                     "warning",
                     "cargo_deny_failed",
-                    err,
+                    err.into_message(),
                     Some(rel.clone()),
                 );
             }
@@ -1682,7 +1686,7 @@ fn enrich_cargo_crev(
                     &mut report.issues,
                     "warning",
                     "cargo_crev_failed",
-                    err,
+                    err.into_message(),
                     Some(rel.clone()),
                 );
             }
@@ -1819,7 +1823,7 @@ fn scan_auditable_binaries(
                     &mut report.issues,
                     "warning",
                     "cargo_audit_bin_failed",
-                    err,
+                    err.into_message(),
                     Some(label),
                 );
             }
@@ -2446,7 +2450,7 @@ pub(crate) fn parse_bundler_audit_json(text: &str) -> Result<Vec<Vulnerability>,
 /// zero findings, even on exit 0: these scanners always emit at least `[]` or
 /// a config message, so emptiness is itself a failed run.
 fn scanner_stdout(
-    out: Result<crate::engine::git_cli::CapturedOutput, String>,
+    out: Result<crate::engine::git_cli::CapturedOutput, CommandError>,
     issues: &mut Vec<HealthIssue>,
     code: &str,
     program: &str,
@@ -2473,7 +2477,7 @@ fn scanner_stdout(
             Some(text)
         }
         Err(e) => {
-            push_issue(issues, "warning", code, e, label);
+            push_issue(issues, "warning", code, e.into_message(), label);
             None
         }
     }
@@ -2536,14 +2540,19 @@ fn npm_cwd(repo: &Path, rel_dir: &str) -> Result<PathBuf, String> {
     Ok(canon)
 }
 
-fn run_npm_json(cwd: &Path, args: &[&str], env: &ScanEnv) -> Result<String, String> {
+fn run_npm_json(cwd: &Path, args: &[&str], env: &ScanEnv) -> Result<String, CommandError> {
     run_json_cli(cwd, npm_program(), args, env)
 }
 
 /// Runs a CLI that prints JSON on stdout. A non-zero exit with a JSON body is
 /// success: `npm audit` and `bun audit` both exit 1 when they find advisories.
 /// Empty stdout on failure is an error, never a clean report.
-fn run_json_cli(cwd: &Path, program: &str, args: &[&str], env: &ScanEnv) -> Result<String, String> {
+fn run_json_cli(
+    cwd: &Path,
+    program: &str,
+    args: &[&str],
+    env: &ScanEnv,
+) -> Result<String, CommandError> {
     let pinned = if program == npm_program() {
         npm_pinned_config(env)
     } else {
@@ -2563,9 +2572,10 @@ fn run_json_cli(cwd: &Path, program: &str, args: &[&str], env: &ScanEnv) -> Resu
             return Err(format!(
                 "{program} {} produced no output",
                 args.first().unwrap_or(&"")
-            ));
+            )
+            .into());
         }
-        return Err(err);
+        return Err(err.into());
     }
     Ok(trimmed.to_string())
 }
@@ -2585,9 +2595,10 @@ fn probe_tool_version(program: &str, args: &[&str], env: &ScanEnv, timeout: Dura
     // tool exists. It is `NotRun`, never "not installed" and never "found but
     // failed": the report must not tell the reader to install what is there.
     if let (Some(scan), Err(error)) = (env.scan.as_ref(), result.as_ref()) {
-        if error.starts_with(DEADLINE_REFUSED) || scan.deadline_cut_probe(error) {
+        if error.message().starts_with(DEADLINE_REFUSED) || scan.deadline_cut_probe(error.message())
+        {
             scan.state().probes_unresolved = true;
-            return ToolProbe::NotRun(error.clone());
+            return ToolProbe::NotRun(error.message().to_string());
         }
     }
     classify_tool_probe(program, result)
@@ -2925,7 +2936,7 @@ fn capture_scanner_command(
     cwd: Option<&Path>,
     timeout: Duration,
     extra_env: &[(&str, &str)],
-) -> Result<CapturedOutput, String> {
+) -> Result<CapturedOutput, CommandError> {
     // The command's own timeout, shortened to what is left of the scan
     // deadline: a command already running at the deadline is cut at it.
     let what = format!("{program} {}", args.first().copied().unwrap_or_default());
@@ -2933,10 +2944,7 @@ fn capture_scanner_command(
         Some(scan) => match scan.timeout_for(timeout, what.trim_end()) {
             Some(clamped) => clamped,
             None => {
-                return Err(format!(
-                    "{DEADLINE_REFUSED}`{}` could start",
-                    what.trim_end()
-                ))
+                return Err(format!("{DEADLINE_REFUSED}`{}` could start", what.trim_end()).into())
             }
         },
         None => (timeout, false),
@@ -3102,7 +3110,7 @@ fn node_program() -> &'static str {
     }
 }
 
-fn list_repo_files(repo: &Path) -> Result<(Vec<String>, Option<ScanLimitNotice>), String> {
+fn list_repo_files(repo: &Path) -> Result<(Vec<String>, Option<ScanLimitNotice>), CommandError> {
     let stdout = git_text(
         repo,
         &[

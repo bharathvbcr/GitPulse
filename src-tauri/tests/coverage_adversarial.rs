@@ -468,7 +468,7 @@ fn detail_lookup_accepts_non_normalized_path_forms() {
     assert!(!canonical.lines.is_empty(), "fixture must have data");
     for form in ["src\\lib.rs", "./src/lib.rs", "src/lib.rs/"] {
         let detail = CoverageScanner::file_coverage(root, form)
-            .unwrap_or_else(|e| panic!("form {form:?} rejected: {e}"));
+            .unwrap_or_else(|e| panic!("form {form:?} rejected: {e}", e = e.message()));
         assert_eq!(detail.path, canonical.path, "{form}: canonical key");
         assert_eq!(detail.totals, canonical.totals, "{form}");
         assert_eq!(detail.lines, canonical.lines, "{form}");

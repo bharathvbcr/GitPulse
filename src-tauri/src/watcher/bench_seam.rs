@@ -18,6 +18,7 @@
 //! the same session `start_watch` does, with callbacks that drop what they are
 //! told.
 
+use crate::ipc_error::CommandError;
 use std::path::{Path, PathBuf};
 
 use notify::Event;
@@ -28,7 +29,7 @@ use super::{
 };
 
 /// Starts a real watch session on `repo_path` whose announcements go nowhere.
-pub fn start_idle_watch(state: &WatcherState, repo_path: &str) -> Result<String, String> {
+pub fn start_idle_watch(state: &WatcherState, repo_path: &str) -> Result<String, CommandError> {
     start_watch_observed(state, repo_path.to_owned(), |_| {}, |_| {})
 }
 

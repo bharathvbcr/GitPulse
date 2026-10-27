@@ -11,6 +11,7 @@
 use super::{invalidate, load_vault, normalize_rel, refresh, BrokenLink, DocsStatus};
 use crate::engine::git_cli::{sandbox_join, sandbox_write_expecting, validate_repo};
 use crate::engine::git_writer::{GitWriter, MovePlan};
+use crate::ipc_error::CommandError;
 use markdev_vault::note::{has_markdown_extension, stem, strip_markdown_extension};
 use markdev_vault::rename::{rewrite_links_in, ProtectedRanges};
 use markdev_vault::{Note, Vault, DEFAULT_MAX_NOTE_BYTES};
@@ -92,8 +93,8 @@ pub fn rename_doc(
     repo_path: &str,
     from: &str,
     to: &str,
-    gate: impl FnOnce(&DocRenamePlan) -> Result<(), String>,
-) -> Result<DocRenameOutcome, String> {
+    gate: impl FnOnce(&DocRenamePlan) -> Result<(), CommandError>,
+) -> Result<DocRenameOutcome, CommandError> {
     let repo = validate_repo(repo_path)?;
     let from = normalize_rel(from)?;
     let to = normalize_rel(to)?;
@@ -109,10 +110,10 @@ pub fn rename_doc(
     let built = load_vault(repo_path, true)?;
     let vault = &built.vault;
     if !vault.notes().iter().any(|n| n.path == from) {
-        return Err(format!("note not in vault: {from}"));
+        return Err(format!("note not in vault: {from}").into());
     }
     if vault.notes().iter().any(|n| n.path == to) {
-        return Err(format!("destination already exists in vault: {to}"));
+        return Err(format!("destination already exists in vault: {to}").into());
     }
     // The vault registers a note under its path without the extension,
     // lowercased (`link_key`), so `B.md` and `B.mdx` answer to one name: moving
@@ -130,13 +131,14 @@ pub fn rename_doc(
             "destination {to} shares its link name with the existing note {}; \
              links to either would resolve to the wrong one",
             other.path
-        ));
+        )
+        .into());
     }
     // Filesystem authority: refuse overwriting an on-disk file the index
     // somehow missed.
     let to_abs = sandbox_join(&repo, &to)?;
     if to_abs.exists() {
-        return Err(format!("destination already exists on disk: {to}"));
+        return Err(format!("destination already exists on disk: {to}").into());
     }
 
     // Untracked notes are outside the vault, so their links were not searched
@@ -165,7 +167,7 @@ pub fn rename_doc(
     // ones are staged together, so staging costs a bounded number of git
     // processes however many notes link here, and each file still gets its own
     // outcome.
-    let written: Vec<Result<bool, String>> = edits
+    let written: Vec<Result<bool, CommandError>> = edits
         .iter()
         .enumerate()
         .map(|(attempt, edit)| write_planned(repo_path, edit, attempt))
@@ -191,7 +193,7 @@ pub fn rename_doc(
                 }
                 Some(Err(error)) => failed.push(DocRenameFailure {
                     path: edit.path,
-                    error: format!("rewritten but not staged: {error}"),
+                    error: format!("rewritten but not staged: {error}", error = error.message()),
                 }),
                 None => failed.push(DocRenameFailure {
                     path: edit.path,
@@ -201,7 +203,7 @@ pub fn rename_doc(
             Ok(false) => skipped_conflict.push(edit.path),
             Err(error) => failed.push(DocRenameFailure {
                 path: edit.path,
-                error,
+                error: error.into_message(),
             }),
         }
     }
@@ -228,7 +230,11 @@ pub fn rename_doc(
 
 /// Writes one planned rewrite over exactly the bytes it was planned from.
 /// `Ok(false)`: the file changed since, and was left as it is.
-fn write_planned(repo_path: &str, edit: &PlannedEdit, attempt: usize) -> Result<bool, String> {
+fn write_planned(
+    repo_path: &str,
+    edit: &PlannedEdit,
+    attempt: usize,
+) -> Result<bool, CommandError> {
     #[cfg(test)]
     if super::probe::write_fault_at() == Some(attempt) {
         return Err("injected write fault".into());

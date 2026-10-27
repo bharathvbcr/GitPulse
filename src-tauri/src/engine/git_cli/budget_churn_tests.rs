@@ -145,14 +145,19 @@ fn a_refusal_names_the_refusing_bucket_and_its_level() {
     assert_eq!(judged, Some(level(RefusingBucket::Shared, 0, 0, 8)));
     let message = refusal_message_at("git status", refusal, judged);
     assert!(
-        message.ends_with(
+        message.message().ends_with(
             "the git spawn rate limit admitted nothing sooner \
              (shared bucket: 0 token(s), needs more than 0, burst 8)"
         ),
-        "{message}"
+        "{message}",
+        message = message.message()
     );
-    assert!(super::is_deferred_under_load(&message), "{message}");
-    assert_eq!(RunError::classify(&message), RunError::Deferred);
+    assert!(
+        super::is_deferred_under_load(message.message()),
+        "{message}",
+        message = message.message()
+    );
+    assert_eq!(RunError::classify(message.message()), RunError::Deferred);
 
     // Background work, shed at once by this process's own bucket: the floor is
     // the reserve kept for reactive reads, and the level is below it.
@@ -172,11 +177,16 @@ fn a_refusal_names_the_refusing_bucket_and_its_level() {
         "git worktree deferred under load after 0.000s: background work is shed while the git \
          spawn rate budget is low (local bucket: 3 token(s), needs more than 4, burst 16)"
     );
-    assert!(super::is_deferred_under_load(&message), "{message}");
+    assert!(
+        super::is_deferred_under_load(message.message()),
+        "{message}",
+        message = message.message()
+    );
     assert!(super::is_deferred_under_load(&format!(
-        "[deferred_worktree] {message}"
+        "[deferred_worktree] {message}",
+        message = message.message()
     )));
-    assert_eq!(RunError::classify(&message), RunError::Deferred);
+    assert_eq!(RunError::classify(message.message()), RunError::Deferred);
 }
 
 /// The wording callers that cannot know the level construct is unchanged: the

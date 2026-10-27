@@ -730,20 +730,20 @@ fn shell_metacharacter_ref_names_are_inert_through_the_git_writer() {
 
     for name in names {
         GitWriter::create_branch(&path, name, None)
-            .unwrap_or_else(|e| panic!("create {name:?}: {e}"));
+            .unwrap_or_else(|e| panic!("create {name:?}: {e}", e = e.message()));
         assert!(
             branches().iter().any(|b| b == name),
             "{name:?} not created as named"
         );
 
         GitWriter::checkout_branch(&path, name)
-            .unwrap_or_else(|e| panic!("checkout {name:?}: {e}"));
+            .unwrap_or_else(|e| panic!("checkout {name:?}: {e}", e = e.message()));
         assert_eq!(git_text(&["symbolic-ref", "--short", "HEAD"]).trim(), name);
 
         GitWriter::checkout_branch(&path, "main").expect("back to main");
         let renamed = format!("{name}-renamed");
         GitWriter::rename_branch(&path, name, &renamed)
-            .unwrap_or_else(|e| panic!("rename {name:?}: {e}"));
+            .unwrap_or_else(|e| panic!("rename {name:?}: {e}", e = e.message()));
         let listed = branches();
         assert!(listed.contains(&renamed), "{renamed:?} missing: {listed:?}");
         assert!(
@@ -751,16 +751,17 @@ fn shell_metacharacter_ref_names_are_inert_through_the_git_writer() {
             "{name:?} should be gone: {listed:?}"
         );
         GitWriter::delete_branch(&path, &renamed, false)
-            .unwrap_or_else(|e| panic!("delete {renamed:?}: {e}"));
+            .unwrap_or_else(|e| panic!("delete {renamed:?}: {e}", e = e.message()));
         assert!(!branches().contains(&renamed));
 
         GitWriter::create_tag(&path, name, None, None)
-            .unwrap_or_else(|e| panic!("tag {name:?}: {e}"));
+            .unwrap_or_else(|e| panic!("tag {name:?}: {e}", e = e.message()));
         assert!(
             tags().iter().any(|t| t == name),
             "tag {name:?} not created as named"
         );
-        GitWriter::delete_tag(&path, name).unwrap_or_else(|e| panic!("untag {name:?}: {e}"));
+        GitWriter::delete_tag(&path, name)
+            .unwrap_or_else(|e| panic!("untag {name:?}: {e}", e = e.message()));
         assert!(!tags().iter().any(|t| t == name));
     }
 
@@ -949,7 +950,8 @@ fn discard_changes_reports_err_while_index_lock_is_held_and_recovers() {
     };
     assert!(
         err.contains("index.lock"),
-        "error should name the actual obstruction, got: {err}"
+        "error should name the actual obstruction, got: {err}",
+        err = err.message()
     );
     assert_eq!(
         std::fs::read_to_string(dir.path().join("lib.rs")).unwrap(),

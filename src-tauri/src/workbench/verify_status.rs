@@ -21,6 +21,7 @@
 
 use super::verification_gate::{Record, STATE_COULD_NOT_RUN};
 use crate::github::GitHubRepoRef;
+use crate::ipc_error::CommandError;
 use serde::Serialize;
 use std::path::Path;
 
@@ -48,9 +49,9 @@ pub(crate) struct Facts<'a> {
     /// read, `None` when the task was never verified.
     pub record: Result<Option<Record>, String>,
     /// HEAD of the verified worktree now.
-    pub head: Result<String, String>,
+    pub head: Result<String, CommandError>,
     /// Whether that worktree has uncommitted changes (tracked or untracked).
-    pub dirty: Result<bool, String>,
+    pub dirty: Result<bool, CommandError>,
 }
 
 /// A status word from the record, kept only if it is a plain lowercase word.
@@ -110,9 +111,12 @@ fn error_plan(sha: &str, headline: &str, record: Option<&Record>) -> Plan {
 }
 
 /// Decides what to post, or why nothing may be.
-pub(crate) fn plan(facts: &Facts<'_>) -> Result<Plan, String> {
+pub(crate) fn plan(facts: &Facts<'_>) -> Result<Plan, CommandError> {
     let head = facts.head.as_ref().map_err(|e| {
-        format!("the verified worktree's head could not be read, so nothing was posted: {e}")
+        format!(
+            "the verified worktree's head could not be read, so nothing was posted: {e}",
+            e = e.message()
+        )
     })?;
     if !crate::engine::git_writer::is_full_oid(head) {
         return Err(
@@ -134,7 +138,8 @@ pub(crate) fn plan(facts: &Facts<'_>) -> Result<Plan, String> {
         return Err(format!(
             "the newest verification record is for another task ({:?}); nothing was posted",
             word(&record.item_id)
-        ));
+        )
+        .into());
     }
     if !crate::engine::git_writer::is_full_oid(&record.head) {
         return Err("the verification record names no commit, so nothing was posted".into());
@@ -155,13 +160,13 @@ pub(crate) fn plan(facts: &Facts<'_>) -> Result<Plan, String> {
             "verification was taken at {} but the worktree is now at {}; verify again. Nothing was posted",
             &sha[..12],
             &head[..12]
-        ));
+        ).into());
     }
     match facts.dirty {
         Err(ref e) => {
-            return Err(format!(
+            return Err(e.clone().wrap(|e| format!(
                 "whether the worktree has uncommitted changes could not be read, so nothing was posted: {e}"
-            ))
+            )))
         }
         Ok(true) => {
             return Ok(error_plan(
@@ -217,7 +222,7 @@ impl Gh for RealGh<'_> {
         if let Some(reason) = crate::github::gh_unavailable_reason(&crate::github::probe_gh_cli()) {
             return Err(reason);
         }
-        crate::github::actions::run_gh_in(repo, &argv).map_err(|e| bounded(&e))
+        crate::github::actions::run_gh_in(repo, &argv).map_err(|e| bounded(e.message()))
     }
 }
 
@@ -366,7 +371,7 @@ pub(crate) fn post_for_task(
     with_comment: bool,
     dry_run: bool,
     gh: &dyn Gh,
-) -> Result<PostedVerifyStatus, String> {
+) -> Result<PostedVerifyStatus, CommandError> {
     match consent {
         Ok(true) => {}
         Ok(false) => return Err(
@@ -374,9 +379,9 @@ pub(crate) fn post_for_task(
                 .into(),
         ),
         Err(e) => {
-            return Err(format!(
-                "the opt-in setting could not be read, so nothing was posted: {e}"
-            ))
+            return Err(
+                format!("the opt-in setting could not be read, so nothing was posted: {e}").into(),
+            )
         }
     }
     let local = super::intake::resolve(repo_path).map_err(|e| e.message)?;
@@ -408,7 +413,7 @@ pub(crate) fn post_for_task(
             .map(|out| !out.trim().is_empty()),
     };
     let plan = plan(&facts)?;
-    post(&remote, &plan, with_comment, dry_run, gh)
+    post(&remote, &plan, with_comment, dry_run, gh).map_err(CommandError::from)
 }
 
 /// The desktop command's body: the repository's opt-in from settings, the
@@ -419,8 +424,8 @@ pub(crate) fn post_via_app(
     item_id: &str,
     with_comment: bool,
     dry_run: bool,
-) -> Result<PostedVerifyStatus, String> {
-    let consent = enabled_for(repo_path);
+) -> Result<PostedVerifyStatus, CommandError> {
+    let consent = enabled_for(repo_path).map_err(CommandError::into_message);
     let repo = crate::engine::git_cli::validate_repo(repo_path)?;
     let gh = RealGh { repo: &repo };
     let mut outcome = None;
@@ -452,15 +457,15 @@ pub(crate) fn post_via_app(
 }
 
 /// Whether `repo_path`'s repository has opted in.
-pub(crate) fn enabled_for(repo_path: &str) -> Result<bool, String> {
+pub(crate) fn enabled_for(repo_path: &str) -> Result<bool, CommandError> {
     let dir = crate::harness::review::common_dir(Path::new(repo_path))?;
-    crate::tool_config::verify_status_enabled(&dir)
+    crate::tool_config::verify_status_enabled(&dir).map_err(CommandError::from)
 }
 
 /// Opts `repo_path`'s repository in or out.
-pub(crate) fn set_enabled(repo_path: &str, enabled: bool) -> Result<(), String> {
+pub(crate) fn set_enabled(repo_path: &str, enabled: bool) -> Result<(), CommandError> {
     let dir = crate::harness::review::common_dir(Path::new(repo_path))?;
-    crate::tool_config::set_verify_status(&dir, enabled)
+    crate::tool_config::set_verify_status(&dir, enabled).map_err(CommandError::from)
 }
 
 #[cfg(test)]
@@ -561,7 +566,7 @@ mod tests {
                 facts(Ok(Some(record("maybe", "settled")))),
             ),
         ] {
-            let p = plan(&f).unwrap_or_else(|e| panic!("{label}: {e}"));
+            let p = plan(&f).unwrap_or_else(|e| panic!("{label}: {e}", e = e.message()));
             assert_eq!(p.state, "error", "{label}");
             assert!(
                 !p.description.contains("passed"),
@@ -795,7 +800,8 @@ mod tests {
                 post_for_task(Ok(&store), path, "task", consent, true, false, &gh).unwrap_err();
             assert!(
                 error.contains("off for this repository") || error.contains("could not be read"),
-                "{error}"
+                "{error}",
+                error = error.message()
             );
             assert!(gh.calls.borrow().is_empty());
         }
@@ -878,7 +884,11 @@ mod tests {
             &gh,
         )
         .unwrap_err();
-        assert!(error.contains("No GitHub remote"), "{error}");
+        assert!(
+            error.contains("No GitHub remote"),
+            "{error}",
+            error = error.message()
+        );
         assert!(gh.calls.borrow().is_empty());
     }
 

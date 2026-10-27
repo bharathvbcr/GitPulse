@@ -1,6 +1,7 @@
 //! Application settings, tools, grants, provenance, cleaner and update commands.
 
 use super::*;
+use crate::ipc_error::CommandError;
 
 /// Checks whether a newer GitPulse release has been published.
 ///
@@ -59,7 +60,7 @@ pub fn cmd_external_tool_install_cancel() {
 pub async fn cmd_external_tool_uninstall(
     tool: crate::tool_install::ExternalTool,
 ) -> Result<String, IpcError> {
-    off_thread(move || crate::tool_install::uninstall_tool(tool)).await
+    off_thread(move || crate::tool_install::uninstall_tool(tool).map_err(CommandError::from)).await
 }
 
 /// Hide or restore a tool without deleting it. Env overrides still win.
@@ -70,14 +71,14 @@ pub async fn cmd_external_tool_set_disabled(
 ) -> Result<crate::tool_config::ToolConfigView, IpcError> {
     off_thread(move || {
         crate::tool_install::set_tool_disabled(tool, disabled)?;
-        crate::tool_config::view()
+        crate::tool_config::view().map_err(CommandError::from)
     })
     .await
 }
 
 #[tauri::command(async)]
 pub async fn cmd_tool_config_get() -> Result<crate::tool_config::ToolConfigView, IpcError> {
-    off_thread(crate::tool_config::view).await
+    off_thread(|| crate::tool_config::view().map_err(CommandError::from)).await
 }
 
 #[tauri::command(async)]
@@ -86,7 +87,7 @@ pub async fn cmd_tool_config_save(
 ) -> Result<crate::tool_config::ToolConfigView, IpcError> {
     off_thread(move || {
         crate::tool_config::save_confirmed(&config, &crate::desktop::confirm::native)?;
-        crate::tool_config::view()
+        crate::tool_config::view().map_err(CommandError::from)
     })
     .await
 }
@@ -264,6 +265,7 @@ pub async fn cmd_host_load_status() -> Result<crate::sysload::HostLoadStatus, Ip
 pub async fn cmd_host_load_terminate_orphan(pid: i32, start_us: u64) -> Result<String, IpcError> {
     off_thread(move || {
         crate::sysload::terminate_orphan(pid, start_us, &crate::desktop::confirm::native)
+            .map_err(CommandError::from)
     })
     .await
 }
@@ -273,7 +275,10 @@ pub async fn cmd_host_load_terminate_orphan(pid: i32, start_us: u64) -> Result<S
 /// minutes (`sysload::admit_anyway`). There is no agent path to this.
 #[tauri::command(async)]
 pub async fn cmd_host_load_admit_anyway() -> Result<String, IpcError> {
-    off_thread(|| crate::sysload::admit_anyway(&crate::desktop::confirm::native)).await
+    off_thread(|| {
+        crate::sysload::admit_anyway(&crate::desktop::confirm::native).map_err(CommandError::from)
+    })
+    .await
 }
 
 /// The host-load kill switch, as stored.
@@ -363,7 +368,7 @@ pub async fn cmd_attempt_review_record(
 pub async fn cmd_review_gate_save(repo_path: String, enabled: bool) -> Result<(), IpcError> {
     off_thread(move || {
         let dir = crate::harness::review::common_dir(std::path::Path::new(&repo_path))?;
-        crate::tool_config::set_review_gate(Some(&dir), Some(enabled))
+        crate::tool_config::set_review_gate(Some(&dir), Some(enabled)).map_err(CommandError::from)
     })
     .await
 }
@@ -466,7 +471,7 @@ pub async fn cmd_grants_view(repo_path: String) -> Result<crate::grants::GrantVi
 /// answer rather than the question.
 #[tauri::command(async)]
 pub async fn cmd_local_scan() -> Result<crate::harness::ScanResult, IpcError> {
-    off_thread(crate::ai::scan_local_servers).await
+    off_thread(|| crate::ai::scan_local_servers().map_err(CommandError::from)).await
 }
 
 // --- provenance freshness ---------------------------------------------
@@ -484,7 +489,8 @@ pub async fn cmd_provenance_freshness(
     commit_sha: String,
     base_branch: Option<String>,
 ) -> Result<crate::engine::ProvenanceFreshness, IpcError> {
-    let repo = validate_repo(&repo_path)?;
+    // Checked before the pool, where no producer runs: a path refusal is text.
+    let repo = validate_repo(&repo_path).map_err(|e| IpcError::from(e.into_message()))?;
     off_thread(move || {
         Ok(crate::engine::provenance::compute_freshness(
             &repo.to_string_lossy(),
@@ -510,7 +516,8 @@ pub async fn cmd_provenance_freshness_batch(
     revisions: Vec<String>,
     base_branch: Option<String>,
 ) -> Result<Vec<crate::engine::ProvenanceFreshness>, IpcError> {
-    let repo = validate_repo(&repo_path)?;
+    // Checked before the pool, where no producer runs: a path refusal is text.
+    let repo = validate_repo(&repo_path).map_err(|e| IpcError::from(e.into_message()))?;
     off_thread(move || {
         Ok(crate::engine::provenance::freshness_batch(
             &repo.to_string_lossy(),

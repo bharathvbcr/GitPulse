@@ -4,6 +4,7 @@ use crate::engine::git_cli::{
     resolve_git_common_dir, sandbox_join, validate_repo, with_background_processes, BoundedRun,
     OutputStream, ProcessObserver, NETWORK_TIMEOUT,
 };
+use crate::ipc_error::CommandError;
 use crate::storage::commit_graph::{CommitGraphWriteOutcome, CommitGraphWritePlan};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -110,7 +111,7 @@ impl StashSaveOptions {
     /// Checks the selected paths stay inside `repo` and fit one command line.
     /// Stashing a selection runs as one `stash push`, so it cannot be split
     /// into chunks the way staging is.
-    fn validate_paths(&self, repo: &Path) -> Result<(), String> {
+    fn validate_paths(&self, repo: &Path) -> Result<(), CommandError> {
         if self.paths.is_empty() {
             return Ok(());
         }
@@ -121,7 +122,8 @@ impl StashSaveOptions {
                 "The {} selected paths are too long to stash in one command; \
                  stash fewer files or the whole working tree",
                 literal.len()
-            ));
+            )
+            .into());
         }
         Ok(())
     }
@@ -159,15 +161,13 @@ pub struct CloneOptions {
 pub const MAX_CLONE_DEPTH: u32 = 1_000_000;
 
 impl CloneOptions {
-    fn validate(&self) -> Result<(), String> {
+    fn validate(&self) -> Result<(), CommandError> {
         if let Some(branch) = &self.branch {
             validate_ref_name(branch)?;
         }
         if let Some(depth) = self.depth {
             if depth == 0 || depth > MAX_CLONE_DEPTH {
-                return Err(format!(
-                    "Clone depth must be between 1 and {MAX_CLONE_DEPTH}"
-                ));
+                return Err(format!("Clone depth must be between 1 and {MAX_CLONE_DEPTH}").into());
             }
         }
         Ok(())
@@ -346,7 +346,7 @@ const COMMIT_GRAPH_LOCKS: [&str; 2] = [
     "objects/info/commit-graphs/commit-graph-chain.lock",
 ];
 
-type CommitGraphFlight = Result<CommitGraphWriteOutcome, String>;
+type CommitGraphFlight = Result<CommitGraphWriteOutcome, CommandError>;
 
 /// One write per common directory, however many worktrees or clicks ask.
 fn commit_graph_flights() -> &'static crate::singleflight::SingleFlight<PathBuf, CommitGraphFlight>
@@ -477,22 +477,22 @@ fn commit_graph_lock_remedy(locks: &[PathBuf]) -> String {
 pub(crate) enum SquashFailure {
     /// The gate or an identity guard refused before git ran; nothing was
     /// started and the index is as it was.
-    Merge(String),
+    Merge(CommandError),
     /// `git merge --squash` itself failed, so it was started: a conflict
     /// leaves unmerged entries and `SQUASH_MSG` behind. The caller that owns
     /// the checkout restores it with [`GitWriter::rollback_failed_merge_gated`].
-    Conflict(String),
+    Conflict(CommandError),
     /// The changes are staged but the commit failed (a refusing hook, an
     /// identity problem). The message says how to finish or undo it.
-    Commit(String),
+    Commit(CommandError),
 }
 
 impl SquashFailure {
-    pub(crate) fn into_message(self) -> String {
+    pub(crate) fn into_error(self) -> CommandError {
         match self {
-            SquashFailure::Merge(message)
-            | SquashFailure::Conflict(message)
-            | SquashFailure::Commit(message) => message,
+            SquashFailure::Merge(error)
+            | SquashFailure::Conflict(error)
+            | SquashFailure::Commit(error) => error,
         }
     }
 }
@@ -533,9 +533,9 @@ fn index_chunks(prefix: &[String], paths: &[String]) -> Vec<Vec<String>> {
     chunks
 }
 
-fn literal_paths(repo: &Path, files: &[String]) -> Result<Vec<String>, String> {
+fn literal_paths(repo: &Path, files: &[String]) -> Result<Vec<String>, CommandError> {
     if files.is_empty() || files.len() > MAX_INDEX_PATHS {
-        return Err(format!("Select between 1 and {MAX_INDEX_PATHS} paths"));
+        return Err(format!("Select between 1 and {MAX_INDEX_PATHS} paths").into());
     }
     let mut bytes = 0usize;
     let mut seen = HashSet::new();
@@ -672,7 +672,7 @@ pub struct RebaseStep {
 pub struct GitWriter;
 
 impl GitWriter {
-    pub fn stage_file(repo_path: &str, file_path: &str) -> Result<(), String> {
+    pub fn stage_file(repo_path: &str, file_path: &str) -> Result<(), CommandError> {
         Self::change_index_with(repo_path, &[file_path.into()], IndexAction::Stage, |_| {
             Ok(())
         })
@@ -704,8 +704,11 @@ impl GitWriter {
     /// applied when a later one fails; the error says so. A lock held by
     /// someone else is not a per-file fault, so it is never halved: the whole
     /// group reports it after one bounded retry.
-    pub fn stage_files_attributed(repo_path: &str, files: &[String]) -> Vec<Result<(), String>> {
-        let mut outcomes: Vec<Result<(), String>> = vec![Ok(()); files.len()];
+    pub fn stage_files_attributed(
+        repo_path: &str,
+        files: &[String],
+    ) -> Vec<Result<(), CommandError>> {
+        let mut outcomes: Vec<Result<(), CommandError>> = vec![Ok(()); files.len()];
         let mut split_budget = STAGE_SPLIT_BUDGET;
         for (batch, slots) in files
             .chunks(STAGE_BATCH_PATHS)
@@ -741,7 +744,7 @@ impl GitWriter {
     fn stage_group(
         repo_path: &str,
         files: &[String],
-        outcomes: &mut [Result<(), String>],
+        outcomes: &mut [Result<(), CommandError>],
         split_budget: &mut usize,
     ) {
         if files.is_empty() {
@@ -756,7 +759,7 @@ impl GitWriter {
         // the set, so a batch that failed is not always untouched. Ignored
         // paths are named exactly, outside the halving budget, and the rest are
         // staged again (a no-op for what git already took).
-        if files.len() > 1 && !is_transient_git_lock_error(&error) {
+        if files.len() > 1 && !is_transient_git_lock_error(error.message()) {
             let ignored = Self::ignored_among(repo_path, files);
             if !ignored.is_empty() && ignored.len() < files.len() {
                 let mut rest = Vec::new();
@@ -765,7 +768,8 @@ impl GitWriter {
                     if ignored.contains(file) {
                         outcomes[index] = Err(format!(
                             "Index update failed for the 1 selected paths: {file} is ignored by a .gitignore file; stage it with force to track it."
-                        ));
+                        )
+                        .into());
                     } else {
                         rest.push(file.clone());
                         rest_slots.push(index);
@@ -779,7 +783,7 @@ impl GitWriter {
                 return;
             }
         }
-        if files.len() > 1 && !is_transient_git_lock_error(&error) && *split_budget > 0 {
+        if files.len() > 1 && !is_transient_git_lock_error(error.message()) && *split_budget > 0 {
             *split_budget -= 1;
             let (left_files, right_files) = files.split_at(files.len() / 2);
             let (left, right) = outcomes.split_at_mut(left_files.len());
@@ -788,10 +792,12 @@ impl GitWriter {
             return;
         }
         let error = if files.len() > 1 {
-            format!(
-                "{error} (one batch of {} paths; not attributed to a single path)",
-                files.len()
-            )
+            error.wrap(|error| {
+                format!(
+                    "{error} (one batch of {} paths; not attributed to a single path)",
+                    files.len()
+                )
+            })
         } else {
             error
         };
@@ -800,7 +806,7 @@ impl GitWriter {
         }
     }
 
-    pub fn unstage_file(repo_path: &str, file_path: &str) -> Result<(), String> {
+    pub fn unstage_file(repo_path: &str, file_path: &str) -> Result<(), CommandError> {
         Self::change_index_with(repo_path, &[file_path.into()], IndexAction::Unstage, |_| {
             Ok(())
         })
@@ -819,9 +825,9 @@ impl GitWriter {
         files: &[String],
         action: IndexAction,
         mut judge: J,
-    ) -> Result<(Vec<V>, usize), String>
+    ) -> Result<(Vec<V>, usize), CommandError>
     where
-        J: FnMut(&[&str]) -> Result<V, String>,
+        J: FnMut(&[&str]) -> Result<V, CommandError>,
     {
         let repo = validate_repo(repo_path)?;
         let paths = literal_paths(&repo, files)?;
@@ -858,13 +864,18 @@ impl GitWriter {
         // leaves that part applied; the message says so rather than reading
         // as all-or-nothing.
         let applied = std::cell::Cell::new(false);
-        let failed = |error: String| {
+        let failed = |error: CommandError| {
             let partly = if applied.get() {
                 " The selection was partly applied before this failure."
             } else {
                 ""
             };
-            format!("Index update failed for the {} selected paths: {error}.{partly} Refresh to review the current index.", paths.len())
+            error.wrap(|error| {
+                format!(
+                    "Index update failed for the {} selected paths: {error}.{partly} Refresh to review the current index.",
+                    paths.len()
+                )
+            })
         };
         if !plain.is_empty() {
             let mut input = Vec::new();
@@ -908,8 +919,8 @@ impl GitWriter {
         repo_path: &str,
         from: &str,
         to: &str,
-        gate: impl FnOnce(&MovePlan) -> Result<(), String>,
-    ) -> Result<MovePlan, String> {
+        gate: impl FnOnce(&MovePlan) -> Result<(), CommandError>,
+    ) -> Result<MovePlan, CommandError> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
@@ -924,15 +935,15 @@ impl GitWriter {
             return Err("Source and destination are the same path".into());
         }
         if to.starts_with(&format!("{from}/")) {
-            return Err(format!("Cannot move {from} into itself"));
+            return Err(format!("Cannot move {from} into itself").into());
         }
         let from_abs = crate::engine::git_cli::sandbox_join_write_entry(&repo, from)?;
         let to_abs = crate::engine::git_cli::sandbox_join_write_entry(&repo, to)?;
         if std::fs::symlink_metadata(&from_abs).is_err() {
-            return Err(format!("{from} does not exist"));
+            return Err(format!("{from} does not exist").into());
         }
         if std::fs::symlink_metadata(&to_abs).is_ok() {
-            return Err(format!("destination already exists: {to}"));
+            return Err(format!("destination already exists: {to}").into());
         }
         crate::engine::git_cli::refuse_nested_gitdir_below(&from_abs, from)?;
         // Git refuses a symlinked `.gitmodules`; a rename is the one write
@@ -946,7 +957,8 @@ impl GitWriter {
         {
             return Err(format!(
                 "A symlink cannot be moved to {to}: git refuses a symlinked .gitmodules"
-            ));
+            )
+            .into());
         }
         let plan = if Self::tracked_count(&repo, from)? > 0 {
             MovePlan::Git {
@@ -989,8 +1001,8 @@ impl GitWriter {
     pub fn delete_path(
         repo_path: &str,
         path: &str,
-        gate: impl FnOnce(&[Vec<String>]) -> Result<(), String>,
-    ) -> Result<DeleteOutcome, String> {
+        gate: impl FnOnce(&[Vec<String>]) -> Result<(), CommandError>,
+    ) -> Result<DeleteOutcome, CommandError> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
@@ -1002,7 +1014,7 @@ impl GitWriter {
         // comparison with `.` and reach `git rm -r`).
         let abs = crate::engine::git_cli::sandbox_join_write_entry(&repo, path)?;
         if std::fs::symlink_metadata(&abs).is_err() {
-            return Err(format!("{path} does not exist"));
+            return Err(format!("{path} does not exist").into());
         }
         crate::engine::git_cli::refuse_nested_gitdir_below(&abs, path)?;
         let spec = literal_paths(&repo, &[path.to_string()])?.remove(0);
@@ -1026,7 +1038,7 @@ impl GitWriter {
         if plan.is_empty() {
             return Err(format!(
                 "{path} holds only ignored files or nested repositories; GitPulse does not delete those"
-            ));
+            ).into());
         }
         gate(&plan)?;
         for (index, argv) in plan.iter().enumerate() {
@@ -1035,7 +1047,9 @@ impl GitWriter {
                 if index == 0 {
                     error
                 } else {
-                    format!("The tracked files were removed, but removing the untracked ones failed: {error}")
+                    error.wrap(|error| {
+                        format!("The tracked files were removed, but removing the untracked ones failed: {error}")
+                    })
                 }
             })?;
         }
@@ -1048,7 +1062,7 @@ impl GitWriter {
     }
 
     /// Index entries at or under `path` (a file, or a directory's contents).
-    fn tracked_count(repo: &Path, path: &str) -> Result<usize, String> {
+    fn tracked_count(repo: &Path, path: &str) -> Result<usize, CommandError> {
         let spec = literal_paths(repo, &[path.to_string()])?.remove(0);
         let listed = git_text(repo, &["ls-files", "-z", "--", spec.as_str()])?;
         Ok(listed.split('\0').filter(|entry| !entry.is_empty()).count())
@@ -1056,7 +1070,7 @@ impl GitWriter {
 
     /// Untracked, non-ignored files at or under `spec` — exactly what
     /// `git clean -f -d` (without `-x`) would remove.
-    fn untracked_count(repo: &Path, spec: &str) -> Result<usize, String> {
+    fn untracked_count(repo: &Path, spec: &str) -> Result<usize, CommandError> {
         let listed = git_text(
             repo,
             &[
@@ -1114,7 +1128,7 @@ impl GitWriter {
             )
     }
 
-    fn email_from_ident(ident: &str) -> Result<String, String> {
+    fn email_from_ident(ident: &str) -> Result<String, CommandError> {
         let start = ident
             .rfind('<')
             .ok_or_else(|| format!("could not read an email from git identity: {ident}"))?;
@@ -1124,9 +1138,7 @@ impl GitWriter {
             .ok_or_else(|| format!("could not read an email from git identity: {ident}"))?;
         let email = rest[..end].trim();
         if email.is_empty() || !email.contains('@') {
-            return Err(format!(
-                "could not read an email from git identity: {ident}"
-            ));
+            return Err(format!("could not read an email from git identity: {ident}").into());
         }
         Ok(email.to_string())
     }
@@ -1141,9 +1153,9 @@ Unset the local override with `git config --local --unset-all user.name` and \
         )
     }
 
-    fn refuse_email(role: &str, email: &str) -> Result<(), String> {
+    fn refuse_email(role: &str, email: &str) -> Result<(), CommandError> {
         if Self::is_fixture_author_email(email) {
-            Err(Self::fixture_identity_refusal(role, email.trim()))
+            Err(Self::fixture_identity_refusal(role, email.trim()).into())
         } else {
             Ok(())
         }
@@ -1156,7 +1168,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         repo.join(".githooks/pre-commit").is_file()
     }
 
-    fn refuse_fixture_identity(repo: &Path, amend: bool) -> Result<(), String> {
+    fn refuse_fixture_identity(repo: &Path, amend: bool) -> Result<(), CommandError> {
         if !Self::guards_fixture_identity(repo) {
             return Ok(());
         }
@@ -1177,7 +1189,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// Reads `name` from git's effective configuration: `Some` when set,
     /// `None` when git says it is unset (exit 1), an error when the read
     /// itself failed, so an unreadable config never passes as "unset".
-    fn config_value(repo: &Path, name: &str) -> Result<Option<String>, String> {
+    fn config_value(repo: &Path, name: &str) -> Result<Option<String>, CommandError> {
         let run = git_captured(repo, &["config", "--get", name])?;
         match run.status_code {
             0 => {
@@ -1188,7 +1200,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
             code => Err(format!(
                 "Could not read {name} from git config (exit {code}): {}",
                 String::from_utf8_lossy(&run.stderr).trim()
-            )),
+            )
+            .into()),
         }
     }
 
@@ -1197,12 +1210,12 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// first, then `user.*` config, then `EMAIL`. The environment counts only
     /// when it covers author and committer both, which is what git needs to
     /// record a commit without configuration.
-    pub fn identity(repo_path: &str) -> Result<GitIdentity, String> {
+    pub fn identity(repo_path: &str) -> Result<GitIdentity, CommandError> {
         let repo = validate_repo(repo_path)?;
         Self::identity_in(&repo)
     }
 
-    fn identity_in(repo: &Path) -> Result<GitIdentity, String> {
+    fn identity_in(repo: &Path) -> Result<GitIdentity, CommandError> {
         Self::identity_with(repo, &|name| std::env::var(name).ok())
     }
 
@@ -1216,7 +1229,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     fn identity_with(
         repo: &Path,
         lookup: &dyn Fn(&str) -> Option<String>,
-    ) -> Result<GitIdentity, String> {
+    ) -> Result<GitIdentity, CommandError> {
         let env = |name: &str| lookup(name).filter(|v| !v.trim().is_empty());
         let env_pair =
             |author: &str, committer: &str| env(author).filter(|_| env(committer).is_some());
@@ -1234,7 +1247,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// Refuses before git runs when no identity is configured. Git would
     /// otherwise either fail with its own multi-line advice or, on a machine
     /// with a resolvable hostname, quietly record `user@host.local`.
-    fn require_identity(repo: &Path) -> Result<(), String> {
+    fn require_identity(repo: &Path) -> Result<(), CommandError> {
         let identity = Self::identity_in(repo)?;
         let missing: Vec<&str> = [
             ("user.name", identity.name.is_none()),
@@ -1248,20 +1261,19 @@ Unset the local override with `git config --local --unset-all user.name` and \
         }
         // Typed where it is written: the commit box offers the identity prompt
         // on this kind, not on the wording (see `crate::ipc_error`).
-        Err(crate::ipc_error::typed_text(
-            crate::ipc_error::IpcErrorKind::IdentityMissing,
-            format!(
-                "{IDENTITY_MISSING}: {} {} not set. Set your name and email for this repository \
-                 or for every repository, then commit again.",
-                missing.join(" and "),
-                if missing.len() == 1 { "is" } else { "are" }
-            ),
-        ))
+        let kind = crate::ipc_error::IpcErrorKind::IdentityMissing;
+        let message = format!(
+            "{IDENTITY_MISSING}: {} {} not set. Set your name and email for this repository \
+             or for every repository, then commit again.",
+            missing.join(" and "),
+            if missing.len() == 1 { "is" } else { "are" }
+        );
+        Err(CommandError::typed(kind, message))
     }
 
     /// Both identity guards every path that records a commit runs first: an
     /// identity must be configured, and it must not be the test fixture's.
-    pub(crate) fn require_commit_identity(repo: &Path) -> Result<(), String> {
+    pub(crate) fn require_commit_identity(repo: &Path) -> Result<(), CommandError> {
         Self::require_identity(repo)?;
         Self::refuse_fixture_identity(repo, false)
     }
@@ -1287,30 +1299,32 @@ Unset the local override with `git config --local --unset-all user.name` and \
     pub(crate) fn rollback_failed_merge_gated(
         repo: &Path,
         merged_tip: &str,
-        gate: &mut dyn FnMut(&[&str]) -> Result<(), String>,
-    ) -> Result<(), String> {
+        gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
+    ) -> Result<(), CommandError> {
         Self::rollback_inner(repo, Some(merged_tip), gate)
     }
 
     /// [`Self::rollback_failed_merge_gated`] with every command allowed and
     /// whatever `MERGE_HEAD` is there taken as this merge's.
     #[cfg(test)]
-    pub(crate) fn rollback_failed_merge_locked(repo: &Path) -> Result<(), String> {
+    pub(crate) fn rollback_failed_merge_locked(repo: &Path) -> Result<(), CommandError> {
         Self::rollback_inner(repo, None, &mut |_| Ok(()))
     }
 
     fn rollback_inner(
         repo: &Path,
         merged_tip: Option<&str>,
-        gate: &mut dyn FnMut(&[&str]) -> Result<(), String>,
-    ) -> Result<(), String> {
+        gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
+    ) -> Result<(), CommandError> {
         use crate::engine::repo_op::{detect_kind, OperationKind};
-        let mut run = |args: &[&str]| -> Result<String, String> {
+        let mut run = |args: &[&str]| -> Result<String, CommandError> {
             gate(args).map_err(|reason| {
-                format!(
-                    "the gate refused `git {}`, so it was not run: {reason}",
-                    args.join(" ")
-                )
+                reason.wrap(|reason| {
+                    format!(
+                        "the gate refused `git {}`, so it was not run: {reason}",
+                        args.join(" ")
+                    )
+                })
             })?;
             git_text(repo, args)
         };
@@ -1327,30 +1341,33 @@ Unset the local override with `git config --local --unset-all user.name` and \
                         return Err(format!(
                             "the merge parked in the checkout is of {}, not of the {tip} this call merged, so it is not this call's and was left alone",
                             head.trim()
-                        ));
+                        ).into());
                     }
                 }
                 if let Err(abort) = run(&["merge", "--abort"]) {
-                    if refused(&abort) {
+                    if refused(abort.message()) {
                         return Err(abort);
                     }
                     run(&["reset", "--merge"]).map_err(|reset| {
-                        if refused(&reset) {
+                        if refused(reset.message()) {
                             reset
                         } else {
-                            format!(
-                                "`git merge --abort` failed ({abort}) and so did `git reset --merge` ({reset})"
-                            )
+                            let abort = abort.message().to_string();
+                            reset.wrap(|reset| {
+                                format!(
+                                    "`git merge --abort` failed ({abort}) and so did `git reset --merge` ({reset})"
+                                )
+                            })
                         }
                     })?;
                 }
             }
             Some(OperationKind::SquashMerge) => {
                 run(&["reset", "--merge"]).map_err(|e| {
-                    if refused(&e) {
+                    if refused(e.message()) {
                         e
                     } else {
-                        format!("`git reset --merge` failed: {e}")
+                        e.wrap(|e| format!("`git reset --merge` failed: {e}"))
                     }
                 })?;
             }
@@ -1358,7 +1375,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 return Err(format!(
                     "a {} is parked in the checkout, which this merge did not start; it was left alone",
                     other.label()
-                ));
+                ).into());
             }
             None => {
                 if !git_text(repo, &["ls-files", "--unmerged"])?
@@ -1382,10 +1399,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         if left.is_empty() {
             Ok(())
         } else {
-            Err(format!(
-                "the checkout was not restored: {}",
-                left.join("; ")
-            ))
+            Err(format!("the checkout was not restored: {}", left.join("; ")).into())
         }
     }
 
@@ -1405,7 +1419,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     }
 
     /// Validates an identity before it is written to any config file.
-    pub fn validate_identity(name: &str, email: &str) -> Result<(), String> {
+    pub fn validate_identity(name: &str, email: &str) -> Result<(), CommandError> {
         let name = name.trim();
         let email = email.trim();
         if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
@@ -1435,7 +1449,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         name: &str,
         email: &str,
         scope: IdentityScope,
-    ) -> Result<GitIdentity, String> {
+    ) -> Result<GitIdentity, CommandError> {
         let repo = validate_repo(repo_path)?;
         Self::validate_identity(name, email)?;
         let _repo_lock = repo_mutation_lock(&repo);
@@ -1449,7 +1463,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         Self::identity_in(&repo)
     }
 
-    pub fn commit(repo_path: &str, message: &str, amend: bool) -> Result<String, String> {
+    pub fn commit(repo_path: &str, message: &str, amend: bool) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
         if message.trim().is_empty() && !(amend && message.is_empty()) {
             return Err("Commit message must not be empty".into());
@@ -1462,7 +1476,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         Self::commit_inner(&repo, message, amend)
     }
 
-    fn commit_inner(repo: &Path, message: &str, amend: bool) -> Result<String, String> {
+    fn commit_inner(repo: &Path, message: &str, amend: bool) -> Result<String, CommandError> {
         Self::refuse_fixture_identity(repo, amend)?;
         let mut args = vec!["commit"];
         if amend && message.is_empty() {
@@ -1490,7 +1504,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// index. Unmerged paths refuse before `add` so a conflicted tree is never
     /// silently marked resolved. Ignored untracked files stay untracked —
     /// `git add --all` does not force them.
-    pub fn quick_commit(repo_path: &str, message: &str) -> Result<String, String> {
+    pub fn quick_commit(repo_path: &str, message: &str) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
         if message.trim().is_empty() {
             return Err("Commit message must not be empty".into());
@@ -1502,7 +1516,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         Self::quick_commit_inner(&repo, message)
     }
 
-    fn quick_commit_inner(repo: &Path, message: &str) -> Result<String, String> {
+    fn quick_commit_inner(repo: &Path, message: &str) -> Result<String, CommandError> {
         Self::require_commit_identity(repo)?;
         let unmerged = git_text(repo, &["ls-files", "--unmerged"])?;
         if !unmerged.trim().is_empty() {
@@ -1525,7 +1539,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         repo_path: &str,
         message: &str,
         files: &[String],
-    ) -> Result<String, String> {
+    ) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
         if message.trim().is_empty() {
             return Err("Commit message must not be empty".into());
@@ -1577,14 +1591,20 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// The answer is a snapshot of the refs and config. A caller that gets it
     /// approved must run it through [`Self::checkout_branch_judged`], which
     /// re-derives it under the repository lock and refuses if it changed.
-    pub fn checkout_branch_argv(repo_path: &str, branch_name: &str) -> Result<Vec<String>, String> {
+    pub fn checkout_branch_argv(
+        repo_path: &str,
+        branch_name: &str,
+    ) -> Result<Vec<String>, CommandError> {
         let repo = validate_repo(repo_path)?;
         Self::checkout_branch_argv_in(&repo, branch_name)
     }
 
-    fn checkout_branch_argv_in(repo: &Path, branch_name: &str) -> Result<Vec<String>, String> {
+    fn checkout_branch_argv_in(
+        repo: &Path,
+        branch_name: &str,
+    ) -> Result<Vec<String>, CommandError> {
         validate_ref_name(branch_name)?;
-        let ref_exists = |full: &str| -> Result<bool, String> {
+        let ref_exists = |full: &str| -> Result<bool, CommandError> {
             Ok(git_captured(repo, &["show-ref", "--verify", "--quiet", full])?.success)
         };
         let argv = |rest: &[&str]| -> Vec<String> {
@@ -1608,14 +1628,15 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 return Err(format!(
                     "'{branch_name}' does not name exactly one configured remote's branch; \
                      check it out by its local name"
-                ));
+                )
+                .into());
             };
             let local = &branch_name[remote.len() + 1..];
             validate_ref_name(local)?;
             if local == "HEAD" {
-                return Err(format!(
-                    "'{branch_name}' is the remote's HEAD pointer, not a branch"
-                ));
+                return Err(
+                    format!("'{branch_name}' is the remote's HEAD pointer, not a branch").into(),
+                );
             }
             if ref_exists(&format!("refs/heads/{local}"))? {
                 let upstream = git_text(
@@ -1631,7 +1652,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
                     return Err(format!(
                         "local branch '{local}' tracks {upstream}, not '{branch_name}'; \
                          switch to '{local}' by name, or rename it first"
-                    ));
+                    )
+                    .into());
                 }
                 return Ok(argv(&["switch", local]));
             }
@@ -1647,7 +1669,10 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// to `checkout <name>`: it detaches HEAD for a remote-tracking ref, a tag
     /// or an object id and reported that as a branch checkout. A refused
     /// `switch` (dirty tree, ambiguous or missing name) is the error.
-    pub fn checkout_branch(repo_path: &str, branch_name: &str) -> Result<CheckoutOutcome, String> {
+    pub fn checkout_branch(
+        repo_path: &str,
+        branch_name: &str,
+    ) -> Result<CheckoutOutcome, CommandError> {
         Self::checkout_branch_locked(repo_path, branch_name, None)
     }
 
@@ -1659,7 +1684,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         repo_path: &str,
         branch_name: &str,
         judged: &[String],
-    ) -> Result<CheckoutOutcome, String> {
+    ) -> Result<CheckoutOutcome, CommandError> {
         Self::checkout_branch_locked(repo_path, branch_name, Some(judged))
     }
 
@@ -1667,7 +1692,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         repo_path: &str,
         branch_name: &str,
         judged: Option<&[String]>,
-    ) -> Result<CheckoutOutcome, String> {
+    ) -> Result<CheckoutOutcome, CommandError> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
@@ -1681,7 +1706,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
                      the repository changed, try again",
                     argv.join(" "),
                     judged.join(" ")
-                ));
+                )
+                .into());
             }
         }
         let args: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
@@ -1691,7 +1717,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
 
     /// Checks out a commit, tag or other revision with HEAD detached. This is
     /// the named way to detach: [`Self::checkout_branch`] never does.
-    pub fn checkout_detached_argv(revision: &str) -> Result<Vec<String>, String> {
+    pub fn checkout_detached_argv(revision: &str) -> Result<Vec<String>, CommandError> {
         validate_oid_or_revision(revision)?;
         Ok(["git", "switch", "--detach", revision]
             .into_iter()
@@ -1699,7 +1725,10 @@ Unset the local override with `git config --local --unset-all user.name` and \
             .collect())
     }
 
-    pub fn checkout_detached(repo_path: &str, revision: &str) -> Result<CheckoutOutcome, String> {
+    pub fn checkout_detached(
+        repo_path: &str,
+        revision: &str,
+    ) -> Result<CheckoutOutcome, CommandError> {
         let argv = Self::checkout_detached_argv(revision)?;
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
@@ -1711,7 +1740,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         Self::checkout_outcome(&repo)
     }
 
-    fn checkout_outcome(repo: &Path) -> Result<CheckoutOutcome, String> {
+    fn checkout_outcome(repo: &Path) -> Result<CheckoutOutcome, CommandError> {
         Ok(CheckoutOutcome {
             detached: crate::engine::git_reader::head_branch(repo)?.is_none(),
         })
@@ -1731,7 +1760,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     pub fn create_branch_argv(
         branch_name: &str,
         start_point: Option<&str>,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<String>, CommandError> {
         validate_ref_name(branch_name)?;
         let mut argv = vec!["git".into(), "branch".into(), branch_name.into()];
         if let Some(sp) = start_point {
@@ -1745,7 +1774,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     }
 
     /// Git's argv for `branch -d|-D <name>`, validated like [`Self::create_branch_argv`].
-    pub fn delete_branch_argv(branch_name: &str, force: bool) -> Result<Vec<String>, String> {
+    pub fn delete_branch_argv(branch_name: &str, force: bool) -> Result<Vec<String>, CommandError> {
         validate_ref_name(branch_name)?;
         Ok(vec![
             "git".into(),
@@ -1756,7 +1785,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     }
 
     /// Git's argv for `branch -m <old> <new>`, validated like [`Self::create_branch_argv`].
-    pub fn rename_branch_argv(old_name: &str, new_name: &str) -> Result<Vec<String>, String> {
+    pub fn rename_branch_argv(old_name: &str, new_name: &str) -> Result<Vec<String>, CommandError> {
         validate_ref_name(old_name)?;
         validate_ref_name(new_name)?;
         Ok(vec![
@@ -1789,7 +1818,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         tag_name: &str,
         commit_id: Option<&str>,
         message: Option<&str>,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<String>, CommandError> {
         validate_ref_name(tag_name)?;
         if let Some(cid) = commit_id {
             validate_oid(cid)?;
@@ -1807,7 +1836,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     }
 
     /// Git's argv for `tag -d <name>`, validated like [`Self::create_branch_argv`].
-    pub fn delete_tag_argv(tag_name: &str) -> Result<Vec<String>, String> {
+    pub fn delete_tag_argv(tag_name: &str) -> Result<Vec<String>, CommandError> {
         validate_ref_name(tag_name)?;
         Ok(vec![
             "git".into(),
@@ -1821,7 +1850,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// an ambiguous branch/tag name cannot publish the wrong object. It names
     /// the remote, never its URL, so nothing credential-bearing is judged.
     /// Validated like [`Self::create_branch_argv`].
-    pub fn push_tag_argv(remote: &str, tag: &str) -> Result<Vec<String>, String> {
+    pub fn push_tag_argv(remote: &str, tag: &str) -> Result<Vec<String>, CommandError> {
         validate_ref_name(remote)?;
         validate_ref_name(tag)?;
         Ok(vec![
@@ -1836,7 +1865,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         repo_path: &str,
         branch_name: &str,
         start_point: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<(), CommandError> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
@@ -1857,7 +1886,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         repo_path: &str,
         branch_name: &str,
         force: bool,
-    ) -> Result<String, String> {
+    ) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
@@ -1868,18 +1897,20 @@ Unset the local override with `git config --local --unset-all user.name` and \
             // `-d` leaves these to git's own safety nets; `-D` bypasses them,
             // so the checks must be re-done server side.
             if is_default_branch(&repo, branch_name).map_err(|error| {
-                format!(
-                    "refusing to force-delete '{branch_name}': could not tell whether it is the default branch: {error}"
-                )
+                error.wrap(|error| {
+                    format!(
+                        "refusing to force-delete '{branch_name}': could not tell whether it is the default branch: {error}"
+                    )
+                })
             })? {
                 return Err(format!(
                     "refusing to force-delete '{branch_name}': it resolves to the repository's default branch"
-                ));
+                ).into());
             }
             if is_checked_out_in_any_worktree(&repo, branch_name)? {
                 return Err(format!(
                     "refusing to force-delete '{branch_name}': it is checked out in a linked worktree"
-                ));
+                ).into());
             }
         }
         // Capture before the ref disappears — after `-d`/`-D` there is nothing
@@ -1895,7 +1926,11 @@ Unset the local override with `git config --local --unset-all user.name` and \
         Ok(tip)
     }
 
-    pub fn rename_branch(repo_path: &str, old_name: &str, new_name: &str) -> Result<(), String> {
+    pub fn rename_branch(
+        repo_path: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(), CommandError> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
@@ -1906,7 +1941,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         Ok(())
     }
 
-    pub fn apply_patch_to_index(repo_path: &str, patch_content: &str) -> Result<(), String> {
+    pub fn apply_patch_to_index(repo_path: &str, patch_content: &str) -> Result<(), CommandError> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
@@ -1921,7 +1956,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         repo_path: &str,
         onto_commit: &str,
         steps: &[RebaseStep],
-    ) -> Result<(), String> {
+    ) -> Result<(), CommandError> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
@@ -1962,7 +1997,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 return Err(format!(
                     "Rebase step {} is not an ancestor of HEAD; refusing to transplant foreign commits",
                     step.commit_id
-                ));
+                ).into());
             }
         }
         // A refused read is an error: taking it for "detached" would skip the
@@ -1972,7 +2007,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         // Recovery must never swallow its own failure: the checkout outcome is
         // captured so a locked index or full disk cannot hide that HEAD was
         // left detached mid-rebase.
-        let restore = |repo: &std::path::Path| -> Result<(), String> {
+        let restore = |repo: &std::path::Path| -> Result<(), CommandError> {
             if let Some(ref branch) = original_branch {
                 git_text(repo, &["checkout", "-f", branch]).map(|_| ())
             } else {
@@ -1982,30 +2017,38 @@ Unset the local override with `git config --local --unset-all user.name` and \
 
         git_text(&repo, &["checkout", "--detach", onto_commit])?;
 
-        let result = (|| -> Result<(), String> {
+        let result = (|| -> Result<(), CommandError> {
             for step in steps {
                 match &step.action {
                     RebaseActionKind::Pick => {
                         git_text(&repo, &["cherry-pick", &step.commit_id]).map_err(|e| {
-                            format!("Rebase step failed (pick {}): {}", step.commit_id, e)
+                            e.wrap(|e| {
+                                format!("Rebase step failed (pick {}): {}", step.commit_id, e)
+                            })
                         })?;
                     }
                     RebaseActionKind::Squash => {
                         git_text(&repo, &["cherry-pick", "-n", &step.commit_id]).map_err(|e| {
-                            format!("Rebase step failed (squash {}): {}", step.commit_id, e)
+                            e.wrap(|e| {
+                                format!("Rebase step failed (squash {}): {}", step.commit_id, e)
+                            })
                         })?;
                         Self::commit_inner(&repo, "", true)?;
                     }
                     RebaseActionKind::Fixup => {
                         git_text(&repo, &["cherry-pick", "-n", &step.commit_id]).map_err(|e| {
-                            format!("Rebase step failed (fixup {}): {}", step.commit_id, e)
+                            e.wrap(|e| {
+                                format!("Rebase step failed (fixup {}): {}", step.commit_id, e)
+                            })
                         })?;
                         git_text(&repo, &["commit", "--amend", "--no-edit"])?;
                     }
                     RebaseActionKind::Drop => {}
                     RebaseActionKind::Reword(new_msg) => {
                         git_text(&repo, &["cherry-pick", &step.commit_id]).map_err(|e| {
-                            format!("Rebase step failed (reword {}): {}", step.commit_id, e)
+                            e.wrap(|e| {
+                                format!("Rebase step failed (reword {}): {}", step.commit_id, e)
+                            })
                         })?;
                         // Amending with only the new subject would destroy the
                         // commit body; rewrite the subject line in place.
@@ -2026,25 +2069,29 @@ Unset the local override with `git config --local --unset-all user.name` and \
             if let Err(abort_err) = &abort_result {
                 log::warn!(
                     target: "engine",
-                    "rebase recovery: cherry-pick --abort failed in {}: {abort_err}",
-                    repo.display()
+                    "rebase recovery: cherry-pick --abort failed in {}: {}",
+                    repo.display(),
+                    abort_err.message()
                 );
             }
             let restore_result = restore(&repo);
             if let Err(restore_err) = &restore_result {
                 log::warn!(
                     target: "engine",
-                    "rebase recovery: checkout -f restore failed in {}: {restore_err}",
-                    repo.display()
+                    "rebase recovery: checkout -f restore failed in {}: {}",
+                    repo.display(),
+                    restore_err.message()
                 );
             }
-            return Err(combine_step_failure_with_recovery(
-                &e,
-                Some(&abort_result),
-                &restore_result,
-                original_branch.as_deref(),
-                &original_head,
-            ));
+            return Err(e.wrap(|e| {
+                combine_step_failure_with_recovery(
+                    e,
+                    Some(&abort_result),
+                    &restore_result,
+                    original_branch.as_deref(),
+                    &original_head,
+                )
+            }));
         }
 
         if let Some(ref branch) = original_branch {
@@ -2053,18 +2100,21 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 if let Err(restore_err) = &restore_result {
                     log::warn!(
                         target: "engine",
-                        "rebase recovery: checkout -f restore after failed 'branch -f' in {}: {restore_err}",
-                        repo.display()
+                        "rebase recovery: checkout -f restore after failed 'branch -f' in {}: {}",
+                        repo.display(),
+                        restore_err.message()
                     );
                 }
                 // No cherry-pick was mid-flight here, so abort_result is None.
-                return Err(combine_step_failure_with_recovery(
-                    &e,
-                    None,
-                    &restore_result,
-                    original_branch.as_deref(),
-                    &original_head,
-                ));
+                return Err(e.wrap(|e| {
+                    combine_step_failure_with_recovery(
+                        e,
+                        None,
+                        &restore_result,
+                        original_branch.as_deref(),
+                        &original_head,
+                    )
+                }));
             }
             // The rebase is durably applied once `branch -f` succeeded; only
             // the working-tree checkout remains. Retry once, and if it still
@@ -2072,10 +2122,12 @@ Unset the local override with `git config --local --unset-all user.name` and \
             // the user knows the branch DID move.
             if let Err(checkout_err) = git_text(&repo, &["checkout", branch]) {
                 if git_text(&repo, &["checkout", branch]).is_err() {
-                    return Err(format!(
-                        "rebase was applied to '{branch}', but working-tree checkout failed: \
+                    return Err(checkout_err.wrap(|checkout_err| {
+                        format!(
+                            "rebase was applied to '{branch}', but working-tree checkout failed: \
                          {checkout_err}"
-                    ));
+                        )
+                    }));
                 }
             }
         }
@@ -2086,10 +2138,10 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// work, so the spawn gate sheds it under load instead of queueing it
     /// ahead of the user's own commands, and skips rather than waits when
     /// another git operation holds the repository.
-    pub fn auto_fetch(repo_path: &str) -> Result<AutoFetchOutcome, String> {
+    pub fn auto_fetch(repo_path: &str) -> Result<AutoFetchOutcome, CommandError> {
         let repo = validate_repo(repo_path)?;
         let skipped = |reason: &str| {
-            Ok(AutoFetchOutcome::Skipped {
+            Ok::<_, CommandError>(AutoFetchOutcome::Skipped {
                 reason: reason.to_string(),
             })
         };
@@ -2105,14 +2157,17 @@ Unset the local override with `git config --local --unset-all user.name` and \
             git_with_timeout(&repo, &AUTO_FETCH_ARGV[1..], AUTO_FETCH_TIMEOUT)
         }) {
             Ok(_) => Ok(AutoFetchOutcome::Fetched),
-            Err(error) if is_deferred_under_load(&error) || is_slot_wait_timeout(&error) => {
+            Err(error)
+                if is_deferred_under_load(error.message())
+                    || is_slot_wait_timeout(error.message()) =>
+            {
                 skipped("the app is busy; deferred to the next interval")
             }
             Err(error) => Err(error),
         }
     }
 
-    pub fn fetch(repo_path: &str, remote: Option<&str>) -> Result<String, String> {
+    pub fn fetch(repo_path: &str, remote: Option<&str>) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
@@ -2142,7 +2197,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// Refused (nothing to confirm) unless
     /// [`CommitGraphState::offers_write`](crate::storage::commit_graph::CommitGraphState::offers_write)
     /// holds, and on an untrusted repository. Reads files only.
-    pub fn commit_graph_write_plan(repo_path: &str) -> Result<CommitGraphWritePlan, String> {
+    pub fn commit_graph_write_plan(repo_path: &str) -> Result<CommitGraphWritePlan, CommandError> {
         Self::commit_graph_write_plan_with(
             repo_path,
             crate::engine::git_cli::git_supports(COMMIT_GRAPH_CHANGED_PATHS_GIT),
@@ -2154,25 +2209,29 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// also covers a git that could not be probed), and a partial clone, whose
     /// write would fetch every missing tree from the promisor remote. A partial
     /// check that could not be read refuses too.
-    fn commit_graph_write_refusal(repo: &Path, git_supports: bool) -> Result<(), String> {
+    fn commit_graph_write_refusal(repo: &Path, git_supports: bool) -> Result<(), CommandError> {
         let (major, minor, _) = COMMIT_GRAPH_CHANGED_PATHS_GIT;
         if !git_supports {
             return Err(format!(
                 "A commit-graph write needs Git {major}.{minor} or newer (for --changed-paths), \
                  or the installed Git could not be checked; update Git to use it"
-            ));
+            )
+            .into());
         }
         match crate::engine::provenance::is_partial_clone(repo) {
             Ok(false) => Ok(()),
             Ok(true) => Err(
                 "This is a partial clone: a commit-graph write would fetch the missing trees \
                  from its remote, so it is not offered"
-                    .to_string(),
+                    .to_string()
+                    .into(),
             ),
-            Err(error) => Err(format!(
-                "Could not tell whether this is a partial clone, so no commit-graph write is \
+            Err(error) => Err(error.wrap(|error| {
+                format!(
+                    "Could not tell whether this is a partial clone, so no commit-graph write is \
                  offered: {error}"
-            )),
+                )
+            })),
         }
     }
 
@@ -2181,7 +2240,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     pub(crate) fn commit_graph_write_plan_with(
         repo_path: &str,
         git_supports: bool,
-    ) -> Result<CommitGraphWritePlan, String> {
+    ) -> Result<CommitGraphWritePlan, CommandError> {
         let repo = validate_repo(repo_path)?;
         Self::commit_graph_write_refusal(&repo, git_supports)?;
         let (private, common) = crate::repository_trust::git_directories(&repo)?;
@@ -2189,7 +2248,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
             return Err(
                 "A commit-graph write is already running in this repository; stop it from the \
                  Storage panel or wait for it to finish"
-                    .to_string(),
+                    .to_string()
+                    .into(),
             );
         }
         let report = crate::storage::commit_graph::inspect(&repo, &private, &common);
@@ -2202,7 +2262,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
                     .as_deref()
                     .map(|note| format!(" ({note})"))
                     .unwrap_or_default()
-            ));
+            )
+            .into());
         }
         Ok(CommitGraphWritePlan {
             argv: Self::commit_graph_write_argv(),
@@ -2218,7 +2279,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// [`COMMIT_GRAPH_STOP_INTENT_LIFETIME`] and honoured by a write that
     /// registers within it, so a Stop sent in the window between the click and
     /// the registration is not lost, and the UI can ask again.
-    pub fn commit_graph_write_cancel(repo_path: &str) -> Result<bool, String> {
+    pub fn commit_graph_write_cancel(repo_path: &str) -> Result<bool, CommandError> {
         let repo = validate_repo(repo_path)?;
         let (_, common) = crate::repository_trust::git_directories(&repo)?;
         let flags = commit_graph_cancels()
@@ -2247,7 +2308,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     pub fn commit_graph_write(
         repo_path: &str,
         confirmed: &[String],
-    ) -> Result<CommitGraphWriteOutcome, String> {
+    ) -> Result<CommitGraphWriteOutcome, CommandError> {
         Self::commit_graph_write_checked(
             repo_path,
             confirmed,
@@ -2262,14 +2323,15 @@ Unset the local override with `git config --local --unset-all user.name` and \
         repo_path: &str,
         confirmed: &[String],
         git_supports: bool,
-    ) -> Result<CommitGraphWriteOutcome, String> {
+    ) -> Result<CommitGraphWriteOutcome, CommandError> {
         let argv = Self::commit_graph_write_argv();
         if confirmed != argv.as_slice() {
             return Err(format!(
                 "The confirmed command `{}` is not the commit-graph write `{}`; nothing ran",
                 confirmed.join(" "),
                 argv.join(" ")
-            ));
+            )
+            .into());
         }
         let repo = validate_repo(repo_path)?;
         Self::commit_graph_write_refusal(&repo, git_supports)?;
@@ -2282,7 +2344,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         repo_path: &str,
         argv: &[String],
         timeout: std::time::Duration,
-    ) -> Result<CommitGraphWriteOutcome, String> {
+    ) -> Result<CommitGraphWriteOutcome, CommandError> {
         let repo = validate_repo(repo_path)?;
         let (private, common) = crate::repository_trust::git_directories(&repo)?;
         let ran = std::cell::Cell::new(false);
@@ -2321,7 +2383,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
             return Err(format!(
                 "Another git process holds, or a stopped one left behind, {}",
                 commit_graph_lock_remedy(&held)
-            ));
+            )
+            .into());
         }
         let (_registered, flag) = CancelRegistration::register(common);
         let stop = Arc::clone(&flag);
@@ -2374,30 +2437,31 @@ Unset the local override with `git config --local --unset-all user.name` and \
             Ok(crate::engine::git_cli::BoundedRun {
                 incomplete: Some(crate::engine::git_cli::Incomplete::Deadline { message, .. }),
                 ..
-            }) => (Err(with_lock(message)), "timed_out"),
+            }) => (Err(with_lock(message).into()), "timed_out"),
             Ok(run) if run.success => (Ok(finished(false, started)), "written"),
             Ok(run) => (
                 Err(with_lock(format!(
                     "git commit-graph write failed: {}",
                     crate::engine::git_cli::byte_tail(&run.stderr, 400).trim()
-                ))),
+                ))
+                .into()),
                 "failed",
             ),
             // Stopped while still waiting for a process slot: nothing was
             // spawned, and the person's stop is the answer, not a failure.
             Err(error)
                 if stop.load(std::sync::atomic::Ordering::SeqCst)
-                    && !crate::engine::git_cli::is_timed_out(&error) =>
+                    && !crate::engine::git_cli::is_timed_out(error.message()) =>
             {
                 (Ok(finished(true, started)), "cancelled")
             }
             Err(error) => {
-                let journal = if crate::engine::git_cli::is_timed_out(&error) {
+                let journal = if crate::engine::git_cli::is_timed_out(error.message()) {
                     "timed_out"
                 } else {
                     "failed"
                 };
-                (Err(with_lock(error)), journal)
+                (Err(error.wrap(|e| with_lock(e.to_string()))), journal)
             }
         };
         record_commit_graph_write(repo, common, argv, journal, started.elapsed());
@@ -2432,7 +2496,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         remote: Option<&str>,
         branch: Option<&str>,
         rebase: Option<bool>,
-    ) -> Result<String, String> {
+    ) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
         if let Some(remote) = remote {
             crate::engine::remotes::require_configured(&repo, remote)?;
@@ -2452,7 +2516,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
 
     /// `pull.rebase` as configured for `repo` (`true`, `false`, `merges`,
     /// `interactive`), or `None` when unset — git then merges.
-    pub fn pull_rebase_config(repo_path: &str) -> Result<Option<String>, String> {
+    pub fn pull_rebase_config(repo_path: &str) -> Result<Option<String>, CommandError> {
         let repo = validate_repo(repo_path)?;
         Self::config_value(&repo, "pull.rebase")
     }
@@ -2465,7 +2529,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         remote: Option<&str>,
         branch: Option<&str>,
         force: bool,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<String>, CommandError> {
         let repo = validate_repo(repo_path)?;
         plan_push_argv(&repo, remote, branch, force)
     }
@@ -2475,7 +2539,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         remote: Option<&str>,
         branch: Option<&str>,
         force: bool,
-    ) -> Result<String, String> {
+    ) -> Result<String, CommandError> {
         let args = Self::plan_push(repo_path, remote, branch, force)?;
         Self::push_planned(repo_path, &args)
     }
@@ -2485,7 +2549,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// validated ref names so a caller cannot smuggle `--force`, a lease with
     /// an explicit expected value, or a lease without the includes check past
     /// the contract.
-    pub fn push_planned(repo_path: &str, args: &[String]) -> Result<String, String> {
+    pub fn push_planned(repo_path: &str, args: &[String]) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
         if args.first().map(String::as_str) != Some("push") {
             return Err("internal: planned push argv must start with push".into());
@@ -2497,7 +2561,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
             }
             if let Some(slot) = FORCE_PUSH_FLAGS.iter().position(|flag| arg == flag) {
                 if std::mem::replace(&mut forced[slot], true) {
-                    return Err(format!("Duplicate push flag {arg}"));
+                    return Err(format!("Duplicate push flag {arg}").into());
                 }
                 continue;
             }
@@ -2545,7 +2609,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
 
     /// Pushes exactly one tag ref. Using a fully-qualified refspec avoids an
     /// ambiguous branch/tag name from publishing the wrong object.
-    pub fn push_tag(repo_path: &str, remote: &str, tag: &str) -> Result<String, String> {
+    pub fn push_tag(repo_path: &str, remote: &str, tag: &str) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
@@ -2585,8 +2649,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
         repo_path: &str,
         branch_name: &str,
         mode: MergeMode,
-        gate: &mut dyn FnMut(&[&str]) -> Result<(), String>,
-    ) -> Result<String, String> {
+        gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
+    ) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
         validate_ref_name(branch_name)?;
         let _repo_lock = repo_mutation_lock(&repo);
@@ -2602,7 +2666,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
                         format!("Nothing to squash: {branch_name} is already merged")
                     }
                 })
-                .map_err(SquashFailure::into_message);
+                .map_err(SquashFailure::into_error);
         }
         // Only a fast-forward-only merge is guaranteed to write no commit.
         if mode != MergeMode::FfOnly {
@@ -2620,7 +2684,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     pub(crate) fn squash_merge_locked(
         repo: &Path,
         branch: &str,
-        gate: &mut dyn FnMut(&[&str]) -> Result<(), String>,
+        gate: &mut dyn FnMut(&[&str]) -> Result<(), CommandError>,
     ) -> Result<bool, SquashFailure> {
         // Checked first: once the merge has staged the squash, a missing
         // identity would leave it stranded in the index.
@@ -2628,11 +2692,13 @@ Unset the local override with `git config --local --unset-all user.name` and \
         let merge = Self::merge_argv(branch, MergeMode::Squash);
         gate(&merge).map_err(SquashFailure::Merge)?;
         git_text(repo, &merge).map_err(SquashFailure::Conflict)?;
-        let staged_note = |e: String| {
-            SquashFailure::Commit(format!(
-                "The squashed changes of {branch} are staged but could not be committed: {e}. \
-                 Commit the staged changes, or undo them with `git reset --merge`."
-            ))
+        let staged_note = |e: CommandError| {
+            SquashFailure::Commit(e.wrap(|e| {
+                format!(
+                    "The squashed changes of {branch} are staged but could not be committed: {e}. \
+                     Commit the staged changes, or undo them with `git reset --merge`."
+                )
+            }))
         };
         // `git merge` refuses to start over staged changes, so whatever is
         // staged now is the squash.
@@ -2648,10 +2714,13 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    return Err(SquashFailure::Commit(format!(
+                    return Err(SquashFailure::Commit(
+                        format!(
                         "The squash of {branch} staged nothing, but {} could not be removed: {e}",
                         message.display()
-                    )))
+                    )
+                        .into(),
+                    ))
                 }
             }
             return Ok(false);
@@ -2687,7 +2756,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         branch: &str,
         onto: &str,
         requested: Option<&str>,
-    ) -> Result<String, String> {
+    ) -> Result<String, CommandError> {
         validate_ref_name(branch)?;
         validate_ref_name(onto)?;
         if let Some(fork_point) = requested {
@@ -2706,7 +2775,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
                     "Fork point {} is not an ancestor of '{branch}', so the stack this \
                      restack was planned from is no longer the stack on disk. Reload and retry.",
                     &fork_point[..fork_point.len().min(12)]
-                ));
+                )
+                .into());
             }
             return Ok(fork_point.to_string());
         }
@@ -2741,7 +2811,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         branch: &str,
         onto: &str,
         upstream: &str,
-    ) -> Result<String, String> {
+    ) -> Result<String, CommandError> {
         validate_ref_name(branch)?;
         validate_ref_name(onto)?;
         // Upstream is either the validated `onto` fallback or a git-emitted
@@ -2761,7 +2831,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 "A {} is already in progress in this repository; \
                  finish or abort it before restacking",
                 parked.kind.label()
-            ));
+            )
+            .into());
         }
         let dirty = git_text(repo_canon, &["status", "--porcelain"])?;
         if !dirty.trim().is_empty() {
@@ -2797,7 +2868,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
                                 "Restack succeeded: '{branch}' was rebased onto '{onto}', but \
                                  restoring your previous branch '{orig}' failed ({checkout_err}). \
                                  The repository is left on '{branch}'."
-                            ));
+                            )
+                            .into());
                         }
                     }
                 }
@@ -2821,9 +2893,10 @@ Unset the local override with `git config --local --unset-all user.name` and \
                         "Restack of '{branch}' onto '{onto}' failed and could not be rolled back \
                          (git rebase --abort failed: {}); the repository is still mid-rebase. \
                          Original failure: {}",
-                        summarize_git_failure(abort_err),
-                        summarize_git_failure(&rebase_err)
-                    ));
+                        summarize_git_failure(abort_err.message()),
+                        summarize_git_failure(rebase_err.message())
+                    )
+                    .into());
                 }
                 let end_state = match &original_head {
                     Some(orig) if orig != branch => {
@@ -2837,8 +2910,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 };
                 Err(format!(
                     "Restack of '{branch}' onto '{onto}' failed and was rolled back ({end_state}): {}",
-                    summarize_git_failure(&rebase_err)
-                ))
+                    summarize_git_failure(rebase_err.message())
+                ).into())
             }
         }
     }
@@ -2847,7 +2920,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// the mutation lock, resolves the upstream, executes with preflight and
     /// rollback. The production command plans/judges/executes under ONE lock
     /// span via [`Self::prepare_restack`] + [`Self::execute_restack`] instead.
-    pub fn restack(repo_path: &str, branch: &str, onto: &str) -> Result<String, String> {
+    pub fn restack(repo_path: &str, branch: &str, onto: &str) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let guard = _repo_lock
@@ -2863,7 +2936,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         tag_name: &str,
         commit_id: Option<&str>,
         message: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<(), CommandError> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
@@ -2878,7 +2951,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         Ok(())
     }
 
-    pub fn delete_tag(repo_path: &str, tag_name: &str) -> Result<(), String> {
+    pub fn delete_tag(repo_path: &str, tag_name: &str) -> Result<(), CommandError> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
@@ -2897,7 +2970,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// (restore cannot match untracked paths, so that pair of outcomes means
     /// the discard completed). A clean failure after a successful restore is
     /// also an error: the tree is half-discarded, and the caller must know.
-    pub fn discard_changes(repo_path: &str, file_path: &str) -> Result<(), String> {
+    pub fn discard_changes(repo_path: &str, file_path: &str) -> Result<(), CommandError> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
@@ -2915,10 +2988,12 @@ Unset the local override with `git config --local --unset-all user.name` and \
         let clean_result = git_text(&repo, &["clean", "-f", "--", &spec]);
         match (restore_result, clean_result) {
             (Ok(_), Ok(_)) => Ok(()),
-            (Ok(_), Err(e)) => Err(format!(
-                "restored '{}' but cleaning untracked files failed: {}",
-                file_path, e
-            )),
+            (Ok(_), Err(e)) => Err(e.wrap(|e| {
+                format!(
+                    "restored '{}' but cleaning untracked files failed: {}",
+                    file_path, e
+                )
+            })),
             (Err(_restore_err), Ok(_)) if existed_before && !dest.exists() => {
                 // Purely untracked path: restore could not match it (expected),
                 // and clean removed it, so the requested end state was reached.
@@ -2928,7 +3003,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         }
     }
 
-    pub fn stash_save(repo_path: &str, message: Option<&str>) -> Result<String, String> {
+    pub fn stash_save(repo_path: &str, message: Option<&str>) -> Result<String, CommandError> {
         Self::stash_save_with(repo_path, message, StashSaveOptions::default())
     }
 
@@ -2936,7 +3011,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         repo_path: &str,
         message: Option<&str>,
         options: StashSaveOptions,
-    ) -> Result<String, String> {
+    ) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
@@ -2956,12 +3031,13 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// operation's control files collide with the first's. Consulting the same
     /// detector the recovery banner uses means the refusal names the operation
     /// the user can actually see and abort.
-    fn refuse_if_parked(repo_canon: &Path, verb: &str) -> Result<(), String> {
+    fn refuse_if_parked(repo_canon: &Path, verb: &str) -> Result<(), CommandError> {
         if let Some(parked) = crate::engine::repo_op::detect(repo_canon)? {
             return Err(format!(
                 "Cannot {verb} while a {} is in progress. Finish or abort it first.",
                 parked.kind.label()
-            ));
+            )
+            .into());
         }
         Ok(())
     }
@@ -2996,7 +3072,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     ///
     /// An empty list would make git operate on `HEAD` implicitly for some
     /// verbs, which is never what a UI meant to send.
-    fn validate_replay_commits(commits: &[String]) -> Result<(), String> {
+    fn validate_replay_commits(commits: &[String]) -> Result<(), CommandError> {
         if commits.is_empty() {
             return Err("No commits were selected".into());
         }
@@ -3004,7 +3080,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
             return Err(format!(
                 "Too many commits selected ({}); the limit is {MAX_REPLAY_COMMITS}",
                 commits.len()
-            ));
+            )
+            .into());
         }
         for commit in commits {
             validate_oid_or_revision(commit)?;
@@ -3023,13 +3100,17 @@ Unset the local override with `git config --local --unset-all user.name` and \
         repo_path: &str,
         commits: &[String],
         no_commit: bool,
-    ) -> Result<String, String> {
+    ) -> Result<String, CommandError> {
         Self::replay(repo_path, "cherry-pick", commits, no_commit)
     }
 
     /// Records the inverse of `commits` as new commits. Same parked-on-conflict
     /// semantics as [`cherry_pick`].
-    pub fn revert(repo_path: &str, commits: &[String], no_commit: bool) -> Result<String, String> {
+    pub fn revert(
+        repo_path: &str,
+        commits: &[String],
+        no_commit: bool,
+    ) -> Result<String, CommandError> {
         Self::replay(repo_path, "revert", commits, no_commit)
     }
 
@@ -3038,7 +3119,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         subcommand: &str,
         commits: &[String],
         no_commit: bool,
-    ) -> Result<String, String> {
+    ) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
         Self::validate_replay_commits(commits)?;
         let _repo_lock = repo_mutation_lock(&repo);
@@ -3066,7 +3147,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     /// is an enum rather than a passthrough string: no caller can invent a
     /// fifth mode, and the write gate sees a rendered line it can rank by
     /// destructiveness.
-    pub fn reset(repo_path: &str, mode: ResetMode, target: &str) -> Result<String, String> {
+    pub fn reset(repo_path: &str, mode: ResetMode, target: &str) -> Result<String, CommandError> {
         let repo = validate_repo(repo_path)?;
         validate_oid_or_revision(target)?;
         let _repo_lock = repo_mutation_lock(&repo);
@@ -3080,7 +3161,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         git_text(&repo, &argv[1..])
     }
 
-    pub fn clone_repo(url: &str, target_dir: &str) -> Result<String, String> {
+    pub fn clone_repo(url: &str, target_dir: &str) -> Result<String, CommandError> {
         Self::clone_repo_with(url, target_dir, &CloneOptions::default(), &mut |_| {})
     }
 
@@ -3091,7 +3172,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         target_dir: &str,
         options: &CloneOptions,
         on_progress: &mut dyn FnMut(&CloneProgress),
-    ) -> Result<String, String> {
+    ) -> Result<String, CommandError> {
         validate_clone_url(url)?;
         options.validate()?;
         super::git_cli::require_git_for_clone(options.recurse_submodules)?;
@@ -3132,7 +3213,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
             dest
         };
         if clone_path.join(".git").exists() {
-            return Err(format!("Already cloned at {}", clone_path.display()));
+            return Err(format!("Already cloned at {}", clone_path.display()).into());
         }
         let clone_str = clone_path.to_string_lossy().into_owned();
         let staging = allocate_clone_staging(
@@ -3154,16 +3235,18 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 if run.success {
                     Ok(())
                 } else {
-                    Err(clone_failure(&run))
+                    Err(clone_failure(&run).into())
                 }
             })
             .and_then(|_| {
-                crate::fs_entry::rename_noreplace(&staging, &clone_path).map_err(|error| {
-                    format!(
+                crate::fs_entry::rename_noreplace(&staging, &clone_path)
+                    .map_err(|error| {
+                        format!(
                         "Cannot publish clone at {} without replacing an existing entry: {error}",
                         clone_path.display()
                     )
-                })
+                    })
+                    .map_err(CommandError::from)
             });
         if let Err(clone_err) = result {
             // This attempt exclusively created staging. Never remove `.git`
@@ -3172,13 +3255,13 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 other => other,
             };
-            return Err(partial_clone_message(&clone_err, &staging, removal));
+            return Err(partial_clone_message(clone_err.message(), &staging, removal).into());
         }
         Ok(clone_str)
     }
 }
 
-fn allocate_clone_staging(parent: &Path) -> Result<PathBuf, String> {
+fn allocate_clone_staging(parent: &Path) -> Result<PathBuf, CommandError> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let timestamp = std::time::SystemTime::now()
@@ -3207,7 +3290,9 @@ fn allocate_clone_staging(parent: &Path) -> Result<PathBuf, String> {
         match created {
             Ok(()) => return Ok(path),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("Cannot create clone staging directory: {error}")),
+            Err(error) => {
+                return Err(format!("Cannot create clone staging directory: {error}").into())
+            }
         }
     }
     Err("Could not allocate a unique clone staging directory after 32 attempts".into())
@@ -3237,7 +3322,7 @@ fn partial_clone_message(clone_err: &str, leftover: &Path, removal: std::io::Res
 /// not a commit to fold into: with only drops ahead of it the fold would amend
 /// the onto commit itself and `branch -f` would then move the branch onto that
 /// rewritten copy of the base. Pick and reword keep a commit; drop does not.
-fn validate_rebase_plan(steps: &[RebaseStep]) -> Result<(), String> {
+fn validate_rebase_plan(steps: &[RebaseStep]) -> Result<(), CommandError> {
     let mut has_kept_commit = false;
     for step in steps {
         let folds_into_previous = match step.action {
@@ -3254,7 +3339,8 @@ fn validate_rebase_plan(steps: &[RebaseStep]) -> Result<(), String> {
                 return Err(format!(
                     "Cannot '{verb}' commit {} without a previous commit to combine into",
                     step.commit_id
-                ));
+                )
+                .into());
             }
         }
     }
@@ -3272,16 +3358,17 @@ fn validate_rebase_plan(steps: &[RebaseStep]) -> Result<(), String> {
 /// Pure: no git, fully unit-testable.
 fn combine_step_failure_with_recovery(
     step_error: &str,
-    abort_result: Option<&Result<(), String>>, // None when no cherry-pick was in progress
-    restore_result: &Result<(), String>,
+    abort_result: Option<&Result<(), CommandError>>, // None when no cherry-pick was in progress
+    restore_result: &Result<(), CommandError>,
     original_branch: Option<&str>,
     original_head: &str,
 ) -> String {
     let mut message = step_error.to_string();
     if let Some(Err(abort_err)) = abort_result {
         message.push_str(&format!(
-            "; additionally, `cherry-pick --abort` failed ({abort_err}) — \
-             the repository may still be mid-cherry-pick"
+            "; additionally, `cherry-pick --abort` failed ({}) — \
+             the repository may still be mid-cherry-pick",
+            abort_err.message()
         ));
     }
     if let Err(restore_err) = restore_result {
@@ -3290,8 +3377,9 @@ fn combine_step_failure_with_recovery(
             None => format!("HEAD {original_head}"),
         };
         message.push_str(&format!(
-            "; additionally, restoring {target} failed ({restore_err}) — \
-             HEAD may remain detached at the rebase base"
+            "; additionally, restoring {target} failed ({}) — \
+             HEAD may remain detached at the rebase base",
+            restore_err.message()
         ));
     }
     message
@@ -3304,7 +3392,7 @@ fn combine_step_failure_with_recovery(
 /// must stay under the canonical parent. The returned path is what git is told
 /// to create, so a symlinked destination can no longer redirect a clone past
 /// the directory the caller picked.
-fn resolve_clone_destination(dest: &Path) -> Result<PathBuf, String> {
+fn resolve_clone_destination(dest: &Path) -> Result<PathBuf, CommandError> {
     if !dest.is_absolute() {
         return Err("Clone destination must be an absolute path".into());
     }
@@ -3334,7 +3422,8 @@ fn resolve_clone_destination(dest: &Path) -> Result<PathBuf, String> {
                     "Clone destination '{}' is a symlink; refusing so the clone cannot land \
                      outside the chosen location",
                     dest.display()
-                ));
+                )
+                .into());
             }
             let actual = crate::engine::git_cli::canonicalize_plain(dest).map_err(|e| {
                 format!(
@@ -3347,7 +3436,8 @@ fn resolve_clone_destination(dest: &Path) -> Result<PathBuf, String> {
                 return Err(format!(
                     "Clone destination '{}' escapes its parent via symlink",
                     actual.display()
-                ));
+                )
+                .into());
             }
             Ok(actual)
         }
@@ -3360,7 +3450,8 @@ fn resolve_clone_destination(dest: &Path) -> Result<PathBuf, String> {
         Err(error) => Err(format!(
             "Cannot inspect clone destination '{}': {error}",
             dest.display()
-        )),
+        )
+        .into()),
     }
 }
 
@@ -3480,7 +3571,7 @@ impl BranchDeleteJournal {
 /// default", so a destructive caller refuses. Reads the repository afresh
 /// rather than through the memoized default base, which would answer from
 /// before the read started failing.
-pub(crate) fn is_default_branch(repo: &Path, branch_name: &str) -> Result<bool, String> {
+pub(crate) fn is_default_branch(repo: &Path, branch_name: &str) -> Result<bool, CommandError> {
     let base = crate::engine::git_reader::compute_default_base(repo).checked()?;
     Ok(base.base.is_some_and(|(short, _)| short == branch_name))
 }
@@ -3490,13 +3581,13 @@ pub(crate) fn is_default_branch(repo: &Path, branch_name: &str) -> Result<bool, 
 pub(crate) fn is_checked_out_in_any_worktree(
     repo: &Path,
     branch_name: &str,
-) -> Result<bool, String> {
+) -> Result<bool, CommandError> {
     Ok(checked_out_branches(repo)?.contains(branch_name))
 }
 
 /// Short names of every local branch checked out in any worktree of `repo`
 /// (including the main one), from a single `git worktree list`.
-pub(crate) fn checked_out_branches(repo: &Path) -> Result<HashSet<String>, String> {
+pub(crate) fn checked_out_branches(repo: &Path) -> Result<HashSet<String>, CommandError> {
     Ok(crate::engine::worktree::read_worktree_entries(repo)?
         .into_iter()
         .filter_map(|entry| entry.branch)
@@ -3525,7 +3616,7 @@ pub(crate) fn reworded_message(original: &str, new_subject: &str) -> String {
 /// where `<scheme>::<args>` hands the argument string to an arbitrary helper
 /// (`ext::sh -c <cmd>` executes it through /bin/sh). A leading `-` is refused
 /// so a URL can never be parsed as a git option.
-pub fn validate_clone_url(url: &str) -> Result<(), String> {
+pub fn validate_clone_url(url: &str) -> Result<(), CommandError> {
     if url.is_empty() || url.contains('\0') || url.chars().any(|c| c.is_control()) {
         return Err("Invalid clone URL".into());
     }
@@ -3549,7 +3640,8 @@ pub fn validate_clone_url(url: &str) -> Result<(), String> {
         return Err(format!(
             "Clone URL uses unsupported transport '{scheme}': use http(s), ssh, git, ftp(s), \
              file, or a local path"
-        ));
+        )
+        .into());
     }
     Ok(())
 }
@@ -3593,8 +3685,10 @@ fn branch_has_upstream(repo: &Path) -> bool {
     .unwrap_or(false)
 }
 
-fn current_branch_name(repo: &Path) -> Result<String, String> {
-    crate::engine::git_reader::head_branch(repo)?.ok_or_else(|| PUSH_DETACHED.to_string())
+fn current_branch_name(repo: &Path) -> Result<String, CommandError> {
+    crate::engine::git_reader::head_branch(repo)?
+        .ok_or_else(|| PUSH_DETACHED.to_string())
+        .map_err(CommandError::from)
 }
 
 /// Remote to publish an unpublished branch to when the caller did not name one.
@@ -3603,7 +3697,7 @@ fn current_branch_name(repo: &Path) -> Result<String, String> {
 /// `origin` when it exists, a lone remote, else a refusal naming the choices.
 /// Never invents `origin` — `git push -u origin …` against a missing remote is
 /// the same class of raw fatal this path exists to replace.
-fn unpublished_push_remote(repo: &Path) -> Result<String, String> {
+fn unpublished_push_remote(repo: &Path) -> Result<String, CommandError> {
     let remotes = crate::engine::remotes::list_names(repo)?;
     if remotes.is_empty() {
         return Err(PUSH_NO_REMOTES.into());
@@ -3623,7 +3717,7 @@ fn unpublished_push_remote(repo: &Path) -> Result<String, String> {
     Err(format!(
         "This branch has no upstream. GitPulse cannot choose among remotes {} — specify one to push.",
         remotes.join(", ")
-    ))
+    ).into())
 }
 
 /// The pair a force push carries. A bare `--force-with-lease` compares against
@@ -3642,7 +3736,7 @@ const FORCE_PUSH_FLAGS: [&str; 2] = ["--force-with-lease", "--force-if-includes"
 /// reads it as `deferred_under_load` rather than as a terminal failure.
 fn require_force_if_includes(
     preflight: &crate::engine::git_cli::GitPreflight,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     use crate::engine::git_cli::{is_deferred_under_load, supports, GitPreflightStatus};
     if supports(preflight, crate::engine::git_cli::FORCE_IF_INCLUDES) {
         return Ok(());
@@ -3665,10 +3759,12 @@ fn require_force_if_includes(
                      restart GitPulse.",
                     preflight.message.as_deref().unwrap_or_default()
                 )
+                .into()
             }
             _ => "Force push needs `--force-if-includes`, which requires Git 2.30 or newer, and \
                   this Git is older. Update Git, then restart GitPulse."
-                .to_string(),
+                .to_string()
+                .into(),
         });
     }
     let detail = preflight
@@ -3679,22 +3775,24 @@ fn require_force_if_includes(
         .strip_prefix("Git could not be checked yet: ")
         .unwrap_or(detail);
     if is_deferred_under_load(detail) {
-        return Err(detail.to_string());
+        return Err(detail.to_string().into());
     }
     Err(format!(
         "Force push needs `--force-if-includes` (Git 2.30 or newer), but Git's version could not \
          be checked just now: {detail}"
-    ))
+    )
+    .into())
 }
 
 /// A branch given to a push: a valid ref name that is not refspec syntax.
-fn validate_push_branch(name: &str) -> Result<(), String> {
+fn validate_push_branch(name: &str) -> Result<(), CommandError> {
     validate_ref_name(name)?;
     if name.starts_with('+') || name.contains(':') {
         return Err(format!(
             "Refusing to push `{name}`: a push takes a plain branch name, and a leading `+` \
              or a `:` is refspec syntax (`+` forces the push without a lease)."
-        ));
+        )
+        .into());
     }
     Ok(())
 }
@@ -3704,7 +3802,7 @@ fn plan_push_argv(
     remote: Option<&str>,
     branch: Option<&str>,
     force: bool,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, CommandError> {
     let mut args = vec!["push".to_string()];
     if force {
         require_force_if_includes(&crate::engine::git_cli::git_preflight())?;
@@ -3752,7 +3850,7 @@ fn plan_push_argv(
 /// The configured remote a push with no named remote goes to: the current
 /// branch's own `branch.<name>.remote` when it names a configured remote,
 /// else the same choice an unpublished branch makes.
-fn implicit_push_remote(repo: &Path) -> Result<String, String> {
+fn implicit_push_remote(repo: &Path) -> Result<String, CommandError> {
     if let Ok(branch) = current_branch_name(repo) {
         let key = format!("branch.{branch}.remote");
         if let Ok(configured) = git_text(repo, &["config", "--get", &key]) {
@@ -3789,7 +3887,7 @@ fn implicit_push_remote(repo: &Path) -> Result<String, String> {
 ///
 /// The tests check this function against `git check-ref-format` over a table and
 /// a sweep of short names, and name the C1 rows as the expected divergence.
-pub fn validate_ref_name(name: &str) -> Result<(), String> {
+pub fn validate_ref_name(name: &str) -> Result<(), CommandError> {
     if name.is_empty() || name.starts_with('-') || name.contains('\0') {
         return Err("Invalid ref name".into());
     }
@@ -3830,7 +3928,7 @@ pub fn validate_ref_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn validate_oid(oid: &str) -> Result<(), String> {
+pub fn validate_oid(oid: &str) -> Result<(), CommandError> {
     if oid.is_empty() || oid.len() > 64 || !oid.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("Invalid commit id".into());
     }
@@ -3860,7 +3958,7 @@ pub fn is_full_oid(text: &str) -> bool {
 /// or peel suffixes (`^{tree}`), so tightening to forbid them is proven safe:
 /// `:` would inject into downstream `rev:path` specs, `{}` enables the
 /// reflog/peel/search grammar, and `..` turns a single revision into a range.
-pub fn validate_oid_or_revision(rev: &str) -> Result<(), String> {
+pub fn validate_oid_or_revision(rev: &str) -> Result<(), CommandError> {
     if rev.is_empty() || rev.starts_with('-') || rev.contains('\0') {
         return Err("Invalid revision".into());
     }
@@ -3970,7 +4068,8 @@ mod tests {
             .expect_err("fixture identity must be refused");
         assert!(
             err.contains("contract@gitpulse.test"),
-            "refusal must name the address, got {err}"
+            "refusal must name the address, got {err}",
+            err = err.message()
         );
         let head = std::process::Command::new("git")
             .args(["rev-parse", "--verify", "HEAD"])
@@ -4031,7 +4130,11 @@ mod tests {
 
         let err = GitWriter::commit(dir.path().to_str().unwrap(), "rewritten", true)
             .expect_err("amend must not preserve the fixture author");
-        assert!(err.contains("contract@gitpulse.test"), "{err}");
+        assert!(
+            err.contains("contract@gitpulse.test"),
+            "{err}",
+            err = err.message()
+        );
         let email = std::process::Command::new("git")
             .args(["log", "-1", "--format=%ae"])
             .current_dir(dir.path())
@@ -4123,7 +4226,7 @@ mod tests {
                 "{flavour}: the fixture merge should conflict"
             );
             GitWriter::rollback_failed_merge_locked(repo)
-                .unwrap_or_else(|e| panic!("{flavour}: {e}"));
+                .unwrap_or_else(|e| panic!("{flavour}: {e}", e = e.message()));
             checkout_is_clean(repo);
             assert!(
                 !repo.join(".git/SQUASH_MSG").exists(),
@@ -4151,7 +4254,11 @@ mod tests {
         std::fs::remove_file(repo.join(".git/MERGE_HEAD")).unwrap();
         let before = std::fs::read_to_string(repo.join("f.txt")).unwrap();
         let refused = GitWriter::rollback_failed_merge_locked(repo).unwrap_err();
-        assert!(refused.contains("left alone"), "{refused}");
+        assert!(
+            refused.contains("left alone"),
+            "{refused}",
+            refused = refused.message()
+        );
         assert_eq!(std::fs::read_to_string(repo.join("f.txt")).unwrap(), before);
         assert!(!git_stdout(repo, &["ls-files", "--unmerged"]).is_empty());
     }
@@ -4183,7 +4290,8 @@ mod tests {
             refused.contains("merge --abort")
                 && refused.contains("not run")
                 && refused.contains("no resets"),
-            "{refused}"
+            "{refused}",
+            refused = refused.message()
         );
         assert!(repo.join(".git/MERGE_HEAD").exists());
         assert!(!git_stdout(repo, &["ls-files", "--unmerged"]).is_empty());
@@ -4211,7 +4319,8 @@ mod tests {
             .unwrap_err();
         assert!(
             refused.contains("not of the") && refused.contains(&foreign),
-            "{refused}"
+            "{refused}",
+            refused = refused.message()
         );
         assert!(
             asked.is_empty(),
@@ -4248,7 +4357,8 @@ mod tests {
         let failed = GitWriter::rollback_failed_merge_locked(repo).unwrap_err();
         assert!(
             failed.contains("merge --abort") && failed.contains("reset --merge"),
-            "{failed}"
+            "{failed}",
+            failed = failed.message()
         );
         assert!(repo.join(".git/MERGE_HEAD").exists());
         std::fs::remove_file(&lock).unwrap();
@@ -4267,7 +4377,11 @@ mod tests {
                 .success
         );
         let refused = GitWriter::rollback_failed_merge_locked(repo).unwrap_err();
-        assert!(refused.contains("cherry-pick"), "{refused}");
+        assert!(
+            refused.contains("cherry-pick"),
+            "{refused}",
+            refused = refused.message()
+        );
         assert!(repo.join(".git/CHERRY_PICK_HEAD").exists());
     }
 
@@ -4283,7 +4397,8 @@ mod tests {
                 .expect_err("a parked sequence must refuse a reset");
             assert!(
                 refused.contains(if revert { "revert" } else { "cherry-pick" }),
-                "{refused}"
+                "{refused}",
+                refused = refused.message()
             );
             assert!(GitWriter::refuse_if_parked(&canon, "stash").is_err());
         }
@@ -4312,11 +4427,12 @@ mod tests {
         )
     }
 
-    fn assert_refused(dir: &std::path::Path, what: &str, result: Result<String, String>) {
+    fn assert_refused(dir: &std::path::Path, what: &str, result: Result<String, CommandError>) {
         let err = result.expect_err(&format!("{what} must refuse the fixture identity"));
         assert!(
             err.contains("contract@gitpulse.test"),
-            "{what}: refusal must name the address, got {err}"
+            "{what}: refusal must name the address, got {err}",
+            err = err.message()
         );
         assert!(
             git_stdout(dir, &["status", "--porcelain"]).is_empty(),
@@ -4432,7 +4548,11 @@ mod tests {
             None,
         )
         .expect_err("pull must refuse the fixture identity");
-        assert!(err.contains("contract@gitpulse.test"), "{err}");
+        assert!(
+            err.contains("contract@gitpulse.test"),
+            "{err}",
+            err = err.message()
+        );
         assert_eq!(refs_snapshot(dir.path()), before);
     }
 
@@ -4725,11 +4845,11 @@ mod tests {
         let repo = init_repo_with_commit();
         let path = repo_path(&repo);
         for name in ["-x", "--force", "-", "--orphan"] {
-            let refused = |what: &str, result: Result<(), String>| {
+            let refused = |what: &str, result: Result<(), CommandError>| {
                 let err = result.expect_err(&format!("{what} must refuse {name:?}"));
                 assert!(
-                    err.starts_with("Invalid ref name"),
-                    "{what}({name:?}) was refused for the wrong reason: {err}"
+                    err.message().starts_with("Invalid ref name"),
+                    "{what}({name:?}) was refused for the wrong reason: {err:?}"
                 );
             };
             refused(
@@ -4828,13 +4948,14 @@ mod tests {
         let err = resolve_clone_destination(&link).expect_err("symlink leaf must refuse");
         assert!(
             err.contains("symlink"),
-            "refusal must name the symlink, got: {err}"
+            "refusal must name the symlink, got: {err}",
+            err = err.message()
         );
 
         // Relative destination keeps its explicit refusal.
         let err = resolve_clone_destination(Path::new("relative/dest"))
             .expect_err("relative destination must refuse");
-        assert!(err.contains("absolute"), "got: {err}");
+        assert!(err.contains("absolute"), "got: {err}", err = err.message());
 
         // Parent does not exist: cannot establish containment, refuse.
         let orphan = base.path().join("no-such-parent").join("clone");
@@ -5396,8 +5517,9 @@ mod tests {
         let err = GitWriter::checkout_branch(dir.path().to_str().unwrap(), "nonexistent-branch")
             .expect_err("missing branch must fail");
         assert!(
-            err.contains("nonexistent-branch") || err.to_lowercase().contains("invalid"),
-            "first error should name the failing ref, got: {err}"
+            err.contains("nonexistent-branch") || err.message().to_lowercase().contains("invalid"),
+            "first error should name the failing ref, got: {err}",
+            err = err.message()
         );
     }
 
@@ -5452,10 +5574,10 @@ mod tests {
                         let mut attempts = 0;
                         loop {
                             GitWriter::stage_file(&path, &file)
-                                .unwrap_or_else(|e| panic!("stage {t}.{i}: {e}"));
+                                .unwrap_or_else(|e| panic!("stage {t}.{i}: {e}", e = e.message()));
                             match GitWriter::commit(&path, &format!("commit t{t}.{i}"), false) {
                                 Ok(_) => break,
-                                Err(e) if is_empty_commit_refusal(&e) => {
+                                Err(e) if is_empty_commit_refusal(e.message()) => {
                                     let landed = std::process::Command::new("git")
                                         .args(["show", &format!("HEAD:{file}")])
                                         .current_dir(std::path::Path::new(&path))
@@ -5472,7 +5594,7 @@ mod tests {
                                         "stage/commit retry never converged for {t}.{i}"
                                     );
                                 }
-                                Err(e) => panic!("commit {t}.{i}: {e}"),
+                                Err(e) => panic!("commit {t}.{i}: {e}", e = e.message()),
                             }
                         }
                     }
@@ -5535,7 +5657,7 @@ mod tests {
                             &format!("commit t{t}.{i}"),
                             std::slice::from_ref(&file),
                         )
-                        .unwrap_or_else(|e| panic!("commit_files {t}.{i}: {e}"));
+                        .unwrap_or_else(|e| panic!("commit_files {t}.{i}: {e}", e = e.message()));
                     }
                 })
             })
@@ -5706,8 +5828,9 @@ mod tests {
         )
         .expect_err("first-step squash must be refused");
         assert!(
-            squash_err.to_lowercase().contains("squash"),
-            "error must name squash, got: {squash_err}"
+            squash_err.message().to_lowercase().contains("squash"),
+            "error must name squash, got: {squash_err}",
+            squash_err = squash_err.message()
         );
         let fixup_err = GitWriter::execute_rebase_sequence(
             dir.path().to_str().unwrap(),
@@ -5719,8 +5842,9 @@ mod tests {
         )
         .expect_err("first-step fixup must be refused");
         assert!(
-            fixup_err.to_lowercase().contains("fixup"),
-            "error must name fixup, got: {fixup_err}"
+            fixup_err.message().to_lowercase().contains("fixup"),
+            "error must name fixup, got: {fixup_err}",
+            fixup_err = fixup_err.message()
         );
         assert_eq!(head_message(&dir), "commit A", "HEAD must be untouched");
     }
@@ -5766,8 +5890,9 @@ mod tests {
                 GitWriter::execute_rebase_sequence(dir.path().to_str().unwrap(), &base, &steps)
                     .expect_err("a squash with every earlier step dropped must be refused");
             assert!(
-                err.to_lowercase().contains(action_name),
-                "error must name {action_name}, got: {err}"
+                err.message().to_lowercase().contains(action_name),
+                "error must name {action_name}, got: {err}",
+                err = err.message()
             );
             assert_eq!(head_oid(&dir), head_before, "HEAD must not move");
             let branch = git_text(dir.path(), &["symbolic-ref", "--short", "HEAD"]).unwrap();
@@ -5832,7 +5957,7 @@ mod tests {
     fn combine_step_failure_names_failed_cherry_pick_abort() {
         let msg = combine_step_failure_with_recovery(
             "step boom",
-            Some(&Err("index.lock exists".to_string())),
+            Some(&Err(CommandError::from("index.lock exists"))),
             &Ok(()),
             Some("main"),
             "abc",
@@ -5854,7 +5979,7 @@ mod tests {
         let msg = combine_step_failure_with_recovery(
             "step boom",
             None,
-            &Err("disk full".to_string()),
+            &Err(CommandError::from("disk full")),
             Some("feature/x"),
             "abc",
         );
@@ -5877,8 +6002,8 @@ mod tests {
     fn combine_step_failure_reports_both_recovery_failures_in_order() {
         let msg = combine_step_failure_with_recovery(
             "step boom",
-            Some(&Err("abort err".to_string())),
-            &Err("restore err".to_string()),
+            Some(&Err(CommandError::from("abort err"))),
+            &Err(CommandError::from("restore err")),
             Some("main"),
             "def456",
         );
@@ -5898,7 +6023,7 @@ mod tests {
         let msg = combine_step_failure_with_recovery(
             "step boom",
             None,
-            &Err("locked index".to_string()),
+            &Err(CommandError::from("locked index")),
             None,
             "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
         );
@@ -6065,9 +6190,10 @@ mod tests {
         let err = GitWriter::plan_push(&repo_path(&repo), None, None, false).unwrap_err();
         assert!(
             err.contains("no remotes"),
-            "must not fall through to git's no-upstream fatal, got: {err}"
+            "must not fall through to git's no-upstream fatal, got: {err}",
+            err = err.message()
         );
-        assert!(!err.to_lowercase().contains("set-upstream"));
+        assert!(!err.message().to_lowercase().contains("set-upstream"));
     }
 
     #[test]
@@ -6084,7 +6210,11 @@ mod tests {
             &["remote", "add", "beta", beta.path().to_str().unwrap()],
         );
         let err = GitWriter::plan_push(&repo_path(&repo), None, None, false).unwrap_err();
-        assert!(err.contains("cannot choose among remotes"), "got: {err}");
+        assert!(
+            err.contains("cannot choose among remotes"),
+            "got: {err}",
+            err = err.message()
+        );
         assert!(err.contains("alpha"));
         assert!(err.contains("beta"));
     }
@@ -6099,7 +6229,11 @@ mod tests {
         );
         git_in(repo.path(), &["checkout", "--detach"]);
         let err = GitWriter::plan_push(&repo_path(&repo), None, None, false).unwrap_err();
-        assert!(err.contains("HEAD is detached"), "got: {err}");
+        assert!(
+            err.contains("HEAD is detached"),
+            "got: {err}",
+            err = err.message()
+        );
     }
 
     #[test]
@@ -6148,10 +6282,10 @@ mod tests {
         for target in [other_path.as_str(), "inner-remote.git", "not-a-remote"] {
             // Spawns of fetch/pull/push fail loudly here, so an Err that names
             // the target and is not a spawn failure proves git never ran it.
-            let forced = |arg: &str, body: &dyn Fn() -> Result<String, String>| {
+            let forced = |arg: &str, body: &dyn Fn() -> Result<String, CommandError>| {
                 crate::engine::git_cli::with_forced_spawn_failure_of(arg, body)
             };
-            let results: Vec<(&str, Result<String, String>)> = vec![
+            let results: Vec<(&str, Result<String, CommandError>)> = vec![
                 (
                     "fetch",
                     forced("fetch", &|| GitWriter::fetch(&path, Some(target))),
@@ -6183,7 +6317,8 @@ mod tests {
                 let err = result.expect_err(what);
                 assert!(
                     err.contains(target) && err.contains("not a configured remote"),
-                    "{what} {target}: {err}"
+                    "{what} {target}: {err}",
+                    err = err.message()
                 );
             }
         }
@@ -6251,7 +6386,8 @@ mod tests {
         let err = GitWriter::push_planned(&repo_path(&repo), &args).unwrap_err();
         assert!(
             err.contains("elsewhere") && err.contains("not a configured remote"),
-            "{err}"
+            "{err}",
+            err = err.message()
         );
         let ok: Vec<String> = ["push", "origin", "main"].map(String::from).to_vec();
         GitWriter::push_planned(&repo_path(&repo), &ok).expect("a configured remote pushes");
@@ -6262,7 +6398,7 @@ mod tests {
         let repo = init_repo_with_commit();
         let err = GitWriter::push_planned(&repo_path(&repo), &["push".into(), "victim.git".into()])
             .unwrap_err();
-        assert!(err.contains("victim.git"), "{err}");
+        assert!(err.contains("victim.git"), "{err}", err = err.message());
     }
 
     #[test]
@@ -6379,7 +6515,8 @@ mod tests {
                 .unwrap_err();
         assert!(
             err.contains("--force-if-includes") && err.contains("2.30") && err.contains("older"),
-            "{err}"
+            "{err}",
+            err = err.message()
         );
         let below_floor =
             require_force_if_includes(&probe(GitPreflightStatus::Outdated, "git version 2.34.1"))
@@ -6389,12 +6526,17 @@ mod tests {
                 && below_floor.contains("minimum")
                 && !below_floor.contains("2.30")
                 && !below_floor.contains("older"),
-            "2.34.1 has the flag and must not be told it lacks it: {below_floor}"
+            "2.34.1 has the flag and must not be told it lacks it: {below_floor}",
+            below_floor = below_floor.message()
         );
         let ancient =
             require_force_if_includes(&probe(GitPreflightStatus::Outdated, "git version 2.29.0"))
                 .unwrap_err();
-        assert!(ancient.contains("--force-if-includes"), "{ancient}");
+        assert!(
+            ancient.contains("--force-if-includes"),
+            "{ancient}",
+            ancient = ancient.message()
+        );
         assert!(
             require_force_if_includes(&probe(GitPreflightStatus::Ok, "git version 2.36.0")).is_ok()
         );
@@ -6418,7 +6560,7 @@ mod tests {
         );
         let err = GitWriter::push(&repo_path(&local), Some("origin"), Some("main"), true)
             .expect_err("the lease must hold against an unseen commit");
-        assert!(!err.is_empty());
+        assert!(!err.message().is_empty());
         assert_eq!(
             remote_tip(origin.path()),
             theirs,
@@ -6485,13 +6627,23 @@ mod tests {
         assert!(
             started.elapsed()
                 < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(20)),
-            "{err}"
+            "{err}",
+            err = err.message()
         );
-        assert!(err.contains("git commit timed out after "), "{err}");
-        assert!(err.contains("pre-commit"), "the hook must be named: {err}");
+        assert!(
+            err.contains("git commit timed out after "),
+            "{err}",
+            err = err.message()
+        );
+        assert!(
+            err.contains("pre-commit"),
+            "the hook must be named: {err}",
+            err = err.message()
+        );
         assert!(
             !err.contains("commit-msg"),
-            "only installed hooks are named: {err}"
+            "only installed hooks are named: {err}",
+            err = err.message()
         );
         assert_eq!(head_oid(&dir), before);
     }
@@ -6526,13 +6678,15 @@ mod tests {
         assert!(
             started.elapsed()
                 < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(20)),
-            "{err}"
+            "{err}",
+            err = err.message()
         );
         assert!(
-            crate::engine::git_cli::is_hooked_git_cancelled(&err),
-            "{err}"
+            crate::engine::git_cli::is_hooked_git_cancelled(err.message()),
+            "{err}",
+            err = err.message()
         );
-        assert!(err.contains("pre-commit"), "{err}");
+        assert!(err.contains("pre-commit"), "{err}", err = err.message());
         assert_eq!(head_oid(&dir), before);
     }
 
@@ -6576,8 +6730,9 @@ mod tests {
             .unwrap_err();
         assert_eq!(canceller.join().unwrap(), 1, "one run was in flight");
         assert!(
-            crate::engine::git_cli::is_hooked_git_cancelled(&err),
-            "{err}"
+            crate::engine::git_cli::is_hooked_git_cancelled(err.message()),
+            "{err}",
+            err = err.message()
         );
         assert_no_stale_index_lock_and_next_commit_lands(&dir);
     }
@@ -6594,7 +6749,7 @@ mod tests {
             || GitWriter::commit_files(&repo_path(&dir), "never lands", &["tracked.txt".into()]),
         )
         .unwrap_err();
-        assert!(err.contains("timed out"), "{err}");
+        assert!(err.contains("timed out"), "{err}", err = err.message());
         assert_no_stale_index_lock_and_next_commit_lands(&dir);
     }
 
@@ -6631,8 +6786,9 @@ mod tests {
             .unwrap_err();
         assert_eq!(canceller.join().unwrap(), 1, "one run was in flight");
         assert!(
-            crate::engine::git_cli::is_hooked_git_cancelled(&err),
-            "{err}"
+            crate::engine::git_cli::is_hooked_git_cancelled(err.message()),
+            "{err}",
+            err = err.message()
         );
         assert_no_stale_index_lock_and_next_commit_lands(&dir);
     }
@@ -6655,7 +6811,7 @@ mod tests {
             || GitWriter::commit_files(&repo_path(&dir), "never lands", &["tracked.txt".into()]),
         )
         .unwrap_err();
-        assert!(err.contains("timed out"), "{err}");
+        assert!(err.contains("timed out"), "{err}", err = err.message());
         assert_no_stale_index_lock_and_next_commit_lands(&dir);
     }
 
@@ -6733,8 +6889,12 @@ mod tests {
             GitWriter::commit_files(&repo_path(&dir), "no identity", &["new.txt".into()])
                 .unwrap_err(),
         ] {
-            assert!(err.starts_with(IDENTITY_MISSING), "{err}");
-            assert!(err.contains("user.name"), "{err}");
+            assert!(
+                err.message().starts_with(IDENTITY_MISSING),
+                "{err}",
+                err = err.message()
+            );
+            assert!(err.contains("user.name"), "{err}", err = err.message());
         }
         // The kind the commit box reads comes out of the command seam typed,
         // from the producer, with the text unchanged.
@@ -7013,7 +7173,11 @@ mod tests {
             ..StashSaveOptions::default()
         };
         let err = GitWriter::stash_save_with(&repo_path(&dir), None, huge).unwrap_err();
-        assert!(err.contains("too long to stash in one command"), "{err}");
+        assert!(
+            err.contains("too long to stash in one command"),
+            "{err}",
+            err = err.message()
+        );
     }
 
     #[test]
@@ -7117,7 +7281,8 @@ mod tests {
         .unwrap_err();
         assert!(
             missing.contains("fatal:"),
-            "the diagnosis survives: {missing}"
+            "the diagnosis survives: {missing}",
+            missing = missing.message()
         );
     }
 
@@ -7397,7 +7562,7 @@ mod tests {
     fn assert_outcomes_match_index(
         dir: &tempfile::TempDir,
         files: &[String],
-        outcomes: &[Result<(), String>],
+        outcomes: &[Result<(), CommandError>],
     ) {
         let staged = staged_names(dir);
         for (file, outcome) in files.iter().zip(outcomes) {
@@ -7522,7 +7687,8 @@ mod tests {
         let staged = staged_names(&dir);
         assert!(
             !staged.contains("plain.md") || error.contains("partly"),
-            "plain.md is staged but the error reads as all-or-nothing: {error}"
+            "plain.md is staged but the error reads as all-or-nothing: {error}",
+            error = error.message()
         );
     }
 

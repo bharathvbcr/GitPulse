@@ -39,7 +39,7 @@ fn every_pulse_reader_answers_on_a_real_repository() {
             r.payload_truncated,
             r.duration_ms
         ),
-        Err(e) => panic!("pulse_report FAILED: {e}"),
+        Err(e) => panic!("pulse_report FAILED: {e}", e = e.message()),
     }
 
     match GitReader::knowledge_report(&path, None) {
@@ -53,7 +53,7 @@ fn every_pulse_reader_answers_on_a_real_repository() {
             r.truncated,
             r.duration_ms
         ),
-        Err(e) => panic!("knowledge_report FAILED: {e}"),
+        Err(e) => panic!("knowledge_report FAILED: {e}", e = e.message()),
     }
 
     match GitReader::dora_report(&path, Some(90)) {
@@ -77,6 +77,6 @@ fn every_pulse_reader_answers_on_a_real_repository() {
             r.commit_scan_truncated,
             r.mttr_hours
         ),
-        Err(e) => panic!("dora_report FAILED: {e}"),
+        Err(e) => panic!("dora_report FAILED: {e}", e = e.message()),
     }
 }

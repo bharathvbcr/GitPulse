@@ -15,7 +15,7 @@ fn main() {
         log::info!("{}", limits.describe());
         let outcome = gitpulse_lib::storage::hygiene::global::run_due_headless();
         if let Err(error) = &outcome {
-            log::error!("Background cleanup: {error}");
+            log::error!("Background cleanup: {error}", error = error.message());
         }
         gitpulse_lib::procguard::exit(if outcome.is_ok() { 0 } else { 1 });
     }

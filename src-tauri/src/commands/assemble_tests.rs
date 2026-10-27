@@ -1,5 +1,6 @@
 use super::*;
 use crate::graph::{MAINLINE_COLOR, MAINLINE_COLUMN};
+use crate::ipc_error::CommandError;
 use crate::procguard::LockedSpawn;
 
 #[test]
@@ -8,7 +9,7 @@ fn slow_command_is_visible_in_diagnostics_without_recording_its_payload() {
     crate::logging::performance::enable_test_facade();
     let result = tauri::async_runtime::block_on(off_thread(|| {
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        Err::<(), _>("private command payload".to_string())
+        Err::<(), _>("private command payload".into())
     }));
     assert_eq!(result.unwrap_err().message, "private command payload");
     let lines = crate::logging::diagnostic_tail(500);
@@ -37,6 +38,7 @@ fn running_command_is_visible_in_diagnostics_before_it_finishes() {
         blocked
             .recv_timeout(std::time::Duration::from_secs(30))
             .map_err(|e| e.to_string())
+            .map_err(CommandError::from)
     }));
     let marker = "running_command_is_visible_in_diagnostics";
     let find = |needle: &str| {
@@ -79,7 +81,7 @@ fn exit_flush_writes_paced_slow_calls_and_unfinished_calls() {
     let slow = || {
         tauri::async_runtime::block_on(off_thread(|| {
             std::thread::sleep(std::time::Duration::from_millis(1100));
-            Ok::<_, String>(())
+            Ok::<_, String>(()).map_err(CommandError::from)
         }))
         .unwrap()
     };
@@ -91,6 +93,7 @@ fn exit_flush_writes_paced_slow_calls_and_unfinished_calls() {
         blocked
             .recv_timeout(std::time::Duration::from_secs(30))
             .map_err(|e| e.to_string())
+            .map_err(CommandError::from)
     }));
     std::thread::sleep(std::time::Duration::from_millis(200));
     crate::logging::performance::flush();
@@ -501,10 +504,10 @@ fn a_stale_stash_refusal_is_typed_and_its_text_is_the_engines() {
     ))
     .expect_err("the command refuses");
     assert_eq!(error.kind, crate::ipc_error::IpcErrorKind::StaleStash);
-    assert_eq!(error.message, engine);
+    assert_eq!(engine, error.message);
     let wire = serde_json::to_value(&error).expect("serialises");
     assert_eq!(wire["kind"], "stale_stash");
-    assert_eq!(wire["message"], engine.as_str());
+    assert_eq!(wire["message"], engine.message());
 }
 
 #[test]
@@ -524,15 +527,14 @@ fn an_unapproved_repository_is_typed_and_its_text_is_the_trust_refusal() {
         error.kind,
         crate::ipc_error::IpcErrorKind::RepositoryTrustRequired
     );
-    assert_eq!(error.message, engine);
+    assert_eq!(engine, error.message);
 }
 
 #[test]
 fn a_command_error_that_says_nothing_reaches_the_frontend_unclassified() {
-    let error = tauri::async_runtime::block_on(off_thread(|| {
-        Err::<(), _>("Nothing to commit".to_string())
-    }))
-    .expect_err("the body failed");
+    let error =
+        tauri::async_runtime::block_on(off_thread(|| Err::<(), _>("Nothing to commit".into())))
+            .expect_err("the body failed");
     assert_eq!(error.kind, crate::ipc_error::IpcErrorKind::Unclassified);
     assert_eq!(error.message, "Nothing to commit");
 }

@@ -7,6 +7,7 @@ use crate::engine::git_cli::{
     git, git_text, git_with_index, git_with_stdin, resolve_git_dir, sandbox_join, validate_repo,
 };
 use crate::engine::git_writer::repo_mutation_lock;
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -168,7 +169,7 @@ fn read_worktree(dest: &Path) -> Result<Worktree, String> {
     })
 }
 
-fn hash(repo: &Path, bytes: &[u8]) -> Result<String, String> {
+fn hash(repo: &Path, bytes: &[u8]) -> Result<String, CommandError> {
     String::from_utf8(git_with_stdin(
         repo,
         &["hash-object", "--stdin", "--no-filters"],
@@ -176,9 +177,10 @@ fn hash(repo: &Path, bytes: &[u8]) -> Result<String, String> {
     )?)
     .map(|text| text.trim().to_owned())
     .map_err(|e| e.to_string())
+    .map_err(CommandError::from)
 }
 
-fn operation(repo: &Path) -> Result<String, String> {
+fn operation(repo: &Path) -> Result<String, CommandError> {
     let dir = resolve_git_dir(repo)?;
     let mut parts = vec![git(repo, &["rev-parse", "--verify", "HEAD"])?];
     // Files that identify a parked step. Optional absence is data; a read that
@@ -219,7 +221,7 @@ fn operation(repo: &Path) -> Result<String, String> {
                 );
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => parts.push(Vec::new()),
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(e.to_string().into()),
         }
     }
     hash(
@@ -228,7 +230,7 @@ fn operation(repo: &Path) -> Result<String, String> {
     )
 }
 
-fn index_stages(repo: &Path, file: &str) -> Result<Vec<ConflictStage>, String> {
+fn index_stages(repo: &Path, file: &str) -> Result<Vec<ConflictStage>, CommandError> {
     let raw = git(
         repo,
         &[
@@ -291,7 +293,7 @@ fn revision(
     operation: &str,
     stages: &[ConflictStage],
     worktree: &Worktree,
-) -> Result<String, String> {
+) -> Result<String, CommandError> {
     let stages: Vec<_> = stages
         .iter()
         .map(|stage| (&stage.mode, &stage.oid, stage.stage))
@@ -314,7 +316,7 @@ fn revision(
     )
 }
 
-fn snapshot_inner(repo: &Path, file: &str) -> Result<(ConflictSnapshot, Worktree), String> {
+fn snapshot_inner(repo: &Path, file: &str) -> Result<(ConflictSnapshot, Worktree), CommandError> {
     let dest = conflict_path(repo, file)?;
     let before = operation(repo)?;
     let mut stages = index_stages(repo, file)?;
@@ -394,7 +396,7 @@ fn snapshot_inner(repo: &Path, file: &str) -> Result<(ConflictSnapshot, Worktree
     ))
 }
 
-fn conflict_marker_size(repo: &Path, file: &str) -> Result<usize, String> {
+fn conflict_marker_size(repo: &Path, file: &str) -> Result<usize, CommandError> {
     let raw = git(
         repo,
         &["check-attr", "-z", "conflict-marker-size", "--", file],
@@ -412,7 +414,7 @@ fn conflict_marker_size(repo: &Path, file: &str) -> Result<usize, String> {
         .map_err(|_| "Invalid conflict-marker-size attribute".into())
 }
 
-pub fn snapshot(repo_path: &str, file: &str) -> Result<ConflictSnapshot, String> {
+pub fn snapshot(repo_path: &str, file: &str) -> Result<ConflictSnapshot, CommandError> {
     snapshot_inner(&validate_repo(repo_path)?, file).map(|(snapshot, _)| snapshot)
 }
 
@@ -475,8 +477,8 @@ fn mutation(
     index: Option<&Path>,
     args: &[&str],
     input: &[u8],
-    judge: &mut impl FnMut(&[&str]) -> Result<(), String>,
-) -> Result<Vec<u8>, String> {
+    judge: &mut impl FnMut(&[&str]) -> Result<(), CommandError>,
+) -> Result<Vec<u8>, CommandError> {
     let argv: Vec<_> = std::iter::once("git").chain(args.iter().copied()).collect();
     judge(&argv)?;
     match index {
@@ -509,7 +511,7 @@ impl IndexLock {
     }
 }
 impl IndexTransaction {
-    fn begin(repo: &Path) -> Result<Self, String> {
+    fn begin(repo: &Path) -> Result<Self, CommandError> {
         let dir = resolve_git_dir(repo)?;
         let index = dir.join("index");
         let path = dir.join("index.lock");
@@ -553,8 +555,8 @@ impl IndexTransaction {
         file: &str,
         mode: &str,
         oid: Option<&str>,
-        judge: &mut impl FnMut(&[&str]) -> Result<(), String>,
-    ) -> Result<(), String> {
+        judge: &mut impl FnMut(&[&str]) -> Result<(), CommandError>,
+    ) -> Result<(), CommandError> {
         let width = match oid {
             Some(oid) => oid.len(),
             None => git_text(repo, &["rev-parse", "--verify", "HEAD"])?
@@ -581,7 +583,7 @@ impl IndexTransaction {
         git_with_index(repo, &self.private.path, &[
             "-c", "core.whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab,-indent-with-non-tab,-tab-in-indent,cr-at-eol",
             "diff", "--cached", "--check", "--no-ext-diff", "--no-color", "--", &format!(":(literal){file}"),
-        ], &[]).map_err(|error| format!("The prepared Git object failed the staged integrity check; no file was written. {error}"))?;
+        ], &[]).map_err(|error| error.wrap(|error| format!("The prepared Git object failed the staged integrity check; no file was written. {error}")))?;
         Ok(())
     }
     fn publish(&mut self) -> Result<(), String> {
@@ -723,8 +725,8 @@ fn desired(
     snap: &ConflictSnapshot,
     source: &Worktree,
     choice: &ConflictFileChoice,
-    judge: &mut impl FnMut(&[&str]) -> Result<(), String>,
-) -> Result<(Worktree, Option<String>, bool), String> {
+    judge: &mut impl FnMut(&[&str]) -> Result<(), CommandError>,
+) -> Result<(Worktree, Option<String>, bool), CommandError> {
     match choice {
         ConflictFileChoice::Ours | ConflictFileChoice::Theirs => {
             let side = if matches!(choice, ConflictFileChoice::Ours) {
@@ -872,7 +874,10 @@ fn write_prepared(
     super::conflict_fs::replace(&conflict_path(repo, file)?, source, next)
 }
 
-pub fn save(repo_path: &str, request: &ConflictSaveRequest) -> Result<ConflictSaveOutcome, String> {
+pub fn save(
+    repo_path: &str,
+    request: &ConflictSaveRequest,
+) -> Result<ConflictSaveOutcome, CommandError> {
     save_with_gate(repo_path, request, |_, _| Ok(()), |_| Ok(()))
 }
 
@@ -882,8 +887,8 @@ pub fn save_with_gate(
     repo_path: &str,
     request: &ConflictSaveRequest,
     mut authorize_file: impl FnMut(&str, &str) -> Result<(), String>,
-    mut judge: impl FnMut(&[&str]) -> Result<(), String>,
-) -> Result<ConflictSaveOutcome, String> {
+    mut judge: impl FnMut(&[&str]) -> Result<(), CommandError>,
+) -> Result<ConflictSaveOutcome, CommandError> {
     if let ConflictFileChoice::Chunks(choices) = &request.choice {
         let bytes = choices.iter().fold(0usize, |sum, choice| {
             sum.saturating_add(match choice {
@@ -955,7 +960,7 @@ pub fn save_with_gate(
     } else {
         None
     };
-    let finish = (|| {
+    let finish = (|| -> Result<_, CommandError> {
         if operation(&repo)? != current.operation
             || read_worktree(&conflict_path(&repo, &request.file_path)?)? != next
         {
@@ -963,7 +968,7 @@ pub fn save_with_gate(
                 "The file or operation changed during save; the resolution was not staged".into(),
             );
         }
-        transaction.publish()
+        transaction.publish().map_err(CommandError::from)
     })();
     if let Err(message) = finish {
         let (snapshot, detail) = match snapshot_inner(&repo, &request.file_path) {
@@ -980,13 +985,19 @@ pub fn save_with_gate(
             ),
             Err(error) => (
                 None,
-                format!(" The saved source could not be reloaded: {error}. Reload before staging."),
+                format!(
+                    " The saved source could not be reloaded: {error}. Reload before staging.",
+                    error = error.message()
+                ),
             ),
         };
         return Ok(ConflictSaveOutcome {
             written: write,
             staged: false,
-            message: format!("Resolution prepared, but staging failed: {message}{detail}"),
+            message: format!(
+                "Resolution prepared, but staging failed: {message}{detail}",
+                message = message.message()
+            ),
             recovery_path: recovery
                 .as_ref()
                 .map(|temp| temp.path.to_string_lossy().into_owned()),
@@ -1123,7 +1134,10 @@ mod tests {
         fs::set_permissions(repo.join("file"), fs::Permissions::from_mode(0o644)).unwrap();
     }
 
-    fn save_choice(repo: &Path, choice: ConflictFileChoice) -> Result<ConflictSaveOutcome, String> {
+    fn save_choice(
+        repo: &Path,
+        choice: ConflictFileChoice,
+    ) -> Result<ConflictSaveOutcome, CommandError> {
         let repo_path = repo.to_str().unwrap();
         let snapshot = snapshot(repo_path, "file")?;
         save(
@@ -1454,7 +1468,11 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(error.contains("changed since loading"), "{error}");
+        assert!(
+            error.contains("changed since loading"),
+            "{error}",
+            error = error.message()
+        );
         assert_eq!(git(&repo, &["ls-files", "--stage"]).unwrap(), unmerged);
     }
 

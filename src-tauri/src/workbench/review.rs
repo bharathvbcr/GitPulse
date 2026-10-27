@@ -10,6 +10,7 @@
 //! the person's explicit action, so there is never an undecided review for an
 //! agent or a stale window to find.
 
+use crate::ipc_error::CommandError;
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -215,7 +216,7 @@ pub(crate) fn record(
     let run_id = run["id"].as_str().unwrap_or_default();
     let text = payload.to_string();
     let digest = crate::tool_install::release::bytes_sha256_hex(text.as_bytes())
-        .map_err(|e| WorkbenchError::new("store_error", e))?;
+        .map_err(|e| WorkbenchError::new("store_error", e.into_message()))?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -304,7 +305,7 @@ pub(crate) fn attempt_review(
     state: &WorkbenchState,
     run_id: &str,
     decision: Option<(&str, Option<&str>)>,
-) -> Result<AttemptReview, String> {
+) -> Result<AttemptReview, CommandError> {
     let run = state
         .request("runs.get", &json!({"id": run_id}).to_string())
         .map_err(|e| e.message)?["item"]
@@ -345,7 +346,7 @@ pub(crate) fn attempt_review(
     }
     let review = review_of(state, run_id, &tip).map_err(|e| e.message)?;
     let gate = crate::harness::review::common_dir(repo)
-        .and_then(|dir| crate::tool_config::review_gate_enabled(&dir));
+        .and_then(|dir| crate::tool_config::review_gate_enabled(&dir).map_err(CommandError::from));
     Ok(AttemptReview {
         run_id: run_id.to_string(),
         branch,
@@ -355,7 +356,7 @@ pub(crate) fn attempt_review(
         ended: ended(&run),
         review,
         gate_on: gate.as_ref().ok().copied(),
-        gate_error: gate.err(),
+        gate_error: gate.err().map(CommandError::into_message),
     })
 }
 

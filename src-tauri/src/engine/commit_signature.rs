@@ -23,6 +23,7 @@ use crate::engine::git_cli::{
 };
 use crate::engine::git_writer::validate_oid;
 use crate::engine::ref_cache::{user_config_paths, FileIdentity};
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -264,7 +265,10 @@ pub(crate) fn read_walk_signatures(repo: &Path, args: &[&str]) -> WalkSignatures
         },
         Err(error) => WalkSignatures {
             signatures: HashMap::new(),
-            failure: Some(format!("the signature read could not run: {error}")),
+            failure: Some(format!(
+                "the signature read could not run: {error}",
+                error = error.message()
+            )),
         },
     }
 }
@@ -362,7 +366,7 @@ impl HeaderStream {
 /// A commit that could not be read is `Unknown`, whatever the reason: the one
 /// place an `Err` becomes a value, so none can become `None` by accident.
 fn settle(
-    answers: HashMap<String, Result<CommitSignature, String>>,
+    answers: HashMap<String, Result<CommitSignature, CommandError>>,
 ) -> HashMap<String, CommitSignature> {
     answers
         .into_iter()
@@ -501,7 +505,7 @@ struct Verdict {
 /// on rather than starting a second signing program.
 #[derive(Default)]
 struct Flight {
-    outcome: Mutex<Option<Result<CommitSignatureCheck, String>>>,
+    outcome: Mutex<Option<Result<CommitSignatureCheck, CommandError>>>,
     done: Condvar,
 }
 
@@ -604,7 +608,7 @@ fn shared_cache() -> &'static Mutex<VerifyCache> {
 pub fn verify_commit_signature(
     repo_path: &str,
     commit_id: &str,
-) -> Result<CommitSignatureCheck, String> {
+) -> Result<CommitSignatureCheck, CommandError> {
     verify_commit_signature_with(shared_cache(), Instant::now(), repo_path, commit_id)
 }
 
@@ -619,7 +623,7 @@ pub(crate) fn verify_commit_signature_with(
     now: Instant,
     repo_path: &str,
     commit_id: &str,
-) -> Result<CommitSignatureCheck, String> {
+) -> Result<CommitSignatureCheck, CommandError> {
     let repo = validate_repo(repo_path)?;
     validate_oid(commit_id)?;
     if !matches!(commit_id.len(), 40 | 64) {
@@ -676,7 +680,7 @@ enum Turn {
 }
 
 /// Waits for the leader of a flight and takes its answer.
-fn follow(flight: &Flight) -> Result<CommitSignatureCheck, String> {
+fn follow(flight: &Flight) -> Result<CommitSignatureCheck, CommandError> {
     let guard = flight
         .outcome
         .lock()
@@ -701,7 +705,7 @@ struct Lead<'a> {
 }
 
 impl Lead<'_> {
-    fn settle(&mut self, result: Result<CommitSignatureCheck, String>) {
+    fn settle(&mut self, result: Result<CommitSignatureCheck, CommandError>) {
         self.settled = true;
         self.cache
             .lock()
@@ -733,7 +737,7 @@ fn verify_uncached(
     repo: &Path,
     commit_id: &str,
     fingerprint: Option<SigningFingerprint>,
-) -> Result<CommitSignatureCheck, String> {
+) -> Result<CommitSignatureCheck, CommandError> {
     let oids = [commit_id.to_string()];
     let signature = commit_signatures(repo, &oids)
         .remove(commit_id)
@@ -775,7 +779,7 @@ fn run_verifier(
     repo: &Path,
     commit_id: &str,
     signature: CommitSignature,
-) -> Result<CommitSignatureCheck, String> {
+) -> Result<CommitSignatureCheck, CommandError> {
     let stdout = git_text_with_timeout(
         repo,
         &[
@@ -787,9 +791,10 @@ fn run_verifier(
         ],
         VERIFY_TIMEOUT,
     )
-    .map_err(|e| format!("Signature verification of {commit_id} failed: {e}"))?;
+    .map_err(|e| e.wrap(|e| format!("Signature verification of {commit_id} failed: {e}")))?;
     parse_verifier_output(&stdout, signature)
         .ok_or_else(|| format!("git answered {stdout:?} for the signature of {commit_id}"))
+        .map_err(CommandError::from)
 }
 
 /// `status NUL key NUL signer`, as [`run_verifier`] asks for it. `None` when
@@ -1306,12 +1311,16 @@ mod tests {
         let absent = "1".repeat(40);
         let err = verify_commit_signature_with(&cache, Instant::now(), path, &absent)
             .expect_err("an object that does not exist cannot be verified");
-        assert!(err.contains(&absent), "{err}");
+        assert!(err.contains(&absent), "{err}", err = err.message());
         assert_eq!(cache.lock().unwrap().len(), 0);
 
         let short = verify_commit_signature_with(&cache, Instant::now(), path, "abc123")
             .expect_err("an abbreviation is not a stable name");
-        assert!(short.contains("full commit id"), "{short}");
+        assert!(
+            short.contains("full commit id"),
+            "{short}",
+            short = short.message()
+        );
         assert!(verify_commit_signature_with(&cache, Instant::now(), path, "--all").is_err());
     }
 
@@ -1735,7 +1744,7 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
-        assert!(!err.is_empty());
+        assert!(!err.message().is_empty());
         let pid: u32 = std::fs::read_to_string(stub.path().join("pid"))
             .expect("the stub started")
             .trim()

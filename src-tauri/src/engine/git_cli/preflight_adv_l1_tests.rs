@@ -176,9 +176,9 @@ fn adv_l1_the_floor_comparison_expression_is_a_lexicographic_max() {
 fn adv_l1_every_unreadable_probe_fails_supports_with_a_distinct_status() {
     let deferred = classify_tool_probe(
         "git",
-        Err("git version deferred under load after 2.000s: busy".to_string()),
+        Err("git version deferred under load after 2.000s: busy".into()),
     );
-    let timeout = classify_tool_probe("git", Err("git timed out after 15s".to_string()));
+    let timeout = classify_tool_probe("git", Err("git timed out after 15s".into()));
     let statuses: Vec<GitPreflightStatus> = [deferred, timeout, ToolProbe::NotFound("x".into())]
         .into_iter()
         .map(|probe| {

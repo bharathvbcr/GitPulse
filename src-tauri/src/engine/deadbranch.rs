@@ -9,6 +9,7 @@
 //!    GitPulse's durable WAL ledger after it runs, with its outcome.
 //! 4. Restoration from those backups only, verified against the backed-up commits.
 
+use crate::ipc_error::CommandError;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -232,7 +233,7 @@ pub fn age_severity(days: i64) -> &'static str {
 }
 
 /// Directory every repository's backup directory lives under.
-fn backups_root() -> Result<PathBuf, String> {
+fn backups_root() -> Result<PathBuf, CommandError> {
     if let Ok(explicit) = std::env::var("GITPULSE_BACKUPS_DIR") {
         return Ok(PathBuf::from(explicit));
     }
@@ -258,9 +259,10 @@ struct BackupLocation {
 }
 
 impl BackupLocation {
-    fn of(repo: &Path) -> Result<Self, String> {
-        let (_, common_dir) = crate::repository_trust::git_directories(repo)
-            .map_err(|e| format!("Cannot identify the repository for its backups: {e}"))?;
+    fn of(repo: &Path) -> Result<Self, CommandError> {
+        let (_, common_dir) = crate::repository_trust::git_directories(repo).map_err(|e| {
+            e.wrap(|e| format!("Cannot identify the repository for its backups: {e}"))
+        })?;
         // `<repo>/.git` names the repository by its parent; a bare
         // repository's common directory is the repository itself.
         let named = if common_dir.file_name().is_some_and(|n| n == ".git") {
@@ -295,7 +297,7 @@ impl BackupLocation {
     /// backups: a `backup-*.txt` regular file directly inside its directory
     /// (or a legacy file this repository owns), no larger than
     /// [`MAX_BACKUP_BYTES`].
-    fn read_contained(&self, backup_path: &str) -> Result<String, String> {
+    fn read_contained(&self, backup_path: &str) -> Result<String, CommandError> {
         let refuse = |why: &str| {
             format!(
                 "Refusing to restore from '{backup_path}': {why}. Backups for this repository \
@@ -310,7 +312,7 @@ impl BackupLocation {
             .and_then(|n| n.to_str())
             .is_some_and(is_backup_file_name)
         {
-            return Err(refuse("it is not a backup file"));
+            return Err(refuse("it is not a backup file").into());
         }
         let parent = file.parent();
         let is_parent = |dir: &Path| canonicalize_plain(dir).ok().as_deref() == parent;
@@ -319,12 +321,14 @@ impl BackupLocation {
         } else if is_parent(&self.legacy_dir) {
             true
         } else {
-            return Err(refuse("it is not one of this repository's backups"));
+            return Err(refuse("it is not one of this repository's backups").into());
         };
-        let content = crate::repository_trust::bounded_text(&file, MAX_BACKUP_BYTES)
-            .map_err(|e| format!("Could not read backup file at '{backup_path}': {e}"))?;
+        let content =
+            crate::repository_trust::bounded_text(&file, MAX_BACKUP_BYTES).map_err(|e| {
+                e.wrap(|e| format!("Could not read backup file at '{backup_path}': {e}"))
+            })?;
         if legacy && !self.owns_legacy(&content) {
-            return Err(refuse("it was written for a different repository"));
+            return Err(refuse("it was written for a different repository").into());
         }
         Ok(content)
     }
@@ -343,14 +347,17 @@ fn is_backup_file_name(name: &str) -> bool {
 }
 
 /// Resolves the backup directory for the repository at `repo`.
-pub fn get_backup_dir(repo: &Path) -> Result<PathBuf, String> {
+pub fn get_backup_dir(repo: &Path) -> Result<PathBuf, CommandError> {
     BackupLocation::of(repo).map(|location| location.dir)
 }
 
 /// Creates `backup-<now>.txt` in `dir`, or `backup-<now>-<n>.txt` when that
 /// second already has one. `create_new` makes the claim atomic, so two
 /// cleans never write the same file.
-fn create_unique_backup(dir: &Path, now_sec: u64) -> Result<(PathBuf, std::fs::File), String> {
+fn create_unique_backup(
+    dir: &Path,
+    now_sec: u64,
+) -> Result<(PathBuf, std::fs::File), CommandError> {
     for n in 0..MAX_BACKUPS_PER_SECOND {
         let filename = if n == 0 {
             format!("backup-{now_sec}.txt")
@@ -365,14 +372,15 @@ fn create_unique_backup(dir: &Path, now_sec: u64) -> Result<(PathBuf, std::fs::F
         {
             Ok(file) => return Ok((path, file)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("Failed to create backup file: {e}")),
+            Err(e) => return Err(format!("Failed to create backup file: {e}").into()),
         }
     }
     Err(format!(
         "Failed to create backup file: {MAX_BACKUPS_PER_SECOND} backups already exist for \
          second {now_sec} in {}",
         dir.display()
-    ))
+    )
+    .into())
 }
 
 /// What comparing a branch's content with the default branch's established.
@@ -436,12 +444,12 @@ pub fn is_branch_merged_by_tree(
 pub fn scan_stale_branches(
     repo_path: &str,
     config: &DeadbranchConfig,
-) -> Result<DeadbranchScanResult, String> {
+) -> Result<DeadbranchScanResult, CommandError> {
     let repo = validate_repo(repo_path)?;
     let mut warnings = Vec::new();
     let checked_out = checked_out_branches(&repo).unwrap_or_else(|e| {
         warnings.push(format!(
-            "Could not list worktrees ({e}); branches checked out in another worktree are not marked"
+            "Could not list worktrees ({e}); branches checked out in another worktree are not marked", e = e.message()
         ));
         HashSet::new()
     });
@@ -479,7 +487,7 @@ fn scan_branches(
     only: Option<&HashSet<&str>>,
     fresh_base: bool,
     mut warnings: Vec<String>,
-) -> Result<Scan, String> {
+) -> Result<Scan, CommandError> {
     let all_branches = GitReader::list_branches(repo_path)?;
     let total_scanned = all_branches.len();
 
@@ -593,7 +601,7 @@ fn scan_branches(
         candidates.par_iter_mut().for_each(|branch| {
             if !branch.is_merged && !branch.is_protected && !branch.is_current_or_worktree {
                 let verdict = match &refused {
-                    Some(reason) => TreeMerge::Unknown(reason.clone()),
+                    Some(reason) => TreeMerge::Unknown(reason.message().to_string()),
                     // The tip is already a full object name, so the merge runs
                     // without a resolve per branch; a short one goes by name.
                     None if is_full_oid(&branch.last_commit_sha) => TreeMerge::of(
@@ -682,7 +690,10 @@ fn scan_branches(
 /// in this repository's own backup directory, under a name no other backup
 /// has. Nothing is journaled here: the ledger records each delete after it
 /// runs (see [`clean_branches_with_gate`]).
-pub fn create_backup(repo_path: &str, branches: &[StaleBranchInfo]) -> Result<String, String> {
+pub fn create_backup(
+    repo_path: &str,
+    branches: &[StaleBranchInfo],
+) -> Result<String, CommandError> {
     let repo = validate_repo(repo_path)?;
     let location = BackupLocation::of(&repo)?;
     std::fs::create_dir_all(&location.dir)
@@ -727,7 +738,7 @@ pub fn create_backup(repo_path: &str, branches: &[StaleBranchInfo]) -> Result<St
     {
         drop(file);
         let _ = std::fs::remove_file(&backup_path);
-        return Err(format!("Failed to write backup file: {e}"));
+        return Err(format!("Failed to write backup file: {e}").into());
     }
 
     Ok(backup_path.to_string_lossy().to_string())
@@ -738,13 +749,16 @@ pub fn create_backup(repo_path: &str, branches: &[StaleBranchInfo]) -> Result<St
 /// Local deletes are `git branch -d/-D <short>`. A squash or rebase merge
 /// uses `-D`, matching the execute path, because `-d` refuses a branch git
 /// does not consider merged. Remote deletes are `git push <remote> --delete`.
-pub fn clean_mutation_argv(branch: &StaleBranchInfo, force: bool) -> Result<Vec<String>, String> {
+pub fn clean_mutation_argv(
+    branch: &StaleBranchInfo,
+    force: bool,
+) -> Result<Vec<String>, CommandError> {
     if branch.is_remote {
         let Some((remote, remote_branch)) = branch.name.split_once('/') else {
-            return Err("Invalid remote branch format".to_string());
+            return Err("Invalid remote branch format".to_string().into());
         };
         if remote.is_empty() || remote_branch.is_empty() {
-            return Err("Invalid remote branch format".to_string());
+            return Err("Invalid remote branch format".to_string().into());
         }
         return Ok(vec![
             "git".to_string(),
@@ -777,7 +791,7 @@ pub fn clean_branches(
     branch_names: &[String],
     force: bool,
     create_backup_file: bool,
-) -> Result<DeadbranchCleanResult, String> {
+) -> Result<DeadbranchCleanResult, CommandError> {
     clean_branches_with_gate(repo_path, branch_names, force, create_backup_file, |_| {
         Ok(())
     })
@@ -800,9 +814,9 @@ pub fn clean_branches_with_gate<F>(
     force: bool,
     create_backup_file: bool,
     mut authorize: F,
-) -> Result<DeadbranchCleanResult, String>
+) -> Result<DeadbranchCleanResult, CommandError>
 where
-    F: FnMut(&[&str]) -> Result<(), String>,
+    F: FnMut(&[&str]) -> Result<(), CommandError>,
 {
     let repo = validate_repo(repo_path)?;
     let _repo_lock = repo_mutation_lock(&repo);
@@ -849,13 +863,15 @@ where
             return Err(format!(
                 "Refusing to delete '{name}': it is the repository's default branch",
                 name = b.short_name
-            ));
+            )
+            .into());
         }
         if !b.is_remote && checked_out.contains(&b.short_name) {
             return Err(format!(
                 "Refusing to delete '{name}': it is checked out in a linked worktree",
                 name = b.short_name
-            ));
+            )
+            .into());
         }
     }
 
@@ -873,7 +889,7 @@ where
     for b in to_clean {
         match clean_mutation_argv(&b, force) {
             Ok(argv) => planned.push((b, argv)),
-            Err(err) if b.is_remote => failed.push((b.name, err)),
+            Err(err) if b.is_remote => failed.push((b.name, err.into_message())),
             Err(err) => return Err(err),
         }
     }
@@ -900,7 +916,7 @@ where
         }
         match result {
             Ok(_) => deleted.push(b.name),
-            Err(err) => failed.push((b.name, err)),
+            Err(err) => failed.push((b.name, err.into_message())),
         }
     }
 
@@ -925,7 +941,7 @@ where
 /// Lists this repository's branch backups, newest first: its own backup
 /// directory, plus files in the pre-key shared directory whose header names
 /// this repository.
-pub fn list_backups(repo_path: &str) -> Result<Vec<DeadbranchBackupInfo>, String> {
+pub fn list_backups(repo_path: &str) -> Result<Vec<DeadbranchBackupInfo>, CommandError> {
     let repo = validate_repo(repo_path)?;
     let location = BackupLocation::of(&repo)?;
     let mut backups = Vec::new();
@@ -942,11 +958,11 @@ fn collect_backups(
     dir: &Path,
     legacy: bool,
     backups: &mut Vec<DeadbranchBackupInfo>,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(format!("Could not read backups directory: {e}")),
+        Err(e) => return Err(format!("Could not read backups directory: {e}").into()),
     };
 
     for entry in entries.flatten() {
@@ -1007,7 +1023,7 @@ pub fn restore_backup(
     repo_path: &str,
     backup_path: &str,
     branches_to_restore: Option<Vec<String>>,
-) -> Result<DeadbranchRestoreResult, String> {
+) -> Result<DeadbranchRestoreResult, CommandError> {
     restore_backup_with_gate(repo_path, backup_path, branches_to_restore, |_| Ok(()))
 }
 
@@ -1031,9 +1047,9 @@ pub fn restore_backup_with_gate<F>(
     backup_path: &str,
     branches_to_restore: Option<Vec<String>>,
     mut authorize: F,
-) -> Result<DeadbranchRestoreResult, String>
+) -> Result<DeadbranchRestoreResult, CommandError>
 where
-    F: FnMut(&[&str]) -> Result<(), String>,
+    F: FnMut(&[&str]) -> Result<(), CommandError>,
 {
     let repo = validate_repo(repo_path)?;
     let _repo_lock = repo_mutation_lock(&repo);
@@ -1080,11 +1096,17 @@ where
             continue;
         };
         if let Err(e) = validate_ref_name(name) {
-            failed.push((name.to_string(), format!("Invalid branch name: {e}")));
+            failed.push((
+                name.to_string(),
+                format!("Invalid branch name: {e}", e = e.message()),
+            ));
             continue;
         }
         if let Err(e) = validate_full_oid(oid) {
-            failed.push((name.to_string(), format!("Invalid commit in backup: {e}")));
+            failed.push((
+                name.to_string(),
+                format!("Invalid commit in backup: {e}", e = e.message()),
+            ));
             continue;
         }
 
@@ -1137,13 +1159,13 @@ where
             )),
             (Ok(_), Err(e)) => failed.push((
                 plan.name,
-                format!("git reported success, but the branch could not be verified: {e}"),
+                format!("git reported success, but the branch could not be verified: {e}", e = e.message()),
             )),
             (Err(err), _) if at_backup => failed.push((
                 plan.name,
-                format!("{err} (the existing branch already points at the backed-up commit; left unchanged)"),
+                format!("{err} (the existing branch already points at the backed-up commit; left unchanged)", err = err.message()),
             )),
-            (Err(err), _) => failed.push((plan.name, err)),
+            (Err(err), _) => failed.push((plan.name, err.into_message())),
         }
     }
 
@@ -1166,7 +1188,7 @@ where
 
 /// A full object id (SHA-1 or SHA-256), which is what a backup records. An
 /// abbreviation could resolve to a different commit than the one backed up.
-fn validate_full_oid(oid: &str) -> Result<(), String> {
+fn validate_full_oid(oid: &str) -> Result<(), CommandError> {
     validate_oid(oid)?;
     if !matches!(oid.len(), 40 | 64) {
         return Err("Invalid commit id: expected a full object id".into());
@@ -1199,7 +1221,7 @@ fn unquote_backup_word(word: &str) -> Option<String> {
 }
 
 /// Every local branch and the commit it points at, from one listing.
-fn local_branch_tips(repo: &Path) -> Result<HashMap<String, String>, String> {
+fn local_branch_tips(repo: &Path) -> Result<HashMap<String, String>, CommandError> {
     let listed = git_text(
         repo,
         &[
@@ -1523,7 +1545,7 @@ mod tests {
             &["gone".to_string()],
             false,
             true,
-            |_| Err("refused by test".to_string()),
+            |_| Err("refused by test".into()),
         );
         assert!(refused.is_err());
         assert!(rev(&repo, "refs/heads/gone").is_some());
@@ -1626,7 +1648,11 @@ mod tests {
                 false,
             )
             .expect_err("develop is now the default branch");
-            assert!(refused.contains("default branch"), "{refused}");
+            assert!(
+                refused.contains("default branch"),
+                "{refused}",
+                refused = refused.message()
+            );
             assert!(
                 git_text(&repo, &["rev-parse", "--verify", "refs/heads/develop"]).is_ok(),
                 "develop was deleted"
@@ -1654,7 +1680,11 @@ mod tests {
                 false,
             )
             .expect_err("develop is now the default branch");
-            assert!(refused.contains("default branch"), "{refused}");
+            assert!(
+                refused.contains("default branch"),
+                "{refused}",
+                refused = refused.message()
+            );
         });
     }
 

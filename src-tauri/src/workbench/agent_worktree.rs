@@ -50,6 +50,7 @@
 use super::WorkbenchError;
 use crate::engine::git_cli::{git_text, resolve_git_common_dir, resolve_git_dir};
 use crate::engine::worktree::{gitpulse_lane_container, GITPULSE_LANE_DIR as EXCLUDED};
+use crate::ipc_error::CommandError;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -116,7 +117,7 @@ fn short(run_id: &str) -> Result<String, WorkbenchError> {
 
 /// The main working tree: the folder holding the repository's common `.git`.
 fn main_checkout(selected: &Path) -> Result<PathBuf, WorkbenchError> {
-    let common = resolve_git_common_dir(selected).map_err(refused)?;
+    let common = resolve_git_common_dir(selected).map_err(|e| refused(e.into_message()))?;
     if common.file_name().and_then(|n| n.to_str()) != Some(".git") {
         return Err(refused(
             "This repository has no main checkout beside its Git directory (it is bare or uses a separate Git directory), so GitPulse cannot place an agent worktree. Choose an existing checkout instead.",
@@ -130,7 +131,8 @@ fn main_checkout(selected: &Path) -> Result<PathBuf, WorkbenchError> {
 
 /// Whether `path` is already a worktree of this repository on `branch`.
 fn existing(selected: &Path, path: &Path, branch: &str) -> Result<bool, WorkbenchError> {
-    let entries = crate::engine::worktree::read_worktree_entries(selected).map_err(refused)?;
+    let entries = crate::engine::worktree::read_worktree_entries(selected)
+        .map_err(|e| refused(e.into_message()))?;
     let wanted = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     Ok(entries.iter().any(|entry| {
         let listed = Path::new(&entry.path);
@@ -220,7 +222,7 @@ fn provision_with(
         .map_err(|e| {
             refused(format!(
                 "{} was left half set up by an earlier preparation of this attempt and could not be removed to set it up again: {e}",
-                path.display()
+                path.display(), e = e.message()
             ))
         })?;
     }
@@ -244,7 +246,7 @@ fn provision_with(
         // Approved hooks only: an unapproved file is reported, not run.
         true,
     )
-    .map_err(refused)?;
+    .map_err(|e| refused(e.into_message()))?;
     let provisioned = Provisioned {
         source: selected.into(),
         path: path_text,
@@ -285,7 +287,9 @@ fn provision_with(
             .map(|e| {
                 format!(
                     " The worktree could not be removed and is still at {} on branch {}: {e}",
-                    provisioned.path, provisioned.branch
+                    provisioned.path,
+                    provisioned.branch,
+                    e = e.message()
                 )
             })
             .unwrap_or_default();
@@ -316,26 +320,28 @@ fn provision_with(
                     .map(|e| {
                         format!(
                             " The worktree could not be removed and is still at {} on branch {}: {e}",
-                            provisioned.path, provisioned.branch
+                            provisioned.path, provisioned.branch, e = e.message()
                         )
                     })
                     .unwrap_or_default();
                 return Err(refused(format!(
-                    "GitPulse could not record which branch the new worktree was cut from, so the agent was not started: {error}.{cleanup}"
+                    "GitPulse could not record which branch the new worktree was cut from, so the agent was not started: {error}.{cleanup}", error = error.message()
                 )));
             }
         }
         Ok(None) => {}
         Err(error) => {
-            log::warn!(target: "workbench", "agent worktree {} has no recorded base branch: {error}", provisioned.path);
+            log::warn!(target: "workbench", "agent worktree {} has no recorded base branch: {error}", provisioned.path, error = error.message());
         }
     }
     // Without the record, a later retry of this same attempt rebuilds the
     // tree instead of trusting it: slower, never wrong.
-    if let Err(error) = resolve_git_dir(Path::new(&provisioned.path))
-        .and_then(|dir| std::fs::write(dir.join(SETUP_COMPLETE), b"").map_err(|e| e.to_string()))
-    {
-        log::warn!(target: "workbench", "agent worktree {} is set up but could not record it: {error}", provisioned.path);
+    if let Err(error) = resolve_git_dir(Path::new(&provisioned.path)).and_then(|dir| {
+        std::fs::write(dir.join(SETUP_COMPLETE), b"")
+            .map_err(|e| e.to_string())
+            .map_err(CommandError::from)
+    }) {
+        log::warn!(target: "workbench", "agent worktree {} is set up but could not record it: {error}", provisioned.path, error = error.message());
     }
     Ok(provisioned)
 }
@@ -442,7 +448,7 @@ fn made_for(run: &Value) -> Option<(PathBuf, String, String)> {
 /// that has commits of its own.
 pub(super) fn reclaim(
     run: &Value,
-    open_files: &dyn Fn(&Path) -> Result<(), String>,
+    open_files: &dyn Fn(&Path) -> Result<(), CommandError>,
 ) -> Option<Reclaimed> {
     // Cancel and release give a tree back; under memory pressure that is the
     // last work to defer, so its git children run as the user action they
@@ -454,7 +460,7 @@ pub(super) fn reclaim(
 
 fn reclaim_unshed(
     run: &Value,
-    open_files: &dyn Fn(&Path) -> Result<(), String>,
+    open_files: &dyn Fn(&Path) -> Result<(), CommandError>,
 ) -> Option<Reclaimed> {
     if !run["owner_id"].is_null() {
         return None;
@@ -487,27 +493,33 @@ fn reclaim_unshed(
         return Some(Reclaimed::kept(
             &path,
             &branch,
-            format!("something may still be using it ({why})"),
+            format!(
+                "something may still be using it ({why})",
+                why = why.message()
+            ),
         ));
     }
     let remove = crate::engine::worktree::remove_worktree_argv(&path, false);
     let refs: Vec<&str> = remove.iter().map(String::as_str).collect();
     let removal = match crate::harness::guard_command(&source, &refs)
+        .map_err(CommandError::from)
         .and_then(|_| crate::engine::worktree::remove_worktree(&source, &path, false))
     {
         Ok(removal) => removal,
-        Err(why) => return Some(Reclaimed::kept(&path, &branch, why)),
+        Err(why) => return Some(Reclaimed::kept(&path, &branch, why.into_message())),
     };
     let cleanup_error = removal_notice(&path, &removal);
     let delete = ["git", "branch", "-d", branch.as_str()];
-    let deleted = crate::harness::guard_command(&source, &delete).and_then(|_| {
-        crate::engine::git_writer::GitWriter::delete_branch(&source, &branch, false).map(|_| ())
-    });
+    let deleted = crate::harness::guard_command(&source, &delete)
+        .map_err(CommandError::from)
+        .and_then(|_| {
+            crate::engine::git_writer::GitWriter::delete_branch(&source, &branch, false).map(|_| ())
+        });
     Some(Reclaimed {
         kept_because: deleted
             .as_ref()
             .err()
-            .map(|why| format!("its branch {branch} was kept: {why}")),
+            .map(|why| format!("its branch {branch} was kept: {}", why.message())),
         branch_deleted: deleted.is_ok(),
         path,
         branch,
@@ -518,7 +530,7 @@ fn reclaim_unshed(
 
 /// Undoes `provision` after the store refused the attempt. A worktree a retry
 /// merely reused is left alone: it belongs to the attempt that made it.
-pub(super) fn discard(provisioned: &Provisioned) -> Result<(), String> {
+pub(super) fn discard(provisioned: &Provisioned) -> Result<(), CommandError> {
     if !provisioned.created {
         return Ok(());
     }

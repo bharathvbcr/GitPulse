@@ -279,8 +279,9 @@ fn pulse_signed_cases(root: &Path, only: Option<&str>) -> Vec<Case<'static>> {
             let walk = {
                 let path = path.clone();
                 move || {
-                    GitReader::pulse_report(&path, None)
-                        .unwrap_or_else(|error| panic!("pulse report failed: {error}"))
+                    GitReader::pulse_report(&path, None).unwrap_or_else(|error| {
+                        panic!("pulse report failed: {error}", error = error.message())
+                    })
                 }
             };
             let _ = std::fs::remove_file(&count_file);
@@ -411,8 +412,9 @@ fn pulse_unsigned_cases(root: &Path, only: Option<&str>) -> Vec<Case<'static>> {
         .map(|commits| {
             let path = unsigned_chain(root, commits);
             let walk = move || {
-                GitReader::pulse_report(&path, Some(commits))
-                    .unwrap_or_else(|error| panic!("pulse report failed: {error}"))
+                GitReader::pulse_report(&path, Some(commits)).unwrap_or_else(|error| {
+                    panic!("pulse report failed: {error}", error = error.message())
+                })
             };
             let (report, git_processes) = count_git_processes(&walk);
             assert_eq!(
@@ -515,8 +517,9 @@ fn main() {
         (rows, started.elapsed())
     };
     let branch_rows = || {
-        let listed = GitReader::list_branches(&refs_path)
-            .unwrap_or_else(|error| panic!("list_branches failed: {error}"));
+        let listed = GitReader::list_branches(&refs_path).unwrap_or_else(|error| {
+            panic!("list_branches failed: {error}", error = error.message())
+        });
         assert!(
             listed.len() >= REF_BRANCHES && listed.iter().all(|b| b.compared_to.is_some()),
             "a branch row was dropped or uncompared, so this run would time a degraded listing"
@@ -526,7 +529,7 @@ fn main() {
     };
     let tag_rows = || {
         let listed = GitReader::list_tags(&refs_path)
-            .unwrap_or_else(|error| panic!("list_tags failed: {error}"));
+            .unwrap_or_else(|error| panic!("list_tags failed: {error}", error = error.message()));
         assert!(
             listed.tags.len() == REF_TAGS && listed.tags.iter().all(|t| t.compared_to.is_some()),
             "a tag row was dropped or uncompared, so this run would time a degraded listing"
@@ -535,8 +538,10 @@ fn main() {
         listed.tags.len() as u64
     };
     let divergence_rows = || {
-        let listed = gitpulse_lib::engine::worktree::list_worktrees(&refs_path)
-            .unwrap_or_else(|error| panic!("list_worktrees failed: {error}"));
+        let listed =
+            gitpulse_lib::engine::worktree::list_worktrees(&refs_path).unwrap_or_else(|error| {
+                panic!("list_worktrees failed: {error}", error = error.message())
+            });
         assert!(
             listed.len() == REF_SPEC.linked_worktrees + 1
                 && listed
@@ -669,8 +674,12 @@ fn main() {
     };
     // The Worktrees panel's explicit opt-in: `ScanDepth::Full`.
     let list_full = |path: &str| {
-        gitpulse_lib::engine::worktree::list_worktrees(path)
-            .unwrap_or_else(|error| panic!("list_worktrees full failed: {error}"))
+        gitpulse_lib::engine::worktree::list_worktrees(path).unwrap_or_else(|error| {
+            panic!(
+                "list_worktrees full failed: {error}",
+                error = error.message()
+            )
+        })
     };
     // What `cmd_list_worktrees` runs by default
     // (`depth.unwrap_or(ScanDepth::Listing)`): one `git worktree list`. At this
@@ -679,7 +688,12 @@ fn main() {
     let list_listing = |path: &str| {
         let worktrees =
             gitpulse_lib::engine::worktree::list_worktrees_scanned(path, ScanDepth::Listing)
-                .unwrap_or_else(|error| panic!("list_worktrees listing failed: {error}"));
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "list_worktrees listing failed: {error}",
+                        error = error.message()
+                    )
+                });
         assert_eq!(
             worktrees.len(),
             SPEC.linked_worktrees + 1,
@@ -765,8 +779,10 @@ fn main() {
                 .counter("git_processes", list_listing_procs)
         }),
         Case::new("language stats", || {
-            let report = GitReader::get_repo_language_stats_bounded(&path, None)
-                .unwrap_or_else(|error| panic!("language stats failed: {error}"));
+            let report =
+                GitReader::get_repo_language_stats_bounded(&path, None).unwrap_or_else(|error| {
+                    panic!("language stats failed: {error}", error = error.message())
+                });
             assert!(
                 !report.truncated,
                 "the language scan was truncated ({} of {} candidates scanned), so this run \
@@ -781,8 +797,9 @@ fn main() {
                 .counter("git_processes", lang_procs)
         }),
         Case::new("docs refresh", || {
-            let status =
-                docs::refresh(&path).unwrap_or_else(|error| panic!("docs refresh failed: {error}"));
+            let status = docs::refresh(&path).unwrap_or_else(|error| {
+                panic!("docs refresh failed: {error}", error = error.message())
+            });
             assert!(
                 !status.truncated && status.skipped_unreadable == 0,
                 "the docs vault was partial: {status:?}"
@@ -801,8 +818,9 @@ fn main() {
             let size = next_cold.get();
             next_cold.set(size + 1);
             let started = std::time::Instant::now();
-            let report = GitReader::knowledge_report(&path, Some(size))
-                .unwrap_or_else(|error| panic!("ownership report failed: {error}"));
+            let report = GitReader::knowledge_report(&path, Some(size)).unwrap_or_else(|error| {
+                panic!("ownership report failed: {error}", error = error.message())
+            });
             let elapsed = started.elapsed();
             assert_eq!(
                 report.scanned_files, size,
@@ -816,7 +834,9 @@ fn main() {
         Case::new("ownership warm", || {
             let started = std::time::Instant::now();
             let report = GitReader::knowledge_report(&path, Some(WARM_OWNERSHIP_SAMPLE))
-                .unwrap_or_else(|error| panic!("ownership report failed: {error}"));
+                .unwrap_or_else(|error| {
+                    panic!("ownership report failed: {error}", error = error.message())
+                });
             let elapsed = started.elapsed();
             std::hint::black_box(&report);
             Sample::default()
@@ -824,8 +844,9 @@ fn main() {
                 .elapsed(elapsed)
         }),
         Case::new("commit details", || {
-            let details = GitReader::get_commit_details(&path, &commit)
-                .unwrap_or_else(|error| panic!("commit details failed: {error}"));
+            let details = GitReader::get_commit_details(&path, &commit).unwrap_or_else(|error| {
+                panic!("commit details failed: {error}", error = error.message())
+            });
             std::hint::black_box(&details);
             Sample::default()
                 .counter("parents", details.parent_ids.len() as u64)

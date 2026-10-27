@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::codeintel::WalkBounds;
+use crate::ipc_error::CommandError;
 
 // --- code intelligence (devmap in-process) ----------------------------
 
@@ -293,7 +294,7 @@ pub async fn cmd_codeintel_cancel(cancel_token: String) -> Result<bool, IpcError
 pub async fn cmd_devmap_build(repo_path: String) -> Result<crate::devmap::BuildOutcome, IpcError> {
     off_thread(move || {
         crate::devmap::clear_live_echo_cooldown(&repo_path);
-        crate::devmap::build(&repo_path)
+        crate::devmap::build(&repo_path).map_err(CommandError::from)
     })
     .await
 }
@@ -305,7 +306,7 @@ pub async fn cmd_devmap_refresh(
 ) -> Result<crate::devmap::BuildOutcome, IpcError> {
     off_thread(move || {
         crate::devmap::clear_live_echo_cooldown(&repo_path);
-        crate::devmap::refresh(&repo_path)
+        crate::devmap::refresh(&repo_path).map_err(CommandError::from)
     })
     .await
 }
@@ -603,6 +604,7 @@ pub async fn cmd_fleet_record_metrics(
         let repo = validate_repo(&repo_path)?;
         crate::ledger::save_fleet_metrics(&repo.to_string_lossy(), &metrics)
             .map_err(|e| e.to_string())
+            .map_err(CommandError::from)
     })
     .await
 }

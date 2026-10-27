@@ -31,6 +31,7 @@
 use crate::engine::git_cli::{git_text, validate_repo};
 use crate::engine::git_reader::symbolic_ref_target;
 use crate::engine::git_writer::repo_mutation_lock;
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -195,7 +196,7 @@ const IDX_SEQUENCER: usize = 6;
 /// idle.
 ///
 /// `repo` must already be a validated repository path.
-pub fn detect(repo: &Path) -> Result<Option<RepoOperation>, String> {
+pub fn detect(repo: &Path) -> Result<Option<RepoOperation>, CommandError> {
     let paths = resolve_control_paths(repo)?;
     let mut warnings: Vec<String> = Vec::new();
 
@@ -231,7 +232,7 @@ pub fn detect(repo: &Path) -> Result<Option<RepoOperation>, String> {
 /// commit and list the conflicts, which costs a child each; a caller that
 /// reports only the kind (the insights snapshot, once per worktree) should not
 /// pay for the rest. Same precedence, same classification.
-pub fn detect_kind(repo: &Path) -> Result<Option<OperationKind>, String> {
+pub fn detect_kind(repo: &Path) -> Result<Option<OperationKind>, CommandError> {
     let paths = resolve_control_paths(repo)?;
     let mut warnings: Vec<String> = Vec::new();
     Ok(classify(repo, &paths, &mut warnings)?.map(|(kind, _)| kind))
@@ -248,7 +249,7 @@ pub fn detect_kind(repo: &Path) -> Result<Option<OperationKind>, String> {
 /// worktree, `.git/worktrees/<name>/` for a linked one, the repository itself
 /// when bare. `control_paths_match_git_rev_parse` holds this against git in
 /// all three layouts.
-fn resolve_control_paths(repo: &Path) -> Result<Vec<PathBuf>, String> {
+fn resolve_control_paths(repo: &Path) -> Result<Vec<PathBuf>, CommandError> {
     let (private, _common) = crate::repository_trust::git_directories(repo)?;
     Ok(PROBE_ORDER
         .iter()
@@ -264,7 +265,7 @@ fn classify<'a>(
     repo: &Path,
     paths: &'a [PathBuf],
     warnings: &mut Vec<String>,
-) -> Result<Option<(OperationKind, &'a Path)>, String> {
+) -> Result<Option<(OperationKind, &'a Path)>, CommandError> {
     for (index, probe) in PROBE_ORDER.iter().enumerate() {
         let path = paths[index].as_path();
         if !path.exists() {
@@ -311,7 +312,7 @@ fn classify<'a>(
             },
             "BISECT_LOG" => OperationKind::Bisect,
             other => {
-                return Err(format!("unhandled operation probe '{other}'"));
+                return Err(format!("unhandled operation probe '{other}'").into());
             }
         };
         return Ok(Some((kind, path)));
@@ -383,7 +384,7 @@ fn squash_is_staged(repo: &Path, warnings: &mut Vec<String>) -> bool {
             true
         }
         Err(err) => {
-            warnings.push(format!("{SQUASH_READ_FAILURE}: {err}"));
+            warnings.push(format!("{SQUASH_READ_FAILURE}: {err}", err = err.message()));
             true
         }
     }
@@ -574,7 +575,10 @@ fn head_ref_for(
             .map(|raw| short_ref(&raw))
             .filter(|name| !name.is_empty()),
         Err(err) => {
-            warnings.push(format!("cannot read the checked-out branch: {err}"));
+            warnings.push(format!(
+                "cannot read the checked-out branch: {err}",
+                err = err.message()
+            ));
             None
         }
     }
@@ -649,7 +653,7 @@ fn describe_oid(repo: &Path, oid: &str) -> Option<String> {
 /// total beside them. A listing that could not be read is an error, never an
 /// empty list. A rename-only conflict has stage entries and no markers, so
 /// the index is read rather than the working tree.
-pub(crate) fn conflicted_paths(repo: &Path) -> Result<(Vec<String>, usize), String> {
+pub(crate) fn conflicted_paths(repo: &Path) -> Result<(Vec<String>, usize), CommandError> {
     let raw = git_text(repo, &["diff", "--name-only", "--diff-filter=U", "-z"])?;
     let all: Vec<&str> = raw.split('\0').filter(|s| !s.is_empty()).collect();
     let total = all.len();
@@ -668,7 +672,10 @@ fn conflicted_files(repo: &Path, warnings: &mut Vec<String>) -> (Vec<String>, us
         Err(err) => {
             // An unreadable conflict list must not render as "no conflicts",
             // which would offer `continue` on an unresolved tree.
-            warnings.push(format!("cannot list conflicted files: {err}"));
+            warnings.push(format!(
+                "cannot list conflicted files: {err}",
+                err = err.message()
+            ));
             (Vec::new(), 0)
         }
     }
@@ -764,9 +771,9 @@ pub fn run_action_with<J, V>(
     repo_path: &str,
     action: OperationAction,
     judge: J,
-) -> Result<(V, String), String>
+) -> Result<(V, String), CommandError>
 where
-    J: FnOnce(&[&str]) -> Result<V, String>,
+    J: FnOnce(&[&str]) -> Result<V, CommandError>,
 {
     let repo = validate_repo(repo_path)?;
     let lock = repo_mutation_lock(&repo);
@@ -807,7 +814,8 @@ where
             } else {
                 String::new()
             }
-        ));
+        )
+        .into());
     }
 
     let argv = action_argv(operation.kind, action);
@@ -823,7 +831,7 @@ where
         git_text(&repo, &[
             "-c", "core.whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab,-indent-with-non-tab,-tab-in-indent,cr-at-eol",
             "diff", "--cached", "--check", "--no-ext-diff", "--no-color",
-        ]).map_err(|error| format!("Cannot continue: the staged integrity check failed. Review the staged changes. {error}"))?;
+        ]).map_err(|error| error.wrap(|error| format!("Cannot continue: the staged integrity check failed. Review the staged changes. {error}")))?;
     }
     // argv[0] is the program name the gate judges; git itself takes the rest.
     let args: Vec<&str> = argv[1..].to_vec();

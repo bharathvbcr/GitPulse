@@ -25,6 +25,7 @@
 //!   inputs no stamp sees: files pulled in by `include.path`, and objects that
 //!   a partial clone fetches later.
 
+use crate::ipc_error::CommandError;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -339,7 +340,11 @@ fn kept() -> &'static KeptTable {
 }
 
 /// [`git_cli::git_text_shared`] for a ref listing over `namespaces`.
-pub(crate) fn git_text(repo: &Path, namespaces: &[&str], args: &[&str]) -> Result<String, String> {
+pub(crate) fn git_text(
+    repo: &Path,
+    namespaces: &[&str],
+    args: &[&str],
+) -> Result<String, CommandError> {
     through(repo, namespaces, args, || {
         git_cli::git_text_shared(repo, args).map(|text| (text, true))
     })
@@ -353,7 +358,7 @@ pub(crate) fn git_text_capped(
     namespaces: &[&str],
     args: &[&str],
     cap: usize,
-) -> Result<(String, Option<Incomplete>), String> {
+) -> Result<(String, Option<Incomplete>), CommandError> {
     let mut incomplete = None;
     let text = through(repo, namespaces, args, || {
         let (text, cut) = git_cli::git_text_capped_shared(repo, args, cap)?;
@@ -374,8 +379,8 @@ pub(crate) fn through(
     repo: &Path,
     namespaces: &[&str],
     args: &[&str],
-    run: impl FnOnce() -> Result<(String, bool), String>,
-) -> Result<String, String> {
+    run: impl FnOnce() -> Result<(String, bool), CommandError>,
+) -> Result<String, CommandError> {
     through_stamped(repo, args, stamp(repo, namespaces).as_ref(), run)
 }
 
@@ -388,8 +393,8 @@ pub(crate) fn through_stamped(
     repo: &Path,
     args: &[&str],
     stamp: Option<&Stamp>,
-    run: impl FnOnce() -> Result<(String, bool), String>,
-) -> Result<String, String> {
+    run: impl FnOnce() -> Result<(String, bool), CommandError>,
+) -> Result<String, CommandError> {
     crate::repository_trust::require(repo)?;
     let key = Key {
         repo: repo.to_path_buf(),
@@ -455,27 +460,20 @@ pub(crate) fn through_stamped_coalesced(
     repo: &Path,
     args: &[&str],
     stamp: Option<&Stamp>,
-    run: impl FnOnce() -> Result<(String, bool), String>,
-) -> Result<String, String> {
+    run: impl FnOnce() -> Result<(String, bool), CommandError>,
+) -> Result<String, CommandError> {
     let Some(stamped) = stamp else {
         return through_stamped(repo, args, None, run);
     };
     let key = coalesce_key(repo, args, stamped);
-    let (answer, records) = coalesced_flights().run(key, || {
-        crate::ipc_error::with_records(|| through_stamped(repo, args, stamp, run))
-    });
-    crate::ipc_error::absorb(records);
-    answer
+    coalesced_flights().run(key, || through_stamped(repo, args, stamp, run))
 }
 
 type CoalesceKey = (PathBuf, Vec<String>, u64, git_cli::Admission);
-// The answer travels with what the leader's producers wrote on its thread
-// (`ipc_error::snapshot`), so a waiter's command types the leader's refusal
-// the way the leader's does: the text alone says nothing about its kind.
-type CoalescedFlights = crate::singleflight::SingleFlight<
-    CoalesceKey,
-    (Result<String, String>, crate::ipc_error::Records),
->;
+// A waiter is handed the leader's answer, and a refusal in it carries its own
+// kind, so the waiter's command types it the way the leader's does.
+type CoalescedFlights =
+    crate::singleflight::SingleFlight<CoalesceKey, Result<String, CommandError>>;
 
 fn coalesced_flights() -> &'static CoalescedFlights {
     static FLIGHTS: OnceLock<CoalescedFlights> = OnceLock::new();
@@ -1753,7 +1751,9 @@ mod tests {
                             ))
                         },
                     )
-                    .map_err(|refused| format!("Blame unavailable: {refused}"))
+                    .map_err(|refused| {
+                        refused.wrap(|refused| format!("Blame unavailable: {refused}"))
+                    })
                 })
             })
         };
@@ -1777,7 +1777,9 @@ mod tests {
                             Ok(("waiter-answer".to_string(), true))
                         },
                     )
-                    .map_err(|refused| format!("Blame unavailable: {refused}"))
+                    .map_err(|refused| {
+                        refused.wrap(|refused| format!("Blame unavailable: {refused}"))
+                    })
                 })
             })
         };

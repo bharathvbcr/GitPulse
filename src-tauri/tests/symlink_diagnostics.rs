@@ -61,7 +61,8 @@ fn diff_links_as_git_objects_without_reading_their_targets() {
             Err(err) => {
                 assert!(
                     !err.contains("PRIVATE CONTENT"),
-                    "{name}: error followed the target: {err}"
+                    "{name}: error followed the target: {err}",
+                    err = err.message()
                 );
             }
         }
@@ -127,7 +128,7 @@ fn synthetic_link_diffs_roundtrip_hostile_filenames_through_git_apply() {
             &["apply", "--cached", "--check", "-"],
             diff.text.as_bytes(),
         )
-        .unwrap_or_else(|e| panic!("invalid diff for {name:?}: {e}"));
+        .unwrap_or_else(|e| panic!("invalid diff for {name:?}: {e}", e = e.message()));
     }
 }
 
@@ -146,7 +147,7 @@ fn synthetic_diffs_refuse_lossy_text_instead_of_offering_a_corrupted_patch() {
     for name in ["link", "text.txt"] {
         let error = GitReader::get_file_diff(path, name, false, false)
             .expect_err("lossy patch must be refused");
-        assert!(error.contains("UTF-8"), "{error}");
+        assert!(error.contains("UTF-8"), "{error}", error = error.message());
     }
 }
 

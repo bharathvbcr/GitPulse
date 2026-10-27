@@ -224,7 +224,7 @@ pub fn suspects(
 
     let store = match open_repo_map(repo_path) {
         Ok(store) => store,
-        Err(reason) => return refused(reason),
+        Err(reason) => return refused(reason.into_message()),
     };
     let repo = std::path::Path::new(repo_path);
     let graph = match dc_regress_store::StoreGraph::new(&store, repo) {

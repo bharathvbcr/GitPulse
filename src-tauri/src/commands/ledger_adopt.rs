@@ -1,6 +1,7 @@
 //! Adopting a ledger that its identity record refused.
 
 use super::*;
+use crate::ipc_error::CommandError;
 
 /// Adopts this repository's ledger after the identity record refused it for
 /// sitting in another directory than the one it was anchored in: a cross-device
@@ -27,7 +28,7 @@ pub(super) const ADOPTING_ACTOR: &str = "user:os-confirmation";
 pub(super) fn adopt_ledger_confirmed(
     repo_path: &str,
     confirm: &dyn Fn(&str, &str) -> bool,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, CommandError> {
     let repo = validate_repo(repo_path)?;
     let here = repo.to_string_lossy().into_owned();
     crate::ledger::bindings::adopt_ledger(&here, ADOPTING_ACTOR, &|earlier| {
@@ -47,7 +48,7 @@ pub(super) fn adopt_ledger_confirmed(
             ),
         )
     })
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string()).map_err(CommandError::from)
 }
 
 #[cfg(test)]

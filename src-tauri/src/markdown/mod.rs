@@ -12,6 +12,7 @@
 //! and refuses active URL schemes; reads are confined to the repository by
 //! [`FileAccess::Vault`], through the same validation as `cmd_get_file_blob`.
 
+use crate::ipc_error::CommandError;
 use std::path::Path;
 
 use markdev_html::{render_fragment, ExportOptions, FileAccess, Fragment, HTMLExportError};
@@ -83,7 +84,7 @@ pub struct FrontmatterField {
 /// when it is a file: relative pictures are then read from the repository
 /// and embedded, never from outside it. Without one (a commit message, a PR
 /// body) nothing is read from disk.
-pub fn render(text: &str, note: Option<(&str, &str)>) -> Result<RenderedMarkdown, String> {
+pub fn render(text: &str, note: Option<(&str, &str)>) -> Result<RenderedMarkdown, CommandError> {
     let slice = cap(text);
     let omitted_bytes = text.len() - slice.len();
     let fragment = match note {

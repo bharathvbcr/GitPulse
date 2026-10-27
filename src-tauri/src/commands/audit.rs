@@ -1,6 +1,7 @@
 //! Ledger, task binding and catch-up commands.
 
 use super::*;
+use crate::ipc_error::CommandError;
 
 // --- the action ledger -------------------------------------------------
 
@@ -28,7 +29,9 @@ pub async fn cmd_ledger_tail(
         } else {
             crate::ledger::tail
         };
-        read(&address.anchor, cursor, limit).map_err(|e| e.to_string())
+        read(&address.anchor, cursor, limit)
+            .map_err(|e| e.to_string())
+            .map_err(CommandError::from)
     })
     .await
 }
@@ -45,6 +48,7 @@ pub async fn cmd_ledger_status(repo_path: String) -> Result<crate::ledger::Ledge
         let repo = validate_repo(&repo_path)?;
         crate::ledger::bindings::repository_status(&repo.to_string_lossy())
             .map_err(|e| e.to_string())
+            .map_err(CommandError::from)
     })
     .await
 }
@@ -84,14 +88,14 @@ pub async fn cmd_task_scopes(
 pub(super) fn task_scopes(
     repo_path: &str,
     task_ids: &[String],
-) -> Result<Vec<crate::tasks::TaskScope>, String> {
+) -> Result<Vec<crate::tasks::TaskScope>, CommandError> {
     let repo = validate_repo(repo_path)?;
     if task_ids.is_empty() {
         return Ok(Vec::new());
     }
     let address = crate::ledger::bindings::repository_address(&repo.to_string_lossy())
         .map_err(|e| e.to_string())?;
-    crate::tasks::scopes(&address.anchor, task_ids)
+    crate::tasks::scopes(&address.anchor, task_ids).map_err(CommandError::from)
 }
 
 /// The catch-up a bind or unbind runs first: the worktree's own, inside the
@@ -224,6 +228,7 @@ pub async fn cmd_bind_worktree_task(
             &task_id,
             catch_up_before_binding,
         )
+        .map_err(CommandError::from)
     })
     .await
 }
@@ -235,8 +240,11 @@ pub async fn cmd_unbind_worktree_task(
     repo_path: String,
     worktree_path: String,
 ) -> Result<i64, IpcError> {
-    off_thread(move || unbind_after_catch_up(&repo_path, &worktree_path, catch_up_before_binding))
-        .await
+    off_thread(move || {
+        unbind_after_catch_up(&repo_path, &worktree_path, catch_up_before_binding)
+            .map_err(CommandError::from)
+    })
+    .await
 }
 
 /// The task a worktree is bound to, or `null`.
@@ -246,7 +254,9 @@ pub async fn cmd_worktree_task(
     worktree_path: String,
 ) -> Result<Option<String>, IpcError> {
     off_thread(move || {
-        crate::ledger::bindings::resolve(&repo_path, &worktree_path).map_err(|e| e.to_string())
+        crate::ledger::bindings::resolve(&repo_path, &worktree_path)
+            .map_err(|e| e.to_string())
+            .map_err(CommandError::from)
     })
     .await
 }

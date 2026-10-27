@@ -130,7 +130,7 @@ fn classify(repo_path: &str, worktree_path: &str, message: String) -> LedgerErro
 fn resolve_address(repo_path: &str, worktree_path: &str) -> Result<FamilyAddress, LedgerError> {
     crate::engine::worktree::resolve_worktree_family(repo_path, worktree_path)
         .map(FamilyAddress::from)
-        .map_err(|message| classify(repo_path, worktree_path, message))
+        .map_err(|message| classify(repo_path, worktree_path, message.into_message()))
 }
 
 /// Admits the pair from metadata, or `Ok(None)` when no checkout of the
@@ -149,7 +149,7 @@ fn admit_with_ledger(
     worktree_path: &str,
 ) -> Result<Option<crate::engine::worktree::AdmittedPair>, LedgerError> {
     let pair = crate::engine::worktree::admit_worktree_pair(repo_path, worktree_path)
-        .map_err(|message| classify(repo_path, worktree_path, message))?;
+        .map_err(|message| classify(repo_path, worktree_path, message.into_message()))?;
     let no_ledger = pair.metadata_checkouts().is_some_and(|checkouts| {
         !checkouts
             .iter()
@@ -165,7 +165,7 @@ fn authenticate(
 ) -> Result<FamilyAddress, LedgerError> {
     pair.authenticate()
         .map(FamilyAddress::from)
-        .map_err(|message| classify(repo_path, worktree_path, message))
+        .map_err(|message| classify(repo_path, worktree_path, message.into_message()))
 }
 
 fn address(repo_path: &str, worktree_path: &str) -> Result<BindingAddress, LedgerError> {
@@ -812,13 +812,14 @@ mod tests {
     fn gate_deferrals() -> Vec<String> {
         use crate::engine::git_cli::{refusal_message, Refusal};
         vec![
-            refusal_message("git worktree", Refusal::Shed),
+            refusal_message("git worktree", Refusal::Shed).into_message(),
             refusal_message(
                 "git worktree",
                 Refusal::Refused {
                     waited: std::time::Duration::from_millis(2_013),
                 },
-            ),
+            )
+            .into_message(),
             "git worktree deferred under load after 0.000s: background work is shed while the \
              git spawn rate budget is low"
                 .to_string(),

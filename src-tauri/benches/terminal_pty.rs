@@ -131,7 +131,7 @@ mod imp {
                 None,
                 gitpulse_lib::terminal::OutputSink::events(app.handle()),
             )
-            .unwrap_or_else(|error| panic!("spawn {program}: {error}"))
+            .unwrap_or_else(|error| panic!("spawn {program}: {error}", error = error.message()))
             .id
         };
 

@@ -3624,7 +3624,10 @@ fn family_source_key(anchor: &Path, source: &str) -> Result<String, LedgerError>
     .map_err(|error| {
         LedgerError::new(
             "legacy_source_key_failed",
-            format!("could not identify a legacy ledger source: {error}"),
+            format!(
+                "could not identify a legacy ledger source: {error}",
+                error = error.message()
+            ),
         )
     })?;
     let key = String::from_utf8_lossy(&output).trim().to_string();

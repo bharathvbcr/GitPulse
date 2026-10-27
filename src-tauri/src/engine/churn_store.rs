@@ -53,6 +53,7 @@
 //! it falls back to memory for the rest of the process, logged once: a cache
 //! must never be the reason branch stats fail.
 
+use crate::ipc_error::CommandError;
 use rusqlite::{params, Connection, OpenFlags};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -265,7 +266,7 @@ fn pinned_store() -> &'static Mutex<Store> {
     STORE.get_or_init(|| {
         let store = if PERSIST.load(Ordering::Relaxed) {
             match default_path()
-                .map_err(OpenError::Failed)
+                .map_err(|e| OpenError::Failed(e.into_message()))
                 .and_then(|path| Store::open(&path, PERSISTED_ROWS))
             {
                 Ok(store) => store,
@@ -289,10 +290,11 @@ fn unpinned_store() -> &'static Mutex<Store> {
     STORE.get_or_init(|| Mutex::new(Store::memory(MEMORY_ROWS)))
 }
 
-fn default_path() -> Result<PathBuf, String> {
+fn default_path() -> Result<PathBuf, CommandError> {
     crate::tool_config::default_cache_dir()
         .map(|dir| dir.join(FILE_NAME))
         .ok_or_else(|| "no per-user cache directory (HOME / LOCALAPPDATA unset)".to_string())
+        .map_err(CommandError::from)
 }
 
 /// Why [`Store::open`] failed. Neither kind has touched the file's contents.
@@ -620,8 +622,8 @@ fn probe(repo: &Path, base_oid: &str) -> Option<Probe> {
 /// Reads a `git --attr-source=<oid> version` run. Only git naming the option
 /// unknown means it lacks it; any other failure says nothing either way.
 fn classify_probe(
-    flagged: Result<String, String>,
-    plain: impl FnOnce() -> Result<String, String>,
+    flagged: Result<String, CommandError>,
+    plain: impl FnOnce() -> Result<String, CommandError>,
 ) -> Option<Probe> {
     let version = |text: &str| {
         let line = text.lines().next().unwrap_or("").trim();
@@ -1095,11 +1097,14 @@ mod tests {
                 .unwrap_err();
         assert!(
             unknown.contains("unknown option: --attr-source-from-the-future"),
-            "{unknown}"
+            "{unknown}",
+            unknown = unknown.message()
         );
-        let old = unknown.replace("--attr-source-from-the-future=x", "--attr-source=abc");
+        let old = unknown
+            .message()
+            .replace("--attr-source-from-the-future=x", "--attr-source=abc");
         assert_eq!(
-            classify_probe(Err(old), || Ok("git version 2.39.5\n".into())),
+            classify_probe(Err(old.into()), || Ok("git version 2.39.5\n".into())),
             Some(Probe {
                 version: "git version 2.39.5".into(),
                 attr_source: false
@@ -1114,7 +1119,10 @@ mod tests {
         );
         // A probe that did not run says nothing: no verdict, nothing reused.
         let deferred = "git version deferred under load after 2.000s: …".to_string();
-        assert_eq!(classify_probe(Err(deferred), || unreachable!()), None);
+        assert_eq!(
+            classify_probe(Err(deferred.into()), || unreachable!()),
+            None
+        );
         assert_eq!(classify_probe(Ok(String::new()), || unreachable!()), None);
         assert_eq!(
             classify_probe(Err("unknown option: --attr-source=x".into()), || Err(

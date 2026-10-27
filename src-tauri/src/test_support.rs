@@ -153,7 +153,12 @@ pub(crate) fn run_within(
 ) -> crate::engine::git_cli::BoundedRun {
     crate::engine::git_cli::run_bounded(cmd, label, budget, None)
         .and_then(|run| run.require_complete(label))
-        .unwrap_or_else(|why| panic!("{label} did not finish within {budget:?}: {why}"))
+        .unwrap_or_else(|why| {
+            panic!(
+                "{label} did not finish within {budget:?}: {why}",
+                why = why.message()
+            )
+        })
 }
 
 /// Runs `git` in `dir` with the test identity pinned, and asserts it succeeded.

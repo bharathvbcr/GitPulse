@@ -316,10 +316,7 @@ mod tests {
         // The gate's own formatter, not a transcription of it.
         use crate::engine::git_cli::{refusal_message, Refusal};
         assert_eq!(
-            reason(&refusal_message(
-                "kingfisher",
-                Refusal::TimedOut { deadline }
-            )),
+            reason(refusal_message("kingfisher", Refusal::TimedOut { deadline }).message()),
             "kingfisher could not start: no process slot became free in time"
         );
         for deferral in [
@@ -329,13 +326,13 @@ mod tests {
             Refusal::Shed,
         ] {
             assert_eq!(
-                reason(&refusal_message("kingfisher", deferral)),
+                reason(refusal_message("kingfisher", deferral).message()),
                 "kingfisher was deferred: GitPulse was under load and started no new process in time",
                 "{deferral:?} is a deferral, not a slot timeout or a scan timeout"
             );
         }
         assert_eq!(
-            reason(&refusal_message("kingfisher", Refusal::Cancelled)),
+            reason(refusal_message("kingfisher", Refusal::Cancelled).message()),
             "superseded by a newer secrets scan"
         );
         assert_eq!(

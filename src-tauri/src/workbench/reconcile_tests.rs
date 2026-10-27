@@ -367,7 +367,8 @@ fn a_worktree_with_a_live_run_in_it_is_not_torn_down() {
     let gate = |repo: &str, argv: &[&str]| crate::harness::guard_command(repo, argv);
     let removal =
         crate::commands::remove_worktree_guarded(&state, repo_path, lane_path, true, &gate)
-            .expect_err("a worktree was removed under a running agent");
+            .expect_err("a worktree was removed under a running agent")
+            .into_message();
     let merge = crate::commands::merge_teardown_guarded(
         &state, repo_path, lane_path, None, false, None, &gate,
     )
@@ -435,7 +436,11 @@ fn a_worktree_with_any_process_in_it_is_not_removed_even_without_a_profile() {
         Err(error) => error,
         Ok(_) => panic!("a worktree was removed under a live process"),
     };
-    assert!(refusal.contains(&format!("pid {pid}")), "{refusal}");
+    assert!(
+        refusal.contains(&format!("pid {pid}")),
+        "{refusal}",
+        refusal = refusal.message()
+    );
     assert!(lane.is_dir());
     drop(tab.stdin.take());
     tab.wait().unwrap();

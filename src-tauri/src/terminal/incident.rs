@@ -492,7 +492,7 @@ pub fn attribute_sender(incident: &Incident) -> Attribution {
                 run.status_code,
                 run.stderr_tail.chars().take(160).collect::<String>()
             )),
-            Err(error) => LogQuery::Failed(error.chars().take(200).collect()),
+            Err(error) => LogQuery::Failed(error.message().chars().take(200).collect()),
         }
     })
 }

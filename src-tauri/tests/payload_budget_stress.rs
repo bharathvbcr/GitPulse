@@ -158,7 +158,8 @@ fn blame_on_a_large_file_stays_within_its_budget() {
         .expect_err("partial blame must be explicit");
     assert!(
         error.contains("Blame unavailable") && error.contains("exceeded"),
-        "the incomplete read must explain its limit: {error}"
+        "the incomplete read must explain its limit: {error}",
+        error = error.message()
     );
 }
 

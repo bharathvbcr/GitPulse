@@ -256,7 +256,7 @@ pub async fn cmd_publish_release(
             GitWriter::push_tag(&repo_path, &plan.remote, &plan.tag).map_err(|error| {
                 format!(
                     "Release tag '{}' exists locally but could not be pushed: {}. Retry the release action after fixing connectivity.",
-                    plan.tag, error
+                    plan.tag, error.message()
                 )
             })?;
         Ok(Guarded {

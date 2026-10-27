@@ -283,7 +283,7 @@ fn release_batch_checks_every_path_and_policy_before_mutating() {
     let result = GitWriter::change_index_with(&repo.path_str(), &files, IndexAction::Stage, |_| {
         calls += 1;
         if calls == 2 {
-            Err("policy unavailable".to_string())
+            Err("policy unavailable".to_string().into())
         } else {
             Ok(())
         }
@@ -321,7 +321,8 @@ fn release_batch_deduplicates_and_a_git_failure_leaves_the_index_untouched() {
     // (the chunked form stopped partway and left 128 of them behind).
     assert!(
         error.contains("Index update failed for the 129 selected paths"),
-        "{error}"
+        "{error}",
+        error = error.message()
     );
     assert_eq!(
         GitReader::get_status(&repo.path_str())
@@ -343,7 +344,8 @@ fn release_batch_deduplicates_and_a_git_failure_leaves_the_index_untouched() {
     .unwrap_err();
     assert!(
         error.contains("Index update failed for the 1 selected paths"),
-        "{error}"
+        "{error}",
+        error = error.message()
     );
     assert_eq!(fs::read_to_string(lock).unwrap(), "another writer");
 }
@@ -427,7 +429,8 @@ fn release_concurrent_clones_never_remove_another_clones_repository() {
         common::trust_repo(&target);
         assert_eq!(
             GitReader::head_id(target.to_str().unwrap()).unwrap_or_else(|e| panic!(
-                "a failed contender damaged the destination: {e}; {outcomes:?}"
+                "a failed contender damaged the destination: {e}; {outcomes:?}",
+                e = e.message()
             )),
             expected
         );
@@ -1077,8 +1080,9 @@ fn quick_commit_refuses_unmerged_paths_and_leaves_the_tree() {
     let err = GitWriter::quick_commit(&path, "feat: should not land")
         .expect_err("conflicted tree must refuse");
     assert!(
-        err.to_lowercase().contains("conflict"),
-        "refusal must name the conflict, got {err}"
+        err.message().to_lowercase().contains("conflict"),
+        "refusal must name the conflict, got {err}",
+        err = err.message()
     );
     let history = GitReader::read_commit_history(&path, 5, None).expect("history");
     assert!(
@@ -1923,7 +1927,11 @@ fn test_reader_read_paths_refuse_symlink_escape() {
     let path = repo.path_str();
     let err = GitReader::get_file_diff(&path, "leak/secret.txt", false, false)
         .expect_err("symlink escape must fail");
-    assert!(err.contains("escapes the repository"), "got: {err}");
+    assert!(
+        err.contains("escapes the repository"),
+        "got: {err}",
+        err = err.message()
+    );
     assert!(GitReader::read_commit_history_paged(
         &path,
         0,
@@ -1973,7 +1981,7 @@ fn test_get_commit_details_surfaces_missing_blob_failure() {
     let head = GitReader::head_id(&path).expect("head id");
     let details = GitReader::get_commit_details(&path, &head)
         .expect_err("missing blob must fail the whole detail report");
-    assert!(!details.is_empty());
+    assert!(!details.message().is_empty());
 
     assert!(GitReader::get_commit_files(&path, &head).is_err());
 }
@@ -2012,7 +2020,8 @@ fn force_delete_refuses_default_branch() {
         .expect_err("force-deleting the default branch must be refused");
     assert!(
         err.contains("refusing to force-delete") && err.contains("default branch"),
-        "error must name the default-branch refusal: {err}"
+        "error must name the default-branch refusal: {err}",
+        err = err.message()
     );
     // The branch must still exist after the refusal.
     assert!(git_out(repo.dir.path(), &["rev-parse", "--verify", "main"]).len() == 40);
@@ -2042,7 +2051,8 @@ fn force_delete_refuses_branch_checked_out_in_linked_worktree() {
         .expect_err("force-deleting a branch checked out in a worktree must be refused");
     assert!(
         err.contains("checked out"),
-        "error must name the worktree conflict: {err}"
+        "error must name the worktree conflict: {err}",
+        err = err.message()
     );
     // Non-forced delete keeps git's native safety net and also fails.
     assert!(GitWriter::delete_branch(&path, "feature", false).is_err());
@@ -2185,7 +2195,8 @@ fn rebase_sequence_refuses_foreign_commit_without_moving_branch() {
     .expect_err("a commit from another branch must not transplant");
     assert!(
         err.contains(&format!("{:.7}", &foreign[..7])) || err.contains(&foreign),
-        "error must name the offending step: {err}"
+        "error must name the offending step: {err}",
+        err = err.message()
     );
     assert_eq!(
         git_out(repo.dir.path(), &["rev-parse", "main"]),
@@ -2362,8 +2373,9 @@ fn rebase_rejects_squash_as_the_first_step() {
     )
     .expect_err("squash with no previous commit must be refused");
     assert!(
-        err.to_lowercase().contains("squash"),
-        "error must name the illegal first action, got: {err}"
+        err.message().to_lowercase().contains("squash"),
+        "error must name the illegal first action, got: {err}",
+        err = err.message()
     );
 }
 
@@ -2525,7 +2537,8 @@ fn restack_refuses_dirty_worktree_without_moving_refs() {
         .expect_err("dirty tree must be refused");
     assert!(
         err.contains("uncommitted"),
-        "error must name the real cause: {err}"
+        "error must name the real cause: {err}",
+        err = err.message()
     );
     let feature_after = git_out(repo.dir.path(), &["rev-parse", "feature"]);
     assert_eq!(feature_before, feature_after, "refs must not move");
@@ -2554,7 +2567,8 @@ fn restack_conflict_aborts_and_restores_original_checkout() {
         .expect_err("conflicting restack must fail");
     assert!(
         err.contains("rolled back"),
-        "error must promise rollback: {err}"
+        "error must promise rollback: {err}",
+        err = err.message()
     );
     // No rebase may linger mid-flight.
     assert!(
@@ -2621,7 +2635,8 @@ fn restack_refuses_when_a_rebase_is_already_in_progress() {
         .expect_err("must refuse while another rebase is in flight");
     assert!(
         err.contains("already in progress"),
-        "error must name the blocker: {err}"
+        "error must name the blocker: {err}",
+        err = err.message()
     );
 
     // Clean up for the temp dir assertion hygiene.
@@ -2978,7 +2993,8 @@ fn cascading_a_stack_replays_each_child_from_its_recorded_parent_tip() {
         .expect_err("replaying from the collapsed fork point drags in the parent's pre-image");
     assert!(
         collapsed_err.contains("rolled back"),
-        "a failed restack must roll back and say so: {collapsed_err}"
+        "a failed restack must roll back and say so: {collapsed_err}",
+        collapsed_err = collapsed_err.message()
     );
 
     // The recorded tip is still an ancestor of the child, so it is honoured,
@@ -3026,7 +3042,11 @@ fn a_fork_point_that_is_not_an_ancestor_is_refused_rather_than_replaced() {
     let canon = validate_repo(&repo.path_str()).expect("repo");
     let err = GitWriter::prepare_restack(&canon, "feature", "main", Some(sibling_tip.as_str()))
         .expect_err("a fork point off another branch must be refused");
-    assert!(err.contains("no longer the stack on disk"), "{err}");
+    assert!(
+        err.contains("no longer the stack on disk"),
+        "{err}",
+        err = err.message()
+    );
 }
 
 #[test]
@@ -3157,8 +3177,9 @@ fn delete_tag_refuses_flags_and_patterns_and_a_missing_tag() {
         let error = GitWriter::delete_tag(&repo.path_str(), refused)
             .expect_err(&format!("{refused:?} must be refused"));
         assert!(
-            error.starts_with("Invalid ref name"),
-            "{refused:?} was refused for the wrong reason: {error}"
+            error.message().starts_with("Invalid ref name"),
+            "{refused:?} was refused for the wrong reason: {error}",
+            error = error.message()
         );
         assert_eq!(
             tags_of(repo.dir.path()),
@@ -3169,7 +3190,11 @@ fn delete_tag_refuses_flags_and_patterns_and_a_missing_tag() {
 
     let error = GitWriter::delete_tag(&repo.path_str(), "never-created")
         .expect_err("a tag that does not exist is an error, not a silent success");
-    assert!(error.contains("never-created"), "{error}");
+    assert!(
+        error.contains("never-created"),
+        "{error}",
+        error = error.message()
+    );
     assert_eq!(tags_of(repo.dir.path()), ["a", "ab", "b"]);
 }
 
@@ -3203,14 +3228,26 @@ fn push_tag_refuses_an_unconfigured_remote_a_flag_and_a_missing_tag() {
 
     let error = GitWriter::push_tag(&repo.path_str(), "elsewhere", "v1")
         .expect_err("an unconfigured remote");
-    assert!(error.contains("not a configured remote"), "{error}");
+    assert!(
+        error.contains("not a configured remote"),
+        "{error}",
+        error = error.message()
+    );
     // A path is a repository, but not a configured remote name.
     let error = GitWriter::push_tag(&repo.path_str(), &bare.path().to_string_lossy(), "v1")
         .expect_err("a URL or path in the remote slot");
-    assert!(error.contains("not a configured remote"), "{error}");
+    assert!(
+        error.contains("not a configured remote"),
+        "{error}",
+        error = error.message()
+    );
     let error = GitWriter::push_tag(&repo.path_str(), "origin", "--delete")
         .expect_err("a flag in the tag slot");
-    assert!(error.starts_with("Invalid ref name"), "{error}");
+    assert!(
+        error.message().starts_with("Invalid ref name"),
+        "{error}",
+        error = error.message()
+    );
     GitWriter::push_tag(&repo.path_str(), "origin", "no-such-tag")
         .expect_err("a tag that does not exist locally");
 

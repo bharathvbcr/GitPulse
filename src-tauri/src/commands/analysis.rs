@@ -1,6 +1,7 @@
 //! Repository analysis: pulse, coverage, dependency health, secrets, storage, hygiene.
 
 use super::*;
+use crate::ipc_error::CommandError;
 
 #[tauri::command(async)]
 pub async fn cmd_get_pulse_report(
@@ -37,6 +38,7 @@ pub async fn cmd_record_pulse_snapshot(
             .map_err(|error| error.to_string())?;
         crate::ledger::save_pulse_snapshot(&address.anchor, &snapshot)
             .map_err(|error| error.to_string())
+            .map_err(CommandError::from)
     })
     .await
 }
@@ -52,6 +54,7 @@ pub async fn cmd_get_pulse_snapshots(
             .map_err(|error| error.to_string())?;
         crate::ledger::get_pulse_snapshots(&address.anchor, limit)
             .map_err(|error| error.to_string())
+            .map_err(CommandError::from)
     })
     .await
 }
@@ -124,7 +127,8 @@ pub async fn cmd_commit_graph_write(
                 "The confirmed command `{}` is not the previewed `{}`; nothing ran",
                 confirmed_argv.join(" "),
                 argv.join(" ")
-            ));
+            )
+            .into());
         }
         let policy = guard(&repo_path, &GitWriter::argv_refs(&argv))?;
         let output = GitWriter::commit_graph_write(&repo_path, &argv)?;
@@ -175,7 +179,7 @@ pub async fn cmd_hygiene_execute(
                     let file_policy = guard_file(&repo_path, path, "delete")?;
                     Ok(strictest_verdict(command_policy, file_policy))
                 }
-                None => guard_file(&repo_path, path, "delete"),
+                None => guard_file(&repo_path, path, "delete").map_err(CommandError::from),
             })?;
         Ok(Guarded { policy, output })
     })

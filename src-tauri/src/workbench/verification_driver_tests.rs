@@ -5,6 +5,7 @@
 use super::gate_tests::{head_of, record, store_record};
 use super::tests::{filed, live, person_edits, profile};
 use super::{complete_task, resolve};
+use crate::ipc_error::CommandError;
 use crate::workbench::verification_driver::{
     base_from_parent_read, decide, run_now, status, status_batch, target_of, verification_base,
     Backend, Driver, Facts, Report, Step, Target, MAX_ACTIVE,
@@ -53,15 +54,15 @@ impl Backend for Fake {
         self.starts.borrow_mut().push(params);
         Ok(json!({"ok": true}))
     }
-    fn head_of(&self, worktree: &str) -> Result<String, String> {
+    fn head_of(&self, worktree: &str) -> Result<String, CommandError> {
         if let Some(err) = self.head_error.borrow().clone() {
-            return Err(err);
+            return Err(err.into());
         }
         gate::current_head(worktree)
     }
-    fn base_of(&self, _: &str, _: &str) -> Result<String, String> {
+    fn base_of(&self, _: &str, _: &str) -> Result<String, CommandError> {
         if let Some(err) = self.base_error.borrow().clone() {
-            return Err(err);
+            return Err(err.into());
         }
         Ok("base-oid".into())
     }
@@ -580,7 +581,7 @@ fn a_deferred_head_read_is_asked_again_and_a_permanent_one_is_recorded() {
             revision: 3,
             logs: "",
             target: &target,
-            current_head: head,
+            current_head: head.map_err(CommandError::from),
             latest: Ok(latest),
             attempt: None,
             item_id: "i",
@@ -742,7 +743,7 @@ fn verification_base_of_a_root_commit_on_the_default_branch_is_an_error() {
         &["commit", "-q", "--allow-empty", "-m", "root"],
     );
     let err = verification_base(repo.path(), &head_of(&repo)).unwrap_err();
-    assert!(err.contains("no parent"), "{err}");
+    assert!(err.contains("no parent"), "{err}", err = err.message());
 }
 
 #[test]
@@ -760,13 +761,17 @@ fn a_deferred_parent_read_is_not_rewritten_as_a_missing_parent() {
     );
     let missing =
         base_from_parent_read(Err("fatal: Needed a single revision".into()), "abc").unwrap_err();
-    assert!(missing.contains("no parent"), "{missing}");
+    assert!(
+        missing.contains("no parent"),
+        "{missing}",
+        missing = missing.message()
+    );
     assert_eq!(
         base_from_parent_read(Err("not a git repository".into()), "abc").unwrap_err(),
         "not a git repository"
     );
     let same = base_from_parent_read(Ok("abc".into()), "abc").unwrap_err();
-    assert!(same.contains("no parent"), "{same}");
+    assert!(same.contains("no parent"), "{same}", same = same.message());
 }
 
 #[test]
@@ -1448,8 +1453,9 @@ fn a_head_read_the_gate_declined_stays_a_retryable_deferral_and_is_not_kept() {
         let pressure = inject_governor(GovernorInput::test_pressure(Level::Critical));
         let declined = gate::current_head(path).unwrap_err();
         assert!(
-            crate::workbench::verification_driver::git_question_unasked(&declined),
-            "{declined}"
+            crate::workbench::verification_driver::git_question_unasked(declined.message()),
+            "{declined}",
+            declined = declined.message()
         );
         let target = Target {
             worktree: path.into(),

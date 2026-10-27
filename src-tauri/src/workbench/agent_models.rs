@@ -21,6 +21,7 @@
 
 use super::terminal_command::{self, validate_model_id};
 use crate::engine::git_cli::CapturedOutput;
+use crate::ipc_error::CommandError;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -180,14 +181,14 @@ fn excerpt(bytes: &[u8]) -> String {
 
 /// `agy models`' answer as a catalog. Pure, so every shape of answer — a
 /// failure, a garbled line, a flood — is testable without the CLI.
-pub(crate) fn agy_catalog(answer: Result<CapturedOutput, String>) -> AgentModelCatalog {
+pub(crate) fn agy_catalog(answer: Result<CapturedOutput, CommandError>) -> AgentModelCatalog {
     let mut out = catalog("agy", "listed", Some("agy models"));
     let output = match answer {
         Ok(output) => output,
         Err(error) => {
             out.error = Some(format!(
                 "agy models could not run: {}",
-                excerpt(error.as_bytes())
+                excerpt(error.message().as_bytes())
             ));
             return out;
         }
@@ -283,14 +284,14 @@ const FAILURE_TTL: Duration = Duration::from_secs(5);
 /// [`FAILURE_TTL`]) unless `refresh`. The cache lock is held only to read or
 /// write an entry, never across the CLI: concurrent requests for one launcher
 /// share a single run, and a slow listing blocks nothing else.
-pub(crate) fn models_for(launcher: &str, refresh: bool) -> Result<AgentModelCatalog, String> {
+pub(crate) fn models_for(launcher: &str, refresh: bool) -> Result<AgentModelCatalog, CommandError> {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     match listing_kind(launcher) {
         Some("known") => Ok(claude_catalog(
             read_claude_settings(home.as_deref()).as_deref(),
         )),
         Some("listed") => Ok(listed_models(launcher, refresh, || list_with_cli(launcher))),
-        _ => Err(format!("{launcher} has no model list GitPulse can read.")),
+        _ => Err(format!("{launcher} has no model list GitPulse can read.").into()),
     }
 }
 
@@ -298,7 +299,7 @@ pub(crate) fn models_for(launcher: &str, refresh: bool) -> Result<AgentModelCata
 fn listed_models(
     launcher: &str,
     refresh: bool,
-    list: impl FnOnce() -> Result<CapturedOutput, String>,
+    list: impl FnOnce() -> Result<CapturedOutput, CommandError>,
 ) -> AgentModelCatalog {
     static FLIGHTS: std::sync::OnceLock<
         crate::singleflight::SingleFlight<String, AgentModelCatalog>,
@@ -337,7 +338,7 @@ fn cached(launcher: &str) -> Option<AgentModelCatalog> {
 
 /// Runs the CLI's own listing command from the temporary directory: never the
 /// open repository, because an agent CLI may write project files where it runs.
-fn list_with_cli(launcher: &str) -> Result<CapturedOutput, String> {
+fn list_with_cli(launcher: &str) -> Result<CapturedOutput, CommandError> {
     let program = terminal_command::program(launcher).map_err(|error| error.message)?;
     crate::engine::git_cli::capture_command(
         &program,
@@ -365,7 +366,7 @@ mod tests {
         stderr: &str,
         success: bool,
         code: i32,
-    ) -> Result<CapturedOutput, String> {
+    ) -> Result<CapturedOutput, CommandError> {
         Ok(CapturedOutput {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
@@ -439,7 +440,7 @@ mod tests {
                 answer("-x\n--y\n", "", true, 0),
                 "none of them a model name",
             ),
-            (Err("timed out after 20s".to_owned()), "timed out"),
+            (Err("timed out after 20s".into()), "timed out"),
             (
                 Ok(CapturedOutput {
                     stdout: vec![0xff, 0xfe],
@@ -540,7 +541,7 @@ mod tests {
         assert_eq!(read_claude_settings(None), None);
     }
 
-    fn good_listing() -> Result<CapturedOutput, String> {
+    fn good_listing() -> Result<CapturedOutput, CommandError> {
         answer("gemini-3-pro\ngemini-3-flash\n", "", true, 0)
     }
 

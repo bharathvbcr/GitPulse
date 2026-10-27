@@ -101,7 +101,11 @@ fn sandbox_write_refuses_symlink_escape() {
     // fs::write followed the link and overwrote the external file.
     std::os::unix::fs::symlink(outside.path().join("target.txt"), repo.join("file-leak")).unwrap();
     let err = sandbox_write(&repo_str, "file-leak", "pwned").expect_err("file symlink");
-    assert!(err.contains("escapes the repository"), "got: {err}");
+    assert!(
+        err.contains("escapes the repository"),
+        "got: {err}",
+        err = err.message()
+    );
     assert_eq!(
         std::fs::read_to_string(outside.path().join("target.txt")).unwrap(),
         "original",
@@ -113,7 +117,11 @@ fn sandbox_write_refuses_symlink_escape() {
     std::os::unix::fs::symlink(outside.path(), repo.join("dir-leak")).unwrap();
     let err =
         sandbox_write(&repo_str, "dir-leak/payload.txt", "pwned").expect_err("directory symlink");
-    assert!(err.contains("escapes the repository"), "got: {err}");
+    assert!(
+        err.contains("escapes the repository"),
+        "got: {err}",
+        err = err.message()
+    );
     assert!(
         !outside.path().join("payload.txt").exists(),
         "nothing may be written through the directory link"
@@ -529,10 +537,14 @@ fn failed_clone_removes_partial_git_dir_and_reports_cleanup() {
         .expect_err("retry must still hit the corrupt source");
     assert!(
         !second.contains("Already cloned"),
-        "cleanup must keep retries working, got: {second}"
+        "cleanup must keep retries working, got: {second}",
+        second = second.message()
     );
     if let Err(err) = first {
-        assert!(!err.trim().is_empty(), "failure must carry a diagnosis");
+        assert!(
+            !err.message().trim().is_empty(),
+            "failure must carry a diagnosis"
+        );
     }
 }
 
@@ -598,7 +610,7 @@ fn writing_dot_git_config_is_refused_and_the_config_is_untouched() {
     }
 }
 
-fn sandbox_write_raw(repo: &str, path: &str) -> Result<(), String> {
+fn sandbox_write_raw(repo: &str, path: &str) -> Result<(), gitpulse_lib::ipc_error::CommandError> {
     gitpulse_lib::engine::git_cli::sandbox_write(repo, path, HOSTILE_CONFIG)
 }
 
@@ -627,7 +639,7 @@ fn ordinary_dot_git_prefixed_names_still_write() {
     let repo_str = repo_dir.path().to_string_lossy().into_owned();
     for path in [".gitignore", ".gitkeep", ".github/x", "sub/.gitattributes"] {
         gitpulse_lib::engine::git_cli::sandbox_write(&repo_str, path, "ok\n")
-            .unwrap_or_else(|e| panic!("{path}: {e}"));
+            .unwrap_or_else(|e| panic!("{path}: {e}", e = e.message()));
         assert_eq!(
             std::fs::read_to_string(repo_dir.path().join(path)).unwrap(),
             "ok\n"

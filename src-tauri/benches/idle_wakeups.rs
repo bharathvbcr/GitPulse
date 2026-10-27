@@ -151,7 +151,7 @@ mod imp {
                         None,
                         gitpulse_lib::terminal::OutputSink::events(app.handle()),
                     )
-                    .unwrap_or_else(|error| panic!("spawn cat: {error}"))
+                    .unwrap_or_else(|error| panic!("spawn cat: {error}", error = error.message()))
                     .id
                 })
                 .collect();
@@ -194,7 +194,9 @@ mod imp {
         let idle_watches = |count: usize| -> Sample {
             for path in &repos[..count] {
                 gitpulse_lib::watcher::bench_seam::start_idle_watch(&watch_state, path)
-                    .unwrap_or_else(|error| panic!("watch {path}: {error}"));
+                    .unwrap_or_else(|error| {
+                        panic!("watch {path}: {error}", error = error.message())
+                    });
             }
             // Registration, the first ignore-rule read and the first scan all
             // settle before the window opens.

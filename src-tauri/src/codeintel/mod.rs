@@ -5,6 +5,7 @@
 //! tracing, and dead code detection.
 
 use crate::engine::git_cli::validate_repo;
+use crate::ipc_error::CommandError;
 use devmap_query::{
     Cancel, Request, ResolutionAvailability, Response, Rung, RungHistogram, SourceFreshness,
     StoreQueryEngine,
@@ -269,7 +270,7 @@ fn map_path(repo: &Path) -> PathBuf {
 /// *before* the map path is built rather than left for the filesystem to follow
 /// afterwards, and it is the existing owner of this decision rather than a
 /// second path policy standing beside it.
-fn resolve_repo(repo_path: &str) -> Result<PathBuf, String> {
+fn resolve_repo(repo_path: &str) -> Result<PathBuf, CommandError> {
     validate_repo(repo_path)
 }
 
@@ -335,8 +336,8 @@ fn open_indexed_store(repo: &Path) -> Result<Store, String> {
 
 /// Validates the repository and opens its built map — the whole preamble every
 /// query surface shares.
-pub(crate) fn open_repo_map(repo_path: &str) -> Result<Store, String> {
-    open_indexed_store(&resolve_repo(repo_path)?)
+pub(crate) fn open_repo_map(repo_path: &str) -> Result<Store, CommandError> {
+    open_indexed_store(&resolve_repo(repo_path)?).map_err(CommandError::from)
 }
 
 /// Refuses a blank query argument instead of answering it.
@@ -996,7 +997,7 @@ pub fn status(repo_path: &str) -> CodeintelStatus {
     // resolve-against-our-own-cwd behaviour this gate exists to refuse.
     let repo = match resolve_repo(repo_path) {
         Ok(repo) => repo,
-        Err(e) => return status_unavailable(String::new(), e),
+        Err(e) => return status_unavailable(String::new(), e.into_message()),
     };
     let db_str = map_path(&repo).to_string_lossy().into_owned();
 
@@ -1075,7 +1076,7 @@ pub fn search(
     }
     let store = match open_repo_map(repo_path) {
         Ok(s) => s,
-        Err(e) => return CodeintelResponse::unavailable(e),
+        Err(e) => return CodeintelResponse::unavailable(e.into_message()),
     };
     let engine = StoreQueryEngine::new(&store);
     let req = Request {
@@ -1126,7 +1127,7 @@ pub fn symbols_for_file(repo_path: &str, file_path: &str, head_sha: &str) -> Cod
     }
     let store = match open_repo_map(repo_path) {
         Ok(s) => s,
-        Err(e) => return CodeintelFileSymbols::unavailable(file_path, head_sha, e),
+        Err(e) => return CodeintelFileSymbols::unavailable(file_path, head_sha, e.into_message()),
     };
     let page = match store.latest_symbols_for_file(file_path) {
         Ok(Some(page)) => page,
@@ -1354,7 +1355,7 @@ fn at_rung_query<E: std::fmt::Display>(
     };
     let store = match open_repo_map(q.repo_path) {
         Ok(s) => s,
-        Err(e) => return CodeintelResponse::unavailable(e),
+        Err(e) => return CodeintelResponse::unavailable(e.into_message()),
     };
     let mut engine = StoreQueryEngine::new(&store);
     if let Some(cancel) = q.cancel {
@@ -1380,7 +1381,7 @@ pub fn dead_symbols(
 ) -> CodeintelResponse<CodeintelDeadSymbol> {
     let store = match open_repo_map(repo_path) {
         Ok(s) => s,
-        Err(e) => return CodeintelResponse::unavailable(e),
+        Err(e) => return CodeintelResponse::unavailable(e.into_message()),
     };
     let engine = StoreQueryEngine::new(&store);
     let budget = token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET);
@@ -1438,7 +1439,7 @@ pub fn trace_between_at_rung(
     };
     let store = match open_repo_map(repo_path) {
         Ok(s) => s,
-        Err(e) => return CodeintelResponse::unavailable(e),
+        Err(e) => return CodeintelResponse::unavailable(e.into_message()),
     };
     let mut engine = StoreQueryEngine::new(&store);
     if let Some(cancel) = cancel {
@@ -1519,7 +1520,7 @@ pub fn neighbors(
     token_budget: Option<u32>,
     min_rung: Option<&str>,
     bounds: WalkBounds,
-) -> Result<Vec<CodeintelNeighbors>, String> {
+) -> Result<Vec<CodeintelNeighbors>, CommandError> {
     if targets.is_empty() {
         return Err("neighbors requires at least one target".into());
     }
@@ -1556,11 +1557,11 @@ pub fn neighbors(
 /// answer, so a refusal never renders as "no callers". A failed walk becomes
 /// an unavailable envelope, as it does for every sibling query.
 pub fn neighbors_envelope(
-    result: Result<Vec<CodeintelNeighbors>, String>,
+    result: Result<Vec<CodeintelNeighbors>, CommandError>,
 ) -> CodeintelResponse<CodeintelNeighbors> {
     let items = match result {
         Ok(items) => items,
-        Err(reason) => return CodeintelResponse::unavailable(reason),
+        Err(reason) => return CodeintelResponse::unavailable(reason.into_message()),
     };
     let reason = items
         .iter()
@@ -1673,12 +1674,12 @@ pub fn impact_layered_with_cancel(
         Err(e) => {
             return CodeintelLayeredImpact {
                 available: false,
-                reason: Some(e.clone()),
-                edges: CodeintelResponse::unavailable(e.clone()),
+                reason: Some(e.message().to_string()),
+                edges: CodeintelResponse::unavailable(e.message().to_string()),
                 blast_radius: CodeintelBlastRadius {
                     seeds: Vec::new(),
                     unmatched_targets: vec![target.to_string()],
-                    layers: CodeintelResponse::unavailable(e),
+                    layers: CodeintelResponse::unavailable(e.into_message()),
                     total_impacted: 0,
                 },
             }
@@ -1810,17 +1811,17 @@ pub fn affected_tests(
         Err(e) => {
             return CodeintelAffectedTests {
                 available: false,
-                reason: Some(e.clone()),
+                reason: Some(e.message().to_string()),
                 targets: targets.to_vec(),
-                tests: CodeintelResponse::unavailable(e.clone()),
+                tests: CodeintelResponse::unavailable(e.message().to_string()),
                 blast_radius: CodeintelBlastRadius {
                     seeds: Vec::new(),
                     unmatched_targets: targets.to_vec(),
-                    layers: CodeintelResponse::unavailable(e.clone()),
+                    layers: CodeintelResponse::unavailable(e.message().to_string()),
                     total_impacted: 0,
                 },
                 fail_closed: true,
-                fail_closed_reason: Some(e),
+                fail_closed_reason: Some(e.into_message()),
             }
         }
     };
@@ -2464,12 +2465,12 @@ pub fn explore(
         Err(e) => {
             return CodeintelExplore {
                 available: false,
-                reason: Some(e.clone()),
-                definitions: CodeintelResponse::unavailable(e.clone()),
+                reason: Some(e.message().to_string()),
+                definitions: CodeintelResponse::unavailable(e.message().to_string()),
                 blast_radius: CodeintelBlastRadius {
                     seeds: Vec::new(),
                     unmatched_targets: vec![query.to_string()],
-                    layers: CodeintelResponse::unavailable(e),
+                    layers: CodeintelResponse::unavailable(e.into_message()),
                     total_impacted: 0,
                 },
                 limit: 0,
@@ -2532,8 +2533,8 @@ pub fn clones(repo_path: &str, token_budget: Option<u32>) -> CodeintelClones {
         Err(e) => {
             return CodeintelClones {
                 available: false,
-                reason: Some(e.clone()),
-                groups: CodeintelResponse::unavailable(e),
+                reason: Some(e.message().to_string()),
+                groups: CodeintelResponse::unavailable(e.into_message()),
                 signed_symbols: 0,
                 unsigned_symbols: 0,
             }

@@ -1,6 +1,7 @@
 //! Markdown rendering, docs vault and path move/delete commands.
 
 use super::*;
+use crate::ipc_error::CommandError;
 
 /// Renders markdown for embedding through MarkDev's renderer. With a note
 /// location (`repo_path` + repo-relative `file_path`) relative pictures are
@@ -17,7 +18,11 @@ pub async fn cmd_markdown_render(
         let note = match (repo_path.as_deref(), file_path.as_deref()) {
             (Some(repo), Some(file)) => Some((repo, file)),
             (None, None) => None,
-            _ => return Err("a note location needs both repo_path and file_path".to_string()),
+            _ => {
+                return Err("a note location needs both repo_path and file_path"
+                    .to_string()
+                    .into())
+            }
         };
         crate::markdown::render(&text, note)
     })
@@ -111,7 +116,7 @@ pub(super) fn docs_rename_guarded(
     repo_path: &str,
     from: &str,
     to: &str,
-) -> Result<Guarded<crate::docs::DocRenameOutcome>, String> {
+) -> Result<Guarded<crate::docs::DocRenameOutcome>, CommandError> {
     let fold = VerdictFold::default();
     let outcome = crate::docs::rename_doc(repo_path, from, to, |plan| {
         fold.record(guard_move(repo_path, plan.mv)?);

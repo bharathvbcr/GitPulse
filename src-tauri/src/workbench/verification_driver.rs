@@ -38,6 +38,7 @@
 use super::intake::{self, HELD_MARKER};
 use super::verification_gate::{self as gate, Gate, Record, EVIDENCE_TYPE, STATE_COULD_NOT_RUN};
 use super::{query, WorkbenchError, WorkbenchState};
+use crate::ipc_error::CommandError;
 use dc_store::Store;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -100,10 +101,10 @@ pub(crate) fn target_of(item: &Value) -> Option<Target> {
 pub(crate) trait Backend {
     /// Manvi's `work.verify.task` with validated params.
     fn start(&self, params: Value) -> Result<Value, WorkbenchError>;
-    fn head_of(&self, worktree: &str) -> Result<String, String>;
+    fn head_of(&self, worktree: &str) -> Result<String, CommandError>;
     /// The revision verification diffs against: where `head` left the default
     /// branch, or its first parent when `head` is on that branch.
-    fn base_of(&self, worktree: &str, head: &str) -> Result<String, String>;
+    fn base_of(&self, worktree: &str, head: &str) -> Result<String, CommandError>;
     fn now(&self) -> Instant;
     fn cancelled(&self) -> bool;
 }
@@ -137,7 +138,7 @@ pub(crate) struct Facts<'a> {
     pub revision: i64,
     pub logs: &'a str,
     pub target: &'a Target,
-    pub current_head: Result<String, String>,
+    pub current_head: Result<String, CommandError>,
     pub latest: Result<Option<Record>, String>,
     pub attempt: Option<(Duration, i64)>,
     pub item_id: &'a str,
@@ -157,7 +158,7 @@ pub(crate) fn decide(facts: &Facts<'_>) -> Step {
         // The spawn was declined. Nothing was read, so this is not a verdict
         // and the next sweep asks again. Writing `could_not_run` here made a
         // two-second rate-limit into a permanent hold for that commit.
-        Err(error) if git_question_unasked(error) => return Step::Skip,
+        Err(error) if git_question_unasked(error.message()) => return Step::Skip,
         // Read before the head: a claim whose worktree is gone stays gone, and
         // without this every sweep wrote another `could_not_run` for it. A
         // settled verdict is not written over either.
@@ -166,7 +167,9 @@ pub(crate) fn decide(facts: &Facts<'_>) -> Step {
         {
             return Step::Skip
         }
-        Err(error) => return Step::CouldNotRun(format!("{HEAD_UNREADABLE}{error}")),
+        Err(error) => {
+            return Step::CouldNotRun(format!("{HEAD_UNREADABLE}{error}", error = error.message()))
+        }
     };
     if *head != facts.target.head {
         return Step::Skip;
@@ -366,9 +369,9 @@ impl Driver {
                     }
                     // Same class as a deferred head read: the base was not
                     // read, so there is no verdict to store.
-                    Err(why) if git_question_unasked(&why) => {}
+                    Err(why) if git_question_unasked(why.message()) => {}
                     Err(why) => {
-                        self.could_not_run(store, card, id, target, &why, report);
+                        self.could_not_run(store, card, id, target, why.message(), report);
                     }
                 }
             }
@@ -466,7 +469,7 @@ fn start(
     card: &Value,
     id: &str,
     target: &Target,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     let identity = repository_identity(store, card).map_err(|e| e.message)?;
     let local = intake::resolve(&target.worktree).map_err(|e| e.message)?;
     if local.identity != identity {
@@ -482,6 +485,7 @@ fn start(
         .start(params)
         .map(|_| ())
         .map_err(|e| format!("the verification could not be started: {}", e.message))
+        .map_err(CommandError::from)
 }
 
 /// The card's verdict as the board shows it, read from the store alone so it
@@ -538,7 +542,7 @@ pub(crate) fn status_batch(
 fn describe(
     record: Option<Record>,
     backend: &dyn Backend,
-    heads: &mut HashMap<String, Result<String, String>>,
+    heads: &mut HashMap<String, Result<String, CommandError>>,
     full: bool,
 ) -> Value {
     let Some(record) = record else {
@@ -612,7 +616,7 @@ pub(crate) fn run_now(
             .map_err(|why| {
                 WorkbenchError::new(
                     "repository_unavailable",
-                    format!("The claimed worktree is gone and whether its work reached the checkout could not be read: {why}"),
+                    format!("The claimed worktree is gone and whether its work reached the checkout could not be read: {why}", why = why.message()),
                 )
             })?;
         if !merged {
@@ -643,12 +647,12 @@ pub(crate) fn run_now(
     }
     let head = backend
         .head_of(&local.path)
-        .map_err(|e| WorkbenchError::new("repository_unavailable", e))?;
+        .map_err(|e| WorkbenchError::new("repository_unavailable", e.into_message()))?;
     let base = match base_override {
         Some(named) => named_base(&local.path, named, &head)?,
         None => backend
             .base_of(&local.path, &head)
-            .map_err(|e| WorkbenchError::new("repository_unavailable", e))?,
+            .map_err(|e| WorkbenchError::new("repository_unavailable", e.into_message()))?,
     };
     let request = format!(
         "manual-{id}-{}-{}",
@@ -672,7 +676,7 @@ fn named_base(checkout: &str, named: &str, head: &str) -> Result<String, Workben
         return Err(invalid("A verification base must be a commit id."));
     }
     let full = resolve_commit(Path::new(checkout), named)
-        .map_err(|why| WorkbenchError::new("repository_unavailable", why))?;
+        .map_err(|why| WorkbenchError::new("repository_unavailable", why.into_message()))?;
     // rev-parse reads a name before an abbreviated id, so text that is also a branch or tag would resolve to
     // that ref. An id names the commit it is a prefix of; anything else it resolved to was not asked for.
     if !full.starts_with(&named.to_ascii_lowercase()) {
@@ -686,7 +690,7 @@ fn named_base(checkout: &str, named: &str, head: &str) -> Result<String, Workben
         ));
     }
     let ancestor = crate::harness::review::contains(Path::new(checkout), head, &full)
-        .map_err(|why| WorkbenchError::new("repository_unavailable", why))?;
+        .map_err(|why| WorkbenchError::new("repository_unavailable", why.into_message()))?;
     if !ancestor {
         return Err(invalid(
             "The verification base is not an ancestor of the checkout's head.",
@@ -725,17 +729,17 @@ const NO_PARENT: &str = "the claimed commit is on the default branch and has no 
 /// A deferred or slot-wait error is returned unchanged. An unknown parent is
 /// the root-commit error. Any other git failure stays that failure.
 pub(crate) fn base_from_parent_read(
-    read: Result<String, String>,
+    read: Result<String, CommandError>,
     head: &str,
-) -> Result<String, String> {
+) -> Result<String, CommandError> {
     match read {
-        Err(err) if git_question_unasked(&err) => Err(err),
-        Err(err) if missing_parent(&err) => Err(NO_PARENT.to_owned()),
+        Err(err) if git_question_unasked(err.message()) => Err(err),
+        Err(err) if missing_parent(err.message()) => Err(NO_PARENT.into()),
         Err(err) => Err(err),
         Ok(parent) => {
             let parent = parent.trim().to_owned();
             if parent.is_empty() || parent == head {
-                Err(NO_PARENT.to_owned())
+                Err(NO_PARENT.to_owned().into())
             } else {
                 Ok(parent)
             }
@@ -762,7 +766,7 @@ fn missing_parent(err: &str) -> bool {
 ///
 /// A git question that was not asked is returned as that error. It is not
 /// rewritten into "no parent" or "no default branch".
-pub(crate) fn verification_base(worktree: &Path, head: &str) -> Result<String, String> {
+pub(crate) fn verification_base(worktree: &Path, head: &str) -> Result<String, CommandError> {
     // The base is a function of `head`, the default branch and the other refs,
     // all of which the ref stamp covers, so an unchanged repository is
     // answered without the three or four reads below. The "argv" is a key
@@ -776,7 +780,7 @@ pub(crate) fn verification_base(worktree: &Path, head: &str) -> Result<String, S
     )
 }
 
-fn verification_base_uncached(worktree: &Path, head: &str) -> Result<String, String> {
+fn verification_base_uncached(worktree: &Path, head: &str) -> Result<String, CommandError> {
     let head = resolve_commit(worktree, head)?;
     let fork = default_fork(worktree, &head)?;
     if fork != head {
@@ -792,7 +796,7 @@ fn verification_base_uncached(worktree: &Path, head: &str) -> Result<String, Str
     )
 }
 
-fn resolve_commit(worktree: &Path, head: &str) -> Result<String, String> {
+fn resolve_commit(worktree: &Path, head: &str) -> Result<String, CommandError> {
     let spec = format!("{head}^{{commit}}");
     let full = crate::engine::git_cli::git_text(
         worktree,
@@ -800,12 +804,12 @@ fn resolve_commit(worktree: &Path, head: &str) -> Result<String, String> {
     )?;
     let full = full.trim().to_owned();
     if full.is_empty() {
-        return Err(format!("the claimed commit {head} could not be resolved"));
+        return Err(format!("the claimed commit {head} could not be resolved").into());
     }
     Ok(full)
 }
 
-fn default_fork(worktree: &Path, head: &str) -> Result<String, String> {
+fn default_fork(worktree: &Path, head: &str) -> Result<String, CommandError> {
     let base = crate::engine::git_reader::default_base(worktree)
         .checked()?
         .base
@@ -827,10 +831,10 @@ impl Backend for HostBackend {
     fn start(&self, params: Value) -> Result<Value, WorkbenchError> {
         self.0.worker_call_current("work.verify.task", params)
     }
-    fn head_of(&self, worktree: &str) -> Result<String, String> {
+    fn head_of(&self, worktree: &str) -> Result<String, CommandError> {
         gate::current_head(worktree)
     }
-    fn base_of(&self, worktree: &str, head: &str) -> Result<String, String> {
+    fn base_of(&self, worktree: &str, head: &str) -> Result<String, CommandError> {
         verification_base(Path::new(worktree), head)
     }
     fn now(&self) -> Instant {

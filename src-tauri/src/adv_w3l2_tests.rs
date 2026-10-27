@@ -382,7 +382,7 @@ fn watched_band_run(
     });
     let (entered_after, failed_after) = band_outcomes();
     let last = watch.last_read.lock().unwrap().clone();
-    let run = run.unwrap_or_else(|e| panic!("{e}; last read by the parent: {last}"));
+    let run = run.unwrap_or_else(|e| panic!("{}; last read by the parent: {last}", e.message()));
     assert!(run.cancelled, "{label} ended on its own; last read: {last}");
     assert_eq!(
         failed_after, failed,

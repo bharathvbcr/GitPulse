@@ -1,6 +1,7 @@
 //! Repository resolution, trust grants and filesystem watching.
 
 use super::*;
+use crate::ipc_error::CommandError;
 
 #[tauri::command(async)]
 pub async fn cmd_resolve_repo(repo_path: String) -> Result<ResolvedRepo, IpcError> {
@@ -55,5 +56,5 @@ pub async fn cmd_unwatch_repo(
     repo_path: String,
 ) -> Result<(), IpcError> {
     let watcher_state = state.inner().clone();
-    off_thread(move || unwatch(&watcher_state, repo_path)).await
+    off_thread(move || unwatch(&watcher_state, repo_path).map_err(CommandError::from)).await
 }

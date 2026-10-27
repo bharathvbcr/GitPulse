@@ -629,18 +629,32 @@ fn refusal_tail_is_single_line_json_safe_and_classified() {
     ] {
         let message = refusal_message_at("git status", refusal, level);
         assert!(
-            !message.contains(['\n', '\r', '"', '\\', '\t']),
-            "{message}"
+            !message.message().contains(['\n', '\r', '"', '\\', '\t']),
+            "{message}",
+            message = message.message()
         );
-        assert!(message.chars().all(|c| !c.is_control()), "{message}");
-        let json = serde_json::to_string(&message).unwrap();
-        assert_eq!(json.len(), message.len() + 2, "needed escaping: {message}");
-        println!("TEXT {refusal:?}: {message}");
+        assert!(
+            message.message().chars().all(|c| !c.is_control()),
+            "{message}",
+            message = message.message()
+        );
+        let json = serde_json::to_string(message.message()).unwrap();
+        assert_eq!(
+            json.len(),
+            message.message().len() + 2,
+            "needed escaping: {message}",
+            message = message.message()
+        );
+        println!("TEXT {refusal:?}: {message}", message = message.message());
         if matches!(
             refusal,
             Refusal::Refused { .. } | Refusal::Shed | Refusal::Pressure { .. }
         ) {
-            assert!(is_deferred_under_load(&message), "{message}");
+            assert!(
+                is_deferred_under_load(message.message()),
+                "{message}",
+                message = message.message()
+            );
         }
     }
     // Pressure and Cancelled/TimedOut never carry the tail.

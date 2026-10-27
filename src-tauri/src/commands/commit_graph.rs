@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::engine::git_reader::FirstParentChain;
+use crate::ipc_error::CommandError;
 use crate::stack::StackedBranchNode;
 use std::path::Path;
 
@@ -328,16 +329,14 @@ pub async fn cmd_get_commit_graph(
             let history = scope.spawn(move || {
                 #[cfg(test)]
                 let _carried = injected.map(crate::sysload::inject_governor);
-                crate::ipc_error::with_records(|| {
-                    GitReader::read_commit_history_paged(
-                        &repo,
-                        skip.unwrap_or(0),
-                        fetch_limit,
-                        rev.as_deref(),
-                        path_filter.as_deref(),
-                        ref_scope,
-                    )
-                })
+                GitReader::read_commit_history_paged(
+                    &repo,
+                    skip.unwrap_or(0),
+                    fetch_limit,
+                    rev.as_deref(),
+                    path_filter.as_deref(),
+                    ref_scope,
+                )
             });
             let repo2 = repo_path.clone();
             let head = scope.spawn(move || GitReader::head_id(&repo2));
@@ -365,11 +364,12 @@ pub async fn cmd_get_commit_graph(
         let head_id = match head {
             Ok(Ok(id)) => Some(id),
             Ok(Err(err)) => {
-                if head_is_unborn(Path::new(&repo_path), &err) {
+                if head_is_unborn(Path::new(&repo_path), err.message()) {
                     notes.notices.push(UNBORN_HEAD_NOTICE.into());
                 } else {
                     notes.warnings.push(format!(
-                        "HEAD unavailable ({err}); commit graph may lack the HEAD marker"
+                        "HEAD unavailable ({err}); commit graph may lack the HEAD marker",
+                        err = err.message()
                     ));
                 }
                 None
@@ -397,7 +397,8 @@ pub async fn cmd_get_commit_graph(
             }
             Ok(Err(err)) => {
                 notes.warnings.push(format!(
-                    "ref decorations unavailable ({err}); branches/tags will not be labeled"
+                    "ref decorations unavailable ({err}); branches/tags will not be labeled",
+                    err = err.message()
                 ));
                 Vec::new()
             }
@@ -418,7 +419,8 @@ pub async fn cmd_get_commit_graph(
             Ok(Err(err)) => {
                 notes.warnings.push(format!(
                     "default branch unresolved ({err}); the straight mainline column is \
-                     anchored on a conventional branch name or HEAD"
+                     anchored on a conventional branch name or HEAD",
+                    err = err.message()
                 ));
                 None
             }
@@ -445,7 +447,8 @@ pub async fn cmd_get_commit_graph(
             Ok(Ok(None)) => {}
             Ok(Err(err)) => notes.warnings.push(format!(
                 "hidden-ref probe failed ({err}); refs outside branches, remotes and tags may \
-                 hold history this graph does not draw"
+                 hold history this graph does not draw",
+                err = err.message()
             )),
             Err(_) => notes.warnings.push(
                 "background task failed (thread panic): hidden-ref probe died; refs outside \
@@ -454,15 +457,11 @@ pub async fn cmd_get_commit_graph(
             ),
         }
 
-        // The walk's own thread wrote the gate's refusal, if there was one. It
-        // is handed to this command's thread before the error leaves, so a
-        // deferred history read is typed (and retried) as it was when the walk
-        // ran inline.
+        // The walk ran on its own thread; a refusal there comes back in its
+        // error with its kind, so a deferred history read is typed (and
+        // retried) as it is when the walk runs inline.
         let history = match history {
-            Ok((history, records)) => {
-                crate::ipc_error::absorb(records);
-                history
-            }
+            Ok(history) => history,
             Err(_) => Err("history walker panicked".into()),
         };
         let raw_commits = history?;
@@ -524,7 +523,7 @@ pub(super) fn stack_hierarchy(
     repo_path: &str,
     window: usize,
     budget: StackWalkBudget,
-) -> Result<crate::stack::StackHierarchyPayload, String> {
+) -> Result<crate::stack::StackHierarchyPayload, CommandError> {
     let branches = GitReader::list_branches(repo_path)?;
     // Ground truth for the root designation comes from the backend, not a
     // frontend guess: list_branches already resolved the default branch

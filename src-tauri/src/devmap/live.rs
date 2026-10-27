@@ -1098,7 +1098,7 @@ mod tests {
             },
         ] {
             assert_eq!(
-                decision_for_spawn_error(&refusal_message("devmap", refusal), wanted),
+                decision_for_spawn_error(refusal_message("devmap", refusal).message(), wanted),
                 LiveRefreshDecision::SkipDeferred,
                 "{refusal:?}"
             );
@@ -1112,7 +1112,7 @@ mod tests {
             Refusal::Cancelled,
         ] {
             assert_eq!(
-                decision_for_spawn_error(&refusal_message("devmap", refusal), wanted),
+                decision_for_spawn_error(refusal_message("devmap", refusal).message(), wanted),
                 wanted,
                 "{refusal:?}"
             );

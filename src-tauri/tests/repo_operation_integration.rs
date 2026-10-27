@@ -7,6 +7,7 @@
 //! that the command exited zero.
 
 use gitpulse_lib::engine::repo_op::{self, OperationAction, OperationKind};
+use gitpulse_lib::ipc_error::CommandError;
 use gitpulse_lib::procguard::LockedSpawn;
 
 /// Drives a recovery verb with a judge that records the argv and approves it.
@@ -15,7 +16,7 @@ use gitpulse_lib::procguard::LockedSpawn;
 /// entry point exists; spelling the no-op judge out here keeps the absence of
 /// a policy gate visible at every call site rather than hidden in a helper
 /// that reads like production code.
-fn act(repo_path: &str, action: OperationAction) -> Result<String, String> {
+fn act(repo_path: &str, action: OperationAction) -> Result<String, CommandError> {
     repo_op::run_action_with(repo_path, action, |argv| {
         assert_eq!(
             argv.first().copied(),
@@ -374,7 +375,8 @@ fn resolving_then_continuing_concludes_the_merge() {
     let refused = act(&repo.path_str(), OperationAction::Continue).unwrap_err();
     assert!(
         refused.contains("conflict"),
-        "refusal must name the cause, got: {refused}"
+        "refusal must name the cause, got: {refused}",
+        refused = refused.message()
     );
 
     repo.write("f.txt", "resolved\n");
@@ -433,7 +435,7 @@ fn a_merge_cannot_be_skipped() {
     let repo = TestRepo::with_diverged_branches();
     run_git_allow_failure(repo.path(), &["merge", "--no-edit", "side"]);
     let err = act(&repo.path_str(), OperationAction::Skip).unwrap_err();
-    assert!(err.contains("skip"), "got: {err}");
+    assert!(err.contains("skip"), "got: {err}", err = err.message());
     // Refusal must leave the operation exactly as it was, not half-unwound.
     assert_eq!(
         repo_op::detect(repo.path()).unwrap().unwrap().kind,
@@ -456,7 +458,8 @@ fn acting_on_an_idle_repository_is_refused_rather_than_run() {
         let err = act(&repo.path_str(), action).unwrap_err();
         assert!(
             err.contains("No merge"),
-            "{action:?} must be refused with a usable message, got: {err}"
+            "{action:?} must be refused with a usable message, got: {err}",
+            err = err.message()
         );
     }
     assert_eq!(repo.head_oid(), head, "a refusal must change nothing");
@@ -479,7 +482,8 @@ fn restack_refuses_on_a_parked_cherry_pick_and_names_it() {
     let err = GitWriter::execute_restack(&canon, "side", "main", "main").unwrap_err();
     assert!(
         err.contains("cherry-pick"),
-        "refusal must name the parked operation, got: {err}"
+        "refusal must name the parked operation, got: {err}",
+        err = err.message()
     );
     // And the cherry-pick is still there, untouched.
     assert_eq!(
@@ -601,7 +605,8 @@ fn concurrent_aborts_leave_exactly_one_winner() {
     for failure in results.iter().filter_map(|r| r.as_ref().err()) {
         assert!(
             failure.contains("No merge"),
-            "losers must report an idle repo, got: {failure}"
+            "losers must report an idle repo, got: {failure}",
+            failure = failure.message()
         );
     }
     assert_eq!(repo_op::detect(repo.path()).unwrap(), None);
@@ -670,10 +675,14 @@ fn a_refused_action_does_not_touch_the_repository() {
     let status = git_out(repo.path(), &["status", "--porcelain"]);
 
     let err = repo_op::run_action_with(&repo.path_str(), OperationAction::Abort, |_argv| {
-        Err::<(), String>("blocked by policy: destructive git operation".into())
+        Err::<(), CommandError>("blocked by policy: destructive git operation".into())
     })
     .unwrap_err();
-    assert!(err.contains("blocked by policy"), "got: {err}");
+    assert!(
+        err.contains("blocked by policy"),
+        "got: {err}",
+        err = err.message()
+    );
 
     // The merge is still parked and nothing moved.
     assert_eq!(
@@ -714,7 +723,7 @@ fn an_unavailable_action_is_refused_before_the_gate_runs() {
         Ok(())
     })
     .unwrap_err();
-    assert!(err.contains("skip"), "got: {err}");
+    assert!(err.contains("skip"), "got: {err}", err = err.message());
     assert!(
         !judged,
         "the gate must not be consulted for an impossible action"

@@ -348,7 +348,11 @@ fn a_failed_fetch_error_does_not_contain_the_token() {
     let err =
         crate::engine::git_writer::GitWriter::fetch(dir.path().to_str().unwrap(), Some("origin"))
             .expect_err("fetch must fail");
-    assert!(!err.contains(SECRET), "fetch error leaks the token: {err}");
+    assert!(
+        !err.contains(SECRET),
+        "fetch error leaks the token: {err}",
+        err = err.message()
+    );
 }
 
 #[test]
@@ -359,7 +363,11 @@ fn a_failed_fetch_from_a_credentialed_path_like_url_does_not_leak() {
     let err =
         crate::engine::git_writer::GitWriter::fetch(dir.path().to_str().unwrap(), Some("origin"))
             .expect_err("fetch must fail");
-    assert!(!err.contains(SECRET), "fetch error leaks the token: {err}");
+    assert!(
+        !err.contains(SECRET),
+        "fetch error leaks the token: {err}",
+        err = err.message()
+    );
 }
 
 // --- membership ----------------------------------------------------------

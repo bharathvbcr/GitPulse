@@ -9,32 +9,35 @@
 //! was), and `detail` is optional structured JSON.
 //!
 //! **Nothing in here reads inside a message.** A kind is attached where the
-//! failure is produced, by the one module that produces it:
+//! failure is produced, by the one module that produces it, and travels to the
+//! command's edge in the error value itself, a [`CommandError`]:
 //!
-//! * the spawn gate's deferral (`git_cli::refusal_message`), the repository
+//! * the spawn gate's deferral (`git_cli::refusal_message_at`), the repository
 //!   trust refusal (`repository_trust`), the missing commit identity
-//!   (`git_writer`) and the stale stash refusal (`engine::stash`) each call
-//!   [`typed_text`] with the kind and the message they wrote;
+//!   (`git_writer`), the stale stash refusal (`engine::stash`) and the
+//!   unconfirmed AI endpoint (`ai`) each build a typed [`CommandError`];
 //! * `From<LedgerError>` maps the ledger's own `code`;
-//! * `From<String>` and `From<&str>` are [`IpcErrorKind::Unclassified`], which
-//!   the frontend treats as opaque: it shows the message and never matches
-//!   text inside it.
+//! * a plain `String` or `&str` is [`IpcErrorKind::Unclassified`], which the
+//!   frontend treats as opaque: it shows the message and never matches text
+//!   inside it.
 //!
-//! [`typed_text`] hands the message back unchanged and remembers, on the
-//! thread that produced it, that *this exact text* has that kind. When a
-//! command body ends, [`run_command`] gives the error its kind only if the
-//! text that came out is one of those, character for character. A message
-//! another layer wrapped (`Stash failed: <deferral>`), rewrote
-//! (`git_cli::not_retryable`) or merely quoted (a branch named like a marker)
-//! is not equal to what the producer wrote, so it is unclassified. A command
-//! that was a user action never carries the retryable kind out at all.
+//! A layer that puts its own words around a failure ([`CommandError::wrap`])
+//! keeps its origin but not its exact kind: a message another layer wrapped
+//! (`Stash failed: <deferral>`) or merely quoted (a branch named like a marker)
+//! is unclassified. A command that was a user action never carries the
+//! retryable kind out at all. Because the kind is in the value, an error handed
+//! across a thread (a scoped helper's join, a single-flight leader's answer)
+//! keeps it with nothing to hand back beside it.
 //!
-//! One kind is typed more loosely, on purpose: a command that was *not* a user
-//! action, failed, and had the spawn gate refuse something during it, carries
-//! `DeferredUnderLoad` whatever the final text, because the engine wraps
-//! runner errors in its own words in about twenty places and the frontend
-//! retries a declined read. Only that kind drives a retry, and asking a read
-//! again is idempotent and bounded (`MAX_DEFERRED_RETRIES`).
+//! One kind is typed more loosely, on purpose: a read on [`REPLAY_SAFE_READS`]
+//! that was *not* a user action and failed with an error whose origin is the
+//! spawn gate's deferral carries `DeferredUnderLoad` whatever words the engine
+//! put around it, because the engine wraps runner errors in its own words in
+//! about twenty places and the frontend retries a declined read. A deferral a
+//! read swallowed and an unrelated failure after it are not typed by it: the
+//! error that comes out is the one the command is about. Only that kind drives a
+//! retry, and asking a read again is idempotent and bounded
+//! (`MAX_DEFERRED_RETRIES`).
 //!
 //! The kind list is mirrored by `IPC_ERROR_KINDS` in `src/lib/ipc/invoke.ts`
 //! and pinned against it by `scripts/enum-variant-contract.test.ts`.
@@ -42,7 +45,6 @@
 use crate::engine::git_cli::{self, Admission, RunError};
 use crate::ledger::LedgerError;
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
 use std::fmt;
 
 /// What went wrong, as far as the frontend acts on it.
@@ -129,36 +131,6 @@ impl IpcError {
         self
     }
 
-    /// The error for `text`, which is where a command body's `String` error
-    /// ends up: typed only if a producer on this thread wrote exactly this
-    /// text (see [`typed_text`]), and never retryable when the command was a
-    /// user action.
-    fn from_scope_text(text: String, replay_safe: bool, user_action: bool) -> Self {
-        let (written, detail) = kind_written_as(&text);
-        let kind = if user_action {
-            // A user action may already have changed something, so it is never
-            // asked again: not for its own deferral, not for a wrapped one.
-            match written {
-                IpcErrorKind::DeferredUnderLoad => IpcErrorKind::Unclassified,
-                kind => kind,
-            }
-        } else if replay_safe && written == IpcErrorKind::Unclassified && saw_deferral() {
-            // A READ that the spawn gate declined and that then failed, whatever
-            // words the engine put around the refusal on the way out. Only a
-            // command on `REPLAY_SAFE_READS` gets this: asking it again is
-            // harmless, and the frontend bounds it (`MAX_DEFERRED_RETRIES`). Every
-            // other command's deferral is typed by exact text or not at all.
-            IpcErrorKind::DeferredUnderLoad
-        } else {
-            written
-        };
-        let error = Self::new(kind, text);
-        match detail {
-            Some(detail) if kind != IpcErrorKind::Unclassified => error.with_detail(detail),
-            _ => error,
-        }
-    }
-
     /// True when the message contains `needle`. For tests and Rust callers
     /// that held the error as a `String` before it was typed.
     pub fn contains(&self, needle: &str) -> bool {
@@ -166,215 +138,201 @@ impl IpcError {
     }
 }
 
-/// How many distinct deferral texts a command remembers. A read that fails more
-/// distinct spawns than this has seen the gate refuse a lot, and past the cap the
-/// loose retry rule is switched off for that command (see [`Records::overflowed`])
-/// rather than something being forgotten: it fails closed.
-const MAX_DEFERRALS: usize = 16;
-
-/// What the producers wrote on one thread during one command.
+/// A failure on its way from the code that produced it to a command's edge,
+/// carrying the kind its producer gave it.
 ///
-/// Trust, identity and stale-stash are singletons that nothing evicts: the
-/// frontend acts on them (a prompt, a refresh), so a flood of deferrals must not
-/// be able to push one out, and the last refusal of each is the one a command
-/// returns. Deferrals are a deduplicated set with a cap.
-#[derive(Clone, Default)]
-pub(crate) struct Records {
-    trust: Option<(String, Option<serde_json::Value>)>,
-    identity: Option<String>,
-    stale: Option<String>,
-    ai_endpoint: Option<(String, Option<serde_json::Value>)>,
-    deferrals: Vec<String>,
-    /// More distinct deferrals than [`MAX_DEFERRALS`] were written.
-    overflowed: bool,
-}
-
-impl Records {
-    fn write(&mut self, kind: IpcErrorKind, text: &str, detail: Option<serde_json::Value>) {
-        match kind {
-            IpcErrorKind::RepositoryTrustRequired => self.trust = Some((text.to_string(), detail)),
-            IpcErrorKind::IdentityMissing => self.identity = Some(text.to_string()),
-            IpcErrorKind::StaleStash => self.stale = Some(text.to_string()),
-            IpcErrorKind::AiEndpointUnconfirmed => {
-                self.ai_endpoint = Some((text.to_string(), detail));
-            }
-            IpcErrorKind::DeferredUnderLoad => {
-                if self.deferrals.iter().any(|written| written == text) {
-                    return;
-                }
-                if self.deferrals.len() >= MAX_DEFERRALS {
-                    self.overflowed = true;
-                } else {
-                    self.deferrals.push(text.to_string());
-                }
-            }
-            // Kinds a producer does not write through here (the ledger maps
-            // its own code, and `Unclassified` is the absence of a record).
-            IpcErrorKind::Unclassified
-            | IpcErrorKind::LedgerNotInitialised
-            | IpcErrorKind::LedgerFailed => {}
-        }
-    }
-
-    fn kind_of(&self, text: &str) -> (IpcErrorKind, Option<serde_json::Value>) {
-        if let Some((written, detail)) = &self.trust {
-            if written == text {
-                return (IpcErrorKind::RepositoryTrustRequired, detail.clone());
-            }
-        }
-        if self.identity.as_deref() == Some(text) {
-            return (IpcErrorKind::IdentityMissing, None);
-        }
-        if self.stale.as_deref() == Some(text) {
-            return (IpcErrorKind::StaleStash, None);
-        }
-        if let Some((written, detail)) = &self.ai_endpoint {
-            if written == text {
-                return (IpcErrorKind::AiEndpointUnconfirmed, detail.clone());
-            }
-        }
-        if self.deferrals.iter().any(|written| written == text) {
-            return (IpcErrorKind::DeferredUnderLoad, None);
-        }
-        (IpcErrorKind::Unclassified, None)
-    }
-
-    /// Folds another thread's records into these. Singletons of `other` win;
-    /// deferrals are added under the same cap.
-    fn absorb(&mut self, other: Records) {
-        if other.trust.is_some() {
-            self.trust = other.trust;
-        }
-        if other.identity.is_some() {
-            self.identity = other.identity;
-        }
-        if other.stale.is_some() {
-            self.stale = other.stale;
-        }
-        if other.ai_endpoint.is_some() {
-            self.ai_endpoint = other.ai_endpoint;
-        }
-        for text in other.deferrals {
-            self.write(IpcErrorKind::DeferredUnderLoad, &text, None);
-        }
-        self.overflowed |= other.overflowed;
-    }
-}
-
-thread_local! {
-    static TYPED: RefCell<Records> = RefCell::new(Records::default());
-}
-
-/// Records that `text` is a failure of `kind` and returns it unchanged. Called
-/// by the code that writes the failure, at the point it writes it.
-pub(crate) fn typed_text(kind: IpcErrorKind, text: String) -> String {
-    TYPED.with(|typed| typed.borrow_mut().write(kind, &text, None));
-    text
-}
-
-/// [`typed_text`] with structured detail the frontend can read, such as which
-/// repository a refusal is about.
-pub(crate) fn typed_text_with_detail(
-    kind: IpcErrorKind,
-    text: String,
-    detail: serde_json::Value,
-) -> String {
-    TYPED.with(|typed| typed.borrow_mut().write(kind, &text, Some(detail)));
-    text
-}
-
-/// Whether a failure of `kind` was written on this thread since the current
-/// command began. For a caller that holds a result struct rather than a
-/// message and needs the same answer the error path would give.
-pub(crate) fn kind_was_written(kind: IpcErrorKind) -> bool {
-    TYPED.with(|typed| {
-        let typed = typed.borrow();
-        match kind {
-            IpcErrorKind::RepositoryTrustRequired => typed.trust.is_some(),
-            IpcErrorKind::IdentityMissing => typed.identity.is_some(),
-            IpcErrorKind::StaleStash => typed.stale.is_some(),
-            IpcErrorKind::AiEndpointUnconfirmed => typed.ai_endpoint.is_some(),
-            IpcErrorKind::DeferredUnderLoad => !typed.deferrals.is_empty(),
-            IpcErrorKind::Unclassified
-            | IpcErrorKind::LedgerNotInitialised
-            | IpcErrorKind::LedgerFailed => false,
-        }
-    })
-}
-
-/// The gate refused something during this command, and not so many things that
-/// the record is incomplete.
-fn saw_deferral() -> bool {
-    TYPED.with(|typed| {
-        let typed = typed.borrow();
-        !typed.deferrals.is_empty() && !typed.overflowed
-    })
-}
-
-fn kind_written_as(text: &str) -> (IpcErrorKind, Option<serde_json::Value>) {
-    TYPED.with(|typed| typed.borrow().kind_of(text))
-}
-
-/// A copy of what this thread has written (see [`with_records`]).
-fn snapshot() -> Records {
-    TYPED.with(|typed| typed.borrow().clone())
-}
-
-/// Runs `work` on this thread and returns its result with what its producers
-/// wrote, for a seam that hands the answer to another thread (a single-flight
-/// leader to its waiters, a scoped helper to the command that joins it). The
-/// receiving thread calls [`absorb`] on the records.
+/// `origin` is set once, by the producer, and survives every layer that puts
+/// its own words around the message ([`CommandError::wrap`]). Wrapping only
+/// marks the text as no longer the producer's: the edge types an unwrapped
+/// error by its origin, and a wrapped one only by the loose deferral rule (see
+/// [`REPLAY_SAFE_READS`]).
 ///
-/// The records returned are only what `work` wrote: this thread's earlier ones
-/// (a single-flight leader's command wrote some before it led) are set aside
-/// during `work` and put back after it, together with what `work` wrote, so
-/// this thread's own command still sees both. Without that, a waiter would
-/// inherit a refusal it never saw.
-pub(crate) fn with_records<T>(work: impl FnOnce() -> T) -> (T, Records) {
-    struct Restore(Option<Records>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            if let Some(mut earlier) = self.0.take() {
-                // On unwind `work`'s partial record merges back too.
-                let wrote = TYPED.with(|typed| std::mem::take(&mut *typed.borrow_mut()));
-                earlier.absorb(wrote);
-                TYPED.with(|typed| *typed.borrow_mut() = earlier);
-            }
+/// There is deliberately no `Display`, `Deref<Target = str>` or conversion to
+/// `String`: each would let `format!("…: {e}")` or `e.to_string()` turn the
+/// error back into text and drop its origin without a word. Reading the text
+/// is [`CommandError::message`]; giving the origin up on purpose, where an
+/// error leaves for a caller that has no use for kinds, is
+/// [`CommandError::into_message`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct CommandError {
+    message: String,
+    origin: Option<(IpcErrorKind, Option<serde_json::Value>)>,
+    wrapped: bool,
+}
+
+impl CommandError {
+    /// A failure nobody typed: what a plain `String` error was.
+    pub fn plain(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            origin: None,
+            wrapped: false,
         }
     }
-    let earlier = TYPED.with(|typed| std::mem::take(&mut *typed.borrow_mut()));
-    let restore = Restore(Some(earlier));
-    let value = work();
-    let wrote = snapshot();
-    drop(restore);
-    (value, wrote)
-}
 
-/// Folds `records` into this thread's. A single-flight waiter is given the
-/// leader's answer and, with it, what the leader's producers wrote, so the
-/// waiter's command types the same text the leader's does.
-pub(crate) fn absorb(records: Records) {
-    TYPED.with(|typed| typed.borrow_mut().absorb(records));
-}
+    /// A failure of `kind`, written by the one module that produces it.
+    pub(crate) fn typed(kind: IpcErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            origin: Some((kind, None)),
+            wrapped: false,
+        }
+    }
 
-struct TypedScope;
+    /// [`CommandError::typed`] with structured detail the frontend can read,
+    /// such as which repository a refusal is about.
+    pub(crate) fn typed_with_detail(
+        kind: IpcErrorKind,
+        message: impl Into<String>,
+        detail: serde_json::Value,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            origin: Some((kind, Some(detail))),
+            wrapped: false,
+        }
+    }
 
-impl TypedScope {
-    fn enter() -> Self {
-        TYPED.with(|typed| *typed.borrow_mut() = Records::default());
-        Self
+    /// The text a person reads.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The text alone, for a caller outside any command (a log line, an MCP
+    /// reply, a status field) that has no use for the kind.
+    pub fn into_message(self) -> String {
+        self.message
+    }
+
+    /// The same failure in another layer's words: `words` gets the current
+    /// text and returns the new one. The origin is kept, so a deferral the
+    /// engine explained is still a deferral to the loose rule, but the text is
+    /// no longer the producer's, so no exact kind is read from it. Words that
+    /// hand the text back unchanged (a cleanup note that had nothing to add)
+    /// leave it the producer's.
+    pub fn wrap(self, words: impl FnOnce(&str) -> String) -> Self {
+        let message = words(&self.message);
+        let wrapped = self.wrapped || message != self.message;
+        Self {
+            message,
+            origin: self.origin,
+            wrapped,
+        }
+    }
+
+    /// [`CommandError::wrap`] for a rewrite that keeps the producer's text
+    /// and only edits it in place (the runner's `not_retryable`): the edge
+    /// still reads the origin, so nothing is typed by the new words.
+    pub(crate) fn map_message(self, edit: impl FnOnce(String) -> String) -> Self {
+        Self {
+            message: edit(self.message),
+            ..self
+        }
+    }
+
+    /// The kind its producer gave it, whatever words were put around it since.
+    pub(crate) fn origin(&self) -> Option<IpcErrorKind> {
+        self.origin.as_ref().map(|(kind, _)| *kind)
+    }
+
+    /// The kind of this exact text: the origin while nobody has wrapped it.
+    pub(crate) fn kind(&self) -> IpcErrorKind {
+        match &self.origin {
+            Some((kind, _)) if !self.wrapped => *kind,
+            _ => IpcErrorKind::Unclassified,
+        }
+    }
+
+    /// True when the message contains `needle`.
+    pub fn contains(&self, needle: &str) -> bool {
+        self.message.contains(needle)
+    }
+
+    /// The error a command sends: typed by its producer unless wrapped, and
+    /// never retryable when the command was a user action.
+    fn into_ipc(self, replay_safe: bool, user_action: bool) -> IpcError {
+        let exact = self.kind();
+        let kind = if user_action {
+            // A user action may already have changed something, so it is never
+            // asked again: not for its own deferral, not for a wrapped one.
+            match exact {
+                IpcErrorKind::DeferredUnderLoad => IpcErrorKind::Unclassified,
+                kind => kind,
+            }
+        } else if replay_safe
+            && exact == IpcErrorKind::Unclassified
+            && self.origin() == Some(IpcErrorKind::DeferredUnderLoad)
+        {
+            // A READ that the spawn gate declined, whatever words the engine
+            // put around the refusal on the way out. Only a command on
+            // `REPLAY_SAFE_READS` gets this: asking it again is harmless, and
+            // the frontend bounds it (`MAX_DEFERRED_RETRIES`). Every other
+            // command's deferral is typed by its unwrapped origin or not at all.
+            IpcErrorKind::DeferredUnderLoad
+        } else {
+            exact
+        };
+        let detail = match self.origin {
+            Some((_, detail)) if kind != IpcErrorKind::Unclassified && !self.wrapped => detail,
+            _ => None,
+        };
+        let error = IpcError::new(kind, self.message);
+        match detail {
+            Some(detail) => error.with_detail(detail),
+            None => error,
+        }
     }
 }
 
-impl Drop for TypedScope {
-    fn drop(&mut self) {
-        TYPED.with(|typed| *typed.borrow_mut() = Records::default());
+/// The text, with the origin beside it, so a test failure says both.
+impl fmt::Debug for CommandError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = f.debug_tuple("CommandError");
+        debug.field(&self.message);
+        if let Some(kind) = self.origin() {
+            debug.field(&kind);
+        }
+        if self.wrapped {
+            debug.field(&"wrapped");
+        }
+        debug.finish()
+    }
+}
+
+/// A plain string says nothing about its cause.
+impl From<String> for CommandError {
+    fn from(message: String) -> Self {
+        Self::plain(message)
+    }
+}
+
+impl From<&str> for CommandError {
+    fn from(message: &str) -> Self {
+        Self::plain(message)
+    }
+}
+
+impl PartialEq<str> for CommandError {
+    fn eq(&self, other: &str) -> bool {
+        self.message == other
+    }
+}
+
+impl PartialEq<&str> for CommandError {
+    fn eq(&self, other: &&str) -> bool {
+        self.message == *other
+    }
+}
+
+impl PartialEq<String> for CommandError {
+    fn eq(&self, other: &String) -> bool {
+        &self.message == other
     }
 }
 
 /// The commands a deferred call may be asked again for, whatever words wrap the
 /// refusal: reads, each checked to have no write a replay could repeat. A
-/// command is on this list or its deferral is typed only by exact text, and a
+/// command is on this list or its deferral is typed only while unwrapped, and a
 /// user action never is. Unverified means not retried, so a command that is not
 /// here stays correct and merely shows the refusal instead of retrying it.
 ///
@@ -418,29 +376,30 @@ pub(crate) fn command_name(type_name: &str) -> Option<&str> {
 /// [`run_command_as`] for a body that is not a named command: nothing is replay
 /// safe about it.
 #[cfg(test)]
-pub(crate) fn run_command<T>(body: impl FnOnce() -> Result<T, String>) -> Result<T, IpcError> {
+pub(crate) fn run_command<T, E: Into<CommandError>>(
+    body: impl FnOnce() -> Result<T, E>,
+) -> Result<T, IpcError> {
     run_command_as(None, body)
 }
 
 /// Runs one command body ([`git_cli::run_command_scope`]) and types its error.
 ///
-/// A pool thread carries nothing in from the command before it or out to the
-/// one after: the remembered messages are cleared on entry and on exit.
-/// `command` is the command's name when it has one; it decides whether the
-/// loose deferral rule may apply (see [`REPLAY_SAFE_READS`]).
-pub(crate) fn run_command_as<T>(
+/// The kind is the one the error carries (see [`CommandError`]), so nothing is
+/// remembered on the pool thread between commands. `command` is the command's
+/// name when it has one; it decides whether the loose deferral rule may apply
+/// (see [`REPLAY_SAFE_READS`]).
+pub(crate) fn run_command_as<T, E: Into<CommandError>>(
     command: Option<&str>,
-    body: impl FnOnce() -> Result<T, String>,
+    body: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, IpcError> {
     let replay_safe = command.is_some_and(|name| REPLAY_SAFE_READS.contains(&name));
-    let _scope = TypedScope::enter();
     let mut user_action = false;
     let result = git_cli::run_command_scope(|| {
-        let result = body();
+        let result = body().map_err(Into::into);
         user_action = git_cli::current_admission() == Admission::Interactive;
         result
     });
-    result.map_err(|text| IpcError::from_scope_text(text, replay_safe, user_action))
+    result.map_err(|error| error.into_ipc(replay_safe, user_action))
 }
 
 impl fmt::Display for IpcError {

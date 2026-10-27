@@ -63,9 +63,9 @@ pub(crate) struct LocalRepository {
 
 pub(crate) fn resolve(repo_path: &str) -> Result<LocalRepository, WorkbenchError> {
     let resolved = crate::engine::git_cli::resolve_repo(repo_path)
-        .map_err(|e| WorkbenchError::new("repository_unavailable", e))?;
+        .map_err(|e| WorkbenchError::new("repository_unavailable", e.into_message()))?;
     let common = crate::engine::git_cli::resolve_git_common_dir(Path::new(&resolved.path))
-        .map_err(|e| WorkbenchError::new("repository_unavailable", e))?;
+        .map_err(|e| WorkbenchError::new("repository_unavailable", e.into_message()))?;
     let common = common.to_str().ok_or_else(|| {
         WorkbenchError::new("invalid_input", "Repository path is not valid Unicode.")
     })?;

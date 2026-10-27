@@ -13,6 +13,7 @@
 //! keychain is reported nowhere), so a save is confirmed by reading the item
 //! back, not by the exit status.
 
+use crate::ipc_error::CommandError;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
@@ -84,12 +85,12 @@ impl Keychain {
     }
 
     /// Stores `raw` (validated first), replacing any key already saved.
-    pub(crate) fn save(&self, raw: &str) -> Result<(), String> {
+    pub(crate) fn save(&self, raw: &str) -> Result<(), CommandError> {
         let key = validate(raw)?;
         let script = format!("add-generic-password -U -s {SERVICE} -a {ACCOUNT} -w {key}\n");
         let (ok, _, stderr, _) = self.run_with_code(&["-i"], Some(script.as_bytes()), key)?;
         if !ok {
-            return Err(format!("The Keychain refused the key: {stderr}"));
+            return Err(format!("The Keychain refused the key: {stderr}").into());
         }
         match self.load()? {
             Some(stored) if stored == key => Ok(()),
@@ -99,7 +100,7 @@ impl Keychain {
 
     /// The saved key, or `None` when there is none. A stored value that is not
     /// a key is an error, not a key: it would only fail later as a 401.
-    pub(crate) fn load(&self) -> Result<Option<String>, String> {
+    pub(crate) fn load(&self) -> Result<Option<String>, CommandError> {
         let (ok, stdout, stderr, code) = self.run_with_code(
             &["find-generic-password", "-s", SERVICE, "-a", ACCOUNT, "-w"],
             None,
@@ -109,9 +110,9 @@ impl Keychain {
             return Ok(None);
         }
         if !ok {
-            return Err(format!(
-                "Could not read the Claude API key from the Keychain: {stderr}"
-            ));
+            return Err(
+                format!("Could not read the Claude API key from the Keychain: {stderr}").into(),
+            );
         }
         let key = validate(&stdout).map_err(|_| {
             "The Keychain item for the Claude API key does not hold a valid key; save it again."
@@ -121,12 +122,12 @@ impl Keychain {
     }
 
     /// Whether a key is saved, without handing it to the caller.
-    pub(crate) fn present(&self) -> Result<bool, String> {
+    pub(crate) fn present(&self) -> Result<bool, CommandError> {
         self.load().map(|key| key.is_some())
     }
 
     /// Removes the saved key. Removing a key that is not there succeeds.
-    pub(crate) fn delete(&self) -> Result<(), String> {
+    pub(crate) fn delete(&self) -> Result<(), CommandError> {
         let (ok, _, stderr, code) = self.run_with_code(
             &["delete-generic-password", "-s", SERVICE, "-a", ACCOUNT],
             None,
@@ -135,9 +136,7 @@ impl Keychain {
         if ok || code == NOT_FOUND {
             Ok(())
         } else {
-            Err(format!(
-                "Could not remove the Claude API key from the Keychain: {stderr}"
-            ))
+            Err(format!("Could not remove the Claude API key from the Keychain: {stderr}").into())
         }
     }
 
@@ -148,7 +147,7 @@ impl Keychain {
         args: &[&str],
         stdin: Option<&[u8]>,
         secret: &str,
-    ) -> Result<(bool, String, String, i32), String> {
+    ) -> Result<(bool, String, String, i32), CommandError> {
         let mut command = Command::new(&self.program);
         command.args(args).env_clear();
         // `security` finds the login keychain through the user's home.
@@ -265,7 +264,11 @@ exit 2
         let dir = tempfile::TempDir::new().unwrap();
         let keychain = fake_security(dir.path(), true);
         let error = keychain.save(KEY).unwrap_err();
-        assert!(error.contains("did not keep"), "{error}");
+        assert!(
+            error.contains("did not keep"),
+            "{error}",
+            error = error.message()
+        );
     }
 
     #[test]
@@ -282,10 +285,15 @@ exit 2
         let keychain = fake_security(dir.path(), false);
         std::fs::write(dir.path().join("item"), "not-a-key").unwrap();
         let error = keychain.load().unwrap_err();
-        assert!(error.contains("does not hold a valid key"), "{error}");
+        assert!(
+            error.contains("does not hold a valid key"),
+            "{error}",
+            error = error.message()
+        );
         assert!(
             !error.contains("not-a-key"),
-            "the stored value must not be echoed: {error}"
+            "the stored value must not be echoed: {error}",
+            error = error.message()
         );
     }
 }

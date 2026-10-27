@@ -1,6 +1,7 @@
 //! Gate verdict machinery shared by every mutating command, plus harness and policy commands.
 
 use super::*;
+use crate::ipc_error::CommandError;
 
 // ---------------------------------------------------------------------------
 // MANVI harness: policy-gated Git actions, and the local AI features.
@@ -169,9 +170,11 @@ pub(super) fn harness_join_failure(error: String) -> crate::harness::HarnessStat
 pub async fn cmd_harness_status() -> crate::harness::HarnessStatus {
     // Probing can spawn the sidecar and wait out a 20s handshake; keep that
     // off the async workers.
-    off_thread(|| Ok::<_, String>(crate::harness::HarnessStatus::probe()))
-        .await
-        .unwrap_or_else(|e| harness_join_failure(e.to_string()))
+    off_thread(|| {
+        Ok::<_, String>(crate::harness::HarnessStatus::probe()).map_err(CommandError::from)
+    })
+    .await
+    .unwrap_or_else(|e| harness_join_failure(e.to_string()))
 }
 
 /// Drops the current sidecar and clears its backoff, so the next call starts a
@@ -180,7 +183,7 @@ pub async fn cmd_harness_status() -> crate::harness::HarnessStatus {
 pub async fn cmd_harness_reconnect() -> crate::harness::HarnessStatus {
     off_thread(|| {
         crate::harness::sidecar::reset();
-        Ok::<_, String>(crate::harness::HarnessStatus::probe())
+        Ok::<_, String>(crate::harness::HarnessStatus::probe()).map_err(CommandError::from)
     })
     .await
     .unwrap_or_else(|e| harness_join_failure(e.to_string()))
@@ -250,12 +253,14 @@ pub async fn cmd_policy_check_command(
     command: String,
 ) -> crate::harness::PolicyVerdict {
     let command_for_fallback = command.clone();
-    off_thread(move || Ok::<_, String>(policy_verdict_for(&repo_path, &command)))
-        .await
-        .unwrap_or_else(|e| {
-            crate::harness::PolicyVerdict::unchecked(
-                &command_for_fallback,
-                &crate::harness::HarnessError::Unavailable(e.to_string()),
-            )
-        })
+    off_thread(move || {
+        Ok::<_, String>(policy_verdict_for(&repo_path, &command)).map_err(CommandError::from)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        crate::harness::PolicyVerdict::unchecked(
+            &command_for_fallback,
+            &crate::harness::HarnessError::Unavailable(e.to_string()),
+        )
+    })
 }

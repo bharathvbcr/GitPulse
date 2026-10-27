@@ -70,6 +70,7 @@
 //! indistinguishable from the original. Without inodes (non-unix) the roots
 //! decide alone.
 
+use crate::ipc_error::CommandError;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -144,7 +145,7 @@ pub(crate) struct Identity {
 impl Identity {
     /// The identity of the trusted repository at `repo_path`. `Err` for one
     /// that is untrusted, unreadable, or has no commit (and so no root).
-    fn read(repo_path: &str) -> Result<Identity, String> {
+    fn read(repo_path: &str) -> Result<Identity, CommandError> {
         use crate::engine::git_cli;
         let repo = git_cli::validate_repo(repo_path)?;
         let roots: BTreeSet<String> = git_cli::git_text_with_timeout(
@@ -325,7 +326,7 @@ struct Recorded {
 
 /// What this process reads of the repository before it touches the ledger.
 struct Observed {
-    identity: Result<Identity, String>,
+    identity: Result<Identity, CommandError>,
     site: Option<Site>,
 }
 
@@ -1127,7 +1128,8 @@ fn reconcile(
 
     let identity = seen.identity.as_ref().map_err(|e| {
         mismatch(format!(
-            "this repository's identity could not be read ({e})"
+            "this repository's identity could not be read ({e})",
+            e = e.message()
         ))
     })?;
     let recorded = latest.as_ref().ok_or_else(|| {

@@ -23,6 +23,7 @@
 //! The only way to run a hook is [`run_repo_hooks`]; the loader and runner
 //! below it are private so no caller can skip the three steps.
 
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -52,12 +53,12 @@ pub struct WorktreeHooksConfig {
 }
 
 impl WorktreeHooksConfig {
-    fn commands(&self, hook_name: &str) -> Result<&[String], String> {
+    fn commands(&self, hook_name: &str) -> Result<&[String], CommandError> {
         match hook_name {
             "post_create" => Ok(&self.post_create),
             "pre_merge" => Ok(&self.pre_merge),
             "post_merge" => Ok(&self.post_merge),
-            other => Err(format!("Unknown worktree hook '{other}'")),
+            other => Err(format!("Unknown worktree hook '{other}'").into()),
         }
     }
 }
@@ -110,25 +111,24 @@ pub struct WorktreeHooksPreview {
 /// `Ok(None)` is "no hooks file". A file that cannot be read, is too large or
 /// does not parse is an error: it used to fall through to the other format or
 /// to no hooks, so a typo turned a team's pre-merge checks off without a word.
-fn read_hooks_file(repo_root: &Path) -> Result<Option<LoadedHooks>, String> {
+fn read_hooks_file(repo_root: &Path) -> Result<Option<LoadedHooks>, CommandError> {
     let dir = repo_root.join(".gitpulse");
     for (file, is_json) in [("hooks.json", true), ("hooks.toml", false)] {
         let path = dir.join(file);
         let meta = match fs::symlink_metadata(&path) {
             Ok(meta) => meta,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(format!("Cannot read .gitpulse/{file}: {e}")),
+            Err(e) => return Err(format!("Cannot read .gitpulse/{file}: {e}").into()),
         };
         if !meta.is_file() {
-            return Err(format!(
-                "Refusing .gitpulse/{file}: it is not a regular file"
-            ));
+            return Err(format!("Refusing .gitpulse/{file}: it is not a regular file").into());
         }
         if meta.len() > MAX_HOOKS_FILE_BYTES {
             return Err(format!(
                 "Refusing .gitpulse/{file}: {} bytes is over the {MAX_HOOKS_FILE_BYTES} byte limit",
                 meta.len()
-            ));
+            )
+            .into());
         }
         let content =
             fs::read_to_string(&path).map_err(|e| format!("Cannot read .gitpulse/{file}: {e}"))?;
@@ -137,7 +137,7 @@ fn read_hooks_file(repo_root: &Path) -> Result<Option<LoadedHooks>, String> {
         } else {
             parse_simple_toml_hooks(&content)
         }
-        .map_err(|e| format!("Invalid .gitpulse/{file}: {e}"))?;
+        .map_err(|e| e.wrap(|e| format!("Invalid .gitpulse/{file}: {e}")))?;
         for list in [&config.post_create, &config.pre_merge, &config.post_merge] {
             if list.len() > MAX_HOOK_COMMANDS
                 || list
@@ -146,7 +146,7 @@ fn read_hooks_file(repo_root: &Path) -> Result<Option<LoadedHooks>, String> {
             {
                 return Err(format!(
                     "Invalid .gitpulse/{file}: a hook lists more than {MAX_HOOK_COMMANDS} commands or a command over {MAX_HOOK_COMMAND_CHARS} characters"
-                ));
+                ).into());
             }
         }
         return Ok(Some(LoadedHooks {
@@ -163,14 +163,16 @@ fn read_hooks_file(repo_root: &Path) -> Result<Option<LoadedHooks>, String> {
 }
 
 /// Parses the JSON form: `{"worktree": {...}}` or the lists at the top level.
-fn parse_json_hooks(content: &str) -> Result<WorktreeHooksConfig, String> {
+fn parse_json_hooks(content: &str) -> Result<WorktreeHooksConfig, CommandError> {
     let value: serde_json::Value = serde_json::from_str(content).map_err(|e| e.to_string())?;
     let object = value.as_object().ok_or("expected a JSON object")?;
     let body = match object.get("worktree") {
         Some(inner) => inner.clone(),
         None => value.clone(),
     };
-    serde_json::from_value(body).map_err(|e| e.to_string())
+    serde_json::from_value(body)
+        .map_err(|e| e.to_string())
+        .map_err(CommandError::from)
 }
 
 /// Lightweight parser for simple `[worktree]` TOML configs without needing external toml crate.
@@ -179,7 +181,7 @@ fn parse_json_hooks(content: &str) -> Result<WorktreeHooksConfig, String> {
 /// basic (`"..."`, `\"` and `\\` escapes) and literal (`'...'`) strings. A commas
 /// inside a string belongs to the string. Anything else on a key it reads is
 /// an error rather than a guess.
-fn parse_simple_toml_hooks(content: &str) -> Result<WorktreeHooksConfig, String> {
+fn parse_simple_toml_hooks(content: &str) -> Result<WorktreeHooksConfig, CommandError> {
     let mut cfg = WorktreeHooksConfig::default();
     let mut current_section = "";
 
@@ -196,14 +198,14 @@ fn parse_simple_toml_hooks(content: &str) -> Result<WorktreeHooksConfig, String>
             continue;
         }
         let Some((key, val)) = trimmed.split_once('=') else {
-            return Err(format!("line {}: expected key = value", index + 1));
+            return Err(format!("line {}: expected key = value", index + 1).into());
         };
         let key = key.trim();
         if !matches!(key, "post_create" | "pre_merge" | "post_merge") {
             continue;
         }
         let items = parse_toml_strings(val.trim())
-            .map_err(|e| format!("line {}: {key}: {e}", index + 1))?;
+            .map_err(|e| e.wrap(|e| format!("line {}: {key}: {e}", index + 1)))?;
         match key {
             "post_create" => cfg.post_create = items,
             "pre_merge" => cfg.pre_merge = items,
@@ -215,7 +217,7 @@ fn parse_simple_toml_hooks(content: &str) -> Result<WorktreeHooksConfig, String>
 }
 
 /// One quoted string or a one-line array of them.
-fn parse_toml_strings(value: &str) -> Result<Vec<String>, String> {
+fn parse_toml_strings(value: &str) -> Result<Vec<String>, CommandError> {
     let mut chars = value.chars().peekable();
     let array = chars.peek() == Some(&'[');
     if array {
@@ -236,22 +238,24 @@ fn parse_toml_strings(value: &str) -> Result<Vec<String>, String> {
                 let mut text = String::new();
                 loop {
                     match chars.next() {
-                        None => return Err("unterminated string".to_string()),
+                        None => return Err("unterminated string".to_string().into()),
                         Some(c) if c == quote => break,
                         Some('\\') if quote == '"' => match chars.next() {
                             Some('"') => text.push('"'),
                             Some('\\') => text.push('\\'),
                             Some('n') => text.push('\n'),
                             Some('t') => text.push('\t'),
-                            Some(other) => return Err(format!("unsupported escape \\{other}")),
-                            None => return Err("unterminated string".to_string()),
+                            Some(other) => {
+                                return Err(format!("unsupported escape \\{other}").into())
+                            }
+                            None => return Err("unterminated string".to_string().into()),
                         },
                         Some(c) => text.push(c),
                     }
                 }
                 items.push(text);
             }
-            Some(other) => return Err(format!("expected a quoted string, found '{other}'")),
+            Some(other) => return Err(format!("expected a quoted string, found '{other}'").into()),
             None => {
                 if array {
                     return Err("unterminated array (multi-line arrays are not supported)".into());
@@ -269,13 +273,13 @@ fn parse_toml_strings(value: &str) -> Result<Vec<String>, String> {
             Some(',') => {}
             Some(']') => break,
             None => return Err("unterminated array (multi-line arrays are not supported)".into()),
-            Some(other) => return Err(format!("expected ',' or ']', found '{other}'")),
+            Some(other) => return Err(format!("expected ',' or ']', found '{other}'").into()),
         }
     }
     let rest: String = chars.collect();
     let rest = rest.trim();
     if !rest.is_empty() && !rest.starts_with('#') {
-        return Err(format!("unexpected text after the value: {rest}"));
+        return Err(format!("unexpected text after the value: {rest}").into());
     }
     Ok(items.into_iter().filter(|s| !s.trim().is_empty()).collect())
 }
@@ -291,16 +295,17 @@ struct Approval {
     content: String,
 }
 
-fn approval_store() -> Result<PathBuf, String> {
+fn approval_store() -> Result<PathBuf, CommandError> {
     crate::tool_config::default_config_dir()
         .map(|dir| dir.join(APPROVAL_DIR))
         .ok_or_else(|| "Cannot resolve GitPulse hook approval storage".to_string())
+        .map_err(CommandError::from)
 }
 
 /// The repository the approval is keyed to, and the record's file name in
 /// `store`. Keyed by the common git directory so a linked worktree and the
 /// main checkout agree.
-fn approval_slot(store: &Path, repo_root: &Path) -> Result<(String, PathBuf), String> {
+fn approval_slot(store: &Path, repo_root: &Path) -> Result<(String, PathBuf), CommandError> {
     let (_, common) = crate::repository_trust::git_directories(repo_root)?;
     let repository = common.to_string_lossy().into_owned();
     let name = format!(
@@ -313,7 +318,7 @@ fn approval_slot(store: &Path, repo_root: &Path) -> Result<(String, PathBuf), St
 /// Whether `loaded` is exactly what was approved for this repository. Any
 /// failure to read the record is "not approved": an unreadable approval never
 /// reads as consent.
-fn is_approved(store: &Path, repo_root: &Path, loaded: &LoadedHooks) -> Result<bool, String> {
+fn is_approved(store: &Path, repo_root: &Path, loaded: &LoadedHooks) -> Result<bool, CommandError> {
     let (repository, path) = approval_slot(store, repo_root)?;
     let Ok(text) = fs::read_to_string(&path) else {
         return Ok(false);
@@ -327,11 +332,16 @@ fn is_approved(store: &Path, repo_root: &Path, loaded: &LoadedHooks) -> Result<b
 }
 
 /// Shows the hooks file for the approval dialog. `None`: there is none.
-pub fn preview_worktree_hooks(repo_root: &Path) -> Result<Option<WorktreeHooksPreview>, String> {
+pub fn preview_worktree_hooks(
+    repo_root: &Path,
+) -> Result<Option<WorktreeHooksPreview>, CommandError> {
     preview_in(&approval_store()?, repo_root)
 }
 
-fn preview_in(store: &Path, repo_root: &Path) -> Result<Option<WorktreeHooksPreview>, String> {
+fn preview_in(
+    store: &Path,
+    repo_root: &Path,
+) -> Result<Option<WorktreeHooksPreview>, CommandError> {
     let Some(loaded) = read_hooks_file(repo_root)? else {
         return Ok(None);
     };
@@ -348,18 +358,19 @@ fn preview_in(store: &Path, repo_root: &Path) -> Result<Option<WorktreeHooksPrev
 /// person was looking at. The file is read again and must still be exactly
 /// that, or nothing is recorded: approving what was on screen, not whatever is
 /// on disk a moment later.
-pub fn approve_worktree_hooks(repo_root: &Path, shown: &str) -> Result<(), String> {
+pub fn approve_worktree_hooks(repo_root: &Path, shown: &str) -> Result<(), CommandError> {
     approve_in(&approval_store()?, repo_root, shown)
 }
 
-fn approve_in(store: &Path, repo_root: &Path, shown: &str) -> Result<(), String> {
+fn approve_in(store: &Path, repo_root: &Path, shown: &str) -> Result<(), CommandError> {
     crate::repository_trust::require(repo_root)?;
     let loaded = read_hooks_file(repo_root)?
         .ok_or("This repository has no .gitpulse/hooks file to approve")?;
     if loaded.content != shown {
         return Err(
             "The hooks file changed after it was shown; review the new content and approve again"
-                .to_string(),
+                .to_string()
+                .into(),
         );
     }
     let (repository, path) = approval_slot(store, repo_root)?;
@@ -372,7 +383,9 @@ fn approve_in(store: &Path, repo_root: &Path, shown: &str) -> Result<(), String>
     .map_err(|e| e.to_string())?;
     let staged = path.with_extension("json.tmp");
     fs::write(&staged, record).map_err(|e| format!("Cannot record hook approval: {e}"))?;
-    fs::rename(&staged, &path).map_err(|e| format!("Cannot record hook approval: {e}"))
+    fs::rename(&staged, &path)
+        .map_err(|e| format!("Cannot record hook approval: {e}"))
+        .map_err(CommandError::from)
 }
 
 /// The command gate as hooks are handed it: the repository and the argv
@@ -394,7 +407,7 @@ pub fn run_repo_hooks(
     worktree_dir: &Path,
     hook_name: &str,
     extra_env: &[(&str, &str)],
-) -> Result<HookOutcome, String> {
+) -> Result<HookOutcome, CommandError> {
     run_repo_hooks_with(
         &approval_store()?,
         repo_root,
@@ -414,7 +427,7 @@ fn run_repo_hooks_with(
     extra_env: &[(&str, &str)],
     gate: HookGate<'_>,
     timeout: std::time::Duration,
-) -> Result<HookOutcome, String> {
+) -> Result<HookOutcome, CommandError> {
     let Some(loaded) = read_hooks_file(repo_root)? else {
         return Ok(HookOutcome::default());
     };
@@ -478,7 +491,7 @@ fn execute_worktree_hooks_within(
     hook_name: &str,
     extra_env: &[(&str, &str)],
     timeout: std::time::Duration,
-) -> Result<Vec<HookExecutionResult>, String> {
+) -> Result<Vec<HookExecutionResult>, CommandError> {
     if commands.is_empty() {
         return Ok(Vec::new());
     }
@@ -526,9 +539,9 @@ fn execute_worktree_hooks_within(
         ) {
             Ok(out) => out,
             Err(e) => {
-                return Err(format!(
-                    "Hook '{hook_name}' command '{trimmed}' did not complete: {e}"
-                ));
+                return Err(e.wrap(|e| {
+                    format!("Hook '{hook_name}' command '{trimmed}' did not complete: {e}")
+                }));
             }
         };
 
@@ -555,7 +568,8 @@ fn execute_worktree_hooks_within(
                 "Hook '{hook_name}' command '{trimmed}' failed with exit code {:?}: {}",
                 Some(output.status_code),
                 results.last().map(|r| &r.stderr).unwrap_or(&String::new())
-            ));
+            )
+            .into());
         }
     }
 
@@ -585,7 +599,11 @@ mod tests {
         );
         let elapsed = started.elapsed();
         let err = result.expect_err("a hook past its deadline must fail");
-        assert!(err.contains("did not complete"), "{err}");
+        assert!(
+            err.contains("did not complete"),
+            "{err}",
+            err = err.message()
+        );
         assert!(
             elapsed < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(10)),
             "the hook ran {elapsed:?} against a 1s deadline"
@@ -619,7 +637,11 @@ mod tests {
             HOOK_TIMEOUT,
         )
         .expect_err("a failing hook fails");
-        assert!(failed.contains("Some(3)"), "{failed}");
+        assert!(
+            failed.contains("Some(3)"),
+            "{failed}",
+            failed = failed.message()
+        );
     }
 
     fn allow(_: &str, _: &[&str]) -> Result<(), String> {
@@ -631,7 +653,7 @@ mod tests {
         fs::write(repo.join(".gitpulse").join(name), content).unwrap();
     }
 
-    fn run(store: &Path, repo: &Path, gate: HookGate<'_>) -> Result<HookOutcome, String> {
+    fn run(store: &Path, repo: &Path, gate: HookGate<'_>) -> Result<HookOutcome, CommandError> {
         run_repo_hooks_with(
             store,
             repo,
@@ -693,7 +715,11 @@ mod tests {
         let store = tempdir().unwrap();
         write_hooks(repo.path(), "hooks.json", TOUCH);
         let err = approve_in(store.path(), repo.path(), r#"{"worktree":{}}"#).unwrap_err();
-        assert!(err.contains("changed after it was shown"), "{err}");
+        assert!(
+            err.contains("changed after it was shown"),
+            "{err}",
+            err = err.message()
+        );
         assert!(!is_approved_for_test(store.path(), repo.path()));
     }
 
@@ -737,7 +763,8 @@ mod tests {
         let err = run(store.path(), repo.path(), &gate).unwrap_err();
         assert!(
             err.contains("rm -rf everything") && err.contains("refused"),
-            "{err}"
+            "{err}",
+            err = err.message()
         );
         assert!(!repo.path().join("first.marker").exists());
         assert_eq!(
@@ -759,9 +786,17 @@ mod tests {
             "[worktree]\npost_create = [\"echo hi\"]\n",
         );
         let err = run(store.path(), repo.path(), &allow).unwrap_err();
-        assert!(err.contains("Invalid .gitpulse/hooks.json"), "{err}");
+        assert!(
+            err.contains("Invalid .gitpulse/hooks.json"),
+            "{err}",
+            err = err.message()
+        );
         let err = preview_in(store.path(), repo.path()).unwrap_err();
-        assert!(err.contains("Invalid .gitpulse/hooks.json"), "{err}");
+        assert!(
+            err.contains("Invalid .gitpulse/hooks.json"),
+            "{err}",
+            err = err.message()
+        );
     }
 
     /// A file over the bound is refused rather than read into an approval.
@@ -774,7 +809,7 @@ mod tests {
         );
         write_hooks(repo.path(), "hooks.json", &big);
         let err = read_hooks_file(repo.path()).unwrap_err();
-        assert!(err.contains("over the"), "{err}");
+        assert!(err.contains("over the"), "{err}", err = err.message());
     }
 
     /// The TOML reader split on every comma, cutting `a, b` inside one command

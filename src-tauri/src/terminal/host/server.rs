@@ -262,7 +262,7 @@ impl Host {
                         if !self.engine.lock_sessions().contains_key(&session) {
                             self.receipts.discard(&session);
                         }
-                        Err(error)
+                        Err(error.into_message())
                     }
                 }
             }

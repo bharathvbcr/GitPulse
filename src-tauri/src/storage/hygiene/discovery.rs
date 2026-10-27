@@ -1,4 +1,5 @@
 //! Bounded discovery across explicitly selected roots, including closed repos.
+use crate::ipc_error::CommandError;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +13,7 @@ pub struct Discovery {
     pub partial: bool,
 }
 
-pub fn roots(values: &[String], exclusions: bool) -> Result<Vec<PathBuf>, String> {
+pub fn roots(values: &[String], exclusions: bool) -> Result<Vec<PathBuf>, CommandError> {
     if values.len() > if exclusions { 128 } else { 16 } {
         return Err("Too many configured paths".into());
     }
@@ -84,7 +85,7 @@ pub fn discover(roots: &[PathBuf], excludes: &[PathBuf], cancel: &AtomicBool) ->
         if path.join(".git").try_exists().unwrap_or(true) {
             match path
                 .to_str()
-                .ok_or_else(|| "Non-UTF-8 repository".to_string())
+                .ok_or_else(|| CommandError::from("Non-UTF-8 repository"))
                 .and_then(crate::engine::git_cli::validate_repo)
             {
                 Ok(root) if same_discovered_repo(&root, &path) => {
@@ -99,7 +100,9 @@ pub fn discover(roots: &[PathBuf], excludes: &[PathBuf], cancel: &AtomicBool) ->
                 Err(e) => {
                     report.partial = true;
                     if report.issues.len() < 128 {
-                        report.issues.push(format!("{}: {e}", path.display()));
+                        report
+                            .issues
+                            .push(format!("{}: {}", path.display(), e.message()));
                     }
                 }
             }

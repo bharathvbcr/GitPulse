@@ -41,6 +41,7 @@ pub mod discovery;
 pub mod http;
 pub mod prompt;
 
+use crate::ipc_error::CommandError;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -483,7 +484,7 @@ fn test_url_is_trusted(url: &str) -> bool {
 fn resolve_target(
     selection: Option<AiSelection>,
     sweep: impl FnOnce() -> Vec<discovery::DiscoveredEndpoint>,
-) -> Result<Target, String> {
+) -> Result<Target, CommandError> {
     resolve_target_checked(selection, sweep, serves_selected_model)
 }
 
@@ -491,7 +492,7 @@ fn resolve_target_checked(
     selection: Option<AiSelection>,
     sweep: impl FnOnce() -> Vec<discovery::DiscoveredEndpoint>,
     check: impl FnOnce(&AiSelection) -> bool,
-) -> Result<Target, String> {
+) -> Result<Target, CommandError> {
     if let Some(selection) = usable_selection(selection) {
         if selection_still_served(&selection, check) {
             return Ok(Target::Confirmed(selection));
@@ -516,14 +517,14 @@ fn resolve_target_checked(
     }
 }
 
-fn unconfirmed_endpoint(base_url: &str, model: &str) -> String {
+fn unconfirmed_endpoint(base_url: &str, model: &str) -> CommandError {
     typed_unconfirmed(base_url, model, false)
 }
 
 /// The typed refusal. The model name comes from a listener nobody has vetted
 /// and is shown to the user, so control, bidi and zero-width characters are
 /// stripped and the length bounded before it reaches the message or the detail.
-fn typed_unconfirmed(base_url: &str, model: &str, stale: bool) -> String {
+fn typed_unconfirmed(base_url: &str, model: &str, stale: bool) -> CommandError {
     let identity = discovery::identify(base_url);
     let model = discovery::display_safe(model, discovery::MAX_NAME_CHARS);
     let message = if stale {
@@ -537,19 +538,17 @@ fn typed_unconfirmed(base_url: &str, model: &str, stale: bool) -> String {
             identity.label
         )
     };
-    crate::ipc_error::typed_text_with_detail(
-        crate::ipc_error::IpcErrorKind::AiEndpointUnconfirmed,
-        message,
-        serde_json::json!({
-            "base_url": base_url,
-            "model": model,
-            "runtime": identity.runtime,
-            "host": identity.host,
-            "port": identity.port,
-            "label": identity.label,
-            "stale": stale,
-        }),
-    )
+    let kind = crate::ipc_error::IpcErrorKind::AiEndpointUnconfirmed;
+    let detail = serde_json::json!({
+        "base_url": base_url,
+        "model": model,
+        "runtime": identity.runtime,
+        "host": identity.host,
+        "port": identity.port,
+        "label": identity.label,
+        "stale": stale,
+    });
+    CommandError::typed_with_detail(kind, message, detail)
 }
 
 /// One assembled request, before it goes out.
@@ -565,7 +564,7 @@ fn run(
     repo_path: &str,
     selection: Option<AiSelection>,
     build: impl Fn(usize) -> Result<Turn, String>,
-) -> Result<AiGeneration, String> {
+) -> Result<AiGeneration, CommandError> {
     let started = Instant::now();
     let mut warnings: Vec<String> = Vec::new();
     let feature_output_cap = feature.max_output_tokens();
@@ -583,7 +582,8 @@ fn run(
                 "No local model server is running. Tried: {}. Start Ollama, LM Studio, \
                  llama.cpp, vLLM or Jan, then try again.",
                 tried.join(", ")
-            ));
+            )
+            .into());
         }
     };
 
@@ -595,7 +595,8 @@ fn run(
                     return Err(format!(
                         "'{}' is an embedding model and cannot generate text. Choose a chat model.",
                         selection.model
-                    ));
+                    )
+                    .into());
                 }
                 let max_output = if info.max_output_tokens > 0 {
                     info.max_output_tokens.min(feature_output_cap)
@@ -942,7 +943,7 @@ const COMMIT_PATCH_CAP: usize = 2 * 1024 * 1024;
 /// Bytes, not text: Lappi's caller contract sends the context as bytes, so the
 /// exact output must survive to the request. Text consumers decode it with
 /// [`String::from_utf8_lossy`] at their own boundary.
-fn read_staged_patch(repo_path: &str) -> Result<(Vec<u8>, bool), String> {
+fn read_staged_patch(repo_path: &str) -> Result<(Vec<u8>, bool), CommandError> {
     let repo = validate_repo(repo_path)?;
     let (bytes, incomplete) = git_bytes_capped(
         &repo,
@@ -1002,7 +1003,7 @@ const BRANCH_DIFF_CAP: usize = 256 * 1024;
 /// The work in progress as one diff: staged, unstaged, and a header per
 /// untracked file (new files are most of what a fresh branch is about, and
 /// `git diff` never mentions them). Every read is capped.
-fn working_diff(repo_path: &str) -> Result<String, String> {
+fn working_diff(repo_path: &str) -> Result<String, CommandError> {
     let repo = validate_repo(repo_path)?;
     let diff = |args: &[&str]| git_text_capped(&repo, args, BRANCH_DIFF_CAP).map(|(text, _)| text);
     let staged = diff(&["diff", "--cached", "--no-color", "--no-ext-diff", "-U3"])?;
@@ -1029,7 +1030,7 @@ fn working_diff(repo_path: &str) -> Result<String, String> {
 pub fn generate_commit_message(
     repo_path: &str,
     selection: Option<AiSelection>,
-) -> Result<AiGeneration, String> {
+) -> Result<AiGeneration, CommandError> {
     generate_commit_message_with(repo_path, selection, || discovery::sweep(None))
 }
 
@@ -1039,7 +1040,7 @@ fn generate_commit_message_with(
     repo_path: &str,
     selection: Option<AiSelection>,
     sweep: impl FnOnce() -> Vec<discovery::DiscoveredEndpoint>,
-) -> Result<AiGeneration, String> {
+) -> Result<AiGeneration, CommandError> {
     let started = Instant::now();
     let (patch, patch_truncated) = read_staged_patch(repo_path)?;
     let diff = String::from_utf8_lossy(&patch).into_owned();
@@ -1089,19 +1090,21 @@ fn generate_commit_message_with(
     let mut draft = commit_brief::draft_change(
         &diff,
         staged_paths.as_deref(),
-        status_error.as_deref(),
+        status_error.as_ref().map(CommandError::message),
         &subjects,
         &branch,
         patch_truncated,
     );
     if let Some(error) = branch_error {
-        draft
-            .warnings
-            .push(format!("The current branch could not be read ({error})."));
+        draft.warnings.push(format!(
+            "The current branch could not be read ({error}).",
+            error = error.message()
+        ));
     }
     if let Some(error) = history_error {
         draft.warnings.push(format!(
-            "Recent commit subjects could not be read ({error})."
+            "Recent commit subjects could not be read ({error}).",
+            error = error.message()
         ));
     }
     // Only a draft the classifier could not type, and only with the user's
@@ -1189,7 +1192,8 @@ fn finish_with_local_model(
             draft,
             started,
             Some(&format!(
-                "The model could not be reached ({error}). The message was written from the patch."
+                "The model could not be reached ({}). The message was written from the patch.",
+                error.message()
             )),
         ),
     }
@@ -1281,7 +1285,7 @@ pub fn explain_commit(
     repo_path: &str,
     commit_id: &str,
     selection: Option<AiSelection>,
-) -> Result<AiGeneration, String> {
+) -> Result<AiGeneration, CommandError> {
     let details = GitReader::get_commit_details(repo_path, commit_id)?;
     // `.text` only: the AI budget already trims the diff to the model's
     // context, and a truncation notice inside the prompt would read as commit
@@ -1304,10 +1308,9 @@ pub fn explain_commit(
     })?;
     generation.text = prompt::strip_think_tags(&generation.text);
     if generation.text.is_empty() {
-        return Err(empty_reply_reason(
-            &generation,
-            "The model returned an empty explanation.",
-        ));
+        return Err(
+            empty_reply_reason(&generation, "The model returned an empty explanation.").into(),
+        );
     }
     if let Some(reason) = &diff_truncation_reason {
         // An explanation written from a prefix must not read as one written
@@ -1327,7 +1330,7 @@ pub fn explain_commit(
 pub fn suggest_branch_name(
     repo_path: &str,
     selection: Option<AiSelection>,
-) -> Result<AiGeneration, String> {
+) -> Result<AiGeneration, CommandError> {
     let diff = working_diff(repo_path)?;
     if diff.trim().is_empty() {
         return Err(
@@ -1347,10 +1350,9 @@ pub fn suggest_branch_name(
     })?;
     generation.text = prompt::clean_branch_name(&generation.text);
     if generation.text.is_empty() {
-        return Err(empty_reply_reason(
-            &generation,
-            "The model returned no usable branch name.",
-        ));
+        return Err(
+            empty_reply_reason(&generation, "The model returned no usable branch name.").into(),
+        );
     }
     Ok(generation)
 }
@@ -1364,7 +1366,7 @@ pub fn fix_health(
     repo_path: &str,
     report_text: &str,
     selection: Option<AiSelection>,
-) -> Result<AiGeneration, String> {
+) -> Result<AiGeneration, CommandError> {
     if report_text.trim().is_empty() {
         return Err("The health report is empty, so there is nothing to plan a fix for.".into());
     }
@@ -1391,7 +1393,7 @@ pub fn coverage_report(
     repo_path: &str,
     report_text: &str,
     selection: Option<AiSelection>,
-) -> Result<AiGeneration, String> {
+) -> Result<AiGeneration, CommandError> {
     if report_text.trim().is_empty() {
         return Err("The coverage report is empty, so there is nothing to analyze.".into());
     }
@@ -1421,8 +1423,8 @@ pub fn coverage_report(
 /// second completion is also empty.
 fn run_advisory_with_empty_retry(
     answer_name: &str,
-    mut generate: impl FnMut(bool) -> Result<AiGeneration, String>,
-) -> Result<AiGeneration, String> {
+    mut generate: impl FnMut(bool) -> Result<AiGeneration, CommandError>,
+) -> Result<AiGeneration, CommandError> {
     let mut prior_warnings = Vec::new();
     let mut ended_in_reasoning = false;
     for retry in [false, true] {
@@ -1449,11 +1451,13 @@ fn run_advisory_with_empty_retry(
     if ended_in_reasoning {
         return Err(format!(
             "{REPLY_ENDED_IN_REASONING} GitPulse retried once for the {answer_name}."
-        ));
+        )
+        .into());
     }
     Err(format!(
         "The model returned an empty {answer_name} twice; GitPulse stopped after one bounded retry."
-    ))
+    )
+    .into())
 }
 
 fn append_visible_answer_retry(system: &mut String, retry: bool) {
@@ -1770,7 +1774,11 @@ mod tests {
             }),
         )
         .expect_err("empty stage must refuse");
-        assert!(error.contains("Nothing is staged"), "{error}");
+        assert!(
+            error.contains("Nothing is staged"),
+            "{error}",
+            error = error.message()
+        );
     }
 
     /// A loopback server that answers every request, listing one model on GET
@@ -2124,11 +2132,19 @@ mod tests {
             Ok(generation)
         })
         .expect_err("both attempts are reasoning only");
-        assert!(err.starts_with(REPLY_ENDED_IN_REASONING), "{err}");
+        assert!(
+            err.message().starts_with(REPLY_ENDED_IN_REASONING),
+            "{err}",
+            err = err.message()
+        );
         // A plainly empty reply keeps the generic reason.
         let err = run_advisory_with_empty_retry("coverage analysis", |_| Ok(empty_generation()))
             .expect_err("both attempts are empty");
-        assert!(err.contains("empty coverage analysis twice"), "{err}");
+        assert!(
+            err.contains("empty coverage analysis twice"),
+            "{err}",
+            err = err.message()
+        );
     }
 
     fn empty_generation() -> AiGeneration {

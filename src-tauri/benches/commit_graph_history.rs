@@ -275,7 +275,7 @@ fn operations(size: usize, main_oid: &str) -> Vec<(&'static str, Vec<String>)> {
 fn run(repo: &Path, argv: &[String]) -> String {
     let args: Vec<&str> = argv.iter().map(String::as_str).collect();
     git_text(repo, &args)
-        .unwrap_or_else(|e| panic!("git {argv:?} failed in {}: {e}", repo.display()))
+        .unwrap_or_else(|e| panic!("git {argv:?} failed in {}: {}", repo.display(), e.message()))
 }
 
 fn main() {

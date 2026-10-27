@@ -2,6 +2,7 @@
 //! regression test of the break it found.
 
 use super::*;
+use crate::ipc_error::CommandError;
 use crate::procguard::LockedSpawn;
 use crate::storage::commit_graph::CommitGraphState;
 use crate::test_support::{git_in, git_repo};
@@ -11,7 +12,7 @@ fn text(path: &Path) -> String {
     path.to_str().unwrap().to_string()
 }
 
-fn click(repo: &str, confirmed: &[String]) -> Result<CommitGraphWriteOutcome, String> {
+fn click(repo: &str, confirmed: &[String]) -> Result<CommitGraphWriteOutcome, CommandError> {
     crate::engine::git_cli::mark_user_action(repo);
     GitWriter::commit_graph_write(repo, confirmed)
 }
@@ -84,9 +85,21 @@ fn adv_a_foreign_lock_taken_after_the_snapshot_is_not_swept() {
         "a lock another git process created after the snapshot was removed"
     );
     let message = result.unwrap_err();
-    assert!(message.contains("A lock file remains"), "{message}");
-    assert!(message.contains(&lock.display().to_string()), "{message}");
-    assert!(message.contains("GitPulse never removes"), "{message}");
+    assert!(
+        message.contains("A lock file remains"),
+        "{message}",
+        message = message.message()
+    );
+    assert!(
+        message.contains(&lock.display().to_string()),
+        "{message}",
+        message = message.message()
+    );
+    assert!(
+        message.contains("GitPulse never removes"),
+        "{message}",
+        message = message.message()
+    );
 }
 
 /// A partial clone: `--reachable --changed-paths` reads trees, and without
@@ -227,7 +240,11 @@ fn adv_config_posture_holds() {
     let (_a, off) = repo_with(&|p| git_in(p, &["config", "core.commitGraph", "false"]));
     let refused =
         GitWriter::commit_graph_write_plan(&text(&off)).expect_err("core.commitGraph=false");
-    assert!(refused.contains("Unknown"), "{refused}");
+    assert!(
+        refused.contains("Unknown"),
+        "{refused}",
+        refused = refused.message()
+    );
     let (_b, shallow) = repo_with(&|p| std::fs::write(p.join(".git/shallow"), "").unwrap());
     assert!(GitWriter::commit_graph_write_plan(&text(&shallow)).is_err());
     let (_c, fetchy) = repo_with(&|p| git_in(p, &["config", "fetch.writeCommitGraph", "true"]));

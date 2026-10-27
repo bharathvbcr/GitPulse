@@ -674,7 +674,10 @@ pub fn inspect(repo: &Path, git_dir: &Path, common_dir: &Path) -> CommitGraphRep
         Err(why) => {
             return CommitGraphReport::unknown(
                 CommitGraphLayout::None,
-                format!("could not read git config, which may switch the graph off: {why}"),
+                format!(
+                    "could not read git config, which may switch the graph off: {why}",
+                    why = why.message()
+                ),
             )
         }
     };

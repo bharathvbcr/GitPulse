@@ -7,6 +7,7 @@
 use super::parse::{
     Envelope, RawFinding, ScanCompleteness, SecretFinding, SecretLocation, SecretsReport,
 };
+use crate::ipc_error::CommandError;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path};
 
@@ -41,7 +42,7 @@ impl GitView {
 /// seam; either failing makes the whole view unavailable rather than half
 /// right, because a missing ignore list would turn every ignored file into a
 /// confident "untracked".
-pub(crate) fn git_view(repo: &Path) -> Result<GitView, String> {
+pub(crate) fn git_view(repo: &Path) -> Result<GitView, CommandError> {
     use crate::engine::git_cli::git;
     let tracked = git(repo, &["ls-files", "-z", "--cached"])?;
     let ignored = git(

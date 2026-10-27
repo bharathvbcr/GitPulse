@@ -22,6 +22,7 @@
 
 use super::intake::resolve;
 use super::WorkbenchError;
+use crate::ipc_error::CommandError;
 use dc_store::Store;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -168,7 +169,7 @@ pub(crate) fn check(store: &Store, item_id: &str, repository_identity: &str) -> 
 }
 
 /// HEAD of the worktree a verification was taken in, as it is now.
-pub(crate) fn current_head(worktree: &str) -> Result<String, String> {
+pub(crate) fn current_head(worktree: &str) -> Result<String, CommandError> {
     // The driver asks this of every held card every sweep, and the board asks
     // it per card on every refresh. HEAD is a function of HEAD and the ref it
     // names, which a symref may place in any namespace (`refs/remotes/...`), so
@@ -187,7 +188,7 @@ fn judge(
     record: &Record,
     item_id: &str,
     repository_identity: &str,
-    head_of: &dyn Fn(&str) -> Result<String, String>,
+    head_of: &dyn Fn(&str) -> Result<String, CommandError>,
 ) -> Gate {
     let verdict = summarize(record);
     if record.item_id != item_id {
@@ -236,7 +237,7 @@ fn judge(
     }
     match head_of(&record.worktree) {
         Err(error) => Gate::Held(format!(
-            "the head of the verified worktree could not be read, so the verdict cannot be tied to the work: {error}"
+            "the head of the verified worktree could not be read, so the verdict cannot be tied to the work: {error}", error = error.message()
         )),
         Ok(head) if head != record.head => Gate::Held(format!(
             "verification passed for {} but the worktree is now at {}; the work changed after it was verified. Verify again",
@@ -350,7 +351,10 @@ pub(crate) fn start_params(input: &str) -> Result<Value, WorkbenchError> {
         None => current_head(&parsed.worktree).map_err(|e| {
             WorkbenchError::new(
                 "repository_unavailable",
-                format!("The worktree's head could not be read: {e}"),
+                format!(
+                    "The worktree's head could not be read: {e}",
+                    e = e.message()
+                ),
             )
         })?,
     };

@@ -193,11 +193,11 @@ pub fn run() {
                 || match repository_trust::persistent_root() {
                     Ok(root) => {
                         if let Err(error) = repository_trust::migrate_store(&root) {
-                            log::warn!(target: "trust", "repository trust migration failed: {error}");
+                            log::warn!(target: "trust", "repository trust migration failed: {error}", error = error.message());
                         }
                     }
                     Err(error) => {
-                        log::warn!(target: "trust", "repository trust migration skipped: {error}");
+                        log::warn!(target: "trust", "repository trust migration skipped: {error}", error = error.message());
                     }
                 })
             {
@@ -222,7 +222,7 @@ pub fn run() {
                                 log::warn!(target: "setup", "the cleaner LaunchAgent started {registered:?}; it now starts this app");
                             }
                             Ok(_) => {}
-                            Err(error) => log::warn!(target: "setup", "cleaner LaunchAgent check: {error}"),
+                            Err(error) => log::warn!(target: "setup", "cleaner LaunchAgent check: {error}", error = error.message()),
                         }
                         desktop::launch_agent::refresh_autostart(&name, || {
                             handle.autolaunch().enable().map_err(|e| e.to_string())
@@ -312,7 +312,7 @@ pub fn run() {
             crate::tool_install::set_app_handle(app.handle().clone());
             crate::devmap::set_build_progress_handle(app.handle().clone());
             if let Err(error) = storage::hygiene::global::start_scheduler() {
-                log::error!("Cleaner scheduler failed to start: {error}");
+                log::error!("Cleaner scheduler failed to start: {error}", error = error.message());
             }
             if let Err(e) = desktop::install_menu(app.handle()) {
                 log::error!(target: "setup", "menu installation failed: {e}");

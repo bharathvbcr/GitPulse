@@ -1,4 +1,5 @@
 use super::*;
+use crate::ipc_error::CommandError;
 use crate::procguard::LockedSpawn;
 
 /// `git init` + one commit, plus an untracked file on disk.
@@ -206,8 +207,8 @@ fn a_read_shed_under_memory_pressure_reaches_the_frontend_as_a_deferral() {
 }
 
 /// The commit graph walks history on a scoped helper thread, so the gate's
-/// refusal is written there, not on the command's thread. The read is still
-/// asked again: the helper's record is handed back at the join.
+/// refusal is raised there, not on the command's thread. The read is still
+/// asked again: the refusal crosses the join inside the error, with its kind.
 #[test]
 fn a_commit_graph_walk_shed_on_its_helper_thread_reaches_the_frontend_as_a_deferral() {
     use crate::sysload::{GovernorInput, Level};
@@ -229,8 +230,8 @@ fn a_commit_graph_walk_shed_on_its_helper_thread_reaches_the_frontend_as_a_defer
 }
 
 /// The engine wraps some runner failures in its own words (`Blame
-/// unavailable: ...`). The read is still asked again: the gate's refusal was
-/// recorded on this command's thread.
+/// unavailable: ...`). The read is still asked again: the wrapped error keeps
+/// the gate's refusal as its origin.
 #[test]
 fn a_wrapped_read_shed_under_memory_pressure_still_reaches_the_frontend_as_a_deferral() {
     use crate::sysload::{GovernorInput, Level};
@@ -278,7 +279,7 @@ fn a_clicked_file_write_is_judged_under_memory_pressure() {
     let root = dir.path().to_string_lossy().to_string();
     let _pressed = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Critical));
     let unpromoted = crate::engine::git_cli::run_command_scope(|| {
-        crate::harness::guard_file(&root, "README.md", "modify")
+        crate::harness::guard_file(&root, "README.md", "modify").map_err(CommandError::from)
     });
     assert!(
         unpromoted
@@ -287,8 +288,9 @@ fn a_clicked_file_write_is_judged_under_memory_pressure() {
             .is_some_and(|e| e.contains("memory pressure")),
         "the lookup this guards against is shed when unpromoted: {unpromoted:?}"
     );
-    let clicked =
-        crate::engine::git_cli::run_command_scope(|| guard_file(&root, "README.md", "modify"));
+    let clicked = crate::engine::git_cli::run_command_scope(|| {
+        guard_file(&root, "README.md", "modify").map_err(CommandError::from)
+    });
     assert!(
         clicked.is_ok(),
         "a save was refused under pressure: {:?}",
@@ -666,7 +668,11 @@ fn rebase_planned_commands_refuses_empty_steps_and_invalid_oids() {
         }],
     )
     .unwrap_err();
-    assert!(err.contains("Invalid revision"), "{err}");
+    assert!(
+        err.contains("Invalid revision"),
+        "{err}",
+        err = err.message()
+    );
 }
 
 /// The restack upstream resolver finds the fork point (here: where feature
@@ -703,7 +709,11 @@ fn restack_honours_a_caller_supplied_fork_point_and_refuses_a_stale_one() {
     // repository and the restack must not proceed on a widened range.
     let err = GitWriter::prepare_restack(&canon, "feature", "main", Some(c_a.as_str()))
         .expect_err("a non-ancestor fork point must be refused");
-    assert!(err.contains("no longer the stack on disk"), "{err}");
+    assert!(
+        err.contains("no longer the stack on disk"),
+        "{err}",
+        err = err.message()
+    );
 
     // Anything that is not an object id is refused before it reaches argv.
     assert!(GitWriter::prepare_restack(&canon, "feature", "main", Some("--exec=boom")).is_err());
@@ -743,7 +753,8 @@ fn a_worktree_summary_whose_reads_failed_is_an_error_not_clean() {
     let error = failed.expect_err("no read answered, so there is no summary");
     assert!(
         error.contains("forced by test"),
-        "the cause is named: {error}"
+        "the cause is named: {error}",
+        error = error.message()
     );
 }
 
@@ -787,7 +798,11 @@ fn many_task_scopes_authenticate_the_repository_once() {
         .map(|n| format!("T{n}"))
         .collect();
     let error = super::task_scopes(path, &too_many).expect_err("over the limit");
-    assert!(error.contains("the limit is 64"), "{error}");
+    assert!(
+        error.contains("the limit is 64"),
+        "{error}",
+        error = error.message()
+    );
 }
 
 #[test]
@@ -1917,7 +1932,7 @@ fn the_kept_pass_follows_force_moves_deletes_twins_and_packed_refs() {
     crate::engine::ref_cache::eager(|| {
         let check = |step: &str| {
             let got = stack_hierarchy(path, FIXTURE_WINDOW, StackWalkBudget::PRODUCTION)
-                .unwrap_or_else(|e| panic!("{step}: {e}"));
+                .unwrap_or_else(|e| panic!("{step}: {e}", e = e.message()));
             let want = per_branch_oracle(&repo, FIXTURE_WINDOW, GitReader::MAX_HISTORY_COMMITS);
             assert_eq!(tree_of(&got), want, "{step}");
         };

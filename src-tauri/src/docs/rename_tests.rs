@@ -1520,7 +1520,10 @@ fn adversarial_random_vaults_keep_every_link_or_report_it() {
         let outcome = match rename_doc(path, &from, &to, |_| Ok(())) {
             Ok(o) => o,
             Err(e) => {
-                failures.push(format!("seed {seed}: {from} -> {to}: rename refused: {e}"));
+                failures.push(format!(
+                    "seed {seed}: {from} -> {to}: rename refused: {e}",
+                    e = e.message()
+                ));
                 continue;
             }
         };
@@ -1795,7 +1798,8 @@ fn adversarial_moving_onto_a_name_that_already_has_a_sibling_stem_keeps_links() 
     let refused = rename_doc(path, "docs/A.md", "docs/B.md", |_| Ok(())).unwrap_err();
     assert!(
         refused.contains("shares its link name") && refused.contains("docs/B.mdx"),
-        "{refused}"
+        "{refused}",
+        refused = refused.message()
     );
     assert!(dir.path().join("docs/A.md").exists());
     assert!(!dir.path().join("docs/B.md").exists());
@@ -1818,7 +1822,8 @@ fn a_sibling_whose_own_name_holds_a_percent_escape_still_blocks_the_move() {
     let refused = rename_doc(path, "docs/A.md", "docs/100%41.md", |_| Ok(())).unwrap_err();
     assert!(
         refused.contains("shares its link name") && refused.contains("docs/100%41.mdx"),
-        "{refused}"
+        "{refused}",
+        refused = refused.message()
     );
     assert!(dir.path().join("docs/A.md").exists());
     assert_eq!(read(&dir, "docs/L.md"), "[[docs/100%41]] and [[A]]\n");

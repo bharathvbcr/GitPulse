@@ -3,6 +3,7 @@ use gitpulse_lib::diff::{
     ConflictResolutionChoice,
 };
 use gitpulse_lib::engine::git_cli::{git, git_with_stdin};
+use gitpulse_lib::ipc_error::CommandError;
 // Only the macOS extended-attribute test spawns.
 #[cfg(target_os = "macos")]
 use gitpulse_lib::procguard::LockedSpawn;
@@ -43,7 +44,7 @@ fn fixture_with_format(format: &str) -> TempDir {
 fn load(dir: &TempDir) -> ConflictSnapshot {
     conflict_session::snapshot(dir.path().to_str().unwrap(), "file").unwrap()
 }
-fn save(dir: &TempDir, captured: &ConflictSnapshot) -> Result<(), String> {
+fn save(dir: &TempDir, captured: &ConflictSnapshot) -> Result<(), CommandError> {
     let repo = dir.path().to_str().unwrap();
     let result = conflict_session::save(
         repo,
@@ -56,7 +57,7 @@ fn save(dir: &TempDir, captured: &ConflictSnapshot) -> Result<(), String> {
     if result.staged {
         Ok(())
     } else {
-        Err(result.message)
+        Err(result.message.into())
     }
 }
 
@@ -152,7 +153,7 @@ fn choose(
     dir: &TempDir,
     file: &str,
     choice: ConflictFileChoice,
-) -> Result<conflict_session::ConflictSaveOutcome, String> {
+) -> Result<conflict_session::ConflictSaveOutcome, CommandError> {
     let repo = dir.path().to_str().unwrap();
     let snap = conflict_session::snapshot(repo, file)?;
     conflict_session::save(

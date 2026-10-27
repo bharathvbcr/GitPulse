@@ -1,6 +1,7 @@
 //! App-wide policy, durable scheduling, bounded runs and shared UI state.
 //! No UI timer owns deletion; the native worker survives page changes.
 use super::{discovery, tree};
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Read;
@@ -48,7 +49,7 @@ impl Default for CleanerConfig {
     }
 }
 impl CleanerConfig {
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), CommandError> {
         if self.version != VERSION {
             return Err("Unsupported cleaner policy version".into());
         }
@@ -189,14 +190,14 @@ impl Cleaner {
             state_after_read: None,
         }
     }
-    fn activity(&self, path: &Path) -> Result<(), String> {
+    fn activity(&self, path: &Path) -> Result<(), CommandError> {
         #[cfg(test)]
         if let Some(check) = self.activity_override {
-            return check(path);
+            return check(path).map_err(CommandError::from);
         }
         super::activity_check(path)
     }
-    fn ensure_dir(&self) -> Result<(), String> {
+    fn ensure_dir(&self) -> Result<(), CommandError> {
         // Refuse existing symlink ancestors before creating app-owned state.
         for ancestor in self.dir.ancestors() {
             if ancestor.try_exists().map_err(|e| e.to_string())? {
@@ -205,9 +206,9 @@ impl Cleaner {
             }
         }
         fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
-        tree::no_symlinks(&self.dir)
+        tree::no_symlinks(&self.dir).map_err(CommandError::from)
     }
-    fn open_lock(&self, name: &str) -> Result<File, String> {
+    fn open_lock(&self, name: &str) -> Result<File, CommandError> {
         self.ensure_dir()?;
         let path = self.dir.join(name);
         if path.try_exists().map_err(|e| e.to_string())? {
@@ -226,17 +227,17 @@ impl Cleaner {
         }
         Ok(file)
     }
-    fn lock(&self, name: &str) -> Result<CleanerLock, String> {
+    fn lock(&self, name: &str) -> Result<CleanerLock, CommandError> {
         let file = self.open_lock(name)?;
         file.try_lock()
             .map_err(|e| format!("Cleaner is busy or its lock is unavailable: {e}"))?;
         Ok(CleanerLock(file))
     }
-    fn read(&self) -> Result<Saved, String> {
+    fn read(&self) -> Result<Saved, CommandError> {
         let path = self.dir.join("state.json");
         match fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Saved::default()),
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(e.to_string().into()),
             Ok(m) if !m.is_file() || m.len() > MAX_STATE_BYTES => {
                 return Err("Cleaner state is not a bounded regular file".into())
             }
@@ -265,7 +266,10 @@ impl Cleaner {
         }
         Ok(saved)
     }
-    fn update<T>(&self, edit: impl FnOnce(&mut Saved) -> Result<T, String>) -> Result<T, String> {
+    fn update<T>(
+        &self,
+        edit: impl FnOnce(&mut Saved) -> Result<T, CommandError>,
+    ) -> Result<T, CommandError> {
         let _lock = self.lock("state.lock")?;
         let mut saved = self.read()?;
         let result = edit(&mut saved)?;
@@ -277,7 +281,7 @@ impl Cleaner {
             .map_err(|e| e.to_string())?;
         Ok(result)
     }
-    pub fn state(&self) -> Result<CleanerState, String> {
+    pub fn state(&self) -> Result<CleanerState, CommandError> {
         // Establish run ownership before reading history. An idle observation
         // holds the lease through the snapshot so a worker cannot start behind
         // it. A busy observation may briefly show a just-completed run as busy,
@@ -290,7 +294,7 @@ impl Cleaner {
                 Ok(()) => Some(CleanerLock(file)),
                 Err(std::fs::TryLockError::WouldBlock) => None,
                 Err(std::fs::TryLockError::Error(error)) => {
-                    return Err(format!("Run lock is unavailable: {error}"));
+                    return Err(format!("Run lock is unavailable: {error}").into());
                 }
             }
         };
@@ -319,7 +323,7 @@ impl Cleaner {
             agent_rules: devmap_query::hygiene::AGENT_RULES.into(),
         })
     }
-    pub fn save(&self, config: CleanerConfig) -> Result<CleanerState, String> {
+    pub fn save(&self, config: CleanerConfig) -> Result<CleanerState, CommandError> {
         if config.enabled && config.run_when_closed && !super::background::supported() {
             return Err(
                 "Closed-app scheduling requires an installed macOS application bundle".into(),
@@ -330,8 +334,8 @@ impl Cleaner {
     fn save_with_background(
         &self,
         mut config: CleanerConfig,
-        configure: impl FnOnce(bool) -> Result<(), String>,
-    ) -> Result<CleanerState, String> {
+        configure: impl FnOnce(bool) -> Result<(), CommandError>,
+    ) -> Result<CleanerState, CommandError> {
         let _settings_lock = self.lock("settings.lock")?;
         config.validate()?;
         config.roots = discovery::roots(&config.roots, false)?
@@ -379,13 +383,13 @@ impl Cleaner {
                 // Never show an active schedule after registration failed. A
                 // leftover launchd job can only read this disabled authority.
                 self.update(|saved| {
-                    saved.background_error = Some(error.clone());
+                    saved.background_error = Some(error.message().to_string());
                     Ok(())
                 })?;
                 self.stop_current()?;
-                return Err(format!(
-                    "Schedule disabled because background setup failed: {error}"
-                ));
+                return Err(error.wrap(|error| {
+                    format!("Schedule disabled because background setup failed: {error}")
+                }));
             }
             self.update(|saved| {
                 if saved.config.revision != config.revision {
@@ -402,7 +406,7 @@ impl Cleaner {
         }
         self.state()
     }
-    fn stop_current(&self) -> Result<(), String> {
+    fn stop_current(&self) -> Result<(), CommandError> {
         self.cancel.store(true, Ordering::SeqCst);
         if let Some((repo, id)) = self
             .current
@@ -414,7 +418,7 @@ impl Cleaner {
         }
         Ok(())
     }
-    pub fn cancel(&self) -> Result<CleanerState, String> {
+    pub fn cancel(&self) -> Result<CleanerState, CommandError> {
         self.stop_current()?;
         self.update(|saved| {
             if let Some(run) = saved.history.first().filter(|r| r.finished_at == 0) {
@@ -425,7 +429,7 @@ impl Cleaner {
         self.stop_current()?;
         self.state()
     }
-    fn still_authorized(&self, config: &CleanerConfig, id: &str) -> Result<(), String> {
+    fn still_authorized(&self, config: &CleanerConfig, id: &str) -> Result<(), CommandError> {
         if self.cancel.load(Ordering::SeqCst) {
             return Err("Cleanup cancelled".into());
         }
@@ -435,7 +439,7 @@ impl Cleaner {
         }
         Ok(())
     }
-    pub fn inventory(&self) -> Result<CleanerInventory, String> {
+    pub fn inventory(&self) -> Result<CleanerInventory, CommandError> {
         if self.scanning.swap(true, Ordering::SeqCst) {
             return Err("Global inventory is already running".into());
         }
@@ -447,7 +451,7 @@ impl Cleaner {
         let config = self.state()?.config;
         self.inspect(&config)
     }
-    fn inspect(&self, config: &CleanerConfig) -> Result<CleanerInventory, String> {
+    fn inspect(&self, config: &CleanerConfig) -> Result<CleanerInventory, CommandError> {
         let roots = discovery::roots(&config.roots, false)?;
         let excludes = discovery::roots(&config.exclusions, true)?;
         let found = discovery::discover(&roots, &excludes, &self.cancel);
@@ -522,7 +526,9 @@ impl Cleaner {
                 Err(e) => {
                     result.partial = true;
                     if result.issues.len() < 128 {
-                        result.issues.push(format!("{repo_path}: {e}"));
+                        result
+                            .issues
+                            .push(format!("{repo_path}: {e}", e = e.message()));
                     }
                 }
             }
@@ -541,7 +547,7 @@ impl Cleaner {
         scheduled: bool,
         revision: u64,
         now: u64,
-    ) -> Result<CleanerState, String> {
+    ) -> Result<CleanerState, CommandError> {
         if !cfg!(unix) {
             return Err("Cleanup is unavailable on this platform".into());
         }
@@ -590,7 +596,7 @@ impl Cleaner {
                             .is_err()
                         {
                             if let Err(e) = watched.stop_current() {
-                                log::error!("Could not stop revoked cleanup: {e}");
+                                log::error!("Could not stop revoked cleanup: {e}", e = e.message());
                             }
                             break;
                         }
@@ -608,7 +614,7 @@ impl Cleaner {
                         outcome
                     }
                 }
-                Err(e) => Err(format!("Cancellation monitor unavailable: {e}")),
+                Err(e) => Err(format!("Cancellation monitor unavailable: {e}").into()),
             };
             if let Err(error) = outcome {
                 run.status = if service.cancel.load(Ordering::SeqCst) {
@@ -618,12 +624,12 @@ impl Cleaner {
                 }
                 .into();
                 if run.issues.len() < 128 {
-                    run.issues.push(error);
+                    run.issues.push(error.into_message());
                 }
             }
             run.finished_at = super::now();
             if let Err(e) = service.record(&run) {
-                log::error!("Cleaner history could not be saved: {e}");
+                log::error!("Cleaner history could not be saved: {e}", e = e.message());
             }
         })
         .map_err(|e| {
@@ -635,14 +641,17 @@ impl Cleaner {
                 }
                 Ok(())
             }) {
-                log::error!("Cleaner dispatch failure could not be saved: {failure}");
+                log::error!(
+                    "Cleaner dispatch failure could not be saved: {failure}",
+                    failure = failure.message()
+                );
             }
             e.to_string()
         })?;
         std::mem::forget(reservation);
         self.state()
     }
-    fn record(&self, run: &CleanerRun) -> Result<(), String> {
+    fn record(&self, run: &CleanerRun) -> Result<(), CommandError> {
         self.update(|saved| {
             let stored = saved
                 .history
@@ -653,7 +662,7 @@ impl Cleaner {
             Ok(())
         })
     }
-    fn perform(&self, config: &CleanerConfig, run: &mut CleanerRun) -> Result<(), String> {
+    fn perform(&self, config: &CleanerConfig, run: &mut CleanerRun) -> Result<(), CommandError> {
         self.perform_with_gate(config, run, |repo, argv, path| {
             if let Some(argv) = argv {
                 crate::harness::guard_command(
@@ -669,8 +678,8 @@ impl Cleaner {
         &self,
         config: &CleanerConfig,
         run: &mut CleanerRun,
-        mut gate: impl FnMut(&str, Option<&[String]>, &str) -> Result<(), String>,
-    ) -> Result<(), String> {
+        mut gate: impl FnMut(&str, Option<&[String]>, &str) -> Result<(), CommandError>,
+    ) -> Result<(), CommandError> {
         self.still_authorized(config, &run.id)?;
         let inventory = self.inspect(config)?;
         run.repositories = inventory.repositories;
@@ -747,11 +756,11 @@ impl Cleaner {
                 row.message = out.message;
                 row.bytes_before = out.bytes_before;
                 row.bytes_after = out.bytes_after;
-                Ok::<(), String>(())
+                Ok::<(), String>(()).map_err(CommandError::from)
             })();
             if let Err(e) = action {
                 row.status = "skipped".into();
-                row.message = e;
+                row.message = e.into_message();
             }
             if let Some(last) = run
                 .items
@@ -781,7 +790,7 @@ impl Cleaner {
     }
 }
 
-fn quiet_repo(repo: &str) -> Result<(), String> {
+fn quiet_repo(repo: &str) -> Result<(), CommandError> {
     let root = crate::engine::git_cli::validate_repo(repo)?;
     let status = crate::engine::git_cli::git_with_stdin(
         &root,
@@ -800,10 +809,7 @@ fn quiet_repo(repo: &str) -> Result<(), String> {
     }
     let tasks = crate::tasks::view(repo);
     if !tasks.error.is_empty() {
-        return Err(format!(
-            "Task activity could not be checked: {}",
-            tasks.error
-        ));
+        return Err(format!("Task activity could not be checked: {}", tasks.error).into());
     }
     if !tasks.leases.is_empty() {
         return Err("Repository has active task leases".into());
@@ -811,7 +817,7 @@ fn quiet_repo(repo: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn mutation_lock() -> Result<CleanerLock, String> {
+pub(super) fn mutation_lock() -> Result<CleanerLock, CommandError> {
     service()?.lock("mutation.lock")
 }
 
@@ -819,7 +825,7 @@ pub fn current_time() -> u64 {
     super::now()
 }
 
-pub fn service() -> Result<&'static Arc<Cleaner>, String> {
+pub fn service() -> Result<&'static Arc<Cleaner>, CommandError> {
     let dir = crate::tool_config::default_config_dir()
         .ok_or("Application config directory unavailable")?
         .join("hygiene");
@@ -829,7 +835,7 @@ pub fn service() -> Result<&'static Arc<Cleaner>, String> {
     Ok(SERVICE.get_or_init(|| Arc::new(Cleaner::new(dir))))
 }
 
-pub fn start_scheduler() -> Result<(), String> {
+pub fn start_scheduler() -> Result<(), CommandError> {
     let cleaner = Arc::clone(service()?);
     if SCHEDULER_STARTED.swap(true, Ordering::SeqCst) {
         return Ok(());
@@ -844,11 +850,11 @@ pub fn start_scheduler() -> Result<(), String> {
                     && super::now() >= state.config.next_run_at =>
             {
                 if let Err(e) = cleaner.start(true, state.config.revision, super::now()) {
-                    log::warn!("Scheduled cleaner could not start: {e}");
+                    log::warn!("Scheduled cleaner could not start: {e}", e = e.message());
                 }
             }
             Ok(_) => {}
-            Err(e) => log::warn!("Cleaner schedule is unavailable: {e}"),
+            Err(e) => log::warn!("Cleaner schedule is unavailable: {e}", e = e.message()),
         },
     )
     .map_err(|e| {
@@ -863,7 +869,7 @@ mod tests;
 
 /// The same executable can be woken by launchd without constructing a webview.
 /// Missed intervals are claimed once by the shared durable scheduler.
-pub fn run_due_headless() -> Result<(), String> {
+pub fn run_due_headless() -> Result<(), CommandError> {
     let cleaner = service()?;
     let state = cleaner.state()?;
     if !state.config.enabled
@@ -892,7 +898,8 @@ pub fn run_due_headless() -> Result<(), String> {
             "Background cleanup {}: {}",
             run.status,
             run.issues.join("; ")
-        ));
+        )
+        .into());
     }
     Ok(())
 }

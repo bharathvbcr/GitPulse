@@ -2,6 +2,7 @@
 //! Data reads never start a model, watcher or execution lease holder. Resuming
 //! saved automatic work uses an explicit, bounded wake request to the Go host.
 
+use crate::ipc_error::CommandError;
 use dc_store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -173,10 +174,10 @@ impl WorkbenchState {
 
     /// Whether anything has a file or working directory open under a path,
     /// before GitPulse removes a worktree there on its own initiative.
-    fn open_files(&self, path: &std::path::Path) -> Result<(), String> {
+    fn open_files(&self, path: &std::path::Path) -> Result<(), CommandError> {
         #[cfg(test)]
         if let Some(check) = self.0.open_files {
-            return check(path);
+            return check(path).map_err(CommandError::from);
         }
         crate::storage::hygiene::open_files_under(path)
     }

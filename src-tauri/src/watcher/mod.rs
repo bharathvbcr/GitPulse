@@ -12,6 +12,7 @@ pub use debouncer::RepoFileWatcher;
 use crate::engine::git_cli::{
     git_text_with_timeout, resolve_git_common_dir, resolve_git_dir, validate_repo,
 };
+use crate::ipc_error::CommandError;
 use notify::{Event, EventKind};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -411,11 +412,11 @@ impl IgnoreRules {
                 log::warn!(
                     target: "watcher",
                     "gitignore query failed for {}: {error}",
-                    repo.display()
+                    repo.display(), error = error.message()
                 );
                 Self {
                     prefixes: HashSet::new(),
-                    load_error: Some(error),
+                    load_error: Some(error.into_message()),
                     truncated: false,
                 }
             }
@@ -1265,7 +1266,7 @@ pub fn start_watch(
     app: AppHandle,
     state: &WatcherState,
     repo_path: String,
-) -> Result<String, String> {
+) -> Result<String, CommandError> {
     let gone_app = app.clone();
     start_watch_observed(
         state,
@@ -1289,7 +1290,7 @@ pub(crate) fn start_watch_inner<F>(
     state: &WatcherState,
     repo_path: String,
     on_change: F,
-) -> Result<String, String>
+) -> Result<String, CommandError>
 where
     F: Fn(RepoChangedPayload) + Send + 'static,
 {
@@ -1306,7 +1307,7 @@ pub(crate) fn start_watch_observed<F, G>(
     repo_path: String,
     on_change: F,
     on_gone: G,
-) -> Result<String, String>
+) -> Result<String, CommandError>
 where
     F: Fn(RepoChangedPayload) + Send + 'static,
     G: FnOnce(RepoGonePayload) + Send + 'static,
@@ -1333,7 +1334,7 @@ where
             return Ok(key);
         }
         if guard.len() >= MAX_WATCHES {
-            return Err(format!("Too many watched repositories (max {MAX_WATCHES})"));
+            return Err(format!("Too many watched repositories (max {MAX_WATCHES})").into());
         }
     }
 
@@ -1346,7 +1347,7 @@ where
         Err(e) => {
             log::debug!(
                 target: "watcher",
-                "linked-worktree ref watching degraded for {key}: {e}"
+                "linked-worktree ref watching degraded for {key}: {e}", e = e.message()
             );
             None
         }
@@ -1454,7 +1455,7 @@ where
         let _ = retired_tx.send(retired);
     }) {
         let _ = state.abandon_watch_slot(&key, &stop);
-        return Err(format!("Failed to start watcher: {}", e));
+        return Err(format!("Failed to start watcher: {}", e).into());
     }
     Ok(key)
 }
@@ -2037,8 +2038,9 @@ mod tests {
         let err = start_watch_inner(&state, dir.path().to_string_lossy().into_owned(), |_| {})
             .expect_err("25th live watch must fail closed");
         assert!(
-            err.contains("24") || err.to_lowercase().contains("too many"),
-            "cap error should mention the limit, got: {err}"
+            err.contains("24") || err.message().to_lowercase().contains("too many"),
+            "cap error should mention the limit, got: {err}",
+            err = err.message()
         );
         assert_eq!(state.watch_count().unwrap(), MAX_WATCHES);
         let canonical = dir.path().canonicalize().unwrap();

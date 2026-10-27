@@ -22,6 +22,7 @@
 //! clone's. Registry and git crates' fingerprints carry no workspace path,
 //! so the worktree reuses their compiled artifacts; path crates rebuild.
 
+use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
@@ -176,27 +177,39 @@ enum CopyStop {
     BelowFloor {
         free: u64,
     },
-    Failed(String),
+    Failed(CommandError),
 }
 
 impl From<String> for CopyStop {
     fn from(message: String) -> Self {
-        Self::Failed(message)
+        Self::Failed(message.into())
+    }
+}
+
+impl From<CommandError> for CopyStop {
+    fn from(error: CommandError) -> Self {
+        Self::Failed(error)
     }
 }
 
 impl CopyStop {
-    /// The message every caller of the public entry points sees.
-    fn into_message(self) -> String {
+    /// The error every caller of the public entry points sees.
+    fn into_error(self) -> CommandError {
         match self {
             Self::CapHit { cap } => {
-                format!("the copy would write more than {cap} bytes (the byte cap), so it was not copied")
+                format!("the copy would write more than {cap} bytes (the byte cap), so it was not copied").into()
             }
             Self::BelowFloor { free } => format!(
                 "free space fell to {free} bytes during the copy, below the floor, so it was not copied"
-            ),
-            Self::Failed(message) => message,
+            )
+            .into(),
+            Self::Failed(error) => error,
         }
+    }
+
+    /// The text of [`CopyStop::into_error`], for a report line.
+    fn into_message(self) -> String {
+        self.into_error().into_message()
     }
 }
 
@@ -408,7 +421,7 @@ impl Drop for StagingGuard<'_> {
 }
 
 /// Work done on a finished staging tree before it is renamed into place.
-type Finish<'a> = &'a dyn Fn(&Path) -> Result<(), String>;
+type Finish<'a> = &'a dyn Fn(&Path) -> Result<(), CommandError>;
 
 /// Reads the volume's free space again as a byte-copy proceeds.
 type Recheck<'a> = &'a dyn Fn() -> Reading<u64>;
@@ -425,7 +438,7 @@ struct CopyRules<'a> {
 
 /// Clones a directory tree from `src` to `dst`, prioritizing Copy-on-Write,
 /// under the default bounds.
-pub fn reflink_copy_dir(src: &Path, dst: &Path) -> Result<ReflinkResult, String> {
+pub fn reflink_copy_dir(src: &Path, dst: &Path) -> Result<ReflinkResult, CommandError> {
     reflink_copy_dir_bounded(src, dst, CowCaps::DEFAULT, CopyRules::default())
 }
 
@@ -435,8 +448,8 @@ fn reflink_copy_dir_bounded(
     dst: &Path,
     caps: CowCaps,
     rules: CopyRules<'_>,
-) -> Result<ReflinkResult, String> {
-    copy_dir_staged(src, dst, caps, rules).map_err(CopyStop::into_message)
+) -> Result<ReflinkResult, CommandError> {
+    copy_dir_staged(src, dst, caps, rules).map_err(CopyStop::into_error)
 }
 
 /// [`reflink_copy_dir_bounded`], keeping why the copy stopped.
@@ -506,7 +519,9 @@ fn copy_dir_rechecked(
             is_cow: tally.is_cow,
             duration_ms: start.elapsed().as_millis() as u64,
         }),
-        Err(CopyStop::Failed(error)) => Err(CopyStop::Failed(discard_staging(&staging, error))),
+        Err(CopyStop::Failed(error)) => Err(CopyStop::Failed(
+            error.wrap(|error| discard_staging(&staging, error.to_string())),
+        )),
         Err(bound) => {
             // The staging tree goes for a bound exactly as for a failure; the
             // stop stays that bound unless its removal failed too.
@@ -514,23 +529,25 @@ fn copy_dir_rechecked(
             Err(if left.is_empty() {
                 bound
             } else {
-                CopyStop::Failed(format!("{}{left}", bound.into_message()))
+                CopyStop::Failed(bound.into_error().wrap(|bound| format!("{bound}{left}")))
             })
         }
     }
 }
 
-fn utf8_path<'a>(path: &'a Path, role: &str) -> Result<&'a str, String> {
-    path.to_str().ok_or_else(|| {
-        format!(
-            "{role} path '{}' is not valid UTF-8, so it is not copied",
-            path.display()
-        )
-    })
+fn utf8_path<'a>(path: &'a Path, role: &str) -> Result<&'a str, CommandError> {
+    path.to_str()
+        .ok_or_else(|| {
+            format!(
+                "{role} path '{}' is not valid UTF-8, so it is not copied",
+                path.display()
+            )
+        })
+        .map_err(CommandError::from)
 }
 
 /// A fresh name beside `dst` that nothing else in this process will pick.
-fn staging_path(dst: &Path) -> Result<PathBuf, String> {
+fn staging_path(dst: &Path) -> Result<PathBuf, CommandError> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let parent = dst
         .parent()
@@ -719,12 +736,12 @@ fn fallback_reflink_copy(
     dst: &Path,
     caps: CowCaps,
     require_clone: bool,
-) -> Result<Tally, String> {
+) -> Result<Tally, CommandError> {
     let rules = CopyRules {
         require_clone,
         ..CopyRules::default()
     };
-    walk_copy(src, dst, caps, rules, None).map_err(CopyStop::into_message)
+    walk_copy(src, dst, caps, rules, None).map_err(CopyStop::into_error)
 }
 
 /// Recursive copier that attempts file-level FICLONE on Linux, or `fs::copy`
@@ -831,15 +848,16 @@ fn walk_copy(
 }
 
 #[cfg(unix)]
-fn copy_link(link: &Path, target: &Path) -> Result<(), String> {
+fn copy_link(link: &Path, target: &Path) -> Result<(), CommandError> {
     let points_to =
         fs::read_link(link).map_err(|e| format!("Cannot read link '{}': {e}", link.display()))?;
     std::os::unix::fs::symlink(points_to, target)
         .map_err(|e| format!("Could not copy link '{}': {e}", link.display()))
+        .map_err(CommandError::from)
 }
 
 #[cfg(not(unix))]
-fn copy_link(link: &Path, _target: &Path) -> Result<(), String> {
+fn copy_link(link: &Path, _target: &Path) -> Result<(), CommandError> {
     Err(format!(
         "'{}' is a link, which this platform's copy does not recreate, so the tree was not copied",
         link.display()
@@ -882,7 +900,7 @@ fn count_dir_stats(
     depth: usize,
     caps: CowCaps,
     entries: &mut usize,
-) -> Result<(usize, u64), String> {
+) -> Result<(usize, u64), CommandError> {
     let mut files = 0;
     let mut bytes = 0;
     let read_dir = fs::read_dir(dir).map_err(|e| format!("Cannot read {}: {e}", dir.display()))?;
@@ -894,7 +912,8 @@ fn count_dir_stats(
             return Err(format!(
                 "the tree holds more than {} entries, so it was not copied",
                 caps.max_entries
-            ));
+            )
+            .into());
         }
         let meta = entry
             .metadata()
@@ -904,7 +923,8 @@ fn count_dir_stats(
                 return Err(format!(
                     "the tree is nested more than {} directories deep, so it was not copied",
                     caps.max_depth
-                ));
+                )
+                .into());
             }
             let (sub_files, sub_bytes) = count_dir_stats(&entry.path(), depth + 1, caps, entries)?;
             files += sub_files;
@@ -923,7 +943,7 @@ fn count_dir_stats(
 /// has — the lock cargo holds for a whole build of that profile — so no
 /// anchor build writes the tree while it is cloned. Released when the files
 /// drop. A profile with no lock file has no build to wait for.
-fn hold_cargo_build_locks(target: &Path) -> Result<Vec<fs::File>, String> {
+fn hold_cargo_build_locks(target: &Path) -> Result<Vec<fs::File>, CommandError> {
     let profiles =
         fs::read_dir(target).map_err(|e| format!("Cannot read '{}': {e}", target.display()))?;
     let mut held = Vec::new();
@@ -932,7 +952,7 @@ fn hold_cargo_build_locks(target: &Path) -> Result<Vec<fs::File>, String> {
             return Err(format!(
                 "'{}' holds more than {MAX_TARGET_PROFILES} entries, so its build locks were not all checked",
                 target.display()
-            ));
+            ).into());
         }
         let profile = profile.map_err(|e| format!("Cannot list '{}': {e}", target.display()))?;
         let lock_path = profile.path().join(".cargo-lock");
@@ -941,7 +961,7 @@ fn hold_cargo_build_locks(target: &Path) -> Result<Vec<fs::File>, String> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             // A profile entry that is a file, not a directory.
             Err(_) if !profile.path().is_dir() => continue,
-            Err(e) => return Err(format!("Cannot open '{}': {e}", lock_path.display())),
+            Err(e) => return Err(format!("Cannot open '{}': {e}", lock_path.display()).into()),
         };
         match file.try_lock() {
             Ok(()) => held.push(file),
@@ -949,10 +969,11 @@ fn hold_cargo_build_locks(target: &Path) -> Result<Vec<fs::File>, String> {
                 return Err(format!(
                     "anchor build in progress ('{}' is locked)",
                     lock_path.display()
-                ))
+                )
+                .into())
             }
             Err(fs::TryLockError::Error(e)) => {
-                return Err(format!("Cannot lock '{}': {e}", lock_path.display()))
+                return Err(format!("Cannot lock '{}': {e}", lock_path.display()).into())
             }
         }
     }
@@ -969,14 +990,15 @@ fn hold_cargo_build_locks(target: &Path) -> Result<Vec<fs::File>, String> {
 /// `from` (the anchor's target directory) with `to` wherever it is a whole
 /// path prefix. A file that cannot be read as UTF-8, or is oversized, fails
 /// the clone.
-fn rewrite_build_outputs(staging: &Path, from: &str, to: &str) -> Result<(), String> {
+fn rewrite_build_outputs(staging: &Path, from: &str, to: &str) -> Result<(), CommandError> {
     let profiles =
         fs::read_dir(staging).map_err(|e| format!("Cannot read '{}': {e}", staging.display()))?;
     for (index, profile) in profiles.enumerate() {
         if index >= MAX_TARGET_PROFILES {
             return Err(format!(
                 "the target directory holds more than {MAX_TARGET_PROFILES} entries"
-            ));
+            )
+            .into());
         }
         let profile = profile.map_err(|e| format!("Cannot list '{}': {e}", staging.display()))?;
         let build = profile.path().join("build");
@@ -990,7 +1012,8 @@ fn rewrite_build_outputs(staging: &Path, from: &str, to: &str) -> Result<(), Str
                 return Err(format!(
                     "'{}' holds more than {MAX_BUILD_SCRIPTS} entries",
                     build.display()
-                ));
+                )
+                .into());
             }
             let script = script.map_err(|e| format!("Cannot list '{}': {e}", build.display()))?;
             for name in ["output", "root-output"] {
@@ -1001,20 +1024,21 @@ fn rewrite_build_outputs(staging: &Path, from: &str, to: &str) -> Result<(), Str
     Ok(())
 }
 
-fn rewrite_one_output(path: &Path, from: &str, to: &str) -> Result<(), String> {
+fn rewrite_one_output(path: &Path, from: &str, to: &str) -> Result<(), CommandError> {
     let meta = match path.symlink_metadata() {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(format!("Cannot read '{}': {e}", path.display())),
+        Err(e) => return Err(format!("Cannot read '{}': {e}", path.display()).into()),
     };
     if !meta.is_file() {
-        return Err(format!("'{}' is not a file", path.display()));
+        return Err(format!("'{}' is not a file", path.display()).into());
     }
     if meta.len() > MAX_BUILD_OUTPUT {
         return Err(format!(
             "'{}' is larger than {MAX_BUILD_OUTPUT} bytes",
             path.display()
-        ));
+        )
+        .into());
     }
     let bytes = fs::read(path).map_err(|e| format!("Cannot read '{}': {e}", path.display()))?;
     let text = String::from_utf8(bytes).map_err(|_| {
@@ -1054,7 +1078,7 @@ fn replace_path_prefix(text: &str, from: &str, to: &str) -> String {
 /// Whether the worktree's own ignore rules cover `dir_name/`. Exit 0 is
 /// "ignored", 1 is "not ignored"; anything else — including a spawn deferred
 /// under load — is no answer, and the caller copies nothing on no answer.
-fn ignored_in(worktree: &Path, dir_name: &str) -> Result<bool, String> {
+fn ignored_in(worktree: &Path, dir_name: &str) -> Result<bool, CommandError> {
     // The trailing slash: patterns like `node_modules/` match directories
     // only, and check-ignore judges the pathname exactly as given.
     let pathname = format!("{dir_name}/");
@@ -1068,7 +1092,8 @@ fn ignored_in(worktree: &Path, dir_name: &str) -> Result<bool, String> {
         code => Err(format!(
             "git check-ignore could not say whether {pathname} is ignored (exit {code}): {}",
             String::from_utf8_lossy(&run.stderr).trim()
-        )),
+        )
+        .into()),
     }
 }
 
@@ -1084,13 +1109,13 @@ pub fn reflink_ignored_caches(
     anchor: &Path,
     worktree: &Path,
     selection: &CacheSelection,
-) -> Result<Vec<ReflinkResult>, String> {
+) -> Result<Vec<ReflinkResult>, CommandError> {
     let report = clone_ignored_caches(anchor, worktree, selection)?;
     if let Some(error) = report.error() {
-        return Err(error);
+        return Err(error.into());
     }
     match report.low_disk {
-        Some(low) => Err(low.message()),
+        Some(low) => Err(low.message().into()),
         None => Ok(report.copied),
     }
 }
@@ -1104,9 +1129,11 @@ pub fn clone_ignored_caches(
     anchor: &Path,
     worktree: &Path,
     selection: &CacheSelection,
-) -> Result<CacheReport, String> {
+) -> Result<CacheReport, CommandError> {
     if !anchor.exists() || !worktree.exists() {
-        return Err("Both anchor and worktree paths must exist".to_string());
+        return Err("Both anchor and worktree paths must exist"
+            .to_string()
+            .into());
     }
     let mut report = CacheReport::default();
     if anchor == worktree {
@@ -1139,7 +1166,9 @@ pub fn clone_ignored_caches(
                 continue;
             }
             Err(err) => {
-                report.failures.push(format!("{dir_name}: {err}"));
+                report
+                    .failures
+                    .push(format!("{dir_name}: {err}", err = err.message()));
                 continue;
             }
         }
@@ -1266,8 +1295,8 @@ fn clone_cargo_target(
                 .to_string(),
         ));
     }
-    let _held =
-        hold_cargo_build_locks(anchor_dir).map_err(|reason| format!("skipped: {reason}"))?;
+    let _held = hold_cargo_build_locks(anchor_dir)
+        .map_err(|reason| reason.wrap(|reason| format!("skipped: {reason}")))?;
     let rewrite = |staging: &Path| rewrite_build_outputs(staging, from, to);
     copy_dir_staged(
         anchor_dir,
@@ -1375,7 +1404,11 @@ mod tests {
         };
         let refused = reflink_copy_dir_bounded(&src, &dst, shallow, CopyRules::default());
         let error = refused.expect_err("a tree past the depth bound was reported copied");
-        assert!(error.contains("12 directories deep"), "{error}");
+        assert!(
+            error.contains("12 directories deep"),
+            "{error}",
+            error = error.message()
+        );
         assert_eq!(
             entries(temp.path()),
             ["src"],
@@ -1397,7 +1430,11 @@ mod tests {
         let error = fallback_reflink_copy(&src, &dst, shallow, false)
             .map(|tally| tally.files)
             .expect_err("past the bound");
-        assert!(error.contains("12 directories deep"), "{error}");
+        assert!(
+            error.contains("12 directories deep"),
+            "{error}",
+            error = error.message()
+        );
         let whole = temp.path().join("whole");
         let tally = fallback_reflink_copy(&src, &whole, CowCaps::DEFAULT, false).expect("copied");
         assert_eq!(tally.files, 1);
@@ -1420,14 +1457,22 @@ mod tests {
         let dst = temp.path().join("dst");
         let error = reflink_copy_dir_bounded(&src, &dst, few, CopyRules::default())
             .expect_err("past the cap");
-        assert!(error.contains("more than 4 entries"), "{error}");
+        assert!(
+            error.contains("more than 4 entries"),
+            "{error}",
+            error = error.message()
+        );
         assert_eq!(entries(temp.path()), ["src"]);
 
         let walk = temp.path().join("walk");
         let error = fallback_reflink_copy(&src, &walk, few, false)
             .map(|tally| tally.files)
             .expect_err("past the cap");
-        assert!(error.contains("more than 4 entries"), "{error}");
+        assert!(
+            error.contains("more than 4 entries"),
+            "{error}",
+            error = error.message()
+        );
 
         let roomy = CowCaps {
             max_entries: 6,
@@ -1454,7 +1499,11 @@ mod tests {
         let copied = reflink_copy_dir(&src, &dst);
         fs::set_permissions(src.join("pkg/locked.js"), fs::Permissions::from_mode(0o644)).unwrap();
         let error = copied.expect_err("a file that could not be read was reported copied");
-        assert!(error.contains("locked.js"), "{error}");
+        assert!(
+            error.contains("locked.js"),
+            "{error}",
+            error = error.message()
+        );
         assert_eq!(
             entries(temp.path()),
             ["src"],
@@ -1540,7 +1589,11 @@ mod tests {
             reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default())
         });
         let error = synced.expect_err("an unchecked cache was copied or skipped silently");
-        assert!(error.contains("node_modules"), "{error}");
+        assert!(
+            error.contains("node_modules"),
+            "{error}",
+            error = error.message()
+        );
         assert!(!worktree.join("node_modules").exists());
     }
 
@@ -1714,8 +1767,12 @@ mod tests {
         let waited = started.elapsed();
         held.unlock().unwrap();
         let error = synced.expect_err("a skipped target/ must be reported");
-        assert!(error.contains("target"), "{error}");
-        assert!(error.contains("anchor build in progress"), "{error}");
+        assert!(error.contains("target"), "{error}", error = error.message());
+        assert!(
+            error.contains("anchor build in progress"),
+            "{error}",
+            error = error.message()
+        );
         assert!(
             waited < std::time::Duration::from_secs(10),
             "waited {waited:?}"
@@ -1742,7 +1799,7 @@ mod tests {
         .unwrap();
         let error = reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default())
             .expect_err("an output that could not be rewritten was cloned");
-        assert!(error.contains("target"), "{error}");
+        assert!(error.contains("target"), "{error}", error = error.message());
         assert!(!worktree.join("target").exists());
         assert!(worktree.join("node_modules/pkg/index.js").is_file());
         assert_eq!(
@@ -1765,9 +1822,21 @@ mod tests {
             reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default())
         });
         let error = synced.expect_err("a skipped target/ must be reported");
-        assert!(error.contains("target: "), "{error}");
-        assert!(error.contains("never byte-copied"), "{error}");
-        assert!(error.contains("copied: node_modules"), "{error}");
+        assert!(
+            error.contains("target: "),
+            "{error}",
+            error = error.message()
+        );
+        assert!(
+            error.contains("never byte-copied"),
+            "{error}",
+            error = error.message()
+        );
+        assert!(
+            error.contains("copied: node_modules"),
+            "{error}",
+            error = error.message()
+        );
         assert!(!worktree.join("target").exists());
         assert!(worktree.join("node_modules/pkg/index.js").is_file());
         assert_eq!(
@@ -1793,7 +1862,11 @@ mod tests {
         std::os::unix::fs::symlink(shared.path(), anchor.join("target")).unwrap();
         let error = reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default())
             .expect_err("a skipped target/ must be reported");
-        assert!(error.contains("target: skipped"), "{error}");
+        assert!(
+            error.contains("target: skipped"),
+            "{error}",
+            error = error.message()
+        );
         assert!(worktree.join("target").symlink_metadata().is_err());
     }
 
@@ -1984,7 +2057,11 @@ mod tests {
         let anchor = main.path().canonicalize().unwrap();
         cache_with_file(&anchor, 8);
         let error = reflink_ignored_caches(&anchor, &worktree, &selection(full)).unwrap_err();
-        assert!(error.contains("low disk"), "{error}");
+        assert!(
+            error.contains("low disk"),
+            "{error}",
+            error = error.message()
+        );
     }
 
     // ---- adversarial W4-L3 (adv-w4l3) ----
@@ -2005,7 +2082,7 @@ mod tests {
         fs::create_dir_all(src.join("pkg")).unwrap();
         fs::write(src.join("pkg/a.js"), "a").unwrap();
         let dst = parent.path().join("dst");
-        let boom = |_: &Path| -> Result<(), String> { panic!("crash mid-copy") };
+        let boom = |_: &Path| -> Result<(), CommandError> { panic!("crash mid-copy") };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             copy_dir_staged(
                 &src,

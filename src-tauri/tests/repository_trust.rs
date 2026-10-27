@@ -722,11 +722,11 @@ fn a_pre_repository_approval_subprocess() {
     let refused = repository_trust::inspect(&worktree).unwrap();
     assert_eq!(refused.scope, repository_trust::TrustScope::None);
     let refusal = repository_trust::require(Path::new(&worktree)).unwrap_err();
-    assert!(repository_trust::refused(&refusal));
+    assert!(repository_trust::refused(refusal.message()));
     assert!(
         refusal.contains("approved before GitPulse covered worktrees"),
         "a reader who already approved this repository needs to be told why \
-         that did not reach here: {refusal}"
+         that did not reach here: {refusal:?}"
     );
     // The constant, not a literal: this assertion is the reason
     // `EXTEND_TRUST_CONTROL` exists, and a second copy of the button's label
@@ -735,7 +735,7 @@ fn a_pre_repository_approval_subprocess() {
     // button read something else, and then failed on the commit that fixed it.
     assert!(
         refusal.contains(repository_trust::EXTEND_TRUST_CONTROL),
-        "the refusal must name the control as the button labels it: {refusal}"
+        "the refusal must name the control as the button labels it: {refusal:?}"
     );
 
     // 3. The collision scan therefore reads one of two working trees — and the

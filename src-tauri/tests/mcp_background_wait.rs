@@ -6,6 +6,7 @@
 
 mod common;
 
+use gitpulse_lib::ipc_error::CommandError;
 use std::time::{Duration, Instant};
 
 use gitpulse_lib::engine::git_cli::{
@@ -19,7 +20,7 @@ const SHED: &str = "background work is shed while the git spawn rate budget is l
 /// at the reserve and the call waited for a refill) or refused. Returns how
 /// many spawns it took, so a call slowed by host load alone (too few spawns to
 /// have drained 144 tokens) cannot pass for the reserve.
-fn drain_until_paced() -> Result<(usize, Duration), String> {
+fn drain_until_paced() -> Result<(usize, Duration), CommandError> {
     for spawns in 1..=800 {
         let began = Instant::now();
         git_global(&["--version"])?;
@@ -50,6 +51,10 @@ fn a_worker_thread_in_the_mcp_configuration_waits_instead_of_shedding() {
                 "{paced:?}"
             );
         }
-        Err(error) => panic!("shed={} at the reserve: {error}", error.contains(SHED)),
+        Err(error) => panic!(
+            "shed={} at the reserve: {error}",
+            error.contains(SHED),
+            error = error.message()
+        ),
     }
 }

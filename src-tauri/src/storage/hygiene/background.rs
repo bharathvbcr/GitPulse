@@ -1,6 +1,7 @@
 //! Optional per-user launchd registration. No shell, privileged job or keep-alive.
 //! Registration is a host concern; DevCouncil's policy stays portable.
 #[cfg(any(target_os = "macos", test))]
+use crate::ipc_error::CommandError;
 use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
@@ -10,7 +11,7 @@ const LABEL: &str = "com.gitpulse.hygiene";
 const OWNER: &str = "<!-- GitPulse repository hygiene v1 -->";
 
 #[cfg(any(target_os = "macos", test))]
-fn app_executable(path: &Path) -> Result<&str, String> {
+fn app_executable(path: &Path) -> Result<&str, CommandError> {
     let text = path.to_str().ok_or("Application path is not UTF-8")?;
     if !path.is_absolute()
         || text.len() > 4096
@@ -44,10 +45,10 @@ fn plist(executable: &str) -> String {
     format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{OWNER}\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{LABEL}</string>\n<key>ProgramArguments</key><array><string>{escaped}</string><string>--cleaner-due</string></array>\n<key>StartInterval</key><integer>60</integer>\n<key>RunAtLoad</key><true/>\n<key>ProcessType</key><string>Background</string>\n</dict></plist>\n")
 }
 #[cfg(any(target_os = "macos", test))]
-fn owned(path: &Path) -> Result<bool, String> {
+fn owned(path: &Path) -> Result<bool, CommandError> {
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e.to_string()),
+        Err(e) => Err(e.to_string().into()),
         Ok(meta) => {
             if !meta.is_file() || meta.len() > 16384 {
                 return Err("LaunchAgent is not a bounded regular file".into());
@@ -71,7 +72,7 @@ fn owned(path: &Path) -> Result<bool, String> {
     }
 }
 #[cfg(target_os = "macos")]
-fn location() -> Result<PathBuf, String> {
+fn location() -> Result<PathBuf, CommandError> {
     let home = std::env::var_os("HOME").ok_or("Home directory unavailable")?;
     let home = PathBuf::from(home);
     if !home.is_absolute() {
@@ -87,7 +88,7 @@ fn location() -> Result<PathBuf, String> {
 /// not. Returns what it found. An absent agent is left absent: registering is
 /// the user's choice in Settings.
 #[cfg(target_os = "macos")]
-pub fn refresh_if_stale() -> Result<crate::desktop::launch_agent::Registration, String> {
+pub fn refresh_if_stale() -> Result<crate::desktop::launch_agent::Registration, CommandError> {
     use crate::desktop::launch_agent::{inspect, is_translocated, Registration};
     let current = std::env::current_exe().map_err(|e| e.to_string())?;
     let path = location()?;
@@ -99,10 +100,10 @@ pub fn refresh_if_stale() -> Result<crate::desktop::launch_agent::Registration, 
         if is_translocated(&current) {
             return Err(format!(
                 "the cleaner LaunchAgent starts {registered:?}, but this copy runs from a translocated path; move GitPulse to Applications and reopen it"
-            ));
+            ).into());
         }
         configure(true).map_err(|error| {
-            format!("the cleaner LaunchAgent starts {registered:?} and could not be re-registered: {error}")
+            format!("the cleaner LaunchAgent starts {registered:?} and could not be re-registered: {error}", error = error.message())
         })?;
     }
     Ok(found)
@@ -119,7 +120,7 @@ pub fn supported() -> bool {
     }
 }
 
-pub fn configure(enable: bool) -> Result<(), String> {
+pub fn configure(enable: bool) -> Result<(), CommandError> {
     #[cfg(target_os = "macos")]
     {
         let path = location()?;
@@ -152,7 +153,8 @@ pub fn configure(enable: bool) -> Result<(), String> {
             Err(format!(
                 "launchctl failed: {}",
                 output.stderr_text().chars().take(1024).collect::<String>()
-            ))
+            )
+            .into())
         })
     }
     #[cfg(not(target_os = "macos"))]
@@ -170,8 +172,8 @@ fn configure_at(
     path: &Path,
     document: Option<&str>,
     domain: &str,
-    mut launch: impl FnMut(&[&str]) -> Result<bool, String>,
-) -> Result<(), String> {
+    mut launch: impl FnMut(&[&str]) -> Result<bool, CommandError>,
+) -> Result<(), CommandError> {
     let exists = owned(path)?;
     if !exists && document.is_none() {
         return Ok(());
