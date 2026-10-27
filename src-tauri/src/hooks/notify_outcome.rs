@@ -60,6 +60,58 @@ impl SendError {
     }
 }
 
+/// What a finished exchange with the bridge means, as a pure function of what
+/// was read and how the read and the send ended. No I/O, so every host tests
+/// the same table; `acknowledge` is the parser of a complete reply.
+///
+/// * A reply that was read decides the outcome, however the read then ended
+///   and whether or not the send succeeded. A bridge at capacity writes its
+///   refusal and closes the socket without reading the report; Linux then
+///   reports `ECONNRESET` on the next read after the reply (macOS reports EOF),
+///   and the refusal must be reported as itself on both. A truncated reply
+///   still fails `acknowledge`, so nothing is hidden.
+/// * No reply and a peer that is gone (end of stream, or `BrokenPipe`,
+///   `ConnectionReset`, `NotConnected`) is [`SendError::NoReply`]: not
+///   confirmed delivered.
+/// * A timeout, with or without a partial reply, is [`SendError::NoReply`]
+///   (through [`SendError::from_io`]), counted once like the outer budget.
+/// * Any other error is a failure, said as `context: error`.
+pub fn classify_exchange(
+    reply: &[u8],
+    read: Result<(), &std::io::Error>,
+    sent: Result<(), &std::io::Error>,
+    acknowledge: impl FnOnce(&[u8]) -> Result<(), String>,
+) -> Result<(), SendError> {
+    let peer_gone = |error: &std::io::Error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::NotConnected
+        )
+    };
+    let decided_by_reply = || acknowledge(reply).map_err(SendError::Failed);
+    match (read, sent) {
+        (Ok(()), Ok(())) if reply.is_empty() => Err(SendError::NoReply),
+        (Ok(()), Ok(())) => decided_by_reply(),
+        (Ok(()), Err(error)) if reply.is_empty() => Err(if peer_gone(error) {
+            SendError::NoReply
+        } else {
+            SendError::from_io("could not send the report", error)
+        }),
+        (Ok(()), Err(_)) => decided_by_reply(),
+        (Err(error), _) if peer_gone(error) => {
+            if reply.is_empty() {
+                Err(SendError::NoReply)
+            } else {
+                decided_by_reply()
+            }
+        }
+        (Err(error), Ok(())) => Err(SendError::from_io("no answer from GitPulse", error)),
+        (Err(_), Err(error)) => Err(SendError::from_io("could not send the report", error)),
+    }
+}
+
 /// The socket a report goes to, or why there is none. The transport is checked
 /// first: on a platform with none the answer is `Unsupported` whatever the path
 /// would have been, and `resolve` is not called. A missing config directory
@@ -243,6 +295,110 @@ mod tests {
         let reset = Error::from(ErrorKind::ConnectionReset);
         assert!(
             matches!(SendError::from_io("read", &reset), SendError::Failed(text) if text.starts_with("read: ")),
+        );
+    }
+
+    /// The exchange table, on every host. The fake acknowledgement accepts only
+    /// `{"ok":true}` and refuses anything else with the bytes it saw.
+    fn acknowledge(bytes: &[u8]) -> Result<(), String> {
+        if bytes == b"{\"ok\":true}\n" {
+            Ok(())
+        } else {
+            Err(format!(
+                "refused: {}",
+                String::from_utf8_lossy(bytes).trim()
+            ))
+        }
+    }
+
+    const AT_CAPACITY: &[u8] = b"{\"ok\":false,\"reason\":\"at_capacity\"}\n";
+
+    fn error(kind: std::io::ErrorKind) -> std::io::Error {
+        std::io::Error::from(kind)
+    }
+
+    /// Linux: the bridge answered at capacity and closed unread, so the read
+    /// that returned the reply is followed by `ECONNRESET`. The reply decides.
+    #[test]
+    fn a_reply_read_before_a_reset_is_the_outcome() {
+        use std::io::ErrorKind::{BrokenPipe, ConnectionReset, NotConnected};
+        for kind in [ConnectionReset, BrokenPipe, NotConnected] {
+            let reset = error(kind);
+            let outcome = classify_exchange(AT_CAPACITY, Err(&reset), Ok(()), acknowledge);
+            assert!(
+                matches!(&outcome, Err(SendError::Failed(text)) if text.contains("at_capacity")),
+                "{kind:?}: {outcome:?}"
+            );
+            // The same refusal with a failed send as well.
+            let outcome =
+                classify_exchange(AT_CAPACITY, Err(&reset), Err(&error(kind)), acknowledge);
+            assert!(
+                matches!(&outcome, Err(SendError::Failed(text)) if text.contains("at_capacity")),
+                "{kind:?} with a failed send: {outcome:?}"
+            );
+        }
+        // macOS: the same reply then end of stream.
+        let outcome = classify_exchange(AT_CAPACITY, Ok(()), Ok(()), acknowledge);
+        assert!(matches!(&outcome, Err(SendError::Failed(text)) if text.contains("at_capacity")));
+        // An acknowledgement before a reset is still an acknowledgement.
+        let reset = error(std::io::ErrorKind::ConnectionReset);
+        assert_eq!(
+            classify_exchange(b"{\"ok\":true}\n", Err(&reset), Ok(()), acknowledge),
+            Ok(())
+        );
+        // A truncated reply after a reset is not hidden.
+        let outcome = classify_exchange(b"{\"ok\":fal", Err(&reset), Ok(()), acknowledge);
+        assert!(matches!(&outcome, Err(SendError::Failed(text)) if text.contains("refused")));
+    }
+
+    /// A timeout, with nothing or with part of a reply, is a missed reply and
+    /// is not swept into the acknowledgement parser (which would make it an
+    /// uncounted failure).
+    #[test]
+    fn a_timeout_is_a_missed_reply_with_or_without_part_of_a_reply() {
+        for kind in [std::io::ErrorKind::TimedOut, std::io::ErrorKind::WouldBlock] {
+            let timed_out = error(kind);
+            for partial in [&b""[..], b"{\"ok\":fal"] {
+                assert_eq!(
+                    classify_exchange(partial, Err(&timed_out), Ok(()), acknowledge),
+                    Err(SendError::NoReply),
+                    "{kind:?} {partial:?}"
+                );
+            }
+        }
+    }
+
+    /// No reply from a peer that is gone is a missed reply; any other error
+    /// stays a failure that says what it was.
+    #[test]
+    fn a_peer_that_is_gone_without_a_reply_is_missed_and_other_errors_fail() {
+        use std::io::ErrorKind::{BrokenPipe, ConnectionReset, PermissionDenied};
+        assert_eq!(
+            classify_exchange(b"", Ok(()), Ok(()), acknowledge),
+            Err(SendError::NoReply)
+        );
+        let reset = error(ConnectionReset);
+        assert_eq!(
+            classify_exchange(b"", Err(&reset), Ok(()), acknowledge),
+            Err(SendError::NoReply)
+        );
+        assert_eq!(
+            classify_exchange(b"", Ok(()), Err(&error(BrokenPipe)), acknowledge),
+            Err(SendError::NoReply)
+        );
+        let denied = error(PermissionDenied);
+        assert!(matches!(
+            classify_exchange(b"", Err(&denied), Ok(()), acknowledge),
+            Err(SendError::Failed(text)) if text.starts_with("no answer from GitPulse: ")
+        ));
+        assert!(matches!(
+            classify_exchange(b"", Ok(()), Err(&denied), acknowledge),
+            Err(SendError::Failed(text)) if text.starts_with("could not send the report: ")
+        ));
+        // A plain acknowledgement is delivered.
+        assert_eq!(
+            classify_exchange(b"{\"ok\":true}\n", Ok(()), Ok(()), acknowledge),
+            Ok(())
         );
     }
 

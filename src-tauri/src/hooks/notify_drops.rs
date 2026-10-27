@@ -24,8 +24,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// The count and whose it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropSnapshot {
-    /// Reports this process abandoned at their deadline. Not confirmed
-    /// delivered and not retried; the app may or may not have received them.
+    /// Reports this process gave up on for want of a reply: the outer budget
+    /// passed (300 ms for `SessionEnd`, 1.5 s for the other events), the
+    /// socket's own deadline passed, or the peer closed without replying. Not
+    /// confirmed delivered and not retried; the app may or may not have
+    /// received them. A worker that panicked or could not start is not counted.
     pub dropped: u64,
     /// What `dropped` counts: [`crate::ledger::DROPPED_SCOPE`].
     pub dropped_scope: String,

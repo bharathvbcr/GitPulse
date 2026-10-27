@@ -6,10 +6,12 @@
    * could not type the staged change; the user still edits and commits the
    * message. Asking sends the staged diff to the local Lappi process
    * (`src-tauri/src/lappi/request.rs`), so the switch says that and not only
-   * "ask". It is not the AI-provider consent gate: the socket is local, and
-   * AI commit-message generation, which can send the same diff to a model
-   * server, has its own consent and is a separate step. Recording keeps local
-   * caller records under Lappi's held-out store and sends nothing anywhere. What recording has done is shown beside the
+   * "ask". It is not the AI-provider consent gate: the socket is local. The
+   * Lappi consult and the AI consent check run in the same
+   * `generate_commit_message` call, Lappi first and whatever the AI consent
+   * state is; AI commit-message generation, which can send the same diff to a
+   * model server, has its own consent. Recording keeps local caller records
+   * under Lappi's held-out store and sends nothing anywhere. What recording has done is shown beside the
    * switch, because "on, nothing written" and "on, stopped at the cap" look
    * identical from the switch alone.
    */

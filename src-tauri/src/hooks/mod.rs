@@ -2454,9 +2454,13 @@ fn notify_send(path: &std::path::Path, payload: &str) -> Result<(), SendError> {
 ///
 /// A failed write, flush or half-close is not yet the outcome, for the same
 /// reason: a peer that answered and closed meets the report with a closed
-/// socket while its reply sits unread. The reply is read; only a socket with
-/// nothing to read reports the failure to send. No reply within the deadline is
-/// [`SendError::NoReply`], whichever clock said so.
+/// socket while its reply sits unread. The reply is read, and a reply that was
+/// read decides the outcome however the read then ended: a bridge at capacity
+/// writes its refusal and closes without reading the report, which Linux
+/// reports as `ECONNRESET` after the reply and macOS as end of stream. What an
+/// exchange means is [`notify_outcome::classify_exchange`], a pure function
+/// tested on every host. No reply within the deadline, or from a peer that is
+/// gone, is [`SendError::NoReply`], whichever clock said so.
 #[cfg(unix)]
 fn exchange(
     stream: std::os::unix::net::UnixStream,
@@ -2476,32 +2480,15 @@ fn exchange(
     // saying it was is the exact confusion this module exists to prevent: the
     // refusal is the drift between this binary and the app it reports to.
     let mut reply = Vec::with_capacity(16);
+    // `read_to_end` keeps what it read when it then fails, so `reply` is what
+    // arrived whatever ended the read.
     let read = (&mut stream).take(64).read_to_end(&mut reply);
-    match (read, sent) {
-        // The peer is gone and said nothing: no reply came, and none will. Not
-        // confirmed delivered is the one fact the count is about, so it is a
-        // missed reply, like a silent peer that is still there.
-        (Ok(_), Ok(())) if reply.is_empty() => Err(SendError::NoReply),
-        (Ok(_), Ok(())) => acknowledged(&reply).map_err(SendError::Failed),
-        (Ok(_), Err(error))
-            if reply.is_empty()
-                && matches!(
-                    error.kind(),
-                    std::io::ErrorKind::BrokenPipe
-                        | std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::NotConnected
-                ) =>
-        {
-            Err(SendError::NoReply)
-        }
-        (Ok(_), Err(error)) if reply.is_empty() => {
-            Err(SendError::from_io("could not send the report", &error))
-        }
-        // A reply read after a failed send is still the reply.
-        (Ok(_), Err(_)) => acknowledged(&reply).map_err(SendError::Failed),
-        (Err(error), Ok(())) => Err(SendError::from_io("no answer from GitPulse", &error)),
-        (Err(_), Err(error)) => Err(SendError::from_io("could not send the report", &error)),
-    }
+    notify_outcome::classify_exchange(
+        &reply,
+        read.as_ref().map(|_| ()),
+        sent.as_ref().map(|_| ()),
+        acknowledged,
+    )
 }
 
 /// Whether the socket's one-line answer accepted the report, and if not, why in
@@ -6181,6 +6168,27 @@ done
         assert!(
             matches!(&error, SendError::Failed(text) if text.contains("at_capacity")),
             "{error:?}"
+        );
+    }
+
+    /// The bridge's real refusal bytes, through the real acknowledgement parser,
+    /// when the read ends in the reset Linux reports after a peer that closed
+    /// unread (`bridge.rs` `serve`: write the refusal, return). Only the
+    /// classification can be driven on this host; `exchange` itself cannot make
+    /// macOS produce the reset.
+    #[cfg(unix)]
+    #[test]
+    fn the_real_at_capacity_reply_survives_a_reset_after_it() {
+        let reply = format!(
+            "{{\"ok\":false,\"reason\":\"{}\"}}\n",
+            crate::alerts::bridge::Reason::AtCapacity.token()
+        );
+        let reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        let outcome =
+            notify_outcome::classify_exchange(reply.as_bytes(), Err(&reset), Ok(()), acknowledged);
+        assert!(
+            matches!(&outcome, Err(SendError::Failed(text)) if text.contains("at_capacity")),
+            "{outcome:?}"
         );
     }
 

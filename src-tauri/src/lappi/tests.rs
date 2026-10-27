@@ -1232,6 +1232,13 @@ fn collect_zero_keeps_the_public_entry_points_off_the_store_and_the_socket() {
 
 /// Control: asking alone does connect, and still creates no store, so the
 /// negatives above are not vacuous and asking is not what opens the store.
+///
+/// Order-dependent by construction: `default_store()` is a process-wide
+/// `OnceLock`, so this test catches the "store opened even when recording is
+/// off" mutant only when it is the first test in the process to reach it. A
+/// run that filters to this test alone always does; a full run may not. The
+/// gate itself is pinned by the resolver tests above, which do not depend on
+/// order.
 #[test]
 fn asking_alone_connects_through_the_public_entry_point_and_creates_no_store() {
     let (world, env) = entry_world();
