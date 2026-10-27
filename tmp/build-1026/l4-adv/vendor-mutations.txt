@@ -1,6 +1,0 @@
-W1_check_spins: STILL RUNNING after 90 s -> BREAK (no timely failure)
-W2_main_noop: vitest rc=1 (⎯⎯⎯⎯⎯⎯ Failed Tests 21 ⎯⎯⎯⎯⎯⎯⎯
- Tests 21 failed | 2 passed (23))
- M src-tauri/src/alerts/bridge.rs
- M src-tauri/src/engine/git_cli.rs
-?? src-tauri/src/alerts/bridge/tests/adv_l4_tests.rs
