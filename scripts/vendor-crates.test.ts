@@ -93,6 +93,30 @@ it("exits with the status main returns when started as a command", async () => {
   } finally { f.cleanup(); }
 }, 30_000);
 
+// A git that never answers (an index lock, a network home, a hung fsmonitor)
+// must fail the run, naming the command, rather than hang the process. Run as
+// a child with its own bound so that a script with no bound fails this test
+// instead of hanging the worker: a synchronous call cannot be interrupted by
+// the test timeout.
+it.runIf(process.platform !== "win32")("reports a git that never answers as an error naming the command", async () => {
+  const f = await fixture();
+  try {
+    const bin = path.join(f.root, "fakebin");
+    mkdirSync(bin);
+    writeFileSync(path.join(bin, "git"), "#!/bin/sh\nexec sleep 3600\n", { mode: 0o755 });
+    const started = Date.now();
+    const spawned = spawnSync(process.execPath, [path.join(f.root, "scripts/vendor-crates.mjs"), "--crate=dc-redact", "--json"], {
+      encoding: "utf8", timeout: 20_000,
+      env: { ...process.env, ...f.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, GITPULSE_VENDOR_GIT_TIMEOUT_MS: "300" },
+    });
+    expect(spawned.error, "the script outlived its own bound").toBeUndefined();
+    expect(spawned.status, spawned.stderr).toBe(2);
+    expect(spawned.stderr).toContain("`git -C");
+    expect(spawned.stderr).toContain("did not finish within 300 ms");
+    expect(Date.now() - started).toBeLessThan(15_000);
+  } finally { f.cleanup(); }
+}, 30_000);
+
 it.each(["edited", "missing", "extra"])("checks locally maintained framework snapshots for %s files", async (mode) => {
   const f = await fixture();
   try {

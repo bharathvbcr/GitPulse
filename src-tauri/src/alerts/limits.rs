@@ -52,6 +52,18 @@ impl Bucket {
         }
     }
 
+    /// [`Bucket::take`] with the clock held still: spends a token if there is
+    /// one and refills nothing.
+    #[cfg(test)]
+    fn take_without_refill(&mut self) -> bool {
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Takes one token if there is one, after refilling for the time since the
     /// last look. A clock that went backwards refills nothing.
     fn take(&mut self, burst: f64, per_sec: f64, now: Instant) -> bool {
@@ -72,6 +84,11 @@ impl Bucket {
 pub(super) struct Limits {
     sessions: HashMap<String, Bucket>,
     outside: Option<Bucket>,
+    /// Test seam: while set, the outside bucket regains nothing with time, so a
+    /// test that emptied it finds it empty for as long as it holds it, however
+    /// slow the host. Never set outside `cfg(test)`.
+    #[cfg(test)]
+    outside_held: bool,
 }
 
 impl Limits {
@@ -79,10 +96,16 @@ impl Limits {
     /// terminal session, which draws on the shared bucket instead.
     pub(super) fn admit(&mut self, key: &str, outside: bool, now: Instant) -> bool {
         if outside {
-            return self
+            #[cfg(test)]
+            let held = self.outside_held;
+            let bucket = self
                 .outside
-                .get_or_insert_with(|| Bucket::full(OUTSIDE_BURST, now))
-                .take(OUTSIDE_BURST, OUTSIDE_PER_SEC, now);
+                .get_or_insert_with(|| Bucket::full(OUTSIDE_BURST, now));
+            #[cfg(test)]
+            if held {
+                return bucket.take_without_refill();
+            }
+            return bucket.take(OUTSIDE_BURST, OUTSIDE_PER_SEC, now);
         }
         if !self.sessions.contains_key(key) && self.sessions.len() >= CAPACITY {
             let oldest = self
@@ -98,6 +121,18 @@ impl Limits {
             .entry(key.to_owned())
             .or_insert_with(|| Bucket::full(SESSION_BURST, now))
             .take(SESSION_BURST, SESSION_PER_SEC, now)
+    }
+
+    /// Test seam: holds the outside bucket's refill off (`true`) or lets it run
+    /// again from now (`false`), without giving back the tokens it spent.
+    #[cfg(test)]
+    pub(super) fn hold_outside_refill(&mut self, held: bool) {
+        self.outside_held = held;
+        if !held {
+            if let Some(bucket) = self.outside.as_mut() {
+                bucket.at = Instant::now();
+            }
+        }
     }
 
     /// The session has ended: its bucket is of no further use.

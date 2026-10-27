@@ -1350,6 +1350,7 @@ mod tests {
         fn drop(&mut self) {
             // Before the lock is released: the field drops after this body.
             apply_at(false, None);
+            crate::alerts::release_outside_bucket();
         }
     }
 
@@ -1400,9 +1401,10 @@ mod tests {
     ///
     /// Other tests in the process draw on it, so a test that holds the
     /// listener would find it empty or full by luck of scheduling. Starting
-    /// every one of them from empty makes the exposure deterministic: a probe
-    /// that names no session is refused as `rate_limited` here every time, not
-    /// once in a few hundred runs under load.
+    /// every one of them from empty, with its refill held off until the test
+    /// ends ([`OwnedListener`]'s drop), makes the exposure deterministic: a
+    /// probe that names no session is refused as `rate_limited` for the whole
+    /// test, however slow the host, not once in a few hundred runs under load.
     ///
     /// It spends the bucket's tokens directly. Offering reports to the hub
     /// instead would put notices in the queue every test shares, and in the
@@ -1429,9 +1431,71 @@ mod tests {
         owned
     }
 
-    /// The listener tests above start from an empty outside bucket (see
-    /// [`drain_outside_bucket`]), so this is what they already rely on: a
-    /// report that names a session has a bucket of its own and is answered.
+    /// macOS refuses `SO_RCVTIMEO` with EINVAL on a socket whose peer has
+    /// already closed, which is what the bridge's refusal of an over-capacity
+    /// connection leaves its client with (reply, then close) when the client
+    /// is slow to set its timeout. The bridge's own side already tolerates it
+    /// through `DeadlineStream`; this pins the platform behaviour and that the
+    /// tolerant path still reads the reply.
+    #[cfg(unix)]
+    #[test]
+    fn a_peer_that_replied_and_closed_does_not_make_the_timeout_setting_fail() {
+        use std::io::{Read, Write};
+        let reply = "{\"ok\":false,\"reason\":\"at_capacity\"}\n";
+        let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+        server.write_all(reply.as_bytes()).unwrap();
+        server.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(server);
+        let raw = client.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                raw.expect_err("macOS accepted a timeout on a closed socket")
+                    .kind(),
+                std::io::ErrorKind::InvalidInput,
+                "the platform behaviour this test stands on has changed"
+            );
+        }
+        let mut guarded = crate::deadline::DeadlineStream::new(
+            client,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        );
+        let mut read = String::new();
+        guarded.read_to_string(&mut read).unwrap();
+        assert_eq!(read, reply);
+    }
+
+    /// Every listener test starts with the outside bucket empty and held: a
+    /// session-less probe is refused, at once and again after the time the
+    /// bucket would have needed to regain several tokens. This is what turns a
+    /// leftover session-less `{"ok":true}` expectation in any listener test into
+    /// a failure every run. Fails if `exhaust_outside_bucket` spends nothing
+    /// (the first probe is answered) or if the refill is not held (the second
+    /// is).
+    #[cfg(unix)]
+    #[test]
+    fn a_listener_test_starts_with_the_outside_bucket_empty_and_held() {
+        let _own = own_listener();
+        let dir = ShortDir::new("held");
+        apply_at(true, Some(dir.socket()));
+        assert!(status().listening, "{:?}", status().error);
+        let probe = br#"{"v":1,"event":"error","agent":"codex"}"#;
+        let refused = r#"{"ok":false,"reason":"rate_limited"}"#;
+        assert_eq!(send(&dir.socket(), probe).trim(), refused, "at once");
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+        assert_eq!(
+            send(&dir.socket(), probe).trim(),
+            refused,
+            "1.5 s later, when an unheld bucket would hold six tokens"
+        );
+        apply_at(false, None);
+    }
+
+    /// With the outside bucket empty, a report that names a session has a
+    /// bucket of its own and is answered. This guards the keying only: it fails
+    /// if every key drew on the outside bucket. It cannot fail on the base's
+    /// flake, which was a session-less probe; that is guarded by
+    /// [`a_listener_test_starts_with_the_outside_bucket_empty_and_held`] and by
+    /// every listener test now sending a session.
     #[cfg(unix)]
     #[test]
     fn a_report_that_names_a_session_is_not_limited_by_the_outside_bucket() {
@@ -2289,9 +2353,15 @@ mod tests {
             open_connections()
         );
 
-        let mut over = std::os::unix::net::UnixStream::connect(dir.socket()).unwrap();
-        over.set_read_timeout(Some(relaxed(5000))).unwrap();
+        // Through the deadline type the bridge's own side uses: the loop answers
+        // the 101st at once and closes, and macOS then refuses a plain
+        // `set_read_timeout` on this end with EINVAL (see
+        // `a_peer_that_replied_and_closed_does_not_make_the_timeout_setting_fail`).
         let started = std::time::Instant::now();
+        let mut over = crate::deadline::DeadlineStream::new(
+            std::os::unix::net::UnixStream::connect(dir.socket()).unwrap(),
+            started + relaxed(5000),
+        );
         let mut reply = String::new();
         let _ = over.read_to_string(&mut reply);
         assert_eq!(

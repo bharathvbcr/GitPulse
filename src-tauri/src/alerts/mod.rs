@@ -534,10 +534,19 @@ pub fn offer(notice: Notice) {
 
 /// Empties the process-wide bucket that session-less hook reports share, for a
 /// test that needs every probe it sends to name a session. `false` when no hub
-/// is running or the bucket could not be emptied. Touches that bucket only.
+/// is running or the bucket could not be emptied. Touches that bucket only, and
+/// holds its refill off until [`release_outside_bucket`].
 #[cfg(all(test, unix))]
 pub(crate) fn exhaust_outside_bucket() -> bool {
     hub().is_some_and(|hub| hub.intake.exhaust_outside_bucket())
+}
+
+/// Lets the outside bucket refill again after [`exhaust_outside_bucket`].
+#[cfg(all(test, unix))]
+pub(crate) fn release_outside_bucket() {
+    if let Some(hub) = hub() {
+        hub.intake.release_outside_bucket();
+    }
 }
 
 /// Offers a hook report together with the stamp that orders it among its

@@ -2479,10 +2479,32 @@ fn within_budget<T: Send + 'static>(
     thread::Builder::new()
         .name("gitpulse-hook-check".into())
         .spawn(move || {
-            let _ = tx.send(work());
+            #[cfg(test)]
+            let started = crate::sysload::thread_cpu();
+            let answer = work();
+            // The CPU the worker spent, handed back beside its answer.
+            #[cfg(test)]
+            let answer = (answer, crate::sysload::thread_cpu() - started);
+            let _ = tx.send(answer);
         })
         .ok()?;
-    rx.recv_timeout(budget).ok()
+    let answer = rx.recv_timeout(budget).ok()?;
+    #[cfg(test)]
+    let answer = {
+        LAST_WORKER_CPU.set(answer.1);
+        answer.0
+    };
+    Some(answer)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The CPU the worker of this thread's last completed [`within_budget`]
+    /// spent. Per calling thread, so tests running side by side do not see each
+    /// other's: a test that must bound the work of a whole reader reads it, as
+    /// wall time on a loaded host is not a measure of work.
+    pub(crate) static LAST_WORKER_CPU: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(Duration::ZERO) };
 }
 
 /// The canonical form of a path that may not exist yet.

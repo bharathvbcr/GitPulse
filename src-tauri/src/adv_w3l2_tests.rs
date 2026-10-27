@@ -213,6 +213,11 @@ struct Reading {
     reads: u32,
 }
 
+/// A pid the child announces as `label=<pid>`, and the end of the command name
+/// `ps` must show for it before it is read (`sh`: still the shell; `sleep`:
+/// exec'd, or a forked descendant that has exec'd).
+type Wanted = (&'static str, &'static str);
+
 /// The pid a child printed as `label=<pid>` on a line of its own.
 fn announced(text: &str, label: &str) -> Option<u32> {
     text.split_inclusive('\n')
@@ -241,9 +246,9 @@ fn announced(text: &str, label: &str) -> Option<u32> {
 /// The 120 s run deadline is only a hang backstop: nothing asserted depends on
 /// it.
 struct BandWatch {
-    wanted: &'static [&'static str],
+    wanted: &'static [Wanted],
     seen: String,
-    announce: Option<mpsc::Sender<Vec<(&'static str, u32)>>>,
+    announce: Option<mpsc::Sender<Vec<(Wanted, u32)>>>,
     stop: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
     readings: Arc<Mutex<Vec<Reading>>>,
@@ -252,8 +257,8 @@ struct BandWatch {
 }
 
 impl BandWatch {
-    fn start(wanted: &'static [&'static str]) -> Self {
-        let (announce, targets) = mpsc::channel::<Vec<(&'static str, u32)>>();
+    fn start(wanted: &'static [Wanted]) -> Self {
+        let (announce, targets) = mpsc::channel::<Vec<(Wanted, u32)>>();
         let stop = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
         let readings = Arc::new(Mutex::new(Vec::new()));
@@ -267,7 +272,7 @@ impl BandWatch {
             );
             std::thread::spawn(move || {
                 let Ok(pids) = targets.recv() else { return };
-                for (label, pid) in pids {
+                for ((label, image), pid) in pids {
                     let mut reads = 0;
                     let mut first = None;
                     let reading = loop {
@@ -278,10 +283,12 @@ impl BandWatch {
                             reads += 1;
                             *last_read.lock().unwrap() =
                                 format!("{label} pid={pid} pri={pri} comm={comm} reads={reads}");
-                            // After the exec, so what is read is the band a
-                            // process image replaced under it kept, not the
-                            // shell's.
-                            if comm.ends_with("sleep") {
+                            // Once the pid runs the image the case is about:
+                            // the shell itself for a child that never execs,
+                            // `sleep` after an exec or for a forked
+                            // descendant, so what is read is not the image
+                            // before it.
+                            if comm.ends_with(image) {
                                 let first = *first.get_or_insert(pri);
                                 if pri < 10 || reads >= SETTLE_READS {
                                     break Reading {
@@ -329,7 +336,7 @@ impl ProcessObserver for BandWatch {
         let pids: Vec<_> = self
             .wanted
             .iter()
-            .filter_map(|label| announced(&self.seen, label).map(|pid| (*label, pid)))
+            .filter_map(|wanted| announced(&self.seen, wanted.0).map(|pid| (*wanted, pid)))
             .collect();
         if pids.len() == self.wanted.len() {
             if let Some(announce) = self.announce.take() {
@@ -355,7 +362,7 @@ fn watched_band_run(
     label: &str,
     script: &str,
     stdin: Option<&[u8]>,
-    wanted: &'static [&'static str],
+    wanted: &'static [Wanted],
 ) -> Vec<Reading> {
     let mut watch = BandWatch::start(wanted);
     let mut cmd = Command::new("/bin/sh");
@@ -404,18 +411,20 @@ fn assert_in_band(readings: &[Reading], what: &str) {
     }
 }
 
-/// A demoted child that has exec'd is at the background priority when its
+/// The timeline case: a demoted child that never execs (it stays the shell,
+/// waiting on a foreground `sleep`) is at the background priority when its
 /// parent reads it, however loaded the host is. The child waits for a line on
 /// stdin, which the run feeds only after the demotion, so the demotion is
-/// already applied when it prints its pid and execs.
+/// already applied when it prints its pid. Its sibling `adv_band_survives_exec`
+/// is the other case: the same child after an exec.
 #[test]
 fn adv_flake_timeline_time_to_demotion() {
     let started = Instant::now();
     let readings = watched_band_run(
         "adv-timeline",
-        "read go; echo self=$$; exec /bin/sleep 600",
+        "read go; echo self=$$; /bin/sleep 600",
         Some(b"go\n"),
-        &["self"],
+        &[("self", "sh")],
     );
     eprintln!("TIMELINE {readings:?} wall={:?}", started.elapsed());
     assert_in_band(&readings, "never demoted");
@@ -444,7 +453,7 @@ fn adv_break_child_that_execs_at_once_misses_the_band() {
             "adv-race",
             "echo self=$$; exec /bin/sleep 600",
             None,
-            &["self"],
+            &[("self", "sleep")],
         );
         missed += readings.iter().filter(|r| r.pri >= 10).count();
     }
@@ -506,7 +515,7 @@ fn adv_band_survives_exec() {
         "adv-exec",
         "read go; echo self=$$; exec /bin/sleep 600",
         Some(b"go\n"),
-        &["self"],
+        &[("self", "sleep")],
     );
     eprintln!("EXEC {readings:?}");
     assert_in_band(&readings, "left the band across exec");
@@ -532,7 +541,7 @@ fn adv_break_grandchild_of_a_demoted_child_misses_the_band() {
             "adv-grand",
             "read go; /bin/sleep 600 & echo grand=$!; echo self=$$; exec /bin/sleep 600",
             Some(b"go\n"),
-            &["grand", "self"],
+            &[("grand", "sleep"), ("self", "sleep")],
         );
         missed += readings.iter().filter(|r| r.pri >= 10).count();
     }

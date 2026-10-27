@@ -74,6 +74,41 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatUsage, wantsHelp } from "./usage.mjs";
 
+/** How long one `git` call may take. These calls are `rev-parse` and `status`
+ *  on a local checkout: milliseconds, unless git is stuck on a lock, a network
+ *  home or a hung fsmonitor, and then nothing else in this process can stop it. */
+const GIT_TIMEOUT_MS = 30_000;
+
+/** A `git` call that ran past its bound. Distinct from "git failed", which the
+ *  callers below treat as "this is not a git checkout": a hang is not that. */
+class GitTimeout extends Error {}
+
+/**
+ * Runs `git` with a bound, and reports a timeout as an error that names the
+ * command. Any other failure is the caller's to interpret.
+ *
+ * `GITPULSE_VENDOR_GIT_TIMEOUT_MS` replaces the bound (a positive integer).
+ *
+ * @param {string[]} args
+ * @returns {string}
+ */
+function runGit(args) {
+  const configured = Number(process.env.GITPULSE_VENDOR_GIT_TIMEOUT_MS);
+  const timeout = Number.isInteger(configured) && configured > 0 ? configured : GIT_TIMEOUT_MS;
+  try {
+    return execFileSync("git", args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout,
+    });
+  } catch (error) {
+    if (/** @type {{ code?: string }} */ (error).code === "ETIMEDOUT") {
+      throw new GitTimeout(`\`git ${args.join(" ")}\` did not finish within ${timeout} ms`);
+    }
+    throw error;
+  }
+}
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, "..");
 
@@ -192,16 +227,20 @@ export function findSibling(name, from = REPO) {
   // `/Code/devtools/<name>`. This also works when the worktree lives under an
   // agent-owned `.codex/worktrees/` directory at an unrelated depth.
   try {
-    const commonDir = execFileSync(
-      "git",
-      ["-C", from, "rev-parse", "--path-format=absolute", "--git-common-dir"],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-    ).trim();
+    const commonDir = runGit([
+      "-C",
+      from,
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-common-dir",
+    ]).trim();
     const gitDir = path.resolve(from, commonDir);
     const canonical = path.dirname(gitDir);
     const candidate = path.join(path.dirname(canonical), name);
     if (existsSync(candidate)) return candidate;
-  } catch {
+  } catch (error) {
+    // A hung git is a failure to report, not a layout to guess around.
+    if (error instanceof GitTimeout) throw error;
     // The explicit environment variables remain the escape hatch for a
     // non-Git source tree or an unusual Git directory layout.
   }
@@ -543,11 +582,9 @@ function walk(dir, prefix = "") {
 /** @param {string} root */
 function gitCommit(root) {
   try {
-    return execFileSync("git", ["-C", root, "rev-parse", "HEAD"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-  } catch {
+    return runGit(["-C", root, "rev-parse", "HEAD"]).trim();
+  } catch (error) {
+    if (error instanceof GitTimeout) throw error;
     return "";
   }
 }
@@ -572,12 +609,10 @@ function gitCommit(root) {
  */
 function gitSubtreeDirty(root, relDir) {
   try {
-    const out = execFileSync("git", ["-C", root, "status", "--porcelain", "--", relDir], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
+    const out = runGit(["-C", root, "status", "--porcelain", "--", relDir]);
     return out.trim() !== "";
-  } catch {
+  } catch (error) {
+    if (error instanceof GitTimeout) throw error;
     // Not a git checkout, or git is unavailable. `commit` is already "" in that
     // case, so there is no commit claim to qualify.
     return false;

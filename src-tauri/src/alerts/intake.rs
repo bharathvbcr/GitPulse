@@ -486,19 +486,32 @@ impl Intake {
         offer
     }
 
-    /// Spends every token of the bucket that session-less reports share, and
-    /// says whether it ended empty. Reads and writes that bucket and nothing
-    /// else: no queue slot, order book entry, twin memory or counter, so a test
-    /// that empties it cannot disturb another test's reports.
+    /// Spends every token of the bucket that session-less reports share, holds
+    /// its refill off until [`Intake::release_outside_bucket`], and says whether
+    /// it ended empty. Reads and writes that bucket and nothing else: no queue
+    /// slot, order book entry, twin memory or counter, so a test that empties it
+    /// cannot disturb another test's reports. Held, it is empty for as long as
+    /// the test runs, not for the quarter second the bucket would take to regain
+    /// a token.
     #[cfg(all(test, unix))]
     pub(super) fn exhaust_outside_bucket(&self) -> bool {
         let mut limits = self
             .limits
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        limits.hold_outside_refill(true);
         let now = std::time::Instant::now();
         (0..super::limits::OUTSIDE_BURST as usize + 1)
             .any(|_| !limits.admit("hook-exhaust", true, now))
+    }
+
+    /// Lets the outside bucket refill again, from now.
+    #[cfg(all(test, unix))]
+    pub(super) fn release_outside_bucket(&self) {
+        self.limits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .hold_outside_refill(false);
     }
 
     /// The checks a peer's report meets before it can leave a trace: order

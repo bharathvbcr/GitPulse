@@ -180,7 +180,7 @@ impl<'de> Visitor<'de> for Kept {
 
 /// The fields `notify` uses, out of `bytes`, accepting and refusing what the
 /// whole-document parse did.
-pub(super) fn kept_fields(bytes: &[u8]) -> Result<HookInput, String> {
+fn kept_fields(bytes: &[u8]) -> Result<HookInput, String> {
     let text = std::str::from_utf8(bytes).map_err(|e| format!("hook stdin is not UTF-8: {e}"))?;
     let mut de = serde_json::Deserializer::from_str(text.trim());
     let value = de
