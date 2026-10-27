@@ -597,3 +597,5 @@ fn the_process_wide_entry_points_reach_the_socket_named_by_the_environment() {
     }
     assert!(fake.next_request(Duration::from_millis(200)).is_none());
 }
+
+mod adv_w3b_graft_differential;

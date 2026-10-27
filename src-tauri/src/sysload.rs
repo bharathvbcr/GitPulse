@@ -414,3 +414,6 @@ mod tests {
         assert_eq!(Platform::current(), Platform::Unavailable);
     }
 }
+
+#[cfg(test)]
+mod adv_w3b_thread_cpu;
