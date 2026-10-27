@@ -41,9 +41,53 @@ export interface SessionAlertStatus {
   bridge_rejected: number;
   /** Well-formed hook reports that arrived behind a later one from the same session and were dropped. */
   stale: number;
+  /**
+   * Hook reports in the last 7 days that got no reply from GitPulse before the
+   * hook's own deadline, from the record the hooks write beside the socket. The
+   * hook's count: not part of `bridge_rejected`, and not "lost", because the
+   * app may have applied a report the hook had stopped waiting for. A floor
+   * when `hook_drop_record_error` is set.
+   */
+  hook_replies_missed: number;
+  /** The newest of them, as `<event> at <UTC time>`. */
+  hook_reply_missed_last: string | null;
+  /** Why that record could not be read in full. Unknown is never shown as 0. */
+  hook_drop_record_error: string | null;
   bridge_listening: boolean;
   bridge_path: string | null;
   last_error: string | null;
+}
+
+/** What the panel says about replies the hooks stopped waiting for. */
+export interface HookReplyMisses {
+  /** `null` when there is nothing to say: no misses on record. */
+  line: string | null;
+  /** The record could not be read in full; shown as its own alert. */
+  error: string | null;
+}
+
+/**
+ * The sentence for `hook_replies_missed`, and the record's read error apart
+ * from it.
+ *
+ * Its own number, in its own words: the hook's wait, never added to
+ * `bridge_rejected` (which counts what the socket refused) and never called
+ * "lost", because a report the hook stopped waiting for may well have been
+ * applied. With nothing counted and an error, only the error is said: an
+ * unreadable record is not a clean zero.
+ */
+export function hookReplyMisses(status: SessionAlertStatus): HookReplyMisses {
+  const count = status.hook_replies_missed;
+  const last = status.hook_reply_missed_last ? ` (last: ${status.hook_reply_missed_last})` : "";
+  const reports = count === 1 ? "1 hook report" : `${count} hook reports`;
+  return {
+    line:
+      count > 0
+        ? `${reports} in the last 7 days got no reply from GitPulse in time${last}. ` +
+          "A missed SessionEnd can leave that agent's banner standing; hooks do not retry."
+        : null,
+    error: status.hook_drop_record_error,
+  };
 }
 
 export interface SessionAlertsView {
@@ -87,6 +131,9 @@ const EMPTY_STATUS: SessionAlertStatus = {
   failed: 0,
   bridge_rejected: 0,
   stale: 0,
+  hook_replies_missed: 0,
+  hook_reply_missed_last: null,
+  hook_drop_record_error: null,
   bridge_listening: false,
   bridge_path: null,
   last_error: null,

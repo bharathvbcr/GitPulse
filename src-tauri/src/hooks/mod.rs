@@ -43,7 +43,7 @@ use crate::harness::{self, PolicyStatus, ScopedVerdict};
 use crate::insights::{self, same_path, CollisionRisk, InsightsSnapshot};
 
 pub mod advisory_once;
-mod notify_drops;
+pub(crate) mod notify_drops;
 mod notify_input;
 mod notify_outcome;
 use notify_drops::{DropSnapshot, NotifyDrops};
@@ -2209,14 +2209,20 @@ fn run_notify_with(
     // Detached at the deadline. A hook the host is waiting on must not be held
     // by a socket that is not answering, and the report is worth nothing late.
     let send_budget = send_budget.unwrap_or_else(|| notify_input::budgets_for(event.name).1);
+    // The worker owns `path` and may outlive this call; the record beside it is
+    // written from the same resolved path, not from a second lookup.
+    let socket = path.clone();
     match within_budget_typed(send_budget, move || send(&path, &payload)) {
         Ok(Ok(())) => Ok(HookOutput::silent()),
         // The socket's own deadline ended the wait before the outer budget did.
         // Same fact, same count: which of two timers fired is not a difference
         // a reader of the count may depend on.
-        Ok(Err(SendError::NoReply)) | Err(BudgetMiss::TimedOut) => {
-            Err(missed_reply(event.name, drops))
-        }
+        Ok(Err(SendError::NoReply)) | Err(BudgetMiss::TimedOut) => Err(missed_reply(
+            event.name,
+            drops,
+            &socket,
+            session_env().as_deref(),
+        )),
         Ok(Err(error)) => Err(error.into()),
         // A dead worker is not a late reply: nothing was awaited past a bound.
         // Said as what it is, at warn, and never counted.
@@ -2231,10 +2237,22 @@ fn run_notify_with(
     }
 }
 
-/// Counts one report whose reply missed its bound, and says so. Counted where
-/// the give-up is decided; a reply that arrives in time never reaches here.
-fn missed_reply(event: &str, drops: &NotifyDrops) -> HookError {
+/// Counts one report whose reply missed its bound, writes it down beside the
+/// socket it was sent to, and says so. Counted where the give-up is decided; a
+/// reply that arrives in time never reaches here. A record that cannot be
+/// written adds a clause to the line and changes nothing else: same error, same
+/// count.
+fn missed_reply(
+    event: &str,
+    drops: &NotifyDrops,
+    socket: &std::path::Path,
+    session: Option<&str>,
+) -> HookError {
     drops.record();
+    let not_recorded = match drops.append_record(socket, event, session) {
+        Some(Err(reason)) => format!("; not recorded: {reason}"),
+        Some(Ok(())) | None => String::new(),
+    };
     let DropSnapshot {
         dropped,
         dropped_scope,
@@ -2242,7 +2260,7 @@ fn missed_reply(event: &str, drops: &NotifyDrops) -> HookError {
     HookError::Failed(format!(
         "notification report ({event}) got no reply (the deadline passed or the peer closed \
          without one); not retried \
-         ({dropped} dropped, scope {dropped_scope})"
+         ({dropped} dropped, scope {dropped_scope}{not_recorded})"
     ))
 }
 
@@ -2788,6 +2806,8 @@ fn truncate_marked(mut text: String, limit: usize) -> String {
 
 #[cfg(test)]
 mod adv_l5_tests;
+#[cfg(all(test, unix))]
+mod adv_w3c_tests;
 #[cfg(test)]
 mod hidden_channel_tests;
 #[cfg(test)]
@@ -2798,6 +2818,8 @@ mod notify_input_attack_tests;
 mod notify_input_tests;
 #[cfg(test)]
 mod notify_protocol_tests;
+#[cfg(all(test, unix))]
+mod notify_record_tests;
 #[cfg(test)]
 mod notify_routes_tests;
 #[cfg(test)]
@@ -5918,8 +5940,13 @@ done
     #[test]
     fn a_socket_that_never_answers_does_not_hold_the_users_turn() {
         let serial = crate::test_support::env::env_serial();
-        let _env = crate::test_support::env::bind_env(&serial)
-            .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
+        // The process's own count writes its record beside the socket, so the
+        // socket is in a directory this test owns.
+        let dir = tempfile::tempdir().expect("socket directory");
+        let _env = crate::test_support::env::bind_env(&serial).set(
+            crate::alerts::bridge::SOCKET_ENV,
+            dir.path().join("hook.sock"),
+        );
         let started = std::time::Instant::now();
         let error = run_notify(Some("idle_prompt"), &notify_input(), |_, _| {
             thread::sleep(Duration::from_secs(30));
@@ -5942,9 +5969,13 @@ done
     #[test]
     fn a_session_end_report_whose_reply_misses_its_bound_is_counted_once() {
         let serial = crate::test_support::env::env_serial();
+        let dir = tempfile::tempdir().expect("socket directory");
         let _env = crate::test_support::env::bind_env(&serial)
             .set(crate::alerts::bridge::SESSION_ENV, "term-4-1")
-            .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
+            .set(
+                crate::alerts::bridge::SOCKET_ENV,
+                dir.path().join("hook.sock"),
+            );
         let drops = NotifyDrops::new();
         assert_eq!(drops.snapshot().dropped, 0);
         let (release, held) = mpsc::channel::<()>();

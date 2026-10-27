@@ -45,6 +45,9 @@ function viewWith(overrides: Partial<{ enabled: boolean; delivered: number }> = 
       failed: 0,
       bridge_rejected: 0,
       stale: 0,
+      hook_replies_missed: 0,
+      hook_reply_missed_last: null as string | null,
+      hook_drop_record_error: null as string | null,
       bridge_listening: true,
       bridge_path: "/tmp/bridge.sock",
       last_error: null,
@@ -66,6 +69,33 @@ describe("loading the alert settings", () => {
     expect(view.settings).toEqual(store.DEFAULT_SESSION_ALERT_SETTINGS);
     expect(invoke).not.toHaveBeenCalled();
     expect(store.sessionAlertSettings()).toEqual(store.DEFAULT_SESSION_ALERT_SETTINGS);
+  });
+
+  it("starts with no hook reply misses on record and no record error, before the backend has said", async () => {
+    isTauri.mockReturnValue(false);
+    const store = await freshStore();
+    const { status } = get(store.sessionAlerts);
+    expect(status.hook_replies_missed).toBe(0);
+    expect(status.hook_reply_missed_last).toBeNull();
+    expect(status.hook_drop_record_error).toBeNull();
+    expect(store.hookReplyMisses(status)).toEqual({ line: null, error: null });
+  });
+
+  it("carries the three hook record fields from the backend untouched", async () => {
+    isTauri.mockReturnValue(true);
+    const view = viewWith();
+    Object.assign(view.status, {
+      hook_replies_missed: 2,
+      hook_reply_missed_last: "session_ended at 2026-10-27T12:00:00.000Z",
+      hook_drop_record_error: "could not be read in full",
+    });
+    invoke.mockResolvedValue(view);
+    const store = await freshStore();
+    await store.loadSessionAlerts();
+    const { status } = get(store.sessionAlerts);
+    expect(status.hook_replies_missed).toBe(2);
+    expect(status.hook_reply_missed_last).toBe("session_ended at 2026-10-27T12:00:00.000Z");
+    expect(status.hook_drop_record_error).toBe("could not be read in full");
   });
 
   it("loads once and serves every later reader from the cache", async () => {
