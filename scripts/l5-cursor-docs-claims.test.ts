@@ -8,9 +8,9 @@
  * page is only as good as the search behind it, so this file pins two things:
  *
  * - the sentences already shown false stay out of the text, and
- * - the row says where its absence claims were checked, so a reader can rerun
- *   the search (`tmp/build-1026/l5-docs-absence.sh` searches every saved page
- *   copy for each name and its spellings).
+ * - the row describes how its absence claims were checked (which pages, saved
+ *   when, one name per search, untruncated counts), so a reader can rerun the
+ *   search against the live pages.
  *
  * Source for the corrected claims, fetched 2026-10-26 and 2026-10-27:
  * https://cursor.com/docs/hooks, "Common input fields":
@@ -51,9 +51,21 @@ describe("absence claims in the Cursor rows of docs/QUALIFICATION.md", () => {
     expect(section).toMatch(/no `async` hook option/);
   });
 
-  it("says where its absence claims were checked", () => {
-    expect(section).toMatch(/l5-docs-absence\.sh/);
-    expect(section).toMatch(/l5-rework2\.md/);
+  it("describes how its absence claims were checked, with page URLs", () => {
+    for (const page of [
+      "https://cursor.com/docs/hooks",
+      "https://cursor.com/docs/reference/plugins",
+      "https://cursor.com/docs/reference/third-party-hooks",
+      "https://cursor.com/docs/plugins",
+    ]) {
+      expect(section, page).toContain(page);
+    }
+    expect(section).toMatch(/one name per command/);
+    expect(section).toMatch(/never truncated/);
+  });
+
+  it("points at nothing outside the repository", () => {
+    expect(section).not.toMatch(/tmp\/|scratchpad|l5-docs-absence|l5-rework/);
   });
 
   it("does not claim the nested hookSpecificOutput format is unsupported", () => {
