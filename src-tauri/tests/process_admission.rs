@@ -209,6 +209,7 @@ fn no_shipped_source_lifts_the_spawn_rate_cap() {
 ///   - a lift in dead code, or in a macro body that is never expanded;
 ///   - a local function that shadows the lifting wrapper's name and does
 ///     nothing.
+///
 /// Each needs the call graph, which `devmap` has and this test does not.
 /// The run-time answer is the instrumented gate: log every spawn a suite makes
 /// under the production rate (the adversary's `apply_metered_log.py`).
