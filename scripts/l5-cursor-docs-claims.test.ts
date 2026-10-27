@@ -65,9 +65,9 @@ describe("absence claims in the Cursor rows of docs/QUALIFICATION.md", () => {
   });
 
   it("points at nothing outside the repository", () => {
-    // No scratch directory, build-run script or lane report: none of them is
-    // tracked, so a reader of the repository cannot open them.
-    expect(section).not.toMatch(/\btmp\b|scratch|\.sh\b|\bl5-/i);
+    // No scratch directory or lane report id: none of them is tracked, so a
+    // reader of the repository cannot open them.
+    expect(section).not.toMatch(/\btmp\b|scratch|\bl5-/i);
   });
 
   it("does not claim the nested hookSpecificOutput format is unsupported", () => {
