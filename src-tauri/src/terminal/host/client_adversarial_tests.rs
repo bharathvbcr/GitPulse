@@ -1455,3 +1455,6 @@ fn a_hundred_threads_ask_through_failing_listings_and_their_retries() {
     let worst = Duration::from_micros(worst.load(Ordering::Acquire));
     assert!(worst < PROMPT, "the slowest check took {worst:?}");
 }
+
+#[path = "adv_w3a_tests.rs"]
+mod adv_w3a;
