@@ -41,11 +41,19 @@
     open,
     onClose,
     load,
+    expanded = $bindable(false),
   }: {
     open: boolean;
     onClose: () => void;
     /** Loader for TerminalPanel, declared at module scope by the caller. */
     load: ViewLoader;
+    /**
+     * The dock fills its column, leaving the view above it no height. Bound
+     * by the host, which must then hide that view: a zero-height view still
+     * paints whatever it positions — Work's Proposals pill, a banner — over
+     * the terminal, and keeps those controls in the tab order.
+     */
+    expanded?: boolean;
   } = $props();
 
   // svelte-ignore state_referenced_locally
@@ -101,7 +109,6 @@
 
   let host: HTMLDivElement | undefined = $state();
   let dragging = $state(false);
-  let expanded = $state(false);
   /** Height of the column the dock shares with the view, for the ceiling. */
   let containerHeight = $state(0);
   /**

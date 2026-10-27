@@ -35,7 +35,8 @@ describe("TerminalDock", () => {
   // restores both original tabs"; "Go to switches to that repository without
   // spawning anything new" and "Go to leaves its dock showing"; "the dock's
   // resize separator grows on ArrowUp and shrinks back on ArrowDown,
-  // reporting its value"; expand and restore.
+  // reporting its value"; expand and restore, with the view's Proposals pill
+  // hidden and unfocusable while expanded and back after restore.
   it("hosts a repository's panel, unseen, while a task terminal waits for it", () => {
     // A launch from a task sheet must start its agent without opening the
     // dock or showing the repository; the queued request is what asks for
@@ -104,6 +105,21 @@ describe("App hosts the terminal as a dock, not a view", () => {
   it("renders the dock inside the view column", () => {
     expect(app).toContain("<TerminalDock");
     expect(app).toContain("open={terminalDockOpen}");
+  });
+
+  it("hides the view, and takes it out of the tab order, while an open dock is expanded", () => {
+    // The expanded dock leaves the view zero height, and Work's Proposals pill
+    // (absolute, z-index 20) hung out of that box over the terminal. The rule
+    // is the view's, not the pill's, so every positioned control is covered.
+    // harness/terminal.html renders it: "an expanded dock hides the view's
+    // Proposals pill rather than painting it over the terminal".
+    expect(source).toContain("expanded = $bindable(false)");
+    expect(source).not.toContain("let expanded = $state(");
+    expect(app).toContain("bind:expanded={terminalDockExpanded}");
+    expect(app).toContain("const viewCoveredByTerminal = $derived(terminalDockOpen && terminalDockExpanded);");
+    expect(app).toMatch(
+      /<div class="gp-view[^"]*" style:visibility=\{viewCoveredByTerminal \? "hidden" : null\} inert=\{viewCoveredByTerminal\}>/,
+    );
   });
 
   it("no longer swaps the main pane out for a terminal", () => {

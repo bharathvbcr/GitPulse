@@ -239,6 +239,12 @@
   // used to open the dock over every other repository the user switched to,
   // and — because hosting a panel starts a shell — spawn a process in each.
   const terminalDockOpen = $derived($repoStore.terminalOpen);
+  let terminalDockExpanded = $state(false);
+  // An expanded dock takes the whole column. The view keeps its box (no
+  // display:none, which would replay the .gp-view entrance fade on restore and
+  // hand every measuring child a zero width), but nothing in it may paint over
+  // the terminal or take focus behind it.
+  const viewCoveredByTerminal = $derived(terminalDockOpen && terminalDockExpanded);
 
   // --- fleet keep-alive -----------------------------------------------------
   // Fleet is workspace-scoped, so it sits BESIDE the repository pane rather
@@ -1199,7 +1205,7 @@
                  per tab. The {#if} chain alone swaps panes; state lives in
                  stores. The per-repository leaves are keyed where they live,
                  inside ViewSectionPanel. -->
-            <div class="gp-view flex-1 flex flex-col min-h-0">
+            <div class="gp-view flex-1 flex flex-col min-h-0" style:visibility={viewCoveredByTerminal ? "hidden" : null} inert={viewCoveredByTerminal}>
               {#if $repoStore.activeTab === "work"}
                 <WorkspaceView
                   loadConflict={loadConflictEditor}
@@ -1237,6 +1243,7 @@
                  unmount the PTY. -->
             <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("terminal", error)}>
               <TerminalDock
+                bind:expanded={terminalDockExpanded}
                 open={terminalDockOpen}
                 onClose={() => repoStore.setTerminalOpen(false)}
                 load={loadTerminalPanel}
