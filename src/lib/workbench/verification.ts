@@ -122,3 +122,21 @@ export async function getVerdicts(ids: readonly string[]): Promise<Map<string, C
   }
   return verdicts;
 }
+
+/** Where `getBoardVerdicts` stops splitting: 16 reads, 4,096 cards. */
+export const MAX_VERDICT_READS = 16;
+
+/**
+ * `getVerdicts` for a board that holds more cards than one read takes —
+ * after Load more or Load all — in `MAX_VERDICT_BATCH` reads one after
+ * another. Past `MAX_VERDICT_READS` it refuses, as one oversized read does.
+ */
+export async function getBoardVerdicts(ids: readonly string[]): Promise<Map<string, CardVerdict>> {
+  const unique = [...new Set(ids)];
+  if (unique.length > MAX_VERDICT_BATCH * MAX_VERDICT_READS) throw new WorkbenchError("invalid_input", "Too many tasks on the board to read their verifications.");
+  const verdicts = new Map<string, CardVerdict>();
+  for (let start = 0; start < unique.length; start += MAX_VERDICT_BATCH) {
+    for (const [id, verdict] of await getVerdicts(unique.slice(start, start + MAX_VERDICT_BATCH))) verdicts.set(id, verdict);
+  }
+  return verdicts;
+}

@@ -27,10 +27,13 @@ describe("the verdict chip on a board card", () => {
   });
 });
 
-describe("the board reads verdicts once per load, in one batch, and says when it cannot", () => {
+describe("the board reads verdicts once per load, batched, and says when it cannot", () => {
   const board = readFileSync(new URL("./TaskBoard.svelte", import.meta.url), "utf8");
+  // One read per load, through getBoardVerdicts: it splits a board past one
+  // host batch (256 cards, after Load more or Load all) into reads of 256.
   it("makes one batched call per load and no per-card read", () => {
-    expect(board.match(/getVerdicts\(/g)).toHaveLength(1);
+    expect(board.match(/getBoardVerdicts\(/g)).toHaveLength(1);
+    expect(board).not.toMatch(/\bgetVerdicts\(/);
     expect(board).not.toMatch(/getVerification\(/);
   });
   it("draws the chip on the board card and the list row, and an error line when the read fails", () => {
