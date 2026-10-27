@@ -2806,6 +2806,8 @@ fn truncate_marked(mut text: String, limit: usize) -> String {
 
 #[cfg(test)]
 mod adv_l5_tests;
+#[cfg(all(test, unix))]
+mod adv_w3c_tests;
 #[cfg(test)]
 mod hidden_channel_tests;
 #[cfg(test)]

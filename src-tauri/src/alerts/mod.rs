@@ -1282,6 +1282,8 @@ fn prune(now: Instant, tracked: &mut HashMap<String, Tracked>) {
 }
 
 #[cfg(test)]
+mod adv_w3c_tests;
+#[cfg(test)]
 mod hook_drop_tests;
 #[cfg(all(test, unix))]
 mod intake_adv_tests;
