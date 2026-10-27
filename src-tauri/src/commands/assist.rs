@@ -86,11 +86,8 @@ pub async fn cmd_ai_generate_commit_message(
     base_url: Option<String>,
     model: Option<String>,
 ) -> Result<crate::ai::AiGeneration, IpcError> {
-    off_thread(move || {
-        crate::ai::generate_commit_message(&repo_path, selection(base_url, model))
-            .map_err(CommandError::from)
-    })
-    .await
+    off_thread(move || crate::ai::generate_commit_message(&repo_path, selection(base_url, model)))
+        .await
 }
 
 #[tauri::command(async)]
@@ -102,7 +99,6 @@ pub async fn cmd_ai_explain_commit(
 ) -> Result<crate::ai::AiGeneration, IpcError> {
     off_thread(move || {
         crate::ai::explain_commit(&repo_path, &commit_id, selection(base_url, model))
-            .map_err(CommandError::from)
     })
     .await
 }
@@ -114,11 +110,7 @@ pub async fn cmd_ai_fix_health(
     base_url: Option<String>,
     model: Option<String>,
 ) -> Result<crate::ai::AiGeneration, IpcError> {
-    off_thread(move || {
-        crate::ai::fix_health(&repo_path, &report, selection(base_url, model))
-            .map_err(CommandError::from)
-    })
-    .await
+    off_thread(move || crate::ai::fix_health(&repo_path, &report, selection(base_url, model))).await
 }
 
 #[tauri::command(async)]
@@ -128,11 +120,8 @@ pub async fn cmd_ai_coverage_report(
     base_url: Option<String>,
     model: Option<String>,
 ) -> Result<crate::ai::AiGeneration, IpcError> {
-    off_thread(move || {
-        crate::ai::coverage_report(&repo_path, &report, selection(base_url, model))
-            .map_err(CommandError::from)
-    })
-    .await
+    off_thread(move || crate::ai::coverage_report(&repo_path, &report, selection(base_url, model)))
+        .await
 }
 
 #[tauri::command(async)]
@@ -141,9 +130,5 @@ pub async fn cmd_ai_suggest_branch_name(
     base_url: Option<String>,
     model: Option<String>,
 ) -> Result<crate::ai::AiGeneration, IpcError> {
-    off_thread(move || {
-        crate::ai::suggest_branch_name(&repo_path, selection(base_url, model))
-            .map_err(CommandError::from)
-    })
-    .await
+    off_thread(move || crate::ai::suggest_branch_name(&repo_path, selection(base_url, model))).await
 }

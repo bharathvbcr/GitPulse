@@ -776,11 +776,7 @@ pub(crate) fn verification_base(worktree: &Path, head: &str) -> Result<String, C
         worktree,
         &[crate::engine::ref_cache::ALL_REFS],
         &["verification-base", head],
-        || {
-            verification_base_uncached(worktree, head)
-                .map(|base| (base, true))
-                .map_err(CommandError::from)
-        },
+        || verification_base_uncached(worktree, head).map(|base| (base, true)),
     )
 }
 
@@ -798,7 +794,6 @@ fn verification_base_uncached(worktree: &Path, head: &str) -> Result<String, Com
         ),
         &head,
     )
-    .map_err(CommandError::from)
 }
 
 fn resolve_commit(worktree: &Path, head: &str) -> Result<String, CommandError> {

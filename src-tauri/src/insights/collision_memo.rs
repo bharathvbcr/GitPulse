@@ -272,7 +272,7 @@ impl CollisionMemo {
                 .reads
                 .get_or_fill(path, self.ttl, || changed_paths_within(path, None));
             oldest.fetch_max(age.as_millis() as u64, Ordering::Relaxed);
-            read.map_err(CommandError::from)
+            read
         };
         let live = live_in(observation, &list);
         (

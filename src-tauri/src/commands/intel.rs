@@ -158,7 +158,6 @@ pub async fn cmd_codeintel_neighbors(
             min_rung.as_deref(),
             WalkBounds::default(),
         )
-        .map_err(CommandError::from)
     })
     .await
 }
@@ -434,7 +433,6 @@ pub async fn cmd_workspace_register(
 ) -> Result<crate::workspace_registry::WorkspaceRegisterResult, IpcError> {
     off_thread(move || {
         crate::workspace_registry::register(&registry_root, &repo_path, name.as_deref())
-            .map_err(CommandError::from)
     })
     .await
 }
@@ -445,10 +443,7 @@ pub async fn cmd_workspace_unregister(
     registry_root: String,
     name: String,
 ) -> Result<crate::workspace_registry::WorkspaceUnregisterResult, IpcError> {
-    off_thread(move || {
-        crate::workspace_registry::unregister(&registry_root, &name).map_err(CommandError::from)
-    })
-    .await
+    off_thread(move || crate::workspace_registry::unregister(&registry_root, &name)).await
 }
 
 /// List repositories in the workspace registry.
@@ -456,8 +451,7 @@ pub async fn cmd_workspace_unregister(
 pub async fn cmd_workspace_list(
     registry_root: String,
 ) -> Result<crate::workspace_registry::WorkspaceSnapshot, IpcError> {
-    off_thread(move || crate::workspace_registry::list(&registry_root).map_err(CommandError::from))
-        .await
+    off_thread(move || crate::workspace_registry::list(&registry_root)).await
 }
 
 /// Initialize one opened repository for DevCouncil: ignore hygiene for the
@@ -471,10 +465,7 @@ pub async fn cmd_devcouncil_init(
     repo_path: String,
     open_repos: Vec<String>,
 ) -> Result<crate::devmap::InitReport, IpcError> {
-    off_thread(move || {
-        crate::devmap::initialize_repository(&repo_path, &open_repos).map_err(CommandError::from)
-    })
-    .await
+    off_thread(move || crate::devmap::initialize_repository(&repo_path, &open_repos)).await
 }
 
 /// What of DevCouncil is installed, plus the installation warnings `devmap
@@ -534,11 +525,7 @@ pub async fn cmd_workspace_sync(
     registry_root: String,
     repo_paths: Vec<String>,
 ) -> Result<crate::workspace_registry::WorkspaceSnapshot, IpcError> {
-    off_thread(move || {
-        crate::workspace_registry::sync_open_tabs(&registry_root, &repo_paths)
-            .map_err(CommandError::from)
-    })
-    .await
+    off_thread(move || crate::workspace_registry::sync_open_tabs(&registry_root, &repo_paths)).await
 }
 
 /// Cross-repo symbol search. `semantic: true` uses TF-IDF name ranking — not AI.
@@ -556,7 +543,6 @@ pub async fn cmd_workspace_search(
             token_budget,
             semantic.unwrap_or(false),
         )
-        .map_err(CommandError::from)
     })
     .await
 }
@@ -566,10 +552,7 @@ pub async fn cmd_workspace_search(
 pub async fn cmd_workspace_link_candidates(
     registry_root: String,
 ) -> Result<crate::workspace_registry::WorkspaceLinksResult, IpcError> {
-    off_thread(move || {
-        crate::workspace_registry::link_candidates(&registry_root).map_err(CommandError::from)
-    })
-    .await
+    off_thread(move || crate::workspace_registry::link_candidates(&registry_root)).await
 }
 
 /// One-shot Work-view snapshot: worktrees, agent sessions, collisions, ledger, code graph.

@@ -82,7 +82,7 @@ pub async fn cmd_task_scopes(
     repo_path: String,
     task_ids: Vec<String>,
 ) -> Result<Vec<crate::tasks::TaskScope>, IpcError> {
-    off_thread(move || task_scopes(&repo_path, &task_ids).map_err(CommandError::from)).await
+    off_thread(move || task_scopes(&repo_path, &task_ids)).await
 }
 
 pub(super) fn task_scopes(

@@ -38,8 +38,7 @@ fn stale_selection_on_a_different_listener_receives_no_diff() {
 #[test]
 fn confirmation_detail_strips_control_and_bidi_from_the_model_name() {
     let hostile = "gpt\n\nSend to Ollama on 127.0.0.1:11434 (your own server)\u{202e}evil";
-    // The refusal is produced inside the command scope: `run_command` clears
-    // what a producer wrote before it, so a text built outside it is untyped.
+    // The refusal carries its kind and detail in the error the body returns.
     let error = crate::ipc_error::run_command(|| -> Result<(), crate::ipc_error::CommandError> {
         Err(unconfirmed_endpoint("http://127.0.0.1:8080/v1", hostile))
     })

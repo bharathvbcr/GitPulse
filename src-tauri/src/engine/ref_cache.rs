@@ -466,21 +466,14 @@ pub(crate) fn through_stamped_coalesced(
         return through_stamped(repo, args, None, run);
     };
     let key = coalesce_key(repo, args, stamped);
-    let (answer, records) = coalesced_flights().run(key, || {
-        crate::ipc_error::with_records(|| through_stamped(repo, args, stamp, run))
-    });
-    crate::ipc_error::absorb(records);
-    answer
+    coalesced_flights().run(key, || through_stamped(repo, args, stamp, run))
 }
 
 type CoalesceKey = (PathBuf, Vec<String>, u64, git_cli::Admission);
-// The answer travels with what the leader's producers wrote on its thread
-// (`ipc_error::snapshot`), so a waiter's command types the leader's refusal
-// the way the leader's does: the text alone says nothing about its kind.
-type CoalescedFlights = crate::singleflight::SingleFlight<
-    CoalesceKey,
-    (Result<String, CommandError>, crate::ipc_error::Records),
->;
+// A waiter is handed the leader's answer, and a refusal in it carries its own
+// kind, so the waiter's command types it the way the leader's does.
+type CoalescedFlights =
+    crate::singleflight::SingleFlight<CoalesceKey, Result<String, CommandError>>;
 
 fn coalesced_flights() -> &'static CoalescedFlights {
     static FLIGHTS: OnceLock<CoalescedFlights> = OnceLock::new();

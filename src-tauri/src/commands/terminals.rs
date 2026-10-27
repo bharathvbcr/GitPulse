@@ -82,7 +82,6 @@ pub async fn cmd_terminal_spawn(
             env,
             crate::terminal::OutputSink::channel(on_output),
         )
-        .map_err(CommandError::from)
     })
     .await
 }
@@ -291,10 +290,7 @@ pub async fn cmd_terminal_run(
     args: Vec<String>,
     timeout_secs: Option<u64>,
 ) -> Result<crate::terminal::TerminalRunResult, IpcError> {
-    off_thread(move || {
-        crate::terminal::run_terminal(&repo_path, &args, timeout_secs).map_err(CommandError::from)
-    })
-    .await
+    off_thread(move || crate::terminal::run_terminal(&repo_path, &args, timeout_secs)).await
 }
 
 /// Runs one model-authored health or coverage command through the app's
@@ -312,7 +308,6 @@ pub async fn cmd_manvi_run_action(
 ) -> Result<crate::terminal::TerminalRunResult, IpcError> {
     off_thread(move || {
         crate::terminal::run_manvi_action(&repo_path, &args, action_kind, timeout_secs)
-            .map_err(CommandError::from)
     })
     .await
 }

@@ -677,7 +677,6 @@ impl GitWriter {
             Ok(())
         })
         .map(|_| ())
-        .map_err(CommandError::from)
     }
 
     /// Stages many files in a bounded number of git processes and reports each
@@ -812,7 +811,6 @@ impl GitWriter {
             Ok(())
         })
         .map(|_| ())
-        .map_err(CommandError::from)
     }
 
     /// One native request and lock for a selection. All paths and all policy
@@ -1270,10 +1268,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
             missing.join(" and "),
             if missing.len() == 1 { "is" } else { "are" }
         );
-        Err(CommandError::typed(
-            kind,
-            crate::ipc_error::typed_text(kind, message),
-        ))
+        Err(CommandError::typed(kind, message))
     }
 
     /// Both identity guards every path that records a commit runs first: an
@@ -1351,7 +1346,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 }
                 if let Err(abort) = run(&["merge", "--abort"]) {
                     if refused(abort.message()) {
-                        return Err(abort.into());
+                        return Err(abort);
                     }
                     run(&["reset", "--merge"]).map_err(|reset| {
                         if refused(reset.message()) {
@@ -2231,14 +2226,12 @@ Unset the local override with `git config --local --unset-all user.name` and \
                     .to_string()
                     .into(),
             ),
-            Err(error) => Err(error
-                .wrap(|error| {
-                    format!(
-                "Could not tell whether this is a partial clone, so no commit-graph write is \
+            Err(error) => Err(error.wrap(|error| {
+                format!(
+                    "Could not tell whether this is a partial clone, so no commit-graph write is \
                  offered: {error}"
-            )
-                })
-                .into()),
+                )
+            })),
         }
     }
 
@@ -2362,7 +2355,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         if let (false, Ok(outcome)) = (ran.get(), answer.as_mut()) {
             outcome.joined = true;
         }
-        answer.map_err(CommandError::from)
+        answer
     }
 
     fn commit_graph_write_run(
@@ -2720,13 +2713,15 @@ Unset the local override with `git config --local --unset-all user.name` and \
             match std::fs::remove_file(&message) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(SquashFailure::Commit(
-                    format!(
+                Err(e) => {
+                    return Err(SquashFailure::Commit(
+                        format!(
                         "The squash of {branch} staged nothing, but {} could not be removed: {e}",
                         message.display()
                     )
-                    .into(),
-                )),
+                        .into(),
+                    ))
+                }
             }
             return Ok(false);
         }

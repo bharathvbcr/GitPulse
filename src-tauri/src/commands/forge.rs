@@ -137,10 +137,7 @@ pub async fn cmd_github_pr_view(
     repo_path: String,
     number: u64,
 ) -> Result<crate::github::PullRequestDetail, IpcError> {
-    off_thread(move || {
-        crate::github::view_pull_request(&repo_path, number).map_err(CommandError::from)
-    })
-    .await
+    off_thread(move || crate::github::view_pull_request(&repo_path, number)).await
 }
 
 /// Creates, reviews or merges a pull request through gh. Each is published
@@ -395,5 +392,5 @@ pub async fn cmd_firebase_create_rollout(
 /// git-native verification note on HEAD. See `ci_local` for both.
 #[tauri::command(async)]
 pub async fn cmd_ci_local(repo_path: String) -> Result<crate::ci_local::CiLocalReport, IpcError> {
-    off_thread(move || crate::ci_local::run_ci_local(&repo_path).map_err(CommandError::from)).await
+    off_thread(move || crate::ci_local::run_ci_local(&repo_path)).await
 }

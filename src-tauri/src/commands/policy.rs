@@ -193,12 +193,7 @@ pub async fn cmd_harness_reconnect() -> crate::harness::HarnessStatus {
 /// into the webview.
 #[tauri::command(async)]
 pub async fn cmd_claude_key_status() -> Result<bool, IpcError> {
-    off_thread(|| {
-        crate::harness::claude_key::Keychain::system()?
-            .present()
-            .map_err(CommandError::from)
-    })
-    .await
+    off_thread(|| crate::harness::claude_key::Keychain::system()?.present()).await
 }
 
 /// Saves the Claude API key Manvi uses when Claude is its model, replacing

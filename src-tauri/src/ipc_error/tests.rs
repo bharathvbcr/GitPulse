@@ -1,6 +1,7 @@
 use super::*;
 use crate::engine::git_cli::{mark_user_action, refusal_message, Refusal};
 use crate::engine::stash::STALE_STACK_HINT;
+use crate::ipc_error::CommandError;
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -33,7 +34,7 @@ fn kind_name(kind: IpcErrorKind) -> String {
 
 /// A command body that fails with `text`, which a producer wrote as `kind`.
 fn written_as(kind: IpcErrorKind, text: String) -> IpcError {
-    run_command(|| Err::<(), _>(typed_text(kind, text))).expect_err("the body failed")
+    run_command(|| Err::<(), _>(CommandError::typed(kind, text))).expect_err("the body failed")
 }
 
 /// A command body that fails with `text` nobody typed: what a wrapping layer,
@@ -43,7 +44,7 @@ fn plain(text: &str) -> IpcError {
 }
 
 /// A command body that is a named read on the replay-safe list.
-fn read<T>(body: impl FnOnce() -> Result<T, String>) -> Result<T, IpcError> {
+fn read<T>(body: impl FnOnce() -> Result<T, CommandError>) -> Result<T, IpcError> {
     run_command_as(Some("cmd_get_status"), body)
 }
 
@@ -215,8 +216,8 @@ fn a_mutations_own_deferral_is_never_typed_retryable() {
 
 /// The engine puts its own words in front of a runner failure in about twenty
 /// places (`Blame unavailable: <deferral>`). A READ that the spawn gate declined
-/// is retried whatever the words, because the gate recorded the refusal on this
-/// thread during this command and asking a read again is harmless.
+/// is retried whatever the words, because the error keeps the gate's refusal as
+/// its origin through the wrapping and asking a read again is harmless.
 #[test]
 fn an_engine_prefixed_deferral_from_a_read_is_typed_retryable() {
     let error = read(|| {
@@ -226,10 +227,7 @@ fn an_engine_prefixed_deferral_from_a_read_is_typed_retryable() {
                 waited: Duration::from_millis(2000),
             },
         );
-        Err::<(), _>(format!(
-            "Blame unavailable: {written}",
-            written = written.message()
-        ))
+        Err::<(), _>(written.wrap(|written| format!("Blame unavailable: {written}")))
     })
     .expect_err("failed");
     assert_eq!(error.kind, IpcErrorKind::DeferredUnderLoad, "{error}");
@@ -248,23 +246,20 @@ fn the_same_wrapper_from_a_mutation_is_unclassified() {
                 waited: Duration::from_millis(2000),
             },
         );
-        Err::<(), _>(format!(
-            "Blame unavailable: {written}",
-            written = written.message()
-        ))
+        Err::<(), _>(written.wrap(|written| format!("Blame unavailable: {written}")))
     })
     .expect_err("failed");
     assert_eq!(error.kind, IpcErrorKind::Unclassified, "{error}");
 }
 
-/// A read that was declined once and then failed on something permanent is
-/// typed retryable too, because the record says "the gate refused something",
-/// not "this text is the refusal". That is bounded and harmless: the frontend
-/// asks again at most `MAX_DEFERRED_RETRIES` (5) times on a 3 s to 30 s
-/// backoff, then shows the error, whose message is the permanent one. The
-/// bound is pinned in `src/lib/ipc/invoke.test.ts`.
+/// A read that was declined once, recovered, and then failed on something
+/// permanent is not retried: the error it returns is the permanent one, and its
+/// origin is not the gate. The thread-local record typed this retryable
+/// because it remembered "the gate refused something"; the owner narrowed the
+/// loose rule to errors that carry the refusal when the record was deleted
+/// (2026-10-26, ft-b595921a). Unverified means not retried.
 #[test]
-fn a_read_declined_once_then_failed_for_good_is_retryable_and_keeps_its_message() {
+fn a_read_declined_once_then_failed_for_good_is_not_retried_and_keeps_its_message() {
     let error = read(|| {
         let _declined = refusal_message(
             "git status",
@@ -272,10 +267,10 @@ fn a_read_declined_once_then_failed_for_good_is_retryable_and_keeps_its_message(
                 waited: Duration::from_millis(2000),
             },
         );
-        Err::<(), _>("fatal: bad object HEAD".to_string())
+        Err::<(), _>("fatal: bad object HEAD".into())
     })
     .expect_err("failed");
-    assert_eq!(error.kind, IpcErrorKind::DeferredUnderLoad);
+    assert_eq!(error.kind, IpcErrorKind::Unclassified);
     assert_eq!(error.message, "fatal: bad object HEAD");
 }
 
@@ -289,18 +284,19 @@ fn a_deferral_one_command_saw_does_not_make_the_next_one_retryable() {
                 waited: Duration::from_millis(2000),
             },
         );
-        Err::<(), _>("one".to_string())
+        Err::<(), _>("one".into())
     });
     let second = plain("two");
     assert_eq!(second.kind, IpcErrorKind::Unclassified);
 }
 
 /// Text that spells a deferral but that no producer wrote is still nothing:
-/// the loose rule needs the gate's own record.
+/// the loose rule needs the gate's own refusal as the error's origin.
 #[test]
 fn deferral_text_with_no_producer_record_is_unclassified_even_for_a_read() {
     let inner = wire_message("deferred_under_load");
-    let error = read(|| Err::<(), _>(format!("Blame unavailable: {inner}"))).expect_err("failed");
+    let error =
+        read(|| Err::<(), _>(format!("Blame unavailable: {inner}").into())).expect_err("failed");
     assert_eq!(error.kind, IpcErrorKind::Unclassified);
 }
 
@@ -325,10 +321,7 @@ fn a_command_off_the_replay_safe_list_is_never_typed_by_the_loose_rule() {
                     waited: Duration::from_millis(2000),
                 },
             );
-            Err::<(), _>(format!(
-                "Could not finish: {written}",
-                written = written.message()
-            ))
+            Err::<(), _>(written.wrap(|written| format!("Could not finish: {written}")))
         })
         .expect_err("failed");
         assert_eq!(
@@ -487,28 +480,33 @@ fn quoted_slot_wait_phrases_are_unclassified() {
     assert_eq!(plain(hostile).kind, IpcErrorKind::Unclassified);
 }
 
-/// The remembered messages belong to one command: a pool thread starts the
-/// next one with none.
+/// A kind belongs to the error that carries it: the next command that returns
+/// the same text as plain words is not typed by it.
 #[test]
 fn a_command_never_inherits_what_the_one_before_wrote() {
     let text = wire_message("stale_stash");
     let first = written_as(IpcErrorKind::StaleStash, text.clone());
     assert_eq!(first.kind, IpcErrorKind::StaleStash);
     assert_eq!(plain(&text).kind, IpcErrorKind::Unclassified);
-    assert!(!kind_was_written(IpcErrorKind::StaleStash));
 }
 
+/// Words that hand the producer's text back unchanged leave it the producer's;
+/// any other words make it wrapped, which keeps the origin and drops the exact
+/// kind.
 #[test]
-fn the_memory_is_bounded() {
-    let _scope = TypedScope::enter();
-    for n in 0..(MAX_DEFERRALS * 4) {
-        typed_text(IpcErrorKind::DeferredUnderLoad, format!("deferral {n}"));
-    }
-    TYPED.with(|typed| {
-        let typed = typed.borrow();
-        assert_eq!(typed.deferrals.len(), MAX_DEFERRALS);
-        assert!(typed.overflowed, "the cap says it was passed");
-    });
+fn a_wrap_that_changes_nothing_keeps_the_exact_kind() {
+    let refusal = || CommandError::typed(IpcErrorKind::StaleStash, wire_message("stale_stash"));
+    let unchanged = refusal().wrap(str::to_string);
+    assert_eq!(unchanged.kind(), IpcErrorKind::StaleStash);
+    let worded = refusal().wrap(|text| format!("Stash failed: {text}"));
+    assert_eq!(worded.kind(), IpcErrorKind::Unclassified);
+    assert_eq!(worded.origin(), Some(IpcErrorKind::StaleStash));
+    // Once wrapped, always wrapped: later words that change nothing do not
+    // make it the producer's text again.
+    assert_eq!(
+        worded.wrap(str::to_string).kind(),
+        IpcErrorKind::Unclassified
+    );
 }
 
 /// The refusal the stash engine really writes, not a copy of its wording.

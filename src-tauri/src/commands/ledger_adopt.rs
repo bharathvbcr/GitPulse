@@ -18,11 +18,7 @@ use crate::ipc_error::CommandError;
 /// ledger row, written with the re-anchor in one transaction.
 #[tauri::command(async)]
 pub async fn cmd_adopt_ledger(repo_path: String) -> Result<Vec<String>, IpcError> {
-    off_thread(move || {
-        adopt_ledger_confirmed(&repo_path, &crate::desktop::confirm::native)
-            .map_err(CommandError::from)
-    })
-    .await
+    off_thread(move || adopt_ledger_confirmed(&repo_path, &crate::desktop::confirm::native)).await
 }
 
 /// The identity the audit row names as the actor: a person, through the OS

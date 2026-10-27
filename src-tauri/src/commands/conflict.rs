@@ -8,10 +8,7 @@ pub async fn cmd_conflict_snapshot(
     repo_path: String,
     file_path: String,
 ) -> Result<ConflictSnapshot, IpcError> {
-    off_thread(move || {
-        conflict_session::snapshot(&repo_path, &file_path).map_err(CommandError::from)
-    })
-    .await
+    off_thread(move || conflict_session::snapshot(&repo_path, &file_path)).await
 }
 
 #[tauri::command(async)]
@@ -26,7 +23,6 @@ pub async fn cmd_save_conflict(
             |file, op| guard_file(&repo_path, file, op),
             |argv| guard(&repo_path, argv),
         )
-        .map_err(CommandError::from)
     })
     .await
 }

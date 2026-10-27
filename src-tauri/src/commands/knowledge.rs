@@ -24,7 +24,7 @@ pub async fn cmd_markdown_render(
                     .into())
             }
         };
-        crate::markdown::render(&text, note).map_err(CommandError::from)
+        crate::markdown::render(&text, note)
     })
     .await
 }
@@ -38,13 +38,13 @@ pub async fn cmd_docs_refresh(
     if background.unwrap_or(false) {
         off_thread_background(move || crate::docs::refresh(&repo_path)).await
     } else {
-        off_thread(move || crate::docs::refresh(&repo_path).map_err(CommandError::from)).await
+        off_thread(move || crate::docs::refresh(&repo_path)).await
     }
 }
 
 #[tauri::command(async)]
 pub async fn cmd_docs_status(repo_path: String) -> Result<crate::docs::DocsStatus, IpcError> {
-    off_thread(move || crate::docs::status(&repo_path).map_err(CommandError::from)).await
+    off_thread(move || crate::docs::status(&repo_path)).await
 }
 
 #[tauri::command(async)]
@@ -59,7 +59,6 @@ pub async fn cmd_docs_search(
             &query,
             limit.unwrap_or(crate::docs::DEFAULT_SEARCH_LIMIT as u32) as usize,
         )
-        .map_err(CommandError::from)
     })
     .await
 }
@@ -68,7 +67,7 @@ pub async fn cmd_docs_search(
 pub async fn cmd_docs_broken_links(
     repo_path: String,
 ) -> Result<Vec<crate::docs::BrokenLink>, IpcError> {
-    off_thread(move || crate::docs::broken_links(&repo_path).map_err(CommandError::from)).await
+    off_thread(move || crate::docs::broken_links(&repo_path)).await
 }
 
 #[tauri::command(async)]
@@ -76,7 +75,7 @@ pub async fn cmd_docs_backlinks(
     repo_path: String,
     path: String,
 ) -> Result<Vec<markdev_vault::Backlink>, IpcError> {
-    off_thread(move || crate::docs::backlinks(&repo_path, &path).map_err(CommandError::from)).await
+    off_thread(move || crate::docs::backlinks(&repo_path, &path)).await
 }
 
 #[tauri::command(async)]
@@ -95,7 +94,6 @@ pub async fn cmd_docs_graph(
             tag.as_deref(),
             folder.as_deref(),
         )
-        .map_err(CommandError::from)
     })
     .await
 }
@@ -107,8 +105,7 @@ pub async fn cmd_docs_rename(
     from: String,
     to: String,
 ) -> Result<Guarded<crate::docs::DocRenameOutcome>, IpcError> {
-    off_thread(move || docs_rename_guarded(&repo_path, &from, &to).map_err(CommandError::from))
-        .await
+    off_thread(move || docs_rename_guarded(&repo_path, &from, &to)).await
 }
 
 /// The body of [`cmd_docs_rename`]. Every path the rename will write is judged

@@ -689,15 +689,9 @@ fn follow(flight: &Flight) -> Result<CommitSignatureCheck, CommandError> {
         .done
         .wait_timeout_while(guard, FOLLOW_TIMEOUT, |outcome| outcome.is_none())
         .unwrap_or_else(PoisonError::into_inner);
-    guard
-        .clone()
-        .unwrap_or_else(|| {
-            Err(
-                "Timed out waiting for a signature verification already running for this commit"
-                    .into(),
-            )
-        })
-        .map_err(CommandError::from)
+    guard.clone().unwrap_or_else(|| {
+        Err("Timed out waiting for a signature verification already running for this commit".into())
+    })
 }
 
 /// The leader of a flight. Settling it removes the flight and wakes the

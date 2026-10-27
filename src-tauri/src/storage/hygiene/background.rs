@@ -156,7 +156,6 @@ pub fn configure(enable: bool) -> Result<(), CommandError> {
             )
             .into())
         })
-        .map_err(CommandError::from)
     }
     #[cfg(not(target_os = "macos"))]
     {

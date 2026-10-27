@@ -31,8 +31,7 @@ pub(crate) const STALE_STACK_HINT: &str = "Refresh the stash list and try again.
 /// A stale-stack refusal, typed where it is written (see `crate::ipc_error`):
 /// the panel refreshes on the `StaleStash` kind and never reads the sentence.
 fn stale(message: String) -> CommandError {
-    let kind = crate::ipc_error::IpcErrorKind::StaleStash;
-    CommandError::typed(kind, crate::ipc_error::typed_text(kind, message))
+    CommandError::typed(crate::ipc_error::IpcErrorKind::StaleStash, message)
 }
 
 /// Upper bound on entries returned in one listing. A stash stack this deep is

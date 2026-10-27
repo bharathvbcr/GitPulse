@@ -23,11 +23,7 @@ pub async fn cmd_list_worktrees(
     // Past `listing` it spawns git per worktree (capped), so it belongs on
     // the blocking pool like every other reader.
     let depth = depth.unwrap_or(crate::engine::worktree::ScanDepth::Listing);
-    off_thread(move || {
-        crate::engine::worktree::list_worktrees_scanned(&repo_path, depth)
-            .map_err(CommandError::from)
-    })
-    .await
+    off_thread(move || crate::engine::worktree::list_worktrees_scanned(&repo_path, depth)).await
 }
 
 /// Creates a linked worktree, after the command gate has judged the exact
@@ -119,7 +115,6 @@ pub async fn cmd_remove_worktree(
             force,
             &|repo, argv| guard(repo, argv),
         )
-        .map_err(CommandError::from)
     })
     .await
 }
@@ -311,11 +306,7 @@ pub async fn cmd_worktree_ai_summary(
     worktree_path: String,
     branch: Option<String>,
 ) -> Result<String, IpcError> {
-    off_thread(move || {
-        worktree_ai_summary(&repo_path, &worktree_path, branch.as_deref())
-            .map_err(CommandError::from)
-    })
-    .await
+    off_thread(move || worktree_ai_summary(&repo_path, &worktree_path, branch.as_deref())).await
 }
 
 /// Body of [`cmd_worktree_ai_summary`].

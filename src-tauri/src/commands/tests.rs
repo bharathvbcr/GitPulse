@@ -207,8 +207,8 @@ fn a_read_shed_under_memory_pressure_reaches_the_frontend_as_a_deferral() {
 }
 
 /// The commit graph walks history on a scoped helper thread, so the gate's
-/// refusal is written there, not on the command's thread. The read is still
-/// asked again: the helper's record is handed back at the join.
+/// refusal is raised there, not on the command's thread. The read is still
+/// asked again: the refusal crosses the join inside the error, with its kind.
 #[test]
 fn a_commit_graph_walk_shed_on_its_helper_thread_reaches_the_frontend_as_a_deferral() {
     use crate::sysload::{GovernorInput, Level};
@@ -230,8 +230,8 @@ fn a_commit_graph_walk_shed_on_its_helper_thread_reaches_the_frontend_as_a_defer
 }
 
 /// The engine wraps some runner failures in its own words (`Blame
-/// unavailable: ...`). The read is still asked again: the gate's refusal was
-/// recorded on this command's thread.
+/// unavailable: ...`). The read is still asked again: the wrapped error keeps
+/// the gate's refusal as its origin.
 #[test]
 fn a_wrapped_read_shed_under_memory_pressure_still_reaches_the_frontend_as_a_deferral() {
     use crate::sysload::{GovernorInput, Level};

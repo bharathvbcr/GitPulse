@@ -184,7 +184,6 @@ pub async fn cmd_agent_models(
 ) -> Result<crate::workbench::agent_models::AgentModelCatalog, IpcError> {
     off_thread(move || {
         crate::workbench::agent_models::models_for(launcher.trim(), refresh.unwrap_or(false))
-            .map_err(CommandError::from)
     })
     .await
 }
@@ -304,19 +303,12 @@ pub async fn cmd_host_load_settings_save(
 /// turned on; an unreadable setting is an error, never a yes.
 #[tauri::command(async)]
 pub async fn cmd_verify_status_enabled(repo_path: String) -> Result<bool, IpcError> {
-    off_thread(move || {
-        crate::workbench::verify_status::enabled_for(&repo_path).map_err(CommandError::from)
-    })
-    .await
+    off_thread(move || crate::workbench::verify_status::enabled_for(&repo_path)).await
 }
 
 #[tauri::command(async)]
 pub async fn cmd_verify_status_save(repo_path: String, enabled: bool) -> Result<(), IpcError> {
-    off_thread(move || {
-        crate::workbench::verify_status::set_enabled(&repo_path, enabled)
-            .map_err(CommandError::from)
-    })
-    .await
+    off_thread(move || crate::workbench::verify_status::set_enabled(&repo_path, enabled)).await
 }
 
 /// Posts a task's verification verdict to GitHub as a commit status (and
@@ -336,7 +328,6 @@ pub async fn cmd_verify_status_post(
         crate::workbench::verify_status::post_via_app(
             &workbench, &repo_path, &task_id, comment, dry_run,
         )
-        .map_err(CommandError::from)
     })
     .await
 }
@@ -348,11 +339,7 @@ pub async fn cmd_attempt_review(
     workbench: State<'_, crate::workbench::WorkbenchState>,
 ) -> Result<crate::workbench::review::AttemptReview, IpcError> {
     let workbench = workbench.inner().clone();
-    off_thread(move || {
-        crate::workbench::review::attempt_review(&workbench, &run_id, None)
-            .map_err(CommandError::from)
-    })
-    .await
+    off_thread(move || crate::workbench::review::attempt_review(&workbench, &run_id, None)).await
 }
 
 /// Records a person's decision on an ended attempt's current commit range:
@@ -372,7 +359,6 @@ pub async fn cmd_attempt_review_record(
             &run_id,
             Some((&decision, note.as_deref())),
         )
-        .map_err(CommandError::from)
     })
     .await
 }
@@ -545,35 +531,20 @@ pub async fn cmd_provenance_freshness_batch(
 #[tauri::command]
 pub async fn cmd_cleaner_state() -> Result<crate::storage::hygiene::global::CleanerState, IpcError>
 {
-    off_thread(|| {
-        crate::storage::hygiene::global::service()?
-            .state()
-            .map_err(CommandError::from)
-    })
-    .await
+    off_thread(|| crate::storage::hygiene::global::service()?.state()).await
 }
 
 #[tauri::command]
 pub async fn cmd_cleaner_save(
     config: crate::storage::hygiene::global::CleanerConfig,
 ) -> Result<crate::storage::hygiene::global::CleanerState, IpcError> {
-    off_thread(move || {
-        crate::storage::hygiene::global::service()?
-            .save(config)
-            .map_err(CommandError::from)
-    })
-    .await
+    off_thread(move || crate::storage::hygiene::global::service()?.save(config)).await
 }
 
 #[tauri::command]
 pub async fn cmd_cleaner_scan(
 ) -> Result<crate::storage::hygiene::global::CleanerInventory, IpcError> {
-    off_thread(|| {
-        crate::storage::hygiene::global::service()?
-            .inventory()
-            .map_err(CommandError::from)
-    })
-    .await
+    off_thread(|| crate::storage::hygiene::global::service()?.inventory()).await
 }
 
 #[tauri::command]
@@ -581,13 +552,11 @@ pub async fn cmd_cleaner_run(
     revision: u64,
 ) -> Result<crate::storage::hygiene::global::CleanerState, IpcError> {
     off_thread(move || {
-        crate::storage::hygiene::global::service()?
-            .start(
-                false,
-                revision,
-                crate::storage::hygiene::global::current_time(),
-            )
-            .map_err(CommandError::from)
+        crate::storage::hygiene::global::service()?.start(
+            false,
+            revision,
+            crate::storage::hygiene::global::current_time(),
+        )
     })
     .await
 }
@@ -595,10 +564,5 @@ pub async fn cmd_cleaner_run(
 #[tauri::command]
 pub async fn cmd_cleaner_cancel() -> Result<crate::storage::hygiene::global::CleanerState, IpcError>
 {
-    off_thread(|| {
-        crate::storage::hygiene::global::service()?
-            .cancel()
-            .map_err(CommandError::from)
-    })
-    .await
+    off_thread(|| crate::storage::hygiene::global::service()?.cancel()).await
 }

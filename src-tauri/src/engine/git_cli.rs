@@ -2666,10 +2666,8 @@ pub(crate) fn refusal_message_at(
     // A deferral is typed where it is written (see `crate::ipc_error`): the
     // error carries the kind to the command's edge, and nothing reads the
     // marker back out of a message.
-    let deferred = |text: String| {
-        let kind = crate::ipc_error::IpcErrorKind::DeferredUnderLoad;
-        CommandError::typed(kind, crate::ipc_error::typed_text(kind, text))
-    };
+    let deferred =
+        |text: String| CommandError::typed(crate::ipc_error::IpcErrorKind::DeferredUnderLoad, text);
     match refusal {
         Refusal::Cancelled => format!("{label} cancelled before spawn").into(),
         Refusal::TimedOut { deadline } => format!(

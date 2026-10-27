@@ -381,9 +381,7 @@ mod tests {
 
     #[test]
     fn an_antigravity_listing_becomes_its_slugs_and_labels() {
-        let out = agy_catalog(
-            answer(AGY, "Fetching available models...\n", true, 0).map_err(CommandError::from),
-        );
+        let out = agy_catalog(answer(AGY, "Fetching available models...\n", true, 0));
         assert_eq!(out.error, None);
         assert_eq!(out.listing, "listed");
         assert_eq!(out.command.as_deref(), Some("agy models"));
@@ -409,7 +407,7 @@ mod tests {
     #[test]
     fn a_garbled_line_is_skipped_and_counted_never_offered() {
         let text = "good-1\tGood\n-flag\tLooks like an option\n\tNo slug\nhas space\tX\na,b\tComma\ngood-2\n\u{1b}[31mred\tEscape\ngood-1\tDuplicate\n   \n";
-        let out = agy_catalog(answer(text, "", true, 0).map_err(CommandError::from));
+        let out = agy_catalog(answer(text, "", true, 0));
         assert_eq!(
             out.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
             ["good-1", "good-2"]
@@ -453,7 +451,7 @@ mod tests {
                 "not UTF-8",
             ),
         ] {
-            let out = agy_catalog(result.map_err(CommandError::from));
+            let out = agy_catalog(result);
             assert!(out.models.is_empty());
             let error = out.error.expect("a failed listing reported no error");
             assert!(error.contains(says), "{error:?} should say {says:?}");
@@ -466,20 +464,17 @@ mod tests {
         let text: String = (0..MAX_CATALOG_MODELS + 50)
             .map(|i| format!("m-{i}\tModel {i}\n"))
             .collect();
-        let out = agy_catalog(answer(&text, "", true, 0).map_err(CommandError::from));
+        let out = agy_catalog(answer(&text, "", true, 0));
         assert_eq!(out.models.len(), MAX_CATALOG_MODELS);
         assert!(out.truncated);
         assert_eq!(out.error, None);
         let long_label = format!("x\t{}\n", "L".repeat(MAX_LABEL_LEN + 1));
         assert_eq!(
-            agy_catalog(answer(&long_label, "", true, 0).map_err(CommandError::from)).models[0]
-                .label,
+            agy_catalog(answer(&long_label, "", true, 0)).models[0].label,
             None
         );
         let noisy = format!("bad\t{}\n", "e".repeat(10_000));
-        let failed = agy_catalog(answer("", &noisy, false, 2).map_err(CommandError::from))
-            .error
-            .unwrap();
+        let failed = agy_catalog(answer("", &noisy, false, 2)).error.unwrap();
         assert!(failed.len() < MAX_ERROR_EXCERPT + 80);
     }
 
@@ -547,7 +542,7 @@ mod tests {
     }
 
     fn good_listing() -> Result<CapturedOutput, CommandError> {
-        answer("gemini-3-pro\ngemini-3-flash\n", "", true, 0).map_err(CommandError::from)
+        answer("gemini-3-pro\ngemini-3-flash\n", "", true, 0)
     }
 
     /// The defect: the cache lock was held across the CLI call (up to 20 s),

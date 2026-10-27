@@ -313,7 +313,6 @@ fn provision_with(
                     &base_branch,
                     oid.trim(),
                 )
-                .map_err(CommandError::from)
             });
             if let Err(error) = recorded {
                 let cleanup = discard(&provisioned)

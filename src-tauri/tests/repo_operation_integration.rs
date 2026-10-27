@@ -674,8 +674,7 @@ fn a_refused_action_does_not_touch_the_repository() {
     let status = git_out(repo.path(), &["status", "--porcelain"]);
 
     let err = repo_op::run_action_with(&repo.path_str(), OperationAction::Abort, |_argv| {
-        Err::<(), String>("blocked by policy: destructive git operation".into())
-            .map_err(CommandError::from)
+        Err::<(), CommandError>("blocked by policy: destructive git operation".into())
     })
     .unwrap_err();
     assert!(

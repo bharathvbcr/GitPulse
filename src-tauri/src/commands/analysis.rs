@@ -61,7 +61,7 @@ pub async fn cmd_get_pulse_snapshots(
 
 #[tauri::command(async)]
 pub async fn cmd_scan_coverage(repo_path: String) -> Result<CoverageReport, IpcError> {
-    off_thread(move || CoverageScanner::scan(&repo_path).map_err(CommandError::from)).await
+    off_thread(move || CoverageScanner::scan(&repo_path)).await
 }
 
 #[tauri::command(async)]
@@ -69,15 +69,12 @@ pub async fn cmd_get_file_coverage(
     repo_path: String,
     file_path: String,
 ) -> Result<FileCoverage, IpcError> {
-    off_thread(move || {
-        CoverageScanner::file_coverage(&repo_path, &file_path).map_err(CommandError::from)
-    })
-    .await
+    off_thread(move || CoverageScanner::file_coverage(&repo_path, &file_path)).await
 }
 
 #[tauri::command(async)]
 pub async fn cmd_scan_deps_health(repo_path: String) -> Result<DepsHealthReport, IpcError> {
-    off_thread(move || DepsScanner::scan(&repo_path).map_err(CommandError::from)).await
+    off_thread(move || DepsScanner::scan(&repo_path)).await
 }
 
 /// On-demand Kingfisher secrets scan of the working tree.
@@ -88,7 +85,7 @@ pub async fn cmd_scan_deps_health(repo_path: String) -> Result<DepsHealthReport,
 pub async fn cmd_scan_secrets(
     repo_path: String,
 ) -> Result<crate::secrets::SecretsReport, IpcError> {
-    off_thread(move || crate::secrets::scan_secrets(&repo_path).map_err(CommandError::from)).await
+    off_thread(move || crate::secrets::scan_secrets(&repo_path)).await
 }
 
 /// Full disk-usage scan of the repository (git internals, build/cache
@@ -98,7 +95,7 @@ pub async fn cmd_scan_secrets(
 pub async fn cmd_storage_scan(
     repo_path: String,
 ) -> Result<crate::storage::StorageReport, IpcError> {
-    off_thread(move || crate::storage::scan_storage(&repo_path).map_err(CommandError::from)).await
+    off_thread(move || crate::storage::scan_storage(&repo_path)).await
 }
 
 /// What the Storage panel's "Write commit-graph" click would run: the exact
@@ -158,19 +155,12 @@ pub async fn cmd_hygiene_prepare(
     target: String,
     min_age_days: u32,
 ) -> Result<crate::storage::hygiene::HygienePlan, IpcError> {
-    off_thread(move || {
-        crate::storage::hygiene::prepare(&repo_path, &target, min_age_days)
-            .map_err(CommandError::from)
-    })
-    .await
+    off_thread(move || crate::storage::hygiene::prepare(&repo_path, &target, min_age_days)).await
 }
 
 #[tauri::command]
 pub async fn cmd_hygiene_cancel(repo_path: String, plan_id: String) -> Result<(), IpcError> {
-    off_thread(move || {
-        crate::storage::hygiene::cancel(&repo_path, &plan_id).map_err(CommandError::from)
-    })
-    .await
+    off_thread(move || crate::storage::hygiene::cancel(&repo_path, &plan_id)).await
 }
 
 #[tauri::command]

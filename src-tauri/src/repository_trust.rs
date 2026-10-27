@@ -696,7 +696,6 @@ fn require_identified(repo: &Path) -> Result<Identity, CommandError> {
         "path": current.checkout.path.display().to_string(),
         "common_dir": current.common_dir.path.display().to_string(),
     });
-    let refusal = crate::ipc_error::typed_text_with_detail(kind, refusal, detail.clone());
     Err(CommandError::typed_with_detail(kind, refusal, detail))
 }
 
@@ -782,7 +781,7 @@ fn with_store_lock<T>(
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     };
     let _file = lock_directory(root)?;
-    f().map_err(CommandError::from)
+    f()
 }
 
 #[cfg(unix)]

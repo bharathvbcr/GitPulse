@@ -548,7 +548,6 @@ fn typed_unconfirmed(base_url: &str, model: &str, stale: bool) -> CommandError {
         "label": identity.label,
         "stale": stale,
     });
-    let message = crate::ipc_error::typed_text_with_detail(kind, message, detail.clone());
     CommandError::typed_with_detail(kind, message, detail)
 }
 

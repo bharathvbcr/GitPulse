@@ -282,17 +282,14 @@ pub(crate) fn last_fetch_at_ms(repo: &std::path::Path) -> Result<Option<i64>, Co
 /// refreshes. Trust-checked like any read; runs no Git.
 #[tauri::command(async)]
 pub async fn cmd_note_tab_activated(repo_path: String) -> Result<(), IpcError> {
-    off_thread(move || {
-        crate::engine::git_cli::note_tab_activated(&repo_path).map_err(CommandError::from)
-    })
-    .await
+    off_thread(move || crate::engine::git_cli::note_tab_activated(&repo_path)).await
 }
 
 #[tauri::command(async)]
 pub async fn cmd_last_fetch_at(repo_path: String) -> Result<Option<i64>, IpcError> {
     off_thread(move || {
         let repo = validate_repo(&repo_path)?;
-        last_fetch_at_ms(&repo).map_err(CommandError::from)
+        last_fetch_at_ms(&repo)
     })
     .await
 }

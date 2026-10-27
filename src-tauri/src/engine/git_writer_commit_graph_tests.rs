@@ -151,9 +151,7 @@ fn an_untrusted_repository_is_refused_before_anything_runs() {
     let argv = GitWriter::commit_graph_write_argv();
     for refused in [
         GitWriter::commit_graph_write_plan(&text(&repo)).map(|_| ()),
-        click(&text(&repo), &argv)
-            .map(|_| ())
-            .map_err(CommandError::from),
+        click(&text(&repo), &argv).map(|_| ()),
         GitWriter::commit_graph_write_cancel(&text(&repo)).map(|_| ()),
     ] {
         let error = refused.expect_err("untrusted");

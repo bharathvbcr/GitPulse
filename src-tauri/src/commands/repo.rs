@@ -5,7 +5,7 @@ use crate::ipc_error::CommandError;
 
 #[tauri::command(async)]
 pub async fn cmd_resolve_repo(repo_path: String) -> Result<ResolvedRepo, IpcError> {
-    off_thread(move || resolve_repo(&repo_path).map_err(CommandError::from)).await
+    off_thread(move || resolve_repo(&repo_path)).await
 }
 
 #[tauri::command(async)]
@@ -47,8 +47,7 @@ pub async fn cmd_watch_repo(
     // worker thread. WatcherState is an Arc-backed Clone; snapshot it so the
     // 'static closure does not borrow the request-scoped State.
     let watcher_state = state.inner().clone();
-    off_thread(move || start_watch(app, &watcher_state, repo_path).map_err(CommandError::from))
-        .await
+    off_thread(move || start_watch(app, &watcher_state, repo_path)).await
 }
 
 #[tauri::command(async)]

@@ -330,7 +330,6 @@ impl Cleaner {
             );
         }
         self.save_with_background(config, super::background::configure)
-            .map_err(CommandError::from)
     }
     fn save_with_background(
         &self,
