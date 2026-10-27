@@ -76,6 +76,16 @@ fn grace_is_bounded_when_stdout_is_closed_and_stderr_floods() {
     assert!(matches!(run.incomplete, Some(Incomplete::Deadline { .. })));
 }
 
+/// Where there is no thread CPU clock the wall-time and `Incomplete`
+/// assertions of the flood test still run; only the CPU line is left out.
+#[test]
+fn the_flood_test_runs_its_assertions_where_there_is_no_thread_cpu_clock() {
+    crate::sysload::no_clock::assert_runs_unmeasured(
+        "grace_is_bounded_when_stdout_is_closed_and_stderr_floods",
+        grace_is_bounded_when_stdout_is_closed_and_stderr_floods,
+    );
+}
+
 /// Attack 1: a grandchild in its own group keeps the pipes after the child
 /// exits on the ask. The run must not wait for EOF past the grace.
 #[test]

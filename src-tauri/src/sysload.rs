@@ -81,7 +81,73 @@ use serde::{Deserialize, Serialize};
 /// and reads the end of its measurement with [`cpu_since`].
 #[cfg(test)]
 pub(crate) fn try_thread_cpu() -> Option<std::time::Duration> {
+    if no_clock::forced() {
+        return None;
+    }
     probe::thread_cpu_ns().map(std::time::Duration::from_nanos)
+}
+
+/// A way to be on a platform with no thread CPU clock, on any host: while a
+/// [`no_clock::NoClock`] guard lives, [`try_thread_cpu`] reads `None` on that
+/// thread, and every skip [`clock_or_skip`] takes is recorded by name. Per
+/// thread, so tests running side by side do not see each other's.
+#[cfg(test)]
+pub(crate) mod no_clock {
+    use std::cell::{Cell, RefCell};
+
+    thread_local! {
+        static FORCED: Cell<bool> = const { Cell::new(false) };
+        static SKIPPED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn forced() -> bool {
+        FORCED.with(Cell::get)
+    }
+
+    pub(super) fn record(test: &str) {
+        SKIPPED.with(|skipped| skipped.borrow_mut().push(test.to_owned()));
+    }
+
+    /// Restores the real clock when dropped.
+    pub(crate) struct NoClock;
+
+    impl NoClock {
+        pub(crate) fn new() -> Self {
+            FORCED.with(|forced| forced.set(true));
+            SKIPPED.with(|skipped| skipped.borrow_mut().clear());
+            Self
+        }
+
+        /// The tests that skipped since this guard was made.
+        pub(crate) fn skipped(&self) -> Vec<String> {
+            SKIPPED.with(|skipped| skipped.borrow().clone())
+        }
+    }
+
+    impl Drop for NoClock {
+        fn drop(&mut self) {
+            FORCED.with(|forced| forced.set(false));
+        }
+    }
+
+    /// Runs `body`, a CPU-bounded test, as on a platform with no thread CPU
+    /// clock, and requires that it took the skip named `name` and did not panic.
+    /// Fails if the test stops returning at its skip point: it would then fall
+    /// through to a measurement it cannot make.
+    pub(crate) fn assert_skips(name: &str, body: impl FnOnce()) {
+        let guard = NoClock::new();
+        body();
+        assert_eq!(guard.skipped(), [name], "{name} did not take its skip");
+    }
+
+    /// Runs `body`, a test that keeps all its assertions without a clock and
+    /// only leaves its CPU reading out, as on a platform with no thread CPU
+    /// clock, and requires that it did not panic and skipped nothing.
+    pub(crate) fn assert_runs_unmeasured(name: &str, body: impl FnOnce()) {
+        let guard = NoClock::new();
+        body();
+        assert_eq!(guard.skipped(), Vec::<String>::new(), "{name} skipped");
+    }
 }
 
 /// The line a CPU-bounded test prints when it cannot measure anything, naming
@@ -102,9 +168,28 @@ pub(crate) fn clock_or_skip(
     clock: Option<std::time::Duration>,
 ) -> Option<std::time::Duration> {
     if clock.is_none() {
-        eprintln!("{}", skip_notice(test));
+        skip(test);
     }
     clock
+}
+
+/// What a CPU-bounded test checks once it has measured: runs `check` on
+/// `measured` when there is one, and otherwise takes the skip. The skip and the
+/// check are one call, so a caller cannot take the skip and then carry on to
+/// assert on a reading it does not have, which is what an early `return` after
+/// [`clock_or_skip`] left to each caller to remember.
+#[cfg(test)]
+pub(crate) fn if_clock<T>(test: &str, measured: Option<T>, check: impl FnOnce(T)) {
+    match measured {
+        Some(measured) => check(measured),
+        None => skip(test),
+    }
+}
+
+#[cfg(test)]
+fn skip(test: &str) {
+    eprintln!("{}", skip_notice(test));
+    no_clock::record(test);
 }
 
 /// CPU the calling thread has spent since `started`, a reading [`clock_or_skip`]
@@ -296,6 +381,44 @@ mod tests {
         let notice = skip_notice("some_test");
         assert!(notice.starts_with("some_test: skipped"), "{notice}");
         assert!(notice.contains("no thread CPU clock"), "{notice}");
+    }
+
+    #[test]
+    fn the_no_clock_override_reads_none_here_only_and_restores_the_clock() {
+        let had_clock = try_thread_cpu().is_some();
+        {
+            let guard = no_clock::NoClock::new();
+            assert_eq!(try_thread_cpu(), None);
+            assert_eq!(clock_or_skip("some_test", try_thread_cpu()), None);
+            assert_eq!(guard.skipped(), ["some_test"]);
+            // Another thread is unaffected.
+            let other = std::thread::spawn(|| try_thread_cpu().is_some())
+                .join()
+                .unwrap();
+            assert_eq!(other, had_clock);
+        }
+        assert_eq!(try_thread_cpu().is_some(), had_clock);
+    }
+
+    #[test]
+    fn if_clock_checks_a_reading_and_skips_without_one_on_any_host() {
+        let guard = no_clock::NoClock::new();
+        if_clock("some_test", None::<Duration>, |_| {
+            panic!("a check ran without a reading")
+        });
+        assert_eq!(guard.skipped(), ["some_test"]);
+        let checked = std::cell::Cell::new(None);
+        if_clock("other_test", Some(Duration::from_secs(2)), |reading| {
+            checked.set(Some(reading));
+        });
+        assert_eq!(checked.get(), Some(Duration::from_secs(2)));
+        assert_eq!(guard.skipped(), ["some_test"], "a reading is not a skip");
+    }
+
+    #[test]
+    #[should_panic(expected = "did not take its skip")]
+    fn a_test_that_does_not_skip_fails_assert_skips() {
+        no_clock::assert_skips("some_test", || {});
     }
 
     #[test]

@@ -21,7 +21,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { findSibling, refuseBadGitBound } from "./vendor-crates.mjs";
+import { failOnGitBound, findSibling } from "./vendor-crates.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const GO_DIR = path.join(REPO_ROOT, "go");
@@ -99,8 +99,10 @@ export function goVersionOf(goMod) {
 }
 
 function main() {
-  const refused = refuseBadGitBound();
-  if (refused !== null) return refused;
+  return failOnGitBound(check);
+}
+
+function check() {
   const devcouncil = process.env.GITPULSE_DEVCOUNCIL_ROOT ?? findSibling("DevCouncil", REPO_ROOT);
   const gusset = process.env.GITPULSE_GUSSET_ROOT ?? findSibling("gusset", REPO_ROOT);
   const envScript = path.join(devcouncil, "rust", "gusset-engine", "cgo-env.sh");

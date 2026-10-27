@@ -114,21 +114,56 @@ export function gitTimeoutMs(env = process.env) {
  * says, and exits with, when `GITPULSE_VENDOR_GIT_TIMEOUT_MS` is not a usable
  * bound: the one `FAIL:` line this file's own `main` prints for it, and exit
  * code 2, or `null` when the setting is fine. `findSibling` only reads the
- * setting when it falls back to `git`, so a script asks here first, at the top
- * of its `main`, or a typo goes unnoticed whenever the siblings are found by
- * walking up.
+ * setting when it falls back to `git`, so it is asked first, or a typo goes
+ * unnoticed whenever the siblings are found by walking up. Scripts use
+ * {@link failOnGitBound}, which also covers a `git` that hangs.
  *
  * @param {NodeJS.ProcessEnv} [env]
  * @returns {number | null} the exit code, after printing, or `null`
  */
-export function refuseBadGitBound(env = process.env) {
+function refuseBadGitBound(env = process.env) {
   try {
     gitTimeoutMs(env);
     return null;
   } catch (error) {
-    if (!(error instanceof GitBoundError)) throw error;
-    console.error(`FAIL: ${error.message}`);
-    return 2;
+    return refuseGitBound(error);
+  }
+}
+
+/**
+ * The one `FAIL:` line and exit code 2 for a {@link GitBoundError}, whether the
+ * setting was bad or a `git` call ran past a good one; any other error is not
+ * this file's to report and is rethrown.
+ *
+ * @param {unknown} error
+ * @returns {number}
+ */
+function refuseGitBound(error) {
+  if (!(error instanceof GitBoundError)) throw error;
+  console.error(`FAIL: ${error.message}`);
+  return 2;
+}
+
+/**
+ * Runs a script's work with the `git` bound reported the way this file's own
+ * `main` reports it: a setting that is not a usable bound, and a `git` call in
+ * {@link findSibling} that ran past a good one, are each one `FAIL:` line naming
+ * the setting or the command, and exit 2, never a stack trace. Awaits an async
+ * `run`, so a rejection is mapped the same way.
+ *
+ * @template {number | Promise<number>} T
+ * @param {() => T} run
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {T | number} the exit code, or a promise of it when `run` is async
+ */
+export function failOnGitBound(run, env = process.env) {
+  const refused = refuseBadGitBound(env);
+  if (refused !== null) return refused;
+  try {
+    const out = run();
+    return out instanceof Promise ? /** @type {T} */ (out.catch(refuseGitBound)) : out;
+  } catch (error) {
+    return refuseGitBound(error);
   }
 }
 

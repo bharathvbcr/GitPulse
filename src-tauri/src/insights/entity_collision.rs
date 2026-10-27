@@ -2495,30 +2495,21 @@ class C:
     /// times, and the longer run is the likelier to be descheduled, so a wall
     /// clock turns the 8000-over-4000 ratio into a measurement of the machine.
     ///
-    /// Only after [`crate::sysload::clock_or_skip`] returned a reading: the
-    /// test that calls it has already returned where there is no clock.
-    fn min_of_3(mut f: impl FnMut()) -> std::time::Duration {
+    /// `None` where there is no thread CPU clock. `f` runs all three times
+    /// either way, so what it asserts on its own (here, that `touching` does not
+    /// fail) is still checked.
+    fn min_of_3(mut f: impl FnMut()) -> Option<std::time::Duration> {
         (0..3)
-            .map(|_| {
-                let t = crate::sysload::try_thread_cpu()
-                    .expect("the test checked for a thread CPU clock before measuring");
+            .filter_map(|_| {
+                let t = crate::sysload::try_thread_cpu();
                 f();
-                crate::sysload::cpu_since(t)
+                t.map(crate::sysload::cpu_since)
             })
             .min()
-            .unwrap()
     }
 
     #[test]
     fn the_join_over_256_symbols_and_4000_hunks_stays_cheap_and_scales_linearly() {
-        if crate::sysload::clock_or_skip(
-            "the_join_over_256_symbols_and_4000_hunks_stays_cheap_and_scales_linearly",
-            crate::sysload::try_thread_cpu(),
-        )
-        .is_none()
-        {
-            return;
-        }
         let symbols: Vec<CodeintelFileSymbol> =
             std::iter::once(sym_q("f", "x.rs::", "File", 1, 2000))
                 .chain((0..255u32).map(|i| {
@@ -2579,17 +2570,31 @@ class C:
             std::hint::black_box(touching(&nested, &nested_hunks).unwrap());
         });
         eprintln!("PERF baseline(4000 ranges)={old:?} new(4000)={new4:?} new(8000)={new8:?} nested255x4000={nest:?}");
-        assert!(
-            new4 < std::time::Duration::from_millis(500),
-            "new(4000) = {new4:?}"
+        crate::sysload::if_clock(
+            "the_join_over_256_symbols_and_4000_hunks_stays_cheap_and_scales_linearly",
+            new4.zip(new8).zip(nest),
+            |((new4, new8), nest)| {
+                assert!(
+                    new4 < std::time::Duration::from_millis(500),
+                    "new(4000) = {new4:?}"
+                );
+                assert!(
+                    new8 < new4 * 4,
+                    "superlinear: 4000 -> {new4:?}, 8000 -> {new8:?}"
+                );
+                assert!(
+                    nest < std::time::Duration::from_secs(2),
+                    "nested = {nest:?}"
+                );
+            },
         );
-        assert!(
-            new8 < new4 * 4,
-            "superlinear: 4000 -> {new4:?}, 8000 -> {new8:?}"
-        );
-        assert!(
-            nest < std::time::Duration::from_secs(2),
-            "nested = {nest:?}"
+    }
+
+    #[test]
+    fn the_join_skips_its_cpu_bounds_where_there_is_no_thread_cpu_clock() {
+        crate::sysload::no_clock::assert_skips(
+            "the_join_over_256_symbols_and_4000_hunks_stays_cheap_and_scales_linearly",
+            the_join_over_256_symbols_and_4000_hunks_stays_cheap_and_scales_linearly,
         );
     }
 

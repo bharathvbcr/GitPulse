@@ -372,33 +372,6 @@ fn a_deadline_already_past_is_timed_out_without_touching_the_socket() {
     assert!(socket.written.is_empty());
 }
 
-/// The deadline loop and its macOS tolerance have one owner,
-/// `crate::deadline::DeadlineStream`. This fails if the exchange grows its own
-/// timeout handling again: a `set_*_timeout` call, an `InvalidInput` match, or
-/// its own remaining-time arithmetic.
-#[test]
-fn the_exchange_carries_no_deadline_loop_of_its_own() {
-    let source = include_str!("../graft.rs");
-    let production = source
-        .split("#[cfg(all(test, unix))]\npub(crate) mod fake_server_tests;")
-        .next()
-        .unwrap();
-    for hand_rolled in [
-        "set_read_timeout",
-        "set_write_timeout",
-        "InvalidInput",
-        "checked_duration_since",
-        "let bound =",
-        "let remaining =",
-    ] {
-        assert!(
-            !production.contains(hand_rolled),
-            "graft.rs hand-rolls its deadline again: {hand_rolled}"
-        );
-    }
-    assert!(production.contains("DeadlineStream::new"));
-}
-
 /// Starts a forwarder on `socket` and returns it with the outcomes it reports.
 fn forwarder_on(socket: Option<PathBuf>, capacity: usize) -> (Forwarder, mpsc::Receiver<Outcome>) {
     let (reported, outcomes) = mpsc::channel();

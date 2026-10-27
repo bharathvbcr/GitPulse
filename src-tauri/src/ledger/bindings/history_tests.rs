@@ -7,7 +7,7 @@ use super::*;
 
 use crate::ledger::ids::{iso8601_utc, parse_event_time};
 use crate::ledger::{latest_binding, with_conn};
-use crate::sysload::{clock_or_skip, cpu_since, try_thread_cpu};
+use crate::sysload::{cpu_since, if_clock, try_thread_cpu};
 
 /// Year 9999: later than any row a test writes, standing in for "now".
 const FOREVER_MS: u64 = 253_402_300_799_999;
@@ -476,33 +476,49 @@ fn ten_thousand_binds_load_and_answer_within_a_pass_budget() {
         Ok(())
     })
     .unwrap();
-    let Some(started) = clock_or_skip(
-        "ten_thousand_binds_load_and_answer_within_a_pass_budget",
-        try_thread_cpu(),
-    ) else {
-        return;
-    };
+    // The load and the lookups run, and their answer is checked, with or
+    // without a clock; only the CPU bound below needs one.
+    let started = try_thread_cpu();
     let history = BindingHistory::load(&repo, &repo).unwrap();
-    let load = cpu_since(started);
+    let load = started.map(cpu_since);
     let mut resolved = 0u64;
     for call in 0..1_000_000u64 {
         let at = T0 + (call * 7_919) % 100_000;
         resolved += u64::from(history.as_of(at).task_id().is_some());
     }
-    let ask = cpu_since(started) - load;
+    let ask = started
+        .map(cpu_since)
+        .zip(load)
+        .map(|(total, load)| total - load);
     eprintln!("10k binds: load {load:?}, 1M as_of {ask:?}, resolved {resolved}");
     assert_eq!(history.as_of(T0 + 9_999 * 10 + 5), bound("T9999"));
     // CPU time this thread spent, not the wall clock: the budget is about the
     // work (a pass over 10k rows, a million lookups), and a loaded host
     // stretches wall time by the queue the thread waits in without changing
     // that work. Still scaled, because instrumentation does change the work.
-    assert!(
-        load < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(2)),
-        "load {load:?}"
+    if_clock(
+        "ten_thousand_binds_load_and_answer_within_a_pass_budget",
+        load.zip(ask),
+        |(load, ask)| {
+            assert!(
+                load < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(2)),
+                "load {load:?}"
+            );
+            assert!(
+                ask < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(5)),
+                "1M as_of took {ask:?}"
+            );
+        },
     );
-    assert!(
-        ask < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(5)),
-        "1M as_of took {ask:?}"
+}
+
+/// Without a thread CPU clock the 10k-row test still loads, looks up and checks
+/// the answer, and skips only its CPU bound.
+#[test]
+fn ten_thousand_binds_skips_its_cpu_bound_where_there_is_no_thread_cpu_clock() {
+    crate::sysload::no_clock::assert_skips(
+        "ten_thousand_binds_load_and_answer_within_a_pass_budget",
+        ten_thousand_binds_load_and_answer_within_a_pass_budget,
     );
 }
 

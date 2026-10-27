@@ -120,9 +120,12 @@ fn slack() -> Duration {
     crate::test_support::coverage_relaxed(Duration::from_millis(1500))
 }
 
+/// A named peer behaviour and the outcome both exchanges must report for it.
+type PeerCase = (&'static str, Box<dyn Fn() -> Reply>, Outcome);
+
 #[test]
 fn held_every_fake_peer_outcome_is_the_one_the_old_exchange_gave() {
-    let cases: Vec<(&str, Box<dyn Fn() -> Reply>, Outcome)> = vec![
+    let cases: Vec<PeerCase> = vec![
         (
             "accepted",
             Box::new(|| Reply::Line("{\"ok\":true,\"sent\":true}".into())),
@@ -595,13 +598,19 @@ fn broke_a_read_timeout_that_cannot_be_set_no_longer_stops_the_request_being_sen
 
 /// A timeout setter that fails with `TimedOut` (not a deadline: the setter
 /// refused). Old: `Io`. New: `failed()` reads the kind and says `TimedOut`.
+///
+/// Accepted as a documented change (coordinator ruling, W3b rework round 1): the
+/// outcome is a failure either way, nothing is sent (`arm` runs first), and a
+/// real `setsockopt` does not return `ETIMEDOUT`, so this is not a practical
+/// case. The test pins what now happens instead of the old mapping.
 #[test]
-fn broke_a_timeout_setter_that_fails_with_timed_out_is_io_not_a_deadline() {
+fn a_timeout_setter_that_fails_with_timed_out_is_now_reported_timed_out_with_nothing_sent() {
     let s = Script {
         set_write_error: Some(ErrorKind::TimedOut),
         ..Script::default()
     };
-    let ((old, _), (new, _)) = run_both(&s, Instant::now() + Duration::from_secs(60));
-    assert_eq!(old, Outcome::Io);
-    assert_eq!(new, old);
+    let ((old, _), (new, new_written)) = run_both(&s, Instant::now() + Duration::from_secs(60));
+    assert_eq!(old, Outcome::Io, "the exchange of 2abaa1ba");
+    assert_eq!(new, Outcome::TimedOut, "documented change, see above");
+    assert_eq!(new_written, Vec::<u8>::new());
 }

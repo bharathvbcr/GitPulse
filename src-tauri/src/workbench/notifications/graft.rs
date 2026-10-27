@@ -288,6 +288,11 @@ where
     use std::io::{ErrorKind, Read, Write};
 
     let mut stream = crate::deadline::DeadlineStream::new(stream, deadline);
+    // Both timeouts first: a socket that cannot take one is an I/O failure with
+    // nothing sent, not a request already out whose answer is never read.
+    if let Err(e) = stream.arm() {
+        return failed(&e);
+    }
     if let Err(e) = stream.write_all(request) {
         return failed(&e);
     }
