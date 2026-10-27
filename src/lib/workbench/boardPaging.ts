@@ -50,19 +50,51 @@ export async function reloadPaged<T extends { id: string }>(read: Read<T>, loade
 }
 
 /**
+ * The page size a reload reads `loaded` rows back at: `size` while
+ * `MAX_RELOAD_PAGES` of it reach them, else `largest` (the store's page
+ * maximum), so a column loaded past 600 cards is not cut back to 600.
+ */
+export function reloadSize(loaded: number, size: number, largest: number): number {
+  return loaded > size * MAX_RELOAD_PAGES ? largest : size;
+}
+
+export interface ReadOn<T> { page: Page<T>; ended: boolean }
+
+/**
+ * `current` with the pages after it folded in, one request at a time (each
+ * cursor comes back with the page before it), until the list ends, `maxPages`
+ * were read, it holds `maxRows`, or `onPage` — shown each step as it lands —
+ * returns false. `ended` says whether the list's true end was reached.
+ */
+export async function readOn<T extends { id: string }>(
+  read: Read<T>,
+  current: Page<T>,
+  maxPages: number,
+  { maxRows = Number.POSITIVE_INFINITY, onPage }: { maxRows?: number; onPage?: (page: Page<T>) => boolean } = {},
+): Promise<ReadOn<T>> {
+  const items = new Map(current.items.map((item) => [item.id, item]));
+  let cursor = current.next_cursor, last = current;
+  const folded = (): Page<T> => {
+    const all = [...items.values()];
+    return { ...last, items: all, shown: all.length, has_more: cursor !== null, next_cursor: cursor };
+  };
+  for (let pages = 0; cursor !== null && pages < maxPages && items.size < maxRows; pages++) {
+    last = await read(cursor);
+    for (const item of last.items) items.set(item.id, item);
+    // A store that hands back the cursor it was given would be read forever.
+    const advanced = last.next_cursor !== cursor;
+    cursor = last.next_cursor;
+    if ((onPage && !onPage(folded())) || !advanced) break;
+  }
+  return { page: folded(), ended: cursor === null };
+}
+
+/**
  * The rest of a page's list after what is loaded, or null when the list did
  * not end within `MAX_COLUMN_PAGES`: a caller that needs the true last row
  * (the position after it) must then refuse rather than guess.
  */
 export async function readToEnd<T extends { id: string }>(read: Read<T>, current: Page<T>): Promise<Page<T> | null> {
-  const items = new Map(current.items.map((item) => [item.id, item]));
-  let cursor = current.next_cursor, last = current;
-  for (let pages = 0; cursor !== null && pages < MAX_COLUMN_PAGES; pages++) {
-    last = await read(cursor);
-    for (const item of last.items) items.set(item.id, item);
-    cursor = last.next_cursor;
-  }
-  if (cursor !== null) return null;
-  const all = [...items.values()];
-  return { ...last, items: all, shown: all.length, has_more: false, next_cursor: null };
+  const { page, ended } = await readOn(read, current, MAX_COLUMN_PAGES);
+  return ended ? page : null;
 }

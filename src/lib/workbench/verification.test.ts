@@ -5,7 +5,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invoke(
 const answer = (value: unknown) => invoke.mockResolvedValue(JSON.stringify(value));
 const sent = () => invoke.mock.calls.map(([, args]) => JSON.parse((args as { input: string }).input));
 
-import { MAX_VERDICT_BATCH, getVerdicts, sameVerdicts, type CardVerdict } from "./verification";
+import { MAX_VERDICT_BATCH, MAX_VERDICT_READS, getBoardVerdicts, getVerdicts, sameVerdicts, type CardVerdict } from "./verification";
 
 describe("sameVerdicts", () => {
   const v = (state: CardVerdict["state"], stale = false): CardVerdict => ({ state, stale });
@@ -54,5 +54,35 @@ describe("getVerdicts", () => {
     answer({ ok: true, items: { zzz: { ok: true, state: "passed", stale: false } } });
     expect((await getVerdicts(["a"])).size).toBe(0);
     await expect(getVerdicts(Array.from({ length: MAX_VERDICT_BATCH + 1 }, (_, n) => `i${n}`))).rejects.toThrow();
+  });
+});
+
+describe("getBoardVerdicts", () => {
+  it("splits a board larger than one read into reads the host accepts, one after another", async () => {
+    invoke.mockImplementation(async (_cmd: string, args?: { input: string }) => {
+      const { ids } = JSON.parse(args?.input ?? "{\"ids\":[]}") as { ids: string[] };
+      return JSON.stringify({ ok: true, items: Object.fromEntries(ids.filter((id) => id.endsWith("7")).map((id) => [id, { ok: true, state: "passed", stale: false }])) });
+    });
+    const ids = Array.from({ length: MAX_VERDICT_BATCH * 2 + 10 }, (_, n) => `i${n}`);
+    const out = await getBoardVerdicts([...ids, ...ids.slice(0, 5)]);
+    expect(sent().map((input) => input.ids.length)).toEqual([MAX_VERDICT_BATCH, MAX_VERDICT_BATCH, 10]);
+    expect(sent().flatMap((input) => input.ids)).toEqual(ids);
+    expect([...out.keys()]).toEqual(ids.filter((id) => id.endsWith("7")));
+  });
+
+  it("is one read for a board that fits, none for an empty one, and refuses past its bound", async () => {
+    answer({ ok: true, items: {} });
+    await getBoardVerdicts(["a", "b"]);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    invoke.mockClear();
+    expect((await getBoardVerdicts([])).size).toBe(0);
+    expect(invoke).not.toHaveBeenCalled();
+    await expect(getBoardVerdicts(Array.from({ length: MAX_VERDICT_BATCH * MAX_VERDICT_READS + 1 }, (_, n) => `i${n}`))).rejects.toThrow();
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("fails the whole read when one part fails, rather than draw the rest as unverified", async () => {
+    invoke.mockResolvedValueOnce(JSON.stringify({ ok: true, items: {} })).mockRejectedValueOnce({ code: "store_error", message: "store unavailable" });
+    await expect(getBoardVerdicts(Array.from({ length: MAX_VERDICT_BATCH + 1 }, (_, n) => `i${n}`))).rejects.toThrow();
   });
 });

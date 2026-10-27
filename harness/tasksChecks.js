@@ -3069,6 +3069,26 @@ if (params.has("check")) {
       await wait(() => refreshes() > reads); await settle(500);
       check(`a workbench change after Load all keeps every task loaded (${coverage()})`, coverage().includes("in all") && bulkCards() === 450);
       await click("Clear task search"); await settle(400);
+      // Browsing, a column pages 30 at a time; Load all reads the rest 200 at
+      // a time. Past 600 cards a refresh used to cut it to 600 (20 pages of
+      // 30), and past 256 the verdict read refused the board outright.
+      guardStep = "load all in a column";
+      for (let i = 450; i < 650; i++) tasks.push(makeTask(`task-${700 + i}`, `Bulkload item ${String(i + 1).padStart(3, "0")}`, "repo-0", "backlog"));
+      root.querySelector('button[aria-label="Refresh"]').click(); await settle(300);
+      const backlog = () => root.querySelector('[data-task-column="backlog"]');
+      const backlogCards = () => backlog()?.querySelectorAll("[data-task-card]").length ?? 0;
+      const backlogTotal = tasks.filter(task => task.status === "backlog" && !task.archived && !deleted.has(task.id)).length;
+      await wait(() => button("Load all Backlog tasks", backlog()));
+      verdictReads.length = 0;
+      button("Load all Backlog tasks", backlog()).click();
+      await wait(() => backlogCards() === backlogTotal); await settle(300);
+      check(`Load all reads a column to its end (${backlogCards()} of ${backlogTotal})`, backlogTotal > 600 && !button("Load more Backlog tasks", backlog()) && !button("Load all Backlog tasks", backlog()));
+      check(`a board past one verdict read reads its verdicts in parts (${verdictReads.map(ids => ids.length).join(",")})`,
+        verdictReads.length > 1 && verdictReads.every(ids => ids.length <= 256) && !root.querySelector('[data-testid="board-verdicts-error"]'));
+      const columnReads = refreshes();
+      await emit("workbench-changed", { sequence: 201 });
+      await wait(() => refreshes() > columnReads); await settle(600);
+      check(`a workbench change keeps a column loaded past 600 cards (${backlogCards()} of ${backlogTotal})`, backlogCards() === backlogTotal);
       tasks = tasks.filter(task => !task.title.startsWith("Bulkload item"));
       root.querySelector('button[aria-label="Refresh"]').click(); await settle(300);
     } catch (error) { check(`the load-all checks ran to the end (${error.message} at ${guardStep})`, false); }

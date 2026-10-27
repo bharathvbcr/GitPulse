@@ -16,7 +16,7 @@
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
   import { popover, restoreFocusTo } from "../ui/popover";
-  import { readToEnd, reloadPaged, samePage, sameRecords } from "../workbench/boardPaging";
+  import { MAX_COLUMN_PAGES, readOn, readToEnd, reloadPaged, reloadSize, samePage, sameRecords } from "../workbench/boardPaging";
   import { createLiveLoader } from "../workbench/liveLoader";
   import { cardFace, dragExceeded, grabPoint, type GrabPoint, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove } from "../workbench/boardDrag";
   import {
@@ -82,7 +82,7 @@
   import TaskActionDialog from "./TaskActionDialog.svelte";
   import TaskMergeDialog from "./TaskMergeDialog.svelte";
   import CardVerdict from "./CardVerdict.svelte";
-  import { getVerdicts, sameVerdicts, type CardVerdict as Verdict } from "../workbench/verification";
+  import { getBoardVerdicts, sameVerdicts, type CardVerdict as Verdict } from "../workbench/verification";
   import { mergeEligibility } from "../workbench/taskMerge";
   import TaskEditor from "./TaskEditor.svelte";
   import WorkspaceEditor from "./WorkspaceEditor.svelte";
@@ -186,8 +186,8 @@
   let suggestTicket = 0;
   /** The search's candidates; null while the board browses columns. */
   let candidates = $state.raw<CandidateSet | null>(null);
-  /** "Load all tasks" is walking the candidate pages; Stop sets the flag it checks between them. */
-  let loadingAll = $state(false); let stopLoadingAll = false;
+  /** What a Load all is walking — the search's candidates or one column — and the flag Stop sets for it to check between pages. */
+  let loadingAll = $state<"search" | TaskStatus | null>(null); let stopLoadingAll = false;
   const boardKey = $derived(JSON.stringify([scope, plan.key]));
   /**
    * A new search on the same scope while its candidates load, or a cleared
@@ -640,7 +640,11 @@
       // columns, say nothing about this scope's pages.
       const kept = candidates === null && loadedScope === JSON.stringify(target);
       const [pages, archive] = await Promise.all([
-        Promise.all(STATUSES.map(async (status) => [status, await reloadPaged((cursor) => listTasks(target, status, "", cursor, TASK_PAGE_SIZE, BOARD), kept ? columns[status]?.items.length ?? 0 : 0, TASK_PAGE_SIZE)] as const)),
+        Promise.all(STATUSES.map(async (status) => {
+          // A column read past 600 cards (Load all) is read back at the store's page size, not cut to 600.
+          const loaded = kept ? columns[status]?.items.length ?? 0 : 0, size = reloadSize(loaded, TASK_PAGE_SIZE, CANDIDATE_PAGE);
+          return [status, await reloadPaged((cursor) => listTasks(target, status, "", cursor, size, BOARD), loaded, size)] as const;
+        })),
         archived,
       ]);
       if (stale()) return false;
@@ -673,7 +677,7 @@
    */
   async function loadVerdicts(ids: string[], generation: number) {
     try {
-      const read = await getVerdicts(ids);
+      const read = await getBoardVerdicts(ids);
       if (generation === revision && !disposed) { if (!sameVerdicts(verdicts, read)) verdicts = read; verdictError = ""; }
     } catch (cause) {
       if (generation === revision && !disposed) { verdicts = new Map(); verdictError = explainError(cause); }
@@ -1196,7 +1200,7 @@
     if (!set || loading || moving || loadedKey !== boardKey || !canLoadMore(set)) return;
     const generation = revision, key = boardKey;
     const stale = () => generation !== revision || disposed || key !== boardKey;
-    interactions++; loading = true; loadingAll = all; stopLoadingAll = false; error = ""; refreshError = false;
+    interactions++; loading = true; loadingAll = all ? "search" : null; stopLoadingAll = false; error = ""; refreshError = false;
     const read: CandidateRead = (query, cursor) => listTasks(current.scope, null, query, cursor, CANDIDATE_PAGE, BOARD);
     const show = (next: CandidateSet) => {
       if (stale()) return false;
@@ -1208,7 +1212,7 @@
       if (all) await readAllCandidates(set, current.word, read, show);
       else show(await nextCandidates(set, current.word, read));
     } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
-    finally { loadingAll = false; if (generation === revision && !disposed) loading = false; }
+    finally { loadingAll = null; if (generation === revision && !disposed) loading = false; }
   }
   /** Whether a column has cards beyond the loaded ones, so the end of what is loaded is not its end. */
   function tailUnknown(status: TaskStatus): boolean {
@@ -1248,6 +1252,35 @@
       void loadVerdicts(Object.values(columns).flatMap((page) => page?.items.map((card) => card.id) ?? []), generation);
     } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
     finally { if (generation === revision && !disposed) loading = false; }
+  }
+  /** Cards loaded across every column: what Load all budgets against `MAX_CANDIDATES`, since each one is drawn. */
+  const columnCards = $derived(Object.values(columns).reduce((sum, page) => sum + (page?.items.length ?? 0), 0));
+  /**
+   * A column read to its end, `CANDIDATE_PAGE` cards a request, drawn as each
+   * page lands. It stops once the board holds `MAX_CANDIDATES` cards, on Stop,
+   * or when the scope or a search takes the board; what it read stays, with
+   * Load more from where it stopped.
+   */
+  async function loadColumnAll(status: TaskStatus) {
+    const page = columns[status];
+    if (searching || loading || moving || loadedKey !== boardKey || !page?.next_cursor) return;
+    const generation = revision, key = boardKey, target = scope;
+    const stale = () => generation !== revision || disposed || key !== boardKey;
+    const budget = MAX_CANDIDATES - (columnCards - page.items.length);
+    if (budget <= page.items.length) return;
+    interactions++; loading = true; loadingAll = status; stopLoadingAll = false; error = ""; refreshError = false;
+    try {
+      await readOn((cursor) => listTasks(target, status, "", cursor, CANDIDATE_PAGE, BOARD), page, MAX_COLUMN_PAGES, {
+        maxRows: budget,
+        onPage: (next) => {
+          if (stale()) return false;
+          columns = { ...columns, [status]: next };
+          return !stopLoadingAll;
+        },
+      });
+      if (!stale()) void loadVerdicts(Object.values(columns).flatMap((one) => one?.items.map((card) => card.id) ?? []), generation);
+    } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
+    finally { loadingAll = null; if (generation === revision && !disposed) loading = false; }
   }
   /**
    * Where a drag at this point would drop.
@@ -2228,6 +2261,10 @@
     <div class="paging" data-task-paging={status}>
       <span class="paging-count">{named ? `${STATUS_LABELS[status]}: ` : ""}{pageOf.items.length} of {pageOf.total}</span>
       {#if pageOf.next_cursor}<button type="button" class="gp-btn" aria-label={`Load more ${STATUS_LABELS[status]} tasks`} onclick={() => pageColumn(status, pageOf.next_cursor ?? undefined)} disabled={loading}>Load more</button>{/if}
+      {#if pageOf.next_cursor}
+        {#if loadingAll === status}<button type="button" class="gp-btn" aria-label={`Stop loading ${STATUS_LABELS[status]} tasks`} onclick={() => { stopLoadingAll = true; }}>Stop</button>
+        {:else}<button type="button" class="gp-btn" aria-label={`Load all ${STATUS_LABELS[status]} tasks`} title={columnCards >= MAX_CANDIDATES ? `The board already holds ${MAX_CANDIDATES.toLocaleString("en-US")} cards; show only the first page of another column, or search, to reach the rest` : `Read the rest of ${STATUS_LABELS[status]}, ${CANDIDATE_PAGE} tasks at a time`} onclick={() => void loadColumnAll(status)} disabled={loading || columnCards >= MAX_CANDIDATES}>Load all</button>{/if}
+      {/if}
       {#if pageOf.items.length > TASK_PAGE_SIZE}<button type="button" class="gp-btn" aria-label={`Show only the first ${STATUS_LABELS[status]} page`} onclick={() => pageColumn(status)} disabled={loading}>First page</button>{/if}
     </div>
   {/if}
@@ -2449,7 +2486,7 @@
         {/if}
         {#if moreCandidates}
           <button type="button" class="gp-btn quick" disabled={loading} onclick={() => void loadMoreCandidates()}>Load more tasks</button>
-          {#if loadingAll}
+          {#if loadingAll === "search"}
             <button type="button" class="gp-btn quick" onclick={() => { stopLoadingAll = true; }}>Stop loading</button>
           {:else}
             <button type="button" class="gp-btn quick" disabled={loading} title={`Read every remaining page, ${CANDIDATE_PAGE} tasks at a time, up to ${MAX_CANDIDATES.toLocaleString("en-US")}`} onclick={() => void loadMoreCandidates(true)}>Load all tasks</button>
@@ -2505,7 +2542,7 @@
         {hiddenRepositoryReport.line}
         {#if moreCandidates && !filtering}
           <button type="button" class="link" disabled={loading} onclick={() => void loadMoreCandidates()}>Load more tasks</button>
-          {#if loadingAll}<button type="button" class="link" onclick={() => { stopLoadingAll = true; }}>Stop loading</button>
+          {#if loadingAll === "search"}<button type="button" class="link" onclick={() => { stopLoadingAll = true; }}>Stop loading</button>
           {:else}<button type="button" class="link" disabled={loading} onclick={() => void loadMoreCandidates(true)}>Load all tasks</button>{/if}
         {/if}
         <button type="button" class="link" onclick={() => interfaceStore.showAllTaskRepositories()}>Show hidden repositories</button>

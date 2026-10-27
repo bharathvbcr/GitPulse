@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MAX_COLUMN_PAGES, MAX_RELOAD_PAGES, pagesLoaded, readToEnd, reloadPaged, samePage, sameRecords } from "./boardPaging";
+import { MAX_COLUMN_PAGES, MAX_RELOAD_PAGES, pagesLoaded, readOn, readToEnd, reloadPaged, reloadSize, samePage, sameRecords } from "./boardPaging";
 import type { Page } from "./client";
 
 type Row = { id: string };
@@ -105,6 +105,59 @@ describe("readToEnd", () => {
     reads.length = 0;
     expect(await readToEnd(read, first)).toBeNull();
     expect(reads).toHaveLength(MAX_COLUMN_PAGES);
+  });
+});
+
+describe("readOn", () => {
+  it("reads on from what is loaded, shows each page as it lands, and says it reached the end", async () => {
+    const all = rows(450);
+    const first = await store(all, 30).read(undefined);
+    const { read, reads } = store(all, 200);
+    const seen: number[] = [];
+    const { page, ended } = await readOn(read, first, MAX_COLUMN_PAGES, { onPage: (next) => { seen.push(next.items.length); return true; } });
+    expect(ended).toBe(true);
+    expect(page.items.map((row) => row.id)).toEqual(all.map((row) => row.id));
+    expect(page).toMatchObject({ total: 450, shown: 450, has_more: false, next_cursor: null });
+    expect(seen).toEqual([230, 430, 450]);
+    expect(reads).toEqual(["t0029", "t0229", "t0429"]);
+  });
+
+  it("stops at a row budget or when told to, keeping what it read and the cursor to continue from", async () => {
+    const all = rows(1000);
+    const first = await store(all, 30).read(undefined);
+    const { read } = store(all, 200);
+    const budgeted = await readOn(read, first, MAX_COLUMN_PAGES, { maxRows: 400 });
+    expect(budgeted.ended).toBe(false);
+    expect(budgeted.page.items).toHaveLength(430);
+    expect(budgeted.page).toMatchObject({ has_more: true, next_cursor: "t0429", shown: 430 });
+    let pages = 0;
+    const stopped = await readOn(read, first, MAX_COLUMN_PAGES, { onPage: () => ++pages < 2 });
+    expect(stopped.page.items).toHaveLength(430);
+    expect(stopped.ended).toBe(false);
+  });
+
+  it("ends when a store hands back the cursor it was given", async () => {
+    let reads = 0;
+    const stuck = async (): Promise<Page<Row>> => { reads++; return { items: [{ id: `s${reads}` }], total: 9_999, shown: 1, has_more: true, next_cursor: "same" }; };
+    const { ended } = await readOn(stuck, { items: [], total: 9_999, shown: 0, has_more: true, next_cursor: "same" }, MAX_COLUMN_PAGES);
+    expect(ended).toBe(false);
+    expect(reads).toBe(1);
+  });
+});
+
+describe("reloadSize", () => {
+  it("keeps the column page size while a reload reaches what is loaded, and takes the store page past it", () => {
+    expect(reloadSize(0, 30, 200)).toBe(30);
+    expect(reloadSize(30 * MAX_RELOAD_PAGES, 30, 200)).toBe(30);
+    expect(reloadSize(30 * MAX_RELOAD_PAGES + 1, 30, 200)).toBe(200);
+  });
+
+  it("reads a fully loaded 2,000-card column back whole", async () => {
+    const all = rows(2000);
+    const size = reloadSize(2000, 30, 200);
+    const { read } = store(all, size);
+    expect((await reloadPaged(read, 2000, size)).items).toHaveLength(2000);
+    expect((await reloadPaged(store(all, 30).read, 2000, 30)).items).toHaveLength(30 * MAX_RELOAD_PAGES);
   });
 });
 
