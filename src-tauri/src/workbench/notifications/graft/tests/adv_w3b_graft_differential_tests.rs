@@ -195,6 +195,10 @@ fn held_an_oversized_answer_is_garbled_without_waiting_for_the_close() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.sock");
         let listener = UnixListener::bind(&path).unwrap();
+        // The peer holds the connection longer than the limit can stretch, so
+        // an exchange that waited for the close would still overrun it.
+        let limit = crate::test_support::coverage_relaxed(Duration::from_millis(1200));
+        let hold = limit + Duration::from_millis(300);
         let peer = std::thread::spawn(move || {
             let (mut s, _) = listener.accept().unwrap();
             let mut line = Vec::new();
@@ -206,16 +210,12 @@ fn held_an_oversized_answer_is_garbled_without_waiting_for_the_close() {
                 line.push(byte[0]);
             }
             let _ = s.write_all(&vec![b'x'; MAX_ANSWER * 4]);
-            std::thread::sleep(Duration::from_millis(1500));
+            std::thread::sleep(hold);
         });
         let t = Instant::now();
         let out = exchange_fn(&path, REQUEST, Duration::from_secs(5));
         assert_eq!(out, Outcome::Garbled);
-        assert!(
-            t.elapsed() < Duration::from_millis(1200),
-            "{:?}",
-            t.elapsed()
-        );
+        assert!(t.elapsed() < limit, "{:?}", t.elapsed());
         peer.join().unwrap();
     }
 }
@@ -247,7 +247,8 @@ fn held_a_peer_that_reads_nothing_times_out_a_partial_write_once() {
         };
         assert_eq!(out, Outcome::TimedOut, "new={new}");
         assert!(
-            t.elapsed() < Duration::from_millis(300) + slack(),
+            t.elapsed()
+                < crate::test_support::coverage_relaxed(Duration::from_millis(300)) + slack(),
             "new={new}: {:?}",
             t.elapsed()
         );
@@ -352,7 +353,7 @@ fn held_a_full_backlog_is_absent_at_once_on_macos() {
         let t = Instant::now();
         assert_eq!(exchange_fn(&path, REQUEST, BUDGET), Outcome::Absent);
         assert!(
-            t.elapsed() < Duration::from_millis(300),
+            t.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(300)),
             "{:?}",
             t.elapsed()
         );

@@ -282,7 +282,7 @@ fn a_fifo_at_the_records_name_does_not_hold_the_hook() {
     })
     .expect_err("no reply");
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5)),
         "{:?}",
         started.elapsed()
     );
