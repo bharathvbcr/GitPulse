@@ -795,9 +795,8 @@ describe("bundle contents", () => {
 
 /**
  * Adversarial cases for ft-ac3bba92 (adversary pass, build run 2026-10-26).
- * Fixtures for the same cases, run through the CLI, are under
- * tmp/build-1026/l2-adv/. Each `it` says whether it broke the implementation
- * (`BREAKS`) or documents a case that held (`HOLDS`).
+ * Each `it` says whether it broke the implementation (`BREAKS`) or documents
+ * a case that held (`HOLDS`).
  */
 describe("bundle contents: adversarial bundles", () => {
   /** What real v1.3.1 Windows installers extract to: every binary at the root of the tree (checked with 7z 23.01 on both). */
