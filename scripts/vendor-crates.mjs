@@ -79,22 +79,45 @@ import { formatUsage, wantsHelp } from "./usage.mjs";
  *  home or a hung fsmonitor, and then nothing else in this process can stop it. */
 const GIT_TIMEOUT_MS = 30_000;
 
-/** A `git` call that ran past its bound. Distinct from "git failed", which the
- *  callers below treat as "this is not a git checkout": a hang is not that. */
-class GitTimeout extends Error {}
+/** The most `GITPULSE_VENDOR_GIT_TIMEOUT_MS` may ask for: ten minutes. A larger
+ *  value is a typo, and would remove the bound it exists to set. */
+const GIT_TIMEOUT_CAP_MS = 600_000;
+
+/** A failure of the `git` bound itself, not of git: a call that ran past it, or
+ *  a setting that cannot be read as one. The callers below treat an ordinary
+ *  git failure as "this is not a git checkout"; neither of these is that, so
+ *  they are rethrown. */
+class GitBoundError extends Error {}
+
+/**
+ * The bound for one `git` call: `GITPULSE_VENDOR_GIT_TIMEOUT_MS` when set, which
+ * must be a plain decimal integer of 1 to {@link GIT_TIMEOUT_CAP_MS}
+ * milliseconds, else {@link GIT_TIMEOUT_MS}. Anything else throws rather than
+ * falling back, so a typo is not mistaken for a working setting.
+ *
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {number}
+ */
+export function gitTimeoutMs(env = process.env) {
+  const raw = env.GITPULSE_VENDOR_GIT_TIMEOUT_MS;
+  if (raw === undefined) return GIT_TIMEOUT_MS;
+  if (!/^[0-9]{1,7}$/.test(raw) || Number(raw) < 1 || Number(raw) > GIT_TIMEOUT_CAP_MS) {
+    throw new GitBoundError(
+      `GITPULSE_VENDOR_GIT_TIMEOUT_MS=${JSON.stringify(raw)} is not a whole number of milliseconds from 1 to ${GIT_TIMEOUT_CAP_MS}`,
+    );
+  }
+  return Number(raw);
+}
 
 /**
  * Runs `git` with a bound, and reports a timeout as an error that names the
  * command. Any other failure is the caller's to interpret.
  *
- * `GITPULSE_VENDOR_GIT_TIMEOUT_MS` replaces the bound (a positive integer).
- *
  * @param {string[]} args
  * @returns {string}
  */
 function runGit(args) {
-  const configured = Number(process.env.GITPULSE_VENDOR_GIT_TIMEOUT_MS);
-  const timeout = Number.isInteger(configured) && configured > 0 ? configured : GIT_TIMEOUT_MS;
+  const timeout = gitTimeoutMs();
   try {
     return execFileSync("git", args, {
       encoding: "utf8",
@@ -103,7 +126,7 @@ function runGit(args) {
     });
   } catch (error) {
     if (/** @type {{ code?: string }} */ (error).code === "ETIMEDOUT") {
-      throw new GitTimeout(`\`git ${args.join(" ")}\` did not finish within ${timeout} ms`);
+      throw new GitBoundError(`\`git ${args.join(" ")}\` did not finish within ${timeout} ms`);
     }
     throw error;
   }
@@ -240,7 +263,7 @@ export function findSibling(name, from = REPO) {
     if (existsSync(candidate)) return candidate;
   } catch (error) {
     // A hung git is a failure to report, not a layout to guess around.
-    if (error instanceof GitTimeout) throw error;
+    if (error instanceof GitBoundError) throw error;
     // The explicit environment variables remain the escape hatch for a
     // non-Git source tree or an unusual Git directory layout.
   }
@@ -584,7 +607,7 @@ function gitCommit(root) {
   try {
     return runGit(["-C", root, "rev-parse", "HEAD"]).trim();
   } catch (error) {
-    if (error instanceof GitTimeout) throw error;
+    if (error instanceof GitBoundError) throw error;
     return "";
   }
 }
@@ -612,7 +635,7 @@ function gitSubtreeDirty(root, relDir) {
     const out = runGit(["-C", root, "status", "--porcelain", "--", relDir]);
     return out.trim() !== "";
   } catch (error) {
-    if (error instanceof GitTimeout) throw error;
+    if (error instanceof GitBoundError) throw error;
     // Not a git checkout, or git is unavailable. `commit` is already "" in that
     // case, so there is no commit claim to qualify.
     return false;
@@ -1120,6 +1143,8 @@ export function main(argv = process.argv.slice(2)) {
   }
 
   try {
+    // A bad bound is refused before any work, not on the first git call.
+    gitTimeoutMs();
     if (argv.includes("--contracts")) {
       const manifest = vendorContracts(process.env);
       if (asJson) console.log(JSON.stringify(manifest, null, 2));

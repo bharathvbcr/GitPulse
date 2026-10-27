@@ -2480,11 +2480,18 @@ fn within_budget<T: Send + 'static>(
         .name("gitpulse-hook-check".into())
         .spawn(move || {
             #[cfg(test)]
-            let started = crate::sysload::thread_cpu();
+            let started = crate::sysload::try_thread_cpu();
             let answer = work();
-            // The CPU the worker spent, handed back beside its answer.
+            // The CPU the worker spent, handed back beside its answer; `None`
+            // where the platform has no thread CPU clock, and then the
+            // worker runs exactly as it does in a release build.
             #[cfg(test)]
-            let answer = (answer, crate::sysload::thread_cpu() - started);
+            let answer = (
+                answer,
+                started
+                    .zip(crate::sysload::try_thread_cpu())
+                    .map(|(started, ended)| ended - started),
+            );
             let _ = tx.send(answer);
         })
         .ok()?;
@@ -2502,9 +2509,10 @@ thread_local! {
     /// The CPU the worker of this thread's last completed [`within_budget`]
     /// spent. Per calling thread, so tests running side by side do not see each
     /// other's: a test that must bound the work of a whole reader reads it, as
-    /// wall time on a loaded host is not a measure of work.
-    pub(crate) static LAST_WORKER_CPU: std::cell::Cell<Duration> =
-        const { std::cell::Cell::new(Duration::ZERO) };
+    /// wall time on a loaded host is not a measure of work. `None` where the
+    /// platform has no thread CPU clock.
+    pub(crate) static LAST_WORKER_CPU: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// The canonical form of a path that may not exist yet.

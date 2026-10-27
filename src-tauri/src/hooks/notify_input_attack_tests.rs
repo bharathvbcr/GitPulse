@@ -345,7 +345,15 @@ fn a_five_mib_tool_input_costs_well_under_the_hook_timeout() {
     for _ in 0..5 {
         let input = new_path(body.as_bytes()).unwrap();
         assert_eq!(input.tool_subject.len(), 16);
-        best = best.min(super::LAST_WORKER_CPU.get());
+        if let Some(cpu) = super::LAST_WORKER_CPU.get() {
+            best = best.min(cpu);
+        }
+    }
+    if best == Duration::MAX {
+        // No per-thread CPU clock here (it exists on macOS and Linux): the
+        // reader ran and answered above, and its work is not measurable.
+        eprintln!("5 MiB tool_input: no thread CPU clock on this platform");
+        return;
     }
     eprintln!("5 MiB tool_input: min of 5 = {best:?} of worker CPU");
     assert!(best < Duration::from_millis(1_000), "{best:?}");

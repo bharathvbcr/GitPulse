@@ -54,7 +54,7 @@ impl Bucket {
 
     /// [`Bucket::take`] with the clock held still: spends a token if there is
     /// one and refills nothing.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn take_without_refill(&mut self) -> bool {
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
@@ -87,7 +87,7 @@ pub(super) struct Limits {
     /// Test seam: while set, the outside bucket regains nothing with time, so a
     /// test that emptied it finds it empty for as long as it holds it, however
     /// slow the host. Never set outside `cfg(test)`.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     outside_held: bool,
 }
 
@@ -96,12 +96,12 @@ impl Limits {
     /// terminal session, which draws on the shared bucket instead.
     pub(super) fn admit(&mut self, key: &str, outside: bool, now: Instant) -> bool {
         if outside {
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             let held = self.outside_held;
             let bucket = self
                 .outside
                 .get_or_insert_with(|| Bucket::full(OUTSIDE_BURST, now));
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             if held {
                 return bucket.take_without_refill();
             }
@@ -125,7 +125,7 @@ impl Limits {
 
     /// Test seam: holds the outside bucket's refill off (`true`) or lets it run
     /// again from now (`false`), without giving back the tokens it spent.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn hold_outside_refill(&mut self, held: bool) {
         self.outside_held = held;
         if !held {
@@ -140,7 +140,7 @@ impl Limits {
         self.sessions.remove(key);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn len(&self) -> usize {
         self.sessions.len()
     }

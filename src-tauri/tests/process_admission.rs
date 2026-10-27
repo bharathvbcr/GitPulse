@@ -211,8 +211,15 @@ fn no_shipped_source_lifts_the_spawn_rate_cap() {
 ///     nothing.
 ///
 /// Each needs the call graph, which `devmap` has and this test does not.
-/// The run-time answer is the instrumented gate: log every spawn a suite makes
-/// under the production rate (the adversary's `apply_metered_log.py`).
+/// The run-time answer is the instrumented gate: patch the library's spawn gate
+/// (`git_cli`'s `SpawnGate::acquire_judged`, where `rate_limited` is decided) to
+/// append the test executable's name, the thread's name and the admission class
+/// (and a backtrace, to name the call) to a log whenever a spawn is made under
+/// the production rate by a process whose executable sits in `target/debug/deps`
+/// (an integration-test crate). A suite in that log either has an entry point
+/// that reaches the gate before its lift, or sits in the list below on a false
+/// reason. That is how `terminal_pty_stress` (14 spawns from
+/// `session-spawn-ledger`) and the `bind` calls of the hook suites were found.
 const UNMETERED_ALLOWLIST: &[(&str, &str)] = &[
     ("adv_notify_process.rs", "subprocess-only: drives gitpulse-hook; the library supplies constants and LockedSpawn"),
     ("adv_w6l4_ascii_oracle.rs", "no git spawn: pure parsers (github::parse_github_remote_url, tasks::scan_briefs)"),
@@ -239,6 +246,7 @@ const UNMETERED_ALLOWLIST: &[(&str, &str)] = &[
     ("logging_process.rs", "subprocess-only: the logging module in processes of their own"),
     ("mcp_background_wait.rs", "measures the metered gate: background spawns waiting for budget"),
     ("mcp_stdio.rs", "subprocess-only: drives gitpulse-mcp over stdio"),
+    ("mcp_transport_stress.rs", "subprocess-only, measured: drives gitpulse-mcp; its in-process calls are repository_trust::inspect/grant (filesystem) and ledger::record, and with the gate instrumented the suite made 0 metered spawns"),
     ("native_event_unwind.rs", "subprocess-only: native event-loop fault injection in a child process"),
     ("native_menu_main_thread.rs", "no git spawn: builds desktop menus"),
     ("native_quit_guard.rs", "no git spawn: quit guard over empty terminal sessions"),

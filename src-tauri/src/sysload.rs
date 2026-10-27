@@ -78,9 +78,15 @@ use serde::{Deserialize, Serialize};
 /// the wall clock by tens of times and the thread's CPU time by almost none.
 #[cfg(test)]
 pub(crate) fn thread_cpu() -> std::time::Duration {
-    std::time::Duration::from_nanos(
-        probe::thread_cpu_ns().expect("the thread CPU clock must be readable"),
-    )
+    try_thread_cpu().expect("the thread CPU clock must be readable")
+}
+
+/// [`thread_cpu`] where the platform may have no per-thread CPU clock (it has
+/// one on macOS and Linux only): `None` there, instead of a panic, for a caller
+/// that must not break a test build on the other targets.
+#[cfg(test)]
+pub(crate) fn try_thread_cpu() -> Option<std::time::Duration> {
+    probe::thread_cpu_ns().map(std::time::Duration::from_nanos)
 }
 
 /// The environment variable a launched task attempt carries: its run id.

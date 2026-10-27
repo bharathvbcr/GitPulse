@@ -117,6 +117,30 @@ it.runIf(process.platform !== "win32")("reports a git that never answers as an e
   } finally { f.cleanup(); }
 }, 30_000);
 
+// The bound's own setting is validated, not guessed at: a typo that fell back to
+// the default (or, as a huge number, removed the bound) would look like a
+// working setting.
+it.each(["abc", "300ms", "0", "-5", "1.5", "0x12c", "1e3", "99999999999999", "600001", ""])(
+  "refuses GITPULSE_VENDOR_GIT_TIMEOUT_MS=%j, naming the variable",
+  async (value) => {
+    const f = await fixture();
+    try {
+      const result = f.runWith({ GITPULSE_VENDOR_GIT_TIMEOUT_MS: value }, "--check", "--allow-drift");
+      expect(result.status, result.stdout).toBe(2);
+      expect(result.stderr).toContain("FAIL: GITPULSE_VENDOR_GIT_TIMEOUT_MS=");
+    } finally { f.cleanup(); }
+  },
+);
+
+// (Not "1": a real git does not answer in 1 ms, and that is accepted as a bound.)
+it.each(["5000", "30000", "600000"])("accepts GITPULSE_VENDOR_GIT_TIMEOUT_MS=%s", async (value) => {
+  const f = await fixture();
+  try {
+    const result = f.runWith({ GITPULSE_VENDOR_GIT_TIMEOUT_MS: value }, "--check", "--allow-drift");
+    expect(result.status, result.stderr).toBe(0);
+  } finally { f.cleanup(); }
+});
+
 it.each(["edited", "missing", "extra"])("checks locally maintained framework snapshots for %s files", async (mode) => {
   const f = await fixture();
   try {

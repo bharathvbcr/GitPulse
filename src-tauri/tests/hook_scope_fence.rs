@@ -134,8 +134,11 @@ fn a_task_bound_session_cannot_write_outside_its_plan_through_any_tool() {
     git(&repo_buf, &["add", "."]);
     git(&repo_buf, &["commit", "-q", "-m", "seed"]);
 
-    // The trust read below reaches the library's git gate in this process; the
-    // hook processes it drives have gates of their own.
+    // `bind` below reaches the library's git gate in this process
+    // (`resolve_worktree_family` -> `git worktree list`; traced through the
+    // same call in `hook_protocol_stress`, since this test is ignored without a
+    // manvi binary). The trust read does not: it reads the filesystem. The hook
+    // processes this test drives have gates of their own.
     gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
     let preview = gitpulse_lib::repository_trust::inspect(repo).expect("inspect");
     gitpulse_lib::repository_trust::grant(repo, &preview.identity, true).expect("trust");
