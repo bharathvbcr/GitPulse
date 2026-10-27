@@ -31,9 +31,9 @@ describe("the Ask Lappi switch", () => {
     expect(description).toContain("staged diff is sent to the local Lappi process");
   });
 
-  it("says where it goes, and that it is not an AI provider", () => {
+  it("says where it goes, and that GitPulse sends it nowhere else", () => {
     expect(description).toContain("local socket");
-    expect(description).toContain("not to an AI provider");
+    expect(description).toContain("GitPulse sends it nowhere else");
   });
 
   it("keeps what it already said: off by default, and the answer only pre-selects", () => {

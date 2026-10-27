@@ -59,7 +59,7 @@
   <div class="text-textMuted text-[10px] mb-1.5">Lappi</div>
   <SettingToggle
     label="Ask Lappi on ambiguous commit types"
-    description="Off by default. When the staged change has no clear type, the staged diff is sent to the local Lappi process on this computer, over a local socket and not to an AI provider. Its answer can only pre-select the type in the draft you edit."
+    description="Off by default. When the staged change has no clear type, the staged diff is sent to the local Lappi process on this computer, over a local socket. GitPulse sends it nowhere else. Its answer can only pre-select the type in the draft you edit."
     checked={view.settings.ask_on_ambiguous_commit_type}
     disabled={busy || !view.transport_supported}
     onchange={(next) => void save({ ...view.settings, ask_on_ambiguous_commit_type: next })}

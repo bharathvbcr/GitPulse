@@ -21,10 +21,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde::Serialize;
-
 /// The count and whose it is.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropSnapshot {
     /// Reports this process abandoned at their deadline. Not confirmed
     /// delivered and not retried; the app may or may not have received them.

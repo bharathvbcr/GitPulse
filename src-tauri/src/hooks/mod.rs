@@ -46,7 +46,7 @@ pub mod advisory_once;
 mod notify_drops;
 mod notify_input;
 mod notify_outcome;
-pub use notify_drops::{DropSnapshot, NotifyDrops};
+use notify_drops::{DropSnapshot, NotifyDrops};
 pub use notify_input::SESSION_END_HOST_TIMEOUT;
 #[cfg(not(unix))]
 use notify_outcome::send_unsupported as notify_send;
@@ -2089,13 +2089,6 @@ pub fn dispatch(
     }
 }
 
-/// What this process has abandoned at a report's deadline so far. A hook is
-/// one-shot, so this is that run's count and nothing wider
-/// ([`notify_drops`] says why).
-pub fn notify_drops() -> DropSnapshot {
-    notify_drops::PROCESS_DROPS.snapshot()
-}
-
 /* ── notify ───────────────────────────────────────────────────────────────── */
 
 /// The environment variable naming the agent that spawned this hook.
@@ -2191,12 +2184,15 @@ fn run_notify_within(
             // Counted where the give-up is decided: this is the one place that
             // knows the reply missed its bound. A reply that arrives in time
             // never reaches this arm.
-            let dropped = drops.record();
+            drops.record();
+            let DropSnapshot {
+                dropped,
+                dropped_scope,
+            } = drops.snapshot();
             Err(HookError::Failed(format!(
                 "notification report ({}) exceeded its deadline; not retried \
-                 ({dropped} dropped by this process, scope {})",
-                event.name,
-                crate::ledger::DROPPED_SCOPE
+                 ({dropped} dropped, scope {dropped_scope})",
+                event.name
             )))
         }
     }
