@@ -936,6 +936,24 @@
                         onchange={(next) => interfaceStore.setStackWorktreeTabs(next)}
                       />
                     </div>
+                    <div data-setting="collapse-inactive-group-tabs" hidden={!shown("collapse-inactive-group-tabs")}>
+                      <SettingToggle
+                        label="Collapse inactive tabs in groups"
+                        description="In tab groups, collapses inactive tabs into the group header to focus on active tabs."
+                        ariaLabel="Collapse inactive tabs in tab groups to focus on active tabs"
+                        checked={$interfaceStore.collapseInactiveGroupTabs}
+                        onchange={(next) => interfaceStore.setCollapseInactiveGroupTabs(next)}
+                      />
+                    </div>
+                    <div data-setting="collapse-inactive-include-shells" hidden={!shown("collapse-inactive-include-shells")}>
+                      <SettingToggle
+                        label="Collapse tabs with active shells"
+                        description="When collapsing inactive tabs in groups, also collapse tabs running background terminal shells."
+                        ariaLabel="Collapse inactive tabs with active terminal shells"
+                        checked={$interfaceStore.collapseInactiveIncludeShells}
+                        onchange={(next) => interfaceStore.setCollapseInactiveIncludeShells(next)}
+                      />
+                    </div>
                     <div data-setting="language-bar" hidden={!shown("language-bar")}>
                       <SettingToggle
                         label="Language mix"

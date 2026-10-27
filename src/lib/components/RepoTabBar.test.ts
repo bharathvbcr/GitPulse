@@ -243,5 +243,140 @@ describe("RepoTabBar", () => {
         await repoStore.closeActiveTab();
       }
     });
+
+    it("collapses inactive tabs in tab groups to focus on active tabs", async () => {
+      await repoStore.openRepo("/projects/tools/lint", { allowBroken: true, activate: true });
+      await repoStore.openRepo("/projects/tools/format", { allowBroken: true, activate: false });
+      await repoStore.openRepo("/projects/web/dashboard", { allowBroken: true, activate: false });
+      await repoStore.openRepo("/projects/other/app", { allowBroken: true, activate: false });
+
+      repoStore.setTabGroup(get(repoStore).openTabs[0].id, "tools");
+      repoStore.setTabGroup(get(repoStore).openTabs[1].id, "tools");
+      repoStore.setTabGroup(get(repoStore).openTabs[2].id, "web");
+
+      interfaceStore.setCollapseInactiveGroupTabs(true);
+
+      const { body } = render(RepoTabBar);
+
+      // tools group has active tab lint -> header + lint visible, format hidden
+      expect(body).toContain('data-group-head="tools"');
+      expect(body).toContain("lint");
+      expect(body).not.toContain("format");
+      expect(body).toContain("1 inactive collapsed");
+
+      // web group has no active tab -> header visible, dashboard hidden
+      expect(body).toContain('data-group-head="web"');
+      expect(body).not.toContain("dashboard");
+
+      // ungrouped tab app remains visible
+      expect(body).toContain("app");
+
+      // Turn off collapseInactiveGroupTabs
+      interfaceStore.setCollapseInactiveGroupTabs(false);
+      const expandedBody = render(RepoTabBar).body;
+      expect(expandedBody).toContain("lint");
+      expect(expandedBody).toContain("format");
+      expect(expandedBody).toContain("dashboard");
+      expect(expandedBody).toContain("app");
+
+      repoStore.ungroupTabs();
+      while (get(repoStore).openTabs.length > 0) {
+        await repoStore.closeActiveTab();
+      }
+    });
+
+    it("collapses inactive tabs running active shells and indicates shells on the group header", async () => {
+      await repoStore.openRepo("/projects/tools/lint", { allowBroken: true, activate: true });
+      await repoStore.openRepo("/projects/tools/format", { allowBroken: true, activate: false });
+
+      repoStore.setTabGroup(get(repoStore).openTabs[0].id, "tools");
+      repoStore.setTabGroup(get(repoStore).openTabs[1].id, "tools");
+
+      const shell = terminalSessions.reserve({
+        key: "tools-format-shell",
+        repoPath: "/projects/tools/format",
+        label: "Build",
+        status: "running",
+        close: async () => {},
+      });
+
+      try {
+        interfaceStore.setCollapseInactiveGroupTabs(true);
+        const { body } = render(RepoTabBar);
+
+        // Group head indicates the collapsed inactive tab and the active shell session running in tools
+        expect(body).toContain('data-group-head="tools"');
+        expect(body).toContain("1 inactive collapsed");
+        expect(body).toContain("1 terminal session running in tools");
+        expect(body).toContain(">lint</span>");
+        expect(body).not.toContain(">format</span>");
+      } finally {
+        shell.release();
+        interfaceStore.setCollapseInactiveGroupTabs(false);
+        repoStore.ungroupTabs();
+        while (get(repoStore).openTabs.length > 0) {
+          await repoStore.closeActiveTab();
+        }
+      }
+    });
+
+    it("respects collapseInactiveIncludeShells when collapsing inactive tabs", async () => {
+      await repoStore.openRepo("/projects/tools/lint", { allowBroken: true, activate: true });
+      await repoStore.openRepo("/projects/tools/format", { allowBroken: true, activate: false });
+      await repoStore.openRepo("/projects/tools/test", { allowBroken: true, activate: false });
+
+      repoStore.setTabGroup(get(repoStore).openTabs[0].id, "tools");
+      repoStore.setTabGroup(get(repoStore).openTabs[1].id, "tools");
+      repoStore.setTabGroup(get(repoStore).openTabs[2].id, "tools");
+
+      const shell = terminalSessions.reserve({
+        key: "tools-format-shell-toggle",
+        repoPath: "/projects/tools/format",
+        label: "Build",
+        status: "running",
+        close: async () => {},
+      });
+
+      try {
+        interfaceStore.setCollapseInactiveGroupTabs(true);
+        // Default: collapseInactiveIncludeShells is true -> format is collapsed even with active shell
+        let body = render(RepoTabBar).body;
+        expect(body).toContain(">lint</span>");
+        expect(body).not.toContain(">format</span>");
+        expect(body).not.toContain(">test</span>");
+
+        // When collapseInactiveIncludeShells is false -> format (active shell) remains visible
+        interfaceStore.setCollapseInactiveIncludeShells(false);
+        body = render(RepoTabBar).body;
+        expect(body).toContain(">lint</span>");
+        expect(body).toContain(">format</span>");
+        expect(body).not.toContain(">test</span>");
+      } finally {
+        shell.release();
+        interfaceStore.setCollapseInactiveGroupTabs(false);
+        interfaceStore.setCollapseInactiveIncludeShells(true);
+        repoStore.ungroupTabs();
+        while (get(repoStore).openTabs.length > 0) {
+          await repoStore.closeActiveTab();
+        }
+      }
+    });
+
+    it("includes collapse inactive options and shell controls in right-click menus", () => {
+      // Tab right-click menu (data-repo-menu)
+      expect(source).toContain("data-repo-menu");
+      expect(source).toContain('Collapse inactive tabs in "{tab.group}"');
+      expect(source).toContain("Collapse tabs with active shells");
+      expect(source).toContain("Keep tabs with active shells visible");
+
+      // Group head right-click menu (data-group-menu)
+      expect(source).toContain("data-group-menu");
+      expect(source).toContain("Collapse inactive tabs");
+      expect(source).toContain("Expand all tabs in group");
+
+      // Strip background right-click menu (data-strip-menu)
+      expect(source).toContain("data-strip-menu");
+      expect(source).toContain("Collapse inactive tabs in groups");
+    });
   });
 });

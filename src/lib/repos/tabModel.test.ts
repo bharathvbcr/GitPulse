@@ -26,6 +26,7 @@ import {
   closeGroup,
   groupByParentFolder,
   collapseAllGroups,
+  collapseInactiveGroups,
   expandAllGroups,
   type WorkspaceTabs,
 } from "./tabModel";
@@ -284,6 +285,13 @@ describe("tab grouping and folder heads", () => {
 
     ws = expandAllGroups(ws);
     expect(ws.collapsedGroups).toEqual([]);
+
+    // Collapse inactive groups leaves the group of active tab open
+    ws = collapseInactiveGroups(ws);
+    // Active tab is r3 (infra group), so devtools and web should be collapsed
+    expect(ws.collapsedGroups).toEqual(expect.arrayContaining(["devtools", "web"]));
+    expect(ws.collapsedGroups).not.toContain("infra");
+    expect(ws.collapsedGroups).toHaveLength(2);
   });
 });
 

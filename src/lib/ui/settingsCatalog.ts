@@ -184,6 +184,18 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "tab strip worktrees agents repository checkouts stack group switcher fatigue clutter",
   },
   {
+    id: "collapse-inactive-group-tabs",
+    section: "layout",
+    label: "Collapse inactive tabs in groups",
+    keywords: "tab strip repository groups collapse minimize inactive active focus clutter shells terminals",
+  },
+  {
+    id: "collapse-inactive-include-shells",
+    section: "layout",
+    label: "Collapse tabs with active shells",
+    keywords: "tab strip repository groups shells terminals active background collapse inactive focus clutter",
+  },
+  {
     id: "language-bar",
     section: "layout",
     label: "Language mix",

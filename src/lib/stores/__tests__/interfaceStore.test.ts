@@ -91,6 +91,30 @@ describe("interfaceStore", () => {
     expect(get(interfaceStore).showGraphAvatars).toBe(true);
   });
 
+  it("manages collapseInactiveGroupTabs preference", () => {
+    expect(get(interfaceStore).collapseInactiveGroupTabs).toBe(false);
+    interfaceStore.setCollapseInactiveGroupTabs(true);
+    expect(get(interfaceStore).collapseInactiveGroupTabs).toBe(true);
+    interfaceStore.toggleCollapseInactiveGroupTabs();
+    expect(get(interfaceStore).collapseInactiveGroupTabs).toBe(false);
+    interfaceStore.toggleCollapseInactiveGroupTabs();
+    expect(get(interfaceStore).collapseInactiveGroupTabs).toBe(true);
+    interfaceStore.reset();
+    expect(get(interfaceStore).collapseInactiveGroupTabs).toBe(false);
+  });
+
+  it("manages collapseInactiveIncludeShells preference", () => {
+    expect(get(interfaceStore).collapseInactiveIncludeShells).toBe(true);
+    interfaceStore.setCollapseInactiveIncludeShells(false);
+    expect(get(interfaceStore).collapseInactiveIncludeShells).toBe(false);
+    interfaceStore.toggleCollapseInactiveIncludeShells();
+    expect(get(interfaceStore).collapseInactiveIncludeShells).toBe(true);
+    interfaceStore.toggleCollapseInactiveIncludeShells();
+    expect(get(interfaceStore).collapseInactiveIncludeShells).toBe(false);
+    interfaceStore.reset();
+    expect(get(interfaceStore).collapseInactiveIncludeShells).toBe(true);
+  });
+
   it("toggles graph avatars via setter and toggle, preserving other prefs", () => {
     interfaceStore.setShowLanguageBar(false);
     interfaceStore.setShowGraphAvatars(false);

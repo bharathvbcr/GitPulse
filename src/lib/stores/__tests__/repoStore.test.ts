@@ -4422,6 +4422,14 @@ describe("repoStore tab grouping", () => {
     store.expandAllGroups();
     expect(get(store).collapsedGroups).toEqual([]);
 
+    // Collapse inactive groups
+    store.collapseInactiveGroups();
+    const active = get(store).openTabs.find((t) => t.isActive);
+    if (active?.group) {
+      expect(get(store).collapsedGroups).not.toContain(active.group);
+    }
+    store.expandAllGroups();
+
     for (const tab of get(store).openTabs) await store.closeTab(tab.id);
   });
 
