@@ -636,3 +636,6 @@ pub(super) static PROCESS_DROPS: NotifyDrops = NotifyDrops::recording(DropRecord
 
 #[cfg(all(test, unix))]
 mod residue_tests;
+
+#[cfg(all(test, unix))]
+mod adv_w4c_tests;
