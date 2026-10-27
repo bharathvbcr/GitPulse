@@ -22,7 +22,7 @@ pub mod client;
 pub mod record;
 pub mod request;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -75,6 +75,16 @@ fn default_store() -> Option<&'static Store> {
         .as_ref()
 }
 
+/// What a consultation reaches outside the process for: the agent's socket and
+/// the caller-record store. Resolved by a closure only once the settings have
+/// allowed a consultation, so a test can prove that with both settings off
+/// neither is so much as looked up.
+struct Transport<'a> {
+    socket: Option<PathBuf>,
+    /// `Some` only when recording is on and allowed.
+    store: Option<&'a Store>,
+}
+
 /// The production entry point: reads the settings and the environment, then
 /// consults. With both settings off this returns after the (cached) config
 /// read and before any socket or store I/O.
@@ -82,20 +92,46 @@ pub fn consult_on_commit_type(repo_path: &str, diff: &[u8], draft: &mut CommitDr
     if !is_decision_point(draft) {
         return;
     }
-    let settings = crate::tool_config::lappi_settings();
-    let recording = settings.record_caller_data && !record::collect_forced_off();
+    consult_gated(
+        &crate::tool_config::lappi_settings(),
+        record::collect_forced_off(),
+        |recording| Transport {
+            socket: client::socket_path(),
+            store: if recording { default_store() } else { None },
+        },
+        &PENDING,
+        repo_path,
+        diff,
+        draft,
+    );
+}
+
+/// [`consult_on_commit_type`] past its decision-point check, with the settings,
+/// the `LAPPI_COLLECT=0` override and the transport passed in. `None` is the
+/// gate: both settings off (or recording forced off and not asking), so
+/// `resolve` was not called and nothing was connected to or written.
+fn consult_gated<'a>(
+    settings: &crate::tool_config::LappiSettings,
+    collect_forced_off: bool,
+    resolve: impl FnOnce(bool) -> Transport<'a>,
+    pending: &Mutex<Pending>,
+    repo_path: &str,
+    diff: &[u8],
+    draft: &mut CommitDraft,
+) -> Option<Consulted> {
+    let recording = settings.record_caller_data && !collect_forced_off;
     if !settings.ask_on_ambiguous_commit_type && !recording {
-        return;
+        return None;
     }
-    let socket = client::socket_path();
+    let transport = resolve(recording);
     let ctx = Consult {
         ask: settings.ask_on_ambiguous_commit_type,
-        socket: socket.as_deref(),
+        socket: transport.socket.as_deref(),
         deadline: ASK_DEADLINE,
-        store: if recording { default_store() } else { None },
-        pending: &PENDING,
+        store: transport.store,
+        pending,
     };
-    consult(&ctx, repo_path, diff, draft);
+    Some(consult(&ctx, repo_path, diff, draft))
 }
 
 /// Only a draft the classifier could not type is a decision point.
@@ -235,13 +271,33 @@ fn record_decision(
 /// The production commit hook: pairs a committed message with its draft's
 /// decision, when recording is on. A failure here never fails the commit.
 pub fn record_commit_outcome(repo_path: &str, message: &str) {
-    let settings = crate::tool_config::lappi_settings();
-    let store = if settings.record_caller_data && !record::collect_forced_off() {
-        default_store()
+    record_outcome_gated(
+        &crate::tool_config::lappi_settings(),
+        record::collect_forced_off(),
+        default_store,
+        &PENDING,
+        repo_path,
+        message,
+    );
+}
+
+/// [`record_commit_outcome`] with the settings, the `LAPPI_COLLECT=0` override
+/// and the store lookup passed in. With recording off `open_store` is not
+/// called, so no store is opened or written.
+fn record_outcome_gated<'a>(
+    settings: &crate::tool_config::LappiSettings,
+    collect_forced_off: bool,
+    open_store: impl FnOnce() -> Option<&'a Store>,
+    pending: &Mutex<Pending>,
+    repo_path: &str,
+    message: &str,
+) -> Option<Appended> {
+    let store = if settings.record_caller_data && !collect_forced_off {
+        open_store()
     } else {
         None
     };
-    observe_commit(store, &PENDING, repo_path, message);
+    observe_commit(store, pending, repo_path, message)
 }
 
 /// Write the outcome line for `repo_path`'s pending decision, if there is one.

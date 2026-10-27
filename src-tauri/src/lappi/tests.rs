@@ -5,7 +5,7 @@
 
 use super::client::{self, NotAskedReason, Outcome, UnavailableReason, MAX_PAYLOAD_BYTES};
 use super::record::{self, Appended, Pending, Store};
-use super::{consult, observe_commit, Consult};
+use super::{consult, consult_gated, observe_commit, record_outcome_gated, Consult, Transport};
 use crate::ai::commit_brief::{self, CommitDraft};
 
 use std::collections::BTreeSet;
@@ -933,6 +933,199 @@ fn recording_off_writes_nothing_even_when_asking() {
     let consulted = consult(&ctx, "/repo", MODIFIED_SOURCE.as_bytes(), &mut draft);
     assert_eq!(consulted.recorded, None);
     assert!(pending.lock().expect("pending").is_empty());
+}
+
+/* ── both switches off: no lookup, no connect, no write ───────────────────── */
+
+fn switches(ask: bool, record: bool) -> crate::tool_config::LappiSettings {
+    crate::tool_config::LappiSettings {
+        ask_on_ambiguous_commit_type: ask,
+        record_caller_data: record,
+    }
+}
+
+/// Pins the claim at `lappi/mod.rs` on `consult_on_commit_type`: with nothing
+/// allowed it returns before any socket or store I/O. The transport is
+/// resolved by a closure that panics, so a consultation that got past the gate
+/// would fail here rather than quietly find nothing to connect to. A connect
+/// to a missing socket and an append to an unset store both fail soft, which
+/// is why asserting on their outcomes proves nothing.
+#[test]
+fn with_nothing_allowed_a_consultation_looks_up_no_socket_and_no_store() {
+    let pending = Mutex::new(Pending::new());
+    let before = low_confidence(true);
+    // Both off; and recording switched on but forced off by `LAPPI_COLLECT=0`
+    // with asking off, which is the same nothing.
+    for (settings, forced_off) in [
+        (switches(false, false), false),
+        (switches(false, false), true),
+        (switches(false, true), true),
+    ] {
+        let mut draft = before.clone();
+        let consulted = consult_gated(
+            &settings,
+            forced_off,
+            |_| panic!("nothing is allowed, yet the socket and the store were looked up"),
+            &pending,
+            "/repo",
+            MODIFIED_SOURCE.as_bytes(),
+            &mut draft,
+        );
+        assert_eq!(consulted, None, "{settings:?} forced_off={forced_off}");
+        assert_eq!(draft, before, "the draft is untouched");
+        assert!(pending.lock().expect("pending").is_empty());
+    }
+}
+
+/// The control for the test above: each switch that is on does resolve what it
+/// needs, once, and is told whether recording is allowed. Without this the
+/// panic test could pass because nothing ever reaches the closure.
+#[test]
+fn an_allowed_switch_resolves_its_transport_once() {
+    let agent = replying(REFUSED);
+    let (_root, store) = held_out_store();
+    let pending = Mutex::new(Pending::new());
+
+    let asked_with = std::cell::Cell::new(None);
+    let consulted = consult_gated(
+        &switches(true, false),
+        false,
+        |recording| {
+            assert!(
+                asked_with.replace(Some(recording)).is_none(),
+                "resolved twice"
+            );
+            Transport {
+                socket: Some(agent.path.clone()),
+                store: None,
+            }
+        },
+        &pending,
+        "/repo",
+        MODIFIED_SOURCE.as_bytes(),
+        &mut low_confidence(true),
+    )
+    .expect("asking is allowed");
+    assert_eq!(
+        asked_with.get(),
+        Some(false),
+        "asking alone does not record"
+    );
+    assert_eq!(consulted.outcome.reading(), "request_refused");
+    assert_eq!(consulted.recorded, None);
+
+    let asked_with = std::cell::Cell::new(None);
+    let consulted = consult_gated(
+        &switches(false, true),
+        false,
+        |recording| {
+            assert!(
+                asked_with.replace(Some(recording)).is_none(),
+                "resolved twice"
+            );
+            Transport {
+                socket: None,
+                store: Some(&store),
+            }
+        },
+        &pending,
+        "/repo",
+        MODIFIED_SOURCE.as_bytes(),
+        &mut low_confidence(true),
+    )
+    .expect("recording is allowed");
+    assert_eq!(asked_with.get(), Some(true));
+    assert_eq!(consulted.recorded, Some(Appended::Written));
+
+    // `LAPPI_COLLECT=0` turns recording off whatever the switch says, while
+    // asking, which it does not govern, still goes ahead.
+    let asked_with = std::cell::Cell::new(None);
+    let consulted = consult_gated(
+        &switches(true, true),
+        true,
+        |recording| {
+            asked_with.set(Some(recording));
+            Transport {
+                socket: Some(agent.path.clone()),
+                store: None,
+            }
+        },
+        &pending,
+        "/repo",
+        MODIFIED_SOURCE.as_bytes(),
+        &mut low_confidence(true),
+    );
+    assert!(consulted.is_some());
+    assert_eq!(asked_with.get(), Some(false));
+}
+
+/// The commit side of the same claim: with recording off the store is not
+/// looked up, and a pending decision is still consumed so a later opt-in
+/// cannot pair a commit with a stale draft.
+#[test]
+fn with_recording_off_a_commit_outcome_looks_up_no_store() {
+    let (_root, store) = held_out_store();
+    let agent = replying(REFUSED);
+    let pending = Mutex::new(Pending::new());
+    let repo = tempfile::tempdir().expect("repo dir");
+    let repo_path = repo.path().to_string_lossy().to_string();
+    let ctx = Consult {
+        ask: true,
+        socket: Some(&agent.path),
+        deadline: DEADLINE,
+        store: Some(&store),
+        pending: &pending,
+    };
+    consult(
+        &ctx,
+        &repo_path,
+        MODIFIED_SOURCE.as_bytes(),
+        &mut low_confidence(true),
+    );
+    assert!(!pending.lock().expect("pending").is_empty());
+    let before = read_store(&store);
+
+    for (settings, forced_off) in [
+        (switches(false, false), false),
+        (switches(true, false), false),
+        (switches(false, true), true),
+    ] {
+        let written = record_outcome_gated(
+            &settings,
+            forced_off,
+            || panic!("recording is off, yet the store was looked up"),
+            &pending,
+            &repo_path,
+            "fix: mend it",
+        );
+        assert_eq!(written, None, "{settings:?} forced_off={forced_off}");
+        assert_eq!(read_store(&store), before, "nothing was written");
+    }
+    assert!(
+        pending.lock().expect("pending").is_empty(),
+        "the decision is consumed, not left to pair with a later commit"
+    );
+
+    consult(
+        &ctx,
+        &repo_path,
+        MODIFIED_SOURCE.as_bytes(),
+        &mut low_confidence(true),
+    );
+    let calls = std::cell::Cell::new(0);
+    let written = record_outcome_gated(
+        &switches(false, true),
+        false,
+        || {
+            calls.set(calls.get() + 1);
+            Some(&store)
+        },
+        &pending,
+        &repo_path,
+        "fix: mend it",
+    );
+    assert_eq!(written, Some(Appended::Written));
+    assert_eq!(calls.get(), 1);
 }
 
 fn read_store(store: &Store) -> Vec<String> {

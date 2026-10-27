@@ -4,7 +4,10 @@
    *
    * Asking lets Lappi pre-select a type only when GitPulse's own classifier
    * could not type the staged change; the user still edits and commits the
-   * message. Recording keeps local caller records under Lappi's held-out store
+   * message. Asking sends the staged diff to the local Lappi process
+   * (`src-tauri/src/lappi/request.rs`), so the switch says that and not only
+   * "ask": it is not the AI-provider consent gate, because GitPulse sends
+   * nothing off this computer through it. Recording keeps local caller records under Lappi's held-out store
    * and sends nothing anywhere. What recording has done is shown beside the
    * switch, because "on, nothing written" and "on, stopped at the cap" look
    * identical from the switch alone.
@@ -56,7 +59,7 @@
   <div class="text-textMuted text-[10px] mb-1.5">Lappi</div>
   <SettingToggle
     label="Ask Lappi on ambiguous commit types"
-    description="Off by default. When the staged change has no clear type, ask a running Lappi agent on this computer. Its answer can only pre-select the type in the draft you edit."
+    description="Off by default. When the staged change has no clear type, the staged diff is sent to the local Lappi process on this computer, over a local socket and not to an AI provider. Its answer can only pre-select the type in the draft you edit."
     checked={view.settings.ask_on_ambiguous_commit_type}
     disabled={busy || !view.transport_supported}
     onchange={(next) => void save({ ...view.settings, ask_on_ambiguous_commit_type: next })}
