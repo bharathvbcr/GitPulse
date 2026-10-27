@@ -49,8 +49,9 @@
 //!
 //! # Limits, said plainly
 //!
-//! * `-U` (real uid) is compared with the effective uid the table carries, which
-//!   differ only for set-uid processes.
+//! * `-U` (real uid) is compared with the real uid where the table has it
+//!   (Linux) and with the effective one, always: a set-uid process is counted
+//!   when either matches, never fewer than before.
 //! * `-G` (group) and `-t` (terminal) are not in the table: those commands are
 //!   asked about, not guessed at.
 //! * POSIX extended regular expressions are evaluated with the `regex` crate. A
@@ -63,6 +64,21 @@
 //! * macOS `pkill` leaves ancestors out; procps `pkill` does not. The guard
 //!   follows the tool on the host, so a Linux `pkill` that would reach an
 //!   ancestor is counted and can be refused.
+//! * The tools differ by host and the guard reads the host's ([`Dialect`]). On
+//!   Linux (procps `pgrep`/`pkill`, psmisc `killall`): a name is `comm` (15
+//!   bytes) and the guard also tries `argv[0]`'s last component; options are
+//!   read anywhere, with long options, abbreviations and a `pkill` signal
+//!   anywhere in the line; one pattern only; an option the guard does not model
+//!   (`-s`, `-r`, `-g`, a path to `killall`, …) is asked about rather than read
+//!   with its macOS meaning. When options follow the first operand the macOS
+//!   reading is counted too, so the set is the union of the two. That can
+//!   refuse a command Linux would have run narrower, never pass one macOS
+//!   refused.
+//! * A process is the user's by the `kill(2)` rule over the real, effective and
+//!   saved uids in `/proc/<pid>/status` (Linux), not by the owner of
+//!   `/proc/<pid>`, which the kernel makes root's for a process that is not
+//!   dumpable. A process that runs as the user is counted whatever its other
+//!   ids say.
 //! * `ssh host pkill …`, `find -exec kill`, `parallel` and the like are not read.
 
 use std::collections::HashMap;
@@ -805,9 +821,51 @@ enum Sel {
     Unevaluable(String),
 }
 
+/// Which family of `pkill`, `pgrep` and `killall` a command line is read as.
+/// The tools differ in what a name is matched against, in how options are
+/// read, in whose ancestors they leave out and in which options they have, so
+/// the answer to "which processes would this signal" depends on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dialect {
+    /// macOS: BSD `getopt` stops at the first operand, a name is `argv[0]`'s
+    /// last component, and `pkill` never matches its own ancestors.
+    Bsd,
+    /// Linux: procps `pgrep`/`pkill` and psmisc `killall`. GNU `getopt_long`
+    /// reads options anywhere, a name is the kernel's `comm`, a signal can be
+    /// named anywhere in the arguments, and only `pkill` itself is left out.
+    Procps,
+}
+
+impl Dialect {
+    fn of(os: &str) -> Self {
+        if os == "linux" {
+            Self::Procps
+        } else {
+            Self::Bsd
+        }
+    }
+
+    /// The tools on the host the hook runs on.
+    fn host() -> Self {
+        Self::of(std::env::consts::OS)
+    }
+
+    /// Whether `pkill` leaves its ancestors out of the match unasked.
+    fn skips_ancestors(self) -> bool {
+        self == Self::Bsd
+    }
+}
+
+impl Default for Dialect {
+    fn default() -> Self {
+        Self::host()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct PgrepSpec {
     prog: &'static str,
+    dialect: Dialect,
     patterns: Vec<String>,
     full: bool,
     icase: bool,
@@ -815,7 +873,10 @@ struct PgrepSpec {
     inverse: bool,
     newest: bool,
     oldest: bool,
+    /// macOS `-a`: ancestors are matched again.
     ancestors: bool,
+    /// procps `-A`: ancestors are left out.
+    ignore_ancestors: bool,
     euids: Vec<String>,
     ruids: Vec<String>,
     ppids: Vec<String>,
@@ -826,16 +887,26 @@ struct PgrepSpec {
     late: Vec<String>,
     /// The same arguments with the options first.
     corrected: Option<String>,
+    /// On Linux, when options follow the first operand: the same words read
+    /// the macOS way. procps reads those options as options (a narrower or a
+    /// wider set, depending on which), so the guard counts what either
+    /// reading would signal and never fewer than the macOS reading did.
+    alt: Option<Box<PgrepSpec>>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct KillallSpec {
+    dialect: Dialect,
     names: Vec<String>,
     regex: bool,
+    /// psmisc `-I`.
+    icase: bool,
     user: Option<String>,
     only: Option<String>,
     late: Vec<String>,
     corrected: Option<String>,
+    /// As [`PgrepSpec::alt`].
+    alt: Option<Box<KillallSpec>>,
 }
 
 /// What reading one invocation's arguments came to.
@@ -880,10 +951,10 @@ fn contains_kill(command: &str) -> bool {
 
 /// Reads `command` and finds every invocation that sends a signal.
 pub(crate) fn plan(command: &str) -> Plan {
-    plan_with(command, process_env)
+    plan_with(command, process_env, Dialect::host())
 }
 
-fn plan_with(command: &str, env: EnvFn) -> Plan {
+fn plan_with(command: &str, env: EnvFn, dialect: Dialect) -> Plan {
     let mut plan = Plan::default();
     if command.len() > MAX_COMMAND_BYTES {
         if contains_kill(command) {
@@ -900,6 +971,7 @@ fn plan_with(command: &str, env: EnvFn) -> Plan {
                 plan: &mut plan,
                 budget: &mut budget,
                 env,
+                dialect,
             };
             cx.walk(&script, 0);
         }
@@ -917,6 +989,7 @@ struct Cx<'a> {
     plan: &'a mut Plan,
     budget: &'a mut Budget,
     env: EnvFn,
+    dialect: Dialect,
 }
 
 /// The command a wrapper (`sudo`, `env`, `nohup` …) runs.
@@ -1137,7 +1210,7 @@ impl Cx<'_> {
         let text = echo(&cmd.words[r.prog_at..]);
         match r.prog.as_str() {
             "pkill" => self.pgrep(&r, text, true, true),
-            "killall" => match parse_killall(r.args) {
+            "killall" => match parse_killall(r.args, self.dialect) {
                 Parsed::Spec(spec) => self.push(Finding {
                     text,
                     elevated: r.elevated,
@@ -1197,7 +1270,7 @@ impl Cx<'_> {
     }
 
     fn pgrep(&mut self, r: &Resolved<'_>, text: String, pkill: bool, bounded: bool) {
-        match parse_pgrep(r.args, pkill) {
+        match parse_pgrep(r.args, pkill, self.dialect) {
             Parsed::Spec(spec) => self.push(Finding {
                 text,
                 elevated: r.elevated,
@@ -1243,6 +1316,7 @@ impl Cx<'_> {
                         elevated,
                         bounded,
                         sel: Sel::Killall(KillallSpec {
+                            dialect: self.dialect,
                             names,
                             ..KillallSpec::default()
                         }),
@@ -1474,7 +1548,21 @@ fn list(arg: &str) -> Vec<String> {
     arg.split(',').map(str::to_string).collect()
 }
 
-fn parse_pgrep(all: &[Word], pkill: bool) -> Parsed<PgrepSpec> {
+fn parse_pgrep(all: &[Word], pkill: bool, dialect: Dialect) -> Parsed<PgrepSpec> {
+    match dialect {
+        Dialect::Bsd => parse_pgrep_bsd(all, pkill),
+        Dialect::Procps => parse_pgrep_procps(all, pkill),
+    }
+}
+
+fn parse_killall(args: &[Word], dialect: Dialect) -> Parsed<KillallSpec> {
+    match dialect {
+        Dialect::Bsd => parse_killall_bsd(args),
+        Dialect::Procps => parse_killall_procps(args),
+    }
+}
+
+fn parse_pgrep_bsd(all: &[Word], pkill: bool) -> Parsed<PgrepSpec> {
     // `-signal` only counts as the first argument, and only to pkill.
     let mut head: &[Word] = &[];
     let mut args = all;
@@ -1502,6 +1590,7 @@ fn parse_pgrep(all: &[Word], pkill: bool) -> Parsed<PgrepSpec> {
     let prog = if pkill { "pkill" } else { "pgrep" };
     let mut spec = PgrepSpec {
         prog,
+        dialect: Dialect::Bsd,
         ..PgrepSpec::default()
     };
     let mut criteria = false;
@@ -1587,13 +1676,16 @@ fn parse_pgrep(all: &[Word], pkill: bool) -> Parsed<PgrepSpec> {
     Parsed::Spec(spec)
 }
 
-fn parse_killall(args: &[Word]) -> Parsed<KillallSpec> {
+fn parse_killall_bsd(args: &[Word]) -> Parsed<KillallSpec> {
     let classified = match classify(args, "dehlmsvqzI", "utc", false, true) {
         Ok(c) => c,
         Err(Reject::Usage(why)) => return Parsed::NoEffect(why),
         Err(Reject::Unevaluable(why)) => return Parsed::Unevaluable(why),
     };
-    let mut spec = KillallSpec::default();
+    let mut spec = KillallSpec {
+        dialect: Dialect::Bsd,
+        ..KillallSpec::default()
+    };
     let mut sends = true;
     for (flag, arg) in &classified.opts {
         match flag {
@@ -1645,6 +1737,487 @@ fn parse_killall(args: &[Word]) -> Parsed<KillallSpec> {
     Parsed::Spec(spec)
 }
 
+/* ── 2b. Reading the Linux tools' arguments ────────────────────────────────── */
+
+/// One `getopt_long` option: its long name, the letter it stands for, and
+/// whether it takes an argument.
+struct Long {
+    name: &'static str,
+    letter: char,
+    arg: bool,
+}
+
+const fn long(name: &'static str, letter: char, arg: bool) -> Long {
+    Long { name, letter, arg }
+}
+
+/// `longopts[]` of procps-ng 4.0.4 `pgrep.c`, which `pkill` shares: a long
+/// option works in `pkill` even where its short letter does not (`--inverse`).
+/// `signal`, `cgroup`, `ns` and `nslist` have no short letter; they are given
+/// private ones that no short option string accepts.
+const PGREP_LONGS: [Long; 32] = [
+    long("signal", 'S', true),
+    long("ignore-ancestors", 'A', false),
+    long("require-handler", 'H', false),
+    long("count", 'c', false),
+    long("cgroup", 'C', true),
+    long("delimiter", 'd', true),
+    long("list-name", 'l', false),
+    long("list-full", 'a', false),
+    long("full", 'f', false),
+    long("pgroup", 'g', true),
+    long("group", 'G', true),
+    long("ignore-case", 'i', false),
+    long("newest", 'n', false),
+    long("oldest", 'o', false),
+    long("older", 'O', true),
+    long("parent", 'P', true),
+    long("session", 's', true),
+    long("terminal", 't', true),
+    long("euid", 'u', true),
+    long("uid", 'U', true),
+    long("inverse", 'v', false),
+    long("lightweight", 'w', false),
+    long("exact", 'x', false),
+    long("pidfile", 'F', true),
+    long("logpidfile", 'L', false),
+    long("echo", 'e', false),
+    long("ns", 'N', true),
+    long("nslist", 'M', true),
+    long("queue", 'q', true),
+    long("runstates", 'r', true),
+    long("help", 'h', false),
+    long("version", 'V', false),
+];
+
+/// `options[]` of psmisc 23.7 `killall.c`. It reads them with
+/// `getopt_long_only`, so a single dash also introduces a long name.
+const KILLALL_LONGS: [Long; 16] = [
+    long("exact", 'e', false),
+    long("ignore-case", 'I', false),
+    long("process-group", 'g', false),
+    long("younger-than", 'y', true),
+    long("older-than", 'o', true),
+    long("interactive", 'i', false),
+    long("list-signals", 'l', false),
+    long("quiet", 'q', false),
+    long("regexp", 'r', false),
+    long("signal", 's', true),
+    long("user", 'u', true),
+    long("verbose", 'v', false),
+    long("wait", 'w', false),
+    long("ns", 'n', true),
+    long("context", 'Z', true),
+    long("version", 'V', false),
+];
+
+/// What a permuting `getopt_long` read: the options in order, and the
+/// operands as indexes into the words it was given.
+struct Gnu {
+    opts: Vec<(char, Option<String>)>,
+    operands: Vec<usize>,
+}
+
+/// The option `name` names: exactly, or as the one option it abbreviates.
+fn resolve_long<'a>(name: &str, longs: &'a [Long]) -> Result<&'a Long, String> {
+    if let Some(found) = longs.iter().find(|l| l.name == name) {
+        return Ok(found);
+    }
+    let mut candidates = longs.iter().filter(|l| l.name.starts_with(name));
+    match (candidates.next(), candidates.next()) {
+        (Some(only), None) if !name.is_empty() => Ok(only),
+        (None, _) => Err(format!("`{name}` is not an option GitPulse reads")),
+        _ => Err(format!("`{name}` abbreviates more than one option")),
+    }
+}
+
+/// `getopt_long` over `words` as GNU reads it: options anywhere among the
+/// operands, `--` ends them, clusters of short flags, an argument attached or
+/// in the next word. `flags` and `with_arg` are the short letters, `longs` the
+/// long names. With `long_only` a single dash that begins a long name is one
+/// (`getopt_long_only`); with `signals` a single-dash word that is a signal is
+/// the option `S`. A letter in `alone` is read only as a word of its own.
+/// Anything this does not model is [`Reject::Unevaluable`], never a usage
+/// error: whether a word is a signal or an unknown option is not worth a guess.
+fn gnu_options(
+    words: &[&Word],
+    flags: &str,
+    with_arg: &str,
+    longs: &[Long],
+    long_only: bool,
+    signals: bool,
+    alone: &str,
+) -> Result<Gnu, Reject> {
+    let mut out = Gnu {
+        opts: Vec::new(),
+        operands: Vec::new(),
+    };
+    let mut i = 0;
+    while i < words.len() {
+        let t = words[i].text.as_str();
+        if t == "--" {
+            out.operands.extend(i + 1..words.len());
+            break;
+        }
+        if t.len() < 2 || !t.starts_with('-') {
+            out.operands.push(i);
+            i += 1;
+            continue;
+        }
+        let body = &t[1..];
+        if !t.starts_with("--") && signals && signal_spec(body).is_some() {
+            out.opts.push(('S', Some(body.to_string())));
+            i += 1;
+            continue;
+        }
+        let long_text = if let Some(rest) = t.strip_prefix("--") {
+            Some(rest)
+        } else if long_only
+            && body.chars().count() > 1
+            && longs
+                .iter()
+                .any(|l| l.name.starts_with(body.split('=').next().unwrap_or(body)))
+        {
+            Some(body)
+        } else {
+            None
+        };
+        if let Some(text) = long_text {
+            let (name, value) = match text.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (text, None),
+            };
+            let found = resolve_long(name, longs).map_err(Reject::Unevaluable)?;
+            let arg = match (found.arg, value) {
+                (true, Some(value)) => Some(value.to_string()),
+                (true, None) => {
+                    i += 1;
+                    let next = words.get(i).ok_or_else(|| {
+                        Reject::Usage(format!("option `--{}` requires an argument", found.name))
+                    })?;
+                    Some(next.text.clone())
+                }
+                (false, None) => None,
+                (false, Some(_)) => {
+                    return Err(Reject::Unevaluable(format!(
+                        "`--{}` takes no argument but was given one",
+                        found.name
+                    )))
+                }
+            };
+            out.opts.push((found.letter, arg));
+            i += 1;
+            continue;
+        }
+        let letters: Vec<char> = body.chars().collect();
+        for (k, c) in letters.iter().enumerate() {
+            if letters.len() > 1 && alone.contains(*c) {
+                return Err(Reject::Unevaluable(format!(
+                    "`{t}` puts `-{c}` in a cluster, which the tool reads by hand"
+                )));
+            }
+            if with_arg.contains(*c) {
+                let rest: String = letters[k + 1..].iter().collect();
+                if rest.is_empty() {
+                    i += 1;
+                    let next = words.get(i).ok_or_else(|| {
+                        Reject::Usage(format!("option requires an argument -- {c}"))
+                    })?;
+                    out.opts.push((*c, Some(next.text.clone())));
+                } else {
+                    out.opts.push((*c, Some(rest)));
+                }
+                break;
+            } else if flags.contains(*c) {
+                out.opts.push((*c, None));
+            } else {
+                return Err(Reject::Unevaluable(format!(
+                    "`{t}` is not an option GitPulse reads, and the Linux tools also read a \
+                     signal written like one"
+                )));
+            }
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
+/// A signal as procps' `signal_name_to_number` reads it: a name with or
+/// without `SIG`, `RTMIN+n`, or a number up to `127 - SIGRTMIN`. `Some(true)`
+/// is signal 0, which only tests that a process exists. Wider than the tool:
+/// a word read as a signal here that the tool refuses sends nothing anyway.
+fn procps_signal(spec: &str) -> Option<bool> {
+    const SIGRTMIN: u64 = 34;
+    let upper = spec.to_ascii_uppercase();
+    let name = upper.strip_prefix("SIG").unwrap_or(&upper);
+    if matches!(name, "EXIT" | "NULL") {
+        return Some(true);
+    }
+    if SIGNALS.contains(&name) {
+        return Some(false);
+    }
+    let (offset, digits) = match name.strip_prefix("RTMIN+") {
+        Some(rest) => (SIGRTMIN, rest),
+        None => (0, name),
+    };
+    let digits = digits.trim_start();
+    let (negative, digits) = match digits.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, digits.strip_prefix('+').unwrap_or(digits)),
+    };
+    if digits.is_empty() || digits.len() > 6 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let value: u64 = digits.parse().ok()?;
+    if (negative && value != 0) || value + SIGRTMIN > 127 {
+        return None;
+    }
+    Some(value + offset == 0)
+}
+
+/// Why an option of the Linux tools cannot be evaluated, for the ones that
+/// select by something the process table does not carry.
+fn procps_unmodelled(letter: char) -> &'static str {
+    match letter {
+        'w' => "`-w` lists threads, which are not in the process table GitPulse reads",
+        'H' => "`-H` selects by signal handler, which is not in the process table GitPulse reads",
+        'O' => "`-O` selects by process age, which GitPulse does not evaluate",
+        's' => "`-s` selects by session id, which is not in the process table GitPulse reads",
+        'G' => "`-G` selects by group id, which is not in the process table GitPulse reads",
+        't' => "`-t` selects by terminal, which is not in the process table GitPulse reads",
+        'r' => "`-r` selects by run state, which is not in the process table GitPulse reads",
+        'C' => {
+            "`--cgroup` selects by control group, which is not in the process table GitPulse reads"
+        }
+        _ => {
+            "`--ns` and `--nslist` select by namespace, which is not in the process table \
+              GitPulse reads"
+        }
+    }
+}
+
+/// procps `pgrep` and `pkill`, as `pgrep.c` of procps-ng 4.0.4 reads them.
+fn parse_pgrep_procps(all: &[Word], pkill: bool) -> Parsed<PgrepSpec> {
+    // Any word could be an option or a signal wherever it stands, so a word
+    // GitPulse cannot expand is not something to guess at.
+    if all.iter().any(|w| w.dynamic) {
+        return Parsed::Unevaluable(
+            "an argument is built from a variable GitPulse cannot expand".into(),
+        );
+    }
+    let mut words: Vec<&Word> = all.iter().collect();
+    if pkill {
+        // `signal_option`: the first word anywhere, not only the first, that is
+        // a dash and a signal is the signal and is taken out before `getopt`.
+        let found = words
+            .iter()
+            .position(|w| w.text.starts_with('-') && procps_signal(&w.text[1..]).is_some());
+        if let Some(at) = found {
+            if procps_signal(&words[at].text[1..]) == Some(true) {
+                return Parsed::NoEffect("signal 0 only tests for existence".into());
+            }
+            words.remove(at);
+        }
+    }
+    let (flags, with_arg) = if pkill {
+        ("eLcfinoxAH?Vh", "qFPOgsuUGtr")
+    } else {
+        ("lavwLcfinoxAH?Vh", "dFPOgsuUGtr")
+    };
+    let read = match gnu_options(&words, flags, with_arg, &PGREP_LONGS, false, false, "") {
+        Ok(read) => read,
+        Err(Reject::Usage(why)) => return Parsed::NoEffect(why),
+        Err(Reject::Unevaluable(why)) => return Parsed::Unevaluable(why),
+    };
+    let mut spec = PgrepSpec {
+        prog: if pkill { "pkill" } else { "pgrep" },
+        dialect: Dialect::Procps,
+        ..PgrepSpec::default()
+    };
+    let mut criteria = false;
+    let mut lock = false;
+    for (flag, arg) in &read.opts {
+        let arg = arg.clone().unwrap_or_default();
+        match flag {
+            'f' => spec.full = true,
+            'i' => spec.icase = true,
+            'x' => spec.exact = true,
+            'v' => spec.inverse = true,
+            'A' => spec.ignore_ancestors = true,
+            'n' => {
+                criteria = true;
+                spec.newest = true;
+            }
+            'o' => {
+                criteria = true;
+                spec.oldest = true;
+            }
+            'u' => {
+                criteria = true;
+                spec.euids.extend(list(&arg));
+            }
+            'U' => {
+                criteria = true;
+                spec.ruids.extend(list(&arg));
+            }
+            'P' => {
+                criteria = true;
+                spec.ppids.extend(list(&arg));
+            }
+            'g' => {
+                criteria = true;
+                if list(&arg).iter().any(|g| g == "0") {
+                    return Parsed::Unevaluable(
+                        "`-g 0` is the process group of the shell the command runs in".into(),
+                    );
+                }
+                spec.pgrps.extend(list(&arg));
+            }
+            'F' => {
+                criteria = true;
+                spec.pidfile = Some(arg);
+            }
+            'L' => lock = true,
+            // What is printed, or how the signal is sent, not which processes.
+            'c' | 'l' | 'a' | 'e' | 'd' | 'q' => {}
+            'S' => {
+                if procps_signal(&arg) == Some(true) {
+                    return Parsed::NoEffect("signal 0 only tests for existence".into());
+                }
+            }
+            'h' | '?' | 'V' => {
+                return Parsed::NoEffect("it prints usage or a version and signals nothing".into())
+            }
+            other => return Parsed::Unevaluable(procps_unmodelled(*other).into()),
+        }
+    }
+    if lock && spec.pidfile.is_none() {
+        return Parsed::NoEffect("-L without -F is a usage error".into());
+    }
+    if read.operands.len() > 1 {
+        return Parsed::NoEffect("only one pattern can be provided".into());
+    }
+    if read.operands.is_empty() && !criteria {
+        return Parsed::NoEffect("no matching criteria specified".into());
+    }
+    for &i in &read.operands {
+        let text = &words[i].text;
+        if text.chars().count() > MAX_PATTERN_CHARS {
+            return Parsed::Unevaluable(format!("a pattern longer than {MAX_PATTERN_CHARS}"));
+        }
+        spec.patterns.push(text.clone());
+    }
+    match parse_pgrep_bsd(all, pkill) {
+        Parsed::Spec(mut bsd) if !bsd.late.is_empty() => {
+            bsd.dialect = Dialect::Procps;
+            spec.late = bsd.late.clone();
+            spec.corrected = bsd.corrected.clone();
+            spec.alt = Some(Box::new(bsd));
+        }
+        Parsed::Unevaluable(why) => return Parsed::Unevaluable(why),
+        _ => {}
+    }
+    Parsed::Spec(spec)
+}
+
+/// psmisc `killall`, as `killall.c` of psmisc 23.7 reads it.
+fn parse_killall_procps(args: &[Word]) -> Parsed<KillallSpec> {
+    if args.iter().any(|w| w.dynamic) {
+        return Parsed::Unevaluable(
+            "an argument is built from a variable GitPulse cannot expand".into(),
+        );
+    }
+    let words: Vec<&Word> = args.iter().collect();
+    let read = match gnu_options(
+        &words,
+        "egilqrvwVI",
+        "yosuZn",
+        &KILLALL_LONGS,
+        true,
+        true,
+        "IV",
+    ) {
+        Ok(read) => read,
+        Err(Reject::Usage(why)) => return Parsed::NoEffect(why),
+        Err(Reject::Unevaluable(why)) => return Parsed::Unevaluable(why),
+    };
+    let mut spec = KillallSpec {
+        dialect: Dialect::Procps,
+        ..KillallSpec::default()
+    };
+    let mut sends = true;
+    let mut zero = false;
+    for (flag, arg) in &read.opts {
+        match flag {
+            // They narrow the match, or change how the signal is waited for.
+            'e' | 'i' | 'q' | 'v' | 'w' => {}
+            'r' => spec.regex = true,
+            'I' => spec.icase = true,
+            'u' => spec.user = arg.clone(),
+            'l' | 'V' => sends = false,
+            's' | 'S' => zero = arg.as_deref().and_then(procps_signal) == Some(true),
+            'g' => {
+                return Parsed::Unevaluable(
+                    "`-g` signals the whole process group of each match, which reaches \
+                     processes the name did not"
+                        .into(),
+                )
+            }
+            'y' | 'o' => {
+                return Parsed::Unevaluable(
+                    "`-y` and `-o` select by process age, which GitPulse does not evaluate".into(),
+                )
+            }
+            'n' => {
+                return Parsed::Unevaluable(
+                    "`-n` selects by namespace, which is not in the process table GitPulse reads"
+                        .into(),
+                )
+            }
+            _ => {
+                return Parsed::Unevaluable(
+                    "`-Z` selects by security context, which is not in the process table \
+                     GitPulse reads"
+                        .into(),
+                )
+            }
+        }
+    }
+    if !sends {
+        return Parsed::NoEffect("-l and -V send no signal".into());
+    }
+    if zero {
+        return Parsed::NoEffect("signal 0 only tests for existence".into());
+    }
+    if read.operands.is_empty() && spec.user.is_none() {
+        return Parsed::NoEffect("no process to select is a usage error".into());
+    }
+    for &i in &read.operands {
+        let text = &words[i].text;
+        if text.chars().count() > MAX_PATTERN_CHARS {
+            return Parsed::Unevaluable(format!("a name longer than {MAX_PATTERN_CHARS}"));
+        }
+        if !spec.regex && text.contains('/') {
+            return Parsed::Unevaluable(format!(
+                "the name `{text}` is a path, which killall matches against the executable's \
+                 inode, not the table GitPulse reads"
+            ));
+        }
+        spec.names.push(text.clone());
+    }
+    match parse_killall_bsd(args) {
+        Parsed::Spec(mut bsd) if !bsd.late.is_empty() => {
+            bsd.dialect = Dialect::Procps;
+            spec.late = bsd.late.clone();
+            spec.corrected = bsd.corrected.clone();
+            spec.alt = Some(Box::new(bsd));
+        }
+        Parsed::Unevaluable(why) => return Parsed::Unevaluable(why),
+        _ => {}
+    }
+    Parsed::Spec(spec)
+}
+
 /* ── 3. The process table, as facts ───────────────────────────────────────── */
 
 /// Everything [`decide`] reads, gathered up front so it can be a pure function.
@@ -1654,6 +2227,9 @@ pub(crate) struct Facts {
     /// The user the table was read as, and so the user whose processes a
     /// signal can reach.
     pub(crate) me_uid: u32,
+    /// The effective uid of the sender, when it is not the real one. `None`
+    /// reads as the real uid.
+    pub(crate) me_euid: Option<u32>,
     /// This process: never a match, as `pkill` never matches itself.
     pub(crate) self_pid: i32,
     pub(crate) users: HashMap<String, u32>,
@@ -1691,6 +2267,17 @@ fn lookup_user(name: &str) -> Option<u32> {
 }
 
 #[cfg(unix)]
+fn effective_uid() -> Option<u32> {
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    Some(unsafe { libc::geteuid() })
+}
+
+#[cfg(not(unix))]
+fn effective_uid() -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
 fn group_of(pid: i32) -> Option<i32> {
     // SAFETY: `getpgid` takes a pid and has no other precondition.
     let group = unsafe { libc::getpgid(pid) };
@@ -1718,6 +2305,7 @@ pub(crate) fn gather(plan: &Plan) -> Result<Facts, String> {
     let table = signal_table()?;
     let mut facts = Facts {
         me_uid: table.me_uid,
+        me_euid: effective_uid(),
         self_pid: i32::try_from(std::process::id()).unwrap_or(-1),
         rows: table.rows,
         ..Facts::default()
@@ -1743,20 +2331,20 @@ pub(crate) fn gather(plan: &Plan) -> Result<Facts, String> {
     Ok(facts)
 }
 
-/// A signal from this user reaches the process.
+/// A signal from this user reaches the process: the sender is root, or the
+/// `kill(2)` rule holds (the sender's real or effective uid is the target's
+/// real or saved uid), or the process runs as this user, the one thing the
+/// table has always counted. The last clause is why a process the kernel makes
+/// root-owned in `/proc` (not dumpable) is still counted when it is this
+/// user's, and why a set-uid process that runs as this user is too: this can
+/// only count more processes, never fewer.
 fn reachable(facts: &Facts, row: &TableRow) -> bool {
-    facts.me_uid == 0 || row.uid == facts.me_uid
-}
-
-/// Whether `pkill` on this host leaves ancestors out of the match.
-///
-/// macOS does. procps on Linux does not: it skips only the `pkill` process.
-fn skip_ancestors() -> bool {
-    skip_ancestors_on(std::env::consts::OS)
-}
-
-fn skip_ancestors_on(os: &str) -> bool {
-    os != "linux"
+    let senders = [facts.me_uid, facts.me_euid.unwrap_or(facts.me_uid)];
+    senders.contains(&0)
+        || row.uid == facts.me_uid
+        || senders
+            .iter()
+            .any(|s| *s == row.real_uid() || *s == row.saved_uid())
 }
 
 /// This process and the processes it descends from.
@@ -1778,14 +2366,80 @@ fn lineage(facts: &Facts) -> Vec<i32> {
 
 /* ── 4. Which processes would the tool pick ───────────────────────────────── */
 
-/// What `pgrep` matches a name pattern against: `argv[0]`'s last component,
-/// which is what the real tool was observed to use (it is not the kernel's
-/// 16-character name).
-fn match_name(row: &TableRow) -> String {
-    match row.argv.as_ref().and_then(|a| a.first()) {
-        Some(first) if !first.is_empty() => base_name(first).to_string(),
-        _ => row.name.clone(),
+/// `argv[0]` of a process whose arguments were read and are not empty.
+fn argv0(row: &TableRow) -> Option<&str> {
+    row.argv
+        .as_ref()
+        .and_then(|a| a.first())
+        .map(String::as_str)
+        .filter(|a| !a.is_empty())
+}
+
+/// The longest process name the Linux kernel keeps (`comm`, 15 bytes).
+const KERNEL_COMM: usize = 15;
+
+/// What a name pattern is tried against for one process, given the name the
+/// kernel reports (`comm`) and `argv[0]` when its arguments could be read.
+///
+/// macOS `pgrep` was observed to use `argv[0]`'s last component, not the
+/// kernel's name. Linux procps `pgrep`/`pkill` use `comm` (from
+/// `/proc/<pid>/stat`, the executable's basename cut at 15 bytes, **not**
+/// `argv[0]`), and psmisc `killall` uses `comm` too, falling back to the
+/// command line only when `comm` is cut. So on Linux a login shell run as
+/// `-zsh` is `zsh` to `pgrep -x zsh`, and a program that rewrites its title is
+/// still its executable's name. The guard tries both: a pattern that matches
+/// either is a hit, which is every process either tool would pick and can
+/// only be more.
+fn name_subjects(dialect: Dialect, comm: &str, argv0: Option<&str>) -> Vec<String> {
+    let from_argv = argv0
+        .map(base_name)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
+    match dialect {
+        Dialect::Bsd => vec![from_argv.unwrap_or_else(|| comm.to_string())],
+        Dialect::Procps => {
+            let mut subjects = vec![comm.to_string()];
+            subjects.extend(from_argv.filter(|name| name != comm));
+            subjects
+        }
     }
+}
+
+/// Whether `killall NAME` (no `-r`) picks a process. macOS compares the name
+/// with the process name exactly. psmisc compares it with `comm` exactly,
+/// and when `comm` is cut at 15 bytes and the name is that long or longer it
+/// compares the first 15 bytes (without `-e`) or the name with the command
+/// line's. The guard also accepts `argv[0]`'s last component, so it picks
+/// every process either reading would.
+fn killall_literal(
+    dialect: Dialect,
+    name: &str,
+    icase: bool,
+    comm: &str,
+    argv0: Option<&str>,
+) -> bool {
+    let same = |a: &str, b: &str| {
+        if icase {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    if name_subjects(dialect, comm, argv0)
+        .iter()
+        .any(|subject| same(name, subject))
+    {
+        return true;
+    }
+    dialect == Dialect::Procps
+        && comm.len() >= KERNEL_COMM
+        && name.len() >= KERNEL_COMM
+        && name.get(..comm.len()).is_some_and(|head| same(head, comm))
+}
+
+/// The macOS name of a process, for the examples a refusal names.
+fn match_name(row: &TableRow) -> String {
+    name_subjects(Dialect::Bsd, &row.name, argv0(row)).remove(0)
 }
 
 fn match_full(row: &TableRow) -> String {
@@ -1838,7 +2492,28 @@ struct Reach<'a> {
     unread: usize,
 }
 
+impl<'a> Reach<'a> {
+    /// What either reading reaches.
+    fn union(self, other: Reach<'a>) -> Reach<'a> {
+        let mut seen: std::collections::HashSet<i32> = self.hits.iter().map(|r| r.pid).collect();
+        let mut hits = self.hits;
+        hits.extend(other.hits.into_iter().filter(|r| seen.insert(r.pid)));
+        Reach {
+            hits,
+            unread: self.unread.max(other.unread),
+        }
+    }
+}
+
 fn eval_pgrep<'a>(spec: &PgrepSpec, facts: &'a Facts) -> Result<Reach<'a>, String> {
+    let reach = eval_pgrep_reading(spec, facts)?;
+    match &spec.alt {
+        Some(alt) => Ok(reach.union(eval_pgrep_reading(alt, facts)?)),
+        None => Ok(reach),
+    }
+}
+
+fn eval_pgrep_reading<'a>(spec: &PgrepSpec, facts: &'a Facts) -> Result<Reach<'a>, String> {
     let patterns: Vec<Regex> = spec
         .patterns
         .iter()
@@ -1858,15 +2533,21 @@ fn eval_pgrep<'a>(spec: &PgrepSpec, facts: &'a Facts) -> Result<Reach<'a>, Strin
     };
     // macOS `pkill` never matches itself or its ancestors; with `-v` the
     // ancestors are in the list again. procps `pkill` (Linux) skips only its
-    // own pid, so an ancestor is a process the command would signal. Leaving
-    // those out made `pkill -u $USER` look smaller than the set it reaches,
-    // and a command that would hit them was not asked about. Counting them
-    // refuses more commands; it does not allow one the guard already refused.
-    // "Itself" is the hook, a sibling of the shell the tool would run in.
-    let excluded: Vec<i32> = if spec.ancestors || spec.inverse || !skip_ancestors() {
-        vec![facts.self_pid]
+    // own pid unless `-A` is given, so an ancestor is a process the command
+    // would signal. Leaving those out made `pkill -u $USER` look smaller than
+    // the set it reaches, and a command that would hit them was not asked
+    // about. Counting them refuses more commands; it does not allow one the
+    // guard already refused. "Itself" is the hook, a sibling of the shell the
+    // tool would run in.
+    let leave_out_ancestors = if spec.dialect.skips_ancestors() {
+        !(spec.ancestors || spec.inverse)
     } else {
+        spec.ignore_ancestors
+    };
+    let excluded: Vec<i32> = if leave_out_ancestors {
         lineage(facts)
+    } else {
+        vec![facts.self_pid]
     };
     let mut hits = Vec::new();
     let mut unread = 0;
@@ -1876,16 +2557,29 @@ fn eval_pgrep<'a>(spec: &PgrepSpec, facts: &'a Facts) -> Result<Reach<'a>, Strin
         }
         let subject_unread = spec.full && row.argv.is_none();
         let matched = patterns.is_empty() || {
-            let subject = if spec.full {
-                match_full(row)
+            if spec.full {
+                let subject = match_full(row);
+                patterns.iter().any(|p| p.is_match(&subject))
             } else {
-                match_name(row)
-            };
-            patterns.iter().any(|p| p.is_match(&subject))
+                let subjects = name_subjects(spec.dialect, &row.name, argv0(row));
+                if spec.inverse {
+                    // Inverted, a row is a hit when the tool's one subject does
+                    // not match, so with two candidate subjects the row is out
+                    // only when every one of them matches: never fewer hits
+                    // than either tool's.
+                    subjects
+                        .iter()
+                        .all(|s| patterns.iter().any(|p| p.is_match(s)))
+                } else {
+                    subjects
+                        .iter()
+                        .any(|s| patterns.iter().any(|p| p.is_match(s)))
+                }
+            }
         };
         let filtered = matched
             && (euids.is_empty() || euids.contains(&row.uid))
-            && (ruids.is_empty() || ruids.contains(&row.uid))
+            && (ruids.is_empty() || ruids.contains(&row.real_uid()) || ruids.contains(&row.uid))
             && (ppids.is_empty() || ppids.contains(&row.ppid))
             && (pgrps.is_empty() || facts.pgids.get(&row.pid).is_some_and(|g| pgrps.contains(g)))
             && pidfile.is_none_or(|p| p == row.pid);
@@ -1912,10 +2606,18 @@ fn eval_pgrep<'a>(spec: &PgrepSpec, facts: &'a Facts) -> Result<Reach<'a>, Strin
 }
 
 fn eval_killall<'a>(spec: &KillallSpec, facts: &'a Facts) -> Result<Reach<'a>, String> {
+    let reach = eval_killall_reading(spec, facts)?;
+    match &spec.alt {
+        Some(alt) => Ok(reach.union(eval_killall_reading(alt, facts)?)),
+        None => Ok(reach),
+    }
+}
+
+fn eval_killall_reading<'a>(spec: &KillallSpec, facts: &'a Facts) -> Result<Reach<'a>, String> {
     let patterns: Vec<Regex> = if spec.regex {
         spec.names
             .iter()
-            .map(|n| compile(n, false, false))
+            .map(|n| compile(n, spec.icase, false))
             .collect::<Result<_, _>>()?
     } else {
         Vec::new()
@@ -1929,18 +2631,23 @@ fn eval_killall<'a>(spec: &KillallSpec, facts: &'a Facts) -> Result<Reach<'a>, S
         if row.pid == facts.self_pid || !reachable(facts, row) {
             continue;
         }
-        if user.is_some_and(|u| u != row.uid) {
+        // psmisc `-u` compares the real uid; the effective one is kept too, as
+        // the table always compared it.
+        if user.is_some_and(|u| u != row.real_uid() && u != row.uid) {
             continue;
         }
-        let name = match_name(row);
-        if spec.only.as_ref().is_some_and(|c| *c != name) {
+        if spec.only.as_ref().is_some_and(|c| *c != match_name(row)) {
             continue;
         }
         let named = spec.names.is_empty()
             || if spec.regex {
-                patterns.iter().any(|p| p.is_match(&name))
+                name_subjects(spec.dialect, &row.name, argv0(row))
+                    .iter()
+                    .any(|s| patterns.iter().any(|p| p.is_match(s)))
             } else {
-                spec.names.contains(&name)
+                spec.names
+                    .iter()
+                    .any(|n| killall_literal(spec.dialect, n, spec.icase, &row.name, argv0(row)))
             };
         if named {
             hits.push(row);
@@ -1973,11 +2680,11 @@ pub fn live_match_pids(program: &str, args: &[&str]) -> Result<Vec<i32>, String>
         })
         .collect();
     let sel = match program {
-        "pkill" | "pgrep" => match parse_pgrep(&words, program == "pkill") {
+        "pkill" | "pgrep" => match parse_pgrep(&words, program == "pkill", Dialect::host()) {
             Parsed::Spec(spec) => Sel::Pgrep(spec),
             Parsed::NoEffect(why) | Parsed::Unevaluable(why) => return Err(why),
         },
-        "killall" => match parse_killall(&words) {
+        "killall" => match parse_killall(&words, Dialect::host()) {
             Parsed::Spec(spec) => Sel::Killall(spec),
             Parsed::NoEffect(why) | Parsed::Unevaluable(why) => return Err(why),
         },
@@ -2137,17 +2844,32 @@ fn describe_pgrep(spec: &PgrepSpec) -> String {
     }
     text.push('.');
     if !spec.late.is_empty() {
-        text.push_str(&format!(
-            " {} came after the first pattern, and macOS option parsing stops at the first \
-             operand: everything after it is one more pattern OR'd with the first, not an \
-             option. That is how `pkill -f \"sleep 60\" -u user` matches every process with \
-             the user's name in its arguments.",
-            spec.late
-                .iter()
-                .map(|l| format!("`{l}`"))
-                .collect::<Vec<_>>()
-                .join(", "),
-        ));
+        let late = spec
+            .late
+            .iter()
+            .map(|l| format!("`{l}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if spec.dialect == Dialect::Procps {
+            let macos = spec
+                .alt
+                .as_ref()
+                .map_or(String::new(), |alt| format!(" {:?}", alt.patterns));
+            text.push_str(&format!(
+                " {late} came after the first pattern. Linux reads them as options; macOS \
+                 option parsing stops at the first operand and reads everything after it as one \
+                 more pattern OR'd with the first, the patterns{macos}. This counts the \
+                 processes either reading would signal, which is how `pkill -f \"sleep 60\" -u \
+                 user` can match every process with the user's name in its arguments."
+            ));
+        } else {
+            text.push_str(&format!(
+                " {late} came after the first pattern, and macOS option parsing stops at the \
+                 first operand: everything after it is one more pattern OR'd with the first, \
+                 not an option. That is how `pkill -f \"sleep 60\" -u user` matches every \
+                 process with the user's name in its arguments."
+            ));
+        }
     }
     text
 }
@@ -2157,7 +2879,9 @@ fn describe_killall(spec: &KillallSpec) -> String {
         "killall read {} {:?}{}",
         plural(spec.names.len(), "name", "names"),
         spec.names,
-        if spec.regex {
+        if spec.regex && spec.dialect == Dialect::Procps {
+            ", as regular expressions (-r)"
+        } else if spec.regex {
             ", as regular expressions (-m)"
         } else {
             ", each matched exactly against the process name"
@@ -2170,20 +2894,29 @@ fn describe_killall(spec: &KillallSpec) -> String {
     }
     text.push('.');
     if !spec.late.is_empty() {
-        text.push_str(&format!(
-            " {} came after the first name, and option parsing stops at the first operand, so \
-             {} taken as more names.",
-            spec.late
-                .iter()
-                .map(|l| format!("`{l}`"))
-                .collect::<Vec<_>>()
-                .join(", "),
-            if spec.late.len() == 1 {
-                "it was"
-            } else {
-                "they were"
-            },
-        ));
+        let late = spec
+            .late
+            .iter()
+            .map(|l| format!("`{l}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let taken = if spec.late.len() == 1 {
+            "it was"
+        } else {
+            "they were"
+        };
+        if spec.dialect == Dialect::Procps {
+            text.push_str(&format!(
+                " {late} came after the first name. Linux reads them as options; macOS option \
+                 parsing stops at the first operand, so {taken} taken as more names. This \
+                 counts the processes either reading would signal."
+            ));
+        } else {
+            text.push_str(&format!(
+                " {late} came after the first name, and option parsing stops at the first \
+                 operand, so {taken} taken as more names."
+            ));
+        }
     }
     text
 }
@@ -2503,11 +3236,24 @@ mod tests {
         }
     }
 
+    /// The tests below that do not name a dialect read the macOS tools, so
+    /// they mean the same on every host the suite runs on. The Linux tools
+    /// are read with [`Dialect::Procps`] explicitly.
+    fn plan_with(command: &str, env: EnvFn) -> Plan {
+        super::plan_with(command, env, Dialect::Bsd)
+    }
+
+    fn parse_pgrep(args: &[Word], pkill: bool) -> Parsed<PgrepSpec> {
+        super::parse_pgrep(args, pkill, Dialect::Bsd)
+    }
+
     fn row(pid: i32, ppid: i32, argv: &[&str]) -> TableRow {
         TableRow {
             pid,
             ppid,
             uid: ME,
+            ruid: None,
+            suid: None,
             start_us: u64::try_from(pid).unwrap_or(0) * 1000,
             name: base_name(argv[0]).to_string(),
             exec: Some(argv[0].to_string()),
@@ -2622,7 +3368,34 @@ mod tests {
     }
 
     fn run_in(command: &str, facts: &Facts) -> HookOutput {
-        decide(&plan_with(command, fake_env), facts)
+        run_on(Dialect::Bsd, command, facts)
+    }
+
+    fn run_on(dialect: Dialect, command: &str, facts: &Facts) -> HookOutput {
+        decide(&super::plan_with(command, fake_env, dialect), facts)
+    }
+
+    /// What the first invocation in `command` reaches, read as `dialect` does.
+    fn pids_in(dialect: Dialect, command: &str, facts: &Facts) -> Vec<i32> {
+        let plan = super::plan_with(command, fake_env, dialect);
+        let reach = match &plan.findings.first().map(|f| &f.sel) {
+            Some(Sel::Pgrep(spec)) => eval_pgrep(spec, facts),
+            Some(Sel::Killall(spec)) => eval_killall(spec, facts),
+            _ => panic!("not a pattern kill: {plan:?}"),
+        }
+        .expect("evaluates");
+        let mut pids: Vec<i32> = reach.hits.iter().map(|r| r.pid).collect();
+        pids.sort_unstable();
+        pids
+    }
+
+    /// The selection the first invocation in `command` was read as.
+    fn sel_in(dialect: Dialect, command: &str) -> Option<Sel> {
+        super::plan_with(command, fake_env, dialect)
+            .findings
+            .into_iter()
+            .next()
+            .map(|f| f.sel)
     }
 
     fn reason_of(output: &HookOutput) -> String {
@@ -2634,18 +3407,7 @@ mod tests {
     }
 
     fn pids_of(command: &str, facts: &Facts) -> Vec<i32> {
-        let plan = plan_with(command, fake_env);
-        let Sel::Pgrep(spec) = &plan.findings[0].sel else {
-            panic!("not a pattern kill: {plan:?}");
-        };
-        let mut pids: Vec<i32> = eval_pgrep(spec, facts)
-            .expect("evaluates")
-            .hits
-            .iter()
-            .map(|r| r.pid)
-            .collect();
-        pids.sort_unstable();
-        pids
+        pids_in(Dialect::Bsd, command, facts)
     }
 
     fn words(args: &[&str]) -> Vec<Word> {
@@ -2695,39 +3457,49 @@ mod tests {
     fn the_session_that_ran_it_is_not_a_victim_but_the_others_are() {
         let facts = world();
         let pids = pids_of("pkill -f claude", &facts);
-        if skip_ancestors() {
-            assert!(!pids.contains(&700), "the sender's own session is excluded");
-            assert_eq!(pids.len(), 5, "the five hosted ones are not: {pids:?}");
-        } else {
-            assert!(
-                pids.contains(&700),
-                "procps reaches the ancestor session: {pids:?}"
-            );
-            assert_eq!(
-                pids.len(),
-                6,
-                "the ancestor plus the five hosted ones: {pids:?}"
-            );
-        }
+        assert!(!pids.contains(&700), "the sender's own session is excluded");
+        assert_eq!(pids.len(), 5, "the five hosted ones are not: {pids:?}");
         let alone = quiet();
-        let only_ancestor = classify_output(&run_in("pkill -f claude", &alone));
-        if skip_ancestors() {
-            assert_eq!(
-                only_ancestor,
-                Out::Silent,
-                "macOS pkill never signals its ancestors"
-            );
-        } else {
-            assert_eq!(
-                only_ancestor,
-                Out::Deny,
-                "the ancestor is a hosted session procps would signal"
-            );
-        }
+        assert_eq!(
+            classify_output(&run_in("pkill -f claude", &alone)),
+            Out::Silent,
+            "macOS pkill never signals its ancestors"
+        );
         assert_eq!(
             classify_output(&run_in("pkill -a -f claude", &alone)),
             Out::Deny,
             "-a includes ancestors"
+        );
+    }
+
+    #[test]
+    fn on_linux_the_session_that_ran_it_is_a_victim_unless_a_is_given() {
+        let facts = world();
+        let pids = pids_in(Dialect::Procps, "pkill -f claude", &facts);
+        assert!(
+            pids.contains(&700),
+            "procps reaches the ancestor session: {pids:?}"
+        );
+        assert_eq!(pids.len(), 6, "the ancestor and the five: {pids:?}");
+        assert_eq!(
+            classify_output(&run_on(Dialect::Procps, "pkill -f claude", &quiet())),
+            Out::Deny,
+            "the ancestor is a hosted session procps would signal"
+        );
+        let ignored = pids_in(Dialect::Procps, "pkill -A -f claude", &facts);
+        assert!(
+            !ignored.contains(&700),
+            "-A leaves ancestors out: {ignored:?}"
+        );
+        assert_eq!(ignored.len(), 5, "{ignored:?}");
+        assert_eq!(
+            classify_output(&run_on(Dialect::Procps, "pkill -A -f claude", &quiet())),
+            Out::Silent
+        );
+        // procps `-a` is --list-full: it prints, it does not change the match.
+        assert_eq!(
+            pids_in(Dialect::Procps, "pkill -f claude", &facts),
+            pids_in(Dialect::Procps, "kill $(pgrep -a -f claude)", &facts)
         );
     }
 
@@ -3378,21 +4150,679 @@ mod tests {
         assert!(!inverse.contains(&900), "never itself");
         let normal = pids_of("pkill -f .", &facts);
         assert!(!normal.contains(&900), "never itself");
-        if skip_ancestors() {
-            assert!(!normal.contains(&700) && !normal.contains(&800));
-        } else {
-            assert!(
-                normal.contains(&700) && normal.contains(&800),
-                "procps counts ancestors: {normal:?}"
-            );
-        }
+        assert!(!normal.contains(&700) && !normal.contains(&800));
+        let procps = pids_in(Dialect::Procps, "pkill -f .", &facts);
+        assert!(
+            procps.contains(&700) && procps.contains(&800) && !procps.contains(&900),
+            "procps counts ancestors: {procps:?}"
+        );
     }
 
     #[test]
     fn procps_counts_ancestors_and_macos_pkill_does_not() {
-        assert!(skip_ancestors_on("macos"));
-        assert!(!skip_ancestors_on("linux"));
-        assert_eq!(skip_ancestors(), skip_ancestors_on(std::env::consts::OS));
+        assert!(Dialect::of("macos").skips_ancestors());
+        assert!(!Dialect::of("linux").skips_ancestors());
+        assert_eq!(Dialect::of("linux"), Dialect::Procps);
+        assert_eq!(Dialect::of("freebsd"), Dialect::Bsd);
+        assert_eq!(Dialect::host(), Dialect::of(std::env::consts::OS));
+    }
+
+    /* ── the Linux tools: names ── */
+
+    fn named(pid: i32, comm: &str, argv: &[&str]) -> TableRow {
+        let mut r = row(pid, 1, argv);
+        r.name = comm.to_string();
+        r
+    }
+
+    #[test]
+    fn a_name_is_tried_as_comm_and_as_argv0_on_linux_and_as_argv0_alone_on_macos() {
+        let subjects = |d, comm: &str, argv0: Option<&str>| name_subjects(d, comm, argv0);
+        // The login shell: its executable is zsh, its argv[0] is `-zsh`.
+        assert_eq!(
+            subjects(Dialect::Procps, "zsh", Some("-zsh")),
+            vec!["zsh", "-zsh"]
+        );
+        assert_eq!(subjects(Dialect::Bsd, "zsh", Some("-zsh")), vec!["-zsh"]);
+        // A program that rewrote its title: comm stays the executable's name.
+        assert_eq!(
+            subjects(Dialect::Procps, "sleep", Some("/x/gpsg1x2")),
+            vec!["sleep", "gpsg1x2"]
+        );
+        // The same name twice is one subject; no argv[0] leaves comm alone.
+        assert_eq!(
+            subjects(Dialect::Procps, "zsh", Some("/bin/zsh")),
+            vec!["zsh"]
+        );
+        assert_eq!(subjects(Dialect::Procps, "zsh", None), vec!["zsh"]);
+        assert_eq!(subjects(Dialect::Procps, "zsh", Some("")), vec!["zsh"]);
+        assert_eq!(subjects(Dialect::Procps, "zsh", Some("/")), vec!["zsh"]);
+        assert_eq!(subjects(Dialect::Bsd, "zsh", None), vec!["zsh"]);
+        // comm is cut at 15 bytes; argv[0] is not.
+        assert_eq!(
+            subjects(
+                Dialect::Procps,
+                "averyverylongpr",
+                Some("averyverylongprocess")
+            ),
+            vec!["averyverylongpr", "averyverylongprocess"]
+        );
+    }
+
+    #[test]
+    fn a_login_shell_run_as_dash_zsh_is_picked_by_pkill_x_zsh_on_linux() {
+        let mut facts = quiet();
+        facts.rows.push(named(2200, "zsh", &["-zsh"]));
+        facts.rows.push(named(2201, "zsh", &["/bin/zsh", "-l"]));
+        facts.rows.push(named(2202, "bash", &["-bash"]));
+        // procps `pgrep -x zsh` finds the login shell: comm is `zsh`. (800 is
+        // the sender's own shell, an ancestor procps counts.)
+        assert_eq!(
+            pids_in(Dialect::Procps, "pkill -x zsh", &facts),
+            vec![800, 2200, 2201]
+        );
+        // macOS matched argv[0], where it is `-zsh`, and left the ancestor out.
+        assert_eq!(pids_in(Dialect::Bsd, "pkill -x zsh", &facts), vec![2201]);
+        assert_eq!(
+            pids_in(Dialect::Procps, "pkill -x bash", &facts),
+            vec![2202]
+        );
+        assert_eq!(
+            pids_in(Dialect::Procps, "pkill -x -- -bash", &facts),
+            vec![2202]
+        );
+    }
+
+    #[test]
+    fn a_name_longer_than_comm_is_still_counted_on_linux_where_pgrep_finds_nothing() {
+        let mut facts = quiet();
+        facts.rows.push(named(
+            2200,
+            "averyverylongpr",
+            &["/b/averyverylongprocessname"],
+        ));
+        // procps matches comm, which is cut at 15, so this finds nothing there;
+        // the guard also tries argv[0] and counts it: the safe direction.
+        assert_eq!(
+            pids_in(Dialect::Procps, "pkill -x averyverylongprocessname", &facts),
+            vec![2200]
+        );
+        assert_eq!(
+            pids_in(Dialect::Procps, "pkill -x averyverylongpr", &facts),
+            vec![2200]
+        );
+    }
+
+    #[test]
+    fn an_inverted_name_match_is_never_smaller_than_either_tools() {
+        let mut facts = quiet();
+        // comm differs from the pattern, argv[0] matches it.
+        facts.rows.push(named(2200, "sleep", &["zsh"]));
+        // comm matches, argv[0] differs.
+        facts.rows.push(named(2201, "zsh", &["-zsh"]));
+        // both match.
+        facts.rows.push(named(2202, "zsh", &["zsh"]));
+        let hits = pids_in(Dialect::Procps, "pkill --inverse -x zsh", &facts);
+        assert!(hits.contains(&2200), "{hits:?}");
+        assert!(hits.contains(&2201), "{hits:?}");
+        assert!(!hits.contains(&2202), "{hits:?}");
+    }
+
+    #[test]
+    fn killall_names_follow_psmisc_on_linux_and_the_process_name_on_macos() {
+        let lit = killall_literal;
+        assert!(lit(Dialect::Procps, "zsh", false, "zsh", Some("-zsh")));
+        assert!(lit(
+            Dialect::Procps,
+            "gpsg",
+            false,
+            "sleep",
+            Some("/x/gpsg")
+        ));
+        assert!(!lit(Dialect::Procps, "zs", false, "zsh", Some("-zsh")));
+        // comm is cut at 15 bytes: a name that long or longer is compared
+        // with its first 15 bytes, or with the command line's.
+        assert!(lit(
+            Dialect::Procps,
+            "averyverylongprocessname",
+            false,
+            "averyverylongpr",
+            None
+        ));
+        assert!(!lit(
+            Dialect::Procps,
+            "averyverylongprocessname",
+            false,
+            "differentlongnm",
+            None
+        ));
+        assert!(!lit(
+            Dialect::Procps,
+            "averyverylong",
+            false,
+            "averyverylongpr",
+            None
+        ));
+        // -I is case-blind, on both names and comm.
+        assert!(lit(Dialect::Procps, "ZSH", true, "zsh", None));
+        assert!(!lit(Dialect::Procps, "ZSH", false, "zsh", None));
+        assert!(lit(
+            Dialect::Procps,
+            "AVERYVERYLONGPROCESS",
+            true,
+            "averyverylongpr",
+            None
+        ));
+        // macOS: argv[0]'s last component, exactly.
+        assert!(lit(Dialect::Bsd, "-zsh", false, "zsh", Some("-zsh")));
+        assert!(!lit(Dialect::Bsd, "zsh", false, "zsh", Some("-zsh")));
+        assert!(!lit(Dialect::Bsd, "sleep", false, "sleep", Some("/x/gpsg")));
+    }
+
+    /* ── the Linux tools: whose processes ── */
+
+    #[test]
+    fn a_signal_reaches_a_process_by_the_kill_rule_not_only_by_its_owner() {
+        let facts = Facts {
+            me_uid: ME,
+            ..Facts::default()
+        };
+        let with = |uid, ruid, suid| TableRow {
+            uid,
+            ruid,
+            suid,
+            ..row(1, 0, &["x"])
+        };
+        // The kernel reports a process that is not dumpable as root's in
+        // /proc; its credentials say it is this user's.
+        assert!(reachable(&facts, &with(ME, Some(ME), Some(ME))));
+        // Running as this user whatever the other ids say: always counted.
+        assert!(reachable(&facts, &with(ME, Some(9), Some(9))));
+        // Real or saved uid this user's: `kill(2)` permits it.
+        assert!(reachable(&facts, &with(0, Some(ME), Some(0))));
+        assert!(reachable(&facts, &with(7, Some(7), Some(ME))));
+        // Nothing of this user's.
+        assert!(!reachable(&facts, &with(7, Some(7), Some(7))));
+        assert!(!reachable(&facts, &with(0, Some(0), Some(0))));
+        // No ids beyond the one: that one decides, as before.
+        assert!(reachable(&facts, &with(ME, None, None)));
+        assert!(!reachable(&facts, &with(0, None, None)));
+        // Root reaches everything; so does a sender whose effective uid is root.
+        let root = Facts {
+            me_uid: 0,
+            ..Facts::default()
+        };
+        assert!(reachable(&root, &with(7, Some(7), Some(7))));
+        let setuid = Facts {
+            me_uid: ME,
+            me_euid: Some(0),
+            ..Facts::default()
+        };
+        assert!(reachable(&setuid, &with(7, Some(7), Some(7))));
+        // The effective uid of the sender counts as well as the real one.
+        let euid = Facts {
+            me_uid: ME,
+            me_euid: Some(7),
+            ..Facts::default()
+        };
+        assert!(reachable(&euid, &with(0, Some(7), Some(0))));
+    }
+
+    #[test]
+    fn user_filters_read_the_effective_and_the_real_uid_the_way_each_tool_does() {
+        let mut facts = quiet();
+        let mut shared = named(2300, "svc", &["svc"]);
+        shared.uid = ME;
+        shared.ruid = Some(0);
+        shared.suid = Some(ME);
+        facts.rows.push(shared);
+        let mut dropped = named(2301, "svc2", &["svc2"]);
+        dropped.uid = 77;
+        dropped.ruid = Some(ME);
+        dropped.suid = Some(77);
+        facts.rows.push(dropped);
+        let hit = |c: &str| pids_in(Dialect::Procps, c, &facts);
+        // -u is the effective uid.
+        assert_eq!(hit("pkill -u 501 -x svc"), vec![2300]);
+        assert!(hit("pkill -u 501 -x svc2").is_empty());
+        // -U is the real uid; the effective one still counts, as it always did.
+        assert_eq!(hit("pkill -U 0 -x svc"), vec![2300]);
+        assert_eq!(hit("pkill -U 501 -x svc2"), vec![2301]);
+        assert_eq!(hit("pkill -U 501 -x svc"), vec![2300]);
+        // psmisc killall -u is the real uid.
+        assert_eq!(hit("killall -u bharath svc2"), vec![2301]);
+        assert_eq!(hit("killall -u root svc"), vec![2300]);
+    }
+
+    /* ── the Linux tools: how the arguments are read ── */
+
+    fn pgrep_on_linux(args: &[&str], pkill: bool) -> Parsed<PgrepSpec> {
+        super::parse_pgrep(&words(args), pkill, Dialect::Procps)
+    }
+
+    fn killall_on_linux(args: &[&str]) -> Parsed<KillallSpec> {
+        super::parse_killall(&words(args), Dialect::Procps)
+    }
+
+    fn spec_of(parsed: Parsed<PgrepSpec>) -> PgrepSpec {
+        match parsed {
+            Parsed::Spec(spec) => spec,
+            Parsed::NoEffect(why) => panic!("no effect: {why}"),
+            Parsed::Unevaluable(why) => panic!("unevaluable: {why}"),
+        }
+    }
+
+    fn killall_spec_of(parsed: Parsed<KillallSpec>) -> KillallSpec {
+        match parsed {
+            Parsed::Spec(spec) => spec,
+            Parsed::NoEffect(why) => panic!("no effect: {why}"),
+            Parsed::Unevaluable(why) => panic!("unevaluable: {why}"),
+        }
+    }
+
+    fn unevaluable<T>(parsed: Parsed<T>) -> bool {
+        matches!(parsed, Parsed::Unevaluable(_))
+    }
+
+    fn no_effect<T>(parsed: Parsed<T>) -> bool {
+        matches!(parsed, Parsed::NoEffect(_))
+    }
+
+    #[test]
+    fn procps_reads_options_anywhere_and_long_options_and_one_pattern() {
+        // `pkill X -f` is `pkill -f X` there; the macOS reading is kept beside it.
+        let late = spec_of(pgrep_on_linux(&["bharath", "-f"], true));
+        assert!(late.full);
+        assert_eq!(late.patterns, vec!["bharath"]);
+        let alt = late.alt.as_ref().expect("the macOS reading is kept");
+        assert_eq!(alt.patterns, vec!["bharath", "-f"]);
+        assert_eq!(late.late, vec!["-f"]);
+        // Options first: one reading, nothing kept beside it.
+        let plain = spec_of(pgrep_on_linux(&["-f", "bharath"], true));
+        assert!(plain.full && plain.alt.is_none() && plain.late.is_empty());
+        // Long options work in pkill, `--inverse` and `--list-full` included.
+        let long = spec_of(pgrep_on_linux(&["--full", "--inverse", "x"], true));
+        assert!(long.full && long.inverse);
+        let abbreviated = spec_of(pgrep_on_linux(&["--ful", "--euid=bharath", "x"], true));
+        assert!(abbreviated.full);
+        assert_eq!(abbreviated.euids, vec!["bharath"]);
+        let separate = spec_of(pgrep_on_linux(&["--uid", "0,bharath", "x"], false));
+        assert_eq!(separate.ruids, vec!["0", "bharath"]);
+        // Short flags cluster, and an argument can be attached.
+        let cluster = spec_of(pgrep_on_linux(&["-fxubharath", "x"], true));
+        assert!(cluster.full && cluster.exact);
+        assert_eq!(cluster.euids, vec!["bharath"]);
+        // `--` ends the options.
+        let dashed = spec_of(pgrep_on_linux(&["-f", "--", "-x"], true));
+        assert_eq!(dashed.patterns, vec!["-x"]);
+        // More than one pattern is a usage error there: nothing is signalled.
+        assert!(no_effect(pgrep_on_linux(&["foo", "bar"], true)));
+        assert!(no_effect(pgrep_on_linux(&["-f", "foo", "bar"], true)));
+        // No pattern and no criterion, the same.
+        assert!(no_effect(pgrep_on_linux(&["-f"], true)));
+        assert!(!no_effect(pgrep_on_linux(&["-u", "bharath"], true)));
+        // An empty pattern matches every process there.
+        let empty = spec_of(pgrep_on_linux(&[""], true));
+        assert_eq!(empty.patterns, vec![""]);
+        // -L needs -F.
+        assert!(no_effect(pgrep_on_linux(&["-L", "x"], false)));
+        // Usage and version print and signal nothing.
+        assert!(no_effect(pgrep_on_linux(&["--help"], true)));
+        assert!(no_effect(pgrep_on_linux(&["-V"], true)));
+        assert!(no_effect(pgrep_on_linux(&["--version"], false)));
+    }
+
+    #[test]
+    fn procps_pkill_takes_a_signal_from_anywhere_in_the_arguments() {
+        // `signal_option` scans every word, so a signal after the options (or
+        // the pattern) is the signal, not an illegal option.
+        let after = spec_of(pgrep_on_linux(&["-u", "bharath", "-9"], true));
+        assert_eq!(after.euids, vec!["bharath"]);
+        assert!(after.patterns.is_empty());
+        let named_after = spec_of(pgrep_on_linux(&["-f", "x", "-TERM"], true));
+        assert_eq!(named_after.patterns, vec!["x"]);
+        let sig_prefix = spec_of(pgrep_on_linux(&["-SIGKILL", "-f", "x"], true));
+        assert!(sig_prefix.full);
+        // Signal 0 only tests: nothing is signalled, wherever it stands.
+        for zero in ["-0", "-00", "-EXIT", "-NULL", "-SIGNULL"] {
+            assert!(
+                no_effect(pgrep_on_linux(&["-f", "x", zero], true)),
+                "{zero}"
+            );
+        }
+        assert!(no_effect(pgrep_on_linux(
+            &["--signal", "0", "-f", "x"],
+            true
+        )));
+        assert!(no_effect(pgrep_on_linux(&["--signal=NULL", "x"], true)));
+        // pgrep has no signal: `-9` is an option it does not have.
+        assert!(unevaluable(pgrep_on_linux(&["-9", "x"], false)));
+        // The macOS reading refuses a signal after the options as an illegal
+        // option, and reads one after the pattern as one more pattern.
+        assert!(matches!(
+            super::parse_pgrep(&words(&["-u", "bharath", "-9"]), true, Dialect::Bsd),
+            Parsed::NoEffect(_)
+        ));
+        let bsd = spec_of(super::parse_pgrep(
+            &words(&["-f", "x", "-9"]),
+            true,
+            Dialect::Bsd,
+        ));
+        assert_eq!(bsd.patterns, vec!["x", "-9"]);
+    }
+
+    #[test]
+    fn procps_signal_specs_are_what_signal_name_to_number_reads() {
+        for (spec, want) in [
+            ("9", Some(false)),
+            ("0", Some(true)),
+            ("TERM", Some(false)),
+            ("sigterm", Some(false)),
+            ("SIGHUP", Some(false)),
+            ("USR1", Some(false)),
+            ("RTMIN", Some(false)),
+            ("RTMIN+3", Some(false)),
+            ("EXIT", Some(true)),
+            ("null", Some(true)),
+            ("93", Some(false)),
+            ("093", Some(false)),
+            ("-0", Some(true)),
+            ("+5", Some(false)),
+            ("94", None),
+            ("094", None),
+            ("-1", None),
+            ("", None),
+            ("SIG", None),
+            ("f", None),
+            ("9x", None),
+            ("1234567", None),
+        ] {
+            assert_eq!(procps_signal(spec), want, "{spec:?}");
+        }
+    }
+
+    #[test]
+    fn procps_options_the_guard_does_not_model_are_asked_about_never_read_as_macos_does() {
+        for args in [
+            vec!["-s", "12", "x"],
+            vec!["--session", "12", "x"],
+            vec!["-r", "R", "x"],
+            vec!["-H", "x"],
+            vec!["-O", "5", "x"],
+            vec!["-G", "100", "x"],
+            vec!["-t", "pts/1", "x"],
+            vec!["--cgroup", "c", "x"],
+            vec!["--ns", "1", "x"],
+            vec!["--nslist", "pid", "x"],
+            vec!["-z", "x"],
+            vec!["--bogus", "x"],
+            vec!["--ig", "x"],
+            vec!["-g", "0"],
+        ] {
+            assert!(unevaluable(pgrep_on_linux(&args, true)), "{args:?}");
+        }
+        // pgrep only: threads; pkill has neither `-w` nor short `-v`.
+        assert!(unevaluable(pgrep_on_linux(&["-w", "x"], false)));
+        assert!(unevaluable(pgrep_on_linux(&["-v", "x"], true)));
+        assert!(unevaluable(pgrep_on_linux(&["-a", "x"], true)));
+        assert!(!unevaluable(pgrep_on_linux(&["-v", "x"], false)));
+        // A word built from a variable can be an option or a signal anywhere.
+        let mut dynamic = words(&["-f", "x"]);
+        dynamic.push(Word {
+            src: "$FLAGS".into(),
+            text: String::new(),
+            dynamic: true,
+            ..Word::default()
+        });
+        assert!(unevaluable(super::parse_pgrep(
+            &dynamic,
+            true,
+            Dialect::Procps
+        )));
+        assert!(unevaluable(super::parse_killall(&dynamic, Dialect::Procps)));
+        // Options that change nothing about the set are read as such.
+        let quiet_flags = spec_of(pgrep_on_linux(&["-e", "-c", "-q", "7", "-f", "x"], true));
+        assert!(quiet_flags.full);
+        let listing = spec_of(pgrep_on_linux(&["-l", "-a", "-d", ",", "x"], false));
+        assert!(
+            !listing.ancestors,
+            "procps -a lists, it does not add ancestors"
+        );
+    }
+
+    #[test]
+    fn psmisc_killall_options_are_parsed_on_linux() {
+        let r = killall_spec_of(killall_on_linux(&["-r", "sle+p"]));
+        assert!(r.regex && !r.icase && r.names == vec!["sle+p"]);
+        let i = killall_spec_of(killall_on_linux(&["-I", "ZSH"]));
+        assert!(i.icase && !i.regex);
+        let both = killall_spec_of(killall_on_linux(&["-I", "-r", "ZS+H"]));
+        assert!(both.icase && both.regex);
+        let long = killall_spec_of(killall_on_linux(&["--regexp", "--ignore-case", "x"]));
+        assert!(long.regex && long.icase);
+        let single_dash_long = killall_spec_of(killall_on_linux(&["-regexp", "x"]));
+        assert!(single_dash_long.regex);
+        let prefix = killall_spec_of(killall_on_linux(&["-reg", "-ign", "x"]));
+        assert!(prefix.regex && prefix.icase);
+        // Options anywhere, a user alone, the signal as an option or by name.
+        let late = killall_spec_of(killall_on_linux(&["x", "-u", "bharath"]));
+        assert_eq!(late.user.as_deref(), Some("bharath"));
+        assert_eq!(late.names, vec!["x"]);
+        assert!(late.alt.is_some(), "the macOS reading is kept beside it");
+        let user_only = killall_spec_of(killall_on_linux(&["-u", "bharath"]));
+        assert!(user_only.names.is_empty() && user_only.user.is_some());
+        let attached = killall_spec_of(killall_on_linux(&["-ubharath", "x"]));
+        assert_eq!(attached.user.as_deref(), Some("bharath"));
+        for args in [
+            vec!["-HUP", "x"],
+            vec!["-9", "x"],
+            vec!["-s", "HUP", "x"],
+            vec!["x", "-INT"],
+        ] {
+            let spec = killall_spec_of(killall_on_linux(&args));
+            assert_eq!(spec.names, vec!["x"], "{args:?}");
+        }
+        // Flags that only change how it reports or waits.
+        let calm = killall_spec_of(killall_on_linux(&["-e", "-i", "-q", "-v", "-w", "x"]));
+        assert_eq!(calm.names, vec!["x"]);
+        // A signal that only tests, listing and version: nothing is signalled.
+        for args in [
+            vec!["-0", "x"],
+            vec!["-s", "0", "x"],
+            vec!["--signal=0", "x"],
+            vec!["-l"],
+            vec!["--list-signals"],
+            vec!["-V"],
+            vec!["--version"],
+            vec![],
+        ] {
+            assert!(no_effect(killall_on_linux(&args)), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn psmisc_killall_options_that_widen_or_select_by_what_the_table_lacks_are_asked_about() {
+        for args in [
+            vec!["-g", "x"],
+            vec!["--process-group", "x"],
+            vec!["-y", "5m", "x"],
+            vec!["-o", "5m", "x"],
+            vec!["-n", "1", "x"],
+            vec!["--ns", "1", "x"],
+            vec!["-Z", "ctx", "x"],
+            vec!["--context=ctx", "x"],
+            vec!["-Q", "x"],
+            vec!["--bogus", "x"],
+            vec!["-ve", "x"],
+            vec!["-Iq", "x"],
+            vec!["/bin/sleep"],
+            vec!["./sleep"],
+        ] {
+            assert!(unevaluable(killall_on_linux(&args)), "{args:?}");
+        }
+        // A path is only a path outside a regular expression.
+        assert!(!unevaluable(killall_on_linux(&["-r", "/bin/sleep"])));
+    }
+
+    #[test]
+    fn the_macos_killall_options_are_not_read_with_their_macos_meaning_on_linux() {
+        // macOS `-m` is a regular expression and `-d` a dry run; psmisc has
+        // neither, so they are options it does not have, and asked about.
+        assert!(unevaluable(killall_on_linux(&["-m", "x"])));
+        assert!(unevaluable(killall_on_linux(&["-d", "x"])));
+        assert!(unevaluable(killall_on_linux(&["-c", "x", "y"])));
+        // And macOS `-s` is a simulation, psmisc's a signal.
+        assert!(matches!(
+            super::parse_killall(&words(&["-s", "x"]), Dialect::Bsd),
+            Parsed::NoEffect(_)
+        ));
+        let linux = killall_spec_of(killall_on_linux(&["-s", "HUP", "x"]));
+        assert_eq!(linux.names, vec!["x"]);
+    }
+
+    /* ── the Linux tools: the decision ── */
+
+    #[test]
+    fn the_incident_command_is_still_refused_on_linux_where_the_options_are_options() {
+        // procps reads `-u bharath` as the user filter, which is narrower; the
+        // macOS reading is wider and is kept, so the set is not smaller.
+        let output = run_on(
+            Dialect::Procps,
+            r#"pkill -f "sleep 60" -u bharath"#,
+            &world(),
+        );
+        assert_eq!(classify_output(&output), Out::Deny);
+        let reason = reason_of(&output);
+        assert!(reason.contains("Linux reads them as options"), "{reason}");
+        assert!(reason.contains("macOS"), "{reason}");
+        assert!(
+            reason.contains("`-u` came after the first pattern"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains(r#"["sleep 60", "-u", "bharath"]"#),
+            "the patterns the macOS reading takes: {reason}"
+        );
+        assert!(
+            reason.contains("Put the options before the pattern"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_late_option_that_widens_the_match_is_counted_on_linux() {
+        let mut facts = quiet();
+        facts
+            .rows
+            .push(row(2200, 1, &["node", "/srv/zzzmarker.js"]));
+        // procps: `-f` is an option, so the pattern is tried against command
+        // lines. The macOS reading tries `zzzmarker` and `-f` against names.
+        assert_eq!(
+            pids_in(Dialect::Procps, "pkill zzzmarker -f", &facts),
+            vec![2200]
+        );
+        assert!(pids_in(Dialect::Bsd, "pkill zzzmarker -f", &facts).is_empty());
+    }
+
+    #[test]
+    fn a_signal_written_after_the_options_is_not_a_silent_pass_on_linux() {
+        // `pkill -u bharath -9` kills every process of the user on Linux. The
+        // macOS reading calls `-9` an illegal option and signals nothing.
+        let on_linux = run_on(Dialect::Procps, "pkill -u bharath -9", &world());
+        assert_eq!(classify_output(&on_linux), Out::Deny, "{on_linux:?}");
+        assert_eq!(
+            classify_output(&run_on(Dialect::Bsd, "pkill -u bharath -9", &world())),
+            Out::Silent
+        );
+        // The long form of an option, which macOS has no such thing as.
+        assert_eq!(
+            classify_output(&run_on(Dialect::Procps, "pkill --full claude", &world())),
+            Out::Deny
+        );
+        assert_eq!(
+            classify_output(&run_on(
+                Dialect::Procps,
+                "pkill --inverse -f zzzz",
+                &world()
+            )),
+            Out::Deny
+        );
+    }
+
+    #[test]
+    fn an_empty_pattern_matches_every_process_on_linux() {
+        let facts = world();
+        let hits = pids_in(Dialect::Procps, "pkill ''", &facts);
+        assert!(hits.len() > 40, "{}", hits.len());
+        assert_eq!(
+            classify_output(&run_on(Dialect::Procps, "pkill ''", &facts)),
+            Out::Deny
+        );
+        assert_eq!(
+            classify_output(&run_on(Dialect::Bsd, "pkill ''", &facts)),
+            Out::Silent,
+            "macOS refuses an empty pattern"
+        );
+    }
+
+    #[test]
+    fn an_option_the_guard_does_not_model_is_a_question_on_linux_not_a_pass() {
+        for command in [
+            "pkill -s 12 sleep",
+            "pkill -r R sleep",
+            "pkill --cgroup system.slice sleep",
+            "killall -g sleep",
+            "killall -y 1h sleep",
+            "killall /bin/sleep",
+            "pkill -z sleep",
+        ] {
+            assert_eq!(
+                classify_output(&run_on(Dialect::Procps, command, &world())),
+                Out::Ask,
+                "{command}"
+            );
+        }
+        assert_eq!(
+            classify_output(&run_on(Dialect::Procps, "killall -l", &world())),
+            Out::Silent
+        );
+    }
+
+    #[test]
+    fn a_killall_late_option_is_counted_both_ways_on_linux() {
+        let facts = world();
+        let hits = pids_in(Dialect::Procps, "killall sleep -u bharath", &facts);
+        assert_eq!(hits.len(), 8, "{hits:?}");
+        // The macOS reading takes `-u` and `bharath` as more names and finds
+        // none; procps reads the option. The union is what is counted.
+        assert!(pids_in(Dialect::Bsd, "killall sleep -u bharath", &facts).len() == 8);
+        assert!(matches!(
+            sel_in(Dialect::Procps, "killall sleep -u bharath"),
+            Some(Sel::Killall(KillallSpec { alt: Some(_), .. }))
+        ));
+    }
+
+    #[test]
+    fn the_linux_readings_never_panic_on_hostile_arguments() {
+        for args in [
+            vec!["--"],
+            vec!["--="],
+            vec!["--=x"],
+            vec!["-"],
+            vec!["--", "--"],
+            vec!["-u"],
+            vec!["--euid"],
+            vec!["--euid="],
+            vec!["--full=1", "x"],
+            vec!["-é", "x"],
+            vec!["--é", "x"],
+            vec!["-ü9"],
+            vec!["-", "-", "-"],
+        ] {
+            let _ = pgrep_on_linux(&args, true);
+            let _ = pgrep_on_linux(&args, false);
+            let _ = killall_on_linux(&args);
+        }
     }
 
     #[test]
