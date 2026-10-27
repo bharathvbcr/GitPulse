@@ -267,3 +267,127 @@ fn the_three_fields_are_on_the_wire_under_the_names_the_store_mirrors() {
     assert!(quiet["hook_reply_missed_last"].is_null());
     assert!(quiet["hook_drop_record_error"].is_null());
 }
+
+/// A generation the hook filled to its 64 KiB backstop has lost every miss
+/// after that point; the count of what is left must not read as complete.
+#[cfg(unix)]
+#[test]
+fn a_record_the_hook_filled_to_its_cap_says_the_count_is_a_lower_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = socket_in(dir.path());
+    let record = crate::hooks::notify_drops::DropRecord::with_clock(|| Some(NOW - HOUR));
+    let mut written = 0u64;
+    let refusal = loop {
+        match record.append(&socket, "session_ended", Some("term-1-1")) {
+            Ok(()) => written += 1,
+            Err(reason) => break reason,
+        }
+    };
+    assert!(refusal.contains("64 KiB cap"), "{refusal}");
+    let report = read_record(&socket, NOW);
+    assert_eq!(report.missed, written);
+    let error = report
+        .error
+        .expect("a capped record is not a complete count");
+    assert!(error.contains("64 KiB cap"), "{error}");
+    assert!(error.contains("lower bound"), "{error}");
+    let status = status_from(bound(&socket), NOW);
+    assert_eq!(status.hook_replies_missed, written);
+    assert_eq!(status.hook_drop_record_error, Some(error));
+}
+
+#[test]
+fn the_lower_bound_is_said_for_either_generation_and_only_at_the_cap() {
+    use crate::hooks::notify_drops::HOOK_STOP_BYTES;
+    let padded = |len: u64| {
+        let mut text = line(NOW - HOUR, "session_ended");
+        text.push_str(&"\n".repeat(len as usize - text.len()));
+        text
+    };
+    for (generation, len, said) in [
+        ("current", HOOK_STOP_BYTES - 1, false),
+        ("current", HOOK_STOP_BYTES, true),
+        ("prev", HOOK_STOP_BYTES - 1, false),
+        ("prev", HOOK_STOP_BYTES, true),
+        ("prev", HOOK_STOP_BYTES + 150, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = socket_in(dir.path());
+        let path = match generation {
+            "current" => record_path(&socket),
+            _ => prev_path(&record_path(&socket)),
+        };
+        std::fs::write(&path, padded(len)).unwrap();
+        let report = read_record(&socket, NOW);
+        assert_eq!(report.missed, 1, "{generation} {len}");
+        assert_eq!(
+            report
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("lower bound")),
+            said,
+            "{generation} {len}: {:?}",
+            report.error
+        );
+    }
+}
+
+#[test]
+fn rotation_that_cannot_get_the_lock_is_skipped_and_the_record_is_still_read() {
+    use crate::hooks::notify_drops::lock_path;
+    let dir = tempfile::tempdir().unwrap();
+    let socket = socket_in(dir.path());
+    let one = line(NOW - HOUR, "session_ended");
+    let count = ROTATE_BYTES as usize / one.len() + 5;
+    write_record(&socket, &one.repeat(count));
+    // Another reader is mid-rotation.
+    let held = crate::fs_entry::open_private_record(&lock_path(&record_path(&socket))).unwrap();
+    held.try_lock().unwrap();
+
+    let report = read_record(&socket, NOW);
+    assert!(record_path(&socket).exists(), "rotated without the lock");
+    assert!(!prev_path(&record_path(&socket)).exists());
+    assert_eq!(report.missed, count as u64);
+    assert_eq!(report.error, None, "a busy lock is not a fault");
+
+    drop(held);
+    let report = read_record(&socket, NOW);
+    assert!(
+        !record_path(&socket).exists(),
+        "never rotated once the lock was free"
+    );
+    assert!(prev_path(&record_path(&socket)).exists());
+    assert_eq!(report.missed, count as u64);
+}
+
+#[test]
+fn a_record_under_the_rotation_size_never_creates_the_lock() {
+    use crate::hooks::notify_drops::lock_path;
+    let dir = tempfile::tempdir().unwrap();
+    let socket = socket_in(dir.path());
+    write_record(&socket, &line(NOW - HOUR, "session_ended"));
+    read_record(&socket, NOW);
+    assert!(!lock_path(&record_path(&socket)).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_lock_file_other_users_could_open_blocks_rotation_loudly_and_loses_nothing() {
+    use crate::hooks::notify_drops::lock_path;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let socket = socket_in(dir.path());
+    let one = line(NOW - HOUR, "session_ended");
+    let count = ROTATE_BYTES as usize / one.len() + 5;
+    write_record(&socket, &one.repeat(count));
+    let lock = lock_path(&record_path(&socket));
+    std::fs::write(&lock, b"").unwrap();
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let report = read_record(&socket, NOW);
+    assert_eq!(report.missed, count as u64);
+    assert!(record_path(&socket).exists());
+    let error = report
+        .error
+        .expect("an untrusted lock is said, not skipped silently");
+    assert!(error.contains("accessible to other users"), "{error}");
+}

@@ -30,9 +30,14 @@
 //!   is the only writer that ever shortens it: past [`ROTATE_BYTES`] it renames
 //!   the file to `<name>.prev`, replacing the older generation, so an append in
 //!   flight lands in the renamed file and no line is lost. Two generations by
-//!   size; the count shows lines at most [`WINDOW_MS`] old. The hook's own
-//!   backstop is [`HOOK_STOP_BYTES`]: at or over it the append is skipped and
-//!   the stderr line says so, so a record nobody rotates stays bounded.
+//!   size; the count shows lines at most [`WINDOW_MS`] old. Rotation has one
+//!   owner at a time across processes (a non-blocking `flock` on
+//!   `<record>.lock`, size checked again under it); a reader that does not get
+//!   the lock reads without rotating. The hook's own backstop is
+//!   [`HOOK_STOP_BYTES`]: at or over it the append is skipped and the stderr
+//!   line says so, so a record nobody rotates stays bounded. A generation at
+//!   that size means later misses were not recorded, and the reader says the
+//!   count is a lower bound rather than showing it as complete.
 //!
 //! The record is a user-private file (mode 0600, no secrets, no payload) that
 //! only the hook writes and only the app reads. Nothing here is a transport:
@@ -48,8 +53,9 @@ use serde::{Deserialize, Serialize};
 const RECORD_SUFFIX: &str = ".drops";
 /// What the app's rotation adds to the record's name.
 const PREV_SUFFIX: &str = ".prev";
+/// What the record's name adds for the file the app's rotation locks.
+const LOCK_SUFFIX: &str = ".lock";
 /// At or over this the hook does not append. The app rotates long before it.
-#[cfg(unix)]
 pub(crate) const HOOK_STOP_BYTES: u64 = 64 * 1024;
 /// Over this the app renames the record to `.prev` before it reads.
 pub(crate) const ROTATE_BYTES: u64 = 32 * 1024;
@@ -178,6 +184,13 @@ pub(crate) fn prev_path(record: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// The file whose lock makes rotation single-owner.
+pub(crate) fn lock_path(record: &Path) -> PathBuf {
+    let mut name = record.as_os_str().to_owned();
+    name.push(LOCK_SUFFIX);
+    PathBuf::from(name)
+}
+
 #[cfg(unix)]
 fn append_to(path: &Path, line: &[u8]) -> Result<(), String> {
     use std::io::Write;
@@ -261,20 +274,41 @@ pub(crate) fn read_record(socket: &Path, now_ms: u64) -> DropReport {
     let cutoff = now_ms.saturating_sub(WINDOW_MS);
     let mut report = DropReport::default();
     let mut newest: Option<(u64, String)> = None;
+    let mut capped = false;
     for path in [&current, &previous] {
         match read_generation(path) {
             Ok(None) => {}
-            Ok(Some(text)) => tally(&text, cutoff, &mut report.missed, &mut newest),
+            Ok(Some(bytes)) => {
+                // The hook stops appending here, so every miss after it went
+                // unrecorded: what is counted is a floor, not the number.
+                capped |= bytes.len() as u64 >= HOOK_STOP_BYTES;
+                tally(
+                    &String::from_utf8_lossy(&bytes),
+                    cutoff,
+                    &mut report.missed,
+                    &mut newest,
+                );
+            }
             Err(reason) => notes.push(reason),
         }
     }
     report.last =
         newest.map(|(at, event)| format!("{event} at {}", crate::ledger::ids::iso8601_utc(at)));
+    let mut said = Vec::new();
     if !notes.is_empty() {
-        report.error = Some(format!(
+        said.push(format!(
             "The record of notify reports that got no reply could not be read in full ({}); the count may be too low.",
             notes.join("; ")
         ));
+    }
+    if capped {
+        said.push(format!(
+            "The record reached its {} KiB cap; later misses were not recorded, so the count is a lower bound.",
+            HOOK_STOP_BYTES / 1024
+        ));
+    }
+    if !said.is_empty() {
+        report.error = Some(said.join(" "));
     }
     report
 }
@@ -295,26 +329,59 @@ fn tally(text: &str, cutoff: u64, missed: &mut u64, newest: &mut Option<(u64, St
         let (Some(at), Some(event)) = (at, parsed.and_then(|line| line.event)) else {
             continue;
         };
-        if event.is_empty() || newest.as_ref().is_some_and(|(seen, _)| *seen >= at) {
+        if newest.as_ref().is_some_and(|(seen, _)| *seen >= at) {
             continue;
         }
         let shown: String = crate::alerts::text::sanitize(&event)
             .chars()
             .take(MAX_SHOWN_EVENT_CHARS)
             .collect();
+        // A name that cleans to nothing is still a miss, counted above, but
+        // is not something to show as the last one: it would hide an older
+        // line that reads.
+        if shown.trim().is_empty() {
+            continue;
+        }
         *newest = Some((at, shown));
     }
 }
 
+/// Whether `current` is a regular file over [`ROTATE_BYTES`]. Absent is not.
+fn needs_rotation(current: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(current) {
+        Ok(meta) => Ok(meta.is_file() && meta.len() > ROTATE_BYTES),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("{}: {error}", current.display())),
+    }
+}
+
 /// Renames `current` to `previous` when it is a regular file over
-/// [`ROTATE_BYTES`]. Absent is fine, and so is losing a race to another reader.
+/// [`ROTATE_BYTES`], and only while holding the rotation lock.
+///
+/// A stat and a rename are two steps, and a second reader (another app
+/// instance, or an overlapping `status()`) between them would rename the small
+/// file a hook had started in the meantime over `.prev`, destroying the whole
+/// first generation. So rotation has one owner at a time: an exclusive,
+/// non-blocking `flock` on `<record>.lock`, taken only once the size says a
+/// rotation is due, with the size checked again under it. A reader that does
+/// not get the lock skips rotation for this poll and still reads. Hooks never
+/// take it: they only append, and an append in flight lands in whichever file
+/// it opened.
 fn rotate_if_large(current: &Path, previous: &Path) -> Result<(), String> {
-    let meta = match std::fs::symlink_metadata(current) {
-        Ok(meta) => meta,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("{}: {error}", current.display())),
-    };
-    if !meta.is_file() || meta.len() <= ROTATE_BYTES {
+    if !needs_rotation(current)? {
+        return Ok(());
+    }
+    let lock_path = lock_path(current);
+    let lock = crate::fs_entry::open_private_record(&lock_path)?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
+        Err(std::fs::TryLockError::Error(error)) => {
+            return Err(format!("could not lock {}: {error}", lock_path.display()))
+        }
+    }
+    // The owner before us may have rotated it already.
+    if !needs_rotation(current)? {
         return Ok(());
     }
     match std::fs::rename(current, previous) {
@@ -328,8 +395,8 @@ fn rotate_if_large(current: &Path, previous: &Path) -> Result<(), String> {
     }
 }
 
-/// One generation's text; `None` when it is absent.
-fn read_generation(path: &Path) -> Result<Option<String>, String> {
+/// One generation's bytes; `None` when it is absent.
+fn read_generation(path: &Path) -> Result<Option<Vec<u8>>, String> {
     use std::io::Read;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -371,7 +438,7 @@ fn read_generation(path: &Path) -> Result<Option<String>, String> {
             READ_CAP_BYTES / 1024
         ));
     }
-    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    Ok(Some(bytes))
 }
 
 /// Counts the reports a process gave up on, and carries the sink that writes

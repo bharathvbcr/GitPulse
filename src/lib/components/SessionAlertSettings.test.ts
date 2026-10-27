@@ -2,13 +2,13 @@
  * What the settings panel says about hook reports that got no reply
  * (ft-6d8ff969, item 4).
  *
- * `environment: "node"` renders a component on the server, where the panel's
- * `load` effect never runs and `draft` stays null, so the counts block cannot
- * be reached by `render` here. The sentence therefore lives in one pure
- * function of the status (`hookReplyMisses`), tested on its output, and the
- * template is read for the three things the function cannot say for itself:
- * where the line sits, that the error is its own alert, and that nothing sums
- * the count with another.
+ * The sentence lives in one pure function of the status (`hookReplyMisses`),
+ * tested here on its output, and the template is read for the three things the
+ * function cannot say for itself: where the line sits, that the error is its
+ * own alert, and that nothing sums the count with another. A server render of
+ * the real component's counts block, which needs the panel's `draft` set
+ * before its load effect (never run on the server) would set it, is in
+ * `adv_w3c_SessionAlertSettings.render.test.ts`; this file does not repeat it.
  */
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";

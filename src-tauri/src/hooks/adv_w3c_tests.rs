@@ -235,7 +235,10 @@ fn adv_w3c_child_appender() {
 }
 
 /// Processes, not threads: the hook is one process per event, so the append
-/// has to be whole across address spaces.
+/// has to be whole across address spaces. The children are this test binary
+/// re-run on one test, with no socket or descriptor to keep from them, so the
+/// inheritance lock `procguard::spawn` takes buys nothing here.
+#[allow(clippy::disallowed_methods)]
 #[test]
 fn adv_w3c_separate_processes_appending_yield_that_many_whole_lines() {
     const PROCESSES: usize = 8;

@@ -6,7 +6,6 @@
 //! A test whose name starts `adv_w3c_broke_` demonstrates a defect on the lane
 //! tip and FAILS there; every other test here passes and adds coverage.
 
-use super::*;
 use crate::hooks::notify_drops::{
     prev_path, read_record, record_path, DropRecord, READ_CAP_BYTES, ROTATE_BYTES,
 };
@@ -292,7 +291,16 @@ fn adv_w3c_the_read_cap_is_exact() {
     let prev = prev_path(&record_path(&socket));
     std::fs::write(&prev, vec![b'x'; READ_CAP_BYTES as usize]).unwrap();
     let at = read_record(&socket, NOW);
-    assert_eq!(at.error, None);
+    // Read, not refused. A generation this size is also past the hook's own
+    // 64 KiB backstop, so since round 1 it carries the lower-bound note; what
+    // it must not carry is the reader's own cap error.
+    assert!(
+        at.error
+            .as_deref()
+            .is_none_or(|error| !error.contains("KiB the reader takes")),
+        "{:?}",
+        at.error
+    );
     std::fs::write(&prev, vec![b'x'; READ_CAP_BYTES as usize + 1]).unwrap();
     let over = read_record(&socket, NOW);
     assert!(over.error.is_some());
