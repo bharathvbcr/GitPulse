@@ -364,6 +364,36 @@ impl Drop for AdoptionWindow<'_> {
     }
 }
 
+/// Who records an exit, as `Inner::claim_exit` decided it.
+enum ExitClaim<'a> {
+    /// Another reporter is recording it now.
+    Recording,
+    /// It was recorded, and the host told to forget it.
+    Recorded,
+    /// This reporter records it.
+    Mine(Recording<'a>),
+}
+
+/// An exit this reporter is recording. Dropping it makes the exit recorded.
+struct Recording<'a> {
+    inner: &'a Inner,
+    id: String,
+}
+
+impl Drop for Recording<'_> {
+    fn drop(&mut self) {
+        let mut recording = lock(&self.inner.recording);
+        {
+            let mut recorded = lock(&self.inner.ended);
+            recorded.push_back(self.id.clone());
+            while recorded.len() > REMEMBERED_EXITS {
+                recorded.pop_front();
+            }
+        }
+        recording.remove(&self.id);
+    }
+}
+
 /// Clears `retrying` when the retry ends, even by a panic.
 struct Retrying<'a>(&'a AtomicBool);
 
@@ -385,6 +415,9 @@ struct Inner {
     adopter: Mutex<Option<Adopter>>,
     /// Sessions whose exit this app has recorded, newest last.
     ended: Mutex<VecDeque<String>>,
+    /// Sessions whose exit a reporter is recording now: the claim
+    /// `record_exit` makes before it runs any bookkeeping.
+    recording: Mutex<HashSet<String>>,
     /// Every session the host holds has a proxy here: set once a connection
     /// has listed them. Until then, whether a run's terminal is held is not
     /// known, and is answered as held.
@@ -395,6 +428,10 @@ struct Inner {
     leaving: AtomicBool,
     /// What is wrong with the host, said plainly, when something is.
     trouble: Mutex<Vec<String>>,
+    /// Run once by `adopt`, between its scan of `proxies` and its read of
+    /// `vouched.late`, so a test can confirm a spawn exactly there.
+    #[cfg(test)]
+    adopt_seam: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// The app's handle on the terminal host. Cheap to clone.
@@ -416,11 +453,14 @@ impl HostClient {
                 events: Mutex::default(),
                 adopter: Mutex::default(),
                 ended: Mutex::default(),
+                recording: Mutex::default(),
                 adopted: AtomicBool::new(false),
                 limit: AtomicUsize::new(0),
                 stall_ms: AtomicU64::new(0),
                 leaving: AtomicBool::new(false),
                 trouble: Mutex::default(),
+                #[cfg(test)]
+                adopt_seam: Mutex::default(),
             }),
         }
     }
@@ -935,6 +975,15 @@ impl Inner {
         lock(&self.events).clone()
     }
 
+    /// Runs the test's hook, if one is set, holding no lock.
+    #[cfg(test)]
+    fn adopt_seam(&self) {
+        let seam = lock(&self.adopt_seam).take();
+        if let Some(seam) = seam {
+            seam();
+        }
+    }
+
     fn adopt_observer(&self, run_id: &str) -> Option<Arc<dyn SessionObserver>> {
         let adopter = lock(&self.adopter).clone()?;
         adopter(run_id)
@@ -1185,16 +1234,47 @@ impl Inner {
             }
             Err(error) => Some(error),
         };
-        let confirmed_meanwhile = lock(&self.vouched).late.clone();
-        let gone: Vec<String> = lock(&self.proxies)
+        // A proxy is ended here only if the host neither listed it nor
+        // confirmed it nor reported its exit. The order of the next two reads
+        // is the guard, and must not be swapped; `late` and `exited` are read
+        // together, in one `vouched` critical section, after the scan.
+        //
+        // `spawn` runs, in this program order: (A) under `vouched`, remove
+        // `starting`, and unless `exited` already holds the id, insert it in
+        // `held` and, while `adopting`, in `late`; unlock; (B) under `proxies`,
+        // clear `proxy.starting` and take any deferred exit; unlock; (C) record
+        // that deferred exit. So a scan that sees a proxy not `starting` has
+        // seen B, and through the `proxies` mutex A happens-before the later
+        // `vouched` read: the id is then in `late`, or in `exited` (A skipped
+        // it because the host had reported its exit, which C records), unless
+        // it has since left one of them. Between A and the read `late` loses
+        // an id only through `note_ended`, which puts it in `exited` first;
+        // the window that clears `late` is this `adopt`'s own and stays open
+        // until it returns, and `adopt` runs under the `connecting` lock, so
+        // no other window clears it. `exited` loses an id only once
+        // `REMEMBERED_EXITS` newer exits have pushed it out. A spawn the scan
+        // saw `starting` is not a candidate, and one that began after the scan
+        // has no proxy in it. Skipping `exited` ids matters beyond a spawn: an
+        // exit the host reported is being recorded by its own reporter (B to C
+        // above, or `record_exit` itself), and ending the proxy here would
+        // announce the host's loss in place of the real status.
+        // `record_exit` claims the id (`claim_exit`) before it runs, so were
+        // both to run, the bookkeeping and the announcement still happen once,
+        // and the later one touches neither the proxy nor the host.
+        let unaccounted: Vec<String> = lock(&self.proxies)
             .iter()
-            .filter(|(id, p)| {
-                !p.starting
-                    && !confirmed_meanwhile.contains(*id)
-                    && !listed.iter().any(|l| &l.id == *id)
-            })
+            .filter(|(id, p)| !p.starting && !listed.iter().any(|l| &l.id == *id))
             .map(|(id, _)| id.clone())
             .collect();
+        #[cfg(test)]
+        self.adopt_seam();
+        let gone: Vec<String> = {
+            let vouched = lock(&self.vouched);
+            unaccounted
+                .into_iter()
+                .filter(|id| !vouched.late.contains(id) && !vouched.exited.contains(id))
+                .collect()
+        };
         for id in gone {
             let run_id = lock(&self.proxies).get(&id).and_then(|p| p.run_id.clone());
             self.record_exit(WireEnded {
@@ -1329,9 +1409,38 @@ impl Inner {
         }
     }
 
+    /// The one place `record_exit` decides who records an exit. Under the
+    /// `recording` lock, with `ended` read inside it, an id is exactly one of
+    /// in flight, recorded or unclaimed; the claim moves it from in flight to
+    /// recorded (in that lock order) when dropped, even by a panic. In-flight
+    /// ids are not part of `ended`'s bound: only recorded ones are pushed out
+    /// of it, so a claim in progress is never forgotten and a late report of
+    /// it is always recognised.
+    fn claim_exit(&self, id: &str) -> ExitClaim<'_> {
+        let mut recording = lock(&self.recording);
+        if recording.contains(id) {
+            return ExitClaim::Recording;
+        }
+        if lock(&self.ended).iter().any(|recorded| recorded == id) {
+            return ExitClaim::Recorded;
+        }
+        recording.insert(id.to_owned());
+        ExitClaim::Mine(Recording {
+            inner: self,
+            id: id.to_owned(),
+        })
+    }
+
     /// Records one session's exit: its run's receipt, the incident record and
-    /// `terminal-exit`, then lets the host forget it. Called once per session;
-    /// a second report of the same exit only clears the host's copy.
+    /// `terminal-exit`, then lets the host forget it. The bookkeeping runs for
+    /// one report per session: the first reporter claims the id (see
+    /// `claim_exit`) before it runs anything. A second report that arrives
+    /// while the first is still recording returns at once, touching neither
+    /// the proxy nor the host: the first reporter removes the proxy and sends
+    /// the host's `Forget` itself, after its run's receipt is written, so a
+    /// copy the host drops early cannot outlive an exit that was never
+    /// recorded. A second report that arrives after the first is done only
+    /// clears the host's copy.
     fn record_exit(&self, ended: WireEnded) {
         let id = ended.payload.id.clone();
         self.note_ended(&id);
@@ -1342,16 +1451,22 @@ impl Inner {
                 return;
             }
         }
-        let already = lock(&self.ended).contains(&id);
-        if !already {
-            let (observer, slot) = {
-                let proxies = lock(&self.proxies);
-                let proxy = proxies.get(&id);
-                (
-                    proxy.and_then(|p| p.observer.clone()),
-                    proxy.filter(|p| !p.end_sent).map(|p| p.output.clone()),
-                )
-            };
+        // Taken before the claim, so the winner has them whatever a loser does
+        // to the proxy afterwards.
+        let (observer, slot) = {
+            let proxies = lock(&self.proxies);
+            let proxy = proxies.get(&id);
+            (
+                proxy.and_then(|p| p.observer.clone()),
+                proxy.filter(|p| !p.end_sent).map(|p| p.output.clone()),
+            )
+        };
+        let (mine, _recording) = match self.claim_exit(&id) {
+            ExitClaim::Recording => return,
+            ExitClaim::Recorded => (false, None),
+            ExitClaim::Mine(recording) => (true, Some(recording)),
+        };
+        if mine {
             let observer = observer.or_else(|| {
                 ended
                     .run_id
@@ -1365,13 +1480,6 @@ impl Inner {
                     catch_unwind(AssertUnwindSafe(|| observer.finished(&ended.payload)))
                 {
                     crate::supervisor::note_stopped("terminal observer panic", panic.as_ref());
-                }
-            }
-            {
-                let mut remembered = lock(&self.ended);
-                remembered.push_back(id.clone());
-                while remembered.len() > REMEMBERED_EXITS {
-                    remembered.pop_front();
                 }
             }
             lock(&self.proxies).remove(&id);
@@ -1399,6 +1507,8 @@ impl Inner {
         } else {
             lock(&self.proxies).remove(&id);
         }
+        // `_recording` is dropped after this: the exit counts as recorded only once
+        // the host has been told to forget it.
         if let Some(conn) = self.current() {
             if let Err(error) = conn.send(Request::Forget { session: id }, &[], None) {
                 log::warn!(target: "terminal", "a recorded exit stays in the host for the next connect: {error}");

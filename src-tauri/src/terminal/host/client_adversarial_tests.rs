@@ -39,6 +39,8 @@ struct Shared {
     /// Lists and receipts answered (or begun), across connections.
     lists: AtomicUsize,
     receipts: AtomicUsize,
+    /// `Forget` requests received: exits the app has finished with.
+    forgets: AtomicUsize,
     /// Only a spawn is left unanswered.
     hang_spawn: AtomicBool,
     /// The next receipts request is answered with an error.
@@ -214,7 +216,11 @@ fn serve(stream: UnixStream, writer: Writer, shared: &Shared) {
             return;
         };
         let answer: Result<serde_json::Value, String> = match request {
-            Request::Limit { .. } | Request::Stall { .. } | Request::Forget { .. } => continue,
+            Request::Limit { .. } | Request::Stall { .. } => continue,
+            Request::Forget { .. } => {
+                shared.forgets.fetch_add(1, Ordering::AcqRel);
+                continue;
+            }
             Request::Hello { .. } => {
                 let delay = shared.hello_delay_ms.load(Ordering::Acquire);
                 if delay > 0 {
@@ -965,6 +971,128 @@ fn a_spawn_confirmed_while_the_adoption_is_listing_is_still_vouched_for() {
     );
 }
 
+/// Session events that keep the ids of the exits they were handed.
+#[derive(Default)]
+struct ExitLog {
+    exits: Mutex<Vec<(String, Option<String>)>>,
+}
+
+impl SessionEvents for ExitLog {
+    fn loss(&self, _: TerminalLossPayload) {}
+    fn notice(&self, _: crate::alerts::Notice) {}
+    fn scan_drops(&self, _: u64) {}
+    fn exit(&self, ended: SessionEnded) {
+        self.exits
+            .lock()
+            .unwrap()
+            .push((ended.payload.id, ended.payload.error));
+    }
+}
+
+impl ExitLog {
+    fn ended(&self, id: &str) -> bool {
+        self.exits
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(ended, _)| ended == id)
+    }
+}
+
+/// Makes `adopt` run `during` between its scan of the proxies and its read of
+/// the spawns confirmed meanwhile, on the adopting thread, holding no lock.
+fn at_the_seam(host: &HostClient, during: impl FnOnce() + Send + 'static) {
+    *lock(&host.inner.adopt_seam) = Some(Box::new(during));
+}
+
+/// A spawn the host confirms exactly between `adopt`'s two reads of what it
+/// has confirmed: the proxy scan and the copy of `vouched.late`. Whichever
+/// comes second is the one that can miss it, so the order is the whole of the
+/// guard: copying `late` first lets the spawn finish (its proxy no longer
+/// `starting`) after the copy and before the scan, and the `gone` pass ends a
+/// live session with `HOST_ENDED`; scanning first, the scan either sees it
+/// `starting` or sees it done, and a proxy seen done was put in `late` first.
+///
+/// Reliable by construction: the spawn runs on the adopting thread at the seam.
+#[test]
+fn a_spawn_confirmed_between_the_two_reads_of_an_adoption_is_not_ended() {
+    let fake = FakeHost::start(&[]);
+    fake.shared.spawn_ok.store(true, Ordering::Release);
+    let app = fixture(fake.config());
+    let host = the_client(&app);
+    let log = Arc::new(ExitLog::default());
+    host.set_events(log.clone());
+    let spawning = host.clone();
+    let spawned_events = log.clone();
+    at_the_seam(&host, move || {
+        spawning
+            .spawn(
+                spawned_events,
+                spawn_request("term-9-race"),
+                nowhere(),
+                None,
+            )
+            .unwrap();
+    });
+
+    app.sessions.connect_host().unwrap();
+
+    assert!(
+        lock(&host.inner.proxies).contains_key("term-9-race"),
+        "the spawn the host confirmed during the adoption lost its proxy"
+    );
+    assert!(
+        !log.ended("term-9-race"),
+        "the adoption ended a live session the host had just confirmed: {:?}",
+        log.exits.lock().unwrap()
+    );
+    assert!(app.host.knows("term-9-race"));
+}
+
+/// The same seam, on a reconnect that has a genuinely vanished session to end:
+/// the spawn confirmed at the seam survives and the session the host no longer
+/// holds is still ended as `HOST_ENDED`. The fix narrows the `gone` pass; it
+/// does not switch it off.
+#[test]
+fn an_adoption_with_a_spawn_at_the_seam_still_ends_the_session_the_host_lost() {
+    let fake = FakeHost::start(&[("term-9-old", None)]);
+    fake.shared.spawn_ok.store(true, Ordering::Release);
+    let app = fixture(fake.config());
+    let host = the_client(&app);
+    let log = Arc::new(ExitLog::default());
+    host.set_events(log.clone());
+    app.sessions.connect_host().unwrap();
+    assert!(app.host.knows("term-9-old"), "the first adoption listed it");
+
+    let spawning = host.clone();
+    let spawned_events = log.clone();
+    at_the_seam(&host, move || {
+        spawning
+            .spawn(spawned_events, spawn_request("term-9-new"), nowhere(), None)
+            .unwrap();
+    });
+    fake.forget("term-9-old");
+    fake.drop_connections();
+    until("the lost session ended", Duration::from_secs(10), || {
+        log.ended("term-9-old")
+    });
+
+    let exits = log.exits.lock().unwrap().clone();
+    assert_eq!(
+        exits
+            .iter()
+            .find(|(id, _)| id == "term-9-old")
+            .and_then(|(_, error)| error.as_deref()),
+        Some(crate::terminal::host::receipts::HOST_ENDED),
+        "the session the host lost is ended as the host's loss"
+    );
+    assert!(
+        !log.ended("term-9-new"),
+        "the spawn confirmed at the seam was ended with it: {exits:?}"
+    );
+    assert!(app.host.knows("term-9-new"));
+}
+
 /// The app quits while a connect is in flight (the hello is slow). `disconnect`
 /// finds no connection to close and revokes; the connect then stores its
 /// connection (client.rs `connect` does not look at `leaving` again), lists,
@@ -1333,3 +1461,6 @@ fn a_hundred_threads_ask_through_failing_listings_and_their_retries() {
     let worst = Duration::from_micros(worst.load(Ordering::Acquire));
     assert!(worst < PROMPT, "the slowest check took {worst:?}");
 }
+
+#[path = "adv_w3a_tests.rs"]
+mod adv_w3a;
