@@ -4,7 +4,9 @@
 //!
 //! `cargo bench --bench adv_w4b_fork_aftermath` (macOS only; the rest prints why
 //! there is nothing to measure). `ADV_RESIDENT_MIB` sets the block the parent
-//! holds (default 128).
+//! holds (default 128); `ADV_VM_ENTRIES` adds that many unmergeable regions;
+//! `ADV_NO_BG` makes every "background" spawn a plain
+//! foreground one, the control for whether the fork is what slows the rest.
 //!
 //! Rounds are interleaved, one of each per round, so drift hits every series
 //! alike. Every series times only the `procguard::spawn` call of a foreground
@@ -29,8 +31,40 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(128);
+    // With `ADV_NO_BG` set the background spawns are replaced by foreground
+    // ones: the same binary and the same schedule of spawns, with no fork.
+    let no_bg = std::env::var_os("ADV_NO_BG").is_some();
     let resident = vec![7u8; mib * 1024 * 1024];
     std::hint::black_box(&resident);
+    // `ADV_VM_ENTRIES` separate 16 KiB regions, each followed by a PROT_NONE
+    // guard page so the kernel cannot merge them: `fork` copies the address
+    // space entry by entry, and a GUI process has thousands (frameworks,
+    // allocator zones, thread stacks) where one big block is a single entry.
+    let entries: usize = std::env::var("ADV_VM_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let mut fragments = Vec::with_capacity(entries);
+    for _ in 0..entries {
+        // SAFETY: anonymous private mappings, never unmapped before exit; the
+        // first page of each is written so it is resident.
+        unsafe {
+            let size = 5 * 4096;
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            );
+            assert_ne!(p, libc::MAP_FAILED);
+            std::ptr::write_volatile(p.cast::<u8>(), 1);
+            libc::mprotect(p.cast::<u8>().add(4 * 4096).cast(), 4096, libc::PROT_NONE);
+            fragments.push(p as usize);
+        }
+    }
+    std::hint::black_box(&fragments);
 
     let trivial = || {
         let mut cmd = Command::new("/usr/bin/true");
@@ -42,7 +76,7 @@ fn main() {
     let spawn_timed = |background: bool| -> Duration {
         let mut cmd = trivial();
         let started = Instant::now();
-        let (mut child, registration) = if background {
+        let (mut child, registration) = if background && !no_bg {
             procguard::spawn_background(&mut cmd, "bench")
         } else {
             procguard::spawn(&mut cmd, "bench")
@@ -53,6 +87,46 @@ fn main() {
         spawned
     };
 
+    // `ADV_CONTEND=n`: n threads spawn background children back to back while
+    // this thread times the whole `procguard::spawn` call of a foreground
+    // child (lock wait included), the latency a user action sees when it
+    // starts a git command beside background work.
+    if let Some(threads) = std::env::var("ADV_CONTEND")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut waits = Vec::with_capacity(ROUNDS);
+        let background_spawns = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        spawn_timed(true);
+                        background_spawns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                });
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            for _ in 0..ROUNDS {
+                waits.push(spawn_timed(false));
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        waits.sort_unstable();
+        println!(
+            "\nforeground spawn call beside {threads} threads of background spawns, {} entries, {mib} MiB held\n\
+             min {:.3?}  p50 {:.3?}  p95 {:.3?}  max {:.3?}  ({} background spawns completed)",
+            entries,
+            waits[0],
+            waits[waits.len() / 2],
+            waits[waits.len() * 95 / 100],
+            waits[waits.len() - 1],
+            background_spawns.load(std::sync::atomic::Ordering::Relaxed)
+        );
+        return;
+    }
     let mut fg_after_fg = Vec::with_capacity(ROUNDS);
     let mut fg_after_bg = Vec::with_capacity(ROUNDS);
     let mut fg_after_bg_later = Vec::with_capacity(ROUNDS);
