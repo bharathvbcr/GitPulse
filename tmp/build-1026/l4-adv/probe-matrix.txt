@@ -1,0 +1,6 @@
+drain=none test=alerts::bridge::tests::a_restart_retires_the_old_loop_without_unlinking_the_new_socket pass=0 fail=3 of 3
+drain=drain_noop test=alerts::bridge::tests::a_restart_retires_the_old_loop_without_unlinking_the_new_socket pass=3 fail=0 of 3
+drain=none test=alerts::bridge::tests::an_idle_accept_loop_does_not_wake pass=3 fail=0 of 3
+drain=drain_noop test=alerts::bridge::tests::an_idle_accept_loop_does_not_wake pass=3 fail=0 of 3
+drain=none test=alerts::bridge::tests::a_flood_of_connections_neither_blocks_nor_grows_without_bound pass=3 fail=0 of 3
+drain=drain_noop test=alerts::bridge::tests::a_flood_of_connections_neither_blocks_nor_grows_without_bound pass=3 fail=0 of 3

@@ -2659,6 +2659,8 @@ mod tests {
     }
 
     #[cfg(unix)]
+    mod adv_l4_tests;
+    #[cfg(unix)]
     mod adv_tests;
     #[cfg(unix)]
     mod order_tests;

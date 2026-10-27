@@ -1,0 +1,4 @@
+== h36: 36 hogs, 30.68 26.45 22.25
+hooks_5mib: pass=10 fail=0 of 10  load=59.05 33.40 24.88
+docs_rebuild: pass=10 fail=0 of 10  load=155.91 76.46 42.92
+w3l2_module: pass=28 fail=2 of 30  load=107.51 86.00 50.92

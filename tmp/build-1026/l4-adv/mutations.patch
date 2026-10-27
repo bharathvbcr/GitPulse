@@ -1,0 +1,91 @@
+diff --git a/src-tauri/src/alerts/intake.rs b/src-tauri/src/alerts/intake.rs
+index 6b817c31..8b8e9cd5 100644
+--- a/src-tauri/src/alerts/intake.rs
++++ b/src-tauri/src/alerts/intake.rs
+@@ -433,6 +433,9 @@ impl Intake {
+         stamp: u64,
+         now: std::time::Instant,
+     ) -> Offer {
++        if notice.event == Some("turn_finished") && std::env::var("L4_MUT").as_deref() == Ok("order_drop") {
++            return Offer::Accepted;
++        }
+         if notice.origin == Origin::Hook {
+             if let Some(refused) = self.screen(&notice, stamp, now) {
+                 return refused;
+@@ -492,6 +495,9 @@ impl Intake {
+     /// that empties it cannot disturb another test's reports.
+     #[cfg(all(test, unix))]
+     pub(super) fn exhaust_outside_bucket(&self) -> bool {
++        if std::env::var("L4_MUT").as_deref() == Ok("drain_noop") {
++            return true;
++        }
+         let mut limits = self
+             .limits
+             .lock()
+@@ -520,7 +526,7 @@ impl Intake {
+             self.counters.stale.fetch_add(1, Ordering::Relaxed);
+             return Some(Offer::Stale);
+         }
+-        let outside = notice.key.starts_with("hook-");
++        let outside = notice.key.starts_with("hook-") || std::env::var("L4_MUT").as_deref() == Ok("outside_all");
+         if !outside
+             && self
+                 .host
+diff --git a/src-tauri/src/docs/mod.rs b/src-tauri/src/docs/mod.rs
+index c5d5e18e..1ce98f50 100644
+--- a/src-tauri/src/docs/mod.rs
++++ b/src-tauri/src/docs/mod.rs
+@@ -235,6 +235,9 @@ fn load_vault(repo_path: &str, force: bool) -> Result<Arc<CachedVault>, String>
+     use std::sync::atomic::Ordering;
+     let repo = validate_repo(repo_path)?;
+     let slot = vault_slot(&repo);
++    if !force && std::env::var("L4_MUT").as_deref() == Ok("docs_block") {
++        drop(slot.build.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
++    }
+     if !force {
+         if let Some(value) = slot.current() {
+             return Ok(value);
+diff --git a/src-tauri/src/engine/git_cli.rs b/src-tauri/src/engine/git_cli.rs
+index df01b196..a7f1c084 100644
+--- a/src-tauri/src/engine/git_cli.rs
++++ b/src-tauri/src/engine/git_cli.rs
+@@ -5297,7 +5297,11 @@ fn run_admitted_inner(
+     // logged and the child carries on at normal priority: failing a read
+     // because it could not be demoted would trade a result for a hint.
+     if runs_in_background_band(class) {
+-        note_band_outcome(label, crate::procguard::enter_background_band(&child));
++        match std::env::var("L4_MUT").as_deref() {
++            Ok("band_skip") => {}
++            Ok("band_fake") => note_band_outcome(label, Ok(crate::procguard::BandOutcome::Entered)),
++            _ => note_band_outcome(label, crate::procguard::enter_background_band(&child)),
++        }
+     }
+     #[cfg(test)]
+     spawn_log::record(cmd);
+diff --git a/src-tauri/src/hooks/notify_input.rs b/src-tauri/src/hooks/notify_input.rs
+index 8773d75d..56654059 100644
+--- a/src-tauri/src/hooks/notify_input.rs
++++ b/src-tauri/src/hooks/notify_input.rs
+@@ -181,6 +181,11 @@ impl<'de> Visitor<'de> for Kept {
+ /// The fields `notify` uses, out of `bytes`, accepting and refusing what the
+ /// whole-document parse did.
+ pub(super) fn kept_fields(bytes: &[u8]) -> Result<HookInput, String> {
++    if std::env::var("L4_MUT").as_deref() == Ok("hooks_parse_slow") {
++        let mut acc = 0u64;
++        for _ in 0..150 { for b in bytes { acc = acc.wrapping_add(u64::from(*b)); } }
++        std::hint::black_box(acc);
++    }
+     let text = std::str::from_utf8(bytes).map_err(|e| format!("hook stdin is not UTF-8: {e}"))?;
+     let mut de = serde_json::Deserializer::from_str(text.trim());
+     let value = de
+@@ -222,6 +227,10 @@ pub fn read_notify_input_within(
+             );
+             return Ok(HookInput::default());
+         }
++        if std::env::var("L4_MUT").as_deref() == Ok("hooks_reader_slow") {
++            let t = std::time::Instant::now();
++            while t.elapsed() < Duration::from_millis(1200) { std::hint::black_box(0u8); }
++        }
+         kept_fields(&bytes)
+     })
+     .ok_or_else(|| "hook stdin deadline exceeded or reader could not run; no report".to_string())?

@@ -1,0 +1,16 @@
+HELD mut=ctrl test=hooks::notify_input_attack_tests::a_five_mib_tool_input_costs_well_under_the_hook_timeout rc=0 secs=2 expect=pass
+HELD mut=ctrl test=docs::tests::a_docs_query_during_a_rebuild_answers_from_the_previous_snapshot rc=0 secs=4 expect=pass
+HELD mut=ctrl test=alerts::bridge::tests::order_tests::sequential_hook_reports_from_one_session_are_never_reordered rc=0 secs=0 expect=pass
+HELD mut=ctrl test=alerts::bridge::tests::a_report_that_names_a_session_is_not_limited_by_the_outside_bucket rc=0 secs=0 expect=pass
+HELD mut=ctrl test=adv_w3l2_tests::adv_flake_timeline_time_to_demotion rc=0 secs=1 expect=pass
+HELD mut=ctrl test=adv_w3l2_tests::adv_band_survives_exec rc=0 secs=0 expect=pass
+HELD mut=hooks_parse_slow test=hooks::notify_input_attack_tests::a_five_mib_tool_input_costs_well_under_the_hook_timeout rc=101 secs=1 expect=fail
+BREAK mut=hooks_reader_slow test=hooks::notify_input_attack_tests::a_five_mib_tool_input_costs_well_under_the_hook_timeout rc=0 secs=2 expect=fail
+HELD mut=docs_block test=docs::tests::a_docs_query_during_a_rebuild_answers_from_the_previous_snapshot rc=101 secs=64 expect=fail
+HELD mut=order_drop test=alerts::bridge::tests::order_tests::sequential_hook_reports_from_one_session_are_never_reordered rc=101 secs=141 expect=fail
+HELD mut=outside_all test=alerts::bridge::tests::a_report_that_names_a_session_is_not_limited_by_the_outside_bucket rc=101 secs=0 expect=fail
+BREAK mut=drain_noop test=alerts::bridge::tests::a_report_that_names_a_session_is_not_limited_by_the_outside_bucket rc=0 secs=0 expect=fail
+HELD mut=band_skip test=adv_w3l2_tests::adv_flake_timeline_time_to_demotion rc=101 secs=1 expect=fail
+HELD mut=band_skip test=adv_w3l2_tests::adv_band_survives_exec rc=101 secs=2 expect=fail
+HELD mut=band_fake test=adv_w3l2_tests::adv_flake_timeline_time_to_demotion rc=101 secs=1 expect=fail
+HELD mut=band_fake test=adv_w3l2_tests::adv_band_survives_exec rc=101 secs=2 expect=fail

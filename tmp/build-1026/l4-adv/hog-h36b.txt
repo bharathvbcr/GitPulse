@@ -1,0 +1,5 @@
+== h36b: 36 hogs, 83.88 70.75 56.88
+order_seq: pass=20 fail=0 of 20  load=85.65 71.33 57.17
+alerts_module: pass=4 fail=1 of 5  load=86.40 83.33 78.47
+vite_watch: pass=10 fail=0 of 10  load=107.17 89.12 80.92
+vendor_crates: pass=10 fail=0 of 10  load=130.89 103.58 87.41

@@ -1,0 +1,5 @@
+BASE_git_hangs: after 70 s vitest alive=yes; distinct hung git shims seen:        5 ( 32011 34394 36453 37625 39103)
+NEW_git_hangs: after 70 s vitest alive=yes; distinct hung git shims seen:        1 ( 42903)
+ M src-tauri/src/alerts/bridge.rs
+ M src-tauri/src/engine/git_cli.rs
+?? src-tauri/src/alerts/bridge/tests/adv_l4_tests.rs
