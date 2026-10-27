@@ -63,7 +63,10 @@ fn adv_w3c_a_prev_that_is_a_symlink_to_dev_zero_is_an_error_not_a_read() {
     std::os::unix::fs::symlink("/dev/zero", prev_path(&record_path(&socket))).unwrap();
     let started = std::time::Instant::now();
     let report = read_record(&socket, NOW);
-    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert!(
+        started.elapsed()
+            < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(2))
+    );
     assert_eq!(report.missed, 1, "the readable generation still counts");
     let error = report.error.expect("an unreadable generation is an error");
     assert!(error.contains("count may be too low"), "{error}");
@@ -97,7 +100,8 @@ fn adv_w3c_a_sparse_gigabyte_record_is_reported_without_being_read() {
     let started = std::time::Instant::now();
     let report = read_record(&socket, NOW);
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(2),
+        started.elapsed()
+            < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(2)),
         "{:?}",
         started.elapsed()
     );

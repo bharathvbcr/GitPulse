@@ -9,6 +9,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use gitpulse_lib::alerts::bridge::{SESSION_ENV, SOCKET_ENV};
 use gitpulse_lib::procguard::LockedSpawn;
 use std::io::Write;
@@ -164,16 +166,19 @@ fn adv_w3c_an_unwritable_record_changes_neither_exit_code_stdout_nor_the_stderr_
         "{}",
         refused.stderr
     );
+    // The log line leads with a one-second timestamp, and the two runs are
+    // ~300 ms apart, so about a third of the time they straddle a second
+    // boundary. The head is compared without it.
     let head = |text: &str| {
-        text.split("scope this_process")
-            .next()
-            .unwrap_or("")
+        let line = text.split("scope this_process").next().unwrap_or("");
+        line.split_once(' ')
+            .map_or(line, |(_, rest)| rest)
             .to_owned()
     };
     assert_eq!(head(&recorded.stderr), head(&refused.stderr));
     // Inside the hook's own budget: 300 ms for the wait plus process start.
     assert!(
-        refused.elapsed < Duration::from_secs(3),
+        refused.elapsed < common::env::coverage_relaxed(Duration::from_secs(3)),
         "{:?}",
         refused.elapsed
     );

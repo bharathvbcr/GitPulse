@@ -11,9 +11,12 @@ use std::time::{Duration, Instant};
 fn held_the_clock_is_there_on_macos_and_linux_for_every_thread() {
     assert!(try_thread_cpu().is_some());
     assert!(clock_or_skip("adv", try_thread_cpu()).is_some());
-    let fresh = std::thread::spawn(|| clock_or_skip("adv", try_thread_cpu()))
-        .join()
-        .unwrap();
+    let fresh = std::thread::scope(|scope| {
+        scope
+            .spawn(|| clock_or_skip("adv", try_thread_cpu()))
+            .join()
+            .unwrap()
+    });
     assert!(fresh.is_some(), "a fresh thread has no clock reading");
 }
 
@@ -35,9 +38,12 @@ fn held_the_reading_is_cpu_time_not_wall_time() {
         slept < Duration::from_millis(100),
         "a sleeping thread used {slept:?} of CPU"
     );
+    // How long to burn CPU, not a limit under test: the assertion below is on
+    // the CPU the spin was charged, so the spin is not stretched for load.
+    let spin = Duration::from_millis(120);
     let wall = Instant::now();
     let mut x = 0u64;
-    while wall.elapsed() < Duration::from_millis(120) {
+    while wall.elapsed() < spin {
         x = std::hint::black_box(x.wrapping_add(1));
     }
     let spun = cpu_since(start) - slept;

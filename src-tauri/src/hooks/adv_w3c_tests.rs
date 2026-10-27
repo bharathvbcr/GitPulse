@@ -7,6 +7,7 @@
 
 use super::notify_drops::{record_path, DropRecord, NotifyDrops};
 use super::*;
+use crate::procguard::LockedSpawn;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -96,7 +97,10 @@ fn adv_w3c_a_directory_at_the_records_name_keeps_the_error_and_the_count() {
     let reason = DropRecord::with_clock(fixed_clock)
         .append(&socket, "session_ended", None)
         .expect_err("a directory is not a record");
-    assert!(started.elapsed() < Duration::from_secs(2), "{reason}");
+    assert!(
+        started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)),
+        "{reason}"
+    );
     let drops = recording();
     let error = miss(&socket, &drops, "session_ended", "term-4-1").expect_err("no reply");
     let text = error.to_string();
@@ -236,9 +240,9 @@ fn adv_w3c_child_appender() {
 
 /// Processes, not threads: the hook is one process per event, so the append
 /// has to be whole across address spaces. The children are this test binary
-/// re-run on one test, with no socket or descriptor to keep from them, so the
-/// inheritance lock `procguard::spawn` takes buys nothing here.
-#[allow(clippy::disallowed_methods)]
+/// re-run on one test, with no socket or descriptor to keep from them; the
+/// spawn still goes through `LockedSpawn`, so another test's pipe is never
+/// held open by one of these children.
 #[test]
 fn adv_w3c_separate_processes_appending_yield_that_many_whole_lines() {
     const PROCESSES: usize = 8;
@@ -256,7 +260,7 @@ fn adv_w3c_separate_processes_appending_yield_that_many_whole_lines() {
                 .env(CHILD_SOCKET, &socket)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
-                .spawn()
+                .spawn_locked()
                 .expect("spawn child")
         })
         .collect();
