@@ -37,10 +37,23 @@
 //!   [`HOOK_STOP_BYTES`]: at or over it the append is skipped and the stderr
 //!   line says so, so a record nobody rotates stays bounded. A generation at
 //!   that size means later misses were not recorded, and the reader says the
-//!   count is a lower bound rather than showing it as complete.
+//!   count is a lower bound rather than showing it as complete. The misses
+//!   went unrecorded until the capped file stopped being the one hooks append
+//!   to, so a capped `.prev` stops being said once its status-change time (the
+//!   rotation's own rename sets it; the modification time would be the start
+//!   of the gap) is older than the window. A capped current file is said for
+//!   as long as it is current, and a time the platform cannot give is "still
+//!   inside".
 //!
 //! The record is a user-private file (mode 0600, no secrets, no payload) that
-//! only the hook writes and only the app reads. Nothing here is a transport:
+//! only the hook writes and only the app reads. A record already there keeps
+//! the mode it was made with, so whoever opens one they own (the hook to
+//! append, the reader to read, each through the handle it opened) brings it to
+//! 0600; a record another user owns is not appended to, and is counted as
+//! unrecorded like any other write that failed. The rotation lock is the app's
+//! own file and is opened through `fs_entry::open_private_record`, which
+//! refuses a wider one outright rather than tightening it, as it does for the
+//! other records that helper serves. Nothing here is a transport:
 //! a miss is a fact about the hook's wait, not a delivery verdict, which is why
 //! the app's line about it never says "lost".
 
@@ -193,8 +206,42 @@ pub(crate) fn lock_path(record: &Path) -> PathBuf {
 
 #[cfg(unix)]
 fn append_to(path: &Path, line: &[u8]) -> Result<(), String> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    append_owned_by(path, line, unsafe { libc::geteuid() })
+}
+
+/// Tightens `file`, already opened and checked to be ours, to 0600 when it is
+/// open to group or others. `fchmod` on the handle, never `chmod` on the path:
+/// what was checked is what is changed, whatever the name points at by now.
+#[cfg(unix)]
+fn tighten_if_wide(
+    file: &std::fs::File,
+    meta: &std::fs::Metadata,
+    path: &Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if meta.mode() & 0o077 == 0 {
+        return Ok(());
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| {
+            format!(
+                "{} is accessible to other users (mode {:o}) and could not be tightened: {error}",
+                path.display(),
+                meta.mode() & 0o777
+            )
+        })
+}
+
+/// [`append_to`] for a record that must be owned by `owner`. A record already
+/// there keeps the mode it was made with, so the one opened here is brought to
+/// 0600 when it is ours and wider; one another user owns is not written to
+/// (and is not ours to change). A test names another owner, which cannot be
+/// made with `chown` without privilege.
+#[cfg(unix)]
+pub(crate) fn append_owned_by(path: &Path, line: &[u8], owner: u32) -> Result<(), String> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     // `O_NOFOLLOW`: a symlink planted at the record's name is not written
     // through. `O_NONBLOCK`: a FIFO there must not hold the hook's thread in
     // `open`; it is inert for the regular file this is meant to be.
@@ -218,6 +265,14 @@ fn append_to(path: &Path, line: &[u8]) -> Result<(), String> {
     if !meta.is_file() {
         return Err(format!("{} is not a regular file", path.display()));
     }
+    if meta.uid() != owner {
+        return Err(format!(
+            "{} is owned by uid {}, not this user (uid {owner})",
+            path.display(),
+            meta.uid()
+        ));
+    }
+    tighten_if_wide(&file, &meta, path)?;
     if meta.len() >= HOOK_STOP_BYTES {
         return Err(format!(
             "{} is at its {} KiB cap",
@@ -275,15 +330,21 @@ pub(crate) fn read_record(socket: &Path, now_ms: u64) -> DropReport {
     let mut report = DropReport::default();
     let mut newest: Option<(u64, String)> = None;
     let mut capped = false;
-    for path in [&current, &previous] {
+    for (path, is_current) in [(&current, true), (&previous, false)] {
         match read_generation(path) {
             Ok(None) => {}
-            Ok(Some(bytes)) => {
+            Ok(Some(generation)) => {
                 // The hook stops appending here, so every miss after it went
-                // unrecorded: what is counted is a floor, not the number.
-                capped |= bytes.len() as u64 >= HOOK_STOP_BYTES;
+                // unrecorded: what is counted is a floor, not the number. That
+                // lasts until the capped file stops being the one hooks append
+                // to, which is when the rotation renamed it.
+                if generation.bytes.len() as u64 >= HOOK_STOP_BYTES
+                    && gap_can_reach_window(is_current, generation.rotated_ms, cutoff)
+                {
+                    capped = true;
+                }
                 tally(
-                    &String::from_utf8_lossy(&bytes),
+                    &String::from_utf8_lossy(&generation.bytes),
                     cutoff,
                     &mut report.missed,
                     &mut newest,
@@ -311,6 +372,16 @@ pub(crate) fn read_record(socket: &Path, now_ms: u64) -> DropReport {
         report.error = Some(said.join(" "));
     }
     report
+}
+
+/// Whether the misses a capped generation did not record may be inside the
+/// window that starts at `cutoff`. The file the hooks append to is still
+/// losing them, so a capped current one always can. A capped `.prev` lost
+/// them only until it was renamed, and `rotated_ms` is when: older than the
+/// window, nothing it missed can be counted any more. Unknown (a platform that
+/// reports no such time) is "may be", never "is not".
+fn gap_can_reach_window(is_current: bool, rotated_ms: Option<u64>, cutoff: u64) -> bool {
+    is_current || rotated_ms.is_none_or(|rotated| rotated >= cutoff)
 }
 
 fn tally(text: &str, cutoff: u64, missed: &mut u64, newest: &mut Option<(u64, String)>) {
@@ -395,8 +466,38 @@ fn rotate_if_large(current: &Path, previous: &Path) -> Result<(), String> {
     }
 }
 
-/// One generation's bytes; `None` when it is absent.
-fn read_generation(path: &Path) -> Result<Option<Vec<u8>>, String> {
+/// One generation as the reader took it.
+struct Generation {
+    bytes: Vec<u8>,
+    /// Unix milliseconds of the file's last status change. A rename sets it and
+    /// leaves the modification time alone, which stays at the file's last
+    /// append: for a capped file that is when the hooks stopped, the start of
+    /// the unrecorded period, not its end. So for a `.prev` this is when the
+    /// rotation happened, or later if something touched the file since, which
+    /// only ever makes the answer later. `None` where the platform reports no
+    /// such time.
+    rotated_ms: Option<u64>,
+}
+
+/// The file's last status change, from the metadata of the handle read.
+#[cfg(unix)]
+fn status_changed_ms(meta: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let secs = u64::try_from(meta.ctime()).ok()?;
+    let millis = u64::try_from(meta.ctime_nsec()).ok()? / 1_000_000;
+    secs.checked_mul(1000)?.checked_add(millis)
+}
+
+#[cfg(not(unix))]
+fn status_changed_ms(_meta: &std::fs::Metadata) -> Option<u64> {
+    None
+}
+
+/// One generation; `None` when it is absent. A record this user owns that is
+/// open to others is brought to 0600 here too, on the handle just opened: the
+/// hook does it when it next appends, but a record no hook appends to again
+/// (one an older build made, or a `.prev`) would stay as wide as it was made.
+fn read_generation(path: &Path) -> Result<Option<Generation>, String> {
     use std::io::Read;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -425,6 +526,16 @@ fn read_generation(path: &Path) -> Result<Option<Vec<u8>>, String> {
             READ_CAP_BYTES / 1024
         ));
     }
+    // Taken before the mode is changed, which is itself a status change.
+    let rotated_ms = status_changed_ms(&meta);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if meta.uid() == unsafe { libc::geteuid() } {
+            tighten_if_wide(&file, &meta, path)?;
+        }
+    }
     let mut bytes = Vec::new();
     // One past the cap, so a file that grew since the check is still seen as
     // over it rather than read as a prefix.
@@ -438,7 +549,7 @@ fn read_generation(path: &Path) -> Result<Option<Vec<u8>>, String> {
             READ_CAP_BYTES / 1024
         ));
     }
-    Ok(Some(bytes))
+    Ok(Some(Generation { bytes, rotated_ms }))
 }
 
 /// Counts the reports a process gave up on, and carries the sink that writes
@@ -522,3 +633,6 @@ impl NotifyDrops {
 /// The process's own count, which `dispatch` passes in. It writes each miss to
 /// the record. Tests pass their own, which does not unless they say so.
 pub(super) static PROCESS_DROPS: NotifyDrops = NotifyDrops::recording(DropRecord::on_disk());
+
+#[cfg(all(test, unix))]
+mod residue_tests;

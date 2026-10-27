@@ -222,7 +222,7 @@ fn no_shipped_source_lifts_the_spawn_rate_cap() {
 /// `session-spawn-ledger`) and the `bind` calls of the hook suites were found.
 const UNMETERED_ALLOWLIST: &[(&str, &str)] = &[
     ("adv_notify_process.rs", "subprocess-only: drives gitpulse-hook; the library supplies constants and LockedSpawn"),
-    ("adv_w3c_process.rs", "subprocess-only: drives gitpulse-hook; the library supplies alerts::bridge env names, logging::LOG_DIR_ENV and LockedSpawn, none of which reaches git_cli's gate"),
+    ("adv_w3c_process.rs", "subprocess-only, measured: drives gitpulse-hook; the library supplies alerts::bridge env names, logging::LOG_DIR_ENV and LockedSpawn, and with the gate instrumented the suite made 0 metered spawns (mcp_background_wait, run beside it as the control, made 121)"),
     ("adv_w6l4_ascii_oracle.rs", "no git spawn: pure parsers (github::parse_github_remote_url, tasks::scan_briefs)"),
     ("agent_notify_socket.rs", "subprocess-only: the socket protocol against built binaries; alerts::bridge parsers"),
     ("ai_transport_integration.rs", "no git spawn: ai::http URL parsing"),

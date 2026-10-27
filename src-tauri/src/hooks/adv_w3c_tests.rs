@@ -175,11 +175,13 @@ fn adv_w3c_every_event_with_a_maximal_session_key_fits_one_short_line() {
     }
 }
 
-/// Characterizes (does not judge) what the ruling's "mode 0600" means for a
-/// record that already exists with a wider mode: the mode argument of `open`
-/// applies at creation only, so the hook appends to it and leaves it alone.
+/// What the ruling's "mode 0600" means for a record that already exists with a
+/// wider mode. The mode argument of `open` applies at creation only, so wave 3
+/// characterized the hook as leaving such a record alone (this test then pinned
+/// 0644). ft-f70ee2bb item 1 decided otherwise: the hook brings a record it owns
+/// to 0600 on the handle it opened, and still appends to it.
 #[test]
-fn adv_w3c_an_existing_wide_record_keeps_its_mode_and_still_takes_the_line() {
+fn adv_w3c_an_existing_wide_record_is_tightened_to_0600_and_still_takes_the_line() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("hook.sock");
     std::fs::write(record_path(&socket), b"").unwrap();
@@ -192,7 +194,14 @@ fn adv_w3c_an_existing_wide_record_keeps_its_mode_and_still_takes_the_line() {
         .permissions()
         .mode()
         & 0o777;
-    assert_eq!(mode, 0o644, "the hook neither widened nor narrowed it");
+    assert_eq!(mode, 0o600, "the hook narrowed a record it owns");
+    assert_eq!(
+        std::fs::read_to_string(record_path(&socket))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
 }
 
 /// A record is created 0600 whatever the umask says (a umask can only remove
