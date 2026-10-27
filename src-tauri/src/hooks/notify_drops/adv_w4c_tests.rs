@@ -62,6 +62,8 @@ fn mkfifo(path: &Path, mode: u32) {
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
     // SAFETY: `c` is a valid NUL-terminated path for the call.
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), mode as libc::mode_t) }, 0);
+    // The mode given to mkfifo is masked by the umask; the test wants it exact.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
 /// Sets the BSD file flags on `path`, and clears them again on drop so the
@@ -107,7 +109,8 @@ fn adv_a1_a_name_flipping_to_a_symlink_never_carries_the_chmod_or_the_line_to_th
             let began = std::time::Instant::now();
             // Bounded by time as well, so a panic in the main loop cannot leave
             // this spinning and the scope joining forever.
-            while !stop.load(Ordering::Acquire) && began.elapsed() < Duration::from_secs(30) {
+            let budget = coverage_relaxed(Duration::from_secs(30));
+            while !stop.load(Ordering::Acquire) && began.elapsed() < budget {
                 let staged = dir.path().join(format!("staged-{n}"));
                 if n % 2 == 0 {
                     std::os::unix::fs::symlink(&victim, &staged).unwrap();
