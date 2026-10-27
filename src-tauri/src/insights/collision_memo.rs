@@ -41,7 +41,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -59,7 +59,13 @@ use crate::engine::worktree::{self, changed_paths_within, WorktreeInfo};
 /// `ref_cache`'s 60 s is right for ref listings and far too long for this.
 pub const TTL: Duration = Duration::from_secs(5);
 
-/// Repositories whose listing is kept at once.
+/// Repositories whose listing is kept at once when no changed-path read from
+/// that listing is still cached. A listing is not dropped while one of its
+/// worktrees is still in the read cache ([`MAX_READS`]): the next scan would
+/// pay for `git worktree list` and find `git status` already remembered. Those
+/// listings may outgrow this cap, and they become eligible again when the
+/// read expires or is itself evicted, so the extra listings stay within the
+/// read cache's own bound.
 const MAX_LISTS: usize = 32;
 /// Worktrees whose changed paths are kept at once.
 const MAX_READS: usize = 512;
@@ -98,7 +104,10 @@ impl<T: Clone> Memo<T> {
         }
     }
 
-    fn slot(&self, key: &str) -> Arc<Slot<T>> {
+    /// The slot for `key`. A cached value for which `retain` is true is not
+    /// the eviction victim. When every other slot is retained the map grows
+    /// past `cap` instead of dropping one that is still in use.
+    fn slot_retaining(&self, key: &str, retain: impl Fn(&T) -> bool) -> Arc<Slot<T>> {
         let tick = self.touched.fetch_add(1, Ordering::Relaxed);
         let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((last, slot)) = slots.get_mut(key) {
@@ -106,12 +115,32 @@ impl<T: Clone> Memo<T> {
             return Arc::clone(slot);
         }
         if slots.len() >= self.cap {
-            // The key nobody has asked for longest.
-            if let Some(stale) = slots
-                .iter()
-                .min_by_key(|(_, (last, _))| *last)
-                .map(|(key, _)| key.clone())
-            {
+            let mut victim: Option<(String, u64)> = None;
+            for (other, (last, slot)) in slots.iter() {
+                if other == key {
+                    continue;
+                }
+                let keep = match slot.held.try_lock() {
+                    Ok(held) => match held.as_ref() {
+                        Some((_, value)) => retain(value),
+                        None => false,
+                    },
+                    // A fill in progress is still in use.
+                    Err(TryLockError::WouldBlock) => true,
+                    Err(TryLockError::Poisoned(poisoned)) => match poisoned.into_inner().as_ref() {
+                        Some((_, value)) => retain(value),
+                        None => false,
+                    },
+                };
+                if keep {
+                    continue;
+                }
+                match &victim {
+                    Some((_, oldest)) if last >= oldest => {}
+                    _ => victim = Some((other.clone(), *last)),
+                }
+            }
+            if let Some((stale, _)) = victim {
                 slots.remove(&stale);
             }
         }
@@ -120,6 +149,17 @@ impl<T: Clone> Memo<T> {
         });
         slots.insert(key.to_string(), (tick, Arc::clone(&slot)));
         slot
+    }
+
+    /// True when `key` still holds a value younger than `ttl`. Does not touch
+    /// the slot, so a retention check cannot pin it.
+    fn fresh(&self, key: &str, ttl: Duration) -> bool {
+        let slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some((_, slot)) = slots.get(key) else {
+            return false;
+        };
+        let held = slot.held.lock().unwrap_or_else(PoisonError::into_inner);
+        held.as_ref().is_some_and(|(at, _)| at.elapsed() < ttl)
     }
 
     /// The kept answer while it is younger than `ttl`, else `fill`'s, which is
@@ -131,7 +171,17 @@ impl<T: Clone> Memo<T> {
         ttl: Duration,
         fill: impl FnOnce() -> Result<T, String>,
     ) -> (Result<T, String>, Duration) {
-        let slot = self.slot(key);
+        self.get_or_fill_retaining(key, ttl, fill, |_| false)
+    }
+
+    fn get_or_fill_retaining(
+        &self,
+        key: &str,
+        ttl: Duration,
+        fill: impl FnOnce() -> Result<T, String>,
+        retain: impl Fn(&T) -> bool,
+    ) -> (Result<T, String>, Duration) {
+        let slot = self.slot_retaining(key, retain);
         // Held across the fill: a second caller for this key waits for the
         // first and then finds its answer, which is the single flight.
         let mut held = slot.held.lock().unwrap_or_else(PoisonError::into_inner);
@@ -256,9 +306,14 @@ impl CollisionMemo {
         observation: &live_sessions::Observation,
         oldest: &AtomicU64,
     ) -> (CollisionRisk, Duration) {
-        let (listed, list_age) = self
-            .lists
-            .get_or_fill(key, self.ttl, || worktree::list_worktrees_lite(repo_path));
+        let ttl = self.ttl;
+        let reads = &self.reads;
+        let (listed, list_age) = self.lists.get_or_fill_retaining(
+            key,
+            ttl,
+            || worktree::list_worktrees_lite(repo_path),
+            |list| list.iter().any(|wt| reads.fresh(&wt.path, ttl)),
+        );
         oldest.fetch_max(list_age.as_millis() as u64, Ordering::Relaxed);
         let list = match listed {
             Ok(list) => list,
@@ -337,6 +392,47 @@ mod tests {
 
         memo.forget("a");
         assert_eq!(memo.get_or_fill("a", ttl, || fill(Ok(5))).0, Ok(5));
+    }
+
+    /// One repository past the old listing cap, each with its status read still
+    /// inside [`MAX_READS`]. The pre-fix LRU dropped the first listing and the
+    /// next read spawned `git worktree list` while `git status` stayed cached.
+    #[test]
+    fn a_listing_survives_past_the_old_cap_while_its_status_read_is_cached() {
+        let memo = CollisionMemo::new(Duration::from_secs(30));
+        let observation = Vec::new();
+        let kept = crate::test_support::git_repo();
+        let kept_path = kept.path().to_path_buf();
+        memo.risk_for_path(&kept_path.to_string_lossy(), "src/planned.rs", &observation);
+
+        let others: Vec<_> = (0..MAX_LISTS)
+            .map(|_| crate::test_support::git_repo())
+            .collect();
+        assert!(
+            1 + others.len() > MAX_LISTS && 1 + others.len() <= MAX_READS,
+            "the status cache still has room"
+        );
+        for other in &others {
+            memo.risk_for_path(
+                &other.path().to_string_lossy(),
+                "src/planned.rs",
+                &observation,
+            );
+        }
+
+        let before = crate::engine::git_cli::spawn_log::spawns_in(&kept_path);
+        memo.risk_for_path(&kept_path.to_string_lossy(), "src/planned.rs", &observation);
+        let after = crate::engine::git_cli::spawn_log::spawns_in(&kept_path);
+        assert!(
+            after.len() >= before.len(),
+            "spawn log dropped {kept_path:?}; cannot prove the listing was kept"
+        );
+        let spawned = &after[before.len()..];
+        let worktree_list = spawned
+            .iter()
+            .filter(|argv| argv.iter().any(|arg| arg == "worktree"))
+            .count();
+        assert_eq!(worktree_list, 0, "listing refill: {spawned:?}");
     }
 
     #[test]

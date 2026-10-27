@@ -166,4 +166,207 @@ describe("computeTabLayout", () => {
     expect(header.conflictedCount).toBe(1);
     expect(header.terminalCount).toBe(3);
   });
+
+  describe("collapse inactive tabs in groups", () => {
+    it("collapses inactive tabs in a group while keeping the active tab visible", () => {
+      const tabs = [
+        makeTab({ id: "t1", path: "/code/devtools/repo1", group: "devtools", isActive: true }),
+        makeTab({ id: "t2", path: "/code/devtools/repo2", group: "devtools" }),
+        makeTab({ id: "t3", path: "/code/devtools/repo3", group: "devtools" }),
+        makeTab({ id: "t4", path: "/code/other/repo4", group: null }),
+      ];
+
+      const layout = computeTabLayout(tabs, [], undefined, [], undefined, { collapseInactive: true });
+
+      // Group header is not fully collapsed because it has an active tab
+      expect(layout.groups[0].isCollapsed).toBe(false);
+      expect(layout.groups[0].hasActiveTab).toBe(true);
+      expect(layout.groups[0].tabCount).toBe(3);
+      expect(layout.groups[0].collapsedInactiveCount).toBe(2);
+
+      // Visible items: group-header + active tab t1 + ungrouped tab t4
+      expect(layout.visibleItems).toHaveLength(3);
+      expect(layout.visibleItems[0].kind).toBe("group-header");
+      expect(layout.visibleItems[1].kind).toBe("tab");
+      expect((layout.visibleItems[1] as TabItem).tab.id).toBe("t1");
+      expect(layout.visibleItems[2].kind).toBe("tab");
+      expect((layout.visibleItems[2] as TabItem).tab.id).toBe("t4");
+
+      // Visible tabs only contains active tab t1 and ungrouped tab t4
+      expect(layout.visibleTabs.map((t) => t.id)).toEqual(["t1", "t4"]);
+
+      // Inactive tabs inside group are marked with isInsideCollapsedGroup
+      const tabItems = layout.allItems.filter((it): it is TabItem => it.kind === "tab");
+      expect(tabItems.find((it) => it.id === "t1")?.isInsideCollapsedGroup).toBe(false);
+      expect(tabItems.find((it) => it.id === "t2")?.isInsideCollapsedGroup).toBe(true);
+      expect(tabItems.find((it) => it.id === "t3")?.isInsideCollapsedGroup).toBe(true);
+    });
+
+    it("collapses all tabs into group header when a group has no active tab", () => {
+      const tabs = [
+        makeTab({ id: "dev1", path: "/code/dev/1", group: "devtools", isActive: true }),
+        makeTab({ id: "dev2", path: "/code/dev/2", group: "devtools" }),
+        makeTab({ id: "web1", path: "/code/web/1", group: "web" }),
+        makeTab({ id: "web2", path: "/code/web/2", group: "web" }),
+      ];
+
+      const layout = computeTabLayout(tabs, [], undefined, [], undefined, { collapseInactive: true });
+
+      const devHeader = layout.groups.find((g) => g.group === "devtools")!;
+      const webHeader = layout.groups.find((g) => g.group === "web")!;
+
+      expect(devHeader.isCollapsed).toBe(false);
+      expect(devHeader.hasActiveTab).toBe(true);
+      expect(devHeader.collapsedInactiveCount).toBe(1);
+
+      expect(webHeader.isCollapsed).toBe(true);
+      expect(webHeader.hasActiveTab).toBe(false);
+      expect(webHeader.collapsedInactiveCount).toBe(2);
+
+      // Visible items: devtools header + dev1 + web header
+      expect(
+        layout.visibleItems.map((it) =>
+          it.kind === "group-header" ? it.group : it.kind === "tab" ? it.tab.id : it.id,
+        ),
+      ).toEqual([
+        "devtools",
+        "dev1",
+        "web",
+      ]);
+      expect(layout.visibleTabs.map((t) => t.id)).toEqual(["dev1"]);
+    });
+
+    it("dynamically shifts visible tabs when active tab changes", () => {
+      const makeTabsWithActive = (activeId: string) => [
+        makeTab({ id: "dev1", path: "/code/dev/1", group: "devtools", isActive: activeId === "dev1" }),
+        makeTab({ id: "dev2", path: "/code/dev/2", group: "devtools", isActive: activeId === "dev2" }),
+        makeTab({ id: "web1", path: "/code/web/1", group: "web", isActive: activeId === "web1" }),
+      ];
+
+      // Switch to dev2
+      const layoutDev2 = computeTabLayout(makeTabsWithActive("dev2"), [], undefined, [], undefined, { collapseInactive: true });
+      expect(layoutDev2.visibleTabs.map((t) => t.id)).toEqual(["dev2"]);
+
+      // Switch to web1
+      const layoutWeb1 = computeTabLayout(makeTabsWithActive("web1"), [], undefined, [], undefined, { collapseInactive: true });
+      expect(layoutWeb1.visibleTabs.map((t) => t.id)).toEqual(["web1"]);
+      expect(layoutWeb1.groups.find((g) => g.group === "devtools")?.isCollapsed).toBe(true);
+      expect(layoutWeb1.groups.find((g) => g.group === "web")?.isCollapsed).toBe(false);
+    });
+
+    it("supports per-group collapsedInactiveGroups when global option is false", () => {
+      const tabs = [
+        makeTab({ id: "dev1", path: "/code/dev/1", group: "devtools", isActive: true }),
+        makeTab({ id: "dev2", path: "/code/dev/2", group: "devtools" }),
+        makeTab({ id: "web1", path: "/code/web/1", group: "web" }),
+        makeTab({ id: "web2", path: "/code/web/2", group: "web" }),
+      ];
+
+      const layout = computeTabLayout(tabs, [], undefined, [], undefined, {
+        collapseInactive: false,
+        collapsedInactiveGroups: ["devtools"],
+      });
+
+      // devtools has inactive collapsed (only dev1 visible)
+      // web is fully expanded (web1 and web2 both visible)
+      expect(layout.visibleTabs.map((t) => t.id)).toEqual(["dev1", "web1", "web2"]);
+      expect(layout.groups.find((g) => g.group === "devtools")?.collapsedInactiveCount).toBe(1);
+      expect(layout.groups.find((g) => g.group === "web")?.collapsedInactiveCount).toBe(0);
+    });
+
+    it("allows explicitly expanding a group even when global collapseInactive is true", () => {
+      const tabs = [
+        makeTab({ id: "dev1", path: "/code/dev/1", group: "devtools", isActive: true }),
+        makeTab({ id: "dev2", path: "/code/dev/2", group: "devtools" }),
+        makeTab({ id: "web1", path: "/code/web/1", group: "web" }),
+        makeTab({ id: "web2", path: "/code/web/2", group: "web" }),
+      ];
+
+      const layout = computeTabLayout(tabs, [], undefined, [], undefined, {
+        collapseInactive: true,
+        expandedGroups: ["devtools"],
+      });
+
+      // devtools is explicitly expanded (dev1 and dev2 visible)
+      // web has no active tab and global collapseInactive is on (web is collapsed)
+      expect(layout.visibleTabs.map((t) => t.id)).toEqual(["dev1", "dev2"]);
+      expect(layout.groups.find((g) => g.group === "devtools")?.collapsedInactiveCount).toBe(0);
+      expect(layout.groups.find((g) => g.group === "web")?.isCollapsed).toBe(true);
+    });
+
+    it("collapses inactive tabs even when they have active shells (default behavior)", () => {
+      const tabs = [
+        makeTab({ id: "t1", path: "/code/devtools/repo1", group: "devtools", isActive: true }),
+        makeTab({ id: "t2", path: "/code/devtools/repo2", group: "devtools" }), // has active shell
+        makeTab({ id: "t3", path: "/code/devtools/repo3", group: "devtools" }),
+      ];
+      const terminalCounts = new Map([["/code/devtools/repo2", 2]]);
+
+      // Default: keepActiveShells is false / undefined -> inactive tabs with shells are collapsed
+      const layout = computeTabLayout(tabs, [], terminalCounts, [], undefined, {
+        collapseInactive: true,
+      });
+
+      const header = layout.groups[0];
+      expect(header.isCollapsed).toBe(false);
+      expect(header.terminalCount).toBe(2);
+      expect(header.collapsedInactiveCount).toBe(2);
+
+      // Only the focused active tab t1 is visible
+      expect(layout.visibleTabs.map((t) => t.id)).toEqual(["t1"]);
+      expect(
+        layout.visibleItems.map((it) => (it.kind === "group-header" ? it.group : it.id)),
+      ).toEqual(["devtools", "t1"]);
+
+      // Inactive tab with shells is marked as collapsed inside group
+      const t2Item = layout.allItems.find((it): it is TabItem => it.kind === "tab" && it.id === "t2")!;
+      expect(t2Item.isInsideCollapsedGroup).toBe(true);
+    });
+
+    it("collapses inactive groups containing active shells into group header with shell indicator", () => {
+      const tabs = [
+        makeTab({ id: "dev1", path: "/code/dev/1", group: "devtools", isActive: true }),
+        makeTab({ id: "srv1", path: "/code/srv/1", group: "backend" }), // inactive with shell
+        makeTab({ id: "srv2", path: "/code/srv/2", group: "backend" }),
+      ];
+      const terminalCounts = new Map([["/code/srv/1", 1]]);
+
+      const layout = computeTabLayout(tabs, [], terminalCounts, [], undefined, {
+        collapseInactive: true,
+      });
+
+      const backendHeader = layout.groups.find((g) => g.group === "backend")!;
+      expect(backendHeader.isCollapsed).toBe(true);
+      expect(backendHeader.terminalCount).toBe(1);
+      expect(backendHeader.collapsedInactiveCount).toBe(2);
+
+      // Only dev1 tab is visible; backend is collapsed into header showing terminalCount
+      expect(layout.visibleTabs.map((t) => t.id)).toEqual(["dev1"]);
+      expect(
+        layout.visibleItems.map((it) => (it.kind === "group-header" ? it.group : it.id)),
+      ).toEqual(["devtools", "dev1", "backend"]);
+    });
+
+    it("keeps tabs with active shells visible when keepActiveShells is true", () => {
+      const tabs = [
+        makeTab({ id: "t1", path: "/code/devtools/repo1", group: "devtools", isActive: true }),
+        makeTab({ id: "t2", path: "/code/devtools/repo2", group: "devtools" }), // has active shell
+        makeTab({ id: "t3", path: "/code/devtools/repo3", group: "devtools" }), // inactive no shell
+      ];
+      const terminalCounts = new Map([["/code/devtools/repo2", 1]]);
+
+      const layout = computeTabLayout(tabs, [], terminalCounts, [], undefined, {
+        collapseInactive: true,
+        keepActiveShells: true,
+      });
+
+      const header = layout.groups[0];
+      expect(header.isCollapsed).toBe(false);
+      expect(header.terminalCount).toBe(1);
+      expect(header.collapsedInactiveCount).toBe(1); // only t3 collapsed
+
+      // Both t1 (active) and t2 (active shell) are visible
+      expect(layout.visibleTabs.map((t) => t.id)).toEqual(["t1", "t2"]);
+    });
+  });
 });

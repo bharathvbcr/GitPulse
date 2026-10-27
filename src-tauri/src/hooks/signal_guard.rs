@@ -60,6 +60,9 @@
 //!   pattern or user built from one is asked about. A pid list from `$PID` is
 //!   one pid and is left to the user's rules.
 //! * Only this user's processes can be signalled, so only they are counted.
+//! * macOS `pkill` leaves ancestors out; procps `pkill` does not. The guard
+//!   follows the tool on the host, so a Linux `pkill` that would reach an
+//!   ancestor is counted and can be refused.
 //! * `ssh host pkill …`, `find -exec kill`, `parallel` and the like are not read.
 
 use std::collections::HashMap;
@@ -1745,6 +1748,17 @@ fn reachable(facts: &Facts, row: &TableRow) -> bool {
     facts.me_uid == 0 || row.uid == facts.me_uid
 }
 
+/// Whether `pkill` on this host leaves ancestors out of the match.
+///
+/// macOS does. procps on Linux does not: it skips only the `pkill` process.
+fn skip_ancestors() -> bool {
+    skip_ancestors_on(std::env::consts::OS)
+}
+
+fn skip_ancestors_on(os: &str) -> bool {
+    os != "linux"
+}
+
 /// This process and the processes it descends from.
 fn lineage(facts: &Facts) -> Vec<i32> {
     let parents: HashMap<i32, i32> = facts.rows.iter().map(|r| (r.pid, r.ppid)).collect();
@@ -1842,10 +1856,14 @@ fn eval_pgrep<'a>(spec: &PgrepSpec, facts: &'a Facts) -> Result<Reach<'a>, Strin
         },
         None => None,
     };
-    // `pkill` never matches itself or its ancestors; with `-v` the ancestors
-    // are in the list again. Here "itself" is the hook, which is a sibling of
-    // the shell the tool would run in and shares every ancestor above it.
-    let excluded: Vec<i32> = if spec.ancestors || spec.inverse {
+    // macOS `pkill` never matches itself or its ancestors; with `-v` the
+    // ancestors are in the list again. procps `pkill` (Linux) skips only its
+    // own pid, so an ancestor is a process the command would signal. Leaving
+    // those out made `pkill -u $USER` look smaller than the set it reaches,
+    // and a command that would hit them was not asked about. Counting them
+    // refuses more commands; it does not allow one the guard already refused.
+    // "Itself" is the hook, a sibling of the shell the tool would run in.
+    let excluded: Vec<i32> = if spec.ancestors || spec.inverse || !skip_ancestors() {
         vec![facts.self_pid]
     } else {
         lineage(facts)
@@ -2677,14 +2695,35 @@ mod tests {
     fn the_session_that_ran_it_is_not_a_victim_but_the_others_are() {
         let facts = world();
         let pids = pids_of("pkill -f claude", &facts);
-        assert!(!pids.contains(&700), "the sender's own session is excluded");
-        assert_eq!(pids.len(), 5, "the five hosted ones are not: {pids:?}");
+        if skip_ancestors() {
+            assert!(!pids.contains(&700), "the sender's own session is excluded");
+            assert_eq!(pids.len(), 5, "the five hosted ones are not: {pids:?}");
+        } else {
+            assert!(
+                pids.contains(&700),
+                "procps reaches the ancestor session: {pids:?}"
+            );
+            assert_eq!(
+                pids.len(),
+                6,
+                "the ancestor plus the five hosted ones: {pids:?}"
+            );
+        }
         let alone = quiet();
-        assert_eq!(
-            classify_output(&run_in("pkill -f claude", &alone)),
-            Out::Silent,
-            "only an ancestor matches, and pkill never signals its ancestors"
-        );
+        let only_ancestor = classify_output(&run_in("pkill -f claude", &alone));
+        if skip_ancestors() {
+            assert_eq!(
+                only_ancestor,
+                Out::Silent,
+                "macOS pkill never signals its ancestors"
+            );
+        } else {
+            assert_eq!(
+                only_ancestor,
+                Out::Deny,
+                "the ancestor is a hosted session procps would signal"
+            );
+        }
         assert_eq!(
             classify_output(&run_in("pkill -a -f claude", &alone)),
             Out::Deny,
@@ -3338,7 +3377,22 @@ mod tests {
         assert!(inverse.contains(&700), "-v includes ancestors");
         assert!(!inverse.contains(&900), "never itself");
         let normal = pids_of("pkill -f .", &facts);
-        assert!(!normal.contains(&700) && !normal.contains(&800) && !normal.contains(&900));
+        assert!(!normal.contains(&900), "never itself");
+        if skip_ancestors() {
+            assert!(!normal.contains(&700) && !normal.contains(&800));
+        } else {
+            assert!(
+                normal.contains(&700) && normal.contains(&800),
+                "procps counts ancestors: {normal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn procps_counts_ancestors_and_macos_pkill_does_not() {
+        assert!(skip_ancestors_on("macos"));
+        assert!(!skip_ancestors_on("linux"));
+        assert_eq!(skip_ancestors(), skip_ancestors_on(std::env::consts::OS));
     }
 
     #[test]

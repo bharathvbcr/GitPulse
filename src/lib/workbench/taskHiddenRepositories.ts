@@ -79,13 +79,65 @@ export interface HiddenRepositoryCount {
   complete: boolean;
 }
 
+const MAX_NAME_LENGTH = 200;
+
+function cleanNames(names: readonly string[]): string[] {
+  const clean: string[] = [];
+  const seen = new Set<string>();
+  for (const name of names) {
+    if (typeof name !== "string") continue;
+    const trimmed = name.trim();
+    if (!trimmed || trimmed.length > MAX_NAME_LENGTH || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    clean.push(trimmed);
+    if (clean.length >= MAX_HIDDEN_REPOSITORIES) break;
+  }
+  return clean;
+}
+
+function safeCount(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(MAX_HIDDEN_REPOSITORIES, Math.trunc(value)));
+}
+
+/**
+ * Who is hidden, by name, for the navigator heading and the board note.
+ *
+ * One or two names are written out. Anything past that, including a hidden
+ * repository whose name is not loaded yet, is "and N others", so the line
+ * still names someone and still fits the navigator.
+ * No names at all returns "" — the note then falls back to a count.
+ */
+export function hiddenRepositoryPhrase(names: readonly string[], total: number): string {
+  const clean = cleanNames(names);
+  const count = Math.max(clean.length, safeCount(total));
+  if (clean.length === 0) return "";
+  const first = clean[0] ?? "";
+  const second = clean[1];
+  if (second === undefined) {
+    const rest = count - 1;
+    return rest > 0 ? `${first} and ${plural(rest, "other")}` : first;
+  }
+  const rest = count - 2;
+  if (rest <= 0) return `${first} and ${second}`;
+  return `${first}, ${second} and ${plural(rest, "other")}`;
+}
+
 /** The line the board shows while repositories are hidden. */
-export function hiddenRepositoryNote(count: HiddenRepositoryCount): string {
-  const repositories = plural(count.repositories, "hidden repository", "hidden repositories");
+export function hiddenRepositoryNote(count: HiddenRepositoryCount, names: readonly string[] = []): string {
+  const named = cleanNames(names);
+  const loaded = count.complete ? "" : "loaded ";
+  if (count.tasks === 0 && named.length === 0) {
+    return `${plural(count.repositories, "repository is", "repositories are")} hidden; none of this board's ${loaded}tasks belong to ${count.repositories === 1 ? "it" : "them"}.`;
+  }
+  const who = named.length === 0
+    ? plural(count.repositories, "hidden repository", "hidden repositories")
+    : hiddenRepositoryPhrase(named, count.repositories);
   if (count.tasks === 0) {
-    return `${plural(count.repositories, "repository is", "repositories are")} hidden; none of this board's ${count.complete ? "" : "loaded "}tasks belong to ${count.repositories === 1 ? "it" : "them"}.`;
+    const many = named.length !== 1 || safeCount(count.repositories) !== 1;
+    return `${who} ${many ? "are" : "is"} hidden; none of this board's ${loaded}tasks belong to ${many ? "them" : "it"}.`;
   }
   const verb = count.tasks === 1 ? "is" : "are";
   const scope = count.complete ? "" : ", counting only the tasks loaded so far";
-  return `${plural(count.tasks, "task")} from ${repositories} ${verb} not on this board${scope}.`;
+  return `${plural(count.tasks, "task")} from ${who} ${verb} not on this board${scope}.`;
 }

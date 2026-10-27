@@ -268,8 +268,12 @@ types.
 
 ---
 
-## License
+## License & Acknowledgements
 
-Distributed under the MIT License. See [LICENSE](LICENSE) for details.
+Distributed under the [MIT License](LICENSE). See [NOTICE](NOTICE) for third-party and vendored crate attributions.
+
+- **[The Tauri Programme (`tauri-apps`)](https://github.com/tauri-apps/tauri)** (`tauri`, `wry`, `tao`, `muda` — Apache-2.0 OR MIT) — Desktop shell runtime and patched crates under `src-tauri/framework/`.
+- **[webkit2gtk-rs](https://github.com/tauri-apps/webkit2gtk-rs)** (`The Gtk-rs Project Developers` & `Antoni Boucher`, MIT), **[libappindicator-rs](https://github.com/qDot/libappindicator-rs)** (`Kyle Machulis / qDot`), and **[notify](https://github.com/notify-rs/notify)** (`Félix Saparelli & contributors`).
+- **[MarkDev](https://github.com/bharathvbcr/MarkDev)** (`bharathvbcr/MarkDev`, MIT) — Embedded Rust Markdown/math/diagram rendering pipeline under `src-tauri/vendor/markdev/`.
 
 © 2026 Bharath Chandra Vaddaram

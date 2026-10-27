@@ -670,6 +670,23 @@ export function collapseAllGroups(ws: WorkspaceTabs): WorkspaceTabs {
 }
 
 /**
+ * Collapses all distinct groups that do not contain the active tab.
+ */
+export function collapseInactiveGroups(ws: WorkspaceTabs): WorkspaceTabs {
+  const activeTab = ws.tabs.find((t) => t.id === ws.activeId);
+  const activeGroup = activeTab?.group ? normalizeGroupName(activeTab.group) : null;
+  const groupsToCollapse = new Set<string>();
+  for (const tab of ws.tabs) {
+    const g = normalizeGroupName(tab.group);
+    if (g && g !== activeGroup) {
+      groupsToCollapse.add(g);
+    }
+  }
+  const collapsedGroups = cleanCollapsedGroups(ws.tabs, Array.from(groupsToCollapse));
+  return { ...ws, collapsedGroups };
+}
+
+/**
  * Expands all groups currently collapsed in the workspace.
  */
 export function expandAllGroups(ws: WorkspaceTabs): WorkspaceTabs {

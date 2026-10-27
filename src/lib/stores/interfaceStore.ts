@@ -130,6 +130,10 @@ export interface InterfacePrefs {
   autoHideRepoTabs: boolean;
   /** Draw the worktrees of one repository as one tab with a switcher. */
   stackWorktreeTabs: boolean;
+  /** Collapse inactive tabs in tab groups to focus on active tabs. */
+  collapseInactiveGroupTabs: boolean;
+  /** When collapsing inactive tabs in groups, collapse even tabs running active shells (default: true). */
+  collapseInactiveIncludeShells: boolean;
   /** Keep a status icon available; closing the window hides it while enabled. */
   showStatusIcon: boolean;
   /** Hide the Dock icon while the main window is closed and the status icon is on. */
@@ -364,6 +368,8 @@ const DEFAULTS: InterfacePrefs = {
   showHeaderActionLabels: true,
   autoHideRepoTabs: false,
   stackWorktreeTabs: true,
+  collapseInactiveGroupTabs: false,
+  collapseInactiveIncludeShells: true,
   showStatusIcon: false,
   hideDockWhenClosed: true,
   statusIconCounts: false,
@@ -511,6 +517,8 @@ function readPrefs(): InterfacePrefs {
       ),
       autoHideRepoTabs: bool(parsed.autoHideRepoTabs, DEFAULTS.autoHideRepoTabs),
       stackWorktreeTabs: bool(parsed.stackWorktreeTabs, DEFAULTS.stackWorktreeTabs),
+      collapseInactiveGroupTabs: bool(parsed.collapseInactiveGroupTabs, DEFAULTS.collapseInactiveGroupTabs),
+      collapseInactiveIncludeShells: bool(parsed.collapseInactiveIncludeShells, DEFAULTS.collapseInactiveIncludeShells),
       showStatusIcon: parsed.showStatusIcon === true,
       hideDockWhenClosed: bool(parsed.hideDockWhenClosed, DEFAULTS.hideDockWhenClosed),
       statusIconCounts: parsed.statusIconCounts === true,
@@ -684,6 +692,12 @@ function createInterfaceStore() {
     setStatusIconCounts: (show: boolean) => patch({ statusIconCounts: show }),
     setAutoHideRepoTabs: (hide: boolean) => patch({ autoHideRepoTabs: hide }),
     setStackWorktreeTabs: (stack: boolean) => patch({ stackWorktreeTabs: stack }),
+    setCollapseInactiveGroupTabs: (collapse: boolean) => patch({ collapseInactiveGroupTabs: collapse }),
+    toggleCollapseInactiveGroupTabs: () =>
+      patch((prefs) => ({ collapseInactiveGroupTabs: !prefs.collapseInactiveGroupTabs })),
+    setCollapseInactiveIncludeShells: (include: boolean) => patch({ collapseInactiveIncludeShells: include }),
+    toggleCollapseInactiveIncludeShells: () =>
+      patch((prefs) => ({ collapseInactiveIncludeShells: !prefs.collapseInactiveIncludeShells })),
     setDiagnosticsButton: (mode: DiagnosticsButtonMode) =>
       patch({ diagnosticsButton: mode }),
     /** Adds or removes one view from the header's hidden list. */

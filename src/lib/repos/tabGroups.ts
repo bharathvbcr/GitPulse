@@ -50,6 +50,7 @@ export interface GroupHeaderItem {
   terminalCount: number;
   tabIds: string[];
   color: TabColor | null;
+  collapsedInactiveCount: number;
 }
 
 /**
@@ -113,6 +114,25 @@ export interface StackingOptions {
   identity?: (path: string) => string;
 }
 
+export interface GroupingOptions {
+  /**
+   * When true, inactive tabs in groups are collapsed to focus on active tabs.
+   */
+  collapseInactive?: boolean;
+  /**
+   * Specific groups whose inactive tabs should be collapsed (even when collapseInactive is false).
+   */
+  collapsedInactiveGroups?: Iterable<string>;
+  /**
+   * Specific groups whose tabs should all remain expanded (when collapseInactive is true).
+   */
+  expandedGroups?: Iterable<string>;
+  /**
+   * When true, tabs with running terminal shells are treated as active and kept visible.
+   */
+  keepActiveShells?: boolean;
+}
+
 export interface TabLayoutResult {
   /** All items in display order, including collapsed tab items (marked with isInsideCollapsedGroup). */
   allItems: TabLayoutItem[];
@@ -151,10 +171,29 @@ export function computeTabLayout(
   terminalCounts?: Map<string, number>,
   groupColors: readonly GroupColor[] = [],
   stacking: StackingOptions = { enabled: false },
+  grouping: GroupingOptions = {},
 ): TabLayoutResult {
   const collapsedSet = new Set(
     Array.from(collapsedGroups).map((g) => normalizeGroupName(g)).filter((g): g is string => g !== null),
   );
+  const collapsedInactiveSet = new Set(
+    Array.from(grouping.collapsedInactiveGroups ?? [])
+      .map((g) => normalizeGroupName(g))
+      .filter((g): g is string => g !== null),
+  );
+  const explicitlyExpandedGroups = new Set(
+    Array.from(grouping.expandedGroups ?? [])
+      .map((g) => normalizeGroupName(g))
+      .filter((g): g is string => g !== null),
+  );
+  const globalCollapseInactive = grouping.collapseInactive ?? false;
+  const keepActiveShells = grouping.keepActiveShells ?? false;
+
+  const shouldCollapseInactiveForGroup = (group: string): boolean => {
+    if (explicitlyExpandedGroups.has(group)) return false;
+    return globalCollapseInactive || collapsedInactiveSet.has(group);
+  };
+
   const expandedStacks = new Set(stacking.expanded ?? []);
   const identity = stacking.identity ?? ((path: string) => normalizeRepoPath(path) ?? path);
 
@@ -180,7 +219,7 @@ export function computeTabLayout(
 
   const groupHeaders = new Map<string, GroupHeaderItem>();
   for (const [group, groupTabs] of groupTabsMap.entries()) {
-    const isCollapsed = collapsedSet.has(group);
+    const isFullyCollapsed = collapsedSet.has(group);
     let hasActiveTab = false;
     let isDirty = false;
     let conflictedCount = 0;
@@ -197,6 +236,26 @@ export function computeTabLayout(
       }
     }
 
+    const collapseInactive = shouldCollapseInactiveForGroup(group);
+    let isCollapsed = isFullyCollapsed;
+    let collapsedInactiveCount = 0;
+    const hasLiveShells = terminalCount > 0;
+    const isGroupActive = hasActiveTab || (keepActiveShells && hasLiveShells);
+    if (isFullyCollapsed) {
+      isCollapsed = true;
+      collapsedInactiveCount = 0;
+    } else if (collapseInactive) {
+      if (isGroupActive) {
+        isCollapsed = false;
+        collapsedInactiveCount = groupTabs.filter(
+          (t) => !t.isActive && !(keepActiveShells && (terminalCounts?.get(t.path) ?? 0) > 0),
+        ).length;
+      } else {
+        isCollapsed = true;
+        collapsedInactiveCount = groupTabs.length;
+      }
+    }
+
     groupHeaders.set(group, {
       kind: "group-header",
       id: `group:${group}`,
@@ -210,6 +269,7 @@ export function computeTabLayout(
       terminalCount,
       tabIds,
       color: lookupGroupColor(groupColors, group),
+      collapsedInactiveCount,
     });
   }
 
@@ -276,15 +336,21 @@ export function computeTabLayout(
     index: number,
     group: string | null,
     stack: string | null,
-  ): TabItem => ({
-    kind: "tab",
-    id: tab.id,
-    tab,
-    group,
-    index,
-    isInsideCollapsedGroup: group !== null && collapsedSet.has(group),
-    stack,
-  });
+  ): TabItem => {
+    const tabHasShell = keepActiveShells && (terminalCounts?.get(tab.path) ?? 0) > 0;
+    const isTabActive = tab.isActive || tabHasShell;
+    return {
+      kind: "tab",
+      id: tab.id,
+      tab,
+      group,
+      index,
+      isInsideCollapsedGroup:
+        group !== null &&
+        (collapsedSet.has(group) || (shouldCollapseInactiveForGroup(group) && !isTabActive)),
+      stack,
+    };
+  };
 
   const stackHeaders: StackHeaderItem[] = [];
   const toNode = (pending: PendingNode): StripNode => {
@@ -315,6 +381,10 @@ export function computeTabLayout(
       conflictedCount += tab.conflictedCount || 0;
       terminalCount += terminalCounts?.get(tab.path) || 0;
     }
+    const stackHasActive = members.some((m) => m.tab.isActive);
+    const stackHasShell =
+      keepActiveShells && members.some((m) => (terminalCounts?.get(m.tab.path) ?? 0) > 0);
+    const stackEffectiveActive = stackHasActive || stackHasShell;
     const header: StackHeaderItem = {
       kind: "stack-header",
       id: `stack:${key}`,
@@ -326,8 +396,11 @@ export function computeTabLayout(
       tabCount: members.length,
       current: current.tab,
       isExpanded,
-      isInsideCollapsedGroup: pending.group !== null && collapsedSet.has(pending.group),
-      hasActiveTab: members.some((m) => m.tab.isActive),
+      isInsideCollapsedGroup:
+        pending.group !== null &&
+        (collapsedSet.has(pending.group) ||
+          (shouldCollapseInactiveForGroup(pending.group) && !stackEffectiveActive)),
+      hasActiveTab: stackHasActive,
       isDirty,
       conflictedCount,
       terminalCount,
@@ -369,7 +442,25 @@ export function computeTabLayout(
     }
     allItems.push(node.header);
     visibleItems.push(node.header);
-    for (const child of node.children) emit(child, node.header.isCollapsed);
+    const collapseInactive = shouldCollapseInactiveForGroup(node.header.group);
+    for (const child of node.children) {
+      const childHasShell =
+        keepActiveShells &&
+        (child.kind === "tab"
+          ? (terminalCounts?.get(child.item.tab.path) ?? 0) > 0
+          : child.kind === "stack"
+            ? child.members.some((m) => (terminalCounts?.get(m.tab.path) ?? 0) > 0)
+            : false);
+      const childActive =
+        child.kind === "tab"
+          ? child.item.tab.isActive || childHasShell
+          : child.kind === "stack"
+            ? child.header.hasActiveTab || childHasShell
+            : false;
+      const childHidden =
+        node.header.isCollapsed || (collapseInactive && !childActive);
+      emit(child, childHidden);
+    }
   };
   for (const node of tree) emit(node, false);
 

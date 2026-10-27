@@ -40,6 +40,12 @@
   import { checkoutName } from "../repos/repoFamily";
   import { expandedStacks, lastUsedCheckouts, setStackExpanded } from "../repos/stackState";
   import {
+    collapsedInactiveGroups,
+    explicitlyExpandedGroups,
+    setGroupInactiveCollapsed,
+    setGroupExplicitlyExpanded,
+  } from "../repos/groupState";
+  import {
     lookupGroupColor,
     normalizeTabColor,
     TAB_COLORS,
@@ -120,6 +126,12 @@
         lastUsed: lastUsedCheckouts(),
         identity,
       },
+      {
+        collapseInactive: $interfaceStore.collapseInactiveGroupTabs,
+        collapsedInactiveGroups: $collapsedInactiveGroups,
+        expandedGroups: $explicitlyExpandedGroups,
+        keepActiveShells: !$interfaceStore.collapseInactiveIncludeShells,
+      },
     ),
   );
 
@@ -196,9 +208,45 @@
 
   function groupAriaLabel(info: GroupHeaderItem): string {
     const count = `${info.tabCount} ${info.tabCount === 1 ? "repository" : "repositories"}`;
-    const collapsed = info.isCollapsed ? ", collapsed" : "";
+    const collapsed = info.isCollapsed
+      ? ", collapsed"
+      : info.collapsedInactiveCount > 0
+        ? `, ${info.collapsedInactiveCount} inactive collapsed`
+        : "";
     const color = info.color ? `, ${TAB_COLOR_LABEL[info.color]}` : "";
     return `Group ${info.label}, ${count}${collapsed}${color}`;
+  }
+
+  function groupTitle(info: GroupHeaderItem): string {
+    const inactiveNote =
+      info.collapsedInactiveCount > 0
+        ? ` (${info.collapsedInactiveCount} inactive collapsed)`
+        : "";
+    const shellsNote =
+      info.terminalCount > 0
+        ? ` · ${info.terminalCount} active shell${info.terminalCount === 1 ? "" : "s"}`
+        : "";
+    const action = info.isCollapsed || info.collapsedInactiveCount > 0 ? "expand" : "collapse";
+    return `Group: ${info.label} (${info.tabCount} ${info.tabCount === 1 ? 'repository' : 'repositories'}${inactiveNote}${shellsNote})\nClick to ${action} · Right-click for options · F2 to rename · Delete to close`;
+  }
+
+  function onGroupHeadClick(info: GroupHeaderItem) {
+    if (info.isCollapsed) {
+      if (collapsedGroupSet.has(info.group)) {
+        repoStore.setGroupCollapsed(info.group, false);
+      }
+      setGroupExplicitlyExpanded(info.group, true);
+    } else if (info.collapsedInactiveCount > 0) {
+      setGroupExplicitlyExpanded(info.group, true);
+    } else {
+      if ($interfaceStore.collapseInactiveGroupTabs || $collapsedInactiveGroups.has(info.group)) {
+        setGroupExplicitlyExpanded(info.group, false);
+        setGroupInactiveCollapsed(info.group, false);
+        repoStore.setGroupCollapsed(info.group, true);
+      } else {
+        repoStore.toggleGroupCollapsed(info.group);
+      }
+    }
   }
 
   function groupChrome(info: { hasActiveTab: boolean }): string {
@@ -662,12 +710,13 @@
   }
 
   function onGroupKeydown(e: KeyboardEvent, info: GroupHeaderItem) {
-    if (e.key === "ArrowRight" && info.isCollapsed) {
+    if (e.key === "ArrowRight" && (info.isCollapsed || info.collapsedInactiveCount > 0)) {
       e.preventDefault();
-      repoStore.setGroupCollapsed(info.group, false);
+      if (collapsedGroupSet.has(info.group)) repoStore.setGroupCollapsed(info.group, false);
+      setGroupExplicitlyExpanded(info.group, true);
       return;
     }
-    if (e.key === "ArrowLeft" && !info.isCollapsed) {
+    if (e.key === "ArrowLeft" && !info.isCollapsed && info.collapsedInactiveCount === 0) {
       e.preventDefault();
       repoStore.setGroupCollapsed(info.group, true);
       return;
@@ -932,10 +981,10 @@
         class="h-7 px-2 flex items-center gap-1.5 rounded-lg border text-xs font-medium cursor-pointer transition-[color,background-color,border-color,box-shadow] duration-150 {groupChrome(info)} {dragHoverGroup === info.group ? 'ring-2 ring-accent border-accent' : ''}"
         aria-expanded={!info.isCollapsed}
         aria-label={groupAriaLabel(info)}
-        title={`Group: ${info.label} (${info.tabCount} ${info.tabCount === 1 ? 'repository' : 'repositories'})\nClick to ${info.isCollapsed ? 'expand' : 'collapse'} · Right-click for options · F2 to rename · Delete to close`}
+        title={groupTitle(info)}
         data-group-head={info.group}
         tabindex={info.isCollapsed && info.hasActiveTab ? 0 : -1}
-        onclick={() => repoStore.toggleGroupCollapsed(info.group)}
+        onclick={() => onGroupHeadClick(info)}
         oncontextmenu={(e) => onGroupContext(e, info.group)}
         onkeydown={(e) => onGroupKeydown(e, info)}
         onauxclick={(e) => {
@@ -982,6 +1031,7 @@
             {#if info.terminalCount > 1}
               <span class="text-[9px] font-medium tabular-nums">{info.terminalCount}</span>
             {/if}
+            <span class="sr-only">{info.terminalCount} terminal session{info.terminalCount === 1 ? '' : 's'} running</span>
           </span>
         {/if}
       </button>
@@ -1576,6 +1626,7 @@
         {#if isTabInCollapsedGroup(tab)}
           <button role="menuitem" class="gp-menu-item" onclick={() => {
             repoStore.setGroupCollapsed(tab.group!, false);
+            setGroupExplicitlyExpanded(tab.group!, true);
             closeMenu();
           }}>
             Expand group "{tab.group}"
@@ -1586,6 +1637,34 @@
             closeMenu();
           }}>
             Collapse group "{tab.group}"
+          </button>
+        {/if}
+        {@const tabGrpHeader = groupHeadersByName.get(tab.group)}
+        {#if tabGrpHeader && !tabGrpHeader.isCollapsed && tabGrpHeader.collapsedInactiveCount === 0}
+          <button role="menuitem" class="gp-menu-item" onclick={() => {
+            setGroupInactiveCollapsed(tab.group!, true);
+            closeMenu();
+          }}>
+            Collapse inactive tabs in "{tab.group}"
+          </button>
+        {:else if tabGrpHeader && tabGrpHeader.collapsedInactiveCount > 0}
+          <button role="menuitem" class="gp-menu-item" onclick={() => {
+            setGroupExplicitlyExpanded(tab.group!, true);
+            closeMenu();
+          }}>
+            Expand all tabs in "{tab.group}"
+          </button>
+        {/if}
+        {#if tabGrpHeader && tabGrpHeader.terminalCount > 0}
+          <button
+            role="menuitem"
+            class="gp-menu-item"
+            onclick={() => {
+              interfaceStore.toggleCollapseInactiveIncludeShells();
+              closeMenu();
+            }}
+          >
+            {$interfaceStore.collapseInactiveIncludeShells ? "Keep tabs with active shells visible" : "Collapse tabs with active shells"}
           </button>
         {/if}
       {:else}
@@ -1624,6 +1703,28 @@
         </button>
       {/if}
       {#if distinctGroupNames.length > 0}
+        <button role="menuitem" class="gp-menu-item" onclick={() => {
+          repoStore.collapseInactiveGroups();
+          closeMenu();
+        }}>
+          Collapse inactive groups
+        </button>
+        <button role="menuitem" class="gp-menu-item" onclick={() => {
+          interfaceStore.setCollapseInactiveGroupTabs(!$interfaceStore.collapseInactiveGroupTabs);
+          closeMenu();
+        }}>
+          {$interfaceStore.collapseInactiveGroupTabs ? "Show all tabs in groups" : "Collapse inactive tabs in groups"}
+        </button>
+        <button
+          role="menuitem"
+          class="gp-menu-item"
+          onclick={() => {
+            interfaceStore.toggleCollapseInactiveIncludeShells();
+            closeMenu();
+          }}
+        >
+          {$interfaceStore.collapseInactiveIncludeShells ? "Keep tabs with active shells visible" : "Collapse tabs with active shells"}
+        </button>
         <button role="menuitem" class="gp-menu-item" onclick={() => {
           repoStore.collapseAllGroups();
           closeMenu();
@@ -1692,11 +1793,83 @@
         role="menuitem"
         class="gp-menu-item"
         onclick={() => {
-          repoStore.toggleGroupCollapsed(groupHeader.group);
+          if (groupHeader.isCollapsed || groupHeader.collapsedInactiveCount > 0) {
+            if (collapsedGroupSet.has(groupHeader.group)) repoStore.setGroupCollapsed(groupHeader.group, false);
+            setGroupExplicitlyExpanded(groupHeader.group, true);
+          } else {
+            repoStore.setGroupCollapsed(groupHeader.group, true);
+          }
           closeGroupMenu();
         }}
       >
-        {groupHeader.isCollapsed ? "Expand group" : "Collapse group"}
+        {groupHeader.isCollapsed || groupHeader.collapsedInactiveCount > 0 ? "Expand group" : "Collapse group"}
+      </button>
+      {#if groupHeader.isCollapsed}
+        <button
+          role="menuitem"
+          class="gp-menu-item"
+          onclick={() => {
+            if (collapsedGroupSet.has(groupHeader.group)) repoStore.setGroupCollapsed(groupHeader.group, false);
+            setGroupInactiveCollapsed(groupHeader.group, true);
+            closeGroupMenu();
+          }}
+        >
+          Collapse inactive tabs
+        </button>
+      {:else if groupHeader.collapsedInactiveCount === 0}
+        <button
+          role="menuitem"
+          class="gp-menu-item"
+          onclick={() => {
+            setGroupInactiveCollapsed(groupHeader.group, true);
+            closeGroupMenu();
+          }}
+        >
+          Collapse inactive tabs
+        </button>
+      {:else}
+        <button
+          role="menuitem"
+          class="gp-menu-item"
+          onclick={() => {
+            setGroupExplicitlyExpanded(groupHeader.group, true);
+            closeGroupMenu();
+          }}
+        >
+          Expand all tabs in group
+        </button>
+      {/if}
+      {#if groupHeader.terminalCount > 0}
+        <button
+          role="menuitem"
+          class="gp-menu-item"
+          onclick={() => {
+            interfaceStore.toggleCollapseInactiveIncludeShells();
+            closeGroupMenu();
+          }}
+        >
+          {$interfaceStore.collapseInactiveIncludeShells ? "Keep tabs with active shells visible" : "Collapse tabs with active shells"}
+        </button>
+      {/if}
+      <button
+        role="menuitem"
+        class="gp-menu-item"
+        onclick={() => {
+          repoStore.collapseInactiveGroups();
+          closeGroupMenu();
+        }}
+      >
+        Collapse inactive groups
+      </button>
+      <button
+        role="menuitem"
+        class="gp-menu-item"
+        onclick={() => {
+          interfaceStore.setCollapseInactiveGroupTabs(!$interfaceStore.collapseInactiveGroupTabs);
+          closeGroupMenu();
+        }}
+      >
+        {$interfaceStore.collapseInactiveGroupTabs ? "Show all tabs in groups" : "Collapse inactive tabs in all groups"}
       </button>
       <button
         role="menuitem"
@@ -1881,6 +2054,65 @@
       <button role="menuitem" class="gp-menu-item text-rose-400 hover:text-rose-300" onclick={() => { const target = info; void confirmCloseCheckouts(target, null); }}>
         Close all {info.tabCount} checkouts…
       </button>
+      {#if info.group}
+        <span class="gp-menu-sep" aria-hidden="true"></span>
+        {@const stackGrpHeader = groupHeadersByName.get(info.group)}
+        {#if stackGrpHeader && !stackGrpHeader.isCollapsed && stackGrpHeader.collapsedInactiveCount === 0}
+          <button
+            role="menuitem"
+            class="gp-menu-item"
+            onclick={() => {
+              setGroupInactiveCollapsed(info.group!, true);
+              closeMenu();
+            }}
+          >
+            Collapse inactive tabs in "{info.group}"
+          </button>
+        {:else if stackGrpHeader && stackGrpHeader.collapsedInactiveCount > 0}
+          <button
+            role="menuitem"
+            class="gp-menu-item"
+            onclick={() => {
+              setGroupExplicitlyExpanded(info.group!, true);
+              closeMenu();
+            }}
+          >
+            Expand all tabs in "{info.group}"
+          </button>
+        {/if}
+        {#if stackGrpHeader && stackGrpHeader.terminalCount > 0}
+          <button
+            role="menuitem"
+            class="gp-menu-item"
+            onclick={() => {
+              interfaceStore.toggleCollapseInactiveIncludeShells();
+              closeMenu();
+            }}
+          >
+            {$interfaceStore.collapseInactiveIncludeShells ? "Keep tabs with active shells visible" : "Collapse tabs with active shells"}
+          </button>
+        {/if}
+        <button
+          role="menuitem"
+          class="gp-menu-item"
+          onclick={() => {
+            repoStore.collapseInactiveGroups();
+            closeMenu();
+          }}
+        >
+          Collapse inactive groups
+        </button>
+        <button
+          role="menuitem"
+          class="gp-menu-item"
+          onclick={() => {
+            interfaceStore.setCollapseInactiveGroupTabs(!$interfaceStore.collapseInactiveGroupTabs);
+            closeMenu();
+          }}
+        >
+          {$interfaceStore.collapseInactiveGroupTabs ? "Show all tabs in groups" : "Collapse inactive tabs in groups"}
+        </button>
+      {/if}
     </div>
   {/if}
 {/if}
@@ -1918,6 +2150,29 @@
       Group all by parent folder
     </button>
     {#if distinctGroupNames.length > 0}
+      <button
+        role="menuitem"
+        class="gp-menu-item"
+        onclick={() => {
+          interfaceStore.setCollapseInactiveGroupTabs(!$interfaceStore.collapseInactiveGroupTabs);
+          closeStripMenu();
+        }}
+      >
+        {$interfaceStore.collapseInactiveGroupTabs ? "Show all tabs in groups" : "Collapse inactive tabs in groups"}
+      </button>
+      <button
+        role="menuitem"
+        class="gp-menu-item"
+        onclick={() => {
+          interfaceStore.toggleCollapseInactiveIncludeShells();
+          closeStripMenu();
+        }}
+      >
+        {$interfaceStore.collapseInactiveIncludeShells ? "Keep tabs with active shells visible" : "Collapse tabs with active shells"}
+      </button>
+      <button role="menuitem" class="gp-menu-item" onclick={() => { repoStore.collapseInactiveGroups(); closeStripMenu(); }}>
+        Collapse inactive groups
+      </button>
       <button role="menuitem" class="gp-menu-item" onclick={() => { repoStore.expandAllGroups(); closeStripMenu(); }}>
         Expand all groups
       </button>

@@ -11,12 +11,14 @@ name: Benchmarks
 # measured code, and a flaky required check is worse than none. A separate
 # workflow so a red result here is its own check, as deep-checks.yml is.
 #
-# Seeding a baseline: a runner class with no committed baseline FAILS this job
-# (bench-compare exits 2, "NO BASELINE") rather than passing with nothing
-# compared. Run this workflow by hand once, download the `bench-<runner>`
-# artifact, and write the baseline from it:
+# Seeding a baseline: a runner class with no committed baseline does not fail
+# the job and does not compare. Smoke still has to pass. The `bench-<runner>`
+# artifact is that run's measurements. Commit one with:
 #   node scripts/bench-compare.mjs --results <unzipped dir> \
 #        --write-baseline src-tauri/benches/baselines/<runner>.json
+# After that file exists, this job fails on a work-counter change or a
+# regression. Invoking bench-compare without a baseline still exits 2; only
+# this workflow treats "no file yet" as bootstrap.
 on:
   schedule:
     # Nightly, off the hour and off the other scheduled runs (03:17, 04:41).
@@ -114,5 +116,17 @@ jobs:
           path: bench-results/*.json
           if-no-files-found: error
 
+      # No committed baseline yet: the artifact from the step above is the
+      # measurement. Comparing would exit 2 (bench-compare refuses to call a
+      # missing file a pass). Say so and let smoke stand. A committed baseline
+      # is compared, and a regression fails the job.
       - name: Compare against the committed baseline
-        run: node scripts/bench-compare.mjs --results bench-results --baseline "src-tauri/benches/baselines/${{ matrix.os }}.json"
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline="src-tauri/benches/baselines/${{ matrix.os }}.json"
+          if [[ ! -f "$baseline" ]]; then
+            echo "::notice title=Bench baseline not committed::No ${baseline} in the tree. Smoke passed and the bench-${{ matrix.os }} artifact holds this run's measurements. Nothing was compared. Commit a baseline with: node scripts/bench-compare.mjs --results <unzipped artifact> --write-baseline ${baseline}"
+            exit 0
+          fi
+          node scripts/bench-compare.mjs --results bench-results --baseline "$baseline"

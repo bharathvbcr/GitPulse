@@ -383,38 +383,43 @@
     return null;
   });
 
+  // Widths are for `table-fixed`. An unsized column takes an equal share, so
+  // a severity badge was as wide as the advisory. The short columns are pinned
+  // and the name columns split what remains. `w-28` is the narrowest fix
+  // column that still holds "no fix yet" on one line; `w-36` holds
+  // "devDependencies" without breaking the word.
   const DEPENDABOT_COLUMNS = Object.freeze([
-    { label: "Severity" },
+    { label: "Severity", width: "w-24" },
     { label: "Package" },
     { label: "Advisory" },
-    { label: "Fix" },
-    { label: "Open on GitHub", width: "w-8", hideLabel: true },
+    { label: "Fix", width: "w-28" },
+    { label: "Open on GitHub", width: "w-12", hideLabel: true },
   ]);
   const CODE_SCANNING_COLUMNS = Object.freeze([
-    { label: "Severity" },
+    { label: "Severity", width: "w-24" },
     { label: "Rule" },
     { label: "Location" },
     { label: "Tool" },
-    { label: "Open on GitHub", width: "w-8", hideLabel: true },
+    { label: "Open on GitHub", width: "w-12", hideLabel: true },
   ]);
   const VULNERABILITY_COLUMNS = Object.freeze([
-    { label: "Severity" },
+    { label: "Severity", width: "w-24" },
     { label: "Package" },
     { label: "Advisory" },
-    { label: "Fix" },
-    { label: "Open advisory", width: "w-8", hideLabel: true },
+    { label: "Fix", width: "w-28" },
+    { label: "Open advisory", width: "w-12", hideLabel: true },
   ]);
   const OUTDATED_COLUMNS = Object.freeze([
     { label: "Package" },
     { label: "Current" },
     { label: "Wanted" },
     { label: "Latest" },
-    { label: "Type" },
+    { label: "Type", width: "w-36" },
   ]);
   const DEAD_CODE_COLUMNS = Object.freeze([
     { label: "Symbol" },
     { label: "File" },
-    { label: "Confidence" },
+    { label: "Confidence", width: "w-24" },
     { label: "Status" },
   ]);
 

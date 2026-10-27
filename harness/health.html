@@ -463,6 +463,47 @@
             const wrapper = section("vulnerabilities").querySelector("table").parentElement;
             return wrapper.scrollWidth <= wrapper.clientWidth + 1;
           });
+          // Equal shares gave the severity badge the same width as the package
+          // name. The short columns are pinned; the name columns have to be
+          // wider than they are, at the stage width, or the pin was dropped.
+          check("short columns leave the spare width to the name", () => {
+            const th = [...section("vulnerabilities").querySelectorAll("th")];
+            const w = th.map((el) => el.getBoundingClientRect().width);
+            // Severity and fix are pinned. At the stage width the package
+            // column has to be wider than either, which equal shares are not.
+            if (!(w[0] + 8 < w[1] && w[3] + 8 < w[1])) {
+              throw new Error(w.map((n) => Math.round(n)).join(","));
+            }
+            const td = section("outdated").querySelector("tbody td");
+            if (getComputedStyle(td).verticalAlign !== "top") throw new Error("row is not top-aligned");
+            return true;
+          });
+          // The harness stage is 1280px wide, which hides this: `overflow-wrap:
+          // anywhere` on the table lets a header word's minimum fall to one
+          // character, and a pane the width of the real window beside the
+          // sidebar splits SEVERITY into SEVER/ITY. Measure at that width,
+          // then put the stage back before the checks that follow.
+          check("column headers stay whole on a narrow pane", () => {
+            const stage = document.querySelector("#app");
+            const previous = stage.style.width;
+            stage.style.width = "480px";
+            const broken = [];
+            for (const th of root.querySelectorAll("table th")) {
+              const text = [...th.childNodes].find((node) => node.nodeType === Node.TEXT_NODE && node.textContent.trim());
+              if (!text) continue;
+              const range = document.createRange();
+              range.selectNodeContents(text);
+              const rects = [...range.getClientRects()].filter((rect) => rect.width > 0);
+              if (rects.length !== 1) broken.push(text.textContent.trim());
+            }
+            const wrapper = section("vulnerabilities").querySelector("table").parentElement;
+            const clipped = wrapper.scrollWidth > wrapper.clientWidth + 1;
+            stage.style.width = previous;
+            if (broken.length > 0 || clipped) {
+              throw new Error(clipped ? "vulnerabilities table wider than the pane" : broken.join(", "));
+            }
+            return true;
+          });
           check("markup in a field is text, not markup", () =>
             has(root, "<script>alert(1)<\/script>")
               && !root.querySelector("#app script"));

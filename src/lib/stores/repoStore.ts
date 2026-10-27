@@ -52,6 +52,7 @@ import {
   closeGroup as closeWorkspaceGroup,
   groupByParentFolder as groupWorkspaceByParentFolder,
   collapseAllGroups as collapseWorkspaceAllGroups,
+  collapseInactiveGroups as collapseWorkspaceInactiveGroups,
   expandAllGroups as expandWorkspaceAllGroups,
   type WorkspaceTabs,
 } from "../repos/tabModel";
@@ -67,7 +68,8 @@ import { autoInit } from "../codeintel/autoInit";
 import { liveIndex } from "../codeintel/liveIndex";
 import { type TabColor } from "../repos/tabColors";
 import { familyFromCommonDir } from "../repos/repoFamily";
-import { computeTabLayout, type StackingOptions } from "../repos/tabGroups";
+import { computeTabLayout, type GroupingOptions, type StackingOptions } from "../repos/tabGroups";
+import { collapsedInactiveGroups, explicitlyExpandedGroups } from "../repos/groupState";
 import {
   activationStops,
   canMoveUnit,
@@ -599,6 +601,16 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     };
   }
 
+  function stripGrouping(): GroupingOptions {
+    const iface = get(interfaceStore);
+    return {
+      collapseInactive: iface.collapseInactiveGroupTabs,
+      collapsedInactiveGroups: get(collapsedInactiveGroups),
+      expandedGroups: get(explicitlyExpandedGroups),
+      keepActiveShells: !iface.collapseInactiveIncludeShells,
+    };
+  }
+
   /** The strip as drawn, for shortcuts that step through what the reader sees. */
   function drawnLayout() {
     const projected = project(internal, options, projection);
@@ -608,6 +620,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       undefined,
       projected.groupColors,
       stripStacking(),
+      stripGrouping(),
     );
   }
 
@@ -2333,6 +2346,12 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     collapseAllGroups: () => {
       commitEdit();
       replaceWorkspace(collapseWorkspaceAllGroups(internal.workspace));
+      publish();
+      flushPersist();
+    },
+    collapseInactiveGroups: () => {
+      commitEdit();
+      replaceWorkspace(collapseWorkspaceInactiveGroups(internal.workspace));
       publish();
       flushPersist();
     },

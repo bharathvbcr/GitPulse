@@ -497,8 +497,35 @@
           }
           const dock = document.querySelector("[data-terminal-dock]");
           const height = dock.getBoundingClientRect().height;
+          // The view above the dock carries positioned controls — Work's
+          // Proposals pill sits at z-index 20 over the board's corner. An
+          // expanded dock takes the view's whole height, and a control left
+          // hanging out of a zero-height box painted over the terminal.
+          const pill = document.querySelector('[data-testid="proposals-open"]');
+          const viewport = () => ({ left: 0, top: 0, right: innerWidth, bottom: innerHeight });
+          const paintsAt = (el, area) => {
+            const r = el.getBoundingClientRect();
+            const left = Math.max(r.left, area.left), right = Math.min(r.right, area.right);
+            const top = Math.max(r.top, area.top), bottom = Math.min(r.bottom, area.bottom);
+            if (right <= left || bottom <= top) return false;
+            const hit = document.elementFromPoint((left + right) / 2, (top + bottom) / 2);
+            return !!hit && el.contains(hit);
+          };
+          const takesFocus = (el) => {
+            const before = document.activeElement;
+            el.focus();
+            const focused = document.activeElement === el;
+            if (before instanceof HTMLElement) before.focus(); else el.blur();
+            return focused;
+          };
+          check("the Proposals pill shows and takes focus while the dock leaves the view room",
+            () => !!pill && paintsAt(pill, viewport()) && takesFocus(pill));
           button("Expand terminal").click(); await wait(); check("expand grows the dock", () => dock.getBoundingClientRect().height > height);
+          check("an expanded dock hides the view's Proposals pill rather than painting it over the terminal",
+            () => !paintsAt(pill, dock.getBoundingClientRect()) && !paintsAt(pill, viewport()));
+          check("an expanded dock takes the view's controls out of the tab order", () => !takesFocus(pill));
           button("Restore terminal size").click(); await wait(); check("restore returns previous height", () => dock.getBoundingClientRect().height === height);
+          check("restoring the dock brings the Proposals pill back", () => paintsAt(pill, viewport()) && takesFocus(pill));
           {
             // The resize handle is a WAI-ARIA separator: it reports its value,
             // and the arrow keys nudge the dock without a pointer.

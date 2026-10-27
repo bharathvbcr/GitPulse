@@ -212,6 +212,12 @@ fn the_reflog_spawn_count_is_bounded_and_a_larger_family_is_reported() {
     assert_eq!(shows() - before, 5 + 1, "{whole:?}");
     assert_eq!(whole.reflog_refs_skipped, 0, "{whole:?}");
     assert!(!whole.truncated, "{whole:?}");
+    // The command-timings bench builds 18 worktrees and refuses a truncated
+    // pass. A cap under that makes the bench fail before it measures anything.
+    assert!(
+        MAX_REFLOG_WORKTREES >= 18,
+        "command_timings fixture does not fit one catch-up pass"
+    );
     let before = shows();
     let again = ingest_reflogs(
         &anchor,

@@ -4854,6 +4854,11 @@ mod tests {
 
     #[test]
     fn mcp_info_reads_the_native_codex_package() {
+        // `GITPULSE_PLUGIN_ROOT` is process-global. A parallel test points it
+        // at a temp package; reading it without the env serial reports that
+        // temp dir as the native Codex package.
+        let serial = crate::test_support::env::env_serial();
+        let _env = crate::test_support::env::bind_env(&serial).remove("GITPULSE_PLUGIN_ROOT");
         let info = mcp_info();
         assert!(info.plugin_found, "{}", info.plugin_error);
         assert!(

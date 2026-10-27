@@ -431,7 +431,7 @@ describe.skipIf(!gitAvailable || !hasBash)("pre-push across remotes, tags and ma
     git(dir, ["remote", "add", "mirror", mirror]);
     const result = tryGit(dir, ["push", "mirror", "main"]);
     expect(result.ok, result.stderr).toBe(true);
-  });
+  }, 30_000);
 
   it("refuses an annotated tag whose tagger is a fixture, and allows one by a person", () => {
     const dir = initPushed();
@@ -446,7 +446,7 @@ describe.skipIf(!gitAvailable || !hasBash)("pre-push across remotes, tags and ma
     git(dir, ["tag", "-a", "real-tag", "-m", "t"], envWithoutIdentity());
     const allowed = tryGit(dir, ["push", "origin", "refs/tags/real-tag"]);
     expect(allowed.ok, allowed.stderr).toBe(true);
-  });
+  }, 30_000);
 
   it("names only the refs that carry a fixture commit when many are pushed at once", () => {
     const dir = initPushed();

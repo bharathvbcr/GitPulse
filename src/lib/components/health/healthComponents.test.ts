@@ -188,6 +188,37 @@ describe("HealthTable", () => {
     expect(body).toContain('scope="col"');
   });
 
+  it("wraps cell values without splitting header words", () => {
+    // `anywhere` on the <table> reaches the header. A header is one word, and
+    // anywhere lets that word's minimum width fall to one character, so a
+    // narrow pane renders SEVER/ITY and PACKA/GE. The body still needs it:
+    // break-word will not shrink a 300-character package name.
+    const text = source("HealthTable.svelte");
+    const tableTag = text.slice(text.indexOf("<table"), text.indexOf(">", text.indexOf("<table")) + 1);
+    const tbodyTag = text.slice(text.indexOf("<tbody"), text.indexOf(">", text.indexOf("<tbody")) + 1);
+    expect(tableTag).not.toContain("overflow-wrap:anywhere");
+    expect(tableTag).toContain("table-fixed");
+    expect(tbodyTag).toContain("overflow-wrap:anywhere");
+    // One wrapping cell used to vertically center the badge and the version.
+    expect(tbodyTag).toContain("align-top");
+    expect(text).toContain("whitespace-nowrap");
+  });
+
+  it("pins the short columns so a name keeps the spare width", () => {
+    // Equal shares made the severity badge as wide as the advisory, and let
+    // "devDependencies" break mid-word while Current sat in the same width.
+    const panel = readFileSync(join(here, "../HealthPanel.svelte"), "utf8");
+    const block = (name: string) => panel.slice(panel.indexOf(`const ${name}`), panel.indexOf("];", panel.indexOf(`const ${name}`)));
+    for (const name of ["DEPENDABOT_COLUMNS", "VULNERABILITY_COLUMNS"]) {
+      const cols = block(name);
+      expect(cols).toContain('label: "Severity", width: "w-24"');
+      expect(cols).toContain('label: "Fix", width: "w-28"');
+    }
+    expect(block("CODE_SCANNING_COLUMNS")).toContain('label: "Severity", width: "w-24"');
+    expect(block("OUTDATED_COLUMNS")).toContain('label: "Type", width: "w-36"');
+    expect(block("DEAD_CODE_COLUMNS")).toContain('label: "Confidence", width: "w-24"');
+  });
+
   it("survives duplicate column labels without dropping a header cell", () => {
     const { body } = render(HealthTable, {
       props: {
