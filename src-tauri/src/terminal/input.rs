@@ -83,8 +83,13 @@ fn write_with_timeout(
     data: &[u8],
     timeout: Duration,
 ) -> Result<(), String> {
-    let deadline = Instant::now() + timeout;
-    let check = |written| {
+    // A stall, not a budget for the whole write. A reader that keeps accepting
+    // bytes (a large paste into a slow program) is making progress; a write
+    // that stops advancing still fails after `timeout`. A single deadline from
+    // the start failed a 60 KiB write on a loaded runner after 28 KiB had
+    // already been accepted.
+    let mut deadline = Instant::now() + timeout;
+    let check = |written: usize, deadline: Instant| {
         if dead.load(Ordering::Acquire) {
             Err(format!(
                 "Terminal closed after writing {written} of {} input bytes",
@@ -97,7 +102,7 @@ fn write_with_timeout(
         }
     };
     let mut writer = loop {
-        check(0)?;
+        check(0, deadline)?;
         match writer.try_lock() {
             Ok(writer) => break writer,
             Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(5)),
@@ -117,7 +122,7 @@ fn write_with_timeout(
         Err(error)
     };
     while written < data.len() {
-        if let Err(error) = check(written) {
+        if let Err(error) = check(written, deadline) {
             return give_up(written, error, &mut writer);
         }
         match writer.write(&data[written..]) {
@@ -131,7 +136,10 @@ fn write_with_timeout(
                     &mut writer,
                 )
             }
-            Ok(n) => written += n,
+            Ok(n) => {
+                written += n;
+                deadline = Instant::now() + timeout;
+            }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(5))
@@ -201,13 +209,62 @@ mod tests {
     use std::io::{self, Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     /// One 100 ms lap, the longest the readiness fallback sleeps.
     fn wait_for_output(fd: std::os::fd::RawFd) -> io::Result<()> {
         wait_for_output_within(fd, Duration::from_millis(100)).map(|_| ())
+    }
+
+    /// A writer that accepts one byte and then blocks briefly is slow, not
+    /// stuck. The timeout is how long delivery may go without progress.
+    struct SlowByte {
+        accepted: Arc<AtomicUsize>,
+        gap: Duration,
+        next: Instant,
+    }
+
+    impl Write for SlowByte {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            if data.is_empty() {
+                return Ok(0);
+            }
+            if Instant::now() < self.next {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "full"));
+            }
+            self.accepted.fetch_add(1, Ordering::SeqCst);
+            self.next = Instant::now() + self.gap;
+            Ok(1)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_slow_reader_that_keeps_accepting_bytes_is_not_a_stuck_write() {
+        let gap = Duration::from_millis(30);
+        let timeout = Duration::from_millis(100);
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let writer = SlowByte {
+            accepted: accepted.clone(),
+            gap,
+            next: Instant::now(),
+        };
+        let held = Mutex::new(Box::new(writer) as Box<dyn Write + Send>);
+        let dead = AtomicBool::new(false);
+        let payload = vec![b'.'; 20];
+        let started = Instant::now();
+        write_with_timeout(&held, &dead, &payload, timeout).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(accepted.load(Ordering::SeqCst), payload.len());
+        assert!(
+            elapsed > timeout,
+            "the write finished inside one stall window ({elapsed:?}), so this did not prove progress resets it"
+        );
     }
 
     /// The defect: a poisoned writer lock answered "Terminal writer lock
