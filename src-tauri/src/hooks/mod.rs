@@ -43,8 +43,14 @@ use crate::harness::{self, PolicyStatus, ScopedVerdict};
 use crate::insights::{self, same_path, CollisionRisk, InsightsSnapshot};
 
 pub mod advisory_once;
+mod notify_drops;
 mod notify_input;
+mod notify_outcome;
+use notify_drops::{DropSnapshot, NotifyDrops};
 pub use notify_input::SESSION_END_HOST_TIMEOUT;
+#[cfg(not(unix))]
+use notify_outcome::send_unsupported as notify_send;
+pub use notify_outcome::{diagnostic, Diagnostic, HookError, SendError};
 pub mod signal_guard;
 
 /// Wall-clock ceiling for the work behind one hook invocation.
@@ -2069,7 +2075,7 @@ pub fn dispatch(
     subcommand: &str,
     argument: Option<&str>,
     input: &HookInput,
-) -> Result<HookOutput, String> {
+) -> Result<HookOutput, HookError> {
     match subcommand {
         "collision-guard" => Ok(run_collision_guard(input)),
         "command-gate" => Ok(run_command_gate(input)),
@@ -2078,7 +2084,8 @@ pub fn dispatch(
         other => Err(format!(
             "unknown subcommand '{other}'; expected one of {}",
             SUBCOMMANDS.join(", ")
-        )),
+        )
+        .into()),
     }
 }
 
@@ -2121,8 +2128,56 @@ pub(crate) const SESSION_END_NOTIFY_BUDGET: Duration = Duration::from_millis(300
 fn run_notify(
     argument: Option<&str>,
     input: &HookInput,
-    send: impl FnOnce(&std::path::Path, &str) -> Result<(), String> + Send + 'static,
-) -> Result<HookOutput, String> {
+    send: impl FnOnce(&std::path::Path, &str) -> Result<(), SendError> + Send + 'static,
+) -> Result<HookOutput, HookError> {
+    run_notify_within(argument, input, send, &notify_drops::PROCESS_DROPS, None)
+}
+
+/// [`run_notify`] with the two things a test must be able to name: where an
+/// abandoned report is counted, and the send budget. `None` is the production
+/// budget for the event ([`notify_input::budgets_for`]); a test passes a few
+/// milliseconds and a send that waits on a channel, so the give-up path runs
+/// without the suite sitting out a real deadline.
+fn run_notify_within(
+    argument: Option<&str>,
+    input: &HookInput,
+    send: impl FnOnce(&std::path::Path, &str) -> Result<(), SendError> + Send + 'static,
+    drops: &NotifyDrops,
+    send_budget: Option<Duration>,
+) -> Result<HookOutput, HookError> {
+    run_notify_with(
+        argument,
+        input,
+        send,
+        drops,
+        send_budget,
+        notify_outcome::TRANSPORT_AVAILABLE,
+        socket_path_from_env,
+    )
+}
+
+/// The socket a report goes to: `GITPULSE_NOTIFY_SOCKET` when set, else the
+/// one in GitPulse's configuration directory (`None` with no such directory).
+fn socket_path_from_env() -> Option<std::path::PathBuf> {
+    match std::env::var_os(crate::alerts::bridge::SOCKET_ENV) {
+        Some(value) if !value.is_empty() => Some(std::path::PathBuf::from(value)),
+        _ => crate::alerts::bridge::socket_path(),
+    }
+}
+
+/// [`run_notify_within`] with the transport's availability and the path lookup
+/// passed in, so a macOS test can drive the order that matters on Windows: the
+/// transport is checked before the path is resolved.
+#[allow(clippy::too_many_arguments)]
+fn run_notify_with(
+    argument: Option<&str>,
+    input: &HookInput,
+    send: impl FnOnce(&std::path::Path, &str) -> Result<(), SendError> + Send + 'static,
+    drops: &NotifyDrops,
+    send_budget: Option<Duration>,
+    transport_available: bool,
+    resolve_socket: impl FnOnce() -> Option<std::path::PathBuf>,
+) -> Result<HookOutput, HookError> {
     let Some(event) = argument.and_then(crate::alerts::bridge::event) else {
         // An Err rather than silence: an unknown reason means the plugin
         // manifest and this binary have drifted, which is exactly the kind of
@@ -2135,7 +2190,8 @@ fn run_notify(
                 .map(|event| event.name)
                 .collect::<Vec<_>>()
                 .join(", ")
-        ));
+        )
+        .into());
     };
     // A state or a resolution is about a GitPulse terminal, and the socket
     // refuses one that names none. Outside a GitPulse terminal — the common
@@ -2145,20 +2201,49 @@ fn run_notify(
     if event.role != crate::alerts::bridge::Role::Banner && session_env().is_none() {
         return Ok(HookOutput::silent());
     }
-    let path = match std::env::var_os(crate::alerts::bridge::SOCKET_ENV) {
-        Some(value) if !value.is_empty() => std::path::PathBuf::from(value),
-        _ => crate::alerts::bridge::socket_path()
-            .ok_or("no GitPulse configuration directory to find a notification socket in")?,
-    };
+    // Before anything about where a socket would live: on a platform with no
+    // transport the answer is "unsupported" whatever the path, and a missing
+    // configuration directory must not turn it into a warning.
+    let path = notify_outcome::socket_for_send(transport_available, resolve_socket)?;
     let payload = notify_payload(event, input);
     // Detached at the deadline. A hook the host is waiting on must not be held
     // by a socket that is not answering, and the report is worth nothing late.
-    let (_, send_budget) = notify_input::budgets_for(event.name);
-    match within_budget(send_budget, move || send(&path, &payload)) {
-        Some(Ok(())) => Ok(HookOutput::silent()),
-        Some(Err(error)) => Err(format!("notification report not delivered: {error}")),
-        None => Err("notification report exceeded its deadline; not retried".into()),
+    let send_budget = send_budget.unwrap_or_else(|| notify_input::budgets_for(event.name).1);
+    match within_budget_typed(send_budget, move || send(&path, &payload)) {
+        Ok(Ok(())) => Ok(HookOutput::silent()),
+        // The socket's own deadline ended the wait before the outer budget did.
+        // Same fact, same count: which of two timers fired is not a difference
+        // a reader of the count may depend on.
+        Ok(Err(SendError::NoReply)) | Err(BudgetMiss::TimedOut) => {
+            Err(missed_reply(event.name, drops))
+        }
+        Ok(Err(error)) => Err(error.into()),
+        // A dead worker is not a late reply: nothing was awaited past a bound.
+        // Said as what it is, at warn, and never counted.
+        Err(BudgetMiss::WorkerPanicked) => Err(HookError::Failed(format!(
+            "notification report ({}) was not sent: its worker thread panicked",
+            event.name
+        ))),
+        Err(BudgetMiss::SpawnFailed(reason)) => Err(HookError::Failed(format!(
+            "notification report ({}) was not sent: could not start its worker thread: {reason}",
+            event.name
+        ))),
     }
+}
+
+/// Counts one report whose reply missed its bound, and says so. Counted where
+/// the give-up is decided; a reply that arrives in time never reaches here.
+fn missed_reply(event: &str, drops: &NotifyDrops) -> HookError {
+    drops.record();
+    let DropSnapshot {
+        dropped,
+        dropped_scope,
+    } = drops.snapshot();
+    HookError::Failed(format!(
+        "notification report ({event}) got no reply (the deadline passed or the peer closed \
+         without one); not retried \
+         ({dropped} dropped, scope {dropped_scope})"
+    ))
 }
 
 /// The GitPulse PTY this hook runs under, when it runs under one.
@@ -2344,35 +2429,66 @@ fn notify_payload(event: &crate::alerts::bridge::Event, input: &HookInput) -> St
     Value::Object(report).to_string()
 }
 
+/// Sends one report down the notification socket. On a platform with no such
+/// transport the stand-in is [`notify_outcome::send_unsupported`], which says so
+/// instead of failing.
 #[cfg(unix)]
-fn notify_send(path: &std::path::Path, payload: &str) -> Result<(), String> {
+fn notify_send(path: &std::path::Path, payload: &str) -> Result<(), SendError> {
+    let stream = std::os::unix::net::UnixStream::connect(path)
+        // A connect that fails is a failure, never a missed reply: nothing was
+        // sent, and `EAGAIN` here is a full accept backlog, not a timeout.
+        .map_err(|e| SendError::Failed(format!("{}: {e}", path.display())))?;
+    exchange(stream, payload, NOTIFY_BUDGET)
+}
+
+/// One report and its answer over a connected socket, inside one deadline.
+///
+/// The deadline is `crate::deadline::DeadlineStream`'s, the one owner of
+/// "every read and write of a socket gets what is left of one deadline". It
+/// also owns two facts this function used to get wrong with a plain
+/// `set_*_timeout(..)?`: macOS refuses a timeout with `EINVAL` on a socket the
+/// peer has already shut down (a bridge at capacity writes its refusal and
+/// closes), which `DeadlineStream` tolerates because such a socket cannot
+/// block; and an expired timeout is `WouldBlock` there and `TimedOut` on Linux,
+/// which it reports as one `TimedOut`.
+///
+/// A failed write, flush or half-close is not yet the outcome, for the same
+/// reason: a peer that answered and closed meets the report with a closed
+/// socket while its reply sits unread. The reply is read, and a reply that was
+/// read decides the outcome however the read then ended: a bridge at capacity
+/// writes its refusal and closes without reading the report, which Linux
+/// reports as `ECONNRESET` after the reply and macOS as end of stream. What an
+/// exchange means is [`notify_outcome::classify_exchange`], a pure function
+/// tested on every host. No reply within the deadline, or from a peer that is
+/// gone, is [`SendError::NoReply`], whichever clock said so.
+#[cfg(unix)]
+fn exchange(
+    stream: std::os::unix::net::UnixStream,
+    payload: &str,
+    budget: Duration,
+) -> Result<(), SendError> {
+    use crate::deadline::DeadlineStream;
     use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
-    let mut stream = UnixStream::connect(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    stream
-        .set_write_timeout(Some(NOTIFY_BUDGET))
-        .map_err(|e| e.to_string())?;
-    stream
-        .set_read_timeout(Some(NOTIFY_BUDGET))
-        .map_err(|e| e.to_string())?;
-    stream
+    let mut stream = DeadlineStream::new(stream, std::time::Instant::now() + budget);
+    let sent = stream
         .write_all(payload.as_bytes())
-        .map_err(|e| e.to_string())?;
-    stream.flush().map_err(|e| e.to_string())?;
-    // Half-close so the reader sees EOF and answers rather than waiting for
-    // its own timeout.
-    stream
-        .shutdown(std::net::Shutdown::Write)
-        .map_err(|e| e.to_string())?;
+        .and_then(|()| stream.flush())
+        // Half-close so the reader sees EOF and answers rather than waiting for
+        // its own timeout.
+        .and_then(|()| stream.get_ref().shutdown(std::net::Shutdown::Write));
     // Then read the answer. A report GitPulse refused was not delivered, and
     // saying it was is the exact confusion this module exists to prevent: the
     // refusal is the drift between this binary and the app it reports to.
     let mut reply = Vec::with_capacity(16);
-    (&mut stream)
-        .take(64)
-        .read_to_end(&mut reply)
-        .map_err(|e| format!("no answer from GitPulse: {e}"))?;
-    acknowledged(&reply)
+    // `read_to_end` keeps what it read when it then fails, so `reply` is what
+    // arrived whatever ended the read.
+    let read = (&mut stream).take(64).read_to_end(&mut reply);
+    notify_outcome::classify_exchange(
+        &reply,
+        read.as_ref().map(|_| ()),
+        sent.as_ref().map(|_| ()),
+        acknowledged,
+    )
 }
 
 /// Whether the socket's one-line answer accepted the report, and if not, why in
@@ -2451,11 +2567,6 @@ fn refusal_text(reply: Option<&Value>) -> String {
     }
 }
 
-#[cfg(not(unix))]
-fn notify_send(_path: &std::path::Path, _payload: &str) -> Result<(), String> {
-    Err("agent notification reports need a Unix socket, which this platform does not offer".into())
-}
-
 /* ── Shared helpers ───────────────────────────────────────────────────────── */
 
 /// Runs `work` on a worker thread and abandons it at `budget`.
@@ -2468,10 +2579,35 @@ fn notify_send(_path: &std::path::Path, _payload: &str) -> Result<(), String> {
 /// token, so the only honest ceiling available is to stop *waiting*. The worker
 /// is left detached: the process exits immediately after printing, which tears
 /// it down, and a detached thread cannot hold up that exit.
+///
+/// `None` for every way the work did not answer: the deadline, a worker that
+/// panicked, a thread that could not be started. Every caller but `notify`
+/// treats all three as "this check did not run" and says so, which is the right
+/// reading for them; `notify` must tell them apart and uses
+/// [`within_budget_typed`].
 fn within_budget<T: Send + 'static>(
     budget: Duration,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {
+    within_budget_typed(budget, work).ok()
+}
+
+/// Why [`within_budget_typed`] gave no answer.
+#[derive(Debug, PartialEq, Eq)]
+enum BudgetMiss {
+    /// The budget passed with the worker still running: it was abandoned.
+    TimedOut,
+    /// The worker died without answering. Nothing was awaited past a bound.
+    WorkerPanicked,
+    /// The worker thread could not be started.
+    SpawnFailed(String),
+}
+
+/// [`within_budget`] saying which way it gave up.
+fn within_budget_typed<T: Send + 'static>(
+    budget: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, BudgetMiss> {
     let budget = clamp_to_total(budget, STARTED.get().copied());
     let (tx, rx) = mpsc::channel();
     // A send onto a dropped receiver is an error, not a panic, so the worker
@@ -2494,14 +2630,18 @@ fn within_budget<T: Send + 'static>(
             );
             let _ = tx.send(answer);
         })
-        .ok()?;
-    let answer = rx.recv_timeout(budget).ok()?;
+        .map_err(|error| BudgetMiss::SpawnFailed(error.to_string()))?;
+    let answer = rx.recv_timeout(budget).map_err(|error| match error {
+        mpsc::RecvTimeoutError::Timeout => BudgetMiss::TimedOut,
+        // The sender is dropped without a value only when the worker unwound.
+        mpsc::RecvTimeoutError::Disconnected => BudgetMiss::WorkerPanicked,
+    })?;
     #[cfg(test)]
     let answer = {
         LAST_WORKER_CPU.set(answer.1);
         answer.0
     };
-    Some(answer)
+    Ok(answer)
 }
 
 #[cfg(test)]
@@ -2646,6 +2786,8 @@ fn truncate_marked(mut text: String, limit: usize) -> String {
     text
 }
 
+#[cfg(test)]
+mod adv_l5_tests;
 #[cfg(test)]
 mod hidden_channel_tests;
 #[cfg(test)]
@@ -5560,7 +5702,8 @@ done
     #[test]
     fn an_unknown_subcommand_is_an_error_the_binary_reports_not_a_silent_no_op() {
         let err = dispatch("collision-gaurd", None, &HookInput::default())
-            .expect_err("a typo must not pass for a check");
+            .expect_err("a typo must not pass for a check")
+            .to_string();
         assert!(err.contains("unknown subcommand"));
         for name in SUBCOMMANDS {
             assert!(err.contains(name), "the error should list {name}");
@@ -5580,7 +5723,9 @@ done
         for name in SUBCOMMANDS {
             let outcome = dispatch(name, None, &HookInput::default());
             if REPORTERS.contains(&name) {
-                let error = outcome.expect_err("a reporter with no argument has nothing to send");
+                let error = outcome
+                    .expect_err("a reporter with no argument has nothing to send")
+                    .to_string();
                 assert!(
                     !error.contains("unknown subcommand"),
                     "{name} is advertised but was not routed: {error}"
@@ -5623,7 +5768,7 @@ done
         event: &str,
         input: &HookInput,
     ) -> (
-        Result<HookOutput, String>,
+        Result<HookOutput, HookError>,
         std::sync::Arc<std::sync::Mutex<Option<String>>>,
     ) {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -5731,7 +5876,9 @@ done
             let result = run_notify(Some(event), &notify_input(), |_, _| {
                 panic!("an unknown event reached the socket")
             });
-            let error = result.expect_err(&format!("{event:?} was accepted"));
+            let error = result
+                .expect_err(&format!("{event:?} was accepted"))
+                .to_string();
             assert!(error.contains("unknown notify event"), "{error}");
         }
         assert!(run_notify(None, &notify_input(), |_, _| Ok(())).is_err());
@@ -5778,13 +5925,298 @@ done
             thread::sleep(Duration::from_secs(30));
             Ok(())
         })
-        .expect_err("a hung socket must not report success");
+        .expect_err("a hung socket must not report success")
+        .to_string();
         assert!(error.contains("deadline"), "{error}");
         assert!(
             started.elapsed() < NOTIFY_BUDGET * 4,
             "waited {:?}",
             started.elapsed()
         );
+    }
+
+    /// A `SessionEnd` report whose reply misses its bound is counted, once,
+    /// in the snapshot shape the ledger gives its own drops. The fake host
+    /// cannot answer until the test lets it, so the deadline always passes
+    /// first: no sleep races it.
+    #[test]
+    fn a_session_end_report_whose_reply_misses_its_bound_is_counted_once() {
+        let serial = crate::test_support::env::env_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(crate::alerts::bridge::SESSION_ENV, "term-4-1")
+            .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
+        let drops = NotifyDrops::new();
+        assert_eq!(drops.snapshot().dropped, 0);
+        let (release, held) = mpsc::channel::<()>();
+        let error = run_notify_within(
+            Some("session_ended"),
+            &notify_input(),
+            move |_, _| {
+                // Blocks until the sender is dropped, which is after the
+                // assertions below.
+                let _ = held.recv();
+                Ok(())
+            },
+            &drops,
+            Some(Duration::from_millis(20)),
+        )
+        .expect_err("a reply that never came must not report success");
+        assert!(error.to_string().contains("deadline"), "{error}");
+        assert_eq!(
+            drops.snapshot(),
+            DropSnapshot {
+                dropped: 1,
+                dropped_scope: crate::ledger::DROPPED_SCOPE.to_string(),
+            }
+        );
+        assert_eq!(drops.snapshot().dropped_scope, "this_process");
+        drop(release);
+    }
+
+    /// A reply that arrives in time is not a drop, whatever it says: accepted,
+    /// refused, or a transport this platform does not have.
+    #[test]
+    fn a_reply_that_arrives_in_time_is_never_counted() {
+        let serial = crate::test_support::env::env_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(crate::alerts::bridge::SESSION_ENV, "term-4-1")
+            .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
+        let drops = NotifyDrops::new();
+        let in_time = Some(Duration::from_secs(30));
+        let delivered = run_notify_within(
+            Some("session_ended"),
+            &notify_input(),
+            |_, _| Ok(()),
+            &drops,
+            in_time,
+        );
+        assert!(delivered.expect("delivered").is_silent());
+        let refused = run_notify_within(
+            Some("session_ended"),
+            &notify_input(),
+            |_, _| Err(SendError::Failed("refused".into())),
+            &drops,
+            in_time,
+        )
+        .expect_err("a refusal is an error");
+        assert!(matches!(refused, HookError::Failed(_)), "{refused:?}");
+        let unsupported = run_notify_within(
+            Some("session_ended"),
+            &notify_input(),
+            |_, _| Err(SendError::Unsupported),
+            &drops,
+            in_time,
+        )
+        .expect_err("an absent transport is not a delivery");
+        assert!(
+            matches!(unsupported, HookError::Unsupported(_)),
+            "{unsupported:?}"
+        );
+        assert_eq!(drops.snapshot().dropped, 0);
+    }
+
+    /// "No reply within the bound" is one outcome however the wait ended. The
+    /// socket's own deadline (`SendError::NoReply`) and the outer budget are
+    /// both counted, once each, for an event whose two bounds are equal.
+    #[test]
+    fn a_missed_reply_is_counted_once_whichever_clock_ends_the_wait() {
+        let serial = crate::test_support::env::env_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(crate::alerts::bridge::SESSION_ENV, "term-4-1")
+            .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
+        let drops = NotifyDrops::new();
+        let error = run_notify_within(
+            Some("tool_finished"),
+            &notify_input(),
+            |_, _| Err(SendError::NoReply),
+            &drops,
+            Some(Duration::from_secs(30)),
+        )
+        .expect_err("no reply is not a delivery");
+        assert!(error.to_string().contains("got no reply"), "{error}");
+        assert_eq!(drops.snapshot().dropped, 1);
+        let (release, held) = mpsc::channel::<()>();
+        run_notify_within(
+            Some("tool_finished"),
+            &notify_input(),
+            move |_, _| {
+                let _ = held.recv();
+                Ok(())
+            },
+            &drops,
+            Some(Duration::from_millis(20)),
+        )
+        .expect_err("a reply past the outer budget is not a delivery");
+        assert_eq!(drops.snapshot().dropped, 2);
+        drop(release);
+    }
+
+    /// A dead worker is not a late reply: it is said as what it is, at warn,
+    /// and not counted. The wait is far longer than the worker takes to die, so
+    /// no deadline can be what ended it.
+    #[test]
+    fn a_worker_that_panics_is_reported_as_such_and_not_counted() {
+        let serial = crate::test_support::env::env_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(crate::alerts::bridge::SESSION_ENV, "term-4-1")
+            .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
+        let drops = NotifyDrops::new();
+        let error = run_notify_within(
+            Some("session_ended"),
+            &notify_input(),
+            |_, _| panic!("worker fault"),
+            &drops,
+            Some(Duration::from_secs(30)),
+        )
+        .expect_err("a dead worker did not deliver");
+        assert!(
+            error.to_string().contains("worker thread panicked"),
+            "{error}"
+        );
+        assert_eq!(diagnostic(&error).level, log::Level::Warn);
+        assert_eq!(drops.snapshot().dropped, 0);
+    }
+
+    /// `within_budget` keeps its meaning for every other caller: no answer is
+    /// `None` whether the deadline passed or the worker died; the typed form
+    /// tells the two apart.
+    #[test]
+    fn within_budget_still_says_none_and_the_typed_form_says_why() {
+        assert_eq!(
+            within_budget(Duration::from_secs(30), || -> u8 { panic!("fault") }),
+            None
+        );
+        assert_eq!(
+            within_budget_typed(Duration::from_secs(30), || -> u8 { panic!("fault") }),
+            Err(BudgetMiss::WorkerPanicked)
+        );
+        let (release, held) = mpsc::channel::<()>();
+        assert_eq!(
+            within_budget_typed(Duration::from_millis(20), move || {
+                let _ = held.recv();
+                1u8
+            }),
+            Err(BudgetMiss::TimedOut)
+        );
+        drop(release);
+        assert_eq!(within_budget_typed(Duration::from_secs(30), || 7u8), Ok(7));
+    }
+
+    /// On a platform with no transport the hook reaches `Unsupported` before it
+    /// asks where a socket would live: the path lookup and the send both panic.
+    #[test]
+    fn an_unavailable_transport_is_unsupported_before_any_path_lookup() {
+        let serial = crate::test_support::env::env_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(crate::alerts::bridge::SESSION_ENV, "term-4-1");
+        let drops = NotifyDrops::new();
+        for event in ["session_ended", "tool_finished", "agent_completed"] {
+            let error = run_notify_with(
+                Some(event),
+                &notify_input(),
+                |_, _| panic!("nothing is sent on a platform with no transport"),
+                &drops,
+                None,
+                false,
+                || panic!("the socket path was resolved with no transport"),
+            )
+            .expect_err("an absent transport is not a delivery");
+            assert!(
+                matches!(error, HookError::Unsupported(_)),
+                "{event}: {error:?}"
+            );
+            assert_eq!(diagnostic(&error).level, log::Level::Info);
+        }
+        assert_eq!(drops.snapshot().dropped, 0);
+    }
+
+    /// With a transport, a missing configuration directory is still a failure.
+    #[test]
+    fn an_available_transport_with_no_config_directory_is_a_failure() {
+        let serial = crate::test_support::env::env_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(crate::alerts::bridge::SESSION_ENV, "term-4-1");
+        let error = run_notify_with(
+            Some("session_ended"),
+            &notify_input(),
+            |_, _| panic!("no path, no send"),
+            &NotifyDrops::new(),
+            None,
+            true,
+            || None,
+        )
+        .expect_err("no socket path");
+        assert!(matches!(error, HookError::Failed(_)), "{error:?}");
+    }
+
+    /// A bridge at capacity writes its refusal and closes before the hook has
+    /// set a timeout. macOS answers `EINVAL` to a timeout on such a socket, and
+    /// the hook used to report that instead of the refusal. The socket pair is
+    /// closed by the peer before `exchange` touches it, so this is the same
+    /// every run, not a race with a listener thread.
+    #[cfg(unix)]
+    #[test]
+    fn a_refusal_written_by_a_peer_that_then_closed_is_reported_as_itself() {
+        use std::io::Write;
+        let (hook_end, mut bridge_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        bridge_end
+            .write_all(b"{\"ok\":false,\"reason\":\"at_capacity\"}\n")
+            .unwrap();
+        drop(bridge_end);
+        let error = exchange(hook_end, r#"{"v":1,"event":"error"}"#, NOTIFY_BUDGET)
+            .expect_err("a refusal is not a delivery");
+        assert!(
+            matches!(&error, SendError::Failed(text) if text.contains("at_capacity")),
+            "{error:?}"
+        );
+    }
+
+    /// The bridge's real refusal bytes, through the real acknowledgement parser,
+    /// when the read ends in the reset Linux reports after a peer that closed
+    /// unread (`bridge.rs` `serve`: write the refusal, return). Only the
+    /// classification can be driven on this host; `exchange` itself cannot make
+    /// macOS produce the reset.
+    #[cfg(unix)]
+    #[test]
+    fn the_real_at_capacity_reply_survives_a_reset_after_it() {
+        let reply = format!(
+            "{{\"ok\":false,\"reason\":\"{}\"}}\n",
+            crate::alerts::bridge::Reason::AtCapacity.token()
+        );
+        let reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        let outcome =
+            notify_outcome::classify_exchange(reply.as_bytes(), Err(&reset), Ok(()), acknowledged);
+        assert!(
+            matches!(&outcome, Err(SendError::Failed(text)) if text.contains("at_capacity")),
+            "{outcome:?}"
+        );
+    }
+
+    /// A peer that closed with nothing to say and a peer that is still there and
+    /// silent are both a missed reply: not confirmed delivered, counted once. A
+    /// peer that closed with a reply is the test above, and is that reply.
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_peer_with_no_reply_and_a_silent_open_one_are_both_missed_replies() {
+        let (hook_end, bridge_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(bridge_end);
+        let error = exchange(hook_end, "{}", NOTIFY_BUDGET).expect_err("nobody answered");
+        assert_eq!(error, SendError::NoReply);
+
+        let (hook_end, _bridge_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let error = exchange(hook_end, "{}", Duration::from_millis(50))
+            .expect_err("a silent peer did not answer");
+        assert_eq!(error, SendError::NoReply);
+    }
+
+    /// The count is per process and each run is its own: a second miss on the
+    /// same sink is the second, not a reset.
+    #[test]
+    fn each_missed_reply_adds_exactly_one() {
+        let drops = NotifyDrops::new();
+        assert_eq!(drops.record(), 1);
+        assert_eq!(drops.record(), 2);
+        assert_eq!(drops.snapshot().dropped, 2);
     }
 
     /// The shipped plugin manifest and this binary have to agree twice over:

@@ -55,6 +55,11 @@ impl<S: Timed> DeadlineStream<S> {
         Self { stream, deadline }
     }
 
+    /// The wrapped stream, for what is not a read or a write (a half-close).
+    pub fn get_ref(&self) -> &S {
+        &self.stream
+    }
+
     fn remaining(&self) -> io::Result<Duration> {
         let left = self.deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {

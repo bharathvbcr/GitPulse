@@ -55,14 +55,16 @@ fn main() {
 /// A panic otherwise exits 101: not the blocking 2, but not the promised 0
 /// either, and a host is free to treat any non-zero hook as a failure the user
 /// has to look at. The installed panic hook has already logged the fault.
-fn run_guarded(decide: impl FnOnce() + std::panic::UnwindSafe) -> i32 {
-    if std::panic::catch_unwind(decide).is_err() {
+fn run_guarded(decide: impl FnOnce() -> i32 + std::panic::UnwindSafe) -> i32 {
+    std::panic::catch_unwind(decide).unwrap_or_else(|_| {
         log::error!(target: "hook", "gitpulse-hook panicked; no decision");
-    }
-    0
+        0
+    })
 }
 
-fn decide() {
+/// Runs one hook invocation and returns its exit code, which
+/// [`hooks::diagnostic`] fixes at 0 for every outcome it reports.
+fn decide() -> i32 {
     gitpulse_lib::logging::init();
     gitpulse_lib::logging::install_panic_hook();
     // A host that decides a hook has taken too long kills it, and the git or
@@ -78,7 +80,7 @@ fn decide() {
             "gitpulse-hook: no subcommand given; expected one of {}",
             SUBCOMMANDS.join(", ")
         );
-        return;
+        return 0;
     };
 
     // Asked who we are rather than to judge anything. No host sends this — it
@@ -89,12 +91,12 @@ fn decide() {
     // it reads no stdin: there is none to read.
     if IDENTITY_FLAGS.contains(&subcommand.as_str()) {
         emit(hooks::identity());
-        return;
+        return 0;
     }
 
     if !SUBCOMMANDS.contains(&subcommand.as_str()) {
         log::warn!(target: "hook", "unknown hook subcommand {subcommand:?}; no decision");
-        return;
+        return 0;
     }
 
     // An unparseable payload is reported on stderr and dropped. Guessing at a
@@ -110,7 +112,7 @@ fn decide() {
         Ok(input) => input,
         Err(error) => {
             log::warn!(target: "hook", "gitpulse-hook {subcommand}: {error}");
-            return;
+            return 0;
         }
     };
 
@@ -127,8 +129,15 @@ fn decide() {
             if let Some(json) = output.render_for_host(input.is_cursor) {
                 emit(format!("{json}\n"));
             }
+            0
         }
-        Err(error) => log::warn!(target: "hook", "gitpulse-hook: {error}"),
+        // One line per invocation, at the level the outcome calls for: a
+        // transport this platform does not have is information, not a failure.
+        Err(error) => {
+            let diagnostic = hooks::diagnostic(&error);
+            log::log!(target: "hook", diagnostic.level, "{}", diagnostic.line);
+            diagnostic.exit_code
+        }
     }
 }
 
@@ -160,6 +169,6 @@ mod tests {
     #[test]
     fn a_panicking_hook_still_exits_zero_with_no_decision() {
         assert_eq!(run_guarded(|| panic!("hook fault")), 0);
-        assert_eq!(run_guarded(|| {}), 0);
+        assert_eq!(run_guarded(|| 0), 0);
     }
 }
