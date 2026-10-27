@@ -33,9 +33,13 @@ fn connection_churn_of_every_shape_does_not_leak_slots() {
     apply_at(true, Some(dir.socket()));
     assert!(status().listening, "{:?}", status().error);
     let path = dir.socket();
+    // The churn's own session, so its few hundred complete reports are not
+    // drawn on the bucket the probe after it needs.
+    let churn = report_for(&unique("churn"));
     let workers: Vec<_> = (0..8)
         .map(|t| {
             let path = path.clone();
+            let churn = churn.clone();
             std::thread::spawn(move || {
                 for i in 0..300 {
                     let Ok(mut s) = UnixStream::connect(&path) else {
@@ -44,16 +48,16 @@ fn connection_churn_of_every_shape_does_not_leak_slots() {
                     match (t + i) % 5 {
                         0 => drop(s),
                         1 => {
-                            let _ = s.write_all(&REPORT[..10]);
+                            let _ = s.write_all(&churn[..10]);
                             drop(s);
                         }
                         2 => {
-                            let _ = s.write_all(&REPORT[..10]);
+                            let _ = s.write_all(&churn[..10]);
                             reset(s);
                         }
                         3 => reset(s),
                         _ => {
-                            let _ = s.write_all(REPORT);
+                            let _ = s.write_all(&churn);
                             let _ = s.shutdown(std::net::Shutdown::Write);
                             let mut reply = String::new();
                             let _ = s.read_to_string(&mut reply);
@@ -68,8 +72,9 @@ fn connection_churn_of_every_shape_does_not_leak_slots() {
     }
     let drained = within(Duration::from_secs(8), || open_connections() == 0);
     let left = open_connections();
+    let probe = report_for(&unique("landed"));
     let landed = within(Duration::from_secs(5), || {
-        send(&path, REPORT).trim() == r#"{"ok":true}"#
+        send(&path, &probe).trim() == r#"{"ok":true}"#
     });
     apply_at(false, None);
     assert!(drained, "{left} slots still held after the churn");
@@ -216,7 +221,7 @@ fn a_report_without_half_close_is_dropped_and_the_client_sees_eof_in_time() {
     assert!(status().listening, "{:?}", status().error);
     let mut s = UnixStream::connect(dir.socket()).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    s.write_all(REPORT).unwrap();
+    s.write_all(&report_for(&unique("noclose"))).unwrap();
     let started = Instant::now();
     let mut reply = Vec::new();
     let result = s.read_to_end(&mut reply);

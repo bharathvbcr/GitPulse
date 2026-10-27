@@ -7,14 +7,6 @@
 use super::*;
 use crate::alerts::bridge::Reason;
 
-fn unique(tag: &str) -> String {
-    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    format!(
-        "wireadv-{tag}-{}",
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    )
-}
-
 /// What `gitpulse-hook` at 08875ad4 does with a reply, exactly: it reads at
 /// most 64 bytes, parses them as one JSON document and looks at `ok`.
 fn old_hook_reads(reply: &str) -> Option<bool> {

@@ -19,6 +19,7 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    common::unmetered_spawns();
     let dir = tempfile::TempDir::new().unwrap();
     let repo = dir.path().canonicalize().unwrap();
     common::run_git(&repo, &["init"]);

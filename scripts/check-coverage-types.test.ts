@@ -130,6 +130,33 @@ describe("check:types coverage contract", () => {
     );
   });
 
+  it("holds ScanStats to its TS twin, so a renamed audit counter is caught", async () => {
+    const storage = CONTRACTS.find((c) => c.label === "storage");
+    expect(storage?.structs, "ScanStats has a contract").toContain("ScanStats");
+    expect(runTypeCheck(storage!).violations).toEqual([]);
+
+    const rustCopy = await scratchCopy(storage!.rustPath, "scanstats-rename");
+    const source = await readFile(rustCopy, "utf8");
+    expect(source).toContain("pub unaudited: u64,");
+    await writeFile(rustCopy, source.replace("pub unaudited: u64,", "pub unexamined: u64,"));
+    const drifted = runTypeCheck({ ...storage!, rustPath: rustCopy });
+    expect(drifted.ok).toBe(false);
+    expect(drifted.violations.join("\n")).toMatch(/ScanStats\.unexamined exists in Rust but has no TS property/);
+    expect(drifted.violations.join("\n")).toMatch(/ScanStats\.unaudited exists in TS but Rust never sends it/);
+  });
+
+  it("holds the alert status's stale counter to its TS mirror", async () => {
+    const alerts = CONTRACTS.find((c) => c.label === "session-alert-status");
+    expect(alerts?.structs).toContain("SessionAlertStatus");
+    expect(runTypeCheck(alerts!).violations).toEqual([]);
+
+    const tsCopy = await scratchCopy(alerts!.tsPath, "stale-rename");
+    const source = await readFile(tsCopy, "utf8");
+    await writeFile(tsCopy, source.replace("  stale: number;", "  stale_reports: number;"));
+    const drifted = runTypeCheck({ ...alerts!, tsPath: tsCopy });
+    expect(drifted.violations.join("\n")).toMatch(/SessionAlertStatus\.stale exists in Rust but has no TS property/);
+  });
+
   it("fails when a Rust field is renamed away from its TS twin", async () => {
     const rustCopy = await scratchCopy(DEFAULT_RUST_SOURCE, "rust-rename");
     const source = await readFile(rustCopy, "utf8");

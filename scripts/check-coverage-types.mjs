@@ -14,7 +14,7 @@
  *       presence no longer agrees.
  *
  * SCOPE: see CONTRACTS below for exactly what is checked — 105 contracts over
- * 258 structs, spanning both wire surfaces: command returns and event payloads.
+ * 259 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -216,7 +216,7 @@ export const CONTRACTS = Object.freeze([
   { label: "word-diff", rustPath: rust("diff", "word_diff.rs"), tsPath: ts("diff", "wordDiff.ts"), structs: ["IntraLineDiff"] },
   { label: "conflict", rustPath: rust("diff", "conflict.rs"), tsPath: ts("diff", "conflict.ts"), structs: ["ConflictDocument", "ConflictChunk"] },
   { label: "conflict-session", rustPath: rust("diff", "conflict_session.rs"), tsPath: ts("diff", "conflictSession.ts"), structs: ["ConflictSnapshot", "ConflictStage", "ConflictSaveRequest", "ConflictSaveOutcome"] },
-  { label: "storage", rustPath: rust("storage", "mod.rs"), tsPath: ts("storage", "types.ts"), structs: ["StorageReport"] },
+  { label: "storage", rustPath: rust("storage", "mod.rs"), tsPath: ts("storage", "types.ts"), structs: ["StorageReport", "ScanStats"] },
   // The commit-graph census inside StorageReport. `unknown` and the nullable
   // facts are what keep "could not check" from rendering as "missing".
   { label: "commit-graph", rustPath: rust("storage", "commit_graph.rs"), tsPath: ts("storage", "types.ts"), structs: ["CommitGraphReport", "CommitGraphWritePlan", "CommitGraphWriteOutcome"] },

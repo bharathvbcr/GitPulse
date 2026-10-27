@@ -27,6 +27,18 @@ use gitpulse_lib::graph::{
 };
 use std::collections::{HashMap, HashSet};
 
+/// The repository the smoke run reads, from `GITPULSE_SMOKE_REPO`.
+///
+/// These runs measure the app's readers on a real repository, not the
+/// production spawn rate: this process links the library without `cfg(test)`,
+/// so a history walk over a large repository would otherwise be deferred by the
+/// gate's 192-token burst partway through. The switch is order-independent and
+/// idempotent, like the other integration suites'.
+fn smoke_repo() -> String {
+    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
+    std::env::var("GITPULSE_SMOKE_REPO").expect("set GITPULSE_SMOKE_REPO to a repository path")
+}
+
 /// The scope the smoke run walks under, from `GITPULSE_SMOKE_SCOPE`
 /// (`named`, the default, or `all`).
 fn smoke_scope() -> RefScope {
@@ -326,8 +338,7 @@ fn check_no_stub_points_at_a_loaded_row(rows: &[VisualCommitRow]) {
 #[ignore = "needs GITPULSE_SMOKE_REPO pointing at a real repository"]
 fn real_repository_filtered_graphs_stay_connected() {
     use gitpulse_lib::graph::{mainline_chain_ids, MAINLINE_COLOR, MAINLINE_COLUMN};
-    let repo =
-        std::env::var("GITPULSE_SMOKE_REPO").expect("set GITPULSE_SMOKE_REPO to a repository path");
+    let repo = smoke_repo();
     let commits = load_history(&repo, 2_000);
     assert!(
         !commits.is_empty(),
@@ -458,8 +469,7 @@ fn real_repository_filtered_graphs_stay_connected() {
 #[test]
 #[ignore = "needs GITPULSE_SMOKE_REPO pointing at a real repository"]
 fn real_repository_reports_the_history_the_named_scope_hides() {
-    let repo =
-        std::env::var("GITPULSE_SMOKE_REPO").expect("set GITPULSE_SMOKE_REPO to a repository path");
+    let repo = smoke_repo();
     let hidden = probe_hidden_history(&repo).expect("hidden-history probe");
     match hidden_ref_warning(&hidden) {
         Some(note) => {
@@ -483,8 +493,7 @@ fn real_repository_reports_the_history_the_named_scope_hides() {
 #[test]
 #[ignore = "needs GITPULSE_SMOKE_REPO pointing at a real repository"]
 fn real_repository_mainline_is_one_straight_rail() {
-    let repo =
-        std::env::var("GITPULSE_SMOKE_REPO").expect("set GITPULSE_SMOKE_REPO to a repository path");
+    let repo = smoke_repo();
     let commits = load_history(&repo, 5_000);
     assert!(
         !commits.is_empty(),
@@ -558,8 +567,7 @@ fn real_repository_mainline_is_one_straight_rail() {
 #[test]
 #[ignore = "needs GITPULSE_SMOKE_REPO pointing at a real repository"]
 fn real_repository_history_solves_clean() {
-    let repo =
-        std::env::var("GITPULSE_SMOKE_REPO").expect("set GITPULSE_SMOKE_REPO to a repository path");
+    let repo = smoke_repo();
     let commits = load_history(&repo, 5_000);
     assert!(
         !commits.is_empty(),
@@ -580,8 +588,7 @@ fn real_repository_history_solves_clean() {
 #[test]
 #[ignore = "needs GITPULSE_SMOKE_REPO pointing at a real repository"]
 fn real_repository_status_smoke() {
-    let repo =
-        std::env::var("GITPULSE_SMOKE_REPO").expect("set GITPULSE_SMOKE_REPO to a repository path");
+    let repo = smoke_repo();
     let statuses = gitpulse_lib::engine::GitReader::get_status(&repo).expect("get_status");
     println!("Real repository status count: {}", statuses.len());
     let mut total_add = 0;

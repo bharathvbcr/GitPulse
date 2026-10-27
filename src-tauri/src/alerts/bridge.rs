@@ -1350,19 +1350,168 @@ mod tests {
         fn drop(&mut self) {
             // Before the lock is released: the field drops after this body.
             apply_at(false, None);
+            crate::alerts::release_outside_bucket();
         }
+    }
+
+    /// Installs the process-wide hub with a host that knows every session.
+    ///
+    /// The hub is a first-wins `OnceLock`, so whichever test starts it decides
+    /// the host for the whole process, and a host that refuses every session
+    /// (`knows` false) turns every other test's session-keyed report into
+    /// `unknown_session`. Every test that needs a hub starts it through here,
+    /// so the answer does not depend on which of them runs first.
+    #[cfg(unix)]
+    pub(super) fn start_test_hub() {
+        crate::alerts::start(std::sync::Arc::new(QuietHost));
+    }
+
+    /// A session key no other report in this process uses.
+    ///
+    /// A report that names a session draws on that session's own bucket
+    /// ([`super::limits`]), 256 deep. One that names none draws on the single
+    /// bucket every outside-a-terminal report in the process shares, 32 deep,
+    /// which other tests drain: a test that expects `{"ok":true}` from a live
+    /// loop then reads `rate_limited` for a reason that has nothing to do with
+    /// it. The counter is the one for the whole process, so keys from
+    /// different test files cannot meet.
+    #[cfg(unix)]
+    pub(super) fn unique(tag: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        format!(
+            "bridge-{tag}-{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+
+    /// A well-formed report of `event` from `agent`, naming `session`.
+    #[cfg(unix)]
+    pub(super) fn report_as(event: &str, agent: &str, session: &str) -> Vec<u8> {
+        format!(r#"{{"v":1,"event":"{event}","agent":"{agent}","session":"{session}"}}"#)
+            .into_bytes()
+    }
+
+    /// The report a live loop answers `{"ok":true}` to, for `session`.
+    #[cfg(unix)]
+    pub(super) fn report_for(session: &str) -> Vec<u8> {
+        report_as("idle_prompt", "claude", session)
+    }
+
+    /// Empties the bucket every session-less report shares.
+    ///
+    /// Other tests in the process draw on it, so a test that holds the
+    /// listener would find it empty or full by luck of scheduling. Starting
+    /// every one of them from empty, with its refill held off until the test
+    /// ends ([`OwnedListener`]'s drop), makes the exposure deterministic: a
+    /// probe that names no session is refused as `rate_limited` for the whole
+    /// test, however slow the host, not once in a few hundred runs under load.
+    ///
+    /// It spends the bucket's tokens directly. Offering reports to the hub
+    /// instead would put notices in the queue every test shares, and in the
+    /// order book, twin memory and counters other tests read.
+    #[cfg(unix)]
+    fn drain_outside_bucket() {
+        assert!(
+            crate::alerts::exhaust_outside_bucket(),
+            "the outside bucket could not be emptied"
+        );
     }
 
     #[cfg(unix)]
     fn own_listener() -> OwnedListener {
         // A report is acknowledged only if the worker took it, so a test that
         // expects `{"ok":true}` needs a worker to take it.
-        crate::alerts::start(std::sync::Arc::new(QuietHost));
-        OwnedListener {
+        start_test_hub();
+        let owned = OwnedListener {
             _lock: LISTENER
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
+        };
+        drain_outside_bucket();
+        owned
+    }
+
+    /// macOS refuses `SO_RCVTIMEO` with EINVAL on a socket whose peer has
+    /// already closed, which is what the bridge's refusal of an over-capacity
+    /// connection leaves its client with (reply, then close) when the client
+    /// is slow to set its timeout. The bridge's own side already tolerates it
+    /// through `DeadlineStream`; this pins the platform behaviour and that the
+    /// tolerant path still reads the reply.
+    #[cfg(unix)]
+    #[test]
+    fn a_peer_that_replied_and_closed_does_not_make_the_timeout_setting_fail() {
+        use std::io::{Read, Write};
+        let reply = "{\"ok\":false,\"reason\":\"at_capacity\"}\n";
+        let (client, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+        server.write_all(reply.as_bytes()).unwrap();
+        server.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(server);
+        let raw = client.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                raw.expect_err("macOS accepted a timeout on a closed socket")
+                    .kind(),
+                std::io::ErrorKind::InvalidInput,
+                "the platform behaviour this test stands on has changed"
+            );
         }
+        let mut guarded = crate::deadline::DeadlineStream::new(
+            client,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        );
+        let mut read = String::new();
+        guarded.read_to_string(&mut read).unwrap();
+        assert_eq!(read, reply);
+    }
+
+    /// Every listener test starts with the outside bucket empty and held: a
+    /// session-less probe is refused, at once and again after the time the
+    /// bucket would have needed to regain several tokens. This is what turns a
+    /// leftover session-less `{"ok":true}` expectation in any listener test into
+    /// a failure every run. Fails if `exhaust_outside_bucket` spends nothing
+    /// (the first probe is answered) or if the refill is not held (the second
+    /// is).
+    #[cfg(unix)]
+    #[test]
+    fn a_listener_test_starts_with_the_outside_bucket_empty_and_held() {
+        let _own = own_listener();
+        let dir = ShortDir::new("held");
+        apply_at(true, Some(dir.socket()));
+        assert!(status().listening, "{:?}", status().error);
+        let probe = br#"{"v":1,"event":"error","agent":"codex"}"#;
+        let refused = r#"{"ok":false,"reason":"rate_limited"}"#;
+        assert_eq!(send(&dir.socket(), probe).trim(), refused, "at once");
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+        assert_eq!(
+            send(&dir.socket(), probe).trim(),
+            refused,
+            "1.5 s later, when an unheld bucket would hold six tokens"
+        );
+        apply_at(false, None);
+    }
+
+    /// With the outside bucket empty, a report that names a session has a
+    /// bucket of its own and is answered. This guards the keying only: it fails
+    /// if every key drew on the outside bucket. It cannot fail on the base's
+    /// flake, which was a session-less probe; that is guarded by
+    /// [`a_listener_test_starts_with_the_outside_bucket_empty_and_held`] and by
+    /// every listener test now sending a session.
+    #[cfg(unix)]
+    #[test]
+    fn a_report_that_names_a_session_is_not_limited_by_the_outside_bucket() {
+        let _own = own_listener();
+        let dir = ShortDir::new("outside");
+        apply_at(true, Some(dir.socket()));
+        assert!(status().listening, "{:?}", status().error);
+        for event in ["idle_prompt", "error", "turn_finished"] {
+            let report = report_as(event, "codex", &unique(event));
+            assert_eq!(
+                send(&dir.socket(), &report).trim(),
+                r#"{"ok":true}"#,
+                "{event}"
+            );
+        }
+        apply_at(false, None);
     }
 
     /// A temporary directory short enough to hold a socket.
@@ -1559,11 +1708,11 @@ mod tests {
         // the worker is still draining, so once the queue has room it is taken.
         let quiet = std::os::unix::net::UnixStream::connect(dir.socket()).unwrap();
         drop(quiet);
+        let after = report_as("error", "codex", &unique("after-flood"));
         assert!(
             within(
                 crate::test_support::coverage_relaxed(std::time::Duration::from_secs(5)),
-                || send(&dir.socket(), br#"{"v":1,"event":"error","agent":"codex"}"#).trim()
-                    == r#"{"ok":true}"#
+                || send(&dir.socket(), &after).trim() == r#"{"ok":true}"#
             ),
             "the worker never took a report after the flood"
         );
@@ -1680,7 +1829,7 @@ mod tests {
         assert!(woke <= 1, "the idle accept loop woke {woke} times in 2 s");
         // And it is still listening: not waking is not the same as not working.
         assert_eq!(
-            send(&dir.socket(), br#"{"v":1,"event":"error","agent":"codex"}"#).trim(),
+            send(&dir.socket(), &report_as("error", "codex", &unique("idle"))).trim(),
             r#"{"ok":true}"#
         );
         apply_at(false, None);
@@ -1732,7 +1881,11 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
             assert!(dir.socket().exists(), "the successor's socket was unlinked");
             assert_eq!(
-                send(&dir.socket(), br#"{"v":1,"event":"error","agent":"codex"}"#).trim(),
+                send(
+                    &dir.socket(),
+                    &report_as("error", "codex", &unique("restart"))
+                )
+                .trim(),
                 r#"{"ok":true}"#
             );
             apply_at(false, None);
@@ -1755,6 +1908,7 @@ mod tests {
     fn concurrent_apply_leaves_listening_and_the_socket_in_agreement() {
         let _own = own_listener();
         let dir = ShortDir::new("conc");
+        let probe = report_as("error", "codex", &unique("conc"));
         let mut disagreements = Vec::new();
         for round in 0..300 {
             let path = dir.socket();
@@ -1781,15 +1935,16 @@ mod tests {
                 && exists
                 && std::os::unix::net::UnixStream::connect(&path).is_ok_and(|mut stream| {
                     use std::io::{Read, Write};
-                    let _ = stream.write_all(br#"{"v":1,"event":"error","agent":"codex"}"#);
+                    let _ = stream.write_all(&probe);
                     let _ = stream.shutdown(std::net::Shutdown::Write);
                     let mut reply = String::new();
                     let _ = stream.read_to_string(&mut reply);
                     // Liveness, not acceptance: a live loop answers every
-                    // well-formed report, and since S1-09 a session-less probe
-                    // may be refused by the shared `hook-…` rate bucket that
-                    // other tests in the process also draw on. Any `{"ok":…}`
-                    // reply is a loop answering.
+                    // well-formed report, and 300 rounds can outrun a bucket's
+                    // refill. Any `{"ok":…}` reply is a loop answering. The
+                    // probe names a session so its rounds never draw on the
+                    // `hook-…` bucket that session-less reports share across
+                    // the process.
                     serde_json::from_str::<serde_json::Value>(reply.trim()).is_ok_and(|value| {
                         value.get("ok").is_some_and(serde_json::Value::is_boolean)
                     })
@@ -2004,9 +2159,6 @@ mod tests {
         state().open_connections.load(Ordering::SeqCst)
     }
 
-    #[cfg(unix)]
-    const REPORT: &[u8] = br#"{"v":1,"event":"idle_prompt","agent":"claude","session":"term-9"}"#;
-
     /// Connects now and then until `done`, so an `accept` that is waiting for a
     /// connection has one to take.
     #[cfg(unix)]
@@ -2038,7 +2190,10 @@ mod tests {
             libc::ECONNABORTED,
             libc::ENOBUFS,
         ]);
-        assert_eq!(send(&dir.socket(), REPORT).trim(), r#"{"ok":true}"#);
+        assert_eq!(
+            send(&dir.socket(), &report_for(&unique("emfile"))).trim(),
+            r#"{"ok":true}"#
+        );
         assert_eq!(injected_remaining(), 0, "the injected errors were not hit");
         assert!(status().listening, "{:?}", status().error);
         assert!(
@@ -2098,10 +2253,11 @@ mod tests {
         );
         // A report sent in the instant before the fresh listener replaces the
         // old one goes down with the old one; the next lands.
+        let report = report_for(&unique("rebind"));
         assert!(
             within(
                 crate::test_support::coverage_relaxed(std::time::Duration::from_secs(10)),
-                || send(&dir.socket(), REPORT).trim() == r#"{"ok":true}"#
+                || send(&dir.socket(), &report).trim() == r#"{"ok":true}"#
             ),
             "the rebound listener never answered"
         );
@@ -2149,11 +2305,12 @@ mod tests {
         let dir = ShortDir::new("silent");
         apply_at(true, Some(dir.socket()));
         assert!(status().listening, "{:?}", status().error);
+        let report = report_for(&unique("silent"));
         let fastest = |rounds: usize| {
             (0..rounds)
                 .map(|_| {
                     let started = std::time::Instant::now();
-                    assert_eq!(send(&dir.socket(), REPORT).trim(), r#"{"ok":true}"#);
+                    assert_eq!(send(&dir.socket(), &report).trim(), r#"{"ok":true}"#);
                     started.elapsed()
                 })
                 .min()
@@ -2196,9 +2353,15 @@ mod tests {
             open_connections()
         );
 
-        let mut over = std::os::unix::net::UnixStream::connect(dir.socket()).unwrap();
-        over.set_read_timeout(Some(relaxed(5000))).unwrap();
+        // Through the deadline type the bridge's own side uses: the loop answers
+        // the 101st at once and closes, and macOS then refuses a plain
+        // `set_read_timeout` on this end with EINVAL (see
+        // `a_peer_that_replied_and_closed_does_not_make_the_timeout_setting_fail`).
         let started = std::time::Instant::now();
+        let mut over = crate::deadline::DeadlineStream::new(
+            std::os::unix::net::UnixStream::connect(dir.socket()).unwrap(),
+            started + relaxed(5000),
+        );
         let mut reply = String::new();
         let _ = over.read_to_string(&mut reply);
         assert_eq!(
@@ -2213,7 +2376,10 @@ mod tests {
         assert!(within(relaxed(5000), || {
             open_connections() == MAX_OPEN_CONNECTIONS - 1
         }));
-        assert_eq!(send(&dir.socket(), REPORT).trim(), r#"{"ok":true}"#);
+        assert_eq!(
+            send(&dir.socket(), &report_for(&unique("cap"))).trim(),
+            r#"{"ok":true}"#
+        );
         drop(silent);
         apply_at(false, None);
         assert!(within(relaxed(5000), || open_connections() == 0));
@@ -2227,10 +2393,11 @@ mod tests {
         use std::io::Write;
         let budget = std::time::Duration::from_millis(150);
         let mut offered = Vec::new();
+        let report = report_for(&unique("deadline"));
 
         // The whole report, but the peer never closes its write half.
         let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
-        client.write_all(REPORT).unwrap();
+        client.write_all(&report).unwrap();
         let outcome = handle_into(server, budget, &mut |notice, _| {
             offered.push(notice);
             Offer::Accepted
@@ -2240,7 +2407,7 @@ mod tests {
 
         // Half a report, then silence.
         let (mut client2, server2) = std::os::unix::net::UnixStream::pair().unwrap();
-        client2.write_all(&REPORT[..REPORT.len() / 2]).unwrap();
+        client2.write_all(&report[..report.len() / 2]).unwrap();
         let outcome = handle_into(server2, budget, &mut |notice, _| {
             offered.push(notice);
             Offer::Accepted
@@ -2252,7 +2419,7 @@ mod tests {
         // The same bytes, finished in time: the sink is wired, so the empty
         // results above mean something.
         let (mut client3, server3) = std::os::unix::net::UnixStream::pair().unwrap();
-        client3.write_all(REPORT).unwrap();
+        client3.write_all(&report).unwrap();
         client3.shutdown(std::net::Shutdown::Write).unwrap();
         let outcome = handle_into(server3, budget, &mut |notice, _| {
             offered.push(notice);
@@ -2355,7 +2522,6 @@ mod tests {
     #[test]
     fn a_report_older_than_one_already_applied_is_dropped_and_counted() {
         let _own = own_listener();
-        crate::alerts::start(std::sync::Arc::new(QuietHost));
         let stale = || crate::alerts::status().stale;
 
         // `tool_finished` was accepted second but offered first; the
@@ -2562,6 +2728,8 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    mod adv_l4_tests;
     #[cfg(unix)]
     mod adv_tests;
     #[cfg(unix)]

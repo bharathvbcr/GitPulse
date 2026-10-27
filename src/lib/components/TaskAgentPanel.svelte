@@ -193,7 +193,10 @@
   /** The attempt being prepared, until a run with its id is on the pane. */
   const pendingRow = $derived(preparing && !allRuns.some((run) => run.id === preparing?.id) ? preparing : null);
   const ended = $derived(allRuns.filter((run) => !runHoldsCheckout(run, clock)).sort((a, b) => b.created_at - a.created_at));
-  const askingCount = $derived(monitored.filter((row) => asksForReader(row.tone)).length);
+  // `asksForReader` reads a module flag Svelte cannot track. Reading the bell
+  // setting first is what recomputes the count when it flips; the store pushes
+  // the flag in before it notifies, so the recount sees the new answer.
+  const askingCount = $derived(($interfaceStore.bellAsksForReader, monitored.filter((row) => asksForReader(row.tone)).length));
   // Null means "nobody has chosen"; the default follows whether a run is live.
   const formOpen = $derived(expandedForm ?? live.length === 0);
   const summary = $derived.by(() => {

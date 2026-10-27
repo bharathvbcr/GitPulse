@@ -1061,3 +1061,13 @@ fn an_answer_to_a_session_the_worker_forgot_still_clears_its_pane() {
     driver.tick(Some(reader("hook-claude-x")), Instant::now());
     assert_eq!(driver.recorder.announcements().len(), 1);
 }
+
+#[test]
+fn the_stale_counter_is_on_the_wire() {
+    let status = SessionAlertStatus {
+        stale: 3,
+        ..Default::default()
+    };
+    let wire = serde_json::to_value(&status).unwrap();
+    assert_eq!(wire["stale"], 3);
+}

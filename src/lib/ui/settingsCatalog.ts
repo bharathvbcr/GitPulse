@@ -63,6 +63,7 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     label: "Agent session notifications",
     keywords: "notification notifications banner alert agent session terminal claude codex bell osc permission idle finished quiet hours sound hook socket attention desktop notify",
   },
+  { id: "bell-asks", section: "agents", label: "Count a terminal bell as waiting for you", keywords: "bell osc notice signalled needs you waiting codex cursor hookless tray board count" },
   {
     id: "agent-defaults",
     section: "agents",

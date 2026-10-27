@@ -12,6 +12,15 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::Listener;
 
+/// A session registry whose sessions record to the ledger through the library's
+/// spawn gate (`session-spawn-ledger`, 14 spawns in this suite), which this
+/// process links without `cfg(test)` and so would run under the production
+/// spawn rate: the suite is about PTYs, not that rate.
+fn terminals() -> TerminalSessions {
+    common::unmetered_spawns();
+    common::terminals()
+}
+
 struct TerminalCleanup(TerminalSessions);
 impl Drop for TerminalCleanup {
     fn drop(&mut self) {
@@ -59,7 +68,7 @@ fn immediate_output_and_exit_status_survive_spawn() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = common::terminals();
+    let state = terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let output = Arc::new(Mutex::new(Vec::new()));
     let captured = output.clone();
@@ -104,7 +113,7 @@ fn a_shell_killed_by_a_signal_reports_the_signal_and_no_exit_code() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = common::terminals();
+    let state = terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let ack = state.clone();
     app.listen("terminal-output", move |event| {
@@ -150,7 +159,7 @@ fn output_flood_is_backpressured_then_drains_without_loss() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = common::terminals();
+    let state = terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let (send, receive) = mpsc::channel();
     app.listen("terminal-output", move |event| {
@@ -220,7 +229,7 @@ fn interactive_round_trips_do_not_accumulate_polling_delays() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = common::terminals();
+    let state = terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let (send, receive) = mpsc::channel();
     app.listen("terminal-output", move |event| {
@@ -258,7 +267,7 @@ fn a_blocked_writer_does_not_block_other_sessions_or_close() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = common::terminals();
+    let state = terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let dir = repo();
     let args = Some(vec![
@@ -321,7 +330,7 @@ fn a_nonreading_terminal_bounds_input_wait_without_requiring_close() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = common::terminals();
+    let state = terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let dir = repo();
     let (ready_send, ready_receive) = mpsc::channel();
@@ -363,7 +372,7 @@ fn close_terminates_a_hup_ignoring_foreground_process_and_is_idempotent() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = common::terminals();
+    let state = terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let dir = repo();
     let (send, receive) = mpsc::channel();
@@ -400,7 +409,7 @@ fn full_capacity_can_close_and_immediately_replace_without_a_false_limit() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = common::terminals();
+    let state = terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let dir = repo();
     let launch = || {
@@ -439,7 +448,7 @@ fn closing_after_stdio_eof_still_reaps_the_live_child() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = common::terminals();
+    let state = terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let dir = repo();
     let session = spawn_session(
@@ -466,7 +475,7 @@ fn binary_mouse_input_reaches_the_pty_without_utf8_reencoding() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = common::terminals();
+    let state = terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let dir = repo();
     let (send, receive) = mpsc::channel();
@@ -525,7 +534,7 @@ fn close_wakes_a_reader_blocked_on_a_full_output_window() {
     let app = tauri::test::mock_builder()
         .build(gitpulse_lib::context())
         .unwrap();
-    let state = common::terminals();
+    let state = terminals();
     let _cleanup = TerminalCleanup(state.clone());
     let dir = repo();
     // The window is full when the next event no longer fits, which leaves

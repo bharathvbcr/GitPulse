@@ -1,4 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { countAgentsWaiting } from "../desktop/menuState";
+import { setSignalledAsksForReader } from "../terminal/sessionActivity";
 import type { FleetRepoFacet } from "../fleet/types";
 import { buildFleetRows } from "../fleet/row";
 import { unknownFacts } from "../repos/facts";
@@ -136,5 +138,27 @@ describe("the attention filter and the headline", () => {
     expect(headline).toContain("2 not fully read");
     expect(plane.attention).toEqual({ needing: 1, unread: 2 });
     expect(applyAgentFilter(plane.rows, "attention")).toHaveLength(plane.attention.needing + plane.attention.unread);
+  });
+});
+
+// ADVERSARIAL (L1, ft-67f95e2d item 3): the Agents plane keeps its own
+// "Asked for attention" reason for a bell and counts it in "need attention",
+// without going through `asksForReader`. With the bell setting off the tray, the
+// board and the task pane say nobody is waiting while this headline says one
+// agent needs attention.
+describe("the bell setting and the Agents headline", () => {
+  afterEach(() => setSignalledAsksForReader(true));
+
+  it("does not count a bell as needing attention once the setting is off, as the tray does", () => {
+    const bell = { lastOutputAt: null, title: null, attention: { kind: "signalled", label: "Signalled", detail: null, at: 1 } } as const;
+    const plane = () => project({ terminals: [terminal({ cwd: "/repo/.claude/worktrees/alpha", attention: "signalled" })] });
+
+    expect(countAgentsWaiting(new Map([["s1", bell]]))).toBe(1);
+    expect(plane().attention.needing).toBe(1);
+
+    setSignalledAsksForReader(false);
+    expect(countAgentsWaiting(new Map([["s1", bell]]))).toBe(0);
+    expect(plane().attention.needing).toBe(0);
+    expect(planeHeadline(plane(), plane().rows.length)).toContain("0 need attention");
   });
 });

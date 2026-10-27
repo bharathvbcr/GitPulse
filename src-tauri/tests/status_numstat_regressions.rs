@@ -11,6 +11,7 @@ struct TestRepo {
 
 impl TestRepo {
     fn init() -> Self {
+        common::unmetered_spawns();
         let dir = TempDir::new().expect("tempdir");
         run_git(dir.path(), &["init", "-b", "main"]);
         run_git(dir.path(), &["config", "user.email", "test@example.com"]);

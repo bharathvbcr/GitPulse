@@ -19,7 +19,10 @@ use std::sync::{Mutex, MutexGuard};
 /// they run one at a time.
 static SERIAL: Mutex<()> = Mutex::new(());
 
+/// Every test but the source walk starts here, so this is also where the spawn
+/// rate cap is lifted for the process.
 fn serial() -> MutexGuard<'static, ()> {
+    common::unmetered_spawns();
     SERIAL
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

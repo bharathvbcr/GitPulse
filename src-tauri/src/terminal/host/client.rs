@@ -23,7 +23,7 @@ use crate::terminal::{
     TerminalContext, TerminalListing, TerminalLossPayload, TerminalSpawned, SHED_NOTICE,
 };
 use serde::de::DeserializeOwned;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::BufReader;
 use std::os::unix::net::UnixStream;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -34,6 +34,8 @@ use std::time::{Duration, Instant};
 
 /// What a call that lost its connection is told.
 const LOST: &str = "The connection to the terminal host was lost; the terminal kept running there.";
+/// What a connect that the app's quit overtook is told.
+const QUIT: &str = "GitPulse is quitting and has let the terminal host go.";
 /// The longest an ordinary request waits for its answer.
 const CALL_DEADLINE: Duration = Duration::from_secs(10);
 /// A spawn checks the repository and its trust and forks.
@@ -52,6 +54,23 @@ const SWEEP_EVERY: Duration = Duration::from_millis(250);
 const PROBE_DEADLINE: Duration = Duration::from_secs(2);
 /// Session ids whose exit was recorded, kept to recognise a second report of it.
 const REMEMBERED_EXITS: usize = 1024;
+/// How long a spawn the host has not yet answered is vouched for to
+/// `holds_session`: a hook in the new process can report before the reply is
+/// read. The reply normally follows within milliseconds; a host that never
+/// answers is not vouched for past this, though the call waits `SPAWN_DEADLINE`.
+const STARTING_GRACE: Duration = Duration::from_secs(1);
+/// The waits before each reconnect attempt after a connection is lost.
+const RECONNECT_DELAYS: [Duration; 3] = [
+    Duration::ZERO,
+    Duration::from_secs(1),
+    Duration::from_secs(1),
+];
+/// The waits before each attempt to adopt again after a listing failed.
+const ADOPTION_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
 
 /// Where the host lives and how to start it.
 #[derive(Debug, Clone)]
@@ -287,8 +306,78 @@ fn nowhere() -> OutputSink {
     OutputSink::from_fn(|_, _| Ok(()))
 }
 
+/// What this app may vouch for to `HostClient::holds_session`: sessions the
+/// host listed on the connection that is open now, less those that have since
+/// ended. It is kept apart from `proxies`, whose lock is held across store
+/// reads and every output frame, so asking it never waits on those.
+#[derive(Default)]
+struct Vouched {
+    /// A connection is open and has listed the host's sessions. False means
+    /// "cannot tell": before the first list, while reconnecting, once the
+    /// reconnects have given up, and after the app let the host go.
+    live: bool,
+    /// The sessions that list named, plus spawns the host has since confirmed,
+    /// less exits since reported.
+    held: HashSet<String>,
+    /// Spawns sent and not yet answered, and when.
+    starting: HashMap<String, Instant>,
+    /// Sessions whose exit has been reported, newest last: a listing taken
+    /// before the exit must not bring one back.
+    exited: VecDeque<String>,
+    /// `exited` has dropped its oldest: an id absent from it may be one that
+    /// ended long ago, so a listing is trusted only for ids already held.
+    wrapped: bool,
+    /// An `adopt` is between asking for the listing and finishing.
+    adopting: bool,
+    /// Spawns the host confirmed while `adopting`: the listing was taken
+    /// before them, so neither publishing it nor reconciling against it may
+    /// drop them.
+    late: HashSet<String>,
+}
+
+impl Vouched {
+    /// Nothing is vouched for until a connection lists again. `held` stays as
+    /// the ids a stricter later listing may be checked against.
+    fn revoke(&mut self) {
+        self.live = false;
+    }
+}
+
+/// An `adopt` is under way: spawns confirmed meanwhile are kept apart, however
+/// it ends.
+struct AdoptionWindow<'a>(&'a Inner);
+
+impl<'a> AdoptionWindow<'a> {
+    fn open(inner: &'a Inner) -> Self {
+        let mut vouched = lock(&inner.vouched);
+        vouched.adopting = true;
+        vouched.late.clear();
+        Self(inner)
+    }
+}
+
+impl Drop for AdoptionWindow<'_> {
+    fn drop(&mut self) {
+        let mut vouched = lock(&self.0.vouched);
+        vouched.adopting = false;
+        vouched.late.clear();
+    }
+}
+
+/// Clears `retrying` when the retry ends, even by a panic.
+struct Retrying<'a>(&'a AtomicBool);
+
+impl Drop for Retrying<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 struct Inner {
     config: HostConfig,
+    vouched: Mutex<Vouched>,
+    /// A retry of a failed adoption is waiting or running.
+    retrying: AtomicBool,
     conn: Mutex<Option<Arc<Connection>>>,
     connecting: Mutex<()>,
     proxies: Mutex<HashMap<String, Proxy>>,
@@ -319,6 +408,8 @@ impl HostClient {
         Self {
             inner: Arc::new(Inner {
                 config,
+                vouched: Mutex::default(),
+                retrying: AtomicBool::new(false),
                 conn: Mutex::default(),
                 connecting: Mutex::default(),
                 proxies: Mutex::default(),
@@ -365,7 +456,12 @@ impl HostClient {
     /// closes, the host detaches every view and keeps every process.
     pub fn disconnect(&self) {
         self.inner.leaving.store(true, Ordering::Release);
-        if let Some(conn) = lock(&self.inner.conn).take() {
+        let conn = {
+            let mut current = lock(&self.inner.conn);
+            lock(&self.inner.vouched).revoke();
+            current.take()
+        };
+        if let Some(conn) = conn {
             conn.close();
         }
     }
@@ -401,6 +497,9 @@ impl HostClient {
             session.clone(),
             Proxy::new(output, observer.clone(), request.run_id.clone(), true, true),
         );
+        lock(&self.inner.vouched)
+            .starting
+            .insert(session.clone(), Instant::now());
         let reply = conn
             .call(Request::Spawn { request }, &[], SPAWN_DEADLINE)
             .and_then(|value| {
@@ -411,6 +510,7 @@ impl HostClient {
         let reply = match reply {
             Ok(reply) => reply,
             Err(error) => {
+                lock(&self.inner.vouched).starting.remove(&session);
                 let proxy = lock(&self.inner.proxies).remove(&session);
                 if let Some(observer) = &observer {
                     observer.spawn_failed(&session, &error);
@@ -430,6 +530,20 @@ impl HostClient {
         let start_error = observer
             .as_ref()
             .and_then(|observer| observer.started(&session, process.clone()).err());
+        {
+            // The host has confirmed the session, unless its exit has been
+            // reported: that one is not held. Before the proxy stops being
+            // `starting`, so an adoption that reads the proxies meanwhile
+            // already finds it in `late`.
+            let mut vouched = lock(&self.inner.vouched);
+            vouched.starting.remove(&session);
+            if !vouched.exited.contains(&session) {
+                vouched.held.insert(session.clone());
+                if vouched.adopting {
+                    vouched.late.insert(session.clone());
+                }
+            }
+        }
         // Started: an exit that overtook the reply is recorded now.
         let deferred = {
             let mut proxies = lock(&self.inner.proxies);
@@ -699,6 +813,35 @@ impl HostClient {
             .any(|p| p.run_id.as_deref() == Some(run_id))
     }
 
+    /// Whether the host holds `session`, as far as this app can say without
+    /// asking it: a session the host listed on the connection that is open
+    /// now (one still ending counts), or one this app spawned and the host has
+    /// confirmed, or one whose spawn is still unanswered after less than
+    /// `STARTING_GRACE`; and not one whose exit has been reported since.
+    /// `None` when that cannot be said: before the first list, while the
+    /// connection is down or after the reconnects gave up, and once the app has
+    /// let the host go. It sends no request, reconnects nothing and starts no
+    /// host, and takes only a short lock that no I/O is done under, so it never
+    /// waits on a host that is slow or gone. It lags the host only by an `Exit`
+    /// frame not yet read.
+    pub fn holds_session(&self, session: &str) -> Option<bool> {
+        self.holds_session_at(session, Instant::now())
+    }
+
+    fn holds_session_at(&self, session: &str, now: Instant) -> Option<bool> {
+        let vouched = lock(&self.inner.vouched);
+        if !vouched.live {
+            return None;
+        }
+        Some(
+            vouched.held.contains(session)
+                || vouched
+                    .starting
+                    .get(session)
+                    .is_some_and(|since| now.saturating_duration_since(*since) < STARTING_GRACE),
+        )
+    }
+
     pub fn set_background(&self, sessions: &[String]) {
         if let Some(conn) = self.inner.current() {
             if let Err(error) = conn.send(
@@ -823,11 +966,18 @@ impl Inner {
     }
 
     fn ensure_connected(self: &Arc<Self>) -> Result<Arc<Connection>, String> {
+        self.connect(true)
+    }
+
+    /// `retry`: a listing that fails is tried again in the background (see
+    /// `retry_adoption`). The attempts that are themselves such a retry, or a
+    /// reconnect, pass false and are their own loop.
+    fn connect(self: &Arc<Self>, retry: bool) -> Result<Arc<Connection>, String> {
         if let Some(conn) = self.current() {
             return Ok(conn);
         }
         if self.leaving.load(Ordering::Acquire) {
-            return Err("GitPulse is quitting and has let the terminal host go.".into());
+            return Err(QUIT.into());
         }
         let _connecting = lock(&self.connecting);
         if let Some(conn) = self.current() {
@@ -855,7 +1005,20 @@ impl Inner {
             }
         };
         let conn = self.open(stream)?;
-        *lock(&self.conn) = Some(conn.clone());
+        {
+            // Under the lock `disconnect` takes: a quit that came while this
+            // was connecting either is seen here or finds this connection.
+            let mut current = lock(&self.conn);
+            if self.leaving.load(Ordering::Acquire) {
+                drop(current);
+                conn.close();
+                return Err(QUIT.into());
+            }
+            // Nothing is vouched for on a connection that has not listed,
+            // whatever an earlier one listed: its loss may not have been seen.
+            lock(&self.vouched).revoke();
+            *current = Some(conn.clone());
+        }
         let limit = self.limit.load(Ordering::Acquire);
         if limit > 0 {
             let _ = conn.send(Request::Limit { limit }, &[], None);
@@ -867,6 +1030,14 @@ impl Inner {
         if let Err(error) = self.adopt(&conn) {
             let trouble = format!("The terminal host's sessions could not be listed: {error}");
             self.note_trouble(trouble.clone());
+            // A listing that was never read leaves nothing to vouch for, and a
+            // connection kept would be reused without ever listing again.
+            if !lock(&self.vouched).live {
+                self.drop_connection(&conn);
+                if retry && !self.leaving.load(Ordering::Acquire) {
+                    self.retry_adoption();
+                }
+            }
             return Err(trouble);
         }
         self.probe_other_protocols();
@@ -962,9 +1133,11 @@ impl Inner {
     /// this app was away is recorded now; a proxy whose session the host no
     /// longer holds, and that no receipt accounts for, is ended.
     fn adopt(self: &Arc<Self>, conn: &Arc<Connection>) -> Result<(), String> {
+        let _window = AdoptionWindow::open(self);
         let listed: Vec<TerminalListing> =
             serde_json::from_value(conn.call(Request::List, &[], CALL_DEADLINE)?)
                 .map_err(|e| e.to_string())?;
+        let exited = self.publish_listing(conn, &listed)?;
         let reattach: Vec<String> = {
             let mut proxies = lock(&self.proxies);
             let mut reattach = Vec::new();
@@ -977,6 +1150,8 @@ impl Inner {
                         reattach.push(listing.id.clone());
                     }
                     Some(_) => {}
+                    // Its exit was reported after the listing was taken.
+                    None if exited.contains(&listing.id) => {}
                     None => {
                         let observer = listing
                             .run_id
@@ -992,18 +1167,32 @@ impl Inner {
             reattach
         };
         self.adopted.store(true, Ordering::Release);
-        let receipts: Vec<WireEnded> =
-            serde_json::from_value(conn.call(Request::Receipts, &[], CALL_DEADLINE)?)
-                .map_err(|e| e.to_string())?;
-        if !receipts.is_empty() {
-            log::info!(target: "terminal", "{} terminal session(s) ended while this app was not connected; recording them", receipts.len());
-        }
-        for ended in receipts {
-            self.record_exit(ended);
-        }
+        let receipts: Result<Vec<WireEnded>, String> = conn
+            .call(Request::Receipts, &[], CALL_DEADLINE)
+            .and_then(|value| serde_json::from_value(value).map_err(|e| e.to_string()));
+        // Receipts that cannot be read do not leave proxies for sessions the
+        // host no longer holds: they are ended below as when none accounts for
+        // them, and the call still reports the failure.
+        let receipts_error = match receipts {
+            Ok(receipts) => {
+                if !receipts.is_empty() {
+                    log::info!(target: "terminal", "{} terminal session(s) ended while this app was not connected; recording them", receipts.len());
+                }
+                for ended in receipts {
+                    self.record_exit(ended);
+                }
+                None
+            }
+            Err(error) => Some(error),
+        };
+        let confirmed_meanwhile = lock(&self.vouched).late.clone();
         let gone: Vec<String> = lock(&self.proxies)
             .iter()
-            .filter(|(id, p)| !p.starting && !listed.iter().any(|l| &l.id == *id))
+            .filter(|(id, p)| {
+                !p.starting
+                    && !confirmed_meanwhile.contains(*id)
+                    && !listed.iter().any(|l| &l.id == *id)
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for id in gone {
@@ -1026,7 +1215,56 @@ impl Inner {
         for id in reattach {
             self.reattach(conn, &id);
         }
-        Ok(())
+        receipts_error.map_or(Ok(()), Err)
+    }
+
+    /// What the host just listed becomes what `holds_session` vouches for, as
+    /// long as `conn` is still the open connection and the app has not let the
+    /// host go: a listing read on one that has since been lost is not current.
+    /// The listing was taken before any exit reported since, so those ids are
+    /// left out (and returned, so no proxy is made for them), and before any
+    /// spawn confirmed since, which are kept. Once the record of exits has
+    /// wrapped, a reconnect vouches only for ids it already held. Done before
+    /// the observers are read from the store, so the answer never waits on that.
+    fn publish_listing(
+        &self,
+        conn: &Arc<Connection>,
+        listed: &[TerminalListing],
+    ) -> Result<HashSet<String>, String> {
+        let current = lock(&self.conn);
+        if self.leaving.load(Ordering::Acquire) {
+            return Err(QUIT.into());
+        }
+        if !current.as_ref().is_some_and(|open| Arc::ptr_eq(open, conn)) {
+            return Err(LOST.into());
+        }
+        let mut vouched = lock(&self.vouched);
+        let strict = vouched.wrapped;
+        let mut next = vouched.late.clone();
+        let mut exited = HashSet::new();
+        for listing in listed {
+            if vouched.exited.contains(&listing.id) {
+                exited.insert(listing.id.clone());
+            } else if !strict || vouched.held.contains(&listing.id) {
+                next.insert(listing.id.clone());
+            }
+        }
+        vouched.held = next;
+        vouched.live = true;
+        Ok(exited)
+    }
+
+    /// Takes `conn` out of use if it is still the open connection, and says
+    /// nothing is vouched for until a connection lists the host's sessions again.
+    fn drop_connection(&self, conn: &Arc<Connection>) {
+        {
+            let mut current = lock(&self.conn);
+            if current.as_ref().is_some_and(|open| Arc::ptr_eq(open, conn)) {
+                *current = None;
+                lock(&self.vouched).revoke();
+            }
+        }
+        conn.close();
     }
 
     /// Shows a session again in the view that showed it before the connection
@@ -1073,11 +1311,30 @@ impl Inner {
         }
     }
 
+    /// The host has said `id` ended: not held from now, however long recording
+    /// it takes, and not again from a listing taken earlier. Idempotent; done
+    /// on the delivery thread before the recording is handed off, so a recording
+    /// that is slow or never starts cannot leave the session vouched for.
+    fn note_ended(&self, id: &str) {
+        let mut vouched = lock(&self.vouched);
+        vouched.held.remove(id);
+        vouched.late.remove(id);
+        vouched.starting.remove(id);
+        if !vouched.exited.iter().any(|ended| ended == id) {
+            vouched.exited.push_back(id.to_owned());
+            while vouched.exited.len() > REMEMBERED_EXITS {
+                vouched.exited.pop_front();
+                vouched.wrapped = true;
+            }
+        }
+    }
+
     /// Records one session's exit: its run's receipt, the incident record and
     /// `terminal-exit`, then lets the host forget it. Called once per session;
     /// a second report of the same exit only clears the host's copy.
     fn record_exit(&self, ended: WireEnded) {
         let id = ended.payload.id.clone();
+        self.note_ended(&id);
         {
             let mut proxies = lock(&self.proxies);
             if let Some(proxy) = proxies.get_mut(&id).filter(|p| p.starting) {
@@ -1207,6 +1464,7 @@ impl Inner {
             // Off this thread too: a run's receipt is a store write, and the
             // output of every other session waits behind delivery.
             HostFrame::Exit { ended } => {
+                self.note_ended(&ended.payload.id);
                 let inner = self.clone();
                 if let Err(error) = crate::supervisor::spawn_one_of_many(
                     "terminal-host-exit",
@@ -1242,6 +1500,9 @@ impl Inner {
             let mut current = lock(&self.conn);
             if current.as_ref().is_some_and(|c| Arc::ptr_eq(c, conn)) {
                 *current = None;
+                // Nothing is vouched for from here until a connection lists
+                // the host's sessions again, including if none ever does.
+                lock(&self.vouched).revoke();
             } else {
                 return;
             }
@@ -1254,22 +1515,51 @@ impl Inner {
         let spawned = crate::supervisor::spawn_one_of_many(
             "terminal-host-reconnect",
             "terminal host reconnect",
-            move || {
-                for attempt in 0..3 {
-                    if attempt > 0 {
-                        std::thread::sleep(Duration::from_secs(1));
-                    }
-                    match inner.ensure_connected() {
-                        Ok(_) => return,
-                        Err(error) => {
-                            log::warn!(target: "terminal", "terminal host reconnect failed: {error}")
-                        }
-                    }
-                }
-            },
+            move || inner.reconnect(&RECONNECT_DELAYS, true),
         );
         if let Err(error) = spawned {
             log::warn!(target: "terminal", "terminal host reconnect did not start: {error}");
+        }
+    }
+
+    /// One attempt after each of `delays`, until one connects and adopts.
+    /// `retry`: an attempt whose listing fails starts the adoption retry.
+    fn reconnect(self: &Arc<Self>, delays: &[Duration], retry: bool) {
+        for delay in delays {
+            if !delay.is_zero() {
+                std::thread::sleep(*delay);
+            }
+            if self.leaving.load(Ordering::Acquire) {
+                return;
+            }
+            match self.connect(retry) {
+                Ok(_) => return,
+                Err(error) => {
+                    log::warn!(target: "terminal", "terminal host reconnect failed: {error}")
+                }
+            }
+        }
+    }
+
+    /// The host's sessions could not be listed: try again, a few times and
+    /// ever further apart, without a caller having to ask. One retry runs at a
+    /// time.
+    fn retry_adoption(self: &Arc<Self>) {
+        if self.retrying.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let inner = self.clone();
+        let spawned = crate::supervisor::spawn_one_of_many(
+            "terminal-host-adopt-retry",
+            "terminal host adoption retry",
+            move || {
+                let _retrying = Retrying(&inner.retrying);
+                inner.reconnect(&ADOPTION_RETRY_DELAYS, false);
+            },
+        );
+        if let Err(error) = spawned {
+            self.retrying.store(false, Ordering::Release);
+            log::warn!(target: "terminal", "terminal host adoption retry did not start: {error}");
         }
     }
 
@@ -1540,3 +1830,29 @@ fn read_loop(inner: Weak<Inner>, conn: Arc<Connection>, mut reader: BufReader<Un
         conn.close();
     }
 }
+
+/// Whether the registry holds the session `key`, asked without waiting on
+/// anything: a host is answered from this app's own snapshot
+/// ([`HostClient::holds_session`]), and an in-process registry from its own
+/// map, a local lock with no connection behind it. `None` when the registry
+/// cannot tell (a host with no open, listed connection, or an unreadable
+/// in-process list): the caller decides what that means.
+///
+/// Its natural home is beside `tracks_run` in `terminal/mod.rs`; it lives here
+/// because a descendant module can read that file's private `host` field.
+pub(crate) fn registry_holds(state: &crate::terminal::TerminalSessions, key: &str) -> Option<bool> {
+    match &state.host {
+        Some(host) => host.holds_session(key),
+        None => crate::terminal::list_sessions(state)
+            .ok()
+            .map(|listed| listed.iter().any(|session| session.id == key)),
+    }
+}
+
+#[cfg(test)]
+#[path = "client_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "client_adversarial_tests.rs"]
+mod adversarial;

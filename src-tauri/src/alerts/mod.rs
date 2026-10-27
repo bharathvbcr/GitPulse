@@ -366,9 +366,8 @@ pub struct SessionAlertStatus {
     /// A hook report that reached the worker behind a later one from the same
     /// session (stamped at accept, applied out of order by the parallel
     /// readers) and was dropped rather than applied late. Counted apart from
-    /// `bridge_rejected` because the report was well formed. Not on the wire
-    /// yet: the TypeScript mirror lives in a file another session holds.
-    #[serde(skip)]
+    /// `bridge_rejected` because the report was well formed. Mirrored in
+    /// `sessionAlertsStore.ts`, which `check:types` holds to this struct.
     pub stale: u64,
     pub bridge_listening: bool,
     pub bridge_path: Option<String>,
@@ -530,6 +529,23 @@ pub fn try_offer(notice: Notice) -> Offer {
 /// refusals are already counted in `dropped_queue` and `coalesced`.
 pub fn offer(notice: Notice) {
     let _ = try_offer(notice);
+}
+
+/// Empties the process-wide bucket that session-less hook reports share, for a
+/// test that needs every probe it sends to name a session. `false` when no hub
+/// is running or the bucket could not be emptied. Touches that bucket only, and
+/// holds its refill off until [`release_outside_bucket`].
+#[cfg(all(test, unix))]
+pub(crate) fn exhaust_outside_bucket() -> bool {
+    hub().is_some_and(|hub| hub.intake.exhaust_outside_bucket())
+}
+
+/// Lets the outside bucket refill again after [`exhaust_outside_bucket`].
+#[cfg(all(test, unix))]
+pub(crate) fn release_outside_bucket() {
+    if let Some(hub) = hub() {
+        hub.intake.release_outside_bucket();
+    }
 }
 
 /// Offers a hook report together with the stamp that orders it among its

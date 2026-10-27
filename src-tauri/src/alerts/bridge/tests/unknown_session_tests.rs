@@ -38,8 +38,11 @@ fn through_the_socket(report: &[u8]) -> (Outcome, String) {
 
 #[test]
 fn prompt_submitted_for_an_unknown_session_is_refused_and_counted() {
-    // The counter lives on the global hub; start it if nothing else has.
-    crate::alerts::start(Arc::new(EmptyRegistry));
+    // The counter lives on the global hub; start it if nothing else has. The
+    // refusal below comes from the intake this test builds around its own
+    // `EmptyRegistry`, not from the hub's host, and a hub started with that
+    // host would refuse every other test's session-keyed report.
+    start_test_hub();
     let before = crate::alerts::status().bridge_rejected;
     let (outcome, reply) = through_the_socket(
         br#"{"v":1,"event":"prompt_submitted","agent":"claude","session":"term-404-dead"}"#,

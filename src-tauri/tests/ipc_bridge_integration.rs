@@ -80,6 +80,7 @@ fn invoke_from(
     cmd: &str,
     body: serde_json::Value,
 ) -> Result<serde_json::Value, serde_json::Value> {
+    common::unmetered_spawns();
     let view = webview_labeled(label);
     let response = get_ipc_response(
         &view,
@@ -256,6 +257,7 @@ fn a_successful_result_arrives_unwrapped_on_the_success_channel() {
 
 /// A repository with one commit and one unstaged change.
 fn repo_with_change() -> tempfile::TempDir {
+    common::unmetered_spawns();
     let dir = tempfile::TempDir::new().expect("tempdir");
     let git = |args: &[&str]| {
         let out = std::process::Command::new("git")

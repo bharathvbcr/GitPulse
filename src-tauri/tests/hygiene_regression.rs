@@ -5,6 +5,7 @@ use std::{fs, process::Command};
 
 #[test]
 fn untracked_environments_agent_state_and_scratch_are_not_safe_cleanup() {
+    common::unmetered_spawns();
     let root = tempfile::tempdir().unwrap();
     assert!(Command::new("git")
         .args(["init", "-q"])
@@ -44,6 +45,7 @@ fn untracked_environments_agent_state_and_scratch_are_not_safe_cleanup() {
 
 #[test]
 fn capped_artifact_inventory_never_looks_complete_to_a_global_cleaner() {
+    common::unmetered_spawns();
     let root = tempfile::tempdir().unwrap();
     assert!(Command::new("git")
         .args(["init", "-q"])

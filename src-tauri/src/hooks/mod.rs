@@ -2628,14 +2628,44 @@ fn within_budget_typed<T: Send + 'static>(
     thread::Builder::new()
         .name("gitpulse-hook-check".into())
         .spawn(move || {
-            let _ = tx.send(work());
+            #[cfg(test)]
+            let started = crate::sysload::try_thread_cpu();
+            let answer = work();
+            // The CPU the worker spent, handed back beside its answer; `None`
+            // where the platform has no thread CPU clock, and then the
+            // worker runs exactly as it does in a release build.
+            #[cfg(test)]
+            let answer = (
+                answer,
+                started
+                    .zip(crate::sysload::try_thread_cpu())
+                    .map(|(started, ended)| ended - started),
+            );
+            let _ = tx.send(answer);
         })
         .map_err(|error| BudgetMiss::SpawnFailed(error.to_string()))?;
-    rx.recv_timeout(budget).map_err(|error| match error {
+    let answer = rx.recv_timeout(budget).map_err(|error| match error {
         mpsc::RecvTimeoutError::Timeout => BudgetMiss::TimedOut,
         // The sender is dropped without a value only when the worker unwound.
         mpsc::RecvTimeoutError::Disconnected => BudgetMiss::WorkerPanicked,
-    })
+    })?;
+    #[cfg(test)]
+    let answer = {
+        LAST_WORKER_CPU.set(answer.1);
+        answer.0
+    };
+    Ok(answer)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The CPU the worker of this thread's last completed [`within_budget`]
+    /// spent. Per calling thread, so tests running side by side do not see each
+    /// other's: a test that must bound the work of a whole reader reads it, as
+    /// wall time on a loaded host is not a measure of work. `None` where the
+    /// platform has no thread CPU clock.
+    pub(crate) static LAST_WORKER_CPU: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// The canonical form of a path that may not exist yet.

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { get } from "svelte/store";
 import { interfaceStore } from "../interfaceStore";
 import { memoryStorage } from "../../repos/persist";
+import { asksForReader } from "../../terminal/sessionActivity";
 
 describe("interfaceStore", () => {
   it("selects one global surface and preserves unrelated terminal preferences", () => {
@@ -339,6 +340,56 @@ describe("interfaceStore", () => {
     } finally {
       if (restore) Object.defineProperty(globalThis, "window", restore);
       else delete (globalThis as { window?: unknown }).window;
+      vi.resetModules();
+    }
+  });
+
+  it("counts a terminal bell as waiting by default, and the setter drives asksForReader", () => {
+    expect(get(interfaceStore).bellAsksForReader).toBe(true);
+    expect(asksForReader("signalled")).toBe(true);
+    try {
+      interfaceStore.setBellAsksForReader(false);
+      expect(get(interfaceStore).bellAsksForReader).toBe(false);
+      expect(asksForReader("signalled")).toBe(false);
+      expect(asksForReader("needs-you")).toBe(true);
+      interfaceStore.setBellAsksForReader(true);
+      expect(asksForReader("signalled")).toBe(true);
+      interfaceStore.setBellAsksForReader(false);
+      interfaceStore.reset();
+      expect(get(interfaceStore).bellAsksForReader).toBe(true);
+      expect(asksForReader("signalled")).toBe(true);
+    } finally {
+      interfaceStore.reset();
+    }
+  });
+
+  it("reads the stored bell setting at load: false round-trips, anything else is on", async () => {
+    const restore = Object.getOwnPropertyDescriptor(globalThis, "window");
+    const load = async (stored: unknown) => {
+      const storage = memoryStorage({
+        gitpulse_interface_prefs: JSON.stringify({ bellAsksForReader: stored }),
+      });
+      Object.defineProperty(globalThis, "window", {
+        value: { localStorage: storage },
+        configurable: true,
+        writable: true,
+      });
+      vi.resetModules();
+      const fresh = await import("../interfaceStore");
+      const activity = await import("../../terminal/sessionActivity");
+      // The flag must already be set when the store is created, before any
+      // subscriber or setter runs.
+      return [get(fresh.interfaceStore).bellAsksForReader, activity.asksForReader("signalled")];
+    };
+    try {
+      expect(await load(false)).toEqual([false, false]);
+      expect(await load(true)).toEqual([true, true]);
+      expect(await load(undefined)).toEqual([true, true]);
+      expect(await load("no")).toEqual([true, true]);
+      expect(await load(0)).toEqual([true, true]);
+    } finally {
+      if (restore) Object.defineProperty(globalThis, "window", restore);
+      else Reflect.deleteProperty(globalThis, "window");
       vi.resetModules();
     }
   });
