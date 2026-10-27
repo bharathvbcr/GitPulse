@@ -39,6 +39,8 @@ struct Shared {
     /// Lists and receipts answered (or begun), across connections.
     lists: AtomicUsize,
     receipts: AtomicUsize,
+    /// `Forget` requests received: exits the app has finished with.
+    forgets: AtomicUsize,
     /// Only a spawn is left unanswered.
     hang_spawn: AtomicBool,
     /// The next receipts request is answered with an error.
@@ -214,7 +216,11 @@ fn serve(stream: UnixStream, writer: Writer, shared: &Shared) {
             return;
         };
         let answer: Result<serde_json::Value, String> = match request {
-            Request::Limit { .. } | Request::Stall { .. } | Request::Forget { .. } => continue,
+            Request::Limit { .. } | Request::Stall { .. } => continue,
+            Request::Forget { .. } => {
+                shared.forgets.fetch_add(1, Ordering::AcqRel);
+                continue;
+            }
             Request::Hello { .. } => {
                 let delay = shared.hello_delay_ms.load(Ordering::Acquire);
                 if delay > 0 {

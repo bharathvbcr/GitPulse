@@ -258,3 +258,89 @@ fn two_concurrent_record_exits_for_one_session_run_finished_once() {
     );
     assert!(!lock(&host.inner.proxies).contains_key("term-9-twice"));
 }
+
+/// Rework round 2: a second report that arrives while the first is still
+/// recording touches neither the proxy nor the host. The first is held inside
+/// `finished` (the run's receipt is not written yet); the second runs to the
+/// end. The host must not be told to forget the exit, or an app that dies
+/// meanwhile has lost it for good, and the session must still be there until
+/// the exit is announced. Once the first finishes, the host is told exactly
+/// once, and only then.
+///
+/// The host's `Forget` is observed by the fake host's counter (`Shared.forgets`
+/// in `client_adversarial_tests.rs`), the narrowest view of it the test
+/// connection has.
+#[test]
+fn a_second_report_during_the_recording_leaves_the_proxy_and_the_host_alone() {
+    let fake = FakeHost::start(&[]);
+    let app = fixture(fake.config());
+    let host = the_client(&app);
+    let log = Arc::new(ExitLog::default());
+    host.set_events(log.clone());
+    app.sessions.connect_host().unwrap();
+    let observer = SlowFinish::new();
+    lock(&host.inner.proxies).insert(
+        "term-9-early".into(),
+        Proxy::new(nowhere(), Some(observer.clone()), None, false, false),
+    );
+    let first = {
+        let inner = host.inner.clone();
+        std::thread::spawn(move || inner.record_exit(exit_of("term-9-early", Some(0))))
+    };
+    until(
+        "the first exit's bookkeeping",
+        Duration::from_secs(5),
+        || observer.started.load(Ordering::Acquire) >= 1,
+    );
+
+    host.inner.record_exit(exit_of("term-9-early", Some(0)));
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert!(
+        lock(&host.inner.proxies).contains_key("term-9-early"),
+        "the session was removed before its exit was recorded"
+    );
+    assert_eq!(
+        fake.shared.forgets.load(Ordering::Acquire),
+        0,
+        "the host was told to forget an exit whose receipt is not written"
+    );
+
+    observer.open.store(true, Ordering::Release);
+    first.join().unwrap();
+    until("the host told to forget", Duration::from_secs(5), || {
+        fake.shared.forgets.load(Ordering::Acquire) >= 1
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(fake.shared.forgets.load(Ordering::Acquire), 1);
+    assert!(!lock(&host.inner.proxies).contains_key("term-9-early"));
+    assert_eq!(log.exits.lock().unwrap().len(), 1);
+}
+
+/// A report that arrives after the exit is recorded keeps today's behaviour:
+/// it clears the host's copy again and removes any proxy, and announces nothing.
+#[test]
+fn a_second_report_after_the_recording_only_clears_the_hosts_copy() {
+    let fake = FakeHost::start(&[]);
+    let app = fixture(fake.config());
+    let host = the_client(&app);
+    let log = Arc::new(ExitLog::default());
+    host.set_events(log.clone());
+    app.sessions.connect_host().unwrap();
+    host.inner.record_exit(exit_of("term-9-late", Some(0)));
+    until("the first forget", Duration::from_secs(5), || {
+        fake.shared.forgets.load(Ordering::Acquire) >= 1
+    });
+    lock(&host.inner.proxies).insert(
+        "term-9-late".into(),
+        Proxy::new(nowhere(), None, None, false, false),
+    );
+
+    host.inner.record_exit(exit_of("term-9-late", Some(0)));
+
+    until("the second forget", Duration::from_secs(5), || {
+        fake.shared.forgets.load(Ordering::Acquire) >= 2
+    });
+    assert!(!lock(&host.inner.proxies).contains_key("term-9-late"));
+    assert_eq!(log.exits.lock().unwrap().len(), 1, "announced once");
+}
