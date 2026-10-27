@@ -123,7 +123,7 @@ fn tightening_is_on_the_opened_handle_so_a_link_never_carries_it_to_its_target()
 }
 
 #[test]
-fn the_reader_tightens_a_wide_current_record_and_a_wide_prev_it_owns() {
+fn the_reader_tightens_a_wide_current_record_and_says_a_wide_prev_it_leaves_alone() {
     let dir = tempfile::tempdir().unwrap();
     let socket = socket_in(dir.path());
     let record = record_path(&socket);
@@ -138,10 +138,60 @@ fn the_reader_tightens_a_wide_current_record_and_a_wide_prev_it_owns() {
 
     let report = read_record(&socket, now);
 
-    assert_eq!(report.missed, 2);
-    assert_eq!(report.error, None);
+    assert_eq!(report.missed, 2, "both are counted");
     assert_eq!(mode_of(&record), 0o600);
-    assert_eq!(mode_of(&previous), 0o600);
+    assert_eq!(
+        mode_of(&previous),
+        0o666,
+        "the rotation clock is not touched"
+    );
+    let error = report.error.expect("the wide .prev is said");
+    assert!(
+        error.contains("readable by other users (mode 0666)"),
+        "{error}"
+    );
+    assert!(error.contains(&previous.display().to_string()), "{error}");
+    assert!(
+        !error.contains("0644"),
+        "the current record was tightened: {error}"
+    );
+    assert!(!error.contains("could not be read in full"), "{error}");
+}
+
+#[test]
+fn a_wide_current_record_is_tightened_before_it_becomes_a_prev_the_reader_leaves_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = socket_in(dir.path());
+    let record = record_path(&socket);
+    let now = wall();
+    let one = line(now - HOUR, "session_ended");
+    let count = ROTATE_BYTES as usize / one.len() + 5;
+    put(&record, one.repeat(count).as_bytes(), 0o644);
+
+    let report = read_record(&socket, now);
+
+    assert!(!record.exists(), "it rotated");
+    assert_eq!(mode_of(&prev_path(&record)), 0o600);
+    assert_eq!(report.missed, count as u64);
+    assert_eq!(report.error, None);
+}
+
+#[test]
+fn a_wide_prev_stops_being_said_once_it_rotates_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = socket_in(dir.path());
+    let previous = prev_path(&record_path(&socket));
+    let now = wall();
+    put(
+        &previous,
+        line(now - HOUR, "session_ended").as_bytes(),
+        0o644,
+    );
+    assert!(read_record(&socket, now).error.is_some());
+
+    std::fs::remove_file(&previous).unwrap();
+
+    assert_eq!(read_record(&socket, now).error, None);
 }
 
 #[test]
@@ -233,7 +283,11 @@ fn a_prev_that_is_not_capped_never_says_it_and_a_gap_that_cannot_be_dated_is_ins
     let dir = tempfile::tempdir().unwrap();
     let socket = socket_in(dir.path());
     let previous = prev_path(&record_path(&socket));
-    std::fs::write(&previous, line(wall() - HOUR, "session_ended")).unwrap();
+    put(
+        &previous,
+        line(wall() - HOUR, "session_ended").as_bytes(),
+        0o600,
+    );
     let report = read_record(&socket, wall() + 30 * WINDOW_MS);
     assert_eq!(report.error, None);
 }

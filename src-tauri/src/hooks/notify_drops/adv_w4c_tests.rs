@@ -1,9 +1,10 @@
 //! W4c adversary attacks on the drop record's existing-file tightening
 //! (ft-f70ee2bb item 1) and on ctime as the rotation time (item 2).
 //!
-//! Tests marked `#[ignore = "BROKE: ..."]` assert the behaviour the card asks
-//! for and FAIL on the lane tip; run them with `--ignored` to see the failure.
-//! Every other test passes on the tip and records an attack that held.
+//! The attacks that broke the first lane tip (1d, 1d', 2c) were fixed in rework
+//! 1 and their tests assert the ruled behaviour: tightening is best effort and
+//! never a precondition, and the reader leaves a `.prev` alone. Every other test
+//! records an attack that held.
 
 use super::*;
 use std::os::unix::ffi::OsStrExt;
@@ -249,7 +250,13 @@ fn adv_a1_a_generation_another_user_owns_is_read_and_left_alone_by_the_reader() 
         return;
     }
     let before = (meta.mode(), meta.ctime(), meta.ctime_nsec());
-    let generation = read_generation(hosts).expect("readable").expect("present");
+    let generation = read_generation(hosts, true)
+        .expect("readable")
+        .expect("present");
+    assert_eq!(
+        generation.wide, None,
+        "not ours, so nothing to say or change"
+    );
     assert!(!generation.bytes.is_empty());
     let after = std::fs::metadata(hosts).unwrap();
     assert_eq!(before, (after.mode(), after.ctime(), after.ctime_nsec()));
@@ -257,13 +264,12 @@ fn adv_a1_a_generation_another_user_owns_is_read_and_left_alone_by_the_reader() 
 
 // Attack 1d: fchmod fails on a record the hook can still append to. macOS
 // `uappnd` (user append-only) allows `O_APPEND` writes and refuses chmod, and
-// an append-only audit log is the legitimate reason anyone sets it. On the
-// base the hook recorded the miss; on the tip a wide append-only record turns
-// every miss into "not recorded", though the line could be written.
+// an append-only audit log is the legitimate reason anyone sets it. Ruled in
+// rework 1: tightening is best effort, so the line is written and counted as
+// recorded, the file stays as wide as it was, and the reader says so.
 #[cfg(target_os = "macos")]
 #[test]
-#[ignore = "BROKE: a wide record the hook can append to is refused because fchmod is refused"]
-fn adv_a1_a_wide_append_only_record_still_takes_the_line_the_hook_could_write() {
+fn adv_a1_a_wide_append_only_record_still_takes_the_line_and_the_reader_says_it_is_wide() {
     let dir = tempfile::tempdir().unwrap();
     let socket = socket_in(dir.path());
     let record = record_path(&socket);
@@ -274,14 +280,21 @@ fn adv_a1_a_wide_append_only_record_still_takes_the_line_the_hook_could_write() 
 
     assert_eq!(appended, Ok(()), "the line could have been written");
     assert_eq!(std::fs::read_to_string(&record).unwrap().lines().count(), 1);
+    assert_eq!(mode_of(&record), 0o644, "the system refused the narrowing");
+    let report = read_record(&socket, clock().unwrap());
+    assert_eq!(report.missed, 1, "{:?}", report.error);
+    let error = report.error.expect("a wide record is said, not hidden");
+    assert!(
+        error.contains("readable by other users (mode 0644)"),
+        "{error}"
+    );
+    assert!(error.contains("could not be tightened"), "{error}");
 }
 
-// Attack 1d': the same fchmod failure, reader side. The file reads fine, but
-// the whole generation is withheld because tightening it failed: the count the
-// reader could have shown becomes 0 with an error.
+// Attack 1d': the same fchmod failure, reader side. The file reads fine and
+// its lines are counted whatever happens to the chmod.
 #[cfg(target_os = "macos")]
 #[test]
-#[ignore = "BROKE: a readable wide generation is withheld when fchmod on it fails"]
 fn adv_a1_a_wide_generation_whose_chmod_is_refused_still_counts_its_lines() {
     let dir = tempfile::tempdir().unwrap();
     let socket = socket_in(dir.path());
@@ -295,11 +308,12 @@ fn adv_a1_a_wide_generation_whose_chmod_is_refused_still_counts_its_lines() {
     assert_eq!(report.missed, 1, "{:?}", report.error);
 }
 
-// Attack 1d'': what the failure does report on the tip (so that the withheld
-// count is at least not silent): an error, never a clean 0.
+// Attack 1d'': what the failure reports (so that a wide record is not silent):
+// its own note, distinct from the unreadable text, and no "count may be too
+// low" because nothing was withheld.
 #[cfg(target_os = "macos")]
 #[test]
-fn adv_a1_a_refused_chmod_on_the_reader_is_reported_not_shown_as_a_clean_zero() {
+fn adv_a1_a_refused_chmod_on_the_reader_is_its_own_note_and_not_an_unreadable_record() {
     let dir = tempfile::tempdir().unwrap();
     let socket = socket_in(dir.path());
     let record = record_path(&socket);
@@ -311,7 +325,8 @@ fn adv_a1_a_refused_chmod_on_the_reader_is_reported_not_shown_as_a_clean_zero() 
 
     let error = report.error.expect("reported");
     assert!(error.contains("could not be tightened"), "{error}");
-    assert!(error.contains("count may be too low"), "{error}");
+    assert!(!error.contains("count may be too low"), "{error}");
+    assert!(!error.contains("could not be read in full"), "{error}");
 }
 
 // Attack 1e: `.lock` and `.prev`. A wide `.lock` is refused, not tightened:
@@ -381,13 +396,12 @@ fn adv_a2_a_status_change_after_rotation_revives_the_note_and_never_ends_it_earl
     );
 }
 
-// Attack 2c: the reader's own tightening is a status change. A legacy wide
-// capped `.prev` expires on its first read (ctime is taken before the chmod)
-// and the very same read moves its ctime to now, so the next read says the
-// note again: expiry is not stable, and the reader is what un-expires it.
+// Attack 2c: the reader's own tightening is a status change. Ruled in rework 1:
+// the reader leaves a `.prev` alone, so a legacy wide capped one expires on its
+// first read and stays expired on every later one. It is said to be wide
+// (its own note) while it exists, and that note is not the lower-bound one.
 #[test]
-#[ignore = "BROKE: the reader's own fchmod of a wide capped .prev revives the note it just expired"]
-fn adv_a2_a_wide_capped_prev_that_expired_stays_expired_after_the_reader_tightened_it() {
+fn adv_a2_a_wide_capped_prev_that_expired_stays_expired_because_the_reader_leaves_it_alone() {
     let dir = tempfile::tempdir().unwrap();
     let socket = socket_in(dir.path());
     let previous = prev_path(&record_path(&socket));
@@ -397,11 +411,26 @@ fn adv_a2_a_wide_capped_prev_that_expired_stays_expired_after_the_reader_tighten
     let now = rotated + WINDOW_MS + 20;
 
     let first = read_record(&socket, now);
-    assert_eq!(mode_of(&previous), 0o600);
     let second = read_record(&socket, now);
 
-    assert_eq!(first.error, None, "expired on the first read");
-    assert_eq!(second.error, None, "and still expired on the second");
+    assert_eq!(
+        mode_of(&previous),
+        0o644,
+        "a `.prev` is not the reader's to chmod"
+    );
+    assert_eq!(
+        ctime_ms(&previous),
+        rotated,
+        "so its rotation clock did not move"
+    );
+    for report in [&first, &second] {
+        assert!(!lower_bound_said(report), "{:?}", report.error);
+        let error = report.error.as_deref().expect("a wide .prev is said");
+        assert!(
+            error.contains("readable by other users (mode 0644)"),
+            "{error}"
+        );
+    }
 }
 
 // Attack 2d: a clock the file system and the reader disagree on. A ctime in
