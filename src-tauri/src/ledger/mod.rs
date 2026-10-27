@@ -4246,8 +4246,11 @@ fn crash_point(written: i64) {
         .ok()
         .and_then(|n| n.parse::<i64>().ok());
     if after == Some(written) {
-        // SAFETY: a signal to this very process; SIGKILL cannot be handled.
-        unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+        // SAFETY: SIGKILL cannot be caught or blocked. `raise` delivers it to
+        // this thread. `kill(getpid())` may be taken by another thread of the
+        // libtest process, and this thread then continues into `commit`, so
+        // the rows of the "killed" transaction are on disk.
+        unsafe { libc::raise(libc::SIGKILL) };
     }
 }
 

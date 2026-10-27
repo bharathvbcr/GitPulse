@@ -181,6 +181,7 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
             dir.display()
         );
     }
+    let dir = plain_git_path(dir);
     let mut command = Command::new("git");
     command
         .args([
@@ -192,7 +193,7 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
             "commit.gpgsign=false",
         ])
         .args(args)
-        .current_dir(dir)
+        .current_dir(&dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -207,14 +208,57 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
         String::from_utf8_lossy(&output.stderr)
     );
     if args.first() == Some(&"init") {
-        trust_repo(dir);
+        trust_repo(&dir);
+    }
+}
+
+#[cfg(test)]
+/// Git for Windows does not treat a `\\?\` verbatim path as a repository it
+/// just created in that directory: `git init` can succeed with that spelling
+/// as the working directory, and the next `git` given the same spelling as an
+/// argument reports "Not a Git repository" or "unknown error occurred while
+/// reading the configuration files". The Win32 extended prefix is a spelling,
+/// not a different directory.
+pub(crate) fn plain_git_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    let Some(rest) = text.strip_prefix(r"\\?\") else {
+        return path.to_path_buf();
+    };
+    if let Some(unc) = rest.strip_prefix(r"UNC\") {
+        return PathBuf::from(format!(r"\\{unc}"));
+    }
+    PathBuf::from(rest)
+}
+
+#[cfg(test)]
+mod plain_path_tests {
+    use super::plain_git_path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn a_verbatim_win32_prefix_is_stripped_for_git() {
+        assert_eq!(
+            plain_git_path(Path::new(
+                r"\\?\C:\Users\runneradmin\AppData\Local\Temp\.tmpabc"
+            )),
+            PathBuf::from(r"C:\Users\runneradmin\AppData\Local\Temp\.tmpabc")
+        );
+        assert_eq!(
+            plain_git_path(Path::new(r"\\?\UNC\server\share\repo")),
+            PathBuf::from(r"\\server\share\repo")
+        );
+        assert_eq!(
+            plain_git_path(Path::new("/tmp/repo")),
+            PathBuf::from("/tmp/repo")
+        );
     }
 }
 
 /// Explicit approval for an owned fixture through the production grant path.
 #[cfg(test)]
 pub(crate) fn trust_repo(dir: &Path) {
-    let path = dir.to_str().expect("fixture path");
+    let plain = plain_git_path(dir);
+    let path = plain.to_str().expect("fixture path");
     let preview = crate::repository_trust::inspect(path).expect("inspect fixture");
     crate::repository_trust::grant(path, &preview.identity, false).expect("approve fixture");
 }
@@ -332,7 +376,7 @@ pub(crate) fn git_repo() -> TempDir {
     let dir = TempDir::new().expect("tempdir");
     let status = Command::new("git")
         .args(["init", "-b", "main"])
-        .current_dir(dir.path())
+        .current_dir(plain_git_path(dir.path()))
         .status_locked()
         .expect("git init");
     assert!(status.success());
@@ -923,6 +967,28 @@ mod diskio_guard {
         let why = diskio::verdict(&samples, &limits(1 << 20, 30, 8_192)).expect("over total");
         assert!(why.contains("budget"), "{why}");
         assert_eq!(diskio::verdict(&[], &limits(40, 30, 8_192)), None);
+    }
+
+    #[test]
+    fn the_measured_suite_rate_stays_under_the_ceiling() {
+        // 89 MiB/s for 30 s is the coverage job's abort (llvm-cov, one thread).
+        // 84 MiB/s is the 8-thread Ubuntu suite. Both must be inside the ceiling;
+        // twice that rate must still abort.
+        let mib: u64 = 1024 * 1024;
+        let limits = diskio::limits(None).expect("the guard is on by default");
+        let healthy = [
+            (Duration::ZERO, 0),
+            (Duration::from_secs(30), 89 * mib * 30),
+        ];
+        assert!(
+            diskio::verdict(&healthy, &limits).is_none(),
+            "the coverage suite's 89 MiB/s was treated as a runaway"
+        );
+        let runaway = [
+            (Duration::ZERO, 0),
+            (Duration::from_secs(30), 200 * mib * 30),
+        ];
+        assert!(diskio::verdict(&runaway, &limits).is_some());
     }
 
     #[test]

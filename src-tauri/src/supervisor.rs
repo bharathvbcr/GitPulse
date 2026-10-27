@@ -282,7 +282,7 @@ pub fn cmd_degraded_subsystems() -> Vec<Degraded> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -300,22 +300,30 @@ mod tests {
     #[test]
     fn a_panicking_tick_is_listed_then_recovers_and_the_loop_survives() {
         const NAME: &str = "supervisor-test-clock";
+        // The listing is cleared by the next successful tick. Two panics and
+        // then a recovery is a window of about ten milliseconds; on a loaded
+        // runner the test thread misses it and the assertion fails even though
+        // the panic was recorded. Hold the panic until this test has seen the
+        // listing, then let a tick complete.
+        let panicking = Arc::new(AtomicBool::new(true));
+        let flag = panicking.clone();
         let ticks = Arc::new(AtomicUsize::new(0));
         let seen = ticks.clone();
         spawn_loop(NAME, Duration::from_millis(5), move || {
-            let n = seen.fetch_add(1, Ordering::SeqCst);
-            if (1..=2).contains(&n) {
-                panic!("injected panic in tick {n}");
+            if flag.load(Ordering::SeqCst) {
+                panic!("injected panic");
             }
+            seen.fetch_add(1, Ordering::SeqCst);
         })
         .unwrap();
         let listed = || degraded().into_iter().find(|d| d.subsystem == NAME);
         assert!(wait(Duration::from_secs(5), || listed().is_some()));
         let first = listed().unwrap();
         assert!(first.reason.contains("injected panic"), "{first:?}");
+        panicking.store(false, Ordering::SeqCst);
         assert!(
             wait(Duration::from_secs(5), || {
-                ticks.load(Ordering::SeqCst) >= 5 && listed().is_none()
+                ticks.load(Ordering::SeqCst) >= 1 && listed().is_none()
             }),
             "the loop did not survive the panic and recover"
         );

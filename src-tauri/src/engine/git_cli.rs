@@ -12780,11 +12780,19 @@ mod admission_scope_tests {
     /// Spawns `gate` admits in `class` before it refuses, its own bucket
     /// frozen so only the budgets decide.
     fn drain(gate: &SpawnGate, class: Admission) -> usize {
+        // The deadline is checked before the attempt. Background runs at
+        // utility QoS, and a stall longer than the deadline is counted as an
+        // empty bucket. An empty background bucket returns `Refusal::Shed`
+        // without waiting, so the longer cap does not add grants. Reactive
+        // stays on the short deadline: it waits out an empty bucket, and a
+        // long one would pad every measurement with that wait.
+        let budget = if class == Admission::Background {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_millis(20)
+        };
         let mut admitted = 0;
-        while with_admission(class, || {
-            gate.acquire(Instant::now() + Duration::from_millis(20))
-                .is_some()
-        }) {
+        while with_admission(class, || gate.acquire(Instant::now() + budget).is_some()) {
             admitted += 1;
         }
         admitted
