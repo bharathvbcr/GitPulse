@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { expect, it, vi } from "vitest";
+import { wallClockBudget } from "../src/lib/testing/wallClock";
 
 type Invocation = { status: number; stdout: string; stderr: string };
 type VendorCli = { main: (argv: string[]) => number };
@@ -113,7 +114,7 @@ it.runIf(process.platform !== "win32")("reports a git that never answers as an e
     expect(spawned.status, spawned.stderr).toBe(2);
     expect(spawned.stderr).toContain("`git -C");
     expect(spawned.stderr).toContain("did not finish within 300 ms");
-    expect(Date.now() - started).toBeLessThan(15_000);
+    expect(Date.now() - started).toBeLessThan(wallClockBudget(15_000));
   } finally { f.cleanup(); }
 }, 30_000);
 
