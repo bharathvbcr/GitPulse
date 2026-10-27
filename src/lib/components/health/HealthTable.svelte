@@ -39,20 +39,33 @@
   } = $props();
 </script>
 
-<!-- `overflow-wrap: anywhere`, not `break-words`, and set here rather than per
-     cell. Package names, file paths, rule ids and symbol names are all
-     identifiers with no break opportunity, and a table column's width is
-     driven by its longest unbreakable word: a 300-character dependency name
-     widened the whole page and gave the scroll container a horizontal bar.
-     `break-word` does not shrink min-content width, so it does not fix that;
-     `anywhere` does. It inherits, so it reaches cells the caller renders. -->
-<div class="border border-border/70 rounded-2xl overflow-hidden shadow-card">
-  <table class="w-full text-left [overflow-wrap:anywhere]">
+<!-- `overflow-wrap: anywhere` belongs on the body, not the table. Package
+     names, file paths, rule ids and symbol names are identifiers with no
+     break opportunity, and a column's min-content width is its longest
+     unbreakable word: a 300-character dependency name widened the page.
+     `break-word` does not shrink that minimum; `anywhere` does. It inherits,
+     so it reaches the cells the caller renders.
+     It must not inherit into the header. A header is one word ("Severity",
+     "Package"), and `anywhere` lets that word's minimum fall to a single
+     character, so a pane narrower than the harness stage splits it —
+     SEVER/ITY, PACKA/GE — while the column shrinks to fit. `nowrap` keeps
+     each header on one line. It does not size the column; `table-fixed`
+     does, so a long cell cannot shrink its neighbours down to that word. -->
+<div class="min-w-0 border border-border/70 rounded-2xl overflow-hidden shadow-card">
+  <!-- `fixed` so a column's width comes from the table and the header widths,
+       not from the longest cell. Without it, one unbreakable package name's
+       max-content takes the spare width and the fix column collapses until
+       "1.1.0" wraps under a header that still says FIX. An unsized column
+       then takes an equal share, so callers set `width` on the short ones
+       (severity, fix, the action) and the name columns receive what remains.
+       `align-top` is on the body: one wrapping cell used to center the
+       severity badge and the version in the middle of that row. -->
+  <table class="w-full table-fixed text-left">
     <caption class="sr-only">{caption}</caption>
     <thead class="bg-surface text-[10px] uppercase text-textMuted">
       <tr>
         {#each keyedList(columns, (column) => column.label) as { item: column, key } (key)}
-          <th scope="col" class="px-3 py-2 font-medium {column.width ?? ''}">
+          <th scope="col" class="whitespace-nowrap px-3 py-2 font-medium {column.width ?? ''}">
             {#if column.hideLabel}
               <span class="sr-only">{column.label}</span>
             {:else}
@@ -62,7 +75,7 @@
         {/each}
       </tr>
     </thead>
-    <tbody>
+    <tbody class="align-top [overflow-wrap:anywhere]">
       {@render children()}
     </tbody>
   </table>
