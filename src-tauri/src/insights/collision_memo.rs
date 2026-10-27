@@ -425,7 +425,7 @@ mod tests {
             .map(|_| crate::test_support::git_repo())
             .collect();
         assert!(
-            1 + others.len() > MAX_LISTS && 1 + others.len() <= MAX_READS,
+            1 + others.len() > MAX_LISTS && others.len() < MAX_READS,
             "the status cache still has room"
         );
         for other in &others {
