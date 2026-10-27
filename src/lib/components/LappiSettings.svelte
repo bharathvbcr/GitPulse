@@ -6,9 +6,10 @@
    * could not type the staged change; the user still edits and commits the
    * message. Asking sends the staged diff to the local Lappi process
    * (`src-tauri/src/lappi/request.rs`), so the switch says that and not only
-   * "ask": it is not the AI-provider consent gate, because GitPulse sends
-   * nothing off this computer through it. Recording keeps local caller records under Lappi's held-out store
-   * and sends nothing anywhere. What recording has done is shown beside the
+   * "ask". It is not the AI-provider consent gate: the socket is local, and
+   * AI commit-message generation, which can send the same diff to a model
+   * server, has its own consent and is a separate step. Recording keeps local
+   * caller records under Lappi's held-out store and sends nothing anywhere. What recording has done is shown beside the
    * switch, because "on, nothing written" and "on, stopped at the cap" look
    * identical from the switch alone.
    */
@@ -59,7 +60,7 @@
   <div class="text-textMuted text-[10px] mb-1.5">Lappi</div>
   <SettingToggle
     label="Ask Lappi on ambiguous commit types"
-    description="Off by default. When the staged change has no clear type, the staged diff is sent to the local Lappi process on this computer, over a local socket. GitPulse sends it nowhere else. Its answer can only pre-select the type in the draft you edit."
+    description="Off by default. When the staged change has no clear type, the staged diff is sent to the local Lappi process on this computer, over a local socket. This is separate from AI commit-message generation, which has its own consent. Its answer can only pre-select the type in the draft you edit."
     checked={view.settings.ask_on_ambiguous_commit_type}
     disabled={busy || !view.transport_supported}
     onchange={(next) => void save({ ...view.settings, ask_on_ambiguous_commit_type: next })}

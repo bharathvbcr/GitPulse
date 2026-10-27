@@ -1128,6 +1128,127 @@ fn with_recording_off_a_commit_outcome_looks_up_no_store() {
     assert_eq!(calls.get(), 1);
 }
 
+/* ── the public entry points, with the real settings, environment and paths ── */
+
+/// `$HOME`, the tool config and the agent socket all point into temp
+/// directories, so the public wrappers read real settings and resolve real
+/// paths without touching the user's.
+struct Entry {
+    home: tempfile::TempDir,
+    _config: tempfile::TempDir,
+    _sock_dir: tempfile::TempDir,
+    listener: UnixListener,
+}
+
+/// The fixture and the environment binding that points the process at it. The
+/// binding owns the environment lock and is dropped (restoring the variables)
+/// before the directories are.
+fn entry_world() -> (Entry, crate::test_support::env::EnvBinding<'static>) {
+    let serial = crate::test_support::env::env_serial();
+    let home = tempfile::tempdir_in("/tmp").expect("home");
+    let config = tempfile::tempdir_in("/tmp").expect("config dir");
+    let sock_dir = socket_dir();
+    let sock = sock_dir.path().join("qd.sock");
+    let listener = UnixListener::bind(&sock).expect("a listener that is never meant to be reached");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let env = crate::test_support::env::bind_env_owned(serial)
+        .set("HOME", home.path())
+        .set(client::SOCKET_ENV, &sock)
+        .set(
+            crate::tool_config::TOOL_CONFIG_ENV,
+            config.path().join("tools.json"),
+        )
+        .remove(record::COLLECT_ENV)
+        .invalidating(crate::tool_config::invalidate_cache);
+    let world = Entry {
+        home,
+        _config: config,
+        _sock_dir: sock_dir,
+        listener,
+    };
+    (world, env)
+}
+
+impl Entry {
+    /// Whether anything connected to the listener. The kernel queues a
+    /// connection when `connect(2)` returns, so after the call under test has
+    /// returned this is exact, not a race.
+    fn was_connected(&self) -> bool {
+        self.listener.accept().is_ok()
+    }
+
+    /// Whether the caller-record store directory exists under the temp `$HOME`.
+    fn store_created(&self) -> bool {
+        self.home
+            .path()
+            .join(record::STORE_RELATIVE_TO_HOME)
+            .exists()
+    }
+}
+
+fn save_switches(ask: bool, record_data: bool) {
+    crate::tool_config::set_lappi_settings(switches(ask, record_data)).expect("save settings");
+    crate::tool_config::invalidate_cache();
+}
+
+/// With both switches off, `consult_on_commit_type` and `record_commit_outcome`
+/// connect to nothing and create no store, driven through the real settings
+/// reader and path lookups. (Removing `consult_gated`'s early return alone is
+/// not visible here: with both off nothing would be asked or recorded anyway.
+/// That return is pinned by the resolver tests above; this pins the outcome
+/// the return exists for, against a wrapper that passes the wrong inputs.)
+#[test]
+fn the_public_entry_points_with_both_switches_off_touch_no_socket_and_no_store() {
+    let (world, _env) = entry_world();
+    assert_eq!(
+        crate::tool_config::lappi_settings(),
+        crate::tool_config::LappiSettings::default()
+    );
+    let before = low_confidence(true);
+    let mut draft = before.clone();
+    super::consult_on_commit_type("/repo", MODIFIED_SOURCE.as_bytes(), &mut draft);
+    super::record_commit_outcome("/repo", "fix: mend it");
+    assert!(
+        !world.was_connected(),
+        "a connection was made with both off"
+    );
+    assert!(!world.store_created(), "a store was created with both off");
+    assert_eq!(draft, before, "the draft is untouched");
+}
+
+/// `LAPPI_COLLECT=0` forces recording off whatever the switch says. A wrapper
+/// that stopped passing it on would create the store here.
+#[test]
+fn collect_zero_keeps_the_public_entry_points_off_the_store_and_the_socket() {
+    let (world, env) = entry_world();
+    let _env = env.set(record::COLLECT_ENV, "0");
+    save_switches(false, true);
+    let mut draft = low_confidence(true);
+    super::consult_on_commit_type("/repo", MODIFIED_SOURCE.as_bytes(), &mut draft);
+    super::record_commit_outcome("/repo", "fix: mend it");
+    assert!(!world.was_connected());
+    assert!(!world.store_created(), "recording was forced off");
+}
+
+/// Control: asking alone does connect, and still creates no store, so the
+/// negatives above are not vacuous and asking is not what opens the store.
+#[test]
+fn asking_alone_connects_through_the_public_entry_point_and_creates_no_store() {
+    let (world, env) = entry_world();
+    let agent = replying(REFUSED);
+    let _env = env.set(client::SOCKET_ENV, &agent.path);
+    save_switches(true, false);
+    let mut draft = low_confidence(true);
+    super::consult_on_commit_type("/repo", MODIFIED_SOURCE.as_bytes(), &mut draft);
+    super::record_commit_outcome("/repo", "fix: mend it");
+    assert!(
+        agent.requests.recv_timeout(DEADLINE).is_ok(),
+        "asking is on, so the agent must have been asked"
+    );
+    assert!(!world.was_connected(), "only the agent under test was used");
+    assert!(!world.store_created(), "recording is off: no store");
+}
+
 fn read_store(store: &Store) -> Vec<String> {
     let mut lines = Vec::new();
     let mut files: Vec<_> = std::fs::read_dir(store.dir())

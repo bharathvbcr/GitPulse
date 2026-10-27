@@ -31,9 +31,20 @@ describe("the Ask Lappi switch", () => {
     expect(description).toContain("staged diff is sent to the local Lappi process");
   });
 
-  it("says where it goes, and that GitPulse sends it nowhere else", () => {
+  it("says where it goes, and that AI commit-message generation is separate", () => {
     expect(description).toContain("local socket");
-    expect(description).toContain("GitPulse sends it nowhere else");
+    expect(description).toContain("separate from AI commit-message generation");
+    expect(description).toContain("has its own consent");
+  });
+
+  // The first version of this file pinned "GitPulse sends it nowhere else".
+  // That sentence is false of GitPulse: `generate_commit_message` sends the
+  // same diff to the confirmed model server under the AI consent gate. The
+  // switch's own claim is the only one it may make, so the overclaim is a
+  // regression, not wording.
+  it("does not claim the diff goes nowhere else", () => {
+    expect(description).not.toMatch(/nowhere else/i);
+    expect(description).not.toMatch(/not to an AI provider/i);
   });
 
   it("keeps what it already said: off by default, and the answer only pre-selects", () => {

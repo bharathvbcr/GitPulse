@@ -41,8 +41,21 @@ impl NotifyDrops {
     }
 
     /// Records one abandoned report and returns the count including it.
+    /// The stored count saturates at `u64::MAX`; it never wraps to a smaller
+    /// number, which would read as "nothing was dropped".
     pub fn record(&self) -> u64 {
-        self.0.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+        // A compare-exchange loop rather than `fetch_add`, which wraps.
+        let mut stored = self.0.load(Ordering::Relaxed);
+        loop {
+            let next = stored.saturating_add(1);
+            match self
+                .0
+                .compare_exchange_weak(stored, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return next,
+                Err(actual) => stored = actual,
+            }
+        }
     }
 
     pub fn snapshot(&self) -> DropSnapshot {
