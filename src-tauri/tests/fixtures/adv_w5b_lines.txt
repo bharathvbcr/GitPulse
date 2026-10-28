@@ -1,0 +1,120 @@
+kill %1
+kill %%
+kill $!
+kill -9 $!
+kill $$
+kill "$pid"
+kill -TERM "$PID"
+kill -9 "$PID"
+kill -0 "$pid"
+kill -s TERM "$pid"
+kill -l
+kill -L
+kill -l 9
+killall -l
+killall -V
+pkill -0 w5b-no-such-process
+pkill -l
+pgrep -f w5b-no-such-process
+pgrep -l w5b-no-such-process
+pidof w5b-no-such-process
+$EDITOR file
+$EDITOR notes/skills.md
+${EDITOR:-vi} killer.txt
+$PAGER skills.log
+git commit -m "skill: add the killer feature" && $PAGER log
+git log --grep=kill | $PAGER
+ps aux | grep w5b-no-such-process
+ps aux | grep kill
+ps -ef | grep -v grep | grep node
+for p in $(cat pids.txt); do kill $p; done
+while read p; do kill $p; done < pids.txt
+kill $(cat app.pid)
+kill $(cat /tmp/app.pid)
+kill -TERM $(cat app.pid)
+[ -f app.pid ] && kill $(cat app.pid) && rm app.pid
+trap 'kill $(jobs -p) 2>/dev/null' EXIT
+trap "kill $child" EXIT
+cleanup() { kill $pid 2>/dev/null; }; cleanup
+docker kill web
+docker kill $(docker ps -q)
+kubectl delete pod web
+systemctl kill foo
+$CC -o skill skill.c
+$CC -o killer killer.c
+$TOOL --killswitch
+$RUNNER --kill-after 5 test
+$CMD kill
+$SHELL -c 'echo hi'
+$SHELL -c 'echo kill'
+sudo $EDITOR /etc/hosts
+./run.sh --skill $NAME
+$HOME/bin/skillctl list
+npx $PKG --skills
+echo "$USER killed it"
+echo killall
+echo "pkill is the tool"
+grep -r kill src/
+cat /var/log/kill.log
+man kill
+which pkill
+command -v killall
+tail -f server.log & echo $! > pid; sleep 1; kill $!
+sleep 100 & kill $!
+(sleep 5; kill $PPID) &
+timeout 5 $CMD
+nohup $CMD > out.log 2>&1 &
+cd $DIR && make killall
+make kill
+npm run kill-port
+lsof -ti:3000 | xargs kill
+lsof -ti:3000 | xargs kill -9
+kill -9 $(lsof -ti:3000)
+fuser -k 3000/tcp
+pkill -f w5b-no-such-vite
+pkill w5b-no-such-vite
+pkill -x w5b-no-such-vite
+pkill -u $USER w5b-no-such-vite
+pkill -f "w5b-no-such vite"
+pkill -f "$APP"
+pkill -f $PATTERN
+killall w5b-no-such-vite
+killall -q w5b-no-such-vite
+killall $NAME
+pkill -f w5b-no-such-vite; $EDITOR out.log
+alias ll='ls -l'; ll
+alias k='kill -9'; k 99999
+alias killp='echo kill'; killp
+eval $SETUP
+eval "$(ssh-agent -s)"
+eval "$(direnv export bash)"
+bash -c "$SCRIPT"
+bash -c "$KILLER"
+sh -c "kill $PID"
+ssh build-host 'pkill -f worker'
+ssh build-host killall worker
+ssh $HOST 'pkill -f worker'
+ssh localhost uptime
+ssh localhost 'pkill -f w5b-no-such-vite'
+find . -name '*.pid' -exec cat {} \;
+find . -name '*.pid' -exec kill {} \;
+find /tmp -name 'w5b-*' -exec rm {} +
+find . -name '*.log' -exec grep -l kill {} +
+busybox ls -l
+busybox --list
+busybox killall w5b-no-such-vite
+busybox pkill w5b-no-such-vite
+toybox pkill w5b-no-such-vite
+p=pkill; $p -f w5b-no-such-vite
+p=ls; $p -l
+c=echo; $c kill
+P=/usr/bin/pkill; $P -f w5b-no-such-vite
+for s in 1 2 3; do $RUNNER $s; done; echo "kill list done"
+make -j$(nproc) test && echo "no skill issues"
+printf '%s\n' "$KILL_SIGNAL"
+export KILL_AFTER=5; $CMD
+ls -l skills/
+cat skills/README.md
+git add skills/ && git commit -m "add skills"
+rg -n "kill" src/
+rg -n "skill" src/

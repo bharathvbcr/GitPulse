@@ -1,0 +1,78 @@
+pkill -f gitpulse-w5b-shape
+kill $(pgrep -f gitpulse-w5b-shape)
+timeout 5 pkill -f gitpulse-w5b-shape
+bash -c 'pkill -f gitpulse-w5b-shape'
+nohup bash -c 'pkill -f gitpulse-w5b-shape' >/dev/null
+busybox pkill -f gitpulse-w5b-shape
+busybox killall gitpulse-w5b-shape
+toybox pkill -f gitpulse-w5b-shape
+sudo busybox pkill -f gitpulse-w5b-shape
+p=pkill; $p -f gitpulse-w5b-shape
+p=killall; $p gitpulse-w5b-shape
+alias k=pkill; k -f gitpulse-w5b-shape
+alias k='pkill -f'; k gitpulse-w5b-shape
+ssh localhost pkill -f gitpulse-w5b-shape
+ssh user@127.0.0.1 'pkill -f gitpulse-w5b-shape'
+ssh $HOST pkill -f gitpulse-w5b-shape
+find /usr/bin -maxdepth 1 -name pkill -exec pkill -f gitpulse-w5b-shape \;
+find . -execdir killall gitpulse-w5b-shape \;
+p=pk''ill; $p -f gitpulse-w5b-shape
+p=pk""ill; $p -f gitpulse-w5b-shape
+p=pk; ${p}ill -f gitpulse-w5b-shape
+p=pkil; ${p}l -f gitpulse-w5b-shape
+c=$(printf 'pk%s' ill); $c -f gitpulse-w5b-shape
+a=p; b=ki; c=ll; $a$b$c -f gitpulse-w5b-shape
+eval "$(printf 'pk%s' ill) -f gitpulse-w5b-shape"
+bash -c "$(printf 'pk%s' ill) -f gitpulse-w5b-shape"
+$'\x70kill' -f gitpulse-w5b-shape
+$'p\153ill' -f gitpulse-w5b-shape
+{pkill,-f,gitpulse-w5b-shape}
+/usr/bin/pk[i]ll -f gitpulse-w5b-shape
+/usr/bin/pk?ll -f gitpulse-w5b-shape
+/usr/bin/pk*ll -f gitpulse-w5b-shape
+bash -o pipefail -c 'pkill -f gitpulse-w5b-shape'
+bash -O extglob -c 'pkill -f gitpulse-w5b-shape'
+bash --noprofile --norc -o errexit -c 'pkill -f gitpulse-w5b-shape'
+echo 'pkill -f gitpulse-w5b-shape' | sh
+echo 'pkill -f gitpulse-w5b-shape' | bash
+bash <<< 'pkill -f gitpulse-w5b-shape'
+source <(echo 'pkill -f gitpulse-w5b-shape')
+ionice -c3 pkill -f gitpulse-w5b-shape
+taskset -c 0 pkill -f gitpulse-w5b-shape
+chrt -o 0 pkill -f gitpulse-w5b-shape
+flock /tmp/w5b-lab/lock pkill -f gitpulse-w5b-shape
+ln -s /usr/bin/pkill /tmp/w5b-lab/xpkill; /tmp/w5b-lab/xpkill -f gitpulse-w5b-shape
+find /usr/bin -maxdepth 1 -name pkill -exec {} -f gitpulse-w5b-shape \;
+echo /usr/bin/pkill | xargs -I{} {} -f gitpulse-w5b-shape
+echo pkill | xargs -I{} sh -c '{} -f gitpulse-w5b-shape'
+for p in $(pgrep -f gitpulse-w5b-shape); do kill $p; done
+pgrep -f gitpulse-w5b-shape | while read p; do kill $p; done
+pids=$(pgrep -f gitpulse-w5b-shape); kill $pids
+xargs kill < <(pgrep -f gitpulse-w5b-shape)
+pgrep -f gitpulse-w5b-shape > /tmp/w5b-lab/pids; kill $(cat /tmp/w5b-lab/pids)
+kill $(pgrep -f gitpulse-w5b-shape | tr '\n' ' ')
+pgrep -f gitpulse-w5b-shape | xargs -r kill
+kill $(ps -eo pid,args | awk '/gitpulse-w5b-shape/ {print $1}')
+kill $(pidof /tmp/w5b-lab/sl)
+kill $(pidof /tmp/w5b-lab/gitpulse-w5b-e*)
+kill $(pidof gitpulse-w5b-exe)
+cd /tmp/w5b-lab && kill $(pidof ./sl)
+kill $(pgrep -f 'caf[[:alpha:]]')
+kill $(pgrep -f -i 'GITPULSE')
+pkill -f 'caf[[:alpha:]]'
+pkill -f -i GITPULSE-W5B
+pkill -f '\d+'
+pkill -f '\bgitpulse'
+pkill -f 'a{'
+pkill -f '(gitpulse'
+pkill -f 'gitpulse)'
+pkill -u $USER -f gitpulse
+pkill -f gitpulse -u $USER
+pkill -U $UID gitpulse
+pkill -u runner
+pkill -U 1001
+pkill --uid runner
+killall gitpulse
+killall -u $USER gitpulse
+killall -r 'gitpulse.*'
+killall -r '\w+'
