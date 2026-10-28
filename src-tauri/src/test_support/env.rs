@@ -327,6 +327,33 @@ pub(crate) mod hermetic {
         root().join("gitconfig")
     }
 
+    /// The hermetic `HOME`, by path under the root rather than by the live
+    /// `HOME`, which a scoped `bind_env` may be pointing at a directory it is
+    /// about to delete.
+    pub(crate) fn home() -> PathBuf {
+        root().join("home")
+    }
+
+    /// Points a fixture's `git` child at the pinned config and the hermetic
+    /// home, named outright.
+    ///
+    /// A fixture command that inherits the process environment reads whatever
+    /// `HOME`, `XDG_CONFIG_HOME` and `GIT_CONFIG_GLOBAL` hold at that instant.
+    /// Those are process-wide, and a neighbouring test that rebinds them (a
+    /// user-level mailmap, a fake home) holds the environment lock, which a
+    /// fixture helper does not take. The helper then reads the neighbour's
+    /// config, or a config file the neighbour has just deleted, and git dies
+    /// with "unknown error occurred while reading the configuration files".
+    /// Only the product call under test should see a rebound environment.
+    pub(crate) fn pin_git(command: &mut std::process::Command) -> &mut std::process::Command {
+        let home = home();
+        command
+            .env("GIT_CONFIG_GLOBAL", pinned_git_config())
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("USERPROFILE", &home)
+            .env("HOME", home)
+    }
+
     /// The `HOME` the developer's shell had before the constructor replaced it.
     pub(crate) fn real_home() -> Option<PathBuf> {
         std::env::var_os(super::REAL_HOME_MARKER)

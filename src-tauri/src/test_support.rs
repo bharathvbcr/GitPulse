@@ -202,6 +202,9 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // The pinned config and home, named outright: a neighbour's scoped rebind
+    // of `HOME` or `GIT_CONFIG_GLOBAL` must not reach a fixture command.
+    env::hermetic::pin_git(&mut command);
     // Spawned under the inheritance lock like every production child: this
     // runs on test threads beside code whose pipes are not yet close-on-exec,
     // and a child forked in that window keeps their ends for its lifetime.
@@ -654,6 +657,43 @@ mod tests {
             started.elapsed()
         );
         holder.join().unwrap();
+    }
+
+    /// A neighbour's scoped rebind of `GIT_CONFIG_GLOBAL` or `HOME` must not
+    /// reach a fixture command: it holds the environment lock, which `git_in`
+    /// does not take, so a fixture running beside it read the neighbour's
+    /// config, or one the neighbour had just deleted ("unknown error occurred
+    /// while reading the configuration files"). The lock is held here so the
+    /// rebind is deterministic, not a race.
+    #[test]
+    fn git_in_reads_the_pinned_config_whatever_a_neighbour_has_rebound() {
+        use crate::test_support::env::{bind_env, env_serial, write_git_config};
+        let serial = env_serial();
+        let neighbour = tempfile::tempdir().unwrap();
+
+        // The config another test pointed `GIT_CONFIG_GLOBAL` at.
+        let rebound = neighbour.path().join("rebound.gitconfig");
+        write_git_config(&rebound, "[init]\n\tdefaultBranch = leaked\n").unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        {
+            let _env = bind_env(&serial).set("GIT_CONFIG_GLOBAL", &rebound);
+            super::git_in(repo.path(), &["init", "-q"]);
+        }
+        let head = std::fs::read_to_string(repo.path().join(".git/HEAD")).unwrap();
+        assert!(
+            !head.contains("leaked"),
+            "git_in read the rebound config: {head}"
+        );
+
+        // A fake home whose `.gitconfig` git cannot parse, with no
+        // `GIT_CONFIG_GLOBAL` left to override it.
+        std::fs::write(neighbour.path().join(".gitconfig"), "[broken\n").unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let _env = bind_env(&serial)
+            .remove("GIT_CONFIG_GLOBAL")
+            .set("HOME", neighbour.path())
+            .set("XDG_CONFIG_HOME", neighbour.path());
+        super::git_in(second.path(), &["init", "-q"]);
     }
 
     /// The defect: a killed run left its harness copies in `target/` for good.
