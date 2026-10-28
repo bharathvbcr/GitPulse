@@ -1533,7 +1533,7 @@
       </div>
     {/if}
   </div>
-  {#if error || exited || spawning || shellPath || hoveredLink}
+  {#if error || exited || spawning || shellPath || hoveredLink || renderer === "reset" || renderer === "lost"}
     <!-- One fixed-height status row: spawn/error/exited/info content swaps
          inside it, so the terminal's box never resizes (and the
          ResizeObserver never refits) merely because the text rotated. -->
