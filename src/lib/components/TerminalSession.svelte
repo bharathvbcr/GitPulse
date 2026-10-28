@@ -84,6 +84,7 @@
   import { planPaste } from "../terminal/pasteGuard";
   import { askConfirm } from "../stores/modalStore";
   import { createAckCoalescer, createOutputCredit, planTerminalOutput, type PaintToken } from "../terminal/outputCredit";
+  import { createSyncFrameWriter } from "../terminal/syncFrames";
   import { applyHelperTextareaHardening, createEraseGuard, describeTerminalControl, webkit229ChordEvent, type TerminalInputEvent } from "../terminal/eraseGuard";
   import { terminalSessions } from "../terminal/sessionRegistry";
   import { copyText } from "../desktop/clipboard";
@@ -543,10 +544,29 @@
     });
   });
 
+  /** Cancel (0x18): aborts an escape sequence a gap in the output cut short. */
+  const CAN = Uint8Array.of(0x18);
+
   function acknowledgeOutput(sessionId: string, bytes: number) {
     if (bytes <= 0) return;
     acks.add(sessionId, bytes);
   }
+
+  /**
+   * Every byte the emulator is given as output goes through here, so each
+   * write ends outside a DEC 2026 block (see `syncFrames.ts`: xterm drops the
+   * paint of a frame whose successor has opened by the time its animation
+   * frame fires). Held bytes are acknowledged when they are written.
+   */
+  const syncFrames = createSyncFrameWriter({
+    write(bytes, written) {
+      if (!term || disposed) throw new Error("the terminal is closed");
+      term.write(bytes, written);
+    },
+    onError(err) {
+      lifecycle?.fail(`Terminal output was not painted: ${formatError(err)}`, true);
+    },
+  });
 
   function paintOutput(token: PaintToken) {
     const termNow = term;
@@ -555,7 +575,7 @@
       return;
     }
     try {
-      termNow.write(token.bytes, () => {
+      syncFrames.push(token.bytes, () => {
         acknowledgeOutput(token.sessionId, token.release());
       });
     } catch (err) {
@@ -844,6 +864,7 @@
           // conversation to offer back, and only one Claude Code saved.
           settleHosted(event, event.id);
           const why = event.error || event.signal || (event.exit_code === null ? "exited" : `exit ${event.exit_code}`);
+          syncFrames.flush();
           term?.writeln(`\r\n\u001b[2m[session closed — ${why}]\u001b[0m`);
         },
         // The close was acknowledged; its exit event may not come at all.
@@ -851,8 +872,9 @@
         reset() {
           return new Promise<void>((resolve) => {
             if (!term || disposed) { resolve(); return; }
+            syncFrames.flush();
             term.write("", () => {
-              if (!disposed) { term?.reset(); warning = null; searchKey = null; }
+              if (!disposed) { term?.reset(); syncFrames.reset(); warning = null; searchKey = null; }
               resolve();
             });
           });
@@ -862,7 +884,11 @@
         // CAN aborts any escape, OSC or DCS sequence the gap cut short, and
         // does nothing at all on the ground state. Queued behind what was
         // painted, ahead of what the resumed stream sends.
-        skipped() { if (term && !disposed) term.write("\x18"); },
+        skipped() {
+          if (!term || disposed) return;
+          syncFrames.flush();
+          syncFrames.push(CAN, () => {});
+        },
         admitted() { onAdmitted?.(); },
         refused(message) { return onRefused?.(message) ?? false; },
       },
@@ -1279,6 +1305,7 @@
       // conversation's record: the tab that shows it next finds it there.
       withdrawOffer();
       if (hostedId && !hostedLive) hostedClaude.forget(hostedId);
+      syncFrames.discard();
       for (const owed of credit.releaseAll()) acknowledgeOutput(owed.sessionId, owed.bytes);
       // Before `lifecycle` goes: nothing owed waits for a frame this view
       // will not see, and a failure is still reported against the session.
