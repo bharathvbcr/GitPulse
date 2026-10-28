@@ -40,13 +40,19 @@ fn a_neighbours_system_config_does_not_reach_a_fixture() {
         env.remove("GIT_CONFIG_NOSYSTEM")
             .set("GIT_CONFIG_SYSTEM", leaking_config(dir, "system.gitconfig"))
     });
-    assert!(!head.contains("leaked"), "git_in read a rebound system config: {head}");
+    assert!(
+        !head.contains("leaked"),
+        "git_in read a rebound system config: {head}"
+    );
 }
 
 #[test]
 fn a_neighbours_config_parameters_do_not_reach_a_fixture() {
     let head = init_head(|env, _| env.set("GIT_CONFIG_PARAMETERS", "'init.defaultBranch=leaked'"));
-    assert!(!head.contains("leaked"), "git_in read GIT_CONFIG_PARAMETERS: {head}");
+    assert!(
+        !head.contains("leaked"),
+        "git_in read GIT_CONFIG_PARAMETERS: {head}"
+    );
 }
 
 #[test]
@@ -56,7 +62,10 @@ fn a_neighbours_config_count_does_not_reach_a_fixture() {
             .set("GIT_CONFIG_KEY_0", "init.defaultBranch")
             .set("GIT_CONFIG_VALUE_0", "leaked")
     });
-    assert!(!head.contains("leaked"), "git_in read GIT_CONFIG_COUNT: {head}");
+    assert!(
+        !head.contains("leaked"),
+        "git_in read GIT_CONFIG_COUNT: {head}"
+    );
 }
 
 #[test]
@@ -182,7 +191,11 @@ fn a_neighbours_home_does_not_reach_a_fixtures_hook() {
     git_in(repo.path(), &["init", "-q"]);
     let seen = repo.path().join("seen-home");
     let hook = repo.path().join(".git/hooks/pre-commit");
-    std::fs::write(&hook, format!("#!/bin/sh\nprintf %s \"$HOME\" > '{}'\n", seen.display())).unwrap();
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\nprintf %s \"$HOME\" > '{}'\n", seen.display()),
+    )
+    .unwrap();
     std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
     {
         let _env = bind_env(&serial).set("HOME", neighbour.path());
@@ -202,8 +215,20 @@ fn a_neighbours_home_does_not_reach_a_fixtures_hook() {
 /// of that shape. Production git wrappers are excluded by name.
 #[test]
 fn no_library_test_helper_spawns_git_on_the_inherited_environment() {
-    const HELPERS: &[&str] = &["git", "git_in", "git_ok", "git_out", "git_text", "run_git", "git_output"];
-    const PRODUCTION: &[&str] = &["engine/git_cli.rs", "engine/ref_cache.rs", "test_support.rs"];
+    const HELPERS: &[&str] = &[
+        "git",
+        "git_in",
+        "git_ok",
+        "git_out",
+        "git_text",
+        "run_git",
+        "git_output",
+    ];
+    const PRODUCTION: &[&str] = &[
+        "engine/git_cli.rs",
+        "engine/ref_cache.rs",
+        "test_support.rs",
+    ];
     fn visit(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
@@ -219,16 +244,24 @@ fn no_library_test_helper_spawns_git_on_the_inherited_environment() {
     visit(&src, &mut files);
     let mut unpinned = Vec::new();
     for path in files {
-        let relative = path.strip_prefix(&src).unwrap().to_string_lossy().replace('\\', "/");
+        let relative = path
+            .strip_prefix(&src)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
         if PRODUCTION.contains(&relative.as_str()) {
             continue;
         }
         let text = std::fs::read_to_string(&path).unwrap();
         let defines = text.lines().any(|line| {
-            let line = line.trim_start().trim_start_matches("pub(crate) ").trim_start_matches("pub ");
+            let line = line
+                .trim_start()
+                .trim_start_matches("pub(crate) ")
+                .trim_start_matches("pub ");
             line.strip_prefix("fn ").is_some_and(|rest| {
                 HELPERS.iter().any(|name| {
-                    rest.strip_prefix(name).is_some_and(|after| after.starts_with('(') || after.starts_with('<'))
+                    rest.strip_prefix(name)
+                        .is_some_and(|after| after.starts_with('(') || after.starts_with('<'))
                 })
             })
         });
@@ -278,7 +311,13 @@ mod drop_order {
     fn probed(window: &Window) -> (ProbedDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
-        (ProbedDir { dir: Some(dir), window: window.clone() }, path)
+        (
+            ProbedDir {
+                dir: Some(dir),
+                window: window.clone(),
+            },
+            path,
+        )
     }
 
     /// Field order as deadbranch.rs has it.
@@ -294,12 +333,16 @@ mod drop_order {
     }
 
     #[test]
-    fn a_fixture_that_declares_its_directory_first_leaves_the_variable_naming_a_deleted_directory() {
+    fn a_fixture_that_declares_its_directory_first_leaves_the_variable_naming_a_deleted_directory()
+    {
         let window: Window = Arc::default();
         {
             let (dir, path) = probed(&window);
             let env = super::super::env::bind_env_owned(env_serial()).set(KEY, &path);
-            let _store = DirFirst { _dir: dir, _env: env };
+            let _store = DirFirst {
+                _dir: dir,
+                _env: env,
+            };
         }
         assert_eq!(
             *window.lock().unwrap(),
@@ -314,7 +357,10 @@ mod drop_order {
         {
             let (dir, path) = probed(&window);
             let env = super::super::env::bind_env_owned(env_serial()).set(KEY, &path);
-            let _store = EnvFirst { _env: env, _dir: dir };
+            let _store = EnvFirst {
+                _env: env,
+                _dir: dir,
+            };
         }
         assert_eq!(*window.lock().unwrap(), Some((false, false)));
     }
