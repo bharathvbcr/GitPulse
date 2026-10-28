@@ -239,6 +239,9 @@ pub(crate) fn plain_git_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
+mod pin_adversary_tests;
+
+#[cfg(test)]
 mod plain_path_tests {
     use super::plain_git_path;
     use std::path::{Path, PathBuf};
