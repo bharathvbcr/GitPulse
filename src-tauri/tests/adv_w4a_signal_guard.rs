@@ -152,6 +152,14 @@ fn specs() -> Vec<Spec> {
             ..spec("empty-arg", "gitpulse-empty")
         },
         Spec {
+            args: strings(&["a\u{1}b"]),
+            ..spec("control-arg", "gitpulse-ctl")
+        },
+        Spec {
+            args: strings(&["caf\u{e9}"]),
+            ..spec("utf8-arg", "gitpulse-u8")
+        },
+        Spec {
             env: vec![("SINK_NODUMP", "1")],
             ..spec("not-dumpable", "gitpulse-nodump")
         },
@@ -185,11 +193,11 @@ impl Lab {
     fn protected(&self) -> BTreeSet<i32> {
         self.decoys
             .iter()
-            // `argv0-other` runs a GitPulse executable under another path as
-            // argv[0]: the guard identifies a process by that path, so it is
-            // not one to it (a noted limit, tested on its own), and
-            // `tie-plain` is the ordinary process beside a decoy.
-            .filter(|(label, _)| !matches!(*label, "tie-plain" | "argv0-other"))
+            // `tie-plain` is the ordinary process beside a decoy. `argv0-other`
+            // runs a GitPulse executable under another path as `argv[0]`: the
+            // guard identifies it by the executable the kernel runs
+            // (`/proc/<pid>/exe`), so it is protected like the others.
+            .filter(|(label, _)| *label != "tie-plain")
             .map(|(_, pid)| *pid)
             .chain(self.ancestors.iter().copied())
             .collect()
@@ -519,11 +527,14 @@ impl Tally {
                 Ok(set) => format!("Ok({} pids)", set.len()),
                 Err(why) => format!("Err({why})"),
             };
+            // One physical line per case, whatever the command holds, so two
+            // runs can be compared line by line.
             eprintln!(
-                "case [{tag}] `{}`: real reaches {} of which decoys {}; guard {guard}, {:?}",
-                v.command,
+                "case [{tag}] `{}`: real reaches {} of which decoys {}; guard {}, {:?}",
+                v.command.escape_debug(),
                 v.real.len(),
                 describe(&v.real.intersection(&protected).copied().collect::<Vec<_>>()),
+                guard.escape_debug(),
                 v.kind
             );
         }
@@ -544,6 +555,13 @@ impl Tally {
     }
 
     fn finish(self, name: &str) {
+        let breaks = self.report(name);
+        assert!(breaks == 0, "{name}: {breaks} break(s)");
+    }
+
+    /// Prints the tally and returns how many cases broke, for a test that runs
+    /// several seeds and must show every one of them before it fails.
+    fn report(&self, name: &str) -> usize {
         eprintln!(
             "{name}: {} cases, {} reach a decoy, guard asked {} denied {}, {} BROKE",
             self.cases,
@@ -561,11 +579,7 @@ impl Tally {
         if self.breaks.len() > 30 {
             eprintln!("... and {} more", self.breaks.len() - 30);
         }
-        assert!(
-            self.breaks.is_empty(),
-            "{name}: {} break(s)",
-            self.breaks.len()
-        );
+        self.breaks.len()
     }
 }
 
@@ -741,31 +755,55 @@ fn full_command_lines_with_newlines_spaces_empties_and_over_a_mebibyte() {
     );
 }
 
-/// BROKE on 2bac9304 and on d9954240 alike (the pattern engine and the
-/// command-line reader are unchanged by W4a): the tool and the guard read a
-/// process's command line differently where it holds a newline, an empty
-/// argument or nothing at all.
+/// BROKE on 1ba087a0 (ft-1d9f44d5, class 1): the tool and the guard read a
+/// process's command line differently where it holds a newline, a control
+/// character, an empty argument or nothing at all. Verified against procps-ng
+/// 4.0.4 under the image's locale, `C` and `C.UTF-8`:
 ///
-/// * procps matches the line with control characters replaced, so `.` crosses
-///   a newline; the `regex` crate's `.` does not.
-/// * `argv_of` drops empty arguments, so `a  b` (an empty argument between)
-///   is `a b` to the guard.
-/// * a process that blanked its argument area is a single replaced character
-///   to procps and its name to the guard.
+/// * procps hands `regcomp` a command line with its control characters
+///   replaced: a newline is a space; any other control character is `?` in a
+///   UTF-8 locale and `.` in the C locale. `.` also crosses a newline, which
+///   the `regex` crate's `.` does not by default.
+/// * an empty argument between two others is a double space (`a  b`); a
+///   trailing one is nothing.
+/// * a process that blanked its argument area is a single `?`.
 #[test]
-#[ignore = "known hole, BROKE on the base too: newline, empty argument, blank command line"]
-fn known_hole_newline_empty_argument_and_blank_command_line() {
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
+fn newline_control_empty_argument_and_blank_command_line_are_read_as_the_tools_read_them() {
     container_only();
     run_named(
-        "cmdline-known-hole",
+        "cmdline-readings",
         vec![
             pk(&["-TERM", "-f", "line.second"]),
+            pk(&["-TERM", "-f", "line second"]),
             pk(&["-TERM", "-f", "first.*second"]),
             pk(&["-TERM", "-fx", "gitpulse-newl first line.second line tail"]),
+            pk(&["-TERM", "-fx", "gitpulse-newl first line second line tail"]),
             pk(&["-TERM", "-fx", "gitpulse-newl.*"]),
             pk(&["-TERM", "-fx", "gitpulse-empty  x"]),
             pk(&["-TERM", "-f", "gitpulse-empty  x"]),
+            pk(&["-TERM", "-fx", "gitpulse-empty x"]),
             pk(&["-TERM", "-fx", "."]),
+            pk(&["-TERM", "-f", "^.$"]),
+            pk(&["-TERM", "-f", "^\\?$"]),
+            pk(&["-TERM", "-f", "^[^a-z]$"]),
+            pk(&["-TERM", "-f", "a.b"]),
+            pk(&["-TERM", "-f", "a\\?b"]),
+            pk(&["-TERM", "-f", "a\\.b"]),
+            pk(&["-TERM", "-f", "a?b"]),
+            pk(&["-TERM", "-f", "a b"]),
+            pk(&["-TERM", "-f", "c.d"]),
+            pk(&["-TERM", "-f", "c\\?d"]),
+            pk(&["-TERM", "-f", "c\\.d"]),
+            pk(&["-TERM", "-f", "caf."]),
+            pk(&["-TERM", "-f", "caf.."]),
+            pk(&["-TERM", "-fx", "gitpulse-u8 caf."]),
+            pk(&["-TERM", "-fx", "gitpulse-u8 caf.."]),
+            pk(&["-TERM", "-f", "caf\u{e9}"]),
+            pk(&["-TERM", "-f", "caf[^a]"]),
+            pk(&["-TERM", "-f", "--inverse", "gitpulse-newl"]),
+            pk(&["-TERM", "-f", "--inverse", "line second"]),
+            pk(&["-TERM", "-fx", "--inverse", "gitpulse-short"]),
         ],
     );
 }
@@ -909,29 +947,270 @@ fn the_same_kill_in_every_shell_shape_is_not_silent() {
     assert!(quiet.is_empty(), "silent for: {quiet:?}");
 }
 
-/// BROKE on 2bac9304 and on d9954240 alike (the shell reader is unchanged by
-/// W4a). Each runs a real `pkill` that reaches the GitPulse-named decoy; the
-/// guard does not see the program. `ssh` and `find -exec` are named in the
-/// module's own limits; a program held in a variable or an alias, and
-/// `busybox pkill`, are not.
+/// BROKE on 1ba087a0 (ft-1d9f44d5, class 3): each is a real `pkill` that
+/// reaches the GitPulse-named decoy when a shell runs it, and the guard did
+/// not see the program. They are asked about now, where the shape is visible
+/// in the line: a busybox or toybox applet, a program (or an `eval` or `-c`
+/// script) built from a variable on a line that says `kill`, an `alias` defined
+/// on the line, `find -exec`, and `ssh` to this machine.
 #[test]
-#[ignore = "known hole, BROKE on the base too: a program the shell reader does not resolve"]
-fn known_hole_a_pkill_the_shell_reader_does_not_see() {
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
+fn a_pkill_the_shell_reader_does_not_resolve_is_asked_about() {
     container_only();
     let mut quiet = Vec::new();
     for command in [
         "busybox pkill -f gitpulse-short",
+        "busybox killall gitpulse-short",
+        "toybox pkill -f gitpulse-short",
+        "sudo busybox pkill -f gitpulse-short",
         "p=pkill; $p -f gitpulse-short",
+        "p=killall; $p gitpulse-short",
+        "p=pkill; \"$p\" -f gitpulse-short",
+        "p=pkill; sudo $p -f gitpulse-short",
+        "p=pkill; ${p} -f gitpulse-short",
+        "p=$(echo pkill); $p -f gitpulse-short",
+        "P=/usr/bin/pkill; $P -f gitpulse-short",
+        "c='pkill -f gitpulse-short'; eval $c",
+        "c='pkill -f gitpulse-short'; bash -c \"$c\"",
+        "c='pkill -f gitpulse-short'; sh -c $c",
         "alias k=pkill; k -f gitpulse-short",
+        "alias k='pkill -f'; k gitpulse-short",
         "ssh localhost pkill -f gitpulse-short",
+        "ssh user@127.0.0.1 'pkill -f gitpulse-short'",
+        "ssh -p 22 localhost \"killall gitpulse-short\"",
+        "ssh $HOST pkill -f gitpulse-short",
         "find . -name x -exec pkill -f gitpulse-short {} +",
+        "find . -name x -execdir pkill -f gitpulse-short {} \\;",
+        "find . -exec killall gitpulse-short \\;",
+        "echo x | xargs $p pkill -f gitpulse-short",
     ] {
         let said = kind(&check_command(command));
-        eprintln!("case [forms-known-hole] `{command}`: real reaches 1 of which decoys 1(short14); guard Ok(0 pids), {said:?}");
+        eprintln!("case [forms-resolve] `{command}`: real reaches 1 of which decoys 1(short14); guard Ok(0 pids), {said:?}");
         if matches!(said, Kind::Silent | Kind::Notice) {
             quiet.push(command);
         }
     }
+    assert!(quiet.is_empty(), "silent for: {quiet:?}");
+}
+
+/// More shapes the shell reader resolves, and lines that signal nothing, so a
+/// differential of two runs shows what a change to the reader made louder: the
+/// first list is the same real `pkill` in a shell form (none may be silent),
+/// the second is lines the guard has no business with (printed, not asserted,
+/// so a new question on one of them shows in the comparison).
+#[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
+fn shell_shapes_are_judged_as_before_or_louder() {
+    container_only();
+    // The GitPulse-named decoys these lines reach, started whatever ran before.
+    let _ = lab();
+    let mut quiet = Vec::new();
+    for command in [
+        "f() { pkill -f gitpulse-short; }; f",
+        "case x in x) pkill -f gitpulse-short;; esac",
+        "pkill -f gitpulse-short <<< ''",
+        "pkill -f gitpulse-short 2>/dev/null",
+        "sudo -u runner pkill -f gitpulse-short",
+        "sudo -n pkill -f gitpulse-short",
+        "doas pkill -f gitpulse-short",
+        "env -i pkill -f gitpulse-short",
+        "env -u X pkill -f gitpulse-short",
+        "env X=1 Y=2 pkill -f gitpulse-short",
+        "nice -n 5 pkill -f gitpulse-short",
+        "nohup setsid pkill -f gitpulse-short",
+        "timeout -s KILL 5 pkill -f gitpulse-short",
+        "command -p pkill -f gitpulse-short",
+        "builtin command pkill -f gitpulse-short",
+        "\\pkill -f gitpulse-short",
+        "/usr/bin/env pkill -f gitpulse-short",
+        "bash -c 'bash -c \"pkill -f gitpulse-short\"'",
+        "sh -c 'echo a; pkill -f gitpulse-short'",
+        "bash -lc 'pkill -f gitpulse-short'",
+        "zsh -c 'pkill -f gitpulse-short'",
+        "eval \"pkill -f gitpulse-short\"",
+        "eval 'pkill' '-f' 'gitpulse-short'",
+        "(cd /tmp && pkill -f gitpulse-short)",
+        "{ echo x; pkill -f gitpulse-short; } | cat",
+        "echo $(pkill -f gitpulse-short)",
+        "echo `pkill -f gitpulse-short`",
+        "x=$(echo $(pkill -f gitpulse-short))",
+        "cat <(pkill -f gitpulse-short)",
+        "for i in 1 2; do pkill -f gitpulse-short; done",
+        "while true; do pkill -f gitpulse-short; break; done",
+        "if true; then pkill -f gitpulse-short; fi",
+        "true || pkill -f gitpulse-short",
+        "false; pkill -f gitpulse-short",
+        "pgrep -f gitpulse-short | xargs kill",
+        "pgrep -f gitpulse-short | xargs -r kill -9",
+        "pgrep -f gitpulse-short | head -1 | xargs kill",
+        "kill $(pgrep -f gitpulse-short | head -1)",
+        "kill -9 `pgrep -f gitpulse-short`",
+        "kill -s TERM $(pgrep -f gitpulse-short)",
+        "kill $(pidof gitpulse-short)",
+        "killall -q gitpulse-short",
+        "killall -s TERM gitpulse-short",
+        "sudo killall gitpulse-short",
+        "xargs -n1 pkill -f <<< gitpulse-short",
+        "echo gitpulse-short | xargs pkill -f",
+        "echo gitpulse-short | xargs -I{} pkill -f {}",
+        "pkill -f gitpulse-short # ssh find alias busybox",
+    ] {
+        let said = kind(&check_command(command));
+        eprintln!("case [forms2] `{}`: real reaches 1 of which decoys 1(short14); guard Ok(0 pids), {said:?}", command.escape_debug());
+        if matches!(said, Kind::Silent | Kind::Notice) {
+            quiet.push(command);
+        }
+    }
+    assert!(quiet.is_empty(), "silent for: {quiet:?}");
+    for command in [
+        "ls -l",
+        "echo kill",
+        "echo pkill",
+        "man pkill",
+        "which killall",
+        "command -v pkill",
+        "type -a kill",
+        "grep kill notes.txt",
+        "git commit -m 'kill the bug'",
+        "$EDITOR notes.txt",
+        "exec \"$@\"",
+        "$CC -o x y.c",
+        "FOO=$HOME $TOOL --flag",
+        "bash -c \"$script\"",
+        "eval $setup",
+        "alias ll='ls -l'",
+        "alias",
+        "unalias ll",
+        "find . -name '*.rs' -exec grep -l todo {} +",
+        "find . -type f -exec ls -l {} \\;",
+        "find . -name killme.txt -print",
+        "ssh build-host ls",
+        "ssh localhost uptime",
+        "busybox ls -l",
+        "busybox --list",
+        "docker kill web",
+        "kill 99999",
+        "kill -0 99999",
+        "kill -l",
+        "kill -s TERM 99999",
+        "pgrep -f gitpulse-short",
+        "pidof gitpulse-short",
+        "pkill -0 -f gitpulse-short",
+        "pkill -l",
+        "killall -l",
+        "killall -V",
+        "sleep 1; echo done",
+        "echo 'killall' | cat",
+    ] {
+        let said = kind(&check_command(command));
+        eprintln!(
+            "case [forms-harmless] `{}`: real reaches 0 of which decoys ; guard Ok(0 pids), {said:?}",
+            command.escape_debug()
+        );
+    }
+}
+
+/// Shapes around what the reader now resolves (ft-1d9f44d5 rework 1): a
+/// variable or alias that is bound on the line, wrappers, shells with options,
+/// pids carried by loops and variables, a program that is a glob or `{}`. The
+/// first list signals the GitPulse-named decoy when a shell runs it, as written
+/// or with the program it names (a line whose alias or variable hides the tool
+/// is the point), and none may be silent; the second is printed only, so a
+/// differential of two builds shows every line that got quieter, and which.
+#[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
+fn shapes_around_bound_programs_wrappers_and_pid_carriers() {
+    container_only();
+    // The GitPulse-named decoys these lines reach, started whatever ran before.
+    let _ = lab();
+    let mut quiet = Vec::new();
+    for command in [
+        "alias pkill=echo; pkill -f gitpulse-short",
+        "alias kill=true; kill -9 $(pgrep -f gitpulse-short)",
+        "alias k=pkill; k -f gitpulse-short",
+        "alias k='pkill -f'; k gitpulse-short",
+        "alias k=pkill; alias j=k; j -f gitpulse-short",
+        "p=pkill; $p -f gitpulse-short",
+        "p=ls; p=pkill; $p -f gitpulse-short",
+        "p=pkill; (p=ls); $p -f gitpulse-short",
+        "export p=pkill; $p -f gitpulse-short",
+        "declare p=pkill; $p -f gitpulse-short",
+        "p=pkill q=$p; $q -f gitpulse-short",
+        "p=pk''ill; $p -f gitpulse-short",
+        "p=pk; ${p}ill -f gitpulse-short",
+        "$'\\x70kill' -f gitpulse-short",
+        "{pkill,-f,gitpulse-short}",
+        "/usr/bin/pk[i]ll -f gitpulse-short",
+        "ionice -c3 pkill -f gitpulse-short",
+        "taskset -c 0 pkill -f gitpulse-short",
+        "chrt -o 0 pkill -f gitpulse-short",
+        "flock /tmp/w5b-lock pkill -f gitpulse-short",
+        "flock /tmp/w5b-lock -c 'pkill -f gitpulse-short'",
+        "setpriv --no-new-privs pkill -f gitpulse-short",
+        "unshare -r pkill -f gitpulse-short",
+        "bash -o pipefail -c 'pkill -f gitpulse-short'",
+        "bash -O extglob -c 'pkill -f gitpulse-short'",
+        "bash -eu -o pipefail -c 'pkill -f gitpulse-short'",
+        "sh -c 'pkill -f gitpulse-short' name",
+        "echo 'pkill -f gitpulse-short' | sh",
+        "echo 'pkill -f gitpulse-short' | bash -s",
+        "bash <<< 'pkill -f gitpulse-short'",
+        "source <(echo 'pkill -f gitpulse-short')",
+        "for p in $(pgrep -f gitpulse-short); do kill $p; done",
+        "pgrep -f gitpulse-short | while read p; do kill $p; done",
+        "pids=$(pgrep -f gitpulse-short); kill $pids",
+        "mapfile -t p < <(pgrep -f gitpulse-short); kill \"${p[@]}\"",
+        "pgrep -f gitpulse-short > /tmp/w5b-pids; kill $(cat /tmp/w5b-pids)",
+        "pidof gitpulse-short > /tmp/w5b-pids; kill $(cat /tmp/w5b-pids)",
+        "kill $(pidof gitpulse-shor*)",
+        "kill $(pidof gitpulse-{short,x})",
+        "echo pkill | xargs -I{} {} -f gitpulse-short",
+        "find /usr/bin -maxdepth 1 -name pkill -exec {} -f gitpulse-short \\;",
+        "pkill -f gitpulse-short",
+    ] {
+        let said = kind(&check_command(command));
+        eprintln!(
+            "case [forms3] `{}`: real reaches 1 of which decoys 1(short14); guard Ok(0 pids), {said:?}",
+            command.escape_debug()
+        );
+        if matches!(said, Kind::Silent | Kind::Notice) {
+            quiet.push(command);
+        }
+    }
+    for command in [
+        "p=ls; $p -l",
+        "p=pkill; p=ls; $p -f no-such-xyz",
+        "alias ll='ls -l'; ll",
+        "alias k='kill -9'; k 99999",
+        "alias ls='ls -l'; ls",
+        "ionice -c3 ls",
+        "taskset -c 0 true",
+        "chrt -o 0 true",
+        "flock /tmp/w5b-lock true",
+        "bash -o pipefail -c 'echo hi'",
+        "bash -c -- 'echo hi'",
+        "echo 'hello' | sh",
+        "cat /etc/hostname | bash -s",
+        "for p in $(seq 1 3); do echo $p; done",
+        "seq 1 3 | while read p; do echo $p; done",
+        "pids=$(echo 1 2); echo $pids",
+        "mapfile -t p < <(echo 1); echo \"${p[@]}\"",
+        "pgrep -f gitpulse-short > /tmp/w5b-pids; cat /tmp/w5b-pids",
+        "pidof sshd",
+        "kill $(pidof nosuchprocessxyz)",
+        "find . -name '*.o' -exec rm {} +",
+        "echo x | xargs -I{} echo {}",
+        "$'echo' hi",
+        "/usr/bin/ec?o hi",
+    ] {
+        let said = kind(&check_command(command));
+        eprintln!(
+            "case [forms3-harmless] `{}`: real reaches 0 of which decoys ; guard Ok(0 pids), {said:?}",
+            command.escape_debug()
+        );
+    }
+    // After both lists are printed, so a build that fails the first still
+    // shows what it said to the second.
     assert!(quiet.is_empty(), "silent for: {quiet:?}");
 }
 
@@ -1038,18 +1317,23 @@ fn glibc_and_rust_regular_expressions_pick_the_same_decoys() {
     assert!(diffs.is_empty(), "{} regex difference(s)", diffs.len());
 }
 
-/// Patterns glibc and the `regex` crate read differently, each of which leaves
-/// a process the tool picks out of the guard's set. `\d` is documented in the
-/// module header; the others are of the same kind: a backslash and a letter
-/// is that letter to glibc (`\a`, `\n`, `\t` are `a`, `n`, `t`, not BEL,
-/// newline and tab), and procps matches names and command lines with control
-/// and invalid bytes replaced, which the guard does not do. Unchanged by W4a.
+/// BROKE on 1ba087a0 (ft-1d9f44d5, class 1): patterns glibc and the `regex`
+/// crate read differently, each of which left a process the tool picks out of
+/// the guard's set. A backslash and a letter is that letter to glibc (`\a`,
+/// `\n`, `\t` are `a`, `n`, `t`, not BEL, newline and tab) and `\d` is a
+/// literal `d`: the guard asks about those and about a backslash in a bracket
+/// expression, where it cannot say which process either reads. The others
+/// (`\.`, `\?`, `[^]a]`, `.*`, `.+`) read the same, and differed only because
+/// procps replaces control characters in what it matches: the guard now tries
+/// the readings the tool may have.
 #[test]
-#[ignore = "known hole, BROKE on the base too: the regex engines read these patterns differently"]
-fn known_hole_regular_expressions_glibc_reads_differently() {
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
+fn glibc_regular_expressions_that_read_differently_are_asked_about() {
     container_only();
     let patterns = [
         r"\d", r"\W", r"\.", r"\?", r"\a", r"\n", r"\t", r"[^]a]", r"[\d]", r"[\n]", r".*", r".+",
+        r"\w", r"\s", r"\S", r"\b", r"\<", r"\>", r"\1", r"[a\]]", r"[[.a.]]", r"[[=a=]]", r"a{",
+        r"a{x}", r"x\{1\}",
     ];
     let diffs = regex_diffs(&patterns);
     assert!(diffs.is_empty(), "{} regex difference(s)", diffs.len());
@@ -1079,6 +1363,20 @@ fn regex_diffs(patterns: &[&str]) -> Vec<String> {
                 .copied()
                 .filter(|p| stat_of(*p).is_some_and(|(_, s)| s != 'Z'))
                 .collect();
+            if std::env::var_os("ADV_VERBOSE").is_some() {
+                let guard = match &v.guard {
+                    Ok(set) => format!("Ok({} pids)", set.len()),
+                    Err(why) => format!("Err({why})"),
+                };
+                eprintln!(
+                    "case [regex] `{}`: real reaches {} of which decoys {}; guard {}, {:?}",
+                    v.command.escape_debug(),
+                    v.real.len(),
+                    describe(&real.iter().copied().collect::<Vec<_>>()),
+                    guard.escape_debug(),
+                    v.kind
+                );
+            }
             match &v.guard {
                 Ok(set) => {
                     let missed: Vec<i32> = real.difference(set).copied().collect();
@@ -1141,18 +1439,28 @@ fn kill_of_a_pidof_substitution_by_name() {
     tally.finish("pidof");
 }
 
-/// BROKE on 2bac9304 and on d9954240 alike. Linux `pidof` (sysvinit's
-/// `killall5`) matches a name with a `/` against the executable's path, so
-/// `kill $(pidof /usr/bin/claude)` reaches the process; the guard compares the
-/// whole word with the process name and `argv[0]`'s last component, finds
-/// nothing, and says nothing. (`killall /path` is the same shape and is asked
-/// about, by W4a.)
+fn base_of(dir: &str) -> &str {
+    dir.rsplit('/').next().unwrap_or(dir)
+}
+
+/// BROKE on 1ba087a0 (ft-1d9f44d5, class 2). Linux `pidof` (sysvinit's
+/// `killall5`) takes a word with a `/` in it for a path to an executable and
+/// picks the processes that run that file, by whatever name (probed: through a
+/// symbolic link, `//` and `./` and `..` in the path, a process whose `argv[0]`
+/// is another path), so `kill $(pidof /usr/bin/claude)` reaches the process.
+/// The guard compared the whole word with the process name and `argv[0]`'s last
+/// component, found nothing, and said nothing. (`killall /path` is the same
+/// shape and is asked about, by W4a.)
 #[test]
-#[ignore = "known hole, BROKE on the base too: pidof with an executable path"]
-fn known_hole_kill_of_a_pidof_substitution_by_executable_path() {
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
+fn kill_of_a_pidof_substitution_by_executable_path() {
     container_only();
     let dir = lab().dir.to_string_lossy().into_owned();
     let path = |name: &str| format!("{dir}/{name}");
+    // A name that is not the executable's, for the same file.
+    let link = path("innocuous-link");
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(path("gitpulse-short"), &link).expect("link to a decoy");
     let mut tally = Tally::default();
     for args in [
         vec![path("gitpulse-short")],
@@ -1160,6 +1468,16 @@ fn known_hole_kill_of_a_pidof_substitution_by_executable_path() {
         vec![path("gitpulse-this-is-a-long-daemon-name")],
         vec![path("gitpulse-login")],
         vec![path("gitpulse-prctl")],
+        // run as `/opt/other/otherprog`: only the file says what it is
+        vec![path("gitpulse-aliased")],
+        vec![link.clone()],
+        vec![format!("{dir}//gitpulse-short")],
+        vec![format!("{dir}/./gitpulse-short")],
+        vec![format!("{dir}/../{}/gitpulse-short", base_of(&dir))],
+        vec!["-x".to_string(), path("gitpulse-short")],
+        vec!["-s".to_string(), path("gitpulse-short")],
+        vec!["-o".to_string(), "1".to_string(), path("gitpulse-short")],
+        vec!["unrelated-name".to_string(), path("gitpulse-short")],
     ] {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let v = ask("pidof", &refs, "TERM");
@@ -1515,7 +1833,13 @@ fn fuzz_args(
     chunks.into_iter().flatten().collect()
 }
 
-fn fuzz(prog: &'static str, seed: u64, count: usize, options: &[&[&str]], signals: &[&[&str]]) {
+fn fuzz(
+    prog: &'static str,
+    seed: u64,
+    count: usize,
+    options: &[&[&str]],
+    signals: &[&[&str]],
+) -> usize {
     let mut rng = Rng(seed);
     let mut tally = Tally::default();
     let mut seen = BTreeSet::new();
@@ -1540,27 +1864,196 @@ fn fuzz(prog: &'static str, seed: u64, count: usize, options: &[&[&str]], signal
             tally.add(&format!("{prog} seed {seed}"), &v);
         }
     }
-    tally.finish(&format!("fuzz-{prog}-{seed}"));
+    tally.report(&format!("fuzz-{prog}-{seed}"))
 }
 
 #[test]
 #[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
 fn fuzz_pkill_option_grammar() {
     container_only();
+    let mut breaks = 0;
     for seed in [
         0x9E37_79B9_7F4A_7C15_u64,
         0xD1B5_4A32_D192_ED03,
         0x1234_5678_9ABC_DEF1,
     ] {
-        fuzz("pkill", seed, 900, PKILL_OPTIONS, PKILL_SIGNALS);
+        breaks += fuzz("pkill", seed, 900, PKILL_OPTIONS, PKILL_SIGNALS);
     }
+    assert!(breaks == 0, "{breaks} break(s)");
 }
 
 #[test]
 #[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
 fn fuzz_pgrep_option_grammar_under_kill_substitution() {
     container_only();
-    fuzz("pgrep", 0xA5A5_5A5A_1357_9BDF, 1200, PKILL_OPTIONS, &[]);
+    let breaks = fuzz("pgrep", 0xA5A5_5A5A_1357_9BDF, 1200, PKILL_OPTIONS, &[]);
+    assert!(breaks == 0, "{breaks} break(s)");
+}
+
+/// Pieces of a regular expression, and of what a command line holds, in the
+/// syntax glibc's `regcomp` and the `regex` crate read alike and in the syntax
+/// they do not.
+const RE_PIECES: &[&str] = &[
+    "gitpulse",
+    "gitpulse-",
+    "short",
+    "sh",
+    "ort",
+    "x",
+    "a",
+    "b",
+    "line",
+    "second",
+    "first",
+    "tail",
+    "caf",
+    "newl",
+    "empty",
+    "blank",
+    "sp",
+    "-",
+    " ",
+    "  ",
+    "\u{e9}",
+    "\t",
+    "\n",
+    "\u{1}",
+    ".",
+    ".*",
+    ".+",
+    ".?",
+    "x*",
+    "a+",
+    "b?",
+    "[a-z]",
+    "[^a-z]",
+    "[[:alpha:]]",
+    "[[:space:]]",
+    "[[:print:]]",
+    "[[:cntrl:]]",
+    "[^]a]",
+    "[a-]",
+    "[.]",
+    "[?]",
+    "(a|b)",
+    "(short|long)",
+    "(x)",
+    "^",
+    "$",
+    "|",
+    "{1}",
+    "{1,2}",
+    "{,2}",
+    "\\.",
+    "\\?",
+    "\\*",
+    "\\\\",
+    "\\(",
+    "\\[",
+    "\\d",
+    "\\D",
+    "\\w",
+    "\\s",
+    "\\b",
+    "\\<",
+    "\\>",
+    "\\1",
+    "\\n",
+    "\\t",
+    "\\a",
+    "[\\d]",
+    "[\\n]",
+    "[[.a.]]",
+    "[[=a=]]",
+    "[a&&b]",
+    "a{",
+    "?",
+    "*",
+    "+",
+    "(",
+    ")",
+    "[",
+    "]",
+    "{",
+];
+
+/// Patterns made of those pieces, against the real `pkill`: the guard's set
+/// must hold every decoy the tool reaches, or it must have said it could not
+/// tell (the question is the guard's way of declining a pattern the two
+/// engines read differently, and an `Err` from `live_match_pids` is its set).
+fn fuzz_regular_expressions(seed: u64, count: usize) -> usize {
+    let mut rng = Rng(seed);
+    let mut tally = Tally::default();
+    let mut seen = BTreeSet::new();
+    let mut set_misses = Vec::new();
+    let flag_sets: [&[&str]; 8] = [
+        &[],
+        &["-f"],
+        &["-x"],
+        &["-i"],
+        &["-fx"],
+        &["-fi"],
+        &["-xi"],
+        &["-fxi"],
+    ];
+    for _ in 0..count {
+        let pieces = 1 + rng.below(4);
+        let pattern: String = (0..pieces).map(|_| *rng.pick(RE_PIECES)).collect();
+        let flags = *rng.pick(&flag_sets);
+        let mut args: Vec<&str> = vec!["-TERM"];
+        args.extend(flags.iter().copied());
+        if pattern.starts_with('-') {
+            args.push("--");
+        }
+        args.push(&pattern);
+        let v = ask("pkill", &args, "TERM");
+        if !seen.insert(v.command.clone()) {
+            continue;
+        }
+        tally.add(&format!("re-fuzz seed {seed}"), &v);
+        let protected = lab().protected();
+        let real: BTreeSet<i32> = v
+            .real
+            .intersection(&protected)
+            .copied()
+            .filter(|p| stat_of(*p).is_some_and(|(_, s)| s != 'Z'))
+            .collect();
+        if let Ok(set) = &v.guard {
+            let missed: Vec<i32> = real.difference(set).copied().collect();
+            if !missed.is_empty() {
+                set_misses.push(format!(
+                    "SET-MISS `{}`: the real tool reaches {} that the guard's set lacks; verdict {:?}",
+                    v.command,
+                    describe(&missed),
+                    v.kind
+                ));
+            }
+        }
+    }
+    for miss in set_misses.iter().take(30) {
+        eprintln!("{}", miss.chars().take(420).collect::<String>());
+    }
+    eprintln!(
+        "re-fuzz seed {seed}: {} distinct patterns, {} set misses",
+        seen.len(),
+        set_misses.len()
+    );
+    tally.report(&format!("fuzz-regex-{seed}")) + set_misses.len()
+}
+
+#[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
+fn fuzz_regular_expression_syntax_and_command_lines() {
+    container_only();
+    let mut problems = 0;
+    for seed in [
+        0xC0FF_EE00_1234_5678_u64,
+        0x0BAD_CAFE_8765_4321,
+        0xFEED_FACE_0F0F_0F0F,
+    ] {
+        problems += fuzz_regular_expressions(seed, 700);
+    }
+    assert!(problems == 0, "{problems} break(s) or set miss(es)");
 }
 
 const KILLALL_OPTIONS: &[&[&str]] = &[
@@ -2139,16 +2632,11 @@ fn the_kill_rule_over_real_effective_and_saved_uids_against_the_real_tools() {
                 Err(why) => why.chars().take(60).collect(),
             }
         ));
-        // Known, on the base too: a hook running as root reads the arguments of
-        // root's own processes only (`argv: if f.uid == me_uid`), so a pattern
-        // that only another user's command line carries is "not tested" (a
-        // notice), not counted. Reported, not asserted.
-        if me == 0 && command.contains("marker-uid-1$") {
-            if !danger.is_empty() && matches!(verdict, Kind::Silent | Kind::Notice) {
-                eprintln!("KNOWN-HOLE as root (base too): `{command}` reaches a user's process, guard said {verdict:?}");
-            }
-            continue;
-        }
+        // BROKE on 1ba087a0 as root (ft-1d9f44d5, class 4): a hook running as
+        // root read the arguments of root's own processes only, so a pattern
+        // that only another user's command line carries (`marker-uid-1$`) was
+        // "not tested", a notice, while the real tool signalled the process.
+        // The table now reads every process's arguments for a root sender.
         if !danger.is_empty() && matches!(verdict, Kind::Silent | Kind::Notice) {
             breaks.push(format!(
                 "BROKE `{command}`: the real tool signals [{}] and the guard said {verdict:?} (counts [{}])",

@@ -344,6 +344,24 @@ pub(crate) trait ProcSource: Send {
     fn creds(&self, _pid: i32) -> Option<Creds> {
         None
     }
+    /// The executable the kernel runs a process from, for the signal table.
+    /// Unlike the exec spelling a scan carries (on Linux `argv[0]` when it is
+    /// a path), a process cannot choose it. The default is "not reported": the
+    /// OS's exec path is already the kernel's.
+    fn real_exe(&self, _pid: i32) -> Option<String> {
+        None
+    }
+    /// Whether [`ProcSource::real_exe`] is how this OS says what a process
+    /// runs, so that a process it cannot read is one whose identity is not
+    /// known. False where the exec path a scan carries is already the kernel's.
+    fn reports_real_exe(&self) -> bool {
+        false
+    }
+    /// Whether the sender can signal every process, and so whether the signal
+    /// table must read the arguments of every process, not only its own.
+    fn is_root(&self) -> bool {
+        self.me_uid() == 0
+    }
 }
 
 /// Launched and observed sessions of one kind.
@@ -1322,8 +1340,21 @@ pub struct TableRow {
     pub name: String,
     /// The path it was exec'd with, when readable.
     pub exec: Option<String>,
+    /// The executable the kernel runs it from (`/proc/<pid>/exe` on Linux),
+    /// which `argv[0]` cannot change. `None` when the OS would not say, and on
+    /// macOS, where [`TableRow::exec`] already is the kernel's.
+    pub real_exe: Option<String>,
+    /// The OS reports the executable the kernel runs (Linux) and this process's
+    /// could not be read, or is the dynamic loader a program was run through
+    /// (`ld.so PROGRAM`): what the process is cannot be told from its own
+    /// spelling (`argv[0]`), which it chooses. Never set where the OS does not
+    /// report it.
+    pub exe_unknown: bool,
     /// Every argument, `argv[0]` first. `None` when the OS refused it: another
-    /// user's process, or one that exited while the table was being read.
+    /// user's process when the sender is not root, or one that exited while
+    /// the table was being read. On Linux an empty argument between two others
+    /// is kept (the tools show it as a double space) and a process that
+    /// blanked its argument area has none.
     pub argv: Option<Vec<String>>,
     /// The agent CLI this is, by executable.
     pub agent: Option<AgentKind>,
@@ -1374,6 +1405,32 @@ pub(crate) fn parse_status_uids(status: &str) -> Option<Creds> {
     })
 }
 
+/// Whether `path` is a dynamic loader (`ld-linux-aarch64.so.1`, `ld.so`,
+/// `ld-2.31.so`): a program run as `ld.so PROGRAM` has the loader as its
+/// executable and its own path only as an argument.
+pub(crate) fn is_dynamic_loader(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.starts_with("ld-linux")
+        || name.starts_with("ld.so")
+        || (name.starts_with("ld-") && name.contains(".so"))
+}
+
+/// The arguments in a `/proc/<pid>/cmdline`: NUL-terminated, an empty one
+/// between two others kept, trailing empty ones dropped. The procps tools join
+/// them with a space, so `a`, ``, `b` is `a  b` to a `-f` pattern, and a
+/// process that zeroed its argument area (all NULs) has none.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn split_cmdline(raw: &[u8]) -> Vec<String> {
+    let mut items: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
+    while items.last().is_some_and(|s| s.is_empty()) {
+        items.pop();
+    }
+    items
+        .into_iter()
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect()
+}
+
 /// The whole table, with the user it was read as.
 #[derive(Debug, Clone)]
 pub struct Table {
@@ -1381,23 +1438,43 @@ pub struct Table {
     pub me_uid: u32,
 }
 
+/// Argument bytes the signal table reads from processes that are not the
+/// sender's, which only a root sender does. Past it the rest stay unread, and
+/// the guard asks about them: a bounded read that fails closed, not a sample
+/// reported as the whole table.
+const FOREIGN_ARGV_BUDGET: usize = 64 << 20;
+
 impl Scanner {
     /// Reads the whole table once as [`TableRow`]s. The arguments are not part
     /// of a scan's identities (only memguard's are kept), so `argv_of` supplies
-    /// them, for this user's processes only. Where the OS reports a process's
-    /// real, effective and saved uids they replace the single uid a scan
-    /// carries, which on Linux is the owner of `/proc/<pid>`.
+    /// them, for this user's processes only: the processes the sender can
+    /// signal are the ones whose command line a `-f` pattern is tested
+    /// against, which for a root sender is every process. Where the OS reports
+    /// a process's real, effective and saved uids they replace the single uid
+    /// a scan carries, which on Linux is the owner of `/proc/<pid>`.
     pub(crate) fn table(
         &mut self,
+        argv_of: impl FnMut(i32) -> Option<Vec<String>>,
+    ) -> Result<Table, String> {
+        self.table_within(argv_of, FOREIGN_ARGV_BUDGET)
+    }
+
+    /// [`Scanner::table`] with the bytes of other processes' arguments it may
+    /// read named.
+    fn table_within(
+        &mut self,
         mut argv_of: impl FnMut(i32) -> Option<Vec<String>>,
+        foreign_budget: usize,
     ) -> Result<Table, String> {
         self.source.read(&mut self.facts)?;
         let me_uid = self.source.me_uid();
+        let root = self.source.is_root();
         self.index.clear();
         for (i, f) in self.facts.iter().enumerate() {
             self.index.insert(f.pid, i);
         }
         self.assign_trees();
+        let mut foreign_bytes = 0usize;
         let rows = self
             .facts
             .iter()
@@ -1405,6 +1482,37 @@ impl Scanner {
             .map(|(i, f)| {
                 let creds = self.source.creds(f.pid);
                 let mine = f.uid == me_uid || creds.is_some_and(|c| c.any_is(me_uid));
+                let readable = mine || (root && foreign_bytes < foreign_budget);
+                let argv = if readable { argv_of(f.pid) } else { None };
+                if !mine {
+                    foreign_bytes += argv
+                        .as_ref()
+                        .map_or(0, |a| a.iter().map(|s| s.len() + 1).sum());
+                }
+                // A binary replaced since the process started reads
+                // `/path/claude (deleted)`: it is still that program.
+                let real_exe = if readable {
+                    self.source.real_exe(f.pid).map(|exe| {
+                        exe.strip_suffix(" (deleted)")
+                            .map_or_else(|| exe.clone(), str::to_string)
+                    })
+                } else {
+                    None
+                };
+                let exe_unknown = readable
+                    && self.source.reports_real_exe()
+                    && real_exe.as_deref().is_none_or(is_dynamic_loader);
+                // A process that is run from a GitPulse or agent executable
+                // under another `argv[0]` is still that: the kernel's path is
+                // the one it cannot change.
+                let agent = f.ident.kind.or_else(|| {
+                    real_exe.as_deref().and_then(|exe| {
+                        classify(
+                            exe,
+                            argv.as_ref().and_then(|a| a.get(1)).map(String::as_str),
+                        )
+                    })
+                });
                 TableRow {
                     pid: f.pid,
                     ppid: f.ppid,
@@ -1414,8 +1522,10 @@ impl Scanner {
                     start_us: f.start_us,
                     name: f.ident.name.clone(),
                     exec: f.ident.exec.clone(),
-                    argv: if mine { argv_of(f.pid) } else { None },
-                    agent: f.ident.kind,
+                    real_exe,
+                    exe_unknown,
+                    argv,
+                    agent,
                     hosted: self.tree_of.get(i).copied().flatten().is_some(),
                 }
             })
@@ -1899,6 +2009,11 @@ mod os {
         fn me_uid(&self) -> u32 {
             self.me
         }
+
+        fn is_root(&self) -> bool {
+            // SAFETY: `geteuid` has no preconditions and cannot fail.
+            self.me == 0 || unsafe { libc::geteuid() } == 0
+        }
     }
 
     fn pidpath(pid: i32) -> Option<String> {
@@ -2161,15 +2276,18 @@ mod os {
         })
     }
 
-    /// Every argument of `pid`, from `/proc/<pid>/cmdline`.
+    /// Every argument of `pid`, from `/proc/<pid>/cmdline`, the way the
+    /// procps tools show them: an empty argument between two others stays.
+    /// A process that is gone by the time it is read has no arguments left to
+    /// match and is not a read that failed.
     pub(crate) fn argv_of(pid: i32, _buf: &mut Vec<u8>) -> Option<Vec<String>> {
-        let raw = read_bounded(&format!("/proc/{pid}/cmdline"), 1 << 20).ok()?;
-        Some(
-            raw.split(|b| *b == 0)
-                .filter(|s| !s.is_empty())
-                .map(|s| String::from_utf8_lossy(s).into_owned())
-                .collect(),
-        )
+        match read_bounded(&format!("/proc/{pid}/cmdline"), 1 << 20) {
+            Ok(raw) => Some(super::split_cmdline(&raw)),
+            // Gone means the directory is gone too; a read that fails with the
+            // process still listed is one that could not be made.
+            Err(_) if !std::path::Path::new(&format!("/proc/{pid}")).exists() => Some(Vec::new()),
+            Err(_) => None,
+        }
     }
 
     pub(crate) fn probe_one(pid: i32) -> Option<ProcFacts> {
@@ -2234,6 +2352,19 @@ mod os {
         fn creds(&self, pid: i32) -> Option<super::Creds> {
             let raw = read_bounded(&format!("/proc/{pid}/status"), 8192).ok()?;
             super::parse_status_uids(&String::from_utf8_lossy(&raw))
+        }
+
+        fn real_exe(&self, pid: i32) -> Option<String> {
+            exe_path(pid)
+        }
+
+        fn reports_real_exe(&self) -> bool {
+            true
+        }
+
+        fn is_root(&self) -> bool {
+            // SAFETY: `geteuid` has no preconditions and cannot fail.
+            self.me == 0 || unsafe { libc::geteuid() } == 0
         }
     }
 
@@ -3516,10 +3647,16 @@ pub(crate) mod tests {
         }
     }
 
-    /// A source that reports credentials for some pids.
+    /// A source that reports credentials, and the executable the kernel runs,
+    /// for some pids, and that can say its sender is root.
     struct WithCreds {
         inner: Fixture,
         creds: HashMap<i32, Creds>,
+        exes: HashMap<i32, String>,
+        root: bool,
+        /// Reports the executable the kernel runs (Linux), so an unreadable
+        /// one is an unknown identity.
+        reports_exe: bool,
     }
 
     impl ProcSource for WithCreds {
@@ -3537,6 +3674,15 @@ pub(crate) mod tests {
         }
         fn creds(&self, pid: i32) -> Option<Creds> {
             self.creds.get(&pid).copied()
+        }
+        fn real_exe(&self, pid: i32) -> Option<String> {
+            self.exes.get(&pid).cloned()
+        }
+        fn reports_real_exe(&self) -> bool {
+            self.reports_exe
+        }
+        fn is_root(&self) -> bool {
+            self.root
         }
     }
 
@@ -3590,6 +3736,9 @@ pub(crate) mod tests {
                     },
                 ),
             ]),
+            exes: HashMap::new(),
+            root: false,
+            reports_exe: false,
         }));
         let table = scan
             .table(|pid| Some(vec![format!("argv-of-{pid}")]))
@@ -3620,5 +3769,206 @@ pub(crate) mod tests {
         let table = scan.table(|_| None).expect("reads");
         assert_eq!(table.rows[0].uid, ME);
         assert_eq!((table.rows[0].ruid, table.rows[0].suid), (None, None));
+    }
+
+    fn source_with(
+        rows: Vec<P>,
+        root: bool,
+        exes: HashMap<i32, String>,
+        reports_exe: bool,
+    ) -> Scanner {
+        Scanner::new(Box::new(WithCreds {
+            inner: Fixture {
+                facts: Arc::new(Mutex::new(facts_of(rows))),
+                cwds: HashMap::new(),
+                fds: HashMap::new(),
+                fail: None,
+            },
+            creds: HashMap::new(),
+            exes,
+            root,
+            reports_exe,
+        }))
+    }
+
+    fn root_source(rows: Vec<P>, root: bool, exes: HashMap<i32, String>) -> Scanner {
+        source_with(rows, root, exes, false)
+    }
+
+    /// Class 4 of ft-1d9f44d5. A sender that is root can signal every process,
+    /// so the arguments of every process are what `-f` is tested against.
+    #[test]
+    fn a_root_sender_reads_the_arguments_of_every_process_and_another_sender_only_its_own() {
+        let rows = || {
+            vec![
+                p(70, 1, "/bin/sleep"),
+                P {
+                    uid: 1001,
+                    ..p(71, 1, "/usr/bin/worker")
+                },
+            ]
+        };
+        let argv = |pid: i32| Some(vec![format!("argv-of-{pid}")]);
+        let table = root_source(rows(), true, HashMap::new())
+            .table(argv)
+            .expect("reads");
+        assert!(table.rows.iter().all(|r| r.argv.is_some()));
+        let table = root_source(rows(), false, HashMap::new())
+            .table(argv)
+            .expect("reads");
+        let of = |pid: i32| table.rows.iter().find(|r| r.pid == pid).unwrap();
+        assert!(of(70).argv.is_some(), "its own");
+        assert!(of(71).argv.is_none(), "another user's stays unread");
+    }
+
+    /// The read of other users' arguments is bounded, and what the bound leaves
+    /// out is unread, never a shorter table passed off as the whole one.
+    #[test]
+    fn a_root_sender_stops_reading_other_users_arguments_at_the_budget() {
+        let rows = (71..76)
+            .map(|pid| P {
+                uid: 1001,
+                ..p(pid, 1, "/usr/bin/worker")
+            })
+            .collect();
+        let mut scan = root_source(rows, true, HashMap::new());
+        let table = scan
+            .table_within(|_| Some(vec!["0123456789".to_string()]), 25)
+            .expect("reads");
+        let read = table.rows.iter().filter(|r| r.argv.is_some()).count();
+        // 11 bytes each: 0, 11, 22 are under 25, 33 is not.
+        assert_eq!(
+            read,
+            3,
+            "{:?}",
+            table
+                .rows
+                .iter()
+                .map(|r| r.argv.is_some())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(table.rows.len(), 5, "no row is dropped, only left unread");
+    }
+
+    /// Class 5. A process run from a GitPulse or agent executable under another
+    /// `argv[0]` is that executable's: the table carries the kernel's path.
+    #[test]
+    fn the_signal_table_carries_the_executable_the_kernel_runs_and_names_an_agent_by_it() {
+        let rows = vec![
+            // exec'd with a path that is not the agent's
+            p(80, 1, "/opt/other/otherprog"),
+            p(81, 1, "/opt/other/otherprog"),
+            p(82, 1, "/bin/sleep"),
+        ];
+        let exes = HashMap::from([
+            (80, CLAUDE.to_string()),
+            (81, "/tmp/lab/gitpulse-aliased".to_string()),
+            (82, "/bin/sleep".to_string()),
+        ]);
+        let table = root_source(rows, false, exes)
+            .table(|pid| Some(vec![format!("argv-of-{pid}")]))
+            .expect("reads");
+        let row = |pid: i32| table.rows.iter().find(|r| r.pid == pid).unwrap();
+        assert_eq!(row(80).agent, Some(AgentKind::Claude));
+        assert_eq!(row(80).exec.as_deref(), Some("/opt/other/otherprog"));
+        assert_eq!(row(80).real_exe.as_deref(), Some(CLAUDE));
+        assert_eq!(row(81).agent, None);
+        assert_eq!(
+            row(81).real_exe.as_deref(),
+            Some("/tmp/lab/gitpulse-aliased")
+        );
+        assert_eq!(row(82).agent, None);
+    }
+
+    #[test]
+    fn a_cmdline_keeps_an_empty_argument_between_two_and_drops_trailing_ones() {
+        let split = split_cmdline;
+        assert_eq!(split(b"a\0b\0"), vec!["a", "b"]);
+        assert_eq!(split(b"a\0\0b\0"), vec!["a", "", "b"]);
+        assert_eq!(split(b"\0x\0"), vec!["", "x"]);
+        assert_eq!(split(b"x\0\0"), vec!["x"]);
+        assert_eq!(split(b"x\0\0\0"), vec!["x"]);
+        assert_eq!(split(b"a b\0c\xffd\0"), vec!["a b", "c\u{fffd}d"]);
+        // A blanked argument area is no arguments, not seventeen empty ones.
+        assert!(split(&[0u8; 17]).is_empty());
+        assert!(split(b"").is_empty());
+    }
+
+    /// A binary replaced since the process started reads `... (deleted)`: it is
+    /// still that program.
+    #[test]
+    fn a_deleted_executable_is_still_the_program_it_names() {
+        let rows = vec![p(80, 1, "/opt/other/otherprog")];
+        let exes = HashMap::from([(80, format!("{CLAUDE} (deleted)"))]);
+        let table = source_with(rows, false, exes, true)
+            .table(|pid| Some(vec![format!("argv-of-{pid}")]))
+            .expect("reads");
+        let row = &table.rows[0];
+        assert_eq!(row.real_exe.as_deref(), Some(CLAUDE));
+        assert_eq!(row.agent, Some(AgentKind::Claude));
+        assert!(!row.exe_unknown);
+    }
+
+    /// Where the OS reports the executable, a process whose own cannot be read,
+    /// or is the dynamic loader, is of unknown identity; where it does not
+    /// (macOS), none is.
+    #[test]
+    fn an_unreadable_executable_or_the_loader_is_an_unknown_identity_only_where_the_os_reports_it()
+    {
+        let rows = || {
+            vec![
+                p(81, 1, "/opt/other/unreadable"),
+                p(82, 1, "/lib/ld-linux-aarch64.so.1"),
+                p(83, 1, "/bin/sleep"),
+                P {
+                    uid: 1001,
+                    ..p(84, 1, "/usr/bin/foreign")
+                },
+            ]
+        };
+        let exes = HashMap::from([
+            (82, "/lib/ld-linux-aarch64.so.1".to_string()),
+            (83, "/bin/sleep".to_string()),
+        ]);
+        let argv = |pid: i32| Some(vec![format!("argv-of-{pid}")]);
+        let table = source_with(rows(), false, exes.clone(), true)
+            .table(argv)
+            .expect("reads");
+        let unknown: Vec<i32> = table
+            .rows
+            .iter()
+            .filter(|r| r.exe_unknown)
+            .map(|r| r.pid)
+            .collect();
+        assert_eq!(
+            unknown,
+            vec![81, 82],
+            "unreadable and the loader; a process the sender cannot read at all is not one"
+        );
+        let table = source_with(rows(), false, exes, false)
+            .table(argv)
+            .expect("reads");
+        assert!(table.rows.iter().all(|r| !r.exe_unknown));
+    }
+
+    #[test]
+    fn the_dynamic_loader_is_told_by_its_name() {
+        for loader in [
+            "/lib/ld-linux-aarch64.so.1",
+            "/lib64/ld-linux-x86-64.so.2",
+            "/usr/lib/ld.so",
+            "/lib/ld-2.31.so",
+            "ld-linux.so.3",
+        ] {
+            assert!(is_dynamic_loader(loader), "{loader}");
+        }
+        for other in [
+            "/bin/sleep",
+            "/usr/bin/ldd",
+            "/usr/bin/ld",
+            "/opt/old-linux",
+        ] {
+            assert!(!is_dynamic_loader(other), "{other}");
+        }
     }
 }
