@@ -112,6 +112,7 @@
   import { Terminal as XTerm } from "@xterm/xterm";
   import { FitAddon } from "@xterm/addon-fit";
   import { SearchAddon } from "@xterm/addon-search";
+  import { Unicode11Addon } from "@xterm/addon-unicode11";
   import { WebglAddon } from "@xterm/addon-webgl";
   import "@xterm/xterm/css/xterm.css";
   import { AlertCircle, AlertTriangle, LoaderCircle, RotateCw, Search, ChevronUp, ChevronDown, X, Minus, Plus, ArrowDownToLine, ExternalLink } from "@lucide/svelte";
@@ -496,6 +497,15 @@
         allowNonHttpProtocols: false,
       },
     });
+    // xterm's built-in width table is Unicode 6, which gives every emoji one
+    // cell while the font draws two. The addon registers the Unicode 11 table
+    // and the version is switched before anything is written, so the cursor
+    // column, wrapping and the cells links and search read all agree with what
+    // a program that measured the glyph as wide has laid out. Here and not
+    // later: this is the one place a terminal is built, including a recreated
+    // one that is given an ended session's remembered tail.
+    created.loadAddon(new Unicode11Addon());
+    created.unicode.activeVersion = "11";
     fitAddon = new FitAddon();
     created.loadAddon(fitAddon);
     searchAddon = new SearchAddon({ highlightLimit: SEARCH_HIGHLIGHT_LIMIT });

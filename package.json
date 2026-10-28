@@ -69,6 +69,7 @@
     "@tauri-apps/plugin-opener": "^2.7.2",
     "@xterm/addon-fit": "0.12.0-beta.313",
     "@xterm/addon-search": "0.17.0-beta.312",
+    "@xterm/addon-unicode11": "0.10.0-beta.312",
     "@xterm/addon-webgl": "0.20.0-beta.311",
     "@xterm/xterm": "6.1.0-beta.317"
   },

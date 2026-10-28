@@ -389,6 +389,53 @@
           await input(""); check("empty query clears result count", () => status() === "");
           await press(label("Find in terminal output"), "Escape"); check("Escape restores terminal focus", () => document.activeElement?.getAttribute("aria-label") === "Terminal input");
 
+          // ---- Wide characters, through the real session.
+          // xterm's own width table is Unicode 6, which gives every emoji one
+          // cell; the Unicode 11 addon (loaded where the terminal is built)
+          // gives the pictographs two. The cursor report is the observable: the
+          // column the cursor reports after printing a glyph is one past the
+          // cells the glyph took, so a wrong width shows up as a wrong column,
+          // in the emulator the user actually types into. Run on the alternate
+          // screen so the main screen the rest of this page reads is untouched.
+          {
+            const cases = [
+              // [name, text, cells the text takes]
+              ["an ASCII letter", "a", 1],
+              ["a rocket", "🚀", 2],
+              ["a rocket between two letters", "a🚀b", 4],
+              ["a run of three emoji", "🚀🔥✅", 6],
+              ["CJK (two cells in Unicode 6 and 11 alike)", "世界", 4],
+              ["a CJK character outside the BMP", "𠀀", 2],
+              ["a heart with the emoji selector (U+2764 U+FE0F)", "\u2764\uFE0F", 1],
+            ];
+            const mark = written.length;
+            const emojiLine = "🚀 https://emoji.example/w and emojineedle";
+            void output("fixture-1", "\u001b[?1049h\u001b[2J" + cases.map(([, text], i) => `\u001b[${i + 1};1H${text}\u001b[6n`).join("")
+              // The cursor is parked on an empty row afterwards: opening Find
+              // resizes the grid, and the fixture's shell repaints its prompt
+              // on the cursor row after every resize, as a real one does.
+              + `\u001b[${cases.length + 2};1H${emojiLine}\u001b[${cases.length + 4};1H`);
+            const cprDeadline = performance.now() + 4000;
+            const replies = () => [...written.slice(mark).join("").matchAll(/\u001b\[(\d+);(\d+)R/g)].map((m) => ({ row: Number(m[1]), col: Number(m[2]) }));
+            while (replies().length < cases.length && performance.now() < cprDeadline) await wait(20);
+            const seen = replies();
+            for (const [i, [name, , cells]] of cases.entries()) {
+              check(`${name} advances the cursor ${cells} cell${cells === 1 ? "" : "s"} (column ${seen[i]?.col ?? "no reply"}, expected ${1 + cells})`,
+                () => seen[i]?.row === i + 1 && seen[i]?.col === 1 + cells);
+            }
+            // Wide glyphs must not skew what is read back from the grid: a link
+            // after an emoji keeps its own cells, and a search finds text that
+            // follows one. Both read the last row written above.
+            await hover("emoji.example", 2);
+            check("a link after an emoji still names its own target", () => footer().includes("Open https://emoji.example/w in your browser"));
+            button("Find in terminal").click(); await wait();
+            await input("emojineedle"); check(`text after an emoji is found (status ${JSON.stringify(status())})`, () => status() === "1 of 1");
+            await press(label("Find in terminal output"), "Escape");
+            void output("fixture-1", "\u001b[?1049l");
+            await wait();
+            check("leaving the alternate screen restores the main one", () => visible(".xterm-rows > div").some((row) => row.textContent.includes("needle end")));
+          }
+
           // ---- Tabs, layout and session management.
           await press(button("New Shell session"), "T", { ctrlKey: true, shiftKey: true });
           check("new-tab chord works from toolbar", () => visible('[role="tab"]').length === 2);

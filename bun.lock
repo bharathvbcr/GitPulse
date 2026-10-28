@@ -11,6 +11,7 @@
         "@tauri-apps/plugin-opener": "^2.7.2",
         "@xterm/addon-fit": "0.12.0-beta.313",
         "@xterm/addon-search": "0.17.0-beta.312",
+        "@xterm/addon-unicode11": "0.10.0-beta.312",
         "@xterm/addon-webgl": "0.20.0-beta.311",
         "@xterm/xterm": "6.1.0-beta.317",
       },
@@ -218,6 +219,8 @@
     "@xterm/addon-fit": ["@xterm/addon-fit@0.12.0-beta.313", "", { "peerDependencies": { "@xterm/xterm": "^6.1.0-beta.317" } }, "sha512-ig5NZbVEcLRBn7CbF2DRQhBZZcywgcFA8yhPEBJqriJsdyoxS3EmJYX7/+wZHaLmbY26+iOj0NXi+fOMbfEW0w=="],
 
     "@xterm/addon-search": ["@xterm/addon-search@0.17.0-beta.312", "", { "peerDependencies": { "@xterm/xterm": "^6.1.0-beta.317" } }, "sha512-jBSShNvQaWqvM84EAuhN84MI9Cxpkh5ZsrXZ2l2nr1INF5T/5xf8tDkxUU2tPYDzu4k0TxzTbeaB8vWeKwS1JA=="],
+
+    "@xterm/addon-unicode11": ["@xterm/addon-unicode11@0.10.0-beta.312", "", { "peerDependencies": { "@xterm/xterm": "^6.1.0-beta.317" } }, "sha512-yAKfzyhsEFvvMysMAEPXbFzpImrUQyQ+hfoPF8sD949PmDYsn0A9rV5vBXhScORXinCm+jmICUwoDuHHqXpc3w=="],
 
     "@xterm/addon-webgl": ["@xterm/addon-webgl@0.20.0-beta.311", "", { "peerDependencies": { "@xterm/xterm": "^6.1.0-beta.317" } }, "sha512-+Hbf79P6Km/nFswekOO+9D8c07OYVWHeZRnXgevu+bhIqsSCr+6BSSiLRRlZW95etnYbm3Vsae1FtMZdIHfH2Q=="],
 
