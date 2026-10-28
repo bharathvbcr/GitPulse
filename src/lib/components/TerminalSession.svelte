@@ -1580,7 +1580,6 @@
              drawing the same rows), but it is slower; say why. -->
         <span
           data-terminal-gpu-note
-          role="status"
           class="ml-auto shrink-0 text-[10px] text-amber-300 whitespace-nowrap"
           title={renderer === "reset"
             ? "The graphics context was lost, for example by a GPU reset or waking from sleep. This terminal draws without the GPU and will try again."

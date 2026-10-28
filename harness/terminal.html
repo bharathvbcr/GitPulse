@@ -413,16 +413,60 @@
           check("returning restores both original tabs", () => visible('[role="tab"]').length === 2 && report.killed === 0);
           check("returning restores this repository's own dock", () => visible("[data-terminal-dock]").length === 1);
 
-          // ---- GPU renderer: attended sessions only, DOM after a loss.
+          // ---- GPU renderer: a hold for the hidden, DOM after a loss that is
+          // recovered within a budget, DOM for good after the budget.
           {
+            const { gpuPolicy } = await import("../src/lib/terminal/gpuRenderer.ts");
+            const policyBefore = { ...gpuPolicy };
             const sessionsAll = () => [...document.querySelectorAll("[data-terminal-session]")];
             const shown = () => sessionsAll().filter((el) => el.getClientRects().length);
             const hidden = () => sessionsAll().filter((el) => !el.getClientRects().length);
             const domText = (el) => [...el.querySelectorAll(".xterm-rows > div")].map((row) => row.textContent).join("").trim();
-            check("this browser can create a WebGL2 context (the GPU checks below need one)",
-              () => !!document.createElement("canvas").getContext("webgl2"));
+            // The addon also adds a 2D link layer (`xterm-link-layer`); the
+            // WebGL canvas is the one without a layer class.
+            const glCanvas = (el) => [...el.querySelectorAll("canvas")].find((node) => ![...node.classList].some((name) => name.endsWith("-layer")));
+            const frames = (count = 2) => new Promise((resolve) => {
+              let left = count;
+              const tick = () => (--left <= 0 ? resolve() : requestAnimationFrame(tick));
+              requestAnimationFrame(tick);
+            });
+            const gpuNote = () => visible("[data-terminal-gpu-note]")[0]?.textContent ?? "";
+            // A context created before any session's is the oldest one on the
+            // page, which is the one a browser force-loses first when the page
+            // passes its cap (16 in Chromium and in WebKit). It is never drawn
+            // to and never released by anything here.
+            const sentinel = document.createElement("canvas").getContext("webgl2");
+            check("this browser can create a WebGL2 context (the GPU checks below need one)", () => !!sentinel);
+            // Whether a draw reached the canvas in the frames after a show: a
+            // renderer set while xterm's render service was paused draws a
+            // blank first frame (xterm.js #6239). `readPixels` has to run in
+            // the task that drew, so the draw calls are wrapped while armed.
+            const probe = { armed: false, draws: 0, painted: false };
+            const drawElements = WebGL2RenderingContext.prototype.drawElementsInstanced;
+            WebGL2RenderingContext.prototype.drawElementsInstanced = function (...args) {
+              const result = drawElements.apply(this, args);
+              if (probe.armed) {
+                probe.draws += 1;
+                const { drawingBufferWidth: w, drawingBufferHeight: h } = this;
+                const pixels = new Uint8Array(w * h * 4);
+                this.readPixels(0, 0, w, h, this.RGBA, this.UNSIGNED_BYTE, pixels);
+                for (let at = 3; at < pixels.length && !probe.painted; at += 4) if (pixels[at] !== 0) probe.painted = true;
+              }
+              return result;
+            };
+            const showAndProbe = async () => {
+              probe.armed = true; probe.draws = 0; probe.painted = false;
+              button("Show terminal").click();
+              await frames(4);
+              probe.armed = false;
+            };
+
             check("with the setting off, no session holds a WebGL context",
               () => sessionsAll().every((el) => el.dataset.renderer === "dom" && !el.querySelector("canvas")));
+            // Long enough that nothing below expires by accident; narrowed where a check waits it out.
+            gpuPolicy.hideGraceMs = 3000;
+            gpuPolicy.recoverDelayMs = 300;
+            gpuPolicy.lossBudget = 2;
             interfaceStore.setTerminalGpu(true); await wait();
             check("the session on screen draws through WebGL", () => {
               const [el] = shown();
@@ -434,26 +478,100 @@
               if (rows.length < 2) throw new Error(`expected the other tab and the other repository's session hidden, saw ${rows.length}`);
               return rows.every((row) => row === "dom/0");
             });
-            button("Hide the terminal dock").click(); await wait();
-            check("hiding the dock releases the on-screen session's context too",
-              () => sessionsAll().every((el) => el.dataset.renderer === "dom" && !el.querySelector("canvas")));
-            button("Show terminal").click(); await wait();
             const [target] = shown();
-            check("showing the dock again attaches a fresh context", () => target?.dataset.renderer === "webgl");
-            // The addon also adds a 2D link layer (`xterm-link-layer`); the
-            // WebGL canvas is the one without a layer class.
-            const canvas = [...target.querySelectorAll("canvas")].find((el) => ![...el.classList].some((name) => name.endsWith("-layer")));
-            const gl = canvas?.getContext("webgl2");
-            check("the on-screen session's canvas holds a live WebGL2 context", () => !!gl && !gl.isContextLost());
-            // Resolves on the canvas's own target phase, after the session's
-            // capture listener has already reacted to the loss.
-            const lostAt = new Promise((resolve) => canvas.addEventListener("webglcontextlost", () => resolve(performance.now()), { once: true }));
-            gl.getExtension("WEBGL_lose_context").loseContext();
-            const lost = await lostAt;
-            await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-            const settled = performance.now() - lost;
+            const firstCanvas = glCanvas(target);
+            const firstGl = firstCanvas?.getContext("webgl2");
+            check("the on-screen session's canvas holds a live WebGL2 context", () => !!firstGl && !firstGl.isContextLost());
+
+            // -- A tab flick inside the hold keeps the warm context.
+            button("Hide the terminal dock").click(); await wait(150);
+            check("hiding the dock keeps the session's context through the hold: same canvas, live, still webgl",
+              () => target.dataset.renderer === "webgl" && glCanvas(target) === firstCanvas && !firstGl.isContextLost());
+            await showAndProbe();
+            check("a tab flick inside the hold reuses the same canvas element and the same live context",
+              () => shown()[0] === target && target.dataset.renderer === "webgl" && glCanvas(target) === firstCanvas && !firstGl.isContextLost());
+            check("the first frames after showing a held session reach the canvas (no blank frame)",
+              () => probe.painted || (() => { throw new Error(`${probe.draws} draw calls, none painted`); })());
+            await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait(80);
+            const other = shown()[0];
+            check("switching tabs gives the other session its own context while this one is held",
+              () => other !== target && other.dataset.renderer === "webgl" && target.dataset.renderer === "webgl"
+                && glCanvas(other) !== glCanvas(target));
+            await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft"); await wait(80);
+            check("switching back inside the hold reuses this session's canvas, and the other is held, within the cap",
+              () => shown()[0] === target && glCanvas(target) === firstCanvas && !firstGl.isContextLost()
+                && sessionsAll().filter((el) => el.querySelector("canvas")).length <= 2);
+
+            // -- The hold ends: the context is freed on purpose, not left for the collector.
+            gpuPolicy.hideGraceMs = 400;
+            await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait(80);
+            await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft"); await wait(900);
+            check("a session that stays hidden past the hold gives its context up",
+              () => other.dataset.renderer === "dom" && !other.querySelector("canvas"));
+            button("Hide the terminal dock").click(); await wait(900);
+            check("hiding the dock past the hold releases the on-screen session's context too",
+              () => sessionsAll().every((el) => el.dataset.renderer === "dom" && !el.querySelector("canvas")));
+            check("the released context was lost on purpose (addon-webgl's dispose alone never does)",
+              () => firstGl.isContextLost());
+            await showAndProbe();
+            check("showing the dock again attaches a fresh context", () => target.dataset.renderer === "webgl" && glCanvas(target) !== firstCanvas);
+            check("the first frames after a fresh attach reach the canvas (no blank frame)",
+              () => probe.painted || (() => { throw new Error(`${probe.draws} draw calls, none painted`); })());
+
+            // -- Forty hide/show cycles inside the hold create nothing: the same canvas, the sentinel untouched.
+            gpuPolicy.hideGraceMs = 3000;
+            const beforeFlicks = glCanvas(target);
+            for (let cycle = 0; cycle < 40; cycle += 1) {
+              button("Hide the terminal dock").click(); await wait(40);
+              button("Show terminal").click(); await wait(40);
+            }
+            await wait(100);
+            check("after 40 hide/show cycles inside the hold the session is on the same canvas, live, on WebGL",
+              () => shown()[0] === target && target.dataset.renderer === "webgl" && glCanvas(target) === beforeFlicks && !beforeFlicks.getContext("webgl2").isContextLost());
+            check("the page's oldest context survived those cycles", () => !sentinel.isContextLost());
+
+            // -- Forty cycles with no hold create and free a context each: the on-screen session stays on WebGL.
+            gpuPolicy.hideGraceMs = 0;
+            const everAttached = [];
+            for (let cycle = 0; cycle < 40; cycle += 1) {
+              button("Hide the terminal dock").click(); await wait(40);
+              button("Show terminal").click(); await wait(40);
+              const attached = glCanvas(target)?.getContext("webgl2");
+              if (attached && !everAttached.includes(attached)) everAttached.push(attached);
+            }
+            await wait(100);
+            const cycled = glCanvas(target);
+            const cycledGl = cycled?.getContext("webgl2");
+            check("after 40 hide/show cycles with no hold the on-screen session is still on WebGL, not lost",
+              () => shown()[0] === target && target.dataset.renderer === "webgl" && !!cycledGl && !cycledGl.isContextLost());
+            check("every earlier context was lost on purpose, none left for the collector",
+              () => everAttached.length > 10 && everAttached.every((gl) => gl === cycledGl || gl.isContextLost()));
+            // Chromium stops counting a lost context at once, so the page's oldest
+            // context is a sound witness there. WebKit counts a lost wrapper until
+            // it is collected and picks its victim by last draw, so the same
+            // witness would measure its collector, not this code; the check above
+            // is what holds in both.
+            if (!/AppleWebKit/.test(navigator.userAgent) || /Chrome\//.test(navigator.userAgent)) {
+              check("the page's oldest context survived (Chromium counts only live contexts)", () => !sentinel.isContextLost());
+            }
+            check("only the session on screen holds a canvas", () => sessionsAll().filter((el) => el.querySelector("canvas")).length === 1);
+            gpuPolicy.hideGraceMs = 400;
+
+            // -- A lost context: the DOM at once, then WebGL again, within the budget.
+            const loseNow = async () => {
+              const canvas = glCanvas(target);
+              const gl = canvas.getContext("webgl2");
+              // Resolves on the canvas's own target phase, after the session's
+              // capture listener has already reacted to the loss.
+              const lostAt = new Promise((resolve) => canvas.addEventListener("webglcontextlost", () => resolve(performance.now()), { once: true }));
+              gl.getExtension("WEBGL_lose_context").loseContext();
+              const lost = await lostAt;
+              await frames(2);
+              return performance.now() - lost;
+            };
+            const settled = await loseNow();
             check("a lost context is disposed at once: no canvas left in the pane", () => !target.querySelector("canvas"));
-            check("the session is marked lost", () => target.dataset.renderer === "lost");
+            check("the session is marked reset, not final", () => target.dataset.renderer === "reset");
             check("the DOM renderer draws the same rows on the next frame, so the pane never blanks", () => {
               const text = domText(target);
               if (!text) throw new Error("no DOM rows two frames after the loss");
@@ -461,22 +579,39 @@
               if (settled > 1000) throw new Error(`DOM rows took ${Math.round(settled)} ms`);
               return true;
             });
-            button("Hide the terminal dock").click(); await wait();
-            button("Show terminal").click(); await wait();
-            check("a lost session is never re-attached", () => target.dataset.renderer === "lost" && !target.querySelector("canvas") && !!domText(target));
+            check("the session says it draws without the GPU after a graphics reset",
+              () => /Drawing without GPU after a graphics reset/.test(gpuNote()));
+            await wait(gpuPolicy.recoverDelayMs + 400);
+            check("it attaches a new context by itself after the recovery delay, and the note goes",
+              () => target.dataset.renderer === "webgl" && !!glCanvas(target) && !glCanvas(target).getContext("webgl2").isContextLost() && gpuNote() === "");
+            await loseNow();
+            check("the second loss is recoverable too (inside the budget)", () => target.dataset.renderer === "reset");
+            button("Hide the terminal dock").click(); await wait(gpuPolicy.recoverDelayMs + 300);
+            check("a hidden session is not re-attached while it is hidden", () => target.dataset.renderer === "reset" && !target.querySelector("canvas"));
+            await showAndProbe(); await wait(100);
+            check("showing it again re-attaches", () => target.dataset.renderer === "webgl" && !!glCanvas(target));
+            await loseNow();
+            check("a loss past the budget is final, and the DOM draws the rows", () => target.dataset.renderer === "lost" && !target.querySelector("canvas") && !!domText(target));
+            check("the final note says so, without promising a retry", () => /^Drawing without GPU$/.test(gpuNote()));
+            button("Hide the terminal dock").click(); await wait(gpuPolicy.recoverDelayMs + 300);
+            button("Show terminal").click(); await wait(gpuPolicy.recoverDelayMs + 300);
+            check("a session past its budget is never re-attached", () => target.dataset.renderer === "lost" && !target.querySelector("canvas") && !!domText(target));
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait();
             check("another session still gets WebGL when it comes on screen",
               () => shown().length === 1 && shown()[0] !== target && shown()[0].dataset.renderer === "webgl");
-            await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft"); await wait();
-            check("switching back leaves the other session without a context and this one on the DOM",
+            await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft"); await wait(gpuPolicy.hideGraceMs + 500);
+            check("switching back leaves the other session without a context once its hold is over, and this one on the DOM",
               () => shown()[0] === target && target.dataset.renderer === "lost" && hidden().every((el) => !el.querySelector("canvas")));
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait();
             interfaceStore.setTerminalGpu(false); await wait();
-            check("turning the setting off returns a live WebGL session to the DOM renderer",
+            check("turning the setting off returns a live WebGL session to the DOM renderer at once",
               () => shown()[0] !== target && shown()[0].dataset.renderer === "dom" && !!domText(shown()[0])
                 && sessionsAll().every((el) => !el.querySelector("canvas")));
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft"); await wait();
+            WebGL2RenderingContext.prototype.drawElementsInstanced = drawElements;
+            Object.assign(gpuPolicy, policyBefore);
           }
+
 
           // ---- Frame probe (OSC 7700), as scripts/tui-redraw-bench.mjs drives it.
           {
