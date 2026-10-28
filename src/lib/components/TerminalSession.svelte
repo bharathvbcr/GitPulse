@@ -1482,7 +1482,8 @@
    * display's raster.
    */
   $effect(() => {
-    const stop = watchDevicePixelRatio(() => fits.settle(() => term?.clearTextureAtlas()));
+    // A session with no box has nothing to redraw; the atlas call full-refreshes.
+    const stop = watchDevicePixelRatio(() => fits.settle(() => { if (hasRenderedBox(container)) term?.clearTextureAtlas(); }));
     return () => {
       stop();
       fits.cancel();

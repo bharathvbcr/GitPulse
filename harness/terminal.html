@@ -1133,9 +1133,9 @@
             if (i % 7 === 0) await wait(10); else await frame();
           }
           await wait(500);
-          // A switch may re-measure a terminal by a column (cell widths are
-          // measured per terminal); what it must never do is hand one a
-          // degenerate grid. Hidden panes measured as 11 x 6 before.
+          // Observed: a first show can re-measure a terminal by one column
+          // (55 to 54), cause not isolated. What a switch must never do is
+          // hand one a degenerate grid; hidden panes measured as 11 x 6.
           const told = since(mark);
           check(`100 seeded tab switches hand no PTY a degenerate grid (${told.length} resizes: ${JSON.stringify(told.slice(0, 6))})`, () => told.length <= 3 && told.every((row) => row.cols >= 40 && row.rows >= 10));
           check("after 100 switches every tab still holds the same grid", () => sameGrid());

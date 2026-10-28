@@ -57,7 +57,7 @@ describe("TerminalSession fit: a terminal nobody can see is never resized", () =
 
   it("measures again when the display's pixel ratio changes, then clears the glyph atlas", () => {
     expect(source).toContain("watchDevicePixelRatio(");
-    expect(source).toMatch(/fits\.settle\(\(\) => term\?\.clearTextureAtlas\(\)\)/);
+    expect(source).toMatch(/fits\.settle\(\(\) => \{ if \(hasRenderedBox\(container\)\) term\?\.clearTextureAtlas\(\); \}\)/);
   });
 });
 
