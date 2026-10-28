@@ -395,7 +395,16 @@ export function createGpuRenderer(deps: {
     // Nothing held: the late event of a context released on purpose.
     if (!addon) return;
     if (source && addon.canvas && source !== addon.canvas) return;
+    // A context held only for warmth is the one both engines evict first (it
+    // drew least recently). Losing it ends the hold early; it is not a fault
+    // on a session anyone is looking at, so it neither counts against the
+    // budget nor schedules a recovery: the next show attaches afresh.
+    const wasHeld = holding;
     release();
+    if (wasHeld) {
+      set("dom");
+      return;
+    }
     const now = Date.now();
     losses = losses.filter((at) => now - at < policy().lossWindowMs);
     losses.push(now);
