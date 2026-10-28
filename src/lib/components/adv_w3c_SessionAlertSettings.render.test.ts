@@ -10,8 +10,8 @@
  * component), points the store at a backend view through the same mocks the
  * store's own test uses, and reads the rendered HTML.
  */
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -23,8 +23,13 @@ vi.mock("../platform", async (importOriginal) => ({
 
 const here = dirname(fileURLToPath(import.meta.url));
 const original = readFileSync(join(here, "SessionAlertSettings.svelte"), "utf8");
-const generatedName = "AdvW3cSessionAlertSettingsLoaded.generated.svelte";
-const generatedPath = join(here, generatedName);
+// Outside src/, in the ignored tmp/ at the repository root: see "the generated
+// copy" below. The copy's relative imports are made absolute, so it loads the
+// very modules (and mocks) the original would.
+const scratch = join(here, "..", "..", "..", "tmp");
+mkdirSync(scratch, { recursive: true });
+const generatedDir = mkdtempSync(join(scratch, "vitest-generated-"));
+const generatedPath = join(generatedDir, "AdvW3cSessionAlertSettingsLoaded.svelte");
 
 const DRAFT_LINE = "let draft = $state<SessionAlertSettings | null>(null);";
 
@@ -74,7 +79,7 @@ async function panel(view: ReturnType<typeof viewWith>): Promise<string> {
   vi.mocked(invoke).mockResolvedValue(view);
   const store = await import("../stores/sessionAlertsStore");
   await store.loadSessionAlerts();
-  const component = (await import(/* @vite-ignore */ `./${generatedName}`)).default;
+  const component = (await import(/* @vite-ignore */ generatedPath)).default;
   const { render } = await import("svelte/server");
   return render(component).body;
 }
@@ -83,13 +88,24 @@ beforeAll(() => {
   expect(original).toContain(DRAFT_LINE);
   const loaded = original
     .replace(DRAFT_LINE, "let draft = $state<SessionAlertSettings | null>({ ...DEFAULT_SESSION_ALERT_SETTINGS });")
-    .replace("  hookReplyMisses,\n", "  hookReplyMisses,\n    DEFAULT_SESSION_ALERT_SETTINGS,\n");
+    .replace("  hookReplyMisses,\n", "  hookReplyMisses,\n    DEFAULT_SESSION_ALERT_SETTINGS,\n")
+    .replace(/from "(\.\.?\/[^"]+)"/g, (_match, specifier: string) => `from "${join(here, specifier)}"`);
   expect(loaded).toContain("DEFAULT_SESSION_ALERT_SETTINGS,");
+  expect(loaded).not.toMatch(/from "\.\.?\//);
   writeFileSync(generatedPath, loaded);
 });
 
 afterAll(() => {
-  rmSync(generatedPath, { force: true });
+  rmSync(generatedDir, { recursive: true, force: true });
+});
+
+describe("the generated copy", () => {
+  it("is written outside src/, where the source-scanning contract tests cannot list it mid-run", () => {
+    // Those tests list every .svelte file under src/ and then read each one;
+    // a copy that exists between the two steps fails them with ENOENT.
+    const src = join(here, "..", "..");
+    expect(relative(src, generatedPath).startsWith("..")).toBe(true);
+  });
 });
 
 describe("the real panel template with the hook record's fields set", () => {
