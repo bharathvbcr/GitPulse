@@ -1249,9 +1249,15 @@ mod tests {
     /// `GITPULSE_BACKUPS_DIR` is process-wide; the binding holds the process's
     /// environment lock and restores the variable when the store drops, including
     /// on a failing test.
+    ///
+    /// Field order is drop order: the binding goes first, so the variable is
+    /// back to what it was before the directory it names is deleted. The other
+    /// way round, a reader that does not take the environment lock (the backups
+    /// root is read without it) sees a path that no longer exists
+    /// (`test_support::pin_adversary_tests::drop_order` shows both orders).
     struct BackupStore {
-        dir: tempfile::TempDir,
         _env: crate::test_support::env::EnvBinding<'static>,
+        dir: tempfile::TempDir,
     }
 
     impl BackupStore {
@@ -1260,7 +1266,7 @@ mod tests {
             let env =
                 crate::test_support::env::bind_env_owned(crate::test_support::env::env_serial())
                     .set("GITPULSE_BACKUPS_DIR", dir.path());
-            Self { dir, _env: env }
+            Self { _env: env, dir }
         }
     }
 

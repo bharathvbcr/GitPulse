@@ -22,11 +22,7 @@ describe("the bell setting reaches the pane and the board without a reload", () 
     expect(asking).toContain("bellAsksForReader");
   });
 
-  // KNOWN GAP: TaskBoard.svelte held by another session on 2026-10-26;
-  // agentsByTask does not depend on the hook-less bell setting. `it.fails`
-  // turns into an unexpected pass, which forces this marker off, once a lane
-  // that may edit the board reads `bellAsksForReader` in that derivation.
-  it.fails("the board's per-task agent summaries depend on the setting, so a toggle recomputes them", () => {
+  it("the board's per-task agent summaries depend on the setting, so a toggle recomputes them", () => {
     const start = boardSource.indexOf("const agentsByTask = $derived.by");
     expect(start).toBeGreaterThan(-1);
     const derivation = boardSource.slice(start, boardSource.indexOf("\n  });", start));

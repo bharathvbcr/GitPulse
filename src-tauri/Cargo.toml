@@ -374,6 +374,16 @@ name = "commit_graph_history"
 harness = false
 test = false
 
+[[bench]]
+name = "alerts_worker_throughput"
+harness = false
+test = false
+
+[[bench]]
+name = "notify_stdin_bench"
+harness = false
+test = false
+
 [profile.release]
 # Thin LTO: cross-crate optimization at a fraction of fat-LTO link time.
 lto = "thin"

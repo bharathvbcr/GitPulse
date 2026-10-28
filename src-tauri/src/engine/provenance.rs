@@ -2535,7 +2535,9 @@ mod batch_tests {
         }
 
         fn git(&self, args: &[&str]) {
-            let out = Command::new("git")
+            let mut command = Command::new("git");
+            crate::test_support::pin_git(&mut command);
+            let out = command
                 .args(args)
                 .current_dir(self.path())
                 .output_locked()
@@ -2544,7 +2546,9 @@ mod batch_tests {
         }
 
         fn rev(&self, spec: &str) -> String {
-            let out = Command::new("git")
+            let mut command = Command::new("git");
+            crate::test_support::pin_git(&mut command);
+            let out = command
                 .args(["rev-parse", spec])
                 .current_dir(self.path())
                 .output_locked()

@@ -396,6 +396,9 @@ pub struct Report {
     pub opts: Opts,
     host_start: Value,
     rows: Vec<Row>,
+    /// Rows measured and printed but never written to the JSON report; see
+    /// [`Report::extend_unrecorded`].
+    unrecorded: Vec<Row>,
     notes: Vec<String>,
     started: Instant,
 }
@@ -426,6 +429,7 @@ impl Report {
             opts,
             host_start,
             rows: Vec::new(),
+            unrecorded: Vec::new(),
             notes: Vec::new(),
             started: Instant::now(),
         }
@@ -433,6 +437,15 @@ impl Report {
 
     pub fn extend(&mut self, rows: Vec<Row>) {
         self.rows.extend(rows);
+    }
+
+    /// Rows that are printed beside the others but never written to the JSON,
+    /// so they can never be in a baseline written from that report: a row that
+    /// exists only in some runs (a comparison against a binary built before a
+    /// change) would otherwise make every later run fail with "baselined row is
+    /// missing from this run".
+    pub fn extend_unrecorded(&mut self, rows: Vec<Row>) {
+        self.unrecorded.extend(rows);
     }
 
     pub fn push(&mut self, row: Row) {
@@ -451,6 +464,7 @@ impl Report {
         let width = self
             .rows
             .iter()
+            .chain(&self.unrecorded)
             .map(|r| r.name.len())
             .max()
             .unwrap_or(0)
@@ -460,7 +474,7 @@ impl Report {
             "row", "n", "min", "p50", "p95", "max"
         );
         println!("{}", "-".repeat(width + 60));
-        for row in &self.rows {
+        for row in self.rows.iter().chain(&self.unrecorded) {
             let counters: Vec<String> = row
                 .counters
                 .iter()

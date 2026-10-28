@@ -790,6 +790,11 @@
   });
   const agentsByTask = $derived.by((): ReadonlyMap<string, TaskAgentSummary> => {
     const read = $boardAgents;
+    // `asksForReader` (reached through `taskAgentSummaries`) reads a module flag
+    // Svelte cannot track. Reading the bell setting first is what recomputes the
+    // chips when it flips; the store pushes the flag in before it notifies, so
+    // the recount sees the new answer. The pane's `askingCount` does the same.
+    void $interfaceStore.bellAsksForReader;
     if (read.readAt === null) return new Map();
     return taskAgentSummaries(read.runs, {
       records: $terminalSessions,

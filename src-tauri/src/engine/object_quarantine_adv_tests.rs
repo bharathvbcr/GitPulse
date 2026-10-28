@@ -32,6 +32,7 @@ impl Repo {
 
     fn run(&self, args: Vec<OsString>, index: Option<&Path>) -> String {
         let mut cmd = Command::new("git");
+        crate::test_support::pin_git(&mut cmd);
         cmd.args(&args).current_dir(self.path());
         if let Some(index) = index {
             cmd.env("GIT_INDEX_FILE", index);

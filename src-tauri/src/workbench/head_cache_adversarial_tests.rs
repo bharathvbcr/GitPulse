@@ -10,7 +10,9 @@ use std::path::Path;
 use std::time::Duration;
 
 fn rev(repo: &Path, spec: &str) -> String {
-    let out = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    crate::test_support::pin_git(&mut command);
+    let out = command
         .args(["rev-parse", "--verify", spec])
         .current_dir(repo)
         .output_locked()
@@ -150,7 +152,9 @@ fn reftable_backend_moves_are_seen() {
     let _held = crate::engine::ref_cache::retention();
     let repo = tempfile::TempDir::new().unwrap();
     let r = repo.path();
-    let init = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    crate::test_support::pin_git(&mut command);
+    let init = command
         .args(["init", "-q", "-b", "main", "--ref-format=reftable"])
         .current_dir(r)
         .status_locked()

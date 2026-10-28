@@ -698,7 +698,9 @@ mod tests {
         use crate::procguard::LockedSpawn;
         use std::io::Write;
         use std::process::{Command, Stdio};
-        let mut child = Command::new("git")
+        let mut command = Command::new("git");
+        crate::test_support::pin_git(&mut command);
+        let mut child = command
             .current_dir(dir)
             .args(args)
             .stdin(Stdio::piped())

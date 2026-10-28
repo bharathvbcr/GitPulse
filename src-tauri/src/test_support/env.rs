@@ -327,6 +327,13 @@ pub(crate) mod hermetic {
         root().join("gitconfig")
     }
 
+    /// The hermetic `HOME`, by path under the root rather than by the live
+    /// `HOME`, which a scoped `bind_env` may be pointing at a directory it is
+    /// about to delete.
+    pub(crate) fn home() -> PathBuf {
+        root().join("home")
+    }
+
     /// The `HOME` the developer's shell had before the constructor replaced it.
     pub(crate) fn real_home() -> Option<PathBuf> {
         std::env::var_os(super::REAL_HOME_MARKER)

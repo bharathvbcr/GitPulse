@@ -7,7 +7,9 @@ use crate::procguard::LockedSpawn;
 use std::process::Command;
 
 fn git(repo: &str, args: &[&str]) -> String {
-    let out = Command::new("git")
+    let mut command = Command::new("git");
+    crate::test_support::pin_git(&mut command);
+    let out = command
         .args(args)
         .current_dir(repo)
         .output_locked()

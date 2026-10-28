@@ -4031,7 +4031,9 @@ mod tests {
     }
 
     fn git_ok(dir: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
+        let mut command = std::process::Command::new("git");
+        crate::test_support::pin_git(&mut command);
+        let output = command
             .args(args)
             .current_dir(dir)
             .output_locked()
@@ -4409,7 +4411,9 @@ mod tests {
     }
 
     fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
+        let mut command = std::process::Command::new("git");
+        crate::test_support::pin_git(&mut command);
+        let output = command
             .args(args)
             .current_dir(dir)
             .output_locked()
@@ -5126,7 +5130,9 @@ mod tests {
     }
 
     fn git_in(dir: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
+        let mut command = std::process::Command::new("git");
+        crate::test_support::pin_git(&mut command);
+        let output = command
             .args(args)
             .current_dir(dir)
             .output_locked()
@@ -5143,7 +5149,9 @@ mod tests {
     }
 
     fn git_text(dir: &std::path::Path, args: &[&str]) -> Result<String, String> {
-        let output = std::process::Command::new("git")
+        let mut command = std::process::Command::new("git");
+        crate::test_support::pin_git(&mut command);
+        let output = command
             .args(args)
             .current_dir(dir)
             .output_locked()

@@ -517,7 +517,9 @@ mod tests {
     use std::process::Command;
 
     fn git(path: &Path, args: &[&str]) {
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        crate::test_support::pin_git(&mut command);
+        let output = command
             .args(args)
             .current_dir(path)
             .env("GIT_AUTHOR_NAME", "GitPulse Test")
