@@ -1,6 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MAX_VISIBLE_SESSIONS } from "./attendance";
-import { createGpuRenderer, createGpuSlots, type GpuAddon, type GpuSlots, type GpuState } from "./gpuRenderer";
+import {
+  createGpuRenderer,
+  createGpuSlots,
+  GPU_HIDE_GRACE_MS,
+  GPU_RECOVER_DELAY_MS,
+  type GpuAddon,
+  type GpuSlots,
+  type GpuState,
+} from "./gpuRenderer";
 
 /** A fake addon that records its disposal and can fire its context loss. */
 function fakeAddon() {
@@ -45,38 +53,55 @@ describe("terminal GPU renderer lifecycle", () => {
     expect(made).toHaveLength(0);
   });
 
-  it("attaches once while on screen and disposes the moment it is hidden", () => {
-    const { renderer, made, slots } = harness();
-    expect(renderer.sync(true)).toBe("webgl");
-    expect(renderer.sync(true)).toBe("webgl");
-    expect(made).toHaveLength(1);
-    expect(slots.held()).toBe(1);
+  it("attaches once while on screen, keeps the context through a hide, and disposes when the hold ends", () => {
+    vi.useFakeTimers();
+    try {
+      const { renderer, made, slots } = harness();
+      expect(renderer.sync(true)).toBe("webgl");
+      expect(renderer.sync(true)).toBe("webgl");
+      expect(made).toHaveLength(1);
+      expect(slots.held()).toBe(1);
 
-    expect(renderer.sync(false)).toBe("dom");
-    expect(made[0].disposed).toBe(1);
-    expect(slots.held()).toBe(0);
+      // Hidden: still held, so a tab flick reuses it (see the lifecycle suite).
+      renderer.sync(false);
+      expect(made[0].disposed).toBe(0);
+      vi.advanceTimersByTime(GPU_HIDE_GRACE_MS);
+      expect(renderer.state()).toBe("dom");
+      expect(made[0].disposed).toBe(1);
+      expect(slots.held()).toBe(0);
 
-    // Shown again: a fresh context, not the disposed one revived.
-    expect(renderer.sync(true)).toBe("webgl");
-    expect(made).toHaveLength(2);
+      // Shown again: a fresh context, not the disposed one revived.
+      expect(renderer.sync(true)).toBe("webgl");
+      expect(made).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  it("disposes synchronously on context loss and never re-attaches", () => {
-    const { renderer, made, slots, changes } = harness();
-    renderer.sync(true);
-    made[0].fireLoss();
-    expect(renderer.state()).toBe("lost");
-    expect(made[0].disposed).toBe(1);
-    expect(made[0].listening()).toBe(false);
-    expect(slots.held()).toBe(0);
+  it("disposes synchronously on context loss, and re-attaches only after the recovery delay", () => {
+    vi.useFakeTimers();
+    try {
+      const { renderer, made, slots, changes } = harness();
+      renderer.sync(true);
+      made[0].fireLoss();
+      expect(renderer.state()).toBe("reset");
+      expect(made[0].disposed).toBe(1);
+      expect(made[0].listening()).toBe(false);
+      expect(slots.held()).toBe(0);
 
-    // Hide and show, repeatedly: a loss loop would create a context each time.
-    for (let round = 0; round < 5; round += 1) {
-      expect(renderer.sync(false)).toBe("lost");
-      expect(renderer.sync(true)).toBe("lost");
+      // Not before the delay, however often the session is shown and hidden.
+      for (let round = 0; round < 5; round += 1) {
+        renderer.sync(false);
+        renderer.sync(true);
+      }
+      expect(made).toHaveLength(1);
+      vi.advanceTimersByTime(GPU_RECOVER_DELAY_MS);
+      expect(renderer.state()).toBe("webgl");
+      expect(made).toHaveLength(2);
+      expect(changes).toEqual(["webgl", "reset", "webgl"]);
+    } finally {
+      vi.useRealTimers();
     }
-    expect(made).toHaveLength(1);
-    expect(changes).toEqual(["webgl", "lost"]);
   });
 
   it("treats a loss reported by the canvas the same as the addon's own event", () => {
@@ -88,8 +113,7 @@ describe("terminal GPU renderer lifecycle", () => {
     renderer.lose();
     made[0].fireLoss();
     expect(made[0].disposed).toBe(1);
-    expect(renderer.state()).toBe("lost");
-    expect(renderer.sync(true)).toBe("lost");
+    expect(renderer.state()).toBe("reset");
     expect(made).toHaveLength(1);
   });
 
