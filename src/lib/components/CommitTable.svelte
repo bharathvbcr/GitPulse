@@ -29,6 +29,7 @@
   import { paintGraphFrame } from "../canvas/graphComposite";
   import { createFrameScheduler } from "../motion/frameScheduler";
   import { observeResize } from "../dom/observeResize";
+  import { watchDevicePixelRatio } from "../dom/devicePixelRatio";
   import { prefersReducedMotion } from "../motion/easing";
   import { INITIAL_GRAPH_PAINT, stepGraphPaint, type GraphPaintState } from "../motion/graphPaint";
   import { nextLoadLimit } from "../stores/graphLimits";
@@ -843,23 +844,10 @@
 
     // Display moves change devicePixelRatio without any resize event; watch the
     // current resolution and re-arm on each transition.
-    let detachDpr = () => {};
-    const watchDpr = () => {
-      if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
-      const query = `(resolution: ${window.devicePixelRatio || 1}dppx)`;
-      const media = window.matchMedia(query);
-      const onChange = () => {
-        detachDpr();
-        watchDpr();
-        graphCache.invalidate();
-        schedulePaint();
-      };
-      if (typeof media.addEventListener === "function") {
-        media.addEventListener("change", onChange);
-        detachDpr = () => media.removeEventListener("change", onChange);
-      }
-    };
-    watchDpr();
+    const detachDpr = watchDevicePixelRatio(() => {
+      graphCache.invalidate();
+      schedulePaint();
+    });
 
     // GPU pressure can revoke the 2D context mid-session; without handling,
     // every subsequent paint silently no-ops into the dead context and the
