@@ -1132,7 +1132,7 @@
      * canvas on screen meanwhile; this falls back to the DOM renderer at once.
      * Captured on the host because the event does not bubble.
      */
-    const onContextLost = () => gpu?.lose();
+    const onContextLost = (event: Event) => gpu?.lose(event.target);
     /**
      * Every paste goes through `planPaste`: bracketed-paste markers inside the
      * clipboard are removed, and a paste that would run before it is read asks
@@ -1216,8 +1216,20 @@
           attach: () => {
             const addon = new WebglAddon();
             t.loadAddon(addon);
-            return addon;
+            // The addon exposes no canvas; its WebGL one is the only canvas
+            // on the screen without a `-layer` class (the link layer has one).
+            // The renderer loses its context on release (xterm.js #6068).
+            const canvas = [...(t.element?.querySelectorAll("canvas") ?? [])].find(
+              (node) => ![...node.classList].some((name) => name.endsWith("-layer")),
+            );
+            return {
+              canvas,
+              dispose: () => addon.dispose(),
+              onContextLoss: (listener) => addon.onContextLoss(listener),
+              clearTextureAtlas: () => addon.clearTextureAtlas(),
+            };
           },
+          refresh: () => t.refresh(0, t.rows - 1),
           onChange: (state) => (renderer = state),
         });
         opened = true;
@@ -1428,13 +1440,16 @@
   });
 
   /**
-   * WebGL only while attended: the same `onscreen` the notifier is told, so a
-   * hidden tab, a collapsed dock or another repository's dock holds no
-   * context. See `terminal/gpuRenderer.ts` for the cap and the loss rule.
+   * WebGL while attended: the same `onscreen` the notifier is told. A hidden
+   * tab, a collapsed dock or another repository's dock keeps its warm context
+   * only through a bounded hold and gives it up when another session needs the
+   * slot; turning the setting off releases it at once. See
+   * `terminal/gpuRenderer.ts` for the cap, the hold and the loss budget.
    */
   $effect(() => {
-    const want = opened && onscreen && $interfaceStore.terminalGpu;
-    untrack(() => gpu?.sync(want));
+    const enabled = $interfaceStore.terminalGpu;
+    const want = opened && onscreen && enabled;
+    untrack(() => gpu?.sync(want, enabled));
   });
 </script>
 
@@ -1518,7 +1533,7 @@
       </div>
     {/if}
   </div>
-  {#if error || exited || spawning || shellPath || hoveredLink}
+  {#if error || exited || spawning || shellPath || hoveredLink || renderer === "reset" || renderer === "lost"}
     <!-- One fixed-height status row: spawn/error/exited/info content swaps
          inside it, so the terminal's box never resizes (and the
          ResizeObserver never refits) merely because the text rotated. -->
@@ -1560,7 +1575,18 @@
         <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" aria-hidden="true"></span>
         <span class="text-[10px] text-textMuted font-mono truncate" title={`${shellPath} · Started in ${startedIn || workPath}`}>{shellPath.split(/[\\/]/).pop()} · {workPath.split(/[\\/]/).pop()}{startDir ? `/${startDir}` : ""}</span>
       {/if}
-      <div class="ml-auto flex items-center gap-1 shrink-0" role="group" aria-label="Terminal text size">
+      {#if renderer === "reset" || renderer === "lost"}
+        <!-- A lost WebGL context is not blank (the DOM renderer is already
+             drawing the same rows), but it is slower; say why. -->
+        <span
+          data-terminal-gpu-note
+          class="ml-auto shrink-0 text-[10px] text-amber-300 whitespace-nowrap"
+          title={renderer === "reset"
+            ? "The graphics context was lost, for example by a GPU reset or waking from sleep. This terminal draws without the GPU and will try again."
+            : "This terminal draws without the GPU: its graphics context was lost repeatedly or could not be created. Reopening the tab tries again."}
+        >{renderer === "reset" ? "Drawing without GPU after a graphics reset" : "Drawing without GPU"}</span>
+      {/if}
+      <div class="{renderer === 'reset' || renderer === 'lost' ? '' : 'ml-auto '}flex items-center gap-1 shrink-0" role="group" aria-label="Terminal text size">
 
         <button type="button" class="gp-icon-btn p-0.5!" aria-label="Decrease terminal text size" title="Smaller text ({platformChord('⌘−', 'Ctrl+Shift+−', $hostPlatform.os)})" disabled={fontSize <= TERMINAL_FONT_MIN} onclick={() => setFontSize(fontSize - 1)}><Minus size={12} /></button>
         <button type="button" class="text-[10px] text-textMuted tabular-nums px-1" aria-label="Reset terminal text size" title="Reset text size ({platformChord('⌘0', 'Ctrl+Shift+0', $hostPlatform.os)})" onclick={() => setFontSize(TERMINAL_FONT_DEFAULT)}>{fontSize}px</button>

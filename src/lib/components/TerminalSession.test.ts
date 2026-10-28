@@ -359,3 +359,13 @@ describe("TerminalSession task link", () => {
     expect(source).toContain("await openTaskForRun(linkedRunId)");
   });
 });
+
+describe("TerminalSession GPU wiring", () => {
+  it("tells the renderer the setting separately from the attendance, names the canvas that was lost, and says when it draws without the GPU", () => {
+    expect(source).toContain("gpu?.sync(want, enabled)");
+    expect(source).toContain("gpu?.lose(event.target)");
+    expect(source).toContain("refresh: () => t.refresh(0, t.rows - 1)");
+    expect(source).toContain("data-terminal-gpu-note");
+    expect(source).toContain("Drawing without GPU after a graphics reset");
+  });
+});
