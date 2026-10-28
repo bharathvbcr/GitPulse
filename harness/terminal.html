@@ -1193,16 +1193,21 @@
           if (seen.every((id) => id === "")) return;
           if (seen.some((id) => id !== seen[0])) partial++; else ids.add(seen[0]);
         };
-        let acked = 0, received = 0;
-        const writer = createSyncFrameWriter({ write: (bytes, written) => term.write(bytes, written) });
+        let acked = 0, received = 0, writes = 0, endedInsideBlock = 0;
+        // xterm's own parser, not this harness's model of it: is mode 2026 on
+        // when a write has been parsed? That is the state its animation frame meets.
+        const modes = term._core?.coreService?.decPrivateModes;
+        if (typeof modes?.synchronizedOutput !== "boolean") throw new Error("xterm's synchronized-output flag is not where this harness looks for it");
+        const write = (bytes, written) => term.write(bytes, () => { writes++; if (modes.synchronizedOutput) endedInsideBlock++; written(); });
+        const writer = createSyncFrameWriter({ write });
         await new Promise((resolve) => requestAnimationFrame(() => resolve()));
         const base = paints;
         const sent = await deliver(frameStream(Math.round(SYNC_FPS * SYNC_MS / 1000)), SYNC_MS, (chunk) => {
           received += chunk.length;
           const done = () => { acked += chunk.length; };
-          if (viaWriter) writer.push(chunk, done); else term.write(chunk, done);
+          if (viaWriter) writer.push(chunk, done); else write(chunk, done);
         });
-        const out = { gpu, renderer, viaWriter, paints: paints - base, distinctFrames: ids.size, chunks: sent.chunks, chunksEndingMidFrame: sent.midFrame };
+        const out = { gpu, renderer, viaWriter, paints: paints - base, distinctFrames: ids.size, chunks: sent.chunks, chunksEndingMidFrame: sent.midFrame, writes, endedInsideBlock };
         await wait(1300);
         out.paintsAfterAnother1p3s = paints - base;
         out.partialPaints = partial;
@@ -1287,6 +1292,7 @@
             // is reported in the verdict's diagnostics, not asserted: it is
             // xterm's bug, and a fixed xterm would make it converge on this one.
             check(`${tag}: through the writer it paints at the render rate (${after.paints} paints, ${after.distinctFrames} distinct frames)`, () => after.paints >= 40 && after.distinctFrames >= 40);
+            check(`${tag}: no write through the writer ends with mode 2026 on in xterm's own parser (${after.endedInsideBlock}/${after.writes}; written directly: ${before.endedInsideBlock}/${before.writes})`, () => after.writes > 0 && after.endedInsideBlock === 0);
             check(`${tag}: no half-drawn frame is ever painted (${before.partialPaints} direct, ${after.partialPaints} through the writer)`, () => before.partialPaints === 0 && after.partialPaints === 0);
             check(`${tag}: every byte received is acknowledged`, () => after.acked === after.received && before.acked === before.received);
           }

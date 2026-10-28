@@ -6,10 +6,11 @@
  * closes (`CSI ? 2026 l`) it flushes the buffer, but schedules the paint
  * through its requestAnimationFrame render debouncer. `_renderRows` runs when
  * that frame fires and drops the paint if mode 2026 is on again by then
- * (xtermjs/xterm.js#6071). A program that redraws continuously, as Claude
- * Code does, opens the next block as soon as it closes the last, so the
- * frame is lost and the screen only advances when xterm's own 1000 ms safety
- * timeout expires: about one frame a second, blank or stale in between.
+ * (xtermjs/xterm.js#6071). A program that redraws continuously (a TUI that
+ * wraps every repaint in a block) opens the next block as soon as it closes
+ * the last, so the frame is lost and the screen only advances when xterm's
+ * own 1000 ms safety timeout expires: about one frame a second, blank or
+ * stale in between.
  *
  * What decides whether the paint survives is the parser's state when the
  * frame fires, and `WriteBuffer` only yields to the event loop between
