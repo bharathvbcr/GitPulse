@@ -14,11 +14,20 @@
    * `display:none`, so its observer fires with a zero rect on every strip
    * change. Those proposals are unusable and must be skipped, not rounded to
    * a 1x1 grid the shell would then be told about.
+   *
+   * `rendered` is whether the terminal's element has a box at all, and it
+   * outranks the proposal. Inside `display: none` `getComputedStyle` answers
+   * with the declared `100%`, which the fit addon's `parseInt` reads as a
+   * 100 px box: a confident, usable-looking 11 x 6 (measured in Chrome and
+   * WebKit). A proposal made without a box is therefore not evidence about
+   * the grid, whatever it says.
    */
   export function shouldRefit(
     current: TermDims | null,
     proposed?: TermDims | null,
+    rendered = true,
   ): boolean {
+    if (!rendered) return false;
     if (!proposed || !Number.isFinite(proposed.cols) || !Number.isFinite(proposed.rows)) {
       return false;
     }
@@ -58,6 +67,40 @@
       Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, "0");
     const opacity = alpha >= 1 ? "" : byte(alpha * 255);
     return `#${parts.slice(0, 3).map(byte).join("")}${opacity}`;
+  }
+
+  /**
+   * The palette xterm is given, from a reader of CSS tokens.
+   *
+   * Every value that can be translucent is spelled in a form xterm parses on
+   * its own (`hexColor`). The selection colour used to be written as
+   * `rgb(128 158 255 / 0.32)`, which is neither hex nor the comma form xterm's
+   * parser accepts: it went to the canvas probe, which throws for alpha below
+   * 255, the parser swallowed the throw, and every terminal selected in
+   * xterm's default translucent white instead. The other colours are opaque
+   * by construction (`--c-*` channel triplets), which the probe reads.
+   */
+  export function buildTermTheme(v: (name: string, fallback: string) => string): Record<string, string> {
+    return {
+      background: hexColor(v("--bg-terminal", "#141a29")),
+      foreground: v("--text-primary", "#e9edf8"),
+      cursor: v("--accent-color", "#809eff"),
+      // The glyph drawn INSIDE a block cursor, so it is a foreground and stays
+      // opaque even when the surface behind it does not.
+      cursorAccent: v("--bg-surface", "#141a29"),
+      selectionBackground: hexColor("rgb(128 158 255 / 0.32)"),
+    };
+  }
+
+  /**
+   * Whether two palettes are the same colours. Setting a theme on xterm
+   * rebuilds its colour set and refreshes the glyph atlas whether or not
+   * anything changed, so an unchanged palette is not set again.
+   */
+  export function sameTheme(a: Record<string, string> | null, b: Record<string, string> | null): boolean {
+    if (!a || !b) return false;
+    const keys = Object.keys(a);
+    return keys.length === Object.keys(b).length && keys.every((key) => a[key] === b[key]);
   }
 </script>
 
@@ -114,6 +157,8 @@
   import type { TerminalSpawned } from "../terminal/runResult";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { observeResize } from "../dom/observeResize";
+  import { watchDevicePixelRatio } from "../dom/devicePixelRatio";
+  import { createFitScheduler } from "../terminal/fitSchedule";
   import { openExternal } from "../desktop/openExternal";
   import { repoStore } from "../stores/repoStore";
   import { linksForRow, resolveLinkAction, type LinkBuffer } from "../terminal/links";
@@ -292,17 +337,25 @@
 
   function termTheme(): Record<string, string> {
     const css = getComputedStyle(document.documentElement);
-    const v = (name: string, fallback: string) =>
-      css.getPropertyValue(name).trim() || fallback;
-    return {
-      background: hexColor(v("--bg-terminal", "#141a29")),
-      foreground: v("--text-primary", "#e9edf8"),
-      cursor: v("--accent-color", "#809eff"),
-      // The glyph drawn INSIDE a block cursor, so it is a foreground and stays
-      // opaque even when the surface behind it does not.
-      cursorAccent: v("--bg-surface", "#141a29"),
-      selectionBackground: "rgb(128 158 255 / 0.32)",
-    };
+    return buildTermTheme((name, fallback) => css.getPropertyValue(name).trim() || fallback);
+  }
+
+  /** The palette on the terminal now, so an unchanged one is not set again. */
+  let appliedTheme: Record<string, string> | null = null;
+
+  /**
+   * The one place a palette reaches xterm. Called from the store effect and
+   * from the observer on the root's class/style, which also fires for accent,
+   * tab-size and UI-scale changes that leave the palette alone; each set
+   * would rebuild the colour set and the glyph atlas of every session, the
+   * hidden ones included.
+   */
+  function applyTheme() {
+    if (!term) return;
+    const next = termTheme();
+    if (sameTheme(appliedTheme, next)) return;
+    appliedTheme = next;
+    term.options.theme = next;
   }
 
   /**
@@ -526,6 +579,7 @@
       return !onChord(event);
     });
     term = created;
+    appliedTheme = termTheme();
     if (!disposed) {
       for (const token of credit.flush()) paintOutput(token);
     }
@@ -564,18 +618,47 @@
     }
   }
 
+  /**
+   * Layout moved: fit, at most once per `FIT_MIN_INTERVAL_MS`. The resize
+   * observer and the first fit come here; showing a terminal and changing the
+   * font go through `fits.settle()`. All of them end in `fitNow`, which is the
+   * only place the emulator is resized and so the only place that decides
+   * whether it may be.
+   */
   function refitIfResized() {
-    if (!fitAddon || !term) return;
+    fits.request();
+  }
+
+  /**
+   * Measure the box and, if the grid it holds changed, resize to it.
+   *
+   * A terminal with no box (a hidden tab, a collapsed dock, another
+   * repository's dock, a container squeezed to nothing) is left exactly as it
+   * is. Measuring it would answer with a small confident grid that is not
+   * evidence of anything, and the PTY would be told it, which makes the
+   * program inside repaint for a tab nobody is looking at. It is fitted once
+   * when it is shown again (`reveal`, and the observer when the box returns).
+   */
+  function fitNow() {
+    if (disposed || !fitAddon || !term) return;
     try {
-      const proposal = fitAddon.proposeDimensions();
+      const rendered = hasRenderedBox(container);
+      const proposal = rendered ? fitAddon.proposeDimensions() : undefined;
       const proposed = proposal ? { cols: Math.min(1000, proposal.cols), rows: Math.min(1000, proposal.rows) } : proposal;
-      if (!shouldRefit({ cols: term.cols, rows: term.rows }, proposed)) return;
+      if (!shouldRefit({ cols: term.cols, rows: term.rows }, proposed, rendered)) return;
       if (proposal && (proposal.cols > 1000 || proposal.rows > 1000) && proposed) {
         term.resize(proposed.cols, proposed.rows);
       } else fitAddon.fit();
     } catch {
       /* container collapsed; refit when it has size again */
     }
+  }
+
+  const fits = createFitScheduler(fitNow);
+
+  /** The grid's cell size changed under an unchanged box: a new font size. */
+  function refitAfterMetricsChange() {
+    fits.settle();
   }
 
   function launcherConfig(kind: LauncherKind): { program?: string; args?: string[] } {
@@ -975,7 +1058,10 @@
 
   /** Called by the panel when this tab becomes visible again. */
   export function reveal() {
-    refitIfResized();
+    // After the layout that shows this pane (next frame, before it paints),
+    // once: the box has its real size by then, and the observer's own fit for
+    // the same change finds the grid already right.
+    fits.settle();
     if (findOpen) findInput?.focus();
     else term?.focus();
   }
@@ -1054,7 +1140,7 @@
     interfaceStore.setTerminalFontSize(fontSize);
     if (term) term.options.fontSize = fontSize;
     // Font metrics settle at layout; ResizeObserver also handles the changed box.
-    void tick().then(() => { if (!disposed && active) refitIfResized(); });
+    refitAfterMetricsChange();
   }
 
   export function handleViewChord(event: KeyboardEvent): boolean {
@@ -1250,9 +1336,7 @@
     }
     // themeStore publishes before a View Transition applies its CSS. Observe
     // the actual class/style commit too, including accent and glass changes.
-    themeObserver = new MutationObserver(() => {
-      if (term) term.options.theme = termTheme();
-    });
+    themeObserver = new MutationObserver(applyTheme);
     themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["class", "style"] });
     lifecycle = createLifecycle();
     // Awaited before the spawn so the launch reflects the saved default mode
@@ -1395,14 +1479,33 @@
       if (size === fontSize) return;
       fontSize = size;
       if (term) term.options.fontSize = size;
-      void tick().then(() => { if (!disposed && active) refitIfResized(); });
+      // Every session that has a box, on screen or not active: a split's
+      // second half keeps its box when the font changes, so only this refits
+      // it. A hidden one is skipped by `fitNow` and fitted when it is shown.
+      refitAfterMetricsChange();
     });
+  });
+
+  /**
+   * A window moved to a display with another pixel ratio keeps its CSS box,
+   * so the resize observer stays silent while xterm rebuilds its cell metrics
+   * and glyph atlas underneath an unchanged grid. Measure again, then clear
+   * the atlas (a no-op on the DOM renderer) so no glyph is drawn from the old
+   * display's raster.
+   */
+  $effect(() => {
+    // A session with no box has nothing to redraw; the atlas call full-refreshes.
+    const stop = watchDevicePixelRatio(() => fits.settle(() => { if (hasRenderedBox(container)) term?.clearTextureAtlas(); }));
+    return () => {
+      stop();
+      fits.cancel();
+    };
   });
 
   /** Theme flips re-resolve the palette from CSS variables. */
   $effect(() => {
     $themeStore;
-    if (term) term.options.theme = termTheme();
+    applyTheme();
   });
 
   /**
