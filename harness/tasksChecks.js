@@ -2637,6 +2637,81 @@ if (params.has("check")) {
       await refreshBoard();
       await wait(() => !root.querySelector('[data-testid="board-agents-error"]'));
       check("once every agent has ended, no card is marked", !root.querySelector('[data-testid="card-agents"]'));
+
+      // ADVERSARY (W5a): "count a terminal bell as waiting for you" must move the
+      // chip by itself. Nothing below refreshes the board after the toggle, so a
+      // chip that only follows the next poll or activity tick fails here. The
+      // setting is read through a module flag Svelte cannot track.
+      {
+        const {terminalSessions} = await import("../src/lib/terminal/sessionRegistry");
+        const {sessionActivity} = await import("../src/lib/terminal/sessionActivity");
+        const asking = id => chip(id)?.dataset.asking ?? null;
+        const working = id => chip(id)?.textContent.trim().match(/^\d+/)?.[0] ?? null;
+        interfaceStore.setBellAsksForReader(true);
+        const record = (key, runId, sessionId) => terminalSessions.adopt({key, repoPath:"/fixture/GitPulse", label:"Codex", status:"running", sessionId, taskRunId:runId, close: async () => {}});
+        // task-1: one hook-less bell. task-3: one hooked ask. task-2: both.
+        const slots = [
+          record("adv-bell", "adv-run-bell", "adv-bell-session"),
+          record("adv-hook", "adv-run-hook", "adv-hook-session"),
+          record("adv-both-bell", "adv-run-both-bell", "adv-both-bell-session"),
+          record("adv-both-hook", "adv-run-both-hook", "adv-both-hook-session"),
+        ];
+        const mk = (id, task, session) => ({...base, id, task_id:task, kind:"external_terminal", state:"running", session_id:session});
+        boardRuns = [
+          mk("adv-run-bell", "task-1", "adv-bell-session"),
+          mk("adv-run-hook", "task-3", "adv-hook-session"),
+          mk("adv-run-both-bell", "task-2", "adv-both-bell-session"),
+          mk("adv-run-both-hook", "task-2", "adv-both-hook-session"),
+        ];
+        await refreshBoard();
+        await wait(() => chip("task-1") && chip("task-2") && chip("task-3"));
+        sessionActivity.announce({session:"adv-bell-session", channel:"bell"});
+        sessionActivity.announce({session:"adv-hook-session", channel:"hook", event:"permission_prompt", detail:"Bash: cargo test"});
+        sessionActivity.announce({session:"adv-both-bell-session", channel:"bell"});
+        sessionActivity.announce({session:"adv-both-hook-session", channel:"hook", event:"permission_prompt", detail:"Bash: cargo test"});
+        await wait(() => asking("task-1") === "1" && asking("task-3") === "1" && asking("task-2") === "2");
+        check("setting on: a hook-less bell, a hooked ask, and both together are counted",
+          asking("task-1") === "1" && asking("task-3") === "1" && asking("task-2") === "2");
+
+        // The board polls its agents every 1.5 s while any run is live, and a
+        // poll recomputes the chips whatever the setting did, so a chip that
+        // only follows the poll would pass any check that waits. Each flip is
+        // therefore judged one macrotask after it, and only counts when no
+        // `runs.list` was sent in that window; a flip a poll raced is undone
+        // and retried.
+        const polls = () => ipcMethods.filter(method => method === "runs.list").length;
+        const flipped = async (values, judge) => {
+          for (let attempt = 0; attempt < 8; attempt++) {
+            const before = polls();
+            for (const value of values) interfaceStore.setBellAsksForReader(value);
+            await tick(); await new Promise(resolve => setTimeout(resolve, 0)); await tick();
+            const verdict = judge();
+            if (polls() === before) return verdict;
+            interfaceStore.setBellAsksForReader(!values.at(-1)); await settle(1800);
+          }
+          throw Error("every flip was raced by a board poll");
+        };
+        check("setting off: the bell chip stops asking at once, before any board poll",
+          await flipped([false], () => asking("task-1") === null && working("task-1") === "1"));
+        check("setting off: a hooked ask still counts, alone and beside a bell",
+          asking("task-3") === "1" && asking("task-2") === "1" && working("task-2") === "2");
+        check("setting off: the chip's title agrees with its count",
+          !/need/.test(chip("task-1").title) && /1 needs you/.test(chip("task-2").title) && /2 agents working/.test(chip("task-2").title));
+
+        check("setting back on: the bell chip asks again at once, before any board poll",
+          await flipped([true], () => asking("task-1") === "1" && asking("task-2") === "2" && asking("task-3") === "1"));
+
+        // Three flips in one tick: the settled answer must be the last one.
+        check("three flips in one tick settle on the last one",
+          await flipped([false, true, false], () => asking("task-1") === null && asking("task-2") === "1"));
+        check("flipping back after that restores the count",
+          await flipped([true], () => asking("task-1") === "1" && asking("task-2") === "2"));
+
+        for (const slot of slots) slot.release();
+        boardRuns = [];
+        await refreshBoard();
+        await wait(() => !root.querySelector('[data-testid="card-agents"]'));
+      }
     }
 
     // ---- Keyboard: moving between cards, selecting and reordering ----------
