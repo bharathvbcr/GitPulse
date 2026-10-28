@@ -2,15 +2,17 @@
  * Writes into xterm that never end inside a DEC 2026 (synchronized output)
  * block.
  *
- * xterm 6.0.0 buffers every row refresh while mode 2026 is on. When the block
- * closes (`CSI ? 2026 l`) it flushes the buffer, but schedules the paint
- * through its requestAnimationFrame render debouncer. `_renderRows` runs when
- * that frame fires and drops the paint if mode 2026 is on again by then
- * (xtermjs/xterm.js#6071). A program that redraws continuously (a TUI that
- * wraps every repaint in a block) opens the next block as soon as it closes
- * the last, so the frame is lost and the screen only advances when xterm's
- * own 1000 ms safety timeout expires: about one frame a second, blank or
- * stale in between.
+ * xterm 6.0.0 and 6.1.0-beta.317 (the shipped pair; `RenderService` is the
+ * same in both for this path, and harness/terminal.html still shows direct
+ * writes painting 0 of 120 frames) buffer every row refresh while mode 2026
+ * is on. When the block closes (`CSI ? 2026 l`) it flushes the buffer, but
+ * schedules the paint through its requestAnimationFrame render debouncer.
+ * `_renderRows` runs when that frame fires and drops the paint if mode 2026
+ * is on again by then (xtermjs/xterm.js#6071). A program that redraws
+ * continuously (a TUI that wraps every repaint in a block) opens the next
+ * block as soon as it closes the last, so the frame is lost and the screen
+ * only advances when xterm's own 1000 ms safety timeout expires: about one
+ * frame a second, blank or stale in between.
  *
  * What decides whether the paint survives is the parser's state when the
  * frame fires, and `WriteBuffer` only yields to the event loop between

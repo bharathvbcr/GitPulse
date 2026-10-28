@@ -248,8 +248,11 @@ describe("keyCode 229 control punctuation", () => {
     ["Ctrl+[", { key: "[", ctrlKey: true }, "\x1b"],
     ["Ctrl+\\", { key: "\\", ctrlKey: true }, "\x1c"],
     ["Ctrl+]", { key: "]", ctrlKey: true }, "\x1d"],
-    ["Ctrl+Shift+@", { key: "@", ctrlKey: true, shiftKey: true }, "\0"],
-    ["Ctrl+Shift+_", { key: "_", ctrlKey: true, shiftKey: true }, "\x1f"],
+    // xterm 6.1 reads these from the physical key (`code`), not from `key`.
+    ["Ctrl+Shift+2 (^@)", { key: "@", code: "Digit2", ctrlKey: true, shiftKey: true }, "\0"],
+    ["Ctrl+Shift+- (^_)", { key: "_", code: "Minus", ctrlKey: true, shiftKey: true }, "\x1f"],
+    ["Ctrl+Shift+6 (^^)", { key: "^", code: "Digit6", ctrlKey: true, shiftKey: true }, "\x1e"],
+    ["Ctrl+/", { key: "/", code: "Slash", ctrlKey: true }, "\x1f"],
   ] as const) {
     it(`sends ${label} the way xterm's keyboard map does`, () => {
       const decision = createEraseGuard().decide(key({ type: "keydown", keyCode: 229, ...partial }));

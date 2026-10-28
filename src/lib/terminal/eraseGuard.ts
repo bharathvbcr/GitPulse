@@ -197,10 +197,17 @@ function modifierMask(event: TerminalInputEvent): number {
   return (event.shiftKey ? 1 : 0) | (event.altKey ? 2 : 0) | (event.ctrlKey ? 4 : 0) | (event.metaKey ? 8 : 0);
 }
 
-/** xterm 6.0.0 `Keyboard.ts`: Ctrl+[ \ ] are keyCodes 219-221. */
-const CTRL_229: Readonly<Record<string, string>> = { "[": ESC, "\\": "\x1c", "]": "\x1d" };
-/** xterm 6.0.0 `Keyboard.ts`: `^@` and `^_` are matched by `key` with Ctrl held. */
-const CTRL_SHIFT_229: Readonly<Record<string, string>> = { "@": "\0", "_": "\x1f" };
+/**
+ * xterm 6.1 `Keyboard.ts`: Ctrl+[ \ ] are keyCodes 219-221, and Ctrl+/ is
+ * matched by `key` (xtermjs/xterm.js#5457; 6.0.0 wrote nothing for it).
+ */
+const CTRL_229: Readonly<Record<string, string>> = { "[": ESC, "\\": "\x1c", "]": "\x1d", "/": "\x1f" };
+/**
+ * xterm 6.1 `Keyboard.ts`: with Ctrl and Shift held, `^@`, `^_` and `^^` are
+ * matched by the physical key. 6.0.0 matched `^@` and `^_` by `key` and had
+ * no `^^`.
+ */
+const CTRL_SHIFT_229: Readonly<Record<string, string>> = { Digit2: "\0", Minus: "\x1f", Digit6: "\x1e" };
 
 /**
  * Bytes for a non-composing keyCode 229 key that must not reach
@@ -240,7 +247,7 @@ function direct229Bytes(event: TerminalInputEvent): string | null {
       break;
   }
   if (event.ctrlKey && !event.altKey && event.key) {
-    const punctuation = event.shiftKey ? CTRL_SHIFT_229[event.key] : CTRL_229[event.key];
+    const punctuation = event.shiftKey ? CTRL_SHIFT_229[event.code ?? ""] : CTRL_229[event.key];
     if (punctuation !== undefined) return punctuation;
   }
   if (event.altKey || event.shiftKey || !event.ctrlKey || !event.key || event.key.length !== 1) return null;
