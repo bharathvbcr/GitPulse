@@ -1107,6 +1107,246 @@
         return results;
       }
 
+      /**
+       * DEC 2026 synchronized output (xtermjs/xterm.js#6071). xterm drops the
+       * paint of a frame when the next frame's `CSI ? 2026 h` has been parsed by
+       * the time its animation frame fires, so a program that redraws
+       * continuously is painted about once a second. PTY output reaches xterm in
+       * chunks cut without regard to frame boundaries, so this feeds back-to-back
+       * frames in chunks that end mid-frame, ~120 frames a second for two
+       * seconds, and counts what xterm paints:
+       *
+       *   - the real xterm, on its DOM renderer and on WebGL, written to
+       *     directly (what the view did before `syncFrames`) and through the
+       *     writer the view uses;
+       *   - the real session, on its DOM renderer, fed through the channel PTY
+       *     output arrives on.
+       *
+       * A paint is any `onRender`; at each one every row is read back and must
+       * carry the same frame number, or a half-drawn frame was shown.
+       */
+      const SYNC_ROWS = 24;
+      const SYNC_COLS = 100;
+      const SYNC_FPS = 120;
+      const SYNC_MS = 2000;
+      /** The options of TerminalSession's own xterm that could touch painting. */
+      const SESSION_LIKE = { lineHeight: 1.15, cursorBlink: true, allowTransparency: true, convertEol: false, allowProposedApi: true };
+      const frameText = (id, rows, width) => {
+        let s = "\u001b[?2026h\u001b[H";
+        for (let r = 0; r < rows; r++) {
+          s += `\u001b[3${1 + (r % 6)}mF${String(id).padStart(5, "0")} row${String(r).padStart(2, "0")} ${"#".repeat(width)}\u001b[0m${r < rows - 1 ? "\r\n" : ""}`;
+        }
+        return s + "\u001b[?2026l";
+      };
+      const frameStream = (frames, rows = SYNC_ROWS, width = 70) => new TextEncoder().encode(Array.from({ length: frames }, (_, i) => frameText(i + 1, rows, width)).join(""));
+      /** Delivers `stream` over `ms`, in chunks of whatever arrived since the last tick, as a reader does. */
+      async function deliver(stream, ms, push) {
+        const started = performance.now();
+        const frameLen = stream.length / Math.round(SYNC_FPS * ms / 1000);
+        let sent = 0, chunks = 0, midFrame = 0;
+        for (;;) {
+          const elapsed = performance.now() - started;
+          const target = elapsed >= ms ? stream.length : Math.floor(stream.length * elapsed / ms);
+          if (target > sent) {
+            const into = target % frameLen;
+            if (into > 8 && into < frameLen - 8) midFrame++;
+            push(stream.subarray(sent, target));
+            sent = target; chunks++;
+          }
+          if (sent >= stream.length) return { chunks, midFrame };
+          await new Promise((resolve) => setTimeout(resolve, 3));
+        }
+      }
+      /** The frame number each row names; a complete frame names one number on every row. */
+      const frameIdsOf = (rows) => rows.map((text) => /^F(\d{5}) row/.exec(text)?.[1] ?? "");
+      const syncHost = () => {
+        const host = document.createElement("div");
+        host.style.cssText = "position:fixed;left:0;top:0;width:900px;height:420px;z-index:-1";
+        document.body.appendChild(host);
+        return host;
+      };
+      /** The real xterm, written to directly or through the view's writer, on WebGL or the DOM. */
+      async function syncRun({ gpu, viaWriter }) {
+        const { Terminal } = await import("@xterm/xterm");
+        const { createSyncFrameWriter } = await import("../src/lib/terminal/syncFrames.ts");
+        const host = syncHost();
+        const term = new Terminal({ cols: SYNC_COLS, rows: SYNC_ROWS, ...SESSION_LIKE });
+        term.open(host);
+        if (gpu) {
+          const { WebglAddon } = await import("@xterm/addon-webgl");
+          term.loadAddon(new WebglAddon());
+        }
+        term.focus();
+        const renderer = host.querySelector("canvas") ? "webgl" : "dom";
+        // `onRender` skips redraw-only renders (a blinking cursor asks for them),
+        // which still paint whatever a block buffered. What the screen shows is
+        // every call into the renderer, so that is what is counted.
+        const live = term._core?._renderService?._renderer?.value;
+        if (!live || typeof live.renderRows !== "function") throw new Error("xterm's renderer is not where this harness looks for it");
+        const drawRows = live.renderRows.bind(live);
+        let paints = 0, partial = 0;
+        const ids = new Set();
+        live.renderRows = (start, end) => {
+          drawRows(start, end);
+          paints++;
+          const seen = frameIdsOf(Array.from({ length: SYNC_ROWS }, (_, r) => term.buffer.active.getLine(r)?.translateToString(true) ?? ""));
+          if (seen.every((id) => id === "")) return;
+          if (seen.some((id) => id !== seen[0])) partial++; else ids.add(seen[0]);
+        };
+        let acked = 0, received = 0;
+        const writer = createSyncFrameWriter({ write: (bytes, written) => term.write(bytes, written) });
+        await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+        const base = paints;
+        const sent = await deliver(frameStream(Math.round(SYNC_FPS * SYNC_MS / 1000)), SYNC_MS, (chunk) => {
+          received += chunk.length;
+          const done = () => { acked += chunk.length; };
+          if (viaWriter) writer.push(chunk, done); else term.write(chunk, done);
+        });
+        const out = { gpu, renderer, viaWriter, paints: paints - base, distinctFrames: ids.size, chunks: sent.chunks, chunksEndingMidFrame: sent.midFrame };
+        await wait(1300);
+        out.paintsAfterAnother1p3s = paints - base;
+        out.partialPaints = partial;
+        out.received = received;
+        out.acked = acked;
+        writer.discard();
+        term.dispose();
+        host.remove();
+        return out;
+      }
+      /** `bytes` of text with a 2026 block every ~190 lines, through a 512 KiB credit window like the view's. */
+      async function floodRun({ viaWriter, bytes }) {
+        const { Terminal } = await import("@xterm/xterm");
+        const { createSyncFrameWriter } = await import("../src/lib/terminal/syncFrames.ts");
+        const host = syncHost();
+        const term = new Terminal({ cols: SYNC_COLS, rows: SYNC_ROWS, scrollback: 1000, ...SESSION_LIKE });
+        term.open(host);
+        const line = (i) => `\u001b[3${1 + (i % 6)}m${String(i).padStart(8, "0")} ${"flood ".repeat(12)}\u001b[0m\r\n`;
+        let base = "";
+        for (let i = 0; base.length < 1_000_003; i++) base += i % 190 === 0 ? `\u001b[?2026h\u001b[H${line(i)}${line(i + 1)}\u001b[?2026l` : line(i);
+        const period = new TextEncoder().encode(base);
+        const CHUNK = 64 * 1024, WINDOW = 512 * 1024;
+        const writer = createSyncFrameWriter({ write: (b, w) => term.write(b, w) });
+        let inflight = 0, offset = 0, sent = 0, wake = null, acked = 0;
+        const t0 = performance.now();
+        while (sent < bytes) {
+          if (inflight + CHUNK > WINDOW) { await new Promise((resolve) => { wake = resolve; }); continue; }
+          const chunk = new Uint8Array(Math.min(CHUNK, bytes - sent));
+          for (let filled = 0; filled < chunk.length;) {
+            const part = period.subarray(offset, Math.min(period.length, offset + chunk.length - filled));
+            chunk.set(part, filled);
+            filled += part.length;
+            offset = (offset + part.length) % period.length;
+          }
+          sent += chunk.length;
+          inflight += chunk.length;
+          const done = () => { inflight -= chunk.length; acked += chunk.length; if (wake) { const w = wake; wake = null; w(); } };
+          if (viaWriter) writer.push(chunk, done); else term.write(chunk, done);
+        }
+        writer.flush();
+        while (acked < sent) await new Promise((resolve) => { wake = resolve; setTimeout(resolve, 50); });
+        const ms = performance.now() - t0;
+        term.dispose();
+        host.remove();
+        return { viaWriter, ms, mibPerS: bytes / 1048576 / (ms / 1000) };
+      }
+      /** Time from a one-byte write to the paint that shows it, nothing else in flight. */
+      async function echoRun({ viaWriter, n }) {
+        const { Terminal } = await import("@xterm/xterm");
+        const { createSyncFrameWriter } = await import("../src/lib/terminal/syncFrames.ts");
+        const host = syncHost();
+        const term = new Terminal({ cols: SYNC_COLS, rows: SYNC_ROWS, ...SESSION_LIKE });
+        term.open(host);
+        const writer = createSyncFrameWriter({ write: (b, w) => term.write(b, w) });
+        const times = [];
+        for (let i = 0; i < n; i++) {
+          const t = performance.now();
+          const shown = new Promise((resolve) => { const d = term.onRender(() => { d.dispose(); resolve(performance.now() - t); }); });
+          const chunk = new TextEncoder().encode("k");
+          if (viaWriter) writer.push(chunk, () => {}); else term.write(chunk);
+          times.push(await shown);
+          await wait(20);
+        }
+        term.dispose();
+        host.remove();
+        times.sort((a, b) => a - b);
+        return { viaWriter, p50: times[Math.floor(n / 2)], p95: times[Math.floor(n * 0.95)], max: times.at(-1) };
+      }
+      async function runSync() {
+        const { results, check, stopped } = createChecks();
+        const numbers = { arms: [] };
+        try {
+          check("this browser can create a WebGL2 context (the WebGL arms below need one)", () => !!document.createElement("canvas").getContext("webgl2"));
+          for (const gpu of [false, true]) {
+            const before = await syncRun({ gpu, viaWriter: false });
+            const after = await syncRun({ gpu, viaWriter: true });
+            numbers.arms.push(before, after);
+            const tag = `${gpu ? "WebGL" : "DOM"} renderer`;
+            check(`${tag}: the arms ran on that renderer`, () => before.renderer === (gpu ? "webgl" : "dom") && after.renderer === before.renderer);
+            check(`${tag}: chunks end inside a block, which is the premise (${after.chunksEndingMidFrame}/${after.chunks})`, () => after.chunksEndingMidFrame > after.chunks / 2);
+            // The direct arm's count (0 on Chrome, 0 to 10 on WebKit, against ~120)
+            // is reported in the verdict's diagnostics, not asserted: it is
+            // xterm's bug, and a fixed xterm would make it converge on this one.
+            check(`${tag}: through the writer it paints at the render rate (${after.paints} paints, ${after.distinctFrames} distinct frames)`, () => after.paints >= 40 && after.distinctFrames >= 40);
+            check(`${tag}: no half-drawn frame is ever painted (${before.partialPaints} direct, ${after.partialPaints} through the writer)`, () => before.partialPaints === 0 && after.partialPaints === 0);
+            check(`${tag}: every byte received is acknowledged`, () => after.acked === after.received && before.acked === before.received);
+          }
+          // The real session on its DOM renderer: its output reaches xterm through the writer.
+          interfaceStore.setTerminalGpu(false);
+          setTerminalSessionLimit(SESSION_LIMIT + 8);
+          await wait();
+          const spawnedBefore = report.spawned;
+          button("New Shell session").click();
+          const spawnDeadline = performance.now() + 3000;
+          while (performance.now() < spawnDeadline && report.spawned === spawnedBefore) await wait(20);
+          const id = `fixture-${report.spawned}`;
+          await wait(700);
+          // Focused, as a session being typed into is: its cursor blinks and asks for redraws.
+          visible("textarea.xterm-helper-textarea").at(-1)?.focus();
+          const rowsNow = () => { const rows = visible(".xterm-rows").at(-1); return rows ? [...rows.children].map((row) => row.textContent ?? "") : []; };
+          const ackMark = acks.length;
+          const ids = new Set();
+          let partial = 0, samples = 0, running = true;
+          const sample = () => {
+            if (!running) return;
+            const matched = frameIdsOf(rowsNow()).filter((x) => x !== "");
+            if (matched.length) { samples++; if (new Set(matched).size > 1) partial++; else ids.add(matched[0]); }
+            requestAnimationFrame(sample);
+          };
+          requestAnimationFrame(sample);
+          let pushed = 0;
+          // A frame that fits the session's 16 x 54 grid, so nothing scrolls or wraps.
+          const session = await deliver(frameStream(Math.round(SYNC_FPS * SYNC_MS / 1000), 12, 30), SYNC_MS, (chunk) => {
+            pushed += chunk.length;
+            // The host sends messages of at most 64 KiB.
+            for (let at = 0; at < chunk.length; at += 65536) pushOutput(id, chunk.subarray(at, at + 65536));
+          });
+          const distinct = ids.size;
+          running = false;
+          await wait(400);
+          const repaid = acks.slice(ackMark).filter((row) => row.sessionId === id).reduce((sum, row) => sum + row.bytes, 0);
+          numbers.session = { id, distinctFrames: distinct, samples, partial, chunks: session.chunks, pushed, repaid };
+          check(`the real session (DOM renderer): continuous frames in mid-frame chunks reach the screen at the render rate (${distinct} distinct frames in 2 s)`, () => distinct >= 40);
+          check("the real session never shows a half-drawn frame", () => samples > 20 && partial === 0);
+          check(`the real session acknowledges every byte of the frames (${repaid}/${pushed})`, () => repaid === pushed);
+          check("no runtime errors", () => report.errors.length === 0);
+          if (params.has("syncbench")) {
+            const size = Number(params.get("syncbench")) * 1024 * 1024;
+            numbers.flood = { direct: [], writer: [] };
+            for (let i = 0; i < 6; i++) {
+              // Alternate which arm goes first, so a warming machine does not favour one.
+              for (const viaWriter of i % 2 ? [true, false] : [false, true]) numbers.flood[viaWriter ? "writer" : "direct"].push(await floodRun({ viaWriter, bytes: size }));
+            }
+            numbers.echo = { direct: await echoRun({ viaWriter: false, n: 40 }), writer: await echoRun({ viaWriter: true, n: 40 }) };
+          }
+        } catch (error) {
+          stopped(error);
+        }
+        report.sync = results;
+        report.syncNumbers = numbers;
+        showReport();
+        return { results, numbers };
+      }
+
       document.querySelector("#checks").onclick = async (event) => { event.currentTarget.disabled = true; await runChecks(); };
       document.querySelector("#stress").onclick = async (event) => { event.currentTarget.disabled = true; await runStress(); };
       document.querySelector("#checks").disabled = false;
@@ -1127,9 +1367,10 @@
         await wait(600);
         const checks = await runChecks();
         const stress = checks.every((row) => row.pass) ? await runStress() : [];
-        const bypass = stress.length && stress.every((row) => row.pass) ? await runBypass() : [];
-        const results = [...checks, ...stress, ...bypass];
-        document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors: report.errors }));
+        const sync = stress.length && stress.every((row) => row.pass) ? await runSync() : { results: [], numbers: {} };
+        const bypass = sync.results.length && sync.results.every((row) => row.pass) ? await runBypass() : [];
+        const results = [...checks, ...stress, ...sync.results, ...bypass];
+        document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors: report.errors, diagnostics: JSON.stringify(sync.numbers) }));
         if (params.has("report")) await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });
       }
     </script>

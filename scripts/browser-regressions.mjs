@@ -18,12 +18,14 @@ export const BROWSER_HARNESSES = Object.freeze(["diagnostics", "pull-requests", 
  * except `tasks`, which drives the whole board — each editor, sheet, view and
  * route guard — through real waits, and already used ~56 of its 60 seconds on
  * an idle host. `tab-switch` mounts the whole App and makes ~80 settled waits,
- * which the WebKit runner's clamped timers stretch past a minute. A page that
+ * which the WebKit runner's clamped timers stretch past a minute. `terminal`
+ * feeds real xterm instances two seconds of frames in each of four arms (plus
+ * the real session), which took a cold Chrome run to 59 of its 60 seconds. A page that
  * is long by design gets its own number here; the rest keep the minute, so a
  * hang anywhere else is still caught as fast.
  */
 export const DEFAULT_DEADLINE_SECONDS = 60;
-export const HARNESS_DEADLINE_SECONDS = Object.freeze(/** @type {Record<string, number>} */ ({ tasks: 150, "tab-switch": 120 }));
+export const HARNESS_DEADLINE_SECONDS = Object.freeze(/** @type {Record<string, number>} */ ({ tasks: 150, "tab-switch": 120, terminal: 120 }));
 
 /** @param {string} harness */
 export function harnessDeadlineSeconds(harness) {
