@@ -593,6 +593,19 @@
             check("a hidden session is not re-attached while it is hidden", () => target.dataset.renderer === "reset" && !target.querySelector("canvas"));
             await showAndProbe(); await wait(100);
             check("showing it again re-attaches", () => target.dataset.renderer === "webgl" && !!glCanvas(target));
+            // The engine evicts the context drawn least recently, a hidden
+            // session's held one: that ends the hold, it is not a counted loss.
+            const graceBefore = gpuPolicy.hideGraceMs;
+            gpuPolicy.hideGraceMs = 3000;
+            button("Hide the terminal dock").click(); await wait(100);
+            const heldCanvas = glCanvas(target);
+            check("a hidden session holds its context through the hold", () => !!heldCanvas && target.dataset.renderer === "webgl");
+            heldCanvas.getContext("webgl2").getExtension("WEBGL_lose_context").loseContext();
+            await wait(100);
+            check("losing a held context ends the hold quietly, without a GPU note", () => target.dataset.renderer === "dom" && !target.querySelector("canvas"));
+            await showAndProbe(); await wait(100);
+            check("after a held loss the next show re-attaches", () => target.dataset.renderer === "webgl" && !!glCanvas(target) && gpuNote() === "");
+            gpuPolicy.hideGraceMs = graceBefore;
             await loseNow();
             check("a loss past the budget is final, and the DOM draws the rows", () => target.dataset.renderer === "lost" && !target.querySelector("canvas") && !!domText(target));
             check("the final note says so, without promising a retry", () => /^Drawing without GPU$/.test(gpuNote()));

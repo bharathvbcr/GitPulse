@@ -458,9 +458,10 @@ describe("a loss is bounded, not final", () => {
     const slots = createGpuSlots();
     const s = session(page, slots);
     s.renderer.sync(true);
-    s.renderer.sync(false);
+    // Lost on screen (a counted loss), then hidden before the delay passes.
     page.forceLose(s.made[0].canvas);
     expect(s.renderer.state()).toBe("reset");
+    s.renderer.sync(false);
     expect(vi.getTimerCount()).toBe(0);
     vi.advanceTimersByTime(GPU_RECOVER_DELAY_MS);
     expect(s.made).toHaveLength(1);
@@ -486,12 +487,42 @@ describe("a loss is bounded, not final", () => {
     s.renderer.sync(true);
     s.renderer.sync(false);
     page.forceLose(s.made[0].canvas);
-    expect(s.renderer.state()).toBe("reset");
+    // A held context is only warmth: losing it is the hold ending early, not
+    // a fault on a session anyone is looking at.
+    expect(s.renderer.state()).toBe("dom");
     expect(slots.held()).toBe(0);
     expect(s.made[0].disposed).toBe(1);
     vi.advanceTimersByTime(GPU_HIDE_GRACE_MS * 2);
     expect(s.made[0].disposed).toBe(1);
     expect(slots.held()).toBe(0);
+    expect(s.renderer.sync(true)).toBe("webgl");
+  });
+
+  it("evictions of a held hidden context never count against the loss budget", () => {
+    // Both engines evict the context drawn least recently, which is a hidden
+    // session's held one; that must not strand the session on the DOM.
+    for (const engine of ["chromium", "webkit"] as const) {
+      const page = fakePage(engine);
+      const slots = createGpuSlots();
+      const s = session(page, slots);
+      for (let round = 0; round < GPU_LOSS_BUDGET * 4; round += 1) {
+        expect(s.renderer.sync(true), `${engine} show ${round}`).toBe("webgl");
+        s.renderer.sync(false);
+        page.forceLose(s.current()!.canvas);
+        expect(s.renderer.state(), `${engine} held loss ${round}`).toBe("dom");
+        expect(slots.held()).toBe(0);
+      }
+      expect(s.renderer.sync(true)).toBe("webgl");
+      // An on-screen loss still counts: the budget is untouched by the holds.
+      for (let loss = 1; loss <= GPU_LOSS_BUDGET; loss += 1) {
+        page.forceLose(s.current()!.canvas);
+        expect(s.renderer.state(), `${engine} on-screen loss ${loss}`).toBe("reset");
+        vi.advanceTimersByTime(GPU_RECOVER_DELAY_MS);
+      }
+      page.forceLose(s.current()!.canvas);
+      expect(s.renderer.state()).toBe("lost");
+      s.renderer.dispose();
+    }
   });
 
   it("a GPU reset that takes every context back leaves every on-screen session drawing and recovering", () => {
