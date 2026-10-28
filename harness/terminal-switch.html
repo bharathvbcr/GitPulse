@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>GitPulse terminal switch measurement</title></head>
+  <body style="margin:0;background:#141a29">
+    <button id="checks" disabled style="position:fixed;bottom:8px;right:8px;z-index:100">Run switch measurement</button>
+    <pre id="result" style="position:fixed;bottom:40px;right:8px;max-height:30vh;overflow:auto;font:11px monospace;background:#141a29;color:#e9edf8;z-index:100"></pre>
+    <div id="host" style="position:absolute;left:0;top:0;width:1100px;height:720px"></div>
+    <script type="module">
+      import { createChecks, CheckFailed } from "./checks.ts";
+      import { run } from "./switchBench.ts";
+
+      const params = new URL(location.href).searchParams;
+      const trials = Number(params.get("trials") ?? 15);
+      const errors = [];
+      addEventListener("error", (event) => errors.push(event.message));
+      addEventListener("unhandledrejection", (event) => errors.push(String(event.reason)));
+
+      const checksButton = document.querySelector("#checks");
+      checksButton.disabled = false;
+      checksButton.onclick = async () => {
+        checksButton.disabled = true;
+        const { results, check, stopped } = createChecks();
+        let rows = [];
+        const finish = () => {
+          const payload = { results, errors, diagnostics: JSON.stringify(rows) };
+          document.querySelector("#result").textContent = JSON.stringify(rows.filter((row) => row.kind !== "trial"), null, 1);
+          document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify(payload));
+          const reportPath = params.get("report");
+          if (reportPath?.startsWith("/__gp_result/")) return fetch(reportPath, { method: "POST", body: document.documentElement.outerHTML });
+        };
+        try {
+          check("this browser can create a WebGL2 context", () => !!document.createElement("canvas").getContext("webgl2"));
+          rows = await run(document.querySelector("#host"), trials);
+          const timed = rows.filter((row) => row.kind === "trial");
+          // The arms are what they claim to be, or the numbers mean nothing.
+          check("a held trial kept its context and canvas through the hide",
+            () => timed.filter((row) => row.arm === "held").every((row) => row.hiddenState === "webgl" && row.sameCanvas));
+          check("a fresh trial released its context on the hide and drew on a new canvas",
+            () => timed.filter((row) => row.arm === "fresh").every((row) => row.hiddenState === "dom" && !row.sameCanvas));
+          check("every timed show reached a WebGL draw", () => timed.every((row) => Number.isFinite(row.firstDrawMs)));
+          for (const row of rows.filter((row) => row.kind === "painted")) {
+            check(`the first frame after a ${row.arm} show is not blank`, () => row.painted);
+          }
+          check("the atlas pages were readable", () => rows.some((row) => row.kind === "memory" && row.atlasPages > 0));
+          check("no unhandled runtime errors", () => errors.length === 0);
+          checksButton.textContent = "done";
+        } catch (error) {
+          stopped(error);
+          if (!(error instanceof CheckFailed)) console.error(error);
+        } finally {
+          await finish();
+        }
+      };
+      if (params.get("check") === "1") checksButton.click();
+    </script>
+  </body>
+</html>

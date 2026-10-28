@@ -21,15 +21,10 @@
  * `GLASS_XTERM=<dir holding @xterm/xterm and @xterm/addon-webgl>` runs the page
  * against that build without touching package.json.
  */
-import { execFile, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createServer } from "vite";
-import { chromeBinary, chromeLaunch } from "./browser-regressions.mjs";
+import { runHarnessPage } from "./harness-page-runner.mjs";
 
 const PAGE = "/harness/terminal-glass.html";
 
@@ -62,101 +57,28 @@ export function summarize(rows) {
 
 async function main() {
   const [engine = "chrome", query = "", seconds = "400"] = process.argv.slice(2);
-  if (engine !== "chrome" && engine !== "webkit") throw new Error("engine is chrome or webkit");
-  if (engine === "webkit" && process.platform !== "darwin") throw new Error("The WebKit runner requires macOS");
-  const deadline = Number(seconds);
-  const profile = await mkdtemp(path.join(tmpdir(), "gitpulse-glass-"));
-  const reportPath = `/__gp_result/${randomUUID()}`;
-  /** @type {import('node:child_process').ChildProcess | undefined} */
-  let browser;
-  /** @type {ReturnType<typeof setTimeout> | undefined} */
-  let timer;
-  /** @type {(html: string) => void} */
-  let deliver = () => {};
-  const verdict = new Promise((resolve, reject) => {
-    deliver = resolve;
-    timer = setTimeout(() => reject(new Error(`no verdict in ${deadline}s`)), deadline * 1000);
-  });
-  verdict.catch(() => {});
-
-  /** @type {import('vite').Plugin} */
-  const receiver = {
-    name: "glass-verdict",
-    configureServer(server) {
-      server.middlewares.use(reportPath, (request, response) => {
-        let html = "";
-        request.setEncoding("utf8");
-        request.on("data", (chunk) => { html += chunk; });
-        request.on("end", () => { response.end("ok"); deliver(html); });
-      });
-    },
-  };
-  const xterm = process.env.GLASS_XTERM ? path.resolve(process.env.GLASS_XTERM, "@xterm") : null;
-  if (xterm) {
+  const xtermDir = process.env.GLASS_XTERM ?? null;
+  if (xtermDir) {
     for (const name of ["xterm", "addon-webgl"]) {
-      console.log(name, JSON.parse(readFileSync(path.join(xterm, name, "package.json"), "utf8")).version);
+      console.log(name, JSON.parse(readFileSync(path.resolve(xtermDir, "@xterm", name, "package.json"), "utf8")).version);
     }
   }
-  const server = await createServer({
-    resolve: xterm ? { alias: [{ find: /^@xterm\/(xterm|addon-webgl)(.*)$/, replacement: `${xterm}/$1$2` }] } : {},
-    plugins: [receiver],
-    cacheDir: path.join(profile, "vite-cache"),
-    optimizeDeps: { entries: ["harness/terminal-glass.html"] },
-    server: { host: "127.0.0.1", port: 0, strictPort: false, hmr: false },
+  const { results, errors, rows } = await runHarnessPage({
+    engine: /** @type {"chrome" | "webkit"} */ (engine), page: PAGE, query, deadlineSeconds: Number(seconds), xtermDir,
+    chromeArgs: (process.env.GLASS_CHROME_ARGS ?? "").split(" ").filter(Boolean),
   });
-  try {
-    await server.listen();
-    const address = server.httpServer?.address();
-    if (!address || typeof address === "string") throw new Error("Vite did not bind a test port");
-    const url = `http://127.0.0.1:${address.port}${PAGE}?check=1&report=${reportPath}&${query}`;
-    if (engine === "webkit") {
-      // The shipped Swift runner only opens pages in BROWSER_HARNESSES; this one
-      // is not, so run a copy whose allow-list also names it.
-      const source = fileURLToPath(new URL("./webkit-regressions.swift", import.meta.url));
-      const patched = readFileSync(source, "utf8").replace(/"\/harness\/mutation-routing\.html"\]/, `"/harness/mutation-routing.html", "${PAGE}"]`);
-      if (!patched.includes(PAGE)) throw new Error("webkit-regressions.swift no longer has the allow-list this script patches");
-      const copy = path.join(profile, "webkit-glass.swift");
-      writeFileSync(copy, patched);
-      browser = execFile("xcrun", ["swift", copy, url, String(deadline + 5)], { timeout: (deadline + 5) * 1000, maxBuffer: 1 << 20, killSignal: "SIGKILL" });
-    } else {
-      const launch = chromeLaunch(chromeBinary(), profile, url);
-      const extra = (process.env.GLASS_CHROME_ARGS ?? "").split(" ").filter(Boolean);
-      browser = spawn(launch.file, [...launch.args.slice(0, -1), ...extra, url], { stdio: "ignore", detached: true });
-    }
-    const html = await verdict;
-    const encoded = /data-gp-result="([^"]*)"/.exec(html)?.[1];
-    if (!encoded) throw new Error("the page did not report");
-    const result = JSON.parse(decodeURIComponent(encoded));
-    /** @type {Row[]} */
-    const rows = JSON.parse(result.diagnostics);
-    const failed = result.results.filter((/** @type {{ pass: boolean }} */ check) => !check.pass);
-    console.log(JSON.stringify({ engine, query, checks: result.results.length, failed, errors: result.errors }));
-    mkdirSync("tmp", { recursive: true });
-    for (const { strips, ...row } of rows) {
-      console.log(JSON.stringify(row));
-      (strips ?? []).forEach((strip, i) => {
-        const file = `tmp/strip-${engine}-${row.arm}-${row.seed}-${i}.png`;
-        writeFileSync(file, Buffer.from(strip.split(",")[1], "base64"));
-        console.log("wrote", file);
-      });
-    }
-    for (const line of summarize(rows)) console.log(line);
-  } finally {
-    clearTimeout(timer);
-    if (browser && browser.exitCode === null && browser.signalCode === null) {
-      const closed = new Promise((resolve) => browser?.once("close", resolve));
-      // Chrome was started as its own process group; its helpers go with it.
-      // The pid is the one this script spawned a moment ago, never a name match.
-      if (engine === "chrome" && browser.pid) {
-        try { process.kill(-browser.pid, "SIGKILL"); } catch { browser.kill("SIGKILL"); }
-      } else {
-        browser.kill("SIGKILL");
-      }
-      await closed;
-    }
-    await server.close();
-    await rm(profile, { recursive: true, force: true, maxRetries: 3 });
+  const failed = results.filter((check) => !check.pass);
+  console.log(JSON.stringify({ engine, query, checks: results.length, failed, errors }));
+  mkdirSync("tmp", { recursive: true });
+  for (const { strips, ...row } of /** @type {Row[]} */ (rows)) {
+    console.log(JSON.stringify(row));
+    (strips ?? []).forEach((strip, i) => {
+      const file = `tmp/strip-${engine}-${row.arm}-${row.seed}-${i}.png`;
+      writeFileSync(file, Buffer.from(strip.split(",")[1], "base64"));
+      console.log("wrote", file);
+    });
   }
+  for (const line of summarize(rows)) console.log(line);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
