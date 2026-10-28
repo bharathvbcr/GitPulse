@@ -85,7 +85,15 @@
 //!   variables the line itself assigned (`p=pk''ill; $p`, `${p}ill`,
 //!   `$a$b$c`, `export p=…`, an alias, `$'\x70kill'`) it is read as what they
 //!   come to (`Binds`, `bound_text`), and a variable assigned twice, from a
-//!   command, a loop or a glob is not known. A program that is not known is
+//!   command, a loop or a glob is not known. What a subshell `( … )`, a
+//!   command substitution, a stage of a pipeline, a command run with `&` or a
+//!   new shell (`bash -c`) binds is dropped when it ends, as the shell that ran
+//!   it never sees it (`Cx::walk`; the lexer numbers the groups); a pipeline
+//!   stage that opens a loop keeps its bindings to the loop's `done`. A
+//!   variable set by `read`, `printf -v`, `mapfile`, `getopts`, `let`, `(( ))`
+//!   or `declare -n` is not known, and `source FILE` makes everything bound
+//!   before it unknown; each of those marks the line when it spells a signal
+//!   tool, and none does otherwise. A program that is not known is
 //!   asked about only when a signal tool (`kill`, `pkill`, `killall`,
 //!   `killall5`, `pgrep`, `pidof`) is a whole word of its command, of a command
 //!   on the line that bound something, or (for a script piped into a shell, or
@@ -164,7 +172,8 @@
 //!   program; a program built by a command substitution where no signal tool is
 //!   a word of the command (`$(printf 'pk%s' ill)`); a link or script file the
 //!   line makes and then runs (`ln -s /usr/bin/pkill xpkill; ./xpkill`,
-//!   `printf … > s.sh; bash s.sh`); a pid file the line did not write; an
+//!   `printf … > s.sh; bash s.sh`), and a file it sources (`p=ls; . ./env.sh;
+//!   $p …`: the file may set `p`); a pid file the line did not write; an
 //!   alias, function or variable defined outside the line; other programs that
 //!   signal (`skill`, `snice`, `fuser -k`, `systemctl kill`, `killall5` outside
 //!   busybox, `python3`/`perl` doing `kill`).
@@ -231,6 +240,14 @@ struct Cmd {
     /// Redirection targets, kept for the substitutions in them.
     redirects: Vec<Word>,
     heredocs: Vec<Heredoc>,
+    /// The `( … )` groups the command is inside, outermost first, each by an
+    /// id that is unique within its script: a subshell, whose assignments the
+    /// shell that ran it never sees.
+    scope: Vec<u32>,
+    /// Run with `&`: a subshell of its own.
+    background: bool,
+    /// An arithmetic command `(( … ))`; its words are those of the expression.
+    arith: bool,
 }
 
 impl Cmd {
@@ -272,6 +289,9 @@ struct Lexer<'a> {
     budget: &'a mut Budget,
     env: EnvFn,
     pending: Vec<Pending>,
+    /// The `( … )` groups open at this point, and the next id to hand out.
+    groups: Vec<u32>,
+    next_group: u32,
 }
 
 fn parse_script(
@@ -291,6 +311,8 @@ fn parse_script(
         budget,
         env,
         pending: Vec::new(),
+        groups: Vec::new(),
+        next_group: 0,
     }
     .script()
 }
@@ -333,9 +355,30 @@ impl Lexer<'_> {
     fn flush_command(&mut self, cmd: &mut Cmd, pipe: &mut Pipeline) -> Result<(), String> {
         if !cmd.is_empty() {
             self.count_command()?;
-            pipe.push(std::mem::take(cmd));
+            let mut done = std::mem::take(cmd);
+            done.scope.clone_from(&self.groups);
+            pipe.push(done);
         }
         Ok(())
+    }
+
+    /// The `))` that closes the arithmetic command opened by `((` at
+    /// `self.i`, with the parentheses inside it balanced.
+    fn arith_end(&self) -> Option<usize> {
+        let mut depth = 0usize;
+        let mut k = self.i + 2;
+        while k < self.chars.len() {
+            match self.chars[k] {
+                '\\' => k += 1,
+                '(' => depth += 1,
+                ')' if depth > 0 => depth -= 1,
+                ')' if self.chars.get(k + 1) == Some(&')') => return Some(k),
+                ')' => return None,
+                _ => {}
+            }
+            k += 1;
+        }
+        None
     }
 
     fn flush_pipeline(
@@ -372,8 +415,17 @@ impl Lexer<'_> {
                     self.redirect(&mut cmd, done.len(), pipe.len())?;
                 }
                 '&' => {
-                    self.i += if self.at(1) == Some('&') { 2 } else { 1 };
+                    let background = self.at(1) != Some('&');
+                    self.i += if background { 1 } else { 2 };
+                    let before = done.len();
                     self.flush_pipeline(&mut cmd, &mut pipe, &mut done)?;
+                    if background && done.len() > before {
+                        if let Some(last) = done.last_mut() {
+                            for c in last {
+                                c.background = true;
+                            }
+                        }
+                    }
                 }
                 '|' if self.at(1) == Some('|') => {
                     self.i += 2;
@@ -383,9 +435,38 @@ impl Lexer<'_> {
                     self.i += if self.at(1) == Some('&') { 2 } else { 1 };
                     self.flush_command(&mut cmd, &mut pipe)?;
                 }
-                '(' | ')' => {
+                // `(( … ))`: an arithmetic command. Its expression is read as
+                // the words of one command (substitutions in it still run).
+                '(' if self.at(1) == Some('(') && cmd.is_empty() && self.arith_end().is_some() => {
+                    let end = self.arith_end().unwrap_or(self.i + 2);
+                    let inner = self.nested(self.i + 2, end)?;
+                    let mut arith = Cmd {
+                        arith: true,
+                        ..Cmd::default()
+                    };
+                    for c in inner.into_iter().flatten() {
+                        arith.words.extend(c.words);
+                        arith.redirects.extend(c.redirects);
+                        arith.heredocs.extend(c.heredocs);
+                    }
+                    self.i = end + 2;
+                    cmd = arith;
+                    self.flush_pipeline(&mut cmd, &mut pipe, &mut done)?;
+                }
+                // `( … )`: a subshell.
+                '(' => {
                     self.i += 1;
                     self.flush_pipeline(&mut cmd, &mut pipe, &mut done)?;
+                    if self.groups.len() >= MAX_DEPTH {
+                        return Err(format!("subshells nested more than {MAX_DEPTH} deep"));
+                    }
+                    self.groups.push(self.next_group);
+                    self.next_group += 1;
+                }
+                ')' => {
+                    self.i += 1;
+                    self.flush_pipeline(&mut cmd, &mut pipe, &mut done)?;
+                    self.groups.pop();
                 }
                 '#' => {
                     while self.peek().is_some_and(|c| c != '\n') {
@@ -812,6 +893,8 @@ fn substitutions(
         budget,
         env,
         pending: Vec::new(),
+        groups: Vec::new(),
+        next_group: 0,
     };
     while let Some(c) = lexer.peek() {
         match c {
@@ -1024,6 +1107,26 @@ const KEYWORDS: [&str; 11] = [
     "if", "then", "else", "elif", "while", "until", "do", "!", "time", "{", "}",
 ];
 const SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", "fish"];
+/// How many compound commands `cmd` opens (`while`, `until`, `for`, `select`,
+/// `if`, `case`, `{`) and closes (`done`, `fi`, `esac`, `}`): by its first word,
+/// which is where a shell reads a reserved word.
+fn compound_opens(cmd: &Cmd) -> usize {
+    usize::from(cmd.words.first().is_some_and(|w| {
+        matches!(
+            w.text.as_str(),
+            "while" | "until" | "for" | "select" | "if" | "case" | "{"
+        )
+    }))
+}
+
+fn compound_closes(cmd: &Cmd) -> usize {
+    usize::from(
+        cmd.words
+            .first()
+            .is_some_and(|w| matches!(w.text.as_str(), "done" | "fi" | "esac" | "}")),
+    )
+}
+
 /// Programs that send a signal to whatever they are given or select.
 const SIGNALLERS: [&str; 4] = ["kill", "pkill", "killall", "killall5"];
 
@@ -1090,6 +1193,10 @@ fn plan_with(command: &str, env: EnvFn, dialect: Dialect) -> Plan {
                 spelled: spelled_tools(command),
                 near: String::new(),
                 pipeline_tool: false,
+                group_path: Vec::new(),
+                group_frames: Vec::new(),
+                stage_frames: Vec::new(),
+                compound_depth: 0,
                 bound_tool: false,
                 binds: Binds::default(),
                 alias_stack: Vec::new(),
@@ -1117,6 +1224,14 @@ struct Cx<'a> {
     near: String,
     /// The pipeline being read is more than one command and spells a signal tool.
     pipeline_tool: bool,
+    /// The subshell groups the last command read was in, and what was bound
+    /// when each was entered (see [`Cx::walk`]).
+    group_path: Vec<u32>,
+    group_frames: Vec<Binds>,
+    /// What was bound before a pipeline stage that opened a compound command,
+    /// and the compound depth to return to for it to end.
+    stage_frames: Vec<(Binds, usize)>,
+    compound_depth: usize,
     /// A command that binds something (an assignment, an alias, a loop
     /// variable) spelled a signal tool: a program the line named later may be
     /// it.
@@ -1451,6 +1566,52 @@ fn var_refs(src: &str) -> Vec<String> {
         }
     }
     refs
+}
+
+/// The variables an arithmetic expression assigns: a name before `=`, `+=`,
+/// `-=`, `*=`, `/=`, `%=`, `<<=`, `>>=`, `&=`, `|=`, `^=` (not `==`), or next to
+/// `++` or `--`; an array subscript is skipped.
+fn arith_targets(src: &str) -> Vec<String> {
+    let chars: Vec<char> = src.chars().collect();
+    let mut targets = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if !(chars[i].is_ascii_alphabetic() || chars[i] == '_') {
+            i += 1;
+            continue;
+        }
+        let from = i;
+        while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+            i += 1;
+        }
+        let name: String = chars[from..i].iter().collect();
+        let mut j = i;
+        if chars.get(j) == Some(&'[') {
+            while j < chars.len() && chars[j] != ']' {
+                j += 1;
+            }
+            j += 1;
+        }
+        while chars.get(j) == Some(&' ') {
+            j += 1;
+        }
+        let rest: String = chars[j.min(chars.len())..].iter().take(3).collect();
+        let assigns = (rest.starts_with('=') && !rest.starts_with("=="))
+            || [
+                "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=", "++", "--",
+            ]
+            .iter()
+            .any(|op| rest.starts_with(op));
+        let preceded = from >= 2
+            && matches!(
+                chars[from - 2..from].iter().collect::<String>().as_str(),
+                "++" | "--"
+            );
+        if assigns || preceded {
+            targets.push(name);
+        }
+    }
+    targets
 }
 
 /// Whether `src` has a glob or brace the shell would expand: one outside quotes.
@@ -1861,7 +2022,19 @@ impl Cx<'_> {
         });
     }
 
+    /// Reads a script. What it binds stays bound after it, except what a
+    /// subshell binds (`( … )`, a stage of a pipeline, a command run with `&`):
+    /// the shell that ran it never sees that, so the bindings are put back as
+    /// they were when the subshell ends. A pipeline stage that opens a compound
+    /// command (`… | while read p; do …; done`) runs until the compound
+    /// closes, so what it binds (the loop variable) is visible to the body.
     fn walk(&mut self, script: &[Pipeline], depth: usize) {
+        let outer = (
+            std::mem::take(&mut self.group_path),
+            std::mem::take(&mut self.group_frames),
+            std::mem::take(&mut self.stage_frames),
+            std::mem::replace(&mut self.compound_depth, 0),
+        );
         for pipeline in script {
             // Whether the pipeline spells a signal tool, once: a script piped
             // into a shell is asked about when it does.
@@ -1871,11 +2044,82 @@ impl Cx<'_> {
                         .iter()
                         .any(|c| c.words.iter().any(|w| spelled_tools(&w.src).tool)));
             let saved = std::mem::replace(&mut self.pipeline_tool, tool);
+            let subshell = pipeline.len() > 1 || pipeline.iter().any(|c| c.background);
+            let before = subshell.then(|| self.binds.clone());
+            let depth_before = self.compound_depth;
             for (at, cmd) in pipeline.iter().enumerate() {
+                self.enter_groups(&cmd.scope);
                 self.command(pipeline, at, cmd, depth);
             }
             self.pipeline_tool = saved;
+            for cmd in pipeline {
+                self.compound_depth = (self.compound_depth + compound_opens(cmd))
+                    .saturating_sub(compound_closes(cmd));
+            }
+            if let Some(before) = before {
+                let runs_on = self.compound_depth > depth_before
+                    && pipeline.last().is_some_and(|c| compound_opens(c) > 0);
+                if runs_on {
+                    self.stage_frames.push((before, depth_before));
+                } else {
+                    self.binds = before;
+                }
+            }
+            while self
+                .stage_frames
+                .last()
+                .is_some_and(|(_, d)| self.compound_depth <= *d)
+            {
+                if let Some((before, _)) = self.stage_frames.pop() {
+                    self.binds = before;
+                }
+            }
         }
+        self.enter_groups(&[]);
+        while let Some((before, _)) = self.stage_frames.pop() {
+            self.binds = before;
+        }
+        self.group_path = outer.0;
+        self.group_frames = outer.1;
+        self.stage_frames = outer.2;
+        self.compound_depth = outer.3;
+    }
+
+    /// Moves from the subshell groups the last command was in to those of the
+    /// next: each one left puts back what was bound when it was entered, each
+    /// one entered remembers what is bound now.
+    fn enter_groups(&mut self, path: &[u32]) {
+        let common = self
+            .group_path
+            .iter()
+            .zip(path)
+            .take_while(|(a, b)| a == b)
+            .count();
+        while self.group_path.len() > common {
+            self.group_path.pop();
+            if let Some(before) = self.group_frames.pop() {
+                self.binds = before;
+            }
+        }
+        for id in &path[common..] {
+            self.group_frames.push(self.binds.clone());
+            self.group_path.push(*id);
+        }
+    }
+
+    /// [`Cx::walk`] for what a new shell or a substitution runs: nothing it
+    /// binds is visible to the shell that started it.
+    fn walk_scoped(&mut self, script: &[Pipeline], depth: usize) {
+        let before = self.binds.clone();
+        self.walk(script, depth);
+        self.binds = before;
+    }
+
+    /// [`Cx::script_text`] for a script a new shell runs.
+    fn shell_text(&mut self, text: &str, depth: usize) {
+        let before = self.binds.clone();
+        self.script_text(text, depth);
+        self.binds = before;
     }
 
     fn script_text(&mut self, text: &str, depth: usize) {
@@ -1911,14 +2155,15 @@ impl Cx<'_> {
     }
 
     fn command_in(&mut self, pipeline: &Pipeline, at: usize, cmd: &Cmd, depth: usize) {
+        // A substitution runs in a subshell: what it binds is not seen here.
         for w in cmd.words.iter().chain(&cmd.redirects) {
             for body in &w.subst {
-                self.walk(body, depth + 1);
+                self.walk_scoped(body, depth + 1);
             }
         }
         for h in &cmd.heredocs {
             for body in &h.nested {
-                self.walk(body, depth + 1);
+                self.walk_scoped(body, depth + 1);
             }
         }
         // An alias is read as what it stands for. One named for a signal tool
@@ -2063,7 +2308,7 @@ impl Cx<'_> {
                     }
                 }
                 for h in &cmd.heredocs {
-                    self.script_text(&h.body, depth);
+                    self.shell_text(&h.body, depth);
                 }
             }
             "source" | "." => {
@@ -2130,6 +2375,60 @@ impl Cx<'_> {
         {
             self.bound_tool = true;
         }
+        // A command that sets variables in ways this does not model: what it
+        // names is no longer known, and it marks the line when it spells a tool
+        // (here-strings and redirections included).
+        let setter_text = || {
+            let mut text = cmd
+                .words
+                .iter()
+                .chain(&cmd.redirects)
+                .map(|w| w.src.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            for h in &cmd.heredocs {
+                text.push(' ');
+                text.push_str(&h.body);
+            }
+            text
+        };
+        if cmd.arith {
+            // The words are the expression cut at its blanks: read it whole.
+            let expression = cmd
+                .words
+                .iter()
+                .map(|w| w.src.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            for name in arith_targets(&expression) {
+                self.unbind(&name);
+            }
+            if spelled_tools(&setter_text()).tool {
+                self.bound_tool = true;
+            }
+            return;
+        }
+        // `declare -n NAME[=REF]`: NAME is a name for REF, so both are unknown.
+        if matches!(first, "declare" | "typeset" | "local")
+            && cmd.words.iter().skip(1).any(|w| {
+                w.text.starts_with('-') && !w.text.starts_with("--") && w.text.contains('n')
+            })
+        {
+            for w in cmd
+                .words
+                .iter()
+                .skip(1)
+                .filter(|w| !w.text.starts_with('-'))
+            {
+                for name in w.text.split('=') {
+                    self.unbind(name);
+                }
+            }
+            if spelled_tools(&setter_text()).tool {
+                self.bound_tool = true;
+            }
+            return;
+        }
         if assignments_only {
             for w in cmd.words.iter().filter(|w| is_assignment(&w.text)) {
                 let Some(eq) = w.src.find('=') else { continue };
@@ -2186,13 +2485,81 @@ impl Cx<'_> {
             _ => {}
         }
         if let Ok(r) = resolve(&cmd.words, &self.binds) {
+            if matches!(
+                r.prog.as_str(),
+                "read" | "printf" | "getopts" | "let" | "mapfile" | "readarray"
+            ) && spelled_tools(&setter_text()).tool
+            {
+                self.bound_tool = true;
+            }
             match r.prog.as_str() {
-                "read" if at > 0 => {
-                    let names = r.args.iter().filter(|w| !w.text.starts_with('-'));
-                    for w in names {
-                        self.binds
-                            .pid_vars
-                            .insert(w.text.clone(), vec![(pipeline[0].clone(), at == 1)]);
+                // `read [-r] [-a ARRAY] [-d D] [-p P] … NAME…` (REPLY without one).
+                "read" => {
+                    let takes_arg = ["-d", "-i", "-n", "-N", "-p", "-t", "-u"];
+                    let mut names: Vec<String> = Vec::new();
+                    let mut k = 0;
+                    while let Some(w) = r.args.get(k) {
+                        k += 1;
+                        let t = w.text.as_str();
+                        if t == "-a" {
+                            names.extend(r.args.get(k).map(|n| n.text.clone()));
+                            k += 1;
+                        } else if takes_arg.contains(&t) {
+                            k += 1;
+                        } else if !t.starts_with('-') {
+                            names.push(t.to_string());
+                        }
+                    }
+                    if names.is_empty() {
+                        names.push("REPLY".to_string());
+                    }
+                    for name in &names {
+                        self.unbind(name);
+                        // `producer | while read p` runs the body in the stage
+                        // that read the pids.
+                        if at > 0 {
+                            self.binds
+                                .pid_vars
+                                .insert(name.clone(), vec![(pipeline[0].clone(), at == 1)]);
+                        }
+                    }
+                }
+                // `printf -v NAME FORMAT …`.
+                "printf" => {
+                    if let Some(at_v) = r.args.iter().position(|w| w.text == "-v") {
+                        if let Some(name) = r.args.get(at_v + 1) {
+                            self.unbind(&name.text);
+                        }
+                    }
+                }
+                // `getopts OPTSTRING NAME [ARGS]` sets NAME, OPTARG and OPTIND.
+                "getopts" => {
+                    for name in r
+                        .args
+                        .get(1)
+                        .map(|w| w.text.as_str())
+                        .into_iter()
+                        .chain(["OPTARG", "OPTIND"])
+                    {
+                        self.unbind(name);
+                    }
+                }
+                // `let EXPR…`: each word is an arithmetic expression.
+                "let" => {
+                    for w in r.args {
+                        for name in arith_targets(&w.src) {
+                            self.unbind(&name);
+                        }
+                    }
+                }
+                // A sourced file may set, change or unset anything: nothing
+                // bound before it is known after it.
+                "source" | "." => {
+                    for value in self.binds.values.values_mut() {
+                        *value = None;
+                    }
+                    for value in self.binds.aliases.values_mut() {
+                        *value = None;
                     }
                 }
                 "mapfile" | "readarray" => {
@@ -2217,6 +2584,7 @@ impl Cx<'_> {
                             break;
                         }
                     }
+                    self.unbind(&name);
                     if !producers.is_empty() {
                         self.binds.pid_vars.insert(name, producers);
                     }
@@ -2229,6 +2597,13 @@ impl Cx<'_> {
                 _ => {}
             }
         }
+    }
+
+    /// A variable something set that this does not model: unknown, and no
+    /// longer the pids of anything.
+    fn unbind(&mut self, name: &str) {
+        self.binds.values.insert(name.to_string(), None);
+        self.binds.pid_vars.remove(name);
     }
 
     /// A word that runs an alias the line defined is read as what the alias
@@ -2341,7 +2716,7 @@ impl Cx<'_> {
         } else {
             script.text.clone()
         };
-        self.script_text(&text, depth);
+        self.shell_text(&text, depth);
     }
 
     fn pgrep(&mut self, r: &Resolved<'_>, text: String, pkill: bool, bounded: bool) {
@@ -7121,8 +7496,155 @@ mod tests {
             "kill $(cat /tmp/pids)",
             "script -qc 'pkill -f claude' /dev/null",
             "flock /tmp/lock -c 'echo hi'",
+            // A sourced file may set anything: what was bound before it is
+            // not known after it, and nothing on the line spells a tool.
+            "p=ls; . ./env.sh; $p -f claude",
+            "p=ls; source ./env.sh; $p -f claude",
+            // A setter that does not spell a tool.
+            "getopts p x; $p -f claude",
+            "read p <<< ls; $p -f claude",
         ] {
             assert_eq!(procps_says(command, &facts), Out::Silent, "{command}");
+        }
+    }
+
+    /// Rework 2. Bindings made in a subshell, a command substitution, a stage of
+    /// a pipeline, a command run with `&` or a new shell are not seen by the
+    /// shell that ran them; the variables a `read`, `printf -v`, `mapfile`,
+    /// `getopts`, `let`, `(( ))`, `declare -n` or `source` set are not known.
+    #[test]
+    fn what_a_subshell_binds_is_not_seen_outside_it_and_other_setters_are_binding_commands() {
+        let facts = world();
+        // The parent's value stands.
+        for command in [
+            "p=pkill; (p=ls); $p -f gitpulse",
+            "p=pkill; p=ls | true; $p -f gitpulse",
+            "p=pkill; true | p=ls; $p -f gitpulse",
+            "p=pkill; p=ls & $p -f gitpulse",
+            "p=pkill; (p=ls) & $p -f gitpulse",
+            "p=pkill; x=$(p=ls); $p -f gitpulse",
+            "p=pkill; echo $(p=ls) `p=ls`; $p -f gitpulse",
+            "p=pkill; cat <(p=ls); $p -f gitpulse",
+            "p=pkill; bash -c 'p=ls'; $p -f gitpulse",
+            "p=pkill; (p=ls; (p=sleep)); $p -f gitpulse",
+            "p=pkill; ( ( p=ls ) ); $p -f gitpulse",
+            // A brace group is the same shell, and is not modelled as one:
+            // the earlier value stands.
+            "p=pkill; { p=ls; }; $p -f gitpulse",
+            // Inside the subshell its own bindings hold.
+            "(p=pkill; $p -f gitpulse)",
+            "(p=pkill; (p=ls); $p -f gitpulse)",
+            // The body of a loop fed by a pipeline runs in the stage that read
+            // the pids, so it sees the variable.
+            "pgrep -f gitpulse | while read p; do kill $p; done",
+            "pgrep -f gitpulse | while read -r p; do echo $p; kill $p; done",
+            // eval and an alias run in this shell.
+            "eval 'p=pkill'; $p -f gitpulse",
+            "alias setp='p=pkill'; setp; $p -f gitpulse",
+        ] {
+            assert_eq!(procps_says(command, &facts), Out::Deny, "{command}");
+        }
+        // Not known, with a tool spelled by the command that bound it.
+        for command in [
+            "(p=pkill); $p -f gitpulse",
+            "(p=pkill; p=ls) ; $p -f gitpulse",
+            "true | p=pkill; $p -f gitpulse",
+            "p=pkill & $p -f gitpulse",
+            "p=pkill; false && p=ls; $p -f gitpulse",
+            // Assigned twice in this shell, differently: not known.
+            "p=ls; eval 'p=pkill'; $p -f gitpulse",
+            "alias setp='p=pkill'; p=ls; setp; $p -f gitpulse",
+            "read p <<< pkill; $p -f gitpulse",
+            "read -r p <<< pkill; $p -f gitpulse",
+            "read -a p <<< pkill; $p -f gitpulse",
+            "read <<< pkill; $REPLY -f gitpulse",
+            "printf -v p pkill; $p -f gitpulse",
+            "printf -v p '%s' pkill; $p -f gitpulse",
+            "read p <<< pkill; (p=ls); $p -f gitpulse",
+            "mapfile -t p <<< pkill; $p -f gitpulse",
+            "readarray -t p <<< pkill; $p -f gitpulse",
+            "mapfile -t <<< pkill; $MAPFILE -f gitpulse",
+            "getopts p pkill; $p -f gitpulse",
+            "p=pkill; ((p=1)); $p -f gitpulse",
+            "p=pkill; (( p += 1 )); $p -f gitpulse",
+            "p=pkill; ((p++)); $p -f gitpulse",
+            "p=pkill; let p=1; $p -f gitpulse",
+            "p=pkill; let 'p+=1'; $p -f gitpulse",
+            "p=pkill; read -a p <<< ls; $p -f gitpulse",
+            "p=pkill; read -p prompt p <<< ls; $p -f gitpulse",
+            "p=pkill; printf -v p ls; $p -f gitpulse",
+            "p=pkill; declare -n p=q; $p -f gitpulse",
+            "p=pkill; typeset -n p; $p -f gitpulse",
+            "p=pkill; local -n p=q; $p -f gitpulse",
+            "p=pkill; . ./env.sh; $p -f gitpulse",
+            "p=pkill; source ./env.sh; $p -f gitpulse",
+            "alias k=pkill; . ./env.sh; k -f gitpulse",
+            "pgrep -f gitpulse | read p; kill $p",
+        ] {
+            assert_eq!(procps_says(command, &facts), Out::Ask, "{command}");
+        }
+        // A loop variable the body read, after the loop has ended, is not.
+        assert_eq!(
+            procps_says(
+                "pgrep -f gitpulse | while read p; do :; done; kill $p",
+                &facts
+            ),
+            Out::Ask
+        );
+    }
+
+    #[test]
+    fn the_lexer_numbers_the_subshell_groups_a_command_is_in() {
+        let mut budget = Budget { commands: 0 };
+        let script =
+            parse_script("a; (b; (c); d) e & (f)", 0, &mut budget, fake_env).expect("parses");
+        let scopes: Vec<(String, Vec<u32>, bool)> = script
+            .iter()
+            .flatten()
+            .map(|c| (c.words[0].text.clone(), c.scope.clone(), c.background))
+            .collect();
+        assert_eq!(
+            scopes,
+            vec![
+                ("a".to_string(), vec![], false),
+                ("b".to_string(), vec![0], false),
+                ("c".to_string(), vec![0, 1], false),
+                ("d".to_string(), vec![0], false),
+                ("e".to_string(), vec![], true),
+                ("f".to_string(), vec![2], false),
+            ]
+        );
+        // `(( ))` is an arithmetic command and not a group.
+        let script =
+            parse_script("((p=1)); ((x = $(echo 1)))", 0, &mut budget, fake_env).expect("parses");
+        let cmds: Vec<&Cmd> = script.iter().flatten().collect();
+        assert!(cmds.iter().all(|c| c.arith && c.scope.is_empty()));
+        assert!(!cmds[1].words.iter().all(|w| w.subst.is_empty()));
+        // A nesting no line needs is refused, not followed.
+        let deep = format!(
+            "{}x{}",
+            "( ".repeat(MAX_DEPTH + 1),
+            " )".repeat(MAX_DEPTH + 1)
+        );
+        assert!(parse_script(&deep, 0, &mut budget, fake_env).is_err());
+    }
+
+    #[test]
+    fn the_variables_an_arithmetic_expression_assigns_are_found() {
+        for (expr, want) in [
+            ("p=1", vec!["p"]),
+            ("p = 1", vec!["p"]),
+            ("p+=1", vec!["p"]),
+            ("p<<=2", vec!["p"]),
+            ("a[1]=2", vec!["a"]),
+            ("p++", vec!["p"]),
+            ("--p", vec!["p"]),
+            ("x=1, y=2", vec!["x", "y"]),
+            ("p==1", vec![]),
+            ("1+2", vec![]),
+            ("a<b", vec![]),
+        ] {
+            assert_eq!(arith_targets(expr), want, "{expr}");
         }
     }
 
