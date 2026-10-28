@@ -2175,3 +2175,30 @@ Shared reads (`src/lib/ipc/sharedReads.ts`, the map in `invoke.ts`) join an in-f
 | renderer answers (`prompt_submitted`) | 91.72 ms | 92.59 ms | **545,151** |
 
 The rate to compare between builds is `50000 / min`. The producer retries a full queue (millions of retries across the samples; it outruns the worker), so the figure is the worker's own rate, less the last 64 notices still queued when the span ends (under 0.2%). One machine's reading; there is no row from before the intake change, because the test calls `try_offer`, which that change introduced.
+
+## 2026-10-28: terminal smoothness, branch `term/smooth`
+
+Symptoms reported: a blank or flickering pane and laggy output, with GPU rendering on or off. The causes below were each reproduced before they were fixed, and each fix has a test that fails without it (`harness/terminal.html`, `gpuRenderer.lifecycle.test.ts`, `syncFrames` tests). None of these figures comes from the installed app; they are browser-harness and model figures.
+
+- **Synchronized-output stall (xterm.js #6071, still open in 6.1.0-beta.317).**
+  - Claude Code 2.1.312 sends `CSI ? 2026 $ p` once the terminal has answered its XTVERSION query, and uses mode 2026 when the answer says the mode is known. xterm.js answers both (`xterm.js(…)`, `CSI ? 2026 ; 2 $ y`). In a PTY that replied as xterm.js does, 50 keystrokes in Claude Code's prompt produced 57 begin/end pairs, one per redraw; in a PTY that replied to nothing, it produced none. Nothing was submitted to the model.
+  - Real session, 2 s of continuous frames. Chrome: 6–7 distinct frames before, 118 after. WebKit: 0 before, 58–118 after.
+  - Standalone arms: 0–2 paints before, 99–121 after, with GPU on and off.
+  - A 100 MiB escape-dense flood ran about 3% slower: median 60.4 → 58.5 MiB/s, n=6, Chrome.
+  - Idle echo was unchanged.
+- **Hidden-tab resize storm.** 100 seeded tab switches told the PTY 140 resizes before (11 × 6 grids) and 1 after. A drag resize told it 50 resizes before and 26 after. The frame median was unchanged, so no speedup is claimed.
+- **WebGL context churn (xterm.js #6068).** A model of 200 hide/show rounds × 11 sessions evicted 1385 contexts before and 0 after. Peak live contexts: 8. The release's own `loseContext()` is what prevents the eviction: the harness runs 40 hide/show cycles with the hold at 0 ms and the on-screen session stays on WebGL.
+- **The hold, measured** (`node scripts/terminal-switch-bench.mjs <chrome|webkit> 15`, three repeats per row, 15 shows per arm per repeat, arms alternated A B B A on one 120 × 40 terminal; load 12.5–12.8 on 18 cores, M5 Pro, macOS 27). "fresh" is the hold at 0 ms, the build before it. The gap is fresh minus held, show to first WebGL draw, per adjacent pair.
+
+  | engine | DPR | held, median of the 3 medians | fresh | gap, medians (range over all pairs) | fresh slower |
+  | --- | --- | --- | --- | --- | --- |
+  | WKWebView | 2 | 17 ms | 24 ms | 7, 7, 6 ms (4–9) | 45/45 |
+  | Chrome | 2 | 16.9 ms | 21.2 ms | 4.8, 4.3, 4.3 ms (3.4–6.5) | 45/45 |
+  | Chrome | 1 | 16.9 ms | 19.5 ms | 2.6, 2.7, 2.9 ms (2.2–3.6) | 45/45 |
+
+  Of the fresh arm's extra time, 3–7 ms is the synchronous context creation in `sync(true)`; the rest is rebuilding the glyph atlas. In every row both arms drew on the first animation frame after the show and presented on the same frame (show to the following frame: 50 ms median in both arms, rAF-quantized), so on this machine and this page the hold saves main-thread time, not a visible frame. A page with more work in the show's frame (the app also fits and re-renders on a show) is where the 4–7 ms would decide a frame; that was not measured. With one terminal on the page, a released context also drops xterm's shared glyph atlas, so the fresh arm is the worst case for the atlas.
+
+  **What a held context occupies**, read in the same run at a 1100 × 720 CSS-pixel pane: a drawing buffer of 10.5 MiB (WKWebView, DPR 2) or 9.3 MiB (Chrome, DPR 2), and one 512 × 512 atlas page, 1.0 MiB. The browser may keep more than one buffer per context; that is not visible from the page. At most 8 contexts exist, the on-screen ones included, so the hold can keep up to 7 hidden panes' buffers alive for 5 minutes, about 80 MiB at this pane size, scaling with pane area. The addon's ceiling is `min(32, MAX_TEXTURE_IMAGE_UNITS)` = 16 atlas pages of up to 4096² here; the agent-CLI screen used one.
+- **WebGL atlas corruption at DPR 2** (xterm.js #5847/#5883, not transparency). Corrupted runs were 2–5 of 5 on 0.19 in both engines, 0 of 5 on the 6.1.0-beta.316 / 0.20.0-beta.310 pair, and 0 of 5 when the atlas is cleared every 25 chunks. Repro: `node scripts/glass-atlas-repro.mjs webkit "arms=glass-a0&runs=5&frames=300&pace=3&ops=8"`. The branch pins 6.1.0-beta.317 / 0.20.0-beta.311, whose `lib/` matches .316 / .310 apart from the version string.
+- **ghostty-web 0.4.0 spike.** Not adopted. Against xterm's DOM renderer it used 2.3× the CPU and parsed floods 2–4× slower. WASM memory grew about 23× the bytes written. It paints in the middle of DEC 2026 frames, and about half of the xterm APIs GitPulse uses are missing. The raw data is kept, untracked, under `tmp/ghostty-spike-2026-10-28/` in the main checkout.
+- **The WebGL A/B win rule (§ 2026-10-14) is still owed.** It needs the installed app quit and an attended window, and its first blocker, the `allowTransparency` decision (ft-cc4be67b), is still open. The atlas repro above says the corruption that card was opened for is the atlas bug, not transparency.
