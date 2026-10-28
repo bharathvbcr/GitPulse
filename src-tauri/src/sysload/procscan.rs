@@ -351,6 +351,12 @@ pub(crate) trait ProcSource: Send {
     fn real_exe(&self, _pid: i32) -> Option<String> {
         None
     }
+    /// Whether [`ProcSource::real_exe`] is how this OS says what a process
+    /// runs, so that a process it cannot read is one whose identity is not
+    /// known. False where the exec path a scan carries is already the kernel's.
+    fn reports_real_exe(&self) -> bool {
+        false
+    }
     /// Whether the sender can signal every process, and so whether the signal
     /// table must read the arguments of every process, not only its own.
     fn is_root(&self) -> bool {
@@ -1338,6 +1344,12 @@ pub struct TableRow {
     /// which `argv[0]` cannot change. `None` when the OS would not say, and on
     /// macOS, where [`TableRow::exec`] already is the kernel's.
     pub real_exe: Option<String>,
+    /// The OS reports the executable the kernel runs (Linux) and this process's
+    /// could not be read, or is the dynamic loader a program was run through
+    /// (`ld.so PROGRAM`): what the process is cannot be told from its own
+    /// spelling (`argv[0]`), which it chooses. Never set where the OS does not
+    /// report it.
+    pub exe_unknown: bool,
     /// Every argument, `argv[0]` first. `None` when the OS refused it: another
     /// user's process when the sender is not root, or one that exited while
     /// the table was being read. On Linux an empty argument between two others
@@ -1391,6 +1403,16 @@ pub(crate) fn parse_status_uids(status: &str) -> Option<Creds> {
         effective: ids.next()??,
         saved: ids.next()??,
     })
+}
+
+/// Whether `path` is a dynamic loader (`ld-linux-aarch64.so.1`, `ld.so`,
+/// `ld-2.31.so`): a program run as `ld.so PROGRAM` has the loader as its
+/// executable and its own path only as an argument.
+pub(crate) fn is_dynamic_loader(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.starts_with("ld-linux")
+        || name.starts_with("ld.so")
+        || (name.starts_with("ld-") && name.contains(".so"))
 }
 
 /// The arguments in a `/proc/<pid>/cmdline`: NUL-terminated, an empty one
@@ -1467,11 +1489,19 @@ impl Scanner {
                         .as_ref()
                         .map_or(0, |a| a.iter().map(|s| s.len() + 1).sum());
                 }
+                // A binary replaced since the process started reads
+                // `/path/claude (deleted)`: it is still that program.
                 let real_exe = if readable {
-                    self.source.real_exe(f.pid)
+                    self.source.real_exe(f.pid).map(|exe| {
+                        exe.strip_suffix(" (deleted)")
+                            .map_or_else(|| exe.clone(), str::to_string)
+                    })
                 } else {
                     None
                 };
+                let exe_unknown = readable
+                    && self.source.reports_real_exe()
+                    && real_exe.as_deref().is_none_or(is_dynamic_loader);
                 // A process that is run from a GitPulse or agent executable
                 // under another `argv[0]` is still that: the kernel's path is
                 // the one it cannot change.
@@ -1493,6 +1523,7 @@ impl Scanner {
                     name: f.ident.name.clone(),
                     exec: f.ident.exec.clone(),
                     real_exe,
+                    exe_unknown,
                     argv,
                     agent,
                     hosted: self.tree_of.get(i).copied().flatten().is_some(),
@@ -2325,6 +2356,10 @@ mod os {
 
         fn real_exe(&self, pid: i32) -> Option<String> {
             exe_path(pid)
+        }
+
+        fn reports_real_exe(&self) -> bool {
+            true
         }
 
         fn is_root(&self) -> bool {
@@ -3619,6 +3654,9 @@ pub(crate) mod tests {
         creds: HashMap<i32, Creds>,
         exes: HashMap<i32, String>,
         root: bool,
+        /// Reports the executable the kernel runs (Linux), so an unreadable
+        /// one is an unknown identity.
+        reports_exe: bool,
     }
 
     impl ProcSource for WithCreds {
@@ -3639,6 +3677,9 @@ pub(crate) mod tests {
         }
         fn real_exe(&self, pid: i32) -> Option<String> {
             self.exes.get(&pid).cloned()
+        }
+        fn reports_real_exe(&self) -> bool {
+            self.reports_exe
         }
         fn is_root(&self) -> bool {
             self.root
@@ -3697,6 +3738,7 @@ pub(crate) mod tests {
             ]),
             exes: HashMap::new(),
             root: false,
+            reports_exe: false,
         }));
         let table = scan
             .table(|pid| Some(vec![format!("argv-of-{pid}")]))
@@ -3729,7 +3771,12 @@ pub(crate) mod tests {
         assert_eq!((table.rows[0].ruid, table.rows[0].suid), (None, None));
     }
 
-    fn root_source(rows: Vec<P>, root: bool, exes: HashMap<i32, String>) -> Scanner {
+    fn source_with(
+        rows: Vec<P>,
+        root: bool,
+        exes: HashMap<i32, String>,
+        reports_exe: bool,
+    ) -> Scanner {
         Scanner::new(Box::new(WithCreds {
             inner: Fixture {
                 facts: Arc::new(Mutex::new(facts_of(rows))),
@@ -3740,7 +3787,12 @@ pub(crate) mod tests {
             creds: HashMap::new(),
             exes,
             root,
+            reports_exe,
         }))
+    }
+
+    fn root_source(rows: Vec<P>, root: bool, exes: HashMap<i32, String>) -> Scanner {
+        source_with(rows, root, exes, false)
     }
 
     /// Class 4 of ft-1d9f44d5. A sender that is root can signal every process,
@@ -3840,5 +3892,83 @@ pub(crate) mod tests {
         // A blanked argument area is no arguments, not seventeen empty ones.
         assert!(split(&[0u8; 17]).is_empty());
         assert!(split(b"").is_empty());
+    }
+
+    /// A binary replaced since the process started reads `... (deleted)`: it is
+    /// still that program.
+    #[test]
+    fn a_deleted_executable_is_still_the_program_it_names() {
+        let rows = vec![p(80, 1, "/opt/other/otherprog")];
+        let exes = HashMap::from([(80, format!("{CLAUDE} (deleted)"))]);
+        let table = source_with(rows, false, exes, true)
+            .table(|pid| Some(vec![format!("argv-of-{pid}")]))
+            .expect("reads");
+        let row = &table.rows[0];
+        assert_eq!(row.real_exe.as_deref(), Some(CLAUDE));
+        assert_eq!(row.agent, Some(AgentKind::Claude));
+        assert!(!row.exe_unknown);
+    }
+
+    /// Where the OS reports the executable, a process whose own cannot be read,
+    /// or is the dynamic loader, is of unknown identity; where it does not
+    /// (macOS), none is.
+    #[test]
+    fn an_unreadable_executable_or_the_loader_is_an_unknown_identity_only_where_the_os_reports_it()
+    {
+        let rows = || {
+            vec![
+                p(81, 1, "/opt/other/unreadable"),
+                p(82, 1, "/lib/ld-linux-aarch64.so.1"),
+                p(83, 1, "/bin/sleep"),
+                P {
+                    uid: 1001,
+                    ..p(84, 1, "/usr/bin/foreign")
+                },
+            ]
+        };
+        let exes = HashMap::from([
+            (82, "/lib/ld-linux-aarch64.so.1".to_string()),
+            (83, "/bin/sleep".to_string()),
+        ]);
+        let argv = |pid: i32| Some(vec![format!("argv-of-{pid}")]);
+        let table = source_with(rows(), false, exes.clone(), true)
+            .table(argv)
+            .expect("reads");
+        let unknown: Vec<i32> = table
+            .rows
+            .iter()
+            .filter(|r| r.exe_unknown)
+            .map(|r| r.pid)
+            .collect();
+        assert_eq!(
+            unknown,
+            vec![81, 82],
+            "unreadable and the loader; a process the sender cannot read at all is not one"
+        );
+        let table = source_with(rows(), false, exes, false)
+            .table(argv)
+            .expect("reads");
+        assert!(table.rows.iter().all(|r| !r.exe_unknown));
+    }
+
+    #[test]
+    fn the_dynamic_loader_is_told_by_its_name() {
+        for loader in [
+            "/lib/ld-linux-aarch64.so.1",
+            "/lib64/ld-linux-x86-64.so.2",
+            "/usr/lib/ld.so",
+            "/lib/ld-2.31.so",
+            "ld-linux.so.3",
+        ] {
+            assert!(is_dynamic_loader(loader), "{loader}");
+        }
+        for other in [
+            "/bin/sleep",
+            "/usr/bin/ldd",
+            "/usr/bin/ld",
+            "/opt/old-linux",
+        ] {
+            assert!(!is_dynamic_loader(other), "{other}");
+        }
     }
 }

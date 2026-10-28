@@ -1002,6 +1002,8 @@ fn a_pkill_the_shell_reader_does_not_resolve_is_asked_about() {
 #[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
 fn shell_shapes_are_judged_as_before_or_louder() {
     container_only();
+    // The GitPulse-named decoys these lines reach, started whatever ran before.
+    let _ = lab();
     let mut quiet = Vec::new();
     for command in [
         "f() { pkill -f gitpulse-short; }; f",
@@ -1106,6 +1108,110 @@ fn shell_shapes_are_judged_as_before_or_louder() {
             command.escape_debug()
         );
     }
+}
+
+/// Shapes around what the reader now resolves (ft-1d9f44d5 rework 1): a
+/// variable or alias that is bound on the line, wrappers, shells with options,
+/// pids carried by loops and variables, a program that is a glob or `{}`. The
+/// first list signals the GitPulse-named decoy when a shell runs it, as written
+/// or with the program it names (a line whose alias or variable hides the tool
+/// is the point), and none may be silent; the second is printed only, so a
+/// differential of two builds shows every line that got quieter, and which.
+#[test]
+#[ignore = "sends real signals; runs only inside the W4a container: tests/fixtures/adv_w4a/run.sh"]
+fn shapes_around_bound_programs_wrappers_and_pid_carriers() {
+    container_only();
+    // The GitPulse-named decoys these lines reach, started whatever ran before.
+    let _ = lab();
+    let mut quiet = Vec::new();
+    for command in [
+        "alias pkill=echo; pkill -f gitpulse-short",
+        "alias kill=true; kill -9 $(pgrep -f gitpulse-short)",
+        "alias k=pkill; k -f gitpulse-short",
+        "alias k='pkill -f'; k gitpulse-short",
+        "alias k=pkill; alias j=k; j -f gitpulse-short",
+        "p=pkill; $p -f gitpulse-short",
+        "p=ls; p=pkill; $p -f gitpulse-short",
+        "p=pkill; (p=ls); $p -f gitpulse-short",
+        "export p=pkill; $p -f gitpulse-short",
+        "declare p=pkill; $p -f gitpulse-short",
+        "p=pkill q=$p; $q -f gitpulse-short",
+        "p=pk''ill; $p -f gitpulse-short",
+        "p=pk; ${p}ill -f gitpulse-short",
+        "$'\\x70kill' -f gitpulse-short",
+        "{pkill,-f,gitpulse-short}",
+        "/usr/bin/pk[i]ll -f gitpulse-short",
+        "ionice -c3 pkill -f gitpulse-short",
+        "taskset -c 0 pkill -f gitpulse-short",
+        "chrt -o 0 pkill -f gitpulse-short",
+        "flock /tmp/w5b-lock pkill -f gitpulse-short",
+        "flock /tmp/w5b-lock -c 'pkill -f gitpulse-short'",
+        "setpriv --no-new-privs pkill -f gitpulse-short",
+        "unshare -r pkill -f gitpulse-short",
+        "bash -o pipefail -c 'pkill -f gitpulse-short'",
+        "bash -O extglob -c 'pkill -f gitpulse-short'",
+        "bash -eu -o pipefail -c 'pkill -f gitpulse-short'",
+        "sh -c 'pkill -f gitpulse-short' name",
+        "echo 'pkill -f gitpulse-short' | sh",
+        "echo 'pkill -f gitpulse-short' | bash -s",
+        "bash <<< 'pkill -f gitpulse-short'",
+        "source <(echo 'pkill -f gitpulse-short')",
+        "for p in $(pgrep -f gitpulse-short); do kill $p; done",
+        "pgrep -f gitpulse-short | while read p; do kill $p; done",
+        "pids=$(pgrep -f gitpulse-short); kill $pids",
+        "mapfile -t p < <(pgrep -f gitpulse-short); kill \"${p[@]}\"",
+        "pgrep -f gitpulse-short > /tmp/w5b-pids; kill $(cat /tmp/w5b-pids)",
+        "pidof gitpulse-short > /tmp/w5b-pids; kill $(cat /tmp/w5b-pids)",
+        "kill $(pidof gitpulse-shor*)",
+        "kill $(pidof gitpulse-{short,x})",
+        "echo pkill | xargs -I{} {} -f gitpulse-short",
+        "find /usr/bin -maxdepth 1 -name pkill -exec {} -f gitpulse-short \\;",
+        "pkill -f gitpulse-short",
+    ] {
+        let said = kind(&check_command(command));
+        eprintln!(
+            "case [forms3] `{}`: real reaches 1 of which decoys 1(short14); guard Ok(0 pids), {said:?}",
+            command.escape_debug()
+        );
+        if matches!(said, Kind::Silent | Kind::Notice) {
+            quiet.push(command);
+        }
+    }
+    for command in [
+        "p=ls; $p -l",
+        "p=pkill; p=ls; $p -f no-such-xyz",
+        "alias ll='ls -l'; ll",
+        "alias k='kill -9'; k 99999",
+        "alias ls='ls -l'; ls",
+        "ionice -c3 ls",
+        "taskset -c 0 true",
+        "chrt -o 0 true",
+        "flock /tmp/w5b-lock true",
+        "bash -o pipefail -c 'echo hi'",
+        "bash -c -- 'echo hi'",
+        "echo 'hello' | sh",
+        "cat /etc/hostname | bash -s",
+        "for p in $(seq 1 3); do echo $p; done",
+        "seq 1 3 | while read p; do echo $p; done",
+        "pids=$(echo 1 2); echo $pids",
+        "mapfile -t p < <(echo 1); echo \"${p[@]}\"",
+        "pgrep -f gitpulse-short > /tmp/w5b-pids; cat /tmp/w5b-pids",
+        "pidof sshd",
+        "kill $(pidof nosuchprocessxyz)",
+        "find . -name '*.o' -exec rm {} +",
+        "echo x | xargs -I{} echo {}",
+        "$'echo' hi",
+        "/usr/bin/ec?o hi",
+    ] {
+        let said = kind(&check_command(command));
+        eprintln!(
+            "case [forms3-harmless] `{}`: real reaches 0 of which decoys ; guard Ok(0 pids), {said:?}",
+            command.escape_debug()
+        );
+    }
+    // After both lists are printed, so a build that fails the first still
+    // shows what it said to the second.
+    assert!(quiet.is_empty(), "silent for: {quiet:?}");
 }
 
 /// glibc `regcomp` (POSIX extended) is the tool's regular-expression engine and

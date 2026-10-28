@@ -56,26 +56,47 @@
 //!   asked about, not guessed at.
 //! * Patterns are evaluated with the `regex` crate and the tools use glibc's
 //!   `regcomp` (POSIX extended). A pattern it cannot compile is asked about. On
-//!   Linux the guard also asks about a pattern whose syntax the two read
-//!   differently (`\d`, `\w`, `\b`, `\<`, `\n`, `\1` and every other backslash
-//!   escape that is not of a metacharacter, a backslash or a collating symbol
-//!   in a bracket expression, an invalid `{`: `ere_uncertainty`), after
-//!   refusing it if what the guard could evaluate already reaches too much. It
-//!   matches `.` across a newline, and tries every subject in the readings
-//!   procps-ng 4.0.4 was observed to give it: control characters replaced
-//!   (newline by a space; in a UTF-8 locale the rest by `?`, in the C locale by
-//!   `.`), an empty argument between two others kept, a blanked command line a
-//!   single `?` (`Pattern`, `full_subjects`). Not modelled: bracket ranges
-//!   under a locale's collation order, locales other than `C` and UTF-8, and
-//!   procps or glibc releases other than the ones the differential ran
-//!   against. macOS reads patterns as it always did, so there `\d` is a digit
-//!   here and a literal `d` to `regcomp`.
-//! * A variable that is not `$HOME`, `$USER` or `$LOGNAME` is not expanded, so a
-//!   pattern or user built from one is asked about, and so is a program (or an
-//!   `eval`/`-c` script) named by one, but only when the line says `kill`
-//!   somewhere: a variable set on the line, in a word that says so. One set
-//!   outside the line is not seen. A pid list from `$PID` is one pid and is
-//!   left to the user's rules.
+//!   Linux the guard also asks, after refusing if what it could evaluate already
+//!   reaches too much, about a pattern whose syntax the two read differently
+//!   (`ere_uncertainty`): a backslash escape that is not of a metacharacter or
+//!   a backslash (`\d`, `\w`, `\b`, `\<`, `\n`, `\1`), a backslash in a bracket,
+//!   any POSIX class, equivalence class or collating symbol (`[[:alpha:]]`,
+//!   `[[=a=]]`, `[[.x.]]`: glibc's are the locale's, so `é`, `α` and `—` are
+//!   `[:alpha:]` or `[:punct:]` to it and not to the crate), an invalid `{`.
+//!   It also asks when `-i` meets a non-ASCII pattern, or a non-ASCII name or
+//!   command line it has not matched (glibc folds `ı` to `I`; the crate does
+//!   not), and when a command line holds bytes that are not UTF-8 and the
+//!   pattern can match a character it does not spell (`.`, a bracket): procps
+//!   counts those bytes one at a time (a surrogate as one) and the guard holds
+//!   them replaced, so it cannot reproduce the count. The guard matches `.`
+//!   across a newline, and tries every subject in the readings procps-ng 4.0.4
+//!   was observed to give it: control characters replaced (newline by a space;
+//!   in a UTF-8 locale the rest by `?`, in the C locale by `.`, and every
+//!   non-ASCII byte there by `?`), an empty argument between two others kept, a
+//!   blanked command line a single `?`, and the first 131071 bytes of a long
+//!   one (`Pattern`, `full_subjects`). Not modelled: bracket ranges under a
+//!   locale's collation order, locales other than `C` and UTF-8, and procps or
+//!   glibc releases other than the ones the differential ran against. macOS
+//!   reads patterns as it always did, so there `\d` is a digit here and a
+//!   literal `d` to `regcomp`.
+//! * A variable that is not `$HOME`, `$USER` or `$LOGNAME` is not expanded in an
+//!   argument, so a pattern or user built from one is asked about. A program, an
+//!   `eval` argument or a `-c` script is different: where it is built from
+//!   variables the line itself assigned (`p=pk''ill; $p`, `${p}ill`,
+//!   `$a$b$c`, `export p=…`, an alias, `$'\x70kill'`) it is read as what they
+//!   come to (`Binds`, `bound_text`), and a variable assigned twice, from a
+//!   command, a loop or a glob is not known. A program that is not known is
+//!   asked about only when a signal tool (`kill`, `pkill`, `killall`,
+//!   `killall5`, `pgrep`, `pidof`) is a whole word of its command, of a command
+//!   on the line that bound something, or (for a script piped into a shell, or
+//!   `{}` put in place by `xargs` or `find`) of its pipeline; a path, `skill`,
+//!   `--kill-after` and `KILL_AFTER=5` are not (`spelled_tools`). A shell given
+//!   `-c SCRIPT` through a variable has the script read. Pids in a variable or
+//!   a file a `pgrep` or `pidof` on the line filled (`for p in $(pgrep …)`,
+//!   `pgrep … | while read p`, `pids=$(…)`, `mapfile`, `> FILE` then
+//!   `$(cat FILE)`) are that command's set; a pid variable the line did not
+//!   fill, beside a `pgrep` or `pidof`, is asked about; otherwise `kill $PID`
+//!   is left to the user's rules.
 //! * Only this user's processes can be signalled, so only they are counted. A
 //!   sender that is root reaches every process, so the table reads every
 //!   process's arguments (up to 64 MiB of them) and counts them all; one it
@@ -107,26 +128,46 @@
 //!   dumpable. A process that runs as the user is counted whatever its other
 //!   ids say.
 //! * A process is a GitPulse process or an agent session by the executable the
-//!   kernel runs it from (`/proc/<pid>/exe` on Linux), as well as by the path
-//!   it was exec'd with, so a GitPulse binary run under another `argv[0]` is
-//!   still one. A word given to Linux `pidof` with a `/` in it is an
-//!   executable: the guard counts the processes running that file (the path as
-//!   written and as it resolves, symbolic links followed) and, as for a name,
-//!   those whose name is its last component. A hard link under another path is
-//!   not followed, and `pidof -x NAME` for a shell running a script named NAME
-//!   (it answers with the shell's pid) is not modelled.
-//! * Programs the shell reader asks about rather than reads: a `busybox` or
-//!   `toybox` applet of `pkill`, `killall` or `killall5` (their options are not
-//!   procps's), an `alias` defined on the line that names a signal command,
-//!   `find -exec`/`-execdir`/`-ok`/`-okdir` of a signal command, and `ssh` to
-//!   this machine (`localhost`, a loopback address, or a host built from a
-//!   variable) with a signal command in it.
-//! * Not read at all, and so silent: `ssh` to another host (its processes are
-//!   not on this machine); `parallel`, `watch`, `nsenter`, `su -c`,
-//!   `env -S`, `script -c`, `docker exec` and the like, whose arguments are a
-//!   command; an alias, function or variable defined outside the line; other
-//!   programs that signal (`skill`, `snice`, `fuser -k`, `systemctl kill`,
-//!   `killall5` outside busybox).
+//!   kernel runs it from (`/proc/<pid>/exe` on Linux, with ` (deleted)` taken
+//!   off: a binary replaced by an update), by the path it was exec'd with, by
+//!   the kernel's name for it (`comm`, which `argv[0]` does not change), and,
+//!   for a program run as `ld.so PROGRAM`, by `PROGRAM`. A process reached by
+//!   the command whose executable could not be read (not dumpable) or is the
+//!   loader is of unknown identity: if nothing refuses the command it is asked
+//!   about, never passed by the spelling the process chose. macOS does not
+//!   report an executable (its exec path is the kernel's), so none is unknown
+//!   there.
+//! * A word given to Linux `pidof` with a `/` in it is an executable: the guard
+//!   counts the processes running that file (the path as written and as it
+//!   resolves, symbolic links followed) and, as for a name, those whose name is
+//!   its last component. A glob or brace list there is asked about (the shell
+//!   expands it first). The real `pidof` does not follow a hard link or a path
+//!   relative to the shell's directory, so neither is modelled; `pidof -x NAME`
+//!   for a shell running a script named NAME (it answers with the shell's pid)
+//!   is not.
+//! * The shell reader looks through the wrappers in `resolve` (`sudo`, `env`,
+//!   `command`, `nohup`, `timeout`, `nice`, `ionice`, `taskset`, `chrt`,
+//!   `flock`, `setpriv`, `unshare`, `setsid`, `stdbuf`, `exec`, …), and
+//!   through `busybox`/`toybox`, whose `pkill`, `killall` and `killall5` read
+//!   their own options and are asked about. It reads the script of a shell
+//!   given options before `-c` (`-o pipefail`, `-ec`, `-lc`). It asks about: a
+//!   script piped into a shell, or `source <(…)`, on a pipeline that spells a
+//!   signal tool; a program that is `{}` (what `find -exec` or `xargs -I{}` puts
+//!   in place); a program that is a glob or brace list one of whose expansions
+//!   is a signal tool (`/usr/bin/pk[i]ll`, `{pkill,-f,x}`); `find -exec` of a
+//!   signal command; `ssh` to this machine (`localhost`, a loopback address, or
+//!   a host built from a variable) with a signal command in it.
+//! * Stated limits, silent today and pinned by `the_stated_limits_of_the_shell_
+//!   reader_are_pinned`: `ssh` to another host (its processes are not on this
+//!   machine); `parallel`, `watch`, `nsenter`, `su -c`, `env -S`, `script -c`,
+//!   `docker exec` and the like, whose arguments are a command for another
+//!   program; a program built by a command substitution where no signal tool is
+//!   a word of the command (`$(printf 'pk%s' ill)`); a link or script file the
+//!   line makes and then runs (`ln -s /usr/bin/pkill xpkill; ./xpkill`,
+//!   `printf … > s.sh; bash s.sh`); a pid file the line did not write; an
+//!   alias, function or variable defined outside the line; other programs that
+//!   signal (`skill`, `snice`, `fuser -k`, `systemctl kill`, `killall5` outside
+//!   busybox, `python3`/`perl` doing `kill`).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -134,7 +175,7 @@ use std::time::Duration;
 use regex::{Regex, RegexBuilder};
 
 use super::{decision, HookInput, HookOutput, PermissionDecision, PRE_TOOL_USE};
-use crate::sysload::procscan::{signal_table, TableRow};
+use crate::sysload::procscan::{is_dynamic_loader, signal_table, TableRow};
 
 /// The most processes one signal command may reach before it is refused.
 pub const MAX_MATCHES: usize = 25;
@@ -697,7 +738,8 @@ impl Lexer<'_> {
                 self.i = k;
             }
             Some('\'') if !in_quotes => {
-                // `$'…'`: the text between the quotes, escapes left as written.
+                // `$'…'`: the text between the quotes, escapes decoded (`\x70`,
+                // `\153`, `\n`), so `$'\x70kill'` is the program `pkill`.
                 let from = self.i + 2;
                 let mut k = from;
                 while k < self.chars.len() && self.chars[k] != '\'' {
@@ -709,7 +751,7 @@ impl Lexer<'_> {
                 if k >= self.chars.len() {
                     return Err("an unterminated `$'`".into());
                 }
-                w.text.push_str(&self.slice(from, k));
+                w.text.push_str(&ansi_c_decode(&self.slice(from, k)));
                 self.i = k + 1;
             }
             Some('"') if !in_quotes => {
@@ -1045,7 +1087,12 @@ fn plan_with(command: &str, env: EnvFn, dialect: Dialect) -> Plan {
                 budget: &mut budget,
                 env,
                 dialect,
-                mentions_kill: contains_kill(command),
+                spelled: spelled_tools(command),
+                near: String::new(),
+                pipeline_tool: false,
+                bound_tool: false,
+                binds: Binds::default(),
+                alias_stack: Vec::new(),
             };
             cx.walk(&script, 0);
         }
@@ -1064,10 +1111,20 @@ struct Cx<'a> {
     budget: &'a mut Budget,
     env: EnvFn,
     dialect: Dialect,
-    /// The line, nested scripts included, says `kill` somewhere. A program
-    /// word the guard cannot resolve is asked about only then: a variable that
-    /// stands for `pkill` was set on this line, in a word that says so.
-    mentions_kill: bool,
+    /// What the line spells out as words, for the pid lists a `kill` is given.
+    spelled: Spelled,
+    /// What the command being read spells out (see [`Cx::command`]).
+    near: String,
+    /// The pipeline being read is more than one command and spells a signal tool.
+    pipeline_tool: bool,
+    /// A command that binds something (an assignment, an alias, a loop
+    /// variable) spelled a signal tool: a program the line named later may be
+    /// it.
+    bound_tool: bool,
+    /// What the line has bound so far.
+    binds: Binds,
+    /// The aliases being expanded, so one that names itself ends.
+    alias_stack: Vec<String>,
 }
 
 /// The command a wrapper (`sudo`, `env`, `nohup` …) runs.
@@ -1089,6 +1146,392 @@ enum Unresolved {
     /// The program word is built from a variable or a substitution, so which
     /// program runs is known only when the shell runs it.
     Dynamic,
+    /// The program word is a glob or a brace list the shell expands, and an
+    /// expansion of it is the name of a program that signals.
+    MaySignal,
+}
+
+/// What a line spells out as words, for deciding whether a program the guard
+/// cannot read is worth a question: a signal tool as a whole shell word (not
+/// inside a path, `skill`, `--kill-after` or `KILL_AFTER=5`). Quotes and
+/// backslashes are removed first, so `pk''ill` is `pkill`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Spelled {
+    /// `kill`, `pkill`, `killall`, `killall5`, `pgrep` or `pidof` is a word.
+    tool: bool,
+    /// `pgrep` or `pidof` is a word: pids that reach a `kill` may come from it.
+    pids: bool,
+}
+
+/// The tools [`Spelled`] looks for.
+const GATING_TOOLS: [&str; 6] = ["kill", "pkill", "killall", "killall5", "pgrep", "pidof"];
+
+fn spelled_tools(command: &str) -> Spelled {
+    let flat: String = command
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .collect();
+    let mut spelled = Spelled::default();
+    for raw in flat.split(|c: char| c.is_whitespace() || ";&|()<>{}$`,".contains(c)) {
+        let token = match raw.split_once('=') {
+            Some((_, value)) if is_assignment(raw) => value,
+            _ => raw,
+        };
+        let name = base_name(token);
+        if GATING_TOOLS.contains(&name) {
+            spelled.tool = true;
+            spelled.pids |= matches!(name, "pgrep" | "pidof");
+        }
+    }
+    spelled
+}
+
+/// What this line has bound so far, in the order the shell runs it. Used only
+/// where a word is a program or a script (`resolve`, `eval`, `-c`) and where a
+/// `kill` is given pids: never to expand an argument, which stays "built from
+/// a variable" and is asked about as before.
+#[derive(Debug, Clone, Default)]
+struct Binds {
+    /// `NAME=value` with a value the line spells out; `None` when it was
+    /// assigned twice differently or from something unknown.
+    values: HashMap<String, Option<String>>,
+    /// `alias NAME=value`; `None` for a value that is not plain text.
+    aliases: HashMap<String, Option<String>>,
+    /// Variables holding pids from a `pgrep`/`pidof` on the line: the first
+    /// command of the pipeline that made them, and whether it was alone.
+    pid_vars: HashMap<String, Vec<(Cmd, bool)>>,
+    /// Files a `pgrep`/`pidof` on the line wrote.
+    pid_files: HashMap<String, Cmd>,
+}
+
+/// The text of the ANSI-C quoted `$'…'` body `s`, escapes decoded.
+fn ansi_c_decode(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut bytes: Vec<u8> = Vec::new();
+    let push_char = |bytes: &mut Vec<u8>, c: char| {
+        let mut buf = [0u8; 4];
+        bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    };
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
+        if c != '\\' {
+            push_char(&mut bytes, c);
+            continue;
+        }
+        let Some(&e) = chars.get(i) else {
+            bytes.push(b'\\');
+            break;
+        };
+        i += 1;
+        let hex = |from: usize, max: usize| -> (u32, usize) {
+            let mut v = 0u32;
+            let mut n = 0;
+            while n < max {
+                match chars.get(from + n).and_then(|c| c.to_digit(16)) {
+                    Some(d) => {
+                        v = v * 16 + d;
+                        n += 1;
+                    }
+                    None => break,
+                }
+            }
+            (v, n)
+        };
+        match e {
+            'a' => bytes.push(7),
+            'b' => bytes.push(8),
+            'e' | 'E' => bytes.push(27),
+            'f' => bytes.push(12),
+            'n' => bytes.push(b'\n'),
+            'r' => bytes.push(b'\r'),
+            't' => bytes.push(b'\t'),
+            'v' => bytes.push(11),
+            '\\' | '\'' | '"' | '?' => push_char(&mut bytes, e),
+            'x' => {
+                let (v, n) = hex(i, 2);
+                if n == 0 {
+                    bytes.extend_from_slice(b"\\x");
+                } else {
+                    bytes.push(u8::try_from(v).unwrap_or(b'?'));
+                    i += n;
+                }
+            }
+            'u' | 'U' => {
+                let (v, n) = hex(i, if e == 'u' { 4 } else { 8 });
+                match char::from_u32(v).filter(|_| n > 0) {
+                    Some(ch) => {
+                        push_char(&mut bytes, ch);
+                        i += n;
+                    }
+                    None => {
+                        bytes.push(b'\\');
+                        push_char(&mut bytes, e);
+                    }
+                }
+            }
+            '0'..='7' => {
+                let mut v = e.to_digit(8).unwrap_or(0);
+                let mut n = 1;
+                while n < 3 {
+                    match chars.get(i).and_then(|c| c.to_digit(8)) {
+                        Some(d) => {
+                            v = v * 8 + d;
+                            i += 1;
+                            n += 1;
+                        }
+                        None => break,
+                    }
+                }
+                bytes.push(u8::try_from(v & 0xff).unwrap_or(b'?'));
+            }
+            other => {
+                bytes.push(b'\\');
+                push_char(&mut bytes, other);
+            }
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// What the line `src` of one word comes to when the variables the line has
+/// bound are filled in, or `None` when any part of it is not known: a command
+/// or arithmetic substitution, a variable that is unbound, assigned twice, or
+/// from something unknown, an unquoted glob or brace, or a value that would
+/// split into several words.
+fn bound_text(src: &str, binds: &Binds) -> Option<String> {
+    bound_text_with(src, binds, false)
+}
+
+/// [`bound_text`], where `rejoined` says the words a value splits into are put
+/// back together with spaces (what `eval` does with its arguments), so a value
+/// with blanks in it is still known.
+fn bound_text_with(src: &str, binds: &Binds, rejoined: bool) -> Option<String> {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    let lookup = |name: &str, quoted: bool| -> Option<String> {
+        let value = binds.values.get(name)?.as_ref()?;
+        let glob = value.chars().any(|c| "*?[]{}~".contains(c));
+        let blanks = value.chars().any(char::is_whitespace);
+        (quoted || (!glob && (rejoined || !blanks))).then(|| value.clone())
+    };
+    while i < chars.len() {
+        match chars[i] {
+            '\'' => {
+                let end = chars[i + 1..].iter().position(|c| *c == '\'')? + i + 1;
+                out.extend(&chars[i + 1..end]);
+                i = end + 1;
+            }
+            '"' => {
+                i += 1;
+                loop {
+                    match *chars.get(i)? {
+                        '"' => {
+                            i += 1;
+                            break;
+                        }
+                        '\\' => {
+                            let n = *chars.get(i + 1)?;
+                            if !matches!(n, '"' | '\\' | '$' | '`') {
+                                out.push('\\');
+                            }
+                            out.push(n);
+                            i += 2;
+                        }
+                        '$' => {
+                            let (name, next) = var_at(&chars, i)?;
+                            out.push_str(&lookup(&name, true)?);
+                            i = next;
+                        }
+                        '`' => return None,
+                        c => {
+                            out.push(c);
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            '\\' => {
+                out.push(*chars.get(i + 1)?);
+                i += 2;
+            }
+            '$' if chars.get(i + 1) == Some(&'\'') => {
+                let mut k = i + 2;
+                while k < chars.len() && chars[k] != '\'' {
+                    if chars[k] == '\\' {
+                        k += 1;
+                    }
+                    k += 1;
+                }
+                if k >= chars.len() {
+                    return None;
+                }
+                let body: String = chars[i + 2..k].iter().collect();
+                out.push_str(&ansi_c_decode(&body));
+                i = k + 1;
+            }
+            '$' => {
+                let (name, next) = var_at(&chars, i)?;
+                out.push_str(&lookup(&name, false)?);
+                i = next;
+            }
+            '*' | '?' | '[' | ']' | '{' | '}' | '`' | '~' => return None,
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The variable named at `chars[at]` (`$name` or `${name}`) and the index after
+/// it; `None` for anything else, `${name:-x}` and `$(…)` included.
+fn var_at(chars: &[char], at: usize) -> Option<(String, usize)> {
+    let ident = |from: usize| {
+        let len = chars[from..]
+            .iter()
+            .take_while(|c| c.is_ascii_alphanumeric() || **c == '_')
+            .count();
+        let name: String = chars[from..from + len].iter().collect();
+        let valid = name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+        valid.then_some((name, from + len))
+    };
+    match chars.get(at + 1)? {
+        '{' => {
+            let (name, end) = ident(at + 2)?;
+            (chars.get(end) == Some(&'}')).then_some((name, end + 1))
+        }
+        _ => ident(at + 1),
+    }
+}
+
+/// Every variable `src` refers to (`$name`, `${name}`, `${name[@]}`), outside
+/// single quotes.
+fn var_refs(src: &str) -> Vec<String> {
+    let chars: Vec<char> = src.chars().collect();
+    let mut refs = Vec::new();
+    let mut i = 0;
+    let mut single = false;
+    while i < chars.len() {
+        match chars[i] {
+            '\'' => {
+                single = !single;
+                i += 1;
+            }
+            '\\' => i += 2,
+            '$' if !single => {
+                let named = if chars.get(i + 1) == Some(&'{') {
+                    let from = i + 2;
+                    let len = chars[from.min(chars.len())..]
+                        .iter()
+                        .take_while(|c| c.is_ascii_alphanumeric() || **c == '_')
+                        .count();
+                    Some((
+                        chars[from..from + len].iter().collect::<String>(),
+                        from + len,
+                    ))
+                } else {
+                    var_at(&chars, i)
+                };
+                match named {
+                    Some((name, next)) if !name.is_empty() => {
+                        refs.push(name);
+                        i = next;
+                    }
+                    _ => i += 1,
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    refs
+}
+
+/// Whether `src` has a glob or brace the shell would expand: one outside quotes.
+fn has_unquoted_meta(src: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut chars = src.chars();
+    let mut previous = ' ';
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (None, '\\') | (Some('"'), '\\') => {
+                chars.next();
+            }
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            // `${name}` is a parameter, not a brace list.
+            (None, '{') if previous == '$' => {}
+            (None, '*' | '?' | '[' | '{') => return true,
+            _ => {}
+        }
+        previous = c;
+    }
+    false
+}
+
+/// Whether a glob or brace word, whose text is `text`, can expand to the name
+/// of a program that signals: each alternative of a one-level brace list, and
+/// each file name `*`, `?` and `[…]` could be, against the tool names.
+fn could_name_tool(text: &str) -> bool {
+    let mut words = vec![text.to_string()];
+    if let (Some(open), Some(close)) = (text.find('{'), text.rfind('}')) {
+        if open < close {
+            let (head, body, tail) = (&text[..open], &text[open + 1..close], &text[close + 1..]);
+            words = body
+                .split(',')
+                .take(16)
+                .map(|alt| format!("{head}{alt}{tail}"))
+                .collect();
+        }
+    }
+    words.iter().any(|w| {
+        let last = base_name(w);
+        GATING_TOOLS.iter().any(|tool| glob_matches(last, tool))
+    })
+}
+
+/// A shell glob (`*`, `?`, `[…]`) against `name`.
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    fn go(p: &[char], n: &[char]) -> bool {
+        match p.first() {
+            None => n.is_empty(),
+            Some('*') => (0..=n.len()).any(|k| go(&p[1..], &n[k..])),
+            Some('?') => !n.is_empty() && go(&p[1..], &n[1..]),
+            Some('[') => {
+                let Some(close) = p.iter().skip(2).position(|c| *c == ']').map(|k| k + 2) else {
+                    return !n.is_empty() && n[0] == '[' && go(&p[1..], &n[1..]);
+                };
+                let class = &p[1..close];
+                let (negate, class) = match class.first() {
+                    Some('!' | '^') => (true, &class[1..]),
+                    _ => (false, class),
+                };
+                let Some(&c) = n.first() else { return false };
+                let mut hit = false;
+                let mut k = 0;
+                while k < class.len() {
+                    if class.get(k + 1) == Some(&'-') && k + 2 < class.len() {
+                        hit |= class[k] <= c && c <= class[k + 2];
+                        k += 3;
+                    } else {
+                        hit |= class[k] == c;
+                        k += 1;
+                    }
+                }
+                hit != negate && go(&p[close + 1..], &n[1..])
+            }
+            Some(&c) => n.first() == Some(&c) && go(&p[1..], &n[1..]),
+        }
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    go(&p, &n)
 }
 
 fn base_name(path: &str) -> &str {
@@ -1129,7 +1572,7 @@ fn skip_options(words: &[Word], mut i: usize, with_arg: &[&str]) -> usize {
 /// Looks through `env`, `sudo`, `command`, `nohup` and the other wrappers to
 /// the program that runs. `Err` says why there is none: nothing runs (a
 /// builtin that only queries), or the program is named by a variable.
-fn resolve(words: &[Word]) -> Result<Resolved<'_>, Unresolved> {
+fn resolve<'a>(words: &'a [Word], binds: &Binds) -> Result<Resolved<'a>, Unresolved> {
     let mut i = 0usize;
     let mut elevated = false;
     let mut applet = false;
@@ -1139,11 +1582,131 @@ fn resolve(words: &[Word]) -> Result<Resolved<'_>, Unresolved> {
             i += 1;
             continue;
         }
-        if w.dynamic {
-            return Err(Unresolved::Dynamic);
+        // A program built from variables this line bound is what they come to;
+        // one built from anything else is not known.
+        let bound;
+        let text: &str = if w.dynamic {
+            bound = bound_text(&w.src, binds).ok_or(Unresolved::Dynamic)?;
+            &bound
+        } else {
+            &w.text
+        };
+        if !w.dynamic && has_unquoted_meta(&w.src) && could_name_tool(text) {
+            return Err(Unresolved::MaySignal);
         }
-        let base = base_name(w.text.trim_start_matches('\\'));
+        let base = base_name(text.trim_start_matches('\\'));
         i = match base {
+            "ionice" => skip_options(
+                words,
+                i + 1,
+                &[
+                    "-c",
+                    "-n",
+                    "-p",
+                    "-P",
+                    "-u",
+                    "--class",
+                    "--classdata",
+                    "--pid",
+                    "--pgid",
+                    "--uid",
+                ],
+            ),
+            "taskset" => {
+                let k = skip_options(words, i + 1, &[]);
+                if words[i + 1..k.min(words.len())].iter().any(|o| {
+                    o.text == "--pid" || (!o.text.starts_with("--") && o.text.contains('p'))
+                }) {
+                    return Err(Unresolved::Nothing);
+                }
+                k + 1
+            }
+            "chrt" => {
+                let k = skip_options(
+                    words,
+                    i + 1,
+                    &[
+                        "-T",
+                        "-P",
+                        "-D",
+                        "--sched-runtime",
+                        "--sched-period",
+                        "--sched-deadline",
+                    ],
+                );
+                if words[i + 1..k.min(words.len())].iter().any(|o| {
+                    o.text == "--pid"
+                        || o.text == "--max"
+                        || (!o.text.starts_with("--") && o.text.contains(['p', 'm']))
+                }) {
+                    return Err(Unresolved::Nothing);
+                }
+                k + 1
+            }
+            "flock" => {
+                let k = skip_options(
+                    words,
+                    i + 1,
+                    &["-w", "-E", "--timeout", "--wait", "--conflict-exit-code"],
+                );
+                // `flock FILE -c STRING` hands the string to a shell.
+                if let Some(c) = words
+                    .iter()
+                    .enumerate()
+                    .skip(k)
+                    .find(|(_, o)| o.text == "-c" || o.text == "--command")
+                    .map(|(at, _)| at)
+                {
+                    return Ok(Resolved {
+                        prog: "sh".to_string(),
+                        prog_at: c,
+                        args: &words[c..],
+                        elevated,
+                        applet,
+                    });
+                }
+                k + 1
+            }
+            "setpriv" => skip_options(
+                words,
+                i + 1,
+                &[
+                    "--reuid",
+                    "--regid",
+                    "--ruid",
+                    "--euid",
+                    "--rgid",
+                    "--egid",
+                    "--groups",
+                    "--inh-caps",
+                    "--ambient-caps",
+                    "--bounding-set",
+                    "--securebits",
+                    "--pdeathsig",
+                    "--selinux-label",
+                    "--apparmor-profile",
+                    "--landlock-access",
+                    "--seccomp-filter",
+                ],
+            ),
+            "unshare" => skip_options(
+                words,
+                i + 1,
+                &[
+                    "--propagation",
+                    "--setgroups",
+                    "--map-user",
+                    "--map-group",
+                    "--map-users",
+                    "--map-groups",
+                    "-S",
+                    "-G",
+                    "--wd",
+                    "-w",
+                    "--root",
+                    "-R",
+                ],
+            ),
             "env" => {
                 let mut k = skip_options(words, i + 1, &["-u", "-C", "-P", "-S"]);
                 while words.get(k).is_some_and(|w| is_assignment(&w.text)) {
@@ -1235,20 +1798,51 @@ fn xargs_command(args: &[Word]) -> &[Word] {
     args.get(i..).unwrap_or(&[])
 }
 
-/// The script a shell was handed with `-c`.
+/// The script a shell was handed with `-c`: the first operand once a cluster
+/// with `c` has been read, past options that take an argument (`-o pipefail`,
+/// `-O extglob`, `+o`, `--rcfile F`, a cluster ending in `o` or `O`) and long
+/// options that do not. `None` for a shell given a file, or nothing.
 fn shell_script(args: &[Word]) -> Option<&Word> {
+    let mut i = 0;
+    let mut command = false;
+    while let Some(w) = args.get(i) {
+        let t = w.text.as_str();
+        i += 1;
+        if t == "--" {
+            return command.then(|| args.get(i)).flatten();
+        }
+        if t.len() < 2 || !(t.starts_with('-') || t.starts_with('+')) {
+            return command.then_some(w);
+        }
+        if matches!(t, "-o" | "-O" | "+o" | "+O" | "--rcfile" | "--init-file") {
+            i += 1;
+        } else if !t.starts_with("--") {
+            command |= t.starts_with('-') && t.contains('c');
+            if t.ends_with(['o', 'O']) {
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Whether a shell is given no script at all: no `-c`, no file, so it reads
+/// its standard input.
+fn shell_reads_stdin(args: &[Word]) -> bool {
     let mut i = 0;
     while let Some(w) = args.get(i) {
         let t = w.text.as_str();
-        if !t.starts_with('-') || t == "--" {
-            return None;
-        }
-        if !t.starts_with("--") && t.contains('c') {
-            return args.get(i + 1);
-        }
         i += 1;
+        if t == "--" || t.len() < 2 || !(t.starts_with('-') || t.starts_with('+')) {
+            return false;
+        }
+        if matches!(t, "-o" | "-O" | "+o" | "+O" | "--rcfile" | "--init-file") {
+            i += 1;
+        } else if !t.starts_with("--") && t.starts_with('-') && t.contains('c') {
+            return false;
+        }
     }
-    None
+    true
 }
 
 impl Cx<'_> {
@@ -1269,9 +1863,18 @@ impl Cx<'_> {
 
     fn walk(&mut self, script: &[Pipeline], depth: usize) {
         for pipeline in script {
+            // Whether the pipeline spells a signal tool, once: a script piped
+            // into a shell is asked about when it does.
+            let tool = self.pipeline_tool
+                || (pipeline.len() > 1
+                    && pipeline
+                        .iter()
+                        .any(|c| c.words.iter().any(|w| spelled_tools(&w.src).tool)));
+            let saved = std::mem::replace(&mut self.pipeline_tool, tool);
             for (at, cmd) in pipeline.iter().enumerate() {
                 self.command(pipeline, at, cmd, depth);
             }
+            self.pipeline_tool = saved;
         }
     }
 
@@ -1292,7 +1895,22 @@ impl Cx<'_> {
         }
     }
 
+    /// One command. `near` is what it spells out, for deciding whether a
+    /// program the guard cannot read is worth a question: the words of the
+    /// command, and, for a script piped into a shell, of its whole pipeline.
     fn command(&mut self, pipeline: &Pipeline, at: usize, cmd: &Cmd, depth: usize) {
+        let near = cmd
+            .words
+            .iter()
+            .map(|w| w.src.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let saved = std::mem::replace(&mut self.near, near);
+        self.command_in(pipeline, at, cmd, depth);
+        self.near = saved;
+    }
+
+    fn command_in(&mut self, pipeline: &Pipeline, at: usize, cmd: &Cmd, depth: usize) {
         for w in cmd.words.iter().chain(&cmd.redirects) {
             for body in &w.subst {
                 self.walk(body, depth + 1);
@@ -1303,10 +1921,43 @@ impl Cx<'_> {
                 self.walk(body, depth + 1);
             }
         }
-        let r = match resolve(&cmd.words) {
+        // An alias is read as what it stands for. One named for a signal tool
+        // (`alias pkill=echo`) is read both ways: the command as written was
+        // always judged, and an alias must never make it quieter.
+        let shadows_tool = cmd
+            .words
+            .first()
+            .is_some_and(|w| GATING_TOOLS.contains(&base_name(&w.text)));
+        if self.expand_alias(cmd, depth) && !shadows_tool {
+            self.record(pipeline, at, cmd);
+            return;
+        }
+        let resolved = resolve(&cmd.words, &self.binds);
+        self.record(pipeline, at, cmd);
+        let r = match resolved {
             Ok(r) => r,
             Err(Unresolved::Dynamic) => {
-                self.dynamic_program(echo(&cmd.words));
+                // A program named by a variable that is handed `-c SCRIPT` is
+                // a shell as far as this goes: its script is read.
+                let program = cmd
+                    .words
+                    .iter()
+                    .position(|w| !is_assignment(&w.text) && !KEYWORDS.contains(&w.text.as_str()));
+                if let Some(script) = program.and_then(|p| shell_script(&cmd.words[p + 1..])) {
+                    self.shell_script(script, depth);
+                } else {
+                    self.dynamic_program(echo(&cmd.words));
+                }
+                return;
+            }
+            Err(Unresolved::MaySignal) => {
+                self.unevaluable(
+                    echo(&cmd.words),
+                    false,
+                    "the program is a glob or a brace list the shell expands, and one of its \
+                     expansions is a program that signals"
+                        .into(),
+                );
                 return;
             }
             Err(Unresolved::Nothing) => return,
@@ -1323,21 +1974,18 @@ impl Cx<'_> {
                 ),
             ),
             "pkill" => self.pgrep(&r, text, true, true),
-            "alias" => {
-                if r.args
-                    .iter()
-                    .any(|w| contains_kill(&w.text) || (w.dynamic && self.mentions_kill))
-                {
-                    self.unevaluable(
-                        text,
-                        r.elevated,
-                        "an alias defined on this line may name a signal command, and a later \
-                         word on it runs the alias"
-                            .into(),
-                    );
-                }
-            }
+            // The alias is recorded by `record`; a word that runs it is read as
+            // what it stands for (`expand_alias`).
+            "alias" => {}
             "find" => self.find_exec(&r, &text, depth),
+            "{}" if self.pipeline_tool => self.unevaluable(
+                text,
+                r.elevated,
+                "the program is what a pipeline's xargs or find puts in place of `{}`, and the \
+                 pipeline names a signal tool"
+                    .into(),
+            ),
+            "{}" => self.dynamic_program(text),
             "ssh" => self.ssh_remote(&r, text),
             "killall" => match parse_killall(r.args, self.dialect) {
                 Parsed::Spec(spec) => self.push(Finding {
@@ -1352,15 +2000,27 @@ impl Cx<'_> {
             "kill" => self.kill(r.args, &text, r.elevated, None),
             "xargs" => {
                 let inner = xargs_command(r.args);
-                let i = match resolve(inner) {
+                let i = match resolve(inner, &self.binds) {
                     Ok(i) => i,
-                    Err(Unresolved::Dynamic) => {
+                    Err(Unresolved::Dynamic | Unresolved::MaySignal) => {
                         self.dynamic_program(text);
                         return;
                     }
                     Err(Unresolved::Nothing) => return,
                 };
-                let upstream = (at > 0).then(|| (&pipeline[0], at == 1));
+                // The pids `xargs kill` is fed: the pipeline before it, or a
+                // `< <(pgrep …)` it reads.
+                let fed = cmd
+                    .redirects
+                    .iter()
+                    .find_map(|w| w.subst.last())
+                    .and_then(|body| body.last())
+                    .and_then(|pl| pl.first().map(|c| (c.clone(), pl.len() == 1)));
+                let upstream = if at > 0 {
+                    Some((&pipeline[0], at == 1))
+                } else {
+                    fed.as_ref().map(|(c, single)| (c, *single))
+                };
                 match i.prog.as_str() {
                     "kill" => self.kill(i.args, &text, r.elevated || i.elevated, upstream),
                     "pkill" | "killall" => self.unevaluable(
@@ -1368,6 +2028,16 @@ impl Cx<'_> {
                         r.elevated,
                         format!("the arguments of `{}` come from xargs", i.prog),
                     ),
+                    // The program is what xargs puts in place of `{}`: asked
+                    // about when the command or its pipeline spells a tool.
+                    "{}" if self.pipeline_tool => self.unevaluable(
+                        text,
+                        r.elevated,
+                        "the program xargs runs is what it puts in place of `{}`, and the \
+                         pipeline names a signal tool"
+                            .into(),
+                    ),
+                    "{}" => self.dynamic_program(text),
                     p if SHELLS.contains(&p) => {
                         if let Some(script) = shell_script(i.args) {
                             self.shell_script(script, depth);
@@ -1379,38 +2049,210 @@ impl Cx<'_> {
             p if SHELLS.contains(&p) => {
                 if let Some(script) = shell_script(r.args) {
                     self.shell_script(script, depth);
+                } else if at > 0 && cmd.heredocs.is_empty() && shell_reads_stdin(r.args) {
+                    // A script piped in: what the guard cannot read is asked
+                    // about when the pipeline spells a signal tool.
+                    if self.pipeline_tool {
+                        self.unevaluable(
+                            text,
+                            r.elevated,
+                            "the shell runs a script piped into it, which GitPulse does not \
+                             read, and the pipeline names a signal tool"
+                                .into(),
+                        );
+                    }
                 }
                 for h in &cmd.heredocs {
                     self.script_text(&h.body, depth);
                 }
             }
-            "eval" if r.args.iter().all(|w| !w.dynamic) => {
+            "source" | "." => {
+                if r.args.first().is_some_and(|w| !w.subst.is_empty()) {
+                    self.dynamic_program(text);
+                }
+            }
+            "eval" => {
+                // Read as written, a variable the line did not bind staying a
+                // variable: `eval $c` runs a program the line does not name.
                 let joined = r
                     .args
                     .iter()
-                    .map(|w| w.text.as_str())
+                    .map(|w| {
+                        if w.dynamic {
+                            bound_text_with(&w.src, &self.binds, true)
+                                .unwrap_or_else(|| w.text.clone())
+                        } else {
+                            w.text.clone()
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(" ");
                 self.script_text(&joined, depth);
             }
-            "eval" => self.dynamic_program(text),
             _ => {}
         }
     }
 
     /// A program, or a script a program runs, that is known only when the
-    /// shell expands it. Asked about when the line says `kill` anywhere: the
-    /// variable was set on it, in a word that says so.
+    /// shell expands it. Asked about when a signal tool is a word of the
+    /// command (`kill`, `pkill`, `killall`, `killall5`, `pgrep`, `pidof`), or
+    /// of a command that bound something earlier on the line: without one a
+    /// variable is an ordinary program, with one it may stand for it.
     fn dynamic_program(&mut self, text: String) {
-        if self.mentions_kill {
+        if self.bound_tool || spelled_tools(&self.near).tool {
             self.unevaluable(
                 text,
                 false,
-                "which program runs, or what script it is given, is built from a variable or \
-                 a substitution, on a line that mentions `kill`"
+                "which program runs, or what script it is given, is built from something \
+                 GitPulse cannot expand, on a line that names a signal tool"
                     .into(),
             );
         }
+    }
+
+    /// What the line has bound, from the command just read: a variable given
+    /// a value, a variable that holds the pids of a `pgrep` or `pidof`, an
+    /// alias, a file a `pgrep` or `pidof` wrote.
+    fn record(&mut self, pipeline: &Pipeline, at: usize, cmd: &Cmd) {
+        let first = cmd.words.first().map(|w| w.text.as_str()).unwrap_or("");
+        let declares = matches!(
+            first,
+            "export" | "declare" | "typeset" | "local" | "readonly"
+        );
+        let assignments_only = !cmd.words.is_empty()
+            && cmd.words.iter().enumerate().all(|(k, w)| {
+                is_assignment(&w.text)
+                    || (k == 0 && declares)
+                    || (declares && w.text.starts_with('-'))
+            });
+        if (assignments_only || matches!(first, "alias" | "for" | "select"))
+            && spelled_tools(&self.near).tool
+        {
+            self.bound_tool = true;
+        }
+        if assignments_only {
+            for w in cmd.words.iter().filter(|w| is_assignment(&w.text)) {
+                let Some(eq) = w.src.find('=') else { continue };
+                let name = w.src[..eq].to_string();
+                let value_src = &w.src[eq + 1..];
+                let value = if w.dynamic {
+                    bound_text(value_src, &self.binds)
+                } else {
+                    w.text.split_once('=').map(|(_, v)| v.to_string())
+                };
+                let producers: Vec<(Cmd, bool)> = w
+                    .subst
+                    .iter()
+                    .filter_map(|body| body.last())
+                    .filter_map(|pl| pl.first().map(|c| (c.clone(), pl.len() == 1)))
+                    .collect();
+                if value.is_none() && !producers.is_empty() {
+                    self.binds.pid_vars.insert(name.clone(), producers);
+                }
+                let merged = match (self.binds.values.get(&name), value) {
+                    (Some(None), _) | (_, None) => None,
+                    (Some(Some(old)), Some(new)) if *old != new => None,
+                    (_, Some(new)) => Some(new),
+                };
+                self.binds.values.insert(name, merged);
+            }
+            return;
+        }
+        match first {
+            "alias" => {
+                for w in cmd.words.iter().skip(1) {
+                    if let Some((name, value)) = w.text.split_once('=') {
+                        let plain = (!w.dynamic).then(|| value.to_string());
+                        self.binds.aliases.insert(name.to_string(), plain);
+                    }
+                }
+            }
+            "for" | "select" => {
+                if let Some(var) = cmd.words.get(1) {
+                    let producers: Vec<(Cmd, bool)> = cmd
+                        .words
+                        .iter()
+                        .skip(3)
+                        .flat_map(|w| w.subst.iter())
+                        .filter_map(|body| body.last())
+                        .filter_map(|pl| pl.first().map(|c| (c.clone(), pl.len() == 1)))
+                        .collect();
+                    if !producers.is_empty() {
+                        self.binds.pid_vars.insert(var.text.clone(), producers);
+                    }
+                    self.binds.values.insert(var.text.clone(), None);
+                }
+            }
+            _ => {}
+        }
+        if let Ok(r) = resolve(&cmd.words, &self.binds) {
+            match r.prog.as_str() {
+                "read" if at > 0 => {
+                    let names = r.args.iter().filter(|w| !w.text.starts_with('-'));
+                    for w in names {
+                        self.binds
+                            .pid_vars
+                            .insert(w.text.clone(), vec![(pipeline[0].clone(), at == 1)]);
+                    }
+                }
+                "mapfile" | "readarray" => {
+                    // `< <(…)` reads as a word of the command to this lexer.
+                    let producers: Vec<(Cmd, bool)> = cmd
+                        .redirects
+                        .iter()
+                        .chain(cmd.words.iter().filter(|w| w.src.starts_with("<(")))
+                        .flat_map(|w| w.subst.iter())
+                        .filter_map(|body| body.last())
+                        .filter_map(|pl| pl.first().map(|c| (c.clone(), pl.len() == 1)))
+                        .collect();
+                    let skip_arg = ["-d", "-n", "-O", "-s", "-u", "-C", "-c"];
+                    let mut k = 0;
+                    let mut name = "MAPFILE".to_string();
+                    while let Some(w) = r.args.get(k) {
+                        k += 1;
+                        if skip_arg.contains(&w.text.as_str()) {
+                            k += 1;
+                        } else if !w.text.starts_with('-') {
+                            name = w.text.clone();
+                            break;
+                        }
+                    }
+                    if !producers.is_empty() {
+                        self.binds.pid_vars.insert(name, producers);
+                    }
+                }
+                "pgrep" | "pidof" => {
+                    for w in &cmd.redirects {
+                        self.binds.pid_files.insert(w.text.clone(), cmd.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A word that runs an alias the line defined is read as what the alias
+    /// stands for, with the rest of the command after it. `true` when it was.
+    fn expand_alias(&mut self, cmd: &Cmd, depth: usize) -> bool {
+        let Some(first) = cmd.words.first().filter(|w| !w.dynamic) else {
+            return false;
+        };
+        let Some(value) = self.binds.aliases.get(&first.text).cloned() else {
+            return false;
+        };
+        if self.alias_stack.contains(&first.text) {
+            return false;
+        }
+        let Some(value) = value else {
+            self.dynamic_program(echo(&cmd.words));
+            return true;
+        };
+        let rest: Vec<&str> = cmd.words.iter().skip(1).map(|w| w.src.as_str()).collect();
+        let expanded = format!("{value} {}", rest.join(" "));
+        self.alias_stack.push(first.text.clone());
+        self.script_text(&expanded, depth);
+        self.alias_stack.pop();
+        true
     }
 
     /// `find … -exec CMD … ;` runs `CMD` once for each file, with the file
@@ -1431,7 +2273,16 @@ impl Cx<'_> {
                 .find(|&j| args[j].text == ";" || (args[j].text == "+" && args[j - 1].text == "{}"))
                 .unwrap_or(args.len());
             let inner = &args[i + 1..end];
-            match resolve(inner) {
+            match resolve(inner, &self.binds) {
+                // The file `find` found is the program: whatever it is, it
+                // runs.
+                Ok(p) if p.prog == "{}" => self.unevaluable(
+                    text.to_string(),
+                    r.elevated || p.elevated,
+                    "`find -exec {}` runs each file it finds as a program, so GitPulse cannot \
+                     tell what it would do"
+                        .into(),
+                ),
                 Ok(p) if SIGNALLERS.contains(&p.prog.as_str()) => self.unevaluable(
                     text.to_string(),
                     r.elevated || p.elevated,
@@ -1448,7 +2299,9 @@ impl Cx<'_> {
                     }
                 }
                 Ok(_) | Err(Unresolved::Nothing) => {}
-                Err(Unresolved::Dynamic) => self.dynamic_program(text.to_string()),
+                Err(Unresolved::Dynamic | Unresolved::MaySignal) => {
+                    self.dynamic_program(text.to_string());
+                }
             }
             i = end + 1;
         }
@@ -1480,11 +2333,14 @@ impl Cx<'_> {
     }
 
     fn shell_script(&mut self, script: &Word, depth: usize) {
-        if script.dynamic {
-            self.dynamic_program(format!("-c {}", script.src));
-            return;
-        }
-        let text = script.text.clone();
+        // A script with a variable in it is read as written: `kill $PID` is a
+        // `kill` with a pid the line does not give, `$c` is a program the
+        // line does not name (asked about when the command spells a tool).
+        let text = if script.dynamic {
+            bound_text(&script.src, &self.binds).unwrap_or_else(|| script.text.clone())
+        } else {
+            script.text.clone()
+        };
         self.script_text(&text, depth);
     }
 
@@ -1505,7 +2361,7 @@ impl Cx<'_> {
     /// pipeline that produces them.
     fn producer(&mut self, first: &Cmd, single: bool, text: &str, elevated: bool) {
         let bounded = single;
-        let Ok(r) = resolve(&first.words) else {
+        let Ok(r) = resolve(&first.words, &self.binds) else {
             self.unevaluable(
                 text.to_string(),
                 elevated,
@@ -1515,6 +2371,21 @@ impl Cx<'_> {
         };
         let source = echo(&first.words[r.prog_at..]);
         match r.prog.as_str() {
+            // `kill $(cat FILE)` after a `pgrep`/`pidof` wrote FILE on this line.
+            "cat"
+                if r.args
+                    .iter()
+                    .any(|w| self.binds.pid_files.contains_key(&w.text)) =>
+            {
+                let stored: Vec<Cmd> = r
+                    .args
+                    .iter()
+                    .filter_map(|w| self.binds.pid_files.get(&w.text).cloned())
+                    .collect();
+                for cmd in stored {
+                    self.producer(&cmd, false, text, elevated);
+                }
+            }
             "pgrep" => self.pgrep(&r, format!("{text} (pids from `{source}`)"), false, bounded),
             "pidof" => {
                 let words: Vec<String> = r
@@ -1550,6 +2421,15 @@ impl Cx<'_> {
                         format!("{text} (pids from `{source}`)"),
                         elevated,
                         "a process name built from a variable".into(),
+                    );
+                } else if r.args.iter().any(|w| has_unquoted_meta(&w.src)) {
+                    // The shell expands a glob or a brace list before `pidof`
+                    // sees it, against files the guard does not list.
+                    self.unevaluable(
+                        format!("{text} (pids from `{source}`)"),
+                        elevated,
+                        "a `pidof` argument is a glob or a brace list the shell expands first"
+                            .into(),
                     );
                 } else if !words.is_empty() {
                     self.push(Finding {
@@ -1641,6 +2521,29 @@ impl Cx<'_> {
                         text.to_string(),
                         elevated,
                         "a process group built from a variable".into(),
+                    );
+                    continue;
+                }
+                // Pids held in a variable a `pgrep` or `pidof` on this line
+                // filled are that command's; any other variable on a line
+                // that runs one is a pid list GitPulse cannot follow.
+                let linked: Vec<(Cmd, bool)> = var_refs(&w.src)
+                    .iter()
+                    .filter_map(|name| self.binds.pid_vars.get(name))
+                    .flatten()
+                    .cloned()
+                    .collect();
+                if !linked.is_empty() {
+                    for (cmd, single) in &linked {
+                        self.producer(cmd, *single, text, elevated);
+                    }
+                } else if self.spelled.pids {
+                    self.unevaluable(
+                        text.to_string(),
+                        elevated,
+                        "the pids come from a variable GitPulse could not follow, on a line \
+                         that runs pgrep or pidof"
+                            .into(),
                     );
                 }
                 continue;
@@ -2750,9 +3653,29 @@ fn full_subjects(dialect: Dialect, row: &TableRow, foreign: bool) -> Vec<String>
     if foreign {
         subjects.push(row.name.clone());
     }
+    // procps shows `-f` the first 131071 bytes of a command line (probed:
+    // `pgrep -a` prints that many, and an end anchor sees the cut), where the
+    // guard reads a mebibyte. A cut copy is one more reading.
+    if dialect == Dialect::Procps {
+        let cut: Vec<String> = subjects
+            .iter()
+            .filter(|s| s.len() > PROCPS_CMDLINE_CUT)
+            .map(|s| {
+                let mut end = PROCPS_CMDLINE_CUT;
+                while !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                s[..end].to_string()
+            })
+            .collect();
+        subjects.extend(cut);
+    }
     subjects.dedup();
     subjects
 }
+
+/// How much of a command line the procps tools match `-f` against.
+const PROCPS_CMDLINE_CUT: usize = 131_071;
 
 /// A pattern as the guard reads it.
 ///
@@ -2778,6 +3701,8 @@ struct Pattern {
     regex: Regex,
     /// Why `regcomp` may read this pattern another way than the `regex` crate.
     uncertain: Option<String>,
+    /// The pattern can match a character it does not spell (`.`, a bracket).
+    consumes_chars: bool,
 }
 
 fn is_printable_ascii(text: &str) -> bool {
@@ -2797,10 +3722,73 @@ fn compile(dialect: Dialect, pattern: &str, icase: bool, exact: bool) -> Result<
         .size_limit(REGEX_SIZE_LIMIT)
         .build()
         .map_err(|e| format!("the pattern `{pattern}` is not one GitPulse can evaluate ({e})"))?;
+    let mut uncertain = procps.then(|| ere_uncertainty(pattern)).flatten();
+    if procps && icase && !pattern.is_ascii() && uncertain.is_none() {
+        uncertain = Some(
+            "`-i` folds case by the locale's rules for a pattern outside ASCII (`ı` is an `I` to \
+             glibc), which GitPulse's engine does differently"
+                .to_string(),
+        );
+    }
     Ok(Pattern {
         regex,
-        uncertain: procps.then(|| ere_uncertainty(pattern)).flatten(),
+        uncertain,
+        consumes_chars: pattern_consumes_chars(pattern),
     })
+}
+
+/// Whether a pattern can match a character it does not spell: a `.`, a bracket
+/// expression, or a literal `?` (what the procps tools show for a byte that is
+/// not valid UTF-8). Where the tools and the guard count the characters of a
+/// subject differently, only such a pattern sees the difference.
+fn pattern_consumes_chars(pattern: &str) -> bool {
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                if chars.next() == Some('?') {
+                    return true;
+                }
+            }
+            '.' | '[' => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Why a process the guard did not pick (or left out of an inverted match) may
+/// be one the procps tools pick: the subject is read in a way the guard cannot
+/// reproduce. Asked about, not guessed at. `None` on macOS.
+fn row_uncertainty(
+    icase: bool,
+    dialect: Dialect,
+    patterns: &[Pattern],
+    subjects: &[String],
+) -> Option<String> {
+    if dialect != Dialect::Procps {
+        return None;
+    }
+    if icase && subjects.iter().any(|s| !s.is_ascii()) {
+        return Some(
+            "`-i` folds case by the locale's rules for a name or command line outside ASCII \
+             (`ı` is an `I` to glibc), which GitPulse's engine does differently"
+                .to_string(),
+        );
+    }
+    if subjects
+        .iter()
+        .any(|s| s.contains(char::REPLACEMENT_CHARACTER))
+        && patterns.iter().any(|p| p.consumes_chars)
+    {
+        return Some(
+            "a name or command line holds bytes that are not valid UTF-8: the procps tools \
+             count them one character at a time (or as one, for a surrogate), and GitPulse holds \
+             them replaced, so a `.` or a bracket may count differently"
+                .to_string(),
+        );
+    }
+    None
 }
 
 impl Pattern {
@@ -2920,10 +3908,6 @@ fn interval_end(chars: &[char], start: usize) -> Option<usize> {
 /// The index after the bracket expression that opens at `start`, or why it
 /// cannot be read the same way by both engines.
 fn bracket_end(chars: &[char], start: usize) -> Result<usize, String> {
-    const CLASSES: [&str; 12] = [
-        "alpha", "digit", "alnum", "upper", "lower", "space", "blank", "punct", "print", "graph",
-        "cntrl", "xdigit",
-    ];
     let unlike = |what: &str| {
         Err(format!(
             "{what} in a bracket expression is read differently by glibc's regcomp, which the \
@@ -2941,19 +3925,10 @@ fn bracket_end(chars: &[char], start: usize) -> Result<usize, String> {
         match c {
             ']' => return Ok(i + 1),
             '\\' => return unlike("a backslash"),
+            // A class (`[:alpha:]`) is ASCII to the crate and the locale's to
+            // glibc, which in a UTF-8 locale also takes `é`, `α` and `—`.
             '[' => match chars.get(i + 1) {
-                Some(':') => {
-                    let Some(end) = (i + 2..chars.len().saturating_sub(1))
-                        .find(|&j| chars[j] == ':' && chars[j + 1] == ']')
-                    else {
-                        return unlike("an unterminated character class");
-                    };
-                    let name: String = chars[i + 2..end].iter().collect();
-                    if !CLASSES.contains(&name.as_str()) {
-                        return unlike("a character class this guard does not know");
-                    }
-                    i = end + 2;
-                }
+                Some(':') => return unlike("a POSIX character class"),
                 Some('.' | '=') => return unlike("a collating symbol or an equivalence class"),
                 _ => return unlike("a `[`"),
             },
@@ -3026,7 +4001,7 @@ fn eval_pgrep_reading<'a>(spec: &PgrepSpec, facts: &'a Facts) -> Result<Reach<'a
         .iter()
         .map(|p| compile(spec.dialect, p, spec.icase, spec.exact))
         .collect::<Result<_, _>>()?;
-    let uncertain = patterns.iter().find_map(|p| p.uncertain.clone());
+    let mut uncertain = patterns.iter().find_map(|p| p.uncertain.clone());
     let euids = uids(facts, &spec.euids)?;
     let ruids = uids(facts, &spec.ruids)?;
     let ppids = numbers(&spec.ppids)?;
@@ -3064,13 +4039,15 @@ fn eval_pgrep_reading<'a>(spec: &PgrepSpec, facts: &'a Facts) -> Result<Reach<'a
             continue;
         }
         let subject_unread = spec.full && row.argv.is_none();
+        let subjects = if patterns.is_empty() {
+            Vec::new()
+        } else if spec.full {
+            let own = [row.uid, row.real_uid(), row.saved_uid()].contains(&facts.me_uid);
+            full_subjects(spec.dialect, row, !own)
+        } else {
+            name_subjects(spec.dialect, &row.name, argv0(row))
+        };
         let matched = patterns.is_empty() || {
-            let subjects = if spec.full {
-                let own = [row.uid, row.real_uid(), row.saved_uid()].contains(&facts.me_uid);
-                full_subjects(spec.dialect, row, !own)
-            } else {
-                name_subjects(spec.dialect, &row.name, argv0(row))
-            };
             if spec.inverse {
                 // Inverted, a row is a hit when the tool's one subject does not
                 // match. Which of the readings of it the tool has is not known,
@@ -3087,6 +4064,11 @@ fn eval_pgrep_reading<'a>(spec: &PgrepSpec, facts: &'a Facts) -> Result<Reach<'a
                     .any(|s| patterns.iter().any(|p| p.is_match(s, spec.dialect)))
             }
         };
+        // A process the guard did not pick (or, inverted, left out) that the
+        // tools may pick by reading its name or command line another way.
+        if uncertain.is_none() && (!matched || spec.inverse) {
+            uncertain = row_uncertainty(spec.icase, spec.dialect, &patterns, &subjects);
+        }
         let filtered = matched
             && (euids.is_empty() || euids.contains(&row.uid))
             && (ruids.is_empty() || ruids.contains(&row.real_uid()) || ruids.contains(&row.uid))
@@ -3136,7 +4118,7 @@ fn eval_killall_reading<'a>(spec: &KillallSpec, facts: &'a Facts) -> Result<Reac
     } else {
         Vec::new()
     };
-    let uncertain = patterns.iter().find_map(|p| p.uncertain.clone());
+    let mut uncertain = patterns.iter().find_map(|p| p.uncertain.clone());
     let user = match &spec.user {
         Some(name) => uids(facts, std::slice::from_ref(name))?.first().copied(),
         None => None,
@@ -3169,6 +4151,9 @@ fn eval_killall_reading<'a>(spec: &KillallSpec, facts: &'a Facts) -> Result<Reac
             .any(|word| runs_executable(row, word, facts.exes.get(word)));
         if spec.names.is_empty() || by_name || by_path {
             hits.push(row);
+        } else if uncertain.is_none() && !spec.names.is_empty() {
+            let subjects = name_subjects(spec.dialect, &row.name, argv0(row));
+            uncertain = row_uncertainty(spec.icase, spec.dialect, &patterns, &subjects);
         }
     }
     Ok(Reach {
@@ -3275,13 +4260,19 @@ struct Tally {
     /// not, so killing a dev server you started in a GitPulse terminal is not
     /// this guard's business.
     sessions: usize,
+    /// Processes whose executable could not be read or is the dynamic loader:
+    /// what they are is not known.
+    unknown_identity: usize,
     examples: Vec<String>,
 }
 
 /// Whether `row` is a GitPulse process. By the executable the kernel runs it
 /// from, which `argv[0]` cannot change, and by the path it was exec'd with:
 /// either one is enough, so a GitPulse executable run under another `argv[0]`
-/// is still GitPulse, and so is any process that says it is.
+/// is still GitPulse, and so is any process that says it is. The kernel's name
+/// for the process (`comm`, which `argv[0]` does not change) and, for a
+/// program run through the dynamic loader (`ld.so PROGRAM`), its first
+/// argument are looked at too.
 fn is_gitpulse(row: &TableRow) -> bool {
     let first_arg = row
         .argv
@@ -3289,14 +4280,25 @@ fn is_gitpulse(row: &TableRow) -> bool {
         .and_then(|a| a.first())
         .map(String::as_str);
     let spelled = row.exec.as_deref().or(first_arg).unwrap_or(&row.name);
-    [row.real_exe.as_deref(), Some(spelled)]
-        .into_iter()
-        .flatten()
-        .any(|program| {
-            let name = base_name(program).to_ascii_lowercase();
-            (name.starts_with("gitpulse") && name != "gitpulse-hook")
-                || program.contains("/GitPulse.app/")
-        })
+    let through_loader = row
+        .real_exe
+        .as_deref()
+        .is_some_and(is_dynamic_loader)
+        .then(|| row.argv.as_ref().and_then(|a| a.get(1)).map(String::as_str))
+        .flatten();
+    [
+        row.real_exe.as_deref(),
+        Some(spelled),
+        Some(row.name.as_str()),
+        through_loader,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|program| {
+        let name = base_name(program).to_ascii_lowercase();
+        (name.starts_with("gitpulse") && name != "gitpulse-hook")
+            || program.contains("/GitPulse.app/")
+    })
 }
 
 /// Whether `row` is a terminal session GitPulse hosts: launched by GitPulse
@@ -3324,6 +4326,7 @@ fn tally(hits: &[&TableRow], rows: &[TableRow]) -> Tally {
         t.gitpulse += usize::from(gitpulse);
         t.hosted += usize::from(row.hosted);
         t.sessions += usize::from(session);
+        t.unknown_identity += usize::from(row.exe_unknown);
         let rank = match (agent && row.hosted, agent, gitpulse || session) {
             (true, _, _) => 0,
             (_, true, _) => 1,
@@ -3568,6 +4571,22 @@ fn judge(finding: &Finding, facts: &Facts) -> Verdict {
             finding.text
         ));
     }
+    // A process the command reaches whose executable could not be read (not
+    // dumpable, or a program run through the loader) may be GitPulse or an
+    // agent under a spelling it chose: asked about, never passed by that spelling.
+    if t.unknown_identity > 0 {
+        return Verdict::Ask(format!(
+            "`{}` reaches {} whose executable GitPulse could not read, so it cannot tell \
+             whether {} GitPulse or an agent session.",
+            finding.text,
+            plural(t.unknown_identity, "process", "processes"),
+            if t.unknown_identity == 1 {
+                "it is"
+            } else {
+                "any is"
+            },
+        ));
+    }
     // A sender that can signal every process has no process of its own to
     // fall back on: one whose command line a `-f` pattern was not tested
     // against may be exactly the one it picks.
@@ -3807,6 +4826,11 @@ mod tests {
         super::parse_pgrep(args, pkill, Dialect::Bsd)
     }
 
+    /// The program a command line runs, with nothing bound.
+    fn resolve(words: &[Word]) -> Result<Resolved<'_>, Unresolved> {
+        super::resolve(words, &Binds::default())
+    }
+
     fn row(pid: i32, ppid: i32, argv: &[&str]) -> TableRow {
         TableRow {
             pid,
@@ -3818,6 +4842,7 @@ mod tests {
             name: base_name(argv[0]).to_string(),
             exec: Some(argv[0].to_string()),
             real_exe: None,
+            exe_unknown: false,
             argv: Some(argv.iter().map(|a| (*a).to_string()).collect()),
             agent: None,
             hosted: false,
@@ -5682,7 +6707,7 @@ mod tests {
             "x{2,}",
             "x{,2}",
             "[a-z]+",
-            "[[:alpha:]_-]",
+            "[_-]",
             "[^]a]",
             "[a-]",
             r"\.",
@@ -5712,6 +6737,11 @@ mod tests {
             "[a--b]",
             "[a~~b]",
             "[[:bogus:]]",
+            // A class is the locale's to glibc (`é`, `α`, `—` are `[:alpha:]`
+            // or `[:punct:]` in a UTF-8 locale) and ASCII to the crate.
+            "[[:alpha:]]",
+            "[[:alpha:]_-]",
+            "[^[:space:]]",
             "[[:alpha",
             "[a[b]",
             "a{",
@@ -5818,45 +6848,116 @@ mod tests {
         );
     }
 
-    /// Class 3. The program is named by a variable, an applet, an alias.
+    /// Class 3. A program named by variables the line itself bound is what they
+    /// come to, and is read as that program (Deny here, where it reaches
+    /// GitPulse); one it cannot work out is asked about when the command spells
+    /// a signal tool, and is an ordinary program otherwise.
     #[test]
-    fn a_program_named_by_a_variable_on_a_line_that_says_kill_is_asked_about() {
-        let facts = quiet();
+    fn a_program_named_by_variables_the_line_bound_is_read_as_that_program() {
+        let facts = world();
         for command in [
-            "p=pkill; $p -f gitpulse-short",
-            "p=killall; $p gitpulse-short",
-            "p=pkill; \"$p\" -f gitpulse-short",
-            "p=pkill; sudo $p -f gitpulse-short",
-            "p=pkill; ${p} -f gitpulse-short",
-            "p=$(echo pkill); $p -f gitpulse-short",
-            "P=/usr/bin/pkill; $P -f gitpulse-short",
-            "c='pkill -f gitpulse-short'; eval $c",
-            "c='pkill -f gitpulse-short'; bash -c \"$c\"",
-            "c='pkill -f gitpulse-short'; sh -c $c",
-            "echo x | xargs $p pkill -f gitpulse-short",
+            "p=pkill; $p -f gitpulse",
+            "p=pk''ill; $p -f gitpulse",
+            "p=pk\"\"ill; $p -f gitpulse",
+            "p=pk; ${p}ill -f gitpulse",
+            "p=pkil; ${p}l -f gitpulse",
+            "a=p; b=ki; c=ll; $a$b$c -f gitpulse",
+            "P=/usr/bin/pk; ${P}ill -f gitpulse",
+            "P=/usr/bin/pkill; $P -f gitpulse",
+            "p=pkill; \"$p\" -f gitpulse",
+            "export p=pkill; $p -f gitpulse",
+            "p=pkill; sudo $p -f gitpulse",
+            "p=pkill; nohup $p -f gitpulse",
+            "$'\\x70kill' -f gitpulse",
+            "$'p\\153ill' -f gitpulse",
+            "c='pkill -f gitpulse'; eval $c",
+            "c='pkill -f gitpulse'; bash -c \"$c\"",
+            "c='pkill -f gitpulse'; sh -c \"$c\"",
+            "p=killall; $p gitpulsed",
         ] {
             for dialect in [Dialect::Bsd, Dialect::Procps] {
                 assert_eq!(
                     classify_output(&run_on(dialect, command, &facts)),
-                    Out::Ask,
+                    Out::Deny,
                     "{dialect:?} {command}"
                 );
             }
         }
-        // Without `kill` on the line a variable is an ordinary program.
+        // Read, not asked: a pattern that reaches nothing is silent.
+        assert_eq!(
+            procps_says("p=pkill; $p -f no-such-process-xyz", &quiet()),
+            Out::Silent
+        );
+        // The bound value is for the program only: an argument built from a
+        // variable is still one GitPulse cannot expand (asked, as it always was).
+        assert_eq!(
+            procps_says("pat=gitpulse; pkill -f $pat", &quiet()),
+            Out::Ask
+        );
+        // Bound twice differently, or from something unknown: not known.
+        for command in [
+            "p=ls; p=pkill; $p -f x",
+            "p=$(echo pkill); $p -f x",
+            "for p in pkill killall; do $p -f x; done",
+            "p='pkill -f'; $p x",
+        ] {
+            assert_eq!(procps_says(command, &quiet()), Out::Ask, "{command}");
+        }
+    }
+
+    #[test]
+    fn a_program_the_line_does_not_name_is_asked_about_only_beside_a_signal_tool() {
+        let facts = quiet();
+        // A signal tool is a word of the command, or of one that bound
+        // something earlier.
+        for command in [
+            "$CMD kill",
+            "$RUN pkill -f x",
+            "echo x | xargs $p pkill -f gitpulse-short",
+            "x=$(echo pkill); $x -f gitpulse-short",
+            "eval \"$(echo pkill) -f x\"",
+            "bash -c \"$(echo pkill) -f x\"",
+            "echo 'pkill -f x' | sh",
+            "echo pkill | bash -s",
+            "source <(echo 'pkill -f x')",
+            ". <(echo pkill)",
+            "find . -exec {} -f x \\; -o -name pkill",
+            "echo /usr/bin/pkill | xargs -I{} {} -f x",
+            "/usr/bin/pk[i]ll -f x",
+            "/usr/bin/pk?ll -f x",
+            "/usr/bin/pk*ll -f x",
+            "{pkill,-f,x}",
+            "/usr/bin/p{k,k}ill -f x",
+        ] {
+            assert_eq!(procps_says(command, &facts), Out::Ask, "{command}");
+        }
+        // Anything else is an ordinary program: a path, `skill`, `--kill-after`,
+        // `KILL_AFTER=5` and a tool in another command are not the tool.
         for command in [
             "$EDITOR notes.txt",
-            "exec \"$@\"",
-            "$CC -o x y.c",
+            "$EDITOR notes/skills.md",
+            "$CC -o skill skill.c",
+            "$TOOL --killswitch",
+            "$RUNNER --kill-after 5 test",
+            "export KILL_AFTER=5; $CMD",
+            "git commit -m 'skill: x' && $PAGER log",
+            "git log --grep=kill | $PAGER",
+            "${EDITOR:-vi} killer.txt",
+            "c=echo; $c kill",
+            "pkill -f no-such-process-xyz; $EDITOR out.log",
+            "for s in 1 2 3; do $RUNNER $s; done; echo \"kill list done\"",
+            "$SHELL -c 'echo kill'",
+            "sh -c \"kill $PID\"",
             "bash -c \"$script\"",
             "eval $setup",
+            "exec \"$@\"",
             "FOO=1 $tool --flag",
+            "cat notes | sh",
+            "echo ok | bash",
+            "source ~/.profile",
+            "eval \"$(ssh-agent -s)\"",
         ] {
-            assert_eq!(
-                classify_output(&run_on(Dialect::Procps, command, &facts)),
-                Out::Silent,
-                "{command}"
-            );
+            assert_eq!(procps_says(command, &facts), Out::Silent, "{command}");
         }
     }
 
@@ -5904,19 +7005,47 @@ mod tests {
     }
 
     #[test]
-    fn an_alias_defined_on_the_line_that_names_a_signal_command_is_asked_about() {
+    fn an_alias_defined_on_the_line_is_read_as_what_it_stands_for() {
+        let facts = world();
+        for command in [
+            "alias k=pkill; k -f gitpulse",
+            "alias k='pkill -f'; k gitpulse",
+            "alias k='pkill -f gitpulse'; k",
+            "bash -c \"alias k=pkill; k -f gitpulse\"",
+            "alias a=b b=pkill; b -f gitpulse",
+        ] {
+            assert_eq!(procps_says(command, &facts), Out::Deny, "{command}");
+        }
+        // Read, so what it stands for decides: nothing signalled, nothing said.
         let facts = quiet();
         for command in [
-            "alias k=pkill; k -f gitpulse-short",
-            "alias k='pkill -f'; k gitpulse-short",
+            "alias ll='ls -l'; ll",
+            "alias killp='echo kill'; killp",
+            "alias k='kill -9'; k 99999",
             "alias killer=ls",
-            "bash -c \"alias k=pkill; k -f gitpulse-short\"",
+            "alias",
+            "unalias k",
+            "alias k=pkill; k -f no-such-process-xyz",
         ] {
-            assert_eq!(procps_says(command, &facts), Out::Ask, "{command}");
-        }
-        for command in ["alias ll='ls -l'", "alias", "unalias k"] {
             assert_eq!(procps_says(command, &facts), Out::Silent, "{command}");
         }
+        // An alias named for a signal tool does not hide the command as written.
+        let facts_world = world();
+        for command in [
+            "alias pkill=echo; pkill -f gitpulse",
+            "alias kill=true; kill -1",
+            "alias killall='echo x'; killall gitpulsed",
+        ] {
+            assert_eq!(procps_says(command, &facts_world), Out::Deny, "{command}");
+        }
+        // An alias that names itself ends.
+        assert_eq!(procps_says("alias ls='ls -l'; ls", &facts), Out::Silent);
+        assert_eq!(procps_says("alias a=a; a -f x", &facts), Out::Silent);
+        // An alias whose value is not plain text, on a line that spells a tool.
+        assert_eq!(
+            procps_says("alias k=\"$x pkill\"; k -f x", &facts),
+            Out::Ask
+        );
     }
 
     #[test]
@@ -5980,9 +7109,243 @@ mod tests {
             "fuser -k 8080/tcp",
             "killall5 -9",
             "k -f claude",
+            // A program the line builds with a command, where no tool is a
+            // word of it; a link or a file the line makes and then runs; a
+            // script file; a pid list the line only reads from a file it
+            // did not write.
+            "c=$(printf 'pk%s' ill); $c -f claude",
+            "eval \"$(printf 'pk%s' ill) -f claude\"",
+            "bash -c \"$(printf 'pk%s' ill) -f claude\"",
+            "ln -s /usr/bin/pkill /tmp/xpkill; /tmp/xpkill -f claude",
+            "printf 'pkill -f claude' > /tmp/s.sh; bash /tmp/s.sh",
+            "kill $(cat /tmp/pids)",
+            "script -qc 'pkill -f claude' /dev/null",
+            "flock /tmp/lock -c 'echo hi'",
         ] {
             assert_eq!(procps_says(command, &facts), Out::Silent, "{command}");
         }
+    }
+
+    /// Class 3, wrappers: each is read through to the program it runs, from the
+    /// one list `resolve` has (nothing here is a second list).
+    #[test]
+    fn wrappers_with_options_and_a_positional_are_read_through() {
+        let facts = world();
+        for command in [
+            "ionice -c3 pkill -f gitpulse",
+            "ionice -c 2 -n 5 pkill -f gitpulse",
+            "taskset -c 0 pkill -f gitpulse",
+            "taskset 0x3 pkill -f gitpulse",
+            "chrt -o 0 pkill -f gitpulse",
+            "chrt -f 10 pkill -f gitpulse",
+            "flock /tmp/lock pkill -f gitpulse",
+            "flock -w 5 /tmp/lock pkill -f gitpulse",
+            "flock /tmp/lock -c 'pkill -f gitpulse'",
+            "setpriv --no-new-privs pkill -f gitpulse",
+            "setpriv --reuid 1000 --regid 1000 pkill -f gitpulse",
+            "unshare -r pkill -f gitpulse",
+            "unshare --map-user=1000 -m pkill -f gitpulse",
+            "nohup nice -n 5 timeout 5 stdbuf -o0 setsid pkill -f gitpulse",
+            "env -i A=1 command exec pkill -f gitpulse",
+            "sudo -n doas pkill -f gitpulse",
+        ] {
+            assert_eq!(procps_says(command, &facts), Out::Deny, "{command}");
+        }
+        for command in [
+            "ionice -p 1",
+            "taskset -p 0x1 1234",
+            "chrt -p 1234",
+            "chrt -m",
+            "ionice -c3 ls",
+            "taskset -c 0 sleep 1",
+            "flock /tmp/lock true",
+        ] {
+            assert_eq!(procps_says(command, &facts), Out::Silent, "{command}");
+        }
+    }
+
+    #[test]
+    fn a_shell_with_options_before_dash_c_has_its_script_read() {
+        let facts = world();
+        for command in [
+            "bash -o pipefail -c 'pkill -f gitpulse'",
+            "bash -O extglob -c 'pkill -f gitpulse'",
+            "bash +o history -c 'pkill -f gitpulse'",
+            "bash --noprofile --norc -o errexit -c 'pkill -f gitpulse'",
+            "bash -eu -o pipefail -c 'pkill -f gitpulse'",
+            "bash -ec 'pkill -f gitpulse'",
+            "bash -lc 'pkill -f gitpulse'",
+            "zsh -l -c 'pkill -f gitpulse'",
+            "sh -c 'pkill -f gitpulse' name arg",
+            "bash --rcfile /dev/null -c 'pkill -f gitpulse'",
+            "bash -c -- 'pkill -f gitpulse'",
+        ] {
+            assert_eq!(procps_says(command, &facts), Out::Deny, "{command}");
+        }
+        // A shell given a file, or a script with no signal in it.
+        for command in [
+            "bash script.sh",
+            "bash -o pipefail script.sh",
+            "bash -c 'echo hi'",
+            "bash",
+        ] {
+            assert_eq!(procps_says(command, &facts), Out::Silent, "{command}");
+        }
+    }
+
+    /// Class 3, pids: a loop, a variable or a file that carries the output of a
+    /// `pgrep` or `pidof` on the line into `kill` is that command's set.
+    #[test]
+    fn pids_a_loop_a_variable_or_a_file_carries_into_kill_are_the_producers_set() {
+        let facts = world();
+        for command in [
+            "for p in $(pgrep -f gitpulse); do kill $p; done",
+            "for p in `pgrep -f gitpulse`; do kill -9 $p; done",
+            "pgrep -f gitpulse | while read p; do kill $p; done",
+            "pgrep -f gitpulse | while read -r p; do kill -TERM \"$p\"; done",
+            "pids=$(pgrep -f gitpulse); kill $pids",
+            "pids=$(pgrep -f gitpulse); kill \"$pids\"",
+            "export pids=$(pgrep -f gitpulse); kill $pids",
+            "mapfile -t p < <(pgrep -f gitpulse); kill \"${p[@]}\"",
+            "readarray -t p < <(pgrep -f gitpulse); kill ${p[@]}",
+            "xargs kill < <(pgrep -f gitpulse)",
+            "pgrep -f gitpulse > /tmp/pids; kill $(cat /tmp/pids)",
+            "pidof gitpulsed > /tmp/pids; kill $(cat /tmp/pids)",
+            "pids=$(pidof gitpulsed); kill $pids",
+            "for p in $(pidof gitpulsed); do kill $p; done",
+        ] {
+            assert_eq!(procps_says(command, &facts), Out::Deny, "{command}");
+        }
+        // The producer decides: nothing it reaches, nothing said.
+        for command in [
+            "for p in $(pgrep -f no-such-process-xyz); do kill $p; done",
+            "pids=$(pgrep -f no-such-process-xyz); kill $pids",
+        ] {
+            assert_eq!(procps_says(command, &quiet()), Out::Silent, "{command}");
+        }
+        // A pid variable the line did not fill, beside a pgrep or a pidof, is a
+        // list GitPulse cannot follow; without one it is an ordinary variable.
+        assert_eq!(
+            procps_says("pgrep -f x > /dev/null; kill $PID", &quiet()),
+            Out::Ask
+        );
+        for command in ["kill $PID", "kill -9 $pid", "echo hi; kill $!"] {
+            assert_eq!(procps_says(command, &quiet()), Out::Silent, "{command}");
+        }
+    }
+
+    #[test]
+    fn a_pidof_argument_the_shell_expands_first_is_asked_about() {
+        let facts = quiet();
+        for command in [
+            "kill $(pidof /d/gitpulse-w5b-e*)",
+            "kill $(pidof /d/s[l])",
+            "kill $(pidof /d/{sl,x})",
+            "kill $(pidof /d/gitpulse-w5b-ex?)",
+            "kill $(pidof gitpulse*)",
+        ] {
+            assert_eq!(procps_says(command, &facts), Out::Ask, "{command}");
+        }
+        for command in [
+            "kill $(pidof nosuchprocessxyz)",
+            "kill $(pidof /usr/bin/nosuchxyz)",
+        ] {
+            assert_eq!(procps_says(command, &facts), Out::Silent, "{command}");
+        }
+    }
+
+    /// Ruling 2, regular expressions the guard cannot answer for.
+    #[test]
+    fn a_posix_class_or_a_case_folded_non_ascii_name_is_asked_about() {
+        let mut facts = quiet();
+        facts.rows.push(row(2100, 1, &["caf\u{e9}-daemon"]));
+        facts
+            .rows
+            .push(row(2101, 1, &["g\u{131}tpulse-x", "--flag"]));
+        // A class is the locale's to glibc.
+        for command in [
+            "pkill -f 'caf[[:alpha:]]'",
+            "pkill 'x[[:space:]]y'",
+            "pkill -f 'a[[=e=]]b'",
+            "pkill -f 'a[[.hyphen.]]b'",
+            "killall -r 'x[[:alpha:]]'",
+        ] {
+            assert_eq!(procps_says(command, &facts), Out::Ask, "{command}");
+        }
+        // `-i` against a non-ASCII pattern or name: `ı` is an `I` to glibc.
+        for command in [
+            "pkill -fi 'GITPULSE-X'",
+            "pkill -fi 'nomatch'",
+            "pkill -i 'caf\u{c9}'",
+            "killall -r -I 'nomatch'",
+        ] {
+            assert_eq!(procps_says(command, &facts), Out::Ask, "{command}");
+        }
+        // Without `-i` the non-ASCII subject is an ordinary one, and a row that
+        // matched is simply a hit.
+        assert_eq!(procps_says("pkill -f nomatchxyz", &facts), Out::Silent);
+        assert_eq!(
+            pids_in(Dialect::Procps, "pkill -fi 'caf\u{e9}-daemon'", &facts),
+            vec![2100]
+        );
+        // macOS is untouched.
+        assert_eq!(
+            classify_output(&run_on(Dialect::Bsd, "pkill -fi 'nomatch'", &facts)),
+            Out::Silent
+        );
+    }
+
+    /// procps matches `-f` against the first 131071 bytes of a command line.
+    #[test]
+    fn a_command_line_is_also_read_as_procps_cuts_it() {
+        let mut facts = quiet();
+        let filler = "a".repeat(100_000);
+        facts
+            .rows
+            .push(row(2100, 1, &["gitpulse-trunc", &filler, &filler, "END"]));
+        // The tail is past the cut: the tool does not see `END`, an anchor on
+        // the cut sees `a`; the whole line still shows the guard `END`.
+        assert_eq!(
+            pids_in(Dialect::Procps, "pkill -f 'a$'", &facts),
+            vec![2100]
+        );
+        assert_eq!(
+            pids_in(Dialect::Procps, "pkill -f 'END$'", &facts),
+            vec![2100]
+        );
+        assert!(
+            full_subjects(Dialect::Procps, &facts.rows[facts.rows.len() - 1], false)
+                .iter()
+                .any(|s| s.len() == PROCPS_CMDLINE_CUT)
+        );
+        // A short line has no cut copy.
+        let short = row(2101, 1, &["gitpulse-short", "x"]);
+        assert_eq!(full_subjects(Dialect::Procps, &short, false).len(), 1);
+    }
+
+    /// A command line with bytes that are not UTF-8 reaches the guard replaced;
+    /// a pattern that counts characters is asked about, one that does not is
+    /// not.
+    #[test]
+    fn invalid_utf8_in_a_command_line_is_asked_about_for_a_pattern_that_counts_characters() {
+        let mut facts = quiet();
+        facts
+            .rows
+            .push(row(2100, 1, &["gitpulse-bad", "x\u{fffd}y"]));
+        for command in [
+            "pkill -f 'x..y$'",
+            "pkill -f 'bad x.{3}y'",
+            "pkill -f 'x[^a][^a]y'",
+            r"pkill -f 'x\?\?y$'",
+        ] {
+            assert_eq!(procps_says(command, &facts), Out::Ask, "{command}");
+        }
+        // A literal pattern counts nothing.
+        assert_eq!(
+            procps_says("pkill -f 'nomatch-literal'", &facts),
+            Out::Silent
+        );
+        assert_eq!(procps_says("pkill -f 'nomatch-lit*'", &facts), Out::Silent);
     }
 
     /// Class 4. A root sender can signal every process, so a command line it
@@ -6074,16 +7437,22 @@ mod tests {
         assert!(is_gitpulse(&spoofed));
         let mut without = spoofed.clone();
         without.real_exe = None;
+        without.name = "renamed-comm".to_string();
         assert!(
             !is_gitpulse(&without),
             "by argv[0] alone it is not, which is how it was missed"
         );
+        // The kernel's name for it, which `argv[0]` does not change, is one
+        // more thing that says what it is.
+        let mut by_comm = without.clone();
+        by_comm.name = "gitpulse-aliased".to_string();
+        assert!(is_gitpulse(&by_comm));
         let mut facts = quiet();
         facts.rows.push(spoofed);
         assert_eq!(procps_says("pkill gitpulse-aliased", &facts), Out::Deny);
         facts.rows.pop();
         facts.rows.push(without);
-        assert_eq!(procps_says("pkill gitpulse-aliased", &facts), Out::Silent);
+        assert_eq!(procps_says("pkill renamed-comm", &facts), Out::Silent);
         // The app bundle is recognised by the executable too.
         let bundled = linux_row(
             2101,
@@ -6096,6 +7465,42 @@ mod tests {
         // `argv[0]` still says it is GitPulse, as it did.
         let claims = linux_row(2102, "sleep", &["/opt/gitpulse-fake"], "/bin/sleep");
         assert!(is_gitpulse(&claims));
+    }
+
+    /// Fail closed on identity: a process in the match set whose executable
+    /// could not be read, or is the dynamic loader, is not passed by the
+    /// spelling it chose.
+    #[test]
+    fn a_process_whose_executable_is_unknown_is_asked_about_not_passed_by_its_spelling() {
+        let mut unknown = linux_row(2100, "ndprog", &["/opt/other/ndprog"], "/unused");
+        unknown.real_exe = None;
+        unknown.exe_unknown = true;
+        let mut facts = quiet();
+        facts.rows.push(unknown.clone());
+        let output = run_on(Dialect::Procps, "pkill ndprog", &facts);
+        assert_eq!(classify_output(&output), Out::Ask, "{output:?}");
+        assert!(reason_of(&output).contains("executable"), "{output:?}");
+        // The same process with its executable known is an ordinary one.
+        let mut known = unknown.clone();
+        known.exe_unknown = false;
+        known.real_exe = Some("/opt/other/ndprog".to_string());
+        facts.rows.pop();
+        facts.rows.push(known);
+        assert_eq!(procps_says("pkill ndprog", &facts), Out::Silent);
+        // By the kernel's name it is still GitPulse: a refusal, not a question.
+        let mut by_name = unknown.clone();
+        by_name.name = "gitpulse-nd".to_string();
+        facts.rows.pop();
+        facts.rows.push(by_name);
+        assert_eq!(procps_says("pkill gitpulse-nd", &facts), Out::Deny);
+        // Through the loader its program is the first argument.
+        let through = linux_row(
+            2101,
+            "ld-linux-aarch64",
+            &["/lib/ld-linux-aarch64.so.1", "/tmp/lab/gitpulse-ld"],
+            "/lib/ld-linux-aarch64.so.1",
+        );
+        assert!(is_gitpulse(&through));
     }
 
     /* ── property: nothing panics, everything is bounded ── */

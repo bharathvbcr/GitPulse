@@ -1334,11 +1334,22 @@ fn every_real_signalling_shape_is_asked_about_or_a_stated_limit() {
         shape("p=pk\"\"ill; $p -f gitpulse-w5b-shape"),
         shape("p=pk; ${p}ill -f gitpulse-w5b-shape"),
         shape("p=pkil; ${p}l -f gitpulse-w5b-shape"),
-        shape("c=$(printf 'pk%s' ill); $c -f gitpulse-w5b-shape"),
+        // a program built by a command, with no signal tool a word of the
+        // command: a stated limit (the program is what the command prints)
+        limit(
+            "c=$(printf 'pk%s' ill); $c -f gitpulse-w5b-shape",
+            "a program built by a command substitution, no signal tool a word of it",
+        ),
         shape("P=/usr/bin/pk; ${P}ill -f gitpulse-w5b-shape"),
         shape("a=p; b=ki; c=ll; $a$b$c -f gitpulse-w5b-shape"),
-        shape("eval \"$(printf 'pk%s' ill) -f gitpulse-w5b-shape\""),
-        shape("bash -c \"$(printf 'pk%s' ill) -f gitpulse-w5b-shape\""),
+        limit(
+            "eval \"$(printf 'pk%s' ill) -f gitpulse-w5b-shape\"",
+            "a program built by a command substitution, no signal tool a word of it",
+        ),
+        limit(
+            "bash -c \"$(printf 'pk%s' ill) -f gitpulse-w5b-shape\"",
+            "a program built by a command substitution, no signal tool a word of it",
+        ),
         // the program word is not a plain word
         shape("$'\\x70kill' -f gitpulse-w5b-shape"),
         shape("$'p\\153ill' -f gitpulse-w5b-shape"),
@@ -1357,8 +1368,14 @@ fn every_real_signalling_shape_is_asked_about_or_a_stated_limit() {
         shape("printf 'pkill -f gitpulse-w5b-shape\\n' | sh -s"),
         shape("bash <<< 'pkill -f gitpulse-w5b-shape'"),
         shape("source <(echo 'pkill -f gitpulse-w5b-shape')"),
-        shape("printf 'pkill -f gitpulse-w5b-shape\\n' > @DIR@/s.sh; bash @DIR@/s.sh"),
-        shape("printf 'pkill -f gitpulse-w5b-shape\\n' > @DIR@/s2.sh; chmod +x @DIR@/s2.sh; @DIR@/s2.sh"),
+        limit(
+            "printf 'pkill -f gitpulse-w5b-shape\\n' > @DIR@/s.sh; bash @DIR@/s.sh",
+            "a script file the line writes and then runs",
+        ),
+        limit(
+            "printf 'pkill -f gitpulse-w5b-shape\\n' > @DIR@/s2.sh; chmod +x @DIR@/s2.sh; @DIR@/s2.sh",
+            "a script file the line writes and then runs",
+        ),
         // wrappers that are not in the reader's list
         shape("ionice -c3 pkill -f gitpulse-w5b-shape"),
         shape("taskset -c 0 pkill -f gitpulse-w5b-shape"),
