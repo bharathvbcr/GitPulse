@@ -701,10 +701,12 @@ stdin at all when the event is unknown or is a state or a resolution outside a
 GitPulse terminal, and otherwise reads once (up to 16 MiB) and builds only the
 fields it uses.
 
-**Measured** (`src-tauri/tests/notify_stdin_bench.rs`, an `#[ignore]`d test,
-release hooks, A is the hook built from the tree before the change and B the
-one after, interleaved and rotated per round, 9 rounds x 20 calls per case, min
-and median of the per-round medians, load average 4 to 5, macOS):
+**Measured** (`src-tauri/benches/notify_stdin_bench.rs`, then an `#[ignore]`d
+test in `tests/` and a registered `[[bench]]` since; release hooks, A is the
+hook built from the tree before the change and B the one after, interleaved and
+rotated per round, 9 rounds x 20 calls per case, min and median of the
+per-round medians, load average 4 to 5, macOS). The A rows are the bench's
+`(base)` rows, present only when `GITPULSE_BENCH_BASE_HOOK` is set:
 
 ```text
 cargo build --release --bin gitpulse-hook    # on the tree before the change
@@ -712,7 +714,7 @@ cp target/release/gitpulse-hook /tmp/gitpulse-hook-base
 # apply the change, rebuild
 GITPULSE_BENCH_BASE_HOOK=/tmp/gitpulse-hook-base \
 GITPULSE_BENCH_HOOK=target/release/gitpulse-hook \
-cargo test --release --test notify_stdin_bench -- --ignored --nocapture
+cargo bench --manifest-path src-tauri/Cargo.toml --bench notify_stdin_bench
 ```
 
 | case | A min median | B min median | A median median | B median median |
@@ -939,7 +941,8 @@ Committed baselines: `local-macos-aarch64` (below, re-seeded after the lag-audit
 | `repo_read` | `get_status` at 1k and 10k files, clean and dirty, with git processes | A-git-05; git-status-assist-spike |
 | `command_timings` | insights snapshot, `list_worktrees listing`, `list_worktrees full`, language stats, docs refresh, `catch_up` (steady and cold), commit details on an 18-worktree fixture | the lag audit's snapshot / listing / stats / docs / catch-up / commit-details cards; `list_worktrees listing` (`list_worktrees_scanned` at `ScanDepth::Listing`, the `cmd_list_worktrees` default) is the baseline for ft-28c58695 (card 4), and `list_worktrees full` (`ScanDepth::Full`, the Worktrees panel's explicit opt-in) is the baseline for the Worktrees panel path |
 | `terminal_pty` | MB/s through a real PTY, IPC messages per MiB, keystroke echo p50 idle and during a flood in another session | terminal-output-channel; terminal-reader-kqueue |
-| `tests/alerts_worker_throughput.rs` (an ignored test, not a registered bench: `Cargo.toml` is held) | sustained notices/s through the intake, the 64-slot queue and the real notification worker: hook state reports and renderer answers over 64 sessions, 50,000 per sample, a full queue retried and counted. `cargo test --release --manifest-path src-tauri/Cargo.toml --test alerts_worker_throughput -- --ignored --nocapture` | ft-9cfd5474 (S1-08; row in ft-c0d9313f) |
+| `alerts_worker_throughput` | sustained notices/s through the intake, the 64-slot queue and the real notification worker: hook state reports and renderer answers over 64 sessions, 50,000 per sample, a full queue retried and counted. Time ungated (a producer/worker hand-off is the scheduler's); the notice and session counters are gated | ft-9cfd5474 (S1-08; row in ft-c0d9313f) |
+| `notify_stdin_bench` | `gitpulse-hook notify` per call (median of 20) at 0 B, 100 KiB and 4 MiB of stdin, outside a GitPulse terminal and inside one against a socket that acknowledges; `(base)` rows beside each when `GITPULSE_BENCH_BASE_HOOK` names a hook built before a change. Time ungated (a process start); the call and stdin-byte counters are gated | ft-9cfd5174 (S1-07) |
 | `idle_wakeups` | process interrupt wakeups/s with 0, 1, 8, 32 idle terminal sessions, an idle mailbox, 8 / 24 idle watches, an idle alerts bridge and the host-load sampler | terminal-reader-kqueue; always-on-pollers; ft-79394019 (Wave 0) |
 | `live_index` | duty cycle of the live index under a 40-tick, 250 ms-cadence edit storm against a stub `devmap` | live-index-duty-cycle |
 | `worktree_teardown` | `remove_worktree` (lock-held) and `merge_and_teardown_worktree` on a worktree with 100k ignored files, and the merge with 0 entries as the control; `contender_wait_ns` of a `lock_worktree` issued mid-teardown | CARD 22 S5-11 (ft-9d04447403db7f9525dce4db970e4b8a) |
@@ -2161,7 +2164,7 @@ Shared reads (`src/lib/ipc/sharedReads.ts`, the map in `invoke.ts`) join an in-f
 
 ## 2026-10-24: notification worker msgs/sec (ft-9cfd547403d57c1725e3ccdb97144170, S1-08; row in ft-c0d9313f)
 
-`alerts_worker_throughput` (N = 9, release, 18 cpus): 50,000 notices per sample over 64 sessions through `alerts::try_offer`, the 64-slot queue and the real worker, a full queue retried. Command: `cargo test --release --manifest-path src-tauri/Cargo.toml --test alerts_worker_throughput -- --ignored --nocapture`. Not in the baseline gate or CI: it is a test, because `Cargo.toml` is held; it becomes a `[[bench]]` when that is free.
+`alerts_worker_throughput` (N = 9, release, 18 cpus): 50,000 notices per sample over 64 sessions through `alerts::try_offer`, the 64-slot queue and the real worker, a full queue retried. Measured as an ignored test (`cargo test --release --manifest-path src-tauri/Cargo.toml --test alerts_worker_throughput -- --ignored --nocapture`), because `Cargo.toml` was held. It is now a `[[bench]]` on the shared harness (`cargo bench --manifest-path src-tauri/Cargo.toml --bench alerts_worker_throughput`) and is in `benches.yml`'s `BENCHES`; `ubuntu-latest` and `macos-latest` have no committed baseline at all (so the scheduled compare step notices that and compares nothing, per `4797eb40`), and `local-macos-aarch64` does not carry this bench (a by-hand compare against it notes "ran but has no baseline" and does not fail). Its first baseline is the `bench-<runner>` artifact of a scheduled or manual `benches.yml` run, committed with `scripts/bench-compare.mjs --write-baseline`.
 
 | row | min | p50 | notices/s at min |
 | --- | --- | --- | --- |
