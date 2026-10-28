@@ -54,13 +54,32 @@
 //!   when either matches, never fewer than before.
 //! * `-G` (group) and `-t` (terminal) are not in the table: those commands are
 //!   asked about, not guessed at.
-//! * POSIX extended regular expressions are evaluated with the `regex` crate. A
-//!   pattern it cannot compile is asked about; a few constructs read differently
-//!   (`\d` is a digit here and a literal `d` to `regcomp`).
+//! * Patterns are evaluated with the `regex` crate and the tools use glibc's
+//!   `regcomp` (POSIX extended). A pattern it cannot compile is asked about. On
+//!   Linux the guard also asks about a pattern whose syntax the two read
+//!   differently (`\d`, `\w`, `\b`, `\<`, `\n`, `\1` and every other backslash
+//!   escape that is not of a metacharacter, a backslash or a collating symbol
+//!   in a bracket expression, an invalid `{`: `ere_uncertainty`), after
+//!   refusing it if what the guard could evaluate already reaches too much. It
+//!   matches `.` across a newline, and tries every subject in the readings
+//!   procps-ng 4.0.4 was observed to give it: control characters replaced
+//!   (newline by a space; in a UTF-8 locale the rest by `?`, in the C locale by
+//!   `.`), an empty argument between two others kept, a blanked command line a
+//!   single `?` (`Pattern`, `full_subjects`). Not modelled: bracket ranges
+//!   under a locale's collation order, locales other than `C` and UTF-8, and
+//!   procps or glibc releases other than the ones the differential ran
+//!   against. macOS reads patterns as it always did, so there `\d` is a digit
+//!   here and a literal `d` to `regcomp`.
 //! * A variable that is not `$HOME`, `$USER` or `$LOGNAME` is not expanded, so a
-//!   pattern or user built from one is asked about. A pid list from `$PID` is
-//!   one pid and is left to the user's rules.
-//! * Only this user's processes can be signalled, so only they are counted.
+//!   pattern or user built from one is asked about, and so is a program (or an
+//!   `eval`/`-c` script) named by one, but only when the line says `kill`
+//!   somewhere: a variable set on the line, in a word that says so. One set
+//!   outside the line is not seen. A pid list from `$PID` is one pid and is
+//!   left to the user's rules.
+//! * Only this user's processes can be signalled, so only they are counted. A
+//!   sender that is root reaches every process, so the table reads every
+//!   process's arguments (up to 64 MiB of them) and counts them all; one it
+//!   could not read is asked about, not passed with a notice.
 //! * macOS `pkill` leaves ancestors out; procps `pkill` does not. The guard
 //!   follows the tool on the host, so a Linux `pkill` that would reach an
 //!   ancestor is counted and can be refused.
@@ -87,7 +106,27 @@
 //!   `/proc/<pid>`, which the kernel makes root's for a process that is not
 //!   dumpable. A process that runs as the user is counted whatever its other
 //!   ids say.
-//! * `ssh host pkill …`, `find -exec kill`, `parallel` and the like are not read.
+//! * A process is a GitPulse process or an agent session by the executable the
+//!   kernel runs it from (`/proc/<pid>/exe` on Linux), as well as by the path
+//!   it was exec'd with, so a GitPulse binary run under another `argv[0]` is
+//!   still one. A word given to Linux `pidof` with a `/` in it is an
+//!   executable: the guard counts the processes running that file (the path as
+//!   written and as it resolves, symbolic links followed) and, as for a name,
+//!   those whose name is its last component. A hard link under another path is
+//!   not followed, and `pidof -x NAME` for a shell running a script named NAME
+//!   (it answers with the shell's pid) is not modelled.
+//! * Programs the shell reader asks about rather than reads: a `busybox` or
+//!   `toybox` applet of `pkill`, `killall` or `killall5` (their options are not
+//!   procps's), an `alias` defined on the line that names a signal command,
+//!   `find -exec`/`-execdir`/`-ok`/`-okdir` of a signal command, and `ssh` to
+//!   this machine (`localhost`, a loopback address, or a host built from a
+//!   variable) with a signal command in it.
+//! * Not read at all, and so silent: `ssh` to another host (its processes are
+//!   not on this machine); `parallel`, `watch`, `nsenter`, `su -c`,
+//!   `env -S`, `script -c`, `docker exec` and the like, whose arguments are a
+//!   command; an alias, function or variable defined outside the line; other
+//!   programs that signal (`skill`, `snice`, `fuser -k`, `systemctl kill`,
+//!   `killall5` outside busybox).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -785,6 +824,17 @@ impl Plan {
         names
     }
 
+    fn exe_paths(&self) -> Vec<String> {
+        self.findings
+            .iter()
+            .filter_map(|f| match &f.sel {
+                Sel::Killall(s) => Some(s.exe_paths.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
     fn needs_pgids(&self) -> bool {
         self.findings.iter().any(|f| match &f.sel {
             Sel::Group(_) => true,
@@ -906,6 +956,9 @@ struct PgrepSpec {
 struct KillallSpec {
     dialect: Dialect,
     names: Vec<String>,
+    /// Paths to executables, from a `pidof` word with a `/` in it: a process
+    /// that runs one is picked whatever name it goes by.
+    exe_paths: Vec<String>,
     regex: bool,
     /// psmisc `-I`.
     icase: bool,
@@ -929,6 +982,18 @@ const KEYWORDS: [&str; 11] = [
     "if", "then", "else", "elif", "while", "until", "do", "!", "time", "{", "}",
 ];
 const SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", "fish"];
+/// Programs that send a signal to whatever they are given or select.
+const SIGNALLERS: [&str; 4] = ["kill", "pkill", "killall", "killall5"];
+
+/// Whether an `ssh` destination (`host`, `user@host`) is this machine.
+fn is_loopback_destination(word: &str) -> bool {
+    let host = word.rsplit('@').next().unwrap_or(word);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host == "::1"
+        || host == "0.0.0.0"
+        || host.starts_with("127.")
+}
 /// First commands whose output is a handful of pids at most.
 const NARROW_PRODUCERS: [&str; 7] = ["lsof", "cat", "echo", "printf", "jobs", "pbpaste", "head"];
 
@@ -980,6 +1045,7 @@ fn plan_with(command: &str, env: EnvFn, dialect: Dialect) -> Plan {
                 budget: &mut budget,
                 env,
                 dialect,
+                mentions_kill: contains_kill(command),
             };
             cx.walk(&script, 0);
         }
@@ -998,6 +1064,10 @@ struct Cx<'a> {
     budget: &'a mut Budget,
     env: EnvFn,
     dialect: Dialect,
+    /// The line, nested scripts included, says `kill` somewhere. A program
+    /// word the guard cannot resolve is asked about only then: a variable that
+    /// stands for `pkill` was set on this line, in a word that says so.
+    mentions_kill: bool,
 }
 
 /// The command a wrapper (`sudo`, `env`, `nohup` …) runs.
@@ -1006,6 +1076,19 @@ struct Resolved<'a> {
     prog_at: usize,
     args: &'a [Word],
     elevated: bool,
+    /// Run as an applet of `busybox` or `toybox`, whose `pkill`, `killall` and
+    /// `kill` read their own options, not procps's or psmisc's.
+    applet: bool,
+}
+
+/// Why a command line names no program the guard can read.
+#[derive(Debug, PartialEq, Eq)]
+enum Unresolved {
+    /// Nothing runs: a builtin that only queries, or no command at all.
+    Nothing,
+    /// The program word is built from a variable or a substitution, so which
+    /// program runs is known only when the shell runs it.
+    Dynamic,
 }
 
 fn base_name(path: &str) -> &str {
@@ -1044,19 +1127,20 @@ fn skip_options(words: &[Word], mut i: usize, with_arg: &[&str]) -> usize {
 }
 
 /// Looks through `env`, `sudo`, `command`, `nohup` and the other wrappers to
-/// the program that runs. `None` when nothing runs (a builtin that only
-/// queries, a program named by a variable).
-fn resolve(words: &[Word]) -> Option<Resolved<'_>> {
+/// the program that runs. `Err` says why there is none: nothing runs (a
+/// builtin that only queries), or the program is named by a variable.
+fn resolve(words: &[Word]) -> Result<Resolved<'_>, Unresolved> {
     let mut i = 0usize;
     let mut elevated = false;
+    let mut applet = false;
     loop {
-        let w = words.get(i)?;
+        let w = words.get(i).ok_or(Unresolved::Nothing)?;
         if is_assignment(&w.text) || KEYWORDS.contains(&w.text.as_str()) {
             i += 1;
             continue;
         }
         if w.dynamic {
-            return None;
+            return Err(Unresolved::Dynamic);
         }
         let base = base_name(w.text.trim_start_matches('\\'));
         i = match base {
@@ -1085,8 +1169,12 @@ fn resolve(words: &[Word]) -> Option<Resolved<'_>> {
                     .get(i + 1)
                     .is_some_and(|w| w.text == "-v" || w.text == "-V")
                 {
-                    return None;
+                    return Err(Unresolved::Nothing);
                 }
+                skip_options(words, i + 1, &[])
+            }
+            "busybox" | "toybox" => {
+                applet = true;
                 skip_options(words, i + 1, &[])
             }
             "builtin" | "nohup" | "setsid" | "time" | "unbuffer" | "stdbuf" => {
@@ -1098,11 +1186,12 @@ fn resolve(words: &[Word]) -> Option<Resolved<'_>> {
             "caffeinate" => skip_options(words, i + 1, &["-t", "-w"]),
             "timeout" => skip_options(words, i + 1, &["-s", "-k"]) + 1,
             _ => {
-                return Some(Resolved {
+                return Ok(Resolved {
                     prog: base.to_string(),
                     prog_at: i,
                     args: &words[i + 1..],
                     elevated,
+                    applet,
                 })
             }
         };
@@ -1214,10 +1303,42 @@ impl Cx<'_> {
                 self.walk(body, depth + 1);
             }
         }
-        let Some(r) = resolve(&cmd.words) else { return };
+        let r = match resolve(&cmd.words) {
+            Ok(r) => r,
+            Err(Unresolved::Dynamic) => {
+                self.dynamic_program(echo(&cmd.words));
+                return;
+            }
+            Err(Unresolved::Nothing) => return,
+        };
         let text = echo(&cmd.words[r.prog_at..]);
         match r.prog.as_str() {
+            "pkill" | "killall" | "killall5" if r.applet => self.unevaluable(
+                text,
+                r.elevated,
+                format!(
+                    "`{}` run as a busybox or toybox applet reads its options its own way, not \
+                     procps's or psmisc's",
+                    r.prog
+                ),
+            ),
             "pkill" => self.pgrep(&r, text, true, true),
+            "alias" => {
+                if r.args
+                    .iter()
+                    .any(|w| contains_kill(&w.text) || (w.dynamic && self.mentions_kill))
+                {
+                    self.unevaluable(
+                        text,
+                        r.elevated,
+                        "an alias defined on this line may name a signal command, and a later \
+                         word on it runs the alias"
+                            .into(),
+                    );
+                }
+            }
+            "find" => self.find_exec(&r, &text, depth),
+            "ssh" => self.ssh_remote(&r, text),
             "killall" => match parse_killall(r.args, self.dialect) {
                 Parsed::Spec(spec) => self.push(Finding {
                     text,
@@ -1231,7 +1352,14 @@ impl Cx<'_> {
             "kill" => self.kill(r.args, &text, r.elevated, None),
             "xargs" => {
                 let inner = xargs_command(r.args);
-                let Some(i) = resolve(inner) else { return };
+                let i = match resolve(inner) {
+                    Ok(i) => i,
+                    Err(Unresolved::Dynamic) => {
+                        self.dynamic_program(text);
+                        return;
+                    }
+                    Err(Unresolved::Nothing) => return,
+                };
                 let upstream = (at > 0).then(|| (&pipeline[0], at == 1));
                 match i.prog.as_str() {
                     "kill" => self.kill(i.args, &text, r.elevated || i.elevated, upstream),
@@ -1265,12 +1393,95 @@ impl Cx<'_> {
                     .join(" ");
                 self.script_text(&joined, depth);
             }
+            "eval" => self.dynamic_program(text),
             _ => {}
+        }
+    }
+
+    /// A program, or a script a program runs, that is known only when the
+    /// shell expands it. Asked about when the line says `kill` anywhere: the
+    /// variable was set on it, in a word that says so.
+    fn dynamic_program(&mut self, text: String) {
+        if self.mentions_kill {
+            self.unevaluable(
+                text,
+                false,
+                "which program runs, or what script it is given, is built from a variable or \
+                 a substitution, on a line that mentions `kill`"
+                    .into(),
+            );
+        }
+    }
+
+    /// `find … -exec CMD … ;` runs `CMD` once for each file, with the file
+    /// named in place of `{}`, so the signal command on it is not the one that
+    /// runs: asked about, not read. A shell it hands a script is read.
+    fn find_exec(&mut self, r: &Resolved<'_>, text: &str, depth: usize) {
+        let args = r.args;
+        let mut i = 0;
+        while i < args.len() {
+            if !matches!(
+                args[i].text.as_str(),
+                "-exec" | "-execdir" | "-ok" | "-okdir"
+            ) {
+                i += 1;
+                continue;
+            }
+            let end = (i + 1..args.len())
+                .find(|&j| args[j].text == ";" || (args[j].text == "+" && args[j - 1].text == "{}"))
+                .unwrap_or(args.len());
+            let inner = &args[i + 1..end];
+            match resolve(inner) {
+                Ok(p) if SIGNALLERS.contains(&p.prog.as_str()) => self.unevaluable(
+                    text.to_string(),
+                    r.elevated || p.elevated,
+                    format!(
+                        "`find -exec {}` runs it once for each file it finds, with the file \
+                         named in the arguments, so GitPulse cannot tell which processes it \
+                         would signal",
+                        p.prog
+                    ),
+                ),
+                Ok(p) if SHELLS.contains(&p.prog.as_str()) => {
+                    if let Some(script) = shell_script(p.args) {
+                        self.shell_script(script, depth);
+                    }
+                }
+                Ok(_) | Err(Unresolved::Nothing) => {}
+                Err(Unresolved::Dynamic) => self.dynamic_program(text.to_string()),
+            }
+            i = end + 1;
+        }
+    }
+
+    /// `ssh HOST … pkill …` runs the signal command on `HOST`. On another
+    /// machine that is not this machine's processes, and not the guard's
+    /// business; on this one (`localhost`, a loopback address, a host named by
+    /// a variable) it is, and the command is a string the remote shell reads.
+    fn ssh_remote(&mut self, r: &Resolved<'_>, text: String) {
+        let names_a_signaller = r.args.iter().any(|w| {
+            w.text
+                .split(|c: char| c.is_whitespace() || ";&|()`$".contains(c))
+                .any(|token| SIGNALLERS.contains(&base_name(token)))
+        });
+        let reaches_this_machine = r
+            .args
+            .iter()
+            .any(|w| w.dynamic || is_loopback_destination(&w.text));
+        if names_a_signaller && reaches_this_machine {
+            self.unevaluable(
+                text,
+                r.elevated,
+                "`ssh` to this machine (or to a host GitPulse cannot name) runs the signal \
+                 command in a shell GitPulse does not read"
+                    .into(),
+            );
         }
     }
 
     fn shell_script(&mut self, script: &Word, depth: usize) {
         if script.dynamic {
+            self.dynamic_program(format!("-c {}", script.src));
             return;
         }
         let text = script.text.clone();
@@ -1294,7 +1505,7 @@ impl Cx<'_> {
     /// pipeline that produces them.
     fn producer(&mut self, first: &Cmd, single: bool, text: &str, elevated: bool) {
         let bounded = single;
-        let Some(r) = resolve(&first.words) else {
+        let Ok(r) = resolve(&first.words) else {
             self.unevaluable(
                 text.to_string(),
                 elevated,
@@ -1306,11 +1517,33 @@ impl Cx<'_> {
         match r.prog.as_str() {
             "pgrep" => self.pgrep(&r, format!("{text} (pids from `{source}`)"), false, bounded),
             "pidof" => {
-                let names: Vec<String> = r
+                let words: Vec<String> = r
                     .args
                     .iter()
                     .filter(|w| !w.text.starts_with('-'))
                     .map(|w| w.text.clone())
+                    .collect();
+                // Linux `pidof` reads a word with a `/` as a path to an
+                // executable and picks the processes running it, whatever
+                // they call themselves. The guard counts the processes that
+                // run that executable (the path as written and the one it
+                // resolves to), and, as it always has, every process with the
+                // last component of the path as its name.
+                let exe_paths: Vec<String> = words
+                    .iter()
+                    .filter(|word| word.contains('/'))
+                    .cloned()
+                    .collect();
+                let names: Vec<String> = words
+                    .iter()
+                    .flat_map(|word| {
+                        let last = base_name(word);
+                        if word.contains('/') && last != word {
+                            vec![word.clone(), last.to_string()]
+                        } else {
+                            vec![word.clone()]
+                        }
+                    })
                     .collect();
                 if r.args.iter().any(|w| w.dynamic) {
                     self.unevaluable(
@@ -1318,7 +1551,7 @@ impl Cx<'_> {
                         elevated,
                         "a process name built from a variable".into(),
                     );
-                } else if !names.is_empty() {
+                } else if !words.is_empty() {
                     self.push(Finding {
                         text: format!("{text} (pids from `{source}`)"),
                         elevated,
@@ -1326,6 +1559,7 @@ impl Cx<'_> {
                         sel: Sel::Killall(KillallSpec {
                             dialect: self.dialect,
                             names,
+                            exe_paths,
                             ..KillallSpec::default()
                         }),
                     });
@@ -2243,6 +2477,9 @@ pub(crate) struct Facts {
     pub(crate) users: HashMap<String, u32>,
     pub(crate) pgids: HashMap<i32, i32>,
     pub(crate) pidfiles: HashMap<String, Result<i32, String>>,
+    /// Executable paths a `pidof` was given, as the file system resolves them
+    /// (symbolic links followed): `pidof` compares the file, not the spelling.
+    pub(crate) exes: HashMap<String, String>,
 }
 
 #[cfg(unix)]
@@ -2336,7 +2573,20 @@ pub(crate) fn gather(plan: &Plan) -> Result<Facts, String> {
         let read = read_pidfile(&path);
         facts.pidfiles.insert(path, read);
     }
+    facts.exes = resolved_executables(&plan.exe_paths());
     Ok(facts)
+}
+
+/// Each executable path as the file system resolves it (symbolic links
+/// followed, `.` and `..` folded); a path that does not resolve is left out.
+fn resolved_executables(paths: &[String]) -> HashMap<String, String> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            let resolved = std::fs::canonicalize(path).ok()?;
+            Some((path.clone(), resolved.to_string_lossy().into_owned()))
+        })
+        .collect()
 }
 
 /// A signal from this user reaches the process: the sender is root, or the
@@ -2353,6 +2603,12 @@ fn reachable(facts: &Facts, row: &TableRow) -> bool {
         || senders
             .iter()
             .any(|s| *s == row.real_uid() || *s == row.saved_uid())
+}
+
+/// Whether the sender is root (by its real or effective uid), which can signal
+/// every process.
+fn sender_is_root(facts: &Facts) -> bool {
+    [facts.me_uid, facts.me_euid.unwrap_or(facts.me_uid)].contains(&0)
 }
 
 /// This process and the processes it descends from.
@@ -2457,17 +2713,256 @@ fn match_full(row: &TableRow) -> String {
     }
 }
 
-fn compile(pattern: &str, icase: bool, exact: bool) -> Result<Regex, String> {
+/// What a `-f` pattern is tried against for one process. macOS joins the
+/// arguments with a space. The procps tools do too, but an empty argument
+/// between two others is a double space to them, and a process that blanked
+/// its argument area is a single `?`; the guard tries those readings as well as
+/// the one it always has (the arguments that are not empty, or the name).
+///
+/// `foreign` is a process that is not the sender's own, whose arguments only a
+/// root sender reads. Until it did, such a process was matched by its name
+/// alone; the name stays one of its subjects, so no process that reading
+/// picked is let go.
+fn full_subjects(dialect: Dialect, row: &TableRow, foreign: bool) -> Vec<String> {
+    let mut subjects = if dialect == Dialect::Procps {
+        let present = |argv: &[String]| {
+            argv.iter()
+                .filter(|a| !a.is_empty())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        // The reading the guard has always had: the arguments that are not
+        // empty, or the name when there are none.
+        let mut subjects = vec![match &row.argv {
+            Some(argv) if argv.iter().any(|a| !a.is_empty()) => present(argv),
+            _ => row.name.clone(),
+        }];
+        match &row.argv {
+            Some(argv) if argv.is_empty() => subjects.push("?".to_string()),
+            Some(argv) => subjects.push(argv.join(" ")),
+            None => {}
+        }
+        subjects
+    } else {
+        vec![match_full(row)]
+    };
+    if foreign {
+        subjects.push(row.name.clone());
+    }
+    subjects.dedup();
+    subjects
+}
+
+/// A pattern as the guard reads it.
+///
+/// The tools match with glibc's `regcomp` (POSIX extended) and the guard with
+/// the `regex` crate, so on Linux the guard never answers from one reading of a
+/// subject or a pattern when the tools may read it another way that picks a
+/// process the first would not:
+///
+/// * `.` also matches a newline (`dot_matches_new_line`), as it does to glibc;
+/// * the procps tools do not hand the pattern the raw command line but one
+///   with its control characters replaced, and which replacement depends on
+///   the locale: newline becomes a space everywhere; in a UTF-8 locale every
+///   other control character and every invalid byte becomes `?`; in the C
+///   locale a control character becomes `.` and every byte outside ASCII,
+///   valid or not, a `?` of its own. A subject is tried as written and in both
+///   readings ([`Pattern::readings`]);
+/// * a pattern whose syntax means one thing to `regcomp` and another to the
+///   `regex` crate carries [`Pattern::uncertain`], and the command is asked
+///   about, never passed, when nothing else refuses it ([`ere_uncertainty`]).
+///
+/// Every reading only adds processes to the set the old reading picked.
+struct Pattern {
+    regex: Regex,
+    /// Why `regcomp` may read this pattern another way than the `regex` crate.
+    uncertain: Option<String>,
+}
+
+fn is_printable_ascii(text: &str) -> bool {
+    text.bytes().all(|b| (0x20..0x7f).contains(&b))
+}
+
+fn compile(dialect: Dialect, pattern: &str, icase: bool, exact: bool) -> Result<Pattern, String> {
     let source = if exact {
         format!("^(?:{pattern})$")
     } else {
         pattern.to_string()
     };
-    RegexBuilder::new(&source)
+    let procps = dialect == Dialect::Procps;
+    let regex = RegexBuilder::new(&source)
         .case_insensitive(icase)
+        .dot_matches_new_line(procps)
         .size_limit(REGEX_SIZE_LIMIT)
         .build()
-        .map_err(|e| format!("the pattern `{pattern}` is not one GitPulse can evaluate ({e})"))
+        .map_err(|e| format!("the pattern `{pattern}` is not one GitPulse can evaluate ({e})"))?;
+    Ok(Pattern {
+        regex,
+        uncertain: procps.then(|| ere_uncertainty(pattern)).flatten(),
+    })
+}
+
+impl Pattern {
+    /// Each way the tools may see `subject`: as written, and as the procps
+    /// tools show it in a UTF-8 locale and in the C locale. macOS has one.
+    fn readings<'a>(subject: &'a str, dialect: Dialect) -> Vec<std::borrow::Cow<'a, str>> {
+        let mut readings = vec![std::borrow::Cow::Borrowed(subject)];
+        if dialect != Dialect::Procps || is_printable_ascii(subject) {
+            return readings;
+        }
+        let utf8_locale: String = subject
+            .chars()
+            .map(|c| match c {
+                '\n' => ' ',
+                c if c.is_control() || c == char::REPLACEMENT_CHARACTER => '?',
+                c => c,
+            })
+            .collect();
+        readings.push(utf8_locale.into());
+        let mut c_locale = String::with_capacity(subject.len());
+        for c in subject.chars() {
+            match c {
+                '\n' => c_locale.push(' '),
+                char::REPLACEMENT_CHARACTER => c_locale.push('?'),
+                c if c.is_ascii_control() => c_locale.push('.'),
+                c if c.is_ascii() => c_locale.push(c),
+                c => c_locale.extend(std::iter::repeat_n('?', c.len_utf8())),
+            }
+        }
+        readings.push(c_locale.into());
+        readings
+    }
+
+    /// Whether the pattern picks `subject` under any reading of it: the most
+    /// processes either tool could pick.
+    fn is_match(&self, subject: &str, dialect: Dialect) -> bool {
+        self.regex.is_match(subject)
+            || (dialect == Dialect::Procps
+                && !is_printable_ascii(subject)
+                && Self::readings(subject, dialect)
+                    .iter()
+                    .any(|text| self.regex.is_match(text)))
+    }
+
+    /// Whether the pattern picks `subject` under every reading, which is when
+    /// an inverted match (`-v`) is certain to leave the process out.
+    fn is_match_in_every_reading(&self, subject: &str, dialect: Dialect) -> bool {
+        Self::readings(subject, dialect)
+            .iter()
+            .all(|text| self.regex.is_match(text))
+    }
+}
+
+/// Why glibc's `regcomp` (POSIX extended) may read `pattern` another way than
+/// the `regex` crate, or `None` when the syntax is the common one: literal
+/// characters, `.`, the repetitions, alternation, groups, anchors, valid
+/// intervals, bracket expressions of characters, ranges and `[:class:]` names,
+/// and a backslash before one of the characters that mean something. The rest
+/// reads differently (`\d`, `\w`, `\b`, `\<`, `\n`, `\1` are GNU escapes,
+/// back-references or plain letters to `regcomp` and classes, boundaries,
+/// control characters or errors to the crate; a backslash in a bracket is
+/// literal to one and an escape to the other; `[[.x.]]`, `[[=x=]]`, `&&`, `--`
+/// and `~~` in a bracket are collation and class operations to one and
+/// characters to the other). Over-reporting is the safe direction: it asks.
+fn ere_uncertainty(pattern: &str) -> Option<String> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => match chars.get(i + 1) {
+                Some(c) if ".[]()*+?{}|^$\\".contains(*c) => i += 2,
+                Some(c) => {
+                    return Some(format!(
+                        "`\\{c}` is a different thing to glibc's regcomp, which the tools use, \
+                         than to the regular-expression engine GitPulse evaluates with"
+                    ))
+                }
+                None => return Some("the pattern ends in a backslash".to_string()),
+            },
+            '[' => match bracket_end(&chars, i) {
+                Ok(next) => i = next,
+                Err(why) => return Some(why),
+            },
+            '{' => match interval_end(&chars, i) {
+                Some(next) => i = next,
+                None => {
+                    return Some(
+                        "a `{` that does not open a valid repetition is a literal to some \
+                         regular-expression engines and an error to others"
+                            .to_string(),
+                    )
+                }
+            },
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// The index after a valid `{n}`, `{n,}`, `{n,m}` or `{,m}` that opens at
+/// `start`.
+fn interval_end(chars: &[char], start: usize) -> Option<usize> {
+    let close = chars[start..].iter().position(|c| *c == '}')? + start;
+    let body: String = chars[start + 1..close].iter().collect();
+    let (low, high) = match body.split_once(',') {
+        Some((low, high)) => (low, Some(high)),
+        None => (body.as_str(), None),
+    };
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    let valid = match high {
+        None => !low.is_empty() && digits(low),
+        Some(high) => digits(low) && digits(high) && !(low.is_empty() && high.is_empty()),
+    };
+    valid.then_some(close + 1)
+}
+
+/// The index after the bracket expression that opens at `start`, or why it
+/// cannot be read the same way by both engines.
+fn bracket_end(chars: &[char], start: usize) -> Result<usize, String> {
+    const CLASSES: [&str; 12] = [
+        "alpha", "digit", "alnum", "upper", "lower", "space", "blank", "punct", "print", "graph",
+        "cntrl", "xdigit",
+    ];
+    let unlike = |what: &str| {
+        Err(format!(
+            "{what} in a bracket expression is read differently by glibc's regcomp, which the \
+             tools use, and by the regular-expression engine GitPulse evaluates with"
+        ))
+    };
+    let mut i = start + 1;
+    if chars.get(i) == Some(&'^') {
+        i += 1;
+    }
+    if chars.get(i) == Some(&']') {
+        i += 1;
+    }
+    while let Some(&c) = chars.get(i) {
+        match c {
+            ']' => return Ok(i + 1),
+            '\\' => return unlike("a backslash"),
+            '[' => match chars.get(i + 1) {
+                Some(':') => {
+                    let Some(end) = (i + 2..chars.len().saturating_sub(1))
+                        .find(|&j| chars[j] == ':' && chars[j + 1] == ']')
+                    else {
+                        return unlike("an unterminated character class");
+                    };
+                    let name: String = chars[i + 2..end].iter().collect();
+                    if !CLASSES.contains(&name.as_str()) {
+                        return unlike("a character class this guard does not know");
+                    }
+                    i = end + 2;
+                }
+                Some('.' | '=') => return unlike("a collating symbol or an equivalence class"),
+                _ => return unlike("a `[`"),
+            },
+            '&' | '-' | '~' if chars.get(i + 1) == Some(&c) => return unlike(&format!("`{c}{c}`")),
+            c if !c.is_ascii() => return unlike("a character outside ASCII"),
+            _ => i += 1,
+        }
+    }
+    Err("an unterminated bracket expression".to_string())
 }
 
 fn uids(facts: &Facts, names: &[String]) -> Result<Vec<u32>, String> {
@@ -2495,9 +2990,12 @@ fn numbers(names: &[String]) -> Result<Vec<i32>, String> {
 /// What a selection reached, and what it could not read.
 struct Reach<'a> {
     hits: Vec<&'a TableRow>,
-    /// This user's processes whose arguments could not be read, which a
-    /// `-f` pattern could not be tested against.
+    /// Processes the signal could reach whose arguments could not be read,
+    /// which a `-f` pattern could not be tested against.
     unread: usize,
+    /// Why the set may be short: a pattern the tools may read another way than
+    /// the guard does ([`Pattern::uncertain`]). What it reached is still real.
+    uncertain: Option<String>,
 }
 
 impl<'a> Reach<'a> {
@@ -2509,6 +3007,7 @@ impl<'a> Reach<'a> {
         Reach {
             hits,
             unread: self.unread.max(other.unread),
+            uncertain: self.uncertain.or(other.uncertain),
         }
     }
 }
@@ -2522,11 +3021,12 @@ fn eval_pgrep<'a>(spec: &PgrepSpec, facts: &'a Facts) -> Result<Reach<'a>, Strin
 }
 
 fn eval_pgrep_reading<'a>(spec: &PgrepSpec, facts: &'a Facts) -> Result<Reach<'a>, String> {
-    let patterns: Vec<Regex> = spec
+    let patterns: Vec<Pattern> = spec
         .patterns
         .iter()
-        .map(|p| compile(p, spec.icase, spec.exact))
+        .map(|p| compile(spec.dialect, p, spec.icase, spec.exact))
         .collect::<Result<_, _>>()?;
+    let uncertain = patterns.iter().find_map(|p| p.uncertain.clone());
     let euids = uids(facts, &spec.euids)?;
     let ruids = uids(facts, &spec.ruids)?;
     let ppids = numbers(&spec.ppids)?;
@@ -2565,24 +3065,26 @@ fn eval_pgrep_reading<'a>(spec: &PgrepSpec, facts: &'a Facts) -> Result<Reach<'a
         }
         let subject_unread = spec.full && row.argv.is_none();
         let matched = patterns.is_empty() || {
-            if spec.full {
-                let subject = match_full(row);
-                patterns.iter().any(|p| p.is_match(&subject))
+            let subjects = if spec.full {
+                let own = [row.uid, row.real_uid(), row.saved_uid()].contains(&facts.me_uid);
+                full_subjects(spec.dialect, row, !own)
             } else {
-                let subjects = name_subjects(spec.dialect, &row.name, argv0(row));
-                if spec.inverse {
-                    // Inverted, a row is a hit when the tool's one subject does
-                    // not match, so with two candidate subjects the row is out
-                    // only when every one of them matches: never fewer hits
-                    // than either tool's.
-                    subjects
+                name_subjects(spec.dialect, &row.name, argv0(row))
+            };
+            if spec.inverse {
+                // Inverted, a row is a hit when the tool's one subject does not
+                // match. Which of the readings of it the tool has is not known,
+                // so the row is out only when the pattern picks every subject
+                // in every reading: never fewer hits than any of them.
+                subjects.iter().all(|s| {
+                    patterns
                         .iter()
-                        .all(|s| patterns.iter().any(|p| p.is_match(s)))
-                } else {
-                    subjects
-                        .iter()
-                        .any(|s| patterns.iter().any(|p| p.is_match(s)))
-                }
+                        .any(|p| p.is_match_in_every_reading(s, spec.dialect))
+                })
+            } else {
+                subjects
+                    .iter()
+                    .any(|s| patterns.iter().any(|p| p.is_match(s, spec.dialect)))
             }
         };
         let filtered = matched
@@ -2610,7 +3112,11 @@ fn eval_pgrep_reading<'a>(spec: &PgrepSpec, facts: &'a Facts) -> Result<Reach<'a
             .into_iter()
             .collect();
     }
-    Ok(Reach { hits, unread })
+    Ok(Reach {
+        hits,
+        unread,
+        uncertain,
+    })
 }
 
 fn eval_killall<'a>(spec: &KillallSpec, facts: &'a Facts) -> Result<Reach<'a>, String> {
@@ -2622,14 +3128,15 @@ fn eval_killall<'a>(spec: &KillallSpec, facts: &'a Facts) -> Result<Reach<'a>, S
 }
 
 fn eval_killall_reading<'a>(spec: &KillallSpec, facts: &'a Facts) -> Result<Reach<'a>, String> {
-    let patterns: Vec<Regex> = if spec.regex {
+    let patterns: Vec<Pattern> = if spec.regex {
         spec.names
             .iter()
-            .map(|n| compile(n, spec.icase, false))
+            .map(|n| compile(spec.dialect, n, spec.icase, false))
             .collect::<Result<_, _>>()?
     } else {
         Vec::new()
     };
+    let uncertain = patterns.iter().find_map(|p| p.uncertain.clone());
     let user = match &spec.user {
         Some(name) => uids(facts, std::slice::from_ref(name))?.first().copied(),
         None => None,
@@ -2647,21 +3154,38 @@ fn eval_killall_reading<'a>(spec: &KillallSpec, facts: &'a Facts) -> Result<Reac
         if spec.only.as_ref().is_some_and(|c| *c != match_name(row)) {
             continue;
         }
-        let named = spec.names.is_empty()
-            || if spec.regex {
-                name_subjects(spec.dialect, &row.name, argv0(row))
-                    .iter()
-                    .any(|s| patterns.iter().any(|p| p.is_match(s)))
-            } else {
-                spec.names
-                    .iter()
-                    .any(|n| killall_literal(spec.dialect, n, spec.icase, &row.name, argv0(row)))
-            };
-        if named {
+        let by_name = if spec.regex {
+            name_subjects(spec.dialect, &row.name, argv0(row))
+                .iter()
+                .any(|s| patterns.iter().any(|p| p.is_match(s, spec.dialect)))
+        } else {
+            spec.names
+                .iter()
+                .any(|n| killall_literal(spec.dialect, n, spec.icase, &row.name, argv0(row)))
+        };
+        let by_path = spec
+            .exe_paths
+            .iter()
+            .any(|word| runs_executable(row, word, facts.exes.get(word)));
+        if spec.names.is_empty() || by_name || by_path {
             hits.push(row);
         }
     }
-    Ok(Reach { hits, unread: 0 })
+    Ok(Reach {
+        hits,
+        unread: 0,
+        uncertain,
+    })
+}
+
+/// Whether `row` runs the executable `word` names: by the path as written or
+/// as the file system resolves it (symbolic links followed), against the path
+/// the kernel runs it from, the one it was exec'd with and `argv[0]`.
+fn runs_executable(row: &TableRow, word: &str, resolved: Option<&String>) -> bool {
+    [row.real_exe.as_deref(), row.exec.as_deref(), argv0(row)]
+        .into_iter()
+        .flatten()
+        .any(|path| path == word || resolved.is_some_and(|r| r == path))
 }
 
 fn eval_group<'a>(group: i32, facts: &'a Facts) -> Reach<'a> {
@@ -2672,6 +3196,7 @@ fn eval_group<'a>(group: i32, facts: &'a Facts) -> Reach<'a> {
             .filter(|r| reachable(facts, r) && facts.pgids.get(&r.pid) == Some(&group))
             .collect(),
         unread: 0,
+        uncertain: None,
     }
 }
 
@@ -2708,14 +3233,20 @@ pub fn live_match_pids(program: &str, args: &[&str]) -> Result<Vec<i32>, String>
         unparsed: None,
     };
     let facts = gather(&plan)?;
-    let mut pids: Vec<i32> = match &plan.findings[0].sel {
-        Sel::Pgrep(spec) => eval_pgrep(spec, &facts)?.hits,
-        Sel::Killall(spec) => eval_killall(spec, &facts)?.hits,
-        _ => Vec::new(),
+    let reach = match &plan.findings[0].sel {
+        Sel::Pgrep(spec) => eval_pgrep(spec, &facts)?,
+        Sel::Killall(spec) => eval_killall(spec, &facts)?,
+        _ => Reach {
+            hits: Vec::new(),
+            unread: 0,
+            uncertain: None,
+        },
+    };
+    // A set that may be short is not an answer to "which processes".
+    if let Some(why) = reach.uncertain {
+        return Err(why);
     }
-    .into_iter()
-    .map(|r| r.pid)
-    .collect();
+    let mut pids: Vec<i32> = reach.hits.into_iter().map(|r| r.pid).collect();
     pids.sort_unstable();
     Ok(pids)
 }
@@ -2747,23 +3278,25 @@ struct Tally {
     examples: Vec<String>,
 }
 
+/// Whether `row` is a GitPulse process. By the executable the kernel runs it
+/// from, which `argv[0]` cannot change, and by the path it was exec'd with:
+/// either one is enough, so a GitPulse executable run under another `argv[0]`
+/// is still GitPulse, and so is any process that says it is.
 fn is_gitpulse(row: &TableRow) -> bool {
-    let program = row
-        .exec
-        .as_deref()
-        .or_else(|| {
-            row.argv
-                .as_ref()
-                .and_then(|a| a.first())
-                .map(String::as_str)
+    let first_arg = row
+        .argv
+        .as_ref()
+        .and_then(|a| a.first())
+        .map(String::as_str);
+    let spelled = row.exec.as_deref().or(first_arg).unwrap_or(&row.name);
+    [row.real_exe.as_deref(), Some(spelled)]
+        .into_iter()
+        .flatten()
+        .any(|program| {
+            let name = base_name(program).to_ascii_lowercase();
+            (name.starts_with("gitpulse") && name != "gitpulse-hook")
+                || program.contains("/GitPulse.app/")
         })
-        .unwrap_or(&row.name);
-    let name = base_name(program).to_ascii_lowercase();
-    let in_app = row
-        .exec
-        .as_deref()
-        .is_some_and(|e| e.contains("/GitPulse.app/"));
-    (name.starts_with("gitpulse") && name != "gitpulse-hook") || in_app
 }
 
 /// Whether `row` is a terminal session GitPulse hosts: launched by GitPulse
@@ -3029,6 +3562,25 @@ fn judge(finding: &Finding, facts: &Facts) -> Verdict {
         };
         return Verdict::Deny(deny_reason(finding, &cause, Some(&t), &advice));
     }
+    if let Some(why) = &reach.uncertain {
+        return Verdict::Ask(format!(
+            "GitPulse could not tell which processes `{}` would signal: {why}.",
+            finding.text
+        ));
+    }
+    // A sender that can signal every process has no process of its own to
+    // fall back on: one whose command line a `-f` pattern was not tested
+    // against may be exactly the one it picks.
+    if reach.unread > 0 && sender_is_root(facts) {
+        return Verdict::Ask(format!(
+            "`{}` runs as root, so it can signal the {} process{} whose command line GitPulse \
+             could not read, and `-f` was not tested against {}.",
+            finding.text,
+            reach.unread,
+            if reach.unread == 1 { "" } else { "es" },
+            if reach.unread == 1 { "it" } else { "them" },
+        ));
+    }
     if finding.elevated {
         return Verdict::Ask(format!(
             "`{}` runs as root, which can signal processes GitPulse cannot see; it found {} of \
@@ -3265,6 +3817,7 @@ mod tests {
             start_us: u64::try_from(pid).unwrap_or(0) * 1000,
             name: base_name(argv[0]).to_string(),
             exec: Some(argv[0].to_string()),
+            real_exe: None,
             argv: Some(argv.iter().map(|a| (*a).to_string()).collect()),
             agent: None,
             hosted: false,
@@ -4943,6 +5496,606 @@ mod tests {
         ] {
             assert_eq!(is_gitpulse(&row(1, 0, &argv)), want, "{argv:?}");
         }
+    }
+
+    /* ── ft-1d9f44d5: the five holes the W4a adversary found ── */
+
+    /// What the guard says about `command` as the Linux tools would run it.
+    fn procps_says(command: &str, facts: &Facts) -> Out {
+        classify_output(&run_on(Dialect::Procps, command, facts))
+    }
+
+    /// A row as the procps tools see it, with the executable the kernel runs.
+    fn linux_row(pid: i32, comm: &str, argv: &[&str], exe: &str) -> TableRow {
+        let mut r = row(pid, 1, argv);
+        r.name = comm.to_string();
+        r.exec = argv
+            .first()
+            .filter(|a| a.starts_with('/'))
+            .map(|a| (*a).to_string())
+            .or_else(|| Some(exe.to_string()));
+        r.real_exe = Some(exe.to_string());
+        r
+    }
+
+    /// Class 1. The tools hand `regcomp` a command line with its control
+    /// characters replaced, so `.` and a space both reach a newline.
+    #[test]
+    fn procps_reads_a_newline_in_an_argument_as_a_space_and_dot_crosses_it() {
+        let mut facts = quiet();
+        facts.rows.push(row(
+            2100,
+            1,
+            &["gitpulse-newl", "first line\nsecond line", "tail"],
+        ));
+        for pattern in [
+            "line.second",
+            "line second",
+            "first.*second",
+            "first line\nsecond",
+        ] {
+            let command = format!("pkill -f '{pattern}'");
+            assert_eq!(
+                pids_in(Dialect::Procps, &command, &facts),
+                vec![2100],
+                "{command}"
+            );
+        }
+        assert_eq!(
+            pids_in(
+                Dialect::Procps,
+                "pkill -fx 'gitpulse-newl first line second line tail'",
+                &facts
+            ),
+            vec![2100]
+        );
+        // macOS reads it as it always did: a newline is not a space there.
+        assert!(pids_in(Dialect::Bsd, "pkill -f 'line second'", &facts).is_empty());
+    }
+
+    #[test]
+    fn procps_reads_a_control_character_as_a_question_mark_or_a_dot_by_locale() {
+        let mut facts = quiet();
+        facts
+            .rows
+            .push(row(2100, 1, &["gitpulse-ctl", "a\u{1}b\tc"]));
+        for pattern in [r"a\?b", r"a\.b", "a.b", r"b\?c", r"b\.c"] {
+            let command = format!("pkill -f '{pattern}'");
+            assert_eq!(
+                pids_in(Dialect::Procps, &command, &facts),
+                vec![2100],
+                "{command}"
+            );
+        }
+        assert!(pids_in(Dialect::Bsd, r"pkill -f 'a\?b'", &facts).is_empty());
+    }
+
+    #[test]
+    fn procps_reads_an_empty_argument_as_a_double_space_and_a_blank_command_line_as_a_question_mark(
+    ) {
+        let mut facts = quiet();
+        facts.rows.push(row(2100, 1, &["gitpulse-empty", "", "x"]));
+        let mut blank = row(2101, 1, &["gitpulse-blank"]);
+        blank.argv = Some(Vec::new());
+        facts.rows.push(blank);
+        for (pattern, want) in [
+            ("gitpulse-empty  x", vec![2100]),
+            // The reading the guard always had, kept: never fewer.
+            ("gitpulse-empty x", vec![2100]),
+            ("^gitpulse-empty x$", vec![2100]),
+            (r"^\?$", vec![2101]),
+            ("^.$", vec![2101]),
+        ] {
+            let command = format!("pkill -f '{pattern}'");
+            assert_eq!(
+                pids_in(Dialect::Procps, &command, &facts),
+                want,
+                "{command}"
+            );
+        }
+        assert_eq!(
+            pids_in(Dialect::Procps, "pkill -fx '.'", &facts),
+            vec![2101]
+        );
+        // The name stands for a blanked command line, as it always did.
+        assert_eq!(
+            pids_in(Dialect::Procps, "pkill -f 'gitpulse-blank'", &facts),
+            vec![2101]
+        );
+    }
+
+    /// In the C locale a multi-byte character is as many `?` as it has bytes.
+    #[test]
+    fn procps_reads_a_non_ascii_character_as_one_character_or_as_a_question_mark_per_byte() {
+        let mut facts = quiet();
+        facts.rows.push(row(2100, 1, &["gitpulse-u8", "caf\u{e9}"]));
+        for pattern in [
+            "caf.$",
+            "caf..$",
+            "caf\u{e9}",
+            "caf[^a]",
+            r"caf\?\?$",
+            r"caf\?",
+        ] {
+            let command = format!("pkill -f '{pattern}'");
+            assert_eq!(
+                pids_in(Dialect::Procps, &command, &facts),
+                vec![2100],
+                "{command}"
+            );
+        }
+        assert!(pids_in(Dialect::Procps, "pkill -f 'caf...$'", &facts).is_empty());
+    }
+
+    /// An inverted match leaves a process out only when the pattern picks it
+    /// in every reading: otherwise the tool, in the reading it has, may not.
+    #[test]
+    fn an_inverted_pattern_leaves_a_process_out_only_when_every_reading_picks_it() {
+        let mut facts = quiet();
+        facts.rows.push(row(2100, 1, &["gitpulse-newl", "x\ny"]));
+        facts.rows.push(row(2101, 1, &["gitpulse-plain", "x y"]));
+        let hits = pids_in(Dialect::Procps, "kill $(pgrep -fv 'x y')", &facts);
+        assert!(
+            hits.contains(&2100),
+            "the raw reading does not pick it: {hits:?}"
+        );
+        assert!(!hits.contains(&2101), "every reading picks it: {hits:?}");
+    }
+
+    #[test]
+    fn a_pattern_regcomp_reads_differently_is_asked_about_and_not_downgraded_from_a_refusal() {
+        let quiet = quiet();
+        for pattern in [
+            r"sleep\d",
+            r"sleep\w",
+            r"\bsleep",
+            r"\<sleep",
+            r"sleep\1",
+            r"sl[\d]ep",
+            "sl[[.e.]]ep",
+            "sl[[=e=]]ep",
+            "sleep{",
+            r"sleep\n",
+        ] {
+            let command = format!("pkill -f '{pattern}'");
+            assert_eq!(procps_says(&command, &quiet), Out::Ask, "{command}");
+        }
+        // macOS evaluates the pattern with the regex crate, as it always did.
+        assert_eq!(
+            classify_output(&run_on(Dialect::Bsd, r"pkill -f 'sleep\d'", &quiet)),
+            Out::Silent
+        );
+        // What the guard can evaluate and finds too much stays a refusal.
+        assert_eq!(procps_says(r"pkill -f '\w'", &world()), Out::Deny);
+        assert_eq!(procps_says(r"pkill -f 'sleep.*[\d]'", &world()), Out::Ask);
+        assert_eq!(procps_says(r"pkill -f '/Users/\w'", &world()), Out::Deny);
+    }
+
+    #[test]
+    fn the_syntax_regcomp_and_the_regex_crate_read_alike_is_not_asked_about() {
+        for pattern in [
+            "gitpulse-short",
+            "a.b",
+            "^(a|b)+$",
+            "x{1,2}",
+            "x{2}",
+            "x{2,}",
+            "x{,2}",
+            "[a-z]+",
+            "[[:alpha:]_-]",
+            "[^]a]",
+            "[a-]",
+            r"\.",
+            r"\(",
+            r"a\|b",
+            r"\\",
+            r"\$",
+            "a|",
+            "()",
+            "caf\u{e9}",
+        ] {
+            assert_eq!(ere_uncertainty(pattern), None, "{pattern}");
+        }
+        for pattern in [
+            r"\d",
+            r"\w",
+            r"\b",
+            r"\<",
+            r"\1",
+            r"\a",
+            r"\t",
+            "ends\\",
+            r"[\d]",
+            "[[.a.]]",
+            "[[=a=]]",
+            "[a&&b]",
+            "[a--b]",
+            "[a~~b]",
+            "[[:bogus:]]",
+            "[[:alpha",
+            "[a[b]",
+            "a{",
+            "a{x}",
+            "a{,}",
+            "[caf\u{e9}]",
+            "[abc",
+        ] {
+            assert!(ere_uncertainty(pattern).is_some(), "{pattern}");
+        }
+    }
+
+    /// Class 2. Linux `pidof` takes a word with a `/` for the executable.
+    #[test]
+    fn a_pidof_path_picks_the_processes_that_run_that_executable_by_any_name() {
+        let mut facts = quiet();
+        let lab = "/tmp/lab";
+        // Run as another path: argv[0] says otherprog, the file says GitPulse.
+        facts.rows.push(linux_row(
+            2100,
+            "gitpulse-aliased",
+            &["/opt/other/otherprog"],
+            "/tmp/lab/gitpulse-aliased",
+        ));
+        // The same file under a different name and argv[0].
+        facts.rows.push(linux_row(
+            2101,
+            "renamed",
+            &["renamed"],
+            "/tmp/lab/gitpulse-aliased",
+        ));
+        facts
+            .rows
+            .push(linux_row(2102, "other", &["other"], "/usr/bin/other"));
+        let hits = |command: &str, facts: &Facts| pids_in(Dialect::Procps, command, facts);
+        assert_eq!(
+            hits(&format!("kill $(pidof {lab}/gitpulse-aliased)"), &facts),
+            vec![2100, 2101]
+        );
+        // The path the file system resolves it to.
+        facts
+            .exes
+            .insert("/tmp/lab/link".into(), "/tmp/lab/gitpulse-aliased".into());
+        assert_eq!(
+            hits("kill $(pidof /tmp/lab/link)", &facts),
+            vec![2100, 2101]
+        );
+        // Any process with the last component as its name, as a name always was.
+        facts
+            .rows
+            .push(linux_row(2103, "link", &["link"], "/usr/bin/link"));
+        assert!(hits("kill $(pidof /tmp/lab/link)", &facts).contains(&2103));
+        assert!(!hits("kill $(pidof /tmp/lab/link)", &facts).contains(&2102));
+        // The decision: a GitPulse executable by its file is a refusal.
+        assert_eq!(
+            procps_says("kill $(pidof /tmp/lab/gitpulse-aliased)", &facts),
+            Out::Deny
+        );
+        assert_eq!(
+            procps_says("kill $(pidof /usr/bin/other)", &facts),
+            Out::Silent
+        );
+    }
+
+    #[test]
+    fn a_pidof_name_without_a_slash_has_no_executable_to_compare() {
+        let Some(Sel::Killall(spec)) = sel_in(Dialect::Procps, "kill $(pidof gitpulse-short)")
+        else {
+            panic!("a pidof is read as a name match");
+        };
+        assert_eq!(spec.names, vec!["gitpulse-short"]);
+        assert!(spec.exe_paths.is_empty());
+        let Some(Sel::Killall(spec)) = sel_in(Dialect::Procps, "kill $(pidof /usr/bin/claude)")
+        else {
+            panic!("a pidof is read as a name match");
+        };
+        // The word as written, which is what it always was, and its last
+        // component.
+        assert_eq!(spec.names, vec!["/usr/bin/claude", "claude"]);
+        assert_eq!(spec.exe_paths, vec!["/usr/bin/claude"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_executable_path_resolves_through_a_symbolic_link() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let real = dir.path().join("real-binary");
+        std::fs::write(&real, b"x").expect("a file");
+        let link = dir.path().join("innocuous");
+        std::os::unix::fs::symlink(&real, &link).expect("a link");
+        let words = vec![
+            link.to_string_lossy().into_owned(),
+            dir.path().join("missing").to_string_lossy().into_owned(),
+        ];
+        let resolved = resolved_executables(&words);
+        let want = std::fs::canonicalize(&real)
+            .expect("resolves")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(resolved.get(&words[0]), Some(&want));
+        assert!(
+            !resolved.contains_key(&words[1]),
+            "an unresolved path is left out"
+        );
+    }
+
+    /// Class 3. The program is named by a variable, an applet, an alias.
+    #[test]
+    fn a_program_named_by_a_variable_on_a_line_that_says_kill_is_asked_about() {
+        let facts = quiet();
+        for command in [
+            "p=pkill; $p -f gitpulse-short",
+            "p=killall; $p gitpulse-short",
+            "p=pkill; \"$p\" -f gitpulse-short",
+            "p=pkill; sudo $p -f gitpulse-short",
+            "p=pkill; ${p} -f gitpulse-short",
+            "p=$(echo pkill); $p -f gitpulse-short",
+            "P=/usr/bin/pkill; $P -f gitpulse-short",
+            "c='pkill -f gitpulse-short'; eval $c",
+            "c='pkill -f gitpulse-short'; bash -c \"$c\"",
+            "c='pkill -f gitpulse-short'; sh -c $c",
+            "echo x | xargs $p pkill -f gitpulse-short",
+        ] {
+            for dialect in [Dialect::Bsd, Dialect::Procps] {
+                assert_eq!(
+                    classify_output(&run_on(dialect, command, &facts)),
+                    Out::Ask,
+                    "{dialect:?} {command}"
+                );
+            }
+        }
+        // Without `kill` on the line a variable is an ordinary program.
+        for command in [
+            "$EDITOR notes.txt",
+            "exec \"$@\"",
+            "$CC -o x y.c",
+            "bash -c \"$script\"",
+            "eval $setup",
+            "FOO=1 $tool --flag",
+        ] {
+            assert_eq!(
+                classify_output(&run_on(Dialect::Procps, command, &facts)),
+                Out::Silent,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_busybox_or_toybox_applet_of_a_signal_command_is_asked_about() {
+        let facts = quiet();
+        for command in [
+            "busybox pkill -f gitpulse-short",
+            "busybox killall gitpulse-short",
+            "toybox pkill -f gitpulse-short",
+            "sudo busybox pkill -f gitpulse-short",
+            "busybox killall5 -9",
+        ] {
+            assert_eq!(procps_says(command, &facts), Out::Ask, "{command}");
+        }
+        for command in [
+            "busybox ls -l",
+            "busybox --list",
+            "busybox kill 12345",
+            "busybox",
+        ] {
+            assert_eq!(procps_says(command, &facts), Out::Silent, "{command}");
+        }
+        let applet = words(&["busybox", "pkill", "-f", "x"]);
+        let resolved = resolve(&applet).expect("resolves");
+        assert_eq!(resolved.prog, "pkill");
+        assert!(resolved.applet);
+        let plain = words(&["pkill", "x"]);
+        assert!(!resolve(&plain).expect("resolves").applet);
+    }
+
+    #[test]
+    fn a_program_word_that_names_nothing_is_not_the_same_as_one_that_is_unknown() {
+        assert!(matches!(
+            resolve(&words(&["p=pkill"])),
+            Err(Unresolved::Nothing)
+        ));
+        assert!(matches!(
+            resolve(&words(&["command", "-v", "pkill"])),
+            Err(Unresolved::Nothing)
+        ));
+        let mut dynamic = words(&["$p", "-f", "x"]);
+        dynamic[0].dynamic = true;
+        assert!(matches!(resolve(&dynamic), Err(Unresolved::Dynamic)));
+    }
+
+    #[test]
+    fn an_alias_defined_on_the_line_that_names_a_signal_command_is_asked_about() {
+        let facts = quiet();
+        for command in [
+            "alias k=pkill; k -f gitpulse-short",
+            "alias k='pkill -f'; k gitpulse-short",
+            "alias killer=ls",
+            "bash -c \"alias k=pkill; k -f gitpulse-short\"",
+        ] {
+            assert_eq!(procps_says(command, &facts), Out::Ask, "{command}");
+        }
+        for command in ["alias ll='ls -l'", "alias", "unalias k"] {
+            assert_eq!(procps_says(command, &facts), Out::Silent, "{command}");
+        }
+    }
+
+    #[test]
+    fn a_signal_command_under_find_exec_is_asked_about() {
+        let facts = quiet();
+        for command in [
+            "find . -name x -exec pkill -f gitpulse-short {} +",
+            "find . -name x -execdir pkill -f gitpulse-short {} \\;",
+            "find . -exec killall gitpulse-short \\;",
+            "find . -ok kill {} \\;",
+            "find . -name x -exec sudo pkill -f gitpulse-short {} +",
+        ] {
+            assert_eq!(procps_says(command, &facts), Out::Ask, "{command}");
+        }
+        for command in [
+            "find . -name '*.rs' -exec grep -l todo {} +",
+            "find . -type f -exec ls -l {} \\;",
+            "find . -name killme.txt",
+        ] {
+            assert_eq!(procps_says(command, &facts), Out::Silent, "{command}");
+        }
+        // A shell it hands a script is read like any other.
+        assert!(!plan_with("find . -exec sh -c 'pkill -f x' \\;", fake_env).is_empty());
+    }
+
+    #[test]
+    fn ssh_to_this_machine_is_asked_about_and_ssh_to_another_is_a_stated_limit() {
+        let facts = quiet();
+        for command in [
+            "ssh localhost pkill -f gitpulse-short",
+            "ssh user@127.0.0.1 'pkill -f gitpulse-short'",
+            "ssh -p 22 localhost \"killall gitpulse-short\"",
+            "ssh $HOST pkill -f gitpulse-short",
+            "ssh [::1] 'sleep 1; killall x'",
+        ] {
+            assert_eq!(procps_says(command, &facts), Out::Ask, "{command}");
+        }
+        for command in [
+            "ssh localhost ls",
+            "ssh build-host ls",
+            "ssh build-host pkill -f gitpulse-short",
+        ] {
+            assert_eq!(procps_says(command, &facts), Out::Silent, "{command}");
+        }
+    }
+
+    /// The limits the module header states, pinned: each is silent today, on
+    /// a machine with agents on it, and a change here is a decision.
+    #[test]
+    fn the_stated_limits_of_the_shell_reader_are_pinned() {
+        let facts = world();
+        for command in [
+            "ssh build-host pkill -f claude",
+            "parallel pkill -f claude ::: a",
+            "watch pkill -f claude",
+            "nsenter -t 1 pkill -f claude",
+            "su -c 'pkill -f claude' other",
+            "env -S 'pkill -f claude'",
+            "docker exec c pkill -f claude",
+            "skill -9 -u bharath",
+            "fuser -k 8080/tcp",
+            "killall5 -9",
+            "k -f claude",
+        ] {
+            assert_eq!(procps_says(command, &facts), Out::Silent, "{command}");
+        }
+    }
+
+    /// Class 4. A root sender can signal every process, so a command line it
+    /// could not read is a process `-f` may pick.
+    #[test]
+    fn a_root_sender_that_could_not_read_a_command_line_is_asked_not_told() {
+        let mut facts = quiet();
+        facts.me_uid = 0;
+        facts.me_euid = Some(0);
+        let mut other = row(2100, 1, &["/usr/bin/worker", "marker-xyz"]);
+        other.uid = 1001;
+        other.argv = None;
+        facts.rows.push(other);
+        let output = run_on(Dialect::Procps, "pkill -f marker-xyz", &facts);
+        assert_eq!(classify_output(&output), Out::Ask, "{output:?}");
+        assert!(reason_of(&output).contains("could not read"), "{output:?}");
+        // The same unread process of the sender's own, for a sender that is
+        // not root: only a notice, as it always was.
+        facts.me_uid = ME;
+        facts.me_euid = Some(ME);
+        facts.rows.last_mut().expect("the process").uid = ME;
+        assert_eq!(
+            classify_output(&run_on(Dialect::Procps, "pkill -f marker-xyz", &facts)),
+            Out::Notice
+        );
+    }
+
+    #[test]
+    fn a_root_sender_that_read_another_users_command_line_counts_the_process() {
+        let mut facts = world();
+        facts.me_uid = 0;
+        facts.me_euid = Some(0);
+        let mut other = row(2100, 1, &["/usr/bin/worker", "marker-xyz"]);
+        other.uid = 1001;
+        facts.rows.push(other);
+        assert_eq!(
+            pids_in(Dialect::Procps, "pkill -f marker-xyz", &facts),
+            vec![2100]
+        );
+        // And a GitPulse process of another user is a refusal.
+        let mut theirs = row(
+            2101,
+            1,
+            &["/usr/local/bin/gitpulsed", "--data", "theirs-xyz"],
+        );
+        theirs.uid = 1001;
+        facts.rows.push(theirs);
+        assert_eq!(
+            classify_output(&run_on(Dialect::Procps, "pkill -f theirs-xyz", &facts)),
+            Out::Deny
+        );
+    }
+
+    /// Before a root sender read another user's command line it matched that
+    /// process by its name; the name stays a subject, so no process the old
+    /// reading picked is let go.
+    #[test]
+    fn a_root_sender_still_matches_another_users_process_by_its_name_under_dash_f() {
+        let mut facts = quiet();
+        facts.me_uid = 0;
+        facts.me_euid = Some(0);
+        let mut other = row(2100, 1, &["/usr/bin/other", "--flag"]);
+        other.name = "worker".to_string();
+        other.uid = 1001;
+        facts.rows.push(other);
+        for dialect in [Dialect::Procps, Dialect::Bsd] {
+            assert_eq!(
+                pids_in(dialect, "pkill -f worker", &facts),
+                vec![2100],
+                "{dialect:?}"
+            );
+        }
+        // The sender's own process is matched by its command line, as ever.
+        facts.me_uid = ME;
+        facts.me_euid = Some(ME);
+        facts.rows.last_mut().expect("the process").uid = ME;
+        assert!(pids_in(Dialect::Procps, "pkill -f worker", &facts).is_empty());
+    }
+
+    /// Class 5. `argv[0]` is the process's to choose; the executable is not.
+    #[test]
+    fn a_gitpulse_executable_run_under_another_argv0_is_still_gitpulse() {
+        let spoofed = linux_row(
+            2100,
+            "gitpulse-aliased",
+            &["/opt/other/otherprog", "--flag"],
+            "/tmp/lab/gitpulse-aliased",
+        );
+        assert!(is_gitpulse(&spoofed));
+        let mut without = spoofed.clone();
+        without.real_exe = None;
+        assert!(
+            !is_gitpulse(&without),
+            "by argv[0] alone it is not, which is how it was missed"
+        );
+        let mut facts = quiet();
+        facts.rows.push(spoofed);
+        assert_eq!(procps_says("pkill gitpulse-aliased", &facts), Out::Deny);
+        facts.rows.pop();
+        facts.rows.push(without);
+        assert_eq!(procps_says("pkill gitpulse-aliased", &facts), Out::Silent);
+        // The app bundle is recognised by the executable too.
+        let bundled = linux_row(
+            2101,
+            "gitpulse",
+            &["renamed"],
+            "/Applications/GitPulse.app/Contents/MacOS/gitpulse",
+        );
+        assert!(is_gitpulse(&bundled));
+        // A process run from an ordinary executable under a GitPulse path as
+        // `argv[0]` still says it is GitPulse, as it did.
+        let claims = linux_row(2102, "sleep", &["/opt/gitpulse-fake"], "/bin/sleep");
+        assert!(is_gitpulse(&claims));
     }
 
     /* ── property: nothing panics, everything is bounded ── */
