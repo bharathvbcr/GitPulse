@@ -6,7 +6,9 @@ use crate::procguard::LockedSpawn;
 fn repo_with_tracked_and_untracked() -> tempfile::TempDir {
     let dir = tempfile::TempDir::new().unwrap();
     let run = |args: &[&str]| {
-        std::process::Command::new("git")
+        let mut command = std::process::Command::new("git");
+        crate::test_support::pin_git(&mut command);
+        command
             .args(args)
             .current_dir(dir.path())
             .env("GIT_AUTHOR_NAME", "t")
@@ -371,7 +373,9 @@ fn verdict_fold_keeps_the_strictest_in_any_order() {
 
 fn git_in(dir: &std::path::Path, args: &[&str]) -> bool {
     use crate::procguard::LockedSpawn;
-    std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    crate::test_support::pin_git(&mut command);
+    command
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "Test")
@@ -481,7 +485,9 @@ fn graph_fetch_limit_yields_the_probe_row_even_at_the_ceiling() {
 fn init_repo_with_branch_commits() -> (tempfile::TempDir, String, String, String) {
     let dir = tempfile::TempDir::new().unwrap();
     let git = |args: &[&str]| {
-        let output = std::process::Command::new("git")
+        let mut command = std::process::Command::new("git");
+        crate::test_support::pin_git(&mut command);
+        let output = command
             .args(["-c", "user.name=t", "-c", "user.email=t@t"])
             .args(args)
             .current_dir(dir.path())
@@ -513,7 +519,9 @@ fn init_repo_with_branch_commits() -> (tempfile::TempDir, String, String, String
 
 /// Bare git runner for tests that only need a side effect (no output).
 fn run_git(cwd: &std::path::Path, args: &[&str]) {
-    let output = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    crate::test_support::pin_git(&mut command);
+    let output = command
         .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args(args)
         .current_dir(cwd)

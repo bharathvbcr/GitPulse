@@ -379,7 +379,9 @@ mod tests {
     use crate::procguard::LockedSpawn;
 
     fn git(repo: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
+        let mut command = std::process::Command::new("git");
+        crate::test_support::pin_git(&mut command);
+        let out = command
             .args(args)
             .current_dir(repo)
             .output_locked()

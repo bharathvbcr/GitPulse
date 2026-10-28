@@ -204,7 +204,7 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
         .stderr(std::process::Stdio::piped());
     // The pinned config and home, named outright: a neighbour's scoped rebind
     // of `HOME` or `GIT_CONFIG_GLOBAL` must not reach a fixture command.
-    env::hermetic::pin_git(&mut command);
+    pin_git(&mut command);
     // Spawned under the inheritance lock like every production child: this
     // runs on test threads beside code whose pipes are not yet close-on-exec,
     // and a child forked in that window keeps their ends for its lifetime.
@@ -218,6 +218,110 @@ pub(crate) fn git_in(dir: &Path, args: &[&str]) {
     if args.first() == Some(&"init") {
         trust_repo(&dir);
     }
+}
+
+/// What git reads from the environment besides [`STRIPPED_GIT_ENV`], that a
+/// fixture command must not inherit: the ceiling and filesystem rules that
+/// decide whether the fixture repository is found, the identities and dates a
+/// commit is stamped with, the defaults a new repository is made with, and the
+/// pagers, editors and protocol rules. From the names the `git` binary on this
+/// host holds (`strings $(git --exec-path)/git`; `git help environment` has no
+/// manual here), minus the ones production already strips. A name set by a
+/// neighbour after [`pin_git`] scans the process is still removed, because each
+/// is removed by name; [`pin_git`] also sweeps every inherited `GIT_*` for the
+/// names this host's git does not list but a newer one may.
+///
+/// [`STRIPPED_GIT_ENV`]: crate::engine::git_cli
+#[cfg(test)]
+const FIXTURE_STRIPPED_GIT_ENV: &[&str] = &[
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_AUTHOR_DATE",
+    "GIT_AUTHOR_IDENT",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_COMMITTER_DATE",
+    "GIT_COMMITTER_IDENT",
+    "GIT_DEFAULT_BRANCH",
+    "GIT_DEFAULT_HASH",
+    "GIT_DEFAULT_REF_FORMAT",
+    "GIT_REFERENCE_BACKEND",
+    "GIT_TEMPLATE_DIR",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_GRAFT_FILE",
+    "GIT_NOTES_REF",
+    "GIT_NOTES_DISPLAY_REF",
+    "GIT_NOTES_REWRITE_REF",
+    "GIT_NOTES_REWRITE_MODE",
+    "GIT_REFLOG_ACTION",
+    "GIT_INDEX_VERSION",
+    "GIT_ALLOW_PROTOCOL",
+    "GIT_PROTOCOL",
+    "GIT_PROTOCOL_FROM_USER",
+    "GIT_ATTR_GLOBAL",
+    "GIT_ATTR_SYSTEM",
+    "GIT_ATTR_NOSYSTEM",
+    "GIT_EDITOR",
+    "GIT_PAGER",
+    "GIT_MERGE_AUTOEDIT",
+    "GIT_MERGE_VERBOSITY",
+    "GIT_REF_PARANOIA",
+    "GIT_QUARANTINE_PATH",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_DIFF_TOOL",
+    "GIT_EXTERNAL_DIFF_TRUST_EXIT_CODE",
+    "GIT_SHELL_PATH",
+    "GIT_COMMIT_GRAPH_PARANOIA",
+    "GIT_DISABLE_UNTRACKED_CACHE",
+    "GIT_FORCE_UNTRACKED_CACHE",
+    "GIT_NO_LAZY_FETCH",
+];
+
+/// Gives a fixture's `git` child the hermetic git environment, whatever a
+/// neighbouring test has rebound in the process.
+///
+/// A neighbour that rebinds a variable holds the environment lock, which a
+/// fixture helper does not take, so the helper reads the neighbour's value:
+/// its config, its `GIT_DIR`, its identity, a config file it has just deleted
+/// ("unknown error occurred while reading the configuration files"). Only the
+/// product call under test should see a rebound environment. So nothing git
+/// reads is inherited: every name production strips
+/// ([`strip_injected_git_env`]), the fixture-only names in
+/// [`FIXTURE_STRIPPED_GIT_ENV`] and any other inherited `GIT_*` are removed on
+/// the `Command`, never in the process, and the config and home are named
+/// outright: the pinned global config, no system config, and the hermetic
+/// `HOME`, `XDG_CONFIG_HOME` and `USERPROFILE`.
+///
+/// Call it before adding the command's own environment: a variable the caller
+/// sets afterwards (an author date, a template) is the caller's choice and
+/// survives.
+///
+/// [`strip_injected_git_env`]: crate::engine::git_cli::strip_injected_git_env
+#[cfg(test)]
+pub(crate) fn pin_git(command: &mut Command) -> &mut Command {
+    crate::engine::git_cli::strip_injected_git_env(command);
+    for name in FIXTURE_STRIPPED_GIT_ENV {
+        command.env_remove(name);
+    }
+    for (name, _) in std::env::vars_os() {
+        if name
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(&name);
+        }
+    }
+    let home = env::hermetic::home();
+    command
+        .env("GIT_CONFIG_GLOBAL", env::hermetic::pinned_git_config())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("USERPROFILE", &home)
+        .env("HOME", home)
 }
 
 #[cfg(test)]
@@ -697,6 +801,28 @@ mod tests {
             .set("HOME", neighbour.path())
             .set("XDG_CONFIG_HOME", neighbour.path());
         super::git_in(second.path(), &["init", "-q"]);
+    }
+
+    /// `GIT_WORK_TREE` moves the work tree git reads files from: with a
+    /// neighbour's value inherited, `add f.txt` looks for `f.txt` in the
+    /// neighbour's directory and the fixture's file is never staged.
+    #[test]
+    fn git_in_does_not_follow_a_neighbours_work_tree() {
+        use crate::test_support::env::{bind_env, env_serial};
+        let serial = env_serial();
+        let neighbour = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        super::git_in(repo.path(), &["init", "-q"]);
+        std::fs::write(repo.path().join("f.txt"), "x").unwrap();
+        {
+            let _env = bind_env(&serial).set("GIT_WORK_TREE", neighbour.path());
+            super::git_in(repo.path(), &["add", "f.txt"]);
+        }
+        let index = std::fs::read(repo.path().join(".git/index")).unwrap();
+        assert!(
+            index.windows(5).any(|window| window == b"f.txt"),
+            "f.txt was not staged: git_in followed the neighbour's GIT_WORK_TREE"
+        );
     }
 
     /// The defect: a killed run left its harness copies in `target/` for good.

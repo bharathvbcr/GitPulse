@@ -29,7 +29,9 @@ impl Repo {
     }
 
     fn git(&self, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let mut command = Command::new("git");
+        crate::test_support::pin_git(&mut command);
+        let out = command
             .args(args)
             .current_dir(self.path())
             .output_locked()

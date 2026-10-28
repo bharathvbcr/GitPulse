@@ -929,7 +929,10 @@ Counter failures are not load-dependent.
 
 Committed baselines: `local-macos-aarch64` (below, re-seeded after the lag-audit Waves 1 and 2). `ubuntu-latest` and
 `macos-latest` have **no committed baseline yet**; until the first
-`workflow_dispatch` seeds them, the scheduled job fails loudly on those classes.
+`workflow_dispatch` seeds them, the scheduled job runs every bench in smoke mode
+(which has to pass), prints a notice that no baseline is committed, and compares
+nothing (`benches.yml`, `4797eb40`). The `bench-<runner>` artifact is that run's
+measurement.
 
 ### What each bench measures, and the audit card it is the baseline for
 
@@ -941,8 +944,8 @@ Committed baselines: `local-macos-aarch64` (below, re-seeded after the lag-audit
 | `repo_read` | `get_status` at 1k and 10k files, clean and dirty, with git processes | A-git-05; git-status-assist-spike |
 | `command_timings` | insights snapshot, `list_worktrees listing`, `list_worktrees full`, language stats, docs refresh, `catch_up` (steady and cold), commit details on an 18-worktree fixture | the lag audit's snapshot / listing / stats / docs / catch-up / commit-details cards; `list_worktrees listing` (`list_worktrees_scanned` at `ScanDepth::Listing`, the `cmd_list_worktrees` default) is the baseline for ft-28c58695 (card 4), and `list_worktrees full` (`ScanDepth::Full`, the Worktrees panel's explicit opt-in) is the baseline for the Worktrees panel path |
 | `terminal_pty` | MB/s through a real PTY, IPC messages per MiB, keystroke echo p50 idle and during a flood in another session | terminal-output-channel; terminal-reader-kqueue |
-| `alerts_worker_throughput` | sustained notices/s through the intake, the 64-slot queue and the real notification worker: hook state reports and renderer answers over 64 sessions, 50,000 per sample, a full queue retried and counted. Time ungated (a producer/worker hand-off is the scheduler's); the notice and session counters are gated | ft-9cfd5474 (S1-08; row in ft-c0d9313f) |
-| `notify_stdin_bench` | `gitpulse-hook notify` per call (median of 20) at 0 B, 100 KiB and 4 MiB of stdin, outside a GitPulse terminal and inside one against a socket that acknowledges; `(base)` rows beside each when `GITPULSE_BENCH_BASE_HOOK` names a hook built before a change. Time ungated (a process start); the call and stdin-byte counters are gated | ft-9cfd5174 (S1-07) |
+| `alerts_worker_throughput` | sustained notices/s through the intake, the 64-slot queue and the real notification worker: hook state reports and renderer answers over 64 sessions, 50,000 per sample, a full queue retried and counted. Time is gated like every bench (the producer/worker hand-off is the work); counters gated: `notices`, `sessions`, and `drained`, 1 when the worker took a probe offered after the last notice | ft-9cfd5474 (S1-08; row in ft-c0d9313f) |
+| `notify_stdin_bench` | `gitpulse-hook notify` per call (median of 20) at 0 B, 100 KiB and 4 MiB of stdin, outside a GitPulse terminal and inside one against a socket that acknowledges; `(base)` rows beside each when `GITPULSE_BENCH_BASE_HOOK` names a hook built before a change (printed, never written to the JSON, so never in a baseline). Time is **recorded, not gated** (a process start); counters gated: `calls`, `stdin_bytes` and `reports_acked` (the reports the socket acknowledged). A hook that delivers but is slower is not caught: a 100 ms sleep added to it compared `OK` | ft-9cfd5174 (S1-15) |
 | `idle_wakeups` | process interrupt wakeups/s with 0, 1, 8, 32 idle terminal sessions, an idle mailbox, 8 / 24 idle watches, an idle alerts bridge and the host-load sampler | terminal-reader-kqueue; always-on-pollers; ft-79394019 (Wave 0) |
 | `live_index` | duty cycle of the live index under a 40-tick, 250 ms-cadence edit storm against a stub `devmap` | live-index-duty-cycle |
 | `worktree_teardown` | `remove_worktree` (lock-held) and `merge_and_teardown_worktree` on a worktree with 100k ignored files, and the merge with 0 entries as the control; `contender_wait_ns` of a `lock_worktree` issued mid-teardown | CARD 22 S5-11 (ft-9d04447403db7f9525dce4db970e4b8a) |

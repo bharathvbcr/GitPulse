@@ -39,7 +39,9 @@ const ALLOW: &str = r#"{"action":"allow","rule":"","severity":"","reason":"","ta
 const DENY: &str = r#"{"action":"deny","rule":"parity.denied","severity":"hard","reason":"refused by the parity fixture","target":"","task_id":"","demoted":"","degraded":[]}"#;
 
 fn git(dir: &Path, args: &[&str]) {
-    let output = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    crate::test_support::pin_git(&mut command);
+    let output = command
         .args(args)
         .current_dir(dir)
         .env("GIT_AUTHOR_NAME", "Test User")

@@ -887,6 +887,21 @@ fn pin_git_environment(cmd: &mut Command) {
         .env("GCM_INTERACTIVE", "never")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("LC_ALL", "C");
+    strip_injected_git_env(cmd);
+    cmd.env("GIT_EDITOR", "true")
+        .env("GIT_SEQUENCE_EDITOR", "true");
+}
+
+/// Removes every name in [`STRIPPED_GIT_ENV`] and [`STRIPPED_GIT_ENV_PREFIXES`]
+/// from the child's environment: the explicit names always (so a name set after
+/// this call but before the spawn is still removed), and the prefix families by
+/// scanning what the process holds now.
+///
+/// The one list of what must not reach a git child, shared by
+/// [`pin_git_environment`] and the test fixtures' `test_support::pin_git`, which
+/// strip more on top of it (identities, the ceiling, templates) rather than
+/// keep a second copy of this one.
+pub(crate) fn strip_injected_git_env(cmd: &mut Command) {
     for name in STRIPPED_GIT_ENV {
         cmd.env_remove(name);
     }
@@ -895,8 +910,6 @@ fn pin_git_environment(cmd: &mut Command) {
             cmd.env_remove(&name);
         }
     }
-    cmd.env("GIT_EDITOR", "true")
-        .env("GIT_SEQUENCE_EDITOR", "true");
 }
 
 /// Reads `PATH`/`HOME` from the process and defers to

@@ -37,13 +37,19 @@
 //!     cargo bench --manifest-path src-tauri/Cargo.toml --bench notify_stdin_bench
 //! ```
 //!
-//! The `(base)` rows exist only in that run, so they are never in a baseline;
-//! the compare notes them as rows with no baseline and does not fail on them.
-//! Every row is `ungated`: its time is a process
-//! start and a pipe, which is the scheduler's and the runner's, not the code's.
-//! The counters (calls and stdin bytes) stay in the gate. Reports the socket
-//! acknowledged are a metric: the listener counts them on its own thread, so
-//! the figure lags the sample that sent them.
+//! The `(base)` rows are printed and never written to the JSON, so no baseline
+//! can be made from a run that had them.
+//!
+//! What the gate catches here. Every row's time is `ungated`: it is dominated by
+//! starting a process, which is the host's more than the code's, and a 1.5x
+//! limit on a 7 ms row would fail on runner noise. The counters are gated:
+//! `calls` and `stdin_bytes` are inputs, and `reports_acked` is measured, the
+//! number of reports the socket acknowledged (the hook waits for the reply, so
+//! the figure is exact once the hook has exited). A hook that stops delivering
+//! (or delivers twice) changes it and fails the compare. **A hook that gets
+//! slower but still delivers is not caught**: a 100 ms sleep added to the hook
+//! (7.5 ms to 119 ms at min) compared `OK`. This bench records that cost; it
+//! does not gate it.
 
 #[cfg(unix)]
 mod common;
@@ -64,6 +70,8 @@ mod imp {
     const CALLS: usize = 20;
     /// Timed samples per case in a full run (`--smoke` cuts it).
     const ROUNDS: usize = 9;
+    /// What a row measured on the base hook is named after.
+    const BASE_SUFFIX: &str = " (base)";
 
     /// A `PostToolUse` payload of about `size` bytes, or nothing at 0.
     fn payload(size: usize) -> Vec<u8> {
@@ -164,7 +172,11 @@ mod imp {
         let new = std::env::var_os("GITPULSE_BENCH_HOOK")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_gitpulse-hook")));
-        let base = std::env::var_os("GITPULSE_BENCH_BASE_HOOK").map(PathBuf::from);
+        // An empty value is unset: a wrapper that exports the variable empty
+        // must not make the bench try to run a hook named "".
+        let base = std::env::var_os("GITPULSE_BENCH_BASE_HOOK")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
         let mut report = Report::new("notify_stdin_bench");
         report.note(format!(
             "hook {}{}; {CALLS} calls per sample, the sample is their median",
@@ -191,7 +203,7 @@ mod imp {
             for (index, (size, _)) in sizes.iter().enumerate() {
                 let mut sides = vec![(format!("{situation} {size}"), new.clone())];
                 if let Some(base) = &base {
-                    sides.push((format!("{situation} {size} (base)"), base.clone()));
+                    sides.push((format!("{situation} {size}{BASE_SUFFIX}"), base.clone()));
                 }
                 for (name, hook) in sides {
                     let (logs, socket, body) = (&logs, &listener.path, &bodies[index]);
@@ -202,11 +214,11 @@ mod imp {
                             let mut samples: Vec<Duration> = (0..CALLS)
                                 .map(|_| call(&hook, logs, socket, session, body))
                                 .collect();
-                            let acked = reports.load(Ordering::Relaxed) - acked;
+                            let acked = (reports.load(Ordering::Relaxed) - acked) as u64;
                             Sample::default()
                                 .counter("calls", CALLS as u64)
                                 .counter("stdin_bytes", stdin_bytes)
-                                .metric("reports_acked", acked as f64)
+                                .counter("reports_acked", acked)
                                 .elapsed(median(&mut samples))
                         })
                         .ungated(),
@@ -215,7 +227,14 @@ mod imp {
             }
         }
         let rows = interleave(cases, report.opts.samples(ROUNDS), report.opts.warmup(1));
+        // The `(base)` rows are measured in the same rotation, so the A/B is
+        // fair, but they are printed and not written to the JSON: a baseline
+        // made from a run that had them would fail every run that does not.
+        let (base_rows, rows): (Vec<_>, Vec<_>) = rows
+            .into_iter()
+            .partition(|row| row.name.ends_with(BASE_SUFFIX));
         report.extend(rows);
+        report.extend_unrecorded(base_rows);
         report.finish();
     }
 }

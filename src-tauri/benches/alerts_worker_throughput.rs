@@ -26,10 +26,14 @@
 //! * `renderer answers`: `prompt_submitted` over 64 sessions, the reserved
 //!   class a typing user produces.
 //!
-//! Both rows are `ungated`: their time is a hand-off between a producer that
-//! yields on a full queue and a worker thread, which is a property of the
-//! scheduler and the core count of the runner, not of the code. Their counters
-//! (notices and sessions) stay in the gate.
+//! Both rows are gated on time and on counters, like the other benches: the
+//! hand-off between the producer and the worker thread is the work being
+//! measured, not a property of the host. A producer that gets slower, or a
+//! worker that stops taking notices, fails the compare. The counters are
+//! `notices` and `sessions` (inputs) and `drained`, which is measured: 1 when
+//! the worker took a probe offered after the sample's last notice (the queue is
+//! one FIFO, so it took them all), 0 when it did not within 30 s. A worker that
+//! stalls or dies makes it 0.
 
 mod common;
 
@@ -102,18 +106,60 @@ fn run(make: Make) -> (Duration, u64) {
     (started.elapsed(), retries)
 }
 
+/// How long the worker is given to take everything a sample offered, once the
+/// last notice is in. Outside the timed span; a worker that never catches up
+/// reads as `drained = 0`, which fails the compare.
+const DRAIN: Duration = Duration::from_secs(30);
+
+/// Offers a probe through the queue every notice of the sample went through and
+/// waits for the worker to stand it; 1 when it did within [`DRAIN`], else 0.
+///
+/// The queue is one FIFO, so a worker that has taken the probe has taken every
+/// notice offered before it. A hook `permission_request` for a session of its
+/// own is what the worker records as a standing question, which
+/// `alerts::standing` reports. The probe is answered afterwards so nothing
+/// stands from one sample to the next.
+fn drained(sample: usize) -> u64 {
+    let key = format!("term-bench-probe-{sample}");
+    let mut probe = notice(Origin::Hook, "hook", "permission_request", 0);
+    probe.key.clone_from(&key);
+    let started = Instant::now();
+    while !alerts::try_offer(probe.clone()).taken() {
+        if started.elapsed() > DRAIN {
+            return 0;
+        }
+        std::thread::yield_now();
+    }
+    let stood = loop {
+        if alerts::standing()
+            .iter()
+            .any(|asking| asking.session == key)
+        {
+            break 1;
+        }
+        if started.elapsed() > DRAIN {
+            break 0;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let _ = alerts::answer(&key);
+    stood
+}
+
 fn arm(name: &'static str, make: Make) -> Case<'static> {
+    let probes = std::sync::atomic::AtomicUsize::new(0);
     Case::new(name, move || {
         let (span, retries) = run(make);
         assert!(span > Duration::ZERO, "{name}: a sample took no time");
+        let drained = drained(probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         Sample::default()
             .counter("notices", NOTICES as u64)
             .counter("sessions", SESSIONS as u64)
+            .counter("drained", drained)
             .metric("full_queue_retries", retries as f64)
             .metric("msgs_per_s", NOTICES as f64 / span.as_secs_f64())
             .elapsed(span)
     })
-    .ungated()
 }
 
 fn main() {

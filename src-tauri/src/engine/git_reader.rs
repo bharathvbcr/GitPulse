@@ -7640,25 +7640,20 @@ mod tests {
         }
     }
 
-    /// A fixture command reads the pinned hermetic config and home, named
-    /// outright, not whatever `HOME` and `GIT_CONFIG_GLOBAL` hold at the
-    /// moment. Those are process-wide and other tests rebind them to a
-    /// directory they delete when they finish, and one test rewrites the shared
-    /// `$HOME/.gitconfig`; a git that opens a config file another thread has
-    /// just removed or replaced dies with "unknown error occurred while reading
-    /// the configuration files", which is how `git add` failed in an unrelated
-    /// test. Only the product call under test should see a rebound environment.
+    /// A fixture command reads the pinned hermetic config and home, not what
+    /// the process holds at the moment (`test_support::pin_git`): other tests
+    /// rebind those to a directory they delete when they finish, and one test
+    /// rewrites the shared `$HOME/.gitconfig`; a git that opens a config file
+    /// another thread has just removed dies with "unknown error occurred while
+    /// reading the configuration files", which is how `git add` failed in an
+    /// unrelated test. Only the product call under test should see a rebound
+    /// environment.
     fn git_output(dir: &Path, args: &[&str]) -> std::process::Output {
-        let root = crate::test_support::env::hermetic::root();
-        std::process::Command::new("git")
+        let mut command = std::process::Command::new("git");
+        crate::test_support::pin_git(&mut command);
+        command
             .args(args)
             .current_dir(dir)
-            .env(
-                "GIT_CONFIG_GLOBAL",
-                crate::test_support::env::hermetic::pinned_git_config(),
-            )
-            .env("HOME", root.join("home"))
-            .env("XDG_CONFIG_HOME", root.join("home").join(".config"))
             .env("GIT_AUTHOR_NAME", "Test User")
             .env("GIT_AUTHOR_EMAIL", "test@example.com")
             .env("GIT_COMMITTER_NAME", "Test User")

@@ -38,7 +38,9 @@ impl R {
 
     fn init_in(&self, dir: &Path) {
         let run = |args: &[&str]| {
-            let out = Command::new("git")
+            let mut command = Command::new("git");
+            crate::test_support::pin_git(&mut command);
+            let out = command
                 .args(args)
                 .current_dir(dir)
                 .output_locked()
@@ -73,7 +75,9 @@ impl R {
     }
 
     fn git(&self, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let mut command = Command::new("git");
+        crate::test_support::pin_git(&mut command);
+        let out = command
             .args(args)
             .current_dir(self.work())
             .output_locked()

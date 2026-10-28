@@ -1591,7 +1591,11 @@ mod tests {
     }
 
     fn git_in(dir: &Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
+        // Not `crate::test_support::git_in`: that one also records the trust of
+        // a repository it initialises, which is what these tests decide.
+        let mut command = std::process::Command::new("git");
+        crate::test_support::pin_git(&mut command);
+        let output = command
             .args([
                 "-c",
                 "user.name=GitPulse",
