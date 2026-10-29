@@ -48,12 +48,14 @@ const ALLOWED: &[(&str, usize, &str)] = &[
 const VENDORED_ALLOWED: &[(&str, usize, &str)] = &[
     ("dc-glob/src/lib.rs", 1, "upstream DevCouncil: slice of a Vec of chunks (`chunks[k - 1][..len - 1]`), not a str"),
     ("dc-redact/src/lib.rs", 1, "upstream DevCouncil: guarded, `head` ends in a matched ASCII quote char so `len - 1` is a boundary"),
-    ("devmap-extract/src/frameworks.rs", 2, "upstream DevCouncil: guarded, `[1..len - 1]` after the first char is an ASCII quote and ends_with(open); and a slice of a Vec<(usize, &str)>"),
+    ("devmap-extract/src/kotlinsemi.rs", 3, "upstream DevCouncil: all three cut a &[u8], not a str (`last_char` decodes the tail itself); `saturating_sub(4)`, `len - 1` after `last_char` returned Some, and `stem.len() - 1` after `stem.last()` matched"),
+    ("devmap-extract/src/frameworks.rs", 2,"upstream DevCouncil: guarded, `[1..len - 1]` after the first char is an ASCII quote and ends_with(open); and a slice of a Vec<(usize, &str)>"),
     ("devmap-extract/src/languages.rs", 1, "upstream DevCouncil: slice of a Vec<&str>, not a str"),
     ("devmap-extract/src/markup.rs", 1, "upstream DevCouncil: guarded, first byte b'[' and ends_with(']')"),
     ("devmap-extract/src/rustsig.rs", 1, "upstream DevCouncil: guarded, `matching_close` returned the index of an ASCII close bracket equal to len - 1"),
     ("devmap-extract/src/wiring.rs", 1, "upstream DevCouncil: slice of a Vec<&str>, not a str"),
-    ("devmap-query/src/cypher.rs", 1, "upstream DevCouncil: guarded, `ends_with(open)` so the `len - open.len_utf8()` tail is exactly one char"),
+    ("devmap-query/src/doc_drift.rs", 4, "upstream DevCouncil: three slice a Vec (`segments`, `owners` twice, the last after `owners.len() >= qualifier.len()`); `span_content` cuts `[1..len - 1]` only after len >= 2, starts_with(' ') and ends_with(' '), both ASCII"),
+    ("devmap-query/src/cypher.rs", 1,"upstream DevCouncil: guarded, `ends_with(open)` so the `len - open.len_utf8()` tail is exactly one char"),
 ];
 
 fn check(
