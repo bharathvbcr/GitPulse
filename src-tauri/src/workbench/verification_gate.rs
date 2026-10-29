@@ -11,9 +11,9 @@
 //!
 //! How the record is read. The profile workbench store the sidecar writes is
 //! the store GitPulse already opens in-process (`dc_store::Store`), so the
-//! newest `work.verify.task` evidence row for the item is read with the same
-//! `evidence_list` reader `gitpulse_task_view` uses. No sidecar call is needed
-//! to complete a task, so completing one works with the sidecar down.
+//! newest `work.verify.task` evidence row for the item is read from it
+//! directly. No sidecar call is needed to complete a task, so completing one
+//! works with the sidecar down.
 //!
 //! The gate fails closed. Everything short of a settled `passed` record whose
 //! head is still the head of the worktree it was taken in is a hold, and a
@@ -24,6 +24,7 @@ use super::intake::resolve;
 use super::WorkbenchError;
 use crate::ipc_error::CommandError;
 use dc_store::Store;
+use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -90,37 +91,44 @@ pub(crate) enum Gate {
 /// current state, so the newest row of this type decides. An unparseable row
 /// is an error rather than a skip: skipping it would let an older `passed`
 /// row stand in for a newer verdict nobody could read.
+///
+/// One row is asked for, newest first, so the walk stops at the card's newest
+/// verification. It used to read a page of the card's whole history (up to
+/// 10,001 rows, each decoded) to use the first one, and called a verdict
+/// behind a page of other evidence "too long to establish". A card never
+/// verified still walks the whole table (`evidence` has no index on
+/// `task_id`); ask [`latest_many`] for more than one card.
 pub(crate) fn latest(store: &Store, item_id: &str) -> Result<Option<Record>, String> {
-    let (rows, truncated) = store
-        .evidence_list(Some(item_id))
-        .map_err(|e| format!("the verification evidence could not be read: {e}"))?;
-    for row in rows {
-        if row.kind != EVIDENCE_TYPE {
-            continue;
-        }
-        let record: Record = serde_json::from_str(&row.data_json).map_err(|e| {
-            format!("the newest verification record could not be parsed, so no verdict is established: {e}")
-        })?;
-        return Ok(Some(record));
-    }
-    if truncated {
-        return Err(
-            "the task's evidence history is too long to establish whether it was ever verified"
-                .into(),
-        );
-    }
-    Ok(None)
+    store
+        .connection()
+        .query_row(
+            "SELECT data_json FROM evidence WHERE task_id = ?1 AND type = ?2
+             ORDER BY id DESC LIMIT 1",
+            rusqlite::params![item_id, EVIDENCE_TYPE],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| format!("the verification evidence could not be read: {e}"))?
+        .map(|data| parse_record(&data))
+        .transpose()
+}
+
+fn parse_record(data: &str) -> Result<Record, String> {
+    serde_json::from_str(data).map_err(|e| {
+        format!(
+            "the newest verification record could not be parsed, so no verdict is established: {e}"
+        )
+    })
 }
 
 /// [`latest`] for many tasks at once: each task's newest verification record,
 /// absent for a task that has none.
 ///
-/// The board asks this for every card it shows, on every refresh. `evidence`
-/// has no index on `task_id` (dc-store's schema), so [`latest`] per card was
-/// one walk of the whole table per card: 4 s for 60 cards on an 82k-row
-/// profile, holding a storage slot throughout. This is one walk for them all.
-/// Only `work.verify.task` rows are read, so a task with many other rows is
-/// never "too long to establish", as it can be through [`latest`].
+/// The board asks this for every card it shows, on every refresh, and the
+/// driver for every held card on every sweep. `evidence` has no index on
+/// `task_id` (dc-store's schema), so [`latest`] per card was one walk of the
+/// whole table per card: 4 s for 60 cards on an 82k-row profile, holding a
+/// storage slot throughout. This is one walk for them all.
 pub(crate) fn latest_many(
     store: &Store,
     item_ids: &[String],
@@ -148,10 +156,7 @@ pub(crate) fn latest_many(
         .map_err(unreadable)?;
     for row in rows {
         let (task, data) = row.map_err(unreadable)?;
-        let record: Record = serde_json::from_str(&data).map_err(|e| {
-            format!("the newest verification record could not be parsed, so no verdict is established: {e}")
-        })?;
-        found.insert(task, record);
+        found.insert(task, parse_record(&data)?);
     }
     Ok(found)
 }

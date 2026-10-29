@@ -523,6 +523,70 @@ fn the_batched_verdict_read_agrees_with_the_per_card_read() {
     assert!(gate::latest_many(&store, &[]).unwrap().is_empty());
 }
 
+/// Records more evidence of another kind for `item` than one evidence page
+/// holds, all of it newer than what is already there.
+fn bury_under_other_evidence(store: &Store, item: &str) {
+    // One statement: `evidence_append` per row is ten thousand commits.
+    store
+        .connection()
+        .execute(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2)
+             INSERT INTO evidence (type, task_id, data_json) SELECT 'other.kind', ?1, '{}' FROM n",
+            rusqlite::params![item, dc_store::records::MAX_LIST_ROWS as i64 + 1],
+        )
+        .unwrap();
+}
+
+/// The newest verification is found however much evidence of other kinds
+/// came after it: the read asks for verification rows, not for a page of
+/// everything the card ever recorded.
+#[test]
+fn the_per_card_read_finds_a_verdict_behind_more_than_a_page_of_other_evidence() {
+    let (_d, store, repo, id) = setup();
+    let head = head_of(&repo);
+    store_record(&store, &id, &record(&id, "passed", "settled", &repo, &head));
+    bury_under_other_evidence(&store, &id);
+    let found = gate::latest(&store, &id).unwrap().expect("the verdict");
+    assert_eq!(found.outcome, "passed");
+}
+
+/// The same through a sweep. A verdict the read could not reach was "too
+/// long to establish", so the card was skipped on every sweep and never moved.
+#[test]
+fn a_sweep_promotes_a_pass_that_sits_behind_more_than_a_page_of_other_evidence() {
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    let fake = Fake::new();
+    let mut driver = Driver::default();
+    assert_eq!(driver.sweep(&store, &fake).started, 1);
+    verdict(&store, &repo, &id, "passed", &fake);
+    bury_under_other_evidence(&store, &id);
+    assert_eq!(driver.sweep(&store, &fake).promoted, 1);
+    assert_eq!(status_of(&store, &id), "done");
+}
+
+/// One card's unreadable verdict is that card's trouble only: the sweep still
+/// starts the verification another card is waiting for.
+#[test]
+fn an_unreadable_verdict_on_one_card_does_not_hold_up_another() {
+    let (_d, store, repo, id) = setup();
+    claim(&store, &repo, &id);
+    store
+        .evidence_append(
+            gate::EVIDENCE_TYPE,
+            Some(&id),
+            None,
+            None,
+            "{\"request_id\": 7}",
+        )
+        .unwrap();
+    let other = filed(&store, &repo, "gp-other", "Another");
+    claim(&store, &repo, &other);
+    let fake = Fake::new();
+    assert_eq!(Driver::default().sweep(&store, &fake).started, 1);
+    assert_eq!(fake.starts.borrow()[0]["item_id"], other);
+}
+
 /// The board reads verdicts on every refresh. That read commits nothing: a
 /// commit there would itself be announced as a change and read again.
 #[test]

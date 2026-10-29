@@ -164,12 +164,15 @@ fn measure_driver_children_over_a_profile_copy() {
     let mut totals = Report::default();
     let mut sweeps = 0usize;
     let mut longest = Duration::ZERO;
+    let mut sweeping = Duration::ZERO;
     let began = Instant::now();
     // The install loop's shape: sweep, then wait a period.
     while began.elapsed() < window {
         let swept = Instant::now();
         let report = driver.sweep(&store, &backend);
-        longest = longest.max(swept.elapsed());
+        let took = swept.elapsed();
+        longest = longest.max(took);
+        sweeping += took;
         totals.started += report.started;
         totals.promoted += report.promoted;
         totals.parked += report.parked;
@@ -209,6 +212,8 @@ fn measure_driver_children_over_a_profile_copy() {
             "window_s": elapsed.as_secs_f64(),
             "sweeps": sweeps,
             "longest_sweep_s": longest.as_secs_f64(),
+            // Time spent sweeping, of the window: the thread's duty cycle.
+            "sweeping_s": sweeping.as_secs_f64(),
             "review_cards": cards.len(),
             "held_with_target": targets.len(),
             "target_worktrees": worktrees.len(),
