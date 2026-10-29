@@ -251,7 +251,7 @@ describe("check:workflows", () => {
         "utf8",
       );
       // Every workflow pins the action to the commit v2 resolved to.
-      const caches = source.split("uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6");
+      const caches = source.split("uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0");
       expect(caches.length, name).toBeGreaterThan(1);
       for (const block of caches.slice(1)) {
         // ImageOS is a runner process env var, not a workflow `env` key, so
