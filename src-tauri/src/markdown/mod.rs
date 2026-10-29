@@ -392,6 +392,24 @@ mod tests {
         );
     }
 
+    /// RUSTSEC-2026-0414: with wikilinks on (MarkDev's options turn them on),
+    /// pulldown-cmark before 0.13.5 leaked each `[[a|]]`'s children into the
+    /// content after it, doubling the events per link. Sixteen links (112
+    /// bytes) made 327,676 events, so a few KiB of repository Markdown could
+    /// exhaust memory well under `MAX_RENDER_BYTES`. The fixed parser renders
+    /// each link once.
+    #[test]
+    fn empty_display_wikilinks_render_once_each() {
+        let source = "[[a|]] ".repeat(16);
+        let rendered = render(&source, None).unwrap();
+        assert!(
+            rendered.html.len() < 4096,
+            "{} bytes of HTML from {} bytes of wikilinks",
+            rendered.html.len(),
+            source.len()
+        );
+    }
+
     #[test]
     fn oversized_input_is_cut_at_a_line_and_the_rest_is_counted() {
         let line = "word ".repeat(19) + "\n";
