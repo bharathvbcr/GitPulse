@@ -866,6 +866,10 @@
                 "type": "integer",
                 "required": true
               },
+              "occurrence": {
+                "type": "integer",
+                "required": false
+              },
               "text": {
                 "type": "string",
                 "required": true
