@@ -639,6 +639,14 @@ impl Store {
         Ok(cleared)
     }
 
+    /// How many rows the queue holds, exhausted ones included: the same count
+    /// `query_source_freshness` refuses to certify over, and a COUNT rather
+    /// than a path listing so a deep queue is not read to ask "is it empty".
+    pub fn queued_path_count(&self) -> Result<i64> {
+        let conn = lock_conn(&self.conn)?;
+        conn.query_row("SELECT COUNT(*) FROM pending_paths", [], |row| row.get(0))
+    }
+
     /// Every queued path a drain may still retry, oldest first.
     pub fn get_pending_paths(&self) -> Result<Vec<String>> {
         self.get_pending_paths_limited(usize::MAX)

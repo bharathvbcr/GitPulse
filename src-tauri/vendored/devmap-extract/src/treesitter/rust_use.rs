@@ -26,7 +26,10 @@ pub(crate) fn rust_type_name(node: Node, source: &str, depth: usize) -> Option<S
         "type_identifier" | "scoped_type_identifier" => {
             let text = get_node_text(node, source);
             let bare = text.rsplit("::").next().unwrap_or(&text);
+            // ` a::b::{c};` is a struct expression whose name is `a::b::` and a
+            // MISSING type: no name at all, which is `None`, not an empty one.
             Some(bare.split('<').next().unwrap_or(bare).trim().to_string())
+                .filter(|name| !name.is_empty())
         }
         _ => None,
     }
@@ -589,6 +592,18 @@ pub(super) fn rust_use_is_public(node: Node, source: &str) -> bool {
         child.kind() == "visibility_modifier" && get_node_text(child, source).trim() == "pub"
     });
     public
+}
+
+/// Whether the generic declaration arm binds a callable's parameters to their
+/// declared types through [`param_type_bindings`].
+///
+/// The one predicate `extract_node` asks, so adding a language is an arm in
+/// `param_type_bindings` and a line here, and never an edit to the arm that
+/// asks. Rust and Go take their own arms and call `param_type_bindings`
+/// directly; this is the answer for the languages the generic arm serves, which
+/// is the C family today.
+pub(super) fn binds_param_types_in_generic_arm(lang: &str) -> bool {
+    is_c_family_grammar(lang)
 }
 
 /// Parameter name → declared type, for languages whose parameters carry one.

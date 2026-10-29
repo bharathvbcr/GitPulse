@@ -661,49 +661,72 @@ impl Store {
         &self,
         key: &devmap_extract::cache::CacheKey,
     ) -> Result<Option<devmap_extract::model::Extraction>> {
-        let conn = lock_conn(&self.conn)?;
-        let payload: Option<String> = conn
-            .query_row(
-                "SELECT payload_json FROM extraction_cache
-                 WHERE content_hash = ?1 AND language = ?2
-                   AND grammar_version = ?3 AND analyzer_version = ?4",
-                params![
-                    key.content_hash as i64,
-                    key.language,
-                    key.grammar_version,
-                    key.analyzer_version
-                ],
-                |row| row.get(0),
-            )
-            .optional()?;
+        self.try_get_cached_extraction_with(key, parse_stored_extraction)
+    }
 
-        // Fall back to a retained generation's copy (SC8).
-        //
-        // `generation_files` holds a byte-identical payload for the same
-        // content, so keeping both was storing every extraction twice — 198 MiB
-        // of a 525 MiB database on one corpus. The fallback matches on the FULL
-        // cache identity, including grammar and analyzer version, so it cannot
-        // serve a payload produced by older extraction semantics; rows written
-        // before schema v8 carry NULL there and are therefore never eligible.
-        // Absence of a recorded identity is not proof of a matching one.
-        let payload = match payload {
-            Some(found) => Some(("extraction_cache", found)),
-            None => conn
+    /// Read one cached extraction, parsing with `parse`.
+    ///
+    /// The connection guard covers the SELECT only. `parse` runs after that
+    /// guard is released, so two cached reads can decode at the same time.
+    /// The identity gate is unchanged, and a payload that will not parse is
+    /// still a store fault rather than a cache miss.
+    #[cfg(feature = "parse")]
+    pub(crate) fn try_get_cached_extraction_with<E>(
+        &self,
+        key: &devmap_extract::cache::CacheKey,
+        parse: impl FnOnce(&str) -> std::result::Result<devmap_extract::model::Extraction, E>,
+    ) -> Result<Option<devmap_extract::model::Extraction>>
+    where
+        E: std::fmt::Display,
+    {
+        // The guard ends with this block. `parse` must not run while it is
+        // held: the incremental extraction pass reloads every cached file on
+        // rayon, and decoding under the mutex makes that pass serial.
+        let payload = {
+            let conn = lock_conn(&self.conn)?;
+            let payload: Option<String> = conn
                 .query_row(
-                    "SELECT extraction_json FROM generation_files
+                    "SELECT payload_json FROM extraction_cache
                      WHERE content_hash = ?1 AND language = ?2
-                       AND grammar_version = ?3 AND analyzer_version = ?4
-                     LIMIT 1",
+                       AND grammar_version = ?3 AND analyzer_version = ?4",
                     params![
                         key.content_hash as i64,
                         key.language,
                         key.grammar_version,
                         key.analyzer_version
                     ],
-                    |row| row.get::<_, String>(0),
+                    |row| row.get(0),
                 )
-                .optional()?
-                .map(|json| ("generation_files", json)),
+                .optional()?;
+
+            // Fall back to a retained generation's copy (SC8).
+            //
+            // `generation_files` holds a byte-identical payload for the same
+            // content, so keeping both was storing every extraction twice — 198 MiB
+            // of a 525 MiB database on one corpus. The fallback matches on the FULL
+            // cache identity, including grammar and analyzer version, so it cannot
+            // serve a payload produced by older extraction semantics; rows written
+            // before schema v8 carry NULL there and are therefore never eligible.
+            // Absence of a recorded identity is not proof of a matching one.
+            match payload {
+                Some(found) => Some(("extraction_cache", found)),
+                None => conn
+                    .query_row(
+                        "SELECT extraction_json FROM generation_files
+                         WHERE content_hash = ?1 AND language = ?2
+                           AND grammar_version = ?3 AND analyzer_version = ?4
+                         LIMIT 1",
+                        params![
+                            key.content_hash as i64,
+                            key.language,
+                            key.grammar_version,
+                            key.analyzer_version
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .map(|json| ("generation_files", json)),
+            }
         };
         // S-5: a stored payload that will not parse is a store fault, not a
         // cache miss. `.ok()` here re-extracted the file on every build for
@@ -712,7 +735,7 @@ impl Store {
         // what it could not read.
         payload
             .map(|(table, json)| {
-                serde_json::from_str(&json).map_err(|error| {
+                parse(&json).map_err(|error| {
                     refusal(format!(
                         "stored extraction payload in {table} for content \
                          {hash:#018x} ({language}, grammar {grammar}, analyzer \
@@ -796,5 +819,813 @@ impl Store {
         )
         .optional()
         .map(|opt| opt.unwrap_or(0))
+    }
+}
+
+/// `serde_json::from_str` as a function item is not higher-ranked, so the
+/// production call cannot pass it directly. This wrapper is.
+#[cfg(feature = "parse")]
+fn parse_stored_extraction(json: &str) -> serde_json::Result<devmap_extract::model::Extraction> {
+    serde_json::from_str(json)
+}
+
+#[cfg(all(test, feature = "parse"))]
+mod cached_read_tests {
+    use super::super::lock_conn;
+    use super::*;
+    use devmap_extract::cache::CacheKey;
+    use devmap_extract::extract_file;
+    use rusqlite::params;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    fn admit(store: &Store, path: &str, source: &str) -> CacheKey {
+        let extraction = extract_file(path, source);
+        let key = CacheKey::for_extraction(&extraction);
+        store
+            .admit_cached_extraction(&key, &extraction)
+            .expect("admit");
+        key
+    }
+
+    #[test]
+    fn two_cached_reads_parse_at_the_same_time() {
+        let store = Arc::new(Store::open_in_memory().expect("store"));
+        let keys = [
+            admit(&store, "a.py", "def a():\n    return 1\n"),
+            admit(&store, "b.py", "def b():\n    return 2\n"),
+        ];
+        let entered = Arc::new(AtomicUsize::new(0));
+        let mut joins = Vec::new();
+        for key in keys {
+            let store = Arc::clone(&store);
+            let entered = Arc::clone(&entered);
+            joins.push(thread::spawn(move || {
+                store.try_get_cached_extraction_with(&key, |json| {
+                    // Probe only once every parser has entered. A sibling can
+                    // still be inside its SELECT before that, and the probe
+                    // itself must not be held or it blocks the others.
+                    let ordinal = entered.fetch_add(1, Ordering::SeqCst) + 1;
+                    let start = Instant::now();
+                    while entered.load(Ordering::SeqCst) < 2
+                        && start.elapsed() < Duration::from_secs(2)
+                    {
+                        thread::yield_now();
+                    }
+                    assert!(
+                        entered.load(Ordering::SeqCst) >= 2,
+                        "the other cached read never entered the parser"
+                    );
+                    if ordinal == 2 {
+                        assert!(
+                            store.conn.try_lock().is_ok(),
+                            "connection guard is held across JSON parse"
+                        );
+                    }
+                    serde_json::from_str(json)
+                })
+            }));
+        }
+        let mut paths = Vec::new();
+        for join in joins {
+            let parsed = join.join().expect("parser thread");
+            let extraction = parsed.expect("cached read").expect("a stored row");
+            paths.push(extraction.file_path);
+        }
+        paths.sort();
+        assert_eq!(paths, ["a.py".to_string(), "b.py".to_string()]);
+    }
+
+    #[test]
+    fn a_cache_miss_does_not_parse() {
+        let store = Store::open_in_memory().expect("store");
+        let key = CacheKey::for_source("python", "def untouched():\n    return 0\n");
+        let parsed = store.try_get_cached_extraction_with(
+            &key,
+            |_json| -> std::result::Result<devmap_extract::model::Extraction, String> {
+                panic!("a miss has no payload to parse");
+            },
+        );
+        assert!(parsed.expect("miss is not a fault").is_none());
+    }
+
+    #[test]
+    fn an_unparseable_cached_payload_is_a_refusal_naming_the_table() {
+        let store = Store::open_in_memory().expect("store");
+        let key = admit(&store, "c.py", "def c():\n    return 3\n");
+        {
+            let conn = lock_conn(&store.conn).expect("connection");
+            conn.execute(
+                "UPDATE extraction_cache SET payload_json = '{'
+                  WHERE content_hash = ?1",
+                params![key.content_hash as i64],
+            )
+            .expect("corrupt the stored payload");
+        }
+        let error = store
+            .try_get_cached_extraction(&key)
+            .expect_err("corrupt JSON is a store fault");
+        let text = error.to_string();
+        assert!(
+            text.contains("stored extraction payload in extraction_cache"),
+            "{text}"
+        );
+        assert!(text.contains("is invalid:"), "{text}");
+        assert!(!text.contains("cache miss"), "{text}");
+        assert!(
+            text.contains("EOF while parsing"),
+            "the serde error must stay in the refusal: {text}"
+        );
+        assert!(
+            !text.contains("{"),
+            "the refusal must name the fault, not quote the payload: {text}"
+        );
+    }
+
+    #[test]
+    fn a_different_analyzer_is_still_a_miss_and_is_not_parsed() {
+        let store = Store::open_in_memory().expect("store");
+        let key = admit(&store, "e.py", "def e():\n    return 5\n");
+        let stale = CacheKey {
+            analyzer_version: format!("{}-stale", key.analyzer_version),
+            ..key
+        };
+        let parsed = store.try_get_cached_extraction_with(
+            &stale,
+            |_json| -> std::result::Result<devmap_extract::model::Extraction, String> {
+                panic!("a stale analyzer must not parse");
+            },
+        );
+        assert!(parsed.expect("stale identity is a miss").is_none());
+    }
+
+    #[test]
+    fn the_parser_receives_the_stored_bytes() {
+        let store = Store::open_in_memory().expect("store");
+        let key = admit(&store, "f.py", "def f():\n    return 6\n");
+        let stored: String = {
+            let conn = lock_conn(&store.conn).expect("connection");
+            conn.query_row(
+                "SELECT payload_json FROM extraction_cache WHERE content_hash = ?1",
+                params![key.content_hash as i64],
+                |row| row.get(0),
+            )
+            .expect("stored payload")
+        };
+        let found = store
+            .try_get_cached_extraction_with(&key, |json| {
+                assert_eq!(json, stored, "parse must see the stored bytes");
+                serde_json::from_str(json)
+            })
+            .expect("read")
+            .expect("row");
+        assert_eq!(found.file_path, "f.py");
+    }
+
+    #[test]
+    fn an_unparseable_generation_payload_names_generation_files() {
+        let store = Store::open_in_memory().expect("store");
+        let source = "def helper():\n    return 1\n";
+        let extraction = extract_file("src/helper.py", source);
+        let key = CacheKey::for_source(&extraction.language, source);
+        let mut resolver = devmap_resolve::Resolver::new();
+        resolver.index_extractions(std::slice::from_ref(&extraction));
+        let resolution = resolver
+            .resolve_all(std::slice::from_ref(&extraction))
+            .expect("resolve");
+        let analysis = devmap_analyze::analyze(std::slice::from_ref(&extraction), &resolution);
+        store
+            .save_generation(std::slice::from_ref(&extraction), &resolution, &analysis)
+            .expect("generation");
+        {
+            let conn = lock_conn(&store.conn).expect("connection");
+            conn.execute("UPDATE file_payloads SET extraction_json = '{'", [])
+                .expect("corrupt the generation payload");
+        }
+        let text = store
+            .try_get_cached_extraction(&key)
+            .expect_err("corrupt generation JSON is a store fault")
+            .to_string();
+        assert!(
+            text.contains("stored extraction payload in generation_files"),
+            "{text}"
+        );
+        assert!(text.contains("is invalid:"), "{text}");
+        assert!(text.contains("EOF while parsing"), "{text}");
+    }
+
+    #[test]
+    fn a_generation_fallback_parses_without_the_connection_guard() {
+        let store = Store::open_in_memory().expect("store");
+        let source = "def helper():\n    return 1\n";
+        let extraction = extract_file("src/helper.py", source);
+        let key = CacheKey::for_source(&extraction.language, source);
+        let mut resolver = devmap_resolve::Resolver::new();
+        resolver.index_extractions(std::slice::from_ref(&extraction));
+        let resolution = resolver
+            .resolve_all(std::slice::from_ref(&extraction))
+            .expect("resolve");
+        let analysis = devmap_analyze::analyze(std::slice::from_ref(&extraction), &resolution);
+        store
+            .save_generation(std::slice::from_ref(&extraction), &resolution, &analysis)
+            .expect("generation");
+        {
+            let conn = lock_conn(&store.conn).expect("connection");
+            let cached: i64 = conn
+                .query_row("SELECT COUNT(*) FROM extraction_cache", [], |row| {
+                    row.get(0)
+                })
+                .expect("count");
+            assert_eq!(cached, 0, "the hit must come from generation_files");
+        }
+        let found = store
+            .try_get_cached_extraction_with(&key, |json| {
+                assert!(
+                    store.conn.try_lock().is_ok(),
+                    "generation fallback holds the connection guard across parse"
+                );
+                serde_json::from_str(json)
+            })
+            .expect("fallback read")
+            .expect("generation row");
+        assert_eq!(found.file_path, "src/helper.py");
+    }
+
+    #[test]
+    fn a_parser_panic_does_not_poison_the_store() {
+        let store = Store::open_in_memory().expect("store");
+        let key = admit(&store, "d.py", "def d():\n    return 4\n");
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.try_get_cached_extraction_with(
+                &key,
+                |_json| -> std::result::Result<devmap_extract::model::Extraction, String> {
+                    panic!("parser blew up");
+                },
+            );
+        }));
+        assert!(panicked.is_err(), "the parser panic must surface");
+        let read = store
+            .try_get_cached_extraction(&key)
+            .expect("the store mutex must still lock after a parser panic");
+        assert_eq!(read.expect("row").file_path, "d.py");
+    }
+
+    /// Same-thread re-entry deadlocks `std::sync::Mutex`. Bound the wait and
+    /// exit the process on timeout: a blocked worker would otherwise keep the
+    /// test binary alive after the assertion gave up.
+    fn run_bounded<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+            let _ = tx.send(outcome);
+        });
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(value)) => value,
+            Ok(Err(payload)) => std::panic::resume_unwind(payload),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                eprintln!("cached-read stress deadlocked");
+                std::process::exit(101);
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("cached-read stress worker disappeared");
+            }
+        }
+    }
+
+    fn save_one(store: &Store, path: &str, source: &str) -> CacheKey {
+        let extraction = extract_file(path, source);
+        let key = CacheKey::for_source(&extraction.language, source);
+        let mut resolver = devmap_resolve::Resolver::new();
+        resolver.index_extractions(std::slice::from_ref(&extraction));
+        let resolution = resolver
+            .resolve_all(std::slice::from_ref(&extraction))
+            .expect("resolve");
+        let analysis = devmap_analyze::analyze(std::slice::from_ref(&extraction), &resolution);
+        store
+            .save_generation(std::slice::from_ref(&extraction), &resolution, &analysis)
+            .expect("generation");
+        key
+    }
+
+    #[test]
+    fn eight_cached_reads_parse_at_the_same_time() {
+        const N: usize = 8;
+        let store = Arc::new(Store::open_in_memory().expect("store"));
+        let keys: Vec<_> = (0..N)
+            .map(|index| {
+                admit(
+                    &store,
+                    &format!("n{index}.py"),
+                    &format!("def n{index}():\n    return {index}\n"),
+                )
+            })
+            .collect();
+        let entered = Arc::new(AtomicUsize::new(0));
+        let mut joins = Vec::new();
+        for key in keys {
+            let store = Arc::clone(&store);
+            let entered = Arc::clone(&entered);
+            joins.push(thread::spawn(move || {
+                store.try_get_cached_extraction_with(&key, |json| {
+                    let ordinal = entered.fetch_add(1, Ordering::SeqCst) + 1;
+                    let start = Instant::now();
+                    while entered.load(Ordering::SeqCst) < N
+                        && start.elapsed() < Duration::from_secs(5)
+                    {
+                        thread::yield_now();
+                    }
+                    assert!(
+                        entered.load(Ordering::SeqCst) >= N,
+                        "a cached read never entered the parser"
+                    );
+                    if ordinal == N {
+                        assert!(
+                            store.conn.try_lock().is_ok(),
+                            "connection guard is held across JSON parse"
+                        );
+                    }
+                    serde_json::from_str(json)
+                })
+            }));
+        }
+        let mut paths = Vec::new();
+        for join in joins {
+            let extraction = join
+                .join()
+                .expect("parser thread")
+                .expect("cached read")
+                .expect("a stored row");
+            paths.push(extraction.file_path);
+        }
+        paths.sort();
+        let expected: Vec<_> = (0..N).map(|index| format!("n{index}.py")).collect();
+        assert_eq!(paths, expected);
+    }
+
+    #[test]
+    fn the_parser_reenters_admits_and_prunes_without_deadlock() {
+        let store = Arc::new(Store::open_in_memory().expect("store"));
+        let key = admit(&store, "outer.py", "def outer():\n    return 1\n");
+        let store_for_read = Arc::clone(&store);
+        let key_for_read = key.clone();
+        let found = run_bounded(move || {
+            store_for_read.try_get_cached_extraction_with(&key_for_read, |json| {
+                let again = store_for_read
+                    .try_get_cached_extraction(&key_for_read)
+                    .expect("re-entering the same key must not deadlock");
+                assert_eq!(again.expect("row").file_path, "outer.py");
+                let extra = admit(
+                    &store_for_read,
+                    "during.py",
+                    "def during():\n    return 2\n",
+                );
+                let admitted = store_for_read
+                    .try_get_cached_extraction(&extra)
+                    .expect("admit during parse");
+                assert_eq!(admitted.expect("row").file_path, "during.py");
+                store_for_read
+                    .prune_extraction_cache()
+                    .expect("prune during parse");
+                serde_json::from_str::<devmap_extract::model::Extraction>(json)
+            })
+        });
+        assert_eq!(found.expect("read").expect("row").file_path, "outer.py");
+        let after = store
+            .try_get_cached_extraction(&key)
+            .expect("store still locks");
+        assert!(
+            after.is_none(),
+            "prune committed while the snapshot was still parsing"
+        );
+    }
+
+    #[test]
+    fn a_writer_replaces_the_row_while_the_snapshot_parses() {
+        let store = Arc::new(Store::open_in_memory().expect("store"));
+        let key = admit(&store, "snap.py", "def snap():\n    return 1\n");
+        let entered = Arc::new(AtomicBool::new(false));
+        let replaced = Arc::new(AtomicBool::new(false));
+        let store_for_read = Arc::clone(&store);
+        let entered_for_read = Arc::clone(&entered);
+        let replaced_for_read = Arc::clone(&replaced);
+        let key_for_read = key.clone();
+        let reader = thread::spawn(move || {
+            store_for_read.try_get_cached_extraction_with(&key_for_read, |json| {
+                entered_for_read.store(true, Ordering::SeqCst);
+                let start = Instant::now();
+                while !replaced_for_read.load(Ordering::SeqCst)
+                    && start.elapsed() < Duration::from_secs(2)
+                {
+                    thread::yield_now();
+                }
+                assert!(
+                    replaced_for_read.load(Ordering::SeqCst),
+                    "writer could not commit while the snapshot was parsing"
+                );
+                assert_ne!(json, "{", "parse must see the bytes copied at SELECT");
+                serde_json::from_str::<devmap_extract::model::Extraction>(json)
+            })
+        });
+        let start = Instant::now();
+        while !entered.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(2) {
+            thread::yield_now();
+        }
+        assert!(entered.load(Ordering::SeqCst), "parser never started");
+        {
+            let conn = lock_conn(&store.conn).expect("writer lock");
+            conn.execute(
+                "UPDATE extraction_cache SET payload_json = '{' WHERE content_hash = ?1",
+                params![key.content_hash as i64],
+            )
+            .expect("replace the stored payload");
+        }
+        replaced.store(true, Ordering::SeqCst);
+        let parsed = reader.join().expect("reader").expect("snapshot read");
+        assert_eq!(parsed.expect("row").file_path, "snap.py");
+        let text = store
+            .try_get_cached_extraction(&key)
+            .expect_err("the replaced row is a fault")
+            .to_string();
+        assert!(
+            text.contains("stored extraction payload in extraction_cache"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn readers_never_observe_a_torn_payload() {
+        let store = Arc::new(Store::open_in_memory().expect("store"));
+        let left = admit(&store, "left.py", "def left():\n    return 1\n");
+        let right = admit(&store, "right.py", "def right():\n    return 2\n");
+        let payload = |key: &CacheKey| -> String {
+            let conn = lock_conn(&store.conn).expect("connection");
+            conn.query_row(
+                "SELECT payload_json FROM extraction_cache WHERE content_hash = ?1",
+                params![key.content_hash as i64],
+                |row| row.get(0),
+            )
+            .expect("payload")
+        };
+        let left_json = payload(&left);
+        let right_json = payload(&right);
+        let stop = Arc::new(AtomicBool::new(false));
+        let faults = Arc::new(AtomicUsize::new(0));
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let store = Arc::clone(&store);
+            let key = left.clone();
+            let stop = Arc::clone(&stop);
+            let faults = Arc::clone(&faults);
+            readers.push(thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    match store.try_get_cached_extraction(&key) {
+                        Ok(Some(ext))
+                            if ext.file_path == "left.py" || ext.file_path == "right.py" => {}
+                        _ => {
+                            faults.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                }
+            }));
+        }
+        let start = Instant::now();
+        let mut flip = false;
+        while start.elapsed() < Duration::from_millis(250) {
+            flip = !flip;
+            let json = if flip { &left_json } else { &right_json };
+            let conn = lock_conn(&store.conn).expect("writer");
+            conn.execute(
+                "UPDATE extraction_cache SET payload_json = ?1 WHERE content_hash = ?2",
+                params![json, left.content_hash as i64],
+            )
+            .expect("swap payload");
+        }
+        stop.store(true, Ordering::SeqCst);
+        for reader in readers {
+            reader.join().expect("reader");
+        }
+        assert_eq!(
+            faults.load(Ordering::SeqCst),
+            0,
+            "a reader saw a torn payload"
+        );
+    }
+
+    #[test]
+    fn hostile_cached_payloads_are_refusals_that_name_the_table() {
+        let store = Store::open_in_memory().expect("store");
+        let key = admit(&store, "bad.py", "def bad():\n    return 1\n");
+        let mut deep = "[".repeat(200);
+        deep.push_str(&"]".repeat(200));
+        let mut huge = String::from("{");
+        huge.extend(std::iter::repeat(' ').take(256 * 1024));
+        let samples = [
+            "",
+            "{",
+            "null",
+            "[]",
+            "0",
+            "\"nope\"",
+            "   ",
+            "{}",
+            "{\"file_path\":",
+            deep.as_str(),
+            huge.as_str(),
+        ];
+        for sample in samples {
+            {
+                let conn = lock_conn(&store.conn).expect("connection");
+                conn.execute(
+                    "UPDATE extraction_cache SET payload_json = ?1 WHERE content_hash = ?2",
+                    params![sample, key.content_hash as i64],
+                )
+                .expect("plant a hostile payload");
+            }
+            let text = store
+                .try_get_cached_extraction(&key)
+                .expect_err("hostile JSON is a store fault")
+                .to_string();
+            assert!(
+                text.contains("stored extraction payload in extraction_cache"),
+                "{sample:?} -> {text}"
+            );
+            assert!(text.contains("is invalid:"), "{sample:?} -> {text}");
+            assert!(!text.contains("cache miss"), "{sample:?} -> {text}");
+            let detail = text.split("is invalid:").nth(1).unwrap_or("");
+            assert!(
+                !detail.trim().is_empty(),
+                "{sample:?} dropped the parser error"
+            );
+        }
+    }
+
+    #[test]
+    fn a_corrupt_cache_row_does_not_fall_through_to_a_valid_generation() {
+        let store = Store::open_in_memory().expect("store");
+        let source = "def both():\n    return 1\n";
+        let key = save_one(&store, "both.py", source);
+        let admitted = admit(&store, "both.py", source);
+        assert_eq!(
+            admitted.content_hash, key.content_hash,
+            "the cache row and the generation row must share an identity"
+        );
+        {
+            let conn = lock_conn(&store.conn).expect("connection");
+            let generations: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM generation_files
+                     WHERE content_hash = ?1 AND language = ?2
+                       AND grammar_version = ?3 AND analyzer_version = ?4",
+                    params![
+                        key.content_hash as i64,
+                        key.language,
+                        key.grammar_version,
+                        key.analyzer_version
+                    ],
+                    |row| row.get(0),
+                )
+                .expect("generation count");
+            assert!(generations >= 1, "the fall-through row has to exist");
+            conn.execute(
+                "UPDATE extraction_cache SET payload_json = '{' WHERE content_hash = ?1",
+                params![key.content_hash as i64],
+            )
+            .expect("corrupt only the cache row");
+        }
+        let text = store
+            .try_get_cached_extraction(&key)
+            .expect_err("the cache row wins, and it is a fault")
+            .to_string();
+        assert!(
+            text.contains("stored extraction payload in extraction_cache"),
+            "{text}"
+        );
+        assert!(!text.contains("generation_files"), "{text}");
+    }
+
+    #[test]
+    fn a_null_generation_identity_is_a_miss_and_is_not_parsed() {
+        let store = Store::open_in_memory().expect("store");
+        let key = save_one(&store, "old.py", "def old():\n    return 1\n");
+        {
+            let conn = lock_conn(&store.conn).expect("connection");
+            conn.execute(
+                "UPDATE file_payloads SET grammar_version = NULL, analyzer_version = NULL",
+                [],
+            )
+            .expect("clear the stored identity");
+        }
+        let parsed = store.try_get_cached_extraction_with(
+            &key,
+            |_json| -> std::result::Result<devmap_extract::model::Extraction, String> {
+                panic!("a NULL generation identity must not parse");
+            },
+        );
+        assert!(parsed.expect("NULL identity is a miss").is_none());
+    }
+
+    #[test]
+    fn a_high_bit_content_hash_round_trips_and_does_not_alias() {
+        let store = Store::open_in_memory().expect("store");
+        let low = admit(&store, "low.py", "def low():\n    return 1\n");
+        let high_payload = {
+            let donor = admit(&store, "high.py", "def high():\n    return 2\n");
+            let conn = lock_conn(&store.conn).expect("connection");
+            let payload: String = conn
+                .query_row(
+                    "SELECT payload_json FROM extraction_cache WHERE content_hash = ?1",
+                    params![donor.content_hash as i64],
+                    |row| row.get(0),
+                )
+                .expect("donor payload");
+            payload
+        };
+        for hash in [1u64 << 63, u64::MAX] {
+            let key = CacheKey {
+                content_hash: hash,
+                ..low.clone()
+            };
+            {
+                let conn = lock_conn(&store.conn).expect("connection");
+                conn.execute(
+                    "INSERT INTO extraction_cache
+                        (content_hash, language, grammar_version, analyzer_version, payload_json, accessed_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+                    params![
+                        key.content_hash as i64,
+                        key.language,
+                        key.grammar_version,
+                        key.analyzer_version,
+                        high_payload
+                    ],
+                )
+                .expect("insert a high-bit identity");
+            }
+            let found = store
+                .try_get_cached_extraction(&key)
+                .expect("high-bit read")
+                .expect("high-bit row");
+            assert_eq!(found.file_path, "high.py");
+        }
+        let still_low = store
+            .try_get_cached_extraction(&low)
+            .expect("low read")
+            .expect("low row");
+        assert_eq!(still_low.file_path, "low.py");
+    }
+
+    #[test]
+    fn a_language_with_sql_metacharacters_matches_only_itself() {
+        let store = Store::open_in_memory().expect("store");
+        let key = admit(&store, "q.py", "def q():\n    return 1\n");
+        let hostile = "python' OR language <> 'python";
+        {
+            let conn = lock_conn(&store.conn).expect("connection");
+            conn.execute(
+                "UPDATE extraction_cache SET language = ?1 WHERE content_hash = ?2",
+                params![hostile, key.content_hash as i64],
+            )
+            .expect("rename the language");
+        }
+        let exact = CacheKey {
+            language: hostile.to_string(),
+            ..key.clone()
+        };
+        let found = store
+            .try_get_cached_extraction(&exact)
+            .expect("exact language")
+            .expect("row");
+        assert_eq!(found.file_path, "q.py");
+        let python = CacheKey {
+            language: "python".to_string(),
+            ..key
+        };
+        let parsed = store.try_get_cached_extraction_with(
+            &python,
+            |_json| -> std::result::Result<devmap_extract::model::Extraction, String> {
+                panic!("a different language must not parse");
+            },
+        );
+        assert!(parsed.expect("other language is a miss").is_none());
+    }
+
+    #[test]
+    fn a_poisoned_store_mutex_is_still_a_refusal() {
+        let store = Arc::new(Store::open_in_memory().expect("store"));
+        let key = admit(&store, "poison.py", "def poison():\n    return 1\n");
+        let doomed = Arc::clone(&store);
+        let joined = thread::spawn(move || {
+            let _guard = lock_conn(&doomed.conn).expect("lock");
+            panic!("poison the store");
+        })
+        .join();
+        assert!(joined.is_err(), "the poisoning thread must panic");
+        for _ in 0..2 {
+            let text = store
+                .try_get_cached_extraction(&key)
+                .expect_err("poison refuses")
+                .to_string();
+            assert!(
+                text.contains("store mutex poisoned — refusing to continue (fail-closed)"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cache_hit_and_a_generation_fallback_parse_together() {
+        let store = Arc::new(Store::open_in_memory().expect("store"));
+        let cached = admit(&store, "hit.py", "def hit():\n    return 1\n");
+        let generated = save_one(&store, "miss.py", "def miss():\n    return 2\n");
+        let entered = Arc::new(AtomicUsize::new(0));
+        let mut joins = Vec::new();
+        for key in [cached, generated] {
+            let store = Arc::clone(&store);
+            let entered = Arc::clone(&entered);
+            joins.push(thread::spawn(move || {
+                store.try_get_cached_extraction_with(&key, |json| {
+                    let ordinal = entered.fetch_add(1, Ordering::SeqCst) + 1;
+                    let start = Instant::now();
+                    while entered.load(Ordering::SeqCst) < 2
+                        && start.elapsed() < Duration::from_secs(2)
+                    {
+                        thread::yield_now();
+                    }
+                    assert!(entered.load(Ordering::SeqCst) >= 2);
+                    if ordinal == 2 {
+                        assert!(
+                            store.conn.try_lock().is_ok(),
+                            "connection guard is held across JSON parse"
+                        );
+                    }
+                    serde_json::from_str(json)
+                })
+            }));
+        }
+        let mut paths = Vec::new();
+        for join in joins {
+            paths.push(
+                join.join()
+                    .expect("parser thread")
+                    .expect("read")
+                    .expect("row")
+                    .file_path,
+            );
+        }
+        paths.sort();
+        assert_eq!(paths, ["hit.py".to_string(), "miss.py".to_string()]);
+    }
+
+    #[test]
+    fn moving_a_large_payload_out_is_the_select_allocation() {
+        let mut source = String::new();
+        for index in 0..400 {
+            source.push_str(&format!("def f{index}(x):\n    return x + {index}\n"));
+        }
+        let store = Store::open_in_memory().expect("store");
+        let key = admit(&store, "big.py", &source);
+        let mut copy_ns = Vec::new();
+        let mut parse_ns = Vec::new();
+        let mut payload_bytes = 0usize;
+        for _ in 0..5 {
+            let started = Instant::now();
+            let copied: String = {
+                let conn = lock_conn(&store.conn).expect("connection");
+                conn.query_row(
+                    "SELECT payload_json FROM extraction_cache
+                     WHERE content_hash = ?1 AND language = ?2
+                       AND grammar_version = ?3 AND analyzer_version = ?4",
+                    params![
+                        key.content_hash as i64,
+                        key.language,
+                        key.grammar_version,
+                        key.analyzer_version
+                    ],
+                    |row| row.get(0),
+                )
+                .expect("payload")
+            };
+            copy_ns.push(started.elapsed().as_nanos());
+            payload_bytes = copied.len();
+            let started = Instant::now();
+            let parsed: devmap_extract::model::Extraction =
+                serde_json::from_str(&copied).expect("parse");
+            parse_ns.push(started.elapsed().as_nanos());
+            assert_eq!(parsed.file_path, "big.py");
+            assert!(copied.len() > 10_000, "payload was {} bytes", copied.len());
+        }
+        copy_ns.sort_unstable();
+        parse_ns.sort_unstable();
+        eprintln!(
+            "large-payload bytes={} copy_ns_min={} parse_ns_min={}",
+            payload_bytes, copy_ns[0], parse_ns[0]
+        );
+        let via = store
+            .try_get_cached_extraction(&key)
+            .expect("cached read")
+            .expect("row");
+        assert_eq!(via.file_path, "big.py");
     }
 }

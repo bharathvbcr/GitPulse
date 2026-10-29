@@ -243,7 +243,7 @@ pub(super) enum ParseAttempt {
 /// `parse` on it would *resume* that state instead of starting on the new
 /// text. The probes reuse one parser per thread, so a cancel resets it here
 /// rather than relying on every caller to.
-pub(super) fn parse_until(
+pub(crate) fn parse_until(
     parser: &mut Parser,
     source: &str,
     deadline: std::time::Instant,
@@ -508,6 +508,57 @@ pub(super) fn extract_treesitter_before_deadline(
             }
             ParseAttempt::Parsed(_) => {}
         }
+        // Kotlin only: a one-line class body is a whole-file grammar error
+        // that a `;` written over a space repairs without moving a byte. The
+        // rewritten tree replaces the failed one only if it is fully clean.
+        let (attempt, semi_ranges, semi_note) = match attempt {
+            // Only a tree `parse_outcome_of` calls `Partial`. That includes the
+            // shapes the grammar recovers itself with a hidden zero-width
+            // token: no node shows it, `has_error()` counts it, and
+            // `parse_outcome_of` charges the node that carries it.
+            ParseAttempt::Parsed(tree)
+                if lang == "kotlin"
+                    && tree.root_node().has_error()
+                    && matches!(
+                        parse_outcome_of(
+                            tree.root_node(),
+                            source,
+                            false,
+                            false,
+                            true,
+                            &crate::kotlinloss::LostScan::default(),
+                        ),
+                        ParseOutcome::Partial { .. }
+                    ) =>
+            {
+                match crate::kotlinsemi::repair(&mut parser, tree, source, deadline) {
+                    crate::kotlinsemi::Repair::Repaired {
+                        tree,
+                        ranges,
+                        edits,
+                        boundaries,
+                    } => (
+                        ParseAttempt::Parsed(tree),
+                        ranges,
+                        Some(format!(
+                            "kotlin one-line class body{}: {edits} separator(s) written over \
+                             spaces so the file parses; offsets are the file's own",
+                            if boundaries {
+                                " (declarations sharing a line)"
+                            } else {
+                                ""
+                            }
+                        )),
+                    ),
+                    crate::kotlinsemi::Repair::Unchanged { tree, why } => (
+                        ParseAttempt::Parsed(tree),
+                        Vec::new(),
+                        Some(format!("kotlin one-line class body not repaired: {why}")),
+                    ),
+                }
+            }
+            other => (other, Vec::new(), None),
+        };
         if let ParseAttempt::Parsed(tree) = attempt {
             return crate::parent_index::with_index(&tree, deadline, || {
                 // The budget covers parse *and* walk *and* everything after it.
@@ -517,8 +568,31 @@ pub(super) fn extract_treesitter_before_deadline(
                 let content_hash = content_hash(source);
 
                 let root = tree.root_node();
-                let parse_outcome =
-                    parse_outcome_of(root, source, is_metal_path(path), lang == "python");
+                // Kotlin only: statements the grammar read as expressions,
+                // which parse without an error and so never reach the walk
+                // below that finds error nodes.
+                let lost = if lang == "kotlin" {
+                    crate::kotlinloss::detect(root, source)
+                } else {
+                    crate::kotlinloss::LostScan::default()
+                };
+                // The walks below leave out what the expression reading made of
+                // a charged statement, instead of the settling that follows
+                // taking it out by name.
+                set_charged_regions(
+                    lost.regions
+                        .iter()
+                        .map(|region| (region.range.start_byte, region.range.end_byte))
+                        .collect(),
+                );
+                let parse_outcome = parse_outcome_of(
+                    root,
+                    source,
+                    is_metal_path(path),
+                    lang == "python",
+                    lang == "kotlin",
+                    &lost,
+                );
 
                 let mut symbols = Vec::new();
                 let mut imports = Vec::new();
@@ -755,49 +829,7 @@ pub(super) fn extract_treesitter_before_deadline(
                     });
                 }
 
-                // The names the exports so far publish, kept as sets so each
-                // exported symbol asks one lookup instead of scanning every
-                // export: a type with tens of thousands of exported members made
-                // this loop quadratic (30,000 Swift properties spent most of
-                // their extraction here).
-                let mut published_as: std::collections::HashSet<String> = exports
-                    .iter()
-                    .map(|export| export.exported_name.clone())
-                    .collect();
-                let mut published_from: std::collections::HashSet<String> = exports
-                    .iter()
-                    .filter(|export| {
-                        export.module_specifier.is_none() && export.exported_name != "default"
-                    })
-                    .filter_map(|export| export.local_name.clone())
-                    .collect();
-                for symbol in symbols.iter().filter(|symbol| symbol.is_exported) {
-                    // A symbol already published under another name —
-                    // `export { local as Public }` — is not also exported as
-                    // itself. Matching on `exported_name` alone fabricated a
-                    // second export, `local`, that the module never declared.
-                    if !published_as.contains(&symbol.name)
-                        && !published_from.contains(&symbol.name)
-                    {
-                        published_as.insert(symbol.name.clone());
-                        if symbol.name != "default" {
-                            published_from.insert(symbol.name.clone());
-                        }
-                        exports.push(ExtractedExport {
-                            exported_name: symbol.name.clone(),
-                            local_name: Some(symbol.name.clone()),
-                            module_specifier: None,
-                            span: symbol.span.clone(),
-                        });
-                    }
-                }
-                exports.sort_by(|a, b| {
-                    (&a.exported_name, &a.module_specifier, a.span.start_byte).cmp(&(
-                        &b.exported_name,
-                        &b.module_specifier,
-                        b.span.start_byte,
-                    ))
-                });
+                publish_exports(&symbols, &mut exports);
                 if lang == "rust" {
                     rust_expand_local_macros(
                         root,
@@ -832,10 +864,11 @@ pub(super) fn extract_treesitter_before_deadline(
                 // failure cannot retroactively turn a successful grammar
                 // parse into a failed parse outcome, but it must remain
                 // visible to downstream diagnostics.
-                let (routes, diagnostics) = match extract_framework_routes(lang, source) {
+                let (routes, mut diagnostics) = match extract_framework_routes(lang, source) {
                     Ok(routes) => (routes, Vec::new()),
                     Err(reason) => (Vec::new(), vec![reason]),
                 };
+                diagnostics.extend(semi_note);
 
                 // Body signatures are stamped here, after every language arm
                 // has finished pushing symbols, rather than inside `walk_tree`.
@@ -900,6 +933,18 @@ pub(super) fn extract_treesitter_before_deadline(
                     } else {
                         (Vec::new(), Vec::new(), Vec::new())
                     };
+                // One call per fact family, each answering for its own
+                // languages and returning an empty set for the rest, so a new
+                // fact is added in `jvmfacts` or `pyfacts` and never here.
+                let jvm_facts = crate::jvmfacts::collect(
+                    root,
+                    source,
+                    lang,
+                    &symbols,
+                    &parse_outcome,
+                    deadline,
+                );
+                let py_facts = crate::pyfacts::collect(root, source, lang, &symbols, deadline);
                 // Bound rather than returned: the embedded-script merge below
                 // still has to run, and it mutates this value in place.
                 let mut extraction = Extraction {
@@ -962,7 +1007,22 @@ pub(super) fn extract_treesitter_before_deadline(
                     } else {
                         Vec::new()
                     },
+                    jvm_decls: jvm_facts.jvm_decls,
+                    package_scopes: jvm_facts.package_scopes,
+                    local_extents: jvm_facts.local_extents,
+                    decl_gaps: jvm_facts.decl_gaps,
+                    recovered_decl_ranges: semi_ranges,
+                    dynamic_dispatch: py_facts.dynamic_dispatch,
                 };
+
+                // Kotlin only, and only for a file the loss detector charged:
+                // re-derive the declarations the grammar read as expressions.
+                // After the extraction is assembled, because the recovered
+                // symbols carry their own stamps from the re-parse, and before
+                // everything below, which reads `extraction.symbols`.
+                if lang == "kotlin" {
+                    crate::kotlinloss::recover(&mut extraction, source, &lost, deadline);
+                }
 
                 // The code inside a template language's `<script>` blocks, in
                 // the outer file's own coordinates. Last, and after
@@ -1008,6 +1068,12 @@ pub(super) fn extract_treesitter_before_deadline(
                 extraction.literals = literals;
                 extraction.diagnostics.append(&mut notes);
                 extraction.diagnostics.extend(take_nesting_cap_notes());
+                extraction
+                    .diagnostics
+                    .extend(take_swift_unspelled_operator_notes());
+                extraction
+                    .diagnostics
+                    .extend(take_swift_bare_cast_member_notes());
                 #[cfg(test)]
                 EXTRACTION_FINISH_HOOK.with(|hook| {
                     if let Some(finish) = hook.take() {
@@ -1073,13 +1139,82 @@ pub(crate) fn push_named_children<'tree>(node: Node<'tree>, worklist: &mut Vec<N
     }
 }
 
+/// Publish every exported symbol under its own name unless the module already
+/// publishes that name, and put `exports` in its published order.
+///
+/// The one owner of the answer, called after the walk and again after a Kotlin
+/// loss recovery has settled `symbols`: an export is derived from the symbols
+/// that survive, never patched on the way, so a symbol that is not published
+/// cannot hold the slot of one that is.
+pub(crate) fn publish_exports(symbols: &[ExtractedSymbol], exports: &mut Vec<ExtractedExport>) {
+    // The names the exports so far publish, kept as sets so each
+    // exported symbol asks one lookup instead of scanning every
+    // export: a type with tens of thousands of exported members made
+    // this loop quadratic (30,000 Swift properties spent most of
+    // their extraction here).
+    let mut published_as: std::collections::HashSet<String> = exports
+        .iter()
+        .map(|export| export.exported_name.clone())
+        .collect();
+    let mut published_from: std::collections::HashSet<String> = exports
+        .iter()
+        .filter(|export| export.module_specifier.is_none() && export.exported_name != "default")
+        .filter_map(|export| export.local_name.clone())
+        .collect();
+    for symbol in symbols.iter().filter(|symbol| symbol.is_exported) {
+        // A symbol already published under another name —
+        // `export { local as Public }` — is not also exported as
+        // itself. Matching on `exported_name` alone fabricated a
+        // second export, `local`, that the module never declared.
+        if !published_as.contains(&symbol.name) && !published_from.contains(&symbol.name) {
+            published_as.insert(symbol.name.clone());
+            if symbol.name != "default" {
+                published_from.insert(symbol.name.clone());
+            }
+            exports.push(ExtractedExport {
+                exported_name: symbol.name.clone(),
+                local_name: Some(symbol.name.clone()),
+                module_specifier: None,
+                span: symbol.span.clone(),
+            });
+        }
+    }
+    exports.sort_by(|a, b| {
+        (&a.exported_name, &a.module_specifier, a.span.start_byte).cmp(&(
+            &b.exported_name,
+            &b.module_specifier,
+            b.span.start_byte,
+        ))
+    });
+}
+
+/// The outcome of a parse: `Clean`, or `Partial` with the ranges that are not
+/// to be trusted.
+///
+/// `lost` is the Kotlin loss detector's answer (see [`crate::kotlinloss`]):
+/// statements the grammar read as an expression without reporting an error. Its
+/// regions are charged as error ranges, so a file that silently dropped a
+/// declaration is `Partial` and every consumer that already treats a partial
+/// parse as unable to prove absence does so here. It is applied in this one
+/// place so the answer has one owner. A detector that did not finish is not a
+/// detector that found nothing: a deadline fails the outcome as this walk's own
+/// deadline does, and a node cap charges the whole file.
 pub(super) fn parse_outcome_of(
     root: Node,
     source: &str,
     is_metal: bool,
     is_python: bool,
+    is_kotlin: bool,
+    lost: &crate::kotlinloss::LostScan,
 ) -> ParseOutcome {
-    if !root.has_error() && !is_python {
+    if lost.deadline_passed {
+        return ParseOutcome::Failed {
+            reason: budget_refusal_reason(
+                "parse outcome validation exceeded the extraction budget".to_string(),
+            ),
+        };
+    }
+    if !root.has_error() && !is_python && lost.regions.is_empty() && !lost.capped {
         return ParseOutcome::Clean;
     }
     let mut error_ranges = Vec::new();
@@ -1126,9 +1261,11 @@ pub(super) fn parse_outcome_of(
             });
         }
         cursor.reset(node);
+        let mut child_has_error = false;
         if cursor.goto_first_child() {
             loop {
                 let child = cursor.node();
+                child_has_error |= child.has_error();
                 if child.has_error() || is_python {
                     stack.push(child);
                 }
@@ -1137,6 +1274,45 @@ pub(super) fn parse_outcome_of(
                 }
             }
         }
+        // Kotlin only: a node that carries an error no node shows. The parser
+        // inserted a zero-width token that is hidden from the tree (a
+        // grammar's `_`-prefixed token), so the cost is on this node and on
+        // none of its children, and the search for an ERROR or MISSING node
+        // above comes back empty. Measured on tree-sitter-kotlin-ng, `class A {
+        // fun f() = if (c) { a() } else { b() } }` is `has_error()` on the
+        // file, the class and its body and on nothing below, and reading what
+        // the hidden token should have separated made the `if` branch a
+        // lambda: phantom `$0` and `it` locals. The file is not clean and no
+        // consumer may be told it is, so the node's own range is charged.
+        //
+        // Not for other grammars: they report `has_error()` with no visible
+        // child in valid code (Swift `b as? String ?? "x"`, a C directive or a
+        // Go declaration at the end of a file with no newline), and charging
+        // those made 4 Vani Swift files and 1 Curio file Partial with no graph
+        // change. Another grammar earns the rule by a measured wrong reading,
+        // not by sharing the blind spot.
+        if is_kotlin
+            && node.has_error()
+            && !node.is_error()
+            && !node.is_missing()
+            && !child_has_error
+        {
+            error_ranges.push(TextRange {
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+            });
+        }
+    }
+    if lost.capped {
+        error_ranges.push(TextRange {
+            start_byte: 0,
+            end_byte: source.len(),
+        });
+    }
+    if !lost.regions.is_empty() || lost.capped {
+        error_ranges.extend(lost.ranges());
+        error_ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
+        error_ranges.dedup();
     }
     if error_ranges.is_empty() {
         ParseOutcome::Clean

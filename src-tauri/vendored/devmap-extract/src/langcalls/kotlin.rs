@@ -255,6 +255,10 @@ pub(crate) fn scope_receivers(root: Node, source: &str) -> Vec<ScopeReceiver> {
         if crate::treesitter::walk_deadline_passed() {
             break;
         }
+        // A charged statement's lambdas are not lambdas of the file.
+        if crate::treesitter::in_charged_region(node) {
+            continue;
+        }
         if node.kind() == "call_expression" {
             if let Some(scope) = scope_function_lambda(node, source) {
                 found.push(scope);

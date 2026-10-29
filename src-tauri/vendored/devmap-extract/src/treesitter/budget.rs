@@ -14,6 +14,16 @@ thread_local! {
     /// and how often. See [`note_nesting_cap`].
     pub(super) static NESTING_CAPS: RefCell<BTreeMap<&'static str, usize>> =
         const { RefCell::new(BTreeMap::new()) };
+    /// Swift calls refused in this file because the grammar's recovery inserted
+    /// an operator with no spelling. See [`note_swift_unspelled_operator`].
+    pub(super) static SWIFT_UNSPELLED_OPERATORS: Cell<usize> = const { Cell::new(0) };
+    /// Swift member references refused in this file because the grammar read
+    /// them off a bare `as?`/`as!` cast. See [`note_swift_bare_cast_member`].
+    pub(super) static SWIFT_BARE_CAST_MEMBERS: Cell<usize> = const { Cell::new(0) };
+    /// Byte ranges of statements the Kotlin loss detector charged, which the
+    /// walks that derive per-scope tables leave out. See [`set_charged_regions`].
+    pub(super) static CHARGED_REGIONS: RefCell<Vec<(usize, usize)>> =
+        const { RefCell::new(Vec::new()) };
     #[cfg(test)]
     pub(super) static NATIVE_PARENT_READS: Cell<usize> = const { Cell::new(0) };
 }
@@ -30,22 +40,54 @@ thread_local! {
 /// only reason it was invisible; extending the bound past the walk — the point
 /// of this type — makes that stale value load-bearing. Tying arm and disarm to
 /// a scope means the invariant cannot be broken by adding a `return`.
-pub(super) struct BudgetGuard;
+///
+/// A guard armed *inside* another one — an embedded script, a Kotlin loss
+/// recovery: an extraction run by an extraction — gives the outer deadline back
+/// when it drops. It used to leave the thread disarmed, so every phase of the
+/// outer file that ran after the inner call checked a clock that was off. The
+/// outer file's Swift refusal counts come back the same way: they were zeroed by
+/// the inner `arm` and never restored, so a script or recovery run inside a
+/// Swift file replaced that file's count with its own.
+pub(super) struct BudgetGuard {
+    /// The deadline that was armed when this guard was, if one was.
+    outer: Option<std::time::Instant>,
+    /// The charged regions of the extraction this one runs inside, if any.
+    outer_regions: Vec<(usize, usize)>,
+    /// The Swift refusal counts of the extraction this one runs inside: its
+    /// unspelled-operator calls and its bare-cast members.
+    outer_swift_refusals: (usize, usize),
+}
 
 impl BudgetGuard {
     pub(super) fn arm(deadline: std::time::Instant) -> Self {
+        let outer = WALK_DEADLINE.with(|slot| slot.get());
+        let outer_regions =
+            CHARGED_REGIONS.with(|regions| std::mem::take(&mut *regions.borrow_mut()));
         reset_scope_locals();
         WALK_DEADLINE.with(|slot| slot.set(Some(deadline)));
         WALK_OVERRAN.with(|slot| slot.set(false));
         PARENT_STEPS.with(|slot| slot.set(0));
         NESTING_CAPS.with(|caps| caps.borrow_mut().clear());
-        BudgetGuard
+        let outer_swift_refusals = (
+            SWIFT_UNSPELLED_OPERATORS.with(|count| count.replace(0)),
+            SWIFT_BARE_CAST_MEMBERS.with(|count| count.replace(0)),
+        );
+        BudgetGuard {
+            outer,
+            outer_regions,
+            outer_swift_refusals,
+        }
     }
 }
 
 impl Drop for BudgetGuard {
     fn drop(&mut self) {
-        WALK_DEADLINE.with(|slot| slot.set(None));
+        WALK_DEADLINE.with(|slot| slot.set(self.outer));
+        CHARGED_REGIONS.with(|regions| {
+            *regions.borrow_mut() = std::mem::take(&mut self.outer_regions);
+        });
+        SWIFT_UNSPELLED_OPERATORS.with(|count| count.set(self.outer_swift_refusals.0));
+        SWIFT_BARE_CAST_MEMBERS.with(|count| count.set(self.outer_swift_refusals.1));
         // Retain the incomplete-walk signal until the next extraction arms
         // its budget. The publication gate must not lose a helper's refusal.
     }
@@ -129,6 +171,30 @@ pub(super) fn walk_overran() -> bool {
     WALK_OVERRAN.with(|slot| slot.get())
 }
 
+/// Declare the byte ranges of the statements the Kotlin loss detector charged.
+///
+/// The expression reading of such a statement is not what the file declares, so
+/// the walks that derive a table from the tree (declarations and their wiring,
+/// per-scope locals, scope receivers) leave a node inside one out: a table is
+/// derived from what the file declares, never patched afterwards by a name a
+/// phantom shares with a real symbol. A recovered region contributes its own
+/// rows from the re-parse. Empty for every file but a Kotlin file the detector
+/// charged; cleared when the next extraction arms its budget.
+pub(crate) fn set_charged_regions(regions: Vec<(usize, usize)>) {
+    CHARGED_REGIONS.with(|slot| *slot.borrow_mut() = regions);
+}
+
+/// Whether `node` lies inside a statement the loss detector charged.
+pub(crate) fn in_charged_region(node: Node<'_>) -> bool {
+    CHARGED_REGIONS.with(|regions| {
+        let regions = regions.borrow();
+        !regions.is_empty()
+            && regions
+                .iter()
+                .any(|&(start, end)| start <= node.start_byte() && node.end_byte() <= end)
+    })
+}
+
 /// Whether this file's extraction may still publish what it has.
 ///
 /// Two ways to fail, and they are not the same question: a helper may have
@@ -189,6 +255,59 @@ pub(super) fn take_nesting_cap_notes() -> Vec<String> {
             })
             .collect()
     })
+}
+
+/// Record that the Swift call gate refused an operator call whose operator has
+/// no spelling.
+///
+/// tree-sitter-swift recovers `x as? String ?? "d"` by inserting a hidden,
+/// zero-width `custom_operator` that is neither an error nor a missing node, so
+/// the file stays `Clean` and nothing else says a site was left out.
+///
+/// That is the common case, not the only one: the gate refuses any Swift call
+/// or constructor whose name has no spelling, so it can also fire on a call or
+/// constructor whose name is a `MISSING` token in a `Partial` file. The
+/// diagnostic's wording ("on an operator") is pinned by tests and stays.
+/// [`take_swift_unspelled_operator_notes`] turns the count into a diagnostic.
+pub(crate) fn note_swift_unspelled_operator() {
+    SWIFT_UNSPELLED_OPERATORS.with(|count| count.set(count.get() + 1));
+}
+
+/// The one diagnostic for this file's refused Swift calls, or none.
+pub(super) fn take_swift_unspelled_operator_notes() -> Vec<String> {
+    let count = SWIFT_UNSPELLED_OPERATORS.with(|count| count.replace(0));
+    if count == 0 {
+        return Vec::new();
+    }
+    vec![format!(
+        "swift: refused {count} call(s) on an operator the grammar inserted with no spelling"
+    )]
+}
+
+/// Record that the references walk refused a Swift member name the grammar
+/// read off a bare cast.
+///
+/// `as?` and `as!` bind looser than postfix `.` and `()`, but tree-sitter-swift
+/// attaches a member to the cast expression itself: `b as? Color ?? .foo()` is
+/// `navigation_expression(as_expression "b as? Color ??", .foo)`, and
+/// `(b as? Foo.Bar)` is `(as_expression "b as? Foo", .Bar)`. There is no error
+/// node, so the file stays `Clean`. The member's real owner is a type the site
+/// never spells, so it is refused rather than given the cast text as receiver,
+/// and counted here because nothing else says a name was left out.
+/// [`take_swift_bare_cast_member_notes`] turns the count into a diagnostic.
+pub(crate) fn note_swift_bare_cast_member() {
+    SWIFT_BARE_CAST_MEMBERS.with(|count| count.set(count.get() + 1));
+}
+
+/// The one diagnostic for this file's refused bare-cast members, or none.
+pub(super) fn take_swift_bare_cast_member_notes() -> Vec<String> {
+    let count = SWIFT_BARE_CAST_MEMBERS.with(|count| count.replace(0));
+    if count == 0 {
+        return Vec::new();
+    }
+    vec![format!(
+        "swift: refused {count} member reference(s) the grammar read off a bare cast"
+    )]
 }
 
 /// Drop the per-scope local-name cache between files.

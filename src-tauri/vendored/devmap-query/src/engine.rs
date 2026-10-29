@@ -23,15 +23,17 @@ mod traversal;
 mod verdict;
 mod workspace;
 
-use self::verdict::StoreVerdict;
 use self::budget::{
-    affected_test_tokens, atomic_budget_take, blast_layer_tokens,
-    budget_page_size, edges_per_direction, explore_budget, explore_definition_tokens,
-    record_test_hit, search_page_size, search_rank_pool_size, unavailable_response,
+    affected_test_tokens, atomic_budget_take, blast_layer_tokens, budget_page_size,
+    edges_per_direction, explore_budget, explore_definition_tokens, record_test_hit,
+    search_page_size, search_rank_pool_size, unavailable_response,
 };
 pub use self::budget::{budget_take, is_test_path, BYTES_PER_TOKEN, SEARCH_PAGE_MAX};
 pub(crate) use self::budget::{
     byte_span_to_line_range, byte_span_to_line_range_in, SEARCH_HIT_OVERHEAD_TOKENS,
+};
+use self::dependencies::{
+    dependency_note, dependency_order, shadowed_symbol_count, DependencyFacts, InboundTarget,
 };
 use self::gaps::{
     analysis_coverage_gap, analysis_status_gap, attribution_coverage_gap, empty_ask_gap,
@@ -47,9 +49,6 @@ use self::hits::{
 pub use self::hits::{EVIDENCE_TEST_BUDGET_SHARE, EVIDENCE_TEST_DEPTH};
 use self::trace::shortest_path;
 pub(crate) use self::trace::PathSearch;
-use self::dependencies::{
-    dependency_note, dependency_order, shadowed_symbol_count, DependencyFacts, InboundTarget,
-};
 use self::traversal::{
     bare_callee_name, blast_radius_from_edges, family_of_path, indexed_traversal_starts,
     indexed_traversed_edges, node_id_of, reached_by, BlastBand, BlastWalk, NamesakeRead,
@@ -57,6 +56,7 @@ use self::traversal::{
     TRAVERSAL_MAX_NODES,
 };
 pub use self::traversal::{traversal_starts, traversed_resolution_edges};
+use self::verdict::StoreVerdict;
 pub use self::workspace::{link_candidates, workspace_search};
 // Only the parse-gated test modules count source-span reads.
 #[cfg(all(test, feature = "parse"))]
@@ -214,106 +214,105 @@ impl<'a> StoreQueryEngine<'a> {
         filter: Option<&crate::scope::NameQueryFilter>,
     ) -> anyhow::Result<Response<SymbolHit>> {
         self.exit(|| {
-        if req.query.trim().is_empty() && filter.is_none() {
-            return Ok(budget_take(Vec::new(), req.token_budget, |_| 0));
-        }
-        let page = search_page_size(req.token_budget);
-        let pool = search_rank_pool_size(req.token_budget);
-        // One snapshot. The count, the rows and the root used to be three
-        // independent reads, each resolving "the latest generation" for itself,
-        // so a daemon commit landing between them produced an answer stitched
-        // from two generations — `shown=40 hidden=0 total=1 truncated=false`
-        // was measured. `shown + hidden == total` is the contract clients
-        // enforce, and it cannot be honoured by numbers describing different
-        // corpora.
-        //
-        // `neighbors` answers the same race by *detecting* a straddle and
-        // disclosing it rather than locking, on the grounds that holding the
-        // store lock across a whole fan-out blocks the writer for too long.
-        // That trade is about fan-outs. This is a count, one limited select and
-        // one row — so the exact answer is affordable here, and an exact answer
-        // beats a disclosed approximation whenever it can be had.
-        let Some(snapshot) = self.keyword_page(&req.query, pool, filter)? else {
-            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
-                reason: "no persisted generation is available".to_string(),
-            }));
-        };
-        let total = snapshot.total;
-        let rows = snapshot.rows;
-        let repo_root = snapshot.repo_root;
-        // Taken off the same snapshot as the count and the rows, before either
-        // is consumed, for the reason the comment above gives: a caveat
-        // resolved separately could describe a different corpus from the one
-        // that was searched.
-        let coverage_gap = search_coverage_gap(analysis_status_gap(snapshot.analysis.as_ref()));
-        let scope = snapshot
-            .narrowing
-            .as_ref()
-            .map(|narrowing| scope_report_from_narrowing(narrowing, snapshot.analysis.as_ref()));
-        let query = req.query.to_lowercase();
-        // Rank, then truncate — R7, and the reason the pool above is wider than
-        // the page below. The store cuts its page with `ORDER BY bm25(...)` and
-        // this function then re-scores what survived with a different ordering
-        // function, so the key that decided which rows *exist* was not the key
-        // that decides which rows *rank*. A symbol named exactly `alpha` that
-        // bm25 puts 150th among 200 prefix matches never entered the page, and
-        // the answer led with 100 worse matches under honest counts.
-        //
-        // Scoring happens on the stored row, before any hit is materialised:
-        // the score reads `name`/`qualified_name` and nothing else, while
-        // building a hit reads the file off disk. So a ten-times wider pool
-        // costs ten times the string comparisons and not one extra file read —
-        // `page`, not `pool`, bounds what is materialised.
-        let ranked = rank_symbol_rows(rows, &query, &self.cancel)?;
-        let mut hits = Vec::with_capacity(ranked.len().min(page));
-        for (score, row) in ranked.into_iter().take(page) {
-            // Every iteration here opens a file. Checked per row rather than
-            // per `CHECK_INTERVAL` because the unit of work is an I/O, not a
-            // string comparison: a page of 200 abandoned reads is 200 reads
-            // nobody is waiting for.
-            self.cancel.check()?;
-            hits.push(hit_from_stored(
-                row,
-                repo_root.as_deref(),
-                req.token_budget,
-                score,
-            ));
-        }
-        let mut response = budget_take(hits, req.token_budget, search_hit_tokens);
-        response.total = total;
-        response.hidden = total.saturating_sub(response.shown);
-        response.truncated = response.hidden > 0;
-        // The pool is bounded, so on a query that matches more than it holds
-        // the ranking really is over a bm25-ordered prefix. `truncated` says
-        // the *list* was cut, which a caller expects; this says the *ordering*
-        // was computed over a sample, which it cannot otherwise know. It is
-        // `None` whenever every match was ranked, which on any ordinary query
-        // is every time.
-        let ranked_over_a_sample = ranking_coverage_gap(total, pool);
-        // Three independent qualifications, composed rather than ranked — the
-        // same shape `dependencies` and the traversals use. One is about the
-        // *ordering* of what was found; one is about whether the corpus
-        // searched was the whole repository; and the third is about what an
-        // empty answer is entitled to mean. The second was documented here as
-        // "the one that decides whether `total: 0` may be read as 'no such
-        // symbol'" — but it is `None` on every healthy index, which left the
-        // most confident-looking answer this API produces as the one carrying
-        // the least justification. See [`empty_result_gap`].
-        response.walk_incomplete = devmap_analyze::combine_reasons(
-            ranked_over_a_sample,
-            devmap_analyze::combine_reasons(coverage_gap, empty_result_gap(total, &req.query)),
-        );
-        if total == 0 {
-            let outside = self.outside_index_reason(filter, &req.query)?;
-            response.walk_incomplete =
-                devmap_analyze::combine_reasons(response.walk_incomplete.take(), outside.note);
-            if let Some(reason) = outside.reason {
-                response.resolution = ResolutionAvailability::Unavailable { reason };
+            if req.query.trim().is_empty() && filter.is_none() {
+                return Ok(budget_take(Vec::new(), req.token_budget, |_| 0));
             }
-        }
-        response.scope = scope;
-        Ok(response)
-    })
+            let page = search_page_size(req.token_budget);
+            let pool = search_rank_pool_size(req.token_budget);
+            // One snapshot. The count, the rows and the root used to be three
+            // independent reads, each resolving "the latest generation" for itself,
+            // so a daemon commit landing between them produced an answer stitched
+            // from two generations — `shown=40 hidden=0 total=1 truncated=false`
+            // was measured. `shown + hidden == total` is the contract clients
+            // enforce, and it cannot be honoured by numbers describing different
+            // corpora.
+            //
+            // `neighbors` answers the same race by *detecting* a straddle and
+            // disclosing it rather than locking, on the grounds that holding the
+            // store lock across a whole fan-out blocks the writer for too long.
+            // That trade is about fan-outs. This is a count, one limited select and
+            // one row — so the exact answer is affordable here, and an exact answer
+            // beats a disclosed approximation whenever it can be had.
+            let Some(snapshot) = self.keyword_page(&req.query, pool, filter)? else {
+                return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+                    reason: "no persisted generation is available".to_string(),
+                }));
+            };
+            let total = snapshot.total;
+            let rows = snapshot.rows;
+            let repo_root = snapshot.repo_root;
+            // Taken off the same snapshot as the count and the rows, before either
+            // is consumed, for the reason the comment above gives: a caveat
+            // resolved separately could describe a different corpus from the one
+            // that was searched.
+            let coverage_gap = search_coverage_gap(analysis_status_gap(snapshot.analysis.as_ref()));
+            let scope = snapshot.narrowing.as_ref().map(|narrowing| {
+                scope_report_from_narrowing(narrowing, snapshot.analysis.as_ref())
+            });
+            let query = req.query.to_lowercase();
+            // Rank, then truncate — R7, and the reason the pool above is wider than
+            // the page below. The store cuts its page with `ORDER BY bm25(...)` and
+            // this function then re-scores what survived with a different ordering
+            // function, so the key that decided which rows *exist* was not the key
+            // that decides which rows *rank*. A symbol named exactly `alpha` that
+            // bm25 puts 150th among 200 prefix matches never entered the page, and
+            // the answer led with 100 worse matches under honest counts.
+            //
+            // Scoring happens on the stored row, before any hit is materialised:
+            // the score reads `name`/`qualified_name` and nothing else, while
+            // building a hit reads the file off disk. So a ten-times wider pool
+            // costs ten times the string comparisons and not one extra file read —
+            // `page`, not `pool`, bounds what is materialised.
+            let ranked = rank_symbol_rows(rows, &query, &self.cancel)?;
+            let mut hits = Vec::with_capacity(ranked.len().min(page));
+            for (score, row) in ranked.into_iter().take(page) {
+                // Every iteration here opens a file. Checked per row rather than
+                // per `CHECK_INTERVAL` because the unit of work is an I/O, not a
+                // string comparison: a page of 200 abandoned reads is 200 reads
+                // nobody is waiting for.
+                self.cancel.check()?;
+                hits.push(hit_from_stored(
+                    row,
+                    repo_root.as_deref(),
+                    req.token_budget,
+                    score,
+                ));
+            }
+            let mut response = budget_take(hits, req.token_budget, search_hit_tokens);
+            response.total = total;
+            response.hidden = total.saturating_sub(response.shown);
+            response.truncated = response.hidden > 0;
+            // The pool is bounded, so on a query that matches more than it holds
+            // the ranking really is over a bm25-ordered prefix. `truncated` says
+            // the *list* was cut, which a caller expects; this says the *ordering*
+            // was computed over a sample, which it cannot otherwise know. It is
+            // `None` whenever every match was ranked, which on any ordinary query
+            // is every time.
+            let ranked_over_a_sample = ranking_coverage_gap(total, pool);
+            // Three independent qualifications, composed rather than ranked — the
+            // same shape `dependencies` and the traversals use. One is about the
+            // *ordering* of what was found; one is about whether the corpus
+            // searched was the whole repository; and the third is about what an
+            // empty answer is entitled to mean. The second was documented here as
+            // "the one that decides whether `total: 0` may be read as 'no such
+            // symbol'" — but it is `None` on every healthy index, which left the
+            // most confident-looking answer this API produces as the one carrying
+            // the least justification. See [`empty_result_gap`].
+            response.walk_incomplete = devmap_analyze::combine_reasons(
+                ranked_over_a_sample,
+                devmap_analyze::combine_reasons(coverage_gap, empty_result_gap(total, &req.query)),
+            );
+            if total == 0 {
+                let outside = self.outside_index_reason(filter, &req.query)?;
+                response.walk_incomplete =
+                    devmap_analyze::combine_reasons(response.walk_incomplete.take(), outside.note);
+                if let Some(reason) = outside.reason {
+                    response.resolution = ResolutionAvailability::Unavailable { reason };
+                }
+            }
+            response.scope = scope;
+            Ok(response)
+        })
     }
 
     /// One keyword page, pinned to the generation the filter was checked against.
@@ -372,75 +371,75 @@ impl<'a> StoreQueryEngine<'a> {
         min_rung: Option<crate::rung::Rung>,
     ) -> anyhow::Result<Response<ResolvedEdge>> {
         self.exit(|| {
-        self.cancel.check()?;
-        // An indexed file path is read first and wins a spelling collision with
-        // a symbol. Anything else is a symbol query and goes through the same
-        // resolution `impact` uses.
-        let Some(snapshot) = self.store.file_edges(&req.query, req.min_confidence)? else {
-            return self.symbol_dependencies(req, min_rung);
-        };
-        if matches!(snapshot.file.parse_outcome, ParseOutcome::Failed { .. }) {
-            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
-                reason: format!("{} could not be parsed", req.query),
-            }));
-        }
-        // The corpus half, then the sites written in this file that the
-        // resolver could not bind — what this file's own list cannot show.
-        let file_sites = self.radius_attribution_gap(
-            Some(snapshot.generation),
-            snapshot.analysis.as_ref(),
-            &BTreeSet::from([(snapshot.file.path.clone(), snapshot.file.path.clone())]),
-            RadiusSide::FileCallees,
-        )?;
-        let coverage_gap = devmap_analyze::combine_reasons(
-            file_edge_coverage_gap(&snapshot.file.parse_outcome),
-            devmap_analyze::combine_reasons(
-                analysis_status_gap(snapshot.analysis.as_ref()),
-                file_sites,
-            ),
-        );
-        self.cancel.check()?;
-        let edges = snapshot
-            .edges
-            .into_iter()
-            .map(stored_edge_to_resolved)
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let outbound_before_rung = edges.len();
-        let (mut edges, rungs) = crate::rung::narrow(edges, min_rung);
-        edges.sort_by(dependency_order);
-        // Which symbols the file's spelling also names. Only a spelling with no
-        // path separator can, and the index is the same one a symbol query
-        // reads, so a warm daemon pays nothing for the check.
-        let shadowed_symbols = if req.query.contains(['/', '\\']) {
-            0
-        } else if let Some(index) = self.generation_edges()? {
-            let names: BTreeSet<&str> = index
-                .symbols(false)
-                .chain(index.symbols(true))
-                .map(|(name, _)| name)
-                .collect();
-            shadowed_symbol_count(&req.query, names.into_iter())
-        } else {
-            0
-        };
-        let note = dependency_note(&DependencyFacts {
-            query: &req.query,
-            outbound_before_rung,
-            outbound_after_rung: edges.len(),
-            inbound: snapshot.inbound_edges,
-            min_rung,
-            shadowed_symbols,
-        });
-        let mut response = budget_take(edges, req.token_budget, |_| 25);
-        response.rungs = Some(rungs);
-        response.note = note;
-        // Composed, not assigned: `budget_take` may already have set a reason
-        // of its own, and a reader deciding whether to act on this list needs
-        // every qualification the answer holds, not the last one written.
-        response.walk_incomplete =
-            devmap_analyze::combine_reasons(response.walk_incomplete.take(), coverage_gap);
-        Ok(response)
-    })
+            self.cancel.check()?;
+            // An indexed file path is read first and wins a spelling collision with
+            // a symbol. Anything else is a symbol query and goes through the same
+            // resolution `impact` uses.
+            let Some(snapshot) = self.store.file_edges(&req.query, req.min_confidence)? else {
+                return self.symbol_dependencies(req, min_rung);
+            };
+            if matches!(snapshot.file.parse_outcome, ParseOutcome::Failed { .. }) {
+                return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+                    reason: format!("{} could not be parsed", req.query),
+                }));
+            }
+            // The corpus half, then the sites written in this file that the
+            // resolver could not bind — what this file's own list cannot show.
+            let file_sites = self.radius_attribution_gap(
+                Some(snapshot.generation),
+                snapshot.analysis.as_ref(),
+                &BTreeSet::from([(snapshot.file.path.clone(), snapshot.file.path.clone())]),
+                RadiusSide::FileCallees,
+            )?;
+            let coverage_gap = devmap_analyze::combine_reasons(
+                file_edge_coverage_gap(&snapshot.file.parse_outcome),
+                devmap_analyze::combine_reasons(
+                    analysis_status_gap(snapshot.analysis.as_ref()),
+                    file_sites,
+                ),
+            );
+            self.cancel.check()?;
+            let edges = snapshot
+                .edges
+                .into_iter()
+                .map(stored_edge_to_resolved)
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let outbound_before_rung = edges.len();
+            let (mut edges, rungs) = crate::rung::narrow(edges, min_rung);
+            edges.sort_by(dependency_order);
+            // Which symbols the file's spelling also names. Only a spelling with no
+            // path separator can, and the index is the same one a symbol query
+            // reads, so a warm daemon pays nothing for the check.
+            let shadowed_symbols = if req.query.contains(['/', '\\']) {
+                0
+            } else if let Some(index) = self.generation_edges()? {
+                let names: BTreeSet<&str> = index
+                    .symbols(false)
+                    .chain(index.symbols(true))
+                    .map(|(name, _)| name)
+                    .collect();
+                shadowed_symbol_count(&req.query, names.into_iter())
+            } else {
+                0
+            };
+            let note = dependency_note(&DependencyFacts {
+                query: &req.query,
+                outbound_before_rung,
+                outbound_after_rung: edges.len(),
+                inbound: snapshot.inbound_edges,
+                min_rung,
+                shadowed_symbols,
+            });
+            let mut response = budget_take(edges, req.token_budget, |_| 25);
+            response.rungs = Some(rungs);
+            response.note = note;
+            // Composed, not assigned: `budget_take` may already have set a reason
+            // of its own, and a reader deciding whether to act on this list needs
+            // every qualification the answer holds, not the last one written.
+            response.walk_incomplete =
+                devmap_analyze::combine_reasons(response.walk_incomplete.take(), coverage_gap);
+            Ok(response)
+        })
     }
 
     /// `dependencies` for a query that is not an indexed file path: a symbol,
@@ -588,9 +587,7 @@ impl<'a> StoreQueryEngine<'a> {
         req: Request<String>,
         min_rung: Option<crate::rung::Rung>,
     ) -> anyhow::Result<Response<ResolvedEdge>> {
-        self.exit(|| {
-        self.traverse(req, true, min_rung)
-    })
+        self.exit(|| self.traverse(req, true, min_rung))
     }
 
     /// [`Self::impact`], with the reached symbols banded by distance.
@@ -620,56 +617,58 @@ impl<'a> StoreQueryEngine<'a> {
     /// caller asking for 2,000 tokens is answered in 2,000.
     pub fn impact_layered(&self, req: Request<String>) -> anyhow::Result<LayeredImpact> {
         self.exit(|| {
-        devmap_store::checked_min_confidence(req.min_confidence)?;
-        let layer_budget = req.token_budget / 2;
-        let edge_budget = req.token_budget.saturating_sub(layer_budget);
-        let Some((generation, index)) = self.store.generation_edges_with_id()? else {
-            let reason = "no persisted generation is available".to_string();
-            return Ok(LayeredImpact {
-                edges: unavailable_response(ResolutionAvailability::Unavailable {
-                    reason: reason.clone(),
-                }),
-                blast_radius: BlastRadius {
-                    seeds: Vec::new(),
-                    unmatched_targets: vec![req.query],
-                    layers: unavailable_response(ResolutionAvailability::Unavailable { reason }),
-                    total_impacted: 0,
+            devmap_store::checked_min_confidence(req.min_confidence)?;
+            let layer_budget = req.token_budget / 2;
+            let edge_budget = req.token_budget.saturating_sub(layer_budget);
+            let Some((generation, index)) = self.store.generation_edges_with_id()? else {
+                let reason = "no persisted generation is available".to_string();
+                return Ok(LayeredImpact {
+                    edges: unavailable_response(ResolutionAvailability::Unavailable {
+                        reason: reason.clone(),
+                    }),
+                    blast_radius: BlastRadius {
+                        seeds: Vec::new(),
+                        unmatched_targets: vec![req.query],
+                        layers: unavailable_response(ResolutionAvailability::Unavailable {
+                            reason,
+                        }),
+                        total_impacted: 0,
+                    },
+                });
+            };
+            let direction = index.directed(true, req.min_confidence);
+            let target = req.query.clone();
+            let min_confidence = req.min_confidence;
+            let (mut edges, bands) = self.traverse_walked(
+                &index,
+                &direction,
+                Request {
+                    token_budget: edge_budget,
+                    ..req
                 },
-            });
-        };
-        let direction = index.directed(true, req.min_confidence);
-        let target = req.query.clone();
-        let min_confidence = req.min_confidence;
-        let (mut edges, bands) = self.traverse_walked(
-            &index,
-            &direction,
-            Request {
-                token_budget: edge_budget,
-                ..req
-            },
-            None,
-            Some(layer_budget),
-        )?;
-        let added = self.attach_unresolved_namesakes(
-            generation,
-            &index,
-            &target,
-            min_confidence,
-            &mut edges,
-        )?;
-        // `Some` by construction: `band_budget` was `Some` on the call above,
-        // and every return path of `traverse_walked` maps it.
-        let mut blast_radius = bands.ok_or_else(|| {
-            anyhow::anyhow!("a banded traversal returned no bands; this is a bug in the kernel")
-        })?;
-        // One answer, two halves: the bands are as incomplete as the edges.
-        blast_radius.layers.walk_incomplete =
-            devmap_analyze::combine_reasons(blast_radius.layers.walk_incomplete.take(), added);
-        Ok(LayeredImpact {
-            edges,
-            blast_radius,
+                None,
+                Some(layer_budget),
+            )?;
+            let added = self.attach_unresolved_namesakes(
+                generation,
+                &index,
+                &target,
+                min_confidence,
+                &mut edges,
+            )?;
+            // `Some` by construction: `band_budget` was `Some` on the call above,
+            // and every return path of `traverse_walked` maps it.
+            let mut blast_radius = bands.ok_or_else(|| {
+                anyhow::anyhow!("a banded traversal returned no bands; this is a bug in the kernel")
+            })?;
+            // One answer, two halves: the bands are as incomplete as the edges.
+            blast_radius.layers.walk_incomplete =
+                devmap_analyze::combine_reasons(blast_radius.layers.walk_incomplete.take(), added);
+            Ok(LayeredImpact {
+                edges,
+                blast_radius,
+            })
         })
-    })
     }
 
     /// Answer both call-graph directions for several targets in one pass.
@@ -723,49 +722,49 @@ impl<'a> StoreQueryEngine<'a> {
         min_rung: Option<crate::rung::Rung>,
     ) -> anyhow::Result<Vec<Neighbors>> {
         self.exit(|| {
-        if targets.len() > MAX_NEIGHBOR_TARGETS {
-            anyhow::bail!(
-                "neighbors accepts at most {} targets, got {}",
-                MAX_NEIGHBOR_TARGETS,
-                targets.len()
-            );
-        }
-        // A composed answer must come from one generation.
-        //
-        // The fan-out used to be `2 * targets.len()` sub-queries, each taking
-        // and releasing the store lock on its own. A build committing
-        // mid-fan-out left one answer describing two different snapshots of the
-        // repository — measured at 25 of 62 composed answers under contention —
-        // and nothing in the response disclosed it. That is not a regression
-        // against the separate `impact`/`deps` calls this replaced, which
-        // straddled the same way; but those were visibly separate exchanges and
-        // this is sold as one.
-        //
-        // `neighbors_once` now reads the edge table once for the whole
-        // fan-out, so the parts of one answer can no longer disagree with each
-        // other about the graph. The check below stays because that read is
-        // still not atomic with the two generation probes around it: a commit
-        // landing between the first probe and the read produces an answer from
-        // a generation the caller was not told about. One read narrows the
-        // window; it does not close it, and an undisclosed straddle is the
-        // defect either way.
-        //
-        // Detected rather than locked out: holding the store lock across the
-        // whole fan-out would block the writer for the duration of a composed
-        // query, which is a worse trade. Commits are rare, so one retry
-        // resolves nearly all of them; a second straddle is reported on every
-        // direction instead of being smoothed over, because a caller that
-        // cannot tell is the actual defect.
-        self.read_composed(
-            || self.neighbors_once(targets, token_budget, min_confidence, max_depth, min_rung),
-            |answers, note| {
-                for entry in answers {
-                    qualify_response(&mut entry.callers, note);
-                    qualify_response(&mut entry.callees, note);
-                }
-            },
-        )
-    })
+            if targets.len() > MAX_NEIGHBOR_TARGETS {
+                anyhow::bail!(
+                    "neighbors accepts at most {} targets, got {}",
+                    MAX_NEIGHBOR_TARGETS,
+                    targets.len()
+                );
+            }
+            // A composed answer must come from one generation.
+            //
+            // The fan-out used to be `2 * targets.len()` sub-queries, each taking
+            // and releasing the store lock on its own. A build committing
+            // mid-fan-out left one answer describing two different snapshots of the
+            // repository — measured at 25 of 62 composed answers under contention —
+            // and nothing in the response disclosed it. That is not a regression
+            // against the separate `impact`/`deps` calls this replaced, which
+            // straddled the same way; but those were visibly separate exchanges and
+            // this is sold as one.
+            //
+            // `neighbors_once` now reads the edge table once for the whole
+            // fan-out, so the parts of one answer can no longer disagree with each
+            // other about the graph. The check below stays because that read is
+            // still not atomic with the two generation probes around it: a commit
+            // landing between the first probe and the read produces an answer from
+            // a generation the caller was not told about. One read narrows the
+            // window; it does not close it, and an undisclosed straddle is the
+            // defect either way.
+            //
+            // Detected rather than locked out: holding the store lock across the
+            // whole fan-out would block the writer for the duration of a composed
+            // query, which is a worse trade. Commits are rare, so one retry
+            // resolves nearly all of them; a second straddle is reported on every
+            // direction instead of being smoothed over, because a caller that
+            // cannot tell is the actual defect.
+            self.read_composed(
+                || self.neighbors_once(targets, token_budget, min_confidence, max_depth, min_rung),
+                |answers, note| {
+                    for entry in answers {
+                        qualify_response(&mut entry.callers, note);
+                        qualify_response(&mut entry.callees, note);
+                    }
+                },
+            )
+        })
     }
 
     /// Bound retry work without holding the writer's lock across a fan-out.
@@ -973,9 +972,7 @@ impl<'a> StoreQueryEngine<'a> {
         req: Request<String>,
         min_rung: Option<crate::rung::Rung>,
     ) -> anyhow::Result<Response<ResolvedEdge>> {
-        self.exit(|| {
-        self.traverse(req, false, min_rung)
-    })
+        self.exit(|| self.traverse(req, false, min_rung))
     }
 
     /// Return one deterministic shortest path from `from` to `to`.
@@ -988,97 +985,98 @@ impl<'a> StoreQueryEngine<'a> {
         req: Request<(String, String)>,
     ) -> anyhow::Result<Response<ResolvedEdge>> {
         self.exit(|| {
-        self.cancel.check()?;
-        devmap_store::checked_min_confidence(req.min_confidence)?;
-        let Some(index) = self.generation_edges()? else {
-            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
-                reason: "no persisted generation is available".to_string(),
-            }));
-        };
-        let (from, to) = req.query;
-        let from = from.trim();
-        let to = to.trim();
-        // "No indexed path" is a claim about the graph only where both
-        // endpoints' calls were looked for (P2.7a). Bare-name endpoints name no
-        // file and are not checked here; a qualified or path endpoint is.
-        let coverage_gap = devmap_analyze::combine_reasons(
-            analysis_coverage_gap(index.analysis()),
-            self.call_blind_starts(query_file(from).into_iter().chain(query_file(to)))?
-                .reason(),
-        );
-        let unavailable = |reason: String| {
-            let mut response = unavailable_response(ResolutionAvailability::Unavailable { reason });
-            response.walk_incomplete = coverage_gap.clone();
-            response
-        };
-        if from.is_empty() || to.is_empty() {
-            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
-                reason: "scoped trace endpoints must not be empty".to_string(),
-            }));
-        }
-        // `trace X X` walked the graph from `X` looking for `X`, never counted
-        // the start as reached, and reported the walk's budget — "stopped at
-        // depth 3 after visiting 44 nodes; whether a path exists is unknown" —
-        // for a question the walk cannot answer. Whether a cycle passes through
-        // a symbol is `impact`'s question; a scoped trace needs two endpoints.
-        if from == to {
-            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
-                reason: format!(
-                    "{from:?} and {to:?} are the same symbol; a scoped trace needs two \
+            self.cancel.check()?;
+            devmap_store::checked_min_confidence(req.min_confidence)?;
+            let Some(index) = self.generation_edges()? else {
+                return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+                    reason: "no persisted generation is available".to_string(),
+                }));
+            };
+            let (from, to) = req.query;
+            let from = from.trim();
+            let to = to.trim();
+            // "No indexed path" is a claim about the graph only where both
+            // endpoints' calls were looked for (P2.7a). Bare-name endpoints name no
+            // file and are not checked here; a qualified or path endpoint is.
+            let coverage_gap = devmap_analyze::combine_reasons(
+                analysis_coverage_gap(index.analysis()),
+                self.call_blind_starts(query_file(from).into_iter().chain(query_file(to)))?
+                    .reason(),
+            );
+            let unavailable = |reason: String| {
+                let mut response =
+                    unavailable_response(ResolutionAvailability::Unavailable { reason });
+                response.walk_incomplete = coverage_gap.clone();
+                response
+            };
+            if from.is_empty() || to.is_empty() {
+                return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+                    reason: "scoped trace endpoints must not be empty".to_string(),
+                }));
+            }
+            // `trace X X` walked the graph from `X` looking for `X`, never counted
+            // the start as reached, and reported the walk's budget — "stopped at
+            // depth 3 after visiting 44 nodes; whether a path exists is unknown" —
+            // for a question the walk cannot answer. Whether a cycle passes through
+            // a symbol is `impact`'s question; a scoped trace needs two endpoints.
+            if from == to {
+                return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+                    reason: format!(
+                        "{from:?} and {to:?} are the same symbol; a scoped trace needs two \
                      different endpoints (whether a cycle passes through it is an \
                      `impact` question)"
-                ),
-            }));
-        }
-        let edges = self.resolved_edges(&index, req.min_confidence)?;
-        let path = match shortest_path(
-            &edges,
-            from,
-            to,
-            req.max_depth.min(MAX_TRAVERSAL_DEPTH),
-            5_000,
-            &self.cancel,
-        )? {
-            PathSearch::Found(path) => path,
-            // The only outcome that is a claim about the graph.
-            PathSearch::NoPath => {
-                return Ok(unavailable(format!(
-                    "no indexed path from {from:?} to {to:?}"
-                )))
+                    ),
+                }));
             }
-            // A limit stopped the walk, so the graph was never asked. Saying
-            // "no path" here is how an agent concludes two symbols are
-            // unrelated when the path is merely longer than `--depth`.
-            PathSearch::Exhausted {
-                depth_capped,
-                node_capped,
-                visited,
-                max_depth,
-                max_nodes,
-            } => {
-                let mut limits = Vec::new();
-                if depth_capped {
-                    limits.push(format!("depth {max_depth}"));
+            let edges = self.resolved_edges(&index, req.min_confidence)?;
+            let path = match shortest_path(
+                &edges,
+                from,
+                to,
+                req.max_depth.min(MAX_TRAVERSAL_DEPTH),
+                5_000,
+                &self.cancel,
+            )? {
+                PathSearch::Found(path) => path,
+                // The only outcome that is a claim about the graph.
+                PathSearch::NoPath => {
+                    return Ok(unavailable(format!(
+                        "no indexed path from {from:?} to {to:?}"
+                    )))
                 }
-                if node_capped {
-                    limits.push(format!("{max_nodes} nodes"));
-                }
-                let limits = if limits.is_empty() {
-                    "its budget".to_string()
-                } else {
-                    limits.join(" and ")
-                };
-                return Ok(unavailable(format!(
-                    "search from {from:?} to {to:?} stopped at {limits} after visiting \
+                // A limit stopped the walk, so the graph was never asked. Saying
+                // "no path" here is how an agent concludes two symbols are
+                // unrelated when the path is merely longer than `--depth`.
+                PathSearch::Exhausted {
+                    depth_capped,
+                    node_capped,
+                    visited,
+                    max_depth,
+                    max_nodes,
+                } => {
+                    let mut limits = Vec::new();
+                    if depth_capped {
+                        limits.push(format!("depth {max_depth}"));
+                    }
+                    if node_capped {
+                        limits.push(format!("{max_nodes} nodes"));
+                    }
+                    let limits = if limits.is_empty() {
+                        "its budget".to_string()
+                    } else {
+                        limits.join(" and ")
+                    };
+                    return Ok(unavailable(format!(
+                        "search from {from:?} to {to:?} stopped at {limits} after visiting \
                          {visited} nodes without reaching the target; whether a path exists \
                          is unknown — retry with a larger --depth"
-                )));
-            }
-        };
-        let mut response = atomic_budget_take(path, req.token_budget, |_| 25);
-        response.walk_incomplete = coverage_gap;
-        Ok(response)
-    })
+                    )));
+                }
+            };
+            let mut response = atomic_budget_take(path, req.token_budget, |_| 25);
+            response.walk_incomplete = coverage_gap;
+            Ok(response)
+        })
     }
 
     /// Every edge in the latest generation at or above `min_confidence`, in
@@ -1627,7 +1625,12 @@ impl<'a> StoreQueryEngine<'a> {
                 starts.checked += 1;
                 continue;
             };
-            starts.record(&file.path, &file.language, &file.engine, &file.parse_outcome);
+            starts.record(
+                &file.path,
+                &file.language,
+                &file.engine,
+                &file.parse_outcome,
+            );
         }
         Ok(starts)
     }
@@ -1678,27 +1681,27 @@ impl<'a> StoreQueryEngine<'a> {
         filter: Option<&crate::scope::NameQueryFilter>,
     ) -> anyhow::Result<ExploreReport> {
         self.exit(|| {
-        self.read_composed(
-            || {
-                self.explore_once(
-                    query,
-                    limit,
-                    token_budget,
-                    min_confidence,
-                    max_depth,
-                    filter,
-                )
-            },
-            |report, note| {
-                qualify_response(&mut report.definitions, note);
-                qualify_response(&mut report.blast_radius.layers, note);
-                for definition in &mut report.definitions.items {
-                    qualify_response(&mut definition.callers, note);
-                    qualify_response(&mut definition.callees, note);
-                }
-            },
-        )
-    })
+            self.read_composed(
+                || {
+                    self.explore_once(
+                        query,
+                        limit,
+                        token_budget,
+                        min_confidence,
+                        max_depth,
+                        filter,
+                    )
+                },
+                |report, note| {
+                    qualify_response(&mut report.definitions, note);
+                    qualify_response(&mut report.blast_radius.layers, note);
+                    for definition in &mut report.definitions.items {
+                        qualify_response(&mut definition.callers, note);
+                        qualify_response(&mut definition.callees, note);
+                    }
+                },
+            )
+        })
     }
 
     fn explore_once(
@@ -1916,91 +1919,91 @@ impl<'a> StoreQueryEngine<'a> {
         max_depth: usize,
     ) -> anyhow::Result<AffectedTestsReport> {
         self.exit(|| {
-        devmap_store::checked_min_confidence(min_confidence)?;
-        let layer_budget = token_budget / 2;
-        let list_budget = token_budget.saturating_sub(layer_budget);
-        let empty_report = |reason: String| AffectedTestsReport {
-            targets: targets.to_vec(),
-            tests: unavailable_response(ResolutionAvailability::Unavailable {
-                reason: reason.clone(),
-            }),
-            blast_radius: BlastRadius {
-                seeds: Vec::new(),
-                unmatched_targets: targets.to_vec(),
-                layers: unavailable_response(ResolutionAvailability::Unavailable { reason }),
-                total_impacted: 0,
-            },
-        };
-        if self.store.latest_generation_id()?.is_none() {
-            return Ok(empty_report(
-                "no persisted generation is available".to_string(),
-            ));
-        }
-        if targets.is_empty() {
-            return Ok(empty_report(
-                "affected_tests requires at least one target".to_string(),
-            ));
-        }
-        if targets.len() > MAX_NEIGHBOR_TARGETS {
-            anyhow::bail!(
-                "affected accepts at most {} targets, got {}",
-                MAX_NEIGHBOR_TARGETS,
-                targets.len()
-            );
-        }
-
-        let Some(index) = self.generation_edges()? else {
-            return Ok(empty_report(
-                "no persisted generation is available".to_string(),
-            ));
-        };
-        let walk = self.blast_walk(&index, targets, max_depth, min_confidence)?;
-        // A test is a symbol in a test file or one a test runner invokes, so a
-        // `#[test] fn` beside the code it tests is named too; its file is the
-        // entry's `path`, like any other test's.
-        let test_symbols = self.store.latest_test_entry_symbols()?;
-
-        // Derived from the *complete* walk, never from the budgeted layers.
-        // Reading the presentation back would drop every test whose band the
-        // token budget trimmed, and the shortfall would be invisible: the test
-        // list's own counters would report a complete answer over a set that
-        // had already been cut. The bands are also sampled for display at
-        // `BLAST_LAYER_NODE_SAMPLE`, which would hide the 51st caller in a band
-        // for the same reason.
-        //
-        // Depth 0 is the seed band: a target that is itself in a test file
-        // counts as an affected test.
-        let mut nearest: BTreeMap<String, (usize, BTreeSet<String>)> = BTreeMap::new();
-        for (symbol, file) in &walk.seeds {
-            record_test_hit(&mut nearest, &test_symbols, symbol, file, 0);
-        }
-        for band in &walk.bands {
-            for (symbol, file) in &band.members {
-                record_test_hit(&mut nearest, &test_symbols, symbol, file, band.depth);
+            devmap_store::checked_min_confidence(min_confidence)?;
+            let layer_budget = token_budget / 2;
+            let list_budget = token_budget.saturating_sub(layer_budget);
+            let empty_report = |reason: String| AffectedTestsReport {
+                targets: targets.to_vec(),
+                tests: unavailable_response(ResolutionAvailability::Unavailable {
+                    reason: reason.clone(),
+                }),
+                blast_radius: BlastRadius {
+                    seeds: Vec::new(),
+                    unmatched_targets: targets.to_vec(),
+                    layers: unavailable_response(ResolutionAvailability::Unavailable { reason }),
+                    total_impacted: 0,
+                },
+            };
+            if self.store.latest_generation_id()?.is_none() {
+                return Ok(empty_report(
+                    "no persisted generation is available".to_string(),
+                ));
             }
-        }
+            if targets.is_empty() {
+                return Ok(empty_report(
+                    "affected_tests requires at least one target".to_string(),
+                ));
+            }
+            if targets.len() > MAX_NEIGHBOR_TARGETS {
+                anyhow::bail!(
+                    "affected accepts at most {} targets, got {}",
+                    MAX_NEIGHBOR_TARGETS,
+                    targets.len()
+                );
+            }
 
-        let mut tests: Vec<AffectedTest> = nearest
-            .into_iter()
-            .map(|(path, (depth, symbols))| AffectedTest {
-                path,
-                depth,
-                reached_symbols: u32::try_from(symbols.len()).unwrap_or(u32::MAX),
-                symbols: symbols.into_iter().take(AFFECTED_SYMBOL_SAMPLE).collect(),
+            let Some(index) = self.generation_edges()? else {
+                return Ok(empty_report(
+                    "no persisted generation is available".to_string(),
+                ));
+            };
+            let walk = self.blast_walk(&index, targets, max_depth, min_confidence)?;
+            // A test is a symbol in a test file or one a test runner invokes, so a
+            // `#[test] fn` beside the code it tests is named too; its file is the
+            // entry's `path`, like any other test's.
+            let test_symbols = self.store.latest_test_entry_symbols()?;
+
+            // Derived from the *complete* walk, never from the budgeted layers.
+            // Reading the presentation back would drop every test whose band the
+            // token budget trimmed, and the shortfall would be invisible: the test
+            // list's own counters would report a complete answer over a set that
+            // had already been cut. The bands are also sampled for display at
+            // `BLAST_LAYER_NODE_SAMPLE`, which would hide the 51st caller in a band
+            // for the same reason.
+            //
+            // Depth 0 is the seed band: a target that is itself in a test file
+            // counts as an affected test.
+            let mut nearest: BTreeMap<String, (usize, BTreeSet<String>)> = BTreeMap::new();
+            for (symbol, file) in &walk.seeds {
+                record_test_hit(&mut nearest, &test_symbols, symbol, file, 0);
+            }
+            for band in &walk.bands {
+                for (symbol, file) in &band.members {
+                    record_test_hit(&mut nearest, &test_symbols, symbol, file, band.depth);
+                }
+            }
+
+            let mut tests: Vec<AffectedTest> = nearest
+                .into_iter()
+                .map(|(path, (depth, symbols))| AffectedTest {
+                    path,
+                    depth,
+                    reached_symbols: u32::try_from(symbols.len()).unwrap_or(u32::MAX),
+                    symbols: symbols.into_iter().take(AFFECTED_SYMBOL_SAMPLE).collect(),
+                })
+                .collect();
+            // Nearest first, then alphabetically — ranked before the budgeter cuts.
+            tests.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.path.cmp(&b.path)));
+            let mut response = budget_take(tests, list_budget, affected_test_tokens);
+            // A test list derived from a walk that stopped early is a lower bound,
+            // and the counters above cannot say so — they describe the budget.
+            response.walk_incomplete = walk.incomplete_reason();
+            Ok(AffectedTestsReport {
+                targets: targets.to_vec(),
+                tests: response,
+                blast_radius: walk.into_radius(layer_budget),
             })
-            .collect();
-        // Nearest first, then alphabetically — ranked before the budgeter cuts.
-        tests.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.path.cmp(&b.path)));
-        let mut response = budget_take(tests, list_budget, affected_test_tokens);
-        // A test list derived from a walk that stopped early is a lower bound,
-        // and the counters above cannot say so — they describe the budget.
-        response.walk_incomplete = walk.incomplete_reason();
-        Ok(AffectedTestsReport {
-            targets: targets.to_vec(),
-            tests: response,
-            blast_radius: walk.into_radius(layer_budget),
         })
-    })
     }
 
     /// Inbound reachability from `targets`, banded by distance.
@@ -2179,63 +2182,63 @@ impl<'a> StoreQueryEngine<'a> {
         token_budget: u32,
     ) -> anyhow::Result<Response<devmap_analyze::DeadSymbolReport>> {
         self.exit(|| {
-        // One snapshot. This resolved the generation three times — an existence
-        // check, the analysis, then the rows — so the coverage disclosure could
-        // describe a different generation than the findings it was attached to.
-        // That combination is what promotes a row from "look at this" to "safe
-        // to delete": a disclosure saying the corpus was fully covered, over
-        // rows from a generation where it was not.
-        //
-        // Bounded by the answer, not by the corpus. The exempt filter and the
-        // cut both run in SQL now; this used to materialise every dead row of
-        // the generation and drop almost all of them here — 80,000 read to show
-        // 66 on the benchmark corpus. One more row than the budget can seat is
-        // read on purpose, so `budget_take` still sees something it cannot fit
-        // and reports `truncated` for the right reason.
-        let limit = (token_budget / DEAD_SYMBOL_TOKENS) as usize + 1;
-        self.cancel.check()?;
-        let Some(page) = self.store.dead_page(limit)? else {
-            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
-                reason: "no persisted generation is available".to_string(),
-            }));
-        };
-        let mut rows = page.rows;
-        self.locate_dead_evidence(&mut rows)?;
-        let mut response = budget_take(rows, token_budget, |_| DEAD_SYMBOL_TOKENS);
-        response.excluded = Some(page.excluded);
-        // `budget_take` counts the page it was handed, and the page is now a
-        // bounded read — so the generation-wide count has to be restored as the
-        // denominator, exactly as `explore` does for definitions. Without this
-        // a capped list would report itself as the whole truth.
-        response.total = u32::try_from(page.total_non_exempt)
-            .unwrap_or(u32::MAX)
-            .max(response.shown);
-        response.hidden = response.total.saturating_sub(response.shown);
-        response.truncated = response.hidden > 0;
-        response.walk_incomplete = analysis_coverage_gap(page.analysis.as_ref());
-        // The other half of the answer, and until now the half nothing could
-        // see. A one-hop inbound-edge join structurally cannot report a
-        // subsystem whose functions call each other, so a `dead` answer without
-        // the component pass is not a shorter list — it is a list missing an
-        // entire class of finding. `DeadClusterScan::clusters` is capped at
-        // `DEAD_CLUSTER_CAP` by the producer, so this needs no budget of its
-        // own; what the cap dropped travels beside it.
-        if let Some(scan) = page.dead_clusters {
-            if scan.refused_oversized_graph {
-                // The one outcome an `Option<Vec<_>>` cannot hold. Leaving the
-                // empty list here would say the walk ran and found nothing.
-                response.dead_clusters_incomplete = Some(format!(
-                    "the call graph exceeded {} distinct symbols, so no \
+            // One snapshot. This resolved the generation three times — an existence
+            // check, the analysis, then the rows — so the coverage disclosure could
+            // describe a different generation than the findings it was attached to.
+            // That combination is what promotes a row from "look at this" to "safe
+            // to delete": a disclosure saying the corpus was fully covered, over
+            // rows from a generation where it was not.
+            //
+            // Bounded by the answer, not by the corpus. The exempt filter and the
+            // cut both run in SQL now; this used to materialise every dead row of
+            // the generation and drop almost all of them here — 80,000 read to show
+            // 66 on the benchmark corpus. One more row than the budget can seat is
+            // read on purpose, so `budget_take` still sees something it cannot fit
+            // and reports `truncated` for the right reason.
+            let limit = (token_budget / DEAD_SYMBOL_TOKENS) as usize + 1;
+            self.cancel.check()?;
+            let Some(page) = self.store.dead_page(limit)? else {
+                return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+                    reason: "no persisted generation is available".to_string(),
+                }));
+            };
+            let mut rows = page.rows;
+            self.locate_dead_evidence(&mut rows)?;
+            let mut response = budget_take(rows, token_budget, |_| DEAD_SYMBOL_TOKENS);
+            response.excluded = Some(page.excluded);
+            // `budget_take` counts the page it was handed, and the page is now a
+            // bounded read — so the generation-wide count has to be restored as the
+            // denominator, exactly as `explore` does for definitions. Without this
+            // a capped list would report itself as the whole truth.
+            response.total = u32::try_from(page.total_non_exempt)
+                .unwrap_or(u32::MAX)
+                .max(response.shown);
+            response.hidden = response.total.saturating_sub(response.shown);
+            response.truncated = response.hidden > 0;
+            response.walk_incomplete = analysis_coverage_gap(page.analysis.as_ref());
+            // The other half of the answer, and until now the half nothing could
+            // see. A one-hop inbound-edge join structurally cannot report a
+            // subsystem whose functions call each other, so a `dead` answer without
+            // the component pass is not a shorter list — it is a list missing an
+            // entire class of finding. `DeadClusterScan::clusters` is capped at
+            // `DEAD_CLUSTER_CAP` by the producer, so this needs no budget of its
+            // own; what the cap dropped travels beside it.
+            if let Some(scan) = page.dead_clusters {
+                if scan.refused_oversized_graph {
+                    // The one outcome an `Option<Vec<_>>` cannot hold. Leaving the
+                    // empty list here would say the walk ran and found nothing.
+                    response.dead_clusters_incomplete = Some(format!(
+                        "the call graph exceeded {} distinct symbols, so no \
                      component scan ran for this generation",
-                    devmap_analyze::dead_clusters::DEAD_CLUSTER_MAX_NODES
-                ));
-            } else {
-                response.dead_clusters_truncated = scan.truncated_clusters;
-                response.dead_clusters = Some(scan.clusters);
+                        devmap_analyze::dead_clusters::DEAD_CLUSTER_MAX_NODES
+                    ));
+                } else {
+                    response.dead_clusters_truncated = scan.truncated_clusters;
+                    response.dead_clusters = Some(scan.clusters);
+                }
             }
-        }
-        Ok(response)
-    })
+            Ok(response)
+        })
     }
 
     /// Turn each unconfirmed row's first-site byte into a line, so a reader
@@ -2305,33 +2308,33 @@ impl<'a> StoreQueryEngine<'a> {
         min_nodes: u32,
     ) -> anyhow::Result<CloneReport> {
         self.exit(|| {
-        if self.store.latest_generation_id()?.is_none() {
-            return Ok(CloneReport {
-                groups: unavailable_response(ResolutionAvailability::Unavailable {
-                    reason: "no persisted generation is available".to_string(),
-                }),
-                signed_symbols: 0,
-                unsigned_symbols: 0,
-            });
-        }
-        // Both the candidate read and the grouping cover every signed symbol of
-        // the generation before the budget cuts anything.
-        self.cancel.check()?;
-        let (candidates, unsigned) = self.store.latest_clone_candidates()?;
-        self.cancel.check()?;
-        let summary = group_clones(&candidates, unsigned);
-        let matching: Vec<_> = summary
-            .groups
-            .into_iter()
-            .filter(|group| kind.is_none_or(|wanted| group.kind == wanted))
-            .filter(|group| group.min_nodes >= min_nodes)
-            .collect();
-        Ok(CloneReport {
-            groups: budget_take(matching, token_budget, clone_group_tokens),
-            signed_symbols: summary.signed_symbols,
-            unsigned_symbols: summary.unsigned_symbols,
+            if self.store.latest_generation_id()?.is_none() {
+                return Ok(CloneReport {
+                    groups: unavailable_response(ResolutionAvailability::Unavailable {
+                        reason: "no persisted generation is available".to_string(),
+                    }),
+                    signed_symbols: 0,
+                    unsigned_symbols: 0,
+                });
+            }
+            // Both the candidate read and the grouping cover every signed symbol of
+            // the generation before the budget cuts anything.
+            self.cancel.check()?;
+            let (candidates, unsigned) = self.store.latest_clone_candidates()?;
+            self.cancel.check()?;
+            let summary = group_clones(&candidates, unsigned);
+            let matching: Vec<_> = summary
+                .groups
+                .into_iter()
+                .filter(|group| kind.is_none_or(|wanted| group.kind == wanted))
+                .filter(|group| group.min_nodes >= min_nodes)
+                .collect();
+            Ok(CloneReport {
+                groups: budget_take(matching, token_budget, clone_group_tokens),
+                signed_symbols: summary.signed_symbols,
+                unsigned_symbols: summary.unsigned_symbols,
+            })
         })
-    })
     }
 
     /// Definitions in one file as signature plus span — never the body.
@@ -2341,14 +2344,27 @@ impl<'a> StoreQueryEngine<'a> {
     /// is still returned and `signature_note` says so explicitly.
     pub fn skeleton(&self, path: &str, token_budget: u32) -> anyhow::Result<SkeletonReport> {
         self.exit(|| {
-        self.cancel.check()?;
-        let path = resolve_skeleton_path(self.store, path)?;
-        let freshness = SourceFreshness::from_store(self.store.query_source_freshness());
-        let Some(extraction) = self.store.latest_extraction_for_path(&path)? else {
-            // Distinguish "no generation at all" from "this path is absent".
-            // Both look like an empty list; only the latter is a finding about
-            // the path the caller named.
-            if self.store.latest_generation_id()?.is_none() {
+            self.cancel.check()?;
+            let path = resolve_skeleton_path(self.store, path)?;
+            let freshness = SourceFreshness::from_store(self.store.query_source_freshness());
+            let Some(extraction) = self.store.latest_extraction_for_path(&path)? else {
+                // Distinguish "no generation at all" from "this path is absent".
+                // Both look like an empty list; only the latter is a finding about
+                // the path the caller named.
+                if self.store.latest_generation_id()?.is_none() {
+                    return Ok(SkeletonReport {
+                        file: path,
+                        presence: SkeletonPresence::NotInIndex,
+                        items: Vec::new(),
+                        shown: 0,
+                        total: 0,
+                        truncated: false,
+                        source_freshness: freshness,
+                        resolution: ResolutionAvailability::Unavailable {
+                            reason: "no persisted generation is available".to_string(),
+                        },
+                    });
+                }
                 return Ok(SkeletonReport {
                     file: path,
                     presence: SkeletonPresence::NotInIndex,
@@ -2357,114 +2373,101 @@ impl<'a> StoreQueryEngine<'a> {
                     total: 0,
                     truncated: false,
                     source_freshness: freshness,
-                    resolution: ResolutionAvailability::Unavailable {
-                        reason: "no persisted generation is available".to_string(),
-                    },
+                    resolution: ResolutionAvailability::Available,
+                });
+            };
+
+            if extraction.symbols.is_empty() {
+                return Ok(SkeletonReport {
+                    file: path,
+                    presence: SkeletonPresence::Empty,
+                    items: Vec::new(),
+                    shown: 0,
+                    total: 0,
+                    truncated: false,
+                    source_freshness: freshness,
+                    resolution: ResolutionAvailability::Available,
                 });
             }
-            return Ok(SkeletonReport {
+
+            // Prefer the on-disk file for line conversion so the numbers match what
+            // an editor shows. Spans were recorded against the indexed content; a
+            // dirty buffer can shift them, which is disclosed via lines_from_bytes
+            // only when the file cannot be read at all.
+            let source_root = self.store.latest_repo_root()?;
+            let on_disk = devmap_extract::safe_fs::read_repo_source(
+                source_root.as_deref().map(Path::new),
+                &path,
+                devmap_extract::MAX_SOURCE_BYTES,
+            )
+            .ok();
+            let line_index = on_disk.as_deref().map(LineIndex::new);
+            let lines_from_bytes = line_index.is_none();
+            // A secret file's declarations are its own text, so a skeleton of one
+            // gives the spans and withholds the signatures.
+            let withheld = devmap_extract::secret::is_secret_path(&path)
+                .then(|| devmap_extract::secret::WITHHELD_SECRET_PATH.to_string());
+
+            let mut items: Vec<SkeletonSymbol> = extraction
+                .symbols
+                .iter()
+                .map(|sym| {
+                    let (start_line, end_line) = match &line_index {
+                        Some(index) => byte_span_to_line_range_in(index, &sym.span),
+                        None => (
+                            (sym.span.start_byte as u32).saturating_add(1),
+                            (sym.span.end_byte as u32).saturating_add(1).max(1),
+                        ),
+                    };
+                    let (signature, signature_note) = match &sym.signature {
+                        _ if withheld.is_some() => (
+                            None,
+                            Some(format!(
+                                "withheld: {}",
+                                devmap_extract::secret::WITHHELD_SECRET_PATH
+                            )),
+                        ),
+                        Some(text) if !text.is_empty() => (Some(text.clone()), None),
+                        _ => (None, Some("not extracted".to_string())),
+                    };
+                    SkeletonSymbol {
+                        qualified_name: sym.qualified_name.clone(),
+                        kind: sym.kind.as_str().to_string(),
+                        start_line,
+                        end_line,
+                        start_byte: sym.span.start_byte,
+                        end_byte: sym.span.end_byte,
+                        lines_from_bytes,
+                        signature,
+                        signature_note,
+                        withheld: withheld.clone(),
+                    }
+                })
+                .collect();
+            // Stable order: declaration order in the file (by start byte), then name.
+            items.sort_by(|a, b| {
+                a.start_byte
+                    .cmp(&b.start_byte)
+                    .then(a.qualified_name.cmp(&b.qualified_name))
+            });
+
+            let total = u32::try_from(items.len()).unwrap_or(u32::MAX);
+            let mut packed = budget_take(items, token_budget, skeleton_symbol_tokens);
+            packed.total = total;
+            packed.hidden = total.saturating_sub(packed.shown);
+            packed.truncated = packed.hidden > 0;
+
+            Ok(SkeletonReport {
                 file: path,
-                presence: SkeletonPresence::NotInIndex,
-                items: Vec::new(),
-                shown: 0,
-                total: 0,
-                truncated: false,
+                presence: SkeletonPresence::Indexed,
+                items: packed.items,
+                shown: packed.shown,
+                total: packed.total,
+                truncated: packed.truncated,
                 source_freshness: freshness,
                 resolution: ResolutionAvailability::Available,
-            });
-        };
-
-        if extraction.symbols.is_empty() {
-            return Ok(SkeletonReport {
-                file: path,
-                presence: SkeletonPresence::Empty,
-                items: Vec::new(),
-                shown: 0,
-                total: 0,
-                truncated: false,
-                source_freshness: freshness,
-                resolution: ResolutionAvailability::Available,
-            });
-        }
-
-        // Prefer the on-disk file for line conversion so the numbers match what
-        // an editor shows. Spans were recorded against the indexed content; a
-        // dirty buffer can shift them, which is disclosed via lines_from_bytes
-        // only when the file cannot be read at all.
-        let source_root = self.store.latest_repo_root()?;
-        let on_disk = devmap_extract::safe_fs::read_repo_source(
-            source_root.as_deref().map(Path::new),
-            &path,
-            devmap_extract::MAX_SOURCE_BYTES,
-        )
-        .ok();
-        let line_index = on_disk.as_deref().map(LineIndex::new);
-        let lines_from_bytes = line_index.is_none();
-        // A secret file's declarations are its own text, so a skeleton of one
-        // gives the spans and withholds the signatures.
-        let withheld = devmap_extract::secret::is_secret_path(&path)
-            .then(|| devmap_extract::secret::WITHHELD_SECRET_PATH.to_string());
-
-        let mut items: Vec<SkeletonSymbol> = extraction
-            .symbols
-            .iter()
-            .map(|sym| {
-                let (start_line, end_line) = match &line_index {
-                    Some(index) => byte_span_to_line_range_in(index, &sym.span),
-                    None => (
-                        (sym.span.start_byte as u32).saturating_add(1),
-                        (sym.span.end_byte as u32).saturating_add(1).max(1),
-                    ),
-                };
-                let (signature, signature_note) = match &sym.signature {
-                    _ if withheld.is_some() => (
-                        None,
-                        Some(format!(
-                            "withheld: {}",
-                            devmap_extract::secret::WITHHELD_SECRET_PATH
-                        )),
-                    ),
-                    Some(text) if !text.is_empty() => (Some(text.clone()), None),
-                    _ => (None, Some("not extracted".to_string())),
-                };
-                SkeletonSymbol {
-                    qualified_name: sym.qualified_name.clone(),
-                    kind: sym.kind.as_str().to_string(),
-                    start_line,
-                    end_line,
-                    start_byte: sym.span.start_byte,
-                    end_byte: sym.span.end_byte,
-                    lines_from_bytes,
-                    signature,
-                    signature_note,
-                    withheld: withheld.clone(),
-                }
             })
-            .collect();
-        // Stable order: declaration order in the file (by start byte), then name.
-        items.sort_by(|a, b| {
-            a.start_byte
-                .cmp(&b.start_byte)
-                .then(a.qualified_name.cmp(&b.qualified_name))
-        });
-
-        let total = u32::try_from(items.len()).unwrap_or(u32::MAX);
-        let mut packed = budget_take(items, token_budget, skeleton_symbol_tokens);
-        packed.total = total;
-        packed.hidden = total.saturating_sub(packed.shown);
-        packed.truncated = packed.hidden > 0;
-
-        Ok(SkeletonReport {
-            file: path,
-            presence: SkeletonPresence::Indexed,
-            items: packed.items,
-            shown: packed.shown,
-            total: packed.total,
-            truncated: packed.truncated,
-            source_freshness: freshness,
-            resolution: ResolutionAvailability::Available,
         })
-    })
     }
 
     /// Rank symbols by TF-IDF similarity of their names to `query`.
@@ -2511,87 +2514,88 @@ impl<'a> StoreQueryEngine<'a> {
         kinds: &[String],
     ) -> anyhow::Result<Response<SymbolHit>> {
         self.exit(|| {
-        self.cancel.check()?;
-        let Some((mut snapshot, resolved)) = self.ranking_corpus(scope)? else {
-            return Ok(unavailable_response(ResolutionAvailability::Unavailable {
-                reason: "no persisted generation is available".to_string(),
-            }));
-        };
-        let mut report = resolved.map(|resolved| resolved.report);
-        if !kinds.is_empty() {
-            let present: BTreeSet<String> =
-                snapshot.rows.iter().map(|row| row.kind.clone()).collect();
-            let missing: Vec<String> = kinds
-                .iter()
-                .filter(|kind| !present.contains(kind.as_str()))
-                .cloned()
-                .collect();
-            if !missing.is_empty() {
-                anyhow::bail!(crate::scope::missing_kind_message(
-                    &missing,
-                    &present,
-                    scope.is_some()
-                ));
-            }
-            let loaded = snapshot.rows.len();
-            let loaded_paths = snapshot
-                .rows
-                .iter()
-                .map(|row| row.path.as_str())
-                .collect::<BTreeSet<_>>()
-                .len();
-            snapshot
-                .rows
-                .retain(|row| kinds.iter().any(|kind| kind == &row.kind));
-            let kind_symbols = u32::try_from(snapshot.rows.len()).unwrap_or(u32::MAX);
-            snapshot.total = kind_symbols;
-            let kind_files = snapshot
-                .rows
-                .iter()
-                .map(|row| row.path.as_str())
-                .collect::<BTreeSet<_>>()
-                .len();
-            let mut built = report.unwrap_or_else(|| crate::scope::ScopeReport {
-                paths: Vec::new(),
-                languages: Vec::new(),
-                kinds: Vec::new(),
-                files: 0,
-                symbols: 0,
-                corpus_files: 0,
-                corpus_symbols: 0,
-                related_tests_outside_scope: 0,
-            });
-            built.kinds = kinds.to_vec();
-            built.symbols = kind_symbols;
-            if scope.is_none() {
-                built.files = u32::try_from(kind_files).unwrap_or(u32::MAX);
-                built.corpus_files = match snapshot.analysis.as_ref() {
-                    Some(disclosure) if disclosure.total_files > 0 => {
-                        u32::try_from(disclosure.total_files).unwrap_or(u32::MAX)
-                    }
-                    _ => u32::try_from(loaded_paths).unwrap_or(u32::MAX),
-                };
-                built.corpus_symbols = match snapshot.analysis.as_ref() {
-                    Some(disclosure) if disclosure.total_symbols > 0 => {
-                        u32::try_from(disclosure.total_symbols).unwrap_or(u32::MAX)
-                    }
-                    _ => u32::try_from(loaded).unwrap_or(u32::MAX),
-                };
-            } else if let Some(disclosure) = snapshot.analysis.as_ref() {
-                if disclosure.total_files > 0 {
-                    built.corpus_files = u32::try_from(disclosure.total_files).unwrap_or(u32::MAX);
+            self.cancel.check()?;
+            let Some((mut snapshot, resolved)) = self.ranking_corpus(scope)? else {
+                return Ok(unavailable_response(ResolutionAvailability::Unavailable {
+                    reason: "no persisted generation is available".to_string(),
+                }));
+            };
+            let mut report = resolved.map(|resolved| resolved.report);
+            if !kinds.is_empty() {
+                let present: BTreeSet<String> =
+                    snapshot.rows.iter().map(|row| row.kind.clone()).collect();
+                let missing: Vec<String> = kinds
+                    .iter()
+                    .filter(|kind| !present.contains(kind.as_str()))
+                    .cloned()
+                    .collect();
+                if !missing.is_empty() {
+                    anyhow::bail!(crate::scope::missing_kind_message(
+                        &missing,
+                        &present,
+                        scope.is_some()
+                    ));
                 }
-                if disclosure.total_symbols > 0 {
-                    built.corpus_symbols =
-                        u32::try_from(disclosure.total_symbols).unwrap_or(u32::MAX);
+                let loaded = snapshot.rows.len();
+                let loaded_paths = snapshot
+                    .rows
+                    .iter()
+                    .map(|row| row.path.as_str())
+                    .collect::<BTreeSet<_>>()
+                    .len();
+                snapshot
+                    .rows
+                    .retain(|row| kinds.iter().any(|kind| kind == &row.kind));
+                let kind_symbols = u32::try_from(snapshot.rows.len()).unwrap_or(u32::MAX);
+                snapshot.total = kind_symbols;
+                let kind_files = snapshot
+                    .rows
+                    .iter()
+                    .map(|row| row.path.as_str())
+                    .collect::<BTreeSet<_>>()
+                    .len();
+                let mut built = report.unwrap_or_else(|| crate::scope::ScopeReport {
+                    paths: Vec::new(),
+                    languages: Vec::new(),
+                    kinds: Vec::new(),
+                    files: 0,
+                    symbols: 0,
+                    corpus_files: 0,
+                    corpus_symbols: 0,
+                    related_tests_outside_scope: 0,
+                });
+                built.kinds = kinds.to_vec();
+                built.symbols = kind_symbols;
+                if scope.is_none() {
+                    built.files = u32::try_from(kind_files).unwrap_or(u32::MAX);
+                    built.corpus_files = match snapshot.analysis.as_ref() {
+                        Some(disclosure) if disclosure.total_files > 0 => {
+                            u32::try_from(disclosure.total_files).unwrap_or(u32::MAX)
+                        }
+                        _ => u32::try_from(loaded_paths).unwrap_or(u32::MAX),
+                    };
+                    built.corpus_symbols = match snapshot.analysis.as_ref() {
+                        Some(disclosure) if disclosure.total_symbols > 0 => {
+                            u32::try_from(disclosure.total_symbols).unwrap_or(u32::MAX)
+                        }
+                        _ => u32::try_from(loaded).unwrap_or(u32::MAX),
+                    };
+                } else if let Some(disclosure) = snapshot.analysis.as_ref() {
+                    if disclosure.total_files > 0 {
+                        built.corpus_files =
+                            u32::try_from(disclosure.total_files).unwrap_or(u32::MAX);
+                    }
+                    if disclosure.total_symbols > 0 {
+                        built.corpus_symbols =
+                            u32::try_from(disclosure.total_symbols).unwrap_or(u32::MAX);
+                    }
                 }
+                report = Some(built);
             }
-            report = Some(built);
-        }
-        let mut response = self.search_semantic_over(query, token_budget, snapshot)?;
-        response.scope = report;
-        Ok(response)
-    })
+            let mut response = self.search_semantic_over(query, token_budget, snapshot)?;
+            response.scope = report;
+            Ok(response)
+        })
     }
 
     /// Sites where a string value is written.
@@ -2670,6 +2674,33 @@ impl<'a> StoreQueryEngine<'a> {
             tokens_used,
             walk_incomplete,
         })
+    }
+
+    /// Markdown references that name code which no longer exists or has
+    /// moved. `paths` and `exclude` are repo-relative prefixes; no `paths`
+    /// means every indexed Markdown file. See [`crate::doc_drift`] for what is
+    /// checked and what is deliberately skipped. `walk_incomplete` is set
+    /// whenever anything was not checked for a reason other than those skips,
+    /// and `available` is false (never an empty clean list) when no generation
+    /// is persisted.
+    pub fn doc_drift(
+        &self,
+        paths: &[String],
+        exclude: &[String],
+        token_budget: u32,
+        default_excludes: bool,
+    ) -> anyhow::Result<crate::doc_drift::DocDriftReport> {
+        crate::doc_drift::doc_drift_report_with(
+            self.store,
+            &self.cancel,
+            &crate::doc_drift::DocDriftOptions {
+                paths,
+                exclude,
+                token_budget,
+                default_excludes,
+                limits: crate::doc_drift::Limits::default(),
+            },
+        )
     }
 
     /// The symbol rows a ranking runs over: the whole latest generation, or
@@ -2802,10 +2833,10 @@ impl<'a> StoreQueryEngine<'a> {
         scope: Option<&crate::scope::SymbolScope>,
     ) -> anyhow::Result<Response<SymbolHit>> {
         self.exit(|| {
-        Ok(self
-            .ask_ranked(query, token_budget, min_confidence, false, scope)?
-            .0)
-    })
+            Ok(self
+                .ask_ranked(query, token_budget, min_confidence, false, scope)?
+                .0)
+        })
     }
 
     /// [`Self::ask`], answered as an evidence pack: hits grouped by file in
@@ -2838,74 +2869,70 @@ impl<'a> StoreQueryEngine<'a> {
         scope: Option<&crate::scope::SymbolScope>,
     ) -> anyhow::Result<crate::evidence::EvidencePack> {
         self.exit(|| {
-        let test_budget = token_budget / EVIDENCE_TEST_BUDGET_SHARE;
-        let (response, qualified, resolved) = self.ask_ranked(
-            query,
-            token_budget - test_budget,
-            min_confidence,
-            true,
-            scope,
-        )?;
-        let (edges, test_symbols) = if response.items.is_empty() {
-            (None, std::collections::HashSet::new())
-        } else {
-            (
-                self.generation_edges()?,
-                self.store.latest_test_entry_symbols()?,
-            )
-        };
-        let (related_tests, coverage_gap, outside_scope) = match edges.as_deref() {
-            Some(edges) => self.evidence_related_tests(
-                edges,
-                &response,
-                &qualified,
-                &test_symbols,
-                test_budget,
+            let test_budget = token_budget / EVIDENCE_TEST_BUDGET_SHARE;
+            let (response, qualified, resolved) = self.ask_ranked(
+                query,
+                token_budget - test_budget,
                 min_confidence,
-                resolved.as_ref(),
-            )?,
-            None => (
-                budget_take(Vec::new(), test_budget, |_| 0),
-                None,
-                0,
-            ),
-        };
-        // The pack states both directions of every hit — `calls` and
-        // `called_by` — so its gap does too: the walk above asked about the
-        // callers it could not follow, and this asks about the calls inside the
-        // hits themselves.
-        let callee_gap = match edges.as_deref() {
-            Some(edges) => {
-                let hits: BTreeSet<(String, String)> = response
-                    .items
-                    .iter()
-                    .zip(&qualified)
-                    .map(|(hit, name)| (name.clone(), hit.file_path.clone()))
-                    .collect();
-                self.radius_attribution_gap(
-                    edges.generation(),
-                    edges.analysis(),
-                    &hits,
-                    RadiusSide::Callees,
-                )?
+                true,
+                scope,
+            )?;
+            let (edges, test_symbols) = if response.items.is_empty() {
+                (None, std::collections::HashSet::new())
+            } else {
+                (
+                    self.generation_edges()?,
+                    self.store.latest_test_entry_symbols()?,
+                )
+            };
+            let (related_tests, coverage_gap, outside_scope) = match edges.as_deref() {
+                Some(edges) => self.evidence_related_tests(
+                    edges,
+                    &response,
+                    &qualified,
+                    &test_symbols,
+                    test_budget,
+                    min_confidence,
+                    resolved.as_ref(),
+                )?,
+                None => (budget_take(Vec::new(), test_budget, |_| 0), None, 0),
+            };
+            // The pack states both directions of every hit — `calls` and
+            // `called_by` — so its gap does too: the walk above asked about the
+            // callers it could not follow, and this asks about the calls inside the
+            // hits themselves.
+            let callee_gap = match edges.as_deref() {
+                Some(edges) => {
+                    let hits: BTreeSet<(String, String)> = response
+                        .items
+                        .iter()
+                        .zip(&qualified)
+                        .map(|(hit, name)| (name.clone(), hit.file_path.clone()))
+                        .collect();
+                    self.radius_attribution_gap(
+                        edges.generation(),
+                        edges.analysis(),
+                        &hits,
+                        RadiusSide::Callees,
+                    )?
+                }
+                None => None,
+            };
+            let mut pack = crate::evidence::assemble(
+                response,
+                &qualified,
+                edges.as_deref(),
+                min_confidence,
+                &test_symbols,
+                related_tests,
+                &self.cancel,
+            )?;
+            pack.coverage_gap = devmap_analyze::combine_reasons(coverage_gap, callee_gap);
+            if let Some(scope) = pack.scope.as_mut() {
+                scope.related_tests_outside_scope = outside_scope;
             }
-            None => None,
-        };
-        let mut pack = crate::evidence::assemble(
-            response,
-            &qualified,
-            edges.as_deref(),
-            min_confidence,
-            &test_symbols,
-            related_tests,
-            &self.cancel,
-        )?;
-        pack.coverage_gap = devmap_analyze::combine_reasons(coverage_gap, callee_gap);
-        if let Some(scope) = pack.scope.as_mut() {
-            scope.related_tests_outside_scope = outside_scope;
-        }
-        Ok(pack)
-    })
+            Ok(pack)
+        })
     }
 
     /// Test files reaching the pack's implementation hits, nearest first.
@@ -2948,11 +2975,7 @@ impl<'a> StoreQueryEngine<'a> {
             }
         }
         if targets.is_empty() {
-            return Ok((
-                budget_take(Vec::new(), token_budget, |_| 0),
-                None,
-                0,
-            ));
+            return Ok((budget_take(Vec::new(), token_budget, |_| 0), None, 0));
         }
         let walk = self.blast_walk(edges, &targets, EVIDENCE_TEST_DEPTH, min_confidence)?;
         // Seeds are implementation hits by construction, so only the bands can
@@ -3366,296 +3389,296 @@ impl<'a> StoreQueryEngine<'a> {
         min_confidence: f32,
     ) -> anyhow::Result<PreviewReport> {
         self.exit(|| {
-        if new_source.len() as u64 > devmap_extract::MAX_SOURCE_BYTES {
-            anyhow::bail!("preview source exceeds the 1 MiB source ceiling");
-        }
-        let candidate = devmap_extract::extract_file(path, new_source);
-        let parse_status = parse_status_name(&candidate.parse_outcome).to_string();
+            if new_source.len() as u64 > devmap_extract::MAX_SOURCE_BYTES {
+                anyhow::bail!("preview source exceeds the 1 MiB source ceiling");
+            }
+            let candidate = devmap_extract::extract_file(path, new_source);
+            let parse_status = parse_status_name(&candidate.parse_outcome).to_string();
 
-        let empty_callers = || Response {
-            source_freshness: crate::model::SourceFreshness::unverified(
-                "whole-tree source freshness was not checked for this answer",
-            ),
-            items: Vec::new(),
-            shown: 0,
-            hidden: 0,
-            total: 0,
-            truncated: false,
-            tokens_used: 0,
-            resolution: ResolutionAvailability::Available,
-            walk_incomplete: None,
-            rungs: None,
-            dead_clusters: None,
-            dead_clusters_truncated: 0,
-            dead_clusters_incomplete: None,
-            excluded: None,
-            unresolved_namesakes: None,
-            note: None,
-            scope: None,
-        };
+            let empty_callers = || Response {
+                source_freshness: crate::model::SourceFreshness::unverified(
+                    "whole-tree source freshness was not checked for this answer",
+                ),
+                items: Vec::new(),
+                shown: 0,
+                hidden: 0,
+                total: 0,
+                truncated: false,
+                tokens_used: 0,
+                resolution: ResolutionAvailability::Available,
+                walk_incomplete: None,
+                rungs: None,
+                dead_clusters: None,
+                dead_clusters_truncated: 0,
+                dead_clusters_incomplete: None,
+                excluded: None,
+                unresolved_namesakes: None,
+                note: None,
+                scope: None,
+            };
 
-        // `Skipped` is here for the same reason `Failed` is, and the reason is
-        // the sentence below rather than the variant: a file that yielded no
-        // symbols cannot be diffed against one that did without the diff
-        // reading as a deletion of every symbol in it. Which of the two
-        // produced the empty symbol list does not change that.
-        if let ParseOutcome::Failed { reason } | ParseOutcome::Skipped { reason } =
-            &candidate.parse_outcome
-        {
-            return Ok(PreviewReport {
-                file_path: path.to_string(),
-                parse_status,
-                delta_available: false,
-                file_is_indexed: self.store.latest_extraction_for_path(path)?.is_some(),
-                compared_against: "nothing".to_string(),
-                degraded_reason: Some(format!(
-                    "the buffer was not parsed ({reason}); no delta is reported, \
+            // `Skipped` is here for the same reason `Failed` is, and the reason is
+            // the sentence below rather than the variant: a file that yielded no
+            // symbols cannot be diffed against one that did without the diff
+            // reading as a deletion of every symbol in it. Which of the two
+            // produced the empty symbol list does not change that.
+            if let ParseOutcome::Failed { reason } | ParseOutcome::Skipped { reason } =
+                &candidate.parse_outcome
+            {
+                return Ok(PreviewReport {
+                    file_path: path.to_string(),
+                    parse_status,
+                    delta_available: false,
+                    file_is_indexed: self.store.latest_extraction_for_path(path)?.is_some(),
+                    compared_against: "nothing".to_string(),
+                    degraded_reason: Some(format!(
+                        "the buffer was not parsed ({reason}); no delta is reported, \
                      because an unparsed file yields no symbols and would read \
                      as a deletion of every symbol in it"
-                )),
-                symbols: Vec::new(),
-                bodies_not_compared: 0,
-                ambiguous_callers: 0,
-                broken_callers: empty_callers(),
-            });
-        }
+                    )),
+                    symbols: Vec::new(),
+                    bodies_not_compared: 0,
+                    ambiguous_callers: 0,
+                    broken_callers: empty_callers(),
+                });
+            }
 
-        // The "before" side is extracted from the file on disk, not read back
-        // from the store. Two reasons: the stored extraction has been through
-        // `for_durable_store`, and more importantly the user is editing the
-        // file that is on disk — diffing against a generation built from an
-        // older commit would report their own already-saved work as part of the
-        // candidate change. The store is still consulted, but only for the
-        // caller graph, where being a generation behind is a known and stated
-        // property rather than a wrong diff.
-        let file_is_indexed = self.store.latest_extraction_for_path(path)?.is_some();
-        // Resolved against the generation's own root, not the process's working
-        // directory. Indexed paths are repository-relative, and the two callers
-        // of this have different working directories: the CLI runs wherever the
-        // user is, the daemon wherever it was spawned. Reading `path` directly
-        // works for one of them and silently finds nothing for the other —
-        // which reads as "no such file", i.e. every symbol added.
-        //
-        // Containment is enforced *before* the read: `path` arrives from an IPC
-        // caller, and this is the only query that reads a file the caller
-        // names. See `contained_repo_path`.
-        let source_root = self.store.latest_repo_root()?;
-        contained_repo_path(source_root.as_deref(), path)?;
-        // `.ok()` here used to collapse two different facts into one. "There is
-        // no such file" and "the file is there and I could not read it"
-        // (non-UTF-8, EACCES, EISDIR) both became `None`, and `None` means
-        // `compared_against: "nothing"` — documented as *no such file, so every
-        // symbol is an addition*.
-        //
-        // The consequence is the worst shape this repository has: a genuine
-        // removal **disappears**. Same edit, same file — readable, the report
-        // says `symbols: ["beta:Removed"]`; unreadable, it says
-        // `["mod.py:Added", "alpha:Added"]` with `degraded_reason: null` and
-        // `delta_available: true`. The caller is handed a clean bill of health
-        // by a comparison that never ran.
-        let (on_disk, read_failure) = match devmap_extract::safe_fs::read_repo_source(
-            source_root.as_deref().map(Path::new),
-            path,
-            devmap_extract::MAX_SOURCE_BYTES,
-        ) {
-            Ok(source) => (Some(source), None),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (None, None),
-            Err(err) => (None, Some(err)),
-        };
-        let compared_against = match (&on_disk, &read_failure) {
-            (Some(_), _) => "disk",
-            // A third value, never a reuse of `nothing`. A consumer keying off
-            // `nothing` to mean "new file" must not be handed this case.
-            (None, Some(_)) => "unreadable",
-            (None, None) => "nothing",
-        };
-        let previous = on_disk
-            .as_deref()
-            .map(|source| devmap_extract::extract_file(path, source).symbols)
-            .unwrap_or_default();
+            // The "before" side is extracted from the file on disk, not read back
+            // from the store. Two reasons: the stored extraction has been through
+            // `for_durable_store`, and more importantly the user is editing the
+            // file that is on disk — diffing against a generation built from an
+            // older commit would report their own already-saved work as part of the
+            // candidate change. The store is still consulted, but only for the
+            // caller graph, where being a generation behind is a known and stated
+            // property rather than a wrong diff.
+            let file_is_indexed = self.store.latest_extraction_for_path(path)?.is_some();
+            // Resolved against the generation's own root, not the process's working
+            // directory. Indexed paths are repository-relative, and the two callers
+            // of this have different working directories: the CLI runs wherever the
+            // user is, the daemon wherever it was spawned. Reading `path` directly
+            // works for one of them and silently finds nothing for the other —
+            // which reads as "no such file", i.e. every symbol added.
+            //
+            // Containment is enforced *before* the read: `path` arrives from an IPC
+            // caller, and this is the only query that reads a file the caller
+            // names. See `contained_repo_path`.
+            let source_root = self.store.latest_repo_root()?;
+            contained_repo_path(source_root.as_deref(), path)?;
+            // `.ok()` here used to collapse two different facts into one. "There is
+            // no such file" and "the file is there and I could not read it"
+            // (non-UTF-8, EACCES, EISDIR) both became `None`, and `None` means
+            // `compared_against: "nothing"` — documented as *no such file, so every
+            // symbol is an addition*.
+            //
+            // The consequence is the worst shape this repository has: a genuine
+            // removal **disappears**. Same edit, same file — readable, the report
+            // says `symbols: ["beta:Removed"]`; unreadable, it says
+            // `["mod.py:Added", "alpha:Added"]` with `degraded_reason: null` and
+            // `delta_available: true`. The caller is handed a clean bill of health
+            // by a comparison that never ran.
+            let (on_disk, read_failure) = match devmap_extract::safe_fs::read_repo_source(
+                source_root.as_deref().map(Path::new),
+                path,
+                devmap_extract::MAX_SOURCE_BYTES,
+            ) {
+                Ok(source) => (Some(source), None),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => (None, None),
+                Err(err) => (None, Some(err)),
+            };
+            let compared_against = match (&on_disk, &read_failure) {
+                (Some(_), _) => "disk",
+                // A third value, never a reuse of `nothing`. A consumer keying off
+                // `nothing` to mean "new file" must not be handed this case.
+                (None, Some(_)) => "unreadable",
+                (None, None) => "nothing",
+            };
+            let previous = on_disk
+                .as_deref()
+                .map(|source| devmap_extract::extract_file(path, source).symbols)
+                .unwrap_or_default();
 
-        let mut old_by_name: BTreeMap<&str, &ExtractedSymbol> = BTreeMap::new();
-        for symbol in &previous {
-            old_by_name.insert(symbol.qualified_name.as_str(), symbol);
-        }
-        let mut new_by_name: BTreeMap<&str, &ExtractedSymbol> = BTreeMap::new();
-        for symbol in &candidate.symbols {
-            new_by_name.insert(symbol.qualified_name.as_str(), symbol);
-        }
+            let mut old_by_name: BTreeMap<&str, &ExtractedSymbol> = BTreeMap::new();
+            for symbol in &previous {
+                old_by_name.insert(symbol.qualified_name.as_str(), symbol);
+            }
+            let mut new_by_name: BTreeMap<&str, &ExtractedSymbol> = BTreeMap::new();
+            for symbol in &candidate.symbols {
+                new_by_name.insert(symbol.qualified_name.as_str(), symbol);
+            }
 
-        let mut symbols: Vec<PreviewSymbol> = Vec::new();
-        let mut bodies_not_compared = 0usize;
-        for (qualified, now) in &new_by_name {
-            match old_by_name.get(qualified) {
-                None => symbols.push(PreviewSymbol {
-                    symbol_name: now.name.clone(),
-                    qualified_name: now.qualified_name.clone(),
-                    kind: now.kind.as_str().to_string(),
-                    change: PreviewChange::Added,
-                    was: None,
-                    now: now.signature.clone(),
-                }),
-                Some(was) => {
-                    // Declaration first: that is what a caller binds to, and a
-                    // changed declaration outranks whatever the body did.
-                    //
-                    // `ExtractedSymbol::signature` is not used for this. It is
-                    // populated by only one grammar in this workspace — 80 of
-                    // ~2,300 sampled symbols, all Go — so comparing it makes
-                    // every Python, Rust and TypeScript signature change look
-                    // like a body change. The declaration hash is computed from
-                    // the tree and works wherever the grammar names a body.
-                    let declaration_moved = match (was.declaration_hash, now.declaration_hash) {
-                        (Some(a), Some(b)) => Some(a != b),
-                        _ => None,
-                    };
-                    let change = match declaration_moved {
-                        Some(true) => PreviewChange::SignatureChanged,
-                        Some(false) | None => match (was.body_signature, now.body_signature) {
-                            (Some(a), Some(b)) if a.exact != b.exact => {
-                                if declaration_moved.is_none() {
-                                    // The body moved and nothing could tell
-                                    // whether the declaration did. Reported as
-                                    // the caller-affecting case, because
-                                    // under-reporting a break is the costlier
-                                    // error of the two.
-                                    PreviewChange::Changed
-                                } else {
-                                    PreviewChange::BodyChanged
-                                }
-                            }
-                            (Some(_), Some(_)) => continue,
-                            // Bodies not comparable. With an unchanged
-                            // declaration there is nothing to report; without
-                            // one, nothing was compared at all.
-                            _ => {
-                                bodies_not_compared += 1;
-                                continue;
-                            }
-                        },
-                    };
-                    symbols.push(PreviewSymbol {
+            let mut symbols: Vec<PreviewSymbol> = Vec::new();
+            let mut bodies_not_compared = 0usize;
+            for (qualified, now) in &new_by_name {
+                match old_by_name.get(qualified) {
+                    None => symbols.push(PreviewSymbol {
                         symbol_name: now.name.clone(),
                         qualified_name: now.qualified_name.clone(),
                         kind: now.kind.as_str().to_string(),
-                        change,
-                        was: was.signature.clone(),
+                        change: PreviewChange::Added,
+                        was: None,
                         now: now.signature.clone(),
-                    });
+                    }),
+                    Some(was) => {
+                        // Declaration first: that is what a caller binds to, and a
+                        // changed declaration outranks whatever the body did.
+                        //
+                        // `ExtractedSymbol::signature` is not used for this. It is
+                        // populated by only one grammar in this workspace — 80 of
+                        // ~2,300 sampled symbols, all Go — so comparing it makes
+                        // every Python, Rust and TypeScript signature change look
+                        // like a body change. The declaration hash is computed from
+                        // the tree and works wherever the grammar names a body.
+                        let declaration_moved = match (was.declaration_hash, now.declaration_hash) {
+                            (Some(a), Some(b)) => Some(a != b),
+                            _ => None,
+                        };
+                        let change = match declaration_moved {
+                            Some(true) => PreviewChange::SignatureChanged,
+                            Some(false) | None => match (was.body_signature, now.body_signature) {
+                                (Some(a), Some(b)) if a.exact != b.exact => {
+                                    if declaration_moved.is_none() {
+                                        // The body moved and nothing could tell
+                                        // whether the declaration did. Reported as
+                                        // the caller-affecting case, because
+                                        // under-reporting a break is the costlier
+                                        // error of the two.
+                                        PreviewChange::Changed
+                                    } else {
+                                        PreviewChange::BodyChanged
+                                    }
+                                }
+                                (Some(_), Some(_)) => continue,
+                                // Bodies not comparable. With an unchanged
+                                // declaration there is nothing to report; without
+                                // one, nothing was compared at all.
+                                _ => {
+                                    bodies_not_compared += 1;
+                                    continue;
+                                }
+                            },
+                        };
+                        symbols.push(PreviewSymbol {
+                            symbol_name: now.name.clone(),
+                            qualified_name: now.qualified_name.clone(),
+                            kind: now.kind.as_str().to_string(),
+                            change,
+                            was: was.signature.clone(),
+                            now: now.signature.clone(),
+                        });
+                    }
                 }
             }
-        }
-        for (qualified, was) in &old_by_name {
-            if new_by_name.contains_key(qualified) {
-                continue;
+            for (qualified, was) in &old_by_name {
+                if new_by_name.contains_key(qualified) {
+                    continue;
+                }
+                symbols.push(PreviewSymbol {
+                    symbol_name: was.name.clone(),
+                    qualified_name: was.qualified_name.clone(),
+                    kind: was.kind.as_str().to_string(),
+                    change: PreviewChange::Removed,
+                    was: was.signature.clone(),
+                    now: None,
+                });
             }
-            symbols.push(PreviewSymbol {
-                symbol_name: was.name.clone(),
-                qualified_name: was.qualified_name.clone(),
-                kind: was.kind.as_str().to_string(),
-                change: PreviewChange::Removed,
-                was: was.signature.clone(),
-                now: None,
+            symbols.sort_by(|a, b| {
+                (a.change as u8, &a.qualified_name).cmp(&(b.change as u8, &b.qualified_name))
             });
-        }
-        symbols.sort_by(|a, b| {
-            (a.change as u8, &a.qualified_name).cmp(&(b.change as u8, &b.qualified_name))
-        });
 
-        // Only removals and re-declarations can break a caller. A body change
-        // moves behaviour without touching the call site, and listing its
-        // callers would bury the cases that actually stop compiling.
-        let at_risk: Vec<String> = symbols
-            .iter()
-            .filter(|s| {
-                matches!(
-                    s.change,
-                    PreviewChange::Removed
-                        | PreviewChange::SignatureChanged
-                        | PreviewChange::Changed
-                )
-            })
-            // Qualified, not bare. Every `target_symbol` in `generation_edges`
-            // is `path::Name` — matching on the bare name finds nothing at all,
-            // and "no calls are affected" is a perfectly plausible-looking way
-            // for this feature to do nothing.
-            .map(|s| s.qualified_name.clone())
-            .collect();
-        // One snapshot for the list and the denominator it is measured
-        // against. Read separately they could describe two generations, and the
-        // `saturating_sub` below turns that into silence: when the newer
-        // generation holds fewer callers the difference clamps to zero and this
-        // reports that the confidence floor hid nothing. Drawn from one
-        // generation the floored set is a subset of the unfiltered one, so the
-        // subtraction cannot underflow at all.
-        let page = self.store.callers_page(&at_risk, path, min_confidence)?;
-        let (caller_edges, total_unfiltered) = match page {
-            Some(page) => (page.callers, page.total_unfiltered),
-            None => (Vec::new(), 0),
-        };
-        let callers: Vec<PreviewCaller> = caller_edges
-            .into_iter()
-            .map(|edge| PreviewCaller {
-                target_symbol: edge.target_symbol,
-                caller_file: edge.source_file,
-                caller_symbol: edge.source_symbol,
-                confidence: edge.confidence,
-            })
-            .collect();
-        // What the floor excluded. Reported rather than dropped: a symbol with
-        // no confident callers and 900 ambiguous ones is not the same situation
-        // as one nothing references, and the difference decides whether a
-        // reader should go and look.
-        // Counted, not built. This asked for every caller edge at floor 0.0 —
-        // six `String` allocations per row — solely to take `.len()`. On this
-        // repository the busiest symbol has 918 callers, so previewing a file
-        // that declares one materialised ~1,836 rows and kept none of them.
-        let ambiguous_callers = total_unfiltered.saturating_sub(callers.len());
+            // Only removals and re-declarations can break a caller. A body change
+            // moves behaviour without touching the call site, and listing its
+            // callers would bury the cases that actually stop compiling.
+            let at_risk: Vec<String> = symbols
+                .iter()
+                .filter(|s| {
+                    matches!(
+                        s.change,
+                        PreviewChange::Removed
+                            | PreviewChange::SignatureChanged
+                            | PreviewChange::Changed
+                    )
+                })
+                // Qualified, not bare. Every `target_symbol` in `generation_edges`
+                // is `path::Name` — matching on the bare name finds nothing at all,
+                // and "no calls are affected" is a perfectly plausible-looking way
+                // for this feature to do nothing.
+                .map(|s| s.qualified_name.clone())
+                .collect();
+            // One snapshot for the list and the denominator it is measured
+            // against. Read separately they could describe two generations, and the
+            // `saturating_sub` below turns that into silence: when the newer
+            // generation holds fewer callers the difference clamps to zero and this
+            // reports that the confidence floor hid nothing. Drawn from one
+            // generation the floored set is a subset of the unfiltered one, so the
+            // subtraction cannot underflow at all.
+            let page = self.store.callers_page(&at_risk, path, min_confidence)?;
+            let (caller_edges, total_unfiltered) = match page {
+                Some(page) => (page.callers, page.total_unfiltered),
+                None => (Vec::new(), 0),
+            };
+            let callers: Vec<PreviewCaller> = caller_edges
+                .into_iter()
+                .map(|edge| PreviewCaller {
+                    target_symbol: edge.target_symbol,
+                    caller_file: edge.source_file,
+                    caller_symbol: edge.source_symbol,
+                    confidence: edge.confidence,
+                })
+                .collect();
+            // What the floor excluded. Reported rather than dropped: a symbol with
+            // no confident callers and 900 ambiguous ones is not the same situation
+            // as one nothing references, and the difference decides whether a
+            // reader should go and look.
+            // Counted, not built. This asked for every caller edge at floor 0.0 —
+            // six `String` allocations per row — solely to take `.len()`. On this
+            // repository the busiest symbol has 918 callers, so previewing a file
+            // that declares one materialised ~1,836 rows and kept none of them.
+            let ambiguous_callers = total_unfiltered.saturating_sub(callers.len());
 
-        let degraded_reason = match &candidate.parse_outcome {
-            ParseOutcome::Partial { .. } => Some(
-                "the buffer parsed with errors; a symbol inside an error region \
+            let degraded_reason = match &candidate.parse_outcome {
+                ParseOutcome::Partial { .. } => Some(
+                    "the buffer parsed with errors; a symbol inside an error region \
                  is invisible to extraction and will appear here as removed"
-                    .to_string(),
-            ),
-            ParseOutcome::Fallback { .. } => Some(
-                "the buffer's language has no linked grammar, so declarations \
+                        .to_string(),
+                ),
+                ParseOutcome::Fallback { .. } => Some(
+                    "the buffer's language has no linked grammar, so declarations \
                  were recovered by pattern and carry no bodies; body changes \
                  cannot be detected"
-                    .to_string(),
-            ),
-            _ => None,
-        };
+                        .to_string(),
+                ),
+                _ => None,
+            };
 
-        // A read that failed outranks a parse note: without the previous
-        // content there is no comparison at all, so the delta is not merely
-        // "to be read with care", it is absent. `delta_available: false` is the
-        // gate the model documents for exactly this, and stating the errno is
-        // what lets a caller tell a permissions problem from a binary file.
-        let (delta_available, degraded_reason) = match read_failure {
-            Some(err) => (
-                false,
-                Some(format!(
-                    "the file on disk could not be read ({err}), so the buffer was compared \
+            // A read that failed outranks a parse note: without the previous
+            // content there is no comparison at all, so the delta is not merely
+            // "to be read with care", it is absent. `delta_available: false` is the
+            // gate the model documents for exactly this, and stating the errno is
+            // what lets a caller tell a permissions problem from a binary file.
+            let (delta_available, degraded_reason) = match read_failure {
+                Some(err) => (
+                    false,
+                    Some(format!(
+                        "the file on disk could not be read ({err}), so the buffer was compared \
 against nothing and no symbol can be reported as removed; this is not a clean delta"
-                )),
-            ),
-            None => (true, degraded_reason),
-        };
+                    )),
+                ),
+                None => (true, degraded_reason),
+            };
 
-        Ok(PreviewReport {
-            file_path: path.to_string(),
-            parse_status,
-            delta_available,
-            file_is_indexed,
-            compared_against: compared_against.to_string(),
-            degraded_reason,
-            symbols,
-            bodies_not_compared,
-            ambiguous_callers,
-            broken_callers: budget_take(callers, token_budget, |_| PREVIEW_CALLER_TOKENS),
+            Ok(PreviewReport {
+                file_path: path.to_string(),
+                parse_status,
+                delta_available,
+                file_is_indexed,
+                compared_against: compared_against.to_string(),
+                degraded_reason,
+                symbols,
+                bodies_not_compared,
+                ambiguous_callers,
+                broken_callers: budget_take(callers, token_budget, |_| PREVIEW_CALLER_TOKENS),
+            })
         })
-    })
     }
 }
 

@@ -245,6 +245,12 @@ struct PySearchPath {
     veto_all: bool,
 }
 
+/// `(file, scope)` → local name → the `(file, declared name)` that import binds, or none.
+type ScopedImportBindings = BTreeMap<(String, String), BTreeMap<String, Option<(String, String)>>>;
+
+/// `(file, parent scope, bare name)` → what that scope declares by that name.
+type ScopeChildren = BTreeMap<(String, String, String), Vec<(SymbolKind, Arc<str>)>>;
+
 pub struct Resolver {
     symbol_index: BTreeMap<String, Vec<IndexedSymbol>>,
     file_symbols: BTreeMap<String, Vec<String>>, // file_path -> symbol_names
@@ -435,8 +441,7 @@ pub struct Resolver {
     /// file or the scope imports the name from two places. The flat
     /// `import_bindings` keeps only module-scope imports for a name the module
     /// binds; this is where the function's own live.
-    python_scoped_import_bindings:
-        BTreeMap<(String, String), BTreeMap<String, Option<(String, String)>>>,
+    python_scoped_import_bindings: ScopedImportBindings,
     /// `(file, name)` that several functions import differently and the module
     /// does not import: the flat table holds one of them, so a read that no
     /// function's own scope answers has no binding.
@@ -578,7 +583,7 @@ pub struct Resolver {
     /// question per scope. Scanning every same-named symbol of the corpus per
     /// scope made a bare read cost O(types sharing the name): 2,000 types each
     /// declaring `id` retired 10.8x the instructions of 2,000 distinct names.
-    scope_children: BTreeMap<(String, String, String), Vec<(SymbolKind, Arc<str>)>>,
+    scope_children: ScopeChildren,
     go_modules: Vec<GoModule>,
     /// Whether `go_modules` was supplied for the snapshot currently indexed.
     ///

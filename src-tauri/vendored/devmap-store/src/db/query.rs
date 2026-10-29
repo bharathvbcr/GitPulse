@@ -2,8 +2,8 @@ use super::{
     append_kinds, append_languages, append_narrowing, append_paths, checked_min_confidence,
     checked_span, decode_stored_outcome, distinct_kinds, fts_failure, fts_match_query,
     literal_predicate, lock_conn, refusal, sqlite_limit, stored_symbol_from_row, CallersPage,
-    DeadPage, EdgeSide, FileEdges, IndexedFiles, KeywordNarrowing, LiteralPage, PathRanks, SearchNarrowing,
-    SearchPage, Store, StoredEdge, StoredFile, StoredLiteral, StoredSymbol,
+    DeadPage, EdgeSide, FileEdges, IndexedFiles, KeywordNarrowing, LiteralPage, PathRanks,
+    SearchNarrowing, SearchPage, Store, StoredEdge, StoredFile, StoredLiteral, StoredSymbol,
 };
 use crate::edge_index::{EdgeOrder, GenerationEdges, GenerationEdgesBuilder};
 use devmap_analyze::clones::CloneCandidate;
@@ -1062,17 +1062,20 @@ impl Store {
              ORDER BY e.confidence DESC, sp.path, tp.path,
                       e.source_symbol, e.target_symbol, e.edge_kind",
         )?;
-        let rows = stmt.query_map(params![gen, path, min_confidence, side == EdgeSide::Either], |row| {
-            Ok(StoredEdge {
-                source_file: row.get(0)?,
-                target_file: row.get(1)?,
-                source_symbol: row.get(2)?,
-                target_symbol: row.get(3)?,
-                edge_kind: row.get(4)?,
-                confidence: row.get(5)?,
-                resolution: row.get(6)?,
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![gen, path, min_confidence, side == EdgeSide::Either],
+            |row| {
+                Ok(StoredEdge {
+                    source_file: row.get(0)?,
+                    target_file: row.get(1)?,
+                    source_symbol: row.get(2)?,
+                    target_symbol: row.get(3)?,
+                    edge_kind: row.get(4)?,
+                    confidence: row.get(5)?,
+                    resolution: row.get(6)?,
+                })
+            },
+        )?;
         rows.collect()
     }
 

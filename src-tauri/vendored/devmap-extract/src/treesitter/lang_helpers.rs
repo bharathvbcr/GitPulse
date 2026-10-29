@@ -575,6 +575,11 @@ pub(super) fn enclosing_type_name(node: Node, source: &str) -> Option<String> {
     let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
         match parent.kind() {
+            // The class a Kotlin loss recovery wraps a statement in is not a
+            // class the source has; what it holds is not a member of anything.
+            "class_declaration" if crate::kotlinloss::is_recovery_wrapper(parent, source) => {
+                ancestor = bounded_parent(parent);
+            }
             "class_definition" | "class_declaration" | "abstract_class_declaration" => {
                 return get_child_text(parent, "name", source);
             }

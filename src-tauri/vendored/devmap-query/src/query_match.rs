@@ -62,7 +62,7 @@ fn looks_like_path(query: &str) -> bool {
         || (query.contains('.') && has_source_extension(query))
 }
 
-fn has_source_extension(query: &str) -> bool {
+pub(crate) fn has_source_extension(query: &str) -> bool {
     matches!(
         query.rsplit('.').next().unwrap_or(""),
         "go" | "py"

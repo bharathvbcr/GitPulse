@@ -1322,7 +1322,13 @@ fn holder_of(lease: &Lease) -> String {
 ///
 /// It is both the connection's `busy_timeout` and the budget `ensure_wal`
 /// spends, so a caller waits the same bounded time whichever lock it lands on.
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// Eighty `runs.prepare` writers on one file, the case
+/// `racing_preparations_never_exceed_a_raised_limit` runs, queue longer than
+/// five seconds on a loaded runner. The ones that gave up came back as a lock
+/// error rather than `capacity_reached`, so the ceiling was never filled
+/// (61 of 64). Thirty seconds covers that queue and is still a bound.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Runs `body` inside one write transaction that holds the write lock from its
 /// first statement, committing when it returns `Ok` and rolling back when it
@@ -1334,7 +1340,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// upgrade *without consulting the busy handler*: a writer holding the lock at
 /// that moment is SQLITE_BUSY, and one that committed since the read is
 /// SQLITE_BUSY_SNAPSHOT, because no amount of waiting makes a stale snapshot
-/// current. The connection's five-second busy timeout therefore never applies,
+/// current. The connection's busy timeout therefore never applies,
 /// and two writers meeting surface as "database is locked" rather than as the
 /// contention they are. Taking the write lock up front is what lets the
 /// timeout do its job. Every write path that reads before it writes goes
@@ -1679,7 +1685,10 @@ mod tests {
     fn a_review_that_could_vouch_for_nothing_is_refused() {
         let store = Store::open_in_memory().expect("open store");
         plant_task(&store, "TASK-R", "[]", "[]");
-        let huge = format!(r#"{{"x":"{}"}}"#, "a".repeat(records::MAX_REVIEW_RECORD_BYTES));
+        let huge = format!(
+            r#"{{"x":"{}"}}"#,
+            "a".repeat(records::MAX_REVIEW_RECORD_BYTES)
+        );
         for (task, criterion, subject, record, why) in [
             ("TASK-NONE", "AC-1", SUBJECT, REVIEW, "no task"),
             ("", "AC-1", SUBJECT, REVIEW, "task id"),

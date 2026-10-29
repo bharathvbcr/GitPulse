@@ -26,13 +26,18 @@
 //!
 //! Everything that names no identifier is dropped rather than recorded as text:
 //! `split_call_target` returns `Option` and `is_callee_identity` rejects
-//! expressions, which is the SC26/SC32 rule.
+//! expressions, which is the SC26/SC32 rule. A call whose name has no spelling
+//! at all — the zero-width `custom_operator` the grammar inserts when it
+//! recovers `x as? String ?? "d"` — is refused at the same gate and counted in
+//! one per-file diagnostic, because the file stays `Clean` and would otherwise
+//! carry no trace of it.
 
 use tree_sitter::Node;
 
 use crate::model::{ExtractedCall, ExtractedReference, ReferenceKind};
 use crate::treesitter::{
-    get_node_text, is_anonymous_callable, is_callee_identity, node_span, split_call_target,
+    get_node_text, is_anonymous_callable, is_callee_identity, node_span,
+    note_swift_unspelled_operator, split_call_target,
 };
 
 use super::scope::{clamp_receiver, enclosing_emitted_symbol, receiver_from};
@@ -52,6 +57,15 @@ pub fn extract_swift_call(
     let Some(call) = swift_call_identity(node, source) else {
         return;
     };
+    // A call with no spelling names nothing. tree-sitter-swift's recovery of
+    // `x as? String ?? "d"` inserts a hidden zero-width `custom_operator`, which
+    // would otherwise pass the operator exemption below as a call named `""`.
+    // Refused here, before that exemption, because both operator arms bypass
+    // `is_callee_identity`; the file says so in one diagnostic.
+    if call.callee_name.trim().is_empty() || call.name_node.byte_range().is_empty() {
+        note_swift_unspelled_operator();
+        return;
+    }
     // An operator's name is punctuation, which `is_callee_identity` refuses by
     // design for an *expression*. A `custom_operator` node is a declared
     // operator's own spelling, so it is an identity and passes.
@@ -303,6 +317,11 @@ fn swift_callee_target<'tree>(node: Node<'tree>) -> Option<Node<'tree>> {
 
 /// `receiver.method()`, including `receiver?.method()` and `receiver!.method()`.
 fn swift_navigation_call<'tree>(nav: Node<'tree>, source: &str) -> Option<SwiftCall<'tree>> {
+    // `b as? Color ?? .foo()`: the member hangs off a cast, so its receiver is
+    // cast text and no type. Refused, with the mirrored `Call` reference.
+    if swift_on_bare_cast(nav) {
+        return None;
+    }
     let suffix = nav.child_by_field_name("suffix")?;
     let name_node = suffix.child_by_field_name("suffix")?;
     let (callee_name, _) = split_call_target(name_node, source)?;
@@ -340,6 +359,37 @@ fn swift_navigation_call<'tree>(nav: Node<'tree>, source: &str) -> Option<SwiftC
         kind: ReferenceKind::Call,
         operator: false,
     })
+}
+
+/// Whether the member chain `chain` is based on an unparenthesised cast (`as`,
+/// `as?` or `as!`: any `as_expression`).
+///
+/// Swift's casts bind looser than postfix `.` and `()`, so a navigation chain
+/// whose base is an `as_expression` is **always** a misparse. tree-sitter-swift
+/// reads `b as? Color ?? .foo()` as `navigation_expression(as_expression
+/// "b as? Color ??", .foo)`, and `(b as? Foo.Bar)` as `(as_expression "b as?
+/// Foo", .Bar)`, without an error node. The member's owner is a type the site
+/// never spells, so a fact about it is refused rather than repaired: reading it
+/// from the leftmost operand would bind `b`'s type, a wrong edge. A parenthesised
+/// cast is a `tuple_expression`, a real operand, and is not this. Bounded at the
+/// same 16 steps as [`swift_sum_tail`]; a chain longer than that is not refused.
+pub(crate) fn swift_on_bare_cast(chain: Node) -> bool {
+    let mut node = chain;
+    for _ in 0..=16 {
+        node = match node.kind() {
+            "as_expression" => return true,
+            "navigation_expression" => match node.child_by_field_name("target") {
+                Some(target) => target,
+                None => return false,
+            },
+            "call_expression" => match swift_callee_target(node) {
+                Some(callee) => callee,
+                None => return false,
+            },
+            _ => return false,
+        };
+    }
+    false
 }
 
 /// The right operand of the sum at the base of a member chain: for

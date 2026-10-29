@@ -58,6 +58,12 @@ pub(super) fn unparsed_extraction(
         source_code: Some(source.to_string()),
         literals: Vec::new(),
         js_objects: Vec::new(),
+        jvm_decls: Vec::new(),
+        package_scopes: Vec::new(),
+        local_extents: Vec::new(),
+        decl_gaps: Vec::new(),
+        recovered_decl_ranges: Vec::new(),
+        dynamic_dispatch: Vec::new(),
     }
 }
 
@@ -276,6 +282,12 @@ pub(super) fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Ex
         source_code: Some(source.to_string()),
         literals: Vec::new(),
         js_objects: Vec::new(),
+        jvm_decls: Vec::new(),
+        package_scopes: Vec::new(),
+        local_extents: Vec::new(),
+        decl_gaps: Vec::new(),
+        recovered_decl_ranges: Vec::new(),
+        dynamic_dispatch: Vec::new(),
     }
 }
 

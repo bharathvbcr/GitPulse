@@ -13,6 +13,7 @@ pub mod cancel;
 pub mod code_graph;
 pub mod cypher;
 pub mod digest;
+pub mod doc_drift;
 pub mod engine;
 pub mod escape;
 pub mod evidence;
@@ -56,6 +57,7 @@ pub use code_graph::{
     CODE_GRAPH_COMPACT_ENCODING, CODE_GRAPH_EXPORT_MAX_BYTES, CODE_GRAPH_SCHEMA_VERSION,
     CODE_GRAPH_TOP_LEVEL_KEYS, EDGE_KIND_LABELS,
 };
+pub use doc_drift::{DocDriftFinding, DocDriftReport, DriftKind};
 pub use engine::{
     budget_take, clone_group_tokens, graph_core_for_store, graph_core_for_store_cancellable,
     is_test_path, link_candidates, parse_clone_kind, resolved_edge_from_stored, traversal_starts,

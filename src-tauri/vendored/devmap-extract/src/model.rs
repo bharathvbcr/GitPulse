@@ -486,7 +486,7 @@ mod line_index_tests {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TextRange {
     pub start_byte: usize,
     pub end_byte: usize,
@@ -1743,6 +1743,231 @@ pub struct Extraction {
     /// with it, because an empty list cannot say "not collected".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub js_objects: Vec<JsObjectFact>,
+    /// One fact per Kotlin/Java declaration that the `symbols` row cannot say:
+    /// its kind, modifiers, type-parameter names, header and body spans, a
+    /// type alias's target and a companion's name. Joined to a symbol by
+    /// `(qualified_name, start_byte)`; a companion, which is deliberately not a
+    /// symbol, is keyed by the host's `qualified_name` and its own start byte.
+    /// Sorted and deduplicated at emission.
+    ///
+    /// A side table and not a field on `ExtractedSymbol`, so a new declaration
+    /// fact never touches the ~35 sites that build a symbol by literal. Empty
+    /// for every other language. An extraction cached before schema v98 is
+    /// never served: an empty list cannot say "not collected".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jvm_decls: Vec<JvmDeclFact>,
+    /// The package or namespace each region of a Scala or C# file belongs to:
+    /// `package a.b`, chained `package a` / `package b` (which is `a.b`), block
+    /// forms, `namespace N { }` and the file-scoped `namespace N;` (which runs
+    /// to the end of the file). Sorted by start and deduplicated.
+    ///
+    /// One field for both languages, because the question is the same: which
+    /// package does the type declared at this byte live in. Kotlin and Java
+    /// keep their single header in [`Self::jvm_package`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub package_scopes: Vec<PackageScope>,
+    /// The extent of the enclosing block or lambda of each local binding a
+    /// Kotlin or Java callable declares, so a name is shadowed only where its
+    /// binding is in scope. [`Self::scope_locals`] stays the flat
+    /// `(scope, name)` list; this is its extent. Sorted and deduplicated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_extents: Vec<LocalExtent>,
+    /// Byte ranges where declarations may be missing from `symbols`: where the
+    /// Kotlin, Java or Scala grammar lost the construct after a parse error, or
+    /// parsed it as an expression. A reader that sees a name resolve to nothing
+    /// inside one of these ranges must abstain, not conclude the name is
+    /// undeclared. Sorted and deduplicated.
+    ///
+    /// Absence is a claim: `parse_outcome` alone cannot say *where* the loss
+    /// is, and a file that parsed clean can still have dropped a declaration.
+    ///
+    /// For Kotlin a range is listed here when the grammar read a declaration as
+    /// an expression and the extractor could **not** repair it: the same range
+    /// is in `parse_outcome`'s `error_ranges`, and nothing the grammar's
+    /// expression reading produced inside it is published. A range that was
+    /// repaired is in [`Self::recovered_decl_ranges`] instead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decl_gaps: Vec<TextRange>,
+    /// Byte ranges the grammar read as an expression and the extractor repaired:
+    /// a Kotlin statement such as `@A @B private fun f() {}` that parses with no
+    /// error and no declaration, re-parsed as the declaration it is, whose
+    /// symbols, calls and references replaced what the expression reading
+    /// produced there. Inside one of these ranges `symbols` is complete, so a
+    /// reader need not abstain; the range exists so that a repair is visible
+    /// rather than indistinguishable from a file the grammar read correctly.
+    /// `parse_outcome` is `Clean` again unless something else is wrong with the
+    /// file. Also the top-level statements of a Kotlin file in which a `;` was
+    /// written over a space so that a one-line class body parses (see
+    /// `kotlinsemi`); the text and every offset are the file's own.
+    /// Sorted and deduplicated; empty for every language but Kotlin.
+    ///
+    /// Apart from [`Self::decl_gaps`] on purpose: that field means "a resolver
+    /// must abstain inside", and a repaired range is the opposite claim.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recovered_decl_ranges: Vec<TextRange>,
+    /// Calls whose target is chosen at run time and that no `calls` row can
+    /// name: Python's `getattr(o, 'cmd_' + n)()`. A side table and not an
+    /// `ExtractedCall`, so a fake callee name never reaches the resolver.
+    /// Sorted and deduplicated; empty for every other language.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dynamic_dispatch: Vec<DynamicDispatch>,
+}
+
+/// What a [`JvmDeclFact`] declares. Not the symbol kind: a companion is a fact
+/// and never a symbol, and a type alias is a fact with no symbol row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JvmDeclKind {
+    /// A class, interface, object, enum, record or annotation type.
+    Type,
+    /// A function, method or constructor.
+    Callable,
+    /// A Kotlin `companion object`, whose members belong to its host.
+    Companion,
+    /// A Kotlin `typealias`.
+    TypeAlias,
+}
+
+/// The modifiers of a [`JvmDeclFact`], as a bitset.
+///
+/// A named type and not a bare `u16`, so a reader asks `contains(PRIVATE)` and
+/// never masks a literal. The bit values are part of the stored payload: a
+/// bit is only ever added, never renumbered, and a new bit is an extraction
+/// schema bump.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct JvmModifiers(u16);
+
+impl JvmModifiers {
+    /// A Kotlin `inner` class: it holds a reference to an instance of its outer
+    /// class.
+    pub const INNER: Self = Self(1 << 0);
+    /// A Java `static` nested type or member.
+    pub const STATIC: Self = Self(1 << 1);
+    /// A Kotlin `internal` declaration: visible within its module.
+    pub const INTERNAL: Self = Self(1 << 2);
+    /// `protected`.
+    pub const PROTECTED: Self = Self(1 << 3);
+    /// A Java declaration with no `public`, `protected` or `private`.
+    pub const PACKAGE_PRIVATE: Self = Self(1 << 4);
+    /// `private`.
+    pub const PRIVATE: Self = Self(1 << 5);
+    /// `abstract`.
+    pub const ABSTRACT: Self = Self(1 << 6);
+    /// A Kotlin `open` declaration: it may be overridden or subclassed.
+    pub const OPEN: Self = Self(1 << 7);
+    /// A Kotlin `data` class.
+    pub const DATA: Self = Self(1 << 8);
+
+    /// No modifier.
+    pub const EMPTY: Self = Self(0);
+
+    /// Whether no modifier is set.
+    pub fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+
+    /// Whether every bit of `other` is set.
+    pub fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// This set with the bits of `other` added.
+    #[must_use]
+    pub fn with(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+/// One Kotlin or Java declaration's facts. See [`Extraction::jvm_decls`].
+///
+/// Every span is a [`TextRange`] in the file's own byte coordinates. A fact
+/// the extractor could not read is `None`, never an empty value: an empty
+/// `type_params` means the declaration has none, and a walk that hit its cap
+/// must say so in the extraction's diagnostics rather than return a short list.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct JvmDeclFact {
+    /// The symbol this is a fact about, or for a companion the host's.
+    pub qualified_name: String,
+    /// Start byte of the declaration. With `qualified_name` this is the key:
+    /// two overloads share a name and never a start.
+    pub start_byte: usize,
+    pub kind: JvmDeclKind,
+    #[serde(default, skip_serializing_if = "JvmModifiers::is_empty")]
+    pub modifiers: JvmModifiers,
+    /// Type-parameter names in source order, names only (`T`, not `T : Any`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub type_params: Vec<String>,
+    /// From the start of the declaration to the start of its body: supertype
+    /// list, primary constructor, annotation arguments, `where` clause,
+    /// type-parameter bounds, delegation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<TextRange>,
+    /// The body block, when the declaration has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<TextRange>,
+    /// A type alias's right-hand side, trimmed. Only for
+    /// [`JvmDeclKind::TypeAlias`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_target: Option<String>,
+    /// A named companion's name. Only for [`JvmDeclKind::Companion`]; `None`
+    /// is the default name, `Companion`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub companion_name: Option<String>,
+}
+
+/// A region of a Scala or C# file and the package or namespace it declares. See
+/// [`Extraction::package_scopes`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PackageScope {
+    /// The dotted, fully chained name: `a.b` for `package a` then `package b`.
+    pub name: String,
+    pub span: TextRange,
+}
+
+/// The extent a local binding is in scope over. See
+/// [`Extraction::local_extents`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LocalExtent {
+    /// The enclosing callable's qualified name, the same string
+    /// `ExtractedCall::caller_symbol` and `scope_locals` use.
+    pub scope: String,
+    pub name: String,
+    /// From the binding to the end of its enclosing block or lambda.
+    pub extent: TextRange,
+}
+
+/// How a [`DynamicDispatch`] picks its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DynamicDispatchKind {
+    /// `getattr(receiver, name)(..)`: the callee is itself a call.
+    Getattr,
+}
+
+/// One site that calls something chosen at run time. See
+/// [`Extraction::dynamic_dispatch`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DynamicDispatch {
+    /// The enclosing callable, as `ExtractedCall::caller_symbol` spells it;
+    /// `None` at module level.
+    pub caller_symbol: Option<String>,
+    /// Start byte of the outer call.
+    pub start_byte: usize,
+    pub kind: DynamicDispatchKind,
+    /// The dispatched-on expression, when written (`self`, `mod`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<String>,
+    /// The literal prefix of the name argument: `cmd_` for `'cmd_' + n`, the
+    /// whole string for a literal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_prefix: Option<String>,
+    /// Whether the name argument is exactly one string literal, so the target
+    /// is `name_prefix` and not a family.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub name_is_literal: bool,
 }
 
 /// One statement that decides what members a JS/TS module-scope object has.

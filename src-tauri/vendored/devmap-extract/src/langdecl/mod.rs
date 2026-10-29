@@ -54,6 +54,7 @@ use crate::model::{SymbolKind, WiringKind};
 pub(crate) mod access;
 pub(crate) mod dart;
 pub(crate) mod erlang;
+pub(crate) mod java;
 pub(crate) mod kotlin;
 pub(crate) mod nix;
 pub(crate) mod pascal;
@@ -128,6 +129,7 @@ pub(crate) fn declaration_of(lang: &str, node: Node, source: &str) -> Option<Dec
     match lang {
         "swift" => swift::declaration(node, source),
         "kotlin" => kotlin::declaration(node, source),
+        "java" => java::declaration(node, source),
         "dart" => dart::declaration(node, source),
         "r" => r::declaration(node, source),
         "erlang" => erlang::declaration(node, source),

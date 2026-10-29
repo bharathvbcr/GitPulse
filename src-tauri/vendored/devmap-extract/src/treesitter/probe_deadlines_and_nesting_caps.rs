@@ -220,3 +220,34 @@ fn a_deep_let_initializer_still_answers_same_name_shadowing() {
         );
     }
 }
+
+#[test]
+fn a_nested_guard_gives_the_outer_files_swift_refusal_counts_back() {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let _outer = BudgetGuard::arm(deadline);
+    note_swift_unspelled_operator();
+    note_swift_unspelled_operator();
+    note_swift_bare_cast_member();
+    {
+        // An extraction run by an extraction starts from zero, as a file does.
+        let _inner = BudgetGuard::arm(deadline);
+        assert!(take_swift_unspelled_operator_notes().is_empty());
+        assert!(take_swift_bare_cast_member_notes().is_empty());
+        note_swift_unspelled_operator();
+        note_swift_bare_cast_member();
+        note_swift_bare_cast_member();
+        note_swift_bare_cast_member();
+    }
+    assert_eq!(
+        take_swift_unspelled_operator_notes(),
+        vec![
+            "swift: refused 2 call(s) on an operator the grammar inserted with no spelling"
+                .to_string()
+        ],
+        "the inner file's count must not replace the outer file's"
+    );
+    assert_eq!(
+        take_swift_bare_cast_member_notes(),
+        vec!["swift: refused 1 member reference(s) the grammar read off a bare cast".to_string()]
+    );
+}

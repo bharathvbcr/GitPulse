@@ -4078,3 +4078,107 @@ fn linked_grammar_keys_cover_every_grammar_for_arm() {
     );
     assert_eq!(count, linked_grammar_keys().len());
 }
+
+/// The Kotlin loss detector's two ways of not finishing are reported by the
+/// outcome, never read as "nothing lost".
+fn kotlin_root_outcome(lost: &crate::kotlinloss::LostScan) -> (usize, ParseOutcome) {
+    let source = "fun f() {}\n";
+    let (_, language) = grammar_for("kotlin").expect("kotlin grammar");
+    let mut parser = Parser::new();
+    parser.set_language(&language).expect("load grammar");
+    let tree = parser.parse(source, None).expect("tree");
+    (
+        source.len(),
+        parse_outcome_of(tree.root_node(), source, false, false, true, lost),
+    )
+}
+
+#[test]
+fn a_kotlin_loss_scan_stopped_by_its_node_cap_charges_the_whole_file() {
+    let lost = crate::kotlinloss::LostScan {
+        capped: true,
+        ..Default::default()
+    };
+    let (len, outcome) = kotlin_root_outcome(&lost);
+    let ParseOutcome::Partial { error_ranges, .. } = outcome else {
+        panic!("a capped scan is not Clean: {outcome:?}");
+    };
+    assert_eq!(
+        error_ranges,
+        vec![TextRange {
+            start_byte: 0,
+            end_byte: len
+        }]
+    );
+}
+
+#[test]
+fn a_kotlin_loss_scan_stopped_by_the_deadline_fails_the_outcome() {
+    let lost = crate::kotlinloss::LostScan {
+        deadline_passed: true,
+        ..Default::default()
+    };
+    let (_, outcome) = kotlin_root_outcome(&lost);
+    assert!(
+        matches!(&outcome, ParseOutcome::Failed { reason } if reason.contains("budget")),
+        "{outcome:?}"
+    );
+}
+
+thread_local! {
+    /// Whether the thread's walk deadline was armed each time the finalization
+    /// hook ran, in order. The hook is one-shot and the recovery's inner
+    /// extraction runs first and takes it, so the hook puts itself back: the
+    /// last entry is the outer file's, after the recovery and every other phase.
+    static DEADLINE_ARMED_AT_FINISH: std::cell::RefCell<Vec<bool>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn note_deadline_at_finish() {
+    let armed = WALK_DEADLINE.with(|slot| slot.get().is_some());
+    DEADLINE_ARMED_AT_FINISH.with(|seen| seen.borrow_mut().push(armed));
+    EXTRACTION_FINISH_HOOK.with(|slot| slot.set(Some(note_deadline_at_finish)));
+}
+
+/// A recovery runs an extraction inside the file's extraction. Its budget guard
+/// used to disarm the thread's deadline when it dropped, so every phase of the
+/// outer file after it (and the publication gate's helpers) ran against a clock
+/// that was off. The outer deadline is armed again afterwards. Fails against
+/// `974edaa3`.
+#[test]
+fn the_walk_deadline_is_armed_again_after_a_kotlin_recovery() {
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            EXTRACTION_FINISH_HOOK.with(|hook| hook.set(None));
+        }
+    }
+    let _clear = ClearHook;
+    DEADLINE_ARMED_AT_FINISH.with(|seen| seen.borrow_mut().clear());
+    EXTRACTION_FINISH_HOOK.with(|slot| slot.set(Some(note_deadline_at_finish)));
+    let extraction = extract_treesitter_with_budget(
+        "A.kt",
+        "kotlin",
+        "@A\n@B\nprivate fun f() {}\nfun after() {}\n",
+        std::time::Duration::from_secs(30),
+    );
+    assert!(
+        extraction
+            .symbols
+            .iter()
+            .any(|symbol| symbol.qualified_name == "A.kt::f"),
+        "the statement was recovered, so an inner extraction ran: {:?}",
+        extraction.diagnostics
+    );
+    let seen = DEADLINE_ARMED_AT_FINISH.with(|seen| seen.borrow().clone());
+    assert_eq!(
+        seen.len(),
+        2,
+        "the recovery's inner extraction finished, then the outer file: {seen:?}"
+    );
+    assert_eq!(
+        seen.last(),
+        Some(&true),
+        "the deadline must be armed when the outer file finishes"
+    );
+}

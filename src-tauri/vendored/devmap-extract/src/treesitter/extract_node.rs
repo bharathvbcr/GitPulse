@@ -1542,7 +1542,11 @@ pub(super) fn extract_node(
             // Declaration identity, kind and visibility all come from the
             // language's own module in `langdecl`, which is the single owner of
             // the answer `langcalls::scope` mirrors for caller attribution.
-            if let Some(declaration) = crate::langdecl::declaration_of(lang, node, source) {
+            // Not inside a statement the Kotlin loss detector charged: what the
+            // grammar's expression reading made of it is not a declaration.
+            if let Some(declaration) = crate::langdecl::declaration_of(lang, node, source)
+                .filter(|_| !in_charged_region(node))
+            {
                 let qualified = declaration.qualified(file_symbol_name);
                 let name = declaration.name.clone();
                 if declaration.declared_kind == SymbolKind::Function
@@ -1607,7 +1611,9 @@ pub(super) fn extract_node(
                 // declared type is the only typed binding available when the
                 // function did not construct the value. Without it, C-family
                 // method calls on parameters (`s.compute(1)`) stay uninferred.
-                if c_family && declaration.declared_kind == SymbolKind::Function {
+                if binds_param_types_in_generic_arm(lang)
+                    && declaration.declared_kind == SymbolKind::Function
+                {
                     for (param, type_name, qualifier) in param_type_bindings(node, source, lang) {
                         let scope = node.child_by_field_name("body").and_then(|body| {
                             enclosing_callable_qualified(body, source, file_symbol_name)

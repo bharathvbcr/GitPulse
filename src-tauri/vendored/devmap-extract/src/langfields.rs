@@ -258,13 +258,26 @@ fn field_of(lang: &str, node: Node, source: &str) -> Option<FieldType> {
             )
         }
         // Swift's `name:` is a pattern wrapping the binding; the type sits in a
-        // sibling `type_annotation` rather than on a `type:` field.
-        "swift" => plain(
-            node.child_by_field_name("name")
-                .and_then(|pattern| declarator_name(pattern, source, 0)),
-            node.named_children(&mut node.walk())
-                .find(|child| child.kind() == "type_annotation"),
-        ),
+        // sibling `type_annotation` rather than on a `type:` field. A property
+        // wrapper with no annotation states its type on `wrappedValue`.
+        "swift" => {
+            let name = node
+                .child_by_field_name("name")
+                .and_then(|pattern| declarator_name(pattern, source, 0));
+            let annotation = node
+                .named_children(&mut node.walk())
+                .find(|child| child.kind() == "type_annotation");
+            let type_name = if let Some(annotation) = annotation {
+                nominal_type_name(annotation, source, 0)
+            } else {
+                crate::swiftscope::property_wrapper_wrapped_type(node, source)
+            };
+            Some(FieldType {
+                name: name?,
+                type_name,
+                qualifier: None,
+            })
+        }
         // Kotlin pairs them positionally inside `variable_declaration`, and a
         // parameter pairs its name and type as two bare siblings.
         "kotlin" => kotlin_field(node, source),

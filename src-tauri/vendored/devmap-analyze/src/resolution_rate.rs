@@ -17,9 +17,9 @@
 //!   regression golden files structurally cannot catch.
 
 use devmap_extract::model::{EdgeKind, Extraction};
+use devmap_extract::wiring::is_vendored_path;
 use devmap_resolve::model::{Resolution, ResolutionResult, ResolvedEdge, UnresolvedReference};
 use serde::{Deserialize, Serialize};
-use devmap_extract::wiring::is_vendored_path;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Permille rather than a float, and `Option` rather than a sentinel.

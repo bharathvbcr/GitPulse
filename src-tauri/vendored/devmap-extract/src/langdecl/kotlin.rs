@@ -48,6 +48,10 @@ pub(crate) fn declaration(node: Node, source: &str) -> Option<Declaration> {
 /// the walk is what produces that name.
 fn self_identity(node: Node, source: &str) -> Option<(SymbolKind, String)> {
     match node.kind() {
+        // The class the loss recovery wraps a swallowed statement in is not a
+        // class the source has. It owns nothing, so what it holds is named as
+        // the top-level declaration it is.
+        "class_declaration" if crate::kotlinloss::is_recovery_wrapper(node, source) => None,
         "class_declaration" => Some((
             class_kind(node, source),
             get_child_text(node, "name", source)?,

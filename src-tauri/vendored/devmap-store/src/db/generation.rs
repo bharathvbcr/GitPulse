@@ -851,6 +851,29 @@ impl Store {
     /// Inspect store health and verify its snapshot against the current tree.
     /// A quiet queue alone says nothing about edits made without a watcher.
     pub fn status(&self, db_path: &str) -> Result<StoreStatus> {
+        self.status_inner(db_path, None)
+    }
+
+    /// [`Self::status`] whose tree walk stops when `cancel` is set.
+    ///
+    /// A cancelled walk is an error (`devmap_extract::BuildCancelled`, found by
+    /// downcast), never a status: the walk did not finish, so no verdict is
+    /// remembered and the previous one is left to the pending-queue and
+    /// generation guards. Used by the daemon's post-drain verification, which a
+    /// shutdown must not wait for.
+    pub fn status_cancellable(
+        &self,
+        db_path: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<StoreStatus> {
+        self.status_inner(db_path, Some(cancel))
+    }
+
+    fn status_inner(
+        &self,
+        db_path: &str,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<StoreStatus> {
         let mut status = self.status_snapshot(db_path)?;
         if let Some(generation) = status.latest_generation {
             if status.pending_count == 0 && status.degraded_reason.is_none() {
@@ -862,7 +885,7 @@ impl Store {
                         Err(error) => (None, Some(format!("analyzer freshness unverified: {error}"))),
                     };
                 let (source_freshness, source_reason, source_delta) =
-                    self.source_snapshot_mismatch(generation)?;
+                    self.source_snapshot_mismatch(generation, cancel)?;
                 status.source_freshness = source_freshness;
                 status.source_delta = source_delta;
                 status.analyzer_freshness = analyzer_freshness;
@@ -910,9 +933,7 @@ impl Store {
         // A remembered verdict describes the tree as `status` last walked it. Edits
         // the watcher has queued since then end that verdict without changing the
         // generation id, so a non-empty queue means the cache cannot speak.
-        let queued: Result<i64> = lock_conn(&self.conn).and_then(|conn| {
-            Ok(conn.query_row("SELECT COUNT(*) FROM pending_paths", [], |row| row.get(0))?)
-        });
+        let queued: Result<i64> = self.queued_path_count();
         match queued {
             Ok(0) => {}
             Ok(count) => {
@@ -971,6 +992,7 @@ generation {latest}; run `devmap status` to re-verify",
     fn source_snapshot_mismatch(
         &self,
         generation: u32,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(Option<bool>, Option<String>, Option<SourceTreeDelta>)> {
         let Some(root) = self.latest_repo_root()? else {
             return Ok((
@@ -984,8 +1006,20 @@ generation {latest}; run `devmap status` to re-verify",
         };
         let hashes = self.latest_file_hashes()?;
         let stored = self.latest_discovery_inventory()?;
-        let scanned = match devmap_extract::scan_tree(Path::new(&root)) {
+        let scan = match cancel {
+            Some(flag) => devmap_extract::scan_tree_cancellable(Path::new(&root), flag),
+            None => devmap_extract::scan_tree(Path::new(&root)),
+        };
+        let scanned = match scan {
             Ok(scanned) => scanned,
+            // A walk the caller stopped is not a walk that found a problem:
+            // it carries no verdict at all, so it is an error and not an
+            // "unverified" status that would be remembered for the generation.
+            Err(error) if error.is::<devmap_extract::BuildCancelled>() => {
+                return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                    devmap_extract::BuildCancelled,
+                )))
+            }
             Err(error) => {
                 return Ok((
                     None,

@@ -406,7 +406,10 @@ pub fn git_version(git: &Path) -> Result<Option<GitVersion>, Failure> {
 /// each of those off from the command line, which outranks every config file:
 ///
 /// * before the subcommand: `core.fsmonitor=false`, `core.hooksPath` at the
-///   null device (no hook can be found there), `log.showSignature=false`;
+///   null device (no hook can be found there), `log.showSignature=false`,
+///   `core.useReplaceRefs=false` (a `git replace` ref rewrites history at read
+///   time: a commit that adds a credential, replaced by a clean twin, is read
+///   as the twin by every diff, log and show);
 /// * after `diff`, `log` or `show`: `--no-ext-diff --no-textconv --no-color`;
 /// * after `blame`: `--no-textconv`;
 /// * after `diff` and `status`: `--ignore-submodules=dirty`. Asked whether a
@@ -445,6 +448,8 @@ where
         format!("core.hooksPath={NULL_DEVICE}"),
         "-c".to_string(),
         "log.showSignature=false".to_string(),
+        "-c".to_string(),
+        "core.useReplaceRefs=false".to_string(),
     ]
     .into_iter()
     .map(std::ffi::OsString::from)
@@ -1548,6 +1553,8 @@ mod tests {
             format!("core.hooksPath={null}"),
             "-c".to_string(),
             "log.showSignature=false".to_string(),
+            "-c".to_string(),
+            "core.useReplaceRefs=false".to_string(),
         ];
         let cases: &[(&[&str], &[&str])] = &[
             (
@@ -1791,6 +1798,75 @@ mod tests {
             "{}",
             captured.stdout_lossy()
         );
+    }
+
+    /// A `git replace` ref rewrites history at read time. A read through the
+    /// seam sees the commit that was made, not the clean twin an agent put in
+    /// its place, while the same read without the guard sees the twin.
+    #[cfg(unix)]
+    #[test]
+    fn a_replace_ref_does_not_rewrite_what_a_read_through_the_seam_sees() {
+        let base = Scratch::new("replace");
+        let root = base.0.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| -> String {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["-c", "user.email=a@example.test", "-c", "user.name=a"])
+                .args(args)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-qm", "base"]);
+        std::fs::write(root.join("keys.txt"), "ORIGINAL-ADDED-LINE\n").unwrap();
+        git(&["add", "keys.txt"]);
+        git(&["commit", "-qm", "adds the secret"]);
+        let bad = git(&["rev-parse", "HEAD"]);
+        let tree = git(&["rev-parse", &format!("{bad}^^{{tree}}")]);
+        let parent = git(&["rev-parse", &format!("{bad}^")]);
+        let clean = git(&["commit-tree", &tree, "-p", &parent, "-m", "clean twin"]);
+        git(&["replace", &bad, &clean]);
+
+        let subjects = |guarded: bool| -> String {
+            let mut command = if guarded {
+                git_with_program(OsStr::new("git"), &root, ["log", "--format=%s", "-1", &bad])
+                    .unwrap()
+            } else {
+                let mut c = Command::new("git");
+                c.arg("-C")
+                    .arg(&root)
+                    .args(["log", "--format=%s", "-1", &bad]);
+                c
+            };
+            let captured = run_bounded(
+                &mut command,
+                Bounds {
+                    deadline: Duration::from_secs(10),
+                    stdout_cap: 1 << 20,
+                    stderr_cap: 4096,
+                },
+            )
+            .unwrap();
+            assert!(captured.status.success(), "{}", captured.stderr_trimmed());
+            captured.stdout_lossy().trim().to_string()
+        };
+        assert_eq!(
+            subjects(false),
+            "clean twin",
+            "the control read does not honour the replace ref, so this test proves nothing"
+        );
+        assert_eq!(subjects(true), "adds the secret");
     }
 
     /// A filter listing too large to read whole is refused: a truncated one

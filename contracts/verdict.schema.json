@@ -93,6 +93,7 @@
         "command.directory_change",
         "path.secret_read",
         "command.secret_read",
+        "command.harness_only",
         "command.operand.unverifiable",
         "path.engine_unavailable",
         "command.engine_unavailable"
@@ -127,6 +128,7 @@
         "command.directory_change": { "const": "hard" },
         "path.secret_read": { "const": "hard" },
         "command.secret_read": { "const": "hard" },
+        "command.harness_only": { "const": "hard" },
         "command.operand.unverifiable": { "const": "hard" },
         "path.engine_unavailable": { "const": "hard" },
         "command.engine_unavailable": { "const": "hard" }

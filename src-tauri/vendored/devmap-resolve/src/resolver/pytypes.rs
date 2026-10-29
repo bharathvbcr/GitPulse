@@ -1259,13 +1259,10 @@ impl Resolver {
                     _ => return None,
                 }
             }
-            let Some(parent) = self
+            let parent = self
                 .symbol_parents
                 .get(&(file.to_string(), current.clone()))
-                .filter(|parent| parent.as_str() != file && **parent != current)
-            else {
-                return None;
-            };
+                .filter(|parent| parent.as_str() != file && **parent != current)?;
             current = parent.clone();
         }
         Some(ScopeHit::Local)

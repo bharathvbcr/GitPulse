@@ -59,6 +59,17 @@ pub(super) fn maybe_push_name_reference(
     {
         return;
     }
+    // The member of a chain the grammar hung off a bare cast, counted and
+    // refused here, before every spelling rule below: a member whose name a
+    // local or parameter shadows, or that is backticked, would otherwise return
+    // first and leave the call `swift_navigation_call` refused unrecorded. One
+    // arm with one `return`, so each refused member is counted exactly once by
+    // structure. `b` itself is the target, not the suffix, and stays. The shape
+    // guard is two `bounded_parent` hops, so the cost stays small.
+    if lang == "swift" && swift_member_of_bare_cast(node) {
+        note_swift_bare_cast_member();
+        return;
+    }
     let name = get_node_text(node, source);
     if !is_user_ident(&name) {
         return;
@@ -109,6 +120,27 @@ pub(super) fn maybe_push_name_reference(
         // `cfg.enabled` from a bare local named `enabled`.
         receiver_expr: member_access_receiver(node, source),
     });
+}
+
+/// Whether `node` is the member name of a navigation chain based on a bare
+/// `as?`/`as!` (see [`crate::langcalls::swift::swift_on_bare_cast`]).
+///
+/// Shape-guarded to the `suffix` field of a `navigation_suffix` under a
+/// `navigation_expression`, as `member_access_receiver` reads a member, so the
+/// cast's own operand is never asked.
+fn swift_member_of_bare_cast(node: Node) -> bool {
+    bounded_parent(node)
+        .filter(|suffix| {
+            suffix.kind() == "navigation_suffix"
+                && suffix
+                    .child_by_field_name("suffix")
+                    .is_some_and(|member| member.id() == node.id())
+        })
+        .and_then(bounded_parent)
+        .is_some_and(|nav| {
+            nav.kind() == "navigation_expression"
+                && crate::langcalls::swift::swift_on_bare_cast(nav)
+        })
 }
 
 /// Whether `node` is the member name of a `recv.name` written inside a macro's

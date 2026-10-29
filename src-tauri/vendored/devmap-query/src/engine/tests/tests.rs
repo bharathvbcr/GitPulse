@@ -533,3 +533,90 @@ fn scoped_trace_budget_never_returns_a_misleading_prefix() {
     assert!(response.truncated);
     assert_eq!(response.tokens_used, 0);
 }
+
+/// AUDIT G24: a budget-truncated caller list drops the noisy edges first.
+///
+/// The Python `query_symbol` ignored edge confidence, so a name collision's
+/// ambiguous fan-out filled the 50 caller slots and pushed the proven callers
+/// off the page. Here the ambiguous edges are *inserted first* and outnumber the
+/// confident ones, so only an explicit confidence-descending order puts the
+/// proven callers inside a four-item budget.
+fn confidence_fixture() -> ResolutionResult {
+    let mut resolution = Resolver::new()
+        .resolve_all(&[])
+        .expect("an empty resolution");
+    let mut edges: Vec<ResolvedEdge> = (0..8)
+        .map(|index| path_edge(&format!("ambiguous_{index}"), "hub", 0.3))
+        .collect();
+    edges.extend((0..4).map(|index| path_edge(&format!("proven_{index}"), "hub", 1.0)));
+    resolution.edges = edges;
+    resolution
+}
+
+fn assert_proven_callers_fill_the_page(
+    confidences: &[f32],
+    total: u32,
+    shown: u32,
+    truncated: bool,
+) {
+    assert_eq!(total, 12, "every caller is counted before truncation");
+    assert_eq!(shown, 4, "a 100-token budget at 25 per edge holds four");
+    assert!(
+        truncated,
+        "eight callers did not fit, and the answer says so"
+    );
+    assert!(
+        confidences.iter().all(|confidence| *confidence == 1.0),
+        "truncation kept an ambiguous caller over a proven one: {confidences:?}"
+    );
+}
+
+#[test]
+fn g24_a_truncated_caller_list_keeps_the_proven_callers_over_ambiguous_ones() {
+    let resolution = confidence_fixture();
+    let engine = QueryEngine::new(&[], &resolution);
+    let response = engine.impact(Request {
+        query: "hub".to_string(),
+        token_budget: 100,
+        min_confidence: 0.0,
+        max_depth: 1,
+    });
+    let confidences: Vec<f32> = response
+        .items
+        .iter()
+        .map(|edge| edge.confidence.0)
+        .collect();
+    assert_proven_callers_fill_the_page(
+        &confidences,
+        response.total,
+        response.shown,
+        response.truncated,
+    );
+}
+
+#[test]
+fn g24_the_store_engine_truncates_callers_in_the_same_order() {
+    let resolution = confidence_fixture();
+    let analysis = devmap_analyze::analyze(&[], &resolution);
+    let store = Store::open_in_memory().unwrap();
+    store.save_generation(&[], &resolution, &analysis).unwrap();
+    let response = StoreQueryEngine::new(&store)
+        .impact(Request {
+            query: "hub".to_string(),
+            token_budget: 100,
+            min_confidence: 0.0,
+            max_depth: 1,
+        })
+        .expect("impact over the stored edges");
+    let confidences: Vec<f32> = response
+        .items
+        .iter()
+        .map(|edge| edge.confidence.0)
+        .collect();
+    assert_proven_callers_fill_the_page(
+        &confidences,
+        response.total,
+        response.shown,
+        response.truncated,
+    );
+}

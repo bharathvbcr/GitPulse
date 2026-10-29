@@ -2049,6 +2049,112 @@ mod session_bounds {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// AUDIT X12: a server that stops reading while the client keeps writing
+    /// cannot wedge the client. The Python held its write lock across a
+    /// blocking pipe write, and the reader thread needed that lock to drain
+    /// the server's replies, so a full pipe deadlocked both. Here a server
+    /// answers `initialize` and then never reads stdin again; the client's
+    /// writes must end in `TimedOut`, not block. The loop runs on its own
+    /// thread so a regression fails after ten seconds instead of hanging the
+    /// suite.
+    #[test]
+    fn x12_a_server_that_stops_reading_cannot_wedge_the_client_writes() {
+        let dir = std::env::temp_dir().join(format!("lsp-x12-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("server.pid");
+        // `exec` keeps the shell's pid for the sleeping server, so the pid file
+        // names the process the client must have killed.
+        let script = format!(
+            "echo $$ > {}; printf 'Content-Length: 36\\r\\n\\r\\n{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}'; exec sleep 60",
+            pidfile.display()
+        );
+        let (done, outcome) = mpsc::channel();
+        let (release, hold) = mpsc::channel::<()>();
+        thread::spawn(move || {
+            let started = Instant::now();
+            let mut client = LspClient::spawn(
+                &spec(script),
+                Path::new("sh"),
+                &std::env::temp_dir(),
+                started + Duration::from_secs(5),
+            )
+            .unwrap_or_else(|e| panic!("initialize was answered: {e:?}"));
+            // 200 frames of 200 KB against a 64 KB pipe and a 16-frame queue.
+            let filler = "A".repeat(200_000);
+            let result = (0..200).try_for_each(|_| {
+                client.notify("textDocument/didChange", json!({ "text": filler }))
+            });
+            let _ = done.send((result, started.elapsed()));
+            // Held until the assertions below have looked at the server:
+            // dropping the client reaps it too, which would hide a write path
+            // that gave up without killing anything.
+            let _ = hold.recv_timeout(Duration::from_secs(20));
+            drop(client);
+        });
+        let (result, elapsed) = outcome
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the client blocked writing to a server that stopped reading");
+        assert!(
+            matches!(result, Err(LspDidNotRun::TimedOut)),
+            "a backed-up writer must end the session as TimedOut, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "took {elapsed:?} against a 5s deadline"
+        );
+        // Ending the session is the kill, not just the error: a server left
+        // alive behind a refused write is a leaked process per wedged session.
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let reaped_by = Instant::now() + Duration::from_secs(2);
+        while alive(pid) && Instant::now() < reaped_by {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !alive(pid),
+            "the server {pid} that stopped reading outlived the session that gave up on it"
+        );
+        drop(release);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The payload cap is exact: a frame body of `LSP_PAYLOAD_CAP` bytes is
+    /// sent, one byte more is refused with its size. Pinned beside X12 because
+    /// the same `write_message` guard decides which writes ever reach the
+    /// bounded queue.
+    #[test]
+    fn x12_the_payload_cap_admits_exactly_the_cap_and_refuses_one_byte_more() {
+        let script = "printf 'Content-Length: 36\\r\\n\\r\\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'; exec sleep 60"
+            .to_string();
+        let mut client = LspClient::spawn(
+            &spec(script),
+            Path::new("sh"),
+            &std::env::temp_dir(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap_or_else(|e| panic!("initialize was answered: {e:?}"));
+        let message =
+            |text: &str| json!({ "jsonrpc": "2.0", "method": "m", "params": { "text": text } });
+        let framing = serde_json::to_vec(&message("")).unwrap().len();
+        let at_cap = "A".repeat(LSP_PAYLOAD_CAP - framing);
+        assert!(
+            client.write_message(&message(&at_cap)).is_ok(),
+            "a body of exactly the cap must be sent"
+        );
+        let over_cap = "A".repeat(LSP_PAYLOAD_CAP - framing + 1);
+        assert!(
+            matches!(
+                client.write_message(&message(&over_cap)),
+                Err(LspDidNotRun::OversizedPayload { bytes }) if bytes == LSP_PAYLOAD_CAP + 1
+            ),
+            "one byte over the cap must be refused with its size"
+        );
+        client.kill();
+    }
+
     /// A language server in `sh`: answers `initialize` and `shutdown` with
     /// `null`, appends `line:character` of every definition request to `$1`,
     /// and answers each with one location in the URI `$2`, at line 0

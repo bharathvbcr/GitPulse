@@ -140,6 +140,9 @@ mod platform {
 
 #[cfg(test)]
 mod tests {
+    // Both tests below are Unix-only. On Windows the import would be unused
+    // and `-D warnings` would fail the lib tests.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use super::*;
 
     /// The counters move when this process writes, and by at least what it

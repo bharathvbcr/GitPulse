@@ -689,7 +689,11 @@ impl ExtractionCoverage {
         let candidates: BTreeSet<&str> = present
             .iter()
             .copied()
-            .chain(LANGUAGE_FAMILIES.iter().flat_map(|(_, m)| m.iter().copied()))
+            .chain(
+                LANGUAGE_FAMILIES
+                    .iter()
+                    .flat_map(|(_, m)| m.iter().copied()),
+            )
             .collect();
         let mut capped: Vec<&str> = Vec::new();
         let mut eligible: Vec<&str> = Vec::new();
@@ -1102,7 +1106,16 @@ fn bounded_names(names: &[&str]) -> String {
 const LANGUAGE_FAMILIES: &[(&str, &[&str])] = &[
     (
         "js",
-        &["javascript", "typescript", "tsx", "arkts", "svelte", "vue", "astro", "liquid"],
+        &[
+            "javascript",
+            "typescript",
+            "tsx",
+            "arkts",
+            "svelte",
+            "vue",
+            "astro",
+            "liquid",
+        ],
     ),
     ("c", &["c", "cpp", "objc", "cuda", "metal"]),
     ("jvm", &["java", "kotlin", "scala"]),
@@ -3725,7 +3738,8 @@ pub fn analyze_liveness_with_coverage(
         // What survives of a script's file-level claim for Python, JavaScript
         // and TypeScript: every symbol but module-level variables.
         let script_callable_claim = file_wiring.iter().copied().find(|w| {
-            w.kind == WiringKind::ScriptEntry && script_entry_exempts_callables(ext.language.as_str())
+            w.kind == WiringKind::ScriptEntry
+                && script_entry_exempts_callables(ext.language.as_str())
         });
 
         // Per-symbol exemptions: a runtime, framework, or harness reaches the

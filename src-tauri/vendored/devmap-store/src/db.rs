@@ -2433,3 +2433,8 @@ mod git_head_tests;
 #[cfg(feature = "parse")]
 #[path = "db/tests/delta_bucket_tests.rs"]
 mod delta_bucket_tests;
+
+#[cfg(test)]
+#[cfg(feature = "parse")]
+#[path = "db/tests/payload_serialization_tests.rs"]
+mod payload_serialization_tests;

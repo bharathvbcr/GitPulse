@@ -113,6 +113,11 @@ required-features = ["parse"]
 name = "attack_build_cancel"
 required-features = ["parse"]
 
+# B-series schema-cost properties extract Python sources (`extract_file`); need the grammars.
+[[test]]
+name = "b_series_schema_cost_properties"
+required-features = ["parse"]
+
 # A recovered file replaces its stored budget refusal; needs `save_generation`.
 [[test]]
 name = "a_recovered_file_replaces_its_stored_budget_refusal"

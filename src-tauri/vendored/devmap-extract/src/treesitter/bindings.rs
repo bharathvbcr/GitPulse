@@ -248,11 +248,21 @@ impl PythonFileFacts {
     }
 }
 
+/// One file's facts and the tree they were read from.
+///
+/// A node id is an address a later tree reuses, so the key is that id together
+/// with the source address and length. The cache used to be a
+/// `RefCell<Option<((usize, usize, usize), Rc<...>)>>`, which the pinned
+/// toolchain rejects as too complex a type on the static itself.
+pub(super) struct CachedPythonFileFacts {
+    key: (usize, usize, usize),
+    facts: std::rc::Rc<PythonFileFacts>,
+}
+
 thread_local! {
-    /// The facts of the file being extracted, with the identity of the tree
-    /// they were read from. Cleared between files with the scope-local cache:
-    /// a node id is an address that a later tree reuses.
-    pub(super) static PYTHON_FILE_FACTS: RefCell<Option<((usize, usize, usize), std::rc::Rc<PythonFileFacts>)>> =
+    /// The facts of the file being extracted. Cleared between files with the
+    /// scope-local cache.
+    pub(super) static PYTHON_FILE_FACTS: RefCell<Option<CachedPythonFileFacts>> =
         const { RefCell::new(None) };
 }
 
@@ -265,13 +275,18 @@ pub(super) fn python_file_facts(root: Node, source: &str) -> std::rc::Rc<PythonF
         cache
             .borrow()
             .as_ref()
-            .filter(|(known, _)| *known == key)
-            .map(|(_, facts)| facts.clone())
+            .filter(|known| known.key == key)
+            .map(|known| known.facts.clone())
     }) {
         return known;
     }
     let facts = std::rc::Rc::new(python_read_file_facts(root, source));
-    PYTHON_FILE_FACTS.with(|cache| *cache.borrow_mut() = Some((key, facts.clone())));
+    PYTHON_FILE_FACTS.with(|cache| {
+        *cache.borrow_mut() = Some(CachedPythonFileFacts {
+            key,
+            facts: facts.clone(),
+        });
+    });
     facts
 }
 

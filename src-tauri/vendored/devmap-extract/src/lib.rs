@@ -78,9 +78,29 @@ mod literals;
 // Walks a parse tree; its one caller is `treesitter::extract_treesitter`.
 #[cfg(feature = "parse")]
 mod jsobjects;
+// The JVM-family declaration facts (Kotlin, Java, Scala, C#). Walks a parse
+// tree; its one caller is `treesitter::extract_treesitter`.
+#[cfg(feature = "parse")]
+mod jvmfacts;
+// The Kotlin declarations the grammar reads as expressions: the loss detector
+// and the recovery. Walks a parse tree; its callers are in
+// `treesitter::extract_treesitter`.
+#[cfg(feature = "parse")]
+mod kotlinloss;
+// The same-length `;` rewrite that lets a one-line Kotlin class body parse.
+#[cfg(feature = "parse")]
+mod kotlinsemi;
+// Python-only facts (dynamic dispatch). Walks a parse tree; its one caller is
+// `treesitter::extract_treesitter`.
+#[cfg(feature = "parse")]
+mod pyfacts;
 pub mod pyproject;
 #[cfg(feature = "parse")]
 mod rustlocal;
+// SQL relations a dialect ERROR swallowed. Reads the source text; its one
+// caller is `extract_file_unfiltered`, after the grammar pass.
+#[cfg(feature = "parse")]
+mod sqlddl;
 // The names a Swift callable binds and the types it writes for them. Walks a
 // parse tree; its callers are `treesitter::collect_site_bindings` and
 // `treesitter::collect_scope_locals`.
@@ -769,7 +789,12 @@ fn extract_file_unfiltered(path: &str, source: &str, budget: std::time::Duration
         return notebook::extract_notebook_bounded(path, source, budget);
     }
     let lang = detect_language(Path::new(path));
-    treesitter::extract_treesitter_with_budget(path, lang, source, budget)
+    // The grammar pass disarms its own clock when it returns, so recovery is
+    // handed the same instant the file's budget ends.
+    let deadline = std::time::Instant::now() + budget;
+    let mut extraction = treesitter::extract_treesitter_with_budget(path, lang, source, budget);
+    sqlddl::recover_lost_relations(&mut extraction, source, deadline);
+    extraction
 }
 
 #[cfg(feature = "parse")]
@@ -1421,7 +1446,31 @@ pub fn scan_tree_with_progress(
     root: &Path,
     progress: Option<&progress::FileProgress>,
 ) -> anyhow::Result<ScannedTree> {
-    let (candidates, mut report) = walk_candidates(root)?;
+    scan_tree_inner(root, progress, None)
+}
+
+/// [`scan_tree`] that stops when `cancel` is set, returning [`BuildCancelled`]
+/// (downcastable from the error) instead of a partial tree.
+///
+/// The flag is read once per directory entry during the walk and once per file
+/// during the read, so a tree of any size stops within one entry of the flag
+/// being set. A cancelled scan returns nothing a caller could mistake for the
+/// tree: an incomplete inventory compared with stored hashes would read as a
+/// mass deletion.
+pub fn scan_tree_cancellable(
+    root: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> anyhow::Result<ScannedTree> {
+    scan_tree_inner(root, None, Some(cancel))
+}
+
+fn scan_tree_inner(
+    root: &Path,
+    progress: Option<&progress::FileProgress>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<ScannedTree> {
+    let cancelled = || cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+    let (candidates, mut report) = walk_candidates(root, cancel)?;
     if let Some(progress) = progress {
         progress.start(candidates.len());
     }
@@ -1429,6 +1478,14 @@ pub fn scan_tree_with_progress(
     let read: Vec<Result<(String, String), (String, DiscoverySkipReason)>> = candidates
         .into_par_iter()
         .map(|(relative, absolute)| {
+            if cancelled() {
+                return Err((
+                    relative,
+                    DiscoverySkipReason::Unreadable {
+                        reason: "scan cancelled".to_string(),
+                    },
+                ));
+            }
             let result = match read_source(&absolute) {
                 Ok(source) => Ok((relative, source)),
                 Err(error) => Err((
@@ -1444,6 +1501,9 @@ pub fn scan_tree_with_progress(
             result
         })
         .collect();
+    if cancelled() {
+        return Err(BuildCancelled.into());
+    }
 
     let mut sources = Vec::with_capacity(read.len());
     for outcome in read {
@@ -1466,7 +1526,10 @@ pub fn scan_tree_with_progress(
 
 /// The walk half of [`scan_tree`]: every candidate that survived the ignore
 /// rules, the extension test and the size ceiling, as `(relative, absolute)`.
-fn walk_candidates(root: &Path) -> anyhow::Result<(Vec<(String, PathBuf)>, DiscoveryReport)> {
+fn walk_candidates(
+    root: &Path,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<(Vec<(String, PathBuf)>, DiscoveryReport)> {
     // A root that exists and is not a directory was never examined. `ignore`
     // walks a file root by yielding the file itself, so a build pointed at a
     // regular file "ran" with zero candidates and wrote a generation that read
@@ -1538,6 +1601,9 @@ fn walk_candidates(root: &Path) -> anyhow::Result<(Vec<(String, PathBuf)>, Disco
         .build();
 
     for result in walker {
+        if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err(BuildCancelled.into());
+        }
         let entry = match result {
             Ok(entry) => entry,
             // A path below the root that the walker could not descend into or

@@ -192,9 +192,10 @@ impl<'a> QueryEngine<'a> {
         let mut call_blind = CallBlindStarts::default();
         let (file_gap, sites, side, shadowed_symbols) = match extraction {
             Some(extraction) => {
-                let symbols = self.resolution.edges.iter().flat_map(|edge| {
-                    [edge.source_symbol.as_str(), edge.target_symbol.as_str()]
-                });
+                let symbols =
+                    self.resolution.edges.iter().flat_map(|edge| {
+                        [edge.source_symbol.as_str(), edge.target_symbol.as_str()]
+                    });
                 (
                     file_edge_coverage_gap(&extraction.parse_outcome),
                     BTreeSet::from([(query.clone(), query.clone())]),
@@ -236,9 +237,12 @@ impl<'a> QueryEngine<'a> {
                 let files: BTreeSet<&str> = named.iter().map(|(_, file)| file.as_str()).collect();
                 for path in files {
                     match self.extractions.iter().find(|e| e.file_path == path) {
-                        Some(e) => {
-                            call_blind.record(&e.file_path, &e.language, &e.engine, &e.parse_outcome)
-                        }
+                        Some(e) => call_blind.record(
+                            &e.file_path,
+                            &e.language,
+                            &e.engine,
+                            &e.parse_outcome,
+                        ),
                         None => call_blind.checked += 1,
                     }
                 }
@@ -283,7 +287,8 @@ impl<'a> QueryEngine<'a> {
         deps.sort_by(dependency_order);
         if outbound_nodes.is_some() && deps.is_empty() {
             if let Some(reason) = call_blind.refusal_when_empty(query) {
-                let mut response = unavailable_response(ResolutionAvailability::Unavailable { reason });
+                let mut response =
+                    unavailable_response(ResolutionAvailability::Unavailable { reason });
                 response.walk_incomplete = coverage_gap;
                 return response;
             }

@@ -795,7 +795,23 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// import Function` are now matched) and applies only when each import of the
 /// root names `torch`; a root no import binds is read as written. A v96 row has
 /// none of these.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "97";
+///
+/// v98 is the extractor-output bundle (`docs/devmap/design/extract-v98.md`) and
+/// adds six side tables to `Extraction`, each `serde(default)` and omitted when
+/// empty: `jvm_decls` (Kotlin/Java declaration facts: kind, modifiers,
+/// type-parameter names, header and body spans, a type alias's target, a
+/// companion's name), `package_scopes` (Scala and C# package or namespace
+/// regions), `local_extents` (the block or lambda extent of a Kotlin/Java local
+/// binding), `decl_gaps` (byte ranges where a Kotlin/Java/Scala declaration may
+/// be missing from `symbols`), `recovered_decl_ranges` (Kotlin statements the
+/// grammar read as an expression and the extractor repaired) and
+/// `dynamic_dispatch` (a Python `getattr(..)(..)` site). Each later extractor change in the bundle fills them and so changes
+/// what a cached payload means: an empty table cannot say "not collected", so a
+/// v97 row, which has none of them, must not be served to a v98 key.
+/// The commit that bumps the number only adds the fields, the empty emitters
+/// (`jvmfacts::collect`, `pyfacts::collect`) and the `langdecl::java` seam, and
+/// leaves every symbol, call, reference and edge as v97 wrote them.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "98";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

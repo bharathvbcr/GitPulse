@@ -1417,8 +1417,15 @@ mod radius_note_tests {
 #[cfg(test)]
 mod charged_range_tests {
     use super::*;
+    // `extract_file` is gated on devmap-extract's `parse` feature. These four
+    // tests need a real parse so the charged-range sentence names the surviving
+    // declaration; compiling them with `parse` off fails the whole lib-test
+    // target. The rest of this module does not touch a grammar and keeps
+    // running in the embedder shape.
+    #[cfg(feature = "parse")]
     use devmap_extract::model::{ParseOutcome, TextRange};
 
+    #[cfg(feature = "parse")]
     fn producer_reason(regions: &[(usize, usize)]) -> String {
         let mut ext = devmap_extract::extract_file("src/a.py", "def x(): pass\n");
         ext.parse_outcome = ParseOutcome::Partial {
@@ -1440,6 +1447,7 @@ mod charged_range_tests {
 
     /// The parser reads the producer's own sentence, so a rewording of it
     /// fails here instead of silently emptying every charged-hole answer.
+    #[cfg(feature = "parse")]
     #[test]
     fn the_charged_clause_round_trips_through_the_producer() {
         // `def x(): pass` is 0..13: 4..8 is inside it (listed separately), the rest is charged.
@@ -1451,6 +1459,7 @@ mod charged_range_tests {
         );
     }
 
+    #[cfg(feature = "parse")]
     #[test]
     fn an_elided_tail_is_counted_not_dropped() {
         let regions: Vec<(usize, usize)> = (0..11).map(|n| (20 + n * 10, 25 + n * 10)).collect();
@@ -1458,6 +1467,7 @@ mod charged_range_tests {
         assert_eq!((listed.len(), elided), (8, 3));
     }
 
+    #[cfg(feature = "parse")]
     #[test]
     fn a_region_inside_a_surviving_declaration_can_still_hold_a_lost_method() {
         // `4..8 in `x``: exempt from the charge, but a lost method of a
@@ -1468,6 +1478,7 @@ mod charged_range_tests {
         );
     }
 
+    #[cfg(feature = "parse")]
     #[test]
     fn nameless_and_zero_width_regions_name_nothing_to_blame() {
         let mut ext = devmap_extract::extract_file("src/a.py", "def x(): pass\n");

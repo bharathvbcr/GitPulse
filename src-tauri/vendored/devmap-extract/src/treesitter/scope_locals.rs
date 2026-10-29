@@ -208,7 +208,7 @@ pub(super) fn collect_non_symbol_locals(scope: Node, source: &str) -> HashSet<St
                 break;
             }
         }
-        if is_callable_node(node) {
+        if is_callable_node(node) || in_charged_region(node) {
             continue;
         }
         if matches!(
@@ -1335,6 +1335,11 @@ pub(super) fn collect_scope_locals(
     let mut by_scope: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut worklist = vec![root];
     while let Some(node) = worklist.pop() {
+        // A charged statement declares no scope of its own: its locals and its
+        // lambdas' belong to nothing the file declares.
+        if in_charged_region(node) {
+            continue;
+        }
         if is_callable_node(node) {
             // Unnamed *and* `let`-bound closures must not dump their parameters
             // into the enclosing function's `scope_locals`. That set is what
@@ -1375,7 +1380,7 @@ pub(super) fn collect_scope_locals(
                         entry.extend(
                             crate::swiftscope::bindings(node, source)
                                 .keys()
-                                .filter(|name| !name.contains('.'))
+                                .filter(|name| !name.contains('.') && !name.starts_with('\u{1}'))
                                 .cloned(),
                         );
                     }
