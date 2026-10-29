@@ -564,68 +564,201 @@ pub fn spawn(cmd: &mut Command, label: &str) -> io::Result<(Child, Registration)
     Ok((child, registration))
 }
 
-/// Puts a child GitPulse just spawned into the macOS background band: lowest
-/// CPU scheduling priority, throttled disk I/O, and throttled network I/O for
-/// sockets it opens afterwards. A no-op elsewhere.
+/// [`spawn`] for a child that must run in the macOS background band: lowest CPU
+/// scheduling priority, throttled disk I/O, and throttled network I/O for
+/// sockets it opens afterwards. Elsewhere it is [`spawn`].
 ///
 /// The caller decides *whether* — `engine::git_cli` does, from the admission
 /// class, which is the single source of truth for "this work may be starved".
 /// This function never looks at who is asking, so a child it is not called for
 /// is never touched.
 ///
-/// Why from the parent after the spawn rather than as a spawn attribute:
-/// `posix_spawnattr_set_qos_class_np` and `POSIX_SPAWN_DARWIN_BG` are private
-/// SPI (absent from the SDK's `spawn.h`), and `std` exposes no spawn attribute
-/// of its own. The only documented way to apply a band *inside* the child is a
-/// `pre_exec` hook calling `setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)`,
-/// which disqualifies the command from `std`'s `posix_spawn` fast path (see
-/// [`sys::prepare`] and `benches/process_spawn.rs`: +35% to +95% per spawn).
-/// So the band is applied with `setpriority(PRIO_DARWIN_PROCESS, pid,
-/// PRIO_DARWIN_BG)`. The `setpriority(2)` man page says only `who == 0` is
-/// supported for background state, but the kernel accepts a pid owned by the
-/// caller (that is what `taskpolicy -b -p <pid>` does), and
-/// `procguard::tests::a_background_band_child_is_demoted` pins the observable
-/// result so an OS that stops honouring it fails a test instead of silently
-/// leaving background children at full priority.
+/// The band is entered by the child itself, in a `pre_exec` hook, before it
+/// execs. That is the only place it can be entered reliably. An exec creates a
+/// new task that copies the band from the old one when it is created and swaps
+/// in later, so a `setpriority` aimed at the child's pid from the parent after
+/// the spawn returns 0 yet marks the task about to be discarded whenever it
+/// lands between the two points — `sh -c` and the `git` shims exec at once, so
+/// it did, and the child then ran at the normal priority for good.
+/// `getpriority` answers only for the caller's own pid, so the parent cannot
+/// read the band back to notice. Set in the child before exec, every later exec
+/// and fork inherits it, and nothing is left for the parent to get to in time.
+/// (A new image can read as a higher priority than the band for its first few
+/// milliseconds, 46 and 31 seen on a loaded host, before `ps` shows the band;
+/// the tests wait for that rather than treat it as the child being outside it.)
 ///
-/// There is a short window between `posix_spawn` returning and this call in
-/// which the child runs at default priority; its descendants inherit the band
-/// from it. Sources read: the SDK's `<sys/resource.h>` (`PRIO_DARWIN_PROCESS`,
-/// `PRIO_DARWIN_BG`) and the `setpriority(2)` man page.
-pub fn enter_background_band(child: &Child) -> io::Result<BandOutcome> {
-    #[cfg(target_os = "macos")]
-    {
-        let pid = libc::id_t::from(child.id());
-        // SAFETY: plain syscall on an integer pid; no pointers.
-        let rc = unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, pid, libc::PRIO_DARWIN_BG) };
-        if rc == 0 {
-            return Ok(BandOutcome::Entered);
-        }
-        let error = io::Error::last_os_error();
-        // A child that already exited and was reaped has nothing left to
-        // demote; with a short-lived `git` that is an ordinary race.
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(BandOutcome::ChildGone);
-        }
-        Err(error)
+/// The hook is `setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)`, and what
+/// it may do between `fork` and `exec` was read from the disassembly of this
+/// host's `libsystem_kernel`: `__setpriority` is `mov x16, #0x60; svc #0x80`
+/// plus `cerror_nocancel` on failure, and the `setpriority` wrapper only does
+/// more when `which == PRIO_DARWIN_THREAD`. A bare syscall, so
+/// async-signal-safe; the closure allocates nothing, takes no lock and reads
+/// only what it captured.
+///
+/// A spawn whose child cannot enter the band **fails**, with "could not enter
+/// the background band: <errno>" (`band_refusal` says so). A child silently
+/// running in the normal band is exactly the defect this replaced, and a
+/// refused demotion is not one a user can act on later. The hook's errno is the
+/// only thing `std` carries out of a failed `pre_exec`, so it travels tagged
+/// (`BAND_ERRNO_TAG`): a missing `git` (ENOENT from the exec) and a refused
+/// band (any errno) are then told apart for every errno, and neither reads as
+/// the other.
+///
+/// The price: a `pre_exec` hook disqualifies the command from `std`'s
+/// `posix_spawn` fast path, so a background child is produced by `fork` +
+/// `exec` (`benches/process_spawn.rs` measures it, in interleaved rows). A
+/// command that already carries admission's `fchdir` hook for a directory
+/// others can rename in pays nothing more for that. `fork` pays per VM-map
+/// entry, not per byte, and runs under `std`'s process-wide child-creation
+/// lock, so a foreground spawn waits behind it: about 1 ms per background
+/// spawn measured here, an estimated ~9 ms at a GUI process's ~8,000 entries
+/// (`benches/adv_w4b_fork_aftermath.rs`). The owner accepted that cost on
+/// 2026-10-29 (ft-b597add5).
+///
+/// A sandbox that denies `system-sched` (a seatbelt profile without it) makes
+/// the hook fail with EPERM, so every background-class command fails there
+/// with the reason above rather than running unbanded.
+///
+/// **The hook stays on `cmd`.** `std` keeps `pre_exec` closures on the
+/// `Command`, so a later `spawn` of the same command starts banded, and a
+/// second `spawn_background` stacks a second hook. Build a fresh `Command` for
+/// each spawn; no production caller reuses one
+/// (`adv_w4b_the_band_hook_stays_on_a_reused_command` pins the behaviour).
+///
+/// A `posix_spawn` attribute was checked first and does not substitute. On this
+/// SDK `posix_spawnattr_set_qos_class_np` is public (`<pthread/spawn.h>`, macOS
+/// 10.10, `QOS_CLASS_BACKGROUND` accepted) and a spawn with it reads `ps` pri 4
+/// through exec and fork, but it is a QoS clamp, not the Darwin background
+/// state: the child reads `getpriority(PRIO_DARWIN_PROCESS, 0) == 0`, where the
+/// hook's child reads 1. `POSIX_SPAWN_DARWIN_BG` and the other background
+/// attributes are absent from the public headers. And `std::process::Command`
+/// cannot carry a `posix_spawnattr_t` at all, so using one would mean a second,
+/// hand-written spawn seam beside this one.
+#[cfg(target_os = "macos")]
+pub fn spawn_background(cmd: &mut Command, label: &str) -> io::Result<(Child, Registration)> {
+    spawn_with_band_hook(cmd, label, band_hook())
+}
+
+/// [`spawn_background`] on a platform with no background band.
+#[cfg(not(target_os = "macos"))]
+pub fn spawn_background(cmd: &mut Command, label: &str) -> io::Result<(Child, Registration)> {
+    spawn(cmd, label)
+}
+
+/// What the child runs to enter the band, as the errno it failed with. A plain
+/// `fn` so the closure that carries it owns nothing to free in the forked child.
+#[cfg(target_os = "macos")]
+type BandHook = fn() -> Result<(), libc::c_int>;
+
+/// Added to the errno of a failed band hook on its way out of the child. The
+/// forked child cannot tell the parent anything but an errno (`std` writes the
+/// `pre_exec` error's raw OS code down a pipe, and the parent rebuilds an
+/// `io::Error` from it), and a real errno is below this bit, so
+/// [`explain_band_failure`] can read the tag as "this came from the band hook".
+#[cfg(target_os = "macos")]
+const BAND_ERRNO_TAG: libc::c_int = 0x1000;
+
+/// `setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)`: the calling process,
+/// which is the child between `fork` and `exec`. Async-signal-safe, see
+/// [`spawn_background`].
+#[cfg(target_os = "macos")]
+fn enter_band() -> Result<(), libc::c_int> {
+    // SAFETY: a plain syscall on integers; no pointers.
+    let rc = unsafe { libc::setpriority(libc::PRIO_DARWIN_PROCESS, 0, libc::PRIO_DARWIN_BG) };
+    if rc == 0 {
+        return Ok(());
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = child;
-        Ok(BandOutcome::NotApplicable)
+    Err(io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EINVAL))
+}
+
+#[cfg(target_os = "macos")]
+fn band_hook() -> BandHook {
+    #[cfg(test)]
+    if let Some(hook) = BAND_HOOK_OVERRIDE.get() {
+        return hook;
+    }
+    enter_band
+}
+
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    static BAND_HOOK_OVERRIDE: std::cell::Cell<Option<BandHook>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Runs `body` with every background spawn on this thread using `hook` in the
+/// child instead of the real band, so a test can make the band fail without
+/// depending on the OS refusing it.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn with_band_hook<T>(hook: BandHook, body: impl FnOnce() -> T) -> T {
+    struct Restore(Option<BandHook>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BAND_HOOK_OVERRIDE.set(self.0);
+        }
+    }
+    let _restore = Restore(BAND_HOOK_OVERRIDE.replace(Some(hook)));
+    body()
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_with_band_hook(
+    cmd: &mut Command,
+    label: &str,
+    hook: BandHook,
+) -> io::Result<(Child, Registration)> {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure calls `hook`, which makes only async-signal-safe
+    // calls and allocates nothing, then builds an `io::Error` from an integer,
+    // which allocates nothing either. It takes no lock and touches no other
+    // state, the only things allowed between `fork` and `exec`.
+    unsafe {
+        cmd.pre_exec(move || {
+            hook().map_err(|errno| io::Error::from_raw_os_error(BAND_ERRNO_TAG | errno))
+        });
+    }
+    spawn(cmd, label).map_err(explain_band_failure)
+}
+
+/// The band refusal carried inside the `io::Error` of a spawn whose child could
+/// not enter the background band. Its kind is `Other` whatever the errno was:
+/// an `ENOENT` from `setpriority` must not read as a missing program.
+#[derive(Debug)]
+#[cfg(target_os = "macos")]
+struct BandRefused(io::Error);
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Display for BandRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not enter the background band: {}", self.0)
     }
 }
 
-/// What [`enter_background_band`] did, so "demoted" and "nothing to demote" are
-/// not the same answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BandOutcome {
-    /// The kernel accepted the demotion.
-    Entered,
-    /// The child had already exited and been reaped.
-    ChildGone,
-    /// This platform has no background band.
-    NotApplicable,
+#[cfg(target_os = "macos")]
+impl std::error::Error for BandRefused {}
+
+/// Reads the tag off a failed spawn's errno: the band refusal when the child's
+/// hook failed, the error untouched for any other failure.
+#[cfg(target_os = "macos")]
+fn explain_band_failure(error: io::Error) -> io::Error {
+    match error.raw_os_error() {
+        Some(raw) if raw & BAND_ERRNO_TAG != 0 => io::Error::other(BandRefused(
+            io::Error::from_raw_os_error(raw & !BAND_ERRNO_TAG),
+        )),
+        _ => error,
+    }
+}
+
+/// Whether a failed spawn failed because its child could not enter the
+/// background band ([`spawn_background`]). Production reads the refusal as the
+/// spawn error's own text; the tests ask it as a fact.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn band_refusal(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.downcast_ref::<BandRefused>().is_some())
 }
 
 /// The scheduler priority `ps -o pri` reports for `pid`. `getpriority(2)` only
@@ -1426,20 +1559,28 @@ mod tests {
     /// The band is what the OS reports, not what the call returned: `ps`
     /// shows the lowest scheduler priority for a background-band process and a
     /// default one far above it, and a child nobody asked about is not moved.
+    /// The child is read until it shows the band, because the first reads of a
+    /// new image can show a transient higher priority (46 and 31 were seen at
+    /// load above 40); nothing in the parent applies the band, so the wait is
+    /// only for `ps` to see it.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_background_band_child_is_demoted_and_a_sibling_is_not() {
         let mut cmd = Command::new("sleep");
         cmd.arg("30").stdin(Stdio::null()).stdout(Stdio::null());
-        let (mut demoted, demoted_guard) = spawn(&mut cmd, "sleep").expect("spawn");
-        let (mut ordinary, ordinary_guard) = spawn(&mut cmd, "sleep").expect("spawn");
+        let (mut demoted, demoted_guard) = spawn_background(&mut cmd, "sleep").expect("spawn");
+        let mut plain = Command::new("sleep");
+        plain.arg("30").stdin(Stdio::null()).stdout(Stdio::null());
+        let (mut ordinary, ordinary_guard) = spawn(&mut plain, "sleep").expect("spawn");
 
-        assert_eq!(
-            enter_background_band(&demoted).expect("enter the band"),
-            BandOutcome::Entered
-        );
-
-        let demoted_priority = scheduler_priority_of(demoted.id()).expect("priority");
+        let mut demoted_priority = i32::MAX;
+        for _ in 0..200 {
+            demoted_priority = scheduler_priority_of(demoted.id()).expect("priority");
+            if demoted_priority < 10 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let ordinary_priority = scheduler_priority_of(ordinary.id()).expect("priority");
         demoted_guard.kill_tree(&mut demoted);
         ordinary_guard.kill_tree(&mut ordinary);
@@ -1452,19 +1593,85 @@ mod tests {
         );
     }
 
-    /// A short-lived `git` can be gone before the parent reaches it; that is
-    /// an ordinary race, not a failure to report.
+    #[cfg(target_os = "macos")]
+    fn band_refused_with_eperm() -> Result<(), libc::c_int> {
+        Err(libc::EPERM)
+    }
+
+    /// A band that cannot be applied fails the spawn instead of leaving a
+    /// background child in the normal band, and the error says why. The failure
+    /// is injected into the child's hook; nothing depends on the OS refusing.
     #[cfg(target_os = "macos")]
     #[test]
-    fn demoting_a_child_that_already_exited_is_not_an_error() {
+    fn a_spawn_whose_band_cannot_be_applied_fails_and_says_why() {
         let mut cmd = Command::new("true");
         cmd.stdin(Stdio::null()).stdout(Stdio::null());
-        let (mut child, guard) = spawn(&mut cmd, "true").expect("spawn");
-        let _ = guard.reap(|| child.wait());
-        assert_eq!(
-            enter_background_band(&child).expect("a reaped child is not an error"),
-            BandOutcome::ChildGone
+        let error = with_band_hook(band_refused_with_eperm, || {
+            spawn_background(&mut cmd, "true").err()
+        })
+        .expect("a child that could not enter the band must not be handed back");
+        assert!(
+            band_refusal(&error),
+            "not recognised as a band refusal: {error:?}"
         );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "could not enter the background band: {}",
+                io::Error::from_raw_os_error(libc::EPERM)
+            )
+        );
+        assert!(
+            error.to_string().contains("Operation not permitted"),
+            "{error}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn band_refused_with_enoent() -> Result<(), libc::c_int> {
+        Err(libc::ENOENT)
+    }
+
+    /// The two failures that arrive as an errno from the child stay apart: a
+    /// refused band whose errno is `ENOENT` is not a missing program, and a
+    /// missing program is not a refused band.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_band_failure_and_a_missing_program_are_not_mistaken_for_each_other() {
+        let mut cmd = Command::new("true");
+        cmd.stdin(Stdio::null()).stdout(Stdio::null());
+        let refused = with_band_hook(band_refused_with_enoent, || {
+            spawn_background(&mut cmd, "true").err()
+        })
+        .expect("spawn must fail");
+        assert!(band_refusal(&refused), "{refused:?}");
+        assert_ne!(refused.kind(), io::ErrorKind::NotFound, "{refused}");
+
+        let mut missing = Command::new("/nonexistent/gitpulse-w4b-no-such-program");
+        missing.stdin(Stdio::null()).stdout(Stdio::null());
+        let Err(absent) = spawn_background(&mut missing, "missing") else {
+            panic!("spawn must fail");
+        };
+        assert!(!band_refusal(&absent), "{absent:?}");
+        assert_eq!(absent.kind(), io::ErrorKind::NotFound, "{absent}");
+    }
+
+    /// A band that is applied costs nothing visible: the hook returns, the exec
+    /// goes through, and the child runs a real program to completion.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_background_child_runs_its_program_to_completion() {
+        let mut cmd = Command::new("/bin/echo");
+        cmd.arg("banded")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped());
+        let (mut child, guard) = spawn_background(&mut cmd, "echo").expect("spawn");
+        let mut out = String::new();
+        std::io::Read::read_to_string(&mut child.stdout.take().expect("stdout"), &mut out)
+            .expect("read");
+        let status = guard.reap(|| child.wait()).expect("reap");
+        assert!(status.success());
+        assert_eq!(out.trim(), "banded");
     }
 
     /// The capability a bare `Child::kill` does not have, and the reason the
