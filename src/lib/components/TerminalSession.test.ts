@@ -92,6 +92,19 @@ describe("TerminalSession PTY contracts", () => {
     expect(source.match(/new XTerm\(/g)?.length).toBe(1);
   });
 
+  it("switches xterm to the Unicode 11 width table where it builds the terminal, before anything is written", () => {
+    const ensureBody = source.slice(source.indexOf("function ensureTerm"), source.indexOf("function refitIfResized"));
+    expect(source.match(/new Unicode11Addon\(\)/g)?.length).toBe(1);
+    expect(source.match(/unicode\.activeVersion = "11"/g)?.length).toBe(1);
+    const load = ensureBody.indexOf("created.loadAddon(new Unicode11Addon());");
+    const activate = ensureBody.indexOf('created.unicode.activeVersion = "11";');
+    expect(load).toBeGreaterThan(-1);
+    expect(activate).toBeGreaterThan(load);
+    // Nothing is written, resized or opened before the table is active.
+    const firstUse = ensureBody.search(/created\.(write|input|open|resize)\(/);
+    expect(firstUse === -1 || firstUse > activate).toBe(true);
+  });
+
   it("builds its xterm options from the shared owners, not literals", () => {
     const ensureBody = source.slice(
       source.indexOf("function ensureTerm"),
@@ -357,5 +370,15 @@ describe("TerminalSession task link", () => {
     expect(source).toContain("const linkedRunId = $derived(taskRunId ?? resume?.runId ?? null)");
     expect(source).toContain("{#if linkedRunId}");
     expect(source).toContain("await openTaskForRun(linkedRunId)");
+  });
+});
+
+describe("TerminalSession GPU wiring", () => {
+  it("tells the renderer the setting separately from the attendance, names the canvas that was lost, and says when it draws without the GPU", () => {
+    expect(source).toContain("gpu?.sync(want, enabled)");
+    expect(source).toContain("gpu?.lose(event.target)");
+    expect(source).toContain("refresh: () => t.refresh(0, t.rows - 1)");
+    expect(source).toContain("data-terminal-gpu-note");
+    expect(source).toContain("Drawing without GPU after a graphics reset");
   });
 });

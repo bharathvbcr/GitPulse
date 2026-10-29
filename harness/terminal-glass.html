@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>GitPulse terminal glass verification</title></head>
+  <body style="margin:0;background:#3a6ea5">
+    <button id="checks" disabled style="position:fixed;bottom:8px;right:8px;z-index:100">Run glass checks</button>
+    <pre id="result" style="position:fixed;bottom:40px;right:8px;max-height:30vh;overflow:auto;font:11px monospace;background:#141a29;color:#e9edf8;z-index:100"></pre>
+    <script type="module">
+      import { createChecks, CheckFailed } from "./checks.ts";
+      import { measure } from "./glassGhost.ts";
+
+      const params = new URL(location.href).searchParams;
+      const ARMS = {
+        // What every opaque theme ships: the control.
+        "opaque": { name: "opaque", background: "#141a29", allowTransparency: true },
+        // The macOS glass theme: --bg-terminal: transparent -> hexColor -> #00000000.
+        "glass-a0": { name: "glass-a0", background: "#00000000", allowTransparency: true },
+        "glass-a1": { name: "glass-a1", background: "#00000001", allowTransparency: true },
+        "glass-a25": { name: "glass-a25", background: "#14141940", allowTransparency: true },
+        "opaque-notransp": { name: "opaque-notransp", background: "#141a29", allowTransparency: false },
+      };
+      const arms = (params.get("arms") ?? "opaque,glass-a0").split(",").map((name) => ARMS[name]);
+      const runs = Number(params.get("runs") ?? 5);
+      const frames = Number(params.get("frames") ?? 150);
+      const pace = Number(params.get("pace") ?? 1);
+      const opsMax = Number(params.get("ops") ?? 3);
+      const distinct = Number(params.get("distinct") ?? 0);
+      const clearEvery = Number(params.get("clearEvery") ?? 0);
+
+      const errors = [];
+      addEventListener("error", (event) => errors.push(event.message));
+      addEventListener("unhandledrejection", (event) => errors.push(String(event.reason)));
+
+      const checksButton = document.querySelector("#checks");
+      checksButton.disabled = false;
+      checksButton.onclick = async () => {
+        checksButton.disabled = true;
+        const { results, check, stopped } = createChecks();
+        const rows = [];
+        const finish = () => {
+          const payload = { results, errors, diagnostics: JSON.stringify(rows) };
+          document.querySelector("#result").textContent = JSON.stringify(rows, null, 1);
+          document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify(payload));
+          const reportPath = params.get("report");
+          if (reportPath?.startsWith("/__gp_result/")) return fetch(reportPath, { method: "POST", body: document.documentElement.outerHTML });
+        };
+        try {
+          check("this browser can create a WebGL2 context", () => !!document.createElement("canvas").getContext("webgl2"));
+          for (const arm of arms) {
+            for (let seed = 1; seed <= runs; seed++) {
+              const row = await measure(arm, seed, frames, pace, opsMax, params.get("debug") === "1", distinct, clearEvery, params.get("scroll") === "1");
+              rows.push(row);
+              check(`${arm.name} seed ${seed}: drew through WebGL`, () => row.webgl);
+            }
+          }
+          check("no unhandled runtime errors", () => errors.length === 0);
+          checksButton.textContent = "done";
+        } catch (error) {
+          stopped(error);
+          if (!(error instanceof CheckFailed)) console.error(error);
+        } finally {
+          await finish();
+        }
+      };
+      if (params.get("check") === "1") checksButton.click();
+    </script>
+  </body>
+</html>

@@ -39,6 +39,8 @@
        * refused rather than merely unobserved. */
       const opened = [];
       const report = { spawned: 0, killed: 0, writes: 0, resizes: 0, errors: [] };
+      /** Every `cmd_terminal_resize`: which session was told which grid, in order. */
+      const resizeLog = [];
       const showReport = () => document.querySelector("#result").textContent = JSON.stringify(report);
       addEventListener("error", (event) => { report.errors.push(event.message); showReport(); });
       addEventListener("unhandledrejection", (event) => { report.errors.push(String(event.reason)); showReport(); });
@@ -105,6 +107,7 @@
             // Real shells repaint the prompt after SIGWINCH. xterm deliberately
             // does not reflow the cursor line; the fixture must model that too.
             report.resizes++;
+            resizeLog.push({ id: args.sessionId, rows: args.rows, cols: args.cols });
             if (sessions.has(args.sessionId)) void output(args.sessionId, `\r\u001b[2K${sessions.get(args.sessionId)} $ `);
             showReport(); return null;
           case "cmd_terminal_kill": sessions.delete(args.sessionId); report.killed++; showReport(); return null;
@@ -386,6 +389,53 @@
           await input(""); check("empty query clears result count", () => status() === "");
           await press(label("Find in terminal output"), "Escape"); check("Escape restores terminal focus", () => document.activeElement?.getAttribute("aria-label") === "Terminal input");
 
+          // ---- Wide characters, through the real session.
+          // xterm's own width table is Unicode 6, which gives every emoji one
+          // cell; the Unicode 11 addon (loaded where the terminal is built)
+          // gives the pictographs two. The cursor report is the observable: the
+          // column the cursor reports after printing a glyph is one past the
+          // cells the glyph took, so a wrong width shows up as a wrong column,
+          // in the emulator the user actually types into. Run on the alternate
+          // screen so the main screen the rest of this page reads is untouched.
+          {
+            const cases = [
+              // [name, text, cells the text takes]
+              ["an ASCII letter", "a", 1],
+              ["a rocket", "🚀", 2],
+              ["a rocket between two letters", "a🚀b", 4],
+              ["a run of three emoji", "🚀🔥✅", 6],
+              ["CJK (two cells in Unicode 6 and 11 alike)", "世界", 4],
+              ["a CJK character outside the BMP", "𠀀", 2],
+              ["a heart with the emoji selector (U+2764 U+FE0F)", "\u2764\uFE0F", 1],
+            ];
+            const mark = written.length;
+            const emojiLine = "🚀 https://emoji.example/w and emojineedle";
+            void output("fixture-1", "\u001b[?1049h\u001b[2J" + cases.map(([, text], i) => `\u001b[${i + 1};1H${text}\u001b[6n`).join("")
+              // The cursor is parked on an empty row afterwards: opening Find
+              // resizes the grid, and the fixture's shell repaints its prompt
+              // on the cursor row after every resize, as a real one does.
+              + `\u001b[${cases.length + 2};1H${emojiLine}\u001b[${cases.length + 4};1H`);
+            const cprDeadline = performance.now() + 4000;
+            const replies = () => [...written.slice(mark).join("").matchAll(/\u001b\[(\d+);(\d+)R/g)].map((m) => ({ row: Number(m[1]), col: Number(m[2]) }));
+            while (replies().length < cases.length && performance.now() < cprDeadline) await wait(20);
+            const seen = replies();
+            for (const [i, [name, , cells]] of cases.entries()) {
+              check(`${name} advances the cursor ${cells} cell${cells === 1 ? "" : "s"} (column ${seen[i]?.col ?? "no reply"}, expected ${1 + cells})`,
+                () => seen[i]?.row === i + 1 && seen[i]?.col === 1 + cells);
+            }
+            // Wide glyphs must not skew what is read back from the grid: a link
+            // after an emoji keeps its own cells, and a search finds text that
+            // follows one. Both read the last row written above.
+            await hover("emoji.example", 2);
+            check("a link after an emoji still names its own target", () => footer().includes("Open https://emoji.example/w in your browser"));
+            button("Find in terminal").click(); await wait();
+            await input("emojineedle"); check(`text after an emoji is found (status ${JSON.stringify(status())})`, () => status() === "1 of 1");
+            await press(label("Find in terminal output"), "Escape");
+            void output("fixture-1", "\u001b[?1049l");
+            await wait();
+            check("leaving the alternate screen restores the main one", () => visible(".xterm-rows > div").some((row) => row.textContent.includes("needle end")));
+          }
+
           // ---- Tabs, layout and session management.
           await press(button("New Shell session"), "T", { ctrlKey: true, shiftKey: true });
           check("new-tab chord works from toolbar", () => visible('[role="tab"]').length === 2);
@@ -413,16 +463,60 @@
           check("returning restores both original tabs", () => visible('[role="tab"]').length === 2 && report.killed === 0);
           check("returning restores this repository's own dock", () => visible("[data-terminal-dock]").length === 1);
 
-          // ---- GPU renderer: attended sessions only, DOM after a loss.
+          // ---- GPU renderer: a hold for the hidden, DOM after a loss that is
+          // recovered within a budget, DOM for good after the budget.
           {
+            const { gpuPolicy } = await import("../src/lib/terminal/gpuRenderer.ts");
+            const policyBefore = { ...gpuPolicy };
             const sessionsAll = () => [...document.querySelectorAll("[data-terminal-session]")];
             const shown = () => sessionsAll().filter((el) => el.getClientRects().length);
             const hidden = () => sessionsAll().filter((el) => !el.getClientRects().length);
             const domText = (el) => [...el.querySelectorAll(".xterm-rows > div")].map((row) => row.textContent).join("").trim();
-            check("this browser can create a WebGL2 context (the GPU checks below need one)",
-              () => !!document.createElement("canvas").getContext("webgl2"));
+            // The addon also adds a 2D link layer (`xterm-link-layer`); the
+            // WebGL canvas is the one without a layer class.
+            const glCanvas = (el) => [...el.querySelectorAll("canvas")].find((node) => ![...node.classList].some((name) => name.endsWith("-layer")));
+            const frames = (count = 2) => new Promise((resolve) => {
+              let left = count;
+              const tick = () => (--left <= 0 ? resolve() : requestAnimationFrame(tick));
+              requestAnimationFrame(tick);
+            });
+            const gpuNote = () => visible("[data-terminal-gpu-note]")[0]?.textContent ?? "";
+            // A context created before any session's is the oldest one on the
+            // page, which is the one a browser force-loses first when the page
+            // passes its cap (16 in Chromium and in WebKit). It is never drawn
+            // to and never released by anything here.
+            const sentinel = document.createElement("canvas").getContext("webgl2");
+            check("this browser can create a WebGL2 context (the GPU checks below need one)", () => !!sentinel);
+            // Whether a draw reached the canvas in the frames after a show: a
+            // renderer set while xterm's render service was paused draws a
+            // blank first frame (xterm.js #6239). `readPixels` has to run in
+            // the task that drew, so the draw calls are wrapped while armed.
+            const probe = { armed: false, draws: 0, painted: false };
+            const drawElements = WebGL2RenderingContext.prototype.drawElementsInstanced;
+            WebGL2RenderingContext.prototype.drawElementsInstanced = function (...args) {
+              const result = drawElements.apply(this, args);
+              if (probe.armed) {
+                probe.draws += 1;
+                const { drawingBufferWidth: w, drawingBufferHeight: h } = this;
+                const pixels = new Uint8Array(w * h * 4);
+                this.readPixels(0, 0, w, h, this.RGBA, this.UNSIGNED_BYTE, pixels);
+                for (let at = 3; at < pixels.length && !probe.painted; at += 4) if (pixels[at] !== 0) probe.painted = true;
+              }
+              return result;
+            };
+            const showAndProbe = async () => {
+              probe.armed = true; probe.draws = 0; probe.painted = false;
+              button("Show terminal").click();
+              await frames(4);
+              probe.armed = false;
+            };
+
             check("with the setting off, no session holds a WebGL context",
               () => sessionsAll().every((el) => el.dataset.renderer === "dom" && !el.querySelector("canvas")));
+            // Long enough that nothing below expires by accident; narrowed where a check waits it out.
+            gpuPolicy.hideGraceMs = 3000;
+            gpuPolicy.recoverDelayMs = 300;
+            gpuPolicy.lossBudget = 2;
             interfaceStore.setTerminalGpu(true); await wait();
             check("the session on screen draws through WebGL", () => {
               const [el] = shown();
@@ -434,26 +528,100 @@
               if (rows.length < 2) throw new Error(`expected the other tab and the other repository's session hidden, saw ${rows.length}`);
               return rows.every((row) => row === "dom/0");
             });
-            button("Hide the terminal dock").click(); await wait();
-            check("hiding the dock releases the on-screen session's context too",
-              () => sessionsAll().every((el) => el.dataset.renderer === "dom" && !el.querySelector("canvas")));
-            button("Show terminal").click(); await wait();
             const [target] = shown();
-            check("showing the dock again attaches a fresh context", () => target?.dataset.renderer === "webgl");
-            // The addon also adds a 2D link layer (`xterm-link-layer`); the
-            // WebGL canvas is the one without a layer class.
-            const canvas = [...target.querySelectorAll("canvas")].find((el) => ![...el.classList].some((name) => name.endsWith("-layer")));
-            const gl = canvas?.getContext("webgl2");
-            check("the on-screen session's canvas holds a live WebGL2 context", () => !!gl && !gl.isContextLost());
-            // Resolves on the canvas's own target phase, after the session's
-            // capture listener has already reacted to the loss.
-            const lostAt = new Promise((resolve) => canvas.addEventListener("webglcontextlost", () => resolve(performance.now()), { once: true }));
-            gl.getExtension("WEBGL_lose_context").loseContext();
-            const lost = await lostAt;
-            await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-            const settled = performance.now() - lost;
+            const firstCanvas = glCanvas(target);
+            const firstGl = firstCanvas?.getContext("webgl2");
+            check("the on-screen session's canvas holds a live WebGL2 context", () => !!firstGl && !firstGl.isContextLost());
+
+            // -- A tab flick inside the hold keeps the warm context.
+            button("Hide the terminal dock").click(); await wait(150);
+            check("hiding the dock keeps the session's context through the hold: same canvas, live, still webgl",
+              () => target.dataset.renderer === "webgl" && glCanvas(target) === firstCanvas && !firstGl.isContextLost());
+            await showAndProbe();
+            check("a tab flick inside the hold reuses the same canvas element and the same live context",
+              () => shown()[0] === target && target.dataset.renderer === "webgl" && glCanvas(target) === firstCanvas && !firstGl.isContextLost());
+            check("the first frames after showing a held session reach the canvas (no blank frame)",
+              () => probe.painted || (() => { throw new Error(`${probe.draws} draw calls, none painted`); })());
+            await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait(80);
+            const other = shown()[0];
+            check("switching tabs gives the other session its own context while this one is held",
+              () => other !== target && other.dataset.renderer === "webgl" && target.dataset.renderer === "webgl"
+                && glCanvas(other) !== glCanvas(target));
+            await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft"); await wait(80);
+            check("switching back inside the hold reuses this session's canvas, and the other is held, within the cap",
+              () => shown()[0] === target && glCanvas(target) === firstCanvas && !firstGl.isContextLost()
+                && sessionsAll().filter((el) => el.querySelector("canvas")).length <= 2);
+
+            // -- The hold ends: the context is freed on purpose, not left for the collector.
+            gpuPolicy.hideGraceMs = 400;
+            await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait(80);
+            await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft"); await wait(900);
+            check("a session that stays hidden past the hold gives its context up",
+              () => other.dataset.renderer === "dom" && !other.querySelector("canvas"));
+            button("Hide the terminal dock").click(); await wait(900);
+            check("hiding the dock past the hold releases the on-screen session's context too",
+              () => sessionsAll().every((el) => el.dataset.renderer === "dom" && !el.querySelector("canvas")));
+            check("the released context was lost on purpose (addon-webgl's dispose alone never does)",
+              () => firstGl.isContextLost());
+            await showAndProbe();
+            check("showing the dock again attaches a fresh context", () => target.dataset.renderer === "webgl" && glCanvas(target) !== firstCanvas);
+            check("the first frames after a fresh attach reach the canvas (no blank frame)",
+              () => probe.painted || (() => { throw new Error(`${probe.draws} draw calls, none painted`); })());
+
+            // -- Forty hide/show cycles inside the hold create nothing: the same canvas, the sentinel untouched.
+            gpuPolicy.hideGraceMs = 3000;
+            const beforeFlicks = glCanvas(target);
+            for (let cycle = 0; cycle < 40; cycle += 1) {
+              button("Hide the terminal dock").click(); await wait(40);
+              button("Show terminal").click(); await wait(40);
+            }
+            await wait(100);
+            check("after 40 hide/show cycles inside the hold the session is on the same canvas, live, on WebGL",
+              () => shown()[0] === target && target.dataset.renderer === "webgl" && glCanvas(target) === beforeFlicks && !beforeFlicks.getContext("webgl2").isContextLost());
+            check("the page's oldest context survived those cycles", () => !sentinel.isContextLost());
+
+            // -- Forty cycles with no hold create and free a context each: the on-screen session stays on WebGL.
+            gpuPolicy.hideGraceMs = 0;
+            const everAttached = [];
+            for (let cycle = 0; cycle < 40; cycle += 1) {
+              button("Hide the terminal dock").click(); await wait(40);
+              button("Show terminal").click(); await wait(40);
+              const attached = glCanvas(target)?.getContext("webgl2");
+              if (attached && !everAttached.includes(attached)) everAttached.push(attached);
+            }
+            await wait(100);
+            const cycled = glCanvas(target);
+            const cycledGl = cycled?.getContext("webgl2");
+            check("after 40 hide/show cycles with no hold the on-screen session is still on WebGL, not lost",
+              () => shown()[0] === target && target.dataset.renderer === "webgl" && !!cycledGl && !cycledGl.isContextLost());
+            check("every earlier context was lost on purpose, none left for the collector",
+              () => everAttached.length > 10 && everAttached.every((gl) => gl === cycledGl || gl.isContextLost()));
+            // Chromium stops counting a lost context at once, so the page's oldest
+            // context is a sound witness there. WebKit counts a lost wrapper until
+            // it is collected and picks its victim by last draw, so the same
+            // witness would measure its collector, not this code; the check above
+            // is what holds in both.
+            if (!/AppleWebKit/.test(navigator.userAgent) || /Chrome\//.test(navigator.userAgent)) {
+              check("the page's oldest context survived (Chromium counts only live contexts)", () => !sentinel.isContextLost());
+            }
+            check("only the session on screen holds a canvas", () => sessionsAll().filter((el) => el.querySelector("canvas")).length === 1);
+            gpuPolicy.hideGraceMs = 400;
+
+            // -- A lost context: the DOM at once, then WebGL again, within the budget.
+            const loseNow = async () => {
+              const canvas = glCanvas(target);
+              const gl = canvas.getContext("webgl2");
+              // Resolves on the canvas's own target phase, after the session's
+              // capture listener has already reacted to the loss.
+              const lostAt = new Promise((resolve) => canvas.addEventListener("webglcontextlost", () => resolve(performance.now()), { once: true }));
+              gl.getExtension("WEBGL_lose_context").loseContext();
+              const lost = await lostAt;
+              await frames(2);
+              return performance.now() - lost;
+            };
+            const settled = await loseNow();
             check("a lost context is disposed at once: no canvas left in the pane", () => !target.querySelector("canvas"));
-            check("the session is marked lost", () => target.dataset.renderer === "lost");
+            check("the session is marked reset, not final", () => target.dataset.renderer === "reset");
             check("the DOM renderer draws the same rows on the next frame, so the pane never blanks", () => {
               const text = domText(target);
               if (!text) throw new Error("no DOM rows two frames after the loss");
@@ -461,22 +629,52 @@
               if (settled > 1000) throw new Error(`DOM rows took ${Math.round(settled)} ms`);
               return true;
             });
-            button("Hide the terminal dock").click(); await wait();
-            button("Show terminal").click(); await wait();
-            check("a lost session is never re-attached", () => target.dataset.renderer === "lost" && !target.querySelector("canvas") && !!domText(target));
+            check("the session says it draws without the GPU after a graphics reset",
+              () => /Drawing without GPU after a graphics reset/.test(gpuNote()));
+            await wait(gpuPolicy.recoverDelayMs + 400);
+            check("it attaches a new context by itself after the recovery delay, and the note goes",
+              () => target.dataset.renderer === "webgl" && !!glCanvas(target) && !glCanvas(target).getContext("webgl2").isContextLost() && gpuNote() === "");
+            await loseNow();
+            check("the second loss is recoverable too (inside the budget)", () => target.dataset.renderer === "reset");
+            button("Hide the terminal dock").click(); await wait(gpuPolicy.recoverDelayMs + 300);
+            check("a hidden session is not re-attached while it is hidden", () => target.dataset.renderer === "reset" && !target.querySelector("canvas"));
+            await showAndProbe(); await wait(100);
+            check("showing it again re-attaches", () => target.dataset.renderer === "webgl" && !!glCanvas(target));
+            // The engine evicts the context drawn least recently, a hidden
+            // session's held one: that ends the hold, it is not a counted loss.
+            const graceBefore = gpuPolicy.hideGraceMs;
+            gpuPolicy.hideGraceMs = 3000;
+            button("Hide the terminal dock").click(); await wait(100);
+            const heldCanvas = glCanvas(target);
+            check("a hidden session holds its context through the hold", () => !!heldCanvas && target.dataset.renderer === "webgl");
+            heldCanvas.getContext("webgl2").getExtension("WEBGL_lose_context").loseContext();
+            await wait(100);
+            check("losing a held context ends the hold quietly, without a GPU note", () => target.dataset.renderer === "dom" && !target.querySelector("canvas"));
+            await showAndProbe(); await wait(100);
+            check("after a held loss the next show re-attaches", () => target.dataset.renderer === "webgl" && !!glCanvas(target) && gpuNote() === "");
+            gpuPolicy.hideGraceMs = graceBefore;
+            await loseNow();
+            check("a loss past the budget is final, and the DOM draws the rows", () => target.dataset.renderer === "lost" && !target.querySelector("canvas") && !!domText(target));
+            check("the final note says so, without promising a retry", () => /^Drawing without GPU$/.test(gpuNote()));
+            button("Hide the terminal dock").click(); await wait(gpuPolicy.recoverDelayMs + 300);
+            button("Show terminal").click(); await wait(gpuPolicy.recoverDelayMs + 300);
+            check("a session past its budget is never re-attached", () => target.dataset.renderer === "lost" && !target.querySelector("canvas") && !!domText(target));
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait();
             check("another session still gets WebGL when it comes on screen",
               () => shown().length === 1 && shown()[0] !== target && shown()[0].dataset.renderer === "webgl");
-            await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft"); await wait();
-            check("switching back leaves the other session without a context and this one on the DOM",
+            await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft"); await wait(gpuPolicy.hideGraceMs + 500);
+            check("switching back leaves the other session without a context once its hold is over, and this one on the DOM",
               () => shown()[0] === target && target.dataset.renderer === "lost" && hidden().every((el) => !el.querySelector("canvas")));
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowRight"); await wait();
             interfaceStore.setTerminalGpu(false); await wait();
-            check("turning the setting off returns a live WebGL session to the DOM renderer",
+            check("turning the setting off returns a live WebGL session to the DOM renderer at once",
               () => shown()[0] !== target && shown()[0].dataset.renderer === "dom" && !!domText(shown()[0])
                 && sessionsAll().every((el) => !el.querySelector("canvas")));
             await press(visible('[role="tab"][aria-selected="true"]')[0], "ArrowLeft"); await wait();
+            WebGL2RenderingContext.prototype.drawElementsInstanced = drawElements;
+            Object.assign(gpuPolicy, policyBefore);
           }
+
 
           // ---- Frame probe (OSC 7700), as scripts/tui-redraw-bench.mjs drives it.
           {
@@ -1043,6 +1241,289 @@
       }
 
       /**
+       * Grid fitting: which terminals are told their size, and when.
+       *
+       * A hidden terminal sits in `display: none`, where `getComputedStyle`
+       * answers with the declared value (`100%`) instead of a pixel size and
+       * xterm's fit addon parses that as a 100px box. These checks read what
+       * the PTY was told (`resizeLog`) and what the DOM grid actually is, so
+       * they fail on the symptom, not on the code path.
+       *
+       * Each section reports its own rows: one failing section must not hide
+       * the sections after it.
+       */
+      async function runFit() {
+        const all = [];
+        const section = async (body) => {
+          const { results, check, stopped } = createChecks();
+          try { await body(check); } catch (error) { stopped(error); }
+          all.push(...results);
+        };
+        const dockHost = () => visible("[data-terminal-host]")[0];
+        const panels = () => [...dockHost().querySelectorAll('[role="tabpanel"]')];
+        const rowsOf = (panel) => panel.querySelectorAll(".xterm-rows > div").length;
+        const rowHeight = (panel) => parseFloat(panel.querySelector(".xterm-rows > div")?.style.height) || 0;
+        const boxOf = (panel) => panel.querySelector("[data-terminal-session]");
+        const shownPanels = () => panels().filter((panel) => panel.getClientRects().length);
+        /** Whole rows fill the box to within one row. A hidden pane has no box to compare. */
+        const fitsHeight = (panel) => {
+          const box = boxOf(panel).clientHeight, rows = rowsOf(panel), height = rowHeight(panel);
+          if (!rows || !height) throw new Error("no rows");
+          return rows * height <= box + 1 && box - rows * height < height + 1;
+        };
+        const sameGrid = () => new Set(panels().map(rowsOf)).size === 1;
+        const tabs = () => visible('[role="tab"]');
+        const since = (mark) => resizeLog.slice(mark);
+        const setDockHeight = (px) => { interfaceStore.setTerminalDockHeight(px); return wait(400); };
+        const frame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+        // Seeded, so a failing order can be replayed.
+        let seed = 0x9e3779b9;
+        const random = () => { seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+        const root = document.querySelector(".h-screen");
+        const rootMaxWidth = root.style.maxWidth;
+        const restoreRoot = () => { root.style.maxWidth = rootMaxWidth; root.style.width = ""; };
+
+        // Setup: the active repository's dock open, three shells, split closed.
+        // The input checks leave a hung context read behind and a question
+        // open; both would hold every close below.
+        const { promptState, completePrompt } = await import("../src/lib/stores/modalStore");
+        const { get } = await import("svelte/store");
+        contextHangs = false; contextBusy = false;
+        if (get(promptState)) { completePrompt(false); await wait(200); }
+        interfaceStore.setTerminalFontSize(12);
+        interfaceStore.setTerminalDockHeight(400);
+        if (label("Close split view")) { button("Close split view").click(); await wait(); }
+        button("Repository GitPulse").click(); await wait();
+        if (!visible("[data-terminal-dock]").length) { button("Show terminal").click(); await wait(); }
+        for (let guard = 0; guard < 40 && visible("[data-terminal-tab] button[aria-label^='Close ']").length > 3; guard++) {
+          visible("[data-terminal-tab] button[aria-label^='Close ']").at(-1).click(); await wait(150);
+          if (get(promptState)) completePrompt(true);
+          await wait(100);
+        }
+        for (let guard = 0; guard < 10 && tabs().length < 3; guard++) { visible("[data-terminal-new]")[0].click(); await wait(300); }
+        // Show each once, so every grid has been fitted to the same box. A
+        // tab that was hidden when the box changed is stale until it is shown.
+        for (let i = tabs().length - 1; i >= 0; i--) { tabs()[i].click(); await wait(400); }
+        await wait(300);
+        const setupTabs = tabs().length;
+
+        await section(async (check) => {
+          check(`setup: three shells in the active repository (tabs ${setupTabs}, panels ${panels().length}, close buttons ${visible("[data-terminal-tab] button[aria-label^='Close ']").length}, prompt ${JSON.stringify(get(promptState)?.options?.message ?? null)}, killed ${report.killed})`, () => setupTabs === 3 && panels().length === 3);
+          // What xterm's fit addon would read for a pane nobody can see.
+          const hiddenBox = panels().filter((panel) => !panel.getClientRects().length).map(boxOf)[0];
+          check(`characterization: a hidden terminal box measures as ${getComputedStyle(hiddenBox).height} x ${getComputedStyle(hiddenBox).width} (shown: ${getComputedStyle(boxOf(shownPanels()[0])).height})`, () => !!hiddenBox);
+          check("every tab, hidden or not, holds the same grid as the one on screen", () => sameGrid());
+          const mark = resizeLog.length;
+          for (let i = 0; i < 20; i++) { tabs()[i % 3].click(); await wait(60); }
+          await wait(300);
+          check(`twenty tab switches tell no PTY a new size (saw ${JSON.stringify(since(mark))})`, () => since(mark).length === 0);
+          check("after the switches every tab still holds the same grid", () => sameGrid());
+          check("the tab on screen fills its box", () => shownPanels().every(fitsHeight));
+        });
+
+        await section(async (check) => {
+          const mark = resizeLog.length;
+          for (let i = 0; i < 100; i++) {
+            tabs()[Math.floor(random() * 3)].click();
+            if (i % 7 === 0) await wait(10); else await frame();
+          }
+          await wait(500);
+          // Observed: a first show can re-measure a terminal by one column
+          // (55 to 54), cause not isolated. What a switch must never do is
+          // hand one a degenerate grid; hidden panes measured as 11 x 6.
+          const told = since(mark);
+          check(`100 seeded tab switches hand no PTY a degenerate grid (${told.length} resizes: ${JSON.stringify(told.slice(0, 6))})`, () => told.length <= 3 && told.every((row) => row.cols >= 40 && row.rows >= 10));
+          check("after 100 switches every tab still holds the same grid", () => sameGrid());
+          check("after 100 switches the tab on screen fills its box", () => shownPanels().every(fitsHeight));
+        });
+
+        await section(async (check) => {
+          tabs()[0].click(); await wait(300);
+          let mark = resizeLog.length;
+          button("Hide the terminal dock").click(); await wait(400);
+          button("Show terminal").click(); await wait(400);
+          check(`hiding and showing the dock tells no PTY a new size (saw ${JSON.stringify(since(mark))})`, () => since(mark).length === 0);
+          check("the grid survives the dock being hidden and shown", () => sameGrid() && shownPanels().every(fitsHeight));
+          // Resized while hidden: nothing may be told until it is shown, and
+          // then once.
+          button("Hide the terminal dock").click(); await wait(300);
+          mark = resizeLog.length;
+          await setDockHeight(300);
+          check(`a dock resized while hidden tells no PTY a new size (saw ${JSON.stringify(since(mark))})`, () => since(mark).length === 0);
+          button("Show terminal").click(); await wait(500);
+          const told = since(mark);
+          check(`showing it tells the one visible session exactly once (saw ${JSON.stringify(told)})`, () => told.length === 1);
+          check("and that session fills the new box", () => shownPanels().every(fitsHeight));
+          // A tab hidden while the dock changed catches up when it is shown.
+          mark = resizeLog.length;
+          tabs()[1].click(); await wait(500);
+          check(`a tab that missed the resize is fitted once when shown (saw ${JSON.stringify(since(mark))})`, () => since(mark).length === 1);
+          check("and it fills the box", () => shownPanels().every(fitsHeight));
+          await setDockHeight(400);
+          await wait(300);
+        });
+
+        await section(async (check) => {
+          // CHARACTERIZATION of the font path: a tab that is hidden when the
+          // size changes is fitted when it is next shown.
+          tabs()[0].click(); await wait(300);
+          let mark = resizeLog.length;
+          interfaceStore.setTerminalFontSize(14); await wait(500);
+          const told = since(mark).length;
+          check(`characterization: one session is told when the font changes (saw ${told})`, () => told === 1);
+          mark = resizeLog.length;
+          tabs()[2].click(); await wait(500);
+          check(`a tab that missed the font change is fitted once when shown (saw ${JSON.stringify(since(mark))})`, () => since(mark).length === 1);
+          check("and it fills the box at the new size", () => shownPanels().every(fitsHeight));
+          interfaceStore.setTerminalFontSize(12); await wait(500);
+        });
+
+        await section(async (check) => {
+          tabs()[0].click(); await wait(300);
+          button("Split terminal").click(); await wait(500);
+          check("split view shows two panes", () => shownPanels().length === 2);
+          const mark = resizeLog.length;
+          interfaceStore.setTerminalFontSize(15); await wait(600);
+          const ids = new Set(since(mark).map((row) => row.id));
+          check(`a font change refits both halves of a split (told ${[...ids].join(", ") || "nobody"})`, () => ids.size === 2);
+          check("both halves fill their boxes at the new size", () => shownPanels().every(fitsHeight));
+          interfaceStore.setTerminalFontSize(12); await wait(500);
+          check("both halves fill their boxes again at the old size", () => shownPanels().every(fitsHeight));
+          button("Close split view").click(); await wait(400);
+        });
+
+        await section(async (check) => {
+          const rules = [...document.styleSheets].filter((sheet) => dockHost().contains(sheet.ownerNode)).flatMap((sheet) => { try { return [...sheet.cssRules]; } catch { return []; } })
+            .filter((rule) => rule.selectorText?.includes(".xterm-selection div") && !rule.selectorText.includes(".focus"));
+          check("xterm resolved a selection colour for every session", () => rules.length >= 3);
+          const channels = (rule) => rule.style.backgroundColor.match(/[\d.]+/g).map(Number);
+          // The intended colour is a translucent blue over the surface; xterm's
+          // own default is a translucent white, which blends to a neutral grey.
+          check(`the selection colour is the intended blue, not xterm's default grey (${rules.map((rule) => rule.style.backgroundColor).join(" | ")})`,
+            () => rules.every((rule) => { const [r, g, b] = channels(rule); return b - r >= 25 && b - g >= 20; }));
+        });
+
+        await section(async (check) => {
+          const styles = [...dockHost().querySelectorAll("style")].filter((el) => el.textContent.includes(".xterm-selection"));
+          check("every session has a theme style sheet to watch", () => styles.length >= 3);
+          let writes = 0;
+          const watcher = new MutationObserver((records) => { writes += records.length; });
+          for (const el of styles) watcher.observe(el, { childList: true, characterData: true, subtree: true });
+          for (let i = 0; i < 10; i++) { document.documentElement.style.setProperty("--gp-fit-probe", String(i)); await wait(40); }
+          check(`ten style changes that leave the theme alone rewrite no terminal palette (saw ${writes} rewrites)`, () => writes === 0);
+          document.documentElement.style.removeProperty("--gp-fit-probe");
+          await wait(100);
+          writes = 0;
+          document.documentElement.style.setProperty("--c-accent", "10 200 90"); await wait(200);
+          check(`a real palette change still reaches every session (saw ${writes} rewrites)`, () => writes >= styles.length);
+          document.documentElement.style.removeProperty("--c-accent"); await wait(200);
+          watcher.disconnect();
+        });
+
+        await section(async (check) => {
+          // A display move cannot be staged here, so the page's own
+          // `matchMedia` is wrapped to hand back the query list the session
+          // armed, and `change` is dispatched on it. What is checked is that
+          // the session subscribed, re-armed, and measured its box again.
+          const realMatchMedia = window.matchMedia.bind(window);
+          const realComputedStyle = window.getComputedStyle.bind(window);
+          const armed = [];
+          window.matchMedia = (query) => { const list = realMatchMedia(query); if (!/screen and/.test(query)) armed.push({ query, list }); return list; };
+          let measured = 0, watched = null;
+          window.getComputedStyle = (element, pseudo) => { if (watched && element === watched) measured++; return realComputedStyle(element, pseudo); };
+          try {
+            if (tabs().length >= 6) { visible("[data-terminal-tab] button[aria-label^='Close ']").at(-1).click(); await wait(200); }
+            visible("[data-terminal-new]")[0].click(); await wait(600);
+            check("a new session watches the display's pixel ratio", () => armed.length >= 1);
+            watched = boxOf(shownPanels()[0]);
+            const first = armed.at(-1);
+            measured = 0;
+            first.list.dispatchEvent(new Event("change"));
+            await wait(300);
+            check(`a pixel-ratio change makes the session measure its box again (measured ${measured} times)`, () => measured >= 1);
+            check("and the query is re-armed for the next change", () => armed.length >= 2);
+          } finally {
+            window.matchMedia = realMatchMedia;
+            window.getComputedStyle = realComputedStyle;
+          }
+        });
+
+        await section(async (check) => {
+          // Output in flight while the layout is being changed under it.
+          const ids = [...sessions].filter(([, repo]) => repo === "/fixture/GitPulse").map(([id]) => id);
+          const block = Array.from({ length: 4096 }, (_, i) => `row ${i} ${"x".repeat(240)}\r\n`).join("");
+          const chunk = block.repeat(Math.ceil((4 * 1024 * 1024) / ids.length / block.length)).slice(0, Math.ceil((4 * 1024 * 1024) / ids.length));
+          const flood = Promise.all(ids.map((id) => output(id, chunk)));
+          const mark = resizeLog.length;
+          for (let i = 0; i < 3; i++) {
+            button(label("Close split view") ? "Close split view" : "Split terminal").click(); await wait(60);
+            interfaceStore.setTerminalDockHeight(i % 2 ? 400 : 260); await wait(60);
+            interfaceStore.setTerminalFontSize(i % 2 ? 12 : 13); await wait(60);
+          }
+          await flood;
+          if (label("Close split view")) { button("Close split view").click(); await wait(200); }
+          interfaceStore.setTerminalDockHeight(400); interfaceStore.setTerminalFontSize(12);
+          await wait(800);
+          check("no runtime error while resizing under a 4 MiB write", () => report.errors.length === 0);
+          check(`every size the PTY was told stays in 2..1000 (saw ${since(mark).length} resizes)`, () => since(mark).every((row) => row.cols >= 2 && row.cols <= 1000 && row.rows >= 1 && row.rows <= 1000));
+          check("and the tab on screen fills its box afterwards", () => shownPanels().every(fitsHeight));
+        });
+
+        await section(async (check) => {
+          // 0 high: a squeezed container is not a 1-row terminal.
+          tabs()[0].click(); await wait(300);
+          const box = boxOf(shownPanels()[0]);
+          const before = rowsOf(shownPanels()[0]);
+          const mark = resizeLog.length;
+          box.style.height = "0px"; await wait(500);
+          check(`a terminal squeezed to 0 high tells no PTY a new size (saw ${JSON.stringify(since(mark))})`, () => since(mark).length === 0);
+          box.style.height = ""; await wait(500);
+          check("and its grid is intact when the box returns", () => rowsOf(shownPanels()[0]) === before && shownPanels().every(fitsHeight));
+        });
+
+        await section(async (check) => {
+          // The grid is capped at 1000 columns however wide the box is.
+          const mark = resizeLog.length;
+          root.style.maxWidth = "none"; root.style.width = "11000px"; await wait(800);
+          const widest = Math.max(0, ...since(mark).map((row) => row.cols));
+          check(`a box wider than 1000 columns is cut at 1000 (widest told ${widest})`, () => widest === 1000);
+          restoreRoot(); await wait(800);
+          check("and narrowing again fits the box", () => since(mark).at(-1).cols < 1000);
+        });
+
+        await section(async (check) => {
+          // A fast horizontal drag: nearly every frame changes the column count,
+          // and every column change reflows the scrollback. Measured, not assumed.
+          root.style.maxWidth = "1300px"; await wait(600);
+          const mark = resizeLog.length;
+          const gaps = [];
+          const started = performance.now();
+          let last = started, frames = 0;
+          for (let x = 1300; x >= 700; x -= 12) {
+            root.style.maxWidth = `${x}px`;
+            await frame();
+            const now = performance.now(); gaps.push(now - last); last = now; frames++;
+          }
+          root.style.maxWidth = "560px";
+          const dragMs = performance.now() - started;
+          await wait(400);
+          const told = since(mark).length;
+          gaps.sort((a, b) => a - b);
+          report.fitDrag = { frames, dragMs: Math.round(dragMs), resizesTold: told, frameMedianMs: +gaps[gaps.length >> 1].toFixed(1), frameP95Ms: +gaps[Math.floor(gaps.length * 0.95)].toFixed(1) };
+          check(`the drag is measured (${JSON.stringify(report.fitDrag)})`, () => frames > 30);
+          check(`a drag tells the PTY at most once per 32 ms, not once per frame (${told} resizes in ${Math.round(dragMs)} ms)`, () => told <= Math.ceil(dragMs / 32) + 2);
+          const box = boxOf(shownPanels()[0]), screen = box.querySelector(".xterm-screen");
+          check(`the last width of the drag is fitted at its end (gap ${(box.clientWidth - screen.offsetWidth).toFixed(1)} px)`, () => box.clientWidth - screen.offsetWidth < 30);
+          restoreRoot(); await wait(500);
+        });
+
+        await section(async (check) => { check("no runtime errors", () => report.errors.length === 0); });
+        report.fit = all;
+        showReport();
+        return all;
+      }
+
+      /**
        * A saved "Skip permissions" default for Claude, through the real dock
        * and on the renderer the app uses. The agreement is an overlay laid on
        * the grid; WebGL adds a full-size link-layer canvas with its own
@@ -1107,6 +1588,252 @@
         return results;
       }
 
+      /**
+       * DEC 2026 synchronized output (xtermjs/xterm.js#6071). xterm drops the
+       * paint of a frame when the next frame's `CSI ? 2026 h` has been parsed by
+       * the time its animation frame fires, so a program that redraws
+       * continuously is painted about once a second. PTY output reaches xterm in
+       * chunks cut without regard to frame boundaries, so this feeds back-to-back
+       * frames in chunks that end mid-frame, ~120 frames a second for two
+       * seconds, and counts what xterm paints:
+       *
+       *   - the real xterm, on its DOM renderer and on WebGL, written to
+       *     directly (what the view did before `syncFrames`) and through the
+       *     writer the view uses;
+       *   - the real session, on its DOM renderer, fed through the channel PTY
+       *     output arrives on.
+       *
+       * A paint is any `onRender`; at each one every row is read back and must
+       * carry the same frame number, or a half-drawn frame was shown.
+       */
+      const SYNC_ROWS = 24;
+      const SYNC_COLS = 100;
+      const SYNC_FPS = 120;
+      const SYNC_MS = 2000;
+      /** The options of TerminalSession's own xterm that could touch painting. */
+      const SESSION_LIKE = { lineHeight: 1.15, cursorBlink: true, allowTransparency: true, convertEol: false, allowProposedApi: true };
+      const frameText = (id, rows, width) => {
+        let s = "\u001b[?2026h\u001b[H";
+        for (let r = 0; r < rows; r++) {
+          s += `\u001b[3${1 + (r % 6)}mF${String(id).padStart(5, "0")} row${String(r).padStart(2, "0")} ${"#".repeat(width)}\u001b[0m${r < rows - 1 ? "\r\n" : ""}`;
+        }
+        return s + "\u001b[?2026l";
+      };
+      const frameStream = (frames, rows = SYNC_ROWS, width = 70) => new TextEncoder().encode(Array.from({ length: frames }, (_, i) => frameText(i + 1, rows, width)).join(""));
+      /** Delivers `stream` over `ms`, in chunks of whatever arrived since the last tick, as a reader does. */
+      async function deliver(stream, ms, push) {
+        const started = performance.now();
+        const frameLen = stream.length / Math.round(SYNC_FPS * ms / 1000);
+        let sent = 0, chunks = 0, midFrame = 0;
+        for (;;) {
+          const elapsed = performance.now() - started;
+          const target = elapsed >= ms ? stream.length : Math.floor(stream.length * elapsed / ms);
+          if (target > sent) {
+            const into = target % frameLen;
+            if (into > 8 && into < frameLen - 8) midFrame++;
+            push(stream.subarray(sent, target));
+            sent = target; chunks++;
+          }
+          if (sent >= stream.length) return { chunks, midFrame };
+          await new Promise((resolve) => setTimeout(resolve, 3));
+        }
+      }
+      /** The frame number each row names; a complete frame names one number on every row. */
+      const frameIdsOf = (rows) => rows.map((text) => /^F(\d{5}) row/.exec(text)?.[1] ?? "");
+      const syncHost = () => {
+        const host = document.createElement("div");
+        host.style.cssText = "position:fixed;left:0;top:0;width:900px;height:420px;z-index:-1";
+        document.body.appendChild(host);
+        return host;
+      };
+      /** The real xterm, written to directly or through the view's writer, on WebGL or the DOM. */
+      async function syncRun({ gpu, viaWriter }) {
+        const { Terminal } = await import("@xterm/xterm");
+        const { createSyncFrameWriter } = await import("../src/lib/terminal/syncFrames.ts");
+        const host = syncHost();
+        const term = new Terminal({ cols: SYNC_COLS, rows: SYNC_ROWS, ...SESSION_LIKE });
+        term.open(host);
+        if (gpu) {
+          const { WebglAddon } = await import("@xterm/addon-webgl");
+          term.loadAddon(new WebglAddon());
+        }
+        term.focus();
+        const renderer = host.querySelector("canvas") ? "webgl" : "dom";
+        // `onRender` skips redraw-only renders (a blinking cursor asks for them),
+        // which still paint whatever a block buffered. What the screen shows is
+        // every call into the renderer, so that is what is counted.
+        const live = term._core?._renderService?._renderer?.value;
+        if (!live || typeof live.renderRows !== "function") throw new Error("xterm's renderer is not where this harness looks for it");
+        const drawRows = live.renderRows.bind(live);
+        let paints = 0, partial = 0;
+        const ids = new Set();
+        live.renderRows = (start, end) => {
+          drawRows(start, end);
+          paints++;
+          const seen = frameIdsOf(Array.from({ length: SYNC_ROWS }, (_, r) => term.buffer.active.getLine(r)?.translateToString(true) ?? ""));
+          if (seen.every((id) => id === "")) return;
+          if (seen.some((id) => id !== seen[0])) partial++; else ids.add(seen[0]);
+        };
+        let acked = 0, received = 0, writes = 0, endedInsideBlock = 0;
+        // xterm's own parser, not this harness's model of it: is mode 2026 on
+        // when a write has been parsed? That is the state its animation frame meets.
+        const modes = term._core?.coreService?.decPrivateModes;
+        if (typeof modes?.synchronizedOutput !== "boolean") throw new Error("xterm's synchronized-output flag is not where this harness looks for it");
+        const write = (bytes, written) => term.write(bytes, () => { writes++; if (modes.synchronizedOutput) endedInsideBlock++; written(); });
+        const writer = createSyncFrameWriter({ write });
+        await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+        const base = paints;
+        const sent = await deliver(frameStream(Math.round(SYNC_FPS * SYNC_MS / 1000)), SYNC_MS, (chunk) => {
+          received += chunk.length;
+          const done = () => { acked += chunk.length; };
+          if (viaWriter) writer.push(chunk, done); else write(chunk, done);
+        });
+        const out = { gpu, renderer, viaWriter, paints: paints - base, distinctFrames: ids.size, chunks: sent.chunks, chunksEndingMidFrame: sent.midFrame, writes, endedInsideBlock };
+        await wait(1300);
+        out.paintsAfterAnother1p3s = paints - base;
+        out.partialPaints = partial;
+        out.received = received;
+        out.acked = acked;
+        writer.discard();
+        term.dispose();
+        host.remove();
+        return out;
+      }
+      /** `bytes` of text with a 2026 block every ~190 lines, through a 512 KiB credit window like the view's. */
+      async function floodRun({ viaWriter, bytes }) {
+        const { Terminal } = await import("@xterm/xterm");
+        const { createSyncFrameWriter } = await import("../src/lib/terminal/syncFrames.ts");
+        const host = syncHost();
+        const term = new Terminal({ cols: SYNC_COLS, rows: SYNC_ROWS, scrollback: 1000, ...SESSION_LIKE });
+        term.open(host);
+        const line = (i) => `\u001b[3${1 + (i % 6)}m${String(i).padStart(8, "0")} ${"flood ".repeat(12)}\u001b[0m\r\n`;
+        let base = "";
+        for (let i = 0; base.length < 1_000_003; i++) base += i % 190 === 0 ? `\u001b[?2026h\u001b[H${line(i)}${line(i + 1)}\u001b[?2026l` : line(i);
+        const period = new TextEncoder().encode(base);
+        const CHUNK = 64 * 1024, WINDOW = 512 * 1024;
+        const writer = createSyncFrameWriter({ write: (b, w) => term.write(b, w) });
+        let inflight = 0, offset = 0, sent = 0, wake = null, acked = 0;
+        const t0 = performance.now();
+        while (sent < bytes) {
+          if (inflight + CHUNK > WINDOW) { await new Promise((resolve) => { wake = resolve; }); continue; }
+          const chunk = new Uint8Array(Math.min(CHUNK, bytes - sent));
+          for (let filled = 0; filled < chunk.length;) {
+            const part = period.subarray(offset, Math.min(period.length, offset + chunk.length - filled));
+            chunk.set(part, filled);
+            filled += part.length;
+            offset = (offset + part.length) % period.length;
+          }
+          sent += chunk.length;
+          inflight += chunk.length;
+          const done = () => { inflight -= chunk.length; acked += chunk.length; if (wake) { const w = wake; wake = null; w(); } };
+          if (viaWriter) writer.push(chunk, done); else term.write(chunk, done);
+        }
+        writer.flush();
+        while (acked < sent) await new Promise((resolve) => { wake = resolve; setTimeout(resolve, 50); });
+        const ms = performance.now() - t0;
+        term.dispose();
+        host.remove();
+        return { viaWriter, ms, mibPerS: bytes / 1048576 / (ms / 1000) };
+      }
+      /** Time from a one-byte write to the paint that shows it, nothing else in flight. */
+      async function echoRun({ viaWriter, n }) {
+        const { Terminal } = await import("@xterm/xterm");
+        const { createSyncFrameWriter } = await import("../src/lib/terminal/syncFrames.ts");
+        const host = syncHost();
+        const term = new Terminal({ cols: SYNC_COLS, rows: SYNC_ROWS, ...SESSION_LIKE });
+        term.open(host);
+        const writer = createSyncFrameWriter({ write: (b, w) => term.write(b, w) });
+        const times = [];
+        for (let i = 0; i < n; i++) {
+          const t = performance.now();
+          const shown = new Promise((resolve) => { const d = term.onRender(() => { d.dispose(); resolve(performance.now() - t); }); });
+          const chunk = new TextEncoder().encode("k");
+          if (viaWriter) writer.push(chunk, () => {}); else term.write(chunk);
+          times.push(await shown);
+          await wait(20);
+        }
+        term.dispose();
+        host.remove();
+        times.sort((a, b) => a - b);
+        return { viaWriter, p50: times[Math.floor(n / 2)], p95: times[Math.floor(n * 0.95)], max: times.at(-1) };
+      }
+      async function runSync() {
+        const { results, check, stopped } = createChecks();
+        const numbers = { arms: [] };
+        try {
+          check("this browser can create a WebGL2 context (the WebGL arms below need one)", () => !!document.createElement("canvas").getContext("webgl2"));
+          for (const gpu of [false, true]) {
+            const before = await syncRun({ gpu, viaWriter: false });
+            const after = await syncRun({ gpu, viaWriter: true });
+            numbers.arms.push(before, after);
+            const tag = `${gpu ? "WebGL" : "DOM"} renderer`;
+            check(`${tag}: the arms ran on that renderer`, () => before.renderer === (gpu ? "webgl" : "dom") && after.renderer === before.renderer);
+            check(`${tag}: chunks end inside a block, which is the premise (${after.chunksEndingMidFrame}/${after.chunks})`, () => after.chunksEndingMidFrame > after.chunks / 2);
+            // The direct arm's count (0 on Chrome, 0 to 10 on WebKit, against ~120)
+            // is reported in the verdict's diagnostics, not asserted: it is
+            // xterm's bug, and a fixed xterm would make it converge on this one.
+            check(`${tag}: through the writer it paints at the render rate (${after.paints} paints, ${after.distinctFrames} distinct frames)`, () => after.paints >= 40 && after.distinctFrames >= 40);
+            check(`${tag}: no write through the writer ends with mode 2026 on in xterm's own parser (${after.endedInsideBlock}/${after.writes}; written directly: ${before.endedInsideBlock}/${before.writes})`, () => after.writes > 0 && after.endedInsideBlock === 0);
+            check(`${tag}: no half-drawn frame is ever painted (${before.partialPaints} direct, ${after.partialPaints} through the writer)`, () => before.partialPaints === 0 && after.partialPaints === 0);
+            check(`${tag}: every byte received is acknowledged`, () => after.acked === after.received && before.acked === before.received);
+          }
+          // The real session on its DOM renderer: its output reaches xterm through the writer.
+          interfaceStore.setTerminalGpu(false);
+          setTerminalSessionLimit(SESSION_LIMIT + 8);
+          await wait();
+          const spawnedBefore = report.spawned;
+          button("New Shell session").click();
+          const spawnDeadline = performance.now() + 3000;
+          while (performance.now() < spawnDeadline && report.spawned === spawnedBefore) await wait(20);
+          const id = `fixture-${report.spawned}`;
+          await wait(700);
+          // Focused, as a session being typed into is: its cursor blinks and asks for redraws.
+          visible("textarea.xterm-helper-textarea").at(-1)?.focus();
+          const rowsNow = () => { const rows = visible(".xterm-rows").at(-1); return rows ? [...rows.children].map((row) => row.textContent ?? "") : []; };
+          const ackMark = acks.length;
+          const ids = new Set();
+          let partial = 0, samples = 0, running = true;
+          const sample = () => {
+            if (!running) return;
+            const matched = frameIdsOf(rowsNow()).filter((x) => x !== "");
+            if (matched.length) { samples++; if (new Set(matched).size > 1) partial++; else ids.add(matched[0]); }
+            requestAnimationFrame(sample);
+          };
+          requestAnimationFrame(sample);
+          let pushed = 0;
+          // A frame that fits the session's 16 x 54 grid, so nothing scrolls or wraps.
+          const session = await deliver(frameStream(Math.round(SYNC_FPS * SYNC_MS / 1000), 12, 30), SYNC_MS, (chunk) => {
+            pushed += chunk.length;
+            // The host sends messages of at most 64 KiB.
+            for (let at = 0; at < chunk.length; at += 65536) pushOutput(id, chunk.subarray(at, at + 65536));
+          });
+          const distinct = ids.size;
+          running = false;
+          await wait(400);
+          const repaid = acks.slice(ackMark).filter((row) => row.sessionId === id).reduce((sum, row) => sum + row.bytes, 0);
+          numbers.session = { id, distinctFrames: distinct, samples, partial, chunks: session.chunks, pushed, repaid };
+          check(`the real session (DOM renderer): continuous frames in mid-frame chunks reach the screen at the render rate (${distinct} distinct frames in 2 s)`, () => distinct >= 40);
+          check("the real session never shows a half-drawn frame", () => samples > 20 && partial === 0);
+          check(`the real session acknowledges every byte of the frames (${repaid}/${pushed})`, () => repaid === pushed);
+          check("no runtime errors", () => report.errors.length === 0);
+          if (params.has("syncbench")) {
+            const size = Number(params.get("syncbench")) * 1024 * 1024;
+            numbers.flood = { direct: [], writer: [] };
+            for (let i = 0; i < 6; i++) {
+              // Alternate which arm goes first, so a warming machine does not favour one.
+              for (const viaWriter of i % 2 ? [true, false] : [false, true]) numbers.flood[viaWriter ? "writer" : "direct"].push(await floodRun({ viaWriter, bytes: size }));
+            }
+            numbers.echo = { direct: await echoRun({ viaWriter: false, n: 40 }), writer: await echoRun({ viaWriter: true, n: 40 }) };
+          }
+        } catch (error) {
+          stopped(error);
+        }
+        report.sync = results;
+        report.syncNumbers = numbers;
+        showReport();
+        return { results, numbers };
+      }
+
       document.querySelector("#checks").onclick = async (event) => { event.currentTarget.disabled = true; await runChecks(); };
       document.querySelector("#stress").onclick = async (event) => { event.currentTarget.disabled = true; await runStress(); };
       document.querySelector("#checks").disabled = false;
@@ -1127,9 +1854,12 @@
         await wait(600);
         const checks = await runChecks();
         const stress = checks.every((row) => row.pass) ? await runStress() : [];
-        const bypass = stress.length && stress.every((row) => row.pass) ? await runBypass() : [];
-        const results = [...checks, ...stress, ...bypass];
-        document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors: report.errors }));
+        const fit = stress.length && stress.every((row) => row.pass) ? await runFit() : [];
+        const sync = fit.length && fit.every((row) => row.pass) ? await runSync() : { results: [], numbers: {} };
+        const bypass = sync.results.length && sync.results.every((row) => row.pass) ? await runBypass() : [];
+        const results = [...checks, ...stress, ...fit, ...sync.results, ...bypass];
+        const diagnostics = `fitDrag ${JSON.stringify(report.fitDrag ?? null)}; sync ${JSON.stringify(sync.numbers)}`;
+        document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors: report.errors, diagnostics }));
         if (params.has("report")) await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });
       }
     </script>

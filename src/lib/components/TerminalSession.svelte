@@ -14,11 +14,20 @@
    * `display:none`, so its observer fires with a zero rect on every strip
    * change. Those proposals are unusable and must be skipped, not rounded to
    * a 1x1 grid the shell would then be told about.
+   *
+   * `rendered` is whether the terminal's element has a box at all, and it
+   * outranks the proposal. Inside `display: none` `getComputedStyle` answers
+   * with the declared `100%`, which the fit addon's `parseInt` reads as a
+   * 100 px box: a confident, usable-looking 11 x 6 (measured in Chrome and
+   * WebKit). A proposal made without a box is therefore not evidence about
+   * the grid, whatever it says.
    */
   export function shouldRefit(
     current: TermDims | null,
     proposed?: TermDims | null,
+    rendered = true,
   ): boolean {
+    if (!rendered) return false;
     if (!proposed || !Number.isFinite(proposed.cols) || !Number.isFinite(proposed.rows)) {
       return false;
     }
@@ -59,6 +68,40 @@
     const opacity = alpha >= 1 ? "" : byte(alpha * 255);
     return `#${parts.slice(0, 3).map(byte).join("")}${opacity}`;
   }
+
+  /**
+   * The palette xterm is given, from a reader of CSS tokens.
+   *
+   * Every value that can be translucent is spelled in a form xterm parses on
+   * its own (`hexColor`). The selection colour used to be written as
+   * `rgb(128 158 255 / 0.32)`, which is neither hex nor the comma form xterm's
+   * parser accepts: it went to the canvas probe, which throws for alpha below
+   * 255, the parser swallowed the throw, and every terminal selected in
+   * xterm's default translucent white instead. The other colours are opaque
+   * by construction (`--c-*` channel triplets), which the probe reads.
+   */
+  export function buildTermTheme(v: (name: string, fallback: string) => string): Record<string, string> {
+    return {
+      background: hexColor(v("--bg-terminal", "#141a29")),
+      foreground: v("--text-primary", "#e9edf8"),
+      cursor: v("--accent-color", "#809eff"),
+      // The glyph drawn INSIDE a block cursor, so it is a foreground and stays
+      // opaque even when the surface behind it does not.
+      cursorAccent: v("--bg-surface", "#141a29"),
+      selectionBackground: hexColor("rgb(128 158 255 / 0.32)"),
+    };
+  }
+
+  /**
+   * Whether two palettes are the same colours. Setting a theme on xterm
+   * rebuilds its colour set and refreshes the glyph atlas whether or not
+   * anything changed, so an unchanged palette is not set again.
+   */
+  export function sameTheme(a: Record<string, string> | null, b: Record<string, string> | null): boolean {
+    if (!a || !b) return false;
+    const keys = Object.keys(a);
+    return keys.length === Object.keys(b).length && keys.every((key) => a[key] === b[key]);
+  }
 </script>
 
 <script lang="ts">
@@ -69,6 +112,7 @@
   import { Terminal as XTerm } from "@xterm/xterm";
   import { FitAddon } from "@xterm/addon-fit";
   import { SearchAddon } from "@xterm/addon-search";
+  import { Unicode11Addon } from "@xterm/addon-unicode11";
   import { WebglAddon } from "@xterm/addon-webgl";
   import "@xterm/xterm/css/xterm.css";
   import { AlertCircle, AlertTriangle, LoaderCircle, RotateCw, Search, ChevronUp, ChevronDown, X, Minus, Plus, ArrowDownToLine, ExternalLink } from "@lucide/svelte";
@@ -84,6 +128,7 @@
   import { planPaste } from "../terminal/pasteGuard";
   import { askConfirm } from "../stores/modalStore";
   import { createAckCoalescer, createOutputCredit, planTerminalOutput, type PaintToken } from "../terminal/outputCredit";
+  import { createSyncFrameWriter } from "../terminal/syncFrames";
   import { applyHelperTextareaHardening, createEraseGuard, describeTerminalControl, webkit229ChordEvent, type TerminalInputEvent } from "../terminal/eraseGuard";
   import { terminalSessions } from "../terminal/sessionRegistry";
   import { copyText } from "../desktop/clipboard";
@@ -114,6 +159,8 @@
   import type { TerminalSpawned } from "../terminal/runResult";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { observeResize } from "../dom/observeResize";
+  import { watchDevicePixelRatio } from "../dom/devicePixelRatio";
+  import { createFitScheduler } from "../terminal/fitSchedule";
   import { openExternal } from "../desktop/openExternal";
   import { repoStore } from "../stores/repoStore";
   import { linksForRow, resolveLinkAction, type LinkBuffer } from "../terminal/links";
@@ -292,17 +339,25 @@
 
   function termTheme(): Record<string, string> {
     const css = getComputedStyle(document.documentElement);
-    const v = (name: string, fallback: string) =>
-      css.getPropertyValue(name).trim() || fallback;
-    return {
-      background: hexColor(v("--bg-terminal", "#141a29")),
-      foreground: v("--text-primary", "#e9edf8"),
-      cursor: v("--accent-color", "#809eff"),
-      // The glyph drawn INSIDE a block cursor, so it is a foreground and stays
-      // opaque even when the surface behind it does not.
-      cursorAccent: v("--bg-surface", "#141a29"),
-      selectionBackground: "rgb(128 158 255 / 0.32)",
-    };
+    return buildTermTheme((name, fallback) => css.getPropertyValue(name).trim() || fallback);
+  }
+
+  /** The palette on the terminal now, so an unchanged one is not set again. */
+  let appliedTheme: Record<string, string> | null = null;
+
+  /**
+   * The one place a palette reaches xterm. Called from the store effect and
+   * from the observer on the root's class/style, which also fires for accent,
+   * tab-size and UI-scale changes that leave the palette alone; each set
+   * would rebuild the colour set and the glyph atlas of every session, the
+   * hidden ones included.
+   */
+  function applyTheme() {
+    if (!term) return;
+    const next = termTheme();
+    if (sameTheme(appliedTheme, next)) return;
+    appliedTheme = next;
+    term.options.theme = next;
   }
 
   /**
@@ -442,6 +497,15 @@
         allowNonHttpProtocols: false,
       },
     });
+    // xterm's built-in width table is Unicode 6, which gives every emoji one
+    // cell while the font draws two. The addon registers the Unicode 11 table
+    // and the version is switched before anything is written, so the cursor
+    // column, wrapping and the cells links and search read all agree with what
+    // a program that measured the glyph as wide has laid out. Here and not
+    // later: this is the one place a terminal is built, including a recreated
+    // one that is given an ended session's remembered tail.
+    created.loadAddon(new Unicode11Addon());
+    created.unicode.activeVersion = "11";
     fitAddon = new FitAddon();
     created.loadAddon(fitAddon);
     searchAddon = new SearchAddon({ highlightLimit: SEARCH_HIGHLIGHT_LIMIT });
@@ -526,6 +590,7 @@
       return !onChord(event);
     });
     term = created;
+    appliedTheme = termTheme();
     if (!disposed) {
       for (const token of credit.flush()) paintOutput(token);
     }
@@ -543,10 +608,29 @@
     });
   });
 
+  /** Cancel (0x18): aborts an escape sequence a gap in the output cut short. */
+  const CAN = Uint8Array.of(0x18);
+
   function acknowledgeOutput(sessionId: string, bytes: number) {
     if (bytes <= 0) return;
     acks.add(sessionId, bytes);
   }
+
+  /**
+   * Every byte the emulator is given as output goes through here, so each
+   * write ends outside a DEC 2026 block (see `syncFrames.ts`: xterm drops the
+   * paint of a frame whose successor has opened by the time its animation
+   * frame fires). Held bytes are acknowledged when they are written.
+   */
+  const syncFrames = createSyncFrameWriter({
+    write(bytes, written) {
+      if (!term || disposed) throw new Error("the terminal is closed");
+      term.write(bytes, written);
+    },
+    onError(err) {
+      lifecycle?.fail(`Terminal output was not painted: ${formatError(err)}`, true);
+    },
+  });
 
   function paintOutput(token: PaintToken) {
     const termNow = term;
@@ -555,7 +639,7 @@
       return;
     }
     try {
-      termNow.write(token.bytes, () => {
+      syncFrames.push(token.bytes, () => {
         acknowledgeOutput(token.sessionId, token.release());
       });
     } catch (err) {
@@ -564,18 +648,47 @@
     }
   }
 
+  /**
+   * Layout moved: fit, at most once per `FIT_MIN_INTERVAL_MS`. The resize
+   * observer and the first fit come here; showing a terminal and changing the
+   * font go through `fits.settle()`. All of them end in `fitNow`, which is the
+   * only place the emulator is resized and so the only place that decides
+   * whether it may be.
+   */
   function refitIfResized() {
-    if (!fitAddon || !term) return;
+    fits.request();
+  }
+
+  /**
+   * Measure the box and, if the grid it holds changed, resize to it.
+   *
+   * A terminal with no box (a hidden tab, a collapsed dock, another
+   * repository's dock, a container squeezed to nothing) is left exactly as it
+   * is. Measuring it would answer with a small confident grid that is not
+   * evidence of anything, and the PTY would be told it, which makes the
+   * program inside repaint for a tab nobody is looking at. It is fitted once
+   * when it is shown again (`reveal`, and the observer when the box returns).
+   */
+  function fitNow() {
+    if (disposed || !fitAddon || !term) return;
     try {
-      const proposal = fitAddon.proposeDimensions();
+      const rendered = hasRenderedBox(container);
+      const proposal = rendered ? fitAddon.proposeDimensions() : undefined;
       const proposed = proposal ? { cols: Math.min(1000, proposal.cols), rows: Math.min(1000, proposal.rows) } : proposal;
-      if (!shouldRefit({ cols: term.cols, rows: term.rows }, proposed)) return;
+      if (!shouldRefit({ cols: term.cols, rows: term.rows }, proposed, rendered)) return;
       if (proposal && (proposal.cols > 1000 || proposal.rows > 1000) && proposed) {
         term.resize(proposed.cols, proposed.rows);
       } else fitAddon.fit();
     } catch {
       /* container collapsed; refit when it has size again */
     }
+  }
+
+  const fits = createFitScheduler(fitNow);
+
+  /** The grid's cell size changed under an unchanged box: a new font size. */
+  function refitAfterMetricsChange() {
+    fits.settle();
   }
 
   function launcherConfig(kind: LauncherKind): { program?: string; args?: string[] } {
@@ -844,6 +957,7 @@
           // conversation to offer back, and only one Claude Code saved.
           settleHosted(event, event.id);
           const why = event.error || event.signal || (event.exit_code === null ? "exited" : `exit ${event.exit_code}`);
+          syncFrames.flush();
           term?.writeln(`\r\n\u001b[2m[session closed — ${why}]\u001b[0m`);
         },
         // The close was acknowledged; its exit event may not come at all.
@@ -851,8 +965,9 @@
         reset() {
           return new Promise<void>((resolve) => {
             if (!term || disposed) { resolve(); return; }
+            syncFrames.flush();
             term.write("", () => {
-              if (!disposed) { term?.reset(); warning = null; searchKey = null; }
+              if (!disposed) { term?.reset(); syncFrames.reset(); warning = null; searchKey = null; }
               resolve();
             });
           });
@@ -862,7 +977,11 @@
         // CAN aborts any escape, OSC or DCS sequence the gap cut short, and
         // does nothing at all on the ground state. Queued behind what was
         // painted, ahead of what the resumed stream sends.
-        skipped() { if (term && !disposed) term.write("\x18"); },
+        skipped() {
+          if (!term || disposed) return;
+          syncFrames.flush();
+          syncFrames.push(CAN, () => {});
+        },
         admitted() { onAdmitted?.(); },
         refused(message) { return onRefused?.(message) ?? false; },
       },
@@ -975,7 +1094,10 @@
 
   /** Called by the panel when this tab becomes visible again. */
   export function reveal() {
-    refitIfResized();
+    // After the layout that shows this pane (next frame, before it paints),
+    // once: the box has its real size by then, and the observer's own fit for
+    // the same change finds the grid already right.
+    fits.settle();
     if (findOpen) findInput?.focus();
     else term?.focus();
   }
@@ -1054,7 +1176,7 @@
     interfaceStore.setTerminalFontSize(fontSize);
     if (term) term.options.fontSize = fontSize;
     // Font metrics settle at layout; ResizeObserver also handles the changed box.
-    void tick().then(() => { if (!disposed && active) refitIfResized(); });
+    refitAfterMetricsChange();
   }
 
   export function handleViewChord(event: KeyboardEvent): boolean {
@@ -1132,7 +1254,7 @@
      * canvas on screen meanwhile; this falls back to the DOM renderer at once.
      * Captured on the host because the event does not bubble.
      */
-    const onContextLost = () => gpu?.lose();
+    const onContextLost = (event: Event) => gpu?.lose(event.target);
     /**
      * Every paste goes through `planPaste`: bracketed-paste markers inside the
      * clipboard are removed, and a paste that would run before it is read asks
@@ -1216,8 +1338,20 @@
           attach: () => {
             const addon = new WebglAddon();
             t.loadAddon(addon);
-            return addon;
+            // The addon exposes no canvas; its WebGL one is the only canvas
+            // on the screen without a `-layer` class (the link layer has one).
+            // The renderer loses its context on release (xterm.js #6068).
+            const canvas = [...(t.element?.querySelectorAll("canvas") ?? [])].find(
+              (node) => ![...node.classList].some((name) => name.endsWith("-layer")),
+            );
+            return {
+              canvas,
+              dispose: () => addon.dispose(),
+              onContextLoss: (listener) => addon.onContextLoss(listener),
+              clearTextureAtlas: () => addon.clearTextureAtlas(),
+            };
           },
+          refresh: () => t.refresh(0, t.rows - 1),
           onChange: (state) => (renderer = state),
         });
         opened = true;
@@ -1238,9 +1372,7 @@
     }
     // themeStore publishes before a View Transition applies its CSS. Observe
     // the actual class/style commit too, including accent and glass changes.
-    themeObserver = new MutationObserver(() => {
-      if (term) term.options.theme = termTheme();
-    });
+    themeObserver = new MutationObserver(applyTheme);
     themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["class", "style"] });
     lifecycle = createLifecycle();
     // Awaited before the spawn so the launch reflects the saved default mode
@@ -1279,6 +1411,7 @@
       // conversation's record: the tab that shows it next finds it there.
       withdrawOffer();
       if (hostedId && !hostedLive) hostedClaude.forget(hostedId);
+      syncFrames.discard();
       for (const owed of credit.releaseAll()) acknowledgeOutput(owed.sessionId, owed.bytes);
       // Before `lifecycle` goes: nothing owed waits for a frame this view
       // will not see, and a failure is still reported against the session.
@@ -1383,14 +1516,33 @@
       if (size === fontSize) return;
       fontSize = size;
       if (term) term.options.fontSize = size;
-      void tick().then(() => { if (!disposed && active) refitIfResized(); });
+      // Every session that has a box, on screen or not active: a split's
+      // second half keeps its box when the font changes, so only this refits
+      // it. A hidden one is skipped by `fitNow` and fitted when it is shown.
+      refitAfterMetricsChange();
     });
+  });
+
+  /**
+   * A window moved to a display with another pixel ratio keeps its CSS box,
+   * so the resize observer stays silent while xterm rebuilds its cell metrics
+   * and glyph atlas underneath an unchanged grid. Measure again, then clear
+   * the atlas (a no-op on the DOM renderer) so no glyph is drawn from the old
+   * display's raster.
+   */
+  $effect(() => {
+    // A session with no box has nothing to redraw; the atlas call full-refreshes.
+    const stop = watchDevicePixelRatio(() => fits.settle(() => { if (hasRenderedBox(container)) term?.clearTextureAtlas(); }));
+    return () => {
+      stop();
+      fits.cancel();
+    };
   });
 
   /** Theme flips re-resolve the palette from CSS variables. */
   $effect(() => {
     $themeStore;
-    if (term) term.options.theme = termTheme();
+    applyTheme();
   });
 
   /**
@@ -1428,13 +1580,16 @@
   });
 
   /**
-   * WebGL only while attended: the same `onscreen` the notifier is told, so a
-   * hidden tab, a collapsed dock or another repository's dock holds no
-   * context. See `terminal/gpuRenderer.ts` for the cap and the loss rule.
+   * WebGL while attended: the same `onscreen` the notifier is told. A hidden
+   * tab, a collapsed dock or another repository's dock keeps its warm context
+   * only through a bounded hold and gives it up when another session needs the
+   * slot; turning the setting off releases it at once. See
+   * `terminal/gpuRenderer.ts` for the cap, the hold and the loss budget.
    */
   $effect(() => {
-    const want = opened && onscreen && $interfaceStore.terminalGpu;
-    untrack(() => gpu?.sync(want));
+    const enabled = $interfaceStore.terminalGpu;
+    const want = opened && onscreen && enabled;
+    untrack(() => gpu?.sync(want, enabled));
   });
 </script>
 
@@ -1518,7 +1673,7 @@
       </div>
     {/if}
   </div>
-  {#if error || exited || spawning || shellPath || hoveredLink}
+  {#if error || exited || spawning || shellPath || hoveredLink || renderer === "reset" || renderer === "lost"}
     <!-- One fixed-height status row: spawn/error/exited/info content swaps
          inside it, so the terminal's box never resizes (and the
          ResizeObserver never refits) merely because the text rotated. -->
@@ -1560,7 +1715,18 @@
         <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" aria-hidden="true"></span>
         <span class="text-[10px] text-textMuted font-mono truncate" title={`${shellPath} · Started in ${startedIn || workPath}`}>{shellPath.split(/[\\/]/).pop()} · {workPath.split(/[\\/]/).pop()}{startDir ? `/${startDir}` : ""}</span>
       {/if}
-      <div class="ml-auto flex items-center gap-1 shrink-0" role="group" aria-label="Terminal text size">
+      {#if renderer === "reset" || renderer === "lost"}
+        <!-- A lost WebGL context is not blank (the DOM renderer is already
+             drawing the same rows), but it is slower; say why. -->
+        <span
+          data-terminal-gpu-note
+          class="ml-auto shrink-0 text-[10px] text-amber-300 whitespace-nowrap"
+          title={renderer === "reset"
+            ? "The graphics context was lost, for example by a GPU reset or waking from sleep. This terminal draws without the GPU and will try again."
+            : "This terminal draws without the GPU: its graphics context was lost repeatedly or could not be created. Reopening the tab tries again."}
+        >{renderer === "reset" ? "Drawing without GPU after a graphics reset" : "Drawing without GPU"}</span>
+      {/if}
+      <div class="{renderer === 'reset' || renderer === 'lost' ? '' : 'ml-auto '}flex items-center gap-1 shrink-0" role="group" aria-label="Terminal text size">
 
         <button type="button" class="gp-icon-btn p-0.5!" aria-label="Decrease terminal text size" title="Smaller text ({platformChord('⌘−', 'Ctrl+Shift+−', $hostPlatform.os)})" disabled={fontSize <= TERMINAL_FONT_MIN} onclick={() => setFontSize(fontSize - 1)}><Minus size={12} /></button>
         <button type="button" class="text-[10px] text-textMuted tabular-nums px-1" aria-label="Reset terminal text size" title="Reset text size ({platformChord('⌘0', 'Ctrl+Shift+0', $hostPlatform.os)})" onclick={() => setFontSize(TERMINAL_FONT_DEFAULT)}>{fontSize}px</button>
