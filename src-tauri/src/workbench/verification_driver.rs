@@ -299,18 +299,36 @@ impl Driver {
                 return report;
             }
         };
+        let held: Vec<(&Value, Target, String)> = cards
+            .iter()
+            .filter_map(|card| {
+                let target = target_of(card)?;
+                Some((
+                    card,
+                    target,
+                    card["id"].as_str().unwrap_or_default().to_owned(),
+                ))
+            })
+            .collect();
+        // Every held card's verdict in one walk of the evidence table. Read
+        // card by card, that walk ran once per card on every sweep: 176 cards
+        // over 328k rows kept this thread busy without a break. Should the
+        // batch fail, each card is read alone, so one card's unreadable
+        // record stays that card's.
+        let ids: Vec<String> = held.iter().map(|(_, _, id)| id.clone()).collect();
+        let batch = gate::latest_many(store, &ids);
         let mut seen = HashSet::new();
-        for card in &cards {
+        for (card, target, id) in &held {
             if backend.cancelled() {
                 return report;
             }
-            let Some(target) = target_of(card) else {
-                continue;
+            let latest = match &batch {
+                Ok(found) => Ok(found.get(id).cloned()),
+                Err(_) => gate::latest(store, id),
             };
-            let id = card["id"].as_str().unwrap_or_default().to_owned();
             let key = (id.clone(), target.head.clone());
             seen.insert(key.clone());
-            self.settle(store, backend, card, &id, &target, &key, &mut report);
+            self.settle(store, backend, card, id, target, &key, latest, &mut report);
         }
         // A card that was moved, edited out of its claim, deleted or left for
         // a newer head is no longer waited on.
@@ -327,23 +345,25 @@ impl Driver {
         id: &str,
         target: &Target,
         key: &(String, String),
+        latest: Result<Option<Record>, String>,
         report: &mut Report,
     ) {
         let revision = card["revision"].as_i64().unwrap_or_default();
         let logs = card["logs"].as_str().unwrap_or_default();
         let now = backend.now();
-        let step = decide(&Facts {
+        let facts = Facts {
             revision,
             logs,
             target,
             current_head: backend.head_of(&target.worktree),
-            latest: gate::latest(store, id),
+            latest,
             attempt: self
                 .attempts
                 .get(key)
                 .map(|a| (now.saturating_duration_since(a.started), a.baseline)),
             item_id: id,
-        });
+        };
+        let step = decide(&facts);
         match step {
             Step::Skip => {}
             Step::Wait => {
@@ -401,7 +421,8 @@ impl Driver {
                 self.attempts.remove(key);
             }
             Step::Park | Step::PassedButChanged => {
-                let record = gate::latest(store, id).ok().flatten().unwrap_or_default();
+                // The record the step was decided on, not a second read.
+                let record = facts.latest.ok().flatten().unwrap_or_default();
                 let note = if step == Step::Park {
                     format!(
                         "--- Verification {} ({}) ---\n{}\n{}. The card stays in review.",
