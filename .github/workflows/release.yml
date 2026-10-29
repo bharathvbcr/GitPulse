@@ -88,7 +88,7 @@ jobs:
         run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: src-tauri
           prefix-key: ${{ env.RUST_CACHE_PREFIX }}
@@ -245,7 +245,7 @@ jobs:
         run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
 
       - name: Rust Cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: src-tauri
           prefix-key: ${{ env.RUST_CACHE_PREFIX }}
@@ -337,7 +337,7 @@ jobs:
         run: bun install --frozen-lockfile --ignore-scripts
 
       - name: SPDX SBOM Of The Build Tree
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         env:
           SYFT_SELECT_CATALOGERS: +javascript-package-cataloger
         with:
