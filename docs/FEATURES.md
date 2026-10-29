@@ -218,8 +218,13 @@ beside Fleet opens global and saved-workspace scopes over the same records.
   relational links between tasks (parent, blocks, related, duplicate of) edited in the task sheet
   and surfaced in agent handoff briefs.
 - **Know the scope**: Facets and Select all operate on loaded cards; column counts and
-  **Load more** reveal additional results. Due soon means the next seven days. Missing checkouts
-  are flagged before action.
+  **Load more** reveal additional results. Each column also provides **Load all**,
+  which reads beyond the initial 30 cards in 200-card pages up to `MAX_CANDIDATES` (2,000 cards)
+  or until stopped. Loaded column counts are preserved across board refreshes (`reloadSize`),
+  and card verdict queries are automatically chunked in batches of 256 IDs (`getBoardVerdicts`)
+  so large boards never trigger host refusals or cleared verdicts. When tasks from hidden
+  repositories are omitted from the board, the notification banner explicitly names the
+  hidden repository. Due soon means the next seven days. Missing checkouts are flagged before action.
 - **Edit and review**: Notes can seed a draft. Manvi proposes title/description
   changes against a saved revision; field locks and explicit acceptance apply.
   Quick Enhance exposes details that compact cards omit. **Merge…** on the board's selection
@@ -453,6 +458,7 @@ rather than presenting a floor as a total.
   - GitHub Dependabot and code scanning alerts (via local `gh` CLI), fetched when a repository opens. Critical and high findings raise a warning. Turn off under Settings → Analysis. The Health **Scan local** button still does not call GitHub.
 - **Supply-Chain Security Parsers**: Integrates `cargo deny` (SARIF) and `cargo crev` (JSONL) report parsers alongside `cargo audit` in dependency health for thorough Rust crate vetting.
 - **Code map status & dead symbols**: When a DevMap store is present (the vendored reader is schema 27), Health surfaces graph availability and budgeted dead-symbol candidates. A query that stopped at its token budget is a floor, not an all-clear; a missing or schema-mismatched map is named rather than shown as empty-and-fine.
+- **Pinned Advisory Columns**: Table columns for security advisories and vulnerability details are pinned to fixed widths to prevent layout jitter across scans.
 - **AI Remediation**: Generates step-by-step upgrade plans with dependency version bump recommendations.
 - **Health Verdict**: Evaluates multi-ecosystem audit findings, code scanning alerts, and repository health signals into a single explicit verdict with one canonical owner per repeated decision.
 
@@ -494,6 +500,10 @@ like, and command output can be read *against* the thing that prompted it: a
 Health remediation plan, a failing test, the diff you are about to commit.
 
 - **Embedded PTY**: Native terminal emulator powered by `portable-pty` and `@xterm/xterm`.
+- **Expanded dock viewport isolation**: When expanded, the dock hides and marks `inert` the underlying workspace view, preventing focus leaks and background mouse or keyboard interactions.
+- **Configurable terminal bell prompts**: "Count a terminal bell as waiting for you" in Settings → Agents (default on, `asksForReader`) controls whether terminal bells from Codex, Cursor, or shell CLIs count as waiting prompts.
+- **Stall-bounded input writes**: Input write timeouts measure idle stalls rather than cumulative write durations, preventing premature timeouts during high-throughput writes.
+- **Sanitized tab titles**: `cleanTabName` routes through `sessionActivity.clean()` to drop control characters and split surrogate pairs without corrupting Unicode text.
 - **Explicit agent sessions**: Local AI suggestions and the policy sidecar do not read or write ordinary shell sessions. Choosing Claude, Manvi or Codex, or launching a saved task, starts a separate user-controlled agent session in the existing dock; that process receives input in its own PTY.
 - **Diagnostic Preservation**: Preserves command output, exit status, and failure context across builds.
 - **Lifecycle Supervision**: Switching views or repositories and hiding the dock preserve sessions. Closing a terminal tab or repository tab terminates the sessions it owns; failed cleanup remains visible.
@@ -505,6 +515,9 @@ Health remediation plan, a failing test, the diff you are about to commit.
 - **Package**: one canonical package at `plugins/gitpulse/` — native Codex `.codex-plugin/plugin.json` + `.mcp.json`, Claude Code compatibility files, closed Agent Plugins 1.0 manifests, and one shared `skills/` tree. The Tauri app copies this package into `Contents/Resources/plugin`.
 - **Tools**: `gitpulse_insights`, `gitpulse_collision_risk`, `gitpulse_merge_conflicts` (would the lanes' committed work merge, pair by pair, in a deleted-afterwards object quarantine), `gitpulse_change_context`, `gitpulse_active_changes`, plus ledger, tasks, codeintel, provenance. The server never mutates git; its only writes are the task-board tools (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_delete_task`, `gitpulse_merge_tasks`).
 - **Work view**: insight strip (worktrees, agent sessions, blocked operations) and a collision banner that never treats a failed scan as “no overlap”.
+- **Linux Signal Guard on Linux**: Models Linux process inspection tools (`procps pkill`/`pgrep`, `psmisc killall`, `pidof`) natively on Linux, checking `/proc/<pid>/status` UIDs with real `kill(2)` permission rules and prompting on unmodelled options to protect GitPulse and agent sessions.
+- **Durable Hook Notify Drop Record**: When notifications miss their timeout budget, timed records are appended to `<socket>.drops` beside the socket, rotated at 32 KiB, tightened to `0600` best-effort, and surfaced in Settings after 7-day expiration.
+- **Client-Side Vouched Snapshots**: `Host::knows` evaluates session membership directly from client-side vouched snapshots without IPC round-trips to `gitpulse-ptyd`.
 - **Settings**: copies `.codex-plugin/plugin.json` / `.mcp.json` and names the binary path, or why it could not be found.
 
 ### 5.3 Fleet — the whole workspace at once (`⌘⇧F`)
@@ -621,7 +634,11 @@ sessions survive and nothing re-hydrates on the way back.
   paths stay clean without lingering.
 - **Repository Tab Groups.** Open repository tabs can be organized into named,
   color-coded tab groups with collapse/expand and bulk close/reload controls,
-  simplifying navigation across multi-repository workspaces.
+  simplifying navigation across multi-repository workspaces. Users can also
+  collapse inactive repository groups and collapse inactive tabs inside groups
+  (with an option to keep tabs running an active shell expanded), controllable
+  via **Settings → Layout** (`collapseInactiveGroupTabs`, `collapseInactiveIncludeShells`),
+  the tab strip (which also collapses inactive groups), or palette commands.
 - **Stacked Worktree Tabs.** Every checkout of one repository — the primary
   checkout and its linked worktrees, including agent worktrees under
   `.<agent>/worktrees/` — shares one tab instead of taking a tab each. The tab

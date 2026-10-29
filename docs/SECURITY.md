@@ -349,6 +349,31 @@ flowchart TD
   not on the target branch, and a squash whose commit fails stops before the
   worktree or branch is touched.
 
+### Process Signal Guard (Linux & macOS Models)
+- The signal guard protects GitPulse, `gitpulse-ptyd`, and child agent sessions from accidental mass-termination by external tools (e.g. `pkill`, `killall`, `pgrep`, `pidof`).
+- **Linux Tool Modeling**: On Linux, the signal guard directly models `procps pkill`/`pgrep`, `psmisc killall`, and `sysvinit pidof` (`ft-06723bb7`, `d9954240`, `1ba087a0`).
+  - Matches process names against both `comm` and `argv[0]`'s basename (union with macOS reading).
+  - Inspects real, effective, and saved UIDs from `/proc/<pid>/status` and applies exact `kill(2)` permission checks.
+  - Correctly counts ancestors for `procps pkill`.
+  - Non-effect classes (multiple patterns, `-h`/`-V`, `killall -l`, signal 0) pass silently without signaling.
+  - Any unmodelled `psmisc killall` option escalates to an explicit user confirmation prompt rather than permitting unverified termination.
+
+### Hook Notify Transport & Durable Drop Records
+- Agent hook notifications (`gitpulse-hook`) communicate over a private, non-blocking Unix domain socket with strict deadlines (300 ms for `SessionEnd`, 1.5 s for other events).
+- If a reply deadline expires or the bridge closes without responding, the hook appends a durable drop record (`{"v":1,"at":<unix_ms>,"event":...,"session":...}`) to `<socket>.drops` beside the socket (`ft-6d8ff969`, `ft-878db72b`).
+- Records are tightened to `0600` best-effort through the file handle (`fchmod`), never as a blocking precondition.
+- Single-owner rotation renames `.drops` to `.prev` when exceeding 32 KiB, halting appending at 64 KiB.
+- The reader uses `.prev`'s `ctime` as an immutable rotation clock to allow lower-bound warning notes in Settings to expire after 7 days.
+- When Unix domain sockets are unavailable (such as on Windows), `notify` reports `unsupported` once per invocation and exits 0 cleanly.
+
+### CI & Release Pipeline Integrity
+- **Release Bundle Verification**: `release.yml` and `scripts/check-release-assets.mjs` download installer packages by asset ID and inspect archive contents across platforms (fat arm64 + x86_64 Mach-O in macOS archives, ELF in Debian packages, and PE binaries extracted via 7z in Windows MSIs/NSIS installers) to ensure every declared `[[bin]]` from `Cargo.toml` exists.
+- **Workflow Pipeline Safety**: `check-workflows.mjs` enforces the `no-pipe-to-shell` rule, rejecting any workflow that pipes downloaded scripts directly into a shell. Actionlint installation is pinned by SHA-256 release tarball checksums.
+
+### Strongly Typed IPC Errors
+- Command runners propagate errors as strongly typed `CommandError` instances directly to the command edge across Tauri IPC (`2bac9304`).
+- This eliminates the legacy thread-local error store (`take_last_error`), preventing ambient error state from leaking across concurrent command invocations or worker threads.
+
 ### Opt-In Release Checks
 - Automatic application release checks are off by default; GitPulse does not
   automatically install application updates.

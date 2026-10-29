@@ -36,6 +36,12 @@ flowchart TD
 
 **Lifecycle hooks require repository trust.** Worktree lifecycle hooks declared in `.gitpulse/hooks.toml` are strictly gated on repository trust; untrusted checkouts refuse execution.
 
+**Linux signal guard protects processes.** On Linux, the signal guard models Linux inspection tools (`pkill`, `pgrep`, `killall`, `pidof`), checking `/proc/<pid>/status` UIDs with real `kill(2)` permission rules and prompting on unmodelled options to protect GitPulse and agent sessions from accidental termination.
+
+**Durable hook notify drop records.** When hook notifications miss their deadline, timed records are appended to `<socket>.drops` beside the socket with single-owner rotation to `.prev`, best-effort `0600` permissions, and 7-day expiration.
+
+**Workflow and bundle integrity.** Workflows enforce `no-pipe-to-shell` rules with pinned actionlint checksums, and CI release verification unpacks installers across platforms to assert every declared binary exists.
+
 **MCP never mutates git.** `gitpulse-mcp` does not checkout, write repository files, or take leases. Its only writes are the task-board tools (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_delete_task`, `gitpulse_merge_tasks`), which write the GitPulse task profile behind the repository trust gate; the last two are annotated destructive. See [[MCP and Agents]].
 
 ## Reporting a vulnerability

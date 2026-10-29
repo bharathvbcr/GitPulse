@@ -11,6 +11,92 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- **Collapsible Inactive Repository Groups & Group Tabs.** In the repository tab bar,
+  inactive repository groups can now be collapsed to declutter multi-repository
+  workspaces (`RepoTabBar.svelte`, `tabGroups.ts`, `groupState.ts`). Inactive tabs
+  within groups can also be collapsed, with an option to keep tabs with active shells
+  visible. Added settings under Settings → Layout (`collapseInactiveGroupTabs`,
+  and `collapseInactiveIncludeShells`, on by default; turn it off to keep shell tabs
+  visible), a strip menu action to collapse inactive groups, and Command Palette
+  actions: *Collapse Inactive Repository Groups*, *Expand All Repository Groups*,
+  *Collapse Inactive Tabs in Groups*, and *Toggle Collapsing Active Shells in Inactive Tabs*.
+- **Tasks Board: "Load all" in a task column.** Users can now click "Load all" in any
+  column on the Tasks board to page beyond the initial 30 tasks (`TaskBoard.svelte`,
+  `boardPaging.ts`, `taskSearchPlan.ts`). Cards are read in 200-card pages up to
+  `MAX_CANDIDATES` (2,000 cards) or until stopped. The loaded column depth is retained
+  across board refreshes (`reloadSize` pages 200 cards when 20 default pages would fall
+  short), and board verdict queries are automatically chunked in batches of 256 IDs
+  (`getBoardVerdicts`) so large boards never trigger host refusals or cleared verdicts.
+- **Tasks Board: Named Hidden Repository Notification.** When tasks belonging to
+  hidden repositories are omitted from the board, the notification banner now
+  explicitly names the hidden repository (`taskHiddenRepositories.ts`) rather than
+  showing an ambiguous count.
+- **Configurable Terminal Bell attention trigger.** Added "Count a terminal bell as
+  waiting for you" in Settings → Agents (default on, `asksForReader`), allowing terminal
+  bell events from Codex, Cursor, and shells to register as reader prompts or be toggled off.
+- **Durable Hook Notify Drop Record (`.drops`).** When a hook notification reply misses its
+  budget (300 ms for `SessionEnd`, 1.5 s for other events), the hook appends a durable drop
+  record (`{"v":1,"at":<unix_ms>,"event":...,"session":...}`) to `<socket>.drops` beside
+  the resolved socket (`ft-6d8ff969`, `ft-878db72b`, `ft-f70ee2bb`). Drop records use
+  single-owner rotation to `.prev` when exceeding 32 KiB (hook halts appends at 64 KiB)
+  and are tightened to `0600` best-effort through the file handle. Settings displays
+  "N hook reports in the last 7 days got no reply from GitPulse in time" (using `.prev`'s
+  `ctime` as the 7-day expiration clock) separately from refused reports, and explicitly
+  not as "lost" since the app may have applied reports the hook stopped waiting for.
+- **Release Bundle Binary Verification.** Added automated installer inspection in
+  `release.yml verify` and `scripts/check-release-assets.mjs` (`ft-ac3bba92`). Downloads
+  bundled installers by asset ID and opens archives across platforms (fat arm64 + x86_64
+  Mach-O in macOS archives, ELF in Debian packages, and PE binaries extracted via 7z in
+  Windows MSIs and NSIS installers) to assert that every `[[bin]]` defined in
+  `src-tauri/Cargo.toml` is present and structurally valid.
+
+### Changed
+
+- **Typed Command Errors across IPC.** Rust command runners now carry errors as strongly
+  typed `CommandError` instances directly to the command edge (`2bac9304`), replacing
+  the thread-local error store (`take_last_error`) with typed, structured errors across
+  the Tauri IPC boundary.
+- **Terminal Host `Host::knows` client-side snapshot resolution.** `Host::knows` answers
+  directly from the client's vouched snapshot, eliminating IPC round-trips to `gitpulse-ptyd`
+  for session existence checks (`ft-67f95e2d`). Authority survives spawns, quits, and
+  wrapped exit records mid-adoption, while newly opened connections revoke previous authority.
+- **Terminal Host Adoption & Exit Reporting lifecycle.** `record_exit` is executed strictly
+  once per session (`ft-c113d00b`); `adopt` skips reported exits and reads `vouched.late`
+  after proxy scans. A second exit report during recording leaves proxy and host state intact,
+  preventing race conditions during session adoption.
+- **Terminal Input Write Timeout is a stall bound.** Changed the terminal input write
+  timeout from a cumulative total to an idle stall bound (`cc0cfb90`), preventing large
+  write streams from failing prematurely.
+- **Terminal Expanded Dock UX Isolation.** Expanding the terminal dock now hides and sets
+  `inert` on the underlying workspace view (`TerminalDock.svelte`, `077de305`), preventing
+  focus leaks and background mouse/keyboard interactions while in full terminal mode.
+- **Terminal Tab Title Sanitization.** `cleanTabName` routes through `sessionActivity.clean()`
+  to reliably drop split surrogate pairs, unprintable controls, and ANSI artifacts.
+- **Advisory Table Column Pinning.** Pinned the short columns of advisory tables in
+  `HealthTable.svelte` / `HealthPanel.svelte` (`e60712a0`) for consistent layout and alignment.
+- **Lappi Settings Copy Transparency.** Updated copy in `LappiSettings.svelte` to clearly
+  state that diffs are transmitted, using transparent "nowhere else" phrasing instead of
+  "not an AI provider".
+
+### Security
+
+- **Linux Signal Guard on Linux.** The signal guard now models Linux process inspection
+  tools (`procps pkill`/`pgrep`, `psmisc killall`, `sysvinit pidof`) on Linux (`ft-06723bb7`,
+  `d9954240`, `1ba087a0`). Matches process names against `comm` or `argv[0]` basename (union
+  with macOS reading), reads UIDs directly from `/proc/<pid>/status` with real `kill(2)`
+  permission enforcement, correctly counts ancestors in `procps pkill`, and escalates
+  unmodelled `psmisc killall` options to explicit user confirmation prompts.
+- **Hook Drop Record Permissions.** Owned `.drops` records are tightened to `0600` best-effort
+  through the file handle; the reader leaves `.prev` untouched to preserve its `ctime`
+  rotation clock for 7-day lower-bound expiration.
+- **CI Workflow Security & Actionlint Checksumming.** Enforced the `no-pipe-to-shell` rule in
+  `check-workflows.mjs`, forbidding piping downloads directly into a shell. Actionlint
+  installation in `ci.yml` is pinned to a verifiable SHA-256 release tarball checksum.
+
+
+
 ## [1.5.0] - 2026-10-25
 
 1.5.0 is the first release published since 1.3.1. 1.3.5 was withdrawn and

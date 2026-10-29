@@ -82,6 +82,8 @@ GitPulse/
 
 There is no virtual-DOM router. View ids are the `ViewTab` union in `src/lib/repos/persist.ts`, registered in `src/lib/views/viewRegistry.ts`, rendered from `App.svelte`. Adding a view means changing all three.
 
+Errors across IPC carry strongly typed `CommandError` instances directly from runners to the command edge, eliminating ambient thread-local error state. For PTY management under the `gitpulse-ptyd` backend, `Host::knows` evaluates session membership directly from client-side vouched snapshots, eliminating IPC round-trip overhead.
+
 ## Why Fleet is not a view
 
 A `ViewTab` is stored on the **active repository's** session and its panel content is keyed on `currentPath` (in `ViewSectionPanel`). Fleet answers a question about the **workspace**. If it were a view it would be scoped wrong and destroyed on every repo switch — taking the live terminal PTY with it.

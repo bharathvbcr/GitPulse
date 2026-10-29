@@ -2,7 +2,9 @@
 
 Open the dock with **Ctrl+`**. It stays below the current view; **Expand terminal**
 gives it as much of the window as will fit (up to 2400px) and **Restore terminal
-size** returns to its previous height. Dragging the splitter can also grow past
+size** returns to its previous height. When expanded, the dock hides and marks `inert`
+the underlying view, ensuring focus remains strictly inside the terminal and preventing
+accidental background mouse or keyboard interactions. Dragging the splitter can also grow past
 the old 900px cap.
 
 **The dock belongs to one repository tab.** Opening a terminal in one repository
@@ -51,8 +53,12 @@ inside macOS's system-wide PTY allowance, which other terminals share.
 
 Use **Terminal tab options** to rename a tab, move it left or right, copy selected
 text, copy retained output, or export retained output through a native save dialog.
-An empty custom name restores the program's automatic title. Inactive tabs mark
+An empty custom name restores the program's automatic title. Program tab titles route
+through `sessionActivity.clean()`, which sanitizes escape sequences, non-printable controls,
+and split Unicode surrogate pairs. Inactive tabs mark
 unread output; ended and failed sessions remain inspectable and can be restarted.
+Terminal input write operations measure timeouts as an idle stall bound rather than a
+cumulative total duration, preventing high-volume writes from prematurely aborting.
 
 **Split terminal** displays two sessions without restarting them. Wide panels put
 them side by side; narrow panels stack them. Short docks scroll their panes so
@@ -109,7 +115,10 @@ An answered request's banner is taken down from Notification Center. The
 terminal's own automatic replies (focus, cursor reports, mouse) answer
 nothing. A bell rung for the same moment as a hook report is folded into it
 rather than becoming a second, reasonless banner, and the rate limit delays a
-banner rather than discarding it, most urgent first. A window that reloads
+banner rather than discarding it, most urgent first. The setting **Count a terminal
+bell as waiting for you** in **Settings → Agents** (default on, `asksForReader`)
+controls whether bells count as waiting prompts; when disabled, terminal bells ring
+without updating the attention badge. A window that reloads
 reads what stood while it was not listening, with its real age. The tray shows
 the attention mark while an agent is waiting on you. Which of Claude Code's settings files an
 agent loads is **Settings → Agents → Claude Code settings files** (user,

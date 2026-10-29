@@ -65,7 +65,8 @@ file; Overview embeds branch stack hierarchy. **Fleet** compares repositories ac
   trust-gated lifecycle hooks.
 - **Organize the work.** Quick add parses priority, labels, owner, repository,
   due date, and notes. Board views with swimlanes (grouped by owner or label),
-  saved views, column WIP limits, task checklists with done states, cross-task links
+  saved views, column WIP limits, column "Load all" paging up to 2,000 cards with
+  persistent reload depth, named hidden repository notices, task checklists with done states, cross-task links
   (parent, blocks, related, duplicate), the Archive dock with Deleted recovery,
   review drafting suggestions, and agent terminal handoff with per-launch model selection.
 - **Explore and search the code.** File navigation and blame are built in. High-speed
@@ -79,9 +80,9 @@ file; Overview embeds branch stack hierarchy. **Fleet** compares repositories ac
   cleanup previews, and Pulse activity summaries distinguish results from scans that did not run.
   Capped results identify their limits.
 - **Work from the desktop.** Native menus, a command palette (`⌘K`), a docked PTY terminal
-  that reports what each session is running, reflog recovery (`reset --keep`), GitHub pull
+  with expanded view isolation and configurable bell prompts that reports what each session is running, reflog recovery (`reset --keep`), GitHub pull
   request actions (review, comment, approve, merge pinned to viewed commit), colour-coded repository
-  tabs and groups that survive a restart, and an optional macOS menu-bar status popover keep
+  tabs and collapsible inactive groups that survive a restart, and an optional macOS menu-bar status popover keep
   frequent actions close. Background windows stop their timers instead of polling.
 
 The [feature reference](docs/FEATURES.md) describes each surface and its limits.

@@ -13,6 +13,7 @@ macOS listed first; Windows / Linux in the second column.
 | Close Repository Tab | `⌘⇧W` | `Ctrl+Shift+W` |
 | Reopen Closed Tab | `⌘⇧Y` | `Ctrl+Shift+Y` |
 | Next / Previous Tab | `Ctrl+Tab` / `Ctrl+⇧Tab` | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
+| Move Tab Left / Right | `Ctrl+⇧+←` / `Ctrl+⇧+→` | `Ctrl+Shift+←` / `Ctrl+Shift+→` |
 | Jump to Tab 1–9 | `Ctrl+⌥1–9` | `Ctrl+Alt+1–9` |
 | Preferences | `⌘,` | `Ctrl+,` |
 

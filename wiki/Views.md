@@ -18,7 +18,7 @@ Everything in flight, keyed on the **worktree** (or a DevCouncil task when a sto
 | **Resolve** | 3-way conflict editor: ours / theirs / base, marker jump, accept current / incoming / both. |
 | **Remote** | PRs and issues in the wide column; workflows, runs, and releases in a CI rail. **CI:local** runs this repo's test matrix on your machine — affected tests when the map can prove coverage, otherwise the full suite (named as such; never badged as affected when fail-closed). |
 | **Policy** | Manvi wrap of DevCouncil modules: gate status, dead-branch cleanup (with tip backups in the ledger, squash merge detection, and authorized delete commands), outgoing commit review, release preflight. |
-| **Tasks** | Repository-scoped board/list over the shared profile task store: editing, selection, Manvi suggestions and agent handoff. |
+| **Tasks** | Repository-scoped board/list over the shared profile task store: editing, selection, column "Load all" (pages up to 2,000 cards with persistent reload depth), named hidden repository notices, Manvi suggestions and agent handoff. |
 
 Uncommitted counts that could not be scanned show nothing rather than `0`. A verdict this build cannot parse is `unreadable`, never `allowed`.
 
@@ -61,7 +61,7 @@ Five on-demand scans of **this repository**. Each must say when it was capped ra
 | --- | --- |
 | **Pulse** | Heatmap, rhythm, punch card, LOC trend, commit hygiene, hotspots, bus factor, local DORA, exportable SVG card. Unscanned tiles are an em dash with a reason. |
 | **Coverage** | LCOV, Cobertura, Go cover, Istanbul/NYC JSON, JaCoCo, Clover. Toolchain hints and failure recovery. |
-| **Health** | `npm` / `cargo-audit` / `pip-audit` / `govulncheck` / `composer` / `bundler-audit` plus `cargo deny` SARIF and `cargo crev` JSONL supply-chain checks, and Dependabot/code scanning via `gh` when a repository opens. Critical and high findings warn. |
+| **Health** | `npm` / `cargo-audit` / `pip-audit` / `govulncheck` / `composer` / `bundler-audit` plus `cargo deny` SARIF and `cargo crev` JSONL supply-chain checks, pinned advisory table columns, and Dependabot/code scanning via `gh` when a repository opens. Critical and high findings warn. |
 | **Secrets** | Kingfisher scanner for exposed credentials and tokens in the working tree. Each finding shows where it sits in Git (tracked, untracked, ignored, `.git` metadata, nested repo) and which rows share a value; secret values and context are dropped; stdout is unlogged; partial or incomplete scans are never shown as clean. |
 | **Storage** | Packfiles, loose objects, LFS, submodules, build caches, size history. |
 
@@ -71,7 +71,7 @@ Five on-demand scans of **this repository**. Each must say when it was capped ra
 
 ### Terminal dock (`Ctrl+\``)
 
-Resizable PTY under whichever view is on screen. Local AI suggestions and the policy sidecar do not read/write ordinary shells. Explicit Claude, Manvi, Codex and task launches create their own sessions. Hiding the dock keeps sessions; closing the repository ends them. See [Terminal](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TERMINAL.md).
+Resizable PTY under whichever view is on screen. When expanded, inerts and hides the underlying view to eliminate focus leaks. Terminal bell prompts can be configured in Settings → Agents to toggle reader attention alerts. Local AI suggestions and the policy sidecar do not read/write ordinary shells. Explicit Claude, Manvi, Codex and task launches create their own sessions. Hiding the dock keeps sessions; closing the repository ends them. See [Terminal](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TERMINAL.md).
 
 ### Tasks
 

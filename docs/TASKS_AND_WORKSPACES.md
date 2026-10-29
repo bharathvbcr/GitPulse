@@ -136,7 +136,20 @@ tab strip.
 six columns are on screen and which chips a card carries. The choices are saved
 per profile and **Reset board view** restores all of them. Hiding a column does
 not hide its work silently: a banner names how many tasks are in the columns
-currently off screen, and the board refuses to hide its last column.
+currently off screen, and the board refuses to hide its last column. When tasks from
+hidden repositories are excluded, the notification banner explicitly names which
+repository is hidden.
+
+### Column paging and "Load all"
+
+When browsing, each column pages 30 tasks at a time. Selecting **Load all** in a
+column header reads remaining tasks in 200-card pages (the store's page limit), drawing
+each page as it lands, until the board holds `MAX_CANDIDATES` (2,000) cards or the
+user selects **Stop**. Loaded column depth is remembered across refreshes: `reloadSize`
+pages at the store's 200-card size once 20 standard column pages would not reach what
+was loaded. Card verification verdicts are queried in sequential chunks of 256 IDs
+(`getBoardVerdicts`), preventing host-side request rejection when the board displays
+large task volumes.
 
 **Archive** files a task away from the board, in whatever column it is in. It
 is on a card's right-click menu beside Delete and on the selection bar for a

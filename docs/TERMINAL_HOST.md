@@ -207,6 +207,16 @@ reaped. The exit is then sent to the app as an `exit` event.
 * An exit can overtake the reply to its own spawn (a program that ends at
   once). The app holds such an exit until it has recorded the start, so a run
   is never finished before it is started.
+* **Exit recording and adoption ordering:** `record_exit` is invoked strictly once
+  per session. `adopt` skips reported exits and reads `vouched.late` after its proxies
+  scan, ensuring late-arriving exits do not race with adoption. A second exit report
+  arriving during recording leaves both proxy and host state intact, so adopt never
+  ends a session that was confirmed during adoption.
+* **`Host::knows` client-side vouched snapshots:** To eliminate IPC round-trips
+  to `gitpulse-ptyd` for session membership checks, `Host::knows` answers directly
+  from the host client's vouched snapshot. Authority survives spawns, quits, and
+  wrapped exit records mid-adoption, while newly opened connections cleanly revoke
+  previous authority. A delivered exit is not vouched for immediately until verified.
 
 ## Quit
 
