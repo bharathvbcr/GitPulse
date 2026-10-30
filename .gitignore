@@ -283,3 +283,10 @@ blob-report/
 *.tgz
 *.stackdump
 *.pdb
+
+# Claude Code cloud sessions with one repository read this file
+# and do not read ~/.claude/settings.json. Machine-local overrides
+# stay in .claude/settings.local.json.
+!.claude/
+.claude/*
+!.claude/settings.json
