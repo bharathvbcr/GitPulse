@@ -207,6 +207,15 @@ export interface CommitGraphPayload {
   mainline_name?: string | null;
 }
 
+/**
+ * Where the selected commit's details are. `idle`: nothing requested yet (or
+ * no selection); `loading`: the read is in flight; `ready`: `selectedCommitDetails`
+ * holds them; `error`: the read failed and `selectedCommitDetailsError` says
+ * why. Without it a failed read was indistinguishable from a commit with no
+ * changed files.
+ */
+export type CommitDetailsStatus = "idle" | "loading" | "ready" | "error";
+
 export interface GraphState {
   rows: VisualCommitRow[];
   commits: VisualCommitRow[];
@@ -214,6 +223,8 @@ export interface GraphState {
   headId: string | null;
   selectedCommit: VisualCommitRow | null;
   selectedCommitDetails: SelectedCommitDetails | null;
+  selectedCommitDetailsStatus: CommitDetailsStatus;
+  selectedCommitDetailsError: string | null;
   isLoading: boolean;
   maxCommits: number;
   visiblePath: string | null;
@@ -259,6 +270,8 @@ interface CachedGraph {
   headId: string | null;
   selectedCommit: VisualCommitRow | null;
   selectedCommitDetails: SelectedCommitDetails | null;
+  selectedCommitDetailsStatus: CommitDetailsStatus;
+  selectedCommitDetailsError: string | null;
   query: string;
   revision: string | null;
   /**
@@ -293,6 +306,8 @@ function emptyVisible(
     headId: null,
     selectedCommit: null,
     selectedCommitDetails: null,
+    selectedCommitDetailsStatus: "idle",
+    selectedCommitDetailsError: null,
     isLoading: loading,
     maxCommits,
     visiblePath: path,
@@ -526,27 +541,51 @@ export function createGraphStore(
     commitId: string,
     seq?: number
   ) {
+    const stillWanted = () =>
+      isCurrent(repoPath, token) && (seq === undefined || selectionCurrent(repoPath, seq));
+    // Every write goes through the same ordering guards as the result, so a
+    // slower read for an older selection can never flip the pane to "loading"
+    // or "error" for the commit now on screen.
+    const record = (patch: {
+      selectedCommitDetails?: SelectedCommitDetails | null;
+      selectedCommitDetailsStatus: CommitDetailsStatus;
+      selectedCommitDetailsError: string | null;
+    }) => {
+      const cachedNow = cache.get(repoPath);
+      if (cachedNow && cachedNow.selectedCommit?.id === commitId) {
+        Object.assign(cachedNow, patch);
+      }
+      if (visiblePath === repoPath) {
+        update((s) => (s.selectedCommit?.id === commitId ? { ...s, ...patch } : s));
+      }
+    };
+    if (stillWanted()) {
+      record({ selectedCommitDetailsStatus: "loading", selectedCommitDetailsError: null });
+    }
     try {
       const details = await invokeFn<CommitDetails>("cmd_get_commit_details", {
         repoPath,
         commitId,
       });
-      if (!isCurrent(repoPath, token)) return;
-      if (seq !== undefined && !selectionCurrent(repoPath, seq)) return;
-      const cachedNow = cache.get(repoPath);
-      if (cachedNow && cachedNow.selectedCommit?.id === commitId) {
-        cachedNow.selectedCommitDetails = details;
-      }
-      if (visiblePath === repoPath) {
-        update((s) =>
-          s.selectedCommit?.id === commitId ? { ...s, selectedCommitDetails: details } : s
-        );
-      }
+      if (!stillWanted()) return;
+      record({
+        selectedCommitDetails: details,
+        selectedCommitDetailsStatus: "ready",
+        selectedCommitDetailsError: null,
+      });
     } catch (err) {
-      // Details are best-effort: the row itself already renders, so a
-      // failure only costs the lower pane's content — but it must still
-      // leave a breadcrumb instead of looking like an eternal blank.
+      // The row itself already renders, so a failure costs the lower pane's
+      // content. The pane is told (status "error", with the reason and a
+      // Retry) instead of showing a commit with zero changed files, and a
+      // breadcrumb still goes to the diagnostics ring.
       reportFailure("graph-details", `${repoPath}/${commitId}: ${formatError(err)}`);
+      if (stillWanted()) {
+        record({
+          selectedCommitDetails: null,
+          selectedCommitDetailsStatus: "error",
+          selectedCommitDetailsError: formatError(err),
+        });
+      }
       return;
     }
     // After the details are on screen and not awaited by anything that gates
@@ -613,6 +652,8 @@ export function createGraphStore(
           headId: cached.headId,
           selectedCommit: cached.selectedCommit,
           selectedCommitDetails: cached.selectedCommitDetails,
+          selectedCommitDetailsStatus: cached.selectedCommitDetailsStatus,
+          selectedCommitDetailsError: cached.selectedCommitDetailsError,
           maxCommits: cached.maxCommits,
           hasMore: cached.hasMore,
           warnings: cached.warnings,
@@ -764,6 +805,8 @@ export function createGraphStore(
           headId: payload.head_id,
           selectedCommit,
           selectedCommitDetails: keepDetails,
+          selectedCommitDetailsStatus: keepDetails ? "ready" : "idle",
+          selectedCommitDetailsError: null,
           query,
           revision,
           refScope,
@@ -787,6 +830,8 @@ export function createGraphStore(
             headId: next.headId,
             selectedCommit: next.selectedCommit,
             selectedCommitDetails: next.selectedCommitDetails,
+            selectedCommitDetailsStatus: next.selectedCommitDetailsStatus,
+            selectedCommitDetailsError: next.selectedCommitDetailsError,
             maxCommits: max,
             hasMore: next.hasMore,
             warnings: next.warnings,
@@ -845,7 +890,16 @@ export function createGraphStore(
     },
     selectCommit: async (commit: VisualCommitRow, repoPath?: string) => {
       const path = repoPath ?? visiblePath;
-      update((s) => ({ ...s, selectedCommit: commit }));
+      // The status describes the selected commit, so it cannot outlive a
+      // change of selection: only details already held for this commit keep
+      // their verdict, anything else starts over (the fetch below says "loading").
+      update((s) => ({
+        ...s,
+        selectedCommit: commit,
+        ...(commit && s.selectedCommitDetails?.id === commit.id
+          ? {}
+          : { selectedCommitDetailsStatus: "idle" as const, selectedCommitDetailsError: null }),
+      }));
       if (path && visiblePath === path) {
         const cached = cache.get(path);
         if (cached) cached.selectedCommit = commit;

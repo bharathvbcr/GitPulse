@@ -56,6 +56,38 @@
 
   let details = $state<CommitDetailsPayload | null>(null);
 
+  // The store's read status describes ITS selected commit; it only speaks for
+  // the commit on screen when they are the same one. Anything else is "not
+  // read yet", which renders as loading, never as an empty commit.
+  let detailsStatus = $derived(
+    $graphStore.selectedCommit?.id === currentCommitId
+      ? $graphStore.selectedCommitDetailsStatus
+      : "idle",
+  );
+  let detailsError = $derived(
+    detailsStatus === "error" ? $graphStore.selectedCommitDetailsError : null,
+  );
+  // The preview pane's own states, in the order they win: a read in flight (or
+  // not started: `selectedDiff` is null until the first read lands), a failed
+  // read, then the text. An empty string is a diff that was read and is empty.
+  let diffLoading = $derived(
+    $repoStore.selectedDiffPending ||
+      ($repoStore.selectedDiff === null && !$repoStore.selectedDiffError),
+  );
+  let diffError = $derived($repoStore.selectedDiffError);
+
+  function retryDetails() {
+    if (selectedCommit) void graphStore.selectCommit(selectedCommit);
+  }
+
+  function retryDiff() {
+    const id = currentCommitId;
+    if (!id) return;
+    const filePath = $repoStore.selectionKind === "commit" ? $repoStore.selectedFilePath : null;
+    if (filePath) void repoStore.selectCommitFileDiff(id, filePath);
+    else void repoStore.selectCommitDiff(id);
+  }
+
   // Agent refactors produce commits with tens of thousands of files; the
   // list renders a window of them and reveals more on demand instead of
   // mounting the whole set at once.
@@ -265,12 +297,18 @@
     <div class="flex-1 grid grid-cols-3 divide-x divide-border min-h-0">
       <div class="p-2 overflow-y-auto space-y-1">
         <div class="text-[10px] font-semibold uppercase text-textMuted px-2 py-1">
-          Changed Files ({filesSummary.count})
+          Changed Files ({details ? filesSummary.count : "--"})
           {#if details}
             <span class="normal-case font-mono text-green-400 ml-1">+{details.total_additions}{filesSummary.partial ? "+" : ""}</span>
             <span class="normal-case font-mono text-red-400">-{details.total_deletions}{filesSummary.partial ? "+" : ""}</span>
           {/if}
         </div>
+        {#if detailsStatus === "error"}
+          <div class="px-2 py-1 flex items-center gap-2 text-[11px] text-amber-500" role="alert">
+            <span class="min-w-0 break-words">Could not load commit details: {detailsError}</span>
+            <button type="button" class="gp-btn text-xs py-1 px-2.5 shrink-0" onclick={retryDetails}>Retry</button>
+          </div>
+        {/if}
         {#if details?.body}
           <div class="px-2 py-1">
             <MarkdownBody source={details.body} />
@@ -367,7 +405,20 @@
       </div>
 
       <div class="col-span-2 p-3 font-mono text-xs overflow-auto bg-background/50 flex flex-col">
-        {#if previewLines.length > 0}
+        {#if diffLoading}
+          <div
+            class="flex flex-1 items-center justify-center gap-2 text-[11px] text-textMuted font-sans"
+            role="status"
+          >
+            <Loader size={14} class="animate-spin" />
+            <span>Reading the diff…</span>
+          </div>
+        {:else if diffError}
+          <div class="flex flex-1 flex-col items-center justify-center gap-2 px-4 text-center font-sans" role="alert">
+            <span class="text-[11px] text-amber-500">Could not read this diff: {diffError}</span>
+            <button type="button" class="gp-btn text-xs py-1 px-2.5" onclick={retryDiff}>Retry</button>
+          </div>
+        {:else if previewLines.length > 0}
           <pre class="whitespace-pre text-textPrimary text-[11px] leading-relaxed select-text">{previewLines.join("\n")}</pre>
           {#if previewTruncated}
             <button
@@ -377,6 +428,14 @@
               Preview capped at {PREVIEW_LINE_CAP.toLocaleString()} lines — open the full diff view
             </button>
           {/if}
+        {:else if currentCommitId !== null}
+          <EmptyState
+            icon={GitCommit}
+            title={$repoStore.selectionKind === "commit" && $repoStore.selectedFilePath
+              ? "No changes in this file"
+              : "No changes in this commit"}
+            compact
+          />
         {:else}
           <EmptyState icon={GitCommit} title="No commit selected" hint="Select a commit to load its diff." compact />
         {/if}

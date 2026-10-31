@@ -72,6 +72,42 @@ describe("CommitDetails single current commit", () => {
     expect(source).not.toContain("$repoStore.selectedCommitId || $graphStore.selectedCommit?.id");
   });
 
+  it("never renders a zero file count for details that are not loaded", () => {
+    expect(source).toContain('Changed Files ({details ? filesSummary.count : "--"})');
+    expect(source).not.toContain("Changed Files ({filesSummary.count})");
+  });
+
+  it("tells a failed details read apart from an empty commit and offers Retry", () => {
+    expect(source).toContain('{#if detailsStatus === "error"}');
+    expect(source).toContain("Could not load commit details: {detailsError}");
+    expect(source).toContain("onclick={retryDetails}");
+    expect(source).toContain("graphStore.selectCommit(selectedCommit)");
+  });
+
+  it("orders the preview states: reading, failed, text, empty commit, no commit", () => {
+    const start = source.indexOf("{#if diffLoading}");
+    expect(start).toBeGreaterThan(-1);
+    const preview = source.slice(start);
+    const order = [
+      "{#if diffLoading}",
+      "{:else if diffError}",
+      "{:else if previewLines.length > 0}",
+      "{:else if currentCommitId !== null}",
+      "{:else}",
+    ].map((marker) => preview.indexOf(marker));
+    expect(order.every((i) => i > -1)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    expect(preview).toContain("Reading the diff…");
+    expect(preview).toContain("Could not read this diff: {diffError}");
+    expect(preview).toContain("No changes in this commit");
+    expect(preview).toContain("No changes in this file");
+    // "No commit selected" is reserved for having no commit at all.
+    expect(preview.indexOf("No commit selected")).toBeGreaterThan(preview.indexOf("{:else if currentCommitId !== null}"));
+    expect(source).toContain("$repoStore.selectedDiffPending");
+    expect(source).toContain("repoStore.selectCommitFileDiff(id, filePath)");
+    expect(source).toContain("repoStore.selectCommitDiff(id)");
+  });
+
   it("derives the header commit from that id, never from a different commit", () => {
     const start = source.indexOf("let selectedCommit = $derived(");
     const block = source.slice(start, source.indexOf("let details = $state"));
