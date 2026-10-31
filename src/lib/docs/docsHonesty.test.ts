@@ -5,6 +5,7 @@ import {
   brokenLinksSection,
   docsRenameHonesty,
   docsSearchHonesty,
+  docsSearchPrompt,
   docsStatusHonesty,
 } from "./docsHonesty";
 
@@ -153,6 +154,24 @@ describe("docsRenameHonesty (adversarial)", () => {
       failed: [{ path: "x.md", error: "disk full" }],
     });
     expect(line).toContain("x.md");
+  });
+});
+
+describe("docsSearchPrompt", () => {
+  it("does not claim 'no hits' for a query that was never run", () => {
+    expect(docsSearchPrompt("a", null, 0, false)).toBe("press-enter");
+  });
+  it("claims 'no hits' only for the query that actually came back empty", () => {
+    expect(docsSearchPrompt("  foo ", "foo", 0, false)).toBe("none");
+  });
+  it("asks for Enter again when the query is edited after a search", () => {
+    expect(docsSearchPrompt("foob", "foo", 3, false)).toBe("press-enter");
+    expect(docsSearchPrompt("foob", "foo", 0, false)).toBe("press-enter");
+  });
+  it("says nothing while searching, for an empty query, or when hits are showing", () => {
+    expect(docsSearchPrompt("foo", null, 0, true)).toBeNull();
+    expect(docsSearchPrompt("   ", "foo", 0, false)).toBeNull();
+    expect(docsSearchPrompt("foo", "foo", 2, false)).toBeNull();
   });
 });
 

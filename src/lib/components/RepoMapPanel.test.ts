@@ -215,6 +215,32 @@ describe("RepoMapPanel build feedback", () => {
   });
 });
 
+describe("RepoMapPanel docs search", () => {
+  const template = source.slice(source.lastIndexOf("</script>"));
+
+  it("only says 'No hits.' through docsSearchPrompt", () => {
+    expect(source).toContain("docsSearchPrompt(docsQuery, searchedQuery, docsHits.length, docsSearching)");
+    const none = template.indexOf("No hits.");
+    expect(none).toBeGreaterThan(-1);
+    expect(template.slice(template.lastIndexOf("{#if", none), none)).toBe('{#if searchPrompt === "none"}\n          <p class="mt-2 text-[11px] text-textMuted">');
+    expect(template.indexOf("No hits.", none + 1)).toBe(-1);
+    expect(template).toContain("Press Enter to search.");
+  });
+
+  it("keeps earlier results (dimmed) while the query is edited", () => {
+    const effect = source.slice(source.indexOf("const query = docsQuery.trim();"), source.indexOf("function reloadView"));
+    expect(effect).toContain('if (query === "")');
+    expect(effect).toContain("docsError = null;");
+    // The unconditional wipe is gone: docsHits is only cleared inside the empty-query branch.
+    expect(effect.slice(0, effect.indexOf('if (query === "")'))).not.toContain("docsHits = []");
+    expect(template).toContain("class:opacity-60={searchedQuery !== docsQuery.trim()}");
+  });
+
+  it("disables Search for an empty query", () => {
+    expect(template).toContain("disabled={docsSearching || !$repoStore.currentPath || !docsQuery.trim()}");
+  });
+});
+
 describe("RepoMapPanel view switching", () => {
   it("drops the previous view's graph before requesting the new one", () => {
     // The view effect, not reloadGraph (which also begins `const view = mapView;`).

@@ -54,6 +54,7 @@
     brokenLinksHonesty,
     brokenLinksSection,
     docsSearchHonesty,
+    docsSearchPrompt,
     docsStatusHonesty,
   } from "../docs/docsHonesty";
   import { formatError } from "../ui/formatError";
@@ -123,6 +124,9 @@
   let docsQuery = $state("");
   let docsHits = $state<DocsSearchHit[]>([]);
   let docsSearching = $state(false);
+  // The trimmed query the current `docsHits` answer; null when no search has
+  // completed (or the last one failed).
+  let searchedQuery = $state<string | null>(null);
   let docsError = $state<string | null>(null);
   let brokenLinks = $state<BrokenLink[]>([]);
   let brokenLoading = $state(false);
@@ -216,6 +220,7 @@
   const docsHonesty = $derived(docsStatusHonesty(docsStatus));
   const searchHonesty = $derived(docsSearchHonesty(docsHits, DOCS_SEARCH_DEFAULT_LIMIT));
   const brokenDisplay = $derived(brokenLinksHonesty(brokenLinks, BROKEN_LINKS_DISPLAY_CAP));
+  const searchPrompt = $derived(docsSearchPrompt(docsQuery, searchedQuery, docsHits.length, docsSearching));
   const brokenSection = $derived(
     brokenLinksSection({ loading: brokenLoading, error: brokenError, links: brokenLinks }),
   );
@@ -385,6 +390,7 @@
     const q = docsQuery.trim();
     if (!repoPath || !q) {
       docsHits = [];
+      searchedQuery = null;
       docsSearching = false;
       return;
     }
@@ -393,10 +399,14 @@
     const live = () => searchRequests.isCurrent(request) && currentRepo === repoPath && docsQuery.trim() === q && mapView === "docs";
     try {
       const hits = await docsSearch(repoPath, q, DOCS_SEARCH_DEFAULT_LIMIT);
-      if (live()) docsHits = hits;
+      if (live()) {
+        docsHits = hits;
+        searchedQuery = q;
+      }
     } catch (err) {
       if (!live()) return;
       docsHits = [];
+      searchedQuery = null;
       docsError = reportMapFailure("search", repoPath, err);
     } finally {
       if (live()) docsSearching = false;
@@ -504,6 +514,7 @@
       graphLoad = null;
       docsStatus = null;
       docsHits = [];
+      searchedQuery = null;
       brokenLinks = [];
       linkResult = null;
       errorMsg = null;
@@ -538,11 +549,18 @@
   });
 
   $effect(() => {
-    docsQuery;
+    const query = docsQuery.trim();
     untrack(() => {
       searchRequests.next();
       docsSearching = false;
-      docsHits = [];
+      // Search-only since broken links own `brokenError`; an edit supersedes it.
+      docsError = null;
+      // Earlier results stay (dimmed) while the query is edited; only an
+      // emptied box discards them.
+      if (query === "") {
+        docsHits = [];
+        searchedQuery = null;
+      }
     });
   });
 
@@ -815,7 +833,7 @@
             bind:value={docsQuery}
             aria-label="Search repository markdown"
           />
-          <button type="submit" class="gp-btn text-[11px] px-2 py-1" disabled={docsSearching || !$repoStore.currentPath}>
+          <button type="submit" class="gp-btn text-[11px] px-2 py-1" disabled={docsSearching || !$repoStore.currentPath || !docsQuery.trim()}>
             {docsSearching ? "Searching…" : "Search"}
           </button>
         </form>
@@ -824,10 +842,13 @@
             {searchHonesty}
           </p>
         {/if}
-        {#if docsHits.length === 0 && docsQuery.trim() && !docsSearching}
+        {#if searchPrompt === "none"}
           <p class="mt-2 text-[11px] text-textMuted">No hits.</p>
-        {:else if docsHits.length > 0}
-          <ul class="mt-2 space-y-1.5">
+        {:else if searchPrompt === "press-enter"}
+          <p class="mt-2 text-[11px] text-textMuted" data-testid="docs-search-prompt">Press Enter to search.</p>
+        {/if}
+        {#if docsHits.length > 0}
+          <ul class="mt-2 space-y-1.5" class:opacity-60={searchedQuery !== docsQuery.trim()}>
             {#each keyedList(docsHits, (hit) => JSON.stringify([hit.path, hit.line, hit.score])) as { item: hit, key: renderKey } (renderKey)}
               <li>
                 <button

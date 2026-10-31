@@ -99,6 +99,23 @@ export function brokenLinksSection(input: {
   return input.links.length === 0 ? "empty" : "list";
 }
 
+/**
+ * What the search box says about the query as typed. "No hits." is a claim
+ * about a search that ran; typing alone has not run one, and editing a query
+ * after a search has not either — those read "press Enter" instead.
+ */
+export function docsSearchPrompt(
+  query: string,
+  searchedQuery: string | null,
+  hitCount: number,
+  searching: boolean,
+): "none" | "press-enter" | null {
+  const q = query.trim();
+  if (searching || q === "") return null;
+  if (q !== searchedQuery) return "press-enter";
+  return hitCount === 0 ? "none" : null;
+}
+
 export function brokenLinksHonesty(
   links: BrokenLink[],
   displayCap: number,
