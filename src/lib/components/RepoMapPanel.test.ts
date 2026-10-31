@@ -132,6 +132,34 @@ describe("RepoMapPanel bounds process output before the status strip", () => {
   });
 });
 
+describe("RepoMapPanel template honesty", () => {
+  const template = source.slice(source.lastIndexOf("</script>"));
+
+  it("never reads a failed broken-links check as 'None found'", () => {
+    expect(source).toContain("brokenLinksSection(");
+    expect(source).toContain("brokenError = reportMapFailure(");
+    expect(source).toContain('data-testid="docs-broken-error"');
+    expect(template).toContain("Could not check links:");
+    const empty = template.indexOf('{:else if brokenSection === "empty"}');
+    const noneFound = template.indexOf("None found in the indexed vault.");
+    expect(empty).toBeGreaterThan(-1);
+    expect(noneFound).toBeGreaterThan(empty);
+    expect(template.indexOf("None found in the indexed vault.", noneFound + 1)).toBe(-1);
+    // Between the empty arm and the claim there is no other branch.
+    expect(template.slice(empty + 1, noneFound)).not.toMatch(/\{:else/);
+    // The count is only claimed after a read that succeeded.
+    expect(template).toContain('{#if brokenSection === "list" || brokenSection === "empty"}');
+  });
+
+  it("keeps the indexed-note count when only the links read fails", () => {
+    const reload = source.slice(source.indexOf("async function reloadDocs"), source.indexOf("async function runDocsSearch"));
+    expect(reload.indexOf("docsStatus = status;")).toBeGreaterThan(-1);
+    expect(reload.indexOf("docsStatus = status;")).toBeLessThan(reload.indexOf("await docsBrokenLinks"));
+    expect(reload).not.toContain("docsStatus = null");
+    expect(reload).not.toContain("docsError");
+  });
+});
+
 describe("CodeView map section", () => {
   it("lazy-loads the Map panel beside Explorer and Blame", () => {
     expect(codeView).toContain('section === "map"');

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { DocRenameOutcome } from "./client";
 import {
   brokenLinksHonesty,
+  brokenLinksSection,
   docsRenameHonesty,
   docsSearchHonesty,
   docsStatusHonesty,
@@ -152,6 +153,22 @@ describe("docsRenameHonesty (adversarial)", () => {
       failed: [{ path: "x.md", error: "disk full" }],
     });
     expect(line).toContain("x.md");
+  });
+});
+
+describe("brokenLinksSection", () => {
+  const link = { source: "a.md", target: "b" };
+  it("never reads a failed check as an empty vault", () => {
+    expect(brokenLinksSection({ loading: false, error: "x", links: [] })).toBe("error");
+  });
+  it("loading wins over everything", () => {
+    expect(brokenLinksSection({ loading: true, error: "x", links: [link] })).toBe("loading");
+  });
+  it("is empty only after a successful read with zero links", () => {
+    expect(brokenLinksSection({ loading: false, error: null, links: [] })).toBe("empty");
+  });
+  it("lists links when the read succeeded", () => {
+    expect(brokenLinksSection({ loading: false, error: null, links: [link] })).toBe("list");
   });
 });
 

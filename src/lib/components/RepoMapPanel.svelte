@@ -50,6 +50,7 @@
   } from "../docs/docGraphPayload";
   import {
     brokenLinksHonesty,
+    brokenLinksSection,
     docsSearchHonesty,
     docsStatusHonesty,
   } from "../docs/docsHonesty";
@@ -118,6 +119,7 @@
   let docsError = $state<string | null>(null);
   let brokenLinks = $state<BrokenLink[]>([]);
   let brokenLoading = $state(false);
+  let brokenError = $state<string | null>(null);
 
   let linkResult = $state<WorkspaceLinksResult | null>(null);
   let linksLoading = $state(false);
@@ -207,7 +209,10 @@
   const docsHonesty = $derived(docsStatusHonesty(docsStatus));
   const searchHonesty = $derived(docsSearchHonesty(docsHits, DOCS_SEARCH_DEFAULT_LIMIT));
   const brokenDisplay = $derived(brokenLinksHonesty(brokenLinks, BROKEN_LINKS_DISPLAY_CAP));
-  const linksHonesty = $derived(linkCandidatesHonesty(linkResult));
+  const brokenSection = $derived(
+    brokenLinksSection({ loading: brokenLoading, error: brokenError, links: brokenLinks }),
+  );
+  const linksHonesty =$derived(linkCandidatesHonesty(linkResult));
 
   const currentRepo = $derived($currentRepoPath);
   const indexSnapshots = liveIndex.snapshots;
@@ -340,19 +345,20 @@
     if (!repoPath) return;
     const request = docsRequests.next();
     const live = () => docsRequests.isCurrent(request) && currentRepo === repoPath && mapView === "docs";
-    docsError = null;
+    brokenError = null;
     brokenLoading = true;
     try {
       const status = await docsRefresh(repoPath);
       if (!live()) return;
+      // Committed before the links read so "N notes indexed" survives a
+      // links-only failure; a refresh that itself failed never reaches here.
+      docsStatus = status;
       const links = await docsBrokenLinks(repoPath);
       if (!live()) return;
-      docsStatus = status;
       brokenLinks = links;
     } catch (err) {
       if (!live()) return;
-      docsError = reportMapFailure("documents", repoPath, err);
-      docsStatus = null;
+      brokenError = reportMapFailure("documents", repoPath, err);
       brokenLinks = [];
     } finally {
       if (live()) brokenLoading = false;
@@ -441,7 +447,7 @@
         map: load ? { available: load.available, path: load.path, reason: load.reason } : null,
         graph: graphLoad ? { available: graphLoad.available, kind: graphLoad.kind, reason: graphLoad.reason } : null,
         liveIndex: liveIndex.get(repository),
-        errors: [errorMsg, actionNote, docsError, linksError],
+        errors: [errorMsg, actionNote, docsError, brokenError, linksError],
       }, live);
       if (live()) copyLogsNote = result === "copied" ? "DevMap logs copied." : "Could not copy DevMap logs. Try again.";
     } catch (error) {
@@ -465,6 +471,7 @@
       linkResult = null;
       errorMsg = null;
       docsError = null;
+      brokenError = null;
       linksError = null;
       actionNote = null;
       copyLogsNote = null;
@@ -789,13 +796,16 @@
       <section aria-labelledby="docs-broken-heading" class="border-t border-border/50 pt-3">
         <h3 id="docs-broken-heading" class="text-[10px] uppercase tracking-wide text-textMuted mb-1.5">
           Broken links
-          {#if !brokenLoading}
+          {#if brokenSection === "list" || brokenSection === "empty"}
             <span class="normal-case tracking-normal ml-1">({brokenLinks.length})</span>
           {/if}
         </h3>
-        {#if brokenLoading}
+        {#if brokenSection === "loading"}
           <p class="text-[11px] text-textMuted">Loading…</p>
-        {:else if brokenLinks.length === 0}
+        {:else if brokenSection === "error"}
+          <p class="text-[11px] text-rose-600 dark:text-rose-400" role="alert" data-testid="docs-broken-error">Could not check links: {boundStrip(brokenError)}</p>
+          <button type="button" class="gp-btn text-[11px] px-2 py-0.5 mt-1" onclick={() => void reloadDocs()}>Retry</button>
+        {:else if brokenSection === "empty"}
           <p class="text-[11px] text-textMuted">None found in the indexed vault.</p>
         {:else}
           {#if brokenDisplay.honesty}

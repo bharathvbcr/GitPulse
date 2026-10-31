@@ -84,6 +84,21 @@ export function docsSearchHonesty(
   return null;
 }
 
+/**
+ * Which body the broken-links section shows. A read that failed must never
+ * share an arm with a read that found nothing: `"empty"` is only reachable
+ * when the check ran and came back with zero links.
+ */
+export function brokenLinksSection(input: {
+  loading: boolean;
+  error: string | null;
+  links: readonly BrokenLink[];
+}): "loading" | "error" | "empty" | "list" {
+  if (input.loading) return "loading";
+  if (input.error) return "error";
+  return input.links.length === 0 ? "empty" : "list";
+}
+
 export function brokenLinksHonesty(
   links: BrokenLink[],
   displayCap: number,
