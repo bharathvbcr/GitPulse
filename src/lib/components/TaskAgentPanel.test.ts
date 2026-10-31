@@ -53,3 +53,67 @@ describe("TaskAgentPanel checkout links", () => {
     expect(source).not.toContain('"Released. The checkout is free for another attempt."');
   });
 });
+
+describe("a history that could not be read is not an empty task", () => {
+  it("the summary and the History empty state name the failed read before saying nothing exists", () => {
+    const summary = source.slice(source.indexOf("const summary = $derived.by"));
+    expect(summary.indexOf("historyError")).toBeGreaterThan(-1);
+    expect(summary.indexOf("historyError")).toBeLessThan(summary.indexOf("No attempts yet."));
+    const history = source.slice(source.indexOf("{#if !runs.length}"));
+    expect(history.indexOf("historyError")).toBeGreaterThan(-1);
+    expect(history.indexOf("historyError")).toBeLessThan(history.indexOf("No runs yet."));
+  });
+
+  it("keeps the launch form shut until a first read has succeeded, and offers a Retry in the banner", () => {
+    expect(source).toMatch(/const formOpen = \$derived\(expandedForm \?\? \(readOnce && live\.length === 0\)\);/);
+    expect(source).toContain("readOnce = true;");
+    const banner = /\{#if historyError\}[^\n]*\{\/if\}/.exec(source)?.[0] ?? "";
+    expect(banner).toContain(">Retry</button>");
+  });
+});
+
+describe("a poll folds the first page into the paged history instead of replacing it", () => {
+  const decisions = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "AgentDecisions.svelte"), "utf8");
+
+  it("both lists merge through the one owner and keep no replace-on-refresh path", () => {
+    for (const text of [source, decisions]) expect(text).toContain("mergeLoadedPage(");
+    expect(source).not.toContain(": page.items;");
+    expect(decisions).not.toContain("(more ? rows : [])");
+    expect(decisions).not.toContain("questions = more ?");
+  });
+
+  it("a head poll keeps the cursor the reader paged to", () => {
+    for (const text of [source, decisions]) {
+      expect(text).toContain("pagedBeyond = true");
+      expect(text).toContain("if (more || !pagedBeyond) cursor = page.next_cursor;");
+    }
+  });
+
+  it("says why Load more stops at the cap instead of disabling it silently", () => {
+    expect(source).toContain(`data-testid="agents-history-cap"`);
+    expect(source).not.toContain("runs.length >= MAX_LOADED_RUNS}>Load more");
+    expect(decisions).not.toContain("rows.length >= 180}>Load more");
+    expect(decisions).toContain("The rest are not loaded here.");
+  });
+});
+
+describe("one action in flight no longer freezes every card", () => {
+  it("has no shared busy flag; every button is gated per card", () => {
+    expect(source).not.toContain("disabled={busy}");
+    expect(source).not.toMatch(/\bbusy = (true|false)/);
+    expect(source).toContain("canAct(run.id, inflight, mutationHolder");
+  });
+
+  it("every act() call names the verb its card shows and says whether it takes the git slot", () => {
+    const calls = source.match(/\bact\(run, \{[^}]*\}/g) ?? [];
+    const sites = source.match(/\bact\(run[,)]/g) ?? [];
+    expect(sites.length).toBeGreaterThan(10);
+    expect(calls.length).toBe(sites.length);
+    for (const call of calls) expect(call).toMatch(/label: "[A-Z][a-z ]+", mutates: (true|false)/);
+  });
+
+  it("only merge, discard, release, resume, recover and trust take the slot", () => {
+    const taking = (source.match(/act\(run, \{ label: "[^"]*", mutates: true \}/g) ?? []).map((call) => /label: "([^"]*)"/.exec(call)?.[1]).sort();
+    expect(taking).toEqual(["Discarding", "Merging", "Releasing", "Resuming", "Resuming", "Trusting"]);
+  });
+});

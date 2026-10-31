@@ -225,7 +225,9 @@ describe("the agent handoff has one implementation", () => {
     expect(panel).toContain("const live = $derived(monitored.map((row) => row.run));");
     expect(panel).toContain("const ended = $derived(allRuns.filter((run) => !runHoldsCheckout(run, clock))");
     expect(panel).not.toMatch(/LIVE\.includes/);
-    expect(panel).toContain("const formOpen = $derived(expandedForm ?? live.length === 0)");
+    // Open by default only for a task whose history has been read and has
+    // nothing live: an unread history is not an empty one (readOnce).
+    expect(panel).toContain("const formOpen = $derived(expandedForm ?? (readOnce && live.length === 0))");
     // Tailwind preflight's `[hidden]` has zero specificity; without this the
     // fold would be decorative and the form would stay on screen.
     expect(panel).toContain("#task-agent-launch[hidden]{display:none}");

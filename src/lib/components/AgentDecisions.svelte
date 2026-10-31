@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
+  import { mergeLoadedPage } from "../workbench/pageMerge";
   import { decisionWrite, decisionQuestions, structuredDecisionAnswer, explainError, listAgentDecisions, listPendingDecisions, saveAgentDecision, WorkbenchError, type AgentDecision, type DecisionQuestion, type DecisionWrite, type TaskRun } from "../workbench/client";
   let { run, refreshToken = 0, active = true }: { run: TaskRun; refreshToken?: number; active?: boolean } = $props();
   let rows = $state<AgentDecision[]>([]), total = $state(0), cursor = $state<string | null>(null);
@@ -8,6 +9,8 @@
   let questions = $state<Record<string, DecisionQuestion[]>>({});
   let structured = $state<Record<string, Record<string, string>>>({});
   let pending = $state<{ source: AgentDecision; input: DecisionWrite } | null>(null);
+  // Set once a "Load more" page has landed, so a head refresh keeps that cursor.
+  let pagedBeyond = false;
   let disposed = false;
   const labels = { pending: "Needs review", decided: "Decision saved · delivery pending", dispatching: "Delivery attempted · awaiting provider confirmation", resolved: "Provider confirmed resolution", cancelled: "Request cancelled" };
   async function refresh(more = false) {
@@ -25,11 +28,17 @@
       const items = [...(waiting?.items ?? []), ...page.items];
       if (items.some((item) => item.task_id !== run.task_id || item.repository_id !== run.repository_id || item.source_revision !== run.source_revision || item.session_id !== run.session_id)) throw new WorkbenchError("protocol_error", "A request does not belong to this run.");
       const sets = Object.fromEntries(items.map((item) => [item.id, decisionQuestions(item)]));
-      questions = more ? {...questions, ...sets} : sets;
-      // One row per request, in first-seen order: a pending request on the
-      // history page too keeps its place at the top.
-      rows = [...new Map([...(more ? rows : []), ...items].map((item) => [item.id, item])).values()];
-      total = page.total; cursor = page.next_cursor; error = "";
+      // One row per request. A refresh folds the fresh pages into the rows the
+      // reader has paged in rather than replacing them. A loaded request that
+      // is no longer in the pending list has been answered since and its history
+      // page may not be loaded, so it is dropped rather than shown as "Needs
+      // review"; with more than a page pending the list cannot prove that.
+      rows = mergeLoadedPage(rows, items, { more, dropStale: waiting && !waiting.has_more ? (item) => item.state === "pending" : undefined });
+      const kept = new Set(rows.map((item) => item.id));
+      questions = Object.fromEntries(Object.entries({ ...questions, ...sets }).filter(([id]) => kept.has(id)));
+      if (more) pagedBeyond = true;
+      total = page.total; error = "";
+      if (more || !pagedBeyond) cursor = page.next_cursor;
     } catch (cause) { if (!disposed) error = explainError(cause); }
     finally { if (!disposed) loading = false; }
   }
@@ -93,7 +102,8 @@
       {:else if item.state === "pending"}<p>This request expired or its target changed. Return to the provider for a current request.</p>{/if}
     </article>
   {/each}
-  {#if cursor}<button class="gp-btn" type="button" onclick={() => refresh(true)} disabled={loading || busy || !!pending || rows.length >= 180}>Load more requests</button>{/if}
+  {#if cursor && rows.length >= 180}<p>Showing {rows.length} of {total} requests. The rest are not loaded here.</p>
+  {:else if cursor}<button class="gp-btn" type="button" onclick={() => refresh(true)} disabled={loading || busy || !!pending}>Load more requests</button>{/if}
 </section>
 
 <style>
