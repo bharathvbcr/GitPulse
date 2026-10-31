@@ -37,7 +37,7 @@
   import { linkTaskToIssue, MAX_TASK_ISSUE_BATCH, prepareTaskIssues, runTaskIssues, summarizeTaskIssues, taskIssuesConfirmation, type TaskIssueResult, type TaskIssueTarget } from "../workbench/taskIssue";
   import { askConfirm } from "../stores/modalStore";
   import { openExternal } from "../desktop/openExternal";
-  import { cardMatchesQuery, parseTaskQuery, queryChips, queryHas, removeQueryTerm, repositoryMatches, toggleQueryTerm, QUERY_HELP, type QueryContext, type SuggestionSources } from "../workbench/taskQuery";
+  import { cardMatchesQuery, dueRangeFilter, parseTaskQuery, queryChips, queryControlValue, queryHas, removeQueryTerm, repositoryMatches, setQueryControl, toggleQueryTerm, QUERY_HELP, type QueryContext, type SuggestionSources } from "../workbench/taskQuery";
   import { describeMatch, searchCards, type RankContext, type RankedCard, type SearchOrder } from "../workbench/taskRank";
   import { CANDIDATE_PAGE, MAX_CANDIDATES, bucketByStatus, canLoadMore, candidatesComplete, describeSearch, nextCandidates, planSearch, readAllCandidates, reloadCandidates, type CandidateRead, type CandidateSet, type SearchPlan } from "../workbench/taskSearchPlan";
   import TaskSearchField from "./TaskSearchField.svelte";
@@ -148,6 +148,15 @@
    * reach the store, so typing `is:bug` does not search for "is" and "bug".
    */
   const parsedQuery = $derived(parseTaskQuery(search));
+  /**
+   * The Filters bar's status select and due-date range read and write the search
+   * (`status:review`, `due:FROM..TO`), so a saved view keeps them with it. null:
+   * the search holds more than a control can show, and it keeps the say.
+   */
+  const statusControl = $derived(queryControlValue(parsedQuery, "status"));
+  const rangeControl = $derived(queryControlValue(parsedQuery, "due-range"));
+  const rangeEnds = $derived<[string, string]>(rangeControl ? (rangeControl.split("..") as [string, string]) : ["", ""]);
+  const setDueRange = (from: string, to: string) => { search = setQueryControl(search, "due-range", dueRangeFilter(from, to)); };
   /** The Filters bar's choices: applied with the search's filters by `cardVisible`, kept by saved views. */
   let facet = $state<TaskFacet>(emptyFacet());
   // ---- Hidden repositories (`taskHiddenRepositories.ts`) ------------------
@@ -2457,6 +2466,21 @@
           <option value="soon">Due soon</option>
           <option value="none">No due date</option>
         </select>
+        <select class="gp-select" aria-label="Filter by status" data-testid="task-filter-status" value={statusControl ?? "several"} disabled={statusControl === null}
+          title={statusControl === null ? "The search holds several statuses or an exclusion; change them there." : undefined}
+          onchange={(event) => { search = setQueryControl(search, "status", event.currentTarget.value ? `status:${event.currentTarget.value}` : ""); }}>
+          <option value="">Any status</option>
+          <option value="open">Not done</option>
+          {#each STATUSES as status}<option value={status}>{STATUS_LABELS[status]}</option>{/each}
+          {#if statusControl === null}<option value="several" disabled>Several, set in the search</option>{/if}
+        </select>
+        <label class="range" title={rangeControl === null ? "The search holds several date ranges; change them there." : "Tasks due on or between these days"}>Due
+          <input class="gp-field" type="date" aria-label="Due on or after" data-testid="task-filter-due-from" value={rangeEnds[0]} max={rangeEnds[1] || undefined} disabled={rangeControl === null}
+            onchange={(event) => setDueRange(event.currentTarget.value, rangeEnds[1])} />
+          to
+          <input class="gp-field" type="date" aria-label="Due on or before" data-testid="task-filter-due-to" value={rangeEnds[1]} min={rangeEnds[0] || undefined} disabled={rangeControl === null}
+            onchange={(event) => setDueRange(rangeEnds[0], event.currentTarget.value)} />
+        </label>
         <!-- A repository's own board already shows only its tasks, so the
              select is offered there only while a filter carried over from
              another board is still on — never as an invisible constraint. -->
@@ -2475,7 +2499,7 @@
         onPriority={(value) => { suggestPriority = value; void askSuggest(); }}
         onOpen={(id) => void openTask(id)} onRefresh={() => void askSuggest()} onClose={() => { showSuggest = false; }}
       />
-      <WavePanel repositoryId={scope.kind === "repository" ? scope.id : null} />
+      <WavePanel repositoryId={scope.kind === "repository" ? scope.id : null} maxPriority={suggestPriority} />
     {/if}
     {#if initialized && (showFilters || filtering || showSearchHelp)}
       <div class="query-bar" data-testid="task-query-bar">
@@ -2941,6 +2965,7 @@
   h1 span{font-size:11px;font-weight:500;color:rgb(var(--c-text-muted))}
   .actions,.facets,.selection,.undo-strip{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
   .facets,.selection{padding:8px 14px}
+  .facets .range{display:inline-flex;align-items:center;gap:6px;font-size:12px}
   .selection,.undo-strip{margin:8px 14px 0;padding:8px 10px;border-radius:12px}
   .undo-strip>span{flex:1;min-width:0;font-size:12px}
   button,input,select{font-size:12px}

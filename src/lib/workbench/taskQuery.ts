@@ -35,7 +35,7 @@
 
 import type { Repository, TaskCard, TaskStatus } from "./client";
 import { STATUSES, STATUS_LABELS } from "./vocabulary";
-import { dueState } from "./taskOrganize";
+import { dayStartSec, dueInRange, dueState } from "./taskOrganize";
 import { PRIORITY_LABELS, parsePriority } from "./taskPriority";
 import { fold, STOPWORDS, words as lexiconWords } from "./taskLexicon";
 
@@ -56,6 +56,8 @@ const KEY_ALIASES: Readonly<Record<string, Exclude<QueryKey, "title">>> = {
 const PRIORITY_NAMES = PRIORITY_LABELS.map((name) => name.toLowerCase());
 const DUE_VALUES = ["overdue", "soon", "later", "none", "any"] as const;
 type DueValue = (typeof DUE_VALUES)[number];
+/** `A..B`, `A..` or `..B` with `YYYY-MM-DD` days; an open end is absent. */
+const DUE_RANGE = /^(\d{4}-\d{2}-\d{2})?\.\.(\d{4}-\d{2}-\d{2})?$/;
 /** Words that mean "has no value" for owner, label and severity. */
 const NONE_WORDS = new Set(["none", "unassigned", "no", "empty"]);
 
@@ -157,6 +159,18 @@ const IS_SHORTCUTS: Readonly<Record<string, { key: Exclude<QueryKey, "title">; v
   overdue: { key: "due", value: "overdue" },
 };
 
+/** A due range read to the form `FROM..TO` (an open end is ""), or the reason it is not one. */
+function resolveDueRange(value: string): { value: string } | { problem: string } {
+  const ends = DUE_RANGE.exec(value.trim());
+  const [from, to] = [ends?.[1] ?? "", ends?.[2] ?? ""];
+  const bad = (why: string) => ({ problem: `due:${value} is not a date range (${why}). Not applied.` });
+  if (!ends || (from === "" && to === "")) return bad("write it as 2026-11-01..2026-11-30, or with one end open");
+  const [start, end] = [from === "" ? null : dayStartSec(from), to === "" ? null : dayStartSec(to)];
+  if ((from !== "" && start === null) || (to !== "" && end === null)) return bad("one end is not a real day");
+  if (start !== null && end !== null && start > end) return bad("it ends before it starts");
+  return { value: `${from}..${to}` };
+}
+
 function resolve(key: Exclude<QueryKey, "title">, value: string): { value: string } | { problem: string } {
   switch (key) {
     case "status": {
@@ -168,6 +182,7 @@ function resolve(key: Exclude<QueryKey, "title">, value: string): { value: strin
       return priority ? { value: priority } : { problem: `priority:${value} is not a priority (${PRIORITY_NAMES.join(", ")}, or p0–p3). Not applied.` };
     }
     case "due": {
+      if (value.includes("..")) return resolveDueRange(value);
       const due = DUE_VALUES.find((entry) => entry === value.toLowerCase());
       return due ? { value: due } : { problem: `due:${value} is not a due filter (${DUE_VALUES.join(", ")}). Not applied.` };
     }
@@ -362,6 +377,8 @@ function repoMatches(card: TaskCard, value: string, ctx: QueryContext): boolean 
 }
 
 function dueMatches(card: TaskCard, value: string, nowSec: number): boolean {
+  const range = DUE_RANGE.exec(value);
+  if (range) return dueInRange(card.due_at, range[1] ?? "", range[2] ?? "");
   const state = dueState(card.due_at, nowSec);
   if ((value as DueValue) === "any") return state !== "none";
   return state === value;
@@ -472,6 +489,86 @@ export function toggleQueryTerm(search: string, filter: string): string {
   const present = parseTaskQuery(search).terms.filter((term) => sameTerm(term, wanted));
   if (present.length > 0) return editSpans(search, present.map((term) => ({ ...term, replacement: tokenWithout(term.raw, wanted) })));
   const next = search.trim() ? `${search.trim()} ${filter.trim()}` : filter.trim();
+  return next.length <= MAX_QUERY_TEXT ? next : search;
+}
+
+/**
+ * The Filters bar's status select and due-date range are views of the search,
+ * not a second state: they read and write `status:` and `due:FROM..TO`, so a
+ * saved view (which keeps the search) keeps them and a chip and a control can
+ * never disagree about what is applied.
+ */
+export type QueryControl = "status" | "due-range";
+
+function controlTerm(term: QueryTerm, control: QueryControl): boolean {
+  return control === "status" ? term.key === "status" : term.key === "due" && term.value.includes("..");
+}
+
+/**
+ * What a control shows for the search: "" when it holds none, the one value
+ * (`review`, `2026-11-01..2026-11-30`) when it holds one, and null when it
+ * holds more than a control can show: an exclusion, or more than one term of
+ * the control's key in any form (a comma list, separate tokens such as
+ * `due:overdue due:2026-11-01..`, a list that mixes its value with others).
+ * Repeated keys widen to OR, so the range beside `overdue` is not the range
+ * alone. The search keeps the say then; the control never pretends to hold it.
+ */
+export function queryControlValue(parsed: ParsedTaskQuery, control: QueryControl): string | null {
+  const key = control === "status" ? "status" : "due";
+  const ofKey = parsed.terms.filter((term) => term.key === key);
+  if (ofKey.length > 1) return null;
+  const held = ofKey.filter((term) => controlTerm(term, control));
+  if (held.length === 0) return "";
+  const [only] = held;
+  const alone = !only.negated && parsed.terms.every((term) => term === only || term.start !== only.start);
+  return alone ? only.value : null;
+}
+
+/**
+ * A filter token (`due:overdue,2026-11-01..`) without the values the control
+ * reads, or "" when none would be left; other values stay as typed. For the
+ * range, a value the parser refused (`due:B..A`) goes too: left behind, it would
+ * sit unseen beside the range that replaces it.
+ */
+function tokenWithoutControl(raw: string, control: QueryControl): string {
+  const match = /^(-?)([A-Za-z]+):(.*)$/s.exec(raw);
+  const key = match ? KEY_ALIASES[match[2].toLowerCase()] : undefined;
+  if (!match || !key) return raw;
+  const pieces = listPieces(match[3]);
+  const kept = pieces.filter((piece) => {
+    const read = parseTaskQuery(`${match[1]}${match[2]}:${piece}`).terms;
+    if (read.some((term) => controlTerm(term, control))) return false;
+    return !(control === "due-range" && key === "due" && read.length === 0 && unquote(piece).includes(".."));
+  });
+  if (kept.length === pieces.length) return raw;
+  return kept.length ? `${match[1]}${match[2]}:${kept.join(",")}` : "";
+}
+
+/**
+ * The `due:FROM..TO` filter for the Filters bar's two days, "" when both are
+ * empty. A pair typed backwards is swapped: the date inputs' min and max do not
+ * stop a typed value, and the parser refuses a range that ends before it starts.
+ */
+export function dueRangeFilter(from: string, to: string): string {
+  if (from === "" && to === "") return "";
+  const [first, last] = from !== "" && to !== "" && from > to ? [to, from] : [from, to];
+  return `due:${first}..${last}`;
+}
+
+/**
+ * The search with every value the control reads taken out (lists and
+ * exclusions included; a list's other values stay), then `filter`
+ * (`status:review`) added unless it is "". A change that would push the
+ * search past the store's limit leaves it unchanged.
+ */
+export function setQueryControl(search: string, control: QueryControl, filter: string): string {
+  const edits = queryTokens(search.slice(0, MAX_QUERY_TEXT)).flatMap((token) => {
+    const replacement = tokenWithoutControl(token.text, control);
+    return replacement === token.text ? [] : [{ start: token.start, end: token.end, raw: token.text, replacement }];
+  });
+  const cleared = editSpans(search, edits);
+  if (filter === "") return cleared;
+  const next = cleared.trim() ? `${cleared.trim()} ${filter}` : filter;
   return next.length <= MAX_QUERY_TEXT ? next : search;
 }
 
@@ -587,6 +684,7 @@ export const QUERY_HELP: readonly { example: string; meaning: string }[] = [
   { example: "label:ci", meaning: "Label; label:none for unlabelled" },
   { example: "severity:high", meaning: "Severity; severity:none for unset" },
   { example: "due:overdue", meaning: "overdue, soon, later, none, any" },
+  { example: "due:2026-11-01..2026-11-30", meaning: "Due within those days; leave one end open with due:2026-11-01.." },
   { example: "-is:bug", meaning: "A leading - excludes; -word excludes titles holding it" },
   { example: "label:ui,ci", meaning: "A comma list is any of its values" },
   { example: 'label:"needs review"', meaning: "Quote a value with spaces" },

@@ -184,6 +184,12 @@ export const STATS_DRAIN_MAX_BATCHES = 64;
  * interval; long enough to cover switching back and forth between two tabs.
  */
 export const ACTIVATION_FRESH_MS = 5_000;
+/**
+ * Consecutive failed status polls before the bar says the file list may be
+ * stale. One failure is routine (a repo mid-rename, a deferral); three in a
+ * row at the poll's rest is about eighteen seconds of silence.
+ */
+export const STATUS_UNAVAILABLE_AFTER_FAILURES = 3;
 /** Publish coalesced stats every N batches (and always on the final drain). */
 export const STATS_PUBLISH_EVERY = 8;
 /**
@@ -477,33 +483,75 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     pollInflight = true;
     const startedAt = Date.now();
     try {
-      const statuses = await invokeFn<FileStatus[]>("cmd_get_status", {
-        repoPath: path,
-      });
-      pollLastDurationMs = Date.now() - startedAt;
-      if (pollRuns.get(sessionId) !== run) return;
-      if (snapshotRuns.get(sessionId) !== snapshotRunAtStart) return;
-      // A quiet repo returns byte-identical statuses every 6s; republishing
-      // them would re-run every subscriber effect app-wide (visible churn in
-      // the diff pane). Skip when the session still holds exactly these
-      // statuses — a generation change re-applies via applyToSession below.
-      const live = internal.sessions[sessionId];
-      if (
-        live &&
-        live.generation === generation &&
-        statusesEqual(statuses, live.statuses)
-      ) {
+      let statuses: FileStatus[];
+      try {
+        statuses = await invokeFn<FileStatus[]>("cmd_get_status", {
+          repoPath: path,
+        });
+      } catch (error) {
+        // Only a refused read counts. One failure is a repo that vanished (the
+        // next full refresh reports it) or a blip; a run of them is a status
+        // that has stopped answering while the file list on screen goes on
+        // looking current. A poll a newer poll or a hydrate superseded says
+        // nothing about the present, and the count stops at the threshold, so
+        // a repository that stays down publishes once, not on every poll.
+        const failed =
+          internal.sessions[sessionId]?.statusPollFailures ?? STATUS_UNAVAILABLE_AFTER_FAILURES;
+        if (
+          pollRuns.get(sessionId) === run &&
+          snapshotRuns.get(sessionId) === snapshotRunAtStart &&
+          failed < STATUS_UNAVAILABLE_AFTER_FAILURES
+        ) {
+          const failures = failed + 1;
+          const noticed = failures === STATUS_UNAVAILABLE_AFTER_FAILURES;
+          const applied = applyToSession(sessionId, generation, {
+            statusPollFailures: failures,
+            ...(noticed ? { statusUnavailableSince: Date.now() } : {}),
+          });
+          if (applied && noticed) {
+            diagnostics.warn(
+              "repo",
+              `git status for ${path} failed ${failures} polls in a row; the file list may be stale: ${formatError(error)}`,
+            );
+          }
+        }
         return;
       }
-      const before = live && live.generation === generation ? live.statuses : [];
-      applyToSession(sessionId, generation, { statuses });
-      // The watcher cannot see nested edits (its worktree watch is
-      // non-recursive); the poll can, so it announces them to the views
-      // derived from files.
-      const polled = changeFromStatusPoll(before, statuses);
-      if (polled) for (const listener of polledChangeListeners) listener(path, polled);
-    } catch {
-      /* a repo that vanished reports through the next full refresh */
+      try {
+        pollLastDurationMs = Date.now() - startedAt;
+        if (pollRuns.get(sessionId) !== run) return;
+        if (snapshotRuns.get(sessionId) !== snapshotRunAtStart) return;
+        // Cleared before the unchanged-statuses return below: a quiet repo that
+        // answers again publishes nothing else, and the notice must still go.
+        applyToSession(sessionId, generation, (live) =>
+          live.statusPollFailures === 0 && live.statusUnavailableSince === null
+            ? {}
+            : { statusPollFailures: 0, statusUnavailableSince: null },
+        );
+        // A quiet repo returns byte-identical statuses every 6s; republishing
+        // them would re-run every subscriber effect app-wide (visible churn in
+        // the diff pane). Skip when the session still holds exactly these
+        // statuses — a generation change re-applies via applyToSession below.
+        const live = internal.sessions[sessionId];
+        if (
+          live &&
+          live.generation === generation &&
+          statusesEqual(statuses, live.statuses)
+        ) {
+          return;
+        }
+        const before = live && live.generation === generation ? live.statuses : [];
+        applyToSession(sessionId, generation, { statuses });
+        // The watcher cannot see nested edits (its worktree watch is
+        // non-recursive); the poll can, so it announces them to the views
+        // derived from files.
+        const polled = changeFromStatusPoll(before, statuses);
+        if (polled) for (const listener of polledChangeListeners) listener(path, polled);
+      } catch (error) {
+        // git answered; a subscriber or listener threw while the answer was
+        // being published. That is not a status that stopped answering.
+        diagnostics.warn("repo", `publishing the status of ${path} failed: ${formatError(error)}`);
+      }
     } finally {
       if (pollRuns.get(sessionId) === run) pollRuns.delete(sessionId);
       pollInflight = false;
@@ -1335,6 +1383,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         trustRequired: false,
         missing: false,
         hasHydrated: true,
+        // The snapshot read the statuses, so the poll's failures are over.
+        statusPollFailures: 0,
+        statusUnavailableSince: null,
       });
       // Stats re-drain even when the snapshot was a no-op: a previously
       // failed drain must retry on the next refresh, and the backend

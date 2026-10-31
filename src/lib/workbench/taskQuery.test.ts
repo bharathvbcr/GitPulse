@@ -2,19 +2,23 @@ import { describe, expect, it } from "vitest";
 import type { TaskCard } from "./client";
 import {
   cardMatchesQuery,
+  dueRangeFilter,
   isEmptyQuery,
   MAX_QUERY_TERMS,
   MAX_QUERY_TEXT,
   parseTaskQuery,
   queryChips,
+  queryControlValue,
   queryHas,
   removeQueryTerm,
   replaceToken,
+  setQueryControl,
   suggest,
   tokenAtCaret,
   toggleQueryTerm,
   type QueryContext,
 } from "./taskQuery";
+import { sanitizeSnapshot } from "../ui/taskBoardViews";
 
 function card(over: Partial<TaskCard> = {}): TaskCard {
   return {
@@ -408,5 +412,149 @@ describe("completions", () => {
     expect(replaceToken("la crash", 0, "label:")).toEqual({ text: "label: crash", caret: 6 });
     expect(replaceToken("label:u crash", 0, "label:ui")).toEqual({ text: "label:ui crash", caret: 9 });
     expect(tokenAtCaret("crash ", 6)).toBeNull();
+  });
+});
+
+describe("due date ranges", () => {
+  // Local midnight, as the board's own day boundaries are, so the expectations
+  // hold in whatever zone the suite runs in.
+  const at = (y: number, m: number, d: number, h = 0, min = 0) => Math.floor(new Date(y, m - 1, d, h, min).getTime() / 1000);
+  const due = (dueAt: number | null) => ({ due_at: dueAt });
+
+  it("matches a due time inside the range, both end days included", () => {
+    const q = "due:2026-11-01..2026-11-30";
+    expect(matches(q, due(at(2026, 11, 15, 12)))).toBe(true);
+    expect(matches(q, due(at(2026, 11, 1, 0, 0)))).toBe(true);
+    expect(matches(q, due(at(2026, 11, 30, 23, 59)))).toBe(true);
+  });
+
+  it("rejects a due time outside the range and a task with no due time", () => {
+    const q = "due:2026-11-01..2026-11-30";
+    expect(matches(q, due(at(2026, 10, 31, 23, 59)))).toBe(false);
+    expect(matches(q, due(at(2026, 12, 1, 0, 0)))).toBe(false);
+    expect(matches(q, due(null))).toBe(false);
+    expect(matches(q, due(0))).toBe(false);
+  });
+
+  it("leaves an end open and excludes with a minus", () => {
+    expect(matches("due:2026-11-01..", due(at(2030, 1, 1)))).toBe(true);
+    expect(matches("due:2026-11-01..", due(at(2026, 10, 31, 23)))).toBe(false);
+    expect(matches("due:..2026-11-30", due(at(2026, 1, 1)))).toBe(true);
+    expect(matches("due:..2026-11-30", due(at(2026, 12, 1)))).toBe(false);
+    expect(matches("-due:2026-11-01..2026-11-30", due(at(2026, 12, 5)))).toBe(true);
+    expect(matches("-due:2026-11-01..2026-11-30", due(at(2026, 11, 5)))).toBe(false);
+  });
+
+  it("is one of several due alternatives, widening like any other list", () => {
+    expect(matches("due:overdue,2026-11-01..2026-11-30", due(at(2026, 11, 15)), { ...ctx, nowSec: 5 })).toBe(true);
+    expect(matches("due:overdue,2026-11-01..2026-11-30", due(at(2027, 3, 1)), { ...ctx, nowSec: 5 })).toBe(false);
+  });
+
+  it("reports a malformed range, applies nothing and keeps the words", () => {
+    for (const bad of ["due:2026-11-30..2026-11-01", "due:2026-02-30..2026-03-01", "due:..", "due:2026-11-01...2026-11-30", "due:2026-11..2026-12", "due:2026-11-01..soon"]) {
+      const parsed = parseTaskQuery(`crash ${bad}`);
+      expect(parsed.terms, bad).toEqual([]);
+      expect(parsed.text, bad).toBe("crash");
+      expect(parsed.problems, bad).toHaveLength(1);
+      expect(parsed.problems[0], bad).toMatch(/is not a date range/);
+    }
+    expect(parseTaskQuery("due:2026-11-30..2026-11-01").problems[0]).toMatch(/ends before it starts/);
+    // An unreadable range filters nothing rather than emptying the board.
+    expect(matches("due:2026-11-30..2026-11-01")).toBe(true);
+  });
+
+  it("reads one canonical term however the range was spelled, so a chip and a toggle agree", () => {
+    const [term] = parseTaskQuery("DUE:2026-11-01..").terms;
+    expect(term).toMatchObject({ key: "due", value: "2026-11-01..", negated: false });
+    expect(queryHas(parseTaskQuery("due:2026-11-01.. crash"), "due:2026-11-01..")).toBe(true);
+    expect(toggleQueryTerm("crash due:2026-11-01..", "due:2026-11-01..")).toBe("crash");
+  });
+});
+
+describe("the Filters bar's controls over the search", () => {
+  const value = (search: string, control: "status" | "due-range") => queryControlValue(parseTaskQuery(search), control);
+
+  it("shows none, one, or too many values for a control", () => {
+    expect(value("crash", "status")).toBe("");
+    expect(value("status:review crash", "status")).toBe("review");
+    expect(value("status:review,ready", "status")).toBeNull();
+    expect(value("-status:done", "status")).toBeNull();
+    expect(value("due:overdue", "due-range")).toBe("");
+    expect(value("due:2026-11-01..2026-11-30", "due-range")).toBe("2026-11-01..2026-11-30");
+    expect(value("due:2026-11-01.. due:..2026-12-01", "due-range")).toBeNull();
+  });
+
+  it("replaces the control's filter and leaves the rest of the search alone", () => {
+    expect(setQueryControl("crash is:bug", "status", "status:review")).toBe("crash is:bug status:review");
+    expect(setQueryControl("crash status:ready is:bug", "status", "status:review")).toBe("crash is:bug status:review");
+    expect(setQueryControl("crash status:ready,review", "status", "")).toBe("crash");
+    expect(setQueryControl("crash due:overdue due:2026-11-01..", "due-range", "due:2026-11-01..2026-11-30")).toBe("crash due:overdue due:2026-11-01..2026-11-30");
+    expect(setQueryControl("due:2026-11-01..2026-11-30", "due-range", "")).toBe("");
+  });
+
+  it("refuses a change that would push the search past the store's limit", () => {
+    const long = "x".repeat(MAX_QUERY_TEXT - 4);
+    expect(setQueryControl(long, "status", "status:review")).toBe(long);
+  });
+
+  it("does not show one range of a list that also holds a named value, and never loses the named value", () => {
+    // `overdue OR from the 1st` is not "from the 1st": the control reads it as several.
+    expect(value("due:overdue,2026-11-01..", "due-range")).toBeNull();
+    expect(value("due:2026-11-01..2026-11-30,overdue", "due-range")).toBeNull();
+    expect(value("is:bug,open", "status")).toBeNull();
+    // Even if the control is written to, the list's other values stay.
+    expect(setQueryControl("due:overdue,2026-11-01..", "due-range", "due:2026-12-01..")).toBe("due:overdue due:2026-12-01..");
+    expect(setQueryControl("due:overdue,2026-11-01..", "due-range", "")).toBe("due:overdue");
+    expect(setQueryControl("crash is:bug,open", "status", "status:review")).toBe("crash is:bug status:review");
+  });
+
+  it("reports several for a control's key spread over more than one term, in any form", () => {
+    // Repeated keys widen to OR, so the range beside `overdue` is not the range alone.
+    expect(value("due:overdue due:2026-11-01..", "due-range")).toBeNull();
+    expect(value("due:2026-11-01.. due:overdue", "due-range")).toBeNull();
+    expect(value("due:2026-11-01..2026-11-30 -due:overdue", "due-range")).toBeNull();
+    expect(value("due:overdue due:soon", "due-range")).toBeNull();
+    expect(value("status:review status:ready", "status")).toBeNull();
+    expect(value("status:review -status:done", "status")).toBeNull();
+    expect(value("status:review is:open", "status")).toBeNull();
+    // One term of the key, or terms of other keys, are still one value.
+    expect(value("status:review due:overdue due:soon", "status")).toBe("review");
+    expect(value("due:2026-11-01.. status:review status:ready", "due-range")).toBe("2026-11-01..");
+  });
+
+  it("writes a range the parser accepts however the two days were typed", () => {
+    expect(dueRangeFilter("", "")).toBe("");
+    expect(dueRangeFilter("2026-11-01", "")).toBe("due:2026-11-01..");
+    expect(dueRangeFilter("", "2026-11-30")).toBe("due:..2026-11-30");
+    expect(dueRangeFilter("2026-11-30", "2026-11-01")).toBe("due:2026-11-01..2026-11-30");
+    const parsed = parseTaskQuery(dueRangeFilter("2026-11-30", "2026-11-01"));
+    expect(parsed.problems).toEqual([]);
+    expect(queryControlValue(parsed, "due-range")).toBe("2026-11-01..2026-11-30");
+  });
+
+  it("takes a refused range out of the search instead of piling a second one beside it", () => {
+    // `due:B..A` is reported and not applied, so the control sees none; the next write must still clear it.
+    const stuck = "crash due:2026-11-30..2026-11-01";
+    expect(queryControlValue(parseTaskQuery(stuck), "due-range")).toBe("");
+    expect(setQueryControl(stuck, "due-range", "due:2026-11-05..")).toBe("crash due:2026-11-05..");
+    expect(setQueryControl(stuck, "due-range", "")).toBe("crash");
+    // A named value beside the refused one stays.
+    expect(setQueryControl("due:overdue,2026-11-30..2026-11-01", "due-range", "")).toBe("due:overdue");
+    // A refused value of another key is not the range's to clear.
+    expect(setQueryControl("status:nope due:2026-11-30..2026-11-01", "due-range", "")).toBe("status:nope");
+  });
+
+  it("is kept by a saved view, because the view keeps the search, and filters the board when applied", () => {
+    const search = "crash status:review due:2026-11-01..2026-11-30";
+    const saved = sanitizeSnapshot({ search });
+    expect(saved.search).toBe(search);
+    const parsed = parseTaskQuery(saved.search);
+    expect(queryControlValue(parsed, "status")).toBe("review");
+    expect(queryControlValue(parsed, "due-range")).toBe("2026-11-01..2026-11-30");
+    const at = (y: number, m: number, d: number) => Math.floor(new Date(y, m - 1, d, 12).getTime() / 1000);
+    const hit = card({ title: "Crash on save", status: "review", due_at: at(2026, 11, 10) });
+    expect(cardMatchesQuery(hit, parsed, ctx)).toBe(true);
+    expect(cardMatchesQuery({ ...hit, status: "ready" }, parsed, ctx)).toBe(false);
+    expect(cardMatchesQuery({ ...hit, due_at: at(2026, 12, 10) }, parsed, ctx)).toBe(false);
   });
 });

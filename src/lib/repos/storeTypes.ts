@@ -290,6 +290,14 @@ export interface RepoSession {
    * would otherwise show fake zeros; cleared by the next successful drain.
    */
   statsFailed: boolean;
+  /** Status polls that failed in a row; any successful status read zeroes it. */
+  statusPollFailures: number;
+  /**
+   * When the status poll's failures reached the point of saying so, or null
+   * while it answers. A notice for the status bar, not `error`: the file list
+   * on screen is the last one read, and this is what says it may be stale.
+   */
+  statusUnavailableSince: number | null;
   /**
    * The multi-step git operation this worktree is parked in, if any, plus
    * whether the probe itself failed. Refreshed with every snapshot: an
@@ -392,6 +400,8 @@ export interface RepoState {
   statsPending: boolean;
   /** True when the active session's last branch-stats attempt failed. */
   statsFailed: boolean;
+  /** When the active session's status poll began failing repeatedly; null while it answers. */
+  statusUnavailableSince: number | null;
   /** The active session's parked operation, if any. */
   operation: OperationState;
   /** The active session's stash stack. */

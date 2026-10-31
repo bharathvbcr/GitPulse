@@ -6,6 +6,8 @@ import {
   cardChrome,
   cardMatchesFacet,
   collectFacetOptions,
+  dayStartSec,
+  dueInRange,
   dueInputValue,
   dueState,
   emptyFacet,
@@ -260,5 +262,33 @@ describe("listRows", () => {
   it("draws nothing from no columns and leaves its input alone", () => {
     expect(listRows([], "priority")).toEqual([]);
     expect(columns[0].map((x) => x.id)).toEqual(["inbox-low", "inbox-urgent"]);
+  });
+});
+
+describe("dueInRange", () => {
+  const at = (y: number, m: number, d: number, h = 0, min = 0) => Math.floor(new Date(y, m - 1, d, h, min).getTime() / 1000);
+
+  it("names a real local day and refuses one that does not exist", () => {
+    expect(dayStartSec("2026-11-01")).toBe(at(2026, 11, 1));
+    for (const bad of ["2026-02-30", "2026-13-01", "2026-11-1", "20261101", "", "2026-11-01T00:00"]) expect(dayStartSec(bad), bad).toBeNull();
+  });
+
+  it("holds both end days whole and nothing either side of them", () => {
+    expect(dueInRange(at(2026, 11, 1, 0, 0), "2026-11-01", "2026-11-30")).toBe(true);
+    expect(dueInRange(at(2026, 11, 30, 23, 59), "2026-11-01", "2026-11-30")).toBe(true);
+    expect(dueInRange(at(2026, 10, 31, 23, 59), "2026-11-01", "2026-11-30")).toBe(false);
+    expect(dueInRange(at(2026, 12, 1, 0, 0), "2026-11-01", "2026-11-30")).toBe(false);
+  });
+
+  it("opens an end with \"\", and puts a task with no due time in no range", () => {
+    expect(dueInRange(at(2026, 5, 5), "", "2026-11-30")).toBe(true);
+    expect(dueInRange(at(2027, 5, 5), "2026-11-01", "")).toBe(true);
+    expect(dueInRange(at(2027, 5, 5), "", "")).toBe(true);
+    for (const none of [null, undefined, 0, -5, Number.NaN]) expect(dueInRange(none, "", ""), String(none)).toBe(false);
+  });
+
+  it("matches nothing, not everything, for a bound that is not a day", () => {
+    expect(dueInRange(at(2026, 11, 15), "soon", "")).toBe(false);
+    expect(dueInRange(at(2026, 11, 15), "", "2026-02-30")).toBe(false);
   });
 });

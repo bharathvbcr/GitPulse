@@ -4,6 +4,7 @@ import { invoke } from "../ipc/invoke";
 import { isTauri } from "../platform";
 import { refusalNotice } from "../health/hostLoad";
 import { toastStore } from "./toastStore";
+import { diagnostics } from "../diagnostics/diagnostics";
 
 /**
  * Host load as the app's sampler publishes it (`src-tauri/src/sysload`,
@@ -383,23 +384,58 @@ function announceRefusal(pulse: HostLoadPulse): void {
  * Starts listening for the sampler's pulse, once per page, and reads the
  * status so the first value does not wait for a tick. Safe to call from
  * every component that needs the pressure.
+ *
+ * A refused listen caches nothing, so the next call tries again: a rejected
+ * promise kept as "already listening" would leave the bar without pulses for
+ * the rest of the run while looking attached.
  */
 export function startHostLoad(): void {
   if (listening || !isTauri()) return;
-  listening = listen<HostLoadPulse>(HOST_LOAD_PULSE_EVENT, (event) => {
+  const attempt: Promise<UnlistenFn | null> = listen<HostLoadPulse>(HOST_LOAD_PULSE_EVENT, (event) => {
     pulseStore.set(event.payload);
     announceRefusal(event.payload);
-  }).catch(() => null);
+  }).catch((error) => {
+    if (listening === attempt) listening = null;
+    diagnostics.warn("hostLoad", `could not listen for the host-load pulse; will retry: ${String(error)}`);
+    return null;
+  });
+  listening = attempt;
   void refreshHostLoad().catch(() => undefined);
 }
 
-/** Reads the full status (Health); the pulse follows it. */
-export async function refreshHostLoad(): Promise<HostLoadStatus | null> {
-  if (!isTauri()) return null;
-  const status = await invoke<HostLoadStatus>("cmd_host_load_status");
-  statusStore.set(status);
-  pulseStore.set(pulseOf(status));
-  return status;
+/** The one status read in flight; a caller that arrives during it shares it. */
+let refreshing: Promise<HostLoadStatus | null> | null = null;
+
+/**
+ * Reads the full status (Health); the pulse follows it. Single-flight: Health
+ * asks every few seconds, and a slow read must not stack another behind
+ * itself, so a call made while one is running gets that one's answer.
+ */
+export function refreshHostLoad(): Promise<HostLoadStatus | null> {
+  if (!isTauri()) return Promise.resolve(null);
+  if (refreshing) return refreshing;
+  const flight: Promise<HostLoadStatus | null> = (async () => {
+    const status = await invoke<HostLoadStatus>("cmd_host_load_status");
+    statusStore.set(status);
+    pulseStore.set(pulseOf(status));
+    return status;
+  })().finally(() => {
+    if (refreshing === flight) refreshing = null;
+  });
+  refreshing = flight;
+  return flight;
+}
+
+/**
+ * Rereads after a change this window made. A read already running began
+ * before the change and may not show it, so this waits for that one and then
+ * reads again instead of joining it.
+ */
+function refreshAfterChange(): void {
+  void (refreshing ?? Promise.resolve())
+    .catch(() => undefined)
+    .then(() => refreshHostLoad())
+    .catch(() => undefined);
 }
 
 /** Terminates a foreign orphan Health listed; the backend re-checks it first. */
@@ -408,7 +444,7 @@ export async function terminateOrphan(pid: number, startUs: number): Promise<str
     pid,
     startUs,
   });
-  void refreshHostLoad().catch(() => undefined);
+  refreshAfterChange();
   return message;
 }
 
@@ -419,7 +455,7 @@ export async function terminateOrphan(pid: number, startUs: number): Promise<str
  */
 export async function admitAnyway(): Promise<string> {
   const message = await invoke<string>("cmd_host_load_admit_anyway");
-  void refreshHostLoad().catch(() => undefined);
+  refreshAfterChange();
   return message;
 }
 
@@ -456,6 +492,7 @@ export const hostPressure: Readable<PressureInput> = derived(
 /** Test seam: resets the module state between tests. */
 export function resetHostLoadForTests(): void {
   listening = null;
+  refreshing = null;
   noticeShown = false;
   pulseStore.set(null);
   statusStore.set(null);

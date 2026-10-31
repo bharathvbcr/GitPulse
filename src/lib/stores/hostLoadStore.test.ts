@@ -3,6 +3,7 @@ import { get } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toastStore } from "./toastStore";
+import { diagnostics } from "../diagnostics/diagnostics";
 import {
   admitAnyway,
   HOST_LOAD_PULSE_EVENT,
@@ -215,6 +216,67 @@ describe("hostLoadStore", () => {
     handler(refusing(true));
     expect(get(toastStore)).toHaveLength(2);
     toastStore.clear();
+  });
+
+  it("listens again on the next call when the first listen was refused, and says so once", async () => {
+    const warn = vi.spyOn(diagnostics, "warn");
+    vi.mocked(invoke).mockResolvedValue(status());
+    vi.mocked(listen).mockRejectedValueOnce(new Error("no event bridge"));
+    startHostLoad();
+    expect(listen).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(warn).toHaveBeenCalledTimes(1));
+    expect(String(warn.mock.calls[0][1])).toContain("no event bridge");
+
+    startHostLoad();
+    expect(listen).toHaveBeenCalledTimes(2);
+    // The second attach holds: a third call does not listen again.
+    await Promise.resolve();
+    startHostLoad();
+    expect(listen).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
+
+  it("shares one status read between concurrent callers", async () => {
+    let release!: (value: HostLoadStatus) => void;
+    vi.mocked(invoke).mockImplementation(
+      () => new Promise<HostLoadStatus>((resolve) => (release = resolve)) as never,
+    );
+    const first = refreshHostLoad();
+    const second = refreshHostLoad();
+    expect(invoke).toHaveBeenCalledTimes(1);
+    release(status());
+    await expect(first).resolves.toEqual(status());
+    await expect(second).resolves.toEqual(status());
+
+    // Once it settles the next call reads again.
+    vi.mocked(invoke).mockResolvedValue(status());
+    await refreshHostLoad();
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it("lets a failed read go, so the next call can succeed", async () => {
+    vi.mocked(invoke).mockRejectedValueOnce(new Error("backend down"));
+    await expect(refreshHostLoad()).rejects.toThrow("backend down");
+    vi.mocked(invoke).mockResolvedValue(status());
+    await expect(refreshHostLoad()).resolves.toEqual(status());
+  });
+
+  it("rereads after a change instead of joining a read that began before it", async () => {
+    const releases: Array<(value: HostLoadStatus) => void> = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "cmd_host_load_admit_anyway") return "admitted" as never;
+      return (await new Promise<HostLoadStatus>((resolve) => releases.push(resolve))) as never;
+    });
+    const running = refreshHostLoad();
+    await admitAnyway();
+    // The read that was running is the only one so far.
+    expect(releases).toHaveLength(1);
+    releases[0](status({ pressure: "normal" }));
+    await running;
+    await vi.waitFor(() => expect(releases).toHaveLength(2));
+    releases[1](status({ pressure: "critical" }));
+    await vi.waitFor(() => expect(get(hostPressure)).toBe("critical"));
   });
 
   it("propagates a status read failure to the caller", async () => {
