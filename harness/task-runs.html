@@ -15,6 +15,8 @@
   const runs = new Map(), sessions = new Map(), prepared = new Map();
   const decisions = new Map(), decisionReceipts = new Map(), decisionWrites = [];
   let loseDecision = false;
+  // The task's attempts cannot be read (the store is down or refuses).
+  let failRunsList = false;
   const report = { managedSpawns:0, managedStops:0, detailReads:0, lists:0, holdingLists:0, taskSpawns:0, launchCalls:0, shellSpawns:0, kills:0, conversationReads:0, resumes:[], resizes:[], writes:[], errors:[], checks:[] };
   let loseManagedLaunch = true;
   let loseLaunch = true, losePreparation = false, conversationMissing = false;
@@ -62,6 +64,7 @@
         // checkouts are occupied (by repository and state); those reads are
         // counted apart from the run history's polling, which the checks
         // below measure.
+        if (failRunsList && input.task_id) throw {code:"transport_error",message:"Fixture could not read the attempts"};
         if (input.repository_id) report.holdingLists++; else report.lists++;
         show();
         // Newest first and paged by `limit`, as the store pages them.
@@ -655,6 +658,23 @@
           &&row(attempt.id).querySelector('[data-testid="agent-run-message"]').textContent.includes("not fully merged"));
         runs.delete(attempt.id);button("Refresh").click();await pause(100);
         stopToasts();
+      }
+      {
+        // A read that could not run is not an empty task: the first read fails
+        // on a freshly mounted pane, which must neither say "No attempts yet"
+        // nor open the launch form as if the task had never run.
+        const kept=[...runs.values()];runs.clear();failRunsList=true;
+        button("Remount pane").click();
+        await wait(()=>document.querySelector('[data-testid="task-agent-panel"] [role="alert"]'));
+        const summaryText=()=>document.querySelector('[data-testid="agents-summary"]').textContent.trim();
+        const panelText=()=>document.querySelector('[data-testid="task-agent-panel"]').textContent;
+        check("A failed first read says the attempts could not be read, not that there are none",
+          summaryText()==="Attempts could not be read."&&!panelText().includes("No attempts yet")&&!panelText().includes("No runs yet"));
+        check("An unread history does not open the launch form",launchForm().hidden);
+        failRunsList=false;button("Retry").click();
+        await wait(()=>summaryText()==="No attempts yet.");
+        check("Retry reads the history, and only then is the task empty and the launch form open",!launchForm().hidden&&!document.querySelector('[data-testid="task-agent-panel"] [role="alert"]'));
+        for(const run of kept)runs.set(run.id,run);button("Refresh").click();await pause(100);
       }
       check("No unrelated shell was started",report.shellSpawns===0);
       check("The remembered handoff never carries bypass into storage",sanitizeHandoff({provider:"codex",kind:"managed",permission:"bypass"}).permission==="ask");

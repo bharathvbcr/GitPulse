@@ -116,6 +116,12 @@
   let loading = $state(false);
   let historyError = $state("");
   /**
+   * Whether the attempts have been read successfully at least once. Never
+   * reset on an error: a failed read is not an empty task, and the launch form
+   * must not open as if the task had never run until a read has said so.
+   */
+  let readOnce = $state(false);
+  /**
    * Each attempt's one message slot: what its last action said, or why it
    * failed. Keyed by run, so a message stays with the attempt it is about —
    * the pane used to say everything in one line at the top, and the form said
@@ -197,10 +203,11 @@
   // setting first is what recomputes the count when it flips; the store pushes
   // the flag in before it notifies, so the recount sees the new answer.
   const askingCount = $derived(($interfaceStore.bellAsksForReader, monitored.filter((row) => asksForReader(row.tone)).length));
-  // Null means "nobody has chosen"; the default follows whether a run is live.
-  const formOpen = $derived(expandedForm ?? live.length === 0);
+  // Null means "nobody has chosen"; the default follows whether a run is live,
+  // and waits for a first successful read: an unread history is not an empty one.
+  const formOpen = $derived(expandedForm ?? (readOnce && live.length === 0));
   const summary = $derived.by(() => {
-    if (!total && !allRuns.length) return loading ? "Loading attempts…" : "No attempts yet.";
+    if (!total && !allRuns.length) return historyError ? "Attempts could not be read." : loading ? "Loading attempts…" : "No attempts yet.";
     const floor = liveComplete ? "" : "at least ";
     const working = live.length ? `${floor}${live.length} working now` : "Nothing working now";
     const asking = askingCount ? ` · ${askingCount} ${askingCount === 1 ? "needs" : "need"} you` : "";
@@ -260,6 +267,7 @@
       pruneTaskTerminals(working ? [...page.items, ...working.runs] : page.items, Date.now());
       decisionRefresh += 1;
       historyError = "";
+      readOnce = true;
       if (working) void readPending(working.runs, ticket);
     } catch (cause) { if (!disposed && ticket === generation) historyError = explainError(cause); }
     finally { loading = false; schedule(); }
@@ -614,7 +622,7 @@
     <button class="gp-btn" type="button" onclick={() => refresh()} disabled={loading} title="Refresh this task's attempts"><RotateCw size={12} /> Refresh</button>
   </header>
 
-  {#if historyError}<p class="error" role="alert">{historyError}</p>{/if}
+  {#if historyError}<p class="error" role="alert">{historyError} <button class="gp-btn" type="button" onclick={() => refresh()} disabled={loading}>Retry</button></p>{/if}
 
   {#if live.length || pendingRow}
     <h4 class="group-heading">Working now</h4>
@@ -685,7 +693,7 @@
     <h4>History{#if ended.length}<span class="meta"> · {ended.length}{cursor ? "+" : ""}</span>{/if}</h4>
     {#if total}<span class="meta">{runs.length} of {total} loaded</span>{/if}
   </div>
-  {#if !runs.length}<p>{loading ? "Loading runs…" : "No runs yet."}</p>
+  {#if !runs.length}<p>{loading ? "Loading runs…" : historyError ? "Attempts could not be read." : "No runs yet."}</p>
   {:else if !ended.length}<p>No ended attempts{cursor ? " loaded yet" : ""}.</p>{/if}
   <div class="run-list" data-testid="agents-history">
     {#each ended as run (run.id)}{@render runCard(run)}{/each}
