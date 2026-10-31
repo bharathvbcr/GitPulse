@@ -5,10 +5,10 @@
   let {
     onChanged,
     onCreated,
-  }: { onChanged: () => void; onCreated: (message: string) => void } = $props();
+  }: { onChanged: (message: string) => void; onCreated: (message: string) => void } = $props();
 
-  /** #7 open, #8 draft, #9 closed — each detail loads its own fixture. */
-  const NUMBERS = [7, 8, 9];
+  /** #7 open, #8 draft, #9 closed, #10 fails its first read — each detail loads its own fixture. */
+  const NUMBERS = [7, 8, 9, 10];
 </script>
 
 <main class="flex flex-col gap-3 p-3 bg-background text-textPrimary max-w-3xl">

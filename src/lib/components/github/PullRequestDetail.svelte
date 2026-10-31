@@ -25,14 +25,18 @@
     repoPath: string;
     number: number;
     slug: string;
-    /** Called after an action succeeded, so the list can reload. */
-    onChanged: () => void;
+    /**
+     * Called after an action succeeded, so the list can reload, with what the
+     * action reported. The confirmation is the caller's to show: a merged pull
+     * request leaves the list and takes this row with it, so a notice kept here
+     * would vanish with the very thing it confirms.
+     */
+    onChanged: (message: string) => void;
   } = $props();
 
   let detail = $state<PullRequestDetail | null>(null);
   let loadError = $state<string | null>(null);
   let actionError = $state<string | null>(null);
-  let notice = $state<string | null>(null);
   let busy = $state(false);
   let reviewBody = $state("");
   let mergeMethod = $state<PrMergeMethod>("squash");
@@ -64,13 +68,13 @@
     if (busy) return;
     busy = true;
     actionError = null;
-    notice = null;
     try {
       const result = await confirmAndRunPrAction(repoPath, action, slug, { pr: detail });
       if (!result) return;
-      notice = `${result.output || done}${result.policy ? ` — ${verdictLabel(result.policy)}` : ""}`;
       reviewBody = "";
-      onChanged();
+      onChanged(`${result.output || done}${result.policy ? ` — ${verdictLabel(result.policy)}` : ""}`);
+      // The list reload may drop this pull request and unmount the row; the
+      // effect's teardown then cancels this read, so it is not wasted work.
       await load();
     } catch (error) {
       actionError = formatError(error);
@@ -94,7 +98,10 @@
 
 <div data-pr-detail={number} class="mt-2 p-3 rounded-xl border border-border/60 bg-background/60 text-xs space-y-3">
   {#if loadError}
-    <div class="text-rose-400">Could not load #{number}: {loadError}</div>
+    <div class="flex flex-wrap items-center gap-2 text-rose-400" role="alert">
+      <span>Could not load #{number}: {loadError}</span>
+      <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" onclick={() => void load()}>Retry</button>
+    </div>
   {:else if !detail}
     <div class="text-textMuted">Loading #{number}…</div>
   {:else}
@@ -154,6 +161,5 @@
       </div>
     {/if}
   {/if}
-  {#if notice}<div class="text-emerald-600 dark:text-emerald-400" role="status">{notice}</div>{/if}
   {#if actionError}<div class="text-rose-400" role="alert">{actionError}</div>{/if}
 </div>
