@@ -52,6 +52,46 @@ export function dueState(dueAt: number | null | undefined, nowSec: number): DueS
   return "later";
 }
 
+/**
+ * A calendar day (`YYYY-MM-DD`) as the unix second its local midnight falls
+ * on, or null when the text is not a real day (`2026-02-30` is not February's).
+ * Local, because a due date is shown and entered in the reader's own clock
+ * (`dueInputValue`); built with the date constructor so a zone with a shifted
+ * midnight still names the day it was asked for.
+ */
+export function dayStartSec(day: string): number | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
+  if (!match) return null;
+  const [year, month, date] = [Number(match[1]), Number(match[2]), Number(match[3])];
+  const start = new Date(year, month - 1, date);
+  if (start.getFullYear() !== year || start.getMonth() !== month - 1 || start.getDate() !== date) return null;
+  const seconds = Math.floor(start.getTime() / 1000);
+  return Number.isSafeInteger(seconds) ? seconds : null;
+}
+
+/**
+ * Whether a due time falls from the start of `from` through the end of `to`,
+ * both whole days; "" leaves that side open. A task with no due time is in no
+ * range, and a bound that is not a real day matches nothing rather than
+ * everything. The one test for the query's `due:A..B` and the Filters bar.
+ */
+export function dueInRange(dueAt: number | null | undefined, from: string, to: string): boolean {
+  if (dueAt == null || !Number.isFinite(dueAt) || dueAt <= 0) return false;
+  if (from !== "") {
+    const start = dayStartSec(from);
+    if (start === null || dueAt < start) return false;
+  }
+  if (to !== "") {
+    const last = dayStartSec(to);
+    if (last === null) return false;
+    // The day after `to`, not `to` plus 86 400 s: a day can be 23 or 25 hours.
+    const next = new Date(last * 1000);
+    next.setDate(next.getDate() + 1);
+    if (dueAt >= Math.floor(next.getTime() / 1000)) return false;
+  }
+  return true;
+}
+
 export function normalizePriority(value: unknown): number | "all" {
   if (value === "all" || value === "" || value == null) return "all";
   return numericPriority(value) ?? "all";
