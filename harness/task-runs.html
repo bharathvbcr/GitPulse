@@ -643,12 +643,27 @@
         await wait(()=>row(attempt.id)?.querySelector('[data-testid="agent-merge"]'));
         check("An ended attempt's own worktree offers Review changes, Merge and Discard",
           !!row(attempt.id).querySelector('[data-testid="agent-review"]')&&!!row(attempt.id).querySelector('[data-testid="agent-discard"]')&&stage(attempt.id)==="Exited");
+        // A second, ended attempt: a slow action on the first must lock that card
+        // alone, and hold only this one's git/checkout-writing buttons.
+        const other={...template,id:"wt1other",provider:"claude",state:"exited",session_id:null,exit_code:0,revision:2};
+        runs.set(other.id,other);button("Refresh").click();
+        await wait(()=>row(other.id));
+        const rowButton=(id,text)=>[...row(id).querySelectorAll("button")].find(b=>b.textContent.trim().startsWith(text));
         row(attempt.id).querySelector('[data-testid="agent-merge"]').click();
         await wait(()=>read(promptState));
         check("Merge asks first, naming the target branch and the uncommitted files the removal loses",
           read(promptState).options.title==="Merge into main?"&&read(promptState).options.message.includes("2 uncommitted files"));
+        check("While a merge runs, its own card says so and locks only itself",
+          row(attempt.id).querySelector('[data-testid="agent-working"]')?.textContent.includes("Merging")
+          &&row(attempt.id).querySelector('[data-testid="agent-discard"]').disabled&&row(attempt.id).querySelector('[data-testid="agent-open-checkout"]').disabled
+          &&!row(other.id).querySelector('[data-testid="agent-working"]')&&!row(other.id).querySelector('[data-testid="agent-open-checkout"]').disabled);
+        check("Another attempt's git-writing button waits, with the reason on its card",
+          rowButton(other.id,"Resume conversation")?.disabled===true&&row(other.id).querySelector('[data-testid="agent-slot-held"]')?.textContent.includes("merging"));
         completePrompt(true);
         await wait(()=>row(attempt.id)?.querySelector('[data-testid="agent-run-message"]'));
+        await wait(()=>!row(attempt.id).querySelector('[data-testid="agent-working"]'));
+        check("When the merge ends every button is available again and the reason is gone",
+          rowButton(other.id,"Resume conversation")?.disabled===false&&!row(other.id).querySelector('[data-testid="agent-slot-held"]')&&!row(attempt.id).querySelector('[data-testid="agent-discard"]').disabled);
         const mergeCall=worktreeCalls.find(c=>c.cmd==="cmd_worktree_merge_teardown");
         check("Merge runs against the repository's main checkout, and the host's refusal shows in the row",
           mergeCall.repoPath==="/fixture/GitPulse"&&mergeCall.worktreePath===wtPath&&mergeCall.targetBranch==="main"&&mergeCall.expectedTip==="def5678"
@@ -666,7 +681,7 @@
         check("Discard removes the worktree from the main checkout, forced only for the changes it named, and never forces the branch",
           removal.repoPath==="/fixture/GitPulse"&&removal.targetPath===wtPath&&removal.force===true&&branchDelete.force===false
           &&row(attempt.id).querySelector('[data-testid="agent-run-message"]').textContent.includes("not fully merged"));
-        runs.delete(attempt.id);button("Refresh").click();await pause(100);
+        runs.delete(attempt.id);runs.delete(other.id);button("Refresh").click();await pause(100);
         stopToasts();
       }
       {

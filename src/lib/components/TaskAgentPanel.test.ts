@@ -96,3 +96,24 @@ describe("a poll folds the first page into the paged history instead of replacin
     expect(decisions).toContain("The rest are not loaded here.");
   });
 });
+
+describe("one action in flight no longer freezes every card", () => {
+  it("has no shared busy flag; every button is gated per card", () => {
+    expect(source).not.toContain("disabled={busy}");
+    expect(source).not.toMatch(/\bbusy = (true|false)/);
+    expect(source).toContain("canAct(run.id, inflight, mutationHolder");
+  });
+
+  it("every act() call names the verb its card shows and says whether it takes the git slot", () => {
+    const calls = source.match(/\bact\(run, \{[^}]*\}/g) ?? [];
+    const sites = source.match(/\bact\(run[,)]/g) ?? [];
+    expect(sites.length).toBeGreaterThan(10);
+    expect(calls.length).toBe(sites.length);
+    for (const call of calls) expect(call).toMatch(/label: "[A-Z][a-z ]+", mutates: (true|false)/);
+  });
+
+  it("only merge, discard, release, resume, recover and trust take the slot", () => {
+    const taking = (source.match(/act\(run, \{ label: "[^"]*", mutates: true \}/g) ?? []).map((call) => /label: "([^"]*)"/.exec(call)?.[1]).sort();
+    expect(taking).toEqual(["Discarding", "Merging", "Releasing", "Resuming", "Resuming", "Trusting"]);
+  });
+});
