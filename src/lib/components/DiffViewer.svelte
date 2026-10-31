@@ -1064,6 +1064,10 @@
       toastStore.error("Could not copy the patch to the clipboard");
       return;
     }
+    // A backend cut makes the clipboard text a prefix of the patch. The button
+    // already says so before the click; the toast says so after it, because the
+    // reader is about to paste it somewhere that will treat it as whole.
+    if (cutByBackend) toastStore.warning(`Copied a partial patch — this diff ${backendCutReason}.`);
     copiedPatch = true;
     setTimeout(() => (copiedPatch = false), 1600);
   }
@@ -1508,14 +1512,16 @@
         class="gp-btn py-0.5! px-2! flex items-center gap-1.5 text-[11px] text-textMuted"
         onclick={copyPatch}
         disabled={!$repoStore.selectedDiff}
-        title="Copy the whole patch as unified diff text"
+        title={cutByBackend
+          ? `Copy the first part of this patch — this diff ${backendCutReason}`
+          : "Copy the whole patch as unified diff text"}
       >
         {#if copiedPatch}
           <Check size={13} class="text-emerald-500" />
         {:else}
           <Copy size={13} />
         {/if}
-        <span class="hidden md:inline">{copiedPatch ? "Copied" : "Copy patch"}</span>
+        <span class="hidden md:inline">{copiedPatch ? "Copied" : cutByBackend ? "Copy partial patch" : "Copy patch"}</span>
       </button>
 
       <button

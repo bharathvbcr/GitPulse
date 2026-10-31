@@ -112,6 +112,7 @@ const {mount,unmount,tick}=await import("svelte");
 const {get}=await import("svelte/store");
 const {repoStore}=await import("../src/lib/stores/repoStore.ts");
 const {interfaceStore}=await import("../src/lib/stores/interfaceStore.ts");
+const {toastStore}=await import("../src/lib/stores/toastStore.ts");
 const DiffViewer=(await import("../src/lib/components/DiffViewer.svelte")).default;
 const {results,check,stopped}=createChecks();
 const preview=document.getElementById("preview");
@@ -191,6 +192,25 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
  check("a line selected from a truncated diff cannot be staged either",()=>buttons("Stage Selected").length===1&&buttons("Stage Selected")[0].disabled);
  await open({text:twoHunks(),truncated:true});
  check("a truncation with no stated cause still discloses the prefix",()=>text().includes("is incomplete"));
+ // --- copy patch ------------------------------------------------------------
+ const clips=[];
+ Object.defineProperty(navigator,"clipboard",{value:{writeText:async t=>{clips.push(t);}},configurable:true});
+ const copyButton=()=>[...preview.querySelectorAll("button")].find(b=>/^Copy (partial )?patch/.test(b.textContent.trim()));
+ await open({text:twoHunks(),truncated:false});
+ check("a whole diff offers 'Copy patch' and says it copies the whole patch",()=>copyButton()?.textContent.trim()==="Copy patch"&&copyButton().title.includes("whole patch"));
+ await open({text:twoHunks(),truncated:true,truncation_reason:"the fixture byte cap"});
+ check("a backend-cut diff offers 'Copy partial patch' and says it copies the first part, in the backend's words",()=>copyButton()?.textContent.trim()==="Copy partial patch"&&copyButton().title.includes("first part")&&copyButton().title.includes("the fixture byte cap")&&!copyButton().title.includes("whole"));
+ toastStore.clear?.();
+ copyButton().click();await until(()=>clips.length===1,"patch copied");await tick();await wait();
+ check("copying it puts the text on the clipboard and warns that it is partial rather than reporting plain success",()=>{
+  const toasts=get(toastStore);
+  return clips[0].includes("new forty")&&toasts.some(t=>t.kind==="warning"&&t.message.includes("partial patch")&&t.message.includes("the fixture byte cap"))&&!toasts.some(t=>t.kind==="success"||t.kind==="error");
+ });
+ clips.length=0;
+ await open({text:twoHunks(),truncated:false});
+ toastStore.clear?.();
+ copyButton().click();await until(()=>clips.length===1,"whole patch copied");await tick();await wait();
+ check("copying a whole diff raises no partial warning",()=>!get(toastStore).some(t=>t.message.includes("partial")));
  // --- find ----------------------------------------------------------------
  await open({text:twoHunks(),truncated:false});
  const findBox=()=>preview.querySelector('input[aria-label="Find in this diff"]');

@@ -51,6 +51,14 @@ describe("DiffViewer source contracts", () => {
     expect(source).toContain("onkeydown={onSearchKeydown}");
   });
 
+  it("says a copied patch is partial when the backend cut the diff", () => {
+    const copy = source.slice(source.indexOf("async function copyPatch"), source.indexOf("let selectedGraphRow"));
+    expect(copy).toContain("if (cutByBackend) toastStore.warning(");
+    // A renderer cut does not shorten `selectedDiff`, so it must not rename the button.
+    expect(source).toContain('cutByBackend ? "Copy partial patch" : "Copy patch"');
+    expect(source).not.toContain('title="Copy the whole patch as unified diff text"');
+  });
+
   it("compiles", () => {
     const { warnings } = compile(source, { generate: "client", filename: "DiffViewer.svelte" });
     expect(warnings.filter((w) => w.code !== "css-unused-selector")).toEqual([]);
