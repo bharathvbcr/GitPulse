@@ -23,10 +23,21 @@ const source = readFileSync(
  */
 describe("DiffViewer source contracts", () => {
   it("reads image blobs without the content digest it never uses", () => {
+    // Both sides go through one helper, so there is one read to check and no
+    // side that could be added later without the flag.
     const reads = source.split('invoke<FileBlob>("cmd_get_file_blob", {').slice(1);
-    expect(reads.length).toBe(2);
+    expect(reads.length).toBe(1);
     // Each read's argument object ends at the first `});` after it opens.
     for (const read of reads) expect(read.slice(0, read.indexOf("});"))).toContain("withDigest: false");
+    expect(source.split("readImageSide(").length - 1).toBe(3); // the definition and the two sides
+  });
+
+  it("reads the two image sides separately, so one failing does not discard the other", () => {
+    const load = source.slice(source.indexOf("async function loadImageBlobs"), source.indexOf("function retryImage"));
+    expect(load).toContain("Promise.all");
+    // The outer catch that nulled both sides is gone; a throw is caught per side.
+    expect(load).not.toContain("catch");
+    expect(source.slice(source.indexOf("async function readImageSide"), source.indexOf("async function loadImageBlobs"))).toContain("catch");
   });
 
   it("compiles", () => {

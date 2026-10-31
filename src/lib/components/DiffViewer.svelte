@@ -229,6 +229,11 @@
   let syntaxOn = $state(diffDefaults.diffSyntaxHighlight);
   let oldSrc = $state<string | null>(null);
   let newSrc = $state<string | null>(null);
+  /** Whether the pictures are in flight, read, or unreadable; never inferred from the sources being null. */
+  let imageStatus = $state<"loading" | "ready" | "failed">("ready");
+  let imageError = $state<string | null>(null);
+  let oldError = $state<string | null>(null);
+  let newError = $state<string | null>(null);
   let selectedLines = $state<Set<number>>(new Set());
   let dragAnchor = $state<number | null>(null);
   let isDragging = $state(false);
@@ -1172,6 +1177,8 @@
   }
 
   let imageBlobKey: string | null = null;
+  /** What the current key reads, kept so Retry asks again for exactly that. */
+  let imageRequest: { key: string; repo: string; path: string; commitId: string | null } | null = null;
 
   $effect(() => {
     const path = singleSection?.path ?? currentFilePath;
@@ -1181,48 +1188,84 @@
       showingImage && path && repo ? `${repo}\u0000${path}\u0000${commitId ?? ""}` : null;
     if (key === imageBlobKey) return;
     imageBlobKey = key;
-    if (!key) {
-      oldSrc = null;
-      newSrc = null;
+    // The previous file's pictures must not sit under the new file's title
+    // while the new ones are read, so every side is cleared the moment the
+    // selection changes, not when the next read lands.
+    oldSrc = null;
+    newSrc = null;
+    oldError = null;
+    newError = null;
+    imageError = null;
+    if (!key || !path || !repo) {
+      imageRequest = null;
+      imageStatus = "ready";
       return;
     }
-    const requestKey = key;
-    (async () => {
-      const blobUrl = (blob: FileBlob | null): string | null => {
-        if (!blob?.base64) return null;
-        return `data:${blob.mime || "image/png"};base64,${blob.base64}`;
-      };
-      try {
-        const newBlob = await invoke<FileBlob>("cmd_get_file_blob", {
-          repoPath: repo,
-          filePath: path,
-          commitId: commitId || null,
-          // Only displayed here, never saved from: skip the digest pass.
-          withDigest: false,
-        });
-        let oldBlob: FileBlob | null = null;
-        try {
-          oldBlob = await invoke<FileBlob>("cmd_get_file_blob", {
-            repoPath: repo,
-            filePath: path,
-            commitId: commitId ? `${commitId}^` : "HEAD",
-            withDigest: false,
-          });
-        } catch {
-          oldBlob = null;
-        }
-        if (imageBlobKey === requestKey) {
-          newSrc = blobUrl(newBlob);
-          oldSrc = blobUrl(oldBlob);
-        }
-      } catch {
-        if (imageBlobKey === requestKey) {
-          oldSrc = null;
-          newSrc = null;
-        }
-      }
-    })();
+    const request = { key, repo, path, commitId: commitId || null };
+    imageRequest = request;
+    void loadImageBlobs(request);
   });
+
+  /** One side's read, settled either way: a throw is a reason, not a lost picture. */
+  async function readImageSide(
+    repo: string,
+    path: string,
+    commitId: string | null,
+  ): Promise<{ src: string | null; error: string | null }> {
+    try {
+      const blob = await invoke<FileBlob>("cmd_get_file_blob", {
+        repoPath: repo,
+        filePath: path,
+        commitId,
+        // Only displayed here, never saved from: skip the digest pass.
+        withDigest: false,
+      });
+      return {
+        src: blob?.base64 ? `data:${blob.mime || "image/png"};base64,${blob.base64}` : null,
+        error: null,
+      };
+    } catch (err) {
+      return { src: null, error: formatError(err) };
+    }
+  }
+
+  /**
+   * Reads both sides, each in its own try so one failing does not discard the
+   * other. A reader that lands after the selection moved on is dropped. Both
+   * staged states read the same pair (worktree against HEAD): the backend has
+   * no index-read mode, so the index is not compared.
+   */
+  async function loadImageBlobs(request: {
+    key: string;
+    repo: string;
+    path: string;
+    commitId: string | null;
+  }): Promise<void> {
+    imageStatus = "loading";
+    imageError = null;
+    const [current, previous] = await Promise.all([
+      readImageSide(request.repo, request.path, request.commitId),
+      readImageSide(request.repo, request.path, request.commitId ? `${request.commitId}^` : "HEAD"),
+    ]);
+    if (imageBlobKey !== request.key) return;
+    newSrc = current.src;
+    oldSrc = previous.src;
+    newError = current.src ? null : current.error;
+    oldError = previous.src ? null : previous.error;
+    // Failed means nothing could be read at all. A missing side beside a
+    // readable one is a normal added/deleted image; a side that simply has no
+    // picture data is the real empty state.
+    if (current.error && previous.error) {
+      imageStatus = "failed";
+      imageError = current.error;
+    } else {
+      imageStatus = "ready";
+    }
+  }
+
+  function retryImage(): void {
+    if (imageRequest) void loadImageBlobs(imageRequest);
+  }
 
   const pending = $derived($repoStore.selectedDiffPending);
   /** Why the selected diff could not be read; per selection, not the repository's `error`. */
@@ -1699,6 +1742,11 @@
               filePath: singleSection?.path ?? $repoStore.selectedFilePath ?? "image",
               oldSrc,
               newSrc,
+              status: imageStatus,
+              error: imageError,
+              oldError,
+              newError,
+              onRetry: retryImage,
             }}
           />
         {:else if showEmpty}

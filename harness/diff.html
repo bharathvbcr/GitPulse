@@ -102,7 +102,10 @@ const impactTokens=[];
 fixtures.cmd_codeintel_impact_at_rung=async a=>{impactTokens.push({target:a.target,token:a.cancelToken});return impactAnswers[a.target]?impactAnswers[a.target](a):unavailableImpact;};
 fixtures.cmd_codeintel_cancel=a=>{cancels.push(a.cancelToken);return true;};
 const blobs={};
-fixtures.cmd_get_file_blob=async a=>{blobCalls.push({path:a.filePath,commitId:a.commitId});const b=blobs[a.filePath]??{};if(b.delay)await new Promise(r=>setTimeout(r,b.delay));return {path:a.filePath,is_binary:true,is_image:true,mime:b.mime??"image/png",base64:b.base64??"AAAA",invalid_utf8_bytes:0};};
+fixtures.cmd_get_file_blob=async a=>{blobCalls.push({path:a.filePath,commitId:a.commitId});const b=blobs[a.filePath]??{};if(b.delay)await new Promise(r=>setTimeout(r,b.delay));
+ // `failNew` / `failOld` throw for that side only: the working-tree read has no commit, the old read names HEAD or a parent.
+ const side=a.commitId===null?"failNew":"failOld";if(b[side])throw new Error(b[side]);
+ return {path:a.filePath,is_binary:true,is_image:true,mime:b.mime??"image/png",base64:b.base64??"AAAA",invalid_utf8_bytes:0};};
 files=[status(FILE),status("src/other.ts")];
 window.__TAURI_INTERNALS__={invoke:async(cmd,args)=>{if(cmd.startsWith("plugin:event|"))return 1;if(fixtures[cmd])return fixtures[cmd](args);unexpected.push(cmd);throw Error(`Unconfigured command: ${cmd}`);},transformCallback:cb=>cb};
 const {mount,unmount,tick}=await import("svelte");
@@ -373,6 +376,31 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
  await repoStore.selectFileDiff("fast.png",false);
  await wait(1000);
  check("a picture that arrives after the reader chose another is dropped, not shown under the new name",()=>imgSrc("After version of fast.png")==="data:image/webp;base64,RkFTVA=="&&!preview.innerHTML.includes("U0xPVw=="));
+ // A picture in flight, unreadable, or half there is each said, never drawn as "nothing to compare".
+ const imgCount=()=>preview.querySelectorAll("img").length;
+ blobs["slow.png"]={base64:"U0xPVw==",mime:"image/gif",delay:600};
+ answer={text:" ",truncated:false};
+ await repoStore.selectFileDiff("logo.png",false);await until(()=>imgSrc("After version of logo.png"),"logo drawn");
+ await repoStore.selectFileDiff("slow.png",false);await wait(150);
+ check("while the next picture is read the pane says it is loading and the previous file's picture is gone",()=>text().includes("Loading images")&&imgCount()===0&&!text().includes("No image"));
+ check("and the loading region is marked busy",()=>Boolean(preview.querySelector('[aria-busy="true"] [role="status"]')));
+ await wait(900);
+ check("the loading state gives way to the pictures once read",()=>!text().includes("Loading images")&&imgSrc("After version of slow.png")==="data:image/gif;base64,U0xPVw==");
+ blobs["gone.png"]={base64:"R09ORQ==",mime:"image/png",failNew:"gone from the working tree"};
+ await repoStore.selectFileDiff("gone.png",false);await wait(500);
+ check("an image whose current side cannot be read still shows the old picture, not 'No image'",()=>imgSrc("Before version of gone.png")==="data:image/png;base64,R09ORQ=="&&!text().includes("No image"));
+ check("and the missing side is labelled with the reason it gave, not passed off as plain Deleted",()=>text().includes("No current version (deleted)")&&text().includes("could not be read: gone from the working tree"));
+ blobs["new.png"]={base64:"TkVX",mime:"image/png",failOld:"no such path in HEAD"};
+ await repoStore.selectFileDiff("new.png",false);await wait(500);
+ check("an added image shows the new picture and says the previous version is absent",()=>imgSrc("After version of new.png")==="data:image/png;base64,TkVX"&&text().includes("No previous version (added)"));
+ blobs["bad.png"]={failNew:"blob unreadable",failOld:"blob unreadable"};
+ blobCalls.length=0;
+ await repoStore.selectFileDiff("bad.png",false);await wait(500);
+ check("an image neither side of which can be read says so and why, instead of 'Nothing to compare'",()=>text().includes("Could not read this image")&&text().includes("blob unreadable")&&!text().includes("No image"));
+ blobs["bad.png"]={base64:"RklYRUQ=",mime:"image/png"};
+ blobCalls.length=0;
+ buttons("Retry")[0].click();await wait(500);
+ check("Retry reads the same image again and draws it",()=>blobCalls.length===2&&imgSrc("After version of bad.png")==="data:image/png;base64,RklYRUQ="&&!text().includes("Could not read this image"));
  // --- opening at the configured defaults -----------------------------------
  interfaceStore.setDiffLayout("split");interfaceStore.setDiffWordWrap(true);interfaceStore.setDiffSyntaxHighlight(false);
  await open({text:twoHunks(),truncated:false});
