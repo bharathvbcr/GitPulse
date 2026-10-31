@@ -306,24 +306,56 @@ shown, and does nothing, off macOS.
 
 ## GPU rendering
 
-A terminal you can see draws through xterm's WebGL renderer
-(`@xterm/addon-webgl`). A hidden one draws through the DOM renderer and holds
-no WebGL context. That covers a background tab, a collapsed dock, and another
-repository's dock. The context is taken when the session comes on screen and
-given back when it leaves (`src/lib/terminal/gpuRenderer.ts`). At most
-`MAX_VISIBLE_SESSIONS` (8) contexts exist at once.
+A terminal you can see draws through xterm's WebGL renderer (`@xterm/addon-webgl`).
+When a terminal session is hidden (such as switching tabs or collapsing the dock),
+its WebGL context is retained briefly in a held cache (up to 2 contexts for 5,000 ms)
+rather than immediately destroyed (`src/lib/terminal/gpuRenderer.ts`). Switching back
+to a recently hidden session restores GPU acceleration instantly without re-allocating
+the WebGL context or rebuilding the glyph atlas. When the hold expires or the context
+capacity is reached, the context is released via `loseContext()` and falls back to
+the DOM renderer. At most `MAX_VISIBLE_SESSIONS` (8) live contexts exist at once.
 
-If a context is lost, for example through a GPU reset or a driver fault, the
-session disposes the addon on the canvas's `webglcontextlost` event and xterm
-draws the same rows through the DOM again. It does not wait for the addon's own
-three-second restore window, which would leave the pane blank. That session is
-marked `lost` (`data-renderer` on its container) and stays on the DOM renderer
-for the rest of its life, so a faulty driver cannot cause a loss loop.
+Context loss (e.g. from GPU resets or device sleep) is managed under a bounded recovery
+budget (`MAX_RECOVERIES = 3`). If an active session experiences context loss, the addon
+is re-initialized cleanly up to the budget limit before permanently falling back to DOM
+rendering (`data-renderer="dom"`). If a held hidden context is lost, the hold simply ends
+without consuming the session's active recovery budget.
+
+On device pixel ratio (DPR) changes (e.g. dragging a window between Retina and non-Retina
+displays), GitPulse invokes `clearAtlas()` to regenerate crisp glyphs and avoid atlas
+corruption. When drawing without WebGL acceleration, the terminal footer displays an
+unobtrusive indicator.
 
 **Settings → Appearance → GPU terminal rendering** turns WebGL off for every
 session at once, for hardware that draws terminal text wrongly. It is on by
 default. Whether the renderer ships at all is decided by the TUI-redraw A/B in
 `docs/PERFORMANCE.md`.
+
+## DEC 2026 synchronized output
+
+Modern CLIs and agents (including Claude Code) emit DEC 2026 synchronized output
+sequences (`CSI ? 2026 h` to begin, `CSI ? 2026 l` to end) to batch redraws into atomic
+visual frames. If a stream ends or pauses mid-block, xterm can freeze the output buffer
+until the next write arrives (xterm.js #6071).
+
+GitPulse intercepts stream writes via `syncFrames.ts` and `eraseGuard.ts` to ensure
+every write chunk delivered to xterm concludes outside an open DEC 2026 block, appending
+an un-sync escape code if necessary. Continuous synchronized frames paint smoothly at
+native display rates without frame buffer stalls.
+
+## Unicode 11 character widths
+
+Terminal sessions incorporate `@xterm/addon-unicode11` (`src/lib/terminal/unicodeWidth.ts`).
+Emojis, variation selectors, and wide symbols are assigned full double-cell widths (2 grid
+columns), preventing wide glyphs from overlapping adjacent terminal text or misaligning
+TUI borders and status bars.
+
+## Resize and fitting schedule
+
+Hidden and collapsed terminals are never fitted (`fitSchedule.ts`). Fitting is deferred
+until a session's tab or pane is shown and has non-zero DOM dimensions. When displayed,
+every visible pane performs an exact geometry refit, coalesced with shared device pixel
+ratio updates (`devicePixelRatio.ts`) to avoid resize event storms.
 
 ### Frame probe (OSC 7700)
 

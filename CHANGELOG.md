@@ -51,6 +51,24 @@ before that tag is pushed.
   Mach-O in macOS archives, ELF in Debian packages, and PE binaries extracted via 7z in
   Windows MSIs and NSIS installers) to assert that every `[[bin]]` defined in
   `src-tauri/Cargo.toml` is present and structurally valid.
+- **Terminal WebGL Context Hold & Loss Recovery.** When a terminal session is hidden,
+  its WebGL context is retained briefly (up to 2 contexts for 5 seconds) rather than
+  instantly torn down (`gpuRenderer.ts`, `term/smooth`), eliminating re-initialization
+  lag and visual flicker when switching between active tabs. WebGL context loss is
+  managed under a recovery budget (up to 3 recoveries), with lost hidden contexts
+  ending the hold cleanly without penalizing the session's active recovery budget (`f1839034`).
+- **DEC 2026 Synchronized Frame Output.** Writes to xterm are monitored to ensure every
+  output chunk ends outside an open DEC 2026 synchronized output block (`\x1b[?2026l`)
+  (`syncFrames.ts`, `eraseGuard.ts`). If a stream or tool ends mid-block, GitPulse closes
+  the frame cleanly so synchronized frames render at native display rates without
+  freezing or stalling the emulator buffer (resolving xterm.js #6071).
+- **Unicode 11 Character Widths in Terminal.** Added `@xterm/addon-unicode11` support
+  (`unicodeWidth.ts`), rendering emojis and wide characters across 2 terminal cells
+  accurately without corrupting adjacent text alignment (`9b908b6c`).
+- **Terminal Footer GPU Status & Atlas Refresh.** Added a status note in the terminal
+  footer when rendering without GPU acceleration, and automatically refreshes the
+  WebGL texture atlas (`clearAtlas()`) on device pixel ratio (DPR) changes to prevent
+  glyph corruption (`1ba2858f`, `e9a7c12d`).
 
 ### Changed
 
@@ -79,6 +97,31 @@ before that tag is pushed.
 - **Lappi Settings Copy Transparency.** Updated copy in `LappiSettings.svelte` to clearly
   state that diffs are transmitted, using transparent "nowhere else" phrasing instead of
   "not an AI provider".
+- **macOS Background Band Pre-Exec Hook.** Background-class child processes enter Darwin's
+  background scheduling band (`PRIO_DARWIN_PROCESS`) in the child process *before* `exec`
+  via a `pre_exec` hook (`procguard::spawn_background`, `ft-b597add5`, `2ae27514`). This
+  prevents race conditions with fast-execing binaries (`sh -c`, `git` wrappers) where
+  post-spawn parent demotion landed after task re-creation. Spawns fail explicitly if the
+  background band cannot be entered (such as under sandbox restrictions) rather than
+  silently running at normal priority.
+- **Batched Workbench Verification Sweep.** Optimized background verification polling
+  (`c7e97f6d`) to read all claimed card verification states in a single batch pass
+  (`latest_many`) rather than performing individual unindexed scans of `evidence_list` per
+  card on every 3-second cycle. Single-card `latest` queries now select `LIMIT 1` directly
+  for `work.verify.task` instead of parsing up to 10,001 rows of history, and parked card notes
+  reuse existing decision records, cutting idle CPU duty cycle from ~80% down to ~27%.
+- **Hidden Terminal Geometry Protection.** Terminals are never fitted (`fit()`) while hidden
+  or zero-dimensioned (`fitSchedule.ts`). Visible panes refit upon presentation, coalescing
+  resize events with shared device pixel ratio changes (`devicePixelRatio.ts`) to eliminate
+  resize storms.
+- **xterm 6.1 Beta Upgrade.** Pinned `@xterm/xterm` (6.1.0-beta.195) and `@xterm/addon-webgl`
+  (0.20.0-beta.57) to resolve WebGL texture atlas corruption at DPR 2 (xterm.js #5847).
+- **DevCouncil Re-Vendor (782b9f16).** Updated vendored DevCouncil crates (`devmap-extract`
+  97 -> 98, store 27, dc-store 11, workbench 14) with Kotlin loss/semi analysis, Swift
+  scoping, and document drift checks.
+- **Claude Code Attribution Suppression.** Configured `.claude/settings.json` with
+  `"attribution": {"commit": false, "pullRequest": false}` to prevent automated attribution
+  trailers in cloud and single-repo sessions.
 
 ### Security
 
@@ -94,6 +137,10 @@ before that tag is pushed.
 - **CI Workflow Security & Actionlint Checksumming.** Enforced the `no-pipe-to-shell` rule in
   `check-workflows.mjs`, forbidding piping downloads directly into a shell. Actionlint
   installation in `ci.yml` is pinned to a verifiable SHA-256 release tarball checksum.
+- **Pulldown-cmark Wikilink Denial of Service Mitigation (`RUSTSEC-2026-0414`).** Upgraded
+  `pulldown-cmark` to 0.13.5 (`4a344600`). Under `ENABLE_WIKILINKS`, malformed wikilinks
+  (`[[a|]]`) previously caused exponential parser event blow-ups that could exhaust memory
+  under `MAX_RENDER_BYTES`. Locked `cssparser-macros` to `syn` 3.0.5.
 
 
 

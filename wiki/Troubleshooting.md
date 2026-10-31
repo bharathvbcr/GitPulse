@@ -60,6 +60,10 @@ rotated out. Each copied section is capped at 64 Ki characters and says when cut
 
 The dock is toggled with `Ctrl+\``. Hiding it does not kill the session. Switching **repositories** does. Fleet hides the repo pane without unmounting it so PTYs survive Fleet. When expanded, the dock hides and marks `inert` the underlying view to prevent focus leaks; restore its size or toggle the dock to return to the repository view.
 
+## Terminal shows non-GPU rendering or text glitching
+
+If WebGL acceleration experiences repeated context losses (surpassing the 3-recovery budget) or a GPU reset occurs, GitPulse falls back to DOM rendering (`data-renderer="dom"`) to prevent pane blanking or driver crashes. A footer indicator informs you when drawing without WebGL. If hardware text distortion occurs, disable GPU rendering globally in **Settings → Appearance → GPU terminal rendering**.
+
 ## Settings shows "N hook reports in the last 7 days got no reply from GitPulse in time"
 
 This notice indicates agent hook notifications were sent when GitPulse was busy, shutting down, or temporarily unreachable. The hook waited out its timeout budget (300 ms for `SessionEnd`, 1.5 s for others), recorded a timed drop in `.drops`, and exited without waiting further. This does not mean the event was lost (the app may have applied it as the hook gave up). Records rotate to `.prev` at 32 KiB and expire automatically after 7 days.

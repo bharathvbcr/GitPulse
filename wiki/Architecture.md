@@ -82,7 +82,7 @@ GitPulse/
 
 There is no virtual-DOM router. View ids are the `ViewTab` union in `src/lib/repos/persist.ts`, registered in `src/lib/views/viewRegistry.ts`, rendered from `App.svelte`. Adding a view means changing all three.
 
-Errors across IPC carry strongly typed `CommandError` instances directly from runners to the command edge, eliminating ambient thread-local error state. For PTY management under the `gitpulse-ptyd` backend, `Host::knows` evaluates session membership directly from client-side vouched snapshots, eliminating IPC round-trip overhead.
+Errors across IPC carry strongly typed `CommandError` instances directly from runners to the command edge, eliminating ambient thread-local error state. For PTY management under the `gitpulse-ptyd` backend, `Host::knows` evaluates session membership directly from client-side vouched snapshots, eliminating IPC round-trip overhead. Background-class processes on macOS enter Darwin's background band in the child process before `exec` (`procguard::spawn_background`), while the frontend terminal holds recently hidden WebGL contexts and enforces DEC 2026 synchronized output boundaries. In the workbench, the verification sweep driver batches claimed card queries via `latest_many` to minimize background polling overhead.
 
 ## Why Fleet is not a view
 

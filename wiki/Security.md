@@ -40,6 +40,10 @@ flowchart TD
 
 **Durable hook notify drop records.** When hook notifications miss their deadline, timed records are appended to `<socket>.drops` beside the socket with single-owner rotation to `.prev`, best-effort `0600` permissions, and 7-day expiration.
 
+**Darwin background band isolation.** Background Git and index processes on macOS enter Darwin's background QoS band in the child process before `exec` (`procguard::spawn_background`), preventing priority demotion races and failing closed if sandbox restrictions apply.
+
+**Markdown parser memory safety.** `pulldown-cmark` 0.13.5 mitigates `RUSTSEC-2026-0414`, preventing event duplication and memory exhaustion from malformed wikilinks under `ENABLE_WIKILINKS`.
+
 **Workflow and bundle integrity.** Workflows enforce `no-pipe-to-shell` rules with pinned actionlint checksums, and CI release verification unpacks installers across platforms to assert every declared binary exists.
 
 **MCP never mutates git.** `gitpulse-mcp` does not checkout, write repository files, or take leases. Its only writes are the task-board tools (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_delete_task`, `gitpulse_merge_tasks`), which write the GitPulse task profile behind the repository trust gate; the last two are annotated destructive. See [[MCP and Agents]].

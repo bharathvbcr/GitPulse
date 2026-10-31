@@ -76,11 +76,43 @@ rust-coverage-summary.txt
 /docs/archive/
 /docs/DEPENDENCY_HEALTH_20*.md
 
-# Session audit, build, branch and release reports, and idea dumps
+# Session audit, build, wave, branch, test, and release reports, and idea dumps
 /AUDIT_REPORT*.md
+AUDIT_REPORT*.md
+*audit-report*.md
+*audit_report*.md
 /BRANCH_REPORT*.md
+BRANCH_REPORT*.md
+*branch-report*.md
+*branch_report*.md
 /BUILD_REPORT*.md
+BUILD_REPORT*.md
+*build-report*.md
+*build_report*.md
+/WAVE_REPORT*.md
+WAVE_REPORT*.md
+/WAVE_*.md
+WAVE_*.md
+*wave-report*.md
+*wave_report*.md
 /RELEASE_REPORT*.md
+RELEASE_REPORT*.md
+*release-report*.md
+*release_report*.md
+/TEST_REPORT*.md
+TEST_REPORT*.md
+*test-report*.md
+*test_report*.md
+/PERF_REPORT*.md
+PERF_REPORT*.md
+*perf-report*.md
+*perf_report*.md
+/BENCH_REPORT*.md
+BENCH_REPORT*.md
+*bench-report*.md
+*bench_report*.md
+/reports/
+reports/
 /IDEAS-*.md
 # Superseded by docs/FEATURES.md
 /FEATURES.md
@@ -96,6 +128,22 @@ CHANGELOG_DRAFT.md
 *.draft.md
 *.scratch.md
 *.local.md
+*.plan.md
+*_Implementation_Plan.md
+IMPLEMENTATION_PLAN.md
+/IMPLEMENTATION_PLAN*.md
+
+# GitPulse tasks, task briefs, and local task state
+/tasks/
+.tasks/
+.gitpulse/*
+!.gitpulse/
+!.gitpulse/hooks.json
+!.gitpulse/hooks.toml
+*.task.md
+*.tasks.md
+*.task.json
+*.tasks.json
 
 # Diagram source backups & temporary files
 *.drawio.bkp
@@ -107,6 +155,8 @@ CHANGELOG_DRAFT.md
 .devcouncil/*
 !.devcouncil/
 .devcouncil-skills.json
+.devcouncil-skills.lock
+opencode.json
 
 # Local AI coding agents
 .agents/*
@@ -166,12 +216,31 @@ CHANGELOG_DRAFT.md
 .cline/
 .roo/
 .chatgpt/
+.chatbox/
+.trae/
+.zed/
+.fleet/
+.cortex/
+.devin/
+.factory/
+.augment/
+.codeium/
 
-# Secrets and local databases
+# Secrets, certificates, and local databases
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
 *.db
+*.db-wal
+*.db-shm
+*.rdb
+*.pem
+*.key
+*.cert
+*.crt
+*.p12
+*.pfx
+*.kdbx
 
 # Temporary, log, and dump artifacts
 logs/
@@ -213,6 +282,21 @@ Session.vim
 *~
 \#*\#
 .#*
+core
+core.[0-9]*
+vgcore.*
+*.crash
+*.hprof
+*.heapsnapshot
+*.prof
+*.pstats
+*.lprof
+*.trace
+trace.out
+trace.json
+*.cpuprofile
+flamegraph.svg
+perf.data*
 
 # Environment, dependency, and cache directories
 __pycache__/
@@ -225,6 +309,15 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.uv/
+.uv_cache/
+.bun/
+.vitest/
+.vitest-cache/
+.playwright/
+coverage.out
+coverage.tmp
+*.cov
 
 # Build, package manager, and linter caches
 *.tsbuildinfo
@@ -236,6 +329,15 @@ venv/
 .npm/
 cargo-timing.html
 **/*.rs.bk
+*.cargo-ok
+Cargo.lock.orig
+
+# Compiled binaries, native libraries, and shared objects
+*.dylib
+*.so
+*.dll
+*.exe
+*.node
 
 # Operating system files
 ._*
@@ -251,6 +353,12 @@ $RECYCLE.BIN/
 .fuse_hidden*
 .directory
 .Trash-*
+.AppleDouble
+.LSOverride
+.AppleDB
+.AppleDesktop
+NetworkTrashFolder
+TemporaryItems
 
 # IDEs and editors
 .idea/
@@ -258,7 +366,10 @@ $RECYCLE.BIN/
 *.iws
 *.ipr
 .vscode/
+*.code-workspace
 *.sublime-workspace
+.helix/
+.nova/
 
 # Legacy local agent state
 .conducor/
@@ -280,6 +391,8 @@ test-results/
 playwright-report/
 blob-report/
 *.pid
+*.pid.lock
+*.sock
 *.tgz
 *.stackdump
 *.pdb

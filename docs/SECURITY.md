@@ -358,6 +358,11 @@ flowchart TD
   - Non-effect classes (multiple patterns, `-h`/`-V`, `killall -l`, signal 0) pass silently without signaling.
   - Any unmodelled `psmisc killall` option escalates to an explicit user confirmation prompt rather than permitting unverified termination.
 
+### Darwin Background Band Pre-Exec Isolation
+- Background-class processes (such as background Git commands and watcher index builders) enter Darwin's background QoS scheduling band (`PRIO_DARWIN_PROCESS`) in the child process *before* `exec` via a `pre_exec` hook (`procguard::spawn_background`, `ft-b597add5`).
+- This eliminates the race window in post-spawn parent demotion where rapidly execing binaries (`sh -c`, `git` wrappers) created new tasks before demotion arrived.
+- If a background child fails to enter the band (such as under sandbox policies that deny `system-sched`), the spawn fails explicitly with a tagged errno ("could not enter the background band: <errno>") rather than silently running at normal priority.
+
 ### Hook Notify Transport & Durable Drop Records
 - Agent hook notifications (`gitpulse-hook`) communicate over a private, non-blocking Unix domain socket with strict deadlines (300 ms for `SessionEnd`, 1.5 s for other events).
 - If a reply deadline expires or the bridge closes without responding, the hook appends a durable drop record (`{"v":1,"at":<unix_ms>,"event":...,"session":...}`) to `<socket>.drops` beside the socket (`ft-6d8ff969`, `ft-878db72b`).
@@ -408,7 +413,9 @@ MarkDev's renderer escapes raw HTML and refuses active URL schemes; GitPulse
 then namespaces every rendered id, replaces any picture that would resolve
 against the app's own origin, and handles every link itself — the webview
 never follows one (`src/lib/files/markdownLinks.ts`, guarded by
-`harness/markdown.html`). Pictures beside a note are read only from inside its
+`harness/markdown.html`). Markdown parsing uses `pulldown-cmark` 0.13.5 (`RUSTSEC-2026-0414`)
+to prevent exponential event duplication attacks from malformed wikilinks (`[[a|]]`)
+under `ENABLE_WIKILINKS`. Pictures beside a note are read only from inside its
 repository, through the same containment check as `cmd_get_file_blob`.
 
 ---

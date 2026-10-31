@@ -18,7 +18,7 @@ Everything in flight, keyed on the **worktree** (or a DevCouncil task when a sto
 | **Resolve** | 3-way conflict editor: ours / theirs / base, marker jump, accept current / incoming / both. |
 | **Remote** | PRs and issues in the wide column; workflows, runs, and releases in a CI rail. **CI:local** runs this repo's test matrix on your machine — affected tests when the map can prove coverage, otherwise the full suite (named as such; never badged as affected when fail-closed). |
 | **Policy** | Manvi wrap of DevCouncil modules: gate status, dead-branch cleanup (with tip backups in the ledger, squash merge detection, and authorized delete commands), outgoing commit review, release preflight. |
-| **Tasks** | Repository-scoped board/list over the shared profile task store: editing, selection, column "Load all" (pages up to 2,000 cards with persistent reload depth), named hidden repository notices, Manvi suggestions and agent handoff. |
+| **Tasks** | Repository-scoped board/list over the shared profile task store: editing, selection, column "Load all" (pages up to 2,000 cards with persistent reload depth), named hidden repository notices, batched verification sweeps (`latest_many`), Manvi suggestions and agent handoff. |
 
 Uncommitted counts that could not be scanned show nothing rather than `0`. A verdict this build cannot parse is `unreadable`, never `allowed`.
 
@@ -71,7 +71,7 @@ Five on-demand scans of **this repository**. Each must say when it was capped ra
 
 ### Terminal dock (`Ctrl+\``)
 
-Resizable PTY under whichever view is on screen. When expanded, inerts and hides the underlying view to eliminate focus leaks. Terminal bell prompts can be configured in Settings → Agents to toggle reader attention alerts. Local AI suggestions and the policy sidecar do not read/write ordinary shells. Explicit Claude, Manvi, Codex and task launches create their own sessions. Hiding the dock keeps sessions; closing the repository ends them. See [Terminal](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TERMINAL.md).
+Resizable PTY under whichever view is on screen. When expanded, inerts and hides the underlying view to eliminate focus leaks. Employs a WebGL context hold to eliminate tab-switching lag with a bounded context recovery budget, enforces DEC 2026 synchronized frame output boundaries to prevent display freezes, sizes Unicode 11 emojis accurately across two cells, and defers fitting until visible. Terminal bell prompts can be configured in Settings → Agents to toggle reader attention alerts. Local AI suggestions and the policy sidecar do not read/write ordinary shells. Explicit Claude, Manvi, Codex and task launches create their own sessions. Hiding the dock keeps sessions; closing the repository ends them. See [Terminal](https://github.com/bharathvbcr/GitPulse/blob/main/docs/TERMINAL.md).
 
 ### Tasks
 

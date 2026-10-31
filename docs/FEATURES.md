@@ -199,6 +199,7 @@ shared task board (with branch stack hierarchy embedded directly in Overview).
 ### 1.4 Policy (Manvi wrap)
 
 - **Policy Monitor**: Displays real-time status of the Manvi command and file write gates (Manvi's wrap around selected DevCouncil modules).
+- **macOS Background Band Pre-Exec Hook**: Background Git and CLI processes enter Darwin's background scheduling band (`PRIO_DARWIN_PROCESS`) in the child process *before* `exec` via a `pre_exec` hook (`procguard::spawn_background`), ensuring background tasks and their child trees inherit background priority permanently without race conditions.
 - **Dead-Branch Cleanup**: Scans local and remote branches for age, protection, WIP branch names, ancestry merges, and squash or rebase merges (`git merge-tree`). Cleaning writes a restorable tip backup first and records it in the ledger. Each `git branch -d/-D` and `git push --delete` command is authorized before execution; a refusal aborts the batch before any branch is removed. The Restore action puts backed-up tips back.
 - **Commit Review**: Analyzes outgoing commits before pushing, reporting reviewed vs total counts.
 - **Release Publisher**: Preflight checks (clean worktree, synchronized branch) before pushing SemVer tags.
@@ -224,7 +225,8 @@ beside Fleet opens global and saved-workspace scopes over the same records.
   and card verdict queries are automatically chunked in batches of 256 IDs (`getBoardVerdicts`)
   so large boards never trigger host refusals or cleared verdicts. When tasks from hidden
   repositories are omitted from the board, the notification banner explicitly names the
-  hidden repository. Due soon means the next seven days. Missing checkouts are flagged before action.
+  hidden repository. Background verification sweeps batch all claimed card status reads into a
+  single `latest_many` pass (`LIMIT 1`), slashing idle CPU consumption. Due soon means the next seven days. Missing checkouts are flagged before action.
 - **Edit and review**: Notes can seed a draft. Manvi proposes title/description
   changes against a saved revision; field locks and explicit acceptance apply.
   Quick Enhance exposes details that compact cards omit. **Merge…** on the board's selection
@@ -499,8 +501,12 @@ could never leave without closing it. As a dock it is what it always behaved
 like, and command output can be read *against* the thing that prompted it: a
 Health remediation plan, a failing test, the diff you are about to commit.
 
-- **Embedded PTY**: Native terminal emulator powered by `portable-pty` and `@xterm/xterm`.
+- **Embedded PTY**: Native terminal emulator powered by `portable-pty` and `@xterm/xterm` (6.1 beta pair).
 - **Expanded dock viewport isolation**: When expanded, the dock hides and marks `inert` the underlying workspace view, preventing focus leaks and background mouse or keyboard interactions.
+- **WebGL context hold & recovery**: Retains up to 2 hidden WebGL contexts for 5 seconds to eliminate tab switching lag, with a 3-strike recovery budget for GPU context loss and automatic fallback to DOM rendering.
+- **DEC 2026 synchronized output**: Delimits all terminal write streams to ensure output concludes outside open DEC 2026 frames, preventing buffer freezes (xterm.js #6071).
+- **Unicode 11 double-cell glyphs**: Incorporates `@xterm/addon-unicode11` to accurately size emojis and wide characters across two cells.
+- **Deferred fitting schedule**: Defers `fit()` calls until terminal tabs and panes are visible and dimensioned, coalescing resizes with device pixel ratio changes and clearing texture atlases on display density shifts.
 - **Configurable terminal bell prompts**: "Count a terminal bell as waiting for you" in Settings → Agents (default on, `asksForReader`) controls whether terminal bells from Codex, Cursor, or shell CLIs count as waiting prompts.
 - **Stall-bounded input writes**: Input write timeouts measure idle stalls rather than cumulative write durations, preventing premature timeouts during high-throughput writes.
 - **Sanitized tab titles**: `cleanTabName` routes through `sessionActivity.clean()` to drop control characters and split surrogate pairs without corrupting Unicode text.
