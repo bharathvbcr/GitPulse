@@ -1,3 +1,16 @@
+<script lang="ts" module>
+  /**
+   * Where the cursor belongs once the prefill has settled: the name when it is
+   * missing, otherwise the email. Both known only happens if git answered after
+   * the prompt was shown, and then the name is still the natural first field.
+   */
+  export function firstEmptyField(name: string, email: string): "name" | "email" {
+    if (!name.trim()) return "name";
+    if (!email.trim()) return "email";
+    return "name";
+  }
+</script>
+
 <script lang="ts">
   /**
    * Offered when a commit was refused because git has no name or email to
@@ -5,7 +18,7 @@
    * to the global config, through the same gated command as any other write,
    * then hands control back so the caller can retry the commit.
    */
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { UserRound } from "@lucide/svelte";
   import { repoStore } from "../stores/repoStore";
   import { identityProblem, type IdentityScope } from "../repos/gitPreflight";
@@ -19,6 +32,10 @@
   let error = $state<string | null>(null);
   let problem = $derived(identityProblem(name, email));
 
+  let formEl = $state<HTMLFormElement | null>(null);
+  let nameEl = $state<HTMLInputElement | null>(null);
+  let emailEl = $state<HTMLInputElement | null>(null);
+
   onMount(() => {
     // Prefill whatever half is already known, so a missing email does not
     // also make the user retype a name git already has.
@@ -26,7 +43,15 @@
       if (!identity) return;
       if (!name && identity.name) name = identity.name;
       if (!email && identity.email) email = identity.email;
-    }).catch(() => {});
+    }).catch(() => {}).then(async () => {
+      // The prompt appears under a Commit button that keeps focus, so a
+      // keyboard user would get no signal at all. Wait for the prefill so the
+      // cursor lands on what is actually missing — unless they have already
+      // moved into the form themselves.
+      await tick();
+      if (formEl?.contains(document.activeElement)) return;
+      (firstEmptyField(name, email) === "name" ? nameEl : emailEl)?.focus({ preventScroll: true });
+    });
   });
 
   async function save() {
@@ -40,14 +65,14 @@
   }
 </script>
 
-<form class="rounded-lg border border-border/60 bg-background p-2.5 space-y-2 text-[11px]" onsubmit={(event) => { event.preventDefault(); void save(); }}>
+<form bind:this={formEl} class="rounded-lg border border-border/60 bg-background p-2.5 space-y-2 text-[11px]" onsubmit={(event) => { event.preventDefault(); void save(); }}>
   <p class="flex items-center gap-1.5 font-medium text-textPrimary"><UserRound size={12} /> Who should commits be recorded as?</p>
   <p class="text-[10px] text-textMuted">Git needs a name and an email for every commit. Nothing was committed yet.</p>
   <label class="block"><span class="sr-only">Name</span>
-    <input class="gp-field w-full" placeholder="Your name" autocomplete="name" bind:value={name} disabled={saving} />
+    <input class="gp-field w-full" placeholder="Your name" autocomplete="name" bind:this={nameEl} bind:value={name} disabled={saving} />
   </label>
   <label class="block"><span class="sr-only">Email</span>
-    <input class="gp-field w-full" type="email" placeholder="you@example.org" autocomplete="email" bind:value={email} disabled={saving} />
+    <input class="gp-field w-full" type="email" placeholder="you@example.org" autocomplete="email" bind:this={emailEl} bind:value={email} disabled={saving} />
   </label>
   <fieldset class="flex flex-wrap gap-x-3 gap-y-1" disabled={saving}>
     <legend class="sr-only">Where to save it</legend>
