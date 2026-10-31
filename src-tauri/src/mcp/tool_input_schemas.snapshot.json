@@ -141,6 +141,36 @@
         "minimum": 1,
         "type": "integer"
       },
+      "kind": {
+        "description": "One symbol kind; same as a single entry of kinds (at most 64 characters)",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "kinds": {
+        "description": "Restrict to these symbol kinds (`function`, `struct`), ignoring case; an unknown kind is refused and the known ones listed (each item at most 64 characters)",
+        "items": {
+          "maxLength": 64,
+          "type": "string"
+        },
+        "maxItems": 16,
+        "type": "array"
+      },
+      "language": {
+        "description": "One language; same as a single entry of languages (at most 64 characters)",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "languages": {
+        "description": "Restrict to files in these languages, as the index labels them (`rust`, `typescript`); a language no indexed file has is refused (each item at most 64 characters)",
+        "items": {
+          "maxLength": 64,
+          "type": "string"
+        },
+        "maxItems": 16,
+        "type": "array"
+      },
       "limit": {
         "description": "Maximum definitions to return (default 20)",
         "maximum": 100,
@@ -153,14 +183,29 @@
         "minimum": 0.0,
         "type": "number"
       },
+      "path": {
+        "description": "One path prefix; same as a single entry of paths (at most 4096 characters)",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "paths": {
+        "description": "Restrict to files under these repository-relative path prefixes (`src/`); a prefix that matches no indexed file is refused (each item at most 4096 characters)",
+        "items": {
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "maxItems": 32,
+        "type": "array"
+      },
       "query": {
-        "description": "Symbol name or fragment",
+        "description": "Symbol name or fragment (at most 4096 characters)",
         "maxLength": 4096,
         "minLength": 1,
         "type": "string"
       },
       "repo_path": {
-        "description": "Absolute path to a git repository",
+        "description": "Absolute path to a git repository (at most 4096 characters)",
         "maxLength": 4096,
         "minLength": 1,
         "type": "string"
@@ -306,14 +351,59 @@
         "minimum": 1,
         "type": "integer"
       },
+      "kind": {
+        "description": "One symbol kind; same as a single entry of kinds (at most 64 characters)",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "kinds": {
+        "description": "Restrict to these symbol kinds (`function`, `struct`), ignoring case; an unknown kind is refused and the known ones listed (each item at most 64 characters)",
+        "items": {
+          "maxLength": 64,
+          "type": "string"
+        },
+        "maxItems": 16,
+        "type": "array"
+      },
+      "language": {
+        "description": "One language; same as a single entry of languages (at most 64 characters)",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "languages": {
+        "description": "Restrict to files in these languages, as the index labels them (`rust`, `typescript`); a language no indexed file has is refused (each item at most 64 characters)",
+        "items": {
+          "maxLength": 64,
+          "type": "string"
+        },
+        "maxItems": 16,
+        "type": "array"
+      },
+      "path": {
+        "description": "One path prefix; same as a single entry of paths (at most 4096 characters)",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "paths": {
+        "description": "Restrict to files under these repository-relative path prefixes (`src/`); a prefix that matches no indexed file is refused (each item at most 4096 characters)",
+        "items": {
+          "maxLength": 4096,
+          "type": "string"
+        },
+        "maxItems": 32,
+        "type": "array"
+      },
       "query": {
-        "description": "Symbol name or prefix",
+        "description": "Symbol name or prefix (at most 4096 characters)",
         "maxLength": 4096,
         "minLength": 1,
         "type": "string"
       },
       "repo_path": {
-        "description": "Absolute path to a git repository",
+        "description": "Absolute path to a git repository (at most 4096 characters)",
         "maxLength": 4096,
         "minLength": 1,
         "type": "string"
@@ -704,7 +794,7 @@
         "type": "string"
       },
       "symptom": {
-        "description": "Symbol that is misbehaving — a qualified node id, or a bare name",
+        "description": "Symbol that is misbehaving \u2014 a qualified node id, or a bare name",
         "maxLength": 4096,
         "minLength": 1,
         "type": "string"
