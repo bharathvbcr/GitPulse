@@ -255,12 +255,13 @@
     onclick={handleCopySha}
     class="font-mono text-accent/80 hover:text-accent shrink-0 tracking-tight flex items-center gap-1 group/sha {isCompact ? 'text-[10px] w-16' : 'text-[11px] w-20'}"
     title="Click to copy full SHA ({row.id})"
+    aria-label="Copy full SHA {row.id}"
   >
     <span>{row.id.substring(0, 7)}</span>
     {#if isCopied}
       <Check size={11} class="text-emerald-500 shrink-0" />
     {:else}
-      <Copy size={10} class="opacity-0 group-hover/sha:opacity-100 text-textMuted transition-opacity shrink-0" />
+      <Copy size={10} class="opacity-0 group-hover/sha:opacity-100 group-focus-within/sha:opacity-100 text-textMuted transition-opacity shrink-0" />
     {/if}
   </button>
 

@@ -268,12 +268,13 @@
           onclick={() => copySha(selectedCommit.id)}
           class="font-mono text-xs font-semibold text-accent hover:underline flex items-center gap-1 group/sha"
           title="Click to copy full commit SHA ({selectedCommit.id})"
+          aria-label="Copy commit SHA"
         >
           <span>{shortHash(selectedCommit.id, 8)}</span>
           {#if copiedSha}
             <Check size={11} class="text-emerald-500" />
           {:else}
-            <Copy size={10} class="text-textMuted/60 opacity-0 group-hover/sha:opacity-100 transition-opacity" />
+            <Copy size={10} class="text-textMuted/60 opacity-0 group-hover/sha:opacity-100 group-focus-within/sha:opacity-100 transition-opacity" />
           {/if}
         </button>
 
@@ -282,8 +283,9 @@
           <button
             type="button"
             onclick={() => copyMessage(selectedCommit.summary)}
-            class="opacity-0 group-hover/msg:opacity-100 text-textMuted hover:text-textPrimary transition-opacity p-0.5"
+            class="opacity-0 group-hover/msg:opacity-100 group-focus-within/msg:opacity-100 focus-visible:opacity-100 text-textMuted hover:text-textPrimary transition-opacity p-0.5"
             title="Copy commit message"
+            aria-label="Copy commit message"
           >
             {#if copiedMessage}
               <Check size={11} class="text-emerald-500" />

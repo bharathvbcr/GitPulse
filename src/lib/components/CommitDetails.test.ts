@@ -65,6 +65,19 @@ describe("CommitDetails", () => {
   });
 });
 
+describe("CommitDetails copy controls keyboard access", () => {
+  it("shows the copy-message button on focus and gives both copy buttons accessible names", () => {
+    const start = source.indexOf("onclick={() => copyMessage(selectedCommit.summary)}");
+    expect(start).toBeGreaterThan(-1);
+    const button = source.slice(start, source.indexOf("</button>", start));
+    expect(button).toContain("group-focus-within/msg:opacity-100");
+    expect(button).toContain("focus-visible:opacity-100");
+    expect(button).toContain('aria-label="Copy commit message"');
+    expect(source).toContain('aria-label="Copy commit SHA"');
+    expect(source).toContain("group-hover/sha:opacity-100 group-focus-within/sha:opacity-100");
+  });
+});
+
 describe("CommitDetails explain error scope", () => {
   it("clears a failed explanation when the commit or repository changes", () => {
     const start = source.indexOf("// A new commit or repository outdates an explanation");

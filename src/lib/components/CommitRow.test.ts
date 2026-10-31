@@ -214,3 +214,19 @@ describe("CommitRow branch creation contract", () => {
     expect(body.indexOf("toastStore.success(")).toBeGreaterThan(body.indexOf("reportFailure(outcome,"));
   });
 });
+
+describe("CommitRow copy SHA control keyboard access", () => {
+  it("reveals the hover-only copy icon on keyboard focus and names the button", () => {
+    const start = source.indexOf("<!-- Short SHA with interactive Copy Button -->");
+    const button = source.slice(start, source.indexOf("</button>", start));
+    expect(button).toContain("group-hover/sha:opacity-100 group-focus-within/sha:opacity-100");
+    expect(button).toContain('aria-label="Copy full SHA {row.id}"');
+    // The title stays for pointer users.
+    expect(button).toContain('title="Click to copy full SHA ({row.id})"');
+  });
+
+  it("renders the accessible name on the SHA button", () => {
+    const { body } = render(CommitRow, { props: { row } });
+    expect(body).toContain(`aria-label="Copy full SHA ${row.id}"`);
+  });
+});
