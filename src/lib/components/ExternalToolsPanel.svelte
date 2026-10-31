@@ -16,13 +16,13 @@
     installExternalTool,
     setExternalToolDisabled,
     toolStatusSummary,
-    uninstallExternalTool,
     type ExternalTool,
     type InstallOutcome,
     type ToolStatus,
     type ToolsStatus,
   } from "../tools/externalTools";
   import { openSetupWizard } from "../tools/onboardingStore";
+  import { confirmAndUninstall } from "../tools/confirmUninstall";
 
   let {
     /** When set, only this tool's row is shown (Map → devmap, MANVI → manvi). */
@@ -101,17 +101,8 @@
   }
 
   async function uninstall(tool: ExternalTool) {
-    if (
-      typeof window !== "undefined" &&
-      !window.confirm(
-        `Remove the GitPulse-owned ${tool} binary if it lives in the app bin directory? A cargo/go install on PATH is left on disk.`,
-      )
-    ) {
-      return;
-    }
     try {
-      await uninstallExternalTool(tool);
-      await refresh();
+      if (await confirmAndUninstall(tool)) await refresh();
     } catch (error) {
       loadError = formatError(error);
     }

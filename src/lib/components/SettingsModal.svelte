@@ -124,6 +124,16 @@
     window.dispatchEvent(new CustomEvent("gitpulse:setup-tools"));
   }
 
+  /** Tells the reader the click did something; cleared when Settings closes. */
+  let tipsStatus = $state("");
+  function resetTips() {
+    interfaceStore.resetCoachMarks();
+    tipsStatus = "Tips restored";
+  }
+  $effect(() => {
+    if (!isOpen) tipsStatus = "";
+  });
+
   async function refreshLaunchAtLogin() {
     launchAtLogin = await readLaunchAtLogin();
   }
@@ -826,11 +836,12 @@
                     </div>
                     <button
                       type="button"
-                      onclick={() => interfaceStore.resetCoachMarks()}
+                      onclick={resetTips}
                       class="gp-btn py-0.5! px-2.5! text-[11px] shrink-0"
                     >
                       Reset Tips
                     </button>
+                    {#if tipsStatus}<span class="text-textMuted text-[10px]" role="status">{tipsStatus}</span>{/if}
                   </div>
 
                   <div
@@ -1245,8 +1256,10 @@
                 </div>
                 <div data-setting="mcp-plugin" hidden={!shown("mcp-plugin")}>
                   <p class="text-textMuted text-[10px] leading-snug mb-2">
-                    Agents connect through the native Codex plugin package
-                    (`.codex-plugin/plugin.json` + `.mcp.json`) and speak MCP 2026-07-28. The
+                    Claude Code, Codex and Cursor connect through the GitPulse plugin package, which
+                    ships a manifest for each. The one read and copied below is the Codex manifest
+                    (<code class="font-mono">.codex-plugin/plugin.json</code> +
+                    <code class="font-mono">.mcp.json</code>); all of them speak MCP 2026-07-28. The
                     surface is read-only: it never checks out a branch or writes a file.
                   </p>
                   {#if mcpError}
@@ -1256,7 +1269,9 @@
                       <AlertTriangle size={12} class="shrink-0 mt-px" />
                       <span>{mcpError}</span>
                     </div>
-                  {:else if mcpInfo}
+                  {:else if !mcpInfo}
+                    <p class="text-textMuted text-[10px] mb-2" data-testid="mcp-info-pending">Reading plugin info…</p>
+                  {:else}
                     <div class="space-y-1.5 rounded-xl border border-border/70 bg-surfaceHover/40 p-2.5">
                       <div class="flex items-start gap-2">
                         <Plug size={13} class="text-accent shrink-0 mt-0.5" />
@@ -1282,11 +1297,11 @@
                           {#if !mcpInfo.binary_on_path || !mcpInfo.hook_on_path}
                             <div class="text-amber-600 dark:text-amber-400 text-[10px] mt-1" data-testid="path-status">
                               {#if !mcpInfo.binary_on_path && !mcpInfo.hook_on_path}
-                                `gitpulse-mcp` and `gitpulse-hook` are not on PATH, so the plugin's own manifests cannot start them.
+                                <code class="font-mono">gitpulse-mcp</code> and <code class="font-mono">gitpulse-hook</code> are not on PATH, so the plugin's own manifests cannot start them.
                               {:else if !mcpInfo.binary_on_path}
-                                `gitpulse-mcp` is not on PATH, so the plugin's own manifest cannot start it.
+                                <code class="font-mono">gitpulse-mcp</code> is not on PATH, so the plugin's own manifest cannot start it.
                               {:else}
-                                `gitpulse-hook` is not on PATH, so the plugin's own hooks cannot start it and the collision guard and command gate are off.
+                                <code class="font-mono">gitpulse-hook</code> is not on PATH, so the plugin's own hooks cannot start it and the collision guard and command gate are off.
                               {/if}
                               Copy the manifests below instead: they name the binaries by absolute path.
                             </div>

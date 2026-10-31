@@ -32,6 +32,36 @@ describe("Settings panels load once (SO-1)", () => {
   });
 });
 
+describe("No native window.confirm in Settings panels (SO-12)", () => {
+  // window.confirm answers null under WKWebView, so `!window.confirm(...)`
+  // read as a refusal and the button silently did nothing.
+  for (const name of ["ExternalToolsPanel.svelte", "AgentIntegrationPanel.svelte"]) {
+    it(`${name} asks through the in-app dialog`, () => {
+      expect(read(name)).not.toContain("window.confirm");
+    });
+  }
+
+  it("uninstall goes through confirmAndUninstall and apply through askConfirm", () => {
+    expect(read("ExternalToolsPanel.svelte")).toContain("confirmAndUninstall(tool)");
+    expect(read("AgentIntegrationPanel.svelte")).toContain("await askConfirm(");
+  });
+
+  it("the Agents plugin copy names the integrations, uses <code> not backticks, and has a pending state", () => {
+    const settings = read("SettingsModal.svelte");
+    expect(settings).not.toContain("native Codex plugin package");
+    expect(settings).toMatch(/Claude Code, Codex and Cursor/);
+    expect(settings).not.toMatch(/`gitpulse-(mcp|hook)`/);
+    expect(settings).toContain("Reading plugin info…");
+  });
+
+  it("Reset Tips says it worked and forgets when Settings closes", () => {
+    const settings = read("SettingsModal.svelte");
+    expect(settings).toContain("onclick={resetTips}");
+    expect(settings).toContain('tipsStatus = "Tips restored"');
+    expect(settings).toMatch(/if \(!isOpen\) tipsStatus = ""/);
+  });
+});
+
 describe("Launch at login row (SO-5)", () => {
   const settings = read("SettingsModal.svelte");
 
