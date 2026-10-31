@@ -507,16 +507,20 @@ function controlTerm(term: QueryTerm, control: QueryControl): boolean {
 /**
  * What a control shows for the search: "" when it holds none, the one value
  * (`review`, `2026-11-01..2026-11-30`) when it holds one, and null when it
- * holds more than a control can show (a list, an exclusion, or a list that
- * mixes its value with others, `due:overdue,2026-11-01..`, which means
- * "overdue OR from the 1st" and is not the range alone). The search keeps the
- * say then; the control never pretends to hold it.
+ * holds more than a control can show: an exclusion, or more than one term of
+ * the control's key in any form (a comma list, separate tokens such as
+ * `due:overdue due:2026-11-01..`, a list that mixes its value with others).
+ * Repeated keys widen to OR, so the range beside `overdue` is not the range
+ * alone. The search keeps the say then; the control never pretends to hold it.
  */
 export function queryControlValue(parsed: ParsedTaskQuery, control: QueryControl): string | null {
-  const held = parsed.terms.filter((term) => controlTerm(term, control));
+  const key = control === "status" ? "status" : "due";
+  const ofKey = parsed.terms.filter((term) => term.key === key);
+  if (ofKey.length > 1) return null;
+  const held = ofKey.filter((term) => controlTerm(term, control));
   if (held.length === 0) return "";
   const [only] = held;
-  const alone = held.length === 1 && !only.negated && parsed.terms.every((term) => term === only || term.start !== only.start);
+  const alone = !only.negated && parsed.terms.every((term) => term === only || term.start !== only.start);
   return alone ? only.value : null;
 }
 

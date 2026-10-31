@@ -3546,6 +3546,16 @@ if (params.has("check")) {
         const searchBox = root.querySelector('[aria-label="Search tasks"]');
         await change(searchBox, "due:overdue,2026-11-01.."); await settle(300);
         check("a due list that mixes a named value with a range disables both date inputs and leaves the search as typed", fromInput().disabled && toInput().disabled && searchText() === "due:overdue,2026-11-01..");
+        // The same list written as separate tokens widens to OR as well: the inputs do not show the range alone.
+        await change(searchBox, "due:overdue due:2026-11-01.."); await settle(300);
+        check("a due list written as separate tokens disables both date inputs and leaves the search as typed", fromInput().disabled && toInput().disabled && searchText() === "due:overdue due:2026-11-01..");
+        // A select that cannot say what the search holds is read-only, so choosing a value cannot replace an exclusion or a list.
+        for (const text of ["-status:done", "status:ready,review", "status:ready status:review"]) {
+          await change(searchBox, text); await settle(300);
+          check(`a search holding ${text} disables the status select, which says several, and leaves the search as typed`, statusPick().disabled && statusPick().value === "several" && searchText() === text);
+        }
+        await change(searchBox, "status:review"); await settle(300);
+        check("a single status leaves the status select enabled and showing it", !statusPick().disabled && statusPick().value === "review");
         await change(searchBox, ""); await settle(300);
         tasks = original;
         await click("Filters"); await click("Refresh"); await wait(() => card("task-1"));

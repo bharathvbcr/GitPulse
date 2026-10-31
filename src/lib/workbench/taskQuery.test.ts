@@ -508,6 +508,20 @@ describe("the Filters bar's controls over the search", () => {
     expect(setQueryControl("crash is:bug,open", "status", "status:review")).toBe("crash is:bug status:review");
   });
 
+  it("reports several for a control's key spread over more than one term, in any form", () => {
+    // Repeated keys widen to OR, so the range beside `overdue` is not the range alone.
+    expect(value("due:overdue due:2026-11-01..", "due-range")).toBeNull();
+    expect(value("due:2026-11-01.. due:overdue", "due-range")).toBeNull();
+    expect(value("due:2026-11-01..2026-11-30 -due:overdue", "due-range")).toBeNull();
+    expect(value("due:overdue due:soon", "due-range")).toBeNull();
+    expect(value("status:review status:ready", "status")).toBeNull();
+    expect(value("status:review -status:done", "status")).toBeNull();
+    expect(value("status:review is:open", "status")).toBeNull();
+    // One term of the key, or terms of other keys, are still one value.
+    expect(value("status:review due:overdue due:soon", "status")).toBe("review");
+    expect(value("due:2026-11-01.. status:review status:ready", "due-range")).toBe("2026-11-01..");
+  });
+
   it("writes a range the parser accepts however the two days were typed", () => {
     expect(dueRangeFilter("", "")).toBe("");
     expect(dueRangeFilter("2026-11-01", "")).toBe("due:2026-11-01..");

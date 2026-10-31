@@ -2466,7 +2466,8 @@
           <option value="soon">Due soon</option>
           <option value="none">No due date</option>
         </select>
-        <select class="gp-select" aria-label="Filter by status" data-testid="task-filter-status" value={statusControl ?? "several"}
+        <select class="gp-select" aria-label="Filter by status" data-testid="task-filter-status" value={statusControl ?? "several"} disabled={statusControl === null}
+          title={statusControl === null ? "The search holds several statuses or an exclusion; change them there." : undefined}
           onchange={(event) => { search = setQueryControl(search, "status", event.currentTarget.value ? `status:${event.currentTarget.value}` : ""); }}>
           <option value="">Any status</option>
           <option value="open">Not done</option>
