@@ -27,6 +27,33 @@ export function resolveCurrentCommitId(
   return graphSelectedId;
 }
 
+/**
+ * Where the commit list should scroll when a new filter's rows land.
+ *
+ * A user scrolled deep into history who types a search must not stay mid-list
+ * (or pinned to the bottom) of a shorter result and conclude it found little.
+ * The top is the answer, unless the commit the panes are on survived the
+ * filter and is below the first screenful: that one is brought into view
+ * (centred), because losing it would leave the panes describing a row nobody
+ * can see.
+ */
+export function scrollTopForNewFilter(input: {
+  rows: readonly { id: string }[];
+  currentId: string | null;
+  rowHeight: number;
+  viewportHeight: number;
+}): number {
+  const { rows, currentId, rowHeight, viewportHeight } = input;
+  if (currentId === null || !(rowHeight > 0)) return 0;
+  const index = rows.findIndex((row) => row.id === currentId);
+  if (index < 0) return 0;
+  const viewport = Number.isFinite(viewportHeight) && viewportHeight > 0 ? viewportHeight : 0;
+  const top = index * rowHeight;
+  if (top + rowHeight <= viewport) return 0;
+  const max = Math.max(0, rows.length * rowHeight - viewport);
+  return Math.min(max, Math.max(0, top - Math.max(0, viewport - rowHeight) / 2));
+}
+
 /** What the reconciler saw last time; `null` before its first run. */
 export interface ReconcileSeen {
   repoId: string | null;

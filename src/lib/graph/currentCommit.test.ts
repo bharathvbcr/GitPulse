@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   planCommitReconcile,
   resolveCurrentCommitId,
+  scrollTopForNewFilter,
   type ReconcileInput,
 } from "./currentCommit";
 
@@ -23,6 +24,38 @@ describe("resolveCurrentCommitId", () => {
   it("names nothing when neither store selects a loaded commit", () => {
     expect(resolveCurrentCommitId(null, null, rows)).toBeNull();
     expect(resolveCurrentCommitId("gone", null, [])).toBeNull();
+  });
+});
+
+describe("scrollTopForNewFilter", () => {
+  const many = Array.from({ length: 100 }, (_, i) => ({ id: `c${i}` }));
+  const base = { rows: many, rowHeight: 36, viewportHeight: 360 };
+
+  it("returns to the top when the current commit is not in the new rows", () => {
+    expect(scrollTopForNewFilter({ ...base, currentId: "gone" })).toBe(0);
+    expect(scrollTopForNewFilter({ ...base, currentId: null })).toBe(0);
+  });
+
+  it("returns to the top when the current commit is already in the first screenful", () => {
+    expect(scrollTopForNewFilter({ ...base, currentId: "c3" })).toBe(0);
+  });
+
+  it("brings a surviving current commit below the first screenful into view, centred", () => {
+    const top = scrollTopForNewFilter({ ...base, currentId: "c50" });
+    // Row 50 starts at 1800 and must lie inside [top, top + viewport).
+    expect(top).toBeLessThanOrEqual(50 * 36);
+    expect(top + 360).toBeGreaterThanOrEqual(50 * 36 + 36);
+    expect(top).toBe(50 * 36 - (360 - 36) / 2);
+  });
+
+  it("never scrolls past the end of the list", () => {
+    const top = scrollTopForNewFilter({ ...base, currentId: "c99" });
+    expect(top).toBe(100 * 36 - 360);
+  });
+
+  it("is safe before the viewport is measured or for a degenerate row height", () => {
+    expect(scrollTopForNewFilter({ ...base, viewportHeight: 0, currentId: "c5" })).toBe(5 * 36);
+    expect(scrollTopForNewFilter({ ...base, rowHeight: 0, currentId: "c5" })).toBe(0);
   });
 });
 

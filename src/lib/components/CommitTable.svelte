@@ -36,8 +36,10 @@
   import {
     planCommitReconcile,
     resolveCurrentCommitId,
+    scrollTopForNewFilter,
     type ReconcileSeen,
   } from "../graph/currentCommit";
+  import { normalizeGraphQuery } from "../graph/graphFetchScheduler";
   import {
     clampGraphScrollLeft,
     graphContentBoxStyle,
@@ -869,6 +871,53 @@
         if (row) void graphStore.selectCommit(row);
       }
       if (plan.loadDiffId !== null) void repoStore.selectCommitDiff(plan.loadDiffId);
+    });
+  });
+
+  // A new query or branch lands a different, usually shorter, row set. The
+  // scroll anchor of the old one would leave the user mid-list (or pinned to
+  // the bottom) of it, reading as "the filter found almost nothing", so the
+  // list returns to the top — or to the current commit, if it survived. Only a
+  // landing under a CHANGED filter signature does this: watcher reloads and
+  // load-more keep the signature and so keep the position, and a repository
+  // switch only records the new baseline (the list is a different one).
+  const listRepoPath = $derived($repoStore.currentPath);
+  const listFilterSignature = $derived(
+    `${normalizeGraphQuery($filterStore.searchQuery)}\u0000${$filterStore.selectedBranch ?? ""}`,
+  );
+  let landedPath: string | null | undefined;
+  let landedRows: readonly VisualCommitRow[] | null = null;
+  let landedSignature = "";
+  let wasLoading = false;
+  $effect(() => {
+    const rows = $graphStore.rows;
+    const loading = $graphStore.isLoading;
+    const path = listRepoPath;
+    const signature = listFilterSignature;
+    untrack(() => {
+      const fellIdle = wasLoading && !loading;
+      wasLoading = loading;
+      if (landedPath === undefined || path !== landedPath) {
+        landedPath = path;
+        landedRows = rows;
+        landedSignature = signature;
+        return;
+      }
+      if (loading) return;
+      // A landing is new rows, or a load that finished with identical rows
+      // (the signature check keeps the array when nothing changed).
+      const landed = rows !== landedRows || fellIdle;
+      landedRows = rows;
+      if (!landed || signature === landedSignature) return;
+      landedSignature = signature;
+      const next = scrollTopForNewFilter({
+        rows,
+        currentId,
+        rowHeight,
+        viewportHeight: containerHeight,
+      });
+      if (container) container.scrollTop = next;
+      scrollTop = next;
     });
   });
 

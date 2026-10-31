@@ -185,6 +185,30 @@ describe("CommitTable failed and loading reloads", () => {
   });
 });
 
+describe("CommitTable scroll on a new filter", () => {
+  const start = source.indexOf("const listRepoPath = $derived");
+  const block = source.slice(start, source.indexOf("// Theme changes are rare"));
+
+  it("keys the reset on the normalized query and branch, and records a repository switch without scrolling", () => {
+    expect(start).toBeGreaterThan(-1);
+    expect(block).toContain("normalizeGraphQuery($filterStore.searchQuery)");
+    expect(block).toContain('$filterStore.selectedBranch ?? ""');
+    const switchBranch = block.slice(block.indexOf("path !== landedPath"), block.indexOf("if (loading) return;"));
+    expect(switchBranch).toContain("landedSignature = signature;");
+    expect(switchBranch).toContain("return;");
+    expect(switchBranch).not.toContain("scrollTop");
+  });
+
+  it("scrolls only when rows land under a changed signature, never mid-load or on a same-signature reload", () => {
+    expect(block).toContain("if (loading) return;");
+    expect(block).toContain("if (!landed || signature === landedSignature) return;");
+    expect(block).toContain("scrollTopForNewFilter({");
+    expect(block).toContain("container.scrollTop = next;");
+    expect(block).toContain("scrollTop = next;");
+    expect(block.indexOf("if (loading) return;")).toBeLessThan(block.indexOf("scrollTopForNewFilter({"));
+  });
+});
+
 describe("CommitTable single current commit", () => {
   it("highlights the row from the shared resolver, not from the repo store's id alone", () => {
     expect(source).toContain("resolveCurrentCommitId");
@@ -197,7 +221,7 @@ describe("CommitTable single current commit", () => {
   it("reconciles the two stores on id changes only, reading everything else untracked", () => {
     const start = source.indexOf("let reconcileSeen");
     expect(start).toBeGreaterThan(-1);
-    const effect = source.slice(start, source.indexOf("// Theme changes are rare"));
+    const effect = source.slice(start, source.indexOf("// A new query or branch lands"));
     expect(effect).toContain("planCommitReconcile(");
     expect(effect).toContain("untrack(() => {");
     expect(effect).toContain("get(repoStore)");
