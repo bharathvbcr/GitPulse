@@ -32,6 +32,26 @@ describe("Settings panels load once (SO-1)", () => {
   });
 });
 
+describe("Settings and Shortcuts Escape handling (SO-8)", () => {
+  const settings = read("SettingsModal.svelte");
+  const shortcuts = read("ShortcutsModal.svelte");
+
+  it("both dialogs ignore an IME Escape", () => {
+    expect(settings).toContain("isDialogEscape(e) && onClose?.()");
+    expect(shortcuts).toContain("isDialogEscape(e) && close()");
+    expect(settings).not.toContain('e.key === "Escape" && onClose');
+    expect(shortcuts).not.toContain('e.key === "Escape" && close');
+  });
+
+  it("Escape in the Settings search clears it before it can close the dialog", () => {
+    expect(settings).toContain("escapeClearsSearch(e, query)");
+  });
+
+  it("the '?' shortcut stands down while another modal is open", () => {
+    expect(shortcuts).toContain("!isOpen && !isModalOccupied()");
+  });
+});
+
 describe("Setup wizard surfaces failures (SO-2)", () => {
   const wizard = read("onboarding/SetupWizard.svelte");
 

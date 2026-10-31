@@ -49,6 +49,7 @@
   } from "../ui/settingsSections";
   import { matchSettings, unsupportedSettingIds } from "../ui/settingsCatalog";
   import { hostPlatform } from "../stores/platformStore";
+  import { escapeClearsSearch, isDialogEscape } from "../keyboard/dialogEscape";
   import {
     describeLaunchAtLogin,
     readLaunchAtLogin,
@@ -504,7 +505,7 @@
     aria-labelledby="settings-modal-title"
     tabindex="-1"
     onclick={(e) => e.target === e.currentTarget && onClose?.()}
-    onkeydown={(e) => e.key === "Escape" && onClose?.()}
+    onkeydown={(e) => isDialogEscape(e) && onClose?.()}
     in:fade={backdropFade()}
     out:fade={backdropFadeOut()}
     class="gp-scrim bg-black/40 flex items-center justify-center p-4 select-none gp-gpu"
@@ -535,6 +536,15 @@
           <input
             type="search"
             bind:value={query}
+            onkeydown={(e) => {
+              // Escape with text in the field clears it; the dialog stays open.
+              // On an empty field it bubbles up and closes Settings.
+              if (escapeClearsSearch(e, query)) {
+                e.preventDefault();
+                e.stopPropagation();
+                query = "";
+              }
+            }}
             placeholder="Search settings"
             aria-label="Search settings"
             class="w-full rounded-lg border border-border/70 bg-surfaceHover/40 py-1 pl-6 pr-6 text-[11px] text-textPrimary placeholder:text-textMuted focus:border-accent/60 focus:outline-hidden"
