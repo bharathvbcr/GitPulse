@@ -2,7 +2,7 @@ import { tick } from "svelte";
 import type { GraphVizLoad, GraphVizPayload } from "../src/lib/codeintel/types";
 
 /** Real client-runtime regression: a same-size/same-generation payload must repaint. */
-export async function runDevmapChecks(setLoad: (load: GraphVizLoad) => void): Promise<string> {
+export async function runDevmapChecks(setLoad: (load: GraphVizLoad | null) => void): Promise<string> {
   const payload: GraphVizPayload = {
     level: "file", generation_id: 7,
     nodes: [
@@ -147,7 +147,20 @@ export async function runDevmapChecks(setLoad: (load: GraphVizLoad) => void): Pr
   if (!document.querySelector('[data-testid="code-graph-legend"]')?.textContent?.includes("Fixture index unavailable")) {
     throw new Error("Unavailable payload lost its reason");
   }
-  return "PASS: repaint, refresh and repository isolation, fit supplied coordinates, combined filters, paged browsing, directed neighbors, keyboard file activation, removed selection, malformed/empty/unavailable states";
+  // The panel's order on a view switch: the scope changes while the model is
+  // still empty (load cleared), and the payload lands later under that scope.
+  // The first payload must be fitted without the user pressing Fit.
+  setLoad({available:true,kind:"code_graph",path:"/fixture/before-fit",payload});
+  await settle();
+  setLoad(null);
+  await settle();
+  setLoad({available:true,kind:"code_graph",payload:{nodes:[{id:"first-fit",name:"First fit",kind:"file",x:10000,y:10000}],links:[]}});
+  await settle();
+  const fitBounds = canvas.getBoundingClientRect();
+  canvas.dispatchEvent(new MouseEvent('click',{clientX:fitBounds.left+fitBounds.width/2,clientY:fitBounds.top+fitBounds.height/2,bubbles:true}));
+  await settle();
+  if (!document.querySelector('[data-testid="code-graph-selection"]')?.textContent?.includes("First fit")) throw new Error("First payload after a scope change was not fitted");
+  return "PASS: repaint, refresh and repository isolation, fit supplied coordinates, first payload fitted after a scope change, combined filters, paged browsing, directed neighbors, keyboard file activation, removed selection, malformed/empty/unavailable states";
 }
 
 /** Measure mounted Svelte + canvas work, including actual frame completion. */

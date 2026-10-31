@@ -62,6 +62,10 @@
   let depth = $state(1);
   let previousScope: string | null = null;
   let previousModel: CodeGraphModel | null = null;
+  // A scope change fits an empty model when the payload has not landed yet
+  // (fitGraphView of nothing is the identity). Plain, not $state: only the
+  // effect below reads it, and it must not re-run that effect.
+  let needsFit = false;
   let dragging = false;
   let dragDistance = 0;
   let pointerStart = { x: 0, y: 0 };
@@ -337,7 +341,14 @@
         clearFilters(); resetView(); showNodeList = false; direction = "both"; depth = 1;
         communityPage = 0;
         previousModel = null;
+        needsFit = nextModel.nodes.length === 0;
       } else if (available) {
+        // First payload for this scope: fit it once. Later same-scope refreshes
+        // keep the user's zoom and pan.
+        if (needsFit && nextModel.nodes.length > 0) {
+          resetView();
+          needsFit = false;
+        }
         const oldNode = previousModel?.nodes.find(n => n.id === selectedId);
         const newNode = nextModel.nodes.find(n => n.id === selectedId);
         if (oldNode && newNode) {

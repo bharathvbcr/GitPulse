@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import type { DocRenameOutcome } from "./client";
 import {
   brokenLinksHonesty,
+  brokenLinksSection,
   docsRenameHonesty,
   docsSearchHonesty,
+  docsSearchPrompt,
   docsStatusHonesty,
 } from "./docsHonesty";
 
@@ -152,6 +154,40 @@ describe("docsRenameHonesty (adversarial)", () => {
       failed: [{ path: "x.md", error: "disk full" }],
     });
     expect(line).toContain("x.md");
+  });
+});
+
+describe("docsSearchPrompt", () => {
+  it("does not claim 'no hits' for a query that was never run", () => {
+    expect(docsSearchPrompt("a", null, 0, false)).toBe("press-enter");
+  });
+  it("claims 'no hits' only for the query that actually came back empty", () => {
+    expect(docsSearchPrompt("  foo ", "foo", 0, false)).toBe("none");
+  });
+  it("asks for Enter again when the query is edited after a search", () => {
+    expect(docsSearchPrompt("foob", "foo", 3, false)).toBe("press-enter");
+    expect(docsSearchPrompt("foob", "foo", 0, false)).toBe("press-enter");
+  });
+  it("says nothing while searching, for an empty query, or when hits are showing", () => {
+    expect(docsSearchPrompt("foo", null, 0, true)).toBeNull();
+    expect(docsSearchPrompt("   ", "foo", 0, false)).toBeNull();
+    expect(docsSearchPrompt("foo", "foo", 2, false)).toBeNull();
+  });
+});
+
+describe("brokenLinksSection", () => {
+  const link = { source: "a.md", target: "b" };
+  it("never reads a failed check as an empty vault", () => {
+    expect(brokenLinksSection({ loading: false, error: "x", links: [] })).toBe("error");
+  });
+  it("loading wins over everything", () => {
+    expect(brokenLinksSection({ loading: true, error: "x", links: [link] })).toBe("loading");
+  });
+  it("is empty only after a successful read with zero links", () => {
+    expect(brokenLinksSection({ loading: false, error: null, links: [] })).toBe("empty");
+  });
+  it("lists links when the read succeeded", () => {
+    expect(brokenLinksSection({ loading: false, error: null, links: [link] })).toBe("list");
   });
 });
 

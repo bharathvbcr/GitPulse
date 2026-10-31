@@ -6,6 +6,9 @@
   import { keyedList } from "../ui/eachKeys";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { liveIndex } from "../codeintel/liveIndex";
+  import { buildBlockReason } from "../codeintel/buildBlock";
+  import { focusTabAt, handleTablistKeydown, panelId, tabId, tabProps } from "../dom/tablist";
+  import { Loader2 } from "@lucide/svelte";
   import { copyDevmapLogs } from "../codeintel/diagnostics";
   import {
     buildDevmap,
@@ -50,7 +53,9 @@
   } from "../docs/docGraphPayload";
   import {
     brokenLinksHonesty,
+    brokenLinksSection,
     docsSearchHonesty,
+    docsSearchPrompt,
     docsStatusHonesty,
   } from "../docs/docsHonesty";
   import { formatError } from "../ui/formatError";
@@ -83,6 +88,16 @@
     | "docgraph"
     | "links";
 
+  const MAP_VIEWS: ReadonlyArray<{ id: MapView; label: string; title?: string }> = [
+    { id: "navigator", label: "Navigator" },
+    { id: "files", label: "Files", title: "File import graph (ranked cap)" },
+    { id: "symbols", label: "Symbols", title: "Symbol call graph (ranked cap)" },
+    { id: "subsystems", label: "Subsystems", title: "Subsystem handoff map" },
+    { id: "docgraph", label: "Doc graph", title: "Markdown doc link graph (same free-2D canvas)" },
+    { id: "docs", label: "Docs", title: "Repo markdown search and broken links" },
+    { id: "links", label: "Links", title: "Cross-repo import link candidates from the workspace registry" },
+  ];
+
   const CODE_GRAPH_VIEWS = new Set<MapView>(["files", "symbols", "subsystems", "docgraph"]);
   const BROKEN_LINKS_DISPLAY_CAP = 200;
 
@@ -105,6 +120,11 @@
   let building = $state(false);
   let errorMsg = $state<string | null>(null);
   let actionNote = $state<string | null>(null);
+  let actionNoteKind = $state<"ok" | "error" | null>(null);
+  let buildKind = $state<"build" | "refresh" | null>(null);
+  // Plain: only timers read it, and it must not re-run any effect.
+  let noteTimer: number | null = null;
+  const SUCCESS_NOTE_MS = 6000;
   let mapView = $state<MapView>("navigator");
   let graphLoad = $state<GraphVizLoad | null>(null);
   let graphLoading = $state(false);
@@ -115,9 +135,13 @@
   let docsQuery = $state("");
   let docsHits = $state<DocsSearchHit[]>([]);
   let docsSearching = $state(false);
+  // The trimmed query the current `docsHits` answer; null when no search has
+  // completed (or the last one failed).
+  let searchedQuery = $state<string | null>(null);
   let docsError = $state<string | null>(null);
   let brokenLinks = $state<BrokenLink[]>([]);
   let brokenLoading = $state(false);
+  let brokenError = $state<string | null>(null);
 
   let linkResult = $state<WorkspaceLinksResult | null>(null);
   let linksLoading = $state(false);
@@ -207,10 +231,17 @@
   const docsHonesty = $derived(docsStatusHonesty(docsStatus));
   const searchHonesty = $derived(docsSearchHonesty(docsHits, DOCS_SEARCH_DEFAULT_LIMIT));
   const brokenDisplay = $derived(brokenLinksHonesty(brokenLinks, BROKEN_LINKS_DISPLAY_CAP));
-  const linksHonesty = $derived(linkCandidatesHonesty(linkResult));
+  const searchPrompt = $derived(docsSearchPrompt(docsQuery, searchedQuery, docsHits.length, docsSearching));
+  const brokenSection = $derived(
+    brokenLinksSection({ loading: brokenLoading, error: brokenError, links: brokenLinks }),
+  );
+  const linksHonesty =$derived(linkCandidatesHonesty(linkResult));
 
   const currentRepo = $derived($currentRepoPath);
   const indexSnapshots = liveIndex.snapshots;
+  const indexPhase = $derived(currentRepo ? $indexSnapshots[currentRepo]?.phase : undefined);
+  const indexBusy = $derived(indexPhase === "scheduled" || indexPhase === "running");
+  const buildBlockedReason = $derived(buildBlockReason(cliKnownAbsent, indexPhase));
   const contentRevisions = repoStore.contentRevisions;
   const indexRevision = $derived(currentRepo ? ($indexSnapshots[currentRepo]?.revision ?? 0) : 0);
   const contentRevision = $derived(currentRepo ? ($contentRevisions[currentRepo] ?? "") : "");
@@ -243,6 +274,10 @@
     for (const requests of [mapRequests, graphRequests, docsRequests, searchRequests, linkRequests, buildRequests, copyRequests]) requests.next();
   }
   onDestroy(cancelRequests);
+  onDestroy(() => {
+    if (noteTimer !== null) window.clearTimeout(noteTimer);
+    noteTimer = null;
+  });
   onDestroy(detailScope.dispose);
 
   $effect(() => {
@@ -340,20 +375,26 @@
     if (!repoPath) return;
     const request = docsRequests.next();
     const live = () => docsRequests.isCurrent(request) && currentRepo === repoPath && mapView === "docs";
-    docsError = null;
+    brokenError = null;
     brokenLoading = true;
+    let statusCommitted = false;
     try {
       const status = await docsRefresh(repoPath);
       if (!live()) return;
+      // Committed before the links read so "N notes indexed" survives a
+      // links-only failure.
+      docsStatus = status;
+      statusCommitted = true;
       const links = await docsBrokenLinks(repoPath);
       if (!live()) return;
-      docsStatus = status;
       brokenLinks = links;
     } catch (err) {
       if (!live()) return;
-      docsError = reportMapFailure("documents", repoPath, err);
-      docsStatus = null;
+      brokenError = reportMapFailure("documents", repoPath, err);
       brokenLinks = [];
+      // A refresh that itself failed must not leave the previous run's count
+      // on screen as if it were current.
+      if (!statusCommitted) docsStatus = null;
     } finally {
       if (live()) brokenLoading = false;
     }
@@ -365,6 +406,7 @@
     const q = docsQuery.trim();
     if (!repoPath || !q) {
       docsHits = [];
+      searchedQuery = null;
       docsSearching = false;
       return;
     }
@@ -373,10 +415,14 @@
     const live = () => searchRequests.isCurrent(request) && currentRepo === repoPath && docsQuery.trim() === q && mapView === "docs";
     try {
       const hits = await docsSearch(repoPath, q, DOCS_SEARCH_DEFAULT_LIMIT);
-      if (live()) docsHits = hits;
+      if (live()) {
+        docsHits = hits;
+        searchedQuery = q;
+      }
     } catch (err) {
       if (!live()) return;
       docsHits = [];
+      searchedQuery = null;
       docsError = reportMapFailure("search", repoPath, err);
     } finally {
       if (live()) docsSearching = false;
@@ -403,28 +449,51 @@
     }
   }
 
+  function clearNote() {
+    if (noteTimer !== null) window.clearTimeout(noteTimer);
+    noteTimer = null;
+    actionNote = null;
+    actionNoteKind = null;
+  }
+
+  /**
+   * A success note is a transient confirmation and fades; a failure stays
+   * until the next build or a repository switch, because it is the only
+   * account of why the map on screen is not the one just asked for.
+   */
+  function setNote(text: string, kind: "ok" | "error") {
+    clearNote();
+    actionNote = text;
+    actionNoteKind = kind;
+    if (kind === "ok") noteTimer = window.setTimeout(clearNote, SUCCESS_NOTE_MS);
+  }
+
   async function runBuild(kind: "build" | "refresh") {
     const repoPath = $repoStore.currentPath;
     if (!repoPath) return;
     const request = buildRequests.next();
     const live = () => buildRequests.isCurrent(request) && currentRepo === repoPath;
     building = true;
-    actionNote = null;
+    buildKind = kind;
+    clearNote();
     errorMsg = null;
     try {
       const outcome = kind === "build" ? await buildDevmap(repoPath) : await refreshDevmap(repoPath);
       if (!live()) return;
       if (!outcome.ok) {
-        actionNote = reportMapFailure(kind, repoPath,
-          buildFailureReason(outcome, outcome.stdout.trim() || `devmap ${kind} failed`));
+        setNote(reportMapFailure(kind, repoPath,
+          buildFailureReason(outcome, outcome.stdout.trim() || `devmap ${kind} failed`)), "error");
       } else {
-        actionNote = `Map ${kind === "build" ? "built" : "refreshed"}.`;
+        setNote(`Map ${kind === "build" ? "built" : "refreshed"}.`, "ok");
       }
       await reload(repoPath);
     } catch (err) {
-      if (live()) actionNote = reportMapFailure(kind, repoPath, err);
+      if (live()) setNote(reportMapFailure(kind, repoPath, err), "error");
     } finally {
-      if (live()) building = false;
+      if (live()) {
+        building = false;
+        buildKind = null;
+      }
     }
   }
 
@@ -441,7 +510,7 @@
         map: load ? { available: load.available, path: load.path, reason: load.reason } : null,
         graph: graphLoad ? { available: graphLoad.available, kind: graphLoad.kind, reason: graphLoad.reason } : null,
         liveIndex: liveIndex.get(repository),
-        errors: [errorMsg, actionNote, docsError, linksError],
+        errors: [errorMsg, actionNote, docsError, brokenError, linksError],
       }, live);
       if (live()) copyLogsNote = result === "copied" ? "DevMap logs copied." : "Could not copy DevMap logs. Try again.";
     } catch (error) {
@@ -461,12 +530,15 @@
       graphLoad = null;
       docsStatus = null;
       docsHits = [];
+      searchedQuery = null;
       brokenLinks = [];
       linkResult = null;
       errorMsg = null;
       docsError = null;
+      brokenError = null;
       linksError = null;
-      actionNote = null;
+      clearNote();
+      buildKind = null;
       copyLogsNote = null;
       copyingLogs = false;
       loading = building = graphLoading = brokenLoading = docsSearching = linksLoading = false;
@@ -484,16 +556,27 @@
       searchRequests.next();
       linkRequests.next();
       graphLoading = brokenLoading = docsSearching = linksLoading = false;
+      // The previous view's payload must not stay painted (and interactive)
+      // under the new tab while the new one loads.
+      graphLoad = null;
+      if (actionNoteKind === "ok") clearNote();
       if (path) reloadView(path, view);
     });
   });
 
   $effect(() => {
-    docsQuery;
+    const query = docsQuery.trim();
     untrack(() => {
       searchRequests.next();
       docsSearching = false;
-      docsHits = [];
+      // Search-only since broken links own `brokenError`; an edit supersedes it.
+      docsError = null;
+      // Earlier results stay (dimmed) while the query is edited; only an
+      // emptied box discards them.
+      if (query === "") {
+        docsHits = [];
+        searchedQuery = null;
+      }
     });
   });
 
@@ -524,6 +607,16 @@
 
   function setView(view: MapView) {
     mapView = view;
+  }
+
+  let tablistEl: HTMLDivElement | undefined = $state();
+
+  function onTablistKeydown(e: KeyboardEvent) {
+    const move = handleTablistKeydown(e.key, MAP_VIEWS.findIndex((v) => v.id === mapView), MAP_VIEWS.length);
+    if (!move) return;
+    e.preventDefault();
+    setView(MAP_VIEWS[move.index].id);
+    focusTabAt(tablistEl, move.index);
   }
 </script>
 
@@ -581,20 +674,30 @@
       <button
         type="button"
         class="gp-btn text-[11px] px-2 py-0.5"
-        disabled={building || !$repoStore.currentPath || cliKnownAbsent}
-        title={cliKnownAbsent ? "devmap CLI is not installed — run Setup first" : "Refresh the map index"}
+        disabled={building || !$repoStore.currentPath || buildBlockedReason != null}
+        title={buildBlockedReason ?? "Refresh the map index"}
+        aria-busy={building && buildKind === "refresh"}
         onclick={() => void runBuild("refresh")}
       >
-        Refresh
+        {#if building && buildKind === "refresh"}
+          <Loader2 size={12} class="animate-spin inline-block align-[-2px]" aria-hidden="true" /> Refreshing…
+        {:else}
+          Refresh index
+        {/if}
       </button>
       <button
         type="button"
         class="gp-btn text-[11px] px-2 py-0.5"
-        disabled={building || !$repoStore.currentPath || cliKnownAbsent}
-        title={cliKnownAbsent ? "devmap CLI is not installed — run Setup first" : "Build the map index"}
+        disabled={building || !$repoStore.currentPath || buildBlockedReason != null}
+        title={buildBlockedReason ?? "Build the map index"}
+        aria-busy={building && buildKind === "build"}
         onclick={() => void runBuild("build")}
       >
-        Build
+        {#if building && buildKind === "build"}
+          <Loader2 size={12} class="animate-spin inline-block align-[-2px]" aria-hidden="true" /> Building…
+        {:else}
+          Build index
+        {/if}
       </button>
     </span>
   </div>
@@ -637,87 +740,38 @@
 
   <!-- View switcher: navigator vs canvases vs docs vs links -->
   <div
+    bind:this={tablistEl}
     class="shrink-0 flex flex-wrap items-center gap-1 border-b border-border/50 px-2 py-1 text-[11px]"
     role="tablist"
     aria-label="Map views"
+    tabindex="-1"
+    onkeydown={onTablistKeydown}
   >
-    <button
-      type="button"
-      role="tab"
-      aria-selected={mapView === "navigator"}
-      class="rounded px-2 py-0.5 {mapView === 'navigator' ? 'bg-accent/15 text-textPrimary' : 'text-textMuted'}"
-      onclick={() => setView("navigator")}
-    >
-      Navigator
-    </button>
-    <button
-      type="button"
-      role="tab"
-      aria-selected={mapView === "files"}
-      class="rounded px-2 py-0.5 {mapView === 'files' ? 'bg-accent/15 text-textPrimary' : 'text-textMuted'}"
-      onclick={() => setView("files")}
-      title="File import graph (ranked cap)"
-    >
-      Files
-    </button>
-    <button
-      type="button"
-      role="tab"
-      aria-selected={mapView === "symbols"}
-      class="rounded px-2 py-0.5 {mapView === 'symbols' ? 'bg-accent/15 text-textPrimary' : 'text-textMuted'}"
-      onclick={() => setView("symbols")}
-      title="Symbol call graph (ranked cap)"
-    >
-      Symbols
-    </button>
-    <button
-      type="button"
-      role="tab"
-      aria-selected={mapView === "subsystems"}
-      class="rounded px-2 py-0.5 {mapView === 'subsystems' ? 'bg-accent/15 text-textPrimary' : 'text-textMuted'}"
-      onclick={() => setView("subsystems")}
-      title="Subsystem handoff map"
-    >
-      Subsystems
-    </button>
-    <button
-      type="button"
-      role="tab"
-      aria-selected={mapView === "docgraph"}
-      class="rounded px-2 py-0.5 {mapView === 'docgraph' ? 'bg-accent/15 text-textPrimary' : 'text-textMuted'}"
-      onclick={() => setView("docgraph")}
-      title="Markdown doc link graph (same free-2D canvas)"
-    >
-      Doc graph
-    </button>
-    <button
-      type="button"
-      role="tab"
-      aria-selected={mapView === "docs"}
-      class="rounded px-2 py-0.5 {mapView === 'docs' ? 'bg-accent/15 text-textPrimary' : 'text-textMuted'}"
-      onclick={() => setView("docs")}
-      title="Repo markdown search and broken links"
-    >
-      Docs
-    </button>
-    <button
-      type="button"
-      role="tab"
-      aria-selected={mapView === "links"}
-      class="rounded px-2 py-0.5 {mapView === 'links' ? 'bg-accent/15 text-textPrimary' : 'text-textMuted'}"
-      onclick={() => setView("links")}
-      title="Cross-repo import link candidates from the workspace registry"
-    >
-      Links
-    </button>
+    {#each MAP_VIEWS as view (view.id)}
+      <button
+        type="button"
+        {...tabProps("map-view", view.id, mapView === view.id)}
+        class="rounded px-2 py-0.5 {mapView === view.id ? 'bg-accent/15 text-textPrimary' : 'text-textMuted'}"
+        onclick={() => setView(view.id)}
+        title={view.title}
+      >
+        {view.label}
+      </button>
+    {/each}
   </div>
 
   {#if actionNote}
     <div class="shrink-0 px-3 py-1.5 text-[11px] text-textMuted border-b border-border/40" role="status">
-      {actionNote}
+      {boundStrip(actionNote)}
     </div>
   {/if}
 
+  <div
+    class="flex-1 min-h-0 flex flex-col"
+    role="tabpanel"
+    id={panelId("map-view", mapView)}
+    aria-labelledby={tabId("map-view", mapView)}
+  >
   {#if CODE_GRAPH_VIEWS.has(mapView)}
     <div class="flex-1 min-h-0 flex flex-col">
       <CodeGraphCanvas scopeKey={JSON.stringify([currentRepo, mapView])} load={graphLoad} loading={graphLoading} onOpenNode={openGraphNode} />
@@ -735,7 +789,7 @@
         </p>
       {/if}
       {#if docsError}
-        <p class="text-[11px] text-rose-600 dark:text-rose-400">{docsError}</p>
+        <p class="text-[11px] text-rose-600 dark:text-rose-400">{boundStrip(docsError)}</p>
       {/if}
 
       <section aria-labelledby="docs-search-heading">
@@ -756,7 +810,7 @@
             bind:value={docsQuery}
             aria-label="Search repository markdown"
           />
-          <button type="submit" class="gp-btn text-[11px] px-2 py-1" disabled={docsSearching || !$repoStore.currentPath}>
+          <button type="submit" class="gp-btn text-[11px] px-2 py-1" disabled={docsSearching || !$repoStore.currentPath || !docsQuery.trim()}>
             {docsSearching ? "Searching…" : "Search"}
           </button>
         </form>
@@ -765,10 +819,13 @@
             {searchHonesty}
           </p>
         {/if}
-        {#if docsHits.length === 0 && docsQuery.trim() && !docsSearching}
+        {#if searchPrompt === "none"}
           <p class="mt-2 text-[11px] text-textMuted">No hits.</p>
-        {:else if docsHits.length > 0}
-          <ul class="mt-2 space-y-1.5">
+        {:else if searchPrompt === "press-enter"}
+          <p class="mt-2 text-[11px] text-textMuted" data-testid="docs-search-prompt">Press Enter to search.</p>
+        {/if}
+        {#if docsHits.length > 0}
+          <ul class="mt-2 space-y-1.5" class:opacity-60={searchedQuery !== docsQuery.trim()}>
             {#each keyedList(docsHits, (hit) => JSON.stringify([hit.path, hit.line, hit.score])) as { item: hit, key: renderKey } (renderKey)}
               <li>
                 <button
@@ -789,13 +846,16 @@
       <section aria-labelledby="docs-broken-heading" class="border-t border-border/50 pt-3">
         <h3 id="docs-broken-heading" class="text-[10px] uppercase tracking-wide text-textMuted mb-1.5">
           Broken links
-          {#if !brokenLoading}
+          {#if brokenSection === "list" || brokenSection === "empty"}
             <span class="normal-case tracking-normal ml-1">({brokenLinks.length})</span>
           {/if}
         </h3>
-        {#if brokenLoading}
+        {#if brokenSection === "loading"}
           <p class="text-[11px] text-textMuted">Loading…</p>
-        {:else if brokenLinks.length === 0}
+        {:else if brokenSection === "error"}
+          <p class="text-[11px] text-rose-600 dark:text-rose-400" role="alert" data-testid="docs-broken-error">Could not check links: {boundStrip(brokenError)}</p>
+          <button type="button" class="gp-btn text-[11px] px-2 py-0.5 mt-1" onclick={() => void reloadDocs()}>Retry</button>
+        {:else if brokenSection === "empty"}
           <p class="text-[11px] text-textMuted">None found in the indexed vault.</p>
         {:else}
           {#if brokenDisplay.honesty}
@@ -835,7 +895,7 @@
         </p>
       {/if}
       {#if linksError}
-        <p class="text-[11px] text-rose-600 dark:text-rose-400">{linksError}</p>
+        <p class="text-[11px] text-rose-600 dark:text-rose-400">{boundStrip(linksError)}</p>
       {/if}
       {#if linksLoading}
         <p class="text-[11px] text-textMuted">Loading…</p>
@@ -878,17 +938,30 @@
   {:else if !map}
     <div class="flex-1 flex flex-col items-center justify-center gap-2 p-6 text-center" role="status">
       <p class="text-sm text-textPrimary">No repository map</p>
-      <p class="text-[11px] text-textMuted max-w-md">
-        {errorMsg ?? "Build the code map to navigate subsystems, entry points and area tests."}
-      </p>
-      <button
-        type="button"
-        class="gp-btn mt-2"
-        disabled={building || !$repoStore.currentPath}
-        onclick={() => void runBuild("build")}
-      >
-        Build Map
-      </button>
+      {#if indexBusy && indexActivity}
+        <p class="text-[11px] text-textMuted flex items-center gap-1.5" aria-busy="true" data-testid="map-index-progress">
+          <Loader2 size={12} class="animate-spin" aria-hidden="true" />
+          {indexActivity}
+        </p>
+      {:else}
+        <p class="text-[11px] text-textMuted max-w-md">
+          {mapFailureText ?? boundStrip(errorMsg) ?? "Build the code map to navigate subsystems, entry points and area tests."}
+        </p>
+        <button
+          type="button"
+          class="gp-btn mt-2"
+          disabled={building || !$repoStore.currentPath || buildBlockedReason != null}
+          title={buildBlockedReason ?? "Build the map index"}
+          aria-busy={building && buildKind === "build"}
+          onclick={() => void runBuild("build")}
+        >
+          {#if building && buildKind === "build"}
+            <Loader2 size={12} class="animate-spin inline-block align-[-2px]" aria-hidden="true" /> Building…
+          {:else}
+            Build index
+          {/if}
+        </button>
+      {/if}
     </div>
   {:else}
     {@const doc = map as RepoMapDocument}
@@ -1143,4 +1216,5 @@
       </div>
     </div>
   {/if}
+  </div>
 </div>
