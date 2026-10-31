@@ -372,6 +372,7 @@ fn skip_deferred_outcome(facts: LiveRefreshFacts, reason: String) -> LiveRefresh
         cooldown_remaining_ms: None,
         artifacts_restored: false,
         index_too_slow: false,
+        probe_pending: false,
     }
 }
 
@@ -429,6 +430,7 @@ fn skip_cooldown_outcome(remaining: Duration, kind: WaitKind) -> LiveRefreshOutc
         cooldown_remaining_ms: Some(ms),
         artifacts_restored: false,
         index_too_slow: kind == WaitKind::TooSlow,
+        probe_pending: false,
     }
 }
 
@@ -570,6 +572,13 @@ pub struct LiveRefreshOutcome {
     /// say the index is too slow rather than "queued".
     #[serde(default)]
     pub index_too_slow: bool,
+    /// The `devmap status` probe this ask needed had not answered yet. `facts`
+    /// are then the previous probe's (all unexamined when there is none), never
+    /// a reading of the repository now, and `decision` is
+    /// [`LiveRefreshDecision::SkipDeferred`]: ask again and the finished probe
+    /// is collected. Absent from the JSON when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub probe_pending: bool,
     /// This build wrote consumer artifacts that were absent before it ran.
     ///
     /// Needed because such a build reports `unchanged: true` whenever the
@@ -746,6 +755,7 @@ pub(crate) fn live_refresh(
             cooldown_remaining_ms: None,
             artifacts_restored: false,
             index_too_slow: false,
+            probe_pending: false,
         };
     }
 
@@ -853,6 +863,7 @@ pub(crate) fn live_refresh(
             cooldown_remaining_ms: None,
             artifacts_restored: false,
             index_too_slow: false,
+            probe_pending: false,
         };
     }
     let rebuild = live_rebuild_kind(cli.status.as_ref(), artifacts_missing);
@@ -879,6 +890,7 @@ pub(crate) fn live_refresh(
                 cooldown_remaining_ms: None,
                 artifacts_restored: false,
                 index_too_slow: false,
+                probe_pending: false,
             };
         }
     };
@@ -930,6 +942,7 @@ pub(crate) fn live_refresh(
                     cooldown_remaining_ms: None,
                     artifacts_restored: false,
                     index_too_slow: false,
+                    probe_pending: false,
                 },
                 // The closure, and with it the writer slot and the live slot,
                 // was dropped with the failed spawn.
@@ -1030,6 +1043,7 @@ impl LiveSettle {
                     cooldown_remaining_ms: wait.map(duration_ms),
                     artifacts_restored: false,
                     index_too_slow: false,
+                    probe_pending: false,
                 };
             }
         };
@@ -1072,6 +1086,7 @@ impl LiveSettle {
             cooldown_remaining_ms: Some(duration_ms(wait)),
             artifacts_restored,
             index_too_slow: kind == WaitKind::TooSlow,
+            probe_pending: false,
         }
     }
 }
@@ -1981,6 +1996,93 @@ exit 2
         // Collected once; the rest it set now answers the next tick.
         let next = start_refresh(&path, true);
         assert_eq!(next.decision, LiveRefreshDecision::SkipCooldown, "{next:?}");
+    }
+
+    /// The command never waits on `devmap status` either. A probe that hangs
+    /// (it is bounded only by a 30 s deadline) used to hold the IPC call, and a
+    /// background permit, for all of it. The ask answers `skip_deferred` with
+    /// `probe_pending` and facts that claim nothing; asks while the probe runs
+    /// start no second one; the next ask after it answers carries its result.
+    #[test]
+    #[cfg(unix)]
+    fn start_refresh_answers_before_a_hung_status_probe_and_collects_it_once() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        struct ResetCooldowns;
+        impl Drop for ResetCooldowns {
+            fn drop(&mut self) {
+                clear_all_live_echo_cooldowns();
+            }
+        }
+        let _reset = ResetCooldowns;
+        let (repo, bound) = stub_repository(
+            r#"#!/bin/sh
+if [ "$1" = "build" ]; then
+  i=0; while [ ! -f release ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done
+  printf '%s\n' '{"ok":true,"unchanged":false}'
+  exit 0
+fi
+exit 2
+"#,
+        );
+        let release_probe = bound.set_status_delayed(
+            cli::available_status(r#"{"is_fresh":false,"schema_outdated":false}"#),
+            Duration::from_secs(10),
+        );
+        let path = repo.path().to_string_lossy().into_owned();
+        let _release = ReleaseStub(repo.path().to_path_buf());
+        let probes_before = cli::test_status_calls();
+
+        let asked = Instant::now();
+        let first = start_refresh(&path, true);
+        assert!(
+            asked.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)),
+            "the command waited {:?} on a status probe that has not answered",
+            asked.elapsed()
+        );
+        assert!(first.probe_pending, "{first:?}");
+        assert_eq!(first.decision, LiveRefreshDecision::SkipDeferred, "{first:?}");
+        assert!(first.build.is_none());
+        assert!(
+            !first.facts.available && !first.facts.is_fresh && !first.facts.schema_ok,
+            "no probe has answered, so the facts claim nothing: {first:?}"
+        );
+
+        // An edit storm during the pending probe: still pending, no second probe.
+        for _ in 0..3 {
+            let during = start_refresh(&path, true);
+            assert!(during.probe_pending, "{during:?}");
+            assert_eq!(during.decision, LiveRefreshDecision::SkipDeferred);
+        }
+        assert_eq!(
+            cli::test_status_calls() - probes_before,
+            1,
+            "a pending probe is single-flight per repository"
+        );
+
+        release_probe.store(true, std::sync::atomic::Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let collected = loop {
+            let answer = start_refresh(&path, true);
+            if !answer.probe_pending {
+                break answer;
+            }
+            assert!(Instant::now() < deadline, "the status probe never reported back");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // The stale store the probe read is acted on: the build it authorizes
+        // starts, from the probe's own answer rather than a second probe.
+        assert_eq!(
+            collected.decision,
+            LiveRefreshDecision::Started,
+            "{collected:?}"
+        );
+        assert!(collected.facts.available && !collected.facts.is_fresh);
+        assert_eq!(
+            cli::test_status_calls() - probes_before,
+            1,
+            "the next ask collects the finished probe instead of asking again"
+        );
     }
 
     /// A detached build whose thread panics must not hold the one live slot

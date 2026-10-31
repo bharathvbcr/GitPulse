@@ -205,6 +205,18 @@ static TEST_BINARY: Mutex<Option<String>> = Mutex::new(None);
 #[cfg(test)]
 static TEST_STATUS: Mutex<Option<CliStatus>> = Mutex::new(None);
 
+/// Test seam: how long the canned [`status`] takes to answer, and the flag that
+/// ends the wait early. A probe that hangs is the case the live index's IPC path
+/// must survive, and a real hang is a 30 s child nobody wants a test to wait for.
+#[cfg(all(test, unix))]
+static TEST_STATUS_DELAY: Mutex<Option<(Duration, std::sync::Arc<std::sync::atomic::AtomicBool>)>> =
+    Mutex::new(None);
+
+/// Test seam: how many times [`status`] served the canned answer, so a test can
+/// say a second probe was not started rather than infer it from timing.
+#[cfg(test)]
+static TEST_STATUS_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Every test that installs a global `devmap` override takes
 /// [`crate::test_support::env::env_serial`], the process's one environment lock.
 ///
@@ -251,6 +263,8 @@ impl Drop for TestBinaryBinding {
         // are released here. Leaving a canned status installed would hand it to
         // whichever test took the serial next.
         set_test_status(None);
+        #[cfg(unix)]
+        release_test_status_delay();
     }
 }
 
@@ -266,6 +280,58 @@ impl TestBinaryBinding {
     /// without holding the serial: the binding *is* the proof of exclusivity.
     pub(crate) fn set_status(&self, status: CliStatus) {
         set_test_status(Some(status));
+    }
+
+    /// [`Self::set_status`] for a probe that takes `delay` to answer. The
+    /// returned flag ends the wait early; the binding's drop sets it, so a
+    /// probe thread a test left parked never outlives the override.
+    pub(crate) fn set_status_delayed(
+        &self,
+        status: CliStatus,
+        delay: Duration,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *TEST_STATUS_DELAY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((delay, std::sync::Arc::clone(&release)));
+        set_test_status(Some(status));
+        release
+    }
+}
+
+/// How many times [`status`] answered from the canned override since the
+/// process started. Compare two readings; the absolute number is shared.
+#[cfg(all(test, unix))]
+pub(crate) fn test_status_calls() -> usize {
+    TEST_STATUS_CALLS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Park the calling probe for the installed delay, or until it is released.
+#[cfg(all(test, unix))]
+fn wait_test_status_delay() {
+    let installed = TEST_STATUS_DELAY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let Some((delay, release)) = installed else {
+        return;
+    };
+    let deadline = Instant::now() + delay;
+    while Instant::now() < deadline && !release.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Remove the installed delay and end any wait in progress.
+#[cfg(all(test, unix))]
+fn release_test_status_delay() {
+    if let Some((_, release)) = TEST_STATUS_DELAY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    {
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1060,6 +1126,9 @@ pub fn status(repo_path: &str) -> CliStatus {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
         {
+            TEST_STATUS_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(unix)]
+            wait_test_status_delay();
             return canned;
         }
     }
