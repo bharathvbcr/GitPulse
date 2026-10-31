@@ -6,6 +6,7 @@
   import { keyedList } from "../ui/eachKeys";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { liveIndex } from "../codeintel/liveIndex";
+  import { requestReveal } from "../files/revealRequests";
   import { copyDevmapLogs } from "../codeintel/diagnostics";
   import {
     buildDevmap,
@@ -516,6 +517,12 @@
     repoStore.setActiveTab("code", "explorer");
   }
 
+  /** A docs hit lands on its own line, not the top of the file. */
+  function openHit(hit: DocsSearchHit) {
+    requestReveal(hit.path, hit.line, null);
+    openFile(hit.path);
+  }
+
   function openGraphNode(path: string, _nodeId: string) {
     // The canvas resolves explicit file ownership, including root-level and
     // extensionless files. Do not add a second language whitelist here.
@@ -774,7 +781,7 @@
                 <button
                   type="button"
                   class="w-full text-left rounded-md px-2 py-1.5 hover:bg-surface/80"
-                  onclick={() => openFile(hit.path)}
+                  onclick={() => openHit(hit)}
                 >
                   <span class="font-mono text-[11px] text-accent block truncate">{hit.path}:{hit.line}</span>
                   <span class="text-[11px] text-textPrimary block truncate">{hit.title}</span>

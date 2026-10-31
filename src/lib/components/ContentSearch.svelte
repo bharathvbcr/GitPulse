@@ -15,7 +15,8 @@
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { cancelCodeintelQuery, newCodeintelCancelToken } from "../codeintel/client";
   import { describeSearchReport, groupByFile } from "../search/contentSearch";
-  import type { ContentSearchOptions, ContentSearchReport } from "../search/types";
+  import { requestReveal } from "../files/revealRequests";
+  import type { ContentMatch, ContentSearchOptions, ContentSearchReport } from "../search/types";
   import EmptyState from "./EmptyState.svelte";
 
   let pattern = $state("");
@@ -80,7 +81,15 @@
     if (token) void cancelCodeintelQuery(token).catch(() => false);
   }
 
-  function open(path: string) {
+  /**
+   * Opens a file, and a match's own line when one is named. The request is
+   * recorded before the selection so it is already waiting when the viewer
+   * mounts (the order the terminal's file links use). A search run at a
+   * revision opens the working-tree file, whose lines need not match that
+   * revision's, so it never carries a line.
+   */
+  function open(path: string, match: ContentMatch | null = null) {
+    if (match && !report?.revision) requestReveal(match.path, match.line, match.column);
     repoStore.selectFilePath(path);
     repoStore.setActiveTab("code", "explorer");
   }
@@ -129,6 +138,11 @@
   {/if}
 
   <div class="flex-1 min-h-0 overflow-auto px-2 py-2">
+    {#if report?.revision && report.matches.length > 0 && !error}
+      <p class="px-2 pb-1 text-[11px] text-textMuted" data-search-revision-note>
+        Searched at {report.revision.slice(0, 7)}. Opening a hit shows the working-tree file.
+      </p>
+    {/if}
     {#if error}
       <div class="p-3 text-rose-400" role="alert">{error}</div>
     {:else if running && !report}
@@ -144,7 +158,7 @@
             {group.path} <span class="text-textMuted">({group.matches.length})</span>
           </button>
           {#each group.matches as match (`${match.line}:${match.column}`)}
-            <button type="button" data-search-match class="w-full text-left flex gap-2 px-2 py-0.5 rounded hover:bg-surfaceHover font-mono text-[11px]" onclick={() => open(match.path)}>
+            <button type="button" data-search-match class="w-full text-left flex gap-2 px-2 py-0.5 rounded hover:bg-surfaceHover font-mono text-[11px]" onclick={() => open(match.path, match)}>
               <span class="w-12 shrink-0 text-right text-textMuted/60 tabular-nums">{match.line}</span>
               <span class="whitespace-pre truncate text-textPrimary">{match.text}{match.text_clipped ? " …" : ""}</span>
             </button>

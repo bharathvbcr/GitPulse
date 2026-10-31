@@ -39,7 +39,7 @@
   import { findMatches, matchLabel, stepMatch } from "../../text/lineSearch";
   import { debounce } from "../../async/debounce";
   import { SEARCH_DEBOUNCE_MS } from "../../files/searchLimits";
-  import { consumeReveal } from "../../files/revealRequests";
+  import { consumeReveal, revealRequest } from "../../files/revealRequests";
   import type { LineEnding } from "../../files/types";
 
   let {
@@ -424,7 +424,11 @@
   $effect(() => {
     const path = filePath;
     const lineCount = rawLines.length;
-    if (!path || lineCount === 0) return;
+    // Read through the store so a request made while this file is already
+    // open (a hit in the palette or Search for the shown file) re-runs the
+    // effect; `consumeReveal` alone reads the slot untracked.
+    const pending = $revealRequest;
+    if (!path || lineCount === 0 || !pending || pending.path !== path) return;
     const target = consumeReveal(path);
     if (!target) return;
     // A reference can name a line past the end of the file it was written

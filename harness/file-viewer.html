@@ -57,6 +57,7 @@ const { mount, tick } = await import("svelte");
 const { get } = await import("svelte/store");
 const { repoStore } = await import("../src/lib/stores/repoStore");
 const { promptState, completePrompt } = await import("../src/lib/stores/modalStore");
+const { requestReveal, revealRequest } = await import("../src/lib/files/revealRequests");
 const Viewer = (await import("../src/lib/components/FileViewer.svelte")).default;
 const { results, check, stopped } = createChecks();
 const wait = (ms = 60) => new Promise(resolve => setTimeout(resolve, ms));
@@ -72,6 +73,16 @@ const type = async value => { const area = textarea(); area.value = value; area.
   mount(Viewer, { target: host });
   repoStore.selectFilePath(file);
   await until(() => button("Edit"), "the file is open with an Edit button");
+
+  // A hit for the file that is already open (palette, Search) must land on its
+  // line: the viewer is not remounted, so only a tracked read of the pending
+  // request can wake it.
+  check("an open file starts on line 1", () => host.textContent.includes("Ln 1, Col 1"));
+  requestReveal(file, 2, 1);
+  await until(() => host.textContent.includes("Ln 2, Col 1"), "the reveal request lands on its line");
+  check("a reveal for the file already open lands on the named line", () => host.textContent.includes("Ln 2, Col 1"));
+  check("and the request is consumed, not left to replay", () => get(revealRequest) === null);
+
   button("Edit").click();
   await until(textarea, "the editor opens");
   await type("one\ntwo\nmine\n");

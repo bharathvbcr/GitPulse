@@ -60,6 +60,7 @@
       const { mount, tick } = await import("svelte");
       const { get } = await import("svelte/store");
       const { repoStore } = await import("../src/lib/stores/repoStore");
+      const { revealRequest, clearReveal } = await import("../src/lib/files/revealRequests");
       const { createChecks } = await import("./checks.ts");
       const Host = (await import("./SearchHost.svelte")).default;
       await repoStore.openRepo("/fixture/GitPulse");
@@ -168,11 +169,36 @@
           mode = "complete";
           await submit();
           await until(() => matches().length === 3);
-          matches()[2].click(); await tick();
+          clearReveal();
+          matches()[1].click(); await tick();
           check("a match opens its file in Explorer", () => {
             const state = get(repoStore);
-            return state.selectedFilePath === "lib/b.rs" && state.activeTab === "code" && state.viewSections.code === "explorer";
+            return state.selectedFilePath === "src/a.ts" && state.activeTab === "code" && state.viewSections.code === "explorer";
           });
+          check("and asks the viewer to land on the match's own line and column", () => {
+            const pending = get(revealRequest);
+            return pending?.path === "src/a.ts" && pending.line === 9 && pending.column === 1;
+          });
+          clearReveal();
+          [...document.querySelectorAll("section > button")][0].click(); await tick();
+          check("the file heading opens the file without naming a line", () => get(revealRequest) === null);
+
+          // A search run at a revision opens the working-tree file, so it must
+          // say so and must not carry a line that belongs to another version.
+          mode = "revision";
+          await set(revisionInput(), "v1.2.0");
+          await submit();
+          await until(() => document.querySelector("[data-search-revision-note]"));
+          check("a revision search says that a hit opens the working-tree file", () =>
+            document.querySelector("[data-search-revision-note]").textContent.includes("Opening a hit shows the working-tree file"));
+          clearReveal();
+          matches()[1].click(); await tick();
+          check("and a revision hit asks for no line", () => get(revealRequest) === null);
+          await set(revisionInput(), "");
+          mode = "complete";
+          await submit();
+          await until(() => !document.querySelector("[data-search-revision-note]") && matches().length === 3);
+          check("a working-tree search shows no such note", () => !document.querySelector("[data-search-revision-note]"));
 
           check("no unhandled runtime errors", () => errors.length === 0);
           report();
