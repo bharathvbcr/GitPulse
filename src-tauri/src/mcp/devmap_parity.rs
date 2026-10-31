@@ -14,12 +14,10 @@
 use crate::ipc_error::CommandError;
 use serde_json::{json, Value};
 
-use crate::codeintel::WalkBounds;
+use crate::codeintel::{NameQueryOptions, WalkBounds, MCP_DEFAULT_WALK_DEPTH};
 
 use super::validate::{tool_args, Spec, ToolArgs, Unit};
-use super::{
-    budget_spec, parse, path_spec, repo_spec, tool, BudgetArgs, RepoArgs, SearchArgs, MAX_ARG_CHARS,
-};
+use super::{budget_spec, parse, path_spec, repo_spec, tool, BudgetArgs, RepoArgs, MAX_ARG_CHARS};
 
 /// Ordered tool names matching `devmap_serve::mcp::TOOL_NAMES`.
 ///
@@ -71,7 +69,7 @@ fn targets_spec() -> Spec {
 }
 
 // Argument structs for the tools whose shape is their own. The ones shared with
-// the `gitpulse_*` surface (`RepoArgs`, `BudgetArgs`, `SearchArgs`) live in the
+// the `gitpulse_*` surface (`RepoArgs`, `BudgetArgs`) live in the
 // parent module.
 
 tool_args! {
@@ -126,6 +124,47 @@ tool_args! {
     }
 }
 
+// The path, language and kind narrowing `search` and `explore` share. The plural
+// lists and the single-value spellings are the standalone server's, and both are
+// read: a single value is one more entry of its list.
+fn paths_spec() -> Spec {
+    Spec::chars_array(
+        "Restrict to files under these repository-relative path prefixes (`src/`); a prefix that matches no indexed file is refused",
+        devmap_query::MAX_SCOPE_PATHS,
+        MAX_ARG_CHARS as usize,
+    )
+}
+
+fn languages_spec() -> Spec {
+    Spec::chars_array(
+        "Restrict to files in these languages, as the index labels them (`rust`, `typescript`); a language no indexed file has is refused",
+        devmap_query::MAX_SCOPE_LANGUAGES,
+        64,
+    )
+}
+
+fn kinds_spec() -> Spec {
+    Spec::chars_array(
+        "Restrict to these symbol kinds (`function`, `struct`), ignoring case; an unknown kind is refused and the known ones listed",
+        devmap_query::MAX_SCOPE_KINDS,
+        64,
+    )
+}
+
+tool_args! {
+    pub(super) struct SearchArgs {
+        repo_path: String = repo_spec(),
+        query: String = path_spec("Symbol name or prefix"),
+        budget: Option<u32> = budget_spec(),
+        paths: Option<Vec<String>> = paths_spec(),
+        path: Option<String> = path_spec("One path prefix; same as a single entry of paths"),
+        languages: Option<Vec<String>> = languages_spec(),
+        language: Option<String> = Spec::chars("One language; same as a single entry of languages", 1, 64),
+        kinds: Option<Vec<String>> = kinds_spec(),
+        kind: Option<String> = Spec::chars("One symbol kind; same as a single entry of kinds", 1, 64),
+    }
+}
+
 tool_args! {
     pub(super) struct ExploreArgs {
         repo_path: String = repo_spec(),
@@ -134,6 +173,35 @@ tool_args! {
         limit: Option<u32> = Spec::int("Maximum definitions to return (default 20)", 1, 100),
         depth: Option<usize> = depth_spec(),
         min_confidence: Option<f32> = confidence_spec(),
+        paths: Option<Vec<String>> = paths_spec(),
+        path: Option<String> = path_spec("One path prefix; same as a single entry of paths"),
+        languages: Option<Vec<String>> = languages_spec(),
+        language: Option<String> = Spec::chars("One language; same as a single entry of languages", 1, 64),
+        kinds: Option<Vec<String>> = kinds_spec(),
+        kind: Option<String> = Spec::chars("One symbol kind; same as a single entry of kinds", 1, 64),
+    }
+}
+
+/// The options both name queries run with on this surface: the caller's
+/// filters, a verified freshness verdict, and (for `explore`) the neighbourhood.
+fn name_query_options(
+    paths: Option<Vec<String>>,
+    path: Option<String>,
+    languages: Option<Vec<String>>,
+    language: Option<String>,
+    kinds: Option<Vec<String>>,
+    kind: Option<String>,
+    neighborhood: bool,
+) -> NameQueryOptions {
+    let joined = |list: Option<Vec<String>>, one: Option<String>| -> Vec<String> {
+        list.into_iter().flatten().chain(one).collect()
+    };
+    NameQueryOptions {
+        paths: joined(paths, path),
+        languages: joined(languages, language),
+        kinds: joined(kinds, kind),
+        verify_freshness: true,
+        neighborhood,
     }
 }
 
@@ -162,7 +230,8 @@ fn envelope_schema(item: Value) -> Value {
             "shown": { "type": "integer", "minimum": 0 },
             "truncated": { "type": "boolean" },
             "walk_incomplete": { "type": "string" },
-            "rungs": { "type": "object" }
+            "rungs": { "type": "object" },
+            "scope": { "type": "object" }
         },
         "required": ["source_freshness", "available", "items", "total", "shown", "truncated"]
     })
@@ -241,6 +310,9 @@ fn search_output_schema() -> Value {
             "kind": { "type": "string" },
             "span_start_line": { "type": "integer" },
             "span_end_line": { "type": "integer" },
+            "source_span": { "type": "string" },
+            "source_unavailable_reason": { "type": ["string", "null"] },
+            "source_span_omitted_bytes": { "type": ["integer", "null"] },
             "score": { "type": "number" }
         },
         "required": ["symbol_name", "file_path", "kind", "score"]
@@ -298,9 +370,21 @@ fn explore_output_schema() -> Value {
                     "symbol_name": { "type": "string" },
                     "file_path": { "type": "string" },
                     "kind": { "type": "string" },
-                    "id": { "type": "string" }
+                    "id": { "type": "string" },
+                    "span_start_line": { "type": "integer" },
+                    "span_end_line": { "type": "integer" },
+                    "source_span": { "type": "string" },
+                    "source_unavailable_reason": { "type": "string" },
+                    "source_span_omitted_bytes": { "type": "integer" },
+                    "withheld": { "type": "string" },
+                    "language": { "type": "string" },
+                    "score": { "type": "number" },
+                    "callers": envelope_schema(edge_schema()),
+                    "callees": envelope_schema(edge_schema())
                 },
-                "required": ["symbol_name", "file_path", "kind", "id"]
+                "required": [
+                    "symbol_name", "file_path", "kind", "id", "source_span", "callers", "callees"
+                ]
             })),
             "blast_radius": blast_radius_schema(),
             "limit": { "type": "integer", "minimum": 0 }
@@ -427,9 +511,11 @@ pub fn tool_definitions() -> Vec<Value> {
 
 /// `depth` and `min_confidence` as the caller sent them. A number out of range
 /// is refused by [`WalkBounds`], so neither is silently replaced by a default.
+/// A call that names no depth walks [`MCP_DEFAULT_WALK_DEPTH`], the figure
+/// `depth_spec` advertises, not the app's own deeper default.
 fn bounds(depth: Option<usize>, min_confidence: Option<f32>) -> WalkBounds {
     WalkBounds {
-        max_depth: depth,
+        max_depth: Some(depth.unwrap_or(MCP_DEFAULT_WALK_DEPTH)),
         min_confidence,
     }
 }
@@ -443,10 +529,20 @@ pub fn handle(name: &str, arguments: &Value) -> Result<Value, CommandError> {
         }
         "devmap_search" => {
             let a: SearchArgs = parse(name, arguments)?;
-            Ok(json!(crate::codeintel::search(
+            let options = name_query_options(
+                a.paths,
+                a.path,
+                a.languages,
+                a.language,
+                a.kinds,
+                a.kind,
+                false,
+            );
+            Ok(json!(crate::codeintel::search_with(
                 &a.repo_path,
                 &a.query,
-                a.budget
+                a.budget,
+                &options
             )))
         }
         "devmap_dependencies" => {
@@ -517,12 +613,22 @@ pub fn handle(name: &str, arguments: &Value) -> Result<Value, CommandError> {
         }
         "devmap_explore" => {
             let a: ExploreArgs = parse(name, arguments)?;
-            Ok(json!(crate::codeintel::explore(
+            let options = name_query_options(
+                a.paths,
+                a.path,
+                a.languages,
+                a.language,
+                a.kinds,
+                a.kind,
+                true,
+            );
+            Ok(json!(crate::codeintel::explore_with(
                 &a.repo_path,
                 &a.query,
                 a.budget,
                 a.limit,
-                bounds(a.depth, a.min_confidence)
+                bounds(a.depth, a.min_confidence),
+                &options
             )))
         }
         "devmap_affected_tests" => {
@@ -870,5 +976,280 @@ mod tests {
             assert_eq!(answer(json!(5.0)), answer(json!(5)), "{name}");
             assert_eq!(answer(json!(1.0)), answer(json!(1)), "{name}");
         }
+    }
+
+    /// `chain_4 -> chain_3 -> chain_2 -> chain_1 -> chain_0`, so the callers of
+    /// `chain_0` sit one to four hops away. Each hop is a deterministic edge.
+    fn caller_chain_repo() -> (tempfile::TempDir, String) {
+        let dir = crate::codeintel::tests::repo_with_one_generation();
+        let root = dir.path().to_string_lossy().into_owned();
+        let conn = rusqlite::Connection::open(crate::codeintel::devmap_db_path(&root))
+            .expect("open fixture db");
+        for k in 0i64..=4 {
+            let name = format!("chain_{k}");
+            let ordinal = 10 + k;
+            conn.execute(
+                "INSERT INTO generation_nodes
+                   (generation_id, ordinal, file_id, name, qualified_name, kind,
+                    span_start, span_end, is_exported)
+                 VALUES (1, ?1, 3, ?2, ?2, 'Function', 0, 20, 1)",
+                (ordinal, &name),
+            )
+            .expect("insert chain node");
+            let fts_rowid = (1i64 << 32) | ordinal;
+            conn.execute(
+                "INSERT INTO nodes_fts (rowid, name, qualified_name, path)
+                 VALUES (?1, ?2, ?2, 'src/island.rs')",
+                (fts_rowid, &name),
+            )
+            .expect("insert chain fts row");
+            conn.execute(
+                "INSERT INTO nodes_fts_map (rowid_ref, generation_id) VALUES (?1, 1)",
+                [fts_rowid],
+            )
+            .expect("insert chain fts map row");
+            if k > 0 {
+                conn.execute(
+                    "INSERT INTO edge_rows
+                       (edge_id, source_file_id, target_file_id,
+                        source_symbol, target_symbol, edge_kind, confidence,
+                        valid_from, valid_to)
+                     VALUES (?1, 3, 3, ?2, ?3, 'Calls', 0.9, 1, NULL)",
+                    (20 + k, &name, format!("chain_{}", k - 1)),
+                )
+                .expect("insert chain edge");
+            }
+        }
+        conn.close().expect("close fixture db");
+        (dir, root)
+    }
+
+    /// The schema says "default 3", and so does the standalone `devmap mcp`. A
+    /// call that names no depth has to walk that far, not the app's own cap of 10.
+    #[test]
+    fn the_default_depth_is_the_advertised_one() {
+        let (_dir, root) = caller_chain_repo();
+        for definition in tool_definitions() {
+            let depth = &definition["inputSchema"]["properties"]["depth"];
+            if depth.is_object() {
+                assert!(
+                    depth["description"].as_str().unwrap().contains(&format!(
+                        "default {}",
+                        crate::codeintel::MCP_DEFAULT_WALK_DEPTH
+                    )),
+                    "{}: {depth}",
+                    definition["name"]
+                );
+            }
+        }
+        let reached = |extra: Value| {
+            let mut args = json!({ "repo_path": root, "target": "chain_0" });
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let out = ask("devmap_impact", args);
+            (edge_symbols(&out).len(), out["walk_incomplete"].is_string())
+        };
+        assert_eq!(
+            reached(json!({})),
+            reached(json!({ "depth": 3 })),
+            "no depth must mean the advertised depth"
+        );
+        assert_eq!(reached(json!({})).0, 3, "three hops of a four-hop chain");
+        assert!(reached(json!({})).1, "the cut is disclosed");
+        assert_eq!(reached(json!({ "depth": 10 })), (4, false));
+    }
+
+    /// `explore` and `neighbors` take the same default through the same
+    /// `bounds()`; `affected_tests` does too, but refuses a fixture whose source
+    /// tree differs from the index, so it cannot be driven from this one.
+    #[test]
+    fn the_default_depth_bounds_explore_and_neighbors() {
+        let (_dir, root) = caller_chain_repo();
+        let explored = ask(
+            "devmap_explore",
+            json!({ "repo_path": root, "query": "chain_0", "budget": 20000 }),
+        );
+        let deepest = explored["blast_radius"]["layers"]["items"]
+            .as_array()
+            .expect("layers")
+            .iter()
+            .map(|l| l["depth"].as_u64().unwrap())
+            .max();
+        assert_eq!(deepest, Some(3), "{explored}");
+        let neighbors = ask(
+            "devmap_neighbors",
+            json!({ "repo_path": root, "targets": ["chain_0"], "budget": 20000 }),
+        );
+        let callers = neighbors["items"][0]["callers"]["items"]
+            .as_array()
+            .expect("callers");
+        assert_eq!(callers.len(), 3, "{neighbors}");
+    }
+
+    #[test]
+    fn explore_carries_source_callers_and_callees() {
+        let (_dir, root) = two_hop_repo();
+        let out = ask(
+            "devmap_explore",
+            json!({ "repo_path": root, "query": "probe_caller" }),
+        );
+        let definition = &out["definitions"]["items"][0];
+        assert_eq!(definition["symbol_name"], "probe_caller", "{out}");
+        assert_eq!(
+            definition["source_span"], "fn probe_caller() { probe_callee(); }\n",
+            "{definition}"
+        );
+        let callees = definition["callees"]["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("explore carries no callees: {definition}"));
+        assert_eq!(callees.len(), 1, "{definition}");
+        assert_eq!(callees[0]["target_symbol"], "probe_callee");
+        let callers = ask(
+            "devmap_explore",
+            json!({ "repo_path": root, "query": "probe_callee" }),
+        );
+        let callers = callers["definitions"]["items"][0]["callers"]["items"]
+            .as_array()
+            .expect("explore carries callers");
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0]["source_symbol"], "probe_caller");
+    }
+
+    #[test]
+    fn explore_output_schema_declares_what_it_returns() {
+        let definitions = tool_definitions();
+        let explore = definitions
+            .iter()
+            .find(|t| t["name"] == "devmap_explore")
+            .unwrap();
+        let item =
+            &explore["outputSchema"]["properties"]["definitions"]["properties"]["items"]["items"];
+        for key in ["source_span", "callers", "callees"] {
+            assert!(item["properties"][key].is_object(), "{key}: {item}");
+            assert!(
+                item["required"].as_array().unwrap().contains(&json!(key)),
+                "{key} is always present on this surface: {item}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_filters_by_kind_path_and_language() {
+        let (_dir, root) = two_hop_repo();
+        let names = |extra: Value| {
+            let mut args = json!({ "repo_path": root, "query": "probe" });
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let out = ask("devmap_search", args);
+            assert_eq!(out["available"], true, "{out}");
+            let mut names: Vec<String> = out["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["symbol_name"].as_str().unwrap().to_string())
+                .collect();
+            names.sort();
+            (names, out)
+        };
+        assert_eq!(names(json!({})).0.len(), 3, "unfiltered baseline");
+        let (by_path, out) = names(json!({ "paths": ["src/caller.rs"] }));
+        assert_eq!(by_path, ["probe_caller"], "{out}");
+        assert_eq!(out["total"], 1, "total counts only what passes: {out}");
+        assert!(out["scope"].is_object(), "the filter is echoed: {out}");
+        let (by_singular, _) = names(json!({ "path": "src/island.rs" }));
+        assert_eq!(by_singular, ["probe_island"]);
+        assert_eq!(names(json!({ "language": "rust" })).0.len(), 3);
+        assert_eq!(names(json!({ "kind": "Function" })).0.len(), 3);
+        let refused = ask(
+            "devmap_search",
+            json!({ "repo_path": root, "query": "probe", "kinds": ["no-such-kind"] }),
+        );
+        assert_eq!(refused["available"], false, "{refused}");
+        assert!(
+            refused["reason"].as_str().unwrap().contains("no-such-kind"),
+            "{refused}"
+        );
+        let missing = ask(
+            "devmap_search",
+            json!({ "repo_path": root, "query": "probe", "paths": ["nowhere/"] }),
+        );
+        assert_eq!(
+            missing["available"], false,
+            "a prefix that names nothing is refused, not answered empty: {missing}"
+        );
+    }
+
+    #[test]
+    fn explore_filters_by_path() {
+        let (_dir, root) = two_hop_repo();
+        let out = ask(
+            "devmap_explore",
+            json!({ "repo_path": root, "query": "probe", "paths": ["src/callee.rs"] }),
+        );
+        let names: Vec<&str> = out["definitions"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["symbol_name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["probe_callee"], "{out}");
+        assert!(out["definitions"]["scope"].is_object(), "{out}");
+    }
+
+    /// `source_freshness.fresh` is a verified boolean when the tree matches the
+    /// index, and the answer says why when it cannot be.
+    #[test]
+    fn search_and_explore_verify_whole_tree_freshness() {
+        let repo = crate::codeintel::tests::freshness_audit_matching_source_fixture();
+        let root = repo.path().to_string_lossy().into_owned();
+        let search = ask(
+            "devmap_search",
+            json!({ "repo_path": root, "query": "probe_caller" }),
+        );
+        assert_eq!(search["source_freshness"]["fresh"], true, "{search}");
+        let explore = ask(
+            "devmap_explore",
+            json!({ "repo_path": root, "query": "probe_caller" }),
+        );
+        let definitions = &explore["definitions"];
+        assert_eq!(definitions["source_freshness"]["fresh"], true, "{explore}");
+        let first = &definitions["items"][0];
+        assert_eq!(first["callees"]["source_freshness"]["fresh"], true);
+        assert_eq!(
+            explore["blast_radius"]["layers"]["source_freshness"]["fresh"], true,
+            "{explore}"
+        );
+
+        std::fs::write(repo.path().join("src/caller.rs"), "fn changed() {}\n").unwrap();
+        let stale = ask(
+            "devmap_search",
+            json!({ "repo_path": root, "query": "probe_caller" }),
+        );
+        assert_eq!(stale["source_freshness"]["fresh"], false, "{stale}");
+    }
+
+    #[test]
+    fn an_unrunnable_freshness_check_says_why_instead_of_passing() {
+        let repo = crate::codeintel::tests::freshness_audit_matching_source_fixture();
+        let root = repo.path().to_string_lossy().into_owned();
+        let store = devmap_store::Store::open(crate::codeintel::devmap_db_path(&root)).unwrap();
+        store
+            .enqueue_pending_paths(&["src/caller.rs".to_string()])
+            .unwrap();
+        drop(store);
+        let search = ask(
+            "devmap_search",
+            json!({ "repo_path": root, "query": "probe_caller" }),
+        );
+        assert!(search["source_freshness"]["fresh"].is_null(), "{search}");
+        assert!(
+            search["source_freshness"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("queued"),
+            "{search}"
+        );
     }
 }

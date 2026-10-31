@@ -7,8 +7,8 @@
 use crate::engine::git_cli::validate_repo;
 use crate::ipc_error::CommandError;
 use devmap_query::{
-    Cancel, Request, ResolutionAvailability, Response, Rung, RungHistogram, SourceFreshness,
-    StoreQueryEngine,
+    Cancel, NameQueryFilter, Request, ResolutionAvailability, Response, Rung, RungHistogram,
+    ScopeReport, SourceFreshness, StoreQueryEngine,
 };
 use devmap_resolve::model::ResolvedEdge;
 use devmap_store::{Store, CURRENT_SCHEMA_VERSION};
@@ -174,6 +174,10 @@ pub struct CodeintelResponse<T> {
     /// Population across the resolution ladder before any `min_rung` filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rungs: Option<CodeintelRungHistogram>,
+    /// The path, language and kind filters the answer was restricted to, with
+    /// the scoped and whole corpus sizes. Absent when nothing was narrowed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ScopeReport>,
 }
 
 impl<T> CodeintelResponse<T> {
@@ -194,6 +198,7 @@ impl<T> CodeintelResponse<T> {
             truncated: false,
             walk_incomplete: None,
             rungs: None,
+            scope: None,
         }
     }
 
@@ -208,6 +213,7 @@ impl<T> CodeintelResponse<T> {
             truncated,
             walk_incomplete: None,
             rungs: None,
+            scope: None,
         }
     }
 }
@@ -378,6 +384,7 @@ fn from_engine<S, T>(response: Response<S>, map: impl Fn(S) -> T) -> CodeintelRe
         walk_incomplete,
         rungs,
         source_freshness,
+        scope,
         ..
     } = response;
     let mut out = match resolution {
@@ -394,6 +401,7 @@ fn from_engine<S, T>(response: Response<S>, map: impl Fn(S) -> T) -> CodeintelRe
     });
     out.rungs = rungs.map(CodeintelRungHistogram::from);
     out.source_freshness = source_freshness;
+    out.scope = scope;
     out
 }
 
@@ -1065,17 +1073,100 @@ fn latest_file_count(store: &Store, gen_id: u32) -> Option<u32> {
         .and_then(|files| u32::try_from(files.len()).ok())
 }
 
+/// What the MCP `devmap_*` name queries (`search`, `explore`) ask beyond the
+/// app's plain query. `Default` is the plain query, which is what the app
+/// commands run.
+#[derive(Debug, Clone, Default)]
+pub struct NameQueryOptions {
+    /// Repository-relative path prefixes the symbols must sit under.
+    pub paths: Vec<String>,
+    /// Languages, as the index labels them.
+    pub languages: Vec<String>,
+    /// Symbol kinds, matched ignoring case.
+    pub kinds: Vec<String>,
+    /// Run the whole-tree freshness check before answering.
+    ///
+    /// Every query opens its own read-only [`Store`], and the engine stamps an
+    /// answer with the verdict that store remembers, which for a store nobody
+    /// has run `status` on is "not checked". The check walks the tree, so the
+    /// app's interactive commands leave it off; the MCP surface turns it on so
+    /// `fresh` is a verified boolean wherever the store can say.
+    pub verify_freshness: bool,
+    /// `explore` only: carry each definition's source span, callers and
+    /// callees, as the standalone `devmap mcp` tool does. The app's panel
+    /// reads the identities alone.
+    pub neighborhood: bool,
+}
+
+impl NameQueryOptions {
+    /// The engine's filter, or why it refused the paths, languages or kinds.
+    fn filter(&self) -> Result<Option<NameQueryFilter>, String> {
+        NameQueryFilter::new(&self.paths, &self.languages, &self.kinds).map_err(|e| e.to_string())
+    }
+}
+
+/// Opens the built map and, when `verify` is set, runs the whole-tree check on
+/// that store so the engine's answers carry its verdict.
+///
+/// The second value is why the check could not run, if it could not: the
+/// answer then stays `fresh: null`, and [`disclose_unrun_check`] puts this
+/// reason on it instead of the engine's generic "not checked".
+fn open_repo_map_checked(
+    repo_path: &str,
+    verify: bool,
+) -> Result<(Store, Option<String>), CommandError> {
+    let repo = resolve_repo(repo_path)?;
+    let store = open_indexed_store(&repo).map_err(CommandError::from)?;
+    let unrun = if verify {
+        match store.status(&map_path(&repo).to_string_lossy()) {
+            Err(e) => Some(format!("whole-tree freshness check failed: {e}")),
+            Ok(status) if status.source_freshness.is_none() && status.pending_count == 0 => {
+                Some(status.degraded_reason.unwrap_or_else(|| {
+                    "whole-tree freshness check produced no verdict".to_string()
+                }))
+            }
+            // A verdict, or a queue the engine already names as the reason.
+            Ok(_) => None,
+        }
+    } else {
+        None
+    };
+    Ok((store, unrun))
+}
+
+/// Replaces the engine's "not checked" on a verdict that is still `null`.
+fn disclose_unrun_check(freshness: &mut SourceFreshness, unrun: Option<&str>) {
+    if let (None, Some(why)) = (freshness.fresh, unrun) {
+        freshness.reason = Some(why.to_string());
+    }
+}
+
 /// Searches symbols using in-process code graph index.
 pub fn search(
     repo_path: &str,
     query: &str,
     token_budget: Option<u32>,
 ) -> CodeintelResponse<CodeintelSymbolHit> {
+    search_with(repo_path, query, token_budget, &NameQueryOptions::default())
+}
+
+/// [`search`] narrowed by path, language and kind, optionally with a verified
+/// freshness verdict. `total` counts only the matches that pass the filter.
+pub fn search_with(
+    repo_path: &str,
+    query: &str,
+    token_budget: Option<u32>,
+    options: &NameQueryOptions,
+) -> CodeintelResponse<CodeintelSymbolHit> {
     if let Err(e) = require_argument("query", query) {
         return CodeintelResponse::unavailable(e);
     }
-    let store = match open_repo_map(repo_path) {
-        Ok(s) => s,
+    let filter = match options.filter() {
+        Ok(filter) => filter,
+        Err(e) => return CodeintelResponse::unavailable(e),
+    };
+    let (store, unrun) = match open_repo_map_checked(repo_path, options.verify_freshness) {
+        Ok(opened) => opened,
         Err(e) => return CodeintelResponse::unavailable(e.into_message()),
     };
     let engine = StoreQueryEngine::new(&store);
@@ -1086,18 +1177,22 @@ pub fn search(
         max_depth: 10,
     };
 
-    match engine.search(req) {
-        Ok(res) => from_engine(res, |hit| CodeintelSymbolHit {
-            symbol_name: hit.symbol_name,
-            file_path: hit.file_path,
-            kind: hit.kind,
-            span_start_line: hit.span.0,
-            span_end_line: hit.span.1,
-            source_span: hit.source_span,
-            source_unavailable_reason: hit.source_unavailable_reason,
-            source_span_omitted_bytes: hit.source_span_omitted_bytes,
-            score: hit.score,
-        }),
+    match engine.search_filtered(req, filter.as_ref()) {
+        Ok(res) => {
+            let mut out = from_engine(res, |hit| CodeintelSymbolHit {
+                symbol_name: hit.symbol_name,
+                file_path: hit.file_path,
+                kind: hit.kind,
+                span_start_line: hit.span.0,
+                span_end_line: hit.span.1,
+                source_span: hit.source_span,
+                source_unavailable_reason: hit.source_unavailable_reason,
+                source_span_omitted_bytes: hit.source_span_omitted_bytes,
+                score: hit.score,
+            });
+            disclose_unrun_check(&mut out.source_freshness, unrun.as_deref());
+            out
+        }
         Err(e) => CodeintelResponse::unavailable(format!("Search failed: {e}")),
     }
 }
@@ -1478,6 +1573,12 @@ pub const MAX_WALK_DEPTH: usize = 64;
 
 /// Walk depth used when the caller names none (the engine's long-standing cap).
 const DEFAULT_WALK_DEPTH: usize = 10;
+
+/// Walk depth the MCP `devmap_*` tools use when the caller names none: what
+/// their schema advertises and what the standalone `devmap mcp` server and the
+/// CLI walk. The app commands keep [`DEFAULT_WALK_DEPTH`]; the MCP surface
+/// resolves its own default before it builds a [`WalkBounds`].
+pub const MCP_DEFAULT_WALK_DEPTH: usize = 3;
 
 /// How far and how confidently a graph walk may reach.
 ///
@@ -2410,6 +2511,34 @@ pub struct CodeintelExploreDefinition {
     pub file_path: String,
     pub kind: String,
     pub id: String,
+    /// The definition's source and one-hop neighbourhood. Absent from the
+    /// app's own `explore`; present when [`NameQueryOptions::neighborhood`]
+    /// asked for it.
+    #[serde(default, flatten)]
+    pub neighborhood: Option<CodeintelExploreNeighborhood>,
+}
+
+/// What `devmap explore` returns for a definition beyond its identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeintelExploreNeighborhood {
+    pub span_start_line: u32,
+    pub span_end_line: u32,
+    /// The symbol's source, empty when it could not be read (see
+    /// `source_unavailable_reason`) or was withheld (see `withheld`).
+    pub source_span: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_unavailable_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_span_omitted_bytes: Option<u32>,
+    /// `"secret_path"` when the location is reported and the text is not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<String>,
+    /// Language the generation recorded for the file; absent when it holds no row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    pub score: f32,
+    pub callers: CodeintelResponse<CodeintelEdge>,
+    pub callees: CodeintelResponse<CodeintelEdge>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2429,22 +2558,50 @@ pub fn explore(
     limit: Option<u32>,
     bounds: WalkBounds,
 ) -> CodeintelExplore {
+    explore_with(
+        repo_path,
+        query,
+        token_budget,
+        limit,
+        bounds,
+        &NameQueryOptions::default(),
+    )
+}
+
+/// An `explore` that could not run: nothing was examined, and the reason says
+/// why. The one shape for every refusal before the engine answers.
+fn explore_unavailable(query: &str, reason: String) -> CodeintelExplore {
+    CodeintelExplore {
+        available: false,
+        reason: Some(reason.clone()),
+        definitions: CodeintelResponse::unavailable(reason.clone()),
+        blast_radius: CodeintelBlastRadius {
+            seeds: Vec::new(),
+            unmatched_targets: vec![query.to_string()],
+            layers: CodeintelResponse::unavailable(reason),
+            total_impacted: 0,
+        },
+        limit: 0,
+    }
+}
+
+/// [`explore`] narrowed by path, language and kind, optionally carrying each
+/// definition's source and callers/callees and a verified freshness verdict.
+pub fn explore_with(
+    repo_path: &str,
+    query: &str,
+    token_budget: Option<u32>,
+    limit: Option<u32>,
+    bounds: WalkBounds,
+    options: &NameQueryOptions,
+) -> CodeintelExplore {
+    let filter = match options.filter() {
+        Ok(filter) => filter,
+        Err(e) => return explore_unavailable(query, e),
+    };
     let (min_confidence, max_depth) = match bounds.resolve() {
         Ok(b) => b,
-        Err(e) => {
-            return CodeintelExplore {
-                available: false,
-                reason: Some(e.clone()),
-                definitions: CodeintelResponse::unavailable(e.clone()),
-                blast_radius: CodeintelBlastRadius {
-                    seeds: Vec::new(),
-                    unmatched_targets: vec![query.to_string()],
-                    layers: CodeintelResponse::unavailable(e),
-                    total_impacted: 0,
-                },
-                limit: 0,
-            }
-        }
+        Err(e) => return explore_unavailable(query, e),
     };
     if let Err(e) = require_argument("query", query) {
         return CodeintelExplore {
@@ -2460,38 +2617,59 @@ pub fn explore(
             limit: 0,
         };
     }
-    let store = match open_repo_map(repo_path) {
-        Ok(s) => s,
-        Err(e) => {
-            return CodeintelExplore {
-                available: false,
-                reason: Some(e.message().to_string()),
-                definitions: CodeintelResponse::unavailable(e.message().to_string()),
-                blast_radius: CodeintelBlastRadius {
-                    seeds: Vec::new(),
-                    unmatched_targets: vec![query.to_string()],
-                    layers: CodeintelResponse::unavailable(e.into_message()),
-                    total_impacted: 0,
-                },
-                limit: 0,
-            }
-        }
+    let (store, unrun) = match open_repo_map_checked(repo_path, options.verify_freshness) {
+        Ok(opened) => opened,
+        Err(e) => return explore_unavailable(query, e.into_message()),
     };
     let engine = StoreQueryEngine::new(&store);
     let budget = token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET);
     let limit = limit.unwrap_or(20) as usize;
-    match engine.explore(query, limit, budget, min_confidence, max_depth) {
+    match engine.explore_filtered(
+        query,
+        limit,
+        budget,
+        min_confidence,
+        max_depth,
+        filter.as_ref(),
+    ) {
         Ok(report) => {
-            let definitions = from_engine(report.definitions, |d| CodeintelExploreDefinition {
-                symbol_name: d.symbol_name,
-                file_path: d.file_path,
-                kind: d.kind,
-                id: d.id,
+            let unrun = unrun.as_deref();
+            let neighborhood = options.neighborhood;
+            let mut definitions = from_engine(report.definitions, |d| {
+                let neighborhood = neighborhood.then(|| {
+                    let mut callers = from_engine(d.callers, map_edge);
+                    let mut callees = from_engine(d.callees, map_edge);
+                    disclose_unrun_check(&mut callers.source_freshness, unrun);
+                    disclose_unrun_check(&mut callees.source_freshness, unrun);
+                    CodeintelExploreNeighborhood {
+                        span_start_line: d.span.0,
+                        span_end_line: d.span.1,
+                        source_span: d.source,
+                        source_unavailable_reason: d.source_unavailable_reason,
+                        source_span_omitted_bytes: d.source_omitted_bytes,
+                        withheld: d.withheld,
+                        language: d.language,
+                        score: d.score,
+                        callers,
+                        callees,
+                    }
+                });
+                CodeintelExploreDefinition {
+                    symbol_name: d.symbol_name,
+                    file_path: d.file_path,
+                    kind: d.kind,
+                    id: d.id,
+                    neighborhood,
+                }
             });
+            definitions.scope = report.scope;
+            disclose_unrun_check(&mut definitions.source_freshness, unrun);
+            let mut blast_radius = map_blast_radius(report.blast_radius);
+            disclose_unrun_check(&mut blast_radius.layers.source_freshness, unrun);
             CodeintelExplore {
                 available: definitions.available,
                 reason: definitions.reason.clone(),
-                blast_radius: map_blast_radius(report.blast_radius),
+                blast_radius,
                 definitions,
                 limit: report.limit,
             }
@@ -4012,7 +4190,7 @@ pub(crate) mod tests {
         );
     }
 
-    fn freshness_audit_matching_source_fixture() -> tempfile::TempDir {
+    pub(crate) fn freshness_audit_matching_source_fixture() -> tempfile::TempDir {
         let repo = repo_with_one_generation();
         let conn = rusqlite::Connection::open(map_path(repo.path())).unwrap();
         conn.execute("DELETE FROM file_rows WHERE file_id <> 1", [])
