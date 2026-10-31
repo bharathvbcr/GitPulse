@@ -27,6 +27,7 @@ const root = "/fixture/GitPulse";
 let listing = ["README.md", "docs/guide.md", "src/app.ts", "src/lib/a.ts", "src/lib/b.ts"];
 const unexpected = [], deletes = [], indexCalls = [], discards = [], writes = [], moves = [];
 let moveFails = false;
+let listFails = false;
 // A command parked here answers only when `release` is called, so a check can
 // look at the store while the host is still working.
 const parked = {};
@@ -46,7 +47,7 @@ const guarded = { policy: null, output: null };
 mockIPCWithEvents((cmd, args) => {
   switch (cmd) {
     case "cmd_resolve_repo": return { path: args.repoPath, name: "GitPulse", is_bare: false };
-    case "cmd_list_repo_files": return listing;
+    case "cmd_list_repo_files": if (listFails) throw new Error("listing refused by fixture"); if (holding.has(cmd)) return park(cmd).then(() => listing); return listing;
     case "cmd_get_status": return statuses;
     case "cmd_stage_file": case "cmd_unstage_file": indexCalls.push({ cmd, ...args }); return guarded;
     case "cmd_discard_changes": discards.push(args); return guarded;
@@ -390,6 +391,34 @@ const press = async (target, key, init = {}) => { target.dispatchEvent(new Keybo
   check("and its count is a floor, not a total", () => counter().textContent.trim().startsWith("≥") && /^At least \d+ of \d+ files match/.test(counter().title));
   await typed("");
   check("a complete filter has neither the caption nor the floor", () => !/Filter stopped at its time budget/.test(host.textContent) && !counter().textContent.includes("≥"));
+
+  // --- a re-list refreshes in place and a failed one keeps the rows ------------
+  const skeleton = () => host.querySelector('[aria-label="Loading content"]');
+  const staleBanner = () => host.querySelector('[data-testid="file-tree-stale"]');
+  const rowsBefore = items().length;
+  holding.add("cmd_list_repo_files");
+  const slowName = "slow-arrival.ts";
+  listing = [...listing, slowName];
+  statuses = [...statuses, status(slowName, "M")];
+  await repoStore.refresh(root);
+  await wait(150);
+  check("a re-list in flight leaves the tree up, not a skeleton", () => skeleton() === null && Boolean(tree()) && items().length > 0);
+  holding.delete("cmd_list_repo_files"); release("cmd_list_repo_files");
+  await wait(200);
+  await reveal(slowName);
+  await until(() => rowFor(slowName), "the row from the finished re-list");
+
+  listFails = true;
+  statuses = [...statuses, status("after-failure.ts", "??")];
+  await repoStore.refresh(root);
+  await until(staleBanner, "the stale-listing banner");
+  check("a failed re-list keeps the last rows on screen", () => items().length >= rowsBefore && Boolean(rowFor("README.md")));
+  check("and a banner says they are the last successful listing", () => staleBanner().getAttribute("role") === "status" && staleBanner().textContent.includes("Could not refresh the file list. Showing the last successful listing."));
+  check("with the reason as a second line", () => staleBanner().textContent.includes("listing refused by fixture"));
+  listFails = false;
+  [...staleBanner().querySelectorAll("button")].find(el => el.textContent.trim() === "Retry").click();
+  await until(() => staleBanner() === null, "the banner goes after a good retry");
+  check("Retry re-lists and clears the banner", () => staleBanner() === null && Boolean(rowFor("README.md")));
 
   check("No unexpected commands", () => unexpected.length === 0);
   check("No unhandled runtime errors", () => errors.length === 0);
