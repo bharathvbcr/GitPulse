@@ -32,6 +32,31 @@ describe("Settings panels load once (SO-1)", () => {
   });
 });
 
+describe("Setup wizard surfaces failures (SO-2)", () => {
+  const wizard = read("onboarding/SetupWizard.svelte");
+
+  it("renders a failed read with Retry in both the Check and Install steps", () => {
+    expect(wizard).toContain("retryWizardLoad($wizard.tool)");
+    expect(wizard.match(/@render readFailure\(\)/g)).toHaveLength(2);
+  });
+
+  it("disables Install while any tool is installing, and Verify while it runs", () => {
+    expect(wizard).toContain("disabled={$installing !== null ||");
+    expect(wizard).toContain("disabled={$verifying}");
+  });
+
+  it("closes through finishSetup, which keeps the wizard open on failure", () => {
+    expect(wizard).toContain("void finishSetup()");
+    expect(wizard).not.toContain("markOnboardingComplete");
+    expect(wizard).toContain("$actionError");
+  });
+
+  it("only says 'complete' for a passing verify", () => {
+    expect(wizard).toContain('outcome === "passed"');
+    expect(wizard).toContain("verify did not pass");
+  });
+});
+
 describe("No native window.confirm in Settings panels (SO-12)", () => {
   // window.confirm answers null under WKWebView, so `!window.confirm(...)`
   // read as a refusal and the button silently did nothing.

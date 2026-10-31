@@ -37,6 +37,7 @@ describe("SetupWizard dialog accessibility", () => {
   });
 
   it("cannot Install before the selected tool's ladder has loaded", () => {
-    expect(source).toContain("disabled={!$ladder ||");
+    // Still gated on the ladder; SO-2 added "while any tool is installing" in front.
+    expect(source).toMatch(/disabled=\{\$installing !== null \|\|\s+!\$ladder \|\|/);
   });
 });

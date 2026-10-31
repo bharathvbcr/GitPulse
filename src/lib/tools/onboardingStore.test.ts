@@ -3,14 +3,18 @@ import { get } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import {
   cancelInstall,
+  cloneSource,
   closeSetupWizard,
   dismissFirstRun,
+  finishSetup,
   markOnboardingComplete,
   onboardingStore,
   openSetupWizard,
   refreshToolsStatus,
+  retryWizardLoad,
   runInstall,
   runVerify,
+  setupOutcome,
   setWizardStep,
   setWizardTool,
   setWizardPreset,
@@ -30,6 +34,119 @@ vi.mock("@tauri-apps/api/event", () => ({
 beforeEach(() => {
   vi.mocked(invoke).mockReset();
   closeSetupWizard();
+});
+
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+describe("failed reads and actions are shown, not swallowed (SO-2)", () => {
+  beforeEach(() => {
+    onboardingStore.config.set(null);
+    onboardingStore.verify.set(null);
+    onboardingStore.loadError.set(null);
+    onboardingStore.actionError.set(null);
+    onboardingStore.verifying.set(false);
+  });
+
+  it("a rejected ladder read sets loadError and leaves ladder and preflight empty", async () => {
+    vi.mocked(invoke).mockRejectedValue("worker down");
+    setWizardTool("devmap");
+    await flush();
+    expect(get(onboardingStore.loadError)).toContain("worker down");
+    expect(get(onboardingStore.ladder)).toBeNull();
+    expect(get(onboardingStore.preflight)).toBeNull();
+  });
+
+  it("retryWizardLoad clears the error and reloads when the read now works", async () => {
+    vi.mocked(invoke).mockRejectedValue("worker down");
+    setWizardTool("devmap");
+    await flush();
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "cmd_tool_ladder") return { tool: "devmap", selected: null, rungs: [], ok: true, requirements: [], estimate: "s" };
+      if (cmd === "cmd_tool_preflight") return { tool: "devmap", ok: true, requirements: [], estimate: "s" };
+      return {};
+    });
+    retryWizardLoad("devmap");
+    await flush();
+    expect(get(onboardingStore.loadError)).toBeNull();
+    expect(get(onboardingStore.ladder)).not.toBeNull();
+    expect(get(onboardingStore.preflight)).not.toBeNull();
+  });
+
+  it("a verify that rejects sets actionError and returns verifying to false", async () => {
+    vi.mocked(invoke).mockRejectedValue(new Error("no doctor"));
+    await runVerify("devmap");
+    expect(get(onboardingStore.actionError)).toContain("no doctor");
+    expect(get(onboardingStore.verifying)).toBe(false);
+    expect(get(onboardingStore.verify)).toBeNull();
+  });
+
+  it("verifying is true while the call is out, and a second press does not stack a run", async () => {
+    let release!: (value: unknown) => void;
+    vi.mocked(invoke).mockReturnValue(new Promise((resolve) => (release = resolve)) as never);
+    const first = runVerify("devmap");
+    expect(get(onboardingStore.verifying)).toBe(true);
+    await runVerify("devmap");
+    expect(invoke).toHaveBeenCalledTimes(1);
+    release({ tool: "devmap", ok: true, binary: null, detail: "ok" });
+    await first;
+    expect(get(onboardingStore.verifying)).toBe(false);
+    expect(get(onboardingStore.verify)?.ok).toBe(true);
+  });
+
+  it("cancelInstall reports a rejection", async () => {
+    vi.mocked(invoke).mockRejectedValue(new Error("not running"));
+    await cancelInstall();
+    expect(get(onboardingStore.actionError)).toContain("not running");
+  });
+
+  it("markOnboardingComplete rejects when the configuration cannot be loaded", async () => {
+    vi.mocked(invoke).mockRejectedValue(new Error("config unreadable"));
+    await expect(markOnboardingComplete()).rejects.toThrow(
+      "Tool configuration is not loaded yet, so setup completion could not be recorded.",
+    );
+  });
+
+  it("finishSetup stays open and says why when completion cannot be recorded", async () => {
+    vi.mocked(invoke).mockRejectedValue(new Error("config unreadable"));
+    openSetupWizard("devmap");
+    await flush();
+    onboardingStore.actionError.set(null);
+    await expect(finishSetup()).resolves.toBe(false);
+    expect(get(onboardingStore.wizard).open).toBe(true);
+    expect(get(onboardingStore.actionError)).toContain("could not be recorded");
+  });
+
+  it("finishSetup closes the wizard once completion is recorded", async () => {
+    const view = {
+      config: { version: 1, devmap: {}, manvi: {}, onboarding: { skipped_tools: [], dismissed: false } },
+      path: "/tmp/tools.json",
+      stale: [],
+    };
+    onboardingStore.config.set(view as never);
+    vi.mocked(invoke).mockResolvedValue(view);
+    openSetupWizard("devmap");
+    await flush();
+    await expect(finishSetup()).resolves.toBe(true);
+    expect(get(onboardingStore.wizard).open).toBe(false);
+    expect(get(onboardingStore.actionError)).toBeNull();
+  });
+
+  it("cloneSource answers a line for a rejection instead of leaving Cloning… up", async () => {
+    vi.mocked(invoke).mockRejectedValue(new Error("no git"));
+    await expect(cloneSource("devmap", "/tmp")).resolves.toBe("Clone failed: no git");
+    vi.mocked(invoke).mockResolvedValue({ tool: "devmap", ok: true, path: "/tmp/devmap", reason: null });
+    await expect(cloneSource("devmap", "/tmp")).resolves.toBe("Cloned to /tmp/devmap");
+    vi.mocked(invoke).mockResolvedValue({ tool: "devmap", ok: false, path: null, reason: null });
+    await expect(cloneSource("devmap", "/tmp")).resolves.toBe("Clone failed");
+  });
+
+  it("the last step only claims completion for a passing verify of this tool", () => {
+    const report = (tool: "devmap" | "manvi", ok: boolean) => ({ tool, ok, binary: null, detail: "" }) as never;
+    expect(setupOutcome(null, "devmap")).toBe("skipped");
+    expect(setupOutcome(report("manvi", true), "devmap")).toBe("skipped");
+    expect(setupOutcome(report("devmap", false), "devmap")).toBe("failed");
+    expect(setupOutcome(report("devmap", true), "devmap")).toBe("passed");
+  });
 });
 
 describe("onboardingStore", () => {
