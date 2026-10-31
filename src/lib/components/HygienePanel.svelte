@@ -9,6 +9,8 @@
   import { copyText } from "../desktop/clipboard";
   import { harnessStore, type Guarded } from "../stores/harnessStore";
   import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
+  import { reportPanelError } from "../diagnostics/report";
+  import { formatError } from "../ui/formatError";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { readBackgroundDocument } from "../runtime/foreground";
 
@@ -57,7 +59,7 @@
       // one review per week, not one per week per repository.
       defaults = { ...defaults, lastSharedReview: Date.now() };
       persistDefaults();
-    } catch (e) { if (alive && mine === epoch) { error = String(e); retryAfter = Date.now() + 60 * 60 * 1000; } }
+    } catch (e) { if (alive && mine === epoch) { error = reportPanelError("hygiene", e); retryAfter = Date.now() + 60 * 60 * 1000; } }
     finally { if (alive && mine === epoch) scanning = false; }
   }
 
@@ -67,7 +69,7 @@
     try {
       await invoke<void>("cmd_hygiene_cancel", { repoPath: current.repo_path, planId: current.id });
       if (alive) { if (!executing) { plan = null; pending = null; } else notice = "Cancellation requested. Entries already removed cannot be restored."; }
-    } catch (e) { if (alive) error = String(e); }
+    } catch (e) { if (alive) error = reportPanelError("hygiene", e); }
   }
 
   async function preview(target: string) {
@@ -86,7 +88,7 @@
       plan = next;
       pending = next;
       clock = Date.now();
-    } catch (e) { if (alive && mine === epoch) error = String(e); }
+    } catch (e) { if (alive && mine === epoch) error = reportPanelError("hygiene", e); }
     finally { if (alive && mine === epoch) busy = false; }
   }
 
@@ -104,7 +106,7 @@
       pending = null;
       await onchanged();
       if (current.scope === "shared") inventory = null;
-    } catch (e) { if (alive) { error = String(e); plan = null; pending = null; } }
+    } catch (e) { if (alive) { error = reportPanelError("hygiene", e); plan = null; pending = null; } }
     finally { if (alive) executing = false; }
   }
 
@@ -115,7 +117,7 @@
       if (!await copyText(rule + "\n")) { error = "Clipboard is unavailable. Add this reviewed rule manually: " + rule; return; }
       notice = `Copied ${rule} — review it in the repository's .gitignore. Tracked files remain tracked.`;
     }
-    catch (e) { error = String(e); }
+    catch (e) { error = formatError(e); }
   }
 
   onMount(() => {
@@ -132,7 +134,7 @@
       alive = false;
       epoch++;
       stopTimer();
-      if (pending) void invoke<void>("cmd_hygiene_cancel", { repoPath: pending.repo_path, planId: pending.id }).catch(e => console.warn("Could not cancel hygiene preview", String(e)));
+      if (pending) void invoke<void>("cmd_hygiene_cancel", { repoPath: pending.repo_path, planId: pending.id }).catch(e => console.warn("Could not cancel hygiene preview", formatError(e)));
     };
   });
 </script>
