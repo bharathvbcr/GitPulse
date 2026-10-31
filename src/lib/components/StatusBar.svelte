@@ -59,6 +59,7 @@
    * branch name look current.
    */
   let watchState = $derived($repoStore.watch);
+  let statusUnavailableSince = $derived($repoStore.statusUnavailableSince ?? null);
 
   /**
    * Host memory pressure, said only when it matters: pressure up, the
@@ -132,6 +133,21 @@
       >
         <RadioTower size={11} class="shrink-0" />
         <span>{watchLabel}</span>
+      </span>
+    {/if}
+
+    <!-- The status poll has stopped answering, so the file list and counts
+         below are the last ones read, not current ones. Absent while it answers. -->
+    {#if statusUnavailableSince !== null}
+      <span
+        class="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded border border-amber-500/50 bg-amber-500/10 px-1.5 py-0.2 font-medium text-amber-600 dark:text-amber-400"
+        title="git status has not answered since {statusUnavailableSince
+          ? new Date(statusUnavailableSince).toLocaleTimeString()
+          : ''}; the file list and counts may be out of date. The Diagnostics log has the error."
+        data-testid="status-unavailable"
+      >
+        <AlertTriangle size={11} class="shrink-0" />
+        <span>Status unavailable</span>
       </span>
     {/if}
 
