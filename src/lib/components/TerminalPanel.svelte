@@ -141,6 +141,12 @@
   let consoleFollowing = $state(true);
   let discardedExecutions = $state(0);
   let validationError = $state<string | null>(null);
+  /**
+   * A session-level failure (Go to, Task link, Close). Kept apart from the
+   * Console input's `validationError` and rendered panel-level, because those
+   * actions run in Shell mode, where the Console's input bar is not on screen.
+   */
+  let sessionError = $state<string | null>(null);
   let copiedId = $state<string | null>(null);
 
   let inputEl = $state<HTMLInputElement | null>(null);
@@ -466,19 +472,19 @@
     try {
       await openTaskForRun(runId);
     } catch (cause) {
-      validationError = `That session's task could not be opened: ${formatError(cause)}`;
+      sessionError = `That session's task could not be opened: ${formatError(cause)}`;
     }
   }
 
   async function goToSession(session: TerminalSessionRecord) {
     sessionListOpen = false;
     if (!onGoToSession) {
-      validationError = "Jumping between sessions is unavailable in this window.";
+      sessionError = "Jumping between sessions is unavailable in this window.";
       return;
     }
     const outcome = await onGoToSession(session);
     if (!outcome.ok) {
-      validationError = outcome.reason === "unavailable"
+      sessionError = outcome.reason === "unavailable"
         ? "That session could not be shown. It may have just exited; the Sessions list refreshes when it does."
         : "That session is no longer running.";
     }
@@ -513,7 +519,7 @@
     try {
       await closeWithConfirmation(session);
     } catch (error: unknown) {
-      validationError = formatError(error);
+      sessionError = formatError(error);
     }
   }
 
@@ -540,7 +546,7 @@
       try {
         await sessions[id]?.close();
       } catch (error: unknown) {
-        validationError = formatError(error);
+        sessionError = formatError(error);
         return;
       }
       if (tabState.tabs.some((candidate) => candidate.id === id)) dropTab(id);
@@ -1037,6 +1043,13 @@
       {:else}
         {waitingForCapacity.title} is waiting to open here: all {$terminalSessionLimit} terminal sessions are in use. Close one in Sessions, or raise the limit in Settings → Agents, and it opens.
       {/if}
+    </div>
+  {/if}
+  {#if sessionError}
+    <div class="px-3 py-1.5 border-b border-rose-500/30 bg-rose-500/10 text-rose-300 text-[11px] flex items-start gap-1.5" role="alert" data-testid="terminal-session-error">
+      <AlertCircle size={13} class="shrink-0 mt-0.5" />
+      <span class="flex-1" style="overflow-wrap:anywhere">{sessionError}</span>
+      <button type="button" class="text-xs hover:text-white" aria-label="Dismiss" onclick={() => (sessionError = null)}>✕</button>
     </div>
   {/if}
   {#if shortcutsOpen}

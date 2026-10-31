@@ -199,3 +199,30 @@ describe("TerminalPanel agent-session record", () => {
     expect(source).toMatch(/import \{[^}]*\bisPromptLauncher\b[^}]*\} from "\.\.\/terminal\/launchRequests"/);
   });
 });
+
+describe("TerminalPanel session failures are visible in Shell mode", () => {
+  function body(name: string): string {
+    const start = source.indexOf(`async function ${name}(`);
+    expect(start).toBeGreaterThan(-1);
+    const next = source.indexOf("\n  }\n", start);
+    return source.slice(start, next);
+  }
+
+  it("renders the session error panel-level, ahead of the Console block", () => {
+    // The old field was only drawn inside `{#if mode === "console"}`, so a
+    // failed Go to / Close in Shell mode showed nothing at all.
+    const strip = source.indexOf('data-testid="terminal-session-error"');
+    expect(strip).toBeGreaterThan(-1);
+    expect(strip).toBeLessThan(source.indexOf('{#if mode === "console"}'));
+    expect(source).toContain('role="alert"');
+    expect(source).toContain('aria-label="Dismiss"');
+  });
+
+  it("writes session failures to sessionError, never to the Console's validationError", () => {
+    for (const name of ["openListedTask", "goToSession", "closeListed", "requestClose"]) {
+      const text = body(name);
+      expect(text, name).toContain("sessionError =");
+      expect(text, name).not.toContain("validationError =");
+    }
+  });
+});
