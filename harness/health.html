@@ -196,6 +196,8 @@
       const { interfaceStore } = await import("../src/lib/stores/interfaceStore");
       const { createChecks, CheckFailed } = await import("./checks.ts");
       const { HEALTH_SECTIONS } = await import("../src/lib/health/sections.ts");
+      const { get } = await import("svelte/store");
+      const { diagnostics } = await import("../src/lib/diagnostics/diagnostics.ts");
       const HealthPanel = (await import("../src/lib/components/HealthPanel.svelte")).default;
 
       interfaceStore.setAutoScanGithubAlerts(true);
@@ -551,6 +553,28 @@
             has(root, "Fixture health scan failed"));
           check("a failed local scan still shows fetched GitHub alerts", () =>
             !!section("dependabot"));
+          // The failure arrived after a successful scan of this same repository:
+          // the old report stays, labelled, instead of being swapped for a bare line.
+          const failureAlert = () => root.querySelector('[role="alert"]');
+          check("a failed rescan keeps the previous report on screen", () =>
+            !!section("summary"));
+          check("the failure banner is an alert that says the report is from the previous scan", () =>
+            !!failureAlert()
+              && has(failureAlert(), "Scan failed: Fixture health scan failed")
+              && has(failureAlert(), "Showing results from the previous scan"));
+          check("the failure banner offers Try again and Open Diagnostics", () =>
+            [...failureAlert().querySelectorAll("button")].map(b => b.textContent.trim()).join("|")
+              === "Try again|Open Diagnostics");
+          check("a failed scan is recorded in Diagnostics under health", () =>
+            get(diagnostics).some(entry => entry.source === "health" && entry.message.includes("Fixture health scan failed")));
+          // A repository with no earlier report has nothing to keep, and must not
+          // be shown another repository's findings.
+          await repoStore.openRepo("/fixture/Fresh");
+          await until(() => !!failureAlert() && has(failureAlert(), "Scan failed"));
+          check("a failed first scan shows no report and does not claim a previous one", () =>
+            !section("summary") && !has(failureAlert(), "previous scan"));
+          await repoStore.openRepo("/fixture/GitPulse");
+          await until(() => !!section("summary"));
           await rescan("findings");
           check("a rescan recovers from a failed scan", () =>
             !has(root, "Fixture health scan failed") && !!section("summary"));
