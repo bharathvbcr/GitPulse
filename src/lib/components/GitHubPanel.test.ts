@@ -39,6 +39,37 @@ describe("GitHubPanel", () => {
   });
 });
 
+describe("GitHubPanel confirmation and refresh contracts", () => {
+  // Rendered behaviour (the notice outliving the row, the failed refresh keeping
+  // the listings) is checked in harness/github-panel.html; effects do not run
+  // here. These pin the structure that makes it true.
+  it("sets an action's confirmation after the reload that clears it, from both callers", () => {
+    expect(source).toContain("async function reloadThenNotice(message: string)");
+    const body = source.slice(source.indexOf("async function reloadThenNotice"));
+    expect(body.indexOf("await loadAll()")).toBeLessThan(body.indexOf("actionNotice = message"));
+    expect(source).toContain("onChanged={(message) => void reloadThenNotice(message)}");
+    expect(source).toContain("void reloadThenNotice(message); }}");
+    // The old shape: the notice set first, then wiped by loadAll's own reset.
+    expect(source).not.toMatch(/actionNotice = message;\s*void loadAll\(\)/);
+  });
+
+  it("hands the confirmation up instead of keeping a copy on the row that may unmount", () => {
+    const row = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "github", "PullRequestDetail.svelte"), "utf8");
+    expect(row).toContain("onChanged: (message: string) => void;");
+    expect(row).not.toContain("let notice");
+    expect(row).toContain(">Retry</button>");
+  });
+
+  it("keeps the last good context when a refresh fails, and disables Refresh while one is out", () => {
+    expect(source).toContain("if (ctx && !ctx.error) reportRefreshFailure(formatError(err));");
+    expect(source).toContain("if (next.error && ctx && !ctx.error) {");
+    expect(source).toContain("disabled={loading || workflowsLoading}");
+    // The stamp is only moved by a read that landed.
+    const failure = source.slice(source.indexOf("function reportRefreshFailure"), source.indexOf("async function loadWorkflowsFor"));
+    expect(failure).not.toContain("fetchedAt");
+  });
+});
+
 describe("GitHubPanel live-poll lifecycle contracts", () => {
   it("drops a poll whose repository is no longer the open one", () => {
     // A resolve can land after the path moved; applying it would show one

@@ -398,6 +398,14 @@
     try {
       const next = await invoke<GitHubContext>("cmd_github_context", { repoPath: repo });
       if (!guard.isLive()) return;
+      // gh reports a rate limit or an outage as a context carrying `error`. On
+      // a panel already showing a good read, that is a failed refresh, not the
+      // new truth: the listings stay, the failure is said, and the stamp keeps
+      // describing what is on screen. An error never overwrites the cache.
+      if (next.error && ctx && !ctx.error) {
+        reportRefreshFailure(next.error);
+        return;
+      }
       ctx = next;
       // The full context is the newer read, so the poll's older snapshot must
       // stop superseding it. Without this, a Refresh after a paused poll shows
@@ -414,10 +422,16 @@
       ctxCache.set(repo, next);
     } catch (err) {
       if (!guard.isLive()) return;
-      ctx = emptyContext(formatError(err));
+      if (ctx && !ctx.error) reportRefreshFailure(formatError(err));
+      else ctx = emptyContext(formatError(err));
     } finally {
       if (guard.isLive()) loading = false;
     }
+  }
+
+  /** A failed refresh over data already on screen: keep the data, say what failed and how old it is. */
+  function reportRefreshFailure(message: string) {
+    actionError = `Refresh failed: ${message} — showing ${fetchedAgo ? `data fetched ${fetchedAgo}` : "the last data read"}`;
   }
 
   async function loadWorkflowsFor(repo: string) {
@@ -451,6 +465,34 @@
     actionError = null;
     await Promise.all([loadFor(repo), loadWorkflowsFor(repo)]);
   }
+
+  /**
+   * Reloads, then confirms what an action did.
+   *
+   * `loadAll` clears the notice before its first await, so a notice set before
+   * it is wiped; and the row that triggered the action may leave the list with
+   * the reload (a merged pull request does), taking any confirmation kept on
+   * the row with it. The confirmation is therefore the panel's, and set last.
+   * A repository switched to mid-reload is not the one the action was on.
+   */
+  async function reloadThenNotice(message: string) {
+    const repo = $repoStore.currentPath;
+    await loadAll();
+    if ($repoStore.currentPath !== repo) return;
+    actionNotice = message;
+  }
+
+  // A pull request that has left the list (merged, closed, no longer fetched)
+  // must not leave its detail open for the next one to inherit the number.
+  // Judged against the fetched list, not the filtered one: narrowing the list
+  // hides a row without forgetting which detail the reader had open.
+  $effect(() => {
+    const open = ctx?.pull_requests;
+    if (!open) return;
+    untrack(() => {
+      if (expandedPr !== null && !open.some((p) => p.number === expandedPr)) expandedPr = null;
+    });
+  });
 
   $effect(() => {
     return () => {
@@ -778,9 +820,14 @@
           {ciRunning ? "Running…" : "Run CI locally"}
         </span>
       </button>
-      <button type="button" onclick={loadAll} class="gp-btn">
+      <!-- Busy whenever a read is out, not only on the first one: a refresh over
+           data already on screen shows nothing else changing, so without this the
+           click looks like it did nothing. Disabled too, so a second click does
+           not start a read the first is still making. It re-enables when the read
+           settles, failed or not — it is also the retry for the error card. -->
+      <button type="button" onclick={loadAll} class="gp-btn" disabled={loading || workflowsLoading}>
         <span class="inline-flex items-center gap-1.5">
-          {#if (loading && !ctx) || (workflowsLoading && !workflows)}
+          {#if loading || workflowsLoading}
             <LoaderCircle size={13} class="animate-spin" />
           {/if}
           Refresh
@@ -905,7 +952,10 @@
           ? 'border-red-500/30 bg-red-500/10 text-red-300'
           : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'}"
       >
-        {actionError ?? actionNotice}
+        <!-- Both when both are true: a merge that went through and a reload that
+             then failed are two facts, and the error must not hide the first. -->
+        {#if actionError && actionNotice}<div>{actionNotice}</div>{/if}
+        <div>{actionError ?? actionNotice}</div>
       </div>
     {/if}
     {#if (ctx.warnings?.length ?? 0) > 0}
@@ -947,7 +997,7 @@
               slug="{ctx.owner}/{ctx.repo}"
               headBranch={currentBranch}
               defaultBase={$repoStore.defaultBranch ?? "main"}
-              onCreated={(message) => { creatingPr = false; actionNotice = message; void loadAll(); }}
+              onCreated={(message) => { creatingPr = false; void reloadThenNotice(message); }}
               onCancel={() => (creatingPr = false)}
             />
           {/if}
@@ -1090,7 +1140,7 @@
                       repoPath={$repoStore.currentPath}
                       number={pr.number}
                       slug="{ctx.owner}/{ctx.repo}"
-                      onChanged={() => void loadAll()}
+                      onChanged={(message) => void reloadThenNotice(message)}
                     />
                   {/if}
                   </div>

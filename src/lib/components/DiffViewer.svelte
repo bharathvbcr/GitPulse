@@ -229,6 +229,11 @@
   let syntaxOn = $state(diffDefaults.diffSyntaxHighlight);
   let oldSrc = $state<string | null>(null);
   let newSrc = $state<string | null>(null);
+  /** Whether the pictures are in flight, read, or unreadable; never inferred from the sources being null. */
+  let imageStatus = $state<"loading" | "ready" | "failed">("ready");
+  let imageError = $state<string | null>(null);
+  let oldError = $state<string | null>(null);
+  let newError = $state<string | null>(null);
   let selectedLines = $state<Set<number>>(new Set());
   let dragAnchor = $state<number | null>(null);
   let isDragging = $state(false);
@@ -361,6 +366,24 @@
   );
   let cutByRenderer = $derived(allLines.length > MAX_RENDER_LINES);
   let truncatedSource = $derived(cutByBackend || cutByRenderer);
+  /**
+   * Whitespace mode reads `git diff -w`, which leaves out whitespace-only edits
+   * and prints some changed lines as context. A hunk or line patch built from
+   * it is not a patch of the file: git refuses it where the omitted edit sits
+   * in the hunk's context, and where it does not the patch stages less than
+   * the file's real change. The rows are fine to read; they are not a base to
+   * stage from.
+   */
+  let whitespaceView = $derived($repoStore.selectedIgnoreWhitespace);
+  /** Hunk and line staging is off. Stage File works from the path, not these rows, so it stays on. */
+  let stagingBlocked = $derived(truncatedSource || whitespaceView);
+  let stagingBlockedReason = $derived(
+    whitespaceView
+      ? "Turn off Ignore whitespace to stage — this view hides whitespace-only changes"
+      : truncatedSource
+        ? "Partial data — the diff is truncated, so staging would silently stage less than this hunk shows"
+        : undefined,
+  );
   let lines = $derived(cutByRenderer ? allLines.slice(0, MAX_RENDER_LINES) : allLines);
   // Only add/del/ctx rows are diff lines: hdr/meta/binary are chrome, so the
   // "N lines" stat means what a diff reader expects it to mean (and an empty
@@ -502,6 +525,17 @@
     searchIndex = 0;
   }
 
+  /** Enter and Shift+Enter step, Escape closes — owned by the box, so no window rule has to guess. */
+  function onSearchKeydown(event: KeyboardEvent): void {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      stepSearch(event.shiftKey ? -1 : 1);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closeSearch();
+    }
+  }
+
   // Re-anchor on the visible row whenever the result set changes, so typing
   // another character does not throw the reader back to match one.
   /** Last search-result signature. A plain `let`, never $state: the
@@ -549,6 +583,8 @@
   let splitScroll = $state(0);
   let viewportHeight = $state(0);
   let bodyEl = $state<HTMLElement>();
+  /** The whole pane: what the window-level Escape and Enter rules are scoped to. */
+  let rootEl = $state<HTMLElement>();
 
   const activeScroll = $derived(viewMode === "split" ? splitScroll : unifiedScroll);
 
@@ -849,6 +885,9 @@
    * the search field keep their own arrow behaviour.
    */
   function onWindowKeydown(event: KeyboardEvent): void {
+    // A handler nearer the key (the find box, a popover, a dialog) has already
+    // answered it; this one is on the window and must not answer it twice.
+    if (event.defaultPrevented) return;
     const target = event.target as HTMLElement | null;
     const tag = target?.tagName;
     const typing =
@@ -856,18 +895,33 @@
       tag === "INPUT" ||
       tag === "TEXTAREA" ||
       tag === "SELECT";
+    // Where the diff owns Enter and Escape: nothing focused (the reader just
+    // clicked the diff), or focus somewhere inside this pane. Anything else is
+    // another surface's key — a dialog's confirm button, a popover.
+    const nothingFocused = target === document.body;
+    const inPane = target instanceof Node && rootEl?.contains(target) === true;
+    const onControl =
+      target?.closest?.('button, a, input, textarea, select, [role="button"], [contenteditable="true"]') != null;
 
     if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "f") {
       event.preventDefault();
       openSearch();
       return;
     }
-    if (event.key === "Escape" && searchOpen) {
+    if (event.key === "Escape" && searchOpen && (nothingFocused || inPane)) {
       event.preventDefault();
       closeSearch();
       return;
     }
-    if (event.key === "F3" || (searchOpen && !typing && event.key === "Enter")) {
+    // Enter steps only from the diff body itself: on a focused button it is
+    // that button's activation (Stage Hunk, Close find), and it is the find
+    // box's own business inside the box (see onSearchKeydown).
+    const enterInDiff =
+      searchOpen &&
+      event.key === "Enter" &&
+      !onControl &&
+      (nothingFocused || (target instanceof Node && bodyEl?.contains(target) === true));
+    if (event.key === "F3" || enterInDiff) {
       event.preventDefault();
       stepSearch(event.shiftKey ? -1 : 1);
       return;
@@ -929,7 +983,9 @@
   }
 
   function toggleLine(index: number) {
-    if (!lineSelectable(index)) return;
+    // A selection nobody can act on is a trap: in whitespace mode the bar's
+    // stage buttons are off, so no line is offered for selecting at all.
+    if (whitespaceView || !lineSelectable(index)) return;
     const next = new Set(selectedLines);
     if (next.has(index)) next.delete(index);
     else next.add(index);
@@ -937,6 +993,7 @@
   }
 
   function selectRange(from: number, to: number) {
+    if (whitespaceView) return;
     const lo = Math.min(from, to);
     const hi = Math.max(from, to);
     const next = new Set<number>();
@@ -947,7 +1004,7 @@
   }
 
   function onLinePointerDown(index: number, event: PointerEvent) {
-    if (!isWorkingTreeFile || !lineSelectable(index)) return;
+    if (whitespaceView || !isWorkingTreeFile || !lineSelectable(index)) return;
     // A drag that starts on the code itself is a TEXT selection, not a
     // line-range selection. Both gestures live on the same row, so the split
     // is by where the pointer went down: the gutter (checkbox, line number,
@@ -980,7 +1037,7 @@
   }
 
   async function stageHunk(hunkIndex: number) {
-    if (!$repoStore.selectedFilePath) return;
+    if (stagingBlocked || !$repoStore.selectedFilePath) return;
     const patch = buildFilePatchForHunk(lines, $repoStore.selectedFilePath, hunkIndex);
     if (!patch) return;
     const outcome = await repoStore.stageSelectivePatch(patch, !isStaged);
@@ -1013,7 +1070,7 @@
   }
 
   async function stageSelected(isStaging: boolean) {
-    if (!$repoStore.selectedFilePath || selectedLines.size === 0) return;
+    if (stagingBlocked || !$repoStore.selectedFilePath || selectedLines.size === 0) return;
     const patch = buildFilePatchFromLines(lines, $repoStore.selectedFilePath, selectedLines);
     if (!patch) return;
     const outcome = await repoStore.stageSelectivePatch(patch, isStaging);
@@ -1028,6 +1085,10 @@
       toastStore.error("Could not copy the patch to the clipboard");
       return;
     }
+    // A backend cut makes the clipboard text a prefix of the patch. The button
+    // already says so before the click; the toast says so after it, because the
+    // reader is about to paste it somewhere that will treat it as whole.
+    if (cutByBackend) toastStore.warning(`Copied a partial patch — this diff ${backendCutReason}.`);
     copiedPatch = true;
     setTimeout(() => (copiedPatch = false), 1600);
   }
@@ -1172,6 +1233,8 @@
   }
 
   let imageBlobKey: string | null = null;
+  /** What the current key reads, kept so Retry asks again for exactly that. */
+  let imageRequest: { key: string; repo: string; path: string; commitId: string | null } | null = null;
 
   $effect(() => {
     const path = singleSection?.path ?? currentFilePath;
@@ -1181,48 +1244,84 @@
       showingImage && path && repo ? `${repo}\u0000${path}\u0000${commitId ?? ""}` : null;
     if (key === imageBlobKey) return;
     imageBlobKey = key;
-    if (!key) {
-      oldSrc = null;
-      newSrc = null;
+    // The previous file's pictures must not sit under the new file's title
+    // while the new ones are read, so every side is cleared the moment the
+    // selection changes, not when the next read lands.
+    oldSrc = null;
+    newSrc = null;
+    oldError = null;
+    newError = null;
+    imageError = null;
+    if (!key || !path || !repo) {
+      imageRequest = null;
+      imageStatus = "ready";
       return;
     }
-    const requestKey = key;
-    (async () => {
-      const blobUrl = (blob: FileBlob | null): string | null => {
-        if (!blob?.base64) return null;
-        return `data:${blob.mime || "image/png"};base64,${blob.base64}`;
-      };
-      try {
-        const newBlob = await invoke<FileBlob>("cmd_get_file_blob", {
-          repoPath: repo,
-          filePath: path,
-          commitId: commitId || null,
-          // Only displayed here, never saved from: skip the digest pass.
-          withDigest: false,
-        });
-        let oldBlob: FileBlob | null = null;
-        try {
-          oldBlob = await invoke<FileBlob>("cmd_get_file_blob", {
-            repoPath: repo,
-            filePath: path,
-            commitId: commitId ? `${commitId}^` : "HEAD",
-            withDigest: false,
-          });
-        } catch {
-          oldBlob = null;
-        }
-        if (imageBlobKey === requestKey) {
-          newSrc = blobUrl(newBlob);
-          oldSrc = blobUrl(oldBlob);
-        }
-      } catch {
-        if (imageBlobKey === requestKey) {
-          oldSrc = null;
-          newSrc = null;
-        }
-      }
-    })();
+    const request = { key, repo, path, commitId: commitId || null };
+    imageRequest = request;
+    void loadImageBlobs(request);
   });
+
+  /** One side's read, settled either way: a throw is a reason, not a lost picture. */
+  async function readImageSide(
+    repo: string,
+    path: string,
+    commitId: string | null,
+  ): Promise<{ src: string | null; error: string | null }> {
+    try {
+      const blob = await invoke<FileBlob>("cmd_get_file_blob", {
+        repoPath: repo,
+        filePath: path,
+        commitId,
+        // Only displayed here, never saved from: skip the digest pass.
+        withDigest: false,
+      });
+      return {
+        src: blob?.base64 ? `data:${blob.mime || "image/png"};base64,${blob.base64}` : null,
+        error: null,
+      };
+    } catch (err) {
+      return { src: null, error: formatError(err) };
+    }
+  }
+
+  /**
+   * Reads both sides, each in its own try so one failing does not discard the
+   * other. A reader that lands after the selection moved on is dropped. Both
+   * staged states read the same pair (worktree against HEAD): the backend has
+   * no index-read mode, so the index is not compared.
+   */
+  async function loadImageBlobs(request: {
+    key: string;
+    repo: string;
+    path: string;
+    commitId: string | null;
+  }): Promise<void> {
+    imageStatus = "loading";
+    imageError = null;
+    const [current, previous] = await Promise.all([
+      readImageSide(request.repo, request.path, request.commitId),
+      readImageSide(request.repo, request.path, request.commitId ? `${request.commitId}^` : "HEAD"),
+    ]);
+    if (imageBlobKey !== request.key) return;
+    newSrc = current.src;
+    oldSrc = previous.src;
+    newError = current.src ? null : current.error;
+    oldError = previous.src ? null : previous.error;
+    // Failed means nothing could be read at all. A missing side beside a
+    // readable one is a normal added/deleted image; a side that simply has no
+    // picture data is the real empty state.
+    if (current.error && previous.error) {
+      imageStatus = "failed";
+      imageError = current.error;
+    } else {
+      imageStatus = "ready";
+    }
+  }
+
+  function retryImage(): void {
+    if (imageRequest) void loadImageBlobs(imageRequest);
+  }
 
   const pending = $derived($repoStore.selectedDiffPending);
   /** Why the selected diff could not be read; per selection, not the repository's `error`. */
@@ -1245,7 +1344,7 @@
      shortcuts must work in every body branch. -->
 <svelte:window onkeydown={onWindowKeydown} />
 
-<div class="flex h-full flex-1 flex-col overflow-hidden bg-background text-xs">
+<div bind:this={rootEl} class="flex h-full flex-1 flex-col overflow-hidden bg-background text-xs">
   <!-- Identity: what is on screen, taken from the diff itself.
 
        `flex-wrap` is the narrow-pane behaviour, not the normal one. Every
@@ -1434,14 +1533,16 @@
         class="gp-btn py-0.5! px-2! flex items-center gap-1.5 text-[11px] text-textMuted"
         onclick={copyPatch}
         disabled={!$repoStore.selectedDiff}
-        title="Copy the whole patch as unified diff text"
+        title={cutByBackend
+          ? `Copy the first part of this patch — this diff ${backendCutReason}`
+          : "Copy the whole patch as unified diff text"}
       >
         {#if copiedPatch}
           <Check size={13} class="text-emerald-500" />
         {:else}
           <Copy size={13} />
         {/if}
-        <span class="hidden md:inline">{copiedPatch ? "Copied" : "Copy patch"}</span>
+        <span class="hidden md:inline">{copiedPatch ? "Copied" : cutByBackend ? "Copy partial patch" : "Copy patch"}</span>
       </button>
 
       <button
@@ -1518,6 +1619,7 @@
       <input
         bind:this={searchInput}
         bind:value={searchQuery}
+        onkeydown={onSearchKeydown}
         type="text"
         class="min-w-0 flex-1 bg-transparent py-0.5 text-[11px] text-textPrimary outline-hidden placeholder:text-textMuted/60"
         placeholder="Find in this diff…"
@@ -1699,6 +1801,11 @@
               filePath: singleSection?.path ?? $repoStore.selectedFilePath ?? "image",
               oldSrc,
               newSrc,
+              status: imageStatus,
+              error: imageError,
+              oldError,
+              newError,
+              onRetry: retryImage,
             }}
           />
         {:else if showEmpty}
@@ -1802,12 +1909,12 @@
           <span>Copy</span>
         </button>
         {#if isStaged}
-          <button onclick={() => stageSelected(false)} class="gp-btn-primary py-1! text-xs!" disabled={truncatedSource}>
+          <button onclick={() => stageSelected(false)} class="gp-btn-primary py-1! text-xs!" disabled={stagingBlocked} title={stagingBlockedReason}>
             <Check size={12} />
             <span>Unstage Selected ({selectedLines.size})</span>
           </button>
         {:else}
-          <button onclick={() => stageSelected(true)} class="gp-btn-primary py-1! text-xs!" disabled={truncatedSource}>
+          <button onclick={() => stageSelected(true)} class="gp-btn-primary py-1! text-xs!" disabled={stagingBlocked} title={stagingBlockedReason}>
             <Check size={12} />
             <span>Stage Selected ({selectedLines.size})</span>
           </button>
@@ -1853,7 +1960,12 @@
     )
       ? 'border-accent bg-accent text-white'
       : 'border-border/60 hover:border-accent/80'}"
-    title={selectedLines.has(index) ? "Deselect line" : "Select line for patch staging"}
+    disabled={whitespaceView}
+    title={whitespaceView
+      ? stagingBlockedReason
+      : selectedLines.has(index)
+        ? "Deselect line"
+        : "Select line for patch staging"}
     aria-label={selectedLines.has(index) ? "Deselect line" : "Select line for patch staging"}
   ></button>
 {/snippet}
@@ -1918,10 +2030,8 @@
         {#if isWorkingTreeFile}
           <button
             onclick={() => stageHunk(index)}
-            disabled={truncatedSource}
-            title={truncatedSource
-              ? "Partial data — the diff is truncated, so staging would silently stage less than this hunk shows"
-              : undefined}
+            disabled={stagingBlocked}
+            title={stagingBlockedReason}
             class="ml-auto shrink-0 rounded border border-border/80 bg-surface px-2 py-0.5 font-sans text-[10px] text-accent transition-colors hover:bg-accent/15 disabled:opacity-40"
           >
             {isStaged ? "Unstage Hunk" : "Stage Hunk"}
@@ -2055,10 +2165,8 @@
         {#if isWorkingTreeFile}
           <button
             onclick={() => stageHunk(row.index)}
-            disabled={truncatedSource}
-            title={truncatedSource
-              ? "Partial data — the diff is truncated, so staging would silently stage less than this hunk shows"
-              : undefined}
+            disabled={stagingBlocked}
+            title={stagingBlockedReason}
             class="ml-auto shrink-0 rounded border border-border/80 bg-surface px-2 py-0.5 font-sans text-[10px] text-accent transition-colors hover:bg-accent/15 disabled:opacity-40"
           >
             {isStaged ? "Unstage Hunk" : "Stage Hunk"}

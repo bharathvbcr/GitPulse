@@ -23,10 +23,50 @@ const source = readFileSync(
  */
 describe("DiffViewer source contracts", () => {
   it("reads image blobs without the content digest it never uses", () => {
+    // Both sides go through one helper, so there is one read to check and no
+    // side that could be added later without the flag.
     const reads = source.split('invoke<FileBlob>("cmd_get_file_blob", {').slice(1);
-    expect(reads.length).toBe(2);
+    expect(reads.length).toBe(1);
     // Each read's argument object ends at the first `});` after it opens.
     for (const read of reads) expect(read.slice(0, read.indexOf("});"))).toContain("withDigest: false");
+    expect(source.split("readImageSide(").length - 1).toBe(3); // the definition and the two sides
+  });
+
+  it("reads the two image sides separately, so one failing does not discard the other", () => {
+    const load = source.slice(source.indexOf("async function loadImageBlobs"), source.indexOf("function retryImage"));
+    expect(load).toContain("Promise.all");
+    // The outer catch that nulled both sides is gone; a throw is caught per side.
+    expect(load).not.toContain("catch");
+    expect(source.slice(source.indexOf("async function readImageSide"), source.indexOf("async function loadImageBlobs"))).toContain("catch");
+  });
+
+  it("keeps the window key handler from taking another control's Enter and Escape", () => {
+    // What a key does to a focused button is a rendered fact (harness/diff.html
+    // dispatches it); these pin the structure that makes it true.
+    const handler = source.slice(source.indexOf("function onWindowKeydown"), source.indexOf("Switches the diff to another commit"));
+    expect(handler.slice(0, 400)).toContain("if (event.defaultPrevented) return;");
+    // Enter that is not in the find box belongs to a control unless it is on the diff body.
+    expect(handler).not.toMatch(/searchOpen && !typing && event\.key === "Enter"/);
+    expect(handler).toContain("!onControl");
+    expect(source).toContain("onkeydown={onSearchKeydown}");
+  });
+
+  it("says a copied patch is partial when the backend cut the diff", () => {
+    const copy = source.slice(source.indexOf("async function copyPatch"), source.indexOf("let selectedGraphRow"));
+    expect(copy).toContain("if (cutByBackend) toastStore.warning(");
+    // A renderer cut does not shorten `selectedDiff`, so it must not rename the button.
+    expect(source).toContain('cutByBackend ? "Copy partial patch" : "Copy patch"');
+    expect(source).not.toContain('title="Copy the whole patch as unified diff text"');
+  });
+
+  it("turns hunk and line staging off in whitespace mode, from one derived flag", () => {
+    expect(source).toContain("let stagingBlocked = $derived(truncatedSource || whitespaceView);");
+    // Every staging control reads the one flag; none re-derives it from truncation alone.
+    expect(source).not.toContain("disabled={truncatedSource}");
+    expect(source.split("disabled={stagingBlocked}").length - 1).toBe(4); // two hunk buttons, two selection buttons
+    // The functions refuse too, so no path but the buttons can send a -w patch.
+    expect(source).toContain("if (stagingBlocked || !$repoStore.selectedFilePath) return;");
+    expect(source).toContain("if (whitespaceView || !lineSelectable(index)) return;");
   });
 
   it("compiles", () => {

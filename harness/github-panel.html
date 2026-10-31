@@ -36,7 +36,8 @@
       const A = "/fixture/acme";
       const B = "/fixture/beta";
       const C = "/fixture/gamma";
-      const BRANCH = { [A]: "feat/search", [B]: "main", [C]: "main" };
+      const D = "/fixture/delta";
+      const BRANCH = { [A]: "feat/search", [B]: "main", [C]: "main", [D]: "main" };
       const branches = (path) => {
         const current = BRANCH[path];
         const row = (name) => ({
@@ -103,6 +104,13 @@
           workflow_runs: [], runs_error: "gh: API rate limit exceeded", runs_truncated: false,
           releases: [], releases_truncated: false, releases_error: null, warnings: [], error: null,
         },
+        // Opened last and never cached before the failing read: a repository with no last-known data.
+        [D]: {
+          available: true, cli_present: true, host: "github.com", owner: "acme", repo: "delta", html_url: "https://github.com/acme/delta",
+          pull_requests: [pr(31)], prs_truncated: false, issues: [], issues_truncated: false, issues_error: null,
+          workflow_runs: [], runs_error: null, runs_truncated: false,
+          releases: [], releases_truncated: false, releases_error: null, warnings: [], error: null,
+        },
       };
       const workflowsFor = (path) => path === A
         ? { available: true, cli_present: true, truncated: true, error: null,
@@ -120,6 +128,7 @@
       const pollAnswers = [];
       /** A held cmd_github_context: resolves when released. */
       let contextGate = null;
+      let contextMode = "ok";
       const holdContext = () => { let release; const promise = new Promise((resolve) => { release = resolve; }); return { promise, release }; };
       /** Pending cmd_ci_local calls, resolved by the checks. */
       const ciPending = [];
@@ -149,7 +158,23 @@
         }),
         cmd_github_context: async (a) => {
           if (contextGate) await contextGate.promise;
+          // "throw": the command itself fails (offline). "error": gh answers with a
+          // context that carries an error and no listings (rate limit).
+          if (contextMode === "throw") throw new Error("gh: network is unreachable");
+          if (contextMode === "error") {
+            return { ...structuredClone(contexts[a.repoPath]), available: false, pull_requests: [], issues: [], workflow_runs: [], releases: [], error: "gh: API rate limit exceeded" };
+          }
           return structuredClone(contexts[a.repoPath]);
+        },
+        cmd_github_pr_view: (a) => ({
+          number: a.number, title: `PR ${a.number}`, state: "OPEN", url: `https://github.com/acme/app/pull/${a.number}`, is_draft: false,
+          author: "ada", head_ref: `topic-${a.number}`, base_ref: "main", head_oid: "c".repeat(40), body: "Adds repository search.", body_truncated: false,
+          additions: 12, deletions: 3, changed_files: 2, mergeable: "MERGEABLE", merge_state: "CLEAN", review_decision: "APPROVED", ci_status: "success",
+        }),
+        // A merge takes the pull request out of the next listing, as on GitHub.
+        cmd_github_pr_action: (a) => {
+          if (a.action.kind === "merge") contexts[A].pull_requests = contexts[A].pull_requests.filter((p) => p.number !== a.action.number);
+          return { policy: null, output: `Merged #${a.action.number} into main.` };
         },
         cmd_github_workflows: (a) => workflowsFor(a.repoPath),
         cmd_github_runs: (a) => pollAnswers.shift() ?? { available: true, checked: false, cli_present: true, owner: "acme", repo: "app", runs: [], truncated: false, error: "no answer queued" },
@@ -184,6 +209,7 @@
       const { createChecks } = await import("./checks.ts");
       const { holdForeground } = await import("./foreground.ts");
       const { repoStore } = await import("../src/lib/stores/repoStore.ts");
+      const { promptState, completePrompt } = await import("../src/lib/stores/modalStore");
       const { filterStore } = await import("../src/lib/stores/filterStore.ts");
       const { harnessStore } = await import("../src/lib/stores/harnessStore.ts");
       const { isMacOS } = await import("../src/lib/platform.ts");
@@ -512,6 +538,69 @@
           await until(() => /fetched /.test(text()));
           await settle();
           check("a newer full context supersedes the poll's snapshot", () => runTitles()[0] === "run 1");
+
+          // ---- a merge's confirmation outlives the row it came from -------------------------
+          const detailOf = (n) => $(`[data-pr-detail="${n}"]`, stage);
+          buttonLabelled("Show details for pull request #4").click();
+          await until(() => detailOf(4)?.textContent.includes("by ada"));
+          button("Merge…", detailOf(4)).click();
+          await until(() => !!get(promptState));
+          completePrompt(true);
+          await until(() => !detailOf(4) && !text().includes("PR 4 "));
+          await settle();
+          check("a merged pull request leaves the list and takes its open detail with it", () => !detailOf(4) && !text().includes("topic-4"));
+          check("and the panel itself says what happened, since the row that would have is gone", () => text().includes("Merged #4 into main."));
+          // Narrowing the list hides a row without forgetting which detail was open.
+          buttonLabelled("Show details for pull request #5").click();
+          await until(() => detailOf(5)?.textContent.includes("by ada"));
+          await input($('input[aria-label="Filter pull requests"]', stage), "PR 1");
+          check("(PR 5 is filtered off the list)", () => !detailOf(5));
+          await input($('input[aria-label="Filter pull requests"]', stage), "");
+          check("clearing the filter brings the same detail back, still open", () => !!detailOf(5));
+          contexts[A].pull_requests = contexts[A].pull_requests.filter((p) => p.number !== 5);
+          button("Refresh").click();
+          await until(() => !text().includes("PR 5") && !detailOf(5));
+          check("a detail whose pull request left the fetched list is closed", () => !detailOf(5));
+
+          // ---- a refresh says it is running, and a failed one keeps what was on screen ------
+          contextGate = holdContext();
+          button("Refresh").click();
+          await tick();
+          check("while a refresh is out Refresh is disabled and shows it is working", () =>
+            button("Refresh").disabled && !!$("svg.animate-spin", button("Refresh")));
+          contextGate.release();
+          contextGate = null;
+          await until(() => !button("Refresh").disabled);
+          check("and it is clickable again once the read lands", () => !button("Refresh").disabled && !$("svg.animate-spin", button("Refresh")));
+          const stamp = () => text().match(/fetched [^·]*?ago|fetched just now/)?.[0] ?? "";
+          contextMode = "throw";
+          button("Refresh").click();
+          await until(() => text().includes("Refresh failed:"));
+          check("a refresh that throws keeps the listings and says what failed and how old they are", () =>
+            text().includes("PR 1") && text().includes("PR 2") && text().includes("Refresh failed: gh: network is unreachable — showing data fetched"));
+          check("it did not replace the pane with the bare error", () => !!section("Open pull requests") && prCards() === 3);
+          check("and Refresh is clickable again, as the retry", () => !button("Refresh").disabled);
+          contextMode = "error";
+          button("Refresh").click();
+          await until(() => text().includes("API rate limit exceeded"));
+          await settle();
+          check("a refresh that gh answers with an error keeps the listings too", () =>
+            text().includes("Refresh failed: gh: API rate limit exceeded") && prCards() === 3);
+          contextMode = "ok";
+          button("Refresh").click();
+          await until(() => !text().includes("Refresh failed:"));
+          check("a refresh that works clears the failure", () => prCards() === 3 && !text().includes("Refresh failed:"));
+          // No last-known data: the error is all there is, and Refresh is the way out of it.
+          contextMode = "throw";
+          await repoStore.openRepo(D);
+          await until(() => text().includes("acme/delta") || text().includes("network is unreachable"));
+          await settle();
+          check("with nothing fetched before, a failed read is the error card, not a stale listing", () =>
+            text().includes("gh: network is unreachable") && !text().includes("PR 31") && !text().includes("Refresh failed:"));
+          contextMode = "ok";
+          button("Refresh").click();
+          await until(() => text().includes("PR 31"));
+          check("and Refresh from it reads the repository", () => text().includes("PR 31") && !text().includes("network is unreachable"));
 
           check("no window.open anywhere", () => windowOpens.length === 0);
           check("every IPC call had a fixture", () => unexpected.length === 0);
