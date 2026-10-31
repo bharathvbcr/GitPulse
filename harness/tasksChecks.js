@@ -3449,7 +3449,13 @@ if (params.has("check")) {
         await change(panel().querySelector('[aria-label="Suggest tasks at or above this priority"]'), "1", "change"); await wait(() => suggestCalls.length === 3 && idle());
         check("the priority picker asks again with that ceiling, as a number",
           suggestCalls.at(-1).max_priority === 1 && suggestCalls.at(-1).repository_id === "repo-1" && same(listed(), ids({ repository_id: "repo-1", max_priority: 1, limit: 5 })));
+        // Run in waves asks for its tasks the way Suggest next does, so the ceiling chosen
+        // here is the one a wave is launched with: its note names it, and says "any" once cleared.
+        // (A wave itself needs an open checkout and worktree commands this fixture does not serve.)
+        const waveNote = () => root.querySelector('[data-testid="wave-priority"]')?.textContent ?? "";
+        check("Run in waves is bounded by the priority Suggest next was set to", waveNote().includes("priority") && waveNote().includes("or higher") && !waveNote().includes("any priority"));
         await change(panel().querySelector('[aria-label="Suggest tasks at or above this priority"]'), "all", "change"); await wait(() => suggestCalls.length === 4 && idle());
+        check("Run in waves asks for any priority again once Suggest next is cleared", waveNote().includes("any priority"));
         check("Any priority asks with no ceiling at all", !("max_priority" in suggestCalls.at(-1)));
         // Two asks in flight: the board's own scope change makes the second. The answers
         // arrive newest first, and the older one must not replace what is on screen.

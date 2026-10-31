@@ -2475,7 +2475,7 @@
         onPriority={(value) => { suggestPriority = value; void askSuggest(); }}
         onOpen={(id) => void openTask(id)} onRefresh={() => void askSuggest()} onClose={() => { showSuggest = false; }}
       />
-      <WavePanel repositoryId={scope.kind === "repository" ? scope.id : null} />
+      <WavePanel repositoryId={scope.kind === "repository" ? scope.id : null} maxPriority={suggestPriority} />
     {/if}
     {#if initialized && (showFilters || filtering || showSearchHelp)}
       <div class="query-bar" data-testid="task-query-bar">
