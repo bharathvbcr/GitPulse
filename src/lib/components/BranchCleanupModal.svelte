@@ -6,6 +6,7 @@
   import type { MutationTarget } from "../repos/storeTypes";
   import { displayName } from "../repos/paths";
   import { trapFocus } from "../ui/focusTrap";
+  import { formatError } from "../ui/formatError";
   import { LAYERS } from "../ui/layers";
   import { fade, scale } from "svelte/transition";
   import {
@@ -54,6 +55,8 @@
   let actionInProgress = $state(false);
   let scanResult = $state<DeadbranchScanResult | null>(null);
   let backups = $state<DeadbranchBackupInfo[]>([]);
+  /** Why the backup list could not be read; null while it was read (even if empty). */
+  let backupsError = $state<string | null>(null);
   let selectedNames = $state<Set<string>>(new Set());
 
   // Filter state
@@ -163,10 +166,14 @@
       if (seq !== backupsSeq) return;
       backups = listed;
       backupsTarget = target;
-    } catch {
+      backupsError = null;
+    } catch (err: unknown) {
       if (seq !== backupsSeq) return;
       backups = [];
       backupsTarget = target;
+      // An unreadable list is not an empty one: the tab is where deleted
+      // branches are recovered, so "no backups" must never stand in for it.
+      backupsError = formatError(err);
     }
   }
 
@@ -339,7 +346,7 @@
               onclick={() => (activeTab = "backups")}
             >
               <Archive size={12} />
-              Backups ({backups.length})
+              Backups ({backupsError ? "?" : backups.length})
             </button>
           </div>
 
@@ -618,7 +625,16 @@
       {:else}
         <!-- Backups List View -->
         <div class="flex-1 overflow-y-auto min-h-72 p-6 divide-y divide-border/60">
-          {#if backups.length === 0}
+          {#if backupsError}
+            <div role="alert" class="py-12 flex flex-col items-center justify-center gap-2 text-center">
+              <AlertCircle size={24} class="text-rose-400" aria-hidden="true" />
+              <p class="text-sm font-medium text-textPrimary">Couldn't read branch backups.</p>
+              <p class="text-xs text-rose-300 break-words max-w-md">{backupsError}</p>
+              <button type="button" class="gp-btn mt-1" onclick={() => void loadBackups()}>
+                <RefreshCw size={12} /> Retry
+              </button>
+            </div>
+          {:else if backups.length === 0}
             <div class="py-12 flex flex-col items-center justify-center text-textMuted gap-2">
               <Archive size={24} class="text-textMuted" />
               <p class="text-sm font-medium text-textPrimary">No branch backups found</p>
