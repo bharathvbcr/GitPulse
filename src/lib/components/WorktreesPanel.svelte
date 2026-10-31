@@ -66,6 +66,9 @@
 
   async function readHooksPreview() {
     const repo = $repoStore.currentPath;
+    // A tab switch ends this read's claim on the consent state: its finally
+    // must not clear the busy flag of whatever the next repository started.
+    const epoch = tabScope.epoch;
     hooksPreview = null;
     hooksError = null;
     if (!repo || !runHooks) return;
@@ -76,7 +79,7 @@
     } catch (err: unknown) {
       if ($repoStore.currentPath === repo) hooksError = reportPanelError("worktrees", err);
     } finally {
-      hooksBusy = false;
+      if (tabScope.isCurrent(epoch)) hooksBusy = false;
     }
   }
 
@@ -84,16 +87,18 @@
     const repo = $repoStore.currentPath;
     const shown = hooksPreview;
     if (!repo || !shown) return;
+    const epoch = tabScope.epoch;
     hooksBusy = true;
     hooksError = null;
     try {
       await invoke("cmd_approve_worktree_hooks", { repoPath: repo, content: shown.content });
     } catch (err: unknown) {
-      hooksError = reportPanelError("worktrees", err);
+      const message = reportPanelError("worktrees", err);
+      if (tabScope.isCurrent(epoch)) hooksError = message;
     } finally {
-      hooksBusy = false;
+      if (tabScope.isCurrent(epoch)) hooksBusy = false;
     }
-    await readHooksPreview();
+    if (tabScope.isCurrent(epoch)) await readHooksPreview();
   }
   let mergeConfirmPath = $state<string | null>(null);
   let mergingPath = $state<string | null>(null);
@@ -177,6 +182,13 @@
       newBranch = "";
       startPoint = "";
       cowCaches = true;
+      // The hooks consent belongs to the repository it was read for: a ticked
+      // box and a preview of that repository's `.gitpulse/hooks` must not be
+      // offered for approval under the next one.
+      runHooks = false;
+      hooksPreview = null;
+      hooksError = null;
+      hooksBusy = false;
     },
   );
 

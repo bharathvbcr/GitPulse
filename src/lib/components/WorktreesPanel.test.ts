@@ -327,3 +327,23 @@ describe("WorktreesPanel GitPulse task worktrees", () => {
  * was shown, not the newer file, and leaves it unapproved; approving the text
  * on screen marks it approved; creating then sends runHooks.
  */
+
+describe("the hooks consent belongs to the repository it was read for", () => {
+  const reset = source.slice(source.indexOf("const tabScope = repoScope("), source.indexOf("\n  );", source.indexOf("const tabScope = repoScope(")));
+
+  it("a tab switch unticks the box and drops the previous repository's preview", () => {
+    expect(reset.length).toBeGreaterThan(100);
+    for (const clear of ["runHooks = false;", "hooksPreview = null;", "hooksError = null;", "hooksBusy = false;"]) expect(reset).toContain(clear);
+  });
+
+  it("a read or approval that outlives its repository leaves the new one's busy flag and error alone", () => {
+    for (const name of ["readHooksPreview", "approveHooks"]) {
+      const start = source.indexOf(`async function ${name}(`);
+      const body = source.slice(start, source.indexOf("\n  }\n", start));
+      expect(body, name).toContain("const epoch = tabScope.epoch;");
+      expect(body, name).toContain("if (tabScope.isCurrent(epoch)) hooksBusy = false;");
+      expect(body, name).not.toMatch(/^\s*hooksBusy = false;$/m);
+    }
+    expect(source).toContain("if (tabScope.isCurrent(epoch)) await readHooksPreview();");
+  });
+});
