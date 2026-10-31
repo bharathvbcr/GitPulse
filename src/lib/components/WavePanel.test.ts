@@ -83,6 +83,7 @@ describe("WavePanel", () => {
 
   it("is mounted on the board beside Suggest next, scoped to the repository board only", () => {
     const board = readFileSync(new URL("./TaskBoard.svelte", import.meta.url), "utf8");
-    expect(board).toContain('<WavePanel repositoryId={scope.kind === "repository" ? scope.id : null} />');
+    // And bounded by the priority ceiling Suggest next is set to, which its note and its asks read.
+    expect(board).toContain('<WavePanel repositoryId={scope.kind === "repository" ? scope.id : null} maxPriority={suggestPriority} />');
   });
 });
