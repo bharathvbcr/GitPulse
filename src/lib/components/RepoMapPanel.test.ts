@@ -102,10 +102,16 @@ describe("RepoMapPanel bounds process output before the status strip", () => {
     // property being written, not a value being shown.
     const template = source.slice(source.lastIndexOf("</script>"));
     expect(template.length).toBeGreaterThan(0);
+    // Bare error state is process output too (`errorMsg` is the raw reason of a
+    // failed map read, the others are build and docs failures). Control-flow
+    // blocks (`{#if actionNote}`, `{:else}`, `{/if}`) only test the value.
     const unbounded = [
-      ...template.matchAll(/\{[^{}]*?\b(?:cliStatus|load|snapshot)\??\.reason\b[^{}]*?\}/g),
+      ...template.matchAll(
+        /\{[^{}]*?(?:\b(?:cliStatus|load|snapshot)\??\.reason\b|\b(?:errorMsg|actionNote|docsError|brokenError|linksError)\b)[^{}]*?\}/g,
+      ),
     ]
       .map((m) => m[0])
+      .filter((expr) => !/^\{[#:/]/.test(expr))
       .filter((expr) => !expr.includes("boundStrip") && !/\breason:/.test(expr));
     expect(
       unbounded,

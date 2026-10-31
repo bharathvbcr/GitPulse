@@ -721,7 +721,7 @@
 
   {#if actionNote}
     <div class="shrink-0 px-3 py-1.5 text-[11px] text-textMuted border-b border-border/40" role="status">
-      {actionNote}
+      {boundStrip(actionNote)}
     </div>
   {/if}
 
@@ -742,7 +742,7 @@
         </p>
       {/if}
       {#if docsError}
-        <p class="text-[11px] text-rose-600 dark:text-rose-400">{docsError}</p>
+        <p class="text-[11px] text-rose-600 dark:text-rose-400">{boundStrip(docsError)}</p>
       {/if}
 
       <section aria-labelledby="docs-search-heading">
@@ -845,7 +845,7 @@
         </p>
       {/if}
       {#if linksError}
-        <p class="text-[11px] text-rose-600 dark:text-rose-400">{linksError}</p>
+        <p class="text-[11px] text-rose-600 dark:text-rose-400">{boundStrip(linksError)}</p>
       {/if}
       {#if linksLoading}
         <p class="text-[11px] text-textMuted">Loading…</p>
@@ -889,7 +889,7 @@
     <div class="flex-1 flex flex-col items-center justify-center gap-2 p-6 text-center" role="status">
       <p class="text-sm text-textPrimary">No repository map</p>
       <p class="text-[11px] text-textMuted max-w-md">
-        {errorMsg ?? "Build the code map to navigate subsystems, entry points and area tests."}
+        {mapFailureText ?? boundStrip(errorMsg) ?? "Build the code map to navigate subsystems, entry points and area tests."}
       </p>
       <button
         type="button"
