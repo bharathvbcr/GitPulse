@@ -290,6 +290,8 @@
   let acknowledgedBypass = $state(false);
   /** Shown instead of a spawn while a bypass launch waits to be agreed to. */
   let awaitingAcknowledgement = $state(false);
+  /** The safer answer: initial focus for the bypass prompt. */
+  let declineButton = $state<HTMLButtonElement | null>(null);
   let container = $state<HTMLDivElement | null>(null);
   let warning = $state<string | null>(null);
   /** Typing is queued behind a send the host has not answered; retracts itself, separate from `warning`. */
@@ -1018,10 +1020,21 @@
   async function spawnPty() { await lifecycle?.start(); }
 
   /** Agreed to for this tab. The stored preference is untouched. */
-  function acknowledgeBypass() {
+  async function acknowledgeBypass() {
     acknowledgedBypass = true;
     awaitingAcknowledgement = false;
     void spawnPty();
+    await handBackFocus();
+  }
+
+  /**
+   * The prompt's button is gone once either answer lands, and the stored
+   * restore target would be the xterm textarea — so focus goes to the grid
+   * explicitly, and only for the tab being looked at.
+   */
+  async function handBackFocus() {
+    await tick();
+    if (active) term?.focus();
   }
 
   /**
@@ -1033,11 +1046,12 @@
    * the stored default is left alone, because this is one launch and not a
    * change of mind about every future one.
    */
-  function declineBypass() {
+  async function declineBypass() {
     permissionMode = "ask";
     acknowledgedBypass = false;
     awaitingAcknowledgement = false;
     void spawnPty();
+    await handBackFocus();
   }
 
   export function restart() { void lifecycle?.restart(); }
@@ -1054,6 +1068,10 @@
    * conversation continues. Its task lists both, so both link back to it.
    */
   const linkedRunId = $derived(taskRunId ?? resume?.runId ?? null);
+  const startingLabel = $derived(`Starting ${launcherLabel(launcher)}…`);
+  const endedLabel = $derived(resumeOffer ? "This session was ended by a signal." : "This session ended.");
+  /** What the always-mounted live region says: spawning wins, as it does in the status row. */
+  const statusAnnouncement = $derived(spawning ? startingLabel : !error && exited ? endedLabel : "");
 
   /** Opens the task this tab's attempt belongs to, where a new attempt starts. */
   async function openOwnTask() {
@@ -1098,7 +1116,11 @@
     // once: the box has its real size by then, and the observer's own fit for
     // the same change finds the grid already right.
     fits.settle();
-    if (findOpen) findInput?.focus();
+    // The grid has no PTY behind it while the bypass prompt waits, so every
+    // way back to this tab (Escape out of a menu, "View agent session", a
+    // notification) lands on the prompt's safer answer instead.
+    if (awaitingAcknowledgement) declineButton?.focus({ preventScroll: true });
+    else if (findOpen) findInput?.focus();
     else term?.focus();
   }
 
@@ -1546,6 +1568,20 @@
   });
 
   /**
+   * Nothing else moves focus into the bypass prompt, so a keyboard user would
+   * keep typing into a grid with no PTY behind it. Only the tab being looked
+   * at takes it: a background dock tab can wait on the same prompt. This is
+   * the moment the prompt first appears; every later return to the tab goes
+   * through `reveal()`, which makes the same choice.
+   */
+  $effect(() => {
+    if (!awaitingAcknowledgement || !active) return;
+    void tick().then(() => {
+      if (awaitingAcknowledgement && active) declineButton?.focus({ preventScroll: true });
+    });
+  });
+
+  /**
    * A hidden container has no size, so xterm cannot lay out while inactive.
    * Becoming active is therefore the moment to refit — the ResizeObserver
    * fires too, but only once the browser has recomputed layout, and the
@@ -1594,6 +1630,10 @@
 </script>
 
 <div class="h-full w-full flex flex-col min-h-0 min-w-0">
+  <!-- Mounted from the start, so the text that lands in it later is announced;
+       a status inserted together with its words is mostly left unread. The
+       visible row below is hidden from assistive technology to match. -->
+  <span class="sr-only" role="status" aria-live="polite" data-terminal-announcer>{statusAnnouncement}</span>
   {#if warning}
     <div role="status" class="shrink-0 flex gap-2 items-center text-[11px] text-amber-300 px-3 py-1 border-b border-border/60">
       <span class="flex-1 min-w-0 truncate" title={warning}>{warning}</span>
@@ -1638,14 +1678,14 @@
         data-terminal-acknowledge
         class="absolute inset-2 bg-surface/95 flex flex-col items-center justify-center gap-2 px-6 text-center"
         role="alertdialog"
-        aria-modal="true"
         aria-labelledby="gp-bypass-title-{tabId}"
+        aria-describedby="gp-bypass-body-{tabId}"
       >
         <AlertTriangle size={18} class="text-amber-500 shrink-0" aria-hidden="true" />
         <span id="gp-bypass-title-{tabId}" class="text-textPrimary text-xs font-medium">
           Start {launcherLabel(launcher)} with no permission checks?
         </span>
-        <p class="text-textMuted text-[11px] leading-snug max-w-sm">
+        <p id="gp-bypass-body-{tabId}" class="text-textMuted text-[11px] leading-snug max-w-sm">
           Your saved default for {launcherLabel(launcher)} is
           <span class="text-textPrimary">{PERMISSION_LABELS.bypass.label}</span>. This session will
           run without permission prompts and without a sandbox, in
@@ -1665,6 +1705,7 @@
             type="button"
             class="gp-btn py-1! text-[11px]!"
             data-testid="bypass-decline"
+            bind:this={declineButton}
             onclick={declineBypass}
           >
             Use {PERMISSION_LABELS.ask.label.toLowerCase()} instead
@@ -1677,18 +1718,26 @@
     <!-- One fixed-height status row: spawn/error/exited/info content swaps
          inside it, so the terminal's box never resizes (and the
          ResizeObserver never refits) merely because the text rotated. -->
-    <div data-terminal-status class="shrink-0 min-w-0 border-t border-border/60 gp-section-edge bg-surface/60 flex items-center gap-2 px-4 h-8">
+    <!-- An error is the one row that must show its whole message, so it lets
+         the height go (inline style beats h-8); every other row stays fixed. -->
+    <div
+      data-terminal-status
+      class="shrink-0 min-w-0 border-t border-border/60 gp-section-edge bg-surface/60 flex items-center gap-2 px-4 h-8"
+      style:height={error && !spawning ? "auto" : undefined}
+      style:min-height={error && !spawning ? "2rem" : undefined}
+      style:padding-block={error && !spawning ? "0.25rem" : undefined}
+    >
       {#if spawning}
         <LoaderCircle size={13} class="animate-spin text-accent shrink-0" />
-        <span class="text-textMuted text-[11px]">Starting {launcherLabel(launcher)}…</span>
+        <span aria-hidden="true" class="text-textMuted text-[11px]">{startingLabel}</span>
       {:else if error}
         <AlertCircle size={13} class="text-rose-400 shrink-0" />
-        <span class="text-rose-300 flex-1 min-w-0 truncate text-[11px]" title={error}>{error}</span>
+        <span role="alert" class="text-rose-300 flex-1 min-w-0 break-words whitespace-pre-wrap max-h-24 overflow-y-auto text-[11px]">{error}</span>
         <button type="button" class="gp-btn py-1! text-[11px]!" onclick={restart}>
           <RotateCw size={12} /> {taskRunId ? "Reconnect attempt" : "Retry"}
         </button>
       {:else if exited}
-        <span class="text-textMuted flex-1 text-[11px]">{resumeOffer ? "This session was ended by a signal." : "This session ended."}</span>
+        <span aria-hidden="true" class="text-textMuted flex-1 text-[11px]">{endedLabel}</span>
         {#if linkedRunId}
           <!-- The task details are where a new attempt starts, so the way
                there is here rather than only named in a tooltip. -->

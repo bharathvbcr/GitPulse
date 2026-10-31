@@ -76,8 +76,53 @@ describe("the live region exists before the content lands in it", () => {
     expect(source).toContain('$toastStore.filter((t) => t.kind !== "error")');
   });
 
-  it("hides the visual card from assistive tech so nothing is read twice", () => {
-    expect(source).toContain('aria-hidden="true"');
+  it("keeps the pile and its buttons exposed, hiding only the text the live regions already read", () => {
+    toastStore.clear();
+    toastStore.info("Created branch topic", { label: "Undo", onClick: () => {} });
+    const { body } = render(ToastContainer);
+    const html = body;
+
+    // Walk the rendered markup with an ancestor stack: a button whose ancestor
+    // is aria-hidden is focusable-but-invisible to assistive tech.
+    const VOID = new Set(["br", "hr", "img", "input", "meta", "link", "path", "circle", "line", "rect", "polyline"]);
+    const stack: { tag: string; hidden: boolean }[] = [];
+    const buttonsUnderHidden: string[] = [];
+    const hiddenText: string[] = [];
+    for (const m of html.matchAll(/<!--[\s\S]*?-->|<(\/?)([a-zA-Z][\w-]*)([^>]*?)(\/?)>|([^<]+)/g)) {
+      if (m[0].startsWith("<!--")) continue;
+      if (m[5] !== undefined) {
+        if (stack.some((s) => s.hidden) && m[5].trim()) hiddenText.push(m[5].trim());
+        continue;
+      }
+      const [, closing, tag, attrs, selfClose] = m;
+      if (closing) {
+        while (stack.length && stack.pop()!.tag !== tag);
+        continue;
+      }
+      const hidden = /aria-hidden="true"/.test(attrs);
+      if (tag === "button" && (hidden || stack.some((s) => s.hidden))) buttonsUnderHidden.push(attrs);
+      if (!selfClose && !VOID.has(tag)) stack.push({ tag, hidden });
+    }
+    expect(buttonsUnderHidden).toEqual([]);
+    // The duplicated message is hidden; the controls' names are not.
+    expect(hiddenText).toContain("Created branch topic");
+    expect(hiddenText).not.toContain("Undo");
+
+    const pile = body.slice(body.indexOf('data-testid="toast-pile"'));
+    expect(body.slice(body.lastIndexOf("<div", body.indexOf('data-testid="toast-pile"')), body.indexOf('data-testid="toast-pile"'))).not.toContain("aria-hidden");
+    expect(pile).toContain('aria-label="Undo: Created branch topic"');
+    // Stacked toasts must not offer identical, context-free Dismiss buttons.
+    expect(pile).toContain('aria-label="Dismiss: Created branch topic"');
+    expect(pile).not.toContain('aria-label="Dismiss notification"');
+    expect(body).toContain("Created branch topic — Undo available");
+  });
+
+  it("does not mention an action that is not there", () => {
+    toastStore.clear();
+    toastStore.error("Push failed");
+    const { body } = render(ToastContainer);
+    expect(body).toContain("Push failed");
+    expect(body).not.toContain("available");
   });
 
   it("pauses countdowns on hover and focus, and stays paused while focus remains inside", () => {

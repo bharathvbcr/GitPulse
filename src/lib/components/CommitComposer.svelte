@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { tick, untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import {
     harnessStore,
@@ -61,6 +61,10 @@
   let isGenerating = $state(false);
   let generation = $state<AiGeneration | null>(null);
   let aiError = $state<string | null>(null);
+  let messageEl = $state<HTMLTextAreaElement | null>(null);
+  /** Per instance: a sidebar can keep more than one composer mounted, and ids must not collide. */
+  const instanceId = $props.id();
+  const keysId = `${instanceId}-commit-message-keys`;
   let commitError = $state<{ message: string; kind: IpcErrorKind } | null>(null);
   let isCommitting = $state(false);
   let lastVerdict = $state<PolicyVerdict | null>(null);
@@ -223,6 +227,12 @@
     } finally {
       if (tabScope.isCurrent(epoch)) isCommitting = false;
     }
+  }
+
+  /** The identity form unmounts under the focused control; the message box is where the next move is. */
+  async function focusMessage() {
+    await tick();
+    messageEl?.focus({ preventScroll: true });
   }
 
   function onMessageKeydown(event: KeyboardEvent) {
@@ -392,13 +402,17 @@
   {/if}
 
   <textarea
+    bind:this={messageEl}
     value={commitMessage}
     oninput={(e) => commitDraft.set((e.currentTarget as HTMLTextAreaElement).value)}
     onkeydown={onMessageKeydown}
+    aria-label="Commit message"
+    aria-describedby={keysId}
     placeholder="Commit message (e.g. feat: add auth)..."
     rows="3"
     class="w-full bg-background border border-border/80 rounded-xl p-2.5 text-xs text-textPrimary placeholder:text-textMuted/60 focus:outline-hidden focus:border-accent/60 resize-none font-mono transition-colors"
   ></textarea>
+  <span id={keysId} class="sr-only">Cmd/Ctrl Enter commits staged files. Cmd/Ctrl Shift Enter stages everything and commits.</span>
 
   {#if generation}
     <!-- Provenance for the suggestion: which model wrote it, against how much
@@ -423,7 +437,7 @@
   {/if}
 
   {#if aiError}
-    <div class="text-[10px] text-rose-400 flex items-start gap-1">
+    <div role="alert" class="text-[10px] text-rose-400 flex items-start gap-1">
       <AlertTriangle size={11} class="mt-px shrink-0" />
       <span>{aiError}</span>
     </div>
@@ -435,8 +449,8 @@
 
   {#if commitError?.kind === "identity_missing"}
     <IdentityPrompt
-      onSaved={() => { commitError = null; void handleCommit(); }}
-      onDismiss={() => (commitError = null)}
+      onSaved={() => { commitError = null; void handleCommit(); void focusMessage(); }}
+      onDismiss={() => { commitError = null; void focusMessage(); }}
     />
   {:else if commitError}
     <div class="text-[10px] text-rose-400 whitespace-pre-wrap font-mono leading-relaxed">{commitError.message}</div>

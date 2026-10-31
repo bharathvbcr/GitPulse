@@ -20,6 +20,48 @@ describe("CommitComposer", () => {
     expect(body).not.toContain("Commit all");
   });
 
+  it("names the message box and ties its chords to it for assistive tech", () => {
+    const { body } = render(CommitComposer);
+    const textarea = body.match(/<textarea[^>]*>/)?.[0] ?? "";
+    expect(textarea).toContain('aria-label="Commit message"');
+    const describedBy = textarea.match(/aria-describedby="([^"]+)"/)?.[1] ?? "";
+    expect(describedBy).toMatch(/commit-message-keys$/);
+    const hint = body.match(new RegExp(`<span id="${describedBy}"[^>]*>([^<]*)</span>`));
+    expect(hint?.[0]).toContain("sr-only");
+    expect(hint?.[1]).toContain("Cmd/Ctrl Enter commits staged files.");
+    expect(hint?.[1]).toContain("Cmd/Ctrl Shift Enter stages everything and commits.");
+  });
+
+  it("gives each composer its own hint id, so two mounted instances never collide", () => {
+    // Svelte numbers instances within one render tree, so two separate SSR
+    // renders can't show a clash; assert the id is derived, not a literal.
+    expect(source).toContain("const instanceId = $props.id();");
+    expect(source).toContain("`${instanceId}-commit-message-keys`");
+    expect(source).toContain("aria-describedby={keysId}");
+    expect(source).toContain("<span id={keysId}");
+    expect(source).not.toContain('id="commit-message-keys"');
+    expect(source).not.toContain('aria-describedby="commit-message-keys"');
+  });
+
+  it("announces an AI-generation error but leaves the commit error to the toast", () => {
+    const ai = source.slice(source.indexOf("{#if aiError}"));
+    expect(ai.slice(0, ai.indexOf("{/if}"))).toContain('<div role="alert"');
+    const commit = source.slice(source.indexOf("{:else if commitError}"));
+    expect(commit.slice(0, commit.indexOf("{:else if lastVerdict}"))).not.toContain("role=");
+  });
+
+  it("returns focus to the message box when the identity prompt goes away", () => {
+    expect(source).toContain("bind:this={messageEl}");
+    const fn = source.slice(source.indexOf("async function focusMessage()"));
+    const body = fn.slice(0, fn.indexOf("\n  }"));
+    expect(body).toContain("await tick();");
+    expect(body).toContain("messageEl?.focus(");
+    const prompt = source.slice(source.indexOf("<IdentityPrompt"), source.indexOf("{:else if commitError}"));
+    expect(prompt.match(/void focusMessage\(\)/g)).toHaveLength(2);
+    expect(prompt.indexOf("onSaved")).toBeLessThan(prompt.indexOf("void focusMessage()"));
+    expect(prompt.indexOf("onDismiss")).toBeLessThan(prompt.lastIndexOf("void focusMessage()"));
+  });
+
   // Rendered in harness/repo-churn.html: the default commit takes the staged
   // files only ("Commit (1)"); an empty message cannot commit; Cmd/Ctrl+Enter
   // commits the staged files without amending; Shift adds the unstaged files

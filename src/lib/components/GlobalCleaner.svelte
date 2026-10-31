@@ -5,6 +5,7 @@
   import { FolderPlus, RefreshCw, Clock, ShieldCheck, X } from "@lucide/svelte";
   import type { CleanerConfig, CleanerInventory, CleanerState } from "../storage/hygiene/globalTypes";
   import { humanBytes } from "../storage/format";
+  import { formatError } from "../ui/formatError";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   let { active = true }: { active?: boolean } = $props();
   let cleaner = $state<CleanerState | null>(null);
@@ -15,7 +16,10 @@
   let dirty = $state(false);
   let busy = $state(false);
   let inspecting = $state(false);
+  /** A save/run/inspect/stop failure: stays until the next action, whatever a poll finds. */
   let error = $state<string | null>(null);
+  /** The last status read failed. Separate so a good poll clears only this, never an action error unread. */
+  let refreshError = $state<string | null>(null);
   let notice = $state<string | null>(null);
   let epoch = 0;
   let live = false;
@@ -34,8 +38,8 @@
     const mine = epoch; loading = true;
     try {
       const next = await invoke<CleanerState>("cmd_cleaner_state");
-      if (live && mine === epoch) accept(next);
-    } catch (e) { if (live && mine === epoch) error = String(e); }
+      if (live && mine === epoch) { accept(next); refreshError = null; }
+    } catch (e) { if (live && mine === epoch) refreshError = formatError(e); }
     finally { if (mine === epoch) loading = false; }
   }
   function edited() { dirty = true; inventory = null; }
@@ -43,12 +47,12 @@
     if (busy) return;
     const mine = epoch; busy = true; error = null;
     try { const next = await invoke<CleanerState>("cmd_cleaner_state"); if (live && mine === epoch) { accept(next, true); notice = "Reloaded the saved policy. Unsaved edits were discarded."; } }
-    catch (e) { if (live && mine === epoch) error = String(e); }
+    catch (e) { if (live && mine === epoch) error = formatError(e); }
     finally { if (live && mine === epoch) busy = false; }
   }
   async function addRoot() {
     try { const path = await invoke<string | null>("cmd_pick_folder"); if (path && live) { rootsText = [...new Set([...paths(rootsText), path])].join("\n"); edited(); } }
-    catch (e) { if (live) error = String(e); }
+    catch (e) { if (live) error = formatError(e); }
   }
   async function save() {
     if (!draft || busy) return;
@@ -58,27 +62,27 @@
     try {
       const next = await invoke<CleanerState>("cmd_cleaner_save", { config });
       if (live && mine === epoch) { accept(next, true); notice = "Policy saved. Changes stop any cleanup already in progress."; }
-    } catch (e) { if (live && mine === epoch) error = String(e); }
+    } catch (e) { if (live && mine === epoch) error = formatError(e); }
     finally { if (live && mine === epoch) busy = false; }
   }
   async function inspect() {
     if (busy || inspecting || dirty) return;
     const mine = epoch; inspecting = true; error = null;
     try { const next = await invoke<CleanerInventory>("cmd_cleaner_scan"); if (live && mine === epoch) inventory = next; }
-    catch (e) { if (live && mine === epoch) error = String(e); }
+    catch (e) { if (live && mine === epoch) error = formatError(e); }
     finally { if (live && mine === epoch) inspecting = false; }
   }
   async function run() {
     if (!cleaner || dirty || busy || cleaner.running || !inventory || inventory.partial) return;
     const mine = epoch; busy = true; error = null;
     try { const next = await invoke<CleanerState>("cmd_cleaner_run", { revision: cleaner.config.revision }); if (live && mine === epoch) { accept(next); inventory = null; notice = "Cleanup started with the saved policy. Every target is inspected again before removal."; } }
-    catch (e) { if (live && mine === epoch) error = String(e); }
+    catch (e) { if (live && mine === epoch) error = formatError(e); }
     finally { if (live && mine === epoch) busy = false; }
   }
   async function stop() {
     const mine = epoch; error = null;
     try { const next = await invoke<CleanerState>("cmd_cleaner_cancel"); if (live && mine === epoch) { accept(next); notice = "Cancellation requested. Removed entries cannot be restored."; } }
-    catch (e) { if (live && mine === epoch) error = String(e); }
+    catch (e) { if (live && mine === epoch) error = formatError(e); }
   }
   $effect(() => {
     if (!active) return;
@@ -94,6 +98,7 @@
     <button class="gp-btn" onclick={refresh}><RefreshCw size={12} />Refresh status</button>
   </div>
   {#if error}<p role="alert" class="rounded border border-rose-400/30 p-3 text-rose-300">{error}</p>{/if}
+  {#if refreshError}<p role="alert" class="rounded border border-rose-400/30 p-3 text-rose-300">{refreshError}</p>{/if}
   {#if notice}<p role="status" class="text-textSecondary">{notice}</p>{/if}
   {#if draft && cleaner}
     {#if cleaner.background_error}<p role="alert" class="text-amber-300">Background setup failed; schedule disabled. {cleaner.background_error}</p>{/if}
@@ -140,5 +145,7 @@
       </details>
     {/if}
     <details><summary class="cursor-pointer">DevCouncil agent hygiene rules</summary><p class="mt-2 whitespace-pre-wrap text-textMuted">{cleaner.agent_rules}</p></details>
+  {:else if refreshError}
+    <div class="flex items-center gap-3"><p class="text-textMuted">Could not read the cleanup policy.</p><button class="gp-btn" onclick={refresh}><RefreshCw size={12} />Retry</button></div>
   {:else}<p class="text-textMuted">Loading saved cleanup policy…</p>{/if}
 </section>

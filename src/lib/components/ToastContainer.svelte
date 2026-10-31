@@ -35,6 +35,11 @@
     },
   };
 
+  /** What the live regions say: the message, and that an action can be reached from the pile. */
+  function announcement(toast: ToastItem): string {
+    return toast.action ? `${toast.message} — ${toast.action.label} available` : toast.message;
+  }
+
   async function handleAction(toast: ToastItem) {
     if (!toast.action) return;
     // An action that reports `false` did not complete (an Undo that could not
@@ -90,12 +95,12 @@
 >
   <div class="sr-only" role="alert" aria-live="assertive" aria-atomic="false">
     {#each $toastStore.filter((t) => t.kind === "error") as toast (toast.id)}
-      <p>{toast.message}</p>
+      <p>{announcement(toast)}</p>
     {/each}
   </div>
   <div class="sr-only" role="status" aria-live="polite" aria-atomic="false">
     {#each $toastStore.filter((t) => t.kind !== "error") as toast (toast.id)}
-      <p>{toast.message}</p>
+      <p>{announcement(toast)}</p>
     {/each}
   </div>
 
@@ -103,13 +108,16 @@
     <!-- Newest toast in front. Lips above it are only edges. Hover or focus
          opens every toast so dismiss and actions stay reachable, and freezes
          the countdown while the pointer or focus is here. The container is
-         pointer-events-none, so this pile is what can see that. Cards stay
-         aria-hidden because the live regions above already announced them. -->
+         pointer-events-none, so this pile is what can see that. The pile and
+         its buttons stay exposed — a focusable control inside aria-hidden is
+         a trap with no name, and Undo would exist only for the mouse. Only the
+         message text and icon are hidden, because the live regions above
+         already announced them. -->
     <div
       class="pile pointer-events-auto"
       class:open={stack.peeks === 0}
       role="group"
-      aria-hidden="true"
+      aria-label="Notification actions"
       data-testid="toast-pile"
       bind:this={pile}
       onmouseenter={engage}
@@ -124,18 +132,17 @@
         {@const config = KIND_CONFIG[toast.kind]}
         {@const Icon = config.icon}
         <div
-          aria-hidden="true"
           role="presentation"
           in:fly={{ y: 12, duration: 160 }}
           out:fade={{ duration: 120 }}
           class="toast pointer-events-auto gp-pop gp-card rounded-2xl p-3 border shadow-float flex items-start gap-2.5 bg-surface {config.border}"
         >
-          <div class="shrink-0 mt-0.5 {config.iconColor}">
+          <div class="shrink-0 mt-0.5 {config.iconColor}" aria-hidden="true">
             <Icon size={16} />
           </div>
 
           <div class="flex-1 min-w-0">
-            <p class="text-xs font-medium leading-snug {config.text} wrap-break-word">
+            <p class="text-xs font-medium leading-snug {config.text} wrap-break-word" aria-hidden="true">
               {toast.message}
             </p>
 
@@ -144,6 +151,7 @@
                 <button
                   type="button"
                   onclick={() => handleAction(toast)}
+                  aria-label="{toast.action.label}: {toast.message}"
                   class="gp-btn py-0.5! px-2.5! text-[11px] font-semibold hover:border-accent/60"
                 >
                   {toast.action.label}
@@ -155,7 +163,7 @@
           <button
             type="button"
             onclick={() => toastStore.dismiss(toast.id)}
-            aria-label="Dismiss notification"
+            aria-label="Dismiss: {toast.message}"
             class="shrink-0 p-1 rounded-full text-textMuted hover:text-textPrimary hover:bg-surfaceHover transition-colors"
           >
             <X size={13} />

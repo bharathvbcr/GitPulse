@@ -254,7 +254,7 @@
         const { results, check, stopped } = createChecks();
         try {
           let writesBefore = report.writes;
-          const status = () => visible('[role="status"]')[0]?.textContent;
+          const status = () => visible('[role="search"] [role="status"]')[0]?.textContent;
           const input = async (text) => {
             const field = label("Find in terminal output");
             field.value = text;
@@ -1567,6 +1567,20 @@
           const decline = overlay().querySelector('[data-testid="bypass-decline"]');
           check("the pointer reaches Start this session", () => reaches(ack));
           check("the pointer reaches the ask-every-time choice", () => reaches(decline));
+          // A keyboard user would otherwise keep typing into a grid with no PTY
+          // behind it. Focus is read as the browser reports it, not as the
+          // component meant it.
+          await wait(150);
+          check("the safer answer holds focus once the prompt shows", () => document.activeElement === decline);
+          // The panel's Escape (closing a menu, the session list, ...) calls the
+          // tab's reveal(); neither `active` nor the prompt changes, so nothing
+          // but reveal() itself can keep focus off the dead grid.
+          const opener = button("New session type");
+          opener.focus(); opener.click(); await wait();
+          check("the launcher menu took focus away from the prompt", () => visible('[aria-label="Session types"]').length > 0 && document.activeElement !== decline);
+          opener.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+          await wait(150);
+          check("Escape out of a menu returns to the safer answer, not the xterm textarea", () => document.activeElement === decline && !document.activeElement.classList.contains("xterm-helper-textarea"));
           ack.click();
           const spawnDeadline = performance.now() + 3000;
           while (performance.now() < spawnDeadline && report.spawned === spawnedBefore) await wait(20);
@@ -1576,6 +1590,8 @@
             return launch.program === "claude" && launch.permissionMode === "bypass" && launch.acknowledged === true;
           });
           check("the agreement is gone once the session starts", () => !overlay());
+          await wait(150);
+          check("focus goes to the terminal's input once the prompt is answered", () => document.activeElement?.classList.contains("xterm-helper-textarea") && host.contains(document.activeElement));
           check("no runtime errors", () => report.errors.length === 0);
         } catch (error) {
           stopped(error);

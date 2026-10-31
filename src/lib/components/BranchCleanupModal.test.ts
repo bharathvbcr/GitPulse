@@ -8,6 +8,57 @@ const source = readFileSync(
   "utf8",
 );
 
+describe("BranchCleanupModal backups read failure", () => {
+  const start = source.indexOf("async function loadBackups()");
+  const load = source.slice(start, source.indexOf("\n  }", start));
+
+  it("records why the list could not be read and clears it on a good read", () => {
+    expect(source).toContain("let backupsError = $state<string | null>(null);");
+    const [ok, failed] = load.split("} catch");
+    expect(ok).toContain("backupsError = null;");
+    expect(failed).toContain('backupsError = reportPanelError("ops", err);');
+  });
+
+  it("records the failure in diagnostics, redacted, as the Ops pane's own", () => {
+    // formatError would show the text but leave no record and skip the
+    // credential redaction the diagnostics seam applies. The modal opens from
+    // the Ops pane (ui/manviFocus.ts: cleanup -> ops), so "ops" is its source.
+    expect(source).toContain('import { reportPanelError } from "../diagnostics/report";');
+    expect(source).not.toContain("formatError");
+  });
+
+  it("says a retry is running, so a repeated identical failure is not mistaken for no reaction", () => {
+    const [, failed] = load.split("} catch");
+    expect(load).toContain("backupsLoading = true;");
+    expect(failed).toContain("finally {");
+    expect(failed).toContain("if (seq === backupsSeq) backupsLoading = false;");
+    const view = source.slice(source.indexOf("{#if backupsError}"));
+    const errorView = view.slice(0, view.indexOf("{:else if backups.length === 0}"));
+    expect(errorView).toContain("disabled={backupsLoading}");
+    expect(errorView).toContain('{backupsLoading ? "Retrying…" : "Retry"}');
+  });
+
+  it("never lets the empty-state sentence stand in for a failed read", () => {
+    const view = source.slice(source.indexOf("<!-- Backups List View -->"));
+    const errorBranch = view.indexOf("{#if backupsError}");
+    const emptyBranch = view.indexOf("{:else if backups.length === 0}");
+    expect(errorBranch).toBeGreaterThan(-1);
+    // The error branch is the first one, so the empty state is its else.
+    expect(emptyBranch).toBeGreaterThan(errorBranch);
+    expect(view.indexOf("No branch backups found")).toBeGreaterThan(emptyBranch);
+    const errorView = view.slice(errorBranch, emptyBranch);
+    expect(errorView).toContain('role="alert"');
+    expect(errorView).toContain("Couldn't read branch backups.");
+    expect(errorView).toContain("{backupsError}");
+    expect(errorView).toContain("onclick={() => void loadBackups()}");
+    expect(errorView).toContain("Retry");
+  });
+
+  it("does not print a count for a list it could not read", () => {
+    expect(source).toContain('Backups ({backupsError ? "?" : backups.length})');
+  });
+});
+
 describe("BranchCleanupModal scan trigger", () => {
   it("rescans only when the modal opens or the repository changes", () => {
     // repoStore publishes a fresh object per keystroke and per status poll;

@@ -2,7 +2,8 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { hexColor, shouldRefit } from "./TerminalSession.svelte";
+import { render } from "svelte/server";
+import TerminalSession, { hexColor, shouldRefit } from "./TerminalSession.svelte";
 
 /**
  * These contracts moved here with the PTY itself when tabs arrived: they were
@@ -380,5 +381,91 @@ describe("TerminalSession GPU wiring", () => {
     expect(source).toContain("refresh: () => t.refresh(0, t.rows - 1)");
     expect(source).toContain("data-terminal-gpu-note");
     expect(source).toContain("Drawing without GPU after a graphics reset");
+  });
+});
+
+describe("TerminalSession bypass prompt and status announcements", () => {
+  const prompt = source.slice(
+    source.indexOf("data-terminal-acknowledge"),
+    source.indexOf('data-testid="bypass-decline"'),
+  );
+
+  it("does not claim modality over the app, and names itself", () => {
+    expect(prompt.length).toBeGreaterThan(0);
+    expect(source).not.toContain("aria-modal");
+    expect(prompt).toContain('role="alertdialog"');
+    expect(prompt).toContain("aria-labelledby=");
+    expect(prompt).toContain("aria-describedby=");
+  });
+
+  it("focuses the safer answer, only for the tab being looked at", () => {
+    expect(source).toContain("bind:this={declineButton}");
+    const effect = source.slice(source.indexOf("if (!awaitingAcknowledgement || !active) return;"));
+    const body = effect.slice(0, effect.indexOf("\n  });"));
+    expect(body).toContain("tick()");
+    expect(body).toContain("declineButton?.focus({ preventScroll: true })");
+    expect(body).toContain("awaitingAcknowledgement && active");
+  });
+
+  it("hands focus back to the grid after either answer, for the active tab only", () => {
+    const hand = source.slice(source.indexOf("async function handBackFocus()"));
+    const handBody = hand.slice(0, hand.indexOf("\n  }"));
+    expect(handBody).toContain("await tick();");
+    expect(handBody).toContain("if (active) term?.focus();");
+    for (const site of ["acknowledgeBypass", "declineBypass"]) {
+      const start = source.indexOf(`async function ${site}(`);
+      expect(start, `${site} is not async`).toBeGreaterThan(-1);
+      expect(source.slice(start, source.indexOf("\n  }", start))).toContain("await handBackFocus();");
+    }
+  });
+
+  it("sends every way back to a waiting tab to the safer answer, not the grid", () => {
+    // `reveal()` is the tab's one focus seam: the panel calls it after Escape
+    // closes a menu, and the Sessions list and notifications call it through
+    // the registry, while `active` and the prompt do not change.
+    const start = source.indexOf("export function reveal()");
+    const body = source.slice(start, source.indexOf("\n  }", start));
+    const ask = body.indexOf("if (awaitingAcknowledgement) declineButton?.focus({ preventScroll: true });");
+    expect(ask).toBeGreaterThan(-1);
+    expect(ask).toBeLessThan(body.indexOf("findInput?.focus()"));
+    expect(ask).toBeLessThan(body.indexOf("term?.focus()"));
+    expect(body).toContain("else if (findOpen)");
+  });
+
+  it("keeps each effect's comment on the effect it describes", () => {
+    // The refit comment sits directly on the effect that reveals the tab.
+    expect(source).toMatch(
+      /terminal must not paint a stale grid in between\.\n   \*\/\n  \$effect\(\(\) => \{\n    if \(active\) reveal\(\);/,
+    );
+  });
+
+  it("mounts one polite live region before any status text can land in it", () => {
+    const { body } = render(TerminalSession, {
+      props: { repoPath: "/r", tabId: "t1", launcher: "shell", active: true, onTitle: () => {}, onChord: () => false },
+    });
+    // Present and empty while nothing is spawning or ended: the region exists
+    // first, and the words arrive in it.
+    expect(body).toMatch(/<span class="sr-only" role="status" aria-live="polite" data-terminal-announcer="">\s*<\/span>/);
+    expect(source).toContain("const statusAnnouncement = $derived(spawning ? startingLabel : !error && exited ? endedLabel : \"\");");
+    const region = source.indexOf("data-terminal-announcer");
+    expect(region).toBeGreaterThan(source.indexOf("<div class=\"h-full w-full flex flex-col min-h-0 min-w-0\">"));
+    expect(region).toBeLessThan(source.indexOf("{#if spawning}"));
+    expect(region).toBeLessThan(source.indexOf("{#if error || exited || spawning"));
+  });
+
+  it("hides the visible spawn and exit text from assistive technology instead of announcing it twice", () => {
+    expect(source).toMatch(/<span aria-hidden="true"[^>]*>\{startingLabel\}<\/span>/);
+    expect(source).toMatch(/<span aria-hidden="true"[^>]*>\{endedLabel\}<\/span>/);
+    expect(source).not.toMatch(/<span role="status"[^>]*>\{(?:startingLabel|endedLabel)\}/);
+  });
+
+  it("announces the error assertively, in full", () => {
+    const alert = source.match(/<span role="alert"[^>]*>\{error\}<\/span>/)?.[0] ?? "";
+    expect(alert).not.toBe("");
+    expect(alert).not.toContain("truncate");
+    expect(alert).toContain("break-words");
+    expect(alert).toContain("max-h-24");
+    // The text is in the node, not only in a tooltip.
+    expect(alert).not.toContain("title=");
   });
 });
