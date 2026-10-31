@@ -192,6 +192,8 @@
   const error = $derived($pulseStore.error);
   const knowledgeError = $derived($pulseStore.knowledgeError);
   const doraError = $derived($pulseStore.doraError);
+  const knowledgeMeasuredAt = $derived($pulseStore.knowledgeMeasuredAt);
+  const doraMeasuredAt = $derived($pulseStore.doraMeasuredAt);
 
   const authors = $derived.by(() => {
     if (!report) return [];
@@ -458,13 +460,14 @@
           {/if}
         </div>
 
-        <PulsePeriodCompare commits={visibleCommits} />
+        <PulsePeriodCompare commits={visibleCommits} truncated={report.truncated} />
         <PulseRhythm commits={visibleCommits} truncated={report.truncated} />
         <PulseHeatmap commits={visibleCommits} />
         <PulseLineTrend
           commits={visibleCommits}
           totalLoc={locKnown ? locValue : 0}
           locStatus={locState.status}
+          scoped={authorFilter !== "all"}
         />
         <PulseExtensionChurn extensions={report.extensions} />
         <PulsePunchCard commits={visibleCommits} scoped={authorFilter !== "all"} />
@@ -483,12 +486,15 @@
           {knowledge}
           error={knowledgeError}
           loading={knowledgeLoading}
+          measuredAt={knowledgeMeasuredAt}
           onRefresh={() => pulseStore.loadKnowledge()}
         />
         <PulseCodeAge
           {knowledge}
           error={knowledgeError}
           loading={knowledgeLoading}
+          measuredAt={knowledgeMeasuredAt}
+          staleNotice={false}
         />
 
       {:else if activeTab === "dora"}
@@ -496,6 +502,7 @@
           {dora}
           error={doraError}
           loading={doraLoading}
+          measuredAt={doraMeasuredAt}
           onRefresh={() => pulseStore.loadDora()}
         />
       {/if}

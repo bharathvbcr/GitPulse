@@ -8,11 +8,14 @@
     totalLoc = 0,
     locStatus = "idle",
     now = Date.now(),
+    scoped = false,
   }: {
     commits: readonly PulseCommitSummary[];
     totalLoc?: number;
     locStatus?: "idle" | "loading" | "ok" | "partial" | "failed";
     now?: number;
+    /** `commits` is one author's slice of the scan, not the whole history. */
+    scoped?: boolean;
   } = $props();
 
   const weeks = $derived(computeLineChanges(commits, 26, now));
@@ -28,10 +31,16 @@
     weeks.reduce((max, w) => Math.max(max, w.additions, w.deletions), 10),
   );
 
-  // Overall totals
-  const totalAdditions = $derived(commits.reduce((sum, c) => sum + c.additions, 0));
-  const totalDeletions = $derived(commits.reduce((sum, c) => sum + c.deletions, 0));
+  // The headline totals sum the same 26 weekly buckets the chart draws, so the
+  // numbers beside "(Past 26 Weeks)" are what the bars show. Summing every
+  // scanned commit here made them many times the chart on a long history.
+  const totalAdditions = $derived(weeks.reduce((sum, w) => sum + w.additions, 0));
+  const totalDeletions = $derived(weeks.reduce((sum, w) => sum + w.deletions, 0));
   const totalNet = $derived(totalAdditions - totalDeletions);
+
+  // The whole scanned history, offered as its own labelled figure.
+  const scannedAdditions = $derived(commits.reduce((sum, c) => sum + c.additions, 0));
+  const scannedDeletions = $derived(commits.reduce((sum, c) => sum + c.deletions, 0));
 </script>
 
 <div class="gp-card p-4 rounded-xl border border-border/80 bg-surface/50 shadow-xs flex flex-col gap-4">
@@ -43,18 +52,23 @@
     </div>
 
     <!-- Aggregate Net Churn Badge -->
-    <div class="flex items-center gap-3 text-xs font-mono">
-      <div class="flex items-center gap-1 text-emerald-500">
-        <ArrowUp size={12} />
-        <span>+{totalAdditions.toLocaleString()}</span>
+    <div class="flex flex-col items-end gap-0.5">
+      <div class="flex items-center gap-3 text-xs font-mono">
+        <div class="flex items-center gap-1 text-emerald-500">
+          <ArrowUp size={12} />
+          <span>+{totalAdditions.toLocaleString()}</span>
+        </div>
+        <div class="flex items-center gap-1 text-rose-500">
+          <ArrowDown size={12} />
+          <span>-{totalDeletions.toLocaleString()}</span>
+        </div>
+        <div class="text-textPrimary font-semibold">
+          Net {totalNet >= 0 ? `+${totalNet.toLocaleString()}` : totalNet.toLocaleString()}
+        </div>
       </div>
-      <div class="flex items-center gap-1 text-rose-500">
-        <ArrowDown size={12} />
-        <span>-{totalDeletions.toLocaleString()}</span>
-      </div>
-      <div class="text-textPrimary font-semibold">
-        Net {totalNet >= 0 ? `+${totalNet.toLocaleString()}` : totalNet.toLocaleString()}
-      </div>
+      <span class="text-[10px] text-textMuted font-mono">
+        {scoped ? "Selected author's" : "All"} {commits.length.toLocaleString()} scanned commit{commits.length === 1 ? "" : "s"}: +{scannedAdditions.toLocaleString()} / −{scannedDeletions.toLocaleString()}
+      </span>
     </div>
   </div>
 

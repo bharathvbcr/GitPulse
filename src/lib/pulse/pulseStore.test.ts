@@ -3,7 +3,7 @@ import { get } from "svelte/store";
 import { diagnostics } from "../diagnostics/diagnostics";
 import { createRepoPanelCache } from "../panels/repoPanelCache";
 import { createPulseStore, DEFAULT_PULSE_WINDOW } from "./pulseStore";
-import type { PulseReport } from "./types";
+import type { DoraReport, KnowledgeReport, PulseReport } from "./types";
 
 function createMockReport(overrides: Partial<PulseReport> = {}): PulseReport {
   return {
@@ -334,5 +334,85 @@ describe("pulseStore failure reporting", () => {
     await store.loadKnowledge();
     expect(get(store).knowledgeError).toBeNull();
     expect(get(store).knowledge).not.toBeNull();
+  });
+
+  describe("a failed refresh after a success", () => {
+    const knowledgeValue = { bus_factor: 3 } as unknown as KnowledgeReport;
+    const doraValue = { deploy_rating: "High" } as unknown as DoraReport;
+
+    function storeThatFailsSecond() {
+      let fail = false;
+      const store = createPulseStore({
+        fetchReport: ok,
+        fetchKnowledge: () =>
+          fail ? Promise.reject(new Error("blame timed out")) : Promise.resolve(knowledgeValue),
+        fetchDora: () =>
+          fail ? Promise.reject(new Error("no such ref")) : Promise.resolve(doraValue),
+        fetchSnapshots: () => Promise.resolve([]),
+        cache: createRepoPanelCache(),
+      });
+      return { store, failFromNow: () => (fail = true) };
+    }
+
+    it("keeps the previous value and its timestamp, and records the error", async () => {
+      diagnostics.clear();
+      const { store, failFromNow } = storeThatFailsSecond();
+      await store.load("/repo");
+      await store.loadKnowledge();
+      await store.loadDora();
+      const first = get(store);
+      expect(first.knowledgeMeasuredAt).toEqual(expect.any(Number));
+      expect(first.doraMeasuredAt).toEqual(expect.any(Number));
+
+      failFromNow();
+      await store.loadKnowledge();
+      await store.loadDora();
+
+      const state = get(store);
+      expect(state.knowledge).toBe(knowledgeValue);
+      expect(state.knowledgeMeasuredAt).toBe(first.knowledgeMeasuredAt);
+      expect(state.knowledgeError).toContain("blame timed out");
+      expect(state.dora).toBe(doraValue);
+      expect(state.doraMeasuredAt).toBe(first.doraMeasuredAt);
+      expect(state.doraError).toContain("no such ref");
+    });
+
+    it("never stamps a value that did not arrive", async () => {
+      const store = createPulseStore({
+        fetchReport: ok,
+        fetchKnowledge: () => Promise.reject(new Error("blame timed out")),
+        fetchDora: () => Promise.reject(new Error("no such ref")),
+        fetchSnapshots: () => Promise.resolve([]),
+        cache: createRepoPanelCache(),
+      });
+      await store.load("/repo");
+      await store.loadKnowledge();
+      await store.loadDora();
+      expect(get(store).knowledgeMeasuredAt).toBeNull();
+      expect(get(store).doraMeasuredAt).toBeNull();
+    });
+
+    it("drops the timestamps together with the values when the repository changes", async () => {
+      // repo-b's secondary scans never answer, so nothing but the reset can
+      // explain an empty value there.
+      const pending = new Promise<never>(() => {});
+      const store = createPulseStore({
+        fetchReport: ok,
+        fetchKnowledge: (path) => (path === "/repo-a" ? Promise.resolve(knowledgeValue) : pending),
+        fetchDora: (path) => (path === "/repo-a" ? Promise.resolve(doraValue) : pending),
+        fetchSnapshots: () => Promise.resolve([]),
+        cache: createRepoPanelCache(),
+      });
+      await store.load("/repo-a");
+      await store.loadKnowledge();
+      await store.loadDora();
+      expect(get(store).knowledgeMeasuredAt).not.toBeNull();
+
+      await store.load("/repo-b");
+      const state = get(store);
+      expect(state.knowledge).toBeNull();
+      expect(state.knowledgeMeasuredAt).toBeNull();
+      expect(state.doraMeasuredAt).toBeNull();
+    });
   });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatDate, formatRelativeTime, shortHash, signatureLabel } from "./format";
+import { formatDate, formatRelativeTime, shortHash, signatureLabel, withoutTrailingPeriod } from "./format";
 import type { CommitSignatureCheck } from "./pulse/types";
 
 describe("formatRelativeTime", () => {
@@ -176,5 +176,18 @@ describe("signatureLabel adversarial matrix", () => {
     expect(signatureLabel(odd).text).toBeTruthy();
     const alien = { signature: "gpg2", status: "good", key: "", signer: "" } as unknown as CommitSignatureCheck;
     expect(() => signatureLabel(alien)).not.toThrow();
+  });
+});
+
+describe("withoutTrailingPeriod", () => {
+  it("removes closing full stops and whitespace so the caller's own period does not double", () => {
+    expect(withoutTrailingPeriod("blame timed out.")).toBe("blame timed out");
+    expect(withoutTrailingPeriod("blame timed out...  ")).toBe("blame timed out");
+    expect(withoutTrailingPeriod("blame timed out")).toBe("blame timed out");
+  });
+
+  it("keeps punctuation inside the message and tolerates an empty one", () => {
+    expect(withoutTrailingPeriod("v1.2 failed: no repo")).toBe("v1.2 failed: no repo");
+    expect(withoutTrailingPeriod("")).toBe("");
   });
 });

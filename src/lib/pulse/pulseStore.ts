@@ -31,6 +31,14 @@ export interface PulseState {
    */
   readonly knowledgeError: string | null;
   readonly doraError: string | null;
+  /**
+   * When `knowledge` / `dora` last arrived (epoch milliseconds, set on success
+   * only). They survive a failed refresh on purpose: the panels keep showing
+   * the previous scan under a failure notice, and this is how old it is. The
+   * Rust payloads carry no timestamp, so the clock is the frontend's.
+   */
+  readonly knowledgeMeasuredAt: number | null;
+  readonly doraMeasuredAt: number | null;
   readonly snapshotsError: string | null;
   readonly currentRepoPath: string | null;
   readonly maxCommits: number;
@@ -118,6 +126,8 @@ export function createPulseStore(deps?: PulseStoreDeps): PulseStore {
     error: null,
     knowledgeError: null,
     doraError: null,
+    knowledgeMeasuredAt: null,
+    doraMeasuredAt: null,
     snapshotsError: null,
     currentRepoPath: null,
     maxCommits: DEFAULT_PULSE_WINDOW,
@@ -150,6 +160,9 @@ export function createPulseStore(deps?: PulseStoreDeps): PulseStore {
       report: cached ?? (switchingRepo ? null : s.report),
       knowledge: switchingRepo ? null : s.knowledge,
       dora: switchingRepo ? null : s.dora,
+      // A timestamp belongs to the value it stamped; both leave with the repo.
+      knowledgeMeasuredAt: switchingRepo ? null : s.knowledgeMeasuredAt,
+      doraMeasuredAt: switchingRepo ? null : s.doraMeasuredAt,
       snapshots: switchingRepo ? [] : s.snapshots,
       loading: true,
       knowledgeLoading: false,
@@ -210,11 +223,18 @@ export function createPulseStore(deps?: PulseStoreDeps): PulseStore {
     const path = activePath;
     const loadingKey = `${slot}Loading` as const;
     const errorKey = `${slot}Error` as const;
+    const measuredAtKey = `${slot}MeasuredAt` as const;
     update((s) => ({ ...s, [loadingKey]: true }));
     try {
       const value = await fetch(path);
       if (activePath !== path) return;
-      update((s) => ({ ...s, [slot]: value, [loadingKey]: false, [errorKey]: null }));
+      update((s) => ({
+        ...s,
+        [slot]: value,
+        [loadingKey]: false,
+        [errorKey]: null,
+        [measuredAtKey]: Date.now(),
+      }));
     } catch (err) {
       if (activePath !== path) return;
       const message = reportPanelError("pulse", err);

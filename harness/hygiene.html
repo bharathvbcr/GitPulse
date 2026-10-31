@@ -82,6 +82,15 @@
     check("completed preview is consumed",!button("Remove reviewed output"));
     selectPreview();await settle();take("cmd_hygiene_prepare").reject("Directory changed; review again");await settle();
     check("backend refusal is visible",root.querySelector('[role="alert"]').textContent.includes("Directory changed"));
+    const {get}=await import("svelte/store");
+    const {diagnostics}=await import("../src/lib/diagnostics/diagnostics.ts");
+    const hygieneEntries=()=>get(diagnostics).filter(entry=>entry.source==="hygiene");
+    check("a refused preview is recorded in Diagnostics under hygiene",hygieneEntries().some(entry=>entry.message.includes("Directory changed")));
+    selectPreview();await settle();take("cmd_hygiene_prepare").resolve(preview());await settle();
+    button("Remove reviewed output").click();await settle();take("cmd_hygiene_execute").reject("Plan no longer matches the directory");await settle();
+    check("a failed execution is shown",root.querySelector('[role="alert"]').textContent.includes("Plan no longer matches the directory"));
+    check("a failed execution is recorded in Diagnostics under hygiene",hygieneEntries().some(entry=>entry.message.includes("Plan no longer matches the directory")));
+    check("a failed execution consumes the plan",!button("Remove reviewed output"));
     selectPreview();await settle();const expired=preview();expired.expires_at=1;take("cmd_hygiene_prepare").resolve(expired);await settle();
     check("expired previews cannot execute",button("Remove reviewed output").disabled);
     button("Cancel").click();await settle();

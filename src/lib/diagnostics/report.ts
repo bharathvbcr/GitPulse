@@ -27,6 +27,7 @@ export type PanelSource =
   | "github"
   | "firebase"
   | "health"
+  | "hygiene"
   | "ops"
   | "clone"
   | "rebase"

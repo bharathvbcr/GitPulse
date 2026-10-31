@@ -1,17 +1,21 @@
 <script lang="ts">
   import type { KnowledgeReport } from "../../pulse/types";
+  import PulseStaleNotice from "./PulseStaleNotice.svelte";
   import { Users, AlertTriangle, ShieldCheck, FileWarning, RefreshCw } from "@lucide/svelte";
 
   let {
     knowledge = null,
     error = null,
     loading = false,
+    measuredAt = null,
     onRefresh,
   }: {
     knowledge: KnowledgeReport | null;
     /** Why the blame scan produced nothing. Never rendered as "no data". */
     error?: string | null;
     loading?: boolean;
+    /** When `knowledge` was measured (epoch ms); dates the figures if a refresh fails. */
+    measuredAt?: number | null;
     onRefresh?: () => void;
   } = $props();
 
@@ -76,6 +80,9 @@
     </div>
   {:else}
     <!-- Key Bus Factor & Scan Stat Row -->
+    {#if error}
+      <PulseStaleNotice {error} {measuredAt} />
+    {/if}
     <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
       <!-- Bus Factor Card -->
       <div class="p-3 rounded-lg border border-border/60 bg-surface flex flex-col justify-between">

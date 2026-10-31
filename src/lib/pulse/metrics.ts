@@ -628,11 +628,16 @@ export function computeHotspotRisks(
 
 /**
  * Computes period comparison deltas between current window (last 30d) and prior window (30-60d).
+ *
+ * `truncated` is whether the scan that produced `commits` stopped before the
+ * start of history. It defaults to false so a caller holding a complete
+ * history need not say so.
  */
 export function computePeriodCompare(
   commits: readonly PulseCommitSummary[],
   nowMs = Date.now(),
   periodDays = 30,
+  truncated = false,
 ): PeriodCompareDeltas {
   const periodMs = periodDays * 86400 * 1000;
   const currentStart = nowMs - periodMs;
@@ -647,10 +652,12 @@ export function computePeriodCompare(
 
   const currentDays = new Set<string>();
   const priorDays = new Set<string>();
+  let oldestMs = Infinity;
 
   for (const c of commits) {
     const commitMs = c.timestamp * 1000;
     const dayKey = formatLocalDayKey(commitMs);
+    if (commitMs < oldestMs) oldestMs = commitMs;
 
     if (commitMs >= currentStart && commitMs <= nowMs) {
       currentCommits++;
@@ -665,10 +672,16 @@ export function computePeriodCompare(
     }
   }
 
-  const calcPct = (curr: number, prior: number): number => {
-    if (prior === 0) return curr > 0 ? 100 : 0;
+  // Nothing to divide by: growth from zero is not a percentage. Reporting it
+  // as +100% read as measured growth when it was "no prior data".
+  const calcPct = (curr: number, prior: number): number | null => {
+    if (prior === 0) return null;
     return Math.round(((curr - prior) / prior) * 100);
   };
+
+  // The prior period is fully scanned when history was read to its start, or
+  // when a commit older than the period's start proves the walk went past it.
+  const priorWindowCovered = !truncated || oldestMs < priorStart;
 
   return {
     currentCommits,
@@ -683,6 +696,7 @@ export function computePeriodCompare(
     currentActiveDays: currentDays.size,
     priorActiveDays: priorDays.size,
     activeDaysDelta: currentDays.size - priorDays.size,
+    priorWindowCovered,
   };
 }
 

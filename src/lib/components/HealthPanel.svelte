@@ -84,6 +84,7 @@
   import { summarizeHealth, type HealthSummary, type HealthTone } from "../health/summary";
   import { HEALTH_CONTENT_WIDTH, HEALTH_PROSE_WIDTH } from "../health/sections";
   import type { SectionCount } from "../health/counts";
+  import { withoutTrailingPeriod } from "../format";
   import { keyedList } from "../ui/eachKeys";
   import HealthSection from "./health/HealthSection.svelte";
   import HealthTable from "./health/HealthTable.svelte";
@@ -105,6 +106,13 @@
   import Skeleton from "./Skeleton.svelte";
 
   let report = $state<DepsHealthReport | null>(null);
+  /**
+   * The repository `report` was scanned from. A failed rescan may keep the
+   * report on screen under a failure banner, but only the report of the same
+   * repository: another repository's findings under this one's name would be
+   * worse than none.
+   */
+  let reportPath = $state<string | null>(null);
   let dependabot = $state<DependabotReport | null>(null);
   let dependabotCheckedAt = $state<number | null>(null);
   let dependabotRequestFailed = $state(false);
@@ -442,6 +450,22 @@
     return guard;
   }
 
+  /**
+   * A failed scan is recorded in Diagnostics like every other panel failure.
+   * The previous report of the same repository stays visible beneath the
+   * failure banner; anything else is dropped rather than shown out of context.
+   */
+  function recordScanFailure(repoPath: string, reason: unknown) {
+    errorMsg = reportPanelError("health", reason);
+    if (!report || reportPath !== repoPath) {
+      report = null;
+      reportPath = null;
+    }
+    // A failed scan must not mark the repo as scanned, or the effect above
+    // would refuse to rescan it after something changes.
+    scanned.path = "";
+  }
+
   async function scan(path?: string) {
     const repoPath = path ?? $repoStore.currentPath;
     if (!repoPath) return;
@@ -462,15 +486,12 @@
     try {
       if (deps.status === "fulfilled") {
         report = deps.value;
+        reportPath = repoPath;
         // A new scan supersedes whatever a plan was written against.
         plan = null;
         planError = null;
       } else {
-        errorMsg = formatError(deps.reason);
-        report = null;
-        // A failed scan must not mark the repo as scanned, or the effect above
-        // would refuse to rescan it after something changes.
-        scanned.path = "";
+        recordScanFailure(repoPath, deps.reason);
       }
       if (dead.status === "fulfilled") {
         deadSymbolsAvailable = dead.value.available;
@@ -517,9 +538,7 @@
         });
       }
     } catch (err: unknown) {
-      errorMsg = formatError(err);
-      report = null;
-      scanned.path = "";
+      recordScanFailure(repoPath, err);
       deadSymbols = [];
       deadSymbolsAvailable = false;
       deadSymbolsTotal = 0;
@@ -826,6 +845,7 @@
         agentNotice = null;
         scanned.path = "";
         report = null;
+        reportPath = null;
         dependabot = null;
         dependabotCheckedAt = null;
         dependabotRequestFailed = false;
@@ -856,6 +876,7 @@
       checkingGithub = false;
       if (cached) {
         report = cached.deps;
+        reportPath = path;
         dependabot = cached.dependabot;
         dependabotCheckedAt = cached.dependabotCheckedAt;
         dependabotRequestFailed = cached.dependabotRequestFailed;
@@ -864,6 +885,7 @@
         codeScanningRequestFailed = cached.codeScanningRequestFailed;
       } else {
         report = null;
+        reportPath = null;
         dependabot = null;
         dependabotCheckedAt = null;
         dependabotRequestFailed = false;
@@ -906,6 +928,35 @@
 </script>
 
 <div class="flex-1 flex flex-col bg-background h-full text-xs font-sans overflow-hidden">
+  <!-- The local scan failed. When an earlier report of this repository is still
+       on screen the banner says so, so its findings are not read as current. -->
+  {#snippet scanFailureBanner()}
+    <div
+      role="alert"
+      class="p-3 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-200 flex flex-wrap items-center justify-between gap-2 {HEALTH_PROSE_WIDTH}"
+    >
+      <span class="min-w-0 wrap-break-word"
+        >Scan failed: {withoutTrailingPeriod(errorMsg ?? "")}{report ? ". Showing results from the previous scan." : "."}</span
+      >
+      <span class="flex items-center gap-2 shrink-0">
+        <button
+          type="button"
+          onclick={() => scan()}
+          disabled={loading}
+          class="gp-btn py-1! px-2.5! text-[11px]! disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          Try again
+        </button>
+        <button
+          type="button"
+          onclick={() => window.dispatchEvent(new CustomEvent("gitpulse:diagnostics"))}
+          class="gp-btn py-1! px-2.5! text-[11px]!"
+        >
+          Open Diagnostics
+        </button>
+      </span>
+    </div>
+  {/snippet}
   {#snippet dependabotRows()}
     {#each keyedList(dependabot?.alerts ?? [], (alert) => `${alert.number}:${alert.package}:${alert.manifest_path}`) as { item: alert, key } (key)}
       <tr class="border-t border-border/40 align-top">
@@ -1211,12 +1262,13 @@
           <Skeleton variant="text" count={4} height="2rem" />
         </div>
       </div>
-    {:else if errorMsg}
-      <div class="p-3 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-200 {HEALTH_PROSE_WIDTH}">
-        {errorMsg}
-      </div>
+    {:else if errorMsg && !report}
+      {@render scanFailureBanner()}
       {@render githubSections()}
     {:else if report}
+      {#if errorMsg}
+        {@render scanFailureBanner()}
+      {/if}
       {#if summary}
         <HealthSection id="summary">
           <HealthSummaryCard {summary} rendered={renderedSections} />
@@ -1597,8 +1649,9 @@
               <p class="mt-2 text-[10px] font-mono text-textMuted">generation {codegraph.generation_id}</p>
             {/if}
             <p class="mt-2 text-[11px] text-textMuted">
-              Agents query this map through `gitpulse_codeintel_search`, `impact`, `trace` and
-              `dead_symbols`. A dash means that count was not stored — not that it is zero.
+              Agents query this map through <code class="font-mono">gitpulse_codeintel_search</code>,
+              <code class="font-mono">impact</code>, <code class="font-mono">trace</code> and
+              <code class="font-mono">dead_symbols</code>. A dash means that count was not stored — not that it is zero.
             </p>
           </div>
         {:else if codegraph}

@@ -295,16 +295,24 @@ export interface HotspotRiskItem {
 export interface PeriodCompareDeltas {
   readonly currentCommits: number;
   readonly priorCommits: number;
-  readonly commitsDeltaPct: number;
+  /** Null when the prior period has nothing to divide by: growth from zero is unknown, not +100%. */
+  readonly commitsDeltaPct: number | null;
   readonly currentAdds: number;
   readonly priorAdds: number;
-  readonly addsDeltaPct: number;
+  readonly addsDeltaPct: number | null;
   readonly currentDels: number;
   readonly priorDels: number;
-  readonly delsDeltaPct: number;
+  readonly delsDeltaPct: number | null;
   readonly currentActiveDays: number;
   readonly priorActiveDays: number;
   readonly activeDaysDelta: number;
+  /**
+   * Whether the scan reached back through the whole prior period. False when
+   * the history was capped and its oldest commit is newer than the period's
+   * start: an empty or thin prior period then means "not scanned", and every
+   * delta against it is a floor on nothing.
+   */
+  readonly priorWindowCovered: boolean;
 }
 
 

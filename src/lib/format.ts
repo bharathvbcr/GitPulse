@@ -41,6 +41,15 @@ export function plural(count: number, singular: string, pluralForm = `${singular
   return `${count} ${count === 1 ? singular : pluralForm}`;
 }
 
+/**
+ * An error message with its closing full stops and trailing whitespace
+ * removed, for a sentence that appends its own punctuation after it. Backend
+ * messages often end in "." already, which otherwise renders as "..".
+ */
+export function withoutTrailingPeriod(message: string): string {
+  return message.replace(/[.\s]+$/, "");
+}
+
 /** Minutes since local midnight as `HH:MM`, the value of an `<input type="time">`. */
 export function formatClockMinutes(minutes: number): string {
   return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
