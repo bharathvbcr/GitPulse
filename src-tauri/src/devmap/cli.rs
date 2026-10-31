@@ -1121,11 +1121,13 @@ pub fn status(repo_path: &str) -> CliStatus {
     // on the path the override exists to take it off.
     #[cfg(test)]
     {
-        if let Some(canned) = TEST_STATUS
+        // Read into a local so the lock is released before the answer is
+        // delayed: held across the wait, it serialized every concurrent probe.
+        let canned = TEST_STATUS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-        {
+            .clone();
+        if let Some(canned) = canned {
             TEST_STATUS_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             #[cfg(unix)]
             wait_test_status_delay();
