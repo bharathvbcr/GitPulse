@@ -1,17 +1,21 @@
 <script lang="ts">
   import type { DoraReport } from "../../pulse/types";
+  import PulseStaleNotice from "./PulseStaleNotice.svelte";
   import { Rocket, RefreshCw, Info } from "@lucide/svelte";
 
   let {
     dora = null,
     error = null,
     loading = false,
+    measuredAt = null,
     onRefresh,
   }: {
     dora: DoraReport | null;
     /** Why the tag/ancestry walk produced nothing. Never rendered as zeroes. */
     error?: string | null;
     loading?: boolean;
+    /** When `dora` was measured (epoch ms); dates the figures if a refresh fails. */
+    measuredAt?: number | null;
     onRefresh?: () => void;
   } = $props();
 
@@ -97,6 +101,9 @@
       No delivery or release data available.
     </div>
   {:else}
+    {#if error}
+      <PulseStaleNotice {error} {measuredAt} />
+    {/if}
     <!-- 4 DORA Cards Grid -->
     <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
       <!-- 1. Deployment Frequency -->

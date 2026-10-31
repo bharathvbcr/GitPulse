@@ -1,16 +1,20 @@
 <script lang="ts">
   import type { KnowledgeReport } from "../../pulse/types";
+  import PulseStaleNotice from "./PulseStaleNotice.svelte";
   import { Hourglass, Sparkles } from "@lucide/svelte";
 
   let {
     knowledge = null,
     error = null,
     loading = false,
+    measuredAt = null,
   }: {
     knowledge: KnowledgeReport | null;
     /** Why the blame scan produced nothing. Never rendered as "no data". */
     error?: string | null;
     loading?: boolean;
+    /** When `knowledge` was measured (epoch ms); dates the figures if a refresh fails. */
+    measuredAt?: number | null;
   } = $props();
 
   const dist = $derived(knowledge?.age_distribution);
@@ -69,6 +73,9 @@
       No code age data available.
     </div>
   {:else}
+    {#if error}
+      <PulseStaleNotice {error} {measuredAt} />
+    {/if}
     <!-- Headline Half-Life Card -->
     <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-3 rounded-lg border border-border/60 bg-surface">
       <div>

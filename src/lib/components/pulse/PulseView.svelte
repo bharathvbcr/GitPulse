@@ -192,6 +192,8 @@
   const error = $derived($pulseStore.error);
   const knowledgeError = $derived($pulseStore.knowledgeError);
   const doraError = $derived($pulseStore.doraError);
+  const knowledgeMeasuredAt = $derived($pulseStore.knowledgeMeasuredAt);
+  const doraMeasuredAt = $derived($pulseStore.doraMeasuredAt);
 
   const authors = $derived.by(() => {
     if (!report) return [];
@@ -483,12 +485,14 @@
           {knowledge}
           error={knowledgeError}
           loading={knowledgeLoading}
+          measuredAt={knowledgeMeasuredAt}
           onRefresh={() => pulseStore.loadKnowledge()}
         />
         <PulseCodeAge
           {knowledge}
           error={knowledgeError}
           loading={knowledgeLoading}
+          measuredAt={knowledgeMeasuredAt}
         />
 
       {:else if activeTab === "dora"}
@@ -496,6 +500,7 @@
           {dora}
           error={doraError}
           loading={doraLoading}
+          measuredAt={doraMeasuredAt}
           onRefresh={() => pulseStore.loadDora()}
         />
       {/if}
