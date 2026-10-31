@@ -126,6 +126,15 @@
 
   let copiedSha = $state(false);
   let copiedMessage = $state(false);
+  // Held so a pane that unmounts mid-flash does not write to dead state.
+  let copiedShaTimer: ReturnType<typeof setTimeout> | undefined;
+  let copiedMessageTimer: ReturnType<typeof setTimeout> | undefined;
+  $effect(() => {
+    return () => {
+      clearTimeout(copiedShaTimer);
+      clearTimeout(copiedMessageTimer);
+    };
+  });
 
   async function copySha(id: string) {
     if (!(await copyText(id))) {
@@ -134,7 +143,8 @@
     }
     copiedSha = true;
     toastStore.info(`Copied full SHA: ${id.slice(0, 8)}`, undefined, 2000);
-    setTimeout(() => (copiedSha = false), 1500);
+    clearTimeout(copiedShaTimer);
+    copiedShaTimer = setTimeout(() => (copiedSha = false), 1500);
   }
 
   async function copyMessage(msg: string) {
@@ -144,7 +154,8 @@
     }
     copiedMessage = true;
     toastStore.info("Copied commit message", undefined, 2000);
-    setTimeout(() => (copiedMessage = false), 1500);
+    clearTimeout(copiedMessageTimer);
+    copiedMessageTimer = setTimeout(() => (copiedMessage = false), 1500);
   }
 
   async function explainCommit() {
@@ -183,6 +194,9 @@
     untrack(() => {
       explainGuard?.cancel();
       isExplaining = false;
+      // The error belongs to the commit it failed on; left set it reads as
+      // "this commit failed" under every commit clicked afterwards.
+      explainError = null;
     });
   });
 

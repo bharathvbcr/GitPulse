@@ -65,6 +65,24 @@ describe("CommitDetails", () => {
   });
 });
 
+describe("CommitDetails explain error scope", () => {
+  it("clears a failed explanation when the commit or repository changes", () => {
+    const start = source.indexOf("// A new commit or repository outdates an explanation");
+    expect(start).toBeGreaterThan(-1);
+    const untrackStart = source.indexOf("untrack(() => {", start);
+    const block = source.slice(untrackStart, source.indexOf("});\n  });", untrackStart));
+    expect(block).toContain("explainGuard?.cancel();");
+    expect(block).toContain("explainError = null;");
+  });
+
+  it("holds the copied-flash timers and clears them when the pane unmounts", () => {
+    expect(source).toContain("copiedShaTimer = setTimeout(");
+    expect(source).toContain("copiedMessageTimer = setTimeout(");
+    expect(source).toContain("clearTimeout(copiedShaTimer);");
+    expect(source).toContain("clearTimeout(copiedMessageTimer);");
+  });
+});
+
 describe("CommitDetails single current commit", () => {
   it("takes its commit id from the same resolver as the commit list", () => {
     expect(source).toContain('import { resolveCurrentCommitId } from "../graph/currentCommit"');
