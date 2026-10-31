@@ -70,13 +70,13 @@ describe("terminal repository boundary", () => {
     }
   });
 
-  it("keys the view leaves per repository inside the panel, in one place", () => {
-    // What a panel holds (a diff, a file tree, a commit table) keeps scroll
-    // offsets, open tabs and drafts that belong to one repository. Until a
-    // leaf is untangled it is rebuilt on a switch, so nothing leaks into the
-    // next worktree. ViewSectionPanel is the single owner of that key.
-    expect(keyCount(panel)).toBe(1);
-    expect(panel).toMatch(/\{#key \$repoStore\.currentPath\}\s*\{@render children\(\)\}\s*\{\/key\}/);
+  it("retains view leaves inside the panel without destructive currentPath keying", () => {
+    // What a panel holds (a diff, a file tree, a commit table) now survives a
+    // repository tab switch without DOM reconstruction. Untangled leaves
+    // update in place (via repoScope, createRepoPanelCache, and store subscriptions).
+    // ViewSectionPanel holds no {#key} block, preserving view DOM and scroll.
+    expect(keyCount(panel)).toBe(0);
+    expect(panel).not.toContain("{#key");
     for (const view of VIEWS) {
       expect(read(`${view}.svelte`), `${view} does not render its content in a ViewSectionPanel`).toContain("<ViewSectionPanel");
       expect(keyCount(read(`${view}.svelte`)), `${view} keys on its own`).toBe(0);

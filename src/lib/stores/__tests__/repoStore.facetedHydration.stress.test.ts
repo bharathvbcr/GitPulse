@@ -14,11 +14,9 @@ import {
   createRepoStore,
   facetForChange,
   mergeFacets,
-  type BranchInfo,
-  type FileStatus,
   type InvokeFn,
-  type RepoChange,
 } from "../repoStore";
+import type { RepoChange } from "../../repos/events";
 import { memoryStorage } from "../../repos/persist";
 
 type CommandCounters = {

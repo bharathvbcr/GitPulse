@@ -248,8 +248,6 @@
   const deadLists = $derived(map ? preferredDeadLists(map) : null);
   const tests = $derived(selected ? roleSample(selected, "tests") : null);
   const docsHonesty = $derived(docsStatusHonesty(docsStatus));
-  /** The hits on screen answer an earlier query than the one in the box. */
-  const docsHitsStale = $derived(docsHits.length > 0 && docsSubmittedQuery !== docsQuery.trim());
   const searchHonesty = $derived(docsSearchHonesty(docsHits, DOCS_SEARCH_DEFAULT_LIMIT));
   const brokenDisplay = $derived(brokenLinksHonesty(brokenLinks, BROKEN_LINKS_DISPLAY_CAP));
   const searchPrompt = $derived(docsSearchPrompt(docsQuery, searchedQuery, docsHits.length, docsSearching));
@@ -572,7 +570,6 @@
       docsSubmittedQuery = memo?.docsSubmittedQuery ?? "";
       docsHits = memo?.docsHits ?? [];
       brokenLinks = [];
-      brokenLoaded = false;
       linkResult = null;
       errorMsg = null;
       docsError = null;

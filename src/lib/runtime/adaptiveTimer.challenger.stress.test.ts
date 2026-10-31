@@ -17,7 +17,7 @@ import {
   type HeartbeatTick,
 } from "./adaptiveTimer";
 import { resetForegroundFocus } from "./foreground";
-import { LAG_HARD_MS, LAG_SOFT_MS, noteEventLoopDelay, resetEventLoopDelay } from "./loadCadence";
+import { LAG_HARD_MS, noteEventLoopDelay, resetEventLoopDelay } from "./loadCadence";
 
 describe("CentralHeartbeatDispatcher Adversarial Stress Tests", () => {
   let doc: EventTarget & {
@@ -26,8 +26,8 @@ describe("CentralHeartbeatDispatcher Adversarial Stress Tests", () => {
     hasFocus: () => boolean;
   };
   let frame: EventTarget & {
-    setTimeout: (handler: TimerHandler, ms?: number) => ReturnType<typeof setTimeout>;
-    clearTimeout: (handle: ReturnType<typeof setTimeout>) => void;
+    setTimeout: (handler: TimerHandler, ms?: number) => any;
+    clearTimeout: (handle: any) => void;
   };
   let hasFocus = true;
 
@@ -40,8 +40,8 @@ describe("CentralHeartbeatDispatcher Adversarial Stress Tests", () => {
       hasFocus: () => hasFocus,
     });
     frame = Object.assign(new EventTarget(), {
-      setTimeout: (handler: TimerHandler, ms?: number) => globalThis.setTimeout(handler, ms),
-      clearTimeout: (handle: ReturnType<typeof setTimeout>) => globalThis.clearTimeout(handle),
+      setTimeout: (handler: TimerHandler, ms?: number) => globalThis.setTimeout(handler, ms) as any,
+      clearTimeout: (handle: any) => globalThis.clearTimeout(handle),
     });
     vi.stubGlobal("document", doc);
     vi.stubGlobal("window", frame);

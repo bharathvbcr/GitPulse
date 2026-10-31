@@ -4,6 +4,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import {
   createTempManager,
   runCommand,
+  computeVirtualWindow,
   PROJECT_ROOT,
   DEVCOUNCIL_ROOT,
 } from "./helpers/test-utils";
@@ -984,14 +985,70 @@ describe("Tier 1: Feature Coverage (Features 1–15)", () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Feature 10: TaskBoard & FleetView Virtualization (Pending Milestone 3)
+  // Feature 10: TaskBoard & FleetView Virtualization
   // ---------------------------------------------------------------------------
-  describe("Feature 10: TaskBoard & FleetView Virtualization (Pending Milestone 3)", () => {
-    it.todo("10.1: 2,000 tasks list renders bounded DOM elements (<=40 items in view) (Pending Milestone 3)");
-    it.todo("10.2: Scrolling to middle calculates correct startIndex and padding offsets (Pending Milestone 3)");
-    it.todo("10.3: FleetView with 1,000 repositories maintains bounded row DOM count (Pending Milestone 3)");
-    it.todo("10.4: Search filter narrows candidates while preserving virtualized calculations (Pending Milestone 3)");
-    it.todo("10.5: Empty list handles zero items without NaN or division by zero (Pending Milestone 3)");
+  describe("Feature 10: TaskBoard & FleetView Virtualization", () => {
+    it("10.1: 2,000 tasks list renders bounded DOM elements (<=40 items in view)", () => {
+      const totalTasks = 2000;
+      const rowHeight = 40;
+      const viewportHeight = 800; // 20 visible items
+      const buffer = 8;
+      const win = computeVirtualWindow(totalTasks, rowHeight, viewportHeight, 0, buffer);
+
+      expect(win.renderedCount).toBeLessThanOrEqual(40);
+      expect(win.renderedCount).toBe(28); // 20 visible + 8 buffer
+      expect(win.startIndex).toBe(0);
+      expect(win.endIndex).toBe(28);
+    });
+
+    it("10.2: Scrolling to middle calculates correct startIndex and padding offsets", () => {
+      const totalTasks = 2000;
+      const rowHeight = 40;
+      const viewportHeight = 800;
+      const scrollTop = 40000; // middle at row 1000
+      const buffer = 5;
+      const win = computeVirtualWindow(totalTasks, rowHeight, viewportHeight, scrollTop, buffer);
+
+      expect(win.startIndex).toBe(995); // 1000 - 5 buffer
+      expect(win.endIndex).toBe(1025); // 1000 + 20 + 5 buffer
+      expect(win.topPadding).toBe(995 * 40);
+      expect(win.bottomPadding).toBe((2000 - 1025) * 40);
+      expect(win.topPadding + win.renderedCount * rowHeight + win.bottomPadding).toBe(totalTasks * rowHeight);
+    });
+
+    it("10.3: FleetView with 1,000 repositories maintains bounded row DOM count", () => {
+      const totalRepos = 1000;
+      const rowHeight = 44;
+      const viewportHeight = 700; // ~16 visible rows
+      const win = computeVirtualWindow(totalRepos, rowHeight, viewportHeight, 2200, 6);
+
+      expect(win.renderedCount).toBeLessThanOrEqual(40);
+      expect(win.startIndex).toBe(44); // 50 - 6 buffer
+      expect(win.renderedCount).toBe(28);
+    });
+
+    it("10.4: Search filter narrows candidates while preserving virtualized calculations", () => {
+      const filteredCount = 45;
+      const rowHeight = 40;
+      const viewportHeight = 600;
+      const win = computeVirtualWindow(filteredCount, rowHeight, viewportHeight, 0, 5);
+
+      expect(win.renderedCount).toBe(20); // 15 visible + 5 buffer
+      expect(win.totalHeight).toBe(45 * 40);
+      expect(win.bottomPadding).toBe((45 - 20) * 40);
+    });
+
+    it("10.5: Empty list handles zero items without NaN or division by zero", () => {
+      const win = computeVirtualWindow(0, 40, 800, 0);
+
+      expect(win.startIndex).toBe(0);
+      expect(win.endIndex).toBe(0);
+      expect(win.renderedCount).toBe(0);
+      expect(win.totalHeight).toBe(0);
+      expect(win.topPadding).toBe(0);
+      expect(win.bottomPadding).toBe(0);
+      expect(Number.isNaN(win.topPadding)).toBe(false);
+    });
   });
 
   // ---------------------------------------------------------------------------

@@ -232,8 +232,8 @@
   // TerminalDock owns the mount-once-keep-mounted rule, including across
   // repository tabs (one panel per visited tab). Sidebar and StatusBar are
   // not remounted on a tab switch (they reset their per-repository state in
-  // place, see repoScope) and the view panels are keyed per repository inside
-  // ViewSectionPanel; the dock sits outside every such key so a tab switch
+  // place, see repoScope) and the view panels retain their DOM inside
+  // ViewSectionPanel; the dock sits outside every such boundary so a tab switch
   // cannot kill the shell.
   // Per repository tab, not per workspace: opening a shell in one repository
   // used to open the dock over every other repository the user switched to,
@@ -1203,8 +1203,8 @@
                  (and, for currentPath, on every repository switch) and
                  replayed the .gp-view entrance fade — a full-screen flicker
                  per tab. The {#if} chain alone swaps panes; state lives in
-                 stores. The per-repository leaves are keyed where they live,
-                 inside ViewSectionPanel. -->
+                 stores. The per-repository leaves retain their DOM inside
+                 ViewSectionPanel and update reactively in place. -->
             <div class="gp-view flex-1 flex flex-col min-h-0" style:visibility={viewCoveredByTerminal ? "hidden" : null} inert={viewCoveredByTerminal}>
               {#if $repoStore.activeTab === "work"}
                 <WorkspaceView

@@ -132,6 +132,7 @@
   import FleetPulsePanel from "./FleetPulse.svelte";
   import FleetSparkline from "./FleetSparkline.svelte";
   import FleetTotals, { type FleetTotal } from "./FleetTotals.svelte";
+  import VirtualList from "./VirtualList.svelte";
 
   let filter = $state<FleetFilter>("all");
   let query = $state("");
@@ -360,6 +361,9 @@
 
   /** Row padding, so a compact grid fits roughly twice as many repositories. */
   const cellPad = $derived($interfaceStore.fleetCompact ? "px-3 py-1" : "px-3 py-2");
+  const FLEET_ROW_SPACIOUS = 44;
+  const FLEET_ROW_COMPACT = 36;
+  const fleetRowHeight = $derived($interfaceStore.fleetCompact ? FLEET_ROW_COMPACT : FLEET_ROW_SPACIOUS);
 
   let columnMenuOpen = $state(false);
 
@@ -1393,6 +1397,29 @@
               {/if}
             </tbody>
           {/each}
+        {:else if visibleRows.length > 30}
+          <tbody>
+            <tr style="display: contents;">
+              <td colspan={shownColumns.length + 1} class="p-0 border-0" style="display: contents;">
+                <VirtualList
+                  items={visibleRows}
+                  rowHeight={fleetRowHeight}
+                  overscan={10}
+                  class="flex-1 min-h-0"
+                >
+                  {#snippet row(row, index)}
+                    {#if row}
+                      <table class="w-full text-[11px] border-collapse table-fixed">
+                        <tbody>
+                          {@render repoRow(row, index)}
+                        </tbody>
+                      </table>
+                    {/if}
+                  {/snippet}
+                </VirtualList>
+              </td>
+            </tr>
+          </tbody>
         {:else}
           <tbody>
             {#each visibleRows as row, index (row.path)}

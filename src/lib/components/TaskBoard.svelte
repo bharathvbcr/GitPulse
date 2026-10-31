@@ -96,6 +96,7 @@
   import TaskQuickAdd from "./TaskQuickAdd.svelte";
   import TaskHandoffSheet from "./TaskHandoffSheet.svelte";
   import Skeleton from "./Skeleton.svelte";
+  import VirtualList from "./VirtualList.svelte";
 
   let { repositoryPath = null, active = true, acceptsOpenRequests = false }: {
     repositoryPath?: string | null;
@@ -364,6 +365,12 @@
   // profile remembers; the header and the View menu write them back.
   const layout = $derived($interfaceStore.taskLayout);
   const compact = $derived($interfaceStore.taskDensity === "compact");
+  const LIST_ROW_HEIGHT_SPACIOUS = 40;
+  const LIST_ROW_HEIGHT_COMPACT = 32;
+  const BOARD_CARD_HEIGHT_SPACIOUS = 72;
+  const BOARD_CARD_HEIGHT_COMPACT = 58;
+  const listRowHeight = $derived(compact ? LIST_ROW_HEIGHT_COMPACT : LIST_ROW_HEIGHT_SPACIOUS);
+  const boardCardHeight = $derived(compact ? BOARD_CARD_HEIGHT_COMPACT : BOARD_CARD_HEIGHT_SPACIOUS);
   const cardFields = $derived(new Set($interfaceStore.taskCardFields));
   const hiddenColumns = $derived($interfaceStore.taskHiddenColumns);
   const showArchived = $derived($interfaceStore.taskShowArchivedWorkspaces);
@@ -2713,6 +2720,19 @@
               {#each group.cards as card (card.id)}{@render listRow(card)}{/each}
             </div>
           {/each}
+        {:else if listCards.length > 35}
+          <VirtualList
+            items={listCards}
+            rowHeight={listRowHeight}
+            overscan={10}
+            class="flex-1 min-h-0"
+          >
+            {#snippet row(card)}
+              {#if card}
+                {@render listRow(card)}
+              {/if}
+            {/snippet}
+          </VirtualList>
         {:else}
           {#each listCards as card (card.id)}{@render listRow(card)}{/each}
         {/if}
@@ -2773,16 +2793,34 @@
             oncontextmenu={(e) => onColumnContextMenu(e, status)}
           >
             <div class="column-title">{@render columnTitle(status)}</div>
-            <div class="cards">
-              {#each drawn as card (card.id)}
-                {#if insertBefore(status, "", drawn, card.id)}<div class="insert" aria-hidden="true"></div>{/if}
-                {@render boardCard(card, status)}
-              {/each}
-              {#if insertAtEnd(status, "", drawn)}<div class="insert" aria-hidden="true"></div>{/if}
-              {#if drawn.length === 0 && drag === null}
+            {#if drawn.length === 0 && drag === null}
+              <div class="cards">
                 <p class="column-empty">Drop a card here, or add one.</p>
-              {/if}
-            </div>
+              </div>
+            {:else if drawn.length > 35}
+              <VirtualList
+                items={drawn}
+                rowHeight={boardCardHeight}
+                overscan={8}
+                class="cards"
+              >
+                {#snippet row(card)}
+                  {#if card}
+                    {#if insertBefore(status, "", drawn, card.id)}<div class="insert" aria-hidden="true"></div>{/if}
+                    {@render boardCard(card, status)}
+                  {/if}
+                {/snippet}
+              </VirtualList>
+              {#if insertAtEnd(status, "", drawn)}<div class="insert" aria-hidden="true"></div>{/if}
+            {:else}
+              <div class="cards">
+                {#each drawn as card (card.id)}
+                  {#if insertBefore(status, "", drawn, card.id)}<div class="insert" aria-hidden="true"></div>{/if}
+                  {@render boardCard(card, status)}
+                {/each}
+                {#if insertAtEnd(status, "", drawn)}<div class="insert" aria-hidden="true"></div>{/if}
+              </div>
+            {/if}
             {@render columnPaging(status)}
           </section>
         {/each}
