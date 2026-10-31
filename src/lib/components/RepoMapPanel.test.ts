@@ -166,6 +166,17 @@ describe("RepoMapPanel template honesty", () => {
   });
 });
 
+describe("RepoMapPanel view switching", () => {
+  it("drops the previous view's graph before requesting the new one", () => {
+    // The view effect, not reloadGraph (which also begins `const view = mapView;`).
+    const start = source.indexOf("const view = mapView;\n    const path = currentRepo;");
+    const end = source.indexOf("reloadView(path, view)", start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    expect(source.slice(start, end)).toContain("graphLoad = null;");
+  });
+});
+
 describe("CodeView map section", () => {
   it("lazy-loads the Map panel beside Explorer and Blame", () => {
     expect(codeView).toContain('section === "map"');

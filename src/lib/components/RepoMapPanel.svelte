@@ -491,6 +491,9 @@
       searchRequests.next();
       linkRequests.next();
       graphLoading = brokenLoading = docsSearching = linksLoading = false;
+      // The previous view's payload must not stay painted (and interactive)
+      // under the new tab while the new one loads.
+      graphLoad = null;
       if (path) reloadView(path, view);
     });
   });
