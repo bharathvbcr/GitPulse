@@ -166,13 +166,15 @@ export function computeVirtualWindow(
     };
   }
 
-  const effectiveScroll = Math.max(0, scrollTop);
+  const safeViewport = Math.max(0, Number.isFinite(viewportHeight) ? viewportHeight : 0);
   const totalHeight = totalItems * itemHeight;
+  const maxScroll = Math.max(0, totalHeight - safeViewport);
+  const effectiveScroll = Math.min(Math.max(0, Number.isFinite(scrollTop) ? scrollTop : 0), maxScroll);
   const rawStart = Math.floor(effectiveScroll / itemHeight);
-  const rawVisible = Math.ceil(viewportHeight / itemHeight);
+  const rawVisible = safeViewport > 0 ? Math.ceil(safeViewport / itemHeight) : 0;
 
-  const startIndex = Math.max(0, rawStart - buffer);
-  const endIndex = Math.min(totalItems, rawStart + rawVisible + buffer);
+  const startIndex = Math.max(0, Math.min(totalItems, rawStart - buffer));
+  const endIndex = Math.max(startIndex, Math.min(totalItems, rawStart + rawVisible + buffer));
   const renderedCount = Math.max(0, endIndex - startIndex);
 
   const topPadding = startIndex * itemHeight;
