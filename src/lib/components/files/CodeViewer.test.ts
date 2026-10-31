@@ -170,7 +170,15 @@ describe("CodeViewer", () => {
       // The request is recorded before the file is read. Scrolling a viewer
       // with no rows lands at zero and looks like the reveal never happened.
       expect(effect).toContain("const lineCount = rawLines.length");
-      expect(effect).toContain("if (!path || lineCount === 0) return;");
+      expect(effect).toContain("lineCount === 0");
+      expect(effect).toContain("return;");
+    });
+
+    it("re-runs when a request arrives for the file that is already open", () => {
+      // consumeReveal reads the slot untracked, so without a tracked read of
+      // the store a hit for the open file would never scroll.
+      expect(effect).toContain("const pending = $revealRequest");
+      expect(effect).toContain("pending.path !== path");
     });
 
     it("asks only for a reveal naming this viewer's own file", () => {

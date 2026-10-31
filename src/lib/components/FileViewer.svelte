@@ -107,15 +107,6 @@
   let isLoadingFile = $state(false);
   /** The repository `activeBlob` was read from; a blob is only "current" for its own repository's path. */
   let blobRepo = $state<string | null>(null);
-  /**
-   * The blob on screen is the open file's own. A reload of it (a status change,
-   * an agent edit, a refused save) swaps the blob in place, so the viewer keeps
-   * its scroll, selection, find bar and view mode; only a different file, or a
-   * different repository's file of the same name, shows the placeholder.
-   */
-  const blobIsCurrent = $derived(
-    activeBlob !== null && activeBlob.path === activeTabPath && blobRepo === $currentRepoPath,
-  );
   let fileError = $state<string | null>(null);
   let inflightGuard: AsyncGuard | null = null;
   let prevLoadKey = "";
@@ -128,6 +119,15 @@
 
   let openTabs = $derived(tabState.tabs);
   let activeTabPath = $derived(tabState.active);
+  /**
+   * The blob on screen is the open file's own. A reload of it (a status change,
+   * an agent edit, a refused save) swaps the blob in place, so the viewer keeps
+   * its scroll, selection, find bar and view mode; only a different file, or a
+   * different repository's file of the same name, shows the placeholder.
+   */
+  const blobIsCurrent = $derived(
+    activeBlob !== null && activeBlob.path === activeTabPath && blobRepo === $currentRepoPath,
+  );
   let activeDraft = $derived(
     activeTabPath ? editorDraft(tabState, activeTabPath) : undefined,
   );
