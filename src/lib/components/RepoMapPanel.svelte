@@ -7,6 +7,7 @@
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { liveIndex } from "../codeintel/liveIndex";
   import { buildBlockReason } from "../codeintel/buildBlock";
+  import { focusTabAt, handleTablistKeydown, panelId, tabId, tabProps } from "../dom/tablist";
   import { Loader2 } from "@lucide/svelte";
   import { copyDevmapLogs } from "../codeintel/diagnostics";
   import {
@@ -86,6 +87,16 @@
     | "docs"
     | "docgraph"
     | "links";
+
+  const MAP_VIEWS: ReadonlyArray<{ id: MapView; label: string; title?: string }> = [
+    { id: "navigator", label: "Navigator" },
+    { id: "files", label: "Files", title: "File import graph (ranked cap)" },
+    { id: "symbols", label: "Symbols", title: "Symbol call graph (ranked cap)" },
+    { id: "subsystems", label: "Subsystems", title: "Subsystem handoff map" },
+    { id: "docgraph", label: "Doc graph", title: "Markdown doc link graph (same free-2D canvas)" },
+    { id: "docs", label: "Docs", title: "Repo markdown search and broken links" },
+    { id: "links", label: "Links", title: "Cross-repo import link candidates from the workspace registry" },
+  ];
 
   const CODE_GRAPH_VIEWS = new Set<MapView>(["files", "symbols", "subsystems", "docgraph"]);
   const BROKEN_LINKS_DISPLAY_CAP = 200;
@@ -592,6 +603,16 @@
   function setView(view: MapView) {
     mapView = view;
   }
+
+  let tablistEl: HTMLDivElement | undefined = $state();
+
+  function onTablistKeydown(e: KeyboardEvent) {
+    const move = handleTablistKeydown(e.key, MAP_VIEWS.findIndex((v) => v.id === mapView), MAP_VIEWS.length);
+    if (!move) return;
+    e.preventDefault();
+    setView(MAP_VIEWS[move.index].id);
+    focusTabAt(tablistEl, move.index);
+  }
 </script>
 
 <div class="flex-1 flex flex-col min-h-0 font-sans text-sm text-textPrimary">
@@ -714,79 +735,24 @@
 
   <!-- View switcher: navigator vs canvases vs docs vs links -->
   <div
+    bind:this={tablistEl}
     class="shrink-0 flex flex-wrap items-center gap-1 border-b border-border/50 px-2 py-1 text-[11px]"
     role="tablist"
     aria-label="Map views"
+    tabindex="-1"
+    onkeydown={onTablistKeydown}
   >
-    <button
-      type="button"
-      role="tab"
-      aria-selected={mapView === "navigator"}
-      class="rounded px-2 py-0.5 {mapView === 'navigator' ? 'bg-accent/15 text-textPrimary' : 'text-textMuted'}"
-      onclick={() => setView("navigator")}
-    >
-      Navigator
-    </button>
-    <button
-      type="button"
-      role="tab"
-      aria-selected={mapView === "files"}
-      class="rounded px-2 py-0.5 {mapView === 'files' ? 'bg-accent/15 text-textPrimary' : 'text-textMuted'}"
-      onclick={() => setView("files")}
-      title="File import graph (ranked cap)"
-    >
-      Files
-    </button>
-    <button
-      type="button"
-      role="tab"
-      aria-selected={mapView === "symbols"}
-      class="rounded px-2 py-0.5 {mapView === 'symbols' ? 'bg-accent/15 text-textPrimary' : 'text-textMuted'}"
-      onclick={() => setView("symbols")}
-      title="Symbol call graph (ranked cap)"
-    >
-      Symbols
-    </button>
-    <button
-      type="button"
-      role="tab"
-      aria-selected={mapView === "subsystems"}
-      class="rounded px-2 py-0.5 {mapView === 'subsystems' ? 'bg-accent/15 text-textPrimary' : 'text-textMuted'}"
-      onclick={() => setView("subsystems")}
-      title="Subsystem handoff map"
-    >
-      Subsystems
-    </button>
-    <button
-      type="button"
-      role="tab"
-      aria-selected={mapView === "docgraph"}
-      class="rounded px-2 py-0.5 {mapView === 'docgraph' ? 'bg-accent/15 text-textPrimary' : 'text-textMuted'}"
-      onclick={() => setView("docgraph")}
-      title="Markdown doc link graph (same free-2D canvas)"
-    >
-      Doc graph
-    </button>
-    <button
-      type="button"
-      role="tab"
-      aria-selected={mapView === "docs"}
-      class="rounded px-2 py-0.5 {mapView === 'docs' ? 'bg-accent/15 text-textPrimary' : 'text-textMuted'}"
-      onclick={() => setView("docs")}
-      title="Repo markdown search and broken links"
-    >
-      Docs
-    </button>
-    <button
-      type="button"
-      role="tab"
-      aria-selected={mapView === "links"}
-      class="rounded px-2 py-0.5 {mapView === 'links' ? 'bg-accent/15 text-textPrimary' : 'text-textMuted'}"
-      onclick={() => setView("links")}
-      title="Cross-repo import link candidates from the workspace registry"
-    >
-      Links
-    </button>
+    {#each MAP_VIEWS as view (view.id)}
+      <button
+        type="button"
+        {...tabProps("map-view", view.id, mapView === view.id)}
+        class="rounded px-2 py-0.5 {mapView === view.id ? 'bg-accent/15 text-textPrimary' : 'text-textMuted'}"
+        onclick={() => setView(view.id)}
+        title={view.title}
+      >
+        {view.label}
+      </button>
+    {/each}
   </div>
 
   {#if actionNote}
@@ -795,6 +761,12 @@
     </div>
   {/if}
 
+  <div
+    class="flex-1 min-h-0 flex flex-col"
+    role="tabpanel"
+    id={panelId("map-view", mapView)}
+    aria-labelledby={tabId("map-view", mapView)}
+  >
   {#if CODE_GRAPH_VIEWS.has(mapView)}
     <div class="flex-1 min-h-0 flex flex-col">
       <CodeGraphCanvas scopeKey={JSON.stringify([currentRepo, mapView])} load={graphLoad} loading={graphLoading} onOpenNode={openGraphNode} />
@@ -1239,4 +1211,5 @@
       </div>
     </div>
   {/if}
+  </div>
 </div>

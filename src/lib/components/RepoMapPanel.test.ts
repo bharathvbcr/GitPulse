@@ -222,7 +222,9 @@ describe("RepoMapPanel docs search", () => {
     expect(source).toContain("docsSearchPrompt(docsQuery, searchedQuery, docsHits.length, docsSearching)");
     const none = template.indexOf("No hits.");
     expect(none).toBeGreaterThan(-1);
-    expect(template.slice(template.lastIndexOf("{#if", none), none)).toBe('{#if searchPrompt === "none"}\n          <p class="mt-2 text-[11px] text-textMuted">');
+    expect(template.slice(template.lastIndexOf("{#if", none), none)).toMatch(
+      /^\{#if searchPrompt === "none"\}\s*<p[^>]*>\s*$/,
+    );
     expect(template.indexOf("No hits.", none + 1)).toBe(-1);
     expect(template).toContain("Press Enter to search.");
   });
@@ -238,6 +240,33 @@ describe("RepoMapPanel docs search", () => {
 
   it("disables Search for an empty query", () => {
     expect(template).toContain("disabled={docsSearching || !$repoStore.currentPath || !docsQuery.trim()}");
+  });
+});
+
+describe("RepoMapPanel map view tablist", () => {
+  const template = source.slice(source.lastIndexOf("</script>"));
+
+  it("uses the shared tablist helpers instead of seven hand-written tabs", () => {
+    expect(source).toContain('tabProps("map-view"');
+    expect(source).toContain("handleTablistKeydown(");
+    expect(source).toContain("focusTabAt(tablistEl");
+    expect(template).not.toMatch(/role="tab"/);
+    expect(template).not.toMatch(/aria-selected=/);
+    expect(source).toContain("const MAP_VIEWS");
+    for (const id of ["navigator", "files", "symbols", "subsystems", "docgraph", "docs", "links"]) {
+      expect(source).toContain(`{ id: "${id}"`);
+    }
+  });
+
+  it("wraps the whole content chain in the tabpanel the selected tab controls", () => {
+    expect(template).toContain('role="tabpanel"');
+    expect(template).toContain('id={panelId("map-view", mapView)}');
+    expect(template).toContain('aria-labelledby={tabId("map-view", mapView)}');
+    const panel = template.indexOf('role="tabpanel"');
+    const chain = template.indexOf("{#if CODE_GRAPH_VIEWS.has(mapView)}");
+    expect(chain).toBeGreaterThan(panel);
+    // Nothing but the panel's own opening tag sits between them.
+    expect(template.slice(panel, chain)).not.toMatch(/\{#if/);
   });
 });
 
