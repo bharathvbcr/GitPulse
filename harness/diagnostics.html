@@ -203,6 +203,19 @@
     await click("Docs");
     check("returning to Docs keeps the query and the hits",target.querySelector('input[type="search"]').value==="boom"&&target.textContent.includes("ALPHA-HIT")&&target.textContent.includes('Results for "alpha"'));
     check("and does not search again on return",calls.get("cmd_docs_search")===searchCallsBeforeLeaving);
+    // Each repository keeps its own docs search.
+    {
+      const {get}=await import("svelte/store");
+      const tabFor = path => get(repoStore).openTabs.find(tab=>tab.path===path)?.id;
+      await repoStore.openRepo("/r/other");await settle();
+      check("another repository's Docs starts with an empty box and no hits",target.querySelector('input[type="search"]').value===""&&!target.textContent.includes("ALPHA-HIT"));
+      await typeOnly("other-only");
+      await repoStore.activateTab(tabFor("/r/diagnostics"));await settle();
+      check("switching back restores the first repository's query and hits",target.querySelector('input[type="search"]').value==="boom"&&target.textContent.includes("ALPHA-HIT"));
+      await repoStore.activateTab(tabFor("/r/other"));await settle();
+      check("the other repository kept its own query, not the first one's",target.querySelector('input[type="search"]').value==="other-only"&&!target.textContent.includes("ALPHA-HIT"));
+      await repoStore.activateTab(tabFor("/r/diagnostics"));await settle();
+    }
     // A vault refresh that fails must not read as "no broken links".
     await click("Symbols");take("graph").resolve({available:false,reason:"symbols",kind:"code_graph",payload:null});await settle();
     const okRefresh=fixture.cmd_docs_refresh;

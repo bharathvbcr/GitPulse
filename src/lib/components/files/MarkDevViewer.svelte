@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { keyedList } from "../../ui/eachKeys";
   import {
     Eye,
@@ -73,7 +74,10 @@
    * the raw CodeViewer collects it.
    */
   $effect(() => {
-    if ($revealRequest?.path === filePath) viewMode = "raw";
+    const wanted = $revealRequest?.path === filePath;
+    // Raw and Split already mount a CodeViewer that collects the request; only
+    // the rendered page needs to give way, and the user's choice stands.
+    if (wanted && untrack(() => viewMode) === "rendered") viewMode = "raw";
   });
   let showOutline = $state(false);
   let wordWrap = $state(true);

@@ -248,6 +248,29 @@ ${row(["tokio", "1.40.0", "1.41.1", "maintained", "none", "", "cancelling_the_to
       await until(() => page().querySelector("h1"), 2000);
       check("a later good render replaces the failure", () => page().querySelector("h1") && !/renderer exploded/.test(viewer().textContent));
 
+      // --- a line target shows the source -----------------------------------
+      // The rendered page has no lines. A hit for this note (Search, Docs, a
+      // terminal link) must open where the line exists, but a chosen Split or
+      // Raw stays as chosen.
+      const { requestReveal, revealRequest, clearReveal } = await import("../src/lib/files/revealRequests");
+      const modeButton = label => [...viewer().querySelectorAll("button[aria-pressed]")].find(b => b.textContent.trim() === label);
+      check("the note opens Rendered", () => modeButton("Rendered")?.getAttribute("aria-pressed") === "true");
+      requestReveal("OTHER.md", 1, 1);
+      await until(() => modeButton("Raw")?.getAttribute("aria-pressed") === "true", 2000);
+      check("a reveal request for the open note switches Rendered to Raw", () => modeButton("Raw").getAttribute("aria-pressed") === "true");
+      await until(() => get(revealRequest) === null, 2000);
+      check("and the source view collects the request", () => get(revealRequest) === null);
+      modeButton("Split").click(); await settle();
+      requestReveal("OTHER.md", 1, 1);
+      await settle(); await settle();
+      check("a reveal request leaves a chosen Split view alone", () => modeButton("Split").getAttribute("aria-pressed") === "true");
+      clearReveal();
+      modeButton("Rendered").click(); await settle();
+      requestReveal("ELSEWHERE.md", 1, 1);
+      await settle();
+      check("and a request for another file does not switch this one", () => modeButton("Rendered").getAttribute("aria-pressed") === "true");
+      clearReveal();
+
       check("no unexpected native commands", () => unexpected.size === 0);
       check("no runtime errors", () => errors.length === 0);
       document.getElementById("result").textContent = `${results.length}/${results.length} passed`;

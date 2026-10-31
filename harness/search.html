@@ -227,6 +227,24 @@
           check("and the options", () => toggle("regex").checked && toggle("match case").checked);
           check("and the answer, without searching again", () => matches().length === 3 && summary()?.textContent.includes("3 matches") && searches.length === searchesBeforeLeaving);
 
+          // --- a repository switch is a different subject and a different memory ----
+          const homeRepo = get(repoStore).currentPath;
+          await repoStore.openRepo("/fixture/Other");
+          await until(() => get(repoStore).currentPath === "/fixture/Other");
+          await until(() => input().value === "");
+          check("another repository starts with an empty box and no answer", () => input().value === "" && !summary() && matches().length === 0);
+          check("and does not inherit the first repository's options", () => !toggle("regex").checked && !toggle("match case").checked);
+          await set(input(), "other-pattern");
+          await repoStore.activateTab(get(repoStore).openTabs.find(tab => tab.path === homeRepo).id);
+          await until(() => get(repoStore).currentPath === homeRepo && input().value === "needle");
+          check("switching back restores the first repository's pattern", () => input().value === "needle");
+          check("and its options and answer, without searching again", () => toggle("regex").checked && toggle("match case").checked && matches().length === 3 && searches.length === searchesBeforeLeaving);
+          await repoStore.activateTab(get(repoStore).openTabs.find(tab => tab.path === "/fixture/Other").id);
+          await until(() => get(repoStore).currentPath === "/fixture/Other" && input().value === "other-pattern");
+          check("the other repository kept what was typed there, not the first one's", () => input().value === "other-pattern" && matches().length === 0);
+          await repoStore.activateTab(get(repoStore).openTabs.find(tab => tab.path === homeRepo).id);
+          await until(() => get(repoStore).currentPath === homeRepo && input().value === "needle");
+
           check("no unhandled runtime errors", () => errors.length === 0);
           report();
         } catch (error) {
