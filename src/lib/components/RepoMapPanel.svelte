@@ -108,6 +108,11 @@
   let building = $state(false);
   let errorMsg = $state<string | null>(null);
   let actionNote = $state<string | null>(null);
+  let actionNoteKind = $state<"ok" | "error" | null>(null);
+  let buildKind = $state<"build" | "refresh" | null>(null);
+  // Plain: only timers read it, and it must not re-run any effect.
+  let noteTimer: number | null = null;
+  const SUCCESS_NOTE_MS = 6000;
   let mapView = $state<MapView>("navigator");
   let graphLoad = $state<GraphVizLoad | null>(null);
   let graphLoading = $state(false);
@@ -253,6 +258,10 @@
     for (const requests of [mapRequests, graphRequests, docsRequests, searchRequests, linkRequests, buildRequests, copyRequests]) requests.next();
   }
   onDestroy(cancelRequests);
+  onDestroy(() => {
+    if (noteTimer !== null) window.clearTimeout(noteTimer);
+    noteTimer = null;
+  });
   onDestroy(detailScope.dispose);
 
   $effect(() => {
@@ -414,28 +423,51 @@
     }
   }
 
+  function clearNote() {
+    if (noteTimer !== null) window.clearTimeout(noteTimer);
+    noteTimer = null;
+    actionNote = null;
+    actionNoteKind = null;
+  }
+
+  /**
+   * A success note is a transient confirmation and fades; a failure stays
+   * until the next build or a repository switch, because it is the only
+   * account of why the map on screen is not the one just asked for.
+   */
+  function setNote(text: string, kind: "ok" | "error") {
+    clearNote();
+    actionNote = text;
+    actionNoteKind = kind;
+    if (kind === "ok") noteTimer = window.setTimeout(clearNote, SUCCESS_NOTE_MS);
+  }
+
   async function runBuild(kind: "build" | "refresh") {
     const repoPath = $repoStore.currentPath;
     if (!repoPath) return;
     const request = buildRequests.next();
     const live = () => buildRequests.isCurrent(request) && currentRepo === repoPath;
     building = true;
-    actionNote = null;
+    buildKind = kind;
+    clearNote();
     errorMsg = null;
     try {
       const outcome = kind === "build" ? await buildDevmap(repoPath) : await refreshDevmap(repoPath);
       if (!live()) return;
       if (!outcome.ok) {
-        actionNote = reportMapFailure(kind, repoPath,
-          buildFailureReason(outcome, outcome.stdout.trim() || `devmap ${kind} failed`));
+        setNote(reportMapFailure(kind, repoPath,
+          buildFailureReason(outcome, outcome.stdout.trim() || `devmap ${kind} failed`)), "error");
       } else {
-        actionNote = `Map ${kind === "build" ? "built" : "refreshed"}.`;
+        setNote(`Map ${kind === "build" ? "built" : "refreshed"}.`, "ok");
       }
       await reload(repoPath);
     } catch (err) {
-      if (live()) actionNote = reportMapFailure(kind, repoPath, err);
+      if (live()) setNote(reportMapFailure(kind, repoPath, err), "error");
     } finally {
-      if (live()) building = false;
+      if (live()) {
+        building = false;
+        buildKind = null;
+      }
     }
   }
 
@@ -478,7 +510,8 @@
       docsError = null;
       brokenError = null;
       linksError = null;
-      actionNote = null;
+      clearNote();
+      buildKind = null;
       copyLogsNote = null;
       copyingLogs = false;
       loading = building = graphLoading = brokenLoading = docsSearching = linksLoading = false;
@@ -499,6 +532,7 @@
       // The previous view's payload must not stay painted (and interactive)
       // under the new tab while the new one loads.
       graphLoad = null;
+      if (actionNoteKind === "ok") clearNote();
       if (path) reloadView(path, view);
     });
   });
@@ -598,18 +632,28 @@
         class="gp-btn text-[11px] px-2 py-0.5"
         disabled={building || !$repoStore.currentPath || buildBlockedReason != null}
         title={buildBlockedReason ?? "Refresh the map index"}
+        aria-busy={building && buildKind === "refresh"}
         onclick={() => void runBuild("refresh")}
       >
-        Refresh
+        {#if building && buildKind === "refresh"}
+          <Loader2 size={12} class="animate-spin inline-block align-[-2px]" aria-hidden="true" /> Refreshing…
+        {:else}
+          Refresh index
+        {/if}
       </button>
       <button
         type="button"
         class="gp-btn text-[11px] px-2 py-0.5"
         disabled={building || !$repoStore.currentPath || buildBlockedReason != null}
         title={buildBlockedReason ?? "Build the map index"}
+        aria-busy={building && buildKind === "build"}
         onclick={() => void runBuild("build")}
       >
-        Build
+        {#if building && buildKind === "build"}
+          <Loader2 size={12} class="animate-spin inline-block align-[-2px]" aria-hidden="true" /> Building…
+        {:else}
+          Build index
+        {/if}
       </button>
     </span>
   </div>
@@ -910,9 +954,14 @@
           class="gp-btn mt-2"
           disabled={building || !$repoStore.currentPath || buildBlockedReason != null}
           title={buildBlockedReason ?? "Build the map index"}
+          aria-busy={building && buildKind === "build"}
           onclick={() => void runBuild("build")}
         >
-          Build Map
+          {#if building && buildKind === "build"}
+            <Loader2 size={12} class="animate-spin inline-block align-[-2px]" aria-hidden="true" /> Building…
+          {:else}
+            Build index
+          {/if}
         </button>
       {/if}
     </div>

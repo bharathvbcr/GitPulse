@@ -180,12 +180,38 @@ describe("RepoMapPanel build gating", () => {
     const busy = template.indexOf("{#if indexBusy && indexActivity}");
     const progress = template.indexOf('data-testid="map-index-progress"');
     const otherwise = template.indexOf("{:else}", busy);
-    const emptyButton = template.indexOf("Build Map", busy);
+    const emptyButton = template.indexOf("Build index", busy);
     expect(busy).toBeGreaterThan(-1);
     expect(progress).toBeGreaterThan(busy);
     expect(progress).toBeLessThan(otherwise);
     // The empty-state button lives only in the else branch.
     expect(emptyButton).toBeGreaterThan(otherwise);
+  });
+});
+
+describe("RepoMapPanel build feedback", () => {
+  const template = source.slice(source.lastIndexOf("</script>"));
+
+  it("shows a spinner and a progressive label on the pressed button", () => {
+    expect(source).toContain('let buildKind = $state<"build" | "refresh" | null>(null);');
+    expect(template).toContain("Building…");
+    expect(template).toContain("Refreshing…");
+    expect(template).toContain('class="animate-spin');
+    expect(template).toContain("Refresh index");
+    expect(template).toContain("Build index");
+    expect(template).not.toMatch(/\n\s*Build Map\s*\n/);
+  });
+
+  it("fades only success notes and clears the timer on teardown", () => {
+    expect(source).toContain("SUCCESS_NOTE_MS");
+    expect(source).toContain('if (kind === "ok") noteTimer = window.setTimeout(clearNote, SUCCESS_NOTE_MS);');
+    expect(source).toContain('if (actionNoteKind === "ok") clearNote();');
+    const destroy = source.slice(source.indexOf("onDestroy(() => {"), source.indexOf("onDestroy(detailScope.dispose)"));
+    expect(destroy).toContain("window.clearTimeout(noteTimer)");
+    // The only scheduled fade is the success one.
+    expect(source.match(/window\.setTimeout\(/g)).toHaveLength(1);
+    // The note row stays a live region.
+    expect(template).toMatch(/\{#if actionNote\}\s*<div[^>]*role="status"/);
   });
 });
 
