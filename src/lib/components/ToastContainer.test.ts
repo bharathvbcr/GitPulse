@@ -111,7 +111,9 @@ describe("the live region exists before the content lands in it", () => {
     const pile = body.slice(body.indexOf('data-testid="toast-pile"'));
     expect(body.slice(body.lastIndexOf("<div", body.indexOf('data-testid="toast-pile"')), body.indexOf('data-testid="toast-pile"'))).not.toContain("aria-hidden");
     expect(pile).toContain('aria-label="Undo: Created branch topic"');
-    expect(pile).toContain('aria-label="Dismiss notification"');
+    // Stacked toasts must not offer identical, context-free Dismiss buttons.
+    expect(pile).toContain('aria-label="Dismiss: Created branch topic"');
+    expect(pile).not.toContain('aria-label="Dismiss notification"');
     expect(body).toContain("Created branch topic — Undo available");
   });
 

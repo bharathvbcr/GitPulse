@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
-import IdentityPrompt, { firstEmptyField } from "./IdentityPrompt.svelte";
+import IdentityPrompt, { firstEmptyField, focusUnmoved } from "./IdentityPrompt.svelte";
 
 const source = readFileSync(
   join(dirname(fileURLToPath(import.meta.url)), "IdentityPrompt.svelte"),
@@ -29,16 +29,34 @@ describe("IdentityPrompt initial focus", () => {
     expect(mount.indexOf("repoStore.gitIdentity()")).toBeLessThan(mount.indexOf(".catch(() => {})"));
     expect(mount.indexOf(".catch(() => {})")).toBeLessThan(mount.indexOf(".focus("));
     expect(mount).toContain("await tick();");
-    expect(mount).toContain("formEl?.contains(document.activeElement)");
+    expect(mount).toContain("const shownWith = document.activeElement;");
+    expect(mount).toContain("!focusUnmoved(shownWith, document.activeElement)");
     expect(mount).toContain('firstEmptyField(name, email) === "name" ? nameEl : emailEl');
     expect(mount).toContain("focus({ preventScroll: true })");
   });
 
-  it("binds the form and both inputs it may focus", () => {
+  it("takes focus only if the user has not moved it since the prompt appeared", () => {
+    const body = { ownerDocument: null as unknown };
+    const doc = { body };
+    body.ownerDocument = doc;
+    const el = (name: string) => ({ name, ownerDocument: doc }) as unknown as Element;
+    const commitButton = el("commit");
+    const textarea = el("message");
+    const nameInput = el("name");
+    // Still on the Commit button that raised the prompt.
+    expect(focusUnmoved(commitButton, commitButton)).toBe(true);
+    // The element went away, so focus fell to the body (or nowhere).
+    expect(focusUnmoved(commitButton, body as unknown as Element)).toBe(true);
+    expect(focusUnmoved(commitButton, null)).toBe(true);
+    // Moved back to the message box, or into this form, while git was slow.
+    expect(focusUnmoved(commitButton, textarea)).toBe(false);
+    expect(focusUnmoved(commitButton, nameInput)).toBe(false);
+  });
+
+  it("binds both inputs it may focus", () => {
     const { body } = render(IdentityPrompt, { props: { onSaved: () => {}, onDismiss: () => {} } });
     expect(body).toContain('placeholder="Your name"');
     expect(body).toContain('placeholder="you@example.org"');
-    expect(source).toContain("bind:this={formEl}");
     expect(source).toContain("bind:this={nameEl}");
     expect(source).toContain("bind:this={emailEl}");
   });

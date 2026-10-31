@@ -163,7 +163,7 @@
           <button
             type="button"
             onclick={() => toastStore.dismiss(toast.id)}
-            aria-label="Dismiss notification"
+            aria-label="Dismiss: {toast.message}"
             class="shrink-0 p-1 rounded-full text-textMuted hover:text-textPrimary hover:bg-surfaceHover transition-colors"
           >
             <X size={13} />

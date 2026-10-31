@@ -6,7 +6,7 @@
   import type { MutationTarget } from "../repos/storeTypes";
   import { displayName } from "../repos/paths";
   import { trapFocus } from "../ui/focusTrap";
-  import { formatError } from "../ui/formatError";
+  import { reportPanelError } from "../diagnostics/report";
   import { LAYERS } from "../ui/layers";
   import { fade, scale } from "svelte/transition";
   import {
@@ -57,6 +57,8 @@
   let backups = $state<DeadbranchBackupInfo[]>([]);
   /** Why the backup list could not be read; null while it was read (even if empty). */
   let backupsError = $state<string | null>(null);
+  /** A read is in flight; Retry says so, since a repeated identical failure changes nothing else. */
+  let backupsLoading = $state(false);
   let selectedNames = $state<Set<string>>(new Set());
 
   // Filter state
@@ -161,6 +163,7 @@
     const target = repoStore.captureTarget();
     if (!target) return;
     const seq = ++backupsSeq;
+    backupsLoading = true;
     try {
       const listed = await deadbranchListBackups(target.path);
       if (seq !== backupsSeq) return;
@@ -173,7 +176,11 @@
       backupsTarget = target;
       // An unreadable list is not an empty one: the tab is where deleted
       // branches are recovered, so "no backups" must never stand in for it.
-      backupsError = formatError(err);
+      // Recorded and redacted like every other panel's read failure; the
+      // modal opens from the Ops pane, so it reports as "ops".
+      backupsError = reportPanelError("ops", err);
+    } finally {
+      if (seq === backupsSeq) backupsLoading = false;
     }
   }
 
@@ -630,8 +637,8 @@
               <AlertCircle size={24} class="text-rose-400" aria-hidden="true" />
               <p class="text-sm font-medium text-textPrimary">Couldn't read branch backups.</p>
               <p class="text-xs text-rose-300 break-words max-w-md">{backupsError}</p>
-              <button type="button" class="gp-btn mt-1" onclick={() => void loadBackups()}>
-                <RefreshCw size={12} /> Retry
+              <button type="button" class="gp-btn mt-1" disabled={backupsLoading} onclick={() => void loadBackups()}>
+                <RefreshCw size={12} class={backupsLoading ? "animate-spin" : ""} /> {backupsLoading ? "Retrying…" : "Retry"}
               </button>
             </div>
           {:else if backups.length === 0}

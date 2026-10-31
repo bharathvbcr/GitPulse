@@ -14,10 +14,28 @@ describe("BranchCleanupModal backups read failure", () => {
 
   it("records why the list could not be read and clears it on a good read", () => {
     expect(source).toContain("let backupsError = $state<string | null>(null);");
-    expect(source).toContain('import { formatError } from "../ui/formatError";');
     const [ok, failed] = load.split("} catch");
     expect(ok).toContain("backupsError = null;");
-    expect(failed).toContain("backupsError = formatError(err);");
+    expect(failed).toContain('backupsError = reportPanelError("ops", err);');
+  });
+
+  it("records the failure in diagnostics, redacted, as the Ops pane's own", () => {
+    // formatError would show the text but leave no record and skip the
+    // credential redaction the diagnostics seam applies. The modal opens from
+    // the Ops pane (ui/manviFocus.ts: cleanup -> ops), so "ops" is its source.
+    expect(source).toContain('import { reportPanelError } from "../diagnostics/report";');
+    expect(source).not.toContain("formatError");
+  });
+
+  it("says a retry is running, so a repeated identical failure is not mistaken for no reaction", () => {
+    const [, failed] = load.split("} catch");
+    expect(load).toContain("backupsLoading = true;");
+    expect(failed).toContain("finally {");
+    expect(failed).toContain("if (seq === backupsSeq) backupsLoading = false;");
+    const view = source.slice(source.indexOf("{#if backupsError}"));
+    const errorView = view.slice(0, view.indexOf("{:else if backups.length === 0}"));
+    expect(errorView).toContain("disabled={backupsLoading}");
+    expect(errorView).toContain('{backupsLoading ? "Retrying…" : "Retry"}');
   });
 
   it("never lets the empty-state sentence stand in for a failed read", () => {

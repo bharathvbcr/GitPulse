@@ -1068,6 +1068,10 @@
    * conversation continues. Its task lists both, so both link back to it.
    */
   const linkedRunId = $derived(taskRunId ?? resume?.runId ?? null);
+  const startingLabel = $derived(`Starting ${launcherLabel(launcher)}…`);
+  const endedLabel = $derived(resumeOffer ? "This session was ended by a signal." : "This session ended.");
+  /** What the always-mounted live region says: spawning wins, as it does in the status row. */
+  const statusAnnouncement = $derived(spawning ? startingLabel : !error && exited ? endedLabel : "");
 
   /** Opens the task this tab's attempt belongs to, where a new attempt starts. */
   async function openOwnTask() {
@@ -1112,7 +1116,11 @@
     // once: the box has its real size by then, and the observer's own fit for
     // the same change finds the grid already right.
     fits.settle();
-    if (findOpen) findInput?.focus();
+    // The grid has no PTY behind it while the bypass prompt waits, so every
+    // way back to this tab (Escape out of a menu, "View agent session", a
+    // notification) lands on the prompt's safer answer instead.
+    if (awaitingAcknowledgement) declineButton?.focus({ preventScroll: true });
+    else if (findOpen) findInput?.focus();
     else term?.focus();
   }
 
@@ -1560,15 +1568,11 @@
   });
 
   /**
-   * A hidden container has no size, so xterm cannot lay out while inactive.
-   * Becoming active is therefore the moment to refit — the ResizeObserver
-   * fires too, but only once the browser has recomputed layout, and the
-   * terminal must not paint a stale grid in between.
-   */
-  /**
    * Nothing else moves focus into the bypass prompt, so a keyboard user would
    * keep typing into a grid with no PTY behind it. Only the tab being looked
-   * at takes it: a background dock tab can wait on the same prompt.
+   * at takes it: a background dock tab can wait on the same prompt. This is
+   * the moment the prompt first appears; every later return to the tab goes
+   * through `reveal()`, which makes the same choice.
    */
   $effect(() => {
     if (!awaitingAcknowledgement || !active) return;
@@ -1577,6 +1581,12 @@
     });
   });
 
+  /**
+   * A hidden container has no size, so xterm cannot lay out while inactive.
+   * Becoming active is therefore the moment to refit — the ResizeObserver
+   * fires too, but only once the browser has recomputed layout, and the
+   * terminal must not paint a stale grid in between.
+   */
   $effect(() => {
     if (active) reveal();
     // A hover label left over from before the switch names a link the pointer
@@ -1620,6 +1630,10 @@
 </script>
 
 <div class="h-full w-full flex flex-col min-h-0 min-w-0">
+  <!-- Mounted from the start, so the text that lands in it later is announced;
+       a status inserted together with its words is mostly left unread. The
+       visible row below is hidden from assistive technology to match. -->
+  <span class="sr-only" role="status" aria-live="polite" data-terminal-announcer>{statusAnnouncement}</span>
   {#if warning}
     <div role="status" class="shrink-0 flex gap-2 items-center text-[11px] text-amber-300 px-3 py-1 border-b border-border/60">
       <span class="flex-1 min-w-0 truncate" title={warning}>{warning}</span>
@@ -1715,7 +1729,7 @@
     >
       {#if spawning}
         <LoaderCircle size={13} class="animate-spin text-accent shrink-0" />
-        <span role="status" class="text-textMuted text-[11px]">Starting {launcherLabel(launcher)}…</span>
+        <span aria-hidden="true" class="text-textMuted text-[11px]">{startingLabel}</span>
       {:else if error}
         <AlertCircle size={13} class="text-rose-400 shrink-0" />
         <span role="alert" class="text-rose-300 flex-1 min-w-0 break-words whitespace-pre-wrap max-h-24 overflow-y-auto text-[11px]">{error}</span>
@@ -1723,7 +1737,7 @@
           <RotateCw size={12} /> {taskRunId ? "Reconnect attempt" : "Retry"}
         </button>
       {:else if exited}
-        <span role="status" class="text-textMuted flex-1 text-[11px]">{resumeOffer ? "This session was ended by a signal." : "This session ended."}</span>
+        <span aria-hidden="true" class="text-textMuted flex-1 text-[11px]">{endedLabel}</span>
         {#if linkedRunId}
           <!-- The task details are where a new attempt starts, so the way
                there is here rather than only named in a tooltip. -->

@@ -9,6 +9,15 @@
     if (!email.trim()) return "email";
     return "name";
   }
+
+  /**
+   * Whether focus is still where it was when the prompt appeared (or nowhere,
+   * because that element went away). Anywhere else means the user moved on
+   * while git was being asked, and a late focus call would take it back.
+   */
+  export function focusUnmoved(shownWith: Element | null, now: Element | null): boolean {
+    return now === shownWith || now === null || now === now.ownerDocument.body;
+  }
 </script>
 
 <script lang="ts">
@@ -32,11 +41,11 @@
   let error = $state<string | null>(null);
   let problem = $derived(identityProblem(name, email));
 
-  let formEl = $state<HTMLFormElement | null>(null);
   let nameEl = $state<HTMLInputElement | null>(null);
   let emailEl = $state<HTMLInputElement | null>(null);
 
   onMount(() => {
+    const shownWith = document.activeElement;
     // Prefill whatever half is already known, so a missing email does not
     // also make the user retype a name git already has.
     void repoStore.gitIdentity().then((identity) => {
@@ -47,9 +56,9 @@
       // The prompt appears under a Commit button that keeps focus, so a
       // keyboard user would get no signal at all. Wait for the prefill so the
       // cursor lands on what is actually missing — unless they have already
-      // moved into the form themselves.
+      // moved on themselves, into this form or anywhere else.
       await tick();
-      if (formEl?.contains(document.activeElement)) return;
+      if (!focusUnmoved(shownWith, document.activeElement)) return;
       (firstEmptyField(name, email) === "name" ? nameEl : emailEl)?.focus({ preventScroll: true });
     });
   });
@@ -65,7 +74,7 @@
   }
 </script>
 
-<form bind:this={formEl} class="rounded-lg border border-border/60 bg-background p-2.5 space-y-2 text-[11px]" onsubmit={(event) => { event.preventDefault(); void save(); }}>
+<form class="rounded-lg border border-border/60 bg-background p-2.5 space-y-2 text-[11px]" onsubmit={(event) => { event.preventDefault(); void save(); }}>
   <p class="flex items-center gap-1.5 font-medium text-textPrimary"><UserRound size={12} /> Who should commits be recorded as?</p>
   <p class="text-[10px] text-textMuted">Git needs a name and an email for every commit. Nothing was committed yet.</p>
   <label class="block"><span class="sr-only">Name</span>

@@ -2,7 +2,8 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { hexColor, shouldRefit } from "./TerminalSession.svelte";
+import { render } from "svelte/server";
+import TerminalSession, { hexColor, shouldRefit } from "./TerminalSession.svelte";
 
 /**
  * These contracts moved here with the PTY itself when tabs arrived: they were
@@ -418,9 +419,47 @@ describe("TerminalSession bypass prompt and status announcements", () => {
     }
   });
 
-  it("announces spawn and exit politely and the error assertively, in full", () => {
-    expect(source).toMatch(/<span role="status"[^>]*>Starting \{launcherLabel\(launcher\)\}…/);
-    expect(source).toMatch(/<span role="status"[^>]*>\{resumeOffer \?/);
+  it("sends every way back to a waiting tab to the safer answer, not the grid", () => {
+    // `reveal()` is the tab's one focus seam: the panel calls it after Escape
+    // closes a menu, and the Sessions list and notifications call it through
+    // the registry, while `active` and the prompt do not change.
+    const start = source.indexOf("export function reveal()");
+    const body = source.slice(start, source.indexOf("\n  }", start));
+    const ask = body.indexOf("if (awaitingAcknowledgement) declineButton?.focus({ preventScroll: true });");
+    expect(ask).toBeGreaterThan(-1);
+    expect(ask).toBeLessThan(body.indexOf("findInput?.focus()"));
+    expect(ask).toBeLessThan(body.indexOf("term?.focus()"));
+    expect(body).toContain("else if (findOpen)");
+  });
+
+  it("keeps each effect's comment on the effect it describes", () => {
+    // The refit comment sits directly on the effect that reveals the tab.
+    expect(source).toMatch(
+      /terminal must not paint a stale grid in between\.\n   \*\/\n  \$effect\(\(\) => \{\n    if \(active\) reveal\(\);/,
+    );
+  });
+
+  it("mounts one polite live region before any status text can land in it", () => {
+    const { body } = render(TerminalSession, {
+      props: { repoPath: "/r", tabId: "t1", launcher: "shell", active: true, onTitle: () => {}, onChord: () => false },
+    });
+    // Present and empty while nothing is spawning or ended: the region exists
+    // first, and the words arrive in it.
+    expect(body).toMatch(/<span class="sr-only" role="status" aria-live="polite" data-terminal-announcer="">\s*<\/span>/);
+    expect(source).toContain("const statusAnnouncement = $derived(spawning ? startingLabel : !error && exited ? endedLabel : \"\");");
+    const region = source.indexOf("data-terminal-announcer");
+    expect(region).toBeGreaterThan(source.indexOf("<div class=\"h-full w-full flex flex-col min-h-0 min-w-0\">"));
+    expect(region).toBeLessThan(source.indexOf("{#if spawning}"));
+    expect(region).toBeLessThan(source.indexOf("{#if error || exited || spawning"));
+  });
+
+  it("hides the visible spawn and exit text from assistive technology instead of announcing it twice", () => {
+    expect(source).toMatch(/<span aria-hidden="true"[^>]*>\{startingLabel\}<\/span>/);
+    expect(source).toMatch(/<span aria-hidden="true"[^>]*>\{endedLabel\}<\/span>/);
+    expect(source).not.toMatch(/<span role="status"[^>]*>\{(?:startingLabel|endedLabel)\}/);
+  });
+
+  it("announces the error assertively, in full", () => {
     const alert = source.match(/<span role="alert"[^>]*>\{error\}<\/span>/)?.[0] ?? "";
     expect(alert).not.toBe("");
     expect(alert).not.toContain("truncate");
