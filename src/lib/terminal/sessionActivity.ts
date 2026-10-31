@@ -157,10 +157,22 @@ const TERMINAL_REPLY = new RegExp(
   "g",
 );
 
-/** Whether data xterm sent to the PTY came from the reader rather than xterm. */
+/**
+ * Control sequences the reader's navigation keys send (arrows, Home/End,
+ * Delete, Shift-Tab, a bracketed-paste marker). Moving through a menu is not
+ * answering it: Enter, Escape or a digit is what answers, and those are not
+ * CSI sequences. Text inside a paste still counts, because only the sequences
+ * are removed.
+ */
+const CSI_KEY = /\x1b\[[0-?]*[ -/]*[@-~]/g;
+
+/**
+ * Whether data xterm sent to the PTY came from the reader and answers what the
+ * program asked, rather than being xterm's own reply or a navigation key.
+ */
 export function isReaderInput(data: string): boolean {
   if (!data) return false;
-  return data.replace(TERMINAL_REPLY, "").length > 0;
+  return data.replace(TERMINAL_REPLY, "").replace(CSI_KEY, "").length > 0;
 }
 
 /**

@@ -63,9 +63,20 @@ describe("the attention vocabulary matches the native notifier's", () => {
 
 describe("isReaderInput", () => {
   it("counts keys, text, Enter and Ctrl-C as the reader's", () => {
-    for (const data of ["y", "\r", "\x03", "\x1b[A", "\x1bOB", "hello world", "\x1b[200~pasted\x1b[201~", "\x1b"]) {
+    for (const data of ["y", "2", "\r", "\x03", "\x1bOB", "hello world", "\x1b[200~pasted\x1b[201~", "\x1b"]) {
       expect(isReaderInput(data), JSON.stringify(data)).toBe(true);
     }
+  });
+
+  it("does not count a navigation key: a menu is answered by Enter, Escape or a digit, not by moving through it", () => {
+    for (const data of ["\x1b[A", "\x1b[B", "\x1b[C\x1b[D", "\x1b[1;5A", "\x1b[3~", "\x1b[Z", "\x1b[H", "\x1b[200~\x1b[201~"]) {
+      expect(isReaderInput(data), JSON.stringify(data)).toBe(false);
+    }
+  });
+
+  it("counts the answer that arrives in the same chunk as a navigation key", () => {
+    expect(isReaderInput("\x1b[B\r")).toBe(true);
+    expect(isReaderInput("\x1b[A2")).toBe(true);
   });
 
   it("does not count replies xterm sends on the program's behalf", () => {
