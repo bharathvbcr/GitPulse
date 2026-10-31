@@ -63,6 +63,7 @@
     type HandoffSettings,
   } from "../workbench/taskHandoff";
   import { TASK_RUN_POLL_MS, nextTaskRunPollDelay } from "../workbench/runPoll";
+  import { mergeLoadedPage } from "../workbench/pageMerge";
   import { readEventLoopDelay } from "../runtime/loadCadence";
   import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
   import type { OpenTabRef } from "../workbench/openMembership";
@@ -140,6 +141,11 @@
   let reviewingRunID = $state<string | null>(null);
   let decisionRefresh = $state(0);
   let expandedForm = $state<boolean | null>(null);
+  /**
+   * Set once a "Load more" page has landed. The head poll then keeps the
+   * cursor the reader paged to instead of rewinding it to page two.
+   */
+  let pagedBeyond = false;
   let disposed = false;
   let generation = 0;
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -258,9 +264,18 @@
         more ? null : listLiveTaskRuns(task.id),
       ]);
       if (disposed || ticket !== generation) return;
-      runs = more ? [...new Map([...runs, ...page.items].map((run) => [run.id, run])).values()] : page.items;
+      // A head poll folds the fresh first page into what the reader has paged
+      // in; replacing the list wiped Load more within one poll of any live run.
+      // A loaded row that still claims a checkout but is absent from a complete
+      // live read has ended since, and is not shown as running.
+      runs = mergeLoadedPage(runs, page.items, {
+        more,
+        dropStale: working?.complete ? (row) => runHoldsCheckout(row, Date.now()) && !working.runs.some((live) => live.id === row.id) : undefined,
+      });
       if (working) { liveRuns = working.runs; liveComplete = working.complete; }
-      total = page.total; cursor = page.next_cursor;
+      if (more) pagedBeyond = true;
+      total = page.total;
+      if (more || !pagedBeyond) cursor = page.next_cursor;
       // A terminal request whose attempt can no longer start (ended, expired
       // while it waited, cancelled elsewhere) must not outlive it: judged
       // against these same reads, never against a run they did not return.
@@ -698,7 +713,8 @@
   <div class="run-list" data-testid="agents-history">
     {#each ended as run (run.id)}{@render runCard(run)}{/each}
   </div>
-  {#if cursor}<button class="gp-btn" type="button" onclick={() => refresh(true)} disabled={loading || runs.length >= MAX_LOADED_RUNS}>Load more ({runs.length} of {total})</button>{/if}
+  {#if cursor && runs.length >= MAX_LOADED_RUNS}<p class="meta" data-testid="agents-history-cap">Showing the newest {runs.length} of {total} attempts. Older ones are not loaded here.</p>
+  {:else if cursor}<button class="gp-btn" type="button" onclick={() => refresh(true)} disabled={loading}>Load more ({runs.length} of {total})</button>{/if}
 </section>
 
 <style>

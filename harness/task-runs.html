@@ -547,6 +547,16 @@
         button("Refresh").click();
         await wait(()=>pane().querySelector('[data-testid="agents-working"] [data-run-id="elder-live"]'));
         check("An agent older than a page of history is still listed as working",!pane().querySelector('[data-testid="agents-history"] [data-run-id="elder-live"]'));
+        // The poll re-reads page one every ~1.5 s while the elder runs. It used
+        // to replace the list, so older history paged in with Load more was
+        // gone within one poll; it now folds page one into what is loaded.
+        const loadedCount=()=>Number(/(\d+) of \d+ loaded/.exec(pane().querySelector(".history-heading").textContent)?.[1]??0);
+        const firstPage=loadedCount();
+        [...pane().querySelectorAll("button")].find(b=>b.textContent.trim().startsWith("Load more (")).click();
+        await wait(()=>loadedCount()>firstPage);
+        const pagedIn=loadedCount(),listsBeforePolls=report.lists;
+        await pause(3500);
+        check("History paged in with Load more survives the live poll",report.lists>listsBeforePolls&&loadedCount()===pagedIn&&pagedIn>firstPage);
         elder.state="exited";elder.exit_code=0;elder.revision++;
         await wait(()=>!pane().querySelector('[data-testid="agents-working"] [data-run-id="elder-live"]'));
         check("The pane goes on polling for it, and sees it end without a manual refresh",document.querySelector('[data-testid="host-working"]').dataset.count==="0");
