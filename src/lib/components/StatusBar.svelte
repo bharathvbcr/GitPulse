@@ -76,14 +76,16 @@
 
   /**
    * The bar owns its own visibility rather than App.svelte, because only it
-   * knows the three signals that override a hidden preference: a parked
-   * operation, unresolved conflicts, and a degraded watcher.
+   * knows the four signals that override a hidden preference: a parked
+   * operation, unresolved conflicts, a degraded watcher, and a status poll
+   * that stopped answering.
    */
   let resolved = $derived(
     resolveStatusBarMode($interfaceStore.statusBarMode, {
       operationParked: Boolean(operationMarker),
       conflictedCount,
       watchDegraded: Boolean(watchLabel),
+      statusUnavailable: statusUnavailableSince !== null,
     }),
   );
   let detail = $derived(resolved.mode);

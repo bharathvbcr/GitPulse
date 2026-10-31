@@ -26,7 +26,16 @@ function branch(name: string): BranchInfo {
 }
 
 function harness() {
-  const state = { failing: false, statusCalls: 0, failedCalls: 0 };
+  const state = {
+    failing: false,
+    statusCalls: 0,
+    failedCalls: 0,
+    /** Every answer names a different file, so every poll announces a change. */
+    changing: false,
+    /** The next status read waits here until `held.reject()` is called. */
+    holdNext: false,
+    held: null as { reject: (error: Error) => void } | null,
+  };
   const statuses = [{ path: "README.md", status_code: "M", is_staged: false, is_conflicted: false, additions: 1, deletions: 0 }];
   const invoke: InvokeFn = async (cmd, args) => {
     const path = String(args?.repoPath ?? "");
@@ -35,6 +44,15 @@ function harness() {
         return { path, name: "r", is_bare: false, common_dir: `${path}/.git` } as never;
       case "cmd_get_status":
         state.statusCalls += 1;
+        if (state.holdNext) {
+          state.holdNext = false;
+          return new Promise((_resolve, reject) => {
+            state.held = { reject };
+          }) as never;
+        }
+        if (state.changing) {
+          return [{ ...statuses[0], path: `file-${state.statusCalls}.txt` }] as never;
+        }
         if (state.failing) {
           state.failedCalls += 1;
           throw new Error("git status exploded");
@@ -129,5 +147,50 @@ describe("a status poll that keeps failing", () => {
 
     expect(get(store).statusUnavailableSince).toBeNull();
     expect(statusWarnings(warn)).toHaveLength(0);
+  });
+
+  it("does not count a poll that git answered but a listener choked on", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(diagnostics, "warn");
+    const { store, state } = harness();
+    await store.openRepo("/r/listener");
+    store.onPolledChange(() => {
+      throw new Error("subscriber exploded");
+    });
+
+    // One answered poll whose listener throws...
+    state.changing = true;
+    const before = state.statusCalls;
+    for (let i = 0; i < 40 && state.statusCalls === before; i += 1) await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(0);
+    state.changing = false;
+    expect(statusWarnings(warn)).toHaveLength(0);
+
+    // ...must not stand toward the threshold: two real failures are one short.
+    state.failing = true;
+    await untilFailures(state, 2);
+    expect(get(store).statusUnavailableSince).toBeNull();
+    expect(statusWarnings(warn)).toHaveLength(0);
+  });
+
+  it("does not count a failure of a poll that a newer snapshot superseded", async () => {
+    vi.useFakeTimers();
+    const { store, state } = harness();
+    await store.openRepo("/r/superseded");
+
+    // A poll goes out and stalls; a full refresh lands while it waits.
+    state.holdNext = true;
+    for (let i = 0; i < 40 && !state.held; i += 1) await vi.advanceTimersByTimeAsync(1_000);
+    const held = state.held;
+    expect(held).not.toBeNull();
+    await store.refresh();
+    held!.reject(new Error("late failure"));
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The stale failure must not stand toward the threshold: two more are
+    // one short of it.
+    state.failing = true;
+    await untilFailures(state, 2);
+    expect(get(store).statusUnavailableSince).toBeNull();
   });
 });

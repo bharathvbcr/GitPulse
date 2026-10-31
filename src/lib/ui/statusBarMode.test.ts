@@ -10,6 +10,7 @@ const quiet: StatusBarSignals = {
   operationParked: false,
   conflictedCount: 0,
   watchDegraded: false,
+  statusUnavailable: false,
 };
 
 describe("isStatusBarMode", () => {
@@ -39,6 +40,7 @@ describe("resolveStatusBarMode", () => {
     ["a parked operation", { ...quiet, operationParked: true }],
     ["unresolved conflicts", { ...quiet, conflictedCount: 1 }],
     ["a degraded watcher", { ...quiet, watchDegraded: true }],
+    ["a status poll that stopped answering", { ...quiet, statusUnavailable: true }],
   ])("forces a hidden bar back for %s", (_label, signals) => {
     // Hiding chrome is allowed to cost the ambient readouts. It is not
     // allowed to cost a warning: silence here is how a user finds out too
