@@ -203,6 +203,37 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
  check("a query for the marker column and text finds nothing, because the marker is not what the row shows",()=>/no matches/.test(text()));
  key(findBox(),{key:"Escape"});await tick();await wait();
  check("Escape closes the find bar",()=>!findBox());
+ // Keys that belong to something else are not the find bar's to take.
+ const fire=(target,init)=>{const event=new KeyboardEvent("keydown",{bubbles:true,cancelable:true,...init});target.dispatchEvent(event);return event;};
+ const typeInFind=async value=>{findBox().value=value;findBox().dispatchEvent(new Event("input",{bubbles:true}));await tick();await wait();};
+ key(preview.querySelector("*"),{key:"f",metaKey:true,ctrlKey:true});await tick();await wait();
+ await typeInFind("new");
+ check("a query that two rows hold starts on the first of them",()=>/1 of 2/.test(text()));
+ const stepped=fire(findBox(),{key:"Enter"});await tick();await wait();
+ check("Enter in the find box steps to the next match",()=>stepped.defaultPrevented&&/2 of 2/.test(text()));
+ fire(findBox(),{key:"Enter",shiftKey:true});await tick();await wait();
+ check("and Shift+Enter in it steps back",()=>/1 of 2/.test(text()));
+ const onHunk=fire(hunkButtons("Stage Hunk")[0],{key:"Enter"});await tick();await wait();
+ check("Enter on a focused Stage Hunk button with find open is the button's, not a search step",()=>!onHunk.defaultPrevented&&/1 of 2/.test(text()));
+ const onClose=fire(preview.querySelector('button[aria-label="Close find"]'),{key:"Enter"});
+ check("and so is Enter on Close find",()=>!onClose.defaultPrevented);
+ const outside=document.body.appendChild(document.createElement("button"));
+ const enterOutside=fire(outside,{key:"Enter"});
+ check("Enter on a control outside the pane, such as a dialog's confirm button, is left alone",()=>!enterOutside.defaultPrevented&&/1 of 2/.test(text()));
+ const escOutside=fire(outside,{key:"Escape"});await tick();await wait();
+ check("Escape aimed at something outside the pane does not close find",()=>!escOutside.defaultPrevented&&Boolean(findBox()));
+ const answered=hunkButtons("Stage Hunk")[0];
+ const claim=event=>{if(event.key==="Escape")event.preventDefault();};
+ answered.addEventListener("keydown",claim);
+ fire(answered,{key:"Escape"});await tick();await wait();answered.removeEventListener("keydown",claim);
+ check("an Escape a nearer handler already answered does not also close find",()=>Boolean(findBox()));
+ const enterBody=fire(document.body,{key:"Enter"});await tick();await wait();
+ check("Enter with nothing focused still steps, as after clicking the diff",()=>enterBody.defaultPrevented&&/2 of 2/.test(text()));
+ const enterRow=fire(preview.querySelector(".gp-diff-text"),{key:"Enter"});await tick();await wait();
+ check("and Enter on the diff text itself steps too",()=>enterRow.defaultPrevented&&/1 of 2/.test(text()));
+ fire(preview.querySelector(".gp-diff-text"),{key:"Escape"});await tick();await wait();
+ check("Escape on the diff text closes find",()=>!findBox());
+ outside.remove();
  // --- stepping between changes -------------------------------------------
  await open({text:longHunk(),truncated:false});
  const pane=scroller();

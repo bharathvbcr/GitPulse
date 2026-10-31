@@ -507,6 +507,17 @@
     searchIndex = 0;
   }
 
+  /** Enter and Shift+Enter step, Escape closes — owned by the box, so no window rule has to guess. */
+  function onSearchKeydown(event: KeyboardEvent): void {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      stepSearch(event.shiftKey ? -1 : 1);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closeSearch();
+    }
+  }
+
   // Re-anchor on the visible row whenever the result set changes, so typing
   // another character does not throw the reader back to match one.
   /** Last search-result signature. A plain `let`, never $state: the
@@ -554,6 +565,8 @@
   let splitScroll = $state(0);
   let viewportHeight = $state(0);
   let bodyEl = $state<HTMLElement>();
+  /** The whole pane: what the window-level Escape and Enter rules are scoped to. */
+  let rootEl = $state<HTMLElement>();
 
   const activeScroll = $derived(viewMode === "split" ? splitScroll : unifiedScroll);
 
@@ -854,6 +867,9 @@
    * the search field keep their own arrow behaviour.
    */
   function onWindowKeydown(event: KeyboardEvent): void {
+    // A handler nearer the key (the find box, a popover, a dialog) has already
+    // answered it; this one is on the window and must not answer it twice.
+    if (event.defaultPrevented) return;
     const target = event.target as HTMLElement | null;
     const tag = target?.tagName;
     const typing =
@@ -861,18 +877,33 @@
       tag === "INPUT" ||
       tag === "TEXTAREA" ||
       tag === "SELECT";
+    // Where the diff owns Enter and Escape: nothing focused (the reader just
+    // clicked the diff), or focus somewhere inside this pane. Anything else is
+    // another surface's key — a dialog's confirm button, a popover.
+    const nothingFocused = target === document.body;
+    const inPane = target instanceof Node && rootEl?.contains(target) === true;
+    const onControl =
+      target?.closest?.('button, a, input, textarea, select, [role="button"], [contenteditable="true"]') != null;
 
     if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === "f") {
       event.preventDefault();
       openSearch();
       return;
     }
-    if (event.key === "Escape" && searchOpen) {
+    if (event.key === "Escape" && searchOpen && (nothingFocused || inPane)) {
       event.preventDefault();
       closeSearch();
       return;
     }
-    if (event.key === "F3" || (searchOpen && !typing && event.key === "Enter")) {
+    // Enter steps only from the diff body itself: on a focused button it is
+    // that button's activation (Stage Hunk, Close find), and it is the find
+    // box's own business inside the box (see onSearchKeydown).
+    const enterInDiff =
+      searchOpen &&
+      event.key === "Enter" &&
+      !onControl &&
+      (nothingFocused || (target instanceof Node && bodyEl?.contains(target) === true));
+    if (event.key === "F3" || enterInDiff) {
       event.preventDefault();
       stepSearch(event.shiftKey ? -1 : 1);
       return;
@@ -1288,7 +1319,7 @@
      shortcuts must work in every body branch. -->
 <svelte:window onkeydown={onWindowKeydown} />
 
-<div class="flex h-full flex-1 flex-col overflow-hidden bg-background text-xs">
+<div bind:this={rootEl} class="flex h-full flex-1 flex-col overflow-hidden bg-background text-xs">
   <!-- Identity: what is on screen, taken from the diff itself.
 
        `flex-wrap` is the narrow-pane behaviour, not the normal one. Every
@@ -1561,6 +1592,7 @@
       <input
         bind:this={searchInput}
         bind:value={searchQuery}
+        onkeydown={onSearchKeydown}
         type="text"
         class="min-w-0 flex-1 bg-transparent py-0.5 text-[11px] text-textPrimary outline-hidden placeholder:text-textMuted/60"
         placeholder="Find in this diff…"

@@ -40,6 +40,17 @@ describe("DiffViewer source contracts", () => {
     expect(source.slice(source.indexOf("async function readImageSide"), source.indexOf("async function loadImageBlobs"))).toContain("catch");
   });
 
+  it("keeps the window key handler from taking another control's Enter and Escape", () => {
+    // What a key does to a focused button is a rendered fact (harness/diff.html
+    // dispatches it); these pin the structure that makes it true.
+    const handler = source.slice(source.indexOf("function onWindowKeydown"), source.indexOf("Switches the diff to another commit"));
+    expect(handler.slice(0, 400)).toContain("if (event.defaultPrevented) return;");
+    // Enter that is not in the find box belongs to a control unless it is on the diff body.
+    expect(handler).not.toMatch(/searchOpen && !typing && event\.key === "Enter"/);
+    expect(handler).toContain("!onControl");
+    expect(source).toContain("onkeydown={onSearchKeydown}");
+  });
+
   it("compiles", () => {
     const { warnings } = compile(source, { generate: "client", filename: "DiffViewer.svelte" });
     expect(warnings.filter((w) => w.code !== "css-unused-selector")).toEqual([]);
