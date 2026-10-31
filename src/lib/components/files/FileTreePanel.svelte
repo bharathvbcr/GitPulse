@@ -105,6 +105,15 @@
   let files = $state.raw<string[]>([]);
   let isLoading = $state(false);
   let errorMsg = $state<string | null>(null);
+  /**
+   * A listing of the current repository has succeeded. Until then the tree has
+   * nothing to show and says so with a skeleton or an error; afterwards a
+   * re-list (an agent writing files, a commit) refreshes in place, and a failed
+   * one keeps the last rows under a banner that labels them stale.
+   */
+  let hasLoaded = $state(false);
+  /** The repository `files` was listed for, so a switch never shows its rows. */
+  let listedRepo: string | null = null;
   let inflight: AsyncGuard | null = null;
 
   let query = $state("");
@@ -176,16 +185,24 @@
     inflight?.cancel();
     const guard = createAsyncGuard();
     inflight = guard;
+    if (repo !== listedRepo) {
+      files = [];
+      hasLoaded = false;
+    }
     isLoading = true;
     errorMsg = null;
     try {
       const list = await invoke<string[]>("cmd_list_repo_files", { repoPath: repo });
       if (!guard.isLive()) return;
       files = list;
+      listedRepo = repo;
+      hasLoaded = true;
     } catch (err: unknown) {
       if (!guard.isLive()) return;
+      // The rows of an earlier successful listing stay; the banner says they
+      // may be out of date. Only a repository with no listing yet shows the
+      // bare error.
       errorMsg = formatError(err);
-      files = [];
     } finally {
       if (guard.isLive()) isLoading = false;
     }
@@ -218,6 +235,8 @@
       if (!repo) {
         inflight?.cancel();
         files = [];
+        listedRepo = null;
+        hasLoaded = false;
         errorMsg = null;
         isLoading = false;
         selectedIndex = -1;
@@ -1051,6 +1070,20 @@
     {/if}
   </div>
 
+  {#if errorMsg && hasLoaded}
+    <div
+      role="status"
+      data-testid="file-tree-stale"
+      class="shrink-0 px-3 py-1.5 border-b border-border/40 bg-amber-500/10 text-[11px] text-amber-600 dark:text-amber-300"
+    >
+      <div class="flex items-center justify-between gap-2">
+        <span>Could not refresh the file list. Showing the last successful listing.</span>
+        <button type="button" class="gp-btn py-0.5! px-2! text-[11px]! shrink-0" onclick={() => { if ($currentRepoPath) void loadFiles($currentRepoPath); }}>Retry</button>
+      </div>
+      <div class="text-textMuted truncate" title={errorMsg}>{errorMsg}</div>
+    </div>
+  {/if}
+
   <!-- Main Tree Viewport -->
   <div
     class="flex-1 min-h-0 relative"
@@ -1065,13 +1098,14 @@
     }}
     onkeydown={handleKeydown}
   >
-    {#if isLoading}
+    {#if isLoading && !hasLoaded}
       <div class="p-3 space-y-1 overflow-hidden h-full">
         <Skeleton variant="tree-row" count={14} />
       </div>
-    {:else if errorMsg}
-      <div class="h-full flex items-center justify-center text-rose-400 text-xs p-4 text-center">
-        {errorMsg}
+    {:else if errorMsg && !hasLoaded}
+      <div class="h-full flex flex-col items-center justify-center gap-2 text-rose-400 text-xs p-4 text-center">
+        <span>{errorMsg}</span>
+        <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" onclick={() => { if ($currentRepoPath) void loadFiles($currentRepoPath); }}>Retry</button>
       </div>
     {:else if rows.length === 0}
       <EmptyState

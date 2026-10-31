@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { keyedList } from "../../ui/eachKeys";
   import {
     Eye,
@@ -28,6 +29,7 @@
   } from "../../files/markdevRender";
   import { findFragmentTarget, type MarkdownNote } from "../../files/markdownLinks";
   import { takeAnchor } from "../../files/pendingAnchor";
+  import { revealRequest } from "../../files/revealRequests";
   import { docsBacklinks, type DocBacklink } from "../../docs/client";
   import CodeViewer from "./CodeViewer.svelte";
   import MarkDevLogo from "./MarkDevLogo.svelte";
@@ -65,6 +67,18 @@
   export type MarkDevViewMode = "rendered" | "split" | "raw";
 
   let viewMode = $state<MarkDevViewMode>("rendered");
+
+  /**
+   * The rendered page has no lines to land on, so a request naming this file
+   * (a search or docs hit, a terminal link) shows the source instead, where
+   * the raw CodeViewer collects it.
+   */
+  $effect(() => {
+    const wanted = $revealRequest?.path === filePath;
+    // Raw and Split already mount a CodeViewer that collects the request; only
+    // the rendered page needs to give way, and the user's choice stands.
+    if (wanted && untrack(() => viewMode) === "rendered") viewMode = "raw";
+  });
   let showOutline = $state(false);
   let wordWrap = $state(true);
   let copiedSource = $state(false);

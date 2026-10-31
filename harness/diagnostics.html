@@ -180,6 +180,50 @@
     check("newer doc search wins out-of-order completion",target.textContent.includes("NEW-SEARCH")&&!target.textContent.includes("STALE-SEARCH"));
     await search("pending");const cleared=take("search");await search("");cleared.resolve([{path:"old.md",line:1,score:1,title:"CLEARED-SEARCH",context:"old"}]);await settle();
     check("cleared search rejects pending results",!target.textContent.includes("CLEARED-SEARCH"));
+    // Typing is not searching: hits stay (labelled), and "No hits" is only ever
+    // said for a query that was actually searched.
+    const typeOnly = async query => {const input=target.querySelector('input[type="search"]');input.value=query;input.dispatchEvent(new Event("input",{bubbles:true}));await settle();};
+    await search("alpha");take("search").resolve([{path:"a.md",line:7,score:1,title:"ALPHA-HIT",context:"alpha"}]);await settle();
+    check("a finished search shows its hits without a label",target.textContent.includes("ALPHA-HIT")&&!target.textContent.includes('Results for "alpha"'));
+    await typeOnly("alphab");
+    check("editing the query keeps the hits, labelled with the query they answer",target.textContent.includes("ALPHA-HIT")&&target.textContent.includes('Results for "alpha"')&&!target.textContent.includes("No hits"));
+    await typeOnly("zzz");
+    check("typing a query that matches nothing yet never says No hits",!target.textContent.includes("No hits"));
+    await search("zzz");take("search").resolve([]);await settle();
+    check("a submitted search with no results names its query",target.textContent.includes('No hits for "zzz".'));
+    await typeOnly("zzzq");
+    check("editing after a no-hit search drops the claim",!target.textContent.includes("No hits"));
+    await search("alpha");take("search").resolve([{path:"a.md",line:7,score:1,title:"ALPHA-HIT",context:"alpha"}]);await settle();
+    await search("boom");take("search").reject(new Error("search backend boom"));await settle();
+    check("a failed search shows its error and keeps the earlier hits labelled",!!target.querySelector('[data-testid="docs-search-error"]')&&target.textContent.includes("ALPHA-HIT")&&target.textContent.includes('Results for "alpha"'));
+    check("and does not say No hits",!target.textContent.includes("No hits"));
+    // Leaving the map and coming back finds the query and hits where they were.
+    const searchCallsBeforeLeaving=calls.get("cmd_docs_search");
+    host.show("markdown");await settle();host.show("map");await settle();
+    await click("Docs");
+    check("returning to Docs keeps the query and the hits",target.querySelector('input[type="search"]').value==="boom"&&target.textContent.includes("ALPHA-HIT")&&target.textContent.includes('Results for "alpha"'));
+    check("and does not search again on return",calls.get("cmd_docs_search")===searchCallsBeforeLeaving);
+    // Each repository keeps its own docs search.
+    {
+      const {get}=await import("svelte/store");
+      const tabFor = path => get(repoStore).openTabs.find(tab=>tab.path===path)?.id;
+      await repoStore.openRepo("/r/other");await settle();
+      check("another repository's Docs starts with an empty box and no hits",target.querySelector('input[type="search"]').value===""&&!target.textContent.includes("ALPHA-HIT"));
+      await typeOnly("other-only");
+      await repoStore.activateTab(tabFor("/r/diagnostics"));await settle();
+      check("switching back restores the first repository's query and hits",target.querySelector('input[type="search"]').value==="boom"&&target.textContent.includes("ALPHA-HIT"));
+      await repoStore.activateTab(tabFor("/r/other"));await settle();
+      check("the other repository kept its own query, not the first one's",target.querySelector('input[type="search"]').value==="other-only"&&!target.textContent.includes("ALPHA-HIT"));
+      await repoStore.activateTab(tabFor("/r/diagnostics"));await settle();
+    }
+    // A vault refresh that fails must not read as "no broken links".
+    await click("Symbols");take("graph").resolve({available:false,reason:"symbols",kind:"code_graph",payload:null});await settle();
+    const okRefresh=fixture.cmd_docs_refresh;
+    fixture.cmd_docs_refresh=()=>{throw new Error("vault refresh boom");};
+    await click("Docs");
+    check("a failed vault refresh says the links could not be checked",target.textContent.includes("Could not check links.")&&!target.textContent.includes("None found in the indexed vault."));
+    fixture.cmd_docs_refresh=okRefresh;
+    await click("Symbols");take("graph").resolve({available:false,reason:"symbols",kind:"code_graph",payload:null});await settle();
     await click("Files");const oldGraph=take("graph");
     await click("Symbols");const newGraph=take("graph");
     newGraph.resolve({available:false,reason:"NEW-SYMBOL-GRAPH",kind:"code_graph",payload:null});await settle();

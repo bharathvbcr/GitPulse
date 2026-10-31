@@ -57,13 +57,14 @@
         }
       });
 
-      const { mount, tick } = await import("svelte");
+      const { mount, tick, unmount } = await import("svelte");
       const { get } = await import("svelte/store");
       const { repoStore } = await import("../src/lib/stores/repoStore");
+      const { revealRequest, clearReveal } = await import("../src/lib/files/revealRequests");
       const { createChecks } = await import("./checks.ts");
       const Host = (await import("./SearchHost.svelte")).default;
       await repoStore.openRepo("/fixture/GitPulse");
-      mount(Host, { target: document.querySelector("#app") });
+      let app = mount(Host, { target: document.querySelector("#app") });
 
       const wait = () => new Promise(resolve => setTimeout(resolve, 40));
       const until = async test => {
@@ -168,11 +169,81 @@
           mode = "complete";
           await submit();
           await until(() => matches().length === 3);
-          matches()[2].click(); await tick();
+          clearReveal();
+          matches()[1].click(); await tick();
           check("a match opens its file in Explorer", () => {
             const state = get(repoStore);
-            return state.selectedFilePath === "lib/b.rs" && state.activeTab === "code" && state.viewSections.code === "explorer";
+            return state.selectedFilePath === "src/a.ts" && state.activeTab === "code" && state.viewSections.code === "explorer";
           });
+          check("and asks the viewer to land on the match's own line and column", () => {
+            const pending = get(revealRequest);
+            return pending?.path === "src/a.ts" && pending.line === 9 && pending.column === 1;
+          });
+          clearReveal();
+          [...document.querySelectorAll("section > button")][0].click(); await tick();
+          check("the file heading opens the file without naming a line", () => get(revealRequest) === null);
+
+          // A search run at a revision opens the working-tree file, so it must
+          // say so and must not carry a line that belongs to another version.
+          mode = "revision";
+          await set(revisionInput(), "v1.2.0");
+          await submit();
+          await until(() => document.querySelector("[data-search-revision-note]"));
+          check("a revision search says that a hit opens the working-tree file", () =>
+            document.querySelector("[data-search-revision-note]").textContent.includes("Opening a hit shows the working-tree file"));
+          clearReveal();
+          matches()[1].click(); await tick();
+          check("and a revision hit asks for no line", () => get(revealRequest) === null);
+          await set(revisionInput(), "");
+          mode = "complete";
+          await submit();
+          await until(() => !document.querySelector("[data-search-revision-note]") && matches().length === 3);
+          check("a working-tree search shows no such note", () => !document.querySelector("[data-search-revision-note]"));
+
+          // --- a newer search leaves the old answer up, labelled stale ----------
+          mode = "hold";
+          await submit();
+          await until(() => !!button("Cancel"));
+          check("while a newer search runs the previous matches stay visible", () => matches().length === 3);
+          check("the results are marked busy and dimmed", () => {
+            const busy = document.querySelector('[aria-busy="true"]');
+            return Boolean(busy) && busy.className.includes("opacity-60");
+          });
+          check("and a Searching line says the matches are the previous ones", () => !!document.querySelector("[data-search-running]") && text().includes("Searching"));
+          button("Cancel").click();
+          await until(() => !!button("Search"));
+          mode = "complete";
+          await submit();
+          await until(() => matches().length === 3 && summary()?.textContent.includes("3 matches"));
+          check("a finished search is not dimmed or busy", () => !document.querySelector('[aria-busy="true"]') && !document.querySelector("[data-search-running]"));
+
+          // --- leaving Search and coming back keeps the query and its answer ----
+          const searchesBeforeLeaving = searches.length;
+          await unmount(app);
+          check("leaving Search removes the panel", () => !input());
+          app = mount(Host, { target: document.querySelector("#app") });
+          await until(() => !!input());
+          check("coming back keeps the pattern", () => input().value === "needle");
+          check("and the options", () => toggle("regex").checked && toggle("match case").checked);
+          check("and the answer, without searching again", () => matches().length === 3 && summary()?.textContent.includes("3 matches") && searches.length === searchesBeforeLeaving);
+
+          // --- a repository switch is a different subject and a different memory ----
+          const homeRepo = get(repoStore).currentPath;
+          await repoStore.openRepo("/fixture/Other");
+          await until(() => get(repoStore).currentPath === "/fixture/Other");
+          await until(() => input().value === "");
+          check("another repository starts with an empty box and no answer", () => input().value === "" && !summary() && matches().length === 0);
+          check("and does not inherit the first repository's options", () => !toggle("regex").checked && !toggle("match case").checked);
+          await set(input(), "other-pattern");
+          await repoStore.activateTab(get(repoStore).openTabs.find(tab => tab.path === homeRepo).id);
+          await until(() => get(repoStore).currentPath === homeRepo && input().value === "needle");
+          check("switching back restores the first repository's pattern", () => input().value === "needle");
+          check("and its options and answer, without searching again", () => toggle("regex").checked && toggle("match case").checked && matches().length === 3 && searches.length === searchesBeforeLeaving);
+          await repoStore.activateTab(get(repoStore).openTabs.find(tab => tab.path === "/fixture/Other").id);
+          await until(() => get(repoStore).currentPath === "/fixture/Other" && input().value === "other-pattern");
+          check("the other repository kept what was typed there, not the first one's", () => input().value === "other-pattern" && matches().length === 0);
+          await repoStore.activateTab(get(repoStore).openTabs.find(tab => tab.path === homeRepo).id);
+          await until(() => get(repoStore).currentPath === homeRepo && input().value === "needle");
 
           check("no unhandled runtime errors", () => errors.length === 0);
           report();

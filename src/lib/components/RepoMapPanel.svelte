@@ -1,3 +1,19 @@
+<script module lang="ts">
+  import { createRepoPanelCache } from "../panels/repoPanelCache";
+
+  /**
+   * What Map → Docs search shows for a repository, kept past the panel's
+   * unmount so opening a hit and coming back finds the query and its hits
+   * where they were. Restored without re-running the search.
+   */
+  interface DocsSearchMemo {
+    docsQuery: string;
+    docsSubmittedQuery: string;
+    docsHits: import("../docs/client").DocsSearchHit[];
+  }
+  const docsSearchMemo = createRepoPanelCache<DocsSearchMemo>();
+</script>
+
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
   import { beginGeneration } from "../async/guard";
@@ -9,6 +25,7 @@
   import { buildBlockReason } from "../codeintel/buildBlock";
   import { focusTabAt, handleTablistKeydown, panelId, tabId, tabProps } from "../dom/tablist";
   import { Loader2 } from "@lucide/svelte";
+  import { requestReveal } from "../files/revealRequests";
   import { copyDevmapLogs } from "../codeintel/diagnostics";
   import {
     buildDevmap,
@@ -134,6 +151,8 @@
   let docsStatus = $state<DocsStatus | null>(null);
   let docsQuery = $state("");
   let docsHits = $state<DocsSearchHit[]>([]);
+  /** The query `docsHits` answers; set only when a search for it succeeds. */
+  let docsSubmittedQuery = $state("");
   let docsSearching = $state(false);
   // The trimmed query the current `docsHits` answer; null when no search has
   // completed (or the last one failed).
@@ -229,6 +248,8 @@
   const deadLists = $derived(map ? preferredDeadLists(map) : null);
   const tests = $derived(selected ? roleSample(selected, "tests") : null);
   const docsHonesty = $derived(docsStatusHonesty(docsStatus));
+  /** The hits on screen answer an earlier query than the one in the box. */
+  const docsHitsStale = $derived(docsHits.length > 0 && docsSubmittedQuery !== docsQuery.trim());
   const searchHonesty = $derived(docsSearchHonesty(docsHits, DOCS_SEARCH_DEFAULT_LIMIT));
   const brokenDisplay = $derived(brokenLinksHonesty(brokenLinks, BROKEN_LINKS_DISPLAY_CAP));
   const searchPrompt = $derived(docsSearchPrompt(docsQuery, searchedQuery, docsHits.length, docsSearching));
@@ -407,7 +428,9 @@
     if (!repoPath || !q) {
       docsHits = [];
       searchedQuery = null;
+      docsSubmittedQuery = "";
       docsSearching = false;
+      rememberDocsSearch();
       return;
     }
     docsSearching = true;
@@ -418,15 +441,28 @@
       if (live()) {
         docsHits = hits;
         searchedQuery = q;
+        docsSubmittedQuery = q;
+        rememberDocsSearch();
       }
     } catch (err) {
       if (!live()) return;
       docsHits = [];
       searchedQuery = null;
+      docsSubmittedQuery = "";
       docsError = reportMapFailure("search", repoPath, err);
     } finally {
       if (live()) docsSearching = false;
     }
+  }
+
+  function rememberDocsSearch() {
+    const repo = currentRepo;
+    if (!repo) return;
+    docsSearchMemo.set(repo, {
+      docsQuery,
+      docsSubmittedQuery,
+      docsHits: $state.snapshot(docsHits),
+    });
   }
 
   async function reloadLinks(path?: string) {
@@ -529,9 +565,14 @@
       selectedArea = null;
       graphLoad = null;
       docsStatus = null;
-      docsHits = [];
-      searchedQuery = null;
+      // A repository's docs search comes back as it was left; nothing re-runs.
+      const memo = path ? docsSearchMemo.get(path) : undefined;
+      docsQuery = memo?.docsQuery ?? "";
+      searchedQuery = memo?.docsSubmittedQuery || null;
+      docsSubmittedQuery = memo?.docsSubmittedQuery ?? "";
+      docsHits = memo?.docsHits ?? [];
       brokenLinks = [];
+      brokenLoaded = false;
       linkResult = null;
       errorMsg = null;
       docsError = null;
@@ -567,6 +608,8 @@
   $effect(() => {
     const query = docsQuery.trim();
     untrack(() => {
+      // Typing retires a search in flight but keeps the hits on screen: they
+      // are labelled with the query they answer until the next search lands.
       searchRequests.next();
       docsSearching = false;
       // Search-only since broken links own `brokenError`; an edit supersedes it.
@@ -576,7 +619,9 @@
       if (query === "") {
         docsHits = [];
         searchedQuery = null;
+        docsSubmittedQuery = "";
       }
+      rememberDocsSearch();
     });
   });
 
@@ -597,6 +642,12 @@
   function openFile(path: string) {
     repoStore.selectFilePath(path);
     repoStore.setActiveTab("code", "explorer");
+  }
+
+  /** A docs hit lands on its own line, not the top of the file. */
+  function openHit(hit: DocsSearchHit) {
+    requestReveal(hit.path, hit.line, null);
+    openFile(hit.path);
   }
 
   function openGraphNode(path: string, _nodeId: string) {
@@ -831,7 +882,7 @@
                 <button
                   type="button"
                   class="w-full text-left rounded-md px-2 py-1.5 hover:bg-surface/80"
-                  onclick={() => openFile(hit.path)}
+                  onclick={() => openHit(hit)}
                 >
                   <span class="font-mono text-[11px] text-accent block truncate">{hit.path}:{hit.line}</span>
                   <span class="text-[11px] text-textPrimary block truncate">{hit.title}</span>
