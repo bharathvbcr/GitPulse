@@ -216,6 +216,14 @@ export interface CommitGraphPayload {
  */
 export type CommitDetailsStatus = "idle" | "loading" | "ready" | "error";
 
+/** What the last failed load asked for, so Retry repeats that request. */
+export interface GraphErrorRequest {
+  /** The page size the failed request asked for. */
+  limit: number;
+  /** True when it was for a new query, branch or scope, not a reload of the shown view. */
+  refining: boolean;
+}
+
 export interface GraphState {
   rows: VisualCommitRow[];
   commits: VisualCommitRow[];
@@ -230,6 +238,8 @@ export interface GraphState {
   visiblePath: string | null;
   /** Why the last load failed, when it did. Never silently emptied. */
   error: string | null;
+  /** The request behind `error`; null whenever `error` is. */
+  errorRequest: GraphErrorRequest | null;
   /** True when older history exists past the current page. */
   hasMore: boolean;
   /** Backend reads that failed this load (HEAD, ref decorations). */
@@ -312,6 +322,7 @@ function emptyVisible(
     maxCommits,
     visiblePath: path,
     error: null,
+    errorRequest: null,
     hasMore: false,
     warnings: [],
     notices: [],
@@ -661,6 +672,7 @@ export function createGraphStore(
           mainlineId: cached.mainlineId,
           mainlineName: cached.mainlineName,
           error: null,
+          errorRequest: null,
           isLoading: false,
           visiblePath: path,
         }));
@@ -715,7 +727,13 @@ export function createGraphStore(
           cached.revision !== revision ||
           cached.refScope !== refScope);
       if ((!cached || refining) && visiblePath === repoPath) {
-        update((s) => ({ ...s, isLoading: true, error: null, visiblePath: repoPath }));
+        update((s) => ({
+          ...s,
+          isLoading: true,
+          error: null,
+          errorRequest: null,
+          visiblePath: repoPath,
+        }));
       }
       try {
         const payload = await invokeFn<CommitGraphPayload>("cmd_get_commit_graph", {
@@ -839,6 +857,7 @@ export function createGraphStore(
             mainlineId: next.mainlineId,
             mainlineName: next.mainlineName,
             error: null,
+            errorRequest: null,
             isLoading: false,
             visiblePath: repoPath,
           }));
@@ -873,8 +892,14 @@ export function createGraphStore(
           update((s) => ({
             ...s,
             isLoading: false,
-            hasMore: false,
+            // A failed load says nothing about whether older history exists:
+            // keep what the last good page reported, so "Load older history"
+            // does not vanish because one reload timed out.
+            hasMore: s.hasMore,
             error: formatError(err),
+            // Retry repeats THIS request (its page size, and whether the
+            // rows on screen belong to a different filter).
+            errorRequest: { limit: max, refining },
             visiblePath: repoPath,
           }));
         }

@@ -160,6 +160,31 @@ describe("CommitTable palette invalidation", () => {
   });
 });
 
+describe("CommitTable failed and loading reloads", () => {
+  it("exposes the error banner and progress bar to assistive tech", () => {
+    const banner = source.slice(
+      source.indexOf("{#if $graphStore.error && !$graphStore.isLoading}"),
+      source.indexOf("class=\"relative z-10 flex min-w-0 shrink-0"),
+    );
+    expect(banner).toContain('role="alert"');
+    const bar = source.slice(source.indexOf("{#if $graphStore.isLoading}"), source.indexOf("{#if $graphStore.error && !$graphStore.isLoading}"));
+    expect(bar).toContain('role="status"');
+    expect(bar).toContain('aria-label="Loading commits"');
+    expect(source).toContain("aria-busy={$graphStore.isLoading}");
+  });
+
+  it("retries the failed request at its own page size", () => {
+    expect(source).toContain("$graphStore.errorRequest?.limit");
+    expect(source).toContain("{ forceLimit: limit }");
+  });
+
+  it("dims the previous filter's rows and says so when a refining reload failed", () => {
+    expect(source).toContain("$graphStore.errorRequest?.refining === true");
+    expect(source).toContain("{previousFilterShown ? 'opacity-60' : ''}");
+    expect(source).toContain("Showing the previous filter's results — the new filter failed to load.");
+  });
+});
+
 describe("CommitTable single current commit", () => {
   it("highlights the row from the shared resolver, not from the repo store's id alone", () => {
     expect(source).toContain("resolveCurrentCommitId");

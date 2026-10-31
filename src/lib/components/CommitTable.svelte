@@ -401,6 +401,16 @@
   let totalCommits = $derived(filteredRows.length);
 
   /**
+   * True when a reload for a NEW query, branch or scope failed: the rows on
+   * screen belong to the previous filter while the filter box shows the new
+   * one, so they are dimmed and the banner says so rather than letting stale
+   * rows pass for the answer.
+   */
+  let previousFilterShown = $derived(
+    $graphStore.error !== null && $graphStore.errorRequest?.refining === true,
+  );
+
+  /**
    * Windowing math from the shared owner rather than a third hand-rolled copy.
    *
    * This pane kept its own arithmetic and had drifted from it in two ways that
@@ -948,22 +958,45 @@
        repository is seconds of work, and "nothing happened" is not an
        acceptable answer for it. -->
   {#if $graphStore.isLoading}
-    <div class="absolute top-0 inset-x-0 h-0.5 z-30 overflow-hidden">
+    <div
+      class="absolute top-0 inset-x-0 h-0.5 z-30 overflow-hidden"
+      role="status"
+      aria-label="Loading commits"
+    >
       <div class="h-full w-1/3 bg-accent animate-[gp-slide_1.2s_ease-in-out_infinite]"></div>
     </div>
   {/if}
   {#if $graphStore.error && !$graphStore.isLoading}
-    <div class="absolute top-1 left-1/2 -translate-x-1/2 z-30 px-3 py-1.5 rounded-lg bg-surface border border-rose-500/40 text-[11px] text-rose-300 shadow-lg flex items-center gap-2 max-w-[90%]">
-      <span class="truncate" title={$graphStore.error}>{$graphStore.error}</span>
-      <button
-        class="shrink-0 underline hover:text-white"
-        onclick={() => {
-          const path = $repoStore.currentPath;
-          if (path) void graphStore.loadGraph(path, $filterStore.searchQuery, $filterStore.selectedBranch);
-        }}
-      >
-        Retry
-      </button>
+    <div
+      class="absolute top-1 left-1/2 -translate-x-1/2 z-30 px-3 py-1.5 rounded-lg bg-surface border border-rose-500/40 text-[11px] text-rose-300 shadow-lg flex flex-col gap-0.5 max-w-[90%]"
+      role="alert"
+    >
+      <div class="flex items-center gap-2 min-w-0">
+        <span class="truncate" title={$graphStore.error}>{$graphStore.error}</span>
+        <button
+          class="shrink-0 underline hover:text-white"
+          onclick={() => {
+            const path = $repoStore.currentPath;
+            if (!path) return;
+            // Repeat the request that failed, page size included: a bare
+            // reload would ask for the old, smaller page.
+            const limit = $graphStore.errorRequest?.limit;
+            void graphStore.loadGraph(
+              path,
+              $filterStore.searchQuery,
+              $filterStore.selectedBranch,
+              limit === undefined ? {} : { forceLimit: limit },
+            );
+          }}
+        >
+          Retry
+        </button>
+      </div>
+      {#if previousFilterShown}
+        <span class="text-textMuted">
+          Showing the previous filter's results — the new filter failed to load.
+        </span>
+      {/if}
     </div>
   {/if}
 
@@ -998,11 +1031,12 @@
   <div
     bind:this={container}
     onscroll={handleScroll}
+    aria-busy={$graphStore.isLoading}
     class="flex-1 overflow-y-auto overflow-x-hidden relative gp-scroll"
   >
     <div style="height: {totalCommits * rowHeight}px; width: 100%; position: relative;">
       <div
-        class="gp-gpu"
+        class="gp-gpu {previousFilterShown ? 'opacity-60' : ''}"
         style="transform: translate3d(0, {startIndex * rowHeight}px, 0); width: 100%;"
       >
         {#each visibleRows as row (row.id)}
