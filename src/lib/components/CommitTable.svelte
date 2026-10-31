@@ -34,6 +34,11 @@
   import { INITIAL_GRAPH_PAINT, stepGraphPaint, type GraphPaintState } from "../motion/graphPaint";
   import { nextLoadLimit } from "../stores/graphLimits";
   import {
+    planCommitReconcile,
+    resolveCurrentCommitId,
+    type ReconcileSeen,
+  } from "../graph/currentCommit";
+  import {
     clampGraphScrollLeft,
     graphContentBoxStyle,
     graphViewportBoxStyle,
@@ -488,8 +493,18 @@
     return gpuCtx;
   }
 
+  /**
+   * The commit every pane describes: row highlight, canvas ring, header and
+   * diff all key on this one id (see graph/currentCommit.ts).
+   */
+  const repoSelectedId = $derived($repoStore.selectedCommitId);
+  const graphSelectedId = $derived($graphStore.selectedCommit?.id ?? null);
+  let currentId = $derived(
+    resolveCurrentCommitId(repoSelectedId, graphSelectedId, $graphStore.rows),
+  );
+
   function selectedId(): string | null {
-    return $repoStore.selectedCommitId || $graphStore.selectedCommit?.id || null;
+    return currentId;
   }
 
   function paintNow() {
@@ -763,6 +778,7 @@
     graphContentWidth;
     graphViewportWidth;
     selectedCommitId;
+    currentId;
     // The canvas ring must not wait on the async diff round-trip: selecting
     // updates graphStore synchronously, repoStore's selectedCommitId only after
     // the diff resolves (or never, when it fails). Both are dependencies.
@@ -800,6 +816,50 @@
       });
     }
     schedulePaint();
+  });
+
+  // The graph store and the repo store each hold a selection and are written by
+  // different paths: the graph store auto-selects the newest commit on open and
+  // after a filter drops the selected one, while the repo store (which owns the
+  // diff) is only written by a click or `inspectCommitInHistory`. This effect
+  // makes the diff follow an auto-selection and the graph follow an inspected
+  // commit, so the header, file list, diff and row highlight describe one
+  // commit. It plans on id CHANGES only (previous ids live in plain variables,
+  // not state), so a watcher refresh that republishes the same ids does nothing
+  // and a click is not undone by the repo store's not-yet-updated previous id.
+  // Cost: one `cmd_get_commit_diff` read per History open or filter change.
+  let reconcileSeen: ReconcileSeen | null = null;
+  const repoInRows = $derived(
+    repoSelectedId !== null && $graphStore.rows.some((r) => r.id === repoSelectedId),
+  );
+  $effect(() => {
+    // Only the three ids below are tracked; everything else is read untracked
+    // so a status poll republishing the repo store never re-runs the plan.
+    const repoId = repoSelectedId;
+    const graphId = graphSelectedId;
+    const inRows = repoInRows;
+    untrack(() => {
+      const repo = get(repoStore);
+      const rows = get(graphStore).rows;
+      const plan = planCommitReconcile({
+        repoId,
+        graphId,
+        repoInRows: inRows,
+        prev: reconcileSeen,
+        foreignSelection: repo.selectionKind !== "commit" && repo.selectedFilePath !== null,
+        diff: {
+          loaded: repo.selectedDiff !== null,
+          pending: repo.selectedDiffPending,
+          error: repo.selectedDiffError,
+        },
+      });
+      reconcileSeen = { repoId, graphId, repoInRows: inRows };
+      if (plan.selectGraphId !== null) {
+        const row = rows.find((r) => r.id === plan.selectGraphId);
+        if (row) void graphStore.selectCommit(row);
+      }
+      if (plan.loadDiffId !== null) void repoStore.selectCommitDiff(plan.loadDiffId);
+    });
   });
 
   // Theme changes are rare; drop everything keyed to the old palette and let
@@ -951,7 +1011,7 @@
             density={$densityStore}
             timestampStyle={$interfaceStore.timestampStyle}
             refs={refsByCommit.get(row.id) ?? []}
-            isSelected={$repoStore.selectedCommitId === row.id}
+            isSelected={currentId === row.id}
             mergeTarget={closeTargetById.get(row.id) ?? null}
             onFocusRow={(element, keyboardVisible) =>
               handleRowFocus(row, element, keyboardVisible)}

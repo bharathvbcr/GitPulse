@@ -159,3 +159,25 @@ describe("CommitTable palette invalidation", () => {
     expect(effect).not.toContain("$interfaceStore");
   });
 });
+
+describe("CommitTable single current commit", () => {
+  it("highlights the row from the shared resolver, not from the repo store's id alone", () => {
+    expect(source).toContain("resolveCurrentCommitId");
+    expect(source).toContain("isSelected={currentId === row.id}");
+    expect(source).not.toContain("isSelected={$repoStore.selectedCommitId === row.id}");
+    const selectedIdFn = source.slice(source.indexOf("function selectedId()"), source.indexOf("function paintNow()"));
+    expect(selectedIdFn).toContain("return currentId;");
+  });
+
+  it("reconciles the two stores on id changes only, reading everything else untracked", () => {
+    const start = source.indexOf("let reconcileSeen");
+    expect(start).toBeGreaterThan(-1);
+    const effect = source.slice(start, source.indexOf("// Theme changes are rare"));
+    expect(effect).toContain("planCommitReconcile(");
+    expect(effect).toContain("untrack(() => {");
+    expect(effect).toContain("get(repoStore)");
+    expect(effect).toContain("graphStore.selectCommit(row)");
+    expect(effect).toContain("repoStore.selectCommitDiff(plan.loadDiffId)");
+    expect(effect).not.toContain("$repoStore");
+  });
+});

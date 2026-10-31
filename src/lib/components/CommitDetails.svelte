@@ -3,6 +3,7 @@
   import { untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { graphStore, normalizeDiffPayload } from "../stores/graphStore";
+  import { resolveCurrentCommitId } from "../graph/currentCommit";
   import { harnessStore, type AiGeneration } from "../stores/harnessStore";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import {
@@ -36,8 +37,21 @@
   import type { ProvenanceFreshness } from "../provenance/types";
 
 
+  // One id for the header, the details and the preview: the same resolution
+  // the commit list uses for its highlight (graph/currentCommit.ts), so the
+  // panes cannot describe different commits.
+  let currentCommitId = $derived(
+    resolveCurrentCommitId(
+      $repoStore.selectedCommitId,
+      $graphStore.selectedCommit?.id ?? null,
+      $graphStore.rows,
+    ),
+  );
   let selectedCommit = $derived(
-    $graphStore.rows.find((r) => r.id === $repoStore.selectedCommitId) || $graphStore.selectedCommit
+    currentCommitId === null
+      ? null
+      : ($graphStore.rows.find((r) => r.id === currentCommitId) ??
+          ($graphStore.selectedCommit?.id === currentCommitId ? $graphStore.selectedCommit : null)),
   );
 
   let details = $state<CommitDetailsPayload | null>(null);
@@ -76,7 +90,6 @@
   let explainError = $state<string | null>(null);
 
   let aiReady = $derived($harnessStore.ai?.ready ?? false);
-  let currentCommitId = $derived($repoStore.selectedCommitId || $graphStore.selectedCommit?.id || null);
   let explainGuard: AsyncGuard | null = null;
 
   let copiedSha = $state(false);

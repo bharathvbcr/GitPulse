@@ -64,3 +64,18 @@ describe("CommitDetails", () => {
     expect(effect).toContain('"cmd_provenance_freshness"');
   });
 });
+
+describe("CommitDetails single current commit", () => {
+  it("takes its commit id from the same resolver as the commit list", () => {
+    expect(source).toContain('import { resolveCurrentCommitId } from "../graph/currentCommit"');
+    expect(source).toContain("let currentCommitId = $derived(\n    resolveCurrentCommitId(");
+    expect(source).not.toContain("$repoStore.selectedCommitId || $graphStore.selectedCommit?.id");
+  });
+
+  it("derives the header commit from that id, never from a different commit", () => {
+    const start = source.indexOf("let selectedCommit = $derived(");
+    const block = source.slice(start, source.indexOf("let details = $state"));
+    expect(block).toContain("currentCommitId === null");
+    expect(block).toContain("$graphStore.selectedCommit?.id === currentCommitId");
+  });
+});
