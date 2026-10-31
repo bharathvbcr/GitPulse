@@ -162,7 +162,10 @@ describe("RepoMapPanel template honesty", () => {
     const reload = source.slice(source.indexOf("async function reloadDocs"), source.indexOf("async function runDocsSearch"));
     expect(reload.indexOf("docsStatus = status;")).toBeGreaterThan(-1);
     expect(reload.indexOf("docsStatus = status;")).toBeLessThan(reload.indexOf("await docsBrokenLinks"));
-    expect(reload).not.toContain("docsStatus = null");
+    // ...but a refresh that itself failed clears the previous run's count.
+    expect(reload).toContain("statusCommitted = true;");
+    expect(reload).toContain("if (!statusCommitted) docsStatus = null;");
+    expect(reload.match(/docsStatus = null/g)).toHaveLength(1);
     expect(reload).not.toContain("docsError");
   });
 });

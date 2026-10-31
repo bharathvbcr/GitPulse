@@ -377,12 +377,14 @@
     const live = () => docsRequests.isCurrent(request) && currentRepo === repoPath && mapView === "docs";
     brokenError = null;
     brokenLoading = true;
+    let statusCommitted = false;
     try {
       const status = await docsRefresh(repoPath);
       if (!live()) return;
       // Committed before the links read so "N notes indexed" survives a
-      // links-only failure; a refresh that itself failed never reaches here.
+      // links-only failure.
       docsStatus = status;
+      statusCommitted = true;
       const links = await docsBrokenLinks(repoPath);
       if (!live()) return;
       brokenLinks = links;
@@ -390,6 +392,9 @@
       if (!live()) return;
       brokenError = reportMapFailure("documents", repoPath, err);
       brokenLinks = [];
+      // A refresh that itself failed must not leave the previous run's count
+      // on screen as if it were current.
+      if (!statusCommitted) docsStatus = null;
     } finally {
       if (live()) brokenLoading = false;
     }
