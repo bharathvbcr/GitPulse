@@ -319,7 +319,10 @@ pub async fn cmd_devmap_refresh(
 ///
 /// Never waits on a build: an authorized build runs on its own thread and
 /// this answers `started`; the next call for the repository collects the
-/// outcome. The blocking-pool thread is held only for the status probe.
+/// outcome. The status probe runs on its own thread too: this waits at most
+/// `PROBE_GRACE` for it and otherwise answers `skip_deferred` with
+/// `probe_pending`, so a hung `devmap status` cannot hold the blocking-pool
+/// thread for its 30 s deadline.
 #[tauri::command(async)]
 pub async fn cmd_devmap_maybe_refresh(
     repo_path: String,

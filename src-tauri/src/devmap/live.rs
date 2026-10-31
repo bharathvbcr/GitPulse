@@ -51,6 +51,14 @@
 //! repository ([`LiveBuildSlot`]), the bound the frontend's single queue slot
 //! used to provide by awaiting each build.
 //!
+//! The `devmap status` probe is off the command too. It runs on its own thread
+//! and the ask waits [`PROBE_GRACE`] for it, so an ordinary probe is answered in
+//! the same call; a probe that has not answered by then (it is bounded only by
+//! [`cli::STATUS_DEADLINE`]) is answered [`LiveRefreshDecision::SkipDeferred`]
+//! with [`LiveRefreshOutcome::probe_pending`], and the next ask collects the
+//! result. One probe runs per repository at a time, however many edits arrive
+//! while it does, and a build or an explicit refresh forgets the last result.
+//!
 //! ## Store lifetime
 //!
 //! Never hold an open [`devmap_store::Store`] across a build. This module
@@ -64,7 +72,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Inputs the pure gate needs — assembled by [`maybe_refresh`] or tests.
@@ -123,7 +132,9 @@ pub enum LiveRefreshDecision {
     /// store goes fresh, and the next tick answers `SkipFresh` instead.
     SkipDaemon,
     /// The spawn gate declined to start the status probe or the build under
-    /// load (background work is shed first). Nothing was examined, so this is
+    /// load (background work is shed first), or the probe was started and has
+    /// not answered yet ([`LiveRefreshOutcome::probe_pending`]). Nothing was
+    /// examined, so this is
     /// not [`Self::SkipUnavailable`]: the same request may succeed in a few
     /// seconds, and reporting it as unavailable let the frontend settle a
     /// repository that was never looked at.
@@ -215,12 +226,14 @@ fn lock_live_waits() -> std::sync::MutexGuard<'static, HashMap<String, LiveWait>
 /// including a "too slow" pause: they have chosen to spend the time.
 pub fn clear_live_echo_cooldown(repo_path: &str) {
     lock_live_waits().remove(repo_path);
+    forget_probe(repo_path);
 }
 
 #[cfg(all(test, unix))]
 pub(crate) fn clear_all_live_echo_cooldowns() {
     lock_live_waits().clear();
     lock_finished_builds().clear();
+    lock_live_probes().clear();
 }
 
 /// Next cooldown length after `streak` consecutive echo/failure builds.
@@ -312,6 +325,208 @@ fn lock_finished_builds() -> std::sync::MutexGuard<'static, HashMap<String, Live
     finished_builds()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// How long [`start_refresh`] waits for the `devmap status` probe it started
+/// before answering that the probe is pending. Long enough that an ordinary
+/// probe (tens of milliseconds) never shows the caller a pending answer, short
+/// enough that a hung one costs the command this and not its 30 s deadline.
+pub(crate) const PROBE_GRACE: Duration = Duration::from_secs(1);
+
+/// How long an available probe answer stands in for a new probe: long enough
+/// that the ask which collected it and a watcher tick right behind it share one
+/// child, short enough that a `devmap build` run from a terminal is not masked.
+const PROBE_FRESH: Duration = Duration::from_secs(2);
+
+/// Status probes in flight at once across every repository. A probe that hangs
+/// holds a thread for up to [`cli::STATUS_DEADLINE`]; this is what keeps a
+/// restore of many tabs from holding one each.
+const PROBE_LIMIT: usize = 4;
+
+/// What [`start_refresh`] knows about the `devmap status` probe of one repository.
+enum ProbeSlot {
+    /// Running on its own thread. `last` is the answer before it, kept only to
+    /// describe what the pending ask could not learn.
+    Pending { id: u64, last: Option<CliStatus> },
+    /// Answered. The first ask after it takes the result whatever its age (the
+    /// ask that started the probe may have given up waiting); after that an
+    /// available result is reused for [`PROBE_FRESH`] and an unavailable one
+    /// never is, so a probe that could not run is retried by the next ask.
+    Done {
+        status: CliStatus,
+        finished: Instant,
+        served: bool,
+    },
+}
+
+fn live_probes() -> &'static Mutex<HashMap<String, ProbeSlot>> {
+    static MAP: OnceLock<Mutex<HashMap<String, ProbeSlot>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lock_live_probes() -> std::sync::MutexGuard<'static, HashMap<String, ProbeSlot>> {
+    live_probes()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Drop what is known about `repo_path`'s status, running probe included: a
+/// build changed the store, so a reading from before it describes nothing now,
+/// and a probe that finishes after this is not recorded (see [`finish_probe`]).
+fn forget_probe(repo_path: &str) {
+    lock_live_probes().remove(repo_path);
+}
+
+/// What [`probe_status`] has for the ask.
+enum ProbeAnswer {
+    Status(CliStatus),
+    /// The probe is running and has not answered; carries the answer before it.
+    Pending(Option<CliStatus>),
+    /// No probe was started, for this reason.
+    Refused(String),
+}
+
+/// The status for one ask, without running a `devmap status` child on the
+/// caller's thread. A result at hand is used; otherwise one probe is started
+/// (single-flight per repository) and waited for [`PROBE_GRACE`].
+fn probe_status(repo_path: &str, now: Instant) -> ProbeAnswer {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    let (id, last) = {
+        let mut probes = lock_live_probes();
+        let last = match probes.get_mut(repo_path) {
+            Some(ProbeSlot::Pending { last, .. }) => return ProbeAnswer::Pending(last.clone()),
+            Some(ProbeSlot::Done {
+                status,
+                finished,
+                served,
+            }) => {
+                let current =
+                    status.available && now.saturating_duration_since(*finished) < PROBE_FRESH;
+                if !*served || current {
+                    *served = true;
+                    return ProbeAnswer::Status(status.clone());
+                }
+                Some(status.clone())
+            }
+            None => None,
+        };
+        let running = probes
+            .values()
+            .filter(|slot| matches!(slot, ProbeSlot::Pending { .. }))
+            .count();
+        if running >= PROBE_LIMIT {
+            return ProbeAnswer::Refused(format!(
+                "{running} devmap status probes are already running; the index check waits for one to finish"
+            ));
+        }
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        probes.insert(
+            repo_path.to_string(),
+            ProbeSlot::Pending {
+                id,
+                last: last.clone(),
+            },
+        );
+        (id, last)
+    };
+    let (answer, answered) = mpsc::channel();
+    let repo = repo_path.to_string();
+    let started =
+        crate::supervisor::spawn_once("devmap-live-status", "devmap-live-status", move || {
+            crate::engine::git_cli::with_background_processes(|| run_probe(&repo, id, &answer));
+        });
+    if let Err(error) = started {
+        let mut probes = lock_live_probes();
+        if matches!(probes.get(repo_path), Some(ProbeSlot::Pending { id: held, .. }) if *held == id)
+        {
+            probes.remove(repo_path);
+        }
+        return ProbeAnswer::Refused(format!(
+            "could not start the devmap status probe thread: {error}"
+        ));
+    }
+    match answered.recv_timeout(PROBE_GRACE) {
+        Ok(status) => {
+            if let Some(ProbeSlot::Done { served, .. }) = lock_live_probes().get_mut(repo_path) {
+                *served = true;
+            }
+            ProbeAnswer::Status(status)
+        }
+        Err(_) => ProbeAnswer::Pending(last),
+    }
+}
+
+/// The body of the probe thread: run the child, record the result for the next
+/// ask, and hand it to the ask still waiting for it, if there is one. A panic is
+/// recorded as a probe that could not run, then resumed for
+/// `supervisor::spawn_once` to list the thread as stopped.
+fn run_probe(repo_path: &str, id: u64, answer: &mpsc::Sender<CliStatus>) {
+    let status = match catch_unwind(AssertUnwindSafe(|| cli::status(repo_path))) {
+        Ok(status) => status,
+        Err(payload) => {
+            finish_probe(
+                repo_path,
+                id,
+                CliStatus {
+                    available: false,
+                    binary: None,
+                    lookup: None,
+                    reason: Some("the devmap status probe thread panicked".into()),
+                    status: None,
+                },
+            );
+            resume_unwind(payload);
+        }
+    };
+    finish_probe(repo_path, id, status.clone());
+    // The ask may have stopped waiting; the result is in the slot either way.
+    let _ = answer.send(status);
+}
+
+/// Record a finished probe, unless [`forget_probe`] has dropped it since: a
+/// build that ran meanwhile made its reading stale before anyone saw it.
+fn finish_probe(repo_path: &str, id: u64, status: CliStatus) {
+    let mut probes = lock_live_probes();
+    if matches!(probes.get(repo_path), Some(ProbeSlot::Pending { id: held, .. }) if *held == id) {
+        probes.insert(
+            repo_path.to_string(),
+            ProbeSlot::Done {
+                status,
+                finished: Instant::now(),
+                served: false,
+            },
+        );
+    }
+}
+
+/// The answer to an ask whose status probe has not finished. Carries what the
+/// previous probe established, if any, and says so; never a reading of the
+/// repository now.
+fn pending_probe_outcome(last: Option<&CliStatus>, repo_changed: bool) -> LiveRefreshOutcome {
+    let previous = last.filter(|status| status.available);
+    let facts = previous.map_or(UNEXAMINED, |status| {
+        let (available, status_fresh, schema_ok) = freshness_from_cli_status(status);
+        LiveRefreshFacts {
+            available,
+            is_fresh: status_fresh
+                && !repo_changed
+                && !needs_manifest_rebuild(status.status.as_ref()),
+            schema_ok,
+            already_building: false,
+            rebuild_required: schema_rebuild_authorized(status.status.as_ref()),
+            artifacts_missing: false,
+            daemon_pending: None,
+        }
+    });
+    let reason = if previous.is_some() {
+        "devmap status has not answered yet; these facts are from the previous probe. Ask again to collect the new one."
+    } else {
+        "devmap status has not answered yet. Ask again to collect it."
+    };
+    LiveRefreshOutcome {
+        probe_pending: true,
+        ..skip_deferred_outcome(facts, reason.into())
+    }
 }
 
 /// The one live build allowed to run at a time, across every repository.
@@ -698,8 +913,9 @@ pub fn maybe_refresh(repo_path: &str, repo_changed: bool) -> LiveRefreshOutcome 
 /// [`LiveRefreshDecision::Started`] as soon as the child's writer slot is held.
 ///
 /// The command used to hold a blocking-pool thread, and the frontend's IPC
-/// call, for as long as the child ran — up to [`cli::BUILD_DEADLINE`]. What
-/// still runs inline is the status probe, bounded by [`cli::STATUS_DEADLINE`].
+/// call, for as long as the child ran — up to [`cli::BUILD_DEADLINE`]. The
+/// status probe is bounded the same way: it runs on its own thread and the call
+/// waits at most [`PROBE_GRACE`] for it (see "Off the IPC path").
 pub fn start_refresh(repo_path: &str, repo_changed: bool) -> LiveRefreshOutcome {
     live_refresh(
         repo_path,
@@ -768,7 +984,16 @@ pub(crate) fn live_refresh(
         }
     }
 
-    let cli = cli::status(repo_path);
+    let cli = match run {
+        LiveBuildRun::Inline => cli::status(repo_path),
+        LiveBuildRun::Detached => match probe_status(repo_path, now) {
+            ProbeAnswer::Status(status) => status,
+            ProbeAnswer::Pending(last) => {
+                return pending_probe_outcome(last.as_ref(), repo_changed)
+            }
+            ProbeAnswer::Refused(reason) => return skip_deferred_outcome(UNEXAMINED, reason),
+        },
+    };
     // Shed or deferred by the spawn gate: the probe never ran. Answering
     // `SkipUnavailable` here is what stranded every tab restored at launch.
     if let Some(reason) = cli
@@ -1016,6 +1241,8 @@ impl LiveSettle {
         spawned: Result<BuildOutcome, String>,
         elapsed: Duration,
     ) -> LiveRefreshOutcome {
+        // Whatever the build did, the reading taken before it is stale now.
+        forget_probe(&self.repo_path);
         let finished = self.started + elapsed;
         let build = match spawned {
             Ok(build) => build,
@@ -2041,7 +2268,11 @@ exit 2
             asked.elapsed()
         );
         assert!(first.probe_pending, "{first:?}");
-        assert_eq!(first.decision, LiveRefreshDecision::SkipDeferred, "{first:?}");
+        assert_eq!(
+            first.decision,
+            LiveRefreshDecision::SkipDeferred,
+            "{first:?}"
+        );
         assert!(first.build.is_none());
         assert!(
             !first.facts.available && !first.facts.is_fresh && !first.facts.schema_ok,
@@ -2067,7 +2298,10 @@ exit 2
             if !answer.probe_pending {
                 break answer;
             }
-            assert!(Instant::now() < deadline, "the status probe never reported back");
+            assert!(
+                Instant::now() < deadline,
+                "the status probe never reported back"
+            );
             std::thread::sleep(Duration::from_millis(20));
         };
         // The stale store the probe read is acted on: the build it authorizes
@@ -2083,6 +2317,103 @@ exit 2
             1,
             "the next ask collects the finished probe instead of asking again"
         );
+    }
+
+    /// An available probe answer serves the asks right behind it, so a watcher
+    /// tick does not spawn a second child; one that could not run is never
+    /// reused, so the next ask tries again; and an explicit refresh forgets it.
+    #[test]
+    #[cfg(unix)]
+    fn a_probe_answer_is_reused_briefly_unless_it_could_not_run_or_a_build_intervened() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        struct ResetCooldowns;
+        impl Drop for ResetCooldowns {
+            fn drop(&mut self) {
+                clear_all_live_echo_cooldowns();
+            }
+        }
+        let _reset = ResetCooldowns;
+        let (repo, bound) = stub_repository("#!/bin/sh\nexit 2\n");
+        let path = repo.path().to_string_lossy().into_owned();
+
+        bound.set_status(cli::available_status(
+            r#"{"is_fresh":true,"schema_outdated":false}"#,
+        ));
+        let before = cli::test_status_calls();
+        for _ in 0..3 {
+            let answer = start_refresh(&path, false);
+            assert_eq!(
+                answer.decision,
+                LiveRefreshDecision::SkipFresh,
+                "{answer:?}"
+            );
+            assert!(!answer.probe_pending);
+        }
+        assert_eq!(
+            cli::test_status_calls() - before,
+            1,
+            "one child served all three"
+        );
+
+        clear_live_echo_cooldown(&path);
+        assert_eq!(
+            start_refresh(&path, false).decision,
+            LiveRefreshDecision::SkipFresh
+        );
+        assert_eq!(
+            cli::test_status_calls() - before,
+            2,
+            "an explicit refresh drops the reading taken before it"
+        );
+
+        clear_all_live_echo_cooldowns();
+        bound.set_status(cli::unavailable_status("devmap status exited 2"));
+        let before = cli::test_status_calls();
+        for _ in 0..2 {
+            let answer = start_refresh(&path, false);
+            assert_eq!(
+                answer.decision,
+                LiveRefreshDecision::SkipUnavailable,
+                "{answer:?}"
+            );
+        }
+        assert_eq!(
+            cli::test_status_calls() - before,
+            2,
+            "a probe that could not run is not a reading to reuse"
+        );
+    }
+
+    /// Hung probes hold a thread each, so only a few run at once; the rest are
+    /// deferred (not pending: nothing was started for them) and ask again.
+    #[test]
+    #[cfg(unix)]
+    fn only_a_few_status_probes_run_at_once() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        struct ResetCooldowns;
+        impl Drop for ResetCooldowns {
+            fn drop(&mut self) {
+                clear_all_live_echo_cooldowns();
+            }
+        }
+        let _reset = ResetCooldowns;
+        let bound = cli::bind_test_binary("/gitpulse-test/no-such-devmap");
+        let release = bound.set_status_delayed(
+            cli::available_status(r#"{"is_fresh":true,"schema_outdated":false}"#),
+            Duration::from_secs(10),
+        );
+        let before = cli::test_status_calls();
+        for index in 0..PROBE_LIMIT {
+            let pending = start_refresh(&format!("/gitpulse-test/probe-limit/{index}"), true);
+            assert!(pending.probe_pending, "{pending:?}");
+        }
+        let refused = start_refresh("/gitpulse-test/probe-limit/over", true);
+        assert_eq!(refused.decision, LiveRefreshDecision::SkipDeferred);
+        assert!(!refused.probe_pending, "{refused:?}");
+        assert_eq!(cli::test_status_calls() - before, PROBE_LIMIT);
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// A detached build whose thread panics must not hold the one live slot
