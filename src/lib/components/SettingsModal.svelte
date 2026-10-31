@@ -49,7 +49,12 @@
   } from "../ui/settingsSections";
   import { matchSettings, unsupportedSettingIds } from "../ui/settingsCatalog";
   import { hostPlatform } from "../stores/platformStore";
-  import { readLaunchAtLogin, writeLaunchAtLogin, type LaunchAtLogin } from "../desktop/launchAtLogin";
+  import {
+    describeLaunchAtLogin,
+    readLaunchAtLogin,
+    writeLaunchAtLogin,
+    type LaunchAtLogin,
+  } from "../desktop/launchAtLogin";
   import { launchAtLoginMechanism, shortcutTextLabel, statusIconLocationName, statusIconSettingLabel } from "../ui/platformCopy";
   import { appleIntelligenceStatus, appleReady, type AppleIntelligenceStatus } from "../ai/appleIntelligence";
   import { VIEW_NAV } from "../views/viewNav";
@@ -94,7 +99,10 @@
 
   let activeSection = $state<SettingsSectionId>("appearance");
   let themePreference = $state<ThemePreference>(themeStore.preference());
-  let launchAtLogin = $state<LaunchAtLogin>({ state: "unknown", error: "still reading" });
+  // Only the very first open shows "Checking…"; later opens keep the last known
+  // state while the read-back runs, so the toggle does not blink disabled.
+  let launchAtLogin = $state<LaunchAtLogin>({ state: "loading" });
+  const launchRow = $derived(describeLaunchAtLogin(launchAtLogin));
 
   /**
    * Settings is the only entry point to the tour, so it has to get out of the
@@ -884,11 +892,16 @@
                         description={`Start GitPulse when you sign in. Uses ${launchAtLoginMechanism($hostPlatform.os)}; the operating system is the source of truth.`}
                         ariaLabel="Launch GitPulse at login"
                         checked={launchAtLogin.state === "on"}
-                        disabled={launchAtLogin.state === "unknown"}
+                        disabled={launchRow.disabled}
                         onchange={(next) => void setLaunchAtLogin(next)}
                       />
-                      {#if launchAtLogin.state === "unknown"}
-                        <p class="mt-1 text-[10px] text-amber-500" role="status">Launch at login is unknown: it could not be read ({launchAtLogin.error}).</p>
+                      {#if launchRow.note}
+                        <p
+                          class="mt-1 text-[10px] {launchRow.note.tone === 'warn' ? 'text-amber-500' : 'text-textMuted'}"
+                          role="status"
+                        >
+                          {launchRow.note.text}
+                        </p>
                       {/if}
                     </div>
                   </div>

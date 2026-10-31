@@ -32,6 +32,21 @@ describe("Settings panels load once (SO-1)", () => {
   });
 });
 
+describe("Launch at login row (SO-5)", () => {
+  const settings = read("SettingsModal.svelte");
+
+  it("is seeded as loading, not as an unreadable plugin", () => {
+    expect(settings).toContain('$state<LaunchAtLogin>({ state: "loading" })');
+    expect(settings).not.toContain("still reading");
+  });
+
+  it("renders from describeLaunchAtLogin and does not re-seed on open", () => {
+    expect(settings).toContain("describeLaunchAtLogin(launchAtLogin)");
+    expect(settings).toContain("disabled={launchRow.disabled}");
+    expect(settings.match(/state: "loading"/g)).toHaveLength(1);
+  });
+});
+
 describe("Run setup from Settings (SO-3)", () => {
   const settings = read("SettingsModal.svelte");
   const wizard = read("onboarding/SetupWizard.svelte");
