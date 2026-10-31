@@ -467,6 +467,7 @@
           commits={visibleCommits}
           totalLoc={locKnown ? locValue : 0}
           locStatus={locState.status}
+          scoped={authorFilter !== "all"}
         />
         <PulseExtensionChurn extensions={report.extensions} />
         <PulsePunchCard commits={visibleCommits} scoped={authorFilter !== "all"} />
@@ -493,6 +494,7 @@
           error={knowledgeError}
           loading={knowledgeLoading}
           measuredAt={knowledgeMeasuredAt}
+          staleNotice={false}
         />
 
       {:else if activeTab === "dora"}

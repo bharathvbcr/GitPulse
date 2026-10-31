@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import { render } from "svelte/server";
 import PulseCodeAge from "./PulseCodeAge.svelte";
 import PulseDora from "./PulseDora.svelte";
@@ -97,5 +98,48 @@ describe.each(panels)("$name stale-on-failure notice", ({ html, stillShown }) =>
     const body = html({ error: null, measuredAt: Date.now() });
     expect(body).not.toContain("Last refresh failed");
     expect(body).toContain(stillShown);
+  });
+});
+
+describe("PulseStaleNotice wording", () => {
+  const notice = (props: Props) => render(PulseKnowledgeMap, { props: { knowledge, ...props } }).body;
+
+  it("does not claim a scan from 'just now' that can age while the notice is on screen", () => {
+    const body = notice({ error: "blame timed out", measuredAt: Date.now() - 10_000 });
+    expect(body).toContain("Showing the previous scan from moments ago.");
+    expect(body).not.toContain("just now");
+  });
+
+  it("does not double the full stop when the error already ends in one", () => {
+    const body = notice({ error: "blame timed out.", measuredAt: null });
+    expect(body).toContain("Last refresh failed: blame timed out. Showing the previous scan.");
+    expect(body).not.toContain("..");
+  });
+});
+
+describe("knowledge tab announces a failed refresh once", () => {
+  const props = { knowledge, error: "blame timed out", measuredAt: Date.now() - 5 * 60_000 };
+  const occurrences = (body: string) => body.split("Last refresh failed").length - 1;
+
+  it("PulseCodeAge can leave the notice to the card above it", () => {
+    const body = render(PulseCodeAge, { props: { ...props, staleNotice: false } }).body;
+    expect(occurrences(body)).toBe(0);
+    expect(body).toContain("Repo Code Half-Life");
+  });
+
+  it("PulseCodeAge keeps its own notice when used on its own", () => {
+    expect(occurrences(render(PulseCodeAge, { props }).body)).toBe(1);
+  });
+
+  it("PulseView turns the second copy off", () => {
+    const view = readFileSync(new URL("./PulseView.svelte", import.meta.url), "utf8");
+    const codeAge = view.slice(view.indexOf("<PulseCodeAge"));
+    expect(codeAge.slice(0, codeAge.indexOf("/>"))).toContain("staleNotice={false}");
+  });
+
+  it("PulseView scopes the line-change totals to the selected author", () => {
+    const view = readFileSync(new URL("./PulseView.svelte", import.meta.url), "utf8");
+    const lineTrend = view.slice(view.indexOf("<PulseLineTrend"));
+    expect(lineTrend.slice(0, lineTrend.indexOf("/>"))).toContain('scoped={authorFilter !== "all"}');
   });
 });

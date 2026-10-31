@@ -8,11 +8,14 @@
     totalLoc = 0,
     locStatus = "idle",
     now = Date.now(),
+    scoped = false,
   }: {
     commits: readonly PulseCommitSummary[];
     totalLoc?: number;
     locStatus?: "idle" | "loading" | "ok" | "partial" | "failed";
     now?: number;
+    /** `commits` is one author's slice of the scan, not the whole history. */
+    scoped?: boolean;
   } = $props();
 
   const weeks = $derived(computeLineChanges(commits, 26, now));
@@ -64,7 +67,7 @@
         </div>
       </div>
       <span class="text-[10px] text-textMuted font-mono">
-        All {commits.length.toLocaleString()} scanned commit{commits.length === 1 ? "" : "s"}: +{scannedAdditions.toLocaleString()} / −{scannedDeletions.toLocaleString()}
+        {scoped ? "Selected author's" : "All"} {commits.length.toLocaleString()} scanned commit{commits.length === 1 ? "" : "s"}: +{scannedAdditions.toLocaleString()} / −{scannedDeletions.toLocaleString()}
       </span>
     </div>
   </div>

@@ -8,6 +8,7 @@
     error = null,
     loading = false,
     measuredAt = null,
+    staleNotice = true,
   }: {
     knowledge: KnowledgeReport | null;
     /** Why the blame scan produced nothing. Never rendered as "no data". */
@@ -15,6 +16,12 @@
     loading?: boolean;
     /** When `knowledge` was measured (epoch ms); dates the figures if a refresh fails. */
     measuredAt?: number | null;
+    /**
+     * Show the stale-figures notice. The knowledge tab renders this card under
+     * PulseKnowledgeMap, which reports the same failed blame refresh, so it
+     * turns this copy off rather than announcing the failure twice.
+     */
+    staleNotice?: boolean;
   } = $props();
 
   const dist = $derived(knowledge?.age_distribution);
@@ -73,7 +80,7 @@
       No code age data available.
     </div>
   {:else}
-    {#if error}
+    {#if error && staleNotice}
       <PulseStaleNotice {error} {measuredAt} />
     {/if}
     <!-- Headline Half-Life Card -->

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { AlertCircle } from "@lucide/svelte";
-  import { formatRelativeTime } from "../../format";
+  import { formatRelativeTime, withoutTrailingPeriod } from "../../format";
 
   let {
     error,
@@ -13,7 +13,12 @@
   } = $props();
 
   // `formatRelativeTime` takes unix SECONDS; the store stamps in milliseconds.
-  const age = $derived(measuredAt ? formatRelativeTime(Math.floor(measuredAt / 1000)) : "");
+  // The age is fixed when the notice appears, so "just now" would stay on
+  // screen long after the scan stopped being recent; say "moments ago" instead.
+  const age = $derived.by(() => {
+    const relative = measuredAt ? formatRelativeTime(Math.floor(measuredAt / 1000)) : "";
+    return relative === "just now" ? "moments ago" : relative;
+  });
 </script>
 
 <!-- A refresh that failed after an earlier success leaves the old figures on
@@ -24,6 +29,6 @@
 >
   <AlertCircle size={14} class="shrink-0 mt-px" />
   <span class="min-w-0 wrap-break-word"
-    >Last refresh failed: {error}. Showing the previous scan{age ? ` from ${age}` : ""}.</span
+    >Last refresh failed: {withoutTrailingPeriod(error)}. Showing the previous scan{age ? ` from ${age}` : ""}.</span
   >
 </div>

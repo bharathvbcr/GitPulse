@@ -63,8 +63,8 @@ describe("PulseLineTrend totals", () => {
   }
 
   /** Whitespace-normalised visible text. */
-  function text(commits: PulseCommitSummary[]): string {
-    const { body } = render(PulseLineTrend, { props: { commits, now: NOW } });
+  function text(commits: PulseCommitSummary[], scoped = false): string {
+    const { body } = render(PulseLineTrend, { props: { commits, now: NOW, scoped } });
     return body.replace(/<!--.*?-->/g, "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
   }
 
@@ -88,5 +88,17 @@ describe("PulseLineTrend totals", () => {
     const rendered = text([commit(1, 100, 40)]);
     expect(rendered).toContain("Net +60");
     expect(rendered).toContain("All 1 scanned commit: +100 / −40");
+  });
+
+  it("does not call one author's commits 'All' of the scan", () => {
+    // PulseView filters `commits` by the author picker; the figure is that
+    // author's slice, so it must not claim to cover the whole history.
+    const rendered = text([commit(1, 100, 40), commit(14, 50, 10)], true);
+    expect(rendered).toContain("Selected author's 2 scanned commits: +150 / −50");
+    expect(rendered).not.toContain("All 2 scanned commits");
+  });
+
+  it("still says 'All' when no author is selected", () => {
+    expect(text([commit(1, 100, 40), commit(14, 50, 10)])).toContain("All 2 scanned commits");
   });
 });

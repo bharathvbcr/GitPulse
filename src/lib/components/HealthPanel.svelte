@@ -84,6 +84,7 @@
   import { summarizeHealth, type HealthSummary, type HealthTone } from "../health/summary";
   import { HEALTH_CONTENT_WIDTH, HEALTH_PROSE_WIDTH } from "../health/sections";
   import type { SectionCount } from "../health/counts";
+  import { withoutTrailingPeriod } from "../format";
   import { keyedList } from "../ui/eachKeys";
   import HealthSection from "./health/HealthSection.svelte";
   import HealthTable from "./health/HealthTable.svelte";
@@ -935,7 +936,7 @@
       class="p-3 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-200 flex flex-wrap items-center justify-between gap-2 {HEALTH_PROSE_WIDTH}"
     >
       <span class="min-w-0 wrap-break-word"
-        >Scan failed: {errorMsg}{report ? ". Showing results from the previous scan." : "."}</span
+        >Scan failed: {withoutTrailingPeriod(errorMsg ?? "")}{report ? ". Showing results from the previous scan." : "."}</span
       >
       <span class="flex items-center gap-2 shrink-0">
         <button

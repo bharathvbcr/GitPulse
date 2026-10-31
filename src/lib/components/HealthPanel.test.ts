@@ -80,3 +80,10 @@ describe("HealthPanel source contracts", () => {
     expect(required.filter((line) => !teardown.includes(line))).toEqual([]);
   });
 });
+
+describe("HealthPanel scan-failure banner", () => {
+  it("strips a trailing full stop from the error before adding its own", () => {
+    // errorMsg often ends in "." already; appending another read "..".
+    expect(source).toContain("Scan failed: {withoutTrailingPeriod(errorMsg ?? \"\")}");
+  });
+});
