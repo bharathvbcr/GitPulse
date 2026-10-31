@@ -23,6 +23,9 @@ addEventListener("unhandledrejection", event => errors.push(String(event.reason)
 const root = "/fixture/GitPulse";
 const file = "src/app.ts";
 const unexpected = [], saves = [], blobReads = [];
+// While set, a file read answers only once this promise settles.
+let blobGate = null;
+let blobFails = false;
 let disk = { text: "one\ntwo\n", base: "8:aaaa" };
 let nextBase = "0:saved";
 const status = (path, code) => ({ path, is_staged: false, status_code: code, is_conflicted: false, additions: 1, deletions: 0 });
@@ -35,7 +38,7 @@ mockIPCWithEvents((cmd, args) => {
     case "cmd_get_status": return statuses;
     case "cmd_detect_language": return { name: "TypeScript", color_hex: "#3178c6", category: "Programming" };
     case "cmd_syntax_highlight": return [];
-    case "cmd_get_file_blob": blobReads.push(args); return blob();
+    case "cmd_get_file_blob": blobReads.push(args); if (blobFails) throw new Error("unreadable by fixture"); if (blobGate) return blobGate.then(() => blob()); return blob();
     case "cmd_write_file_content":
       saves.push(args);
       if (args.expectedBase !== disk.base) throw { code: "changed_on_disk", message: `'${args.filePath}' changed on disk since it was opened. Nothing was written.`, path: args.filePath, expected: args.expectedBase ?? "", actual: disk.base };
@@ -82,6 +85,36 @@ const type = async value => { const area = textarea(); area.value = value; area.
   await until(() => host.textContent.includes("Ln 2, Col 1"), "the reveal request lands on its line");
   check("a reveal for the file already open lands on the named line", () => host.textContent.includes("Ln 2, Col 1"));
   check("and the request is consumed, not left to replay", () => get(revealRequest) === null);
+
+  // A reload of the open file (a status change, an agent's edit) swaps the
+  // blob in place. Tag the live viewer, then reload it while the read is held.
+  const lnSpan = () => [...host.querySelectorAll("span")].find(el => /^Ln \d+, Col 1$/.test(el.textContent.trim()));
+  lnSpan().dataset.keep = "1";
+  let releaseBlob;
+  blobGate = new Promise(resolve => { releaseBlob = resolve; });
+  const readsBeforeReload = blobReads.length;
+  statuses = [status(file, "MM")];
+  await repoStore.refresh(root);
+  await until(() => blobReads.length > readsBeforeReload, "the status change re-reads the file");
+  await wait(100);
+  check("a reload in flight keeps the viewer mounted instead of the loading text", () => !host.textContent.includes("Loading file contents") && lnSpan()?.dataset.keep === "1");
+  blobGate = null; releaseBlob();
+  await wait(200);
+  check("and the finished reload leaves the same viewer on the same line", () => lnSpan()?.dataset.keep === "1" && host.textContent.includes("Ln 2, Col 1"));
+  // A reload that fails must not leave the old text looking current.
+  blobFails = true;
+  statuses = [status(file, "M")];
+  await repoStore.refresh(root);
+  await until(() => host.textContent.includes("Failed to read file"), "the failed reload is shown");
+  check("a reload that cannot read the file shows the failure instead of the stale text", () => host.textContent.includes("unreadable by fixture") && !lnSpan());
+  blobFails = false;
+  statuses = [status(file, "MM")];
+  await repoStore.refresh(root);
+  await until(() => lnSpan(), "the file is readable again");
+  check("and the next good reload clears the failure", () => !host.textContent.includes("Failed to read file"));
+  statuses = [status(file, "M")];
+  await repoStore.refresh(root);
+  await wait(300);
 
   button("Edit").click();
   await until(textarea, "the editor opens");
