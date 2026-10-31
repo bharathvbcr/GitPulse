@@ -25,6 +25,12 @@ describe("Settings panels load once (SO-1)", () => {
     }
   });
 
+  it("the host-load toggles stay disabled until a read has succeeded, so defaults are never saved over real settings", () => {
+    const source = read("HostLoadSetting.svelte");
+    expect(source).toContain("readOk = true");
+    expect(source.match(/disabled=\{busy \|\| !readOk/g)).toHaveLength(2);
+  });
+
   it("the notification panel shows the store's load failure instead of the default form", () => {
     const source = read("SessionAlertSettings.svelte");
     expect(source).toContain("sessionAlertsLoadError");

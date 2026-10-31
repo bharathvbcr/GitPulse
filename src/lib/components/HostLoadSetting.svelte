@@ -21,12 +21,16 @@
   let settings = $state<HostLoadSettings>(DEFAULT_HOST_LOAD_SETTINGS);
   let busy = $state(false);
   let error = $state("");
+  // False until a read succeeds: before that `settings` is the defaults, and a
+  // toggle on defaults would save them over the real configuration.
+  let readOk = $state(false);
 
   async function load() {
     busy = true;
     error = "";
     try {
       settings = await loadHostLoadSettings();
+      readOk = true;
     } catch (cause) {
       error = explainError(cause);
     } finally {
@@ -61,14 +65,14 @@
     label="Measure memory pressure and agent sessions"
     description="On by default. Every 2 seconds GitPulse reads this computer's memory pressure, swap and compressor, and finds the agent sessions running on it, for Health and for the agents GitPulse launches. Off stops the readings; nothing is ever sent anywhere."
     checked={settings.enabled}
-    disabled={busy}
+    disabled={busy || !readOk}
     onchange={(next) => void save({ enabled: next })}
   />
   <SettingToggle
     label="Refuse agent launches under severe memory pressure"
     description="On by default. When the kernel reports critical memory pressure, or the memory compressor is thrashing, GitPulse refuses to start an agent until it clears, and says which. You can always choose Admit anyway in Health. Off still sheds GitPulse's own background and refresh work under pressure, but never refuses a launch. Needs the measurement above."
     checked={settings.govern_launches}
-    disabled={busy || !settings.enabled}
+    disabled={busy || !readOk || !settings.enabled}
     onchange={(next) => void save({ govern_launches: next })}
   />
   {#if error}
