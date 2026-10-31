@@ -14,6 +14,11 @@ libc = { version = "0.2" }
 # rule everywhere else in the crate while letting the single audited block
 # opt out by name — tighter than the kernel crate this code came from, which
 # opts into no lints at all. The block carries its own SAFETY comment.
+[features]
+# Test-only hooks (`dc_proc::test_hooks`), enabled by the dev-dependencies of
+# crates whose tests need a deterministic slow drain thread. Off everywhere else.
+test-hooks = []
+
 [lints.rust]
 unsafe_code = "deny"
 

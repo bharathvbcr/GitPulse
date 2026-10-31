@@ -231,6 +231,18 @@ pub fn confidence_millis(value: f32) -> i64 {
 /// (SC15). A gate constant that lives in two places will disagree eventually,
 /// and the copy nobody runs is the one that goes stale.
 ///
+/// **Schema 29 (zstd extraction documents) re-derived this from 176 to 112 KiB.**
+/// Measured on this repository's `git archive` snapshot (1,896 files), release
+/// build, one cold `build --full`: 166.8 MB, **85.9 KiB/file**, against 348.8 MB,
+/// 179.6 KiB/file for the same corpus when the documents were JSON text. 112 KiB
+/// is 1.30x the v29 measurement and sits below the text-era figure with room to
+/// spare (a payload that went back to TEXT is 1.6x over it), so the gate fails
+/// the regression it used to be too loose to see: at 176 KiB a store three
+/// times its measured size passed. Steady state has its own constant below.
+///
+/// What follows is the history of the 176 KiB figure, kept because the
+/// reasoning about what each term costs is still true:
+///
 /// 176 KiB is the measured worst case plus headroom after schema 49: cold-build
 /// cost is ~167 KiB/file on DevCouncil (851 files → 139 MiB, 2026-09-11). The
 /// prior 160 KiB budget was calibrated when AmbiguousGlobal fan-out lived as
@@ -252,10 +264,22 @@ pub fn confidence_millis(value: f32) -> i64 {
 /// gate compares its plateaued size to `db_size_gate_steady_bytes`. Loosening
 /// this constant to cover the steady state would have blunted the cold-build
 /// check instead of adding the missing one.
-pub const DB_SIZE_GATE_PER_FILE: u64 = 176 * 1024;
+pub const DB_SIZE_GATE_PER_FILE: u64 = 112 * 1024;
+/// Per-file budget for a store at its retention ceiling.
+///
+/// A separate figure and no longer `PER_FILE x retained generations`: since the
+/// payload (v17), edge (v18) and file-row (v28) relations stopped copying
+/// themselves per generation, a store holding two generations is barely larger
+/// than one holding one. Measured at schema 29 on the same 1,896 files, a cold
+/// build and then six one-file edits (the growth gate's shape): 166.8 MB cold,
+/// **175.3 MB plateaued, 90.3 KiB/file, two generations retained** (schema 28:
+/// 357.3 MB, 184.1 KiB/file). 116 KiB is 1.28x the plateau. The old doubling
+/// would have allowed 224 KiB/file, and a text-era store (184 KiB) passed it.
+pub const DB_SIZE_GATE_STEADY_PER_FILE: u64 = 116 * 1024;
 /// Generations a store retains. Mirrors `devmap_store::GENERATION_RETENTION`,
 /// which this crate cannot depend on; `retention_matches_the_store_constant` in
-/// devmap-store asserts the two agree so they cannot drift.
+/// devmap-store asserts the two agree so they cannot drift. It documents what
+/// the steady-state figure was measured under; it is no longer a multiplier.
 pub const DB_SIZE_GATE_RETAINED_GENERATIONS: u64 = 2;
 pub const DB_SIZE_GATE_FLOOR: u64 = 60 * 1024 * 1024;
 
@@ -269,11 +293,7 @@ pub fn db_size_gate_bytes(file_count: u64) -> u64 {
 /// before, so a regression that only showed up on the second build — which is
 /// every build after the first — had no check to fail.
 pub fn db_size_gate_steady_bytes(file_count: u64) -> u64 {
-    DB_SIZE_GATE_FLOOR.max(
-        file_count
-            .saturating_mul(DB_SIZE_GATE_PER_FILE)
-            .saturating_mul(DB_SIZE_GATE_RETAINED_GENERATIONS),
-    )
+    DB_SIZE_GATE_FLOOR.max(file_count.saturating_mul(DB_SIZE_GATE_STEADY_PER_FILE))
 }
 
 #[cfg(test)]
@@ -844,6 +864,12 @@ pub const SWIFT_STORED_PROPERTY: &str = "stored property";
 pub const SWIFT_COMPUTED_PROPERTY: &str = "computed property";
 /// See [`SWIFT_STORED_PROPERTY`].
 pub const SWIFT_PROPERTY_REQUIREMENT: &str = "property requirement";
+
+/// The `signature` of a JS/TS module-scope `Variable` whose initializer is a
+/// literal and nothing else — a number, a string, a regular expression, or an
+/// array or object of those. Nothing such a value holds can be called, so the
+/// resolver refuses a `Calls` edge to it.
+pub const JS_LITERAL_CONSTANT: &str = "literal constant";
 
 impl ExtractedSymbol {
     /// Whether this is a Swift member property (stored, computed or a protocol
@@ -1549,6 +1575,30 @@ pub fn go_interface_method_matches<'a>(
         })
         .collect()
 }
+
+/// The name under which a Java file's own scope in [`Extraction::scope_locals`]
+/// records that it declares at least one type-parameter list (`class Box<T>`,
+/// `<U> void f()`), whatever the names in it.
+///
+/// A file-level fact and not a name: `\u{1}` is no character of a Java
+/// identifier, so no use of a name can match it. It exists so a reader that
+/// would claim a bare type name for `java.lang` can tell that the file may bind
+/// that spelling as a type parameter, which the extractor does not record per
+/// name.
+pub const FILE_DECLARES_TYPE_PARAMETERS: &str = "\u{1}type_parameters";
+
+/// The prefix under which a JS/TS file's own scope in [`Extraction::scope_locals`]
+/// records a CommonJS export it withholds: `\u{1}cjs_withheld:` then the exported
+/// name (`default` for `module.exports = …`).
+///
+/// A file publishes `exports.x` only when it assigns it once and never reassigns
+/// `module.exports`; any other assignment is withheld, and this is how the
+/// resolver tells an importer why the name was not found.
+pub const CJS_WITHHELD_PREFIX: &str = "\u{1}cjs_withheld:";
+
+/// The `signature` of a Java `record` class symbol, so a reader can tell a record
+/// from a class (both are `SymbolKind::Class`, and no older reader needs a new kind).
+pub const JAVA_RECORD_SIGNATURE: &str = "record";
 
 /// The leading words of every `ParseOutcome::Failed` reason that records a
 /// parse-budget overrun. See [`Extraction::is_budget_refusal`].
@@ -2477,38 +2527,72 @@ mod gate_and_binding_tests {
     /// absolute assertion somewhere, or every check of it is self-referential.
     #[test]
     fn size_gate_constants_are_their_declared_magnitudes() {
-        assert_eq!(DB_SIZE_GATE_PER_FILE, 180_224, "176 KiB per file");
-        // SC27: the steady-state budget is this per-generation figure times the
-        // retention count, and is what a running repository is measured against.
+        assert_eq!(DB_SIZE_GATE_PER_FILE, 114_688, "112 KiB per file");
+        assert_eq!(
+            DB_SIZE_GATE_STEADY_PER_FILE, 118_784,
+            "116 KiB per file at the plateau"
+        );
+        // SC27: the steady-state budget is its own measured figure (the
+        // plateau after the retention ceiling), and is what a running
+        // repository is measured against.
         assert_eq!(DB_SIZE_GATE_RETAINED_GENERATIONS, 2, "2 generations kept");
         assert_eq!(
             db_size_gate_steady_bytes(10_000),
-            3_604_480_000,
-            "steady-state budget doubles the per-generation one"
+            1_187_840_000,
+            "steady-state budget is the plateau figure, not a doubling"
         );
         assert_eq!(DB_SIZE_GATE_FLOOR, 62_914_560, "60 MiB floor");
-        // The floor covers repositories up to 349 files at 176 KiB/file; past
-        // that the per-file budget takes over (was 384 files at 160 KiB).
+        // The floor covers repositories up to 548 files at 112 KiB/file; past
+        // that the per-file budget takes over (was 349 files at 176 KiB).
         assert_eq!(
             db_size_gate_bytes(100),
             DB_SIZE_GATE_FLOOR,
             "floor dominates small repos"
         );
         assert_eq!(
-            db_size_gate_bytes(349),
+            db_size_gate_bytes(548),
             DB_SIZE_GATE_FLOOR,
             "the crossover stays on the floor"
         );
         assert_eq!(
-            db_size_gate_bytes(350),
-            63_078_400,
+            db_size_gate_bytes(549),
+            62_963_712,
             "one file past the crossover scales"
         );
         assert_eq!(
             db_size_gate_bytes(10_000),
-            1_802_240_000,
+            1_146_880_000,
             "per-file dominates large repos"
         );
+    }
+
+    /// The gates are derived from what schema 29 measured, and are tight enough
+    /// that a store of the text era fails them. Both figures are the 2026-10-29
+    /// measurements on the 1,896-file snapshot (see the doc on
+    /// `DB_SIZE_GATE_PER_FILE`); this holds the relations between the gates and
+    /// the numbers they were derived from, which the absolute assertions above
+    /// cannot say.
+    #[test]
+    fn size_gates_pass_the_compressed_store_and_fail_the_text_one() {
+        const FILES: u64 = 1_896;
+        const V29_COLD: u64 = 166_772_736;
+        const V29_STEADY: u64 = 175_292_416;
+        const TEXT_COLD: u64 = 348_782_592;
+        const TEXT_STEADY: u64 = 357_318_656;
+        assert!(V29_COLD < db_size_gate_bytes(FILES));
+        assert!(V29_STEADY < db_size_gate_steady_bytes(FILES));
+        assert!(
+            TEXT_COLD >= db_size_gate_bytes(FILES),
+            "a store whose documents are JSON text again must fail the cold gate"
+        );
+        assert!(
+            TEXT_STEADY >= db_size_gate_steady_bytes(FILES),
+            "and the steady-state gate: the old doubling let it through"
+        );
+        // Headroom stated, not implied: neither gate sits more than 1.4x above
+        // what it was derived from.
+        assert!(db_size_gate_bytes(FILES) * 10 <= V29_COLD * 14);
+        assert!(db_size_gate_steady_bytes(FILES) * 10 <= V29_STEADY * 14);
     }
 
     /// `binding_pairs` reverses each `(imported, local)` into `(local, imported)`

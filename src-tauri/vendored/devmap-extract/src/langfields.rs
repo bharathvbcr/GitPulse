@@ -82,11 +82,20 @@ pub(crate) fn extract_field_type(
     if field.name.is_empty() {
         return None;
     }
-    let enclosing = match owning_type_name(node, source) {
+    // A Java parameter or typed local is the enclosing method's, never a field of
+    // the type around it: the owner walk below does not stop at a constructor,
+    // so a constructor parameter would be typed as a field of its class. Only a
+    // record component, written in the record's header, is both.
+    let java_binding =
+        lang == "java" && node.kind() != "field_declaration" && !java_is_record_component(node);
+    let enclosing = match owning_type_name(node, source).filter(|_| !java_binding) {
         Some(owner) => format!("{file_symbol_name}::{owner}"),
         // A Kotlin parameter, or a typed local, is the enclosing function's: the
         // owner walk stops at a callable, and the binding is that callable's.
         None if lang == "kotlin" => {
+            crate::langcalls::scope::enclosing_emitted_symbol(node, source, lang, file_symbol_name)?
+        }
+        None if java_binding && java_binding_is_in_a_callable(node) => {
             crate::langcalls::scope::enclosing_emitted_symbol(node, source, lang, file_symbol_name)?
         }
         None => return None,
@@ -181,7 +190,18 @@ fn field_node_kinds(lang: &str) -> Option<&'static [&'static str]> {
     Some(match lang {
         // Metal borrows the `cpp` grammar and arrives here as `cpp`, exactly as
         // it does in `langimports`.
-        "c" | "cpp" | "cuda" | "go" | "java" | "rust" => &["field_declaration"],
+        "c" | "cpp" | "cuda" | "go" | "rust" => &["field_declaration"],
+        // A Java binding is typed where it is written: a field, a method
+        // parameter (which is also a record component when it sits in a record
+        // header), a typed local, a loop variable and a type pattern.
+        "java" => &[
+            "field_declaration",
+            "formal_parameter",
+            "local_variable_declaration",
+            "enhanced_for_statement",
+            "instanceof_expression",
+            "type_pattern",
+        ],
         "csharp" => &["field_declaration", "property_declaration"],
         "dart" => &["declaration"],
         "kotlin" => &["property_declaration", "class_parameter", "parameter"],
@@ -214,7 +234,8 @@ fn field_of(lang: &str, node: Node, source: &str) -> Option<FieldType> {
     };
     match lang {
         // `name:` and `type:` are both direct fields.
-        "rust" | "java" | "solidity" => plain(
+        "java" => java_field(node, source),
+        "rust" | "solidity" => plain(
             get_child_text(node, "name", source).or_else(|| {
                 // Java puts the name one level down, on the declarator.
                 let declarator = node.child_by_field_name("declarator")?;
@@ -345,6 +366,82 @@ fn field_of(lang: &str, node: Node, source: &str) -> Option<FieldType> {
         }
         _ => None,
     }
+}
+
+/// A Java binding and the type it is written with: a field, a parameter, a typed
+/// local, an enhanced-`for` variable, or the name an `instanceof` or a `case`
+/// type pattern introduces.
+///
+/// `var` states no type, so it yields none: typing `var p = make()` as a class
+/// called `var` would hand the resolver a name it can never match, and the
+/// initializer shape is what types such a local. A declaration of several
+/// variables (`Point a, b;`) is typed by its first, which is the whole
+/// declaration's type.
+fn java_field(node: Node, source: &str) -> Option<FieldType> {
+    let typed = |name: Option<String>, type_node: Option<Node>| {
+        let type_node = type_node.filter(|ty| get_node_text(*ty, source) != "var")?;
+        Some(FieldType {
+            name: name?,
+            type_name: nominal_type_name(type_node, source, 0),
+            qualifier: None,
+        })
+    };
+    match node.kind() {
+        "field_declaration" | "local_variable_declaration" => typed(
+            node.child_by_field_name("declarator")
+                .and_then(|declarator| get_child_text(declarator, "name", source)),
+            node.child_by_field_name("type"),
+        ),
+        "formal_parameter" | "enhanced_for_statement" => typed(
+            get_child_text(node, "name", source),
+            node.child_by_field_name("type"),
+        ),
+        "instanceof_expression" => typed(
+            get_child_text(node, "name", source),
+            node.child_by_field_name("right"),
+        ),
+        // `case Circle c ->`: the type and the binding are two bare children.
+        "type_pattern" => {
+            let mut cursor = node.walk();
+            let mut named = node.named_children(&mut cursor);
+            let type_node = named.next()?;
+            let binding = named.next().filter(|name| name.kind() == "identifier")?;
+            typed(Some(get_node_text(binding, source)), Some(type_node))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `node` is a component in a record's header: `x` in `record P(int x)`.
+fn java_is_record_component(node: Node) -> bool {
+    node.kind() == "formal_parameter"
+        && bounded_parent(node)
+            .and_then(bounded_parent)
+            .is_some_and(|record| record.kind() == "record_declaration")
+}
+
+/// Whether a Java binding is written inside a method or constructor body (or a
+/// lambda in one), as opposed to at a type's own level.
+///
+/// The walk ends at the first declaration boundary: a callable means the
+/// binding is its own, a type body means it is not.
+fn java_binding_is_in_a_callable(node: Node) -> bool {
+    let mut ancestor = bounded_parent(node);
+    while let Some(parent) = ancestor {
+        match parent.kind() {
+            "method_declaration"
+            | "constructor_declaration"
+            | "compact_constructor_declaration" => return true,
+            "class_body"
+            | "interface_body"
+            | "enum_body"
+            | "annotation_type_body"
+            | "record_declaration"
+            | "program" => return false,
+            _ => ancestor = bounded_parent(parent),
+        }
+    }
+    false
 }
 
 /// A Kotlin typed binding: a property, a function parameter, or a primary

@@ -434,6 +434,50 @@ impl Resolver {
             .then(|| (target_file.clone(), target_symbol.clone(), package.clone()))
     }
 
+    /// JS/TS: the `type_methods` hits a type name reaches from `call_file`,
+    /// when the module's own scope settles which of several namesakes it is.
+    ///
+    /// A module binds a name once. A class this file declares is the one its
+    /// receivers name, and an imported type is the file the import resolves to,
+    /// whatever other files declare under the same name: a non-exported `class
+    /// Parser` in each of five files is five unrelated types, not one ambiguous
+    /// one. `None` when the file is not JS/TS, when there is only one hit, or
+    /// when neither the file nor an import accounts for any hit (so the
+    /// ambiguity stands).
+    pub(super) fn js_module_scoped_hits<'a>(
+        &self,
+        call_file: &str,
+        type_name: &str,
+        hits: &[&'a (String, String)],
+    ) -> Option<Vec<&'a (String, String)>> {
+        if hits.len() < 2 || self.family_of_file(call_file) != Some(LangFamily::JsTs) {
+            return None;
+        }
+        // A module cannot both import and declare a top-level name, so an
+        // import of it is authoritative, and a nested class of the same name in
+        // this file does not take its place.
+        let imported = self
+            .import_bindings
+            .get(call_file)
+            .and_then(|bindings| bindings.get(type_name))
+            .map(|(bound_file, _)| {
+                hits.iter()
+                    .copied()
+                    .filter(|hit| &hit.0 == bound_file)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|imported| !imported.is_empty());
+        if imported.is_some() {
+            return imported;
+        }
+        let own: Vec<&(String, String)> = hits
+            .iter()
+            .copied()
+            .filter(|hit| hit.0 == call_file)
+            .collect();
+        (!own.is_empty()).then_some(own)
+    }
+
     /// Where a bare `name` written in `file` goes by Swift's module-scope rule.
     ///
     /// A Swift target is one unqualified namespace spanning every file that
@@ -484,6 +528,9 @@ impl Resolver {
             if !in_own.is_empty() {
                 uniq = in_own;
             }
+        }
+        if let Some(narrowed) = self.js_module_scoped_hits(call_file, type_name, &uniq) {
+            uniq = narrowed;
         }
         if uniq.is_empty() || !uniq.iter().all(|hit| hit.0 == uniq[0].0) {
             return None;

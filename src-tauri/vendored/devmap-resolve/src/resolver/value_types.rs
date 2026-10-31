@@ -37,6 +37,44 @@ impl Resolver {
     /// reassignment in the extraction, so it withdraws the answer too; that
     /// costs an abstention, where reading it the other way would cost a
     /// confidently wrong edge.
+    /// Record the module-scope JS/TS values nothing can call.
+    ///
+    /// A `Variable` the extractor tagged [`devmap_extract::model::JS_LITERAL_CONSTANT`]
+    /// holds a number, a string, a regular expression, or an array or object of
+    /// such: none is callable, so an edge `Calls` it is a false one. The import rung bound
+    /// `import { DEFAULT_SCOPE } from './x'; DEFAULT_SCOPE()` to the constant,
+    /// and a barrel made the same shape reachable through more specifiers.
+    ///
+    /// Only a declaration the extractor read as literal is recorded. `const hook =
+    /// createHook()`, `const alias = other` and `const { a } = obj` all carry a
+    /// call or a name, so they stay targets: what they hold is not known.
+    pub(super) fn index_inert_values(&mut self, ext: &Extraction, family: LangFamily) {
+        if family != LangFamily::JsTs {
+            return;
+        }
+        // A symbol's identity is its kind, its file and its name. The set is
+        // keyed `file::name`, which a function and a variable of one name share
+        // (`exports.x = 3; function x() {}`), so a name is recorded only when
+        // the literal-constant variable is the one symbol of it in the file:
+        // demoting a call at the function would be a false demotion.
+        let mut by_name: BTreeMap<&str, usize> = BTreeMap::new();
+        for symbol in &ext.symbols {
+            *by_name.entry(symbol.qualified_name.as_str()).or_default() += 1;
+        }
+        for symbol in &ext.symbols {
+            if symbol.kind != SymbolKind::Variable
+                || symbol.parent_symbol.as_deref() != Some(ext.file_path.as_str())
+            {
+                continue;
+            }
+            if symbol.signature.as_deref() == Some(devmap_extract::model::JS_LITERAL_CONSTANT)
+                && by_name.get(symbol.qualified_name.as_str()).copied() == Some(1)
+            {
+                self.inert_values.insert(symbol.qualified_name.clone());
+            }
+        }
+    }
+
     pub(super) fn index_module_value_types(&mut self, ext: &Extraction, family: LangFamily) {
         let mut declarations: BTreeMap<&str, Vec<&Span>> = BTreeMap::new();
         for symbol in &ext.symbols {
@@ -280,23 +318,33 @@ impl Resolver {
             let owner = owner.rsplit("::").next()?;
             self.unique_type_method(family, owner, function)?
         } else if let Some((receiver, function)) = shape.rsplit_once('.') {
-            if !Self::is_plain_ident(receiver)
-                || !Self::is_plain_ident(function)
-                || scope.is_some_and(|scope| self.scope_shadows(family, file, scope, receiver))
+            let root = Self::path_root(receiver);
+            if !Self::is_plain_ident(function)
+                || scope.is_some_and(|scope| self.scope_shadows(family, file, scope, root))
             {
                 return None;
             }
-            let module = self
-                .import_binding_at(family, file, scope, receiver)
-                .filter(|_| !self.is_value_import(file, receiver));
-            match module {
-                Some((module_file, _)) => self.lookup_in_package(module_file, function)?,
-                // `Svc.create()`: a static factory on a type this corpus
-                // declares once.
-                None if self.unique_indexed_type(family, receiver) => {
-                    self.unique_type_method(family, receiver, function)?
+            if Self::is_plain_ident(receiver) {
+                let module = self
+                    .import_binding_at(family, file, scope, receiver)
+                    .filter(|_| !self.is_value_import(file, receiver));
+                match module {
+                    Some((module_file, _)) => self.lookup_in_package(module_file, function)?,
+                    // `Svc.create()`: a static factory on a type this corpus
+                    // declares once.
+                    None if self.unique_indexed_type(family, receiver) => {
+                        self.unique_type_method(family, receiver, function)?
+                    }
+                    None => {
+                        let base_type = self.receiver_type_for(file, scope, receiver, None)?;
+                        let key = (family, base_type, function.to_string());
+                        self.type_methods.get(&key)?.first()?.clone()
+                    }
                 }
-                None => return None,
+            } else {
+                let base_type = self.receiver_type_for(file, scope, receiver, None)?;
+                let key = (family, base_type, function.to_string());
+                self.type_methods.get(&key)?.first()?.clone()
             }
         } else {
             if !Self::is_plain_ident(shape)
@@ -477,9 +525,15 @@ impl Resolver {
         else {
             return false;
         };
-        self.symbol_index.get(declared).is_some_and(|candidates| {
+        self.declares_type_at(Some(declaring_file), declared)
+    }
+
+    /// Whether `file` declares a class, struct, enum, interface or trait
+    /// named `name`; with no `file`, whether any file does.
+    pub(super) fn declares_type_at(&self, file: Option<&str>, name: &str) -> bool {
+        self.symbol_index.get(name).is_some_and(|candidates| {
             candidates.iter().any(|(path, kind, _, _)| {
-                path == declaring_file
+                file.is_none_or(|file| path == file)
                     && matches!(
                         kind,
                         SymbolKind::Class

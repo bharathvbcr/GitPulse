@@ -5,12 +5,14 @@ pub mod edge_index;
 // frontend to produce what it caches. A read-only consumer never touches it.
 #[cfg(feature = "parse")]
 pub mod extract_cache;
+pub(crate) mod payload_codec;
 pub mod schema;
 
 pub use coverage::{
     add_manifest_refusals, discovery_refusals, over_limit_inventory, refusal_inventory,
     CoverageGapRow, CoverageGapSample, CoverageGaps, DiscoveryInventory, DiscoveryRefusal,
     PartialParseGap, COVERAGE_GAP_SAMPLE, GAP_DISCOVERY_REFUSED, GAP_OVER_LIMIT,
+    GAP_RESOLUTION_BUDGET,
 };
 pub use db::{
     checked_min_confidence, current_git_head, BuildHistoryRow, CallersPage, DeadPage, FileEdges,

@@ -4,6 +4,7 @@ use super::{
     literal_predicate, lock_conn, refusal, sqlite_limit, stored_symbol_from_row, CallersPage,
     DeadPage, EdgeSide, FileEdges, IndexedFiles, KeywordNarrowing, LiteralPage, PathRanks,
     SearchNarrowing, SearchPage, Store, StoredEdge, StoredFile, StoredLiteral, StoredSymbol,
+    FTS_ORD_SQL, FTS_PAYLOAD_SQL, LITERAL_SITES,
 };
 use crate::edge_index::{EdgeOrder, GenerationEdges, GenerationEdgesBuilder};
 use devmap_analyze::clones::CloneCandidate;
@@ -28,14 +29,20 @@ impl Store {
             None => return Ok(vec![]),
         };
         let read = || -> Result<Vec<(String, String, String)>> {
-            let mut stmt = snapshot.prepare(
+            let mut stmt = snapshot.prepare(&format!(
                 "SELECT name, qualified_name, path
-                 FROM nodes_fts
-                 WHERE rowid IN (SELECT rowid_ref FROM nodes_fts_map WHERE generation_id = ?1)
-                   AND nodes_fts MATCH ?2
-                 ORDER BY rowid
-                 LIMIT ?3",
-            )?;
+                     FROM nodes_fts
+                     WHERE {FTS_PAYLOAD_SQL} IN (
+                               SELECT r.payload_id
+                                 FROM generations g
+                                 JOIN file_rows r
+                                   ON g.id >= r.valid_from
+                                  AND (r.valid_to IS NULL OR g.id < r.valid_to)
+                                WHERE g.id = ?1)
+                       AND nodes_fts MATCH ?2
+                     ORDER BY rowid
+                     LIMIT ?3"
+            ))?;
             let match_q = fts_match_query(query)?;
             let rows = stmt.query_map(params![gen, match_q, sqlite_limit(limit)], |row| {
                 Ok((
@@ -131,13 +138,19 @@ impl Store {
 
     fn all_symbols_in(snapshot: &Connection, gen: u32) -> Result<Vec<StoredSymbol>> {
         let mut stmt = snapshot.prepare(
+            // `ORDER BY r.row_id, n.ord_in_file` is the order v27 wrote the
+            // symbols in: carried files where they were, files this build
+            // rewrote after them (see `MIGRATION_V27_TO_V28`).
             "SELECT n.name, n.qualified_name, n.kind, p.path,
                     n.span_start, n.span_end, n.is_exported, f.content_hash
-             FROM generation_nodes n
-             JOIN generation_files f ON f.generation_id = n.generation_id AND f.file_id = n.file_id
-             JOIN paths p ON p.id = n.file_id
-             WHERE n.generation_id = ?1
-             ORDER BY n.ordinal",
+             FROM generations g
+             JOIN file_rows r
+               ON g.id >= r.valid_from AND (r.valid_to IS NULL OR g.id < r.valid_to)
+             JOIN payload_nodes n ON n.payload_id = r.payload_id
+             JOIN file_payloads f ON f.payload_id = r.payload_id
+             JOIN paths p ON p.id = r.file_id
+             WHERE g.id = ?1
+             ORDER BY r.row_id, n.ord_in_file",
         )?;
         let rows = stmt.query_map(params![gen], |row| {
             let name: String = row.get(0)?;
@@ -225,20 +238,21 @@ impl Store {
         }
         let match_query = fts_match_query(query)?;
         let mut stmt = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT n.name, n.qualified_name, n.kind, p.path,
                     n.span_start, n.span_end, n.is_exported, f.content_hash
              FROM nodes_fts
-             CROSS JOIN nodes_fts_map m ON m.rowid_ref = nodes_fts.rowid
-             JOIN generation_nodes n
-               ON n.generation_id = m.generation_id
-              AND n.ordinal = (nodes_fts.rowid & 4294967295)
-             JOIN paths p ON p.id = n.file_id
-             JOIN generation_files f ON f.generation_id = n.generation_id AND f.file_id = n.file_id
-             WHERE m.generation_id = ?1 AND nodes_fts MATCH ?2
+             CROSS JOIN payload_nodes n
+               ON n.payload_id = {FTS_PAYLOAD_SQL} AND n.ord_in_file = {FTS_ORD_SQL}
+             JOIN file_rows r ON r.payload_id = n.payload_id
+             JOIN generations g
+               ON g.id = ?1 AND g.id >= r.valid_from AND (r.valid_to IS NULL OR g.id < r.valid_to)
+             JOIN paths p ON p.id = r.file_id
+             JOIN file_payloads f ON f.payload_id = r.payload_id
+             WHERE nodes_fts MATCH ?2
              ORDER BY bm25(nodes_fts), p.path, n.name, n.span_start
              LIMIT ?3",
-            )
+            ))
             .map_err(fts_failure)?;
         let rows = stmt
             .query_map(params![gen, match_query, sqlite_limit(limit)], |row| {
@@ -278,18 +292,21 @@ impl Store {
         }
         let match_query = fts_match_query(query)?;
         // CROSS JOIN pins the FTS table as the outer loop. As a plain JOIN,
-        // SQLite 3.45 (the bundled version) leads with `nodes_fts_map` on
-        // `generation_id` and re-scans full-text storage once per mapped row:
+        // SQLite 3.45 (the bundled version) leads with the membership table on
+        // `generation_id` and re-scans full-text storage once per member row:
         // 12.7s at 200k rows, against 1.7ms for the match alone. A subquery
         // does not help because the planner flattens it. `search_symbols`
         // avoids this only by accident, via `ORDER BY bm25(...)`.
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*)
+                &format!(
+                    "SELECT COUNT(*)
              FROM nodes_fts
-             CROSS JOIN nodes_fts_map m
-               ON m.rowid_ref = nodes_fts.rowid AND m.generation_id = ?1
-             WHERE nodes_fts MATCH ?2",
+             CROSS JOIN file_rows r ON r.payload_id = {FTS_PAYLOAD_SQL}
+             JOIN generations g
+               ON g.id = ?1 AND g.id >= r.valid_from AND (r.valid_to IS NULL OR g.id < r.valid_to)
+             WHERE nodes_fts MATCH ?2"
+                ),
                 params![gen, match_query],
                 |row| row.get(0),
             )
@@ -396,7 +413,7 @@ impl Store {
             return Ok(None);
         };
         let (predicate, mut params) = literal_predicate(generation, query, exact);
-        let count_sql = format!("SELECT COUNT(*) FROM generation_literals l WHERE {predicate}");
+        let count_sql = format!("SELECT COUNT(*) FROM {LITERAL_SITES} WHERE {predicate}");
         let count: i64 = snapshot
             .query_row(&count_sql, params_from_iter(params.iter()), |row| {
                 row.get(0)
@@ -406,8 +423,8 @@ impl Store {
             u32::try_from(count).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, count))?;
         let page_sql = format!(
             "SELECT p.path, l.line, l.span_start, l.value, l.qualified_name, l.symbol_name
-             FROM generation_literals l
-             JOIN paths p ON p.id = l.file_id
+             FROM {LITERAL_SITES}
+             JOIN paths p ON p.id = r.file_id
              WHERE {predicate}
              ORDER BY p.path, l.line, l.span_start
              LIMIT ?"
@@ -468,17 +485,16 @@ impl Store {
             return Ok((0, Vec::new(), Some(narrowing)));
         }
         let match_query = fts_match_query(query)?;
-        let mut count_sql = String::from(
+        let mut count_sql = format!(
             "SELECT COUNT(*)
              FROM nodes_fts
-             CROSS JOIN nodes_fts_map m
-               ON m.rowid_ref = nodes_fts.rowid AND m.generation_id = ?
-             JOIN generation_nodes n
-               ON n.generation_id = m.generation_id
-              AND n.ordinal = (nodes_fts.rowid & 4294967295)
-             JOIN paths p ON p.id = n.file_id
-             JOIN generation_files f
-               ON f.generation_id = n.generation_id AND f.file_id = n.file_id
+             CROSS JOIN payload_nodes n
+               ON n.payload_id = {FTS_PAYLOAD_SQL} AND n.ord_in_file = {FTS_ORD_SQL}
+             JOIN file_rows r ON r.payload_id = n.payload_id
+             JOIN generations g
+               ON g.id = ? AND g.id >= r.valid_from AND (r.valid_to IS NULL OR g.id < r.valid_to)
+             JOIN paths p ON p.id = r.file_id
+             JOIN file_payloads f ON f.payload_id = r.payload_id
              WHERE nodes_fts MATCH ?",
         );
         let mut count_params: Vec<Box<dyn ToSql>> = vec![
@@ -496,17 +512,18 @@ impl Store {
         }
         let total =
             u32::try_from(count).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, count))?;
-        let mut page_sql = String::from(
+        let mut page_sql = format!(
             "SELECT n.name, n.qualified_name, n.kind, p.path,
                     n.span_start, n.span_end, n.is_exported, f.content_hash
              FROM nodes_fts
-             CROSS JOIN nodes_fts_map m ON m.rowid_ref = nodes_fts.rowid
-             JOIN generation_nodes n
-               ON n.generation_id = m.generation_id
-              AND n.ordinal = (nodes_fts.rowid & 4294967295)
-             JOIN paths p ON p.id = n.file_id
-             JOIN generation_files f ON f.generation_id = n.generation_id AND f.file_id = n.file_id
-             WHERE m.generation_id = ? AND nodes_fts MATCH ?",
+             CROSS JOIN payload_nodes n
+               ON n.payload_id = {FTS_PAYLOAD_SQL} AND n.ord_in_file = {FTS_ORD_SQL}
+             JOIN file_rows r ON r.payload_id = n.payload_id
+             JOIN generations g
+               ON g.id = ? AND g.id >= r.valid_from AND (r.valid_to IS NULL OR g.id < r.valid_to)
+             JOIN paths p ON p.id = r.file_id
+             JOIN file_payloads f ON f.payload_id = r.payload_id
+             WHERE nodes_fts MATCH ?",
         );
         let mut page_params: Vec<Box<dyn ToSql>> =
             vec![Box::new(i64::from(generation)), Box::new(match_query)];
@@ -651,30 +668,48 @@ impl Store {
     ///
     /// The `RuntimeEntryPoint` wiring annotations whose details
     /// [`devmap_extract::wiring::is_test_harness_reason`] recognises, read
-    /// without decoding whole extractions: SQLite pulls out only the
-    /// `wiring` array, and only from files whose payload mentions an entry
-    /// point at all. `affected_tests` runs on every hook-driven query, and a
-    /// full [`Self::latest_extractions`] decode there would cost more than the
-    /// walk it serves.
+    /// without decoding whole extractions. `affected_tests` runs on every
+    /// hook-driven query, and a full [`Self::latest_extractions`] decode there
+    /// would cost more than the walk it serves.
+    ///
+    /// Since schema 29 the extraction is a compressed blob, which SQL cannot
+    /// look inside, so the annotations this query wants are stored beside it
+    /// (`file_payloads.entry_wiring_json`, written with the payload) and the
+    /// query reads those: no payload is decompressed. A payload with no stored
+    /// entry wiring (`NULL`, a row some other writer inserted) is the one case
+    /// that still decodes its document, so the answer never depends on who
+    /// wrote the row. The test-harness judgement stays here, where it was.
     pub fn latest_test_entry_symbols(&self) -> Result<std::collections::HashSet<String>> {
+        use crate::payload_codec::{decode_value, entry_wiring_of_document};
         let conn = lock_conn(&self.conn)?;
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
             return Ok(std::collections::HashSet::new());
         };
+        // The CASE reads the document only for a row with no stored entry
+        // wiring; for every other row the column is never loaded.
         let mut stmt = snapshot.prepare(
-            "SELECT json_extract(f.extraction_json, '$.wiring'), p.path
-             FROM generation_files f
-             JOIN paths p ON p.id = f.file_id
-             WHERE f.generation_id = ?1
-               AND instr(f.extraction_json, 'RuntimeEntryPoint') > 0",
+            "SELECT p.entry_wiring_json, pa.path,
+                    CASE WHEN p.entry_wiring_json IS NULL THEN p.extraction_json END
+             FROM generation_file_rows m
+             JOIN file_payloads p ON p.payload_id = m.payload_id
+             JOIN paths pa ON pa.id = m.file_id
+             WHERE m.generation_id = ?1
+               AND (p.entry_wiring_json IS NULL OR p.entry_wiring_json <> '[]')",
         )?;
         let rows = stmt.query_map(params![gen], |row| {
-            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+            let path: String = row.get(1)?;
+            let json = match row.get::<_, Option<String>>(0)? {
+                Some(json) => json,
+                None => {
+                    let document = decode_value(row.get_ref(2)?, &path)?;
+                    entry_wiring_of_document(&document, &path)?
+                }
+            };
+            Ok((json, path))
         })?;
         let mut symbols = std::collections::HashSet::new();
         for row in rows {
             let (json, path) = row?;
-            let Some(json) = json else { continue };
             let wiring: Vec<devmap_extract::model::WiringAnnotation> = serde_json::from_str(&json)
                 .map_err(|error| {
                     refusal(format!("stored wiring for {path} is invalid: {error}"))
@@ -721,7 +756,9 @@ impl Store {
              ORDER BY p.path",
         )?;
         let rows = stmt.query_map(params![gen], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            let path: String = row.get(1)?;
+            let json = crate::payload_codec::decode_value(row.get_ref(0)?, &path)?.into_owned();
+            Ok((json, path))
         })?;
         let mut extractions = Vec::new();
         for row in rows {
@@ -759,7 +796,7 @@ impl Store {
                  JOIN paths p ON p.id = f.file_id
                  WHERE f.generation_id = ?1 AND p.path = ?2",
                 params![gen, path],
-                |row| row.get(0),
+                |row| Ok(crate::payload_codec::decode_value(row.get_ref(0)?, path)?.into_owned()),
             )
             .optional()?;
         let Some(json) = json else {
@@ -1533,9 +1570,9 @@ impl Store {
     /// denominator, and a caller that assumed zero would turn "most of this
     /// tree was never examined" into "this tree is clean".
     ///
-    /// Reads every symbol row of one generation. `generation_nodes` is
-    /// `WITHOUT ROWID` keyed on `(generation_id, ordinal)`, so this is a
-    /// primary-key range scan rather than a table scan of every generation.
+    /// Reads every symbol row of one generation, through the generation's file
+    /// rows to their payloads' symbols: a range scan of `payload_nodes` per
+    /// file, in the order the symbols were written.
     pub fn latest_clone_candidates(&self) -> Result<(Vec<CloneCandidate>, usize)> {
         let conn = lock_conn(&self.conn)?;
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
@@ -1544,10 +1581,13 @@ impl Store {
         let mut stmt = snapshot.prepare(
             "SELECT p.path, n.name, n.qualified_name, n.kind, n.span_start, n.span_end,
                     n.body_exact, n.body_structural, n.body_nodes
-             FROM generation_nodes n
-             JOIN paths p ON p.id = n.file_id
-             WHERE n.generation_id = ?1
-             ORDER BY n.ordinal",
+             FROM generations g
+             JOIN file_rows r
+               ON g.id >= r.valid_from AND (r.valid_to IS NULL OR g.id < r.valid_to)
+             JOIN payload_nodes n ON n.payload_id = r.payload_id
+             JOIN paths p ON p.id = r.file_id
+             WHERE g.id = ?1
+             ORDER BY r.row_id, n.ord_in_file",
         )?;
         let rows = stmt.query_map(params![gen], |row| {
             Ok((
@@ -1725,9 +1765,13 @@ impl Store {
         // rowid join finds nothing). One query covers both.
         let searchable: bool = conn.query_row(
             "SELECT EXISTS(
-                SELECT 1 FROM nodes_fts_map m
-                JOIN nodes_fts f ON f.rowid = m.rowid_ref
-                WHERE m.generation_id = ?1
+                SELECT 1
+                  FROM generations g
+                  JOIN file_rows r
+                    ON g.id >= r.valid_from AND (r.valid_to IS NULL OR g.id < r.valid_to)
+                  JOIN payload_nodes n ON n.payload_id = r.payload_id
+                  JOIN nodes_fts f ON f.rowid = ((n.payload_id << 24) | n.ord_in_file)
+                 WHERE g.id = ?1
              )",
             params![gen],
             |row| row.get::<_, i64>(0).map(|found| found != 0),

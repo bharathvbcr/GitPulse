@@ -120,6 +120,11 @@ pub fn ambiguous_candidate_total(
         | devmap_resolve::model::Resolution::Dispatch { candidates, .. } => {
             i64::try_from(candidates.len()).ok()
         }
+        // A capped list weighed `total` candidates and kept a prefix; the
+        // column is the weighed count, and NULL when the lookup never ran.
+        devmap_resolve::model::Resolution::CappedGlobal { total, .. } => {
+            total.and_then(|total| i64::try_from(total).ok())
+        }
         _ => None,
     }
 }

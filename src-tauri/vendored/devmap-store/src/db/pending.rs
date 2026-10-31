@@ -240,6 +240,13 @@ impl Store {
             [],
             |row| row.get(0),
         )?;
+        Self::classify_owner(owner, root)
+    }
+
+    /// [`Self::repo_root_owner_in`] after the recorded owner has been read: how
+    /// that owner stands to `root`. The one place that decides `Live` from
+    /// `Gone`, shared by the opened store and the read made before it is opened.
+    fn classify_owner(owner: Option<String>, root: &str) -> Result<RepoRootOwner> {
         let Some(owner) = owner else {
             return Ok(RepoRootOwner::Unbound);
         };
@@ -325,6 +332,136 @@ impl Store {
         let previous = Self::bind_repo_root_in(&tx, &root)?;
         tx.commit()?;
         Ok(previous)
+    }
+
+    /// Refuse when another worktree that still exists owns this store, writing
+    /// nothing: [`Self::bind_repo_root`]'s ownership refusal as a read.
+    ///
+    /// A store that is not ours is never touched, so a caller that is about to
+    /// look at the store's soundness asks this first. An owner that is absent
+    /// from disk, or not yet recorded, passes: `bind_repo_root` takes those over
+    /// afterwards. An owner that cannot be read is an error, not a pass.
+    pub fn refuse_a_live_foreign_owner(&self, root: &Path) -> Result<()> {
+        let root = Self::normalized_repo_root(root)?;
+        let conn = lock_conn(&self.conn)?;
+        match Self::repo_root_owner_in(&conn, &root)? {
+            RepoRootOwner::Live(owner) => Err(Self::live_owner_refusal(&owner, &root)),
+            RepoRootOwner::Unbound | RepoRootOwner::Same | RepoRootOwner::Gone(_) => Ok(()),
+        }
+    }
+
+    /// [`Self::refuse_a_live_foreign_owner`] for a store file that has not been
+    /// opened, which is the only form that can come first.
+    ///
+    /// [`Store::open`] migrates and heals the file before anyone can ask it
+    /// whose it is, so a build of worktree B that was refused for ownership had
+    /// already rewritten worktree A's store, and the previous release's binary,
+    /// still running in A, could no longer read it (schema 27 to 29 also
+    /// rewrites every stored extraction). Ownership is therefore read here, over
+    /// a connection that cannot write, and a store that belongs to another
+    /// worktree that still exists is refused before the opening connection
+    /// exists. Nothing is written, and the only thing this ever returns beyond
+    /// the refusal is `Ok`, so the opening path is the same for every caller.
+    ///
+    /// The owner is `pending_state.repo_root` from schema 20 and the newest
+    /// `generations.repo_root` before it (schema 7 onward); a store older than 7
+    /// records none. A file that does not exist, is not a store this kernel can
+    /// open, or whose version cannot be read passes: [`Store::open`] refuses
+    /// those itself, before it writes anything.
+    ///
+    /// An owner record that cannot be read is a refusal when the store is older
+    /// than this kernel's schema, because opening it would migrate it, and
+    /// "unprovable" is not "ours". At the current schema it passes, so that the
+    /// open reports the damage in its own words, as it did before; it is checked
+    /// again once open, by [`Self::refuse_a_live_foreign_owner`].
+    pub fn refuse_a_live_foreign_owner_before_open(db_path: &Path, root: &Path) -> Result<()> {
+        let resolved = devmap_extract::safe_fs::resolve_file_alias(db_path)
+            .map_err(|error| refusal(error.to_string()))?;
+        if !resolved.is_file() {
+            return Ok(());
+        }
+        let root = Self::normalized_repo_root(root)?;
+        let Ok(mut conn) =
+            Connection::open_with_flags(&resolved, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        else {
+            return Ok(());
+        };
+        let version = |conn: &Connection| -> Result<i32> {
+            conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        };
+        // A store file is untrusted SQL: a view standing where the owner table
+        // should be runs whatever it says on this read. `Store::open` refuses
+        // such a store before it runs anything of the file's; this read does the
+        // same by never reading a name that is not a table.
+        conn.execute_batch("PRAGMA trusted_schema = OFF;")?;
+        let stamped = match version(&conn) {
+            Ok(stamped) => stamped,
+            // The directory is read-only and the store is WAL: the immutable
+            // read `Store::open` falls back to.
+            Err(error) if Self::directory_refused_the_wal(&error) => {
+                conn = Self::open_immutable(&resolved)?;
+                version(&conn)?
+            }
+            Err(_) => return Ok(()),
+        };
+        if stamped == 0 || !Self::schema_is_migratable(stamped) {
+            return Ok(());
+        }
+        let owner = match Self::stored_repo_root(&conn, stamped) {
+            Ok(owner) => owner,
+            // Stated in the doc: the open reports a damaged current store itself.
+            Err(_) if stamped >= crate::schema::CURRENT_SCHEMA_VERSION => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        match Self::classify_owner(owner, &root)? {
+            RepoRootOwner::Live(owner) => Err(Self::live_owner_refusal(&owner, &root)),
+            RepoRootOwner::Unbound | RepoRootOwner::Same | RepoRootOwner::Gone(_) => Ok(()),
+        }
+    }
+
+    /// The worktree a store of schema `stamped` records as its owner, if it
+    /// records one. See [`Self::refuse_a_live_foreign_owner_before_open`].
+    fn stored_repo_root(conn: &Connection, stamped: i32) -> Result<Option<String>> {
+        const PENDING_STATE_SCHEMA: i32 = 20;
+        const GENERATION_OWNER_SCHEMA: i32 = 7;
+        let source = if stamped >= PENDING_STATE_SCHEMA {
+            "pending_state"
+        } else {
+            "generations"
+        };
+        if stamped >= GENERATION_OWNER_SCHEMA {
+            let kind: Option<String> = conn
+                .query_row(
+                    "SELECT type FROM sqlite_master WHERE name = ?1",
+                    [source],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if kind.as_deref() != Some("table") {
+                return Err(refusal(format!(
+                    "the store's owner record {source:?} is {} and not a table, so it was not read",
+                    kind.as_deref().unwrap_or("absent")
+                )));
+            }
+        }
+        if stamped >= PENDING_STATE_SCHEMA {
+            conn.query_row(
+                "SELECT repo_root FROM pending_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+        } else if stamped >= GENERATION_OWNER_SCHEMA {
+            Ok(conn
+                .query_row(
+                    "SELECT repo_root FROM generations ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten())
+        } else {
+            Ok(None)
+        }
     }
 
     /// Enqueue changed paths in the queue's canonical form: repo-relative,

@@ -13,6 +13,7 @@ use rusqlite::{params_from_iter, Connection, Result};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod generation;
+mod integrity;
 mod maintenance;
 mod migrate;
 mod open;
@@ -53,7 +54,7 @@ impl std::error::Error for StoreRefusal {}
 /// concurrently.
 static CONNECTION_SETUP: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn refusal(message: impl Into<String>) -> rusqlite::Error {
+pub(crate) fn refusal(message: impl Into<String>) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(StoreRefusal(message.into())))
 }
 
@@ -69,9 +70,9 @@ fn fts_damage_reason(what: &str) -> String {
     format!(
         "{what}; rebuild the full-text index with `devmap repair --fts`. If a fresh \
          `devmap status` on this store reports it healthy, this process's view of the \
-         store is stale rather than the index damaged: restart it. If the damage \
-         survives the repair, the database itself is damaged: rebuild it with \
-         `devmap build --full`"
+         store is stale rather than the index damaged: restart it. If the repair \
+         itself fails with \"malformed\", the database file is damaged: move or delete \
+         it and run `devmap build` to rebuild it from source"
     )
 }
 
@@ -1112,6 +1113,50 @@ struct EdgeTuple<'a> {
 #[cfg(feature = "parse")]
 const NO_MORE_IN_BUCKET: u32 = u32::MAX;
 
+/// The digest a payload is keyed on beside the file, the content and the
+/// extractor's version strings: 128 bits over the three documents a
+/// `file_payloads` row holds, as written.
+///
+/// The version strings name an extractor; they do not name what it produced.
+/// Two binaries that report one version -- a lane build under an open
+/// `EXTRACTION_SCHEMA_VERSION`, a build interrupted by a wall-clock budget --
+/// give different documents for one file, and the rows derived from a payload
+/// (symbols, literals, full-text entries) are a function of the document. Keying
+/// reuse on the documents makes "the stored payload is this extraction" true by
+/// identity rather than by a spot check, and gives a different output its own
+/// payload, so a retained generation keeps reading the rows it was built with.
+///
+/// Two hashers over the same bytes, the second behind a salt, as
+/// [`RowSetDigest`] does: a false "same payload" needs both 64-bit halves to
+/// collide. `DefaultHasher::new` is fixed-key SipHash, stable for a pinned
+/// toolchain; a toolchain whose hash differs makes every stored digest read as a
+/// different payload, which costs one rewritten payload per file and is
+/// reclaimed by retention, never a wrong answer. The strings are hashed with
+/// their lengths (`str::hash` terminates each), so moving a byte from one
+/// document to the next changes the digest.
+///
+/// Not gated on `parse`: the migration to v28 computes it for the payloads a
+/// v27 store already holds, in builds that link no grammar.
+pub(crate) fn payload_digest(
+    parse_outcome_json: &str,
+    engine_json: &str,
+    extraction_json: &str,
+) -> [u8; 16] {
+    use std::hash::{Hash, Hasher};
+    const SALT: u64 = 0xD6E8_FEB8_6659_FD93;
+    let mut lo = std::collections::hash_map::DefaultHasher::new();
+    let mut hi = std::collections::hash_map::DefaultHasher::new();
+    SALT.hash(&mut hi);
+    for document in [parse_outcome_json, engine_json, extraction_json] {
+        document.hash(&mut lo);
+        document.hash(&mut hi);
+    }
+    let mut digest = [0u8; 16];
+    digest[..8].copy_from_slice(&lo.finish().to_le_bytes());
+    digest[8..].copy_from_slice(&hi.finish().to_le_bytes());
+    digest
+}
+
 /// A 64-bit digest of a row's identity, for bucketing only.
 ///
 /// **Never an answer.** Every candidate a bucket offers is compared field by
@@ -1450,23 +1495,23 @@ pub struct WriteBreakdown {
     /// `ensure_payload_id`: the identity probe and the `file_payloads` insert
     /// it falls through to.
     pub payloads: f64,
-    /// The `generation_file_rows` membership rows, carried and fresh. The
-    /// payload behind a fresh row is [`Self::payloads`], its JSON
-    /// [`Self::serialize`].
+    /// The `file_rows` membership delta: the open rows read, the rows closed
+    /// and the rows opened. Nothing is written for a carried file. The payload
+    /// behind a fresh row is [`Self::payloads`], its JSON [`Self::serialize`].
     pub file_rows: f64,
-    /// `generation_nodes`, carried and fresh.
+    /// `payload_nodes`, written once per new payload.
     pub nodes: f64,
-    /// `nodes_fts` and `nodes_fts_map`, carried and fresh.
+    /// `nodes_fts`, written once per new payload alongside its `payload_nodes`.
     pub fts: f64,
-    /// `generation_literals`: the carry-forward `INSERT ... SELECT` and the
-    /// fresh inserts. The largest relation of a one-file edit (117k rows on
-    /// this repository) and, until it was named, most of `other`.
+    /// `payload_literals`, written once per new payload. Until v28 this was
+    /// the largest cost of a one-file edit (172k rows copied per retained
+    /// generation on this repository) and, until it was named, most of `other`.
     pub literals: f64,
     /// The edge delta: the scan of live rows, the closes and the inserts.
     pub edges: f64,
     /// The unresolved-call ledger delta, the same three passes.
     pub unresolved: f64,
-    /// `generation_file_digests` -- writing the per-file digests the *next*
+    /// `digest_rows` -- the delta of the per-file digests the *next*
     /// build scopes its two deltas by. Only the table write: computing a digest
     /// is part of the pass over the relation it describes, and is charged to
     /// `edges` and `unresolved` where the rows are.
@@ -1871,6 +1916,23 @@ fn append_kinds(sql: &mut String, params: &mut Vec<Box<dyn ToSql>>, kinds: &[Str
     sql.push(')');
 }
 
+/// The payload a `nodes_fts` rowid names, as SQL. Decodes
+/// [`Store::fts_rowid`]; the test beside it holds the literal to
+/// [`crate::schema::NODE_ORD_BITS`].
+/// The literal sites of one generation, as `l`, under the file row `r` that
+/// brings each payload into it. Binds the generation with the first `?`; a
+/// caller adds `JOIN paths p ON p.id = r.file_id` for the path.
+pub(crate) const LITERAL_SITES: &str = "payload_literals l
+     JOIN file_rows r ON r.payload_id = l.payload_id
+     JOIN generations g
+       ON g.id = ? AND g.id >= r.valid_from AND (r.valid_to IS NULL OR g.id < r.valid_to)";
+
+pub(crate) const FTS_PAYLOAD_SQL: &str = "(nodes_fts.rowid >> 24)";
+
+/// The symbol's place in its payload, as SQL: the other half of
+/// [`FTS_PAYLOAD_SQL`].
+pub(crate) const FTS_ORD_SQL: &str = "(nodes_fts.rowid & 16777215)";
+
 fn distinct_kinds(
     conn: &Connection,
     generation: u32,
@@ -1897,7 +1959,8 @@ fn distinct_kinds(
     Ok(present)
 }
 
-/// `?` placeholders, in order: generation, then the value.
+/// `?` placeholders, in order: generation (bound by [`LITERAL_SITES`]), then the
+/// value.
 ///
 /// Exact is equality. Otherwise the value contains the query anywhere:
 /// `instr` rather than `LIKE`, so `%` and `_` are text and the comparison is
@@ -1907,9 +1970,9 @@ fn literal_predicate(generation: u32, query: &str, exact: bool) -> (String, Vec<
     let params: Vec<Box<dyn ToSql>> =
         vec![Box::new(i64::from(generation)), Box::new(query.to_string())];
     let predicate = if exact {
-        "l.generation_id = ? AND l.value = ?"
+        "l.value = ?"
     } else {
-        "l.generation_id = ? AND instr(l.value, ?) > 0"
+        "instr(l.value, ?) > 0"
     };
     (predicate.to_string(), params)
 }
@@ -1977,20 +2040,6 @@ fn decode_stored_outcome(
 fn stored_is_parse_failure(outcome: &ParseOutcome, engine: &ExtractionEngine) -> bool {
     matches!(outcome, ParseOutcome::Failed { .. })
         && !matches!(engine, ExtractionEngine::NotApplicable { .. })
-}
-
-/// Whether a stored `parse_outcome_json` is a wall-clock parse-budget refusal,
-/// by the rule `Extraction::is_budget_refusal` applies to a live outcome: a
-/// `Failed` whose reason starts with
-/// [`devmap_extract::model::BUDGET_REFUSAL_PREFIX`]. A value that does not
-/// decode is not one; the payload's own readers refuse it loudly elsewhere.
-#[cfg(feature = "parse")]
-fn is_budget_refusal_json(outcome_json: &str) -> bool {
-    matches!(
-        serde_json::from_str::<ParseOutcome>(outcome_json),
-        Ok(ParseOutcome::Failed { reason })
-            if reason.starts_with(devmap_extract::model::BUDGET_REFUSAL_PREFIX)
-    )
 }
 
 /// The FTS5 `MATCH` expression for a user's search string, or an error naming
@@ -2102,7 +2151,13 @@ struct StoredPayload<'a> {
     analyzer_version: &'a str,
     parse_outcome_json: &'a str,
     engine_json: &'a str,
-    extraction_json: &'a str,
+    /// The extraction as a zstd frame; see `crate::payload_codec`.
+    extraction_frame: &'a [u8],
+    /// `RuntimeEntryPoint` wiring, promoted out of the compressed document.
+    entry_wiring_json: &'a str,
+    /// [`payload_digest`] of the three documents above *as text*, before the
+    /// extraction was compressed: the sixth part of the payload's identity.
+    payload_digest: &'a [u8],
 }
 
 /// Relations the current schema creates that a reader must tolerate *absent*,
@@ -2191,6 +2246,8 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
             "parse_outcome_json",
             "engine_json",
             "extraction_json",
+            "payload_digest",
+            "entry_wiring_json",
         ],
     ),
     (
@@ -2298,6 +2355,56 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
             "value",
             "qualified_name",
             "symbol_name",
+        ],
+    ),
+    // v28's base tables, listed for the reason `edge_rows` is: the views above
+    // are checked through `PRAGMA table_info`, which says nothing about what
+    // they are views over, and a store whose payload tables had lost a column
+    // would pass every check above and fail at the first write.
+    (
+        "payload_nodes",
+        &[
+            "payload_id",
+            "ord_in_file",
+            "name",
+            "qualified_name",
+            "kind",
+            "span_start",
+            "span_end",
+            "is_exported",
+            "body_exact",
+            "body_structural",
+            "body_nodes",
+        ],
+    ),
+    (
+        "payload_literals",
+        &[
+            "payload_id",
+            "line",
+            "span_start",
+            "value",
+            "qualified_name",
+            "symbol_name",
+        ],
+    ),
+    (
+        "file_rows",
+        &["row_id", "file_id", "payload_id", "valid_from", "valid_to"],
+    ),
+    (
+        "digest_rows",
+        &[
+            "row_id",
+            "file_id",
+            "edge_rows",
+            "edge_lo",
+            "edge_hi",
+            "unresolved_rows",
+            "unresolved_lo",
+            "unresolved_hi",
+            "valid_from",
+            "valid_to",
         ],
     ),
     (
@@ -2438,3 +2545,7 @@ mod delta_bucket_tests;
 #[cfg(feature = "parse")]
 #[path = "db/tests/payload_serialization_tests.rs"]
 mod payload_serialization_tests;
+
+#[cfg(test)]
+#[path = "db/tests/symbol_identity_tests.rs"]
+mod symbol_identity_tests;

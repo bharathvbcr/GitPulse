@@ -2,7 +2,7 @@ use super::{
     checked_span, fts_damage_reason, fts_match_query, lock_conn, refusal, sqlite_limit,
     validate_head_sha, BuildHistoryRow, CachedSourceFreshness, FileSymbolsPage, LedgerKey,
     QuerySourceFreshness, SourceTreeDelta, Store, StoreStatus, StoredSymbol, UnresolvedSiteRow,
-    UnresolvedSitesByName, MAX_PENDING_ATTEMPTS,
+    UnresolvedSitesByName, FTS_PAYLOAD_SQL, MAX_PENDING_ATTEMPTS,
 };
 use crate::coverage::{CoverageGapRow, CoverageGapSample, CoverageGaps, DiscoveryRefusal};
 use crate::edge_index::ResolutionSource;
@@ -538,11 +538,14 @@ impl Store {
         let mut stmt = snapshot.prepare(
             "SELECT n.name, n.qualified_name, n.kind, p.path,
                     n.span_start, n.span_end, n.is_exported, f.content_hash
-             FROM generation_nodes n
-             JOIN generation_files f ON f.generation_id = n.generation_id AND f.file_id = n.file_id
-             JOIN paths p ON p.id = n.file_id
-             WHERE n.generation_id = ?1 AND p.path = ?2
-             ORDER BY n.span_start, n.ordinal",
+             FROM generations g
+             JOIN file_rows r
+               ON g.id >= r.valid_from AND (r.valid_to IS NULL OR g.id < r.valid_to)
+             JOIN payload_nodes n ON n.payload_id = r.payload_id
+             JOIN file_payloads f ON f.payload_id = r.payload_id
+             JOIN paths p ON p.id = r.file_id
+             WHERE g.id = ?1 AND p.path = ?2
+             ORDER BY n.span_start, n.ord_in_file",
         )?;
         let rows = stmt
             .query_map(params![generation, path], |row| {
@@ -701,6 +704,7 @@ impl Store {
         snapshot: &rusqlite::Transaction<'_>,
         generation: u32,
         node_count: usize,
+        whole: bool,
     ) -> Result<Option<String>> {
         if node_count == 0 {
             return Ok(None);
@@ -717,8 +721,13 @@ impl Store {
 
         let probe: Option<String> = snapshot
             .query_row(
-                "SELECT name FROM generation_nodes
-                 WHERE generation_id = ?1 ORDER BY ordinal LIMIT 1",
+                "SELECT n.name
+                   FROM generations g
+                   JOIN file_rows r
+                     ON g.id >= r.valid_from AND (r.valid_to IS NULL OR g.id < r.valid_to)
+                   JOIN payload_nodes n ON n.payload_id = r.payload_id
+                  WHERE g.id = ?1
+                  ORDER BY n.payload_id, n.ord_in_file LIMIT 1",
                 params![generation],
                 |row| row.get(0),
             )
@@ -727,11 +736,15 @@ impl Store {
             Some(name) => {
                 let match_query = fts_match_query(name)?;
                 match snapshot.query_row(
-                    "SELECT COUNT(*)
-                     FROM nodes_fts
-                     CROSS JOIN nodes_fts_map m
-                       ON m.rowid_ref = nodes_fts.rowid AND m.generation_id = ?1
-                     WHERE nodes_fts MATCH ?2",
+                    &format!(
+                        "SELECT COUNT(*)
+                         FROM nodes_fts
+                         CROSS JOIN file_rows r ON r.payload_id = {FTS_PAYLOAD_SQL}
+                         JOIN generations g
+                           ON g.id = ?1 AND g.id >= r.valid_from
+                          AND (r.valid_to IS NULL OR g.id < r.valid_to)
+                         WHERE nodes_fts MATCH ?2"
+                    ),
                     params![generation, match_query],
                     |row| row.get::<_, i64>(0),
                 ) {
@@ -742,6 +755,34 @@ impl Store {
             None => None,
         };
 
+        // The whole check walks every symbol of the generation through the
+        // index, which on a large store is the bulk of a no-change build's work,
+        // so a caller on a hot path (`build`) opts out of it and leaves the
+        // partial-loss count to `status`.
+        // The MATCH above reads the term index and the postings, and nothing
+        // else. The rest of the index is its content and docsize tables, which
+        // a damaged page can break without the probe's one symbol ever touching
+        // them; a page-by-page scan of each is a fraction of the whole check's
+        // per-symbol lookups. Both depths run it, so `status` and `build` can
+        // never disagree about a page one of them can read.
+        for shadow in ["nodes_fts_content", "nodes_fts_docsize"] {
+            if let Err(error) =
+                snapshot.query_row(&format!("SELECT COUNT(*) FROM {shadow}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+            {
+                return unreadable(error);
+            }
+        }
+        if !whole {
+            return match (&probe, probe_hits) {
+                (Some(name), Some(0)) => Ok(Some(fts_damage_reason(&format!(
+                    "the full-text index holds generation {generation}'s rows but finds none \
+                     of them: a search for its symbol {name:?} matched nothing"
+                )))),
+                _ => Ok(None),
+            };
+        }
         let memo = self
             .fts_reachable
             .lock()
@@ -753,9 +794,13 @@ impl Store {
             Some(reachable) => reachable,
             None => {
                 let counted = snapshot.query_row(
-                    "SELECT COUNT(*) FROM nodes_fts_map m
-                     JOIN nodes_fts f ON f.rowid = m.rowid_ref
-                     WHERE m.generation_id = ?1",
+                    "SELECT COUNT(*)
+                       FROM generations g
+                       JOIN file_rows r
+                         ON g.id >= r.valid_from AND (r.valid_to IS NULL OR g.id < r.valid_to)
+                       JOIN payload_nodes n ON n.payload_id = r.payload_id
+                       JOIN nodes_fts f ON f.rowid = ((n.payload_id << 24) | n.ord_in_file)
+                      WHERE g.id = ?1",
                     params![generation],
                     |row| row.get::<_, i64>(0),
                 );
@@ -783,6 +828,54 @@ impl Store {
             ))));
         }
         Ok(None)
+    }
+
+    /// Why the latest generation's search index cannot be trusted, if it cannot:
+    /// the probe `status` and `build` share.
+    ///
+    /// One owner for the verdict, so the two surfaces cannot disagree about a
+    /// store: `status` reads the same probe through [`Store::status`]'s
+    /// `degraded_reason`, and `build` asks it directly before it decides that
+    /// nothing changed. The answer is the reason text, which already names the
+    /// remedy; `None` is "no generation" or "the index is readable and whole".
+    pub fn search_index_damage(&self) -> Result<Option<String>> {
+        self.search_index_damage_at(true)
+    }
+
+    /// [`Self::search_index_damage`] without the whole-index count: only whether
+    /// the index can be read and finds the generation's own symbol.
+    ///
+    /// For a caller on a hot path. `devmap build` asks this before it decides
+    /// nothing changed, and a no-change build is the common one; the count
+    /// behind [`Self::search_index_damage`] walks every symbol through the
+    /// index (measured: +15% instructions on an unchanged 1,893-file build).
+    /// Both depths read every shadow table of the index page by page, so
+    /// neither surface can miss a damaged page the other reports. What the cheap
+    /// depth leaves to `status` is the *logical* loss: rows missing from an
+    /// index that reads cleanly.
+    pub fn search_index_unreadable(&self) -> Result<Option<String>> {
+        self.search_index_damage_at(false)
+    }
+
+    fn search_index_damage_at(&self, whole: bool) -> Result<Option<String>> {
+        let conn = lock_conn(&self.conn)?;
+        let snapshot = conn.unchecked_transaction()?;
+        let Some(generation) = Self::latest_generation_id_locked(&snapshot)? else {
+            return Ok(None);
+        };
+        // The whole check compares against the symbol count; the readable probe
+        // only needs to know whether there is a symbol to look for, which a
+        // single index probe answers without counting every row.
+        let node_count = if whole {
+            self.generation_counts_locked(&snapshot, generation)?.0
+        } else {
+            snapshot.query_row(
+                "SELECT EXISTS(SELECT 1 FROM generation_nodes WHERE generation_id = ?1)",
+                params![generation],
+                |row| row.get::<_, i64>(0).map(|found| found as usize),
+            )?
+        };
+        self.fts_health_locked(&snapshot, generation, node_count, whole)
     }
 
     /// The latest generation's analysis **status**, without its summary.
@@ -1190,7 +1283,7 @@ generation {latest}; run `devmap status` to re-verify",
         };
         // Inside the same snapshot as the node count it is compared against.
         let fts_reason = match latest {
-            Some(generation) => self.fts_health_locked(&snapshot, generation, node_count)?,
+            Some(generation) => self.fts_health_locked(&snapshot, generation, node_count, true)?,
             None => None,
         };
         let quarantine_reason = if quarantined_count > 0 {
@@ -1215,6 +1308,7 @@ generation {latest}; run `devmap status` to re-verify",
         } else {
             None
         };
+        let encoding_reason = Self::payload_encoding_reason_locked(&snapshot)?;
         Ok(StoreStatus {
             db_path: db_path.to_string(),
             latest_generation: latest,
@@ -1224,11 +1318,115 @@ generation {latest}; run `devmap status` to re-verify",
             source_freshness: None,
             source_delta: None,
             analyzer_freshness: None,
-            degraded_reason: devmap_analyze::combine_reasons(quarantine_reason, fts_reason),
+            degraded_reason: devmap_analyze::combine_reasons(
+                devmap_analyze::combine_reasons(quarantine_reason, fts_reason),
+                encoding_reason,
+            ),
             quarantined_count,
             quarantined_paths,
             coverage_gaps,
         })
+    }
+
+    /// How many unconverted payloads one status examines. Each examination
+    /// decodes a document, and a healthy store has none to examine.
+    const ENCODING_EXAMINED: usize = 64;
+
+    /// The stored extractions a writer open could not convert, by path, or
+    /// `None` when there are none.
+    ///
+    /// A writer open converts what it can and leaves the rest as it found it
+    /// ([`Store::heal_extraction_encoding`]), and a reader refuses such a row by
+    /// name when it reaches it. Neither says so at open, and a store that opened
+    /// cleanly with one unreadable payload looked exactly like one with none, so
+    /// status reports it. It asks the store rather than remembering the open, so
+    /// it also describes a store only ever opened read-only, by running the
+    /// heal's own test on the rows the heal would pick: a row not yet converted
+    /// but readable (a foreign writer's text document) is not a fault and is not
+    /// reported; one that does not decode is. At most
+    /// [`Self::ENCODING_EXAMINED`] rows are examined, and when more remain the
+    /// reason says so instead of reading the rest as clean.
+    ///
+    /// **What it does not look at, and says so.** Only the rows the heal would
+    /// pick: a compressed frame that already has its entry wiring is never
+    /// examined, so one truncated or bit-rotted there is found when a reader
+    /// decompresses it, not here. A structural check of every frame's header was
+    /// built and measured (the leading bytes of 1,896 rows, no decompression):
+    /// status went from 1.9 ms to 5.8 ms, min of 14 per process, n=7 alternating,
+    /// because SQLite loads each blob to take its prefix. `status` runs on every
+    /// answer, so that was not taken; the reason names the scope instead.
+    fn payload_encoding_reason_locked(
+        snapshot: &rusqlite::Transaction<'_>,
+    ) -> Result<Option<String>> {
+        use crate::payload_codec::{decode_value, entry_wiring_of_document};
+        let total: i64 = snapshot.query_row(
+            "SELECT COUNT(*) FROM file_payloads
+              WHERE typeof(extraction_json) <> 'blob' OR entry_wiring_json IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        if total == 0 {
+            return Ok(None);
+        }
+        let mut stmt = snapshot.prepare(
+            "SELECT pa.path, fp.extraction_json
+               FROM file_payloads fp JOIN paths pa ON pa.id = fp.file_id
+              WHERE typeof(fp.extraction_json) <> 'blob' OR fp.entry_wiring_json IS NULL
+              ORDER BY fp.payload_id LIMIT ?1",
+        )?;
+        let examined = stmt
+            .query_map(params![Self::ENCODING_EXAMINED as i64], |row| {
+                let path: String = row.get(0)?;
+                let verdict = decode_value(row.get_ref(1)?, &path)
+                    .and_then(|json| entry_wiring_of_document(&json, &path))
+                    .is_ok();
+                Ok((path, verdict))
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        let failed: Vec<&str> = examined
+            .iter()
+            .filter(|(_, convertible)| !convertible)
+            .map(|(path, _)| path.as_str())
+            .collect();
+        let unexamined = usize::try_from(total)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(examined.len());
+        if failed.is_empty() && unexamined == 0 {
+            return Ok(None);
+        }
+        let mut reason = String::new();
+        if !failed.is_empty() {
+            let shown: Vec<&str> = failed.iter().copied().take(Self::DEGRADED_SAMPLE).collect();
+            let more = failed.len().saturating_sub(shown.len());
+            reason.push_str(&format!(
+                "{} stored extraction(s) cannot be converted to the schema-29 form (compressed, \
+                 with entry wiring): {}{}; they are refused by name when read",
+                failed.len(),
+                shown.join(", "),
+                if more > 0 {
+                    format!(", and {more} more")
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        if unexamined > 0 {
+            if !reason.is_empty() {
+                reason.push_str("; ");
+            }
+            reason.push_str(&format!(
+                "{unexamined} more extraction(s) are not in the schema-29 form and were not \
+                 examined (the first {} were), so they are not known to be readable",
+                examined.len()
+            ));
+        }
+        reason.push_str(
+            "; this covers only payloads a writer open would convert (text, or without entry \
+             wiring): a compressed frame that already has its entry wiring is not examined, and \
+             a damaged one is found only when a reader decompresses it",
+        );
+        reason.push_str(" -- move or delete the store and run `devmap build`");
+        Ok(Some(reason))
     }
 
     /// The latest generation's coverage-gap inventory, capped per kind.
@@ -1514,6 +1712,38 @@ generation {latest}; run `devmap status` to re-verify",
             total: total.max(0) as usize,
             shown,
         }))
+    }
+
+    /// The latest generation's resolution-budget gap rows (`resolution_budget`),
+    /// one per exceeded budget, by path (`resolve:<budget>`). Empty when the
+    /// generation was not capped or the store holds none.
+    ///
+    /// For the build that proves nothing changed: it keeps the generation it
+    /// finds, so it must say that generation is capped, as it restates what
+    /// discovery refused. At most one row per budget, so there is no cap to
+    /// carry.
+    pub fn latest_resolution_budget_gaps(&self) -> Result<Vec<CoverageGapRow>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(Vec::new());
+        };
+        let mut page = snapshot.prepare(
+            "SELECT path, reason FROM generation_coverage_gaps
+             WHERE generation_id = ?1 AND gap = ?2
+             ORDER BY path ASC",
+        )?;
+        let rows = page
+            .query_map(
+                params![generation, crate::coverage::GAP_RESOLUTION_BUDGET],
+                |row| {
+                    Ok(CoverageGapRow {
+                        path: row.get(0)?,
+                        reason: row.get(1)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Every path [`Self::latest_budget_refusals`] counts, uncapped.

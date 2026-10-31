@@ -383,41 +383,36 @@ impl Store {
             })?;
         tx.execute_batch("DROP TABLE nodes_fts")?;
         tx.execute_batch(&definition)?;
-        tx.execute("DELETE FROM nodes_fts_map", [])?;
-        let gen: Option<u32> = tx
-            .query_row(
-                "SELECT id FROM generations ORDER BY id DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(g) = gen {
+        // Every payload's symbols, not only the latest generation's: the index
+        // holds a row per symbol of every payload a retained generation names,
+        // and a payload shared by two of them is one set of rows. Rows the
+        // retention prune has not yet collected go back too, which is what the
+        // index held before it was damaged.
+        {
             let mut stmt = tx.prepare(
-                "SELECT n.ordinal, n.name, n.qualified_name, p.path
-                 FROM generation_nodes n
-                 JOIN paths p ON n.file_id = p.id
-                 WHERE n.generation_id = ?1",
+                "SELECT n.payload_id, n.ord_in_file, n.name, n.qualified_name, p.path
+                 FROM payload_nodes n
+                 JOIN file_payloads fp ON fp.payload_id = n.payload_id
+                 JOIN paths p ON p.id = fp.file_id
+                 ORDER BY n.payload_id, n.ord_in_file",
             )?;
-            let rows = stmt.query_map(params![g], |row| {
+            let rows = stmt.query_map([], |row| {
                 Ok((
-                    row.get::<_, u32>(0)?,
-                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, u32>(1)? as usize,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })?;
             let collected: Vec<_> = rows.collect::<Result<Vec<_>>>()?;
             drop(stmt);
-            for (ord, name, qn, path) in collected {
-                let fts_rowid = Self::fts_rowid(g, ord);
+            for (payload_id, ord, name, qn, path) in collected {
+                let fts_rowid = Self::fts_rowid(payload_id, ord)?;
                 tx.prepare_cached(
                     "INSERT INTO nodes_fts (rowid, name, qualified_name, path) VALUES (?1, ?2, ?3, ?4)",
                 )?
                 .execute(params![fts_rowid, name, qn, path])?;
-                tx.prepare_cached(
-                    "INSERT INTO nodes_fts_map (rowid_ref, generation_id) VALUES (?1, ?2)",
-                )?
-                .execute(params![fts_rowid, g])?;
             }
         }
         tx.commit()?;
@@ -426,6 +421,83 @@ impl Store {
             *cache = None;
         }
         Ok(())
+    }
+
+    /// Removes the rows derived from one payload: its symbols' full-text
+    /// entries first, then its symbols and its literals. The payload row itself
+    /// is the caller's to keep or delete.
+    ///
+    /// The one owner of "what depends on a payload", called by the in-place
+    /// replacement of a budget refusal, by the reconciliation of a reused
+    /// payload whose symbols no longer match the extraction in hand, and --
+    /// through [`Store::delete_unreferenced_payloads`] -- by retention.
+    pub(super) fn delete_payload_rows(tx: &Connection, payload_id: i64) -> Result<usize> {
+        let low = payload_id << crate::schema::NODE_ORD_BITS;
+        let high = low + i64::from(crate::schema::MAX_NODES_PER_PAYLOAD);
+        let fts = tx
+            .prepare_cached("DELETE FROM nodes_fts WHERE rowid >= ?1 AND rowid < ?2")?
+            .execute(params![low, high])?;
+        tx.prepare_cached("DELETE FROM payload_nodes WHERE payload_id = ?1")?
+            .execute(params![payload_id])?;
+        tx.prepare_cached("DELETE FROM payload_literals WHERE payload_id = ?1")?
+            .execute(params![payload_id])?;
+        Ok(fts)
+    }
+
+    /// The identity of one symbol: its payload and its place in that payload,
+    /// packed as `payload_id << NODE_ORD_BITS | ord_in_file`.
+    ///
+    /// It is the symbol's `nodes_fts` rowid and the `ordinal` the
+    /// `generation_nodes` view reports, and nothing about it names a
+    /// generation, which is what lets the rows be written once per payload.
+    /// The one owner of the encoding: the readers decode with
+    /// [`FTS_PAYLOAD_SQL`](super::FTS_PAYLOAD_SQL) and
+    /// [`FTS_ORD_SQL`](super::FTS_ORD_SQL), which a test holds to the same
+    /// constant. Refuses an `ord_in_file` that would spill into the payload's
+    /// bits, and a payload id that would not fit a rowid, rather than wrapping
+    /// into another symbol's identity.
+    pub(super) fn fts_rowid(payload_id: i64, ord_in_file: usize) -> Result<i64> {
+        let ord = u32::try_from(ord_in_file)
+            .ok()
+            .filter(|ord| *ord < crate::schema::MAX_NODES_PER_PAYLOAD)
+            .ok_or_else(|| {
+                refusal(format!(
+                    "payload {payload_id} holds more than {} symbols, which a symbol's \
+                     identity cannot address; refusing to wrap into another symbol's rowid",
+                    crate::schema::MAX_NODES_PER_PAYLOAD
+                ))
+            })?;
+        if payload_id <= 0 || payload_id >= (1i64 << (62 - crate::schema::NODE_ORD_BITS)) {
+            return Err(refusal(format!(
+                "payload id {payload_id} does not fit a symbol identity"
+            )));
+        }
+        Ok((payload_id << crate::schema::NODE_ORD_BITS) | i64::from(ord))
+    }
+
+    /// Deletes every payload no `file_rows` range names, with the rows derived
+    /// from it, and returns how many full-text rows that removed.
+    ///
+    /// The one place a payload is retired. Run after the closed ranges have been
+    /// deleted, in the retention transaction.
+    pub(super) fn delete_unreferenced_payloads(tx: &Connection) -> Result<usize> {
+        let orphans: Vec<i64> = {
+            let mut stmt = tx.prepare(
+                "SELECT payload_id FROM file_payloads
+                  WHERE payload_id NOT IN (SELECT payload_id FROM file_rows)",
+            )?;
+            let ids = stmt
+                .query_map([], |row| row.get(0))?
+                .collect::<Result<Vec<_>>>()?;
+            ids
+        };
+        let mut fts_rows = 0;
+        for payload_id in &orphans {
+            fts_rows += Self::delete_payload_rows(tx, *payload_id)?;
+            tx.prepare_cached("DELETE FROM file_payloads WHERE payload_id = ?1")?
+                .execute(params![payload_id])?;
+        }
+        Ok(fts_rows)
     }
 
     pub fn prune_generations_except_latest(&self, keep_generations: usize) -> Result<usize> {
@@ -459,46 +531,22 @@ impl Store {
 
         for &old_gen in to_prune {
             tx.execute(
-                "DELETE FROM nodes_fts WHERE rowid IN (SELECT rowid_ref FROM nodes_fts_map WHERE generation_id = ?1)",
-                params![old_gen],
-            )?;
-            tx.execute(
-                "DELETE FROM nodes_fts_map WHERE generation_id = ?1",
-                params![old_gen],
-            )?;
-            tx.execute(
-                "DELETE FROM generation_nodes WHERE generation_id = ?1",
-                params![old_gen],
-            )?;
-            tx.execute(
-                "DELETE FROM generation_file_rows WHERE generation_id = ?1",
-                params![old_gen],
-            )?;
-            tx.execute(
                 "DELETE FROM generation_coverage_gaps WHERE generation_id = ?1",
-                params![old_gen],
-            )?;
-            // The v19 digests go with their generation like every other
-            // per-generation copy. Only the newest generation's are ever read —
-            // it is the one the live rows belong to — and it is the one
-            // retention keeps by construction, so this deletes rows nothing
-            // would consult rather than rows something needs.
-            tx.execute(
-                "DELETE FROM generation_file_digests WHERE generation_id = ?1",
                 params![old_gen],
             )?;
             tx.execute(
                 "DELETE FROM generation_dead_symbols WHERE generation_id = ?1",
                 params![old_gen],
             )?;
-            tx.execute(
-                "DELETE FROM generation_literals WHERE generation_id = ?1",
-                params![old_gen],
-            )?;
             tx.execute("DELETE FROM generations WHERE id = ?1", params![old_gen])?;
             pruned_count += 1;
         }
 
+        // Since v28 a file's membership and its digests are ranges, like the
+        // edges below, and the symbols, literals and full-text rows belong to
+        // payloads. Nothing of them is keyed by the generation just deleted:
+        // what becomes unreachable is a range that had ended by the oldest
+        // retained generation, and then a payload no remaining range names.
         // Edges and unresolved calls are not deleted per generation: since v18
         // one row covers the whole range of generations it was valid for, and
         // deleting it because *one* of them went away would take it from the
@@ -527,19 +575,28 @@ impl Store {
             params![cutoff],
         )?;
 
-        // A payload outlives its generation only for as long as some *other*
-        // generation still names it. Deleting the membership rows above frees
-        // nothing on its own — the bytes are in `file_payloads`, and since v17
-        // that is where 54% of this store lives — so the orphans go too.
+        tx.execute(
+            "DELETE FROM file_rows WHERE valid_to IS NOT NULL AND valid_to <= ?1",
+            params![cutoff],
+        )?;
+        tx.execute(
+            "DELETE FROM digest_rows WHERE valid_to IS NOT NULL AND valid_to <= ?1",
+            params![cutoff],
+        )?;
+
+        // A payload outlives its generations only for as long as some range
+        // still names it. Closing and deleting the ranges above frees nothing on
+        // its own -- the bytes are in `file_payloads`, and since v17 that is
+        // where most of this store lives -- so the orphans go too, with the rows
+        // derived from them: full-text entries first, because their rowids are
+        // read out of `payload_nodes`, then symbols and literals, then the
+        // payload. The foreign keys refuse the payload's delete while any of
+        // them remains.
         //
         // Deferred to after the loop rather than run per generation: a payload
         // shared by two pruned generations would otherwise be probed twice, and
         // the anti-join is one index scan either way.
-        tx.execute(
-            "DELETE FROM file_payloads
-              WHERE payload_id NOT IN (SELECT payload_id FROM generation_file_rows)",
-            [],
-        )?;
+        let fts_rows_removed = Self::delete_unreferenced_payloads(&tx)?;
 
         // Interned paths are shared by every retained generation and by edge
         // endpoints that need not have an extraction payload. Retire an id
@@ -549,10 +606,9 @@ impl Store {
         // transaction so a failed retirement also rolls back the prune.
         tx.execute(
             "DELETE FROM paths WHERE id NOT IN (
-                SELECT file_id FROM generation_nodes
-                UNION SELECT file_id FROM file_payloads
-                UNION SELECT file_id FROM generation_file_rows
-                UNION SELECT file_id FROM generation_file_digests
+                SELECT file_id FROM file_payloads
+                UNION SELECT file_id FROM file_rows
+                UNION SELECT file_id FROM digest_rows
                 UNION SELECT source_file_id FROM edge_rows
                 UNION SELECT target_file_id FROM edge_rows
                 UNION SELECT source_file_id FROM unresolved_rows
@@ -586,12 +642,15 @@ impl Store {
         // FTS5 deletes only tombstone their postings; without a merge the freed
         // space stays inside the index and the prune reclaims nothing there.
         //
-        // Unconditional by construction: the early return above leaves
-        // `gen_ids.len() > keep_generations`, so `to_prune` is never empty and
-        // the loop always deleted at least one generation. A `pruned_count > 0`
-        // guard here was always true — mutation testing flagged it precisely
-        // because no test could distinguish its branches.
-        tx.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('optimize')", [])?;
+        // Only when this prune removed full-text rows. Until v28 every prune
+        // removed a whole generation's worth, so the merge was unconditional --
+        // and it is a rewrite of every segment, which is not a cost to pay for a
+        // prune that deleted nothing from the index. A one-file edit retires one
+        // payload's rows, and the rows it adds are a small new segment the
+        // index merges on its own schedule.
+        if fts_rows_removed > 0 {
+            tx.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('optimize')", [])?;
+        }
 
         tx.commit()?;
         Ok(pruned_count)
@@ -684,7 +743,8 @@ impl Store {
         // rayon, and decoding under the mutex makes that pass serial.
         let payload = {
             let conn = lock_conn(&self.conn)?;
-            let payload: Option<String> = conn
+            let what = format!("content {:#018x}", key.content_hash);
+            let payload: Option<crate::payload_codec::StoredDocument> = conn
                 .query_row(
                     "SELECT payload_json FROM extraction_cache
                      WHERE content_hash = ?1 AND language = ?2
@@ -695,7 +755,7 @@ impl Store {
                         key.grammar_version,
                         key.analyzer_version
                     ],
-                    |row| row.get(0),
+                    |row| crate::payload_codec::StoredDocument::from_value(row.get_ref(0)?, &what),
                 )
                 .optional()?;
 
@@ -708,6 +768,13 @@ impl Store {
             // serve a payload produced by older extraction semantics; rows written
             // before schema v8 carry NULL there and are therefore never eligible.
             // Absence of a recorded identity is not proof of a matching one.
+            //
+            // One identity can name several payloads since v28 (another output
+            // for the same version strings is another payload), so the newest
+            // generation's is the one served, and a failed parse is never
+            // served: the cache does not admit one (`cache_admits`), and a
+            // generation built under a wall-clock refusal would otherwise
+            // hand it back as a hit for bytes that parse.
             match payload {
                 Some(found) => Some(("extraction_cache", found)),
                 None => conn
@@ -715,6 +782,8 @@ impl Store {
                         "SELECT extraction_json FROM generation_files
                          WHERE content_hash = ?1 AND language = ?2
                            AND grammar_version = ?3 AND analyzer_version = ?4
+                           AND parse_outcome_json NOT LIKE '{\"Failed\":%'
+                         ORDER BY generation_id DESC
                          LIMIT 1",
                         params![
                             key.content_hash as i64,
@@ -722,7 +791,9 @@ impl Store {
                             key.grammar_version,
                             key.analyzer_version
                         ],
-                        |row| row.get::<_, String>(0),
+                        |row| {
+                            crate::payload_codec::StoredDocument::from_value(row.get_ref(0)?, &what)
+                        },
                     )
                     .optional()?
                     .map(|json| ("generation_files", json)),
@@ -733,8 +804,13 @@ impl Store {
         // ever and threw away the only evidence that a row was corrupt — the
         // one JSON read in this file that stayed quiet while every other names
         // what it could not read.
+        // A frame is decompressed here, after the guard: the incremental pass
+        // reloads every cached file on rayon, and decompression must not make
+        // it serial any more than parsing may.
         payload
-            .map(|(table, json)| {
+            .map(|(table, document)| {
+                let what = format!("{table} content {:#018x}", key.content_hash);
+                let json = document.into_json(&what)?;
                 parse(&json).map_err(|error| {
                     refusal(format!(
                         "stored extraction payload in {table} for content \

@@ -350,6 +350,26 @@ pub enum Resolution {
         candidates: Arc<[(String, String)]>, // shared immutable (file_path, symbol_name)
         family: LangFamily,
     },
+    /// An [`Self::AmbiguousGlobal`] site whose candidate list a resolution
+    /// budget cut short — or whose lookup a budget skipped outright.
+    ///
+    /// Carried only by the site's ledger row, like the variant it stands in
+    /// for, and never by an edge. `candidates` is the **retained prefix** of
+    /// the sorted list (empty when the lookup was skipped), `total` the number
+    /// of distinct targets the name really has (`None` when the lookup never
+    /// ran, so the count is unknown, not zero), and `limit` names the budget
+    /// that was exceeded. A reader that needs the *complete* candidate set must
+    /// treat a row of this kind as "the name may name more than is listed":
+    /// liveness reads it that way.
+    ///
+    /// Its own variant, not a field on `AmbiguousGlobal`, so the stored text of
+    /// every complete ambiguity row — the overwhelming majority — is unchanged.
+    CappedGlobal {
+        candidates: Arc<[(String, String)]>, // retained prefix, shared like AmbiguousGlobal's
+        total: Option<usize>,
+        limit: Arc<str>,
+        family: LangFamily,
+    },
     /// An interface or virtual candidate set a language server returned.
     ///
     /// Speculative, like [`Self::AmbiguousGlobal`]: default walks exclude it.
@@ -422,7 +442,11 @@ impl Resolution {
             Resolution::ReceiverType { .. } => ResolutionKind::ReceiverType,
             Resolution::LanguageServer { .. } => ResolutionKind::LanguageServer,
             Resolution::UniqueGlobal { .. } => ResolutionKind::UniqueGlobal,
-            Resolution::AmbiguousGlobal { .. } => ResolutionKind::AmbiguousGlobal,
+            // A capped row is the same rung with less evidence kept; persisted
+            // under the same label, so no stored generation changes meaning.
+            Resolution::AmbiguousGlobal { .. } | Resolution::CappedGlobal { .. } => {
+                ResolutionKind::AmbiguousGlobal
+            }
             Resolution::LanguageServerDispatch { .. } => ResolutionKind::LanguageServerDispatch,
             Resolution::Dispatch { .. } => ResolutionKind::Dispatch,
             Resolution::Unresolved { .. } => ResolutionKind::Unresolved,
@@ -451,7 +475,9 @@ impl Resolution {
     /// one implementer is a call in fact, so it is not in this set.
     pub fn is_unproven_candidate_set(&self) -> bool {
         match self {
-            Resolution::AmbiguousGlobal { .. } | Resolution::LanguageServerDispatch { .. } => true,
+            Resolution::AmbiguousGlobal { .. }
+            | Resolution::CappedGlobal { .. }
+            | Resolution::LanguageServerDispatch { .. } => true,
             Resolution::Dispatch { candidates, .. } => candidates.len() > 1,
             _ => false,
         }
@@ -505,6 +531,7 @@ impl Resolution {
             } => Some((target_file.as_str(), target_symbol.as_str())),
             // Several targets, or none: neither can answer "which one".
             Resolution::AmbiguousGlobal { .. }
+            | Resolution::CappedGlobal { .. }
             | Resolution::LanguageServerDispatch { .. }
             | Resolution::Dispatch { .. }
             | Resolution::Unresolved { .. } => None,
@@ -924,21 +951,50 @@ pub struct ReexportGlobCutoff {
     pub dropped_at_least: usize,
 }
 
+/// What resolution does when a [`ResolutionLimits`] budget is exceeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LimitPolicy {
+    /// Finish the graph and say what was cut: the affected sites keep their
+    /// ledger rows as [`Resolution::CappedGlobal`] and the build records a
+    /// coverage gap naming the budget and how much it cost. The default — an
+    /// index of a large tree that is capped and says so beats no index.
+    #[default]
+    Degrade,
+    /// Refuse the whole resolution with a [`ResolutionLimitError`]; no partial
+    /// graph is produced. For a caller that would rather have nothing than a
+    /// capped answer.
+    Refuse,
+}
+
 /// Aggregate limits for global-candidate lookup and repeated ambiguity evidence.
-/// Exceeding one refuses the complete resolution before it can be published.
+///
+/// The ambiguity budget charges each *distinct* candidate list once, because
+/// that is what is held in memory (one shared `Arc` per list) and what the
+/// store persists (one interned text per distinct list); a hundred thousand
+/// sites naming the same ten candidates cost one list, not a hundred thousand.
+/// What happens on excess is [`Self::on_exceed`].
 #[derive(Debug, Clone, Copy)]
 pub struct ResolutionLimits {
     pub candidate_visits: u64,
     pub retained_candidate_bytes: u64,
     pub ambiguity_evidence_bytes: u64,
+    pub on_exceed: LimitPolicy,
+    /// Candidates a capped list keeps when [`LimitPolicy::Degrade`] has to cut
+    /// an ambiguous list short.
+    pub degraded_candidates: usize,
 }
 
 impl Default for ResolutionLimits {
     fn default() -> Self {
         Self {
             candidate_visits: 4_000_000,
-            retained_candidate_bytes: 32 * 1024 * 1024,
+            // Sized to the Linux kernel (74,042 files), which retains more than
+            // the 32 MiB this was first set to: at 32 MiB it skipped the lookup
+            // of 6,374 names. Still a bound — a hostile tree cannot grow it.
+            retained_candidate_bytes: 256 * 1024 * 1024,
             ambiguity_evidence_bytes: 128 * 1024 * 1024,
+            on_exceed: LimitPolicy::Degrade,
+            degraded_candidates: 8,
         }
     }
 }
@@ -947,16 +1003,145 @@ impl Default for ResolutionLimits {
 pub struct ResolutionLimitError {
     pub resource: &'static str,
     pub limit: u64,
+    /// A lower bound on what the resolution needs, not its total. The first
+    /// pass charges the budget from many threads, and the error reports the
+    /// counter as the charging thread saw it: every other thread's pending
+    /// charge is missing and which ones had landed varies run to run. It is
+    /// always above [`Self::limit`], which is all the refusal needs to be true.
     pub attempted: u64,
 }
 
 impl std::fmt::Display for ResolutionLimitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "resolution refused: {} requires {} units, exceeding the {} limit; narrow the indexed scope; no partial graph was produced", self.resource, self.attempted, self.limit)
+        write!(f, "resolution refused: {} requires at least {} units, exceeding the {} limit; narrow the indexed scope; no partial graph was produced", self.resource, self.attempted, self.limit)
     }
 }
 
 impl std::error::Error for ResolutionLimitError {}
+
+/// What one exceeded [`ResolutionLimits`] budget cost, read back off the ledger.
+///
+/// Derived from the [`Resolution::CappedGlobal`] rows themselves rather than
+/// carried beside them, so it cannot disagree with the ledger it describes and
+/// every writer of a `ResolutionResult` reports it identically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionBudgetGap {
+    /// The budget, by [`ResolutionLimitError::resource`].
+    pub limit: String,
+    /// Distinct names whose candidate list was cut to a prefix.
+    pub names_truncated: usize,
+    /// Distinct candidates the cut lists lost, summed over every list of every
+    /// name: a name with a list per language family (or per Go package
+    /// directory) loses candidates in each, and each loss is counted.
+    pub candidates_dropped: usize,
+    /// Distinct names whose lookup was skipped, so nothing is known of them.
+    pub names_skipped: usize,
+    /// Ledger rows carrying a capped list or a skipped lookup.
+    pub sites: usize,
+    /// A sample of the affected names, sorted and bounded: at most
+    /// [`Self::SAMPLE`] names, each at most [`Self::NAME_BYTES`] bytes (a
+    /// longer one is cut on a character boundary and ends in `…`), and
+    /// [`Self::SAMPLE_BYTES`] bytes in all. [`Self::names_truncated`] and
+    /// [`Self::names_skipped`] are the totals; this is never the set.
+    pub sample_names: Vec<String>,
+    /// Every distinct affected name, so a reader of a bounded sample sees how
+    /// many it left out (`names_total - sample_names.len()`).
+    pub names_total: usize,
+}
+
+impl ResolutionBudgetGap {
+    /// How many names [`Self::sample_names`] carries at most.
+    pub const SAMPLE: usize = 10;
+    /// The most bytes one quoted name keeps. A name is whatever the tree
+    /// declares and nothing else bounds it: a 100,000-character identifier
+    /// would make every surface that quotes the gap (the stored row, the build
+    /// JSON, both exported maps, every query's `walk_incomplete`) 100 KB.
+    pub const NAME_BYTES: usize = 128;
+    /// The most bytes the whole sample keeps.
+    pub const SAMPLE_BYTES: usize = 1024;
+
+    /// The first [`Self::SAMPLE`] of `names`, in order, each cut to
+    /// [`Self::NAME_BYTES`] on a character boundary with `…` marking the cut,
+    /// stopping before the sample would pass [`Self::SAMPLE_BYTES`]. Fewer
+    /// names than that is reported as such by [`Self::describe`]'s "sample of
+    /// N", so a sample cut short says so.
+    fn bounded_sample<'a>(names: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+        let mut sample = Vec::new();
+        let mut bytes = 0usize;
+        for name in names.into_iter().take(Self::SAMPLE) {
+            let quoted = if name.len() > Self::NAME_BYTES {
+                let mut end = Self::NAME_BYTES;
+                while !name.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}…", &name[..end])
+            } else {
+                name.clone()
+            };
+            if bytes + quoted.len() > Self::SAMPLE_BYTES {
+                break;
+            }
+            bytes += quoted.len();
+            sample.push(quoted);
+        }
+        sample
+    }
+
+    /// One sentence that says what was capped and by how much.
+    pub fn describe(&self) -> String {
+        // Two of the three states a budget can leave a name in are gaps, and
+        // each says which it is. The third (a cut that drops nothing) is no
+        // gap at all: the list stays a complete `AmbiguousGlobal`, so there is
+        // nothing to say and the status is not Partial.
+        let mut parts = Vec::new();
+        if self.names_truncated > 0 {
+            // Capped: candidates were dropped, and the count is known.
+            parts.push(format!(
+                "{} name(s) capped, {} candidate(s) dropped",
+                self.names_truncated, self.candidates_dropped
+            ));
+        }
+        if self.names_skipped > 0 {
+            // Skipped: the lookup never ran, so what it would have resolved is
+            // unknown, which is not the same as nothing.
+            let under = match Self::flag(&self.limit) {
+                Some(flag) => format!(" under `{flag}`"),
+                None => format!(" under the {} budget", self.limit),
+            };
+            parts.push(format!(
+                "{} name lookup(s) skipped{under}; what they would have resolved is unknown",
+                self.names_skipped
+            ));
+        }
+        let more = self.names_total.saturating_sub(self.sample_names.len());
+        let tail = if more > 0 {
+            format!(", +{more} more")
+        } else {
+            String::new()
+        };
+        format!(
+            "{} budget exceeded: {}; {} ledger row(s) affected, no edge asserted for any; \
+             names (sample of {}, each cut to {} bytes): {}{}",
+            self.limit,
+            parts.join("; "),
+            self.sites,
+            self.sample_names.len(),
+            Self::NAME_BYTES,
+            self.sample_names.join(", "),
+            tail
+        )
+    }
+
+    /// The build flag that sets `limit`, for the budgets a lookup can be
+    /// skipped under.
+    fn flag(limit: &str) -> Option<&'static str> {
+        match limit {
+            "candidate visits" => Some("--resolve-candidate-visits"),
+            "retained candidate bytes" => Some("--resolve-retained-candidate-bytes"),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolutionResult {
@@ -982,4 +1167,78 @@ pub struct ResolutionResult {
     /// Calls, references and route handlers seen but not attributed.
     /// Deterministically ordered (R4).
     pub unresolved: Vec<UnresolvedReference>,
+}
+
+impl ResolutionResult {
+    /// One gap per exceeded budget, sorted by budget name; empty when nothing
+    /// was capped. See [`ResolutionBudgetGap`].
+    pub fn budget_gaps(&self) -> Vec<ResolutionBudgetGap> {
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::hash::{Hash, Hasher};
+        #[derive(Default)]
+        struct Acc {
+            /// Per name, the distinct targets each of its capped lists lost,
+            /// keyed by the list (its true count and retained prefix) so the
+            /// sites that share one list count it once.
+            truncated: BTreeMap<String, BTreeMap<u64, usize>>,
+            skipped: BTreeSet<String>,
+            sites: usize,
+        }
+        let mut by_limit: BTreeMap<String, Acc> = BTreeMap::new();
+        for row in &self.unresolved {
+            let Resolution::CappedGlobal {
+                candidates,
+                total,
+                limit,
+                ..
+            } = &row.resolution
+            else {
+                continue;
+            };
+            let acc = by_limit.entry(limit.to_string()).or_default();
+            acc.sites += 1;
+            match total {
+                Some(total) => {
+                    // One name can have several lists (a Go name per package
+                    // directory, a name per language family). Each loses its
+                    // own candidates, so the loss is summed over every list of
+                    // the name, and a list many sites share is counted once.
+                    // `candidates` is the retained prefix, so it is short and
+                    // cheap to hash; two lists with the same true count and the
+                    // same prefix are the same list.
+                    let lost = total.saturating_sub(candidates.len());
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    total.hash(&mut hasher);
+                    candidates.hash(&mut hasher);
+                    acc.truncated
+                        .entry(row.callee_name.clone())
+                        .or_default()
+                        .insert(hasher.finish(), lost);
+                }
+                None => {
+                    acc.skipped.insert(row.callee_name.clone());
+                }
+            }
+        }
+        by_limit
+            .into_iter()
+            .map(|(limit, acc)| {
+                let names: BTreeSet<&String> =
+                    acc.truncated.keys().chain(acc.skipped.iter()).collect();
+                ResolutionBudgetGap {
+                    limit,
+                    names_truncated: acc.truncated.len(),
+                    candidates_dropped: acc
+                        .truncated
+                        .values()
+                        .map(|lists| lists.values().sum::<usize>())
+                        .sum(),
+                    names_skipped: acc.skipped.len(),
+                    sites: acc.sites,
+                    names_total: names.len(),
+                    sample_names: ResolutionBudgetGap::bounded_sample(names),
+                }
+            })
+            .collect()
+    }
 }

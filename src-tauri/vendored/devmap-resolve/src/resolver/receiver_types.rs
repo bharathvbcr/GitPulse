@@ -171,6 +171,11 @@ impl Resolver {
         if let Some(chained) = self.swift_chained_receiver(file, scope, name, binding) {
             return Some(chained);
         }
+        if name.contains('.') && !name.contains("::") {
+            if let Some(chained) = self.resolve_chained_receiver_type(file, scope, name, binding) {
+                return Some(chained);
+            }
+        }
         if let Some((root, field)) = Self::one_hop_field(name) {
             let root_binding = binding.filter(|b| b.name == root);
             let owner = self
@@ -711,6 +716,99 @@ impl Resolver {
         (!hits.is_empty() && every_hit_returns_it).then_some(type_name)
     }
 
+    /// Evaluates the nominal receiver type of a dotted member access or method
+    /// chain: `root.step1.step2` or `Builder.new.with_x`.
+    pub(super) fn resolve_chained_receiver_type(
+        &self,
+        file: &str,
+        scope: Option<&str>,
+        chain: &str,
+        binding: Option<&devmap_extract::model::LocalBinding>,
+    ) -> Option<String> {
+        let (prefix, member) = chain.rsplit_once('.')?;
+        if !Self::is_plain_ident(member) {
+            return None;
+        }
+        let root = Self::path_root(prefix);
+        let base_type = self.receiver_type_for(
+            file,
+            scope,
+            prefix,
+            binding.filter(|b| b.name == root),
+        )?;
+
+        // 1. Check if member is a declared field on base_type
+        if let Some(field_type) = self.field_type_through(file, scope, &base_type, member) {
+            return Some(field_type);
+        }
+
+        // 2. Check if member is a method on base_type
+        let family = self.family_of_file(file)?;
+        self.method_return_nominal_type(family, file, scope, &base_type, member)
+    }
+
+    /// Evaluates the nominal return type of calling `method` on `base_type`.
+    /// Handles builder patterns where the method returns `Self`, `&mut Self`,
+    /// or `this` by propagating `base_type`.
+    pub(super) fn method_return_nominal_type(
+        &self,
+        family: LangFamily,
+        _file: &str,
+        _scope: Option<&str>,
+        base_type: &str,
+        method: &str,
+    ) -> Option<String> {
+        let key = (family, base_type.to_string(), method.to_string());
+        let (callee_file, callee) = if let Some(hits) = self.type_methods.get(&key) {
+            match hits.as_slice() {
+                [(target_file, target_sym)] => (target_file.clone(), target_sym.clone()),
+                _ => return None, // ambiguous methods abstain
+            }
+        } else if let Some((found_file, found, _)) = self.inherited_method(family, base_type, method) {
+            (found_file, found)
+        } else if family == LangFamily::Rust {
+            let (target_file, target_sym) = self.rust_blanket_method(method)?;
+            (target_file.clone(), target_sym.clone())
+        } else {
+            return None;
+        };
+
+        let written = self.return_types.get(&(callee_file.clone(), callee.clone()))?;
+        let written = written.trim();
+
+        // Builder pattern: method returns Self / &mut Self / this
+        if written == "Self"
+            || written == "&Self"
+            || written == "&mut Self"
+            || written == "mut Self"
+            || written == "this"
+            || written.starts_with("Self<")
+        {
+            return Some(base_type.to_string());
+        }
+
+        // Rust signature value unwrapping
+        if family == LangFamily::Rust {
+            if let Some(val) = devmap_extract::rustsig::value_type(written, false) {
+                if val == "Self" {
+                    return Some(base_type.to_string());
+                }
+                if let Some(nominal) = Self::admissible_nominal_type(val) {
+                    if nominal == "Self" {
+                        return Some(base_type.to_string());
+                    }
+                    return Some(nominal);
+                }
+            }
+        }
+
+        let mut nominal = Self::admissible_nominal_type(written)?;
+        if nominal == "Self" {
+            nominal = base_type.to_string();
+        }
+        Some(nominal)
+    }
+
     /// `root.field` with exactly one hop of plain identifiers — the shape
     /// `w.Priority.valid()` and `h.engine.tick()` need. Deeper chains and
     /// `::` paths are refused: those need inference this resolver does not do.
@@ -758,6 +856,18 @@ impl Resolver {
             return Self::admissible_nominal_type(ty);
         }
         if let Some(ty) = init.strip_suffix("{..}") {
+            return Self::admissible_nominal_type(ty);
+        }
+        if let Some(ty) = init.strip_suffix("::default") {
+            return Self::admissible_nominal_type(ty);
+        }
+        if let Some(ty) = init.strip_suffix(".default") {
+            return Self::admissible_nominal_type(ty);
+        }
+        if let Some(ty) = init.strip_suffix("::builder") {
+            return Self::admissible_nominal_type(ty);
+        }
+        if let Some(ty) = init.strip_suffix(".builder") {
             return Self::admissible_nominal_type(ty);
         }
         None

@@ -44,13 +44,38 @@ impl Resolver {
         if let Some(known) = cache.sets.get(&key) {
             return Ok(Arc::clone(known));
         }
-        charge(
+        // A budget that is exceeded either refuses the resolution (the strict
+        // pass) or degrades this one set (the degrade pass, which runs the
+        // files in order so that *which* sets degrade is deterministic).
+        let skipped = |cache: &mut GlobalCandidateCache,
+                       key: CandidateKey,
+                       error: ResolutionLimitError|
+         -> Result<Arc<GlobalCandidates>, ResolutionLimitError> {
+            if !cache.degrade {
+                return Err(error);
+            }
+            let set = Arc::new(GlobalCandidates {
+                rows: CandidateSet::from(Vec::new()),
+                declarations: 0,
+                cap: Some(CandidateCap {
+                    limit: Arc::from(error.resource),
+                    looked_up: false,
+                    distinct_total: 0,
+                }),
+            });
+            cache.sets.insert(key, Arc::clone(&set));
+            Ok(set)
+        };
+        if let Err(error) = charge(
             &mut cache.visits,
             hits.len() as u64,
             limits.candidate_visits,
             "candidate visits",
-        )?;
+        ) {
+            return skipped(&mut cache, key, error);
+        }
         let mut candidates = Vec::new();
+        let mut retained = 0u64;
         for (path, kind, candidate_family, identity) in hits {
             if family.admits(*candidate_family)
                 && !Self::never_a_call_target(family, *kind)
@@ -63,28 +88,83 @@ impl Resolver {
                     || *kind != SymbolKind::Method
                     || !Self::method_needs_a_type_scope(family))
             {
-                let bytes =
-                    (std::mem::size_of::<(String, String)>() + path.len() + identity.len()) as u64;
-                charge(
-                    &mut cache.retained_bytes,
-                    bytes,
-                    limits.retained_candidate_bytes,
-                    "retained candidate bytes",
-                )?;
+                retained = retained.saturating_add(
+                    (std::mem::size_of::<(String, String)>() + path.len() + identity.len()) as u64,
+                );
                 candidates.push((path.clone(), identity.to_string()));
             }
+        }
+        if let Err(error) = charge(
+            &mut cache.retained_bytes,
+            retained,
+            limits.retained_candidate_bytes,
+            "retained candidate bytes",
+        ) {
+            return skipped(&mut cache, key, error);
+        }
+        // A Java *record* and its canonical constructor are one declaration of the
+        // name, not two: `new Canon(1, 2)` names the record, whose constructor
+        // runs. A record with an explicit or compact canonical constructor lost
+        // its `new` binding when the record became a symbol, because `Canon` and
+        // `Canon.Canon` made two declarations where base (the record not a symbol)
+        // had one. A plain class and its constructors stay as they were: that
+        // collapse is carded to the C-style Java step (J-T1).
+        if !self.java_records.is_empty() {
+            let records: BTreeSet<(String, String)> = candidates
+                .iter()
+                .filter(|candidate| self.java_records.contains(*candidate))
+                .cloned()
+                .collect();
+            candidates.retain(|(path, identity)| {
+                let owner = identity.strip_suffix(&format!(".{name}"));
+                !owner.is_some_and(|owner| records.contains(&(path.clone(), owner.to_string())))
+            });
         }
         let declarations = candidates.len();
         candidates.sort();
         candidates.dedup();
-        // Conservative JSON/Debug upper bound, computed once per shared set.
-        let evidence_bytes = candidates.iter().fold(64u64, |total, (file, symbol)| {
-            total.saturating_add(16 + escaped_evidence_bytes(file) + escaped_evidence_bytes(symbol))
-        });
+        let mut cap = None;
+        if declarations > 1 {
+            // Charged once per distinct list — the unit the memory (one shared
+            // `Arc`) and the store (one interned text) actually hold — and not
+            // once per site that names it.
+            let evidence = evidence_bytes_of(&candidates);
+            if let Err(error) = charge(
+                &mut cache.evidence_bytes,
+                evidence,
+                limits.ambiguity_evidence_bytes,
+                "ambiguity evidence bytes",
+            ) {
+                if !cache.degrade {
+                    return Err(error);
+                }
+                // Keep the sorted prefix, and charge what is kept so the
+                // degraded lists still add up; a list this short never
+                // refuses.
+                //
+                // `CappedGlobal` means candidates were dropped. A list already
+                // within the prefix loses nothing, so it stays the complete
+                // `AmbiguousGlobal` it was: tagging it capped would mark the
+                // graph degraded for a loss that did not happen.
+                let keep = limits.degraded_candidates.max(1);
+                if candidates.len() > keep {
+                    let distinct_total = candidates.len();
+                    candidates.truncate(keep);
+                    cap = Some(CandidateCap {
+                        limit: Arc::from(error.resource),
+                        looked_up: true,
+                        distinct_total,
+                    });
+                }
+                cache.evidence_bytes = cache
+                    .evidence_bytes
+                    .saturating_add(evidence_bytes_of(&candidates));
+            }
+        }
         let candidates = Arc::new(GlobalCandidates {
             rows: candidates.into(),
             declarations,
-            evidence_bytes,
+            cap,
         });
         cache.sets.insert(key, Arc::clone(&candidates));
         Ok(candidates)

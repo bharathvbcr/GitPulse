@@ -70,8 +70,9 @@ use super::cli::{self, BuildOutcome, CliStatus};
 use crate::engine::git_cli::is_deferred_under_load;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -529,37 +530,48 @@ fn pending_probe_outcome(last: Option<&CliStatus>, repo_changed: bool) -> LiveRe
     }
 }
 
-/// The one live build allowed to run at a time, across every repository.
-///
-/// The frontend used to provide this by awaiting each build inside its single
-/// queue slot. Once a build no longer holds the IPC call, nothing else would
-/// stop every tab restored at launch from starting its own child at once.
-fn live_build_slot() -> &'static Mutex<Option<String>> {
-    static SLOT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(None))
+/// Active live builds keyed by repository canonical path.
+/// Enforces single-flight serialization within the same repository while
+/// allowing concurrent builds across distinct repositories.
+fn live_build_slots() -> &'static Mutex<HashSet<PathBuf>> {
+    static SLOTS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    SLOTS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-struct LiveBuildSlot;
+/// Normalizes repository paths across symlinks and platform aliases (e.g. macOS /var vs /private/var).
+fn canonical_repo_path(repo_path: &Path) -> PathBuf {
+    std::fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf())
+}
+
+pub(crate) struct LiveBuildSlot {
+    repo_path: PathBuf,
+}
 
 impl LiveBuildSlot {
-    /// Claim the slot for `repo_path`, or name the repository holding it.
-    fn claim(repo_path: &str) -> Result<Self, String> {
-        let mut slot = live_build_slot()
+    /// Claim a build slot for `repo_path`.
+    /// Returns `Ok(Self)` if claimed, or `Err(holder)` if this repository is already building.
+    pub(crate) fn claim(repo_path: &str) -> Result<Self, String> {
+        let path = Path::new(repo_path);
+        let canonical = canonical_repo_path(path);
+        let mut slots = live_build_slots()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(holder) = slot.as_ref() {
-            return Err(holder.clone());
+
+        if slots.contains(&canonical) {
+            return Err(canonical.display().to_string());
         }
-        *slot = Some(repo_path.to_string());
-        Ok(Self)
+
+        slots.insert(canonical.clone());
+        Ok(Self { repo_path: canonical })
     }
 }
 
 impl Drop for LiveBuildSlot {
     fn drop(&mut self) {
-        *live_build_slot()
+        live_build_slots()
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.repo_path);
     }
 }
 
@@ -1110,7 +1122,7 @@ pub(crate) fn live_refresh(
                 facts: facts.into(),
                 build: None,
                 reason: Some(format!(
-                    "the live index is building {holder}; one automatic build runs at a time"
+                    "the live index is already building {holder}; one automatic build runs at a time for this repository"
                 )),
                 cooldown_remaining_ms: None,
                 artifacts_restored: false,
@@ -1900,10 +1912,11 @@ exit 2
         fn drop(&mut self) {
             let _ = std::fs::write(self.0.join("release"), "");
             let deadline = Instant::now() + Duration::from_secs(35);
-            while live_build_slot()
+            let canon = canonical_repo_path(&self.0);
+            while live_build_slots()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_some()
+                .contains(&canon)
                 && Instant::now() < deadline
             {
                 std::thread::sleep(Duration::from_millis(10));
@@ -2319,6 +2332,84 @@ exit 2
         );
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn adversarial_hung_30s_status_probe_returns_within_grace_and_does_not_block_ipc() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        struct ResetCooldowns;
+        impl Drop for ResetCooldowns {
+            fn drop(&mut self) {
+                clear_all_live_echo_cooldowns();
+            }
+        }
+        let _reset = ResetCooldowns;
+        let (repo, bound) = stub_repository(
+            r#"#!/bin/sh
+if [ "$1" = "build" ]; then
+  printf '%s\n' '{"ok":true,"unchanged":false}'
+  exit 0
+fi
+exit 2
+"#,
+        );
+        // Simulate a hung or 30-second delayed probe
+        let release_probe = bound.set_status_delayed(
+            cli::available_status(r#"{"is_fresh":false,"schema_outdated":false}"#),
+            Duration::from_secs(30),
+        );
+        let path = repo.path().to_string_lossy().into_owned();
+        let _release = ReleaseStub(repo.path().to_path_buf());
+        let probes_before = cli::test_status_calls();
+
+        // Step 1: start_refresh must return within PROBE_GRACE + slack (< 1.5s), NOT 30s!
+        let asked = Instant::now();
+        let first = start_refresh(&path, true);
+        let elapsed = asked.elapsed();
+
+        assert!(
+            elapsed >= PROBE_GRACE,
+            "must wait at least PROBE_GRACE (1s), waited {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "command blocked past PROBE_GRACE! Took {:?}",
+            elapsed
+        );
+        assert!(first.probe_pending, "must report probe_pending: true: {first:?}");
+        assert_eq!(first.decision, LiveRefreshDecision::SkipDeferred, "{first:?}");
+        assert!(first.build.is_none());
+
+        // Step 2: Edit storm during hung probe: all return instantly (< 50ms total), no duplicate probes
+        let burst_start = Instant::now();
+        for _ in 0..5 {
+            let burst_answer = start_refresh(&path, true);
+            assert!(burst_answer.probe_pending);
+            assert_eq!(burst_answer.decision, LiveRefreshDecision::SkipDeferred);
+        }
+        assert!(
+            burst_start.elapsed() < Duration::from_millis(100),
+            "subsequent calls during pending probe must be instant: took {:?}",
+            burst_start.elapsed()
+        );
+        assert_eq!(
+            cli::test_status_calls() - probes_before,
+            1,
+            "must remain single-flight, no duplicate probes spawned"
+        );
+
+        // Step 3: Interactive execution is not starved while probe is hung in background
+        let interactive_ran = crate::engine::git_cli::with_admission(
+            crate::engine::git_cli::Admission::Interactive,
+            || true,
+        );
+        assert!(interactive_ran);
+
+        // Release the probe
+        release_probe.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// An available probe answer serves the asks right behind it, so a watcher
     /// tick does not spawn a second child; one that could not run is never
     /// reused, so the next ask tries again; and an explicit refresh forgets it.
@@ -2436,7 +2527,7 @@ exit 2
         let path = "/gitpulse-test/panicking-detached-build".to_string();
         let slot = LiveBuildSlot::claim(&path).expect("the slot is free");
         assert!(
-            LiveBuildSlot::claim("/gitpulse-test/other").is_err(),
+            LiveBuildSlot::claim(&path).is_err(),
             "the slot is held while the build runs"
         );
         let settle = LiveSettle {
@@ -2456,7 +2547,7 @@ exit 2
             .expect("thread starts");
         handle.join().expect("spawn_once records the panic itself");
 
-        drop(LiveBuildSlot::claim("/gitpulse-test/other").expect("the panic freed the slot"));
+        drop(LiveBuildSlot::claim(&path).expect("the panic freed the slot"));
         let outcome = lock_finished_builds()
             .remove(&path)
             .expect("a panicked build leaves an outcome for the next ask");
@@ -2515,89 +2606,182 @@ exit 2
         run_detached_build(slot, settle, Instant::now(), |settler| {
             settler(Err("devmap could not run".into()))
         });
-        drop(LiveBuildSlot::claim("/gitpulse-test/other").expect("the settler freed the slot"));
+        drop(LiveBuildSlot::claim(&path).expect("the settler freed the slot"));
         let outcome = lock_finished_builds()
             .remove(&path)
             .expect("outcome stored");
         assert_eq!(outcome.reason.as_deref(), Some("devmap could not run"));
     }
 
-    /// One automatic build at a time across every repository: the frontend
-    /// used to provide this by awaiting each build in its single queue slot.
+    /// One automatic build at a time per repository: distinct repositories build concurrently,
+    /// while duplicate builds on the same repository are serialized.
     #[test]
     #[cfg(unix)]
-    fn one_live_build_runs_at_a_time_across_repositories() {
+    fn one_live_build_runs_at_a_time_per_repository() {
         let _lock = crate::harness::sidecar::test_serial();
         clear_all_live_echo_cooldowns();
-        struct ResetCooldowns;
-        impl Drop for ResetCooldowns {
-            fn drop(&mut self) {
-                clear_all_live_echo_cooldowns();
-            }
+
+        let path_a = "/gitpulse-test/repo-a";
+        let path_b = "/gitpulse-test/repo-b";
+
+        let slot_a = LiveBuildSlot::claim(path_a).expect("slot a claims");
+        assert!(
+            LiveBuildSlot::claim(path_a).is_err(),
+            "duplicate build on repo a must be refused"
+        );
+
+        // Concurrency verification: Repo B must succeed while Repo A is active!
+        let slot_b = LiveBuildSlot::claim(path_b).expect("slot b claims concurrently with slot a");
+
+        drop(slot_a);
+        let slot_a2 = LiveBuildSlot::claim(path_a).expect("repo a claims again after drop");
+        drop(slot_b);
+        drop(slot_a2);
+    }
+
+    #[test]
+    fn concurrency_stress_multiple_distinct_repositories() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+
+        let num_repos = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(num_repos));
+        let mut handles = Vec::new();
+
+        for i in 0..num_repos {
+            let b = std::sync::Arc::clone(&barrier);
+            let handle = std::thread::spawn(move || {
+                let repo_path = format!("/gitpulse-test/concurrent-repo-{i}");
+                let slot = LiveBuildSlot::claim(&repo_path).expect("each distinct repo claims slot");
+
+                // Duplicate claim on same repo must fail while slot is held
+                assert!(LiveBuildSlot::claim(&repo_path).is_err());
+
+                // Synchronize: all 8 slots are held concurrently across 8 threads
+                b.wait();
+
+                // Simulate indexing work
+                std::thread::sleep(Duration::from_millis(25));
+
+                drop(slot);
+            });
+            handles.push(handle);
         }
-        let _reset = ResetCooldowns;
-        let script = r#"#!/bin/sh
-printf '%s\n' "$*" >> argv.log
-if [ "$1" = "build" ]; then
-  i=0; while [ ! -f release ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done
-  printf '%s\n' '{"ok":true,"unchanged":false}'
-  exit 0
-fi
-exit 2
-"#;
-        let (first, bound) = stub_repository(script);
-        let _release_first = ReleaseStub(first.path().to_path_buf());
+
+        for h in handles {
+            h.join().expect("thread completes");
+        }
+
+        // Verify that after threads exit and drop slots, all repos can be reclaimed
+        for i in 0..num_repos {
+            let repo_path = format!("/gitpulse-test/concurrent-repo-{i}");
+            let slot = LiveBuildSlot::claim(&repo_path).expect("slot can be reclaimed after drop");
+            drop(slot);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn path_canonicalization_and_collision_rejection() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+
+        let dir = tempfile::TempDir::new().expect("create tempdir");
+        let dir_path = dir.path();
+
+        // Create a symlink to the repo dir
+        let symlink_dir = tempfile::TempDir::new().expect("create symlink parent dir");
+        let symlink_path = symlink_dir.path().join("repo-symlink");
+        std::os::unix::fs::symlink(dir_path, &symlink_path).expect("create symlink");
+
+        let raw_str = dir_path.to_str().expect("valid utf8 path");
+        let trailing_slash_str = format!("{}/", raw_str);
+        let symlink_str = symlink_path.to_str().expect("valid utf8 symlink");
+        let dot_rel_str = format!("{}/.", raw_str);
+
+        // 1. Base path claims slot
+        let slot = LiveBuildSlot::claim(raw_str).expect("claim base path succeeds");
+
+        // 2. Trailing slash, symlink, and dot-relative MUST collide and be rejected
+        assert!(
+            LiveBuildSlot::claim(&trailing_slash_str).is_err(),
+            "trailing slash collision must be rejected"
+        );
+        assert!(
+            LiveBuildSlot::claim(symlink_str).is_err(),
+            "symlink collision must be rejected"
+        );
+        assert!(
+            LiveBuildSlot::claim(&dot_rel_str).is_err(),
+            "dot-relative collision must be rejected"
+        );
+
+        // 3. Drop base slot, claim via symlink
+        drop(slot);
+
+        let slot_symlink = LiveBuildSlot::claim(symlink_str).expect("claim via symlink succeeds");
+        assert!(
+            LiveBuildSlot::claim(raw_str).is_err(),
+            "base path rejected while symlink holds slot"
+        );
+        assert!(
+            LiveBuildSlot::claim(&trailing_slash_str).is_err(),
+            "trailing slash rejected while symlink holds slot"
+        );
+        drop(slot_symlink);
+
+        // 4. Claim via trailing slash, verify base path and symlink are rejected
+        let slot_slash = LiveBuildSlot::claim(&trailing_slash_str).expect("claim via trailing slash succeeds");
+        assert!(
+            LiveBuildSlot::claim(raw_str).is_err(),
+            "base path rejected while trailing slash holds slot"
+        );
+        assert!(
+            LiveBuildSlot::claim(symlink_str).is_err(),
+            "symlink rejected while trailing slash holds slot"
+        );
+        drop(slot_slash);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlink_and_trailing_slash_skip_building_in_maybe_refresh() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+
+        let (repo, bound) = stub_repository("#!/bin/sh\nexit 0\n");
+        let repo_path = repo.path();
+        let raw_str = repo_path.to_string_lossy().into_owned();
+        let slash_str = format!("{}/", raw_str);
+
+        let symlink_dir = tempfile::TempDir::new().expect("create symlink parent dir");
+        let symlink_path = symlink_dir.path().join("repo-symlink");
+        std::os::unix::fs::symlink(repo_path, &symlink_path).expect("create symlink");
+        let symlink_str = symlink_path.to_string_lossy().into_owned();
+
         bound.set_status(cli::available_status(
-            r#"{"is_fresh":false,"schema_outdated":false}"#,
+            r#"{"is_fresh":false,"schema_outdated":false,"rebuild_required":false}"#,
         ));
-        // The second repository is served by the same bound stub binary.
-        let second = tempfile::TempDir::new().unwrap();
-        assert!(std::process::Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(second.path())
-            .output_locked()
-            .expect("git init")
-            .status
-            .success());
-        crate::test_support::trust_repo(second.path());
-        write_stub_artifacts(second.path());
-        let first_path = first.path().to_string_lossy().into_owned();
-        let second_path = second.path().to_string_lossy().into_owned();
 
+        // Claim slot via raw_str
+        let slot = LiveBuildSlot::claim(&raw_str).expect("claim succeeds");
+
+        // Attempting refresh via symlink or trailing slash must yield SkipBuilding
+        let outcome_symlink = start_refresh(&symlink_str, false);
         assert_eq!(
-            start_refresh(&first_path, true).decision,
-            LiveRefreshDecision::Started
-        );
-        let refused = start_refresh(&second_path, true);
-        assert_eq!(
-            refused.decision,
+            outcome_symlink.decision,
             LiveRefreshDecision::SkipBuilding,
-            "{refused:?}"
-        );
-        assert!(
-            refused
-                .reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("one automatic build runs at a time")),
-            "{refused:?}"
-        );
-        // The daemon probe may ask the stub for paths; a build it may not run.
-        let second_log =
-            std::fs::read_to_string(second.path().join("argv.log")).unwrap_or_default();
-        assert!(
-            !second_log.lines().any(|line| line.starts_with("build")),
-            "the second repository built while the first was building:\n{second_log}"
+            "symlink must yield SkipBuilding while base path holds slot"
         );
 
-        std::fs::write(first.path().join("release"), "").unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while start_refresh(&first_path, true).decision == LiveRefreshDecision::SkipBuilding {
-            assert!(Instant::now() < deadline, "the first build never finished");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        std::fs::write(second.path().join("release"), "").unwrap();
-        let after = maybe_refresh(&second_path, true);
-        assert_eq!(after.decision, LiveRefreshDecision::Refresh, "{after:?}");
+        let outcome_slash = start_refresh(&slash_str, false);
+        assert_eq!(
+            outcome_slash.decision,
+            LiveRefreshDecision::SkipBuilding,
+            "trailing slash must yield SkipBuilding while base path holds slot"
+        );
+
+        drop(slot);
     }
 
     #[test]

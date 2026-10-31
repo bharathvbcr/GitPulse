@@ -70,7 +70,7 @@ use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -226,7 +226,7 @@ where
                 let version = version
                     .map_or_else(|| "of unrecognised version".to_string(), |v| v.to_string());
                 return Err(Failure::Refused {
-                    program: resolved.display().to_string(),
+                    program: resolved.path().display().to_string(),
                     reason: format!(
                         "{} is a partial clone, and git {version} does not honour \
                          GIT_NO_LAZY_FETCH, so a read could fetch missing objects from its \
@@ -242,7 +242,7 @@ where
             filters = config.filters;
         }
     }
-    let mut command = Command::new(resolved);
+    let mut command = resolved.command();
     command
         .arg("-C")
         .arg(root)
@@ -345,24 +345,37 @@ impl GitVersion {
 /// git that stalls here is reported as killed, not waited for.
 pub const GIT_VERSION_DEADLINE: Duration = Duration::from_secs(2);
 
-/// The version of the git at `git` (an absolute path, as [`resolve_outside`]
-/// returns it), asked once per binary per process. A git replaced in place —
-/// a different size or modification time — is asked again. `git version`
-/// reads no repository, so it runs nothing a repository names.
+/// The version of `git` (as [`resolve_outside`] returns it), asked once per
+/// binary and name per process. The probe starts the file under the name it
+/// was looked up by, as the read it guards will: a `git` that is a link to a
+/// multiplexer reading `argv[0]` (a mise or asdf shim) answers as git only
+/// under that name. A git replaced in place — a different size or modification
+/// time — is asked again. `git version` reads no repository, so it runs
+/// nothing a repository names.
 ///
 /// `None` is a git that ran and gave no version this can read; callers treat
 /// it as one that does not honour `GIT_NO_LAZY_FETCH`, the cautious reading.
 /// A git that could not be run at all is a [`Failure`].
-pub fn git_version(git: &Path) -> Result<Option<GitVersion>, Failure> {
+pub fn git_version(git: &Resolved) -> Result<Option<GitVersion>, Failure> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Key = (PathBuf, u64, Option<std::time::SystemTime>);
+    type Key = (
+        PathBuf,
+        std::ffi::OsString,
+        u64,
+        Option<std::time::SystemTime>,
+    );
     static VERSIONS: OnceLock<Mutex<HashMap<Key, Option<GitVersion>>>> = OnceLock::new();
-    let meta = std::fs::metadata(git).map_err(|error| Failure::Spawn {
-        program: git.display().to_string(),
+    let meta = std::fs::metadata(git.path()).map_err(|error| Failure::Spawn {
+        program: git.path().display().to_string(),
         error,
     })?;
-    let key: Key = (git.to_path_buf(), meta.len(), meta.modified().ok());
+    let key: Key = (
+        git.path().to_path_buf(),
+        git.name().to_os_string(),
+        meta.len(),
+        meta.modified().ok(),
+    );
     let versions = VERSIONS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(version) = versions
         .lock()
@@ -371,7 +384,7 @@ pub fn git_version(git: &Path) -> Result<Option<GitVersion>, Failure> {
     {
         return Ok(version.clone());
     }
-    let mut command = Command::new(git);
+    let mut command = git.command();
     command.arg("version").current_dir(std::env::temp_dir());
     git_env(&mut command);
     let captured = run_bounded(
@@ -527,9 +540,9 @@ struct RepositoryConfig {
 /// repository's config is read first (reading config runs nothing). A root
 /// git cannot enter has no repository config to neutralize; the read that
 /// follows reports the root itself.
-fn probe_repository_config(git: &Path, root: &Path) -> Result<RepositoryConfig, Failure> {
-    let program = git.display().to_string();
-    let mut command = Command::new(git);
+fn probe_repository_config(git: &Resolved, root: &Path) -> Result<RepositoryConfig, Failure> {
+    let program = git.path().display().to_string();
+    let mut command = git.command();
     command.arg("-C").arg(root).args([
         "config",
         "--show-scope",
@@ -593,7 +606,12 @@ fn probe_repository_config(git: &Path, root: &Path) -> Result<RepositoryConfig, 
 /// time or inode.
 #[derive(Default)]
 struct ConfigScope {
-    entries: std::collections::HashMap<(PathBuf, PathBuf), (ConfigStamp, RepositoryConfig)>,
+    /// Keyed by the file, the name it runs under, and the repository: the
+    /// same file under two names can be two programs (a multiplexer shim).
+    entries: std::collections::HashMap<
+        (PathBuf, std::ffi::OsString, PathBuf),
+        (ConfigStamp, RepositoryConfig),
+    >,
 }
 
 /// Entries one scope keeps; an operation reading more roots than this reads
@@ -655,12 +673,16 @@ fn config_stamp(root: &Path) -> Option<(PathBuf, ConfigStamp)> {
 
 /// The repository's filter and partial-clone config, from the open
 /// [`config_scope`] when there is one and its entry is current.
-fn repository_config(git: &Path, root: &Path) -> Result<RepositoryConfig, Failure> {
+fn repository_config(git: &Resolved, root: &Path) -> Result<RepositoryConfig, Failure> {
     let scoped = CONFIG_SCOPE.with(|scope| scope.borrow().is_some());
     let stamp = if scoped { config_stamp(root) } else { None };
-    let key = stamp
-        .as_ref()
-        .map(|(top, _)| (git.to_path_buf(), top.clone()));
+    let key = stamp.as_ref().map(|(top, _)| {
+        (
+            git.path().to_path_buf(),
+            git.name().to_os_string(),
+            top.clone(),
+        )
+    });
     if let (Some(key), Some((_, stamp))) = (&key, &stamp) {
         let hit = CONFIG_SCOPE.with(|scope| {
             scope
@@ -815,7 +837,104 @@ pub fn filter_overrides(listing: &[u8]) -> Result<Vec<String>, String> {
 ///
 /// A refusal or a program found nowhere is a [`Failure::Spawn`]: nothing ran,
 /// and every caller already reports that as "git could not run".
+///
+/// What comes back is a [`Resolved`]: the file, and the `program` it was asked
+/// for, because a program can decide what it is from the name it is started
+/// under. `~/.cargo/bin/rust-analyzer` is a link to `rustup`, which started as
+/// `rustup` prints its usage and exits; started as `rust-analyzer` it is the
+/// language server. The link is followed so that the boundary check is made
+/// on the file that runs; the name is not, and [`Resolved::command`] starts
+/// the file under it.
 pub fn resolve_outside(
+    program: &OsStr,
+    path_var: Option<&OsStr>,
+    root: &Path,
+) -> Result<Resolved, Failure> {
+    let path = resolve_outside_path(program, path_var, root)?;
+    Ok(Resolved {
+        path,
+        name: program.to_os_string(),
+    })
+}
+
+/// A program [`resolve_outside`] found: the file to run, and the name the
+/// caller asked for it by.
+///
+/// The two differ whenever the lookup went through a link — a rustup proxy, a
+/// Homebrew `bin/git -> ../Cellar/...` — or an explicit relative path was made
+/// absolute. The file is what was checked against the repository boundary and
+/// is the only thing that runs; the name is what the child sees as `argv[0]`.
+/// [`path`](Resolved::path) says where the program is. It does not dereference
+/// to that path and does not convert to an `OsStr` or a `Path`: a
+/// `Command::new` built from it would run the file under the file's own name,
+/// which is the mistake this type exists to make unwritable. Two probes did
+/// exactly that through a `Deref<Target = Path>` until it was removed.
+///
+/// ```compile_fail
+/// let found = dc_proc::Resolved::as_given("git");
+/// let _ = std::process::Command::new(found);
+/// ```
+///
+/// ```compile_fail
+/// let found = dc_proc::Resolved::as_given("git");
+/// let _ = dc_proc::session_command(&found);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    path: PathBuf,
+    name: std::ffi::OsString,
+}
+
+impl Resolved {
+    /// A program the caller chose itself, started under exactly the name it
+    /// gives: `program` is both the file and `argv[0]`, as `Command::new`
+    /// would have it. For a test's script, or a bare name a caller means
+    /// `PATH` to search; a program looked up for a repository goes through
+    /// [`resolve_outside`] instead.
+    pub fn as_given(program: impl AsRef<OsStr>) -> Self {
+        let program = program.as_ref().to_os_string();
+        Resolved {
+            path: PathBuf::from(&program),
+            name: program,
+        }
+    }
+
+    /// The file that runs: absolute, and canonical when it was found on
+    /// `PATH`.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The name the program was asked for by, which the child sees as
+    /// `argv[0]`.
+    pub fn name(&self) -> &OsStr {
+        &self.name
+    }
+
+    /// The command that starts the program: [`path`](Self::path) runs, under
+    /// [`name`](Self::name). Built through [`session_command`] like every
+    /// other child the kernel starts, so a caller sets only its arguments,
+    /// directory and environment.
+    ///
+    /// On Unix the name is `argv[0]`, set with `CommandExt::arg0`; which file
+    /// executes is unchanged, so a candidate the boundary check refused is no
+    /// more reachable than before. Windows has no `argv[0]` apart from the
+    /// command line, and `std` offers no way to set one: there the child is
+    /// started by its path, and sees that. Rustup's Windows proxies are copies
+    /// of `rustup.exe` under the tool's own name, not links, so the file's name
+    /// and the looked-up name agree.
+    pub fn command(&self) -> Command {
+        let mut command = session_command(&self.path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.arg0(&self.name);
+        }
+        command
+    }
+}
+
+fn resolve_outside_path(
     program: &OsStr,
     path_var: Option<&OsStr>,
     root: &Path,
@@ -1196,12 +1315,16 @@ pub struct Session {
     /// [`Session::kill`] sent the group a signal. Read by the tests that pin
     /// when it must not.
     group_signalled: bool,
+    /// The last bytes the child wrote to stderr, kept by a drain thread.
+    stderr: Arc<StderrCapture>,
 }
 
 impl Session {
-    /// The child's stdin, once; `None` after the first call.
-    pub fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
-        self.child.stdin.take()
+    /// The child's stdin, once; `None` after the first call. Writing to it
+    /// after the child has gone is an `Err(BrokenPipe)`, never a signal: see
+    /// [`SessionStdin`].
+    pub fn take_stdin(&mut self) -> Option<SessionStdin> {
+        self.child.stdin.take().map(SessionStdin::new)
     }
 
     /// The child's stdout, once; `None` after the first call.
@@ -1219,6 +1342,54 @@ impl Session {
     /// The program this session runs, for messages.
     pub fn program(&self) -> &str {
         &self.program
+    }
+
+    /// The last [`SESSION_STDERR_TAIL_BYTES`] bytes the child wrote to stderr,
+    /// waiting at most `settle` for the child's end of the pipe to close.
+    ///
+    /// The bytes are the child's own and **unredacted**: a caller that shows
+    /// them redacts them first. `complete` says the pipe reached EOF, so the
+    /// tail is everything the child will ever say (less `dropped_bytes`); when
+    /// it is false a descendant still holds the pipe, or the wait ran out, and
+    /// more may follow. Call it after [`kill`](Self::kill) to have the group
+    /// closed first, and pass [`SESSION_STDERR_EOF_DEADLINE`] as `settle`: once
+    /// the child is reaped and no descendant holds the pipe the wait ends at
+    /// EOF, so the long bound costs nothing, while a short one loses the race
+    /// against a drain thread the host has not yet scheduled.
+    pub fn stderr_tail(&self, settle: Duration) -> StderrTail {
+        self.stderr_tail_until(Instant::now() + settle, || false)
+    }
+
+    /// [`stderr_tail`](Self::stderr_tail) for a caller that has a deadline and
+    /// a cancel flag of its own: the wait ends at EOF, at `deadline`, or when
+    /// `cancelled` answers true, whichever comes first. A caller that bounds
+    /// its own work (a language-server start given two seconds) passes the
+    /// earlier of its deadline and [`SESSION_STDERR_EOF_DEADLINE`], so this
+    /// wait never runs past the time it was promised. `cancelled` is polled
+    /// every [`STDERR_WAIT_POLL`]; EOF wakes the wait at once.
+    pub fn stderr_tail_until(&self, deadline: Instant, cancelled: impl Fn() -> bool) -> StderrTail {
+        let mut state = self
+            .stderr
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while !state.finished && !cancelled() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            state = self
+                .stderr
+                .changed
+                .wait_timeout(state, left.min(STDERR_WAIT_POLL))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        StderrTail {
+            bytes: state.tail.iter().copied().collect(),
+            dropped_bytes: state.dropped,
+            complete: state.finished,
+        }
     }
 
     /// Signal the child's process group and reap the child. Idempotent.
@@ -1248,34 +1419,356 @@ impl Drop for Session {
     }
 }
 
+/// The write end of a [`Session`] child's stdin.
+///
+/// A write to a pipe whose reader has exited raises `SIGPIPE`, and a process
+/// that has the default disposition for it dies on the spot. A one-shot
+/// `devmap` command does (`devmap export | head` must end quietly), so a
+/// language server that exited before its first frame was written — a server
+/// that dies at start-up, which is exactly the case the caller wants to
+/// report — killed the whole `devmap build --lsp` with signal 13 before it
+/// printed anything: 7 of 60 runs under load. A caller that talks to a child
+/// has to be able to see that the child is gone, so writes here return
+/// `Err(BrokenPipe)` instead, on whichever thread they run.
+///
+/// On macOS the signal is not the writing thread's to mask: the unmasked write
+/// returned `BrokenPipe` and the process was killed anyway (the test beside
+/// this crate shows it), so the descriptor's own `F_SETNOSIGPIPE` flag is used.
+/// Elsewhere on Unix the signal is the writing thread's, and the write runs
+/// with it blocked and the signal it raised taken back (type-checked for
+/// `x86_64-unknown-linux-gnu` from macOS, not run there).
+pub struct SessionStdin {
+    inner: std::process::ChildStdin,
+}
+
+impl SessionStdin {
+    fn new(inner: std::process::ChildStdin) -> Self {
+        sigpipe::refuse_on_descriptor(&inner);
+        Self { inner }
+    }
+}
+
+impl std::io::Write for SessionStdin {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let asked = buf.len();
+        sigpipe::as_error(
+            || std::io::Write::write(&mut self.inner, buf),
+            |written| *written < asked,
+        )
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        sigpipe::as_error(|| std::io::Write::flush(&mut self.inner), |()| false)
+    }
+}
+
+/// How a write to a closed pipe becomes an error instead of a signal; one
+/// module so the audited `unsafe` surface is one place.
+mod sigpipe {
+    use std::io;
+    use std::process::ChildStdin;
+
+    /// macOS: set `F_SETNOSIGPIPE` on the descriptor, once.
+    #[cfg(target_os = "macos")]
+    #[allow(
+        unsafe_code,
+        reason = "one audited fcntl(F_SETNOSIGPIPE) on a descriptor the caller owns"
+    )]
+    pub(super) fn refuse_on_descriptor(pipe: &ChildStdin) {
+        use std::os::fd::AsRawFd;
+        // `<sys/fcntl.h>`; the `libc` this workspace is locked to does not
+        // export it.
+        const F_SETNOSIGPIPE: libc::c_int = 73;
+        // SAFETY: `fcntl` with `F_SETNOSIGPIPE` sets a flag on a descriptor
+        // `pipe` keeps open for the call; it reads no memory.
+        unsafe {
+            libc::fcntl(pipe.as_raw_fd(), F_SETNOSIGPIPE, 1);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn refuse_on_descriptor(_pipe: &ChildStdin) {}
+
+    /// macOS: the descriptor flag already did the work.
+    #[cfg(target_os = "macos")]
+    pub(super) fn as_error<R>(
+        write: impl FnOnce() -> io::Result<R>,
+        _cut_short: impl FnOnce(&R) -> bool,
+    ) -> io::Result<R> {
+        write()
+    }
+
+    /// Other Unix: `SIGPIPE` is the writing thread's. Block it for the write;
+    /// if the write failed because the reader is gone the signal is pending,
+    /// and unblocking it would deliver it, so take it first.
+    ///
+    /// A write raises the signal when the reader is gone, and has two ways to
+    /// say so: `Err(BrokenPipe)`, or, when the reader goes while the write is
+    /// blocked with part of the buffer accepted, `Ok` of the shorter count
+    /// (Linux's `pipe_write` raises the signal and returns the partial count).
+    /// `cut_short` says whether an `Ok` is that second shape; both leave the
+    /// signal pending, and unblocking would deliver it.
+    ///
+    /// Only a signal this write raised is taken. `sigpending` also reports a
+    /// process-directed `SIGPIPE` that was already waiting (someone ran
+    /// `kill -PIPE` with every thread blocking it), which is not this write's
+    /// to consume, so the pending set is read before the write and a signal
+    /// that was already there is left alone. The mask is put back by a guard on
+    /// every path out, including a panic in the write.
+    ///
+    /// Run on Linux aarch64 in a container (see the `review_ccf_linux_sigpipe`
+    /// and `attack_ccf_session_stdin` tests), not on the x86_64 CI runner.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[allow(
+        unsafe_code,
+        reason = "pthread_sigmask, sigpending and sigtimedwait on this thread's own mask"
+    )]
+    pub(super) fn as_error<R>(
+        write: impl FnOnce() -> io::Result<R>,
+        cut_short: impl FnOnce(&R) -> bool,
+    ) -> io::Result<R> {
+        /// Puts the thread's signal mask back when dropped.
+        struct Restore(libc::sigset_t);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: `self.0` is the mask `pthread_sigmask` returned for
+                // this thread; the call changes only this thread's mask.
+                unsafe {
+                    libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut());
+                }
+            }
+        }
+
+        // SAFETY: every `sigset_t` is initialised by `sigemptyset` before it is
+        // read; the calls touch only the calling thread's signal mask and
+        // pending set.
+        unsafe fn sigpipe_is_pending() -> bool {
+            unsafe {
+                let mut pending: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut pending);
+                libc::sigpending(&mut pending) == 0
+                    && libc::sigismember(&pending, libc::SIGPIPE) == 1
+            }
+        }
+
+        // SAFETY: as above; `before` is written by `pthread_sigmask` on success.
+        unsafe {
+            let mut blocked: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut blocked);
+            libc::sigaddset(&mut blocked, libc::SIGPIPE);
+            let mut before: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut before);
+            if libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut before) != 0 {
+                return write();
+            }
+            let _restore = Restore(before);
+            let waiting_before = sigpipe_is_pending();
+            let result = write();
+            let may_have_raised = match &result {
+                Err(error) => error.kind() == io::ErrorKind::BrokenPipe,
+                Ok(written) => cut_short(written),
+            };
+            if !waiting_before && may_have_raised && sigpipe_is_pending() {
+                let now = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                libc::sigtimedwait(&blocked, std::ptr::null_mut(), &now);
+            }
+            result
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn as_error<R>(
+        write: impl FnOnce() -> io::Result<R>,
+        _cut_short: impl FnOnce(&R) -> bool,
+    ) -> io::Result<R> {
+        write()
+    }
+}
+
 /// A command for [`spawn_session`], so a session's program is named through
 /// this module like every other child the kernel starts.
+///
+/// `program` runs under its own name. A program found by [`resolve_outside`]
+/// is started through [`Resolved::command`] instead, which keeps the name it
+/// was looked up by; this is for a name the caller means `PATH` to search, or
+/// a file the caller chose itself.
 pub fn session_command(program: impl AsRef<OsStr>) -> Command {
     Command::new(program)
 }
 
-/// Start `command` as a [`Session`]: stdin and stdout piped, stderr discarded
-/// (a conversational child that fills an undrained stderr pipe blocks), and the
-/// child leading its own process group. Spawning retries the same pre-exec
-/// refusal [`run_bounded`] does, within `spawn_deadline`.
+/// How many of a session child's last stderr bytes [`Session::stderr_tail`]
+/// keeps. The pipe is always read to EOF, so a chatty child never blocks on a
+/// full pipe, and memory stays at this bound however much it writes.
+pub const SESSION_STDERR_TAIL_BYTES: usize = 4096;
+
+/// How long [`Session::stderr_tail`] callers wait for the drain thread to reach
+/// EOF once the child has been killed and reaped.
+///
+/// A reaped child and a dead group hold no end of the pipe, so EOF is certain
+/// and the wait returns the moment the drain thread is scheduled; this is the
+/// bound for the one case where it is not, a descendant that left the process
+/// group and kept the pipe. It is generous on purpose: a short settle is
+/// shorter than the time a starved thread can wait to run on a loaded host, and
+/// a tail that lost that race read as "the child said nothing". A caller with
+/// a deadline of its own passes the earlier of the two to
+/// [`Session::stderr_tail_until`]: this is a ceiling on the wait, never time
+/// added to what the caller was promised.
+pub const SESSION_STDERR_EOF_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How often [`Session::stderr_tail_until`] looks at its cancel flag while it
+/// waits.
+pub const STDERR_WAIT_POLL: Duration = Duration::from_millis(25);
+
+/// Hooks for tests of code that sits on a [`Session`]; compiled only with the
+/// `test-hooks` feature, which no build enables by default.
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    thread_local! {
+        static DRAIN_START_DELAY: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    }
+
+    /// Run `body` with every [`Session`](crate::Session) it spawns **on this
+    /// thread** starting its stderr drain thread `delay` late: the thread a
+    /// loaded host does not schedule for a while, made deterministic. The
+    /// child's bytes wait in the pipe meanwhile, so nothing is lost; only the
+    /// time at which the tail is complete moves.
+    pub fn with_stderr_drain_start_delay<R>(delay: Duration, body: impl FnOnce() -> R) -> R {
+        struct Restore(Duration);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                DRAIN_START_DELAY.with(|cell| cell.set(self.0));
+            }
+        }
+        let _restore = Restore(DRAIN_START_DELAY.with(|cell| cell.replace(delay)));
+        body()
+    }
+
+    pub(crate) fn drain_start_delay() -> Duration {
+        DRAIN_START_DELAY.with(Cell::get)
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+fn drain_start_delay() -> Duration {
+    test_hooks::drain_start_delay()
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn drain_start_delay() -> Duration {
+    Duration::ZERO
+}
+
+/// What a [`Session`] child wrote to stderr, as far as it was kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StderrTail {
+    /// The last bytes written, at most [`SESSION_STDERR_TAIL_BYTES`].
+    pub bytes: Vec<u8>,
+    /// How many earlier bytes were read and discarded to stay inside the cap.
+    pub dropped_bytes: u64,
+    /// The pipe reached EOF: the child, and every descendant that held it, is
+    /// done writing.
+    pub complete: bool,
+}
+
+impl StderrTail {
+    /// The tail as text, invalid UTF-8 replaced.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes).into_owned()
+    }
+}
+
+#[derive(Default)]
+struct StderrState {
+    tail: std::collections::VecDeque<u8>,
+    dropped: u64,
+    finished: bool,
+}
+
+#[derive(Default)]
+struct StderrCapture {
+    state: Mutex<StderrState>,
+    changed: Condvar,
+}
+
+/// Read `pipe` to EOF (or error), keeping the last [`SESSION_STDERR_TAIL_BYTES`]
+/// bytes in `capture`. Reading continues past the cap on purpose, for the same
+/// reason [`drain`] does: a reader that stops leaves the child blocked on a full
+/// pipe.
+fn drain_tail(mut pipe: impl Read, capture: &StderrCapture) {
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        let read = match pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let mut state = capture.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.tail.extend(&chunk[..read]);
+        let excess = state.tail.len().saturating_sub(SESSION_STDERR_TAIL_BYTES);
+        if excess > 0 {
+            state.tail.drain(..excess);
+            state.dropped += excess as u64;
+        }
+    }
+    let mut state = capture.state.lock().unwrap_or_else(PoisonError::into_inner);
+    state.finished = true;
+    capture.changed.notify_all();
+}
+
+/// Start `command` as a [`Session`]: stdin and stdout piped, stderr piped to a
+/// drain thread that keeps its tail (see [`Session::stderr_tail`]; an undrained
+/// stderr pipe would block a chatty child, and a discarded one leaves a failed
+/// start with no stated cause), and the child leading its own process group.
+/// Spawning retries the same pre-exec refusal [`run_bounded`] does, within
+/// `spawn_deadline`.
 pub fn spawn_session(command: &mut Command, spawn_deadline: Duration) -> Result<Session, Failure> {
     let program = command.get_program().to_string_lossy().into_owned();
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let child = spawn_with_retry(|| command.spawn(), &program, Instant::now(), spawn_deadline)?;
+    let mut child = spawn_with_retry(|| command.spawn(), &program, Instant::now(), spawn_deadline)?;
+    let stderr = Arc::new(StderrCapture::default());
+    match child.stderr.take() {
+        Some(pipe) => {
+            let capture = Arc::clone(&stderr);
+            let start_delay = drain_start_delay();
+            thread::spawn(move || {
+                if !start_delay.is_zero() {
+                    thread::sleep(start_delay);
+                }
+                drain_tail(pipe, &capture);
+            });
+        }
+        // Piped above, so absent only if the platform refused the pipe; the
+        // tail then reports itself finished and empty rather than waiting.
+        None => {
+            stderr
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .finished = true;
+        }
+    }
     Ok(Session {
         child,
         program,
         killed: false,
         reaped: false,
         group_signalled: false,
+        stderr,
     })
 }
 
@@ -1493,6 +1986,100 @@ mod tests {
             assert!(Instant::now() < deadline, "the child never exited");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// A language server that dies at start-up says why on stderr. The session
+    /// used to send that to `/dev/null`, so the only evidence was an exit code.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_keeps_what_its_child_said_on_stderr() {
+        let mut session = session_of("echo 'fatal: no toolchain' >&2; exit 3");
+        wait_until_reaped(&mut session);
+        let tail = session.stderr_tail(Duration::from_secs(5));
+        assert!(tail.complete, "the pipe closed with the child: {tail:?}");
+        assert_eq!(tail.text(), "fatal: no toolchain\n");
+        assert_eq!(tail.dropped_bytes, 0);
+    }
+
+    /// The tail is the *last* bytes, bounded, and the child is read to EOF so a
+    /// chatty one never blocks on a full pipe.
+    #[cfg(unix)]
+    #[test]
+    fn the_stderr_tail_is_the_last_bytes_and_bounded() {
+        let mut session =
+            session_of("yes 0123456789abcdef | head -c 300000 >&2; printf '%s' END-OF-STDERR >&2");
+        wait_until_reaped(&mut session);
+        let tail = session.stderr_tail(Duration::from_secs(5));
+        assert!(tail.complete);
+        assert_eq!(tail.bytes.len(), SESSION_STDERR_TAIL_BYTES);
+        assert!(tail.text().ends_with("END-OF-STDERR"), "{:?}", tail.text());
+        assert_eq!(
+            tail.dropped_bytes + tail.bytes.len() as u64,
+            300_000 + "END-OF-STDERR".len() as u64,
+            "every byte is either kept or counted as dropped"
+        );
+    }
+
+    /// A drain thread the host schedules late: the child is reaped, its bytes
+    /// are in the pipe, and a short settle returns an empty, incomplete tail.
+    /// The long deadline waits for EOF and gets the lot.
+    #[cfg(all(unix, feature = "test-hooks"))]
+    #[test]
+    fn a_late_drain_thread_is_waited_for_not_given_up_on() {
+        let mut session =
+            test_hooks::with_stderr_drain_start_delay(Duration::from_millis(600), || {
+                session_of("echo 'fatal: no toolchain' >&2; exit 3")
+            });
+        wait_until_reaped(&mut session);
+        session.kill();
+        let short = session.stderr_tail(Duration::from_millis(100));
+        assert!(!short.complete && short.bytes.is_empty(), "{short:?}");
+        let long = session.stderr_tail(SESSION_STDERR_EOF_DEADLINE);
+        assert!(long.complete, "{long:?}");
+        assert_eq!(long.text(), "fatal: no toolchain\n");
+    }
+
+    /// A descendant that still holds the pipe must not hold the caller: the wait
+    /// is bounded, says the tail is not complete, and `kill` then ends it.
+    #[cfg(unix)]
+    #[test]
+    fn the_stderr_wait_is_bounded_when_a_descendant_holds_the_pipe() {
+        let mut session = session_of("echo early >&2; sleep 30 & exit 0");
+        wait_until_reaped(&mut session);
+        let started = Instant::now();
+        let tail = session.stderr_tail(Duration::from_millis(150));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!tail.complete, "the sleeper still holds stderr: {tail:?}");
+        assert!(tail.text().contains("early"));
+        session.kill();
+        assert!(session.stderr_tail(Duration::from_secs(5)).complete);
+    }
+
+    /// The wait is the caller's to bound: a deadline of its own ends it early,
+    /// and so does its cancel flag, polled while a descendant holds the pipe.
+    #[cfg(unix)]
+    #[test]
+    fn the_stderr_wait_ends_at_the_callers_deadline_or_cancel() {
+        let mut session = session_of("echo early >&2; sleep 30 & exit 0");
+        wait_until_reaped(&mut session);
+
+        let started = Instant::now();
+        let tail = session.stderr_tail_until(Instant::now() + Duration::from_millis(200), || false);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!tail.complete && tail.text().contains("early"), "{tail:?}");
+
+        let cancel_at = Instant::now() + Duration::from_millis(100);
+        let started = Instant::now();
+        let tail = session.stderr_tail_until(Instant::now() + Duration::from_secs(20), || {
+            Instant::now() >= cancel_at
+        });
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(!tail.complete, "{tail:?}");
+        session.kill();
     }
 
     /// `try_status` reaps the child; the group id then names nothing of ours,
@@ -1932,7 +2519,7 @@ mod tests {
         path
     }
 
-    fn refusal(result: Result<PathBuf, Failure>) -> (ErrorKind, String) {
+    fn refusal(result: Result<Resolved, Failure>) -> (ErrorKind, String) {
         match result {
             Err(Failure::Spawn { error, .. }) => (error.kind(), error.to_string()),
             other => panic!("expected a spawn refusal, got {other:?}"),
@@ -1949,7 +2536,7 @@ mod tests {
         let path = base.0.join("usr").join("bin");
 
         let got = resolve_outside(OsStr::new("git"), Some(path.as_os_str()), &root).unwrap();
-        assert_eq!(got, std::fs::canonicalize(installed).unwrap());
+        assert_eq!(got.path(), std::fs::canonicalize(installed).unwrap());
     }
 
     #[cfg(unix)]
@@ -2007,7 +2594,9 @@ mod tests {
         let path = std::env::join_paths([base.0.join("bin")]).unwrap();
         assert_eq!(repository_top(&root).unwrap(), root);
         assert_eq!(
-            resolve_outside(OsStr::new("git"), Some(&path), &root).unwrap(),
+            resolve_outside(OsStr::new("git"), Some(&path), &root)
+                .unwrap()
+                .path(),
             outside
         );
     }
@@ -2129,7 +2718,7 @@ mod tests {
             &root,
         )
         .unwrap();
-        assert_eq!(got, std::fs::canonicalize(installed).unwrap());
+        assert_eq!(got.path(), std::fs::canonicalize(installed).unwrap());
     }
 
     #[cfg(unix)]
@@ -2166,7 +2755,7 @@ mod tests {
         let path = std::env::join_paths([base.0.join("first"), base.0.join("second")]).unwrap();
 
         let got = resolve_outside(OsStr::new("git"), Some(&path), &root).unwrap();
-        assert_eq!(got, std::fs::canonicalize(installed).unwrap());
+        assert_eq!(got.path(), std::fs::canonicalize(installed).unwrap());
     }
 
     #[test]
@@ -2197,7 +2786,7 @@ mod tests {
             &missing,
         )
         .unwrap();
-        assert_eq!(got, std::fs::canonicalize(installed).unwrap());
+        assert_eq!(got.path(), std::fs::canonicalize(installed).unwrap());
     }
 
     /// An explicit program — a path, not a name — is the caller's choice, used
@@ -2210,14 +2799,74 @@ mod tests {
         let stand_in = plant(&root.join("bin"), "git", 0o755);
 
         let got = resolve_outside(stand_in.as_os_str(), Some(OsStr::new("")), &root).unwrap();
-        assert_eq!(got, stand_in);
+        assert_eq!(got.path(), stand_in);
+        assert_eq!(got.name(), stand_in.as_os_str());
         let got = resolve_outside(OsStr::new("some/dir/git"), None, &root).unwrap();
         assert!(
-            got.is_absolute() && got.ends_with("some/dir/git"),
+            got.path().is_absolute() && got.path().ends_with("some/dir/git"),
             "{}",
-            got.display()
+            got.path().display()
         );
     }
+
+    /// A program found through a link runs as the file the link reaches —
+    /// that is the file the boundary check examined — but under the name it
+    /// was looked up by. A rustup proxy (`rust-analyzer -> rustup`) is the
+    /// real case: rustup reads its own `argv[0]` to know which tool to be,
+    /// and started as `rustup` it prints its usage and exits. The stand-in is
+    /// compiled, because a script's `$0` is always the file the kernel handed
+    /// the interpreter, whatever name it was started under.
+    ///
+    /// The name is the one asked for, never the link's own file name or the
+    /// target's: `bin/fake-lsp -> ../real/proxy` asked for as `fake-lsp` is
+    /// started as `fake-lsp`.
+    #[cfg(unix)]
+    #[test]
+    fn a_program_found_through_a_link_keeps_the_name_it_was_asked_for() {
+        let base = Scratch::new("argv0");
+        let root = base.0.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = base.0.join("started-as");
+        let proxy = compile_argv0_proxy(&base.0.join("real"), "fake-lsp", &marker);
+        let bin = base.0.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(
+            Path::new("..").join("real").join("proxy"),
+            bin.join("fake-lsp"),
+        )
+        .unwrap();
+
+        let got = resolve_outside(OsStr::new("fake-lsp"), Some(bin.as_os_str()), &root).unwrap();
+        // Which file runs is the link's target, canonical: the boundary check
+        // and the exec agree on it.
+        assert_eq!(got.path(), std::fs::canonicalize(&proxy).unwrap());
+        assert_eq!(got.name(), OsStr::new("fake-lsp"));
+
+        let output = got.command().output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "started under the file's name, not the looked-up one: {stderr}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "fake-lsp",
+            "argv[0] is the name asked for"
+        );
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "fake-lsp");
+
+        // The same file started by its own path answers as what it is: the
+        // name is the only thing the seam changes.
+        let output = Resolved::as_given(got.path()).command().output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("usage: started as proxy"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    include!("../../testsupport/proxy.rs");
 
     #[test]
     fn a_transient_executable_writer_retries_without_duplicating_a_child() {

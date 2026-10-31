@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdin, ChildStdout};
+use std::process::ChildStdout;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -75,7 +75,7 @@ type Answer = Result<Record, String>;
 /// One running `cat-file` and the thread reading its answers.
 struct Lane {
     session: Session,
-    stdin: ChildStdin,
+    stdin: dc_proc::SessionStdin,
     answers: Receiver<Answer>,
     /// Set when the process stopped answering; every later request repeats it.
     broken: Option<HistoryRefusal>,

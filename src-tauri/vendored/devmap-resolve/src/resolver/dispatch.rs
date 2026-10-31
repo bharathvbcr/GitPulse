@@ -191,6 +191,37 @@ impl Resolver {
         }
     }
 
+    /// The declaration `module_file` publishes as `name`: one it declares, else
+    /// the one a re-export chain ends at.
+    ///
+    /// A namespace handle over a barrel (`import * as ui from './index'`, then
+    /// `ui.buildTab()`) asks the barrel for a name the barrel only re-exports.
+    /// The named-import path already follows the chain
+    /// (`export { buildTab } from './tabs'`, `export * from './filters'`); the
+    /// member path asked the barrel's own declarations and found none, so every
+    /// call through a namespace over a barrel was lost.
+    pub(super) fn lookup_module_member(
+        &self,
+        module_file: &str,
+        name: &str,
+    ) -> Option<(String, String)> {
+        // The default export is the module's own statement, never a hop (a hop
+        // keyed `file::default` is a name `export *` would republish): it
+        // answers a member `default` of this module and of no module over it.
+        if name == "default" {
+            if let Some(local) = self.default_exports.get(module_file) {
+                return self.lookup_in_package(module_file, local);
+            }
+        }
+        self.lookup_in_package(module_file, name).or_else(|| {
+            let terminal = self
+                .reexport_chains
+                .get(&format!("{module_file}::{name}"))?;
+            let (file, declared) = terminal.rsplit_once("::")?;
+            self.lookup_in_package(file, declared)
+        })
+    }
+
     pub(super) fn lookup_in_package(&self, file: &str, name: &str) -> Option<(String, String)> {
         let hits = self.symbol_index.get(name)?;
         let eligible = |path: &str, identity: &str| self.declared_at_file_level(path, identity);
@@ -610,6 +641,14 @@ impl Resolver {
                 .first()
                 .copied()
                 .filter(|first| visible.iter().all(|hit| hit == first));
+        }
+        // JS/TS: the module's own scope says which namesake is meant.
+        let all: Vec<&(String, String)> = hits.iter().collect();
+        if let Some(scoped) = self.js_module_scoped_hits(&ext.file_path, class_type, &all) {
+            return scoped
+                .first()
+                .copied()
+                .filter(|first| scoped.iter().all(|hit| hit == first));
         }
         // Overloads of one method are several hits that name one identity
         // (`add(Int)` / `add(String)` both mint `Calc.add`): one target.

@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
@@ -94,10 +93,36 @@ fn escaped_evidence_bytes(value: &str) -> u64 {
     })
 }
 
+/// One shared answer to "which declarations does this bare name have, seen
+/// from here".
 struct GlobalCandidates {
+    /// The sorted, distinct targets — or, when a budget cut the set short, its
+    /// retained prefix (empty when the lookup was skipped).
     rows: CandidateSet,
+    /// How many *distinct targets* the name has. Two declarations that share a
+    /// file and a graph identity — `#ifdef` variants of one C function, the
+    /// overloads of one method — are one target: an edge names the identity, so
+    /// binding to it is true of every declaration at once. Meaningless when
+    /// [`Self::cap`] says the lookup was skipped.
     declarations: usize,
-    evidence_bytes: u64,
+    /// Set when a budget degraded this set; see [`CandidateCap`].
+    cap: Option<CandidateCap>,
+}
+
+/// How a resolution budget degraded one candidate set. Only ever built under
+/// [`LimitPolicy::Degrade`]; under `Refuse` the budget is an error instead.
+struct CandidateCap {
+    /// The budget that was exceeded, by [`ResolutionLimitError::resource`].
+    limit: Arc<str>,
+    /// `false` when the lookup was skipped outright, so `declarations` and
+    /// `rows` say nothing about the name.
+    looked_up: bool,
+    /// Distinct targets the list held before the cut, so a capped row's dropped
+    /// count is `distinct_total - rows.len()` exactly. `declarations` cannot
+    /// say it: it counts declarations, and two that share a file and an
+    /// identity are one target after the dedup. Zero when the lookup was
+    /// skipped.
+    distinct_total: usize,
 }
 type CandidateKey = (LangFamily, String, String);
 
@@ -106,6 +131,12 @@ struct GlobalCandidateCache {
     sets: BTreeMap<CandidateKey, Arc<GlobalCandidates>>,
     visits: u64,
     retained_bytes: u64,
+    /// Escaped-JSON upper bound of every distinct ambiguous list held, charged
+    /// once per list however many sites share it.
+    evidence_bytes: u64,
+    /// `true` on the deterministic degrade pass: a budget that would have
+    /// refused the resolution degrades the set instead.
+    degrade: bool,
 }
 
 fn charge(
@@ -126,30 +157,11 @@ fn charge(
     Ok(())
 }
 
-fn charge_ambiguity(
-    counter: &AtomicU64,
-    candidates: &GlobalCandidates,
-    limit: u64,
-) -> Result<(), ResolutionLimitError> {
-    // One ledger row per ambiguous site, however many candidates it names.
-    let additional = candidates.evidence_bytes;
-    // An explicit compare-exchange loop rather than `fetch_update`, which Rust
-    // 1.99 deprecates in favour of `try_update` — a name older toolchains this
-    // workspace still builds on do not have.
-    let mut used = counter.load(Ordering::Relaxed);
-    loop {
-        let Some(next) = used.checked_add(additional).filter(|next| *next <= limit) else {
-            return Err(ResolutionLimitError {
-                resource: "ambiguity evidence bytes",
-                limit,
-                attempted: used.saturating_add(additional),
-            });
-        };
-        match counter.compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return Ok(()),
-            Err(current) => used = current,
-        }
-    }
+/// The conservative JSON/Debug upper bound of one candidate list.
+fn evidence_bytes_of(candidates: &[(String, String)]) -> u64 {
+    candidates.iter().fold(64u64, |total, (file, symbol)| {
+        total.saturating_add(16 + escaped_evidence_bytes(file) + escaped_evidence_bytes(symbol))
+    })
 }
 
 /// Where the name a resolution rung failed on was written.
@@ -482,6 +494,19 @@ pub struct Resolver {
     /// value import is typed by in another file, which is the whole shape of a
     /// singleton service: declared once, called everywhere else.
     module_value_types: BTreeMap<(String, String), String>,
+    /// Qualified names of the JS/TS module-scope values the extractor read as a
+    /// literal — `export const LIMIT = 3`, `const SCOPE = 'project'`,
+    /// `const TABLE = { a: 1 }`. Nothing a call could run: a `LIMIT()` is not a
+    /// call to it. See `index_inert_values`.
+    inert_values: BTreeSet<String>,
+    /// The JS/TS files that state an `export * from …`. `export *` forwards every
+    /// name but `default` (ES 15.2.3.5); a file in this set is where a default
+    /// import that found nothing is told why.
+    star_export_files: BTreeSet<String>,
+    /// `(file, qualified name)` of every Java `record` symbol. A record and its
+    /// canonical constructor are one declaration of the name for a `new Rec(..)`
+    /// lookup; a plain class and its constructors stay what they were.
+    java_records: BTreeSet<(String, String)>,
     /// `(file, name)` → the names a module-scope value's **own declaration**
     /// carries: the shorthand properties of `export const api = { get, post }`
     /// and the methods written inside `export const log = { info() {…} }`.
@@ -636,6 +661,10 @@ pub struct Resolver {
     /// package here gets no unexported-selector answers at all: one unseen file
     /// could declare the second method or the vetoing field.
     go_package_dirs_unvouched: BTreeSet<String>,
+    /// Go files carrying a build constraint (`//go:build`, `// +build` or a
+    /// `_GOOS`/`_GOARCH` suffix), from [`Extraction::go_build_constrained`].
+    /// Read by [`Resolver::go_build_variants`].
+    go_constrained_files: BTreeSet<String>,
     /// The Go type model: declarations, signatures and imports by package.
     go_model: GoModel,
     /// file_path → Swift module name derived from the path.
@@ -778,6 +807,9 @@ impl Resolver {
             import_bindings: BTreeMap::new(),
             value_imports: BTreeMap::new(),
             module_value_types: BTreeMap::new(),
+            inert_values: BTreeSet::new(),
+            star_export_files: BTreeSet::new(),
+            java_records: BTreeSet::new(),
             module_value_members: BTreeMap::new(),
             js_objects: BTreeMap::new(),
             return_types: BTreeMap::new(),
@@ -801,6 +833,7 @@ impl Resolver {
             go_package_methods: BTreeMap::new(),
             go_package_member_vetoes: BTreeSet::new(),
             go_package_dirs_unvouched: BTreeSet::new(),
+            go_constrained_files: BTreeSet::new(),
             go_model: GoModel::default(),
             swift_module_by_file: BTreeMap::new(),
             jvm_package_by_file: BTreeMap::new(),
@@ -870,6 +903,7 @@ mod scope;
 mod implicit_receiver;
 
 mod dispatch;
+mod go_variants;
 
 mod imports;
 

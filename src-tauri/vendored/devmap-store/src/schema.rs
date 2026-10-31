@@ -80,8 +80,10 @@ CREATE TABLE IF NOT EXISTS generation_file_rows (
     PRIMARY KEY (generation_id, file_id)
 ) WITHOUT ROWID;
 
-CREATE INDEX IF NOT EXISTS idx_generation_file_rows_payload
-    ON generation_file_rows(payload_id);
+-- (v28 removed `idx_generation_file_rows_payload` and
+-- `idx_generation_nodes_file` from this batch with the tables they indexed. A
+-- store walked up the ladder is re-entrant over the current shape, where those
+-- two names are views, and `CREATE INDEX` on a view is an error.)
 
 -- `generation_files` keeps its name and its exact column set, as a view.
 --
@@ -127,9 +129,6 @@ CREATE TABLE IF NOT EXISTS generation_dead_symbols (
     exemption_reason TEXT,
     PRIMARY KEY (generation_id, ordinal)
 ) WITHOUT ROWID;
-
-CREATE INDEX IF NOT EXISTS idx_generation_nodes_file
-    ON generation_nodes(generation_id, file_id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
     name, qualified_name, path, tokenize='unicode61'
@@ -254,8 +253,7 @@ CREATE TABLE IF NOT EXISTS generation_file_rows (
     PRIMARY KEY (generation_id, file_id)
 ) WITHOUT ROWID;
 
-CREATE INDEX IF NOT EXISTS idx_generation_file_rows_payload
-    ON generation_file_rows(payload_id);
+-- (no `idx_generation_file_rows_payload`: see `CREATE_SCHEMA_V3`.)
 
 -- `generation_files` keeps its name and its exact column set, as a view.
 --
@@ -288,8 +286,6 @@ CREATE TABLE IF NOT EXISTS generation_dead_symbols (
     PRIMARY KEY (generation_id, ordinal)
 ) WITHOUT ROWID;
 
-CREATE INDEX IF NOT EXISTS idx_generation_nodes_file
-    ON generation_nodes(generation_id, file_id);
 "#;
 
 /// The v5 edge indexes, split out of [`MIGRATION_V4_TO_V5`] because they are
@@ -1202,6 +1198,20 @@ SELECT g.id             AS generation_id,
 ///
 /// # Why there is no v20 putting the nodes on ranges
 ///
+/// **Superseded by v28, which did it.** This section is kept because the
+/// measurement it records is what v28 had to beat, not because its conclusion
+/// stands. The 54 ms write and 39 ms prune it prices predate
+/// `generation_literals` (v26), a relation of 172,040 rows per retained
+/// generation on this repository; measured on the v27 binary against a
+/// `git archive` of this repository, a steady-state one-file edit spent 0.21 s
+/// of `persist:write` copying literals and 0.57 s in
+/// `persist:prune_generations` deleting the previous generation's copy of every
+/// relation. The "re-keyed full-text index on the hottest read" it feared is the
+/// `payload_id << 24 | ord_in_file` rowid of [`MIGRATION_V27_TO_V28`], which the
+/// readers decode in one place. The test that pinned the state described below,
+/// `an_incremental_build_still_copies_every_node_and_full_text_row`, is now
+/// `a_one_file_edit_writes_one_files_worth_of_rows_to_every_relation`.
+///
 /// v18 ranged the edges and the unresolved ledger and left `generation_nodes`,
 /// `nodes_fts`/`nodes_fts_map`, `generation_file_rows`, `generation_dead_symbols`
 /// and `generation_coverage_gaps` as full per-generation copies. The obvious
@@ -1369,7 +1379,390 @@ ALTER TABLE generation_dead_symbols ADD COLUMN evidence_path TEXT;
 ALTER TABLE generation_dead_symbols ADD COLUMN evidence_byte INTEGER;
 "#;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 27;
+/// Bits of a symbol's identity that say *where in its payload it is*.
+///
+/// A symbol is `(payload_id, ord_in_file)`. The pair is packed into one integer
+/// as `payload_id << NODE_ORD_BITS | ord_in_file`, which is at once the row's
+/// `nodes_fts` rowid and the `ordinal` the `generation_nodes` view reports, so
+/// the full-text index and the symbol table are joined by arithmetic on a key
+/// that no generation appears in. 24 bits is 16,777,216 symbols in one file;
+/// the extractor's one-MiB input limit cannot reach a tenth of that, and a
+/// write that did would refuse loudly rather than wrap into a neighbour's id.
+pub const NODE_ORD_BITS: u32 = 24;
+
+/// One past the largest `ord_in_file` a payload may hold.
+pub const MAX_NODES_PER_PAYLOAD: u32 = 1 << NODE_ORD_BITS;
+
+/// The indexes earlier schemas declared that v28 removed along with the tables
+/// they indexed, and whose `CREATE INDEX` is still in a batch of
+/// [`FRESH_SCHEMA_BATCHES`].
+///
+/// The fresh schema is the old batches followed by [`MIGRATION_V27_TO_V28`], so
+/// that text would be both demanded by the index gate and replayed against a
+/// view by `heal_declared_indexes`. Named here once and filtered out of both.
+/// `idx_generation_nodes_file` and `idx_generation_file_rows_payload` are not
+/// listed because v28 took their statements out of the batches themselves: the
+/// v3 and v4 rungs re-run `CREATE_SCHEMA_V3` over stores that already carry the
+/// current shape, where those names are views.
+pub const INDEXES_REMOVED_BY_V28: &[&str] = &[
+    "idx_generation_literals_value",
+    "idx_file_payloads_identity",
+];
+
+/// v28: symbols, literals and full-text rows belong to a *payload*, and a
+/// file's membership and digests live for a *range* of generations.
+///
+/// Measured on this repository (2,816 files, 25,424 symbols), release kernel at
+/// schema 27, one appended line to one file between builds:
+///
+/// ```text
+///   generation_literals   172,040 rows for generation 2, the same 172,040 for 3
+///   edge_rows              96,928 rows in all, one changed
+///   a one-file edit        0.21 s copying literals, 0.57 s pruning the
+///                          previous generation's copy of every relation
+/// ```
+///
+/// v17 solved this shape for the payload's JSON by keying it on the file and
+/// the extractor identity; the relations *derived from* one file's payload were
+/// left keyed by generation and copied wholesale on every build. They depend on
+/// nothing but that payload, so they are keyed by it now:
+///
+/// * `payload_nodes(payload_id, ord_in_file, ...)` and
+///   `payload_literals(payload_id, ...)`, and the `nodes_fts` rows, are written
+///   once, when the payload is. A payload is the same file at the same content
+///   under the same extractor *and with the same output*: the identity carries
+///   `payload_digest`, a 128-bit digest of the three documents the row holds,
+///   because the extractor's version strings name a binary and not what it
+///   produced. Two outputs for one key are two payloads, so the rows a retained
+///   generation reads are never rewritten underneath it, and a payload's rows
+///   are the extraction's by identity. Fable ruling 1 (2026-10-29): the first
+///   v28 keyed on the version strings alone and kept a stored payload's rows
+///   whenever the symbol count matched.
+/// * `file_rows(file_id, payload_id, valid_from, valid_to)` is the membership
+///   relation as a validity range, exactly as `edge_rows` is for edges. An
+///   unchanged file's row stays open and nothing is written for it.
+/// * `digest_rows` does the same for `generation_file_digests`.
+///
+/// The old relations keep their names and column sets as views, the v17/v18
+/// playbook, so every reader that asks "what did generation g hold" is
+/// unchanged. Two things a view cannot keep: the `nodes_fts` rowid, which no
+/// longer carries a generation, and `ordinal`, which is now
+/// `payload_id << 24 | ord_in_file` instead of a position in the generation.
+/// Both are re-derived in one place (`Store::fts_rowid`), and the readers that
+/// joined on the old encoding were rewritten against it. That is also why the
+/// reader floor is raised to 28: a v27 reader would join the new rowids by the
+/// old arithmetic and answer from the wrong rows without an error.
+///
+/// `generation_dead_symbols` and `generation_coverage_gaps` stay
+/// per-generation. They are whole-graph results rather than derivations of one
+/// file, and at 8k and 60 rows they are not what a one-file edit pays for.
+///
+/// # Row order is preserved by `file_rows.row_id`
+///
+/// The v27 write order put a build's carried files first and its fresh files
+/// after, so `ORDER BY ordinal` was "unchanged files, then what this build
+/// rewrote", and semantic ranking and clone grouping consume symbols in it.
+/// `file_rows.row_id` is allocated when a membership row is opened, so
+/// `ORDER BY row_id, ord_in_file` is that same order, including after a revert
+/// (a reverted file gets a new row and goes last, as it did before).
+///
+/// # The migration
+///
+/// One transaction, so a crash leaves the v27 store whole. File rows become the
+/// maximal runs of consecutive generations that held the same payload for a
+/// file, ordered by `(valid_from, position in that generation)` so `row_id`
+/// reproduces v27's write order. Nodes and literals are copied once per
+/// payload from the newest generation that names it, `ord_in_file` being the
+/// rank of the v27 ordinal within the file. `nodes_fts` is dropped and rebuilt
+/// under the new rowids. Digests are collapsed into runs the same way. The
+/// retained generations' relation sizes are compared before and after by the
+/// caller; a difference refuses the migration.
+pub const MIGRATION_V27_TO_V28: &str = r#"
+-- The payload's identity gains the digest of what was extracted. Existing rows
+-- read as the empty digest here and are given their real one by
+-- `Store::migrate_to_v28` straight after this batch, which is Rust because SQL
+-- has no hash of its own to agree with the writer's. The unique index replaces
+-- `idx_file_payloads_identity` under a new name: two statements declaring one
+-- name with different definitions is the contradiction the index-gate test
+-- exists to refuse.
+ALTER TABLE file_payloads ADD COLUMN payload_digest BLOB NOT NULL DEFAULT x'';
+
+DROP INDEX IF EXISTS idx_file_payloads_identity;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_file_payloads_digest_identity
+    ON file_payloads(file_id, content_hash, language,
+                     COALESCE(grammar_version, ''), COALESCE(analyzer_version, ''),
+                     payload_digest);
+
+CREATE TABLE IF NOT EXISTS payload_nodes (
+    payload_id      INTEGER NOT NULL REFERENCES file_payloads(payload_id),
+    ord_in_file     INTEGER NOT NULL CHECK (ord_in_file >= 0 AND ord_in_file < 16777216),
+    name            TEXT NOT NULL,
+    qualified_name  TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    span_start      INTEGER NOT NULL,
+    span_end        INTEGER NOT NULL,
+    is_exported     INTEGER NOT NULL,
+    body_exact      INTEGER,
+    body_structural INTEGER,
+    body_nodes      INTEGER,
+    PRIMARY KEY (payload_id, ord_in_file)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS payload_literals (
+    payload_id     INTEGER NOT NULL REFERENCES file_payloads(payload_id),
+    line           INTEGER NOT NULL,
+    span_start     INTEGER NOT NULL,
+    value          TEXT NOT NULL,
+    qualified_name TEXT NOT NULL,
+    symbol_name    TEXT NOT NULL,
+    PRIMARY KEY (payload_id, span_start, value, qualified_name)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_payload_literals_value
+    ON payload_literals (value);
+
+CREATE TABLE IF NOT EXISTS file_rows (
+    row_id     INTEGER PRIMARY KEY,
+    file_id    INTEGER NOT NULL REFERENCES paths(id),
+    payload_id INTEGER NOT NULL REFERENCES file_payloads(payload_id),
+    valid_from INTEGER NOT NULL,
+    valid_to   INTEGER,
+    CHECK (valid_to IS NULL OR valid_to > valid_from)
+);
+
+-- At most one open row per file, and at most one row per file closed at a given
+-- generation. Not a partial index: the v18 note beside `idx_edge_rows_closed`
+-- records what a `valid_to IS NULL` index did to the readers' plan. The
+-- expression keeps the index total, so the planner cannot offer it for the
+-- range predicate, and the write path reads the open rows with one scan of a
+-- table that has one row per file.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_file_rows_file
+    ON file_rows (file_id, COALESCE(valid_to, -1));
+
+CREATE INDEX IF NOT EXISTS idx_file_rows_payload
+    ON file_rows (payload_id);
+
+CREATE TABLE IF NOT EXISTS digest_rows (
+    row_id          INTEGER PRIMARY KEY,
+    file_id         INTEGER NOT NULL REFERENCES paths(id),
+    edge_rows       INTEGER NOT NULL,
+    edge_lo         INTEGER NOT NULL,
+    edge_hi         INTEGER NOT NULL,
+    unresolved_rows INTEGER NOT NULL,
+    unresolved_lo   INTEGER NOT NULL,
+    unresolved_hi   INTEGER NOT NULL,
+    valid_from      INTEGER NOT NULL,
+    valid_to        INTEGER,
+    CHECK (valid_to IS NULL OR valid_to > valid_from)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_digest_rows_file
+    ON digest_rows (file_id, COALESCE(valid_to, -1));
+
+INSERT INTO file_rows (file_id, payload_id, valid_from, valid_to)
+WITH g AS (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS seq FROM generations
+), m AS (
+    SELECT r.file_id AS file_id, r.payload_id AS payload_id, g.id AS gid,
+           g.seq - ROW_NUMBER() OVER (
+               PARTITION BY r.file_id, r.payload_id ORDER BY g.seq) AS island
+      FROM generation_file_rows r
+      JOIN g ON g.id = r.generation_id
+), isl AS (
+    SELECT file_id, payload_id, MIN(gid) AS vf, MAX(gid) AS vl
+      FROM m GROUP BY file_id, payload_id, island
+)
+SELECT i.file_id, i.payload_id, i.vf,
+       (SELECT MIN(g2.id) FROM generations g2 WHERE g2.id > i.vl)
+  FROM isl i
+  LEFT JOIN (SELECT generation_id AS gid, file_id AS fid, MIN(ordinal) AS first_ord
+               FROM generation_nodes GROUP BY generation_id, file_id) o
+         ON o.gid = i.vf AND o.fid = i.file_id
+ ORDER BY i.vf, COALESCE(o.first_ord, 9223372036854775807), i.file_id;
+
+-- Nodes and literals are walked from the per-generation side and looked up in
+-- membership by its primary key, `(generation_id, file_id)`. The other direction
+-- would probe the nodes by `(generation_id, file_id)`, and the index that
+-- served that probe, `idx_generation_nodes_file`, is not on every store that
+-- reaches this rung.
+INSERT INTO payload_nodes
+    (payload_id, ord_in_file, name, qualified_name, kind, span_start, span_end,
+     is_exported, body_exact, body_structural, body_nodes)
+SELECT r.payload_id,
+       ROW_NUMBER() OVER (PARTITION BY r.payload_id ORDER BY n.ordinal) - 1,
+       n.name, n.qualified_name, n.kind, n.span_start, n.span_end, n.is_exported,
+       n.body_exact, n.body_structural, n.body_nodes
+  FROM generation_nodes n
+  CROSS JOIN generation_file_rows r
+          ON r.generation_id = n.generation_id AND r.file_id = n.file_id
+  CROSS JOIN (SELECT payload_id, MAX(generation_id) AS gid
+                FROM generation_file_rows GROUP BY payload_id) s
+          ON s.payload_id = r.payload_id AND s.gid = r.generation_id;
+
+INSERT INTO payload_literals
+    (payload_id, line, span_start, value, qualified_name, symbol_name)
+SELECT r.payload_id, l.line, l.span_start, l.value, l.qualified_name, l.symbol_name
+  FROM generation_literals l
+  CROSS JOIN generation_file_rows r
+          ON r.generation_id = l.generation_id AND r.file_id = l.file_id
+  CROSS JOIN (SELECT payload_id, MAX(generation_id) AS gid
+                FROM generation_file_rows GROUP BY payload_id) s
+          ON s.payload_id = r.payload_id AND s.gid = r.generation_id;
+
+INSERT INTO digest_rows
+    (file_id, edge_rows, edge_lo, edge_hi, unresolved_rows, unresolved_lo,
+     unresolved_hi, valid_from, valid_to)
+WITH g AS (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS seq FROM generations
+), m AS (
+    SELECT d.file_id AS file_id, d.edge_rows AS edge_rows, d.edge_lo AS edge_lo,
+           d.edge_hi AS edge_hi, d.unresolved_rows AS unresolved_rows,
+           d.unresolved_lo AS unresolved_lo, d.unresolved_hi AS unresolved_hi,
+           g.id AS gid,
+           g.seq - ROW_NUMBER() OVER (
+               PARTITION BY d.file_id, d.edge_rows, d.edge_lo, d.edge_hi,
+                            d.unresolved_rows, d.unresolved_lo, d.unresolved_hi
+               ORDER BY g.seq) AS island
+      FROM generation_file_digests d
+      JOIN g ON g.id = d.generation_id
+)
+SELECT file_id, edge_rows, edge_lo, edge_hi, unresolved_rows, unresolved_lo,
+       unresolved_hi, MIN(gid),
+       (SELECT MIN(g2.id) FROM generations g2 WHERE g2.id > MAX(m.gid))
+  FROM m
+ GROUP BY file_id, edge_rows, edge_lo, edge_hi, unresolved_rows, unresolved_lo,
+          unresolved_hi, island;
+
+DROP TABLE generation_literals;
+DROP TABLE generation_nodes;
+DROP TABLE generation_file_digests;
+DROP TABLE generation_file_rows;
+DROP TABLE nodes_fts_map;
+DROP TABLE nodes_fts;
+
+CREATE VIRTUAL TABLE nodes_fts USING fts5(
+    name, qualified_name, path, tokenize='unicode61'
+);
+
+-- The one owner of the range predicate, as for `generation_edges`.
+CREATE VIEW generation_file_rows AS
+SELECT g.id         AS generation_id,
+       r.file_id    AS file_id,
+       r.payload_id AS payload_id
+  FROM file_rows r
+  JOIN generations g
+    ON g.id >= r.valid_from
+   AND (r.valid_to IS NULL OR g.id < r.valid_to);
+
+CREATE VIEW generation_nodes AS
+SELECT g.id AS generation_id,
+       (n.payload_id << 24) | n.ord_in_file AS ordinal,
+       r.file_id         AS file_id,
+       n.name            AS name,
+       n.qualified_name  AS qualified_name,
+       n.kind            AS kind,
+       n.span_start      AS span_start,
+       n.span_end        AS span_end,
+       n.is_exported     AS is_exported,
+       n.body_exact      AS body_exact,
+       n.body_structural AS body_structural,
+       n.body_nodes      AS body_nodes
+  FROM file_rows r
+  JOIN generations g
+    ON g.id >= r.valid_from
+   AND (r.valid_to IS NULL OR g.id < r.valid_to)
+  JOIN payload_nodes n ON n.payload_id = r.payload_id;
+
+CREATE VIEW nodes_fts_map AS
+SELECT (n.payload_id << 24) | n.ord_in_file AS rowid_ref,
+       g.id                                 AS generation_id
+  FROM file_rows r
+  JOIN generations g
+    ON g.id >= r.valid_from
+   AND (r.valid_to IS NULL OR g.id < r.valid_to)
+  JOIN payload_nodes n ON n.payload_id = r.payload_id;
+
+CREATE VIEW generation_literals AS
+SELECT g.id          AS generation_id,
+       r.file_id     AS file_id,
+       l.line        AS line,
+       l.span_start  AS span_start,
+       l.value       AS value,
+       l.qualified_name AS qualified_name,
+       l.symbol_name AS symbol_name
+  FROM file_rows r
+  JOIN generations g
+    ON g.id >= r.valid_from
+   AND (r.valid_to IS NULL OR g.id < r.valid_to)
+  JOIN payload_literals l ON l.payload_id = r.payload_id;
+
+CREATE VIEW generation_file_digests AS
+SELECT g.id              AS generation_id,
+       d.file_id         AS file_id,
+       d.edge_rows       AS edge_rows,
+       d.edge_lo         AS edge_lo,
+       d.edge_hi         AS edge_hi,
+       d.unresolved_rows AS unresolved_rows,
+       d.unresolved_lo   AS unresolved_lo,
+       d.unresolved_hi   AS unresolved_hi
+  FROM digest_rows d
+  JOIN generations g
+    ON g.id >= d.valid_from
+   AND (d.valid_to IS NULL OR g.id < d.valid_to);
+
+INSERT INTO nodes_fts (rowid, name, qualified_name, path)
+SELECT (n.payload_id << 24) | n.ord_in_file, n.name, n.qualified_name, p.path
+  FROM payload_nodes n
+  JOIN file_payloads fp ON fp.payload_id = n.payload_id
+  JOIN paths p ON p.id = fp.file_id
+ ORDER BY n.payload_id, n.ord_in_file;
+"#;
+
+/// v29: a payload's extraction document is stored zstd-compressed.
+///
+/// Measured on this repository's own store at schema 28 (1,896 payloads):
+/// `file_payloads` is 196 MB of 349 MB, and all but 0.15 MB of that is
+/// `extraction_json`, ~106 KB a row as JSON text. Per-row zstd takes it ~11x
+/// smaller; the measurements that decided whether that is worth a schema bump
+/// are in `docs/devmap/design/store-write-cost-proposal.md`, Appendix C.
+///
+/// What the bump changes, and what it does not:
+///
+/// * `extraction_json` keeps its name and its `TEXT NOT NULL` declaration, and
+///   `generation_files` keeps exposing it, but a v29 row holds a zstd frame as a
+///   `BLOB`. SQLite does not convert a blob stored in a `TEXT` column, so no DDL
+///   is needed, and the storage class tells the two forms apart (see
+///   [`crate::payload_codec`]). That is also why the floor is raised: a v28
+///   reader would read the blob with `get::<String>`, and while that fails
+///   loudly the failure is "invalid column type" and not "this store is newer".
+/// * Payload identity is unchanged. `payload_digest` covers the JSON text, taken
+///   before compression.
+/// * `json_extract` cannot see inside a compressed value, and
+///   `latest_test_entry_symbols` ran `json_extract(extraction_json, '$.wiring')`
+///   on every hook-driven `affected_tests`. What it needs is promoted into
+///   `entry_wiring_json`: the `RuntimeEntryPoint` wiring annotations as a JSON
+///   array, written beside the payload, so the query reads a few bytes and
+///   decompresses nothing. `NULL` means "not computed" (a row a foreign writer
+///   inserted) and the reader falls back to decoding that one document; `'[]'`
+///   means "computed, none".
+///
+/// # The migration
+///
+/// One transaction, like every rung. Each uncompressed payload is read,
+/// compressed, and written back with its `entry_wiring_json`, one row at a time
+/// so the migration holds one document and not the store's. The rung is guarded
+/// on the shape and the pass selects only what is not yet converted, so a
+/// store re-entered after a crash, or one that a writer left half converted,
+/// converges: the same pass runs at every writer open (`Store::heal_extraction_encoding`) and
+/// costs one probe when there is nothing to do. The pages the rewrite frees go
+/// back to the filesystem through the incremental vacuum the store already
+/// uses.
+pub const MIGRATION_V28_TO_V29: &str = r#"
+ALTER TABLE file_payloads ADD COLUMN entry_wiring_json TEXT;
+"#;
+
+pub const CURRENT_SCHEMA_VERSION: i32 = 29;
 
 /// The oldest reader schema that can read a store this binary writes.
 ///
@@ -1392,17 +1785,22 @@ pub const CURRENT_SCHEMA_VERSION: i32 = 27;
 ///   or renames anything an older reader selects. v23 and v25 were exactly
 ///   this — version-only bumps that exist so an older binary *refuses* rather
 ///   than reconstructing `LanguageServer` rows or `Registers` edges as
-///   something else.
+///   something else. v28 is this too, and not for want of compatible views:
+///   the `nodes_fts` rowid no longer carries a generation, so a v27 reader
+///   joining it by `rowid & 4294967295` would resolve a payload's symbols to
+///   the wrong rows and answer without an error. v29 is this as well: it
+///   changes the storage class of `file_payloads.extraction_json` from `TEXT`
+///   to a compressed `BLOB`, which no earlier binary can decode.
 ///
 /// Writers stay exact-match: a binary never migrates or writes a store newer
 /// than itself, whatever this floor says.
-pub const MIN_READER_SCHEMA_VERSION: i32 = 25;
+pub const MIN_READER_SCHEMA_VERSION: i32 = 29;
 
 /// `(schema, floor)` for every schema since the floor was introduced, oldest
 /// first. The last row must be `(CURRENT_SCHEMA_VERSION,
 /// MIN_READER_SCHEMA_VERSION)`; a unit test holds that, so bumping the schema
 /// without deciding the new floor fails rather than silently inheriting one.
-pub const SCHEMA_READER_FLOORS: &[(i32, i32)] = &[(26, 25), (27, 25)];
+pub const SCHEMA_READER_FLOORS: &[(i32, i32)] = &[(26, 25), (27, 25), (28, 28), (29, 29)];
 
 /// Where a writer records [`MIN_READER_SCHEMA_VERSION`].
 ///
@@ -1461,10 +1859,30 @@ pub const FRESH_SCHEMA_BATCHES: &[&str] = &[
     MIGRATION_V24_TO_V25,
     MIGRATION_V25_TO_V26,
     MIGRATION_V26_TO_V27,
+    // Over the empty v27 shape the batches above just built, on the fresh path;
+    // over a real store, on the ladder (see `Store::migrate_to_v28`).
+    MIGRATION_V27_TO_V28,
+    // The one column v29 adds; the compression of existing rows is Rust, and a
+    // fresh store has none (see `Store::migrate_to_v29`).
+    MIGRATION_V28_TO_V29,
     // Not a rung: no `user_version` bump. Every writer open creates it — the
     // fresh path and the ladder alike — so both still land on one schema.
     READER_COMPAT_TABLE,
 ];
+
+/// The name in the body of a `CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ...`
+/// chunk, where `body` starts at `INDEX `.
+fn index_name_of(body: &str) -> &str {
+    let rest = body.strip_prefix("INDEX ").unwrap_or(body).trim_start();
+    let rest = rest
+        .strip_prefix("IF NOT EXISTS ")
+        .unwrap_or(rest)
+        .trim_start();
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '(' || c == ';')
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
 
 /// Strip SQL line comments so a scan of DDL text cannot read prose as code.
 fn without_sql_comments(sql: &str) -> String {
@@ -1538,6 +1956,12 @@ pub fn declared_index_statements() -> Vec<String> {
                 continue;
             };
             let statement = format!("CREATE {};", chunk[..end].trim());
+            if INDEXES_REMOVED_BY_V28
+                .iter()
+                .any(|removed| index_name_of(body) == *removed)
+            {
+                continue;
+            }
             if seen.insert(statement.clone()) {
                 statements.push(statement);
             }
@@ -1565,7 +1989,7 @@ pub fn declared_index_names() -> Vec<String> {
                 .chars()
                 .take_while(|c| !c.is_whitespace() && *c != '(' && *c != ';')
                 .collect();
-            if !name.is_empty() {
+            if !name.is_empty() && !INDEXES_REMOVED_BY_V28.contains(&name.as_str()) {
                 names.push(name);
             }
         }

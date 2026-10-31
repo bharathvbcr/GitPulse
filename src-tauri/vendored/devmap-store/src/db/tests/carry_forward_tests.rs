@@ -33,7 +33,9 @@ fn read_row(store: &Store, generation: u32, path: &str) -> FileRow {
                 row.get(2)?,
                 row.get(3)?,
                 row.get(4)?,
-                row.get(5)?,
+                // Stored as a zstd frame since schema 29; the carried-row
+                // comparison is of the document it decodes to.
+                crate::payload_codec::decode_value(row.get_ref(5)?, path)?.into_owned(),
                 row.get(6)?,
                 row.get(7)?,
             ))

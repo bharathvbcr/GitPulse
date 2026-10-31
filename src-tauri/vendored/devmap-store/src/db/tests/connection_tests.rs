@@ -432,10 +432,23 @@ fn a_pinned_generation_keeps_its_rows_when_another_connection_prunes_it() {
         conn.execute("INSERT INTO paths (id, path) VALUES (1, 'src/a.py')", [])
             .expect("path");
         conn.execute(
-            "INSERT INTO generation_nodes
-                 (generation_id, ordinal, file_id, name, qualified_name, kind,
+            "INSERT INTO file_payloads
+                 (payload_id, file_id, content_hash, language, grammar_version,
+                  analyzer_version, parse_outcome_json, engine_json, extraction_json)
+                 VALUES (1, 1, 1, 'python', 'g', 'a', '\"Clean\"', '\"TreeSitter\"', '{}')",
+            [],
+        )
+        .expect("payload");
+        conn.execute(
+            "INSERT INTO file_rows (file_id, payload_id, valid_from) VALUES (1, 1, 7)",
+            [],
+        )
+        .expect("membership");
+        conn.execute(
+            "INSERT INTO payload_nodes
+                 (payload_id, ord_in_file, name, qualified_name, kind,
                   span_start, span_end, is_exported)
-                 VALUES (7, 0, 1, 'alpha', 'src/a.py::alpha', 'Function', 0, 1, 0)",
+                 VALUES (1, 0, 'alpha', 'src/a.py::alpha', 'Function', 0, 1, 0)",
             [],
         )
         .expect("node");
@@ -448,7 +461,7 @@ fn a_pinned_generation_keeps_its_rows_when_another_connection_prunes_it() {
             .busy_timeout(std::time::Duration::from_secs(5))
             .expect("busy timeout");
         other
-            .execute("DELETE FROM generation_nodes WHERE generation_id = 7", [])
+            .execute("DELETE FROM file_rows WHERE valid_from = 7", [])
             .expect("prune");
         other
             .execute("DELETE FROM generations WHERE id = 7", [])
@@ -490,14 +503,13 @@ fn a_pinned_generation_keeps_its_rows_when_another_connection_prunes_it() {
             [],
         )
         .expect("generation");
+        // Only the membership range was pruned; the payload's symbols are
+        // still there, and the range is what puts them in generation 7.
         conn.execute(
-            "INSERT INTO generation_nodes
-                 (generation_id, ordinal, file_id, name, qualified_name, kind,
-                  span_start, span_end, is_exported)
-                 VALUES (7, 0, 1, 'alpha', 'src/a.py::alpha', 'Function', 0, 1, 0)",
+            "INSERT INTO file_rows (file_id, payload_id, valid_from) VALUES (1, 1, 7)",
             [],
         )
-        .expect("node");
+        .expect("membership");
     }
     let pinned = {
         let conn = lock_conn(&store.conn).expect("connection");

@@ -799,6 +799,68 @@ impl Resolver {
         None
     }
 
+    /// The edge kind, and its detail, for a call site that resolved to
+    /// `target_symbol` in `target_file`.
+    ///
+    /// A call edge must name something that runs. In Go and Rust a composite
+    /// literal (`args{}`, `Error(..)`) or a conversion names a *type*, and the
+    /// extractor records it as a call site because it is written like one. The
+    /// ladder binds it correctly, but a `Calls` edge to a struct says "this
+    /// runs the struct", which a compiler never agrees with: measured against
+    /// `go/types` on this repository, 1,304 of 8,634 Go `Calls` pairs (15%) and
+    /// 53 Rust ones targeted a `Struct` and none was a call. The same site is
+    /// emitted as the existing `References` kind (detail `Constructor`, the
+    /// reference kind the extractor gives a composite literal), so the type
+    /// still has an inbound use for liveness, impact and neighbors; it is no
+    /// longer a callee.
+    ///
+    /// Only Go and Rust, and only for a target the index proves is a type
+    /// declaration. Other families keep `Calls`: a class call in Python or
+    /// Kotlin and a Swift initializer do run code. A target the index cannot
+    /// place stays a `Calls` edge.
+    pub(super) fn call_site_edge_kind(
+        &self,
+        family: LangFamily,
+        target_file: &str,
+        target_symbol: &str,
+    ) -> (EdgeKind, Option<String>) {
+        if matches!(family, LangFamily::Go | LangFamily::Rust)
+            && self.declares_only_a_type(target_file, target_symbol)
+        {
+            return (
+                EdgeKind::References,
+                Some(format!("{:?}", ReferenceKind::Constructor)),
+            );
+        }
+        (EdgeKind::Calls, None)
+    }
+
+    /// Whether every declaration of `symbol` in `file` is a type (struct,
+    /// enum, interface or trait). False when the index holds no such
+    /// declaration, so an unplaceable target is never reclassified.
+    fn declares_only_a_type(&self, file: &str, symbol: &str) -> bool {
+        let identity = self.qualified_for(file, symbol);
+        let tail = identity.rsplit("::").next().unwrap_or(&identity);
+        let bare = tail.rsplit('.').next().unwrap_or(tail);
+        let Some(hits) = self.symbol_index.get(bare) else {
+            return false;
+        };
+        let mut seen = false;
+        for (path, kind, _, declared) in hits {
+            if path != file || (declared.as_ref() != identity && declared.as_ref() != symbol) {
+                continue;
+            }
+            if !matches!(
+                kind,
+                SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Interface | SymbolKind::Trait
+            ) {
+                return false;
+            }
+            seen = true;
+        }
+        seen
+    }
+
     /// The kind `file` declares `name` as, when it declares it exactly once.
     ///
     /// `then_some` **evaluates its argument**, so `(len == 1).then_some(v[0])`

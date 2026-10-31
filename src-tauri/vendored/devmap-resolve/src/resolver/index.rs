@@ -22,6 +22,9 @@ impl Resolver {
         self.reexport_glob_cutoff = None;
         self.rust_module_globs.clear();
         self.default_exports.clear();
+        self.inert_values.clear();
+        self.star_export_files.clear();
+        self.java_records.clear();
         self.receiver_types.clear();
         self.scoped_receiver_types.clear();
         self.poisoned_receiver_keys.clear();
@@ -56,6 +59,7 @@ impl Resolver {
         self.go_package_methods.clear();
         self.go_package_member_vetoes.clear();
         self.go_package_dirs_unvouched.clear();
+        self.go_constrained_files.clear();
         self.go_model = GoModel::default();
         self.swift_module_by_file.clear();
         self.jvm_package_by_file.clear();
@@ -257,6 +261,23 @@ impl Resolver {
                 self.scope_locals
                     .insert((ext.file_path.clone(), scope.clone(), local.clone()));
             }
+            self.java_records.extend(
+                ext.symbols
+                    .iter()
+                    .filter(|symbol| {
+                        symbol.signature.as_deref()
+                            == Some(devmap_extract::model::JAVA_RECORD_SIGNATURE)
+                    })
+                    .map(|symbol| (ext.file_path.clone(), symbol.qualified_name.clone())),
+            );
+            if LangFamily::from_lang(&ext.language) == LangFamily::JsTs
+                && ext
+                    .exports
+                    .iter()
+                    .any(|export| export.exported_name == "*" && export.module_specifier.is_some())
+            {
+                self.star_export_files.insert(ext.file_path.clone());
+            }
             for (owner, target) in &ext.rust_deref_targets {
                 self.rust_deref_targets
                     .entry(owner.clone())
@@ -301,6 +322,9 @@ impl Resolver {
             if let Some(pkg) = ext.go_package.as_deref().filter(|pkg| !pkg.is_empty()) {
                 self.go_package_by_file
                     .insert(ext.file_path.clone(), pkg.to_string());
+                if ext.go_build_constrained {
+                    self.go_constrained_files.insert(ext.file_path.clone());
+                }
                 // X45. The package block, indexed. `parent_symbol` is the
                 // extractor's own answer for "what declares this", and a
                 // file-level parent is exactly what Go puts in the package
@@ -1494,6 +1518,7 @@ impl Resolver {
                 }
             }
             self.index_module_value_types(ext, family);
+            self.index_inert_values(ext, family);
             self.index_js_objects(ext);
             // A `let x = self.field` (including through `if` / `&`) takes the
             // field's type, so `x.run()` can dispatch. Field `Type` references
@@ -1911,6 +1936,27 @@ impl Resolver {
             else {
                 continue;
             };
+            // `export { local as Public }` and `exports.Public = local`: the
+            // module publishes `Public` and a binding of its own is what it
+            // names, so the hop stays in this file. Without it an importer of
+            // `Public` asked a file that declares no such name.
+            //
+            // Not for `default`: `export default function main` is `default`
+            // here with `main` the local, and a hop keyed `file::default` is a
+            // name an `export *` over this file would then republish, though
+            // `export *` never forwards `default`. The default export has its own
+            // table (`default_exports`) and needs no hop.
+            if local != export.exported_name
+                && export.exported_name != "default"
+                && self
+                    .file_symbols
+                    .get(&ext.file_path)
+                    .is_some_and(|symbols| symbols.iter().any(|symbol| symbol == local))
+            {
+                hops.entry(format!("{}::{}", ext.file_path, export.exported_name))
+                    .or_insert((ext.file_path.clone(), local.to_string()));
+                continue;
+            }
             for imp in &ext.imports {
                 let imported = if imp.imported_names.is_empty() {
                     // A default import: `import X from './m'`.

@@ -570,25 +570,20 @@ mod tests {
         )
         .expect("insert second hop");
         conn.execute(
-            "INSERT INTO generation_nodes
-               (generation_id, ordinal, file_id, name, qualified_name, kind,
+            "INSERT INTO payload_nodes
+               (payload_id, ord_in_file, name, qualified_name, kind,
                 span_start, span_end, is_exported)
-             VALUES (1, 2, 3, 'probe_island', 'probe_island', 'Function', 0, 20, 1)",
+             VALUES (3, 0, 'probe_island', 'probe_island', 'Function', 0, 20, 1)",
             [],
         )
         .expect("insert island node");
-        let fts_rowid = (1i64 << 32) | 2;
+        let fts_rowid = 3i64 << 24;
         conn.execute(
             "INSERT INTO nodes_fts (rowid, name, qualified_name, path)
              VALUES (?1, 'probe_island', 'probe_island', 'src/island.rs')",
             [fts_rowid],
         )
         .expect("insert island fts row");
-        conn.execute(
-            "INSERT INTO nodes_fts_map (rowid_ref, generation_id) VALUES (?1, 1)",
-            [fts_rowid],
-        )
-        .expect("insert island fts map row");
         conn.close().expect("close fixture db");
         (dir, root)
     }

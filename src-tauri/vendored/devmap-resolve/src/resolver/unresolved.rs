@@ -195,6 +195,110 @@ impl Resolver {
         })
     }
 
+    /// Whether any Java, Kotlin, Scala or Groovy file of the corpus declares a
+    /// symbol of this name, of any kind.
+    pub(super) fn jvm_source_declares(&self, name: &str) -> bool {
+        self.symbol_index.get(name).is_some_and(|hits| {
+            hits.iter().any(|(file, _, _, _)| {
+                matches!(
+                    file.rsplit_once('.').map(|(_, extension)| extension),
+                    Some("java" | "kt" | "kts" | "scala" | "groovy")
+                )
+            })
+        })
+    }
+
+    /// Why a JS/TS import that found nothing found nothing, when the module it
+    /// names withholds the name: a default over an `export *` barrel, which
+    /// never forwards `default`, or a CommonJS export the file does not prove.
+    ///
+    /// `default_import` says the callee is bound by `import X from '…'`.
+    ///
+    /// The import is looked up the way the call ladder looked it up: a bare
+    /// callee through its own binding, a one-segment receiver (`t.name()`,
+    /// `t` from `require`) through the receiver's.
+    pub(super) fn abstention_reason(
+        &self,
+        family: LangFamily,
+        file: &str,
+        scope: Option<&str>,
+        receiver: Option<&str>,
+        callee: &str,
+        default_import: bool,
+    ) -> Option<String> {
+        if family != LangFamily::JsTs {
+            return None;
+        }
+        let (target, name) = match receiver {
+            None => {
+                let (target, imported) = self.import_binding_at(family, file, scope, callee)?;
+                (target.clone(), imported.clone())
+            }
+            Some(receiver) if !receiver.is_empty() && !receiver.contains(['.', '(', '[']) => {
+                let (target, _) = self.import_binding_at(family, file, scope, receiver)?;
+                (target.clone(), callee.to_string())
+            }
+            Some(_) => return None,
+        };
+        // A whole-module handle called as a function is the module's default,
+        // and so is the name a default import binds (the binding table keeps the
+        // importer's own spelling for it).
+        let name = if name == "*" || (default_import && receiver.is_none()) {
+            "default"
+        } else {
+            name.as_str()
+        };
+        if self.scope_locals.contains(&(
+            target.clone(),
+            target.clone(),
+            format!("{}{name}", devmap_extract::model::CJS_WITHHELD_PREFIX),
+        )) {
+            return Some(
+                "commonjs export withheld: assigned more than once, or `module.exports` is reassigned in the file"
+                    .to_string(),
+            );
+        }
+        (name == "default"
+            && self.star_export_files.contains(&target)
+            && !self.default_exports.contains_key(&target))
+        .then(|| "default is not re-exported by `export *`".to_string())
+    }
+
+    /// Whether a bare type name in `file_path` is a `java.lang` type, as far as
+    /// the index can prove: a Java file, a `java.lang` spelling, no JVM-language
+    /// declaration of it, and **no type-parameter list anywhere in the file**.
+    ///
+    /// The extractor does not record which names a class's type-parameter list
+    /// declares, so `class Box<Record> { Record held; }` cannot be told from the
+    /// JDK's `Record`. Failing closed means a file that declares any list does
+    /// not claim `java.lang` for any name; the miss keeps the class the name
+    /// would have without this rung.
+    pub(super) fn claims_java_lang(&self, file_path: &str, name: &str) -> bool {
+        file_path.ends_with(".java")
+            && crate::builtins::is_java_lang_type(name)
+            && !self.jvm_source_declares(name)
+            && !self.file_declares_type_parameters(file_path)
+    }
+
+    /// Whether the extractor saw a Java type-parameter list in `file_path`.
+    pub(super) fn file_declares_type_parameters(&self, file_path: &str) -> bool {
+        self.scope_locals.contains(&(
+            file_path.to_string(),
+            file_path.to_string(),
+            devmap_extract::model::FILE_DECLARES_TYPE_PARAMETERS.to_string(),
+        ))
+    }
+
+    /// Whether an unresolved Java type reference to `name` stayed unexplained
+    /// only because its file declares a type-parameter list: the name is a
+    /// `java.lang` spelling that [`Self::claims_java_lang`] refused.
+    pub(super) fn is_possibly_a_type_parameter(&self, file_path: &str, name: &str) -> bool {
+        file_path.ends_with(".java")
+            && crate::builtins::is_java_lang_type(name)
+            && !self.jvm_source_declares(name)
+            && self.file_declares_type_parameters(file_path)
+    }
+
     /// Why a call that failed the resolution ladder has no edge (SC18).
     ///
     /// Ordered by strength of evidence, and **fail-open toward `Unresolved`**:
@@ -319,6 +423,18 @@ impl Resolver {
                     && !self.family_declares(family, callee_name)
                 {
                     return UnresolvedClass::Builtin;
+                }
+                // J-T1, the last route of a Java type name: declaration, same
+                // package and imports have all failed, so `java.lang` is what is
+                // left. `CStyle` is C, C++ and C# too, so it is the Java *file*
+                // that gates the table, and a JVM-language declaration of the
+                // name anywhere in the corpus keeps the miss unexplained: it may
+                // be a bind failure, not the JDK's type. A namesake in another
+                // language (Go's `String()` method) is no evidence either way.
+                if self.claims_java_lang(file_path, callee_name) {
+                    return UnresolvedClass::External {
+                        module: format!("java.lang.{callee_name}"),
+                    };
                 }
             }
             // Written imports outrank the language/prelude table. In

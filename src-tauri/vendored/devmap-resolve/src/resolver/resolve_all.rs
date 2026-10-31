@@ -8,13 +8,46 @@ impl Resolver {
         self.resolve_all_with_limits(extractions, ResolutionLimits::default())
     }
 
+    /// Resolve every file under `limits`.
+    ///
+    /// A budget that is exceeded does not abort the build under
+    /// [`LimitPolicy::Degrade`] (the default). The first pass runs in parallel
+    /// and treats a budget as an error, which costs nothing on every tree that
+    /// stays inside its budgets; if one trips, the whole resolution runs again
+    /// on a single thread, with the budgets degrading the offending candidate
+    /// sets instead — one thread because *which* sets a shared budget cuts is
+    /// decided by the order they are charged in, and a degraded graph must be
+    /// the same graph on every run. Under [`LimitPolicy::Refuse`] the first
+    /// pass's error is returned as it always was.
     pub fn resolve_all_with_limits(
         &self,
         extractions: &[Extraction],
         limits: ResolutionLimits,
     ) -> Result<ResolutionResult, ResolutionLimitError> {
-        let global_candidates = Mutex::new(GlobalCandidateCache::default());
-        let ambiguity_bytes = AtomicU64::new(0);
+        match self.resolve_pass(extractions, limits, false) {
+            Err(refusal) if limits.on_exceed == LimitPolicy::Degrade => {
+                // A pool that cannot be built cannot give the deterministic
+                // order, so the budget's own refusal stands rather than a
+                // degraded graph that depends on scheduling.
+                let Ok(serial) = rayon::ThreadPoolBuilder::new().num_threads(1).build() else {
+                    return Err(refusal);
+                };
+                serial.install(|| self.resolve_pass(extractions, limits, true))
+            }
+            outcome => outcome,
+        }
+    }
+
+    fn resolve_pass(
+        &self,
+        extractions: &[Extraction],
+        limits: ResolutionLimits,
+        degrade: bool,
+    ) -> Result<ResolutionResult, ResolutionLimitError> {
+        let global_candidates = Mutex::new(GlobalCandidateCache {
+            degrade,
+            ..Default::default()
+        });
         // Per-file resolution runs in parallel.
         //
         // Sound because the loop body below reads only `self` — the symbol and
@@ -851,6 +884,19 @@ impl Resolver {
                             read_scope(call.caller_symbol.as_deref(), &call.span).as_deref(),
                             &call.callee_name,
                         ) {
+                            // A whole-module handle called as a function is the
+                            // module's own value, which is what its default
+                            // export names: `const run = require('./util');
+                            // run()` against `module.exports = main`. A
+                            // namespace object is not callable, so the call can
+                            // only mean that value.
+                            let target_sym = if target_sym == "*" && family == LangFamily::JsTs {
+                                self.default_exports
+                                    .get(target_f)
+                                    .unwrap_or(target_sym)
+                            } else {
+                                target_sym
+                            };
                             if let Some((resolved_file, resolved_sym)) =
                                 self.lookup_in_package(target_f, target_sym)
                             {
@@ -861,7 +907,24 @@ impl Resolver {
                                 }));
                             } else {
                                 resolution = Some(Arc::new(Resolution::Unresolved {
-                                    reason: "the named import has no unambiguous declaration in its module".to_string(),
+                                    reason: self
+                                        .abstention_reason(
+                                            family,
+                                            &ext.file_path,
+                                            read_scope(call.caller_symbol.as_deref(), &call.span)
+                                                .as_deref(),
+                                            None,
+                                            &call.callee_name,
+                                            ext.imports.iter().any(|imp| {
+                                                imp.imported_names.is_empty()
+                                                    && imp.alias.as_deref()
+                                                        == Some(call.callee_name.as_str())
+                                            }),
+                                        )
+                                        .unwrap_or_else(|| {
+                                            "the named import has no unambiguous declaration in its module"
+                                                .to_string()
+                                        }),
                                 }));
                             }
                         }
@@ -953,7 +1016,7 @@ impl Resolver {
                         if !recv.is_empty() && !method.is_empty()
                             && ext.local_binding_at(call.span.start_byte, &recv).is_none() {
                             {
-                                if let Some((target_f, _)) = self.import_binding_at(
+                                if let Some((target_f, imported)) = self.import_binding_at(
                                     family,
                                     &ext.file_path,
                                     read_scope(call.caller_symbol.as_deref(), &call.span).as_deref(),
@@ -965,9 +1028,57 @@ impl Resolver {
                                     // an arbitrary value's method that shares
                                     // a name with a free function beside it.
                                     if self.module_member_admitted(&ext.file_path, &recv, &method) {
-                                        if let Some((resolved_file, resolved_sym)) =
-                                            self.lookup_in_package(target_f, &method)
-                                        {
+                                        // Go: the imported package declares the
+                                        // name once per build variant. Asked
+                                        // first, because `lookup_in_package`
+                                        // abstains on the pair, or binds the one
+                                        // that happens to sit in `target_f`.
+                                        if family == LangFamily::Go {
+                                            resolution = self.go_build_variants(
+                                                &Self::parent_dir(target_f),
+                                                self.go_package_by_file.get(target_f),
+                                                &method,
+                                                false,
+                                            );
+                                        }
+                                        // A module handle's member may be one the module
+                                        // only re-exports; a type's may not (an enum's
+                                        // variant `Query` is not the `Query` struct a
+                                        // re-export beside the enum happens to publish).
+                                        // The import names the type, wherever the path
+                                        // to it ran through.
+                                        // Go keeps the declared-here lookup it had (the
+                                        // variant set above, then its own package
+                                        // siblings): a Go package has no re-exports, so
+                                        // the chain fallback has nothing to add and a
+                                        // chain entry must never outrank a sibling file.
+                                        //
+                                        // Rust takes the split: `pub use` publishes module
+                                        // members as a JS barrel does. A Rust module-handle
+                                        // member (`m::run()` after `use crate::m;`) now
+                                        // reaches `lookup_module_member`: `lookup_in_package`
+                                        // first (a declaration in `m` wins), then, on a miss,
+                                        // the re-export chain `m` states for the name
+                                        // (`reexport_chains`, which follows an explicit
+                                        // `pub use a::run;` and a `pub use a::*;` the corpus
+                                        // expansion resolved to one terminal; an ambiguous
+                                        // glob yields no chain). Residual risk: an explicit
+                                        // `pub use` whose terminal is a namesake of the item
+                                        // the caller's own `use` tree denotes (`m` re-exports
+                                        // `a::run` while the caller meant `b::run`). Watched
+                                        // by the corpus-diff bucket "Rust ImportScoped
+                                        // module-handle Calls edges new vs dbd0193a".
+                                        let member = resolution.is_none().then(|| {
+                                            if family == LangFamily::Go
+                                                || self.imports_a_type(&ext.file_path, &recv)
+                                                || self.declares_type_at(None, imported)
+                                            {
+                                                self.lookup_in_package(target_f, &method)
+                                            } else {
+                                                self.lookup_module_member(target_f, &method)
+                                            }
+                                        }).flatten();
+                                        if let Some((resolved_file, resolved_sym)) = member {
                                             resolution = Some(Arc::new(Resolution::ImportScoped {
                                                 target_symbol: resolved_sym,
                                                 target_file: resolved_file,
@@ -1410,6 +1521,14 @@ impl Resolver {
                                 target_file,
                                 package_name,
                             }));
+                        } else if let Some(variants) = self.go_build_variants(
+                            &Self::parent_dir(&ext.file_path),
+                            self.go_package_by_file.get(&ext.file_path),
+                            &call.callee_name,
+                            ext.file_path.ends_with("_test.go"),
+                        ) {
+                            // The name is declared once per build variant.
+                            resolution = Some(variants);
                         }
                     }
                     // 2f. An unexported Go selector on a receiver no rung above
@@ -1582,7 +1701,16 @@ impl Resolver {
                                 candidates
                             }
                         };
-                        if candidates.declarations == 1 {
+                        if let Some(cap) = candidates.cap.as_ref().filter(|cap| !cap.looked_up) {
+                            // The lookup itself was skipped: no claim either
+                            // way, and the row says why.
+                            resolution = Some(Arc::new(Resolution::CappedGlobal {
+                                candidates: Arc::clone(&candidates.rows),
+                                total: None,
+                                limit: Arc::clone(&cap.limit),
+                                family,
+                            }));
+                        } else if candidates.declarations == 1 {
                             let (target_f, target_identity) = &candidates.rows[0];
                             // A Swift type nested in another type is named
                             // bare only from inside that type; from anywhere
@@ -1600,8 +1728,17 @@ impl Resolver {
                                 }));
                             }
                         } else if candidates.declarations > 1 {
-                            charge_ambiguity(&ambiguity_bytes, &candidates, limits.ambiguity_evidence_bytes)?;
-                            resolution = Some(Arc::new(Resolution::AmbiguousGlobal { candidates: Arc::clone(&candidates.rows), family }));
+                            resolution = Some(Arc::new(match &candidates.cap {
+                                None => Resolution::AmbiguousGlobal { candidates: Arc::clone(&candidates.rows), family },
+                                // The list was cut by a budget: say so on the
+                                // row, with the true count.
+                                Some(cap) => Resolution::CappedGlobal {
+                                    candidates: Arc::clone(&candidates.rows),
+                                    total: Some(cap.distinct_total),
+                                    limit: Arc::clone(&cap.limit),
+                                    family,
+                                },
+                            }));
                         }
                     }
 
@@ -1630,7 +1767,7 @@ impl Resolver {
                     let mut emitted = false;
                     if let Some(resolution) = &resolution {
                         match resolution.as_ref() {
-                            Resolution::AmbiguousGlobal { .. } => {
+                            Resolution::AmbiguousGlobal { .. } | Resolution::CappedGlobal { .. } => {
                                 // S2. A bare name with several in-repo namesakes
                                 // and no other evidence is **not** a call to any
                                 // of them: measured 0/8 (TS), 1/26 (Swift), 4/12
@@ -1692,14 +1829,18 @@ impl Resolver {
                             }
                             named => {
                                 if let Some((target_file, target_symbol)) = named.target() {
+                                    // A composite literal or conversion names a
+                                    // type, which nothing runs: a use, not a call.
+                                    let (edge_kind, details) =
+                                        self.call_site_edge_kind(family, target_file, target_symbol);
                                     edges.push(ResolvedEdge::resolved(
                                         ext.file_path.clone(),
                                         target_file.to_string(),
                                         caller_sym.clone(),
                                         self.qualified_for(target_file, target_symbol),
-                                        EdgeKind::Calls,
+                                        edge_kind,
                                         Arc::clone(resolution),
-                                        None,
+                                        details,
                                     ));
                                     emitted = true;
                                 }
@@ -1744,10 +1885,24 @@ impl Resolver {
                             resolution: match resolution {
                                 Some(r) => (*r).clone(),
                                 None => Resolution::Unresolved {
-                                    reason: format!(
-                                        "no resolution ladder rung matched {:?} in {} family {:?}",
-                                        call.callee_name, ext.file_path, family
-                                    ),
+                                    // A JS/TS import that names something the module
+                                    // withholds says so, instead of the bare ladder text.
+                                    reason: self
+                                        .abstention_reason(
+                                            family,
+                                            &ext.file_path,
+                                            read_scope(call.caller_symbol.as_deref(), &call.span)
+                                                .as_deref(),
+                                            call.receiver_expr.as_deref(),
+                                            &call.callee_name,
+                                            false,
+                                        )
+                                        .unwrap_or_else(|| {
+                                            format!(
+                                                "no resolution ladder rung matched {:?} in {} family {:?}",
+                                                call.callee_name, ext.file_path, family
+                                            )
+                                        }),
                                 },
                             },
                             class,
@@ -1905,6 +2060,14 @@ impl Resolver {
                         &source_symbol,
                         position,
                     );
+                    // A `java.lang` spelling this file may bind as a type
+                    // parameter is left unexplained, and says so.
+                    let type_parameter_doubt = matches!(class, UnresolvedClass::Unresolved)
+                        && matches!(
+                            reference.kind,
+                            ReferenceKind::Type | ReferenceKind::TypeQualifier
+                        )
+                        && self.is_possibly_a_type_parameter(&ext.file_path, name);
                     unresolved.push(UnresolvedReference {
                         source_file: ext.file_path.clone(),
                         source_symbol,
@@ -1912,8 +2075,16 @@ impl Resolver {
                         kind: UnresolvedKind::Reference,
                         resolution: Resolution::Unresolved {
                             reason: format!(
-                                "no resolution rung matched {:?} reference {:?} in {} family {:?}",
-                                reference.kind, name, ext.file_path, family
+                                "no resolution rung matched {:?} reference {:?} in {} family {:?}{}",
+                                reference.kind,
+                                name,
+                                ext.file_path,
+                                family,
+                                if type_parameter_doubt {
+                                    ": possibly a type parameter"
+                                } else {
+                                    ""
+                                }
                             ),
                         },
                         class,
@@ -2111,6 +2282,20 @@ impl Resolver {
                     }),
                     Some(reason.to_string()),
                 ));
+            }
+        }
+
+        // A call written at a value nothing can run is not a call of it: a
+        // template's `maxlength={MAX_QUERY_LENGTH}` and a `LIMIT()` both *use*
+        // the constant, so the edge stays, as the reference it is, and the
+        // constant keeps its users.
+        if !self.inert_values.is_empty() {
+            for edge in edges.iter_mut() {
+                if edge.edge_kind == EdgeKind::Calls
+                    && self.inert_values.contains(edge.target_symbol.as_str())
+                {
+                    edge.edge_kind = EdgeKind::References;
+                }
             }
         }
 

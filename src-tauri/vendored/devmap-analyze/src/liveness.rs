@@ -3065,7 +3065,8 @@ fn ambiguous_ledger_rows(
             return None;
         }
         match &row.resolution {
-            Resolution::AmbiguousGlobal { candidates, .. } => Some((row, &candidates[..])),
+            Resolution::AmbiguousGlobal { candidates, .. }
+            | Resolution::CappedGlobal { candidates, .. } => Some((row, &candidates[..])),
             _ => None,
         }
     })
@@ -4302,6 +4303,62 @@ mod tests {
                  spelling `{target}`, got {report:?}"
             );
         }
+    }
+
+    fn ledger_row(resolution: devmap_resolve::model::Resolution) -> UnresolvedReference {
+        UnresolvedReference {
+            source_file: "g.py".to_string(),
+            source_symbol: "g.py::caller".to_string(),
+            callee_name: "helper".to_string(),
+            kind: UnresolvedKind::Call,
+            resolution,
+            class: devmap_resolve::model::UnresolvedClass::Unresolved,
+            receiver: None,
+            site: None,
+        }
+    }
+
+    fn reports_with_ledger(ext: Extraction, row: UnresolvedReference) -> Vec<DeadSymbolReport> {
+        let resolution = ResolutionResult {
+            edges: Vec::new(),
+            receiver_types: std::collections::BTreeMap::new(),
+            reexport_chains: std::collections::BTreeMap::new(),
+            unresolved: vec![row],
+        };
+        analyze_liveness(std::slice::from_ref(&ext), &resolution)
+    }
+
+    /// A candidate list a resolution budget cut short must not manufacture a
+    /// confident dead-code finding.
+    ///
+    /// `f.py::helper` is one of the name's candidates but fell outside the
+    /// retained prefix, so no candidate list names it. What keeps it off the
+    /// confident tier is the name-level join over the ledger (`unresolved
+    /// namesake`), which a capped row — class `Unresolved`, callee `helper` —
+    /// takes part in exactly as a complete ambiguous row does. Pinned here so a
+    /// future change that narrows the join to listed candidates fails.
+    #[test]
+    fn a_capped_candidate_list_never_leaves_an_unlisted_candidate_confidently_dead() {
+        use devmap_resolve::model::{LangFamily, Resolution};
+        let prefix: std::sync::Arc<[(String, String)]> =
+            vec![("other.py".to_string(), "other.py::helper".to_string())].into();
+        let capped = reports_with_ledger(
+            extraction(vec![symbol("helper", 0, 10)], None),
+            ledger_row(Resolution::CappedGlobal {
+                candidates: prefix,
+                total: Some(40),
+                limit: "ambiguity evidence bytes".into(),
+                family: LangFamily::Python,
+            }),
+        );
+        let report = capped
+            .iter()
+            .find(|r| r.symbol_name.contains("helper"))
+            .expect("helper is reported");
+        assert!(
+            report.confidence <= 0.4,
+            "a capped list must not leave an unlisted candidate confidently dead: {report:?}"
+        );
     }
 
     fn reports(ext: Extraction) -> Vec<DeadSymbolReport> {

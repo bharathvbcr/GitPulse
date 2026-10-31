@@ -167,6 +167,56 @@ export type { BulkRunReport, WorkspaceWip };
 export type { RepoFacts };
 export type { InvokeFn };
 
+export interface FileStatusFacetPayload {
+  statuses: FileStatus[];
+  statusPollFailures: number;
+  statusUnavailableSince: number | null;
+}
+
+export interface BranchGraphFacetPayload {
+  branches: BranchInfo[];
+  currentBranch: string | null;
+  defaultBranch: string | null;
+}
+
+export interface MetadataFacetPayload {
+  tags: TagInfo[];
+  tagsTruncated: boolean;
+  tagsFailed: boolean;
+  operation: OperationState;
+  stashEntries: StashEntry[];
+  stashFailed: boolean;
+  stashTruncated: boolean;
+  fetchedAt: number | null;
+}
+
+export type HydrationFacet = "status" | "branches" | "metadata" | "all";
+
+export function facetForChange(change?: RepoChange | null): HydrationFacet {
+  if (!change || !change.kinds || change.kinds.length === 0) return "all";
+  const kinds = change.kinds;
+  const hasStatus = kinds.some(
+    (k) => k === "worktree" || k === "index" || k === "documents" || k === "ignore",
+  );
+  const hasBranches = kinds.some(
+    (k) => k === "refs" || k === "git_state" || k === "objects",
+  );
+  const hasMeta = kinds.some((k) => k === "config");
+
+  if (hasStatus && !hasBranches && !hasMeta) return "status";
+  if (hasBranches && !hasStatus && !hasMeta) return "branches";
+  if (hasMeta && !hasStatus && !hasBranches) return "metadata";
+  return "all";
+}
+
+export function mergeFacets(
+  existing: HydrationFacet | undefined,
+  incoming: HydrationFacet,
+): HydrationFacet {
+  if (!existing || existing === incoming) return incoming;
+  if (existing === "all" || incoming === "all") return "all";
+  return "all";
+}
 
 const MENU_RECENT_CAP = 12;
 /** Trailing debounce for localStorage writes and the native-menu rebuild. */
@@ -976,37 +1026,35 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     publish();
   });
 
-  async function loadSnapshot(path: string): Promise<{
-    branches: BranchInfo[];
-    statuses: FileStatus[];
-    tags: TagInfo[];
-    currentBranch: string | null;
-    defaultBranch: string | null;
-    operation: OperationState;
-    stashEntries: StashEntry[];
-    stashFailed: boolean;
-    stashTruncated: boolean;
-    tagsTruncated: boolean;
-    tagsFailed: boolean;
-    fetchedAt: number | null;
-  }> {
-    const [branches, statuses, tags, operation, stash, fetchedAt] = await Promise.all([
-      invokeFn<BranchInfo[]>("cmd_list_branches", { repoPath: path }),
-      invokeFn<FileStatus[]>("cmd_get_status", { repoPath: path }),
+  async function loadFileStatusFacet(path: string): Promise<FileStatusFacetPayload> {
+    const statuses = await invokeFn<FileStatus[]>("cmd_get_status", { repoPath: path });
+    return {
+      statuses,
+      statusPollFailures: 0,
+      statusUnavailableSince: null,
+    };
+  }
+
+  async function loadBranchGraphFacet(path: string): Promise<BranchGraphFacetPayload> {
+    const branches = await invokeFn<BranchInfo[]>("cmd_list_branches", { repoPath: path });
+    const currentBranch = branches.find((b) => b.is_current)?.name || null;
+    const defaultBranch =
+      branches.find((b) => b.is_default)?.name || currentBranch || "main";
+    return {
+      branches,
+      currentBranch,
+      defaultBranch,
+    };
+  }
+
+  async function loadMetadataFacet(path: string): Promise<MetadataFacetPayload> {
+    const [tags, operation, stash, fetchedAt] = await Promise.all([
       invokeFn<unknown>("cmd_list_tags", { repoPath: path })
         .then((raw) => parseTagList(raw))
         .catch(() => ({ tags: [] as TagInfo[], truncated: false, failed: true })),
-      // A failed probe is recorded as a failure, never folded into "idle".
-      // Reporting "no operation in progress" because the check itself broke
-      // is what strands a user mid-merge in a UI insisting all is well. It
-      // does not fail the snapshot, though: branches and statuses are still
-      // worth rendering, and the marker says the state is unknown.
       invokeFn<RepoOperation | null>("cmd_repo_operation", { repoPath: path })
         .then((value) => ({ operation: value ?? null, probeFailed: false }))
         .catch(() => ({ operation: null, probeFailed: true })),
-      // Same fail-soft-but-honest treatment as the operation probe: an empty
-      // stash list and an unreadable one must not render the same, because a
-      // forgotten stash is work that exists nowhere else.
       invokeFn<unknown>("cmd_stash_list", { repoPath: path })
         .then((raw) => ({ ...parseStashList(raw), failed: false }))
         .catch(() => ({ entries: [] as StashEntry[], failed: true, truncated: false })),
@@ -1014,22 +1062,30 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         .then((value) => (typeof value === "number" ? value : null))
         .catch(() => null),
     ]);
-    const currentBranch = branches.find((b) => b.is_current)?.name || null;
-    const defaultBranch =
-      branches.find((b) => b.is_default)?.name || currentBranch || "main";
     return {
-      branches,
-      statuses,
       tags: tags.tags,
-      currentBranch,
-      defaultBranch,
+      tagsTruncated: tags.truncated,
+      tagsFailed: tags.failed,
       operation,
       stashEntries: stash.entries,
       stashFailed: stash.failed,
       stashTruncated: stash.truncated,
-      tagsTruncated: tags.truncated,
-      tagsFailed: tags.failed,
       fetchedAt,
+    };
+  }
+
+  async function loadSnapshot(
+    path: string,
+  ): Promise<FileStatusFacetPayload & BranchGraphFacetPayload & MetadataFacetPayload> {
+    const [fileStatus, branchGraph, metadata] = await Promise.all([
+      loadFileStatusFacet(path),
+      loadBranchGraphFacet(path),
+      loadMetadataFacet(path),
+    ]);
+    return {
+      ...fileStatus,
+      ...branchGraph,
+      ...metadata,
     };
   }
 
@@ -1218,23 +1274,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
    * the same identity the stats drain merges under — and otherwise takes the
    * snapshot's (tip moved ⇒ stale churn must not survive).
    */
-  function withCarriedChurn(
+  function withCarriedChurn<T extends { branches: BranchInfo[] }>(
     live: RepoSession,
-    snapshot: {
-      branches: BranchInfo[];
-      statuses: FileStatus[];
-      tags: TagInfo[];
-      currentBranch: string | null;
-      defaultBranch: string | null;
-      operation: OperationState;
-      stashEntries: StashEntry[];
-      stashFailed: boolean;
-      stashTruncated: boolean;
-      tagsTruncated: boolean;
-      tagsFailed: boolean;
-      fetchedAt: number | null;
-    },
-  ) {
+    snapshot: T,
+  ): T {
     if (live.branches.length === 0) return snapshot;
     const key = (b: Pick<BranchInfo, "name" | "is_remote" | "remote_name">) =>
       `${b.is_remote ? "remote" : "local"}:${b.remote_name ?? ""}:${b.name}`;
@@ -1333,8 +1376,15 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
    * watcher event, a poll, an activation, a mutation's refresh — comes through
    * here, so the cost of a burst of them is one snapshot plus one more.
    */
-  function hydrate(id: string, path: string, generation: number): Promise<void> {
-    return sessionBook.hydrates.run(id, generation, () => hydrateNow(id, path, generation));
+  function hydrate(
+    id: string,
+    path: string,
+    generation: number,
+    facet: HydrationFacet = "all",
+  ): Promise<void> {
+    return sessionBook.hydrates.run(id, generation, () =>
+      hydrateFacet(id, path, generation, facet),
+    );
   }
 
   /**
@@ -1360,52 +1410,75 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     );
   }
 
-  async function hydrateNow(id: string, path: string, generation: number) {
+  async function hydrateFacet(
+    id: string,
+    path: string,
+    generation: number,
+    facet: HydrationFacet = "all",
+  ): Promise<void> {
     // A trailing run starts after the tab may have been closed.
     if (!internal.sessions[id]) return;
     const run = (snapshotRuns.get(id) ?? 0) + 1;
     snapshotRuns.set(id, run);
     // Synchronous unless there is something to learn: an extra yield on every
     // hydrate would reorder the snapshot fetches the run token arbitrates.
-    if (familyUnknown.has(id)) {
+    if (familyUnknown.has(id) && (facet === "all" || facet === "branches")) {
       await learnFamily(id, path, generation);
       if (snapshotRuns.get(id) !== run) return;
     }
     try {
-      const raw = await loadSnapshot(path);
-      if (snapshotRuns.get(id) !== run) return;
-      const live = internal.sessions[id];
-      const snapshot = live ? withCarriedChurn(live, raw) : raw;
+      let patch: Partial<RepoSession> = {};
+      if (facet === "status") {
+        const statusData = await loadFileStatusFacet(path);
+        if (snapshotRuns.get(id) !== run) return;
+        patch = statusData;
+      } else if (facet === "branches") {
+        const branchData = await loadBranchGraphFacet(path);
+        if (snapshotRuns.get(id) !== run) return;
+        const live = internal.sessions[id];
+        patch = live ? withCarriedChurn(live, branchData) : branchData;
+      } else if (facet === "metadata") {
+        const metaData = await loadMetadataFacet(path);
+        if (snapshotRuns.get(id) !== run) return;
+        patch = metaData;
+      } else {
+        const raw = await loadSnapshot(path);
+        if (snapshotRuns.get(id) !== run) return;
+        const live = internal.sessions[id];
+        patch = live ? withCarriedChurn(live, raw) : raw;
+      }
+
       applyToSession(id, generation, {
-        ...snapshot,
+        ...patch,
         isLoading: false,
         error: null,
         trustRequired: false,
         missing: false,
         hasHydrated: true,
-        // The snapshot read the statuses, so the poll's failures are over.
-        statusPollFailures: 0,
-        statusUnavailableSince: null,
+        ...(facet === "status" || facet === "all"
+          ? { statusPollFailures: 0, statusUnavailableSince: null }
+          : {}),
       });
-      // Stats re-drain even when the snapshot was a no-op: a previously
-      // failed drain must retry on the next refresh, and the backend
-      // memoizes per-tip so an unchanged repo costs one cheap call.
-      if (internal.sessions[id]?.generation === generation) {
-        sessionBook.hydratedAt.set(id, Date.now());
-        contentRevisions.update((revisions) => ({
-          ...Object.fromEntries(Object.values(internal.sessions)
-            .filter((session) => revisions[session.path] !== undefined)
-            .map((session) => [session.path, revisions[session.path]])),
-          [path]: `${generation}:${run}`,
-        }));
-        void fetchBranchStats(id, path, generation);
+
+      if (facet === "all" || facet === "branches") {
+        if (internal.sessions[id]?.generation === generation) {
+          if (facet === "all") {
+            sessionBook.hydratedAt.set(id, Date.now());
+            contentRevisions.update((revisions) => ({
+              ...Object.fromEntries(
+                Object.values(internal.sessions)
+                  .filter((session) => revisions[session.path] !== undefined)
+                  .map((session) => [session.path, revisions[session.path]]),
+              ),
+              [path]: `${generation}:${run}`,
+            }));
+          }
+          void fetchBranchStats(id, path, generation);
+        }
       }
     } catch (err: unknown) {
       if (snapshotRuns.get(id) !== run) return;
       const message = formatError(err);
-      // A deferral reaching here has already been retried through the whole
-      // backoff by src/lib/ipc/invoke.ts. The snapshot already rendered stays;
-      // the toast and diagnostics show the deferral as a warning, not an error.
       applyToSession(id, generation, {
         isLoading: false,
         error: message,
@@ -1619,6 +1692,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   // shown window at once, background tabs on a bounded schedule, nothing while
   // hidden. See watcherRefresh.ts for why the cost had to stop scaling with
   // the number of busy tabs.
+  const pendingFacets = new Map<string, HydrationFacet>();
   const watcherRefreshPolicy = createWatcherRefreshPolicy({
     now: () => Date.now(),
     setTimer: (run, delayMs) => setTimeout(run, delayMs),
@@ -1628,7 +1702,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       return !!active && sameRepo(active.path, path, options);
     },
     isHidden: readHiddenDocument,
-    refresh: (path) => store.refresh(path),
+    refresh: (path) => {
+      const facet = pendingFacets.get(path) ?? "all";
+      pendingFacets.delete(path);
+      return store.refresh(path, facet);
+    },
   });
   let unbindRefreshVisibility: (() => void) | null = null;
   function bindRefreshVisibility(): void {
@@ -2447,7 +2525,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       publish();
       flushPersist();
     },
-    refresh: async (repoPath?: string) => {
+    refresh: async (repoPath?: string, facet: HydrationFacet = "all") => {
       const session = repoPath
         ? Object.values(internal.sessions).find((item) =>
             sameRepo(item.path, repoPath, options),
@@ -2460,22 +2538,35 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       applyToSession(session.id, generation, {
         isLoading: !session.hasHydrated,
       });
-      await hydrate(session.id, session.path, generation);
+      await hydrate(session.id, session.path, generation, facet);
       const latest = internal.sessions[session.id];
-      if (latest && internal.workspace.activeId === session.id) {
+      if (
+        latest &&
+        internal.workspace.activeId === session.id &&
+        (facet === "all" || facet === "branches")
+      ) {
         // Reload with the visible filter context: the store normalizes the
         // query and the backend applies every term, so the cached payload
         // always answers exactly the query the scheduler keys on.
         void graph.loadGraph(latest.path, latest.searchQuery, latest.selectedBranch);
       }
     },
+    hydrateFacet: async (repoPath?: string, facet: HydrationFacet = "all") => {
+      return store.refresh(repoPath, facet);
+    },
+    loadFileStatusFacet,
+    loadBranchGraphFacet,
+    loadMetadataFacet,
     /** Subscribes to worktree changes the status poll observed (the watcher
      *  misses nested edits). Returns the unsubscribe. */
     onPolledChange: (listener: (path: string, change: RepoChange) => void): (() => void) => {
       polledChangeListeners.add(listener);
       return () => void polledChangeListeners.delete(listener);
     },
-    handleRepoChanged: async (changedPath?: string | null) => {
+    handleRepoChanged: async (
+      changedPath?: string | null,
+      change?: RepoChange | null,
+    ) => {
       // The one entry for "the repository changed under us": a read already
       // running began before this change, so no refresh asked for from here
       // may join it (ipc/invoke.ts). Before every early return below, because
@@ -2487,7 +2578,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // storm becomes one refresh; explicit refresh() calls stay undelayed.
       if (!changedPath) {
         if (activeSession()?.trustRequired) return;
-        scheduleWatcherRefresh("", () => void store.refresh());
+        scheduleWatcherRefresh("", () => void store.refresh(undefined, "all"));
         return;
       }
       const session = Object.values(internal.sessions).find((item) =>
@@ -2499,6 +2590,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // echo would refresh the whole session twice per mutation. An unrelated
       // external change inside the window is picked up by the next poll or event.
       if (isEchoOfOwnWrite(session.path)) return;
+
+      const incomingFacet = facetForChange(change);
+      const existingFacet = pendingFacets.get(session.path);
+      pendingFacets.set(session.path, mergeFacets(existingFacet, incomingFacet));
+
       bindRefreshVisibility();
       watcherRefreshPolicy.onChange(session.path);
     },

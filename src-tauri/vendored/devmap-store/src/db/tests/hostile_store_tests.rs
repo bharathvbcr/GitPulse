@@ -31,8 +31,9 @@ fn tampered_store(label: &str, sql: &str) -> std::path::PathBuf {
     path
 }
 
-const PERSISTENCE_TRIGGER: &str = "CREATE TRIGGER inject AFTER INSERT ON generation_literals
-     BEGIN UPDATE generation_literals SET value = 'INJECTED-BY-SHIPPED-STORE' WHERE rowid = NEW.rowid; END;";
+const PERSISTENCE_TRIGGER: &str = "CREATE TRIGGER inject AFTER INSERT ON payload_literals
+     BEGIN UPDATE payload_literals SET value = 'INJECTED-BY-SHIPPED-STORE'
+      WHERE payload_id = NEW.payload_id AND span_start = NEW.span_start; END;";
 
 const SPINNING_TRIGGER: &str = "CREATE TRIGGER spin AFTER INSERT ON generations BEGIN
      WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT count(*) FROM r; END;";
@@ -149,4 +150,88 @@ fn only_whitespace_differences_in_a_view_are_tolerated() {
         Store::open(&path)
             .unwrap_or_else(|e| panic!("{name}: whitespace-only change refused: {e}"));
     }
+}
+
+/// Every refusal that tells the operator to remove a store names a command that
+/// exists. `dev map doctor --fix` was named here and does not exist
+/// (`docs/cli-reference.md` lists it under "Unknown"), and the auto-quarantine
+/// it promised is parked (`docs/devmap/design/auto-quarantine-parked.md`): the
+/// remedy is to move or delete the store and run `devmap build`.
+fn assert_names_the_remedy_that_exists(error: &rusqlite::Error, what: &str) {
+    let text = error.to_string();
+    assert!(
+        text.contains("move or delete the store and run `devmap build`"),
+        "{what}: the refusal does not say what to do: {text}"
+    );
+    assert!(
+        !text.contains("doctor") && !text.contains("quarantines"),
+        "{what}: the refusal names a command that does not exist: {text}"
+    );
+}
+
+#[test]
+fn the_trigger_refusal_names_a_remedy_that_exists() {
+    let path = tampered_store("remedy-trigger", PERSISTENCE_TRIGGER);
+    let error = Store::open(&path).err().expect("a trigger is refused");
+    assert_names_the_remedy_that_exists(&error, "trigger");
+}
+
+#[test]
+fn the_redefined_view_refusal_names_a_remedy_that_exists() {
+    let (name, sql) = core_views().into_iter().next().expect("a core view");
+    let path = store_with_view("remedy-view", &name, &format!("{sql} LIMIT 0"));
+    let error = Store::open(&path)
+        .err()
+        .expect("a redefined view is refused");
+    assert_names_the_remedy_that_exists(&error, &name);
+}
+
+#[test]
+fn the_missing_index_refusal_names_a_remedy_that_exists() {
+    // A writer open recreates a missing index, so the refusal is the read-only
+    // open's: it validates the schema and cannot repair it. Every declared index
+    // is dropped in turn and each refusal is read.
+    let mut refused = 0;
+    for index in crate::schema::declared_index_names() {
+        let path = tampered_store(
+            &format!("remedy-index-{index}"),
+            &format!("DROP INDEX \"{index}\";"),
+        );
+        if let Err(error) = Store::open_read_only(&path) {
+            assert!(
+                error.to_string().contains("was not recreated"),
+                "{index}: refused, but not for the index: {error}"
+            );
+            assert_names_the_remedy_that_exists(&error, &index);
+            refused += 1;
+        }
+    }
+    assert!(
+        refused > 0,
+        "no dropped index was refused: the test proves nothing"
+    );
+}
+
+/// The ownership read `devmap build` makes before it opens a store reads SQL that
+/// belongs to the file. A view standing where `pending_state` should be, and
+/// spinning, must not be run by it.
+#[test]
+fn the_ownership_read_before_open_does_not_run_a_view_standing_for_the_owner_table() {
+    let path = tampered_store(
+        "owner-view",
+        "DROP TABLE pending_state;
+         CREATE VIEW pending_state AS
+         WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 400000000)
+         SELECT 1 AS singleton, max(n) AS repo_root FROM r;",
+    );
+    let root = scratch("owner-view-root");
+    let started = std::time::Instant::now();
+    // At the current schema an unreadable owner passes (the open reports the
+    // damage itself); what is pinned is that nothing of the file's was run.
+    let _ = Store::refuse_a_live_foreign_owner_before_open(&path, &root);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the ownership read ran a view for {:?}",
+        started.elapsed()
+    );
 }

@@ -21,7 +21,9 @@ fn have_real_store(repo: &str) -> bool {
 /// The store's own refusal of a schema it does not read, in either direction.
 fn is_schema_mismatch(reason: Option<&str>) -> bool {
     reason.is_some_and(|reason| {
-        reason.contains("is not supported by this binary") || reason.contains("this build reads")
+        reason.contains("is not supported by this binary")
+            || reason.contains("this build reads")
+            || reason.contains("can be read only by a reader at schema")
     })
 }
 

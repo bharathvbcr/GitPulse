@@ -6,10 +6,10 @@ use crate::schema::{
     MIGRATION_V17_TO_V18_BACKFILL_EDGES, MIGRATION_V17_TO_V18_BACKFILL_UNRESOLVED,
     MIGRATION_V17_TO_V18_RENAME_EDGES, MIGRATION_V17_TO_V18_RENAME_UNRESOLVED,
     MIGRATION_V18_TO_V19, MIGRATION_V19_TO_V20, MIGRATION_V20_TO_V21, MIGRATION_V21_TO_V22,
-    MIGRATION_V23_TO_V24, MIGRATION_V25_TO_V26, MIGRATION_V26_TO_V27, MIGRATION_V3_TO_V4,
-    MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7,
-    MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, MIN_READER_SCHEMA_VERSION,
-    READER_COMPAT_TABLE, VALIDITY_RANGE_TABLES,
+    MIGRATION_V23_TO_V24, MIGRATION_V25_TO_V26, MIGRATION_V26_TO_V27, MIGRATION_V27_TO_V28,
+    MIGRATION_V28_TO_V29, MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES,
+    MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9,
+    MIGRATION_V9_TO_V10, MIN_READER_SCHEMA_VERSION, READER_COMPAT_TABLE, VALIDITY_RANGE_TABLES,
 };
 use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection, Result, TransactionBehavior};
@@ -147,6 +147,261 @@ impl Store {
         Ok(Some(floor as i32))
     }
 
+    /// The v28 rung: move nodes, literals, full-text rows, file membership and
+    /// digests onto payloads and validity ranges ([`MIGRATION_V27_TO_V28`]).
+    ///
+    /// Guarded on the shape rather than the stamp, like the v22 rung: a store
+    /// whose `generation_nodes` is already a view has had this rung applied,
+    /// and re-running it would read tables it no longer has.
+    ///
+    /// This rung moves rows, so it counts them. The latest generation's symbol,
+    /// literal, file and digest rows are counted through the v27 tables before
+    /// and through the v28 views after, and any difference refuses the whole
+    /// migration. Every statement is in the caller's one transaction, so the
+    /// refusal leaves the v27 store as it was. Only the latest generation is
+    /// compared: an older retained generation may name a payload the newest
+    /// also names, and a payload stores one copy of its rows.
+    fn migrate_to_v28(conn: &Connection) -> Result<()> {
+        if !Self::relation_is_table(conn, "generation_nodes")? {
+            // Applied already. A store re-stamped to an early version and walked
+            // up has re-run `CREATE_SCHEMA_V3` over it, which recreates the
+            // identity index v28 replaced; left in place it would refuse a
+            // second payload under one key, which is what v28 exists to store.
+            conn.execute_batch("DROP INDEX IF EXISTS idx_file_payloads_identity;")?;
+            return Ok(());
+        }
+        let counts = |conn: &Connection| -> Result<Option<[i64; 4]>> {
+            let latest: Option<i64> =
+                conn.query_row("SELECT MAX(id) FROM generations", [], |row| row.get(0))?;
+            let Some(latest) = latest else {
+                return Ok(None);
+            };
+            let mut counted = [0i64; 4];
+            for (slot, relation) in [
+                "generation_nodes",
+                "generation_literals",
+                "generation_file_rows",
+                "generation_file_digests",
+            ]
+            .iter()
+            .enumerate()
+            {
+                counted[slot] = conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {relation} WHERE generation_id = ?1"),
+                    params![latest],
+                    |row| row.get(0),
+                )?;
+            }
+            Ok(Some(counted))
+        };
+        let before = counts(conn)?;
+        conn.execute_batch(MIGRATION_V27_TO_V28)?;
+        Self::backfill_payload_digests(conn)?;
+        let after = counts(conn)?;
+        if before != after {
+            return Err(refusal(format!(
+                "moving the store to schema 28 changed the latest generation's rows \
+                 (nodes, literals, file rows, digests): {before:?} before, {after:?} after; \
+                 the store has been left unmigrated"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Give every payload a v27 store holds the digest the writer would have
+    /// stamped on it, computed from the documents as stored.
+    ///
+    /// A payload left at the empty digest would never match an extraction in
+    /// hand, so the first `--full` after the migration would write a second
+    /// copy of every file's payload and rows. One row at a time, so the
+    /// migration holds one payload's documents and not the store's.
+    fn backfill_payload_digests(conn: &Connection) -> Result<()> {
+        let ids: Vec<i64> = conn
+            .prepare("SELECT payload_id FROM file_payloads WHERE payload_digest = x''")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_>>()?;
+        // The extraction is read through the codec: a store that is being
+        // walked up from v27 holds text here, and one re-stamped down from v29
+        // holds frames. The digest covers the text either way, so a payload
+        // keeps the identity it had before it was compressed.
+        let mut read = conn.prepare(
+            "SELECT fp.parse_outcome_json, fp.engine_json, fp.extraction_json, pa.path
+               FROM file_payloads fp JOIN paths pa ON pa.id = fp.file_id
+              WHERE fp.payload_id = ?1",
+        )?;
+        let mut stamp =
+            conn.prepare("UPDATE file_payloads SET payload_digest = ?2 WHERE payload_id = ?1")?;
+        for id in ids {
+            let digest = read.query_row(params![id], |row| {
+                let path: String = row.get(3)?;
+                let extraction = crate::payload_codec::decode_value(row.get_ref(2)?, &path)?;
+                Ok(crate::db::payload_digest(
+                    &row.get::<_, String>(0)?,
+                    &row.get::<_, String>(1)?,
+                    &extraction,
+                ))
+            })?;
+            stamp.execute(params![id, digest.as_slice()])?;
+        }
+        Ok(())
+    }
+
+    /// The v29 rung: store every payload's extraction compressed and give every
+    /// payload its `entry_wiring_json` ([`MIGRATION_V28_TO_V29`]).
+    ///
+    /// Refuses, leaving the v28 store whole (the caller's one transaction
+    /// rolls back), when any payload could not be converted: a store being
+    /// migrated is converted entirely or not at all, and the remedy for a store
+    /// that holds a document nothing can read is to move or delete it and run
+    /// `devmap build`.
+    fn migrate_to_v29(conn: &Connection) -> Result<()> {
+        let payloads: i64 =
+            conn.query_row("SELECT COUNT(*) FROM file_payloads", [], |row| row.get(0))?;
+        let unconverted = Self::heal_extraction_encoding(conn)?;
+        if let Some((path, reason)) = unconverted.first() {
+            return Err(refusal(format!(
+                "moving the store to schema 29 could not convert {} of {payloads} stored \
+                 extractions, the first for {path}: {reason}; the store has been left unmigrated",
+                unconverted.len()
+            )));
+        }
+        // The invariant of the rung, checked rather than inferred from the pass
+        // having returned nothing: every payload is a frame with its entry wiring.
+        let left: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM file_payloads
+              WHERE typeof(extraction_json) <> 'blob' OR entry_wiring_json IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        if left != 0 {
+            return Err(refusal(format!(
+                "moving the store to schema 29 left {left} of {payloads} payloads uncompressed \
+                 or without entry wiring; the store has been left unmigrated"
+            )));
+        }
+        Self::release_free_pages(conn)
+    }
+
+    /// Compress every stored extraction that is still text and give every
+    /// payload that has none its `entry_wiring_json`, one payload at a time.
+    ///
+    /// The migration's work and the same-version heal in one function: it
+    /// selects only what is not yet converted, so it resumes a pass that was
+    /// interrupted, converges a store a writer left half converted, and costs a
+    /// single index-free probe when there is nothing to do (`typeof` reads the
+    /// record header, not the document). Each compressed document is
+    /// decompressed again and compared with the text it came from before it
+    /// replaces it, so a conversion that did not round-trip never reaches the
+    /// store.
+    ///
+    /// Returns the payloads it could not convert, `(path, reason)`, and leaves
+    /// each as it found it: a document that is not valid JSON or a frame that
+    /// will not decompress. The reader refuses those by name when it reaches
+    /// them, and the migration refuses the store ([`Self::migrate_to_v29`]), so
+    /// the list is never read as "converted".
+    fn heal_extraction_encoding(conn: &Connection) -> Result<Vec<(String, String)>> {
+        use crate::payload_codec::{
+            compress_document, decode_value, entry_wiring_of_document, inflate_document,
+        };
+        if !Self::has_column(conn, "file_payloads", "entry_wiring_json")? {
+            conn.execute_batch(MIGRATION_V28_TO_V29)?;
+        }
+        let ids: Vec<i64> = conn
+            .prepare(
+                "SELECT payload_id FROM file_payloads
+                  WHERE typeof(extraction_json) <> 'blob' OR entry_wiring_json IS NULL",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<_>>()?;
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut read = conn.prepare(
+            "SELECT fp.extraction_json, pa.path
+               FROM file_payloads fp JOIN paths pa ON pa.id = fp.file_id
+              WHERE fp.payload_id = ?1",
+        )?;
+        let mut write = conn.prepare(
+            "UPDATE file_payloads SET extraction_json = ?2, entry_wiring_json = ?3
+              WHERE payload_id = ?1",
+        )?;
+        let mut keep_frame =
+            conn.prepare("UPDATE file_payloads SET entry_wiring_json = ?2 WHERE payload_id = ?1")?;
+        let mut unconverted = Vec::new();
+        for id in ids {
+            let converted = read.query_row(params![id], |row| {
+                let path: String = row.get(1)?;
+                let value = row.get_ref(0)?;
+                let was_text = matches!(value, rusqlite::types::ValueRef::Text(_));
+                let outcome = (|| -> Result<(Option<Vec<u8>>, String)> {
+                    let json = decode_value(value, &path)?;
+                    let entries = entry_wiring_of_document(&json, &path)?;
+                    if !was_text {
+                        return Ok((None, entries));
+                    }
+                    let frame = compress_document(&json)?;
+                    if inflate_document(&frame, &path)? != *json {
+                        return Err(refusal(format!(
+                            "the compressed extraction for {path} did not decompress to the \
+                             document it was made from"
+                        )));
+                    }
+                    Ok((Some(frame), entries))
+                })();
+                Ok((path, outcome))
+            })?;
+            match converted {
+                (_, Ok((Some(frame), entries))) => {
+                    write.execute(params![id, frame, entries])?;
+                }
+                (_, Ok((None, entries))) => {
+                    keep_frame.execute(params![id, entries])?;
+                }
+                (path, Err(error)) => unconverted.push((path, error.to_string())),
+            }
+        }
+        Ok(unconverted)
+    }
+
+    /// Give a store stamped 28 by the first v28 prototype the `payload_digest`
+    /// column it lacks, and stamp every row that still reads the empty digest.
+    ///
+    /// Serves stores written by the 480aab5c prototype; no released writer
+    /// produced one. The same case as an index added to the fresh schema within
+    /// a version number ([`Self::heal_declared_indexes`]): the ladder runs no
+    /// rung for a store already at the current version, and the declared index
+    /// over the missing column would otherwise fail the open with a bare "no
+    /// such column". The digests are stamped from the stored documents, as the
+    /// v27 rung does, and the old identity index goes, so the store is the one
+    /// a fresh open would have made.
+    ///
+    /// The stamping runs whether or not the column was just added: a store
+    /// that has the column and rows still at the empty digest (a prototype
+    /// writer stopped between the two steps) would otherwise open and never
+    /// match an extraction in hand, and the next build would write a second
+    /// copy of every such payload. A store with every row stamped has nothing
+    /// to do and pays one probe.
+    fn heal_payload_digest(conn: &Connection) -> Result<()> {
+        if !Self::has_column(conn, "file_payloads", "payload_digest")? {
+            conn.execute_batch(
+                "ALTER TABLE file_payloads ADD COLUMN payload_digest BLOB NOT NULL DEFAULT x'';
+                 DROP INDEX IF EXISTS idx_file_payloads_identity;",
+            )?;
+        }
+        Self::backfill_payload_digests(conn)
+    }
+
+    /// Hand every free page back to the filesystem, stepping the pragma to
+    /// exhaustion (it frees one page per row stepped, and `execute_batch`
+    /// steps once). A store whose `auto_vacuum` is not incremental has nothing
+    /// to hand back and the pragma is a no-op.
+    fn release_free_pages(conn: &Connection) -> Result<()> {
+        let mut stmt = conn.prepare("PRAGMA incremental_vacuum")?;
+        let mut rows = stmt.query([])?;
+        while rows.next()?.is_some() {}
+        Ok(())
+    }
+
     /// Refuse a store whose schema carries a trigger.
     ///
     /// No version of this schema has ever declared one, so a trigger in
@@ -167,8 +422,8 @@ impl Store {
             None => Ok(()),
             Some(name) => Err(refusal(format!(
                 "the store carries a trigger ({name:?}), which no devmap schema declares; \
-                 refusing to run SQL somebody else put in the file — `dev map doctor --fix` \
-                 quarantines the store and rebuilds it"
+                 refusing to run SQL somebody else put in the file — move or delete the \
+                 store and run `devmap build`"
             ))),
         }
     }
@@ -205,7 +460,7 @@ impl Store {
                     return Err(refusal(format!(
                         "the store defines the view {name:?} differently from this binary's \
                          schema; refusing to read through SQL somebody else put in the file — \
-                         `dev map doctor --fix` quarantines the store and rebuilds it"
+                         move or delete the store and run `devmap build`"
                     )));
                 }
             }
@@ -289,8 +544,8 @@ impl Store {
             if !present.contains(&index) {
                 return Err(refusal(format!(
                     "required index {index} is missing and was not recreated; the store \
-                     would answer correctly and scan for every answer — `dev map doctor \
-                     --fix` quarantines the store and rebuilds it"
+                     would answer correctly and scan for every answer — move or delete the \
+                     store and run `devmap build`"
                 )));
             }
         }
@@ -445,6 +700,17 @@ impl Store {
             tx.execute_batch(MIGRATION_V23_TO_V24)?;
             tx.execute_batch(MIGRATION_V25_TO_V26)?;
             Self::add_dead_evidence_columns(tx)?;
+            // Over the empty v27 shape just built, like the v22 rung above:
+            // the fresh path and the ladder land on one schema because they run
+            // one batch.
+            Self::migrate_to_v28(tx)?;
+            Self::migrate_to_v29(tx)?;
+            // That rung drops the six flat tables the batches above just made
+            // empty, which on a store with no content yet leaves their pages
+            // on the freelist: a brand-new file that already reads as "worth
+            // reclaiming" to `vacuum_if_needed`. Nothing is referenced by
+            // them, so give the pages back before the file is first used.
+            Self::release_free_pages(tx)?;
             Self::stamp_reader_compat(tx)?;
             Self::validate_schema(tx)?;
             tx.execute(
@@ -834,7 +1100,15 @@ impl Store {
             version = 25;
         }
         if version == 25 {
-            conn.execute_batch(MIGRATION_V25_TO_V26)?;
+            // Not over a view: a store re-stamped to an earlier version and
+            // walked up carries v28's `generation_literals` view, and indexing
+            // a view is an error. The table is absent (a real v25 store) or the
+            // rung's own.
+            if Self::relation_is_table(conn, "generation_literals")?
+                || !Self::relation_exists(conn, "generation_literals")?
+            {
+                conn.execute_batch(MIGRATION_V25_TO_V26)?;
+            }
             conn.execute("PRAGMA user_version = 26", [])?;
             version = 26;
         }
@@ -843,11 +1117,28 @@ impl Store {
             conn.execute("PRAGMA user_version = 27", [])?;
             version = 27;
         }
+        if version == 27 {
+            Self::migrate_to_v28(conn)?;
+            conn.execute("PRAGMA user_version = 28", [])?;
+            version = 28;
+        }
+        if version == 28 {
+            Self::migrate_to_v29(conn)?;
+            conn.execute("PRAGMA user_version = 29", [])?;
+            version = 29;
+        }
         if version != CURRENT_SCHEMA_VERSION {
             return Err(Self::unsupported_schema(store, version));
         }
-        // A store already at the current version can still be missing an
-        // index a later build of the same version added to the fresh schema.
+        // A store already at the current version can still be missing what a
+        // later build of the same version added to the fresh schema.
+        Self::heal_payload_digest(conn)?;
+        // Whatever a same-version writer left unconverted stays so, and the
+        // readers refuse it by name; only the migration refuses the store. The
+        // list is not dropped: `Store::status` asks the same question of the
+        // store (`payload_encoding_reason_locked`) and names the paths in
+        // `degraded_reason`, so an open that could not convert is visible.
+        Self::heal_extraction_encoding(conn)?;
         Self::heal_declared_indexes(conn)?;
         Self::stamp_reader_compat(conn)?;
         Self::validate_schema(conn)?;

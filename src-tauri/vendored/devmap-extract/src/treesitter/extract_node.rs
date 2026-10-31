@@ -412,13 +412,26 @@ pub(super) fn extract_node(
                 if !binds_function && is_module_level(node) {
                     if let Some(target) = node.child_by_field_name("name") {
                         let is_exported = js_symbol_is_exported(node, source);
+                        // A plain `const X = <literal>` says so: nothing it holds
+                        // can be called, which `Calls` edges must respect.
+                        // Only `const`: a `let` or `var` initialised to a literal is a
+                        // slot another statement assigns (`export let hook = null`),
+                        // and a call through it is a call.
+                        let literal = target.kind() == "identifier"
+                            && js_declaration_is_const(node)
+                            && value.is_some_and(|value| js_is_literal_value(value, 0));
                         for name in js_pattern_bound_names(target, source) {
-                            symbols.push(module_binding_symbol(
+                            let mut symbol = module_binding_symbol(
                                 file_symbol_name,
                                 name,
                                 is_exported,
                                 span.clone(),
-                            ));
+                            );
+                            if literal {
+                                symbol.signature =
+                                    Some(crate::model::JS_LITERAL_CONSTANT.to_string());
+                            }
+                            symbols.push(symbol);
                         }
                     }
                 }
@@ -640,6 +653,93 @@ pub(super) fn extract_node(
                         span,
                         path_load: None,
                     });
+                }
+            }
+            // CommonJS: `exports.x = …`, `module.exports.x = …` and
+            // `module.exports = …` at module level. The function an export
+            // assignment publishes is a symbol of this file, and what it
+            // publishes is an export, so a `require` of the file binds it exactly
+            // as an `import` of an `export` does.
+            "assignment_expression" => {
+                if let Some((exported, value)) = js_cjs_export_assignment(node, source)
+                    // Published only when the file proves what a `require` sees: see
+                    // `CjsFacts`. Anything else is withheld, and the resolver says so
+                    // (`cjs_withheld_names`).
+                    .filter(|(exported, _)| {
+                        cjs_facts_for(node, source).publishes(exported.as_deref())
+                    })
+                {
+                    let local = match js_cjs_function_name(exported.as_deref(), value, source) {
+                        Some(name) => {
+                            symbols.push(ExtractedSymbol {
+                                qualified_name: format!("{file_symbol_name}::{name}"),
+                                name: name.clone(),
+                                kind: SymbolKind::Function,
+                                span: span.clone(),
+                                is_exported: true,
+                                docstring: None,
+                                signature: None,
+                                parent_symbol: Some(file_symbol_name.to_string()),
+                                body_signature: None,
+                                declaration_hash: None,
+                                return_type: None,
+                            });
+                            Some(name)
+                        }
+                        // `exports.x = local`: the export names a binding the
+                        // file already declares.
+                        None if value.kind() == "identifier" => Some(get_node_text(value, source)),
+                        None => None,
+                    };
+                    match (exported, local) {
+                        (Some(exported_name), Some(local)) => exports.push(ExtractedExport {
+                            exported_name,
+                            local_name: Some(local),
+                            module_specifier: None,
+                            span: span.clone(),
+                        }),
+                        // `module.exports = main`: the module's value is that
+                        // binding, which is what an `export default` says.
+                        (None, Some(local)) => exports.push(ExtractedExport {
+                            exported_name: "default".to_string(),
+                            local_name: Some(local),
+                            module_specifier: None,
+                            span: span.clone(),
+                        }),
+                        // `module.exports = { a, b: other }`: one export per
+                        // member that names a binding. A computed, spread or
+                        // method member names none and is passed over.
+                        (None, None) if value.kind() == "object" => {
+                            let mut cursor = value.walk();
+                            for member in value.named_children(&mut cursor) {
+                                let (exported_name, local) = match member.kind() {
+                                    "shorthand_property_identifier" => {
+                                        let name = get_node_text(member, source);
+                                        (name.clone(), name)
+                                    }
+                                    "pair" => {
+                                        let key = js_pair_key(member, source);
+                                        let local = member
+                                            .child_by_field_name("value")
+                                            .filter(|value| value.kind() == "identifier")
+                                            .map(|value| get_node_text(value, source));
+                                        match (key, local) {
+                                            (Some(key), Some(local)) => (key, local),
+                                            _ => continue,
+                                        }
+                                    }
+                                    _ => continue,
+                                };
+                                exports.push(ExtractedExport {
+                                    exported_name,
+                                    local_name: Some(local),
+                                    module_specifier: None,
+                                    span: span.clone(),
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             "jsx_opening_element" | "jsx_self_closing_element" => {
@@ -1601,7 +1701,11 @@ pub(super) fn extract_node(
                     signature: (lang == "swift")
                         .then(|| crate::langdecl::swift::property_signature(node))
                         .flatten()
-                        .map(str::to_string),
+                        .map(str::to_string)
+                        .or_else(|| {
+                            (lang == "java" && node.kind() == "record_declaration")
+                                .then(|| crate::model::JAVA_RECORD_SIGNATURE.to_string())
+                        }),
                     parent_symbol: Some(declaration.parent_symbol(file_symbol_name)),
                     body_signature: None,
                     declaration_hash: None,

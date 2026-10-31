@@ -2983,8 +2983,8 @@ pub(crate) mod tests {
                 "INSERT INTO file_payloads
                    (payload_id, file_id, content_hash, language,
                     parse_outcome_json, engine_json, extraction_json,
-                    grammar_version, analyzer_version)
-                 VALUES (?1, ?1, ?2, 'rust', '\"Clean\"', '\"ConfigScanner\"', 'null', 'v1', 'v1')",
+                    entry_wiring_json, grammar_version, analyzer_version)
+                 VALUES (?1, ?1, ?2, 'rust', '\"Clean\"', '\"ConfigScanner\"', '{}', '[]', 'v1', 'v1')",
                 // Signed SQLite value emitted by the real devmap writer for
                 // CALLER_SOURCE. The readable-source assertion below pins the
                 // fixture bytes and this identity together.
@@ -2999,45 +2999,36 @@ pub(crate) mod tests {
             )
             .expect("insert file payload");
             conn.execute(
-                "INSERT INTO generation_file_rows (generation_id, file_id, payload_id)
-                 VALUES (1, ?1, ?1)",
+                "INSERT INTO file_rows (file_id, payload_id, valid_from, valid_to)
+                 VALUES (?1, ?1, 1, NULL)",
                 [id],
             )
-            .expect("insert generation file row");
+            .expect("insert file row");
         }
 
         // `search` reads nodes through the FTS index, whose rowid encodes the
-        // generation and the node ordinal — see `Store::fts_rowid`.
-        for (ordinal, (file_id, name)) in [(1i64, "probe_caller"), (2, "probe_callee")]
-            .into_iter()
-            .enumerate()
-        {
-            let ordinal = ordinal as i64;
+        // payload_id and the node ord_in_file — see `Store::fts_rowid`.
+        for (file_id, name) in [(1i64, "probe_caller"), (2, "probe_callee")] {
             let span_end = if file_id == 1 {
                 CALLER_SOURCE.len() as i64
             } else {
                 20
             };
             conn.execute(
-                "INSERT INTO generation_nodes
-                   (generation_id, ordinal, file_id, name, qualified_name, kind,
+                "INSERT INTO payload_nodes
+                   (payload_id, ord_in_file, name, qualified_name, kind,
                     span_start, span_end, is_exported)
-                 VALUES (1, ?1, ?2, ?3, ?3, 'Function', 0, ?4, 1)",
-                (ordinal, file_id, name, span_end),
+                 VALUES (?1, 0, ?2, ?2, 'Function', 0, ?3, 1)",
+                (file_id, name, span_end),
             )
-            .expect("insert node");
-            let fts_rowid = (1i64 << 32) | ordinal;
+            .expect("insert payload node");
+            let fts_rowid = file_id << 24;
             conn.execute(
                 "INSERT INTO nodes_fts (rowid, name, qualified_name, path)
                  VALUES (?1, ?2, ?2, ?3)",
                 (fts_rowid, name, files[(file_id - 1) as usize]),
             )
             .expect("insert fts row");
-            conn.execute(
-                "INSERT INTO nodes_fts_map (rowid_ref, generation_id) VALUES (?1, 1)",
-                [fts_rowid],
-            )
-            .expect("insert fts map row");
         }
 
         // Since schema v18 `generation_edges` is a view over `edge_rows`
@@ -3224,23 +3215,23 @@ pub(crate) mod tests {
             "INSERT INTO file_payloads
                (payload_id, file_id, content_hash, language,
                 parse_outcome_json, engine_json, extraction_json,
-                grammar_version, analyzer_version)
-             VALUES (1, 1, ?1, 'rust', '\"Clean\"', '\"ConfigScanner\"', 'null', 'v1', 'v1')",
+                entry_wiring_json, grammar_version, analyzer_version)
+             VALUES (1, 1, ?1, 'rust', '\"Clean\"', '\"ConfigScanner\"', '{}', '[]', 'v1', 'v1')",
             [devmap_extract::content_hash(text) as i64],
         )
         .expect("insert file payload");
         conn.execute(
-            "INSERT INTO generation_file_rows (generation_id, file_id, payload_id)
-             VALUES (1, 1, 1)",
+            "INSERT INTO file_rows (file_id, payload_id, valid_from, valid_to)
+             VALUES (1, 1, 1, NULL)",
             [],
         )
-        .expect("insert generation file row");
+        .expect("insert file row");
         for (ordinal, (name, qualified, kind, first, last)) in symbols.iter().enumerate() {
             conn.execute(
-                "INSERT INTO generation_nodes
-                   (generation_id, ordinal, file_id, name, qualified_name, kind,
+                "INSERT INTO payload_nodes
+                   (payload_id, ord_in_file, name, qualified_name, kind,
                     span_start, span_end, is_exported)
-                 VALUES (1, ?1, 1, ?2, ?3, ?4, ?5, ?6, 1)",
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, 1)",
                 (
                     ordinal as i64,
                     name,
@@ -4024,7 +4015,7 @@ pub(crate) mod tests {
     fn freshness_audit_matching_source_fixture() -> tempfile::TempDir {
         let repo = repo_with_one_generation();
         let conn = rusqlite::Connection::open(map_path(repo.path())).unwrap();
-        conn.execute("DELETE FROM generation_file_rows WHERE file_id <> 1", [])
+        conn.execute("DELETE FROM file_rows WHERE file_id <> 1", [])
             .unwrap();
         repo
     }

@@ -1485,29 +1485,61 @@ pub fn catch_up_coalesced(repo_path: &str) -> CatchUp {
     })
 }
 
+struct SerializeState {
+    running: std::sync::Mutex<std::collections::HashSet<String>>,
+    cvar: std::sync::Condvar,
+}
+
+fn serialize_state() -> &'static SerializeState {
+    static STATE: std::sync::OnceLock<SerializeState> = std::sync::OnceLock::new();
+    STATE.get_or_init(|| SerializeState {
+        running: std::sync::Mutex::new(std::collections::HashSet::new()),
+        cvar: std::sync::Condvar::new(),
+    })
+}
+
 /// Passes in this process one repository's ledger is being caught up by, so
 /// two never read the same history at once (the second would only find the
 /// first's cursors already advanced, or worse, record a reflog entry twice).
+///
+/// Uses Condvar synchronization instead of spin-wait sleeping: waiting threads
+/// block on the condition variable and are awakened immediately upon lock release
+/// or budget deadline expiration.
 fn serialize(ledger_repo: &str, budget: &Budget) -> Option<Serial> {
+    let state = serialize_state();
+    let mut running = state
+        .running
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     loop {
-        if running()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(ledger_repo.to_string())
-        {
+        if running.insert(ledger_repo.to_string()) {
             return Some(Serial(ledger_repo.to_string()));
         }
+
         if budget.expired() {
             return None;
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-}
 
-fn running() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    static RUNNING: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    RUNNING.get_or_init(Default::default)
+        match budget.remaining() {
+            Some(remaining) => {
+                if remaining.is_zero() {
+                    return None;
+                }
+                let (guard, _timeout_result) = state
+                    .cvar
+                    .wait_timeout(running, remaining)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                running = guard;
+            }
+            None => {
+                running = state
+                    .cvar
+                    .wait(running)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+    }
 }
 
 /// Holds one ledger's place in [`serialize`] until dropped.
@@ -1515,10 +1547,14 @@ struct Serial(String);
 
 impl Drop for Serial {
     fn drop(&mut self) {
-        running()
+        let state = serialize_state();
+        let mut running = state
+            .running
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.0);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if running.remove(&self.0) {
+            state.cvar.notify_all();
+        }
     }
 }
 
@@ -2458,3 +2494,157 @@ mod walk_tests;
 mod adv2_bench_tests;
 #[cfg(test)]
 mod adv_l5_tests;
+
+#[cfg(test)]
+mod serialize_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn serialize_single_flight_and_condvar_wakeup() {
+        let budget = Budget::within(Duration::from_millis(500));
+        let repo = "test-repo-condvar";
+
+        let first = serialize(repo, &budget).expect("first acquisition succeeds");
+
+        // Concurrent attempt with 50ms budget should timeout while first is held
+        let quick_budget = Budget::within(Duration::from_millis(50));
+        assert!(serialize(repo, &quick_budget).is_none());
+
+        // Spawn a thread waiting on serialize
+        let handle = std::thread::spawn(move || {
+            let wait_budget = Budget::within(Duration::from_millis(500));
+            serialize("test-repo-condvar", &wait_budget)
+        });
+
+        std::thread::sleep(Duration::from_millis(20));
+        drop(first); // Wakes up waiter immediately via Condvar notify_all
+
+        let second = handle.join().expect("thread completes").expect("second acquires");
+        drop(second);
+    }
+
+    #[test]
+    fn serialize_distinct_repos_do_not_block_each_other() {
+        let budget = Budget::within(Duration::from_millis(100));
+        let first = serialize("repo-alpha", &budget).expect("alpha succeeds");
+        let second = serialize("repo-beta", &budget).expect("beta succeeds concurrently");
+        drop(first);
+        drop(second);
+    }
+
+    #[test]
+    fn serialize_stress_ten_plus_concurrent_threads_contention() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let num_threads = 12;
+        let active_count = Arc::new(AtomicUsize::new(0));
+        let completed_count = Arc::new(AtomicUsize::new(0));
+        let repo = "stress-ledger-repo-contention";
+
+        let mut handles = Vec::new();
+        for _ in 0..num_threads {
+            let active = Arc::clone(&active_count);
+            let completed = Arc::clone(&completed_count);
+            let handle = std::thread::spawn(move || {
+                let budget = Budget::within(Duration::from_secs(5));
+                let serial = serialize(repo, &budget).expect("thread acquires serial within budget");
+
+                // Verify single flight: mutual exclusion invariant
+                let prev = active.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(prev, 0, "Mutual exclusion violated! Two threads active simultaneously");
+
+                std::thread::sleep(Duration::from_millis(5));
+
+                let cur = active.fetch_sub(1, Ordering::SeqCst);
+                assert_eq!(cur, 1, "Only 1 thread should have been active");
+                completed.fetch_add(1, Ordering::SeqCst);
+
+                drop(serial);
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.join().expect("thread completes cleanly");
+        }
+
+        assert_eq!(completed_count.load(Ordering::SeqCst), num_threads);
+        assert_eq!(active_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn serialize_wakeup_latency_via_cvar_notification() {
+        let repo = "latency-test-repo-cvar";
+        let budget = Budget::within(Duration::from_millis(1000));
+
+        let first = serialize(repo, &budget).expect("first acquisition succeeds");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            let wait_budget = Budget::within(Duration::from_millis(1000));
+            tx.send(()).unwrap();
+            let serial = serialize(repo, &wait_budget).expect("waiter acquires lock after notification");
+            let wake_time = std::time::Instant::now();
+            (serial, wake_time)
+        });
+
+        rx.recv().unwrap();
+        // Give waiter thread time to block on Condvar
+        std::thread::sleep(Duration::from_millis(25));
+
+        let drop_time = std::time::Instant::now();
+        drop(first); // Wakes up waiter immediately via Condvar notify_all
+
+        let (_serial, wake_time) = handle.join().expect("waiter thread finishes");
+        let latency = wake_time.duration_since(drop_time);
+
+        // Instant wake-up via cvar.notify_all() occurs in < 15ms (sub-millisecond or few ms on macOS)
+        assert!(
+            latency < Duration::from_millis(15),
+            "wake-up latency via cvar.notify_all() was too slow ({:?}); expected instant event wake-up",
+            latency
+        );
+    }
+
+    #[test]
+    fn serialize_budget_deadline_expiration_without_deadlock() {
+        let repo = "timeout-test-repo-deadlock";
+        let long_budget = Budget::within(Duration::from_millis(500));
+        let holder = serialize(repo, &long_budget).expect("holder acquires lock");
+
+        let num_waiters = 5;
+        let mut handles = Vec::new();
+        for i in 0..num_waiters {
+            let handle = std::thread::spawn(move || {
+                let timeout_ms = 20 + i * 10;
+                let short_budget = Budget::within(Duration::from_millis(timeout_ms));
+                let start = std::time::Instant::now();
+                let res = serialize(repo, &short_budget);
+                let elapsed = start.elapsed();
+                assert!(res.is_none(), "timed out attempt must return None");
+                assert!(
+                    elapsed >= Duration::from_millis(timeout_ms),
+                    "must wait for budget duration"
+                );
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.join().expect("waiter exited cleanly without deadlock");
+        }
+
+        // Holder is still valid and not deadlocked
+        drop(holder);
+
+        // Immediate subsequent acquisition succeeds
+        let post_budget = Budget::within(Duration::from_millis(100));
+        let post = serialize(repo, &post_budget);
+        assert!(post.is_some(), "re-acquisition after timeout threads succeeds");
+        drop(post);
+    }
+}
+

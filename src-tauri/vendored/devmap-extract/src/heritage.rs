@@ -376,7 +376,10 @@ fn heritage_clauses<'a>(
         ) | ("python", "class_definition")
             | (
                 "java",
-                "class_declaration" | "interface_declaration" | "record_declaration"
+                "class_declaration"
+                    | "interface_declaration"
+                    | "record_declaration"
+                    | "enum_declaration"
             )
             | (
                 "csharp",

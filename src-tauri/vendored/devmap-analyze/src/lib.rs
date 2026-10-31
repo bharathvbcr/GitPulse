@@ -100,7 +100,18 @@ pub fn analyze_with_discovery(
         // check that could not run. Concatenated rather than ranked because a
         // reader acting on `Partial` needs every reason it holds, not the
         // first one that happened to fire.
-        status: match combine_reasons(detection.degraded, liveness.coverage.degraded_reason()) {
+        //
+        // A resolution budget that cut candidate lists is the third reason, and
+        // it rides this same status rather than a flag of its own: it was in the
+        // stderr line, the build JSON, the coverage-gap row and `status`, while
+        // `repo_map.json` said `graph_degraded: false` and `code_graph.json` said
+        // `analysis_status: ok`. Derived from the ledger rows (`budget_gaps`), so
+        // the daemon, which resolves under the default budgets and has no flags,
+        // reports it identically.
+        status: match combine_reasons(
+            combine_reasons(detection.degraded, liveness.coverage.degraded_reason()),
+            resolution_budget_reason(resolution),
+        ) {
             None => AnalysisStatus::Ok,
             Some(reason) => AnalysisStatus::Partial { reason },
         },
@@ -152,6 +163,25 @@ pub fn analyze_with_discovery(
             scan
         },
     }
+}
+
+/// Why the resolution itself is incomplete, or `None` when no budget cut it.
+///
+/// One sentence per exceeded budget, from the same
+/// [`devmap_resolve::ResolutionBudgetGap::describe`] the stored coverage-gap row
+/// and the build's stderr line use, so the three cannot word the loss
+/// differently.
+fn resolution_budget_reason(resolution: &ResolutionResult) -> Option<String> {
+    let gaps = resolution.budget_gaps();
+    if gaps.is_empty() {
+        return None;
+    }
+    let sentences: Vec<String> = gaps.iter().map(|gap| gap.describe()).collect();
+    Some(format!(
+        "resolution was capped by a budget, so some ambiguous call sites carry a partial \
+         candidate list or none: {}",
+        sentences.join("; ")
+    ))
 }
 
 /// Join two "why this answer is qualified" reasons, keeping `None` when

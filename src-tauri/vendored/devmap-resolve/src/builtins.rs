@@ -1014,6 +1014,127 @@ pub fn is_prelude_type(family: LangFamily, name: &str) -> bool {
     }
 }
 
+/// The public top-level types of `java.lang`, which every Java compilation unit
+/// imports implicitly (JLS 7.3). The last route of a Java type name's lookup:
+/// declaration, same package, on-demand import, then this package.
+///
+/// Consulted by [`is_java_lang_type`] for a name no earlier route bound, so a
+/// miss is the JDK's and not a defect. It is a hand-kept list of the long-stable
+/// classes, interfaces, annotation interfaces, exceptions and errors, and it
+/// leaves out what the JDK added or removed in recent releases (`Compiler`,
+/// `MatchException`, `WrongThreadException`, `StackWalker`, `Module`): a name left
+/// out stays unexplained, the direction this module prefers to fail in.
+///
+/// Sorted for `binary_search`.
+pub const JAVA_LANG_TYPES: &[&str] = &[
+    "AbstractMethodError",
+    "Appendable",
+    "ArithmeticException",
+    "ArrayIndexOutOfBoundsException",
+    "ArrayStoreException",
+    "AssertionError",
+    "AutoCloseable",
+    "Boolean",
+    "BootstrapMethodError",
+    "Byte",
+    "CharSequence",
+    "Character",
+    "Class",
+    "ClassCastException",
+    "ClassCircularityError",
+    "ClassFormatError",
+    "ClassLoader",
+    "ClassNotFoundException",
+    "CloneNotSupportedException",
+    "Cloneable",
+    "Comparable",
+    "Deprecated",
+    "Double",
+    "Enum",
+    "EnumConstantNotPresentException",
+    "Error",
+    "Exception",
+    "ExceptionInInitializerError",
+    "Float",
+    "FunctionalInterface",
+    "IllegalAccessError",
+    "IllegalAccessException",
+    "IllegalArgumentException",
+    "IllegalMonitorStateException",
+    "IllegalStateException",
+    "IllegalThreadStateException",
+    "IncompatibleClassChangeError",
+    "IndexOutOfBoundsException",
+    "InheritableThreadLocal",
+    "InstantiationError",
+    "InstantiationException",
+    "Integer",
+    "InternalError",
+    "InterruptedException",
+    "Iterable",
+    "LinkageError",
+    "Long",
+    "Math",
+    "NegativeArraySizeException",
+    "NoClassDefFoundError",
+    "NoSuchFieldError",
+    "NoSuchFieldException",
+    "NoSuchMethodError",
+    "NoSuchMethodException",
+    "NullPointerException",
+    "Number",
+    "NumberFormatException",
+    "Object",
+    "OutOfMemoryError",
+    "Override",
+    "Package",
+    "Process",
+    "ProcessBuilder",
+    "Readable",
+    "Record",
+    "ReflectiveOperationException",
+    "Runnable",
+    "Runtime",
+    "RuntimeException",
+    "RuntimePermission",
+    "SafeVarargs",
+    "SecurityException",
+    "SecurityManager",
+    "Short",
+    "StackOverflowError",
+    "StackTraceElement",
+    "StrictMath",
+    "String",
+    "StringBuffer",
+    "StringBuilder",
+    "StringIndexOutOfBoundsException",
+    "SuppressWarnings",
+    "System",
+    "Thread",
+    "ThreadDeath",
+    "ThreadGroup",
+    "ThreadLocal",
+    "Throwable",
+    "TypeNotPresentException",
+    "UnknownError",
+    "UnsatisfiedLinkError",
+    "UnsupportedClassVersionError",
+    "UnsupportedOperationException",
+    "VerifyError",
+    "VirtualMachineError",
+    "Void",
+];
+
+/// Whether `name` is a type `java.lang` supplies to every Java file.
+///
+/// Language-specific, not family-specific: `LangFamily::CStyle` is also C, C++,
+/// C# and Objective-C, whose `String` and `Object` are other types. The caller
+/// establishes that the file is Java, and that no JVM-language file of the
+/// corpus declares the name.
+pub fn is_java_lang_type(name: &str) -> bool {
+    JAVA_LANG_TYPES.binary_search(&name).is_ok()
+}
+
 /// Swift standard-library **free functions**, from the Swift Standard Library
 /// reference. Swift is a primary language for this repository, so a bare call
 /// to one of these is expected-unresolvable rather than a defect.
@@ -1451,6 +1572,7 @@ mod tests {
             ("ruby", RUBY_BUILTINS),
             ("php", PHP_BUILTINS),
             ("rust prelude types", RUST_PRELUDE_TYPES),
+            ("java.lang types", JAVA_LANG_TYPES),
             ("shell", SHELL_BUILTINS),
         ] {
             let mut sorted = table.to_vec();

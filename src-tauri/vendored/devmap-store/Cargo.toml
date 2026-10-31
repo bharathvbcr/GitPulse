@@ -16,6 +16,12 @@ serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = { version = "1.0" }
 anyhow = { version = "1.0" }
 rayon = { version = "1.10" }
+# Stored extraction documents (schema 29). Pinned exactly, and to a release at
+# least two weeks old when it was chosen (0.14.0, 2026-09-04; 0.14.3 was 13 days
+# old on 2026-10-29). No default features: `legacy` (old-format frames) and
+# `zdict_builder` (dictionary training) are not used -- the store writes and
+# reads its own frames only, with no dictionary.
+zstd = { version = "=0.14.0", default-features = false }
 
 [package.metadata.dist]
 # hold_uncommitted_child is a test helper. cargo-dist announced it as a
@@ -126,4 +132,26 @@ required-features = ["parse"]
 # Shared-payload rewrite attack; needs `save_generation`.
 [[test]]
 name = "a_shared_payload_row_does_not_misreport_a_generation"
+required-features = ["parse"]
+
+# v28's payload-scoped rows: builds every generation it reads from extracted
+# source and writes it with `save_generation_with_opts`.
+[[test]]
+name = "v28_payload_scoped_rows"
+required-features = ["parse"]
+
+# v29: the extraction is a zstd frame. Builds its stores from extracted source.
+[[test]]
+name = "v29_compressed_extractions"
+required-features = ["parse"]
+
+# Attack tests of the v29 reviewer round: builds stores from extracted source.
+[[test]]
+name = "attack_v29_zstd"
+required-features = ["parse"]
+
+# v29's size and hot-path claims, stated through raw SQL; extracts this crate's
+# own sources, so it needs the grammars.
+[[test]]
+name = "v29_size_and_hot_path"
 required-features = ["parse"]
