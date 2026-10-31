@@ -161,10 +161,11 @@ const TERMINAL_REPLY = new RegExp(
  * Control sequences the reader's navigation keys send (arrows, Home/End,
  * Delete, Shift-Tab, a bracketed-paste marker). Moving through a menu is not
  * answering it: Enter, Escape or a digit is what answers, and those are not
- * CSI sequences. Text inside a paste still counts, because only the sequences
- * are removed.
+ * CSI sequences. The same arrows and Home/End arrive as SS3 (`ESC O A`) when a
+ * program turns on application cursor keys, which menus commonly do. Text
+ * inside a paste still counts, because only the sequences are removed.
  */
-const CSI_KEY = /\x1b\[[0-?]*[ -/]*[@-~]/g;
+const CSI_KEY = /\x1b(?:\[[0-?]*[ -/]*[@-~]|O[A-DHF])/g;
 
 /**
  * Whether data xterm sent to the PTY came from the reader and answers what the
