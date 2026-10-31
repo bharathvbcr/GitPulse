@@ -62,6 +62,37 @@ describe("RepoPanel remotes", () => {
   });
 });
 
+describe("RepoPanel section headers on a failed read", () => {
+  // The headers sit above the body's own error line; a failed read leaves the
+  // list empty and `*Loaded` true, so without an error arm the header would
+  // state "No remotes configured" / "has no submodules" as fact.
+  const header = (name: string) => {
+    const at = source.indexOf(`{${name}Error ? "Could not read ${name}"`);
+    expect(at, `${name} header has no error arm`).toBeGreaterThan(-1);
+    return source.slice(source.lastIndexOf("<span", at), source.indexOf("</span>", at));
+  };
+
+  it("names the failure instead of describing an empty list", () => {
+    expect(header("remotes")).toContain('remotesLoaded ? describeRemotes(remotes) : "Loading…"');
+    expect(header("submodules")).toContain('submodulesLoaded ? describeSubmodules(submodules) : "Loading…"');
+  });
+
+  it("checks the error before the loaded flag and uses the body's error colour", () => {
+    for (const name of ["remotes", "submodules"]) {
+      const h = header(name);
+      expect(h.indexOf(`${name}Error ?`)).toBeLessThan(h.indexOf(`${name}Loaded ?`));
+      expect(h).toContain("text-red-600 dark:text-red-400");
+    }
+  });
+
+  it("keeps the header reload, which reloads both lists, as the retry", () => {
+    expect(source).toContain("onclick={() => void load()}");
+    const load = source.slice(source.indexOf("await Promise.all(["));
+    expect(load.slice(0, load.indexOf("]);"))).toContain("repoStore.listSubmodules()");
+    expect(load.slice(0, load.indexOf("]);"))).toContain("repoStore.listRemotes()");
+  });
+});
+
 describe("RepoPanel submodules", () => {
   it("exposes sync and deinit, not only initialize", () => {
     expect(source).toContain('kind: "sync"');

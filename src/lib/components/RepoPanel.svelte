@@ -389,8 +389,8 @@
         <div class="flex items-center gap-2 min-w-0">
           <Cloud size={15} class="shrink-0 text-accent" />
           <h2 class="font-semibold text-textPrimary">Remotes</h2>
-          <span class="truncate text-[11px] text-textMuted">
-            {remotesLoaded ? describeRemotes(remotes) : "Loading…"}
+          <span class="truncate text-[11px] {remotesError ? 'text-red-600 dark:text-red-400' : 'text-textMuted'}">
+            {remotesError ? "Could not read remotes" : remotesLoaded ? describeRemotes(remotes) : "Loading…"}
           </span>
         </div>
         <button
@@ -637,8 +637,8 @@
         <div class="flex items-center gap-2 min-w-0">
           <Package size={15} class="shrink-0 text-accent" />
           <h2 class="font-semibold text-textPrimary">Submodules</h2>
-          <span class="truncate text-[11px] text-textMuted">
-            {submodulesLoaded ? describeSubmodules(submodules) : "Loading…"}
+          <span class="truncate text-[11px] {submodulesError ? 'text-red-600 dark:text-red-400' : 'text-textMuted'}">
+            {submodulesError ? "Could not read submodules" : submodulesLoaded ? describeSubmodules(submodules) : "Loading…"}
           </span>
         </div>
         <div class="flex items-center gap-1.5 shrink-0">
