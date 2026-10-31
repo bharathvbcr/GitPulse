@@ -3449,7 +3449,14 @@ if (params.has("check")) {
         await change(panel().querySelector('[aria-label="Suggest tasks at or above this priority"]'), "1", "change"); await wait(() => suggestCalls.length === 3 && idle());
         check("the priority picker asks again with that ceiling, as a number",
           suggestCalls.at(-1).max_priority === 1 && suggestCalls.at(-1).repository_id === "repo-1" && same(listed(), ids({ repository_id: "repo-1", max_priority: 1, limit: 5 })));
+        // Run in waves asks for its tasks the way Suggest next does, so the ceiling chosen
+        // here is the one a wave is launched with: its note names it, and says "any" once cleared.
+        // (A wave itself needs an open checkout and worktree commands this fixture does not serve.)
+        const waveNote = () => root.querySelector('[data-testid="wave-priority"]')?.textContent ?? "";
+        check("Run in waves is bounded by the priority Suggest next was set to", waveNote().includes("priority") && waveNote().includes("or higher") && !waveNote().includes("any priority"));
         await change(panel().querySelector('[aria-label="Suggest tasks at or above this priority"]'), "all", "change"); await wait(() => suggestCalls.length === 4 && idle());
+        // Companion to the check above, not a discriminator: the note says "any" before the ceiling is wired too.
+        check("Run in waves asks for any priority again once Suggest next is cleared (companion)", waveNote().includes("any priority"));
         check("Any priority asks with no ceiling at all", !("max_priority" in suggestCalls.at(-1)));
         // Two asks in flight: the board's own scope change makes the second. The answers
         // arrive newest first, and the older one must not replace what is on screen.
@@ -3501,6 +3508,58 @@ if (params.has("check")) {
         tasks = original;
         await click("Filters"); await click("Refresh"); await wait(() => card("task-1"));
       } catch (error) { check(`the severity filter checks ran to the end (${error.message} at ${step})`, false); }
+
+      try {
+        step = "status and due range";
+        const original = tasks;
+        const plain = [...root.querySelectorAll('[data-task-column="ready"] [data-task-card]')].map(el => el.dataset.cardId).find(id => !["task-1", "task-2", "task-3"].includes(id));
+        // Local noon, the zone the range's days are read in.
+        const noon = (y, m, d) => Math.floor(new Date(y, m - 1, d, 12).getTime() / 1000);
+        tasks = tasks.map(task => task.id === "task-1" ? { ...task, due_at: noon(2026, 11, 10) } : task.id === "task-2" ? { ...task, due_at: noon(2026, 12, 15) } : task);
+        await click("Refresh"); await wait(() => card("task-1") && card("task-2") && card("task-3") && card(plain));
+        if (!root.querySelector('[aria-label="Filter by status"]')) await click("Filters");
+        const statusPick = () => root.querySelector('[aria-label="Filter by status"]');
+        const fromInput = () => root.querySelector('[data-testid="task-filter-due-from"]'), toInput = () => root.querySelector('[data-testid="task-filter-due-to"]');
+        const searchText = () => root.querySelector("input#task-search")?.value ?? "";
+        const names = () => [card("task-1"), card("task-2"), card("task-3"), card(plain)].map(Boolean);
+        check("the status select offers Any, Not done and every column", same([...statusPick().options].map(option => option.value), ["", "open", "inbox", "backlog", "ready", "in_progress", "review", "done"]) && statusPick().value === "");
+        // The first filter switches the board to the candidate set, which is read before it can draw.
+        // Earlier checks have moved cards between columns: pick the column task-2 is in now.
+        const column = tasks.find(task => task.id === "task-2").status;
+        const inColumn = ["task-1", "task-2", "task-3", plain].map(id => tasks.find(task => task.id === id).status === column);
+        check("the fixture leaves at least one of the four cards out of that column", inColumn[1] && inColumn.includes(false));
+        await change(statusPick(), column, "change"); await wait(() => card("task-2")); await settle(300);
+        check("choosing a column keeps only the cards in it and writes it into the search", same(names(), inColumn) && searchText().includes(`status:${column}`));
+        await change(statusPick(), "", "change"); await settle(300);
+        check("Any status brings every card back and takes the filter out of the search", same(names(), [true, true, true, true]) && !searchText().includes("status:"));
+        await change(fromInput(), "2026-11-01", "change"); await settle(300);
+        check("a from day alone keeps every card due on or after it, and none without a due date", same(names(), [true, true, false, false]) && searchText().includes("due:2026-11-01.."));
+        await change(toInput(), "2026-11-30", "change"); await settle(300);
+        check("a from and to day keep only the card due between them, both days written into the search", same(names(), [true, false, false, false]) && searchText().includes("due:2026-11-01..2026-11-30"));
+        check("each date input bounds the other, so a range cannot end before it starts", fromInput().max === "2026-11-30" && toInput().min === "2026-11-01");
+        await change(fromInput(), "", "change"); await change(toInput(), "", "change"); await settle(300);
+        check("clearing both days brings every card back and takes the range out of the search", same(names(), [true, true, true, true]) && !searchText().includes("due:"));
+        // A day typed before the other end is swapped, so the search never holds a range the parser refuses.
+        await change(fromInput(), "2026-11-20", "change"); await change(toInput(), "2026-11-05", "change"); await settle(300);
+        check("an end typed before the other end swaps them, leaving one accepted range in the search", searchText().includes("due:2026-11-05..2026-11-20") && !searchText().includes("due:2026-11-20") && fromInput().value === "2026-11-05" && toInput().value === "2026-11-20");
+        // A range inside a list with a named value is the search's to keep: the inputs do not claim half of it.
+        const searchBox = root.querySelector('[aria-label="Search tasks"]');
+        await change(searchBox, "due:overdue,2026-11-01.."); await settle(300);
+        check("a due list that mixes a named value with a range disables both date inputs and leaves the search as typed", fromInput().disabled && toInput().disabled && searchText() === "due:overdue,2026-11-01..");
+        // The same list written as separate tokens widens to OR as well: the inputs do not show the range alone.
+        await change(searchBox, "due:overdue due:2026-11-01.."); await settle(300);
+        check("a due list written as separate tokens disables both date inputs and leaves the search as typed", fromInput().disabled && toInput().disabled && searchText() === "due:overdue due:2026-11-01..");
+        // A select that cannot say what the search holds is read-only, so choosing a value cannot replace an exclusion or a list.
+        for (const text of ["-status:done", "status:ready,review", "status:ready status:review"]) {
+          await change(searchBox, text); await settle(300);
+          check(`a search holding ${text} disables the status select, which says several, and leaves the search as typed`, statusPick().disabled && statusPick().value === "several" && searchText() === text);
+        }
+        await change(searchBox, "status:review"); await settle(300);
+        check("a single status leaves the status select enabled and showing it", !statusPick().disabled && statusPick().value === "review");
+        await change(searchBox, ""); await settle(300);
+        tasks = original;
+        await click("Filters"); await click("Refresh"); await wait(() => card("task-1"));
+      } catch (error) { check(`the status and due range checks ran to the end (${error.message} at ${step})`, false); }
 
       try {
         step = "key e";
