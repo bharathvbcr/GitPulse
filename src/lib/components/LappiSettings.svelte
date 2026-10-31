@@ -18,12 +18,12 @@
   import { explainError } from "../workbench/client";
   import SettingToggle from "./SettingToggle.svelte";
   import { lappi, refreshLappi, saveLappi, type LappiSettings } from "../stores/lappiStore";
+  import { loadOnce } from "../settings/loadOnce";
 
   let { active = true }: { active?: boolean } = $props();
 
   let busy = $state(false);
   let error = $state("");
-  let loaded = false;
 
   const view = $derived($lappi);
 
@@ -32,7 +32,6 @@
     error = "";
     try {
       await refreshLappi();
-      loaded = true;
     } catch (cause) {
       error = explainError(cause);
     } finally {
@@ -53,8 +52,11 @@
     }
   }
 
+  // One automatic attempt: a failed load shows its error and a Retry button
+  // rather than re-running this effect as `busy` settles.
+  const loader = loadOnce(load);
   $effect(() => {
-    if (active && !loaded && !busy) void load();
+    if (active) loader.request();
   });
 </script>
 
@@ -84,5 +86,8 @@
         : ""}{view.store.last_error ? ` · ${view.store.last_error}` : ""}
     </p>
   {/if}
-  {#if error}<p class="text-amber-600 dark:text-amber-400" role="alert">{error}</p>{/if}
+  {#if error}
+    <p class="text-amber-600 dark:text-amber-400" role="alert">{error}</p>
+    <button type="button" class="gp-btn text-[11px] px-2 py-0.5" disabled={busy} onclick={() => loader.retry()}>Retry</button>
+  {/if}
 </div>

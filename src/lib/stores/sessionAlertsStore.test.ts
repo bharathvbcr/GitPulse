@@ -136,6 +136,41 @@ describe("loading the alert settings", () => {
   });
 });
 
+describe("a failed first read", () => {
+  it("keeps the reason, re-asks on the next read, and clears it when a read succeeds", async () => {
+    isTauri.mockReturnValue(true);
+    invoke.mockRejectedValueOnce(new Error("backend down"));
+    const store = await freshStore();
+    expect(get(store.sessionAlertsLoadError)).toBeNull();
+    const view = await store.loadSessionAlerts();
+    // The spawn path still gets the defaults, so a tab can open ...
+    expect(view.settings).toEqual(store.DEFAULT_SESSION_ALERT_SETTINGS);
+    // ... but the panel can tell those defaults from a real answer.
+    expect(get(store.sessionAlertsLoadError)).toBe("backend down");
+    invoke.mockResolvedValueOnce(viewWith({ enabled: true }));
+    await store.loadSessionAlerts();
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(get(store.sessionAlertsLoadError)).toBeNull();
+  });
+
+  it("clears the reason on a successful refresh or save too", async () => {
+    isTauri.mockReturnValue(true);
+    invoke.mockRejectedValueOnce("worker not running");
+    const store = await freshStore();
+    await store.loadSessionAlerts();
+    expect(get(store.sessionAlertsLoadError)).toBe("worker not running");
+    invoke.mockResolvedValueOnce(viewWith());
+    await store.refreshSessionAlerts();
+    expect(get(store.sessionAlertsLoadError)).toBeNull();
+    invoke.mockRejectedValueOnce(new Error("down again"));
+    const again = await freshStore();
+    await again.loadSessionAlerts();
+    invoke.mockResolvedValueOnce(viewWith());
+    await again.saveSessionAlerts(again.DEFAULT_SESSION_ALERT_SETTINGS);
+    expect(get(again.sessionAlertsLoadError)).toBeNull();
+  });
+});
+
 describe("refreshing and saving", () => {
   it("refresh re-reads the counters, and is a no-op outside the app", async () => {
     const store = await freshStore();

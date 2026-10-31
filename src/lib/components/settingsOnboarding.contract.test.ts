@@ -9,6 +9,29 @@ import { describe, expect, it } from "vitest";
  */
 const read = (name: string) => readFileSync(new URL(`./${name}`, import.meta.url), "utf8");
 
+describe("Settings panels load once (SO-1)", () => {
+  for (const name of ["LappiSettings.svelte", "HostLoadSetting.svelte", "SessionAlertSettings.svelte"]) {
+    const source = read(name);
+    it(`${name} gates its load effect on one recorded attempt, not on success`, () => {
+      // `!loaded && !busy` re-fires as `busy` settles after every rejection.
+      expect(source).not.toMatch(/active && !loaded/);
+      expect(source).toContain("loader.request()");
+    });
+  }
+
+  it("the Lappi and host-load panels offer Retry beside their error", () => {
+    for (const name of ["LappiSettings.svelte", "HostLoadSetting.svelte"]) {
+      expect(read(name)).toContain("loader.retry()");
+    }
+  });
+
+  it("the notification panel shows the store's load failure instead of the default form", () => {
+    const source = read("SessionAlertSettings.svelte");
+    expect(source).toContain("sessionAlertsLoadError");
+    expect(source).toContain("session-alerts-load-error");
+  });
+});
+
 describe("Run setup from Settings (SO-3)", () => {
   const settings = read("SettingsModal.svelte");
   const wizard = read("onboarding/SetupWizard.svelte");

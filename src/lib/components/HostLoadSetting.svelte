@@ -14,20 +14,19 @@
     saveHostLoadSettings,
     type HostLoadSettings,
   } from "../stores/hostLoadStore";
+  import { loadOnce } from "../settings/loadOnce";
 
   let { active = true }: { active?: boolean } = $props();
 
   let settings = $state<HostLoadSettings>(DEFAULT_HOST_LOAD_SETTINGS);
   let busy = $state(false);
   let error = $state("");
-  let loaded = false;
 
   async function load() {
     busy = true;
     error = "";
     try {
       settings = await loadHostLoadSettings();
-      loaded = true;
     } catch (cause) {
       error = explainError(cause);
     } finally {
@@ -48,8 +47,11 @@
     }
   }
 
+  // One automatic attempt: a failed load shows its error and a Retry button
+  // rather than re-running this effect as `busy` settles.
+  const loader = loadOnce(load);
   $effect(() => {
-    if (active && !loaded && !busy) void load();
+    if (active) loader.request();
   });
 </script>
 
@@ -71,5 +73,6 @@
   />
   {#if error}
     <p class="text-amber-300">{error}</p>
+    <button type="button" class="gp-btn text-[11px] px-2 py-0.5" disabled={busy} onclick={() => loader.retry()}>Retry</button>
   {/if}
 </div>
