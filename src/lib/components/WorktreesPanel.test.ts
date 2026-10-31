@@ -347,3 +347,26 @@ describe("the hooks consent belongs to the repository it was read for", () => {
     expect(source).toContain("if (tabScope.isCurrent(epoch)) await readHooksPreview();");
   });
 });
+
+describe("a task state that could not be read is not an unbound worktree", () => {
+  const load = source.slice(source.indexOf("async function loadTaskState("), source.indexOf("async function loadLaneRuns("));
+
+  it("one failed binding read no longer discards the others or hides the line", () => {
+    expect(load).not.toContain("throw new Error(failed.detail)");
+    expect(load).toContain("unread[read.path] = read.detail;");
+    expect(load).toContain("bindingErrors = unread;");
+  });
+
+  it("a thrown task-store read is kept as a reason, not collapsed into an absent store", () => {
+    expect(load).toContain("taskStateError = reportPanelError(\"worktrees\", err);");
+    expect(load).toContain("taskStateError = null;");
+  });
+
+  it("the row says task state unavailable for either, and a tab switch forgets both", () => {
+    expect(source).toContain("{#if bindingErrors[wt.path]}");
+    expect(source).toContain("{:else if taskView?.error || taskStateError}");
+    const reset = source.slice(source.indexOf("const tabScope = repoScope("), source.indexOf("\n  );", source.indexOf("const tabScope = repoScope(")));
+    expect(reset).toContain("bindingErrors = {};");
+    expect(reset).toContain("taskStateError = null;");
+  });
+});

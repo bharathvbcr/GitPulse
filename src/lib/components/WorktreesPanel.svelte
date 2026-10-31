@@ -45,6 +45,14 @@
    */
   let taskView = $state<TaskView | null>(null);
   let bindings = $state<Record<string, string | null>>({});
+  /**
+   * Why a worktree's binding could not be read, keyed by path. A row listed
+   * here is neither bound nor unbound: it says so rather than passing for
+   * unbound, which is a different safety posture (no planned-files fence).
+   */
+  let bindingErrors = $state<Record<string, string>>({});
+  /** Why the task store itself could not be read; null when it was, or was never asked. */
+  let taskStateError = $state<string | null>(null);
   /** Declared scope per bound task, for the planned-file summary. */
   let scopes = $state<Record<string, TaskScope>>({});
   let isLoading = $state(false);
@@ -170,6 +178,8 @@
       worktrees = [];
       taskView = null;
       bindings = {};
+      bindingErrors = {};
+      taskStateError = null;
       scopes = {};
       liveRuns = [];
       aiSummaries = {};
@@ -221,20 +231,28 @@
    *
    * Deliberately non-fatal: most repositories have no DevCouncil store, and
    * that is not an error. A failure here leaves the worktree list intact and
-   * simply shows no task column — the panel's own job still works.
+   * the panel's own job still works. It is not silent, though: a store or a
+   * binding that could not be read says "task state unavailable" on the rows
+   * it concerns, because a bound worktree that looks unbound reads as
+   * unfenced.
    */
   async function loadTaskState(repo: string, list: WorktreeInfo[], guard: AsyncGuard) {
     try {
       const view = await invoke<TaskView>("cmd_task_view", { repoPath: repo });
       if (!guard.isLive()) return;
       taskView = view;
+      taskStateError = null;
       const reads = await loadWorktreeTasks(invoke, repo, list.map((wt) => wt.path));
       if (!guard.isLive()) return;
-      const failed = reads.find((read) => !read.ok);
-      if (failed && !failed.ok) throw new Error(failed.detail);
+      // Each read stands on its own: one failing marks its row and no other.
       const resolved: Record<string, string | null> = {};
-      for (const read of reads) resolved[read.path] = read.taskId;
+      const unread: Record<string, string> = {};
+      for (const read of reads) {
+        if (read.ok) resolved[read.path] = read.taskId;
+        else unread[read.path] = read.detail;
+      }
       bindings = resolved;
+      bindingErrors = unread;
 
       // The declared scope of each bound task, so a row can say how much this
       // worktree is authorised to touch. Fetched only for tasks actually bound
@@ -247,7 +265,8 @@
       if (!guard.isLive()) return;
       // Reported to diagnostics, not to the panel's error banner: task state is
       // an enrichment, and losing it must not read as "the worktrees failed".
-      reportPanelError("worktrees", err);
+      // Each row still says its task state is unavailable.
+      taskStateError = reportPanelError("worktrees", err);
       taskView = null;
     }
   }
@@ -968,7 +987,10 @@
             {@const bound = bindings[wt.path] ?? null}
             {@const lease = leaseFor(bound)}
             <div class="flex items-center gap-1 pl-1 pb-0.5 min-w-0">
-              {#if bound}
+              {#if bindingErrors[wt.path]}
+                <!-- Not bound and not unbound: the binding could not be read. -->
+                <span class="text-[9px] text-amber-400 truncate" title={bindingErrors[wt.path]}>task state unavailable</span>
+              {:else if bound}
                 <span
                   class="shrink-0 text-[9px] font-mono rounded-full bg-accent/15 text-accent border border-accent/30 px-1.5"
                   title="Mutations in this worktree are judged against {bound}'s planned files"
@@ -1024,12 +1046,14 @@
                 </select>
               {/if}
             </div>
-          {:else if taskView && taskView.error}
+          {:else if taskView?.error || taskStateError}
             <!--
               A store we could not read is not a repository without one. Saying
               so is the difference between "no tasks here" and "we do not know".
+              The store reports its own error; a read that threw has no store
+              answer at all, which is the same "we do not know".
             -->
-            <div class="pl-1 pb-0.5 text-[9px] text-amber-400 truncate" title={taskView.error}>
+            <div class="pl-1 pb-0.5 text-[9px] text-amber-400 truncate" title={taskView?.error ?? taskStateError ?? ""}>
               task state unavailable
             </div>
           {/if}
