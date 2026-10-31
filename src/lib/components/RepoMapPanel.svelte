@@ -6,6 +6,8 @@
   import { keyedList } from "../ui/eachKeys";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { liveIndex } from "../codeintel/liveIndex";
+  import { buildBlockReason } from "../codeintel/buildBlock";
+  import { Loader2 } from "@lucide/svelte";
   import { copyDevmapLogs } from "../codeintel/diagnostics";
   import {
     buildDevmap,
@@ -216,6 +218,9 @@
 
   const currentRepo = $derived($currentRepoPath);
   const indexSnapshots = liveIndex.snapshots;
+  const indexPhase = $derived(currentRepo ? $indexSnapshots[currentRepo]?.phase : undefined);
+  const indexBusy = $derived(indexPhase === "scheduled" || indexPhase === "running");
+  const buildBlockedReason = $derived(buildBlockReason(cliKnownAbsent, indexPhase));
   const contentRevisions = repoStore.contentRevisions;
   const indexRevision = $derived(currentRepo ? ($indexSnapshots[currentRepo]?.revision ?? 0) : 0);
   const contentRevision = $derived(currentRepo ? ($contentRevisions[currentRepo] ?? "") : "");
@@ -591,8 +596,8 @@
       <button
         type="button"
         class="gp-btn text-[11px] px-2 py-0.5"
-        disabled={building || !$repoStore.currentPath || cliKnownAbsent}
-        title={cliKnownAbsent ? "devmap CLI is not installed — run Setup first" : "Refresh the map index"}
+        disabled={building || !$repoStore.currentPath || buildBlockedReason != null}
+        title={buildBlockedReason ?? "Refresh the map index"}
         onclick={() => void runBuild("refresh")}
       >
         Refresh
@@ -600,8 +605,8 @@
       <button
         type="button"
         class="gp-btn text-[11px] px-2 py-0.5"
-        disabled={building || !$repoStore.currentPath || cliKnownAbsent}
-        title={cliKnownAbsent ? "devmap CLI is not installed — run Setup first" : "Build the map index"}
+        disabled={building || !$repoStore.currentPath || buildBlockedReason != null}
+        title={buildBlockedReason ?? "Build the map index"}
         onclick={() => void runBuild("build")}
       >
         Build
@@ -891,17 +896,25 @@
   {:else if !map}
     <div class="flex-1 flex flex-col items-center justify-center gap-2 p-6 text-center" role="status">
       <p class="text-sm text-textPrimary">No repository map</p>
-      <p class="text-[11px] text-textMuted max-w-md">
-        {mapFailureText ?? boundStrip(errorMsg) ?? "Build the code map to navigate subsystems, entry points and area tests."}
-      </p>
-      <button
-        type="button"
-        class="gp-btn mt-2"
-        disabled={building || !$repoStore.currentPath}
-        onclick={() => void runBuild("build")}
-      >
-        Build Map
-      </button>
+      {#if indexBusy && indexActivity}
+        <p class="text-[11px] text-textMuted flex items-center gap-1.5" aria-busy="true" data-testid="map-index-progress">
+          <Loader2 size={12} class="animate-spin" aria-hidden="true" />
+          {indexActivity}
+        </p>
+      {:else}
+        <p class="text-[11px] text-textMuted max-w-md">
+          {mapFailureText ?? boundStrip(errorMsg) ?? "Build the code map to navigate subsystems, entry points and area tests."}
+        </p>
+        <button
+          type="button"
+          class="gp-btn mt-2"
+          disabled={building || !$repoStore.currentPath || buildBlockedReason != null}
+          title={buildBlockedReason ?? "Build the map index"}
+          onclick={() => void runBuild("build")}
+        >
+          Build Map
+        </button>
+      {/if}
     </div>
   {:else}
     {@const doc = map as RepoMapDocument}

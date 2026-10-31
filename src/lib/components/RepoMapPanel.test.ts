@@ -72,7 +72,8 @@ describe("RepoMapPanel", () => {
 
   it("disables Build and Refresh when the CLI is known absent", () => {
     expect(source).toContain("cliKnownAbsent");
-    expect(source).toContain("devmap CLI is not installed");
+    // The reason text is owned by buildBlock.ts (asserted in buildBlock.test.ts).
+    expect(source).toContain("buildBlockReason(cliKnownAbsent, indexPhase)");
     expect(source).toContain("openSetupWizard");
     expect(source).toContain("classifyMapFailure");
     expect(source).toContain("mapFailureMessage");
@@ -163,6 +164,28 @@ describe("RepoMapPanel template honesty", () => {
     expect(reload.indexOf("docsStatus = status;")).toBeLessThan(reload.indexOf("await docsBrokenLinks"));
     expect(reload).not.toContain("docsStatus = null");
     expect(reload).not.toContain("docsError");
+  });
+});
+
+describe("RepoMapPanel build gating", () => {
+  const template = source.slice(source.lastIndexOf("</script>"));
+
+  it("gates all three build buttons on one reason", () => {
+    expect(template.match(/buildBlockedReason != null/g)).toHaveLength(3);
+    expect(template).not.toContain("cliKnownAbsent ?");
+  });
+
+  it("shows progress, not an invitation to build, while the automatic index runs", () => {
+    expect(source).toContain('indexPhase === "scheduled" || indexPhase === "running"');
+    const busy = template.indexOf("{#if indexBusy && indexActivity}");
+    const progress = template.indexOf('data-testid="map-index-progress"');
+    const otherwise = template.indexOf("{:else}", busy);
+    const emptyButton = template.indexOf("Build Map", busy);
+    expect(busy).toBeGreaterThan(-1);
+    expect(progress).toBeGreaterThan(busy);
+    expect(progress).toBeLessThan(otherwise);
+    // The empty-state button lives only in the else branch.
+    expect(emptyButton).toBeGreaterThan(otherwise);
   });
 });
 
