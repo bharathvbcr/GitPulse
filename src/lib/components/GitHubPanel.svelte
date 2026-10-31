@@ -398,6 +398,14 @@
     try {
       const next = await invoke<GitHubContext>("cmd_github_context", { repoPath: repo });
       if (!guard.isLive()) return;
+      // gh reports a rate limit or an outage as a context carrying `error`. On
+      // a panel already showing a good read, that is a failed refresh, not the
+      // new truth: the listings stay, the failure is said, and the stamp keeps
+      // describing what is on screen. An error never overwrites the cache.
+      if (next.error && ctx && !ctx.error) {
+        reportRefreshFailure(next.error);
+        return;
+      }
       ctx = next;
       // The full context is the newer read, so the poll's older snapshot must
       // stop superseding it. Without this, a Refresh after a paused poll shows
@@ -414,10 +422,16 @@
       ctxCache.set(repo, next);
     } catch (err) {
       if (!guard.isLive()) return;
-      ctx = emptyContext(formatError(err));
+      if (ctx && !ctx.error) reportRefreshFailure(formatError(err));
+      else ctx = emptyContext(formatError(err));
     } finally {
       if (guard.isLive()) loading = false;
     }
+  }
+
+  /** A failed refresh over data already on screen: keep the data, say what failed and how old it is. */
+  function reportRefreshFailure(message: string) {
+    actionError = `Refresh failed: ${message} — showing ${fetchedAgo ? `data fetched ${fetchedAgo}` : "the last data read"}`;
   }
 
   async function loadWorkflowsFor(repo: string) {
@@ -806,9 +820,14 @@
           {ciRunning ? "Running…" : "Run CI locally"}
         </span>
       </button>
-      <button type="button" onclick={loadAll} class="gp-btn">
+      <!-- Busy whenever a read is out, not only on the first one: a refresh over
+           data already on screen shows nothing else changing, so without this the
+           click looks like it did nothing. Disabled too, so a second click does
+           not start a read the first is still making. It re-enables when the read
+           settles, failed or not — it is also the retry for the error card. -->
+      <button type="button" onclick={loadAll} class="gp-btn" disabled={loading || workflowsLoading}>
         <span class="inline-flex items-center gap-1.5">
-          {#if (loading && !ctx) || (workflowsLoading && !workflows)}
+          {#if loading || workflowsLoading}
             <LoaderCircle size={13} class="animate-spin" />
           {/if}
           Refresh

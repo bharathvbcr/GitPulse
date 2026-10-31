@@ -59,6 +59,15 @@ describe("GitHubPanel confirmation and refresh contracts", () => {
     expect(row).not.toContain("let notice");
     expect(row).toContain(">Retry</button>");
   });
+
+  it("keeps the last good context when a refresh fails, and disables Refresh while one is out", () => {
+    expect(source).toContain("if (ctx && !ctx.error) reportRefreshFailure(formatError(err));");
+    expect(source).toContain("if (next.error && ctx && !ctx.error) {");
+    expect(source).toContain("disabled={loading || workflowsLoading}");
+    // The stamp is only moved by a read that landed.
+    const failure = source.slice(source.indexOf("function reportRefreshFailure"), source.indexOf("async function loadWorkflowsFor"));
+    expect(failure).not.toContain("fetchedAt");
+  });
 });
 
 describe("GitHubPanel live-poll lifecycle contracts", () => {
