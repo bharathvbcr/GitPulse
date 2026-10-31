@@ -186,7 +186,7 @@ describe("CommitTable failed and loading reloads", () => {
 });
 
 describe("CommitTable scroll on a new filter", () => {
-  const start = source.indexOf("const listRepoPath = $derived");
+  const start = source.indexOf("const listFilterSignature = $derived");
   const block = source.slice(start, source.indexOf("// Theme changes are rare"));
 
   it("keys the reset on the normalized query and branch, and records a repository switch without scrolling", () => {

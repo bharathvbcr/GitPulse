@@ -2,7 +2,7 @@
   import { onMount, untrack } from "svelte";
   import { get } from "svelte/store";
   import { graphStore } from "../stores/graphStore";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { filterStore } from "../stores/filterStore";
   import { themeStore } from "../stores/themeStore";
   import { densityStore } from "../stores/densityStore";
@@ -881,7 +881,6 @@
   // landing under a CHANGED filter signature does this: watcher reloads and
   // load-more keep the signature and so keep the position, and a repository
   // switch only records the new baseline (the list is a different one).
-  const listRepoPath = $derived($repoStore.currentPath);
   const listFilterSignature = $derived(
     `${normalizeGraphQuery($filterStore.searchQuery)}\u0000${$filterStore.selectedBranch ?? ""}`,
   );
@@ -892,7 +891,7 @@
   $effect(() => {
     const rows = $graphStore.rows;
     const loading = $graphStore.isLoading;
-    const path = listRepoPath;
+    const path = $currentRepoPath;
     const signature = listFilterSignature;
     untrack(() => {
       const fellIdle = wasLoading && !loading;
