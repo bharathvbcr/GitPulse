@@ -37,7 +37,7 @@
   import { linkTaskToIssue, MAX_TASK_ISSUE_BATCH, prepareTaskIssues, runTaskIssues, summarizeTaskIssues, taskIssuesConfirmation, type TaskIssueResult, type TaskIssueTarget } from "../workbench/taskIssue";
   import { askConfirm } from "../stores/modalStore";
   import { openExternal } from "../desktop/openExternal";
-  import { cardMatchesQuery, parseTaskQuery, queryChips, queryControlValue, queryHas, removeQueryTerm, repositoryMatches, setQueryControl, toggleQueryTerm, QUERY_HELP, type QueryContext, type SuggestionSources } from "../workbench/taskQuery";
+  import { cardMatchesQuery, dueRangeFilter, parseTaskQuery, queryChips, queryControlValue, queryHas, removeQueryTerm, repositoryMatches, setQueryControl, toggleQueryTerm, QUERY_HELP, type QueryContext, type SuggestionSources } from "../workbench/taskQuery";
   import { describeMatch, searchCards, type RankContext, type RankedCard, type SearchOrder } from "../workbench/taskRank";
   import { CANDIDATE_PAGE, MAX_CANDIDATES, bucketByStatus, canLoadMore, candidatesComplete, describeSearch, nextCandidates, planSearch, readAllCandidates, reloadCandidates, type CandidateRead, type CandidateSet, type SearchPlan } from "../workbench/taskSearchPlan";
   import TaskSearchField from "./TaskSearchField.svelte";
@@ -156,7 +156,7 @@
   const statusControl = $derived(queryControlValue(parsedQuery, "status"));
   const rangeControl = $derived(queryControlValue(parsedQuery, "due-range"));
   const rangeEnds = $derived<[string, string]>(rangeControl ? (rangeControl.split("..") as [string, string]) : ["", ""]);
-  const setDueRange = (from: string, to: string) => { search = setQueryControl(search, "due-range", from || to ? `due:${from}..${to}` : ""); };
+  const setDueRange = (from: string, to: string) => { search = setQueryControl(search, "due-range", dueRangeFilter(from, to)); };
   /** The Filters bar's choices: applied with the search's filters by `cardVisible`, kept by saved views. */
   let facet = $state<TaskFacet>(emptyFacet());
   // ---- Hidden repositories (`taskHiddenRepositories.ts`) ------------------

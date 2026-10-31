@@ -3455,7 +3455,8 @@ if (params.has("check")) {
         const waveNote = () => root.querySelector('[data-testid="wave-priority"]')?.textContent ?? "";
         check("Run in waves is bounded by the priority Suggest next was set to", waveNote().includes("priority") && waveNote().includes("or higher") && !waveNote().includes("any priority"));
         await change(panel().querySelector('[aria-label="Suggest tasks at or above this priority"]'), "all", "change"); await wait(() => suggestCalls.length === 4 && idle());
-        check("Run in waves asks for any priority again once Suggest next is cleared", waveNote().includes("any priority"));
+        // Companion to the check above, not a discriminator: the note says "any" before the ceiling is wired too.
+        check("Run in waves asks for any priority again once Suggest next is cleared (companion)", waveNote().includes("any priority"));
         check("Any priority asks with no ceiling at all", !("max_priority" in suggestCalls.at(-1)));
         // Two asks in flight: the board's own scope change makes the second. The answers
         // arrive newest first, and the older one must not replace what is on screen.
@@ -3538,6 +3539,14 @@ if (params.has("check")) {
         check("each date input bounds the other, so a range cannot end before it starts", fromInput().max === "2026-11-30" && toInput().min === "2026-11-01");
         await change(fromInput(), "", "change"); await change(toInput(), "", "change"); await settle(300);
         check("clearing both days brings every card back and takes the range out of the search", same(names(), [true, true, true, true]) && !searchText().includes("due:"));
+        // A day typed before the other end is swapped, so the search never holds a range the parser refuses.
+        await change(fromInput(), "2026-11-20", "change"); await change(toInput(), "2026-11-05", "change"); await settle(300);
+        check("an end typed before the other end swaps them, leaving one accepted range in the search", searchText().includes("due:2026-11-05..2026-11-20") && !searchText().includes("due:2026-11-20") && fromInput().value === "2026-11-05" && toInput().value === "2026-11-20");
+        // A range inside a list with a named value is the search's to keep: the inputs do not claim half of it.
+        const searchBox = root.querySelector('[aria-label="Search tasks"]');
+        await change(searchBox, "due:overdue,2026-11-01.."); await settle(300);
+        check("a due list that mixes a named value with a range disables both date inputs and leaves the search as typed", fromInput().disabled && toInput().disabled && searchText() === "due:overdue,2026-11-01..");
+        await change(searchBox, ""); await settle(300);
         tasks = original;
         await click("Filters"); await click("Refresh"); await wait(() => card("task-1"));
       } catch (error) { check(`the status and due range checks ran to the end (${error.message} at ${step})`, false); }

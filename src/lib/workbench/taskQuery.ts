@@ -507,24 +507,62 @@ function controlTerm(term: QueryTerm, control: QueryControl): boolean {
 /**
  * What a control shows for the search: "" when it holds none, the one value
  * (`review`, `2026-11-01..2026-11-30`) when it holds one, and null when it
- * holds more than a control can show (a list, an exclusion). The search keeps
- * the say then; the control never pretends to hold it.
+ * holds more than a control can show (a list, an exclusion, or a list that
+ * mixes its value with others, `due:overdue,2026-11-01..`, which means
+ * "overdue OR from the 1st" and is not the range alone). The search keeps the
+ * say then; the control never pretends to hold it.
  */
 export function queryControlValue(parsed: ParsedTaskQuery, control: QueryControl): string | null {
   const held = parsed.terms.filter((term) => controlTerm(term, control));
   if (held.length === 0) return "";
-  return held.length === 1 && !held[0].negated ? held[0].value : null;
+  const [only] = held;
+  const alone = held.length === 1 && !only.negated && parsed.terms.every((term) => term === only || term.start !== only.start);
+  return alone ? only.value : null;
 }
 
 /**
- * The search with every filter the control reads taken out (whole tokens,
- * lists and exclusions included), then `filter` (`status:review`) added
- * unless it is "". A change that would push the search past the store's
- * limit leaves it unchanged.
+ * A filter token (`due:overdue,2026-11-01..`) without the values the control
+ * reads, or "" when none would be left; other values stay as typed. For the
+ * range, a value the parser refused (`due:B..A`) goes too: left behind, it would
+ * sit unseen beside the range that replaces it.
+ */
+function tokenWithoutControl(raw: string, control: QueryControl): string {
+  const match = /^(-?)([A-Za-z]+):(.*)$/s.exec(raw);
+  const key = match ? KEY_ALIASES[match[2].toLowerCase()] : undefined;
+  if (!match || !key) return raw;
+  const pieces = listPieces(match[3]);
+  const kept = pieces.filter((piece) => {
+    const read = parseTaskQuery(`${match[1]}${match[2]}:${piece}`).terms;
+    if (read.some((term) => controlTerm(term, control))) return false;
+    return !(control === "due-range" && key === "due" && read.length === 0 && unquote(piece).includes(".."));
+  });
+  if (kept.length === pieces.length) return raw;
+  return kept.length ? `${match[1]}${match[2]}:${kept.join(",")}` : "";
+}
+
+/**
+ * The `due:FROM..TO` filter for the Filters bar's two days, "" when both are
+ * empty. A pair typed backwards is swapped: the date inputs' min and max do not
+ * stop a typed value, and the parser refuses a range that ends before it starts.
+ */
+export function dueRangeFilter(from: string, to: string): string {
+  if (from === "" && to === "") return "";
+  const [first, last] = from !== "" && to !== "" && from > to ? [to, from] : [from, to];
+  return `due:${first}..${last}`;
+}
+
+/**
+ * The search with every value the control reads taken out (lists and
+ * exclusions included; a list's other values stay), then `filter`
+ * (`status:review`) added unless it is "". A change that would push the
+ * search past the store's limit leaves it unchanged.
  */
 export function setQueryControl(search: string, control: QueryControl, filter: string): string {
-  const held = parseTaskQuery(search).terms.filter((term) => controlTerm(term, control));
-  const cleared = editSpans(search, held.map((term) => ({ ...term, replacement: "" })));
+  const edits = queryTokens(search.slice(0, MAX_QUERY_TEXT)).flatMap((token) => {
+    const replacement = tokenWithoutControl(token.text, control);
+    return replacement === token.text ? [] : [{ start: token.start, end: token.end, raw: token.text, replacement }];
+  });
+  const cleared = editSpans(search, edits);
   if (filter === "") return cleared;
   const next = cleared.trim() ? `${cleared.trim()} ${filter}` : filter;
   return next.length <= MAX_QUERY_TEXT ? next : search;
