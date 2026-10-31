@@ -7,6 +7,8 @@
   import { LAYERS } from "../ui/layers";
   import { Keyboard, X, Search, Layers, GitBranch, LayoutGrid, FileDiff } from "@lucide/svelte";
   import { isImeComposition } from "../keyboard/imeGuard";
+  import { isDialogEscape } from "../keyboard/dialogEscape";
+  import { isModalOccupied } from "../keyboard/modalOccupied";
   import { hostPlatform } from "../stores/platformStore";
   import { shortcutKeyLabels, shortcutTextLabel } from "../ui/platformCopy";
 
@@ -143,7 +145,7 @@
     const isInput =
       target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
 
-    if ((e.key === "?" || ((e.metaKey || e.ctrlKey) && e.key === "/")) && !isInput && !isOpen) {
+    if ((e.key === "?" || ((e.metaKey || e.ctrlKey) && e.key === "/")) && !isInput && !isOpen && !isModalOccupied()) {
       e.preventDefault();
       isOpen = true;
     } else if (e.key === "Escape" && isOpen) {
@@ -173,7 +175,7 @@
     aria-label="Keyboard Shortcuts"
     tabindex="-1"
     onclick={(e) => e.target === e.currentTarget && close()}
-    onkeydown={(e) => e.key === "Escape" && close()}
+    onkeydown={(e) => isDialogEscape(e) && close()}
     in:fade={backdropFade()}
     out:fade={backdropFadeOut()}
     class="gp-scrim bg-black/50 flex items-center justify-center p-4 select-none gp-gpu"

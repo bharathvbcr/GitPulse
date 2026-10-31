@@ -49,7 +49,13 @@
   } from "../ui/settingsSections";
   import { matchSettings, unsupportedSettingIds } from "../ui/settingsCatalog";
   import { hostPlatform } from "../stores/platformStore";
-  import { readLaunchAtLogin, writeLaunchAtLogin, type LaunchAtLogin } from "../desktop/launchAtLogin";
+  import { escapeClearsSearch, isDialogEscape } from "../keyboard/dialogEscape";
+  import {
+    describeLaunchAtLogin,
+    readLaunchAtLogin,
+    writeLaunchAtLogin,
+    type LaunchAtLogin,
+  } from "../desktop/launchAtLogin";
   import { launchAtLoginMechanism, shortcutTextLabel, statusIconLocationName, statusIconSettingLabel } from "../ui/platformCopy";
   import { appleIntelligenceStatus, appleReady, type AppleIntelligenceStatus } from "../ai/appleIntelligence";
   import { VIEW_NAV } from "../views/viewNav";
@@ -94,7 +100,10 @@
 
   let activeSection = $state<SettingsSectionId>("appearance");
   let themePreference = $state<ThemePreference>(themeStore.preference());
-  let launchAtLogin = $state<LaunchAtLogin>({ state: "unknown", error: "still reading" });
+  // Only the very first open shows "Checking…"; later opens keep the last known
+  // state while the read-back runs, so the toggle does not blink disabled.
+  let launchAtLogin = $state<LaunchAtLogin>({ state: "loading" });
+  const launchRow = $derived(describeLaunchAtLogin(launchAtLogin));
 
   /**
    * Settings is the only entry point to the tour, so it has to get out of the
@@ -105,6 +114,26 @@
     onClose?.();
     productTour.open();
   }
+
+  /**
+   * The wizard is its own dialog and Settings would paint over it (and hold
+   * focus in a hidden dialog), so Settings gets out of the way first, the same
+   * as `replayWalkthrough`.
+   */
+  function runToolsSetup() {
+    onClose?.();
+    window.dispatchEvent(new CustomEvent("gitpulse:setup-tools"));
+  }
+
+  /** Tells the reader the click did something; cleared when Settings closes. */
+  let tipsStatus = $state("");
+  function resetTips() {
+    interfaceStore.resetCoachMarks();
+    tipsStatus = "Tips restored";
+  }
+  $effect(() => {
+    if (!isOpen) tipsStatus = "";
+  });
 
   async function refreshLaunchAtLogin() {
     launchAtLogin = await readLaunchAtLogin();
@@ -476,7 +505,7 @@
     aria-labelledby="settings-modal-title"
     tabindex="-1"
     onclick={(e) => e.target === e.currentTarget && onClose?.()}
-    onkeydown={(e) => e.key === "Escape" && onClose?.()}
+    onkeydown={(e) => isDialogEscape(e) && onClose?.()}
     in:fade={backdropFade()}
     out:fade={backdropFadeOut()}
     class="gp-scrim bg-black/40 flex items-center justify-center p-4 select-none gp-gpu"
@@ -507,6 +536,15 @@
           <input
             type="search"
             bind:value={query}
+            onkeydown={(e) => {
+              // Escape with text in the field clears it; the dialog stays open.
+              // On an empty field it bubbles up and closes Settings.
+              if (escapeClearsSearch(e, query)) {
+                e.preventDefault();
+                e.stopPropagation();
+                query = "";
+              }
+            }}
             placeholder="Search settings"
             aria-label="Search settings"
             class="w-full rounded-lg border border-border/70 bg-surfaceHover/40 py-1 pl-6 pr-6 text-[11px] text-textPrimary placeholder:text-textMuted focus:border-accent/60 focus:outline-hidden"
@@ -808,11 +846,12 @@
                     </div>
                     <button
                       type="button"
-                      onclick={() => interfaceStore.resetCoachMarks()}
+                      onclick={resetTips}
                       class="gp-btn py-0.5! px-2.5! text-[11px] shrink-0"
                     >
                       Reset Tips
                     </button>
+                    {#if tipsStatus}<span class="text-textMuted text-[10px]" role="status">{tipsStatus}</span>{/if}
                   </div>
 
                   <div
@@ -874,11 +913,16 @@
                         description={`Start GitPulse when you sign in. Uses ${launchAtLoginMechanism($hostPlatform.os)}; the operating system is the source of truth.`}
                         ariaLabel="Launch GitPulse at login"
                         checked={launchAtLogin.state === "on"}
-                        disabled={launchAtLogin.state === "unknown"}
+                        disabled={launchRow.disabled}
                         onchange={(next) => void setLaunchAtLogin(next)}
                       />
-                      {#if launchAtLogin.state === "unknown"}
-                        <p class="mt-1 text-[10px] text-amber-500" role="status">Launch at login is unknown: it could not be read ({launchAtLogin.error}).</p>
+                      {#if launchRow.note}
+                        <p
+                          class="mt-1 text-[10px] {launchRow.note.tone === 'warn' ? 'text-amber-500' : 'text-textMuted'}"
+                          role="status"
+                        >
+                          {launchRow.note.text}
+                        </p>
                       {/if}
                     </div>
                   </div>
@@ -1222,8 +1266,10 @@
                 </div>
                 <div data-setting="mcp-plugin" hidden={!shown("mcp-plugin")}>
                   <p class="text-textMuted text-[10px] leading-snug mb-2">
-                    Agents connect through the native Codex plugin package
-                    (`.codex-plugin/plugin.json` + `.mcp.json`) and speak MCP 2026-07-28. The
+                    Claude Code, Codex and Cursor connect through the GitPulse plugin package, which
+                    ships a manifest for each. The one read and copied below is the Codex manifest
+                    (<code class="font-mono">.codex-plugin/plugin.json</code> +
+                    <code class="font-mono">.mcp.json</code>); all of them speak MCP 2026-07-28. The
                     surface is read-only: it never checks out a branch or writes a file.
                   </p>
                   {#if mcpError}
@@ -1233,7 +1279,9 @@
                       <AlertTriangle size={12} class="shrink-0 mt-px" />
                       <span>{mcpError}</span>
                     </div>
-                  {:else if mcpInfo}
+                  {:else if !mcpInfo}
+                    <p class="text-textMuted text-[10px] mb-2" data-testid="mcp-info-pending">Reading plugin info…</p>
+                  {:else}
                     <div class="space-y-1.5 rounded-xl border border-border/70 bg-surfaceHover/40 p-2.5">
                       <div class="flex items-start gap-2">
                         <Plug size={13} class="text-accent shrink-0 mt-0.5" />
@@ -1259,11 +1307,11 @@
                           {#if !mcpInfo.binary_on_path || !mcpInfo.hook_on_path}
                             <div class="text-amber-600 dark:text-amber-400 text-[10px] mt-1" data-testid="path-status">
                               {#if !mcpInfo.binary_on_path && !mcpInfo.hook_on_path}
-                                `gitpulse-mcp` and `gitpulse-hook` are not on PATH, so the plugin's own manifests cannot start them.
+                                <code class="font-mono">gitpulse-mcp</code> and <code class="font-mono">gitpulse-hook</code> are not on PATH, so the plugin's own manifests cannot start them.
                               {:else if !mcpInfo.binary_on_path}
-                                `gitpulse-mcp` is not on PATH, so the plugin's own manifest cannot start it.
+                                <code class="font-mono">gitpulse-mcp</code> is not on PATH, so the plugin's own manifest cannot start it.
                               {:else}
-                                `gitpulse-hook` is not on PATH, so the plugin's own hooks cannot start it and the collision guard and command gate are off.
+                                <code class="font-mono">gitpulse-hook</code> is not on PATH, so the plugin's own hooks cannot start it and the collision guard and command gate are off.
                               {/if}
                               Copy the manifests below instead: they name the binaries by absolute path.
                             </div>
@@ -1340,7 +1388,7 @@
                   <button
                     type="button"
                     class="gp-btn text-[11px] px-2 py-0.5"
-                    onclick={() => window.dispatchEvent(new CustomEvent("gitpulse:setup-tools"))}
+                    onclick={runToolsSetup}
                   >
                     Run setup
                   </button>

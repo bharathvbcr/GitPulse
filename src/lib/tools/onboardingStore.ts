@@ -5,6 +5,7 @@ import { writable, derived, get } from "svelte/store";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   cancelExternalToolInstall,
+  cloneToolSource,
   getExternalToolsStatus,
   getToolConfig,
   getToolLadder,
@@ -25,6 +26,7 @@ import {
 } from "./externalTools";
 
 import type { DevcouncilPreset } from "./devcouncilInstall";
+import { formatError } from "../ui/formatError";
 
 export type WizardStep = "explain" | "source" | "preflight" | "install" | "verify" | "done";
 
@@ -54,6 +56,14 @@ const progressLine = writable<string | null>(null);
 const preflight = writable<PreflightReport | null>(null);
 const ladder = writable<LadderAssessment | null>(null);
 const verify = writable<VerifyReport | null>(null);
+/** True while a verify run is out, so the button can say so and not stack runs. */
+const verifying = writable<boolean>(false);
+/**
+ * Why the last wizard action (verify, cancel, finish) failed. Separate from
+ * `loadError`, which is about reads: an action that threw used to vanish, so
+ * the wizard looked like it had done nothing.
+ */
+const actionError = writable<string | null>(null);
 
 // Single in-flight/settled registration: concurrent callers share one
 // listen() so a second open before the first await resolves cannot leak.
@@ -73,6 +83,8 @@ export const onboardingStore = {
   preflight,
   ladder,
   verify,
+  verifying,
+  actionError,
   /** True when either tool is missing and onboarding was not dismissed. */
   showFirstRunCard: derived([status, config], ([$status, $config]) => {
     if (!$status || !$config) return false;
@@ -114,6 +126,7 @@ export function openSetupWizard(tool: ExternalTool = "devmap", step: WizardStep 
     focusToolOnly: tool !== "devmap" || step !== "explain",
     preset: "devmap",
   });
+  actionError.set(null);
   void ensureProgressListener().catch(() => {});
   void refreshToolsStatus();
   void refreshToolConfig();
@@ -125,10 +138,12 @@ export function closeSetupWizard() {
 }
 
 export function setWizardStep(step: WizardStep) {
+  actionError.set(null);
   wizard.update((w) => ({ ...w, step }));
 }
 
 export function setWizardTool(tool: ExternalTool) {
+  actionError.set(null);
   wizard.update((w) => ({ ...w, tool, preset: tool === "devmap" ? w.preset : "devmap" }));
   void loadLadderAndPreflight(tool);
 }
@@ -137,10 +152,24 @@ export function setWizardPreset(preset: DevcouncilPreset) {
   wizard.update((w) => ({ ...w, preset }));
 }
 
+/**
+ * Re-runs everything the wizard reads, for the Retry beside a failed read.
+ * Without it a failed ladder or preflight left the Check step on "Checking…"
+ * and the Install step on an empty rung list, with nothing to press.
+ */
+export function retryWizardLoad(tool: ExternalTool) {
+  void refreshToolsStatus();
+  void refreshToolConfig();
+  void loadLadderAndPreflight(tool);
+}
+
 async function loadLadderAndPreflight(tool: ExternalTool) {
   const ticket = ++ladderTicket;
   ladder.set(null);
   preflight.set(null);
+  // This attempt supersedes any earlier failure, including one for the tool
+  // the user has just switched away from.
+  loadError.set(null);
   try {
     const nextLadder = await getToolLadder(tool);
     if (ticket !== ladderTicket) return;
@@ -201,7 +230,12 @@ export async function runInstall(tool: ExternalTool, rung?: InstallRung | null) 
 }
 
 export async function cancelInstall() {
-  await cancelExternalToolInstall();
+  actionError.set(null);
+  try {
+    await cancelExternalToolInstall();
+  } catch (e) {
+    actionError.set(`Could not cancel the install: ${formatError(e)}`);
+  }
 }
 
 export async function dismissFirstRun() {
@@ -222,9 +256,16 @@ export async function dismissFirstRun() {
   config.set(next);
 }
 
+/**
+ * Records that setup finished. Throws when it could not: an unreadable saved
+ * configuration used to return quietly, so the wizard closed having recorded
+ * nothing and the first-run card came back on the next launch.
+ */
 export async function markOnboardingComplete() {
-  const current = get(config)?.config;
-  if (!current) return;
+  const current = get(config)?.config ?? (await refreshToolConfig())?.config;
+  if (!current) {
+    throw new Error("Tool configuration is not loaded yet, so setup completion could not be recorded.");
+  }
   const next = await saveToolConfig({
     ...current,
     onboarding: {
@@ -237,8 +278,50 @@ export async function markOnboardingComplete() {
   config.set(next);
 }
 
+/**
+ * What the last step may claim. "Setup complete" used to print whether or not
+ * anything was installed or verify had passed; only a passing verify for this
+ * tool earns it.
+ */
+export function setupOutcome(report: VerifyReport | null, tool: ExternalTool): "passed" | "failed" | "skipped" {
+  if (!report || report.tool !== tool) return "skipped";
+  return report.ok ? "passed" : "failed";
+}
+
+/** Completes setup and closes the wizard; stays open and says why when it cannot. */
+export async function finishSetup(): Promise<boolean> {
+  actionError.set(null);
+  try {
+    await markOnboardingComplete();
+  } catch (e) {
+    actionError.set(formatError(e));
+    return false;
+  }
+  closeSetupWizard();
+  return true;
+}
+
 export async function runVerify(tool: ExternalTool) {
-  verify.set(await verifyTool(tool));
+  if (get(verifying)) return;
+  verifying.set(true);
+  actionError.set(null);
+  try {
+    verify.set(await verifyTool(tool));
+  } catch (e) {
+    actionError.set(`Verify could not run: ${formatError(e)}`);
+  } finally {
+    verifying.set(false);
+  }
+}
+
+/** Clones a tool's source; always answers a line the wizard can show. */
+export async function cloneSource(tool: ExternalTool, parentDir: string): Promise<string> {
+  try {
+    const result = await cloneToolSource(tool, parentDir);
+    return result.ok ? `Cloned to ${result.path}` : (result.reason ?? "Clone failed");
+  } catch (e) {
+    return `Clone failed: ${formatError(e)}`;
+  }
 }
 
 export type { DevcouncilPreset };

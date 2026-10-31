@@ -28,7 +28,11 @@ describe("ft-038e6ba5 wiring", () => {
 
   it("Launch at login renders unknown distinctly from Off", () => {
     const modal = read("SettingsModal.svelte");
-    expect(modal).toContain('launchAtLogin.state === "unknown"');
+    // The unknown/off distinction moved out of the template into
+    // describeLaunchAtLogin (pinned in launchAtLogin.test.ts); the modal must
+    // render through it and still never collapse an unreadable setting to off.
+    expect(modal).toContain("describeLaunchAtLogin(launchAtLogin)");
+    expect(modal).toContain('checked={launchAtLogin.state === "on"}');
     expect(modal).not.toMatch(/launchAtLogin = false/);
   });
 });

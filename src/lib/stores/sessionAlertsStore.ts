@@ -1,6 +1,7 @@
 import { writable, type Readable } from "svelte/store";
 import { invoke } from "../ipc/invoke";
 import { isTauri } from "../platform";
+import { formatError } from "../ui/formatError";
 import { createAttendance } from "../terminal/attendance";
 
 /**
@@ -145,6 +146,17 @@ const store = writable<SessionAlertsView>({
   bridge_supported: false,
 });
 
+/**
+ * Why the first read of the settings failed, or null when it has not failed.
+ *
+ * `loadSessionAlerts` answers the defaults on a failure so a terminal can
+ * still spawn, which is right for the spawn path and wrong for the panel: the
+ * defaults would render as the user's real settings. The panel reads this to
+ * tell the two apart. A later successful read clears it.
+ */
+const loadErrorStore = writable<string | null>(null);
+export const sessionAlertsLoadError: Readable<string | null> = { subscribe: loadErrorStore.subscribe };
+
 let loaded = false;
 let inFlight: Promise<SessionAlertsView> | null = null;
 
@@ -164,10 +176,16 @@ export async function loadSessionAlerts(): Promise<SessionAlertsView> {
   inFlight = invoke<SessionAlertsView>("cmd_session_alerts")
     .then((view) => {
       store.set(view);
+      loadErrorStore.set(null);
       loaded = true;
       return view;
     })
-    .catch(() => current())
+    .catch((error) => {
+      // Not loaded: the next read asks again. The defaults still go to the
+      // caller, but the reason is kept for whoever shows them.
+      loadErrorStore.set(formatError(error));
+      return current();
+    })
     .finally(() => {
       inFlight = null;
     });
@@ -179,6 +197,7 @@ export async function refreshSessionAlerts(): Promise<SessionAlertsView> {
   if (!isTauri()) return current();
   const view = await invoke<SessionAlertsView>("cmd_session_alerts");
   store.set(view);
+  loadErrorStore.set(null);
   loaded = true;
   return view;
 }
@@ -192,6 +211,7 @@ export async function saveSessionAlerts(
   }
   const view = await invoke<SessionAlertsView>("cmd_session_alerts_save", { settings });
   store.set(view);
+  loadErrorStore.set(null);
   loaded = true;
   return view;
 }

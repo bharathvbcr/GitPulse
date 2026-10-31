@@ -5,20 +5,23 @@
    */
   import { X, Download, Check, ChevronRight, Clipboard, Terminal } from "@lucide/svelte";
   import { invoke } from "../../ipc/invoke";
+  import { LAYERS } from "../../ui/layers";
   import {
     cancelInstall,
+    cloneSource,
     closeSetupWizard,
-    markOnboardingComplete,
+    finishSetup,
     onboardingStore,
+    retryWizardLoad,
     runInstall,
     runVerify,
+    setupOutcome,
     setWizardPreset,
     setWizardStep,
     setWizardTool,
     type WizardStep,
   } from "../../tools/onboardingStore";
   import {
-    cloneToolSource,
     toolStatusSummary,
     type ExternalTool,
     type InstallRung,
@@ -42,6 +45,9 @@
   const progressLine = onboardingStore.progressLine;
   const lastOutcome = onboardingStore.lastOutcome;
   const verify = onboardingStore.verify;
+  const verifying = onboardingStore.verifying;
+  const loadError = onboardingStore.loadError;
+  const actionError = onboardingStore.actionError;
 
   const steps: { id: WizardStep; label: string }[] = [
     { id: "explain", label: t("setup.step.explain") },
@@ -104,10 +110,7 @@
   async function doClone() {
     if (!cloneParent) return;
     cloneNote = "Cloning…";
-    const result = await cloneToolSource($wizard.tool, cloneParent);
-    cloneNote = result.ok
-      ? `Cloned to ${result.path}`
-      : (result.reason ?? "Clone failed");
+    cloneNote = await cloneSource($wizard.tool, cloneParent);
   }
 
   async function installSelected() {
@@ -124,15 +127,20 @@
     closeSetupWizard();
   }
 
-  async function finish() {
-    await markOnboardingComplete();
-    closeSetupWizard();
-  }
+  const outcome = $derived(setupOutcome($verify, $wizard.tool));
 </script>
+
+{#snippet readFailure()}
+  <div class="space-y-1.5" role="alert" data-testid="setup-read-error">
+    <p class="text-danger text-[11px]">Could not read the install options: {$loadError}</p>
+    <button type="button" class="gp-btn text-[11px]" onclick={() => retryWizardLoad($wizard.tool)}>Retry</button>
+  </div>
+{/snippet}
 
 {#if $wizard.open}
   <div
-    class="gp-scrim fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+    class="gp-scrim fixed inset-0 flex items-center justify-center bg-black/40 p-4"
+    style="z-index: {LAYERS.PROMPT}"
     role="presentation"
   >
     <div
@@ -258,6 +266,8 @@
                 </li>
               {/each}
             </ul>
+          {:else if $loadError}
+            {@render readFailure()}
           {:else}
             <p class="text-textMuted">{t("setup.checking")}</p>
           {/if}
@@ -307,6 +317,9 @@
             {/if}
           {/if}
           {#if $wizard.tool !== "devmap" || $wizard.preset === "devmap"}
+            {#if !$ladder && $loadError}
+              {@render readFailure()}
+            {/if}
             {#if $ladder}
               <ul class="space-y-1.5">
                 {#each $ladder.rungs as rung, i (`${rung.rung}#${i}`)}
@@ -345,7 +358,10 @@
                 <button
                   type="button"
                   class="gp-btn text-[11px] inline-flex items-center gap-1"
-                  disabled={!$ladder || (toolStatus?.installed && $ladder.selected === "already_on_path")}
+                  disabled={$installing !== null ||
+                    !$ladder ||
+                    (toolStatus?.installed && $ladder.selected === "already_on_path")}
+                  title={$installing ? `Installing ${$installing}…` : undefined}
                   onclick={() => void installSelected()}
                 >
                   <Download size={12} />
@@ -370,9 +386,10 @@
           <button
             type="button"
             class="gp-btn text-[11px]"
+            disabled={$verifying}
             onclick={() => void runVerify($wizard.tool)}
           >
-            Run verify
+            {$verifying ? "Verifying…" : "Run verify"}
           </button>
           {#if $verify && $verify.tool === $wizard.tool}
             <p class={$verify.ok ? "text-emerald-600 dark:text-emerald-400" : "text-amber-600 dark:text-amber-400"}>
@@ -386,11 +403,22 @@
             Continue
           </button>
         {:else}
-          <div class="flex items-center gap-2 text-emerald-600 dark:text-emerald-400">
-            <Check size={14} />
-            <span>{t("setup.complete")}</span>
-          </div>
-          <button type="button" class="gp-btn text-[11px]" onclick={() => void finish()}>Done</button>
+          {#if outcome === "passed"}
+            <div class="flex items-center gap-2 text-emerald-600 dark:text-emerald-400">
+              <Check size={14} />
+              <span>{t("setup.complete")}</span>
+            </div>
+          {:else}
+            <p class="text-amber-600 dark:text-amber-400" data-testid="setup-done-caveat">
+              {outcome === "failed"
+                ? "Setup finished, but verify did not pass."
+                : "Setup finished; verify was skipped."}
+            </p>
+          {/if}
+          <button type="button" class="gp-btn text-[11px]" onclick={() => void finishSetup()}>Done</button>
+        {/if}
+        {#if $actionError}
+          <p class="text-danger text-[11px]" role="alert" data-testid="setup-action-error">{$actionError}</p>
         {/if}
       </div>
     </div>

@@ -64,7 +64,10 @@ describe("AgentIntegrationPanel", () => {
     expect(integration).toContain("applyDevmapIntegration");
     // Applying is gated on a confirmation built by the tested owner.
     expect(integration).toContain("applyConfirmText");
-    expect(integration).toContain("window.confirm");
+    // ... asked in the app's own dialog: window.confirm answers null under
+    // WKWebView, which this gate read as a refusal (SO-12).
+    expect(integration).toContain("askConfirm(");
+    expect(integration).not.toContain("window.confirm");
   });
 
   it("never assembles its own change-count sentence", () => {

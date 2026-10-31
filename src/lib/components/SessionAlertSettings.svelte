@@ -15,6 +15,7 @@
    * user with no way to tell a silent feature from a broken one.
    */
   import { onMount } from "svelte";
+  import { get } from "svelte/store";
   import { isTauri } from "../platform";
   import { hostPlatform } from "../stores/platformStore";
   import { desktopNotificationsSupported, notificationUnavailableReason } from "../ui/platformCopy";
@@ -25,8 +26,10 @@
     refreshSessionAlerts,
     saveSessionAlerts,
     sessionAlerts,
+    sessionAlertsLoadError,
     type SessionAlertSettings,
   } from "../stores/sessionAlertsStore";
+  import { loadOnce } from "../settings/loadOnce";
 
   let { active = true }: { active?: boolean } = $props();
 
@@ -85,7 +88,12 @@
     try {
       const fresh = await (loaded ? refreshSessionAlerts() : loadSessionAlerts());
       if (disposed) return;
+      // An attempt either way, so the effect below never starts another by
+      // itself; Retry is the way to ask again.
       loaded = true;
+      // The store answers the defaults when it cannot read, and a form of
+      // defaults would pass for the user's real settings. Show the reason.
+      if (get(sessionAlertsLoadError) !== null) return;
       draft = { ...fresh.settings };
       quiet = fresh.settings.quiet_start !== null;
       if (fresh.settings.quiet_start !== null && fresh.settings.quiet_end !== null) {
@@ -139,8 +147,9 @@
     disposed = true;
   });
 
+  const loader = loadOnce(load);
   $effect(() => {
-    if (active && !loaded && !busy) void load();
+    if (active) loader.request();
   });
 </script>
 
@@ -234,5 +243,14 @@
       <button type="button" class="gp-btn text-[11px] px-2 py-0.5" onclick={load} disabled={busy}>Recheck</button>
     </div>
   {/if}
-  {#if error}<p role="alert" class="text-danger">{error}</p>{/if}
+  {#if error}
+    <p role="alert" class="text-danger">{error}</p>
+  {:else if !draft && $sessionAlertsLoadError}
+    <p role="alert" class="text-danger" data-testid="session-alerts-load-error">
+      The notification settings could not be read: {$sessionAlertsLoadError}
+    </p>
+  {/if}
+  {#if !draft && (error || $sessionAlertsLoadError)}
+    <button type="button" class="gp-btn text-[11px] px-2 py-0.5" onclick={load} disabled={busy}>Retry</button>
+  {/if}
 </div>

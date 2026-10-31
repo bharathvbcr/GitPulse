@@ -18,6 +18,7 @@
    */
   import { AlertTriangle, Check, ChevronRight, RefreshCw } from "@lucide/svelte";
   import { formatError } from "../ui/formatError";
+  import { askConfirm } from "../stores/modalStore";
   import { displayName } from "../repos/paths";
   import {
     applyDevmapIntegration,
@@ -99,9 +100,9 @@
     const path = repoPath;
     const plan = plans.get(host);
     if (!path || !plan || applying) return;
-    if (typeof window !== "undefined" && !window.confirm(applyConfirmText(plan))) {
-      return;
-    }
+    // The app's own dialog: the native confirm answers null under WKWebView,
+    // which read as "no" and left Apply doing nothing.
+    if (!(await askConfirm({ title: "Apply integration changes?", message: applyConfirmText(plan), confirmLabel: "Apply" }))) return;
     applying = host;
     try {
       const outcome = acceptPreview(host, await applyDevmapIntegration(path, host));

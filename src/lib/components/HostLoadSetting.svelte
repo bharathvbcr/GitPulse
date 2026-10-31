@@ -14,20 +14,23 @@
     saveHostLoadSettings,
     type HostLoadSettings,
   } from "../stores/hostLoadStore";
+  import { loadOnce } from "../settings/loadOnce";
 
   let { active = true }: { active?: boolean } = $props();
 
   let settings = $state<HostLoadSettings>(DEFAULT_HOST_LOAD_SETTINGS);
   let busy = $state(false);
   let error = $state("");
-  let loaded = false;
+  // False until a read succeeds: before that `settings` is the defaults, and a
+  // toggle on defaults would save them over the real configuration.
+  let readOk = $state(false);
 
   async function load() {
     busy = true;
     error = "";
     try {
       settings = await loadHostLoadSettings();
-      loaded = true;
+      readOk = true;
     } catch (cause) {
       error = explainError(cause);
     } finally {
@@ -48,8 +51,11 @@
     }
   }
 
+  // One automatic attempt: a failed load shows its error and a Retry button
+  // rather than re-running this effect as `busy` settles.
+  const loader = loadOnce(load);
   $effect(() => {
-    if (active && !loaded && !busy) void load();
+    if (active) loader.request();
   });
 </script>
 
@@ -59,17 +65,18 @@
     label="Measure memory pressure and agent sessions"
     description="On by default. Every 2 seconds GitPulse reads this computer's memory pressure, swap and compressor, and finds the agent sessions running on it, for Health and for the agents GitPulse launches. Off stops the readings; nothing is ever sent anywhere."
     checked={settings.enabled}
-    disabled={busy}
+    disabled={busy || !readOk}
     onchange={(next) => void save({ enabled: next })}
   />
   <SettingToggle
     label="Refuse agent launches under severe memory pressure"
     description="On by default. When the kernel reports critical memory pressure, or the memory compressor is thrashing, GitPulse refuses to start an agent until it clears, and says which. You can always choose Admit anyway in Health. Off still sheds GitPulse's own background and refresh work under pressure, but never refuses a launch. Needs the measurement above."
     checked={settings.govern_launches}
-    disabled={busy || !settings.enabled}
+    disabled={busy || !readOk || !settings.enabled}
     onchange={(next) => void save({ govern_launches: next })}
   />
   {#if error}
     <p class="text-amber-300">{error}</p>
+    <button type="button" class="gp-btn text-[11px] px-2 py-0.5" disabled={busy} onclick={() => loader.retry()}>Retry</button>
   {/if}
 </div>
