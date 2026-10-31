@@ -460,7 +460,7 @@
           {/if}
         </div>
 
-        <PulsePeriodCompare commits={visibleCommits} />
+        <PulsePeriodCompare commits={visibleCommits} truncated={report.truncated} />
         <PulseRhythm commits={visibleCommits} truncated={report.truncated} />
         <PulseHeatmap commits={visibleCommits} />
         <PulseLineTrend

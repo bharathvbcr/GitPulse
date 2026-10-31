@@ -371,6 +371,74 @@ describe("computePeriodCompare", () => {
     expect(deltas.priorAdds).toBe(50);
     expect(deltas.addsDeltaPct).toBe(200); // 50 -> 150 (+200%)
   });
+
+  const nowMs = 1700000000 * 1000;
+  const ago = (days: number): number => 1700000000 - days * 86400;
+
+  it("has no percentage when the prior period is empty, rather than +100%", () => {
+    const deltas = computePeriodCompare(
+      [createMockCommit({ timestamp: ago(3), additions: 40, deletions: 8 })],
+      nowMs,
+      30,
+    );
+    expect(deltas.currentCommits).toBe(1);
+    expect(deltas.priorCommits).toBe(0);
+    expect(deltas.commitsDeltaPct).toBeNull();
+    expect(deltas.addsDeltaPct).toBeNull();
+    expect(deltas.delsDeltaPct).toBeNull();
+  });
+
+  it("has no percentage when neither period has activity", () => {
+    const deltas = computePeriodCompare([], nowMs, 30);
+    expect(deltas.commitsDeltaPct).toBeNull();
+    expect(deltas.addsDeltaPct).toBeNull();
+    expect(deltas.delsDeltaPct).toBeNull();
+  });
+
+  it("still computes a real percentage, including a drop to zero, when the prior period had data", () => {
+    const deltas = computePeriodCompare(
+      [createMockCommit({ timestamp: ago(40), additions: 10, deletions: 4 })],
+      nowMs,
+      30,
+    );
+    expect(deltas.commitsDeltaPct).toBe(-100);
+    expect(deltas.addsDeltaPct).toBe(-100);
+    expect(deltas.delsDeltaPct).toBe(-100);
+  });
+
+  describe("priorWindowCovered", () => {
+    it("is false when the scan was cut inside the prior period", () => {
+      // Oldest commit is 45 days back: the prior period starts at 60.
+      const deltas = computePeriodCompare(
+        [createMockCommit({ timestamp: ago(3) }), createMockCommit({ timestamp: ago(45) })],
+        nowMs,
+        30,
+        true,
+      );
+      expect(deltas.priorWindowCovered).toBe(false);
+    });
+
+    it("is false when a cut scan returned nothing at all", () => {
+      expect(computePeriodCompare([], nowMs, 30, true).priorWindowCovered).toBe(false);
+    });
+
+    it("is true when a cut scan still reached past the start of the prior period", () => {
+      const deltas = computePeriodCompare(
+        [createMockCommit({ timestamp: ago(3) }), createMockCommit({ timestamp: ago(75) })],
+        nowMs,
+        30,
+        true,
+      );
+      expect(deltas.priorWindowCovered).toBe(true);
+    });
+
+    it("is true for a complete scan, however young the history", () => {
+      const deltas = computePeriodCompare([createMockCommit({ timestamp: ago(3) })], nowMs, 30, false);
+      expect(deltas.priorWindowCovered).toBe(true);
+      // Omitting the argument means a complete scan, so existing callers keep compiling.
+      expect(computePeriodCompare([createMockCommit({ timestamp: ago(3) })], nowMs).priorWindowCovered).toBe(true);
+    });
+  });
 });
 
 /** Epoch seconds for an ISO instant, so day bucketing stays explicit. */
