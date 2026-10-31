@@ -1,3 +1,23 @@
+<script module lang="ts">
+  import { createRepoPanelCache } from "../panels/repoPanelCache";
+  import type { ContentSearchReport as RememberedReport } from "../search/types";
+
+  /**
+   * The last search per repository, kept past the panel's unmount: Code swaps
+   * its sections with `{#if}`, so opening a hit and coming back would
+   * otherwise find the box empty. Only the query, its options and the answer
+   * are kept — never the cancel token, and nothing re-runs on return.
+   */
+  interface SearchMemo {
+    pattern: string;
+    fixedStrings: boolean;
+    ignoreCase: boolean;
+    revision: string;
+    report: RememberedReport | null;
+  }
+  const searchMemo = createRepoPanelCache<SearchMemo>();
+</script>
+
 <script lang="ts">
   /**
    * Repository-wide content search (Code → Search).
@@ -23,8 +43,10 @@
   let fixedStrings = $state(true);
   let ignoreCase = $state(true);
   let revision = $state("");
-  let report = $state<ContentSearchReport | null>(null);
+  // Replaced wholesale by each answer, never edited in place.
+  let report = $state.raw<ContentSearchReport | null>(null);
   let error = $state<string | null>(null);
+  let patternInput: HTMLInputElement | undefined = $state();
   let running = $state(false);
   let inflight: AsyncGuard | null = null;
   let token: string | null = null;
@@ -94,15 +116,32 @@
     repoStore.setActiveTab("code", "explorer");
   }
 
-  // A different repository is a different subject.
+  // A different repository is a different subject: it shows what was last
+  // searched there, or nothing.
   $effect(() => {
-    void $currentRepoPath;
+    const repo = $currentRepoPath;
     untrack(() => {
       stop();
       running = false;
-      report = null;
       error = null;
+      const memo = repo ? searchMemo.get(repo) : undefined;
+      pattern = memo?.pattern ?? "";
+      fixedStrings = memo?.fixedStrings ?? true;
+      ignoreCase = memo?.ignoreCase ?? true;
+      revision = memo?.revision ?? "";
+      report = memo?.report ?? null;
     });
+  });
+
+  $effect(() => {
+    const repo = $currentRepoPath;
+    const memo: SearchMemo = { pattern, fixedStrings, ignoreCase, revision, report };
+    if (repo) untrack(() => searchMemo.set(repo, memo));
+  });
+
+  // The search box is the first thing wanted here.
+  $effect(() => {
+    patternInput?.focus();
   });
 
   $effect(() => () => stop());
@@ -115,7 +154,7 @@
   >
     <label class="relative flex-1 min-w-56">
       <Search size={12} class="absolute left-2.5 top-1/2 -translate-y-1/2 text-textMuted pointer-events-none" />
-      <input class="gp-field w-full pl-7! font-mono" type="search" placeholder="Search file contents" aria-label="Search file contents" bind:value={pattern} />
+      <input class="gp-field w-full pl-7! font-mono" type="search" placeholder="Search file contents" aria-label="Search file contents" bind:value={pattern} bind:this={patternInput} />
     </label>
     <input class="gp-field w-36 font-mono" placeholder="Revision (optional)" aria-label="Revision to search" bind:value={revision} />
     <label class="flex items-center gap-1 text-[11px] text-textMuted"><input type="checkbox" checked={!fixedStrings} onchange={(e) => (fixedStrings = !e.currentTarget.checked)} /> regex</label>
@@ -131,13 +170,18 @@
     <div
       data-search-summary
       role="status"
-      class="px-4 py-1.5 border-b border-border/40 text-[11px] shrink-0 {report.truncated ? 'bg-amber-500/10 text-amber-600 dark:text-amber-300' : 'text-textMuted'}"
+      class="px-4 py-1.5 border-b border-border/40 text-[11px] shrink-0 {running ? 'opacity-60' : ''} {report.truncated ? 'bg-amber-500/10 text-amber-600 dark:text-amber-300' : 'text-textMuted'}"
     >
       {describeSearchReport(report)}
     </div>
   {/if}
 
-  <div class="flex-1 min-h-0 overflow-auto px-2 py-2">
+  <!-- While a newer search runs the previous answer stays up, dimmed and
+       labelled, rather than reading as the current one. -->
+  <div class="flex-1 min-h-0 overflow-auto px-2 py-2 {running && report ? 'opacity-60' : ''}" aria-busy={running}>
+    {#if running && report}
+      <p class="px-2 pb-1 text-[11px] text-textMuted" data-search-running>Searching… showing the previous results.</p>
+    {/if}
     {#if report?.revision && report.matches.length > 0 && !error}
       <p class="px-2 pb-1 text-[11px] text-textMuted" data-search-revision-note>
         Searched at {report.revision.slice(0, 7)}. Opening a hit shows the working-tree file.

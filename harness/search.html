@@ -57,14 +57,14 @@
         }
       });
 
-      const { mount, tick } = await import("svelte");
+      const { mount, tick, unmount } = await import("svelte");
       const { get } = await import("svelte/store");
       const { repoStore } = await import("../src/lib/stores/repoStore");
       const { revealRequest, clearReveal } = await import("../src/lib/files/revealRequests");
       const { createChecks } = await import("./checks.ts");
       const Host = (await import("./SearchHost.svelte")).default;
       await repoStore.openRepo("/fixture/GitPulse");
-      mount(Host, { target: document.querySelector("#app") });
+      let app = mount(Host, { target: document.querySelector("#app") });
 
       const wait = () => new Promise(resolve => setTimeout(resolve, 40));
       const until = async test => {
@@ -199,6 +199,33 @@
           await submit();
           await until(() => !document.querySelector("[data-search-revision-note]") && matches().length === 3);
           check("a working-tree search shows no such note", () => !document.querySelector("[data-search-revision-note]"));
+
+          // --- a newer search leaves the old answer up, labelled stale ----------
+          mode = "hold";
+          await submit();
+          await until(() => !!button("Cancel"));
+          check("while a newer search runs the previous matches stay visible", () => matches().length === 3);
+          check("the results are marked busy and dimmed", () => {
+            const busy = document.querySelector('[aria-busy="true"]');
+            return Boolean(busy) && busy.className.includes("opacity-60");
+          });
+          check("and a Searching line says the matches are the previous ones", () => !!document.querySelector("[data-search-running]") && text().includes("Searching"));
+          button("Cancel").click();
+          await until(() => !!button("Search"));
+          mode = "complete";
+          await submit();
+          await until(() => matches().length === 3 && summary()?.textContent.includes("3 matches"));
+          check("a finished search is not dimmed or busy", () => !document.querySelector('[aria-busy="true"]') && !document.querySelector("[data-search-running]"));
+
+          // --- leaving Search and coming back keeps the query and its answer ----
+          const searchesBeforeLeaving = searches.length;
+          await unmount(app);
+          check("leaving Search removes the panel", () => !input());
+          app = mount(Host, { target: document.querySelector("#app") });
+          await until(() => !!input());
+          check("coming back keeps the pattern", () => input().value === "needle");
+          check("and the options", () => toggle("regex").checked && toggle("match case").checked);
+          check("and the answer, without searching again", () => matches().length === 3 && summary()?.textContent.includes("3 matches") && searches.length === searchesBeforeLeaving);
 
           check("no unhandled runtime errors", () => errors.length === 0);
           report();

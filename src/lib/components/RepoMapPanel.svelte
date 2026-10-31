@@ -1,3 +1,19 @@
+<script module lang="ts">
+  import { createRepoPanelCache } from "../panels/repoPanelCache";
+
+  /**
+   * What Map → Docs search shows for a repository, kept past the panel's
+   * unmount so opening a hit and coming back finds the query and its hits
+   * where they were. Restored without re-running the search.
+   */
+  interface DocsSearchMemo {
+    docsQuery: string;
+    docsSubmittedQuery: string;
+    docsHits: import("../docs/client").DocsSearchHit[];
+  }
+  const docsSearchMemo = createRepoPanelCache<DocsSearchMemo>();
+</script>
+
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
   import { beginGeneration } from "../async/guard";
@@ -115,10 +131,16 @@
   let docsStatus = $state<DocsStatus | null>(null);
   let docsQuery = $state("");
   let docsHits = $state<DocsSearchHit[]>([]);
+  /** The query `docsHits` answers; set only when a search for it succeeds. */
+  let docsSubmittedQuery = $state("");
   let docsSearching = $state(false);
-  let docsError = $state<string | null>(null);
+  /** The vault refresh failed; the indexed-note and broken-link reads are unknown. */
+  let docsRefreshError = $state<string | null>(null);
+  let docsSearchError = $state<string | null>(null);
   let brokenLinks = $state<BrokenLink[]>([]);
   let brokenLoading = $state(false);
+  /** `brokenLinks` came from a successful read, so an empty list means none. */
+  let brokenLoaded = $state(false);
 
   let linkResult = $state<WorkspaceLinksResult | null>(null);
   let linksLoading = $state(false);
@@ -206,6 +228,8 @@
   const deadLists = $derived(map ? preferredDeadLists(map) : null);
   const tests = $derived(selected ? roleSample(selected, "tests") : null);
   const docsHonesty = $derived(docsStatusHonesty(docsStatus));
+  /** The hits on screen answer an earlier query than the one in the box. */
+  const docsHitsStale = $derived(docsHits.length > 0 && docsSubmittedQuery !== docsQuery.trim());
   const searchHonesty = $derived(docsSearchHonesty(docsHits, DOCS_SEARCH_DEFAULT_LIMIT));
   const brokenDisplay = $derived(brokenLinksHonesty(brokenLinks, BROKEN_LINKS_DISPLAY_CAP));
   const linksHonesty = $derived(linkCandidatesHonesty(linkResult));
@@ -341,7 +365,7 @@
     if (!repoPath) return;
     const request = docsRequests.next();
     const live = () => docsRequests.isCurrent(request) && currentRepo === repoPath && mapView === "docs";
-    docsError = null;
+    docsRefreshError = null;
     brokenLoading = true;
     try {
       const status = await docsRefresh(repoPath);
@@ -350,11 +374,13 @@
       if (!live()) return;
       docsStatus = status;
       brokenLinks = links;
+      brokenLoaded = true;
     } catch (err) {
       if (!live()) return;
-      docsError = reportMapFailure("documents", repoPath, err);
+      docsRefreshError = reportMapFailure("documents", repoPath, err);
       docsStatus = null;
       brokenLinks = [];
+      brokenLoaded = false;
     } finally {
       if (live()) brokenLoading = false;
     }
@@ -366,22 +392,39 @@
     const q = docsQuery.trim();
     if (!repoPath || !q) {
       docsHits = [];
+      docsSubmittedQuery = "";
+      docsSearchError = null;
       docsSearching = false;
+      rememberDocsSearch();
       return;
     }
     docsSearching = true;
-    docsError = null;
+    docsSearchError = null;
     const live = () => searchRequests.isCurrent(request) && currentRepo === repoPath && docsQuery.trim() === q && mapView === "docs";
     try {
       const hits = await docsSearch(repoPath, q, DOCS_SEARCH_DEFAULT_LIMIT);
-      if (live()) docsHits = hits;
+      if (live()) {
+        docsHits = hits;
+        docsSubmittedQuery = q;
+        rememberDocsSearch();
+      }
     } catch (err) {
       if (!live()) return;
-      docsHits = [];
-      docsError = reportMapFailure("search", repoPath, err);
+      // The previous hits stay, labelled with the query they answer.
+      docsSearchError = reportMapFailure("search", repoPath, err);
     } finally {
       if (live()) docsSearching = false;
     }
+  }
+
+  function rememberDocsSearch() {
+    const repo = currentRepo;
+    if (!repo) return;
+    docsSearchMemo.set(repo, {
+      docsQuery,
+      docsSubmittedQuery,
+      docsHits: $state.snapshot(docsHits),
+    });
   }
 
   async function reloadLinks(path?: string) {
@@ -442,7 +485,7 @@
         map: load ? { available: load.available, path: load.path, reason: load.reason } : null,
         graph: graphLoad ? { available: graphLoad.available, kind: graphLoad.kind, reason: graphLoad.reason } : null,
         liveIndex: liveIndex.get(repository),
-        errors: [errorMsg, actionNote, docsError, linksError],
+        errors: [errorMsg, actionNote, docsRefreshError, docsSearchError, linksError],
       }, live);
       if (live()) copyLogsNote = result === "copied" ? "DevMap logs copied." : "Could not copy DevMap logs. Try again.";
     } catch (error) {
@@ -461,11 +504,17 @@
       selectedArea = null;
       graphLoad = null;
       docsStatus = null;
-      docsHits = [];
+      // A repository's docs search comes back as it was left; nothing re-runs.
+      const memo = path ? docsSearchMemo.get(path) : undefined;
+      docsQuery = memo?.docsQuery ?? "";
+      docsSubmittedQuery = memo?.docsSubmittedQuery ?? "";
+      docsHits = memo?.docsHits ?? [];
       brokenLinks = [];
+      brokenLoaded = false;
       linkResult = null;
       errorMsg = null;
-      docsError = null;
+      docsRefreshError = null;
+      docsSearchError = null;
       linksError = null;
       actionNote = null;
       copyLogsNote = null;
@@ -492,9 +541,11 @@
   $effect(() => {
     docsQuery;
     untrack(() => {
+      // Typing retires a search in flight but keeps the hits on screen: they
+      // are labelled with the query they answer until the next search lands.
       searchRequests.next();
       docsSearching = false;
-      docsHits = [];
+      rememberDocsSearch();
     });
   });
 
@@ -741,8 +792,8 @@
           {docsHonesty}
         </p>
       {/if}
-      {#if docsError}
-        <p class="text-[11px] text-rose-600 dark:text-rose-400">{docsError}</p>
+      {#if docsRefreshError}
+        <p class="text-[11px] text-rose-600 dark:text-rose-400" role="alert">{docsRefreshError}</p>
       {/if}
 
       <section aria-labelledby="docs-search-heading">
@@ -772,10 +823,18 @@
             {searchHonesty}
           </p>
         {/if}
-        {#if docsHits.length === 0 && docsQuery.trim() && !docsSearching}
-          <p class="mt-2 text-[11px] text-textMuted">No hits.</p>
-        {:else if docsHits.length > 0}
-          <ul class="mt-2 space-y-1.5">
+        {#if docsSearchError}
+          <p class="mt-2 text-[11px] text-rose-600 dark:text-rose-400" role="alert" data-testid="docs-search-error">{docsSearchError}</p>
+        {/if}
+        {#if docsHits.length === 0}
+          {#if docsSubmittedQuery && docsSubmittedQuery === docsQuery.trim() && !docsSearching && !docsSearchError}
+            <p class="mt-2 text-[11px] text-textMuted" data-testid="docs-no-hits">No hits for "{docsSubmittedQuery}".</p>
+          {/if}
+        {:else}
+          {#if docsHitsStale}
+            <p class="mt-2 text-[10px] text-textMuted" data-testid="docs-hits-stale">Results for "{docsSubmittedQuery}"</p>
+          {/if}
+          <ul class="mt-2 space-y-1.5 {docsHitsStale ? 'opacity-60' : ''}">
             {#each keyedList(docsHits, (hit) => JSON.stringify([hit.path, hit.line, hit.score])) as { item: hit, key: renderKey } (renderKey)}
               <li>
                 <button
@@ -796,11 +855,15 @@
       <section aria-labelledby="docs-broken-heading" class="border-t border-border/50 pt-3">
         <h3 id="docs-broken-heading" class="text-[10px] uppercase tracking-wide text-textMuted mb-1.5">
           Broken links
-          {#if !brokenLoading}
+          {#if brokenLoaded && !brokenLoading}
             <span class="normal-case tracking-normal ml-1">({brokenLinks.length})</span>
           {/if}
         </h3>
         {#if brokenLoading}
+          <p class="text-[11px] text-textMuted">Loading…</p>
+        {:else if docsRefreshError}
+          <p class="text-[11px] text-textMuted" data-testid="docs-broken-unknown">Could not check links.</p>
+        {:else if !brokenLoaded}
           <p class="text-[11px] text-textMuted">Loading…</p>
         {:else if brokenLinks.length === 0}
           <p class="text-[11px] text-textMuted">None found in the indexed vault.</p>
