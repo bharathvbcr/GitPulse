@@ -347,7 +347,23 @@
         await quietUnderChurn("StoragePanel", StoragePanel, ["cmd_storage_scan"]);
 
         // ---- CommitDetails: provenance for the selected commit, once.
-        await repoStore.selectCommitDiff("c".repeat(40));
+        // The pane describes a commit only when the History list holds it, so
+        // the graph the selection points into is loaded first.
+        const { graphStore } = await import("../src/lib/stores/graphStore");
+        const selectedId = "c".repeat(40);
+        const graphFixture = fixtures.cmd_get_commit_graph;
+        fixtures.cmd_get_commit_graph = () => ({ head_id: selectedId, refs: [], has_more: false,
+          rows: [{ id: selectedId, parent_ids: [], summary: "churn", author_name: "ada", author_email: "ada@example.com",
+            timestamp: 1, lane: 0, color_index: 0, active_lanes: [0], active_lane_colors: [0], connections: [],
+            is_merge: false, is_root: true }] });
+        fixtures.cmd_get_commit_details = (a) => ({ id: a.commitId, parent_ids: [], author_name: "ada", author_email: "ada@example.com",
+          author_date: "", committer_name: "ada", committer_email: "ada@example.com", committer_date: "", summary: "churn", body: "",
+          co_authors: [], changed_files: [], total_additions: 0, total_deletions: 0 });
+        fixtures.cmd_verify_commit_signature = () => ({ signature: "none", status: "none", key: "", signer: "" });
+        graphStore.showRepo(REPO);
+        await graphStore.loadGraph(REPO);
+        fixtures.cmd_get_commit_graph = graphFixture;
+        await repoStore.selectCommitDiff(selectedId);
         await settle(5);
         await quietUnderChurn("CommitDetails", CommitDetails, ["cmd_provenance_freshness"]);
 

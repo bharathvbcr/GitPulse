@@ -159,3 +159,74 @@ describe("CommitTable palette invalidation", () => {
     expect(effect).not.toContain("$interfaceStore");
   });
 });
+
+describe("CommitTable failed and loading reloads", () => {
+  it("exposes the error banner and progress bar to assistive tech", () => {
+    const banner = source.slice(
+      source.indexOf("{#if $graphStore.error && !$graphStore.isLoading}"),
+      source.indexOf("class=\"relative z-10 flex min-w-0 shrink-0"),
+    );
+    expect(banner).toContain('role="alert"');
+    const bar = source.slice(source.indexOf("{#if $graphStore.isLoading}"), source.indexOf("{#if $graphStore.error && !$graphStore.isLoading}"));
+    expect(bar).toContain('role="status"');
+    expect(bar).toContain('aria-label="Loading commits"');
+    expect(source).toContain("aria-busy={$graphStore.isLoading}");
+  });
+
+  it("retries the failed request at its own page size", () => {
+    expect(source).toContain("$graphStore.errorRequest?.limit");
+    expect(source).toContain("{ forceLimit: limit }");
+  });
+
+  it("dims the previous filter's rows and says so when a refining reload failed", () => {
+    expect(source).toContain("$graphStore.errorRequest?.refining === true");
+    expect(source).toContain("{previousFilterShown ? 'opacity-60' : ''}");
+    expect(source).toContain("Showing the previous filter's results — the new filter failed to load.");
+  });
+});
+
+describe("CommitTable scroll on a new filter", () => {
+  const start = source.indexOf("const listFilterSignature = $derived");
+  const block = source.slice(start, source.indexOf("// Theme changes are rare"));
+
+  it("keys the reset on the normalized query and branch, and records a repository switch without scrolling", () => {
+    expect(start).toBeGreaterThan(-1);
+    expect(block).toContain("normalizeGraphQuery($filterStore.searchQuery)");
+    expect(block).toContain('$filterStore.selectedBranch ?? ""');
+    const switchBranch = block.slice(block.indexOf("path !== landedPath"), block.indexOf("if (loading) return;"));
+    expect(switchBranch).toContain("landedSignature = signature;");
+    expect(switchBranch).toContain("return;");
+    expect(switchBranch).not.toContain("scrollTop");
+  });
+
+  it("scrolls only when rows land under a changed signature, never mid-load or on a same-signature reload", () => {
+    expect(block).toContain("if (loading) return;");
+    expect(block).toContain("if (!landed || signature === landedSignature) return;");
+    expect(block).toContain("scrollTopForNewFilter({");
+    expect(block).toContain("container.scrollTop = next;");
+    expect(block).toContain("scrollTop = next;");
+    expect(block.indexOf("if (loading) return;")).toBeLessThan(block.indexOf("scrollTopForNewFilter({"));
+  });
+});
+
+describe("CommitTable single current commit", () => {
+  it("highlights the row from the shared resolver, not from the repo store's id alone", () => {
+    expect(source).toContain("resolveCurrentCommitId");
+    expect(source).toContain("isSelected={currentId === row.id}");
+    expect(source).not.toContain("isSelected={$repoStore.selectedCommitId === row.id}");
+    const selectedIdFn = source.slice(source.indexOf("function selectedId()"), source.indexOf("function paintNow()"));
+    expect(selectedIdFn).toContain("return currentId;");
+  });
+
+  it("reconciles the two stores on id changes only, reading everything else untracked", () => {
+    const start = source.indexOf("let reconcileSeen");
+    expect(start).toBeGreaterThan(-1);
+    const effect = source.slice(start, source.indexOf("// A new query or branch lands"));
+    expect(effect).toContain("planCommitReconcile(");
+    expect(effect).toContain("untrack(() => {");
+    expect(effect).toContain("get(repoStore)");
+    expect(effect).toContain("graphStore.selectCommit(row)");
+    expect(effect).toContain("repoStore.selectCommitDiff(plan.loadDiffId)");
+    expect(effect).not.toContain("$repoStore");
+  });
+});

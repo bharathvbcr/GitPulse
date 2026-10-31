@@ -2,7 +2,7 @@
   import { onMount, untrack } from "svelte";
   import { get } from "svelte/store";
   import { graphStore } from "../stores/graphStore";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { filterStore } from "../stores/filterStore";
   import { themeStore } from "../stores/themeStore";
   import { densityStore } from "../stores/densityStore";
@@ -33,6 +33,13 @@
   import { prefersReducedMotion } from "../motion/easing";
   import { INITIAL_GRAPH_PAINT, stepGraphPaint, type GraphPaintState } from "../motion/graphPaint";
   import { nextLoadLimit } from "../stores/graphLimits";
+  import {
+    planCommitReconcile,
+    resolveCurrentCommitId,
+    scrollTopForNewFilter,
+    type ReconcileSeen,
+  } from "../graph/currentCommit";
+  import { normalizeGraphQuery } from "../graph/graphFetchScheduler";
   import {
     clampGraphScrollLeft,
     graphContentBoxStyle,
@@ -396,6 +403,16 @@
   let totalCommits = $derived(filteredRows.length);
 
   /**
+   * True when a reload for a NEW query, branch or scope failed: the rows on
+   * screen belong to the previous filter while the filter box shows the new
+   * one, so they are dimmed and the banner says so rather than letting stale
+   * rows pass for the answer.
+   */
+  let previousFilterShown = $derived(
+    $graphStore.error !== null && $graphStore.errorRequest?.refining === true,
+  );
+
+  /**
    * Windowing math from the shared owner rather than a third hand-rolled copy.
    *
    * This pane kept its own arithmetic and had drifted from it in two ways that
@@ -488,8 +505,18 @@
     return gpuCtx;
   }
 
+  /**
+   * The commit every pane describes: row highlight, canvas ring, header and
+   * diff all key on this one id (see graph/currentCommit.ts).
+   */
+  const repoSelectedId = $derived($repoStore.selectedCommitId);
+  const graphSelectedId = $derived($graphStore.selectedCommit?.id ?? null);
+  let currentId = $derived(
+    resolveCurrentCommitId(repoSelectedId, graphSelectedId, $graphStore.rows),
+  );
+
   function selectedId(): string | null {
-    return $repoStore.selectedCommitId || $graphStore.selectedCommit?.id || null;
+    return currentId;
   }
 
   function paintNow() {
@@ -763,6 +790,7 @@
     graphContentWidth;
     graphViewportWidth;
     selectedCommitId;
+    currentId;
     // The canvas ring must not wait on the async diff round-trip: selecting
     // updates graphStore synchronously, repoStore's selectedCommitId only after
     // the diff resolves (or never, when it fails). Both are dependencies.
@@ -800,6 +828,96 @@
       });
     }
     schedulePaint();
+  });
+
+  // The graph store and the repo store each hold a selection and are written by
+  // different paths: the graph store auto-selects the newest commit on open and
+  // after a filter drops the selected one, while the repo store (which owns the
+  // diff) is only written by a click or `inspectCommitInHistory`. This effect
+  // makes the diff follow an auto-selection and the graph follow an inspected
+  // commit, so the header, file list, diff and row highlight describe one
+  // commit. It plans on id CHANGES only (previous ids live in plain variables,
+  // not state), so a watcher refresh that republishes the same ids does nothing
+  // and a click is not undone by the repo store's not-yet-updated previous id.
+  // Cost: one `cmd_get_commit_diff` read per History open or filter change.
+  let reconcileSeen: ReconcileSeen | null = null;
+  const repoInRows = $derived(
+    repoSelectedId !== null && $graphStore.rows.some((r) => r.id === repoSelectedId),
+  );
+  $effect(() => {
+    // Only the three ids below are tracked; everything else is read untracked
+    // so a status poll republishing the repo store never re-runs the plan.
+    const repoId = repoSelectedId;
+    const graphId = graphSelectedId;
+    const inRows = repoInRows;
+    untrack(() => {
+      const repo = get(repoStore);
+      const rows = get(graphStore).rows;
+      const plan = planCommitReconcile({
+        repoId,
+        graphId,
+        repoInRows: inRows,
+        prev: reconcileSeen,
+        foreignSelection: repo.selectionKind !== "commit" && repo.selectedFilePath !== null,
+        diff: {
+          loaded: repo.selectedDiff !== null,
+          pending: repo.selectedDiffPending,
+          error: repo.selectedDiffError,
+        },
+      });
+      reconcileSeen = { repoId, graphId, repoInRows: inRows };
+      if (plan.selectGraphId !== null) {
+        const row = rows.find((r) => r.id === plan.selectGraphId);
+        if (row) void graphStore.selectCommit(row);
+      }
+      if (plan.loadDiffId !== null) void repoStore.selectCommitDiff(plan.loadDiffId);
+    });
+  });
+
+  // A new query or branch lands a different, usually shorter, row set. The
+  // scroll anchor of the old one would leave the user mid-list (or pinned to
+  // the bottom) of it, reading as "the filter found almost nothing", so the
+  // list returns to the top — or to the current commit, if it survived. Only a
+  // landing under a CHANGED filter signature does this: watcher reloads and
+  // load-more keep the signature and so keep the position, and a repository
+  // switch only records the new baseline (the list is a different one).
+  const listFilterSignature = $derived(
+    `${normalizeGraphQuery($filterStore.searchQuery)}\u0000${$filterStore.selectedBranch ?? ""}`,
+  );
+  let landedPath: string | null | undefined;
+  let landedRows: readonly VisualCommitRow[] | null = null;
+  let landedSignature = "";
+  let wasLoading = false;
+  $effect(() => {
+    const rows = $graphStore.rows;
+    const loading = $graphStore.isLoading;
+    const path = $currentRepoPath;
+    const signature = listFilterSignature;
+    untrack(() => {
+      const fellIdle = wasLoading && !loading;
+      wasLoading = loading;
+      if (landedPath === undefined || path !== landedPath) {
+        landedPath = path;
+        landedRows = rows;
+        landedSignature = signature;
+        return;
+      }
+      if (loading) return;
+      // A landing is new rows, or a load that finished with identical rows
+      // (the signature check keeps the array when nothing changed).
+      const landed = rows !== landedRows || fellIdle;
+      landedRows = rows;
+      if (!landed || signature === landedSignature) return;
+      landedSignature = signature;
+      const next = scrollTopForNewFilter({
+        rows,
+        currentId,
+        rowHeight,
+        viewportHeight: containerHeight,
+      });
+      if (container) container.scrollTop = next;
+      scrollTop = next;
+    });
   });
 
   // Theme changes are rare; drop everything keyed to the old palette and let
@@ -888,22 +1006,45 @@
        repository is seconds of work, and "nothing happened" is not an
        acceptable answer for it. -->
   {#if $graphStore.isLoading}
-    <div class="absolute top-0 inset-x-0 h-0.5 z-30 overflow-hidden">
+    <div
+      class="absolute top-0 inset-x-0 h-0.5 z-30 overflow-hidden"
+      role="status"
+      aria-label="Loading commits"
+    >
       <div class="h-full w-1/3 bg-accent animate-[gp-slide_1.2s_ease-in-out_infinite]"></div>
     </div>
   {/if}
   {#if $graphStore.error && !$graphStore.isLoading}
-    <div class="absolute top-1 left-1/2 -translate-x-1/2 z-30 px-3 py-1.5 rounded-lg bg-surface border border-rose-500/40 text-[11px] text-rose-300 shadow-lg flex items-center gap-2 max-w-[90%]">
-      <span class="truncate" title={$graphStore.error}>{$graphStore.error}</span>
-      <button
-        class="shrink-0 underline hover:text-white"
-        onclick={() => {
-          const path = $repoStore.currentPath;
-          if (path) void graphStore.loadGraph(path, $filterStore.searchQuery, $filterStore.selectedBranch);
-        }}
-      >
-        Retry
-      </button>
+    <div
+      class="absolute top-1 left-1/2 -translate-x-1/2 z-30 px-3 py-1.5 rounded-lg bg-surface border border-rose-500/40 text-[11px] text-rose-300 shadow-lg flex flex-col gap-0.5 max-w-[90%]"
+      role="alert"
+    >
+      <div class="flex items-center gap-2 min-w-0">
+        <span class="truncate" title={$graphStore.error}>{$graphStore.error}</span>
+        <button
+          class="shrink-0 underline hover:text-white"
+          onclick={() => {
+            const path = $repoStore.currentPath;
+            if (!path) return;
+            // Repeat the request that failed, page size included: a bare
+            // reload would ask for the old, smaller page.
+            const limit = $graphStore.errorRequest?.limit;
+            void graphStore.loadGraph(
+              path,
+              $filterStore.searchQuery,
+              $filterStore.selectedBranch,
+              limit === undefined ? {} : { forceLimit: limit },
+            );
+          }}
+        >
+          Retry
+        </button>
+      </div>
+      {#if previousFilterShown}
+        <span class="text-textMuted">
+          Showing the previous filter's results — the new filter failed to load.
+        </span>
+      {/if}
     </div>
   {/if}
 
@@ -938,11 +1079,12 @@
   <div
     bind:this={container}
     onscroll={handleScroll}
+    aria-busy={$graphStore.isLoading}
     class="flex-1 overflow-y-auto overflow-x-hidden relative gp-scroll"
   >
     <div style="height: {totalCommits * rowHeight}px; width: 100%; position: relative;">
       <div
-        class="gp-gpu"
+        class="gp-gpu {previousFilterShown ? 'opacity-60' : ''}"
         style="transform: translate3d(0, {startIndex * rowHeight}px, 0); width: 100%;"
       >
         {#each visibleRows as row (row.id)}
@@ -951,7 +1093,7 @@
             density={$densityStore}
             timestampStyle={$interfaceStore.timestampStyle}
             refs={refsByCommit.get(row.id) ?? []}
-            isSelected={$repoStore.selectedCommitId === row.id}
+            isSelected={currentId === row.id}
             mergeTarget={closeTargetById.get(row.id) ?? null}
             onFocusRow={(element, keyboardVisible) =>
               handleRowFocus(row, element, keyboardVisible)}
