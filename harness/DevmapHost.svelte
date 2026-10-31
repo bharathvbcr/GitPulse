@@ -15,7 +15,7 @@
     links: nodes.filter(n => n.degree > 0).slice(1).map(n => ({source: nodes[0].id, target: n.id, kind: "imports"})),
     counts: { nodes_shown: nodes.length, nodes_total: 400, nodes_truncated: true, max_nodes: nodes.length },
   };
-  let load: GraphVizLoad = $state({ available: true, kind: "code_graph", payload: fixture });
+  let load: GraphVizLoad | null = $state({ available: true, kind: "code_graph", payload: fixture });
   let opened = $state("");
   let show = $state(true);
   let verdict = $state("");
