@@ -366,6 +366,24 @@
   );
   let cutByRenderer = $derived(allLines.length > MAX_RENDER_LINES);
   let truncatedSource = $derived(cutByBackend || cutByRenderer);
+  /**
+   * Whitespace mode reads `git diff -w`, which leaves out whitespace-only edits
+   * and prints some changed lines as context. A hunk or line patch built from
+   * it is not a patch of the file: git refuses it where the omitted edit sits
+   * in the hunk's context, and where it does not the patch stages less than
+   * the file's real change. The rows are fine to read; they are not a base to
+   * stage from.
+   */
+  let whitespaceView = $derived($repoStore.selectedIgnoreWhitespace);
+  /** Hunk and line staging is off. Stage File works from the path, not these rows, so it stays on. */
+  let stagingBlocked = $derived(truncatedSource || whitespaceView);
+  let stagingBlockedReason = $derived(
+    whitespaceView
+      ? "Turn off Ignore whitespace to stage — this view hides whitespace-only changes"
+      : truncatedSource
+        ? "Partial data — the diff is truncated, so staging would silently stage less than this hunk shows"
+        : undefined,
+  );
   let lines = $derived(cutByRenderer ? allLines.slice(0, MAX_RENDER_LINES) : allLines);
   // Only add/del/ctx rows are diff lines: hdr/meta/binary are chrome, so the
   // "N lines" stat means what a diff reader expects it to mean (and an empty
@@ -965,7 +983,9 @@
   }
 
   function toggleLine(index: number) {
-    if (!lineSelectable(index)) return;
+    // A selection nobody can act on is a trap: in whitespace mode the bar's
+    // stage buttons are off, so no line is offered for selecting at all.
+    if (whitespaceView || !lineSelectable(index)) return;
     const next = new Set(selectedLines);
     if (next.has(index)) next.delete(index);
     else next.add(index);
@@ -973,6 +993,7 @@
   }
 
   function selectRange(from: number, to: number) {
+    if (whitespaceView) return;
     const lo = Math.min(from, to);
     const hi = Math.max(from, to);
     const next = new Set<number>();
@@ -983,7 +1004,7 @@
   }
 
   function onLinePointerDown(index: number, event: PointerEvent) {
-    if (!isWorkingTreeFile || !lineSelectable(index)) return;
+    if (whitespaceView || !isWorkingTreeFile || !lineSelectable(index)) return;
     // A drag that starts on the code itself is a TEXT selection, not a
     // line-range selection. Both gestures live on the same row, so the split
     // is by where the pointer went down: the gutter (checkbox, line number,
@@ -1016,7 +1037,7 @@
   }
 
   async function stageHunk(hunkIndex: number) {
-    if (!$repoStore.selectedFilePath) return;
+    if (stagingBlocked || !$repoStore.selectedFilePath) return;
     const patch = buildFilePatchForHunk(lines, $repoStore.selectedFilePath, hunkIndex);
     if (!patch) return;
     const outcome = await repoStore.stageSelectivePatch(patch, !isStaged);
@@ -1049,7 +1070,7 @@
   }
 
   async function stageSelected(isStaging: boolean) {
-    if (!$repoStore.selectedFilePath || selectedLines.size === 0) return;
+    if (stagingBlocked || !$repoStore.selectedFilePath || selectedLines.size === 0) return;
     const patch = buildFilePatchFromLines(lines, $repoStore.selectedFilePath, selectedLines);
     if (!patch) return;
     const outcome = await repoStore.stageSelectivePatch(patch, isStaging);
@@ -1888,12 +1909,12 @@
           <span>Copy</span>
         </button>
         {#if isStaged}
-          <button onclick={() => stageSelected(false)} class="gp-btn-primary py-1! text-xs!" disabled={truncatedSource}>
+          <button onclick={() => stageSelected(false)} class="gp-btn-primary py-1! text-xs!" disabled={stagingBlocked} title={stagingBlockedReason}>
             <Check size={12} />
             <span>Unstage Selected ({selectedLines.size})</span>
           </button>
         {:else}
-          <button onclick={() => stageSelected(true)} class="gp-btn-primary py-1! text-xs!" disabled={truncatedSource}>
+          <button onclick={() => stageSelected(true)} class="gp-btn-primary py-1! text-xs!" disabled={stagingBlocked} title={stagingBlockedReason}>
             <Check size={12} />
             <span>Stage Selected ({selectedLines.size})</span>
           </button>
@@ -1939,7 +1960,12 @@
     )
       ? 'border-accent bg-accent text-white'
       : 'border-border/60 hover:border-accent/80'}"
-    title={selectedLines.has(index) ? "Deselect line" : "Select line for patch staging"}
+    disabled={whitespaceView}
+    title={whitespaceView
+      ? stagingBlockedReason
+      : selectedLines.has(index)
+        ? "Deselect line"
+        : "Select line for patch staging"}
     aria-label={selectedLines.has(index) ? "Deselect line" : "Select line for patch staging"}
   ></button>
 {/snippet}
@@ -2004,10 +2030,8 @@
         {#if isWorkingTreeFile}
           <button
             onclick={() => stageHunk(index)}
-            disabled={truncatedSource}
-            title={truncatedSource
-              ? "Partial data — the diff is truncated, so staging would silently stage less than this hunk shows"
-              : undefined}
+            disabled={stagingBlocked}
+            title={stagingBlockedReason}
             class="ml-auto shrink-0 rounded border border-border/80 bg-surface px-2 py-0.5 font-sans text-[10px] text-accent transition-colors hover:bg-accent/15 disabled:opacity-40"
           >
             {isStaged ? "Unstage Hunk" : "Stage Hunk"}
@@ -2141,10 +2165,8 @@
         {#if isWorkingTreeFile}
           <button
             onclick={() => stageHunk(row.index)}
-            disabled={truncatedSource}
-            title={truncatedSource
-              ? "Partial data — the diff is truncated, so staging would silently stage less than this hunk shows"
-              : undefined}
+            disabled={stagingBlocked}
+            title={stagingBlockedReason}
             class="ml-auto shrink-0 rounded border border-border/80 bg-surface px-2 py-0.5 font-sans text-[10px] text-accent transition-colors hover:bg-accent/15 disabled:opacity-40"
           >
             {isStaged ? "Unstage Hunk" : "Stage Hunk"}

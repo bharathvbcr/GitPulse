@@ -211,6 +211,27 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
  toastStore.clear?.();
  copyButton().click();await until(()=>clips.length===1,"whole patch copied");await tick();await wait();
  check("copying a whole diff raises no partial warning",()=>!get(toastStore).some(t=>t.message.includes("partial")));
+ // --- ignore whitespace: the rows are not a base to stage from -------------
+ const wsBox=()=>preview.querySelector('input[aria-label="Ignore whitespace-only changes"]');
+ await open({text:twoHunks(),truncated:false});
+ await until(()=>lineBoxes().length>0,"line boxes");
+ lineBoxes()[0].click();await tick();await wait();
+ check("with whitespace shown, a line can be selected and staged as before",()=>text().includes("1 line selected")&&!buttons("Stage Selected")[0].disabled);
+ wsBox().click();await until(()=>get(repoStore).selectedIgnoreWhitespace===true,"whitespace on");await wait(400);
+ check("turning Ignore whitespace on drops a selection made from the other view",()=>!text().includes("line selected"));
+ const wsReason="Turn off Ignore whitespace to stage — this view hides whitespace-only changes";
+ check("with it on, every Stage Hunk is disabled and says why",()=>hunkButtons("Stage Hunk").length===2&&hunkButtons("Stage Hunk").every(b=>b.disabled&&b.title===wsReason));
+ stagingCalls.length=0;
+ hunkButtons("Stage Hunk")[0].click();await wait(150);
+ check("a click on it stages nothing",()=>stagingCalls.length===0);
+ check("and the line checkboxes are disabled with the same reason",()=>lineBoxes().length>0&&lineBoxes().every(b=>b.disabled&&b.title===wsReason));
+ lineBoxes()[0].click();await tick();await wait();
+ check("clicking one selects nothing, so no bar offers Stage Selected",()=>!text().includes("line selected")&&buttons("Stage Selected").length===0);
+ check("Stage File is not touched by it",()=>buttons("Stage File").length===1&&!buttons("Stage File")[0].disabled);
+ wsBox().click();await until(()=>get(repoStore).selectedIgnoreWhitespace===false,"whitespace off");await wait(400);
+ check("turning it off gives hunk staging back",()=>hunkButtons("Stage Hunk").length===2&&hunkButtons("Stage Hunk").every(b=>!b.disabled&&b.title===""));
+ lineBoxes()[0].click();await tick();await wait();
+ check("and line selection",()=>text().includes("1 line selected"));
  // --- find ----------------------------------------------------------------
  await open({text:twoHunks(),truncated:false});
  const findBox=()=>preview.querySelector('input[aria-label="Find in this diff"]');

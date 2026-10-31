@@ -59,6 +59,16 @@ describe("DiffViewer source contracts", () => {
     expect(source).not.toContain('title="Copy the whole patch as unified diff text"');
   });
 
+  it("turns hunk and line staging off in whitespace mode, from one derived flag", () => {
+    expect(source).toContain("let stagingBlocked = $derived(truncatedSource || whitespaceView);");
+    // Every staging control reads the one flag; none re-derives it from truncation alone.
+    expect(source).not.toContain("disabled={truncatedSource}");
+    expect(source.split("disabled={stagingBlocked}").length - 1).toBe(4); // two hunk buttons, two selection buttons
+    // The functions refuse too, so no path but the buttons can send a -w patch.
+    expect(source).toContain("if (stagingBlocked || !$repoStore.selectedFilePath) return;");
+    expect(source).toContain("if (whitespaceView || !lineSelectable(index)) return;");
+  });
+
   it("compiles", () => {
     const { warnings } = compile(source, { generate: "client", filename: "DiffViewer.svelte" });
     expect(warnings.filter((w) => w.code !== "css-unused-selector")).toEqual([]);
