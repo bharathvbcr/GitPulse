@@ -348,6 +348,45 @@ fn ask(argv: &[&str], known: &Snapshot) -> (BTreeSet<i32>, BTreeSet<i32>) {
     (wanted, got.into_iter().collect())
 }
 
+/// One comparison of the two tools, with the differences churn explains
+/// taken out.
+struct Compared {
+    /// The last answers asked: the second ask's when there was one.
+    wanted: BTreeSet<i32>,
+    gotten: BTreeSet<i32>,
+    /// What `unexplained` returned over the first ask.
+    first: Vec<(i32, &'static str)>,
+    /// What survived `persistent`; empty when the tools agree.
+    differ: Vec<(i32, &'static str)>,
+}
+
+/// `pgrep` and the guard over `argv`, asked between two snapshots of the
+/// table. `pgrep` lists every user's processes; only this user's can be
+/// signalled, so those are the ones the guard counts. A difference
+/// `unexplained` leaves is asked about once more and kept only if
+/// `persistent` keeps it. `own` is as for `unexplained`.
+fn compare(argv: &[&str], own: Option<i32>) -> Compared {
+    let before = snapshot(None);
+    let (mut wanted, mut gotten) = ask(argv, &before);
+    let after = snapshot(None);
+    let first = unexplained(&wanted, &gotten, &before, &after, own);
+    let mut differ = first.clone();
+    if !differ.is_empty() {
+        let pids: Vec<i32> = differ.iter().map(|(pid, _)| *pid).collect();
+        let (wanted_now, gotten_now) = ask(argv, &before);
+        let samples: Vec<Snapshot> = (0..SAMPLES).map(|_| snapshot(Some(&pids))).collect();
+        let reads: Vec<&Snapshot> = [&before, &after].into_iter().chain(&samples).collect();
+        differ = persistent(&differ, &reads, &wanted_now, &gotten_now);
+        (wanted, gotten) = (wanted_now, gotten_now);
+    }
+    Compared {
+        wanted,
+        gotten,
+        first,
+        differ,
+    }
+}
+
 /// Whether a case is held to `pgrep`'s exact answer. Every one is, except on
 /// Linux where an option follows the first operand: procps reads it as an
 /// option, macOS as one more pattern, and the guard counts what either reading
@@ -373,21 +412,12 @@ fn the_guard_picks_exactly_the_processes_pgrep_picks() {
         let models_self =
             cfg!(target_os = "linux") || argv.iter().any(|a| *a == "-v" || *a == "-a");
         let own_pid = models_self.then_some(own);
-        // `pgrep` lists every user's processes; only this user's can be
-        // signalled, so those are the ones the guard counts.
-        let before = snapshot(None);
-        let (mut wanted, mut gotten) = ask(&argv, &before);
-        let after = snapshot(None);
-        let mut differ = unexplained(&wanted, &gotten, &before, &after, own_pid);
-        let first = differ.clone();
-        if !differ.is_empty() {
-            let pids: Vec<i32> = differ.iter().map(|(pid, _)| *pid).collect();
-            let (wanted_now, gotten_now) = ask(&argv, &before);
-            let samples: Vec<Snapshot> = (0..SAMPLES).map(|_| snapshot(Some(&pids))).collect();
-            let reads: Vec<&Snapshot> = [&before, &after].into_iter().chain(&samples).collect();
-            differ = persistent(&differ, &reads, &wanted_now, &gotten_now);
-            (wanted, gotten) = (wanted_now, gotten_now);
-        }
+        let Compared {
+            wanted,
+            gotten,
+            first,
+            mut differ,
+        } = compare(&argv, own_pid);
         // The marked children live throughout, so they are in or out of both
         // answers together, whatever else is running.
         let marked_agree = if exact {
@@ -548,28 +578,33 @@ fn a_process_whose_argv0_differs_from_its_executable_is_counted_by_either_name()
     let parent = std::process::id().to_string();
     let mine: BTreeSet<i32> = marked.pids().into_iter().collect();
     // Both tools over the children of this process, which is where the
-    // sleepers are (other tests' sleepers are too, all `sleep`).
-    let ask = |name: &[&str]| -> (BTreeSet<i32>, BTreeSet<i32>) {
-        let mut args: Vec<&str> = name.to_vec();
-        args.extend(["-P", &parent]);
-        let wanted = pgrep(&args).into_iter().collect();
-        let got = live_match_pids("pgrep", &args)
-            .expect("the guard evaluates it")
-            .into_iter()
-            .collect();
-        (wanted, got)
-    };
+    // sleepers are. Other tests' sleepers are too, all `sleep`, started and
+    // reaped while this runs, so the comparison excuses that churn.
     // By the executable's name: `pgrep -x sleep` finds all of them, and so
     // must the guard, whose macOS reading looked at `argv[0]` only and saw none.
-    let (wanted, got) = ask(&["-x", "sleep"]);
+    let Compared {
+        wanted,
+        gotten,
+        first,
+        mut differ,
+    } = compare(&["-x", "sleep", "-P", &parent], None);
     assert!(mine.is_subset(&wanted), "pgrep -x sleep: {wanted:?}");
+    assert!(mine.is_subset(&gotten), "the guard: {gotten:?}");
+    differ.retain(|(_, side)| *side == "pgrep");
     assert!(
-        wanted.is_subset(&got),
-        "pgrep -x sleep reached {wanted:?}, the guard only {got:?}"
+        differ.is_empty(),
+        "pgrep -x sleep reached {wanted:?}, the guard only {gotten:?}: \
+         disputed first {first:?}, still unexplained {differ:?}"
     );
-    // By `argv[0]`: procps finds none, the guard counts them all.
-    let (wanted, got) = ask(&["-x", &marked.marker]);
+    // By `argv[0]`: procps finds none, the guard counts them all. The marker
+    // is this test's own, so nothing else running can match it.
+    let args = ["-x", marked.marker.as_str(), "-P", &parent];
+    let wanted = pgrep(&args);
     assert!(wanted.is_empty(), "procps matched argv[0]: {wanted:?}");
+    let got: BTreeSet<i32> = live_match_pids("pgrep", &args)
+        .expect("the guard evaluates it")
+        .into_iter()
+        .collect();
     assert_eq!(got, mine, "the guard also tries argv[0]");
 }
 
@@ -660,15 +695,26 @@ fn a_not_dumpable_process_of_this_user_is_counted() {
     );
     let own = std::process::id().to_string();
     let uid_text = uid.to_string();
+    // The other tests in this binary start and reap children of this process
+    // while this one runs, so the set `-P` selects moves between `pgrep`'s
+    // read and the guard's. The child is held to being in both answers, and
+    // every other difference to the rule `compare` applies everywhere here.
     for args in [vec!["-P", &own], vec!["-u", &uid_text, "-P", &own]] {
-        let wanted = pgrep(&args);
+        let Compared {
+            wanted,
+            gotten,
+            first,
+            differ,
+        } = compare(&args, None);
         assert!(wanted.contains(&pid), "pgrep {args:?}: {wanted:?}");
-        let got = live_match_pids("pgrep", &args).expect("the guard evaluates it");
         assert!(
-            got.contains(&pid),
-            "pgrep {args:?} reaches the not-dumpable child {pid}; the guard counted {got:?}"
+            gotten.contains(&pid),
+            "pgrep {args:?} reaches the not-dumpable child {pid}; the guard counted {gotten:?}"
         );
-        assert_eq!(got, wanted, "pgrep {args:?}");
+        assert!(
+            differ.is_empty(),
+            "pgrep {args:?}: disputed first {first:?}, still unexplained {differ:?}"
+        );
     }
 }
 

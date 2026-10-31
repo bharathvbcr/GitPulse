@@ -3998,8 +3998,10 @@ done
         ));
 
         let sent = std::fs::read_to_string(&requests).unwrap_or_default();
-        let request: Value = serde_json::from_str(sent.lines().next().expect("a policy request"))
-            .expect("the request is JSON");
+        let first = sent.lines().next().unwrap_or_else(|| {
+            panic!("a policy request; the gate decided without asking: {output:?}")
+        });
+        let request: Value = serde_json::from_str(first).expect("the request is JSON");
         assert_eq!(
             request["params"]["scope"]["task_id"], "TASK-HOOK",
             "the bound task's scope never reached the harness: {request}"
