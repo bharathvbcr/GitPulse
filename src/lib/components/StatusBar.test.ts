@@ -60,11 +60,11 @@ describe("StatusBar", () => {
     expect(tokens).not.toContain("gp-gpu");
   });
 
-  it("feeds all three override signals to the visibility rule", () => {
+  it("feeds all four override signals to the visibility rule", () => {
     // The rule itself is covered in ui/statusBarMode.test.ts. What cannot be
     // reached from a server render — repoStore state arrives from Tauri — is
     // whether the bar actually hands it a parked operation, the conflict
-    // count and the watcher state, so that wiring is pinned here: dropping
+    // count, the watcher state and a silent status poll, so that wiring is pinned here: dropping
     // one would leave a hidden bar silent about it.
     const wiring = source.slice(
       source.indexOf("resolveStatusBarMode($interfaceStore.statusBarMode"),
@@ -73,5 +73,6 @@ describe("StatusBar", () => {
     expect(wiring).toContain("operationParked: Boolean(operationMarker)");
     expect(wiring).toContain("conflictedCount,");
     expect(wiring).toContain("watchDegraded: Boolean(watchLabel)");
+    expect(wiring).toContain("statusUnavailable: statusUnavailableSince !== null");
   });
 });
