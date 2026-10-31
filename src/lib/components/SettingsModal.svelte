@@ -106,6 +106,16 @@
     productTour.open();
   }
 
+  /**
+   * The wizard is its own dialog and Settings would paint over it (and hold
+   * focus in a hidden dialog), so Settings gets out of the way first, the same
+   * as `replayWalkthrough`.
+   */
+  function runToolsSetup() {
+    onClose?.();
+    window.dispatchEvent(new CustomEvent("gitpulse:setup-tools"));
+  }
+
   async function refreshLaunchAtLogin() {
     launchAtLogin = await readLaunchAtLogin();
   }
@@ -1340,7 +1350,7 @@
                   <button
                     type="button"
                     class="gp-btn text-[11px] px-2 py-0.5"
-                    onclick={() => window.dispatchEvent(new CustomEvent("gitpulse:setup-tools"))}
+                    onclick={runToolsSetup}
                   >
                     Run setup
                   </button>

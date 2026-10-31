@@ -5,6 +5,7 @@
    */
   import { X, Download, Check, ChevronRight, Clipboard, Terminal } from "@lucide/svelte";
   import { invoke } from "../../ipc/invoke";
+  import { LAYERS } from "../../ui/layers";
   import {
     cancelInstall,
     closeSetupWizard,
@@ -132,7 +133,8 @@
 
 {#if $wizard.open}
   <div
-    class="gp-scrim fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+    class="gp-scrim fixed inset-0 flex items-center justify-center bg-black/40 p-4"
+    style="z-index: {LAYERS.PROMPT}"
     role="presentation"
   >
     <div
