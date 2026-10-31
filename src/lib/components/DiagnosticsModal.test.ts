@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
 import DiagnosticsModal, {
   classifyBackendDiagnostics,
+  hiddenByFilterNotice,
   isCurrentBackendLoad,
 } from "./DiagnosticsModal.svelte";
 import { diagnostics } from "../diagnostics/diagnostics";
@@ -179,5 +180,34 @@ describe("DiagnosticsModal backend log context", () => {
     expect(backendSection.indexOf('aria-live="polite"')).toBeLessThan(
       backendSection.indexOf("backendStatusLabel(backendStatus)"),
     );
+  });
+});
+
+describe("DiagnosticsModal empty state under a severity filter", () => {
+  it("says entries are hidden by the filter instead of claiming nothing was recorded", () => {
+    // One warning in the ring, filter = errors: the list is empty but the ring is not.
+    expect(hiddenByFilterNotice("error", 1)).toBe(
+      "No errors recorded. 1 other entry hidden by this filter.",
+    );
+    expect(hiddenByFilterNotice("warning", 3)).toBe(
+      "No warnings recorded. 3 other entries hidden by this filter.",
+    );
+  });
+
+  it("keeps the plain empty text for a genuinely empty ring or no filter", () => {
+    expect(hiddenByFilterNotice("error", 0)).toBeNull();
+    expect(hiddenByFilterNotice("warning", 0)).toBeNull();
+    expect(hiddenByFilterNotice("all", 4)).toBeNull();
+  });
+
+  it("offers Show all, which resets the filter, only on the filtered-out branch", () => {
+    expect(source).toContain("{#if hiddenNotice}");
+    expect(source).toContain('onclick={() => (filter = "all")}');
+    // The unfiltered empty ring still renders the original sentence.
+    diagnostics.clear();
+    const { body } = render(DiagnosticsModal, { props: { isOpen: true } });
+    expect(body).toContain("No frontend diagnostics recorded.");
+    // "Show all only" is the filter button's own tooltip; the button is the label.
+    expect(body).not.toMatch(/Show all\s*<\/button>/);
   });
 });

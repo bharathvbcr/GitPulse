@@ -207,6 +207,20 @@
     } finally {Storage.prototype.setItem=originalSetItem;}
     await click("Retry saving");
     check("diagnostics retry restores saved status",target.textContent.includes("App diagnostics saved locally")&&!target.textContent.includes("Retry saving"));
+    // A severity filter that leaves the list empty while the ring is not.
+    // The ring holds exactly one warning and no error, so the Errors filter matches nothing.
+    diagnostics.clear();
+    diagnostics.warn("filter-canary","Harness filtered warning");
+    await settle();
+    await click("Errors");
+    check("a filter that hides every entry says so instead of claiming nothing was recorded",
+      target.textContent.includes("No errors recorded. 1 other entry hidden by this filter.")&&!target.textContent.includes("No frontend diagnostics recorded")&&!target.textContent.includes("Harness filtered warning"),
+      target.textContent.slice(0,300));
+    await click("Show all");
+    check("Show all lists the entries the filter hid",target.textContent.includes("Harness filtered warning")&&!target.textContent.includes("hidden by this filter"));
+    diagnostics.clear();
+    await settle();
+    check("an empty ring still says nothing was recorded",target.textContent.includes("No frontend diagnostics recorded"));
     // Capture the platform's real ResizeObserver loop ErrorEvent before
     // installing the classifier, so filename/lineno/error are not filtered.
     const captureGenuine = event => {

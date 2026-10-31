@@ -1,5 +1,6 @@
 <script module lang="ts">
   import type { DaemonStatus, Degraded, PersistedLog as PersistedLogShape } from "../diagnostics/types";
+  import type { DiagnosticSeverity } from "../diagnostics/diagnostics";
 
   export type BackendDiagnosticStatus =
     | "idle"
@@ -24,6 +25,20 @@
     return hasLines ? "healthy" : "empty";
   }
 
+  export type SeverityFilter = "all" | DiagnosticSeverity;
+
+  /**
+   * What the list says when the active filter leaves it empty, or null when the
+   * ring itself is empty. Entries that exist but are filtered out must never
+   * read as "nothing was recorded": someone debugging a failure would conclude
+   * the app logged nothing.
+   */
+  export function hiddenByFilterNotice(filter: SeverityFilter, total: number): string | null {
+    if (filter === "all" || total <= 0) return null;
+    const wanted = filter === "error" ? "errors" : "warnings";
+    return `No ${wanted} recorded. ${total} other ${total === 1 ? "entry" : "entries"} hidden by this filter.`;
+  }
+
   /** A response belongs to the currently visible opening of the dialog. */
   export function isCurrentBackendLoad(
     generation: number,
@@ -45,7 +60,6 @@
     redactDiagnosticText,
     staleBuildNote,
     type DiagnosticEntry,
-    type DiagnosticSeverity,
   } from "../diagnostics/diagnostics";
   import {
     backdropFade,
@@ -72,8 +86,6 @@
     isOpen?: boolean;
     onClose?: () => void;
   } = $props();
-
-  type SeverityFilter = "all" | DiagnosticSeverity;
 
   const FILTERS: Array<{ value: SeverityFilter; label: string }> = [
     { value: "all", label: "All" },
@@ -109,6 +121,7 @@
       (entry) => filter === "all" || entry.severity === filter,
     ),
   );
+  let hiddenNotice = $derived(hiddenByFilterNotice(filter, $diagnostics.length));
   let errorCount = $derived(
     ($diagnostics as readonly DiagnosticEntry[]).reduce(
       (total, entry) => (entry.severity === "error" ? total + entry.count : total),
@@ -437,8 +450,19 @@
             <pre class="whitespace-pre-wrap wrap-break-word font-mono text-[11px] leading-relaxed text-textPrimary m-0">{entry.message}</pre>
           </div>
         {:else}
-          <div class="py-10 text-center text-textMuted" role="status">
-            No frontend diagnostics recorded.
+          <div class="py-10 text-center text-textMuted flex flex-col items-center gap-3" role="status">
+            {#if hiddenNotice}
+              <span>{hiddenNotice}</span>
+              <button
+                type="button"
+                class="gp-btn py-1! px-2.5! text-[11px]!"
+                onclick={() => (filter = "all")}
+              >
+                Show all
+              </button>
+            {:else}
+              <span>No frontend diagnostics recorded.</span>
+            {/if}
           </div>
         {/each}
       </div>
