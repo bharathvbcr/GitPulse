@@ -382,3 +382,51 @@ describe("TerminalSession GPU wiring", () => {
     expect(source).toContain("Drawing without GPU after a graphics reset");
   });
 });
+
+describe("TerminalSession bypass prompt and status announcements", () => {
+  const prompt = source.slice(
+    source.indexOf("data-terminal-acknowledge"),
+    source.indexOf('data-testid="bypass-decline"'),
+  );
+
+  it("does not claim modality over the app, and names itself", () => {
+    expect(prompt.length).toBeGreaterThan(0);
+    expect(source).not.toContain("aria-modal");
+    expect(prompt).toContain('role="alertdialog"');
+    expect(prompt).toContain("aria-labelledby=");
+    expect(prompt).toContain("aria-describedby=");
+  });
+
+  it("focuses the safer answer, only for the tab being looked at", () => {
+    expect(source).toContain("bind:this={declineButton}");
+    const effect = source.slice(source.indexOf("if (!awaitingAcknowledgement || !active) return;"));
+    const body = effect.slice(0, effect.indexOf("\n  });"));
+    expect(body).toContain("tick()");
+    expect(body).toContain("declineButton?.focus({ preventScroll: true })");
+    expect(body).toContain("awaitingAcknowledgement && active");
+  });
+
+  it("hands focus back to the grid after either answer, for the active tab only", () => {
+    const hand = source.slice(source.indexOf("async function handBackFocus()"));
+    const handBody = hand.slice(0, hand.indexOf("\n  }"));
+    expect(handBody).toContain("await tick();");
+    expect(handBody).toContain("if (active) term?.focus();");
+    for (const site of ["acknowledgeBypass", "declineBypass"]) {
+      const start = source.indexOf(`async function ${site}(`);
+      expect(start, `${site} is not async`).toBeGreaterThan(-1);
+      expect(source.slice(start, source.indexOf("\n  }", start))).toContain("await handBackFocus();");
+    }
+  });
+
+  it("announces spawn and exit politely and the error assertively, in full", () => {
+    expect(source).toMatch(/<span role="status"[^>]*>Starting \{launcherLabel\(launcher\)\}…/);
+    expect(source).toMatch(/<span role="status"[^>]*>\{resumeOffer \?/);
+    const alert = source.match(/<span role="alert"[^>]*>\{error\}<\/span>/)?.[0] ?? "";
+    expect(alert).not.toBe("");
+    expect(alert).not.toContain("truncate");
+    expect(alert).toContain("break-words");
+    expect(alert).toContain("max-h-24");
+    // The text is in the node, not only in a tooltip.
+    expect(alert).not.toContain("title=");
+  });
+});
