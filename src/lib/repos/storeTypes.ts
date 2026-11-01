@@ -78,8 +78,11 @@ export interface FileStatus {
   unstaged_deletions?: number;
   /**
    * Why this row's additions/deletions may understate reality — its numstat
-   * record could not be parsed. Rust omits the key entirely while empty, so
-   * this is absent on the overwhelming majority of rows.
+   * record could not be parsed, or it is an untracked file whose lines were
+   * not counted (this refresh's scan budget was spent, it is over the size
+   * limit, or it could not be read), in which case its 0 is not a count. Rust
+   * omits the key entirely while empty, so this is absent on the overwhelming
+   * majority of rows.
    */
   warnings?: string[];
 }

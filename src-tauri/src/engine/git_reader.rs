@@ -16,7 +16,7 @@ use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -184,9 +184,11 @@ pub struct FileStatus {
     pub unstaged_additions: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unstaged_deletions: Option<usize>,
-    /// Why this row's additions/deletions may understate reality (its numstat
-    /// record could not be parsed). Absent from the JSON entirely while empty,
-    /// so existing consumers see no shape change.
+    /// Why this row's additions/deletions may understate reality: its numstat
+    /// record could not be parsed, or it is an untracked file whose lines were
+    /// not counted (scan budget spent, over the size limit, unreadable).
+    /// Absent from the JSON entirely while empty, so existing consumers see
+    /// no shape change.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
@@ -1172,6 +1174,15 @@ impl GitReader {
     pub const STATUS_ARGV: &'static [&'static str] = crate::engine::git_cli::STATUS_ARGV;
 
     pub fn get_status(repo_path: &str) -> Result<Vec<FileStatus>, CommandError> {
+        Self::get_status_with_budget(repo_path, UntrackedBudget::SHIPPED)
+    }
+
+    /// [`Self::get_status`] with `untracked` as the most it may read to count
+    /// untracked files' lines; a row past it carries a warning instead.
+    fn get_status_with_budget(
+        repo_path: &str,
+        untracked: UntrackedBudget,
+    ) -> Result<Vec<FileStatus>, CommandError> {
         let repo = validate_repo(repo_path)?;
         // -z disables path quoting outright; core.quotepath=off is kept as
         // belt-and-braces so a future non-z invocation still gets raw UTF-8.
@@ -1207,6 +1218,7 @@ impl GitReader {
             NumstatParse::default()
         };
 
+        let mut untracked_scan = UntrackedScan::new(&repo, untracked);
         let mut statuses = Vec::new();
         for record in records {
             let RawStatusRecord {
@@ -1234,12 +1246,19 @@ impl GitReader {
                 (0, 0)
             };
 
+            let mut warnings: Vec<String> = Vec::new();
             // Unstaged churn: untracked files count file lines directly; modified working-tree files read numstat_work
             let (work_add, work_del) = if is_untracked {
-                if let Ok(safe_path) = sandbox_join_canonical(&repo, &path) {
-                    count_untracked_file_lines(&safe_path)
-                } else {
-                    (0, 0)
+                let lines = match sandbox_join_canonical(&repo, &path) {
+                    Ok(safe_path) => untracked_scan.lines(&safe_path),
+                    Err(_) => UntrackedLines::NotCounted(UNTRACKED_UNREADABLE),
+                };
+                match lines {
+                    UntrackedLines::Counted(lines) => (lines, 0),
+                    UntrackedLines::NotCounted(why) => {
+                        warnings.push(why.to_string());
+                        (0, 0)
+                    }
                 }
             } else if is_work_changed {
                 numstat_work
@@ -1255,7 +1274,6 @@ impl GitReader {
             let additions = staged_add + work_add;
             let deletions = staged_del + work_del;
 
-            let mut warnings: Vec<String> = Vec::new();
             if is_staged {
                 for (warned_path, reason) in &numstat_index.issues {
                     if warned_path == &path || old_path.as_deref() == Some(warned_path) {
@@ -1287,6 +1305,7 @@ impl GitReader {
                 warnings,
             });
         }
+        untracked_scan.finish();
         Ok(statuses)
     }
 
@@ -5214,67 +5233,265 @@ fn validate_oid(oid: &str) -> Result<(), CommandError> {
     Ok(())
 }
 
-/// Streaming line counter for untracked working-tree text files.
+/// What one status refresh may spend counting the lines of untracked files.
 ///
-/// Returns `(line_count, 0)` for valid text files, and `(0, 0)` for binary,
-/// empty, oversized, symlinked, directory, or unreadable files.
-/// Operates with O(1) buffer space (64 KB) to ensure zero memory bloat even
-/// when scanning very large files.
-fn count_untracked_file_lines(full_path: &Path) -> (usize, usize) {
-    let Ok(meta) = std::fs::symlink_metadata(full_path) else {
-        return (0, 0);
+/// `-u` lists every untracked file, so an unignored `out/` of 30k files would
+/// otherwise be streamed whole on every watcher event. A row past either
+/// limit is reported as not counted instead.
+#[derive(Clone, Copy, Debug)]
+struct UntrackedBudget {
+    /// Files opened for reading.
+    files: usize,
+    /// Bytes read, summed over those files.
+    bytes: u64,
+}
+
+impl UntrackedBudget {
+    const SHIPPED: Self = Self {
+        files: 2_000,
+        bytes: 128 * 1024 * 1024,
     };
-    if !meta.is_file() {
-        return (0, 0);
-    }
-    if meta.len() == 0 {
-        return (0, 0);
-    }
-    const MAX_UNTRACKED_SCAN_BYTES: u64 = 64 * 1024 * 1024;
-    if meta.len() > MAX_UNTRACKED_SCAN_BYTES {
-        return (0, 0);
+}
+
+/// The largest single untracked file whose lines are counted.
+const UNTRACKED_FILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Why an untracked row's line count is absent. Each is a `FileStatus`
+/// warning, so the row's zero is not read as "no lines".
+const UNTRACKED_BUDGET_SPENT: &str =
+    "untracked file not line-counted: this refresh's scan budget was spent";
+const UNTRACKED_TOO_LARGE: &str =
+    "untracked file not line-counted: larger than the 64 MiB scan limit";
+const UNTRACKED_UNREADABLE: &str = "untracked file not line-counted: it could not be read";
+
+enum UntrackedLines {
+    Counted(usize),
+    NotCounted(&'static str),
+}
+
+/// Remembered line counts of untracked files, so a refresh reads only what
+/// changed since the last one.
+///
+/// Keyed by path and checked against [`ScanIdentity`] (length, inode, mtime
+/// and ctime), with the same racily-clean rule as [`lang_cache`]: a file
+/// written within [`lang_cache::RACY_WINDOW`] is not remembered. Bounded by
+/// `MAX_REPOS` repositories and `MAX_FILES_PER_REPO` files each; a miss is
+/// always recomputed from the file.
+mod untracked_cache {
+    use super::{HashMap, Mutex, OnceLock, PoisonError, ScanIdentity};
+    use std::path::PathBuf;
+
+    const MAX_REPOS: usize = 8;
+    pub(super) const MAX_FILES_PER_REPO: usize = 20_000;
+
+    #[derive(Clone, Copy, Debug)]
+    pub(super) struct Entry {
+        pub identity: ScanIdentity,
+        pub lines: usize,
     }
 
-    let Ok(file) = std::fs::File::open(full_path) else {
-        return (0, 0);
-    };
-    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
-    let mut line_count = 0usize;
-    let mut last_byte: Option<u8> = None;
-    let mut is_binary = false;
-    let mut buffer = [0u8; 64 * 1024];
+    pub(super) type RepoMap = HashMap<PathBuf, Entry>;
 
-    loop {
-        match std::io::Read::read(&mut reader, &mut buffer) {
-            Ok(0) => break,
-            Ok(n) => {
-                let chunk = &buffer[..n];
-                if chunk.contains(&0) {
-                    is_binary = true;
-                    break;
-                }
-                for &b in chunk {
-                    if b == b'\n' {
-                        line_count += 1;
-                    }
-                }
-                last_byte = Some(chunk[n - 1]);
+    #[derive(Default)]
+    struct Store {
+        /// Least recently scanned first.
+        order: Vec<PathBuf>,
+        repos: HashMap<PathBuf, RepoMap>,
+    }
+
+    fn store() -> &'static Mutex<Store> {
+        static STORE: OnceLock<Mutex<Store>> = OnceLock::new();
+        STORE.get_or_init(|| Mutex::new(Store::default()))
+    }
+
+    /// Takes `repo`'s map so the scan holds no lock while it reads files. A
+    /// concurrent refresh of the same repository starts empty.
+    pub(super) fn take(repo: &PathBuf) -> RepoMap {
+        let mut store = store().lock().unwrap_or_else(PoisonError::into_inner);
+        store.order.retain(|key| key != repo);
+        store.repos.remove(repo).unwrap_or_default()
+    }
+
+    pub(super) fn put(repo: PathBuf, map: RepoMap) {
+        if map.is_empty() {
+            return;
+        }
+        let mut store = store().lock().unwrap_or_else(PoisonError::into_inner);
+        store.order.retain(|key| *key != repo);
+        store.order.push(repo.clone());
+        store.repos.insert(repo, map);
+        while store.order.len() > MAX_REPOS {
+            let oldest = store.order.remove(0);
+            store.repos.remove(&oldest);
+        }
+    }
+}
+
+/// What the untracked line counter did on this thread, and a seam between its
+/// `lstat` and its `open` for the test that swaps a FIFO into that gap.
+#[cfg(test)]
+mod untracked_probe {
+    use super::Path;
+    use std::cell::{Cell, RefCell};
+
+    type Hook = Box<dyn Fn(&Path)>;
+
+    thread_local! {
+        static READ: Cell<(usize, u64)> = const { Cell::new((0, 0)) };
+        static BEFORE_OPEN: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn note_open() {
+        READ.with(|c| c.set((c.get().0 + 1, c.get().1)));
+    }
+
+    pub(super) fn note_bytes(n: u64) {
+        READ.with(|c| c.set((c.get().0, c.get().1 + n)));
+    }
+
+    /// Files opened and bytes read since the last call.
+    pub(super) fn take() -> (usize, u64) {
+        READ.with(|c| c.replace((0, 0)))
+    }
+
+    pub(super) fn before_open(path: &Path) {
+        BEFORE_OPEN.with(|hook| {
+            if let Some(hook) = hook.borrow().as_ref() {
+                hook(path);
             }
-            Err(_) => return (0, 0),
+        });
+    }
+
+    pub(super) fn set_before_open(hook: impl Fn(&Path) + 'static) {
+        BEFORE_OPEN.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+}
+
+/// Streaming line counter for the untracked files of one status refresh.
+///
+/// A file is `Counted` when its lines were read or remembered, including the
+/// zero of an empty, binary, directory or vanished path. It is `NotCounted`
+/// when the budget is spent, it exceeds [`UNTRACKED_FILE_MAX_BYTES`], or it
+/// could not be opened: the row's zero is then not a count. A remembered
+/// count costs one `lstat` and spends none of the budget. Reads use O(1)
+/// buffer space (64 KB), never exceed the length measured by the `lstat`, and
+/// go through [`open_working_tree_file`], so a FIFO swapped in after that
+/// `lstat` cannot hang the refresh.
+struct UntrackedScan {
+    repo: PathBuf,
+    budget: UntrackedBudget,
+    files_read: usize,
+    bytes_read: u64,
+    previous: untracked_cache::RepoMap,
+    next: untracked_cache::RepoMap,
+}
+
+impl UntrackedScan {
+    fn new(repo: &Path, budget: UntrackedBudget) -> Self {
+        let repo = repo.to_path_buf();
+        let previous = untracked_cache::take(&repo);
+        Self {
+            repo,
+            budget,
+            files_read: 0,
+            bytes_read: 0,
+            previous,
+            next: HashMap::new(),
         }
     }
 
-    if is_binary {
-        return (0, 0);
+    fn lines(&mut self, full_path: &Path) -> UntrackedLines {
+        let Ok(meta) = std::fs::symlink_metadata(full_path) else {
+            return UntrackedLines::Counted(0);
+        };
+        if !meta.is_file() || meta.len() == 0 {
+            return UntrackedLines::Counted(0);
+        }
+        let identity = ScanIdentity::of(&meta);
+        if let Some(known) = self.previous.get(full_path) {
+            if known.identity == identity {
+                let lines = known.lines;
+                self.remember(full_path, identity, lines);
+                return UntrackedLines::Counted(lines);
+            }
+        }
+        if meta.len() > UNTRACKED_FILE_MAX_BYTES {
+            return UntrackedLines::NotCounted(UNTRACKED_TOO_LARGE);
+        }
+        // Checked against the measured length BEFORE the open, so the bytes
+        // read can never pass the budget.
+        if self.files_read >= self.budget.files
+            || self.bytes_read.saturating_add(meta.len()) > self.budget.bytes
+        {
+            return UntrackedLines::NotCounted(UNTRACKED_BUDGET_SPENT);
+        }
+        #[cfg(test)]
+        untracked_probe::before_open(full_path);
+        self.files_read += 1;
+        #[cfg(test)]
+        untracked_probe::note_open();
+        let Ok(file) = open_working_tree_file(full_path) else {
+            return UntrackedLines::NotCounted(UNTRACKED_UNREADABLE);
+        };
+        match file.metadata() {
+            Ok(opened) if opened.is_file() => {}
+            // Replaced by something that is not a file after the `lstat`.
+            Ok(_) => return UntrackedLines::Counted(0),
+            Err(_) => return UntrackedLines::NotCounted(UNTRACKED_UNREADABLE),
+        }
+        match self.count_lines(file, meta.len()) {
+            Some(lines) => {
+                if lang_cache::settled(&identity) {
+                    self.remember(full_path, identity, lines);
+                }
+                UntrackedLines::Counted(lines)
+            }
+            None => UntrackedLines::NotCounted(UNTRACKED_UNREADABLE),
+        }
     }
 
-    if let Some(last) = last_byte {
-        if last != b'\n' {
+    /// Lines in the first `len` bytes of `file`; 0 for a binary one. `None`
+    /// when a read fails.
+    fn count_lines(&mut self, file: std::fs::File, len: u64) -> Option<usize> {
+        let mut reader = file.take(len);
+        let mut line_count = 0usize;
+        let mut last_byte: Option<u8> = None;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    self.bytes_read += n as u64;
+                    #[cfg(test)]
+                    untracked_probe::note_bytes(n as u64);
+                    let chunk = &buffer[..n];
+                    if chunk.contains(&0) {
+                        return Some(0);
+                    }
+                    line_count += chunk.iter().filter(|&&b| b == b'\n').count();
+                    last_byte = Some(chunk[n - 1]);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return None,
+            }
+        }
+        if last_byte.is_some_and(|last| last != b'\n') {
             line_count += 1;
         }
+        Some(line_count)
     }
 
-    (line_count, 0)
+    fn remember(&mut self, path: &Path, identity: ScanIdentity, lines: usize) {
+        if self.next.len() < untracked_cache::MAX_FILES_PER_REPO {
+            self.next
+                .insert(path.to_path_buf(), untracked_cache::Entry { identity, lines });
+        }
+    }
+
+    /// Keeps what this refresh learned, for the next one.
+    fn finish(self) {
+        untracked_cache::put(self.repo, self.next);
+    }
 }
 
 /// Rejects files larger than `max_bytes` BEFORE their bytes are read.
@@ -5294,6 +5511,21 @@ fn check_working_tree_size(path: &Path, max_bytes: u64) -> Result<(), CommandErr
     Ok(())
 }
 
+/// The one way a working-tree file is opened for reading: on Unix a final
+/// symlink is refused (`O_NOFOLLOW`) and a FIFO swapped in after the caller's
+/// `lstat` opens without waiting for a writer (`O_NONBLOCK`). The handle can
+/// still be anything, so the caller rechecks it with `fstat` before reading.
+fn open_working_tree_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
 /// Read a regular file with a hard allocation bound, including if it grows
 /// after stat. Never open a FIFO in blocking mode on Unix, and recheck the
 /// opened handle so replacing a file cannot bypass the metadata check.
@@ -5304,16 +5536,7 @@ pub(crate) fn read_working_tree_file(path: &Path, max_bytes: u64) -> Result<Vec<
         return Err("Expected a regular working-tree file".into());
     }
     check_working_tree_size(path, max_bytes)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
-    }
-    let file = options
-        .open(path)
-        .map_err(|e| format!("Cannot open file: {e}"))?;
+    let file = open_working_tree_file(path).map_err(|e| format!("Cannot open file: {e}"))?;
     if !file
         .metadata()
         .map_err(|e| format!("Cannot inspect open file: {e}"))?
@@ -5462,18 +5685,9 @@ fn blame_at_revision(
 /// using the same zero-OID convention as Git's uncommitted porcelain records.
 fn uncommitted_file_blame(repo: &Path, path: &Path) -> Result<Vec<BlameLine>, CommandError> {
     use std::io::Read;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // Refuse leaf replacement with a symlink and never block on a FIFO
-        // substituted between the initial stat and this open.
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = options
-        .open(path)
-        .map_err(|e| format!("Blame unavailable: {e}"))?;
+    // Refuses leaf replacement with a symlink and never blocks on a FIFO
+    // substituted between the initial stat and this open.
+    let file = open_working_tree_file(path).map_err(|e| format!("Blame unavailable: {e}"))?;
     let metadata = file
         .metadata()
         .map_err(|e| format!("Blame unavailable: {e}"))?;
@@ -6539,14 +6753,7 @@ fn tally_file(path: &Path, len: u64, rel_path: &str, path_info: LanguageInfo) ->
 /// so an unchanged file takes one read and one end-of-file read: `open`,
 /// `fstat`, two `read`s and `close`.
 fn read_file_prefix(path: &Path, limit: u64, len: u64) -> std::io::Result<Vec<u8>> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
-    }
-    let mut file = options.open(path)?;
+    let mut file = open_working_tree_file(path)?;
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::other("not a regular file"));
     }
@@ -12463,6 +12670,214 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             capped.is_mttr_approximation && full.is_mttr_approximation,
             "the restore time stays a heuristic either way; truncation is the added caveat"
         );
+    }
+
+    /// Characterization of the untracked line counts a small tree has always
+    /// had: the budget that now bounds the scan must not move any of them.
+    #[test]
+    fn untracked_line_counts_on_a_small_tree_are_what_they_always_were() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("tracked.txt"), "t\n").unwrap();
+        crate::test_support::git_in(&root, &["add", "."]);
+        crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("three.txt"), "1\n2\n3\n").unwrap();
+        std::fs::write(root.join("no_newline.txt"), "x\ny").unwrap();
+        std::fs::write(root.join("empty.txt"), "").unwrap();
+        std::fs::write(root.join("binary.dat"), b"ab\0cd\n").unwrap();
+        std::fs::write(root.join("sub").join("one.txt"), "one\n").unwrap();
+
+        let rows = GitReader::get_status(root.to_str().unwrap()).unwrap();
+        let churn = |name: &str| {
+            let row = rows.iter().find(|r| r.path == name).expect(name);
+            (row.additions, row.deletions)
+        };
+        assert_eq!(rows.len(), 5, "{rows:?}");
+        assert_eq!(churn("three.txt"), (3, 0));
+        assert_eq!(churn("no_newline.txt"), (2, 0));
+        assert_eq!(churn("empty.txt"), (0, 0));
+        assert_eq!(churn("binary.dat"), (0, 0));
+        assert_eq!(churn("sub/one.txt"), (1, 0));
+    }
+
+    /// A repository holding one tracked file and `count` untracked ones,
+    /// `u000.txt`.., each `lines` lines of two bytes.
+    fn untracked_fixture(count: usize, lines: usize) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("tracked.txt"), "t\n").unwrap();
+        crate::test_support::git_in(&root, &["add", "."]);
+        crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+        for n in 0..count {
+            std::fs::write(root.join(format!("u{n:03}.txt")), "x\n".repeat(lines)).unwrap();
+        }
+        (dir, root)
+    }
+
+    /// Rows split into the ones with a line count and the ones without, as
+    /// `(counted additions, not-counted paths with their reasons)`.
+    fn counted_and_not(rows: &[FileStatus]) -> (Vec<usize>, Vec<(&str, &[String])>) {
+        let mut counted = Vec::new();
+        let mut not_counted = Vec::new();
+        for row in rows {
+            if row.warnings.is_empty() {
+                counted.push(row.additions);
+            } else {
+                not_counted.push((row.path.as_str(), row.warnings.as_slice()));
+            }
+        }
+        (counted, not_counted)
+    }
+
+    /// A-git-05: every untracked file used to be opened and streamed on every
+    /// refresh. The file count now bounds the opens, and each row past it says
+    /// its zero is not a count.
+    #[test]
+    fn untracked_scan_stops_at_the_file_budget_and_marks_the_rest() {
+        let (_dir, root) = untracked_fixture(20, 2);
+        untracked_probe::take();
+        let rows = GitReader::get_status_with_budget(
+            root.to_str().unwrap(),
+            UntrackedBudget {
+                files: 7,
+                bytes: u64::MAX,
+            },
+        )
+        .unwrap();
+        let (opened, bytes) = untracked_probe::take();
+        let (counted, not_counted) = counted_and_not(&rows);
+        assert_eq!(rows.len(), 20);
+        assert_eq!(counted, vec![2; 7], "exactly the budgeted files are counted");
+        assert_eq!(not_counted.len(), 13);
+        for (path, why) in &not_counted {
+            assert_eq!(*why, [UNTRACKED_BUDGET_SPENT.to_string()], "{path}");
+        }
+        assert!(rows
+            .iter()
+            .filter(|r| !r.warnings.is_empty())
+            .all(|r| r.additions == 0 && r.deletions == 0));
+        assert_eq!((opened, bytes), (7, 7 * 4), "nothing past the budget was read");
+    }
+
+    /// The same bound in bytes: a file that would pass it is never opened, so
+    /// the bytes read cannot exceed the budget.
+    #[test]
+    fn untracked_scan_never_reads_more_bytes_than_its_budget() {
+        // 500 lines of two bytes: 1000 bytes a file.
+        let (_dir, root) = untracked_fixture(20, 500);
+        let budget = UntrackedBudget {
+            files: usize::MAX,
+            bytes: 5_500,
+        };
+        untracked_probe::take();
+        let rows = GitReader::get_status_with_budget(root.to_str().unwrap(), budget).unwrap();
+        let (opened, bytes) = untracked_probe::take();
+        let (counted, not_counted) = counted_and_not(&rows);
+        assert_eq!(counted, vec![500; 5]);
+        assert_eq!(not_counted.len(), 15);
+        assert_eq!((opened, bytes), (5, 5_000));
+        assert!(bytes <= budget.bytes);
+    }
+
+    /// A file over the single-file limit is reported, not silently zero, and
+    /// is not opened. Sparse, so nothing of it is ever read.
+    #[test]
+    fn an_untracked_file_over_the_size_limit_is_marked_not_counted() {
+        let (_dir, root) = untracked_fixture(1, 3);
+        let big = std::fs::File::create(root.join("big.bin")).unwrap();
+        big.set_len(UNTRACKED_FILE_MAX_BYTES + 1).unwrap();
+        untracked_probe::take();
+        let rows = GitReader::get_status(root.to_str().unwrap()).unwrap();
+        let (opened, _) = untracked_probe::take();
+        let big = rows.iter().find(|r| r.path == "big.bin").unwrap();
+        assert_eq!(big.warnings, [UNTRACKED_TOO_LARGE.to_string()]);
+        assert_eq!(opened, 1, "only the small file was opened");
+    }
+
+    /// A settled file is remembered by (path, length, mtime, ctime): what a
+    /// refresh already counted costs one `lstat` and none of the budget, so a
+    /// tree larger than the budget is counted across refreshes; a rewritten
+    /// file is read again.
+    #[test]
+    fn remembered_untracked_counts_spend_no_budget_and_follow_the_file() {
+        let (_dir, root) = untracked_fixture(6, 5);
+        let path = root.to_str().unwrap();
+        let budget = UntrackedBudget {
+            files: 3,
+            bytes: u64::MAX,
+        };
+        let opened_by = |rows: &mut Vec<FileStatus>| {
+            *rows = GitReader::get_status_with_budget(path, budget).unwrap();
+            untracked_probe::take().0
+        };
+        let mut rows = Vec::new();
+
+        // Written moments ago: counted, but too fresh to be remembered.
+        untracked_probe::take();
+        assert_eq!(opened_by(&mut rows), 3);
+        assert_eq!(counted_and_not(&rows).0.len(), 3);
+
+        std::thread::sleep(lang_cache::RACY_WINDOW + Duration::from_millis(300));
+        assert_eq!(opened_by(&mut rows), 3, "settled now, so these are read once more");
+        assert_eq!(counted_and_not(&rows).0.len(), 3);
+
+        // The first three come from memory, so the budget reaches the rest.
+        assert_eq!(opened_by(&mut rows), 3);
+        let (counted, not_counted) = counted_and_not(&rows);
+        assert_eq!((counted, not_counted.len()), (vec![5; 6], 0));
+
+        assert_eq!(opened_by(&mut rows), 0, "all six are remembered");
+        assert_eq!(counted_and_not(&rows).0, vec![5; 6]);
+
+        std::fs::write(root.join("u002.txt"), "x\n".repeat(9)).unwrap();
+        assert_eq!(opened_by(&mut rows), 1, "only the rewritten file is read");
+        let row = rows.iter().find(|r| r.path == "u002.txt").unwrap();
+        assert_eq!(row.additions, 9);
+    }
+
+    /// The race the card describes: a path that was a regular file when the
+    /// scan measured it and is a FIFO when it opens it. A blocking open waits
+    /// for a writer forever; the refresh must come back.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_swapped_in_after_the_stat_does_not_hang_the_status() {
+        use std::os::unix::ffi::OsStrExt;
+        let (_dir, root) = untracked_fixture(3, 2);
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let scanned = root.clone();
+        std::thread::spawn(move || {
+            untracked_probe::set_before_open(move |path| {
+                if path.file_name().is_some_and(|name| name == "u001.txt") {
+                    std::fs::remove_file(path).unwrap();
+                    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                    // SAFETY: `c_path` is a valid NUL-terminated path.
+                    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+                    let _ = reached_tx.send(());
+                }
+            });
+            let rows = GitReader::get_status_with_budget(
+                scanned.to_str().unwrap(),
+                UntrackedBudget::SHIPPED,
+            );
+            let _ = done_tx.send(rows.map_err(|e| format!("{e:?}")));
+        });
+        // Generous: the fixture's `git status` runs first, under whatever
+        // load the machine has. The 2 s is for what follows the swap.
+        reached_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the scan never reached the FIFO swap");
+        let rows = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("get_status blocked opening a FIFO")
+            .unwrap();
+        let swapped = rows.iter().find(|r| r.path == "u001.txt").unwrap();
+        assert_eq!(swapped.additions, 0);
+        assert_eq!(rows.iter().find(|r| r.path == "u000.txt").unwrap().additions, 2);
+        assert_eq!(rows.iter().find(|r| r.path == "u002.txt").unwrap().additions, 2);
     }
 
     /// The two numstats run only when a row reads them, and skipping them
