@@ -90,6 +90,10 @@ mod kotlinloss;
 // The same-length `;` rewrite that lets a one-line Kotlin class body parse.
 #[cfg(feature = "parse")]
 mod kotlinsemi;
+// The same-length letter rewrite that lets a bare `&` or `>` of a Svelte
+// template's text parse.
+#[cfg(feature = "parse")]
+mod sveltetext;
 // Python-only facts (dynamic dispatch). Walks a parse tree; its one caller is
 // `treesitter::extract_treesitter`.
 #[cfg(feature = "parse")]

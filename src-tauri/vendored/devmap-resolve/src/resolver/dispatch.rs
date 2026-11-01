@@ -659,11 +659,123 @@ impl Resolver {
             return Some(first);
         }
         let scope = binding.and_then(|b| b.scope.as_deref()).or(scope);
+        if ext.language == "rust" {
+            if !Self::rust_receiver_spelled_bare(ext, scope, receiver, class_type) {
+                return None;
+            }
+            return self.rust_same_file_method(ext, class_type, hits);
+        }
         if ext.language != "go" || !Self::go_receiver_spelled_bare(ext, scope, receiver, class_type)
         {
             return None;
         }
         self.go_own_package_method(ext, class_type, hits)
+    }
+
+    pub(super) fn rust_receiver_spelled_bare(
+        ext: &Extraction,
+        scope: Option<&str>,
+        receiver: &str,
+        class_type: &str,
+    ) -> bool {
+        let mut bare = false;
+        for reference in ext.references.iter().filter(|reference| {
+            reference.assigned_to.as_deref() == Some(receiver)
+                && reference.enclosing_symbol.as_deref() == scope
+        }) {
+            match reference.kind {
+                ReferenceKind::TypeQualifier => return false,
+                ReferenceKind::Type if reference.name == class_type => {
+                    let preceded_by_qualifier = ext.references.iter().any(|other| {
+                        other.assigned_to.as_deref() == Some(receiver)
+                            && other.enclosing_symbol.as_deref() == scope
+                            && other.span.end_byte + 2 == reference.span.start_byte
+                    });
+                    if preceded_by_qualifier {
+                        return false;
+                    }
+                    bare = true;
+                }
+                ReferenceKind::Constructor if reference.name == class_type => {
+                    let written = reference.span.end_byte - reference.span.start_byte;
+                    if written != reference.name.len() {
+                        return false;
+                    }
+                    bare = true;
+                }
+                ReferenceKind::Call => {
+                    let call_recv = reference.receiver_expr.as_deref().or_else(|| {
+                        ext.calls.iter().find_map(|call| {
+                            (call.callee_name == reference.name
+                                && call.span.start_byte <= reference.span.start_byte
+                                && call.span.end_byte >= reference.span.end_byte)
+                                .then_some(call.receiver_expr.as_deref())
+                                .flatten()
+                        })
+                    });
+                    if let Some(call_recv) = call_recv {
+                        let head = call_recv
+                            .split('<')
+                            .next()
+                            .unwrap_or(call_recv)
+                            .trim()
+                            .trim_end_matches("::");
+                        if head.ends_with(&format!("::{class_type}")) {
+                            return false;
+                        }
+                        if head == class_type {
+                            bare = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        bare
+    }
+
+    pub(super) fn rust_same_file_method<'a>(
+        &self,
+        ext: &Extraction,
+        class_type: &str,
+        hits: &'a [(String, String)],
+    ) -> Option<&'a (String, String)> {
+        let type_count = ext
+            .symbols
+            .iter()
+            .filter(|sym| {
+                sym.name == class_type
+                    && matches!(
+                        sym.kind,
+                        SymbolKind::Struct
+                            | SymbolKind::Enum
+                            | SymbolKind::Trait
+                            | SymbolKind::Class
+                            | SymbolKind::Interface
+                    )
+            })
+            .count();
+        if type_count == 0 || (type_count > 1 && !ext.rust_inline_modules.is_empty()) {
+            return None;
+        }
+        let imported_by_name = ext.imports.iter().any(|imp| {
+            imp.local_names.iter().any(|n| n == class_type)
+                || (imp.local_names.is_empty()
+                    && imp.imported_names.iter().any(|n| n == class_type))
+        });
+        if imported_by_name {
+            return None;
+        }
+        let mut own: Vec<&(String, String)> = hits
+            .iter()
+            .filter(|(path, _)| path == &ext.file_path)
+            .collect();
+        own.sort();
+        own.dedup();
+        match own.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        }
     }
 
     /// Whether this file wrote `receiver`'s type as a bare `class_type`, and

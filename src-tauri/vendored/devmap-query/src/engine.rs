@@ -632,6 +632,8 @@ impl<'a> StoreQueryEngine<'a> {
                         layers: unavailable_response(ResolutionAvailability::Unavailable {
                             reason,
                         }),
+                        seeds_total: 0,
+                        seeds_omitted: 0,
                         total_impacted: 0,
                     },
                 });
@@ -654,6 +656,7 @@ impl<'a> StoreQueryEngine<'a> {
                 &index,
                 &target,
                 min_confidence,
+                edge_budget,
                 &mut edges,
             )?;
             // `Some` by construction: `band_budget` was `Some` on the call above,
@@ -1148,12 +1151,14 @@ impl<'a> StoreQueryEngine<'a> {
         }
         let target = req.query.clone();
         let min_confidence = req.min_confidence;
+        let token_budget = req.token_budget;
         let mut response = self.traverse_over(&index, &direction, req, min_rung)?;
         self.attach_unresolved_namesakes(
             generation,
             &index,
             &target,
             min_confidence,
+            token_budget,
             &mut response,
         )?;
         Ok(response)
@@ -1180,13 +1185,14 @@ impl<'a> StoreQueryEngine<'a> {
         index: &GenerationEdges,
         target: &str,
         min_confidence: f32,
+        token_budget: u32,
         response: &mut Response<T>,
     ) -> anyhow::Result<Option<String>> {
         // A refused start query (an ambiguous bare name) has already been
         // reported by the walk; the names below then come from the query text.
         let starts = indexed_traversal_starts(index, target, true, min_confidence, &self.cancel)
             .unwrap_or_default();
-        let namesakes = match self.unresolved_namesakes(generation, target, &starts)? {
+        let mut namesakes = match self.unresolved_namesakes(generation, target, &starts)? {
             NamesakeRead::NotApplicable => return Ok(None),
             NamesakeRead::GenerationGone => {
                 // Checked, and could not be answered consistently: saying
@@ -1231,6 +1237,27 @@ impl<'a> StoreQueryEngine<'a> {
                 )),
             );
         }
+        let site_budget = token_budget / 4;
+        let full_len = namesakes.sites.len();
+        let mut used = 0u32;
+        let mut keep = 0usize;
+        for site in &namesakes.sites {
+            let bytes = site.source_file.len()
+                + site.source_symbol.len()
+                + site.callee_name.len()
+                + site.receiver.as_deref().map_or(0, str::len)
+                + site.classification.len();
+            let cost = u32::try_from(bytes / BYTES_PER_TOKEN as usize)
+                .unwrap_or(u32::MAX)
+                .saturating_add(24);
+            if used.saturating_add(cost) > site_budget {
+                break;
+            }
+            used = used.saturating_add(cost);
+            keep += 1;
+        }
+        namesakes.sites.truncate(keep);
+        namesakes.sites_omitted = full_len.saturating_sub(keep);
         response.walk_incomplete =
             devmap_analyze::combine_reasons(response.walk_incomplete.take(), added.clone());
         response.unresolved_namesakes = Some(namesakes);
@@ -1493,6 +1520,8 @@ impl<'a> StoreQueryEngine<'a> {
                     layers.walk_incomplete = coverage_gap.clone();
                     layers
                 },
+                seeds_total: 0,
+                seeds_omitted: 0,
                 total_impacted: 0,
             });
             return Ok((response, bands));
@@ -1728,6 +1757,8 @@ impl<'a> StoreQueryEngine<'a> {
                 seeds: Vec::new(),
                 unmatched_targets: Vec::new(),
                 layers: unavailable_response(ResolutionAvailability::Unavailable { reason }),
+                seeds_total: 0,
+                seeds_omitted: 0,
                 total_impacted: 0,
             },
             budget,
@@ -1931,6 +1962,8 @@ impl<'a> StoreQueryEngine<'a> {
                     seeds: Vec::new(),
                     unmatched_targets: targets.to_vec(),
                     layers: unavailable_response(ResolutionAvailability::Unavailable { reason }),
+                    seeds_total: 0,
+                    seeds_omitted: 0,
                     total_impacted: 0,
                 },
             };

@@ -1,4 +1,6 @@
-use super::{blast_layer_tokens, budget_take, edge_kind_name, stored_edge_to_resolved};
+use super::{
+    blast_layer_tokens, budget_take, edge_kind_name, stored_edge_to_resolved, BYTES_PER_TOKEN,
+};
 use crate::cancel::Cancel;
 use crate::model::{BlastLayer, BlastRadius, ResolutionAvailability, UnresolvedNamesakes};
 use devmap_analyze::traversal::TraversalStop;
@@ -422,19 +424,111 @@ impl BlastWalk {
                 }
             })
             .collect();
-        let mut response = budget_take(layers, token_budget, blast_layer_tokens);
+        let seeds = self.seeds.into_iter().map(|(symbol, _)| symbol).collect();
+        let mut radius = pack_radius(
+            seeds,
+            self.unmatched,
+            layers,
+            self.total_impacted,
+            token_budget,
+        );
         if self.unresolved_seeds {
-            response.resolution = ResolutionAvailability::Unavailable {
+            radius.layers.resolution = ResolutionAvailability::Unavailable {
                 reason: "no target matched an indexed traversal start".to_string(),
             };
         }
-        response.walk_incomplete = incomplete;
-        BlastRadius {
-            seeds: self.seeds.into_iter().map(|(symbol, _)| symbol).collect(),
-            unmatched_targets: self.unmatched,
-            layers: response,
-            total_impacted: self.total_impacted,
+        radius.layers.walk_incomplete = incomplete;
+        radius
+    }
+}
+
+/// Seed ids a blast radius lists. The exact count travels in
+/// [`BlastRadius::seeds_total`]; this bounds the listing, never the count.
+pub(super) const BLAST_SEED_SAMPLE: usize = 10;
+
+/// Share of a radius's budget its seed list may take: a quarter, so the bands
+/// keep most of what they were given.
+const BLAST_SEED_BUDGET_SHARE: u32 = 4;
+
+/// Token cost of one listed seed id: its bytes over [`BYTES_PER_TOKEN`] plus one
+/// for the separator, the rate [`blast_layer_tokens`] charges a band's nodes.
+fn seed_tokens(seed: &str) -> u32 {
+    u32::try_from(seed.len() / BYTES_PER_TOKEN as usize)
+        .unwrap_or(u32::MAX)
+        .saturating_add(1)
+}
+
+/// Shrink each band's `nodes` to what the budget left it, in order.
+///
+/// [`budget_take`] withholds the first band that does not fit and every band
+/// after it, and a band's cost is almost entirely its listed nodes, so a budget
+/// one node short of the 50-node sample showed no bands at all: the nearest
+/// callers, the most useful band, were the ones dropped. A band is trimmed
+/// instead, and the nodes it no longer lists are added to `nodes_omitted` —
+/// `node_count` is untouched. A band whose header alone does not fit is left as
+/// it is for [`budget_take`] to withhold, and so is every band after it.
+fn fit_bands(layers: &mut [BlastLayer], token_budget: u32) {
+    let mut remaining = token_budget;
+    for layer in layers {
+        let before = layer.nodes.len();
+        while blast_layer_tokens(layer) > remaining && !layer.nodes.is_empty() {
+            layer.nodes.pop();
         }
+        if blast_layer_tokens(layer) > remaining {
+            return;
+        }
+        let dropped = before - layer.nodes.len();
+        if dropped > 0 {
+            let kept: BTreeSet<&str> = layer.nodes.iter().map(String::as_str).collect();
+            layer.direct.retain(|node| kept.contains(node.as_str()));
+            layer.dispatch.retain(|node| kept.contains(node.as_str()));
+            layer.nodes_omitted = layer
+                .nodes_omitted
+                .saturating_add(u32::try_from(dropped).unwrap_or(u32::MAX));
+        }
+        remaining -= blast_layer_tokens(layer);
+    }
+}
+
+/// A radius in the form it is presented: a sampled seed list, bands trimmed to
+/// fit, and both charged to `token_budget`.
+///
+/// The one place a radius is packed, for the walk-based producer
+/// ([`BlastWalk::into_radius`]) and the edge-based one
+/// ([`blast_radius_from_edges`]), so the two cannot disagree about what a
+/// budget buys. The seed list is listed first at its capped cost and the bands
+/// get what is left, so seeds plus bands never exceed `token_budget`.
+fn pack_radius(
+    seeds: Vec<String>,
+    unmatched_targets: Vec<String>,
+    mut layers: Vec<BlastLayer>,
+    total_impacted: u32,
+    token_budget: u32,
+) -> BlastRadius {
+    let seeds_total = u32::try_from(seeds.len()).unwrap_or(u32::MAX);
+    let share = token_budget / BLAST_SEED_BUDGET_SHARE;
+    let mut spent = 0u32;
+    let listed: Vec<String> = seeds
+        .into_iter()
+        .take(BLAST_SEED_SAMPLE)
+        .take_while(|seed| {
+            let cost = seed_tokens(seed);
+            let fits = cost <= share.saturating_sub(spent);
+            if fits {
+                spent += cost;
+            }
+            fits
+        })
+        .collect();
+    let band_budget = token_budget.saturating_sub(spent);
+    fit_bands(&mut layers, band_budget);
+    BlastRadius {
+        seeds_omitted: seeds_total.saturating_sub(u32::try_from(listed.len()).unwrap_or(u32::MAX)),
+        seeds: listed,
+        seeds_total,
+        unmatched_targets,
+        layers: budget_take(layers, band_budget, blast_layer_tokens),
+        total_impacted,
     }
 }
 
@@ -576,18 +670,19 @@ pub(super) fn blast_radius_from_edges(
         })
         .collect();
 
-    let mut response = budget_take(layers, token_budget, blast_layer_tokens);
-    response.walk_incomplete = walk_incomplete;
-    BlastRadius {
-        seeds: seed_set.into_iter().map(str::to_string).collect(),
-        // Every seed here came from `indexed_traversal_starts` and therefore
-        // matched. The unmatched case never reaches this function — it returns
-        // an `Unavailable` radius one level up, where the caller's own text is
-        // still in hand to name.
-        unmatched_targets: Vec::new(),
-        layers: response,
+    // Every seed here came from `indexed_traversal_starts` and therefore
+    // matched. The unmatched case never reaches this function — it returns an
+    // `Unavailable` radius one level up, where the caller's own text is still
+    // in hand to name.
+    let mut radius = pack_radius(
+        seed_set.into_iter().map(str::to_string).collect(),
+        Vec::new(),
+        layers,
         total_impacted,
-    }
+        token_budget,
+    );
+    radius.layers.walk_incomplete = walk_incomplete;
+    radius
 }
 
 #[cfg(test)]

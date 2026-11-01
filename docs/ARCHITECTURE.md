@@ -190,8 +190,10 @@ Two of these are worth stating plainly, because both were live defects:
   wall-clock deadline — reporting `2 of 5+` rather than presenting a capped
   sample as a total.
 
-### Async Hygiene & Cancellation Guards
+### Async Hygiene, Cancellation Guards & 5-Lane Workflow Separation
 When switching between repositories or triggering fast refilters, in-flight IPC calls could return out of order. GitPulse guards asynchronous calls using `createAsyncGuard` ([`src/lib/async/guard.ts`](../src/lib/async/guard.ts)). When a repository changes or a new query starts, pending promises from prior invocations are automatically invalidated and dropped.
+
+Repository and background operations are partitioned into five isolated execution lanes (`git-read`, `git-write`, `github`, `insights`, and `devmap`) via [`src/lib/async/lanes.ts`](../src/lib/async/lanes.ts) so slow background DevMap indexing or repository-wide insights scans never contend with interactive git status reads, staging, or view navigation. On the backend, DevMap IPC commands apply a 4-second non-blocking lock timeout (`try_lock_timeout`) and `UntrackedBudget` bounds untracked file line-counting to 4 MiB / 512 files with `O_NONBLOCK | O_NOFOLLOW` opens and `(path, mtime, size)` metadata caching. `ViewSectionPanel.svelte` retains visited view DOM subtrees (hiding inactive panels with `hidden` and `inert`) and `VirtualList.svelte` virtualizes long lists to keep tab switching instantaneous.
 
 ---
 

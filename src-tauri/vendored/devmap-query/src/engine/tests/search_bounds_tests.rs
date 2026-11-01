@@ -325,3 +325,146 @@ fn ask_and_semantic_search_share_the_page_ceiling() {
         );
     }
 }
+
+/// A repository directory holding `path` = `source`, and a store indexed from
+/// it, so the engine reads the same bytes the index was built from.
+fn on_disk_store(name: &str, path: &str, source: &str) -> (Store, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "devmap-filelead-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(path), source).unwrap();
+    let store = store_rooted_at(path, source, Some(&dir.to_string_lossy()));
+    (store, dir)
+}
+
+/// A `gadget.py` of two small functions under `padding` bytes of module
+/// comment, so the file is larger than any one hit's share of a budget while
+/// each function is not.
+fn gadget_source(padding: usize) -> String {
+    let mut source =
+        String::from("def gadget_alpha():\n    return 1\n\n\ndef gadget_beta():\n    return 2\n\n");
+    while source.len() < padding {
+        source.push_str("# gadget notes: nothing here answers a query about gadgets\n");
+    }
+    source
+}
+
+/// A whole-file hit that does not fit its share of the budget carries no text.
+///
+/// The cap kept the first quarter-budget of the file — imports and a module
+/// comment — and charged it at the full rate: at a 2,000-token budget a File hit
+/// printed 1,920 arbitrary bytes and cost 500 tokens, which on a file-heavy
+/// query was nearly all of the answer. The file's path is the lead; its
+/// `source_span_omitted_bytes` says all of it was withheld, so an empty span is
+/// never mistaken for an empty file.
+#[test]
+fn a_capped_file_hit_is_a_lead_not_an_arbitrary_prefix() {
+    let source = gadget_source(6_000);
+    let (store, dir) = on_disk_store("capped", "gadget.py", &source);
+
+    let response = StoreQueryEngine::new(&store)
+        .search(Request {
+            query: "gadget".to_string(),
+            token_budget: 2_000,
+            min_confidence: 0.0,
+            max_depth: 1,
+        })
+        .expect("search");
+
+    let file = response
+        .items
+        .iter()
+        .find(|hit| hit.kind == "File")
+        .unwrap_or_else(|| panic!("the fixture must return its File hit: {:?}", response.items));
+    assert!(
+        file.source_span.is_empty(),
+        "a capped File hit printed {} bytes of the file's head",
+        file.source_span.len()
+    );
+    assert_eq!(
+        file.source_span_omitted_bytes,
+        Some(u32::try_from(source.len()).unwrap()),
+        "every byte of the file was withheld and the hit must say so"
+    );
+    let names: Vec<&str> = response
+        .items
+        .iter()
+        .map(|hit| hit.symbol_name.as_str())
+        .collect();
+    assert!(
+        names.contains(&"gadget_alpha") && names.contains(&"gadget_beta"),
+        "the functions the file holds must still be shown: {names:?}"
+    );
+    assert!(
+        response.tokens_used <= 2_000,
+        "spent {} of a 2,000 budget",
+        response.tokens_used
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A file small enough to fit its share keeps its text: it is complete, and
+/// it is the one rung of the answer that is not a lead.
+#[test]
+fn a_whole_file_hit_that_fits_keeps_its_text() {
+    let source = gadget_source(300);
+    let (store, dir) = on_disk_store("fits", "gadget.py", &source);
+
+    let response = StoreQueryEngine::new(&store)
+        .search(Request {
+            query: "gadget".to_string(),
+            token_budget: 2_000,
+            min_confidence: 0.0,
+            max_depth: 1,
+        })
+        .expect("search");
+
+    let file = response
+        .items
+        .iter()
+        .find(|hit| hit.kind == "File")
+        .unwrap_or_else(|| panic!("the fixture must return its File hit: {:?}", response.items));
+    assert_eq!(file.source_span, source, "an uncapped File hit is verbatim");
+    assert_eq!(file.source_span_omitted_bytes, None);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A capped function is still a capped prefix: only whole-file hits turn into
+/// leads, because a function's head (its signature) answers a question and a
+/// file's head does not.
+#[test]
+fn a_capped_function_keeps_its_prefix() {
+    let mut body = String::from("def gadget_long():\n    total = 0\n");
+    while body.len() < 6_000 {
+        body.push_str("    total += 1  # gadget accumulation step\n");
+    }
+    body.push_str("    return total\n");
+    let (store, dir) = on_disk_store("function", "gadget.py", &body);
+
+    let response = StoreQueryEngine::new(&store)
+        .search(Request {
+            query: "gadget_long".to_string(),
+            token_budget: 2_000,
+            min_confidence: 0.0,
+            max_depth: 1,
+        })
+        .expect("search");
+
+    let function = response
+        .items
+        .iter()
+        .find(|hit| hit.symbol_name == "gadget_long")
+        .unwrap_or_else(|| panic!("the function must be a hit: {:?}", response.items));
+    assert!(function.source_span.starts_with("def gadget_long():"));
+    assert!(function.source_span_omitted_bytes.is_some());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

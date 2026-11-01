@@ -315,15 +315,14 @@ pub(crate) fn encloses(outer: &SymbolHit, inner: &SymbolHit) -> bool {
 /// the budget buys more hits. Folding may still find containers accepted
 /// *after* a hit; that only makes the pack smaller than what was charged.
 ///
-/// A whole-file hit whose text was capped becomes a lead first
-/// ([`file_hit_as_lead`]): its text is the file's first lines, and a capped
-/// span can stand in for nothing.
+/// A whole-file hit whose text was capped is already a lead when it arrives
+/// (`hit_from_stored` makes it one): its text would be the file's first lines,
+/// and a capped span can stand in for nothing.
 pub fn fold_aware_take(hits: Vec<SymbolHit>, token_budget: u32) -> Response<SymbolHit> {
     let mut accepted: Vec<SymbolHit> = Vec::new();
     let mut used = 0u32;
     let mut truncated = false;
-    for mut hit in hits {
-        file_hit_as_lead(&mut hit);
+    for hit in hits {
         let folds = accepted
             .iter()
             .any(|outer| shows_whole(outer) && encloses(outer, &hit));
@@ -343,29 +342,6 @@ pub fn fold_aware_take(hits: Vec<SymbolHit>, token_budget: u32) -> Response<Symb
     response.tokens_used = used;
     response.truncated = truncated;
     response
-}
-
-/// Turn a capped whole-file hit into a lead: no text, every byte reported as
-/// not shown.
-///
-/// The cap keeps a file's first quarter-budget of bytes — imports and a module
-/// comment — which rarely answers anything and spent up to a quarter of the
-/// pack. The path stays, as the lead to read; `source_span_omitted_bytes` says
-/// the whole symbol was withheld, so an empty span is never mistaken for an
-/// empty file. An uncapped file hit keeps its text: it is complete, and it can
-/// fold every other hit in the file.
-fn file_hit_as_lead(hit: &mut SymbolHit) {
-    let Some(omitted) = hit.source_span_omitted_bytes else {
-        return;
-    };
-    if hit.kind != "File" {
-        return;
-    }
-    let whole = u32::try_from(hit.source_span.len())
-        .unwrap_or(u32::MAX)
-        .saturating_add(omitted);
-    hit.source_span.clear();
-    hit.source_span_omitted_bytes = Some(whole);
 }
 
 /// Drop the second copy of text a containing unit already shows.

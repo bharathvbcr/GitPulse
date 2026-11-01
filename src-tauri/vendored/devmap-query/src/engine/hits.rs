@@ -164,7 +164,8 @@ pub(super) fn hit_from_stored(
         .as_deref()
         .filter(|_| withheld.is_none())
         .and_then(|text| line_indent_before(text, row.span_start));
-    let (source_span, source_span_omitted_bytes) = cap_source_span(source_span, token_budget);
+    let (source_span, source_span_omitted_bytes) =
+        capped_file_as_lead(&row.kind, cap_source_span(source_span, token_budget));
     SymbolHit {
         symbol_name: row.name,
         file_path: row.path,
@@ -176,6 +177,35 @@ pub(super) fn hit_from_stored(
         source_indent,
         withheld,
         score,
+    }
+}
+
+/// Turn a capped whole-file hit into a lead: no text, every byte reported as
+/// not shown.
+///
+/// The cap keeps a file's first quarter-budget of bytes — imports and a module
+/// comment — which rarely answers anything and spent up to a quarter of the
+/// budget, at the full per-byte rate, on every file the query matched. The path
+/// stays, as the lead to read; `source_span_omitted_bytes` says the whole
+/// symbol was withheld, so an empty span is never mistaken for an empty file.
+/// An uncapped file hit keeps its text: it is complete, and an evidence pack
+/// can fold every other hit in the file into it. Other kinds keep a capped
+/// prefix, because a function's head (its signature) answers a question.
+///
+/// Applied here, where `search`, `explore`, `ask` and its evidence pack all
+/// build their hits, so the four cannot treat a file differently.
+fn capped_file_as_lead(
+    kind: &str,
+    (source_span, omitted): (String, Option<u32>),
+) -> (String, Option<u32>) {
+    match omitted {
+        Some(omitted) if kind == "File" => {
+            let whole = u32::try_from(source_span.len())
+                .unwrap_or(u32::MAX)
+                .saturating_add(omitted);
+            (String::new(), Some(whole))
+        }
+        _ => (source_span, omitted),
     }
 }
 

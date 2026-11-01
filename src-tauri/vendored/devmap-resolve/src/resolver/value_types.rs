@@ -387,8 +387,31 @@ impl Resolver {
             nominal = self.python_annotation_class(&callee_file, &nominal)?;
         }
         (self.unique_indexed_type(family, &nominal)
+            || (family == LangFamily::JsTs && self.unique_js_ts_interface(&nominal))
             || self.names_one_type_in_both(file, &callee_file, &nominal))
         .then_some(nominal)
+    }
+
+    pub(super) fn unique_js_ts_interface(&self, name: &str) -> bool {
+        let Some(candidates) = self.symbol_index.get(name) else {
+            return false;
+        };
+        let mut count = 0usize;
+        for (_, kind, candidate_family, _) in candidates {
+            if !LangFamily::JsTs.admits(*candidate_family) {
+                continue;
+            }
+            if matches!(
+                kind,
+                SymbolKind::Class | SymbolKind::Struct | SymbolKind::Interface
+            ) {
+                count += 1;
+                if count > 1 {
+                    return false;
+                }
+            }
+        }
+        count == 1
     }
 
     /// Whether the callable `scope` binds `name` itself, so a read of it there is

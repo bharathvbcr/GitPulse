@@ -557,6 +557,20 @@ pub(super) fn extract_treesitter_before_deadline(
                     ),
                 }
             }
+            ParseAttempt::Parsed(tree) if lang == "svelte" && tree.root_node().has_error() => {
+                match crate::sveltetext::repair(&mut parser, &tree, source, deadline) {
+                    Some(repaired) => (
+                        ParseAttempt::Parsed(repaired.tree),
+                        Vec::new(),
+                        Some(format!(
+                            "svelte template text: {} bare `&`/`>` character(s) written over \
+                             so the file parses; offsets are the file's own",
+                            repaired.edits
+                        )),
+                    ),
+                    None => (ParseAttempt::Parsed(tree), Vec::new(), None),
+                }
+            }
             other => (other, Vec::new(), None),
         };
         if let ParseAttempt::Parsed(tree) = attempt {

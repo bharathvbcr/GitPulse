@@ -606,6 +606,7 @@ impl Resolver {
                                 && own.is_none()
                                 && inherited.is_none()
                                 && blanket.is_none()
+                                && !self.type_methods.contains_key(&key)
                                 && self.declares_type(family, &class_type)
                             {
                                 rust_member_miss = true;

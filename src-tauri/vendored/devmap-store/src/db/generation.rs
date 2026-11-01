@@ -27,6 +27,68 @@ fn parse_failed_gap() -> &'static str {
 const BUDGET_GAP_FILTER: &str = "generation_id = ?1 AND gap = ?2
                AND substr(reason, 1, ?3) = ?4";
 
+/// The statement behind `Store::unresolved_sites_keyed` for `key_count` keys.
+///
+/// A free function so that a test reads the very text the store prepares: the
+/// plan guard and the oracle parity test both go through it, and neither can
+/// drift from what runs.
+///
+/// Placeholder order, which the caller binds in: the `key_count` keys, the
+/// generation twice (`valid_from`, `valid_to`), then — only when
+/// `unattributed_only` — the [`devmap_resolve::UNATTRIBUTED_LABELS`] and the
+/// generation once more (the namesake subquery), and finally the per-key cap.
+pub(super) fn keyed_ledger_sql(key: LedgerKey, key_count: usize, unattributed_only: bool) -> String {
+    let placeholders = vec!["?"; key_count].join(", ");
+    let (column, key_filter) = match key {
+        LedgerKey::Callee => ("u.callee_name", format!("u.callee_name IN ({placeholders})")),
+        LedgerKey::SourceSymbol => (
+            "u.source_symbol",
+            format!("u.source_symbol IN ({placeholders})"),
+        ),
+        LedgerKey::SourceFile => (
+            "p.path",
+            format!("u.source_file_id IN (SELECT id FROM paths WHERE path IN ({placeholders}))"),
+        ),
+    };
+    // A receiver call whose method name no symbol at this generation carries
+    // cannot be a missed edge into it — an edge needs a target, and no target
+    // has that name (`rows.length`, `mu.Unlock()`: 126,023 of ScholarLM's
+    // 200,790 untyped-receiver rows). A receiver-less call keeps counting
+    // without a namesake: `f = make(); f()` may hold any function. In SQL,
+    // before the cap, for the reason the class filter is.
+    let class_filter = if unattributed_only {
+        format!(
+            "AND u.classification_id IN (SELECT id FROM unresolved_texts WHERE text IN ({}))
+                   AND (u.receiver IS NULL
+                        OR u.callee_name IN (SELECT n.name FROM generation_nodes n
+                                             WHERE n.generation_id = ?))",
+            vec!["?"; devmap_resolve::UNATTRIBUTED_LABELS.len()].join(", ")
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "SELECT key, path, source_symbol, receiver, class, rn, callee_name FROM (
+                 SELECT {column} AS key, p.path AS path,
+                        u.source_symbol AS source_symbol, u.receiver AS receiver,
+                        c.text AS class, u.callee_name AS callee_name,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY {column}
+                            ORDER BY p.path, u.source_symbol, u.unresolved_id
+                        ) AS rn
+                 FROM unresolved_rows u
+                 JOIN paths p            ON p.id = u.source_file_id
+                 JOIN unresolved_texts c ON c.id = u.classification_id
+                 WHERE {key_filter}
+                   AND u.valid_from <= ?
+                   AND (u.valid_to IS NULL OR u.valid_to > ?)
+                   {class_filter}
+             )
+             WHERE rn <= ?
+             ORDER BY key, rn"
+    )
+}
+
 impl Store {
     /// Most recent builds, newest first. `limit` is clamped to the retention cap.
     pub fn build_history(&self, limit: usize) -> Result<Vec<BuildHistoryRow>> {
@@ -233,49 +295,7 @@ impl Store {
         if keys.is_empty() {
             return Ok(Some(found));
         }
-        let column = match key {
-            LedgerKey::Callee => "u.callee_name",
-            LedgerKey::SourceSymbol => "u.source_symbol",
-            LedgerKey::SourceFile => "p.path",
-        };
-        let placeholders = vec!["?"; keys.len()].join(", ");
-        // A receiver call whose method name no symbol at this generation
-        // carries cannot be a missed edge into it — an edge needs a target, and
-        // no target has that name (`rows.length`, `mu.Unlock()`: 126,023 of
-        // ScholarLM's 200,790 untyped-receiver rows). A receiver-less call
-        // keeps counting without a namesake: `f = make(); f()` may hold any
-        // function. In SQL, before the cap, for the reason the class filter is.
-        let class_filter = if unattributed_only {
-            format!(
-                "AND c.text IN ({})
-                   AND (u.receiver IS NULL
-                        OR u.callee_name IN (SELECT n.name FROM generation_nodes n
-                                             WHERE n.generation_id = ?))",
-                vec!["?"; devmap_resolve::UNATTRIBUTED_LABELS.len()].join(", ")
-            )
-        } else {
-            String::new()
-        };
-        let sql = format!(
-            "SELECT key, path, source_symbol, receiver, class, rn, callee_name FROM (
-                 SELECT {column} AS key, p.path AS path,
-                        u.source_symbol AS source_symbol, u.receiver AS receiver,
-                        c.text AS class, u.callee_name AS callee_name,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY {column}
-                            ORDER BY p.path, u.source_symbol, u.unresolved_id
-                        ) AS rn
-                 FROM unresolved_rows u
-                 JOIN paths p            ON p.id = u.source_file_id
-                 JOIN unresolved_texts c ON c.id = u.classification_id
-                 WHERE {column} IN ({placeholders})
-                   AND u.valid_from <= ?
-                   AND (u.valid_to IS NULL OR u.valid_to > ?)
-                   {class_filter}
-             )
-             WHERE rn <= ?
-             ORDER BY key, rn"
-        );
+        let sql = keyed_ledger_sql(key, keys.len(), unattributed_only);
         let mut stmt = conn.prepare(&sql)?;
         let generation = i64::from(generation);
         let cap = sqlite_limit(limit_per_key.saturating_add(1));

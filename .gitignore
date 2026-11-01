@@ -157,6 +157,12 @@ CHANGELOG_DRAFT.md
 *_Implementation_Plan.md
 IMPLEMENTATION_PLAN.md
 /IMPLEMENTATION_PLAN*.md
+/PROJECT.md
+/TEST_INFRA*.md
+/TEST_READY*.md
+/TASK_REVIEW*.md
+/GATE_STATUS*.md
+/ORIGINAL_REQUEST*.md
 
 # GitPulse tasks, task briefs, and local task state
 /tasks/

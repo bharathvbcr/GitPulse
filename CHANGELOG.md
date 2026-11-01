@@ -13,6 +13,44 @@ before that tag is pushed.
 
 ### Added
 
+- **5-Lane Workflow Separation & Non-Blocking DevMap IPC.** Separated repository
+  and background operations into five isolated execution lanes (`git-read`,
+  `git-write`, `github`, `insights`, `devmap`) (`src/lib/async/lanes.ts`,
+  `src/lib/stores/repo.ts`), ensuring slow background DevMap builds or insights
+  probes never block git reads, commit composition, or UI navigation. DevMap IPC
+  invocations (`src-tauri/src/commands/devmap.rs`) apply a 4-second non-blocking
+  timeout (`try_lock_timeout`) when another build holds the writer lock, returning
+  a structured busy/fallback response instead of stalling Tauri worker threads.
+- **Untracked File Scan Budget & Metadata Cache (`UntrackedBudget`).** Bounded
+  untracked file line-counting (`src-tauri/src/engine/git.rs`) to a 4 MiB total
+  byte budget and 512-file ceiling, opening files with `O_NONBLOCK | O_NOFOLLOW`
+  on Unix to refuse FIFOs and symlinks without blocking, and caching line counts
+  by `(path, mtime, size)` across refreshes.
+- **View DOM Retention & Virtualized Lists.** `ViewSectionPanel.svelte` retains
+  visited view subtrees in the DOM (up to 6 cached panels) and hides inactive
+  sections with `hidden` / `inert` instead of destroying and remounting them on
+  tab switches. Added reusable `VirtualList.svelte` virtualization for large list
+  surfaces.
+- **Full 11-Tool `devmap_*` MCP Parity.** `gitpulse-mcp` now exposes all 11
+  `devmap_*` tools (`status`, `search`, `dependencies`, `impact`, `trace`,
+  `neighbors`, `dead_symbols`, `clones`, `preview`, `explore`, `affected_tests`)
+  with unified schema and envelope parity (`src-tauri/src/mcp/mod.rs`).
+- **UI/UX Enhancements Across 8 Views:**
+  - **Changes (`ChangesView.svelte`, `DiffSection.svelte`, `ConflictView.svelte`):**
+    Side-by-side split diff, blamed hunk headers, and 3-way conflict resolution
+    with current/incoming/both actions and marker navigation.
+  - **Branches (`BranchesView.svelte`, `CompareDrawer.svelte`):** Interactive
+    rebase lane, divergence badges, and branch Compare drawer.
+  - **History (`CommitGraph.svelte`, `HistoryView.svelte`):** Structured filter
+    chips (`author:`, `sha:`, `type:`, `path:`) and commit lane inspection.
+  - **Repo Health (`RepoHealth.svelte`, `PulseView.svelte`):** Bus-factor
+    concentration, local DORA metrics, and commit hygiene cards.
+  - **Terminal (`TerminalDock.svelte`):** Multi-session tabs, split panes, and
+    command history search.
+  - **Settings (`SettingsModal.svelte`):** Live theme token editor and shortcut
+    customization.
+  - **Blame (`BlameView.svelte`):** Interactive code-age timeline, filterable
+    legend bands, and proportional age rail.
 - **Collapsible Inactive Repository Groups & Group Tabs.** In the repository tab bar,
   inactive repository groups can now be collapsed to declutter multi-repository
   workspaces (`RepoTabBar.svelte`, `tabGroups.ts`, `groupState.ts`). Inactive tabs

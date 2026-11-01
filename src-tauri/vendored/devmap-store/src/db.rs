@@ -2549,3 +2549,8 @@ mod payload_serialization_tests;
 #[cfg(test)]
 #[path = "db/tests/symbol_identity_tests.rs"]
 mod symbol_identity_tests;
+
+#[cfg(test)]
+#[cfg(feature = "parse")]
+#[path = "db/tests/ledger_read_plan_tests.rs"]
+mod ledger_read_plan_tests;
