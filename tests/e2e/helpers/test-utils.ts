@@ -56,7 +56,7 @@ export function runCommand(
   return {
     status: res.status,
     stdout: res.stdout || "",
-    stderr: res.stderr || "",
+    stderr: res.stderr || (res.error ? String(res.error.message || res.error) : ""),
   };
 }
 
@@ -67,7 +67,8 @@ export function createFixtureGitRepo(
   const git = (...args: string[]) => {
     const res = runCommand("git", args, { cwd: dir });
     if (res.status !== 0) {
-      throw new Error(`git ${args.join(" ")} failed: ${res.stderr}`);
+      const detail = res.stderr.trim() || res.stdout.trim() || "unknown git failure";
+      throw new Error(`git ${args.join(" ")} failed (status ${res.status}): ${detail}`);
     }
     return res.stdout.trim();
   };
@@ -84,7 +85,11 @@ export function createFixtureGitRepo(
   }
 
   git("add", "-A");
-  git("commit", "-q", "-m", "Initial fixture commit");
+  const commitArgs = ["commit", "-q", "-m", "Initial fixture commit"];
+  if (Object.keys(initialFiles).length === 0) {
+    commitArgs.push("--allow-empty");
+  }
+  git(...commitArgs);
 }
 
 /**
