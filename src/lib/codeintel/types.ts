@@ -78,6 +78,17 @@ export interface CodeintelRungHistogram {
   filtered_out: number;
 }
 
+export interface ScopeReport {
+  paths: string[];
+  languages: string[];
+  kinds?: string[];
+  files: number;
+  symbols: number;
+  corpus_files: number;
+  corpus_symbols: number;
+  related_tests_outside_scope?: number;
+}
+
 /**
  * Whole-tree freshness on a query envelope. `fresh: null` plus a reason means
  * the check did not run — never the same as a verified true/false.
@@ -101,6 +112,8 @@ export interface CodeintelResponse<T> {
   walk_incomplete?: string;
   /** Population across the resolution ladder before any min_rung filter. Omitted when absent. */
   rungs?: CodeintelRungHistogram;
+  /** The path, language and kind filters the answer was restricted to, with the scoped and whole corpus sizes. */
+  scope?: ScopeReport;
 }
 
 export interface CodeintelStatus {
