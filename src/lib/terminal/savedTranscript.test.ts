@@ -19,6 +19,8 @@ function foundWire(text: string, over: Record<string, unknown> = {}): Record<str
     bytes: new TextEncoder().encode(text).length,
     retained: new TextEncoder().encode(text).length,
     truncated: false,
+    rotated: false,
+    clipped: false,
     gap_markers: 0,
     redacted: false,
     live: false,
@@ -124,6 +126,8 @@ describe("transcriptNotices", () => {
     bytes: 10,
     retained: 10,
     truncated: false,
+    rotated: false,
+    clipped: false,
     gapMarkers: 0,
     redacted: false,
     live: false,
@@ -141,14 +145,18 @@ describe("transcriptNotices", () => {
       bytes: 1000,
       retained: 5000,
       truncated: true,
+      rotated: true,
+      clipped: true,
       gapMarkers: 2,
       redacted: true,
       live: true,
       settled: false,
       recordingError: "disk full.",
     });
-    expect(notices).toHaveLength(6);
-    expect(notices[0]).toContain("last 1,000 of 5,000");
+    expect(notices).toHaveLength(7);
+    expect(notices.join("\n")).toContain("newest 1,000 bytes");
+    expect(notices.join("\n")).not.toContain("5,000");
+    expect(notices.join("\n")).toContain("rotated away");
     expect(notices.join("\n")).toMatch(/2 stretches/);
     expect(notices.join("\n")).toContain("disk full.");
     expect(notices.join("\n")).toContain("still running");
@@ -157,7 +165,24 @@ describe("transcriptNotices", () => {
   });
 
   it("tells a rotated-away start from a clipped read", () => {
-    expect(transcriptNotices({ ...base, truncated: true })[0]).toContain("rotated away");
+    expect(transcriptNotices({ ...base, truncated: true, rotated: true })[0]).toContain("rotated away");
+    const clipped = transcriptNotices({ ...base, bytes: 1000, retained: 5000, truncated: true, clipped: true });
+    expect(clipped).toHaveLength(1);
+    expect(clipped[0]).toContain("last 1,000 of 5,000");
+  });
+
+  it("says both when the start was rotated away and the read was clipped", () => {
+    const notices = transcriptNotices({ ...base, bytes: 1000, retained: 5000, truncated: true, rotated: true, clipped: true });
+    expect(notices).toHaveLength(2);
+    expect(notices.join("\n")).toContain("rotated away");
+    expect(notices.join("\n")).toContain("last 1,000 of 5,000");
+  });
+
+  it("does not compare a masked byte count with an on-disk one", () => {
+    // `bytes` is counted after masking, `retained` before: their difference
+    // says nothing about how much was left out.
+    const [notice] = transcriptNotices({ ...base, bytes: 4990, retained: 5000, truncated: true, clipped: true, redacted: true });
+    expect(notice).not.toContain("5,000");
   });
 });
 
@@ -173,6 +198,20 @@ describe("transcriptPlainText", () => {
 
   it("erases a backspaced character and drops other control bytes", () => {
     expect(transcriptPlainText("helo\blo\u0007\u0000!\n")).toBe("hello!\n");
+  });
+
+  it("keeps a line's text when the program wrote CRLF and the terminal added another CR", () => {
+    // The tty's ONLCR turns a program's \r\n into \r\r\n.
+    expect(transcriptPlainText("done\r\r\nnext\r\n")).toBe("done\nnext\n");
+  });
+
+  it("keeps the last line's text when the tail ends on a bare carriage return", () => {
+    expect(transcriptPlainText("50%\r")).toBe("50%");
+    expect(transcriptPlainText("abc\rX\r\n")).toBe("X\n");
+  });
+
+  it("shows the last non-empty segment, since the erase-line a program sends is stripped", () => {
+    expect(transcriptPlainText("100%\rok\r\n")).toBe("ok\n");
   });
 
   it("leaves a gap marker readable", () => {

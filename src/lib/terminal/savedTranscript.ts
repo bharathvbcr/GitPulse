@@ -35,8 +35,12 @@ export interface FoundTranscript {
   readonly bytes: number;
   /** Bytes of the session's output still on disk; more than `bytes` when clipped. */
   readonly retained: number;
-  /** The start of the session's output is not in `text`. */
+  /** The start of the session's output is not in `text` (`rotated` or `clipped`). */
   readonly truncated: boolean;
+  /** Earlier output was rotated off the disk to keep the transcript within its limit. */
+  readonly rotated: boolean;
+  /** The read was cut to its byte bound, so older saved output exists but is not in `text`. */
+  readonly clipped: boolean;
   /** Places where the host dropped output it could not keep up with. */
   readonly gapMarkers: number;
   /** Secrets were masked in the host. */
@@ -45,7 +49,10 @@ export interface FoundTranscript {
   readonly live: boolean;
   /** The host had written everything it was given; false means `text` may lag. */
   readonly settled: boolean;
-  /** Why recording stopped short, when a write failed. */
+  /**
+   * Why the saved output may stop short: a write failed, or the host that wrote
+   * it ended without closing it, so its end is unknown.
+   */
   readonly recordingError: string | null;
 }
 
@@ -129,7 +136,7 @@ function parseFound(record: Record<string, unknown>): SavedTranscript {
   const bytes = nonNegativeInteger(record.bytes);
   const retained = nonNegativeInteger(record.retained);
   const gapMarkers = nonNegativeInteger(record.gap_markers);
-  const flags = ["truncated", "redacted", "live", "settled"] as const;
+  const flags = ["truncated", "rotated", "clipped", "redacted", "live", "settled"] as const;
   if (typeof record.data_b64 !== "string" || bytes === null || retained === null || gapMarkers === null) {
     return failed("The terminal host's transcript was malformed.");
   }
@@ -153,6 +160,8 @@ function parseFound(record: Record<string, unknown>): SavedTranscript {
     bytes,
     retained,
     truncated: record.truncated as boolean,
+    rotated: record.rotated as boolean,
+    clipped: record.clipped as boolean,
     gapMarkers,
     redacted: record.redacted as boolean,
     live: record.live as boolean,
@@ -178,11 +187,16 @@ function decodeBase64Utf8(data: string): Uint8Array | null {
  */
 export function transcriptNotices(found: FoundTranscript): string[] {
   const notices: string[] = [];
-  if (found.truncated) {
+  if (found.rotated) {
+    notices.push("Earlier output was rotated away to keep the saved transcript within its size limit.");
+  }
+  if (found.clipped) {
+    // `bytes` is counted after masking and `retained` before it, so with
+    // masking on the two are not the same unit and are not set side by side.
     notices.push(
-      found.retained > found.bytes
-        ? `Showing the last ${found.bytes.toLocaleString("en-US")} of ${found.retained.toLocaleString("en-US")} saved bytes; earlier output is not shown.`
-        : "Earlier output was rotated away to keep the saved transcript within its size limit.",
+      found.redacted
+        ? `Showing only the newest ${found.bytes.toLocaleString("en-US")} bytes of the saved output; earlier output is not shown.`
+        : `Showing the last ${found.bytes.toLocaleString("en-US")} of ${found.retained.toLocaleString("en-US")} saved bytes; earlier output is not shown.`,
     );
   }
   if (found.gapMarkers > 0) {
@@ -190,7 +204,7 @@ export function transcriptNotices(found: FoundTranscript): string[] {
       `${found.gapMarkers} stretch${found.gapMarkers === 1 ? "" : "es"} of output could not be saved fast enough and ${found.gapMarkers === 1 ? "is" : "are"} marked in the text.`,
     );
   }
-  if (found.recordingError) notices.push(`Saving stopped early: ${found.recordingError} Later output is not here.`);
+  if (found.recordingError) notices.push(`The saved output may be incomplete: ${found.recordingError}`);
   if (found.live) notices.push("This session is still running; more output may follow.");
   if (!found.settled) notices.push("The host was still writing output when it answered; the end may be missing.");
   if (found.redacted) notices.push("Secrets were masked.");
@@ -205,9 +219,12 @@ const ESCAPES =
 
 /**
  * Plain text for a viewer that is not a terminal: escape sequences removed,
- * a carriage return overwriting its line the way a progress bar intends,
- * backspace erasing, and other control characters dropped. Colour and cursor
- * movement are lost; the words and their order are not.
+ * a carriage return replacing its line with what follows the way a progress bar
+ * intends (a shorter later segment does not leave the rest of the earlier one
+ * showing, because the erase-to-end-of-line a program sends with it is among
+ * the sequences removed), backspace erasing, and other control characters
+ * dropped. Colour and cursor movement are lost; the words and their order are
+ * not.
  */
 export function transcriptPlainText(text: string): string {
   const lines = text
@@ -215,7 +232,12 @@ export function transcriptPlainText(text: string): string {
     .replace(/\r\n/g, "\n")
     .split("\n")
     .map((line) => {
-      const shown = line.split("\r").filter((part, index, parts) => part.length > 0 || index === parts.length - 1);
+      // A line's text is its last non-empty segment between carriage returns.
+      // The empty ones are not overwrites: the tty turns a program's "\r\n"
+      // into "\r\r\n", and a tail can end on a bare "\r" (a run killed mid
+      // progress bar); taking the empty segment after either would blank a
+      // line that has words on it.
+      const shown = line.split("\r").filter((part) => part.length > 0);
       return eraseBackspaces(shown[shown.length - 1] ?? "");
     });
   // eslint-disable-next-line no-control-regex
