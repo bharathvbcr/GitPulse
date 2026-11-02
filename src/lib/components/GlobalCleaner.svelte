@@ -4,6 +4,7 @@
   import { closedAppSchedulingReason } from "../ui/platformCopy";
   import { FolderPlus, RefreshCw, Clock, ShieldCheck, X } from "@lucide/svelte";
   import type { CleanerConfig, CleanerInventory, CleanerState } from "../storage/hygiene/globalTypes";
+  import { cleanupAllowed, coverageNotice } from "../storage/hygiene/globalEligibility";
   import { humanBytes } from "../storage/format";
   import { formatError } from "../ui/formatError";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
@@ -24,6 +25,8 @@
   let epoch = 0;
   let live = false;
   let loading = false;
+  /** Coverage warning for an inventory that could not read everything; never a refusal. */
+  const coverage = $derived(coverageNotice(inventory));
   const paths = (text: string) => text.split("\n").map(p => p.trim()).filter(Boolean);
 
   function accept(next: CleanerState, reset = false) {
@@ -73,7 +76,7 @@
     finally { if (live && mine === epoch) inspecting = false; }
   }
   async function run() {
-    if (!cleaner || dirty || busy || cleaner.running || !inventory || inventory.partial) return;
+    if (!cleaner || dirty || busy || cleaner.running || !cleanupAllowed(inventory)) return;
     const mine = epoch; busy = true; error = null;
     try { const next = await invoke<CleanerState>("cmd_cleaner_run", { revision: cleaner.config.revision }); if (live && mine === epoch) { accept(next); inventory = null; notice = "Cleanup started with the saved policy. Every target is inspected again before removal."; } }
     catch (e) { if (live && mine === epoch) error = formatError(e); }
@@ -132,11 +135,11 @@
     {#if inventory}
       <div class="space-y-2 rounded-xl border border-border p-3">
         <strong>{inventory.repositories} repositories · {inventory.candidates.length} output candidates · {inventory.visited_entries.toLocaleString()} entries inspected</strong>
-        {#if inventory.partial}<p class="text-amber-300">Partial inventory. Cleanup is blocked until a complete scan succeeds; narrow the selected roots or add exclusions.</p>{/if}
+        {#if coverage}<p class="text-amber-300">{coverage}</p>{/if}
         {#each inventory.issues as issue}<p class="text-amber-300 break-all">{issue}</p>{/each}
         <div class="max-h-52 overflow-y-auto">{#each inventory.candidates as row (`${row.repo_path}/${row.path}`)}<div class="flex justify-between gap-3 border-b border-border/40 py-2"><div class="min-w-0"><p class="font-mono break-all">{row.repo_path}/{row.path}</p><p class="text-textMuted">{row.provider}</p></div><span class="shrink-0">{humanBytes(row.bytes)}</span></div>{/each}</div>
         <p class="text-textMuted">These are current logical sizes. Fresh retention, index, activity and policy checks decide which candidates can be removed, up to the saved limits. Removal is permanent.</p>
-        <button class="gp-btn-primary" onclick={run} disabled={dirty || busy || cleaner.running || !cleaner.supported || inventory.partial || !inventory.candidates.length}>Clean eligible output now</button>
+        <button class="gp-btn-primary" onclick={run} disabled={dirty || busy || cleaner.running || !cleaner.supported || !cleanupAllowed(inventory)}>Clean eligible output now</button>
       </div>
     {/if}
     {#if cleaner.history.length}
