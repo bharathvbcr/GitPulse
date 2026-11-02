@@ -16,6 +16,7 @@
  */
 
 import type { Grant } from "../grants/types";
+import { isJournalEvent } from "../ledger/projection";
 import type { LedgerEvent } from "../ledger/types";
 import type { TaskLease } from "../tasks/types";
 import type { WorktreeInfo } from "../branches/types";
@@ -324,6 +325,9 @@ export function projectWork(input: WorkInputs): WorkProjection {
   }
 
   for (const event of input.events ?? []) {
+    // Token counts and lifecycle changes belong to a run's timeline; counting
+    // them would put a row per response in "recent events".
+    if (!isJournalEvent(event)) continue;
     // The ledger records both, so each mode joins on the column it actually
     // keys by rather than inferring one from the other.
     const key = byTask ? event.task_id || UNBOUND_ROW_ID : event.worktree_path || UNBOUND_ROW_ID;

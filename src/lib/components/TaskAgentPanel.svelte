@@ -22,6 +22,7 @@
   import { ChevronDown, ChevronRight, RotateCw, SquareTerminal } from "@lucide/svelte";
   import AttemptReview from "./AttemptReview.svelte";
   import AgentDecisions from "./AgentDecisions.svelte";
+  import RunActivity from "./RunActivity.svelte";
   import TaskHandoffForm from "./TaskHandoffForm.svelte";
   import { interfaceStore } from "../stores/interfaceStore";
   import { attemptNotices, clearAttemptNotice, consumeTaskTerminal, noteAttempt, pruneTaskTerminals, taskTerminalRequests } from "../terminal/taskLaunches";
@@ -600,6 +601,8 @@
         {/if}
       </ul>
     {/if}
+
+    <RunActivity {run} {now} {active} />
 
     {#if run.reason}<p>{run.reason}</p>{/if}
     {#if run.state === "unresolved"}<p class="error">This attempt's outcome is unresolved and it still holds its checkout. Release it once its agent has stopped; another worktree can run meanwhile.</p>

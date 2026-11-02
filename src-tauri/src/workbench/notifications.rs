@@ -677,6 +677,43 @@ impl<R: tauri::Runtime> crate::alerts::Host for SessionHost<R> {
         })
     }
 
+    /// Records a session's change of state in its repository's ledger
+    /// (`ledger::lifecycle`), on a thread of its own: the intake calls this
+    /// from a bridge worker and never waits on SQLite or on the terminal host.
+    ///
+    /// The repository and the task attempt come from the terminal registry,
+    /// not from the report, which is a peer's word: a session the registry no
+    /// longer lists (it exited before its last report was read) has no known
+    /// repository and records nothing, said in the log and not as a row. The
+    /// recording process is this app, as for `session.spawn`.
+    fn lifecycle(&self, change: crate::ledger::lifecycle::Change) {
+        let app = self.app.clone();
+        let work = move || {
+            let Some(sessions) = app.try_state::<crate::terminal::TerminalSessions>() else {
+                return;
+            };
+            let listed = match crate::terminal::list_sessions(&sessions) {
+                Ok(listed) => listed,
+                Err(error) => {
+                    log::warn!(target: "alerts", "lifecycle change not recorded, registry unreadable: {error}");
+                    return;
+                }
+            };
+            let Some(entry) = listed.iter().find(|entry| entry.id == change.session) else {
+                log::debug!(target: "alerts", "lifecycle change not recorded: the registry no longer lists the session");
+                return;
+            };
+            crate::ledger::lifecycle::record(&entry.repo, entry.run_id.as_deref(), &change);
+        };
+        if let Err(error) = crate::supervisor::spawn_one_of_many(
+            "session-lifecycle-ledger",
+            "session lifecycle ledger",
+            work,
+        ) {
+            log::warn!(target: "alerts", "lifecycle change not recorded: {error}");
+        }
+    }
+
     /// A failed emit is logged, not retried: the next notice from the session
     /// replaces this one, and the pane's own activity reading still stands.
     fn announce(&self, attention: &crate::alerts::Attention) {

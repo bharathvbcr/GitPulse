@@ -444,6 +444,13 @@ pub trait Host: Send + Sync + 'static {
     fn knows(&self, _key: &str) -> bool {
         true
     }
+    /// A session's state changed (`ledger::lifecycle`): the intake saw a hook
+    /// report that leaves it in a state other than the last one it reported.
+    /// The host records it durably. Must not block: it is called on the
+    /// producer's thread, outside every lock, and a host that writes does so
+    /// on a thread of its own. The default records nothing, as every test
+    /// host does.
+    fn lifecycle(&self, _change: crate::ledger::lifecycle::Change) {}
     /// The user's current preferences. Re-read per delivery so a setting
     /// change takes effect without a restart.
     fn config(&self) -> crate::tool_config::SessionAlertSettings {
@@ -1291,6 +1298,8 @@ mod intake_adv_tests;
 mod intake_tests;
 #[cfg(all(test, unix))]
 mod intake_twin_attack_tests;
+#[cfg(all(test, unix))]
+mod lifecycle_tests;
 #[cfg(all(test, unix))]
 mod limits_tests;
 #[cfg(test)]

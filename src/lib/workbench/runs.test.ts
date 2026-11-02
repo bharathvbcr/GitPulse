@@ -159,6 +159,24 @@ describe("resuming a conversation", () => {
   });
 });
 
+describe("the clock a run carries", () => {
+  it("keeps the store's claimed, started and finished times, and refuses a malformed one", () => {
+    // The body is shaped as the store writes it: a finished attempt has all three.
+    const stored = {...run, state:"exited", exit_code:0, claimed_at:100, started_at:102, finished_at:160};
+    expect(taskRun(stored)).toMatchObject({claimed_at:100, started_at:102, finished_at:160});
+    // An uncertain outcome is stored as finished_at NULL: that is kept as null, not dropped.
+    expect(taskRun({...stored, finished_at:null}).finished_at).toBeNull();
+    // Never happened, or not recorded: the keys stay absent rather than becoming zero.
+    for (const key of ["claimed_at", "started_at", "finished_at"]) expect(taskRun(run), key).not.toHaveProperty(key);
+    // A present value that is not a time is a protocol error, not coerced.
+    for (const key of ["claimed_at", "started_at", "finished_at"]) {
+      for (const bad of ["160", -1, 1.5, true, [160]]) expect(() => taskRun({...run, [key]: bad}), `${key}=${JSON.stringify(bad)}`).toThrow();
+    }
+    // The store never writes null for the first two; if one arrives it is "not recorded", not zero.
+    for (const key of ["claimed_at", "started_at"]) expect(taskRun({...run, [key]: null}), key).not.toHaveProperty(key);
+  });
+});
+
 describe("the model a run was launched with", () => {
   it("reads the recorded fields, keeps a run from before schema 11 as having none, and refuses a malformed record", () => {
     expect(taskRun({...run, model_choice: {model:"opus", effort:"high"}}).model_choice).toEqual({model:"opus", effort:"high"});
