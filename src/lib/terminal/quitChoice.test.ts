@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { decideQuitTerminals, parseBackendStatus, quitQuestion, type Ask } from "./quitChoice";
+import { decideQuitManagedRuns, decideQuitTerminals, parseBackendStatus, quitManagedQuestion, quitQuestion, type Ask, type AskStop } from "./quitChoice";
 
 function listing(id: string, launcher: string | null, extra: Record<string, unknown> = {}) {
   return { id, shell: "/bin/zsh", cwd: "/r", repo: "/repos/app", launcher, run_id: null, detached: false, ...extra };
@@ -88,5 +88,69 @@ describe("parseBackendStatus", () => {
     for (const bad of [null, [], { backend: "host" }, { backend: "x", trouble: [] }, { backend: "host", trouble: [1] }]) {
       expect(parseBackendStatus(bad)).toBeNull();
     }
+  });
+});
+
+function managedRun(id: string, over: Record<string, unknown> = {}) {
+  return { id, kind: "managed", state: "running", provider: "codex", task_title: `Task ${id}`, cwd: `/repos/app/.gitpulse/worktrees/${id}`, ...over } as unknown as import("../workbench/client").TaskRun;
+}
+
+describe("decideQuitManagedRuns", () => {
+  it("asks nothing when the list was read in full and no managed run is working", async () => {
+    const ask = vi.fn<AskStop>();
+    const listRuns = vi.fn(async () => ({
+      complete: true,
+      // A terminal attempt is not stopped by the sidecar going away, a prepared one has not started, and an exited one is over.
+      runs: [managedRun("a", { kind: "external_terminal" }), managedRun("b", { state: "prepared" }), managedRun("c", { state: "exited" })],
+    }));
+    expect(await decideQuitManagedRuns({ ask, listRuns })).toEqual({ cancelled: false, stopping: 0 });
+    expect(ask).not.toHaveBeenCalled();
+  });
+
+  it("names how many managed runs quitting stops, counting starting, running and unresolved ones", async () => {
+    const ask = vi.fn<AskStop>(async () => true);
+    const listRuns = async () => ({ complete: true, runs: [managedRun("a"), managedRun("b", { state: "starting" }), managedRun("c", { state: "unresolved", provider: "claude" }), managedRun("d", { state: "prepared" })] });
+    expect(await decideQuitManagedRuns({ ask, listRuns, displayName: (path) => path.split("/").pop() ?? path })).toEqual({ cancelled: false, stopping: 3 });
+    const question = ask.mock.calls[0][0];
+    expect(question.title).toBe("Quit While 3 Managed Runs Are Working?");
+    expect(question.message).toContain("3 managed runs will be stopped");
+    expect(question.message).toContain("• codex — Task a — a");
+    expect(question.message).toContain("• claude — Task c — c");
+    expect(question.message).not.toContain("Task d");
+    expect(question.confirmLabel).toBe("Stop and Quit");
+    expect(question.cancelLabel).toBe("Keep Working");
+    expect(question.destructive).toBe(true);
+  });
+
+  it("is a cancellation when the person keeps working", async () => {
+    const ask = vi.fn<AskStop>(async () => false);
+    expect(await decideQuitManagedRuns({ ask, listRuns: async () => ({ complete: true, runs: [managedRun("a")] }) })).toEqual({ cancelled: true });
+    expect(ask.mock.calls[0][0].title).toBe("Quit While a Managed Run Is Working?");
+    expect(ask.mock.calls[0][0].message).toContain("1 managed run will be stopped");
+  });
+
+  it("asks, as a floor, when the list was cut short, even with none counted", async () => {
+    const ask = vi.fn<AskStop>(async () => false);
+    expect(await decideQuitManagedRuns({ ask, listRuns: async () => ({ complete: false, runs: [] }) })).toEqual({ cancelled: true });
+    expect(ask.mock.calls[0][0].message).toContain("could not be read in full");
+    ask.mockClear();
+    await decideQuitManagedRuns({ ask, listRuns: async () => ({ complete: false, runs: [managedRun("a")] }) });
+    expect(ask.mock.calls[0][0].message).toContain("at least 1 managed run will be stopped");
+  });
+
+  it("asks anyway, saying so, when the list cannot be read at all", async () => {
+    const onError = vi.fn();
+    const ask = vi.fn<AskStop>(async () => true);
+    const failure = new Error("workbench gone");
+    expect(await decideQuitManagedRuns({ ask, listRuns: async () => { throw failure; }, onError })).toEqual({ cancelled: false, stopping: null });
+    expect(ask.mock.calls[0][0].message).toContain("could not list them");
+    expect(onError).toHaveBeenCalledWith("the managed runs", failure);
+  });
+
+  it("lists at most five and counts the rest", () => {
+    const many = Array.from({ length: 8 }, (_, i) => managedRun(`r${i}`));
+    const question = quitManagedQuestion(many, true);
+    expect(question.message.match(/^• /gm)).toHaveLength(5);
+    expect(question.message).toContain("…and 3 more");
   });
 });

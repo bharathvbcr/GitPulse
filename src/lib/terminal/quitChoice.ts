@@ -9,9 +9,15 @@
  *
  * A session list that cannot be read is not "no sessions": the question is
  * asked anyway, saying the count is unknown.
+ *
+ * Managed agent runs (Codex and Claude driven by the Manvi sidecar) are a
+ * different kind of work: no terminal host keeps them. Quitting closes the
+ * sidecar, and the sidecar cancels every run it holds, with either terminal
+ * backend. `decideQuitManagedRuns` asks about them on every quit.
  */
 
 import { invoke as tauriInvoke } from "../ipc/invoke";
+import type { TaskRun } from "../workbench/client";
 import { parseListing } from "./detachedSessions";
 
 type Invoke = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
@@ -122,4 +128,92 @@ export async function decideQuitTerminals(deps: {
   const answer = await deps.ask(quitQuestion(sessions, deps.displayName));
   if (answer === null) return { backend: "host", cancelled: true };
   return { backend: "host", terminals: answer === "confirm" ? "leave" : "stop" };
+}
+
+/** A managed run the sidecar's shutdown cancels: it has started, or may have, and has not ended. */
+const WORKING_MANAGED_STATES: readonly string[] = ["starting", "running", "unresolved"];
+
+export function isWorkingManagedRun(run: Pick<TaskRun, "kind" | "state">): boolean {
+  return run.kind === "managed" && WORKING_MANAGED_STATES.includes(run.state);
+}
+
+/** The two-way question: `true` stops them and quits, `false` keeps working. */
+export interface QuitStopQuestion {
+  title: string;
+  message: string;
+  confirmLabel: string;
+  cancelLabel: string;
+  destructive: true;
+}
+
+export type AskStop = (question: QuitStopQuestion) => Promise<boolean>;
+
+/**
+ * The question for quitting over managed runs. `runs` are the working ones
+ * read, or null when the list could not be read at all; `complete` false says
+ * the list was cut short, so the count is a floor.
+ */
+export function quitManagedQuestion(
+  runs: readonly Pick<TaskRun, "provider" | "task_title" | "cwd">[] | null,
+  complete: boolean,
+  displayName: (path: string) => string = (path) => path,
+): QuitStopQuestion {
+  const count = runs?.length ?? null;
+  const listed = (runs ?? [])
+    .slice(0, LISTED)
+    .map((run) => `• ${run.provider} — ${run.task_title} — ${displayName(run.cwd)}`)
+    .join("\n");
+  const omitted = count !== null && count > LISTED ? `\n…and ${count - LISTED} more` : "";
+  const noun = (n: number) => (n === 1 ? "managed run" : "managed runs");
+  let what: string;
+  let title: string;
+  if (count === null) {
+    what = "Managed agent runs may still be working (GitPulse could not list them).";
+    title = "Quit While Managed Runs May Be Working?";
+  } else if (!complete) {
+    what = count === 0
+      ? "The list of managed agent runs could not be read in full, so some may still be working."
+      : `The list of managed agent runs could not be read in full, so at least ${count} ${noun(count)} will be stopped:`;
+    title = "Quit While Managed Runs May Be Working?";
+  } else {
+    what = `${count} ${noun(count)} will be stopped:`;
+    title = count === 1 ? "Quit While a Managed Run Is Working?" : `Quit While ${count} Managed Runs Are Working?`;
+  }
+  return {
+    title,
+    message: `${what}${listed ? `\n${listed}${omitted}` : ""}\nQuitting GitPulse closes the agent runtime, which stops every managed run and whatever it is in the middle of. A terminal host does not keep them.`,
+    confirmLabel: "Stop and Quit",
+    cancelLabel: "Keep Working",
+    destructive: true,
+  };
+}
+
+/** What the quit does about managed runs: `stopping` is how many were counted, null when they could not be listed. */
+export type QuitManagedDecision = { cancelled: true } | { cancelled: false; stopping: number | null };
+
+/**
+ * Decides whether a quit may stop the managed runs. Asks when one is working,
+ * when the list was cut short, or when it could not be read: none of those is
+ * "nothing is running". It does not depend on the terminal backend, because a
+ * managed run dies on quit with the terminal host on or off.
+ */
+export async function decideQuitManagedRuns(deps: {
+  ask: AskStop;
+  listRuns: () => Promise<{ runs: readonly TaskRun[]; complete: boolean }>;
+  displayName?: (path: string) => string;
+  onError?: (what: string, error: unknown) => void;
+}): Promise<QuitManagedDecision> {
+  let working: readonly TaskRun[] | null;
+  let complete = true;
+  try {
+    const live = await deps.listRuns();
+    working = live.runs.filter(isWorkingManagedRun);
+    complete = live.complete;
+  } catch (error) {
+    (deps.onError ?? (() => {}))("the managed runs", error);
+    working = null;
+  }
+  if (working !== null && working.length === 0 && complete) return { cancelled: false, stopping: 0 };
+  const stop = await deps.ask(quitManagedQuestion(working, complete, deps.displayName));
+  return stop ? { cancelled: false, stopping: working?.length ?? null } : { cancelled: true };
 }

@@ -31,6 +31,8 @@
   import { trustExtended } from "../repos/trustExtension";
   import { listAllLiveRuns, type TaskRun } from "../workbench/client";
   import { liveRunIn } from "../workbench/liveRun";
+  import { squashesByDefault } from "../workbench/attemptBranch";
+  import { MERGE_MODES } from "../branches/mergeSelection";
   import { runStateLabel } from "../workbench/taskHandoff";
   import { openTaskForRun } from "../workbench/taskOpen";
 
@@ -110,6 +112,8 @@
   }
   let mergeConfirmPath = $state<string | null>(null);
   let mergingPath = $state<string | null>(null);
+  /** Whether the armed merge lands as one commit; set when the confirm is armed, changeable until it is pressed. */
+  let mergeSquash = $state(false);
   /**
    * The repository each armed confirm was raised in, captured on the first
    * click. The second click runs there or is refused: it never lands on
@@ -508,6 +512,15 @@
     !isLoading && !error && worktrees.length > 0 && worktrees.every((wt) => wt.is_main),
   );
 
+  /** Keeps the armed merge confirm open for another few seconds; the squash choice counts as attention. */
+  function holdMergeConfirm(path: string) {
+    if (mergeTimer !== null) clearTimeout(mergeTimer);
+    mergeTimer = setTimeout(() => {
+      mergeTimer = null;
+      if (mergeConfirmPath === path) mergeConfirmPath = null;
+    }, 4000);
+  }
+
   async function mergeTeardown(wt: WorktreeInfo) {
     if (mergingPath === wt.path) return;
     if (mergeConfirmPath !== wt.path) {
@@ -515,11 +528,8 @@
       if (!armed) return;
       mergeTarget = armed;
       mergeConfirmPath = wt.path;
-      if (mergeTimer !== null) clearTimeout(mergeTimer);
-      mergeTimer = setTimeout(() => {
-        mergeTimer = null;
-        if (mergeConfirmPath === wt.path) mergeConfirmPath = null;
-      }, 4000);
+      mergeSquash = squashesByDefault(wt.branch);
+      holdMergeConfirm(wt.path);
       return;
     }
     mergeConfirmPath = null;
@@ -548,7 +558,7 @@
         {
           worktreePath: wt.path,
           targetBranch: null,
-          squash: false,
+          squash: mergeSquash,
           // The commit this row showed: the host merges nothing if the branch moved since.
           expectedTip: wt.head,
         },
@@ -966,6 +976,10 @@
             <div class="text-[9px] font-semibold text-amber-400 pt-0.5" role="status">
               Merge {wt.branch ?? wt.name} into the default branch and remove this worktree? Press merge again to confirm.
             </div>
+            <label class="flex items-center gap-1 pt-0.5 text-[9px] text-textMuted" title={MERGE_MODES.find((mode) => mode.mode === "squash")?.detail}>
+              <input type="checkbox" bind:checked={mergeSquash} onchange={() => holdMergeConfirm(wt.path)} />
+              Squash into one commit
+            </label>
           {/if}
 
           {#if aiSummaries[wt.path]}

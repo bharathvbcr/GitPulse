@@ -268,6 +268,18 @@ describe("App overlay wiring", () => {
     expect(source).not.toContain("conflictSessions.flush()");
   });
 
+  it("asks about managed runs on every quit, whichever terminal backend holds the sessions", () => {
+    const start = source.indexOf("async function answerNativeExitRequest()");
+    const body = source.slice(start, source.indexOf("\n  }\n", start));
+    const managed = body.indexOf("decideQuitManagedRuns({");
+    // Not inside the host-only branch: the sidecar closes its runs with the terminal host on or off.
+    expect(managed).toBeGreaterThan(-1);
+    expect(managed).toBeLessThan(body.indexOf("decideQuitTerminals({"));
+    expect(body).toContain("listRuns: listAllLiveRuns");
+    expect(body).toMatch(/if \(managedRuns\.cancelled\) \{ cancelNativeExitRequest\(\); return; \}/);
+    expect(source).toContain('import { listAllLiveRuns } from "./lib/workbench/client"');
+  });
+
   it("answers every native quit request it saw, so a held quit or logout is never stranded", () => {
     const start = source.indexOf("async function answerNativeExitRequest()");
     const end = source.indexOf("\n  }\n", start);

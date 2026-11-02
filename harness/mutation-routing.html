@@ -37,6 +37,10 @@ const branchOf = name => ({ name, short_name: name, age_days: 90, severity: "sta
 const scanFor = repo => ({ default_branch: "main", branches: [branchOf(repo === A ? "stale/from-a" : "stale/from-b")], total_scanned: 1, stale_count: 1, merged_count: 1, squash_merged_count: 0, warnings: [] });
 const backupsFor = repo => [{ filename: `${repo === A ? "a" : "b"}.json`, path: `${repo}/.backup/1.json`, timestamp: 1700000000, branch_count: 1, repo_name: repo }];
 const guarded = output => ({ policy: null, output });
+/** The attempt review fixture: a two-file range from `a…` to the attempt worktree's head `c…`. */
+let reviewStatus = "unreviewed", ancestry = true, rangeTruncated = false;
+const rangeCalls = [];
+const reviewRecord = () => ({ run_id: "att", branch: "gitpulse/att", base_oid: "a".repeat(40), head_oid: "c".repeat(40), files_changed: 2, ended: true, review: reviewStatus === "approved" ? { status: "approved", note: null } : { status: "unreviewed" }, gate_on: true, gate_error: null });
 mockIPCWithEvents(async (cmd, args) => {
   switch (cmd) {
     case "cmd_resolve_repo": return { path: args.repoPath ?? args.path, name: "repo", is_bare: false, common_dir: String(args.repoPath ?? args.path).endsWith("/att") ? `${A}/.git` : undefined };
@@ -72,6 +76,10 @@ mockIPCWithEvents(async (cmd, args) => {
       if (cmd === "cmd_deadbranch_restore") return guarded({ restored: ["stale/from-a"], failed: [], message: "Restored" });
       return guarded(null);
     }
+    case "cmd_attempt_review": return reviewRecord();
+    case "cmd_attempt_review_record": reviewStatus = args.decision === "approve" ? "approved" : "unreviewed"; return reviewRecord();
+    case "cmd_provenance_freshness": return { commit_sha: args.commitSha, landed_on_base: ancestry, on_base: ancestry, base_oid: args.baseBranch, merge_base: null, ahead: null, behind: null, base_relation_reason: "", verified: false };
+    case "cmd_get_range_diff": rangeCalls.push({ repoPath: args.repoPath, from: args.from, to: args.to }); return { text: "diff --git a/f.txt b/f.txt\n+new\n", truncated: rangeTruncated, truncation_reason: rangeTruncated ? "larger than the fixture reads" : null };
     case "cmd_deadbranch_scan": await parkIfHeld(`scan:${args.repoPath}`); return scanFor(args.repoPath);
     case "cmd_deadbranch_list_backups": await parkIfHeld(`backups:${args.repoPath}`); return backupsFor(args.repoPath);
     default: unexpected.push(cmd); throw new Error(`Unimplemented fixture: ${cmd}`);
@@ -86,6 +94,7 @@ const { promptState, completePrompt } = await import("../src/lib/stores/modalSto
 const { discardAttemptWorktree } = await import("../src/lib/workbench/attemptWorktree");
 const { gitActionCount } = await import("../src/lib/desktop/exitGuard");
 const WorktreesPanel = (await import("../src/lib/components/WorktreesPanel.svelte")).default;
+const AttemptReview = (await import("../src/lib/components/AttemptReview.svelte")).default;
 const BranchCleanupModal = (await import("../src/lib/components/BranchCleanupModal.svelte")).default;
 const ToastContainer = (await import("../src/lib/components/ToastContainer.svelte")).default;
 const { results, check, stopped } = createChecks();
@@ -374,6 +383,69 @@ const sentTo = cmd => sent.filter(s => s.cmd === cmd);
   await repoStore.activateTab(tabId(A));
   harnessStore.activateRepository(A);
   await until(() => button("Lock lane"), "A's rows back after the failed remove");
+
+  // squash on the armed merge: on by default for an attempt branch, off for any other, and what is sent is what the box says
+  const squashBox = () => [...document.querySelectorAll('input[type="checkbox"]')].find(box => box.closest("label")?.textContent.includes("Squash into one commit"));
+  const mergesBefore = sentTo("cmd_worktree_merge_teardown").length;
+  check("the merge of a plain branch that no one asked to squash, sent earlier in this run, kept its commits",() => sentTo("cmd_worktree_merge_teardown")[0].squash === false);
+  button("Merge att into the default branch and remove it").click();
+  await until(() => squashBox(), "squash choice shown with the armed merge");
+  check("an attempt branch's armed merge has squash on, and still reads Press merge again to confirm", () => squashBox().checked === true && document.body.textContent.includes("Press merge again to confirm"));
+  button("Merge att into the default branch and remove it").click();
+  await until(() => sentTo("cmd_worktree_merge_teardown").length === mergesBefore + 1, "attempt merge sent");
+  await until(() => busy() === 0, "attempt merge settled");
+  check("and the attempt branch is sent squashed, held to the tip the row showed", () => sentTo("cmd_worktree_merge_teardown")[mergesBefore].squash === true && sentTo("cmd_worktree_merge_teardown")[mergesBefore].worktreePath === `${A}/.claude/worktrees/att` && sentTo("cmd_worktree_merge_teardown")[mergesBefore].expectedTip === "c".repeat(40));
+  await until(() => button("Merge lane into the default branch and remove it"), "rows back after the attempt merge");
+  button("Merge lane into the default branch and remove it").click();
+  await until(() => squashBox(), "squash choice shown for the plain branch");
+  check("a plain branch's armed merge has squash off", () => squashBox().checked === false);
+  squashBox().click();
+  await wait(60);
+  check("choosing it keeps the confirm armed", () => squashBox()?.checked === true && document.body.textContent.includes("Press merge again to confirm"));
+  button("Merge lane into the default branch and remove it").click();
+  await until(() => sentTo("cmd_worktree_merge_teardown").length === mergesBefore + 2, "plain branch merge sent");
+  await until(() => busy() === 0, "plain branch merge settled");
+  check("and the plain branch is sent squashed because the reader asked", () => sentTo("cmd_worktree_merge_teardown")[mergesBefore + 1].squash === true && sentTo("cmd_worktree_merge_teardown")[mergesBefore + 1].worktreePath.endsWith("/lane"));
+  await until(() => button("Lock lane"), "A's rows back after the squash merges");
+
+  // attempt review: the committed range is read in the attempt's own checkout, qualified before Approve, and landed at the approved commit
+  const ATTW = `${A}/.claude/worktrees/att`;
+  const reviewHost = document.createElement("div");
+  host.append(reviewHost);
+  mount(AttemptReview, { target: reviewHost, props: { run: { id: "att", cwd: ATTW, state: "exited", expires_at: 0 } } });
+  await repoStore.activateTab(tabId(B));
+  harnessStore.activateRepository(B);
+  const q = testid => document.querySelector(`[data-testid="${testid}"]`);
+  const notices = () => [...document.querySelectorAll('[data-testid="attempt-diff-notice"]')].map(n => n.textContent);
+  button("Merge review").click();
+  await until(() => q("attempt-view-diff"), "the review loaded with its diff control");
+  check("View diff names how many files the attempt changed", () => q("attempt-view-diff").textContent.includes("View diff (2 files)"));
+  check("Uncommitted files is not offered for a checkout with none", () => !q("attempt-view-uncommitted"));
+  rangeTruncated = true;
+  ancestry = false;
+  // Earlier checks leave their persistent error toasts up, and the stack holds five.
+  toastStore.clear();
+  q("attempt-view-diff").click();
+  await until(() => rangeCalls.length === 1 && notices().length === 2, "the range read and its notices shown");
+  check("the range is read in the attempt's own checkout, base to head, though B was in front", () => rangeCalls[0].repoPath === ATTW && rangeCalls[0].from === "a".repeat(40) && rangeCalls[0].to === "c".repeat(40));
+  check("and that checkout is now the repository in front", () => get(repoStore).currentPath === ATTW && get(repoStore).selectionKind === "range");
+  check("the cut is said before Approve, with the reason and the whole-range scope", () => notices().some(n => /Only part of this diff is shown \(larger than the fixture reads\)/.test(n) && /all 2 files/.test(n)));
+  check("a base that is not an ancestor of head is said, not presented as the approved range", () => notices().some(n => /is not an ancestor of/.test(n) && /not the range the review covers/.test(n)));
+  check("both are also toasted where the reader lands", () => toasts().filter(t => t.startsWith("warning") && (/Only part of this diff/.test(t) || /is not an ancestor/.test(t))).length === 2);
+  button("Approve for merge").click();
+  await until(() => button("Land and clean up"), "Land offered once the review is approved");
+  const mergesBeforeLand = sentTo("cmd_worktree_merge_teardown").length;
+  button("Land and clean up").click();
+  await until(() => get(promptState), "land confirm");
+  check("landing asks how, with squash as the default for an attempt branch", () => get(promptState).options.confirmLabel === "Squash into one commit" && get(promptState).options.alternateLabel === "Merge into main");
+  completePrompt(true);
+  await until(() => sentTo("cmd_worktree_merge_teardown").length === mergesBeforeLand + 1, "landing sent");
+  await until(() => q("attempt-landed"), "landing reported");
+  check("the landing is held to the approved commit and squashed, in the attempt's main checkout", () => { const s = sentTo("cmd_worktree_merge_teardown")[mergesBeforeLand]; return s.repoPath === A && s.expectedTip === "c".repeat(40) && s.squash === true && s.worktreePath === ATTW; });
+  check("and the review stops offering anything on the worktree it removed", () => /Squashed 1 commit/.test(q("attempt-landed").textContent) && !q("attempt-view-diff") && !button("Land and clean up"));
+  await repoStore.activateTab(tabId(A));
+  harnessStore.activateRepository(A);
+  await until(() => button("Lock lane"), "A's rows back after the review");
 
   // attemptWorktree: the main checkout's tab is captured before the confirm
   const ATT = `${A}/.claude/worktrees/att`;
