@@ -1073,13 +1073,32 @@ fn a_truncated_repository_scan_still_cleans_a_tree_that_was_read_in_full() {
     }
 
     // Enough artifact directories to push the report past its reporting cap,
-    // which is what makes `scan.truncated` true. Each is unignored, so each is
-    // excluded as a candidate on its own merits and only the tree above is left.
+    // which is what makes `scan.truncated` true. They are COMMITTED, for two
+    // reasons: tracked files make each one ineligible on its own merits, so the
+    // tree above is the only candidate; and `quiet_repo` refuses a repository
+    // with any `git status` output at all, so leaving them untracked made the
+    // repository dirty and nothing was gated -- the fixture defeating its own
+    // test. They still count towards the reporting cap, which is applied before
+    // any git filtering.
     for i in 0..=64 {
         let filler = r.join(format!("f{i}/coverage"));
         fs::create_dir_all(&filler).unwrap();
         fs::write(filler.join("report.txt"), b"x").unwrap();
     }
+    crate::engine::git_cli::git_text(&r, &["add", "."]).unwrap();
+    crate::engine::git_cli::git_text(
+        &r,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "fillers",
+        ],
+    )
+    .unwrap();
 
     cleaner.save(config(&cleaner, &root)).unwrap();
     let inventory = cleaner.inventory().expect("inventory");

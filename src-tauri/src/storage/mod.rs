@@ -96,6 +96,13 @@ const DEADLINE_CHECK_STRIDE: usize = 4_096;
 /// is ~3x the larger of those, and the scan deadline still bounds the whole
 /// walk, so a pathological tree costs time once and is then refused, never
 /// walked without end.
+///
+/// Enforced where [`WalkBudget::exhausted`] is consulted: on entering a
+/// directory, and every [`DEADLINE_CHECK_STRIDE`] entries inside one. So the
+/// allowance can be overshot by up to one directory's worth of entries, or
+/// 4,096 of them in a single flat directory, before the tree is marked
+/// unexamined. That is the cost of not reading the clock once per `stat`; the
+/// overshoot is bounded and the verdict is still fail-closed.
 const MAX_FILES_PER_ARTIFACT: usize = 600_000;
 /// How many times a directory name may repeat in its own ancestor chain before
 /// the walk treats the nesting as runaway and prunes it.
@@ -3204,12 +3211,20 @@ mod tests {
     /// An artifact tree past its own file allowance is refused, not trimmed and
     /// called clean. The allowance is injected rather than reached, because
     /// reaching it honestly would mean creating 600,000 files.
+    ///
+    /// The files are spread across subdirectories deliberately. The allowance
+    /// is consulted where `exhausted()` is consulted -- on entering a
+    /// directory, and every `DEADLINE_CHECK_STRIDE` entries within one -- so a
+    /// single flat directory of 20 files runs to its end whatever the
+    /// allowance says. That is the bound the code actually offers, and an
+    /// earlier version of this test asserted a tighter one that does not
+    /// exist.
     #[test]
     fn an_artifact_tree_past_its_own_file_allowance_is_incomplete() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         for i in 0..20 {
-            write_file(&root.join("target").join(format!("o{i}.o")), 10);
+            write_file(&root.join("target").join(format!("d{i}/o.o")), 10);
         }
 
         let mut budget = WalkBudget::new();
