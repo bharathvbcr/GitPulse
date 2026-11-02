@@ -23,10 +23,67 @@
 //! thinking, and a provenance store that quoted reasoning would be a very
 //! effective way to leak the contents of every private repository it watched.
 
+use std::borrow::Cow;
+use std::collections::VecDeque;
+
 use serde::{Deserialize, Serialize};
 
+/// How a call ended, as far as the transcript says.
+///
+/// A call is written when the model asks for it and its result is written
+/// later, on another line. A call whose result this reader never saw (the
+/// agent was killed, the result is still to come, the line was unreadable) is
+/// [`CallResult::Unobserved`], which is not a success: the ledger's `outcome`
+/// column has no "unknown" (it is `ok`, `failed` or `blocked`), so such a row
+/// is `ok` there, as every transcript row has always been, and the difference
+/// is that it carries no `detail_json.result`. A reader that wants to know
+/// whether a call passed asks that key and not the column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CallResult {
+    /// No result line was read for this call.
+    #[default]
+    Unobserved,
+    /// The result came back without the error flag.
+    Succeeded,
+    /// The result came back flagged as an error (`is_error`).
+    Errored,
+}
+
+impl CallResult {
+    /// The word `detail_json.result` carries; an unobserved call carries none.
+    pub fn word(self) -> &'static str {
+        match self {
+            CallResult::Unobserved => "unobserved",
+            CallResult::Succeeded => "ok",
+            CallResult::Errored => "error",
+        }
+    }
+}
+
+/// The token counts of one model response, and nothing else the response said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TokenUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_creation: u64,
+}
+
+/// Which transcript line a call came from, for the row's identity.
+///
+/// A call is written when its result is read, which is a later line than the
+/// one that holds it, so the identity cannot be taken from the line being read.
+/// It is the line that holds the call, as it always was: a row recorded before
+/// results were paired keeps the identity it has now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineOrigin {
+    pub offset: u64,
+    pub ordinal: usize,
+    pub digest: u64,
+}
+
 /// One mutating tool call, attributed to a repository.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ToolCall {
     /// The session this came from, which is also the transcript's identity.
     pub session_id: String,
@@ -45,6 +102,30 @@ pub struct ToolCall {
     pub file_path: Option<String>,
     /// The command line for `Bash`; `None` for a file tool.
     pub command: Option<String>,
+    /// The id the agent gave the call, which its result names.
+    #[serde(skip)]
+    pub tool_use_id: Option<String>,
+    /// What the call's result said; see [`CallResult`].
+    #[serde(skip)]
+    pub result: CallResult,
+    /// Milliseconds from the call's record to its result's, when both were
+    /// timed and the result came after. Never a guess: absent is "not known".
+    #[serde(skip)]
+    pub duration_ms: Option<i64>,
+    /// The subagent whose transcript this line is in (`agent-<id>.jsonl`), or
+    /// `None` for the session's own transcript. The session id of a subagent's
+    /// line is its parent's, so this is what tells the two apart.
+    #[serde(skip)]
+    pub subagent_id: Option<String>,
+    /// Where the call was read when that is not the line being read.
+    #[serde(skip)]
+    pub origin: Option<LineOrigin>,
+    /// The model response a [`USAGE_TOOL`] row counts.
+    #[serde(skip)]
+    pub message_id: Option<String>,
+    /// What a [`USAGE_TOOL`] row counted.
+    #[serde(skip)]
+    pub usage: Option<TokenUsage>,
 }
 
 /// Every ledger action a transcript call can become, and only those.
@@ -52,15 +133,26 @@ pub struct ToolCall {
 /// `session.spawn` shares the prefix but is GitPulse opening a terminal; a
 /// reader asking "what came from transcripts" must match this list, not the
 /// prefix.
-pub const ACTIONS: [&str; 2] = [EDIT, COMMAND];
+pub const ACTIONS: [&str; 3] = [EDIT, COMMAND, USAGE];
 const EDIT: &str = "session.edit";
 const COMMAND: &str = "session.command";
+/// One model response's token counts: numbers only, never what was said.
+pub const USAGE: &str = "session.usage";
+
+/// The `tool` of a record that is a model response's token counts and not a
+/// call. It shares [`ToolCall`] so it is attributed, owned and written by the
+/// same machinery as the calls beside it.
+pub const USAGE_TOOL: &str = "Usage";
+
+/// A usage record's ordinal in its line's identity, which no call's can reach.
+const USAGE_ORDINAL: usize = 1 << 20;
 
 impl ToolCall {
     /// The ledger action this call becomes.
     pub fn action(&self) -> &'static str {
         match self.tool.as_str() {
             "Bash" => COMMAND,
+            USAGE_TOOL => USAGE,
             _ => EDIT,
         }
     }
@@ -70,6 +162,7 @@ impl ToolCall {
         self.file_path
             .clone()
             .or_else(|| self.command.clone())
+            .or_else(|| self.message_id.clone())
             .unwrap_or_default()
     }
 }
@@ -150,24 +243,35 @@ pub fn parse_record(line: &str) -> LineOutcome {
     }
 }
 
+/// The fields every record of a session carries, as a call with nothing else
+/// filled in; `None` for a record that cannot be placed in the history.
+///
+/// Without a session or a time the row could not be placed at all, and without
+/// a cwd a Bash call cannot be attributed. Recording it with blanks would put
+/// an unattributable row in the ledger, so it is skipped and counted instead.
+fn base_call(record: &serde_json::Value) -> Option<ToolCall> {
+    let session_id = record["sessionId"].as_str().unwrap_or_default().to_string();
+    let ts_utc = record["timestamp"].as_str().unwrap_or_default().to_string();
+    if session_id.is_empty() || ts_utc.is_empty() {
+        return None;
+    }
+    Some(ToolCall {
+        session_id,
+        ts_utc,
+        version: record["version"].as_str().unwrap_or_default().to_string(),
+        cwd: record["cwd"].as_str().unwrap_or_default().to_string(),
+        git_branch: record["gitBranch"].as_str().map(str::to_string),
+        ..ToolCall::default()
+    })
+}
+
 fn calls_in(record: &serde_json::Value) -> Vec<ToolCall> {
     if record.get("type").and_then(|t| t.as_str()) != Some("assistant") {
         return Vec::new();
     }
-
-    let session_id = record["sessionId"].as_str().unwrap_or_default().to_string();
-    let ts_utc = record["timestamp"].as_str().unwrap_or_default().to_string();
-    let version = record["version"].as_str().unwrap_or_default().to_string();
-    let cwd = record["cwd"].as_str().unwrap_or_default().to_string();
-    let git_branch = record["gitBranch"].as_str().map(str::to_string);
-
-    // Without a cwd a Bash call cannot be attributed at all, and a file tool's
-    // absolute path is the only thing left. Recording the call with an empty
-    // cwd would put an unattributable row in the ledger, so it is skipped and
-    // counted instead.
-    if session_id.is_empty() || ts_utc.is_empty() {
+    let Some(base) = base_call(record) else {
         return Vec::new();
-    }
+    };
 
     let Some(blocks) = record["message"]["content"].as_array() else {
         return Vec::new();
@@ -186,12 +290,12 @@ fn calls_in(record: &serde_json::Value) -> Vec<ToolCall> {
         }
         let input = &block["input"];
         calls.push(ToolCall {
-            session_id: session_id.clone(),
-            ts_utc: ts_utc.clone(),
-            version: version.clone(),
-            cwd: cwd.clone(),
-            git_branch: git_branch.clone(),
             tool: tool.to_string(),
+            tool_use_id: block
+                .get("id")
+                .and_then(|i| i.as_str())
+                .filter(|id| !id.is_empty())
+                .map(str::to_string),
             file_path: input
                 .get("file_path")
                 .and_then(|p| p.as_str())
@@ -200,9 +304,449 @@ fn calls_in(record: &serde_json::Value) -> Vec<ToolCall> {
                 .get("command")
                 .and_then(|c| c.as_str())
                 .map(str::to_string),
+            ..base.clone()
         });
     }
     calls
+}
+
+// ---------------------------------------------------------------------------
+// Reading a whole transcript: results paired with their calls, and token counts.
+// ---------------------------------------------------------------------------
+
+/// The tag a tool-result block carries as Claude Code writes it. A result is a
+/// block of a `user` record, so it is on the lines [`parse_record`] never reads.
+const RESULT_TAG: &str = "\"type\":\"tool_result\"";
+
+/// The most calls waiting for their result at once. A call pushed out by a
+/// newer one is written unpaired, which the row says.
+const MAX_PENDING: usize = 256;
+
+/// How far (by the transcript's own clock) a newer record may be from a call
+/// that has no result before the call is written without one. Above the longest
+/// time a command is allowed to run, so a call still running is not given up
+/// on; a call the agent never got a result for is not held for ever.
+pub const PENDING_MAX_AGE_MS: u64 = 15 * 60 * 1000;
+
+/// Response ids remembered as already counted, per transcript read.
+const MAX_COUNTED: usize = 64;
+
+/// A tool-result record, read for the ids and error flags of its blocks and
+/// nothing else: `content` is the tool's output and is skipped unread.
+#[derive(Deserialize)]
+struct ResultRecord<'a> {
+    #[serde(borrow, rename = "type")]
+    kind: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    timestamp: Option<Cow<'a, str>>,
+    message: Option<ResultMessage<'a>>,
+}
+
+#[derive(Deserialize)]
+struct ResultMessage<'a> {
+    #[serde(borrow)]
+    content: Option<ResultBlocks<'a>>,
+}
+
+/// A message's `content` when it is a list of blocks; empty for anything else
+/// (a prompt typed as plain text), which is skipped unread. A custom reader and
+/// not an untagged enum, because that would buffer the whole of every tool
+/// output before looking at it.
+struct ResultBlocks<'a>(Vec<ResultBlock<'a>>);
+
+impl<'de: 'a, 'a> Deserialize<'de> for ResultBlocks<'a> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Blocks<'a>(std::marker::PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> serde::de::Visitor<'de> for Blocks<'a> {
+            type Value = ResultBlocks<'a>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a message's content")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut blocks = Vec::new();
+                while let Some(block) = seq.next_element::<ResultBlock<'a>>()? {
+                    blocks.push(block);
+                }
+                Ok(ResultBlocks(blocks))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(ResultBlocks(Vec::new()))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                while map
+                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .is_some()
+                {}
+                Ok(ResultBlocks(Vec::new()))
+            }
+        }
+        deserializer.deserialize_any(Blocks(std::marker::PhantomData))
+    }
+}
+
+#[derive(Deserialize)]
+struct ResultBlock<'a> {
+    #[serde(borrow, rename = "type")]
+    kind: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    tool_use_id: Option<Cow<'a, str>>,
+    is_error: Option<bool>,
+}
+
+/// An assistant record read only for its response's identity and token counts.
+#[derive(Deserialize)]
+struct UsageRecord<'a> {
+    #[serde(borrow, rename = "type")]
+    kind: Option<Cow<'a, str>>,
+    #[serde(borrow, rename = "sessionId")]
+    session_id: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    timestamp: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    cwd: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    version: Option<Cow<'a, str>>,
+    #[serde(borrow, rename = "gitBranch")]
+    git_branch: Option<Cow<'a, str>>,
+    message: Option<UsageMessage<'a>>,
+}
+
+#[derive(Deserialize)]
+struct UsageMessage<'a> {
+    #[serde(borrow)]
+    id: Option<Cow<'a, str>>,
+    usage: Option<UsageWire>,
+}
+
+#[derive(Deserialize)]
+struct UsageWire {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+}
+
+impl UsageWire {
+    /// `None` when the record counted nothing at all, which is not a response
+    /// that used zero tokens.
+    fn counts(&self) -> Option<TokenUsage> {
+        if self.input_tokens.is_none()
+            && self.output_tokens.is_none()
+            && self.cache_read_input_tokens.is_none()
+            && self.cache_creation_input_tokens.is_none()
+        {
+            return None;
+        }
+        Some(TokenUsage {
+            input: self.input_tokens.unwrap_or(0),
+            output: self.output_tokens.unwrap_or(0),
+            cache_read: self.cache_read_input_tokens.unwrap_or(0),
+            cache_creation: self.cache_creation_input_tokens.unwrap_or(0),
+        })
+    }
+}
+
+/// A response whose records are still being read: Claude Code writes one record
+/// per content block of a response, each repeating the response's usage.
+struct OpenUsage {
+    call: ToolCall,
+}
+
+/// Reads one transcript file's lines in order, pairing each call with its
+/// result and counting each response's tokens once.
+///
+/// The row for a call is written when its result is read, so the reader holds a
+/// call back until then. What it holds back must not be lost to a cursor that
+/// moved past it, so [`Reader::held_from`] says the earliest line still owed, and
+/// the pass leaves its cursor there. The lines between are read again next
+/// time; every row's identity is its own line's, so a row already written is
+/// refused rather than written twice.
+///
+/// Only block types, ids, error flags, numbers and the fields of a record's
+/// head are read. A result's `content`, the prose of a response and its
+/// reasoning are skipped unread.
+pub struct Reader {
+    subagent_id: Option<String>,
+    line: Option<(u64, u64)>,
+    pending: VecDeque<ToolCall>,
+    open_usage: Option<OpenUsage>,
+    counted: VecDeque<String>,
+    newest_ms: Option<u64>,
+}
+
+impl Reader {
+    /// A reader for the transcript at `path`: `agent-<id>.jsonl` is a subagent's.
+    pub fn for_path(path: &std::path::Path) -> Self {
+        Reader::new(subagent_id_of(path))
+    }
+
+    pub fn new(subagent_id: Option<String>) -> Self {
+        Reader {
+            subagent_id,
+            line: None,
+            pending: VecDeque::new(),
+            open_usage: None,
+            counted: VecDeque::new(),
+            newest_ms: None,
+        }
+    }
+
+    /// The byte offset and content digest of the line [`Reader::read`] is about
+    /// to be given.
+    pub fn locate(&mut self, offset: u64, digest: u64) {
+        self.line = Some((offset, digest));
+    }
+
+    /// The offset of the earliest line a call or a response still being read
+    /// came from: the pass's cursor must not pass it.
+    pub fn held_from(&self) -> Option<u64> {
+        let calls = self.pending.iter().filter_map(|c| c.origin.map(|o| o.offset));
+        let usage = self
+            .open_usage
+            .iter()
+            .filter_map(|u| u.call.origin.map(|o| o.offset));
+        calls.chain(usage).min()
+    }
+
+    /// The end of the file was reached. With `give_up`, everything held is
+    /// written as it stands (calls without a result, the last response) because
+    /// nothing more is coming; without it, nothing is, and it stays held.
+    pub fn finish(&mut self, give_up: bool) -> Vec<ToolCall> {
+        if !give_up {
+            return Vec::new();
+        }
+        let mut out: Vec<ToolCall> = self.pending.drain(..).collect();
+        out.extend(self.close_usage());
+        out
+    }
+
+    /// Reads one line.
+    pub fn read(&mut self, line: &str) -> LineOutcome {
+        if line.contains(RESULT_TAG) {
+            return self.read_result(line);
+        }
+        let holds_call = line.contains("\"assistant\"") && line.contains("\"tool_use\"");
+        if !holds_call && !line.contains(ASSISTANT_TAG) {
+            return LineOutcome::NoCalls;
+        }
+        #[cfg(test)]
+        PARSES.with(|parses| parses.set(parses.get() + 1));
+        let mut out = Vec::new();
+        if holds_call {
+            let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+                return LineOutcome::Unreadable;
+            };
+            if record.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+                return LineOutcome::NoCalls;
+            }
+            let Some(base) = base_call(&record) else {
+                return LineOutcome::NoCalls;
+            };
+            self.note_time(&base.ts_utc);
+            for (ordinal, mut call) in calls_in(&record).into_iter().enumerate() {
+                call.subagent_id.clone_from(&self.subagent_id);
+                call.origin = self.origin(ordinal);
+                if call.tool_use_id.is_some() && call.origin.is_some() {
+                    self.pending.push_back(call);
+                } else {
+                    out.push(call);
+                }
+            }
+            let message = &record["message"];
+            let counts = UsageWire {
+                input_tokens: message["usage"]["input_tokens"].as_u64(),
+                output_tokens: message["usage"]["output_tokens"].as_u64(),
+                cache_read_input_tokens: message["usage"]["cache_read_input_tokens"].as_u64(),
+                cache_creation_input_tokens: message["usage"]["cache_creation_input_tokens"]
+                    .as_u64(),
+            }
+            .counts();
+            out.extend(self.note_usage(base, message["id"].as_str(), counts));
+        } else {
+            let Ok(record) = serde_json::from_str::<UsageRecord<'_>>(line) else {
+                return LineOutcome::Unreadable;
+            };
+            if let (Some("assistant"), Some(session), Some(ts)) = (
+                record.kind.as_deref(),
+                record.session_id.as_deref().filter(|s| !s.is_empty()),
+                record.timestamp.as_deref().filter(|t| !t.is_empty()),
+            ) {
+                let base = ToolCall {
+                    session_id: session.to_string(),
+                    ts_utc: ts.to_string(),
+                    version: record.version.as_deref().unwrap_or_default().to_string(),
+                    cwd: record.cwd.as_deref().unwrap_or_default().to_string(),
+                    git_branch: record.git_branch.as_deref().map(str::to_string),
+                    ..ToolCall::default()
+                };
+                self.note_time(ts);
+                let message = record.message.as_ref();
+                out.extend(self.note_usage(
+                    base,
+                    message.and_then(|m| m.id.as_deref()),
+                    message.and_then(|m| m.usage.as_ref()).and_then(UsageWire::counts),
+                ));
+            }
+        }
+        out.extend(self.expire());
+        Self::outcome(out)
+    }
+
+    fn read_result(&mut self, line: &str) -> LineOutcome {
+        #[cfg(test)]
+        PARSES.with(|parses| parses.set(parses.get() + 1));
+        let Ok(record) = serde_json::from_str::<ResultRecord<'_>>(line) else {
+            return LineOutcome::NoCalls;
+        };
+        if record.kind.as_deref() != Some("user") {
+            return LineOutcome::NoCalls;
+        }
+        let Some(ResultBlocks(blocks)) = record.message.and_then(|m| m.content) else {
+            return LineOutcome::NoCalls;
+        };
+        let at_ms = record
+            .timestamp
+            .as_deref()
+            .and_then(crate::ledger::ids::parse_event_time);
+        if let Some(at) = at_ms {
+            self.newest_ms = Some(self.newest_ms.map_or(at, |newest| newest.max(at)));
+        }
+        let mut out = Vec::new();
+        for block in blocks {
+            if block.kind.as_deref() != Some("tool_result") {
+                continue;
+            }
+            let Some(id) = block.tool_use_id.as_deref() else {
+                continue;
+            };
+            let Some(slot) = self
+                .pending
+                .iter()
+                .position(|call| call.tool_use_id.as_deref() == Some(id))
+            else {
+                continue;
+            };
+            let Some(mut call) = self.pending.remove(slot) else {
+                continue;
+            };
+            call.result = if block.is_error == Some(true) {
+                CallResult::Errored
+            } else {
+                CallResult::Succeeded
+            };
+            call.duration_ms = at_ms.zip(crate::ledger::ids::parse_event_time(&call.ts_utc)).and_then(
+                |(done, began)| {
+                    done.checked_sub(began)
+                        .and_then(|span| i64::try_from(span).ok())
+                },
+            );
+            out.push(call);
+        }
+        out.extend(self.expire());
+        Self::outcome(out)
+    }
+
+    fn outcome(calls: Vec<ToolCall>) -> LineOutcome {
+        if calls.is_empty() {
+            LineOutcome::NoCalls
+        } else {
+            LineOutcome::Calls(calls)
+        }
+    }
+
+    fn origin(&self, ordinal: usize) -> Option<LineOrigin> {
+        self.line.map(|(offset, digest)| LineOrigin {
+            offset,
+            ordinal,
+            digest,
+        })
+    }
+
+    fn note_time(&mut self, ts: &str) {
+        if let Some(at) = crate::ledger::ids::parse_event_time(ts) {
+            self.newest_ms = Some(self.newest_ms.map_or(at, |newest| newest.max(at)));
+        }
+    }
+
+    /// The calls whose record is too far behind the newest one to be waiting
+    /// for a result any longer, and the oldest past the bound on how many wait.
+    fn expire(&mut self) -> Vec<ToolCall> {
+        let mut out = Vec::new();
+        while self.pending.len() > MAX_PENDING {
+            out.extend(self.pending.pop_front());
+        }
+        if let Some(newest) = self.newest_ms {
+            let aged = |call: &ToolCall| {
+                crate::ledger::ids::parse_event_time(&call.ts_utc)
+                    .is_some_and(|at| newest.saturating_sub(at) > PENDING_MAX_AGE_MS)
+            };
+            // Arrival order is time order inside one transcript; a call that is
+            // out of order is held until its neighbours go, which only delays it.
+            while self.pending.front().is_some_and(aged) {
+                out.extend(self.pending.pop_front());
+            }
+        }
+        out
+    }
+
+    /// Takes in one record's counts. A response is written over several
+    /// records that repeat its usage; it is written once, when the next
+    /// response starts or the file ends, from the last of them.
+    fn note_usage(
+        &mut self,
+        base: ToolCall,
+        message_id: Option<&str>,
+        counts: Option<TokenUsage>,
+    ) -> Vec<ToolCall> {
+        let (Some(id), Some(counts)) = (message_id.filter(|id| !id.is_empty()), counts) else {
+            return Vec::new();
+        };
+        if let Some(open) = &mut self.open_usage {
+            if open.call.message_id.as_deref() == Some(id) {
+                open.call.usage = Some(counts);
+                return Vec::new();
+            }
+        }
+        let closed = self.close_usage();
+        if self.counted.iter().any(|seen| seen == id) {
+            return closed.into_iter().collect();
+        }
+        let mut call = ToolCall {
+            tool: USAGE_TOOL.to_string(),
+            message_id: Some(id.to_string()),
+            usage: Some(counts),
+            subagent_id: self.subagent_id.clone(),
+            ..base
+        };
+        call.origin = self.origin(USAGE_ORDINAL);
+        if call.origin.is_none() {
+            return closed.into_iter().chain(Some(call)).collect();
+        }
+        self.open_usage = Some(OpenUsage { call });
+        closed.into_iter().collect()
+    }
+
+    fn close_usage(&mut self) -> Option<ToolCall> {
+        let open = self.open_usage.take()?;
+        if let Some(id) = &open.call.message_id {
+            if self.counted.len() >= MAX_COUNTED {
+                self.counted.pop_front();
+            }
+            self.counted.push_back(id.clone());
+        }
+        Some(open.call)
+    }
+}
+
+/// The subagent a transcript belongs to: the `<id>` of `agent-<id>.jsonl`.
+pub fn subagent_id_of(path: &std::path::Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let id = stem.strip_prefix("agent-")?;
+    (!id.is_empty()).then(|| id.to_string())
 }
 
 /// What a call is attributed by: a file tool's own absolute path, a command's
@@ -575,6 +1119,7 @@ mod tests {
             tool: path.map_or("Bash", |_| "Edit").into(),
             file_path: path.map(str::to_string),
             command: path.is_none().then(|| "ls".to_string()),
+            ..ToolCall::default()
         }
     }
 
@@ -774,5 +1319,259 @@ mod adv2_under_tests {
     fn u03_backslash_paths_are_never_under_by_the_documented_byte_rule() {
         assert!(!under("C:\\w1\\f", "C:\\w1"));
         assert!(!under("C:\\w1\\..\\w2", "C:\\w1"));
+    }
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+
+    /// An assistant record with one content block of the given kind, in
+    /// response `msg`, whose usage is `out` output tokens. Synthetic.
+    fn assistant(ts: &str, msg: &str, block: &str, out: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","sessionId":"S1","timestamp":"{ts}","version":"2.1.241","cwd":"/repo","gitBranch":"main","message":{{"id":"{msg}","content":[{block}],"usage":{{"input_tokens":3,"output_tokens":{out},"cache_read_input_tokens":100,"cache_creation_input_tokens":7,"service_tier":"standard"}}}}}}"#
+        )
+    }
+
+    fn bash(id: &str) -> String {
+        format!(r#"{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":"cargo test"}}}}"#)
+    }
+
+    fn edit(id: &str) -> String {
+        format!(r#"{{"type":"tool_use","id":"{id}","name":"Edit","input":{{"file_path":"/repo/a.rs"}}}}"#)
+    }
+
+    fn thinking() -> String {
+        r#"{"type":"thinking","thinking":"SYNTHETIC-REASONING"}"#.to_string()
+    }
+
+    /// A user record holding one tool result.
+    fn result(ts: &str, id: &str, is_error: Option<bool>) -> String {
+        let flag = is_error.map_or(String::new(), |e| format!(r#","is_error":{e}"#));
+        format!(
+            r#"{{"type":"user","sessionId":"S1","timestamp":"{ts}","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{id}","content":"SYNTHETIC-OUTPUT"{flag}}}]}}}}"#
+        )
+    }
+
+    fn feed(reader: &mut Reader, offset: u64, line: &str) -> Vec<ToolCall> {
+        reader.locate(offset, offset ^ 0xabc);
+        match reader.read(line) {
+            LineOutcome::Calls(calls) => calls,
+            LineOutcome::NoCalls => Vec::new(),
+            LineOutcome::Unreadable => panic!("unreadable: {line}"),
+        }
+    }
+
+    const T0: &str = "2026-09-01T12:00:00.000Z";
+    const T0_2S: &str = "2026-09-01T12:00:02.500Z";
+
+    #[test]
+    fn a_call_is_written_with_the_error_flag_and_duration_of_its_result() {
+        let mut reader = Reader::new(None);
+        assert!(feed(&mut reader, 0, &assistant(T0, "m1", &bash("tu1"), 5)).is_empty());
+        assert_eq!(reader.held_from(), Some(0), "the call is owed its result");
+        let done = feed(&mut reader, 400, &result(T0_2S, "tu1", Some(true)));
+        assert_eq!(done.len(), 1);
+        let call = &done[0];
+        assert_eq!(call.tool, "Bash");
+        assert_eq!(call.result, CallResult::Errored);
+        assert_eq!(call.duration_ms, Some(2500));
+        // The row is the call line's, not the result line's.
+        let origin = call.origin.expect("origin");
+        assert_eq!((origin.offset, origin.ordinal), (0, 0));
+        assert_eq!(origin.digest, 0xabc);
+    }
+
+    #[test]
+    fn a_result_without_the_error_flag_is_a_success_not_an_unknown() {
+        let mut reader = Reader::new(None);
+        feed(&mut reader, 0, &assistant(T0, "m1", &edit("tu1"), 5));
+        let done = feed(&mut reader, 10, &result(T0_2S, "tu1", None));
+        assert_eq!(done[0].result, CallResult::Succeeded);
+        let mut reader = Reader::new(None);
+        feed(&mut reader, 0, &assistant(T0, "m1", &edit("tu2"), 5));
+        let done = feed(&mut reader, 10, &result(T0_2S, "tu2", Some(false)));
+        assert_eq!(done[0].result, CallResult::Succeeded);
+    }
+
+    #[test]
+    fn a_result_older_than_its_call_has_no_duration_rather_than_a_negative_one() {
+        let mut reader = Reader::new(None);
+        feed(&mut reader, 0, &assistant(T0_2S, "m1", &bash("tu1"), 5));
+        let done = feed(&mut reader, 10, &result(T0, "tu1", None));
+        assert_eq!(done[0].duration_ms, None);
+    }
+
+    #[test]
+    fn a_call_with_no_result_stays_held_and_is_then_written_unobserved() {
+        let mut reader = Reader::new(None);
+        feed(&mut reader, 0, &assistant(T0, "m1", &bash("tu1"), 5));
+        // The file is live: nothing is given up on.
+        assert!(reader.finish(false).is_empty());
+        assert_eq!(reader.held_from(), Some(0));
+        // Still: it is written as it stands, and says it has no result.
+        let flushed = reader.finish(true);
+        assert_eq!(flushed.iter().filter(|c| c.tool == "Bash").count(), 1);
+        let call = flushed.iter().find(|c| c.tool == "Bash").unwrap();
+        assert_eq!(call.result, CallResult::Unobserved);
+        assert_eq!(call.duration_ms, None);
+        assert_eq!(reader.held_from(), None);
+    }
+
+    #[test]
+    fn the_cursor_is_held_at_the_earliest_line_still_owed() {
+        let mut reader = Reader::new(None);
+        feed(&mut reader, 100, &assistant(T0, "m1", &bash("a"), 5));
+        feed(&mut reader, 300, &assistant(T0, "m2", &bash("b"), 5));
+        assert_eq!(reader.held_from(), Some(100));
+        feed(&mut reader, 500, &result(T0_2S, "a", None));
+        assert_eq!(reader.held_from(), Some(300));
+    }
+
+    #[test]
+    fn a_call_far_behind_the_newest_record_is_given_up_on() {
+        let mut reader = Reader::new(None);
+        feed(&mut reader, 0, &assistant(T0, "m1", &bash("tu1"), 5));
+        // Twenty minutes later by the transcript's own clock: past any command's limit.
+        let late = "2026-09-01T12:20:00.000Z";
+        let out = feed(&mut reader, 900, &assistant(late, "m2", &thinking(), 9));
+        let call = out.iter().find(|c| c.tool == "Bash").expect("given up on");
+        assert_eq!(call.result, CallResult::Unobserved);
+        // A call 14 minutes behind is not.
+        let mut reader = Reader::new(None);
+        feed(&mut reader, 0, &assistant(T0, "m1", &bash("tu1"), 5));
+        let soon = "2026-09-01T12:14:00.000Z";
+        assert!(feed(&mut reader, 900, &assistant(soon, "m2", &thinking(), 9))
+            .iter()
+            .all(|c| c.tool != "Bash"));
+    }
+
+    #[test]
+    fn the_calls_waiting_for_results_are_bounded() {
+        let mut reader = Reader::new(None);
+        let mut written = 0;
+        for i in 0..(MAX_PENDING as u64 + 10) {
+            let id = format!("tu{i}");
+            written += feed(&mut reader, i * 10, &assistant(T0, &format!("m{i}"), &bash(&id), 1))
+                .iter()
+                .filter(|c| c.tool == "Bash")
+                .count();
+        }
+        assert_eq!(written, 10, "the oldest ten were pushed out unpaired");
+        assert!(reader.pending.len() <= MAX_PENDING);
+    }
+
+    #[test]
+    fn a_response_is_counted_once_however_many_records_repeat_its_usage() {
+        // One response, three records (thinking, then two tool calls), each
+        // repeating the response's usage; counting per record would triple it.
+        let mut reader = Reader::new(None);
+        let mut usage = Vec::new();
+        for (offset, block) in [(0, thinking()), (100, bash("a")), (200, edit("b"))] {
+            usage.extend(
+                feed(&mut reader, offset, &assistant(T0, "m1", &block, 42))
+                    .into_iter()
+                    .filter(|c| c.tool == USAGE_TOOL),
+            );
+        }
+        assert!(usage.is_empty(), "the response is still being read");
+        assert_eq!(reader.held_from(), Some(0));
+        // The next response closes it.
+        let closed: Vec<ToolCall> = feed(&mut reader, 300, &assistant(T0_2S, "m2", &thinking(), 1))
+            .into_iter()
+            .filter(|c| c.tool == USAGE_TOOL)
+            .collect();
+        assert_eq!(closed.len(), 1);
+        let counted = closed[0].usage.expect("usage");
+        assert_eq!(
+            counted,
+            TokenUsage {
+                input: 3,
+                output: 42,
+                cache_read: 100,
+                cache_creation: 7
+            }
+        );
+        assert_eq!(closed[0].message_id.as_deref(), Some("m1"));
+        assert_eq!(closed[0].action(), "session.usage");
+        // Its identity is the first record of the response.
+        assert_eq!(closed[0].origin.map(|o| o.offset), Some(0));
+        // Never counted again, even if its records come round once more (here
+        // m2, which was open, is closed by the interruption and counted once).
+        let again = feed(&mut reader, 400, &assistant(T0_2S, "m1", &thinking(), 42));
+        assert!(again.iter().all(|c| c.message_id.as_deref() != Some("m1")));
+        let rest = reader.finish(true);
+        assert!(rest.iter().all(|c| c.message_id.as_deref() != Some("m1")));
+    }
+
+    #[test]
+    fn the_last_response_is_written_when_the_file_has_gone_still() {
+        let mut reader = Reader::new(None);
+        feed(&mut reader, 0, &assistant(T0, "m1", &thinking(), 42));
+        assert!(reader.finish(false).is_empty());
+        assert_eq!(reader.held_from(), Some(0));
+        let last = reader.finish(true);
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0].usage.map(|u| u.output), Some(42));
+    }
+
+    #[test]
+    fn a_record_without_counts_is_not_a_response_that_used_none() {
+        let mut reader = Reader::new(None);
+        let bare = r#"{"type":"assistant","sessionId":"S1","timestamp":"2026-09-01T12:00:00.000Z","cwd":"/repo","message":{"id":"m1","content":[]}}"#;
+        feed(&mut reader, 0, bare);
+        assert_eq!(reader.held_from(), None);
+        assert!(reader.finish(true).is_empty());
+    }
+
+    #[test]
+    fn a_subagent_transcript_names_its_agent_on_every_row() {
+        assert_eq!(
+            subagent_id_of(std::path::Path::new("/p/s/subagents/agent-a1b2c3.jsonl")).as_deref(),
+            Some("a1b2c3")
+        );
+        assert_eq!(subagent_id_of(std::path::Path::new("/p/s.jsonl")), None);
+        assert_eq!(subagent_id_of(std::path::Path::new("/p/agent-.jsonl")), None);
+        let mut reader = Reader::for_path(std::path::Path::new("/p/agent-a1b2c3.jsonl"));
+        feed(&mut reader, 0, &assistant(T0, "m1", &bash("tu1"), 5));
+        let mut rows = feed(&mut reader, 10, &result(T0_2S, "tu1", None));
+        rows.extend(reader.finish(true));
+        assert_eq!(rows.len(), 2, "the call and its response's usage");
+        assert!(rows.iter().all(|r| r.subagent_id.as_deref() == Some("a1b2c3")));
+        // The session id is still the parent's: that is why the id is needed.
+        assert!(rows.iter().all(|r| r.session_id == "S1"));
+        let mut own = Reader::for_path(std::path::Path::new("/p/S1.jsonl"));
+        feed(&mut own, 0, &assistant(T0, "m1", &bash("tu1"), 5));
+        let own_rows = feed(&mut own, 10, &result(T0_2S, "tu1", None));
+        assert_eq!(own_rows[0].subagent_id, None);
+    }
+
+    #[test]
+    fn a_result_line_is_read_once_and_a_prompt_never() {
+        let prompt = r#"{"type":"user","sessionId":"S1","timestamp":"2026-09-01T12:00:00.000Z","message":{"role":"user","content":"SYNTHETIC-PROMPT"}}"#;
+        let mut reader = Reader::new(None);
+        let before = PARSES.with(std::cell::Cell::get);
+        reader.read(prompt);
+        assert_eq!(PARSES.with(std::cell::Cell::get) - before, 0);
+        reader.read(&result(T0_2S, "tuX", None));
+        assert_eq!(PARSES.with(std::cell::Cell::get) - before, 1);
+    }
+
+    #[test]
+    fn a_result_for_a_call_that_was_never_held_writes_nothing() {
+        // The call was in an earlier pass's range and is owed to that pass.
+        let mut reader = Reader::new(None);
+        assert!(feed(&mut reader, 0, &result(T0_2S, "gone", Some(true))).is_empty());
+    }
+
+    #[test]
+    fn what_a_result_said_is_never_carried() {
+        let mut reader = Reader::new(None);
+        feed(&mut reader, 0, &assistant(T0, "m1", &bash("tu1"), 5));
+        let done = feed(&mut reader, 10, &result(T0_2S, "tu1", Some(true)));
+        let shown = format!("{done:?}");
+        assert!(!shown.contains("SYNTHETIC-OUTPUT"));
+        assert!(!shown.contains("SYNTHETIC-REASONING"));
     }
 }

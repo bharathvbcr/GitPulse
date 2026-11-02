@@ -455,14 +455,43 @@ fn transcript_draft(
         ledger::ids::now_millis(),
         |ms| history.as_of(ms),
     );
-    let detail = serde_json::json!({
+    let mut detail = serde_json::json!({
         "source": "transcript",
         "tool": call.tool,
         "transcript_version": call.version,
         "git_branch": call.git_branch,
         ledger::TRANSCRIPT_ROW_KEY: row.key(),
-    })
-    .to_string();
+    });
+    // Keys a row carries only when the transcript said something: a row with
+    // no `subagent_id` is the session's own, and a row with no `result` is a
+    // call whose result was not read (or a response's token counts, which have
+    // none).
+    if let Some(subagent) = &call.subagent_id {
+        detail["subagent_id"] = subagent.clone().into();
+    }
+    if let Some(usage) = call.usage {
+        detail["message_id"] = call.message_id.clone().into();
+        detail["usage"] = serde_json::json!({
+            "input": usage.input,
+            "output": usage.output,
+            "cache_read": usage.cache_read,
+            "cache_creation": usage.cache_creation,
+        });
+    } else if call.result != transcript::CallResult::Unobserved {
+        // What the result said, in words the column cannot say: the column has
+        // no "unknown", so a call whose result was never read is `ok` there
+        // (as every transcript row has always been) and has no `result` here,
+        // and only the presence of this key tells a call that passed from one
+        // that was never seen to finish. A reader asks the key, not the column.
+        detail["result"] = call.result.word().into();
+        if let Some(id) = &call.tool_use_id {
+            detail["tool_use_id"] = id.clone().into();
+        }
+    }
+    let outcome = match call.result {
+        transcript::CallResult::Errored => Outcome::Failed,
+        transcript::CallResult::Succeeded | transcript::CallResult::Unobserved => Outcome::Ok,
+    };
     Draft {
         repo_path: ledger_repo.to_string(),
         worktree_path: (ledger_repo != worktree_path).then(|| worktree_path.to_string()),
@@ -474,12 +503,13 @@ fn transcript_draft(
         // a transcript recorded the call, not because an agent announced it.
         actor_kind: Some(ActorKind::Agent),
         actor_id: Some(actor_id.into()),
-        outcome: Some(Outcome::Ok),
+        outcome: Some(outcome),
+        duration_ms: call.duration_ms,
         // No verdict: GitPulse's gate never saw this action. That is
         // emphatically not the same as an action that passed, and the absence
         // is what says so.
         verdict_json: None,
-        detail_json: Some(detail),
+        detail_json: Some(detail.to_string()),
         event_stamp: Some(when.stamp()),
         ..Default::default()
     }
@@ -1783,6 +1813,188 @@ mod tests {
             );
         });
         assert_eq!(ledger::tail(repo, 0, 100).unwrap().len(), 1);
+    }
+
+    // ---- Pairing a call with its result, and counting a response's tokens ----
+
+    const T0: &str = "2026-09-01T12:00:00.000Z";
+    const T2: &str = "2026-09-01T12:00:02.500Z";
+
+    /// An assistant record of response `message` holding one tool call, with its
+    /// usage. Synthetic.
+    fn call_line(repo: &str, message: &str, ts: &str, id: &str, block: serde_json::Value) -> String {
+        let mut block = block;
+        block["type"] = "tool_use".into();
+        block["id"] = id.into();
+        serde_json::json!({
+            "type": "assistant", "sessionId": "S1", "timestamp": ts, "version": "2.1.241",
+            "cwd": repo, "gitBranch": "main",
+            "message": { "id": message, "content": [block],
+                "usage": { "input_tokens": 3, "output_tokens": 40,
+                    "cache_read_input_tokens": 100, "cache_creation_input_tokens": 7 } }
+        })
+        .to_string()
+    }
+
+    fn result_line(ts: &str, id: &str, is_error: bool) -> String {
+        serde_json::json!({
+            "type": "user", "sessionId": "S1", "timestamp": ts,
+            "message": { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": id, "content": "SYNTHETIC-OUTPUT", "is_error": is_error }
+            ]}
+        })
+        .to_string()
+    }
+
+    fn bash(command: &str) -> serde_json::Value {
+        serde_json::json!({ "name": "Bash", "input": { "command": command } })
+    }
+
+    /// Writes `lines` as the transcript at `dir/rel`, last written `age_secs` ago.
+    fn write_transcript(dir: &std::path::Path, rel: &str, lines: &[String], age_secs: u64) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    fn detail_of(event: &ledger::LedgerEvent) -> serde_json::Value {
+        serde_json::from_str(event.detail_json.as_deref().unwrap()).unwrap()
+    }
+
+    const IDLE: u64 = 3600;
+
+    #[test]
+    fn a_command_is_recorded_with_what_its_result_said_and_how_long_it_took() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().to_str().unwrap();
+        let tdir = tempfile::tempdir().unwrap();
+        write_transcript(
+            tdir.path(),
+            "slug/S1.jsonl",
+            &[
+                call_line(repo, "m1", T0, "tu1", bash("cargo test")),
+                result_line(T2, "tu1", true),
+            ],
+            IDLE,
+        );
+        let out = with_transcript_root(tdir.path(), || ingest_transcripts(repo));
+        let events = ledger::tail(repo, 0, 10).unwrap();
+        let command = events.iter().find(|e| e.action == "session.command").expect("the command");
+        assert_eq!(command.outcome, "failed", "the result was flagged as an error");
+        assert_eq!(command.duration_ms, Some(2500));
+        let detail = detail_of(command);
+        assert_eq!(detail["result"], "error");
+        assert_eq!(detail["tool_use_id"], "tu1");
+        assert_eq!(detail["occurred_at"], T0, "dated by the call, not by its result");
+        assert!(!command.detail_json.as_deref().unwrap().contains("SYNTHETIC-OUTPUT"));
+        // The response's tokens, once.
+        let usage: Vec<_> = events.iter().filter(|e| e.action == "session.usage").collect();
+        assert_eq!(usage.len(), 1, "{events:?}");
+        assert_eq!(
+            detail_of(usage[0])["usage"],
+            serde_json::json!({ "input": 3, "output": 40, "cache_read": 100, "cache_creation": 7 })
+        );
+        assert_eq!(out.recorded, 2);
+    }
+
+    #[test]
+    fn a_call_whose_result_is_still_to_come_waits_and_is_then_recorded_with_it() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().to_str().unwrap();
+        let tdir = tempfile::tempdir().unwrap();
+        let call = call_line(repo, "m1", T0, "tu1", bash("sleep 5"));
+        // The agent is mid-command: the file was just written.
+        write_transcript(tdir.path(), "slug/S1.jsonl", &[call.clone()], 0);
+        with_transcript_root(tdir.path(), || {
+            let first = ingest_transcripts(repo);
+            assert_eq!(first.recorded, 0, "nothing is recorded without a result: {first:?}");
+            // The result arrives, as the same file grows.
+            write_transcript(
+                tdir.path(),
+                "slug/S1.jsonl",
+                &[call, result_line(T2, "tu1", false)],
+                0,
+            );
+            let second = ingest_transcripts(repo);
+            assert!(second.recorded >= 1, "{second:?}");
+        });
+        let events = ledger::tail(repo, 0, 10).unwrap();
+        let command = events.iter().find(|e| e.action == "session.command").expect("the command");
+        assert_eq!((command.outcome.as_str(), command.duration_ms), ("ok", Some(2500)));
+        assert_eq!(detail_of(command)["result"], "ok");
+        // And a later pass adds nothing: the held lines were read twice, the rows once.
+        let before = ledger::tail(repo, 0, 100).unwrap().len();
+        with_transcript_root(tdir.path(), || ingest_transcripts(repo));
+        assert_eq!(ledger::tail(repo, 0, 100).unwrap().len(), before);
+    }
+
+    #[test]
+    fn a_call_that_never_got_a_result_is_recorded_unobserved_once_the_file_is_still() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().to_str().unwrap();
+        let tdir = tempfile::tempdir().unwrap();
+        write_transcript(
+            tdir.path(),
+            "slug/S1.jsonl",
+            &[call_line(repo, "m1", T0, "tu1", bash("sleep 600"))],
+            IDLE,
+        );
+        with_transcript_root(tdir.path(), || ingest_transcripts(repo));
+        let events = ledger::tail(repo, 0, 10).unwrap();
+        let command = events.iter().find(|e| e.action == "session.command").expect("the command");
+        let detail = detail_of(command);
+        assert!(
+            detail.get("result").is_none(),
+            "a call never seen to finish carries no result, so it cannot read as a pass: {detail}"
+        );
+        assert_eq!(command.duration_ms, None);
+    }
+
+    #[test]
+    fn a_subagents_rows_name_the_subagent_and_keep_the_parents_session() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().to_str().unwrap();
+        let tdir = tempfile::tempdir().unwrap();
+        write_transcript(
+            tdir.path(),
+            "slug/S1/subagents/agent-a1b2c3.jsonl",
+            &[
+                call_line(repo, "m1", T0, "tu1", serde_json::json!({ "name": "Edit", "input": { "file_path": format!("{repo}/a.rs") } })),
+                result_line(T2, "tu1", false),
+            ],
+            IDLE,
+        );
+        write_transcript(
+            tdir.path(),
+            "slug/S1.jsonl",
+            &[
+                call_line(repo, "m9", T0, "tu9", serde_json::json!({ "name": "Edit", "input": { "file_path": format!("{repo}/b.rs") } })),
+                result_line(T2, "tu9", false),
+            ],
+            IDLE,
+        );
+        with_transcript_root(tdir.path(), || ingest_transcripts(repo));
+        let events = ledger::tail(repo, 0, 20).unwrap();
+        let by_object = |suffix: &str| {
+            events
+                .iter()
+                .find(|e| e.action == "session.edit" && e.object.as_deref().is_some_and(|o| o.ends_with(suffix)))
+                .unwrap()
+        };
+        assert_eq!(detail_of(by_object("a.rs"))["subagent_id"], "a1b2c3");
+        assert_eq!(by_object("a.rs").session_id.as_deref(), Some("S1"));
+        assert!(detail_of(by_object("b.rs")).get("subagent_id").is_none());
+        // The subagent's response is its own usage row, named for it.
+        let usage: Vec<_> = events.iter().filter(|e| e.action == "session.usage").collect();
+        assert_eq!(usage.len(), 2);
+        assert!(usage.iter().any(|e| detail_of(e)["subagent_id"] == "a1b2c3"));
     }
 
     #[test]
