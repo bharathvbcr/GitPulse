@@ -45,7 +45,9 @@ repositories beneath selected project roots, including repositories that are not
 open in GitPulse. Save roots, exclusions, retention, byte/target limits and an
 optional schedule. Defaults are off, 30-day retention, a weekly interval,
 10 GiB of attempted output and at most 20 directories per run. Inspect saved
-roots before an immediate run; incomplete inventories block cleanup.
+roots before an immediate run. An incomplete inventory does not block cleanup:
+what it could not read is reported and left alone, and the directories it read
+in full stay eligible.
 
 **Insights → Storage → Repository hygiene** provides individual expiring
 previews and tool-owned shared-cache maintenance. Its shared-cache review is
@@ -101,9 +103,24 @@ not followed. Repository inventory stops starting scans after 120 seconds or
 artifact cap and permission failures propagate as partial results. Returned
 counts describe inspected results, not an exhaustive machine inventory.
 
-A run requires a complete inventory, clean worktrees, readable task state with no
-active leases, producer evidence, ignored and untracked output, retention and
-fresh filesystem/activity checks. Git checks suppress configured filesystem-monitor
+Incompleteness is refused at the narrowest scope that the evidence supports, in
+three tiers. A **directory** whose own enumeration did not reach the end is never
+a removal candidate: its size is a floor and what the rest of it holds is
+unknown. A **repository** whose inventory could not be enumerated at all — a scan
+error, an untrusted repository, an ignore or tracked-file check that did not run,
+or artifacts cut off by the 512-candidate cap — has every one of its candidates
+dropped. The **run** refuses only when nothing is eligible and something could
+not be read; a complete scan that simply found nothing to remove is an ordinary
+successful run. A partial inventory is otherwise a statement about coverage and
+not a veto, so a permission failure in one directory, a repository past the
+linked-worktree sizing cap or a 65th artifact directory no longer stops the
+trees that were read in full from being cleaned. Every run that could not read
+everything reports `completed_with_skips` and names what it skipped, so a
+reduced-coverage run is never presented as complete.
+
+A run requires clean worktrees, readable task state with no active leases,
+producer evidence, ignored and untracked output, retention and fresh
+filesystem/activity checks. Git checks suppress configured filesystem-monitor
 hooks. Every deletion rechecks the saved revision and exclusions after the host
 policy gate. Attempts consume the byte budget even when execution fails.
 The user can select 1–100 targets, up to 1 TiB and 7–3,650 retention days through

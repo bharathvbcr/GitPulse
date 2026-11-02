@@ -71,3 +71,50 @@ fn walk_bench() {
     }
     println!("BENCH size_tree_us={size_ms} walk_worktree_us={walk_ms}");
 }
+
+/// Read-only diagnosis probe: runs a real `scan_storage` against
+/// `GITPULSE_SCAN_REPO` and prints every signal that feeds `scan.truncated`,
+/// so a "Partial repository scan" verdict can be attributed to a cause instead
+/// of guessed at. Run:
+/// `GITPULSE_SCAN_REPO=<repo> cargo test --lib scan_probe -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn scan_probe() {
+    let repo = std::env::var("GITPULSE_SCAN_REPO").expect("GITPULSE_SCAN_REPO");
+    // Session-scoped, in-process grant (`remember: false`): nothing is written
+    // to the owner's trust store and nothing changes in the app.
+    crate::test_support::trust_repo(Path::new(&repo));
+    let t = Instant::now();
+    let report = crate::storage::scan_storage(&repo).expect("scan");
+    let s = &report.scan;
+    println!(
+        "PROBE repo={repo}\n  elapsed={}ms truncated={} files_visited={} \
+         permission_denied={} unreadable={} non_utf8={} unaudited={}\n  \
+         artifacts={} (cap {}) worktrees_sized={} worktree_bytes={:.2}GiB",
+        t.elapsed().as_millis(),
+        s.truncated,
+        s.files_visited,
+        s.permission_denied,
+        s.unreadable,
+        s.non_utf8,
+        s.unaudited,
+        report.artifacts.len(),
+        MAX_ARTIFACT_DIRS,
+        report.worktrees.len(),
+        report.totals.worktree_bytes as f64 / (1u64 << 30) as f64,
+    );
+    for a in report.artifacts.iter().take(6) {
+        println!(
+            "  artifact {} bytes={:.2}GiB scan_complete={} unignored={} tracked={} unexamined={}",
+            a.path,
+            a.bytes as f64 / (1u64 << 30) as f64,
+            a.scan_complete,
+            a.unignored,
+            a.tracked_files,
+            a.checks_unexamined
+        );
+    }
+    for wt in &report.worktrees {
+        println!("  worktree {} truncated={}", wt.name, wt.truncated);
+    }
+}

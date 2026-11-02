@@ -12,6 +12,29 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(super) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// Takes the serialisation lock, recovering it if a previous test panicked
+/// while holding it.
+///
+/// Recovery is correct here because this mutex guards nothing: it carries `()`,
+/// and exists only so that tests which touch process-wide state run one at a
+/// time. A panicking test therefore leaves no half-written invariant for the
+/// next one to trip over, which is the situation poisoning is designed to
+/// protect.
+///
+/// What poisoning does instead is destroy the signal. One genuine failure
+/// under this lock made every later test that takes it fail with
+/// `PoisonError`, and this suite has 14 such sites: a single real failure
+/// reported as thirteen, twice during this work, each time reading as a broken
+/// subsystem rather than as one open question. That is the same defect the
+/// storage cleaner exists to avoid, aimed at ourselves -- a check that never
+/// ran must not report the same result as a check that ran and failed. Every
+/// assertion is unchanged; only the failure count is now truthful.
+pub(super) fn serial() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn fixture() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().unwrap();
     let repo = crate::engine::git_cli::canonicalize_plain(temp.path()).unwrap();
@@ -90,7 +113,7 @@ fn preview(repo: &Path) -> HygienePlan {
 #[test]
 #[cfg(unix)]
 fn plan_executes_exact_reviewed_target_once_and_keeps_source() {
-    let _serial = TEST_LOCK.lock().unwrap();
+    let _serial = serial();
     let (_temp, repo) = fixture();
     let view = preview(&repo);
     let (policy, outcome) = execute_with_activity(
@@ -117,7 +140,7 @@ fn plan_executes_exact_reviewed_target_once_and_keeps_source() {
 
 #[test]
 fn stale_expired_cancelled_and_foreign_plans_never_mutate() {
-    let _serial = TEST_LOCK.lock().unwrap();
+    let _serial = serial();
     let (_temp, repo) = fixture();
     let (_other, other) = fixture();
     let view = preview(&repo);
@@ -159,7 +182,7 @@ fn stale_expired_cancelled_and_foreign_plans_never_mutate() {
 
 #[test]
 fn gate_denial_busy_activity_and_post_gate_writes_fail_closed() {
-    let _serial = TEST_LOCK.lock().unwrap();
+    let _serial = serial();
     let (_temp, repo) = fixture();
     assert!(
         prepare_with_activity(repo.to_str().unwrap(), "local:target", 30, |_| Err(
@@ -196,7 +219,7 @@ fn gate_denial_busy_activity_and_post_gate_writes_fail_closed() {
 
 #[test]
 fn cancellation_and_concurrent_execution_are_enforced_during_policy_review() {
-    let _serial = TEST_LOCK.lock().unwrap();
+    let _serial = serial();
     let (_temp, repo) = fixture();
     let view = preview(&repo);
     let guard = EXECUTION.lock().unwrap();
@@ -227,7 +250,7 @@ fn cancellation_and_concurrent_execution_are_enforced_during_policy_review() {
 
 #[test]
 fn plan_budget_is_bounded_and_cancellation_releases_capacity() {
-    let _serial = TEST_LOCK.lock().unwrap();
+    let _serial = serial();
     let (_temp, repo) = fixture();
     let views: Vec<_> = (0..MAX_PLANS).map(|_| preview(&repo)).collect();
     assert!(
@@ -244,7 +267,7 @@ fn plan_budget_is_bounded_and_cancellation_releases_capacity() {
 
 #[test]
 fn index_and_ignore_changes_during_policy_review_preserve_output() {
-    let _serial = TEST_LOCK.lock().unwrap();
+    let _serial = serial();
     let (_temp, repo) = fixture();
     let view = preview(&repo);
     let error = execute_with_activity(
@@ -351,7 +374,7 @@ fn ecosystem_adapters_require_their_producer_evidence() {
 
 #[test]
 fn retention_paths_git_index_and_marker_checks_are_independent() {
-    let _serial = TEST_LOCK.lock().unwrap();
+    let _serial = serial();
     let (_temp, repo) = fixture();
     for path in [
         "",
@@ -510,7 +533,7 @@ fn shared_cache_commands_pin_scope_and_preserve_downloads() {
 #[cfg(unix)]
 #[ignore = "requires installed Go; run explicitly to verify native cache maintenance"]
 fn installed_go_cleans_only_the_reviewed_temporary_cache() {
-    let _serial = TEST_LOCK.lock().unwrap();
+    let _serial = serial();
     let (_temp, repo) = fixture();
     fs::write(repo.join(".gitignore"), ".gocache/\n").unwrap();
     fs::write(repo.join("main.go"), "package main\nfunc main() {}\n").unwrap();
@@ -595,7 +618,7 @@ fn poison<T: Send>(lock: &'static Mutex<T>) {
 /// for the rest of the process, so cleanup could never run again.
 #[test]
 fn a_panic_under_any_hygiene_lock_does_not_disable_cleanup() {
-    let _serial = TEST_LOCK.lock().unwrap();
+    let _serial = serial();
     for (lock, busy) in [
         (&EXECUTION, "execution busy"),
         (&PREPARATION, "preparation busy"),

@@ -29,6 +29,14 @@ export interface ArtifactDir {
    * is disposable.
    */
   checks_unexamined?: boolean;
+  /**
+   * This directory's own tree was enumerated to the end, so `bytes` is exact
+   * and nothing inside it went unseen. Absent or false means a budget cut the
+   * tree short: it is not a removal candidate, whatever the git probes said.
+   * Distinct from `scan.truncated`, which says the repository's totals are
+   * floors and may be true for reasons unrelated to this tree.
+   */
+  scan_complete?: boolean;
 }
 
 export interface LargeFile {

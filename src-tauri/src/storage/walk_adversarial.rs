@@ -264,11 +264,11 @@ fn break_non_utf8_artifact_path_does_not_resolve_to_the_directory() {
     let mut collector = ArtifactCollector::new();
     collector.on_dir_enter(&abs, &rel, "node_modules");
     collector.on_file(4096);
-    let (found_rel, _, found_abs, bytes) = &collector.found[0];
-    assert_eq!(*bytes, 4096);
+    let found = &collector.found[0];
+    assert_eq!(found.bytes, 4096);
     assert_eq!(
-        root.join(found_rel),
-        *found_abs,
+        root.join(&found.rel),
+        found.abs,
         "the artifact's repo-relative path must name the directory that was measured"
     );
 }

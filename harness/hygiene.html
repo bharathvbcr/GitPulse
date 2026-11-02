@@ -45,9 +45,10 @@
     throw Error(`Unexpected IPC ${cmd}`);
   }};
   const report={repo_path:"/fixture/repo",reclaim:[],scan:{truncated:false},artifacts:[
-    {path:"src-tauri/target",bytes:1200000000,kind:"build",tracked_files:0,unignored:false},
-    {path:"coverage",bytes:12000,kind:"cache",tracked_files:1,unignored:false},
-    {path:"__pycache__",bytes:9000,kind:"cache",tracked_files:0,unignored:true}
+    {path:"src-tauri/target",bytes:1200000000,kind:"build",tracked_files:0,unignored:false,scan_complete:true},
+    {path:"coverage",bytes:12000,kind:"cache",tracked_files:1,unignored:false,scan_complete:true},
+    {path:"__pycache__",bytes:9000,kind:"cache",tracked_files:0,unignored:true,scan_complete:true},
+    {path:"tmp/half-read",bytes:44000,kind:"build",tracked_files:0,unignored:false,scan_complete:false}
   ]};
   const preview=()=>({id:`plan-${++generation}`,repo_path:report.repo_path,target:"local:src-tauri/target",label:"Rust / Cargo",path:"/fixture/repo/src-tauri/target",scope:"repository",command:"Remove reviewed output",bytes:1200000000,files:231,expires_at:Math.floor(Date.now()/1000)+300,warning:"Removes the reviewed generated files permanently. Rebuilding costs time."});
   const verdict={status:"unchecked",checked:false,target:"fixture",rule:"",severity:"",reason:"fixture: gate unavailable",demoted:"",grant_id:"",granted_by:"",widened:"",degraded:[],task_id:"",detail:"",detail_code:""};
@@ -62,6 +63,8 @@
     check("inventory is opt in",calls.length===0);
     check("tracked output is preserved",[...root.querySelectorAll("button")].filter(b=>b.textContent.includes("Preview cleanup"))[1].disabled);
     check("unignored output requires a rule",[...root.querySelectorAll("button")].filter(b=>b.textContent.includes("Preview cleanup"))[2].disabled);
+    check("a tree the walk did not finish is preserved",[...root.querySelectorAll("button")].filter(b=>b.textContent.includes("Preview cleanup"))[3].disabled);
+    check("and says why it was not read in full",root.textContent.includes("Not read in full"));
     check("an ignore rule can be copied",!!button("Copy ignore rule"));
     selectPreview();await settle();const first=take("cmd_hygiene_prepare");
     check("preview uses repository identity",first.args.repoPath===report.repo_path);

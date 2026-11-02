@@ -184,7 +184,9 @@
   let hygieneGaps = $derived.by(() => {
     const current = report;
     if (!current) return [] as ArtifactDir[];
-    return current.artifacts.filter((a) => a.unignored || a.tracked_files > 0 || a.checks_unexamined);
+    return current.artifacts.filter(
+      (a) => a.unignored || a.tracked_files > 0 || a.checks_unexamined || !a.scan_complete,
+    );
   });
 
   function artifactBar(bytes: number): number {
@@ -258,6 +260,7 @@
       for (const a of current.artifacts) {
         const flags = [
           a.checks_unexamined ? "NOT CHECKED" : a.unignored ? "NOT IGNORED" : null,
+          a.scan_complete ? null : "NOT READ IN FULL",
           a.tracked_files > 0 ? `${a.tracked_files} tracked` : null,
         ]
           .filter(Boolean)
@@ -456,6 +459,9 @@
                 {:else if artifact.unignored}
                   <span class="text-[10px] uppercase font-semibold text-amber-300">not ignored</span>
                 {/if}
+                {#if !artifact.scan_complete}
+                  <span class="text-[10px] uppercase font-semibold text-amber-300">not read in full</span>
+                {/if}
                 {#if artifact.tracked_files > 0}
                   <span class="text-[10px] uppercase font-semibold text-rose-300">
                     {artifact.tracked_files} file{artifact.tracked_files === 1 ? "" : "s"} committed
@@ -466,6 +472,10 @@
               {#if artifact.checks_unexamined}
                 <p class="mt-1 text-[11px] text-textMuted">
                   Git did not answer whether this directory is ignored or tracked, so it is not treated as disposable.
+                </p>
+              {:else if !artifact.scan_complete}
+                <p class="mt-1 text-[11px] text-textMuted">
+                  The walk did not reach the end of this directory, so its size is a floor and what the rest of it holds is unknown.
                 </p>
               {:else if artifact.unignored}
                 <p class="mt-1 text-[11px] text-textMuted">
@@ -662,7 +672,7 @@
                   ></div>
                 </div>
                 <span class="font-mono text-textSecondary w-20 text-right">{humanBytes(artifact.bytes)}</span>
-                {#if artifact.checks_unexamined}<span title="Git did not answer whether this directory is ignored or tracked"><AlertTriangle size={12} class="text-amber-300" /></span>{:else if artifact.unignored}<span title="Not covered by .gitignore"><AlertTriangle size={12} class="text-amber-300" /></span>{/if}
+                {#if artifact.checks_unexamined}<span title="Git did not answer whether this directory is ignored or tracked"><AlertTriangle size={12} class="text-amber-300" /></span>{:else if !artifact.scan_complete}<span title="The walk did not reach the end of this directory, so its size is a floor"><AlertTriangle size={12} class="text-amber-300" /></span>{:else if artifact.unignored}<span title="Not covered by .gitignore"><AlertTriangle size={12} class="text-amber-300" /></span>{/if}
                 {#if artifact.tracked_files > 0}
                   <span class="text-[10px] font-mono text-rose-300" title="Committed files inside an artifact directory">
                     {artifact.tracked_files}✓

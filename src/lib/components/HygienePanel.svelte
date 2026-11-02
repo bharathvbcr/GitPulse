@@ -217,10 +217,11 @@
           <FolderTree size={12} class="text-textMuted" /><span class="flex-1 min-w-32 font-mono break-all">{artifact.path}</span>
           <span class="text-textMuted">{humanBytes(artifact.bytes)}</span>
           {#if artifact.checks_unexamined}<span class="text-amber-300">Ignore check did not run</span>{/if}
+          {#if !artifact.scan_complete}<span class="text-amber-300" title="The walk did not reach the end of this directory, so its size is a floor and what the rest of it holds is unknown">Not read in full</span>{/if}
           {#if artifact.tracked_files > 0}<span class="text-amber-300">{artifact.tracked_files} tracked · preserved</span>{/if}
           {#if artifact.unignored && artifact.tracked_files === 0 && !artifact.checks_unexamined}<button class="gp-btn" onclick={() => copyIgnore(artifact.path)}>Copy ignore rule</button>{/if}
           {#if blocked}<span class="text-amber-300" title={blocked}>Preserved · review required</span>{/if}
-          <button class="gp-btn" disabled={busy || executing || scanning || artifact.tracked_files > 0 || artifact.unignored || artifact.checks_unexamined || !!blocked} onclick={() => preview(`local:${artifact.path}`)}>Preview cleanup</button>
+          <button class="gp-btn" disabled={busy || executing || scanning || !artifact.scan_complete || artifact.tracked_files > 0 || artifact.unignored || artifact.checks_unexamined || !!blocked} onclick={() => preview(`local:${artifact.path}`)}>Preview cleanup</button>
         </div>
       {:else}<p class="py-2 text-xs text-textMuted">No build or cache directories were found in this scan.</p>{/each}
     </div>
