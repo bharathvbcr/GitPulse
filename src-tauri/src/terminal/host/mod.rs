@@ -5,12 +5,14 @@
 //! engine the app runs in-process and answers one connected app over a private
 //! unix socket ([`proto`]); [`client`] is the app's side, behind the unchanged
 //! `terminal::` functions; [`receipts`] keeps every exit on disk until an app
-//! has recorded it.
+//! has recorded it; [`transcripts`] keeps each session's output on disk, bounded,
+//! so it can be read after the session is gone.
 
 pub mod client;
 pub mod proto;
 mod receipts;
 pub mod server;
+mod transcripts;
 
 use std::path::PathBuf;
 
@@ -22,6 +24,8 @@ pub const BINARY: &str = "gitpulse-ptyd";
 pub const BINARY_ENV: &str = "GITPULSE_PTYD";
 /// Where receipts live inside the host directory.
 const RECEIPTS_DIR: &str = "receipts";
+/// Where each session's saved output lives inside the host directory.
+const TRANSCRIPTS_DIR: &str = "transcripts";
 
 /// The host directory in GitPulse's config directory.
 pub fn default_dir() -> Option<PathBuf> {

@@ -107,6 +107,31 @@ pub async fn cmd_terminal_context(
     .await
 }
 
+/// The newest `max_bytes` of a session's saved output (default and ceiling:
+/// `MAX_TRANSCRIPT_TAIL_BYTES`), for a session still running or one that has
+/// ended, including one that ended before the app or the terminal host
+/// restarted. Read-only: it never attaches. `redact` masks secrets in the
+/// host before the bytes leave it. The answer says which of found, missing,
+/// unreadable (and why) and unavailable (no host) it is; see
+/// `terminal::TranscriptRead`.
+#[tauri::command(async)]
+pub async fn cmd_terminal_transcript(
+    state: State<'_, crate::terminal::TerminalSessions>,
+    session_id: String,
+    max_bytes: Option<usize>,
+    redact: Option<bool>,
+) -> Result<crate::terminal::TranscriptRead, String> {
+    crate::terminal::control_async(&state, "terminal_transcript", move |state| {
+        crate::terminal::session_transcript(
+            state,
+            &session_id,
+            max_bytes.unwrap_or(crate::terminal::MAX_TRANSCRIPT_TAIL_BYTES),
+            redact.unwrap_or(false),
+        )
+    })
+    .await
+}
+
 /// Every live terminal session, including ones started by a page that has
 /// since been reloaded — which the renderer cannot otherwise know exist, and
 /// which still count against the shared session limit.

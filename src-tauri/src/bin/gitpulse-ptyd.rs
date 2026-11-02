@@ -7,7 +7,7 @@
 //! `docs/TERMINAL_HOST.md`.
 //!
 //! It is not meant to be run by hand, but it can be: `--dir` names the host
-//! directory (socket, lock, receipts), and a host with no app and no sessions
+//! directory (socket, lock, receipts, transcripts), and a host with no app and no sessions
 //! for `--idle-exit-ms` exits on its own.
 
 use std::time::Duration;

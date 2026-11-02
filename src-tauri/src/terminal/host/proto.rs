@@ -18,7 +18,10 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// What this build speaks. Bumped whenever a frame changes shape or meaning.
-pub const PROTOCOL: u32 = 2;
+/// 3 added `Request::Transcript`: a host of protocol 2 ends the connection of
+/// an app that sends a request it cannot decode, and the socket name carries
+/// the protocol, so the two never meet.
+pub const PROTOCOL: u32 = 3;
 
 /// Longest JSON header accepted. A spawn request (argv and environment are
 /// bounded at 128 KiB each by `validate_pty_options`) is the largest a caller
@@ -109,6 +112,15 @@ pub enum Request {
     },
     Release {
         session: String,
+    },
+    /// The newest `max_bytes` of the session's saved output, read-only: live
+    /// or finished, it never attaches. Answered with `terminal::TranscriptRead`.
+    /// `redact` masks secrets in the host before the bytes leave it.
+    Transcript {
+        session: String,
+        max_bytes: usize,
+        #[serde(default)]
+        redact: bool,
     },
 }
 
@@ -425,6 +437,85 @@ mod tests {
             reply,
             serde_json::json!({"kind": "reply", "id": 1, "ok": {"protocol": 9, "build": "b", "pid": 4, "sessions": 2}})
         );
+    }
+
+    /// The transcript read is new in protocol 3, so a host and an app of
+    /// different protocols never exchange it: the socket they would meet on is
+    /// named for the protocol.
+    #[test]
+    fn the_transcript_request_has_a_pinned_shape_and_lives_on_protocol_three() {
+        assert_eq!(PROTOCOL, 3);
+        assert_ne!(
+            crate::terminal::host::socket_name(PROTOCOL),
+            crate::terminal::host::socket_name(2)
+        );
+        let request = serde_json::to_value(Envelope {
+            id: 9,
+            request: Request::Transcript {
+                session: "term-1-a".into(),
+                max_bytes: 4096,
+                redact: true,
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            request,
+            serde_json::json!({"id": 9, "op": "transcript", "session": "term-1-a", "max_bytes": 4096, "redact": true})
+        );
+        // `redact` is optional on the wire: left out it is off.
+        let bare: Envelope = serde_json::from_value(
+            serde_json::json!({"id": 1, "op": "transcript", "session": "term-1-a", "max_bytes": 10}),
+        )
+        .unwrap();
+        assert_eq!(
+            bare.request,
+            Request::Transcript {
+                session: "term-1-a".into(),
+                max_bytes: 10,
+                redact: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_transcript_answer_names_which_of_its_states_it_is() {
+        use crate::terminal::{TranscriptRead, TranscriptTail};
+        for (answer, state) in [
+            (TranscriptRead::Missing, "missing"),
+            (
+                TranscriptRead::Unreadable {
+                    reason: "denied".into(),
+                },
+                "unreadable",
+            ),
+            (
+                TranscriptRead::Unavailable {
+                    reason: "in-process".into(),
+                },
+                "unavailable",
+            ),
+            (
+                TranscriptRead::Found(TranscriptTail {
+                    data_b64: "aGk=".into(),
+                    bytes: 2,
+                    retained: 2,
+                    truncated: false,
+                    gap_markers: 0,
+                    redacted: false,
+                    live: false,
+                    settled: true,
+                    recording_error: None,
+                }),
+                "found",
+            ),
+        ] {
+            let wire = serde_json::to_value(&answer).unwrap();
+            assert_eq!(wire["state"], state);
+            assert_eq!(
+                serde_json::from_value::<TranscriptRead>(wire).unwrap(),
+                answer
+            );
+        }
     }
 
     #[test]

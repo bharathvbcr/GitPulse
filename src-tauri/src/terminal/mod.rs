@@ -28,6 +28,7 @@ mod jobs;
 mod readiness;
 mod ring;
 mod sink;
+mod transcript;
 pub use events::{AppEvents, SessionEnded, SessionEvents};
 use executor::Executor;
 use flow::{OutputFlow, Route};
@@ -44,6 +45,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::AppHandle;
+pub use transcript::{TranscriptRead, TranscriptTail, MAX_TRANSCRIPT_TAIL_BYTES};
 
 /// Bounds for one-shot command execution timeout.
 const MIN_RUN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -378,6 +380,9 @@ pub struct TerminalSessions {
     /// them running (a crash, a signal, or a quit that chose to), or stop them.
     /// Meaningless in-process, where a session cannot outlive the app.
     leave_running: Arc<AtomicBool>,
+    /// Copies of a starting session's output that the terminal host armed
+    /// (`host::transcripts`). Always empty in the app's own engine.
+    ring_taps: Arc<ring::Taps>,
 }
 
 impl Default for TerminalSessions {
@@ -398,6 +403,7 @@ impl Default for TerminalSessions {
             #[cfg(unix)]
             host: None,
             leave_running: Arc::new(AtomicBool::new(false)),
+            ring_taps: Arc::default(),
         }
     }
 }
@@ -1507,6 +1513,26 @@ pub fn session_context(
     }
 }
 
+/// The newest `max_bytes` of a session's saved output, live or finished. Only
+/// the terminal host keeps a transcript (`host::transcripts`); the app's own
+/// engine says so rather than answering as if it had looked. `redact` masks
+/// secrets in the host, before the bytes leave it.
+pub fn session_transcript(
+    state: &TerminalSessions,
+    session_id: &str,
+    max_bytes: usize,
+    redact: bool,
+) -> Result<TranscriptRead, String> {
+    #[cfg(unix)]
+    if let Some(host) = &state.host {
+        return host.transcript(session_id, max_bytes, redact);
+    }
+    let _ = (state, session_id, max_bytes, redact);
+    Ok(TranscriptRead::Unavailable {
+        reason: "Terminal output is saved only when terminals are kept running by the terminal host (Settings > Agents); this app is running them itself.".into(),
+    })
+}
+
 /// Whether this process still holds the PTY session of `run_id`, dead or not.
 ///
 /// Unlike `attach_tracked_session`, a session whose child has already exited still
@@ -2197,7 +2223,10 @@ pub(crate) fn start_session(
     let hidden = Arc::new(AtomicBool::new(false));
     let master = Arc::new(Mutex::new(pair.master));
     let closing = Arc::new(AtomicUsize::new(0));
-    let ring = Arc::new(Mutex::new(ring::Ring::default()));
+    let ring = Arc::new(Mutex::new(ring::Ring::for_session(
+        &state.ring_taps,
+        &session_id,
+    )));
     let (input, geometry) = session_lanes();
     let entry = SessionEntry {
         master: master.clone(),

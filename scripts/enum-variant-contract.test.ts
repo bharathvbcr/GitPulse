@@ -30,6 +30,10 @@ const TS_ROOT = fileURLToPath(new URL("../src/", import.meta.url));
  * fine" — if a UI starts comparing these strings, it needs the named type.
  */
 const NO_TS_MIRROR = new Map<string, string>([
+  [
+    "TranscriptRead",
+    "internally tagged enum, not a unit enum; `parseSavedTranscript` in src/lib/terminal/savedTranscript.ts refuses any `state` but the four, pinned by savedTranscript.test.ts and the proto round-trip test",
+  ],
   ["CoverageFormat", "the frontend renders `format` as an opaque label and never branches on it"],
   [
     "LandedVia",

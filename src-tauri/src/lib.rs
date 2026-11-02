@@ -543,6 +543,7 @@ pub fn run() {
             cmd_terminal_backend,
             cmd_terminal_context,
             cmd_terminal_sessions,
+            cmd_terminal_transcript,
             cmd_terminal_attach,
             cmd_terminal_detach,
             cmd_terminal_run,

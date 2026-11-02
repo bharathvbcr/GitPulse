@@ -693,6 +693,26 @@ impl HostClient {
         self.call(Request::List, CALL_DEADLINE)
     }
 
+    /// The newest `max_bytes` of `session`'s saved output, from the host's
+    /// disk: a live session's, a finished one's, or one a host that has since
+    /// restarted wrote. Read-only; it never attaches. The wait is the call
+    /// deadline, which covers the host finishing the writes it had queued.
+    pub fn transcript(
+        &self,
+        session: &str,
+        max_bytes: usize,
+        redact: bool,
+    ) -> Result<crate::terminal::TranscriptRead, String> {
+        self.call(
+            Request::Transcript {
+                session: session.to_owned(),
+                max_bytes,
+                redact,
+            },
+            CALL_DEADLINE,
+        )
+    }
+
     pub fn context(&self, session: &str) -> Result<TerminalContext, String> {
         self.call(
             Request::Context {

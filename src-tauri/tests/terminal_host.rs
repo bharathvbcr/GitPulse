@@ -552,3 +552,110 @@ fn a_host_that_answers_with_another_protocol_is_refused_by_name() {
     );
     assert!(!state.host_trouble().is_empty());
 }
+
+fn transcript_text(
+    state: &TerminalSessions,
+    session: &str,
+) -> (String, gitpulse_lib::terminal::TranscriptTail) {
+    match gitpulse_lib::terminal::session_transcript(state, session, 64 * 1024, false).unwrap() {
+        gitpulse_lib::terminal::TranscriptRead::Found(tail) => (
+            String::from_utf8_lossy(&STANDARD.decode(&tail.data_b64).unwrap()).into_owned(),
+            tail,
+        ),
+        other => panic!("expected a transcript for {session}, got {other:?}"),
+    }
+}
+
+/// A finished run's output outlives the app that ran it and the host that held
+/// it: the host exits when it has no app and no sessions, and a host started
+/// afterwards reads what the first one wrote.
+#[test]
+fn a_finished_sessions_output_is_read_back_after_the_app_and_the_host_restart() {
+    let dir = host_dir();
+    let repo = repo();
+    let first = App::new(dir.path());
+    let id = first.shell(
+        repo.path(),
+        "printf 'line-one\\n'; printf 'line-two\\n'; exit 3",
+    );
+    let exit = first.exit_of(&id, Duration::from_secs(10));
+    assert_eq!(exit["exit_code"], 3);
+    let (text, tail) = transcript_text(&first.state, &id);
+    assert!(
+        text.contains("line-one") && text.contains("line-two"),
+        "{text:?}"
+    );
+    assert!(!tail.truncated && tail.gap_markers == 0);
+    // The exit event is sent from the reader just before it lets go of the
+    // session's ring, which is what ends the transcript.
+    assert!(wait_for(Duration::from_secs(5), || !transcript_text(
+        &first.state,
+        &id
+    )
+    .1
+    .live));
+    let host = first.state.host_pid().expect("a host");
+    gitpulse_lib::teardown::close_terminals(&first.state);
+    drop(first);
+    // SAFETY: signal 0 only asks whether the process exists.
+    let gone = || unsafe { libc::kill(host as i32, 0) } != 0;
+    assert!(
+        wait_for(Duration::from_secs(20), gone),
+        "the idle host should have exited"
+    );
+
+    let next = App::new(dir.path());
+    let _stop = Stop(next.state.clone());
+    let (again, _) = transcript_text(&next.state, &id);
+    assert_eq!(
+        again, text,
+        "the same output, from a different host process"
+    );
+    assert_ne!(next.state.host_pid(), Some(host));
+    assert_eq!(
+        gitpulse_lib::terminal::session_transcript(&next.state, "term-1-1", 100, false).unwrap(),
+        gitpulse_lib::terminal::TranscriptRead::Missing,
+        "a session the host never ran is missing, not unreadable"
+    );
+}
+
+/// Output printed while no app was connected is in the transcript: the copy is
+/// taken from the ring, which sees held output as well as delivered.
+#[test]
+fn output_printed_while_no_app_was_there_is_in_the_transcript() {
+    let dir = host_dir();
+    let repo = repo();
+    let first = App::new(dir.path());
+    let id = first.shell(
+        repo.path(),
+        "printf 'before\\n'; sleep 1; printf 'while-away\\n'; read x",
+    );
+    assert!(wait_for(Duration::from_secs(10), || first
+        .text(&id)
+        .contains("before")));
+    gitpulse_lib::teardown::close_terminals(&first.state);
+    drop(first);
+    std::thread::sleep(Duration::from_millis(2500));
+
+    let next = App::new(dir.path());
+    let _stop = Stop(next.state.clone());
+    let (text, tail) = transcript_text(&next.state, &id);
+    assert!(
+        text.contains("before") && text.contains("while-away"),
+        "{text:?}"
+    );
+    assert!(tail.live, "the session is still running");
+}
+
+/// An app that runs terminals itself keeps no transcript, and says that rather
+/// than answering "missing".
+#[test]
+fn the_in_process_engine_says_it_keeps_no_transcript() {
+    let state = TerminalSessions::default();
+    match gitpulse_lib::terminal::session_transcript(&state, "term-1-1", 100, false).unwrap() {
+        gitpulse_lib::terminal::TranscriptRead::Unavailable { reason } => {
+            assert!(reason.contains("terminal host"), "{reason}")
+        }
+        other => panic!("{other:?}"),
+    }
+}
