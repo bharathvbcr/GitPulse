@@ -375,6 +375,30 @@ const sentTo = cmd => sent.filter(s => s.cmd === cmd);
   harnessStore.activateRepository(A);
   await until(() => button("Lock lane"), "A's rows back after the failed remove");
 
+  // squash on the armed merge: on by default for an attempt branch, off for any other, and what is sent is what the box says
+  const squashBox = () => [...document.querySelectorAll('input[type="checkbox"]')].find(box => box.closest("label")?.textContent.includes("Squash into one commit"));
+  const mergesBefore = sentTo("cmd_worktree_merge_teardown").length;
+  check("the merge of a plain branch that no one asked to squash, sent earlier in this run, kept its commits",() => sentTo("cmd_worktree_merge_teardown")[0].squash === false);
+  button("Merge att into the default branch and remove it").click();
+  await until(() => squashBox(), "squash choice shown with the armed merge");
+  check("an attempt branch's armed merge has squash on, and still reads Press merge again to confirm", () => squashBox().checked === true && document.body.textContent.includes("Press merge again to confirm"));
+  button("Merge att into the default branch and remove it").click();
+  await until(() => sentTo("cmd_worktree_merge_teardown").length === mergesBefore + 1, "attempt merge sent");
+  await until(() => busy() === 0, "attempt merge settled");
+  check("and the attempt branch is sent squashed, held to the tip the row showed", () => sentTo("cmd_worktree_merge_teardown")[mergesBefore].squash === true && sentTo("cmd_worktree_merge_teardown")[mergesBefore].worktreePath === `${A}/.claude/worktrees/att` && sentTo("cmd_worktree_merge_teardown")[mergesBefore].expectedTip === "c".repeat(40));
+  await until(() => button("Merge lane into the default branch and remove it"), "rows back after the attempt merge");
+  button("Merge lane into the default branch and remove it").click();
+  await until(() => squashBox(), "squash choice shown for the plain branch");
+  check("a plain branch's armed merge has squash off", () => squashBox().checked === false);
+  squashBox().click();
+  await wait(60);
+  check("choosing it keeps the confirm armed", () => squashBox()?.checked === true && document.body.textContent.includes("Press merge again to confirm"));
+  button("Merge lane into the default branch and remove it").click();
+  await until(() => sentTo("cmd_worktree_merge_teardown").length === mergesBefore + 2, "plain branch merge sent");
+  await until(() => busy() === 0, "plain branch merge settled");
+  check("and the plain branch is sent squashed because the reader asked", () => sentTo("cmd_worktree_merge_teardown")[mergesBefore + 1].squash === true && sentTo("cmd_worktree_merge_teardown")[mergesBefore + 1].worktreePath.endsWith("/lane"));
+  await until(() => button("Lock lane"), "A's rows back after the squash merges");
+
   // attemptWorktree: the main checkout's tab is captured before the confirm
   const ATT = `${A}/.claude/worktrees/att`;
   const attempt = { id: "att", cwd: ATT, state: "exited", expires_at: 0 };

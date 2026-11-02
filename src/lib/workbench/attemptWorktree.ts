@@ -21,10 +21,11 @@
 import { get } from "svelte/store";
 import { invoke } from "../ipc/invoke";
 import { interfaceStore } from "../stores/interfaceStore";
-import { askConfirm } from "../stores/modalStore";
+import { askChoice, askConfirm } from "../stores/modalStore";
 import { repoStore, type MutationOutcome, type MutationTarget, type ResolvedRepo } from "../stores/repoStore";
 import type { MergeTeardownResult, WorktreeInfo } from "../branches/types";
 import { MergeTeardownFailure, readMergeTeardownError } from "../branches/mergeTeardown";
+import { MERGE_MODES } from "../branches/mergeSelection";
 import { familyFromCommonDir } from "../repos/repoFamily";
 import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
 import { formatError } from "../ui/formatError";
@@ -33,6 +34,7 @@ import { isAttemptWorktree } from "./taskSessions";
 import { runHoldsCheckout } from "./taskHandoff";
 import { listAllLiveRuns, type TaskRun } from "./client";
 import { liveRunIn } from "./liveRun";
+import { ATTEMPT_BRANCH_PREFIX, squashesByDefault } from "./attemptBranch";
 
 type AttemptRef = Pick<TaskRun, "id" | "cwd" | "state" | "expires_at">;
 
@@ -142,6 +144,29 @@ export async function reviewAttemptChanges(run: Pick<TaskRun, "cwd">): Promise<v
 /** The outcome of an after-run action, as the row says it. `null`: the reader declined. */
 export type WorktreeActionResult = { message: string } | null;
 
+const SQUASH_MODE = MERGE_MODES.find((mode) => mode.mode === "squash");
+
+/**
+ * Asks how to land `branch` into `target`: the one confirm the merge needs,
+ * with squash as its other way (wording from `mergeSelection.ts`). The default
+ * answer is the primary button. Resolves whether to squash, or null when the
+ * reader declined.
+ */
+async function askHowToMerge(question: { branch: string; target: string; detail: string; destructive: boolean }): Promise<boolean | null> {
+  if (!SQUASH_MODE) throw new Error("The squash merge mode is missing from the merge options.");
+  const defaultSquash = squashesByDefault(question.branch);
+  const plain = `Merge into ${question.target}`;
+  const answer = await askChoice({
+    title: `Merge into ${question.target}?`,
+    message: `Merges ${question.detail}\n${SQUASH_MODE.label}: ${SQUASH_MODE.detail}`,
+    confirmLabel: defaultSquash ? SQUASH_MODE.label : plain,
+    alternateLabel: defaultSquash ? plain : SQUASH_MODE.label,
+    destructive: question.destructive,
+  });
+  if (answer === null) return null;
+  return (answer === "confirm") === defaultSquash;
+}
+
 /**
  * Merges the attempt's branch into the main checkout's branch and removes
  * the worktree, through the same host command the Worktrees panel uses.
@@ -154,18 +179,18 @@ export async function mergeAttemptWorktree(run: AttemptRef): Promise<WorktreeAct
   if (!own.branch) throw new Error("This worktree is not on a branch, so there is nothing to merge.");
   const target = main?.branch ?? null;
   if (!target) throw new Error("The main checkout is not on a branch, so there is nothing to merge into.");
-  const approved = await askConfirm({
-    title: `Merge into ${target}?`,
-    message: `Merges ${own.branch} into ${target} in ${root}, then removes the worktree at ${run.cwd} and its branch. ${changesClause(own.dirty_files)}`,
-    confirmLabel: `Merge into ${target}`,
+  const squash = await askHowToMerge({
+    branch: own.branch,
+    target,
+    detail: `${own.branch} into ${target} in ${root}, then removes the worktree at ${run.cwd} and its branch. ${changesClause(own.dirty_files)}`,
     destructive: (own.dirty_files ?? 0) > 0,
   });
-  if (!approved) return null;
+  if (squash === null) return null;
   if (!(await repoStore.trustRepo(run.cwd))) return null;
   const mutationTarget = await mainCheckoutTarget(root, known);
-  const merged = await mergeAndTeardown(mutationTarget, run.cwd, target, own.head);
+  const merged = await mergeAndTeardown(mutationTarget, run.cwd, target, own.head, squash);
   if (merged.worktree_removed) await closeStranded(run.cwd);
-  const parts = [mergedSentence(merged)];
+  const parts = [mergedSentence(merged, squash)];
   if (merged.worktree_removed && !merged.branch_deleted) parts.push(`The branch ${merged.merged_branch} was kept: ${merged.branch_error ?? "no reason was given"}`);
   if (merged.cleanup_error) parts.push(merged.cleanup_error);
   if (merged.sweep_problems?.length) parts.push(`Leftovers of earlier removals were not cleared: ${merged.sweep_problems.join("; ")}`);
@@ -182,8 +207,8 @@ export async function mergeAttemptWorktree(run: AttemptRef): Promise<WorktreeAct
  * can tell a conflict from a refusal; any other rejection passes through, and
  * so does the store's refusal when the repository changed while it waited.
  */
-async function mergeAndTeardown(mutationTarget: MutationTarget, cwd: string, target: string, expectedTip: string): Promise<MergeTeardownResult> {
-  const outcome = await repoStore.worktreeMergeTeardown({ worktreePath: cwd, targetBranch: target, squash: false, expectedTip }, mutationTarget, true);
+async function mergeAndTeardown(mutationTarget: MutationTarget, cwd: string, target: string, expectedTip: string, squash: boolean): Promise<MergeTeardownResult> {
+  const outcome = await repoStore.worktreeMergeTeardown({ worktreePath: cwd, targetBranch: target, squash, expectedTip }, mutationTarget, true);
   if (outcome.ok && outcome.output) return outcome.output;
   const cause = failureOf(outcome);
   const failure = readMergeTeardownError(cause);
@@ -191,8 +216,10 @@ async function mergeAndTeardown(mutationTarget: MutationTarget, cwd: string, tar
 }
 
 /** What landed, and, when the cleanup after it did not finish, that it is pending and why. */
-function mergedSentence(merged: MergeTeardownResult): string {
-  const landed = `Merged ${plural(merged.commits_merged, "commit")} from ${merged.merged_branch} into ${merged.target_branch}`;
+function mergedSentence(merged: MergeTeardownResult, squash: boolean): string {
+  const landed = squash
+    ? `Squashed ${plural(merged.commits_merged, "commit")} from ${merged.merged_branch} into ${merged.target_branch} as one commit`
+    : `Merged ${plural(merged.commits_merged, "commit")} from ${merged.merged_branch} into ${merged.target_branch}`;
   if (!merged.worktree_removed) return `${landed}; cleanup pending: ${merged.removal_error ?? "the worktree was not removed"}.`;
   return `${landed}. The worktree was removed.`;
 }
@@ -228,9 +255,10 @@ export async function mergeVerifiedAttempt(run: AttemptRef, expectedHead: string
   if (!(await repoStore.trustRepo(run.cwd))) throw new Error("The repository is not trusted, so it is not merged.");
   // The head the verdict was reached for is the tip the host holds the merge to.
   const mutationTarget = await mainCheckoutTarget(root, known);
-  const merged = await mergeAndTeardown(mutationTarget, run.cwd, target, expectedHead);
+  // An unattended wave merge keeps the commits as the verdict saw them.
+  const merged = await mergeAndTeardown(mutationTarget, run.cwd, target, expectedHead, false);
   if (merged.worktree_removed) await closeStranded(run.cwd);
-  const parts = [mergedSentence(merged)];
+  const parts = [mergedSentence(merged, false)];
   if (merged.worktree_removed && !merged.branch_deleted) parts.push(`The branch ${merged.merged_branch} was kept: ${merged.branch_error ?? "no reason was given"}`);
   if (merged.cleanup_error) parts.push(merged.cleanup_error);
   if (merged.sweep_problems?.length) parts.push(`Leftovers of earlier removals were not cleared: ${merged.sweep_problems.join("; ")}`);
@@ -266,7 +294,7 @@ export async function discardAttemptWorktree(run: AttemptRef): Promise<WorktreeA
   const parts = ["The worktree was removed."];
   if (removed.output?.cleanup_error) parts.push(removed.output.cleanup_error);
   if (removed.output?.sweep_problems?.length) parts.push(`Leftovers of earlier removals were not cleared: ${removed.output.sweep_problems.join("; ")}`);
-  if (own.branch?.startsWith("gitpulse/")) {
+  if (own.branch?.startsWith(ATTEMPT_BRANCH_PREFIX)) {
     const deleted = await repoStore.deleteBranch(own.branch, false, mutationTarget, true);
     parts.push(deleted.ok ? `Its branch ${own.branch} was deleted.` : `Its branch ${own.branch} was kept: ${deleted.error ?? "it did not complete."}`);
   } else if (own.branch) {
