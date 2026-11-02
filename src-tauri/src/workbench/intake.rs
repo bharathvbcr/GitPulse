@@ -666,6 +666,11 @@ fn place_once(
     // store's rules decide it: a live task, one parent, no cycle, bounded
     // depth. The link goes in only when it is not already the card's own, and
     // every other link the card holds is kept.
+    //
+    // The parent was already read before anything was registered (`add_task`);
+    // it is read again here on purpose. Between the two the board is free to
+    // delete or merge it, and the link must name a card that is live at the
+    // moment of the write, which this read decides.
     if let Some(reference) = &task.parent {
         let (parent_id, _) = find_live_task(store, repository_id, reference)?;
         let held: Vec<Value> = current
@@ -1112,7 +1117,9 @@ fn add_task_once(
     // scanned. A repository the board has never seen has no task to be a
     // parent of.
     let mut parent_item = None;
-    match (find(store, &local.identity)?, &task.parent) {
+    // One lookup serves the parent check and the creation checks below.
+    let known_repository = find(store, &local.identity)?;
+    match (&known_repository, &task.parent) {
         (Some(repository), Some(reference)) => {
             let repository_id = repository["id"].as_str().unwrap_or_default();
             parent_item = Some(find_live_task(store, repository_id, reference)?.0);
@@ -1125,7 +1132,7 @@ fn add_task_once(
         }
         _ => {}
     }
-    if let Some(repository) = find(store, &local.identity)? {
+    if let Some(repository) = known_repository {
         let repository_id = repository["id"].as_str().unwrap_or_default();
         let own = item_id(repository_id, &task.key);
         let creating = get_item(store, &own)?.is_none()
@@ -2324,6 +2331,10 @@ mod head_cache_adversarial_tests;
 #[cfg(test)]
 #[path = "intake_merge_tests.rs"]
 mod merge_tests;
+
+#[cfg(test)]
+#[path = "lineage_tests.rs"]
+mod lineage_tests;
 
 #[cfg(test)]
 #[path = "profile_upgrade_tests.rs"]

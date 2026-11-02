@@ -94,6 +94,11 @@ const SCAN_FPS = ["0123456789abcdef", "fedcba9876543210"];
 const scanProposal = (fingerprint, n) => ({fingerprint, category: "dead_symbols", status: "new", title: `Remove unused helper ${n}`, description: `Helper ${n} has no callers.`, kind: "maintenance", priority: 2, labels: ["manvi-scan"], signals: [{source: "devmap dead_symbols", result: "confidence 0.9"}]});
 const filedFingerprints = new Map();
 const verdicts = new Map(), verdictReads = [];
+// Parent links as the store holds them (child id -> parent id). `items.lineage`
+// derives each card's parent and subtask progress from these and from the
+// tasks' status, as the host's one read over `work_item_links` does.
+const parentOf = new Map(), lineageReads = [];
+let failLineage = false;
 let verifyOptIn = false;
 const verifyPosts = [];
 let failConfiguration = false, blankConfiguration = false, loseEnhancement = false, holdDelete = false, releaseDelete;
@@ -261,6 +266,21 @@ mockIPCWithEvents(async (cmd, args) => {
       return JSON.stringify({ok: true, items: Object.fromEntries(input.ids.filter(id => verdicts.has(id)).map(id => [id, verdicts.get(id)]))});
     }
     case "verifications.status": return JSON.stringify(verdicts.get(input.id) ?? {ok: true, state: "none", stale: false, record: null});
+    // Each named live card's parent and how many of its live subtasks are Done.
+    // A card the store does not hold is left out, so the board shows it as unknown.
+    case "items.lineage": {
+      lineageReads.push([...input.ids]);
+      if (failLineage) throw {code:"store_error", message:"Fixture lineage is unavailable"};
+      const live = id => tasks.some(task => task.id === id) && !deleted.has(id);
+      const statusOf = id => tasks.find(task => task.id === id)?.status;
+      const items = {};
+      for (const id of input.ids.filter(live)) {
+        const kids = [...parentOf].filter(([child, parent]) => parent === id && live(child)).map(([child]) => child);
+        const parent = parentOf.get(id);
+        items[id] = {parent_item_id: parent && live(parent) ? parent : null, children: {total: kids.length, done: kids.filter(child => statusOf(child) === "done").length}};
+      }
+      return JSON.stringify({ok: true, items});
+    }
     case "enhancements.configuration": {
       if(failConfiguration) throw {code:"worker_error",message:"Manvi temporarily unavailable"};
       return JSON.stringify({ok:true,provider:"local",model:blankConfiguration ? "" : "quick-fixture",model_source:"fixture",providers:["local"]});
@@ -671,9 +691,30 @@ if (params.has("check")) {
     check("switching repository tabs replaces prior task cards", Boolean(card("task-3")) && !card("task-1"));
     check("each board load reads verdicts in one batch of at most 256 distinct ids", verdictReads.length > 0 && verdictReads.every(ids => ids.length > 0 && ids.length <= 256 && new Set(ids).size === ids.length));
     check("a card nobody has verified shows no verdict chip", root.querySelectorAll('[data-testid="card-verdict"]').length === 0);
+    check("each board load reads lineage in one batch of at most 256 distinct ids", lineageReads.length > 0 && lineageReads.every(ids => ids.length > 0 && ids.length <= 256 && new Set(ids).size === ids.length));
+    check("a card in no task tree shows neither a parent nor a subtask count", root.querySelectorAll('[data-testid="card-parent"], [data-testid="card-subtasks"]').length === 0);
     verdicts.set("task-1", {ok: true, state: "passed", stale: false, record: null});
+    // task-1 holds three subtasks, one of them Done (and archived, which is still Done).
+    parentOf.set("task-2", "task-1"); parentOf.set("task-3", "task-1"); parentOf.set("task-100", "task-1");
     await click("Global fixture"); await settle(400);
     check("a verified card shows its verdict on the card", card("task-1")?.querySelector('[data-testid="card-verdict"]')?.dataset.state === "passed");
+    {
+      const progress = card("task-1")?.querySelector('[data-testid="card-subtasks"]');
+      check("a parent card says how many of its subtasks are done", progress?.textContent.trim() === "1 of 3 subtasks done" && progress.dataset.done === "1" && progress.dataset.total === "3");
+      const parentMark = card("task-2")?.querySelector('[data-testid="card-parent"]');
+      check("a subtask card names its parent", parentMark?.dataset.parentId === "task-1" && parentMark.textContent.includes("Keep repository tasks in sync"));
+      check("a card with no subtasks and no parent shows neither mark", !card("task-10")?.querySelector('[data-testid="card-parent"], [data-testid="card-subtasks"]'));
+      check("a subtask without subtasks of its own shows no subtask count", !card("task-2")?.querySelector('[data-testid="card-subtasks"]'));
+      check("a read that worked shows no lineage error", !root.querySelector('[data-testid="board-lineage-error"]'));
+      // A lineage read that fails is said, and no card then claims a count it did not read.
+      failLineage = true;
+      await click("Manvi fixture"); await settle(400); await click("Global fixture"); await settle(400);
+      check("a failed lineage read says so on the board", Boolean(root.querySelector('[data-testid="board-lineage-error"]')));
+      check("a failed lineage read leaves every card unknown, not at 0 of 0", root.querySelectorAll('[data-testid="card-parent"], [data-testid="card-subtasks"]').length === 0);
+      failLineage = false;
+      await click("Manvi fixture"); await settle(400); await click("Global fixture"); await settle(400);
+      check("the next lineage read that works clears the error and restores the marks", !root.querySelector('[data-testid="board-lineage-error"]') && card("task-1")?.querySelector('[data-testid="card-subtasks"]')?.textContent.trim() === "1 of 3 subtasks done");
+    }
     card("task-1").click(); await wait(editor);
     await wait(() => editor().querySelector('[data-testid="verification-chip"]'));
     check("the task sheet shows the verdict, a Verify action and the refine action",
@@ -699,6 +740,7 @@ if (params.has("check")) {
     verifyOptIn = false;
     await repoStore.removeRepo("/fixture/GitPulse");
     verdicts.delete("task-1");
+    parentOf.clear();
     const title = field("Title"); await change(title, "Unsaved task title");
     confirmations = 0;
     confirmAnswer = false;
