@@ -313,11 +313,12 @@ describe("annotated but unregistered commands", () => {
     // 287 when cmd_stash_pop was removed (UI pops go through cmd_stash_action),
     // then 288 with cmd_adopt_ledger (a person adopts a refused ledger), and
     // 291 with the commit-graph write commands (cmd_commit_graph_write_plan,
-    // cmd_commit_graph_write, cmd_commit_graph_write_cancel);
+    // cmd_commit_graph_write, cmd_commit_graph_write_cancel), and 292 with
+    // cmd_terminal_transcript (a session's saved output);
     // `bun run check:ipc`
     // prints all three numbers, so a bump made without re-running it will not
     // agree.
-    expect(found.size).toBe(291);
+    expect(found.size).toBe(292);
     expect(found.has("cmd_terminal_incidents")).toBe(true);
     expect(found.has("cmd_terminal_conversations")).toBe(true);
     expect(found.has("cmd_terminal_backend")).toBe(true);

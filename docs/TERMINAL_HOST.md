@@ -65,7 +65,8 @@ A unix-domain `SOCK_STREAM` socket, one frame at a time in each direction.
   worker). Requests: `hello`, `retire`,
   `spawn`, `write`, `resize`, `ack`, `detach`, `detach_all`, `attach`,
   `attach_tracked`, `kill`, `stop_all`, `list`, `context`, `background`,
-  `limit`, `stall`, `receipts`, `forget`, and the test-only `wakeups`, `size`,
+  `limit`, `stall`, `receipts`, `forget`, `transcript` (protocol 3, see
+  [Saved transcripts](#saved-transcripts)), and the test-only `wakeups`, `size`,
   `hold`, `release`.
 * The app keeps each session's input and geometry lanes in front of the host,
   as in-process: a session's keystrokes go one at a time in order, a full
@@ -218,6 +219,133 @@ reaped. The exit is then sent to the app as an `exit` event.
   wrapped exit records mid-adoption, while newly opened connections cleanly revoke
   previous authority. A delivered exit is not vouched for immediately until verified.
 
+## Saved transcripts
+
+The ring keeps 512 KiB in memory and the receipts keep how a session ended;
+neither keeps what it printed. A host that dies, a reboot, or simply a run that
+finished while nobody watched lost the output. The host now also writes it down:
+`<host dir>/transcripts/<session id>.log` (`terminal/host/transcripts.rs`), so a
+finished task run's output can be reopened after the app quits or the host
+restarts (`cmd_terminal_transcript`, `src/lib/terminal/savedTranscript.ts`).
+
+**What is recorded.** Every byte the reader reads, held or not. The copy is taken
+in `Ring::push` (`terminal/ring.rs`), the one place that sees all of a session's
+output: a detached session's bytes never reach the output sink, so a tap on the
+sink would miss exactly the output this exists for. The tap is armed before the
+fork (`Taps`, claimed when the session's ring is made), so a program that prints
+and exits at once is recorded from its first byte. Only the host records; the
+in-process backend keeps nothing, and a read says so (`unavailable`), not
+`missing`.
+
+**The reader never waits on the disk.** `Ring::push` runs with the ring's lock
+held, and that lock is held across the wait for the view's credit, so the tap
+only appends to an in-memory queue bounded to 4 MiB (each queued operation
+counts for its bytes plus 64). One supervised writer thread (`spawn_service`,
+named `terminal-transcripts`) drains it. When the queue is full the chunk is
+dropped, its size remembered, and `[gitpulse: N bytes of output were not
+recorded]` is written ahead of the next chunk that fits (or when the session
+ends). Recorded bytes plus the counts in the markers always add up to what the
+session printed.
+
+**Bounds** (`Limits`):
+
+* a session's log is two segments, `<id>.log` (current) and `<id>.log.1`
+  (previous), at most 4 MiB each; a full current segment becomes the previous
+  one and the old previous one is deleted. Every segment after the first begins
+  with `[gitpulse: transcript continues]`, which a read strips from the text and
+  uses to know the start of the output is gone (`truncated`);
+* the directory is held to 256 MiB by deleting whole sessions, least recently
+  written first, never one still running (checked when a segment rotates and
+  when a session ends). If running sessions alone are over it, their previous
+  segments go next, and a warning is logged while they remain over;
+* a transcript untouched for 14 days is deleted when a host starts and each time
+  a session ends or a segment rotates (the same pass that enforces the size
+  limit), so a host that stays up ages them out as long as sessions keep ending;
+  an idle host that never ends another session keeps them until it exits;
+* writes are plain `write_all`s to the page cache and survive the host process
+  dying. They are `fsync`ed when a segment rotates, when a session ends, when
+  the host stops, and 5 s after the last write to an idle session, so a power
+  loss or kernel panic can lose only the unsynced tail of a running session.
+
+**Lifecycle, and what "tied to the receipt" means.** The file is created when
+the session is armed, beside its receipt's `spawn` line; it is closed and
+synced when the session's ring is dropped; and it is removed with the receipt
+when the session never started (`discard`). It is *not* removed by `forget`:
+that means "the app has recorded this exit", which is long before anyone reopens
+the run's output, so deleting there would leave the feature with nothing to
+show. A finished session's transcript ends by eviction or age, above. A new
+session under an id that has a transcript replaces it.
+
+**How the recording ended is on disk.** Whether a transcript is whole is not
+something a host's memory may hold: the host that knew is the one that died.
+Closing a session appends `[gitpulse: transcript ends]` to its newest segment
+(under the segment's size bound; a segment with no room rotates first), and a
+write that fails leaves `<id>.log.err` with the reason (`0600`, `O_NOFOLLOW`,
+at most 2 KiB, removed and evicted with the session). A read strips the marker
+like the continuation line and answers `recording_error`: the failure's reason
+if there is one (from memory, or from the note after a restart), else, for a
+finished session whose newest segment lacks the marker, *the host that wrote
+this did not close it, so the end of the output may be missing*. A session that
+is still running has no marker yet and is not reported for it. The marker is
+text a program could print; spoofing it can only make a transcript read as
+closed.
+
+**The read.** `Request::Transcript { session, max_bytes, redact }` is read-only
+(`attach` means a live session; this never attaches) and works for live and
+finished sessions. `max_bytes` is clamped to 128 KiB. The tail crosses the
+socket as base64 inside the reply header (the same `data_b64` the webview hop
+has always used for a one-shot `{id, data_b64}`), not as a frame payload: the
+streaming `output` path is unchanged and stays base64-free, and a reply
+carrying a payload would need a payload slot threaded through every waiter for
+a call that happens once per reopened run. 128 KiB is 171 KiB encoded, under
+the 512 KiB header bound. The answer (`terminal::TranscriptRead`) is one of:
+
+| state | meaning |
+|---|---|
+| `found` | the tail, plus `bytes` (after masking, when `redact`), `retained` (on disk, before masking), `truncated` (`rotated` or `clipped`: `rotated` means the start was rotated off the disk, `clipped` that older saved output was left out of this read's bound; both can hold), `gap_markers`, `redacted`, `live`, `settled` (everything queued was written before the answer; false means the end may lag) and `recording_error` (the saved output may stop short: a write failed, or the host that wrote it never closed it) |
+| `missing` | no transcript: never recorded, evicted, or aged out |
+| `unreadable` | one exists or should and could not be read; `reason` says why. A transcript that is a symbolic link, is not a regular file, belongs to another user, or could not be recorded (disk full, directory gone) is `unreadable`, as is a host whose transcript store would not open |
+| `unavailable` | the app runs terminals itself (never sent by a host) |
+
+The renderer's `readSavedTranscript` adds `failed` (the call failed, timed out,
+or the answer was malformed), which is not `missing`: the output may be there.
+`recording_error` survives a host restart (see *How the recording ended is on
+disk*); a transcript whose host died reads as `found` up to where it stopped
+with `recording_error` set, never as complete.
+
+**Protocol.** Adding the request bumped `PROTOCOL` to 3. A host of protocol 2
+ends the connection of an app that sends a request it cannot decode, so the two
+must never meet; they do not, since the socket and lock names carry the
+protocol. An updated app finds a v2 host the way it finds any other-protocol
+host (`probe_other_protocols`): retired when idle, reported with its session
+count when it holds sessions.
+
+**At-rest posture.** The transcript is the raw terminal stream, escape sequences
+and anything a program echoed included, so it can contain secrets. It is stored
+unredacted, deliberately: redaction would corrupt the byte stream (a secret cut
+across a chunk is missed in one place and a mask lands inside an escape
+sequence in another), and the file is reachable only by the user who owns it.
+
+* The directory is `0700` and refused if any component is a symlink; each file is
+  created `0600`, opened `O_NOFOLLOW`, checked to be a regular file owned by the
+  host's user (a file with wider permissions is narrowed before anything is
+  written), and named only by a well-formed session id. A read applies the same
+  checks, so a link planted in place of a transcript is reported, never followed.
+* The only way to it through GitPulse is the host socket, which refuses any peer
+  that is not the host's own user. It is never sent anywhere.
+* `redact: true` runs the tail through `ledger::redact::text` in the host, before
+  the bytes leave it, and is what any surface beyond the local user (an export, a
+  ledger entry, a shared report) must use. A masking read looks 64 KiB further
+  back than the window it returns, masks, then clips to the window, so a name
+  such as `password=` or a key's first line just before the window still marks
+  what follows. A private key whose closing line is in that margin but whose
+  opening line is not is masked up to the closing line. What it cannot see: a
+  secret split by the margin's own start, or a key body longer than the margin
+  with neither line in view. Redaction is a mask for display, not a guarantee.
+* `keep_terminals_running` stays default-off; a user who never turns it on has
+  no host and no transcripts. The sign-off in the security statement below covers
+  what a transcript at rest widens.
+
 ## Quit
 
 With the host backend a quit no longer has to end anything, so it asks:
@@ -317,6 +445,15 @@ load governor), so a request that reaches the host has passed both.
 **Bounds.** Header frames ≤ 64 KiB, payloads ≤ 64 KiB, argv/env bounds as
 today (`validate_pty_options`), the session cap as today. A peer that sends a
 malformed or oversized frame is disconnected.
+
+**Saved transcripts widen what a same-user peer can read.** Before, a peer could
+read a session's output only by attaching to it, while it lived. Now it can read
+the last 8 MiB per session of finished ones from the socket (`transcript`) or
+from the files, for up to 14 days or until the 256 MiB directory bound evicts
+them. The same-user reasoning above holds (the files are `0600` in a `0700`
+directory), but a transcript outlives the session, and that is new at rest; it
+is on disk only when the host is, which is opt-in. See [Saved
+transcripts](#saved-transcripts).
 
 **Signals.** The host signals only through `procguard::signal` and only
 processes in sessions it created; the app never signals the host.
