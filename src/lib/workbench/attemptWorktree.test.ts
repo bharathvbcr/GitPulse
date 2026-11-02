@@ -7,21 +7,39 @@ const askConfirm = vi.fn();
 const askChoice = vi.fn();
 vi.mock("../stores/modalStore", () => ({ askConfirm: (...args: unknown[]) => askConfirm(...args), askChoice: (...args: unknown[]) => askChoice(...args) }));
 type Tab = { id: string; path: string; familyRoot: string | null; currentBranch: string | null };
-const repoState = writable<{ openTabs: Tab[] }>({ openTabs: [] });
+/** The slice of the active session the range review reads back from the store. */
+type Selection = { currentPath?: string | null; isLoading?: boolean; error?: string | null; selectionKind?: string; selectedFilePath?: string | null; selectedDiffTruncated?: boolean; selectedDiffTruncationReason?: string | null; selectedDiffError?: string | null };
+const repoState = writable<{ openTabs: Tab[] } & Selection>({ openTabs: [] });
 const trustRepo = vi.fn(async (path: string) => path);
 const closeTab = vi.fn(async (_id: string) => {});
 const previewUncommitted = vi.fn(async (_path: string) => {});
+/** What the store was asked to do to the repository view, in order. */
+const viewLog: string[] = [];
+/** What a range selection leaves in the active session; a test replaces it to model a diff that is cut, failed or overtaken. */
+let rangeAnswer: (from: string, to: string) => Selection = (from, to) => ({ selectionKind: "range", selectedFilePath: `${from}...${to}`, selectedDiffTruncated: false, selectedDiffTruncationReason: null, selectedDiffError: null });
+const openRepo = vi.fn(async (path: string, extras?: { onReady?: (path: string) => void }) => {
+  viewLog.push(`open:${path}`);
+  repoState.update((state) => ({ ...state, currentPath: path, isLoading: false, error: null }));
+  extras?.onReady?.(path);
+  return true;
+});
+const selectRangeDiff = vi.fn(async (from: string, to: string) => {
+  viewLog.push(`range:${from}...${to}`);
+  repoState.update((state) => ({ ...state, ...rangeAnswer(from, to) }));
+});
 let fake: ReturnType<typeof import("./attemptRepoStoreFake").fakeAttemptStore>;
 vi.mock("../stores/repoStore", async () => {
   const { fakeAttemptStore } = await import("./attemptRepoStoreFake");
   fake = fakeAttemptStore((command, args) => invoke(command, args), { merge: "cmd_worktree_merge_teardown", remove: "cmd_remove_worktree", deleteBranch: "cmd_delete_branch" });
-  return { repoStore: { subscribe: repoState.subscribe, trustRepo: (p: string) => trustRepo(p), closeTab: (id: string) => closeTab(id), previewUncommitted: (p: string) => previewUncommitted(p), ...fake.members } };
+  return { repoStore: { subscribe: repoState.subscribe, trustRepo: (p: string) => trustRepo(p), closeTab: (id: string) => closeTab(id), previewUncommitted: (p: string) => { viewLog.push(`uncommitted:${p}`); return previewUncommitted(p); }, openRepo: (...args: Parameters<typeof openRepo>) => openRepo(...args), selectRangeDiff: (from: string, to: string) => selectRangeDiff(from, to), ...fake.members } };
 });
 const setGlobalSurface = vi.fn();
 vi.mock("../stores/interfaceStore", () => ({ interfaceStore: { setGlobalSurface: (s: string) => setGlobalSurface(s) } }));
 
 const { MergeTeardownFailure } = await import("../branches/mergeTeardown");
-const { attemptWorktreeOffer, discardAttemptWorktree, mainCheckoutOf, mergeAttemptWorktree, mergeTargetLabel, reviewAttemptChanges } = await import("./attemptWorktree");
+const { toastStore } = await import("../stores/toastStore");
+const { get } = await import("svelte/store");
+const { attemptDirtyFiles, attemptWorktreeOffer, discardAttemptWorktree, mainCheckoutOf, mergeAttemptWorktree, mergeTargetLabel, openAttemptDiff, reviewAttemptChanges, reviewAttemptUncommitted } = await import("./attemptWorktree");
 
 const NOW = 1_800_000_000_000;
 const WT = "/work/repo/.gitpulse/worktrees/fix-e42-wt0attem";
@@ -37,6 +55,9 @@ const listing = (dirty: number | null, branch = "gitpulse/fix-e42-wt0attem") => 
 
 beforeEach(() => {
   invoke.mockReset(); askConfirm.mockReset(); askChoice.mockReset(); trustRepo.mockClear(); closeTab.mockClear(); setGlobalSurface.mockClear(); previewUncommitted.mockClear();
+  openRepo.mockClear(); selectRangeDiff.mockClear(); viewLog.length = 0;
+  rangeAnswer = (from, to) => ({ selectionKind: "range", selectedFilePath: `${from}...${to}`, selectedDiffTruncated: false, selectedDiffTruncationReason: null, selectedDiffError: null });
+  toastStore.clear();
   repoState.set({ openTabs: [] });
   fake.seen.length = 0; fake.opened.length = 0; fake.state.stillNamed = () => true; fake.state.openFails = false; fake.state.mainOpen = true;
 });
@@ -96,6 +117,24 @@ describe("merge and discard", () => {
     // The commit the listing showed is the tip the host holds the merge to.
     expect(invoke).toHaveBeenLastCalledWith("cmd_worktree_merge_teardown", { repoPath: "/work/repo", worktreePath: WT, targetBranch: "main", squash: true, expectedTip: "b" });
     expect(result?.message).toBe("Squashed 2 commits from gitpulse/fix-e42-wt0attem into main as one commit. The worktree was removed.");
+  });
+
+  it("holds the landing to the commit the review approved, not to whatever the listing shows", async () => {
+    askChoice.mockResolvedValueOnce("confirm");
+    invoke.mockImplementationOnce(async () => ({ path: WT, name: "fix", is_bare: false, common_dir: "/work/repo/.git" }))
+      .mockImplementationOnce(async () => listing(0))
+      .mockImplementationOnce(async () => ({ policy: null, output: teardown() }));
+    // The listing's head is "b": the same commit the review approved.
+    await mergeAttemptWorktree(run(), { expectedTip: "b" });
+    expect(invoke).toHaveBeenLastCalledWith("cmd_worktree_merge_teardown", expect.objectContaining({ expectedTip: "b" }));
+  });
+
+  it("refuses, before asking, to land a worktree that moved after the review approved it", async () => {
+    invoke.mockImplementationOnce(async () => ({ path: WT, name: "fix", is_bare: false, common_dir: "/work/repo/.git" }))
+      .mockImplementationOnce(async () => listing(0));
+    await expect(mergeAttemptWorktree(run(), { expectedTip: "approved1234567" })).rejects.toThrow(/moved to b after approved1234 was approved/);
+    expect(askChoice).not.toHaveBeenCalled();
+    expect(invoke.mock.calls.map((call) => call[0])).not.toContain("cmd_worktree_merge_teardown");
   });
 
   it("merges the commits as they are when the reader chooses the other way", async () => {
@@ -276,10 +315,139 @@ describe("merge and discard", () => {
     expect(fake.seen).toEqual([{ command: "cmd_remove_worktree", target: { tabId: "tab:/work/repo", path: "/work/repo" } }]);
   });
 
-  it("review opens the checkout on its changes, in front", async () => {
+  it("review of an attempt that committed nothing opens the checkout on its uncommitted files, in front", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "cmd_attempt_review") return reviewRecord({ head_oid: BASE });
+      throw new Error(`unexpected ${cmd}`);
+    });
     await reviewAttemptChanges(run());
     expect(previewUncommitted).toHaveBeenCalledWith(WT);
+    expect(selectRangeDiff).not.toHaveBeenCalled();
     expect(setGlobalSurface).toHaveBeenCalledWith("repository");
+  });
+});
+
+const BASE = "a".repeat(40);
+const HEAD = "b".repeat(40);
+const reviewRecord = (over: Record<string, unknown> = {}) => ({ run_id: "wt0attempt", branch: "gitpulse/fix-e42-wt0attem", base_oid: BASE, head_oid: HEAD, files_changed: 2, ended: true, review: { status: "unreviewed" }, gate_on: true, gate_error: null, ...over });
+const freshness = (over: Record<string, unknown> = {}) => ({ commit_sha: BASE, landed_on_base: true, on_base: true, base_oid: HEAD, merge_base: BASE, ahead: 0, behind: 2, base_relation_reason: "", ...over });
+/** The host as an attempt that committed two files shows it: its review record, and base reachable from head unless `over` says otherwise. */
+function committedAttempt(over: { review?: Record<string, unknown>; freshness?: unknown } = {}) {
+  invoke.mockImplementation(async (cmd: string) => {
+    if (cmd === "cmd_attempt_review") return reviewRecord(over.review);
+    if (cmd === "cmd_provenance_freshness") {
+      if (over.freshness instanceof Error) throw over.freshness;
+      return over.freshness ?? freshness();
+    }
+    if (cmd === "cmd_resolve_repo") return { path: WT, name: "fix", is_bare: false, common_dir: "/work/repo/.git" };
+    if (cmd === "cmd_list_worktrees") return listing(0);
+    throw new Error(`unexpected ${cmd}`);
+  });
+}
+const warnings = () => get(toastStore).filter((toast) => toast.kind === "warning").map((toast) => toast.message);
+
+describe("reviewing what an attempt committed", () => {
+  it("opens the committed range in the attempt's own checkout, selecting only once that checkout is ready", async () => {
+    committedAttempt();
+    // Another repository is in front: a selection made now would diff that one.
+    repoState.set({ openTabs: [], currentPath: "/work/repo", isLoading: false, error: null });
+    await reviewAttemptChanges(run());
+    expect(viewLog).toEqual([`open:${WT}`, `range:${BASE}...${HEAD}`]);
+    expect(previewUncommitted).not.toHaveBeenCalled();
+    expect(setGlobalSurface).toHaveBeenCalledWith("repository");
+  });
+
+  it("selects directly when the attempt's checkout is already the ready tab in front", async () => {
+    committedAttempt();
+    repoState.set({ openTabs: [], currentPath: WT, isLoading: false, error: null });
+    await reviewAttemptChanges(run());
+    expect(viewLog).toEqual([`range:${BASE}...${HEAD}`]);
+  });
+
+  it("reopens a checkout whose tab is still loading or failed, rather than selecting into it", async () => {
+    committedAttempt();
+    repoState.set({ openTabs: [], currentPath: WT, isLoading: true, error: null });
+    await reviewAttemptChanges(run());
+    expect(viewLog[0]).toBe(`open:${WT}`);
+  });
+
+  it("asks whether base is an ancestor of head, in the attempt's checkout, with no git spawned here", async () => {
+    committedAttempt();
+    const opened = await openAttemptDiff(run(), reviewRecord() as never);
+    expect(invoke).toHaveBeenCalledWith("cmd_provenance_freshness", { repoPath: WT, commitSha: BASE, baseBranch: HEAD });
+    expect(opened).toMatchObject({ shown: "range", notices: [], truncated: false, from: BASE, to: HEAD });
+    expect(warnings()).toEqual([]);
+  });
+
+  it("says plainly that the three-dot diff is not the approved range when base is not an ancestor of head", async () => {
+    committedAttempt({ freshness: freshness({ landed_on_base: false, on_base: false, merge_base: "c".repeat(40), ahead: 3 }) });
+    const opened = await openAttemptDiff(run(), reviewRecord() as never);
+    expect(opened.shown).toBe("range");
+    expect(opened.notices).toHaveLength(1);
+    expect(opened.notices[0]).toContain(`${BASE.slice(0, 12)} is not an ancestor of ${HEAD.slice(0, 12)}`);
+    expect(opened.notices[0]).toContain("not the range the review covers");
+    // Said where the reader lands, not only in the panel they left.
+    expect(warnings()).toEqual(opened.notices);
+  });
+
+  it("does not call an unmeasured ancestry a failed one", async () => {
+    committedAttempt({ freshness: freshness({ landed_on_base: null, on_base: null, ahead: null, behind: null, base_relation_reason: "not measured: this is a shallow clone" }) });
+    const opened = await openAttemptDiff(run(), reviewRecord() as never);
+    expect(opened.notices[0]).toContain("could not be told");
+    expect(opened.notices[0]).toContain("this is a shallow clone");
+    expect(opened.notices[0]).not.toContain("is not an ancestor");
+    committedAttempt({ freshness: new Error("host gone") });
+    const failed = await openAttemptDiff(run(), reviewRecord() as never);
+    expect(failed.notices[0]).toContain("could not be told");
+    expect(failed.notices[0]).toContain("host gone");
+  });
+
+  it("surfaces a truncated range diff, saying the review covers the whole range", async () => {
+    committedAttempt();
+    rangeAnswer = (from, to) => ({ selectionKind: "range", selectedFilePath: `${from}...${to}`, selectedDiffTruncated: true, selectedDiffTruncationReason: "larger than GitPulse reads in one go", selectedDiffError: null });
+    const opened = await openAttemptDiff(run(), reviewRecord() as never);
+    expect(opened.truncated).toBe(true);
+    expect(opened.notices[0]).toContain("Only part of this diff is shown");
+    expect(opened.notices[0]).toContain("larger than GitPulse reads in one go");
+    expect(opened.notices[0]).toContain("all 2 files");
+    expect(warnings()).toContain(opened.notices[0]);
+  });
+
+  it("says when the diff could not be read, or the view moved on before it was selected", async () => {
+    committedAttempt();
+    rangeAnswer = (from, to) => ({ selectionKind: "range", selectedFilePath: `${from}...${to}`, selectedDiffTruncated: false, selectedDiffError: "bad revision" });
+    expect((await openAttemptDiff(run(), reviewRecord() as never)).notices.join(" ")).toContain("could not be read: bad revision");
+    // Something else took the selection before this one's answer: the view must not be reported as showing the range.
+    rangeAnswer = () => ({ selectionKind: "file", selectedFilePath: "other.txt", selectedDiffTruncated: false, selectedDiffError: null });
+    const overtaken = await openAttemptDiff(run(), reviewRecord() as never);
+    expect(overtaken.notices.join(" ")).toContain("moved on");
+  });
+
+  it("falls back to the uncommitted files, saying why, when the review cannot be read", async () => {
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "cmd_attempt_review") throw new Error("store busy");
+      throw new Error(`unexpected ${cmd}`);
+    });
+    await reviewAttemptChanges(run());
+    expect(previewUncommitted).toHaveBeenCalledWith(WT);
+    expect(selectRangeDiff).not.toHaveBeenCalled();
+    expect(warnings().join(" ")).toContain("commits could not be read");
+    expect(warnings().join(" ")).toContain("store busy");
+  });
+
+  it("keeps the uncommitted files as its own action, and counts them from the listing", async () => {
+    committedAttempt();
+    await reviewAttemptUncommitted(run());
+    expect(previewUncommitted).toHaveBeenCalledWith(WT);
+    expect(setGlobalSurface).toHaveBeenCalledWith("repository");
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "cmd_resolve_repo") return { path: WT, name: "fix", is_bare: false, common_dir: "/work/repo/.git" };
+      if (cmd === "cmd_list_worktrees") return listing(4);
+      throw new Error(`unexpected ${cmd}`);
+    });
+    expect(await attemptDirtyFiles(run())).toBe(4);
+    invoke.mockImplementation(async (cmd: string) => (cmd === "cmd_resolve_repo" ? { path: WT, name: "fix", is_bare: false, common_dir: "/work/repo/.git" } : listing(null)));
+    expect(await attemptDirtyFiles(run())).toBeNull();
   });
 });
 
