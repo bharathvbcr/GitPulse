@@ -166,10 +166,15 @@ pub(crate) struct OrderBook {
     /// The reports last queued per session, for [`OrderBook::is_twin`]: at most
     /// [`RECENT_PER_SESSION`], oldest first.
     recent: HashMap<String, VecDeque<Reported>>,
-    /// The state each session's last recorded lifecycle change left it in
-    /// ([`crate::ledger::lifecycle::state_of`]), so only a change is recorded.
-    /// Bounded by [`ORDER_BOOK_CAP`]; a session pushed out costs one repeated
-    /// row, never a missing one.
+    /// The state each session's last *reported* lifecycle change left it in
+    /// ([`crate::ledger::lifecycle::state_of`]), so only a change is handed to
+    /// the host to record. It is remembered when the report is made, not when
+    /// the host has written the row: a report the host then could not record
+    /// (registry unreadable, session no longer listed, ledger refused) is not
+    /// asked for again while the state stays the same, and the timeline keeps
+    /// showing the earlier state over that span, not "unknown". Bounded by
+    /// [`ORDER_BOOK_CAP`]; a session pushed out costs one repeated row, never
+    /// a missing one.
     lifecycle: HashMap<String, &'static str>,
 }
 
@@ -278,7 +283,7 @@ impl OrderBook {
         });
     }
 
-    /// Whether a session in `state` is a change from the last state recorded
+    /// Whether a session in `state` is a change from the last state reported
     /// for it, and if so remembers it. `ended` is remembered like any state:
     /// the PTY exiting and the hook's `SessionEnd` both report one end, and a
     /// new run under a reused key is a change from it.
@@ -327,7 +332,7 @@ impl OrderBook {
 }
 
 /// The lifecycle change a report is, if it is one: a session's first report, or
-/// one that leaves it in a state other than the last recorded. A subagent's
+/// one that leaves it in a state other than the last reported. A subagent's
 /// report is about the subagent, not the session the person sees, so it moves
 /// nothing here (its work is in the transcript rows, under its own id).
 #[cfg(unix)]

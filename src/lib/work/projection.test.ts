@@ -237,6 +237,20 @@ describe("projectWork joins", () => {
     ).toEqual([9]);
   });
 
+  it("does not count a run's token and lifecycle rows as recent events", () => {
+    const p = projectWork(
+      inputs({
+        leases: [lease("TASK-1")],
+        events: [
+          event({ id: 1, task_id: "TASK-1", action: "session.edit" }),
+          event({ id: 2, task_id: "TASK-1", action: "session.usage" }),
+          event({ id: 3, task_id: "TASK-1", action: "session.state" }),
+        ],
+      }),
+    );
+    expect(p.rows.find((r) => r.taskId === "TASK-1")!.verdicts.events).toBe(1);
+  });
+
   it("attributes verdicts and grants by what was recorded, never inferred", () => {
     const p = projectWork(
       inputs({
