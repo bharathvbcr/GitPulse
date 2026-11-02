@@ -90,7 +90,7 @@
       <div class="bar" role="img" aria-label={summary || "No time observed"} data-testid="agent-activity-bar">
         {#each timeline.segments.filter((s) => s.durationMs !== null && s.state !== "ended") as segment, index (index)}
           {@const share = shares[index]?.pct ?? 0}
-          <span style:width="{share}%" data-state={segment.state} title={segmentTitle(segment)} data-testid="agent-activity-segment"></span>
+          <span style:width="{share}%" data-state={segment.state} data-bound={segment.bound} title={segmentTitle(segment)} data-testid="agent-activity-segment"></span>
         {/each}
       </div>
       <ul class="legend" aria-label="Time by state">

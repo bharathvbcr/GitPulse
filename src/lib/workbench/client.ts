@@ -540,6 +540,11 @@ export function taskRun(value: unknown): TaskRun {
     cwd: text(raw.cwd), created_at: integer(raw.created_at), expires_at: integer(raw.expires_at), session_id: nullableText(raw.session_id),
     exit_code: raw.exit_code === null ? null : integer(raw.exit_code), reason: text(raw.reason), outcome_uncertain: boolean(raw.outcome_uncertain),
     ...(raw.model_choice === undefined ? {} : { model_choice: modelChoice(raw.model_choice) }),
+    // The attempt's own clock. Absent stays absent (never zero); `finished_at` is stored as
+    // null for an outcome nobody observed, and that null is kept: it is a statement, not a gap.
+    ...(raw.claimed_at == null ? {} : { claimed_at: integer(raw.claimed_at) }),
+    ...(raw.started_at == null ? {} : { started_at: integer(raw.started_at) }),
+    ...(raw.finished_at === undefined ? {} : { finished_at: raw.finished_at === null ? null : integer(raw.finished_at) }),
     ...(raw.git_dir === undefined ? {} : { git_dir: text(raw.git_dir) }),
     ...(raw.git_common_dir === undefined ? {} : { git_common_dir: text(raw.git_common_dir) }) };
 }

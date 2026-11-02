@@ -306,6 +306,36 @@
         ledgerRows=[];
         check("Reading the timeline raised no error",report.errors.length===0&&!card().querySelector('[data-testid="agent-activity-error"]'));
       }
+      // ---- A finished attempt's timeline is bounded by the store's own clock ----
+      // The record reaches the pane through the same decoder every run does, so
+      // a store-shaped body (epoch seconds, `started_at`/`finished_at`) is what
+      // proves those times survive it. The rows end at `turn_finished`: a PTY
+      // exit is usually not recorded, so only the run's `finished_at` can say
+      // how long the last span lasted.
+      {
+        const base=Date.parse("2026-09-01T12:00:00.000Z")/1000, at=seconds=>new Date((base+seconds)*1000).toISOString();
+        const template=[...runs.values()].find(item=>item.kind==="external_terminal");
+        // Not a Claude run: a deleted fixture stays in the loaded history, and an
+        // exited Claude attempt there would offer Resume to the checks below.
+        const done={...template,id:"finished-activity",provider:"codex",state:"exited",session_id:"finished-pty",exit_code:0,revision:2,claimed_at:base-70,started_at:base-60,finished_at:base+400};
+        const row=(id,session,action,object,detail)=>({id,ulid:`01FINISHED${String(id).padStart(16,"0")}`,ts_utc:at(0),schema_version:1,repo_path:"/fixture/GitPulse",worktree_path:null,actor_kind:"agent",actor_id:"claude-code",session_id:session,task_id:null,action,object,argv_json:null,outcome:"ok",verdict_json:null,before_ref:null,after_ref:null,duration_ms:null,detail_json:JSON.stringify(detail)});
+        ledgerRows=[
+          row(1,"finished-pty","session.state","prompt_submitted",{event:"prompt_submitted",occurred_at:at(0)}),
+          row(2,"finished-pty","session.state","turn_finished",{event:"turn_finished",occurred_at:at(300)}),
+          row(3,done.id,"session.edit","/fixture/GitPulse/src/done.ts",{occurred_at:at(120),result:"ok"}),
+        ];
+        runs.set(done.id,done);button("Refresh").click();
+        const card=()=>pane().querySelector(`[data-run-id="${done.id}"]`);
+        await wait(()=>card());
+        card().querySelector('[data-testid="agent-activity"]').open=true;
+        await wait(()=>card().querySelector('[data-testid="agent-activity-bar"]'));
+        const spans=[...card().querySelectorAll('[data-testid="agent-activity-segment"]')];
+        check("A finished attempt is drawn from its recorded start: a lead-in nobody observed, the work, then the rest up to its recorded end",
+          spans.map(span=>span.dataset.state).join(">")==="unknown>working>idle");
+        check("…and its last span is bounded by the run's own finish, with a length, not left as not observed",
+          spans.at(-1)?.dataset.bound==="finished"&&!spans.at(-1).title.includes("length not known")&&spans.at(-1).title.endsWith("1m 40s"));
+        runs.delete(done.id);ledgerRows=[];button("Refresh").click();await pause(100);
+      }
       // ---- Monitoring one agent from the pane ------------------------------
       {
         const watched=[...runs.values()].find(run=>run.session_id==="task-session-1"), sid=watched.session_id;
