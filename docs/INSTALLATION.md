@@ -44,6 +44,54 @@ xattr -dr com.apple.quarantine /Applications/GitPulse.app
 This removes a local quarantine attribute; it does not verify or notarize the app.
 Open GitPulse from Applications, Finder, or Spotlight.
 
+#### Signing local builds
+
+On macOS, `bun run tauri build` signs with a team identity when your login
+keychain has one: a **Developer ID Application** certificate first, otherwise
+an **Apple Development** certificate. It prints the identity it chose. With
+neither it signs ad-hoc, as the release workflow does. To choose for yourself,
+set Tauri's own variable, which always wins: `APPLE_SIGNING_IDENTITY=-` for an
+ad-hoc build, or a certificate's name or SHA-1 hash from
+`security find-identity -v -p codesigning`. The lookup is skipped when `CI` is
+set.
+
+A team signature keeps the same identity across rebuilds, so the cleaner agent
+and macOS privacy permissions keep recognising each new build. The first build
+signed this way is a new identity to macOS, so it may ask for permissions such
+as Automation again, once. Local builds use the hardened runtime that Tauri
+enables for every non-ad-hoc signature. An Apple Development signature is for
+your own Mac: Gatekeeper refuses it on others, so share Developer ID builds
+only.
+
+#### Replacing an installed build
+
+macOS pins each LaunchAgent it loads at login to the signature of the program
+the agent starts. For a team-signed build that pin is the team and signing
+identifier, which a rebuild keeps. An ad-hoc signature has no team identity, so
+the pin is that build's code hash, and every new build has a different one. If
+you replaced an ad-hoc GitPulse, or replaced one build with another signed by a
+different identity, while **Also run when GitPulse is closed** was on, the cleaner
+agent's next run (within 60 seconds) is killed before any GitPulse code runs.
+macOS saves a `gitpulse-*.ips` report with "Launch Constraint Violation" and may
+show "gitpulse quit unexpectedly". The GitPulse window is not affected. launchd
+then re-pins the agent to the new build, and the run after that succeeds. The
+launch-at-login agent starts only at login, so it does not hit this within a
+session.
+
+To avoid the refused run when installing such a build, unload the cleaner agent
+before you replace the app and load it again afterwards:
+
+```sh
+launchctl bootout "gui/$(id -u)/com.gitpulse.hygiene"
+# replace /Applications/GitPulse.app here
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.gitpulse.hygiene.plist
+```
+
+`bootout` stops a cleaner run that is in progress at that moment. An agent
+loaded with `bootstrap` is not pinned for the rest of that login session; macOS
+pins it again when it loads the agent at the next login. Skip both commands if
+the agent is not installed.
+
 #### Quitting
 
 Cmd-Q, Dock → Quit, the status menu's Quit item, and a Quit Apple event

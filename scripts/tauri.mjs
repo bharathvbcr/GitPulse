@@ -7,6 +7,7 @@ import {
   spawnLocalBin,
   withTauriDevUrl,
 } from "./dev-port.mjs";
+import { applySigningIdentity } from "./macos-signing.mjs";
 
 const repoRoot = defaultRepoRoot();
 const args = process.argv.slice(2);
@@ -16,6 +17,9 @@ if (process.platform === "darwin") {
   const binDir = path.join(repoRoot, "scripts", "bin");
   env.PATH = env.PATH ? `${binDir}:${env.PATH}` : binDir;
 }
+
+const signing = applySigningIdentity({ args, env });
+if (signing) console.info(signing);
 
 if (isTauriDevArgs(args)) {
   const result = await resolveDevPort({ repoRoot, env, allowAutoport: true });

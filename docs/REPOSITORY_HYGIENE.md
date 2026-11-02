@@ -72,6 +72,19 @@ leave the attempted schedule enabled. Foreign jobs and symlink paths are refused
 Disabling revokes authority before unloading the job. No shell or crontab entry
 is used. See [Apple's launchd guidance](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/ScheduledJobs.html).
 
+Replacing an ad-hoc signed app while this agent is loaded makes its next run
+fail. macOS pins an agent loaded at login to the code hash of the build it
+starts, which is all an ad-hoc signature offers, so the first run after the
+replacement is killed with "Launch Constraint Violation" before `--cleaner-due`
+executes. A build signed with a team identity is pinned by team and signing
+identifier instead and keeps running across rebuilds; local builds use one when
+the keychain has it ([Installation](INSTALLATION.md#signing-local-builds)).
+No cleanup starts, the policy is untouched, and launchd re-pins the agent to the
+new build for the following run. GitPulse's startup check compares only the
+agent's executable path, so it does not detect a build replaced at the same path.
+[Installation](INSTALLATION.md#replacing-an-installed-build) shows how to replace
+the app without the refused run.
+
 Intervals are elapsed hours, not a calendar or timezone promise. A due run claims
 and advances the next time before mutation. Restart/wake can attempt one missed
 run; missed intervals are not replayed. A manual run also advances an enabled

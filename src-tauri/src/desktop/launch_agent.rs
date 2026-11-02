@@ -8,6 +8,15 @@
 //! starting something else, every 60 seconds in the cleaner's case. Startup
 //! compares what each agent records with `current_exe` and either registers
 //! the running app again or says why it did not.
+//!
+//! Only the path is compared. A build replaced at the same path is `Current`
+//! here, yet macOS pins an agent loaded at login to the code hash of an
+//! ad-hoc build, so the cleaner's first run after replacing one is killed with
+//! a launch constraint violation before `main`, and launchd re-pins it for the
+//! next run. That run usually comes before the app is reopened, so
+//! re-registering at startup would not prevent it. A team-signed build is
+//! pinned by team instead (scripts/macos-signing.mjs picks one for local
+//! builds); docs/INSTALLATION.md covers replacing an ad-hoc build.
 
 use std::path::Path;
 
