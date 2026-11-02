@@ -563,6 +563,12 @@
         "minLength": 1,
         "type": "string"
       },
+      "parent_task_id": {
+        "description": "File this task as a subtask of an existing task in this repository: its task_id, or an item_id from gitpulse_list_tasks. A task has at most one parent, the parent must be live, a cycle is refused, and the chain may be only so deep. The parent you name is not held back as 'related work'",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
       "planned_files": {
         "description": "Files the work is expected to touch; kept as a section of the description",
         "items": {

@@ -499,6 +499,9 @@ tool_args! {
             intake::MAX_REVIEWED_RELATED,
             128,
         ),
+        parent_task_id: Option<String> = task_ref_spec(
+            "File this task as a subtask of an existing task in this repository: its task_id, or an item_id from gitpulse_list_tasks. A task has at most one parent, the parent must be live, a cycle is refused, and the chain may be only so deep. The parent you name is not held back as 'related work'",
+        ),
     }
 }
 
@@ -1130,7 +1133,7 @@ fn build_tools() -> Vec<Value> {
         mutating_tool(
             "gitpulse_add_task",
             "Add task",
-            "File a task on the GitPulse task board for this repository — the board a person sees and launches agents from. Prefer fewer, larger tasks: before filing, call gitpulse_list_tasks and fold related work into one task (one coherent concern each) rather than one task per finding. A new task is refused with related_tasks_exist while open tasks look like the same work; the refusal lists them. Then either fold yours into one (call again with that task's item_id as task_id and overwrite: true, carrying its content plus yours), or, if it is genuinely separate, pass reviewed_related with every listed item_id. Requires the repository to be trusted in GitPulse. task_id is the stable key: adding the same task_id again is refused unless overwrite is true, so a retry never makes a duplicate; overwrite also accepts a board item_id. Planned files are kept as a section of the description. Recorded in the board's event history.",
+            "File a task on the GitPulse task board for this repository — the board a person sees and launches agents from. Prefer fewer, larger tasks: before filing, call gitpulse_list_tasks and fold related work into one task (one coherent concern each) rather than one task per finding. A new task is refused with related_tasks_exist while open tasks look like the same work; the refusal lists them. Then either fold yours into one (call again with that task's item_id as task_id and overwrite: true, carrying its content plus yours), or, if it is genuinely separate, pass reviewed_related with every listed item_id. Requires the repository to be trusted in GitPulse. task_id is the stable key: adding the same task_id again is refused unless overwrite is true, so a retry never makes a duplicate; overwrite also accepts a board item_id. parent_task_id files the task as a subtask of one already on this repository's board, so work you split off stays under the task it came from. Planned files are kept as a section of the description. Recorded in the board's event history.",
             AddTaskArgs::properties(),
             &AddTaskArgs::required(),
             json!({
@@ -1146,6 +1149,7 @@ fn build_tools() -> Vec<Value> {
                     "priority": { "type": "integer" },
                     "repository": { "type": "object" },
                     "folded_into_description": { "type": "object" },
+                    "parent_item_id": { "type": ["string", "null"] },
                     "related_check": { "type": ["object", "null"] }
                 },
                 "required": ["ok", "outcome", "task_id", "item_id", "title", "status", "priority", "repository"]
@@ -1841,6 +1845,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 planned_files: a.planned_files.unwrap_or_default(),
                 repositories: a.repositories.unwrap_or_default(),
                 logs: a.logs,
+                parent: a.parent_task_id,
             };
             let reviewed = a.reviewed_related.unwrap_or_default();
             let store =
@@ -5582,6 +5587,195 @@ mod tests {
         assert!(!error, "{filed}");
         assert_eq!(filed["outcome"], "created");
         assert_eq!(filed["related_check"]["related_open_tasks"], 1);
+    }
+
+    /// The links a board task holds, read back the way the board reads them.
+    fn board_links(profile: &tempfile::TempDir, repo: &str, item_id: &str) -> Value {
+        let board =
+            crate::workbench::WorkbenchState::for_profile(&profile.path().join("workbench.sqlite"));
+        board
+            .board_register(repo, "board-new-id", "board-request")
+            .unwrap();
+        board
+            .board_request("items.get", &json!({"id": item_id}).to_string())
+            .unwrap()["item"]["links"]
+            .clone()
+    }
+
+    /// An agent that splits work off files it under the task it came from, by
+    /// that task's key or its board id, and is not held back as "related work"
+    /// for sharing the parent's words.
+    #[test]
+    fn a_task_can_be_filed_as_a_subtask_of_one_already_on_the_board() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let (error, parent) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-exporter", "title": "Ship the exporter pipeline", "labels": ["exporter"] }),
+        );
+        assert!(!error, "{parent}");
+        assert_eq!(parent["parent_item_id"], Value::Null);
+        let parent_id = parent["item_id"].as_str().unwrap().to_owned();
+
+        // Same words and label as the parent: unfiled without the parent named.
+        let sibling = json!({ "repo_path": repo, "task_id": "gp-exporter-retries", "title": "Ship the exporter pipeline retries", "labels": ["exporter"] });
+        let (error, held) = tool_json("gitpulse_add_task", sibling.clone());
+        assert!(
+            error && held.as_str().unwrap().starts_with("related_tasks_exist"),
+            "{held}"
+        );
+
+        let mut by_key = sibling.clone();
+        by_key["parent_task_id"] = json!("gp-exporter");
+        let (error, child) = tool_json("gitpulse_add_task", by_key);
+        assert!(!error, "{child}");
+        assert_eq!(child["outcome"], "created");
+        assert_eq!(child["parent_item_id"], parent_id.as_str());
+        assert_eq!(
+            board_links(&profile, &repo, child["item_id"].as_str().unwrap()),
+            json!([{"kind": "parent", "item_id": parent_id}])
+        );
+
+        let (error, by_id) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-exporter-docs", "title": "Document the exporter pipeline", "labels": ["exporter"],
+                    "parent_task_id": parent_id, "reviewed_related": [child["item_id"]] }),
+        );
+        assert!(!error, "{by_id}");
+        assert_eq!(by_id["parent_item_id"], parent_id.as_str());
+
+        // Folding more into the child keeps it under the parent and does not
+        // duplicate the link.
+        let (error, again) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-exporter-retries", "overwrite": true,
+                    "title": "Ship the exporter pipeline retries and backoff", "parent_task_id": "gp-exporter" }),
+        );
+        assert!(!error, "{again}");
+        assert_eq!(again["outcome"], "updated");
+        assert_eq!(
+            board_links(&profile, &repo, child["item_id"].as_str().unwrap()),
+            json!([{"kind": "parent", "item_id": parent_id}])
+        );
+    }
+
+    #[test]
+    fn a_subtask_naming_a_missing_or_deleted_parent_files_nothing() {
+        let (dir, _profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        // No board yet: there is nothing to be a parent of, and no trace is left.
+        let (error, none) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "title": "Orphaned subtask", "parent_task_id": "gp-nowhere" }),
+        );
+        assert!(error, "{none}");
+        assert!(none.as_str().unwrap().contains("gp-nowhere"), "{none}");
+
+        let (error, base) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-base", "title": "Rework the cache layer" }),
+        );
+        assert!(!error, "{base}");
+        let (error, missing) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "title": "Prune stale shards", "parent_task_id": "gp-nowhere" }),
+        );
+        assert!(error, "{missing}");
+        assert!(
+            missing.as_str().unwrap().contains("gp-nowhere"),
+            "{missing}"
+        );
+
+        let (error, deleted) = tool_json(
+            "gitpulse_delete_task",
+            json!({ "repo_path": repo, "task_id": "gp-base", "reason": "Superseded by another plan." }),
+        );
+        assert!(!error, "{deleted}");
+        let (error, gone) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "title": "Prune stale shards", "parent_task_id": "gp-base" }),
+        );
+        assert!(error, "{gone}");
+        assert!(gone.as_str().unwrap().contains("deleted"), "{gone}");
+
+        let (_, listed) = tool_json("gitpulse_list_tasks", json!({ "repo_path": repo }));
+        assert_eq!(listed["total"], 0, "a refused subtask files nothing");
+    }
+
+    /// The store's own rules decide a parent link, and the call that breaks one
+    /// is an error that leaves the board as it was.
+    #[test]
+    fn a_parent_that_would_make_a_cycle_or_a_second_parent_is_refused() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let mut ids = std::collections::HashMap::new();
+        for (key, title, parent) in [
+            ("gp-a", "Quarterly roadmap alpha", None),
+            ("gp-b", "Billing migration bravo", Some("gp-a")),
+            ("gp-c", "Telemetry rollout charlie", Some("gp-b")),
+        ] {
+            let mut args = json!({ "repo_path": repo, "task_id": key, "title": title });
+            if let Some(parent) = parent {
+                args["parent_task_id"] = json!(parent);
+            }
+            let (error, filed) = tool_json("gitpulse_add_task", args);
+            assert!(!error, "{key}: {filed}");
+            ids.insert(key, filed["item_id"].as_str().unwrap().to_owned());
+        }
+        // The top of the chain cannot be hung under its own grandchild.
+        let (error, cycle) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-a", "overwrite": true,
+                    "title": "Quarterly roadmap alpha", "parent_task_id": "gp-c" }),
+        );
+        assert!(error, "{cycle}");
+        assert!(cycle.as_str().unwrap().contains("subtask"), "{cycle}");
+        assert_eq!(board_links(&profile, &repo, &ids["gp-a"]), json!([]));
+
+        // A task has one parent: naming another replaces it, never adds a second.
+        let (error, moved) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-c", "overwrite": true,
+                    "title": "Telemetry rollout charlie", "parent_task_id": "gp-a" }),
+        );
+        assert!(!error, "{moved}");
+        let links = board_links(&profile, &repo, moved["item_id"].as_str().unwrap());
+        assert_eq!(links.as_array().unwrap().len(), 1, "{links}");
+        assert_eq!(links[0]["item_id"], json!(ids["gp-a"]));
+    }
+
+    /// A chain past the store's depth bound is refused by the store and the
+    /// error reaches the agent; the board keeps the chain it had.
+    #[test]
+    fn a_subtask_past_the_depth_bound_is_refused() {
+        let (dir, _profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        // dc-store `MAX_PARENT_DEPTH`: the most tasks one parent chain holds.
+        const DEPTH: usize = 256;
+        let mut previous: Option<String> = None;
+        for n in 0..DEPTH {
+            let key = format!("gp-chain-{n}");
+            // Words no other title shares, so the related-work check stays out of it.
+            let mut args =
+                json!({ "repo_path": repo, "task_id": key, "title": format!("zq{n} wv{n}") });
+            if let Some(parent) = &previous {
+                args["parent_task_id"] = json!(parent);
+            }
+            let (error, filed) = tool_json("gitpulse_add_task", args);
+            assert!(!error, "link {n} of the chain: {filed}");
+            previous = Some(key);
+        }
+        let (error, deeper) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "gp-chain-too-deep", "title": "Zzyzx quux", "parent_task_id": previous }),
+        );
+        assert!(error, "{deeper}");
+        assert!(deeper.as_str().unwrap().contains("deeper"), "{deeper}");
+        let (_, listed) = tool_json(
+            "gitpulse_list_tasks",
+            json!({ "repo_path": repo, "limit": 1 }),
+        );
+        assert_eq!(listed["total"], DEPTH);
     }
 
     #[test]
