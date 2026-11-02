@@ -84,7 +84,7 @@ describe("items", () => {
       // A row from before results were paired: no detail.result, column says ok.
       command("ls", 20),
       // The writer forces `ok` into the column for a call whose result was never read.
-      command("sleep 600", 30, {}, { result: "unobserved" }),
+      command("sleep 600", 30),
     ];
     const timeline = projectRunTimeline(rows, GONE, NOW, 100);
     expect(timeline.items.map((i) => [i.label, i.kind, i.outcome, i.durationMs, i.subagentId])).toEqual([
@@ -98,7 +98,7 @@ describe("items", () => {
   });
 
   it("never reads a duration off a call whose result was not read", () => {
-    const [item] = projectRunTimeline([command("x", 1, { duration_ms: 5 }, { result: "unobserved" })], GONE, NOW, 100).items;
+    const [item] = projectRunTimeline([command("x", 1, { duration_ms: 5 })], GONE, NOW, 100).items;
     expect(item.durationMs).toBeNull();
   });
 
@@ -191,7 +191,7 @@ describe("segments", () => {
       state("turn_finished", 100),
       command("cargo test", 20, { duration_ms: 30_000 }, { result: "ok" }),
       // Not measured: its time stays working.
-      command("sleep 1", 70, {}, { result: "unobserved" }),
+      command("sleep 1", 70),
     ];
     const timeline = projectRunTimeline(rows, GONE, NOW, 100);
     expect(timeline.segments.map((s) => [s.state, s.durationMs])).toEqual([

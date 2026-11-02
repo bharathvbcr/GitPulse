@@ -718,7 +718,8 @@ mod ledger_tail_filter_tests {
         let state = row(&repo, Some("s"), "session.state", "x");
         row(&repo, Some("t"), "session.state", "y");
         let wanted = vec!["s".to_string()];
-        let got = filtered_tail(&repo, 0, 100, false, &wanted, Some("session.state".into())).unwrap();
+        let got =
+            filtered_tail(&repo, 0, 100, false, &wanted, Some("session.state".into())).unwrap();
         assert_eq!(ids(&got), vec![state]);
         let any = filtered_tail(&repo, 0, 100, false, &[], Some("session.state".into())).unwrap();
         assert_eq!(any.len(), 2);
@@ -730,7 +731,12 @@ mod ledger_tail_filter_tests {
         let mut all = Vec::new();
         for i in 0..6 {
             let session = if i % 2 == 0 { "a" } else { "b" };
-            all.push(row(&repo, Some(session), "session.command", &format!("c{i}")));
+            all.push(row(
+                &repo,
+                Some(session),
+                "session.command",
+                &format!("c{i}"),
+            ));
         }
         let wanted = vec!["a".to_string(), "b".to_string()];
         let first = filtered_tail(&repo, 0, 4, false, &wanted, None).unwrap();
@@ -755,6 +761,8 @@ mod ledger_tail_filter_tests {
     fn a_repository_with_no_ledger_yet_reads_as_no_rows() {
         let (_dir, repo) = git_repo();
         let wanted = vec!["s".to_string()];
-        assert!(filtered_tail(&repo, 0, 100, false, &wanted, None).unwrap().is_empty());
+        assert!(filtered_tail(&repo, 0, 100, false, &wanted, None)
+            .unwrap()
+            .is_empty());
     }
 }

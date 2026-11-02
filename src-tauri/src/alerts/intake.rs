@@ -331,7 +331,10 @@ impl OrderBook {
 /// report is about the subagent, not the session the person sees, so it moves
 /// nothing here (its work is in the transcript rows, under its own id).
 #[cfg(unix)]
-fn lifecycle_change(book: &mut OrderBook, notice: &Notice) -> Option<crate::ledger::lifecycle::Change> {
+fn lifecycle_change(
+    book: &mut OrderBook,
+    notice: &Notice,
+) -> Option<crate::ledger::lifecycle::Change> {
     let event = notice.event?;
     if notice.subagent {
         return None;

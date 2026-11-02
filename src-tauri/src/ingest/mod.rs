@@ -477,13 +477,13 @@ fn transcript_draft(
             "cache_read": usage.cache_read,
             "cache_creation": usage.cache_creation,
         });
-    } else if call.result != transcript::CallResult::Unobserved {
+    } else if let Some(word) = call.result.word() {
         // What the result said, in words the column cannot say: the column has
         // no "unknown", so a call whose result was never read is `ok` there
         // (as every transcript row has always been) and has no `result` here,
         // and only the presence of this key tells a call that passed from one
         // that was never seen to finish. A reader asks the key, not the column.
-        detail["result"] = call.result.word().into();
+        detail["result"] = word.into();
         if let Some(id) = &call.tool_use_id {
             detail["tool_use_id"] = id.clone().into();
         }
@@ -1822,7 +1822,13 @@ mod tests {
 
     /// An assistant record of response `message` holding one tool call, with its
     /// usage. Synthetic.
-    fn call_line(repo: &str, message: &str, ts: &str, id: &str, block: serde_json::Value) -> String {
+    fn call_line(
+        repo: &str,
+        message: &str,
+        ts: &str,
+        id: &str,
+        block: serde_json::Value,
+    ) -> String {
         let mut block = block;
         block["type"] = "tool_use".into();
         block["id"] = id.into();
@@ -1886,16 +1892,32 @@ mod tests {
         );
         let out = with_transcript_root(tdir.path(), || ingest_transcripts(repo));
         let events = ledger::tail(repo, 0, 10).unwrap();
-        let command = events.iter().find(|e| e.action == "session.command").expect("the command");
-        assert_eq!(command.outcome, "failed", "the result was flagged as an error");
+        let command = events
+            .iter()
+            .find(|e| e.action == "session.command")
+            .expect("the command");
+        assert_eq!(
+            command.outcome, "failed",
+            "the result was flagged as an error"
+        );
         assert_eq!(command.duration_ms, Some(2500));
         let detail = detail_of(command);
         assert_eq!(detail["result"], "error");
         assert_eq!(detail["tool_use_id"], "tu1");
-        assert_eq!(detail["occurred_at"], T0, "dated by the call, not by its result");
-        assert!(!command.detail_json.as_deref().unwrap().contains("SYNTHETIC-OUTPUT"));
+        assert_eq!(
+            detail["occurred_at"], T0,
+            "dated by the call, not by its result"
+        );
+        assert!(!command
+            .detail_json
+            .as_deref()
+            .unwrap()
+            .contains("SYNTHETIC-OUTPUT"));
         // The response's tokens, once.
-        let usage: Vec<_> = events.iter().filter(|e| e.action == "session.usage").collect();
+        let usage: Vec<_> = events
+            .iter()
+            .filter(|e| e.action == "session.usage")
+            .collect();
         assert_eq!(usage.len(), 1, "{events:?}");
         assert_eq!(
             detail_of(usage[0])["usage"],
@@ -1911,10 +1933,13 @@ mod tests {
         let tdir = tempfile::tempdir().unwrap();
         let call = call_line(repo, "m1", T0, "tu1", bash("sleep 5"));
         // The agent is mid-command: the file was just written.
-        write_transcript(tdir.path(), "slug/S1.jsonl", &[call.clone()], 0);
+        write_transcript(tdir.path(), "slug/S1.jsonl", std::slice::from_ref(&call), 0);
         with_transcript_root(tdir.path(), || {
             let first = ingest_transcripts(repo);
-            assert_eq!(first.recorded, 0, "nothing is recorded without a result: {first:?}");
+            assert_eq!(
+                first.recorded, 0,
+                "nothing is recorded without a result: {first:?}"
+            );
             // The result arrives, as the same file grows.
             write_transcript(
                 tdir.path(),
@@ -1926,8 +1951,14 @@ mod tests {
             assert!(second.recorded >= 1, "{second:?}");
         });
         let events = ledger::tail(repo, 0, 10).unwrap();
-        let command = events.iter().find(|e| e.action == "session.command").expect("the command");
-        assert_eq!((command.outcome.as_str(), command.duration_ms), ("ok", Some(2500)));
+        let command = events
+            .iter()
+            .find(|e| e.action == "session.command")
+            .expect("the command");
+        assert_eq!(
+            (command.outcome.as_str(), command.duration_ms),
+            ("ok", Some(2500))
+        );
         assert_eq!(detail_of(command)["result"], "ok");
         // And a later pass adds nothing: the held lines were read twice, the rows once.
         let before = ledger::tail(repo, 0, 100).unwrap().len();
@@ -1948,7 +1979,10 @@ mod tests {
         );
         with_transcript_root(tdir.path(), || ingest_transcripts(repo));
         let events = ledger::tail(repo, 0, 10).unwrap();
-        let command = events.iter().find(|e| e.action == "session.command").expect("the command");
+        let command = events
+            .iter()
+            .find(|e| e.action == "session.command")
+            .expect("the command");
         let detail = detail_of(command);
         assert!(
             detail.get("result").is_none(),
@@ -1966,7 +2000,13 @@ mod tests {
             tdir.path(),
             "slug/S1/subagents/agent-a1b2c3.jsonl",
             &[
-                call_line(repo, "m1", T0, "tu1", serde_json::json!({ "name": "Edit", "input": { "file_path": format!("{repo}/a.rs") } })),
+                call_line(
+                    repo,
+                    "m1",
+                    T0,
+                    "tu1",
+                    serde_json::json!({ "name": "Edit", "input": { "file_path": format!("{repo}/a.rs") } }),
+                ),
                 result_line(T2, "tu1", false),
             ],
             IDLE,
@@ -1975,7 +2015,13 @@ mod tests {
             tdir.path(),
             "slug/S1.jsonl",
             &[
-                call_line(repo, "m9", T0, "tu9", serde_json::json!({ "name": "Edit", "input": { "file_path": format!("{repo}/b.rs") } })),
+                call_line(
+                    repo,
+                    "m9",
+                    T0,
+                    "tu9",
+                    serde_json::json!({ "name": "Edit", "input": { "file_path": format!("{repo}/b.rs") } }),
+                ),
                 result_line(T2, "tu9", false),
             ],
             IDLE,
@@ -1985,16 +2031,24 @@ mod tests {
         let by_object = |suffix: &str| {
             events
                 .iter()
-                .find(|e| e.action == "session.edit" && e.object.as_deref().is_some_and(|o| o.ends_with(suffix)))
+                .find(|e| {
+                    e.action == "session.edit"
+                        && e.object.as_deref().is_some_and(|o| o.ends_with(suffix))
+                })
                 .unwrap()
         };
         assert_eq!(detail_of(by_object("a.rs"))["subagent_id"], "a1b2c3");
         assert_eq!(by_object("a.rs").session_id.as_deref(), Some("S1"));
         assert!(detail_of(by_object("b.rs")).get("subagent_id").is_none());
         // The subagent's response is its own usage row, named for it.
-        let usage: Vec<_> = events.iter().filter(|e| e.action == "session.usage").collect();
+        let usage: Vec<_> = events
+            .iter()
+            .filter(|e| e.action == "session.usage")
+            .collect();
         assert_eq!(usage.len(), 2);
-        assert!(usage.iter().any(|e| detail_of(e)["subagent_id"] == "a1b2c3"));
+        assert!(usage
+            .iter()
+            .any(|e| detail_of(e)["subagent_id"] == "a1b2c3"));
     }
 
     #[test]

@@ -567,7 +567,8 @@ fn ingest_family(
                     // for long enough that its results are not coming.
                     finished = true;
                     let still = modified_ms.is_none_or(|at| {
-                        ledger::ids::now_millis().saturating_sub(at) > transcript::PENDING_MAX_AGE_MS
+                        ledger::ids::now_millis().saturating_sub(at)
+                            > transcript::PENDING_MAX_AGE_MS
                     });
                     (parser.finish(still), start + consumed, 0)
                 }

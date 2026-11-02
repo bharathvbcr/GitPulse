@@ -51,8 +51,13 @@ pub const EVENTS: [&str; 12] = [
 pub fn state_of(event: &str) -> Option<&'static str> {
     Some(match event {
         "prompt_submitted" | "tool_finished" => "working",
-        "permission_prompt" | "permission_request" | "idle_prompt" | "agent_needs_input"
-        | "elicitation_dialog" | "elicitation_url_dialog" | "error" => "waiting_you",
+        "permission_prompt"
+        | "permission_request"
+        | "idle_prompt"
+        | "agent_needs_input"
+        | "elicitation_dialog"
+        | "elicitation_url_dialog"
+        | "error" => "waiting_you",
         "turn_finished" | "agent_completed" => "idle",
         "session_ended" => "ended",
         _ => return None,
@@ -107,7 +112,12 @@ pub fn record(repository: &str, run_id: Option<&str>, change: &Change) -> Option
         occurred_at: super::ids::iso8601_utc(change.at_ms),
         // Seen by this process when it was told, not read from the agent's clock.
         occurred_at_basis: "ingest".to_string(),
-        task_basis: if task_id.is_some() { "bound" } else { "unbound" }.to_string(),
+        task_basis: if task_id.is_some() {
+            "bound"
+        } else {
+            "unbound"
+        }
+        .to_string(),
     };
     super::record(Draft {
         repo_path: ledger_repo,
@@ -151,7 +161,10 @@ mod tests {
 
     #[test]
     fn the_list_is_the_bridges_vocabulary() {
-        let bridge: Vec<&str> = crate::alerts::bridge::EVENTS.iter().map(|e| e.name).collect();
+        let bridge: Vec<&str> = crate::alerts::bridge::EVENTS
+            .iter()
+            .map(|e| e.name)
+            .collect();
         let mut mine = EVENTS.to_vec();
         let mut theirs = bridge;
         mine.sort_unstable();
@@ -180,15 +193,20 @@ mod tests {
         let repo = path.to_string_lossy().into_owned();
         // 2026-09-01T12:00:00.000Z
         let at = super::super::ids::parse_event_time("2026-09-01T12:00:00.000Z").unwrap();
-        let id = record(&repo, Some("run-7"), &change("permission_request", "waiting_you", at))
-            .expect("recorded");
+        let id = record(
+            &repo,
+            Some("run-7"),
+            &change("permission_request", "waiting_you", at),
+        )
+        .expect("recorded");
         let rows = super::super::tail(&repo, 0, 10).unwrap();
         let row = rows.iter().find(|r| r.id == id).expect("the row");
         assert_eq!(row.action, ACTION);
         assert_eq!(row.session_id.as_deref(), Some("term-1"));
         assert_eq!(row.object.as_deref(), Some("permission_request"));
         assert_eq!(row.actor_kind, "agent");
-        let detail: serde_json::Value = serde_json::from_str(row.detail_json.as_deref().unwrap()).unwrap();
+        let detail: serde_json::Value =
+            serde_json::from_str(row.detail_json.as_deref().unwrap()).unwrap();
         assert_eq!(detail["event"], "permission_request");
         assert_eq!(detail["state"], "waiting_you");
         assert_eq!(detail["run_id"], "run-7");

@@ -51,11 +51,11 @@ pub enum CallResult {
 
 impl CallResult {
     /// The word `detail_json.result` carries; an unobserved call carries none.
-    pub fn word(self) -> &'static str {
+    pub fn word(self) -> Option<&'static str> {
         match self {
-            CallResult::Unobserved => "unobserved",
-            CallResult::Succeeded => "ok",
-            CallResult::Errored => "error",
+            CallResult::Unobserved => None,
+            CallResult::Succeeded => Some("ok"),
+            CallResult::Errored => Some("error"),
         }
     }
 }
@@ -364,7 +364,10 @@ impl<'de: 'a, 'a> Deserialize<'de> for ResultBlocks<'a> {
                 f.write_str("a message's content")
             }
 
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
                 let mut blocks = Vec::new();
                 while let Some(block) = seq.next_element::<ResultBlock<'a>>()? {
                     blocks.push(block);
@@ -376,7 +379,10 @@ impl<'de: 'a, 'a> Deserialize<'de> for ResultBlocks<'a> {
                 Ok(ResultBlocks(Vec::new()))
             }
 
-            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
                 while map
                     .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
                     .is_some()
@@ -504,7 +510,10 @@ impl Reader {
     /// The offset of the earliest line a call or a response still being read
     /// came from: the pass's cursor must not pass it.
     pub fn held_from(&self) -> Option<u64> {
-        let calls = self.pending.iter().filter_map(|c| c.origin.map(|o| o.offset));
+        let calls = self
+            .pending
+            .iter()
+            .filter_map(|c| c.origin.map(|o| o.offset));
         let usage = self
             .open_usage
             .iter()
@@ -585,11 +594,15 @@ impl Reader {
                 };
                 self.note_time(ts);
                 let message = record.message.as_ref();
-                out.extend(self.note_usage(
-                    base,
-                    message.and_then(|m| m.id.as_deref()),
-                    message.and_then(|m| m.usage.as_ref()).and_then(UsageWire::counts),
-                ));
+                out.extend(
+                    self.note_usage(
+                        base,
+                        message.and_then(|m| m.id.as_deref()),
+                        message
+                            .and_then(|m| m.usage.as_ref())
+                            .and_then(UsageWire::counts),
+                    ),
+                );
             }
         }
         out.extend(self.expire());
@@ -638,12 +651,12 @@ impl Reader {
             } else {
                 CallResult::Succeeded
             };
-            call.duration_ms = at_ms.zip(crate::ledger::ids::parse_event_time(&call.ts_utc)).and_then(
-                |(done, began)| {
+            call.duration_ms = at_ms
+                .zip(crate::ledger::ids::parse_event_time(&call.ts_utc))
+                .and_then(|(done, began)| {
                     done.checked_sub(began)
                         .and_then(|span| i64::try_from(span).ok())
-                },
-            );
+                });
             out.push(call);
         }
         out.extend(self.expire());
@@ -1335,11 +1348,15 @@ mod reader_tests {
     }
 
     fn bash(id: &str) -> String {
-        format!(r#"{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":"cargo test"}}}}"#)
+        format!(
+            r#"{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":"cargo test"}}}}"#
+        )
     }
 
     fn edit(id: &str) -> String {
-        format!(r#"{{"type":"tool_use","id":"{id}","name":"Edit","input":{{"file_path":"/repo/a.rs"}}}}"#)
+        format!(
+            r#"{{"type":"tool_use","id":"{id}","name":"Edit","input":{{"file_path":"/repo/a.rs"}}}}"#
+        )
     }
 
     fn thinking() -> String {
@@ -1442,9 +1459,11 @@ mod reader_tests {
         let mut reader = Reader::new(None);
         feed(&mut reader, 0, &assistant(T0, "m1", &bash("tu1"), 5));
         let soon = "2026-09-01T12:14:00.000Z";
-        assert!(feed(&mut reader, 900, &assistant(soon, "m2", &thinking(), 9))
-            .iter()
-            .all(|c| c.tool != "Bash"));
+        assert!(
+            feed(&mut reader, 900, &assistant(soon, "m2", &thinking(), 9))
+                .iter()
+                .all(|c| c.tool != "Bash")
+        );
     }
 
     #[test]
@@ -1453,10 +1472,14 @@ mod reader_tests {
         let mut written = 0;
         for i in 0..(MAX_PENDING as u64 + 10) {
             let id = format!("tu{i}");
-            written += feed(&mut reader, i * 10, &assistant(T0, &format!("m{i}"), &bash(&id), 1))
-                .iter()
-                .filter(|c| c.tool == "Bash")
-                .count();
+            written += feed(
+                &mut reader,
+                i * 10,
+                &assistant(T0, &format!("m{i}"), &bash(&id), 1),
+            )
+            .iter()
+            .filter(|c| c.tool == "Bash")
+            .count();
         }
         assert_eq!(written, 10, "the oldest ten were pushed out unpaired");
         assert!(reader.pending.len() <= MAX_PENDING);
@@ -1532,13 +1555,18 @@ mod reader_tests {
             Some("a1b2c3")
         );
         assert_eq!(subagent_id_of(std::path::Path::new("/p/s.jsonl")), None);
-        assert_eq!(subagent_id_of(std::path::Path::new("/p/agent-.jsonl")), None);
+        assert_eq!(
+            subagent_id_of(std::path::Path::new("/p/agent-.jsonl")),
+            None
+        );
         let mut reader = Reader::for_path(std::path::Path::new("/p/agent-a1b2c3.jsonl"));
         feed(&mut reader, 0, &assistant(T0, "m1", &bash("tu1"), 5));
         let mut rows = feed(&mut reader, 10, &result(T0_2S, "tu1", None));
         rows.extend(reader.finish(true));
         assert_eq!(rows.len(), 2, "the call and its response's usage");
-        assert!(rows.iter().all(|r| r.subagent_id.as_deref() == Some("a1b2c3")));
+        assert!(rows
+            .iter()
+            .all(|r| r.subagent_id.as_deref() == Some("a1b2c3")));
         // The session id is still the parent's: that is why the id is needed.
         assert!(rows.iter().all(|r| r.session_id == "S1"));
         let mut own = Reader::for_path(std::path::Path::new("/p/S1.jsonl"));

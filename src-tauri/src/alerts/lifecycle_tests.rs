@@ -84,7 +84,10 @@ fn a_tool_call_per_report_is_one_change_not_one_per_call() {
     for _ in 0..20 {
         rig.say("tool_finished", S);
     }
-    assert_eq!(rig.told(), vec![(S.to_string(), "prompt_submitted", "working")]);
+    assert_eq!(
+        rig.told(),
+        vec![(S.to_string(), "prompt_submitted", "working")]
+    );
 }
 
 #[test]
@@ -103,7 +106,11 @@ fn only_a_change_of_state_is_told_and_each_is_told_with_its_event() {
     ] {
         rig.say(event, S);
     }
-    let states: Vec<_> = rig.told().into_iter().map(|(_, event, state)| (event, state)).collect();
+    let states: Vec<_> = rig
+        .told()
+        .into_iter()
+        .map(|(_, event, state)| (event, state))
+        .collect();
     assert_eq!(
         states,
         vec![
@@ -161,7 +168,8 @@ fn a_report_from_outside_any_terminal_names_no_session_and_is_not_told() {
     let mut rig = Rig::new();
     // Keyed `hook-claude-elsewhere`: it names no terminal the registry could
     // place in a repository, and a peer chose its place.
-    let offer = rig.say_json(r#"{"v":1,"event":"permission_prompt","agent":"claude","cwd":"/tmp/elsewhere"}"#);
+    let offer = rig
+        .say_json(r#"{"v":1,"event":"permission_prompt","agent":"claude","cwd":"/tmp/elsewhere"}"#);
     assert_eq!(offer, Offer::Accepted, "the banner itself is still offered");
     assert!(rig.told().is_empty());
 }
@@ -171,7 +179,8 @@ fn a_stale_report_is_not_told() {
     let mut rig = Rig::new();
     rig.say("prompt_submitted", S);
     let older = bridge::parse_report_stamped(
-        format!(r#"{{"v":1,"event":"permission_request","agent":"claude","session":"{S}"}}"#).as_bytes(),
+        format!(r#"{{"v":1,"event":"permission_request","agent":"claude","session":"{S}"}}"#)
+            .as_bytes(),
     )
     .unwrap()
     .0;
@@ -188,7 +197,8 @@ fn a_report_the_queue_refused_is_not_told() {
     // Nobody will ever drain it.
     drop(receiver);
     let notice = bridge::parse_report_stamped(
-        format!(r#"{{"v":1,"event":"prompt_submitted","agent":"claude","session":"{S}"}}"#).as_bytes(),
+        format!(r#"{{"v":1,"event":"prompt_submitted","agent":"claude","session":"{S}"}}"#)
+            .as_bytes(),
     )
     .unwrap()
     .0;
@@ -201,7 +211,8 @@ fn an_intake_with_no_host_tells_nobody_and_still_orders_reports() {
     let counters = Arc::new(Counters::default());
     let (intake, receiver) = Intake::channel(counters);
     let notice = bridge::parse_report_stamped(
-        format!(r#"{{"v":1,"event":"prompt_submitted","agent":"claude","session":"{S}"}}"#).as_bytes(),
+        format!(r#"{{"v":1,"event":"prompt_submitted","agent":"claude","session":"{S}"}}"#)
+            .as_bytes(),
     )
     .unwrap()
     .0;

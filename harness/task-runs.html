@@ -259,7 +259,7 @@
           state("prompt_submitted",0),state("permission_request",200),state("tool_finished",230),state("turn_finished",300),
           row(run.id,"session.command","cargo build",{occurred_at:at(5),result:"ok"},{duration_ms:4200}),
           row(run.id,"session.command","cargo test --lib",{occurred_at:at(20),result:"error",subagent_id:"a1b2c3d4e5"},{outcome:"failed",duration_ms:90000}),
-          row(run.id,"session.command","sleep 600",{occurred_at:at(130),result:"unobserved"}),
+          row(run.id,"session.command","sleep 600",{occurred_at:at(130)}),
           row(run.id,"session.edit","/fixture/GitPulse/src/reconnect.ts",{occurred_at:at(140),result:"ok"}),
           usage(3,400,1000,70,10),usage(2,100,2000,0,45),
         ];

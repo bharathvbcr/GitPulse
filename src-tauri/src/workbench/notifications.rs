@@ -705,9 +705,11 @@ impl<R: tauri::Runtime> crate::alerts::Host for SessionHost<R> {
             };
             crate::ledger::lifecycle::record(&entry.repo, entry.run_id.as_deref(), &change);
         };
-        if let Err(error) =
-            crate::supervisor::spawn_one_of_many("session-lifecycle-ledger", "session lifecycle ledger", work)
-        {
+        if let Err(error) = crate::supervisor::spawn_one_of_many(
+            "session-lifecycle-ledger",
+            "session lifecycle ledger",
+            work,
+        ) {
             log::warn!(target: "alerts", "lifecycle change not recorded: {error}");
         }
     }
