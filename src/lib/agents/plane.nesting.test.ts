@@ -161,6 +161,20 @@ describe("child agent processes", () => {
     expect(plane.gaps.some((gap) => gap.label === "Child sessions" && gap.kind === "partial")).toBe(true);
   });
 
+  it("are counted as unplaced, with a note, when the session above them is in no probe read", () => {
+    // Pid 812's parent is 9_999, an agent that runs outside every probed worktree.
+    const plane = project({
+      probes: [probe({ snapshot: withLive({ [ALPHA]: [live(812, { tree: "session:s1", parent_pid: 9_999 })] }) })],
+      terminals: [session()],
+    });
+    expect(find(plane.rows, (row) => row.liveKey === "t1").children).toEqual([]);
+    expect(plane.childSessions).toBe(0);
+    expect(plane.unplacedSessions).toBe(1);
+    const note = plane.gaps.find((gap) => gap.label === "Child sessions");
+    expect(note?.kind).toBe("partial");
+    expect(note?.reason).toContain("1 child agent session");
+  });
+
   it("terminate on a lineage that loops, and attach to nothing", () => {
     const plane = project({
       probes: [probe({ snapshot: withLive({ [ALPHA]: [

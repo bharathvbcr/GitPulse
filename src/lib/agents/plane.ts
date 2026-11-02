@@ -745,8 +745,9 @@ function collectProcesses(snapshots: readonly InsightsSnapshot[]): Map<number, L
  * id it carries, else the agent checkout its directory is in. A process with
  * no process above it is not a row (it is the session a terminal or checkout
  * row already stands for, or one this window did not start). A chain that
- * loops, runs past [`MAX_LINEAGE`], or ends at nothing the plane shows is
- * counted as unplaced, never dropped and never attached to a guess.
+ * loops, runs past [`MAX_LINEAGE`], ends at nothing the plane shows, or names
+ * a parent no probe listed is counted as unplaced, never dropped and never
+ * attached to a guess.
  */
 function placeSessions(
   processes: ReadonlyMap<number, LiveProcess>,
@@ -801,7 +802,14 @@ function placeSessions(
   let placed = 0;
   let unplaced = 0;
   for (const process of [...processes.values()].sort((a, b) => a.pid - b.pid)) {
-    if (process.parentPid === null || !processes.has(process.parentPid)) continue;
+    if (process.parentPid === null) continue;
+    // The agent above it was in no probe read (its directory is outside every
+    // probed worktree, or in a repository that was not probed). That is a
+    // child whose place is unknown, not a process with nothing above it.
+    if (!processes.has(process.parentPid)) {
+      unplaced += 1;
+      continue;
+    }
     if (containerOf(process, new Set()) === null) unplaced += 1;
     else placed += 1;
   }
@@ -1210,7 +1218,7 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
       repoPath: "",
       label: "Child sessions",
       kind: "partial",
-      reason: `${plural(placed.unplaced, "child agent session", "child agent sessions")} could not be placed under a row: the session above ${placed.unplaced === 1 ? "it is" : "them is"} not one of the rows shown. Their count is kept; their place is unknown.`,
+      reason: `${plural(placed.unplaced, "child agent session", "child agent sessions")} could not be placed under a row: the session above ${placed.unplaced === 1 ? "it is" : "them is"} not one of the rows shown, or was not listed by any repository read. Their count is kept; their place is unknown.`,
     });
   }
   for (const row of rows) {

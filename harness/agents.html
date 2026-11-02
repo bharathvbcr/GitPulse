@@ -47,6 +47,8 @@
       let mode = "ready";
       // Whether the process table shows a child agent under alpha's session.
       let lineage = false;
+      // Whether a further agent process names a parent that no probe lists.
+      let orphan = false;
       let taskMode = "running";
       let holding = true;
       let releaseHold = () => {};
@@ -77,6 +79,7 @@
                 worktrees: [{ path: ALPHA, sessions: [
                   { kind: "claude", pid: 900, entrypoint: "cli", status: "busy", cwd: ALPHA, tree: "session:pty-alpha" },
                   { kind: "codex", pid: 901, entrypoint: "", status: "idle", cwd: ALPHA, tree: "session:pty-alpha", parent_pid: 900 },
+                  ...(orphan ? [{ kind: "codex", pid: 902, entrypoint: "", status: "busy", cwd: ALPHA, tree: "session:pty-alpha", parent_pid: 9999 }] : []),
                 ] }],
               }
               : { ok: true, sessions: 0, kinds: [], worktrees: [] },
@@ -363,6 +366,20 @@
         await press("Live");
         check("the live filter keeps a parent with its live child", () => !!row("alpha") && !!row("Child session"));
         await press("All");
+
+        // A child whose parent is in no probe read is neither nested nor dropped:
+        // it is counted as unplaced and the plane says so.
+        orphan = true;
+        button("Refresh").click();
+        await until(() => text().includes("Child sessions") && text().includes("could not be placed under a row"), "a child with an unseen parent was dropped without a trace");
+        check("a child whose parent no probe lists is said to be unplaced, not left out", () =>
+          text().includes("1 child agent session could not be placed under a row") && !!row("Child session"));
+        check("the unseen-parent child is not nested under any row", () => rows().filter((item) => item.textContent.includes("pid 902")).length === 0);
+        // Later checks read the plane without any child agent process.
+        orphan = false;
+        lineage = false;
+        button("Refresh").click();
+        await until(() => !row("Child session") && !text().includes("could not be placed under a row"), "the child sessions did not clear");
 
         let releaseSlow = () => {};
         slow = new Promise((resolve) => { releaseSlow = resolve; });
