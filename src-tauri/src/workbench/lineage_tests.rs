@@ -137,6 +137,31 @@ fn the_read_is_bounded_and_refuses_what_it_cannot_answer_whole() {
     drop(dir);
 }
 
+/// The cap is documented as at most 256 cards after repeats are folded, so a
+/// request that names a card several times is judged by the cards it names.
+#[test]
+fn the_cap_counts_distinct_cards_not_names() {
+    let (dir, path) = profile();
+    let host = crate::workbench::WorkbenchState::for_profile(&path);
+    let store = Store::open(&path).unwrap();
+    registered(&store, &git_repo());
+    // 300 names of 200 cards.
+    let repeated: Vec<String> = (0..300).map(|n| format!("id-{}", n % 200)).collect();
+    let refs: Vec<&str> = repeated.iter().map(String::as_str).collect();
+    assert!(
+        lineage(&host, &refs).is_ok(),
+        "300 names of 200 distinct cards is within the 256-card cap"
+    );
+    // 257 distinct cards, however they repeat, are past it.
+    let over: Vec<String> = (0..600).map(|n| format!("id-{}", n % 257)).collect();
+    let refs: Vec<&str> = over.iter().map(String::as_str).collect();
+    assert_eq!(lineage(&host, &refs).unwrap_err().code, "invalid_input");
+    // A request too long to walk is refused unread.
+    let flood: Vec<&str> = std::iter::repeat("a").take(4097).collect();
+    assert_eq!(lineage(&host, &flood).unwrap_err().code, "invalid_input");
+    drop(dir);
+}
+
 /// The board reads lineage on every refresh. That read commits nothing: a
 /// commit there would itself be announced as a change and read again.
 #[test]
