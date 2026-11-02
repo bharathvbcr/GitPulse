@@ -74,6 +74,21 @@ const MAX_ENTRIES_PER_ARTIFACT_DIR: usize = MAX_FILES_PER_ARTIFACT;
 /// 818, so nothing there wanted a larger bound and widening one costs only
 /// worst-case time.
 const MAX_ENTRIES_PER_GIT_DIR: usize = 100_000;
+
+/// The caps that govern an artifact tree have to agree, or the loosest one is
+/// decorative: a per-directory entry cap that binds before the tree's own file
+/// allowance makes that allowance unreachable. This was a runtime `assert!` in
+/// a test, which `clippy::assertions_on_constants` rightly objected to -- the
+/// values are known at compile time, so the invariant belongs here, where no
+/// test filter can skip it and a bad edit cannot build.
+const _: () = assert!(
+    MAX_ENTRIES_PER_ARTIFACT_DIR >= MAX_FILES_PER_ARTIFACT,
+    "a flat directory inside an artifact tree must be bounded by the tree's own budget, not by a smaller cap underneath it"
+);
+const _: () = assert!(
+    MAX_ENTRIES_PER_DIR < MAX_ENTRIES_PER_ARTIFACT_DIR,
+    "source trees keep the tight per-directory cap"
+);
 /// How often the deadline is consulted while enumerating one directory. A
 /// clock read per entry would cost more than the `stat` it guards; once every
 /// few thousand keeps the worst-case overshoot inside one directory to the
@@ -2994,27 +3009,17 @@ mod tests {
         assert!(budget.truncated);
     }
 
-    /// The caps that govern an artifact tree have to agree, or the loosest one
-    /// is decorative. A per-directory entry cap that binds before the tree's
-    /// own file allowance makes the artifact budget unreachable: `target`'s
-    /// `debug/deps` holds 110,472 entries in DevCouncil and 80,529 in
-    /// GitPulse, so a per-directory cap of 100,000 fell between two ordinary
-    /// Cargo workspaces and reported the larger tree unexamined while the
-    /// 600,000-file allowance it was walking under had barely been touched.
-    #[test]
-    fn no_directory_cap_binds_before_an_artifact_trees_own_allowance() {
-        assert!(
-            MAX_ENTRIES_PER_ARTIFACT_DIR >= MAX_FILES_PER_ARTIFACT,
-            "a flat directory inside an artifact tree must be bounded by the \
-             tree's own budget, not by a smaller cap underneath it"
-        );
-        assert!(
-            MAX_ENTRIES_PER_DIR < MAX_ENTRIES_PER_ARTIFACT_DIR,
-            "source trees keep the tight cap"
-        );
-    }
-
-    /// And behaviourally: a flat directory wide enough to pass the source cap
+    /// The cap relationship this used to assert at runtime is now a `const`
+    /// assertion beside the constants themselves, because the values are known
+    /// at compile time and a build-time check cannot be filtered out. Why it
+    /// matters: `target/debug/deps` holds 110,472 entries in DevCouncil and
+    /// 80,529 in GitPulse, so a per-directory cap of 100,000 fell between two
+    /// ordinary Cargo workspaces and reported the larger tree unexamined while
+    /// the 600,000-file allowance it was walking under had barely been touched.
+    ///
+    /// What a test can still show is the behaviour, which is below.
+    ///
+    /// A flat directory wide enough to pass the source cap
     /// is still enumerated to the end inside an artifact tree, while the same
     /// width in a source tree is still sampled and still says so.
     #[test]

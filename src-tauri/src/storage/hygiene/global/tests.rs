@@ -26,6 +26,43 @@ fn repo(root: &std::path::Path, name: &str) -> std::path::PathBuf {
     crate::test_support::trust_repo(&repo);
     repo
 }
+
+/// Makes a directory unreadable and restores its mode when the guard drops.
+///
+/// Every permission-denial test here runs real work with a directory at mode 0
+/// -- `save`, `update`, `lock`, `inventory` or `perform_with_gate` and its
+/// `debug_assert!` -- and a panic anywhere in that window skips a hand-written
+/// restore. `TempDir::drop` then cannot remove the tree, so a failing test
+/// leaks its fixture under `$TMPDIR` on top of failing. Tests that need to read
+/// through the directory in their assertions still call [`Denied::restore`]
+/// first; this only guarantees the mode comes back on the panic path, and a
+/// second restore is harmless.
+#[cfg(unix)]
+#[must_use = "the directory is restored when this guard drops"]
+struct Denied(std::path::PathBuf);
+
+#[cfg(unix)]
+fn deny(path: &std::path::Path) -> Denied {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o0)).unwrap();
+    Denied(path.to_path_buf())
+}
+
+#[cfg(unix)]
+impl Denied {
+    /// Restores the mode now, for assertions that have to read inside.
+    fn restore(&self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Denied {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
 #[test]
 fn global_policy_defaults_to_no_schedule_and_rejects_unbounded_inputs() {
     let c = CleanerConfig::default();
@@ -753,16 +790,15 @@ fn dropped_locks_release_even_while_a_duplicated_descriptor_is_alive() {
 #[cfg(unix)]
 #[test]
 fn inaccessible_repository_contents_make_the_global_inventory_incomplete() {
-    use std::os::unix::fs::PermissionsExt;
     let (_temp, cleaner, root) = fixture();
     let r = repo(&root, "repo");
     let hidden = r.join(".hidden");
     fs::create_dir(&hidden).unwrap();
     fs::write(hidden.join("source"), "preserve").unwrap();
     cleaner.save(config(&cleaner, &root)).unwrap();
-    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o0)).unwrap();
+    let denied = deny(&hidden);
     let report = cleaner.inventory();
-    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o700)).unwrap();
+    denied.restore();
     assert!(
         report.unwrap().partial,
         "an inaccessible storage subtree is not a complete scan"
@@ -779,7 +815,6 @@ fn inaccessible_repository_contents_make_the_global_inventory_incomplete() {
 #[cfg(unix)]
 #[test]
 fn an_unreadable_artifact_tree_is_dropped_while_a_readable_one_stays_a_candidate() {
-    use std::os::unix::fs::PermissionsExt;
     let (_temp, cleaner, root) = fixture();
     let r = repo(&root, "repo");
     fs::write(r.join(".gitignore"), "target/\n").unwrap();
@@ -804,10 +839,10 @@ fn an_unreadable_artifact_tree_is_dropped_while_a_readable_one_stays_a_candidate
     fs::create_dir_all(&blocked).unwrap();
     fs::write(blocked.join("lib.rlib"), vec![b'x'; 4096]).unwrap();
     cleaner.save(config(&cleaner, &root)).unwrap();
-    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o0)).unwrap();
+    let denied = deny(&blocked);
 
     let inventory = cleaner.inventory();
-    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+    denied.restore();
     let inventory = inventory.expect("inventory");
     let paths: Vec<&str> = inventory
         .candidates
@@ -888,15 +923,29 @@ fn every_candidate_from_an_unread_repository_is_filtered_out() {
 /// `an_unreadable_directory_inside_an_artifact_tree_keeps_it_ineligible`.
 ///
 /// Why the sibling cannot change the answer. Nothing the removal rests on is
-/// read from the repository-wide walk: `unignored` and `tracked_files` come
+/// read from the repository-wide walk. `unignored` and `tracked_files` come
 /// from `git check-ignore` and `git ls-files` queries scoped to the artifact's
-/// own path, the producer markers and the retention stamp are read inside the
-/// tree, and the tree's byte figure and its completeness come from the
+/// own path. The retention stamp is read inside the tree. The producer evidence
+/// is a `stat` on a named path -- for this fixture's `__pycache__` there is no
+/// marker check at all, and where there is one `local_provider` reads the
+/// artifact's *parent* (`Cargo.toml`, `package.json`, `pom.xml` and so on)
+/// alongside in-tree markers like `CACHEDIR.TAG`; either way it is a named
+/// path, not a walk. The byte figure and the completeness come from the
 /// per-artifact budget in `walk_worktree`. A directory elsewhere in the
-/// repository is not evidence about any of them. Reading the repository flag as
-/// "nothing here was examined" is what left 9 of 10 of the owner's
-/// repositories permanently ineligible, including both trees that held the
-/// bytes.
+/// repository is not evidence about any of them.
+///
+/// What reading the repository flag as "nothing here was examined" cost: 20
+/// consecutive daily runs reclaiming 0 bytes across a 57-repository workspace,
+/// two repositories untrusted and six truncated by the budget, so `partial` was
+/// true on every run and always would be. That figure is `2540db65`'s, measured
+/// from the hygiene state file; it is the one on record, and the only one this
+/// comment should be quoted for.
+///
+/// The repository is not left unguarded by this. `quiet_repo` is still a
+/// repository-wide gate at removal time, and this test passes only because
+/// `.unreadable/` is committed to `.gitignore`: an unreadable directory that
+/// was not ignored would show up in `git status --porcelain`, and the
+/// repository would be refused for having uncommitted work.
 ///
 /// What still blocks removal is an unread directory *inside* the artifact's own
 /// tree, because then the walk genuinely cannot say what is in there and the
@@ -910,7 +959,6 @@ fn every_candidate_from_an_unread_repository_is_filtered_out() {
 #[cfg(unix)]
 #[test]
 fn an_unreadable_directory_beside_an_artifact_tree_does_not_veto_it() {
-    use std::os::unix::fs::PermissionsExt;
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
@@ -959,7 +1007,7 @@ fn an_unreadable_directory_beside_an_artifact_tree_does_not_veto_it() {
     let blocked = root.join("unread/.unreadable");
     fs::create_dir(&blocked).unwrap();
     fs::write(blocked.join("entry"), "unreadable").unwrap();
-    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o0)).unwrap();
+    let denied = deny(&blocked);
 
     let saved = cleaner.save(config(&cleaner, &root)).unwrap();
     cleaner
@@ -988,9 +1036,9 @@ fn an_unreadable_directory_beside_an_artifact_tree_does_not_veto_it() {
         gated.push(repo.to_string());
         Ok(())
     });
-    // Restored before any assertion can unwind, so the temporary directory is
-    // always removable regardless of how this test ends.
-    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+    // Restored before the assertions so they see the tree as a user would;
+    // `Denied` still restores it if anything above this line panics.
+    denied.restore();
     outcome.expect("one unreadable directory must not fail the whole run");
 
     assert!(
@@ -1061,26 +1109,35 @@ fn an_unreadable_directory_beside_an_artifact_tree_does_not_veto_it() {
 /// single line moved, so per-tree completeness is the only difference between
 /// the two outcomes.
 ///
-/// Two independent layers refuse this, and this test pins both separately
-/// because they fail for different reasons and a reader should not mistake one
-/// for the other. The layer under test is `inspect`'s `scan_complete` filter,
-/// which never offers the tree as a candidate: forcing `complete = true` in
-/// `walk_worktree` turns the item-count assertion red, measured. The issue
-/// assertion sits behind that panic so it was not reached, and would go red
-/// too -- with nothing reporting `!scan_complete` there is no artifact for
-/// `inspect` to derive the line from.
-/// Behind it, `tree::snapshot` in strict mode refuses the same tree anyway --
-/// measured under that revert, with "Python bytecode directory contains
-/// non-bytecode content", because the subdirectory is rejected as content
-/// before anything tries to read it; for a provider without that content rule
-/// it would be the `read_dir` denial instead. That second layer is why the
-/// bytes-survive assertions stay green under the revert, so they are the one
-/// thing here that is not evidence about `scan_complete`. Stated rather than
-/// assumed, because a test that cannot fail proves nothing.
+/// Two independent layers refuse this tree, which is good for the owner's files
+/// and awkward for a test: most of what is asserted below would hold even if
+/// the layer under test were gone. So the assertions are labelled rather than
+/// left to look equally load-bearing.
+///
+/// The layer under test is `inspect`'s `scan_complete` filter, which never
+/// offers the tree as a candidate. Forcing `complete = true` in `walk_worktree`
+/// discriminates on exactly two assertions: `run.items.len() == 1`, measured
+/// red (`left: 2, right: 1`), and the "Artifact tree not read in full … /unread"
+/// issue line, which sits behind that panic so it was not reached -- red by
+/// mechanism, since with nothing reporting `!scan_complete` there is no
+/// artifact for `inspect` to derive the line from.
+///
+/// Everything else stays green under that revert and is therefore not evidence
+/// about `scan_complete`. Measured green: both bytes-survive assertions,
+/// `complete/__pycache__` removed, and `gated.len() == 1` -- the gate runs only
+/// after `prepare` succeeds, and here `tree::snapshot` in strict mode refuses
+/// first with "Python bytecode directory contains non-bytecode content",
+/// rejecting the subdirectory as content before anything tries to read it (for
+/// a provider without that content rule it would be the `read_dir` denial
+/// instead). Green by mechanism, not reached because the panic preceded them:
+/// `run.partial` and `completed_with_skips`, both of which survive because a
+/// denial under the artifact root still reaches `scan.permission_denied`
+/// through `absorb_artifact` whatever `complete` says.
+///
+/// Stated rather than assumed, because a test that cannot fail proves nothing.
 #[cfg(unix)]
 #[test]
 fn an_unreadable_directory_inside_an_artifact_tree_keeps_it_ineligible() {
-    use std::os::unix::fs::PermissionsExt;
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
@@ -1112,21 +1169,22 @@ fn an_unreadable_directory_inside_an_artifact_tree_keeps_it_ineligible() {
         fs::create_dir(r.join("__pycache__")).unwrap();
         fs::write(r.join("__pycache__/module.pyc"), vec![b'x'; 100]).unwrap();
         // The one difference from the sibling case: this subdirectory is under
-        // the artifact root, so the denial lands on the artifact's own budget.
-        let mut stamped = vec![r.join("__pycache__/module.pyc")];
+        // the artifact root, so the denial lands on the artifact's own budget
+        // rather than on the repository's.
         if name == "unread" {
             let blocked = r.join("__pycache__/blocked");
             fs::create_dir(&blocked).unwrap();
             fs::write(blocked.join("entry"), vec![b'x'; 100]).unwrap();
-            // Stamped old as well: a fresh mtime anywhere in the tree would
-            // make `require_age` refuse for being recently modified, and the
-            // test would pass without ever reaching the completeness check.
-            stamped.push(blocked.join("entry"));
-            stamped.push(blocked);
         }
-        stamped.push(r.join("__pycache__"));
+        // Stamped after that subdirectory exists, because creating it refreshes
+        // `__pycache__`'s own mtime. Nothing inside `blocked` is stamped:
+        // `require_age` runs inside `prepare_with_activity`, downstream of
+        // `inspect`'s completeness filter, so it could not keep this tree from
+        // reaching that filter however fresh it was -- and here it is never
+        // reached at all, because the strict snapshot rejects `blocked` as
+        // non-bytecode content before it reads a stamp.
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
-        for p in stamped {
+        for p in [r.join("__pycache__/module.pyc"), r.join("__pycache__")] {
             fs::File::open(p)
                 .unwrap()
                 .set_times(fs::FileTimes::new().set_modified(old))
@@ -1134,7 +1192,7 @@ fn an_unreadable_directory_inside_an_artifact_tree_keeps_it_ineligible() {
         }
     }
     let blocked = root.join("unread/__pycache__/blocked");
-    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o0)).unwrap();
+    let denied = deny(&blocked);
 
     let saved = cleaner.save(config(&cleaner, &root)).unwrap();
     cleaner
@@ -1163,9 +1221,9 @@ fn an_unreadable_directory_inside_an_artifact_tree_keeps_it_ineligible() {
         gated.push(repo.to_string());
         Ok(())
     });
-    // Restored before any assertion can unwind, so the temporary directory is
-    // always removable regardless of how this test ends.
-    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+    // Restored before the assertions, which read through this directory to
+    // prove its contents survived; `Denied` covers the panic path above.
+    denied.restore();
     outcome.expect("one half-read tree must not fail the whole run");
 
     assert!(
@@ -1390,7 +1448,6 @@ fn a_truncated_repository_scan_still_cleans_a_tree_that_was_read_in_full() {
 #[cfg(unix)]
 #[test]
 fn a_workspace_whose_every_tree_was_cut_short_refuses_instead_of_reporting_success() {
-    use std::os::unix::fs::PermissionsExt;
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
@@ -1410,7 +1467,7 @@ fn a_workspace_whose_every_tree_was_cut_short_refuses_instead_of_reporting_succe
     let blocked = r.join("__pycache__/inner");
     fs::create_dir(&blocked).unwrap();
     fs::write(blocked.join("entry"), "unreadable").unwrap();
-    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o0)).unwrap();
+    let denied = deny(&blocked);
 
     let saved = cleaner.save(config(&cleaner, &root)).unwrap();
     cleaner
@@ -1439,7 +1496,7 @@ fn a_workspace_whose_every_tree_was_cut_short_refuses_instead_of_reporting_succe
         gated.push(repo.to_string());
         Ok(())
     });
-    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+    denied.restore();
 
     assert!(
         outcome.is_err(),
