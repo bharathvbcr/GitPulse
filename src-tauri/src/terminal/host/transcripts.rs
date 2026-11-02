@@ -32,6 +32,14 @@
 //! It is *not* removed when the app `forget`s the receipt: forgetting means the
 //! app has recorded the exit, which is long before anyone reopens the run's
 //! output. Eviction and age are what end a finished session's transcript.
+//!
+//! **How it ended is on disk too.** What a host knows only in memory is gone
+//! when it is, and a log that simply stops reads like a log that is complete.
+//! So closing a session appends [`ENDED`] to its newest segment, and a write
+//! that fails leaves `<id>.log.err` holding the reason. A read strips the
+//! marker like [`CONTINUED`]; one that finds a finished session with neither
+//! the marker nor a note says its end may be missing (the host that wrote it
+//! died, or was killed, mid-session) instead of answering as if it were whole.
 
 use crate::terminal::ring::Tap;
 use crate::terminal::{TranscriptRead, TranscriptTail, MAX_TRANSCRIPT_TAIL_BYTES};
@@ -48,6 +56,18 @@ use std::time::{Duration, SystemTime};
 
 /// The first line of every segment after a session's first.
 const CONTINUED: &[u8] = b"[gitpulse: transcript continues]\r\n";
+/// The last bytes of a session's newest segment once it was closed normally.
+const ENDED: &[u8] = b"\r\n[gitpulse: transcript ends]\r\n";
+/// What a read says of a finished session whose segment lacks [`ENDED`] and
+/// whose recording left no note: the host that wrote it did not get to close it.
+const UNCLOSED: &str =
+    "the host that wrote this did not close it, so the end of the output may be missing";
+/// Most bytes of a failure note, written or read.
+const NOTE_MAX: usize = 2048;
+/// How much older output a masking read looks at beyond the bytes it returns,
+/// so a name or a key's first line just before the window still marks what
+/// follows as secret.
+const REDACT_LOOKBACK: usize = 64 * 1024;
 /// What a gap marker's text ends with; the count of these in a tail is
 /// [`TranscriptTail::gap_markers`].
 const GAP_TAIL: &[u8] = b" bytes of output were not recorded]";
@@ -60,6 +80,8 @@ const SETTLE_DEADLINE: Duration = Duration::from_secs(2);
 const SYNC_EVERY: Duration = Duration::from_secs(5);
 /// Most entries one directory scan looks at.
 const MAX_SCANNED: usize = 16 * 1024;
+/// How often a read starts over when a rotation lands between its two opens.
+const READ_ATTEMPTS: usize = 3;
 const MIN_SEGMENT_BYTES: u64 = 256;
 
 /// How much a host keeps.
@@ -105,6 +127,66 @@ enum Op {
     Discard(String),
 }
 
+impl Op {
+    fn session(&self) -> &str {
+        match self {
+            Op::Open(session)
+            | Op::Data(session, _)
+            | Op::Gap(session, _)
+            | Op::Close(session)
+            | Op::Discard(session) => session,
+        }
+    }
+}
+
+/// The operations the writer took in one go. However it ends, they all count
+/// as finished, so a read waiting on them is released; if the writer panicked
+/// part-way, the sessions whose operations it did not apply are marked failed,
+/// not left looking whole.
+struct Batch<'a> {
+    inner: &'a Inner,
+    ops: VecDeque<Op>,
+    total: u64,
+    current: Option<String>,
+}
+
+impl<'a> Batch<'a> {
+    fn take(inner: &'a Inner, queue: &mut Queue) -> Self {
+        let ops: VecDeque<Op> = std::mem::take(&mut queue.ops);
+        queue.cost = 0;
+        Self {
+            inner,
+            total: ops.len() as u64,
+            ops,
+            current: None,
+        }
+    }
+
+    fn next(&mut self) -> Option<Op> {
+        let op = self.ops.pop_front()?;
+        self.current = Some(op.session().to_owned());
+        Some(op)
+    }
+}
+
+impl Drop for Batch<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let mut lost: Vec<String> = self.current.take().into_iter().collect();
+            lost.extend(self.ops.iter().map(|op| op.session().to_owned()));
+            for session in lost {
+                self.inner.fail(
+                    &session,
+                    "the transcript writer stopped unexpectedly, so later output is not here"
+                        .to_owned(),
+                );
+            }
+        }
+        lock(&self.inner.queue).done += self.total;
+        self.inner.settled.notify_all();
+    }
+}
+
 #[derive(Default)]
 struct Queue {
     ops: VecDeque<Op>,
@@ -137,8 +219,12 @@ struct Inner {
     settled: Condvar,
     /// Open logs. Only the writer takes this lock.
     files: Mutex<HashMap<String, Log>>,
-    /// Why a session's recording stopped, for the sessions it has.
+    /// Why a session's recording stopped, for the sessions it has. The same
+    /// reason is written to the session's `.log.err` for a later host.
     failures: Mutex<HashMap<String, String>>,
+    /// A session whose next data write panics, for the test of what that costs.
+    #[cfg(test)]
+    panic_on: Mutex<Option<String>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -187,6 +273,8 @@ impl Transcripts {
             settled: Condvar::new(),
             files: Mutex::default(),
             failures: Mutex::default(),
+            #[cfg(test)]
+            panic_on: Mutex::default(),
         });
         inner.sweep(&HashSet::new())?;
         let worker = inner.clone();
@@ -220,7 +308,7 @@ impl Transcripts {
     /// The session never started: nothing it recorded is worth keeping.
     pub(super) fn discard(&self, session: &str) {
         let mut queue = lock(&self.inner.queue);
-        if queue.recording.contains(session) {
+        if queue.recording.contains(session) || queue.shutdown {
             return;
         }
         queue.push(Op::Discard(session.to_owned()), 0);
@@ -272,6 +360,11 @@ impl Inner {
         self.dir.join(format!("{session}.log.1"))
     }
 
+    /// Why this session's recording stopped, when it did.
+    fn note(&self, session: &str) -> PathBuf {
+        self.dir.join(format!("{session}.log.err"))
+    }
+
     // -- the reader's side: never waits on the disk -------------------------
 
     fn push_data(&self, session: &str, data: &[u8]) {
@@ -281,7 +374,12 @@ impl Inner {
         let owned = data.to_vec();
         let cost = data.len() + OP_COST;
         let mut queue = lock(&self.queue);
-        if queue.shutdown || queue.cost + cost > self.limits.queue_bytes {
+        if queue.shutdown {
+            // The writer is gone or going: nothing queued now would be
+            // written, and a gap counted now would never be.
+            return;
+        }
+        if queue.cost + cost > self.limits.queue_bytes {
             *queue.gaps.entry(session.to_owned()).or_insert(0) += data.len() as u64;
             return;
         }
@@ -296,6 +394,12 @@ impl Inner {
     fn close(&self, session: &str) {
         let mut queue = lock(&self.queue);
         queue.recording.remove(session);
+        if queue.shutdown {
+            // Never written, so the file keeps no end marker: a later host
+            // reads that as a session its host did not get to close.
+            queue.gaps.remove(session);
+            return;
+        }
         if let Some(dropped) = queue.gaps.remove(session) {
             queue.push(Op::Gap(session.to_owned(), dropped), 0);
         }
@@ -359,19 +463,21 @@ impl Inner {
                     continue;
                 }
             }
-            let batch: Vec<Op> = queue.ops.drain(..).collect();
-            queue.cost = 0;
+            let mut batch = Batch::take(self, &mut queue);
             drop(queue);
-            let finished = batch.len() as u64;
-            for op in batch {
+            while let Some(op) = batch.next() {
                 self.apply(op);
             }
-            lock(&self.queue).done += finished;
-            self.settled.notify_all();
         }
     }
 
     fn apply(&self, op: Op) {
+        #[cfg(test)]
+        if let Op::Data(session, _) = &op {
+            if lock(&self.panic_on).as_deref() == Some(session.as_str()) {
+                panic!("a test made the transcript writer panic on {session}");
+            }
+        }
         match op {
             Op::Open(session) => {
                 lock(&self.failures).remove(&session);
@@ -385,7 +491,14 @@ impl Inner {
             }
             Op::Close(session) => {
                 let log = lock(&self.files).remove(&session);
-                if let Some(log) = log {
+                if let Some(mut log) = log {
+                    // A recording that failed already says why, in its note;
+                    // an end marker would claim a close it did not have.
+                    if !self.failed(&session) {
+                        if let Err(error) = self.write_ended(&session, &mut log) {
+                            self.fail(&session, error);
+                        }
+                    }
                     if let Err(error) = log.file.sync_data() {
                         log::warn!(target: "terminal_host", "a transcript could not be synced as its session ended: {error}");
                     }
@@ -416,6 +529,10 @@ impl Inner {
             .is_none();
         if first {
             log::error!(target: "terminal_host", "a session's transcript stopped being recorded: {reason}");
+            // For a host that starts later and has no memory of this one.
+            if let Err(error) = self.write_note(session, &reason) {
+                log::warn!(target: "terminal_host", "could not keep a note of why a transcript stopped: {error}");
+            }
         }
     }
 
@@ -424,13 +541,17 @@ impl Inner {
     }
 
     /// A segment file: appended to, `0600`, never through a link, and ours.
+    ///
+    /// `O_NONBLOCK` is for the open alone: a named pipe planted by the same
+    /// user would otherwise block it for ever. It does nothing to a regular
+    /// file, and a pipe is refused by the check below.
     fn create_file(path: &Path) -> Result<File, String> {
         let mut options = OpenOptions::new();
         options
             .append(true)
             .create(true)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW);
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         let file = options
             .open(path)
             .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -448,6 +569,83 @@ impl Inner {
         Ok(file)
     }
 
+    /// Writes [`ENDED`] as the last bytes of the session's newest segment,
+    /// under the segment size like any other bytes: when it would not fit the
+    /// segment rotates first.
+    fn write_ended(&self, session: &str, log: &mut Log) -> Result<(), String> {
+        let room = self.limits.segment_bytes.saturating_sub(log.len);
+        if room < ENDED.len() as u64 {
+            self.rotate(session, log)?;
+        }
+        log.file
+            .write_all(ENDED)
+            .map_err(|e| format!("{}: {e}", self.path(session).display()))?;
+        log.len += ENDED.len() as u64;
+        log.dirty = true;
+        Ok(())
+    }
+
+    /// Records why `session` stopped being recorded, beside its log.
+    fn write_note(&self, session: &str, reason: &str) -> Result<(), String> {
+        let path = self.note(session);
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let mut file = options
+            .open(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let meta = file
+            .metadata()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        // SAFETY: `getuid` reads this process's real user id and cannot fail.
+        if !meta.is_file() || meta.uid() != unsafe { libc::getuid() } {
+            return Err(format!("{} is not a file this host owns", path.display()));
+        }
+        let mut end = reason.len().min(NOTE_MAX);
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        file.write_all(&reason.as_bytes()[..end])
+            .and_then(|()| file.sync_data())
+            .map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// The reason an earlier host left for `session`'s recording stopping, if
+    /// it left one. A note that is there and cannot be read is reported as that,
+    /// not as no note.
+    fn read_note(&self, session: &str) -> Option<String> {
+        let path = self.note(session);
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let file = match options.open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => return Some(unreadable_note(&path, &error.to_string())),
+        };
+        let meta = match file.metadata() {
+            Ok(meta) => meta,
+            Err(error) => return Some(unreadable_note(&path, &error.to_string())),
+        };
+        // SAFETY: `getuid` reads this process's real user id and cannot fail.
+        if !meta.is_file() || meta.uid() != unsafe { libc::getuid() } {
+            return Some(unreadable_note(&path, "it is not a file this host wrote"));
+        }
+        let mut bytes = Vec::new();
+        match std::io::Read::read_to_end(
+            &mut std::io::Read::take(&file, NOTE_MAX as u64),
+            &mut bytes,
+        ) {
+            Ok(_) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(error) => Some(unreadable_note(&path, &error.to_string())),
+        }
+    }
+
     fn create(&self, session: &str) -> Result<Log, String> {
         let path = self.path(session);
         let file = Self::create_file(&path)?;
@@ -460,7 +658,11 @@ impl Inner {
     }
 
     fn remove_files(&self, session: &str) {
-        for path in [self.path(session), self.previous(session)] {
+        for path in [
+            self.path(session),
+            self.previous(session),
+            self.note(session),
+        ] {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -564,20 +766,31 @@ impl Inner {
 
     // -- retention -----------------------------------------------------------
 
-    fn scan(&self) -> Result<HashMap<String, Held>, String> {
+    /// What the directory holds, per session, from at most `cap` entries. The
+    /// flag is whether there were more: a total counted from a capped scan is
+    /// short, and the caller must not treat it as the directory's size.
+    fn scan_up_to(&self, cap: usize) -> Result<(HashMap<String, Held>, bool), String> {
         let entries =
             std::fs::read_dir(&self.dir).map_err(|e| format!("{}: {e}", self.dir.display()))?;
         let mut held: HashMap<String, Held> = HashMap::new();
-        for entry in entries.take(MAX_SCANNED) {
+        let mut capped = false;
+        for (seen, entry) in entries.enumerate() {
+            if seen >= cap {
+                capped = true;
+                break;
+            }
             let entry = entry.map_err(|e| format!("{}: {e}", self.dir.display()))?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            let (session, previous) = match name.strip_suffix(".log.1") {
-                Some(session) => (session, true),
-                None => match name.strip_suffix(".log") {
-                    Some(session) => (session, false),
-                    None => continue,
-                },
+            let (session, previous) = if let Some(session) = name.strip_suffix(".log.1") {
+                (session, true)
+            } else if let Some(session) = name
+                .strip_suffix(".log.err")
+                .or_else(|| name.strip_suffix(".log"))
+            {
+                (session, false)
+            } else {
+                continue;
             };
             if !crate::terminal::is_session_id(session) {
                 continue;
@@ -597,12 +810,15 @@ impl Inner {
             }
             held.paths.push(entry.path());
         }
-        Ok(held)
+        Ok((held, capped))
     }
 
     /// Deletes what the age and size limits no longer allow, except `live`.
     fn sweep(&self, live: &HashSet<String>) -> Result<(), String> {
-        let mut held = self.scan()?;
+        let (mut held, capped) = self.scan_up_to(MAX_SCANNED)?;
+        if capped {
+            log::warn!(target: "terminal_host", "the transcript directory holds more than {MAX_SCANNED} entries; limits are enforced on the {MAX_SCANNED} read, so it may stay over them");
+        }
         let now = SystemTime::now();
         held.retain(|session, entry| {
             let expired = !live.contains(session)
@@ -670,12 +886,26 @@ impl Inner {
         }
         let settled = self.settle(SETTLE_DEADLINE);
         let live = lock(&self.queue).recording.contains(session);
-        let recording_error = lock(&self.failures).get(session).cloned();
+        // This host's memory first; a host that started later has only the
+        // note the earlier one left. A running session has no earlier host.
+        let remembered = lock(&self.failures).get(session).cloned();
+        let failure = match remembered {
+            Some(error) => Some(error),
+            None if live => None,
+            None => self.read_note(session),
+        };
         let max = max_bytes.clamp(1, MAX_TRANSCRIPT_TAIL_BYTES);
-        let raw = match self.read_tail(session, max) {
+        // Masking needs what came before the window: the name a value follows,
+        // the first line of a key. It looks that much further back, then clips.
+        let want = if redact {
+            max.saturating_add(REDACT_LOOKBACK)
+        } else {
+            max
+        };
+        let raw = match self.read_tail(session, want) {
             Ok(Some(raw)) => raw,
             Ok(None) => {
-                return match recording_error {
+                return match failure {
                     Some(error) => TranscriptRead::Unreadable {
                         reason: format!("this session's output could not be recorded: {error}"),
                     },
@@ -684,20 +914,27 @@ impl Inner {
             }
             Err(reason) => return TranscriptRead::Unreadable { reason },
         };
-        let gap_markers = count(&raw.bytes, GAP_TAIL);
-        let mut truncated = raw.truncated;
+        let mut clipped = raw.clipped;
         let bytes = if redact {
-            let (bytes, clipped) = redacted(&raw.bytes, max);
-            truncated |= clipped;
+            let (bytes, cut) = redacted(&raw.bytes, max);
+            clipped |= cut;
             bytes
         } else {
             raw.bytes
         };
+        let gap_markers = count(&bytes, GAP_TAIL);
+        // A finished session whose newest segment was never closed and left no
+        // note: its host died or was killed. Whether anything is missing is
+        // unknown, which is not the same as nothing missing.
+        let recording_error =
+            failure.or_else(|| (!live && !raw.ended).then(|| UNCLOSED.to_owned()));
         TranscriptRead::Found(TranscriptTail {
             data_b64: BASE64.encode(&bytes),
             bytes: bytes.len(),
             retained: raw.retained,
-            truncated,
+            truncated: raw.rotated || clipped,
+            rotated: raw.rotated,
+            clipped,
             gap_markers,
             redacted: redact,
             live,
@@ -707,24 +944,50 @@ impl Inner {
     }
 
     /// The newest `max` bytes across both segments, with each continuation
-    /// line taken out; `None` when there is neither segment.
+    /// line and the end marker taken out; `None` when there is neither segment.
     fn read_tail(&self, session: &str, max: usize) -> Result<Option<RawTail>, String> {
-        let mut segments = Vec::with_capacity(2);
-        for path in [self.previous(session), self.path(session)] {
-            if let Some(segment) = Segment::open(&path)? {
-                segments.push(segment);
+        self.read_tail_between(session, max, &mut || {})
+    }
+
+    /// [`Self::read_tail`], calling `between` after the older segment is open
+    /// and before the newer one is: where a rotation can slip in.
+    fn read_tail_between(
+        &self,
+        session: &str,
+        max: usize,
+        between: &mut dyn FnMut(),
+    ) -> Result<Option<RawTail>, String> {
+        let (previous_path, current_path) = (self.previous(session), self.path(session));
+        for _ in 0..READ_ATTEMPTS {
+            let previous = Segment::open(&previous_path)?;
+            between();
+            let current = Segment::open(&current_path)?;
+            // A rotation between the two opens leaves the older name on what
+            // was the newest segment, and a read of the pair would skip it.
+            if Segment::is_current(&previous, &previous_path)?
+                && Segment::is_current(&current, &current_path)?
+            {
+                let segments: Vec<Segment> = previous.into_iter().chain(current).collect();
+                return Self::tail_of(&segments, max);
             }
         }
-        let Some(first) = segments.first() else {
+        Err(format!(
+            "{} was rotated again and again while it was being read",
+            current_path.display()
+        ))
+    }
+
+    fn tail_of(segments: &[Segment], max: usize) -> Result<Option<RawTail>, String> {
+        let (Some(first), Some(last)) = (segments.first(), segments.last()) else {
             return Ok(None);
         };
-        let began_cut = first.continued;
+        let rotated = first.continued;
         let retained: u64 = segments.iter().map(|s| s.effective).sum();
         let take = retained.min(max as u64);
         let start = retained - take;
         let mut bytes = Vec::with_capacity(take as usize);
         let mut at = 0u64;
-        for segment in &segments {
+        for segment in segments {
             let (from, to) = (at.max(start), (at + segment.effective).min(retained));
             if from < to {
                 let mut part = vec![0u8; (to - from) as usize];
@@ -739,7 +1002,9 @@ impl Inner {
         Ok(Some(RawTail {
             bytes,
             retained,
-            truncated: began_cut || start > 0,
+            rotated,
+            clipped: start > 0,
+            ended: last.ended,
         }))
     }
 }
@@ -747,24 +1012,39 @@ impl Inner {
 struct RawTail {
     bytes: Vec<u8>,
     retained: u64,
-    truncated: bool,
+    /// The start of the session's output was rotated off the disk.
+    rotated: bool,
+    /// Older saved output was left out to fit the bound asked for.
+    clipped: bool,
+    /// The newest segment ends with [`ENDED`]: its session was closed.
+    ended: bool,
 }
 
 /// One segment opened to be read.
 struct Segment {
     file: File,
     path: PathBuf,
+    /// Which file this is, to tell it from whatever the name points to later.
+    device: u64,
+    inode: u64,
     /// Bytes of continuation line at its head, which the read leaves out.
     skip: u64,
     /// Bytes it contributes to the output.
     effective: u64,
     continued: bool,
+    /// It ends with [`ENDED`], which the read leaves out.
+    ended: bool,
 }
 
 impl Segment {
     fn open(path: &Path) -> Result<Option<Self>, String> {
+        // `O_NONBLOCK` keeps a named pipe planted here from holding the open
+        // for ever; it does nothing to a regular file, and the check below
+        // refuses anything that is not one.
         let mut options = OpenOptions::new();
-        options.read(true).custom_flags(libc::O_NOFOLLOW);
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         let file = match options.open(path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -791,13 +1071,38 @@ impl Segment {
             .map_err(|e| format!("{}: {e}", path.display()))?;
         let continued = head == CONTINUED;
         let skip = if continued { CONTINUED.len() as u64 } else { 0 };
+        let mut ended = false;
+        if len - skip >= ENDED.len() as u64 {
+            let mut last = vec![0u8; ENDED.len()];
+            file.read_exact_at(&mut last, len - ENDED.len() as u64)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            ended = last == ENDED;
+        }
+        let marker = if ended { ENDED.len() as u64 } else { 0 };
         Ok(Some(Self {
             file,
             path: path.to_owned(),
+            device: meta.dev(),
+            inode: meta.ino(),
             skip,
-            effective: len - skip,
+            effective: len - skip - marker,
             continued,
+            ended,
         }))
+    }
+
+    /// Whether `path` still names the file `opened` is (or still names no
+    /// file, when none was opened). A file unlinked since it was opened is
+    /// still a whole, consistent snapshot, so that counts.
+    fn is_current(opened: &Option<Self>, path: &Path) -> Result<bool, String> {
+        match (std::fs::symlink_metadata(path), opened) {
+            (Ok(meta), Some(segment)) => {
+                Ok(meta.dev() == segment.device && meta.ino() == segment.inode)
+            }
+            (Ok(_), None) => Ok(false),
+            (Err(error), _) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            (Err(error), _) => Err(format!("{}: {error}", path.display())),
+        }
     }
 }
 
@@ -852,10 +1157,62 @@ fn count(haystack: &[u8], needle: &[u8]) -> u32 {
     found
 }
 
+fn unreadable_note(path: &Path, why: &str) -> String {
+    format!(
+        "a note on why recording stopped is at {} but could not be read: {why}",
+        path.display()
+    )
+}
+
+/// Where the first private-key marker of the named kind (`-----begin`,
+/// `-----end`) is in `lower` (ASCII-lowercased text): its start, and the end of
+/// its closing dashes. The marker has to sit on one line, as the redaction's
+/// own pattern requires.
+fn key_marker(lower: &str, tag: &str) -> Option<(usize, usize)> {
+    const KEY: &str = "private key";
+    let mut at = 0;
+    while let Some(found) = lower[at..].find(tag) {
+        let start = at + found;
+        let line_end = lower[start..]
+            .find(['\r', '\n'])
+            .map_or(lower.len(), |n| start + n);
+        let line = &lower[start..line_end];
+        if let Some(k) = line.find(KEY) {
+            let after = &line[k + KEY.len()..];
+            let after = after.strip_prefix(" block").unwrap_or(after);
+            if after.starts_with("-----") {
+                return Some((start, line_end - after.len() + "-----".len()));
+            }
+        }
+        at = start + tag.len();
+    }
+    None
+}
+
+/// `text` with a private key's body masked when the text starts inside it: the
+/// first thing in it is the key's closing line, with no opening one before.
+/// The redaction masks a block from its opening line, which this window may
+/// not hold; without this its body would pass as plain text. A body longer
+/// than the lookback, closing line and all outside the window, is not seen.
+fn mask_leading_key_body(text: &str) -> std::borrow::Cow<'_, str> {
+    let lower = text.to_ascii_lowercase();
+    let Some((end_start, end_to)) = key_marker(&lower, "-----end") else {
+        return std::borrow::Cow::Borrowed(text);
+    };
+    if key_marker(&lower, "-----begin").is_some_and(|(begin, _)| begin < end_start) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    std::borrow::Cow::Owned(format!("<private key redacted>{}", &text[end_to..]))
+}
+
 /// `bytes` with secrets masked by the ledger's redaction, clipped to its
 /// newest `max` bytes on a character boundary. The flag says it was clipped.
+/// `bytes` should reach back past the `max` it is clipped to (see
+/// [`REDACT_LOOKBACK`]), so what the redaction needs to recognise a secret is
+/// there when the secret is.
 fn redacted(bytes: &[u8], max: usize) -> (Vec<u8>, bool) {
-    let text = crate::ledger::redact::text(&String::from_utf8_lossy(bytes));
+    let lossy = String::from_utf8_lossy(bytes);
+    let text = crate::ledger::redact::text(&mask_leading_key_body(&lossy));
     if text.len() <= max {
         return (text.into_bytes(), false);
     }

@@ -625,21 +625,50 @@ fn a_finished_sessions_output_is_read_back_after_the_app_and_the_host_restart() 
 fn output_printed_while_no_app_was_there_is_in_the_transcript() {
     let dir = host_dir();
     let repo = repo();
+    // The shell prints the second line only once the test says go, and says
+    // when it has: no app is attached for either, and nothing here is a guess
+    // at how long that takes.
+    let (go, printed) = (dir.path().join("go"), dir.path().join("printed"));
     let first = App::new(dir.path());
     let id = first.shell(
         repo.path(),
-        "printf 'before\\n'; sleep 1; printf 'while-away\\n'; read x",
+        &format!(
+            "printf 'before\\n'; while [ ! -e '{}' ]; do sleep 0.05; done; \
+             printf 'while-away\\n'; : > '{}'; read x",
+            go.display(),
+            printed.display()
+        ),
     );
     assert!(wait_for(Duration::from_secs(10), || first
         .text(&id)
         .contains("before")));
     gitpulse_lib::teardown::close_terminals(&first.state);
     drop(first);
-    std::thread::sleep(Duration::from_millis(2500));
+    std::fs::write(&go, b"").unwrap();
+    assert!(
+        wait_for(Duration::from_secs(10), || printed.exists()),
+        "the shell never printed the second line"
+    );
 
     let next = App::new(dir.path());
     let _stop = Stop(next.state.clone());
-    let (text, tail) = transcript_text(&next.state, &id);
+    let seen = std::cell::RefCell::new((String::new(), None));
+    let arrived = wait_for(Duration::from_secs(10), || {
+        let read = gitpulse_lib::terminal::session_transcript(&next.state, &id, 64 * 1024, false);
+        let now = match read {
+            Ok(gitpulse_lib::terminal::TranscriptRead::Found(tail)) => (
+                String::from_utf8_lossy(&STANDARD.decode(&tail.data_b64).unwrap()).into_owned(),
+                Some(tail),
+            ),
+            _ => (String::new(), None),
+        };
+        let done = now.0.contains("while-away");
+        *seen.borrow_mut() = now;
+        done
+    });
+    let (text, tail) = seen.into_inner();
+    assert!(arrived, "{text:?}");
+    let tail = tail.expect("a transcript was read");
     assert!(
         text.contains("before") && text.contains("while-away"),
         "{text:?}"

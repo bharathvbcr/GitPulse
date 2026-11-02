@@ -267,7 +267,8 @@ fn a_directory_over_its_total_drops_the_oldest_finished_session_and_never_a_runn
     let store = store(
         &dir,
         Limits {
-            total_bytes: 650,
+            // A finished session is its 200 bytes and the 31 of its end marker.
+            total_bytes: 700,
             ..small()
         },
     );
@@ -277,7 +278,7 @@ fn a_directory_over_its_total_drops_the_oldest_finished_session_and_never_a_runn
         record(&store, session, &stream(200), 200);
     }
     assert!(store.flush(Duration::from_secs(5)));
-    assert_eq!(names(&files(&dir)).len(), 3, "600 bytes fit in 650");
+    assert_eq!(names(&files(&dir)).len(), 3, "662 bytes fit in 700");
     // Oldest first, and the running session is the very oldest of all.
     age(
         &files(&dir).join("term-1-9.log"),
@@ -416,4 +417,352 @@ fn a_stopped_store_takes_no_new_sessions() {
     let store = store(&dir, small());
     store.shutdown();
     assert!(matches!(store.arm("term-1-1"), Err(ArmError::Closed)));
+}
+
+// -- how a recording ended, kept on disk --------------------------------------
+
+/// A host that died, or was killed, before it closed a session's transcript
+/// leaves a file that reads like any other. It must not read as complete.
+#[test]
+fn a_transcript_the_host_never_closed_reads_as_possibly_incomplete() {
+    let dir = private_tempdir();
+    {
+        let store = store(&dir, small());
+        let tap = store.arm("term-1-1").unwrap();
+        tap.chunk(b"started\r\n");
+        assert!(store.flush(Duration::from_secs(5)));
+        // The host goes before the session's close is ever applied.
+        store.shutdown();
+        drop(tap);
+    }
+    let restarted = store(&dir, small());
+    let (got, tail) = tail(restarted.read("term-1-1", 4096, false));
+    assert_eq!(got, b"started\r\n");
+    assert!(!tail.live, "no running session belongs to the new host");
+    let error = tail
+        .recording_error
+        .expect("an end nobody wrote down is not a complete transcript");
+    assert!(error.contains("did not close"), "{error}");
+}
+
+/// Why a recording failed is on disk beside it, so a later host can still say.
+#[test]
+fn a_recording_failure_is_remembered_by_the_host_that_reads_it_later() {
+    let dir = private_tempdir();
+    {
+        let store = store(&dir, small());
+        let tap = store.arm("term-1-1").unwrap();
+        tap.chunk(&stream(100));
+        assert!(store.flush(Duration::from_secs(5)));
+        // The next rotation cannot happen: its target is a directory.
+        let previous = files(&dir).join("term-1-1.log.1");
+        std::fs::create_dir(&previous).unwrap();
+        tap.chunk(&stream(300));
+        assert!(store.flush(Duration::from_secs(5)));
+        std::fs::remove_dir(&previous).unwrap();
+        let (_, now) = tail(store.read("term-1-1", 4096, false));
+        assert!(now.recording_error.is_some(), "the failing host knows");
+        drop(tap);
+    }
+    let restarted = store(&dir, small());
+    let (got, tail) = tail(restarted.read("term-1-1", 4096, false));
+    assert_eq!(got.len(), 256, "what was written before the failure");
+    let error = tail
+        .recording_error
+        .expect("the reason survived the host that saw it");
+    assert!(error.contains("term-1-1.log"), "{error}");
+    assert!(!error.contains("did not close"), "{error}");
+}
+
+/// The ordinary case, which the end marker must not disturb: a session that
+/// was closed reads clean after a restart, and the marker is not text.
+#[test]
+fn a_session_closed_normally_reads_clean_after_a_restart_and_the_end_marker_is_not_text() {
+    let dir = private_tempdir();
+    {
+        let store = store(&dir, small());
+        record(&store, "term-1-1", b"all of it\r\n", 4);
+        assert!(store.flush(Duration::from_secs(5)));
+        let raw = std::fs::read(files(&dir).join("term-1-1.log")).unwrap();
+        assert!(
+            String::from_utf8_lossy(&raw).contains("transcript ends]"),
+            "the file records that it was closed: {raw:?}"
+        );
+    }
+    let restarted = store(&dir, small());
+    let (got, tail) = tail(restarted.read("term-1-1", 4096, false));
+    assert_eq!(got, b"all of it\r\n");
+    assert_eq!(tail.recording_error, None);
+    assert_eq!(tail.retained, 11, "the marker is not output");
+    assert!(!tail.truncated);
+}
+
+/// The marker is written under the same size bound as the output.
+#[test]
+fn the_end_marker_never_pushes_a_segment_past_its_size() {
+    let dir = private_tempdir();
+    let store = store(&dir, small());
+    // 250 of 256 bytes: too little room left for the marker.
+    let expected = stream(250);
+    record(&store, "term-1-1", &expected, 50);
+    assert!(store.flush(Duration::from_secs(5)));
+    for name in names(&files(&dir)) {
+        let len = std::fs::metadata(files(&dir).join(&name)).unwrap().len();
+        assert!(len <= 256, "{name} is {len} bytes");
+    }
+    let (got, tail) = tail(store.read("term-1-1", 4096, false));
+    assert_eq!(got, expected);
+    assert_eq!(tail.recording_error, None);
+}
+
+// -- hazards on the way in ----------------------------------------------------
+
+fn within<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = send.send(f());
+    });
+    receive
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_else(|_| panic!("{what} did not return: it is blocked on a file"))
+}
+
+fn fifo(path: &Path) {
+    let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    // SAFETY: `name` is a valid NUL-terminated path for the length of the call.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+}
+
+/// Anything the user can plant in a `0700` directory: a named pipe in place of
+/// a segment must be reported, not waited on.
+#[test]
+fn a_named_pipe_in_place_of_a_transcript_is_unreadable_and_blocks_nothing() {
+    let dir = private_tempdir();
+    let store = store(&dir, small());
+    fifo(&files(&dir).join("term-1-1.log"));
+    match within("reading a pipe", move || store.read("term-1-1", 100, false)) {
+        TranscriptRead::Unreadable { reason } => {
+            assert!(reason.contains("not a file"), "{reason}")
+        }
+        other => panic!("a pipe read as {other:?}"),
+    }
+}
+
+#[test]
+fn a_named_pipe_in_the_way_of_a_new_segment_is_refused_and_blocks_nothing() {
+    let dir = private_tempdir();
+    let planted = files(&dir);
+    std::fs::create_dir_all(&planted).unwrap();
+    let planted = planted.join("term-1-3.log");
+    fifo(&planted);
+    assert!(within("creating over a pipe", move || Inner::create_file(&planted)).is_err());
+}
+
+// -- the end of the session's output, after shutdown --------------------------
+
+#[test]
+fn a_store_that_stopped_settles_even_when_a_session_ends_afterwards() {
+    let dir = private_tempdir();
+    let store = store(&dir, small());
+    let tap = store.arm("term-1-1").unwrap();
+    tap.chunk(b"late");
+    store.shutdown();
+    tap.chunk(b"after the host stopped");
+    drop(tap);
+    assert!(
+        store.flush(Duration::from_millis(300)),
+        "nothing queued after the stop can ever be written, so nothing waits for it"
+    );
+}
+
+// -- redaction needs the context before the window ----------------------------
+
+#[test]
+fn a_value_whose_name_is_before_the_window_is_still_masked() {
+    let dir = private_tempdir();
+    let store = store(
+        &dir,
+        Limits {
+            segment_bytes: 1024 * 1024,
+            ..small()
+        },
+    );
+    let value = "Zq7Lw9Xv2Rk8Tn5Jm3Hs6Bd1Fg0CaPe4Yu";
+    record(
+        &store,
+        "term-1-1",
+        format!("connecting\r\npassword={value}\r\ndone\r\n").as_bytes(),
+        64,
+    );
+    // The window starts inside the value, after the name that marks it secret.
+    let (masked, tail) = tail(store.read("term-1-1", 24, true));
+    let masked = String::from_utf8(masked).unwrap();
+    assert!(!masked.contains(&value[value.len() - 12..]), "{masked:?}");
+    assert!(tail.redacted);
+    assert!(tail.truncated);
+}
+
+#[test]
+fn the_tail_of_a_private_key_whose_first_line_is_before_the_window_is_masked() {
+    let dir = private_tempdir();
+    let store = store(
+        &dir,
+        Limits {
+            segment_bytes: 8 * 1024 * 1024,
+            ..small()
+        },
+    );
+    let body: String = (0..2000)
+        .map(|i| format!("QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo{i:04}\r\n"))
+        .collect();
+    record(
+        &store,
+        "term-1-1",
+        format!("-----BEGIN PRIVATE KEY-----\r\n{body}-----END PRIVATE KEY-----\r\nafter\r\n")
+            .as_bytes(),
+        4096,
+    );
+    // Both the cut and the lookback land inside the key's body.
+    let (masked, tail) = tail(store.read("term-1-1", 1000, true));
+    let masked = String::from_utf8(masked).unwrap();
+    assert!(!masked.contains("QUJDREVG"), "{masked:?}");
+    assert!(masked.contains("after"), "{masked:?}");
+    assert!(tail.redacted);
+}
+
+// -- truncated says which way ---------------------------------------------------
+
+#[test]
+fn a_tail_says_whether_it_was_clipped_or_rotated_or_both() {
+    let dir = private_tempdir();
+    let store = store(&dir, small());
+    record(&store, "term-1-1", &stream(200), 50);
+    let (_, clipped) = tail(store.read("term-1-1", 64, false));
+    assert!(clipped.truncated && clipped.clipped && !clipped.rotated);
+    let (_, whole) = tail(store.read("term-1-1", 4096, false));
+    assert!(!whole.truncated && !whole.clipped && !whole.rotated);
+
+    record(&store, "term-1-2", &stream(5000), 100);
+    let (_, rotated) = tail(store.read("term-1-2", 4096, false));
+    assert!(rotated.truncated && rotated.rotated && !rotated.clipped);
+    let (_, both) = tail(store.read("term-1-2", 64, false));
+    assert!(both.truncated && both.rotated && both.clipped);
+}
+
+// -- a rotation while a read is under way -------------------------------------
+
+/// Numbered lines, so a read that skipped a stretch in the middle is caught
+/// where the periodic `stream` would hide it.
+fn lines(from: usize, to: usize) -> Vec<u8> {
+    (from..to)
+        .flat_map(|n| format!("line {n:05}\r\n").into_bytes())
+        .collect()
+}
+
+#[test]
+fn a_rotation_between_the_two_opens_of_a_read_does_not_drop_a_segment_from_the_middle() {
+    let dir = private_tempdir();
+    let store = store(&dir, small());
+    // 12 bytes a line, 256 to a segment: 40 lines have rotated twice.
+    let tap = store.arm("term-1-1").unwrap();
+    tap.chunk(&lines(0, 40));
+    assert!(store.flush(Duration::from_secs(5)));
+    let mut rotated_once = false;
+    let read = store
+        .inner
+        .read_tail_between("term-1-1", 4096, &mut || {
+            if !rotated_once {
+                rotated_once = true;
+                // What the writer does with the next full segment, while the
+                // reader holds the older one open and has yet to open the newer.
+                tap.chunk(&lines(40, 60));
+                assert!(store.flush(Duration::from_secs(5)));
+            }
+        })
+        .unwrap()
+        .unwrap();
+    assert!(rotated_once);
+    let text = String::from_utf8(read.bytes).unwrap();
+    let numbers: Vec<usize> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("line ")?.parse().ok())
+        .collect();
+    assert!(numbers.len() > 10, "{text:?}");
+    for pair in numbers.windows(2) {
+        assert_eq!(
+            pair[1],
+            pair[0] + 1,
+            "lines are missing from the middle of {numbers:?}"
+        );
+    }
+    drop(tap);
+}
+
+// -- the directory scan says when it stopped early ----------------------------
+
+#[test]
+fn a_directory_scan_that_hit_its_cap_says_so() {
+    let dir = private_tempdir();
+    let store = store(&dir, small());
+    for n in 0..5 {
+        std::fs::write(files(&dir).join(format!("term-1-{n}.log")), b"x").unwrap();
+    }
+    let (held, capped) = store.inner.scan_up_to(3).unwrap();
+    assert!(capped, "five entries, three read");
+    assert!(held.len() <= 3);
+    let (held, capped) = store.inner.scan_up_to(5).unwrap();
+    assert!(!capped, "all five were read");
+    assert_eq!(held.len(), 5);
+}
+
+#[test]
+fn a_failure_note_is_part_of_its_sessions_files_for_retention() {
+    let dir = private_tempdir();
+    let store = store(&dir, small());
+    std::fs::write(files(&dir).join("term-1-1.log.err"), b"disk full").unwrap();
+    std::fs::write(files(&dir).join("term-1-1.log"), b"x").unwrap();
+    let (held, _) = store.inner.scan_up_to(10).unwrap();
+    assert_eq!(held["term-1-1"].paths.len(), 2);
+    assert_eq!(held["term-1-1"].bytes, 10);
+    store.inner.remove_files("term-1-1");
+    assert!(names(&files(&dir)).is_empty());
+}
+
+// -- the writer panicking -----------------------------------------------------
+
+#[test]
+fn a_writer_that_panics_marks_the_session_failed_and_does_not_hold_up_a_read() {
+    let dir = private_tempdir();
+    let store = store(&dir, small());
+    *lock(&store.inner.panic_on) = Some("term-1-1".into());
+    let tap = store.arm("term-1-1").unwrap();
+    tap.chunk(b"never written");
+    let started = std::time::Instant::now();
+    let read = store.read("term-1-1", 4096, false);
+    assert!(
+        started.elapsed() < SETTLE_DEADLINE / 2,
+        "a read waited {:?} for operations that can no longer finish",
+        started.elapsed()
+    );
+    let (_, tail) = tail(read);
+    assert!(tail.settled);
+    let error = tail.recording_error.expect("the session's output was lost");
+    assert!(error.contains("stopped unexpectedly"), "{error}");
+}
+
+// -- age, in a host that stays up ---------------------------------------------
+
+#[test]
+fn a_host_that_stays_up_ages_out_old_transcripts_whenever_a_session_ends() {
+    let dir = private_tempdir();
+    let store = store(&dir, small());
+    record(&store, "term-1-1", b"old", 3);
+    assert!(store.flush(Duration::from_secs(5)));
+    age(
+        &files(&dir).join("term-1-1.log"),
+        Duration::from_secs(15 * 24 * 3600),
+    );
+    record(&store, "term-1-2", b"new", 3);
+    assert!(store.flush(Duration::from_secs(5)));
+    assert_eq!(names(&files(&dir)), ["term-1-2.log"]);
 }

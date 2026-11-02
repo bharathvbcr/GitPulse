@@ -40,9 +40,15 @@ pub struct TranscriptTail {
     /// Bytes of the session's output that are still on disk. More than
     /// `bytes` when the tail was clipped.
     pub retained: u64,
-    /// The start of the session's output is not in `data_b64`: the read was
-    /// clipped to its bound, or earlier output was rotated away.
+    /// The start of the session's output is not in `data_b64`: `rotated` or
+    /// `clipped`.
     pub truncated: bool,
+    /// Earlier output was rotated off the disk to keep the transcript within
+    /// its size limit, so it is gone, not merely not shown.
+    pub rotated: bool,
+    /// The read was cut to its byte bound: older output is still saved but is
+    /// not in `data_b64`. Both this and `rotated` can hold.
+    pub clipped: bool,
     /// Places in `data_b64` where the host could not keep up and dropped
     /// output, each marked in the text itself.
     pub gap_markers: u32,
@@ -53,7 +59,10 @@ pub struct TranscriptTail {
     /// The host had written everything it had been given when it answered.
     /// `false` means the tail may lag the session by what was still queued.
     pub settled: bool,
-    /// Why recording stopped short, when a write failed (disk full, a
-    /// permission change). Output after that point is not in the log.
+    /// Why the saved output may stop short of what the session printed: a
+    /// write failed (disk full, a permission change), or the host that wrote it
+    /// ended without closing it, so whether its end is missing is unknown.
+    /// `None` only for a session still being recorded without error, or one
+    /// whose end was written down.
     pub recording_error: Option<String>,
 }

@@ -258,7 +258,10 @@ session printed.
   written first, never one still running (checked when a segment rotates and
   when a session ends). If running sessions alone are over it, their previous
   segments go next, and a warning is logged while they remain over;
-* a transcript untouched for 14 days is deleted when a host starts;
+* a transcript untouched for 14 days is deleted when a host starts and each time
+  a session ends or a segment rotates (the same pass that enforces the size
+  limit), so a host that stays up ages them out as long as sessions keep ending;
+  an idle host that never ends another session keeps them until it exits;
 * writes are plain `write_all`s to the page cache and survive the host process
   dying. They are `fsync`ed when a segment rotates, when a session ends, when
   the host stops, and 5 s after the last write to an idle session, so a power
@@ -273,6 +276,20 @@ the run's output, so deleting there would leave the feature with nothing to
 show. A finished session's transcript ends by eviction or age, above. A new
 session under an id that has a transcript replaces it.
 
+**How the recording ended is on disk.** Whether a transcript is whole is not
+something a host's memory may hold: the host that knew is the one that died.
+Closing a session appends `[gitpulse: transcript ends]` to its newest segment
+(under the segment's size bound; a segment with no room rotates first), and a
+write that fails leaves `<id>.log.err` with the reason (`0600`, `O_NOFOLLOW`,
+at most 2 KiB, removed and evicted with the session). A read strips the marker
+like the continuation line and answers `recording_error`: the failure's reason
+if there is one (from memory, or from the note after a restart), else, for a
+finished session whose newest segment lacks the marker, *the host that wrote
+this did not close it, so the end of the output may be missing*. A session that
+is still running has no marker yet and is not reported for it. The marker is
+text a program could print; spoofing it can only make a transcript read as
+closed.
+
 **The read.** `Request::Transcript { session, max_bytes, redact }` is read-only
 (`attach` means a live session; this never attaches) and works for live and
 finished sessions. `max_bytes` is clamped to 128 KiB. The tail crosses the
@@ -285,15 +302,16 @@ the 512 KiB header bound. The answer (`terminal::TranscriptRead`) is one of:
 
 | state | meaning |
 |---|---|
-| `found` | the tail, plus `bytes`, `retained` (on disk), `truncated`, `gap_markers`, `redacted`, `live`, `settled` (everything queued was written before the answer; false means the end may lag) and `recording_error` (a write failed; later output is not here) |
+| `found` | the tail, plus `bytes` (after masking, when `redact`), `retained` (on disk, before masking), `truncated` (`rotated` or `clipped`: `rotated` means the start was rotated off the disk, `clipped` that older saved output was left out of this read's bound; both can hold), `gap_markers`, `redacted`, `live`, `settled` (everything queued was written before the answer; false means the end may lag) and `recording_error` (the saved output may stop short: a write failed, or the host that wrote it never closed it) |
 | `missing` | no transcript: never recorded, evicted, or aged out |
 | `unreadable` | one exists or should and could not be read; `reason` says why. A transcript that is a symbolic link, is not a regular file, belongs to another user, or could not be recorded (disk full, directory gone) is `unreadable`, as is a host whose transcript store would not open |
 | `unavailable` | the app runs terminals itself (never sent by a host) |
 
 The renderer's `readSavedTranscript` adds `failed` (the call failed, timed out,
 or the answer was malformed), which is not `missing`: the output may be there.
-`recording_error` lives in the host's memory; after a host restart a transcript
-that stopped early reads as `found` up to where it stopped.
+`recording_error` survives a host restart (see *How the recording ended is on
+disk*); a transcript whose host died reads as `found` up to where it stopped
+with `recording_error` set, never as complete.
 
 **Protocol.** Adding the request bumped `PROTOCOL` to 3. A host of protocol 2
 ends the connection of an app that sends a request it cannot decode, so the two
@@ -317,9 +335,13 @@ sequence in another), and the file is reachable only by the user who owns it.
   that is not the host's own user. It is never sent anywhere.
 * `redact: true` runs the tail through `ledger::redact::text` in the host, before
   the bytes leave it, and is what any surface beyond the local user (an export, a
-  ledger entry, a shared report) must use. The tail is cut to a character
-  boundary first, so a secret split by the cut is not recognised; redaction is a
-  mask for display, not a guarantee.
+  ledger entry, a shared report) must use. A masking read looks 64 KiB further
+  back than the window it returns, masks, then clips to the window, so a name
+  such as `password=` or a key's first line just before the window still marks
+  what follows. A private key whose closing line is in that margin but whose
+  opening line is not is masked up to the closing line. What it cannot see: a
+  secret split by the margin's own start, or a key body longer than the margin
+  with neither line in view. Redaction is a mask for display, not a guarantee.
 * `keep_terminals_running` stays default-off; a user who never turns it on has
   no host and no transcripts. The sign-off in the security statement below covers
   what a transcript at rest widens.

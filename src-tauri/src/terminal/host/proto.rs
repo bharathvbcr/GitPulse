@@ -500,6 +500,8 @@ mod tests {
                     bytes: 2,
                     retained: 2,
                     truncated: false,
+                    rotated: false,
+                    clipped: false,
                     gap_markers: 0,
                     redacted: false,
                     live: false,
