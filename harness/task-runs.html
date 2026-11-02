@@ -333,8 +333,33 @@
         check("A finished attempt is drawn from its recorded start: a lead-in nobody observed, the work, then the rest up to its recorded end",
           spans.map(span=>span.dataset.state).join(">")==="unknown>working>idle");
         check("…and its last span is bounded by the run's own finish, with a length, not left as not observed",
-          spans.at(-1)?.dataset.bound==="finished"&&!spans.at(-1).title.includes("length not known")&&spans.at(-1).title.endsWith("1m 40s"));
+          spans.at(-1)?.dataset.bound==="finished"&&!spans.at(-1).title.includes("length not known")&&spans.at(-1).title.endsWith("1m 40s")&&
+          !card().querySelector('[data-testid="agent-activity-unbounded"]'));
         runs.delete(done.id);ledgerRows=[];button("Refresh").click();await pause(100);
+      }
+      // ---- A reconciled attempt's finished_at is when it was noticed, not when it ended ----
+      // dc-store's reconciliation stamps `finished_at` with the release time and
+      // sets `outcome_uncertain`. The last span must not borrow that stamp as an end.
+      {
+        const base=Date.parse("2026-09-01T12:00:00.000Z")/1000, at=seconds=>new Date((base+seconds)*1000).toISOString();
+        const template=[...runs.values()].find(item=>item.kind==="external_terminal");
+        const released={...template,id:"reconciled-activity",provider:"codex",state:"exited",session_id:"reconciled-pty",exit_code:null,outcome_uncertain:true,reason:"Reconciled: agent process is no longer running",revision:2,claimed_at:base-70,started_at:base-60,finished_at:base+4000};
+        const row=(id,session,action,object,detail)=>({id,ulid:`01RECONCIL${String(id).padStart(16,"0")}`,ts_utc:at(0),schema_version:1,repo_path:"/fixture/GitPulse",worktree_path:null,actor_kind:"agent",actor_id:"claude-code",session_id:session,task_id:null,action,object,argv_json:null,outcome:"ok",verdict_json:null,before_ref:null,after_ref:null,duration_ms:null,detail_json:JSON.stringify(detail)});
+        ledgerRows=[
+          row(1,"reconciled-pty","session.state","prompt_submitted",{event:"prompt_submitted",occurred_at:at(0)}),
+          row(2,"reconciled-pty","session.state","turn_finished",{event:"turn_finished",occurred_at:at(300)}),
+        ];
+        runs.set(released.id,released);button("Refresh").click();
+        const card=()=>pane().querySelector(`[data-run-id="${released.id}"]`);
+        await wait(()=>card());
+        card().querySelector('[data-testid="agent-activity"]').open=true;
+        await wait(()=>card().querySelector('[data-testid="agent-activity-bar"]'));
+        const spans=[...card().querySelectorAll('[data-testid="agent-activity-segment"]')];
+        // A span with no length is not drawn (it has no width); the pane says so instead.
+        check("A reconciled attempt's last span is not bounded by the reconciler's stamp: nothing is drawn as finished, and the pane says the last stretch was not observed",
+          spans.length>0&&!spans.some(span=>span.dataset.bound==="finished")&&!spans.some(span=>span.dataset.state==="idle")&&
+          /not observed/.test(card().querySelector('[data-testid="agent-activity-unbounded"]')?.textContent??""));
+        runs.delete(released.id);ledgerRows=[];button("Refresh").click();await pause(100);
       }
       // ---- Monitoring one agent from the pane ------------------------------
       {

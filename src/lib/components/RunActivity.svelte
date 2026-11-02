@@ -98,6 +98,7 @@
           <li data-state={state}><span class="swatch" aria-hidden="true"></span>{SEGMENT_LABELS[state as keyof typeof SEGMENT_LABELS]} {formatDuration(ms ?? null)}</li>
         {/each}
       </ul>
+      {#if timeline.segments.some((s) => s.durationMs === null && s.state !== "ended")}<p class="meta" data-testid="agent-activity-unbounded">How long the last stretch lasted was not observed, so it is not drawn.</p>{/if}
       {#if timeline.segments.some((s) => s.bound === "now")}<p class="meta">The newest span is still open and counted up to the last read.</p>{/if}
     {:else}
       <p class="meta" data-testid="agent-activity-no-lifecycle">No lifecycle events were recorded for this attempt, so how its time was spent is not known.</p>
