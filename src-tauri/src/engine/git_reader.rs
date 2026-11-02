@@ -5483,8 +5483,10 @@ impl UntrackedScan {
 
     fn remember(&mut self, path: &Path, identity: ScanIdentity, lines: usize) {
         if self.next.len() < untracked_cache::MAX_FILES_PER_REPO {
-            self.next
-                .insert(path.to_path_buf(), untracked_cache::Entry { identity, lines });
+            self.next.insert(
+                path.to_path_buf(),
+                untracked_cache::Entry { identity, lines },
+            );
         }
     }
 
@@ -12750,7 +12752,11 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         let (opened, bytes) = untracked_probe::take();
         let (counted, not_counted) = counted_and_not(&rows);
         assert_eq!(rows.len(), 20);
-        assert_eq!(counted, vec![2; 7], "exactly the budgeted files are counted");
+        assert_eq!(
+            counted,
+            vec![2; 7],
+            "exactly the budgeted files are counted"
+        );
         assert_eq!(not_counted.len(), 13);
         for (path, why) in &not_counted {
             assert_eq!(*why, [UNTRACKED_BUDGET_SPENT.to_string()], "{path}");
@@ -12759,7 +12765,11 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             .iter()
             .filter(|r| !r.warnings.is_empty())
             .all(|r| r.additions == 0 && r.deletions == 0));
-        assert_eq!((opened, bytes), (7, 7 * 4), "nothing past the budget was read");
+        assert_eq!(
+            (opened, bytes),
+            (7, 7 * 4),
+            "nothing past the budget was read"
+        );
     }
 
     /// The same bound in bytes: a file that would pass it is never opened, so
@@ -12821,7 +12831,11 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
         assert_eq!(counted_and_not(&rows).0.len(), 3);
 
         std::thread::sleep(lang_cache::RACY_WINDOW + Duration::from_millis(300));
-        assert_eq!(opened_by(&mut rows), 3, "settled now, so these are read once more");
+        assert_eq!(
+            opened_by(&mut rows),
+            3,
+            "settled now, so these are read once more"
+        );
         assert_eq!(counted_and_not(&rows).0.len(), 3);
 
         // The first three come from memory, so the budget reaches the rest.
@@ -12876,8 +12890,20 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0second\0Ada\0ada@example.com\0\0\
             .unwrap();
         let swapped = rows.iter().find(|r| r.path == "u001.txt").unwrap();
         assert_eq!(swapped.additions, 0);
-        assert_eq!(rows.iter().find(|r| r.path == "u000.txt").unwrap().additions, 2);
-        assert_eq!(rows.iter().find(|r| r.path == "u002.txt").unwrap().additions, 2);
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.path == "u000.txt")
+                .unwrap()
+                .additions,
+            2
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.path == "u002.txt")
+                .unwrap()
+                .additions,
+            2
+        );
     }
 
     /// The two numstats run only when a row reads them, and skipping them

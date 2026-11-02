@@ -562,7 +562,9 @@ impl LiveBuildSlot {
         }
 
         slots.insert(canonical.clone());
-        Ok(Self { repo_path: canonical })
+        Ok(Self {
+            repo_path: canonical,
+        })
     }
 }
 
@@ -2373,12 +2375,19 @@ exit 2
             elapsed
         );
         assert!(
-            elapsed < Duration::from_millis(1500),
+            elapsed < crate::test_support::coverage_relaxed(Duration::from_millis(1500)),
             "command blocked past PROBE_GRACE! Took {:?}",
             elapsed
         );
-        assert!(first.probe_pending, "must report probe_pending: true: {first:?}");
-        assert_eq!(first.decision, LiveRefreshDecision::SkipDeferred, "{first:?}");
+        assert!(
+            first.probe_pending,
+            "must report probe_pending: true: {first:?}"
+        );
+        assert_eq!(
+            first.decision,
+            LiveRefreshDecision::SkipDeferred,
+            "{first:?}"
+        );
         assert!(first.build.is_none());
 
         // Step 2: Edit storm during hung probe: all return instantly (< 50ms total), no duplicate probes
@@ -2389,7 +2398,8 @@ exit 2
             assert_eq!(burst_answer.decision, LiveRefreshDecision::SkipDeferred);
         }
         assert!(
-            burst_start.elapsed() < Duration::from_millis(100),
+            burst_start.elapsed()
+                < crate::test_support::coverage_relaxed(Duration::from_millis(100)),
             "subsequent calls during pending probe must be instant: took {:?}",
             burst_start.elapsed()
         );
@@ -2652,7 +2662,8 @@ exit 2
             let b = std::sync::Arc::clone(&barrier);
             let handle = std::thread::spawn(move || {
                 let repo_path = format!("/gitpulse-test/concurrent-repo-{i}");
-                let slot = LiveBuildSlot::claim(&repo_path).expect("each distinct repo claims slot");
+                let slot =
+                    LiveBuildSlot::claim(&repo_path).expect("each distinct repo claims slot");
 
                 // Duplicate claim on same repo must fail while slot is held
                 assert!(LiveBuildSlot::claim(&repo_path).is_err());
@@ -2731,7 +2742,8 @@ exit 2
         drop(slot_symlink);
 
         // 4. Claim via trailing slash, verify base path and symlink are rejected
-        let slot_slash = LiveBuildSlot::claim(&trailing_slash_str).expect("claim via trailing slash succeeds");
+        let slot_slash =
+            LiveBuildSlot::claim(&trailing_slash_str).expect("claim via trailing slash succeeds");
         assert!(
             LiveBuildSlot::claim(raw_str).is_err(),
             "base path rejected while trailing slash holds slot"

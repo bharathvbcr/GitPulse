@@ -2520,7 +2520,10 @@ mod serialize_tests {
         std::thread::sleep(Duration::from_millis(20));
         drop(first); // Wakes up waiter immediately via Condvar notify_all
 
-        let second = handle.join().expect("thread completes").expect("second acquires");
+        let second = handle
+            .join()
+            .expect("thread completes")
+            .expect("second acquires");
         drop(second);
     }
 
@@ -2549,11 +2552,15 @@ mod serialize_tests {
             let completed = Arc::clone(&completed_count);
             let handle = std::thread::spawn(move || {
                 let budget = Budget::within(Duration::from_secs(5));
-                let serial = serialize(repo, &budget).expect("thread acquires serial within budget");
+                let serial =
+                    serialize(repo, &budget).expect("thread acquires serial within budget");
 
                 // Verify single flight: mutual exclusion invariant
                 let prev = active.fetch_add(1, Ordering::SeqCst);
-                assert_eq!(prev, 0, "Mutual exclusion violated! Two threads active simultaneously");
+                assert_eq!(
+                    prev, 0,
+                    "Mutual exclusion violated! Two threads active simultaneously"
+                );
 
                 std::thread::sleep(Duration::from_millis(5));
 
@@ -2586,7 +2593,8 @@ mod serialize_tests {
         let handle = std::thread::spawn(move || {
             let wait_budget = Budget::within(Duration::from_millis(1000));
             tx.send(()).unwrap();
-            let serial = serialize(repo, &wait_budget).expect("waiter acquires lock after notification");
+            let serial =
+                serialize(repo, &wait_budget).expect("waiter acquires lock after notification");
             let wake_time = std::time::Instant::now();
             (serial, wake_time)
         });
@@ -2643,8 +2651,10 @@ mod serialize_tests {
         // Immediate subsequent acquisition succeeds
         let post_budget = Budget::within(Duration::from_millis(100));
         let post = serialize(repo, &post_budget);
-        assert!(post.is_some(), "re-acquisition after timeout threads succeeds");
+        assert!(
+            post.is_some(),
+            "re-acquisition after timeout threads succeeds"
+        );
         drop(post);
     }
 }
-

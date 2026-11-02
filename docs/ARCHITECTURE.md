@@ -190,10 +190,10 @@ Two of these are worth stating plainly, because both were live defects:
   wall-clock deadline — reporting `2 of 5+` rather than presenting a capped
   sample as a total.
 
-### Async Hygiene, Cancellation Guards & 5-Lane Workflow Separation
+### Async Hygiene & Cancellation Guards
 When switching between repositories or triggering fast refilters, in-flight IPC calls could return out of order. GitPulse guards asynchronous calls using `createAsyncGuard` ([`src/lib/async/guard.ts`](../src/lib/async/guard.ts)). When a repository changes or a new query starts, pending promises from prior invocations are automatically invalidated and dropped.
 
-Repository and background operations are partitioned into five isolated execution lanes (`git-read`, `git-write`, `github`, `insights`, and `devmap`) via [`src/lib/async/lanes.ts`](../src/lib/async/lanes.ts) so slow background DevMap indexing or repository-wide insights scans never contend with interactive git status reads, staging, or view navigation. On the backend, DevMap IPC commands apply a 4-second non-blocking lock timeout (`try_lock_timeout`) and `UntrackedBudget` bounds untracked file line-counting to 4 MiB / 512 files with `O_NONBLOCK | O_NOFOLLOW` opens and `(path, mtime, size)` metadata caching. `ViewSectionPanel.svelte` retains visited view DOM subtrees (hiding inactive panels with `hidden` and `inert`) and `VirtualList.svelte` virtualizes long lists to keep tab switching instantaneous.
+On the backend, a DevMap live refresh never holds its IPC command on the `devmap status` probe: `start_refresh` waits at most `PROBE_GRACE` (1 s) and otherwise answers with `probe_pending` while the probe finishes in the background. Untracked-file line counting is bounded per refresh by `UntrackedBudget` (2,000 files / 128 MiB, and no single file over 64 MiB); each file is opened `O_NONBLOCK | O_NOFOLLOW`, results are cached against a `ScanIdentity` (length, inode, mtime, ctime), and a row whose lines were not counted carries a warning so its zero is not read as "no lines".
 
 ---
 
@@ -444,7 +444,7 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 | Contract Tool | Command | Description |
 | --- | --- | --- |
 | **IPC Checker** | `bun run check:ipc` | Verifies all 291 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
-| **Type Sync Checker** | `bun run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 1859 data fields, over 259 structs, in 105 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
+| **Type Sync Checker** | `bun run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 1860 data fields, over 259 structs, in 105 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
 | **Release Version Gate** | `bun run check:release` | Validates that `package.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, and every discovered plugin manifest agree. Plugin manifests are found under `plugins/<name>/` rather than hardcoded, because one package ships a manifest per agent client and the newest one is the likeliest to be missed. |
 | **MCP Install Doctor** | `bun run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH — the binary the plugin manifests spawn — and asserts both its version and its manifest's store schema match this tree, then asks what source both binaries were built from against the digest `mcp:install` recorded. Version is the release identity and cannot see a fix that landed between releases; the digest can. Missing schema identity is unresponsive, never a pass, and an unrecorded install is *unverifiable*, never an OK. Reports *absent*, *unresponsive*, *stale*, and *unverifiable* as distinct failures. |
 

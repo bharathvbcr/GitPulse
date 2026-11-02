@@ -56,6 +56,7 @@ const VENDORED_ALLOWED: &[(&str, usize, &str)] = &[
     ("devmap-extract/src/wiring.rs", 1, "upstream DevCouncil: slice of a Vec<&str>, not a str"),
     ("devmap-query/src/doc_drift.rs", 4, "upstream DevCouncil: three slice a Vec (`segments`, `owners` twice, the last after `owners.len() >= qualifier.len()`); `span_content` cuts `[1..len - 1]` only after len >= 2, starts_with(' ') and ends_with(' '), both ASCII"),
     ("devmap-query/src/cypher.rs", 1,"upstream DevCouncil: guarded, `ends_with(open)` so the `len - open.len_utf8()` tail is exactly one char"),
+    ("devmap-resolve/src/lsp.rs", 1, "upstream DevCouncil: slice of a Vec<&str> of stderr lines (`all[all.len().saturating_sub(N)..]`), not a str"),
 ];
 
 fn check(

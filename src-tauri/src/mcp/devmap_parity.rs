@@ -985,29 +985,26 @@ mod tests {
         let root = dir.path().to_string_lossy().into_owned();
         let conn = rusqlite::Connection::open(crate::codeintel::devmap_db_path(&root))
             .expect("open fixture db");
+        // `generation_nodes` and `nodes_fts_map` are views over `file_rows` +
+        // `payload_nodes`, so the chain lives in `src/island.rs`'s payload (3)
+        // and its FTS rowid is `payload_id << 24 | ord_in_file`.
         for k in 0i64..=4 {
             let name = format!("chain_{k}");
-            let ordinal = 10 + k;
             conn.execute(
-                "INSERT INTO generation_nodes
-                   (generation_id, ordinal, file_id, name, qualified_name, kind,
+                "INSERT INTO payload_nodes
+                   (payload_id, ord_in_file, name, qualified_name, kind,
                     span_start, span_end, is_exported)
-                 VALUES (1, ?1, 3, ?2, ?2, 'Function', 0, 20, 1)",
-                (ordinal, &name),
+                 VALUES (3, ?1, ?2, ?2, 'Function', 0, 20, 1)",
+                (k, &name),
             )
             .expect("insert chain node");
-            let fts_rowid = (1i64 << 32) | ordinal;
+            let fts_rowid = (3i64 << 24) | k;
             conn.execute(
                 "INSERT INTO nodes_fts (rowid, name, qualified_name, path)
                  VALUES (?1, ?2, ?2, 'src/island.rs')",
                 (fts_rowid, &name),
             )
             .expect("insert chain fts row");
-            conn.execute(
-                "INSERT INTO nodes_fts_map (rowid_ref, generation_id) VALUES (?1, 1)",
-                [fts_rowid],
-            )
-            .expect("insert chain fts map row");
             if k > 0 {
                 conn.execute(
                     "INSERT INTO edge_rows
