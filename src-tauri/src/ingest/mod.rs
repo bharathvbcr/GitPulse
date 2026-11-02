@@ -1966,6 +1966,53 @@ mod tests {
         assert_eq!(ledger::tail(repo, 0, 100).unwrap().len(), before);
     }
 
+    /// An assistant record of response `message` with no tool call in it, with
+    /// its usage. Synthetic.
+    fn text_line(repo: &str, message: &str, ts: &str) -> String {
+        serde_json::json!({
+            "type": "assistant", "sessionId": "S1", "timestamp": ts, "version": "2.1.241",
+            "cwd": repo, "gitBranch": "main",
+            "message": { "id": message, "content": [{ "type": "text", "text": "SYNTHETIC-PROSE" }],
+                "usage": { "input_tokens": 3, "output_tokens": 40,
+                    "cache_read_input_tokens": 100, "cache_creation_input_tokens": 7 } }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_cursor_held_in_the_middle_of_a_response_does_not_count_it_twice() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path().to_str().unwrap();
+        let tdir = tempfile::tempdir().unwrap();
+        // Response m1 is a text record and then a call that never gets a
+        // result; response m2 has started after it. The call holds the cursor,
+        // and the cursor must hold at the start of m1 and not at the call, or the
+        // next pass meets m1 half-way and counts it a second time.
+        let mut lines = vec![
+            text_line(repo, "m1", T0),
+            call_line(repo, "m1", T0, "tu1", bash("sleep 600")),
+            text_line(repo, "m2", T2),
+        ];
+        write_transcript(tdir.path(), "slug/S1.jsonl", &lines, 0);
+        with_transcript_root(tdir.path(), || {
+            ingest_transcripts(repo);
+            // The file grows (still the same live response) and is read again.
+            lines.push(text_line(repo, "m2", T2));
+            write_transcript(tdir.path(), "slug/S1.jsonl", &lines, 0);
+            ingest_transcripts(repo);
+            ingest_transcripts(repo);
+        });
+        let events = ledger::tail(repo, 0, 50).unwrap();
+        let counted = |message: &str| {
+            events
+                .iter()
+                .filter(|e| e.action == "session.usage")
+                .filter(|e| detail_of(e)["message_id"] == message)
+                .count()
+        };
+        assert_eq!(counted("m1"), 1, "m1 was counted again: {events:?}");
+    }
+
     #[test]
     fn a_call_that_never_got_a_result_is_recorded_unobserved_once_the_file_is_still() {
         let repo_dir = tempfile::tempdir().unwrap();

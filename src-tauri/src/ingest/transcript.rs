@@ -462,6 +462,17 @@ struct OpenUsage {
     call: ToolCall,
 }
 
+/// A call waiting for its result, and where the response it came from began.
+///
+/// A response's tokens are identified by the first record of it this reader
+/// saw, so a pass that starts in the middle of a response identifies them by
+/// another line and counts them again. The cursor therefore waits for a call at
+/// the start of its response, never at the call.
+struct Held {
+    call: ToolCall,
+    response_from: u64,
+}
+
 /// Reads one transcript file's lines in order, pairing each call with its
 /// result and counting each response's tokens once.
 ///
@@ -478,7 +489,7 @@ struct OpenUsage {
 pub struct Reader {
     subagent_id: Option<String>,
     line: Option<(u64, u64)>,
-    pending: VecDeque<ToolCall>,
+    pending: VecDeque<Held>,
     open_usage: Option<OpenUsage>,
     counted: VecDeque<String>,
     newest_ms: Option<u64>,
@@ -508,12 +519,10 @@ impl Reader {
     }
 
     /// The offset of the earliest line a call or a response still being read
-    /// came from: the pass's cursor must not pass it.
+    /// came from, taking a waiting call to be where its response began: the
+    /// pass's cursor must not pass it.
     pub fn held_from(&self) -> Option<u64> {
-        let calls = self
-            .pending
-            .iter()
-            .filter_map(|c| c.origin.map(|o| o.offset));
+        let calls = self.pending.iter().map(|held| held.response_from);
         let usage = self
             .open_usage
             .iter()
@@ -528,7 +537,7 @@ impl Reader {
         if !give_up {
             return Vec::new();
         }
-        let mut out: Vec<ToolCall> = self.pending.drain(..).collect();
+        let mut out: Vec<ToolCall> = self.pending.drain(..).map(|held| held.call).collect();
         out.extend(self.close_usage());
         out
     }
@@ -556,11 +565,18 @@ impl Reader {
                 return LineOutcome::NoCalls;
             };
             self.note_time(&base.ts_utc);
+            let response_from = self.response_start(record["message"]["id"].as_str());
             for (ordinal, mut call) in calls_in(&record).into_iter().enumerate() {
                 call.subagent_id.clone_from(&self.subagent_id);
                 call.origin = self.origin(ordinal);
-                if call.tool_use_id.is_some() && call.origin.is_some() {
-                    self.pending.push_back(call);
+                if let (Some(_), Some(origin), Some(response_from)) =
+                    (&call.tool_use_id, call.origin, response_from)
+                {
+                    let response_from = response_from.min(origin.offset);
+                    self.pending.push_back(Held {
+                        call,
+                        response_from,
+                    });
                 } else {
                     out.push(call);
                 }
@@ -639,11 +655,11 @@ impl Reader {
             let Some(slot) = self
                 .pending
                 .iter()
-                .position(|call| call.tool_use_id.as_deref() == Some(id))
+                .position(|held| held.call.tool_use_id.as_deref() == Some(id))
             else {
                 continue;
             };
-            let Some(mut call) = self.pending.remove(slot) else {
+            let Some(Held { mut call, .. }) = self.pending.remove(slot) else {
                 continue;
             };
             call.result = if block.is_error == Some(true) {
@@ -679,6 +695,19 @@ impl Reader {
         })
     }
 
+    /// The offset of the first record of the response the line being read
+    /// belongs to: the open response's own first record when this line
+    /// continues it, else this line.
+    fn response_start(&self, message_id: Option<&str>) -> Option<u64> {
+        let own = self.line.map(|(offset, _)| offset)?;
+        let open = self
+            .open_usage
+            .as_ref()
+            .filter(|open| message_id.is_some() && open.call.message_id.as_deref() == message_id)
+            .and_then(|open| open.call.origin.map(|o| o.offset));
+        Some(open.map_or(own, |from| from.min(own)))
+    }
+
     fn note_time(&mut self, ts: &str) {
         if let Some(at) = crate::ledger::ids::parse_event_time(ts) {
             self.newest_ms = Some(self.newest_ms.map_or(at, |newest| newest.max(at)));
@@ -690,17 +719,17 @@ impl Reader {
     fn expire(&mut self) -> Vec<ToolCall> {
         let mut out = Vec::new();
         while self.pending.len() > MAX_PENDING {
-            out.extend(self.pending.pop_front());
+            out.extend(self.pending.pop_front().map(|held| held.call));
         }
         if let Some(newest) = self.newest_ms {
-            let aged = |call: &ToolCall| {
-                crate::ledger::ids::parse_event_time(&call.ts_utc)
+            let aged = |held: &Held| {
+                crate::ledger::ids::parse_event_time(&held.call.ts_utc)
                     .is_some_and(|at| newest.saturating_sub(at) > PENDING_MAX_AGE_MS)
             };
             // Arrival order is time order inside one transcript; a call that is
             // out of order is held until its neighbours go, which only delays it.
             while self.pending.front().is_some_and(aged) {
-                out.extend(self.pending.pop_front());
+                out.extend(self.pending.pop_front().map(|held| held.call));
             }
         }
         out
@@ -1444,6 +1473,40 @@ mod reader_tests {
         assert_eq!(reader.held_from(), Some(100));
         feed(&mut reader, 500, &result(T0_2S, "a", None));
         assert_eq!(reader.held_from(), Some(300));
+    }
+
+    #[test]
+    fn a_call_in_the_middle_of_a_response_holds_the_cursor_at_the_responses_start() {
+        // m1 is written over two records and its second holds a call with no
+        // result; m2 has started, so m1's tokens have been written, identified by
+        // the first record of m1. Held at the call, the next pass would meet m1
+        // half-way and identify its tokens by the call's line: a second row.
+        let mut reader = Reader::new(None);
+        feed(&mut reader, 0, &assistant(T0, "m1", &thinking(), 42));
+        feed(&mut reader, 100, &assistant(T0, "m1", &bash("a"), 42));
+        let closed: Vec<ToolCall> = feed(&mut reader, 300, &assistant(T0_2S, "m2", &thinking(), 1))
+            .into_iter()
+            .filter(|c| c.tool == USAGE_TOOL)
+            .collect();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].origin.map(|o| o.offset), Some(0));
+        assert_eq!(
+            reader.held_from(),
+            Some(0),
+            "the owed call lies inside m1, whose tokens are identified by its first record"
+        );
+        // Read again from there, as the pass does: the same identity.
+        let mut again = Reader::new(None);
+        feed(&mut again, 0, &assistant(T0, "m1", &thinking(), 42));
+        feed(&mut again, 100, &assistant(T0, "m1", &bash("a"), 42));
+        let redone: Vec<ToolCall> = feed(&mut again, 300, &assistant(T0_2S, "m2", &thinking(), 1))
+            .into_iter()
+            .filter(|c| c.tool == USAGE_TOOL)
+            .collect();
+        assert_eq!(
+            redone.iter().map(|c| c.origin).collect::<Vec<_>>(),
+            closed.iter().map(|c| c.origin).collect::<Vec<_>>()
+        );
     }
 
     #[test]
