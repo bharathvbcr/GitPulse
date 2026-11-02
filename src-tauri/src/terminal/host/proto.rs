@@ -524,6 +524,7 @@ mod tests {
                     rotated: false,
                     clipped: false,
                     gap_markers: 0,
+                    unrecorded_bytes: 0,
                     redacted: false,
                     live: false,
                     settled: true,

@@ -244,8 +244,15 @@ counts for its bytes plus 64). One supervised writer thread (`spawn_service`,
 named `terminal-transcripts`) drains it. When the queue is full the chunk is
 dropped, its size remembered, and `[gitpulse: N bytes of output were not
 recorded]` is written ahead of the next chunk that fits (or when the session
-ends). Recorded bytes plus the counts in the markers always add up to what the
-session printed.
+ends). Once the session has ended and the writer has drained, recorded bytes
+plus the counts in the markers add up to what the session printed, with one
+exception: bytes dropped after the host began shutting down are never marked,
+because no writer is left to mark them. Before that, a live session's dropped
+bytes have no marker in the text yet, so the sum is short by exactly what a read
+reports as `unrecorded_bytes`: the read looks at the queue's pending drop count
+in the same lock acquisition as the session's liveness, and also counts what was
+dropped after shutdown began. A marker written for the same bytes while the read
+is running can name them in both places; they are never reported as zero.
 
 **Bounds** (`Limits`):
 
@@ -302,7 +309,7 @@ the 512 KiB header bound. The answer (`terminal::TranscriptRead`) is one of:
 
 | state | meaning |
 |---|---|
-| `found` | the tail, plus `bytes` (after masking, when `redact`), `retained` (on disk, before masking), `truncated` (`rotated` or `clipped`: `rotated` means the start was rotated off the disk, `clipped` that older saved output was left out of this read's bound; both can hold), `gap_markers`, `redacted`, `live`, `settled` (everything queued was written before the answer; false means the end may lag) and `recording_error` (the saved output may stop short: a write failed, or the host that wrote it never closed it) |
+| `found` | the tail, plus `bytes` (after masking, when `redact`), `retained` (on disk, before masking), `truncated` (`rotated` or `clipped`: `rotated` means the start was rotated off the disk, `clipped` that older saved output was left out of this read's bound; both can hold), `gap_markers`, `unrecorded_bytes` (dropped and not yet marked in the text, or dropped after shutdown began and never to be), `redacted`, `live`, `settled` (everything queued was written before the answer; false means the end may lag) and `recording_error` (the saved output may stop short: a write failed, or the host that wrote it never closed it) |
 | `missing` | no transcript: never recorded, evicted, or aged out |
 | `unreadable` | one exists or should and could not be read; `reason` says why. A transcript that is a symbolic link, is not a regular file, belongs to another user, or could not be recorded (disk full, directory gone) is `unreadable`, as is a host whose transcript store would not open |
 | `unavailable` | the app runs terminals itself (never sent by a host) |

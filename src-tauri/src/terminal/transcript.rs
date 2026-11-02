@@ -52,6 +52,14 @@ pub struct TranscriptTail {
     /// Places in `data_b64` where the host could not keep up and dropped
     /// output, each marked in the text itself.
     pub gap_markers: u32,
+    /// Bytes the session printed that the host dropped and that no marker in
+    /// `data_b64` accounts for: dropped while the writer was behind and not yet
+    /// marked (the marker is written ahead of the next chunk that fits, or when
+    /// the session ends), or dropped after the host began shutting down, which
+    /// will never be marked. `0` means none were pending when the host answered.
+    /// A marker written for the same bytes while the read ran can name them
+    /// again; they are never counted as zero.
+    pub unrecorded_bytes: u64,
     /// Secrets were masked (`ledger::redact`) before this left the host.
     pub redacted: bool,
     /// The session is still running, so more output may follow.

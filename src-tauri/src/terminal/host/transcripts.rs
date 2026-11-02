@@ -192,7 +192,9 @@ struct Queue {
     ops: VecDeque<Op>,
     /// Bytes (and per-op costs) of `ops`, which the bound is on.
     cost: usize,
-    /// Bytes dropped per session since its last gap marker was queued.
+    /// Bytes dropped per session that no gap marker has been queued for: held
+    /// back until a chunk fits or the session ends, and, once the writer is
+    /// stopping, for good. A read reports it (`TranscriptTail::unrecorded_bytes`).
     gaps: HashMap<String, u64>,
     /// Sessions armed and not yet closed.
     recording: HashSet<String>,
@@ -374,13 +376,13 @@ impl Inner {
         let owned = data.to_vec();
         let cost = data.len() + OP_COST;
         let mut queue = lock(&self.queue);
-        if queue.shutdown {
-            // The writer is gone or going: nothing queued now would be
-            // written, and a gap counted now would never be.
-            return;
-        }
-        if queue.cost + cost > self.limits.queue_bytes {
-            *queue.gaps.entry(session.to_owned()).or_insert(0) += data.len() as u64;
+        // Once the writer is stopping nothing queued would be written, and no
+        // later chunk will carry a marker for these bytes either. They are
+        // counted all the same, in the one place a read looks, so it can say
+        // they are missing instead of leaving the text to read as complete.
+        if queue.shutdown || queue.cost + cost > self.limits.queue_bytes {
+            let dropped = queue.gaps.entry(session.to_owned()).or_insert(0);
+            *dropped = dropped.saturating_add(data.len() as u64);
             return;
         }
         if let Some(dropped) = queue.gaps.remove(session) {
@@ -396,8 +398,9 @@ impl Inner {
         queue.recording.remove(session);
         if queue.shutdown {
             // Never written, so the file keeps no end marker: a later host
-            // reads that as a session its host did not get to close.
-            queue.gaps.remove(session);
+            // reads that as a session its host did not get to close. Bytes
+            // dropped and not yet marked stay counted: no gap marker will
+            // ever be written for them, and a read still reports them.
             return;
         }
         if let Some(dropped) = queue.gaps.remove(session) {
@@ -885,7 +888,17 @@ impl Inner {
             };
         }
         let settled = self.settle(SETTLE_DEADLINE);
-        let live = lock(&self.queue).recording.contains(session);
+        // One look at the queue for both facts, taken before the files are
+        // read: a count and a liveness from two moments could disagree. Bytes
+        // counted here that a gap marker reaches the file for before the read
+        // below are named twice, never zero times.
+        let (live, unrecorded_bytes) = {
+            let queue = lock(&self.queue);
+            (
+                queue.recording.contains(session),
+                queue.gaps.get(session).copied().unwrap_or(0),
+            )
+        };
         // This host's memory first; a host that started later has only the
         // note the earlier one left. A running session has no earlier host.
         let remembered = lock(&self.failures).get(session).cloned();
@@ -936,6 +949,7 @@ impl Inner {
             rotated: raw.rotated,
             clipped,
             gap_markers,
+            unrecorded_bytes,
             redacted: redact,
             live,
             settled,

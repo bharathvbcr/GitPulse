@@ -210,6 +210,25 @@ fn a_file_with_wider_permissions_is_narrowed_before_anything_is_written() {
     assert_eq!(mode, 0o600);
 }
 
+/// The bytes of `text` that are output, and the bytes its gap markers say were
+/// dropped.
+fn accounted(text: &str) -> (u64, u64) {
+    let mut recorded = 0u64;
+    let mut dropped = 0u64;
+    let mut rest = text;
+    while let Some(at) = rest.find("\r\n[gitpulse: ") {
+        recorded += rest[..at].len() as u64;
+        let after = &rest[at + "\r\n[gitpulse: ".len()..];
+        let (n, tail_text) = after.split_once(' ').unwrap();
+        dropped += n.parse::<u64>().unwrap();
+        rest = tail_text
+            .strip_prefix("bytes of output were not recorded]\r\n")
+            .unwrap();
+    }
+    recorded += rest.len() as u64;
+    (recorded, dropped)
+}
+
 #[test]
 fn output_that_outruns_the_writer_is_dropped_with_a_marker_and_never_stalls_the_reader() {
     let dir = private_tempdir();
@@ -240,25 +259,95 @@ fn output_that_outruns_the_writer_is_dropped_with_a_marker_and_never_stalls_the_
     let (got, tail) = tail(store.read("term-1-1", MAX_TRANSCRIPT_TAIL_BYTES, false));
     assert!(tail.gap_markers >= 1, "{} markers", tail.gap_markers);
     let text = String::from_utf8(got).unwrap();
-    let mut recorded = 0u64;
-    let mut dropped = 0u64;
-    let mut rest = text.as_str();
-    while let Some(at) = rest.find("\r\n[gitpulse: ") {
-        recorded += rest[..at].len() as u64;
-        let after = &rest[at + "\r\n[gitpulse: ".len()..];
-        let (n, tail_text) = after.split_once(' ').unwrap();
-        dropped += n.parse::<u64>().unwrap();
-        rest = tail_text
-            .strip_prefix("bytes of output were not recorded]\r\n")
-            .unwrap();
-    }
-    recorded += rest.len() as u64;
+    let (recorded, dropped) = accounted(&text);
     assert_eq!(
         recorded + dropped,
         200 * 300,
         "every byte is either in the log or counted in a marker"
     );
     assert!(dropped > 0 && recorded > 0);
+}
+
+/// An answer as it crosses the socket, so a test can name a field the way the
+/// renderer reads it.
+fn wire(read: TranscriptRead) -> serde_json::Value {
+    serde_json::to_value(read).unwrap()
+}
+
+#[test]
+fn a_read_before_the_session_ends_reports_the_bytes_dropped_and_not_yet_marked() {
+    let dir = private_tempdir();
+    let store = store(
+        &dir,
+        Limits {
+            queue_bytes: 2000,
+            segment_bytes: 1024 * 1024,
+            ..small()
+        },
+    );
+    let tap = store.arm("term-1-1").unwrap();
+    assert!(store.flush(Duration::from_secs(5)), "the session opens");
+    // Stalled only now, with the file open, so a read finds a log to read.
+    let stalled = lock(&store.inner.files);
+    let chunk = vec![b'x'; 300];
+    for _ in 0..200 {
+        tap.chunk(&chunk);
+    }
+    // How many chunks the writer took before it stalled is the scheduler's,
+    // and a chunk that fits after a drop queues the marker for the drops before
+    // it. What overflowed since the last such marker has none queued and the
+    // session is still open: the log shows none, and only the read can say
+    // they are missing.
+    let during = wire(store.read("term-1-1", MAX_TRANSCRIPT_TAIL_BYTES, false));
+    assert_eq!(during["state"], "found", "{during}");
+    assert_eq!(during["live"], true);
+    assert_eq!(during["settled"], false, "the writer is stalled");
+    assert_eq!(during["gap_markers"], 0);
+    let pending = during["unrecorded_bytes"].as_u64().unwrap_or(0);
+    assert!(
+        (1..=199).contains(&(pending / 300)) && pending % 300 == 0,
+        "a live read hid the bytes already dropped: {during}"
+    );
+    drop(tap);
+    drop(stalled);
+    assert!(store.flush(Duration::from_secs(5)));
+    let after = wire(store.read("term-1-1", MAX_TRANSCRIPT_TAIL_BYTES, false));
+    assert_eq!(
+        after["unrecorded_bytes"], 0,
+        "the session's end queued the marker"
+    );
+    // The count the live read gave is the one the last marker then carried, and
+    // with it every byte is accounted for.
+    let text =
+        String::from_utf8(BASE64.decode(after["data_b64"].as_str().unwrap()).unwrap()).unwrap();
+    assert!(
+        text.ends_with(&format!(
+            "[gitpulse: {pending} bytes of output were not recorded]\r\n"
+        )),
+        "the live read said {pending}, the log ends otherwise"
+    );
+    let (recorded, dropped) = accounted(&text);
+    assert_eq!(recorded + dropped, 200 * 300);
+}
+
+#[test]
+fn output_after_the_store_began_stopping_is_counted_as_unrecorded_even_once_the_session_ends() {
+    let dir = private_tempdir();
+    let store = store(&dir, small());
+    let tap = store.arm("term-1-1").unwrap();
+    tap.chunk(b"before");
+    store.shutdown();
+    let late = b"after the host stopped";
+    tap.chunk(late);
+    drop(tap);
+    let answer = wire(store.read("term-1-1", MAX_TRANSCRIPT_TAIL_BYTES, false));
+    assert_eq!(answer["state"], "found", "{answer}");
+    assert_eq!(
+        answer["unrecorded_bytes"],
+        late.len(),
+        "bytes dropped after shutdown began were forgotten: {answer}"
+    );
+    assert_eq!(answer["live"], false);
 }
 
 #[test]

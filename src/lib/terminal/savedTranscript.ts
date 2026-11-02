@@ -43,6 +43,13 @@ export interface FoundTranscript {
   readonly clipped: boolean;
   /** Places where the host dropped output it could not keep up with. */
   readonly gapMarkers: number;
+  /**
+   * Bytes the host dropped that no marker in `text` accounts for yet: pending
+   * (the marker is written when a chunk fits or the session ends) or lost for
+   * good because the host was already stopping. Not "none" when zero is
+   * absent: the host always says.
+   */
+  readonly unrecordedBytes: number;
   /** Secrets were masked in the host. */
   readonly redacted: boolean;
   /** The session is still running, so more output may follow. */
@@ -136,8 +143,9 @@ function parseFound(record: Record<string, unknown>): SavedTranscript {
   const bytes = nonNegativeInteger(record.bytes);
   const retained = nonNegativeInteger(record.retained);
   const gapMarkers = nonNegativeInteger(record.gap_markers);
+  const unrecordedBytes = nonNegativeInteger(record.unrecorded_bytes);
   const flags = ["truncated", "rotated", "clipped", "redacted", "live", "settled"] as const;
-  if (typeof record.data_b64 !== "string" || bytes === null || retained === null || gapMarkers === null) {
+  if (typeof record.data_b64 !== "string" || bytes === null || retained === null || gapMarkers === null || unrecordedBytes === null) {
     return failed("The terminal host's transcript was malformed.");
   }
   for (const flag of flags) {
@@ -163,6 +171,7 @@ function parseFound(record: Record<string, unknown>): SavedTranscript {
     rotated: record.rotated as boolean,
     clipped: record.clipped as boolean,
     gapMarkers,
+    unrecordedBytes,
     redacted: record.redacted as boolean,
     live: record.live as boolean,
     settled: record.settled as boolean,
@@ -202,6 +211,11 @@ export function transcriptNotices(found: FoundTranscript): string[] {
   if (found.gapMarkers > 0) {
     notices.push(
       `${found.gapMarkers} stretch${found.gapMarkers === 1 ? "" : "es"} of output could not be saved fast enough and ${found.gapMarkers === 1 ? "is" : "are"} marked in the text.`,
+    );
+  }
+  if (found.unrecordedBytes > 0) {
+    notices.push(
+      `${found.unrecordedBytes.toLocaleString("en-US")} more byte${found.unrecordedBytes === 1 ? " was" : "s were"} dropped because the host could not save output fast enough, and the text does not mark where.`,
     );
   }
   if (found.recordingError) notices.push(`The saved output may be incomplete: ${found.recordingError}`);

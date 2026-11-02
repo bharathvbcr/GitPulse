@@ -22,6 +22,7 @@ function foundWire(text: string, over: Record<string, unknown> = {}): Record<str
     rotated: false,
     clipped: false,
     gap_markers: 0,
+    unrecorded_bytes: 0,
     redacted: false,
     live: false,
     settled: true,
@@ -65,6 +66,9 @@ describe("parseSavedTranscript", () => {
       foundWire("x", { data_b64: 5 }),
       foundWire("x", { bytes: -1 }),
       foundWire("x", { gap_markers: 1.5 }),
+      foundWire("x", { unrecorded_bytes: -1 }),
+      foundWire("x", { unrecorded_bytes: 1.5 }),
+      foundWire("x", { unrecorded_bytes: undefined }),
       foundWire("x", { truncated: "no" }),
       foundWire("x", { settled: undefined }),
       foundWire("x", { recording_error: 3 }),
@@ -129,6 +133,7 @@ describe("transcriptNotices", () => {
     rotated: false,
     clipped: false,
     gapMarkers: 0,
+    unrecordedBytes: 0,
     redacted: false,
     live: false,
     settled: true,
@@ -148,12 +153,13 @@ describe("transcriptNotices", () => {
       rotated: true,
       clipped: true,
       gapMarkers: 2,
+      unrecordedBytes: 58_500,
       redacted: true,
       live: true,
       settled: false,
       recordingError: "disk full.",
     });
-    expect(notices).toHaveLength(7);
+    expect(notices).toHaveLength(8);
     expect(notices.join("\n")).toContain("newest 1,000 bytes");
     expect(notices.join("\n")).not.toContain("5,000");
     expect(notices.join("\n")).toContain("rotated away");
@@ -162,6 +168,13 @@ describe("transcriptNotices", () => {
     expect(notices.join("\n")).toContain("still running");
     expect(notices.join("\n")).toContain("end may be missing");
     expect(notices.join("\n")).toContain("masked");
+    expect(notices.join("\n")).toContain("58,500 more bytes were dropped");
+  });
+
+  it("names the bytes dropped but not yet marked, in the singular too", () => {
+    expect(transcriptNotices({ ...base, unrecordedBytes: 1 })).toEqual([
+      "1 more byte was dropped because the host could not save output fast enough, and the text does not mark where.",
+    ]);
   });
 
   it("tells a rotated-away start from a clipped read", () => {
