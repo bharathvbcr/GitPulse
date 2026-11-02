@@ -41,6 +41,7 @@ fn bell(session: &str, detail: Option<&str>) -> Notice {
         channel: "bell",
         subject: None,
         subagent: false,
+        agent_id: None,
     }
 }
 

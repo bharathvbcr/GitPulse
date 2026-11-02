@@ -2409,6 +2409,13 @@ fn notify_payload(event: &crate::alerts::bridge::Event, input: &HookInput) -> St
     }
     if !input.agent_id.is_empty() {
         report.insert("subagent".into(), json!(true));
+        // Which subagent, when the host's id is one the bridge will take. The
+        // boolean above stays so a bridge that predates the id still hears
+        // that this is a subagent; an id that would not pass is left off
+        // rather than sent for the whole report to be refused over.
+        if crate::alerts::bridge::valid_key(&input.agent_id) {
+            report.insert("agent_id".into(), json!(input.agent_id));
+        }
     }
     // What is left once the fixed fields are in: the place and the message
     // share it, the place first because it names the session and the message
@@ -5293,6 +5300,9 @@ done
             entrypoint: "cli".into(),
             status: "busy".into(),
             cwd: "/repo".into(),
+            tree: None,
+            run_id: None,
+            parent_pid: None,
         };
         let kind = |kind: &str, ok, sessions| LiveKindStatus {
             kind: kind.into(),
@@ -5313,6 +5323,8 @@ done
             worktrees: vec![LiveWorktree {
                 path: "/repo".into(),
                 sessions: vec![session(11), session(12)],
+                children: Vec::new(),
+                children_truncated: false,
             }],
         };
         snapshot.collisions.shared_worktrees = vec![SharedWorktree {
@@ -6398,7 +6410,21 @@ done
 
         let mut inside = tool_event("PostToolUse", json!({"command":"ls"}));
         inside.agent_id = "agent-7".into();
-        assert!(report("tool_finished", &inside).subagent);
+        let from_inside = report("tool_finished", &inside);
+        assert!(from_inside.subagent);
+        // The id is the one signal that says which subagent: it crosses the
+        // hook, the socket and the parse with the boolean beside it.
+        assert_eq!(from_inside.agent_id.as_deref(), Some("agent-7"));
+        assert_eq!(asked.agent_id, None);
+
+        // An id the bridge would refuse is left off, not sent to cost the
+        // report; the boolean still says it came from a subagent.
+        for unsendable in ["has space".to_string(), "x".repeat(97)] {
+            inside.agent_id.clone_from(&unsendable);
+            let degraded = report("tool_finished", &inside);
+            assert!(degraded.subagent, "{unsendable:?}");
+            assert_eq!(degraded.agent_id, None, "{unsendable:?}");
+        }
     }
 
     #[test]

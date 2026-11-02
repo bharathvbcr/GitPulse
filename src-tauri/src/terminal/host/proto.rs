@@ -184,6 +184,11 @@ pub struct WireNotice {
     pub channel: String,
     pub subject: Option<String>,
     pub subagent: bool,
+    /// Which subagent, when one was named. Left off the wire when absent, so a
+    /// peer that predates it (and refuses unknown fields) reads every notice
+    /// that does not carry one exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 /// The channels a terminal's own output can raise a notice on: the scanner's,
@@ -202,6 +207,7 @@ impl WireNotice {
             channel: notice.channel.to_owned(),
             subject: notice.subject.clone(),
             subagent: notice.subagent,
+            agent_id: notice.agent_id.clone(),
         }
     }
 
@@ -225,6 +231,13 @@ impl WireNotice {
                     self.channel
                 )
             })?;
+        if self
+            .agent_id
+            .as_deref()
+            .is_some_and(|id| !crate::alerts::bridge::valid_key(id))
+        {
+            return Err("the terminal host named a malformed agent id".to_owned());
+        }
         Ok(crate::alerts::Notice {
             key: self.key,
             origin: crate::alerts::Origin::Terminal,
@@ -236,6 +249,7 @@ impl WireNotice {
             channel,
             subject: self.subject,
             subagent: self.subagent,
+            agent_id: self.agent_id,
         })
     }
 }
@@ -464,6 +478,7 @@ mod tests {
             channel: "exit",
             subject: None,
             subagent: false,
+            agent_id: None,
         };
         let wire = WireNotice::from_notice(&notice);
         assert_eq!(wire.clone().into_notice().unwrap(), notice);
@@ -473,5 +488,42 @@ mod tests {
         let mut unknown = wire;
         unknown.event = Some("not_an_event".into());
         assert!(unknown.into_notice().is_err());
+    }
+
+    /// The subagent's id survives the hop, stays off the wire when there is
+    /// none (a peer that refuses unknown fields reads such a notice as it
+    /// always did), and a malformed one is refused rather than carried on.
+    #[test]
+    fn a_subagent_id_crosses_the_socket_and_an_absent_one_leaves_no_trace() {
+        let notice = crate::alerts::Notice {
+            key: "term-1-a".into(),
+            origin: crate::alerts::Origin::Terminal,
+            label: "Claude Code".into(),
+            place: None,
+            event: Some("session_ended"),
+            detail: None,
+            is_agent: true,
+            channel: "exit",
+            subject: None,
+            subagent: true,
+            agent_id: Some("a1b2c3d4e5f6".into()),
+        };
+        let wire = WireNotice::from_notice(&notice);
+        let text = serde_json::to_string(&wire).unwrap();
+        let back: WireNotice = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.into_notice().unwrap(), notice);
+
+        let mut bare = wire.clone();
+        bare.agent_id = None;
+        let json = serde_json::to_value(&bare).unwrap();
+        assert!(json.get("agent_id").is_none(), "{json}");
+        let older: WireNotice = serde_json::from_value(json).unwrap();
+        assert_eq!(older.agent_id, None);
+
+        for bad in ["", "has space", "../x", &"x".repeat(97)] {
+            let mut malformed = wire.clone();
+            malformed.agent_id = Some(bad.into());
+            assert!(malformed.into_notice().is_err(), "{bad:?}");
+        }
     }
 }

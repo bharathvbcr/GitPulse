@@ -985,6 +985,7 @@ impl SessionWatcher {
                 channel: signal.channel.label(),
                 subject: None,
                 subagent: false,
+                agent_id: None,
             });
         }
         let dropped = self.scanner.dropped();
@@ -1010,6 +1011,7 @@ impl SessionWatcher {
             channel: "exit",
             subject: None,
             subagent: false,
+            agent_id: None,
         });
     }
 }
