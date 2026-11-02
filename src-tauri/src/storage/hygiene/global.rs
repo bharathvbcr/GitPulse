@@ -94,8 +94,7 @@ pub struct CleanerInventory {
     pub issues: Vec<String>,
     /// Repositories whose inventory could not be enumerated at all, so no
     /// candidate from them can be trusted: the scan returned an error
-    /// (including `REPOSITORY_TRUST_REQUIRED`), the filesystem refused a
-    /// location outright (`permission_denied`), git declined to answer whether
+    /// (including `REPOSITORY_TRUST_REQUIRED`), git declined to answer whether
     /// their directories are ignored or tracked, or the workspace candidate cap
     /// cut their artifact list off mid-enumeration. Their artifacts are never
     /// removed.
@@ -536,27 +535,6 @@ impl Cleaner {
                     }
                     if report.scan.truncated || report.scan.permission_denied > 0 {
                         result.partial = true;
-                        // A location the filesystem REFUSED is a different kind
-                        // of fact from a budget cap, and only the first still
-                        // condemns the whole repository. `truncated` is routine
-                        // and local to nothing -- more linked worktrees than the
-                        // sizing cap, more artifact directories than the
-                        // reporting cap. `permission_denied` is anomalous: part
-                        // of this repository could not be read at all, and what
-                        // is in there is unknown, so its trees are left alone
-                        // even where their own enumeration finished.
-                        //
-                        // Dropping both conditions reversed a deliberate,
-                        // tested invariant --
-                        // an_unreadable_repository_does_not_stop_cleanup_of_a_readable_one
-                        // gated two repositories instead of one -- and the
-                        // conservative half of it was never the half that
-                        // blocked the large trees. Measured: GitPulse and
-                        // DevCouncil both report permission_denied == 0, so
-                        // keeping this costs nothing that motivated the change.
-                        if report.scan.permission_denied > 0 {
-                            result.incomplete_repos.insert(repo_path.to_string());
-                        }
                         if result.issues.len() < 128 {
                             result
                                 .issues
