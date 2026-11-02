@@ -702,12 +702,14 @@ impl HostClient {
         session: &str,
         max_bytes: usize,
         redact: bool,
+        run_id: Option<&str>,
     ) -> Result<crate::terminal::TranscriptRead, String> {
         self.call(
             Request::Transcript {
                 session: session.to_owned(),
                 max_bytes,
                 redact,
+                run_id: run_id.map(str::to_owned),
             },
             CALL_DEADLINE,
         )

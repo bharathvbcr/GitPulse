@@ -33,6 +33,15 @@
 //! app has recorded the exit, which is long before anyone reopens the run's
 //! output. Eviction and age are what end a finished session's transcript.
 //!
+//! **A transcript is a run's, not only an id's.** Terminal ids are
+//! `term-<pid>-<count>` and repeat across reboots. A session spawned for a run
+//! writes the run id to `<id>.log.meta`; a new session under an id deletes the old
+//! files only if they were recorded for the same run or for none, and otherwise
+//! keeps them as `<id>.<tag of the run>.*` (one per run, counted toward the
+//! directory limits under that name). A read that names a run is answered from
+//! that run's files or as [`TranscriptRead::Reused`], never from another
+//! session's.
+//!
 //! **How it ended is on disk too.** What a host knows only in memory is gone
 //! when it is, and a log that simply stops reads like a log that is complete.
 //! So closing a session appends [`ENDED`] to its newest segment, and a write
@@ -64,6 +73,10 @@ const UNCLOSED: &str =
     "the host that wrote this did not close it, so the end of the output may be missing";
 /// Most bytes of a failure note, written or read.
 const NOTE_MAX: usize = 2048;
+/// Most bytes of a run id the host keeps beside a transcript, and compares. An
+/// id is clipped the same way wherever it is read, so a longer one still names
+/// one run.
+const RUN_ID_MAX: usize = 256;
 /// How much older output a masking read looks at beyond the bytes it returns,
 /// so a name or a key's first line just before the window still marks what
 /// follows as secret.
@@ -117,8 +130,10 @@ pub(super) enum ArmError {
 }
 
 enum Op {
-    /// A new session: any transcript left under its id is replaced.
-    Open(String),
+    /// A new session, with the run it was spawned for. A transcript left under
+    /// its id is replaced, unless it was another run's: that one is kept
+    /// under a name of its own.
+    Open(String, Option<String>),
     Data(String, Vec<u8>),
     Gap(String, u64),
     /// The session ended: sync and release its file.
@@ -130,7 +145,7 @@ enum Op {
 impl Op {
     fn session(&self) -> &str {
         match self {
-            Op::Open(session)
+            Op::Open(session, _)
             | Op::Data(session, _)
             | Op::Gap(session, _)
             | Op::Close(session)
@@ -288,8 +303,13 @@ impl Transcripts {
         })
     }
 
-    /// Starts recording `session`. The tap goes to the session's ring.
-    pub(super) fn arm(&self, session: &str) -> Result<Arc<dyn Tap>, ArmError> {
+    /// Starts recording `session`, spawned for `run_id` when it has one. The
+    /// tap goes to the session's ring.
+    pub(super) fn arm(
+        &self,
+        session: &str,
+        run_id: Option<&str>,
+    ) -> Result<Arc<dyn Tap>, ArmError> {
         let mut queue = lock(&self.inner.queue);
         if queue.shutdown {
             return Err(ArmError::Closed);
@@ -298,7 +318,13 @@ impl Transcripts {
             return Err(ArmError::Duplicate);
         }
         queue.gaps.remove(session);
-        queue.push(Op::Open(session.to_owned()), 0);
+        queue.push(
+            Op::Open(
+                session.to_owned(),
+                run_id.map(|id| clip_run_id(id).to_owned()),
+            ),
+            0,
+        );
         drop(queue);
         self.inner.work.notify_one();
         Ok(Arc::new(SessionTap {
@@ -323,9 +349,17 @@ impl Transcripts {
         self.inner.settle(within)
     }
 
-    /// The newest `max_bytes` of `session`'s output.
-    pub(super) fn read(&self, session: &str, max_bytes: usize, redact: bool) -> TranscriptRead {
-        self.inner.read(session, max_bytes, redact)
+    /// The newest `max_bytes` of `session`'s output. With `run_id`, only that
+    /// run's: an id a later session reused answers [`TranscriptRead::Reused`]
+    /// (or the run's own kept transcript, when it was kept).
+    pub(super) fn read(
+        &self,
+        session: &str,
+        max_bytes: usize,
+        redact: bool,
+        run_id: Option<&str>,
+    ) -> TranscriptRead {
+        self.inner.read(session, max_bytes, redact, run_id)
     }
 
     /// Writes out what is queued and stops the writer.
@@ -365,6 +399,21 @@ impl Inner {
     /// Why this session's recording stopped, when it did.
     fn note(&self, session: &str) -> PathBuf {
         self.dir.join(format!("{session}.log.err"))
+    }
+
+    /// The run this session was spawned for, when it was spawned for one.
+    fn meta(&self, session: &str) -> PathBuf {
+        self.dir.join(format!("{session}.log.meta"))
+    }
+
+    /// Every file a session (or a kept earlier run's stem) can have.
+    fn files_of(&self, stem: &str) -> [PathBuf; 4] {
+        [
+            self.path(stem),
+            self.previous(stem),
+            self.note(stem),
+            self.meta(stem),
+        ]
     }
 
     // -- the reader's side: never waits on the disk -------------------------
@@ -482,11 +531,23 @@ impl Inner {
             }
         }
         match op {
-            Op::Open(session) => {
+            Op::Open(session, run_id) => {
                 lock(&self.failures).remove(&session);
-                self.remove_files(&session);
+                let kept = self.retire_previous(&session, run_id.as_deref());
                 let log = self.create(&session);
+                let made = log.is_ok();
                 self.install(&session, log);
+                if let (true, Some(run_id)) = (made, &run_id) {
+                    // Without it a read cannot tell this run's output from a
+                    // later session's under the same id, so the recording
+                    // is marked failed rather than left to look identified.
+                    if let Err(error) = self.write_meta(&session, run_id) {
+                        self.fail(&session, error);
+                    }
+                }
+                if kept {
+                    self.enforce();
+                }
             }
             Op::Data(session, bytes) => self.append(&session, &bytes),
             Op::Gap(session, dropped) => {
@@ -590,7 +651,17 @@ impl Inner {
 
     /// Records why `session` stopped being recorded, beside its log.
     fn write_note(&self, session: &str, reason: &str) -> Result<(), String> {
-        let path = self.note(session);
+        Self::write_small(&self.note(session), reason, NOTE_MAX)
+    }
+
+    /// Records which run `session` was spawned for, beside its log.
+    fn write_meta(&self, session: &str, run_id: &str) -> Result<(), String> {
+        Self::write_small(&self.meta(session), run_id, RUN_ID_MAX)
+    }
+
+    /// Replaces the small file at `path` with the first `max` bytes of `text`
+    /// (cut on a character boundary): `0600`, never through a link, and ours.
+    fn write_small(path: &Path, text: &str, max: usize) -> Result<(), String> {
         let mut options = OpenOptions::new();
         options
             .write(true)
@@ -599,7 +670,7 @@ impl Inner {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         let mut file = options
-            .open(&path)
+            .open(path)
             .map_err(|e| format!("{}: {e}", path.display()))?;
         let meta = file
             .metadata()
@@ -608,13 +679,37 @@ impl Inner {
         if !meta.is_file() || meta.uid() != unsafe { libc::getuid() } {
             return Err(format!("{} is not a file this host owns", path.display()));
         }
-        let mut end = reason.len().min(NOTE_MAX);
-        while !reason.is_char_boundary(end) {
+        let mut end = text.len().min(max);
+        while !text.is_char_boundary(end) {
             end -= 1;
         }
-        file.write_all(&reason.as_bytes()[..end])
+        file.write_all(&text.as_bytes()[..end])
             .and_then(|()| file.sync_data())
             .map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// The text of the small file at `path`, at most `max` bytes: `None` when
+    /// there is no such file, and an error saying why when there is one that
+    /// cannot be read (a link, a file of another user, a failed read).
+    fn read_small(path: &Path, max: usize) -> Result<Option<String>, String> {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let file = match options.open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        let meta = file.metadata().map_err(|e| e.to_string())?;
+        // SAFETY: `getuid` reads this process's real user id and cannot fail.
+        if !meta.is_file() || meta.uid() != unsafe { libc::getuid() } {
+            return Err("it is not a file this host wrote".to_owned());
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(&file, max as u64), &mut bytes)
+            .map_err(|e| e.to_string())?;
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
     }
 
     /// The reason an earlier host left for `session`'s recording stopping, if
@@ -622,31 +717,74 @@ impl Inner {
     /// not as no note.
     fn read_note(&self, session: &str) -> Option<String> {
         let path = self.note(session);
-        let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        let file = match options.open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(error) => return Some(unreadable_note(&path, &error.to_string())),
-        };
-        let meta = match file.metadata() {
-            Ok(meta) => meta,
-            Err(error) => return Some(unreadable_note(&path, &error.to_string())),
-        };
-        // SAFETY: `getuid` reads this process's real user id and cannot fail.
-        if !meta.is_file() || meta.uid() != unsafe { libc::getuid() } {
-            return Some(unreadable_note(&path, "it is not a file this host wrote"));
+        match Self::read_small(&path, NOTE_MAX) {
+            Ok(note) => note,
+            Err(why) => Some(unreadable_note(&path, &why)),
         }
-        let mut bytes = Vec::new();
-        match std::io::Read::read_to_end(
-            &mut std::io::Read::take(&file, NOTE_MAX as u64),
-            &mut bytes,
-        ) {
-            Ok(_) => Some(String::from_utf8_lossy(&bytes).into_owned()),
-            Err(error) => Some(unreadable_note(&path, &error.to_string())),
+    }
+
+    /// The run `stem`'s transcript was recorded for: `None` when it was not
+    /// spawned for one, an error when the record is there and unreadable.
+    fn read_meta(&self, stem: &str) -> Result<Option<String>, String> {
+        let path = self.meta(stem);
+        Self::read_small(&path, RUN_ID_MAX).map_err(|why| format!("{}: {why}", path.display()))
+    }
+
+    /// Whether any segment of `stem` is on disk.
+    fn holds(&self, stem: &str) -> bool {
+        [self.path(stem), self.previous(stem)]
+            .iter()
+            .any(|path| std::fs::symlink_metadata(path).is_ok())
+    }
+
+    /// Clears the way for a new session under `session`. What an earlier
+    /// session left there is deleted, unless it was recorded for a different
+    /// run than the new one: terminal ids are `term-<pid>-<count>`, so after a
+    /// reboot a new session can carry an id an earlier run's output is filed
+    /// under, and that output is still the earlier run's to read. It is kept
+    /// under a name of its own (at most one per run), subject to the directory's
+    /// limits like any other. Returns whether something was kept.
+    fn retire_previous(&self, session: &str, run_id: Option<&str>) -> bool {
+        let any = self
+            .files_of(session)
+            .iter()
+            .any(|path| std::fs::symlink_metadata(path).is_ok());
+        if !any {
+            return false;
         }
+        match self.read_meta(session) {
+            Ok(Some(earlier)) if Some(earlier.as_str()) != run_id => {
+                match self.keep_under_own_name(session, &earlier) {
+                    Ok(()) => return true,
+                    Err(error) => {
+                        log::warn!(target: "terminal_host", "an earlier run's transcript could not be kept, so a new session replaces it: {error}")
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                log::warn!(target: "terminal_host", "an earlier transcript's run could not be read, so a new session replaces it: {error}")
+            }
+        }
+        self.remove_files(session);
+        false
+    }
+
+    /// Moves every file of `session` to the stem kept for `run_id`, replacing
+    /// what was kept for that run before.
+    fn keep_under_own_name(&self, session: &str, run_id: &str) -> Result<(), String> {
+        let stem = kept_stem(session, run_id);
+        self.remove_files(&stem);
+        for (from, to) in self.files_of(session).into_iter().zip(self.files_of(&stem)) {
+            match std::fs::rename(&from, &to) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!("{} to {}: {error}", from.display(), to.display()))
+                }
+            }
+        }
+        Ok(())
     }
 
     fn create(&self, session: &str) -> Result<Log, String> {
@@ -661,11 +799,7 @@ impl Inner {
     }
 
     fn remove_files(&self, session: &str) {
-        for path in [
-            self.path(session),
-            self.previous(session),
-            self.note(session),
-        ] {
+        for path in self.files_of(session) {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -789,13 +923,16 @@ impl Inner {
                 (session, true)
             } else if let Some(session) = name
                 .strip_suffix(".log.err")
+                .or_else(|| name.strip_suffix(".log.meta"))
                 .or_else(|| name.strip_suffix(".log"))
             {
                 (session, false)
             } else {
                 continue;
             };
-            if !crate::terminal::is_session_id(session) {
+            // A session's own id, or the stem of an earlier run's transcript
+            // kept after a later session took the id.
+            if !is_stem(session) {
                 continue;
             }
             // `DirEntry::metadata` does not follow a link.
@@ -881,13 +1018,85 @@ impl Inner {
 
     // -- reading -------------------------------------------------------------
 
-    fn read(&self, session: &str, max_bytes: usize, redact: bool) -> TranscriptRead {
+    /// Which transcript answers a read of `session`, and the run it was
+    /// recorded for. Without `expected` it is whatever the id holds. With one it
+    /// is that run's: the id's own transcript when it was recorded for it, else
+    /// the copy kept when a later session took the id. Anything else under the
+    /// id is not this run's, and is answered as such (or, when what is there
+    /// cannot be told apart from a transcript still being opened, as unreadable)
+    /// instead of being shown as the run's output.
+    fn choose(
+        &self,
+        session: &str,
+        expected: Option<&str>,
+        settled: bool,
+    ) -> Result<(String, Option<String>), TranscriptRead> {
+        let unreadable = |reason: String| TranscriptRead::Unreadable {
+            reason: format!("which run this transcript belongs to could not be read: {reason}"),
+        };
+        let current = self.read_meta(session).map_err(unreadable)?;
+        let Some(want) = expected.map(clip_run_id) else {
+            return Ok((session.to_owned(), current));
+        };
+        if current.as_deref() == Some(want) {
+            return Ok((session.to_owned(), current));
+        }
+        let kept = kept_stem(session, want);
+        if self.read_meta(&kept).map_err(unreadable)?.as_deref() == Some(want) {
+            return Ok((kept, Some(want.to_owned())));
+        }
+        if !self.holds(session) {
+            // Nothing under the id at all: the ordinary missing / could-not-be
+            // -recorded answer, not a claim about another session.
+            return Ok((session.to_owned(), current));
+        }
+        if current.is_none() {
+            // A transcript with no run on record is a session spawned without
+            // one, or one whose opening was not finished or whose record was not
+            // written; only the first is another session's.
+            let failure = lock(&self.failures)
+                .get(session)
+                .cloned()
+                .or_else(|| self.read_note(session));
+            if let Some(error) = failure {
+                return Err(TranscriptRead::Unreadable {
+                    reason: format!(
+                        "whether this transcript is this run's could not be confirmed: {error}"
+                    ),
+                });
+            }
+            if !settled {
+                return Err(TranscriptRead::Unreadable {
+                    reason: "the host had not finished opening this session's transcript, so whether it is this run's could not be confirmed".to_owned(),
+                });
+            }
+        }
+        Err(TranscriptRead::Reused {
+            reason: match current {
+                Some(_) => "a later session reused this terminal id, so the output saved under it is not this run's".to_owned(),
+                None => "the output saved under this terminal id was recorded for a session that was not this run, so it is not shown as this run's".to_owned(),
+            },
+        })
+    }
+
+    fn read(
+        &self,
+        session: &str,
+        max_bytes: usize,
+        redact: bool,
+        expected: Option<&str>,
+    ) -> TranscriptRead {
         if !crate::terminal::is_session_id(session) {
             return TranscriptRead::Unreadable {
                 reason: format!("{session:?} is not a session id"),
             };
         }
         let settled = self.settle(SETTLE_DEADLINE);
+        let (stem, run_id) = match self.choose(session, expected, settled) {
+            Ok(chosen) => chosen,
+            Err(answer) => return answer,
+        };
+        let session = stem.as_str();
         // One look at the queue for both facts, taken before the files are
         // read: a count and a liveness from two moments could disagree. Bytes
         // counted here that a gap marker reaches the file for before the read
@@ -927,6 +1136,25 @@ impl Inner {
             }
             Err(reason) => return TranscriptRead::Unreadable { reason },
         };
+        // A new session under the id may have taken it between the check above
+        // and the read: the bytes are the run's only if the record still says so.
+        if let Some(want) = expected.map(clip_run_id) {
+            match self.read_meta(session) {
+                Ok(now) if now.as_deref() == Some(want) => {}
+                Ok(_) => {
+                    return TranscriptRead::Reused {
+                        reason: "a later session took this terminal id while its output was being read, so what was read is not shown as this run's".to_owned(),
+                    }
+                }
+                Err(reason) => {
+                    return TranscriptRead::Unreadable {
+                        reason: format!(
+                            "which run this transcript belongs to could not be read: {reason}"
+                        ),
+                    }
+                }
+            }
+        }
         let mut clipped = raw.clipped;
         let bytes = if redact {
             let (bytes, cut) = redacted(&raw.bytes, max);
@@ -954,6 +1182,7 @@ impl Inner {
             live,
             settled,
             recording_error,
+            run_id,
         })
     }
 
@@ -1147,6 +1376,48 @@ impl Held {
                     log::warn!(target: "terminal_host", "could not remove {}: {error}", path.display());
                 }
             }
+        }
+    }
+}
+
+/// `run_id` cut to [`RUN_ID_MAX`] bytes on a character boundary.
+fn clip_run_id(run_id: &str) -> &str {
+    let mut end = run_id.len().min(RUN_ID_MAX);
+    while !run_id.is_char_boundary(end) {
+        end -= 1;
+    }
+    &run_id[..end]
+}
+
+/// A fixed-width name for a run id (FNV-1a), to file its kept transcript under.
+/// It only names a file: a read trusts the run id recorded inside, so two ids
+/// that shared a name could cost a kept transcript but never be confused.
+fn run_tag(run_id: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in run_id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// The stem an earlier run's transcript is kept under after a later session
+/// took `session`'s id: `<session>.<tag of the run>`.
+fn kept_stem(session: &str, run_id: &str) -> String {
+    format!("{session}.{}", run_tag(clip_run_id(run_id)))
+}
+
+/// Whether `stem` names a session's files: a session id, or a kept earlier
+/// run's stem ([`kept_stem`]).
+fn is_stem(stem: &str) -> bool {
+    match stem.split_once('.') {
+        None => crate::terminal::is_session_id(stem),
+        Some((session, tag)) => {
+            crate::terminal::is_session_id(session)
+                && tag.len() == 16
+                && tag
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         }
     }
 }

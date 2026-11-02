@@ -27,6 +27,7 @@ function foundWire(text: string, over: Record<string, unknown> = {}): Record<str
     live: false,
     settled: true,
     recording_error: null,
+    run_id: null,
     ...over,
   };
 }
@@ -45,9 +46,13 @@ describe("parseSavedTranscript", () => {
     expect(parsed.recordingError).toBeNull();
   });
 
-  it("keeps the four states the host can answer apart", () => {
+  it("keeps the states the host can answer apart", () => {
     expect(parseSavedTranscript({ state: "missing" })).toEqual({ kind: "missing" });
     expect(parseSavedTranscript({ state: "unreadable", reason: "denied" })).toEqual({ kind: "unreadable", reason: "denied" });
+    expect(parseSavedTranscript({ state: "reused", reason: "a later session reused this terminal id" })).toEqual({
+      kind: "reused",
+      reason: "a later session reused this terminal id",
+    });
     expect(parseSavedTranscript({ state: "unavailable", reason: "in-process" })).toEqual({
       kind: "unavailable",
       reason: "in-process",
@@ -63,6 +68,10 @@ describe("parseSavedTranscript", () => {
       { state: "perhaps" },
       { state: "unreadable" },
       { state: "unreadable", reason: "" },
+      { state: "reused" },
+      { state: "reused", reason: "" },
+      foundWire("x", { run_id: 5 }),
+      foundWire("x", { run_id: undefined }),
       foundWire("x", { data_b64: 5 }),
       foundWire("x", { bytes: -1 }),
       foundWire("x", { gap_markers: 1.5 }),
@@ -84,7 +93,7 @@ describe("parseSavedTranscript", () => {
 
 describe("readSavedTranscript", () => {
   it("asks for the session's transcript with its bounds and parses the answer", async () => {
-    const asked: Array<{ sessionId: string; maxBytes: number; redact: boolean }> = [];
+    const asked: Array<{ sessionId: string; maxBytes: number; redact: boolean; runId: string | null }> = [];
     const read = await readSavedTranscript(
       "term-1-a",
       { maxBytes: 4096, redact: true },
@@ -99,7 +108,23 @@ describe("readSavedTranscript", () => {
       deadlineMs: 1000,
     };
     expect(await readSavedTranscript("term-1-a", { maxBytes: 4096, redact: true }, spy)).toEqual({ kind: "missing" });
-    expect(asked).toEqual([{ sessionId: "term-1-a", maxBytes: 4096, redact: true }]);
+    expect(asked).toEqual([{ sessionId: "term-1-a", maxBytes: 4096, redact: true, runId: null }]);
+  });
+
+  it("names the run it is asking about, and reads a reused id as reused, not as that run's output", async () => {
+    const asked: Array<{ runId: string | null }> = [];
+    const spy: TranscriptDeps = {
+      read: async (args) => {
+        asked.push(args);
+        return { state: "reused", reason: "a later session reused this terminal id" };
+      },
+      deadlineMs: 1000,
+    };
+    const read = await readSavedTranscript("term-1-a", { runId: "run-7" }, spy);
+    expect(asked).toEqual([{ sessionId: "term-1-a", maxBytes: 128 * 1024, redact: false, runId: "run-7" }]);
+    expect(read).toEqual({ kind: "reused", reason: "a later session reused this terminal id" });
+    const found = parseSavedTranscript(foundWire("mine\r\n", { run_id: "run-7" }));
+    expect(found.kind === "found" && found.runId).toBe("run-7");
   });
 
   it("reports a rejected call as failed with its reason, not as missing", async () => {
@@ -138,6 +163,7 @@ describe("transcriptNotices", () => {
     live: false,
     settled: true,
     recordingError: null,
+    runId: null,
   };
 
   it("says nothing about a complete, finished transcript", () => {

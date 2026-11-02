@@ -8,13 +8,17 @@
  * host restart. This module is the renderer's whole contract with that read:
  * ask, validate what came back, and decide what the viewer must be told.
  *
- * Five outcomes, kept apart by type so a caller cannot show one as another:
+ * Six outcomes, kept apart by type so a caller cannot show one as another:
  *
  * - `found`: output, with the facts that qualify it (clipped, gaps, masked,
  *   still running, not fully written yet, recording stopped).
  * - `missing`: the host has no transcript for the session. Never recorded,
  *   evicted for space, or aged out.
  * - `unreadable`: one exists or should, and the host could not read it.
+ * - `reused`: the read named a run, and what is saved under the terminal id is
+ *   not that run's (terminal ids repeat across reboots, so a later session can
+ *   hold the id an earlier run used). Another session's output is never shown
+ *   as the run's.
  * - `unavailable`: this app runs terminals itself, so nothing is recorded.
  * - `failed`: the question was not answered (the call failed, timed out, or the
  *   answer was malformed). Not "missing": the output may well be there.
@@ -61,12 +65,15 @@ export interface FoundTranscript {
    * it ended without closing it, so its end is unknown.
    */
   readonly recordingError: string | null;
+  /** The run the session was spawned for, as the host recorded it; null when it was spawned for none. */
+  readonly runId: string | null;
 }
 
 export type SavedTranscript =
   | FoundTranscript
   | { readonly kind: "missing" }
   | { readonly kind: "unreadable"; readonly reason: string }
+  | { readonly kind: "reused"; readonly reason: string }
   | { readonly kind: "unavailable"; readonly reason: string }
   | { readonly kind: "failed"; readonly reason: string };
 
@@ -75,11 +82,17 @@ export interface TranscriptReadOptions {
   readonly maxBytes?: number;
   /** Have the host mask secrets before the bytes leave it. */
   readonly redact?: boolean;
+  /**
+   * The run the caller is asking about. Pass it whenever the caller has one:
+   * without it the host answers with whatever the terminal id holds now, which
+   * after an id was reused is another session's output.
+   */
+  readonly runId?: string;
 }
 
 export interface TranscriptDeps {
   /** `cmd_terminal_transcript`. */
-  readonly read: (args: { sessionId: string; maxBytes: number; redact: boolean }) => Promise<unknown>;
+  readonly read: (args: { sessionId: string; maxBytes: number; redact: boolean; runId: string | null }) => Promise<unknown>;
   readonly deadlineMs: number;
 }
 
@@ -100,6 +113,7 @@ export async function readSavedTranscript(
         sessionId,
         maxBytes: options.maxBytes ?? TRANSCRIPT_TAIL_BYTES,
         redact: options.redact ?? false,
+        runId: options.runId ?? null,
       }),
       deps.deadlineMs,
       "Reading saved terminal output",
@@ -126,6 +140,7 @@ export function parseSavedTranscript(raw: unknown): SavedTranscript {
     case "missing":
       return { kind: "missing" };
     case "unreadable":
+    case "reused":
     case "unavailable": {
       if (typeof record.reason !== "string" || record.reason.length === 0) {
         return failed(`The terminal host said ${record.state} without saying why.`);
@@ -155,6 +170,10 @@ function parseFound(record: Record<string, unknown>): SavedTranscript {
   if (recordingError !== null && recordingError !== undefined && typeof recordingError !== "string") {
     return failed("The terminal host's transcript was malformed.");
   }
+  const runId = record.run_id;
+  if (runId !== null && typeof runId !== "string") {
+    return failed("The terminal host's transcript was malformed.");
+  }
   const decoded = decodeBase64Utf8(record.data_b64);
   if (decoded === null) return failed("The terminal host's transcript was not valid base64.");
   if (decoded.byteLength !== bytes) {
@@ -176,6 +195,7 @@ function parseFound(record: Record<string, unknown>): SavedTranscript {
     live: record.live as boolean,
     settled: record.settled as boolean,
     recordingError: typeof recordingError === "string" ? recordingError : null,
+    runId,
   };
 }
 

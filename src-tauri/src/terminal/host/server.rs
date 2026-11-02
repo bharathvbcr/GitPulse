@@ -247,7 +247,7 @@ impl Host {
                 // Armed before the fork, so the ring of a program that prints
                 // and exits at once is already copying its first byte.
                 if let Ok(transcripts) = &self.transcripts {
-                    match transcripts.arm(&session) {
+                    match transcripts.arm(&session, request.run_id.as_deref()) {
                         Ok(tap) => self.engine.ring_taps.arm(&session, tap),
                         // Another request is starting this very id; the engine
                         // refuses the second, and must not touch the first's.
@@ -320,8 +320,9 @@ impl Host {
                 session,
                 max_bytes,
                 redact,
+                run_id,
             } => json(match &self.transcripts {
-                Ok(transcripts) => transcripts.read(&session, max_bytes, redact),
+                Ok(transcripts) => transcripts.read(&session, max_bytes, redact, run_id.as_deref()),
                 Err(why) => TranscriptRead::Unreadable {
                     reason: format!("this host could not open its transcript store: {why}"),
                 },

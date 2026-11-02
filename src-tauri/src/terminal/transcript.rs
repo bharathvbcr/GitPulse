@@ -5,9 +5,11 @@
 //! outside `host` because the answer reaches the renderer through a command
 //! that exists on every platform, while only a unix host can keep a transcript.
 //!
-//! Four answers, and none of them stands in for another: a transcript that was
-//! never kept (`missing`) is not one that could not be read (`unreadable`), and
-//! neither is the app saying it has no host to ask (`unavailable`).
+//! Five answers, and none of them stands in for another: a transcript that was
+//! never kept (`missing`) is not one that could not be read (`unreadable`), is
+//! not one that belongs to a different session than the run asked about
+//! (`reused`), and neither is the app saying it has no host to ask
+//! (`unavailable`).
 
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +27,12 @@ pub enum TranscriptRead {
     Missing,
     /// One exists, or should, and could not be read; `reason` says why.
     Unreadable { reason: String },
+    /// The read named a run, and what the host saved under this terminal id is
+    /// not that run's: a later session reused the id (terminal ids are
+    /// `term-<pid>-<count>`, so they repeat across reboots), or the transcript
+    /// there was recorded for no run. The run's own output was not kept.
+    /// Never shown as the run's output.
+    Reused { reason: String },
     /// This app has no terminal host to ask, so nothing is recorded anywhere
     /// it could look. Never sent by a host.
     Unavailable { reason: String },
@@ -73,4 +81,8 @@ pub struct TranscriptTail {
     /// `None` only for a session still being recorded without error, or one
     /// whose end was written down.
     pub recording_error: Option<String>,
+    /// The run the session was spawned for, as the host recorded it; `None`
+    /// when it was spawned for none. A read that named a run only ever returns
+    /// that run's.
+    pub run_id: Option<String>,
 }

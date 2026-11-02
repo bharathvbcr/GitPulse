@@ -20,7 +20,9 @@ use std::io::{self, Read, Write};
 /// What this build speaks. Bumped whenever a frame changes shape or meaning.
 /// 3 added `Request::Transcript`: a host of protocol 2 ends the connection of
 /// an app that sends a request it cannot decode, and the socket name carries
-/// the protocol, so the two never meet.
+/// the protocol, so the two never meet. The request's optional `run_id` and the
+/// transcript answer's `unrecorded_bytes`, `run_id` and `reused` state were
+/// added before protocol 3 was released, so they did not bump it.
 pub const PROTOCOL: u32 = 3;
 
 /// Longest JSON header accepted. A spawn request (argv and environment are
@@ -115,12 +117,17 @@ pub enum Request {
     },
     /// The newest `max_bytes` of the session's saved output, read-only: live
     /// or finished, it never attaches. Answered with `terminal::TranscriptRead`.
-    /// `redact` masks secrets in the host before the bytes leave it.
+    /// `redact` masks secrets in the host before the bytes leave it. `run_id`,
+    /// when sent, asks for that run's output only: an id a later session
+    /// reused is answered as such, not read as the run's. Left out on the wire
+    /// when absent, and optional when received, so protocol 3 is unchanged.
     Transcript {
         session: String,
         max_bytes: usize,
         #[serde(default)]
         redact: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
     },
 }
 
@@ -476,12 +483,39 @@ mod tests {
                 session: "term-1-a".into(),
                 max_bytes: 4096,
                 redact: true,
+                run_id: None,
             },
         })
         .unwrap();
         assert_eq!(
             request,
             serde_json::json!({"id": 9, "op": "transcript", "session": "term-1-a", "max_bytes": 4096, "redact": true})
+        );
+        // A run id rides the same request when the caller has the run, and is
+        // left out when it has not, so a request without one is the request
+        // protocol 3 always had.
+        let named = serde_json::to_value(Envelope {
+            id: 9,
+            request: Request::Transcript {
+                session: "term-1-a".into(),
+                max_bytes: 4096,
+                redact: false,
+                run_id: Some("run-7".into()),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            named,
+            serde_json::json!({"id": 9, "op": "transcript", "session": "term-1-a", "max_bytes": 4096, "redact": false, "run_id": "run-7"})
+        );
+        assert_eq!(
+            serde_json::from_value::<Envelope>(named).unwrap().request,
+            Request::Transcript {
+                session: "term-1-a".into(),
+                max_bytes: 4096,
+                redact: false,
+                run_id: Some("run-7".into())
+            }
         );
         // `redact` is optional on the wire: left out it is off.
         let bare: Envelope = serde_json::from_value(
@@ -493,7 +527,8 @@ mod tests {
             Request::Transcript {
                 session: "term-1-a".into(),
                 max_bytes: 10,
-                redact: false
+                redact: false,
+                run_id: None
             }
         );
     }
@@ -516,6 +551,12 @@ mod tests {
                 "unavailable",
             ),
             (
+                TranscriptRead::Reused {
+                    reason: "a later session reused this id".into(),
+                },
+                "reused",
+            ),
+            (
                 TranscriptRead::Found(TranscriptTail {
                     data_b64: "aGk=".into(),
                     bytes: 2,
@@ -529,6 +570,7 @@ mod tests {
                     live: false,
                     settled: true,
                     recording_error: None,
+                    run_id: Some("run-7".into()),
                 }),
                 "found",
             ),
