@@ -1,4 +1,6 @@
-use super::{Cleaner, CleanerConfig, CleanerRun, Saved, VERSION};
+use super::{
+    eligible_candidates, Cleaner, CleanerCandidate, CleanerConfig, CleanerRun, Saved, VERSION,
+};
 use crate::storage::hygiene::discovery;
 use std::fs;
 use std::sync::atomic::AtomicBool;
@@ -825,5 +827,408 @@ fn an_unreadable_artifact_tree_is_dropped_while_a_readable_one_stays_a_candidate
     assert!(
         inventory.partial,
         "the run still says something could not be read"
+    );
+}
+
+#[test]
+fn an_incomplete_repository_does_not_veto_the_complete_ones() {
+    let candidate = |repo: &str, path: &str| CleanerCandidate {
+        repo_path: repo.into(),
+        path: path.into(),
+        provider: "cargo".into(),
+        bytes: 1,
+    };
+    let candidates = vec![
+        candidate("/w/trusted", "target"),
+        candidate("/w/untrusted", "target"),
+        candidate("/w/partial", "node_modules"),
+        candidate("/w/trusted", "node_modules"),
+    ];
+    let incomplete = ["/w/untrusted".to_string(), "/w/partial".to_string()]
+        .into_iter()
+        .collect();
+
+    let (eligible, skipped) = eligible_candidates(candidates, &incomplete);
+
+    assert_eq!(skipped, 2, "both artifacts in unread trees must be skipped");
+    assert_eq!(
+        eligible.len(),
+        2,
+        "the complete tree's artifacts stay eligible"
+    );
+    assert!(
+        eligible.iter().all(|c| c.repo_path == "/w/trusted"),
+        "no candidate from an incompletely read repository may survive: {:?}",
+        eligible.iter().map(|c| &c.repo_path).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn every_candidate_from_an_unread_repository_is_filtered_out() {
+    let candidates = vec![CleanerCandidate {
+        repo_path: "/w/untrusted".into(),
+        path: "target".into(),
+        provider: "cargo".into(),
+        bytes: 1,
+    }];
+    let incomplete = ["/w/untrusted".to_string()].into_iter().collect();
+    let (eligible, skipped) = eligible_candidates(candidates, &incomplete);
+    assert!(eligible.is_empty(), "nothing may be cleaned");
+    assert_eq!(skipped, 1);
+}
+
+/// The fix's own behaviour, through the real run path: a repository whose
+/// inventory could not be read in full must not stop one that could.
+///
+/// The `eligible_candidates` tests cover the filter in isolation; this covers
+/// the call site in `perform_with_gate`, which is where the refusal used to be
+/// global. Reverting that guard to `if run.partial` makes this test fail.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_repository_does_not_stop_cleanup_of_a_readable_one() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = crate::storage::hygiene::tests::TEST_LOCK.lock().unwrap();
+    let (temp, _old, root) = fixture();
+    let mut service = Cleaner::new(
+        crate::engine::git_cli::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("mixed-state"),
+    );
+    service.activity_override = Some(|_| Ok(()));
+    let cleaner = Arc::new(service);
+
+    // Both repositories carry an identical, long-stale __pycache__ with the
+    // same producer evidence. The only difference is that "unread" also holds
+    // a directory the storage scan cannot enter, which is what makes its own
+    // inventory incomplete. Both ignored paths are committed to .gitignore so
+    // each tree is quiet, leaving the eligibility filter as the only reason
+    // one artifact survives and the other does not.
+    for name in ["complete", "unread"] {
+        let r = repo(&root, name);
+        fs::write(r.join(".gitignore"), "__pycache__/\n.unreadable/\n").unwrap();
+        fs::write(r.join("source.py"), "print('preserve')").unwrap();
+        crate::engine::git_cli::git_text(&r, &["add", "."]).unwrap();
+        crate::engine::git_cli::git_text(
+            &r,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        )
+        .unwrap();
+        fs::create_dir(r.join("__pycache__")).unwrap();
+        fs::write(r.join("__pycache__/module.pyc"), vec![b'x'; 100]).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
+        for p in [r.join("__pycache__/module.pyc"), r.join("__pycache__")] {
+            fs::File::open(p)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+    }
+    let blocked = root.join("unread/.unreadable");
+    fs::create_dir(&blocked).unwrap();
+    fs::write(blocked.join("entry"), "unreadable").unwrap();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o0)).unwrap();
+
+    let saved = cleaner.save(config(&cleaner, &root)).unwrap();
+    cleaner
+        .cancel
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut run = CleanerRun {
+        id: "mixed-run".into(),
+        trigger: "manual".into(),
+        started_at: crate::storage::hygiene::now(),
+        finished_at: 0,
+        status: "running".into(),
+        repositories: 0,
+        partial: false,
+        issues: vec![],
+        items: vec![],
+    };
+    cleaner
+        .update(|s| {
+            s.history.push(run.clone());
+            Ok(())
+        })
+        .unwrap();
+    let _run_lock = cleaner.lock("run.lock").unwrap();
+    let mut gated: Vec<String> = vec![];
+    let outcome = cleaner.perform_with_gate(&saved.config, &mut run, |repo, _, _| {
+        gated.push(repo.to_string());
+        Ok(())
+    });
+    // Restored before any assertion can unwind, so the temporary directory is
+    // always removable regardless of how this test ends.
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+    outcome.expect("one unreadable repository must not fail the whole run");
+
+    assert!(
+        run.partial,
+        "the workspace inventory was not read in full and must still say so"
+    );
+    assert_eq!(
+        gated.len(),
+        1,
+        "exactly one repository may be gated: {gated:?}"
+    );
+    assert!(
+        gated[0].ends_with("/complete"),
+        "removal must be gated for the readable repository and no other: {gated:?}"
+    );
+    assert_eq!(
+        run.items.len(),
+        1,
+        "only the readable repository's artifact is attempted: {:?}",
+        run.items
+    );
+    assert_eq!(run.items[0].status, "completed", "{:?}", run.items);
+    assert!(
+        run.items[0].repo_path.ends_with("/complete"),
+        "{:?}",
+        run.items
+    );
+    assert_eq!(
+        run.status, "completed_with_skips",
+        "a run that skipped an unread tree claims no complete coverage"
+    );
+    assert!(
+        run.issues.iter().any(|i| i.contains("left alone")),
+        "the skipped artifact must be reported: {:?}",
+        run.issues
+    );
+    assert!(
+        !root.join("complete/__pycache__").exists(),
+        "the readable repository's stale cache should have been removed"
+    );
+    assert!(
+        root.join("unread/__pycache__/module.pyc").is_file(),
+        "an artifact in a repository that was not read in full must survive"
+    );
+    assert!(root.join("complete/source.py").is_file());
+    assert!(root.join("unread/source.py").is_file());
+}
+
+/// The reconciliation, end to end, in the shape that motivated it.
+///
+/// DevCouncil's repository scan is truncated for reasons that belong to the
+/// repository and to no tree inside it -- 17 linked worktrees against a sizing
+/// cap of 8, and more artifact directories than the reporting cap -- while its
+/// `rust/target` was enumerated to the end. Keying `incomplete_repos` on
+/// `scan.truncated` put the repository in that set, `eligible_candidates`
+/// dropped every one of its candidates, and `candidates.is_empty() &&
+/// run.partial` then turned the whole run into an error. 64 GiB that the scan
+/// had read in full, refused by a flag about linked worktrees.
+///
+/// This fixture uses the artifact reporting cap because it needs no git calls:
+/// 65 unignored artifact directories push the list past `MAX_ARTIFACT_DIRS` and
+/// set `scan.truncated`, and being unignored they are not candidates
+/// themselves. The one stale, ignored, fully-read tree is.
+#[cfg(unix)]
+#[test]
+fn a_truncated_repository_scan_still_cleans_a_tree_that_was_read_in_full() {
+    let _serial = crate::storage::hygiene::tests::TEST_LOCK.lock().unwrap();
+    let (temp, _old, root) = fixture();
+    let mut service = Cleaner::new(
+        crate::engine::git_cli::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("truncated-state"),
+    );
+    service.activity_override = Some(|_| Ok(()));
+    let cleaner = Arc::new(service);
+
+    let r = repo(&root, "big");
+    fs::write(r.join(".gitignore"), "__pycache__/\n").unwrap();
+    fs::write(r.join("source.py"), "print('preserve')").unwrap();
+    crate::engine::git_cli::git_text(&r, &["add", "."]).unwrap();
+    crate::engine::git_cli::git_text(
+        &r,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    )
+    .unwrap();
+
+    // The tree to be reclaimed: ignored, long stale, read to the end, and the
+    // largest artifact so the reporting cap cannot drop it.
+    fs::create_dir(r.join("__pycache__")).unwrap();
+    fs::write(r.join("__pycache__/module.pyc"), vec![b'x'; 4096]).unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
+    for p in [r.join("__pycache__/module.pyc"), r.join("__pycache__")] {
+        fs::File::open(p)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+    }
+
+    // Enough artifact directories to push the report past its reporting cap,
+    // which is what makes `scan.truncated` true. Each is unignored, so each is
+    // excluded as a candidate on its own merits and only the tree above is left.
+    for i in 0..=64 {
+        let filler = r.join(format!("f{i}/coverage"));
+        fs::create_dir_all(&filler).unwrap();
+        fs::write(filler.join("report.txt"), b"x").unwrap();
+    }
+
+    cleaner.save(config(&cleaner, &root)).unwrap();
+    let inventory = cleaner.inventory().expect("inventory");
+    assert!(
+        inventory.partial,
+        "the repository scan really is truncated, and the run must keep saying so"
+    );
+    assert!(
+        inventory.incomplete_repos.is_empty(),
+        "a truncated scan is not a repository that could not be read: {:?}",
+        inventory.incomplete_repos
+    );
+    let paths: Vec<&str> = inventory
+        .candidates
+        .iter()
+        .map(|c| c.path.as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["__pycache__"],
+        "the tree that was read in full is the one candidate: {paths:?}"
+    );
+
+    let saved = cleaner.save(config(&cleaner, &root)).unwrap();
+    cleaner
+        .cancel
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut run = CleanerRun {
+        id: "truncated-run".into(),
+        trigger: "manual".into(),
+        started_at: crate::storage::hygiene::now(),
+        finished_at: 0,
+        status: "running".into(),
+        repositories: 0,
+        partial: false,
+        issues: vec![],
+        items: vec![],
+    };
+    cleaner
+        .update(|s| {
+            s.history.push(run.clone());
+            Ok(())
+        })
+        .unwrap();
+    let _run_lock = cleaner.lock("run.lock").unwrap();
+    let mut gated: Vec<String> = vec![];
+    cleaner
+        .perform_with_gate(&saved.config, &mut run, |repo, _, _| {
+            gated.push(repo.to_string());
+            Ok(())
+        })
+        .expect("a truncated repository scan is not a reason to fail the run");
+
+    assert_eq!(gated.len(), 1, "the readable tree is gated: {gated:?}");
+    assert_eq!(
+        run.items.len(),
+        1,
+        "and it is the only thing attempted: {:?}",
+        run.items
+    );
+    assert_eq!(run.items[0].status, "completed", "{:?}", run.items);
+    assert!(
+        run.items[0].path.ends_with("__pycache__"),
+        "{:?}",
+        run.items
+    );
+    assert!(
+        run.partial,
+        "the run still claims no complete coverage of the workspace"
+    );
+    assert!(
+        !r.join("__pycache__").exists(),
+        "the tree that was read in full was actually removed"
+    );
+    assert!(
+        r.join("source.py").is_file(),
+        "and nothing else was touched"
+    );
+}
+
+/// The other side of making eligibility per tree: if the only trees in the
+/// workspace were not read in full, nothing is eligible, and that has to be a
+/// refusal rather than a clean run of zero items. The refusal is guarded by
+/// `candidates.is_empty() && run.partial`, so this is really a test that
+/// per-tree incompleteness reaches `partial` -- which `inspect` derives from
+/// `scan_complete` directly rather than inferring from `scan.truncated`.
+#[cfg(unix)]
+#[test]
+fn a_workspace_whose_every_tree_was_cut_short_refuses_instead_of_reporting_success() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = crate::storage::hygiene::tests::TEST_LOCK.lock().unwrap();
+    let (temp, _old, root) = fixture();
+    let mut service = Cleaner::new(
+        crate::engine::git_cli::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("all-unread-state"),
+    );
+    service.activity_override = Some(|_| Ok(()));
+    let cleaner = Arc::new(service);
+
+    let r = repo(&root, "only");
+    fs::write(r.join(".gitignore"), "__pycache__/\n").unwrap();
+    fs::create_dir(r.join("__pycache__")).unwrap();
+    fs::write(r.join("__pycache__/module.pyc"), vec![b'x'; 100]).unwrap();
+    // A subtree of the artifact itself that the walk cannot enter, so the only
+    // candidate tree in the workspace is the one that was not read in full.
+    let blocked = r.join("__pycache__/inner");
+    fs::create_dir(&blocked).unwrap();
+    fs::write(blocked.join("entry"), "unreadable").unwrap();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o0)).unwrap();
+
+    let saved = cleaner.save(config(&cleaner, &root)).unwrap();
+    cleaner
+        .cancel
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut run = CleanerRun {
+        id: "all-unread-run".into(),
+        trigger: "manual".into(),
+        started_at: crate::storage::hygiene::now(),
+        finished_at: 0,
+        status: "running".into(),
+        repositories: 0,
+        partial: false,
+        issues: vec![],
+        items: vec![],
+    };
+    cleaner
+        .update(|s| {
+            s.history.push(run.clone());
+            Ok(())
+        })
+        .unwrap();
+    let _run_lock = cleaner.lock("run.lock").unwrap();
+    let mut gated: Vec<String> = vec![];
+    let outcome = cleaner.perform_with_gate(&saved.config, &mut run, |repo, _, _| {
+        gated.push(repo.to_string());
+        Ok(())
+    });
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert!(
+        outcome.is_err(),
+        "nothing was eligible and something could not be read: that is a refusal"
+    );
+    assert_eq!(run.status, "incomplete");
+    assert!(gated.is_empty(), "nothing may be gated: {gated:?}");
+    assert!(run.items.is_empty(), "{:?}", run.items);
+    assert!(
+        r.join("__pycache__/module.pyc").is_file(),
+        "and the tree survives on disk"
     );
 }

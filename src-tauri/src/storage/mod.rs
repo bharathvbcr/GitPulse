@@ -405,6 +405,11 @@ struct WalkBudget {
     /// repository's allowance for everything else.
     artifact_files_visited: u64,
     max_files: usize,
+    /// File allowance handed to each artifact sub-budget. A field rather than
+    /// the constant read inline, so a test can shrink it and exercise the
+    /// cap's fail-closed path without creating six hundred thousand files.
+    /// Production always carries [`MAX_FILES_PER_ARTIFACT`].
+    artifact_max_files: usize,
     /// Test-only fault injection: paths whose read fails with `EIO` instead of
     /// touching the filesystem (the walkers have no other fs seam).
     #[cfg(test)]
@@ -428,6 +433,7 @@ impl WalkBudget {
             files_visited: 0,
             artifact_files_visited: 0,
             max_files,
+            artifact_max_files: MAX_FILES_PER_ARTIFACT,
             #[cfg(test)]
             fail_paths: Vec::new(),
         }
@@ -461,10 +467,14 @@ impl WalkBudget {
         #[cfg(test)]
         return Self {
             fail_paths: self.fail_paths.clone(),
-            ..Self::with_limits(self.deadline, MAX_FILES_PER_ARTIFACT)
+            artifact_max_files: self.artifact_max_files,
+            ..Self::with_limits(self.deadline, self.artifact_max_files)
         };
         #[cfg(not(test))]
-        Self::with_limits(self.deadline, MAX_FILES_PER_ARTIFACT)
+        Self {
+            artifact_max_files: self.artifact_max_files,
+            ..Self::with_limits(self.deadline, self.artifact_max_files)
+        }
     }
 
     /// Takes over everything an artifact sub-budget counted. The error and
@@ -1483,12 +1493,33 @@ fn walk_worktree(
             }
         }
         if is_linked_worktree {
+            // Outside an artifact scope this is the design: linked worktrees
+            // and submodules are measured on their own in
+            // `collect_worktree_usage`, so skipping one here loses nothing.
+            //
+            // Inside an artifact scope it is not. The enclosing tree is a
+            // candidate for wholesale removal, and this says the tree contains
+            // a repository of its own: its bytes are then a floor, and
+            // removing it would take a working tree with it. Mark the
+            // enclosing artifact tree unexamined — the budget here IS that
+            // tree's own sub-budget, so this condemns the tree and nothing
+            // else.
+            if in_artifact {
+                budget.mark_exhausted();
+            }
             continue;
         }
 
         #[cfg(unix)]
         if let Ok(meta) = fs::metadata(&child_path) {
             if !ctx.seen_dir_inodes.insert((meta.dev(), meta.ino())) {
+                // Reached twice (a bind mount, or the same directory under two
+                // names): counted once, by whichever path got there first. If
+                // that path was outside this artifact tree, the tree's bytes
+                // are a floor, and this walk cannot tell which case it is.
+                if in_artifact {
+                    budget.mark_exhausted();
+                }
                 continue;
             }
         }
@@ -3129,6 +3160,161 @@ mod tests {
             !outer.complete,
             "a pruned artifact tree is not a tree that was read to the end"
         );
+    }
+
+
+    /// Builds a walk context and walks `root`, returning the collector so a
+    /// test can ask what each artifact scope concluded about itself.
+    fn walk_artifacts(root: &Path, budget: &mut WalkBudget) -> ArtifactCollector {
+        let mut collector = ArtifactCollector::new();
+        let mut entered = Vec::new();
+        let mut large = LargeFileCollector::new();
+        let linked = std::collections::HashSet::new();
+        let mut ancestors = Vec::new();
+        #[cfg(unix)]
+        let mut seen = std::collections::HashSet::new();
+        #[cfg(unix)]
+        let mut seen_dirs = std::collections::HashSet::new();
+        {
+            let mut ctx = test_walk_ctx(
+                root,
+                &mut collector,
+                &mut entered,
+                &mut large,
+                &linked,
+                &mut ancestors,
+                #[cfg(unix)]
+                &mut seen,
+                #[cfg(unix)]
+                &mut seen_dirs,
+            );
+            walk_worktree(&mut ctx, root, 0, budget);
+        }
+        collector
+    }
+
+    fn scope<'a>(collector: &'a ArtifactCollector, rel: &str) -> &'a FoundArtifact {
+        collector
+            .found
+            .iter()
+            .find(|found| found.rel == rel)
+            .unwrap_or_else(|| panic!("{rel} is an artifact scope"))
+    }
+
+    /// An artifact tree past its own file allowance is refused, not trimmed and
+    /// called clean. The allowance is injected rather than reached, because
+    /// reaching it honestly would mean creating 600,000 files.
+    #[test]
+    fn an_artifact_tree_past_its_own_file_allowance_is_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for i in 0..20 {
+            write_file(&root.join("target").join(format!("o{i}.o")), 10);
+        }
+
+        let mut budget = WalkBudget::new();
+        budget.artifact_max_files = 5;
+        let collector = walk_artifacts(root, &mut budget);
+
+        let target = scope(&collector, "target");
+        assert!(
+            !target.complete,
+            "a tree that outran its own allowance was not read to the end"
+        );
+        assert!(
+            budget.truncated,
+            "and the repository's totals are floors because of it"
+        );
+        assert!(
+            target.bytes < 200,
+            "its byte figure is a floor, not the whole tree: {bytes}",
+            bytes = target.bytes
+        );
+    }
+
+    /// The mid-directory budget check: one flat directory wide enough to reach
+    /// the stride must notice an exhausted budget instead of running to the end
+    /// of the directory. Driven through the file allowance because that is the
+    /// same `exhausted()` predicate the deadline uses, and a wall-clock
+    /// deadline in a test is a flake on a loaded host.
+    #[test]
+    fn a_wide_artifact_directory_notices_an_exhausted_budget_mid_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let wide = DEADLINE_CHECK_STRIDE + 16;
+        for i in 0..wide {
+            write_file(&root.join("target").join(format!("o{i}.o")), 1);
+        }
+
+        let mut budget = WalkBudget::new();
+        budget.artifact_max_files = 8;
+        let collector = walk_artifacts(root, &mut budget);
+
+        let target = scope(&collector, "target");
+        assert!(!target.complete, "the tree is refused");
+        assert!(budget.truncated);
+        assert!(
+            target.bytes <= DEADLINE_CHECK_STRIDE as u64,
+            "the walk stopped at the stride rather than finishing the directory: {bytes}",
+            bytes = target.bytes
+        );
+    }
+
+    /// `scan_complete` promises every file under the tree was visited, so a
+    /// child the walk declines to descend has to retract that promise. A
+    /// repository of its own inside a build tree is the case that matters:
+    /// removing the tree would take a working tree with it.
+    #[cfg(unix)]
+    #[test]
+    fn a_nested_repository_inside_an_artifact_tree_retracts_completeness() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_file(&root.join("target/debug/x.o"), 400);
+        // A directory carrying its own `.git` is a submodule or linked
+        // worktree: `walk_worktree` declines to descend into it.
+        write_file(&root.join("target/vendored/.git"), 20);
+        write_file(&root.join("target/vendored/keep.rs"), 900);
+
+        let mut budget = WalkBudget::new();
+        let collector = walk_artifacts(root, &mut budget);
+
+        let target = scope(&collector, "target");
+        assert!(
+            !target.complete,
+            "a tree holding a repository of its own was not read in full"
+        );
+        assert!(budget.truncated);
+        assert!(
+            target.bytes < 1_320,
+            "the undescended repository's bytes are not in the total: {bytes}",
+            bytes = target.bytes
+        );
+    }
+
+    /// The same skip OUTSIDE an artifact tree is the design, not a gap: linked
+    /// worktrees and submodules are measured on their own in
+    /// `collect_worktree_usage`, so skipping one there must not truncate the
+    /// scan. (GitPulse's own `.claude/worktrees/*` do NOT take this path --
+    /// `.claude` is itself a recognised artifact name, so those worktrees sit
+    /// inside an artifact scope and correctly mark that scope unexamined. The
+    /// scope is also `protected_artifact`, so it was never removable anyway.)
+    #[cfg(unix)]
+    #[test]
+    fn a_nested_repository_outside_an_artifact_tree_does_not_truncate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_file(&root.join("src/main.rs"), 100);
+        write_file(&root.join("plain/lane/.git"), 20);
+        write_file(&root.join("plain/lane/main.rs"), 500);
+
+        let mut budget = WalkBudget::new();
+        let collector = walk_artifacts(root, &mut budget);
+
+        assert!(
+            !budget.truncated,
+            "a linked worktree is measured separately, not missed"
+        );
+        assert!(collector.found.is_empty(), "nothing here is an artifact");
     }
 
     #[test]

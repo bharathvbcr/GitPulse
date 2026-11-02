@@ -473,6 +473,10 @@
                 <p class="mt-1 text-[11px] text-textMuted">
                   Git did not answer whether this directory is ignored or tracked, so it is not treated as disposable.
                 </p>
+              {:else if !artifact.scan_complete}
+                <p class="mt-1 text-[11px] text-textMuted">
+                  The walk did not reach the end of this directory, so its size is a floor and what the rest of it holds is unknown.
+                </p>
               {:else if artifact.unignored}
                 <p class="mt-1 text-[11px] text-textMuted">
                   No ignore rule covers this directory — it shows up in every status listing and can slip into commits.

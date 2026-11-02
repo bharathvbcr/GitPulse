@@ -3,6 +3,7 @@
 use super::{discovery, tree};
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -91,6 +92,28 @@ pub struct CleanerInventory {
     pub visited_entries: u32,
     pub partial: bool,
     pub issues: Vec<String>,
+    /// Repositories whose inventory could not be enumerated at all, so no
+    /// candidate from them can be trusted: the scan returned an error
+    /// (including `REPOSITORY_TRUST_REQUIRED`), git declined to answer whether
+    /// their directories are ignored or tracked, or the workspace candidate cap
+    /// cut their artifact list off mid-enumeration. Their artifacts are never
+    /// removed.
+    ///
+    /// Deliberately NOT recorded for a merely truncated repository scan. That
+    /// is a statement about the repository's totals and artifact list, not
+    /// about any one tree, and it is routinely true of a healthy repository
+    /// (more linked worktrees than the sizing cap, more artifact directories
+    /// than the reporting cap). Whether a particular tree was enumerated to
+    /// the end is `ArtifactDir::scan_complete`, which `inspect` filters on per
+    /// candidate; keying this set on `scan.truncated` instead reinstated the
+    /// whole-repository veto and left the largest trees unreclaimable.
+    /// Workspace-level incompleteness is reported by `partial`.
+    ///
+    /// Internal to the run path, never part of the IPC payload: `serde(skip)`
+    /// keeps the wire contract that scripts/check-coverage-types.mjs pins
+    /// against src/lib/storage/hygiene/globalTypes.ts unchanged.
+    #[serde(skip)]
+    pub incomplete_repos: BTreeSet<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CleanerItem {
@@ -461,6 +484,7 @@ impl Cleaner {
             partial: found.partial,
             issues: found.issues,
             candidates: vec![],
+            incomplete_repos: BTreeSet::new(),
         };
         let start = Instant::now();
         for repo in found.repos {
@@ -477,6 +501,38 @@ impl Cleaner {
             let repo_path = repo.to_str().ok_or("Non-UTF-8 repository")?;
             match crate::storage::scan_storage(repo_path) {
                 Ok(report) => {
+                    // A truncated repository scan sets `partial` and says so,
+                    // and it deliberately does NOT record the repository as
+                    // incomplete. `scan.truncated` means the repository's
+                    // totals are floors and its artifact list may be a sample;
+                    // it is true for reasons that belong to no particular tree
+                    // (linked worktrees past the sizing cap, a 65th artifact
+                    // directory, a flat source directory past the entry cap).
+                    // Recording the repository here dropped every one of its
+                    // candidates, which is how a 64 GiB `rust/target` that had
+                    // been enumerated to the end stayed unreclaimable because
+                    // the repository it lives in has 17 linked worktrees and
+                    // the sizing cap is 8. Per-tree completeness is carried by
+                    // `ArtifactDir::scan_complete` and filtered below.
+                    //
+                    // "Something here was not examined" is carried by
+                    // `partial`, and it is derived from per-tree completeness
+                    // directly, below, rather than inferred from
+                    // `scan.truncated`. The refusal in `perform_with_gate`
+                    // rests on that flag: without this, a workspace whose every
+                    // tree was cut short would produce no candidates, no
+                    // recorded incomplete repository and therefore no refusal,
+                    // and would report a clean, complete run of zero items. It
+                    // is a derivation and not an assertion so it cannot drift
+                    // if the walk's own propagation ever changes.
+                    if report.artifacts.iter().any(|a| !a.scan_complete) {
+                        result.partial = true;
+                        if result.issues.len() < 128 {
+                            result.issues.push(format!(
+                                "Artifact tree not read in full: {repo_path}"
+                            ));
+                        }
+                    }
                     if report.scan.truncated || report.scan.permission_denied > 0 {
                         result.partial = true;
                         if result.issues.len() < 128 {
@@ -491,6 +547,7 @@ impl Cleaner {
                         .any(|artifact| artifact.checks_unexamined)
                     {
                         result.partial = true;
+                        result.incomplete_repos.insert(repo_path.to_string());
                         if result.issues.len() < 128 {
                             result.issues.push(format!(
                                 "Ignore or tracked-file check did not run: {repo_path}"
@@ -500,6 +557,10 @@ impl Cleaner {
                     for artifact in report.artifacts {
                         if result.candidates.len() >= 512 {
                             result.partial = true;
+                            // This repository's artifacts were cut off
+                            // mid-enumeration, so the ones already collected
+                            // do not represent a tree that was read in full.
+                            result.incomplete_repos.insert(repo_path.to_string());
                             break;
                         }
                         // Removal needs this tree read in full: a walk that
@@ -538,6 +599,10 @@ impl Cleaner {
                 }
                 Err(e) => {
                     result.partial = true;
+                    // Includes REPOSITORY_TRUST_REQUIRED: a repository the user
+                    // has never trusted in the UI is one whose contents were
+                    // never read, not one known to hold nothing worth keeping.
+                    result.incomplete_repos.insert(repo_path.to_string());
                     if result.issues.len() < 128 {
                         result
                             .issues
@@ -698,13 +763,45 @@ impl Cleaner {
         run.repositories = inventory.repositories;
         run.partial = inventory.partial;
         run.issues = inventory.issues;
-        if run.partial {
+        // An incomplete workspace inventory is a reason not to claim complete
+        // coverage; it is not a reason to leave every tree alone. Each
+        // candidate is already gated on its own repository being read in full
+        // and on that repository being clean at removal time, so the refusal
+        // belongs to the repositories that were not read, not to the run.
+        //
+        // Refusing globally left 20 consecutive scheduled runs reclaiming 0
+        // bytes: two repositories that were never trusted and a traversal
+        // budget on six large ones held a 57-repository workspace hostage.
+        let incomplete_repos = inventory.incomplete_repos;
+        let (candidates, skipped) = eligible_candidates(inventory.candidates, &incomplete_repos);
+        // The refusal below leans on this: a dropped candidate means its
+        // repository was recorded incomplete, and every site that records one
+        // also sets `partial`. A new site that recorded a repository without
+        // setting `partial` would let an all-unread workspace report a clean,
+        // complete run of zero items, so it fails loudly here under test
+        // rather than quietly claiming coverage it does not have.
+        debug_assert!(
+            skipped == 0 || run.partial,
+            "an incompletely read repository must mark the run partial"
+        );
+        // Nothing eligible is a refusal only when something could not be read.
+        // Every repository recorded in `incomplete_repos` also set `partial`,
+        // so an all-unread workspace still refuses here, while a complete scan
+        // that simply found nothing to remove stays an ordinary successful run
+        // rather than being reported as an incomplete one.
+        if candidates.is_empty() && run.partial {
             run.status = "incomplete".into();
             return Err("Incomplete inventory: no cleanup was started".into());
         }
+        if skipped > 0 {
+            run.partial = true;
+            run.issues.push(format!(
+                "{skipped} artifact(s) were left alone: their repository was not read in full"
+            ));
+        }
         let started = Instant::now();
         let mut attempted = 0u64;
-        for candidate in inventory.candidates {
+        for candidate in candidates {
             if run.items.len() >= config.max_targets as usize
                 || started.elapsed() > Duration::from_secs(300)
             {
@@ -801,6 +898,25 @@ impl Cleaner {
         .into();
         Ok(())
     }
+}
+
+/// Splits an inventory's candidates into those whose repository was read in
+/// full and those that must be left alone, returning the eligible ones and how
+/// many were dropped.
+///
+/// Pure, so the policy that decides what may be deleted is testable without a
+/// scheduler, an app-support directory or a git repository.
+fn eligible_candidates(
+    candidates: Vec<CleanerCandidate>,
+    incomplete_repos: &BTreeSet<String>,
+) -> (Vec<CleanerCandidate>, usize) {
+    let before = candidates.len();
+    let kept: Vec<CleanerCandidate> = candidates
+        .into_iter()
+        .filter(|c| !incomplete_repos.contains(&c.repo_path))
+        .collect();
+    let dropped = before - kept.len();
+    (kept, dropped)
 }
 
 fn quiet_repo(repo: &str) -> Result<(), CommandError> {
