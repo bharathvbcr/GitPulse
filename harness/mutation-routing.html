@@ -408,6 +408,21 @@ const sentTo = cmd => sent.filter(s => s.cmd === cmd);
   check("and the plain branch is sent squashed because the reader asked", () => sentTo("cmd_worktree_merge_teardown")[mergesBefore + 1].squash === true && sentTo("cmd_worktree_merge_teardown")[mergesBefore + 1].worktreePath.endsWith("/lane"));
   await until(() => button("Lock lane"), "A's rows back after the squash merges");
 
+  // the squash choice is the confirmed row's, though another row is armed while the trust check is out
+  button("Merge lane into the default branch and remove it").click();
+  await until(() => squashBox() && squashBox().checked === false, "plain branch armed with squash off");
+  const mergesBeforeRace = sentTo("cmd_worktree_merge_teardown").length;
+  hold("trust");
+  button("Merge lane into the default branch and remove it").click();
+  await wait(100);
+  button("Merge att into the default branch and remove it").click();
+  await until(() => squashBox() && squashBox().checked === true, "the attempt branch armed meanwhile, with squash on");
+  releaseAll("trust");
+  await until(() => sentTo("cmd_worktree_merge_teardown").length === mergesBeforeRace + 1, "plain branch merge sent after the trust wait");
+  await until(() => busy() === 0, "plain branch merge settled after the trust wait");
+  check("a merge confirmed with squash off is sent with squash off though another row was armed during the trust check", () => { const s = sentTo("cmd_worktree_merge_teardown")[mergesBeforeRace]; return s.squash === false && s.worktreePath.endsWith("/lane"); });
+  await until(() => button("Lock lane"), "A's rows back after the raced merge");
+
   // attempt review: the committed range is read in the attempt's own checkout, qualified before Approve, and landed at the approved commit
   const ATTW = `${A}/.claude/worktrees/att`;
   const reviewHost = document.createElement("div");
