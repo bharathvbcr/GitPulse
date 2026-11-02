@@ -175,6 +175,24 @@ describe("child agent processes", () => {
     expect(note?.reason).toContain("1 child agent session");
   });
 
+  it("are all unplaced when an agent above them is in no probe read, however deep the chain below it", () => {
+    // 9_999 is outside every probe. 500 names it as its parent, and 501 and 502
+    // sit under 500: 500's own place is unknown, so what is under it has none
+    // either, even though 500's launch id and directory would name a terminal.
+    const plane = project({
+      probes: [probe({ snapshot: withLive({ [ALPHA]: [
+        live(500, { tree: "session:s1", parent_pid: 9_999 }),
+        live(501, { tree: "session:s1", parent_pid: 500 }),
+        live(502, { tree: "session:s1", parent_pid: 501 }),
+      ] }) })],
+      terminals: [session()],
+    });
+    expect(find(plane.rows, (row) => row.liveKey === "t1").children).toEqual([]);
+    expect(plane.childSessions).toBe(0);
+    expect(plane.unplacedSessions).toBe(3);
+    expect(plane.rows.filter((row) => row.origin === "session")).toEqual([]);
+  });
+
   it("terminate on a lineage that loops, and attach to nothing", () => {
     const plane = project({
       probes: [probe({ snapshot: withLive({ [ALPHA]: [
