@@ -502,7 +502,20 @@ impl Cleaner {
                             result.partial = true;
                             break;
                         }
-                        if artifact.tracked_files > 0
+                        // Removal needs this tree read in full: a walk that
+                        // stopped inside it cannot say whether something
+                        // unexpected is in there, and its byte figure is a
+                        // floor. The repository-wide `scan.truncated` above is
+                        // a different claim and is deliberately not consulted
+                        // here — a repository is partial for reasons that have
+                        // nothing to do with any one tree (linked worktrees
+                        // past the sizing cap, artifacts past the reporting
+                        // cap, a flat source directory past the entry cap),
+                        // and reading it as "nothing here was examined"
+                        // disqualified every tree the scan had in fact read to
+                        // the end.
+                        if !artifact.scan_complete
+                            || artifact.tracked_files > 0
                             || artifact.unignored
                             || artifact.checks_unexamined
                             || excludes

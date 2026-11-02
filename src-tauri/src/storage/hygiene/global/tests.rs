@@ -766,3 +766,64 @@ fn inaccessible_repository_contents_make_the_global_inventory_incomplete() {
         "an inaccessible storage subtree is not a complete scan"
     );
 }
+
+/// Eligibility is per artifact tree, and it is the tree's OWN enumeration that
+/// decides. A repository is reported partial for reasons that say nothing about
+/// any one tree -- linked worktrees past the sizing cap, artifact directories
+/// past the reporting cap, a flat source directory past the entry cap -- and
+/// reading that flag as "nothing here was examined" disqualified every tree in
+/// the repository, including the ones the scan had read to the end. What must
+/// still disqualify a tree is that tree being unreadable.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_artifact_tree_is_dropped_while_a_readable_one_stays_a_candidate() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_temp, cleaner, root) = fixture();
+    let r = repo(&root, "repo");
+    fs::write(r.join(".gitignore"), "target/\n").unwrap();
+
+    // Two Cargo projects in one repository. `local_provider` only accepts a
+    // `target` next to a Cargo.toml that carries Cargo's own markers, so both
+    // get them; the sole difference is a subtree one of them cannot read.
+    for name in ["whole", "cut"] {
+        let project = r.join(name);
+        let target = project.join("target");
+        fs::create_dir_all(target.join("debug")).unwrap();
+        fs::write(project.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        fs::write(target.join(".rustc_info.json"), "{}").unwrap();
+        fs::write(target.join("debug").join("x.o"), vec![b'x'; 4096]).unwrap();
+    }
+    let blocked = r.join("cut/target/deps");
+    fs::create_dir_all(&blocked).unwrap();
+    fs::write(blocked.join("lib.rlib"), vec![b'x'; 4096]).unwrap();
+    cleaner.save(config(&cleaner, &root)).unwrap();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o0)).unwrap();
+
+    let inventory = cleaner.inventory();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+    let inventory = inventory.expect("inventory");
+    let paths: Vec<&str> = inventory
+        .candidates
+        .iter()
+        .map(|c| c.path.as_str())
+        .collect();
+
+    assert!(
+        !paths.contains(&"cut/target"),
+        "a tree the walk could not finish is not a removal candidate: {paths:?}"
+    );
+    assert!(
+        paths.contains(&"whole/target"),
+        "a tree that WAS read to the end stays eligible even though the \
+         repository scan is partial: {paths:?}"
+    );
+    assert!(
+        inventory.partial,
+        "the run still says something could not be read"
+    );
+}
