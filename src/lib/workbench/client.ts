@@ -79,6 +79,12 @@ export interface TaskRun extends RecordVersion {
   provider: AgentProvider; permission_mode: PermissionMode; state: typeof RUN_STATES[number];
   cwd: string; created_at: number; expires_at: number; session_id: string | null;
   exit_code: number | null; reason: string; outcome_uncertain: boolean;
+  /**
+   * The attempt's own clock, in epoch seconds as the store writes it. Each is
+   * absent until that happens (an attempt never claimed has no `claimed_at`),
+   * and absent means "did not happen or was not recorded", never zero.
+   */
+  claimed_at?: number | null; started_at?: number | null; finished_at?: number | null;
   /** The checkout's Git directories as preparation observed them; the store's key for "this checkout is taken". */
   git_dir?: string; git_common_dir?: string;
   /** The model fields this attempt was launched with; null when it used the launcher's own default. */
