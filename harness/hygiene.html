@@ -180,8 +180,11 @@
     check("global inventory failure is recoverable",root.textContent.includes("Root unavailable")&&!button("Inspect saved roots").disabled);
     const scan={repositories:2,visited_entries:100,partial:true,issues:["Partial repository scan"],candidates:[{repo_path:"/fixture/code/closed",path:"target",provider:"Rust / Cargo",bytes:1000}]};
     button("Inspect saved roots").click();await settle();take("cmd_cleaner_scan").resolve(scan);await settle();
-    check("partial inventory blocks global cleanup",button("Clean eligible output now").disabled);
+    check("a partial inventory that still found candidates allows global cleanup",!button("Clean eligible output now").disabled);
+    check("a partial inventory names reduced coverage rather than a refusal",root.textContent.includes("Incomplete inventory: part of the workspace could not be read")&&!root.textContent.includes("Cleanup is blocked"));
     check("closed repository scope is visible",root.textContent.includes("/fixture/code/closed/target"));
+    button("Inspect saved roots").click();await settle();take("cmd_cleaner_scan").resolve({...scan,candidates:[]});await settle();
+    check("a partial inventory with nothing eligible blocks global cleanup",button("Clean eligible output now").disabled&&root.textContent.includes("nothing eligible was found"));
     button("Inspect saved roots").click();await settle();take("cmd_cleaner_scan").resolve({...scan,partial:false,issues:[]});await settle();
     check("complete inventory allows explicit cleanup",!button("Clean eligible output now").disabled);
     button("Clean eligible output now").click();await settle();const run=take("cmd_cleaner_run");
