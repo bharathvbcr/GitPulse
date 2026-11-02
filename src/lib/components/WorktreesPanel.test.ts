@@ -170,7 +170,10 @@ describe("WorktreesPanel removal safety", () => {
     const fn = source.slice(source.indexOf("async function mergeTeardown"), source.indexOf("async function fetchAiSummary"));
     // The choice is armed with the confirm and sent; it is never hard-coded.
     expect(fn).not.toContain("squash: false");
-    expect(fn).toContain("squash: mergeSquash");
+    // ...and read when the confirm is taken, before any await, not after the
+    // trust check while another row may have been armed.
+    expect(fn).toMatch(/const squash = mergeSquash;[\s\S]*?await repoStore\.trustRepo[\s\S]*?\n\s+squash,\n/);
+    expect(fn).not.toContain("squash: mergeSquash");
     expect(fn).toContain("mergeSquash = squashesByDefault(wt.branch)");
     const armed = source.slice(source.indexOf("{#if mergeConfirmPath === wt.path}"));
     expect(armed.slice(0, 1200)).toContain("Press merge again to confirm.");
