@@ -187,6 +187,13 @@ pub struct WireNotice {
     /// Which subagent, when one was named. Left off the wire when absent, so a
     /// peer that predates it (and refuses unknown fields) reads every notice
     /// that does not carry one exactly as before.
+    ///
+    /// That only holds while no sender sets it: today the host forwards only
+    /// its own `SessionWatcher`'s notices, which never name a subagent, so a
+    /// `Some` does not cross this socket. A host-side producer that starts
+    /// setting it would make an app built before this field fail to parse the
+    /// frame (`deny_unknown_fields`; the client logs and drops it), and so
+    /// must bump `PROTOCOL` in the same change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
 }
