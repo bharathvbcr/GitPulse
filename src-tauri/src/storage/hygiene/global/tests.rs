@@ -877,15 +877,39 @@ fn every_candidate_from_an_unread_repository_is_filtered_out() {
     assert_eq!(skipped, 1);
 }
 
-/// The fix's own behaviour, through the real run path: a repository whose
-/// inventory could not be read in full must not stop one that could.
+/// Completeness is a property of an artifact tree, not of the repository that
+/// contains it, and this test asserts the narrower veto that follows.
 ///
-/// The `eligible_candidates` tests cover the filter in isolation; this covers
-/// the call site in `perform_with_gate`, which is where the refusal used to be
-/// global. Reverting that guard to `if run.partial` makes this test fail.
+/// It used to assert the opposite: that an unreadable directory anywhere in a
+/// repository made every artifact in that repository permanently ineligible.
+/// That was a deliberate policy and it is retired on purpose, not loosened to
+/// make a test pass. The owner decided the narrower rule after the evidence
+/// below; the two halves of it are this test and
+/// `an_unreadable_directory_inside_an_artifact_tree_keeps_it_ineligible`.
+///
+/// Why the sibling cannot change the answer. Nothing the removal rests on is
+/// read from the repository-wide walk: `unignored` and `tracked_files` come
+/// from `git check-ignore` and `git ls-files` queries scoped to the artifact's
+/// own path, the producer markers and the retention stamp are read inside the
+/// tree, and the tree's byte figure and its completeness come from the
+/// per-artifact budget in `walk_worktree`. A directory elsewhere in the
+/// repository is not evidence about any of them. Reading the repository flag as
+/// "nothing here was examined" is what left 9 of 10 of the owner's
+/// repositories permanently ineligible, including both trees that held the
+/// bytes.
+///
+/// What still blocks removal is an unread directory *inside* the artifact's own
+/// tree, because then the walk genuinely cannot say what is in there and the
+/// size is a floor. The companion test named above covers that half, and
+/// `an_unreadable_artifact_tree_is_dropped_while_a_readable_one_stays_a_candidate`
+/// covers it at the inventory level.
+///
+/// This still covers the call site in `perform_with_gate`, which is where the
+/// refusal used to be global: restoring `if run.partial` there makes this test
+/// fail, because the run would refuse outright rather than clean either tree.
 #[cfg(unix)]
 #[test]
-fn an_unreadable_repository_does_not_stop_cleanup_of_a_readable_one() {
+fn an_unreadable_directory_beside_an_artifact_tree_does_not_veto_it() {
     use std::os::unix::fs::PermissionsExt;
     let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
@@ -899,10 +923,11 @@ fn an_unreadable_repository_does_not_stop_cleanup_of_a_readable_one() {
 
     // Both repositories carry an identical, long-stale __pycache__ with the
     // same producer evidence. The only difference is that "unread" also holds
-    // a directory the storage scan cannot enter, which is what makes its own
-    // inventory incomplete. Both ignored paths are committed to .gitignore so
-    // each tree is quiet, leaving the eligibility filter as the only reason
-    // one artifact survives and the other does not.
+    // a directory the storage scan cannot enter -- a sibling of the artifact,
+    // not part of it -- which makes that repository's scan partial while
+    // saying nothing about the artifact tree beside it. Both ignored paths are
+    // committed to .gitignore so each tree is quiet, leaving per-tree
+    // completeness as the only thing that could separate the two.
     for name in ["complete", "unread"] {
         let r = repo(&root, name);
         fs::write(r.join(".gitignore"), "__pycache__/\n.unreadable/\n").unwrap();
@@ -966,49 +991,59 @@ fn an_unreadable_repository_does_not_stop_cleanup_of_a_readable_one() {
     // Restored before any assertion can unwind, so the temporary directory is
     // always removable regardless of how this test ends.
     fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
-    outcome.expect("one unreadable repository must not fail the whole run");
+    outcome.expect("one unreadable directory must not fail the whole run");
 
     assert!(
         run.partial,
-        "the workspace inventory was not read in full and must still say so"
+        "part of the workspace was not read and the run must still say so"
     );
+    let mut gated_names: Vec<&str> = gated
+        .iter()
+        .map(|g| g.rsplit('/').next().unwrap_or(g))
+        .collect();
+    gated_names.sort_unstable();
     assert_eq!(
-        gated.len(),
-        1,
-        "exactly one repository may be gated: {gated:?}"
-    );
-    assert!(
-        gated[0].ends_with("/complete"),
-        "removal must be gated for the readable repository and no other: {gated:?}"
+        gated_names,
+        ["complete", "unread"],
+        "both artifact trees were enumerated to the end, so both are gated \
+         for removal; the unreadable sibling disqualifies neither: {gated:?}"
     );
     assert_eq!(
         run.items.len(),
-        1,
-        "only the readable repository's artifact is attempted: {:?}",
+        2,
+        "both artifacts are attempted: {:?}",
         run.items
     );
-    assert_eq!(run.items[0].status, "completed", "{:?}", run.items);
     assert!(
-        run.items[0].repo_path.ends_with("/complete"),
+        run.items.iter().all(|i| i.status == "completed"),
         "{:?}",
         run.items
     );
     assert_eq!(
         run.status, "completed_with_skips",
-        "a run that skipped an unread tree claims no complete coverage"
+        "a run that could not read part of the workspace claims no complete \
+         coverage, even when every artifact it did examine was removed"
     );
     assert!(
-        run.issues.iter().any(|i| i.contains("left alone")),
-        "the skipped artifact must be reported: {:?}",
+        run.issues
+            .iter()
+            .any(|i| i.contains("Partial repository scan") && i.ends_with("/unread")),
+        "the directory that could not be read must still be reported: {:?}",
         run.issues
     );
     assert!(
         !root.join("complete/__pycache__").exists(),
-        "the readable repository's stale cache should have been removed"
+        "the stale cache in the fully readable repository should have been removed"
     );
     assert!(
-        root.join("unread/__pycache__/module.pyc").is_file(),
-        "an artifact in a repository that was not read in full must survive"
+        !root.join("unread/__pycache__").exists(),
+        "a stale, ignored, untracked cache that WAS read to the end is \
+         removable even though a sibling directory in the same repository \
+         could not be read"
+    );
+    assert!(
+        root.join("unread/.unreadable").is_dir(),
+        "the directory that could not be read is left exactly as it was"
     );
     assert!(root.join("complete/source.py").is_file());
     assert!(root.join("unread/source.py").is_file());
