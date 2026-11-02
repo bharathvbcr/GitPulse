@@ -1049,6 +1049,173 @@ fn an_unreadable_directory_beside_an_artifact_tree_does_not_veto_it() {
     assert!(root.join("unread/source.py").is_file());
 }
 
+/// The other half of the narrower veto, and the half that must not regress:
+/// move the unreadable directory from beside the artifact to inside it, and the
+/// artifact stops being removable.
+///
+/// This is what makes the test above a narrowing rather than a weakening. Here
+/// the walk really cannot say what the tree holds, so its byte figure is a
+/// floor and its contents are unknown; `walk_worktree` gives the tree its own
+/// `artifact_child()` budget, the denial sets `truncated` on that budget, and
+/// `scan_complete` is therefore false. The fixture is the one above with a
+/// single line moved, so per-tree completeness is the only difference between
+/// the two outcomes.
+///
+/// Two independent layers refuse this, and this test pins both separately
+/// because they fail for different reasons and a reader should not mistake one
+/// for the other. The layer under test is `inspect`'s `scan_complete` filter,
+/// which never offers the tree as a candidate: forcing `complete = true` in
+/// `walk_worktree` turns the item-count assertion red, measured. The issue
+/// assertion sits behind that panic so it was not reached, and would go red
+/// too -- with nothing reporting `!scan_complete` there is no artifact for
+/// `inspect` to derive the line from.
+/// Behind it, `tree::snapshot` in strict mode refuses the same tree anyway --
+/// measured under that revert, with "Python bytecode directory contains
+/// non-bytecode content", because the subdirectory is rejected as content
+/// before anything tries to read it; for a provider without that content rule
+/// it would be the `read_dir` denial instead. That second layer is why the
+/// bytes-survive assertions stay green under the revert, so they are the one
+/// thing here that is not evidence about `scan_complete`. Stated rather than
+/// assumed, because a test that cannot fail proves nothing.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_directory_inside_an_artifact_tree_keeps_it_ineligible() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = crate::storage::hygiene::tests::serial();
+    let (temp, _old, root) = fixture();
+    let mut service = Cleaner::new(
+        crate::engine::git_cli::canonicalize_plain(temp.path())
+            .unwrap()
+            .join("inside-state"),
+    );
+    service.activity_override = Some(|_| Ok(()));
+    let cleaner = Arc::new(service);
+
+    for name in ["complete", "unread"] {
+        let r = repo(&root, name);
+        fs::write(r.join(".gitignore"), "__pycache__/\n").unwrap();
+        fs::write(r.join("source.py"), "print('preserve')").unwrap();
+        crate::engine::git_cli::git_text(&r, &["add", "."]).unwrap();
+        crate::engine::git_cli::git_text(
+            &r,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        )
+        .unwrap();
+        fs::create_dir(r.join("__pycache__")).unwrap();
+        fs::write(r.join("__pycache__/module.pyc"), vec![b'x'; 100]).unwrap();
+        // The one difference from the sibling case: this subdirectory is under
+        // the artifact root, so the denial lands on the artifact's own budget.
+        let mut stamped = vec![r.join("__pycache__/module.pyc")];
+        if name == "unread" {
+            let blocked = r.join("__pycache__/blocked");
+            fs::create_dir(&blocked).unwrap();
+            fs::write(blocked.join("entry"), vec![b'x'; 100]).unwrap();
+            // Stamped old as well: a fresh mtime anywhere in the tree would
+            // make `require_age` refuse for being recently modified, and the
+            // test would pass without ever reaching the completeness check.
+            stamped.push(blocked.join("entry"));
+            stamped.push(blocked);
+        }
+        stamped.push(r.join("__pycache__"));
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86400);
+        for p in stamped {
+            fs::File::open(p)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(old))
+                .unwrap();
+        }
+    }
+    let blocked = root.join("unread/__pycache__/blocked");
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o0)).unwrap();
+
+    let saved = cleaner.save(config(&cleaner, &root)).unwrap();
+    cleaner
+        .cancel
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut run = CleanerRun {
+        id: "inside-run".into(),
+        trigger: "manual".into(),
+        started_at: crate::storage::hygiene::now(),
+        finished_at: 0,
+        status: "running".into(),
+        repositories: 0,
+        partial: false,
+        issues: vec![],
+        items: vec![],
+    };
+    cleaner
+        .update(|s| {
+            s.history.push(run.clone());
+            Ok(())
+        })
+        .unwrap();
+    let _run_lock = cleaner.lock("run.lock").unwrap();
+    let mut gated: Vec<String> = vec![];
+    let outcome = cleaner.perform_with_gate(&saved.config, &mut run, |repo, _, _| {
+        gated.push(repo.to_string());
+        Ok(())
+    });
+    // Restored before any assertion can unwind, so the temporary directory is
+    // always removable regardless of how this test ends.
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+    outcome.expect("one half-read tree must not fail the whole run");
+
+    assert!(
+        root.join("unread/__pycache__/module.pyc").is_file(),
+        "a tree the walk could not finish must not be removed"
+    );
+    assert!(
+        root.join("unread/__pycache__/blocked/entry").is_file(),
+        "nor anything inside the part it could not read"
+    );
+    assert!(
+        !root.join("complete/__pycache__").exists(),
+        "the tree that WAS read to the end is still removed: {:?}",
+        run.items
+    );
+    assert_eq!(
+        gated.len(),
+        1,
+        "only the fully enumerated tree reaches the removal gate: {gated:?}"
+    );
+    assert_eq!(
+        run.items.len(),
+        1,
+        "the half-read tree is never offered as a candidate, so nothing is \
+         attempted for it: {:?}",
+        run.items
+    );
+    assert!(
+        run.items[0].repo_path.ends_with("/complete"),
+        "{:?}",
+        run.items
+    );
+    assert!(
+        run.partial,
+        "a tree that could not be read in full makes the run partial"
+    );
+    assert!(
+        run.issues
+            .iter()
+            .any(|i| i.contains("Artifact tree not read in full") && i.ends_with("/unread")),
+        "the half-read tree must be named, not silently dropped: {:?}",
+        run.issues
+    );
+    assert_eq!(
+        run.status, "completed_with_skips",
+        "a run holding a tree it could not read claims no complete coverage"
+    );
+    assert!(root.join("unread/source.py").is_file());
+}
+
 /// The reconciliation, end to end, in the shape that motivated it.
 ///
 /// DevCouncil's repository scan is truncated for reasons that belong to the
