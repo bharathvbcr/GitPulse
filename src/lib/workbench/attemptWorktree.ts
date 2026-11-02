@@ -275,7 +275,7 @@ export async function reviewAttemptChanges(run: Pick<TaskRun, "id" | "cwd">): Pr
 }
 
 /** The outcome of an after-run action, as the row says it. `null`: the reader declined. */
-export type WorktreeActionResult = { message: string } | null;
+export type WorktreeActionResult = { message: string; worktreeRemoved: boolean } | null;
 
 const SQUASH_MODE = MERGE_MODES.find((mode) => mode.mode === "squash");
 
@@ -336,7 +336,7 @@ export async function mergeAttemptWorktree(run: AttemptRef, options: { expectedT
   if (merged.cleanup_error) parts.push(merged.cleanup_error);
   if (merged.sweep_problems?.length) parts.push(`Leftovers of earlier removals were not cleared: ${merged.sweep_problems.join("; ")}`);
   if (merged.hook_error) parts.push(`The post-merge hook failed: ${merged.hook_error}`);
-  return { message: parts.join(" ") };
+  return { message: parts.join(" "), worktreeRemoved: merged.worktree_removed === true };
 }
 
 /**
@@ -441,5 +441,5 @@ export async function discardAttemptWorktree(run: AttemptRef): Promise<WorktreeA
   } else if (own.branch) {
     parts.push(`Its branch ${own.branch} was kept.`);
   }
-  return { message: parts.join(" ") };
+  return { message: parts.join(" "), worktreeRemoved: true };
 }

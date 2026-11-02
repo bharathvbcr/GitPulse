@@ -28,6 +28,11 @@
   // No Git checkout contains the attempt's directory.
   let gitRootMissing = false;
   const worktreeCalls = [];
+  // A second attempt worktree that can be reviewed and landed: its listing row,
+  // whether the review is approved, and whether the host's merge succeeds.
+  const LAND_PATH = "/fixture/GitPulse/.gitpulse/worktrees/fix-e42-wt2lande", LAND_HEAD = "fed9876";
+  let landListed = false, landApproved = false, landMerges = false;
+  const landReview = () => ({run_id:"wt2landed",branch:"gitpulse/fix-e42-wt2lande",base_oid:"a".repeat(40),head_oid:LAND_HEAD,files_changed:1,ended:true,review:landApproved?{status:"approved",note:null}:{status:"unreviewed"},gate_on:true,gate_error:null});
   const preparations = [];
   // The ledger rows of the attempts' activity timelines, and the reads made.
   let ledgerRows = [];
@@ -136,9 +141,14 @@
       case "cmd_list_worktrees":worktreeCalls.push({cmd,...args});return [
         {path:"/fixture/GitPulse",name:"GitPulse",head:"abc1234",branch:"main",is_bare:false,is_detached:false,is_main:true,is_locked:false,is_prunable:false,dirty_files:0,diff_stat:null,main_divergence:null,active_routes:[]},
         {path:"/fixture/GitPulse/.gitpulse/worktrees/fix-e42-wt0attem",name:"fix-e42-wt0attem",head:"def5678",branch:"gitpulse/fix-e42-wt0attem",is_bare:false,is_detached:false,is_main:false,is_locked:false,is_prunable:false,dirty_files:2,diff_stat:null,main_divergence:null,active_routes:[]},
+        ...(landListed?[{path:LAND_PATH,name:"fix-e42-wt2lande",head:LAND_HEAD,branch:"gitpulse/fix-e42-wt2lande",is_bare:false,is_detached:false,is_main:false,is_locked:false,is_prunable:false,dirty_files:0,diff_stat:null,main_divergence:null,active_routes:[]}]:[]),
       ];
+      case "cmd_attempt_review":return landReview();
+      case "cmd_attempt_review_record":landApproved=args.decision==="approve";return landReview();
       // The backend lane refuses while a live run holds the worktree.
-      case "cmd_worktree_merge_teardown":worktreeCalls.push({cmd,...args});throw new Error("Claude Code is still working in this worktree (attempt wt0attempt). Stop it or wait for it to finish, then merge.");
+      case "cmd_worktree_merge_teardown":worktreeCalls.push({cmd,...args});
+        if (landMerges && args.worktreePath===LAND_PATH) { landListed=false; return {policy:null,output:{merged:true,merged_branch:"gitpulse/fix-e42-wt2lande",target_branch:"main",commits_merged:1,before_oid:"a",after_oid:"b",base_oid:null,worktree_removed:true,removal_error:null,branch_deleted:true,branch_error:null,hook_error:null}}; }
+        throw new Error("Claude Code is still working in this worktree (attempt wt0attempt). Stop it or wait for it to finish, then merge.");
       case "cmd_remove_worktree":worktreeCalls.push({cmd,...args});return {policy:null,output:null};
       case "cmd_delete_branch":worktreeCalls.push({cmd,...args});throw new Error("error: the branch 'gitpulse/fix-e42-wt0attem' is not fully merged");
       case "cmd_terminal_spawn":
@@ -803,6 +813,27 @@
         check("Discard removes the worktree from the main checkout, forced only for the changes it named, and never forces the branch",
           removal.repoPath==="/fixture/GitPulse"&&removal.targetPath===wtPath&&removal.force===true&&branchDelete.force===false
           &&row(attempt.id).querySelector('[data-testid="agent-run-message"]').textContent.includes("not fully merged"));
+        check("Once its worktree is removed the row stops offering Merge, Discard and Review changes for it",
+          !row(attempt.id).querySelector('[data-testid="agent-merge"]')&&!row(attempt.id).querySelector('[data-testid="agent-discard"]')&&!row(attempt.id).querySelector('[data-testid="agent-review"]'));
+        // ---- Landing from the review removes the worktree: the row must not offer it again ----
+        const landed={...template,id:"wt2landed",provider:"codex",state:"exited",session_id:null,exit_code:0,revision:2,cwd:LAND_PATH};
+        landListed=true;runs.set(landed.id,landed);button("Refresh").click();
+        await wait(()=>row(landed.id)?.querySelector('[data-testid="agent-merge"]'));
+        const inRow=text=>[...row(landed.id).querySelectorAll("button")].find(b=>b.textContent.trim()===text);
+        inRow("Merge review").click();
+        await wait(()=>inRow("Approve for merge"));
+        inRow("Approve for merge").click();
+        await wait(()=>inRow("Land and clean up"));
+        check("Before landing, the row offers Merge and Discard for the worktree that is still there",
+          !!row(landed.id).querySelector('[data-testid="agent-merge"]')&&!!row(landed.id).querySelector('[data-testid="agent-discard"]'));
+        landMerges=true;
+        inRow("Land and clean up").click();
+        await wait(()=>read(promptState));completePrompt(true);
+        await wait(()=>row(landed.id)?.querySelector('[data-testid="attempt-landed"]'));
+        check("After Land and clean up the row no longer offers Merge, Discard or Review changes for the removed worktree",
+          !row(landed.id).querySelector('[data-testid="agent-merge"]')&&!row(landed.id).querySelector('[data-testid="agent-discard"]')&&!row(landed.id).querySelector('[data-testid="agent-review"]'));
+        check("and what landing said stays on the row",/Squashed|Merged/i.test(row(landed.id).querySelector('[data-testid="attempt-landed"]').textContent));
+        landMerges=false;runs.delete(landed.id);
         runs.delete(attempt.id);runs.delete(other.id);button("Refresh").click();await pause(100);
         stopToasts();
       }

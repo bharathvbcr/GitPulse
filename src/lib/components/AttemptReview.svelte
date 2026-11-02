@@ -4,7 +4,9 @@
   import { readAttemptReview, recordAttemptReview, reviewSummary, setReviewGate, type AttemptReview, type ReviewDecision } from "../workbench/attemptReview";
   import { attemptDirtyFiles, mergeAttemptWorktree, openAttemptDiff, reviewAttemptUncommitted, type AttemptDiffOpening } from "../workbench/attemptWorktree";
   import { plural } from "../format";
-  let { run }: { run: TaskRun } = $props();
+  import { diagnostics, formatDiagnosticFailure } from "../diagnostics/diagnostics";
+  /** `onlanded` is told once the worktree is gone, so the page around this can stop offering it. */
+  let { run, onlanded }: { run: TaskRun; onlanded?: () => void } = $props();
   let view = $state<AttemptReview | null>(null), note = $state(""), busy = $state(false), error = $state("");
   /** Files the checkout holds uncommitted: null when they could not be counted, which is not "none". */
   let dirty = $state<number | null>(null);
@@ -21,7 +23,10 @@
   async function read(): Promise<AttemptReview> {
     const next = await readAttemptReview(run.id);
     // Counted with the review so "Uncommitted files" is offered for what is there; a count that fails is unknown, not zero.
-    const count = await attemptDirtyFiles(run).catch(() => null);
+    const count = await attemptDirtyFiles(run).catch((cause: unknown) => {
+      diagnostics.warn("attempt-review", `Uncommitted files of ${run.cwd} could not be counted: ${formatDiagnosticFailure(cause)}`);
+      return null;
+    });
     if (!disposed) dirty = count;
     return next;
   }
@@ -44,7 +49,11 @@
     if (!current) return;
     return step(async () => {
       const result = await mergeAttemptWorktree(run, { expectedTip: current.head_oid });
-      if (result && !disposed) landed = result.message;
+      if (!result) return;
+      // Told even when this view is gone: the worktree is removed either way.
+      // A merge whose removal did not complete leaves it, and says nothing.
+      if (result.worktreeRemoved) onlanded?.();
+      if (!disposed) landed = result.message;
     });
   }
   const undecided = $derived(view?.ended === true && (view.review.status === "unreviewed" || view.review.status === "stale"));

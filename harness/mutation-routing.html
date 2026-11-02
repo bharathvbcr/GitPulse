@@ -56,7 +56,7 @@ mockIPCWithEvents(async (cmd, args) => {
     case "cmd_get_commit_graph": return { nodes: [], edges: [], total_commits: 0, truncated: false };
     case "cmd_task_view": return { available: false, store_path: "", leases: [], error: "" };
     case "cmd_worktree_task": return null;
-    case "cmd_list_worktrees": return [
+    case "cmd_list_worktrees": if (args.depth === "dirty" && failNext.dirtyList) { delete failNext.dirtyList; throw new Error("dirty listing refused by fixture"); } return [
       { path: args.repoPath, name: "main", branch: "main", head: "f".repeat(40), is_main: true, is_bare: false, is_detached: false, is_locked: false, is_prunable: false, dirty_files: 0 },
       { path: `${args.repoPath}/.claude/worktrees/lane`, name: "lane", branch: "claude/lane", head: "b".repeat(40), is_main: false, is_bare: false, is_detached: false, is_locked: locked.has(`${args.repoPath}/.claude/worktrees/lane`), is_prunable: false, dirty_files: 0 },
       { path: `${args.repoPath}/.claude/worktrees/att`, name: "att", branch: "gitpulse/att", head: "c".repeat(40), is_main: false, is_bare: false, is_detached: false, is_locked: false, is_prunable: false, dirty_files: 0 },
@@ -90,6 +90,7 @@ const { get } = await import("svelte/store");
 const { repoStore } = await import("../src/lib/stores/repoStore");
 const { harnessStore } = await import("../src/lib/stores/harnessStore");
 const { toastStore } = await import("../src/lib/stores/toastStore");
+const { diagnostics } = await import("../src/lib/diagnostics/diagnostics");
 const { promptState, completePrompt } = await import("../src/lib/stores/modalStore");
 const { discardAttemptWorktree } = await import("../src/lib/workbench/attemptWorktree");
 const { gitActionCount } = await import("../src/lib/desktop/exitGuard");
@@ -432,8 +433,14 @@ const sentTo = cmd => sent.filter(s => s.cmd === cmd);
   harnessStore.activateRepository(B);
   const q = testid => document.querySelector(`[data-testid="${testid}"]`);
   const notices = () => [...document.querySelectorAll('[data-testid="attempt-diff-notice"]')].map(n => n.textContent);
+  // a dirty count that cannot be read is unknown, offered as such, and its reason is recorded
+  failNext.dirtyList = true;
   button("Merge review").click();
   await until(() => q("attempt-view-diff"), "the review loaded with its diff control");
+  check("a dirty count that could not be read offers Uncommitted files as unknown, not as none", () => /Uncommitted files$/.test(q("attempt-view-uncommitted")?.textContent.trim() ?? ""));
+  check("and its reason is in Diagnostics, not dropped", () => get(diagnostics).some(entry => entry.source === "attempt-review" && entry.message.includes("dirty listing refused by fixture")));
+  button("Refresh review").click();
+  await until(() => !q("attempt-view-uncommitted"), "the review re-read with a countable checkout");
   check("View diff names how many files the attempt changed", () => q("attempt-view-diff").textContent.includes("View diff (2 files)"));
   check("Uncommitted files is not offered for a checkout with none", () => !q("attempt-view-uncommitted"));
   rangeTruncated = true;
