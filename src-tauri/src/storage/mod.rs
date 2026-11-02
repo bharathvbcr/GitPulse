@@ -3169,7 +3169,6 @@ mod tests {
         );
     }
 
-
     /// Builds a walk context and walks `root`, returning the collector so a
     /// test can ask what each artifact scope concluded about itself.
     fn walk_artifacts(root: &Path, budget: &mut WalkBudget) -> ArtifactCollector {

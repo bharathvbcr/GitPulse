@@ -528,9 +528,9 @@ impl Cleaner {
                     if report.artifacts.iter().any(|a| !a.scan_complete) {
                         result.partial = true;
                         if result.issues.len() < 128 {
-                            result.issues.push(format!(
-                                "Artifact tree not read in full: {repo_path}"
-                            ));
+                            result
+                                .issues
+                                .push(format!("Artifact tree not read in full: {repo_path}"));
                         }
                     }
                     if report.scan.truncated || report.scan.permission_denied > 0 {

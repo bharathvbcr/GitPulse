@@ -418,7 +418,7 @@ fn global_cleanup_uses_real_snapshots_and_removal_with_exact_limits() {
     // Only OS process activity is injected: the test itself runs under Cargo.
     // Discovery, Git status/index, journal and removal are real. The policy
     // service is injected at the same gate called by production.
-    let _serial = crate::storage::hygiene::tests::TEST_LOCK.lock().unwrap();
+    let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
         crate::engine::git_cli::canonicalize_plain(temp.path())
@@ -616,7 +616,7 @@ fn turning_off_background_mode_revokes_before_unloading_and_plain_saves_do_not_r
 #[cfg(unix)]
 #[test]
 fn policy_edits_inside_the_execution_gate_preserve_real_artifacts() {
-    let _serial = crate::storage::hygiene::tests::TEST_LOCK.lock().unwrap();
+    let _serial = crate::storage::hygiene::tests::serial();
     let (_temp, mut cleaner, root) = fixture();
     Arc::get_mut(&mut cleaner).unwrap().activity_override = Some(|_| Ok(()));
     let r = repo(&root, "repo");
@@ -887,7 +887,7 @@ fn every_candidate_from_an_unread_repository_is_filtered_out() {
 #[test]
 fn an_unreadable_repository_does_not_stop_cleanup_of_a_readable_one() {
     use std::os::unix::fs::PermissionsExt;
-    let _serial = crate::storage::hygiene::tests::TEST_LOCK.lock().unwrap();
+    let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
         crate::engine::git_cli::canonicalize_plain(temp.path())
@@ -1032,7 +1032,7 @@ fn an_unreadable_repository_does_not_stop_cleanup_of_a_readable_one() {
 #[cfg(unix)]
 #[test]
 fn a_truncated_repository_scan_still_cleans_a_tree_that_was_read_in_full() {
-    let _serial = crate::storage::hygiene::tests::TEST_LOCK.lock().unwrap();
+    let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
         crate::engine::git_cli::canonicalize_plain(temp.path())
@@ -1189,7 +1189,7 @@ fn a_truncated_repository_scan_still_cleans_a_tree_that_was_read_in_full() {
 #[test]
 fn a_workspace_whose_every_tree_was_cut_short_refuses_instead_of_reporting_success() {
     use std::os::unix::fs::PermissionsExt;
-    let _serial = crate::storage::hygiene::tests::TEST_LOCK.lock().unwrap();
+    let _serial = crate::storage::hygiene::tests::serial();
     let (temp, _old, root) = fixture();
     let mut service = Cleaner::new(
         crate::engine::git_cli::canonicalize_plain(temp.path())
