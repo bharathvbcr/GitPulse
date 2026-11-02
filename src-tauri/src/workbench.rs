@@ -20,6 +20,7 @@ pub(crate) mod conversation;
 pub mod external_changes;
 mod in_flight;
 pub(crate) mod intake;
+mod lineage;
 mod managed_run;
 pub(crate) mod notifications;
 pub(crate) mod process_birth;
@@ -563,6 +564,15 @@ impl WorkbenchState {
                 &verification_driver::HostBackend(self.clone()),
                 &ids,
             );
+        }
+        // Each card's parent and subtask progress. The card list omits links,
+        // so this is the one read over them; like the verdict read above it
+        // opens read-only, so a view the board takes on every refresh commits
+        // nothing and cannot contend for the profile's write lock.
+        if method == "items.lineage" {
+            let store = Store::open_readonly(&self.profile_path()?)
+                .map_err(|e| WorkbenchError::new("store_error", e.to_string()))?;
+            return lineage::read(&store, input);
         }
         if method == "verifications.status" || method == "verifications.run" {
             let parsed: Value = serde_json::from_str(input)

@@ -118,13 +118,48 @@ pub struct LiveSession {
     /// The agent's own last-reported state (`busy`, `idle`, …), verbatim.
     pub status: String,
     pub cwd: String,
+    /// The GitPulse launch this process belongs to — `session:<terminal id>`
+    /// or `run:<attempt id>` — when GitPulse started it or something above it.
+    /// Absent for a session the process table could not tie to a launch, and
+    /// for every session read from a registry, which has no such fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
+    /// The task attempt that launched it, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// The nearest agent session above this one in the process tree, found
+    /// through any shells between them. Absent is "none the scan could see",
+    /// which is not "started by a person". It names a session of the same
+    /// observation, though not necessarily one in this worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_pid: Option<u32>,
+}
+
+/// One session in the forest [`LiveWorktree::children`] holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveSessionNode {
+    pub pid: u32,
+    pub kind: String,
+    pub children: Vec<LiveSessionNode>,
 }
 
 /// The live sessions whose working directory is inside one worktree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveWorktree {
     pub path: String,
+    /// Every session in the worktree, flat and counted once. Nesting changes
+    /// none of the counts.
     pub sessions: Vec<LiveSession>,
+    /// The sessions that sit under another session of this worktree, nested
+    /// under it: a forest whose roots are the sessions that have a child here.
+    /// A session whose parent is in another worktree (or in none this
+    /// repository lists) is not nested here; its `parent_pid` still names it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<LiveSessionNode>,
+    /// True when `children` stopped descending at its depth bound; the deeper
+    /// sessions are in `sessions` with their `parent_pid`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub children_truncated: bool,
 }
 
 /// What one agent kind's detector established for this repository.

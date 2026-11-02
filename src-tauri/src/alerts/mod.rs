@@ -118,6 +118,10 @@ pub struct Notice {
     pub subject: Option<String>,
     /// Reported from inside a subagent rather than the session's main agent.
     pub subagent: bool,
+    /// Which subagent, when the report named it (`bridge::valid_key`). Identity
+    /// only: coalescing and policy still read `subagent`, so an id never
+    /// changes what a notice does.
+    pub agent_id: Option<String>,
 }
 
 impl Notice {
@@ -603,6 +607,7 @@ pub fn answer(session: &str) -> Result<(), &'static str> {
         channel: "reader",
         subject: None,
         subagent: false,
+        agent_id: None,
     })
     .taken();
     if taken {

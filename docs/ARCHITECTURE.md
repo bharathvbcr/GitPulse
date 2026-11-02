@@ -444,7 +444,7 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 | Contract Tool | Command | Description |
 | --- | --- | --- |
 | **IPC Checker** | `bun run check:ipc` | Verifies all 291 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
-| **Type Sync Checker** | `bun run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 1860 data fields, over 259 structs, in 105 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
+| **Type Sync Checker** | `bun run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 1869 data fields, over 260 structs, in 105 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
 | **Release Version Gate** | `bun run check:release` | Validates that `package.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, and every discovered plugin manifest agree. Plugin manifests are found under `plugins/<name>/` rather than hardcoded, because one package ships a manifest per agent client and the newest one is the likeliest to be missed. |
 | **MCP Install Doctor** | `bun run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH — the binary the plugin manifests spawn — and asserts both its version and its manifest's store schema match this tree, then asks what source both binaries were built from against the digest `mcp:install` recorded. Version is the release identity and cannot see a fix that landed between releases; the digest can. Missing schema identity is unresponsive, never a pass, and an unrecorded install is *unverifiable*, never an OK. Reports *absent*, *unresponsive*, *stale*, and *unverifiable* as distinct failures. |
 
@@ -727,10 +727,20 @@ pages `items.list` one open column at a time (bounded at 2,000 open cards, with
 `scan_complete` reporting whether that was all of them) and treats a card as
 related when it shares two significant title words, or one and a label that is
 not that same word. Any related card not named in `reviewed_related` refuses the
-add as `related_tasks_exist`. `place` accepts a board item id as the key under
+add as `related_tasks_exist`, except the card the call names as its
+`parent_task_id`: a subtask shares its parent's words by construction, so the
+parent is read by being named and is exempt from that match. `place` accepts a board item id as the key under
 `replace`, so related work can be folded into a card the person made on the
 board; `keep_unsent` keeps every field the call did not send, so a fold-in never
 resets the person's status, priority, owner, criteria or logs.
+`workbench/lineage.rs` answers `items.lineage`: for a bounded batch of card ids
+(at most 256, refused rather than cut), one read-only query over the store's
+`parent` links returns each live card's live parent and how many of its live
+subtasks are `done`. The card list omits `links`, so this is how the board
+(`lineage.ts`, drawn by `TaskBoard.svelte`) shows "Subtask of ..." and "N of M
+subtasks done". A card the store does not hold is left out of the answer and a
+failed read throws; the board shows both as unknown and says so, never as
+"0 of 0".
 Real Git tests cover linked worktrees, distinct clones, malformed/bare/unavailable
 checkouts, unborn/broken HEAD, changed sources, and branch changes at the same
 commit. Observations do not lock external Git writers or identify an otherwise

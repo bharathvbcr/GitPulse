@@ -22,7 +22,7 @@
 //! is reported as unknown, never as zero sessions: "we cannot see Codex
 //! sessions" and "no Codex session is running" are different facts.
 
-use super::{LiveKindStatus, LiveSession, LiveSessionFacet, LiveWorktree};
+use super::{LiveKindStatus, LiveSession, LiveSessionFacet, LiveSessionNode, LiveWorktree};
 use crate::workbench::process_birth::{self, Liveness};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -163,6 +163,9 @@ pub(crate) fn from_scan(
             entrypoint: entry.map(|e| e.entrypoint.clone()).unwrap_or_default(),
             status: entry.map(|e| e.status.clone()).unwrap_or_default(),
             cwd: cwd.clone(),
+            tree: session.tree.clone(),
+            run_id: session.run_id.clone(),
+            parent_pid: session.parent_pid.and_then(|pid| u32::try_from(pid).ok()),
         });
     }
     kinds
@@ -323,6 +326,10 @@ fn read_claude_registry(dir: &Path, alive: &dyn Fn(u32, u128) -> Liveness) -> Ki
                 entrypoint: entry.entrypoint,
                 status: entry.status,
                 cwd: entry.cwd,
+                // A registry entry says nothing about launch or lineage.
+                tree: None,
+                run_id: None,
+                parent_pid: None,
             }),
             // Claude Code removes an entry when its session exits cleanly; one
             // left behind by a crash names a process that is gone.
@@ -397,6 +404,8 @@ pub(crate) fn attribute(observation: &Observation, worktree_paths: &[String]) ->
                 None => worktrees.push(LiveWorktree {
                     path: owner.to_string(),
                     sessions: vec![session.clone()],
+                    children: Vec::new(),
+                    children_truncated: false,
                 }),
             }
         }
@@ -421,6 +430,7 @@ pub(crate) fn attribute(observation: &Observation, worktree_paths: &[String]) ->
     }
     for row in &mut worktrees {
         row.sessions.sort_by_key(|s| s.pid);
+        (row.children, row.children_truncated) = nest(&row.sessions);
     }
     worktrees.sort_by(|a, b| a.path.cmp(&b.path));
     let sessions = kinds.iter().map(|k| k.sessions).sum();
@@ -431,6 +441,94 @@ pub(crate) fn attribute(observation: &Observation, worktree_paths: &[String]) ->
         sessions,
         kinds,
         worktrees,
+    }
+}
+
+/// How deep [`nest`] descends. Real agent trees are a few levels (Manvi bounds
+/// its own spawn depth); the bound keeps the output's recursion shallow for the
+/// readers that parse it, and a tree past it says so.
+pub(crate) const MAX_NEST_DEPTH: usize = 16;
+
+/// The sessions of one worktree that sit under another session of the same
+/// worktree, nested under it, and whether the depth bound cut any.
+///
+/// A root is a session with at least one child here. A parent that is not in
+/// `sessions` (another worktree, another repository, a pid the scan did not
+/// keep) leaves its child a root of its own rather than a node of anything,
+/// and a parent chain that loops back on itself is entered once, at the
+/// lowest pid, and cut where it would repeat — so every session appears at
+/// most once and the walk ends.
+fn nest(sessions: &[LiveSession]) -> (Vec<LiveSessionNode>, bool) {
+    let index: std::collections::HashMap<u32, usize> = sessions
+        .iter()
+        .enumerate()
+        .map(|(at, session)| (session.pid, at))
+        .collect();
+    let mut kids: Vec<Vec<usize>> = vec![Vec::new(); sessions.len()];
+    let mut has_parent = vec![false; sessions.len()];
+    for (at, session) in sessions.iter().enumerate() {
+        let Some(&parent) = session.parent_pid.and_then(|pid| index.get(&pid)) else {
+            continue;
+        };
+        if parent == at {
+            continue;
+        }
+        kids[parent].push(at);
+        has_parent[at] = true;
+    }
+    let mut placed = vec![false; sessions.len()];
+    let mut truncated = false;
+    let mut forest = Vec::new();
+    let order = (0..sessions.len())
+        .filter(|at| !has_parent[*at])
+        .chain((0..sessions.len()).filter(|at| has_parent[*at]));
+    for root in order {
+        if placed[root] || kids[root].is_empty() {
+            continue;
+        }
+        forest.push(node(root, 1, sessions, &kids, &mut placed, &mut truncated));
+    }
+    (forest, truncated)
+}
+
+fn node(
+    at: usize,
+    depth: usize,
+    sessions: &[LiveSession],
+    kids: &[Vec<usize>],
+    placed: &mut [bool],
+    truncated: &mut bool,
+) -> LiveSessionNode {
+    placed[at] = true;
+    let mut children = Vec::new();
+    for &child in &kids[at] {
+        if placed[child] {
+            continue;
+        }
+        if depth >= MAX_NEST_DEPTH {
+            // Cut here, and keep the rest of the subtree from resurfacing as
+            // a root of its own further on.
+            *truncated = true;
+            hide(child, kids, placed);
+            continue;
+        }
+        children.push(node(child, depth + 1, sessions, kids, placed, truncated));
+    }
+    LiveSessionNode {
+        pid: sessions[at].pid,
+        kind: sessions[at].kind.clone(),
+        children,
+    }
+}
+
+/// Marks `at` and everything under it placed without emitting it.
+fn hide(at: usize, kids: &[Vec<usize>], placed: &mut [bool]) {
+    let mut stack = vec![at];
+    while let Some(next) = stack.pop() {
+        if std::mem::replace(&mut placed[next], true) {
+            continue;
+        }
+        stack.extend(kids[next].iter().copied());
     }
 }
 
@@ -632,6 +730,7 @@ mod tests {
             cwd: cwd.map(|c| c.to_string_lossy().into_owned()),
             tree: None,
             run_id: None,
+            parent_pid: None,
             footprint: crate::sysload::Reading::Value(1),
             members: 1,
             unreadable_members: 0,
@@ -780,6 +879,177 @@ mod tests {
         let claude = facet.kinds.iter().find(|k| k.kind == "claude").unwrap();
         assert_eq!(claude.sessions, 3, "{facet:?}");
         assert!(claude.ok, "{facet:?}");
+    }
+
+    fn child_of(
+        mut session: crate::sysload::AgentSession,
+        parent: i32,
+    ) -> crate::sysload::AgentSession {
+        session.parent_pid = Some(parent);
+        session
+    }
+
+    fn pids(nodes: &[LiveSessionNode]) -> Vec<(u32, Vec<u32>)> {
+        nodes
+            .iter()
+            .map(|n| (n.pid, n.children.iter().map(|c| c.pid).collect()))
+            .collect()
+    }
+
+    /// The process scan already knew each session's launch and ancestor; the
+    /// facet used to drop both on the way in.
+    #[test]
+    fn the_scan_s_launch_and_ancestor_reach_the_live_session() {
+        use crate::sysload::AgentKind;
+        let repo = tempfile::TempDir::new().unwrap();
+        let mut launched = scanned(AgentKind::Claude, 700, Some(repo.path()));
+        launched.tree = Some("run:run-3".into());
+        launched.run_id = Some("run-3".into());
+        let child = child_of(scanned(AgentKind::Codex, 701, Some(repo.path())), 700);
+        let seen = from_scan(&[launched, child], &[]);
+        let claude = seen.iter().find(|k| k.kind == "claude").unwrap();
+        assert_eq!(claude.live[0].tree.as_deref(), Some("run:run-3"));
+        assert_eq!(claude.live[0].run_id.as_deref(), Some("run-3"));
+        assert_eq!(claude.live[0].parent_pid, None);
+        let codex = seen.iter().find(|k| k.kind == "codex").unwrap();
+        assert_eq!(codex.live[0].parent_pid, Some(700));
+        assert_eq!(codex.live[0].tree, None);
+    }
+
+    /// Nesting is a second view of the same sessions: the flat list and every
+    /// count are what they were without it.
+    #[test]
+    fn a_child_nests_under_its_parent_and_no_count_changes() {
+        use crate::sysload::AgentKind;
+        let repo = tempfile::TempDir::new().unwrap();
+        let root = repo.path();
+        let sessions = [
+            scanned(AgentKind::Claude, 800, Some(root)),
+            child_of(scanned(AgentKind::Claude, 801, Some(root)), 800),
+            child_of(scanned(AgentKind::Codex, 802, Some(root)), 801),
+            child_of(scanned(AgentKind::Claude, 803, Some(root)), 800),
+            scanned(AgentKind::Claude, 804, Some(root)),
+        ];
+        let seen = from_scan(&sessions, &[]);
+        let facet = attribute(&seen, &[root.to_string_lossy().into_owned()]);
+        assert_eq!(facet.sessions, 5, "{facet:?}");
+        let row = &facet.worktrees[0];
+        assert_eq!(
+            row.sessions.iter().map(|s| s.pid).collect::<Vec<_>>(),
+            [800, 801, 802, 803, 804]
+        );
+        assert_eq!(pids(&row.children), [(800, vec![801, 803])]);
+        assert_eq!(pids(&row.children[0].children[0].children), [(802, vec![])]);
+        assert_eq!(row.children[0].children[0].children[0].kind, "codex");
+        assert!(!row.children_truncated);
+        let claude = facet.kinds.iter().find(|k| k.kind == "claude").unwrap();
+        let codex = facet.kinds.iter().find(|k| k.kind == "codex").unwrap();
+        assert_eq!((claude.sessions, codex.sessions), (4, 1));
+        assert!(facet.ok);
+    }
+
+    /// A parent in another worktree is not a node here, and a child whose
+    /// parent was never seen stays a plain session with its `parent_pid`.
+    #[test]
+    fn a_parent_outside_the_worktree_is_not_nested_here() {
+        use crate::sysload::AgentKind;
+        let repo = tempfile::TempDir::new().unwrap();
+        let main = repo.path().to_path_buf();
+        let linked = main.join(".claude/worktrees/lane");
+        fs::create_dir_all(&linked).unwrap();
+        let sessions = [
+            scanned(AgentKind::Claude, 810, Some(&main)),
+            child_of(scanned(AgentKind::Claude, 811, Some(&linked)), 810),
+            child_of(scanned(AgentKind::Claude, 812, Some(&linked)), 9_999),
+        ];
+        let seen = from_scan(&sessions, &[]);
+        let facet = attribute(
+            &seen,
+            &[
+                main.to_string_lossy().into_owned(),
+                linked.to_string_lossy().into_owned(),
+            ],
+        );
+        assert_eq!(facet.sessions, 3);
+        for row in &facet.worktrees {
+            assert!(row.children.is_empty(), "{row:?}");
+        }
+        let lane = facet
+            .worktrees
+            .iter()
+            .find(|w| Path::new(&w.path) == linked)
+            .unwrap();
+        let by_pid = |pid| lane.sessions.iter().find(|s| s.pid == pid).unwrap();
+        assert_eq!(by_pid(811).parent_pid, Some(810));
+        assert_eq!(by_pid(812).parent_pid, Some(9_999));
+    }
+
+    /// Lineage that loops, or points at itself, still ends: each session is
+    /// placed at most once and nothing recurses without bound.
+    #[test]
+    fn a_looping_or_self_parent_chain_terminates_with_each_session_once() {
+        use crate::sysload::AgentKind;
+        let repo = tempfile::TempDir::new().unwrap();
+        let root = repo.path();
+        let sessions = [
+            child_of(scanned(AgentKind::Claude, 820, Some(root)), 821),
+            child_of(scanned(AgentKind::Claude, 821, Some(root)), 820),
+            child_of(scanned(AgentKind::Claude, 822, Some(root)), 822),
+        ];
+        let seen = from_scan(&sessions, &[]);
+        let facet = attribute(&seen, &[root.to_string_lossy().into_owned()]);
+        let row = &facet.worktrees[0];
+        assert_eq!(facet.sessions, 3);
+        assert_eq!(pids(&row.children), [(820, vec![821])]);
+    }
+
+    #[test]
+    fn nesting_stops_at_its_depth_bound_and_says_so() {
+        use crate::sysload::AgentKind;
+        let repo = tempfile::TempDir::new().unwrap();
+        let root = repo.path();
+        let depth = MAX_NEST_DEPTH as i32 + 4;
+        let sessions: Vec<_> = (0..depth)
+            .map(|n| {
+                let session = scanned(AgentKind::Claude, 900 + n, Some(root));
+                if n == 0 {
+                    session
+                } else {
+                    child_of(session, 900 + n - 1)
+                }
+            })
+            .collect();
+        let seen = from_scan(&sessions, &[]);
+        let facet = attribute(&seen, &[root.to_string_lossy().into_owned()]);
+        let row = &facet.worktrees[0];
+        assert!(row.children_truncated, "{row:?}");
+        assert_eq!(row.sessions.len() as i32, depth, "the flat list is whole");
+        let mut levels = 0;
+        let mut at = &row.children[0];
+        loop {
+            levels += 1;
+            match at.children.first() {
+                Some(next) => at = next,
+                None => break,
+            }
+        }
+        assert_eq!(levels, MAX_NEST_DEPTH);
+    }
+
+    /// A registry knows nothing about lineage, and says nothing rather than
+    /// "no parent".
+    #[test]
+    fn a_registry_session_has_no_lineage() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let reg = registry(&[("1.json", entry(910, repo.path(), 1))]);
+        let seen = observe_with(Some(reg.path()), &always(Liveness::Alive));
+        let facet = attribute(&seen, &[repo.path().to_string_lossy().into_owned()]);
+        let session = &facet.worktrees[0].sessions[0];
+        assert_eq!(
+            (&session.tree, &session.run_id, session.parent_pid),
+            (&None, &None, None)
+        );
+        assert!(facet.worktrees[0].children.is_empty());
     }
 
     /// A config-directory list that could not be completed fails the kind: a

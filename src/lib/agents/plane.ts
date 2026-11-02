@@ -22,6 +22,19 @@
  * directory that is known and outside every checkout belongs to none of them,
  * whatever tab the process was opened from. One repository read through two
  * of its own checkouts is one repository: each checkout appears once.
+ *
+ * Rows nest. A terminal that continues an attempt sits under the attempt's
+ * row, and a child agent process (one the process table shows under another
+ * session, found through any shells between) sits under the row of the session
+ * above it: the terminal or attempt whose launch id it carries, else the agent
+ * checkout its directory is in. `rows` stays the flat list of checkout,
+ * terminal and attempt rows, each once, so no count moves; `roots` is the same
+ * rows as a tree, and a child process is a row only there. A parent's own
+ * presence and attention stay its own, and `rollup` says what lies under it.
+ * A child process nothing here observes has `attentionObserved: false`: its
+ * empty attention is unknown, not quiet. The plane has no source for subagents
+ * inside one process (the hook's `agent_id` reaches the native notifier, not
+ * this view), so it shows none rather than infer them.
  */
 
 import type { InsightsSnapshot, WorktreeSummary } from "../insights/types";
@@ -119,8 +132,12 @@ const REASON_LABEL: Record<AttentionReason, string> = {
  */
 export type AgentPresence = "live" | "exited" | "on-disk" | "missing";
 
-/** Which source a row was first drawn from. A checkout row stays one when a terminal joins it. */
-export type AgentOrigin = "checkout" | "terminal" | "task";
+/**
+ * Which source a row was first drawn from. A checkout row stays one when a
+ * terminal joins it. `session` is a child agent process the process table
+ * shows under another session: it exists only nested under its parent.
+ */
+export type AgentOrigin = "checkout" | "terminal" | "task" | "session";
 
 export type GapKind = "failed" | "skipped" | "unread" | "partial";
 
@@ -188,8 +205,39 @@ export interface PlaneInput {
   paths: PathIdentityOptions;
 }
 
+/**
+ * What lies under a row, rolled up. A row's own `presence` and `attention`
+ * stay its own: a parent that is quiet while a child asks for the reader is
+ * not itself asking, and the plane says both.
+ */
+export interface AgentRollup {
+  /** Rows nested anywhere under this one. */
+  descendants: number;
+  /** Of those, how many are live. */
+  live: number;
+  /** The reasons any of them stands for, most urgent first. */
+  attention: AttentionReason[];
+  /** Descendants whose attention nothing observes (a process the table shows, with no terminal here). */
+  unobserved: number;
+}
+
 export interface AgentRow {
   id: string;
+  /**
+   * The row this one is nested under, or null for a root. A terminal that
+   * continues an attempt nests under the attempt's row; a child agent process
+   * nests under the session whose process tree it is in.
+   */
+  parentId: string | null;
+  /** Direct children, in display order. Empty for a leaf. */
+  children: AgentRow[];
+  rollup: AgentRollup;
+  /**
+   * False when nothing here observes what this row asks for: a child process
+   * the table shows, with no terminal or attempt of this window behind it. Its
+   * empty `attention` is then unknown, not quiet.
+   */
+  attentionObserved: boolean;
   /** The repository's path. Empty for an attempt whose repository could not be resolved. */
   repoPath: string;
   repoLabel: string;
@@ -218,7 +266,19 @@ export interface AgentRow {
 }
 
 export interface AgentPlane {
+  /**
+   * Every checkout, terminal and attempt row, flat, each once. A row nested
+   * under another is here too: counts and filters over `rows` are unchanged by
+   * nesting. Child agent processes are not here; they exist only under a
+   * parent's `children`.
+   */
   rows: AgentRow[];
+  /** The rows of `rows` with no parent among them, children attached: what a tree view draws. */
+  roots: AgentRow[];
+  /** Child agent processes placed under a row. */
+  childSessions: number;
+  /** Child agent processes seen with no row to put them under. Their count is not lost; their place is unknown. */
+  unplacedSessions: number;
   shown: number;
   total: number;
   /** True when `rows` is shorter than the rows that were found. */
@@ -269,6 +329,12 @@ interface Draft {
   parallelFloor: boolean;
   /** Agent-summary session count for this repository, when the summary ran. */
   diskSessions: number | null;
+  /** The terminal's backend session id: what a launched process's `session:<id>` tree names. */
+  sessionId: string | null;
+  /** Whether the terminal behind this row launched its run (`attempt`) or continues one. */
+  runRole: "attempt" | "continuation" | null;
+  /** The draft this one nests under. Set after the attempts are folded. */
+  parent: Draft | null;
 }
 
 /** One repository, however many of its checkouts were probed. */
@@ -491,8 +557,14 @@ function attach(draft: Draft, terminal: PlaneTerminal): void {
   draft.presence = live ? "live" : "exited";
   draft.presenceDetail = live ? LIVE_DETAIL : EXITED_DETAIL;
   draft.liveKey = terminal.key;
-  if (terminal.taskRunId) draft.taskRunId = terminal.taskRunId;
-  else if (terminal.continuesRunId && !draft.taskRunId) draft.taskRunId = terminal.continuesRunId;
+  draft.sessionId = terminal.sessionId || null;
+  if (terminal.taskRunId) {
+    draft.taskRunId = terminal.taskRunId;
+    draft.runRole = "attempt";
+  } else if (terminal.continuesRunId) {
+    if (!draft.taskRunId) draft.taskRunId = terminal.continuesRunId;
+    draft.runRole = "continuation";
+  }
   for (const reason of terminalReasons(terminal)) draft.attention.add(reason);
   const title = clean(terminal.title || terminal.label, 80);
   if (title && draft.session === draft.kind) draft.session = title;
@@ -520,6 +592,9 @@ function fromCheckout(family: Family, item: WorktreeSummary, collisions: Set<str
     dirtyKnown: item.dirty_files !== null,
     parallelFloor: family.floor,
     diskSessions: family.diskSessions,
+    sessionId: null,
+    runRole: null,
+    parent: null,
   };
 }
 
@@ -555,6 +630,9 @@ function fromTerminal(terminal: PlaneTerminal, cwd: string | null, places: Reado
     dirtyKnown: false,
     parallelFloor: false,
     diskSessions: null,
+    sessionId: null,
+    runRole: null,
+    parent: null,
   };
 }
 
@@ -601,12 +679,193 @@ function fromTask(task: PlaneTask, places: ReadonlyMap<string, Place>, paths: Pa
     dirtyKnown: false,
     parallelFloor: false,
     diskSessions: null,
+    sessionId: null,
+    runRole: null,
+    parent: null,
   };
 }
 
 /** True when this read listed every worktree and counted every agent. */
 function completeRead(snapshot: InsightsSnapshot): boolean {
   return snapshot.agents.ok && !snapshot.agents.truncated && !snapshot.worktrees.truncated;
+}
+
+const EMPTY_ROLLUP: AgentRollup = Object.freeze({ descendants: 0, live: 0, attention: [] as AttentionReason[], unobserved: 0 });
+
+/** Most urgent first, then by repository, kind and name: the order rows and a row's children are shown in. */
+function compareRows(a: AgentRow, b: AgentRow): number {
+  return urgentRank(a.attention) - urgentRank(b.attention)
+    || a.repoLabel.localeCompare(b.repoLabel)
+    || a.kind.localeCompare(b.kind)
+    || a.session.localeCompare(b.session)
+    || a.id.localeCompare(b.id);
+}
+
+/** An agent process the process table showed, as the insights facet reports it. */
+interface LiveProcess {
+  pid: number;
+  kind: string;
+  /** `session:<terminal id>` or `run:<attempt id>`; null when none was observed. */
+  tree: string | null;
+  parentPid: number | null;
+  cwd: string;
+  status: string;
+}
+
+/** Ancestors one placement follows. Deeper is a loop or a table that is not a tree. */
+const MAX_LINEAGE = 32;
+
+/**
+ * The live sessions of every probe read, by pid. One process seen through two
+ * probes (two tabs of one repository) is one process.
+ */
+function collectProcesses(snapshots: readonly InsightsSnapshot[]): Map<number, LiveProcess> {
+  const found = new Map<number, LiveProcess>();
+  for (const snapshot of snapshots) {
+    for (const worktree of snapshot.agents.live.worktrees) {
+      for (const session of worktree.sessions) {
+        if (found.has(session.pid)) continue;
+        found.set(session.pid, {
+          pid: session.pid,
+          kind: session.kind,
+          tree: session.tree ?? null,
+          parentPid: session.parent_pid ?? null,
+          cwd: session.cwd,
+          status: session.status,
+        });
+      }
+    }
+  }
+  return found;
+}
+
+/**
+ * Nests every agent process that has an agent process above it under the row
+ * the topmost of that chain belongs to: the terminal or attempt whose launch
+ * id it carries, else the agent checkout its directory is in. A process with
+ * no process above it is not a row (it is the session a terminal or checkout
+ * row already stands for, or one this window did not start). A chain that
+ * loops, runs past [`MAX_LINEAGE`], ends at nothing the plane shows, or names
+ * a parent no probe listed is counted as unplaced, never dropped and never
+ * attached to a guess.
+ */
+function placeSessions(
+  processes: ReadonlyMap<number, LiveProcess>,
+  rows: readonly AgentRow[],
+  draftOf: ReadonlyMap<AgentRow, Draft>,
+  checkouts: ReadonlyMap<string, Draft>,
+  rowOf: ReadonlyMap<Draft, AgentRow>,
+  paths: PathIdentityOptions,
+  used: Set<string>,
+): { placed: number; unplaced: number } {
+  const kept = new Set(rows);
+  const byTree = new Map<string, AgentRow>();
+  for (const row of rows) {
+    const draft = draftOf.get(row);
+    if (!draft) continue;
+    if (draft.sessionId && !byTree.has(`session:${draft.sessionId}`)) byTree.set(`session:${draft.sessionId}`, row);
+    if (draft.taskRunId && draft.runRole !== "continuation" && !byTree.has(`run:${draft.taskRunId}`)) {
+      byTree.set(`run:${draft.taskRunId}`, row);
+    }
+  }
+  const ownerOf = (process: LiveProcess): AgentRow | null => {
+    const launched = process.tree ? byTree.get(process.tree) : undefined;
+    if (launched) return launched;
+    const host = nearestContaining(checkouts, process.cwd, paths);
+    const row = host ? rowOf.get(host) : undefined;
+    return row && kept.has(row) ? row : null;
+  };
+  const made = new Map<number, AgentRow | null>();
+  const containerOf = (process: LiveProcess, trail: Set<number>): AgentRow | null => {
+    const memo = made.get(process.pid);
+    if (memo !== undefined) return memo;
+    const parent = process.parentPid === null ? undefined : processes.get(process.parentPid);
+    if (!parent) return ownerOf(process);
+    if (trail.has(process.pid) || trail.size >= MAX_LINEAGE) {
+      made.set(process.pid, null);
+      return null;
+    }
+    trail.add(process.pid);
+    const above = containerOf(parent, trail);
+    trail.delete(process.pid);
+    if (!above) {
+      made.set(process.pid, null);
+      return null;
+    }
+    const id = uniqueRowId(`${above.id}|session|${process.pid}`, used);
+    used.add(id);
+    const row = childSessionRow(id, process, above);
+    above.children.push(row);
+    made.set(process.pid, row);
+    return row;
+  };
+  let placed = 0;
+  let unplaced = 0;
+  for (const process of [...processes.values()].sort((a, b) => a.pid - b.pid)) {
+    if (process.parentPid === null) continue;
+    // The agent above it was in no probe read (its directory is outside every
+    // probed worktree, or in a repository that was not probed). That is a
+    // child whose place is unknown, not a process with nothing above it.
+    if (!processes.has(process.parentPid)) {
+      unplaced += 1;
+      continue;
+    }
+    if (containerOf(process, new Set()) === null) unplaced += 1;
+    else placed += 1;
+  }
+  return { placed, unplaced };
+}
+
+function childSessionRow(id: string, process: LiveProcess, above: AgentRow): AgentRow {
+  const status = clean(process.status, 40);
+  return {
+    id,
+    parentId: above.id,
+    children: [],
+    rollup: EMPTY_ROLLUP,
+    attentionObserved: false,
+    repoPath: above.repoPath,
+    repoLabel: above.repoLabel,
+    kind: clean(process.kind, 40) || "agent",
+    session: `Child session · pid ${process.pid}`,
+    checkout: above.checkout,
+    worktreePath: process.cwd,
+    checkoutPath: above.checkoutPath,
+    origin: "session",
+    presence: "live",
+    presenceDetail: `A child agent process the process table shows under this session. This window did not start it.${status ? ` The agent reports it as ${status}.` : ""}`,
+    attention: [],
+    attentionLabel: "",
+    parallelCount: above.parallelCount,
+    parallelFloor: above.parallelFloor,
+    dirtyFiles: null,
+    dirtyKnown: false,
+    liveKey: null,
+    taskRunId: null,
+  };
+}
+
+/** Reasons that mean something below a row is asking, as opposed to a reading that is missing or a change that exists. */
+function asks(reason: AttentionReason): boolean {
+  return FILTER_ATTENTION.has(reason) && !UNREAD_REASONS.has(reason);
+}
+
+/** Fills `rollup` on this row and everything under it. */
+function settleRollups(row: AgentRow): AgentRollup {
+  let descendants = 0;
+  let live = 0;
+  let unobserved = 0;
+  const reasons = new Set<AttentionReason>();
+  for (const child of row.children) {
+    const below = settleRollups(child);
+    descendants += 1 + below.descendants;
+    live += (child.presence === "live" ? 1 : 0) + below.live;
+    unobserved += (child.attentionObserved ? 0 : 1) + below.unobserved;
+    for (const reason of child.attention) if (asks(reason)) reasons.add(reason);
+    for (const reason of below.attention) reasons.add(reason);
+  }
+  row.rollup = descendants === 0 ? EMPTY_ROLLUP : { descendants, live, attention: orderReasons(reasons), unobserved };
+  return row.rollup;
 }
 
 /**
@@ -776,7 +1035,7 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
       continue;
     }
     const draft: Draft = host
-      ? { ...host, origin: "terminal", attention: new Set(host.attention), liveKey: null, taskRunId: null }
+      ? { ...host, origin: "terminal", attention: new Set(host.attention), liveKey: null, taskRunId: null, sessionId: null, runRole: null, parent: null }
       : fromTerminal(terminal, cwd, places, paths);
     attach(draft, terminal);
     // A second process in a checkout is its own row, not a rewrite of the first.
@@ -850,6 +1109,22 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
     taskAttempts = attempts.size;
   }
 
+  // A terminal that continues an attempt nests under the row that stands for
+  // that attempt. Only a terminal row moves: a continuation that joined a
+  // checkout's row keeps being that checkout, and an attempt is never nested
+  // under what continues it.
+  const attemptRows = new Map<string, Draft>();
+  for (const draft of drafts) {
+    if (draft.taskRunId && draft.runRole !== "continuation" && !attemptRows.has(draft.taskRunId)) {
+      attemptRows.set(draft.taskRunId, draft);
+    }
+  }
+  for (const draft of drafts) {
+    if (draft.runRole !== "continuation" || draft.origin !== "terminal" || !draft.taskRunId) continue;
+    const host = attemptRows.get(draft.taskRunId);
+    if (host && host !== draft) draft.parent = host;
+  }
+
   // One repository has one parallel count, computed once. A row that did not
   // come from the agent summary (a terminal in the main tree) must not report
   // a smaller number than the checkout beside it. An attempt whose repository
@@ -866,6 +1141,8 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
 
   const finished: AgentRow[] = [];
   const used = new Set<string>();
+  const draftOf = new Map<AgentRow, Draft>();
+  const rowOf = new Map<Draft, AgentRow>();
   let needing = 0;
   let unread = 0;
   drafts.forEach((draft, index) => {
@@ -881,8 +1158,12 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
       used,
     );
     used.add(id);
-    finished.push({
+    const row: AgentRow = {
       id,
+      parentId: null,
+      children: [],
+      rollup: EMPTY_ROLLUP,
+      attentionObserved: true,
       repoPath: draft.repoPath,
       repoLabel: draft.repoLabel || clean(draft.repoPath, 80),
       kind: draft.kind || "agent",
@@ -901,15 +1182,13 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
       dirtyKnown: draft.dirtyKnown,
       liveKey: draft.liveKey,
       taskRunId: draft.taskRunId,
-    });
+    };
+    finished.push(row);
+    draftOf.set(row, draft);
+    rowOf.set(draft, row);
   });
 
-  finished.sort((a, b) =>
-    urgentRank(a.attention) - urgentRank(b.attention)
-    || a.repoLabel.localeCompare(b.repoLabel)
-    || a.kind.localeCompare(b.kind)
-    || a.session.localeCompare(b.session)
-    || a.id.localeCompare(b.id));
+  finished.sort(compareRows);
 
   let checkoutCount = 0;
   let checkoutsFloor = false;
@@ -921,8 +1200,35 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
   const total = finished.length;
   const truncated = total > MAX_AGENT_ROWS;
   const rows = truncated ? finished.slice(0, MAX_AGENT_ROWS) : finished;
+
+  // Nesting is drawn from the rows that were kept: a child whose parent fell
+  // past the cap is a root, never a dangling reference.
+  const kept = new Set(rows);
+  for (const row of rows) {
+    const parent = draftOf.get(row)?.parent;
+    const parentRow = parent ? rowOf.get(parent) : undefined;
+    if (!parentRow || !kept.has(parentRow)) continue;
+    row.parentId = parentRow.id;
+    parentRow.children.push(row);
+  }
+  const lineage = collectProcesses(readProbes.map((entry) => entry.snapshot));
+  const placed = placeSessions(lineage, rows, draftOf, checkouts, rowOf, paths, used);
+  if (placed.unplaced > 0) {
+    gaps.push({
+      repoPath: "",
+      label: "Child sessions",
+      kind: "partial",
+      reason: `${plural(placed.unplaced, "child agent session", "child agent sessions")} could not be placed under a row: the session above ${placed.unplaced === 1 ? "it is" : "them is"} not one of the rows shown, or was not listed by any repository read. Their count is kept; their place is unknown.`,
+    });
+  }
+  for (const row of rows) {
+    if (row.parentId === null) settleRollups(row);
+  }
   return {
     rows,
+    roots: rows.filter((row) => row.parentId === null),
+    childSessions: placed.placed,
+    unplacedSessions: placed.unplaced,
     shown: rows.length,
     total,
     truncated,
@@ -947,6 +1253,81 @@ export function applyAgentFilter(rows: readonly AgentRow[], filter: AgentFilter)
   if (filter === "live") return rows.filter((row) => row.presence === "live");
   if (filter === "parallel") return rows.filter((row) => row.parallelCount > 1 || row.parallelFloor);
   return rows.filter((row) => wantsAttention(row.attention));
+}
+
+/**
+ * [`applyAgentFilter`] over a tree. A root stays when it matches or anything
+ * under it does, and keeps all its children: a quiet parent is shown with the
+ * child that asked, not instead of it, and the child is never shown without
+ * the session it belongs to.
+ */
+export function applyAgentTree(roots: readonly AgentRow[], filter: AgentFilter): AgentRow[] {
+  if (filter === "all") return [...roots];
+  const matches = (row: AgentRow): boolean =>
+    filter === "live"
+      ? row.presence === "live"
+      : filter === "parallel"
+        ? row.parallelCount > 1 || row.parallelFloor
+        : wantsAttention(row.attention);
+  const keeps = (row: AgentRow): boolean => matches(row) || row.children.some(keeps);
+  return roots.filter(keeps);
+}
+
+/** Rows a tree holds that the plane counts as rows: every nested one, child agent processes aside. */
+export function countAgentRows(roots: readonly AgentRow[]): number {
+  let count = 0;
+  const walk = (row: AgentRow): void => {
+    if (row.origin !== "session") count += 1;
+    row.children.forEach(walk);
+  };
+  roots.forEach(walk);
+  return count;
+}
+
+/** One line of a tree as drawn: the row and where it sits among its siblings. */
+export interface AgentTreeEntry {
+  row: AgentRow;
+  /** 1 for a root. */
+  level: number;
+  posInSet: number;
+  setSize: number;
+  expandable: boolean;
+  expanded: boolean;
+}
+
+/**
+ * The rows in the order a tree is drawn, depth first. A row in `collapsed`
+ * keeps its place and hides what is under it.
+ */
+export function flattenAgentTree(roots: readonly AgentRow[], collapsed: ReadonlySet<string>): AgentTreeEntry[] {
+  const entries: AgentTreeEntry[] = [];
+  const walk = (rows: readonly AgentRow[], level: number): void => {
+    rows.forEach((row, index) => {
+      const expandable = row.children.length > 0;
+      const expanded = expandable && !collapsed.has(row.id);
+      entries.push({ row, level, posInSet: index + 1, setSize: rows.length, expandable, expanded });
+      if (expanded) walk(row.children, level + 1);
+    });
+  };
+  walk(roots, 1);
+  return entries;
+}
+
+/**
+ * What lies under a row, in the words the presence and attention cells add
+ * beneath their own. Empty strings for a leaf. A row's own cells are not
+ * changed by what is under it; these say the rest.
+ */
+export function rollupSummary(row: AgentRow): { presence: string; attention: string } {
+  const { descendants, live, attention, unobserved } = row.rollup;
+  if (descendants === 0) return { presence: "", attention: "" };
+  const parts: string[] = [];
+  if (attention.length > 0) parts.push(`Under it: ${attentionText(attention)}`);
+  if (unobserved > 0) parts.push(`${unobserved} not observed`);
+  return {
+    presence: `${live} of ${plural(descendants, "nested row", "nested rows")} live`,
+    attention: parts.join(" · "),
+  };
 }
 
 /**
@@ -987,6 +1368,7 @@ export function planeHeadline(plane: AgentPlane, visible: number): string {
       ? "task attempts not read"
       : `${plane.tasksFloor ? "at least " : ""}${plural(plane.taskAttempts, "task attempt", "task attempts")}`);
   }
+  if (plane.childSessions > 0) parts.push(plural(plane.childSessions, "child session", "child sessions"));
   parts.push(`${plane.attention.needing} need attention`);
   if (plane.attention.unread > 0) parts.push(`${plane.attention.unread} not fully read`);
   // Rows past the cap are not hidden by the filter. `visible` counts how many

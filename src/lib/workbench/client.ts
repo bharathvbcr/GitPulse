@@ -37,7 +37,17 @@ export interface TaskCard extends RecordVersion {
   archived: boolean;
   /** When the task last entered Done (Unix seconds); null while it is not Done. The store's, never sent. */
   completed_at: number | null;
+  /**
+   * The live task this one is a subtask of, from `items.lineage`. Absent when
+   * the lineage was not read for this card: absent is unknown, never "no
+   * parent" (that is `null`). Never sent on a write.
+   */
+  parent_item_id?: string | null;
+  /** Live subtasks and how many of them are Done, from `items.lineage`. Absent is unknown, never 0 of 0. Never sent. */
+  children?: ChildProgress;
 }
+/** How many live subtasks a task has, and how many of those are Done. */
+export interface ChildProgress { total: number; done: number }
 /** How one task names another. Read from the other end, `parent` is a subtask and `blocks` is blocked-by. */
 export const LINK_KINDS = ["parent", "blocks", "related", "duplicate_of"] as const;
 export type LinkKind = (typeof LINK_KINDS)[number];
@@ -106,11 +116,11 @@ export interface RunPreparation {
   model_choice?: LaunchModelChoice;
 }
 /** What a write sends: everything but the store's own stamps. */
-export type TaskDraft = Omit<Task, keyof RecordVersion | "completed_at">;
+export type TaskDraft = Omit<Task, keyof RecordVersion | "completed_at" | "parent_item_id" | "children">;
 export type WorkspaceDraft = Omit<Workspace, keyof RecordVersion>;
 export interface Page<T> { items: T[]; total: number; shown: number; has_more: boolean; next_cursor: string | null }
 export type Scope = { kind: "global" } | { kind: "workspace" | "repository"; id: string };
-export type WorkbenchMethod = "decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "runs.conversation" | "runs.checkout_identity" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.restore" | "items.merge" | "items.history" | "events.list" | "enhancements.complete" | "verifications.status" | "verifications.run" | "verifications.board" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list" | "tasks.suggest";
+export type WorkbenchMethod = "decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "runs.conversation" | "runs.checkout_identity" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.restore" | "items.merge" | "items.lineage" | "items.history" | "events.list" | "enhancements.complete" | "verifications.status" | "verifications.run" | "verifications.board" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list" | "tasks.suggest";
 
 export interface WorkbenchError {
   readonly code: string;
@@ -810,7 +820,7 @@ export function freshTaskFields(): Pick<TaskDraft, "archived" | "checklist" | "l
   return { archived: false, checklist: [], links: [] };
 }
 export function taskDraft(full: Task): TaskDraft {
-  const { id: _id, revision: _revision, updated_at: _updated, completed_at: _completed, ...draft } = full;
+  const { id: _id, revision: _revision, updated_at: _updated, completed_at: _completed, parent_item_id: _parent, children: _children, ...draft } = full;
   return draft;
 }
 /** One merged source, as the merge reports it. */

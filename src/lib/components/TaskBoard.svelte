@@ -4,7 +4,7 @@
   import { liquidSelection } from "../ui/transitions";
   import { onMount, untrack } from "svelte";
   import { invoke } from "../ipc/invoke";
-  import { AlertTriangle, Archive, Bot, ChevronDown, ChevronRight, ChevronUp, Clipboard, Eye, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Merge, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
+  import { AlertTriangle, Archive, Bot, ChevronDown, ChevronRight, ChevronUp, Clipboard, CornerDownRight, Eye, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Merge, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
   import { isMacOS } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
@@ -83,6 +83,7 @@
   import TaskMergeDialog from "./TaskMergeDialog.svelte";
   import CardVerdict from "./CardVerdict.svelte";
   import { getBoardVerdicts, sameVerdicts, type CardVerdict as Verdict } from "../workbench/verification";
+  import { childProgressLabel, getBoardLineage, sameLineage, withLineage, type CardLineage } from "../workbench/lineage";
   import { mergeEligibility } from "../workbench/taskMerge";
   import TaskEditor from "./TaskEditor.svelte";
   import WorkspaceEditor from "./WorkspaceEditor.svelte";
@@ -114,6 +115,9 @@
   /** Verification verdicts for the cards loaded, read once per board load. */
   let verdicts = $state<ReadonlyMap<string, Verdict>>(new Map());
   let verdictError = $state("");
+  /** Each loaded card's parent and subtask progress, read with the verdicts. A card absent here is unknown, not childless. */
+  let lineage = $state<ReadonlyMap<string, CardLineage>>(new Map());
+  let lineageError = $state("");
   let search = $state(""); let initialized = $state(false); let loading = $state(false);
   let error = $state(""); let catalogError = $state(""); let liveNotice = $state(""); let announce = $state("");
   let taskTabs = $state<TaskTabState>(emptyTaskTabs());
@@ -351,6 +355,8 @@
     onDismiss: (reason: string) => closeAddMenu({ restoreFocus: reason === "escape" }),
   });
   const loadedCards = $derived(allLoadedCards(displayColumns));
+  /** Titles of the cards loaded, so a subtask can name its parent when the parent is on the board. */
+  const loadedTitles = $derived(new Map(loadedCards.map((card) => [card.id, card.title])));
   const facetOptions = $derived(collectFacetOptions(loadedCards));
   /**
    * The repository filter's choices, by name; an id the catalog has not
@@ -678,7 +684,7 @@
       inProgressCount = columns.in_progress?.total ?? 0;
       keepSelected(read);
       settled(quiet);
-      void loadVerdicts(pages.flatMap(([, page]) => page.items.map((card) => card.id)), generation);
+      void loadCardReads(pages.flatMap(([, page]) => page.items.map((card) => card.id)), generation);
       return true;
     } catch (cause) {
       // A background read that failed says so, and the next one that
@@ -707,6 +713,24 @@
     } catch (cause) {
       if (generation === revision && !disposed) { verdicts = new Map(); verdictError = explainError(cause); }
     }
+  }
+  /**
+   * One batched read of each loaded card's parent and subtask progress. A
+   * failure is shown, never drawn as "no subtasks": a parent with open
+   * subtasks must not look like a task with none.
+   */
+  async function loadLineage(ids: string[], generation: number) {
+    try {
+      const read = await getBoardLineage(ids);
+      if (generation === revision && !disposed) { if (!sameLineage(lineage, read)) lineage = read; lineageError = ""; }
+    } catch (cause) {
+      if (generation === revision && !disposed) { lineage = new Map(); lineageError = explainError(cause); }
+    }
+  }
+  /** Everything a card shows that the card list does not carry: its verdict and its place in a task tree. */
+  function loadCardReads(ids: string[], generation: number) {
+    void loadVerdicts(ids, generation);
+    void loadLineage(ids, generation);
   }
   /**
    * A task write finished; tell the archive dock to reload.
@@ -1279,7 +1303,7 @@
       if (generation !== revision || disposed || key !== boardKey) return;
       const items = cursor ? [...new Map([...(columns[status]?.items ?? []), ...result.items].map((item) => [item.id, item])).values()] : result.items;
       columns = { ...columns, [status]: { ...result, items, shown: items.length } };
-      void loadVerdicts(Object.values(columns).flatMap((page) => page?.items.map((card) => card.id) ?? []), generation);
+      loadCardReads(Object.values(columns).flatMap((page) => page?.items.map((card) => card.id) ?? []), generation);
     } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
     finally { if (generation === revision && !disposed) loading = false; }
   }
@@ -1308,7 +1332,7 @@
           return !stopLoadingAll;
         },
       });
-      if (!stale()) void loadVerdicts(Object.values(columns).flatMap((one) => one?.items.map((card) => card.id) ?? []), generation);
+      if (!stale()) loadCardReads(Object.values(columns).flatMap((one) => one?.items.map((card) => card.id) ?? []), generation);
     } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
     finally { loadingAll = null; if (generation === revision && !disposed) loading = false; }
   }
@@ -2229,6 +2253,7 @@
     {#if agents}<span class="agents-chip" data-testid="card-agents" data-tone={agents.tone ?? undefined} data-asking={agents.asking || undefined} title={agentsTitle(agents)}><Bot size={11} aria-hidden="true" />{agents.working}{$boardAgents.complete ? "" : "+"}<span class="sr-only"> {agents.working === 1 ? "agent" : "agents"} working</span>{#if agents.asking}<span class="asking"> · {agents.asking} {agents.asking === 1 ? "needs" : "need"} you</span>{/if}</span>{/if}
     {#if flag}<span class="checkout-flag" data-testid="card-checkout" title={flag.detail}><AlertTriangle size={10} aria-hidden="true" /> {flag.label}</span>{/if}
     {#if verdicts.get(card.id)}<CardVerdict verdict={verdicts.get(card.id)!} />{/if}
+    {@render lineageMarks(card)}
     {#if face.repo && cardFields.has("repo")}<div class="card-repos">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</div>{/if}
     {#if (chrome.kind && cardFields.has("type")) || (chrome.owner && cardFields.has("owner")) || (dueLabel(chrome.due) && cardFields.has("due"))}
       <div class="card-extra">
@@ -2268,12 +2293,22 @@
     {#if agents}<span class="agents-chip" data-testid="card-agents" data-tone={agents.tone ?? undefined} data-asking={agents.asking || undefined} title={agentsTitle(agents)}><Bot size={11} aria-hidden="true" />{agents.working}{$boardAgents.complete ? "" : "+"}<span class="sr-only"> {agents.working === 1 ? "agent" : "agents"} working</span>{#if agents.asking}<span class="asking"> · {agents.asking} {agents.asking === 1 ? "needs" : "need"} you</span>{/if}</span>{/if}
     {#if flag}<span class="checkout-flag" data-testid="card-checkout" title={flag.detail}>{flag.label}</span>{/if}
     {#if verdicts.get(card.id)}<CardVerdict verdict={verdicts.get(card.id)!} />{/if}
+    {@render lineageMarks(card)}
     {#if openCardIds.has(card.id)}<span class="open-mark">Open</span>{/if}
     {#if face.repo && cardFields.has("repo")}<span class="muted">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</span>{/if}
     {#if chrome.owner && cardFields.has("owner")}<span class="muted">{chrome.owner}</span>{/if}
     {#if dueLabel(chrome.due) && cardFields.has("due")}<span class="due" data-due={chrome.due}>{dueLabel(chrome.due)}</span>{/if}
     {@render matchHint(card)}
   </button>
+{/snippet}
+{#snippet lineageMarks(card: TaskCard)}
+  <!-- Where the card sits in a task tree. A card the lineage read did not name
+       shows neither mark: unknown is not "no subtasks". -->
+  {@const known = withLineage(card, lineage)}
+  {@const progress = childProgressLabel(known.children)}
+  {@const parentTitle = known.parent_item_id ? loadedTitles.get(known.parent_item_id) : undefined}
+  {#if known.parent_item_id}<span class="card-lineage" data-testid="card-parent" data-parent-id={known.parent_item_id} title={parentTitle ? `Subtask of ${parentTitle}` : "Subtask of a task that is not loaded on this board"}><CornerDownRight size={10} aria-hidden="true" /> Subtask of {parentTitle ?? "another task"}</span>{/if}
+  {#if progress && known.children}<span class="card-lineage" data-testid="card-subtasks" data-done={known.children.done} data-total={known.children.total}>{progress}</span>{/if}
 {/snippet}
 {#snippet matchHint(card: TaskCard)}
   <!-- Why a search matched a card it would not obviously match: a related
@@ -2689,6 +2724,7 @@
     <!-- Cards carry no agent marks while this stands: an old reading would
          claim agents nobody checked. -->
     {#if verdictError}<p class="agents-unread" role="status" data-testid="board-verdicts-error">Verification verdicts could not be read, so cards show none: {verdictError}</p>{/if}
+    {#if lineageError}<p class="agents-unread" role="status" data-testid="board-lineage-error">Subtask progress could not be read, so cards show none: {lineageError}</p>{/if}
     {#if $boardAgents.error}<p class="agents-unread" role="status" data-testid="board-agents-error">Agents working on these tasks could not be read: {$boardAgents.error}</p>{/if}
     <!-- A check that could not run is said, not shown as a healthy checkout:
          those rows and cards carry no mark either way. -->
@@ -3065,6 +3101,8 @@
   /* A task whose primary repository has no checkout here: said on the card, before a launch finds out. */
   .checkout-flag{display:inline-flex;align-items:center;gap:3px;align-self:flex-start;flex-shrink:0;font-size:10px;font-weight:600;line-height:1;padding:2px 5px;border-radius:999px;color:#d29922;background:rgb(210 153 34 / .16);white-space:nowrap}
   .card .checkout-flag{margin-top:4px}
+  .card-lineage{display:inline-flex;align-items:center;gap:3px;align-self:flex-start;max-width:100%;font-size:10px;line-height:1.2;color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .card .card-lineage{display:flex;margin-top:4px}
   .checkout-mark{color:#d29922;font-size:10px}
   .navigator .gp-icon-btn.urgent{color:#d29922}
   .editor-dock{display:flex;flex-direction:column;flex-shrink:0;min-width:0;min-height:0;align-self:stretch}
