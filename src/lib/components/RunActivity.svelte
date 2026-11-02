@@ -160,7 +160,7 @@
   .items{list-style:none;margin:8px 0 0;padding:0;display:flex;flex-direction:column;gap:3px}
   .items li{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:baseline;gap:2px 8px;min-width:0}
   .kind{font-size:10px;text-transform:uppercase;letter-spacing:.04em;color:rgb(var(--c-text-muted))}
-  .label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono,ui-monospace,monospace)}
+  .label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
   .sub{font-size:10px;color:rgb(var(--c-text-muted))}
   .outcome{font-size:10.5px;color:rgb(var(--c-text-muted))}
   li[data-outcome="failed"] .outcome,li[data-outcome="failed"] .label{color:#dc6565}
