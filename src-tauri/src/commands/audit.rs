@@ -13,27 +13,116 @@ use crate::ipc_error::CommandError;
 /// it holds the last cursor it saw and asks for what followed. That is what
 /// makes the history survive a reload, a crash, and a restart — and what makes
 /// "everything visible is a projection of the log" true rather than aspirational.
+///
+/// `session_ids` and `action` narrow the read to one run's rows (a run is two
+/// session ids: the terminal's, which the spawn and lifecycle rows carry, and
+/// the agent's own, which the transcript rows carry) or to one kind of row.
+/// Both are optional; with neither, this is the unfiltered read it always was.
+/// Filtered, the read goes through [`crate::ledger::EventQuery`], whose
+/// session and action filters are indexed, so a run's rows are found without
+/// scanning the history. At most [`MAX_TAIL_SESSIONS`] ids are accepted, and
+/// more are refused rather than trimmed. The `limit` applies to the merged
+/// answer, and a caller that gets `limit` rows back has been capped.
 #[tauri::command(async)]
 pub async fn cmd_ledger_tail(
     repo_path: String,
     cursor: i64,
     limit: u32,
     newest: Option<bool>,
+    session_ids: Option<Vec<String>>,
+    action: Option<String>,
 ) -> Result<Vec<crate::ledger::LedgerEvent>, IpcError> {
     off_thread(move || {
         let repo = validate_repo(&repo_path)?;
         let address = crate::ledger::bindings::repository_address(&repo.to_string_lossy())
             .map_err(|e| e.to_string())?;
-        let read = if newest.unwrap_or(false) {
-            crate::ledger::tail_newest
-        } else {
-            crate::ledger::tail
-        };
-        read(&address.anchor, cursor, limit)
-            .map_err(|e| e.to_string())
-            .map_err(CommandError::from)
+        let newest = newest.unwrap_or(false);
+        if session_ids.as_ref().is_none_or(Vec::is_empty) && action.is_none() {
+            let read = if newest {
+                crate::ledger::tail_newest
+            } else {
+                crate::ledger::tail
+            };
+            return read(&address.anchor, cursor, limit)
+                .map_err(|e| e.to_string())
+                .map_err(CommandError::from);
+        }
+        filtered_tail(
+            &address.anchor,
+            cursor,
+            limit,
+            newest,
+            session_ids.as_deref().unwrap_or_default(),
+            action,
+        )
+        .map_err(CommandError::from)
     })
     .await
+}
+
+/// Most session ids one filtered tail takes: a run is two, with room for a
+/// subagent's.
+const MAX_TAIL_SESSIONS: usize = 4;
+
+/// The byte budget of each page a filtered tail reads.
+const FILTERED_TAIL_BYTES: usize = 4 << 20;
+
+/// The rows of `session_ids` (or of every session, when empty) after `cursor`,
+/// oldest first, at most `limit`: the newest `limit` of them when `newest`.
+///
+/// One indexed query per id, merged by row id. A page the byte budget cut is an
+/// error and not a short answer, because a short answer reads as "that is all
+/// there was".
+fn filtered_tail(
+    anchor: &str,
+    cursor: i64,
+    limit: u32,
+    newest: bool,
+    session_ids: &[String],
+    action: Option<String>,
+) -> Result<Vec<crate::ledger::LedgerEvent>, String> {
+    if session_ids.len() > MAX_TAIL_SESSIONS {
+        return Err(format!(
+            "at most {MAX_TAIL_SESSIONS} session ids can be read at once, got {}",
+            session_ids.len()
+        ));
+    }
+    let wanted: Vec<Option<&String>> = if session_ids.is_empty() {
+        vec![None]
+    } else {
+        session_ids.iter().map(Some).collect()
+    };
+    let mut rows: Vec<crate::ledger::LedgerEvent> = Vec::new();
+    for session in wanted {
+        let query = crate::ledger::EventQuery {
+            after: cursor,
+            limit,
+            descending: newest,
+            action: action.clone(),
+            session_id: session.cloned(),
+            ..crate::ledger::EventQuery::default()
+        };
+        let Some(page) = crate::ledger::query_readonly_page(anchor, &query, FILTERED_TAIL_BYTES)
+            .map_err(|e| e.to_string())?
+        else {
+            continue;
+        };
+        if page.byte_capped {
+            return Err("a ledger page was cut by its byte budget; narrow the read".to_string());
+        }
+        rows.extend(page.events);
+    }
+    rows.sort_by_key(|event| event.id);
+    rows.dedup_by_key(|event| event.id);
+    let limit = limit.clamp(1, 1000) as usize;
+    if rows.len() > limit {
+        if newest {
+            rows.drain(..rows.len() - limit);
+        } else {
+            rows.truncate(limit);
+        }
+    }
+    Ok(rows)
 }
 
 /// Reports whether the ledger is recording for this repository.
@@ -570,5 +659,102 @@ mod catch_up_binding_tests {
         let failed = ledger::status(&repo);
         assert_eq!(failed.catch_up_failures, before.catch_up_failures + 1);
         assert_eq!(failed.dropped, before.dropped);
+    }
+}
+
+#[cfg(test)]
+mod ledger_tail_filter_tests {
+    use super::*;
+
+    use crate::ledger;
+    use crate::test_support::git_in;
+
+    fn git_repo() -> (tempfile::TempDir, String) {
+        let _env = crate::test_support::env::env_serial();
+        let dir = tempfile::tempdir().expect("temp repository");
+        let path = dir.path().canonicalize().expect("canonical path");
+        git_in(&path, &["init", "-b", "main"]);
+        std::fs::write(path.join("seed.txt"), "seed").expect("seed repository");
+        git_in(&path, &["add", "seed.txt"]);
+        git_in(&path, &["commit", "-m", "seed"]);
+        let text = path.to_string_lossy().into_owned();
+        (dir, text)
+    }
+
+    fn row(repo: &str, session: Option<&str>, action: &str, object: &str) -> i64 {
+        ledger::append(ledger::Draft {
+            repo_path: repo.to_string(),
+            session_id: session.map(str::to_string),
+            action: action.into(),
+            object: Some(object.into()),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn ids(events: &[ledger::LedgerEvent]) -> Vec<i64> {
+        events.iter().map(|event| event.id).collect()
+    }
+
+    /// A run is two session ids (the terminal's and the agent's own); the read
+    /// takes both and nothing else, in the order the rows were written.
+    #[test]
+    fn a_run_is_read_by_both_of_its_session_ids_and_no_other_session() {
+        let (_dir, repo) = git_repo();
+        let pty = row(&repo, Some("pty-1"), "session.spawn", "zsh");
+        let other = row(&repo, Some("other"), "session.command", "ls");
+        let agent = row(&repo, Some("claude-uuid"), "session.command", "cargo test");
+        let none = row(&repo, None, "git.commit", "abc");
+        let ids_wanted = vec!["claude-uuid".to_string(), "pty-1".to_string()];
+        let got = filtered_tail(&repo, 0, 100, false, &ids_wanted, None).unwrap();
+        assert_eq!(ids(&got), vec![pty, agent]);
+        assert!(!ids(&got).contains(&other) && !ids(&got).contains(&none));
+    }
+
+    #[test]
+    fn the_action_narrows_the_read_with_or_without_a_session() {
+        let (_dir, repo) = git_repo();
+        row(&repo, Some("s"), "session.command", "ls");
+        let state = row(&repo, Some("s"), "session.state", "x");
+        row(&repo, Some("t"), "session.state", "y");
+        let wanted = vec!["s".to_string()];
+        let got = filtered_tail(&repo, 0, 100, false, &wanted, Some("session.state".into())).unwrap();
+        assert_eq!(ids(&got), vec![state]);
+        let any = filtered_tail(&repo, 0, 100, false, &[], Some("session.state".into())).unwrap();
+        assert_eq!(any.len(), 2);
+    }
+
+    #[test]
+    fn the_limit_is_the_merged_answers_and_newest_keeps_the_end() {
+        let (_dir, repo) = git_repo();
+        let mut all = Vec::new();
+        for i in 0..6 {
+            let session = if i % 2 == 0 { "a" } else { "b" };
+            all.push(row(&repo, Some(session), "session.command", &format!("c{i}")));
+        }
+        let wanted = vec!["a".to_string(), "b".to_string()];
+        let first = filtered_tail(&repo, 0, 4, false, &wanted, None).unwrap();
+        assert_eq!(ids(&first), all[..4].to_vec());
+        let last = filtered_tail(&repo, 0, 4, true, &wanted, None).unwrap();
+        assert_eq!(ids(&last), all[2..].to_vec());
+        // A cursor skips what the reader already holds.
+        let after = filtered_tail(&repo, all[3], 100, false, &wanted, None).unwrap();
+        assert_eq!(ids(&after), all[4..].to_vec());
+    }
+
+    #[test]
+    fn too_many_session_ids_are_refused_not_trimmed() {
+        let (_dir, repo) = git_repo();
+        row(&repo, Some("s0"), "session.command", "ls");
+        let many: Vec<String> = (0..=MAX_TAIL_SESSIONS).map(|i| format!("s{i}")).collect();
+        let refused = filtered_tail(&repo, 0, 100, false, &many, None).unwrap_err();
+        assert!(refused.contains("at most"), "{refused}");
+    }
+
+    #[test]
+    fn a_repository_with_no_ledger_yet_reads_as_no_rows() {
+        let (_dir, repo) = git_repo();
+        let wanted = vec!["s".to_string()];
+        assert!(filtered_tail(&repo, 0, 100, false, &wanted, None).unwrap().is_empty());
     }
 }

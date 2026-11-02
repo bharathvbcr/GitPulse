@@ -351,6 +351,8 @@ fn ledger_commands_refuse_a_missing_repo_without_creating_it() {
         0,
         100,
         None,
+        None,
+        None,
     ));
     let catch_up_result =
         tauri::async_runtime::block_on(cmd_catch_up(missing.to_string_lossy().into_owned()));
@@ -449,6 +451,8 @@ fn ledger_commands_resolve_a_linked_worktree_to_the_family_anchor() {
         linked_path.to_string_lossy().into_owned(),
         0,
         100,
+        None,
+        None,
         None,
     ))
     .expect("tail from linked worktree");
