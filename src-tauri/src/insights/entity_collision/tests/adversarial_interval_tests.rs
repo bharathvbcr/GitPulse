@@ -165,25 +165,30 @@ fn test_randomized_interval_fuzzing_against_oracle() {
         let p1 = make_party(a_intervals.clone());
         let p2 = make_party(b_intervals.clone());
 
-        // Naive reference oracle:
-        let mut expected_contended = Vec::new();
-        for &(s1, e1) in &p1.footprint {
-            for &(s2, e2) in &p2.footprint {
-                if s1.max(s2) <= e1.min(e2) {
-                    expected_contended.push((s1.max(s2), e1.min(e2)));
-                }
-            }
-        }
-        expected_contended.sort_unstable();
-        expected_contended.dedup();
+        // Independent oracle, per-point set membership rather than interval
+        // arithmetic: a point is contended exactly when both parties' closed
+        // intervals contain it.
+        let points = |intervals: &[(u64, u64)]| -> std::collections::BTreeSet<u64> {
+            intervals.iter().flat_map(|&(s, e)| s..=e).collect()
+        };
+        let expected_points: std::collections::BTreeSet<u64> = points(&p1.footprint)
+            .intersection(&points(&p2.footprint))
+            .copied()
+            .collect();
+        let expected_contended = !expected_points.is_empty();
 
         let verdict = classify_parties("fuzz.rs", &[p1, p2], &[]);
-        if expected_contended.is_empty() {
+        let reported_points = points(&verdict.contended_lines);
+        if expected_contended {
+            assert_eq!(verdict.kind, EntityCollisionKind::ContendedLine);
+            assert_eq!(
+                reported_points, expected_points,
+                "a={a_intervals:?} b={b_intervals:?} got={:?}",
+                verdict.contended_lines
+            );
+        } else {
             assert_eq!(verdict.kind, EntityCollisionKind::DisjointSymbols);
             assert!(verdict.contended_lines.is_empty());
-        } else {
-            assert_eq!(verdict.kind, EntityCollisionKind::ContendedLine);
-            assert_eq!(verdict.contended_lines, expected_contended);
         }
     }
 }

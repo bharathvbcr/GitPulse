@@ -784,11 +784,18 @@ mod tests {
         );
         let claude = facet.kinds.iter().find(|k| k.kind == "claude").unwrap();
         let codex = facet.kinds.iter().find(|k| k.kind == "codex").unwrap();
-        let antigravity = facet.kinds.iter().find(|k| k.kind == "antigravity").unwrap();
+        let antigravity = facet
+            .kinds
+            .iter()
+            .find(|k| k.kind == "antigravity")
+            .unwrap();
         let devcouncil = facet.kinds.iter().find(|k| k.kind == "devcouncil").unwrap();
         let manvi = facet.kinds.iter().find(|k| k.kind == "manvi").unwrap();
         assert_eq!((claude.sessions, codex.sessions), (7, 1));
-        assert_eq!((antigravity.sessions, devcouncil.sessions, manvi.sessions), (1, 1, 1));
+        assert_eq!(
+            (antigravity.sessions, devcouncil.sessions, manvi.sessions),
+            (1, 1, 1)
+        );
         let rows = &facet.worktrees[0].sessions;
         let busy = rows.iter().filter(|s| s.status == "busy").count();
         assert_eq!(busy, 5, "the five with registry entries are enriched");

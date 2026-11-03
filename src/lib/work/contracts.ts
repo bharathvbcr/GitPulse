@@ -96,10 +96,14 @@ export function validateWorkResponse(command: string, value: unknown): void {
           if (item.entity != null) {
             const entity = fields(item.entity, ["path", "kind", "reason"]);
             const kind = String(entity.kind);
-            if (!["shared_symbol", "disjoint_symbols", "file_level"].includes(kind)) {
+            if (!["shared_symbol", "contended_line", "disjoint_symbols", "file_level"].includes(kind)) {
               throw new Error(`unknown entity kind: ${kind}`);
             }
             list(entity.shared_symbols ?? [], (name) => { if (typeof name !== "string") throw new Error("shared_symbols entry"); });
+            list(entity.contended_lines ?? [], (range) => {
+              if (!Array.isArray(range) || range.length !== 2) throw new Error("contended_lines entry");
+              count(range[0]); count(range[1]);
+            });
           }
         });
         break;

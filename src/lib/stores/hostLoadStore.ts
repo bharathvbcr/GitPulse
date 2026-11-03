@@ -28,7 +28,7 @@ export type Role = "writer" | "reader" | "not_sampling" | "unsupported";
 export type Platform = "governed" | "advise" | "unavailable";
 export type Thermal = "nominal" | "fair" | "serious" | "critical";
 export type Power = "ac" | "battery";
-export type AgentKind = "claude" | "codex";
+export type AgentKind = "claude" | "codex" | "antigravity" | "dev_council" | "manvi";
 
 export interface SensorReport {
   state: SensorState;
@@ -197,6 +197,8 @@ export interface ProcView {
   unreadable: number;
   claude: SessionCount;
   codex: SessionCount;
+  /** Antigravity, DevCouncil and Manvi sessions, so the counts add up to `sessions`. */
+  other: SessionCount;
   sessions: AgentSession[];
   sessions_truncated: boolean;
   trees: LaunchedTree[];

@@ -157,13 +157,15 @@ export interface CollisionParty {
   agent_kind: string;
 }
 
-export type EntityCollisionKind = "shared_symbol" | "disjoint_symbols" | "file_level";
+export type EntityCollisionKind = "shared_symbol" | "contended_line" | "disjoint_symbols" | "file_level";
 
 export interface EntityCollisionVerdict {
   path: string;
   kind: EntityCollisionKind;
   reason: string;
   shared_symbols: string[];
+  /** Closed [start, end] line-boundary intervals where the parties' edits touch or overlap. */
+  contended_lines?: [number, number][];
 }
 
 export interface CollisionItem {

@@ -487,7 +487,10 @@ pub fn reflink_copy_file(src: &Path, dst: &Path) -> Result<ReflinkResult, Comman
         {
             if let (Ok(src_c), Ok(dst_c)) = (
                 CString::new(src_text),
-                staging.to_str().ok_or(()).and_then(|s| CString::new(s).map_err(|_| ())),
+                staging
+                    .to_str()
+                    .ok_or(())
+                    .and_then(|s| CString::new(s).map_err(|_| ())),
             ) {
                 // SAFETY: `src_c` and `dst_c` are valid NUL-terminated C strings
                 // outliving `clonefile(2)`.
@@ -511,15 +514,16 @@ pub fn reflink_copy_file(src: &Path, dst: &Path) -> Result<ReflinkResult, Comman
         let block = dest_block(caps, staging.parent().unwrap_or(&staging));
         let cost = allocated(&meta, block);
         if cost > caps.max_bytes {
-            return Err(CopyStop::CapHit { cap: caps.max_bytes }.into_error());
+            return Err(CopyStop::CapHit {
+                cap: caps.max_bytes,
+            }
+            .into_error());
         }
         copy_bounded(src, &staging, meta.len(), &mut || Ok(())).map_err(CopyStop::into_error)?;
     }
 
     fs::rename(&staging, dst).map_err(|e| {
-        CommandError::from(format!(
-            "Could not move cloned file into '{dst_text}': {e}"
-        ))
+        CommandError::from(format!("Could not move cloned file into '{dst_text}': {e}"))
     })?;
     guard.armed = false;
 
