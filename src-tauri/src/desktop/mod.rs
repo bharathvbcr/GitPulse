@@ -752,13 +752,14 @@ pub fn cmd_exit_app(
             ))
         }
     };
-    if let Some(leave) = leave_terminals {
-        sessions.set_leave_running(leave);
-    }
-    if let Some(choice) = managed_exit {
-        crate::harness::sidecar::set_managed_exit(choice);
-    }
-    exit::approve(&app);
+    exit::approve(&app, || {
+        if let Some(leave) = leave_terminals {
+            sessions.set_leave_running(leave);
+        }
+        if let Some(choice) = managed_exit {
+            crate::harness::sidecar::set_managed_exit(choice);
+        }
+    });
     Ok(())
 }
 
