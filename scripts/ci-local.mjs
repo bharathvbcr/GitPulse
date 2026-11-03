@@ -166,8 +166,8 @@ export const GATES = [
     id: "cargo-clippy",
     name: "Rust lint (clippy)",
     program: "cargo",
-    args: ["clippy", "--manifest-path", CARGO_MANIFEST, "--all-targets", "--", "-D", "warnings"],
-    covers: [`cargo clippy --manifest-path ${CARGO_MANIFEST} --all-targets -- -D warnings`],
+    args: ["clippy", "--manifest-path", CARGO_MANIFEST, "--locked", "--all-targets", "--", "-D", "warnings"],
+    covers: [`cargo clippy --manifest-path ${CARGO_MANIFEST} --locked --all-targets -- -D warnings`],
   },
   {
     id: "cargo-tests",

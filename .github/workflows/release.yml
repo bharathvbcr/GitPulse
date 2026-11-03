@@ -136,7 +136,7 @@ jobs:
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 
       - name: Rust Cargo Clippy
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
 
       - name: Rust Unit & Integration Tests
         # Match ci.yml: --locked refuses a lockfile the tree would rewrite,
