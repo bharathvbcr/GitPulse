@@ -459,7 +459,10 @@ impl Mailbox {
         Delivery::Absent
     }
 
-    /// Messages waiting in a session's mailbox.
+    /// Messages waiting in a session's mailbox. Only the tests count them: no
+    /// shipped path needs the number, and one that reported 0 for a mailbox it
+    /// could not read would read as "empty".
+    #[cfg(test)]
     pub(crate) fn pending(&self, session: &str) -> usize {
         self.session_path(session).map_or(0, |dir| {
             regular_files(&dir)

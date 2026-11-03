@@ -77,7 +77,7 @@ fn with_nothing_to_say_it_waits_its_limit_and_exits_0() {
         "{outcome:?}"
     );
     assert!(began.elapsed() >= Duration::from_millis(400));
-    assert!(began.elapsed() < Duration::from_secs(5));
+    assert!(began.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5)));
     assert_eq!(
         waiters_on(&mailbox, SESSION),
         0,
@@ -100,7 +100,10 @@ fn a_session_it_does_not_know_exits_0_at_once_and_makes_no_mailbox() {
             matches!(outcome, Ok(ref output) if output.is_silent()),
             "{bad:?}: {outcome:?}"
         );
-        assert!(began.elapsed() < Duration::from_secs(2), "{bad:?} waited");
+        assert!(
+            began.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)),
+            "{bad:?} waited"
+        );
     }
     assert!(!dir.path().join("agent-mailbox").exists());
 }
@@ -117,7 +120,7 @@ fn two_copies_of_the_hook_deliver_one_message_once() {
         let seen = Instant::now();
         while waiters_on(&mailbox, SESSION) < 2 {
             assert!(
-                seen.elapsed() < Duration::from_secs(10),
+                seen.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
                 "the copies never both waited"
             );
             std::thread::sleep(Duration::from_millis(5));
@@ -154,7 +157,7 @@ fn a_waiter_past_the_per_session_cap_exits_0_at_once() {
         let seen = Instant::now();
         while waiters_on(&mailbox, SESSION) < cap {
             assert!(
-                seen.elapsed() < Duration::from_secs(10),
+                seen.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
                 "waiters never registered"
             );
             std::thread::sleep(Duration::from_millis(5));
@@ -166,7 +169,7 @@ fn a_waiter_past_the_per_session_cap_exits_0_at_once() {
             "{extra:?}"
         );
         assert!(
-            began.elapsed() < Duration::from_secs(2),
+            began.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)),
             "the extra waiter waited"
         );
         // Release the ones holding places.
@@ -196,7 +199,7 @@ fn a_repeat_in_a_stop_chain_looks_once_and_does_not_start_another_waiter() {
         "{outcome:?}"
     );
     assert!(
-        began.elapsed() < Duration::from_secs(2),
+        began.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)),
         "a chained stop waited"
     );
     assert_eq!(waiters_on(&mailbox, SESSION), 0);
@@ -289,5 +292,5 @@ fn the_entry_point_serves_only_sessions_gitpulse_launched() {
     // And with nothing left it waits only the shortened limit.
     let began = Instant::now();
     assert!(matches!(run(&stop(SESSION)), Ok(ref output) if output.is_silent()));
-    assert!(began.elapsed() < Duration::from_secs(5));
+    assert!(began.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5)));
 }

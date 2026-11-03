@@ -456,7 +456,7 @@ fn waiting_takes_a_message_that_is_already_there_at_once() {
             text: "waiting for you".into()
         })
     );
-    assert!(began.elapsed() < Duration::from_secs(5));
+    assert!(began.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5)));
 }
 
 #[test]
@@ -468,7 +468,7 @@ fn waiting_takes_a_message_that_arrives_while_it_waits_and_then_leaves_no_trace(
         let seen = Instant::now();
         while !mailbox.listening(SESSION, SystemTime::now()) {
             assert!(
-                seen.elapsed() < Duration::from_secs(10),
+                seen.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
                 "the waiter never registered"
             );
             std::thread::sleep(Duration::from_millis(5));
@@ -517,6 +517,6 @@ fn a_waiter_over_the_cap_declines_instead_of_waiting() {
     let began = Instant::now();
     let outcome = mailbox.wait(SESSION, Duration::from_secs(30)).unwrap();
     assert!(matches!(outcome, Wait::Declined(_)), "{outcome:?}");
-    assert!(began.elapsed() < Duration::from_secs(5));
+    assert!(began.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5)));
     drop(held);
 }
