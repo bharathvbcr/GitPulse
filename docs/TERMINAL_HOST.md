@@ -398,8 +398,8 @@ pipe).
   absent: absent means *leave* to a backend that does hold the runs, and the
   reading that chose the two-way question can be wrong (a connection that was
   dropped reads as not hosted). When the worker holds no connection at that
-  point (a relaunch that has not touched the worker, a replaced or faulted
-  connection) a stop dials the server at its own path (adopting only, never
+  point (a relaunch in which nothing has needed the worker yet, so none was ever
+  made; a replaced or faulted connection) a stop dials the server at its own path (adopting only, never
   starting one, with every check of the relaunch below), bounded by the
   controller wait and the stop's own wait, and stops the runs. A server that
   cannot be reached or used leaves its runs going; that is logged, not hidden.

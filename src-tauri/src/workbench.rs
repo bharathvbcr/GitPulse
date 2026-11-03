@@ -336,7 +336,7 @@ impl WorkbenchState {
     }
 
     pub(crate) fn shutdown(&self) {
-        self.0.closed.store(true, Ordering::Release);
+        let repeat = self.0.closed.swap(true, Ordering::AcqRel);
         // The external-changes loop may be waiting out a hidden window.
         external_changes::wake();
         // Waiting requests are refused now rather than at their deadline.
@@ -358,9 +358,47 @@ impl WorkbenchState {
             let guard = crate::supervisor::lock_or_recover(&self.0.worker);
             guard.as_ref().map(|(_, worker)| Arc::clone(worker))
         };
-        if let Some(worker) = worker {
-            if !worker.shutdown() {
-                log::warn!(target: "workbench", "profile worker shutdown could not acquire the active request; generation outcome may remain unresolved");
+        match worker {
+            Some(worker) => {
+                if !worker.shutdown() {
+                    log::warn!(target: "workbench", "profile worker shutdown could not acquire the active request; generation outcome may remain unresolved");
+                }
+            }
+            // No worker was ever made this launch, so nothing is connected to
+            // a hosted Manvi that an earlier launch left holding runs. A quit
+            // that chose to stop them still has to reach them: a worker that
+            // is built only to be closed does that (it dials, adopting only,
+            // and stops). Only the app's own profile hosts, and only once.
+            None if !repeat
+                && self.0.path.is_none()
+                && crate::harness::hosted::exit_choice()
+                    == crate::harness::hosted::ExitChoice::Stop =>
+            {
+                self.stop_unconnected_hosted_runs();
+            }
+            None => {}
+        }
+    }
+
+    /// [`Self::shutdown`] for a quit that chose to stop a hosted server's runs
+    /// when this launch never made a worker.
+    fn stop_unconnected_hosted_runs(&self) {
+        let Some(plan) = crate::harness::hosted::HostPlan::from_settings() else {
+            return;
+        };
+        let path = match intake::default_profile_path() {
+            Ok(path) => path,
+            Err(error) => {
+                log::warn!(target: "workbench", "could not stop the hosted managed runs before quitting: {}", error.message);
+                return;
+            }
+        };
+        match crate::harness::sidecar::ProfileConnection::new_hosting(path, None, Some(plan)) {
+            Ok(connection) => {
+                connection.shutdown();
+            }
+            Err(error) => {
+                log::warn!(target: "workbench", "could not stop the hosted managed runs before quitting: {}", error.message());
             }
         }
     }

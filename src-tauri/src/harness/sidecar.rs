@@ -2741,6 +2741,9 @@ impl ProfileConnection {
         else {
             return false;
         };
+        // A repeat (a worker closed once by a refused call and again by the
+        // quit) has nothing left to settle and must not dial again.
+        let repeat = guard.closed;
         guard.closed = true;
         let sidecar = guard.sidecar.take();
         // What a dial to a server this worker is not connected to would need.
@@ -2765,7 +2768,7 @@ impl ProfileConnection {
             None =>
             {
                 #[cfg(unix)]
-                if hosted::exit_choice() == hosted::ExitChoice::Stop {
+                if !repeat && hosted::exit_choice() == hosted::ExitChoice::Stop {
                     if let Some((profile, selection, plan)) = unconnected {
                         stop_unconnected_hosted(&profile, selection.as_ref(), &plan);
                     }

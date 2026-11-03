@@ -763,6 +763,12 @@ fn a_quit_that_stops_the_runs_reaches_a_server_this_worker_is_not_connected_to()
     assert!(connection.shutdown());
     assert_eq!(server.shared.saw("serve.stop_all"), 1);
     assert!(relock(&server.shared.jobs).is_empty());
+
+    // Closed twice (a refused call and then the quit): the second has nothing
+    // left to settle and does not dial again.
+    let dialled = server.shared.saw("serve.status");
+    assert!(connection.shutdown());
+    assert_eq!(server.shared.saw("serve.status"), dialled);
 }
 
 /// A server this app started and then cannot use is ended, so the stdio child
