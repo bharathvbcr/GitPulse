@@ -319,18 +319,87 @@ fn a_read_before_the_session_ends_reports_the_bytes_dropped_and_not_yet_marked()
         after["unrecorded_bytes"], 0,
         "the session's end queued the marker"
     );
-    // The count the live read gave is the one the last marker then carried, and
-    // with it every byte is accounted for.
+    // The live log had no marker yet, so what the live read counted is what the
+    // markers then carried between them, and with it every byte is accounted for.
     let text =
         String::from_utf8(BASE64.decode(after["data_b64"].as_str().unwrap()).unwrap()).unwrap();
-    assert!(
-        text.ends_with(&format!(
-            "[gitpulse: {pending} bytes of output were not recorded]\r\n"
-        )),
-        "the live read said {pending}, the log ends otherwise"
-    );
     let (recorded, dropped) = accounted(&text);
+    assert_eq!(dropped, pending, "the live read said {pending}");
     assert_eq!(recorded + dropped, 200 * 300);
+}
+
+#[test]
+fn a_read_counts_the_drops_whose_marker_is_queued_or_taken_but_not_yet_in_the_file() {
+    let dir = private_tempdir();
+    let store = store(
+        &dir,
+        Limits {
+            queue_bytes: 2000,
+            segment_bytes: 1024 * 1024,
+            ..small()
+        },
+    );
+    let tap = store.arm("term-1-1", None).unwrap();
+    assert!(store.flush(Duration::from_secs(5)), "the session opens");
+    let chunk = vec![b'x'; 300];
+    let mut printed = 0u64;
+    // Drops with no marker queued for them: the writer is held, so nothing
+    // that overflowed was freed for a later chunk to follow.
+    let stalled = lock(&store.inner.files);
+    for _ in 0..200 {
+        tap.chunk(&chunk);
+        printed += 300;
+    }
+    drop(stalled);
+    assert!(store.flush(Duration::from_secs(5)), "the writer drains");
+    // The writer is now stopped at the marker the next chunk queues for them:
+    // the marker is out of the queue's counts and not yet in the file.
+    let hold = lock(&store.inner.gap_hold);
+    let first = lock(&store.inner.queue)
+        .gaps
+        .get("term-1-1")
+        .copied()
+        .unwrap_or(0);
+    assert!(first > 0, "the overflow left bytes without a marker");
+    tap.chunk(&chunk);
+    printed += 300;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !lock(&store.inner.queue).ops.is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the writer never took the marker's batch"
+        );
+        std::thread::yield_now();
+    }
+    // More overflow behind the stopped writer.
+    for _ in 0..20 {
+        tap.chunk(&chunk);
+        printed += 300;
+    }
+    let second = lock(&store.inner.queue)
+        .gaps
+        .get("term-1-1")
+        .copied()
+        .unwrap_or(0);
+    assert!(second > 0, "the second overflow left bytes without a marker");
+    let during = wire(store.read("term-1-1", MAX_TRANSCRIPT_TAIL_BYTES, false, None));
+    assert_eq!(during["state"], "found", "{during}");
+    assert_eq!(during["settled"], false, "the writer is stopped");
+    assert_eq!(
+        during["unrecorded_bytes"].as_u64(),
+        Some(first + second),
+        "a live read hid dropped bytes: {first} wait on a marker the writer holds and is \
+         not in the file, {second} have none queued: {during}"
+    );
+    drop(hold);
+    drop(tap);
+    assert!(store.flush(Duration::from_secs(5)));
+    let after = wire(store.read("term-1-1", MAX_TRANSCRIPT_TAIL_BYTES, false, None));
+    assert_eq!(after["unrecorded_bytes"], 0, "{after}");
+    let text =
+        String::from_utf8(BASE64.decode(after["data_b64"].as_str().unwrap()).unwrap()).unwrap();
+    let (recorded, dropped) = accounted(&text);
+    assert_eq!(recorded + dropped, printed, "every byte is accounted for");
 }
 
 #[test]
@@ -856,6 +925,34 @@ fn a_writer_that_panics_marks_the_session_failed_and_does_not_hold_up_a_read() {
     assert!(error.contains("stopped unexpectedly"), "{error}");
 }
 
+#[test]
+fn a_marker_the_panicked_writer_never_appended_stops_holding_its_bytes_back() {
+    let dir = private_tempdir();
+    let store = store(&dir, small());
+    let tap = store.arm("term-1-1", None).unwrap();
+    assert!(store.flush(Duration::from_secs(5)), "the session opens");
+    *lock(&store.inner.panic_on) = Some("term-1-1".into());
+    {
+        // One batch for the writer: the data it panics on, then a marker it
+        // never gets to.
+        let mut queue = lock(&store.inner.queue);
+        queue.push(Op::Data("term-1-1".into(), b"never written".to_vec()), 0);
+        queue.gaps.insert("term-1-1".into(), 500);
+        queue.mark_gap("term-1-1", 0);
+        assert_eq!(queue.unrecorded("term-1-1"), 500);
+    }
+    store.inner.work.notify_one();
+    assert!(store.flush(Duration::from_secs(5)), "the batch finishes");
+    assert_eq!(
+        lock(&store.inner.queue).unrecorded("term-1-1"),
+        0,
+        "a marker nobody will write still holds its bytes as pending"
+    );
+    let (_, tail) = tail(store.read("term-1-1", 4096, false, None));
+    assert!(tail.recording_error.is_some(), "the loss is still reported");
+    drop(tap);
+}
+
 // -- age, in a host that stays up ---------------------------------------------
 
 #[test]
@@ -937,7 +1034,7 @@ fn a_read_for_a_run_never_returns_another_sessions_output() {
     record_for(&store, "term-1-2", None, b"an ordinary shell");
     match store.read("term-1-2", 100, false, Some("run-a")) {
         TranscriptRead::Reused { reason } => {
-            assert!(reason.contains("was not this run"), "{reason}")
+            assert!(reason.contains("no run was recorded"), "{reason}")
         }
         other => panic!("a shell's output was served for run-a: {other:?}"),
     }
@@ -983,6 +1080,24 @@ fn a_session_replaces_what_its_own_run_or_no_run_left_but_keeps_what_another_run
     assert_eq!(
         tail(store.read("term-1-2", 100, false, Some("run-a"))).0,
         b"a run"
+    );
+}
+
+#[test]
+fn a_keep_that_fails_part_way_leaves_the_kept_name_with_the_record_of_whose_it_is() {
+    let dir = private_tempdir();
+    let store = store(&dir, small());
+    record_for(&store, "term-1-1", Some("run-a"), b"a run's output");
+    // The log cannot move onto a directory with something in it.
+    let kept = kept_stem("term-1-1", "run-a");
+    let blocker = files(&dir).join(format!("{kept}.log"));
+    std::fs::create_dir(&blocker).unwrap();
+    std::fs::write(blocker.join("occupied"), b"x").unwrap();
+    record_for(&store, "term-1-1", Some("run-b"), b"the next run");
+    assert!(
+        files(&dir).join(format!("{kept}.log.meta")).exists(),
+        "the record was left behind, so what is kept cannot say whose it is: {:?}",
+        names(&files(&dir))
     );
 }
 

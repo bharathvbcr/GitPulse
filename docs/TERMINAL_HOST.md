@@ -247,12 +247,16 @@ recorded]` is written ahead of the next chunk that fits (or when the session
 ends). Once the session has ended and the writer has drained, recorded bytes
 plus the counts in the markers add up to what the session printed, with one
 exception: bytes dropped after the host began shutting down are never marked,
-because no writer is left to mark them. Before that, a live session's dropped
-bytes have no marker in the text yet, so the sum is short by exactly what a read
-reports as `unrecorded_bytes`: the read looks at the queue's pending drop count
-in the same lock acquisition as the session's liveness, and also counts what was
-dropped after shutdown began. A marker written for the same bytes while the read
-is running can name them in both places; they are never reported as zero.
+because no writer is left to mark them. Before that, dropped bytes have no
+marker in the text until the writer has written one, so the sum is short by
+exactly what a read reports as `unrecorded_bytes`. That is the sum of three
+counts the queue keeps for the session, all read in the same lock acquisition
+as its liveness: bytes dropped that no marker has been queued for, bytes whose
+marker is queued or in the writer's hands but not yet in the file (the count
+is released only after the writer has appended the marker), and bytes dropped
+after shutdown began. A marker written for the same bytes while the read is
+running can name them in both places; a byte the host dropped is not left out
+of both.
 
 **Bounds** (`Limits`):
 

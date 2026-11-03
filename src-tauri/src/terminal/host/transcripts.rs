@@ -197,7 +197,16 @@ impl Drop for Batch<'_> {
                 );
             }
         }
-        lock(&self.inner.queue).done += self.total;
+        let mut queue = lock(&self.inner.queue);
+        // A marker the writer will never append no longer holds its bytes back
+        // from a read: the session is marked failed above, which a read says.
+        for op in self.ops.drain(..) {
+            if let Op::Gap(session, dropped) = op {
+                queue.marked(&session, dropped);
+            }
+        }
+        queue.done += self.total;
+        drop(queue);
         self.inner.settled.notify_all();
     }
 }
@@ -211,6 +220,12 @@ struct Queue {
     /// back until a chunk fits or the session ends, and, once the writer is
     /// stopping, for good. A read reports it (`TranscriptTail::unrecorded_bytes`).
     gaps: HashMap<String, u64>,
+    /// Bytes per session whose gap marker has left `gaps` and is not yet in the
+    /// file: queued behind other operations, or taken by the writer and not yet
+    /// appended. Added where the marker is queued, released by the writer only
+    /// once it has appended the marker (or can no longer), so a byte is always
+    /// in `gaps`, here, or in the file's markers. A read reports `gaps` and this.
+    marking: HashMap<String, u64>,
     /// Sessions armed and not yet closed.
     recording: HashSet<String>,
     /// Operations ever queued, and ever finished by the writer.
@@ -242,6 +257,10 @@ struct Inner {
     /// A session whose next data write panics, for the test of what that costs.
     #[cfg(test)]
     panic_on: Mutex<Option<String>>,
+    /// Held by a test to stop the writer before it writes a gap marker, with
+    /// the marker's operation already taken from the queue.
+    #[cfg(test)]
+    gap_hold: Mutex<()>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -292,6 +311,8 @@ impl Transcripts {
             failures: Mutex::default(),
             #[cfg(test)]
             panic_on: Mutex::default(),
+            #[cfg(test)]
+            gap_hold: Mutex::default(),
         });
         inner.sweep(&HashSet::new())?;
         let worker = inner.clone();
@@ -385,6 +406,47 @@ impl Queue {
         self.queued += 1;
         self.ops.push_back(op);
     }
+
+    /// Queues the marker for the bytes `session` has had dropped since its last
+    /// one, moving them from `gaps` to `marking` in the same critical section.
+    fn mark_gap(&mut self, session: &str, cost: usize) {
+        if let Some(dropped) = self.gaps.remove(session) {
+            let marking = self.marking.entry(session.to_owned()).or_insert(0);
+            *marking = marking.saturating_add(dropped);
+            self.push(Op::Gap(session.to_owned(), dropped), cost);
+        }
+    }
+
+    /// The marker for `dropped` bytes is in the file, or never will be.
+    fn marked(&mut self, session: &str, dropped: u64) {
+        if let Some(marking) = self.marking.get_mut(session) {
+            *marking = marking.saturating_sub(dropped);
+            if *marking == 0 {
+                self.marking.remove(session);
+            }
+        }
+    }
+
+    /// Dropped bytes of `session` that are not in its file's markers yet.
+    fn unrecorded(&self, session: &str) -> u64 {
+        let pending = self.gaps.get(session).copied().unwrap_or(0);
+        let queued = self.marking.get(session).copied().unwrap_or(0);
+        pending.saturating_add(queued)
+    }
+}
+
+/// Releases a gap marker's bytes from [`Queue::marking`] when the writer is
+/// done with it, including when it panics part-way.
+struct Marked<'a> {
+    inner: &'a Inner,
+    session: &'a str,
+    dropped: u64,
+}
+
+impl Drop for Marked<'_> {
+    fn drop(&mut self) {
+        lock(&self.inner.queue).marked(self.session, self.dropped);
+    }
 }
 
 impl Inner {
@@ -406,13 +468,15 @@ impl Inner {
         self.dir.join(format!("{session}.log.meta"))
     }
 
-    /// Every file a session (or a kept earlier run's stem) can have.
+    /// Every file a session (or a kept earlier run's stem) can have, the run's
+    /// record first: moved in this order, a partly moved transcript still has
+    /// the record that says whose it is.
     fn files_of(&self, stem: &str) -> [PathBuf; 4] {
         [
+            self.meta(stem),
             self.path(stem),
             self.previous(stem),
             self.note(stem),
-            self.meta(stem),
         ]
     }
 
@@ -434,9 +498,7 @@ impl Inner {
             *dropped = dropped.saturating_add(data.len() as u64);
             return;
         }
-        if let Some(dropped) = queue.gaps.remove(session) {
-            queue.push(Op::Gap(session.to_owned(), dropped), OP_COST);
-        }
+        queue.mark_gap(session, OP_COST);
         queue.push(Op::Data(session.to_owned(), owned), cost);
         drop(queue);
         self.work.notify_one();
@@ -452,9 +514,7 @@ impl Inner {
             // ever be written for them, and a read still reports them.
             return;
         }
-        if let Some(dropped) = queue.gaps.remove(session) {
-            queue.push(Op::Gap(session.to_owned(), dropped), 0);
-        }
+        queue.mark_gap(session, 0);
         queue.push(Op::Close(session.to_owned()), 0);
         drop(queue);
         self.work.notify_one();
@@ -530,6 +590,10 @@ impl Inner {
                 panic!("a test made the transcript writer panic on {session}");
             }
         }
+        #[cfg(test)]
+        if let Op::Gap(..) = &op {
+            drop(lock(&self.gap_hold));
+        }
         match op {
             Op::Open(session, run_id) => {
                 lock(&self.failures).remove(&session);
@@ -551,6 +615,13 @@ impl Inner {
             }
             Op::Data(session, bytes) => self.append(&session, &bytes),
             Op::Gap(session, dropped) => {
+                // Released only after the append: a read between the two
+                // names the bytes twice, never zero times.
+                let _release = Marked {
+                    inner: self,
+                    session: &session,
+                    dropped,
+                };
                 self.append(&session, gap_marker(dropped).as_bytes());
             }
             Op::Close(session) => {
@@ -1074,7 +1145,7 @@ impl Inner {
         Err(TranscriptRead::Reused {
             reason: match current {
                 Some(_) => "a later session reused this terminal id, so the output saved under it is not this run's".to_owned(),
-                None => "the output saved under this terminal id was recorded for a session that was not this run, so it is not shown as this run's".to_owned(),
+                None => "no run was recorded for the output saved under this terminal id, so it is not shown as this run's".to_owned(),
             },
         })
     }
@@ -1103,10 +1174,7 @@ impl Inner {
         // below are named twice, never zero times.
         let (live, unrecorded_bytes) = {
             let queue = lock(&self.queue);
-            (
-                queue.recording.contains(session),
-                queue.gaps.get(session).copied().unwrap_or(0),
-            )
+            (queue.recording.contains(session), queue.unrecorded(session))
         };
         // This host's memory first; a host that started later has only the
         // note the earlier one left. A running session has no earlier host.

@@ -63,10 +63,11 @@ pub struct TranscriptTail {
     /// Bytes the session printed that the host dropped and that no marker in
     /// `data_b64` accounts for: dropped while the writer was behind and not yet
     /// marked (the marker is written ahead of the next chunk that fits, or when
-    /// the session ends), or dropped after the host began shutting down, which
-    /// will never be marked. `0` means none were pending when the host answered.
-    /// A marker written for the same bytes while the read ran can name them
-    /// again; they are never counted as zero.
+    /// the session ends), dropped with a marker queued or in the writer's hands
+    /// but not yet in the file, or dropped after the host began shutting down,
+    /// which will never be marked. `0` means none were pending when the host
+    /// answered. A marker written for the same bytes while the read ran can name
+    /// them again; a dropped byte is not left out of both.
     pub unrecorded_bytes: u64,
     /// Secrets were masked (`ledger::redact`) before this left the host.
     pub redacted: bool,
