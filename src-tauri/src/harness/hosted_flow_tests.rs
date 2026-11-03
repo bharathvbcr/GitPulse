@@ -26,6 +26,9 @@ struct Shared {
     controller: AtomicBool,
     jobs: Mutex<Vec<(String, String)>>,
     ops: Mutex<Vec<String>>,
+    /// An op the server does not advertise in `hello`, for a server this build
+    /// cannot use.
+    unadvertised: Mutex<Option<&'static str>>,
 }
 
 impl Shared {
@@ -50,13 +53,22 @@ impl Shared {
                 })).collect::<Vec<_>>(),
                 "idle_exit_ms": 300000
             }),
-            "hello" => json!({
-                "protocol": 1,
-                "ops": ["hello", "serve.status", "serve.stop_all", "serve.takeover",
-                        "work.runs.managed.stop", "work.enhancements.generate",
-                        "work.enhancements.configuration"],
-                "posture": "host"
-            }),
+            "hello" => {
+                let missing = *relock(&self.unadvertised);
+                let ops: Vec<&str> = [
+                    "hello",
+                    "serve.status",
+                    "serve.stop_all",
+                    "serve.takeover",
+                    "work.runs.managed.stop",
+                    "work.enhancements.generate",
+                    "work.enhancements.configuration",
+                ]
+                .into_iter()
+                .filter(|op| Some(*op) != missing)
+                .collect();
+                json!({"protocol": 1, "ops": ops, "posture": "host"})
+            }
             "serve.stop_all" => {
                 let stopped: Vec<String> = relock(&self.jobs).drain(..).map(|(id, _)| id).collect();
                 json!({"stopped": stopped, "pending": []})
@@ -87,6 +99,7 @@ impl FakeServer {
                     .collect(),
             ),
             ops: Mutex::new(Vec::new()),
+            unadvertised: Mutex::new(None),
         });
         let listener = UnixListener::bind(socket).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -153,6 +166,8 @@ fn plan_in(dir: &Path, launches: Option<Arc<Mutex<Option<FakeServer>>>>) -> host
             *relock(&started) = Some(FakeServer::start(&paths.socket, &[], true));
             Ok(hosted::Launched {
                 exited: Arc::new(AtomicBool::new(false)),
+                pid: 0,
+                start_us: 0,
             })
         }),
         None => Arc::new(|_, _| panic!("nothing may be started in this test")),
@@ -603,4 +618,208 @@ fn a_live_process_that_is_not_the_one_recorded_is_not_signalled() {
     );
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// The first test's stand-in `manvi` binary: only has to exist for the
+/// capability probe, whose usage line says it can serve on a socket.
+fn listening_binary(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let binary = dir.join("manvi");
+    std::fs::write(
+        &binary,
+        "#!/bin/sh\necho 'manvi serve --listen /abs/serve.sock'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    binary
+}
+
+/// Adopting is not a way round the model: a relaunch that finds a server
+/// holding runs, started with another model than the one now selected, serves
+/// what does not depend on the model and makes the rest wait for the runs --
+/// exactly as a connection that started it would.
+#[test]
+fn an_adopted_server_that_holds_runs_keeps_its_model_until_they_end() {
+    let _serial = test_serial();
+    let _reset = Reset;
+    let dir = short_dir();
+    let plan = plan_in(dir.path(), None);
+    plan.paths.prepare().unwrap();
+    let server = FakeServer::start(&plan.paths.socket, &[("a", "running")], true);
+    let selection = ModelSelection::Local {
+        base_url: "http://127.0.0.1:1".into(),
+        model: "other".into(),
+    };
+    let (connection, profile) = connection(dir.path(), plan.clone(), Some(selection));
+    record_for(&plan, &server.shared, &profile, "default");
+
+    // Reconciliation's way in: adopt, never start.
+    match connection.hosted_view() {
+        hosted::View::Live { jobs, .. } => assert_eq!(jobs.len(), 1),
+        other => panic!("expected the server to be adopted, got {other:?}"),
+    }
+    assert_eq!(hosted::observed(), hosted::Observed::Hosted);
+
+    connection
+        .call("work.runs.managed.stop", json!({"id": "a"}))
+        .unwrap();
+    let error = connection
+        .call("work.enhancements.generate", json!({}))
+        .unwrap_err();
+    match error {
+        HarnessError::Refused(WireError { code, message, .. }) => {
+            assert_eq!(code, "model_pending");
+            assert!(message.contains("keeping 1 managed run going"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(server.shared.saw("work.enhancements.generate"), 0);
+
+    // The runs ended: the next call goes to replace the server (which is this
+    // very process here, so it is refused rather than signalled).
+    relock(&server.shared.jobs).clear();
+    let error = connection
+        .call("work.enhancements.generate", json!({}))
+        .unwrap_err();
+    assert!(
+        error.message().contains("could not be replaced"),
+        "{}",
+        error.message()
+    );
+}
+
+/// A connection that was replaced and ends again later (a `Drop` after
+/// `drop_sidecar`, a failed attach) is not the live one: it must not turn the
+/// live connection's `Hosted` into `Detached`, which makes the quit ask as if
+/// nothing held the runs.
+#[test]
+fn an_older_connection_ending_late_does_not_detach_the_live_one() {
+    let serial = test_serial();
+    let _reset = Reset;
+    let dir = short_dir();
+    let plan = plan_in(dir.path(), None);
+    plan.paths.prepare().unwrap();
+    let server = FakeServer::start(&plan.paths.socket, &[("a", "running")], true);
+    let (connection, profile) = connection(dir.path(), plan.clone(), None);
+    record_for(&plan, &server.shared, &profile, "default");
+    let _ = &serial;
+
+    let old = socket_sidecar(hosted::connect(&plan.paths.socket).unwrap(), &plan.paths, "manvi")
+        .unwrap();
+    connection
+        .call("work.runs.managed.stop", json!({"id": "a"}))
+        .unwrap();
+    assert_eq!(hosted::observed(), hosted::Observed::Hosted);
+
+    old.terminate();
+    assert_eq!(
+        hosted::observed(),
+        hosted::Observed::Hosted,
+        "a connection that was never the live one took the observation back"
+    );
+
+    // The live one ending does.
+    assert!(connection.shutdown());
+    assert_eq!(hosted::observed(), hosted::Observed::Detached);
+}
+
+/// "Stop and Quit" must stop a hosted server's runs even when this worker is
+/// not connected to it (a relaunch that has not touched the worker yet, or a
+/// connection that was dropped): the quit dials it, bounded, and stops them.
+/// A quit that leaves them does not even dial.
+#[test]
+fn a_quit_that_stops_the_runs_reaches_a_server_this_worker_is_not_connected_to() {
+    let _serial = test_serial();
+    let _reset = Reset;
+    let dir = short_dir();
+    let plan = plan_in(dir.path(), None);
+    plan.paths.prepare().unwrap();
+    let server = FakeServer::start(
+        &plan.paths.socket,
+        &[("a", "running"), ("b", "running")],
+        true,
+    );
+    let (connection, profile) = connection(dir.path(), plan.clone(), None);
+    record_for(&plan, &server.shared, &profile, "default");
+
+    hosted::set_exit_choice(hosted::ExitChoice::Leave);
+    let (left, _) = self::connection(dir.path(), plan.clone(), None);
+    assert!(left.shutdown());
+    assert_eq!(server.shared.saw("serve.status"), 0, "leaving must not dial");
+    assert_eq!(server.shared.saw("serve.stop_all"), 0);
+    assert_eq!(relock(&server.shared.jobs).len(), 2);
+
+    // No call was ever made on this connection: nothing is connected.
+    assert!(relock(&connection.slot).sidecar.is_none());
+    hosted::set_exit_choice(hosted::ExitChoice::Stop);
+    assert!(connection.shutdown());
+    assert_eq!(server.shared.saw("serve.stop_all"), 1);
+    assert!(relock(&server.shared.jobs).is_empty());
+}
+
+/// A server this app started and then cannot use is ended, so the stdio child
+/// that replaces it does not run beside a detached `manvi serve`.
+#[test]
+fn a_fresh_server_that_cannot_be_used_is_ended_before_the_fallback() {
+    use crate::procguard::LockedSpawn;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    let serial = test_serial();
+    let _reset = Reset;
+    let dir = short_dir();
+    let binary = listening_binary(dir.path());
+    let _binary = bind_test_binary(&serial, binary.to_str().unwrap());
+
+    let started: Arc<Mutex<Option<FakeServer>>> = Arc::new(Mutex::new(None));
+    let stand_in: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(None));
+    let paths = hosted::HostPaths::under(&dir.path().join("h"));
+    let (server_slot, child_slot) = (started.clone(), stand_in.clone());
+    let launch: hosted::Launcher = Arc::new(move |_command, paths: &hosted::HostPaths| {
+        let server = FakeServer::start(&paths.socket, &[], true);
+        // A server that does not serve what this build needs.
+        *relock(&server.shared.unadvertised) = Some("serve.stop_all");
+        *relock(&server_slot) = Some(server);
+        // The started "server" process: a real one, so there is something to end.
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn_locked()
+            .map_err(|e| e.to_string())?;
+        let pid = child.id();
+        let start_us = crate::sysload::procscan::probe_one(pid as i32)
+            .map(|facts| facts.start_us)
+            .unwrap_or(0);
+        *relock(&child_slot) = Some(child);
+        Ok(hosted::Launched {
+            exited: Arc::new(AtomicBool::new(false)),
+            pid,
+            start_us,
+        })
+    });
+    let plan = hosted::HostPlan { paths, launch };
+    let (connection, _) = connection(dir.path(), plan.clone(), None);
+
+    // The fallback is the stdio child, which this binary is not; what matters is
+    // that the hosted attempt was given up.
+    let _ = connection.call("work.enhancements.configuration", json!({}));
+    let observed = hosted::observed();
+    assert!(
+        matches!(&observed, hosted::Observed::FellBack(why) if why.contains("does not serve")),
+        "{observed:?}"
+    );
+
+    let mut child = relock(&stand_in).take().expect("the launcher ran");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the unusable server was left running beside the fallback");
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.signal(), Some(libc::SIGTERM));
+    assert!(connection.shutdown());
 }

@@ -996,4 +996,18 @@ mod hosted {
         with_process["process_id"] = json!(55);
         same(live(&[], true), &with_process);
     }
+
+    #[test]
+    fn the_hosted_server_is_asked_once_per_pass_however_many_runs_are_judged() {
+        let asked = std::cell::Cell::new(0);
+        let views = super::super::HostedViews::default();
+        for _ in 0..5 {
+            let view = views.get(|| {
+                asked.set(asked.get() + 1);
+                View::Unknown("another client controls the hosted Manvi".into())
+            });
+            assert!(matches!(view, View::Unknown(_)));
+        }
+        assert_eq!(asked.get(), 1, "each held run redialled the server");
+    }
 }

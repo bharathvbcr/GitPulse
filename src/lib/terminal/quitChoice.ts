@@ -136,8 +136,8 @@ export async function decideQuitTerminals(deps: {
   try {
     status = await readTerminalBackend(invoke);
   } catch (error) {
-    // Unknown is read as in-process: that question says the agents end,
-    // which is the warning that cannot do harm if it is wrong.
+    // Unknown is read as in-process: that question says the agents end, and
+    // the backend makes that true wherever it can (see the managed question).
     report("which process holds the terminals", error);
     return { backend: "in-process" };
   }
@@ -273,8 +273,11 @@ export function quitManagedHostedQuestion(
  * Without a hosted Manvi (`hosted` absent or false) a managed run dies on quit,
  * so the question is the two-way one with `ask`. With one the runs can outlive
  * the app, and the question is the three-way `askHosted`; its answer is
- * `managed`. A `hosted` that cannot be read is read as "not hosted", whose
- * question says the runs end — the warning that cannot do harm if it is wrong.
+ * `managed`. A `hosted` that cannot be read is read as "not hosted", and its
+ * question says the runs end — so a confirmed answer is sent as
+ * `managed: "stop"`, never left absent: absent means "leave" to a backend that
+ * does hold them, and a hosted Manvi that this reading missed would keep runs
+ * the dialog just said would stop. A backend with nothing hosted ignores it.
  *
  * "Read in full" is judged over the runs that matter to a quit — starting,
  * running and unresolved ones — not over `prepared` rows, which are not
@@ -317,5 +320,5 @@ export async function decideQuitManagedRuns(deps: {
       : { cancelled: false, stopping: working?.length ?? null, managed: "stop" };
   }
   const stop = await deps.ask(quitManagedQuestion(working, complete, deps.displayName));
-  return stop ? { cancelled: false, stopping: working?.length ?? null } : { cancelled: true };
+  return stop ? { cancelled: false, stopping: working?.length ?? null, managed: "stop" } : { cancelled: true };
 }

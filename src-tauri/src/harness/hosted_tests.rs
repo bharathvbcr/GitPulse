@@ -317,3 +317,16 @@ fn the_directory_holding_the_socket_is_made_private_and_never_a_symlink() {
     std::os::unix::fs::symlink(&real, &link).unwrap();
     assert!(HostPaths::under(&link).prepare().is_err());
 }
+
+/// Manvi refuses a socket path over 100 bytes, which is shorter than what the
+/// system allows (103 on macOS): a path in between must be refused here, with
+/// the reason, and not handed to a server that will refuse it.
+#[test]
+fn a_socket_path_longer_than_manvi_accepts_is_refused_before_it_is_started() {
+    let dir = std::path::PathBuf::from(format!("/{}", "a".repeat(89)));
+    let paths = HostPaths::under(&dir);
+    assert_eq!(paths.socket.as_os_str().len(), 101);
+    let error = paths.prepare().unwrap_err();
+    assert!(error.contains("101 bytes") && error.contains("allows 100"), "{error}");
+    assert!(!dir.exists(), "nothing was created for a path that cannot be used");
+}

@@ -394,10 +394,21 @@ pipe).
   *Stop Them and Quit*, *Keep Working*, sent as `cmd_exit_app`'s `managed`. Leave
   disconnects and nothing else; stop sends `serve.stop_all`, waits at most ten
   seconds, then disconnects. Without a hosted Manvi the old two-way question
-  stands. An exit nobody was asked about (a signal, a crash) leaves the runs, as
-  it leaves the terminals. The stop round trip never runs under the worker's
-  lock, and `teardown::steps` settles any hosted connection the worker's own
-  shutdown did not reach.
+  stands, and its confirmation is sent as `managed: "stop"` too, never left
+  absent: absent means *leave* to a backend that does hold the runs, and the
+  reading that chose the two-way question can be wrong (a connection that was
+  dropped reads as not hosted). When the worker holds no connection at that
+  point (a relaunch that has not touched the worker, a replaced or faulted
+  connection) a stop dials the server at its own path (adopting only, never
+  starting one, with every check of the relaunch below), bounded by the
+  controller wait and the stop's own wait, and stops the runs. A server that
+  cannot be reached or used leaves its runs going; that is logged, not hidden.
+  An exit nobody was asked about (a signal, a crash) leaves the runs, as it
+  leaves the terminals. The stop round trip never runs under the worker's lock
+  or the workbench's, and `teardown::steps` settles any hosted connection the
+  worker's own shutdown did not reach. Whether the app is "hosted" is the last
+  observation of the connection that made it: an older connection ending late
+  cannot take it back from a newer one.
 * **Relaunch.** Reconciling task runs asks the hosted Manvi first, for a managed
   run that still holds its checkout. The server is dialled only at its own
   path, and only if that is a socket owned by the user answering from the user's
@@ -411,7 +422,9 @@ pipe).
   "the Manvi is alive" no longer says the run is). No socket, a socket nobody
   answers on, or a server of another owner or profile adopts nothing and leaves
   today's release rules in force. A server that could not be read at all keeps
-  every verdict as it was: unobserved is not gone.
+  every verdict as it was: unobserved is not gone. The server is asked once per
+  reconciliation pass, not once per held run, so a server controlled by another
+  client costs one bounded wait and not one per run.
 * **Another controller.** A second connection to a server is answered busy until
   the first's is served out (Manvi allows five seconds), so a reconnect waits a
   bounded time. After that the server is reported as controlled by another client
@@ -424,10 +437,30 @@ pipe).
 * **A model or key that changed.** The server keeps the environment it was
   started with. A new model selection or Claude key reaches it only through a
   new server: an idle one is ended (SIGTERM to the pid it reported over the
-  authenticated socket, that `host.json` names, started no later than its
-  owner stamp, never this process) and a fresh one started; one that holds runs
-  is kept for them, `work.enhancements.generate`/`refine` answer `model_pending`
-  meanwhile, and the next call after the runs end replaces it.
+  authenticated socket, that `host.json` names, whose start time still equals
+  the one recorded when GitPulse started it, never this process) and a fresh one
+  started; one that holds runs is kept for them,
+  `work.enhancements.generate`/`refine` answer `model_pending` meanwhile, and the
+  next call after the runs end replaces it. This holds for a server adopted at
+  relaunch exactly as for one this connection started: the selection it was
+  started with (which also says whether it holds the Claude key) is the record's,
+  and it is judged against the selection the connection wants.
+* **A server that cannot be used.** A server this app starts and then cannot use
+  (it never opens its socket, answers for another protocol, or does not serve
+  what is needed) is ended with the same guarded SIGTERM before the stdio child
+  runs, so the child is not beside a detached server nothing will connect to. It
+  held no run. If its start time could not be read it is not signalled and idles
+  out after five minutes (logged).
+* **Turning the setting off.** The setting is read when the worker connects. If
+  it is turned off while a hosted server still holds runs, the next launch uses
+  the stdio child: those runs keep going and liveness keeps their checkouts, but
+  they cannot be controlled from the app until they end, and a quit does not
+  dial the server. Settings then describes the stdio child's behaviour (runs end
+  with the app), which is not true of runs that server already holds; turn the
+  setting back on to adopt them.
+* **Socket path.** The path must fit both the system's limit and Manvi's own
+  (100 bytes); a longer one is refused before anything is started, with the
+  reason.
 * **Per connection.** Each connection to the server has its own chat ledgers and
   `capability.probe` cache, so a reconnect starts them empty; the managed runner
   and its jobs are the server's.
@@ -543,19 +576,28 @@ process outlives the app, holding managed Codex and Claude runs.
   and stop managed runs on the profile's repositories, read what they printed
   (checkpointed in the run record). Nothing it could not do by editing the
   profile database the server uses or by starting `manvi serve` itself. The
-  directory is `0700` and checked, the socket `0600`, Manvi refuses a peer of
-  another uid, and GitPulse refuses to dial a socket that is not a socket owned
-  by the user, answers from another uid, belongs to another owner than the one it
-  recorded, or serves another profile; a platform that cannot report a peer's
-  user hosts nothing.
+  directory is made `0700` by GitPulse (which refuses a symlinked one) and the
+  socket is created `0600` by Manvi (GitPulse does not check the socket's mode),
+  Manvi refuses a peer of another uid, and GitPulse refuses to dial a socket that
+  is not a socket owned by the user, answers from another uid, belongs to another
+  owner than the one it recorded, or serves another profile; a platform that
+  cannot report a peer's user hosts nothing.
 * *Credentials.* A server started for a Claude selection holds the saved Claude
   API key in its environment until it exits (the stdio child holds it for the
   life of the app). It is started only after Manvi's promise to withhold it from
   its children has been read, and is checked again in `hello`. A key that
   changed reaches a server only when it is replaced, which waits for its runs.
-* *Signals.* GitPulse signals the server in one case, a replacement of an idle
-  server whose pid it verified three ways (see above). It never signals a
-  server that holds a run.
+* *Signals.* GitPulse signals the server in two cases: a replacement of an idle
+  server whose pid it verified three ways (see above), and a server it has just
+  started and cannot use, identified by the pid it started and that process's
+  start time. Both go through `procguard::signal`, which refuses a pid whose
+  start time differs, this process and pid 1. It never signals a server that
+  holds a run.
+* *Stopping at quit.* *Stop Them and Quit* can now dial the server from an app
+  that holds no connection to it. That dial is the relaunch's: only the server
+  at GitPulse's own path, owned by the user, answering from the user's uid, of
+  the recorded owner and profile, never started, never taken over. It widens
+  nothing a same-user process could not already do.
 
 **Sign-off.** This statement needs the owner's review before the host
 becomes the default (migration step 3). Until then the host is opt-in.

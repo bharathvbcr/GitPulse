@@ -17,10 +17,10 @@
 //! deadlines stay in `sidecar.rs`, which speaks to a socket exactly as it does
 //! to a pipe.
 //!
-//! **Trust.** The socket's directory is `0700`, the socket `0600`, and Manvi
-//! checks every peer's uid; this side checks the same of the server it dials
-//! (the socket must be a socket, ours, answering from our uid) before a byte
-//! is sent. The peer uid is the only authentication there is: any process of
+//! **Trust.** The socket's directory is made `0700` by this side; Manvi makes
+//! the socket `0600` and checks every peer's uid. GitPulse does not check the
+//! socket's mode: it checks that the dialled path is a socket, owned by this
+//! user, answering from this user's uid, before a byte is sent. The peer uid is the only authentication there is: any process of
 //! the same user can drive the server, as it could already write the profile
 //! database the server uses. Whose server it is, is a separate question,
 //! answered by the [`Record`] GitPulse wrote when it started that server.
@@ -39,7 +39,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 #[cfg(unix)]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
@@ -91,6 +91,10 @@ pub(crate) fn controller_wait() -> Duration {
     #[cfg(not(test))]
     CONTROLLER_WAIT
 }
+/// The longest socket path `manvi serve --listen` accepts (`maxSocketPath` in
+/// Manvi's `socket.go`), shorter than macOS's 103 bytes.
+#[cfg(unix)]
+const MANVI_MAX_SOCKET_PATH: usize = 100;
 /// The most jobs Manvi lists in `serve.status`. A listing this long may have
 /// been cut, so a job missing from it proves nothing.
 pub(crate) const MAX_LISTED_JOBS: usize = 64;
@@ -128,7 +132,9 @@ impl HostPaths {
     /// Creates the directory private and checks the socket path fits.
     #[cfg(unix)]
     pub(crate) fn prepare(&self) -> Result<(), String> {
-        let limit = crate::local_socket::max_path_bytes();
+        // The system's limit, and Manvi's own: a path between the two passes
+        // the first and is refused by the server it was meant for.
+        let limit = crate::local_socket::max_path_bytes().min(MANVI_MAX_SOCKET_PATH);
         if self.socket.as_os_str().len() > limit {
             return Err(format!(
                 "the socket path is {} bytes and this system allows {limit}: {}",
@@ -597,6 +603,40 @@ pub(crate) fn end_idle_server(
 /// when it exits, which ends the wait for its socket early.
 pub(crate) struct Launched {
     pub exited: Arc<AtomicBool>,
+    /// The started process and its start time as the operating system reported
+    /// it right after the start (0 when it could not be read): what lets a
+    /// server that was started and then could not be used be ended without
+    /// signalling a pid that was reused.
+    pub pid: u32,
+    pub start_us: u64,
+}
+
+/// Ends a server this app just started and cannot use, so the stdio child
+/// that replaces it does not run beside a detached `manvi serve` that nothing
+/// will ever connect to. Best effort and logged: it holds no run (it was never
+/// connected), and left alone it idles out by itself.
+#[cfg(unix)]
+pub(crate) fn end_unusable(launched: &Launched) {
+    let pid = launched.pid;
+    let Ok(signed) = i32::try_from(pid) else {
+        return;
+    };
+    if pid <= 1 || pid == std::process::id() || launched.exited.load(Ordering::Acquire) {
+        return;
+    }
+    if launched.start_us == 0 {
+        log::warn!(target: "harness", "the hosted Manvi (pid {pid}) could not be used and its start time is unknown, so it was not signalled; it exits by itself when idle");
+        return;
+    }
+    if let Err(error) = crate::procguard::signal::signal_process(
+        signed,
+        launched.start_us,
+        &start_of,
+        libc::SIGTERM,
+        "ending a hosted Manvi that could not be used",
+    ) {
+        log::warn!(target: "harness", "could not end the unusable hosted Manvi (pid {pid}): {error}");
+    }
 }
 
 /// Starts the server from a built command. The one seam a test replaces.
@@ -676,6 +716,10 @@ fn launch_detached(mut command: Command, paths: &HostPaths) -> Result<Launched, 
         .spawn_locked()
         .map_err(|e| format!("could not start the hosted Manvi: {e}"))?;
     let pid = child.id();
+    let start_us = i32::try_from(pid)
+        .ok()
+        .and_then(start_of)
+        .unwrap_or(0);
     log::info!(target: "harness", "started the hosted Manvi (pid {pid})");
     let exited = Arc::new(AtomicBool::new(false));
     let flag = exited.clone();
@@ -694,7 +738,11 @@ fn launch_detached(mut command: Command, paths: &HostPaths) -> Result<Launched, 
     if let Err(error) = waited {
         log::warn!(target: "harness", "the hosted Manvi will not be reaped by this app: {error}");
     }
-    Ok(Launched { exited })
+    Ok(Launched {
+        exited,
+        pid,
+        start_us,
+    })
 }
 
 /// Permissions the hosted directory must have; checked by tests and by
@@ -804,14 +852,51 @@ pub(crate) enum Observed {
     Blocked(String),
 }
 
-static OBSERVED: Mutex<Observed> = Mutex::new(Observed::Untried);
+/// The observation, and which connection made it when it is [`Observed::Hosted`].
+struct Seen {
+    now: Observed,
+    /// The id of the connection that last observed `Hosted`; only that one can
+    /// take it back (see [`observe_detached`]).
+    conn: u64,
+}
+
+static OBSERVED: Mutex<Seen> = Mutex::new(Seen {
+    now: Observed::Untried,
+    conn: 0,
+});
+
+static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
+
+/// A fresh id for a hosted connection, so its end can be told from another's.
+pub(crate) fn next_conn_id() -> u64 {
+    NEXT_CONN.fetch_add(1, Ordering::Relaxed)
+}
 
 pub(crate) fn observe(now: Observed) {
-    *crate::supervisor::lock_or_recover(&OBSERVED) = now;
+    crate::supervisor::lock_or_recover(&OBSERVED).now = now;
+}
+
+/// Connection `conn` is the live hosted one.
+pub(crate) fn observe_hosted(conn: u64) {
+    let mut seen = crate::supervisor::lock_or_recover(&OBSERVED);
+    seen.now = Observed::Hosted;
+    seen.conn = conn;
+}
+
+/// Connection `conn` ended. Takes `Hosted` back only if `conn` is the
+/// connection that made it: an older connection ending late (a replaced one
+/// disconnected again from `Drop`, or one whose attach failed) must not turn a
+/// live newer one into "detached", which would make the quit ask as if nothing
+/// held the runs.
+pub(crate) fn observe_detached(conn: u64) {
+    let mut seen = crate::supervisor::lock_or_recover(&OBSERVED);
+    if seen.now == Observed::Hosted && seen.conn == conn {
+        seen.now = Observed::Detached;
+    }
 }
 
 pub(crate) fn observed() -> Observed {
-    crate::supervisor::lock_or_recover(&OBSERVED).clone()
+    crate::supervisor::lock_or_recover(&OBSERVED).now.clone()
 }
 
 /// The account of managed-run hosting that Settings shows and the quit

@@ -110,7 +110,7 @@ describe("decideQuitManagedRuns", () => {
   it("names how many managed runs quitting stops, counting starting, running and unresolved ones", async () => {
     const ask = vi.fn<AskStop>(async () => true);
     const listRuns = async () => ({ complete: true, runs: [managedRun("a"), managedRun("b", { state: "starting" }), managedRun("c", { state: "unresolved", provider: "claude" }), managedRun("d", { state: "prepared" })] });
-    expect(await decideQuitManagedRuns({ ask, listRuns, displayName: (path) => path.split("/").pop() ?? path })).toEqual({ cancelled: false, stopping: 3 });
+    expect(await decideQuitManagedRuns({ ask, listRuns, displayName: (path) => path.split("/").pop() ?? path })).toEqual({ cancelled: false, stopping: 3, managed: "stop" });
     const question = ask.mock.calls[0][0];
     expect(question.title).toBe("Quit While 3 Managed Runs Are Working?");
     expect(question.message).toContain("3 managed runs will be stopped");
@@ -142,7 +142,7 @@ describe("decideQuitManagedRuns", () => {
     const onError = vi.fn();
     const ask = vi.fn<AskStop>(async () => true);
     const failure = new Error("workbench gone");
-    expect(await decideQuitManagedRuns({ ask, listRuns: async () => { throw failure; }, onError })).toEqual({ cancelled: false, stopping: null });
+    expect(await decideQuitManagedRuns({ ask, listRuns: async () => { throw failure; }, onError })).toEqual({ cancelled: false, stopping: null, managed: "stop" });
     expect(ask.mock.calls[0][0].message).toContain("could not list them");
     expect(onError).toHaveBeenCalledWith("the managed runs", failure);
   });
@@ -213,7 +213,7 @@ describe("decideQuitManagedRuns with a hosted Manvi", () => {
     const ask = vi.fn<AskStop>(async () => true);
     const askHosted = vi.fn<Ask>();
     for (const hosted of [async () => false, undefined]) {
-      expect(await decideQuitManagedRuns({ ask, askHosted, hosted, listRuns })).toEqual({ cancelled: false, stopping: 2 });
+      expect(await decideQuitManagedRuns({ ask, askHosted, hosted, listRuns })).toEqual({ cancelled: false, stopping: 2, managed: "stop" });
     }
     expect(askHosted).not.toHaveBeenCalled();
     expect(ask.mock.calls[0][0].message).toContain("stops every managed run");

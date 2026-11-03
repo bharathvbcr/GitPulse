@@ -351,8 +351,14 @@ impl WorkbenchState {
         if let Some(notifications) = self.0.notifications.get() {
             notifications.wake();
         }
-        let guard = crate::supervisor::lock_or_recover(&self.0.worker);
-        if let Some((_, worker)) = guard.as_ref() {
+        // Not under the worker lock: with a hosted Manvi and "stop" chosen,
+        // closing the worker waits for its runs to end, and every other
+        // `current_worker` caller would queue behind that wait.
+        let worker = {
+            let guard = crate::supervisor::lock_or_recover(&self.0.worker);
+            guard.as_ref().map(|(_, worker)| Arc::clone(worker))
+        };
+        if let Some(worker) = worker {
             if !worker.shutdown() {
                 log::warn!(target: "workbench", "profile worker shutdown could not acquire the active request; generation outcome may remain unresolved");
             }

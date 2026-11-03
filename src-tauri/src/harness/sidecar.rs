@@ -250,6 +250,9 @@ struct HostedPeer {
     /// connection's and holds runs, so it cannot be replaced yet: what to tell
     /// a caller whose call depends on the model.
     model_pending: Mutex<Option<String>>,
+    /// Which connection this is, so a late end of an older one cannot undo the
+    /// observation a newer one made (see [`hosted::observe_detached`]).
+    conn_id: u64,
 }
 
 /// A running sidecar and the handshake it answered with.
@@ -550,9 +553,7 @@ impl Sidecar {
             Peer::Hosted(hosted) => {
                 drop(stdin);
                 let _ = hosted.stream.shutdown(std::net::Shutdown::Both);
-                if hosted::observed() == hosted::Observed::Hosted {
-                    hosted::observe(hosted::Observed::Detached);
-                }
+                hosted::observe_detached(hosted.conn_id);
             }
         }
     }
@@ -1754,7 +1755,10 @@ enum HostMode {
 #[cfg(unix)]
 enum HostedFailure {
     /// Hosting cannot be used and nothing is left behind that the stdio child
-    /// would collide with: run that instead, and say why.
+    /// would collide with: run that instead, and say why. A server this call
+    /// started and then could not use is ended first (`hosted::end_unusable`,
+    /// best effort and logged; it held no run, and idles out if the signal
+    /// could not be sent).
     Fallback(String),
     /// A server is there and this connection cannot use it. Nothing else is
     /// started beside it: two Manvi processes on one profile would each run
@@ -1792,6 +1796,7 @@ fn socket_sidecar(
             log: paths.log.clone(),
             identity: OnceLock::new(),
             model_pending: Mutex::new(None),
+            conn_id: hosted::next_conn_id(),
         }),
         inbox: Inbox::new(rx),
         stderr: Arc::new(Mutex::new(VecDeque::new())),
@@ -1825,6 +1830,9 @@ fn spawn_hosted(
     // Twice: the second pass starts the server that replaced one which held
     // nothing and was out of date.
     for _ in 0..2 {
+        // The server this pass started, if it did: when it cannot be used it
+        // is ended, so the stdio child that replaces it is not beside it.
+        let mut started: Option<hosted::Launched> = None;
         let (stream, fresh) = match hosted::connect(&plan.paths.socket) {
             Ok(stream) => (stream, false),
             Err(Reach::Refused(why)) => {
@@ -1862,8 +1870,14 @@ fn spawn_hosted(
                     .args(["--idle-exit", hosted::IDLE_EXIT]);
                 let launched =
                     (plan.launch)(command, &plan.paths).map_err(HostedFailure::Fallback)?;
-                let stream = hosted::wait_for_socket(&plan.paths, &launched.exited)
-                    .map_err(HostedFailure::Fallback)?;
+                let stream = match hosted::wait_for_socket(&plan.paths, &launched.exited) {
+                    Ok(stream) => stream,
+                    Err(why) => {
+                        hosted::end_unusable(&launched);
+                        return Err(HostedFailure::Fallback(why));
+                    }
+                };
+                started = Some(launched);
                 (stream, true)
             }
         };
@@ -1878,7 +1892,12 @@ fn spawn_hosted(
         ) {
             Attach::Ready(sidecar) => return Ok(*sidecar),
             Attach::Replaced => continue,
-            Attach::Failed(failure) => return Err(failure),
+            Attach::Failed(failure) => {
+                if let (Some(launched), HostedFailure::Fallback(_)) = (&started, &failure) {
+                    hosted::end_unusable(launched);
+                }
+                return Err(failure);
+            }
         }
     }
     Err(HostedFailure::Blocked(HarnessError::Unavailable(
@@ -1960,8 +1979,12 @@ fn attach(
         return fail(HarnessError::Protocol("not a hosted connection".into()));
     };
     let _ = peer.identity.set((pid, stamp));
+    let conn_id = peer.conn_id;
 
-    let mut serving = wanted.to_string();
+    // The selection the server was started with, which is what it holds (and
+    // so whether it holds the Claude key). A server this call started was
+    // started with `wanted`.
+    let mut started_with = wanted.to_string();
     if !fresh {
         // Whose server this is: the one GitPulse started for this profile.
         let record = match hosted::read_record(&plan.paths) {
@@ -1991,11 +2014,12 @@ fn attach(
                 record.profile
             )));
         }
-        // Adopting takes the server as it is; starting wants a model.
-        if mode == HostMode::Adopt {
-            serving = record.selection.clone();
-        }
-        match hosted::judge_server(&record, &serving, status.jobs.len()) {
+        started_with = record.selection.clone();
+        // Judged against what this connection wants in either mode: an adopted
+        // server that holds runs still keeps the model it was started with, and
+        // a call that depends on the model waits for those runs
+        // (`model_pending`) instead of quietly running on the old one.
+        match hosted::judge_server(&record, wanted, status.jobs.len()) {
             hosted::Reuse::Yes => {}
             hosted::Reuse::Replace if mode == HostMode::Adopt => {
                 // Nothing to adopt: it holds no run and is due for replacement,
@@ -2024,7 +2048,7 @@ fn attach(
         }
     }
 
-    let holds_key = serving.starts_with("claude|");
+    let holds_key = started_with.starts_with("claude|");
     let sidecar = match handshake_sidecar(sidecar, holds_key) {
         Ok(sidecar) => sidecar,
         Err(error) => return fail(error),
@@ -2042,7 +2066,7 @@ fn attach(
             )));
         }
     }
-    hosted::observe(hosted::Observed::Hosted);
+    hosted::observe_hosted(conn_id);
     Attach::Ready(Box::new(sidecar))
 }
 
@@ -2164,6 +2188,30 @@ fn settle_hosted(sidecar: &Sidecar, choice: hosted::ExitChoice) {
         log::info!(target: "harness", "quitting with every hosted managed run left running");
     }
     sidecar.terminate();
+}
+
+/// The quit chose to stop a hosted server's runs and this worker is not
+/// connected to it: dial it (never starting one), bounded by the controller
+/// wait and the stop's own wait, and stop its runs. A server that cannot be
+/// reached or used leaves its runs going, which is logged and not hidden.
+#[cfg(unix)]
+fn stop_unconnected_hosted(
+    profile: &Path,
+    selection: Option<&ModelSelection>,
+    plan: &hosted::HostPlan,
+) {
+    match spawn_hosted(profile, selection, plan, HostMode::Adopt) {
+        Ok(sidecar) => settle_hosted(&sidecar, hosted::ExitChoice::Stop),
+        Err(HostedFailure::Gone) => {
+            log::info!(target: "harness", "no hosted Manvi holds runs to stop");
+        }
+        Err(HostedFailure::Blocked(error)) => {
+            log::warn!(target: "harness", "could not stop the hosted managed runs before quitting: {}", error.message());
+        }
+        Err(HostedFailure::Fallback(why)) => {
+            log::warn!(target: "harness", "could not stop the hosted managed runs before quitting: {why}");
+        }
+    }
 }
 
 /// Settles every hosted connection for an exit that has not closed them yet:
@@ -2695,13 +2743,33 @@ impl ProfileConnection {
         };
         guard.closed = true;
         let sidecar = guard.sidecar.take();
+        // What a dial to a server this worker is not connected to would need.
+        #[cfg(unix)]
+        let unconnected = guard.hosting.clone().map(|plan| {
+            (
+                guard.profile.clone().unwrap_or_default(),
+                guard.selection.clone(),
+                plan,
+            )
+        });
         drop(guard);
         match sidecar {
             Some(sidecar) if sidecar.is_hosted() => {
                 settle_hosted(&sidecar, hosted::exit_choice());
             }
             Some(sidecar) => sidecar.terminate(),
-            None => {}
+            // No connection: a replaced or faulted one, or none made yet this
+            // launch. A hosted server may still hold the runs from an earlier
+            // launch, and a quit that chose to stop them must not leave them
+            // because this worker happened not to be connected.
+            None => {
+                #[cfg(unix)]
+                if hosted::exit_choice() == hosted::ExitChoice::Stop {
+                    if let Some((profile, selection, plan)) = unconnected {
+                        stop_unconnected_hosted(&profile, selection.as_ref(), &plan);
+                    }
+                }
+            }
         }
         true
     }

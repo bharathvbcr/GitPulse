@@ -234,7 +234,7 @@ fn reconciler() -> String {
     format!("reconciler-{}-{nanos}", std::process::id())
 }
 
-fn observe(state: &WorkbenchState, run: &Value) -> Verdict {
+fn observe(state: &WorkbenchState, run: &Value, views: &HostedViews) -> Verdict {
     let tracked = state
         .terminals()
         .map(|terminals| crate::terminal::tracks_run(terminals, run["id"].as_str().unwrap_or("")));
@@ -249,11 +249,31 @@ fn observe(state: &WorkbenchState, run: &Value) -> Verdict {
     // cannot be missing from the answer.
     let verdict =
         if run["kind"] == "managed" && run["state"].as_str().is_some_and(|s| HELD.contains(&s)) {
-            apply_hosted(verdict, run, &hosted_view(state))
+            apply_hosted(verdict, run, views.get(|| hosted_view(state)))
         } else {
             verdict
         };
     confirm_vacated(verdict, run, crate::terminal::foreground::working_in)
+}
+
+/// The hosted Manvi's account of its runs, asked at most once per pass.
+///
+/// Asking connects and, when another client controls the server, waits for it
+/// (see `connect_as_controller`) with the profile slot held; asking once per
+/// held run would repeat that wait N times with every workbench call queued
+/// behind it. One pass is one question: the runs it judges were all read before
+/// the first answer, so a run the server was not yet holding cannot be among
+/// them.
+#[derive(Default)]
+pub(super) struct HostedViews(std::cell::OnceCell<crate::harness::hosted::View>);
+
+impl HostedViews {
+    fn get(
+        &self,
+        ask: impl FnOnce() -> crate::harness::hosted::View,
+    ) -> &crate::harness::hosted::View {
+        self.0.get_or_init(ask)
+    }
 }
 
 /// What the hosted Manvi, if there is one, says about its runs. Asking connects
@@ -379,12 +399,16 @@ pub(crate) fn confirm_vacated(
 ///
 /// A revision conflict means someone — most likely the owner — wrote in the
 /// meantime; the run is read and judged once more rather than overwritten.
-fn settle(state: &WorkbenchState, id: &str) -> Result<(Verdict, Value), WorkbenchError> {
+fn settle(
+    state: &WorkbenchState,
+    id: &str,
+    views: &HostedViews,
+) -> Result<(Verdict, Value), WorkbenchError> {
     for _ in 0..2 {
         let run = state
             .with_store(|store| query(store, "runs.get", &json!({"id":id}).to_string()))?["item"]
             .clone();
-        let verdict = observe(state, &run);
+        let verdict = observe(state, &run, views);
         let Verdict::Release(reason) = &verdict else {
             return Ok((verdict, run));
         };
@@ -433,7 +457,7 @@ pub(super) fn release(state: &WorkbenchState, input: &str) -> Result<Value, Work
     // A receipt its own observer could not store is better evidence than
     // anything judged here, so it goes in first.
     super::receipts::replay(state, Some(&request.id));
-    let (verdict, item) = settle(state, &request.id)?;
+    let (verdict, item) = settle(state, &request.id, &HostedViews::default())?;
     Ok(match verdict {
         Verdict::Release(_) => {
             json!({"ok":true,"released":true,"reason":item["reason"],"item":item})
@@ -603,9 +627,10 @@ pub(super) fn working_in(
             ));
         }
     }
+    let views = HostedViews::default();
     Ok(inside
         .into_iter()
-        .find_map(|run| match observe(state, &run) {
+        .find_map(|run| match observe(state, &run, &views) {
             Verdict::Keep(why) => Some((run, why)),
             Verdict::Release(_) => None,
         }))
@@ -656,8 +681,9 @@ fn sweep_pages(state: &WorkbenchState, max_pages: usize) -> Result<Swept, Workbe
         log::warn!(target: "workbench", "run reconciliation stopped at its page cap; some held runs were not examined");
     }
     let mut released = 0;
+    let views = HostedViews::default();
     for id in ids {
-        match settle(state, &id) {
+        match settle(state, &id, &views) {
             Ok((Verdict::Release(_), _)) => released += 1,
             Ok((Verdict::Keep(reason), _)) => {
                 log::info!(target: "workbench", "run {id} keeps its checkout: {reason}");
