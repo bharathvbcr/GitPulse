@@ -811,6 +811,15 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
             let (worktree_path, devmap_seeded, zero_copy_devmap, sparse_cone) = if !sparse
                 .is_empty()
             {
+                // Every git write the sparse path runs after `worktree add`
+                // passes the same policy gate as the add itself.
+                let mut gate = |args: &[&str]| -> Result<(), CommandError> {
+                    let argv: Vec<&str> =
+                        std::iter::once("git").chain(args.iter().copied()).collect();
+                    gitpulse_lib::harness::guard_command(&repo, &argv)
+                        .map(|_| ())
+                        .map_err(CommandError::plain)
+                };
                 let created = add_sparse_worktree_zero_copy(
                     &repo,
                     target_str,
@@ -818,6 +827,7 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                     base.as_deref(),
                     &sparse,
                     share_cache,
+                    &mut gate,
                 )
                 .map_err(CommandError::into_message)?;
                 (

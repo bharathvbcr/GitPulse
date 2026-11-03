@@ -9476,10 +9476,9 @@ mod tests {
     }
 
     fn git_ok(args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .output_locked()
-            .expect("git");
+        let mut cmd = std::process::Command::new("git");
+        crate::test_support::pin_git(&mut cmd);
+        let out = cmd.args(args).output_locked().expect("git");
         assert!(
             out.status.success(),
             "git {args:?}: {}",
