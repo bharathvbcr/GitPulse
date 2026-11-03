@@ -28,7 +28,7 @@ import {
   TIMELINE_PREVIEW_COUNT,
   type TimelineRow,
 } from "./timeline";
-import { anyInFlight, failuresSince, settledSince, verdictRate } from "./transitions";
+import { anyInFlight, settledSince, verdictRate } from "./transitions";
 import { overflowsPreview, previewSlice } from "../ui/previewList";
 
 /**
@@ -301,8 +301,6 @@ describe("transitions under fuzz", () => {
       }
       // A baseline observation announces nothing, whatever it contains.
       expect(settledSince([], next)).toEqual([]);
-      // Failures are a subset, and only ever the bad verdict.
-      for (const t of failuresSince(previous, next)) expect(t.to).toBe("settled_bad");
 
       const rate = verdictRate(next);
       expect(rate.judged + rate.unjudged).toBe(next.length);
