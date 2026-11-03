@@ -18,11 +18,11 @@
 //!    merge conflicts across worktree `HEAD`s in an isolated scratch object store.
 
 use crate::codeintel::worktree_overlay::{
-    compute_worktree_dirty_nodes_readonly, open_worktree_or_anchor_csr,
+    compute_worktree_dirty_nodes_readonly, open_worktree_or_anchor_csr, DirtyNodeScan,
 };
 use crate::engine::git_cli::{resolve_git_common_dir, validate_repo, DEFAULT_TIMEOUT};
 use crate::engine::object_quarantine::{MergeOutcome, ObjectQuarantine};
-use crate::engine::worktree::list_worktrees;
+use crate::engine::worktree::{list_worktrees, WorktreeInfo};
 use crate::ipc_error::CommandError;
 use devmap_query::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -127,6 +127,14 @@ pub struct OdbPairConflict {
     pub reason: Option<String>,
 }
 
+/// A radar layer that could not run for one worktree, with the reason. A worktree
+/// listed here is in `worktrees_unscanned`, never in `worktrees_scanned`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RadarScanError {
+    pub worktree: String,
+    pub error: String,
+}
+
 /// Unified 3-layer parallel agent radar report.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParallelAgentRadarReport {
@@ -138,7 +146,56 @@ pub struct ParallelAgentRadarReport {
     pub claim_conflicts: Vec<ClaimConflict>,
     pub semantic_conflicts: Vec<SemanticLaneConflict>,
     pub odb_merge_conflicts: Vec<OdbPairConflict>,
+    /// Any layer was capped: a conflict list, the ODB pair budget, or a
+    /// worktree's changed-file list.
     pub truncated: bool,
+    /// Why each unscanned worktree (or skipped layer) produced no answer. A
+    /// worktree whose directory is missing is unscanned without an entry here.
+    #[serde(default)]
+    pub scan_errors: Vec<RadarScanError>,
+}
+
+/// Per-worktree dirty-node scan results, tallied so a failed scan is never counted as done.
+#[derive(Default)]
+struct OverlayScan {
+    scanned: usize,
+    unscanned: usize,
+    truncated: bool,
+    errors: Vec<RadarScanError>,
+    overlays: Vec<(String, Option<String>, RoaringBitmap)>,
+}
+
+fn scan_worktree_overlays(
+    worktrees: &[&WorktreeInfo],
+    mut scan: impl FnMut(&WorktreeInfo) -> Result<DirtyNodeScan, CommandError>,
+) -> OverlayScan {
+    let mut out = OverlayScan::default();
+    for wt in worktrees {
+        if !Path::new(&wt.path).is_dir() {
+            out.unscanned += 1;
+            continue;
+        }
+        match scan(wt) {
+            Ok(found) => {
+                out.scanned += 1;
+                out.truncated |= found.truncated;
+                if !found.dirty_nodes.is_empty() {
+                    out.overlays
+                        .push((wt.path.clone(), wt.branch.clone(), found.dirty_nodes));
+                }
+            }
+            Err(err) => {
+                // The listing's `dirty_files` count says the worktree has changes, not
+                // that its nodes were scanned; a failed scan is unscanned.
+                out.unscanned += 1;
+                out.errors.push(RadarScanError {
+                    worktree: wt.path.clone(),
+                    error: err.message().to_string(),
+                });
+            }
+        }
+    }
+    out
 }
 
 fn now_epoch_ms() -> u64 {
@@ -243,10 +300,7 @@ fn acquire_bus_file_lock(
 }
 
 #[cfg(not(unix))]
-fn acquire_bus_file_lock(
-    lanes_dir: &Path,
-    create_dir: bool,
-) -> Result<Option<()>, CommandError> {
+fn acquire_bus_file_lock(lanes_dir: &Path, create_dir: bool) -> Result<Option<()>, CommandError> {
     if create_dir {
         fs::create_dir_all(lanes_dir).map_err(|e| {
             CommandError::from(format!("cannot create {}: {e}", lanes_dir.display()))
@@ -303,8 +357,12 @@ fn read_json_bounded<T: for<'de> Deserialize<'de> + Default>(
     if buf.is_empty() {
         return Ok(T::default());
     }
-    serde_json::from_slice(&buf)
-        .map_err(|e| CommandError::from(format!("corrupt coordination state {}: {e}", path.display())))
+    serde_json::from_slice(&buf).map_err(|e| {
+        CommandError::from(format!(
+            "corrupt coordination state {}: {e}",
+            path.display()
+        ))
+    })
 }
 
 fn sanitize_token(label: &str, val: &str, max_len: usize) -> Result<String, CommandError> {
@@ -765,7 +823,9 @@ fn compute_semantic_conflicts(
 /// 1. Pre-edit file & symbol claim overlaps
 /// 2. Zero-copy `WorktreeOverlay` `RoaringBitmap` + 1-hop `CsrGraphReader` caller/callee collisions
 /// 3. Quarantined ODB 3-way `git merge-tree` committed conflict checks
-pub fn scan_parallel_agent_radar(repo_path: &str) -> Result<ParallelAgentRadarReport, CommandError> {
+pub fn scan_parallel_agent_radar(
+    repo_path: &str,
+) -> Result<ParallelAgentRadarReport, CommandError> {
     let repo = validate_repo(repo_path)?;
     let lanes = list_lanes(repo_path)?;
     let mut claim_conflicts = compute_claim_conflicts(&lanes);
@@ -788,32 +848,16 @@ pub fn scan_parallel_agent_radar(repo_path: &str) -> Result<ParallelAgentRadarRe
     let csr_graph_available = csr_opt.is_some();
     let csr_generation = csr_opt.as_ref().map(|(_, g)| *g);
 
-    let mut worktrees_scanned = 0usize;
-    let mut worktrees_unscanned = 0usize;
-    let mut overlays: Vec<(String, Option<String>, RoaringBitmap)> = Vec::new();
-
-    for wt in &non_bare {
-        let wt_dir = Path::new(&wt.path);
-        if !wt_dir.is_dir() {
-            worktrees_unscanned += 1;
-            continue;
-        }
-        match compute_worktree_dirty_nodes_readonly(&wt.path, Some(&anchor_path)) {
-            Ok(dirty_nodes) => {
-                worktrees_scanned += 1;
-                if !dirty_nodes.is_empty() {
-                    overlays.push((wt.path.clone(), wt.branch.clone(), dirty_nodes));
-                }
-            }
-            Err(_) => {
-                if wt.dirty_files.is_some() {
-                    worktrees_scanned += 1;
-                } else {
-                    worktrees_unscanned += 1;
-                }
-            }
-        }
-    }
+    let OverlayScan {
+        scanned: worktrees_scanned,
+        unscanned: worktrees_unscanned,
+        truncated: overlays_truncated,
+        errors: mut scan_errors,
+        overlays,
+    } = scan_worktree_overlays(&non_bare, |wt| {
+        compute_worktree_dirty_nodes_readonly(&wt.path, Some(&anchor_path))
+    });
+    truncated |= overlays_truncated;
 
     let mut semantic_conflicts = match csr_opt.as_ref() {
         Some((csr, _)) => compute_semantic_conflicts(&overlays, csr),
@@ -827,7 +871,14 @@ pub fn scan_parallel_agent_radar(repo_path: &str) -> Result<ParallelAgentRadarRe
     let mut odb_merge_conflicts = Vec::new();
     let mut pairs_checked = 0usize;
 
-    if let Ok(quarantine) = ObjectQuarantine::new(&anchor_path) {
+    let quarantine = ObjectQuarantine::new(&anchor_path);
+    if let Err(err) = &quarantine {
+        scan_errors.push(RadarScanError {
+            worktree: anchor_path.to_string_lossy().into_owned(),
+            error: format!("ODB merge layer skipped: {err}"),
+        });
+    }
+    if let Ok(quarantine) = quarantine {
         'outer: for i in 0..non_bare.len() {
             for j in (i + 1)..non_bare.len() {
                 let wa = non_bare[i];
@@ -848,9 +899,7 @@ pub fn scan_parallel_agent_radar(repo_path: &str) -> Result<ParallelAgentRadarRe
                 ) {
                     Ok(MergeOutcome::Clean { .. }) => {}
                     Ok(MergeOutcome::Conflicted {
-                        paths,
-                        paths_total,
-                        ..
+                        paths, paths_total, ..
                     }) => {
                         odb_merge_conflicts.push(OdbPairConflict {
                             worktree_a: wa.path.clone(),
@@ -892,6 +941,7 @@ pub fn scan_parallel_agent_radar(repo_path: &str) -> Result<ParallelAgentRadarRe
         semantic_conflicts,
         odb_merge_conflicts,
         truncated,
+        scan_errors,
     })
 }
 
@@ -903,7 +953,9 @@ mod tests {
     use std::process::Command;
 
     fn git(repo: &Path, args: &[&str]) {
-        let out = Command::new("git")
+        let mut out_cmd = Command::new("git");
+        crate::test_support::pin_git(&mut out_cmd);
+        let out = out_cmd
             .current_dir(repo)
             .args(args)
             .output_locked()
@@ -992,9 +1044,25 @@ mod tests {
         assert_eq!(inbox_b.messages[0].seq, 1);
 
         // Adversarial validation: empty body and oversized body are rejected!
-        assert!(post_message(wt_a.to_str().unwrap(), "claude-1", None, "note", "   ", None).is_err());
+        assert!(post_message(
+            wt_a.to_str().unwrap(),
+            "claude-1",
+            None,
+            "note",
+            "   ",
+            None
+        )
+        .is_err());
         let huge = "x".repeat(MAX_MESSAGE_BODY_BYTES + 1);
-        assert!(post_message(wt_a.to_str().unwrap(), "claude-1", None, "note", &huge, None).is_err());
+        assert!(post_message(
+            wt_a.to_str().unwrap(),
+            "claude-1",
+            None,
+            "note",
+            &huge,
+            None
+        )
+        .is_err());
 
         // Release lane cleans up claim.
         assert!(release_lane(wt_a.to_str().unwrap(), "claude-1").unwrap());
@@ -1039,11 +1107,23 @@ mod tests {
         let wt_b = wt_parent.path().join("lane-callee");
         git(
             anchor,
-            &["worktree", "add", "-b", "lane/caller", wt_a.to_str().unwrap()],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane/caller",
+                wt_a.to_str().unwrap(),
+            ],
         );
         git(
             anchor,
-            &["worktree", "add", "-b", "lane/callee", wt_b.to_str().unwrap()],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane/callee",
+                wt_b.to_str().unwrap(),
+            ],
         );
         crate::test_support::trust_repo(&wt_a);
         crate::test_support::trust_repo(&wt_b);
@@ -1090,7 +1170,16 @@ mod tests {
         git(plain, &["add", "hello.rs"]);
         git(
             plain,
-            &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
         );
         crate::test_support::trust_repo(plain);
 
@@ -1116,20 +1205,39 @@ mod tests {
         crate::test_support::trust_repo(anchor);
         crate::devmap::ensure_state_dir_excluded(anchor);
         fs::create_dir_all(anchor.join("src")).unwrap();
-        fs::write(anchor.join("src/caller.rs"), "pub fn probe_caller() { probe_callee(); }\n").unwrap();
+        fs::write(
+            anchor.join("src/caller.rs"),
+            "pub fn probe_caller() { probe_callee(); }\n",
+        )
+        .unwrap();
         fs::write(anchor.join("src/callee.rs"), "pub fn probe_callee() {}\n").unwrap();
         git(anchor, &["add", "src/caller.rs", "src/callee.rs"]);
         git(
             anchor,
-            &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "seed"],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "seed",
+            ],
         );
         let _csr = crate::codeintel::open_repo_csr_graph(anchor.to_str().unwrap()).unwrap();
 
         let wt_parent = tempfile::tempdir().unwrap();
         let wt_a = wt_parent.path().join("ro-caller");
         let wt_b = wt_parent.path().join("ro-callee");
-        git(anchor, &["worktree", "add", "-b", "ro/caller", wt_a.to_str().unwrap()]);
-        git(anchor, &["worktree", "add", "-b", "ro/callee", wt_b.to_str().unwrap()]);
+        git(
+            anchor,
+            &["worktree", "add", "-b", "ro/caller", wt_a.to_str().unwrap()],
+        );
+        git(
+            anchor,
+            &["worktree", "add", "-b", "ro/callee", wt_b.to_str().unwrap()],
+        );
         crate::test_support::trust_repo(&wt_a);
         crate::test_support::trust_repo(&wt_b);
         provision_worktree_devmap_zero_copy(anchor, &wt_a).unwrap();
@@ -1140,8 +1248,16 @@ mod tests {
         // Leave `wt_b` completely unprovisioned (no `.devmap` directory at all) to also
         // exercise `fallback_anchor` resolution in `compute_worktree_dirty_nodes_readonly`.
 
-        fs::write(wt_a.join("src/caller.rs"), "pub fn probe_caller() { probe_callee(99); }\n").unwrap();
-        fs::write(wt_b.join("src/callee.rs"), "pub fn probe_callee(x: i32) {}\n").unwrap();
+        fs::write(
+            wt_a.join("src/caller.rs"),
+            "pub fn probe_caller() { probe_callee(99); }\n",
+        )
+        .unwrap();
+        fs::write(
+            wt_b.join("src/callee.rs"),
+            "pub fn probe_callee(x: i32) {}\n",
+        )
+        .unwrap();
 
         let radar = scan_parallel_agent_radar(anchor.to_str().unwrap()).unwrap();
         assert!(
@@ -1201,9 +1317,103 @@ mod tests {
         )
         .unwrap();
         assert_eq!(claim2.claimed_files, vec!["src/auth/jwt.rs"]);
-        assert_eq!(conflicts.len(), 1, "normalized path claims must overlap: {conflicts:?}");
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "normalized path claims must overlap: {conflicts:?}"
+        );
         assert_eq!(conflicts[0].overlapping_files, vec!["src/auth/jwt.rs"]);
         assert_eq!(conflicts[0].overlapping_symbols, vec!["auth::verify"]);
     }
-}
 
+    #[test]
+    fn radar_counts_a_worktree_whose_scan_failed_as_unscanned_and_says_why() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path();
+        crate::test_support::trust_repo(anchor);
+        let _csr = crate::codeintel::open_repo_csr_graph(anchor.to_str().unwrap()).unwrap();
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("broken-overlay");
+        git(
+            anchor,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "radar/broken",
+                wt.to_str().unwrap(),
+            ],
+        );
+        crate::test_support::trust_repo(&wt);
+        // Dirty, so the listing carries `dirty_files: Some(_)` -- the old code's
+        // reason to count a failed scan as done.
+        fs::write(wt.join("dirty.txt"), "x").unwrap();
+        let overlay_path = crate::codeintel::worktree_overlay_path(wt.to_str().unwrap());
+        fs::create_dir_all(overlay_path.parent().unwrap()).unwrap();
+        fs::write(&overlay_path, b"{ not json").unwrap();
+
+        let radar = scan_parallel_agent_radar(anchor.to_str().unwrap()).unwrap();
+        let wt_canon = wt.canonicalize().unwrap();
+        let failed = radar
+            .scan_errors
+            .iter()
+            .find(|e| {
+                Path::new(&e.worktree).canonicalize().ok().as_deref() == Some(wt_canon.as_path())
+            })
+            .unwrap_or_else(|| panic!("scan failure must be surfaced: {radar:?}"));
+        assert!(!failed.error.is_empty());
+        assert!(radar.worktrees_unscanned >= 1, "{radar:?}");
+    }
+
+    fn listed_worktree_with_dirty_files(
+    ) -> (tempfile::TempDir, tempfile::TempDir, Vec<WorktreeInfo>) {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path();
+        crate::test_support::trust_repo(anchor);
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("scan-seam");
+        git(
+            anchor,
+            &["worktree", "add", "-b", "radar/seam", wt.to_str().unwrap()],
+        );
+        crate::test_support::trust_repo(&wt);
+        fs::write(wt.join("dirty.txt"), "x").unwrap();
+        let listed = list_worktrees(anchor.to_str().unwrap()).unwrap();
+        (anchor_dir, wt_parent, listed)
+    }
+
+    #[test]
+    fn scan_tally_never_counts_an_errored_scan_as_scanned_even_with_a_dirty_count() {
+        let (_a, _p, listed) = listed_worktree_with_dirty_files();
+        let scan_seam: Vec<&WorktreeInfo> =
+            listed.iter().filter(|w| w.name == "scan-seam").collect();
+        assert_eq!(scan_seam.len(), 1);
+        assert!(
+            scan_seam[0].dirty_files.is_some(),
+            "premise: listing counted dirty files"
+        );
+
+        let tally = scan_worktree_overlays(&scan_seam, |_| Err(CommandError::from("boom")));
+        assert_eq!(tally.scanned, 0);
+        assert_eq!(tally.unscanned, 1);
+        assert_eq!(tally.errors.len(), 1);
+        assert!(tally.errors[0].error.contains("boom"));
+    }
+
+    #[test]
+    fn scan_tally_carries_a_truncated_worktree_scan_into_the_radar_flag() {
+        let (_a, _p, listed) = listed_worktree_with_dirty_files();
+        let scan_seam: Vec<&WorktreeInfo> =
+            listed.iter().filter(|w| w.name == "scan-seam").collect();
+        let tally = scan_worktree_overlays(&scan_seam, |_| {
+            Ok(DirtyNodeScan {
+                dirty_nodes: RoaringBitmap::new(),
+                truncated: true,
+            })
+        });
+        assert_eq!(tally.scanned, 1);
+        assert!(tally.truncated);
+        let tally = scan_worktree_overlays(&scan_seam, |_| Ok(DirtyNodeScan::default()));
+        assert!(!tally.truncated);
+    }
+}

@@ -125,45 +125,6 @@ pub struct Shed {
     pub reactive: bool,
 }
 
-/// Maximum allowed RSS per worker process: 512 MB.
-pub const MAX_WORKER_RSS_BYTES: u64 = 512 * 1024 * 1024;
-
-/// Verifies that a process's RSS does not breach the 512MB worker ceiling.
-pub fn check_worker_rss_ceiling(pid: u32, rss_bytes: u64) -> Result<(), String> {
-    if rss_bytes > MAX_WORKER_RSS_BYTES {
-        Err(format!(
-            "Process {pid} breached worker RSS ceiling: {rss_bytes} bytes exceeds 512MB limit"
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-/// 4-tier load shedding tiers based on total host memory utilization ratio:
-/// Normal (< 70%), Throttle (70% - 80%), ShedAdvisory (80% - 90%), EmergencyLockdown (>= 90%).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LoadShedTier {
-    Normal,
-    Throttle,
-    ShedAdvisory,
-    EmergencyLockdown,
-}
-
-/// Evaluate load shed tier from host memory utilization ratio (0.0 to 1.0).
-pub fn evaluate_load_shed(memory_utilization_ratio: f64) -> LoadShedTier {
-    if memory_utilization_ratio.is_nan() || memory_utilization_ratio >= 0.90 {
-        LoadShedTier::EmergencyLockdown
-    } else if memory_utilization_ratio >= 0.80 {
-        LoadShedTier::ShedAdvisory
-    } else if memory_utilization_ratio >= 0.70 {
-        LoadShedTier::Throttle
-    } else {
-        LoadShedTier::Normal
-    }
-}
-
-
 /// What the governor decides from, copied out of a sensor report so the
 /// decision is a pure function of it.
 #[derive(Debug, Clone, PartialEq)]

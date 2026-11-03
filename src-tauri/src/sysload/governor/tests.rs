@@ -774,26 +774,3 @@ fn adv_a_thousand_low_disk_launches_do_not_write_a_thousand_events() {
         "{events} host_load.advisory events for 1000 identical launches"
     );
 }
-
-#[test]
-fn test_worker_rss_ceiling_enforcement() {
-    assert!(check_worker_rss_ceiling(1234, 100 * 1024 * 1024).is_ok());
-    assert!(check_worker_rss_ceiling(1234, 512 * 1024 * 1024).is_ok());
-    let err = check_worker_rss_ceiling(1234, 513 * 1024 * 1024).unwrap_err();
-    assert!(err.contains("breached worker RSS ceiling"));
-    assert!(err.contains("1234"));
-}
-
-#[test]
-fn test_evaluate_load_shed_tiers() {
-    assert_eq!(evaluate_load_shed(0.50), LoadShedTier::Normal);
-    assert_eq!(evaluate_load_shed(0.69), LoadShedTier::Normal);
-    assert_eq!(evaluate_load_shed(0.70), LoadShedTier::Throttle);
-    assert_eq!(evaluate_load_shed(0.79), LoadShedTier::Throttle);
-    assert_eq!(evaluate_load_shed(0.80), LoadShedTier::ShedAdvisory);
-    assert_eq!(evaluate_load_shed(0.89), LoadShedTier::ShedAdvisory);
-    assert_eq!(evaluate_load_shed(0.90), LoadShedTier::EmergencyLockdown);
-    assert_eq!(evaluate_load_shed(0.98), LoadShedTier::EmergencyLockdown);
-    assert_eq!(evaluate_load_shed(f64::NAN), LoadShedTier::EmergencyLockdown);
-}
-
