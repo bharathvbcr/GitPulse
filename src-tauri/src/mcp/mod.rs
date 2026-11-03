@@ -1932,12 +1932,24 @@ fn build_tools() -> Vec<Value> {
                             ]
                         }
                     },
-                    "truncated": { "type": "boolean" }
+                    "truncated": { "type": "boolean" },
+                    "scan_errors": {
+                        "type": "array",
+                        "description": "Why each unscanned worktree, or skipped layer, produced no answer. `worktrees_unscanned` counts them; a worktree whose directory is missing is unscanned without an entry here.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "worktree": { "type": "string" },
+                                "error": { "type": "string" }
+                            },
+                            "required": ["worktree", "error"]
+                        }
+                    }
                 },
                 "required": [
                     "ok", "repo_path", "worktrees_scanned", "worktrees_unscanned",
                     "lanes_registered", "csr_graph_available", "csr_generation",
-                    "claim_conflicts", "semantic_conflicts", "odb_merge_conflicts", "truncated"
+                    "claim_conflicts", "semantic_conflicts", "odb_merge_conflicts", "truncated", "scan_errors"
                 ]
             }),
         ),
@@ -3167,7 +3179,9 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 "claim_conflicts": report.claim_conflicts,
                 "semantic_conflicts": report.semantic_conflicts,
                 "odb_merge_conflicts": report.odb_merge_conflicts,
-                "truncated": report.truncated
+                "truncated": report.truncated,
+                // Depends on zc/fix-engine 9b404787 (RadarReport::scan_errors).
+                "scan_errors": report.scan_errors
             }))
         }
         "gitpulse_worktree_overlay_sync" => {
@@ -9429,6 +9443,9 @@ mod tests {
         let (err, radar_after) =
             tool_json("gitpulse_worktree_radar", json!({ "repo_path": anchor }));
         assert!(!err, "{radar_after}");
+        // Depends on zc/fix-engine 9b404787: a failed per-worktree scan is
+        // carried to the client with its reason, never only counted.
+        assert!(radar_after["scan_errors"].is_array(), "{radar_after}");
         assert_eq!(radar_after["lanes_registered"], 1);
         assert_eq!(radar_after["claim_conflicts"].as_array().unwrap().len(), 0);
     }
