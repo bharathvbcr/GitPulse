@@ -13,6 +13,7 @@ import {
   bundleSpecs,
   checkSevenZipListing,
   createBudget,
+  credentialFreeEnv,
   declaredBinaryNames,
   extractWithSevenZip,
   expectedAssetNames,
@@ -515,6 +516,35 @@ describe("7z listing", () => {
         process.env.PATH = previous.path;
         if (previous.listing === undefined) delete process.env.FAKE_7Z_LISTING;
         else process.env.FAKE_7Z_LISTING = previous.listing;
+      }
+    });
+
+    it("drops credential variables and keeps the rest", () => {
+      expect(credentialFreeEnv({ PATH: "/bin", GH_TOKEN: "t", GITHUB_TOKEN: "t", ACTIONS_ID_TOKEN_REQUEST_TOKEN: "t", NPM_PASSWORD: "p", AWS_SECRET_ACCESS_KEY: "s", HOME: "/h" }))
+        .toEqual({ PATH: "/bin", HOME: "/h" });
+    });
+
+    it.skipIf(process.platform === "win32")("never hands 7-Zip the job's GitHub token (stub 7z on PATH)", () => {
+      const dir = mkdtempSync(path.join(tmpdir(), "gitpulse-stub-7z-env-"));
+      tempDirs.push(dir);
+      const seen = path.join(dir, "env.txt");
+      writeFileSync(path.join(dir, "7z"), `#!/bin/bash\nenv >> "${seen}"\nif [ "$1" = "l" ]; then cat "$FAKE_7Z_LISTING"; fi\nexit 0\n`, { mode: 0o755 });
+      writeFileSync(path.join(dir, "listing.txt"), header("Nsis"));
+      const previous = { path: process.env.PATH, listing: process.env.FAKE_7Z_LISTING, token: process.env.GH_TOKEN };
+      process.env.PATH = `${dir}${path.delimiter}${process.env.PATH ?? ""}`;
+      process.env.FAKE_7Z_LISTING = path.join(dir, "listing.txt");
+      process.env.GH_TOKEN = "ghs_must_not_reach_7z";
+      try {
+        extractWithSevenZip(path.join(dir, "a.bin"), path.join(dir, "out"), { format: "nsis" });
+        const env = readFileSync(seen, "utf8");
+        expect(env).toContain("FAKE_7Z_LISTING=");
+        expect(env).not.toContain("ghs_must_not_reach_7z");
+      } finally {
+        process.env.PATH = previous.path;
+        for (const [name, value] of [["FAKE_7Z_LISTING", previous.listing], ["GH_TOKEN", previous.token]] as const) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
       }
     });
   });

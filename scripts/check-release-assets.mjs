@@ -578,6 +578,21 @@ function peMachine(file) {
   }
 }
 
+/** Environment names that carry a credential, by the conventions CI and `gh` use. */
+const CREDENTIAL_ENV = /TOKEN|SECRET|PASSWORD|CREDENTIAL/i;
+
+/**
+ * The environment for a tool that parses untrusted bytes. The verify job runs
+ * with `GH_TOKEN` set for `gh`; 7-Zip needs no credential, so a parser bug an
+ * installer can reach must not find one in its environment.
+ *
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {NodeJS.ProcessEnv}
+ */
+export function credentialFreeEnv(env) {
+  return Object.fromEntries(Object.entries(env).filter(([name]) => !CREDENTIAL_ENV.test(name)));
+}
+
 /**
  * Extracts a Windows installer with 7-Zip, which opens both MSI and NSIS and
  * ships on the runner image the release `verify` job uses. A missing `7z`
@@ -602,7 +617,7 @@ export function extractWithSevenZip(archive, outDir, { format, maxBytes = MAX_UN
   /** @param {string[]} args @param {import("node:child_process").SpawnSyncOptionsWithStringEncoding} spawnOptions */
   const sevenZip = (args, spawnOptions) => {
     const timeout = budget ? budget.callTimeout(EXTRACT_TIMEOUT_MS) : EXTRACT_TIMEOUT_MS;
-    const result = spawnSync("7z", args, { ...spawnOptions, timeout });
+    const result = spawnSync("7z", args, { ...spawnOptions, env: credentialFreeEnv(process.env), timeout });
     if (result.error) {
       if (timeout < EXTRACT_TIMEOUT_MS && /** @type {NodeJS.ErrnoException} */ (result.error).code === "ETIMEDOUT") throw new BudgetExhausted();
       throw new UnreadableBundle(`7z could not run: ${result.error.message}`);
