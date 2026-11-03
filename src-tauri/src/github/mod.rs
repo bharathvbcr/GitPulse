@@ -178,9 +178,10 @@ pub struct GitHubRunsReport {
     pub runs: Vec<WorkflowRunInfo>,
     pub truncated: bool,
     pub error: Option<String>,
-    /// Runs that finished red (`outcome: failed`) since the previous look at
-    /// this repository, decided by [`outcome::Observer`] and not by the panel.
-    /// Empty on the first look, when nothing could have been seen moving, and
+    /// Runs that finished red (`outcome: failed`) that the panel's own previous
+    /// listing of this repository showed in flight, decided by
+    /// [`outcome::Observer`] and not by the panel. Empty on the panel's first
+    /// look (and after a long gap), when it had seen nothing moving, and
     /// whenever `checked` is false: absent news is not good news, and
     /// `checked` is what says which.
     #[serde(default)]
@@ -206,7 +207,7 @@ impl GitHubRunsReport {
 
 /// The workflow-run listing on its own, for the Remote panel's live poll. It
 /// folds a checked listing into the shared baseline and fills `went_red` from
-/// the panel's own cursor (see `outcome::went_red`).
+/// the panel's own baseline (see `outcome::went_red`).
 ///
 /// Every failure path returns `checked: false` with a reason. A poll that
 /// cannot reach `gh` must never look like a poll that found nothing.
@@ -217,7 +218,7 @@ pub fn load_workflow_runs_report(repo_path: &str) -> GitHubRunsReport {
 }
 
 /// The same listing for the CI watcher. It folds a checked listing into the
-/// shared baseline too, but leaves the panel's cursor alone and returns an
+/// shared baseline too, but leaves the panel's baseline alone and returns an
 /// empty `went_red`: the watcher takes its news from the observer's queue.
 pub fn watch_workflow_runs_report(repo_path: &str) -> GitHubRunsReport {
     let (report, requested_at) = fetch_workflow_runs_report(repo_path);

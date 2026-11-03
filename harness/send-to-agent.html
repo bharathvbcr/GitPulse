@@ -145,12 +145,12 @@
 
       // ---- the attempt changed between the preview and the send -----------------
       reset();
-      scenario = { ...scenario, route: "mailbox", reason: "Live.", confirm: () => ({ error: { code: "route_changed", message: "This message would now go by resume and not by mailbox, which is what you were shown. Nothing was sent; read the preview again." } }) };
+      scenario = { ...scenario, route: "mailbox", reason: "Live.", confirm: () => ({ error: { code: "route_changed", message: "This message would now go by resume and not by mailbox, which is what you were shown. This press sent nothing; read the preview again." } }) };
       type(row, "Changed underneath");
       await wait(() => calls.previews.length === 1 && settled(row)(), "the preview");
       confirmBtn(row).click();
       await wait(() => calls.sends.length === 1 && q(row(), "send-to-agent-outcome"), "the refusal");
-      check("A refused route change says nothing was sent", () => q(row(), "send-to-agent-outcome").textContent.includes("Nothing was sent") && q(row(), "send-to-agent-outcome").dataset.tone === "error");
+      check("A refused route change says this press sent nothing", () => q(row(), "send-to-agent-outcome").textContent.includes("This press sent nothing") && q(row(), "send-to-agent-outcome").dataset.tone === "error");
       await wait(() => calls.previews.length === 2, "the route to be asked again");
       check("…and asks again instead of sending anywhere else", () => calls.previews.length === 2 && calls.sends.length === 1 && get(taskTerminalRequests).length === 0);
 
@@ -204,6 +204,33 @@
       await tick();
       await open(row);
       check("Closing and reopening the panel clears the warning", () => !q(row(), "send-to-agent-edit-warning"));
+
+      // ---- a managed follow-up whose wait ran out: Manvi may have written it ------
+      reset();
+      const TIMEOUT = { error: { code: "timeout", message: "Manvi did not answer within 65 seconds." } };
+      scenario = { ...scenario, route: "managed", managedState: "parked", reason: "This managed run is between turns.", confirm: () => TIMEOUT };
+      type(row, "Follow-up whose wait timed out");
+      await wait(() => calls.previews.length === 1 && settled(row)(), "the timed-out-scenario preview");
+      confirmBtn(row).click();
+      await wait(() => calls.sends.length === 1 && q(row(), "send-to-agent-outcome"), "the timed-out answer");
+      check("A managed send that errors is 'not confirmed sent', not 'nothing was sent'", () => { const o = q(row(), "send-to-agent-outcome"); return o.dataset.tone === "error" && o.textContent.includes("Not confirmed sent") && !o.textContent.includes("Nothing was sent"); });
+      check("…and the note editor warns that an edit is sent in addition, because the follow-up may have been written", () => { const w = q(row(), "send-to-agent-edit-warning"); return !!w && w.textContent.includes("sent in addition"); });
+      check("…while Confirm stays armed for the same request id", () => !confirmBtn(row).disabled && calls.sends.length === 1);
+      type(row, "An edit after the timed-out follow-up");
+      await wait(() => calls.previews.length === 2 && settled(row)(), "the preview of the edited note");
+      check("Editing keeps the warning: the earlier follow-up may still land", () => { const w = q(row(), "send-to-agent-edit-warning"); return !!w && w.textContent.includes("sent in addition") && calls.previews[1].request_id !== calls.sends[0].request_id; });
+      q(row(), "send-to-agent-cancel").click();
+      await tick();
+      await open(row);
+      check("Closing and reopening the panel clears it", () => !q(row(), "send-to-agent-edit-warning"));
+      // A route that writes nothing when it fails must not raise the same warning.
+      reset();
+      scenario = { ...scenario, route: "mailbox", managedState: undefined, reason: "Live.", confirm: () => ({ error: { code: "transport_error", message: "The mailbox could not be written." } }) };
+      type(row, "Mailbox write that failed");
+      await wait(() => calls.previews.length === 1 && settled(row)(), "the failing-mailbox preview");
+      confirmBtn(row).click();
+      await wait(() => calls.sends.length === 1 && q(row(), "send-to-agent-outcome"), "the failing-mailbox answer");
+      check("A failed mailbox send is 'not confirmed sent' but raises no may-have-been-delivered warning", () => q(row(), "send-to-agent-outcome").textContent.includes("Not confirmed sent") && !q(row(), "send-to-agent-edit-warning"));
 
       // ---- a Manvi that cannot take follow-ups -----------------------------------
       reset();

@@ -317,7 +317,7 @@ pub(super) fn send_with(
         return Err(WorkbenchError::new(
             "route_changed",
             format!(
-                "This message would now go by {} and not by {expected}, which is what you were shown. Nothing was sent; read the preview again.",
+                "This message would now go by {} and not by {expected}, which is what you were shown. This press sent nothing; read the preview again.",
                 route.name()
             ),
         ));

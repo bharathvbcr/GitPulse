@@ -400,6 +400,20 @@ fn a_preview_sends_nothing_and_a_confirm_sends_only_along_the_route_shown() {
     )
     .unwrap_err();
     assert_eq!(error.code, "route_changed");
+    // The message speaks of this press only: a different press may have
+    // already sent something, and "nothing was sent" would deny it.
+    assert!(
+        error
+            .message
+            .contains("This press sent nothing; read the preview again."),
+        "{}",
+        error.message
+    );
+    assert!(
+        !error.message.contains("Nothing was sent"),
+        "{}",
+        error.message
+    );
     assert_eq!(
         mailbox.pending(SESSION),
         0,

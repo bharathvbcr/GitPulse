@@ -57,14 +57,18 @@
 //! the panel's poll and the watcher's poll see the same history and a finish
 //! is detected once, whichever of them looked first. Detecting it once must
 //! not mean telling only one of them: the watcher drains a queue, and the
-//! panel reads a bounded log of red finishes past its own cursor, so a failure
-//! the watcher crossed first is still the panel's banner. Everything it holds
-//! is bounded.
+//! panel keeps a baseline of its own (what its last listing showed) and
+//! compares its next listing against that through the same [`diff`]. So a
+//! failure the watcher crossed first is still the panel's banner, but only if
+//! the panel had seen that run moving: a red the panel never watched is
+//! history to it, however long ago the watcher logged it. A listing the
+//! process-wide baseline ignores as stale still counts for the panel's, which
+//! has its own order. Everything it holds is bounded.
 use super::{GitHubRunsReport, WorkflowRunInfo};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// How a run stands. See the module docs for the table this implements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -162,15 +166,21 @@ pub fn diff(previous: Option<&Baseline>, runs: &[WorkflowRunInfo], truncated: bo
     }
 }
 
-/// Repositories the process remembers a baseline for. A baseline is at most one
-/// listing (twenty runs), so this bounds the whole structure.
+/// Repositories the process remembers a baseline for. Each holds two baselines
+/// (the process-wide one and the panel's own), each at most one listing (twenty
+/// runs), so this bounds the whole structure.
 pub const MAX_REPOSITORIES: usize = 64;
 /// Finishes queued for the watcher at once. Past it the oldest is dropped and
 /// counted, never the newest and never silently.
 pub const MAX_PENDING: usize = 256;
-/// Red finishes kept per repository for the panel's banner. Past it the oldest
-/// is dropped and counted ([`Observer::red_overflow`]).
-pub const MAX_RED_LOG: usize = 32;
+/// How long the panel's own baseline is believed: the panel's live-poll session
+/// ceiling, `DEFAULT_POLL_LIMITS.maxDurationMs` in `src/lib/delivery/pollSchedule.ts`
+/// (15 minutes). The renderer owns that number and there is no Rust constant
+/// to share, so a test pins the two together. A panel that last looked longer
+/// ago than a whole session was allowed to run has stopped watching; what it
+/// saw moving then is not what it is watching now, and a remount must not
+/// announce a run that was in flight an hour ago.
+pub const PANEL_SEEN_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// A finish the watcher has yet to act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,30 +195,33 @@ struct RepositoryBaseline {
     observed_at: Instant,
     /// Position in the observation order, for evicting the stalest repository.
     turn: u64,
-    /// Red finishes in the order they were seen, each with its sequence
-    /// number. The panel's cursor reads this; the watcher's queue does not.
-    red: VecDeque<(u64, WorkflowRunInfo)>,
-    /// The sequence number the panel has been told up to. `None` until its
-    /// first look at this repository, which announces nothing.
-    panel_cursor: Option<u64>,
+    /// What the panel's own last listing showed. `None` until its first look
+    /// at this repository (which announces nothing) and again once that look is
+    /// older than [`PANEL_SEEN_TTL`].
+    panel_seen: Option<PanelSeen>,
+}
+
+/// The panel's own view of a repository: the outcomes its last listing showed
+/// and when that listing was requested.
+struct PanelSeen {
+    runs: Baseline,
+    at: Instant,
 }
 
 /// One baseline per repository, shared by every poll in the process.
 ///
 /// A finish is *detected* once, against that one baseline, whichever poll
 /// looked first. It is then *delivered* to each consumer from its own place:
-/// the watcher drains [`Self::take_pending`], and the panel reads the
-/// repository's red log past its own cursor. Neither consumer can use up the
-/// other's news.
+/// the watcher drains [`Self::take_pending`], and the panel compares its own
+/// listings against what its previous listing showed. Neither consumer can use
+/// up the other's news, and the panel is never told of a run it did not see
+/// move.
 #[derive(Default)]
 pub struct Observer {
     repositories: HashMap<String, RepositoryBaseline>,
     pending: VecDeque<Finished>,
     dropped: u64,
-    red_overflow: u64,
     turn: u64,
-    /// Sequence number of the latest red finish seen anywhere.
-    seq: u64,
 }
 
 impl Observer {
@@ -243,24 +256,11 @@ impl Observer {
                 runs: Baseline::new(),
                 observed_at: at,
                 turn: self.turn,
-                red: VecDeque::new(),
-                panel_cursor: None,
+                panel_seen: None,
             });
         held.runs = baseline_of(runs);
         held.observed_at = at;
         held.turn = self.turn;
-        for run in observed
-            .finished
-            .iter()
-            .filter(|run| run.outcome == RunOutcome::Failed)
-        {
-            self.seq += 1;
-            if held.red.len() >= MAX_RED_LOG {
-                held.red.pop_front();
-                self.red_overflow += 1;
-            }
-            held.red.push_back((self.seq, run.clone()));
-        }
         self.evict();
         for run in &observed.finished {
             if self.pending.len() >= MAX_PENDING {
@@ -291,14 +291,30 @@ impl Observer {
         }
     }
 
-    /// The panel's look: fold the listing in like any other poll, then return
-    /// the red finishes this repository has logged past the panel's own cursor
-    /// (whoever saw them first) and move the cursor to the newest.
+    /// The panel's look: fold the listing into the process-wide baseline like
+    /// any other poll, then return the runs that are red in it and that the
+    /// panel's *own* previous listing showed in flight, and remember this
+    /// listing as what the panel has seen.
     ///
-    /// The panel's first look at a repository announces nothing: its cursor
-    /// starts where the log stood *before* this listing, so a finish this very
-    /// listing reveals is news and an older one is history. A listing ignored
-    /// as stale still delivers what the log already holds.
+    /// The comparison is [`diff`], the one definition of a finish, against the
+    /// panel's baseline instead of the process-wide one. So:
+    /// - the panel's first look at a repository announces nothing, and so does
+    ///   a look after [`PANEL_SEEN_TTL`] without one: nothing was being watched;
+    /// - a red the watcher crossed first is still the panel's news, once, if
+    ///   the panel had seen the run moving;
+    /// - a red the panel never saw moving is history to it, however recently
+    ///   the watcher logged it;
+    /// - a listing the process-wide baseline ignores as stale (the watcher's
+    ///   request was issued later and came back first) is still the panel's
+    ///   newest sight of the repository, because the panel's own polls never
+    ///   overlap. It is compared with the panel's baseline and moves it, but
+    ///   leaves the process-wide baseline alone. Dropping it would lose the
+    ///   banner outright when it is the listing that first shows the run
+    ///   settled: the panel stops polling once nothing is in flight, so there
+    ///   is no later listing to deliver it.
+    ///
+    /// A listing older than the panel's own baseline is out of order for the
+    /// panel too: it delivers nothing and moves nothing.
     pub fn panel_look(
         &mut self,
         repository: &str,
@@ -306,18 +322,29 @@ impl Observer {
         truncated: bool,
         at: Instant,
     ) -> Vec<WorkflowRunInfo> {
-        let before = self.seq;
-        self.observe(repository, runs, truncated, at);
+        // `None` is a listing stale against the process-wide baseline, which
+        // is no reason to ignore it for the panel's.
+        let _ = self.observe(repository, runs, truncated, at);
         let Some(held) = self.repositories.get_mut(repository) else {
             return Vec::new();
         };
-        let cursor = *held.panel_cursor.get_or_insert(before);
-        held.panel_cursor = Some(self.seq);
-        held.red
-            .iter()
-            .filter(|(seq, _)| *seq > cursor)
-            .map(|(_, run)| run.clone())
-            .collect()
+        if held.panel_seen.as_ref().is_some_and(|seen| at < seen.at) {
+            return Vec::new();
+        }
+        let previous = held
+            .panel_seen
+            .take()
+            .filter(|seen| at.saturating_duration_since(seen.at) <= PANEL_SEEN_TTL);
+        let news = diff(previous.as_ref().map(|seen| &seen.runs), runs, truncated)
+            .finished
+            .into_iter()
+            .filter(|run| run.outcome == RunOutcome::Failed)
+            .collect();
+        held.panel_seen = Some(PanelSeen {
+            runs: baseline_of(runs),
+            at,
+        });
+        news
     }
 
     /// Up to `max` finishes, oldest first, removed from the queue.
@@ -330,12 +357,6 @@ impl Observer {
     /// was never acted on.
     pub fn dropped(&self) -> u64 {
         self.dropped
-    }
-
-    /// Red finishes that left a repository's log before any consumer could
-    /// have read them. Nonzero means the panel may have missed a banner.
-    pub fn red_overflow(&self) -> u64 {
-        self.red_overflow
     }
 }
 
@@ -359,12 +380,13 @@ pub fn repository_key(owner: &str, repo: &str) -> String {
 }
 
 /// The panel's look at a successful report: fold it into the process-wide
-/// baseline and return the runs that finished *red* since the panel last
-/// looked, including ones the watcher saw cross first. Only `failed` is red:
-/// see the module docs for why `cancelled` and `needs_person` are not.
+/// baseline and return the runs that finished *red* since the panel's own last
+/// listing showed them moving, including ones the watcher saw cross first. Only
+/// `failed` is red: see the module docs for why `cancelled` and `needs_person`
+/// are not.
 ///
 /// Only the Remote panel's poll calls this, because it moves the panel's
-/// cursor. The watcher's poll uses [`observe_report`].
+/// baseline. The watcher's poll uses [`observe_report`].
 pub fn went_red(report: &GitHubRunsReport, requested_at: Instant) -> Vec<WorkflowRunInfo> {
     if !report.checked {
         return Vec::new();
@@ -376,8 +398,8 @@ pub fn went_red(report: &GitHubRunsReport, requested_at: Instant) -> Vec<Workflo
 }
 
 /// The watcher's look at a successful report: fold it into the baseline, which
-/// queues any finish for [`Observer::take_pending`] and logs a red one for the
-/// panel, and leave the panel's cursor where it is.
+/// queues any finish for [`Observer::take_pending`], and leave the panel's
+/// baseline where it is.
 pub fn observe_report(report: &GitHubRunsReport, requested_at: Instant) {
     if !report.checked {
         return;

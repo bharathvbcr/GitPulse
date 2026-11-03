@@ -79,25 +79,12 @@ export function settledSince<T extends PhasedRow>(
 }
 
 /**
- * The transitions worth telling someone about: the ones that ended badly.
- *
- * `unknown` is excluded even though it is settled. An unjudgeable state is not
- * a failure, and a notice that cries failure over a state this build has never
- * heard of teaches people to ignore the notices.
- */
-export function failuresSince<T extends PhasedRow>(
-  previous: readonly T[],
-  next: readonly T[],
-): PhaseTransition<T>[] {
-  return settledSince(previous, next).filter((t) => t.to === "settled_bad");
-}
-
-/**
  * The transitions that ended well.
  *
- * Separate from the failures rather than derived by negation, because the
- * complement of "ended badly" includes `unknown`, and calling that a success
- * is the exact mistake [`isVerdict`] exists to prevent.
+ * Filtered on `settled_ok` rather than derived by negating "ended badly",
+ * because that complement includes `unknown`, and calling that a success is
+ * the exact mistake [`isVerdict`] exists to prevent. An unjudgeable state is
+ * settled but is neither a success to count nor a failure to announce.
  */
 export function successesSince<T extends PhasedRow>(
   previous: readonly T[],
