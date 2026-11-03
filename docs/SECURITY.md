@@ -321,6 +321,54 @@ flowchart TD
   The watcher widens nothing that can run; it adds one reader of `gh` output
   inside the existing trust gate and one writer of a notice-only store method.
 
+### Send to Agent: The Mailbox and the Waiting Hook
+- **Send to agent** puts a CI result, or a person's note, back into the agent
+  that pushed the branch. It is never automatic: the panel shows the exact
+  text and the route a send would take (live session, resume, managed
+  follow-up, or unavailable with the reason), and sends only on an explicit
+  confirm of that route. The host re-decides the route at confirm time and
+  refuses (`route_changed`, nothing sent) if it is no longer the one shown.
+  Text from the producer (a workflow or branch name, a run URL) has control
+  and bidirectional characters made visible before it is composed, and the
+  message is held to 8 KiB, plain text with line breaks and tabs only.
+- A live Claude session is reached through a **filesystem mailbox**, not a
+  socket: `<config dir>/agent-mailbox/<session uuid>/`. Directories are
+  `0700`, files `0600`, every open is `O_NOFOLLOW`, a symlink anywhere on the
+  path is refused, and an object not owned by the current user or wider than
+  its mode is refused and never read. Writes are temp-file plus
+  `rename`-without-replace; a claim is a second atomic rename, so a message is
+  delivered once even though the plugin's hook and the `--settings` copy both
+  run. Per session: 8 pending messages, 2 waiting hooks; 64 sessions and 16
+  waiting hooks overall; pending messages expire after 2 hours, claimed ones
+  after 10 minutes.
+- Delivery is a second `Stop` hook entry, `gitpulse-hook deliver`, registered
+  with `asyncRewake: true` and a 1800 s timeout (Claude Code hooks reference,
+  https://code.claude.com/docs/en/hooks.md: an `asyncRewake` hook runs in the
+  background and wakes the session on exit 2, showing stderr as a system
+  reminder). It waits at most 1740 s with a bounded 250 ms poll, claims one
+  message, writes it to stderr and exits 2. Every other outcome (timeout,
+  unknown session, full caps, an untrusted mailbox, any I/O error) exits 0. Only
+  a session GitPulse launched has a mailbox: the hook acts only when
+  `GITPULSE_SESSION_ID` is set and the payload's `session_id` is a canonical
+  UUID, and an unknown session creates nothing on disk. When Claude is already
+  continuing because of a stop hook (`stop_hook_active`), the hook takes at
+  most one message without waiting, so it cannot extend the host's
+  continuation chain by itself.
+- A **queued** message is not **read**: the panel says queued, picked up, or
+  delivered, and never that the agent read or acted on it. A managed follow-up
+  goes through Manvi's `work.runs.managed.continue`; a Manvi that does not
+  advertise it is reported as "this Manvi version cannot take follow-ups", and
+  a run not prepared for follow-ups as that, neither as a run failure.
+- Security impact: a same-uid process could always type into an agent's
+  terminal, so the mailbox widens nothing a local user could not already do; it
+  adds one new way for text to reach an agent's context, and that text is only
+  what a person previewed and confirmed. No new network endpoint, credential,
+  socket or Tauri command (the host method is `runs.send_to_agent` on the
+  existing workbench seam). The hook adds a background process per idle
+  GitPulse-launched Claude session, bounded by the waiter caps and the
+  timeout. Expired entries are removed by the deposit and claim paths
+  themselves, not by a daemon.
+
 ### Local Dependency Scans Read, They Do Not Build
 - Health's local dependency scan runs whichever audit CLIs are already on
   PATH, and each is invoked so that it reads dependency metadata instead of

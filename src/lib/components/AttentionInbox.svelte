@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
   import NativeNotificationSettings from "./NativeNotificationSettings.svelte";
+  import SendToAgent from "./SendToAgent.svelte";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { readBackgroundDocument } from "../runtime/foreground";
   import { createLiveLoader } from "../workbench/liveLoader";
@@ -107,6 +108,10 @@
               <span>{formatRelativeTime(item.created_at)}</span>
             </div>
             <button type="button" class="gp-btn" onclick={() => open(item)} disabled={busy || item.target_status === "task_deleted" || item.target_status === "unavailable"}>Open</button>
+            {#if item.signal && item.target_type === "run" && item.signal.kind !== "ci_passed" && item.target_status !== "task_deleted" && item.target_status !== "unavailable"}
+              <!-- Puts this result back into the agent that pushed the branch: previewed, then confirmed. Never automatic. -->
+              <SendToAgent runId={item.target_id} signal={item.signal} />
+            {/if}
           </article>
         {/if}
       {/each}
@@ -127,7 +132,7 @@
   .pile{position:relative;display:flex;flex-direction:column;gap:8px;margin-top:8px}
   .pile.open{max-height:280px;overflow:auto}
   .pile:not(.open){padding-bottom:16px}
-  article{position:relative;z-index:1;display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 12px}
+  article{position:relative;z-index:1;display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;padding:10px 12px}
   article.unreadable{border-style:dashed}
   article.unread{box-shadow:var(--shadow-card),inset 3px 0 0 rgb(var(--c-accent))}
   .peek{position:absolute;z-index:0;height:16px;pointer-events:none;left:calc(var(--depth) * 10px);right:calc(var(--depth) * 10px);bottom:calc((2 - var(--depth)) * 8px)}

@@ -1,0 +1,221 @@
+<!doctype html>
+<html class="dark"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>Send to agent verification</title></head>
+<body style="margin:0"><div id="app"></div><pre id="result" style="position:fixed;bottom:4px;right:8px;z-index:100;background:#142032;color:#e6edf5;font:11px system-ui;padding:8px;max-width:480px;max-height:30vh;overflow:auto;white-space:pre-wrap"></pre>
+<script type="module">
+  import { mockIPCWithEvents } from "./tauriMocks";
+  import "../src/app.css";
+  import { createChecks } from "./checks.ts";
+
+  // Disposable fixture: the host that decides a route and the one that sends
+  // are simulated. What is real is the panel, the composed text, the client's
+  // decoders and the resume request it queues.
+  const RUN = "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11";
+  const CARD_RUN = "7a2d3b8f-1e5c-4d2f-8b66-4c1f9a3e0d22";
+  const signal = {
+    source: "github", external_id: "run-1", kind: "ci_failed", conclusion: "failure", workflow: "CI",
+    branch: "gitpulse/fix-e42", head_sha: "a".repeat(40),
+    url: `https://github.com/o/r/actions/runs/${"1234567890".repeat(30)}`,
+  };
+  const taskRun = id => ({ kind: "external_terminal", id, revision: 1, updated_at: 1, task_id: "task", source_revision: 1, task_title: "Fix the build", repository_id: "repo", provider: "claude", permission_mode: "ask", state: "exited", cwd: "/fixture/GitPulse", created_at: 1, expires_at: 300, session_id: null, exit_code: 0, reason: "", outcome_uncertain: false });
+
+  const calls = { previews: [], sends: [], conversations: 0, errors: [] };
+  const show = () => { document.getElementById("result").textContent = JSON.stringify({ previews: calls.previews.length, sends: calls.sends.length, errors: calls.errors }, null, 1); };
+  addEventListener("error", e => { calls.errors.push(e.message); show(); });
+  addEventListener("unhandledrejection", e => { calls.errors.push(String(e.reason)); show(); });
+
+  // What the host will say next. A scenario is set by the check that needs it.
+  let scenario = { route: "mailbox", reason: "A GitPulse hook is not waiting; it is shown when the turn ends.", listening: false, managedState: undefined, previewDelay: 0, previewFails: false, confirm: null };
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const preview = () => ({ ok: true, sent: false, route: scenario.route, reason: scenario.reason, ...(scenario.route === "mailbox" ? { listening: scenario.listening, session_id: RUN } : {}), ...(scenario.managedState ? { managed_state: scenario.managedState } : {}) });
+
+  mockIPCWithEvents(async (cmd, args) => {
+    if (cmd === "cmd_workbench_request") {
+      const input = JSON.parse(args.input);
+      if (args.method === "runs.send_to_agent") {
+        if (!input.confirm) {
+          calls.previews.push(input); show();
+          if (scenario.previewDelay) await sleep(scenario.previewDelay);
+          if (scenario.previewFails) throw { code: "transport_error", message: "Fixture host did not answer" };
+          return JSON.stringify(preview());
+        }
+        calls.sends.push(input); show();
+        const confirm = scenario.confirm?.(input);
+        if (confirm?.error) throw confirm.error;
+        if (confirm?.body) return JSON.stringify({ ...preview(), ...confirm.body });
+        if (scenario.route === "resume") return JSON.stringify({ ...preview(), action: "open_resume" });
+        return JSON.stringify({ ...preview(), sent: true, status: scenario.route === "managed" ? "delivered" : "queued", request_id: input.request_id, expires_at_ms: Date.now() + 7200000, duplicate: false });
+      }
+      if (args.method === "runs.get") return JSON.stringify({ ok: true, item: taskRun(input.id) });
+      if (args.method === "runs.conversation") { calls.conversations++; return JSON.stringify({ ok: true, resumable: true, session_id: input.id, cwd: "/fixture/GitPulse", permission_mode: "ask", reason: "Claude Code saved this conversation." }); }
+      throw new Error(`Unconfigured task method: ${args.method}`);
+    }
+    switch (cmd) {
+      case "cmd_resolve_repo": return { path: args.repoPath, name: "GitPulse", is_bare: false };
+      case "cmd_resolve_git_root": return args.path;
+      case "cmd_repository_trust": return { path: args.repoPath, git_dir: "/fixture/GitPulse/.git", common_dir: "/fixture/GitPulse/.git", identity: "fixture", scope: "repository", worktrees: 1 };
+      case "cmd_list_worktrees": return [];
+      case "cmd_get_status": case "cmd_list_branches": case "cmd_list_remotes": case "cmd_list_submodules": return [];
+      case "cmd_stash_list": return { entries: [], truncated: false };
+      case "cmd_list_tags": return { tags: [], truncated: false };
+      case "cmd_branch_stats": return {};
+      case "cmd_repo_operation": case "cmd_workspace_sync": case "cmd_terminal_ack": return null;
+      default: throw new Error(`Unconfigured native command: ${cmd}`);
+    }
+  });
+
+  const { mount, tick } = await import("svelte");
+  const { get } = await import("svelte/store");
+  const { composeAgentMessage } = await import("../src/lib/workbench/sendToAgent.ts");
+  const { taskTerminalRequests, consumeTaskTerminalRequest } = await import("../src/lib/terminal/taskLaunches.ts");
+  const Host = (await import("./SendToAgentHost.svelte")).default;
+  mount(Host, { target: document.getElementById("app"), props: { signal, runId: RUN, cardRunId: CARD_RUN } });
+  show();
+
+  const { results, check, stopped } = createChecks();
+  const params = new URLSearchParams(location.search);
+  const wait = async (condition, what) => {
+    const start = performance.now();
+    while (!condition()) {
+      if (performance.now() - start > 6000) throw new Error(`Timed out waiting for ${what}`);
+      await sleep(20);
+    }
+  };
+  const row = () => document.querySelector('[data-testid="ci-row"]');
+  const card = () => document.querySelector('[data-testid="run-card"]');
+  const q = (root, id) => root.querySelector(`[data-testid="${id}"]`);
+  const text = root => q(root(), "send-to-agent-text").textContent;
+  const route = root => q(root(), "send-to-agent-route");
+  const confirmBtn = root => q(root(), "send-to-agent-confirm");
+  const type = (root, value) => { const el = q(root(), "send-to-agent-note"); el.value = value; el.dispatchEvent(new Event("input", { bubbles: true })); };
+  const settled = root => () => { const r = route(root); return r && ["mailbox", "resume", "managed", "unavailable"].includes(r.dataset.route); };
+  const open = async root => { q(root(), "send-to-agent-open").click(); await wait(() => q(root(), "send-to-agent-panel"), "the panel to open"); };
+  const reset = () => { calls.previews.length = 0; calls.sends.length = 0; };
+
+  const run = async () => {
+    try {
+      // ---- the CI row: a live session whose hook is not waiting ---------------
+      check("Nothing is asked of the host until the panel is opened", () => calls.previews.length === 0 && calls.sends.length === 0 && !q(row(), "send-to-agent-panel"));
+      await open(row);
+      check("The panel shows the exact text composed from the result", () => text(row) === composeAgentMessage(signal, ""));
+      await wait(settled(row), "the route");
+      check("It asked which route a send would take, with that text, and without confirming", () => calls.previews.length === 1 && calls.previews[0].confirm === false && calls.previews[0].text === composeAgentMessage(signal, "") && calls.previews[0].id === RUN);
+      check("The route is named and its reason is the host's own words", () => route(row).dataset.route === "mailbox" && route(row).textContent.includes("Live session") && q(row(), "send-to-agent-reason").textContent === scenario.reason);
+      check("Confirm is labelled for that route and enabled", () => confirmBtn(row).textContent.trim() === "Send to the live session" && !confirmBtn(row).disabled);
+      await sleep(600);
+      check("Nothing is sent on its own: no send after opening, checking and waiting", () => calls.sends.length === 0);
+
+      type(row, "Please look at the lint step.");
+      await tick();
+      check("Editing the note changes the shown text exactly", () => text(row) === composeAgentMessage(signal, "Please look at the lint step."));
+      check("Confirm is off while the route is asked again for the new text", () => confirmBtn(row).disabled && route(row).dataset.route !== "mailbox");
+      await wait(() => calls.previews.length === 2 && settled(row)(), "the second preview");
+      check("The second preview carries the edited text", () => calls.previews[1].text === composeAgentMessage(signal, "Please look at the lint step.") && !confirmBtn(row).disabled);
+      const shownBeforeSend = text(row);
+      confirmBtn(row).click();
+      await wait(() => calls.sends.length === 1 && q(row(), "send-to-agent-outcome"), "the send");
+      check("Confirm sends once, with confirm, the route that was shown, and the exact text on screen", () => calls.sends.length === 1 && calls.sends[0].confirm === true && calls.sends[0].expect_route === "mailbox" && calls.sends[0].text === shownBeforeSend);
+      check("A queued message is said to be queued, and not to have been read", () => { const t = q(row(), "send-to-agent-outcome").textContent; return t.includes("Queued") && t.includes("Queued is not read") && !/\bwas read\b/.test(t); });
+      check("The button now says Sent and is off", () => confirmBtn(row).textContent.trim() === "Sent" && confirmBtn(row).disabled);
+      confirmBtn(row).click(); confirmBtn(row).click();
+      await sleep(250);
+      check("Pressing it again sends nothing more", () => calls.sends.length === 1);
+      const firstId = calls.sends[0].request_id;
+      type(row, "Something else entirely.");
+      await wait(() => calls.previews.length === 3 && settled(row)(), "the third preview");
+      check("A different note is a new message with a new request id, and Confirm is back", () => !confirmBtn(row).disabled && calls.previews[2].request_id !== firstId && !q(row(), "send-to-agent-outcome"));
+
+      // ---- no route ------------------------------------------------------------
+      reset();
+      scenario = { ...scenario, route: "unavailable", reason: "Claude Code has no saved conversation for this attempt." };
+      type(row, "Try again");
+      await wait(() => calls.previews.length === 1 && settled(row)(), "the unavailable preview");
+      check("An attempt nothing can reach says why, in the host's words", () => route(row).dataset.route === "unavailable" && route(row).textContent.includes("Cannot be sent") && q(row(), "send-to-agent-reason").textContent === scenario.reason);
+      check("…and offers no way to send", () => confirmBtn(row).disabled && confirmBtn(row).textContent.trim() === "Cannot be sent");
+      confirmBtn(row).click(); await sleep(200);
+      check("…and pressing the disabled button sends nothing", () => calls.sends.length === 0);
+
+      // ---- the route could not be asked ----------------------------------------
+      reset();
+      scenario = { ...scenario, route: "mailbox", previewFails: true };
+      type(row, "Try once more");
+      await wait(() => calls.previews.length === 1 && route(row).textContent.includes("Could not check"), "the failed preview");
+      check("A route that could not be asked for is not offered: Confirm stays off and the panel says nothing can be sent", () => confirmBtn(row).disabled && route(row).textContent.includes("nothing can be sent"));
+      scenario = { ...scenario, previewFails: false };
+
+      // ---- the attempt changed between the preview and the send -----------------
+      reset();
+      scenario = { ...scenario, route: "mailbox", reason: "Live.", confirm: () => ({ error: { code: "route_changed", message: "This message would now go by resume and not by mailbox, which is what you were shown. Nothing was sent; read the preview again." } }) };
+      type(row, "Changed underneath");
+      await wait(() => calls.previews.length === 1 && settled(row)(), "the preview");
+      confirmBtn(row).click();
+      await wait(() => calls.sends.length === 1 && q(row(), "send-to-agent-outcome"), "the refusal");
+      check("A refused route change says nothing was sent", () => q(row(), "send-to-agent-outcome").textContent.includes("Nothing was sent") && q(row(), "send-to-agent-outcome").dataset.tone === "error");
+      await wait(() => calls.previews.length === 2, "the route to be asked again");
+      check("…and asks again instead of sending anywhere else", () => calls.previews.length === 2 && calls.sends.length === 1 && get(taskTerminalRequests).length === 0);
+
+      // ---- a managed run between turns that is refused, then accepts ------------
+      reset();
+      let refusals = 1;
+      scenario = { ...scenario, route: "managed", managedState: "parked", reason: "This managed run is between turns.", confirm: () => refusals-- > 0 ? { body: { sent: false, status: "refused", retryable: true, code: "E_TURN_IN_FLIGHT", reason: "a turn is still in flight" } } : { body: { sent: true, status: "delivered", turn: 2, max_turns: 3 } } };
+      type(row, "Managed follow-up");
+      await wait(() => calls.previews.length === 1 && settled(row)(), "the managed preview");
+      check("A managed run's button names the managed route", () => route(row).dataset.route === "managed" && confirmBtn(row).textContent.trim() === "Send as the next turn");
+      confirmBtn(row).click();
+      await wait(() => calls.sends.length === 1 && q(row(), "send-to-agent-outcome"), "the refusal");
+      check("A refusal that can be retried says it was not sent and that sending again can help", () => { const o = q(row(), "send-to-agent-outcome"); return o.dataset.tone === "error" && o.textContent.includes("a turn is still in flight") && o.textContent.includes("you can send again"); });
+      check("…and Confirm is still available", () => !confirmBtn(row).disabled && confirmBtn(row).textContent.trim() === "Send as the next turn");
+      confirmBtn(row).click();
+      await wait(() => calls.sends.length === 2 && q(row(), "send-to-agent-outcome")?.dataset.tone === "note", "the retry");
+      check("The retry carries the same request id, so it cannot send twice", () => calls.sends[1].request_id === calls.sends[0].request_id && calls.sends[1].text === calls.sends[0].text);
+      check("A delivered follow-up says delivered", () => q(row(), "send-to-agent-outcome").textContent.includes("Delivered"));
+
+      // ---- a Manvi that cannot take follow-ups -----------------------------------
+      reset();
+      scenario = { ...scenario, route: "unavailable", managedState: undefined, reason: "This Manvi version cannot take follow-ups. Update Manvi to send one to a running managed agent.", confirm: null };
+      type(row, "For an old Manvi");
+      await wait(() => calls.previews.length === 1 && settled(row)(), "the old-Manvi preview");
+      check("An old Manvi is said to be that, without an error alert", () => q(row(), "send-to-agent-reason").textContent.includes("This Manvi version cannot take follow-ups") && !row().querySelector('[role="alert"]') && confirmBtn(row).disabled);
+
+      // ---- the run card: a note, no signal; an ended attempt that resumes --------
+      reset();
+      scenario = { ...scenario, route: "resume", reason: "This attempt has ended and Claude Code saved its conversation.", managedState: undefined, confirm: null };
+      await open(card);
+      check("With no result to compose from and no note, there is nothing to send and the host is not asked", () => text(card) === "(nothing yet)" && !!q(card(), "send-to-agent-problem") && confirmBtn(card).disabled);
+      await sleep(500);
+      check("…not even after the typing delay", () => calls.previews.length === 0);
+      type(card, "Please rerun the failing job.");
+      await wait(() => calls.previews.length === 1 && settled(card)(), "the resume preview");
+      check("A note alone is the whole message, exactly", () => text(card) === "Please rerun the failing job." && calls.previews[0].text === "Please rerun the failing job." && calls.previews[0].id === CARD_RUN);
+      check("An ended attempt's button says it resumes the conversation", () => route(card).dataset.route === "resume" && confirmBtn(card).textContent.trim() === "Resume and send");
+      confirmBtn(card).click();
+      await wait(() => q(card(), "send-to-agent-outcome"), "the resume outcome");
+      check("Confirm for a resume asked the host only to approve the route", () => calls.sends.length === 1 && calls.sends[0].expect_route === "resume" && calls.conversations === 1);
+      check("The conversation's resume request carries the message as its first prompt, verbatim", () => { const queued = get(taskTerminalRequests); return queued.length === 1 && queued[0].resume?.prompt === "Please rerun the failing job." && queued[0].resume?.sessionId === CARD_RUN && queued[0].provider === "claude"; });
+      check("The outcome says the message is the conversation's first prompt", () => q(card(), "send-to-agent-outcome").textContent.includes("first prompt") && confirmBtn(card).textContent.trim() === "Sent");
+      type(card, "A second, different message.");
+      await wait(() => calls.previews.length === 2 && settled(card)(), "the second resume preview");
+      confirmBtn(card).click();
+      await wait(() => calls.sends.length === 2 && q(card(), "send-to-agent-outcome")?.dataset.tone === "error", "the second resume to be refused");
+      check("A second message for a conversation already waiting to open is refused, not dropped into it", () => q(card(), "send-to-agent-outcome").textContent.includes("already waiting") && get(taskTerminalRequests).length === 1 && get(taskTerminalRequests)[0].resume.prompt === "Please rerun the failing job.");
+
+      // ---- layout and accessibility ---------------------------------------------
+      const fits = el => el.scrollWidth <= el.clientWidth + 1;
+      check("Neither panel overflows its 360px column, even with a 300-character run URL in the text", () => fits(q(row(), "send-to-agent-panel")) && fits(q(card(), "send-to-agent-panel")) && fits(q(row(), "send-to-agent-text")) && row().scrollWidth <= row().clientWidth + 1);
+      check("The route region is a polite status and the buttons are real buttons", () => route(row).getAttribute("role") === "status" && route(row).getAttribute("aria-live") === "polite" && confirmBtn(row).tagName === "BUTTON" && q(row(), "send-to-agent-open").getAttribute("aria-expanded") === "true");
+      q(row(), "send-to-agent-cancel").click();
+      await tick();
+      check("Cancel closes the panel and sends nothing", () => !q(row(), "send-to-agent-panel") && q(row(), "send-to-agent-open").getAttribute("aria-expanded") === "false");
+      const sentTotal = calls.sends.filter(s => s.confirm === true).length;
+      check("Every send in the run was a confirm of a route that had been shown", () => calls.sends.every(s => s.confirm === true && ["mailbox", "resume", "managed"].includes(s.expect_route)) && sentTotal === calls.sends.length);
+      check(`No browser runtime errors${calls.errors.length ? ` (${calls.errors.join(" | ")})` : ""}`, () => calls.errors.length === 0);
+    } catch (error) {
+      stopped(error);
+    } finally {
+      for (const request of get(taskTerminalRequests)) consumeTaskTerminalRequest(request);
+      show();
+      document.documentElement.setAttribute("data-gp-result", encodeURIComponent(JSON.stringify({ results, errors: calls.errors, diagnostics: JSON.stringify({ previews: calls.previews.length, sends: calls.sends.length }) })));
+      if (params.has("report")) await fetch(params.get("report"), { method: "POST", body: document.documentElement.outerHTML });
+    }
+  };
+  if (params.has("check")) await run();
+</script></body></html>

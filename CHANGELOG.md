@@ -13,6 +13,16 @@ before that tag is pushed.
 
 ### Added
 
+- **Send to agent.** A CI notice that names an agent attempt, and the attempt's
+  run card, can put the result (or a note) back into the agent that pushed the
+  branch. The panel shows the exact text and the route (live Claude session
+  mailbox, resumed conversation with the text as its first prompt, managed
+  follow-up through Manvi, or unavailable with the reason), and sends only on an
+  explicit confirm. A live session is woken by a second `Stop` hook entry,
+  `gitpulse-hook deliver`, registered with `asyncRewake`; a Manvi without
+  `work.runs.managed.continue` is reported as unable to take follow-ups. The
+  installed `gitpulse-hook` must be rebuilt for the new subcommand
+  (`bun run mcp:install`). See `docs/SECURITY.md`.
 - **5-Lane Workflow Separation & Non-Blocking DevMap IPC.** Separated repository
   and background operations into five isolated execution lanes (`git-read`,
   `git-write`, `github`, `insights`, `devmap`) (`src/lib/async/lanes.ts`,
