@@ -458,6 +458,13 @@ flowchart TD
   not on the target branch, and a squash whose commit fails stops before the
   worktree or branch is touched.
 
+### Zero-Copy Worktree Pointers, Agent Bus & Build Cache Boundaries
+- **Cross-repository pointer validation**: Zero-copy DevMap pointers (`base_store_ref.json`) are accepted only when `resolve_git_common_dir` proves the linked worktree and `anchor_repo_root` share the exact canonical Git common directory and contain no `..` traversal components (`codeintel/worktree_overlay.rs`, `codeintel/store.rs`). Crafted pointers targeting unrelated repositories or arbitrary SQLite databases fail closed.
+- **Managed lane directory reservation**: `.gitpulse/worktrees/` is reserved for GitPulse-managed task-attempt lanes; manual UI, CLI, and MCP worktree creation inside that directory is refused (`refuse_gitpulse_lane_target`).
+- **Bounded, lock-serialized agent coordination bus**: `<git-common-dir>/gitpulse/lanes/` serializes reads and writes under `flock(2)` on `.bus.lock`, rejects absolute paths, `..` traversal segments, and NUL bytes (`sanitize_claim_paths`), and enforces hard caps on active lanes (64), claimed paths/symbols per lane (128), retained messages (256), message body bytes (16 KiB), and `gitpulse_worktree_radar` wire size (64 KiB, reporting `truncated: true` when cut).
+- **MCP write & Git mutation gates**: Read tools (`readOnlyHint: true`, including `gitpulse_worktree_inbox` and `gitpulse_worktree_radar`) never mutate Git or task state. Mutating `gitpulse_worktree_*` tools require explicit repository trust (`repository_trust::require`), canonical path containment within the repository's worktree family, and Manvi policy-harness checks (`harness::guard_command`) on Git mutations.
+- **Sound `gitpulse-rustc` artifact reuse**: `gitpulse-rustc` bounds `@<rspfile>` expansion (8 MiB, depth 4), never caches `-C incremental` or `build_script_build` invocations, re-verifies every `.d` file dependency and `# env-dep:` variable on Stage 2 hits, and strips comments and string literals before applying the compile-time `include*!(concat!(env!("OUT_DIR"), ...))` exemption so runtime `OUT_DIR` paths cannot leak across worktrees.
+
 ### Process Signal Guard (Linux & macOS Models)
 - The signal guard protects GitPulse, `gitpulse-ptyd`, and child agent sessions from accidental mass-termination by external tools (e.g. `pkill`, `killall`, `pgrep`, `pidof`).
 - **Linux Tool Modeling**: On Linux, the signal guard directly models `procps pkill`/`pgrep`, `psmisc killall`, and `sysvinit pidof` (`ft-06723bb7`, `d9954240`, `1ba087a0`).

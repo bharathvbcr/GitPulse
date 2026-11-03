@@ -4,6 +4,122 @@ use super::{
 };
 use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection, Result, TransactionBehavior};
+use std::ops::{Deref, DerefMut};
+use std::sync::MutexGuard;
+
+/// The store's connection with `foreign_keys` switched off, switched back on
+/// by [`Self::restore`] on the way out and by `Drop` on every other way out.
+///
+/// The pragma is a no-op inside a transaction, so it is changed before the
+/// prune opens its own and restored after that has committed or rolled back:
+/// declare the guard before the transaction and the reverse drop order gives
+/// exactly that on `?` and on a panic. A restore that fails leaves the one
+/// connection every later write goes through unconstrained, so the explicit
+/// path returns it as an error; `Drop` can only say so on stderr.
+struct ForeignKeysOff<'a> {
+    conn: MutexGuard<'a, Connection>,
+    restored: bool,
+}
+
+impl<'a> ForeignKeysOff<'a> {
+    fn new(conn: MutexGuard<'a, Connection>) -> Result<Self> {
+        // Built first so that the checks below also restore on their way out.
+        let guard = Self {
+            conn,
+            restored: false,
+        };
+        guard.conn.pragma_update(None, "foreign_keys", "OFF")?;
+        if guard.foreign_keys()? != 0 {
+            return Err(refusal(
+                "could not switch foreign keys off for the prune: the pragma is ignored \
+                 inside a transaction, and one is open on the store connection",
+            ));
+        }
+        Ok(guard)
+    }
+
+    fn foreign_keys(&self) -> Result<i64> {
+        self.conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+    }
+
+    fn switch_on(&self) -> Result<()> {
+        self.conn.pragma_update(None, "foreign_keys", "ON")?;
+        if self.foreign_keys()? != 1 {
+            return Err(refusal(
+                "foreign keys did not come back on after the prune; refusing to leave the \
+                 store connection unconstrained",
+            ));
+        }
+        Ok(())
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        self.switch_on()?;
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Deref for ForeignKeysOff<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+impl DerefMut for ForeignKeysOff<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
+}
+
+impl Drop for ForeignKeysOff<'_> {
+    fn drop(&mut self) {
+        if !self.restored {
+            if let Err(error) = self.switch_on() {
+                eprintln!("devmap-store: {error}");
+            }
+        }
+    }
+}
+
+/// Refuse, by naming the first offender, when any table's foreign key to
+/// `parent` has a row whose parent no longer exists.
+///
+/// The prune runs with foreign keys off (see `prune_generations_except_latest`),
+/// so this is what replaces the constraint's refusal of a retirement that left
+/// something pointing at a deleted row. It asks only about `parent`: a
+/// violation of some other key is not this prune's to report, and failing on it
+/// would wedge the prune on a store it did not damage.
+fn refuse_dangling_references(tx: &Connection, parent: &str) -> Result<()> {
+    let children: Vec<String> = tx
+        .prepare(
+            "SELECT DISTINCT m.name FROM sqlite_master m, pragma_foreign_key_list(m.name) f
+              WHERE m.type = 'table' AND f.\"table\" = ?1
+              ORDER BY m.name",
+        )?
+        .query_map(params![parent], |row| row.get(0))?
+        .collect::<Result<_>>()?;
+    for child in children {
+        let mut check = tx.prepare(&format!(
+            "PRAGMA foreign_key_check(\"{}\")",
+            child.replace('"', "\"\"")
+        ))?;
+        let mut rows = check.query([])?;
+        while let Some(row) = rows.next()? {
+            let violated: String = row.get("parent")?;
+            if violated == parent {
+                let rowid: Option<i64> = row.get("rowid")?;
+                return Err(refusal(format!(
+                    "foreign_key_check: retiring `{parent}` rows left `{child}` row {rowid:?} \
+                     naming one that no longer exists; the prune is rolled back"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
 
 impl Store {
     /// Every file indexed by one named generation.
@@ -501,7 +617,19 @@ impl Store {
     }
 
     pub fn prune_generations_except_latest(&self, keep_generations: usize) -> Result<usize> {
-        let mut conn = lock_conn(&self.conn)?;
+        // Foreign keys are off for this transaction and on again after it.
+        //
+        // `unresolved_rows` declares `source_file_id`, `reason_id` and
+        // `classification_id` as foreign keys and indexes none of them as a
+        // leading column, so with the constraint on, every `paths` or
+        // `unresolved_texts` row retired below makes SQLite scan the whole
+        // ledger to prove nothing names it: K orphans, K full scans. That is
+        // what a rename or a branch switch turns into minutes. An index on each
+        // column would answer it, at the per-row write cost v21 removed; so the
+        // constraint steps aside for the one transaction whose own anti-joins
+        // already decide what is unreferenced, and `refuse_dangling_references`
+        // asks the question once per child table before the commit.
+        let mut conn = ForeignKeysOff::new(lock_conn(&self.conn)?)?;
 
         // Always retain the latest generation; the method name promises that
         // older generations are pruned while the current one remains usable.
@@ -523,6 +651,8 @@ impl Store {
         };
 
         if gen_ids.len() <= keep_generations {
+            drop(tx);
+            conn.restore()?;
             return Ok(0);
         }
 
@@ -570,7 +700,7 @@ impl Store {
             "DELETE FROM edge_rows WHERE valid_to IS NOT NULL AND valid_to <= ?1",
             params![cutoff],
         )?;
-        tx.execute(
+        let ledger_rows_deleted = tx.execute(
             "DELETE FROM unresolved_rows WHERE valid_to IS NOT NULL AND valid_to <= ?1",
             params![cutoff],
         )?;
@@ -590,8 +720,11 @@ impl Store {
         // where most of this store lives -- so the orphans go too, with the rows
         // derived from them: full-text entries first, because their rowids are
         // read out of `payload_nodes`, then symbols and literals, then the
-        // payload. The foreign keys refuse the payload's delete while any of
-        // them remains.
+        // payload. With foreign keys on, the payload's delete would be refused
+        // while any of them remained; they are off for this transaction, so that
+        // order is pinned instead by
+        // `b10_every_child_of_file_payloads_is_cleared_before_the_payload_row`,
+        // which reads the children from the schema.
         //
         // Deferred to after the loop rather than run per generation: a payload
         // shared by two pruned generations would otherwise be probed twice, and
@@ -604,15 +737,25 @@ impl Store {
         // renames grow this table forever, and PathRanks reads and sorts the
         // entire history on every edge load. Keep this inside the same
         // transaction so a failed retirement also rolls back the prune.
-        tx.execute(
-            "DELETE FROM paths WHERE id NOT IN (
-                SELECT file_id FROM file_payloads
-                UNION SELECT file_id FROM file_rows
-                UNION SELECT file_id FROM digest_rows
-                UNION SELECT source_file_id FROM edge_rows
-                UNION SELECT target_file_id FROM edge_rows
-                UNION SELECT source_file_id FROM unresolved_rows
-             )",
+        //
+        // One `NOT IN` per relation, ANDed, not one over a `UNION` of them: the
+        // union makes SQLite build and sort a de-duplicated temp b-tree of every
+        // id in every relation before it can answer the first membership test,
+        // where separate tests each probe an ephemeral index that is filled the
+        // first time it is consulted, so a path the earlier tests already keep
+        // never reaches the later ones. `file_payloads` goes first because
+        // nearly every live path is named there. Every column is `NOT NULL`
+        // (`file_id` and the edge endpoints by their declarations, the ledger's
+        // `source_file_id` by v22's), so `NOT IN` has no NULL trap. The lazy
+        // filling is planner behaviour the A/B in `benchmarks/` measures; the
+        // plan can only show that the sort is gone.
+        let paths_retired = tx.execute(
+            "DELETE FROM paths WHERE id NOT IN (SELECT file_id FROM file_payloads)
+                AND id NOT IN (SELECT file_id FROM file_rows)
+                AND id NOT IN (SELECT file_id FROM digest_rows)
+                AND id NOT IN (SELECT source_file_id FROM edge_rows)
+                AND id NOT IN (SELECT target_file_id FROM edge_rows)
+                AND id NOT IN (SELECT source_file_id FROM unresolved_rows)",
             [],
         )?;
 
@@ -624,20 +767,46 @@ impl Store {
         //
         // `NOT IN` over the two id columns, not a probe per candidate: SQLite
         // materialises each subquery once, so this is two scans of
-        // `unresolved_rows` and one of the pool, and it needs no index on
-        // `reason_id`. An index there would put back exactly the per-row write
-        // amplification v21 removed, to serve a statement that runs once a
-        // prune.
+        // `unresolved_rows` and one of the pool, and no sort of their union. A
+        // probe per candidate is what the foreign keys would have made of it
+        // with the constraint on: an index on `reason_id` would answer it, at
+        // exactly the per-row write amplification v21 removed, to serve a
+        // statement that runs once a prune. That is why foreign keys are off for
+        // this transaction instead. Both columns are `NOT NULL`, so `NOT IN` has
+        // no NULL trap.
         //
         // After the deletes above, so the rows whose texts this is deciding
-        // about are already gone.
-        tx.execute(
-            "DELETE FROM unresolved_texts WHERE id NOT IN (
-                SELECT reason_id FROM unresolved_rows
-                UNION SELECT classification_id FROM unresolved_rows
-             )",
-            [],
-        )?;
+        // about are already gone, and only when one of them was deleted: a text
+        // becomes unreferenced only when a row naming it goes (`reason_id` and
+        // `classification_id` are written once, at insert, and never updated in
+        // place), so a prune that deleted no ledger row has nothing to retire
+        // here and does not pay for two scans of the ledger to learn that. A
+        // text interned by a write whose row was then deduplicated waits for the
+        // next prune that does delete ledger rows, which bounds it; the early
+        // return above already gives a prune that drops no generation the same
+        // contract.
+        let texts_retired = if ledger_rows_deleted > 0 {
+            tx.execute(
+                "DELETE FROM unresolved_texts WHERE id NOT IN (SELECT reason_id FROM unresolved_rows)
+                    AND id NOT IN (SELECT classification_id FROM unresolved_rows)",
+                [],
+            )?
+        } else {
+            0
+        };
+
+        // Foreign keys are off, so nothing has refused a retirement that left a
+        // row pointing at what it deleted: ask, once, before committing. Only
+        // for a parent this prune actually deleted from, and only for the keys
+        // that name it. A drifted anti-join must fail here and roll the prune
+        // back, never dangle `source_file_id` (see the note on
+        // `MIGRATION_V21_TO_V22`).
+        if paths_retired > 0 {
+            refuse_dangling_references(&tx, "paths")?;
+        }
+        if texts_retired > 0 {
+            refuse_dangling_references(&tx, "unresolved_texts")?;
+        }
 
         // FTS5 deletes only tombstone their postings; without a merge the freed
         // space stays inside the index and the prune reclaims nothing there.
@@ -653,6 +822,7 @@ impl Store {
         }
 
         tx.commit()?;
+        conn.restore()?;
         Ok(pruned_count)
     }
 

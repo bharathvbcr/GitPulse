@@ -18,7 +18,9 @@
 
 use devmap_extract::model::{EdgeKind, Extraction};
 use devmap_extract::wiring::is_vendored_path;
-use devmap_resolve::model::{Resolution, ResolutionResult, ResolvedEdge, UnresolvedReference};
+use devmap_resolve::model::{
+    Resolution, ResolutionResult, ResolvedEdge, UnresolvedClass, UnresolvedReference,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -44,6 +46,74 @@ fn permille(numerator: usize, denominator: usize) -> Permille {
     // 1000, or the fence cannot tell "resolved everything" from "resolved all
     // but one of forty thousand".
     Some(((numerator as u128 * 1000) / denominator as u128) as u32)
+}
+
+/// The 9-class unresolved taxonomy tracking exact counts across classes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnresolvedTaxonomy {
+    pub builtin: usize,
+    pub host_global: usize,
+    pub local_binding: usize,
+    pub external: usize,
+    pub uninferred_receiver: usize,
+    pub unresolved_member: usize,
+    pub no_namesake: usize,
+    pub module_path: usize,
+    pub unresolved: usize,
+}
+
+impl UnresolvedTaxonomy {
+    pub fn record(&mut self, class: &UnresolvedClass) {
+        match class {
+            UnresolvedClass::Builtin => self.builtin += 1,
+            UnresolvedClass::HostGlobal { .. } => self.host_global += 1,
+            UnresolvedClass::LocalBinding => self.local_binding += 1,
+            UnresolvedClass::External { .. } => self.external += 1,
+            UnresolvedClass::UninferredReceiver => self.uninferred_receiver += 1,
+            UnresolvedClass::UnresolvedMember => self.unresolved_member += 1,
+            UnresolvedClass::NoNamesake => self.no_namesake += 1,
+            UnresolvedClass::ModulePath => self.module_path += 1,
+            UnresolvedClass::Unresolved => self.unresolved += 1,
+        }
+    }
+
+    pub fn total(&self) -> usize {
+        self.builtin
+            + self.host_global
+            + self.local_binding
+            + self.external
+            + self.uninferred_receiver
+            + self.unresolved_member
+            + self.no_namesake
+            + self.module_path
+            + self.unresolved
+    }
+
+    /// Evaluates Normalized Defect Rate (D_norm).
+    /// D_norm = (|Unresolved| + |ModulePath|) / (|Calls_total| - |NoNamesake| - |Builtin| - |HostGlobal| - |External| - |LocalBinding|)
+    pub fn d_norm(&self, resolved_sites: usize) -> Option<f64> {
+        let total_calls = resolved_sites + self.total();
+        let exclusions =
+            self.no_namesake + self.builtin + self.host_global + self.external + self.local_binding;
+        if total_calls <= exclusions {
+            return None;
+        }
+        let denominator = total_calls - exclusions;
+        let numerator = self.unresolved + self.module_path;
+        Some(numerator as f64 / denominator as f64)
+    }
+
+    pub fn d_norm_permille(&self, resolved_sites: usize) -> Permille {
+        let total_calls = resolved_sites + self.total();
+        let exclusions =
+            self.no_namesake + self.builtin + self.host_global + self.external + self.local_binding;
+        if total_calls <= exclusions {
+            return None;
+        }
+        let denominator = total_calls - exclusions;
+        let numerator = self.unresolved + self.module_path;
+        permille(numerator, denominator)
+    }
 }
 
 /// One language's share of the attribution work.
@@ -81,11 +151,24 @@ pub struct LanguageResolution {
     /// Of those, the ones that are explained rather than failed: `Builtin`,
     /// `HostGlobal`, `External`. See [`ResolutionRate::net_permille`].
     pub explained_sites: usize,
+    /// Exact 9-class unresolved taxonomy breakdown.
+    #[serde(default)]
+    pub taxonomy: UnresolvedTaxonomy,
     /// `None` when `extracts_calls` is false: a language with no call extractor
     /// attributed no call, so a figure here would score missing work as perfect.
     pub gross_permille: Permille,
     /// `None` when `extracts_calls` is false, for the same reason.
     pub net_permille: Permille,
+}
+
+impl LanguageResolution {
+    pub fn d_norm(&self) -> Option<f64> {
+        self.taxonomy.d_norm(self.resolved_sites)
+    }
+
+    pub fn d_norm_permille(&self) -> Permille {
+        self.taxonomy.d_norm_permille(self.resolved_sites)
+    }
 }
 
 /// The corpus rate, and the same figure per language.
@@ -149,6 +232,19 @@ pub struct ResolutionRate {
     pub measured_unresolved_sites: usize,
     #[serde(default, deserialize_with = "null_as_default")]
     pub measured_explained_sites: usize,
+    /// 9-class unresolved taxonomy breakdown across measured languages.
+    #[serde(default)]
+    pub taxonomy: UnresolvedTaxonomy,
+}
+
+impl ResolutionRate {
+    pub fn d_norm(&self) -> Option<f64> {
+        self.taxonomy.d_norm(self.measured_resolved_sites)
+    }
+
+    pub fn d_norm_permille(&self) -> Permille {
+        self.taxonomy.d_norm_permille(self.measured_resolved_sites)
+    }
 }
 
 /// An explicit `null` reads as the type's default, the same as an absent field.
@@ -267,6 +363,7 @@ pub fn resolution_rate(
     let mut explained_sites = 0usize;
     let mut vendored_unresolved = 0usize;
     let mut unresolved_by_language: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let mut taxonomy_by_language: BTreeMap<String, UnresolvedTaxonomy> = BTreeMap::new();
     for row in &resolution.unresolved {
         unresolved_sites += 1;
         let explained = is_explained(row);
@@ -288,6 +385,10 @@ pub fn resolution_rate(
         if explained {
             entry.1 += 1;
         }
+        taxonomy_by_language
+            .entry(language.to_string())
+            .or_default()
+            .record(&row.class);
     }
 
     let mut by_language: BTreeMap<String, LanguageResolution> = BTreeMap::new();
@@ -330,6 +431,7 @@ pub fn resolution_rate(
             .get(&language)
             .copied()
             .unwrap_or((0, 0));
+        let taxonomy = taxonomy_by_language.remove(&language).unwrap_or_default();
         // Asked of the extractions, not of the language string, so a notebook
         // row reports its kernel's capabilities rather than `NONE`. Falls back
         // to the registry for a language that appears only in the resolution
@@ -351,6 +453,7 @@ pub fn resolution_rate(
                 resolved_sites: resolved,
                 unresolved_sites: unresolved,
                 explained_sites: explained,
+                taxonomy,
                 gross_permille: extracts_calls
                     .then(|| permille(resolved, resolved + unresolved))
                     .flatten(),
@@ -370,11 +473,21 @@ pub fn resolution_rate(
     // the breakdown beneath it.
     let (mut measured_resolved, mut measured_unresolved, mut measured_explained) = (0, 0, 0);
     let mut call_blind_sites = 0usize;
+    let mut corpus_taxonomy = UnresolvedTaxonomy::default();
     for row in by_language.values() {
         if row.extracts_calls {
             measured_resolved += row.resolved_sites;
             measured_unresolved += row.unresolved_sites;
             measured_explained += row.explained_sites;
+            corpus_taxonomy.builtin += row.taxonomy.builtin;
+            corpus_taxonomy.host_global += row.taxonomy.host_global;
+            corpus_taxonomy.local_binding += row.taxonomy.local_binding;
+            corpus_taxonomy.external += row.taxonomy.external;
+            corpus_taxonomy.uninferred_receiver += row.taxonomy.uninferred_receiver;
+            corpus_taxonomy.unresolved_member += row.taxonomy.unresolved_member;
+            corpus_taxonomy.no_namesake += row.taxonomy.no_namesake;
+            corpus_taxonomy.module_path += row.taxonomy.module_path;
+            corpus_taxonomy.unresolved += row.taxonomy.unresolved;
         } else {
             call_blind_sites += row.resolved_sites + row.unresolved_sites;
         }
@@ -396,6 +509,7 @@ pub fn resolution_rate(
         measured_resolved_sites: measured_resolved,
         measured_unresolved_sites: measured_unresolved,
         measured_explained_sites: measured_explained,
+        taxonomy: corpus_taxonomy,
     }
 }
 
@@ -427,5 +541,35 @@ mod tests {
         assert!(is_attribution(EdgeKind::Calls));
         assert!(is_attribution(EdgeKind::Imports));
         assert!(is_attribution(EdgeKind::References));
+    }
+
+    #[test]
+    fn test_unresolved_taxonomy_and_d_norm() {
+        let mut tax = UnresolvedTaxonomy::default();
+        tax.record(&UnresolvedClass::Builtin); // 1
+        tax.record(&UnresolvedClass::HostGlobal {
+            environment: "web".into(),
+        }); // 1
+        tax.record(&UnresolvedClass::LocalBinding); // 1
+        tax.record(&UnresolvedClass::External {
+            module: "fmt".into(),
+        }); // 1
+        tax.record(&UnresolvedClass::NoNamesake); // 1
+        tax.record(&UnresolvedClass::UninferredReceiver); // 1
+        tax.record(&UnresolvedClass::UnresolvedMember); // 1
+        tax.record(&UnresolvedClass::ModulePath); // 1
+        tax.record(&UnresolvedClass::Unresolved); // 1
+
+        assert_eq!(tax.total(), 9);
+
+        // Resolved sites = 10
+        // Total calls = 10 + 9 = 19
+        // Exclusions: NoNamesake (1) + Builtin (1) + HostGlobal (1) + External (1) + LocalBinding (1) = 5
+        // Denominator = 19 - 5 = 14
+        // Numerator = Unresolved (1) + ModulePath (1) = 2
+        // D_norm = 2 / 14 = 1 / 7 approx 0.142857
+        let d_norm = tax.d_norm(10).expect("calculated d_norm");
+        assert!((d_norm - (2.0 / 14.0)).abs() < 1e-6);
+        assert_eq!(tax.d_norm_permille(10), Some(142));
     }
 }

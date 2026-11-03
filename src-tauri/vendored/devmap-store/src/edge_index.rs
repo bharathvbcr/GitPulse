@@ -1088,6 +1088,60 @@ impl GenerationEdges {
         }
     }
 
+    /// Number of distinct ranked symbols in this generation's edge index.
+    pub fn symbol_count(&self) -> usize {
+        self.text.symbols.len()
+    }
+
+    /// Look up the dense CSR node rank (`0..symbol_count`) for `symbol`.
+    pub fn symbol_rank(&self, symbol: &str) -> Option<u32> {
+        self.text.symbol_rank.get(symbol).copied()
+    }
+
+    /// Look up the symbol name for a dense CSR node rank (`0..symbol_count`).
+    pub fn symbol_at_rank(&self, rank: u32) -> Option<&str> {
+        self.text.symbols.get(rank as usize).map(|s| &**s)
+    }
+
+    /// Materialize this generation's symbol adjacency into a flat zero-copy
+    /// [`crate::csr::CsrGraphWriter`] stamped with `self.generation().unwrap_or(0)`.
+    pub fn to_csr_writer(&self) -> crate::csr::CsrGraphWriter {
+        use crate::csr::{CsrGraphWriter, CsrNodeRecord, IncrementalDigestEngine};
+        let gen = u64::from(self.generation.unwrap_or(0));
+        let mut writer = CsrGraphWriter::new(gen);
+        for (rank, sym) in self.text.symbols.iter().enumerate() {
+            let out_edges = self.by_source_symbol.run(rank as u32);
+            let file_hash = out_edges
+                .first()
+                .map(|&eid| {
+                    let f = self.source_file(eid);
+                    IncrementalDigestEngine::hash_bytes(f.as_bytes())
+                })
+                .unwrap_or(0);
+            writer.add_node(CsrNodeRecord {
+                node_id: rank as u32,
+                kind: 0,
+                flags: 0,
+                out_degree: out_edges.len() as u32,
+                _reserved: 0,
+                name_hash: IncrementalDigestEngine::hash_bytes(sym.as_bytes()),
+                file_path_hash: file_hash,
+            });
+        }
+        for id in 0..self.len() {
+            let src = self.source_symbol[id];
+            let dst = self.target_symbol[id];
+            let attr = confidence_millis(self.confidence[id]).clamp(0, i64::from(u16::MAX)) as u16;
+            writer.add_edge(src, dst, attr);
+        }
+        writer
+    }
+
+    /// Build an in-memory zero-copy [`crate::csr::CsrGraphReader`] directly from this index.
+    pub fn to_csr_reader(&self) -> anyhow::Result<crate::csr::CsrGraphReader> {
+        crate::csr::CsrGraphReader::from_bytes(self.to_csr_writer().build())
+    }
+
     /// A one-direction view a bounded walk can consume.
     ///
     /// The direction travels with the view, so a walk cannot be given a
@@ -1232,5 +1286,33 @@ mod tests {
         // Rounds to 750 >= 750: admitted, exactly as `latest_edges` admits it.
         assert!(index.admits(0, 0.75));
         assert!(!index.admits(0, 0.76));
+    }
+
+    #[test]
+    fn generation_edges_roundtrips_to_csr_reader() {
+        let rows = vec![
+            edge("alpha", "beta", "Calls", 1.0),
+            edge("alpha", "gamma", "Calls", 0.8),
+            edge("beta", "delta", "Calls", 0.9),
+        ];
+        let index = GenerationEdges::build(Arc::new(rows), None)
+            .expect("index")
+            .with_generation(42);
+        let reader = index.to_csr_reader().expect("csr reader");
+        assert_eq!(reader.generation(), 42);
+        assert_eq!(reader.node_count(), index.symbol_count());
+        assert_eq!(reader.edge_count(), index.len());
+
+        let alpha_rank = index.symbol_rank("alpha").expect("alpha rank");
+        let beta_rank = index.symbol_rank("beta").expect("beta rank");
+        let gamma_rank = index.symbol_rank("gamma").expect("gamma rank");
+        let delta_rank = index.symbol_rank("delta").expect("delta rank");
+        assert_eq!(index.symbol_at_rank(alpha_rank), Some("alpha"));
+
+        let out = reader.outgoing_edges(alpha_rank);
+        assert!(out.contains(&beta_rank));
+        assert!(out.contains(&gamma_rank));
+        let reach = reader.bfs_reachability(alpha_rank, 2);
+        assert!(reach.contains(&delta_rank));
     }
 }

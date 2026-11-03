@@ -84,6 +84,9 @@ const MAX_ORPHANS: usize = 16;
 pub enum AgentKind {
     Claude,
     Codex,
+    Antigravity,
+    DevCouncil,
+    Manvi,
 }
 
 impl AgentKind {
@@ -91,6 +94,9 @@ impl AgentKind {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Antigravity => "antigravity",
+            Self::DevCouncil => "devcouncil",
+            Self::Manvi => "manvi",
         }
     }
 }
@@ -111,6 +117,15 @@ pub(crate) fn classify(exec: &str, arg1: Option<&str>) -> Option<AgentKind> {
     if base == "codex" {
         return Some(AgentKind::Codex);
     }
+    if base == "antigravity" || base.starts_with("antigravity-") {
+        return Some(AgentKind::Antigravity);
+    }
+    if base == "devcouncil" || base == "dev" {
+        return Some(AgentKind::DevCouncil);
+    }
+    if base == "manvi" {
+        return Some(AgentKind::Manvi);
+    }
     let runtime = base == "node" || base == "bun" || base.starts_with("node2");
     if runtime {
         let script = arg1?;
@@ -119,6 +134,9 @@ pub(crate) fn classify(exec: &str, arg1: Option<&str>) -> Option<AgentKind> {
         }
         if script.contains("/@openai/codex/") {
             return Some(AgentKind::Codex);
+        }
+        if script.contains("bin/devcouncil.js") || script.contains("/devcouncil/") {
+            return Some(AgentKind::DevCouncil);
         }
     }
     None
@@ -130,7 +148,14 @@ pub(crate) fn classify(exec: &str, arg1: Option<&str>) -> Option<AgentKind> {
 /// not candidates. A prefix for `node`, whose versioned binaries are `node`,
 /// `node2` and `nodejs`.
 pub(crate) fn name_selects_procargs(name: &str) -> bool {
-    name == "claude" || name == "codex" || name == "bun" || name.starts_with("node")
+    name == "claude"
+        || name == "codex"
+        || name == "antigravity"
+        || name == "devcouncil"
+        || name == "dev"
+        || name == "manvi"
+        || name == "bun"
+        || name.starts_with("node")
 }
 
 /// A name the kernel reports for a versioned installer binary: empty, or a
@@ -973,14 +998,17 @@ impl Scanner {
             let f = &self.facts[i];
             let kind = f.ident.kind.unwrap_or(AgentKind::Claude);
             let tree = self.tree_of[i].map(|t| self.tree_names[t as usize].clone());
-            let count = match kind {
-                AgentKind::Claude => &mut claude,
-                AgentKind::Codex => &mut codex,
+            let count: Option<&mut SessionCount> = match kind {
+                AgentKind::Claude => Some(&mut claude),
+                AgentKind::Codex => Some(&mut codex),
+                _ => None,
             };
-            if tree.is_some() {
-                count.launched += 1;
-            } else {
-                count.observed += 1;
+            if let Some(count) = count {
+                if tree.is_some() {
+                    count.launched += 1;
+                } else {
+                    count.observed += 1;
+                }
             }
             if sessions.len() >= MAX_SESSIONS {
                 continue;
@@ -2973,6 +3001,15 @@ pub(crate) mod tests {
                 "/usr/local/bin/node",
                 Some("/usr/local/lib/node_modules/@openai/codex/bin/codex.js"),
                 Some(AgentKind::Codex),
+            ),
+            ("/usr/local/bin/antigravity", None, Some(AgentKind::Antigravity)),
+            ("/usr/local/bin/devcouncil", None, Some(AgentKind::DevCouncil)),
+            ("/usr/local/bin/dev", None, Some(AgentKind::DevCouncil)),
+            ("/usr/local/bin/manvi", None, Some(AgentKind::Manvi)),
+            (
+                "/opt/homebrew/bin/node",
+                Some("/Users/me/Code/DevCouncil/bin/devcouncil.js"),
+                Some(AgentKind::DevCouncil),
             ),
             // Not agents: the desktop app, a helper, a version directory that
             // is not Claude's, a node running something else.

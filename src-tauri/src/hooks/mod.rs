@@ -768,6 +768,7 @@ fn entity_collision_tail(facts: &CollisionFacts) -> String {
             if matches!(
                 entity.kind,
                 crate::insights::EntityCollisionKind::SharedSymbol
+                    | crate::insights::EntityCollisionKind::ContendedLine
             ) =>
         {
             format!("{}.", entity.reason.trim_end_matches('.'))
@@ -1110,6 +1111,7 @@ fn classify_incoming_edit(
         kind: insights::EntityCollisionKind::FileLevel,
         reason: "the symbol check for this edit did not finish in time".into(),
         shared_symbols: Vec::new(),
+        contended_lines: Vec::new(),
         stale: false,
     })
 }
@@ -3353,6 +3355,7 @@ mod tests {
                 kind: crate::insights::EntityCollisionKind::DisjointSymbols,
                 reason: "src/lib.rs is dirty in multiple worktrees, but no shared symbol was seen on the old-side ranges — file overlap, not a merge promise".into(),
                 shared_symbols: Vec::new(),
+                contended_lines: Vec::new(),
                 stale: false,
             }),
         });
@@ -3388,6 +3391,7 @@ mod tests {
                 kind: crate::insights::EntityCollisionKind::FileLevel,
                 reason: "indexed generation head_sha abc is not the requested def".into(),
                 shared_symbols: Vec::new(),
+                contended_lines: Vec::new(),
                 stale: true,
             }),
         });

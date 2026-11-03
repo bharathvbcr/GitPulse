@@ -29,6 +29,7 @@ pub async fn cmd_list_worktrees(
 /// Creates a linked worktree, after the command gate has judged the exact
 /// `git worktree add` line this would run.
 #[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
 pub async fn cmd_add_worktree(
     repo_path: String,
     target_path: String,
@@ -37,37 +38,72 @@ pub async fn cmd_add_worktree(
     detach: bool,
     cow_caches: Option<bool>,
     run_hooks: Option<bool>,
+    zero_copy_devmap: Option<bool>,
+    sparse_paths: Option<Vec<String>>,
 ) -> Result<Guarded<crate::engine::worktree::WorktreeCreated>, IpcError> {
     off_thread(move || {
-        // GitPulse's task-worktree container has one creator, the task
-        // provisioner, which keeps it out of `git status` first.
-        crate::engine::worktree::refuse_gitpulse_lane_target(&target_path)?;
-        let argv_owned = crate::engine::worktree::add_worktree_argv(
-            &target_path,
-            new_branch.as_deref(),
-            start_point.as_deref(),
-            detach,
-        );
-        let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
-        let policy = guard(&repo_path, &refs)?;
-        let cow = cow_caches.unwrap_or(false);
-        let created = crate::engine::worktree::add_worktree_extended(
+        add_worktree_guarded(
             &repo_path,
             &target_path,
             new_branch.as_deref(),
             start_point.as_deref(),
             detach,
-            cow,
-            // Off unless asked for; and even then only hooks a person
-            // approved for this exact file run.
+            cow_caches.unwrap_or(false),
             run_hooks.unwrap_or(false),
-        )?;
-        Ok(Guarded {
-            policy,
-            output: created,
-        })
+            zero_copy_devmap.unwrap_or(false),
+            sparse_paths.as_deref(),
+            &|repo, argv| guard(repo, argv),
+        )
     })
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_worktree_guarded(
+    repo_path: &str,
+    target_path: &str,
+    new_branch: Option<&str>,
+    start_point: Option<&str>,
+    detach: bool,
+    cow_caches: bool,
+    run_hooks: bool,
+    zero_copy_devmap: bool,
+    sparse_paths: Option<&[String]>,
+    gate: WorktreeGate<'_>,
+) -> Result<Guarded<crate::engine::worktree::WorktreeCreated>, CommandError> {
+    // GitPulse's task-worktree container has one creator, the task
+    // provisioner, which keeps it out of `git status` first.
+    crate::engine::worktree::refuse_gitpulse_lane_target(target_path)?;
+    let has_sparse = sparse_paths
+        .unwrap_or(&[])
+        .iter()
+        .any(|s| !s.trim().is_empty());
+    let argv_owned = crate::engine::worktree::add_worktree_argv_configured(
+        target_path,
+        new_branch,
+        start_point,
+        detach,
+        has_sparse,
+    );
+    let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
+    let policy = gate(repo_path, &refs)?;
+    let created = crate::engine::worktree::add_worktree_configured(
+        repo_path,
+        target_path,
+        new_branch,
+        start_point,
+        detach,
+        cow_caches,
+        // Off unless asked for; and even then only hooks a person
+        // approved for this exact file run.
+        run_hooks,
+        zero_copy_devmap,
+        sparse_paths,
+    )?;
+    Ok(Guarded {
+        policy,
+        output: created,
+    })
 }
 
 /// The repository's `.gitpulse/hooks` file as the approval dialog shows it:
@@ -363,3 +399,156 @@ pub(super) fn worktree_ai_summary(
         Ok(parts.join(" · "))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn add_worktree_guarded_supports_zero_copy_devmap_and_sparse_cone() {
+        let sandbox = tempfile::tempdir().expect("tempdir");
+        let anchor_fixture = crate::codeintel::tests::repo_with_one_generation();
+        let repo_dir = anchor_fixture.path().to_path_buf();
+        std::fs::create_dir_all(repo_dir.join("pkg/api")).expect("mkdir api");
+        std::fs::create_dir_all(repo_dir.join("pkg/other")).expect("mkdir other");
+        std::fs::write(repo_dir.join("pkg/api/lib.rs"), "pub fn api() {}\n").expect("write api");
+        std::fs::write(repo_dir.join("pkg/other/lib.rs"), "pub fn other() {}\n")
+            .expect("write other");
+
+        crate::test_support::git_in(&repo_dir, &["config", "user.name", "Test"]);
+        crate::test_support::git_in(&repo_dir, &["config", "user.email", "test@example.com"]);
+        crate::test_support::git_in(&repo_dir, &["add", "pkg"]);
+        crate::test_support::git_in(&repo_dir, &["commit", "-m", "add packages"]);
+        crate::test_support::trust_repo(&repo_dir);
+
+        let repo_str = repo_dir.to_str().expect("repo_str");
+        let judged: RefCell<Vec<Vec<String>>> = RefCell::new(Vec::new());
+        let gate = |repo: &str, argv: &[&str]| {
+            judged
+                .borrow_mut()
+                .push(argv.iter().map(|s| (*s).to_string()).collect());
+            crate::harness::guard_command(repo, argv)
+        };
+
+        // 1. Refuses `.gitpulse/worktrees/...` before invoking the gate.
+        let illegal_target = repo_dir.join(".gitpulse/worktrees/illegal");
+        let refused = add_worktree_guarded(
+            repo_str,
+            illegal_target.to_str().expect("illegal"),
+            Some("feat/illegal"),
+            None,
+            false,
+            false,
+            false,
+            true,
+            None,
+            &gate,
+        );
+        assert!(refused.is_err());
+        assert!(judged.borrow().is_empty());
+
+        // 2. Full checkout with `zero_copy_devmap = true` writes `base_store_ref.json` without copying `devmap.sqlite`.
+        let zc_target = sandbox.path().join("wt-zc");
+        let zc_created = add_worktree_guarded(
+            repo_str,
+            zc_target.to_str().expect("zc"),
+            Some("feat/zc"),
+            None,
+            false,
+            false,
+            false,
+            true,
+            None,
+            &gate,
+        )
+        .expect("zc add_worktree_guarded");
+        assert_eq!(
+            judged.borrow()[0],
+            vec![
+                "git",
+                "worktree",
+                "add",
+                "-b",
+                "feat/zc",
+                zc_target.to_str().expect("zc"),
+            ]
+        );
+        let zc_wt = std::path::Path::new(&zc_created.output.path);
+        crate::test_support::trust_repo(zc_wt);
+        assert!(!devmap_query::paths::store_path(zc_wt).exists());
+        assert!(crate::codeintel::load_zero_copy_base_ref(&zc_created.output.path)
+            .expect("load base ref")
+            .is_some());
+
+        // 3. Sparse cone checkout judges `--no-checkout` and materializes only `pkg/api`.
+        let sparse_target = sandbox.path().join("wt-sparse");
+        let sparse_paths = vec!["pkg/api".to_string()];
+        let sparse_created = add_worktree_guarded(
+            repo_str,
+            sparse_target.to_str().expect("sparse"),
+            Some("feat/sparse"),
+            None,
+            false,
+            false,
+            false,
+            true,
+            Some(&sparse_paths),
+            &gate,
+        )
+        .expect("sparse add_worktree_guarded");
+        assert_eq!(
+            judged.borrow()[1],
+            vec![
+                "git",
+                "worktree",
+                "add",
+                "--no-checkout",
+                "-b",
+                "feat/sparse",
+                sparse_target.to_str().expect("sparse"),
+            ]
+        );
+        let sp_wt = std::path::Path::new(&sparse_created.output.path);
+        crate::test_support::trust_repo(sp_wt);
+        assert!(sp_wt.join("pkg/api/lib.rs").is_file());
+        assert!(!sp_wt.join("pkg/other/lib.rs").exists());
+        assert!(
+            crate::codeintel::load_zero_copy_base_ref(&sparse_created.output.path)
+                .expect("load base ref")
+                .is_some()
+        );
+
+        // 4. Sparse cone checkout with `zero_copy_devmap = false` honors the caller's choice
+        //    and provisions a local CoW `devmap.sqlite` instead of forcing `base_store_ref.json`.
+        let sparse_local_target = sandbox.path().join("wt-sparse-local-devmap");
+        let sparse_local_created = add_worktree_guarded(
+            repo_str,
+            sparse_local_target.to_str().expect("sparse_local"),
+            Some("feat/sparse-local"),
+            None,
+            false,
+            false,
+            false,
+            false,
+            Some(&sparse_paths),
+            &gate,
+        )
+        .expect("sparse local devmap add_worktree_guarded");
+        let sp_local_wt = std::path::Path::new(&sparse_local_created.output.path);
+        crate::test_support::trust_repo(sp_local_wt);
+        assert!(sp_local_wt.join("pkg/api/lib.rs").is_file());
+        assert!(!sp_local_wt.join("pkg/other/lib.rs").exists());
+        assert!(
+            crate::codeintel::load_zero_copy_base_ref(&sparse_local_created.output.path)
+                .expect("load base ref")
+                .is_none(),
+            "zero_copy_devmap=false must not write base_store_ref.json"
+        );
+        assert!(
+            devmap_query::paths::store_path(sp_local_wt).is_file(),
+            "zero_copy_devmap=false with sparse_paths must provision local devmap.sqlite"
+        );
+    }
+}
+

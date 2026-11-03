@@ -752,6 +752,21 @@ impl Store {
         }
     }
 
+    /// Path of the zero-copy mmap CSR graph sidecar (`<db_path>.csr`) accompanying `db_path`.
+    pub fn csr_sidecar_path(db_path: &Path) -> std::path::PathBuf {
+        let canonical = db_path.canonicalize().ok();
+        let db_path = canonical.as_deref().unwrap_or(db_path);
+        let mut name = db_path.file_name().map_or_else(
+            || std::ffi::OsString::from("devmap-store"),
+            |name| name.to_os_string(),
+        );
+        name.push(".csr");
+        match db_path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+            _ => std::path::PathBuf::from(name),
+        }
+    }
+
     /// Take the cross-process writer lock for the store at `db_path` (K13).
     ///
     /// There was no such lock. Two `devmap build` processes — or a build and

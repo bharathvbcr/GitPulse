@@ -44,11 +44,33 @@ pub const DEFAULT_PARSE_BUDGET: std::time::Duration = std::time::Duration::from_
 /// C++ input.
 pub const RETRY_BUDGET_FACTOR: u32 = 5;
 
-/// At most this many files are retried per build, so a corpus full of
-/// pathological inputs costs at most `MAX_BUDGET_RETRIES x 25 s` of serial
-/// retry rather than `N x 25 s`. Files past the cap stay refused and are
-/// counted in `BudgetRetryReport::not_retried`.
-pub const MAX_BUDGET_RETRIES: usize = 16;
+/// How long the serial retry phase may run in total, measured from its first
+/// file. Once it has run this long, the files still waiting stay refused, are
+/// counted in `BudgetRetryReport::not_retried` and say so in their reason.
+///
+/// This bounds the phase by time rather than by file count. It was a count
+/// (16 files), and a count is the wrong bound: when the host is starved (a
+/// build in the macOS background band) 24-32 files overrun the first-pass
+/// budget, every one of them parses when re-run alone (91 of 91 recovered),
+/// and the cap committed the files past the sixteenth as parse failures in a
+/// generation reported ok, so the graph silently lost 7-10 % of its symbols.
+/// The cost the cap was protecting against, a corpus of pathological inputs
+/// costing `N x 25 s`, is what a deadline bounds directly.
+///
+/// The deadline bounds the phase itself, not only the gaps between files: a
+/// file that starts with less than the retry budget left gets only the time
+/// that remains. The phase therefore ends at this deadline plus the per-file
+/// budget's check granularity (it is polled at walk boundaries, not
+/// preemptive), never plus a whole retry budget ([`RETRY_BUDGET_FACTOR`] times
+/// [`DEFAULT_PARSE_BUDGET`], 25 s).
+///
+/// The writer lock is held for the whole phase, and a CLI build that arrives
+/// during it waits at most `Store::WRITER_LOCK_WAIT` (60 s) before failing
+/// with "pid holds the store". So this deadline is also the longest a
+/// competing build can be locked out by a retry phase; 240 s is far above the
+/// phase a starved 5,000-file corpus needs (about 30 files at a few seconds
+/// each) and far below the hour a corpus of 25 s inputs would otherwise take.
+pub const RETRY_PHASE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(240);
 
 /// Stamp a budget-overrun reason so [`crate::model::Extraction::is_budget_refusal`]
 /// can recognise it. The single constructor of such reasons.

@@ -2184,6 +2184,78 @@ pub fn add_worktree_extended(
     )
 }
 
+/// Creates a linked worktree with optional Copy-on-Write cache cloning,
+/// optional zero-copy DevMap pointer (`base_store_ref.json`), optional
+/// DevMap-guided `--cone` sparse checkout paths, and approved `post_create` hooks.
+#[allow(clippy::too_many_arguments)]
+pub fn add_worktree_configured(
+    repo_path: &str,
+    target_path: &str,
+    new_branch: Option<&str>,
+    start_point: Option<&str>,
+    detach: bool,
+    cow_caches: bool,
+    run_hooks: bool,
+    zero_copy_devmap: bool,
+    sparse_paths: Option<&[String]>,
+) -> Result<WorktreeCreated, CommandError> {
+    let cleaned_sparse: Vec<String> = sparse_paths
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !cleaned_sparse.is_empty() {
+        let sparse = add_sparse_worktree_zero_copy_optional_branch(
+            repo_path,
+            target_path,
+            new_branch,
+            start_point,
+            detach,
+            &cleaned_sparse,
+            cow_caches,
+            zero_copy_devmap,
+        )?;
+        let mut created = WorktreeCreated {
+            path: sparse.path,
+            cache_error: sparse.cache_error,
+            low_disk: None,
+            disk_unknown: false,
+            hook_error: None,
+            hook_notice: None,
+        };
+        if run_hooks {
+            let repo = validate_repo(repo_path)?;
+            let branch_name = new_branch.unwrap_or("");
+            match run_repo_hooks(
+                &repo,
+                Path::new(&created.path),
+                "post_create",
+                &[
+                    ("GITPULSE_BRANCH", branch_name),
+                    ("GITPULSE_WORKTREE_PATH", &created.path),
+                ],
+            ) {
+                Ok(outcome) => created.hook_notice = outcome.skipped,
+                Err(e) => created.hook_error = Some(e.into_message()),
+            }
+        }
+        return Ok(created);
+    }
+
+    let selection = crate::engine::cow_clone::CacheSelection::default();
+    add_worktree_cached_with_devmap_mode(
+        repo_path,
+        target_path,
+        new_branch,
+        start_point,
+        detach,
+        cow_caches.then_some(&selection),
+        run_hooks,
+        zero_copy_devmap,
+    )
+}
+
 /// [`add_worktree_extended`] with the cache copy's selection (bounds and
 /// free-space reader) given, or `None` for no caches.
 pub fn add_worktree_cached(
@@ -2195,6 +2267,29 @@ pub fn add_worktree_cached(
     caches: Option<&crate::engine::cow_clone::CacheSelection>,
     run_hooks: bool,
 ) -> Result<WorktreeCreated, CommandError> {
+    add_worktree_cached_with_devmap_mode(
+        repo_path,
+        target_path,
+        new_branch,
+        start_point,
+        detach,
+        caches,
+        run_hooks,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_worktree_cached_with_devmap_mode(
+    repo_path: &str,
+    target_path: &str,
+    new_branch: Option<&str>,
+    start_point: Option<&str>,
+    detach: bool,
+    caches: Option<&crate::engine::cow_clone::CacheSelection>,
+    run_hooks: bool,
+    zero_copy_devmap: bool,
+) -> Result<WorktreeCreated, CommandError> {
     let path = add_worktree(repo_path, target_path, new_branch, start_point, detach)?;
     let mut created = WorktreeCreated {
         path,
@@ -2204,9 +2299,32 @@ pub fn add_worktree_cached(
         hook_error: None,
         hook_notice: None,
     };
+    let target = Path::new(&created.path);
+    let anchor = resolve_worktree_family(repo_path, &created.path)
+        .ok()
+        .map(|f| f.anchor)
+        .unwrap_or_else(|| Path::new(repo_path).to_path_buf());
     if let Some(selection) = caches {
         let repo = validate_repo(repo_path)?;
-        match clone_ignored_caches(&repo, Path::new(target_path), selection) {
+        let low_space = matches!(
+            crate::engine::cow_clone::read_free(selection.free_space, target),
+            crate::sysload::Reading::Value(left) if left < crate::sysload::LOW_DISK_FLOOR
+        );
+        let cache_outcome = std::thread::scope(|scope| {
+            let cache_task = scope.spawn(|| clone_ignored_caches(&repo, target, selection));
+            let devmap_task = scope.spawn(|| {
+                if zero_copy_devmap {
+                    let _ = crate::codeintel::provision_worktree_devmap_zero_copy(&anchor, target);
+                } else if !low_space {
+                    let _ = crate::codeintel::provision_worktree_devmap(&anchor, target);
+                }
+            });
+            let _ = devmap_task.join();
+            cache_task
+                .join()
+                .unwrap_or_else(|_| Err(CommandError::plain("cache clone worker panicked")))
+        });
+        match cache_outcome {
             Ok(report) => {
                 created.cache_error = report.error();
                 created.low_disk = report.low_disk;
@@ -2214,17 +2332,27 @@ pub fn add_worktree_cached(
             }
             Err(error) => created.cache_error = Some(error.into_message()),
         }
+    } else if zero_copy_devmap {
+        let _ = crate::codeintel::provision_worktree_devmap_zero_copy(&anchor, target);
+    } else {
+        let low_space = matches!(
+            crate::engine::cow_clone::read_free(crate::sysload::free_bytes, target),
+            crate::sysload::Reading::Value(left) if left < crate::sysload::LOW_DISK_FLOOR
+        );
+        if !low_space {
+            let _ = crate::codeintel::provision_worktree_devmap(&anchor, target);
+        }
     }
     if run_hooks {
         let repo = validate_repo(repo_path)?;
         let branch_name = new_branch.unwrap_or("");
         match run_repo_hooks(
             &repo,
-            Path::new(target_path),
+            target,
             "post_create",
             &[
                 ("GITPULSE_BRANCH", branch_name),
-                ("GITPULSE_WORKTREE_PATH", target_path),
+                ("GITPULSE_WORKTREE_PATH", &created.path),
             ],
         ) {
             Ok(outcome) => created.hook_notice = outcome.skipped,
@@ -3860,6 +3988,11 @@ pub fn remove_worktree_with(
         // cut short after the rename. Finishing it is removing that record;
         // `validate_repo` below would refuse a path that is not there.
         if finish_vanished_worktree(&repo, target_path)? {
+            let _ = crate::engine::agent_bus::release_lanes_matching(
+                repo_path,
+                Some(Path::new(&plain_path_text(target_path))),
+                None,
+            );
             return Ok(WorktreeRemoval {
                 cleanup_error: None,
                 sweep_problems,
@@ -3871,6 +4004,11 @@ pub fn remove_worktree_with(
             remove_worktree_locked(&repo, target_path, force)
         })?
     };
+    let _ = crate::engine::agent_bus::release_lanes_matching(
+        repo_path,
+        Some(Path::new(&plain_path_text(target_path))),
+        None,
+    );
     Ok(WorktreeRemoval {
         cleanup_error: finish_teardown(aside, delete_aside),
         sweep_problems,
@@ -3976,7 +4114,22 @@ pub fn add_worktree_argv(
     start_point: Option<&str>,
     detach: bool,
 ) -> Vec<String> {
+    add_worktree_argv_configured(target_path, new_branch, start_point, detach, false)
+}
+
+/// Exact `git worktree add` argv for both full checkouts and `--no-checkout`
+/// sparse-cone checkouts, so the policy gate judges the exact line executed.
+pub fn add_worktree_argv_configured(
+    target_path: &str,
+    new_branch: Option<&str>,
+    start_point: Option<&str>,
+    detach: bool,
+    sparse_no_checkout: bool,
+) -> Vec<String> {
     let mut argv: Vec<String> = vec!["git".into(), "worktree".into(), "add".into()];
+    if sparse_no_checkout {
+        argv.push("--no-checkout".into());
+    }
     if let Some(branch) = new_branch {
         argv.push("-b".into());
         argv.push(branch.into());
@@ -4030,11 +4183,1242 @@ pub fn prune_worktree_argv() -> Vec<String> {
     ]
 }
 
+/// Sanitizes a branch name for safe directory naming (replaces `/`, `\`, `:`, whitespace, etc. with `-`).
+pub fn sanitize_branch_name(branch: &str) -> String {
+    let sanitized: String = branch
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '-' })
+        .collect();
+    let trimmed = sanitized.trim_matches(|c| c == '-' || c == '.');
+    if trimmed.is_empty() {
+        "worktree".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Renders a branch template safely, substituting variables:
+/// `repo`, `branch`, `branch | sanitize`, `task_id`, `agent_id`, `short_sha`.
+pub fn render_branch_template(
+    template: &str,
+    repo_name: &str,
+    branch: &str,
+    task_id: Option<&str>,
+    agent_id: Option<&str>,
+    short_sha: Option<&str>,
+) -> Result<String, CommandError> {
+    let sanitized_branch = sanitize_branch_name(branch);
+    let mut rendered = template.to_string();
+    rendered = rendered.replace("{{ repo }}", repo_name);
+    rendered = rendered.replace("{{repo}}", repo_name);
+    rendered = rendered.replace("{{ branch | sanitize }}", &sanitized_branch);
+    rendered = rendered.replace("{{branch | sanitize}}", &sanitized_branch);
+    rendered = rendered.replace("{{ branch }}", branch);
+    rendered = rendered.replace("{{branch}}", branch);
+    rendered = rendered.replace("{{ task_id }}", task_id.unwrap_or(""));
+    rendered = rendered.replace("{{task_id}}", task_id.unwrap_or(""));
+    rendered = rendered.replace("{{ agent_id }}", agent_id.unwrap_or(""));
+    rendered = rendered.replace("{{agent_id}}", agent_id.unwrap_or(""));
+    rendered = rendered.replace("{{ short_sha }}", short_sha.unwrap_or(""));
+    rendered = rendered.replace("{{short_sha}}", short_sha.unwrap_or(""));
+
+    if rendered.contains("{{") || rendered.contains("}}") {
+        return Err(CommandError::plain(format!(
+            "template contains unrendered tags: {rendered}"
+        )));
+    }
+    if rendered.contains('\0') {
+        return Err(CommandError::plain("rendered template contains null byte"));
+    }
+    Ok(rendered)
+}
+
+/// Resolves a deterministic target worktree path for a branch in a repository.
+pub fn resolve_worktree_path_for_branch(
+    repo_path: &str,
+    branch: &str,
+    base_target: Option<&str>,
+) -> Result<PathBuf, CommandError> {
+    if let Some(target) = base_target {
+        validate_target_path(target)?;
+        refuse_gitpulse_lane_target(target)?;
+        return Ok(PathBuf::from(target));
+    }
+    let repo = validate_repo(repo_path)?;
+    let anchor = resolve_worktree_family(repo_path, repo_path)
+        .ok()
+        .and_then(|f| f.anchor.to_str().and_then(|s| validate_repo(s).ok()))
+        .unwrap_or(repo);
+    let repo_name = anchor
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("repo");
+    let template = "../{{ repo }}.{{ branch | sanitize }}";
+    let rendered = render_branch_template(template, repo_name, branch, None, None, None)?;
+    let parent = anchor.parent().unwrap_or(&anchor);
+    let target = parent.join(rendered.trim_start_matches("../"));
+    if let Some(target_str) = target.to_str() {
+        refuse_gitpulse_lane_target(target_str)?;
+    }
+    Ok(target)
+}
+
+/// Results of the Six-Point Branch Integration Verification Algorithm.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SixPointCheckResult {
+    pub branch: String,
+    pub target: String,
+    pub same_commit: bool,
+    pub is_ancestor: bool,
+    pub no_added_changes: bool,
+    pub trees_match: bool,
+    pub merge_adds_nothing: bool,
+    pub patch_id_match: bool,
+    pub is_integrated: bool,
+}
+
+/// Verifies whether a branch is fully integrated into a target branch via 6 distinct checks:
+/// 1. SameCommit: branch SHA == target SHA
+/// 2. Ancestor: git merge-base --is-ancestor branch target
+/// 3. NoAddedChanges: git diff target...branch is empty
+/// 4. TreesMatch: branch tree == target tree
+/// 5. MergeAddsNothing: quarantined `git merge-tree --write-tree` matches target tree (squash merges)
+/// 6. PatchIdMatch: `git cherry` confirms every commit on branch has an equivalent patch-id in target (rebases/cherry-picks)
+pub fn verify_branch_integration(
+    repo: &Path,
+    branch: &str,
+    target: &str,
+) -> Result<SixPointCheckResult, CommandError> {
+    validate_ref_name(branch)?;
+    validate_ref_name(target)?;
+
+    let branch_sha = git_text(repo, &["rev-parse", "--verify", branch])
+        .map(|s| s.trim().to_string())?;
+    let target_sha = git_text(repo, &["rev-parse", "--verify", target])
+        .map(|s| s.trim().to_string())?;
+
+    // Check 1: SameCommit
+    let same_commit = branch_sha == target_sha;
+
+    // Check 2: Ancestor (merge-base --is-ancestor branch target)
+    let is_ancestor = crate::engine::git_cli::git_captured(
+        repo,
+        &["merge-base", "--is-ancestor", &branch_sha, &target_sha],
+    )
+    .map(|run| run.status_code == 0)
+    .unwrap_or(false);
+
+    // Check 3: NoAddedChanges (git diff target...branch --quiet)
+    let no_added_changes = crate::engine::git_cli::git_captured(
+        repo,
+        &["diff", &format!("{target_sha}...{branch_sha}"), "--quiet"],
+    )
+    .map(|run| run.status_code == 0)
+    .unwrap_or(false);
+
+    // Check 4: TreesMatch (rev-parse branch^{tree} == rev-parse target^{tree})
+    let branch_tree = git_text(repo, &["rev-parse", &format!("{branch_sha}^{{tree}}")])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let target_tree = git_text(repo, &["rev-parse", &format!("{target_sha}^{{tree}}")])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let trees_match = !branch_tree.is_empty() && branch_tree == target_tree;
+
+    // Check 5: MergeAddsNothing (quarantined 3-way merge-tree --write-tree produces target_tree)
+    let merge_adds_nothing = if same_commit || is_ancestor || trees_match {
+        true
+    } else if !target_tree.is_empty() {
+        match crate::engine::object_quarantine::ObjectQuarantine::new(repo) {
+            Ok(quarantine) => match quarantine.merge_tree(
+                repo,
+                &target_sha,
+                &branch_sha,
+                Instant::now() + crate::engine::git_cli::DEFAULT_TIMEOUT,
+            ) {
+                Ok(crate::engine::object_quarantine::MergeOutcome::Clean { tree }) => {
+                    tree == target_tree
+                }
+                _ => false,
+            },
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
+
+    // Check 6: PatchIdMatch (`git cherry` confirms every non-ancestor commit has an equivalent patch-id in target)
+    let patch_id_match = if same_commit || is_ancestor {
+        true
+    } else {
+        match git_text(repo, &["cherry", &target_sha, &branch_sha]) {
+            Ok(cherry) => {
+                let mut saw_equivalent = false;
+                let mut any_unmatched = false;
+                for line in cherry.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                    if line.starts_with("- ") {
+                        saw_equivalent = true;
+                    } else {
+                        any_unmatched = true;
+                    }
+                }
+                saw_equivalent && !any_unmatched
+            }
+            Err(_) => false,
+        }
+    };
+
+    let is_integrated = same_commit
+        || is_ancestor
+        || no_added_changes
+        || trees_match
+        || merge_adds_nothing
+        || patch_id_match;
+
+    Ok(SixPointCheckResult {
+        branch: branch.to_string(),
+        target: target.to_string(),
+        same_commit,
+        is_ancestor,
+        no_added_changes,
+        trees_match,
+        merge_adds_nothing,
+        patch_id_match,
+        is_integrated,
+    })
+}
+
+/// Report of process reaping operation in a worktree directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessReapReport {
+    pub pids_examined: Vec<i32>,
+    pub pids_terminated: Vec<i32>,
+    pub pids_spared: Vec<i32>,
+    pub dry_run: bool,
+}
+
+/// Reaps detached background processes working in `dir` through [`crate::procguard::signal`],
+/// sparing interactive shells, live agent sessions, supervisor-owned launches, `memguard`,
+/// and processes belonging to another user, while failing closed if the process table cannot be read.
+pub fn reap_processes_in_dir(dir: &Path, dry_run: bool) -> Result<ProcessReapReport, CommandError> {
+    let pids = crate::sysload::procscan::working_in(dir).map_err(CommandError::plain)?;
+
+    let mut terminated = Vec::new();
+    let mut spared = Vec::new();
+
+    #[cfg(unix)]
+    let me_uid = unsafe { libc::getuid() };
+    #[cfg(unix)]
+    let start_of = |p: i32| crate::sysload::procscan::probe_one(p).map(|facts| facts.start_us);
+
+    for &pid in &pids {
+        #[cfg(unix)]
+        {
+            if pid <= 1 || pid == std::process::id() as i32 {
+                spared.push(pid);
+                continue;
+            }
+            let Some(facts) = crate::sysload::procscan::probe_one(pid) else {
+                // Exited between `working_in` and `probe_one`.
+                continue;
+            };
+            let base_name = facts.ident.name.trim_start_matches('-');
+            let is_interactive_shell = matches!(
+                base_name,
+                "sh" | "bash"
+                    | "zsh"
+                    | "fish"
+                    | "nu"
+                    | "tcsh"
+                    | "csh"
+                    | "ksh"
+                    | "tmux"
+                    | "screen"
+            );
+            if facts.start_us == 0
+                || facts.uid != me_uid
+                || facts.ident.memguard
+                || facts.ident.launch.is_some()
+                || facts.ident.kind.is_some()
+                || is_interactive_shell
+            {
+                spared.push(pid);
+                continue;
+            }
+
+            if dry_run {
+                terminated.push(pid);
+                continue;
+            }
+
+            let sigterm_res = crate::procguard::signal::signal_process(
+                pid,
+                facts.start_us,
+                &start_of,
+                libc::SIGTERM,
+                "worktree reap",
+            );
+            match sigterm_res {
+                Ok(()) => {
+                    let mut exited = false;
+                    for _ in 0..10 {
+                        std::thread::sleep(Duration::from_millis(50));
+                        let still_same = crate::sysload::procscan::probe_one(pid)
+                            .is_some_and(|now| now.start_us == facts.start_us);
+                        if !still_same {
+                            exited = true;
+                            break;
+                        }
+                    }
+                    if !exited {
+                        let _ = crate::procguard::signal::signal_process(
+                            pid,
+                            facts.start_us,
+                            &start_of,
+                            libc::SIGKILL,
+                            "worktree reap escalate",
+                        );
+                    }
+                    terminated.push(pid);
+                }
+                Err(_) => {
+                    if crate::sysload::procscan::probe_one(pid)
+                        .is_some_and(|now| now.start_us == facts.start_us)
+                    {
+                        spared.push(pid);
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            spared.push(pid);
+        }
+    }
+
+    Ok(ProcessReapReport {
+        pids_examined: pids,
+        pids_terminated: terminated,
+        pids_spared: spared,
+        dry_run,
+    })
+}
+
+/// Result of automated worktree merge pipeline execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeMergeResult {
+    pub ok: bool,
+    pub source_branch: String,
+    pub target_branch: String,
+    pub squashed_commit: Option<String>,
+    pub merged_sha: Option<String>,
+    pub worktree_removed: bool,
+    pub error: Option<String>,
+}
+
+/// Returns `true` when `rel_path` names a machine-generated runtime state file
+/// written by GitPulse or DevMap itself (`.devcouncil/ledger.sqlite*`,
+/// `.devcouncil/codeintel/**`, `.devmap/codeintel/**`), rather than a user or
+/// agent source edit. User-authored files such as `.devcouncil/config.yaml`
+/// return `false` so uncommitted edits to them remain protected.
+pub fn is_runtime_state_artifact_path(rel_path: &str) -> bool {
+    let normalized = rel_path.trim_matches('/');
+    if matches!(
+        normalized,
+        ".devcouncil/ledger.sqlite"
+            | ".devcouncil/ledger.sqlite-wal"
+            | ".devcouncil/ledger.sqlite-shm"
+            | ".devcouncil/ledger.sqlite-journal"
+            | ".devmap/ledger.sqlite"
+            | ".devmap/ledger.sqlite-wal"
+            | ".devmap/ledger.sqlite-shm"
+            | ".devmap/ledger.sqlite-journal"
+    ) {
+        return true;
+    }
+    normalized.starts_with(".devcouncil/codeintel/")
+        || normalized.starts_with(".devmap/codeintel/")
+}
+
+/// Repo-relative uncommitted user/agent paths in `worktree_path`, excluding
+/// GitPulse/DevMap's own runtime SQLite and codeintel artifacts. Fails closed
+/// if the underlying status scan was capped (`truncated`) with no visible user
+/// path, so a capped status sample is never mistaken for a clean checkout.
+pub fn user_changed_paths(worktree_path: &str) -> Result<(Vec<String>, bool), CommandError> {
+    let (raw, truncated) = changed_paths(worktree_path)?;
+    let filtered: Vec<String> = raw
+        .into_iter()
+        .filter(|p| !is_runtime_state_artifact_path(p))
+        .collect();
+    if filtered.is_empty() && truncated {
+        return Err(CommandError::plain(format!(
+            "Worktree status for {worktree_path} exceeded scan cap; refusing to treat capped status as clean"
+        )));
+    }
+    Ok((filtered, truncated))
+}
+
+/// Executes the automated worktree merge pipeline safely across checked-out and
+/// headless target branches:
+/// 1. Repository trust, policy & agent-review gate (`harness::guard_command`)
+/// 2. Dirty-worktree & parked-operation guards on both source and target checkouts
+/// 3. 6-point integration verification + quarantined 3-way `git merge-tree` conflict check
+/// 4. Working-tree merge (when target is checked out) or CAS in-memory `merge-tree` + `commit-tree`
+/// 5. Process reaping, worktree removal, and source branch cleanup
+pub fn merge_worktree_pipeline(
+    repo_path: &str,
+    source_branch: &str,
+    target_branch: Option<&str>,
+    squash: bool,
+    commit_message: Option<&str>,
+    remove_wt: bool,
+) -> Result<WorktreeMergeResult, CommandError> {
+    let family = resolve_worktree_family(repo_path, repo_path)?;
+    let anchor = family.anchor;
+    let anchor_str = anchor
+        .to_str()
+        .ok_or_else(|| CommandError::plain("repository anchor path is not valid UTF-8"))?;
+    crate::repository_trust::require(&anchor)?;
+    validate_ref_name(source_branch)?;
+
+    let target = match target_branch {
+        Some(t) => {
+            validate_ref_name(t)?;
+            t.to_string()
+        }
+        None => {
+            if let Ok(default) = crate::engine::git_reader::compute_default_base(&anchor).checked()
+            {
+                if let Some((name, _)) = default.base {
+                    name
+                } else if git_text(&anchor, &["rev-parse", "--verify", "refs/heads/main"]).is_ok() {
+                    "main".to_string()
+                } else if git_text(&anchor, &["rev-parse", "--verify", "refs/heads/master"]).is_ok()
+                {
+                    "master".to_string()
+                } else {
+                    return Err(CommandError::plain("cannot determine target branch"));
+                }
+            } else if git_text(&anchor, &["rev-parse", "--verify", "refs/heads/main"]).is_ok() {
+                "main".to_string()
+            } else if git_text(&anchor, &["rev-parse", "--verify", "refs/heads/master"]).is_ok() {
+                "master".to_string()
+            } else {
+                return Err(CommandError::plain("cannot determine target branch"));
+            }
+        }
+    };
+
+    if source_branch == target {
+        return Err(CommandError::plain(format!(
+            "cannot merge branch {source_branch:?} into itself"
+        )));
+    }
+
+    let merge_flag = if squash { "--squash" } else { "--no-edit" };
+    crate::harness::guard_command(anchor_str, &["git", "merge", merge_flag, source_branch])
+        .map_err(CommandError::from)?;
+
+    let (source_sha, source_wt_path, squashed_sha, final_sha) = {
+        let _repo_lock = repo_mutation_lock(&anchor);
+        let _guard = _repo_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let source_ref = format!("refs/heads/{source_branch}");
+        let target_ref = format!("refs/heads/{target}");
+        let source_sha = git_text(&anchor, &["rev-parse", "--verify", &source_ref])
+            .map(|s| s.trim().to_string())?;
+        let target_sha = git_text(&anchor, &["rev-parse", "--verify", &target_ref])
+            .map(|s| s.trim().to_string())?;
+
+        let worktrees = list_worktrees(anchor_str)?;
+        let source_wt = worktrees
+            .iter()
+            .find(|w| w.branch.as_deref() == Some(source_branch))
+            .cloned();
+        if let Some(ref swt) = source_wt {
+            let (dirty, _) = user_changed_paths(&swt.path)?;
+            if !dirty.is_empty() {
+                return Err(CommandError::plain(format!(
+                    "Worktree for {source_branch} has {} uncommitted file change(s); commit or stash them before merging",
+                    dirty.len()
+                )));
+            }
+        }
+
+        let target_wt = worktrees
+            .iter()
+            .find(|w| w.branch.as_deref() == Some(target.as_str()))
+            .cloned();
+        if let Some(ref twt) = target_wt {
+            let (dirty, _) = user_changed_paths(&twt.path)?;
+            if !dirty.is_empty() {
+                return Err(CommandError::plain(format!(
+                    "Target worktree ({target}) has {} uncommitted file change(s); commit or stash them before merging",
+                    dirty.len()
+                )));
+            }
+            if let Some(kind) = crate::engine::repo_op::detect_kind(Path::new(&twt.path))? {
+                return Err(CommandError::plain(format!(
+                    "Target worktree ({target}) has a {} in progress; finish or abort it before merging",
+                    kind.label()
+                )));
+            }
+        }
+
+        let check = verify_branch_integration(&anchor, source_branch, &target)?;
+        let mut squashed_sha = None;
+
+        if !check.is_integrated {
+            let quarantine = crate::engine::object_quarantine::ObjectQuarantine::new(&anchor)
+                .map_err(|e| CommandError::plain(e.to_string()))?;
+            match quarantine
+                .merge_tree(
+                    &anchor,
+                    &target_sha,
+                    &source_sha,
+                    Instant::now() + crate::engine::git_cli::DEFAULT_TIMEOUT,
+                )
+                .map_err(|e| CommandError::plain(e.to_string()))?
+            {
+                crate::engine::object_quarantine::MergeOutcome::Conflicted {
+                    paths,
+                    paths_total,
+                    ..
+                } => {
+                    let preview: Vec<&str> = paths.iter().take(5).map(String::as_str).collect();
+                    return Err(CommandError::plain(format!(
+                        "Merge of {source_branch} into {target} has {paths_total} conflicting file(s): {}",
+                        preview.join(", ")
+                    )));
+                }
+                crate::engine::object_quarantine::MergeOutcome::Clean { .. } => {}
+            }
+
+            let is_ff = crate::engine::git_cli::git_captured(
+                &anchor,
+                &["merge-base", "--is-ancestor", &target_sha, &source_sha],
+            )
+            .map(|r| r.status_code == 0)
+            .unwrap_or(false);
+
+            if squash || !is_ff {
+                GitWriter::require_commit_identity(&anchor)?;
+            }
+
+            let msg = match commit_message {
+                Some(m) => m.to_string(),
+                None if squash => format!("Squash merge branch '{source_branch}' into {target}"),
+                None => format!("Merge branch '{source_branch}' into {target}"),
+            };
+
+            let new_commit = if !squash && is_ff {
+                source_sha.clone()
+            } else {
+                let merged_tree = git_text(
+                    &anchor,
+                    &[
+                        "merge-tree",
+                        "--write-tree",
+                        "--no-messages",
+                        &target_sha,
+                        &source_sha,
+                    ],
+                )?
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+                if merged_tree.is_empty() {
+                    return Err(CommandError::plain(
+                        "git merge-tree did not return a merged tree OID",
+                    ));
+                }
+                let created_commit = if squash {
+                    git_text(
+                        &anchor,
+                        &["commit-tree", &merged_tree, "-p", &target_sha, "-m", &msg],
+                    )?
+                    .trim()
+                    .to_string()
+                } else {
+                    git_text(
+                        &anchor,
+                        &[
+                            "commit-tree",
+                            &merged_tree,
+                            "-p",
+                            &target_sha,
+                            "-p",
+                            &source_sha,
+                            "-m",
+                            &msg,
+                        ],
+                    )?
+                    .trim()
+                    .to_string()
+                };
+                if squash {
+                    squashed_sha = Some(created_commit.clone());
+                }
+                created_commit
+            };
+
+            if let Some(ref twt) = target_wt {
+                let twt_path = Path::new(&twt.path);
+                git_text(twt_path, &["merge", "--ff-only", &new_commit])?;
+            } else {
+                git_text(&anchor, &["update-ref", &target_ref, &new_commit, &target_sha])?;
+            }
+        }
+
+        let final_sha = git_text(&anchor, &["rev-parse", "--verify", &target_ref])
+            .map(|s| s.trim().to_string())
+            .ok();
+
+        let swt_path = source_wt
+            .filter(|w| !w.is_main)
+            .map(|w| w.path);
+        (source_sha, swt_path, squashed_sha, final_sha)
+    };
+
+    let mut wt_removed = false;
+    if remove_wt {
+        let current_source_sha = git_text(
+            &anchor,
+            &["rev-parse", "--verify", &format!("refs/heads/{source_branch}")],
+        )
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+        if current_source_sha == source_sha {
+            let mut safe_to_delete_branch = true;
+            if let Some(ref wt_path) = source_wt_path {
+                let still_clean = user_changed_paths(wt_path)
+                    .map(|(dirty, _)| dirty.is_empty())
+                    .unwrap_or(false);
+                if still_clean {
+                    let remove_argv = remove_worktree_argv(wt_path, true);
+                    let remove_refs: Vec<&str> = remove_argv.iter().map(String::as_str).collect();
+                    if crate::harness::guard_command(anchor_str, &remove_refs).is_ok() {
+                        let _ = reap_processes_in_dir(Path::new(wt_path), false);
+                        if remove_worktree(anchor_str, wt_path, true).is_ok() {
+                            wt_removed = true;
+                        } else {
+                            safe_to_delete_branch = false;
+                        }
+                    } else {
+                        safe_to_delete_branch = false;
+                    }
+                } else {
+                    safe_to_delete_branch = false;
+                }
+            }
+            if safe_to_delete_branch {
+                let del_flag = if squash { "-D" } else { "-d" };
+                if crate::harness::guard_command(
+                    anchor_str,
+                    &["git", "branch", del_flag, source_branch],
+                )
+                .is_ok()
+                {
+                    let _ = git_text(&anchor, &["branch", del_flag, source_branch]);
+                }
+            }
+            if wt_removed || safe_to_delete_branch {
+                let _ = crate::engine::agent_bus::release_lanes_matching(
+                    anchor_str,
+                    source_wt_path.as_deref().map(Path::new),
+                    Some(source_branch),
+                );
+            }
+        }
+    }
+
+    Ok(WorktreeMergeResult {
+        ok: true,
+        source_branch: source_branch.to_string(),
+        target_branch: target,
+        squashed_commit: squashed_sha,
+        merged_sha: final_sha,
+        worktree_removed: wt_removed,
+        error: None,
+    })
+}
+
+const MAX_SPARSE_SCOPE_INPUTS: usize = 64;
+const MAX_SPARSE_GRAPH_DEPTH: usize = 3;
+const MAX_SPARSE_GRAPH_FILES: usize = 256;
+
+/// Receipt for a DevMap-guided sparse, zero-copy worktree checkout.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SparseWorktreeCreated {
+    pub path: String,
+    pub branch: String,
+    pub head_sha: String,
+    pub requested_paths: Vec<String>,
+    pub materialized_cone_dirs: Vec<String>,
+    pub caches_cloned: Vec<String>,
+    pub cache_error: Option<String>,
+    pub zero_copy_devmap: bool,
+    pub overlay_path: Option<String>,
+}
+
+fn normalize_sparse_rel_path(raw: &str) -> Result<String, CommandError> {
+    let trimmed = raw.trim().replace('\\', "/");
+    if trimmed.starts_with('/')
+        || Path::new(&trimmed).is_absolute()
+        || (trimmed.len() >= 2
+            && trimmed.as_bytes()[0].is_ascii_alphabetic()
+            && trimmed.as_bytes()[1] == b':')
+    {
+        return Err(CommandError::plain(format!(
+            "sparse scope path {raw:?} must be repository-relative"
+        )));
+    }
+    let stripped = trimmed.trim_end_matches('/');
+    if stripped.is_empty() || stripped.contains('\0') || stripped.starts_with('-') {
+        return Err(CommandError::plain(format!(
+            "invalid sparse scope path {raw:?}"
+        )));
+    }
+    let path = Path::new(stripped);
+    let mut parts = Vec::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::Normal(os) => {
+                let s = os.to_str().ok_or_else(|| {
+                    CommandError::plain(format!("sparse scope path {raw:?} is not valid UTF-8"))
+                })?;
+                if s.is_empty() || s == "." || s == ".." {
+                    return Err(CommandError::plain(format!(
+                        "sparse scope path {raw:?} contains disallowed segment"
+                    )));
+                }
+                parts.push(s);
+            }
+            _ => {
+                return Err(CommandError::plain(format!(
+                    "sparse scope path {raw:?} contains disallowed component"
+                )));
+            }
+        }
+    }
+    Ok(parts.join("/"))
+}
+
+fn cone_dir_for_rel_path(anchor: &Path, rev: Option<&str>, rel: &str) -> Option<String> {
+    let tree_rev = rev.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("HEAD");
+    let spec = format!("{tree_rev}:{rel}");
+    if let Ok(run) = crate::engine::git_cli::git_captured(anchor, &["cat-file", "-t", &spec]) {
+        if run.status_code == 0 {
+            match String::from_utf8_lossy(&run.stdout).trim() {
+                "tree" | "commit" => return Some(rel.to_string()),
+                "blob" => {
+                    return rel
+                        .rsplit_once('/')
+                        .and_then(|(parent, _)| (!parent.is_empty()).then(|| parent.to_string()));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let candidate = anchor.join(rel);
+    if candidate.is_dir() {
+        return Some(rel.to_string());
+    }
+    if candidate.is_file() {
+        return rel
+            .rsplit_once('/')
+            .and_then(|(parent, _)| (!parent.is_empty()).then(|| parent.to_string()));
+    }
+    match rel.rsplit_once('/') {
+        Some((parent, leaf)) if !parent.is_empty() => {
+            if leaf.contains('.') && !leaf.starts_with('.') {
+                Some(parent.to_string())
+            } else {
+                Some(rel.to_string())
+            }
+        }
+        _ => {
+            // Root-level files are always checked out by `git sparse-checkout --cone`;
+            // a single non-existent directory name (including leading-dot dirs like `.github`)
+            // is treated as a directory cone.
+            if !rel.contains('.') || rel.starts_with('.') {
+                Some(rel.to_string())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn collapse_redundant_cone_dirs(dirs: std::collections::BTreeSet<String>) -> Vec<String> {
+    let mut minimal: Vec<String> = Vec::new();
+    for dir in dirs {
+        if dir.is_empty() {
+            continue;
+        }
+        let covered = minimal
+            .iter()
+            .any(|existing| dir == *existing || dir.starts_with(&format!("{existing}/")));
+        if !covered {
+            minimal.push(dir);
+        }
+    }
+    minimal
+}
+
+/// Expands `scope_paths` into a minimal sorted set of Git `--cone` directories by
+/// walking outbound file dependencies in `anchor`'s DevMap store (bounded to
+/// `MAX_SPARSE_GRAPH_DEPTH` hops and `MAX_SPARSE_GRAPH_FILES` files).
+///
+/// When `anchor` has no indexed DevMap store yet, falls back deterministically
+/// to the normalized cone directories of `scope_paths`.
+pub fn expand_sparse_cone_with_devmap(
+    anchor: &Path,
+    scope_paths: &[String],
+) -> Result<Vec<String>, CommandError> {
+    expand_sparse_cone_with_devmap_at(anchor, None, scope_paths)
+}
+
+fn expand_sparse_cone_with_devmap_at(
+    anchor: &Path,
+    base: Option<&str>,
+    scope_paths: &[String],
+) -> Result<Vec<String>, CommandError> {
+    if scope_paths.is_empty() {
+        return Err(CommandError::plain(
+            "sparse scope_paths must contain at least one path",
+        ));
+    }
+    if scope_paths.len() > MAX_SPARSE_SCOPE_INPUTS {
+        return Err(CommandError::plain(format!(
+            "sparse scope_paths exceeds maximum of {MAX_SPARSE_SCOPE_INPUTS} entries"
+        )));
+    }
+
+    let mut normalized = Vec::with_capacity(scope_paths.len());
+    let mut cone_dirs = std::collections::BTreeSet::new();
+    for raw in scope_paths {
+        let rel = normalize_sparse_rel_path(raw)?;
+        if let Some(cone) = cone_dir_for_rel_path(anchor, base, &rel) {
+            cone_dirs.insert(cone);
+        }
+        normalized.push(rel);
+    }
+
+    if let Some(anchor_str) = anchor.to_str() {
+        if let Ok(store) = crate::codeintel::open_repo_map(anchor_str) {
+            let indexed_files: Vec<String> = store
+                .latest_file_hashes()
+                .map(|m| m.into_keys().collect())
+                .unwrap_or_default();
+
+            let mut visited = std::collections::HashSet::new();
+            let mut queue = std::collections::VecDeque::new();
+
+            for req in &normalized {
+                let prefix = format!("{req}/");
+                for file in &indexed_files {
+                    if (file == req || file.starts_with(&prefix))
+                        && visited.len() < MAX_SPARSE_GRAPH_FILES
+                        && visited.insert(file.clone())
+                    {
+                        queue.push_back((file.clone(), 0usize));
+                    }
+                }
+            }
+
+            while let Some((curr_file, depth)) = queue.pop_front() {
+                if depth >= MAX_SPARSE_GRAPH_DEPTH || visited.len() >= MAX_SPARSE_GRAPH_FILES {
+                    continue;
+                }
+                if let Ok(Some(file_edges)) = store.file_edges(&curr_file, 0.5) {
+                    for edge in file_edges.edges {
+                        if let Some((parent, _)) = edge.target_file.rsplit_once('/') {
+                            if !parent.is_empty() {
+                                cone_dirs.insert(parent.to_string());
+                            }
+                        }
+                        if visited.len() < MAX_SPARSE_GRAPH_FILES
+                            && visited.insert(edge.target_file.clone())
+                        {
+                            queue.push_back((edge.target_file, depth + 1));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(collapse_redundant_cone_dirs(cone_dirs))
+}
+
+fn clone_scoped_caches_for_cone(
+    anchor: &Path,
+    worktree: &Path,
+    cone_dirs: &[String],
+) -> (Vec<String>, Option<String>) {
+    let selection = crate::engine::cow_clone::CacheSelection::default();
+    let mut cloned_names = Vec::new();
+    let mut errors = Vec::new();
+
+    match clone_ignored_caches(anchor, worktree, &selection) {
+        Ok(report) => {
+            for item in &report.copied {
+                if let Some(name) = Path::new(&item.destination)
+                    .strip_prefix(worktree)
+                    .ok()
+                    .and_then(|p| p.to_str())
+                {
+                    cloned_names.push(name.replace('\\', "/"));
+                }
+            }
+            if let Some(err) = report.error() {
+                errors.push(err);
+            }
+        }
+        Err(e) => errors.push(e.into_message()),
+    }
+
+    // Also CoW-clone nested `node_modules` inside materialized cone directories
+    // (never touching unmaterialized sibling packages).
+    for cone in cone_dirs {
+        let nested_rel = format!("{cone}/node_modules");
+        let src_nm = anchor.join(&nested_rel);
+        let dst_nm = worktree.join(&nested_rel);
+        if !src_nm.is_dir() || dst_nm.symlink_metadata().is_ok() {
+            continue;
+        }
+        let check_arg = format!("{nested_rel}/");
+        let is_ignored = crate::engine::git_cli::git_captured(
+            worktree,
+            &["check-ignore", "-q", "--", check_arg.as_str()],
+        )
+        .map(|run| run.status_code == 0)
+        .unwrap_or(false);
+        if !is_ignored {
+            continue;
+        }
+        if let Some(parent) = dst_nm.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match crate::engine::cow_clone::reflink_copy_dir(&src_nm, &dst_nm) {
+            Ok(_) => cloned_names.push(nested_rel),
+            Err(e) => errors.push(format!("{nested_rel}: {}", e.message())),
+        }
+    }
+
+    cloned_names.sort();
+    cloned_names.dedup();
+    let err_out = (!errors.is_empty()).then(|| errors.join("; "));
+    (cloned_names, err_out)
+}
+
+/// Creates a zero-copy, DevMap-graph-scoped sparse Git worktree that materializes
+/// ONLY root files plus the requested directories and their transitive DevMap
+/// code dependencies (`--no-checkout` + per-worktree `sparse-checkout --cone`),
+/// paired with a `<512B` zero-copy shared DevMap base pointer (`base_store_ref.json`).
+pub fn add_sparse_worktree_zero_copy(
+    repo_path: &str,
+    target_path: &str,
+    branch: &str,
+    base: Option<&str>,
+    scope_paths: &[String],
+    selective_cache: bool,
+) -> Result<SparseWorktreeCreated, CommandError> {
+    add_sparse_worktree_zero_copy_optional_branch(
+        repo_path,
+        target_path,
+        Some(branch),
+        base,
+        false,
+        scope_paths,
+        selective_cache,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_sparse_worktree_zero_copy_optional_branch(
+    repo_path: &str,
+    target_path: &str,
+    new_branch: Option<&str>,
+    base: Option<&str>,
+    detach: bool,
+    scope_paths: &[String],
+    selective_cache: bool,
+    zero_copy_devmap: bool,
+) -> Result<SparseWorktreeCreated, CommandError> {
+    let repo = validate_repo(repo_path)?;
+    validate_target_path(target_path)?;
+    refuse_gitpulse_lane_target(target_path)?;
+    if let Some(branch) = new_branch {
+        validate_ref_name(branch)?;
+    }
+    if let Some(start) = base {
+        validate_oid_or_revision(start)?;
+    }
+
+    let anchor = resolve_worktree_family(repo_path, repo_path)
+        .ok()
+        .and_then(|f| f.anchor.to_str().and_then(|s| validate_repo(s).ok()))
+        .unwrap_or_else(|| repo.clone());
+
+    let mut normalized_inputs = Vec::with_capacity(scope_paths.len());
+    for raw in scope_paths {
+        normalized_inputs.push(normalize_sparse_rel_path(raw)?);
+    }
+    let cone_dirs = expand_sparse_cone_with_devmap_at(&anchor, base, scope_paths)?;
+    let target_plain = plain_path_text(target_path);
+    let target = Path::new(&target_plain);
+
+    let head_sha = {
+        let _repo_lock = repo_mutation_lock(&anchor);
+        let _guard = _repo_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut add_args: Vec<&str> = vec!["worktree", "add", "--no-checkout"];
+        if let Some(branch) = new_branch {
+            add_args.push("-b");
+            add_args.push(branch);
+        } else if detach {
+            add_args.push("--detach");
+        }
+        add_args.push(&target_plain);
+        if let Some(start) = base {
+            add_args.push(start);
+        }
+        git_text(&repo, &add_args)?;
+
+        let setup = (|| -> Result<String, CommandError> {
+            git_text(&repo, &["config", "extensions.worktreeConfig", "true"])?;
+            git_text(target, &["sparse-checkout", "init", "--cone"])?;
+            if !cone_dirs.is_empty() {
+                let mut set_args: Vec<&str> = Vec::with_capacity(3 + cone_dirs.len());
+                set_args.extend_from_slice(&["sparse-checkout", "set", "--cone", "--"]);
+                for dir in &cone_dirs {
+                    set_args.push(dir.as_str());
+                }
+                git_text(target, &set_args)?;
+            }
+            let _ = git_text(
+                target,
+                &["config", "--worktree", "core.untrackedCache", "true"],
+            );
+            git_text(target, &["checkout", "-q", "HEAD"])?;
+            git_text(target, &["rev-parse", "--verify", "HEAD"]).map(|s| s.trim().to_string())
+        })();
+
+        match setup {
+            Ok(sha) => sha,
+            Err(err) => {
+                let _ = git_text(&repo, &["worktree", "remove", "--force", &target_plain]);
+                if let Some(branch) = new_branch {
+                    let _ = git_text(&repo, &["branch", "-D", branch]);
+                }
+                return Err(err);
+            }
+        }
+    };
+
+    let low_space = !zero_copy_devmap
+        && matches!(
+            crate::engine::cow_clone::read_free(crate::sysload::free_bytes, target),
+            crate::sysload::Reading::Value(left) if left < crate::sysload::LOW_DISK_FLOOR
+        );
+
+    let ((caches_cloned, cache_error), devmap_res) = std::thread::scope(|scope| {
+        let cache_task = scope.spawn(|| {
+            if selective_cache {
+                clone_scoped_caches_for_cone(&anchor, target, &cone_dirs)
+            } else {
+                (Vec::new(), None)
+            }
+        });
+        let devmap_task = scope.spawn(|| {
+            if zero_copy_devmap {
+                crate::codeintel::provision_worktree_devmap_zero_copy(&anchor, target)
+            } else if !low_space {
+                crate::codeintel::provision_worktree_devmap(&anchor, target)
+            } else {
+                Err(CommandError::plain("skipped local devmap clone under low disk"))
+            }
+        });
+        let c = cache_task
+            .join()
+            .unwrap_or_else(|_| (Vec::new(), Some("selective cache worker panicked".into())));
+        let d = devmap_task
+            .join()
+            .unwrap_or_else(|_| Err(CommandError::plain("devmap provisioning worker panicked")));
+        (c, d)
+    });
+
+    let (provisioned_zero_copy, overlay_path) = match devmap_res {
+        Ok(p) => (p.seeded && p.zero_copy_base_ref, p.overlay_path),
+        Err(_) => (false, None),
+    };
+
+    Ok(SparseWorktreeCreated {
+        path: target_plain,
+        branch: new_branch.unwrap_or_default().to_string(),
+        head_sha,
+        requested_paths: normalized_inputs,
+        materialized_cone_dirs: cone_dirs,
+        caches_cloned,
+        cache_error,
+        zero_copy_devmap: provisioned_zero_copy,
+        overlay_path,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::procguard::LockedSpawn;
     use std::path::PathBuf;
+
+    #[test]
+    fn test_branch_template_rendering_and_sanitization() {
+        assert_eq!(sanitize_branch_name("feature/add-sync:v1"), "feature-add-sync-v1");
+        assert_eq!(sanitize_branch_name("---test/foo---"), "test-foo");
+        let template = "../{{ repo }}.{{ branch | sanitize }}";
+        let rendered = render_branch_template(template, "my-repo", "feature/my-work", None, None, None).unwrap();
+        assert_eq!(rendered, "../my-repo.feature-my-work");
+
+        let custom = "{{ repo }}/{{ task_id }}/{{ branch | sanitize }}";
+        let res = render_branch_template(custom, "my-repo", "feat/123", Some("TASK-1"), None, None).unwrap();
+        assert_eq!(res, "my-repo/TASK-1/feat-123");
+
+        assert!(render_branch_template("{{ unknown }}", "r", "b", None, None, None).is_err());
+    }
+
+    #[test]
+    fn test_six_point_branch_verification_algorithm() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        crate::test_support::git_in(repo, &["init", "-b", "main"]);
+        crate::test_support::git_in(repo, &["config", "user.name", "test"]);
+        crate::test_support::git_in(repo, &["config", "user.email", "test@test.com"]);
+        std::fs::write(repo.join("file1.txt"), "hello").unwrap();
+        crate::test_support::git_in(repo, &["add", "."]);
+        crate::test_support::git_in(repo, &["commit", "-m", "initial"]);
+
+        // Same commit branch
+        crate::test_support::git_in(repo, &["branch", "feat-same"]);
+        let res = verify_branch_integration(repo, "feat-same", "main").unwrap();
+        assert!(res.same_commit);
+        assert!(res.is_ancestor);
+        assert!(res.is_integrated);
+
+        // Advance feat-different
+        crate::test_support::git_in(repo, &["checkout", "-b", "feat-diff"]);
+        std::fs::write(repo.join("file2.txt"), "world").unwrap();
+        crate::test_support::git_in(repo, &["add", "."]);
+        crate::test_support::git_in(repo, &["commit", "-m", "add file2"]);
+        crate::test_support::git_in(repo, &["checkout", "main"]);
+
+        let res_diff = verify_branch_integration(repo, "feat-diff", "main").unwrap();
+        assert!(!res_diff.same_commit);
+        assert!(!res_diff.is_ancestor);
+        assert!(!res_diff.merge_adds_nothing);
+        assert!(!res_diff.patch_id_match);
+        assert!(!res_diff.is_integrated);
+
+        // Cherry-pick feat-diff onto main PLUS another commit on main so trees differ!
+        std::fs::write(repo.join("main_only.txt"), "diverged").unwrap();
+        crate::test_support::git_in(repo, &["add", "."]);
+        crate::test_support::git_in(repo, &["commit", "-m", "main diverged"]);
+        crate::test_support::git_in(repo, &["cherry-pick", "feat-diff"]);
+
+        let res_cherry = verify_branch_integration(repo, "feat-diff", "main").unwrap();
+        assert!(!res_cherry.same_commit);
+        assert!(!res_cherry.is_ancestor);
+        assert!(!res_cherry.trees_match);
+        assert!(res_cherry.patch_id_match);
+        assert!(res_cherry.merge_adds_nothing);
+        assert!(res_cherry.is_integrated);
+    }
+
+    #[test]
+    fn test_merge_worktree_pipeline_preserves_divergent_target_and_refuses_dirty_or_conflicting_lanes() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        crate::test_support::git_in(repo, &["init", "-b", "main"]);
+        crate::test_support::git_in(repo, &["config", "user.name", "Test User"]);
+        crate::test_support::git_in(repo, &["config", "user.email", "user@example.com"]);
+        std::fs::write(repo.join("shared.txt"), "base\n").unwrap();
+        crate::test_support::git_in(repo, &["add", "."]);
+        crate::test_support::git_in(repo, &["commit", "-m", "base"]);
+        crate::test_support::trust_repo(repo);
+
+        let repo_str = repo.to_str().unwrap();
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt_clean = wt_parent.path().join("wt-clean");
+        let wt_clean_str = wt_clean.to_str().unwrap();
+        add_worktree(repo_str, wt_clean_str, Some("feat/clean"), Some("main"), false).unwrap();
+        crate::test_support::trust_repo(&wt_clean);
+
+        std::fs::write(wt_clean.join("agent_feature.txt"), "agent work\n").unwrap();
+        crate::test_support::git_in(&wt_clean, &["add", "."]);
+        crate::test_support::git_in(&wt_clean, &["commit", "-m", "agent commit"]);
+
+        // Advance `main` in the primary checkout so `main` diverges from `feat/clean`!
+        std::fs::write(repo.join("main_progress.txt"), "concurrent main commit\n").unwrap();
+        crate::test_support::git_in(repo, &["add", "."]);
+        crate::test_support::git_in(repo, &["commit", "-m", "main commit"]);
+
+        // Uncommitted file in `wt_clean` must block merge_worktree_pipeline.
+        std::fs::write(wt_clean.join("uncommitted.txt"), "wip").unwrap();
+        let dirty_err = merge_worktree_pipeline(repo_str, "feat/clean", Some("main"), true, None, true)
+            .expect_err("dirty worktree must be refused");
+        assert!(dirty_err.message().contains("uncommitted"));
+        std::fs::remove_file(wt_clean.join("uncommitted.txt")).unwrap();
+
+        // Clean squash merge preserves BOTH `main_progress.txt` and `agent_feature.txt`
+        // AND keeps `main`'s working tree/index clean!
+        let merged = merge_worktree_pipeline(
+            repo_str,
+            "feat/clean",
+            Some("main"),
+            true,
+            Some("feat: squashed agent work"),
+            true,
+        )
+        .unwrap();
+        assert!(merged.ok);
+        assert!(merged.worktree_removed);
+        assert!(merged.squashed_commit.is_some());
+        assert_eq!(std::fs::read_to_string(repo.join("main_progress.txt")).unwrap(), "concurrent main commit\n");
+        assert_eq!(std::fs::read_to_string(repo.join("agent_feature.txt")).unwrap(), "agent work\n");
+        let (main_dirty, _) = user_changed_paths(repo_str).unwrap();
+        assert!(main_dirty.is_empty(), "main working tree must stay clean: {main_dirty:?}");
+
+        // Conflicting branch must fail closed without polluting `main`.
+        let wt_conflict = wt_parent.path().join("wt-conflict");
+        let wt_conflict_str = wt_conflict.to_str().unwrap();
+        add_worktree(repo_str, wt_conflict_str, Some("feat/conflict"), Some("main"), false).unwrap();
+        crate::test_support::trust_repo(&wt_conflict);
+        std::fs::write(wt_conflict.join("shared.txt"), "agent side\n").unwrap();
+        crate::test_support::git_in(&wt_conflict, &["add", "shared.txt"]);
+        crate::test_support::git_in(&wt_conflict, &["commit", "-m", "conflict side A"]);
+
+        std::fs::write(repo.join("shared.txt"), "main side\n").unwrap();
+        crate::test_support::git_in(repo, &["add", "shared.txt"]);
+        crate::test_support::git_in(repo, &["commit", "-m", "conflict side B"]);
+
+        let conflict_err = merge_worktree_pipeline(repo_str, "feat/conflict", Some("main"), true, None, true)
+            .expect_err("conflicting merge must fail closed");
+        assert!(conflict_err.message().contains("conflicting"));
+        let (main_dirty_after, _) = user_changed_paths(repo_str).unwrap();
+        assert!(main_dirty_after.is_empty());
+        assert!(wt_conflict.exists(), "conflicting worktree must be preserved");
+    }
 
     /// A full family memory used to empty itself: the first family past the
     /// cap forgot every other one, so a session with more repositories than the
@@ -10369,4 +11753,306 @@ some-future-field whatever
         };
         assert_eq!(finish_teardown(Some(aside), &mut delete_dir_tree), None);
     }
+
+    #[test]
+    fn test_sparse_worktree_zero_copy_expands_devmap_deps_and_skips_unrelated_dirs() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let anchor = sandbox.path().join("mono");
+        std::fs::create_dir_all(anchor.join("crates/api/src")).unwrap();
+        std::fs::create_dir_all(anchor.join("crates/shared/src")).unwrap();
+        std::fs::create_dir_all(anchor.join("crates/unrelated_heavy/src")).unwrap();
+        std::fs::create_dir_all(anchor.join("crates/api/node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(anchor.join("crates/unrelated_heavy/node_modules/pkg")).unwrap();
+
+        std::fs::write(anchor.join(".gitignore"), "**/node_modules/\n.devmap/\n").unwrap();
+        std::fs::write(anchor.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(
+            anchor.join("crates/api/src/lib.rs"),
+            "pub fn handle() { shared_helper(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            anchor.join("crates/shared/src/lib.rs"),
+            "pub fn shared_helper() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            anchor.join("crates/unrelated_heavy/src/lib.rs"),
+            "pub fn heavy_unused() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            anchor.join("crates/api/node_modules/pkg/index.js"),
+            "module.exports = 'api';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            anchor.join("crates/unrelated_heavy/node_modules/pkg/index.js"),
+            "module.exports = 'heavy';\n",
+        )
+        .unwrap();
+
+        git_in(&anchor, &["init", "-q", "-b", "main"]);
+        git_in(&anchor, &["config", "user.name", "Sparse Test"]);
+        git_in(&anchor, &["config", "user.email", "sparse@example.com"]);
+        git_in(&anchor, &["add", "."]);
+        git_in(&anchor, &["commit", "-q", "-m", "init monorepo"]);
+        crate::test_support::trust_repo(&anchor);
+
+        // Seed a real DevMap SQLite store in `anchor` with an outbound edge:
+        // crates/api/src/lib.rs -> crates/shared/src/lib.rs
+        let canon_anchor = anchor.canonicalize().unwrap();
+        let db_path = devmap_query::paths::store_path(&canon_anchor);
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let store = devmap_store::Store::open(&db_path).unwrap();
+        drop(store);
+
+        let head_sha = rev(&canon_anchor, "HEAD");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE pending_state SET repo_root = ?1 WHERE singleton = 1",
+            [canon_anchor.to_str().unwrap()],
+        )
+        .unwrap();
+        let files = [
+            "crates/api/src/lib.rs",
+            "crates/shared/src/lib.rs",
+            "crates/unrelated_heavy/src/lib.rs",
+        ];
+        for (id, path) in (1i64..).zip(files) {
+            conn.execute("INSERT INTO paths (id, path) VALUES (?1, ?2)", (id, path))
+                .unwrap();
+            conn.execute(
+                "INSERT INTO file_payloads
+                   (payload_id, file_id, content_hash, language,
+                    parse_outcome_json, engine_json, extraction_json,
+                    entry_wiring_json, grammar_version, analyzer_version)
+                 VALUES (?1, ?1, ?1, 'rust', '\"Clean\"', '\"ConfigScanner\"', '{}', '[]', 'v1', 'v1')",
+                [id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_rows (file_id, payload_id, valid_from, valid_to)
+                 VALUES (?1, ?1, 1, NULL)",
+                [id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO generations (id, created_at, head_sha, analysis_json, repo_root)
+             VALUES (1, 0.0, ?1, ?2, ?3)",
+            (
+                &head_sha,
+                r#"{"total_files":3,"total_symbols":3,"total_edges":1,"dead_symbols":[],"communities":[],"status":"Ok","unresolved_calls":0}"#,
+                canon_anchor.to_str().unwrap(),
+            ),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edge_rows
+               (edge_id, source_file_id, target_file_id,
+                source_symbol, target_symbol, edge_kind, confidence,
+                valid_from, valid_to)
+             VALUES (0, 1, 2, 'handle', 'shared_helper', 'Calls', 0.95, 1, NULL)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let wt_target = sandbox.path().join("lane-sparse-api");
+        let created = add_sparse_worktree_zero_copy(
+            canon_anchor.to_str().unwrap(),
+            wt_target.to_str().unwrap(),
+            "agent/sparse-api",
+            None,
+            &["crates/api".to_string()],
+            true,
+        )
+        .expect("sparse zero-copy worktree");
+
+        assert!(created.zero_copy_devmap, "{created:?}");
+        assert!(
+            created
+                .materialized_cone_dirs
+                .iter()
+                .any(|d| d.starts_with("crates/api")),
+            "{created:?}"
+        );
+        assert!(
+            created
+                .materialized_cone_dirs
+                .iter()
+                .any(|d| d.starts_with("crates/shared")),
+            "DevMap dependency crates/shared must be auto-expanded into sparse cone: {created:?}"
+        );
+        assert!(
+            !created
+                .materialized_cone_dirs
+                .iter()
+                .any(|d| d.contains("unrelated_heavy")),
+            "unrelated subsystem must NOT be in sparse cone: {created:?}"
+        );
+
+        // Verify disk materialization: root + api + shared exist; unrelated_heavy is NOT copied!
+        assert!(wt_target.join("Cargo.toml").is_file());
+        assert!(wt_target.join("crates/api/src/lib.rs").is_file());
+        assert!(wt_target.join("crates/shared/src/lib.rs").is_file());
+        assert!(
+            !wt_target.join("crates/unrelated_heavy").exists(),
+            "unrelated_heavy must NOT be materialized on disk in sparse worktree"
+        );
+        // Main checkout remains 100% intact (per-worktree sparse config isolation).
+        assert!(canon_anchor.join("crates/unrelated_heavy/src/lib.rs").is_file());
+
+        // Selective cache cloning copied `crates/api/node_modules` and NOT `crates/unrelated_heavy/node_modules`!
+        assert!(wt_target.join("crates/api/node_modules/pkg/index.js").is_file());
+        assert!(!wt_target.join("crates/unrelated_heavy/node_modules").exists());
+
+        // Zero-copy DevMap check: no devmap.sqlite copied, base_store_ref.json + overlay.json exist!
+        assert!(!devmap_query::paths::store_path(&wt_target).exists());
+        crate::test_support::trust_repo(&wt_target);
+        let base_ref = crate::codeintel::load_zero_copy_base_ref(wt_target.to_str().unwrap())
+            .unwrap()
+            .expect("base_store_ref.json present");
+        assert_eq!(base_ref.generation_id, 1);
+
+        let (dirty, truncated) = user_changed_paths(wt_target.to_str().unwrap()).unwrap();
+        assert!(dirty.is_empty() && !truncated, "dirty={dirty:?}");
+    }
+
+    #[test]
+    fn test_sparse_worktree_rejects_traversal_and_absolute_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(expand_sparse_cone_with_devmap(dir.path(), &[]).is_err());
+        assert!(expand_sparse_cone_with_devmap(dir.path(), &["../secret".into()]).is_err());
+        assert!(expand_sparse_cone_with_devmap(dir.path(), &["/etc/passwd".into()]).is_err());
+        assert!(expand_sparse_cone_with_devmap(dir.path(), &["-bad-flag".into()]).is_err());
+    }
+
+    #[test]
+    fn test_sparse_worktree_dotted_dirs_chained_zero_copy_and_lane_target_refusal() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let anchor = sandbox.path().join("anchor");
+        std::fs::create_dir_all(&anchor).unwrap();
+        let run_git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .output_locked()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        run_git(&anchor, &["init", "-q", "-b", "main"]);
+        run_git(&anchor, &["config", "user.name", "Test"]);
+        run_git(&anchor, &["config", "user.email", "test@example.com"]);
+
+        std::fs::create_dir_all(anchor.join(".github/workflows")).unwrap();
+        std::fs::create_dir_all(anchor.join("releases/v1.0")).unwrap();
+        std::fs::create_dir_all(anchor.join("heavy_unwanted")).unwrap();
+        std::fs::write(anchor.join(".github/workflows/ci.yml"), "name: CI\n").unwrap();
+        std::fs::write(anchor.join("releases/v1.0/notes.txt"), "v1.0\n").unwrap();
+        std::fs::write(anchor.join("heavy_unwanted/blob.rs"), "pub fn big() {}\n").unwrap();
+        run_git(&anchor, &["add", "."]);
+        run_git(&anchor, &["commit", "-q", "-m", "init dotted dirs"]);
+
+        let canon_anchor = std::fs::canonicalize(&anchor).unwrap();
+        crate::test_support::trust_repo(&canon_anchor);
+        crate::devmap::ensure_state_dir_excluded(&canon_anchor);
+
+        let head_sha = run_git(&canon_anchor, &["rev-parse", "HEAD"]);
+        let db = devmap_query::paths::store_path(&canon_anchor);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = devmap_store::Store::open(&db).unwrap();
+        store.bind_repo_root(&canon_anchor).unwrap();
+        drop(store);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO generations (id, created_at, head_sha, analysis_json, repo_root)
+             VALUES (1, 0.0, ?1, ?2, ?3)",
+            (
+                &head_sha,
+                r#"{"total_files":0,"total_symbols":0,"total_edges":0,"dead_symbols":[],"communities":[],"status":"Ok","unresolved_calls":0}"#,
+                canon_anchor.to_str().unwrap(),
+            ),
+        )
+        .unwrap();
+        drop(conn);
+
+        // 1. Refuse `.gitpulse/worktrees/...` targets in both `add_sparse_worktree_zero_copy`
+        //    and `resolve_worktree_path_for_branch`.
+        let illegal_lane_target = canon_anchor.join(".gitpulse/worktrees/illegal-lane");
+        let sparse_refused = add_sparse_worktree_zero_copy(
+            canon_anchor.to_str().unwrap(),
+            illegal_lane_target.to_str().unwrap(),
+            "agent/illegal",
+            None,
+            &[".github".to_string()],
+            true,
+        )
+        .expect_err("must refuse .gitpulse/worktrees target");
+        assert!(
+            sparse_refused.message().contains(".gitpulse/worktrees"),
+            "{sparse_refused:?}"
+        );
+
+        let resolved_refused = resolve_worktree_path_for_branch(
+            canon_anchor.to_str().unwrap(),
+            "agent/illegal",
+            Some(illegal_lane_target.to_str().unwrap()),
+        )
+        .expect_err("resolve_worktree_path_for_branch must refuse .gitpulse/worktrees target");
+        assert!(
+            resolved_refused.message().contains(".gitpulse/worktrees"),
+            "{resolved_refused:?}"
+        );
+
+        // 2. Top-level dotted directory `.github` must resolve to `.github` cone (not root `None`!).
+        let wt1 = sandbox.path().join("wt1-github");
+        let created1 = add_sparse_worktree_zero_copy(
+            canon_anchor.to_str().unwrap(),
+            wt1.to_str().unwrap(),
+            "agent/wt1-github",
+            None,
+            &[".github".to_string()],
+            true,
+        )
+        .expect("wt1 sparse .github");
+        assert_eq!(created1.materialized_cone_dirs, vec![".github".to_string()]);
+        assert!(wt1.join(".github/workflows/ci.yml").is_file());
+        assert!(!wt1.join("releases/v1.0").exists());
+        assert!(!wt1.join("heavy_unwanted").exists());
+
+        // 3. Chaining `add_sparse_worktree_zero_copy` from `wt1` (a sparse zero-copy linked worktree
+        //    where `releases/v1.0` is NOT on disk and `devmap.sqlite` is NOT local!) MUST resolve
+        //    `releases/v1.0` via git tree object and chain zero-copy DevMap from the primary anchor!
+        crate::test_support::trust_repo(&wt1);
+        let wt2 = sandbox.path().join("wt2-releases");
+        let created2 = add_sparse_worktree_zero_copy(
+            wt1.to_str().unwrap(),
+            wt2.to_str().unwrap(),
+            "agent/wt2-releases",
+            None,
+            &["releases/v1.0".to_string()],
+            true,
+        )
+        .expect("wt2 chained from wt1");
+        assert_eq!(
+            created2.materialized_cone_dirs,
+            vec!["releases/v1.0".to_string()]
+        );
+        assert!(
+            created2.zero_copy_devmap,
+            "chained sparse worktree from zero-copy worktree must still get zero_copy_devmap: {created2:?}"
+        );
+        assert!(wt2.join("releases/v1.0/notes.txt").is_file());
+        assert!(!wt2.join("heavy_unwanted").exists());
+    }
 }
+
+

@@ -382,9 +382,10 @@ GitPulse/
 │   ├── lib/canvas/       GPU-accelerated commit-graph renderer
 │   ├── lib/views/        View registry + navigation (routerless, 4 views)
 │   └── lib/<domain>/     Pure logic: files, diff, filter, graph, coverage, health…
+├── crates/gitpulse-worktree/ Standalone zero-copy worktree CLI & gitpulse-rustc cache wrapper
 └── src-tauri/src/        Rust core
     ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (292 handlers)
-    ├── engine/           git CLI wrapper: reader, writer, worktrees, sandboxing
+    ├── engine/           git CLI wrapper: reader, writer, sparse worktrees, CoW clone, agent bus, sandboxing
     ├── graph/            Lane solver, mainline pinning, filter simplification, bezier geometry, ref decorations
     ├── analyzer/         Language detection, LOC, coverage, dependency health
     ├── harness/          Manvi wrap: policy gate, sidecar protocol
@@ -392,7 +393,7 @@ GitPulse/
     ├── github/           gh CLI integration (PRs, issues, runs, Dependabot, code scanning)
     ├── updates/          Opt-in release check
     ├── ledger/ tasks/ grants/ ingest/  Control plane: durable log, leases, overrides, attribution
-    ├── mcp/              MCP tool surface (reads, plus the task-board tools) and control-plane snapshots
+    ├── mcp/              MCP tool surface (reads, plus trust-gated task-board & worktree tools)
     ├── bin/              Headless entry points (see below)
     ├── vendored/         Copies of selected DevCouncil and MarkDev crates (see below)
     └── terminal/ diff/ storage/ watcher/ stack/ ai/ desktop/
@@ -401,14 +402,16 @@ GitPulse/
 ### Headless binaries
 
 The desktop app is not the only way into the control plane. Four helper binaries build
-from the same crate and reuse its modules:
+from `src-tauri` and two standalone CLI binaries build from `crates/gitpulse-worktree`:
 
 | Binary | Shape | What it is for |
 | --- | --- | --- |
 | `gitpulse-hook` | Host hook JSON on stdin/stdout | Runs the shared hook dispatcher for agent integrations; failures yield no decision plus diagnostics, leaving the host permission flow in control. |
-| `gitpulse-mcp` | JSON-RPC over stdio (MCP 2026-07-28) | Lets an agent *read* the control plane: insights snapshot, collisions, change context, ledger, task view, code graph, provenance. Never mutates git; its only writes are the task-board tools (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_delete_task`, `gitpulse_merge_tasks`). Dual-era: modern per-request `_meta` plus legacy `initialize`. Packaged for Codex, Claude Code, and Agent Plugins 1.0 under `plugins/gitpulse/`. |
+| `gitpulse-mcp` | JSON-RPC over stdio (MCP 2026-07-28) | Exposes the control plane to coding agents: read-only (`readOnlyHint: true`) insights, collisions, 3-layer agent radar, agent inbox, change context, ledger, task view, in-process DevMap code graph, and provenance, plus repository-trust-gated task-board tools (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_delete_task`, `gitpulse_merge_tasks`) and `gitpulse_worktree_*` lifecycle/coordination tools. Dual-era: modern per-request `_meta` plus legacy `initialize`. Packaged for Codex, Claude Code, and Agent Plugins 1.0 under `plugins/gitpulse/`. |
 | `gitpulsed` | NDJSON on stdout, interval loop | *Writes* what nothing else was writing. Attribution catch-up — transcripts and reflog into the ledger — used to run only when the desktop app opened a repository, so hours of agent work with GitPulse closed left a hole in the record that nothing on screen reported. |
 | `gitpulse-ptyd` | Length-prefixed frames over a Unix socket | Not a control-plane entry: the optional terminal host. With "Keep terminals running when GitPulse quits" on (off by default), it owns the PTYs so sessions survive a quit or crash. See [docs/TERMINAL_HOST.md](docs/TERMINAL_HOST.md). |
+| `gitpulse-worktree` | CLI (`--json` or human text) | Standalone zero-copy worktree & `--cone` sparse-checkout orchestrator, DevMap `overlay.json` delta compiler, `<git-common-dir>/gitpulse/lanes/` multi-agent coordination bus, and 6-point merge/prune driver. See [docs/ZERO_COPY_AGENTIC_WORKTREES.md](docs/ZERO_COPY_AGENTIC_WORKTREES.md). |
+| `gitpulse-rustc` | `RUSTC_WRAPPER` compiler wrapper | Content-addressed two-stage (Blake3 direct + `.d` dep-info / `# env-dep:`) Rust build cache sharing `.rlib` / `.rmeta` / `proc-macro` outputs across sibling worktrees via APFS `clonefile` / Linux `FICLONE`. |
 
 `gitpulsed` deliberately serves no requests (that is `gitpulse-mcp`'s job, and
 a second surface answering the same questions from the same store would be a

@@ -46,9 +46,10 @@ From the forensics of 2026-10-09 (V = verified, I = inferred):
 | Trigger | Owner | Notes |
 |---|---|---|
 | One process over 32 GiB, or pressure level 4 for 3 samples | memguard | GitPulse never kills a single process for its footprint. |
+| Per-worker RSS ceiling (`MAX_WORKER_RSS_BYTES` = 512 MiB) | `sysload::governor::check_worker_rss_ceiling` | Returns an explicit `Err` when a worker exceeds 512 MiB so callers fail closed before host memory pressure spikes. |
 | A `mac_heavy.sh` job tree over its RSS cap | mac_heavy | Card 4 exempts trees carrying `MAC_HEAVY_LABEL`. |
 | The **sum** of a GitPulse-launched tree | Card 4 (supervisor) | Advise by default; enforce is opt-in. |
-| Admission and shedding | Cards 1b and 1c, one verdict (`sysload::governor`) | See Admission and shedding. |
+| Admission and 4-tier load shedding (`LoadShedTier`: *Normal*, *DeferIndex*, *DeferTests*, *Lockdown*) | Cards 1b and 1c, one verdict (`sysload::governor::evaluate_load_shed`) | Evaluates CPU/memory metrics and fails closed to *Lockdown* on `NaN` or non-finite telemetry. See Admission and shedding. |
 | Leases, the hook, advice | Cards 1d, 3 | **The sensor only measures and publishes.** They consume the same verdict. |
 
 The sensor's one action is a person clicking **Terminate** on a foreign orphan

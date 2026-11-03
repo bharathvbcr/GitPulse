@@ -22,9 +22,148 @@
 //!   evidence" shape this kernel spends its effort avoiding.
 
 use devmap_extract::model::confidence_millis;
-use devmap_resolve::model::ResolvedEdge;
+use devmap_resolve::model::{ResolutionKind, ResolvedEdge};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+/// The complete 11-tier resolution ladder with strict confidence scoring ($1.0$ down to $0.1$).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ResolutionLadderTier {
+    /// Tier 1: Declared in same file and matching lexical scope ($1.0$).
+    SameFile = 1,
+    /// Tier 2: Declared in same package / inline module ($1.0$).
+    SamePackage = 2,
+    /// Tier 3: Matches explicit named import ($1.0$).
+    ImportScoped = 3,
+    /// Tier 4: Statically typed receiver with declared member ($1.0$).
+    ReceiverType = 4,
+    /// Tier 5: Language server compiler daemon binding ($0.9$).
+    LanguageServer = 5,
+    /// Tier 6: Exactly one in-family namesake passing visibility ($0.9$).
+    UniqueGlobal = 6,
+    /// Tier 7: Multiple namesakes without distinguishing evidence ($0.1$).
+    AmbiguousGlobal = 7,
+    /// Tier 8: Wide polymorphic LSP candidate set ($0.1$).
+    LanguageServerDispatch = 8,
+    /// Tier 9: Polymorphic interface/trait method bound up to cap ($0.5$).
+    Dispatch = 9,
+    /// Tier 10: Structural tree containment ($1.0$).
+    Structural = 10,
+    /// Tier 11: Floor for unresolved references ($0.1$ or $0.0$).
+    Unresolved = 11,
+}
+
+impl ResolutionLadderTier {
+    pub const ALL: [ResolutionLadderTier; 11] = [
+        ResolutionLadderTier::SameFile,
+        ResolutionLadderTier::SamePackage,
+        ResolutionLadderTier::ImportScoped,
+        ResolutionLadderTier::ReceiverType,
+        ResolutionLadderTier::LanguageServer,
+        ResolutionLadderTier::UniqueGlobal,
+        ResolutionLadderTier::AmbiguousGlobal,
+        ResolutionLadderTier::LanguageServerDispatch,
+        ResolutionLadderTier::Dispatch,
+        ResolutionLadderTier::Structural,
+        ResolutionLadderTier::Unresolved,
+    ];
+
+    pub fn confidence_score(self) -> f32 {
+        match self {
+            ResolutionLadderTier::SameFile
+            | ResolutionLadderTier::SamePackage
+            | ResolutionLadderTier::ImportScoped
+            | ResolutionLadderTier::ReceiverType
+            | ResolutionLadderTier::Structural => 1.0,
+            ResolutionLadderTier::LanguageServer | ResolutionLadderTier::UniqueGlobal => 0.9,
+            ResolutionLadderTier::Dispatch => 0.5,
+            ResolutionLadderTier::AmbiguousGlobal
+            | ResolutionLadderTier::LanguageServerDispatch
+            | ResolutionLadderTier::Unresolved => 0.1,
+        }
+    }
+
+    pub fn confidence_millis(self) -> i64 {
+        (self.confidence_score() * 1000.0) as i64
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ResolutionLadderTier::SameFile => "SameFile",
+            ResolutionLadderTier::SamePackage => "SamePackage",
+            ResolutionLadderTier::ImportScoped => "ImportScoped",
+            ResolutionLadderTier::ReceiverType => "ReceiverType",
+            ResolutionLadderTier::LanguageServer => "LanguageServer",
+            ResolutionLadderTier::UniqueGlobal => "UniqueGlobal",
+            ResolutionLadderTier::AmbiguousGlobal => "AmbiguousGlobal",
+            ResolutionLadderTier::LanguageServerDispatch => "LanguageServerDispatch",
+            ResolutionLadderTier::Dispatch => "Dispatch",
+            ResolutionLadderTier::Structural => "Structural",
+            ResolutionLadderTier::Unresolved => "Unresolved",
+        }
+    }
+
+    pub fn from_resolution_kind(kind: ResolutionKind) -> Self {
+        match kind {
+            ResolutionKind::SameFile => ResolutionLadderTier::SameFile,
+            ResolutionKind::SamePackage => ResolutionLadderTier::SamePackage,
+            ResolutionKind::ImportScoped => ResolutionLadderTier::ImportScoped,
+            ResolutionKind::ReceiverType => ResolutionLadderTier::ReceiverType,
+            ResolutionKind::LanguageServer => ResolutionLadderTier::LanguageServer,
+            ResolutionKind::UniqueGlobal => ResolutionLadderTier::UniqueGlobal,
+            ResolutionKind::AmbiguousGlobal => ResolutionLadderTier::AmbiguousGlobal,
+            ResolutionKind::LanguageServerDispatch => ResolutionLadderTier::LanguageServerDispatch,
+            ResolutionKind::Dispatch => ResolutionLadderTier::Dispatch,
+            ResolutionKind::Structural => ResolutionLadderTier::Structural,
+            ResolutionKind::Unresolved => ResolutionLadderTier::Unresolved,
+        }
+    }
+
+    pub fn to_resolution_kind(self) -> ResolutionKind {
+        match self {
+            ResolutionLadderTier::SameFile => ResolutionKind::SameFile,
+            ResolutionLadderTier::SamePackage => ResolutionKind::SamePackage,
+            ResolutionLadderTier::ImportScoped => ResolutionKind::ImportScoped,
+            ResolutionLadderTier::ReceiverType => ResolutionKind::ReceiverType,
+            ResolutionLadderTier::LanguageServer => ResolutionKind::LanguageServer,
+            ResolutionLadderTier::UniqueGlobal => ResolutionKind::UniqueGlobal,
+            ResolutionLadderTier::AmbiguousGlobal => ResolutionKind::AmbiguousGlobal,
+            ResolutionLadderTier::LanguageServerDispatch => ResolutionKind::LanguageServerDispatch,
+            ResolutionLadderTier::Dispatch => ResolutionKind::Dispatch,
+            ResolutionLadderTier::Structural => ResolutionKind::Structural,
+            ResolutionLadderTier::Unresolved => ResolutionKind::Unresolved,
+        }
+    }
+}
+
+/// Histogram counting edges across all 11 resolution ladder tiers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LadderHistogram {
+    pub counts: BTreeMap<String, usize>,
+    pub total: usize,
+}
+
+impl LadderHistogram {
+    pub fn from_edges(edges: &[ResolvedEdge]) -> Self {
+        let mut counts = BTreeMap::new();
+        for tier in ResolutionLadderTier::ALL {
+            counts.insert(tier.label().to_string(), 0);
+        }
+        let mut total = 0;
+        for edge in edges {
+            if let Some(res) = &edge.resolution {
+                let tier = ResolutionLadderTier::from_resolution_kind(res.kind());
+                *counts.entry(tier.label().to_string()).or_default() += 1;
+                total += 1;
+            }
+        }
+        Self { counts, total }
+    }
+
+    pub fn count_for_tier(&self, tier: ResolutionLadderTier) -> usize {
+        self.counts.get(tier.label()).copied().unwrap_or(0)
+    }
+}
 
 /// A named floor on the resolution ladder.
 ///
@@ -243,5 +382,46 @@ mod tests {
         assert_eq!(Rung::parse("Deterministic"), None, "case is significant");
         assert_eq!(Rung::parse("lsp"), None, "another tool's vocabulary");
         assert_eq!(Rung::parse(""), None);
+    }
+
+    #[test]
+    fn test_11_tier_resolution_ladder_and_histogram() {
+        assert_eq!(ResolutionLadderTier::ALL.len(), 11);
+        assert_eq!(ResolutionLadderTier::SameFile.confidence_score(), 1.0);
+        assert_eq!(ResolutionLadderTier::SamePackage.confidence_score(), 1.0);
+        assert_eq!(ResolutionLadderTier::ImportScoped.confidence_score(), 1.0);
+        assert_eq!(ResolutionLadderTier::ReceiverType.confidence_score(), 1.0);
+        assert_eq!(ResolutionLadderTier::LanguageServer.confidence_score(), 0.9);
+        assert_eq!(ResolutionLadderTier::UniqueGlobal.confidence_score(), 0.9);
+        assert_eq!(
+            ResolutionLadderTier::AmbiguousGlobal.confidence_score(),
+            0.1
+        );
+        assert_eq!(
+            ResolutionLadderTier::LanguageServerDispatch.confidence_score(),
+            0.1
+        );
+        assert_eq!(ResolutionLadderTier::Dispatch.confidence_score(), 0.5);
+        assert_eq!(ResolutionLadderTier::Structural.confidence_score(), 1.0);
+        assert_eq!(ResolutionLadderTier::Unresolved.confidence_score(), 0.1);
+
+        let mut hist = LadderHistogram::default();
+        for tier in ResolutionLadderTier::ALL {
+            hist.counts.insert(tier.label().to_string(), 0);
+        }
+        *hist
+            .counts
+            .get_mut(ResolutionLadderTier::SameFile.label())
+            .unwrap() += 5;
+        *hist
+            .counts
+            .get_mut(ResolutionLadderTier::Unresolved.label())
+            .unwrap() += 2;
+        hist.total = 7;
+
+        assert_eq!(hist.count_for_tier(ResolutionLadderTier::SameFile), 5);
+        assert_eq!(hist.count_for_tier(ResolutionLadderTier::Unresolved), 2);
+        assert_eq!(hist.count_for_tier(ResolutionLadderTier::SamePackage), 0);
+        assert_eq!(hist.total, 7);
     }
 }

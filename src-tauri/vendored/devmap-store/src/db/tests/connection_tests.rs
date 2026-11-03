@@ -529,3 +529,81 @@ fn a_pinned_generation_keeps_its_rows_when_another_connection_prunes_it() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn foreign_keys_pragma(store: &Store) -> i64 {
+    let conn = lock_conn(&store.conn).expect("connection");
+    conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+        .expect("foreign_keys pragma")
+}
+
+/// `prune_generations_except_latest` switches foreign keys off for its own
+/// transaction, so every way out of it has to switch them back on: the store's
+/// one connection serves every later write, and a write with the constraint
+/// silently off is the integrity loss the pragma exists to prevent.
+#[test]
+fn a_prune_that_drops_nothing_leaves_foreign_keys_on() {
+    let store = Store::open_in_memory().expect("store");
+    assert_eq!(foreign_keys_pragma(&store), 1);
+    assert_eq!(store.prune_generations_except_latest(1).expect("prune"), 0);
+    assert_eq!(
+        foreign_keys_pragma(&store),
+        1,
+        "the early return left them off"
+    );
+}
+
+#[test]
+fn a_prune_that_errors_leaves_foreign_keys_on_and_the_store_unchanged() {
+    let store = Store::open_in_memory().expect("store");
+    {
+        let conn = lock_conn(&store.conn).expect("connection");
+        for id in 1..=3 {
+            conn.execute(
+                "INSERT INTO generations (id, created_at, head_sha, analysis_json)
+                 VALUES (?1, 1.0, 'seed', '{}')",
+                params![id],
+            )
+            .expect("generation");
+        }
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_generation_delete BEFORE DELETE ON generations
+             BEGIN SELECT RAISE(ABORT, 'injected prune failure'); END;",
+        )
+        .expect("trigger");
+    }
+    let error = store
+        .prune_generations_except_latest(1)
+        .expect_err("the trigger refuses the delete");
+    assert!(
+        error.to_string().contains("injected prune failure"),
+        "{error}"
+    );
+    assert_eq!(
+        foreign_keys_pragma(&store),
+        1,
+        "the error path left them off"
+    );
+    let conn = lock_conn(&store.conn).expect("connection");
+    let generations: i64 = conn
+        .query_row("SELECT count(*) FROM generations", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(generations, 3, "a failed prune must roll back whole");
+}
+
+#[test]
+fn a_prune_that_commits_leaves_foreign_keys_on() {
+    let store = Store::open_in_memory().expect("store");
+    {
+        let conn = lock_conn(&store.conn).expect("connection");
+        for id in 1..=3 {
+            conn.execute(
+                "INSERT INTO generations (id, created_at, head_sha, analysis_json)
+                 VALUES (?1, 1.0, 'seed', '{}')",
+                params![id],
+            )
+            .expect("generation");
+        }
+    }
+    assert_eq!(store.prune_generations_except_latest(1).expect("prune"), 2);
+    assert_eq!(foreign_keys_pragma(&store), 1);
+}

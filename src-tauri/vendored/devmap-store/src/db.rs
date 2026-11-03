@@ -1417,9 +1417,12 @@ pub struct GenerationWriteOpts {
     pub affected_paths: Vec<String>,
     /// Files known deleted from the working tree — must not remain as live nodes (N2).
     pub deleted_paths: Vec<String>,
-    /// Start of measured build work. The store samples it while persisting the
-    /// history row, so the duration includes generation writes. `None` remains
-    /// SQL NULL rather than becoming an ambiguous numeric zero.
+    /// Start of measured build work, taken once the writer lock is held. The
+    /// store samples it while persisting the history row, so the duration
+    /// includes generation writes but not the commit; a caller that wants the
+    /// prunes and the vacuum counted calls `Store::finalize_build_ms` after
+    /// them. `None` remains SQL NULL rather than becoming an ambiguous
+    /// numeric zero.
     pub build_started: Option<std::time::Instant>,
     /// Absolute root the sources were read from. Node paths are stored
     /// repo-relative, so without this a query process resolves them against its

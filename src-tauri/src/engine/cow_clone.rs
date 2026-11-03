@@ -398,7 +398,7 @@ fn volume_of(path: &Path) -> u64 {
 
 /// A free-space read that cannot take the caller down: a reader that panics
 /// is a volume that could not be read.
-fn read_free(reader: FreeSpace, path: &Path) -> Reading<u64> {
+pub(crate) fn read_free(reader: FreeSpace, path: &Path) -> Reading<u64> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reader(path))).unwrap_or_else(|_| {
         log::warn!("the free-space reader panicked for '{}'", path.display());
         Reading::Unavailable(Why::Failed)
@@ -440,6 +440,97 @@ struct CopyRules<'a> {
 /// under the default bounds.
 pub fn reflink_copy_dir(src: &Path, dst: &Path) -> Result<ReflinkResult, CommandError> {
     reflink_copy_dir_bounded(src, dst, CowCaps::DEFAULT, CopyRules::default())
+}
+
+struct StagingFileGuard<'a> {
+    path: &'a Path,
+    armed: bool,
+}
+
+impl Drop for StagingFileGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(self.path);
+        }
+    }
+}
+
+/// Clones a single regular file from `src` to `dst`, prioritizing Copy-on-Write
+/// (`clonefile(2)` on macOS, `FICLONE` on Linux, bounded byte-copy fallback),
+/// staged beside `dst` and atomically renamed into place so `nlink` stays 1.
+pub fn reflink_copy_file(src: &Path, dst: &Path) -> Result<ReflinkResult, CommandError> {
+    let src_text = utf8_path(src, "Source")?;
+    let dst_text = utf8_path(dst, "Destination")?;
+    let meta = fs::symlink_metadata(src)
+        .map_err(|e| CommandError::from(format!("Cannot inspect '{src_text}': {e}")))?;
+    if !meta.file_type().is_file() {
+        return Err(CommandError::from(format!(
+            "Source path '{src_text}' is not a regular file"
+        )));
+    }
+    if dst.symlink_metadata().is_ok() {
+        return Err(CommandError::from(format!(
+            "Destination path '{dst_text}' already exists"
+        )));
+    }
+
+    let start = Instant::now();
+    let staging = staging_path(dst)?;
+    let mut guard = StagingFileGuard {
+        path: &staging,
+        armed: true,
+    };
+
+    let mut is_cow = false;
+    if !byte_copy_forced() {
+        #[cfg(target_os = "macos")]
+        {
+            if let (Ok(src_c), Ok(dst_c)) = (
+                CString::new(src_text),
+                staging.to_str().ok_or(()).and_then(|s| CString::new(s).map_err(|_| ())),
+            ) {
+                // SAFETY: `src_c` and `dst_c` are valid NUL-terminated C strings
+                // outliving `clonefile(2)`.
+                if unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) } == 0 {
+                    is_cow = true;
+                } else {
+                    let _ = fs::remove_file(&staging);
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if try_linux_ficlone(src, &staging).unwrap_or(false) {
+                is_cow = true;
+            }
+        }
+    }
+
+    if !is_cow {
+        let caps = CowCaps::DEFAULT;
+        let block = dest_block(caps, staging.parent().unwrap_or(&staging));
+        let cost = allocated(&meta, block);
+        if cost > caps.max_bytes {
+            return Err(CopyStop::CapHit { cap: caps.max_bytes }.into_error());
+        }
+        copy_bounded(src, &staging, meta.len(), &mut || Ok(())).map_err(CopyStop::into_error)?;
+    }
+
+    fs::rename(&staging, dst).map_err(|e| {
+        CommandError::from(format!(
+            "Could not move cloned file into '{dst_text}': {e}"
+        ))
+    })?;
+    guard.armed = false;
+
+    Ok(ReflinkResult {
+        source: src_text.to_string(),
+        destination: dst_text.to_string(),
+        files_cloned: 1,
+        bytes_cloned: meta.len(),
+        is_cow,
+        duration_ms: start.elapsed().as_millis() as u64,
+    })
 }
 
 /// [`reflink_copy_dir`] under `caps` and `rules`, as a message.

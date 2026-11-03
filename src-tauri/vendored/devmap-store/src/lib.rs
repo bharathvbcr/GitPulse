@@ -1,4 +1,5 @@
 pub mod coverage;
+pub mod csr;
 pub mod db;
 pub mod edge_index;
 // The extraction cache belongs to the *build* path: it needs the parsing
@@ -13,6 +14,10 @@ pub use coverage::{
     CoverageGapRow, CoverageGapSample, CoverageGaps, DiscoveryInventory, DiscoveryRefusal,
     PartialParseGap, COVERAGE_GAP_SAMPLE, GAP_DISCOVERY_REFUSED, GAP_OVER_LIMIT,
     GAP_RESOLUTION_BUDGET,
+};
+pub use csr::{
+    apply_v30_pragmas, AtomicGraphHandle, CsrGraphReader, CsrGraphWriter, CsrHeader, CsrNodeRecord,
+    FastBitSet, IncrementalDigestEngine, DC_GRAPH_MAGIC, DC_GRAPH_VERSION, V30_PRAGMAS,
 };
 pub use db::{
     checked_min_confidence, current_git_head, BuildHistoryRow, CallersPage, DeadPage, FileEdges,

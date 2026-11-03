@@ -3014,6 +3014,14 @@ pub fn extraction_coverage(extractions: &[Extraction]) -> ExtractionCoverage {
 pub struct LivenessOutcome {
     pub reports: Vec<DeadSymbolReport>,
     pub coverage: ExtractionCoverage,
+    /// What [`exempt_symbol_names`] returns for the same
+    /// `(extractions, resolution)`, handed on so `dead_clusters` reads the set
+    /// this pass already built instead of building it a second time.
+    pub exempt_names: std::collections::BTreeSet<String>,
+    /// What `unresolved_namesake_names` returns for the same `resolution`,
+    /// owned so the outcome carries no lifetime. Handed on for the same reason
+    /// as [`Self::exempt_names`].
+    pub unresolved_names: std::collections::BTreeSet<String>,
 }
 
 /// The two symbol sets the whole liveness question turns on: what an edge
@@ -3601,6 +3609,13 @@ pub fn analyze_liveness_with_coverage(
     // every one of which this pass had already exempted, one function later.
     let exemptions =
         symbol_exemption_index(extractions, resolution, &called_symbols, &ambiguous_symbols);
+    // The same set `exempt_symbol_names` derives from this index, kept for
+    // `LivenessOutcome::exempt_names`. Cloned, not moved: the cascade below
+    // still reads `exemptions`.
+    let exempt_names: std::collections::BTreeSet<String> = exemptions
+        .keys()
+        .map(|(_, qualified_name)| qualified_name.clone())
+        .collect();
 
     let dispatch_only = dispatch_only_symbols(resolution);
     let mut reports = Vec::new();
@@ -3997,7 +4012,15 @@ pub fn analyze_liveness_with_coverage(
 
     attach_site_evidence(extractions, resolution, &mut reports, &pending);
 
-    LivenessOutcome { reports, coverage }
+    LivenessOutcome {
+        reports,
+        coverage,
+        exempt_names,
+        unresolved_names: unresolved_names
+            .iter()
+            .map(|name| name.to_string())
+            .collect(),
+    }
 }
 
 #[cfg(all(test, feature = "parse"))]

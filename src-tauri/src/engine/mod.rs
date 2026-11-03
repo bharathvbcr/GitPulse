@@ -1,3 +1,4 @@
+pub mod agent_bus;
 pub mod budget;
 pub mod churn_store;
 pub mod commit_signature;
@@ -23,6 +24,12 @@ mod worktree_family_adversarial_tests;
 mod worktree_family_disk;
 pub mod worktree_hooks;
 
+pub use agent_bus::{
+    list_lanes, post_message, read_messages, register_or_update_lane,
+    register_or_update_lane_with_conflicts, release_lane, scan_parallel_agent_radar,
+    AgentBusMessage, AgentInboxPage, AgentLaneClaim, ClaimConflict, OdbPairConflict,
+    ParallelAgentRadarReport, SemanticLaneConflict,
+};
 pub use cow_clone::{reflink_copy_dir, reflink_ignored_caches, ReflinkResult};
 pub use portless::{detect_worktree_routes, hash_port, read_portless_routes, WorktreeRouteInfo};
 pub use worktree_hooks::{
@@ -52,7 +59,8 @@ pub use repo_op::{OperationAction, OperationKind, RepoOperation};
 pub use stash::{StashAction, StashEntry};
 pub use submodules::{SubmoduleChange, SubmoduleInfo, SubmoduleList, SubmoduleState};
 pub use worktree::{
-    add_worktree_extended, agent_kind, agent_session_slug, merge_and_teardown_worktree,
-    merge_teardown_argv, MergeTeardownError, MergeTeardownResult, WorktreeDiffStat,
+    add_sparse_worktree_zero_copy, add_worktree_extended, agent_kind, agent_session_slug,
+    expand_sparse_cone_with_devmap, merge_and_teardown_worktree, merge_teardown_argv,
+    MergeTeardownError, MergeTeardownResult, SparseWorktreeCreated, WorktreeDiffStat,
     WorktreeDivergence, WorktreeInfo,
 };

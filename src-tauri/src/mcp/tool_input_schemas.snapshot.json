@@ -1321,5 +1321,398 @@
       "repo_path"
     ],
     "type": "object"
+  },
+  "gitpulse_worktree_claim": {
+    "additionalProperties": false,
+    "properties": {
+      "agent_id": {
+        "description": "Unique agent lane identifier, e.g. 'agent-auth' (up to 128 B)",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "branch": {
+        "description": "Branch owned by this agent lane (up to 256 B)",
+        "maxLength": 256,
+        "minLength": 1,
+        "type": "string"
+      },
+      "claimed_files": {
+        "description": "Repo-relative file or directory paths this lane intends to edit",
+        "items": {
+          "maxLength": 512,
+          "type": "string"
+        },
+        "maxItems": 128,
+        "type": "array"
+      },
+      "claimed_symbols": {
+        "description": "Qualified symbol names this lane intends to modify",
+        "items": {
+          "maxLength": 512,
+          "type": "string"
+        },
+        "maxItems": 128,
+        "type": "array"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "sparse_cone": {
+        "description": "Optional repo-relative sparse cone directories active in this lane",
+        "items": {
+          "maxLength": 512,
+          "type": "string"
+        },
+        "maxItems": 128,
+        "type": "array"
+      },
+      "worktree_path": {
+        "description": "Optional absolute path to the lane's checked-out worktree",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "agent_id",
+      "branch"
+    ],
+    "type": "object"
+  },
+  "gitpulse_worktree_create": {
+    "additionalProperties": false,
+    "properties": {
+      "base": {
+        "description": "Optional base commit or branch (default: default branch)",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "branch": {
+        "description": "Branch name to create and check out",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "execute_command": {
+        "description": "Optional command to execute in worktree upon completion",
+        "maxLength": 1024,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "share_cache": {
+        "description": "Enable CoW reflink cache sharing for target/ and node_modules/",
+        "type": "boolean"
+      },
+      "sparse_paths": {
+        "description": "Optional repo-relative paths for DevMap-guided sparse cone checkout (copies only needed directories + transitive graph dependencies)",
+        "items": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "maxItems": 64,
+        "type": "array"
+      },
+      "zero_copy": {
+        "description": "Use zero-copy shared base DevMap graph pointer instead of cloning devmap.sqlite",
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "repo_path",
+      "branch"
+    ],
+    "type": "object"
+  },
+  "gitpulse_worktree_inbox": {
+    "additionalProperties": false,
+    "properties": {
+      "agent_id": {
+        "description": "Optional agent identifier to filter direct and broadcast messages; omit to read all bus messages (up to 128 B)",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "limit": {
+        "description": "Maximum messages to return (default 100, max 256)",
+        "maximum": 256,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "since_seq": {
+        "description": "Return messages with seq strictly greater than since_seq (default 0)",
+        "maximum": 9007199254740991,
+        "minimum": 0,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
+  "gitpulse_worktree_isolate": {
+    "additionalProperties": false,
+    "properties": {
+      "cache_directories": {
+        "description": "Directories to reflink-clone (e.g. target, node_modules, .gocache)",
+        "items": {
+          "maxLength": 256,
+          "type": "string"
+        },
+        "maxItems": 16,
+        "type": "array"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "worktree_path": {
+        "description": "Absolute path to the target worktree",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "zero_copy": {
+        "description": "Use zero-copy shared base DevMap graph pointer instead of cloning devmap.sqlite",
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "repo_path",
+      "worktree_path"
+    ],
+    "type": "object"
+  },
+  "gitpulse_worktree_merge": {
+    "additionalProperties": false,
+    "properties": {
+      "commit_message": {
+        "description": "Optional commit message for the squashed commit",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "remove_worktree": {
+        "description": "Remove worktree and delete branch after successful fast-forward merge",
+        "type": "boolean"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "source_branch": {
+        "description": "Branch to merge into target",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "squash": {
+        "description": "Squash source branch commits into a single commit",
+        "type": "boolean"
+      },
+      "target_branch": {
+        "description": "Target branch to receive changes (default: default branch)",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "source_branch"
+    ],
+    "type": "object"
+  },
+  "gitpulse_worktree_overlay_sync": {
+    "additionalProperties": false,
+    "properties": {
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "worktree_path": {
+        "description": "Optional target worktree path within the same repository family (defaults to repo_path)",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
+  "gitpulse_worktree_prune": {
+    "additionalProperties": false,
+    "properties": {
+      "branch": {
+        "description": "Optional specific branch to prune. If omitted, prunes all integrated worktrees.",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "dry_run": {
+        "description": "Simulate pruning and return prunable status without altering disk",
+        "type": "boolean"
+      },
+      "force": {
+        "description": "Force removal of dirty or unmerged worktrees",
+        "type": "boolean"
+      },
+      "reap_processes": {
+        "description": "Terminate detached background processes running with CWD in the worktree",
+        "type": "boolean"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
+  "gitpulse_worktree_radar": {
+    "additionalProperties": false,
+    "properties": {
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path"
+    ],
+    "type": "object"
+  },
+  "gitpulse_worktree_release": {
+    "additionalProperties": false,
+    "properties": {
+      "agent_id": {
+        "description": "Agent lane identifier to release (up to 128 B)",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "agent_id"
+    ],
+    "type": "object"
+  },
+  "gitpulse_worktree_send_message": {
+    "additionalProperties": false,
+    "properties": {
+      "body": {
+        "description": "Message payload text (up to 16 KiB)",
+        "maxLength": 16384,
+        "minLength": 1,
+        "type": "string"
+      },
+      "branch": {
+        "description": "Optional branch context associated with this message (up to 256 B)",
+        "maxLength": 256,
+        "minLength": 1,
+        "type": "string"
+      },
+      "from_agent": {
+        "description": "Sender agent lane identifier (up to 128 B)",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      },
+      "kind": {
+        "description": "Message kind tag, default 'note' (up to 64 B)",
+        "maxLength": 64,
+        "minLength": 1,
+        "type": "string"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "to_agent": {
+        "description": "Optional recipient agent identifier; omit to broadcast to all lanes (up to 128 B)",
+        "maxLength": 128,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "from_agent",
+      "body"
+    ],
+    "type": "object"
+  },
+  "gitpulse_worktree_switch": {
+    "additionalProperties": false,
+    "properties": {
+      "base": {
+        "description": "Base revision to branch from if creating",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "branch": {
+        "description": "Branch name to switch to",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "create_if_missing": {
+        "description": "Create worktree and branch if they do not exist",
+        "type": "boolean"
+      },
+      "repo_path": {
+        "description": "Absolute path to a git repository",
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "repo_path",
+      "branch"
+    ],
+    "type": "object"
   }
 }

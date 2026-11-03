@@ -1098,6 +1098,14 @@ DROP INDEX IF EXISTS idx_unresolved_rows_class;
 /// shape of dishonesty this store is built to refuse. With the foreign key the
 /// delete fails loudly instead.
 ///
+/// The constraint is enforced on every write. The prune is the one exception:
+/// none of the three columns is indexed, so with the constraint on, each `paths`
+/// or `unresolved_texts` row it retires scans the whole ledger, and it turns off
+/// `foreign_keys` for its own transaction and runs `PRAGMA foreign_key_check`
+/// for those two parents before it commits (`refuse_dangling_references`). A
+/// drifted anti-join still fails loudly and rolls back; it just does so once per
+/// prune instead of once per retired row.
+///
 /// Every other relation keyed on `paths` declares the same constraint —
 /// `edge_rows` twice, and it carries the cost on the same builds — so this is
 /// the house rule rather than an exception made for the ledger. The cost falls

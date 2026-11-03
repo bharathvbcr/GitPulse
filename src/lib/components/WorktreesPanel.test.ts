@@ -385,3 +385,22 @@ describe("a task state that could not be read is not an unbound worktree", () =>
     expect(reset).toContain("taskStateError = null;");
   });
 });
+
+describe("WorktreesPanel zero-copy DevMap and sparse-cone provisioning", () => {
+  it("exposes zero-copy DevMap pointer toggle and optional sparse-cone paths through repoStore.addWorktree", () => {
+    expect(source).toContain("let zeroCopyDevmap = $state(true);");
+    expect(source).toContain("let sparsePathsInput = $state(\"\");");
+    expect(source).toContain("Zero-copy DevMap graph (shared base pointer)");
+    expect(source).toContain('aria-label="Sparse checkout paths"');
+    expect(source).toContain("zeroCopyDevmap,");
+    expect(source).toContain("sparsePaths: sparsePaths.length > 0 ? sparsePaths : null,");
+    expect(source).not.toContain("cmd_add_worktree");
+
+    const reset = source.slice(
+      source.indexOf("const tabScope = repoScope("),
+      source.indexOf("\n  );", source.indexOf("const tabScope = repoScope(")),
+    );
+    expect(reset).toContain("zeroCopyDevmap = true;");
+    expect(reset).toContain('sparsePathsInput = "";');
+  });
+});

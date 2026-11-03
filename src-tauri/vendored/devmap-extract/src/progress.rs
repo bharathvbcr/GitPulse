@@ -31,7 +31,7 @@ pub struct BudgetRetryCounts {
     pub retried: usize,
     /// Of those retried, parsed.
     pub recovered: usize,
-    /// Refused and never re-run (retry cap or cancellation).
+    /// Refused and never re-run (retry deadline or cancellation).
     pub not_retried: usize,
     /// Still refused in the final result.
     pub still_refused: usize,

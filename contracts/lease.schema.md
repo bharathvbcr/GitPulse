@@ -112,11 +112,15 @@ CREATE TABLE IF NOT EXISTS task_leases (
     created_at VARCHAR NOT NULL,
     expires_at VARCHAR,
     released_at VARCHAR,
+    worktree_path VARCHAR,
+    worktree_id VARCHAR,
     PRIMARY KEY (id)
 );
 
 CREATE INDEX IF NOT EXISTS ix_task_leases_task_id ON task_leases (task_id);
 CREATE INDEX IF NOT EXISTS ix_task_leases_status ON task_leases (status);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_task_leases_worktree
+    ON task_leases (worktree_path) WHERE status = 'active' AND worktree_path IS NOT NULL;
 
 CREATE UNIQUE INDEX IF NOT EXISTS ux_task_leases_active
     ON task_leases (task_id) WHERE status = 'active';

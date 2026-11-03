@@ -14,14 +14,18 @@
 //! canonical schema for this revision, which is also why there is no `ping` and
 //! no `logging/setLevel` in the modern era — neither exists in 2026-07-28.
 //!
-//! Nothing here writes git. The only writes are the task-board tools
-//! (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`,
-//! `gitpulse_delete_task`, `gitpulse_merge_tasks`), which write the GitPulse
-//! task profile behind the repository trust gate. `gitpulse_delete_task` and
-//! `gitpulse_merge_tasks` are the destructive tools — both end in the store's
-//! soft delete — and are annotated `destructiveHint: true`.
-//! Any tool that would run a git mutation must go through
-//! `harness::guard_command`, and every writing tool must be added to the
+//! Read tools (`readOnlyHint: true`) never write git or task state. Writes are
+//! restricted to the task-board tools (`gitpulse_add_task`, `gitpulse_import_tasks`,
+//! `gitpulse_complete_task`, `gitpulse_delete_task`, `gitpulse_merge_tasks`) and
+//! the worktree engine & coordination tools (`gitpulse_worktree_create`,
+//! `gitpulse_worktree_switch`, `gitpulse_worktree_isolate`,
+//! `gitpulse_worktree_overlay_sync`, `gitpulse_worktree_claim`,
+//! `gitpulse_worktree_release`, `gitpulse_worktree_send_message`,
+//! `gitpulse_worktree_prune`, `gitpulse_worktree_merge`),
+//! all behind the repository trust gate (`repository_trust::require`) and
+//! `harness::guard_command` (for git mutations). Destructive tools (`gitpulse_delete_task`,
+//! `gitpulse_merge_tasks`, `gitpulse_worktree_prune`, `gitpulse_worktree_merge`)
+//! carry `destructiveHint: true`, and every writing tool is held to the explicit
 //! allowlist in `no_advertised_tool_offers_an_ungated_mutation`.
 
 #[cfg(test)]
@@ -609,6 +613,149 @@ tool_args! {
         ),
         even_if_running: Option<bool> = Spec::flag(
             "Merge a source even though an agent attempt on it may still be working (task_in_use). Only when that agent is you, or the person asked for this. Default false",
+        ),
+    }
+}
+
+tool_args! {
+    struct WorktreeCreateArgs {
+        repo_path: String = repo_spec(),
+        branch: String = path_spec("Branch name to create and check out"),
+        base: Option<String> = path_spec("Optional base commit or branch (default: default branch)"),
+        share_cache: Option<bool> = Spec::flag("Enable CoW reflink cache sharing for target/ and node_modules/"),
+        sparse_paths: Option<Vec<String>> = Spec::chars_array(
+            "Optional repo-relative paths for DevMap-guided sparse cone checkout (copies only needed directories + transitive graph dependencies)",
+            64,
+            256,
+        ),
+        zero_copy: Option<bool> = Spec::flag("Use zero-copy shared base DevMap graph pointer instead of cloning devmap.sqlite"),
+        execute_command: Option<String> = Spec::chars("Optional command to execute in worktree upon completion", 1, 1024),
+    }
+}
+
+tool_args! {
+    struct WorktreeSwitchArgs {
+        repo_path: String = repo_spec(),
+        branch: String = path_spec("Branch name to switch to"),
+        create_if_missing: Option<bool> = Spec::flag("Create worktree and branch if they do not exist"),
+        base: Option<String> = path_spec("Base revision to branch from if creating"),
+    }
+}
+
+tool_args! {
+    struct WorktreeIsolateArgs {
+        repo_path: String = repo_spec(),
+        worktree_path: String = path_spec("Absolute path to the target worktree"),
+        zero_copy: Option<bool> = Spec::flag("Use zero-copy shared base DevMap graph pointer instead of cloning devmap.sqlite"),
+        cache_directories: Option<Vec<String>> = Spec::chars_array(
+            "Directories to reflink-clone (e.g. target, node_modules, .gocache)",
+            16,
+            256,
+        ),
+    }
+}
+
+tool_args! {
+    struct WorktreePruneArgs {
+        repo_path: String = repo_spec(),
+        branch: Option<String> = path_spec("Optional specific branch to prune. If omitted, prunes all integrated worktrees."),
+        reap_processes: Option<bool> = Spec::flag("Terminate detached background processes running with CWD in the worktree"),
+        dry_run: Option<bool> = Spec::flag("Simulate pruning and return prunable status without altering disk"),
+        force: Option<bool> = Spec::flag("Force removal of dirty or unmerged worktrees"),
+    }
+}
+
+tool_args! {
+    struct WorktreeMergeArgs {
+        repo_path: String = repo_spec(),
+        source_branch: String = path_spec("Branch to merge into target"),
+        target_branch: Option<String> = path_spec("Target branch to receive changes (default: default branch)"),
+        squash: Option<bool> = Spec::flag("Squash source branch commits into a single commit"),
+        commit_message: Option<String> = Spec::chars("Optional commit message for the squashed commit", 1, 4096),
+        remove_worktree: Option<bool> = Spec::flag("Remove worktree and delete branch after successful fast-forward merge"),
+    }
+}
+
+tool_args! {
+    struct WorktreeClaimArgs {
+        repo_path: String = repo_spec(),
+        agent_id: String = Spec::bytes("Unique agent lane identifier, e.g. 'agent-auth'", 1, 128),
+        branch: String = Spec::bytes("Branch owned by this agent lane", 1, 256),
+        worktree_path: Option<String> = path_spec("Optional absolute path to the lane's checked-out worktree"),
+        sparse_cone: Option<Vec<String>> = Spec::bytes_array(
+            "Optional repo-relative sparse cone directories active in this lane",
+            crate::engine::agent_bus::MAX_CLAIMED_ITEMS,
+            512,
+        ),
+        claimed_files: Option<Vec<String>> = Spec::bytes_array(
+            "Repo-relative file or directory paths this lane intends to edit",
+            crate::engine::agent_bus::MAX_CLAIMED_ITEMS,
+            512,
+        ),
+        claimed_symbols: Option<Vec<String>> = Spec::bytes_array(
+            "Qualified symbol names this lane intends to modify",
+            crate::engine::agent_bus::MAX_CLAIMED_ITEMS,
+            512,
+        ),
+    }
+}
+
+tool_args! {
+    struct WorktreeReleaseArgs {
+        repo_path: String = repo_spec(),
+        agent_id: String = Spec::bytes("Agent lane identifier to release", 1, 128),
+    }
+}
+
+tool_args! {
+    struct WorktreeSendMessageArgs {
+        repo_path: String = repo_spec(),
+        from_agent: String = Spec::bytes("Sender agent lane identifier", 1, 128),
+        to_agent: Option<String> = Spec::bytes(
+            "Optional recipient agent identifier; omit to broadcast to all lanes",
+            1,
+            128,
+        ),
+        kind: Option<String> = Spec::bytes("Message kind tag, default 'note'", 1, 64),
+        body: String = Spec::bytes(
+            "Message payload text",
+            1,
+            crate::engine::agent_bus::MAX_MESSAGE_BODY_BYTES,
+        ),
+        branch: Option<String> = Spec::bytes(
+            "Optional branch context associated with this message",
+            1,
+            256,
+        ),
+    }
+}
+
+tool_args! {
+    struct WorktreeInboxArgs {
+        repo_path: String = repo_spec(),
+        agent_id: Option<String> = Spec::bytes(
+            "Optional agent identifier to filter direct and broadcast messages; omit to read all bus messages",
+            1,
+            128,
+        ),
+        since_seq: Option<u64> = Spec::int(
+            "Return messages with seq strictly greater than since_seq (default 0)",
+            0,
+            MAX_REVISION,
+        ),
+        limit: Option<u32> = Spec::int(
+            "Maximum messages to return (default 100, max 256)",
+            1,
+            crate::engine::agent_bus::MAX_BUS_MESSAGES as u64,
+        ),
+    }
+}
+
+tool_args! {
+    struct WorktreeOverlaySyncArgs {
+        repo_path: String = repo_spec(),
+        worktree_path: Option<String> = path_spec(
+            "Optional target worktree path within the same repository family (defaults to repo_path)",
         ),
     }
 }
@@ -1297,6 +1444,356 @@ fn build_tools() -> Vec<Value> {
                 "required": ["ok", "outcome", "item_id", "target_live", "repository", "sources", "added", "escalated", "logs_kept_in_history", "next_step"]
             }),
         ),
+        mutating_tool(
+            "gitpulse_worktree_create",
+            "Create worktree",
+            "Create a new git branch and linked worktree with optional DevMap-guided sparse cone checkout, zero-copy shared base graph, parallel CoW build-cache sharing, and policy-gated lifecycle command execution",
+            WorktreeCreateArgs::properties(),
+            &WorktreeCreateArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "branch": { "type": "string" },
+                    "worktree_path": { "type": "string" },
+                    "cache_shared": { "type": "boolean" },
+                    "devmap_seeded": { "type": "boolean" },
+                    "zero_copy_devmap": { "type": "boolean" },
+                    "sparse_cone": { "type": ["array", "null"], "items": { "type": "string" } },
+                    "command_output": { "type": ["string", "null"] }
+                },
+                "required": ["ok", "branch", "worktree_path", "cache_shared", "devmap_seeded"]
+            }),
+            false,
+        ),
+        mutating_tool(
+            "gitpulse_worktree_switch",
+            "Switch worktree",
+            "Switch to an existing worktree by branch name or create a new branch and worktree with parallel CoW cache + DevMap seeding if absent",
+            WorktreeSwitchArgs::properties(),
+            &WorktreeSwitchArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "branch": { "type": "string" },
+                    "worktree_path": { "type": "string" },
+                    "created": { "type": "boolean" },
+                    "devmap_seeded": { "type": "boolean" }
+                },
+                "required": ["ok", "branch", "worktree_path", "created", "devmap_seeded"]
+            }),
+            true,
+        ),
+        mutating_tool(
+            "gitpulse_worktree_isolate",
+            "Isolate worktree",
+            "Establish parallel Copy-on-Write build-cache cloning, DevMap store/CSR provisioning, and ephemeral WorktreeOverlay sync for an existing worktree",
+            WorktreeIsolateArgs::properties(),
+            &WorktreeIsolateArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "worktree_path": { "type": "string" },
+                    "caches_cloned": { "type": "array", "items": { "type": "string" } },
+                    "cache_error": { "type": ["string", "null"] },
+                    "devmap_seeded": { "type": "boolean" },
+                    "devmap_mode": { "type": "string" },
+                    "overlay_dirty_files": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["ok", "worktree_path", "caches_cloned", "devmap_seeded", "devmap_mode", "overlay_dirty_files"]
+            }),
+            true,
+        ),
+        destructive_tool(
+            "gitpulse_worktree_prune",
+            "Prune worktrees",
+            "Safely prune worktrees and delete branches verified as integrated via 6-point check, optionally reaping detached processes",
+            WorktreePruneArgs::properties(),
+            &WorktreePruneArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "pruned_worktrees": { "type": "array", "items": { "type": "string" } },
+                    "reaped_pids": { "type": "array", "items": { "type": "integer" } },
+                    "dry_run": { "type": "boolean" }
+                },
+                "required": ["ok", "pruned_worktrees", "reaped_pids", "dry_run"]
+            }),
+        ),
+        destructive_tool(
+            "gitpulse_worktree_merge",
+            "Merge worktree",
+            "Automated merge pipeline: 6-point check, quarantined 3-way conflict detection, squash or merge commit, process reaping, and worktree/branch teardown",
+            WorktreeMergeArgs::properties(),
+            &WorktreeMergeArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "source_branch": { "type": "string" },
+                    "target_branch": { "type": "string" },
+                    "squashed_commit": { "type": ["string", "null"] },
+                    "merged_sha": { "type": ["string", "null"] },
+                    "worktree_removed": { "type": "boolean" },
+                    "error": { "type": ["string", "null"] }
+                },
+                "required": ["ok", "source_branch", "target_branch", "worktree_removed"]
+            }),
+        ),
+        mutating_tool(
+            "gitpulse_worktree_claim",
+            "Claim agent worktree lane",
+            "Register or update an agent lane's worktree, sparse cone, and pre-edit file/symbol claims on the shared <git-common-dir>/gitpulse/lanes coordination bus, returning the lane record and any immediate claim overlaps with sibling agents",
+            WorktreeClaimArgs::properties(),
+            &WorktreeClaimArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "claim": {
+                        "type": "object",
+                        "properties": {
+                            "agent_id": { "type": "string" },
+                            "branch": { "type": "string" },
+                            "worktree_path": { "type": ["string", "null"] },
+                            "sparse_cone": { "type": "array", "items": { "type": "string" } },
+                            "claimed_files": { "type": "array", "items": { "type": "string" } },
+                            "claimed_symbols": { "type": "array", "items": { "type": "string" } },
+                            "updated_at_ms": { "type": "integer", "minimum": 0 }
+                        },
+                        "required": [
+                            "agent_id", "branch", "worktree_path", "sparse_cone",
+                            "claimed_files", "claimed_symbols", "updated_at_ms"
+                        ]
+                    },
+                    "claim_conflicts": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "agent_a": { "type": "string" },
+                                "branch_a": { "type": "string" },
+                                "agent_b": { "type": "string" },
+                                "branch_b": { "type": "string" },
+                                "overlapping_files": { "type": "array", "items": { "type": "string" } },
+                                "overlapping_symbols": { "type": "array", "items": { "type": "string" } }
+                            },
+                            "required": [
+                                "agent_a", "branch_a", "agent_b", "branch_b",
+                                "overlapping_files", "overlapping_symbols"
+                            ]
+                        }
+                    }
+                },
+                "required": ["ok", "claim", "claim_conflicts"]
+            }),
+            true,
+        ),
+        mutating_tool(
+            "gitpulse_worktree_release",
+            "Release agent worktree lane",
+            "Release an agent lane's claim record from <git-common-dir>/gitpulse/lanes/claims.json when its task finishes or switches focus",
+            WorktreeReleaseArgs::properties(),
+            &WorktreeReleaseArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "agent_id": { "type": "string" },
+                    "released": { "type": "boolean" }
+                },
+                "required": ["ok", "agent_id", "released"]
+            }),
+            true,
+        ),
+        mutating_tool(
+            "gitpulse_worktree_send_message",
+            "Send agent coordination message",
+            "Post a bounded agent-to-agent message (direct to to_agent, or broadcast when omitted) onto <git-common-dir>/gitpulse/lanes/messages.json across sibling worktrees",
+            WorktreeSendMessageArgs::properties(),
+            &WorktreeSendMessageArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "message": {
+                        "type": "object",
+                        "properties": {
+                            "seq": { "type": "integer", "minimum": 1 },
+                            "from_agent": { "type": "string" },
+                            "to_agent": { "type": ["string", "null"] },
+                            "kind": { "type": "string" },
+                            "body": { "type": "string" },
+                            "branch": { "type": ["string", "null"] },
+                            "created_at_ms": { "type": "integer", "minimum": 0 }
+                        },
+                        "required": [
+                            "seq", "from_agent", "to_agent", "kind", "body",
+                            "branch", "created_at_ms"
+                        ]
+                    }
+                },
+                "required": ["ok", "message"]
+            }),
+            false,
+        ),
+        tool(
+            "gitpulse_worktree_inbox",
+            "Read agent coordination inbox",
+            "Read direct and broadcast coordination messages from <git-common-dir>/gitpulse/lanes/messages.json strictly after since_seq",
+            WorktreeInboxArgs::properties(),
+            &WorktreeInboxArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "repo_path": { "type": "string" },
+                    "messages": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "seq": { "type": "integer", "minimum": 1 },
+                                "from_agent": { "type": "string" },
+                                "to_agent": { "type": ["string", "null"] },
+                                "kind": { "type": "string" },
+                                "body": { "type": "string" },
+                                "branch": { "type": ["string", "null"] },
+                                "created_at_ms": { "type": "integer", "minimum": 0 }
+                            },
+                            "required": [
+                                "seq", "from_agent", "to_agent", "kind", "body",
+                                "branch", "created_at_ms"
+                            ]
+                        }
+                    },
+                    "latest_seq": { "type": "integer", "minimum": 0 },
+                    "dropped_before_seq": { "type": "integer", "minimum": 0 },
+                    "has_more": { "type": "boolean" }
+                },
+                "required": [
+                    "ok", "repo_path", "messages", "latest_seq",
+                    "dropped_before_seq", "has_more"
+                ]
+            }),
+        ),
+        tool(
+            "gitpulse_worktree_radar",
+            "Parallel agent 3-layer collision radar",
+            "Run the 3-layer parallel agent collision radar across all worktrees and registered lanes: (1) pre-edit file/symbol claim overlaps, (2) zero-copy WorktreeOverlay RoaringBitmap + 1-hop CsrGraphReader caller/callee semantic collisions, and (3) quarantined ODB 3-way git merge-tree committed conflicts",
+            RepoArgs::properties(),
+            &RepoArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "repo_path": { "type": "string" },
+                    "worktrees_scanned": { "type": "integer", "minimum": 0 },
+                    "worktrees_unscanned": { "type": "integer", "minimum": 0 },
+                    "lanes_registered": { "type": "integer", "minimum": 0 },
+                    "csr_graph_available": { "type": "boolean" },
+                    "csr_generation": { "type": ["integer", "null"] },
+                    "claim_conflicts": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "agent_a": { "type": "string" },
+                                "branch_a": { "type": "string" },
+                                "agent_b": { "type": "string" },
+                                "branch_b": { "type": "string" },
+                                "overlapping_files": { "type": "array", "items": { "type": "string" } },
+                                "overlapping_symbols": { "type": "array", "items": { "type": "string" } }
+                            },
+                            "required": [
+                                "agent_a", "branch_a", "agent_b", "branch_b",
+                                "overlapping_files", "overlapping_symbols"
+                            ]
+                        }
+                    },
+                    "semantic_conflicts": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "worktree_a": { "type": "string" },
+                                "branch_a": { "type": ["string", "null"] },
+                                "worktree_b": { "type": "string" },
+                                "branch_b": { "type": ["string", "null"] },
+                                "relation": { "type": "string" },
+                                "direct_dirty_node_overlap": { "type": "integer", "minimum": 0 },
+                                "caller_callee_linked_nodes": { "type": "integer", "minimum": 0 }
+                            },
+                            "required": [
+                                "worktree_a", "branch_a", "worktree_b", "branch_b", "relation",
+                                "direct_dirty_node_overlap", "caller_callee_linked_nodes"
+                            ]
+                        }
+                    },
+                    "odb_merge_conflicts": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "worktree_a": { "type": "string" },
+                                "branch_a": { "type": ["string", "null"] },
+                                "worktree_b": { "type": "string" },
+                                "branch_b": { "type": ["string", "null"] },
+                                "state": { "type": "string" },
+                                "paths": { "type": "array", "items": { "type": "string" } },
+                                "paths_total": { "type": "integer", "minimum": 0 },
+                                "reason": { "type": ["string", "null"] }
+                            },
+                            "required": [
+                                "worktree_a", "branch_a", "worktree_b", "branch_b",
+                                "state", "paths", "paths_total", "reason"
+                            ]
+                        }
+                    },
+                    "truncated": { "type": "boolean" }
+                },
+                "required": [
+                    "ok", "repo_path", "worktrees_scanned", "worktrees_unscanned",
+                    "lanes_registered", "csr_graph_available", "csr_generation",
+                    "claim_conflicts", "semantic_conflicts", "odb_merge_conflicts", "truncated"
+                ]
+            }),
+        ),
+        mutating_tool(
+            "gitpulse_worktree_overlay_sync",
+            "Synchronize ephemeral worktree DevMap overlay",
+            "Recompute <state_dir>/codeintel/overlay.json for a worktree against its base DevMap generation (cloned or zero-copy pointer), updating Blake3 file hashes, tombstones, CAS AST reuse, and RoaringBitmap dirty CSR nodes",
+            WorktreeOverlaySyncArgs::properties(),
+            &WorktreeOverlaySyncArgs::required(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" },
+                    "worktree_path": { "type": "string" },
+                    "overlay_path": { "type": "string" },
+                    "generation_id": { "type": "integer", "minimum": 0 },
+                    "base_head_sha": { "type": ["string", "null"] },
+                    "modified_files": { "type": "integer", "minimum": 0 },
+                    "tombstoned_files": { "type": "integer", "minimum": 0 },
+                    "tombstoned_symbols": { "type": "integer", "minimum": 0 },
+                    "dirty_nodes": { "type": "integer", "minimum": 0 },
+                    "reused_cas_asts": { "type": "integer", "minimum": 0 },
+                    "skipped_large_files": { "type": "integer", "minimum": 0 },
+                    "truncated": { "type": "boolean" },
+                    "duration_ms": { "type": "integer", "minimum": 0 }
+                },
+                "required": [
+                    "ok", "worktree_path", "overlay_path", "generation_id",
+                    "base_head_sha", "modified_files", "tombstoned_files",
+                    "tombstoned_symbols", "dirty_nodes", "reused_cas_asts",
+                    "skipped_large_files", "truncated", "duration_ms"
+                ]
+            }),
+            true,
+        ),
         tool(
             "gitpulse_codeintel_search",
             "Symbol search",
@@ -1467,7 +1964,7 @@ fn discover_result(modern: bool) -> Value {
             json!({
                 "supportedVersions": [PROTOCOL_VERSION],
                 "capabilities": capabilities(),
-                "instructions": "GitPulse control plane. It never mutates git state; its only writes are the task-board tools — gitpulse_add_task, gitpulse_import_tasks, gitpulse_complete_task, gitpulse_delete_task and gitpulse_merge_tasks — which a person sees on the GitPulse board. gitpulse_delete_task removes a card and gitpulse_merge_tasks folds duplicate cards into one and removes the rest (both soft, with a required reason kept in history, and no undelete over MCP); use them only for tasks that should not exist separately, never to finish one, and not on a task another agent is running. Keep the board small: before gitpulse_add_task, read gitpulse_list_tasks and group related findings into one task, or fold them into an existing one with overwrite; gitpulse_add_task refuses a new task that looks like open work until you have reviewed it. When the board already holds duplicates, merge them with gitpulse_merge_tasks rather than deleting all but one. Start with gitpulse_insights for a repository snapshot (worktrees, agent sessions, collisions, ledger, code graph). Use gitpulse_change_context before editing, and gitpulse_collision_risk before parallel agent work. The same views are addressable as gitpulse://<facet>{+repo_path} resources; gitpulse://server/manifest describes the whole surface. Pass absolute repo_path on every call. When GitPulse launched you on a task, your brief names it on its Task: line; when the work is finished and verified, call gitpulse_complete_task with that id and a short summary.",
+                "instructions": "GitPulse control plane. Read tools (readOnlyHint: true) never mutate git or task state. Writes are restricted to the task-board tools — gitpulse_add_task, gitpulse_import_tasks, gitpulse_complete_task, gitpulse_delete_task and gitpulse_merge_tasks — and the policy-gated worktree engine and lane coordination tools — gitpulse_worktree_create, gitpulse_worktree_switch, gitpulse_worktree_isolate, gitpulse_worktree_prune, gitpulse_worktree_merge, gitpulse_worktree_claim, gitpulse_worktree_release, gitpulse_worktree_send_message and gitpulse_worktree_overlay_sync (each gated by repository trust and harness::guard_command). gitpulse_delete_task removes a card and gitpulse_merge_tasks folds duplicate cards into one and removes the rest (both soft, with a required reason kept in history, and no undelete over MCP); use them only for tasks that should not exist separately, never to finish one, and not on a task another agent is running. Keep the board small: before gitpulse_add_task, read gitpulse_list_tasks and group related findings into one task, or fold them into an existing one with overwrite; gitpulse_add_task refuses a new task that looks like open work until you have reviewed it. When the board already holds duplicates, merge them with gitpulse_merge_tasks rather than deleting all but one. Start with gitpulse_insights for a repository snapshot (worktrees, agent sessions, collisions, ledger, code graph). Use gitpulse_change_context before editing, and gitpulse_collision_risk, gitpulse_worktree_claim, gitpulse_worktree_inbox, and gitpulse_worktree_radar before and during parallel agent work. The same views are addressable as gitpulse://<facet>{+repo_path} resources; gitpulse://server/manifest describes the whole surface. Pass absolute repo_path on every call. When GitPulse launched you on a task, your brief names it on its Task: line; when the work is finished and verified, call gitpulse_complete_task with that id and a short summary.",
             }),
         ),
         DISCOVER_TTL_MS,
@@ -1951,6 +2448,536 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 a.even_if_running.unwrap_or(false),
             )
             .map_err(workbench_message)
+        }
+        "gitpulse_worktree_create" => {
+            let a: WorktreeCreateArgs = parse(name, arguments)?;
+            crate::repository_trust::require(std::path::Path::new(&a.repo_path))
+                .map_err(CommandError::into_message)?;
+            let share_cache = a.share_cache.unwrap_or(true);
+            let zero_copy = a.zero_copy.unwrap_or(false);
+            let target_path = crate::engine::worktree::resolve_worktree_path_for_branch(
+                &a.repo_path,
+                &a.branch,
+                None,
+            )
+            .map_err(CommandError::into_message)?;
+            let target_str = target_path
+                .to_str()
+                .ok_or_else(|| "invalid target path".to_string())?;
+            let argv = crate::engine::worktree::add_worktree_argv(
+                target_str,
+                Some(&a.branch),
+                a.base.as_deref(),
+                false,
+            );
+            let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            crate::harness::guard_command(&a.repo_path, &argv_refs)?;
+
+            let (worktree_path, devmap_seeded, zero_copy_devmap, sparse_cone) =
+                if let Some(ref sparse) = a.sparse_paths.filter(|p| !p.is_empty()) {
+                    let created = crate::engine::worktree::add_sparse_worktree_zero_copy(
+                        &a.repo_path,
+                        target_str,
+                        &a.branch,
+                        a.base.as_deref(),
+                        sparse,
+                        share_cache,
+                    )
+                    .map_err(CommandError::into_message)?;
+                    (
+                        created.path,
+                        created.zero_copy_devmap,
+                        created.zero_copy_devmap,
+                        Some(created.materialized_cone_dirs),
+                    )
+                } else if zero_copy {
+                    let path = crate::engine::worktree::add_worktree(
+                        &a.repo_path,
+                        target_str,
+                        Some(&a.branch),
+                        a.base.as_deref(),
+                        false,
+                    )
+                    .map_err(CommandError::into_message)?;
+                    let mut zc_seeded = false;
+                    if let Ok(family) =
+                        crate::engine::worktree::resolve_worktree_family(&a.repo_path, &path)
+                    {
+                        let selection = crate::engine::cow_clone::CacheSelection::default();
+                        let (_, dev_res) = std::thread::scope(|scope| {
+                            let c = scope.spawn(|| {
+                                if share_cache {
+                                    let _ = crate::engine::cow_clone::clone_ignored_caches(
+                                        &family.anchor,
+                                        &family.worktree,
+                                        &selection,
+                                    );
+                                }
+                            });
+                            let d = scope.spawn(|| {
+                                crate::codeintel::provision_worktree_devmap_zero_copy(
+                                    &family.anchor,
+                                    &family.worktree,
+                                )
+                            });
+                            let _ = c.join();
+                            ((), d.join().ok().and_then(Result::ok))
+                        });
+                        if let Some(p) = dev_res {
+                            zc_seeded = p.seeded && p.zero_copy_base_ref;
+                        }
+                    }
+                    (path, zc_seeded, zc_seeded, None)
+                } else {
+                    let created = crate::engine::worktree::add_worktree_extended(
+                        &a.repo_path,
+                        target_str,
+                        Some(&a.branch),
+                        a.base.as_deref(),
+                        false,
+                        share_cache,
+                        true,
+                    )
+                    .map_err(CommandError::into_message)?;
+                    if !share_cache {
+                        if let Ok(family) = crate::engine::worktree::resolve_worktree_family(
+                            &a.repo_path,
+                            &created.path,
+                        ) {
+                            let _ = crate::codeintel::provision_worktree_devmap(
+                                &family.anchor,
+                                &family.worktree,
+                            );
+                        }
+                    }
+                    let seeded = devmap_query::paths::store_path(std::path::Path::new(
+                        &created.path,
+                    ))
+                    .is_file();
+                    (created.path, seeded, false, None)
+                };
+
+            let mut cmd_out = None;
+            if let Some(cmd) = a.execute_command {
+                #[cfg(unix)]
+                let (prog, prog_args): (&str, [&str; 2]) = ("sh", ["-c", cmd.as_str()]);
+                #[cfg(windows)]
+                let (prog, prog_args): (&str, [&str; 2]) = ("cmd", ["/C", cmd.as_str()]);
+                let mut guard_argv = vec![prog];
+                guard_argv.extend_from_slice(&prog_args);
+                crate::harness::guard_command(&worktree_path, &guard_argv)?;
+                let output = crate::engine::git_cli::capture_command(
+                    prog,
+                    &prog_args,
+                    Some(std::path::Path::new(&worktree_path)),
+                    std::time::Duration::from_secs(60),
+                    &[],
+                )
+                .map_err(CommandError::into_message)?;
+                let mut combined = output.stdout_text();
+                if !output.success {
+                    let stderr = output.stderr_text();
+                    if !stderr.is_empty() {
+                        if !combined.is_empty() && !combined.ends_with('\n') {
+                            combined.push('\n');
+                        }
+                        combined.push_str(&stderr);
+                    }
+                    return Err(format!(
+                        "execute_command exited with status {}: {}",
+                        output.status_code,
+                        combined.trim()
+                    ));
+                }
+                cmd_out = Some(combined);
+            }
+            Ok(json!({
+                "ok": true,
+                "branch": a.branch,
+                "worktree_path": worktree_path,
+                "cache_shared": share_cache,
+                "devmap_seeded": devmap_seeded,
+                "zero_copy_devmap": zero_copy_devmap,
+                "sparse_cone": sparse_cone,
+                "command_output": cmd_out
+            }))
+        }
+        "gitpulse_worktree_switch" => {
+            let a: WorktreeSwitchArgs = parse(name, arguments)?;
+            crate::repository_trust::require(std::path::Path::new(&a.repo_path))
+                .map_err(CommandError::into_message)?;
+            let worktrees = crate::engine::worktree::list_worktrees(&a.repo_path)
+                .map_err(CommandError::into_message)?;
+            if let Some(wt) = worktrees
+                .iter()
+                .find(|w| w.branch.as_deref() == Some(&a.branch))
+            {
+                let devmap_seeded =
+                    devmap_query::paths::store_path(std::path::Path::new(&wt.path)).is_file()
+                        || crate::codeintel::zero_copy_base_ref_path(&wt.path).is_file();
+                return Ok(json!({
+                    "ok": true,
+                    "branch": a.branch,
+                    "worktree_path": wt.path,
+                    "created": false,
+                    "devmap_seeded": devmap_seeded
+                }));
+            }
+            if a.create_if_missing.unwrap_or(false) {
+                let target_path = crate::engine::worktree::resolve_worktree_path_for_branch(
+                    &a.repo_path,
+                    &a.branch,
+                    None,
+                )
+                .map_err(CommandError::into_message)?;
+                let target_str = target_path
+                    .to_str()
+                    .ok_or_else(|| "invalid target path".to_string())?;
+                let argv = crate::engine::worktree::add_worktree_argv(
+                    target_str,
+                    Some(&a.branch),
+                    a.base.as_deref(),
+                    false,
+                );
+                let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                crate::harness::guard_command(&a.repo_path, &argv_refs)?;
+                let created = crate::engine::worktree::add_worktree_extended(
+                    &a.repo_path,
+                    target_str,
+                    Some(&a.branch),
+                    a.base.as_deref(),
+                    false,
+                    true,
+                    true,
+                )
+                .map_err(CommandError::into_message)?;
+                let devmap_seeded =
+                    devmap_query::paths::store_path(std::path::Path::new(&created.path)).is_file();
+                return Ok(json!({
+                    "ok": true,
+                    "branch": a.branch,
+                    "worktree_path": created.path,
+                    "created": true,
+                    "devmap_seeded": devmap_seeded
+                }));
+            }
+            Err(format!("worktree for branch {:?} does not exist", a.branch))
+        }
+        "gitpulse_worktree_isolate" => {
+            let a: WorktreeIsolateArgs = parse(name, arguments)?;
+            crate::repository_trust::require(std::path::Path::new(&a.repo_path))
+                .map_err(CommandError::into_message)?;
+            let family = crate::engine::worktree::resolve_worktree_family(
+                &a.repo_path,
+                &a.worktree_path,
+            )
+            .map_err(CommandError::into_message)?;
+            crate::harness::guard_command(&a.repo_path, &["git", "worktree", "list"])?;
+            let zero_copy = a.zero_copy.unwrap_or(false);
+            let include_virtualenvs = a.cache_directories.as_ref().is_some_and(|dirs| {
+                dirs.iter().any(|d| d == ".venv" || d == "venv")
+            });
+            let selection = crate::engine::cow_clone::CacheSelection {
+                include_virtualenvs,
+                ..Default::default()
+            };
+            let anchor = &family.anchor;
+            let target = &family.worktree;
+            let (cache_res, devmap_res) = std::thread::scope(|scope| {
+                let cache_handle = scope.spawn(|| {
+                    crate::engine::cow_clone::clone_ignored_caches(anchor, target, &selection)
+                });
+                let devmap_handle = scope.spawn(|| {
+                    if zero_copy {
+                        crate::codeintel::provision_worktree_devmap_zero_copy(anchor, target)
+                    } else {
+                        crate::codeintel::provision_worktree_devmap(anchor, target)
+                    }
+                });
+                let c = cache_handle
+                    .join()
+                    .unwrap_or_else(|_| Err(CommandError::plain("cache clone worker panicked")));
+                let d = devmap_handle.join().unwrap_or_else(|_| {
+                    Err(CommandError::plain("devmap provision worker panicked"))
+                });
+                (c, d)
+            });
+            let report = cache_res.map_err(CommandError::into_message)?;
+            let caches_cloned: Vec<String> = report
+                .copied
+                .iter()
+                .filter_map(|r| {
+                    std::path::Path::new(&r.destination)
+                        .file_name()?
+                        .to_str()
+                        .map(str::to_owned)
+                })
+                .collect();
+            let (devmap_seeded, devmap_mode) = match devmap_res {
+                Ok(p) => {
+                    let mode = if !p.seeded {
+                        p.reason.unwrap_or_else(|| "not_seeded".to_string())
+                    } else if p.zero_copy_base_ref {
+                        "zero_copy_base_ref".to_string()
+                    } else if p.used_online_backup {
+                        "online_backup".to_string()
+                    } else if p.is_cow {
+                        "cow_clone".to_string()
+                    } else {
+                        "byte_copy".to_string()
+                    };
+                    (p.seeded, mode)
+                }
+                Err(e) => (false, format!("failed: {}", e.message())),
+            };
+            let overlay_dirty = target
+                .to_str()
+                .and_then(|s| crate::codeintel::sync_worktree_overlay(s).ok())
+                .map(|r| r.modified_files + r.tombstoned_files)
+                .unwrap_or(0);
+            Ok(json!({
+                "ok": true,
+                "worktree_path": a.worktree_path,
+                "caches_cloned": caches_cloned,
+                "cache_error": report.error(),
+                "devmap_seeded": devmap_seeded,
+                "devmap_mode": devmap_mode,
+                "overlay_dirty_files": overlay_dirty
+            }))
+        }
+        "gitpulse_worktree_prune" => {
+            let a: WorktreePruneArgs = parse(name, arguments)?;
+            crate::repository_trust::require(std::path::Path::new(&a.repo_path))
+                .map_err(CommandError::into_message)?;
+            let dry_run = a.dry_run.unwrap_or(false);
+            let force = a.force.unwrap_or(false);
+            let reap = a.reap_processes.unwrap_or(true);
+            let family =
+                crate::engine::worktree::resolve_worktree_family(&a.repo_path, &a.repo_path)
+                    .map_err(CommandError::into_message)?;
+            let anchor = family.anchor;
+            let default_base = crate::engine::git_reader::compute_default_base(&anchor)
+                .checked()
+                .ok()
+                .and_then(|d| d.base.map(|(n, _)| n))
+                .unwrap_or_else(|| "main".to_string());
+            let worktrees = crate::engine::worktree::list_worktrees(&a.repo_path)
+                .map_err(CommandError::into_message)?;
+            let mut pruned = Vec::new();
+            let mut all_reaped = Vec::new();
+
+            for wt in worktrees {
+                if wt.is_main {
+                    continue;
+                }
+                if let Some(ref target_br) = a.branch {
+                    if wt.branch.as_deref() != Some(target_br.as_str()) {
+                        continue;
+                    }
+                }
+                let mut prunable = force;
+                if !prunable {
+                    let is_clean = crate::engine::worktree::user_changed_paths(&wt.path)
+                        .is_ok_and(|(dirty, _)| dirty.is_empty());
+                    if is_clean {
+                        if let Some(br) = wt.branch.as_deref() {
+                            if let Ok(verif) = crate::engine::worktree::verify_branch_integration(
+                                &anchor,
+                                br,
+                                &default_base,
+                            ) {
+                                prunable = verif.is_integrated;
+                            }
+                        }
+                    }
+                }
+                if prunable {
+                    let remove_argv =
+                        crate::engine::worktree::remove_worktree_argv(&wt.path, force);
+                    let remove_refs: Vec<&str> = remove_argv.iter().map(String::as_str).collect();
+                    crate::harness::guard_command(&a.repo_path, &remove_refs)?;
+                    if reap {
+                        let r = crate::engine::worktree::reap_processes_in_dir(
+                            std::path::Path::new(&wt.path),
+                            dry_run,
+                        )
+                        .map_err(CommandError::into_message)?;
+                        all_reaped.extend(r.pids_terminated);
+                    }
+                    if !dry_run {
+                        crate::engine::worktree::remove_worktree(&a.repo_path, &wt.path, force)
+                            .map_err(CommandError::into_message)?;
+                        if let Some(br) = wt.branch.as_deref() {
+                            crate::harness::guard_command(
+                                &a.repo_path,
+                                &["git", "branch", "-D", br],
+                            )?;
+                            let _ =
+                                crate::engine::git_cli::git_text(&anchor, &["branch", "-D", br]);
+                        }
+                    }
+                    pruned.push(wt.path);
+                }
+            }
+            Ok(json!({
+                "ok": true,
+                "pruned_worktrees": pruned,
+                "reaped_pids": all_reaped,
+                "dry_run": dry_run
+            }))
+        }
+        "gitpulse_worktree_merge" => {
+            let a: WorktreeMergeArgs = parse(name, arguments)?;
+            crate::repository_trust::require(std::path::Path::new(&a.repo_path))
+                .map_err(CommandError::into_message)?;
+            let res = crate::engine::worktree::merge_worktree_pipeline(
+                &a.repo_path,
+                &a.source_branch,
+                a.target_branch.as_deref(),
+                a.squash.unwrap_or(true),
+                a.commit_message.as_deref(),
+                a.remove_worktree.unwrap_or(true),
+            )
+            .map_err(CommandError::into_message)?;
+            Ok(json!({
+                "ok": res.ok,
+                "source_branch": res.source_branch,
+                "target_branch": res.target_branch,
+                "squashed_commit": res.squashed_commit,
+                "merged_sha": res.merged_sha,
+                "worktree_removed": res.worktree_removed,
+                "error": res.error
+            }))
+        }
+        "gitpulse_worktree_claim" => {
+            let a: WorktreeClaimArgs = parse(name, arguments)?;
+            crate::repository_trust::require(std::path::Path::new(&a.repo_path))
+                .map_err(CommandError::into_message)?;
+            if let Some(ref wt_path) = a.worktree_path {
+                crate::engine::worktree::resolve_worktree_family(&a.repo_path, wt_path)
+                    .map_err(CommandError::into_message)?;
+            }
+            crate::harness::guard_command(&a.repo_path, &["git", "worktree", "list"])?;
+            let (claim, claim_conflicts) =
+                crate::engine::agent_bus::register_or_update_lane_with_conflicts(
+                    &a.repo_path,
+                    &a.agent_id,
+                    &a.branch,
+                    a.worktree_path.as_deref(),
+                    a.sparse_cone.as_deref().unwrap_or(&[]),
+                    a.claimed_files.as_deref().unwrap_or(&[]),
+                    a.claimed_symbols.as_deref().unwrap_or(&[]),
+                )
+                .map_err(CommandError::into_message)?;
+            Ok(json!({
+                "ok": true,
+                "claim": claim,
+                "claim_conflicts": claim_conflicts
+            }))
+        }
+        "gitpulse_worktree_release" => {
+            let a: WorktreeReleaseArgs = parse(name, arguments)?;
+            crate::repository_trust::require(std::path::Path::new(&a.repo_path))
+                .map_err(CommandError::into_message)?;
+            crate::harness::guard_command(&a.repo_path, &["git", "worktree", "list"])?;
+            let released = crate::engine::agent_bus::release_lane(&a.repo_path, &a.agent_id)
+                .map_err(CommandError::into_message)?;
+            Ok(json!({
+                "ok": true,
+                "agent_id": a.agent_id,
+                "released": released
+            }))
+        }
+        "gitpulse_worktree_send_message" => {
+            let a: WorktreeSendMessageArgs = parse(name, arguments)?;
+            crate::repository_trust::require(std::path::Path::new(&a.repo_path))
+                .map_err(CommandError::into_message)?;
+            crate::harness::guard_command(&a.repo_path, &["git", "worktree", "list"])?;
+            let kind = a.kind.as_deref().unwrap_or("note");
+            let message = crate::engine::agent_bus::post_message(
+                &a.repo_path,
+                &a.from_agent,
+                a.to_agent.as_deref(),
+                kind,
+                &a.body,
+                a.branch.as_deref(),
+            )
+            .map_err(CommandError::into_message)?;
+            Ok(json!({
+                "ok": true,
+                "message": message
+            }))
+        }
+        "gitpulse_worktree_inbox" => {
+            let a: WorktreeInboxArgs = parse(name, arguments)?;
+            let mut page = crate::engine::agent_bus::read_messages(
+                &a.repo_path,
+                a.agent_id.as_deref(),
+                a.since_seq.unwrap_or(0),
+            )
+            .map_err(CommandError::into_message)?;
+            let cap = a.limit.map(|l| l as usize).unwrap_or(100);
+            let has_more = page.messages.len() > cap;
+            if has_more {
+                page.messages.truncate(cap);
+            }
+            Ok(json!({
+                "ok": true,
+                "repo_path": a.repo_path,
+                "messages": page.messages,
+                "latest_seq": page.latest_seq,
+                "dropped_before_seq": page.dropped_before_seq,
+                "has_more": has_more
+            }))
+        }
+        "gitpulse_worktree_radar" => {
+            let a: RepoArgs = parse(name, arguments)?;
+            let report = crate::engine::agent_bus::scan_parallel_agent_radar(&a.repo_path)
+                .map_err(CommandError::into_message)?;
+            Ok(json!({
+                "ok": true,
+                "repo_path": a.repo_path,
+                "worktrees_scanned": report.worktrees_scanned,
+                "worktrees_unscanned": report.worktrees_unscanned,
+                "lanes_registered": report.lanes_registered,
+                "csr_graph_available": report.csr_graph_available,
+                "csr_generation": report.csr_generation,
+                "claim_conflicts": report.claim_conflicts,
+                "semantic_conflicts": report.semantic_conflicts,
+                "odb_merge_conflicts": report.odb_merge_conflicts,
+                "truncated": report.truncated
+            }))
+        }
+        "gitpulse_worktree_overlay_sync" => {
+            let a: WorktreeOverlaySyncArgs = parse(name, arguments)?;
+            crate::repository_trust::require(std::path::Path::new(&a.repo_path))
+                .map_err(CommandError::into_message)?;
+            let target_arg = a.worktree_path.as_deref().unwrap_or(&a.repo_path);
+            let family =
+                crate::engine::worktree::resolve_worktree_family(&a.repo_path, target_arg)
+                    .map_err(CommandError::into_message)?;
+            crate::harness::guard_command(&a.repo_path, &["git", "status", "--porcelain=v1"])?;
+            let target_str = family
+                .worktree
+                .to_str()
+                .ok_or_else(|| "worktree path is not valid UTF-8".to_string())?;
+            let report = crate::codeintel::sync_worktree_overlay(target_str)
+                .map_err(CommandError::into_message)?;
+            Ok(json!({
+                "ok": true,
+                "worktree_path": target_str,
+                "overlay_path": report.overlay_path,
+                "generation_id": report.generation_id,
+                "base_head_sha": report.base_head_sha,
+                "modified_files": report.modified_files,
+                "tombstoned_files": report.tombstoned_files,
+                "tombstoned_symbols": report.tombstoned_symbols,
+                "dirty_nodes": report.dirty_nodes,
+                "reused_cas_asts": report.reused_cas_asts,
+                "skipped_large_files": report.skipped_large_files,
+                "truncated": report.truncated,
+                "duration_ms": report.duration_ms
+            }))
         }
         name if name.starts_with("devmap_") => {
             devmap_parity::handle(name, arguments).map_err(CommandError::into_message)
@@ -3017,15 +4044,31 @@ mod tests {
                             | "gitpulse_complete_task"
                             | "gitpulse_delete_task"
                             | "gitpulse_merge_tasks"
+                            | "gitpulse_worktree_create"
+                            | "gitpulse_worktree_switch"
+                            | "gitpulse_worktree_isolate"
+                            | "gitpulse_worktree_prune"
+                            | "gitpulse_worktree_merge"
+                            | "gitpulse_worktree_claim"
+                            | "gitpulse_worktree_release"
+                            | "gitpulse_worktree_send_message"
+                            | "gitpulse_worktree_overlay_sync"
                     ),
                     "unexpected mutating tool {name}"
                 );
-                // Deleting a card, alone or by merging it into another, is
-                // the destructive write, and it must say so: clients gate
-                // their approval prompt on this hint.
+                // Deleting a card, alone or by merging it into another, or
+                // pruning/merging worktrees and branches is the destructive
+                // write, and it must say so: clients gate their approval prompt
+                // on this hint.
                 assert_eq!(
                     tool["annotations"]["destructiveHint"],
-                    matches!(name, "gitpulse_delete_task" | "gitpulse_merge_tasks"),
+                    matches!(
+                        name,
+                        "gitpulse_delete_task"
+                            | "gitpulse_merge_tasks"
+                            | "gitpulse_worktree_prune"
+                            | "gitpulse_worktree_merge"
+                    ),
                     "{name} has the wrong destructiveHint"
                 );
                 continue;
@@ -3828,6 +4871,11 @@ mod tests {
         ("gitpulse_add_task", "one task record back, no list"),
         ("gitpulse_complete_task", "one task record back, no list"),
         ("gitpulse_delete_task", "one deletion receipt, no list"),
+        ("gitpulse_worktree_switch", "one worktree switch receipt, no list"),
+        ("gitpulse_worktree_merge", "one merge pipeline receipt, no list"),
+        ("gitpulse_worktree_release", "one lane release receipt, no list"),
+        ("gitpulse_worktree_send_message", "one coordination message receipt, no list"),
+        ("gitpulse_worktree_overlay_sync", "one worktree overlay sync report, no list"),
         ("gitpulse_provenance", "one provenance record, no list"),
         ("gitpulse_landed", "one landing record, no list"),
         ("devmap_status", "one status envelope, no list"),
@@ -4087,17 +5135,21 @@ mod tests {
                 .map(|tool| tool["outputSchema"].clone())
                 .unwrap_or_else(|| panic!("{name} is not advertised"))
         };
-        let mut call_writer =
-            |name: &str, arguments: Value, validated: &mut std::collections::BTreeSet<String>| {
-                let outcome = handle_tool_call(name, &arguments);
-                check(
-                    name,
-                    "the task-board lifecycle",
-                    &schema_of(name),
-                    outcome,
-                    validated,
-                );
-            };
+        let mut call_writer = |name: &str,
+                               arguments: Value,
+                               validated: &mut std::collections::BTreeSet<String>|
+         -> Option<Value> {
+            let outcome = handle_tool_call(name, &arguments);
+            let ok_value = outcome.as_ref().ok().cloned();
+            check(
+                name,
+                "the writer lifecycle",
+                &schema_of(name),
+                outcome,
+                validated,
+            );
+            ok_value
+        };
         for (task, title) in [
             ("gp-schema-first", "Rotate the signing keys"),
             ("gp-schema-second", "Paginate the activity feed"),
@@ -4134,7 +5186,172 @@ mod tests {
             json!({ "repo_path": healthy, "task_id": "gp-schema-third", "reason": "schema probe cleanup" }),
             &mut validated,
         );
-        // And the readers that depend on those tasks existing.
+
+        // Exercise the policy-gated worktree lifecycle inside a dedicated nested
+        // sandbox so sibling worktree directories (`../{{ repo }}.{{ branch }}`)
+        // stay inside `wt_sandbox` and never leak into `/tmp`.
+        let wt_sandbox = tempfile::tempdir().expect("tempdir");
+        let wt_repo_dir = wt_sandbox.path().join("wt-schema-repo");
+        std::fs::create_dir_all(wt_repo_dir.join("node_modules/pkg")).expect("mkdir node_modules");
+        std::fs::create_dir_all(wt_repo_dir.join("src")).expect("mkdir src");
+        std::fs::write(wt_repo_dir.join(".gitignore"), "node_modules/\ntarget/\n")
+            .expect("write gitignore");
+        std::fs::write(wt_repo_dir.join("README.md"), "# schema probe\n").expect("write readme");
+        std::fs::write(wt_repo_dir.join("src/lib.rs"), "pub fn probe() {}\n").expect("write src");
+        std::fs::write(
+            wt_repo_dir.join("node_modules/pkg/index.js"),
+            b"module.exports = 1;\n",
+        )
+        .expect("write cached module");
+        let wt_repo = wt_repo_dir.to_string_lossy().into_owned();
+        git(&["init", "-q", "-b", "main", &wt_repo]);
+        git(&["-C", &wt_repo, "config", "user.name", "Schema Probe"]);
+        git(&["-C", &wt_repo, "config", "user.email", "probe@example.com"]);
+        git(&["-C", &wt_repo, "add", ".gitignore", "README.md", "src/lib.rs"]);
+        git(&[
+            "-C",
+            &wt_repo,
+            "-c",
+            "user.name=Schema Probe",
+            "-c",
+            "user.email=probe@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        crate::test_support::trust_repo(&wt_repo_dir);
+
+        let created_merge = call_writer(
+            "gitpulse_worktree_create",
+            json!({
+                "repo_path": wt_repo,
+                "branch": "feat/schema-merge",
+                "share_cache": false
+            }),
+            &mut validated,
+        )
+        .expect("gitpulse_worktree_create succeeds");
+        let wt_merge_path = created_merge["worktree_path"]
+            .as_str()
+            .expect("worktree_path string")
+            .to_string();
+        call_writer(
+            "gitpulse_worktree_switch",
+            json!({ "repo_path": wt_repo, "branch": "feat/schema-merge" }),
+            &mut validated,
+        );
+        call_writer(
+            "gitpulse_worktree_isolate",
+            json!({ "repo_path": wt_repo, "worktree_path": wt_merge_path }),
+            &mut validated,
+        );
+        std::fs::write(
+            std::path::Path::new(&wt_merge_path).join("feature.txt"),
+            "agent lane output\n",
+        )
+        .expect("write feature");
+        call_writer(
+            "gitpulse_worktree_overlay_sync",
+            json!({ "repo_path": wt_repo, "worktree_path": wt_merge_path }),
+            &mut validated,
+        );
+        call_writer(
+            "gitpulse_worktree_claim",
+            json!({
+                "repo_path": wt_repo,
+                "agent_id": "agent-alpha",
+                "branch": "main",
+                "claimed_files": ["src/lib.rs"],
+                "claimed_symbols": ["probe"]
+            }),
+            &mut validated,
+        );
+        call_writer(
+            "gitpulse_worktree_claim",
+            json!({
+                "repo_path": wt_repo,
+                "agent_id": "agent-beta",
+                "branch": "main",
+                "claimed_files": ["src/lib.rs"]
+            }),
+            &mut validated,
+        );
+        call_writer(
+            "gitpulse_worktree_claim",
+            json!({
+                "repo_path": wt_repo,
+                "agent_id": "agent-ephemeral",
+                "branch": "feat/schema-merge",
+                "worktree_path": wt_merge_path
+            }),
+            &mut validated,
+        );
+        call_writer(
+            "gitpulse_worktree_release",
+            json!({
+                "repo_path": wt_repo,
+                "agent_id": "agent-ephemeral"
+            }),
+            &mut validated,
+        );
+        call_writer(
+            "gitpulse_worktree_send_message",
+            json!({
+                "repo_path": wt_repo,
+                "from_agent": "agent-alpha",
+                "to_agent": "agent-beta",
+                "kind": "conflict_warning",
+                "body": "Both lanes claimed src/lib.rs; coordinating edit order",
+                "branch": "main"
+            }),
+            &mut validated,
+        );
+        git(&["-C", &wt_merge_path, "add", "feature.txt"]);
+        git(&[
+            "-C",
+            &wt_merge_path,
+            "-c",
+            "user.name=Schema Probe",
+            "-c",
+            "user.email=probe@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "feat: schema merge lane",
+        ]);
+        call_writer(
+            "gitpulse_worktree_merge",
+            json!({
+                "repo_path": wt_repo,
+                "source_branch": "feat/schema-merge",
+                "target_branch": "main",
+                "squash": true,
+                "remove_worktree": true
+            }),
+            &mut validated,
+        );
+        call_writer(
+            "gitpulse_worktree_create",
+            json!({
+                "repo_path": wt_repo,
+                "branch": "feat/schema-prune",
+                "sparse_paths": ["src"],
+                "share_cache": false
+            }),
+            &mut validated,
+        );
+        call_writer(
+            "gitpulse_worktree_prune",
+            json!({
+                "repo_path": wt_repo,
+                "dry_run": false,
+                "reap_processes": false
+            }),
+            &mut validated,
+        );
+
+        // And the readers that depend on those tasks or agent lanes existing.
         for name in ["gitpulse_list_tasks", "gitpulse_get_task"] {
             let tool = tools()
                 .into_iter()
@@ -4144,6 +5361,20 @@ mod tests {
             check(
                 name,
                 "the task-board lifecycle",
+                &tool["outputSchema"],
+                handle_tool_call(name, &arguments),
+                &mut validated,
+            );
+        }
+        for name in ["gitpulse_worktree_inbox", "gitpulse_worktree_radar"] {
+            let tool = tools()
+                .into_iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            let arguments = json!({ "repo_path": wt_repo });
+            check(
+                name,
+                "the worktree coordination lifecycle",
                 &tool["outputSchema"],
                 handle_tool_call(name, &arguments),
                 &mut validated,
@@ -5926,6 +7157,59 @@ mod tests {
     }
 
     #[test]
+    fn worktree_writes_are_refused_for_an_untrusted_repository() {
+        let (_dir, _profile, repo) = task_fixture();
+        for (name, args) in [
+            (
+                "gitpulse_worktree_create",
+                json!({ "repo_path": repo, "branch": "feat/untrusted" }),
+            ),
+            (
+                "gitpulse_worktree_switch",
+                json!({ "repo_path": repo, "branch": "feat/untrusted", "create_if_missing": true }),
+            ),
+            (
+                "gitpulse_worktree_isolate",
+                json!({ "repo_path": repo, "worktree_path": repo }),
+            ),
+            (
+                "gitpulse_worktree_prune",
+                json!({ "repo_path": repo, "dry_run": false }),
+            ),
+            (
+                "gitpulse_worktree_merge",
+                json!({ "repo_path": repo, "source_branch": "feat/untrusted" }),
+            ),
+            (
+                "gitpulse_worktree_claim",
+                json!({ "repo_path": repo, "agent_id": "agent-untrusted", "branch": "feat/untrusted" }),
+            ),
+            (
+                "gitpulse_worktree_release",
+                json!({ "repo_path": repo, "agent_id": "agent-untrusted" }),
+            ),
+            (
+                "gitpulse_worktree_send_message",
+                json!({ "repo_path": repo, "from_agent": "agent-untrusted", "body": "probe" }),
+            ),
+            (
+                "gitpulse_worktree_overlay_sync",
+                json!({ "repo_path": repo }),
+            ),
+        ] {
+            let (error, message) = tool_json(name, args);
+            assert!(
+                error
+                    && message
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains(crate::repository_trust::REQUIRED),
+                "{name} did not refuse untrusted repository: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn reads_of_a_machine_with_no_board_create_nothing() {
         let (_dir, profile, repo) = task_fixture();
         let (error, listed) = tool_json("gitpulse_list_tasks", json!({ "repo_path": repo }));
@@ -6768,6 +8052,17 @@ mod tests {
             ("gitpulse_complete_task", CompleteTaskArgs),
             ("gitpulse_delete_task", DeleteTaskArgs),
             ("gitpulse_merge_tasks", MergeTasksArgs),
+            ("gitpulse_worktree_create", WorktreeCreateArgs),
+            ("gitpulse_worktree_switch", WorktreeSwitchArgs),
+            ("gitpulse_worktree_isolate", WorktreeIsolateArgs),
+            ("gitpulse_worktree_prune", WorktreePruneArgs),
+            ("gitpulse_worktree_merge", WorktreeMergeArgs),
+            ("gitpulse_worktree_claim", WorktreeClaimArgs),
+            ("gitpulse_worktree_release", WorktreeReleaseArgs),
+            ("gitpulse_worktree_send_message", WorktreeSendMessageArgs),
+            ("gitpulse_worktree_inbox", WorktreeInboxArgs),
+            ("gitpulse_worktree_radar", RepoArgs),
+            ("gitpulse_worktree_overlay_sync", WorktreeOverlaySyncArgs),
             ("gitpulse_codeintel_search", SearchArgs),
             ("gitpulse_codeintel_impact", CodeintelImpactArgs),
             ("gitpulse_codeintel_dependencies", CodeintelDependenciesArgs),
@@ -6870,6 +8165,17 @@ mod tests {
                 ("gitpulse_complete_task", CompleteTaskArgs),
                 ("gitpulse_delete_task", DeleteTaskArgs),
                 ("gitpulse_merge_tasks", MergeTasksArgs),
+                ("gitpulse_worktree_create", WorktreeCreateArgs),
+                ("gitpulse_worktree_switch", WorktreeSwitchArgs),
+                ("gitpulse_worktree_isolate", WorktreeIsolateArgs),
+                ("gitpulse_worktree_prune", WorktreePruneArgs),
+                ("gitpulse_worktree_merge", WorktreeMergeArgs),
+                ("gitpulse_worktree_claim", WorktreeClaimArgs),
+                ("gitpulse_worktree_release", WorktreeReleaseArgs),
+                ("gitpulse_worktree_send_message", WorktreeSendMessageArgs),
+                ("gitpulse_worktree_inbox", WorktreeInboxArgs),
+                ("gitpulse_worktree_radar", RepoArgs),
+                ("gitpulse_worktree_overlay_sync", WorktreeOverlaySyncArgs),
                 ("gitpulse_codeintel_search", SearchArgs),
                 ("gitpulse_codeintel_impact", CodeintelImpactArgs),
                 ("gitpulse_codeintel_dependencies", CodeintelDependenciesArgs),
@@ -7689,6 +8995,196 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn worktree_agent_bus_radar_and_overlay_sync_coordinate_parallel_lanes_over_mcp() {
+        let sandbox = tempfile::tempdir().expect("sandbox");
+        let anchor_dir = sandbox.path().join("coord-repo");
+        std::fs::create_dir_all(anchor_dir.join("src")).expect("mkdir src");
+        std::fs::write(anchor_dir.join("src/auth.rs"), "pub fn verify() -> bool { true }\n")
+            .expect("write auth.rs");
+        let anchor = anchor_dir.to_string_lossy().into_owned();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .output_locked()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main", &anchor]);
+        git(&["-C", &anchor, "add", "src/auth.rs"]);
+        git(&[
+            "-C",
+            &anchor,
+            "-c",
+            "user.name=Coord Test",
+            "-c",
+            "user.email=coord@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        crate::test_support::trust_repo(&anchor_dir);
+
+        // Create a zero-copy sparse sibling worktree via MCP.
+        let (err, wt_created) = tool_json(
+            "gitpulse_worktree_create",
+            json!({
+                "repo_path": anchor,
+                "branch": "feat/auth-lane",
+                "sparse_paths": ["src"],
+                "zero_copy": true,
+                "share_cache": false
+            }),
+        );
+        assert!(!err, "create failed: {wt_created}");
+        let wt_path = wt_created["worktree_path"].as_str().unwrap().to_string();
+
+        // Claim lane A on the sibling worktree, then claim overlapping path on lane B.
+        let (err, claim_a) = tool_json(
+            "gitpulse_worktree_claim",
+            json!({
+                "repo_path": anchor,
+                "agent_id": "lane-a",
+                "branch": "feat/auth-lane",
+                "worktree_path": wt_path,
+                "sparse_cone": ["src"],
+                "claimed_files": ["src/auth.rs"],
+                "claimed_symbols": ["verify"]
+            }),
+        );
+        assert!(!err, "claim_a failed: {claim_a}");
+        assert_eq!(claim_a["claim_conflicts"].as_array().unwrap().len(), 0);
+
+        let (err, claim_b) = tool_json(
+            "gitpulse_worktree_claim",
+            json!({
+                "repo_path": anchor,
+                "agent_id": "lane-b",
+                "branch": "main",
+                "claimed_files": ["src"],
+                "claimed_symbols": ["verify"]
+            }),
+        );
+        assert!(!err, "claim_b failed: {claim_b}");
+        let conflicts = claim_b["claim_conflicts"].as_array().unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0]["overlapping_files"], json!(["src/auth.rs"]));
+        assert_eq!(conflicts[0]["overlapping_symbols"], json!(["verify"]));
+
+        // Reject claiming or syncing an unrelated directory outside the worktree family.
+        let outsider = tempfile::tempdir().expect("outsider");
+        let (err, bad_sync) = tool_json(
+            "gitpulse_worktree_overlay_sync",
+            json!({
+                "repo_path": anchor,
+                "worktree_path": outsider.path().to_str().unwrap()
+            }),
+        );
+        assert!(err, "expected family boundary rejection, got: {bad_sync}");
+
+        // Send broadcast + direct messages and verify inbox filtering and limit/has_more pagination.
+        let (err, m1) = tool_json(
+            "gitpulse_worktree_send_message",
+            json!({
+                "repo_path": anchor,
+                "from_agent": "lane-a",
+                "kind": "broadcast",
+                "body": "Starting auth refactor",
+                "branch": "feat/auth-lane"
+            }),
+        );
+        assert!(!err && m1["message"]["seq"] == 1, "{m1}");
+        let (err, m2) = tool_json(
+            "gitpulse_worktree_send_message",
+            json!({
+                "repo_path": anchor,
+                "from_agent": "lane-b",
+                "to_agent": "lane-c",
+                "body": "Private note for lane-c"
+            }),
+        );
+        assert!(!err && m2["message"]["seq"] == 2, "{m2}");
+        let (err, m3) = tool_json(
+            "gitpulse_worktree_send_message",
+            json!({
+                "repo_path": anchor,
+                "from_agent": "lane-b",
+                "to_agent": "lane-a",
+                "kind": "handoff",
+                "body": "Yielding src/auth.rs to lane-a"
+            }),
+        );
+        assert!(!err && m3["message"]["seq"] == 3, "{m3}");
+
+        // Lane A sees broadcast (seq 1) and direct message to lane-a (seq 3), NOT private message to lane-c (seq 2).
+        let (err, inbox_page1) = tool_json(
+            "gitpulse_worktree_inbox",
+            json!({
+                "repo_path": anchor,
+                "agent_id": "lane-a",
+                "since_seq": 0,
+                "limit": 1
+            }),
+        );
+        assert!(!err, "{inbox_page1}");
+        assert_eq!(inbox_page1["has_more"], true);
+        assert_eq!(inbox_page1["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(inbox_page1["messages"][0]["seq"], 1);
+
+        let (err, inbox_page2) = tool_json(
+            "gitpulse_worktree_inbox",
+            json!({
+                "repo_path": anchor,
+                "agent_id": "lane-a",
+                "since_seq": 1,
+                "limit": 10
+            }),
+        );
+        assert!(!err, "{inbox_page2}");
+        assert_eq!(inbox_page2["has_more"], false);
+        assert_eq!(inbox_page2["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(inbox_page2["messages"][0]["seq"], 3);
+
+        // Dirty file in sibling worktree -> sync overlay -> radar sees registered lanes & claim conflicts.
+        std::fs::write(
+            std::path::Path::new(&wt_path).join("src/auth.rs"),
+            "pub fn verify() -> bool { false }\n",
+        )
+        .expect("modify auth.rs");
+        let (err, synced) = tool_json(
+            "gitpulse_worktree_overlay_sync",
+            json!({
+                "repo_path": anchor,
+                "worktree_path": wt_path
+            }),
+        );
+        assert!(!err, "overlay sync failed: {synced}");
+        assert_eq!(synced["modified_files"], 1);
+
+        let (err, radar) = tool_json("gitpulse_worktree_radar", json!({ "repo_path": anchor }));
+        assert!(!err, "radar failed: {radar}");
+        assert_eq!(radar["lanes_registered"], 2);
+        assert_eq!(radar["claim_conflicts"].as_array().unwrap().len(), 1);
+        assert!(radar["worktrees_scanned"].as_u64().unwrap() >= 2);
+
+        // Release lane-b -> conflict clears.
+        let (err, rel) = tool_json(
+            "gitpulse_worktree_release",
+            json!({ "repo_path": anchor, "agent_id": "lane-b" }),
+        );
+        assert!(!err && rel["released"] == true, "{rel}");
+        let (err, radar_after) =
+            tool_json("gitpulse_worktree_radar", json!({ "repo_path": anchor }));
+        assert!(!err, "{radar_after}");
+        assert_eq!(radar_after["lanes_registered"], 1);
+        assert_eq!(radar_after["claim_conflicts"].as_array().unwrap().len(), 0);
     }
 }
 

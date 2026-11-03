@@ -2300,40 +2300,9 @@ impl Resolver {
             }
         }
 
-        // R4: emission order must not depend on input iteration order.
-        //
-        // Same total order as the tuple form this replaces, evaluated lazily.
-        // Building a tuple constructs every element up front, so all four
-        // `format!` calls ran on *every* comparison even though tuple
-        // comparison short-circuits at the first difference — and the two
-        // costly keys are 5th and 7th, reached only when the four string keys
-        // ahead of them tie. Formatting a `Resolution` also serializes its
-        // whole candidate list. Measured: this sort was 113.5 s of a 130 s
-        // build over ~1.06 M pre-dedup edges.
-        //
-        // `then_with` defers each key until the preceding ones compare equal,
-        // which keeps the ordering identical — verified by an edge-ordinal
-        // digest over a 4,742-file corpus before and after.
-        edges.sort_by(|left, right| {
-            left.source_file
-                .cmp(&right.source_file)
-                .then_with(|| left.source_symbol.cmp(&right.source_symbol))
-                .then_with(|| left.target_file.cmp(&right.target_file))
-                .then_with(|| left.target_symbol.cmp(&right.target_symbol))
-                .then_with(|| {
-                    format!("{:?}", left.edge_kind).cmp(&format!("{:?}", right.edge_kind))
-                })
-                .then_with(|| {
-                    left.confidence
-                        .0
-                        .to_bits()
-                        .cmp(&right.confidence.0.to_bits())
-                })
-                .then_with(|| {
-                    format!("{:?}", left.resolution).cmp(&format!("{:?}", right.resolution))
-                })
-                .then_with(|| left.details.cmp(&right.details))
-        });
+        // R4: emission order must not depend on input iteration order. See
+        // `edge_order` for the comparator and why the sort must stay stable.
+        sort_edges(&mut edges);
         edges.dedup_by(|left, right| {
             left.source_file == right.source_file
                 && left.source_symbol == right.source_symbol
@@ -2346,13 +2315,7 @@ impl Resolver {
         });
 
         // R4: emission order must not depend on input iteration order.
-        unresolved.sort_by(|left, right| {
-            (&left.source_file, &left.source_symbol, &left.callee_name).cmp(&(
-                &right.source_file,
-                &right.source_symbol,
-                &right.callee_name,
-            ))
-        });
+        sort_unresolved(&mut unresolved);
 
         debug_assert!(
             self.dangling_swift_targets(&edges).is_empty(),
@@ -2366,4 +2329,67 @@ impl Resolver {
             unresolved,
         })
     }
+}
+
+/// Sorts `resolve_pass`'s edges into emission order. The one call production
+/// makes, so the tests in `parallel_sort_tests` exercise it rather than a copy:
+/// a switch to an unstable sort here is what they catch.
+pub(super) fn sort_edges(edges: &mut [ResolvedEdge]) {
+    edges.par_sort_by(edge_order);
+}
+
+/// Sorts `resolve_pass`'s unresolved ledger into emission order; see
+/// [`sort_edges`].
+pub(super) fn sort_unresolved(unresolved: &mut [UnresolvedReference]) {
+    unresolved.par_sort_by(unresolved_order);
+}
+
+/// The emission order of `resolve_pass`'s edges (R4).
+///
+/// Named so the tie-order pin in `parallel_sort_tests` sorts with the very function
+/// production does. The caller uses `par_sort_by`, which is a *stable* merge
+/// sort, so rows this comparator calls equal keep their input order exactly as
+/// `sort_by` kept them; never switch the caller to an unstable sort.
+///
+/// Same total order as the tuple form this replaces, evaluated lazily.
+/// Building a tuple constructs every element up front, so all four `format!`
+/// calls ran on *every* comparison even though tuple comparison short-circuits
+/// at the first difference — and the two costly keys are 5th and 7th, reached
+/// only when the four string keys ahead of them tie. Formatting a `Resolution`
+/// also serializes its whole candidate list. Measured: this sort was 113.5 s of
+/// a 130 s build over ~1.06 M pre-dedup edges. `then_with` defers each key
+/// until the preceding ones compare equal, which keeps the ordering identical
+/// — verified by an edge-ordinal digest over a 4,742-file corpus before and
+/// after.
+pub(super) fn edge_order(left: &ResolvedEdge, right: &ResolvedEdge) -> std::cmp::Ordering {
+    left.source_file
+        .cmp(&right.source_file)
+        .then_with(|| left.source_symbol.cmp(&right.source_symbol))
+        .then_with(|| left.target_file.cmp(&right.target_file))
+        .then_with(|| left.target_symbol.cmp(&right.target_symbol))
+        .then_with(|| format!("{:?}", left.edge_kind).cmp(&format!("{:?}", right.edge_kind)))
+        .then_with(|| {
+            left.confidence
+                .0
+                .to_bits()
+                .cmp(&right.confidence.0.to_bits())
+        })
+        .then_with(|| format!("{:?}", left.resolution).cmp(&format!("{:?}", right.resolution)))
+        .then_with(|| left.details.cmp(&right.details))
+}
+
+/// The emission order of `resolve_pass`'s unresolved ledger (R4).
+///
+/// Deliberately not total: rows equal on `(source_file, source_symbol,
+/// callee_name)` but differing in kind, receiver or reason tie, and their
+/// relative order is output. That is why the caller must stay on a stable sort.
+pub(super) fn unresolved_order(
+    left: &UnresolvedReference,
+    right: &UnresolvedReference,
+) -> std::cmp::Ordering {
+    (&left.source_file, &left.source_symbol, &left.callee_name).cmp(&(
+        &right.source_file,
+        &right.source_symbol,
+        &right.callee_name,
+    ))
 }

@@ -3729,7 +3729,7 @@ fn has_legacy_remotes(repo: &Path) -> bool {
 /// everything `list_branches`, `list_tags`, `branch_stats` and the graph's
 /// default-branch label each derived on their own.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DefaultBase {
+pub struct DefaultBase {
     pub remote: String,
     pub remote_head: Option<String>,
     /// (short name, commit oid), or `None` when no candidate resolves.
@@ -3745,7 +3745,7 @@ impl DefaultBase {
     /// The answer, or the reason it is not one. A missing default branch read
     /// through a refusal used to render as a repository with no default
     /// branch; with the reason, a deferral is retried instead.
-    pub(crate) fn checked(self) -> Result<Self, CommandError> {
+    pub fn checked(self) -> Result<Self, CommandError> {
         match self.incomplete {
             Some(reason) => Err(reason),
             None => Ok(self),
@@ -3943,7 +3943,7 @@ pub(crate) fn default_base(repo: &Path) -> DefaultBase {
 /// Uncached all the way down: the config listing and HEAD are read from git
 /// here too, not through [`ref_cache`], whose stamp cannot see an
 /// `include.path` file.
-pub(crate) fn compute_default_base(repo: &Path) -> DefaultBase {
+pub fn compute_default_base(repo: &Path) -> DefaultBase {
     compute_default_base_with(repo, Reads::Fresh)
 }
 

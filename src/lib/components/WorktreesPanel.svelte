@@ -66,6 +66,8 @@
   let newBranch = $state("");
   let startPoint = $state("");
   let cowCaches = $state(true);
+  let zeroCopyDevmap = $state(true);
+  let sparsePathsInput = $state("");
   // Repository hooks run shell commands from a file the working tree
   // controls, so they are off until asked for and, even then, run only when the
   // exact file text was approved here.
@@ -196,6 +198,8 @@
       newBranch = "";
       startPoint = "";
       cowCaches = true;
+      zeroCopyDevmap = true;
+      sparsePathsInput = "";
       // The hooks consent belongs to the repository it was read for: a ticked
       // box and a preview of that repository's `.gitpulse/hooks` must not be
       // offered for approval under the next one.
@@ -401,13 +405,26 @@
     const targetPath = newPath.trim();
     const branch = newBranch.trim();
     const base = startPoint.trim();
+    const sparsePaths = sparsePathsInput
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
     if (!target || !targetPath) return;
     const epoch = tabScope.epoch;
     isCreating = true;
     error = null;
     try {
       const outcome = await repoStore.addWorktree(
-        { targetPath, newBranch: branch || null, startPoint: base || null, detach: !branch, cowCaches, runHooks },
+        {
+          targetPath,
+          newBranch: branch || null,
+          startPoint: base || null,
+          detach: !branch,
+          cowCaches,
+          runHooks,
+          zeroCopyDevmap,
+          sparsePaths: sparsePaths.length > 0 ? sparsePaths : null,
+        },
         target,
         true,
       );
@@ -419,6 +436,7 @@
       newPath = "";
       newBranch = "";
       startPoint = "";
+      sparsePathsInput = "";
       showAddForm = false;
       await load();
     } finally {
@@ -697,9 +715,19 @@
           class="flex-1 min-w-0 bg-surface border border-border/80 rounded-full px-2.5 py-1 font-mono text-[10px] text-textPrimary focus:outline-hidden focus:border-accent/60 transition-colors"
         />
       </div>
+      <input
+        bind:value={sparsePathsInput}
+        placeholder="sparse paths, comma-separated (optional, e.g. src/auth)"
+        aria-label="Sparse checkout paths"
+        class="w-full bg-surface border border-border/80 rounded-full px-2.5 py-1 font-mono text-[10px] text-textPrimary focus:outline-hidden focus:border-accent/60 transition-colors"
+      />
       <label class="flex items-center gap-1.5 text-[9px] text-textMuted cursor-pointer select-none">
         <input type="checkbox" bind:checked={cowCaches} class="rounded border-border text-accent focus:ring-accent" />
         <span>Share build caches (reflink / clonefile)</span>
+      </label>
+      <label class="flex items-center gap-1.5 text-[9px] text-textMuted cursor-pointer select-none">
+        <input type="checkbox" bind:checked={zeroCopyDevmap} class="rounded border-border text-accent focus:ring-accent" />
+        <span>Zero-copy DevMap graph (shared base pointer)</span>
       </label>
       <label class="flex items-center gap-1.5 text-[9px] text-textMuted cursor-pointer select-none">
         <input

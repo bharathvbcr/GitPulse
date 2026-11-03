@@ -46,30 +46,6 @@ const FTS_50_SQL: &str = concat!(
     "(?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?)"
 );
 
-#[cfg(feature = "parse")]
-const UNRESOLVED_CHUNK_SIZE: usize = 64;
-
-#[cfg(feature = "parse")]
-const UNRESOLVED_64_SQL: &str = concat!(
-    "INSERT INTO unresolved_rows (source_file_id, source_symbol, callee_name, reason_id, classification_id, receiver, valid_from, valid_to) VALUES ",
-    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
-    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
-    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
-    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
-    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
-    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
-    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
-    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
-    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
-    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
-    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
-    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
-    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
-    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
-    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), ",
-    "(?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL), (?, ?, ?, ?, ?, ?, ?, NULL)"
-);
-
 /// How many extractions may be handed to the serializer threads, per thread,
 /// ahead of the one being inserted. The window of a write is this times the
 /// threads it started.
@@ -1974,17 +1950,18 @@ impl Store {
             // in once and only genuinely new texts are inserted. On this
             // repository that is 46,978 rows read and, on an incremental build,
             // a handful written.
-            let mut text_ids: std::collections::HashMap<std::rc::Rc<str>, i64> = {
-                let mut stmt = tx.prepare("SELECT id, text FROM unresolved_texts")?;
-                let mut rows = stmt.query([])?;
-                let mut pool = std::collections::HashMap::new();
-                while let Some(row) = rows.next()? {
-                    let id: i64 = row.get(0)?;
-                    let text: String = row.get(1)?;
-                    pool.insert(std::rc::Rc::from(text.as_str()), id);
-                }
-                pool
-            };
+            //
+            // The pool is streamed against the slot map built below, and is
+            // not first copied into a map of its own. It used to be: every
+            // pool row became an owned `String`, an `Rc<str>` and a hash
+            // entry, 140,380 of them on the GitPulse corpus, to answer a
+            // question the slot map can answer from the borrowed row text.
+            // Measured on that corpus (N=5, interleaved, same-binary noise
+            // arm, two independent runs) streaming made the incremental
+            // `unresolved` span faster in 9 of 10 paired reps, by about
+            // 17-20% at the median (0.65-0.70 s against 0.77-0.87 s). The
+            // gap in the minimum is not resolvable: one quiet-host run of the
+            // noise arm landed below both.
 
             // Per-row ids, in `resolution.unresolved` order.
             //
@@ -2005,8 +1982,13 @@ impl Store {
             //
             // `Rc<str>` so a distinct text is stored once and the map's key is a
             // refcount bump rather than a second copy.
+            //
+            // Sized at a quarter of the rows as a hint only (140,380 distinct
+            // texts over 605,844 rows on the GitPulse corpus), so the map does
+            // not rehash its way up from empty; a corpus with more distinct
+            // texts than that still grows normally.
             let mut slot_of_text: std::collections::HashMap<std::rc::Rc<str>, u32> =
-                std::collections::HashMap::new();
+                std::collections::HashMap::with_capacity(resolution.unresolved.len() / 4);
             let mut slot_text: Vec<std::rc::Rc<str>> = Vec::new();
             let mut reason_slots: Vec<u32> = Vec::with_capacity(resolution.unresolved.len());
             let mut class_slots: Vec<u32> = Vec::with_capacity(resolution.unresolved.len());
@@ -2096,11 +2078,25 @@ impl Store {
                 }
             }
 
-            // The slots the pool does not hold yet, inserted in sorted order.
-            let mut slot_ids: Vec<i64> = vec![0; slot_text.len()];
+            // The persisted pool answers for every slot it already holds; the
+            // rest are inserted in sorted order. No `unresolved_texts` row is
+            // written between the slotting above and this point, so reading the
+            // pool here sees what it saw when it was read first.
+            const UNASSIGNED: i64 = i64::MIN;
+            let mut slot_ids: Vec<i64> = vec![UNASSIGNED; slot_text.len()];
+            {
+                let mut stmt = tx.prepare("SELECT id, text FROM unresolved_texts")?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let text = row.get_ref(1)?.as_str()?;
+                    if let Some(slot) = slot_of_text.get(text) {
+                        slot_ids[*slot as usize] = row.get(0)?;
+                    }
+                }
+            }
             {
                 let mut fresh: Vec<u32> = (0..slot_text.len() as u32)
-                    .filter(|slot| !text_ids.contains_key(&slot_text[*slot as usize]))
+                    .filter(|slot| slot_ids[*slot as usize] == UNASSIGNED)
                     .collect();
                 fresh.sort_unstable_by(|left, right| {
                     slot_text[*left as usize].cmp(&slot_text[*right as usize])
@@ -2108,15 +2104,14 @@ impl Store {
                 let mut insert =
                     tx.prepare_cached("INSERT INTO unresolved_texts (text) VALUES (?1)")?;
                 for slot in fresh {
-                    let text = std::rc::Rc::clone(&slot_text[slot as usize]);
-                    insert.execute(params![text.as_ref()])?;
-                    text_ids.insert(text, tx.last_insert_rowid());
+                    insert.execute(params![slot_text[slot as usize].as_ref()])?;
+                    slot_ids[slot as usize] = tx.last_insert_rowid();
                 }
             }
-            for (slot, text) in slot_text.iter().enumerate() {
-                slot_ids[slot] = *text_ids.get(text).ok_or_else(|| {
-                    refusal("an interned ledger text has no id after its own insert")
-                })?;
+            if slot_ids.contains(&UNASSIGNED) {
+                return Err(refusal(
+                    "an interned ledger text has no id after its own insert",
+                ));
             }
             let reason_ids: Vec<i64> = reason_slots
                 .iter()
@@ -2297,53 +2292,52 @@ impl Store {
             // no error — and the varying-arity remainder statement is a new
             // cache key every build, evicting one of the sixteen slots
             // rusqlite's LRU has and this write already fills eleven of.
-            // Dual-statement chunked batching: fixed 64-row chunks for bulk insertion,
-            // with a single-row cached statement for the remainder (< 64). Exactly two
-            // statements in prepare_cached, preventing LRU cache eviction.
-            let mut chunk: Vec<usize> = Vec::with_capacity(UNRESOLVED_CHUNK_SIZE);
+            //
+            // Measured a second time at the size that matters, because the
+            // self-build's 180,679 rows are a third of a large repository's
+            // ledger. A 64-row `INSERT ... VALUES (...), (...)` chunk was
+            // restored for a while (ce71cae2) and A/B'd against this loop on
+            // the frozen GitPulse corpus (605,844 unresolved rows), a build
+            // of one commit with the chunk path switched off at runtime,
+            // interleaved, N=5, with a same-binary noise arm:
+            //
+            //   cold `unresolved` span, min / median  chunked 3.726 / 4.097 s
+            //                                         same binary again 3.762 / 3.896 s
+            //                                         single-row   2.574 / 2.894 s
+            //
+            // Single-row was faster than chunked in 5 of 5 paired reps, by
+            // 23-38% (ratios 0.77 0.69 0.70 0.70 0.62). The noise floor is the
+            // two chunked arms against each other: 1% apart on the minimum,
+            // and up to 17% apart in a single paired rep (0.83-1.03), so the
+            // worst single-row rep still beats the best noise rep. Whole cold
+            // `persist:write` min was 4.94 s against 6.50 s and 6.44 s. The
+            // mechanism is inferred, not measured: a 64-row statement binds
+            // 448 parameters through a `Vec<&dyn ToSql>` and an intermediate
+            // tuple vector per chunk, and an earlier sampling profile (not
+            // re-run) put 44% of the main thread's cold samples in the
+            // chunked `sqlite3_step`. Batching
+            // is neutral on a small table and a loss on a large one, and the
+            // loop below stays one row per execute.
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO unresolved_rows
+                 (source_file_id, source_symbol, callee_name, reason_id, classification_id,
+                  receiver, valid_from, valid_to)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+            )?;
             for (index, still_valid) in ledger_matched.iter().enumerate() {
                 if *still_valid {
                     continue;
                 }
-                chunk.push(index);
-                if chunk.len() == UNRESOLVED_CHUNK_SIZE {
-                    let tuples: Vec<UnresolvedTuple<'_>> =
-                        chunk.iter().map(|&idx| unresolved_tuple(idx)).collect();
-                    let mut params_vec: Vec<&dyn ToSql> =
-                        Vec::with_capacity(UNRESOLVED_CHUNK_SIZE * 7);
-                    for tuple in &tuples {
-                        params_vec.push(&tuple.source_file_id);
-                        params_vec.push(&tuple.source_symbol);
-                        params_vec.push(&tuple.callee_name);
-                        params_vec.push(&tuple.reason_id);
-                        params_vec.push(&tuple.classification_id);
-                        params_vec.push(&tuple.receiver);
-                        params_vec.push(&gen_id);
-                    }
-                    tx.prepare_cached(UNRESOLVED_64_SQL)?
-                        .execute(params_from_iter(params_vec.iter()))?;
-                    chunk.clear();
-                }
-            }
-            if !chunk.is_empty() {
-                let mut insert = tx.prepare_cached(
-                    "INSERT INTO unresolved_rows
-                     (source_file_id, source_symbol, callee_name, reason_id, classification_id,
-                      receiver, valid_from, valid_to)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
-                )?;
-                for index in chunk {
-                    let tuple = unresolved_tuple(index);
-                    insert.execute(params![
-                        tuple.source_file_id,
-                        tuple.source_symbol.as_ref(),
-                        tuple.callee_name.as_ref(),
-                        tuple.reason_id,
-                        tuple.classification_id,
-                        tuple.receiver.as_deref(),
-                        gen_id,
-                    ])?;
-                }
+                let tuple = unresolved_tuple(index);
+                insert.execute(params![
+                    tuple.source_file_id,
+                    tuple.source_symbol.as_ref(),
+                    tuple.callee_name.as_ref(),
+                    tuple.reason_id,
+                    tuple.classification_id,
+                    tuple.receiver.as_deref(),
+                    gen_id,
+                ])?;
             }
         }
 
@@ -2549,7 +2543,8 @@ impl Store {
                 let mut count = 0i64;
                 for row in rows {
                     let (path, parse_json, engine_json) = row?;
-                    let (outcome, engine) = decode_stored_outcome(&path, &parse_json, &engine_json)?;
+                    let (outcome, engine) =
+                        decode_stored_outcome(&path, &parse_json, &engine_json)?;
                     if stored_is_parse_failure(&outcome, &engine) {
                         count += 1;
                     }

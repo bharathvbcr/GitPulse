@@ -16,12 +16,15 @@ serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = { version = "1.0" }
 anyhow = { version = "1.0" }
 rayon = { version = "1.10" }
+libc = { version = "0.2" }
 # Stored extraction documents (schema 29). Pinned exactly, and to a release at
-# least two weeks old when it was chosen (0.14.0, 2026-09-04; 0.14.3 was 13 days
-# old on 2026-10-29). No default features: `legacy` (old-format frames) and
-# `zdict_builder` (dictionary training) are not used -- the store writes and
-# reads its own frames only, with no dictionary.
-zstd = { version = "=0.14.0", default-features = false }
+# least two weeks old when it was chosen: 0.14.3 (published 2026-10-16, chosen
+# 2026-11-02), which with zstd-safe 8.2.0 and zstd-sys 2.1.2 carries the fixes
+# for RUSTSEC-2026-0391, -0395 to -0406 and -0410 that 0.14.0 lacked. No
+# default features: `legacy` (old-format frames) and `zdict_builder`
+# (dictionary training) are not used -- the store writes and reads its own
+# frames only, with no dictionary.
+zstd = { version = "=0.14.3", default-features = false }
 
 [package.metadata.dist]
 # hold_uncommitted_child is a test helper. cargo-dist announced it as a
@@ -60,6 +63,10 @@ required-features = ["parse"]
 # those moved to a `*_without_grammars` target, which is not gated.
 [[test]]
 name = "adversarial_store"
+required-features = ["parse"]
+
+[[test]]
+name = "adversarial_storage_batching_stress"
 required-features = ["parse"]
 
 [[test]]

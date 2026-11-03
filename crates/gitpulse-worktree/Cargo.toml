@@ -1,0 +1,55 @@
+[package]
+name = "gitpulse-worktree"
+version = "1.5.0"
+edition = "2021"
+description = "Standalone worktree & branch orchestrator and DevMap delta overlay compiler for parallel agentic lanes"
+license = "MIT"
+
+[lib]
+name = "gitpulse_worktree"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gitpulse-worktree"
+path = "src/main.rs"
+
+[[bin]]
+name = "gitpulse-rustc"
+path = "src/bin/gitpulse-rustc.rs"
+
+[dependencies]
+gitpulse = { path = "../../src-tauri" }
+devmap-query = { path = "../../src-tauri/vendored/devmap-query", default-features = false }
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+devmap-store = { path = "../../src-tauri/vendored/devmap-store", default-features = false }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+tempfile = "3.27"
+
+[patch.crates-io]
+tauri-build = { git = "https://github.com/tauri-apps/tauri", rev = "30da1fd6e17de6107ecc850c95dfb16b5729f2dd" }
+tauri-codegen = { git = "https://github.com/tauri-apps/tauri", rev = "30da1fd6e17de6107ecc850c95dfb16b5729f2dd" }
+tauri-macros = { git = "https://github.com/tauri-apps/tauri", rev = "30da1fd6e17de6107ecc850c95dfb16b5729f2dd" }
+tauri-plugin = { git = "https://github.com/tauri-apps/tauri", rev = "30da1fd6e17de6107ecc850c95dfb16b5729f2dd" }
+tauri-utils = { git = "https://github.com/tauri-apps/tauri", rev = "30da1fd6e17de6107ecc850c95dfb16b5729f2dd" }
+libappindicator = { path = "../../src-tauri/framework/libappindicator" }
+libappindicator-sys = { path = "../../src-tauri/framework/libappindicator-sys" }
+muda = { path = "../../src-tauri/framework/muda" }
+notify = { path = "../../src-tauri/framework/notify" }
+tao = { path = "../../src-tauri/framework/tao" }
+tauri = { path = "../../src-tauri/framework/tauri" }
+tauri-runtime = { path = "../../src-tauri/framework/tauri-runtime" }
+tauri-runtime-wry = { path = "../../src-tauri/framework/tauri-runtime-wry" }
+webkit2gtk = { path = "../../src-tauri/framework/webkit2gtk" }
+webkit2gtk-sys = { path = "../../src-tauri/framework/webkit2gtk-sys" }
+wry = { path = "../../src-tauri/framework/wry" }
+
+[patch."https://github.com/tauri-apps/tauri"]
+tauri = { path = "../../src-tauri/framework/tauri" }
+tauri-runtime = { path = "../../src-tauri/framework/tauri-runtime" }
+tauri-runtime-wry = { path = "../../src-tauri/framework/tauri-runtime-wry" }
+
+

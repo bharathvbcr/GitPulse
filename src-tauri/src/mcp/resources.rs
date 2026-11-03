@@ -256,10 +256,16 @@ fn server_document(name: &str) -> Result<Value, ReadError> {
             // while a tool writes. It said `true` after the task-board tools
             // began writing the GitPulse task profile.
             "readOnly": super::tools().iter().all(|tool| tool["annotations"]["readOnlyHint"] == true),
-            // True of `gitpulse_merge_conflicts` and `gitpulse_landed` too: a
+            // True of `gitpulse_merge_conflicts` and `gitpulse_landed` read tools: a
             // merge-tree writes its objects to a quarantined directory that is
-            // deleted afterwards, and the object-store tests hold that.
-            "gitWrites": false,
+            // deleted afterwards. Derived dynamically so the manifest reports
+            // `true` whenever policy-gated `gitpulse_worktree_*` tools are advertised.
+            "gitWrites": super::tools().iter().any(|tool| {
+                tool["annotations"]["readOnlyHint"] != true
+                    && tool["name"]
+                        .as_str()
+                        .is_some_and(|n| n.starts_with("gitpulse_worktree_"))
+            }),
             "writes": super::tools().iter()
                 .filter(|tool| tool["annotations"]["readOnlyHint"] != true)
                 .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
@@ -748,10 +754,11 @@ mod tests {
             parsed["tools"].as_array().unwrap().len(),
             super::super::tools().len()
         );
-        // The task-board tools write the task profile, so the surface is not
-        // read-only; it never writes git, and it names exactly what writes.
+        // The task-board tools write the task profile and the policy-gated
+        // `gitpulse_worktree_*` tools mutate worktrees/branches under
+        // `harness::guard_command`; the manifest names both honestly.
         assert_eq!(parsed["readOnly"], false);
-        assert_eq!(parsed["gitWrites"], false);
+        assert_eq!(parsed["gitWrites"], true);
         assert_eq!(
             parsed["writes"],
             json!([
@@ -759,7 +766,16 @@ mod tests {
                 "gitpulse_import_tasks",
                 "gitpulse_complete_task",
                 "gitpulse_delete_task",
-                "gitpulse_merge_tasks"
+                "gitpulse_merge_tasks",
+                "gitpulse_worktree_create",
+                "gitpulse_worktree_switch",
+                "gitpulse_worktree_isolate",
+                "gitpulse_worktree_prune",
+                "gitpulse_worktree_merge",
+                "gitpulse_worktree_claim",
+                "gitpulse_worktree_release",
+                "gitpulse_worktree_send_message",
+                "gitpulse_worktree_overlay_sync"
             ])
         );
         assert_eq!(

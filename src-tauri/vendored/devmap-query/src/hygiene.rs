@@ -231,9 +231,26 @@ pub fn protected_entry(relative: &Path) -> bool {
         )
 }
 
+/// Audit a list of tracked relative repository paths against hygiene invariants.
+/// Flags any tracked path that belongs to protected artifacts (dependencies,
+/// environments, shared caches, temporary files, logs, credential stores, or secret configs).
+/// Returns a list of violation messages.
+pub fn audit_tracked_hygiene(_repo: &Path, tracked_relative_paths: &[&str]) -> Vec<String> {
+    let mut violations = Vec::new();
+    for path in tracked_relative_paths {
+        let p = Path::new(path);
+        if protected_artifact(path) || protected_entry(p) {
+            violations.push(format!(
+                "Hygiene violation: tracked path '{path}' matches protected artifact or secret pattern"
+            ));
+        }
+    }
+    violations
+}
+
 #[cfg(test)]
 mod boundary_tests {
-    use super::{local_provider, protected_artifact, protected_entry};
+    use super::{audit_tracked_hygiene, local_provider, protected_artifact, protected_entry};
     use std::path::Path;
     #[test]
     fn public_adapter_rejects_non_relative_and_parent_paths_before_probing() {
@@ -266,5 +283,23 @@ mod boundary_tests {
         ] {
             assert!(protected_entry(Path::new(path)), "{path}");
         }
+    }
+    #[test]
+    fn audit_tracked_hygiene_flags_protected_and_secret_artifacts() {
+        let paths = [
+            "src/main.rs",
+            "Cargo.toml",
+            ".env.local",
+            "node_modules/package.json",
+            "keys/id_ed25519",
+            "tests/test.py",
+        ];
+        let violations = audit_tracked_hygiene(Path::new("/repo"), &paths);
+        assert_eq!(violations.len(), 3);
+        assert!(violations.iter().any(|v| v.contains(".env.local")));
+        assert!(violations
+            .iter()
+            .any(|v| v.contains("node_modules/package.json")));
+        assert!(violations.iter().any(|v| v.contains("keys/id_ed25519")));
     }
 }

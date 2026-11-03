@@ -921,4 +921,7 @@ mod import_resolution_tests;
 mod ladder_tests;
 
 #[cfg(test)]
+mod parallel_sort_tests;
+
+#[cfg(test)]
 mod reference_resolution_tests;

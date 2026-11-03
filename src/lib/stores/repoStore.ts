@@ -1275,18 +1275,153 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
    * snapshot's (tip moved ⇒ stale churn must not survive).
    */
   function withCarriedChurn<T extends { branches: BranchInfo[] }>(
+    id: string,
     live: RepoSession,
     snapshot: T,
-  ): T {
-    if (live.branches.length === 0) return snapshot;
+  ): { patch: T; drainVerified: boolean } {
+    if (live.branches.length === 0) return { patch: snapshot, drainVerified: false };
     const key = (b: Pick<BranchInfo, "name" | "is_remote" | "remote_name">) =>
       `${b.is_remote ? "remote" : "local"}:${b.remote_name ?? ""}:${b.name}`;
     const liveByKey = new Map(live.branches.map((b) => [key(b), b]));
+
+    // Only synthesize tip-matched donor churn for newly created or renamed
+    // branches once a background `cmd_branch_stats` pass has actually settled
+    // on `live`; while `statsPending` or `statsFailed` is set, `cmd_list_branches`
+    // placeholders (`0/0/0`) are unmeasured, not zero-diff verdicts.
+    const liveReady = !live.statsPending && !live.statsFailed;
+    const drainedRecord = statsDrained.get(id);
+    const wasCleanlyDrained =
+      liveReady &&
+      !statsInflight.has(id) &&
+      drainedRecord?.signature === branchTipSignature(live.branches);
+    const liveDefault = live.branches.find((b) => !b.is_remote && b.is_default)?.name ?? null;
+    const snapDefault = snapshot.branches.find((b) => !b.is_remote && b.is_default)?.name ?? null;
+    const drainedBase =
+      wasCleanlyDrained && typeof drainedRecord?.comparedTo === "string" && drainedRecord.comparedTo.length > 0
+        ? drainedRecord.comparedTo
+        : undefined;
+    const measuredBase =
+      live.branches.find(
+        (b) => typeof b.compared_to === "string" && b.compared_to.length > 0,
+      )?.compared_to ??
+      drainedBase ??
+      liveDefault;
+    const findNamedRef = (list: BranchInfo[], refName: string) =>
+      list.find((b) => b.name === refName);
+    const liveBase = measuredBase ? findNamedRef(live.branches, measuredBase) : undefined;
+    const snapBase = measuredBase ? findNamedRef(snapshot.branches, measuredBase) : undefined;
+    const baseStable =
+      liveReady &&
+      !!measuredBase &&
+      !!liveBase &&
+      !!snapBase &&
+      liveBase.tip_commit_id === snapBase.tip_commit_id &&
+      liveDefault === snapDefault;
+
+    const liveLocalNames = new Set(
+      live.branches.filter((b) => !b.is_remote).map((b) => b.name),
+    );
+    const snapLocalNames = new Set(
+      snapshot.branches.filter((b) => !b.is_remote).map((b) => b.name),
+    );
+    const strippedRemoteName = (b: BranchInfo) =>
+      b.remote_name && b.name.startsWith(`${b.remote_name}/`)
+        ? b.name.slice(b.remote_name.length + 1)
+        : b.name;
+
+    const donorByTip = new Map<string, BranchInfo>();
+    if (baseStable && measuredBase) {
+      // Local measured branches take priority; `cmd_branch_stats` skips remote
+      // branches shadowed by a local twin (`git_reader.rs:880`), leaving those
+      // shadowed remote entries with unmeasured `0/0/0` placeholders.
+      for (const b of live.branches) {
+        if (
+          !b.is_remote &&
+          b.compared_to === measuredBase &&
+          typeof b.additions === "number" &&
+          !donorByTip.has(b.tip_commit_id)
+        ) {
+          donorByTip.set(b.tip_commit_id, b);
+        }
+      }
+      for (const b of live.branches) {
+        if (
+          b.is_remote &&
+          !liveLocalNames.has(strippedRemoteName(b)) &&
+          b.compared_to === measuredBase &&
+          typeof b.additions === "number" &&
+          !donorByTip.has(b.tip_commit_id)
+        ) {
+          donorByTip.set(b.tip_commit_id, b);
+        }
+      }
+    }
+
+    let allEligibleVerified = wasCleanlyDrained && baseStable;
     const branches = snapshot.branches.map((b) => {
+      const isExempt =
+        (!b.is_remote && b.is_default) ||
+        (!!measuredBase && b.name === measuredBase) ||
+        (b.is_remote && snapLocalNames.has(strippedRemoteName(b)));
+      const newlyUnshadowedRemote =
+        b.is_remote &&
+        liveLocalNames.has(strippedRemoteName(b)) &&
+        !snapLocalNames.has(strippedRemoteName(b));
+
       const carried = liveByKey.get(key(b));
-      return carried && carried.tip_commit_id === b.tip_commit_id ? carried : b;
+      const carriedBaseMoved = (() => {
+        if (!carried?.compared_to) return false;
+        const prevRef = findNamedRef(live.branches, carried.compared_to);
+        const nextRef = findNamedRef(snapshot.branches, carried.compared_to);
+        return !!prevRef && !!nextRef && prevRef.tip_commit_id !== nextRef.tip_commit_id;
+      })();
+      if (
+        carried &&
+        carried.tip_commit_id === b.tip_commit_id &&
+        !newlyUnshadowedRemote &&
+        !carriedBaseMoved
+      ) {
+        return {
+          ...b,
+          additions: carried.additions,
+          deletions: carried.deletions,
+          files_changed: carried.files_changed,
+          commits_ahead_of_base: carried.commits_ahead_of_base,
+          commits_behind_base: carried.commits_behind_base,
+          compared_to: carried.compared_to,
+        };
+      }
+      if (baseStable && measuredBase && snapBase && !isExempt) {
+        const donor = donorByTip.get(b.tip_commit_id);
+        if (donor) {
+          return {
+            ...b,
+            additions: donor.additions,
+            deletions: donor.deletions,
+            files_changed: donor.files_changed,
+            commits_ahead_of_base: donor.commits_ahead_of_base,
+            commits_behind_base: donor.commits_behind_base,
+            compared_to: donor.compared_to,
+          };
+        }
+        if (b.tip_commit_id === snapBase.tip_commit_id) {
+          return {
+            ...b,
+            additions: 0,
+            deletions: 0,
+            files_changed: 0,
+            commits_ahead_of_base: 0,
+            commits_behind_base: 0,
+            compared_to: measuredBase,
+          };
+        }
+      }
+      if (!isExempt) {
+        allEligibleVerified = false;
+      }
+      return b;
     });
-    return { ...snapshot, branches };
+    return { patch: { ...snapshot, branches }, drainVerified: allEligibleVerified };
   }
 
   /**
@@ -1428,6 +1563,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     }
     try {
       let patch: Partial<RepoSession> = {};
+      let drainVerified = false;
       if (facet === "status") {
         const statusData = await loadFileStatusFacet(path);
         if (snapshotRuns.get(id) !== run) return;
@@ -1436,7 +1572,13 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         const branchData = await loadBranchGraphFacet(path);
         if (snapshotRuns.get(id) !== run) return;
         const live = internal.sessions[id];
-        patch = live ? withCarriedChurn(live, branchData) : branchData;
+        if (live) {
+          const carried = withCarriedChurn(id, live, branchData);
+          patch = carried.patch;
+          drainVerified = carried.drainVerified;
+        } else {
+          patch = branchData;
+        }
       } else if (facet === "metadata") {
         const metaData = await loadMetadataFacet(path);
         if (snapshotRuns.get(id) !== run) return;
@@ -1445,7 +1587,13 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         const raw = await loadSnapshot(path);
         if (snapshotRuns.get(id) !== run) return;
         const live = internal.sessions[id];
-        patch = live ? withCarriedChurn(live, raw) : raw;
+        if (live) {
+          const carried = withCarriedChurn(id, live, raw);
+          patch = carried.patch;
+          drainVerified = carried.drainVerified;
+        } else {
+          patch = raw;
+        }
       }
 
       applyToSession(id, generation, {
@@ -1461,7 +1609,20 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       });
 
       if (facet === "all" || facet === "branches") {
-        if (internal.sessions[id]?.generation === generation) {
+        const current = internal.sessions[id];
+        if (current?.generation === generation) {
+          if (drainVerified && !statsInflight.has(id)) {
+            const comparedTo =
+              statsDrained.get(id)?.comparedTo ??
+              current.branches.find(
+                (b) => typeof b.compared_to === "string" && b.compared_to.length > 0,
+              )?.compared_to ??
+              null;
+            statsDrained.set(id, {
+              signature: branchTipSignature(current.branches),
+              comparedTo,
+            });
+          }
           if (facet === "all") {
             sessionBook.hydratedAt.set(id, Date.now());
             contentRevisions.update((revisions) => ({
@@ -1530,7 +1691,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       known &&
       known.generation === generation &&
       !known.statsFailed &&
-      statsDrained.get(id) === branchTipSignature(known.branches)
+      statsDrained.get(id)?.signature === branchTipSignature(known.branches)
     ) {
       return;
     }
@@ -1604,6 +1765,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // must not taint the settle.
       let lastBatchHadFailures = false;
       let drainedCleanly = false;
+      let drainedComparedTo: string | null = null;
       for (let batch = 0; batch < STATS_DRAIN_MAX_BATCHES; batch += 1) {
         const report = await invokeFn<BranchStatsReport>("cmd_branch_stats", {
           repoPath: path,
@@ -1612,6 +1774,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         if (!session || session.generation !== generation) return;
 
         lastBatchHadFailures = report.compute_failures > 0;
+        if (typeof report.compared_to === "string" && report.compared_to.length > 0) {
+          drainedComparedTo = report.compared_to;
+        }
 
         const updates = new Map(
           report.updates.map((update) => [
@@ -1659,7 +1824,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         !lastBatchHadFailures &&
         branchTipSignature(settled.branches) === startSignature
       ) {
-        statsDrained.set(id, startSignature);
+        statsDrained.set(id, {
+          signature: startSignature,
+          comparedTo: drainedComparedTo,
+        });
       } else {
         statsDrained.delete(id);
       }
@@ -2950,12 +3118,12 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           branchName,
           startPoint,
         }),
-        { target },
+        { target, facet: "branches" },
       ),
     renameBranch: async (oldName: string, newName: string, target?: MutationTarget | null) =>
       runMutating("branch-rename", `${oldName} → ${newName}`, (path) =>
         invokeFn("cmd_rename_branch", { repoPath: path, oldName, newName }),
-        { target },
+        { target, facet: "branches" },
       ),
     /**
      * `handled`: the caller reports a refusal itself (a row that says the
@@ -2968,7 +3136,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         branchName,
         (path) =>
           invokeFn("cmd_delete_branch", { repoPath: path, branchName, force }),
-        { target, expected: handled ? () => true : undefined },
+        { target, facet: "branches", expected: handled ? () => true : undefined },
       ),
     // --- stash ----------------------------------------------------------
 
@@ -3127,7 +3295,16 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
      * `deleteBranch`: the panel or row that asked reports the failure itself.
      */
     addWorktree: async (
-      request: { targetPath: string; newBranch: string | null; startPoint: string | null; detach: boolean; cowCaches: boolean; runHooks: boolean },
+      request: {
+        targetPath: string;
+        newBranch: string | null;
+        startPoint: string | null;
+        detach: boolean;
+        cowCaches: boolean;
+        runHooks: boolean;
+        zeroCopyDevmap?: boolean;
+        sparsePaths?: string[] | null;
+      },
       target?: MutationTarget | null,
       handled: boolean = false,
     ) =>
@@ -3143,6 +3320,12 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             detach: request.detach,
             cowCaches: request.cowCaches,
             runHooks: request.runHooks,
+            ...(request.zeroCopyDevmap !== undefined
+              ? { zeroCopyDevmap: request.zeroCopyDevmap }
+              : {}),
+            ...(request.sparsePaths !== undefined
+              ? { sparsePaths: request.sparsePaths }
+              : {}),
           }),
         { target, expected: handled ? () => true : undefined },
       ),
@@ -3736,6 +3919,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     action: (path: string) => Promise<unknown>,
     opts: {
       skipRefresh?: boolean;
+      facet?: HydrationFacet;
       session?: RepoSession;
       /**
        * The repository a prompt, confirm or toast was raised for. Given, the
@@ -3789,7 +3973,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       });
       const still = internal.sessions[session.id];
       if (still && still.generation === generation && !opts.skipRefresh) {
-        await store.refresh(path);
+        const refreshFacet: HydrationFacet =
+          opts.facet && still.hasHydrated ? opts.facet : "all";
+        await store.refresh(path, refreshFacet);
         refreshed = true;
         // The refresh updates statuses/branches but nothing refetches the
         // open diff pane, which would otherwise show pre-mutation content

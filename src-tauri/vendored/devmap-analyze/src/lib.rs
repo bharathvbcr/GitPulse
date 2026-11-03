@@ -14,7 +14,10 @@ pub mod pdg;
 pub mod pdgsrc;
 pub mod record_identity;
 pub mod resolution_rate;
+pub mod scoping;
 pub mod traversal;
+
+pub use scoping::*;
 
 pub use clones::{
     candidates_from_extractions, clone_coverage, group_clones, CloneCandidate, CloneCoverage,
@@ -139,7 +142,12 @@ pub fn analyze_with_discovery(
         // cluster in a five-percent-blind corpus is no longer priced the same
         // as a two-symbol cluster in a corpus that is one file short.
         dead_clusters: {
-            let mut scan = crate::dead_clusters::dead_clusters(extractions, resolution);
+            let mut scan = crate::dead_clusters::dead_clusters_with(
+                extractions,
+                resolution,
+                &liveness.exempt_names,
+                &liveness.unresolved_names,
+            );
             let degraded = !liveness.coverage.is_complete();
             for cluster in &mut scan.clusters {
                 cluster.confidence = liveness
