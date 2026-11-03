@@ -110,6 +110,8 @@ export interface CodeintelResponse<T> {
   truncated: boolean;
   /** Producer stopped early — distinct from budget truncation. Omitted when absent. */
   walk_incomplete?: string;
+  /** What the uncommitted-worktree overlay contributed or could not (fallback-scan symbols, an unreadable overlay, a failed or capped live change list). Present means the answer is not a plain index read; it is not an early stop. Omitted when absent. */
+  overlay_note?: string;
   /** Population across the resolution ladder before any min_rung filter. Omitted when absent. */
   rungs?: CodeintelRungHistogram;
   /** The path, language and kind filters the answer was restricted to, with the scoped and whole corpus sizes. */
