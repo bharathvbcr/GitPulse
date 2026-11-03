@@ -291,7 +291,9 @@
         // CI watcher also acts on (`github/outcome.rs`). The rule: a run is
         // announced only if it is red in this listing and the panel's own
         // previous listing showed it in flight, once. The observer keeps that
-        // previous listing per repository (not what the watcher saw), drops it
+        // previous listing per repository (not what the watcher saw, and it
+        // counts this listing even when the watcher's newer request came back
+        // first, since the panel stops polling once nothing is in flight), drops it
         // after the 15-minute live-poll session ceiling, and announces nothing
         // on the panel's first look, so mounting the panel cannot replay a
         // failure it was not watching, however recently the watcher logged it.

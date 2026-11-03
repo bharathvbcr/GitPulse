@@ -61,8 +61,9 @@
 //! compares its next listing against that through the same [`diff`]. So a
 //! failure the watcher crossed first is still the panel's banner, but only if
 //! the panel had seen that run moving: a red the panel never watched is
-//! history to it, however long ago the watcher logged it. Everything it holds
-//! is bounded.
+//! history to it, however long ago the watcher logged it. A listing the
+//! process-wide baseline ignores as stale still counts for the panel's, which
+//! has its own order. Everything it holds is bounded.
 use super::{GitHubRunsReport, WorkflowRunInfo};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -165,8 +166,9 @@ pub fn diff(previous: Option<&Baseline>, runs: &[WorkflowRunInfo], truncated: bo
     }
 }
 
-/// Repositories the process remembers a baseline for. A baseline is at most one
-/// listing (twenty runs), so this bounds the whole structure.
+/// Repositories the process remembers a baseline for. Each holds two baselines
+/// (the process-wide one and the panel's own), each at most one listing (twenty
+/// runs), so this bounds the whole structure.
 pub const MAX_REPOSITORIES: usize = 64;
 /// Finishes queued for the watcher at once. Past it the oldest is dropped and
 /// counted, never the newest and never silently.
@@ -289,9 +291,10 @@ impl Observer {
         }
     }
 
-    /// The panel's look: fold the listing in like any other poll, then return
-    /// the runs that are red in it and that the panel's *own* previous listing
-    /// showed in flight, and remember this listing as what the panel has seen.
+    /// The panel's look: fold the listing into the process-wide baseline like
+    /// any other poll, then return the runs that are red in it and that the
+    /// panel's *own* previous listing showed in flight, and remember this
+    /// listing as what the panel has seen.
     ///
     /// The comparison is [`diff`], the one definition of a finish, against the
     /// panel's baseline instead of the process-wide one. So:
@@ -301,9 +304,17 @@ impl Observer {
     ///   the panel had seen the run moving;
     /// - a red the panel never saw moving is history to it, however recently
     ///   the watcher logged it;
-    /// - a listing ignored as stale (older than the process-wide baseline)
-    ///   delivers nothing and leaves the panel's baseline untouched, so the
-    ///   next fresh listing still finds the run it was waiting on.
+    /// - a listing the process-wide baseline ignores as stale (the watcher's
+    ///   request was issued later and came back first) is still the panel's
+    ///   newest sight of the repository, because the panel's own polls never
+    ///   overlap. It is compared with the panel's baseline and moves it, but
+    ///   leaves the process-wide baseline alone. Dropping it would lose the
+    ///   banner outright when it is the listing that first shows the run
+    ///   settled: the panel stops polling once nothing is in flight, so there
+    ///   is no later listing to deliver it.
+    ///
+    /// A listing older than the panel's own baseline is out of order for the
+    /// panel too: it delivers nothing and moves nothing.
     pub fn panel_look(
         &mut self,
         repository: &str,
@@ -311,12 +322,15 @@ impl Observer {
         truncated: bool,
         at: Instant,
     ) -> Vec<WorkflowRunInfo> {
-        if self.observe(repository, runs, truncated, at).is_none() {
-            return Vec::new();
-        }
+        // `None` is a listing stale against the process-wide baseline, which
+        // is no reason to ignore it for the panel's.
+        let _ = self.observe(repository, runs, truncated, at);
         let Some(held) = self.repositories.get_mut(repository) else {
             return Vec::new();
         };
+        if held.panel_seen.as_ref().is_some_and(|seen| at < seen.at) {
+            return Vec::new();
+        }
         let previous = held
             .panel_seen
             .take()

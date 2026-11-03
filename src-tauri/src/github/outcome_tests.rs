@@ -620,18 +620,62 @@ fn every_red_the_panel_saw_moving_is_news_however_many_there_are() {
     assert_eq!(news.len() as u64, total);
 }
 
-/// A slow panel request made before the watcher saw the finish lands late. It
-/// is ignored like any stale listing: it delivers nothing and leaves the
-/// panel's baseline alone, so the next fresh listing still finds the run the
-/// panel was waiting on.
+/// The watcher's request was issued after the panel's, yet came back first, so
+/// the process-wide baseline ignores the panel's listing as stale. That listing
+/// is the first to show run 1 settled, and the panel stops polling once nothing
+/// is in flight, so no later listing will ever deliver the banner. It has to
+/// count for the panel on the spot, against the panel's own baseline.
 #[test]
-fn a_stale_listing_delivers_nothing_and_leaves_the_panels_baseline_alone() {
+fn a_stale_listing_still_delivers_to_the_panel_what_it_alone_saw_move() {
     let mut observer = Observer::default();
     let t0 = Instant::now();
     observer.panel_look("acme/app", &[moving(1)], false, t0);
     observer.observe("acme/app", &[ended(1, "failure")], false, later(t0, 5));
-    let stale = observer.panel_look("acme/app", &[moving(1)], false, later(t0, 2));
-    assert!(stale.is_empty());
+    observer.take_pending(10);
+    let stale = observer.panel_look("acme/app", &[ended(1, "failure")], false, later(t0, 2));
+    assert_eq!(ids(&stale), vec![1], "told by the listing that showed it");
+    let fresh = observer.panel_look("acme/app", &[ended(1, "failure")], false, later(t0, 6));
+    assert!(fresh.is_empty(), "and told once");
+}
+
+/// A listing the process-wide baseline refuses must still not rewind it: the
+/// watcher's finish stays announced once.
+#[test]
+fn a_stale_panel_listing_does_not_rewind_the_process_wide_baseline() {
+    let mut observer = Observer::default();
+    let t0 = Instant::now();
+    observer.panel_look("acme/app", &[moving(1)], false, t0);
+    observer.observe("acme/app", &[ended(1, "failure")], false, later(t0, 5));
+    assert_eq!(observer.take_pending(10).len(), 1);
+    observer.panel_look("acme/app", &[moving(1)], false, later(t0, 2));
+    observer.observe("acme/app", &[ended(1, "failure")], false, later(t0, 6));
+    assert!(
+        observer.take_pending(10).is_empty(),
+        "the watcher is not told of run 1 a second time"
+    );
+}
+
+/// The panel's own polls never overlap, so a listing older than the panel's
+/// own baseline is out of order for the panel too: it says nothing and moves
+/// nothing, and the newer baseline keeps what it was waiting on.
+#[test]
+fn a_listing_older_than_the_panels_own_baseline_delivers_nothing_and_moves_nothing() {
+    let mut observer = Observer::default();
+    let t0 = Instant::now();
+    observer.panel_look("acme/app", &[moving(1)], false, t0);
+    observer.panel_look("acme/app", &[moving(1)], false, later(t0, 5));
+    let late = observer.panel_look("acme/app", &[ended(1, "failure")], false, later(t0, 2));
+    assert!(late.is_empty());
     let news = observer.panel_look("acme/app", &[ended(1, "failure")], false, later(t0, 6));
-    assert_eq!(ids(&news), vec![1], "told once, by the next fresh listing");
+    assert_eq!(ids(&news), vec![1], "the newer baseline was left alone");
+}
+
+/// A stale first look is still a first look: a baseline, announcing nothing.
+#[test]
+fn a_stale_first_look_of_the_panel_is_a_baseline_and_announces_nothing() {
+    let mut observer = Observer::default();
+    let t0 = Instant::now();
+    observer.observe("acme/app", &[ended(1, "failure")], false, later(t0, 5));
+    let first = observer.panel_look("acme/app", &[ended(1, "failure")], false, later(t0, 2));
+    assert!(first.is_empty(), "{:?}", ids(&first));
 }
