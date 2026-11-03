@@ -46,11 +46,7 @@ fn toolchain_and_profile_env(home: &Path) -> Vec<(&'static str, PathBuf)> {
 fn approve_in_isolated_home(repo: &Path, home: &Path) {
     fs::create_dir_all(home).unwrap();
     let status = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "approve_build_cache_fixture_helper",
-            "--ignored",
-        ])
+        .args(["--exact", "approve_build_cache_fixture_helper", "--ignored"])
         .envs(toolchain_and_profile_env(home))
         .env("GITPULSE_E2E_GRANT_REPO", repo)
         .status_locked()
@@ -84,6 +80,12 @@ fn run_cli(home: &Path, args: &[&str]) -> Output {
     Command::new(worktree_bin())
         .args(args)
         .envs(toolchain_and_profile_env(home))
+        // The fixtures assert on `<worktree>/target/debug/<bin>`. An inherited
+        // target dir (CI and parallel lanes set one) would send the nested
+        // `cargo build` elsewhere, and the binary the test then runs would not
+        // exist.
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
         .output_locked()
         .expect("spawn gitpulse-worktree")
 }
@@ -97,9 +99,8 @@ fn run_cli_json_ok(home: &Path, args: &[&str]) -> Value {
         "gitpulse-worktree {args:?} failed (code {:?}):\nstdout: {stdout}\nstderr: {stderr}",
         out.status.code()
     );
-    serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!("invalid JSON from {args:?}: {e}\nraw stdout: {stdout}")
-    })
+    serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid JSON from {args:?}: {e}\nraw stdout: {stdout}"))
 }
 
 fn toml_escape_path(path: &Path) -> String {
@@ -269,7 +270,10 @@ fn build_shares_zero_copy_artifacts_across_worktrees_and_enforces_stage2_dep_inv
     let bin_a = anchor.join(format!("target/debug/agent_app{}", exe_suffix()));
     let run_a = Command::new(&bin_a).output_locked().expect("run bin_a");
     assert!(run_a.status.success());
-    assert_eq!(String::from_utf8_lossy(&run_a.stdout).trim(), "hello-from-v1:55");
+    assert_eq!(
+        String::from_utf8_lossy(&run_a.stdout).trim(),
+        "hello-from-v1:55"
+    );
 
     // 2. Create sibling Worktree B with `--no-cache` (no `target/` cloned, simulating an
     //    active `.cargo-lock` on the anchor checkout) and build via `gitpulse-worktree build`.
@@ -325,7 +329,10 @@ fn build_shares_zero_copy_artifacts_across_worktrees_and_enforces_stage2_dep_inv
     let bin_b = wt_b.join(format!("target/debug/agent_app{}", exe_suffix()));
     let run_b = Command::new(&bin_b).output_locked().expect("run bin_b");
     assert!(run_b.status.success());
-    assert_eq!(String::from_utf8_lossy(&run_b.stdout).trim(), "hello-from-v1:55");
+    assert_eq!(
+        String::from_utf8_lossy(&run_b.stdout).trim(),
+        "hello-from-v1:55"
+    );
 
     // 3. Adversarial Stage 2 test: mutate ONLY `greeting.txt` (consumed via `include_str!`)
     //    without touching `crates/local_greeter/src/lib.rs`, remove `wt_b/target`, and rebuild.
@@ -365,7 +372,9 @@ fn build_shares_zero_copy_artifacts_across_worktrees_and_enforces_stage2_dep_inv
         "mutated include_str! dependency must trigger Stage 2 invalidation: {build_b2}"
     );
 
-    let run_b2 = Command::new(&bin_b).output_locked().expect("run bin_b after stage2");
+    let run_b2 = Command::new(&bin_b)
+        .output_locked()
+        .expect("run bin_b after stage2");
     assert!(run_b2.status.success());
     assert_eq!(
         String::from_utf8_lossy(&run_b2.stdout).trim(),
@@ -400,7 +409,9 @@ fn build_shares_zero_copy_artifacts_across_worktrees_and_enforces_stage2_dep_inv
         Some(1),
         "option_env! AGENT_BUILD_TAG change must trigger Stage 2 # env-dep invalidation: {build_b3}"
     );
-    let run_b3 = Command::new(&bin_b).output_locked().expect("run bin_b after env-dep");
+    let run_b3 = Command::new(&bin_b)
+        .output_locked()
+        .expect("run bin_b after env-dep");
     assert!(run_b3.status.success());
     assert_eq!(
         String::from_utf8_lossy(&run_b3.stdout).trim(),
@@ -468,24 +479,29 @@ fn build_shares_zero_copy_artifacts_across_worktrees_and_enforces_stage2_dep_inv
                 ],
             )
         });
-        (tc.join().expect("lane c thread"), td.join().expect("lane d thread"))
+        (
+            tc.join().expect("lane c thread"),
+            td.join().expect("lane d thread"),
+        )
     });
     assert_eq!(par_c["ok"], true);
     assert_eq!(par_d["ok"], true);
-    let total_par_hits = par_c["delta_hits"].as_u64().unwrap_or(0)
-        + par_d["delta_hits"].as_u64().unwrap_or(0);
+    let total_par_hits =
+        par_c["delta_hits"].as_u64().unwrap_or(0) + par_d["delta_hits"].as_u64().unwrap_or(0);
     assert!(
         total_par_hits >= 2,
         "expected both concurrent lanes to hit shared_calc from cache: c={par_c}, d={par_d}"
     );
 
     // 4. `cache-stats` inspection + `--prune --max-bytes 1` bounded eviction.
-    let stats_before = run_cli_json_ok(
-        &home,
-        &["cache-stats", "--repo", anchor_str, "--json"],
-    );
+    let stats_before = run_cli_json_ok(&home, &["cache-stats", "--repo", anchor_str, "--json"]);
     assert!(stats_before["report"]["blob_count"].as_u64().unwrap_or(0) >= 2);
-    assert!(stats_before["report"]["manifest_count"].as_u64().unwrap_or(0) >= 2);
+    assert!(
+        stats_before["report"]["manifest_count"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 2
+    );
 
     let stats_pruned = run_cli_json_ok(
         &home,
@@ -504,15 +520,23 @@ fn build_shares_zero_copy_artifacts_across_worktrees_and_enforces_stage2_dep_inv
         "expected blobs evicted under 1-byte cap: {stats_pruned}"
     );
     assert!(
-        stats_pruned["report"]["pruned_manifests"].as_u64().unwrap_or(0) >= 2,
+        stats_pruned["report"]["pruned_manifests"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 2,
         "expected manifests referencing evicted blobs removed: {stats_pruned}"
     );
-    assert!(stats_pruned["report"]["total_blob_bytes"].as_u64().unwrap_or(99) <= 1);
+    assert!(
+        stats_pruned["report"]["total_blob_bytes"]
+            .as_u64()
+            .unwrap_or(99)
+            <= 1
+    );
 }
 
 #[test]
-fn build_caches_build_rs_include_out_dir_and_proc_macro_while_invalidating_runtime_out_dir_and_rewriting_symlinks()
-{
+fn build_caches_build_rs_include_out_dir_and_proc_macro_while_invalidating_runtime_out_dir_and_rewriting_symlinks(
+) {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let vendor = tmp.path().join("vendor");
@@ -608,10 +632,16 @@ fn build_caches_build_rs_include_out_dir_and_proc_macro_while_invalidating_runti
     assert!(lock_out.status.success());
 
     git(&real_anchor, &["init", "-q", "-b", "main"]);
-    git(&real_anchor, &["config", "user.email", "test@gitpulse.local"]);
+    git(
+        &real_anchor,
+        &["config", "user.email", "test@gitpulse.local"],
+    );
     git(&real_anchor, &["config", "user.name", "GitPulse Test"]);
     git(&real_anchor, &["add", "."]);
-    git(&real_anchor, &["commit", "-q", "-m", "init combo workspace"]);
+    git(
+        &real_anchor,
+        &["commit", "-q", "-m", "init combo workspace"],
+    );
 
     approve_in_isolated_home(&real_anchor, &home);
 
@@ -647,7 +677,10 @@ fn build_caches_build_rs_include_out_dir_and_proc_macro_while_invalidating_runti
     let bin_a = anchor.join(format!("target/debug/combo_app{}", exe_suffix()));
     let run_a = Command::new(&bin_a).output_locked().expect("run bin_a");
     assert!(run_a.status.success());
-    assert_eq!(String::from_utf8_lossy(&run_a.stdout).trim(), "1379:live-asset");
+    assert_eq!(
+        String::from_utf8_lossy(&run_a.stdout).trim(),
+        "1379:live-asset"
+    );
 
     fs::remove_dir_all(real_anchor.join("target")).unwrap();
 
@@ -718,7 +751,10 @@ fn build_caches_build_rs_include_out_dir_and_proc_macro_while_invalidating_runti
         "combo_app failed (stale OUT_DIR baked into binary?): stderr={}",
         String::from_utf8_lossy(&run_b.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&run_b.stdout).trim(), "1379:live-asset");
+    assert_eq!(
+        String::from_utf8_lossy(&run_b.stdout).trim(),
+        "1379:live-asset"
+    );
 
     // Verify no `.d` file in `wt_b/target/debug/deps` leaks either `sym-anchor` or `real-anchor`!
     for entry in fs::read_dir(wt_b.join("target/debug/deps")).unwrap() {
@@ -787,7 +823,8 @@ fn gitpulse_rustc_expands_response_files_and_claim_cli_isolates_caller_conflicts
         .unwrap();
     assert!(status_b.success());
 
-    let stats: Value = serde_json::from_slice(&fs::read(cache_dir.join("stats.json")).unwrap()).unwrap();
+    let stats: Value =
+        serde_json::from_slice(&fs::read(cache_dir.join("stats.json")).unwrap()).unwrap();
     assert_eq!(
         stats["hits"].as_u64(),
         Some(1),
@@ -808,18 +845,51 @@ fn gitpulse_rustc_expands_response_files_and_claim_cli_isolates_caller_conflicts
     let repo_str = repo.to_str().unwrap();
     run_cli_json_ok(
         &home,
-        &["claim", "--repo", repo_str, "--agent", "lane-a", "--branch", "a", "--files", "src/shared.rs", "--json"],
+        &[
+            "claim",
+            "--repo",
+            repo_str,
+            "--agent",
+            "lane-a",
+            "--branch",
+            "a",
+            "--files",
+            "src/shared.rs",
+            "--json",
+        ],
     );
     let claim_b = run_cli_json_ok(
         &home,
-        &["claim", "--repo", repo_str, "--agent", "lane-b", "--branch", "b", "--files", "src/shared.rs", "--json"],
+        &[
+            "claim",
+            "--repo",
+            repo_str,
+            "--agent",
+            "lane-b",
+            "--branch",
+            "b",
+            "--files",
+            "src/shared.rs",
+            "--json",
+        ],
     );
     assert_eq!(claim_b["claim_conflicts"].as_array().unwrap().len(), 1);
 
     // Unrelated `lane-c` claims disjoint `src/isolated.rs`: must NOT see `lane-a` vs `lane-b` conflict!
     let claim_c = run_cli_json_ok(
         &home,
-        &["claim", "--repo", repo_str, "--agent", "lane-c", "--branch", "c", "--files", "src/isolated.rs", "--json"],
+        &[
+            "claim",
+            "--repo",
+            repo_str,
+            "--agent",
+            "lane-c",
+            "--branch",
+            "c",
+            "--files",
+            "src/isolated.rs",
+            "--json",
+        ],
     );
     assert_eq!(
         claim_c["claim_conflicts"].as_array().unwrap().len(),
@@ -827,4 +897,3 @@ fn gitpulse_rustc_expands_response_files_and_claim_cli_isolates_caller_conflicts
         "lane-c claimed disjoint file and must not receive unrelated lane-a/lane-b conflicts: {claim_c}"
     );
 }
-

@@ -434,3 +434,4 @@ blob-report/
 !.claude/
 .claude/*
 !.claude/settings.json
+/crates/gitpulse-worktree/target/

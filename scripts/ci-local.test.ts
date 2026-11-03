@@ -86,7 +86,30 @@ describe("ci:local mirrors the workflows it stands in for", () => {
     expect(cargo.some((line) => line.startsWith("cargo fmt"))).toBe(true);
     expect(cargo.some((line) => line.startsWith("cargo clippy"))).toBe(true);
     expect(cargo.some((line) => line.includes("llvm-cov"))).toBe(true);
-    for (const line of cargo) expect(line).toContain("src-tauri/Cargo.toml");
+    const manifests = ["src-tauri/Cargo.toml", "crates/gitpulse-worktree/Cargo.toml"];
+    for (const line of cargo) {
+      expect(manifests.some((manifest) => line.includes(manifest))).toBe(true);
+    }
+  });
+
+  it("builds and tests crates/gitpulse-worktree, which is not a src-tauri workspace member", () => {
+    // Before these gates nothing in CI or ci:local built the zero-copy build cache.
+    const manifest = "crates/gitpulse-worktree/Cargo.toml";
+    const crate = GATES.filter((gate) => gate.program === "cargo")
+      .map(commandLine)
+      .filter((line) => line.includes(manifest));
+    for (const verb of ["fmt", "clippy", "test"]) {
+      expect(crate.some((line) => line.startsWith(`cargo ${verb} `))).toBe(true);
+    }
+    // Locked, so the crate's own Cargo.lock is what CI resolves.
+    for (const line of crate.filter((l) => !l.startsWith("cargo fmt"))) {
+      expect(line).toContain("--locked");
+    }
+    // Each gate states the exact workflow step it covers, and ci.yml still has it.
+    const ci = workflow("ci.yml");
+    for (const gate of GATES.filter((g) => commandLine(g).includes(manifest))) {
+      for (const covered of gate.covers ?? []) expect(ci).toContain(covered);
+    }
   });
 
   it("runs the WKWebView sweep CI runs, and only where it can", () => {

@@ -31,11 +31,7 @@ fn profile_env(home: &Path) -> [(&'static str, PathBuf); 3] {
 fn approve_in_isolated_home(repo: &Path, home: &Path) {
     fs::create_dir_all(home).unwrap();
     let status = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "approve_subprocess_fixture_helper",
-            "--ignored",
-        ])
+        .args(["--exact", "approve_subprocess_fixture_helper", "--ignored"])
         .envs(profile_env(home))
         .env("GITPULSE_E2E_GRANT_REPO", repo)
         .status_locked()
@@ -86,9 +82,8 @@ fn run_cli_json_ok(home: &Path, args: &[&str]) -> Value {
         "gitpulse-worktree {full_args:?} failed (code {:?}):\nstdout: {stdout}\nstderr: {stderr}",
         out.status.code()
     );
-    serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        panic!("invalid JSON from {full_args:?}: {e}\nraw stdout: {stdout}")
-    })
+    serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("invalid JSON from {full_args:?}: {e}\nraw stdout: {stdout}"))
 }
 
 fn seed_monorepo_with_devmap_and_csr(anchor: &Path) {
@@ -290,7 +285,13 @@ fn cli_end_to_end_zero_copy_sparse_overlay_agent_bus_radar_and_merge() {
     // 1. `expand-cone`: asking only for `packages/app` automatically pulls in `packages/shared`!
     let cone = run_cli_json_ok(
         home.path(),
-        &["expand-cone", "--repo", anchor_str, "--paths", "packages/app"],
+        &[
+            "expand-cone",
+            "--repo",
+            anchor_str,
+            "--paths",
+            "packages/app",
+        ],
     );
     assert_eq!(
         cone["materialized_cone_dirs"],
@@ -439,14 +440,22 @@ fn cli_end_to_end_zero_copy_sparse_overlay_agent_bus_radar_and_merge() {
 
     let ov_a = run_cli_json_ok(
         home.path(),
-        &["compile-overlay", "--worktree", wt_a_target.to_str().unwrap()],
+        &[
+            "compile-overlay",
+            "--worktree",
+            wt_a_target.to_str().unwrap(),
+        ],
     );
     assert_eq!(ov_a["report"]["modified_files"], 1);
     assert_eq!(ov_a["report"]["dirty_nodes"], 1);
 
     let ov_b = run_cli_json_ok(
         home.path(),
-        &["compile-overlay", "--worktree", wt_b_target.to_str().unwrap()],
+        &[
+            "compile-overlay",
+            "--worktree",
+            wt_b_target.to_str().unwrap(),
+        ],
     );
     assert_eq!(ov_b["report"]["modified_files"], 1);
     assert_eq!(ov_b["report"]["dirty_nodes"], 1);
@@ -455,15 +464,17 @@ fn cli_end_to_end_zero_copy_sparse_overlay_agent_bus_radar_and_merge() {
     assert_eq!(radar["radar"]["csr_graph_available"], true);
     let sem = radar["radar"]["semantic_conflicts"].as_array().unwrap();
     assert!(
-        sem.iter()
-            .any(|c| c["relation"] == "caller_callee_1hop"
-                && c["caller_callee_linked_nodes"].as_u64().unwrap_or(0) >= 1),
+        sem.iter().any(|c| c["relation"] == "caller_callee_1hop"
+            && c["caller_callee_linked_nodes"].as_u64().unwrap_or(0) >= 1),
         "expected cross-file 1-hop caller/callee semantic conflict in radar: {radar}"
     );
 
     // 6. Commit in `lane-a`, `verify` (not yet integrated), `merge` into `main`, and `release`!
     git(&wt_a_target, &["add", "packages/app/main.rs"]);
-    git(&wt_a_target, &["commit", "-q", "-m", "feat(app): update run_app"]);
+    git(
+        &wt_a_target,
+        &["commit", "-q", "-m", "feat(app): update run_app"],
+    );
 
     let pre_verify = run_cli_json_ok(
         home.path(),
@@ -531,7 +542,14 @@ fn cli_refuses_every_subcommand_on_untrusted_repository() {
     let cases: &[&[&str]] = &[
         &["--json", "status", "--repo", repo_str],
         &["--json", "create", "--repo", repo_str, "--branch", "feat/x"],
-        &["--json", "expand-cone", "--repo", repo_str, "--paths", "README.md"],
+        &[
+            "--json",
+            "expand-cone",
+            "--repo",
+            repo_str,
+            "--paths",
+            "README.md",
+        ],
         &["--json", "compile-overlay", "--worktree", repo_str],
         &[
             "--json",
@@ -547,29 +565,21 @@ fn cli_refuses_every_subcommand_on_untrusted_repository() {
         ],
         &["--json", "release", "--repo", repo_str, "--agent", "rogue"],
         &[
+            "--json", "msg-send", "--repo", repo_str, "--from", "rogue", "--kind", "status",
+            "--body", "bypass",
+        ],
+        &[
             "--json",
-            "msg-send",
+            "msg-inbox",
             "--repo",
             repo_str,
-            "--from",
+            "--agent",
             "rogue",
-            "--kind",
-            "status",
-            "--body",
-            "bypass",
         ],
-        &["--json", "msg-inbox", "--repo", repo_str, "--agent", "rogue"],
         &["--json", "radar", "--repo", repo_str],
         &["--json", "verify", "--repo", repo_str, "--branch", "main"],
         &[
-            "--json",
-            "merge",
-            "--repo",
-            repo_str,
-            "--source",
-            "main",
-            "--target",
-            "main",
+            "--json", "merge", "--repo", repo_str, "--source", "main", "--target", "main",
         ],
         &["--json", "prune", "--repo", repo_str],
     ];
@@ -602,7 +612,10 @@ fn cli_cross_process_concurrent_claims_messages_and_auto_release_on_merge() {
     fs::create_dir_all(&anchor).unwrap();
     git(&anchor, &["init", "-q", "-b", "main"]);
     git(&anchor, &["config", "user.name", "Concurrency Agent"]);
-    git(&anchor, &["config", "user.email", "concurrency@example.com"]);
+    git(
+        &anchor,
+        &["config", "user.email", "concurrency@example.com"],
+    );
     fs::write(anchor.join("lib.rs"), "pub fn base() {}\n").unwrap();
     git(&anchor, &["add", "."]);
     git(&anchor, &["commit", "-q", "-m", "init"]);
@@ -618,16 +631,8 @@ fn cli_cross_process_concurrent_claims_messages_and_auto_release_on_merge() {
         let file = format!("src/mod_{i:02}.rs");
         let child = Command::new(bin_path())
             .args([
-                "--json",
-                "claim",
-                "--repo",
-                anchor_str,
-                "--agent",
-                &agent,
-                "--branch",
-                &branch,
-                "--files",
-                &file,
+                "--json", "claim", "--repo", anchor_str, "--agent", &agent, "--branch", &branch,
+                "--files", &file,
             ])
             .envs(profile_env(home.path()))
             .stdout(std::process::Stdio::piped())
@@ -652,16 +657,8 @@ fn cli_cross_process_concurrent_claims_messages_and_auto_release_on_merge() {
         let body = format!("hello-{i:02}");
         let child = Command::new(bin_path())
             .args([
-                "--json",
-                "msg-send",
-                "--repo",
-                anchor_str,
-                "--from",
-                &agent,
-                "--kind",
-                "status",
-                "--body",
-                &body,
+                "--json", "msg-send", "--repo", anchor_str, "--from", &agent, "--kind", "status",
+                "--body", &body,
             ])
             .envs(profile_env(home.path()))
             .stdout(std::process::Stdio::piped())
@@ -697,7 +694,10 @@ fn cli_cross_process_concurrent_claims_messages_and_auto_release_on_merge() {
         12,
         "all 12 concurrent cross-process messages must survive without lost updates"
     );
-    let mut seqs: Vec<u64> = messages.iter().map(|m| m["seq"].as_u64().unwrap()).collect();
+    let mut seqs: Vec<u64> = messages
+        .iter()
+        .map(|m| m["seq"].as_u64().unwrap())
+        .collect();
     seqs.sort_unstable();
     assert_eq!(
         seqs,
@@ -752,4 +752,3 @@ fn cli_cross_process_concurrent_claims_messages_and_auto_release_on_merge() {
         "merge teardown must auto-release merge-worker lane slot, remaining={remaining_agents:?}"
     );
 }
-
