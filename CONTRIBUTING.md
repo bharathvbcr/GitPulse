@@ -357,9 +357,13 @@ repository with the hook active; **unverified:** GitHub's immutable releases or
 a tag ruleset may still refuse the same push on the server, which a local bare
 repository does not model.
 
-Builds older than 1.4.0's update check announce the newest tag, published or
-not, so those users can see a version from the moment its tag is pushed. Publish
-the draft promptly, or delete the tag if the run fails.
+The update check announces a version only once its release is published from
+1.4.0 on (`release_is_published` in `src-tauri/src/updates/mod.rs` asks for the
+release's `GitPulse_X.Y.Z_SHA256SUMS.txt` anonymously). Every build before 1.4.0,
+which includes every release published up to 1.3.1, announces the newest `v*`
+tag on origin whether or not its release is published. Those users see a version
+from the moment its tag is pushed, so publish the draft promptly, or delete the
+tag if the run fails.
 
 ---
 
