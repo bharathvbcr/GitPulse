@@ -97,7 +97,6 @@
   import TaskQuickAdd from "./TaskQuickAdd.svelte";
   import TaskHandoffSheet from "./TaskHandoffSheet.svelte";
   import Skeleton from "./Skeleton.svelte";
-  import VirtualList from "./VirtualList.svelte";
 
   let { repositoryPath = null, active = true, acceptsOpenRequests = false }: {
     repositoryPath?: string | null;
@@ -371,12 +370,6 @@
   // profile remembers; the header and the View menu write them back.
   const layout = $derived($interfaceStore.taskLayout);
   const compact = $derived($interfaceStore.taskDensity === "compact");
-  const LIST_ROW_HEIGHT_SPACIOUS = 40;
-  const LIST_ROW_HEIGHT_COMPACT = 32;
-  const BOARD_CARD_HEIGHT_SPACIOUS = 72;
-  const BOARD_CARD_HEIGHT_COMPACT = 58;
-  const listRowHeight = $derived(compact ? LIST_ROW_HEIGHT_COMPACT : LIST_ROW_HEIGHT_SPACIOUS);
-  const boardCardHeight = $derived(compact ? BOARD_CARD_HEIGHT_COMPACT : BOARD_CARD_HEIGHT_SPACIOUS);
   const cardFields = $derived(new Set($interfaceStore.taskCardFields));
   const hiddenColumns = $derived($interfaceStore.taskHiddenColumns);
   const showArchived = $derived($interfaceStore.taskShowArchivedWorkspaces);
@@ -2756,19 +2749,6 @@
               {#each group.cards as card (card.id)}{@render listRow(card)}{/each}
             </div>
           {/each}
-        {:else if listCards.length > 35}
-          <VirtualList
-            items={listCards}
-            rowHeight={listRowHeight}
-            overscan={10}
-            class="flex-1 min-h-0"
-          >
-            {#snippet row(card)}
-              {#if card}
-                {@render listRow(card)}
-              {/if}
-            {/snippet}
-          </VirtualList>
         {:else}
           {#each listCards as card (card.id)}{@render listRow(card)}{/each}
         {/if}
@@ -2815,6 +2795,12 @@
         </div>
       </div>
     {:else}
+      <!-- Every loaded card is drawn (Load all budgets against MAX_CANDIDATES on
+           that premise). Windowing the column with a fixed row height was tried
+           and refused: a card's height follows its title, chips and labels, so
+           the window drifted off the cards; and the drop, Home/End, nudge and
+           move-across code finds cards in the DOM, so an unmounted card lost
+           the focus a keyboard move hands back to it. -->
       <div class="columns" aria-busy={loading || moving} data-testid="task-columns">
         {#each shown as status (status)}
           {@const drawn = visibleIn(status)}
@@ -2833,21 +2819,6 @@
               <div class="cards">
                 <p class="column-empty">Drop a card here, or add one.</p>
               </div>
-            {:else if drawn.length > 35}
-              <VirtualList
-                items={drawn}
-                rowHeight={boardCardHeight}
-                overscan={8}
-                class="cards"
-              >
-                {#snippet row(card)}
-                  {#if card}
-                    {#if insertBefore(status, "", drawn, card.id)}<div class="insert" aria-hidden="true"></div>{/if}
-                    {@render boardCard(card, status)}
-                  {/if}
-                {/snippet}
-              </VirtualList>
-              {#if insertAtEnd(status, "", drawn)}<div class="insert" aria-hidden="true"></div>{/if}
             {:else}
               <div class="cards">
                 {#each drawn as card (card.id)}
