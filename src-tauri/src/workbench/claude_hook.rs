@@ -54,6 +54,14 @@ const PLUGIN_HOOKS: &str = include_str!("../../../plugins/gitpulse/hooks/hooks.j
 /// only report: `gitpulse-hook notify` writes nothing to stdout, so it can
 /// neither allow nor deny anything.
 ///
+/// `Stop` also carries `gitpulse-hook deliver`, the `asyncRewake` entry that
+/// lets a person's message reach an idle session (`hooks::deliver`). It rides
+/// in with the rest of `Stop`'s manifest entries, unchanged but for the binary's
+/// path: its `timeout` (1800 s) and `asyncRewake` are the manifest's own, and
+/// `the_stop_event_carries_the_waiter_in_the_manifest_and_in_every_launch`
+/// holds both copies to them. Two copies of it can run for one stop; the
+/// mailbox's one-use claim is what keeps that to one wake.
+///
 /// Left to the plugin: the `Notification` matchers and `StopFailure`, which
 /// are banners, and `SessionStart`'s brief. A session without the plugin gets
 /// its banners from the bell it already rings.
@@ -456,6 +464,70 @@ mod tests {
         assert!(merged.get("Stop").is_some());
         assert_eq!(merge_hooks(Some(&merged), ours.clone()), merged);
         assert_eq!(merge_hooks(None, ours.clone()), ours);
+    }
+
+    /// The mailbox waiter is a `Stop` entry marked `asyncRewake` with a
+    /// `timeout` Claude Code enforces (default 600 s when none is given). Both
+    /// the plugin's copy and the one every launch carries must have it, must not
+    /// be `async` (which cannot wake), and must outlast the hook's own wait.
+    #[test]
+    fn the_stop_event_carries_the_waiter_in_the_manifest_and_in_every_launch() {
+        let manifest: Value = serde_json::from_str(PLUGIN_HOOKS).unwrap();
+        let injected =
+            settings_hooks(Path::new("/Applications/Git Pulse.app/gitpulse-hook")).unwrap();
+        for (label, stop) in [
+            ("manifest", &manifest["hooks"]["Stop"]),
+            ("injected", &injected["Stop"]),
+        ] {
+            let handlers: Vec<&Value> = stop
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|group| group["hooks"].as_array().unwrap())
+                .collect();
+            let waiters: Vec<&&Value> = handlers
+                .iter()
+                .filter(|hook| hook["command"].as_str().unwrap().ends_with(" deliver"))
+                .collect();
+            assert_eq!(waiters.len(), 1, "{label}: {handlers:?}");
+            let waiter = waiters[0];
+            assert_eq!(waiter["asyncRewake"], json!(true), "{label}");
+            assert!(
+                waiter.get("async").is_none(),
+                "{label}: an async hook cannot wake"
+            );
+            let timeout = waiter["timeout"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{label}: no timeout"));
+            assert!(timeout <= 1800, "{label}: {timeout}");
+            assert!(
+                timeout > crate::hooks::deliver::DELIVER_WAIT.as_secs(),
+                "{label}: the host would kill the waiter before it gave up"
+            );
+            // The existing report is still there, still in the background.
+            let report = handlers
+                .iter()
+                .find(|hook| {
+                    hook["command"]
+                        .as_str()
+                        .unwrap()
+                        .ends_with("notify turn_finished")
+                })
+                .unwrap_or_else(|| panic!("{label}: turn_finished is gone"));
+            assert_eq!(report["async"], json!(true), "{label}");
+            assert!(report.get("asyncRewake").is_none(), "{label}");
+        }
+        let command = injected["Stop"][0]["hooks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hook| hook["command"].as_str().unwrap().to_owned())
+            .find(|command| command.ends_with(" deliver"))
+            .unwrap();
+        assert_eq!(
+            command,
+            "'/Applications/Git Pulse.app/gitpulse-hook' deliver"
+        );
     }
 
     #[test]
