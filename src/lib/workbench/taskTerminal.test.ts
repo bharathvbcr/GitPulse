@@ -92,6 +92,58 @@ describe("startTaskTerminal", () => {
     expect(openRepo).toHaveBeenLastCalledWith("/work/a", { activate: true, deferTrust: true });
   });
 
+  describe("resuming with a first prompt", () => {
+    // A person who read a CI failure sends it to an attempt that has ended. The
+    // text rides on the resume request and becomes one argv element of the
+    // `claude --resume <id> -- <text>` the tab starts; it is data, never a
+    // command line, so nothing in it may be read as a flag or a shell word.
+    const A_PROMPT = "CI failed on `build`; $(rm -rf /) -- --settings {}\nRun: https://example.test/run/1";
+
+    it("carries the prompt on the request, verbatim, and nothing else changes", async () => {
+      findConversation.mockResolvedValueOnce({ resumable: true, sessionId: SESSION, cwd: "/work/a", mode: "ask", reason: "saved" });
+      openRepo.mockResolvedValue(true);
+      expect(await resumeTaskConversation({ id: "a", task_title: "Fix" }, "background", A_PROMPT)).toEqual({ outcome: "started" });
+      expect(get(taskTerminalRequests)).toEqual([{
+        runId: "a", repoPath: "/work/a", provider: "claude", title: "Fix",
+        resume: { sessionId: SESSION, mode: "ask", runId: "a", prompt: A_PROMPT },
+      }]);
+    });
+
+    it("sends no prompt key at all when there is none", async () => {
+      findConversation.mockResolvedValueOnce({ resumable: true, sessionId: SESSION, cwd: "/work/a", mode: "ask", reason: "saved" });
+      openRepo.mockResolvedValue(true);
+      await resumeTaskConversation({ id: "a", task_title: "Fix" });
+      expect(get(taskTerminalRequests)[0].resume).toEqual({ sessionId: SESSION, mode: "ask", runId: "a" });
+    });
+
+    it("refuses a prompt the agent launcher would refuse, before looking for the conversation", async () => {
+      for (const bad of ["", "   ", "has\0nul", "x".repeat(16001)]) {
+        const outcome = await resumeTaskConversation({ id: "a", task_title: "Fix" }, "background", bad);
+        expect(outcome.outcome, JSON.stringify(bad.slice(0, 12))).toBe("unavailable");
+      }
+      expect(findConversation).not.toHaveBeenCalled();
+      expect(get(taskTerminalRequests)).toEqual([]);
+    });
+
+    it("will not drop the prompt into a conversation that is already running or already waiting to open", async () => {
+      liveSession({ key: "resumed", continuesRunId: "a" });
+      const live = await resumeTaskConversation({ id: "a", task_title: "Fix" }, "show", A_PROMPT);
+      expect(live).toEqual({ outcome: "unavailable", reason: expect.stringContaining("already running") });
+      expect(focusTerminalSession).not.toHaveBeenCalled();
+      expect(findConversation).not.toHaveBeenCalled();
+    });
+
+    it("will not queue a second prompted resume behind one that is waiting", async () => {
+      findConversation.mockResolvedValue({ resumable: true, sessionId: SESSION, cwd: "/work/a", mode: "ask", reason: "saved" });
+      openRepo.mockResolvedValue(false);
+      await resumeTaskConversation({ id: "a", task_title: "Fix" }, "background");
+      const second = await resumeTaskConversation({ id: "a", task_title: "Fix" }, "background", A_PROMPT);
+      expect(second.outcome).toBe("unavailable");
+      expect(get(taskTerminalRequests)).toHaveLength(1);
+      expect(get(taskTerminalRequests)[0].resume).not.toHaveProperty("prompt");
+    });
+  });
+
   it("keeps the terminal waiting, and says for which checkout, when an open is answered without a reason", async () => {
     openRepo.mockResolvedValueOnce(false);
     expect(await startTaskTerminal(run("c", "/work/c"))).toEqual({ kind: "waiting", reason: "checkout", checkout: "/work/c" });
