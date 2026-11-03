@@ -403,6 +403,8 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
                 branch: flag("branch").map(str::to_string),
                 ttl_seconds: ttl,
                 force,
+                worktree_path: flag("worktree-path").map(str::to_string),
+                worktree_id: flag("worktree-id").map(str::to_string),
             };
             match store.acquire_outcome(&request) {
                 Ok((lease, retired)) => {
@@ -1323,6 +1325,8 @@ fn lease_json(lease: &Lease) -> String {
         ("created_at", &quote(&lease.created_at)),
         ("expires_at", &maybe(lease.expires_at.as_deref())),
         ("released_at", &maybe(lease.released_at.as_deref())),
+        ("worktree_path", &maybe(lease.worktree_path.as_deref())),
+        ("worktree_id", &maybe(lease.worktree_id.as_deref())),
     ])
 }
 
