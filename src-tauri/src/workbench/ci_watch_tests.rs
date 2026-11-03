@@ -844,6 +844,44 @@ fn a_capped_listing_is_reported_as_capped() {
     assert!(watcher.repos.values().next().unwrap().status.capped);
 }
 
+/// `capped` was set and nothing read it, so a repository whose listing outgrew
+/// the page was only visible to a debugger. It is a warning when it turns on,
+/// once, and not on every poll while it stays on.
+#[test]
+fn a_listing_that_turns_capped_is_reported_once_when_it_does() {
+    let world = world();
+    let _repo = world.attempt("a", Some(BRANCH));
+    let fake = Fake::new();
+    let mut capped = listing(vec![moving(1)]);
+    capped.truncated = true;
+    let whole = listing(vec![moving(1)]);
+    let mut watcher = Watcher::default();
+
+    fake.say(whole.clone());
+    assert_eq!(sweep(&mut watcher, &world, &fake).newly_capped, 0);
+    fake.say(capped.clone());
+    assert_eq!(
+        sweep(&mut watcher, &world, &fake).newly_capped,
+        1,
+        "complete, then capped, is the transition"
+    );
+    fake.say(capped.clone());
+    assert_eq!(
+        sweep(&mut watcher, &world, &fake).newly_capped,
+        0,
+        "staying capped is not announced again"
+    );
+    fake.say(whole);
+    assert_eq!(sweep(&mut watcher, &world, &fake).newly_capped, 0);
+    assert!(!watcher.repos.values().next().unwrap().status.capped);
+    fake.say(capped);
+    assert_eq!(
+        sweep(&mut watcher, &world, &fake).newly_capped,
+        1,
+        "capped again after a complete listing is a new transition"
+    );
+}
+
 #[test]
 fn a_repository_with_no_attempt_branch_is_never_asked() {
     let world = world();

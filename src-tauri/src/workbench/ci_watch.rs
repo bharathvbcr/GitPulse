@@ -29,8 +29,10 @@
 //!   [`MAX_RETRY`] results.
 //! - **Honest.** `gh` missing or unauthenticated, an untrusted repository, a
 //!   spent call budget and a capped listing are each their own state in
-//!   [`status`]; none of them reads as "no CI". A result that could not be
-//!   recorded is retried and then logged, never dropped silently.
+//!   [`RepoStatus`] ([`WatchState`] and `capped`); none of them reads as "no
+//!   CI". A listing that turns capped is also logged once, as a warning. A
+//!   result that could not be recorded is retried and then logged, never
+//!   dropped silently.
 //! - **Idempotent.** The store de-duplicates on (task, source, run, conclusion),
 //!   so a re-poll answers `recorded: false` and writes neither a second notice
 //!   nor a second log block.
@@ -259,6 +261,9 @@ pub(crate) struct Report {
     pub already_recorded: usize,
     pub unmatched: usize,
     pub failed: usize,
+    /// Repositories whose listing turned capped this sweep (it was complete, or
+    /// unread, the time before).
+    pub newly_capped: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -405,7 +410,7 @@ impl Watcher {
                 self.watch = Some(set);
                 return report;
             }
-            if self.poll(&checkout, backend, now) {
+            if self.poll(&checkout, backend, now, &mut report) {
                 report.polled += 1;
             }
         }
@@ -448,7 +453,13 @@ impl Watcher {
     }
 
     /// Asks one repository, unless it must not be asked. True when `gh` ran.
-    fn poll(&mut self, checkout: &str, backend: &dyn Backend, now: Instant) -> bool {
+    fn poll(
+        &mut self,
+        checkout: &str,
+        backend: &dyn Backend,
+        now: Instant,
+        tally: &mut Report,
+    ) -> bool {
         let Some(repo) = self.repos.get_mut(checkout) else {
             return false;
         };
@@ -528,6 +539,10 @@ impl Watcher {
                 .any(|run| run.outcome == RunOutcome::InFlight);
             repo.status.state = WatchState::Watching;
             repo.status.reason = String::new();
+            if report.truncated && !repo.status.capped {
+                tally.newly_capped += 1;
+                log::warn!(target: "workbench", "ci watch {checkout}: the run listing is capped; a run that was moving and fell off the end can no longer be followed");
+            }
             repo.status.capped = report.truncated;
             repo.next_due = now + if repo.moving { ACTIVE_POLL } else { IDLE_POLL };
         } else {
@@ -922,7 +937,7 @@ impl Backend for HostBackend {
             .map_err(|error| error.into_message())
     }
     fn runs(&self, checkout: &str) -> GitHubRunsReport {
-        // Not the panel's loader: that one moves the panel's banner cursor.
+        // Not the panel's loader: that one moves the panel's own baseline.
         crate::github::watch_workflow_runs_report(checkout)
     }
     fn take_finished(&self, max: usize) -> Vec<Finished> {
