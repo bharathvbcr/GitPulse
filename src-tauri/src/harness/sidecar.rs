@@ -2783,6 +2783,7 @@ impl ProfileConnection {
         };
         // A repeat (a worker closed once by a refused call and again by the
         // quit) has nothing left to settle and must not dial again.
+        #[cfg(unix)]
         let repeat = guard.closed;
         guard.closed = true;
         let sidecar = guard.sidecar.take();
