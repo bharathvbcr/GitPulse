@@ -16,6 +16,9 @@
       "devmap.query",
       "devmap.status",
       "harness.resolve",
+      "serve.status",
+      "serve.stop_all",
+      "serve.takeover",
       "work.attention.get",
       "work.attention.list",
       "work.attention.update",
@@ -71,6 +74,7 @@
       "work.runs.get",
       "work.runs.list",
       "work.runs.managed.activate",
+      "work.runs.managed.continue",
       "work.runs.managed.follow",
       "work.runs.managed.prepare",
       "work.runs.managed.stop",
@@ -561,6 +565,51 @@
         }
       }
     },
+    "ManagedContinueParams": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "id": {
+          "type": "string",
+          "required": true
+        },
+        "message": {
+          "type": "string",
+          "required": false,
+          "nullable": true
+        },
+        "request_id": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    "ManagedContinueResult": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "idle_deadline": {
+          "type": "integer",
+          "required": false
+        },
+        "max_turns": {
+          "type": "integer",
+          "required": true
+        },
+        "request_id": {
+          "type": "string",
+          "required": false
+        },
+        "state": {
+          "type": "string",
+          "required": true
+        },
+        "turn": {
+          "type": "integer",
+          "required": true
+        }
+      }
+    },
     "ManagedPrepareParams": {
       "type": "object",
       "required": false,
@@ -587,6 +636,10 @@
         "id": {
           "type": "string",
           "required": true
+        },
+        "max_continuations": {
+          "type": "integer",
+          "required": false
         },
         "request_id": {
           "type": "string",
@@ -1077,6 +1130,204 @@
         },
         "state": {
           "type": "string",
+          "required": true
+        }
+      }
+    },
+    "ServeJob": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "activated": {
+          "type": "boolean",
+          "required": true
+        },
+        "continue": {
+          "type": "object",
+          "required": false,
+          "nullable": true,
+          "fields": {
+            "idle_deadline": {
+              "type": "integer",
+              "required": false
+            },
+            "max_turns": {
+              "type": "integer",
+              "required": true
+            },
+            "request_id": {
+              "type": "string",
+              "required": false
+            },
+            "state": {
+              "type": "string",
+              "required": true
+            },
+            "turn": {
+              "type": "integer",
+              "required": true
+            }
+          }
+        },
+        "id": {
+          "type": "string",
+          "required": true
+        },
+        "owner_id": {
+          "type": "string",
+          "required": true
+        },
+        "phase": {
+          "type": "string",
+          "required": true
+        },
+        "process_id": {
+          "type": "integer",
+          "required": true
+        },
+        "provider": {
+          "type": "string",
+          "required": false
+        },
+        "session_id": {
+          "type": "string",
+          "required": true
+        }
+      }
+    },
+    "ServeStatusResult": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "controller": {
+          "type": "boolean",
+          "required": true
+        },
+        "idle_exit_ms": {
+          "type": "integer",
+          "required": true
+        },
+        "jobs": {
+          "type": "array",
+          "required": true,
+          "items": {
+            "type": "object",
+            "required": false,
+            "fields": {
+              "activated": {
+                "type": "boolean",
+                "required": true
+              },
+              "continue": {
+                "type": "object",
+                "required": false,
+                "nullable": true,
+                "fields": {
+                  "idle_deadline": {
+                    "type": "integer",
+                    "required": false
+                  },
+                  "max_turns": {
+                    "type": "integer",
+                    "required": true
+                  },
+                  "request_id": {
+                    "type": "string",
+                    "required": false
+                  },
+                  "state": {
+                    "type": "string",
+                    "required": true
+                  },
+                  "turn": {
+                    "type": "integer",
+                    "required": true
+                  }
+                }
+              },
+              "id": {
+                "type": "string",
+                "required": true
+              },
+              "owner_id": {
+                "type": "string",
+                "required": true
+              },
+              "phase": {
+                "type": "string",
+                "required": true
+              },
+              "process_id": {
+                "type": "integer",
+                "required": true
+              },
+              "provider": {
+                "type": "string",
+                "required": false
+              },
+              "session_id": {
+                "type": "string",
+                "required": true
+              }
+            }
+          }
+        },
+        "owner_id": {
+          "type": "string",
+          "required": true
+        },
+        "process_id": {
+          "type": "integer",
+          "required": true
+        },
+        "protocol": {
+          "type": "integer",
+          "required": true
+        }
+      }
+    },
+    "ServeStopAllParams": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "wait_ms": {
+          "type": "integer",
+          "required": false
+        }
+      }
+    },
+    "ServeStopAllResult": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "pending": {
+          "type": "array",
+          "required": true,
+          "items": {
+            "type": "string",
+            "required": false
+          }
+        },
+        "stopped": {
+          "type": "array",
+          "required": true,
+          "items": {
+            "type": "string",
+            "required": false
+          }
+        }
+      }
+    },
+    "ServeTakeoverResult": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "controller": {
+          "type": "boolean",
+          "required": true
+        },
+        "took_over": {
+          "type": "boolean",
           "required": true
         }
       }
