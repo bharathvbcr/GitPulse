@@ -134,10 +134,22 @@ describe("plugin hooks", () => {
     for (const [event, groups] of Object.entries(hooks.hooks)) {
       for (const group of groups) {
         for (const handler of group.hooks) {
-          const reports = String(handler.command).split(/\s+/)[1] === "notify";
+          const subcommand = String(handler.command).split(/\s+/)[1];
+          const reports = subcommand === "notify";
+          // `deliver` is the one hook that waits, in the background: `asyncRewake`
+          // runs it without blocking the agent and wakes the agent on exit 2. It
+          // is not `async`, which "cannot block" and so cannot wake.
+          const waits = subcommand === "deliver";
+          if (waits) {
+            expect(event, "deliver only makes sense where a turn ends").toBe("Stop");
+            expect(handler.asyncRewake, "deliver is asyncRewake").toBe(true);
+            expect(handler.async, "an async hook cannot wake the agent").toBeUndefined();
+            continue;
+          }
           if (mustBeAsync.has(event)) expect(handler.async, `${event} blocks the agent on a report`).toBe(true);
           // A deciding hook that ran in the background would decide nothing.
           if (!reports) expect(handler.async, `${event} decides in the background`).toBeUndefined();
+          expect(handler.asyncRewake, `${event} wakes the agent from something that is not deliver`).toBeUndefined();
         }
       }
     }
@@ -158,7 +170,12 @@ describe("plugin hooks", () => {
           // hang the user's editor indefinitely.
           expect(typeof handler.timeout, `${event} has no timeout`).toBe("number");
           expect(handler.timeout as number).toBeGreaterThan(0);
-          expect(handler.timeout as number).toBeLessThanOrEqual(60);
+          // An `asyncRewake` waiter is the one entry that lives for minutes: it
+          // runs in the background, so no tool call waits on it, and Claude Code
+          // enforces its `timeout` (default 600 s) by killing it. Everything
+          // else is on the agent's path and stays under a minute.
+          const ceiling = handler.asyncRewake === true ? 1800 : 60;
+          expect(handler.timeout as number, `${event} ${handler.command}`).toBeLessThanOrEqual(ceiling);
         }
       }
     }
@@ -509,6 +526,7 @@ describe("hook budgets sit inside the host's timeouts", () => {
    */
   function budgetSecondsFor(subcommand: string, argument = ""): number {
     if (subcommand === "notify") return notifyRunSeconds(argument);
+    if (subcommand === "deliver") return deliverWaitSeconds();
     const handler = new RegExp(
       `fn run_${subcommand.replaceAll("-", "_")}\\b[\\s\\S]*?within_budget\\(\\s*([A-Z_]+)`,
     ).exec(hookSource);
@@ -532,6 +550,20 @@ describe("hook budgets sit inside the host's timeouts", () => {
     path.join(ROOT, "src-tauri", "src", "hooks", "notify_input.rs"),
     "utf8",
   );
+
+  /**
+   * How long `deliver` waits for a message: `DELIVER_WAIT` in hooks/deliver.rs,
+   * a plain whole number of seconds. It is not `BUDGET` or `TOTAL_BUDGET`: those
+   * are for hooks the agent is waiting on, and a waiter cut to them would give
+   * up on an idle session. The entry's `timeout` has to outlast it, or the host
+   * kills the waiter mid-wait and a message claimed in that instant is lost.
+   */
+  function deliverWaitSeconds(): number {
+    const source = readFileSync(path.join(ROOT, "src-tauri", "src", "hooks", "deliver.rs"), "utf8");
+    const declared = /pub const DELIVER_WAIT: Duration = Duration::from_secs\((\d+)\)/.exec(source);
+    expect(declared, "DELIVER_WAIT is no longer a whole number of seconds; update this contract").toBeTruthy();
+    return Number(declared![1]);
+  }
 
   /**
    * What one `notify` run waits out for `event`: the read and then the socket
@@ -593,6 +625,18 @@ describe("hook budgets sit inside the host's timeouts", () => {
         `${event} "${command}" is killed by the host after ${timeout}s, but the hook waits ${budget}s before giving up — the host discards the output of a timed-out hook, so whatever it had to say would never be delivered`,
       ).toBeGreaterThan(budget);
     }
+  });
+
+  it("lets the mailbox waiter finish and exit on its own well before the host's timeout kills it", () => {
+    const rows = declaredTimeouts().filter((row) => row.command.split(/\s+/)[1] === "deliver");
+    expect(rows.length, "the manifest has no deliver entry").toBe(1);
+    const wait = deliverWaitSeconds();
+    // A margin big enough for a poll, a last claim and a write; the host's
+    // timeout is the weaker backstop, never the way a normal wait ends.
+    expect(rows[0].timeout - wait).toBeGreaterThanOrEqual(30);
+    expect(rows[0].timeout).toBeLessThanOrEqual(1800);
+    // And it is not clamped to the short budget the deciding hooks share.
+    expect(wait).toBeGreaterThan(Number(/pub const TOTAL_BUDGET: Duration = Duration::from_secs\((\d+)\)/.exec(hookSource)![1]));
   });
 
   it("ends the whole process, not just each wait, a stated margin before the host's timeout", () => {

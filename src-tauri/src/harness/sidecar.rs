@@ -46,6 +46,11 @@ pub const MANAGED_PREPARE_TIMEOUT: Duration = Duration::from_secs(180);
 /// How long `work.runs.managed.stop` may take: it closes a provider, which can
 /// outlast an ordinary call.
 pub const MANAGED_STOP_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long `work.runs.managed.continue` may take. Manvi writes the follow-up
+/// on the run's own drive loop and bounds that wait at 30 s inside a one-minute
+/// lane deadline, so a healthy delivery can outlast the default; this is the
+/// lane deadline plus [`ADVERTISED_DEADLINE_MARGIN`].
+pub const MANAGED_CONTINUE_TIMEOUT: Duration = Duration::from_secs(65);
 
 /// How long `work.enhancements.refine` may take: Manvi's model-call budget
 /// (150 s) plus the 30 s it allows for grounding and board reads around it.
@@ -63,6 +68,7 @@ pub(crate) fn op_deadline(op: &str) -> Duration {
     match op {
         "work.runs.managed.prepare" => MANAGED_PREPARE_TIMEOUT,
         "work.runs.managed.stop" => MANAGED_STOP_TIMEOUT,
+        "work.runs.managed.continue" => MANAGED_CONTINUE_TIMEOUT,
         "work.enhancements.refine" => REFINE_TIMEOUT,
         "work.scan.gaps" => SCAN_START_TIMEOUT,
         _ => DEFAULT_CALL_TIMEOUT,
@@ -1721,6 +1727,7 @@ fn missing_op_message(op: &str) -> String {
         "work.runs.managed.prepare" | "work.runs.managed.activate" | "work.runs.managed.stop" => {
             "managed runs"
         }
+        "work.runs.managed.continue" => "follow-ups to a managed run",
         _ => "task enhancements",
     };
     format!("This Manvi binary does not advertise {op}. Update Manvi to use {feature}.")
@@ -1871,6 +1878,7 @@ impl ProfileConnection {
                 | "work.runs.managed.prepare"
                 | "work.runs.managed.activate"
                 | "work.runs.managed.stop"
+                | "work.runs.managed.continue"
                 | "work.verify.task"
                 | "work.verify.get"
                 | "work.enhancements.refine"
@@ -3273,6 +3281,7 @@ done
             ("work.verify.task", "task verification"),
             ("work.scan.gaps", "the repository gap scan"),
             ("work.runs.managed.prepare", "managed runs"),
+            ("work.runs.managed.continue", "follow-ups to a managed run"),
             ("work.enhancements.generate", "task enhancements"),
         ] {
             let message = missing_op_message(op);

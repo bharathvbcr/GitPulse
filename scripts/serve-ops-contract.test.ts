@@ -180,8 +180,8 @@ describe("the ops GitPulse names are served", () => {
     expect(allow, "profile worker allowlist not found").not.toBeNull();
     const ops = [...allow![1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
     expect(ops.filter((op) => !served.has(op))).toEqual([]);
-    expect(ops).toHaveLength(14);
-    expect(ops).toEqual(expect.arrayContaining(["work.verify.task", "work.verify.get", "work.scan.gaps", "work.scan.get", "work.scan.cancel", "work.enhancements.refine", "work.tasks.suggest"]));
+    expect(ops).toHaveLength(15);
+    expect(ops).toEqual(expect.arrayContaining(["work.verify.task", "work.verify.get", "work.scan.gaps", "work.scan.get", "work.scan.cancel", "work.enhancements.refine", "work.tasks.suggest", "work.runs.managed.continue"]));
   });
 
   it("what GitPulse sends work.verify.task and work.verify.get is declared, and nothing required is missing", () => {
@@ -197,6 +197,22 @@ describe("the ops GitPulse names are served", () => {
     const get = paramKeys(fnBody("get_params"));
     expect(undeclared(get, "VerifyGetParams")).toEqual([]);
     expect(missingRequired(get, "VerifyGetParams")).toEqual([]);
+  });
+
+  it("what GitPulse sends work.runs.managed.continue is declared, and the op it names is the served one", () => {
+    const managedRs = read("src-tauri", "src", "workbench", "managed_run.rs");
+    const at = managedRs.indexOf("pub(crate) fn continue_params(");
+    expect(at, "continue_params not found").toBeGreaterThanOrEqual(0);
+    const rest = managedRs.slice(at);
+    const keys = paramKeys(rest.slice(0, rest.search(/\n\}\n/)));
+    expect(keys).toEqual(expect.arrayContaining(["id", "request_id", "message"]));
+    expect(undeclared(keys, "ManagedContinueParams")).toEqual([]);
+    expect(missingRequired(keys, "ManagedContinueParams")).toEqual([]);
+    const op = /pub\(crate\) const OP_CONTINUE: &str = "([^"]+)";/.exec(managedRs);
+    expect(op).not.toBeNull();
+    expect(contract.ops.optional).toContain(op![1]);
+    // What GitPulse reads back is a subset of what Manvi answers.
+    expect(declared("ManagedContinueResult")).toEqual(expect.arrayContaining(["state", "request_id", "turn", "max_turns", "idle_deadline"]));
   });
 
   it("what GitPulse sends work.scan.* and work.enhancements.refine is declared, and the root is always sent", () => {

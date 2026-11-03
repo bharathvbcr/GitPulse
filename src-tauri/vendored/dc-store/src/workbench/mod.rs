@@ -15,6 +15,7 @@ mod notifications;
 mod refine;
 mod runs;
 mod scope;
+mod signals;
 
 pub use briefs::{AGENT_GUIDANCE, AGENT_GUIDANCE_HEADING};
 pub(crate) use legacy::{require_retired as require_legacy_retired, retire as retire_legacy_tasks};
@@ -203,6 +204,7 @@ impl Store {
                 | "decisions.decide"
                 | "decisions.claim"
                 | "decisions.resolve"
+                | "signals.record"
                 | "store.compact"
                 | "store.upgrade"
         );
@@ -596,6 +598,18 @@ fn mutate(input: &Input<'_>, method: &str, now: i64, now_ms: i64) -> Result<Stri
             });
         }
         return replay_response(input.conn, &response);
+    }
+    if method == "signals.record" {
+        // A signal has no record of its own to revise: it is create-only, and
+        // its idempotency is its key, not an expected revision. The reply is
+        // kept verbatim because a repeat with a new request_id answers
+        // `recorded: false`, which the event alone cannot rebuild.
+        let response = signals::record(input, now)?;
+        input.conn.execute(
+            "INSERT INTO work_requests(id,method,input,response,sequence) VALUES(?1,?2,?3,?4,json_extract(?4,'$.sequence'))",
+            params![request, method, normalized, response],
+        )?;
+        return Ok(response);
     }
     let id = input.id("id")?;
     let expected = input.integer("expected_revision", None, MAX_INTEGER)?;

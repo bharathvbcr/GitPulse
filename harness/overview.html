@@ -68,7 +68,7 @@
           owner: "example", repo: "repo", pull_requests: ["empty", "stress", "bare"].includes(scenario) ? [] : [
             pr(148, "Make code review easier to navigate", "codex/review-flow"),
             pr(151, "Search across repository files", "feature/repository-search")],
-          workflow_runs: scenario === "partial" ? [{ id: 10, name: "Build", title: "Build", status: "completed", conclusion: "failure", head_branch: "main", url: "https://github.com/example/repo/actions/runs/10", created_at: new Date().toISOString() }] : [],
+          workflow_runs: scenario === "partial" ? [{ id: 10, name: "Build", title: "Build", status: "completed", conclusion: "failure", outcome: "failed", head_branch: "main", url: "https://github.com/example/repo/actions/runs/10", created_at: new Date().toISOString() }] : [],
           warnings: scenario === "partial" ? ["Fixture PR listing incomplete"] : [], prs_truncated: scenario === "partial", runs_truncated: scenario === "partial",
           issues: [], releases: [], error: null }),
         cmd_ledger_tail: () => [],

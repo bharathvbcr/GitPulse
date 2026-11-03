@@ -1,87 +1,51 @@
 /**
- * GitHub Actions' run vocabulary, reduced to a phase this app can act on.
+ * GitHub Actions' runs, reduced to a phase this app can act on.
  *
- * The sibling of `firebase/rolloutState.ts`, deliberately shaped the same way
- * and for the same reasons: closed sets, no fallthrough to a verdict, and a
- * state this build has never heard of shows its raw string rather than
- * inheriting a colour it did not earn.
+ * Whether a run is moving, delivered, broke or is waiting for a person is
+ * decided once, in Rust (`src-tauri/src/github/outcome.rs`), and arrives on
+ * every run as `outcome`. This module maps that to the one vocabulary the
+ * delivery views share (`MonitorPhase`) and keeps no table of `status` and
+ * `conclusion` words for the purpose. It had one, the work view had another,
+ * and they disagreed about `action_required`; the native CI watcher needs the
+ * same answer with no renderer running.
  *
- * Actions splits what Firebase keeps in one field. `status` says whether the
- * run is moving; `conclusion` says how it ended and is meaningless until it
- * has. Reading `conclusion` without checking `status` first is how a run that
- * is still executing gets reported as a success: an in-progress run's
- * conclusion is empty, and empty is not failure, so a naive
- * `conclusion !== "failure"` check calls every running job green.
- *
- * Vocabulary source: `gh run list --help` from gh 2.101.0, which documents the
- * union of both fields as its `--status` filter values —
- * `queued|completed|in_progress|requested|waiting|pending|action_required|
- * cancelled|failure|neutral|skipped|stale|startup_failure|success|timed_out`.
- * Captured from the tool rather than recalled; an invented list here would
- * silently misclassify whatever it got wrong.
+ * `status` and `conclusion` stay on the run for the words a reader sees, and
+ * the label tables below are only that: a run whose words this build has not
+ * heard of shows them in parentheses rather than inheriting a colour.
  */
 import type { MonitorPhase } from "../delivery/phase";
 import { displayText, type TimelineRow } from "../delivery/timeline";
-import type { WorkflowRunInfo } from "./types";
+import { asRunOutcome, type RunOutcome, type WorkflowRunInfo } from "./types";
 
 /**
- * Statuses that mean the run has not finished.
+ * The phase each outcome stands for.
  *
- * `waiting` and `pending` are in here because a run held for a deployment
- * approval or a concurrency group genuinely has not settled — but note that
- * both are bounded by the poll session's own ceiling, so a run waiting for an
- * approval that never comes stops being polled rather than forever.
+ * `cancelled` is `settled_bad` here although it is not `failed` and raises no
+ * red banner: the delivery views feed one pass rate with Firebase App Hosting
+ * (`rolloutState.ts`), where a cancelled rollout is a bad end, and a word that
+ * meant "bad" in one panel and "no verdict" in the other would make the rate
+ * unreadable. That is a statement about a rate, not about interrupting anyone.
+ *
+ * `needs_person` is `unknown`: settled, so the poll stops waiting on it, but it
+ * is a run held for an approval, which is neither a pass nor a breakage and
+ * must not enter a rate.
  */
-const IN_FLIGHT_STATUS: ReadonlySet<string> = new Set([
-  "queued",
-  "in_progress",
-  "requested",
-  "waiting",
-  "pending",
-]);
-
-/** The one status that means `conclusion` is now worth reading. */
-const COMPLETED_STATUS = "completed";
-
-/** Conclusions that mean the run delivered. A closed set of exactly one. */
-const OK_CONCLUSION: ReadonlySet<string> = new Set(["success"]);
+const PHASE_OF_OUTCOME: Readonly<Record<RunOutcome, MonitorPhase>> = {
+  in_flight: "in_flight",
+  passed: "settled_ok",
+  failed: "settled_bad",
+  cancelled: "settled_bad",
+  needs_person: "unknown",
+  unknown: "unknown",
+};
 
 /**
- * Conclusions that mean the run finished and did not deliver.
- *
- * `cancelled` is counted as a failure to match `rolloutState.ts`, which made
- * the same call for App Hosting. The two sources feed one pass rate and one
- * set of notices, and a word that means "bad" in one panel and "no verdict" in
- * the other would make that rate unreadable.
- *
- * What is deliberately NOT here: `neutral`, `skipped`, `stale` and
- * `action_required`. None of them is a failure. A run awaiting manual approval
- * has not broken anything, and a notice that cries failure over one teaches
- * people to stop reading the notices.
+ * The phase for a run. An outcome that is missing or that this build does not
+ * name is `unknown`: a payload that predates the field, or a newer one, never
+ * becomes a success by omission.
  */
-const BAD_CONCLUSION: ReadonlySet<string> = new Set([
-  "failure",
-  "cancelled",
-  "timed_out",
-  "startup_failure",
-]);
-
-/**
- * The phase for a run, from both of its fields.
- *
- * Every path that is not an explicit member of a closed set returns `unknown`,
- * including the one that matters most: `status: completed` with an empty
- * `conclusion`. That happens whenever the conclusion could not be read, and it
- * must never be a success.
- */
-export function runPhase(run: Pick<WorkflowRunInfo, "status" | "conclusion">): MonitorPhase {
-  const status = (run.status ?? "").trim().toLowerCase();
-  const conclusion = (run.conclusion ?? "").trim().toLowerCase();
-  if (IN_FLIGHT_STATUS.has(status)) return "in_flight";
-  if (status !== COMPLETED_STATUS) return "unknown";
-  if (OK_CONCLUSION.has(conclusion)) return "settled_ok";
-  if (BAD_CONCLUSION.has(conclusion)) return "settled_bad";
-  return "unknown";
+export function runPhase(run: Pick<WorkflowRunInfo, "outcome">): MonitorPhase {
+  return PHASE_OF_OUTCOME[asRunOutcome(run.outcome)];
 }
 
 /** Human labels for the words gh reports. */
@@ -115,10 +79,12 @@ const CONCLUSION_LABELS: Record<string, string> = {
 export function runStateLabel(run: Pick<WorkflowRunInfo, "status" | "conclusion">): string {
   const status = (run.status ?? "").trim().toLowerCase();
   const conclusion = (run.conclusion ?? "").trim().toLowerCase();
-  if (IN_FLIGHT_STATUS.has(status)) return STATUS_LABELS[status] ?? `Unknown (${status})`;
-  if (status === COMPLETED_STATUS) {
+  if (Object.hasOwn(STATUS_LABELS, status)) return STATUS_LABELS[status];
+  if (status === "completed") {
     if (conclusion === "") return "Completed (no conclusion reported)";
-    return CONCLUSION_LABELS[conclusion] ?? `Unknown (${conclusion})`;
+    return Object.hasOwn(CONCLUSION_LABELS, conclusion)
+      ? CONCLUSION_LABELS[conclusion]
+      : `Unknown (${conclusion})`;
   }
   if (status === "") return "Unknown (no status reported)";
   return `Unknown (${status})`;
@@ -132,7 +98,7 @@ export function runStateLabel(run: Pick<WorkflowRunInfo, "status" | "conclusion"
  * panel to check. Kept identical to `rolloutStateClass` so a failed deploy and
  * a failed run are the same red.
  */
-export function runStateClass(run: Pick<WorkflowRunInfo, "status" | "conclusion">): string {
+export function runStateClass(run: Pick<WorkflowRunInfo, "outcome">): string {
   const phase = runPhase(run);
   if (phase === "settled_ok") return "text-green-700 dark:text-green-400";
   if (phase === "settled_bad") return "text-red-700 dark:text-red-400";

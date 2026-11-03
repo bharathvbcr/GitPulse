@@ -138,7 +138,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-store",
-        "commit": "7926697d67876549f72905a09fca4eb03e3c7c33"
+        "commit": "01f027e652ee662ca8846c34c4095665f8c73d09"
       },
       "omitted": [
         "tests/",
@@ -160,13 +160,13 @@
         "src/schema.rs": "aa66e3c78cb596caec58f09ebd1becce5dc2b4510c27f3fc309613a7537c55ee",
         "src/tasks.rs": "f8e1567cea344e31b6c1917073a8f6579d2dbec814555e10855d9b156f2010b2",
         "src/workbench/agent_guidance.md": "422b999eea166cfb75310decb92829dee6583ef8ca8a8af85762ff1274d70667",
-        "src/workbench/attention.rs": "477689a39d7bd4733098005841e051f2c45c2e8ffd885c2dfe0ea191dc41591e",
+        "src/workbench/attention.rs": "fc550745816dc0bc57b37753d31c2bead8b059f7e5cbfa73ca61c6370f9cc016",
         "src/workbench/attention.sql": "09b96497ba44f1141a64b2a5a86aff06114cb13b1c0b2a3bdab2345ce4915ad3",
         "src/workbench/automation.rs": "802914d535b8431f24fa920575098c858a15039fa1dbc04880340a5fc6451047",
         "src/workbench/automation.sql": "dd8d201b530e49fa7fe1a245ca267d879be35298ab7703723d0c2eb33ac514df",
         "src/workbench/briefs.rs": "75f4d91d7995c31a2b14804835d4fef48b71e11ce3c7ee7acabfc83a954513fb",
         "src/workbench/compaction.rs": "00e02f6f19986a2e0d6e7480f0b8df566dbf741e2d73e7efa87153bd0ba146d3",
-        "src/workbench/decisions.rs": "c7452e59b4adae2cedbeda983d793e6146d98d47d66f750de75e3c616183b892",
+        "src/workbench/decisions.rs": "f9143366189dc3f107ef58dda4d24b99de316e5f0f61d3f6fe6a67f5ff08e69f",
         "src/workbench/decisions.sql": "e4acc6c419065ac479262a6ef861e4c1cec9b0234a9662641d48743fa2c25985",
         "src/workbench/enhancement_lifecycle_tests.rs": "f6e534cec50f4baa0d3e0a2a19e1c6f6247d57d4876a85f840582baabfe70616",
         "src/workbench/enhancements.rs": "9c0039d8b309591fce6118ecfecfdf22af9d1484c0dc58fefecc7c8b93459a43",
@@ -177,14 +177,15 @@
         "src/workbench/items.sql": "a0fa95047257e7433582b892878daa37275ef26877a45034d6dd069eaab31252",
         "src/workbench/legacy.rs": "dce6ed06c3b08b8c241637d91bdcb13d0219e9effce40bcf3ef9bac054d5342a",
         "src/workbench/logs_tests.rs": "352308cfbe50d1a74cb4e84b0c78cbb474e15036f29f3cc8938f7624b5419053",
-        "src/workbench/mod.rs": "29d56e367337ea3f6f865508ea515e4a950784eac201c7dfd2ae71f1a66c6351",
+        "src/workbench/mod.rs": "88ea5315c442ff169f3fceb00a3fd7a8322830c111e1744ad51b9bb3b2bdbdc2",
         "src/workbench/notifications.rs": "b845ec5c599f621a3c57f5b807f75c09c911d1c01df3fce60d39e107c6f60e8e",
         "src/workbench/notifications.sql": "35d39f5bcd61a1750aeeee661b053fa1ee7298271c90b6f4357180b7323489c5",
         "src/workbench/refine.rs": "c77e0189d7cb8e9c06575dc672c6d94af85d77028e23647efc135985ed2dd350",
         "src/workbench/runs.rs": "36a11de6f98966d614b07eb024281803f6ec645ec8fdacd613beaa3589200b25",
         "src/workbench/runs.sql": "03b207aafb7c99df78b3ab465314b322e36e8056f339c3db26af001bd92cbe59",
         "src/workbench/schema.sql": "d1e7452b7a5eb0e5bf2fdf71aa0b6a0590cd0f130665dfd2f00e9bfd511b2c19",
-        "src/workbench/scope.rs": "526f28122b77aa9dc1590976dafefd7918a707e4a559732009bcdd78b0a859b1"
+        "src/workbench/scope.rs": "526f28122b77aa9dc1590976dafefd7918a707e4a559732009bcdd78b0a859b1",
+        "src/workbench/signals.rs": "a89bfe71f37513af9ba5dbb0c26a73134a640e7691b48227776cfca23d61cccf"
       }
     },
     {

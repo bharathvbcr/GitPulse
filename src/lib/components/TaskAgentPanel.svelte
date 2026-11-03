@@ -23,6 +23,7 @@
   import AttemptReview from "./AttemptReview.svelte";
   import AgentDecisions from "./AgentDecisions.svelte";
   import RunActivity from "./RunActivity.svelte";
+  import SendToAgent from "./SendToAgent.svelte";
   import TaskHandoffForm from "./TaskHandoffForm.svelte";
   import { interfaceStore } from "../stores/interfaceStore";
   import { attemptNotices, clearAttemptNotice, consumeTaskTerminal, noteAttempt, pruneTaskTerminals, taskTerminalRequests } from "../terminal/taskLaunches";
@@ -92,6 +93,8 @@
    * why when there is none.
    */
   const RESUMABLE = ["exited", "failed", "cancelled"];
+  /** States of an attempt that has (or had) an agent a message could reach. */
+  const SENDABLE = ["starting", "running", ...RESUMABLE];
   /**
    * The history's page ceiling. The store pages runs; this bounds how many a
    * sheet keeps in memory and re-renders on every poll.
@@ -664,6 +667,10 @@
       {#if canRelease(run)}<button class="gp-btn" type="button" onclick={() => release(run)} disabled={!mayMutate} title="Frees the checkout if the agent and the GitPulse that launched it have both stopped. A running agent is never released. The worktree and its changes stay on disk.">Release checkout</button>{/if}
       {#if run.session_id && run.kind === "managed"}<button class="gp-btn" type="button" onclick={() => { reviewingRunID = reviewingRunID === run.id ? null : run.id; }}>{reviewingRunID === run.id ? "Hide requests" : "Review requests"}</button>{/if}
     </div>
+
+    <!-- A message back to this attempt's agent. Offered whenever there is an agent that ran; the host says which
+         way it would go, or why none, and nothing is sent until the reader confirms (SendToAgent). -->
+    {#if SENDABLE.includes(run.state)}<SendToAgent runId={run.id} taskTitle={run.task_title} />{/if}
 
     {#if run.kind === "managed" && run.provider_state}<p>Provider turn: {run.provider_state}. {run.provider_state === "completed" ? "Review the result before accepting the task." : ""}</p>{/if}
     {#if run.kind === "managed" && detail?.id === run.id}

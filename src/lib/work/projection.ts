@@ -422,8 +422,19 @@ export function rowNeedsAttention(row: WorkRow): boolean {
   return row.operation !== null || dirty.files > 0 || dirty.scanned < dirty.total ||
     row.worktrees.some(binding => binding.operationChecked === false) ||
     row.pullRequests.some(pr => pr.ci_status.toLowerCase() === "failure" || pr.review_decision.toUpperCase() === "CHANGES_REQUESTED") ||
-    latestRuns(row).some(run => run.status.toLowerCase() === "completed" &&
-      ["failure", "timed_out", "action_required", "startup_failure"].includes(run.conclusion.toLowerCase()));
+    latestRuns(row).some(run => runNeedsAttention(run));
+}
+
+/**
+ * A latest run that wants a person: it failed, or it is held for one.
+ *
+ * Read from the outcome Rust decided (`github/outcome.rs`), not from `status`
+ * and `conclusion`. `needs_person` (`action_required`) counts here because
+ * someone must act before it can go on, while it is never `failed`: the Remote
+ * panel raises no red banner for it. One rule, stated once, at the owner.
+ */
+export function runNeedsAttention(run: Pick<WorkflowRunInfo, "outcome">): boolean {
+  return run.outcome === "failed" || run.outcome === "needs_person";
 }
 
 /** The worktree on this row that is blocked, if any. */

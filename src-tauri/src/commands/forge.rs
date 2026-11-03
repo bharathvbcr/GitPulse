@@ -56,6 +56,7 @@ pub async fn cmd_github_runs(repo_path: String) -> crate::github::GitHubRunsRepo
         runs: Vec::new(),
         truncated: false,
         error: Some(e),
+        went_red: Vec::new(),
     })
 }
 
@@ -390,7 +391,49 @@ pub async fn cmd_firebase_create_rollout(
 /// Every step is judged by the harness command gate and reaches the ledger
 /// with its verdict; a completed run against a clean tree is recorded as a
 /// git-native verification note on HEAD. See `ci_local` for both.
+///
+/// In an agent attempt's worktree the run is also the attempt's: its note names
+/// the attempt's task, and the result is reported to that task as a `ci_local`
+/// signal (see `workbench::ci_watch`). Failing to find the attempt is not a
+/// failure of the run, so it is reported in `signal_error`, never swallowed.
 #[tauri::command(async)]
-pub async fn cmd_ci_local(repo_path: String) -> Result<crate::ci_local::CiLocalReport, IpcError> {
-    off_thread(move || crate::ci_local::run_ci_local(&repo_path)).await
+pub async fn cmd_ci_local(
+    workbench: State<'_, crate::workbench::WorkbenchState>,
+    repo_path: String,
+) -> Result<crate::ci_local::CiLocalReport, IpcError> {
+    let host = workbench.inner().clone();
+    off_thread(move || {
+        let (attempt, lookup_error) =
+            match crate::workbench::ci_watch::attempt_of(&host, &repo_path) {
+                Ok(found) => (found, String::new()),
+                Err(error) => (
+                    None,
+                    format!(
+                        "the attempt for this checkout could not be looked up: {}",
+                        error.message
+                    ),
+                ),
+            };
+        let mut report = crate::ci_local::run_ci_local_for(
+            &repo_path,
+            attempt.as_ref().map(|a| a.task_id.as_str()),
+        )?;
+        report.signal_error = lookup_error;
+        if let (Some(attempt), Some((kind, conclusion))) =
+            (attempt, crate::ci_local::attempt_signal(&report))
+        {
+            if let Err(error) = crate::workbench::ci_watch::record_local(
+                &host,
+                &attempt,
+                kind,
+                conclusion,
+                &report.recorded_commit,
+            ) {
+                report.signal_error =
+                    format!("the task was not told of this result: {}", error.message);
+            }
+        }
+        Ok::<_, CommandError>(report)
+    })
+    .await
 }

@@ -26,6 +26,9 @@
        * runs gh; every IPC answer is a fixture and every request is recorded.
        */
       import "../src/app.css";
+      // The outcome Rust's classifier gives a run's words (`github/outcome.rs`,
+      // through its shared cases): fixtures carry the real answer, not a guess.
+      import { outcomeFor } from "../src/lib/github/runOutcomeFixtures.ts";
 
       const params = new URLSearchParams(location.search);
       const errors = [];
@@ -52,7 +55,8 @@
         url: `https://github.com/acme/app/pull/${number}`, is_draft: false, ci_status: "success",
         created_at: iso(600 + number), updated_at: iso(60), review_decision: "APPROVED", first_review_at: iso(300), ...extra,
       });
-      const run = (id, extra = {}) => ({
+      const withOutcome = (r) => ({ ...r, outcome: outcomeFor(r.status, r.conclusion) });
+      const run = (id, extra = {}) => withOutcome({
         id, name: "CI", title: `run ${id}`, status: "completed", conclusion: "success", head_branch: "main",
         url: `https://github.com/acme/app/actions/runs/${id}`, created_at: iso(id), started_at: iso(id), updated_at: iso(id),
         head_sha: "d".repeat(40), event: "push", ...extra,
@@ -177,7 +181,7 @@
           return { policy: null, output: `Merged #${a.action.number} into main.` };
         },
         cmd_github_workflows: (a) => workflowsFor(a.repoPath),
-        cmd_github_runs: (a) => pollAnswers.shift() ?? { available: true, checked: false, cli_present: true, owner: "acme", repo: "app", runs: [], truncated: false, error: "no answer queued" },
+        cmd_github_runs: (a) => pollAnswers.shift() ?? { available: true, checked: false, cli_present: true, owner: "acme", repo: "app", runs: [], truncated: false, error: "no answer queued", went_red: [] },
         cmd_github_trigger_workflow: () => ({ policy: VERDICT, output: actionOutput }),
         cmd_github_rerun_run: () => ({ policy: null, output: "rerun queued by gh" }),
         cmd_github_cancel_run: () => ({ policy: null, output: "" }),
@@ -419,8 +423,11 @@
           // B's run lands first; the run started on A lands after it and must lose.
           ciPending[1]({ steps: [{ name: "vitest", command: "npx vitest run", status: "passed", detail: "ok", duration_ms: 1200 }], passed: 1, failed: 0, skipped: 0,
             total_duration_ms: 1200, recorded_commit: "0123456789abcdef", not_recorded_reason: "",
+            signal_error: "the task was not told of this result: The task no longer exists.",
             test_scope: { mode: "full", reason: "the graph is unavailable", seeds: [], test_files: [], fail_closed: true } });
           await settle();
+          check("an attempt's task that was not told of the result says so, apart from the note", () =>
+            text().includes("the task was not told of this result: The task no longer exists.") && text().includes("recorded on 01234567"));
           check("the live run's report lands, with its fail-closed full-suite reason", () =>
             text().includes("CI:local") && text().includes("full suite — the graph is unavailable"));
           ciPending[0]({ steps: [{ name: "stale", command: "x", status: "passed", detail: "", duration_ms: 1 }], passed: 1, failed: 0, skipped: 0,
@@ -516,10 +523,21 @@
           // The in-flight run is on another branch and far past the preview:
           // the poll must watch it anyway. The first answer could not run; the
           // second ran, and the run it was watching went red.
+          // The banner is the native observer's word (`went_red`), not the
+          // panel's own diff of two listings: the second answer shows run 10
+          // red and the observer says nothing new, so the panel must say
+          // nothing; the third repeats the rows and carries the observer's news.
+          // That third answer is also the case where the CI watcher crossed
+          // in-flight to failed before the panel looked: the panel's own two
+          // listings both show run 10 red, so nothing the renderer could diff
+          // explains the banner, and it must still appear. The Rust side of it
+          // is `the_panel_still_hears_of_a_red_finish_the_watcher_saw_first`.
+          const redTen = withOutcome({ ...runsA.find((r) => r.id === 10), status: "completed", conclusion: "failure" });
+          const redRows = runsA.map((r) => r.id === 10 ? redTen : { ...r, title: `polled ${r.id}` });
           pollAnswers.push(
-            { available: true, checked: false, cli_present: true, owner: "acme", repo: "app", runs: [], truncated: false, error: "gh: network down" },
-            { available: true, checked: true, cli_present: true, owner: "acme", repo: "app", truncated: false, error: null,
-              runs: runsA.map((r) => r.id === 10 ? { ...r, status: "completed", conclusion: "failure" } : { ...r, title: `polled ${r.id}` }) },
+            { available: true, checked: false, cli_present: true, owner: "acme", repo: "app", runs: [], truncated: false, error: "gh: network down", went_red: [] },
+            { available: true, checked: true, cli_present: true, owner: "acme", repo: "app", truncated: false, error: null, runs: redRows, went_red: [] },
+            { available: true, checked: true, cli_present: true, owner: "acme", repo: "app", truncated: false, error: null, runs: redRows, went_red: [redTen] },
           );
           const contextsDuringPoll = count("cmd_github_context");
           await until(() => count("cmd_github_runs") >= 1, 15000);
@@ -528,6 +546,9 @@
             count("cmd_github_runs") >= 1 && count("cmd_github_context") === contextsDuringPoll);
           check("a poll that could not run leaves the fetched rows in place", () =>
             runTitles().join() === "run 1,run 2,run 3" && !text().includes("Run listing unavailable"));
+          await until(() => runTitles()[0] === "polled 1", 15000);
+          check("rows that turned red are not announced unless the native observer says they went red", () =>
+            !text().includes("Failed while watching:"));
           await until(() => text().includes("Failed while watching:"), 15000);
           check("a run that went red while watched is reported", () => text().includes("Failed while watching: release build"));
           button("this branch").click();

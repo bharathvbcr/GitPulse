@@ -134,7 +134,7 @@
   import { copyText } from "../desktop/clipboard";
   import { ptyBus } from "../terminal/ptyBus.tauri";
   import { launcherLabel, type LauncherKind, type ResumeLaunch } from "../terminal/tabs";
-  import { agentPromptArgs } from "../terminal/launchRequests";
+  import { agentPromptArgs, resumeArgs } from "../terminal/launchRequests";
   import { conversationForStart, hostedClaude, resumers, settleConversation, type ExitFacts, type ResumeOutcome } from "../terminal/hostedClaude";
   import { checkTranscripts } from "../terminal/transcripts";
   import {
@@ -703,8 +703,18 @@
     // front of these at spawn so they can never land behind Claude Code's
     // `-- <text>` and be read as prompt — and so a task attempt, which never
     // passes through here, gets the same ones.
-    const args = resume ? ["--resume", resume.sessionId] : agentPromptArgs(kind, initialPrompt) ?? [];
+    const args = resume ? resumeArgs(resume.sessionId, takeResumePrompt()) : agentPromptArgs(kind, initialPrompt) ?? [];
     return kind === "shell" ? {} : { program: kind, args };
+  }
+  /**
+   * The first message of a resumed conversation, once: a restart of this tab
+   * resumes without it, because the conversation already heard it.
+   */
+  let resumePrompt: string | undefined = untrack(() => resume?.prompt);
+  function takeResumePrompt(): string | undefined {
+    const prompt = resumePrompt;
+    resumePrompt = undefined;
+    return prompt;
   }
 
   /**

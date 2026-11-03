@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { AdaptiveHost } from "../runtime/adaptiveTimer";
 import { runPhase, runTimelineRow } from "../github/runLifecycle";
+import { outcomeFor } from "../github/runOutcomeFixtures";
 import type { WorkflowRunInfo } from "../github/types";
 import { createLivePoll } from "./livePoll";
 import { isSettled, isVerdict, type MonitorPhase } from "./phase";
@@ -99,12 +100,16 @@ const INSTANTS = [
 ];
 
 function fuzzRun(random: () => number, id: number): WorkflowRunInfo {
+  const status = pick(random, STATUS_WORDS);
+  const conclusion = pick(random, CONCLUSION_WORDS);
   return {
+    // What Rust would have made of these words (`github/outcome.rs`).
+    outcome: outcomeFor(status, conclusion),
     id,
     name: pick(random, ["ci", "release", "", "a".repeat(500)]),
     title: pick(random, ["build", "", "x".repeat(1000), "multi\nline\ttitle"]),
-    status: pick(random, STATUS_WORDS),
-    conclusion: pick(random, CONCLUSION_WORDS),
+    status,
+    conclusion,
     head_branch: pick(random, ["main", "", "feat/x"]),
     url: pick(random, ["https://example.invalid/1", ""]),
     created_at: pick(random, INSTANTS),

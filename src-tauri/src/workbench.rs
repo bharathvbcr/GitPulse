@@ -14,6 +14,8 @@ use tauri::{Emitter, State};
 
 pub(crate) mod agent_models;
 mod agent_worktree;
+#[doc(hidden)]
+pub(crate) mod ci_watch;
 pub(crate) mod claude_hook;
 pub(crate) mod conversation;
 #[doc(hidden)]
@@ -28,6 +30,7 @@ mod receipts;
 mod reconcile;
 pub(crate) mod retention;
 pub mod review;
+mod send_to_agent;
 mod suggest;
 pub(crate) mod terminal_command;
 mod terminal_launch;
@@ -477,6 +480,12 @@ impl WorkbenchState {
                 | "decisions.create"
                 | "decisions.claim"
                 | "decisions.resolve"
+                // A CI result is the host watcher's observation of GitHub
+                // (`ci_watch`) or of a local CI run (`ci_local`). Through
+                // this path a renderer could write a "your branch passed CI"
+                // notice that GitHub never sent, and have it delivered
+                // natively as if GitPulse had checked.
+                | "signals.record"
                 // Preparation goes through `runs.prepare_terminal` /
                 // `runs.prepare_managed`, which observe the checkout and name
                 // the user's limit. The raw method would take a renderer's
@@ -524,6 +533,12 @@ impl WorkbenchState {
         }
         if method == "runs.conversation" {
             return conversation::find(self, input);
+        }
+        // A person's confirmed message to the agent behind an attempt. The
+        // preview and the send are one method so the route a send takes is
+        // decided in one place (`send_to_agent`), never re-derived by a caller.
+        if method == "runs.send_to_agent" {
+            return send_to_agent::send(self, input);
         }
         // The board's Merge: the merge `gitpulse_merge_tasks` runs, not a
         // second implementation of it. It is a sequence of store writes, so
@@ -684,6 +699,15 @@ impl WorkbenchState {
             }
         }
         result
+    }
+
+    /// Asks the native notification coordinator to look for new notices now
+    /// instead of on its next five-second pass. For host writers that go
+    /// around [`Self::request`], which does this for the inbox writes it makes.
+    pub(crate) fn wake_notifications(&self) {
+        if let Some(notifications) = self.0.notifications.get() {
+            notifications.wake();
+        }
     }
 
     /// A call that names a model selection (or the default one): the worker is
@@ -1575,6 +1599,7 @@ done
             "decisions.create",
             "decisions.claim",
             "decisions.resolve",
+            "signals.record",
             "notifications.claim",
             "notifications.finish",
             "notifications.activate",
