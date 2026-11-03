@@ -251,7 +251,10 @@ describe("App overlay wiring", () => {
     expect(source).toContain('invoke("cmd_set_exit_guard_ready")');
     // The quit's choice for sessions the terminal host keeps reaches the
     // backend with the exit itself (`quitChoice.ts`).
-    expect(source).toContain('invoke("cmd_exit_app", terminals ? { terminals } : {})');
+    // Managed runs a hosted Manvi keeps get the same choice, in the same call.
+    expect(source).toContain('invoke("cmd_exit_app", quitChoices)');
+    expect(source).toContain("...(terminals ? { terminals } : {})");
+    expect(source).toContain("...(managedRuns.managed ? { managed: managedRuns.managed } : {})");
     expect(source).toContain("decideQuitTerminals({");
     expect(source).toContain('window.addEventListener("beforeunload"');
     expect(source).toContain("await editorFileSaveQueue.whenIdle()");

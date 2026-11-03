@@ -6,6 +6,11 @@
    * starts, so the row says which backend holds the terminals now and that a
    * change waits for the next launch.
    *
+   * The same choice keeps managed agent runs (Codex and Claude driven by
+   * Manvi) running, when the installed Manvi can serve on a socket. Whether it
+   * does — and, when it cannot, why managed runs still end with the app — is
+   * its own line below the note, as the backend reports it.
+   *
    * What is wrong with the host — another version's host still running
    * sessions, a host that would not start — is shown here as the backend
    * reports it, never summarised into "fine".
@@ -28,10 +33,8 @@
   const view = $derived($agentDefaultsStore);
   const chosen = $derived(view.defaults.keep_terminals_running === true);
 
-  function load() {
-    if (loaded) return;
-    loaded = true;
-    void loadAgentDefaults();
+  function readBackend() {
+    backendError = "";
     readTerminalBackend()
       .then((status) => {
         backend = status;
@@ -39,6 +42,13 @@
       .catch((err: unknown) => {
         backendError = formatError(err);
       });
+  }
+
+  function load() {
+    if (loaded) return;
+    loaded = true;
+    void loadAgentDefaults();
+    readBackend();
   }
 
   onMount(() => {
@@ -59,6 +69,9 @@
     error = "";
     try {
       await saveAgentDefaults(next ? { ...rest, keep_terminals_running: true } : rest);
+      // What the installed Manvi can do about managed runs follows the saved
+      // choice at once; the terminals' answer still waits for the next launch.
+      readBackend();
     } catch (err) {
       error = formatError(err);
       input.checked = chosen;
@@ -88,11 +101,20 @@
   <p class="text-textMuted text-[10px] leading-snug mt-1" data-testid="keep-terminals-note">
     Terminals and the agents in them run in a process of their own, so quitting GitPulse — or GitPulse crashing — does not end
     them. The next launch lists them, shows what they printed meanwhile, and records any that finished. Quitting asks whether to
-    stop them or leave them running.
+    stop them or leave them running. Managed agent runs (Codex and Claude driven by Manvi) are kept the same way when the
+    installed Manvi can host them.
     {#if backend}
       Now: {running ? "kept running when GitPulse quits" : "ended when GitPulse quits"}{pending ? "; your choice applies when GitPulse next starts" : ""}.
     {/if}
   </p>
+  {#if backend?.managed}
+    <p
+      class="text-[10px] leading-snug mt-1 {backend.managed.requested && !backend.managed.hosted ? 'text-amber-600 dark:text-amber-400' : 'text-textMuted'}"
+      data-testid="keep-managed-status"
+    >
+      {backend.managed.detail}
+    </p>
+  {/if}
   {#if backendError}
     <div class="flex items-start gap-1.5 text-amber-600 dark:text-amber-400 text-[10px] mt-1.5">
       <AlertTriangle size={12} class="shrink-0 mt-px" />

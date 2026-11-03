@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { cancelTaskRun, checkoutIdentity, findConversation, listHoldingRuns, listLiveTaskRuns, releaseTaskRun, getRepository, getTaskRun, launchManagedRun, stopManagedRun, listTaskRuns, prepareTaskRun, taskRun, type RunPreparation, type TaskRun } from "./client";
+import { cancelTaskRun, checkoutIdentity, findConversation, listAllLiveRuns, listHoldingRuns, listLiveTaskRuns, releaseTaskRun, getRepository, getTaskRun, launchManagedRun, stopManagedRun, listTaskRuns, prepareTaskRun, taskRun, type RunPreparation, type TaskRun } from "./client";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const native = vi.mocked(invoke);
@@ -107,6 +107,20 @@ describe("task attempt transport", () => {
     for (const call of native.mock.calls) expect(JSON.parse((call[1] as {input: string}).input)).toMatchObject({task_id:"task", newest:true});
     native.mockImplementation(async () => JSON.stringify({ok:true,items:[{...run, task_id:"other"}],total:1,shown:1,has_more:false,next_cursor:null}));
     await expect(listLiveTaskRuns("task")).rejects.toMatchObject({code:"protocol_error"});
+  });
+  it("judges a listing's completeness over the working states apart from a prepared backlog", async () => {
+    const overflowing = (full: string) => native.mockImplementation(async (command, args) => {
+      if (command !== "cmd_workbench_request") return null; // vitest calls the mock returned by beforeEach as a cleanup hook
+      const input = JSON.parse((args as {input: string}).input) as {state: string};
+      const more = input.state === full;
+      return JSON.stringify({ok:true,items:[{...run, id:input.state, state:input.state}],total:more ? 101 : 1,shown:1,has_more:more,next_cursor:more ? "next" : null});
+    });
+    // A long prepared backlog says nothing about whether the working runs were all seen.
+    overflowing("prepared");
+    expect(await listAllLiveRuns()).toMatchObject({complete: false, workingComplete: true});
+    // A working state that overflowed does.
+    overflowing("running");
+    expect(await listAllLiveRuns()).toMatchObject({complete: false, workingComplete: false});
   });
   it("releases only what the host says it released, and passes a refusal's reason through", async () => {
     const released = {...run, state:"exited", outcome_uncertain:true, reason:"Reconciled: agent process 42 is no longer running"};
