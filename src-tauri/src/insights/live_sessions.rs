@@ -50,10 +50,24 @@ const BIRTH_CLOCK_SLACK_NANOS: u128 = 5_000_000_000;
 /// Codex keeps rollout logs under `~/.codex/sessions`, which record that a
 /// session happened, not that it is running or where. Listing it here is
 /// what makes its absence from the fallback's counts an explicit "unknown".
-const UNOBSERVABLE_KINDS: &[(&str, &str)] = &[(
-    "codex",
-    "Codex keeps no registry of running sessions that GitPulse can read, so its live sessions cannot be counted",
-)];
+const UNOBSERVABLE_KINDS: &[(&str, &str)] = &[
+    (
+        "codex",
+        "Codex keeps no registry of running sessions that GitPulse can read, so its live sessions cannot be counted",
+    ),
+    (
+        "antigravity",
+        "Antigravity keeps no registry of running sessions that GitPulse can read, so its live sessions cannot be counted",
+    ),
+    (
+        "devcouncil",
+        "DevCouncil keeps no registry of running sessions that GitPulse can read, so its live sessions cannot be counted",
+    ),
+    (
+        "manvi",
+        "Manvi keeps no registry of running sessions that GitPulse can read, so its live sessions cannot be counted",
+    ),
+];
 
 /// What one detector saw, before attribution to any repository.
 #[derive(Debug, Clone, Default)]
@@ -117,9 +131,12 @@ pub(crate) fn observe() -> Observation {
 }
 
 /// The kinds the process scan observes.
-const SCANNED_KINDS: [crate::sysload::AgentKind; 2] = [
+const SCANNED_KINDS: [crate::sysload::AgentKind; 5] = [
     crate::sysload::AgentKind::Claude,
     crate::sysload::AgentKind::Codex,
+    crate::sysload::AgentKind::Antigravity,
+    crate::sysload::AgentKind::DevCouncil,
+    crate::sysload::AgentKind::Manvi,
 ];
 
 /// Turns the process scan's sessions into per-kind observations, enriched
@@ -753,18 +770,32 @@ mod tests {
             .map(|i| scanned(AgentKind::Claude, 300 + i, Some(repo.path())))
             .collect();
         sessions.push(scanned(AgentKind::Codex, 400, Some(repo.path())));
+        sessions.push(scanned(AgentKind::Antigravity, 401, Some(repo.path())));
+        sessions.push(scanned(AgentKind::DevCouncil, 402, Some(repo.path())));
+        sessions.push(scanned(AgentKind::Manvi, 403, Some(repo.path())));
         let facet = attribute(
             &from_scan(&sessions, &[reg.path().to_path_buf()]),
             &[repo.path().to_string_lossy().into_owned()],
         );
-        assert_eq!(facet.sessions, 8, "{facet:?}");
+        assert_eq!(facet.sessions, 11, "{facet:?}");
         assert!(
             facet.ok,
-            "both kinds observed, nothing unverified: {facet:?}"
+            "all kinds observed, nothing unverified: {facet:?}"
         );
         let claude = facet.kinds.iter().find(|k| k.kind == "claude").unwrap();
         let codex = facet.kinds.iter().find(|k| k.kind == "codex").unwrap();
+        let antigravity = facet
+            .kinds
+            .iter()
+            .find(|k| k.kind == "antigravity")
+            .unwrap();
+        let devcouncil = facet.kinds.iter().find(|k| k.kind == "devcouncil").unwrap();
+        let manvi = facet.kinds.iter().find(|k| k.kind == "manvi").unwrap();
         assert_eq!((claude.sessions, codex.sessions), (7, 1));
+        assert_eq!(
+            (antigravity.sessions, devcouncil.sessions, manvi.sessions),
+            (1, 1, 1)
+        );
         let rows = &facet.worktrees[0].sessions;
         let busy = rows.iter().filter(|s| s.status == "busy").count();
         assert_eq!(busy, 5, "the five with registry entries are enriched");

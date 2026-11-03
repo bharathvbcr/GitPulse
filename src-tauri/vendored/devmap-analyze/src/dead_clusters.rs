@@ -29,6 +29,9 @@ use devmap_resolve::model::{Resolution, ResolutionResult, ResolvedEdge};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 
+#[cfg(all(test, feature = "parse"))]
+mod handed_on_sets_tests;
+
 /// Most clusters reported. Shares the reasoning behind `DEAD_CANDIDATE_CAP`:
 /// this is a debt list a human reads, and an unbounded one is not read at all.
 pub const DEAD_CLUSTER_CAP: usize = 50;
@@ -225,7 +228,10 @@ fn is_reaching_edge(edge: &ResolvedEdge) -> bool {
 /// Both the qualified name and the short name are recorded, because a cluster
 /// member is identified by its full `file::Type.method` id while an unresolved
 /// row carries only the callee spelling.
-fn qualifying_symbols<'a>(resolution: &'a ResolutionResult) -> BTreeSet<&'a str> {
+fn qualifying_symbols<'a>(
+    resolution: &'a ResolutionResult,
+    unresolved_names: &'a BTreeSet<String>,
+) -> BTreeSet<&'a str> {
     let mut named: BTreeSet<&'a str> = BTreeSet::new();
     for edge in &resolution.edges {
         if !is_symbol_edge(edge) {
@@ -238,7 +244,7 @@ fn qualifying_symbols<'a>(resolution: &'a ResolutionResult) -> BTreeSet<&'a str>
             named.insert(edge.target_symbol.as_str());
         }
     }
-    named.extend(crate::liveness::unresolved_namesake_names(resolution));
+    named.extend(unresolved_names.iter().map(String::as_str));
     named
 }
 
@@ -359,9 +365,9 @@ pub(crate) fn strongly_connected_components(adjacency: &[Vec<u32>]) -> Vec<Vec<u
 /// `liveness::exempt_symbol_names` is now the one owner and both passes read it.
 fn externally_reachable_symbols(
     extractions: &[Extraction],
-    resolution: &ResolutionResult,
+    exempt: &BTreeSet<String>,
 ) -> BTreeSet<String> {
-    let mut reachable = crate::liveness::exempt_symbol_names(extractions, resolution);
+    let mut reachable = exempt.clone();
     for ext in extractions {
         for symbol in &ext.symbols {
             if symbol.is_exported {
@@ -386,7 +392,33 @@ fn externally_reachable_symbols(
 }
 
 /// Find components of the resolved call graph that nothing outside reaches.
+///
+/// Derives the two evidence sets itself; a caller that already holds them (the
+/// liveness pass builds both) uses [`dead_clusters_with`] and skips the second
+/// walk of the corpus.
 pub fn dead_clusters(extractions: &[Extraction], resolution: &ResolutionResult) -> DeadClusterScan {
+    let exempt = crate::liveness::exempt_symbol_names(extractions, resolution);
+    let unresolved_names: BTreeSet<String> = crate::liveness::unresolved_namesake_names(resolution)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    dead_clusters_with(extractions, resolution, &exempt, &unresolved_names)
+}
+
+/// [`dead_clusters`] over evidence sets the caller already built.
+///
+/// **Invariant the caller owns:** `exempt` equals
+/// `liveness::exempt_symbol_names(extractions, resolution)` and
+/// `unresolved_names` equals `liveness::unresolved_namesake_names(resolution)`
+/// for these very arguments. Passing sets from a different corpus silently
+/// changes which components are reported. `LivenessOutcome::exempt_names` and
+/// `LivenessOutcome::unresolved_names` satisfy it, and a test pins that.
+pub fn dead_clusters_with(
+    extractions: &[Extraction],
+    resolution: &ResolutionResult,
+    exempt: &BTreeSet<String>,
+    unresolved_names: &BTreeSet<String>,
+) -> DeadClusterScan {
     // Node ids, assigned in first-seen order over a deterministically ordered
     // edge list. `resolution.edges` is sorted by the resolver (R4), so the ids
     // — and therefore the cluster ids below — are stable across runs.
@@ -463,8 +495,8 @@ pub fn dead_clusters(extractions: &[Extraction], resolution: &ResolutionResult) 
         }
     }
 
-    let externally_reachable = externally_reachable_symbols(extractions, resolution);
-    let qualifying = qualifying_symbols(resolution);
+    let externally_reachable = externally_reachable_symbols(extractions, exempt);
+    let qualifying = qualifying_symbols(resolution, unresolved_names);
 
     let mut clustered_symbols: BTreeSet<String> = BTreeSet::new();
     let mut found: Vec<DeadClusterReport> = Vec::new();

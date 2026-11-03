@@ -345,6 +345,13 @@ export interface WorktreeHooksPreview {
   approved: boolean;
 }
 
+/** What seeding a worktree's DevMap store did (mirrors the Rust `DevmapOutcome`). */
+export type DevmapOutcome =
+  | { status: "not_requested" }
+  | { status: "provisioned"; zero_copy: boolean }
+  | { status: "skipped"; reason: string }
+  | { status: "failed"; error: string };
+
 /**
  * A worktree that exists, and what of its optional setup did not happen.
  * Mirrors `engine::worktree::WorktreeCreated`.
@@ -361,6 +368,11 @@ export interface WorktreeCreated {
   hook_error: string | null;
   /** Hooks were asked for but the repository's file was not approved, so none ran. */
   hook_notice?: string | null;
+  /**
+   * What seeding the worktree's DevMap store did. `not_requested` unless the
+   * caller asked for it; `failed` carries the error, `skipped` the reason.
+   */
+  devmap?: DevmapOutcome;
 }
 
 /**

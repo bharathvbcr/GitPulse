@@ -641,6 +641,10 @@
           {#if entity.kind === "shared_symbol"}
             Shared symbol{entity.shared_symbols.length === 1 ? "" : "s"} on {entity.path}:
             {entity.shared_symbols.join(", ") || "unknown"} — real collision when these branches meet.
+          {:else if entity.kind === "contended_line"}
+            {entity.path}: edits touch at adjacent or overlapping lines
+            {entity.contended_lines?.length ? ` (${entity.contended_lines.map(([s, e]) => (s === e ? `${s}` : `${s}-${e}`)).join(", ")})` : ""}
+            — different symbols, but git merges this as a conflict.
           {:else if entity.kind === "disjoint_symbols"}
             {entity.path}: same file, distinct symbols on the old-side ranges — file overlap, not a merge promise.
           {:else}

@@ -209,7 +209,7 @@ flowchart TD
 | `bun run check:vendor-edits` | The gate CI and `ci:local` run: `vendor:check` with `--allow-drift`, so a vendored file edited here fails while upstream drift is printed but does not. Bare `vendor:check` fails on drift alone by design — it is the check to run right after `bun run vendor`, not a gate |
 | `bun run check:vendor-schema` | Pins vendored `CURRENT_SCHEMA_VERSION` against the installed `devmap` CLI (when present) so an incompatible store is reported explicitly |
 | `bun run check:schema-parity` | Asks every reader of DevCouncil's schemas which ones it reads, and compares each answer with what DevCouncil's checkout writes: devmap store, dc-store and workbench. The readers are the vendored crates, `devmap` and `dcstore` on PATH, the `gitpulse-mcp` on PATH, the one bundled in `/Applications/GitPulse.app` (`--app` for another), and the DevCouncil commits Manvi and Jarvis pin. Pins are judged by the constants at the pinned commit. The check also compares GitPulse's copy of Manvi's serve contract with Manvi's. Each row ends `match`, `stale`, `unverifiable` or `absent`. Only `match` and `absent` pass, and a run where nothing was checked fails. Not in `ci:local`: hosted runners have none of these binaries or sibling checkouts |
-| `bun run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 105 contracts (260 structs, 1873 fields) |
+| `bun run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 105 contracts (260 structs, 1876 fields) |
 | `bun run check:release` | Asserts all version manifests are in sync: `package.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, plus every plugin manifest *discovered* under `plugins/<name>/` — the per-client manifests are found rather than listed, so a package added for a new agent client is covered the moment it exists |
 | `bun run mcp:install` | Installs `gitpulse-mcp` and `gitpulse-hook` onto PATH via `cargo install`, so both binaries agent clients spawn are tracked and refreshable rather than hand-placed copies. The hook is not optional: `plugins/gitpulse/hooks/hooks.json` spawns it by bare name, and a host that cannot start a hook records a non-blocking error and proceeds, so an absent one disables the collision guard and command gate silently |
 | `bun run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH and asks the `gitpulse-hook` who it is, asserting both report this tree's version and that the hook serves every subcommand `hooks/hooks.json` declares. A third verdict asks what *source* they were built from: version is a release identity and does not move between releases, so a hook built before a fix reports a matching version and once passed this check while still running the pre-fix code. `mcp:install` records a digest of the compiled sources and this re-derives it. Each half carries its own verdict — *absent*, *unresponsive*, *stale*, *unverifiable* or *matching* — because a healthy server reporting a clean pass over silently disabled hooks is the substitution this check exists to refuse, and an install nobody recorded must not read the same as one that was checked and matched. Not in `ci:local`: CI does not install either binary, and a check that cannot run must not look like one that passed |
@@ -382,9 +382,10 @@ GitPulse/
 │   ├── lib/canvas/       GPU-accelerated commit-graph renderer
 │   ├── lib/views/        View registry + navigation (routerless, 4 views)
 │   └── lib/<domain>/     Pure logic: files, diff, filter, graph, coverage, health…
+├── crates/gitpulse-worktree/ Standalone zero-copy worktree CLI & gitpulse-rustc cache wrapper
 └── src-tauri/src/        Rust core
     ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (292 handlers)
-    ├── engine/           git CLI wrapper: reader, writer, worktrees, sandboxing
+    ├── engine/           git CLI wrapper: reader, writer, sparse worktrees, CoW clone, agent bus, sandboxing
     ├── graph/            Lane solver, mainline pinning, filter simplification, bezier geometry, ref decorations
     ├── analyzer/         Language detection, LOC, coverage, dependency health
     ├── harness/          Manvi wrap: policy gate, sidecar protocol
@@ -392,7 +393,7 @@ GitPulse/
     ├── github/           gh CLI integration (PRs, issues, runs, Dependabot, code scanning)
     ├── updates/          Opt-in release check
     ├── ledger/ tasks/ grants/ ingest/  Control plane: durable log, leases, overrides, attribution
-    ├── mcp/              MCP tool surface (reads, plus the task-board tools) and control-plane snapshots
+    ├── mcp/              MCP tool surface (reads, plus trust-gated task-board & worktree tools)
     ├── bin/              Headless entry points (see below)
     ├── vendored/         Copies of selected DevCouncil and MarkDev crates (see below)
     └── terminal/ diff/ storage/ watcher/ stack/ ai/ desktop/
@@ -401,14 +402,16 @@ GitPulse/
 ### Headless binaries
 
 The desktop app is not the only way into the control plane. Four helper binaries build
-from the same crate and reuse its modules:
+from `src-tauri` and two standalone CLI binaries build from `crates/gitpulse-worktree`:
 
 | Binary | Shape | What it is for |
 | --- | --- | --- |
 | `gitpulse-hook` | Host hook JSON on stdin/stdout | Runs the shared hook dispatcher for agent integrations; failures yield no decision plus diagnostics, leaving the host permission flow in control. |
-| `gitpulse-mcp` | JSON-RPC over stdio (MCP 2026-07-28) | Lets an agent *read* the control plane: insights snapshot, collisions, change context, ledger, task view, code graph, provenance. Never mutates git; its only writes are the task-board tools (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_delete_task`, `gitpulse_merge_tasks`). Dual-era: modern per-request `_meta` plus legacy `initialize`. Packaged for Codex, Claude Code, and Agent Plugins 1.0 under `plugins/gitpulse/`. |
+| `gitpulse-mcp` | JSON-RPC over stdio (MCP 2026-07-28) | Exposes the control plane to coding agents: read-only (`readOnlyHint: true`) insights, collisions, 3-layer agent radar, agent inbox, change context, ledger, task view, in-process DevMap code graph, and provenance, plus repository-trust-gated task-board tools (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_delete_task`, `gitpulse_merge_tasks`) and `gitpulse_worktree_*` lifecycle/coordination tools. Dual-era: modern per-request `_meta` plus legacy `initialize`. Packaged for Codex, Claude Code, and Agent Plugins 1.0 under `plugins/gitpulse/`. |
 | `gitpulsed` | NDJSON on stdout, interval loop | *Writes* what nothing else was writing. Attribution catch-up — transcripts and reflog into the ledger — used to run only when the desktop app opened a repository, so hours of agent work with GitPulse closed left a hole in the record that nothing on screen reported. |
 | `gitpulse-ptyd` | Length-prefixed frames over a Unix socket | Not a control-plane entry: the optional terminal host. With "Keep terminals running when GitPulse quits" on (off by default), it owns the PTYs so sessions survive a quit or crash. See [docs/TERMINAL_HOST.md](docs/TERMINAL_HOST.md). |
+| `gitpulse-worktree` | CLI (`--json` or human text) | Standalone zero-copy worktree & `--cone` sparse-checkout orchestrator, DevMap `overlay.json` delta compiler, `<git-common-dir>/gitpulse/lanes/` multi-agent coordination bus, and 6-point merge/prune driver. See [docs/ZERO_COPY_AGENTIC_WORKTREES.md](docs/ZERO_COPY_AGENTIC_WORKTREES.md). |
+| `gitpulse-rustc` | `RUSTC_WRAPPER` compiler wrapper | Content-addressed two-stage (Blake3 direct + `.d` dep-info / `# env-dep:`) Rust build cache sharing `.rlib` / `.rmeta` / `proc-macro` outputs across sibling worktrees via APFS `clonefile` / Linux `FICLONE`. |
 
 `gitpulsed` deliberately serves no requests (that is `gitpulse-mcp`'s job, and
 a second surface answering the same questions from the same store would be a

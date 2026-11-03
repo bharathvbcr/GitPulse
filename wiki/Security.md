@@ -46,7 +46,7 @@ flowchart TD
 
 **Workflow and bundle integrity.** Workflows enforce `no-pipe-to-shell` rules with pinned actionlint checksums, and CI release verification unpacks installers across platforms to assert every declared binary exists.
 
-**MCP never mutates git.** `gitpulse-mcp` does not checkout, write repository files, or take leases. Its only writes are the task-board tools (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_delete_task`, `gitpulse_merge_tasks`), which write the GitPulse task profile behind the repository trust gate; the last two are annotated destructive. See [[MCP and Agents]].
+**MCP write & worktree boundaries.** Read tools (`readOnlyHint: true`) never mutate git or task state. Writes on `gitpulse-mcp` are restricted to the task-board tools (`gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_delete_task`, `gitpulse_merge_tasks`) and the worktree lifecycle & coordination tools (`gitpulse_worktree_create`, `gitpulse_worktree_switch`, `gitpulse_worktree_isolate`, `gitpulse_worktree_overlay_sync`, `gitpulse_worktree_claim`, `gitpulse_worktree_release`, `gitpulse_worktree_send_message`, `gitpulse_worktree_merge`, `gitpulse_worktree_prune`), all gated on explicit repository trust and Manvi policy checks (`harness::guard_command`) for git mutations; destructive operations carry `destructiveHint: true`. Zero-copy DevMap pointers (`base_store_ref.json`) verify shared `<git-common-dir>` ancestry before opening an anchor SQLite store, `.gitpulse/worktrees/` is reserved for managed task lanes, and `<git-common-dir>/gitpulse/lanes/` enforces `flock` serialization, path-traversal rejection, and strict payload bounds. See [[MCP and Agents]].
 
 ## Reporting a vulnerability
 

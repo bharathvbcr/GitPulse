@@ -14,8 +14,10 @@ Coding agents isolate work under `<repo>/.<agent>/worktrees/<slug>`. GitPulse la
 ## Procedure
 
 1. `gitpulse_insights` — how many worktrees, how many agent sessions, how many blocked operations. `agents.live` lists the running sessions per worktree path.
-2. `gitpulse_collision_risk` — files dirty in more than one worktree (`items`), and files dirty in a worktree two or more live sessions share (`shared_worktrees`). Two sessions in one checkout never show in `overlapping_files`: there is only one worktree to compare.
-3. For each overlapping path, `gitpulse_change_context` on each involved worktree before editing.
+2. `gitpulse_worktree_radar` — 3-layer parallel-agent radar combining pre-edit file/symbol intent claims (`claims.json`), 1-hop DevMap CSR call-graph semantic adjacency across dirty worktrees, and read-only quarantined `git merge-tree` checks across active branches.
+3. `gitpulse_collision_risk` — files dirty in more than one worktree (`items`), and files dirty in a worktree two or more live sessions share (`shared_worktrees`). Two sessions in one checkout never show in `overlapping_files`: there is only one worktree to compare.
+4. Before starting edits in a parallel lane, declare intent with `gitpulse_worktree_claim` (`claimed_files`, `claimed_symbols`), check `gitpulse_worktree_inbox` for handoff or `interface_change` notices from sibling agents, broadcast signature changes via `gitpulse_worktree_send_message`, and call `gitpulse_worktree_release` when done.
+5. For each overlapping path, `gitpulse_change_context` on each involved worktree before editing.
 
 If `unscanned_worktrees` is non-zero, the overlap list is incomplete. Do not treat it as "no collision".
 

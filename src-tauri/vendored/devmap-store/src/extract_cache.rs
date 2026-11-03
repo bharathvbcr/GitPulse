@@ -542,6 +542,7 @@ mod tests {
                 budgets: devmap_extract::ParseBudgets {
                     first_pass: std::time::Duration::ZERO,
                     retry: std::time::Duration::from_secs(60),
+                    retry_total: devmap_extract::treesitter::RETRY_PHASE_DEADLINE,
                 },
                 after_retry: &trip,
             },
@@ -578,6 +579,7 @@ mod tests {
                 budgets: devmap_extract::ParseBudgets {
                     first_pass: std::time::Duration::ZERO,
                     retry: std::time::Duration::from_secs(60),
+                    retry_total: devmap_extract::treesitter::RETRY_PHASE_DEADLINE,
                 },
                 after_retry: &trip,
             },

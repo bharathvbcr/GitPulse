@@ -354,6 +354,15 @@ describe("the MCP server's documented surface matches its code", () => {
     "gitpulse_complete_task",
     "gitpulse_merge_tasks",
     "gitpulse_delete_task",
+    "gitpulse_worktree_create",
+    "gitpulse_worktree_switch",
+    "gitpulse_worktree_isolate",
+    "gitpulse_worktree_overlay_sync",
+    "gitpulse_worktree_claim",
+    "gitpulse_worktree_release",
+    "gitpulse_worktree_send_message",
+    "gitpulse_worktree_merge",
+    "gitpulse_worktree_prune",
   ] as const;
 
   it("states the real number of devmap_* tools", () => {
@@ -368,7 +377,7 @@ describe("the MCP server's documented surface matches its code", () => {
     );
   });
 
-  it("names only write tools the server defines, and calls the five its only writers", () => {
+  it("names every write tool the server defines across task-board and worktree surfaces", () => {
     const skill = read(SKILL);
     const server = read("src-tauri/src/mcp/mod.rs");
     for (const name of WRITE_TOOLS) {

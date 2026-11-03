@@ -23,6 +23,7 @@ local-first desktop workspace with 18 specialized sections across 4 views. This 
 | Guide | Covers |
 | --- | --- |
 | [Tasks and workspaces](TASKS_AND_WORKSPACES.md) | Quick add, boards, saved workspaces, drafting, archive, agent handoff |
+| [Zero-copy agentic worktrees](ZERO_COPY_AGENTIC_WORKTREES.md) | Sparse `--cone` checkouts, zero-copy DevMap overlays, `gitpulse-rustc` build cache, parallel agent radar |
 | [Terminal](TERMINAL.md) | Sessions, split panes, search, export, recovery |
 | [Coverage](COVERAGE.md) | Report formats, generation, missing toolchains, diagnostics |
 | [Repository hygiene](REPOSITORY_HYGIENE.md) | Storage scopes, cleanup previews, scheduling |
@@ -49,6 +50,7 @@ local-first desktop workspace with 18 specialized sections across 4 views. This 
 | [Good first issues](GOOD_FIRST_ISSUES.md) | Scoped contribution ideas |
 | [Dependency health](DEPENDENCY_HEALTH.md) | Dependency maintenance and unresolved advisories |
 | [Performance](PERFORMANCE.md) | Performance design and measurement boundaries |
+| [Zero-copy agentic worktrees](ZERO_COPY_AGENTIC_WORKTREES.md) | Sparse cones, DevMap overlays, `gitpulse-rustc` build cache, parallel agent radar |
 | [Overview hardening](OVERVIEW_HARDENING.md) | Worktree identity and incomplete-state contracts |
 | [Native notifications](NATIVE_NOTIFICATIONS_ADAPTER.md) | Adapter contract and platform qualification |
 | [Contracts](../contracts/README.md) | Cross-process lease and operation schemas |

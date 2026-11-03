@@ -21,6 +21,14 @@ pub use suspects::{
     suspects, CodeintelSuspect, CodeintelSuspectScope, CodeintelSuspectsPayload,
     CodeintelTouchedSymbol,
 };
+pub mod worktree_overlay;
+pub use worktree_overlay::{
+    load_worktree_overlay, load_zero_copy_base_ref, provision_worktree_devmap,
+    provision_worktree_devmap_zero_copy, sync_worktree_overlay, worktree_overlay_path,
+    zero_copy_base_ref_path, DevmapWorktreeProvision, WorktreeOverlayReport, ZeroCopyBaseRef,
+    BASE_STORE_REF_RELPATH, CAS_AST_RELPATH, MAX_OVERLAY_DIRTY_FILES, MAX_OVERLAY_FILE_BYTES,
+    OVERLAY_RELPATH,
+};
 
 pub const DEFAULT_CODEINTEL_BUDGET: u32 = 2000;
 
@@ -171,6 +179,11 @@ pub struct CodeintelResponse<T> {
     /// Set when the producer stopped early — distinct from budget truncation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub walk_incomplete: Option<String>,
+    /// What the uncommitted-worktree overlay contributed or could not: symbols recovered
+    /// by the fallback scan, an unreadable overlay, or a failed or capped live change
+    /// list. Present means the answer is not a plain index read; it is not an early stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_note: Option<String>,
     /// Population across the resolution ladder before any `min_rung` filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rungs: Option<CodeintelRungHistogram>,
@@ -197,6 +210,7 @@ impl<T> CodeintelResponse<T> {
             shown: 0,
             truncated: false,
             walk_incomplete: None,
+            overlay_note: None,
             rungs: None,
             scope: None,
         }
@@ -212,6 +226,7 @@ impl<T> CodeintelResponse<T> {
             shown,
             truncated,
             walk_incomplete: None,
+            overlay_note: None,
             rungs: None,
             scope: None,
         }
@@ -256,6 +271,11 @@ pub fn devmap_db_path(repo_path: &str) -> PathBuf {
     map_path(Path::new(repo_path))
 }
 
+/// Locates the zero-copy mmap CSR graph sidecar (`<db_path>.csr`) for a repository.
+pub fn devmap_csr_path(repo_path: &str) -> PathBuf {
+    Store::csr_sidecar_path(&map_path(Path::new(repo_path)))
+}
+
 fn map_path(repo: &Path) -> PathBuf {
     devmap_query::paths::store_path(repo)
 }
@@ -295,7 +315,30 @@ fn rewrite_schema_mismatch(raw: &str) -> Option<String> {
     ))
 }
 
-fn open_store(repo: &Path) -> Result<Store, String> {
+enum OpenedRepoStore {
+    Local(Store),
+    ZeroCopy {
+        store: Store,
+        base_ref: ZeroCopyBaseRef,
+        anchor_root: PathBuf,
+    },
+}
+
+impl OpenedRepoStore {
+    fn store(&self) -> &Store {
+        match self {
+            Self::Local(store) | Self::ZeroCopy { store, .. } => store,
+        }
+    }
+
+    fn into_store(self) -> Store {
+        match self {
+            Self::Local(store) | Self::ZeroCopy { store, .. } => store,
+        }
+    }
+}
+
+fn open_local_store(repo: &Path) -> Result<Store, String> {
     let db_path = map_path(repo);
     if !db_path.exists() {
         return Err(format!(
@@ -316,6 +359,47 @@ fn open_store(repo: &Path) -> Result<Store, String> {
     Ok(store)
 }
 
+pub(super) fn open_local_indexed_store(repo: &Path) -> Result<Store, String> {
+    let store = open_local_store(repo)?;
+    match store.latest_generation_id() {
+        Ok(Some(_)) => Ok(store),
+        Ok(None) => Err(format!(
+            "No generation indexed in {}; the code map has not been built yet",
+            map_path(repo).to_string_lossy()
+        )),
+        Err(e) => Err(format!("Failed to read devmap generation: {e}")),
+    }
+}
+
+fn open_store_any(repo: &Path) -> Result<OpenedRepoStore, String> {
+    if map_path(repo).exists() {
+        return open_local_store(repo).map(OpenedRepoStore::Local);
+    }
+    if zero_copy_base_ref_path(&repo.to_string_lossy()).is_file() {
+        match worktree_overlay::open_verified_zero_copy_anchor_store(repo) {
+            Ok(Some((store, base_ref))) => {
+                let anchor_root = PathBuf::from(&base_ref.anchor_repo_root);
+                return Ok(OpenedRepoStore::ZeroCopy {
+                    store,
+                    base_ref,
+                    anchor_root,
+                });
+            }
+            Ok(None) => {}
+            Err(e) => return Err(e.into_message()),
+        }
+    }
+    Err(format!(
+        "No devmap database at {}",
+        map_path(repo).to_string_lossy()
+    ))
+}
+
+#[cfg(test)]
+fn open_store(repo: &Path) -> Result<Store, String> {
+    open_store_any(repo).map(OpenedRepoStore::into_store)
+}
+
 /// Opens the store AND requires that it actually hold an indexed generation.
 ///
 /// The five query surfaces below all answered from a store that opened but held
@@ -328,10 +412,10 @@ fn open_store(repo: &Path) -> Result<Store, String> {
 /// `status` deliberately does NOT use this. It has to tell "no database",
 /// "no generation yet" and "database unreadable" apart, because those call for
 /// three different actions, and collapsing them here would lose that.
-fn open_indexed_store(repo: &Path) -> Result<Store, String> {
-    let store = open_store(repo)?;
-    match store.latest_generation_id() {
-        Ok(Some(_)) => Ok(store),
+fn open_indexed_store_any(repo: &Path) -> Result<OpenedRepoStore, String> {
+    let opened = open_store_any(repo)?;
+    match opened.store().latest_generation_id() {
+        Ok(Some(_)) => Ok(opened),
         Ok(None) => Err(format!(
             "No generation indexed in {}; the code map has not been built yet",
             map_path(repo).to_string_lossy()
@@ -340,10 +424,31 @@ fn open_indexed_store(repo: &Path) -> Result<Store, String> {
     }
 }
 
+fn open_indexed_store(repo: &Path) -> Result<Store, String> {
+    open_indexed_store_any(repo).map(OpenedRepoStore::into_store)
+}
+
 /// Validates the repository and opens its built map — the whole preamble every
 /// query surface shares.
 pub(crate) fn open_repo_map(repo_path: &str) -> Result<Store, CommandError> {
     open_indexed_store(&resolve_repo(repo_path)?).map_err(CommandError::from)
+}
+
+/// Opens a zero-copy [`devmap_store::CsrGraphReader`] for the repository's latest
+/// DevMap generation (using `<db_path>.csr` via `mmap` when present and matching,
+/// or materialising from `generation_edges`).
+pub fn open_repo_csr_graph(repo_path: &str) -> Result<devmap_store::CsrGraphReader, CommandError> {
+    let store = open_repo_map(repo_path)?;
+    match store
+        .open_latest_csr_sidecar()
+        .map_err(|e| CommandError::from(format!("Failed to open CSR graph: {e}")))?
+    {
+        Some(reader) => Ok(reader),
+        None => Err(CommandError::from(format!(
+            "No generation indexed in {}; the code map has not been built yet",
+            devmap_db_path(repo_path).to_string_lossy()
+        ))),
+    }
 }
 
 /// Refuses a blank query argument instead of answering it.
@@ -996,6 +1101,34 @@ fn status_unavailable(db_path: String, reason: String) -> CodeintelStatus {
     }
 }
 
+fn evaluate_zero_copy_status(
+    worktree: &Path,
+    anchor_root: &Path,
+    store: &Store,
+    summary: &devmap_store::StoreStatus,
+) -> (Option<bool>, Option<String>) {
+    let (wt_fresh, wt_reason) = worktree_overlay::verify_zero_copy_worktree_freshness(
+        worktree,
+        anchor_root,
+        store,
+        summary,
+    );
+    let non_source_reason = if summary.analyzer_freshness == Some(false) {
+        Some("stored extraction payload is obsolete; rebuild with the current analyzer".to_string())
+    } else if summary.source_freshness.is_none() {
+        summary.degraded_reason.clone()
+    } else {
+        None
+    };
+    let combined = match (wt_reason, non_source_reason) {
+        (Some(a), Some(b)) if a != b => Some(format!("{a}; {b}")),
+        (Some(a), _) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    (wt_fresh, combined)
+}
+
 /// Reports the availability and metrics of the repository's code intelligence graph.
 pub fn status(repo_path: &str) -> CodeintelStatus {
     // A repository path we refused to resolve has no map path to report. The
@@ -1007,45 +1140,78 @@ pub fn status(repo_path: &str) -> CodeintelStatus {
         Ok(repo) => repo,
         Err(e) => return status_unavailable(String::new(), e.into_message()),
     };
-    let db_str = map_path(&repo).to_string_lossy().into_owned();
+    let default_db_str = map_path(&repo).to_string_lossy().into_owned();
 
-    let store = match open_store(&repo) {
+    let opened = match open_store_any(&repo) {
         Ok(s) => s,
-        Err(e) => return status_unavailable(db_str, e),
+        Err(e) => return status_unavailable(default_db_str, e),
     };
 
-    // `Store::status` is devmap's own summary of a generation, and it answers
-    // with `COUNT(*)` over the generation's primary-key range. This used to call
-    // `latest_file_hashes()` and `latest_edges(0.0)` and immediately throw the
-    // rows away through `.len()`, materializing the entire edge table — every
-    // edge as four owned strings — to learn one integer. On this repository's own
-    // 65 MB map (703 files, 53,622 edges) that cost 261 ms and ~29 MiB of peak
-    // RSS on a call that runs on every `gitpulse_status` and every
-    // `gitpulse_insights`.
-    let summary = match store.status(&db_str) {
-        Ok(summary) => summary,
-        Err(e) => return status_unavailable(db_str, format!("Database error: {e}")),
-    };
-    let Some(gen_id) = summary.latest_generation else {
-        return status_unavailable(db_str, "No generation indexed in database".into());
-    };
+    match opened {
+        OpenedRepoStore::Local(store) => {
+            let summary = match store.status(&default_db_str) {
+                Ok(summary) => summary,
+                Err(e) => {
+                    return status_unavailable(default_db_str, format!("Database error: {e}"))
+                }
+            };
+            let Some(gen_id) = summary.latest_generation else {
+                return status_unavailable(
+                    default_db_str,
+                    "No generation indexed in database".into(),
+                );
+            };
 
-    CodeintelStatus {
-        available: true,
-        is_fresh: Some(summary.is_fresh()),
-        freshness_reason: summary.freshness_reason(),
-        source_freshness: summary.source_freshness,
-        analyzer_freshness: summary.analyzer_freshness,
-        pending_count: Some(summary.pending_count),
-        db_path: db_str,
-        generation_id: Some(gen_id),
-        total_files: latest_file_count(&store, gen_id),
-        // Was hardcoded `None`, so the hook renderer's "N symbols across M
-        // files" always said zero symbols and the health panel always showed a
-        // dash. `Store::status` counts them in the same pass as the edges.
-        total_symbols: u32::try_from(summary.node_count).ok(),
-        total_edges: u32::try_from(summary.edge_count).ok(),
-        reason: None,
+            CodeintelStatus {
+                available: true,
+                is_fresh: Some(summary.is_fresh()),
+                freshness_reason: summary.freshness_reason(),
+                source_freshness: summary.source_freshness,
+                analyzer_freshness: summary.analyzer_freshness,
+                pending_count: Some(summary.pending_count),
+                db_path: default_db_str,
+                generation_id: Some(gen_id),
+                total_files: latest_file_count(&store, gen_id),
+                total_symbols: u32::try_from(summary.node_count).ok(),
+                total_edges: u32::try_from(summary.edge_count).ok(),
+                reason: None,
+            }
+        }
+        OpenedRepoStore::ZeroCopy {
+            store,
+            base_ref,
+            anchor_root,
+        } => {
+            let db_str = base_ref.anchor_db_path;
+            let summary = match store.status(&db_str) {
+                Ok(summary) => summary,
+                Err(e) => return status_unavailable(db_str, format!("Database error: {e}")),
+            };
+            let Some(gen_id) = summary.latest_generation else {
+                return status_unavailable(db_str, "No generation indexed in database".into());
+            };
+            let (wt_fresh, combined_reason) =
+                evaluate_zero_copy_status(&repo, &anchor_root, &store, &summary);
+            let is_fresh = summary.pending_count == 0
+                && summary.analyzer_freshness == Some(true)
+                && wt_fresh == Some(true)
+                && combined_reason.is_none();
+
+            CodeintelStatus {
+                available: true,
+                is_fresh: Some(is_fresh),
+                freshness_reason: combined_reason,
+                source_freshness: wt_fresh,
+                analyzer_freshness: summary.analyzer_freshness,
+                pending_count: Some(summary.pending_count),
+                db_path: db_str,
+                generation_id: Some(gen_id),
+                total_files: latest_file_count(&store, gen_id),
+                total_symbols: u32::try_from(summary.node_count).ok(),
+                total_edges: u32::try_from(summary.edge_count).ok(),
+                reason: None,
+            }
+        }
     }
 }
 
@@ -1105,41 +1271,403 @@ impl NameQueryOptions {
     }
 }
 
+struct OpenedCheckedStore {
+    repo: PathBuf,
+    store: Store,
+    anchor_root: Option<PathBuf>,
+    freshness_override: Option<SourceFreshness>,
+    unrun: Option<String>,
+}
+
 /// Opens the built map and, when `verify` is set, runs the whole-tree check on
 /// that store so the engine's answers carry its verdict.
-///
-/// The second value is why the check could not run, if it could not: the
-/// answer then stays `fresh: null`, and [`disclose_unrun_check`] puts this
-/// reason on it instead of the engine's generic "not checked".
 fn open_repo_map_checked(
     repo_path: &str,
     verify: bool,
-) -> Result<(Store, Option<String>), CommandError> {
+) -> Result<OpenedCheckedStore, CommandError> {
     let repo = resolve_repo(repo_path)?;
-    let store = open_indexed_store(&repo).map_err(CommandError::from)?;
-    let unrun = if verify {
-        match store.status(&map_path(&repo).to_string_lossy()) {
-            Err(e) => Some(format!("whole-tree freshness check failed: {e}")),
-            Ok(status) if status.source_freshness.is_none() && status.pending_count == 0 => {
-                Some(status.degraded_reason.unwrap_or_else(|| {
-                    "whole-tree freshness check produced no verdict".to_string()
-                }))
-            }
-            // A verdict, or a queue the engine already names as the reason.
-            Ok(_) => None,
+    let opened = open_indexed_store_any(&repo).map_err(CommandError::from)?;
+    match opened {
+        OpenedRepoStore::Local(store) => {
+            let unrun = if verify {
+                match store.status(&map_path(&repo).to_string_lossy()) {
+                    Err(e) => Some(format!("whole-tree freshness check failed: {e}")),
+                    Ok(status)
+                        if status.source_freshness.is_none() && status.pending_count == 0 =>
+                    {
+                        Some(status.degraded_reason.unwrap_or_else(|| {
+                            "whole-tree freshness check produced no verdict".to_string()
+                        }))
+                    }
+                    Ok(_) => None,
+                }
+            } else {
+                None
+            };
+            Ok(OpenedCheckedStore {
+                repo,
+                store,
+                anchor_root: None,
+                freshness_override: None,
+                unrun,
+            })
         }
-    } else {
-        None
-    };
-    Ok((store, unrun))
+        OpenedRepoStore::ZeroCopy {
+            store,
+            base_ref,
+            anchor_root,
+        } => {
+            let gen_id = store.latest_generation_id().ok().flatten();
+            let (freshness_override, unrun) = if verify {
+                match store.status(&base_ref.anchor_db_path) {
+                    Err(e) => (
+                        Some(SourceFreshness {
+                            fresh: None,
+                            generation_id: gen_id,
+                            reason: Some(format!("whole-tree freshness check failed: {e}")),
+                        }),
+                        None,
+                    ),
+                    Ok(summary) => {
+                        let (wt_fresh, combined_reason) =
+                            evaluate_zero_copy_status(&repo, &anchor_root, &store, &summary);
+                        (
+                            Some(SourceFreshness {
+                                fresh: wt_fresh,
+                                generation_id: summary.latest_generation.or(gen_id),
+                                reason: combined_reason,
+                            }),
+                            None,
+                        )
+                    }
+                }
+            } else {
+                (None, None)
+            };
+            Ok(OpenedCheckedStore {
+                repo,
+                store,
+                anchor_root: Some(anchor_root),
+                freshness_override,
+                unrun,
+            })
+        }
+    }
 }
 
-/// Replaces the engine's "not checked" on a verdict that is still `null`.
-fn disclose_unrun_check(freshness: &mut SourceFreshness, unrun: Option<&str>) {
-    if let (None, Some(why)) = (freshness.fresh, unrun) {
+fn apply_checked_freshness(
+    freshness: &mut SourceFreshness,
+    override_freshness: Option<&SourceFreshness>,
+    unrun: Option<&str>,
+) {
+    if let Some(ov) = override_freshness {
+        *freshness = ov.clone();
+    } else if let (None, Some(why)) = (freshness.fresh, unrun) {
         freshness.reason = Some(why.to_string());
     }
 }
+
+struct WorktreeHitContext {
+    repo: PathBuf,
+    anchor_root: Option<PathBuf>,
+    overlay: Option<devmap_query::WorktreeOverlay>,
+    live_deltas: Option<std::collections::HashMap<String, worktree_overlay::DeltaKind>>,
+    /// Why the overlay or the live change list is missing or partial.
+    degraded: Vec<String>,
+}
+
+impl WorktreeHitContext {
+    fn load(opened: &OpenedCheckedStore) -> Self {
+        let mut degraded = Vec::new();
+        let gen_id = opened.store.latest_generation_id().ok().flatten();
+        let repo_str = opened.repo.to_string_lossy();
+        let overlay = if worktree_overlay_path(&repo_str).is_file() {
+            match load_worktree_overlay(&repo_str) {
+                Ok(found) => found.filter(|ov| match gen_id {
+                    Some(g) => ov.generation == u64::from(g),
+                    None => true,
+                }),
+                Err(e) => {
+                    degraded.push(format!(
+                        "worktree overlay unreadable, treated as absent: {}",
+                        e.message()
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let live_deltas = if opened.anchor_root.is_some() || overlay.is_some() {
+            let gen_head = opened.store.latest_generation_head_sha().ok().flatten();
+            match worktree_overlay::collect_worktree_deltas(&opened.repo, gen_head.as_deref()) {
+                Ok((rows, truncated)) => {
+                    if truncated {
+                        degraded.push(format!(
+                            "live change list capped at {} files; later changes are not reflected",
+                            worktree_overlay::MAX_OVERLAY_DIRTY_FILES
+                        ));
+                    }
+                    Some(rows.into_iter().collect())
+                }
+                Err(e) => {
+                    degraded.push(format!(
+                        "live worktree changes unavailable: {}",
+                        e.message()
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Self {
+            repo: opened.repo.clone(),
+            anchor_root: opened.anchor_root.clone(),
+            overlay,
+            live_deltas,
+            degraded,
+        }
+    }
+
+    /// Records this context's degradations on a response.
+    fn annotate<T>(&self, out: &mut CodeintelResponse<T>) {
+        if self.degraded.is_empty() {
+            return;
+        }
+        let joined = self.degraded.join("; ");
+        out.overlay_note = Some(match out.overlay_note.take() {
+            Some(existing) if !existing.is_empty() => format!("{existing}; {joined}"),
+            _ => joined,
+        });
+    }
+
+    fn overlay_file_still_matches(
+        &self,
+        ov: &devmap_query::WorktreeOverlay,
+        rel_path: &str,
+    ) -> bool {
+        let full = self.repo.join(rel_path);
+        // An oversize or non-regular file never carries a recorded hash, so it cannot match.
+        let bytes = match worktree_overlay::read_bounded_file(
+            &full,
+            worktree_overlay::MAX_OVERLAY_FILE_BYTES,
+        ) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) | Err(_) => return !full.exists(),
+        };
+        match ov.modified_files.get(Path::new(rel_path)) {
+            Some(expected) => devmap_query::blake3_hash(&bytes) == *expected,
+            None => true,
+        }
+    }
+
+    fn is_tombstoned(&self, file_path: &str, symbol_name: &str) -> bool {
+        if self.live_deltas.as_ref().and_then(|m| m.get(file_path))
+            == Some(&worktree_overlay::DeltaKind::Deleted)
+        {
+            return true;
+        }
+        let Some(ref ov) = self.overlay else {
+            return false;
+        };
+        if ov.is_file_tombstoned(Path::new(file_path)) && !self.repo.join(file_path).exists() {
+            return true;
+        }
+        let scoped = format!("{file_path}::{symbol_name}");
+        if (ov.is_symbol_tombstoned(&scoped) || ov.is_symbol_tombstoned(symbol_name))
+            && self.overlay_file_still_matches(ov, file_path)
+        {
+            return true;
+        }
+        false
+    }
+
+    fn sanitize_span(
+        &self,
+        file_path: &str,
+        source_span: &mut String,
+        source_unavailable_reason: &mut Option<String>,
+        source_span_omitted_bytes: &mut Option<u32>,
+    ) {
+        let Some(ref anchor) = self.anchor_root else {
+            return;
+        };
+        let modified_in_wt = self.live_deltas.as_ref().and_then(|m| m.get(file_path))
+            == Some(&worktree_overlay::DeltaKind::Modified)
+            || {
+                let wt_file = self.repo.join(file_path);
+                wt_file.is_file() && {
+                    let read = |p: &Path| {
+                        worktree_overlay::read_bounded_file(
+                            p,
+                            worktree_overlay::MAX_OVERLAY_FILE_BYTES,
+                        )
+                        .ok()
+                        .flatten()
+                    };
+                    // A file over the bound cannot be compared, so it is treated as modified.
+                    match (read(&wt_file), read(&anchor.join(file_path))) {
+                        (Some(a), Some(b)) => a != b,
+                        _ => true,
+                    }
+                }
+            };
+        if modified_in_wt {
+            *source_span = String::new();
+            *source_span_omitted_bytes = None;
+            *source_unavailable_reason =
+                Some("file modified in worktree since indexed generation".to_string());
+        }
+    }
+
+    /// Adds uncommitted overlay symbols matching `query`. Bounded: at most
+    /// [`MAX_OVERLAY_SEARCH_HITS`] hits and the response's remaining source budget;
+    /// symbols are matched before any file is read, and each read is bounded. Hitting a
+    /// bound sets `truncated`. The provenance note goes in `overlay_note`, never
+    /// `walk_incomplete` (which means the walk stopped early).
+    fn append_overlay_search_hits(
+        &self,
+        query: &str,
+        token_budget: u32,
+        filter: Option<&NameQueryFilter>,
+        out: &mut CodeintelResponse<CodeintelSymbolHit>,
+    ) {
+        let Some(ref ov) = self.overlay else {
+            return;
+        };
+        let needle = query.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return;
+        }
+        // ~4 bytes of source per budget token, minus what the index hits already spent.
+        let spent: usize = out.items.iter().map(|h| h.source_span.len()).sum();
+        let mut remaining = (token_budget as usize)
+            .saturating_mul(4)
+            .saturating_sub(spent);
+        let mut added = 0u32;
+        'files: for (rel_path, ext) in &ov.added_extractions {
+            if let Some(f) = filter {
+                let path_ok = f.paths().is_empty()
+                    || f.paths()
+                        .iter()
+                        .any(|p| rel_path == p || rel_path.starts_with(&format!("{p}/")));
+                let lang_ok = f.languages().is_empty()
+                    || f.languages()
+                        .iter()
+                        .any(|l| l.eq_ignore_ascii_case(&ext.language));
+                if !path_ok || !lang_ok {
+                    continue;
+                }
+            }
+            let matching: Vec<_> = ext
+                .symbols
+                .iter()
+                .filter(|sym| !matches!(sym.kind, devmap_extract::SymbolKind::File))
+                .filter(|sym| {
+                    filter.is_none_or(|f| {
+                        f.kinds().is_empty()
+                            || f.kinds()
+                                .iter()
+                                .any(|k| k.eq_ignore_ascii_case(sym.kind.as_str()))
+                    })
+                })
+                .filter(|sym| {
+                    sym.name.to_ascii_lowercase().contains(&needle)
+                        || sym.qualified_name.to_ascii_lowercase().contains(&needle)
+                })
+                .collect();
+            if matching.is_empty() {
+                continue;
+            }
+            let full_path = self.repo.join(rel_path);
+            let bytes = match worktree_overlay::read_bounded_file(
+                &full_path,
+                worktree_overlay::MAX_OVERLAY_FILE_BYTES,
+            ) {
+                Ok(Some(bytes)) => bytes,
+                // Missing, oversize or unreadable: its symbols cannot be verified.
+                Ok(None) | Err(_) => continue,
+            };
+            if let Some(expected_hash) = ov.modified_files.get(Path::new(rel_path)) {
+                if devmap_query::blake3_hash(&bytes) != *expected_hash {
+                    continue;
+                }
+            }
+            let source_text = std::str::from_utf8(&bytes).ok();
+            let secret = devmap_extract::secret::is_secret_path(rel_path);
+            for sym in matching {
+                if out
+                    .items
+                    .iter()
+                    .any(|h| h.file_path == *rel_path && h.symbol_name == sym.name)
+                {
+                    continue;
+                }
+                if added as usize >= MAX_OVERLAY_SEARCH_HITS || remaining == 0 {
+                    out.truncated = true;
+                    break 'files;
+                }
+                let (span_start_line, span_end_line) = source_text
+                    .map(|t| sym.span.line_range(t))
+                    .unwrap_or((0, 0));
+                let (source_span, source_unavailable_reason) = if secret {
+                    (
+                        String::new(),
+                        Some("secret file content withheld".to_string()),
+                    )
+                } else if let Some(t) = source_text {
+                    let s = sym.span.start_byte.min(t.len());
+                    let e = sym.span.end_byte.min(t.len()).max(s);
+                    let span = t.get(s..e).unwrap_or("");
+                    if span.len() > remaining {
+                        (
+                            String::new(),
+                            Some("source span omitted: token budget exhausted".to_string()),
+                        )
+                    } else {
+                        remaining -= span.len();
+                        (span.to_string(), None)
+                    }
+                } else {
+                    (
+                        String::new(),
+                        Some("source file is not valid UTF-8".to_string()),
+                    )
+                };
+                out.items.push(CodeintelSymbolHit {
+                    symbol_name: sym.name.clone(),
+                    file_path: rel_path.clone(),
+                    kind: sym.kind.as_str().to_string(),
+                    span_start_line,
+                    span_end_line,
+                    source_span,
+                    source_unavailable_reason,
+                    source_span_omitted_bytes: None,
+                    score: if sym.name.eq_ignore_ascii_case(query.trim()) {
+                        1.0
+                    } else {
+                        0.75
+                    },
+                });
+                added += 1;
+            }
+        }
+        if added > 0 {
+            out.total = out.total.saturating_add(added);
+            out.shown = out.items.len() as u32;
+            const NOTE: &str =
+                "includes uncommitted worktree overlay symbols recovered by fallback declaration scan";
+            out.overlay_note = Some(match out.overlay_note.take() {
+                Some(existing) if !existing.is_empty() => format!("{existing}; {NOTE}"),
+                _ => NOTE.to_string(),
+            });
+        }
+    }
+}
+
+/// Most overlay-only symbols one search adds beyond the index's own hits.
+const MAX_OVERLAY_SEARCH_HITS: usize = 50;
 
 /// Searches symbols using in-process code graph index.
 pub fn search(
@@ -1165,11 +1693,12 @@ pub fn search_with(
         Ok(filter) => filter,
         Err(e) => return CodeintelResponse::unavailable(e),
     };
-    let (store, unrun) = match open_repo_map_checked(repo_path, options.verify_freshness) {
+    let opened = match open_repo_map_checked(repo_path, options.verify_freshness) {
         Ok(opened) => opened,
         Err(e) => return CodeintelResponse::unavailable(e.into_message()),
     };
-    let engine = StoreQueryEngine::new(&store);
+    let hit_ctx = WorktreeHitContext::load(&opened);
+    let engine = StoreQueryEngine::new(&opened.store);
     let req = Request {
         query: query.to_string(),
         token_budget: token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET),
@@ -1179,18 +1708,46 @@ pub fn search_with(
 
     match engine.search_filtered(req, filter.as_ref()) {
         Ok(res) => {
-            let mut out = from_engine(res, |hit| CodeintelSymbolHit {
-                symbol_name: hit.symbol_name,
-                file_path: hit.file_path,
-                kind: hit.kind,
-                span_start_line: hit.span.0,
-                span_end_line: hit.span.1,
-                source_span: hit.source_span,
-                source_unavailable_reason: hit.source_unavailable_reason,
-                source_span_omitted_bytes: hit.source_span_omitted_bytes,
-                score: hit.score,
+            let mut out = from_engine(res, |hit| {
+                let mut source_span = hit.source_span;
+                let mut source_unavailable_reason = hit.source_unavailable_reason;
+                let mut source_span_omitted_bytes = hit.source_span_omitted_bytes;
+                hit_ctx.sanitize_span(
+                    &hit.file_path,
+                    &mut source_span,
+                    &mut source_unavailable_reason,
+                    &mut source_span_omitted_bytes,
+                );
+                CodeintelSymbolHit {
+                    symbol_name: hit.symbol_name,
+                    file_path: hit.file_path,
+                    kind: hit.kind,
+                    span_start_line: hit.span.0,
+                    span_end_line: hit.span.1,
+                    source_span,
+                    source_unavailable_reason,
+                    source_span_omitted_bytes,
+                    score: hit.score,
+                }
             });
-            disclose_unrun_check(&mut out.source_freshness, unrun.as_deref());
+            let before_len = out.items.len();
+            out.items
+                .retain(|h| !hit_ctx.is_tombstoned(&h.file_path, &h.symbol_name));
+            let removed = (before_len - out.items.len()) as u32;
+            out.total = out.total.saturating_sub(removed);
+            out.shown = out.items.len() as u32;
+            hit_ctx.append_overlay_search_hits(
+                query,
+                token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET),
+                filter.as_ref(),
+                &mut out,
+            );
+            hit_ctx.annotate(&mut out);
+            apply_checked_freshness(
+                &mut out.source_freshness,
+                opened.freshness_override.as_ref(),
+                opened.unrun.as_deref(),
+            );
             out
         }
         Err(e) => CodeintelResponse::unavailable(format!("Search failed: {e}")),
@@ -1241,6 +1798,64 @@ pub fn symbols_for_file(repo_path: &str, file_path: &str, head_sha: &str) -> Cod
             );
         }
     };
+
+    if page.rows.is_empty() && worktree_overlay_path(repo_path).is_file() {
+        if let Ok(Some(ov)) = load_worktree_overlay(repo_path) {
+            if let Some(ext) = ov.added_extractions.get(file_path) {
+                let full_path = Path::new(repo_path).join(file_path);
+                if let Ok(bytes) = std::fs::read(&full_path) {
+                    let hash_ok = ov
+                        .modified_files
+                        .get(Path::new(file_path))
+                        .is_none_or(|expected| devmap_query::blake3_hash(&bytes) == *expected);
+                    if hash_ok {
+                        let text = std::str::from_utf8(&bytes).ok();
+                        let non_file: Vec<&devmap_extract::ExtractedSymbol> = ext
+                            .symbols
+                            .iter()
+                            .filter(|s| !matches!(s.kind, devmap_extract::SymbolKind::File))
+                            .collect();
+                        if !non_file.is_empty() {
+                            let total = non_file.len() as u32;
+                            let truncated = non_file.len() > MAX_FILE_SYMBOLS;
+                            let items: Vec<CodeintelFileSymbol> = non_file
+                                .into_iter()
+                                .take(MAX_FILE_SYMBOLS)
+                                .map(|sym| {
+                                    let (span_start_line, span_end_line) =
+                                        text.map(|t| sym.span.line_range(t)).unwrap_or((0, 0));
+                                    CodeintelFileSymbol {
+                                        symbol_name: sym.name.clone(),
+                                        qualified_name: sym.qualified_name.clone(),
+                                        kind: sym.kind.as_str().to_string(),
+                                        span_start_line,
+                                        span_end_line,
+                                    }
+                                })
+                                .collect();
+                            let shown = items.len() as u32;
+                            return CodeintelFileSymbols {
+                                available: true,
+                                reason: Some(
+                                    "uncommitted file extracted from worktree overlay (not in indexed HEAD)"
+                                        .to_string(),
+                                ),
+                                file_path: file_path.to_string(),
+                                requested_head_sha: head_sha.to_string(),
+                                generation_id: Some(page.generation),
+                                generation_head_sha: Some(page.head_sha),
+                                head_matches: false,
+                                items,
+                                total,
+                                shown,
+                                truncated,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let head_matches = page.head_sha == head_sha;
     let mut reason = None;
@@ -1926,7 +2541,7 @@ pub fn affected_tests(
             }
         }
     };
-    let store = match open_indexed_store(&repo) {
+    let opened = match open_indexed_store_any(&repo) {
         Ok(s) => s,
         Err(e) => {
             return CodeintelAffectedTests {
@@ -1945,15 +2560,41 @@ pub fn affected_tests(
             }
         }
     };
-    // A map with pending paths is not a complete picture of this checkout.
-    // Querying it and treating the answer as "these are the tests to run"
-    // is exactly the failure mode fail_closed exists to prevent.
-    let db_str = map_path(&repo).to_string_lossy().into_owned();
-    let freshness_failure = match store.status(&db_str) {
-        Ok(summary) => summary
-            .freshness_reason()
-            .map(|reason| (true, format!("code map is stale or degraded: {reason}"))),
-        Err(error) => Some((false, format!("code map freshness check failed: {error}"))),
+    // A map with pending paths or unindexed worktree edits is not a complete
+    // picture of this checkout. Querying it and treating the answer as "these
+    // are the tests to run" is the exact failure mode fail_closed prevents.
+    let freshness_failure = match &opened {
+        OpenedRepoStore::Local(store) => {
+            let db_str = map_path(&repo).to_string_lossy().into_owned();
+            match store.status(&db_str) {
+                Ok(summary) => summary
+                    .freshness_reason()
+                    .map(|reason| (true, format!("code map is stale or degraded: {reason}"))),
+                Err(error) => Some((false, format!("code map freshness check failed: {error}"))),
+            }
+        }
+        OpenedRepoStore::ZeroCopy {
+            store,
+            base_ref,
+            anchor_root,
+        } => match store.status(&base_ref.anchor_db_path) {
+            Ok(summary) => {
+                let (wt_fresh, combined_reason) =
+                    evaluate_zero_copy_status(&repo, anchor_root, store, &summary);
+                if let Some(reason) = combined_reason {
+                    Some((true, format!("code map is stale or degraded: {reason}")))
+                } else if wt_fresh != Some(true) || summary.analyzer_freshness != Some(true) {
+                    Some((
+                        true,
+                        "code map is stale or degraded: worktree source freshness could not be verified"
+                            .to_string(),
+                    ))
+                } else {
+                    None
+                }
+            }
+            Err(error) => Some((false, format!("code map freshness check failed: {error}"))),
+        },
     };
     if let Some((available, reason)) = freshness_failure {
         return CodeintelAffectedTests {
@@ -1972,7 +2613,7 @@ pub fn affected_tests(
         };
     }
     affected_tests_from_store(
-        &store,
+        opened.store(),
         targets,
         token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET),
         min_confidence,
@@ -2617,11 +3258,12 @@ pub fn explore_with(
             limit: 0,
         };
     }
-    let (store, unrun) = match open_repo_map_checked(repo_path, options.verify_freshness) {
+    let opened = match open_repo_map_checked(repo_path, options.verify_freshness) {
         Ok(opened) => opened,
         Err(e) => return explore_unavailable(query, e.into_message()),
     };
-    let engine = StoreQueryEngine::new(&store);
+    let hit_ctx = WorktreeHitContext::load(&opened);
+    let engine = StoreQueryEngine::new(&opened.store);
     let budget = token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET);
     let limit = limit.unwrap_or(20) as usize;
     match engine.explore_filtered(
@@ -2633,20 +3275,38 @@ pub fn explore_with(
         filter.as_ref(),
     ) {
         Ok(report) => {
-            let unrun = unrun.as_deref();
+            let unrun = opened.unrun.as_deref();
+            let freshness_override = opened.freshness_override.as_ref();
             let neighborhood = options.neighborhood;
             let mut definitions = from_engine(report.definitions, |d| {
                 let neighborhood = neighborhood.then(|| {
                     let mut callers = from_engine(d.callers, map_edge);
                     let mut callees = from_engine(d.callees, map_edge);
-                    disclose_unrun_check(&mut callers.source_freshness, unrun);
-                    disclose_unrun_check(&mut callees.source_freshness, unrun);
+                    apply_checked_freshness(
+                        &mut callers.source_freshness,
+                        freshness_override,
+                        unrun,
+                    );
+                    apply_checked_freshness(
+                        &mut callees.source_freshness,
+                        freshness_override,
+                        unrun,
+                    );
+                    let mut source_span = d.source;
+                    let mut source_unavailable_reason = d.source_unavailable_reason;
+                    let mut source_span_omitted_bytes = d.source_omitted_bytes;
+                    hit_ctx.sanitize_span(
+                        &d.file_path,
+                        &mut source_span,
+                        &mut source_unavailable_reason,
+                        &mut source_span_omitted_bytes,
+                    );
                     CodeintelExploreNeighborhood {
                         span_start_line: d.span.0,
                         span_end_line: d.span.1,
-                        source_span: d.source,
-                        source_unavailable_reason: d.source_unavailable_reason,
-                        source_span_omitted_bytes: d.source_omitted_bytes,
+                        source_span,
+                        source_unavailable_reason,
+                        source_span_omitted_bytes,
                         withheld: d.withheld,
                         language: d.language,
                         score: d.score,
@@ -2662,10 +3322,21 @@ pub fn explore_with(
                     neighborhood,
                 }
             });
+            let before_len = definitions.items.len();
+            definitions
+                .items
+                .retain(|d| !hit_ctx.is_tombstoned(&d.file_path, &d.symbol_name));
+            let removed = (before_len - definitions.items.len()) as u32;
+            definitions.shown = definitions.items.len() as u32;
+            definitions.total = definitions.total.saturating_sub(removed);
             definitions.scope = report.scope;
-            disclose_unrun_check(&mut definitions.source_freshness, unrun);
+            apply_checked_freshness(&mut definitions.source_freshness, freshness_override, unrun);
             let mut blast_radius = map_blast_radius(report.blast_radius);
-            disclose_unrun_check(&mut blast_radius.layers.source_freshness, unrun);
+            apply_checked_freshness(
+                &mut blast_radius.layers.source_freshness,
+                freshness_override,
+                unrun,
+            );
             CodeintelExplore {
                 available: definitions.available,
                 reason: definitions.reason.clone(),
@@ -4787,5 +5458,41 @@ pub(crate) mod tests {
         wait_until("the second query keeps its deadline", || {
             second.is_cancelled()
         });
+    }
+
+    #[test]
+    fn vendored_devmap_store_csr_format_is_wired_and_compatible() {
+        let csr_path = devmap_csr_path("/tmp/example-repo");
+        assert!(csr_path.to_string_lossy().ends_with("devmap.sqlite.csr"));
+
+        let edges = std::sync::Arc::new(vec![
+            devmap_store::StoredEdge {
+                source_file: "src/a.rs".to_string(),
+                target_file: "src/b.rs".to_string(),
+                source_symbol: "caller".to_string(),
+                target_symbol: "callee".to_string(),
+                edge_kind: "Calls".to_string(),
+                confidence: 1.0,
+                resolution: Some("SameFile".to_string()),
+            },
+            devmap_store::StoredEdge {
+                source_file: "src/b.rs".to_string(),
+                target_file: "src/c.rs".to_string(),
+                source_symbol: "callee".to_string(),
+                target_symbol: "leaf".to_string(),
+                edge_kind: "Calls".to_string(),
+                confidence: 0.9,
+                resolution: Some("ImportScoped".to_string()),
+            },
+        ]);
+        let index = devmap_store::GenerationEdges::build(edges, None).expect("build edge index");
+        let reader = index.to_csr_reader().expect("materialize CSR reader");
+        assert_eq!(reader.node_count(), 3);
+        assert_eq!(reader.edge_count(), 2);
+
+        let caller_rank = index.symbol_rank("caller").expect("caller rank");
+        let leaf_rank = index.symbol_rank("leaf").expect("leaf rank");
+        let reach = reader.bfs_reachability(caller_rank, 2);
+        assert!(reach.contains(&leaf_rank));
     }
 }

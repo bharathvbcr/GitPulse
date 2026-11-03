@@ -83,7 +83,7 @@ impl HarnessStatus {
 /// This used to exist twice (a generic closure-taking variant here, and a
 /// private reimplementation in `commands`); this signature is the canonical
 /// one both now share.
-pub(crate) fn guard_command(repo_path: &str, argv: &[&str]) -> Result<PolicyVerdict, String> {
+pub fn guard_command(repo_path: &str, argv: &[&str]) -> Result<PolicyVerdict, String> {
     guard_command_allowing(repo_path, argv, &[])
 }
 

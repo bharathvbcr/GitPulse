@@ -84,6 +84,9 @@ const MAX_ORPHANS: usize = 16;
 pub enum AgentKind {
     Claude,
     Codex,
+    Antigravity,
+    DevCouncil,
+    Manvi,
 }
 
 impl AgentKind {
@@ -91,6 +94,9 @@ impl AgentKind {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Antigravity => "antigravity",
+            Self::DevCouncil => "devcouncil",
+            Self::Manvi => "manvi",
         }
     }
 }
@@ -111,6 +117,17 @@ pub(crate) fn classify(exec: &str, arg1: Option<&str>) -> Option<AgentKind> {
     if base == "codex" {
         return Some(AgentKind::Codex);
     }
+    if base == "antigravity" || base.starts_with("antigravity-") {
+        return Some(AgentKind::Antigravity);
+    }
+    // Not `dev`: that name is also Jarvis's CLI. DevCouncil's own binary is
+    // `devcouncil` (`dev` is only a symlink or npm alias to it).
+    if base == "devcouncil" {
+        return Some(AgentKind::DevCouncil);
+    }
+    if base == "manvi" {
+        return Some(AgentKind::Manvi);
+    }
     let runtime = base == "node" || base == "bun" || base.starts_with("node2");
     if runtime {
         let script = arg1?;
@@ -119,6 +136,12 @@ pub(crate) fn classify(exec: &str, arg1: Option<&str>) -> Option<AgentKind> {
         }
         if script.contains("/@openai/codex/") {
             return Some(AgentKind::Codex);
+        }
+        // DevCouncil's npm shim (`bin/devcouncil.js`) or a global-bin link to
+        // it. A path merely under a devcouncil checkout (vite, vitest) is not.
+        let script_name = Path::new(script).file_name().and_then(|n| n.to_str());
+        if matches!(script_name, Some("devcouncil" | "devcouncil.js")) {
+            return Some(AgentKind::DevCouncil);
         }
     }
     None
@@ -130,7 +153,13 @@ pub(crate) fn classify(exec: &str, arg1: Option<&str>) -> Option<AgentKind> {
 /// not candidates. A prefix for `node`, whose versioned binaries are `node`,
 /// `node2` and `nodejs`.
 pub(crate) fn name_selects_procargs(name: &str) -> bool {
-    name == "claude" || name == "codex" || name == "bun" || name.starts_with("node")
+    name == "claude"
+        || name == "codex"
+        || name == "antigravity"
+        || name == "devcouncil"
+        || name == "manvi"
+        || name == "bun"
+        || name.starts_with("node")
 }
 
 /// A name the kernel reports for a versioned installer binary: empty, or a
@@ -555,6 +584,9 @@ pub struct ProcView {
     pub unreadable: u32,
     pub claude: SessionCount,
     pub codex: SessionCount,
+    /// Sessions of every other kind (Antigravity, DevCouncil, Manvi), so
+    /// the per-kind counts add up to the sessions the scan found.
+    pub other: SessionCount,
     pub sessions: Vec<AgentSession>,
     /// More sessions ran than one scan describes.
     pub sessions_truncated: bool,
@@ -580,6 +612,7 @@ impl ProcView {
             unreadable: 0,
             claude: SessionCount::default(),
             codex: SessionCount::default(),
+            other: SessionCount::default(),
             sessions: Vec::new(),
             sessions_truncated: false,
             trees: Vec::new(),
@@ -965,7 +998,11 @@ impl Scanner {
         }
         tree_rows.sort_by(|a, b| a.tree.cmp(&b.tree));
 
-        let (mut claude, mut codex) = (SessionCount::default(), SessionCount::default());
+        let (mut claude, mut codex, mut other) = (
+            SessionCount::default(),
+            SessionCount::default(),
+            SessionCount::default(),
+        );
         let mut sessions = Vec::with_capacity(sessions_at.len().min(MAX_SESSIONS));
         let session_pids: std::collections::HashSet<i32> =
             sessions_at.iter().map(|&i| self.facts[i].pid).collect();
@@ -973,9 +1010,10 @@ impl Scanner {
             let f = &self.facts[i];
             let kind = f.ident.kind.unwrap_or(AgentKind::Claude);
             let tree = self.tree_of[i].map(|t| self.tree_names[t as usize].clone());
-            let count = match kind {
+            let count: &mut SessionCount = match kind {
                 AgentKind::Claude => &mut claude,
                 AgentKind::Codex => &mut codex,
+                AgentKind::Antigravity | AgentKind::DevCouncil | AgentKind::Manvi => &mut other,
             };
             if tree.is_some() {
                 count.launched += 1;
@@ -1034,6 +1072,7 @@ impl Scanner {
             unreadable,
             claude,
             codex,
+            other,
             sessions_truncated: sessions_at.len() > MAX_SESSIONS,
             sessions,
             trees: tree_rows,
@@ -2974,6 +3013,34 @@ pub(crate) mod tests {
                 Some("/usr/local/lib/node_modules/@openai/codex/bin/codex.js"),
                 Some(AgentKind::Codex),
             ),
+            ("/usr/local/bin/antigravity", None, Some(AgentKind::Antigravity)),
+            ("/usr/local/bin/devcouncil", None, Some(AgentKind::DevCouncil)),
+            // `dev` is a generic name (Jarvis ships a `dev` CLI too); only
+            // DevCouncil's own binary name or its npm shim script identify it.
+            ("/usr/local/bin/dev", None, None),
+            ("/Users/me/Code/Jarvis/build/dev", None, None),
+            (
+                "/opt/homebrew/bin/node",
+                Some("/opt/homebrew/bin/devcouncil"),
+                Some(AgentKind::DevCouncil),
+            ),
+            // Tooling run from inside a devcouncil checkout is not the agent.
+            (
+                "/opt/homebrew/bin/node",
+                Some("/Users/me/Code/devcouncil/node_modules/vite/bin/vite.js"),
+                None,
+            ),
+            (
+                "/Users/me/.bun/bin/bun",
+                Some("/Users/me/Code/DevCouncil/node_modules/.bin/vitest"),
+                None,
+            ),
+            ("/usr/local/bin/manvi", None, Some(AgentKind::Manvi)),
+            (
+                "/opt/homebrew/bin/node",
+                Some("/Users/me/Code/DevCouncil/bin/devcouncil.js"),
+                Some(AgentKind::DevCouncil),
+            ),
             // Not agents: the desktop app, a helper, a version directory that
             // is not Claude's, a node running something else.
             ("/Applications/Claude.app/Contents/MacOS/Claude", None, None),
@@ -3411,6 +3478,31 @@ pub(crate) mod tests {
         let observed = view.sessions.iter().find(|s| s.pid == 41).unwrap();
         assert_eq!(observed.members, 3);
         assert_eq!(observed.footprint, Reading::Value(300));
+    }
+
+    /// Agents that have no per-kind field still count somewhere, so the
+    /// counts add up to every session the scan found.
+    #[test]
+    fn sessions_of_other_kinds_are_counted_in_other() {
+        let (mut scan, _) = scanner(vec![
+            p(10, 1, CLAUDE),
+            p(20, 1, "/usr/local/bin/manvi"),
+            p(30, 1, "/usr/local/bin/antigravity"),
+            p(40, 1, "/usr/local/bin/devcouncil"),
+        ]);
+        let view = scan.scan(&ctx(5_000));
+        let total = |c: SessionCount| c.launched + c.observed;
+        assert_eq!(
+            total(view.claude) + total(view.codex) + total(view.other),
+            u32::try_from(view.sessions.len()).unwrap()
+        );
+        assert_eq!(
+            view.other,
+            SessionCount {
+                launched: 0,
+                observed: 3
+            }
+        );
     }
 
     /// A launched tree keeps a child that was reparented to launchd, through

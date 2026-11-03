@@ -10,6 +10,7 @@ pub mod artifacts;
 pub mod ast;
 pub mod bounded;
 pub mod cancel;
+pub mod cas;
 pub mod code_graph;
 pub mod cypher;
 pub mod digest;
@@ -27,6 +28,7 @@ pub mod linguist;
 pub mod manifest;
 pub mod map_preview;
 pub mod model;
+pub mod overlay;
 pub mod query_match;
 pub mod rung;
 pub mod scope;
@@ -49,6 +51,7 @@ pub use artifacts::{
     should_regenerate, write_atomic, writer_identity, ArtifactFingerprint, ArtifactRecord,
     ArtifactStamp,
 };
+pub use ask::*;
 pub use bounded::{bounded_reason, bounded_text, MAX_REASON_COMPONENT_BYTES};
 pub use cancel::{cancelled_queries, Cancel, QueryCancelled};
 pub use code_graph::{
@@ -79,8 +82,12 @@ pub use map_preview::{
 pub use model::*;
 pub use snapshots::{semantic_snapshot_for_file, semantic_snapshots, SemanticSnapshot};
 
-pub use ask::{ASK_DEFAULT_MIN_CONFIDENCE, ASK_MAX_ITERS, ASK_RESTART};
-pub use rung::{filter_by_rung, histogram as rung_histogram, Rung, RungHistogram};
+pub use cas::{blake3_hash, CasAstStore, CAS_TOMBSTONE};
+pub use overlay::{OverlayEdge, RoaringBitmap, WorktreeOverlay};
+pub use rung::{
+    filter_by_rung, histogram as rung_histogram, LadderHistogram, ResolutionLadderTier, Rung,
+    RungHistogram,
+};
 pub use scope::{
     missing_kind_message, NameQueryFilter, ResolvedScope, ScopeReport, SymbolScope,
     MAX_SCOPE_KINDS, MAX_SCOPE_LANGUAGES, MAX_SCOPE_PATHS,

@@ -1204,6 +1204,73 @@ impl Store {
         Ok(Some((loaded, index)))
     }
 
+    /// Materialize and atomically write the `<db_path>.csr` zero-copy mmap sidecar
+    /// for the store's latest generation. Returns `Ok(None)` for an in-memory store,
+    /// a read-only store, or a store with no generations.
+    pub fn write_latest_csr_sidecar(&self) -> Result<Option<std::path::PathBuf>> {
+        if self.read_only {
+            return Ok(None);
+        }
+        let Some(db_path) = self.db_path.as_deref() else {
+            return Ok(None);
+        };
+        let Some((_, index)) = self.generation_edges_with_id()? else {
+            return Ok(None);
+        };
+        let csr_path = Self::csr_sidecar_path(db_path);
+        let mut tmp_name = csr_path.file_name().map_or_else(
+            || std::ffi::OsString::from("devmap.sqlite.csr"),
+            |n| n.to_os_string(),
+        );
+        tmp_name.push(format!(".tmp.{}", std::process::id()));
+        let tmp_path = csr_path.with_file_name(tmp_name);
+        if index.to_csr_writer().write_to_file(&tmp_path).is_ok() {
+            let _ = std::fs::rename(&tmp_path, &csr_path);
+            let _ = std::fs::remove_file(&tmp_path);
+            return Ok(Some(csr_path));
+        }
+        let _ = std::fs::remove_file(&tmp_path);
+        Ok(None)
+    }
+
+    /// Open a zero-copy [`crate::csr::CsrGraphReader`] for the store's latest generation.
+    ///
+    /// If `<db_path>.csr` exists on disk and its stamped generation matches the store's
+    /// latest generation, it is mapped directly via `mmap` without scanning `generation_edges`.
+    /// Otherwise, it is materialized from `generation_edges_with_id()` (and cached to `<db_path>.csr`
+    /// when writable).
+    pub fn open_latest_csr_sidecar(&self) -> Result<Option<crate::csr::CsrGraphReader>> {
+        let Some(current) = self.latest_generation_id()? else {
+            return Ok(None);
+        };
+        if let Some(db_path) = self.db_path.as_deref() {
+            let csr_path = Self::csr_sidecar_path(db_path);
+            if csr_path.is_file() {
+                if let Ok(reader) = crate::csr::CsrGraphReader::open_mmap(&csr_path) {
+                    if reader.generation() == u64::from(current) {
+                        return Ok(Some(reader));
+                    }
+                }
+            }
+            if !self.read_only {
+                if let Ok(Some(written_path)) = self.write_latest_csr_sidecar() {
+                    if let Ok(reader) = crate::csr::CsrGraphReader::open_mmap(&written_path) {
+                        if reader.generation() == u64::from(current) {
+                            return Ok(Some(reader));
+                        }
+                    }
+                }
+            }
+        }
+        let Some((_, index)) = self.generation_edges_with_id()? else {
+            return Ok(None);
+        };
+        index
+            .to_csr_reader()
+            .map(Some)
+            .map_err(|err| refusal(err.to_string()))
+    }
+
     /// The latest generation's adjacency, read fresh, and the generation it
     /// came from.
     ///

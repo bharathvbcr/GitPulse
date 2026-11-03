@@ -59,10 +59,12 @@ file; Overview embeds branch stack hierarchy. **Fleet** compares repositories ac
   word highlighting, symbol-grouped diff hunks, image comparisons, selective staging,
   stash previews, a three-way conflict resolver, and structured patch-brief commit
   phrasing with on-device Apple Intelligence fallback.
-- **Manage worktrees and branches.** Dead-branch cleanup with durable tip backups
-  in the WAL ledger and authorized delete commands, macOS pre-exec background QoS band isolation,
-  copy-on-write build cache sync (`node_modules`, `target`, `.venv`), named localhost routes via portless, and
-  trust-gated lifecycle hooks.
+- **Manage worktrees and branches.** Zero-round-trip branch churn carry-forward on branch mutations,
+  DevMap-guided `--cone` sparse worktrees, `<512 B` zero-copy DevMap base pointers with Blake3/CAS delta overlays,
+  copy-on-write dependency cache sync (`node_modules`, `target`, `.venv`) plus lock-free `gitpulse-rustc` (`RUSTC_WRAPPER`)
+  shared CoW crate caching, parallel agent coordination bus and 3-layer CSR/ODB collision radar (`gitpulse-worktree` CLI & `gitpulse-mcp`),
+  dead-branch cleanup with durable WAL tip backups and authorized delete actions, macOS pre-exec background QoS band isolation,
+  named localhost routes via portless, and trust-gated lifecycle hooks.
 - **Organize the work.** Quick add parses priority, labels, owner, repository,
   due date, and notes. Board views with swimlanes (grouped by owner or label),
   saved views, column WIP limits, column "Load all" paging up to 2,000 cards with
@@ -211,7 +213,8 @@ A frontend build alone does not qualify the native application. Follow the
 The [documentation index](docs/README.md) organizes user guides, integration
 references, contributor contracts, and historical evidence. Start with
 [installation](docs/INSTALLATION.md), [your first repository](docs/GETTING_STARTED.md),
-or [tasks and workspaces](docs/TASKS_AND_WORKSPACES.md).
+[feature reference](docs/FEATURES.md), [tasks and workspaces](docs/TASKS_AND_WORKSPACES.md),
+or [zero-copy agentic worktrees](docs/ZERO_COPY_AGENTIC_WORKTREES.md).
 
 Bug reports, documentation, design, tests, and code contributions are welcome.
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [good first issues](docs/GOOD_FIRST_ISSUES.md).

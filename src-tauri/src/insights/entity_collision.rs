@@ -23,6 +23,9 @@ use std::path::Path;
 pub enum EntityCollisionKind {
     /// At least one symbol appears on both sides' old-side ranges.
     SharedSymbol,
+    /// Edits touch or overlap in line ranges outside shared symbols,
+    /// causing a git merge conflict.
+    ContendedLine,
     /// Both sides resolved symbols, none overlap, and no two parties' edits
     /// touch (adjacent or overlapping old-side lines, which git conflicts) —
     /// file overlap only. The touch rule compares old-side line numbers, so it
@@ -41,6 +44,9 @@ pub struct EntityCollisionVerdict {
     pub reason: String,
     /// Symbol names shared across parties when `kind` is [`SharedSymbol`].
     pub shared_symbols: Vec<String>,
+    /// Closed intervals [s, e + 1] in line-boundary coordinates where edits touch or overlap.
+    #[serde(default)]
+    pub contended_lines: Vec<(u64, u64)>,
     /// Set when the head_sha check failed for every party that failed. Never
     /// inferred from `reason`, which carries user-chosen worktree names and
     /// source text. Not part of the wire shape.
@@ -382,6 +388,7 @@ pub fn classify_parties(
         kind: EntityCollisionKind::FileLevel,
         reason,
         shared_symbols: Vec::new(),
+        contended_lines: Vec::new(),
         stale,
     };
     if !failures.is_empty() {
@@ -414,6 +421,7 @@ pub fn classify_parties(
                 names.join(", ")
             ),
             shared_symbols: names,
+            contended_lines: Vec::new(),
             stale: false,
         };
     }
@@ -423,12 +431,31 @@ pub fn classify_parties(
             .find_map(|b| first_contact(&a.footprint, &b.footprint))
     });
     if let Some(line) = contact {
-        return file_level(
-            format!(
+        let mut contended = Vec::new();
+        for (i, a) in parties.iter().enumerate() {
+            for b in &parties[i + 1..] {
+                for &(s1, e1) in &a.footprint {
+                    for &(s2, e2) in &b.footprint {
+                        if s1.max(s2) <= e1.min(e2) {
+                            contended.push((s1.max(s2), e1.min(e2)));
+                        }
+                    }
+                }
+            }
+        }
+        contended.sort_unstable();
+        contended.dedup();
+
+        return EntityCollisionVerdict {
+            path: path.to_string(),
+            kind: EntityCollisionKind::ContendedLine,
+            reason: format!(
                 "edits touch at line {line} of {path}: the symbols differ but git merges adjacent changes as a conflict"
             ),
-            false,
-        );
+            shared_symbols: Vec::new(),
+            contended_lines: contended,
+            stale: false,
+        };
     }
     EntityCollisionVerdict {
         path: path.to_string(),
@@ -437,6 +464,7 @@ pub fn classify_parties(
             "{path} is dirty in multiple worktrees, but no shared symbol was seen on the old-side ranges — file overlap, not a merge promise"
         ),
         shared_symbols: Vec::new(),
+        contended_lines: Vec::new(),
         stale: false,
     }
 }
@@ -768,6 +796,7 @@ pub fn classify_incoming(
                 kind: EntityCollisionKind::FileLevel,
                 reason: "this write replaces the whole file".into(),
                 shared_symbols: Vec::new(),
+                contended_lines: Vec::new(),
                 stale: false,
             }
         }
@@ -2099,7 +2128,11 @@ class C:
         );
         let v = verdict_for(FILE, &left, &right);
         assert_disjoint_means_git_merges(&v, FILE, base, &left, &right);
-        assert_eq!(v.kind, EntityCollisionKind::FileLevel, "{v:?}");
+        assert_eq!(v.kind, EntityCollisionKind::ContendedLine, "{v:?}");
+        assert!(
+            !v.contended_lines.is_empty(),
+            "contended lines must be non-empty"
+        );
         assert!(v.reason.contains("edits touch"), "{}", v.reason);
     }
 
@@ -2124,8 +2157,38 @@ class C:
         );
         let v = verdict_for(FILE, &left, &right);
         assert_disjoint_means_git_merges(&v, FILE, CLASS_TEXT, &left, &right);
-        assert_eq!(v.kind, EntityCollisionKind::FileLevel, "{v:?}");
+        assert_eq!(v.kind, EntityCollisionKind::ContendedLine, "{v:?}");
+        assert!(
+            !v.contended_lines.is_empty(),
+            "contended lines must be non-empty"
+        );
         assert!(v.reason.contains("edits touch"), "{}", v.reason);
+    }
+
+    #[test]
+    fn tristate_classification_reports_contended_line_with_exact_footprint() {
+        let base = "fn a() {\n    1\n}\nfn b() {\n    2\n}\n";
+        let syms = [
+            ("a", "lib.rs::a", "Function", 1, 3),
+            ("b", "lib.rs::b", "Function", 4, 6),
+        ];
+        // Party A modifies line 3 (footprint [3, 4])
+        let left = worktree_named("w1-", FILE, base, &syms, &replace_line(base, 3, "} // a"));
+        // Party B modifies line 4 (footprint [4, 5])
+        let right = worktree_named(
+            "w2-",
+            FILE,
+            base,
+            &syms,
+            &replace_line(base, 4, "fn b() { // b"),
+        );
+        let v = verdict_for(FILE, &left, &right);
+        assert_eq!(v.kind, EntityCollisionKind::ContendedLine, "{v:?}");
+        assert!(
+            v.contended_lines.contains(&(4, 4)),
+            "contended lines must capture intersection at 4: {:?}",
+            v.contended_lines
+        );
     }
 
     #[test]
@@ -2601,4 +2664,5 @@ class C:
     }
 
     mod adv_w6_entity_tests;
+    mod adversarial_interval_tests;
 }

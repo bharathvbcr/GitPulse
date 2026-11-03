@@ -34,6 +34,8 @@ import { formatUsage, wantsHelp } from "./usage.mjs";
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const CARGO_MANIFEST = "src-tauri/Cargo.toml";
+// Its own workspace, Cargo.lock and target dir: not a member of src-tauri.
+const WORKTREE_MANIFEST = "crates/gitpulse-worktree/Cargo.toml";
 
 /**
  * The gates, in the order CI runs them.
@@ -191,6 +193,27 @@ export const GATES = [
       `cargo test --manifest-path ${CARGO_MANIFEST} --locked --no-fail-fast -- --nocapture --test-threads=1`,
     ],
     produces: ["lcov.info"],
+  },
+  {
+    id: "worktree-fmt",
+    name: "Worktree crate format check",
+    program: "cargo",
+    args: ["fmt", "--manifest-path", WORKTREE_MANIFEST, "--", "--check"],
+    covers: [`cargo fmt --manifest-path ${WORKTREE_MANIFEST} -- --check`],
+  },
+  {
+    id: "worktree-clippy",
+    name: "Worktree crate lint (clippy)",
+    program: "cargo",
+    args: ["clippy", "--manifest-path", WORKTREE_MANIFEST, "--locked", "--all-targets", "--", "-D", "warnings"],
+    covers: [`cargo clippy --manifest-path ${WORKTREE_MANIFEST} --locked --all-targets -- -D warnings`],
+  },
+  {
+    id: "worktree-tests",
+    name: "Worktree crate tests",
+    program: "cargo",
+    args: ["test", "--manifest-path", WORKTREE_MANIFEST, "--locked", "--no-fail-fast", "--", "--test-threads=1"],
+    covers: [`cargo test --manifest-path ${WORKTREE_MANIFEST} --locked --no-fail-fast -- --test-threads=1`],
   },
   {
     // The terminal suites again, every registry backed by a real

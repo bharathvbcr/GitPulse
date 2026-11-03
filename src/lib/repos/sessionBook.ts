@@ -54,7 +54,7 @@ export function createSessionBook(
    * branch-stats drain that finished cleanly. While the branch list still
    * has exactly these, a refresh has nothing to ask the backend about.
    */
-  const statsDrained = new Map<string, string>();
+  const statsDrained = new Map<string, { signature: string; comparedTo: string | null }>();
 
   return {
     familyUnknown,

@@ -1,0 +1,5 @@
+[build]
+# Its own target dir (crates/gitpulse-worktree/target, relative to the directory
+# holding `.cargo/`), never src-tauri/target: that one is the app's shared build
+# directory, and this crate's builds and tests must not contend on its lock.
+target-dir = "target"
