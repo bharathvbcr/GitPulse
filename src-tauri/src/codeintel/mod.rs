@@ -179,6 +179,11 @@ pub struct CodeintelResponse<T> {
     /// Set when the producer stopped early — distinct from budget truncation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub walk_incomplete: Option<String>,
+    /// What the uncommitted-worktree overlay contributed or could not: symbols recovered
+    /// by the fallback scan, an unreadable overlay, or a failed or capped live change
+    /// list. Present means the answer is not a plain index read; it is not an early stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_note: Option<String>,
     /// Population across the resolution ladder before any `min_rung` filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rungs: Option<CodeintelRungHistogram>,
@@ -205,6 +210,7 @@ impl<T> CodeintelResponse<T> {
             shown: 0,
             truncated: false,
             walk_incomplete: None,
+            overlay_note: None,
             rungs: None,
             scope: None,
         }
@@ -220,6 +226,7 @@ impl<T> CodeintelResponse<T> {
             shown,
             truncated,
             walk_incomplete: None,
+            overlay_note: None,
             rungs: None,
             scope: None,
         }
@@ -1274,7 +1281,10 @@ struct OpenedCheckedStore {
 
 /// Opens the built map and, when `verify` is set, runs the whole-tree check on
 /// that store so the engine's answers carry its verdict.
-fn open_repo_map_checked(repo_path: &str, verify: bool) -> Result<OpenedCheckedStore, CommandError> {
+fn open_repo_map_checked(
+    repo_path: &str,
+    verify: bool,
+) -> Result<OpenedCheckedStore, CommandError> {
     let repo = resolve_repo(repo_path)?;
     let opened = open_indexed_store_any(&repo).map_err(CommandError::from)?;
     match opened {
@@ -1282,7 +1292,9 @@ fn open_repo_map_checked(repo_path: &str, verify: bool) -> Result<OpenedCheckedS
             let unrun = if verify {
                 match store.status(&map_path(&repo).to_string_lossy()) {
                     Err(e) => Some(format!("whole-tree freshness check failed: {e}")),
-                    Ok(status) if status.source_freshness.is_none() && status.pending_count == 0 => {
+                    Ok(status)
+                        if status.source_freshness.is_none() && status.pending_count == 0 =>
+                    {
                         Some(status.degraded_reason.unwrap_or_else(|| {
                             "whole-tree freshness check produced no verdict".to_string()
                         }))
@@ -1360,28 +1372,52 @@ struct WorktreeHitContext {
     anchor_root: Option<PathBuf>,
     overlay: Option<devmap_query::WorktreeOverlay>,
     live_deltas: Option<std::collections::HashMap<String, worktree_overlay::DeltaKind>>,
+    /// Why the overlay or the live change list is missing or partial.
+    degraded: Vec<String>,
 }
 
 impl WorktreeHitContext {
     fn load(opened: &OpenedCheckedStore) -> Self {
+        let mut degraded = Vec::new();
         let gen_id = opened.store.latest_generation_id().ok().flatten();
         let repo_str = opened.repo.to_string_lossy();
         let overlay = if worktree_overlay_path(&repo_str).is_file() {
-            load_worktree_overlay(&repo_str)
-                .ok()
-                .flatten()
-                .filter(|ov| match gen_id {
+            match load_worktree_overlay(&repo_str) {
+                Ok(found) => found.filter(|ov| match gen_id {
                     Some(g) => ov.generation == u64::from(g),
                     None => true,
-                })
+                }),
+                Err(e) => {
+                    degraded.push(format!(
+                        "worktree overlay unreadable, treated as absent: {}",
+                        e.message()
+                    ));
+                    None
+                }
+            }
         } else {
             None
         };
         let live_deltas = if opened.anchor_root.is_some() || overlay.is_some() {
             let gen_head = opened.store.latest_generation_head_sha().ok().flatten();
-            worktree_overlay::collect_worktree_deltas(&opened.repo, gen_head.as_deref())
-                .ok()
-                .map(|(rows, _)| rows.into_iter().collect())
+            match worktree_overlay::collect_worktree_deltas(&opened.repo, gen_head.as_deref()) {
+                Ok((rows, truncated)) => {
+                    if truncated {
+                        degraded.push(format!(
+                            "live change list capped at {} files; later changes are not reflected",
+                            worktree_overlay::MAX_OVERLAY_DIRTY_FILES
+                        ));
+                    }
+                    Some(rows.into_iter().collect())
+                }
+                Err(e) => {
+                    degraded.push(format!(
+                        "live worktree changes unavailable: {}",
+                        e.message()
+                    ));
+                    None
+                }
+            }
         } else {
             None
         };
@@ -1390,13 +1426,35 @@ impl WorktreeHitContext {
             anchor_root: opened.anchor_root.clone(),
             overlay,
             live_deltas,
+            degraded,
         }
     }
 
-    fn overlay_file_still_matches(&self, ov: &devmap_query::WorktreeOverlay, rel_path: &str) -> bool {
+    /// Records this context's degradations on a response.
+    fn annotate<T>(&self, out: &mut CodeintelResponse<T>) {
+        if self.degraded.is_empty() {
+            return;
+        }
+        let joined = self.degraded.join("; ");
+        out.overlay_note = Some(match out.overlay_note.take() {
+            Some(existing) if !existing.is_empty() => format!("{existing}; {joined}"),
+            _ => joined,
+        });
+    }
+
+    fn overlay_file_still_matches(
+        &self,
+        ov: &devmap_query::WorktreeOverlay,
+        rel_path: &str,
+    ) -> bool {
         let full = self.repo.join(rel_path);
-        let Ok(bytes) = std::fs::read(&full) else {
-            return !full.exists();
+        // An oversize or non-regular file never carries a recorded hash, so it cannot match.
+        let bytes = match worktree_overlay::read_bounded_file(
+            &full,
+            worktree_overlay::MAX_OVERLAY_FILE_BYTES,
+        ) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) | Err(_) => return !full.exists(),
         };
         match ov.modified_files.get(Path::new(rel_path)) {
             Some(expected) => devmap_query::blake3_hash(&bytes) == *expected,
@@ -1405,10 +1463,7 @@ impl WorktreeHitContext {
     }
 
     fn is_tombstoned(&self, file_path: &str, symbol_name: &str) -> bool {
-        if self
-            .live_deltas
-            .as_ref()
-            .and_then(|m| m.get(file_path))
+        if self.live_deltas.as_ref().and_then(|m| m.get(file_path))
             == Some(&worktree_overlay::DeltaKind::Deleted)
         {
             return true;
@@ -1438,15 +1493,25 @@ impl WorktreeHitContext {
         let Some(ref anchor) = self.anchor_root else {
             return;
         };
-        let modified_in_wt = self
-            .live_deltas
-            .as_ref()
-            .and_then(|m| m.get(file_path))
+        let modified_in_wt = self.live_deltas.as_ref().and_then(|m| m.get(file_path))
             == Some(&worktree_overlay::DeltaKind::Modified)
             || {
                 let wt_file = self.repo.join(file_path);
-                wt_file.is_file()
-                    && std::fs::read(&wt_file).ok() != std::fs::read(anchor.join(file_path)).ok()
+                wt_file.is_file() && {
+                    let read = |p: &Path| {
+                        worktree_overlay::read_bounded_file(
+                            p,
+                            worktree_overlay::MAX_OVERLAY_FILE_BYTES,
+                        )
+                        .ok()
+                        .flatten()
+                    };
+                    // A file over the bound cannot be compared, so it is treated as modified.
+                    match (read(&wt_file), read(&anchor.join(file_path))) {
+                        (Some(a), Some(b)) => a != b,
+                        _ => true,
+                    }
+                }
             };
         if modified_in_wt {
             *source_span = String::new();
@@ -1456,9 +1521,15 @@ impl WorktreeHitContext {
         }
     }
 
+    /// Adds uncommitted overlay symbols matching `query`. Bounded: at most
+    /// [`MAX_OVERLAY_SEARCH_HITS`] hits and the response's remaining source budget;
+    /// symbols are matched before any file is read, and each read is bounded. Hitting a
+    /// bound sets `truncated`. The provenance note goes in `overlay_note`, never
+    /// `walk_incomplete` (which means the walk stopped early).
     fn append_overlay_search_hits(
         &self,
         query: &str,
+        token_budget: u32,
         filter: Option<&NameQueryFilter>,
         out: &mut CodeintelResponse<CodeintelSymbolHit>,
     ) {
@@ -1469,8 +1540,13 @@ impl WorktreeHitContext {
         if needle.is_empty() {
             return;
         }
+        // ~4 bytes of source per budget token, minus what the index hits already spent.
+        let spent: usize = out.items.iter().map(|h| h.source_span.len()).sum();
+        let mut remaining = (token_budget as usize)
+            .saturating_mul(4)
+            .saturating_sub(spent);
         let mut added = 0u32;
-        for (rel_path, ext) in &ov.added_extractions {
+        'files: for (rel_path, ext) in &ov.added_extractions {
             if let Some(f) = filter {
                 let path_ok = f.paths().is_empty()
                     || f.paths()
@@ -1484,9 +1560,34 @@ impl WorktreeHitContext {
                     continue;
                 }
             }
-            let full_path = self.repo.join(rel_path);
-            let Ok(bytes) = std::fs::read(&full_path) else {
+            let matching: Vec<_> = ext
+                .symbols
+                .iter()
+                .filter(|sym| !matches!(sym.kind, devmap_extract::SymbolKind::File))
+                .filter(|sym| {
+                    filter.is_none_or(|f| {
+                        f.kinds().is_empty()
+                            || f.kinds()
+                                .iter()
+                                .any(|k| k.eq_ignore_ascii_case(sym.kind.as_str()))
+                    })
+                })
+                .filter(|sym| {
+                    sym.name.to_ascii_lowercase().contains(&needle)
+                        || sym.qualified_name.to_ascii_lowercase().contains(&needle)
+                })
+                .collect();
+            if matching.is_empty() {
                 continue;
+            }
+            let full_path = self.repo.join(rel_path);
+            let bytes = match worktree_overlay::read_bounded_file(
+                &full_path,
+                worktree_overlay::MAX_OVERLAY_FILE_BYTES,
+            ) {
+                Ok(Some(bytes)) => bytes,
+                // Missing, oversize or unreadable: its symbols cannot be verified.
+                Ok(None) | Err(_) => continue,
             };
             if let Some(expected_hash) = ov.modified_files.get(Path::new(rel_path)) {
                 if devmap_query::blake3_hash(&bytes) != *expected_hash {
@@ -1495,31 +1596,17 @@ impl WorktreeHitContext {
             }
             let source_text = std::str::from_utf8(&bytes).ok();
             let secret = devmap_extract::secret::is_secret_path(rel_path);
-            for sym in &ext.symbols {
-                if matches!(sym.kind, devmap_extract::SymbolKind::File) {
-                    continue;
-                }
-                if let Some(f) = filter {
-                    if !f.kinds().is_empty()
-                        && !f
-                            .kinds()
-                            .iter()
-                            .any(|k| k.eq_ignore_ascii_case(sym.kind.as_str()))
-                    {
-                        continue;
-                    }
-                }
-                let matches_query = sym.name.to_ascii_lowercase().contains(&needle)
-                    || sym.qualified_name.to_ascii_lowercase().contains(&needle);
-                if !matches_query {
-                    continue;
-                }
+            for sym in matching {
                 if out
                     .items
                     .iter()
                     .any(|h| h.file_path == *rel_path && h.symbol_name == sym.name)
                 {
                     continue;
+                }
+                if added as usize >= MAX_OVERLAY_SEARCH_HITS || remaining == 0 {
+                    out.truncated = true;
+                    break 'files;
                 }
                 let (span_start_line, span_end_line) = source_text
                     .map(|t| sym.span.line_range(t))
@@ -1532,7 +1619,16 @@ impl WorktreeHitContext {
                 } else if let Some(t) = source_text {
                     let s = sym.span.start_byte.min(t.len());
                     let e = sym.span.end_byte.min(t.len()).max(s);
-                    (t.get(s..e).unwrap_or("").to_string(), None)
+                    let span = t.get(s..e).unwrap_or("");
+                    if span.len() > remaining {
+                        (
+                            String::new(),
+                            Some("source span omitted: token budget exhausted".to_string()),
+                        )
+                    } else {
+                        remaining -= span.len();
+                        (span.to_string(), None)
+                    }
                 } else {
                     (
                         String::new(),
@@ -1562,13 +1658,16 @@ impl WorktreeHitContext {
             out.shown = out.items.len() as u32;
             const NOTE: &str =
                 "includes uncommitted worktree overlay symbols recovered by fallback declaration scan";
-            out.walk_incomplete = Some(match out.walk_incomplete.take() {
+            out.overlay_note = Some(match out.overlay_note.take() {
                 Some(existing) if !existing.is_empty() => format!("{existing}; {NOTE}"),
                 _ => NOTE.to_string(),
             });
         }
     }
 }
+
+/// Most overlay-only symbols one search adds beyond the index's own hits.
+const MAX_OVERLAY_SEARCH_HITS: usize = 50;
 
 /// Searches symbols using in-process code graph index.
 pub fn search(
@@ -1637,7 +1736,13 @@ pub fn search_with(
             let removed = (before_len - out.items.len()) as u32;
             out.total = out.total.saturating_sub(removed);
             out.shown = out.items.len() as u32;
-            hit_ctx.append_overlay_search_hits(query, filter.as_ref(), &mut out);
+            hit_ctx.append_overlay_search_hits(
+                query,
+                token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET),
+                filter.as_ref(),
+                &mut out,
+            );
+            hit_ctx.annotate(&mut out);
             apply_checked_freshness(
                 &mut out.source_freshness,
                 opened.freshness_override.as_ref(),

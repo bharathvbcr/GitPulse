@@ -26,7 +26,7 @@
 
 use crate::devmap::init::ensure_dir_excluded;
 use crate::engine::cow_clone::{reflink_copy_dir, reflink_copy_file};
-use crate::engine::git_cli::{git_captured, validate_repo};
+use crate::engine::git_cli::{git_captured, validate_repo, BoundedRun};
 use crate::ipc_error::CommandError;
 use devmap_query::{blake3_hash, CasAstStore, WorktreeOverlay, CAS_TOMBSTONE};
 use devmap_store::{IncrementalDigestEngine, Store};
@@ -210,9 +210,7 @@ fn rebind_cloned_sqlite_root(tmp_db: &Path, canonical_worktree: &Path) -> Result
     {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|e| {
-                CommandError::from(format!("failed to begin rebind transaction: {e}"))
-            })?;
+            .map_err(|e| CommandError::from(format!("failed to begin rebind transaction: {e}")))?;
         tx.execute(
             "UPDATE pending_state SET repo_root = ?1 WHERE singleton = 1",
             [wt_str],
@@ -224,9 +222,8 @@ fn rebind_cloned_sqlite_root(tmp_db: &Path, canonical_worktree: &Path) -> Result
             .map_err(|e| {
                 CommandError::from(format!("failed to rebind generations.repo_root: {e}"))
             })?;
-        tx.commit().map_err(|e| {
-            CommandError::from(format!("failed to commit repo_root rebind: {e}"))
-        })?;
+        tx.commit()
+            .map_err(|e| CommandError::from(format!("failed to commit repo_root rebind: {e}")))?;
     }
     // Flush any WAL frames created by the 2-row rebind back into `tmp_db` before
     // renaming `tmp_db` to `devmap.sqlite`.
@@ -387,7 +384,10 @@ pub fn provision_worktree_devmap(
     // Determine which state directory name `worktree` will resolve to.
     let target_state_name = if worktree.join(devmap_query::paths::STATE_DIR).is_dir() {
         devmap_query::paths::STATE_DIR
-    } else if worktree.join(devmap_query::paths::LEGACY_STATE_DIR).is_dir() {
+    } else if worktree
+        .join(devmap_query::paths::LEGACY_STATE_DIR)
+        .is_dir()
+    {
         devmap_query::paths::LEGACY_STATE_DIR
     } else {
         anchor_state_name
@@ -411,7 +411,11 @@ pub fn provision_worktree_devmap(
             .unwrap_or(generation_id);
         drop(existing_store);
         let target_db = devmap_query::paths::store_path(&worktree);
-        let overlay = sync_worktree_overlay_internal(&worktree, Some(existing_gen)).ok();
+        let (overlay, overlay_error) =
+            match sync_worktree_overlay_internal(&worktree, Some(existing_gen)) {
+                Ok(report) => (Some(report), None),
+                Err(e) => (None, Some(format!("overlay sync failed: {}", e.message()))),
+            };
         return Ok(DevmapWorktreeProvision {
             seeded: true,
             is_cow: false,
@@ -424,7 +428,7 @@ pub fn provision_worktree_devmap(
             cas_seeded: cas_ast_dir_for_state(&worktree.join(target_state_name)).is_dir(),
             overlay_path: overlay.map(|r| r.overlay_path),
             duration_ms: start.elapsed().as_millis() as u64,
-            reason: None,
+            reason: overlay_error,
         });
     }
 
@@ -695,7 +699,10 @@ pub fn provision_worktree_devmap_zero_copy(
 
     let target_state_name = if worktree.join(devmap_query::paths::STATE_DIR).is_dir() {
         devmap_query::paths::STATE_DIR
-    } else if worktree.join(devmap_query::paths::LEGACY_STATE_DIR).is_dir() {
+    } else if worktree
+        .join(devmap_query::paths::LEGACY_STATE_DIR)
+        .is_dir()
+    {
         devmap_query::paths::LEGACY_STATE_DIR
     } else {
         anchor_state_name
@@ -847,6 +854,28 @@ fn parse_nul_porcelain_status(bytes: &[u8]) -> Vec<(String, DeltaKind)> {
     out
 }
 
+/// Folds `git ls-files --others` output into `map`. A failed or cut-short listing is an
+/// error: reading it as "no untracked files" would silently drop every new file.
+fn merge_untracked_listing(
+    map: &mut HashMap<String, DeltaKind>,
+    run: BoundedRun,
+) -> Result<(), CommandError> {
+    if run.status_code != 0 {
+        return Err(CommandError::from(format!(
+            "git ls-files --others failed with code {}: {}",
+            run.status_code,
+            String::from_utf8_lossy(&run.stderr).trim()
+        )));
+    }
+    let run = run.require_complete("git ls-files --others")?;
+    for raw in run.stdout.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+        if let Ok(path) = std::str::from_utf8(raw) {
+            map.insert(path.to_string(), DeltaKind::Modified);
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn collect_worktree_deltas(
     repo: &Path,
     base_head_sha: Option<&str>,
@@ -856,7 +885,8 @@ pub(super) fn collect_worktree_deltas(
     let mut diffed_against_base = false;
     if let Some(sha) = base_head_sha.filter(|s| !s.is_empty()) {
         if let Ok(run) = git_captured(repo, &["diff", "--name-status", "-z", sha, "--"]) {
-            if run.status_code == 0 {
+            // A cut-short diff would drop deltas; fall through to the full status read instead.
+            if run.status_code == 0 && run.incomplete.is_none() {
                 diffed_against_base = true;
                 for (path, kind) in parse_nul_diff_name_status(&run.stdout) {
                     map.insert(path, kind);
@@ -867,13 +897,7 @@ pub(super) fn collect_worktree_deltas(
 
     if diffed_against_base {
         let untracked = git_captured(repo, &["ls-files", "--others", "--exclude-standard", "-z"])?;
-        if untracked.status_code == 0 {
-            for raw in untracked.stdout.split(|&b| b == 0).filter(|s| !s.is_empty()) {
-                if let Ok(path) = std::str::from_utf8(raw) {
-                    map.insert(path.to_string(), DeltaKind::Modified);
-                }
-            }
-        }
+        merge_untracked_listing(&mut map, untracked)?;
     } else {
         let status = git_captured(repo, &["status", "--porcelain=v1", "-z", "-uall"])?;
         if status.status_code != 0 {
@@ -883,6 +907,7 @@ pub(super) fn collect_worktree_deltas(
                 String::from_utf8_lossy(&status.stderr).trim()
             )));
         }
+        let status = status.require_complete("git status")?;
         for (path, kind) in parse_nul_porcelain_status(&status.stdout) {
             map.insert(path, kind);
         }
@@ -952,7 +977,7 @@ impl CsrDigestLookup {
     }
 }
 
-fn read_bounded_file(path: &Path, cap: u64) -> Result<Option<Vec<u8>>, CommandError> {
+pub(super) fn read_bounded_file(path: &Path, cap: u64) -> Result<Option<Vec<u8>>, CommandError> {
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1033,8 +1058,18 @@ pub(super) fn open_verified_zero_copy_anchor_store(
 }
 
 pub(super) fn is_sparse_worktree(repo: &Path) -> bool {
-    git_captured(repo, &["config", "--bool", "core.sparseCheckout"])
-        .map(|run| run.status_code == 0 && String::from_utf8_lossy(&run.stdout).trim() == "true")
+    // `--get` is a read; an unset key exits 1, which is "not sparse".
+    git_captured(repo, &["config", "--get", "core.sparseCheckout"])
+        .map(|run| {
+            run.status_code == 0
+                && matches!(
+                    String::from_utf8_lossy(&run.stdout)
+                        .trim()
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "true" | "yes" | "on" | "1"
+                )
+        })
         .unwrap_or(false)
 }
 
@@ -1072,7 +1107,12 @@ pub(super) fn verify_zero_copy_worktree_freshness(
             }
         }
         match collect_worktree_deltas(worktree, gen_head.as_deref()) {
-            Err(e) => return (None, Some(format!("source freshness unverified: {}", e.message()))),
+            Err(e) => {
+                return (
+                    None,
+                    Some(format!("source freshness unverified: {}", e.message())),
+                )
+            }
             Ok((deltas, _)) if !deltas.is_empty() => {
                 return (
                     Some(false),
@@ -1401,10 +1441,8 @@ fn sync_worktree_overlay_internal(
             DeltaKind::Deleted => {
                 overlay.mark_file_tombstone(&rel_path, first_node);
                 for row in &indexed_rows {
-                    overlay.mark_symbol_tombstone(
-                        file_scoped_symbol_id(&rel_path, &row.name),
-                        None,
-                    );
+                    overlay
+                        .mark_symbol_tombstone(file_scoped_symbol_id(&rel_path, &row.name), None);
                     overlay.mark_symbol_tombstone(
                         file_scoped_symbol_id(&rel_path, &row.qualified_name),
                         None,
@@ -1507,9 +1545,8 @@ fn sync_worktree_overlay_internal(
         .split('/')
         .fold(state_dir, |acc, part| acc.join(part));
     if let Some(parent) = overlay_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-            CommandError::from(format!("cannot create {}: {e}", parent.display()))
-        })?;
+        fs::create_dir_all(parent)
+            .map_err(|e| CommandError::from(format!("cannot create {}: {e}", parent.display())))?;
     }
     let encoded = serde_json::to_vec_pretty(&overlay)
         .map_err(|e| CommandError::from(format!("cannot serialize WorktreeOverlay: {e}")))?;
@@ -1562,13 +1599,27 @@ pub fn load_worktree_overlay(repo_path: &str) -> Result<Option<WorktreeOverlay>,
     Ok(Some(overlay))
 }
 
+/// What a read-only dirty-node scan found, and whether it is the whole answer.
+#[derive(Debug, Default)]
+pub(crate) struct DirtyNodeScan {
+    pub dirty_nodes: devmap_query::RoaringBitmap,
+    /// The worktree's changed-file list was capped at [`MAX_OVERLAY_DIRTY_FILES`], so
+    /// `dirty_nodes` covers only the files that fit.
+    pub truncated: bool,
+}
+
 /// Computes live [`RoaringBitmap`] CSR `dirty_nodes` for `repo_path` purely in memory
 /// without modifying `.git/info/exclude`, creating `.devmap`/`.devcouncil` directories,
 /// or writing `overlay.json` / CAS AST blobs. Used by read-only radar scans (`readOnlyHint: true`).
+///
+/// The result says whether the delta list was capped ([`DirtyNodeScan::truncated`]); a
+/// persisted overlay that cannot be read, or whose generation differs from the CSR being
+/// intersected, is never merged silently (the first is an error, the second is discarded
+/// because the live delta below supersedes it).
 pub(crate) fn compute_worktree_dirty_nodes_readonly(
     repo_path: &str,
     fallback_anchor: Option<&Path>,
-) -> Result<devmap_query::RoaringBitmap, CommandError> {
+) -> Result<DirtyNodeScan, CommandError> {
     let repo = validate_repo(repo_path)?;
     let local_store = super::open_local_indexed_store(&repo).ok();
     let zero_copy_anchor = if local_store.is_none() {
@@ -1587,16 +1638,19 @@ pub(crate) fn compute_worktree_dirty_nodes_readonly(
         .or_else(|| zero_copy_anchor.as_ref().map(|(s, _)| s))
         .or(fallback_store.as_ref());
 
-    let mut dirty = match load_worktree_overlay(repo_path) {
-        Ok(Some(existing)) => existing.dirty_nodes,
-        _ => devmap_query::RoaringBitmap::new(),
-    };
+    // Node IDs are only comparable within one CSR generation; a persisted overlay is
+    // merged below only after its generation is checked against the CSR in hand.
+    let persisted = load_worktree_overlay(repo_path)?;
 
     let Some(store) = active_store else {
-        return Ok(dirty);
+        return Ok(DirtyNodeScan::default());
     };
     let Some(csr_reader) = store.open_latest_csr_sidecar().ok().flatten() else {
-        return Ok(dirty);
+        return Ok(DirtyNodeScan::default());
+    };
+    let mut dirty = match persisted {
+        Some(existing) if existing.generation == csr_reader.generation() => existing.dirty_nodes,
+        _ => devmap_query::RoaringBitmap::new(),
     };
     let csr_lookup = CsrDigestLookup::from_reader(&csr_reader);
     let base_head_sha = store
@@ -1609,7 +1663,7 @@ pub(crate) fn compute_worktree_dirty_nodes_readonly(
                 .and_then(|(_, r)| r.base_head_sha.clone())
         });
 
-    let (deltas, _) = collect_worktree_deltas(&repo, base_head_sha.as_deref())?;
+    let (deltas, truncated) = collect_worktree_deltas(&repo, base_head_sha.as_deref())?;
     for (rel_path, _kind) in deltas {
         let indexed_symbols: Vec<String> = store
             .latest_symbols_for_file(&rel_path)
@@ -1621,7 +1675,10 @@ pub(crate) fn compute_worktree_dirty_nodes_readonly(
             dirty.insert(nid);
         }
     }
-    Ok(dirty)
+    Ok(DirtyNodeScan {
+        dirty_nodes: dirty,
+        truncated,
+    })
 }
 
 #[cfg(test)]
@@ -1631,7 +1688,9 @@ mod tests {
     use std::process::Command;
 
     fn git(repo: &Path, args: &[&str]) {
-        let out = Command::new("git")
+        let mut out_cmd = Command::new("git");
+        crate::test_support::pin_git(&mut out_cmd);
+        let out = out_cmd
             .current_dir(repo)
             .args(args)
             .output_locked()
@@ -1683,7 +1742,11 @@ mod tests {
         {
             use std::os::unix::fs::MetadataExt;
             let db_meta = fs::metadata(devmap_query::paths::store_path(&wt)).unwrap();
-            assert_eq!(db_meta.nlink(), 1, "seeded SQLite DB must not be hardlinked");
+            assert_eq!(
+                db_meta.nlink(),
+                1,
+                "seeded SQLite DB must not be hardlinked"
+            );
         }
 
         // Codeintel status and CSR graph must open cleanly in the new worktree
@@ -1696,7 +1759,9 @@ mod tests {
         assert_eq!(csr.generation(), u64::from(report.generation_id.unwrap()));
 
         // Git status in the worktree must be 100% clean (excluded via info/exclude).
-        let git_status = Command::new("git")
+        let mut git_status_cmd = Command::new("git");
+        crate::test_support::pin_git(&mut git_status_cmd);
+        let git_status = git_status_cmd
             .current_dir(&wt)
             .args(["status", "--porcelain"])
             .output_locked()
@@ -1733,9 +1798,7 @@ mod tests {
         // Hold an open writer connection with an uncheckpointed WAL transaction on anchor DB.
         let anchor_db = devmap_query::paths::store_path(anchor);
         let writer = Connection::open(&anchor_db).unwrap();
-        writer
-            .pragma_update(None, "journal_mode", "WAL")
-            .unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
         writer
             .pragma_update(None, "wal_autocheckpoint", 0i64)
             .unwrap();
@@ -1747,7 +1810,9 @@ mod tests {
             .unwrap();
         let wal_path = PathBuf::from(format!("{}-wal", anchor_db.display()));
         assert!(
-            fs::metadata(&wal_path).map(|m| m.len() > 0).unwrap_or(false),
+            fs::metadata(&wal_path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false),
             "expected non-empty WAL sidecar"
         );
 
@@ -1865,7 +1930,13 @@ mod tests {
         let wt = wt_parent.path().join("lane-zero-copy");
         git(
             anchor,
-            &["worktree", "add", "-b", "lane/zero-copy", wt.to_str().unwrap()],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane/zero-copy",
+                wt.to_str().unwrap(),
+            ],
         );
         crate::test_support::trust_repo(&wt);
 
@@ -1984,7 +2055,9 @@ mod tests {
                 "seed fresh anchor",
             ],
         );
-        let head_out = Command::new("git")
+        let mut head_out_cmd = Command::new("git");
+        crate::test_support::pin_git(&mut head_out_cmd);
+        let head_out = head_out_cmd
             .current_dir(anchor)
             .args(["rev-parse", "HEAD"])
             .output_locked()
@@ -1999,8 +2072,7 @@ mod tests {
             .into_iter()
             .map(|(k, v)| (k.to_string(), v))
             .collect();
-        let (grammar_ver, analyzer_ver) =
-            devmap_extract::cache::current_payload_identity("rust");
+        let (grammar_ver, analyzer_ver) = devmap_extract::cache::current_payload_identity("rust");
 
         let db = devmap_query::paths::store_path(anchor);
         fs::create_dir_all(db.parent().unwrap()).unwrap();
@@ -2013,7 +2085,11 @@ mod tests {
         let files = [
             ("src/caller.rs", "probe_caller", caller_src.len() as i64),
             ("src/callee.rs", "probe_callee", callee_src.len() as i64),
-            ("tests/caller_test.rs", "calls_probe_caller", test_src.len() as i64),
+            (
+                "tests/caller_test.rs",
+                "calls_probe_caller",
+                test_src.len() as i64,
+            ),
         ];
         conn.execute(
             "INSERT INTO generations (id, created_at, head_sha, analysis_json, repo_root)
@@ -2030,11 +2106,12 @@ mod tests {
             let content_hash = *hashes.get(*path).expect("scanned hash") as i64;
             conn.execute("INSERT INTO paths (id, path) VALUES (?1, ?2)", (id, *path))
                 .unwrap();
-            let engine_json = serde_json::to_string(&devmap_extract::ExtractionEngine::TreeSitter {
-                grammar: "rust".to_string(),
-                grammar_version: grammar_ver.parse::<u32>().unwrap_or(1),
-            })
-            .unwrap();
+            let engine_json =
+                serde_json::to_string(&devmap_extract::ExtractionEngine::TreeSitter {
+                    grammar: "rust".to_string(),
+                    grammar_version: grammar_ver.parse::<u32>().unwrap_or(1),
+                })
+                .unwrap();
             conn.execute(
                 "INSERT INTO file_payloads
                    (payload_id, file_id, content_hash, language,
@@ -2100,7 +2177,13 @@ mod tests {
         let wt = wt_parent.path().join("wt-zc-queries");
         git(
             anchor,
-            &["worktree", "add", "-b", "lane/zc-queries", wt.to_str().unwrap()],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane/zc-queries",
+                wt.to_str().unwrap(),
+            ],
         );
         crate::test_support::trust_repo(&wt);
         provision_worktree_devmap_zero_copy(anchor, &wt).expect("zero-copy provision");
@@ -2159,11 +2242,15 @@ mod tests {
         assert_eq!(neigh.len(), 1);
 
         let file_syms = crate::codeintel::symbols_for_file(wt_str, "src/caller.rs", &head_sha);
-        assert!(file_syms.available, "zero-copy symbols_for_file failed: {file_syms:?}");
+        assert!(
+            file_syms.available,
+            "zero-copy symbols_for_file failed: {file_syms:?}"
+        );
         assert!(file_syms.head_matches);
         assert_eq!(file_syms.items.len(), 1);
 
-        let csr = crate::codeintel::open_repo_csr_graph(wt_str).expect("zero-copy open_repo_csr_graph");
+        let csr =
+            crate::codeintel::open_repo_csr_graph(wt_str).expect("zero-copy open_repo_csr_graph");
         assert!(csr.node_count() >= 3);
 
         let selected = crate::codeintel::affected_tests(
@@ -2219,14 +2306,68 @@ mod tests {
             .find(|h| h.symbol_name == "probe_caller")
             .expect("expected probe_caller hit");
         assert!(
-            dirty_caller.source_span.is_empty()
-                && dirty_caller.source_unavailable_reason.is_some(),
+            dirty_caller.source_span.is_empty() && dirty_caller.source_unavailable_reason.is_some(),
             "dirty zero-copy worktree must NOT return anchor's stale source_span: {dirty_caller:?}"
         );
     }
 
     #[test]
-    fn sync_worktree_overlay_extracts_fallback_declarations_tombstones_removed_symbols_and_shares_cas() {
+    fn search_surfaces_an_unreadable_overlay_instead_of_reading_it_as_absent() {
+        let (anchor_dir, _) = fixture_with_csr();
+        let anchor = anchor_dir.path();
+        let overlay_path = OVERLAY_RELPATH
+            .split('/')
+            .fold(devmap_query::paths::state_dir(anchor), |acc, part| {
+                acc.join(part)
+            });
+        fs::create_dir_all(overlay_path.parent().unwrap()).unwrap();
+        fs::write(&overlay_path, b"{ not json").unwrap();
+        let hits = crate::codeintel::search(anchor.to_str().unwrap(), "probe_caller", None);
+        assert!(
+            hits.overlay_note
+                .as_deref()
+                .is_some_and(|n| n.contains("unreadable")),
+            "a corrupt overlay must be reported: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn overlay_search_hits_are_capped_and_the_cap_sets_truncated() {
+        let (anchor_dir, _head_sha) = seed_fresh_anchor_for_zero_copy();
+        let anchor = anchor_dir.path();
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("wt-cap");
+        git(
+            anchor,
+            &["worktree", "add", "-b", "lane/cap", wt.to_str().unwrap()],
+        );
+        crate::test_support::trust_repo(&wt);
+        provision_worktree_devmap_zero_copy(anchor, &wt).unwrap();
+        let src: String = (0..80)
+            .map(|i| format!("pub fn overlay_cap_probe_{i}() -> usize {{ {i} }}\n"))
+            .collect();
+        fs::write(wt.join("src/many.rs"), src).unwrap();
+        let wt_str = wt.to_str().unwrap();
+        sync_worktree_overlay(wt_str).expect("sync");
+
+        let hits = crate::codeintel::search(wt_str, "overlay_cap_probe_", Some(100_000));
+        let overlay_hits = hits
+            .items
+            .iter()
+            .filter(|h| h.file_path == "src/many.rs")
+            .count();
+        assert!(overlay_hits > 0, "premise: overlay symbols found: {hits:?}");
+        assert!(
+            overlay_hits <= 50,
+            "overlay hits must be bounded, got {overlay_hits}"
+        );
+        assert!(hits.truncated, "a capped overlay search must say truncated");
+        assert!(hits.walk_incomplete.is_none(), "{:?}", hits.walk_incomplete);
+    }
+
+    #[test]
+    fn sync_worktree_overlay_extracts_fallback_declarations_tombstones_removed_symbols_and_shares_cas(
+    ) {
         let (anchor_dir, _head_sha) = seed_fresh_anchor_for_zero_copy();
         let anchor = anchor_dir.path();
 
@@ -2235,11 +2376,23 @@ mod tests {
         let wt_b = wt_parent.path().join("wt-lane-b");
         git(
             anchor,
-            &["worktree", "add", "-b", "lane/extract-a", wt_a.to_str().unwrap()],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane/extract-a",
+                wt_a.to_str().unwrap(),
+            ],
         );
         git(
             anchor,
-            &["worktree", "add", "-b", "lane/extract-b", wt_b.to_str().unwrap()],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "lane/extract-b",
+                wt_b.to_str().unwrap(),
+            ],
         );
         crate::test_support::trust_repo(&wt_a);
         crate::test_support::trust_repo(&wt_b);
@@ -2287,17 +2440,29 @@ mod tests {
             new_hits
                 .items
                 .iter()
-                .any(|h| h.symbol_name == "brand_new_lane_helper" && h.file_path == "src/new_feature.rs"),
+                .any(|h| h.symbol_name == "brand_new_lane_helper"
+                    && h.file_path == "src/new_feature.rs"),
             "expected overlay symbol in search results: {new_hits:?}"
         );
         assert!(
-            new_hits.walk_incomplete.is_some(),
-            "fallback overlay symbol search must disclose walk_incomplete"
+            new_hits
+                .overlay_note
+                .as_deref()
+                .is_some_and(|n| n.contains("overlay symbols")),
+            "fallback overlay symbol search must disclose itself in overlay_note: {new_hits:?}"
+        );
+        assert!(
+            new_hits.walk_incomplete.is_none(),
+            "overlay provenance is not an early stop: {:?}",
+            new_hits.walk_incomplete
         );
 
         let old_hits = crate::codeintel::search(wt_a_str, "probe_caller", None);
         assert!(
-            !old_hits.items.iter().any(|h| h.symbol_name == "probe_caller"),
+            !old_hits
+                .items
+                .iter()
+                .any(|h| h.symbol_name == "probe_caller"),
             "tombstoned symbol probe_caller must be filtered from worktree search: {old_hits:?}"
         );
 
@@ -2309,6 +2474,160 @@ mod tests {
             "sibling zero-copy lane must reuse CAS AST written by lane A via anchor CAS"
         );
     }
+
+    fn fixture_with_csr() -> (tempfile::TempDir, u64) {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        crate::test_support::trust_repo(anchor_dir.path());
+        let csr =
+            crate::codeintel::open_repo_csr_graph(anchor_dir.path().to_str().unwrap()).unwrap();
+        let generation = csr.generation();
+        (anchor_dir, generation)
+    }
+
+    fn write_bulk_files(dir: &Path, count: usize) {
+        let bulk = dir.join("bulk");
+        fs::create_dir_all(&bulk).unwrap();
+        for i in 0..count {
+            fs::write(bulk.join(format!("f{i}.txt")), b"x").unwrap();
+        }
+    }
+
+    #[test]
+    fn readonly_dirty_scan_reports_a_capped_delta_list_as_truncated() {
+        let (anchor_dir, _) = fixture_with_csr();
+        let anchor = anchor_dir.path();
+        let anchor_str = anchor.to_str().unwrap();
+
+        // Pre-existing untracked fixture files count toward the cap; fill to it exactly.
+        let (existing, _) = collect_worktree_deltas(anchor, None).unwrap();
+        write_bulk_files(anchor, MAX_OVERLAY_DIRTY_FILES - existing.len());
+        let at_cap = compute_worktree_dirty_nodes_readonly(anchor_str, None).unwrap();
+        assert!(
+            !at_cap.truncated,
+            "exactly {MAX_OVERLAY_DIRTY_FILES} changed files is complete, not truncated"
+        );
+
+        fs::write(anchor.join("bulk/one_more.txt"), b"x").unwrap();
+        let over = compute_worktree_dirty_nodes_readonly(anchor_str, None).unwrap();
+        assert!(
+            over.truncated,
+            "{} changed files exceed the {MAX_OVERLAY_DIRTY_FILES} cap and must say so",
+            MAX_OVERLAY_DIRTY_FILES + 1
+        );
+    }
+
+    #[test]
+    fn readonly_dirty_scan_ignores_a_persisted_overlay_from_another_csr_generation() {
+        let (anchor_dir, generation) = fixture_with_csr();
+        let anchor = anchor_dir.path();
+        let anchor_str = anchor.to_str().unwrap();
+        let overlay_path = OVERLAY_RELPATH
+            .split('/')
+            .fold(devmap_query::paths::state_dir(anchor), |acc, part| {
+                acc.join(part)
+            });
+        fs::create_dir_all(overlay_path.parent().unwrap()).unwrap();
+        let write_overlay = |overlay_generation: u64| {
+            let mut overlay = WorktreeOverlay::new("fixture".to_string(), overlay_generation);
+            overlay.dirty_nodes.insert(u32::MAX);
+            fs::write(&overlay_path, serde_json::to_vec(&overlay).unwrap()).unwrap();
+        };
+
+        write_overlay(generation);
+        let same = compute_worktree_dirty_nodes_readonly(anchor_str, None).unwrap();
+        assert!(
+            same.dirty_nodes.contains(u32::MAX),
+            "an overlay from the CSR's own generation is merged"
+        );
+
+        write_overlay(generation + 7);
+        let stale = compute_worktree_dirty_nodes_readonly(anchor_str, None).unwrap();
+        assert!(
+            !stale.dirty_nodes.contains(u32::MAX),
+            "node IDs from generation {} must not be intersected with generation {generation}",
+            generation + 7
+        );
+    }
+
+    #[test]
+    fn readonly_dirty_scan_fails_loudly_on_an_unreadable_persisted_overlay() {
+        let (anchor_dir, _) = fixture_with_csr();
+        let anchor = anchor_dir.path();
+        let overlay_path = OVERLAY_RELPATH
+            .split('/')
+            .fold(devmap_query::paths::state_dir(anchor), |acc, part| {
+                acc.join(part)
+            });
+        fs::create_dir_all(overlay_path.parent().unwrap()).unwrap();
+        fs::write(&overlay_path, b"{ not json").unwrap();
+        assert!(
+            compute_worktree_dirty_nodes_readonly(anchor.to_str().unwrap(), None).is_err(),
+            "a corrupt overlay is a failed scan, not an empty one"
+        );
+    }
+
+    #[test]
+    fn a_failed_untracked_listing_is_an_error_not_an_empty_listing() {
+        let failed = BoundedRun {
+            stdout: Vec::new(),
+            stderr: b"fatal: not a git repository".to_vec(),
+            success: false,
+            status_code: 128,
+            incomplete: None,
+            stderr_incomplete: None,
+            cancelled: false,
+        };
+        let mut map = HashMap::new();
+        let err = merge_untracked_listing(&mut map, failed).unwrap_err();
+        assert!(err.message().contains("128"), "{err:?}");
+        assert!(map.is_empty());
+
+        let ok = BoundedRun {
+            stdout: b"new.rs\0dir/other.rs\0".to_vec(),
+            stderr: Vec::new(),
+            success: true,
+            status_code: 0,
+            incomplete: None,
+            stderr_incomplete: None,
+            cancelled: false,
+        };
+        merge_untracked_listing(&mut map, ok).unwrap();
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn provisioning_reports_why_an_overlay_sync_failed_on_the_already_seeded_path() {
+        let anchor_dir = crate::codeintel::tests::repo_with_one_generation();
+        let anchor = anchor_dir.path();
+        crate::test_support::trust_repo(anchor);
+        let wt_parent = tempfile::tempdir().unwrap();
+        let wt = wt_parent.path().join("lane-seeded");
+        git(
+            anchor,
+            &["worktree", "add", "-b", "lane/seeded", wt.to_str().unwrap()],
+        );
+        crate::test_support::trust_repo(&wt);
+        let first = provision_worktree_devmap(anchor, &wt).expect("first provision");
+        assert!(first.seeded, "{first:?}");
+
+        // A directory where overlay.json must be written makes the sync fail.
+        let overlay_path = OVERLAY_RELPATH
+            .split('/')
+            .fold(devmap_query::paths::state_dir(&wt), |acc, part| {
+                acc.join(part)
+            });
+        let _ = fs::remove_file(&overlay_path);
+        fs::create_dir_all(&overlay_path).unwrap();
+
+        let second = provision_worktree_devmap(anchor, &wt).expect("second provision");
+        assert!(second.seeded, "{second:?}");
+        assert!(second.overlay_path.is_none(), "{second:?}");
+        assert!(
+            second
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("overlay sync failed")),
+            "a dropped overlay error must be reported: {second:?}"
+        );
+    }
 }
-
-
