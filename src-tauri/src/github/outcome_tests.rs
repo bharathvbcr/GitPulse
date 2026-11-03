@@ -62,7 +62,7 @@ fn every_status_and_conclusion_gh_documents_has_one_outcome() {
 }
 
 /// The cases file is also what the renderer's test fixtures build their runs
-/// from (`src/lib/github/outcomeCases.ts`), so a fixture's outcome is this
+/// from (`src/lib/github/runOutcomeFixtures.ts`), so a fixture's outcome is this
 /// classifier's answer and not a second opinion. It has to be right, and it has
 /// to cover every word `gh run list --help` documents.
 #[test]
@@ -438,7 +438,7 @@ fn the_panel_and_the_watcher_each_get_a_finish_neither_using_up_the_others() {
 }
 
 #[test]
-fn the_panels_first_look_announces_nothing_even_when_the_watcher_logged_failures_before_it() {
+fn the_panels_first_look_announces_nothing_even_when_the_watcher_saw_runs_move_before_it() {
     let mut observer = Observer::default();
     let t0 = Instant::now();
     observer.observe("acme/app", &[moving(1), moving(2)], false, t0);
@@ -448,15 +448,16 @@ fn the_panels_first_look_announces_nothing_even_when_the_watcher_logged_failures
         false,
         later(t0, 1),
     );
-    // The panel opens later: run 1 is history to it, run 2 finishing in the
-    // very listing it looks at is news.
+    // The panel opens later. The watcher saw both runs move, but the panel
+    // never did: run 1 is history, and so is run 2 finishing in the very
+    // listing the panel first looks at, because it was not watching before it.
     let first = observer.panel_look(
         "acme/app",
         &[ended(1, "failure"), ended(2, "failure")],
         false,
         later(t0, 2),
     );
-    assert_eq!(ids(&first), vec![2]);
+    assert!(first.is_empty(), "{:?}", ids(&first));
     assert!(observer
         .panel_look(
             "acme/app",
@@ -467,8 +468,118 @@ fn the_panels_first_look_announces_nothing_even_when_the_watcher_logged_failures
         .is_empty());
 }
 
+/// The replay the process-wide red log allowed: the panel polls only while its
+/// own listing has something moving, so a red the watcher logged while the
+/// panel was not polling used to be announced on the panel's next live poll.
 #[test]
-fn only_a_red_finish_is_logged_for_the_panel_and_it_is_per_repository() {
+fn a_red_the_panel_never_saw_moving_is_not_announced_when_the_panel_polls_again() {
+    let mut observer = Observer::default();
+    let t0 = Instant::now();
+    assert!(observer
+        .panel_look("acme/app", &[moving(1)], false, t0)
+        .is_empty());
+    // Run 2 starts and fails while the panel is not polling; only the watcher
+    // follows it.
+    observer.observe("acme/app", &[moving(2)], false, later(t0, 1));
+    observer.observe("acme/app", &[ended(2, "failure")], false, later(t0, 2));
+    // Run 1 goes green; the panel polls again and looks at both.
+    let news = observer.panel_look(
+        "acme/app",
+        &[ended(2, "failure"), ended(1, "success")],
+        false,
+        later(t0, 3),
+    );
+    assert!(
+        news.is_empty(),
+        "run 2 was never seen moving by the panel: {:?}",
+        ids(&news)
+    );
+}
+
+#[test]
+fn the_panels_baseline_is_its_own_not_the_watchers() {
+    let mut observer = Observer::default();
+    let t0 = Instant::now();
+    observer.panel_look("acme/app", &[moving(1)], false, t0);
+    // The watcher saw run 1 settle red and drained it.
+    observer.observe("acme/app", &[ended(1, "failure")], false, later(t0, 1));
+    observer.take_pending(10);
+    // The panel still remembers run 1 moving, so it is told, once.
+    assert_eq!(
+        ids(&observer.panel_look("acme/app", &[ended(1, "failure")], false, later(t0, 2))),
+        vec![1]
+    );
+    assert!(observer
+        .panel_look("acme/app", &[ended(1, "failure")], false, later(t0, 3))
+        .is_empty());
+}
+
+#[test]
+fn a_panel_baseline_older_than_the_live_poll_session_is_dropped() {
+    let mut observer = Observer::default();
+    let t0 = Instant::now();
+    observer.panel_look("acme/app", &[moving(1)], false, t0);
+    observer.observe("acme/app", &[ended(1, "failure")], false, later(t0, 1));
+    // An hour on, the panel remounts and looks: what it saw moving then is not
+    // what it is watching now.
+    assert!(PANEL_SEEN_TTL < Duration::from_secs(3600));
+    assert!(
+        observer
+            .panel_look("acme/app", &[ended(1, "failure")], false, later(t0, 3600))
+            .is_empty(),
+        "a run that was in flight an hour ago is history"
+    );
+    // That look re-baselined the panel: the next run it watches is news.
+    observer.panel_look(
+        "acme/app",
+        &[moving(2), ended(1, "failure")],
+        false,
+        later(t0, 3601),
+    );
+    assert_eq!(
+        ids(&observer.panel_look(
+            "acme/app",
+            &[ended(2, "failure"), ended(1, "failure")],
+            false,
+            later(t0, 3602)
+        )),
+        vec![2]
+    );
+}
+
+#[test]
+fn a_panel_baseline_exactly_at_the_session_ceiling_is_still_believed() {
+    let mut observer = Observer::default();
+    let t0 = Instant::now();
+    observer.panel_look("acme/app", &[moving(1)], false, t0);
+    let news = observer.panel_look(
+        "acme/app",
+        &[ended(1, "failure")],
+        false,
+        t0 + PANEL_SEEN_TTL,
+    );
+    assert_eq!(ids(&news), vec![1]);
+}
+
+/// The ceiling is the renderer's `DEFAULT_POLL_LIMITS.maxDurationMs`. There is
+/// no constant to share across the language boundary, so this reads it.
+#[test]
+fn the_panel_baseline_ceiling_is_the_live_poll_session_ceiling() {
+    let schedule = include_str!("../../../src/lib/delivery/pollSchedule.ts");
+    let line = schedule
+        .lines()
+        .find(|line| line.trim_start().starts_with("maxDurationMs: 15"))
+        .expect("pollSchedule.ts no longer declares a 15 minute default maxDurationMs");
+    assert_eq!(
+        line.trim(),
+        "maxDurationMs: 15 * 60_000,",
+        "update PANEL_SEEN_TTL in outcome.rs with it"
+    );
+    assert_eq!(PANEL_SEEN_TTL, Duration::from_secs(15 * 60));
+}
+
+#[test]
+fn only_a_red_finish_is_news_to_the_panel_and_it_is_per_repository() {
     let mut observer = Observer::default();
     let t0 = Instant::now();
     observer.panel_look("acme/app", &[moving(1), moving(2)], false, t0);
@@ -494,32 +605,33 @@ fn only_a_red_finish_is_logged_for_the_panel_and_it_is_per_repository() {
     );
 }
 
+/// The panel's baseline is one listing, so a flood of finishes cannot grow it,
+/// and every red the panel saw move is still its news.
 #[test]
-fn the_red_log_is_bounded_and_counts_what_it_dropped() {
+fn every_red_the_panel_saw_moving_is_news_however_many_there_are() {
     let mut observer = Observer::default();
     let t0 = Instant::now();
-    let total = (MAX_RED_LOG + 5) as u64;
+    let total = 40_u64;
     let moving_runs: Vec<_> = (1..=total).map(moving).collect();
     let red_runs: Vec<_> = (1..=total).map(|id| ended(id, "failure")).collect();
     observer.panel_look("acme/app", &moving_runs, false, t0);
     observer.observe("acme/app", &red_runs, false, later(t0, 1));
     let news = observer.panel_look("acme/app", &red_runs, false, later(t0, 2));
-    assert_eq!(news.len(), MAX_RED_LOG, "the log holds at most its bound");
-    assert_eq!(
-        ids(&news).first().copied(),
-        Some(6),
-        "the oldest went first, the newest stayed"
-    );
-    assert_eq!(observer.red_overflow(), 5, "and the loss is counted");
+    assert_eq!(news.len() as u64, total);
 }
 
+/// A slow panel request made before the watcher saw the finish lands late. It
+/// is ignored like any stale listing: it delivers nothing and leaves the
+/// panel's baseline alone, so the next fresh listing still finds the run the
+/// panel was waiting on.
 #[test]
-fn a_stale_listing_still_delivers_what_the_log_already_holds() {
+fn a_stale_listing_delivers_nothing_and_leaves_the_panels_baseline_alone() {
     let mut observer = Observer::default();
     let t0 = Instant::now();
     observer.panel_look("acme/app", &[moving(1)], false, t0);
     observer.observe("acme/app", &[ended(1, "failure")], false, later(t0, 5));
-    // A slow panel request, made before the watcher saw the finish, lands now.
-    let news = observer.panel_look("acme/app", &[moving(1)], false, later(t0, 2));
-    assert_eq!(ids(&news), vec![1]);
+    let stale = observer.panel_look("acme/app", &[moving(1)], false, later(t0, 2));
+    assert!(stale.is_empty());
+    let news = observer.panel_look("acme/app", &[ended(1, "failure")], false, later(t0, 6));
+    assert_eq!(ids(&news), vec![1], "told once, by the next fresh listing");
 }

@@ -288,11 +288,14 @@
       liveRuns = report;
       if (report.checked) {
         // Which runs just went red is the native observer's call, the one the
-        // CI watcher also acts on (`github/outcome.rs`): it announces nothing
-        // on a first look and keeps one baseline per repository, so mounting
-        // the panel cannot replay historical failures as news and a finish is
-        // reported once however many things are watching. The panel only
-        // words it.
+        // CI watcher also acts on (`github/outcome.rs`). The rule: a run is
+        // announced only if it is red in this listing and the panel's own
+        // previous listing showed it in flight, once. The observer keeps that
+        // previous listing per repository (not what the watcher saw), drops it
+        // after the 15-minute live-poll session ceiling, and announces nothing
+        // on the panel's first look, so mounting the panel cannot replay a
+        // failure it was not watching, however recently the watcher logged it.
+        // The panel only words it.
         const wentRed = report.went_red.map(runTimelineRow);
         if (wentRed.length > 0) {
           failureNotice =
