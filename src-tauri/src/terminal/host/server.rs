@@ -15,9 +15,10 @@ use super::proto::{
     self, Envelope, Hello, HostFrame, Request, Retired, WireEnded, WireNotice, PROTOCOL,
 };
 use super::receipts::Receipts;
+use super::transcripts::{ArmError, Limits, Transcripts};
 use crate::terminal::{
     self as engine, OutputSink, Place, SessionEnded, SessionEvents, TerminalLossPayload,
-    TerminalSessions,
+    TerminalSessions, TranscriptRead,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -203,6 +204,10 @@ struct Host {
     engine: TerminalSessions,
     link: Arc<Link>,
     receipts: Arc<Receipts>,
+    /// Each session's saved output, or why the store could not be opened: a
+    /// host that cannot keep transcripts still holds terminals, and says so
+    /// when asked rather than answering as if it had looked.
+    transcripts: Result<Arc<Transcripts>, String>,
     /// Test-only master holds (`Request::Hold`), released by `Release` or
     /// when the connection that took them ends.
     holds: Mutex<HashMap<String, engine::MasterHold>>,
@@ -239,6 +244,21 @@ impl Host {
                 };
                 self.receipts
                     .spawned(&session, request.run_id.as_deref(), &program, &place)?;
+                // Armed before the fork, so the ring of a program that prints
+                // and exits at once is already copying its first byte.
+                if let Ok(transcripts) = &self.transcripts {
+                    match transcripts.arm(&session, request.run_id.as_deref()) {
+                        Ok(tap) => self.engine.ring_taps.arm(&session, tap),
+                        // Another request is starting this very id; the engine
+                        // refuses the second, and must not touch the first's.
+                        Err(ArmError::Duplicate) => {
+                            return Err(format!("Terminal session '{session}' already exists"))
+                        }
+                        Err(ArmError::Closed) => {
+                            log::warn!(target: "terminal_host", "a session starts without a transcript: the store has stopped")
+                        }
+                    }
+                }
                 let events = Arc::new(HostEvents {
                     link: self.link.clone(),
                     receipts: self.receipts.clone(),
@@ -259,8 +279,12 @@ impl Host {
                     Err(error) => {
                         // Only a session whose reader never started has no
                         // exit coming; one that started reports its own.
+                        self.engine.ring_taps.disarm(&session);
                         if !self.engine.lock_sessions().contains_key(&session) {
                             self.receipts.discard(&session);
+                            if let Ok(transcripts) = &self.transcripts {
+                                transcripts.discard(&session);
+                            }
                         }
                         Err(error.into_message())
                     }
@@ -292,6 +316,17 @@ impl Host {
             Request::Context { session } => json(engine::session_context(&self.engine, &session)?),
             Request::Receipts => json(self.receipts.pending()),
             Request::Forget { session } => json(self.receipts.forget(&session)?),
+            Request::Transcript {
+                session,
+                max_bytes,
+                redact,
+                run_id,
+            } => json(match &self.transcripts {
+                Ok(transcripts) => transcripts.read(&session, max_bytes, redact, run_id.as_deref()),
+                Err(why) => TranscriptRead::Unreadable {
+                    reason: format!("this host could not open its transcript store: {why}"),
+                },
+            }),
             Request::Wakeups { session } => json(engine::reader_wakeups(&self.engine, &session)),
             Request::Size { session } => json(engine::pty_size(&self.engine, &session)?),
             Request::Hold { session } => {
@@ -440,6 +475,7 @@ fn operation_label(request: &Request) -> &'static str {
         Request::StopAll => "host_stop_all",
         Request::Attach { .. } | Request::AttachTracked { .. } => "host_attach",
         Request::Context { .. } => "host_context",
+        Request::Transcript { .. } => "host_transcript",
         Request::List => "host_list",
         _ => "host_control",
     }
@@ -604,6 +640,13 @@ pub fn serve(config: ServeConfig) -> i32 {
             return exit_code::FAILED;
         }
     };
+    let transcripts =
+        Transcripts::open(config.dir.join(super::TRANSCRIPTS_DIR), Limits::default()).map(Arc::new);
+    if let Err(error) = &transcripts {
+        // Terminals still run; reads say why there is nothing to read.
+        log::error!(target: "terminal_host", "session output will not be saved: {error}");
+        eprintln!("gitpulse-ptyd: session output will not be saved: {error}");
+    }
     let recovered = receipts.recover(&std::collections::HashSet::new());
     if recovered > 0 {
         log::warn!(target: "terminal_host", "{recovered} session(s) outlived by an earlier host were recorded as ended with it");
@@ -620,6 +663,7 @@ pub fn serve(config: ServeConfig) -> i32 {
         engine: TerminalSessions::default(),
         link: Arc::default(),
         receipts,
+        transcripts,
         holds: Mutex::default(),
         retire: AtomicBool::new(false),
     });
@@ -629,6 +673,12 @@ pub fn serve(config: ServeConfig) -> i32 {
             log::info!(target: "terminal_host", "signalled: stopping every session");
             if let Err(error) = engine::shutdown_sessions(&host.engine) {
                 log::warn!(target: "terminal_host", "terminal shutdown incomplete: {error}");
+            }
+            // What the sessions printed while they were being stopped.
+            if let Ok(transcripts) = &host.transcripts {
+                if !transcripts.flush(Duration::from_secs(3)) {
+                    log::warn!(target: "terminal_host", "saved output was still being written when the host stopped");
+                }
             }
         });
     }
@@ -681,6 +731,11 @@ pub fn serve(config: ServeConfig) -> i32 {
         }
     };
     drop(listener);
+    // The shutdown hook holds the host for the life of the process, so the
+    // store is stopped here, not by a drop: what is queued is written first.
+    if let Ok(transcripts) = &host.transcripts {
+        transcripts.shutdown();
+    }
     // Only a socket, and only ours: a successor binding the path after this
     // host decided to go must keep it, and nothing but this host binds it
     // while the lock is held.

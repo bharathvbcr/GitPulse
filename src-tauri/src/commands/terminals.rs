@@ -107,6 +107,35 @@ pub async fn cmd_terminal_context(
     .await
 }
 
+/// The newest `max_bytes` of a session's saved output (default and ceiling:
+/// `MAX_TRANSCRIPT_TAIL_BYTES`), for a session still running or one that has
+/// ended, including one that ended before the app or the terminal host
+/// restarted. Read-only: it never attaches. `redact` masks secrets in the
+/// host before the bytes leave it. `run_id` names the run the caller is asking
+/// about: terminal ids repeat across reboots, so with it a session that a later
+/// one reused answers `reused`, never the other session's output. The answer
+/// says which of found, missing, unreadable (and why), reused and unavailable
+/// (no host) it is; see `terminal::TranscriptRead`.
+#[tauri::command(async)]
+pub async fn cmd_terminal_transcript(
+    state: State<'_, crate::terminal::TerminalSessions>,
+    session_id: String,
+    max_bytes: Option<usize>,
+    redact: Option<bool>,
+    run_id: Option<String>,
+) -> Result<crate::terminal::TranscriptRead, String> {
+    crate::terminal::control_async(&state, "terminal_transcript", move |state| {
+        crate::terminal::session_transcript(
+            state,
+            &session_id,
+            max_bytes.unwrap_or(crate::terminal::MAX_TRANSCRIPT_TAIL_BYTES),
+            redact.unwrap_or(false),
+            run_id.as_deref(),
+        )
+    })
+    .await
+}
+
 /// Every live terminal session, including ones started by a page that has
 /// since been reloaded — which the renderer cannot otherwise know exist, and
 /// which still count against the shared session limit.
@@ -223,15 +252,23 @@ pub async fn cmd_terminal_conversations(
 /// sessions, a host that would not start). The quit dialog asks whether to stop
 /// or leave sessions only when they can outlive the app; Settings says which.
 ///
-/// Inline: two reads of in-memory state, no I/O.
+/// `managed` says the same of managed agent runs (Codex and Claude driven by
+/// Manvi): kept running by a hosted Manvi, or ended with the app, and why.
+/// Answering it may ask the installed Manvi whether it can (once per binary),
+/// so it is read on the terminal control pool; the terminal half is two reads
+/// of in-memory state.
 #[tauri::command(async)]
 pub async fn cmd_terminal_backend(
     state: State<'_, crate::terminal::TerminalSessions>,
 ) -> Result<crate::terminal::TerminalBackendStatus, String> {
-    Ok(crate::terminal::TerminalBackendStatus {
-        backend: state.backend().to_owned(),
-        trouble: state.host_trouble(),
+    crate::terminal::control_async(&state, "terminal_backend", |state| {
+        Ok(crate::terminal::TerminalBackendStatus {
+            backend: state.backend().to_owned(),
+            trouble: state.host_trouble(),
+            managed: crate::harness::sidecar::managed_hosting(),
+        })
     })
+    .await
 }
 
 /// Exports user-selected terminal output through the native save dialog.

@@ -13,6 +13,16 @@ before that tag is pushed.
 
 ### Added
 
+- **Send to agent.** A CI notice that names an agent attempt, and the attempt's
+  run card, can put the result (or a note) back into the agent that pushed the
+  branch. The panel shows the exact text and the route (live Claude session
+  mailbox, resumed conversation with the text as its first prompt, managed
+  follow-up through Manvi, or unavailable with the reason), and sends only on an
+  explicit confirm. A live session is woken by a second `Stop` hook entry,
+  `gitpulse-hook deliver`, registered with `asyncRewake`; a Manvi without
+  `work.runs.managed.continue` is reported as unable to take follow-ups. The
+  installed `gitpulse-hook` must be rebuilt for the new subcommand
+  (`bun run mcp:install`). See `docs/SECURITY.md`.
 - **5-Lane Workflow Separation & Non-Blocking DevMap IPC.** Separated repository
   and background operations into five isolated execution lanes (`git-read`,
   `git-write`, `github`, `insights`, `devmap`) (`src/lib/async/lanes.ts`,
@@ -110,6 +120,14 @@ before that tag is pushed.
 
 ### Changed
 
+- **The task profile moves one way to workbench schema 15** (dc-store vendored
+  from DevCouncil `012c7f8a`; store schema stays 11). CI results are stored as
+  `run_ci_passed` / `run_ci_failed` / `run_ci_cancelled` attention rows, which a
+  schema 14 host cannot read, so a schema 14 build refuses an upgraded profile with
+  `schema_unsupported`. The desktop app performs the upgrade and keeps
+  `<profile>.pre-schema-14.bak` beside it. Update GitPulse (app, `gitpulse-mcp`,
+  `gitpulse-hook` via `bun run mcp:install`), `dcstore` and Manvi together, then
+  confirm with `bun run check:schema-parity`.
 - **Typed Command Errors across IPC.** Rust command runners now carry errors as strongly
   typed `CommandError` instances directly to the command edge (`2bac9304`), replacing
   the thread-local error store (`take_last_error`) with typed, structured errors across

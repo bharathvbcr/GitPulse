@@ -36,7 +36,7 @@ Portable MCP config (`plugins/gitpulse/.mcp.json`):
 
 ## Hooks
 
-`plugins/gitpulse/hooks/hooks.json` registers sixteen hooks, all spawning `gitpulse-hook`:
+`plugins/gitpulse/hooks/hooks.json` registers seventeen hooks, all spawning `gitpulse-hook`:
 
 | Event | Subcommand | What it does |
 | --- | --- | --- |
@@ -46,13 +46,14 @@ Portable MCP config (`plugins/gitpulse/.mcp.json`):
 | `Notification`, one entry per matcher | `notify <matcher>` | Tells a running GitPulse that this agent wants the user, and why. |
 | `StopFailure` | `notify error` | Same, for a turn that ended on an error. |
 | `PermissionRequest`, `PostToolUse` and `PostToolUseFailure`, `UserPromptSubmit`, `Stop`, `SessionEnd` | `notify permission_request`, `tool_finished`, `prompt_submitted`, `turn_finished`, `session_ended` | State reports for a running GitPulse: an approval is pending or a turn finished, and the resolutions that clear them (the user answered, a tool ran, the session ended). |
+| `Stop`, a second entry with `asyncRewake` and a 1800 s timeout | `deliver` | Waits, in the background, for a message a person previewed and confirmed in GitPulse's **Send to agent**, and wakes the idle session with it (exit 2, text on stderr). |
 
 The reason travels as the subcommand's argument, not in the payload: the hook reference documents `Notification`'s matchers (`permission_prompt`, `idle_prompt`, `agent_needs_input`, `agent_completed`, `elicitation_dialog`, `elicitation_url_dialog`) but publishes no input field naming which one fired. Registering one entry per matcher makes the reason a fact about which hook the host chose to run rather than a string parsed out of a message.
 
 Four properties are deliberate:
 
 - **No hook ever answers `allow`.** An approval GitPulse did not earn would override the user's own permission rules. The gate can refuse or escalate; it cannot wave anything through.
-- **Every hook exits 0.** Exit 2 blocks a tool call whatever the JSON says, and a hook that crashed must never be the reason an edit is refused. Failures degrade to "no decision".
+- **Every hook exits 0, except one deliberate case.** Exit 2 blocks a tool call whatever the JSON says, and a hook that crashed must never be the reason an edit is refused. Failures degrade to "no decision". The exception is `deliver`: it is registered on `Stop` with `asyncRewake`, where Claude Code runs it in the background and wakes the session on exit 2, so exit 2 there is a delivered message and blocks nothing. Every failure of it, and a timeout, is still exit 0.
 - **A check that could not run says so.** Anything that did not scan, scanned partially, or could not reach the harness emits a `systemMessage` naming the gap, rather than the silence that means "clean".
 - **`notify` is the one exception, because it is not a check.** GitPulse being closed is its ordinary case, and a `systemMessage` on every turn would be noise the user cannot act on. Where an undelivered report is visible instead is **Settings → Notifications → Agent session notifications**, which reports whether the socket is listening and how many reports it has accepted — a place a user looks when they wonder why nothing arrives, not one that interrupts them when they do not.
 

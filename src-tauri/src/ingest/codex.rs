@@ -216,6 +216,12 @@ impl RecordParser for CodexParser {
                 };
                 self.calls_in(&record["payload"], head.timestamp.as_deref())
             }
+            "token_usage_record" => {
+                let Some(record) = parse_value(line) else {
+                    return Parsed::skipped();
+                };
+                self.usage_in(&record["payload"], head.timestamp.as_deref())
+            }
             other if INERT.contains(&other) => Parsed::nothing(),
             _ => Parsed::skipped(),
         }
@@ -305,6 +311,52 @@ impl CodexParser {
         }
     }
 
+    /// One model response's token counts, from a `token_usage_record` envelope.
+    ///
+    /// Codex writes one per response, with the response's own `usage` beside the
+    /// turn's and the thread's running totals; the `event_msg` `token_count`
+    /// that follows each repeats the same counts and is not read, so a response
+    /// is counted once. Only the numbers are taken. Codex's `input_tokens`
+    /// includes the cached tokens, so the cached ones are taken out of `input`
+    /// and reported as `cache_read`, which is how Claude's counts are shaped.
+    /// A record that cannot be placed (no response id, thread, directory or
+    /// time, or counts that are not numbers) is counted unread, not guessed at.
+    fn usage_in(&self, payload: &serde_json::Value, timestamp: Option<&str>) -> Parsed {
+        let usage = &payload["usage"];
+        let count = |key: &str| usage[key].as_u64();
+        let response = payload["response_id"].as_str().filter(|id| !id.is_empty());
+        let (Some(input), Some(output), Some(response), Some(ts_utc)) = (
+            count("input_tokens"),
+            count("output_tokens"),
+            response,
+            timestamp.filter(|ts| !ts.is_empty()),
+        ) else {
+            return Parsed::skipped();
+        };
+        if self.thread.is_empty() || self.cwd.is_empty() || self.lost {
+            return Parsed::skipped();
+        }
+        let cached = count("cached_input_tokens").unwrap_or(0);
+        Parsed {
+            calls: vec![ToolCall {
+                session_id: self.thread.clone(),
+                ts_utc: ts_utc.to_string(),
+                version: self.version.clone(),
+                cwd: self.cwd.clone(),
+                tool: super::transcript::USAGE_TOOL.to_string(),
+                message_id: Some(response.to_string()),
+                usage: Some(super::transcript::TokenUsage {
+                    input: input.saturating_sub(cached),
+                    output,
+                    cache_read: cached,
+                    cache_creation: count("cache_write_input_tokens").unwrap_or(0),
+                }),
+                ..ToolCall::default()
+            }],
+            skipped: 0,
+        }
+    }
+
     fn calls_in(&self, payload: &serde_json::Value, timestamp: Option<&str>) -> Parsed {
         let Some(found) = scan_payload(payload) else {
             return Parsed::nothing();
@@ -337,6 +389,7 @@ impl CodexParser {
                 tool: tool.to_string(),
                 file_path,
                 command,
+                ..ToolCall::default()
             };
         for command in found.commands {
             // A relative workdir is relative to the turn's directory.
@@ -555,5 +608,69 @@ mod tests {
     fn a_code_mode_exec_that_is_not_text_is_one_counted_skip() {
         let payload = serde_json::json!({"type": "custom_tool_call", "name": "exec", "input": 7});
         assert_eq!(scan_payload(&payload).unwrap().unread, 1);
+    }
+
+    const META: &str = r#"{"timestamp":"2026-09-01T12:00:00.000Z","type":"session_meta","payload":{"id":"T1","cwd":"/repo","cli_version":"0.149.1"}}"#;
+
+    fn token_record(response: &str, usage: &str) -> String {
+        format!(
+            r#"{{"timestamp":"2026-09-01T12:00:05.000Z","ordinal":5,"type":"token_usage_record","payload":{{"thread_id":"T1","response_id":"{response}","usage":{usage}}}}}"#
+        )
+    }
+
+    const USAGE: &str = r#"{"input_tokens":28589,"cached_input_tokens":5888,"cache_write_input_tokens":3,"output_tokens":1259,"reasoning_output_tokens":86,"total_tokens":29848}"#;
+
+    fn started() -> CodexParser {
+        let mut parser = CodexParser::default();
+        assert!(parser.parse(META).calls.is_empty());
+        parser
+    }
+
+    #[test]
+    fn a_response_is_one_usage_row_shaped_like_claudes_counts() {
+        let parsed = started().parse(&token_record("resp_1", USAGE));
+        assert_eq!(parsed.skipped, 0);
+        assert_eq!(parsed.calls.len(), 1);
+        let call = &parsed.calls[0];
+        assert_eq!(call.action(), "session.usage");
+        assert_eq!(call.session_id, "T1");
+        assert_eq!(call.cwd, "/repo");
+        assert_eq!(call.message_id.as_deref(), Some("resp_1"));
+        // Codex's input includes the cached tokens; they are reported apart.
+        assert_eq!(
+            call.usage,
+            Some(super::super::transcript::TokenUsage {
+                input: 28589 - 5888,
+                output: 1259,
+                cache_read: 5888,
+                cache_creation: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn the_event_that_repeats_a_responses_counts_is_not_counted_again() {
+        let repeat = r#"{"timestamp":"2026-09-01T12:00:05.000Z","ordinal":6,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":28589,"output_tokens":1259},"last_token_usage":{"input_tokens":28589,"output_tokens":1259}}}}"#;
+        let parsed = started().parse(repeat);
+        assert!(parsed.calls.is_empty());
+        assert_eq!(parsed.skipped, 0);
+    }
+
+    #[test]
+    fn a_usage_record_that_cannot_be_placed_or_read_is_counted_and_never_guessed() {
+        // Before any session_meta: no thread or directory to place it by.
+        let unplaced = CodexParser::default().parse(&token_record("resp_1", USAGE));
+        assert!(unplaced.calls.is_empty());
+        assert_eq!(unplaced.skipped, 1);
+        let mut parser = started();
+        for bad in [
+            token_record("resp_1", r#"{"input_tokens":"many","output_tokens":1}"#),
+            token_record("resp_1", r#"{"output_tokens":1}"#),
+            token_record("", USAGE),
+        ] {
+            let parsed = parser.parse(&bad);
+            assert!(parsed.calls.is_empty(), "{bad}");
+            assert_eq!(parsed.skipped, 1, "{bad}");
+        }
     }
 }

@@ -137,6 +137,11 @@ export interface AgentSession {
   cwd: string | null;
   tree: string | null;
   run_id: string | null;
+  /**
+   * The nearest agent session above this one in the process tree. Null is "no
+   * session above it that the scan could see", not "started by a person".
+   */
+  parent_pid: number | null;
   footprint: Reading<number>;
   members: number;
   unreadable_members: number;

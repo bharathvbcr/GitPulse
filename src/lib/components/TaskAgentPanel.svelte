@@ -22,6 +22,8 @@
   import { ChevronDown, ChevronRight, RotateCw, SquareTerminal } from "@lucide/svelte";
   import AttemptReview from "./AttemptReview.svelte";
   import AgentDecisions from "./AgentDecisions.svelte";
+  import RunActivity from "./RunActivity.svelte";
+  import SendToAgent from "./SendToAgent.svelte";
   import TaskHandoffForm from "./TaskHandoffForm.svelte";
   import { interfaceStore } from "../stores/interfaceStore";
   import { attemptNotices, clearAttemptNotice, consumeTaskTerminal, noteAttempt, pruneTaskTerminals, taskTerminalRequests } from "../terminal/taskLaunches";
@@ -91,6 +93,8 @@
    * why when there is none.
    */
   const RESUMABLE = ["exited", "failed", "cancelled"];
+  /** States of an attempt that has (or had) an agent a message could reach. */
+  const SENDABLE = ["starting", "running", ...RESUMABLE];
   /**
    * The history's page ceiling. The store pages runs; this bounds how many a
    * sheet keeps in memory and re-renders on every poll.
@@ -146,6 +150,13 @@
   let total = $state(0);
   let cursor = $state<string | null>(null);
   let reviewingRunID = $state<string | null>(null);
+  /**
+   * Attempts whose own worktree this view removed (landed from the review, or
+   * discarded). Whether a worktree exists is not on the run record, so the
+   * row would keep offering Merge and Discard on a directory that is gone.
+   */
+  let removedWorktrees = $state<ReadonlySet<string>>(new Set());
+  const worktreeRemoved = (runId: string) => { removedWorktrees = new Set(removedWorktrees).add(runId); };
   let decisionRefresh = $state(0);
   let expandedForm = $state<boolean | null>(null);
   /**
@@ -502,13 +513,19 @@
   function merge(run: TaskRun) {
     return act(run, { label: "Merging", mutates: true }, async () => {
       const result = await mergeAttemptWorktree(run);
-      if (result) say(run.id, "note", result.message);
+      if (result) {
+        if (result.worktreeRemoved) worktreeRemoved(run.id);
+        say(run.id, "note", result.message);
+      }
     });
   }
   function discard(run: TaskRun) {
     return act(run, { label: "Discarding", mutates: true }, async () => {
       const result = await discardAttemptWorktree(run);
-      if (result) say(run.id, "note", result.message);
+      if (result) {
+        if (result.worktreeRemoved) worktreeRemoved(run.id);
+        say(run.id, "note", result.message);
+      }
     });
   }
   function permissionLabel(run: TaskRun): string {
@@ -526,7 +543,7 @@
   {@const place = describeCheckout(run.cwd, $repoStore.openTabs, pathOpts)}
   {@const asked = requestsLine(holding ? pending.get(run.id) : undefined)}
   {@const stage = attemptStage(row, clock)}
-  {@const offer = attemptWorktreeOffer(run, clock)}
+  {@const offer = removedWorktrees.has(run.id) ? { review: false, ownWorktree: false } : attemptWorktreeOffer(run, clock)}
   {@const message = messages[run.id]}
   {@const free = canAct(run.id, inflight, mutationHolder, false)}
   {@const mayMutate = canAct(run.id, inflight, mutationHolder, true)}
@@ -601,6 +618,8 @@
       </ul>
     {/if}
 
+    <RunActivity {run} {now} {active} />
+
     {#if run.reason}<p>{run.reason}</p>{/if}
     {#if run.state === "unresolved"}<p class="error">This attempt's outcome is unresolved and it still holds its checkout. Release it once its agent has stopped; another worktree can run meanwhile.</p>
     {:else if run.outcome_uncertain}<p>Released without an observed exit. Review what it changed before relying on it.</p>{/if}
@@ -649,6 +668,10 @@
       {#if run.session_id && run.kind === "managed"}<button class="gp-btn" type="button" onclick={() => { reviewingRunID = reviewingRunID === run.id ? null : run.id; }}>{reviewingRunID === run.id ? "Hide requests" : "Review requests"}</button>{/if}
     </div>
 
+    <!-- A message back to this attempt's agent. Offered whenever there is an agent that ran; the host says which
+         way it would go, or why none, and nothing is sent until the reader confirms (SendToAgent). -->
+    {#if SENDABLE.includes(run.state)}<SendToAgent runId={run.id} taskTitle={run.task_title} />{/if}
+
     {#if run.kind === "managed" && run.provider_state}<p>Provider turn: {run.provider_state}. {run.provider_state === "completed" ? "Review the result before accepting the task." : ""}</p>{/if}
     {#if run.kind === "managed" && detail?.id === run.id}
       <section aria-label="Managed run details">
@@ -659,7 +682,7 @@
         <div class="actions"><button class="gp-btn" type="button" onclick={() => inspect(run)} disabled={!free}>Refresh output</button><button class="gp-btn" type="button" onclick={() => { detail = null; }}>Close details</button></div>
       </section>
     {/if}
-    {#if offer.ownWorktree}<AttemptReview {run} />{/if}
+    {#if offer.ownWorktree || removedWorktrees.has(run.id)}<AttemptReview {run} onlanded={() => worktreeRemoved(run.id)} />{/if}
     {#if reviewingRunID === run.id}<AgentDecisions {run} {active} refreshToken={decisionRefresh} />{/if}
   </article>
 {/snippet}

@@ -1,5 +1,5 @@
 import { writable } from "svelte/store";
-import type { LauncherKind } from "./tabs";
+import { isSessionId, type LauncherKind } from "./tabs";
 import { AGENT_PROMPT_MAX_BYTES } from "./agentPromptText";
 import { isCaseInsensitiveFs, sameRepo, type PathIdentityOptions } from "../repos/paths";
 
@@ -31,6 +31,20 @@ export function agentPromptArgs(launcher: LauncherKind, prompt?: string): string
   // Antigravity reads prompts only from `--prompt-interactive` / `--print`, never positionally.
   if (launcher === "agy") return ["--prompt-interactive", prompt];
   return ["--", prompt];
+}
+
+/**
+ * The arguments that pick a Claude Code conversation back up, optionally with a
+ * first prompt: `claude --resume <id> -- <prompt>`. `claude [options] [prompt]`
+ * takes the prompt positionally (`claude --help`), and `--` is the separator
+ * `agentPromptArgs` already uses for every initial prompt, so the text is one
+ * argument whatever it looks like — a flag, a shell word, a settings object.
+ * Nothing here goes through a shell. The prompt is held to the same ceiling as
+ * an initial prompt; `sessionId` must be the canonical form Claude Code takes.
+ */
+export function resumeArgs(sessionId: string, prompt?: string): string[] {
+  if (!isSessionId(sessionId)) throw new Error("Only a Claude Code conversation with a valid session id can be resumed.");
+  return ["--resume", sessionId, ...(agentPromptArgs("claude", prompt) ?? [])];
 }
 
 interface LaunchRequest {

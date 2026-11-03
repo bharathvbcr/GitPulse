@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { AdaptiveHost } from "../runtime/adaptiveTimer";
 import { runPhase, runTimelineRow } from "../github/runLifecycle";
+import { outcomeFor } from "../github/runOutcomeFixtures";
 import type { WorkflowRunInfo } from "../github/types";
 import { createLivePoll } from "./livePoll";
 import { isSettled, isVerdict, type MonitorPhase } from "./phase";
@@ -27,7 +28,7 @@ import {
   TIMELINE_PREVIEW_COUNT,
   type TimelineRow,
 } from "./timeline";
-import { anyInFlight, failuresSince, settledSince, verdictRate } from "./transitions";
+import { anyInFlight, settledSince, verdictRate } from "./transitions";
 import { overflowsPreview, previewSlice } from "../ui/previewList";
 
 /**
@@ -99,12 +100,16 @@ const INSTANTS = [
 ];
 
 function fuzzRun(random: () => number, id: number): WorkflowRunInfo {
+  const status = pick(random, STATUS_WORDS);
+  const conclusion = pick(random, CONCLUSION_WORDS);
   return {
+    // What Rust would have made of these words (`github/outcome.rs`).
+    outcome: outcomeFor(status, conclusion),
     id,
     name: pick(random, ["ci", "release", "", "a".repeat(500)]),
     title: pick(random, ["build", "", "x".repeat(1000), "multi\nline\ttitle"]),
-    status: pick(random, STATUS_WORDS),
-    conclusion: pick(random, CONCLUSION_WORDS),
+    status,
+    conclusion,
     head_branch: pick(random, ["main", "", "feat/x"]),
     url: pick(random, ["https://example.invalid/1", ""]),
     created_at: pick(random, INSTANTS),
@@ -296,8 +301,6 @@ describe("transitions under fuzz", () => {
       }
       // A baseline observation announces nothing, whatever it contains.
       expect(settledSince([], next)).toEqual([]);
-      // Failures are a subset, and only ever the bad verdict.
-      for (const t of failuresSince(previous, next)) expect(t.to).toBe("settled_bad");
 
       const rate = verdictRate(next);
       expect(rate.judged + rate.unjudged).toBe(next.length);

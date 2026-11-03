@@ -14,12 +14,15 @@ use tauri::{Emitter, State};
 
 pub(crate) mod agent_models;
 mod agent_worktree;
+#[doc(hidden)]
+pub(crate) mod ci_watch;
 pub(crate) mod claude_hook;
 pub(crate) mod conversation;
 #[doc(hidden)]
 pub mod external_changes;
 mod in_flight;
 pub(crate) mod intake;
+mod lineage;
 mod managed_run;
 pub(crate) mod notifications;
 pub(crate) mod process_birth;
@@ -27,6 +30,7 @@ mod receipts;
 mod reconcile;
 pub(crate) mod retention;
 pub mod review;
+mod send_to_agent;
 mod suggest;
 pub(crate) mod terminal_command;
 mod terminal_launch;
@@ -335,7 +339,7 @@ impl WorkbenchState {
     }
 
     pub(crate) fn shutdown(&self) {
-        self.0.closed.store(true, Ordering::Release);
+        let repeat = self.0.closed.swap(true, Ordering::AcqRel);
         // The external-changes loop may be waiting out a hidden window.
         external_changes::wake();
         // Waiting requests are refused now rather than at their deadline.
@@ -350,10 +354,54 @@ impl WorkbenchState {
         if let Some(notifications) = self.0.notifications.get() {
             notifications.wake();
         }
-        let guard = crate::supervisor::lock_or_recover(&self.0.worker);
-        if let Some((_, worker)) = guard.as_ref() {
-            if !worker.shutdown() {
-                log::warn!(target: "workbench", "profile worker shutdown could not acquire the active request; generation outcome may remain unresolved");
+        // Not under the worker lock: with a hosted Manvi and "stop" chosen,
+        // closing the worker waits for its runs to end, and every other
+        // `current_worker` caller would queue behind that wait.
+        let worker = {
+            let guard = crate::supervisor::lock_or_recover(&self.0.worker);
+            guard.as_ref().map(|(_, worker)| Arc::clone(worker))
+        };
+        match worker {
+            Some(worker) => {
+                if !worker.shutdown() {
+                    log::warn!(target: "workbench", "profile worker shutdown could not acquire the active request; generation outcome may remain unresolved");
+                }
+            }
+            // No worker was ever made this launch, so nothing is connected to
+            // a hosted Manvi that an earlier launch left holding runs. A quit
+            // that chose to stop them still has to reach them: a worker that
+            // is built only to be closed does that (it dials, adopting only,
+            // and stops). Only the app's own profile hosts, and only once.
+            None if !repeat
+                && self.0.path.is_none()
+                && crate::harness::hosted::exit_choice()
+                    == crate::harness::hosted::ExitChoice::Stop =>
+            {
+                self.stop_unconnected_hosted_runs();
+            }
+            None => {}
+        }
+    }
+
+    /// [`Self::shutdown`] for a quit that chose to stop a hosted server's runs
+    /// when this launch never made a worker.
+    fn stop_unconnected_hosted_runs(&self) {
+        let Some(plan) = crate::harness::hosted::HostPlan::from_settings() else {
+            return;
+        };
+        let path = match self.profile_path() {
+            Ok(path) => path,
+            Err(error) => {
+                log::warn!(target: "workbench", "could not stop the hosted managed runs before quitting: {}", error.message);
+                return;
+            }
+        };
+        match crate::harness::sidecar::ProfileConnection::new_hosting(path, None, Some(plan)) {
+            Ok(connection) => {
+                connection.shutdown();
+            }
+            Err(error) => {
+                log::warn!(target: "workbench", "could not stop the hosted managed runs before quitting: {}", error.message());
             }
         }
     }
@@ -476,6 +524,12 @@ impl WorkbenchState {
                 | "decisions.create"
                 | "decisions.claim"
                 | "decisions.resolve"
+                // A CI result is the host watcher's observation of GitHub
+                // (`ci_watch`) or of a local CI run (`ci_local`). Through
+                // this path a renderer could write a "your branch passed CI"
+                // notice that GitHub never sent, and have it delivered
+                // natively as if GitPulse had checked.
+                | "signals.record"
                 // Preparation goes through `runs.prepare_terminal` /
                 // `runs.prepare_managed`, which observe the checkout and name
                 // the user's limit. The raw method would take a renderer's
@@ -524,6 +578,12 @@ impl WorkbenchState {
         if method == "runs.conversation" {
             return conversation::find(self, input);
         }
+        // A person's confirmed message to the agent behind an attempt. The
+        // preview and the send are one method so the route a send takes is
+        // decided in one place (`send_to_agent`), never re-derived by a caller.
+        if method == "runs.send_to_agent" {
+            return send_to_agent::send(self, input);
+        }
         // The board's Merge: the merge `gitpulse_merge_tasks` runs, not a
         // second implementation of it. It is a sequence of store writes, so
         // it is a host method rather than a raw store one.
@@ -563,6 +623,15 @@ impl WorkbenchState {
                 &verification_driver::HostBackend(self.clone()),
                 &ids,
             );
+        }
+        // Each card's parent and subtask progress. The card list omits links,
+        // so this is the one read over them; like the verdict read above it
+        // opens read-only, so a view the board takes on every refresh commits
+        // nothing and cannot contend for the profile's write lock.
+        if method == "items.lineage" {
+            let store = Store::open_readonly(&self.profile_path()?)
+                .map_err(|e| WorkbenchError::new("store_error", e.to_string()))?;
+            return lineage::read(&store, input);
         }
         if method == "verifications.status" || method == "verifications.run" {
             let parsed: Value = serde_json::from_str(input)
@@ -676,6 +745,15 @@ impl WorkbenchState {
         result
     }
 
+    /// Asks the native notification coordinator to look for new notices now
+    /// instead of on its next five-second pass. For host writers that go
+    /// around [`Self::request`], which does this for the inbox writes it makes.
+    pub(crate) fn wake_notifications(&self) {
+        if let Some(notifications) = self.0.notifications.get() {
+            notifications.wake();
+        }
+    }
+
     /// A call that names a model selection (or the default one): the worker is
     /// rebuilt when the selection's fingerprint differs from the live one.
     fn worker_call(
@@ -773,9 +851,21 @@ impl WorkbenchState {
                         log::warn!(target: "workbench", "profile worker retire could not acquire the active request; prior generation may remain unresolved");
                     }
                 }
-                let connection =
-                    crate::harness::sidecar::ProfileConnection::new(path.clone(), selection)
-                        .map_err(|error| worker_error(&path, error))?;
+                // Only the app's own profile hosts its agent runtime outside
+                // this process (and only when the person chose that); a state
+                // with a test-supplied profile never reads the machine's
+                // settings, like its run limit.
+                let hosting = if self.0.path.is_none() {
+                    crate::harness::hosted::HostPlan::from_settings()
+                } else {
+                    None
+                };
+                let connection = crate::harness::sidecar::ProfileConnection::new_hosting(
+                    path.clone(),
+                    selection,
+                    hosting,
+                )
+                .map_err(|error| worker_error(&path, error))?;
                 *guard = Some((fingerprint, Arc::new(connection)));
             }
             Arc::clone(&guard.as_ref().expect("worker slot just ensured").1)
@@ -1565,6 +1655,7 @@ done
             "decisions.create",
             "decisions.claim",
             "decisions.resolve",
+            "signals.record",
             "notifications.claim",
             "notifications.finish",
             "notifications.activate",

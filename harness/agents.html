@@ -45,6 +45,10 @@
       });
 
       let mode = "ready";
+      // Whether the process table shows a child agent under alpha's session.
+      let lineage = false;
+      // Whether a further agent process names a parent that no probe lists.
+      let orphan = false;
       let taskMode = "running";
       let holding = true;
       let releaseHold = () => {};
@@ -68,7 +72,17 @@
           deadline_expired: false, duration_ms: 4,
           worktrees: facet(items, { truncated }),
           agents: {
-            ok: true, sessions: truncated ? 9 : 4, kinds: [{ kind: "claude", sessions: truncated ? 9 : 4 }], truncated, live: { ok: true, sessions: 0, kinds: [], worktrees: [] },
+            ok: true, sessions: truncated ? 9 : 4, kinds: [{ kind: "claude", sessions: truncated ? 9 : 4 }], truncated,
+            live: lineage
+              ? {
+                ok: true, sessions: 2, kinds: [],
+                worktrees: [{ path: ALPHA, sessions: [
+                  { kind: "claude", pid: 900, entrypoint: "cli", status: "busy", cwd: ALPHA, tree: "session:pty-alpha" },
+                  { kind: "codex", pid: 901, entrypoint: "", status: "idle", cwd: ALPHA, tree: "session:pty-alpha", parent_pid: 900 },
+                  ...(orphan ? [{ kind: "codex", pid: 902, entrypoint: "", status: "busy", cwd: ALPHA, tree: "session:pty-alpha", parent_pid: 9999 }] : []),
+                ] }],
+              }
+              : { ok: true, sessions: 0, kinds: [], worktrees: [] },
           },
           changes: {
             ok: true, error: "", files: 3, staged: 0, unstaged: 3, untracked: 0, conflicted: 0,
@@ -294,6 +308,78 @@
           get(interfaceStore).globalSurface === "repository" && revealed === 1 && get(repoStore).currentPath === MAIN);
         interfaceStore.setAgentsOpen(true);
         await until(() => row("alpha") && !button("Refresh").disabled, "the plane did not return");
+
+        // A child agent process under alpha's session nests under alpha's row.
+        lineage = true;
+        button("Refresh").click();
+        await until(() => row("Child session"), "the child session did not appear under its parent");
+        const treeRow = (name) => row(name);
+        const levelOf = (name) => Number(treeRow(name)?.getAttribute("aria-level"));
+        check("the plane is a labelled treegrid", () =>
+          root().querySelector("table")?.getAttribute("role") === "treegrid"
+          && !!root().querySelector("table").getAttribute("aria-label"));
+        check("a child agent process nests one level under the session it is in", () =>
+          levelOf("alpha") === 1 && levelOf("Child session") === 2
+          && treeRow("alpha").getAttribute("aria-expanded") === "true"
+          && treeRow("Child session").getAttribute("aria-posinset") === "1"
+          && treeRow("Child session").getAttribute("aria-setsize") === "1"
+          && treeRow("Child session").getAttribute("aria-expanded") === null);
+        check("the child is not counted as a checkout, terminal or attempt", () =>
+          text().includes("4 agent checkouts · 1 live terminal · 1 task attempt · 1 child session"));
+        check("a child's attention is not observed, and the parent says how many it cannot see", () =>
+          treeRow("Child session").textContent.includes("Not observed")
+          && treeRow("alpha").textContent.includes("1 not observed")
+          && treeRow("alpha").textContent.includes("1 of 1 nested row live"));
+        check("the parent's own cells are still its own", () =>
+          treeRow("alpha").textContent.includes("Needs you") && !treeRow("Child session").textContent.includes("Needs you"));
+        const roving = () => rows().filter((item) => item.getAttribute("tabindex") === "0").length;
+        check("exactly one row is in the tab order", () => roving() === 1);
+
+        treeRow("alpha").focus();
+        const key = async (name) => {
+          document.activeElement.dispatchEvent(new KeyboardEvent("keydown", { key: name, bubbles: true, cancelable: true }));
+          await settle();
+        };
+        await key("ArrowDown");
+        check("Down moves to the child row and makes it the one tab stop", () =>
+          document.activeElement === treeRow("Child session") && roving() === 1
+          && treeRow("Child session").getAttribute("tabindex") === "0");
+        await key("ArrowLeft");
+        check("Left on a child steps out to its parent", () => document.activeElement === treeRow("alpha"));
+        await key("ArrowLeft");
+        check("Left on an open parent closes it and hides the child", () =>
+          treeRow("alpha").getAttribute("aria-expanded") === "false" && !row("Child session"));
+        await key("ArrowRight");
+        check("Right on a closed parent opens it", () =>
+          treeRow("alpha").getAttribute("aria-expanded") === "true" && !!row("Child session"));
+        await key("ArrowRight");
+        check("Right on an open parent steps into its first child", () => document.activeElement === treeRow("Child session"));
+        await key("Home");
+        check("Home goes to the first row", () => document.activeElement === rows()[0]);
+        row("alpha").querySelector("[data-testid=agents-row-toggle]").click();
+        await settle();
+        check("the toggle button closes a parent as the keys do", () =>
+          treeRow("alpha").getAttribute("aria-expanded") === "false" && !row("Child session"));
+        row("alpha").querySelector("[data-testid=agents-row-toggle]").click();
+        await settle();
+
+        await press("Live");
+        check("the live filter keeps a parent with its live child", () => !!row("alpha") && !!row("Child session"));
+        await press("All");
+
+        // A child whose parent is in no probe read is neither nested nor dropped:
+        // it is counted as unplaced and the plane says so.
+        orphan = true;
+        button("Refresh").click();
+        await until(() => text().includes("Child sessions") && text().includes("could not be placed under a row"), "a child with an unseen parent was dropped without a trace");
+        check("a child whose parent no probe lists is said to be unplaced, not left out", () =>
+          text().includes("1 child agent session could not be placed under a row") && !!row("Child session"));
+        check("the unseen-parent child is not nested under any row", () => rows().filter((item) => item.textContent.includes("pid 902")).length === 0);
+        // Later checks read the plane without any child agent process.
+        orphan = false;
+        lineage = false;
+        button("Refresh").click();
+        await until(() => !row("Child session") && !text().includes("could not be placed under a row"), "the child sessions did not clear");
 
         let releaseSlow = () => {};
         slow = new Promise((resolve) => { releaseSlow = resolve; });

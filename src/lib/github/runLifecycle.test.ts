@@ -1,10 +1,22 @@
 import { describe, expect, it } from "vitest";
 import { isSettled, isVerdict } from "../delivery/phase";
 import { runPhase, runStateClass, runStateLabel, runTimelineRow } from "./runLifecycle";
-import type { WorkflowRunInfo } from "./types";
+import { outcomeFor } from "./runOutcomeFixtures";
+import { RUN_OUTCOMES, type WorkflowRunInfo } from "./types";
 
+/**
+ * A run as Rust would have parsed it: `outcome` is the classifier's answer for
+ * the status and conclusion given (`runOutcomeFixtures`), unless a test names
+ * one to prove the renderer reads it and nothing else.
+ */
 function makeRun(overrides: Partial<WorkflowRunInfo> = {}): WorkflowRunInfo {
+  const run = baseRun(overrides);
+  return { ...run, outcome: overrides.outcome ?? outcomeFor(run.status, run.conclusion) };
+}
+
+function baseRun(overrides: Partial<WorkflowRunInfo>): WorkflowRunInfo {
   return {
+    outcome: "unknown",
     id: 1,
     name: "CI",
     title: "Fix the thing",
@@ -45,6 +57,40 @@ const GH_CONCLUSION_WORDS = [
   "success",
   "timed_out",
 ] as const;
+
+describe("the phase is the Rust outcome and nothing else", () => {
+  it("maps every outcome to one deliberate phase", () => {
+    const phases = Object.fromEntries(
+      RUN_OUTCOMES.map((outcome) => [outcome, runPhase(makeRun({ outcome }))]),
+    );
+    expect(phases).toEqual({
+      in_flight: "in_flight",
+      passed: "settled_ok",
+      failed: "settled_bad",
+      // Not red, but a bad end for the pass rate it shares with Firebase.
+      cancelled: "settled_bad",
+      // Held for a person: settled, and no verdict.
+      needs_person: "unknown",
+      unknown: "unknown",
+    });
+  });
+
+  it("does not look at status or conclusion when judging", () => {
+    // If the renderer kept a table of its own, these would come out as a pass
+    // and a failure. The only opinion is the one Rust attached.
+    expect(
+      runPhase(makeRun({ status: "completed", conclusion: "success", outcome: "unknown" })),
+    ).toBe("unknown");
+    expect(
+      runPhase(makeRun({ status: "in_progress", conclusion: "", outcome: "failed" })),
+    ).toBe("settled_bad");
+  });
+
+  it("gives no verdict to an outcome this build has never heard of", () => {
+    const newer = { ...makeRun(), outcome: "quarantined" } as unknown as WorkflowRunInfo;
+    expect(runPhase(newer)).toBe("unknown");
+  });
+});
 
 describe("a run still moving is never given a verdict", () => {
   it("treats every in-flight status as in flight", () => {

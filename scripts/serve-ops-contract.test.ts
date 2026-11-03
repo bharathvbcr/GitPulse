@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -27,6 +27,7 @@ interface Field {
   type: string;
   required: boolean;
   fields?: Record<string, Field>;
+  items?: Field;
 }
 interface ServeContract {
   protocol: number;
@@ -42,6 +43,145 @@ const gateRs = read("src-tauri", "src", "workbench", "verification_gate.rs");
 const proposalsRs = read("src-tauri", "src", "workbench", "intake_proposals.rs");
 const workbenchRs = read("src-tauri", "src", "workbench.rs");
 
+/**
+ * Where the Rust literal, comment or char starting at `i` ends, or `i` when
+ * none starts there. Braces and semicolons inside these do not count when a
+ * test item's extent is measured. (A lifetime such as `'a` is not a literal.)
+ */
+function literalEnd(text: string, i: number): number {
+  const c = text[i];
+  if (c === "/" && text[i + 1] === "/") {
+    const nl = text.indexOf("\n", i);
+    return nl < 0 ? text.length : nl;
+  }
+  if (c === "/" && text[i + 1] === "*") {
+    let depth = 0;
+    for (let j = i; j < text.length - 1; j++) {
+      const pair = text.slice(j, j + 2);
+      if (pair === "/*") (depth++, j++);
+      else if (pair === "*/") {
+        j++;
+        if (--depth === 0) return j + 1;
+      }
+    }
+    return text.length;
+  }
+  if (c === "r") {
+    const raw = /r(#*)"/y;
+    raw.lastIndex = i;
+    const open = raw.exec(text);
+    if (open) {
+      const close = text.indexOf(`"${open[1]}`, i + open[0].length);
+      return close < 0 ? text.length : close + 1 + open[1].length;
+    }
+    return i;
+  }
+  if (c === '"') {
+    for (let j = i + 1; j < text.length; j++) {
+      if (text[j] === "\\") j++;
+      else if (text[j] === '"') return j + 1;
+    }
+    return text.length;
+  }
+  if (c === "'") {
+    const ch = /'(?:\\u\{[0-9a-fA-F_]+\}|\\x[0-9a-fA-F]{2}|\\.|[^\\'\n])'/y;
+    ch.lastIndex = i;
+    const m = ch.exec(text);
+    return m ? i + m[0].length : i;
+  }
+  return i;
+}
+
+/** The index just past the `}` that closes the `{` at `open`. */
+function blockEnd(text: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < text.length; ) {
+    const lit = literalEnd(text, i);
+    if (lit > i) {
+      i = lit;
+      continue;
+    }
+    if (text[i] === "{") depth++;
+    else if (text[i] === "}" && --depth === 0) return i + 1;
+    i++;
+  }
+  return text.length;
+}
+
+/** The index just past the item starting at `from`: up to its `;`, or through its `{ .. }` body. */
+function itemEnd(text: string, from: number): number {
+  let parens = 0;
+  for (let i = from; i < text.length; ) {
+    const lit = literalEnd(text, i);
+    if (lit > i) {
+      i = lit;
+      continue;
+    }
+    const c = text[i];
+    if (c === "(" || c === "[") parens++;
+    else if (c === ")" || c === "]") parens--;
+    else if (c === ";" && parens <= 0) return i + 1;
+    else if (c === "{" && parens <= 0) return blockEnd(text, i);
+    i++;
+  }
+  return text.length;
+}
+
+/**
+ * `text` without the items a `#[cfg(test)]` / `#[cfg(all(test, ..))]`
+ * attribute puts out of the production build: a `mod x;` declaration (its body
+ * is another file), an inline `mod x { .. }` (to its closing brace), a test-only
+ * `fn`, `const` or statement. Everything around them is kept, so code after a
+ * test module is still scanned. Line breaks are kept so positions stay put.
+ */
+function withoutTestItems(text: string): string {
+  const attr = /#\[cfg\((?:all\()?test\b[^\n]*\]/y;
+  let out = "";
+  for (let i = 0; i < text.length; ) {
+    const lit = literalEnd(text, i);
+    if (lit > i) {
+      out += text.slice(i, lit);
+      i = lit;
+      continue;
+    }
+    attr.lastIndex = i;
+    const found = text[i] === "#" ? attr.exec(text) : null;
+    if (!found) {
+      out += text[i++];
+      continue;
+    }
+    const end = itemEnd(text, i + found[0].length);
+    out += text.slice(i, end).replace(/[^\n]/g, "");
+    i = end;
+  }
+  return out;
+}
+
+/**
+ * The production text of every `src-tauri/src/harness/*.rs` file, by file name.
+ * Test items are removed, not the rest of the file after them: they name ops as
+ * literals on purpose, to talk to fakes, and `*_tests.rs` files are skipped.
+ */
+function harnessProduction(): Map<string, string> {
+  const dir = path.join(REPO, "src-tauri", "src", "harness");
+  const files = new Map<string, string>();
+  for (const name of readdirSync(dir).filter((f) => f.endsWith(".rs") && !/_tests?\.rs$/.test(f))) {
+    files.set(name, withoutTestItems(readFileSync(path.join(dir, name), "utf8")));
+  }
+  return files;
+}
+
+/**
+ * Op-shaped string literals passed as the op argument of a sidecar call:
+ * `x.call("a.b", ..)`, `call_typed::<T>("a.b", ..)`, `call_in_slot(owner, "a.b", ..)`.
+ * An op is `hello` or dotted lowercase words, which a path or message is not.
+ */
+const OP_LITERAL_ARG = /\bcall\w*(?:::<[^>]*>)?\(\s*(?:&?(?:mut\s+)?[\w.:]+\s*,\s*){0,2}"(hello|[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+)"/g;
+
+function literalOpCalls(source: string): string[] {
+  return [...source.matchAll(OP_LITERAL_ARG)].map((m) => m[1]);
+}
+
 const declared = (type: string) => Object.keys(contract.types[type].fields ?? {});
 
 /** Text from `start` to the first line that is exactly the closing brace. */
@@ -56,7 +196,7 @@ function block(source: string, start: RegExp): string {
 
 /** Field names of a Rust struct, skipping doc comments and attributes. */
 function structFields(source: string, name: string): string[] {
-  const body = block(source, new RegExp(`pub struct ${name} \\{`));
+  const body = block(source, new RegExp(`pub(?:\\(crate\\))? struct ${name} \\{`));
   return [...body.matchAll(/^\s+pub (\w+):/gm)].map((m) => m[1]);
 }
 
@@ -180,8 +320,8 @@ describe("the ops GitPulse names are served", () => {
     expect(allow, "profile worker allowlist not found").not.toBeNull();
     const ops = [...allow![1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
     expect(ops.filter((op) => !served.has(op))).toEqual([]);
-    expect(ops).toHaveLength(14);
-    expect(ops).toEqual(expect.arrayContaining(["work.verify.task", "work.verify.get", "work.scan.gaps", "work.scan.get", "work.scan.cancel", "work.enhancements.refine", "work.tasks.suggest"]));
+    expect(ops).toHaveLength(15);
+    expect(ops).toEqual(expect.arrayContaining(["work.verify.task", "work.verify.get", "work.scan.gaps", "work.scan.get", "work.scan.cancel", "work.enhancements.refine", "work.tasks.suggest", "work.runs.managed.continue"]));
   });
 
   it("what GitPulse sends work.verify.task and work.verify.get is declared, and nothing required is missing", () => {
@@ -197,6 +337,22 @@ describe("the ops GitPulse names are served", () => {
     const get = paramKeys(fnBody("get_params"));
     expect(undeclared(get, "VerifyGetParams")).toEqual([]);
     expect(missingRequired(get, "VerifyGetParams")).toEqual([]);
+  });
+
+  it("what GitPulse sends work.runs.managed.continue is declared, and the op it names is the served one", () => {
+    const managedRs = read("src-tauri", "src", "workbench", "managed_run.rs");
+    const at = managedRs.indexOf("pub(crate) fn continue_params(");
+    expect(at, "continue_params not found").toBeGreaterThanOrEqual(0);
+    const rest = managedRs.slice(at);
+    const keys = paramKeys(rest.slice(0, rest.search(/\n\}\n/)));
+    expect(keys).toEqual(expect.arrayContaining(["id", "request_id", "message"]));
+    expect(undeclared(keys, "ManagedContinueParams")).toEqual([]);
+    expect(missingRequired(keys, "ManagedContinueParams")).toEqual([]);
+    const op = /pub\(crate\) const OP_CONTINUE: &str = "([^"]+)";/.exec(managedRs);
+    expect(op).not.toBeNull();
+    expect(contract.ops.optional).toContain(op![1]);
+    // What GitPulse reads back is a subset of what Manvi answers.
+    expect(declared("ManagedContinueResult")).toEqual(expect.arrayContaining(["state", "request_id", "turn", "max_turns", "idle_deadline"]));
   });
 
   it("what GitPulse sends work.scan.* and work.enhancements.refine is declared, and the root is always sent", () => {
@@ -228,5 +384,97 @@ describe("the ops GitPulse names are served", () => {
       expect(contract.ops.optional).toContain(op);
       expect(contract.ops.always).not.toContain(op);
     }
+  });
+});
+
+describe("every op the harness sends is a named, contract-checked constant", () => {
+  const served = new Set([...contract.ops.always, ...contract.ops.optional]);
+
+  it("sidecar calls in the harness name an OP_* constant, never an op literal", () => {
+    // What `every OP_* constant is a served op` cannot see: a literal handed
+    // straight to `call` is in no list, so the hosted `serve.status` and
+    // `serve.stop_all` went out unchecked against the contract.
+    const offenders: string[] = [];
+    for (const [file, text] of harnessProduction()) {
+      for (const op of literalOpCalls(text)) offenders.push(`${file}: ${op}`);
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it("no serve.* op is spelled as a literal outside protocol.rs", () => {
+    // `HOSTED_OPS` lists the hosted server's ops; it is not a call argument.
+    const offenders: string[] = [];
+    for (const [file, text] of harnessProduction()) {
+      if (file === "protocol.rs") continue;
+      // `serve.sock` and `serve.log` are file names; only the contract's ops count.
+      for (const m of text.matchAll(/"(serve\.[a-z_]+)"/g)) if (served.has(m[1])) offenders.push(`${file}: ${m[1]}`);
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it("the literal-op scan sees a literal in a call (it is not vacuous)", () => {
+    expect(literalOpCalls('let raw = self.call("serve.stop_all", None, t)?;')).toEqual(["serve.stop_all"]);
+    expect(literalOpCalls('call_in_slot(\n owner,\n "policy.check",\n None)')).toEqual(["policy.check"]);
+    expect(literalOpCalls("sidecar::call_typed::<PrepareResult>(OP_CHAT_PREPARE, params, t)")).toEqual([]);
+    expect(literalOpCalls("self.call(OP_SERVE_STATUS, None, t)")).toEqual([]);
+    expect(literalOpCalls('self.call("not an op", None, t)')).toEqual([]);
+  });
+
+  it("the test-item stripper keeps the production code after a test module (it does not cut the file)", () => {
+    const decl = [
+      "fn before() {}",
+      "#[cfg(all(test, unix))]",
+      "mod concurrent_tests;",
+      "",
+      'fn after() { let _ = sidecar::call("work.runs.managed.stop", None, t); }',
+    ].join("\n");
+    expect(literalOpCalls(withoutTestItems(decl))).toEqual(["work.runs.managed.stop"]);
+    const inline = [
+      "#[cfg(test)]",
+      "mod tests {",
+      '    fn fake() { self.call("serve.stop_all", None, t); let brace = "}"; let c = \'}\'; /* } */ }',
+      '    const RAW: &str = r#"} mod x {"#;',
+      "}",
+      "pub struct Kept { pub a: u8 }",
+      'fn after() { self.call_in_slot(&self.slot, "serve.status", None, t); }',
+    ].join("\n");
+    const kept = withoutTestItems(inline);
+    expect(kept).toContain("pub struct Kept");
+    expect(literalOpCalls(kept)).toEqual(["serve.status"]);
+    // A test-only function or statement inside production code goes too; its neighbours stay.
+    const stmt = '#[cfg(test)]\nlet lent = sidecar::call("a.b", None);\nlet kept = self.call("c.d", None);\n';
+    expect(literalOpCalls(withoutTestItems(stmt))).toEqual(["c.d"]);
+    expect(withoutTestItems(inline).split("\n")).toHaveLength(inline.split("\n").length);
+  });
+
+  it("the stripper leaves the production items after the test modules of the real harness files", () => {
+    const files = harnessProduction();
+    // Items that follow a `#[cfg(test)] mod` in their file; the old cut-at-first-test-module dropped them.
+    expect(files.get("mod.rs")).toMatch(/\npub(?:\(crate\))? fn guard_files\b/);
+    expect(files.get("mod.rs")).not.toMatch(/guard_files_with_workers_for_bench/);
+    expect(files.get("protocol.rs")).toMatch(/pub struct ScanResult\b/);
+    expect(files.get("policy.rs")).toMatch(/pub fn check_file\(/);
+    for (const [file, text] of files) expect(text, file).not.toMatch(/#\[cfg\((?:all\()?test\b/);
+  });
+
+  it("the serve ops the hosted lane sends are constants, served, and the shapes Rust reads are declared", () => {
+    const ops = Object.fromEntries([...protocolRs.matchAll(/pub const (OP_\w+): &str = "([^"]+)";/g)].map((m) => [m[1], m[2]]));
+    expect(ops.OP_SERVE_STATUS).toBe("serve.status");
+    expect(ops.OP_SERVE_STOP_ALL).toBe("serve.stop_all");
+    expect(served.has("serve.status") && served.has("serve.stop_all")).toBe(true);
+    // What GitPulse sends with serve.stop_all.
+    expect(declared("ServeStopAllParams")).toContain("wait_ms");
+    expect(sidecarRs).toMatch(/OP_SERVE_STOP_ALL,\s*Some\(serde_json::json!\(\{"wait_ms":/);
+    // What it reads back of serve.status ...
+    const hostedRs = read("src-tauri", "src", "harness", "hosted.rs");
+    const status = structFields(hostedRs, "ServeStatus");
+    expect(status).toEqual(expect.arrayContaining(["protocol", "owner_id", "process_id", "controller", "jobs"]));
+    expect(undeclared(status, "ServeStatusResult")).toEqual([]);
+    const job = structFields(hostedRs, "ServeJob");
+    expect(job).toEqual(expect.arrayContaining(["id", "phase"]));
+    const jobFields = contract.types.ServeStatusResult.fields?.jobs.items?.fields ?? {};
+    expect(job.filter((name) => !(name in jobFields))).toEqual([]);
+    // ... and of serve.stop_all (the `pending` ids sidecar.rs decodes).
+    expect(declared("ServeStopAllResult")).toContain("pending");
   });
 });

@@ -534,13 +534,44 @@ fn ingest_family(
         let mut row_file: Option<String> = None;
         let mut touched: HashSet<usize> = HashSet::new();
         let mut consumed = 0u64;
+        let mut finished = false;
         loop {
             if expired(&out) {
                 out.truncated = true;
                 break;
             }
-            let line = match reader.next_line() {
-                Ok(Some(line)) => line,
+            // The calls to place, and the line they were found on.
+            let (parsed, line_offset, digest) = match reader.next_line() {
+                Ok(Some(line)) => {
+                    consumed += line.len;
+                    let Some(body) = line.body else {
+                        // Longer than the reader keeps: counted, never silently lost.
+                        out.skipped_lines += 1;
+                        continue;
+                    };
+                    let Ok(text) = std::str::from_utf8(body) else {
+                        out.skipped_lines += 1;
+                        continue;
+                    };
+                    let text = text.trim_end_matches('\r');
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    let digest = ledger::ids::fnv1a64(body);
+                    parser.locate(line.offset, digest);
+                    (parser.parse(text), line.offset, digest)
+                }
+                Ok(None) if !finished => {
+                    // The end of the file. What the parser is still holding is
+                    // written as it stands only once the file has been still
+                    // for long enough that its results are not coming.
+                    finished = true;
+                    let still = modified_ms.is_none_or(|at| {
+                        ledger::ids::now_millis().saturating_sub(at)
+                            > transcript::PENDING_MAX_AGE_MS
+                    });
+                    (parser.finish(still), start + consumed, 0)
+                }
                 Ok(None) => break,
                 Err(_) => {
                     // What was read stays read; the rest is owed to the next pass.
@@ -548,25 +579,17 @@ fn ingest_family(
                     break;
                 }
             };
-            consumed += line.len;
-            let Some(body) = line.body else {
-                // Longer than the reader keeps: counted, never silently lost.
-                out.skipped_lines += 1;
-                continue;
-            };
-            let Ok(text) = std::str::from_utf8(body) else {
-                out.skipped_lines += 1;
-                continue;
-            };
-            let text = text.trim_end_matches('\r');
-            if text.trim().is_empty() {
-                continue;
-            }
-            let parsed = parser.parse(text);
             out.skipped_lines += parsed.skipped;
-            let digest = ledger::ids::fnv1a64(body);
             let row_file = row_file.get_or_insert_with(|| canonical_file_key(&path));
             for (ordinal, call) in parsed.calls.into_iter().enumerate() {
+                // A call written on the line of its result is still the call of
+                // the line that held it: that is the row's identity, and the
+                // offset every cursor comparison below is made at.
+                let origin = call.origin.unwrap_or(transcript::LineOrigin {
+                    offset: line_offset,
+                    ordinal,
+                    digest,
+                });
                 // One owner per call, and the row is always the owner's:
                 // its path, its task. A removed worktree is found by
                 // its path alone, and only when the family is known (an
@@ -607,7 +630,7 @@ fn ingest_family(
                 let owes = &owed[slot];
                 // Bytes before a participant's own cursor are ones
                 // it has already consumed.
-                if line.offset < owes.start {
+                if origin.offset < owes.start {
                     continue;
                 }
                 let participant = &participants[index];
@@ -631,7 +654,7 @@ fn ingest_family(
                                 if consumed_by(
                                     &owners.hosted[owner],
                                     &file_key,
-                                    line.offset,
+                                    origin.offset,
                                     len,
                                     &mut probe,
                                 ) {
@@ -661,9 +684,9 @@ fn ingest_family(
                     history,
                     ledger::TranscriptRow {
                         file_key: row_file.clone(),
-                        offset: line.offset,
-                        ordinal,
-                        digest,
+                        offset: origin.offset,
+                        ordinal: origin.ordinal,
+                        digest: origin.digest,
                     },
                 ));
                 out.rehosted_calls += i64::from(rehosted);
@@ -672,7 +695,13 @@ fn ingest_family(
         #[cfg(test)]
         BYTES_READ.with(|read| read.set(read.get() + reader.bytes_read()));
 
-        let end = start + consumed;
+        // The cursor stays at the earliest line the parser still owes a call
+        // for, so what it was holding is read again, with its result, by the
+        // next pass; rows already written from the lines between are refused
+        // by their identity, not written twice.
+        let end = parser
+            .held_from()
+            .map_or(start + consumed, |held| held.clamp(start, start + consumed));
         // Taken from the file as it stands once the lines are read, and only
         // when a cursor is to be written at all.
         // The stat recorded with it is the one taken before the read: a file
@@ -688,7 +717,11 @@ fn ingest_family(
             }
             // A rotated cursor is rewritten even where the new file ends at the
             // old offset, or it would read as rotated again on every pass.
-            if (owes.from != Some(end) || owes.rotated) && !(owes.from.is_none() && end == 0) {
+            // And a cursor held where it already stands still commits the rows
+            // found past it: they are not waited for, and the pass that reads
+            // them again finds them recorded (their identity refuses a copy).
+            let moves = owes.from != Some(end) || owes.rotated || !drafts.is_empty();
+            if moves && !(owes.from.is_none() && end == 0 && drafts.is_empty()) {
                 has_events |= !drafts.is_empty();
                 participants[owes.participant]
                     .pending

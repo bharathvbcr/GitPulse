@@ -75,6 +75,8 @@ const deleted = new Set(), deleteWrites = [], restoreWrites = [], mergeWrites = 
 let mergeFailSource = "";
 // Reads of one workspace's membership, and a switch that makes them fail.
 let workspaceGets = 0, failWorkspaceGet = false;
+/** What `attention.list` answers: the inbox's rows, as the store writes them. Empty unless a check sets it. */
+let attentionRows = [];
 let failList = false, corruptSave = false, loseSave = false, holdSave = false, releaseSave, holdSearch = false, heldSearch = [], holdGet = false, releaseGet;
 /** Hold the catalog read a background refresh starts with, and any next-page task read, to open the gap between them. */
 let holdCatalog = false, heldCatalog = [], holdPages = false, heldPages = [];
@@ -94,6 +96,11 @@ const SCAN_FPS = ["0123456789abcdef", "fedcba9876543210"];
 const scanProposal = (fingerprint, n) => ({fingerprint, category: "dead_symbols", status: "new", title: `Remove unused helper ${n}`, description: `Helper ${n} has no callers.`, kind: "maintenance", priority: 2, labels: ["manvi-scan"], signals: [{source: "devmap dead_symbols", result: "confidence 0.9"}]});
 const filedFingerprints = new Map();
 const verdicts = new Map(), verdictReads = [];
+// Parent links as the store holds them (child id -> parent id). `items.lineage`
+// derives each card's parent and subtask progress from these and from the
+// tasks' status, as the host's one read over `work_item_links` does.
+const parentOf = new Map(), lineageReads = [];
+let failLineage = false;
 let verifyOptIn = false;
 const verifyPosts = [];
 let failConfiguration = false, blankConfiguration = false, loseEnhancement = false, holdDelete = false, releaseDelete;
@@ -249,10 +256,7 @@ mockIPCWithEvents(async (cmd, args) => {
       return JSON.stringify({ok: true, item: saved});
     }
     case "enhancements.wake": case "enhancements.worker": return JSON.stringify({ok:true, state:"disabled", reason:"", task_id:"", proposal_id:"", next_check_at:0});
-    case "attention.list": {
-      const result = JSON.stringify(page([]));
-      return result;
-    }
+    case "attention.list": return JSON.stringify(page(attentionRows));
     case "runs.list": return JSON.stringify(page([]));
     // What Manvi's verification says about a card, as the host reads it from the
     // store. `verdicts` holds the cards that have one; every other card is "none".
@@ -261,6 +265,21 @@ mockIPCWithEvents(async (cmd, args) => {
       return JSON.stringify({ok: true, items: Object.fromEntries(input.ids.filter(id => verdicts.has(id)).map(id => [id, verdicts.get(id)]))});
     }
     case "verifications.status": return JSON.stringify(verdicts.get(input.id) ?? {ok: true, state: "none", stale: false, record: null});
+    // Each named live card's parent and how many of its live subtasks are Done.
+    // A card the store does not hold is left out, so the board shows it as unknown.
+    case "items.lineage": {
+      lineageReads.push([...input.ids]);
+      if (failLineage) throw {code:"store_error", message:"Fixture lineage is unavailable"};
+      const live = id => tasks.some(task => task.id === id) && !deleted.has(id);
+      const statusOf = id => tasks.find(task => task.id === id)?.status;
+      const items = {};
+      for (const id of input.ids.filter(live)) {
+        const kids = [...parentOf].filter(([child, parent]) => parent === id && live(child)).map(([child]) => child);
+        const parent = parentOf.get(id);
+        items[id] = {parent_item_id: parent && live(parent) ? parent : null, children: {total: kids.length, done: kids.filter(child => statusOf(child) === "done").length}};
+      }
+      return JSON.stringify({ok: true, items});
+    }
     case "enhancements.configuration": {
       if(failConfiguration) throw {code:"worker_error",message:"Manvi temporarily unavailable"};
       return JSON.stringify({ok:true,provider:"local",model:blankConfiguration ? "" : "quick-fixture",model_source:"fixture",providers:["local"]});
@@ -671,9 +690,30 @@ if (params.has("check")) {
     check("switching repository tabs replaces prior task cards", Boolean(card("task-3")) && !card("task-1"));
     check("each board load reads verdicts in one batch of at most 256 distinct ids", verdictReads.length > 0 && verdictReads.every(ids => ids.length > 0 && ids.length <= 256 && new Set(ids).size === ids.length));
     check("a card nobody has verified shows no verdict chip", root.querySelectorAll('[data-testid="card-verdict"]').length === 0);
+    check("each board load reads lineage in one batch of at most 256 distinct ids", lineageReads.length > 0 && lineageReads.every(ids => ids.length > 0 && ids.length <= 256 && new Set(ids).size === ids.length));
+    check("a card in no task tree shows neither a parent nor a subtask count", root.querySelectorAll('[data-testid="card-parent"], [data-testid="card-subtasks"]').length === 0);
     verdicts.set("task-1", {ok: true, state: "passed", stale: false, record: null});
+    // task-1 holds three subtasks, one of them Done (and archived, which is still Done).
+    parentOf.set("task-2", "task-1"); parentOf.set("task-3", "task-1"); parentOf.set("task-100", "task-1");
     await click("Global fixture"); await settle(400);
     check("a verified card shows its verdict on the card", card("task-1")?.querySelector('[data-testid="card-verdict"]')?.dataset.state === "passed");
+    {
+      const progress = card("task-1")?.querySelector('[data-testid="card-subtasks"]');
+      check("a parent card says how many of its subtasks are done", progress?.textContent.trim() === "1 of 3 subtasks done" && progress.dataset.done === "1" && progress.dataset.total === "3");
+      const parentMark = card("task-2")?.querySelector('[data-testid="card-parent"]');
+      check("a subtask card names its parent", parentMark?.dataset.parentId === "task-1" && parentMark.textContent.includes("Keep repository tasks in sync"));
+      check("a card with no subtasks and no parent shows neither mark", !card("task-10")?.querySelector('[data-testid="card-parent"], [data-testid="card-subtasks"]'));
+      check("a subtask without subtasks of its own shows no subtask count", !card("task-2")?.querySelector('[data-testid="card-subtasks"]'));
+      check("a read that worked shows no lineage error", !root.querySelector('[data-testid="board-lineage-error"]'));
+      // A lineage read that fails is said, and no card then claims a count it did not read.
+      failLineage = true;
+      await click("Manvi fixture"); await settle(400); await click("Global fixture"); await settle(400);
+      check("a failed lineage read says so on the board", Boolean(root.querySelector('[data-testid="board-lineage-error"]')));
+      check("a failed lineage read leaves every card unknown, not at 0 of 0", root.querySelectorAll('[data-testid="card-parent"], [data-testid="card-subtasks"]').length === 0);
+      failLineage = false;
+      await click("Manvi fixture"); await settle(400); await click("Global fixture"); await settle(400);
+      check("the next lineage read that works clears the error and restores the marks", !root.querySelector('[data-testid="board-lineage-error"]') && card("task-1")?.querySelector('[data-testid="card-subtasks"]')?.textContent.trim() === "1 of 3 subtasks done");
+    }
     card("task-1").click(); await wait(editor);
     await wait(() => editor().querySelector('[data-testid="verification-chip"]'));
     check("the task sheet shows the verdict, a Verify action and the refine action",
@@ -699,6 +739,7 @@ if (params.has("check")) {
     verifyOptIn = false;
     await repoStore.removeRepo("/fixture/GitPulse");
     verdicts.delete("task-1");
+    parentOf.clear();
     const title = field("Title"); await change(title, "Unsaved task title");
     confirmations = 0;
     confirmAnswer = false;
@@ -3325,6 +3366,37 @@ if (params.has("check")) {
       check("the header offers New task and an Inbox", Boolean(button("New task")) && Boolean(root.querySelector('[aria-label="Inbox"]')));
       const urgent = card("task-2")?.querySelector('[aria-label$=" priority"]');
       check("a card names its priority for a screen reader, not by colour alone", /^High priority$/.test(urgent?.getAttribute("aria-label") ?? ""));
+
+      guardStep = "claims: CI notices in the inbox";
+      {
+        // What `signals.record` leaves in the inbox (dc-store), plus a kind a newer store might write. The page
+        // must draw the CI facts it understands and name the one it cannot, and one must not blank the other.
+        const notice = (n, kind, title, extra = {}) => ({ id: `event-${n}`, revision: 1, updated_at: 1000, source_sequence: n, task_id: "task-1", task_revision: 1, target_type: "run", target_id: "run-1", target_revision: 1, target_status: "current", kind, title, created_at: 1000, read_at: null, dismissed_at: null, snoozed_until: null, ...extra });
+        const facts = { source: "github", external_id: "77", kind: "ci_failed", conclusion: "failure", workflow: "CI", branch: "gitpulse/fix-1234abcd", url: "https://github.com/acme/app/actions/runs/77", head_sha: "b".repeat(40) };
+        attentionRows = [
+          notice(52, "run_ci_failed", "Coding agent branch failed CI", { signal: facts }),
+          notice(51, "run_ci_passed", "Coding agent branch passed CI", { signal: { ...facts, source: "ci_local", kind: "ci_passed", conclusion: "success", workflow: "ci.local", url: null } }),
+          notice(50, "run_quarantined", "Coding agent was quarantined"),
+        ];
+        // (The board's Inbox *column* is also a section labelled "Inbox"; this is the notification inbox.)
+        const toggle = root.querySelector('.gp-icon-btn[aria-label="Inbox"]');
+        const inbox = () => root.querySelector('section.inbox[aria-label="Inbox"]');
+        if (!inbox()) toggle.click();
+        // Three notices are a pile: the front card and a button that spreads them.
+        // ("3 notifications, 2 unread": the label counts what is buried behind the front card.)
+        const spread = () => [...(inbox() ?? root).querySelectorAll("button")].find(el => el.textContent.trim().startsWith("3 notifications"));
+        await wait(() => Boolean(spread()));
+        spread().click();
+        await wait(() => inbox()?.querySelectorAll("article").length === 3);
+        const rows = [...inbox().querySelectorAll("article")];
+        check("a failed CI notice says what failed, on which branch and how", /Coding agent branch failed CI/.test(rows[0].textContent) && /CI · gitpulse\/fix-1234abcd · failure/.test(rows[0].textContent) && rows[0].dataset.noticeKind === "run_ci_failed");
+        check("a local CI result is marked as local", /ci\.local · gitpulse\/fix-1234abcd · success \(local\)/.test(rows[1].textContent));
+        check("a CI notice opens its task", Boolean(button("Open", rows[0])) && Boolean(button("Open", rows[1])));
+        check("a kind this version cannot read is a row that says so, not an error", /A notice this version of GitPulse cannot read/.test(rows[2].textContent) && /run_quarantined/.test(rows[2].textContent) && !inbox().querySelector('[role="alert"]'));
+        check("and offers nothing to open, since what it targets is unknown", !button("Open", rows[2]));
+        attentionRows = [];
+        toggle.click(); await settle();
+      }
 
       guardStep = "claims: quick add dims";
       const quickRow = () => root.querySelector('[data-testid="task-quick-add-row"]');

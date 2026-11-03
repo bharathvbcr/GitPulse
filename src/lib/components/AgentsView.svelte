@@ -17,8 +17,8 @@
    * and an attempt's task by `openTaskForRun`.
    */
   import { get } from "svelte/store";
-  import { Bot, CircleAlert, FolderOpen, ListChecks, RefreshCw, Rows3, SquareTerminal, X } from "@lucide/svelte";
-  import { untrack } from "svelte";
+  import { Bot, ChevronDown, ChevronRight, CircleAlert, FolderOpen, ListChecks, RefreshCw, Rows3, SquareTerminal, X } from "@lucide/svelte";
+  import { tick, untrack } from "svelte";
   import { repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import { toastStore } from "../stores/toastStore";
@@ -41,15 +41,19 @@
   import { createRegisteredRepositories, repositoryPaths, taskProbeFromBoard } from "../agents/tasks";
   import {
     AGENT_COLUMNS,
-    applyAgentFilter,
+    applyAgentTree,
+    countAgentRows,
+    flattenAgentTree,
     isAgentFilter,
     planeHeadline,
     plural,
     projectAgentPlane,
+    rollupSummary,
     scopeToRepository,
     type AgentColumnKey,
     type AgentFilter,
     type AgentRow,
+    type AgentTreeEntry,
   } from "../agents/plane";
 
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
@@ -101,10 +105,24 @@
     tasks: taskProbe,
     paths: pathOpts,
   }));
-  const scoped = $derived(scopeToRepository(plane.rows, $agentsRepositoryScope, pathOpts));
-  const visible = $derived(applyAgentFilter(scoped, filter));
+  // The plane is a tree: a terminal that continues an attempt, and a child
+  // agent process, sit under the row they came from. The scope and the filter
+  // pick roots, and a kept root keeps everything under it; `collapsed` only
+  // hides what is drawn. The headline counts rows (nested ones too), so a
+  // nested row is never a row the filter quietly hid.
+  let collapsed = $state<ReadonlySet<string>>(new Set());
+  let focusedId = $state<string | null>(null);
+  let treegrid = $state<HTMLTableElement | null>(null);
+  const scoped = $derived(scopeToRepository(plane.roots, $agentsRepositoryScope, pathOpts));
+  const visible = $derived(applyAgentTree(scoped, filter));
+  const entries = $derived(flattenAgentTree(visible, collapsed));
   const scopeLabel = $derived($agentsRepositoryScope ? displayName($agentsRepositoryScope) : "");
-  const headline = $derived(planeHeadline(plane, visible.length));
+  const headline = $derived(planeHeadline(plane, countAgentRows(visible)));
+  // Exactly one row is in the tab order (a roving tabindex), and it is the one
+  // last focused while that row is still drawn.
+  const activeId = $derived(
+    entries.some((entry) => entry.row.id === focusedId) ? focusedId : (entries[0]?.row.id ?? null),
+  );
   const scanning = $derived($agentPlaneStore.scanning);
   const notes = $derived([
     ...plane.gaps,
@@ -178,6 +196,61 @@
     if (!row.checkoutPath) return;
     interfaceStore.setGlobalSurface("repository");
     void repoStore.openRepo(row.checkoutPath);
+  }
+
+  function setExpanded(id: string, open: boolean) {
+    const next = new Set(collapsed);
+    if (open) next.delete(id);
+    else next.add(id);
+    collapsed = next;
+  }
+
+  /** Moves the roving focus to the entry at `index` and puts the browser's focus on it. */
+  async function focusEntry(index: number) {
+    const target = entries[Math.max(0, Math.min(entries.length - 1, index))];
+    if (!target) return;
+    focusedId = target.row.id;
+    await tick();
+    treegrid?.querySelector<HTMLElement>(`[data-row-id="${CSS.escape(target.row.id)}"]`)?.focus();
+  }
+
+  /**
+   * The treegrid keys. Up and Down move between drawn rows; Right opens a
+   * closed row and then steps into it; Left closes an open row and then steps
+   * out to its parent. Keys that land on a button inside the row are the
+   * button's own.
+   */
+  function onRowKey(event: KeyboardEvent, entry: AgentTreeEntry, index: number) {
+    if (event.target !== event.currentTarget || event.altKey || event.ctrlKey || event.metaKey) return;
+    switch (event.key) {
+      case "ArrowDown":
+        void focusEntry(index + 1);
+        break;
+      case "ArrowUp":
+        void focusEntry(index - 1);
+        break;
+      case "Home":
+        void focusEntry(0);
+        break;
+      case "End":
+        void focusEntry(entries.length - 1);
+        break;
+      case "ArrowRight":
+        if (entry.expandable && !entry.expanded) setExpanded(entry.row.id, true);
+        else if (entry.expandable) void focusEntry(index + 1);
+        break;
+      case "ArrowLeft":
+        if (entry.expanded) setExpanded(entry.row.id, false);
+        else if (entry.level > 1) {
+          let up = index - 1;
+          while (up > 0 && entries[up].level >= entry.level) up -= 1;
+          void focusEntry(up);
+        }
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
   }
 
   function presenceWord(row: AgentRow): string {
@@ -353,7 +426,17 @@
         {/if}
       </p>
     {:else}
-      <table class="w-full text-left border-collapse {compact ? 'text-[11px]' : 'text-[12px]'}">
+      <!-- A table whose rows nest is a treegrid (ARIA authoring practices); the
+           rows carry their level and open state, and the arrow keys move through
+           them (harness/agents.html drives them). -->
+      <!-- Justified: Svelte's rule only knows the flat table, not the treegrid. -->
+      <!-- svelte-ignore a11y_no_noninteractive_element_to_interactive_role -->
+      <table
+        bind:this={treegrid}
+        role="treegrid"
+        aria-label="Agent checkouts, terminals, task attempts and the child sessions under them"
+        class="w-full text-left border-collapse {compact ? 'text-[11px]' : 'text-[12px]'}"
+      >
         <caption class="sr-only">Agent checkouts, terminals and task attempts across open repositories</caption>
         <thead class="sticky top-0 bg-background text-textMuted">
           <tr class="border-b border-border">
@@ -366,9 +449,43 @@
           </tr>
         </thead>
         <tbody>
-          {#each visible as row (row.id)}
-            <tr class="border-b border-border/60 hover:bg-surfaceHover/60" data-testid="agents-row">
-              <th scope="row" class="px-4 py-2 font-normal text-left align-top">
+          {#each entries as entry, index (entry.row.id)}
+            {@const row = entry.row}
+            {@const under = rollupSummary(row)}
+            <tr
+              class="border-b border-border/60 hover:bg-surfaceHover/60 focus-visible:outline-2 focus-visible:outline-accent"
+              data-testid="agents-row"
+              data-row-id={row.id}
+              data-level={entry.level}
+              data-origin={row.origin}
+              aria-level={entry.level}
+              aria-posinset={entry.posInSet}
+              aria-setsize={entry.setSize}
+              aria-expanded={entry.expandable ? entry.expanded : undefined}
+              tabindex={row.id === activeId ? 0 : -1}
+              onfocus={(event) => {
+                if (event.target === event.currentTarget) focusedId = row.id;
+              }}
+              onkeydown={(event) => onRowKey(event, entry, index)}
+            >
+              <th scope="row" class="py-2 pr-4 font-normal text-left align-top" style:padding-left="{16 + (entry.level - 1) * 20}px">
+                <span class="flex items-start gap-1">
+                  {#if entry.expandable}
+                    <button
+                      type="button"
+                      class="gp-icon-btn h-4! w-4! mt-0.5 shrink-0"
+                      tabindex="-1"
+                      aria-label="{entry.expanded ? 'Collapse' : 'Expand'} {row.session}"
+                      title={entry.expanded ? "Collapse" : "Expand"}
+                      data-testid="agents-row-toggle"
+                      onclick={() => setExpanded(row.id, !entry.expanded)}
+                    >
+                      {#if entry.expanded}<ChevronDown size={11} />{:else}<ChevronRight size={11} />{/if}
+                    </button>
+                  {:else if entry.level > 1}
+                    <span class="w-4 shrink-0" aria-hidden="true"></span>
+                  {/if}
+                  <span class="min-w-0">
                 <span class="block font-medium text-textPrimary">{row.session}</span>
                 <span class="block text-textMuted">{agentKindLabel(row.kind)} · {row.repoLabel}</span>
                 <span class="mt-1 flex flex-wrap gap-1" data-testid="agents-row-actions">
@@ -407,6 +524,8 @@
                     </button>
                   {/if}
                 </span>
+                  </span>
+                </span>
               </th>
               {#if columnVisible("checkout")}
                 <td class="px-3 py-2 align-top text-textSecondary">{row.checkout}</td>
@@ -414,10 +533,22 @@
               {#if columnVisible("presence")}
                 <td class="px-3 py-2 align-top" title={row.presenceDetail}>
                   {presenceWord(row)}
+                  {#if under.presence}
+                    <span class="block text-textMuted" data-testid="agents-row-rollup-presence">{under.presence}</span>
+                  {/if}
                 </td>
               {/if}
               {#if columnVisible("attention")}
-                <td class="px-3 py-2 align-top">{row.attentionLabel || "—"}</td>
+                <td class="px-3 py-2 align-top">
+                  {#if !row.attentionObserved}
+                    <span title="Nothing in this window watches what this process asks for.">Not observed</span>
+                  {:else}
+                    {row.attentionLabel || "—"}
+                  {/if}
+                  {#if under.attention}
+                    <span class="block text-textMuted" data-testid="agents-row-rollup-attention">{under.attention}</span>
+                  {/if}
+                </td>
               {/if}
               {#if columnVisible("parallel")}
                 <td class="px-3 py-2 align-top tabular-nums">

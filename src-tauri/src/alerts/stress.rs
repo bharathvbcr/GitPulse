@@ -54,6 +54,7 @@ fn notice(key: &str, channel: &'static str) -> Notice {
         channel,
         subject: None,
         subagent: false,
+        agent_id: None,
     }
 }
 

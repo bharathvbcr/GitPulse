@@ -15,6 +15,7 @@ mod notifications;
 mod refine;
 mod runs;
 mod scope;
+mod signals;
 
 pub use briefs::{AGENT_GUIDANCE, AGENT_GUIDANCE_HEADING};
 pub(crate) use legacy::{require_retired as require_legacy_retired, retire as retire_legacy_tasks};
@@ -30,7 +31,7 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// version is refused, so every host sharing a profile must be built at the
 /// same one; `dcstore --version` reports it so a host can check that before
 /// handing a profile to a store it did not build.
-pub const WORKBENCH_SCHEMA: i64 = 14;
+pub const WORKBENCH_SCHEMA: i64 = 15;
 const MAX_INTEGER: i64 = 9_007_199_254_740_990;
 // Reserve envelope/cursor space within a 2 MiB response. The collector stops
 // fetching rows at this bound, including for full revision and event documents.
@@ -203,6 +204,7 @@ impl Store {
                 | "decisions.decide"
                 | "decisions.claim"
                 | "decisions.resolve"
+                | "signals.record"
                 | "store.compact"
                 | "store.upgrade"
         );
@@ -457,6 +459,17 @@ fn migrate_step(conn: &Connection, from: i64) -> Result<()> {
             // every task it saves, so older hosts must refuse this profile.
             conn.execute("UPDATE work_meta SET version=14 WHERE id=1", [])?;
         }
+        14 => {
+            // CI results arrive as `signals.record` attention rows of kind
+            // `run_ci_passed`, `run_ci_failed` and `run_ci_cancelled`, each with
+            // a `body.signal` object, and the attention query judges a signal
+            // row by its branch key rather than by revision. No table changes. A
+            // host that does not know those kinds would refuse the whole
+            // attention page on the first one, and an older store would stale
+            // a signal row by revision comparison, so older hosts must refuse
+            // this profile.
+            conn.execute("UPDATE work_meta SET version=15 WHERE id=1", [])?;
+        }
         other => {
             return Err(Error {
                 code: "schema_unsupported",
@@ -596,6 +609,18 @@ fn mutate(input: &Input<'_>, method: &str, now: i64, now_ms: i64) -> Result<Stri
             });
         }
         return replay_response(input.conn, &response);
+    }
+    if method == "signals.record" {
+        // A signal has no record of its own to revise: it is create-only, and
+        // its idempotency is its key, not an expected revision. The reply is
+        // kept verbatim because a repeat with a new request_id answers
+        // `recorded: false`, which the event alone cannot rebuild.
+        let response = signals::record(input, now)?;
+        input.conn.execute(
+            "INSERT INTO work_requests(id,method,input,response,sequence) VALUES(?1,?2,?3,?4,json_extract(?4,'$.sequence'))",
+            params![request, method, normalized, response],
+        )?;
+        return Ok(response);
     }
     let id = input.id("id")?;
     let expected = input.integer("expected_revision", None, MAX_INTEGER)?;

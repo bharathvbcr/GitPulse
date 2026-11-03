@@ -158,6 +158,17 @@ impl std::fmt::Display for StoreError {
             StoreError::LeaseHeld { task_id, holder } => {
                 write!(f, "task {task_id} is held by {holder}")
             }
+            // rusqlite renders this variant with the whole SQL it was given, and
+            // for a batch that is every statement after the one that failed:
+            // the schema DDL, comments and all, in a message a person reads.
+            // The statement that failed is the part that says anything.
+            StoreError::Sql(rusqlite::Error::SqlInputError {
+                msg, sql, offset, ..
+            }) => write!(
+                f,
+                "store error: {msg} in `{}`",
+                failing_statement(sql, *offset)
+            ),
             StoreError::Sql(e) => write!(f, "store error: {e}"),
             StoreError::BadTimestamp { value } => {
                 write!(f, "unreadable timestamp in store: {value:?}")
@@ -197,6 +208,39 @@ impl std::fmt::Display for StoreError {
 }
 
 impl std::error::Error for StoreError {}
+
+/// The longest statement excerpt an error message carries.
+const FAILING_STATEMENT_MAX_CHARS: usize = 240;
+
+/// The one statement of `sql` that holds byte `offset` — the bounds are the
+/// `;` on either side — with `--` comments dropped and whitespace collapsed,
+/// cut to [`FAILING_STATEMENT_MAX_CHARS`] with an ellipsis when longer. An
+/// offset SQLite did not give (negative, or past the end) names the first
+/// statement, which is where a batch stops.
+fn failing_statement(sql: &str, offset: std::os::raw::c_int) -> String {
+    let at = usize::try_from(offset).unwrap_or(0).min(sql.len());
+    let at = (0..=at)
+        .rev()
+        .find(|i| sql.is_char_boundary(*i))
+        .unwrap_or(0);
+    let start = sql[..at].rfind(';').map_or(0, |i| i + 1);
+    let end = sql[at..].find(';').map_or(sql.len(), |i| at + i);
+    let statement = sql[start..end]
+        .lines()
+        .map(|line| line.split_once("--").map_or(line, |(code, _)| code))
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if statement.chars().count() <= FAILING_STATEMENT_MAX_CHARS {
+        statement
+    } else {
+        let cut: String = statement
+            .chars()
+            .take(FAILING_STATEMENT_MAX_CHARS)
+            .collect();
+        format!("{cut}…")
+    }
+}
 
 impl From<rusqlite::Error> for StoreError {
     fn from(e: rusqlite::Error) -> Self {
@@ -255,6 +299,8 @@ pub struct Lease {
     pub created_at: String,
     pub expires_at: Option<String>,
     pub released_at: Option<String>,
+    pub worktree_path: Option<String>,
+    pub worktree_id: Option<String>,
 }
 
 /// How [`Store::observe_leases`] judged one active row.
@@ -281,6 +327,8 @@ pub struct AcquireRequest {
     pub ttl_seconds: Option<i64>,
     /// Steal an existing active lease. Reserved for human intervention.
     pub force: bool,
+    pub worktree_path: Option<String>,
+    pub worktree_id: Option<String>,
 }
 
 /// How many times one lazy-expiry read re-reads a lease that changed under it
@@ -659,13 +707,16 @@ impl Store {
             created_at: self.iso(now),
             expires_at: req.ttl_seconds.map(|ttl| self.iso(now.saturating_add(ttl))),
             released_at: None,
+            worktree_path: req.worktree_path.clone(),
+            worktree_id: req.worktree_id.clone(),
         };
 
         let inserted = self.conn.execute(
             "INSERT INTO task_leases
                (id, task_id, owner, agent, client_id, run_id, branch,
-                lease_token, status, created_at, expires_at, released_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL)",
+                lease_token, status, created_at, expires_at, released_at,
+                worktree_path, worktree_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,NULL,?12,?13)",
             params![
                 lease.id,
                 lease.task_id,
@@ -678,6 +729,8 @@ impl Store {
                 lease.status,
                 lease.created_at,
                 lease.expires_at,
+                lease.worktree_path,
+                lease.worktree_id,
             ],
         );
 
@@ -788,7 +841,8 @@ impl Store {
                AND status = 'active'
                AND (expires_at IS NULL OR unixepoch(expires_at) >= ?5)
              RETURNING id, task_id, owner, agent, client_id, run_id, branch,
-                       lease_token, status, created_at, expires_at, released_at",
+                       lease_token, status, created_at, expires_at, released_at,
+                       worktree_path, worktree_id",
                 params![expires, active.id, task_id, token, now],
                 row_to_lease,
             )
@@ -804,7 +858,8 @@ impl Store {
     pub fn observe_leases(&self) -> Result<Vec<(Lease, LeaseState)>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, task_id, owner, agent, client_id, run_id, branch,
-                    lease_token, status, created_at, expires_at, released_at
+                    lease_token, status, created_at, expires_at, released_at,
+                    worktree_path, worktree_id
              FROM task_leases WHERE status = 'active' ORDER BY task_id",
         )?;
         let leases = stmt
@@ -884,7 +939,8 @@ impl Store {
             .conn
             .query_row(
                 "SELECT id, task_id, owner, agent, client_id, run_id, branch,
-                        lease_token, status, created_at, expires_at, released_at
+                        lease_token, status, created_at, expires_at, released_at,
+                        worktree_path, worktree_id
                  FROM task_leases WHERE task_id = ?1 AND status = 'active'",
                 params![task_id],
                 row_to_lease,
@@ -1305,6 +1361,8 @@ fn row_to_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<Lease> {
         created_at: row.get(9)?,
         expires_at: row.get(10)?,
         released_at: row.get(11)?,
+        worktree_path: row.get(12)?,
+        worktree_id: row.get(13)?,
     })
 }
 
@@ -2237,6 +2295,31 @@ mod tests {
             stamped, None,
             "a failed migration still stamped the version"
         );
+    }
+
+    /// A failed batch reports the statement that failed, not the rest of the
+    /// batch: the schema DDL after it once reached the task board verbatim.
+    #[test]
+    fn a_failed_batch_names_only_the_statement_that_failed() {
+        let conn = Connection::open_in_memory().expect("open");
+        let tail = "-- a long explanation nobody asked to read\nCREATE TABLE later (x INTEGER);\n"
+            .repeat(50);
+        let err = conn
+            .execute_batch(&format!(
+                "CREATE TABLE t (a INTEGER);\nCREATE INDEX ix_t ON t (missing);\n{tail}"
+            ))
+            .expect_err("an index over a missing column was accepted");
+        let shown = StoreError::Sql(err).to_string();
+        assert_eq!(
+            shown,
+            "store error: no such column: missing in `CREATE INDEX ix_t ON t (missing)`"
+        );
+
+        let long = format!("SELECT {} FROM nowhere", "x, ".repeat(200));
+        let excerpt = failing_statement(&long, 9_999);
+        assert_eq!(excerpt.chars().count(), FAILING_STATEMENT_MAX_CHARS + 1);
+        assert!(excerpt.ends_with('…'));
+        assert_eq!(failing_statement("SELECT 1; SELECT 2", -1), "SELECT 1");
     }
 
     /// A task id nothing was planned under gets a routable answer rather than a

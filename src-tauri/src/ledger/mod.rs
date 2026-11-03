@@ -34,6 +34,7 @@ mod cap;
 mod consolidated;
 pub mod freshness;
 pub mod ids;
+pub mod lifecycle;
 pub mod redact;
 
 #[cfg(test)]

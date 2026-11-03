@@ -14,7 +14,7 @@
  *       presence no longer agrees.
  *
  * SCOPE: see CONTRACTS below for exactly what is checked — 105 contracts over
- * 259 structs, spanning both wire surfaces: command returns and event payloads.
+ * 260 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -172,7 +172,7 @@ export const CONTRACTS = Object.freeze([
   { label: "git-preflight", rustPath: rust("engine", "git_cli", "preflight.rs"), tsPath: ts("repos", "gitPreflight.ts"), structs: ["GitPreflight"] },
   { label: "insights", rustPath: rust("insights", "mod.rs"), tsPath: ts("insights", "types.ts"), structs: [
     "WorktreeSummary", "AgentKindCount", "AgentSummary", "WorktreeFacet", "ChangesFacet",
-    "LiveSession", "LiveWorktree", "LiveKindStatus", "LiveSessionFacet", "SharedWorktree",
+    "LiveSession", "LiveSessionNode", "LiveWorktree", "LiveKindStatus", "LiveSessionFacet", "SharedWorktree",
     "CollisionParty", "CollisionItem", "CollisionRisk", "InsightsSnapshot",
     "ChangedFile", "ActiveChanges", "ChangeContext", "McpToolInfo", "McpInfo",
   ] },

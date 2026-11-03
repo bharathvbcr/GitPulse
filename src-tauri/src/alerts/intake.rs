@@ -166,6 +166,16 @@ pub(crate) struct OrderBook {
     /// The reports last queued per session, for [`OrderBook::is_twin`]: at most
     /// [`RECENT_PER_SESSION`], oldest first.
     recent: HashMap<String, VecDeque<Reported>>,
+    /// The state each session's last *reported* lifecycle change left it in
+    /// ([`crate::ledger::lifecycle::state_of`]), so only a change is handed to
+    /// the host to record. It is remembered when the report is made, not when
+    /// the host has written the row: a report the host then could not record
+    /// (registry unreadable, session no longer listed, ledger refused) is not
+    /// asked for again while the state stays the same, and the timeline keeps
+    /// showing the earlier state over that span, not "unknown". Bounded by
+    /// [`ORDER_BOOK_CAP`]; a session pushed out costs one repeated row, never
+    /// a missing one.
+    lifecycle: HashMap<String, &'static str>,
 }
 
 /// A report that was queued, and when its hook stamped it.
@@ -273,6 +283,24 @@ impl OrderBook {
         });
     }
 
+    /// Whether a session in `state` is a change from the last state reported
+    /// for it, and if so remembers it. `ended` is remembered like any state:
+    /// the PTY exiting and the hook's `SessionEnd` both report one end, and a
+    /// new run under a reused key is a change from it.
+    pub(crate) fn lifecycle_changed(&mut self, key: &str, state: &'static str) -> bool {
+        if self.lifecycle.get(key) == Some(&state) {
+            return false;
+        }
+        if !self.lifecycle.contains_key(key) && self.lifecycle.len() >= ORDER_BOOK_CAP {
+            let any = self.lifecycle.keys().next().cloned();
+            if let Some(any) = any {
+                self.lifecycle.remove(&any);
+            }
+        }
+        self.lifecycle.insert(key.to_owned(), state);
+        true
+    }
+
     /// Whether a report with `stamp` for `key` is current, and if so records it.
     pub(crate) fn admit(&mut self, key: &str, stamp: u64, ends_session: bool) -> bool {
         if let Some(&ended_at) = self.ended.get(key) {
@@ -301,6 +329,34 @@ impl OrderBook {
         }
         true
     }
+}
+
+/// The lifecycle change a report is, if it is one: a session's first report, or
+/// one that leaves it in a state other than the last reported. A subagent's
+/// report is about the subagent, not the session the person sees, so it moves
+/// nothing here (its work is in the transcript rows, under its own id).
+#[cfg(unix)]
+fn lifecycle_change(
+    book: &mut OrderBook,
+    notice: &Notice,
+) -> Option<crate::ledger::lifecycle::Change> {
+    let event = notice.event?;
+    if notice.subagent {
+        return None;
+    }
+    let state = crate::ledger::lifecycle::state_of(event)?;
+    // `hook-…` names no terminal session: nothing could say which repository
+    // it belongs to, and the host would refuse it.
+    if notice.key.starts_with("hook-") || !book.lifecycle_changed(&notice.key, state) {
+        return None;
+    }
+    Some(crate::ledger::lifecycle::Change {
+        session: notice.key.clone(),
+        event,
+        state,
+        at_ms: crate::ledger::ids::now_millis(),
+        agent: notice.label.clone(),
+    })
 }
 
 /// The sending half of the worker's queue, with the rules above.
@@ -474,7 +530,9 @@ impl Intake {
         let remembered = notice.event.is_some().then(|| notice.clone());
         let ended_key = ends.then(|| notice.key.clone());
         let offer = self.enqueue(notice);
+        let mut change = None;
         if let (Offer::Accepted, Some(notice)) = (offer, remembered) {
+            change = lifecycle_change(&mut book, &notice);
             book.remember(&notice, stamp);
         }
         if let Some(key) = ended_key {
@@ -482,6 +540,12 @@ impl Intake {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .forget(&key);
+        }
+        drop(book);
+        // After every lock, and only for a report the worker will see: what the
+        // host does with a change is its own, and never waited for here.
+        if let (Some(change), Some(host)) = (change, &self.host) {
+            host.lifecycle(change);
         }
         offer
     }

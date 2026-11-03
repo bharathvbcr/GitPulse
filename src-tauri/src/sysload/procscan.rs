@@ -195,6 +195,78 @@ pub(crate) struct SessionRow {
     pub launch: Option<LaunchKey>,
 }
 
+/// A process's parent and start, for every process the sessions-only scan
+/// listed, not only the candidates. A session's ancestor is found by walking
+/// these through the shells and runtimes between it and the agent above it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcLink {
+    pub ppid: i32,
+    /// Microseconds since the Unix epoch; 0 when the OS would not say.
+    pub start_us: u64,
+}
+
+/// What the sessions-only scan read: the classified rows, and the parent link
+/// of every process it listed.
+pub(crate) struct SessionTable {
+    pub rows: Vec<SessionRow>,
+    pub links: HashMap<i32, ProcLink>,
+}
+
+impl From<Vec<SessionRow>> for SessionTable {
+    /// A table whose only known processes are its rows: an ancestor that is
+    /// not itself a candidate is then not walked through.
+    fn from(rows: Vec<SessionRow>) -> Self {
+        let links = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.pid,
+                    ProcLink {
+                        ppid: row.ppid,
+                        start_us: row.start_us,
+                    },
+                )
+            })
+            .collect();
+        Self { rows, links }
+    }
+}
+
+/// The nearest agent session above the process `pid` (parent `ppid`, started
+/// `start_us`), found by walking parents through whatever stands between, or
+/// `None` when no session is above it or the chain cannot be trusted.
+///
+/// The walk stops, with no ancestor, at a parent that is missing from the
+/// table, at a cycle or a chain longer than [`MAX_DEPTH`], and at a parent that
+/// started *after* its child: a pid the kernel handed to a newer process since
+/// the child's real parent exited. `link` reads the table; `is_session` says
+/// whether a pid is one of the sessions being reported, so a wrapper target
+/// (which is not) is walked through to the session it belongs to.
+fn nearest_agent_ancestor(
+    pid: i32,
+    ppid: i32,
+    start_us: u64,
+    link: impl Fn(i32) -> Option<ProcLink>,
+    is_session: impl Fn(i32) -> bool,
+) -> Option<i32> {
+    let (mut child_start, mut at) = (start_us, ppid);
+    for _ in 0..MAX_DEPTH {
+        if at <= 0 || at == pid {
+            return None;
+        }
+        let parent = link(at)?;
+        if parent.start_us != 0 && child_start != 0 && parent.start_us > child_start {
+            return None;
+        }
+        if is_session(at) {
+            return Some(at);
+        }
+        child_start = parent.start_us;
+        at = parent.ppid;
+    }
+    None
+}
+
 /// Arguments that were read, or `None` when the read failed. A readable
 /// argument list that is not an agent is not rescued by the resolved path.
 pub(crate) fn session_row(
@@ -382,6 +454,13 @@ pub struct AgentSession {
     /// The launched tree this session is in, when GitPulse started it.
     pub tree: Option<String>,
     pub run_id: Option<String>,
+    /// The pid of the nearest agent session above this one, found by walking
+    /// parents through any shells and runtimes between them. `None` is "no
+    /// session above it that the scan could see", not "launched by a person":
+    /// a parent that exited, a reused pid and a chain past the walk bound all
+    /// read the same. A direct same-kind parent is a wrapper (this process
+    /// would not be a session), so it is never reported here.
+    pub parent_pid: Option<i32>,
     /// The session's own process plus every descendant still attached.
     pub footprint: Reading<u64>,
     pub members: u32,
@@ -888,6 +967,8 @@ impl Scanner {
 
         let (mut claude, mut codex) = (SessionCount::default(), SessionCount::default());
         let mut sessions = Vec::with_capacity(sessions_at.len().min(MAX_SESSIONS));
+        let session_pids: std::collections::HashSet<i32> =
+            sessions_at.iter().map(|&i| self.facts[i].pid).collect();
         for (n, &i) in sessions_at.iter().enumerate() {
             let f = &self.facts[i];
             let kind = f.ident.kind.unwrap_or(AgentKind::Claude);
@@ -915,6 +996,18 @@ impl Scanner {
                     .map(|p| p.to_string_lossy().into_owned()),
                 run_id: f.ident.launch.as_ref().and_then(|k| k.run_id.clone()),
                 tree,
+                parent_pid: nearest_agent_ancestor(
+                    f.pid,
+                    f.ppid,
+                    f.start_us,
+                    |pid| {
+                        self.index.get(&pid).map(|&at| ProcLink {
+                            ppid: self.facts[at].ppid,
+                            start_us: self.facts[at].start_us,
+                        })
+                    },
+                    |pid| session_pids.contains(&pid),
+                ),
                 footprint: sum.reading(),
                 members: sum.readable + sum.unreadable,
                 unreadable_members: sum.unreadable,
@@ -1239,9 +1332,10 @@ pub(crate) const SCAN_SUPPORTED: bool = os::SUPPORTED;
 /// a scan that could not finish. Working directories are read only for the
 /// sessions that remain.
 fn assemble_sessions(
-    rows: Vec<SessionRow>,
+    table: SessionTable,
     mut cwd_of: impl FnMut(i32) -> Option<PathBuf>,
 ) -> Result<Vec<AgentSession>, String> {
+    let SessionTable { rows, links } = table;
     let by_pid: HashMap<i32, AgentKind> = rows.iter().map(|row| (row.pid, row.kind)).collect();
     let kept: Vec<&SessionRow> = rows
         .iter()
@@ -1252,6 +1346,7 @@ fn assemble_sessions(
             "more than {MAX_SESSIONS} agent sessions are running; the scan does not describe them all"
         ));
     }
+    let session_pids: std::collections::HashSet<i32> = kept.iter().map(|row| row.pid).collect();
     Ok(kept
         .into_iter()
         .map(|row| AgentSession {
@@ -1261,6 +1356,13 @@ fn assemble_sessions(
             cwd: cwd_of(row.pid).map(|path| path.to_string_lossy().into_owned()),
             tree: row.launch.as_ref().and_then(LaunchKey::tree),
             run_id: row.launch.as_ref().and_then(|key| key.run_id.clone()),
+            parent_pid: nearest_agent_ancestor(
+                row.pid,
+                row.ppid,
+                row.start_us,
+                |pid| links.get(&pid).copied(),
+                |pid| session_pids.contains(&pid),
+            ),
             // This path does not read footprints. Unavailable is the
             // not-measured signal; zero would say the session uses no memory.
             footprint: Reading::Unavailable(Why::Unsupported),
@@ -1272,7 +1374,7 @@ fn assemble_sessions(
 
 /// A failed table read stays an error. An empty `Ok` would mean no sessions.
 pub(crate) fn sessions_from_read(
-    read: Result<Vec<SessionRow>, String>,
+    read: Result<SessionTable, String>,
     cwd_of: impl FnMut(i32) -> Option<PathBuf>,
 ) -> Result<Vec<AgentSession>, String> {
     assemble_sessions(read?, cwd_of)
@@ -2035,12 +2137,13 @@ mod os {
 
     /// Classified agent processes only. `Err` when the pid list itself could
     /// not be read — never an empty list standing in for that failure.
-    pub(super) fn read_session_rows() -> Result<Vec<super::SessionRow>, String> {
+    pub(super) fn read_session_rows() -> Result<super::SessionTable, String> {
         let mut pids = Vec::new();
         list_pids(&mut pids)?;
         let me = uid();
         let mut args_buf = vec![0u8; argmax()];
         let mut rows = Vec::new();
+        let mut links = std::collections::HashMap::with_capacity(pids.len());
         for pid in pids {
             if pid <= 0 {
                 continue;
@@ -2048,6 +2151,15 @@ mod os {
             let Some(info) = basic(pid) else {
                 continue;
             };
+            // Every process, whoever owns it: a session's ancestor chain runs
+            // through shells and runtimes that are not candidates.
+            links.insert(
+                pid,
+                super::ProcLink {
+                    ppid: info.ppid,
+                    start_us: info.start_us,
+                },
+            );
             if info.zombie || info.uid != me {
                 continue;
             }
@@ -2061,7 +2173,7 @@ mod os {
                 rows.push(row);
             }
         }
-        Ok(rows)
+        Ok(super::SessionTable { rows, links })
     }
 }
 
@@ -2402,13 +2514,14 @@ mod os {
 
     /// Classified agent processes only. `Err` when the pid list itself could
     /// not be read — never an empty list standing in for that failure.
-    pub(super) fn read_session_rows() -> Result<Vec<super::SessionRow>, String> {
+    pub(super) fn read_session_rows() -> Result<super::SessionTable, String> {
         let mut pids = Vec::new();
         list_pids(&mut pids)?;
         let me = uid();
         let ticks = clock_ticks();
         let boot = boot_us();
         let mut rows = Vec::new();
+        let mut links = std::collections::HashMap::with_capacity(pids.len());
         for pid in pids {
             if pid <= 0 {
                 continue;
@@ -2416,6 +2529,16 @@ mod os {
             let Some(info) = stat(pid) else {
                 continue;
             };
+            let start_us = boot.saturating_add(info.start_ticks.saturating_mul(1_000_000) / ticks);
+            // Every process, whoever owns it: a session's ancestor chain runs
+            // through shells and runtimes that are not candidates.
+            links.insert(
+                pid,
+                super::ProcLink {
+                    ppid: info.ppid,
+                    start_us,
+                },
+            );
             if info.zombie {
                 continue;
             }
@@ -2425,7 +2548,6 @@ mod os {
             if owner_uid != me {
                 continue;
             }
-            let start_us = boot.saturating_add(info.start_ticks.saturating_mul(1_000_000) / ticks);
             let Some(probe) = super::session_probe(&info.name, || exe_path(pid)) else {
                 continue;
             };
@@ -2436,7 +2558,7 @@ mod os {
                 rows.push(row);
             }
         }
-        Ok(rows)
+        Ok(super::SessionTable { rows, links })
     }
 }
 
@@ -2490,7 +2612,7 @@ mod os {
         }
     }
 
-    pub(super) fn read_session_rows() -> Result<Vec<super::SessionRow>, String> {
+    pub(super) fn read_session_rows() -> Result<super::SessionTable, String> {
         Err("this platform has no process scan".into())
     }
 }
@@ -2947,7 +3069,7 @@ pub(crate) mod tests {
                 launch: LaunchKey::from_env(["GITPULSE_RUN_ID=run-3"]),
             },
         ];
-        let sessions = sessions_from_read(Ok(rows), |pid| {
+        let sessions = sessions_from_read(Ok(rows.into()), |pid| {
             (pid == 10).then(|| std::path::PathBuf::from("/repo"))
         })
         .unwrap();
@@ -2981,7 +3103,7 @@ pub(crate) mod tests {
     #[test]
     fn more_sessions_than_the_scan_will_describe_is_an_error() {
         // Parents are not candidates, so none of these is a wrapper target.
-        let rows = (1..=i32::try_from(MAX_SESSIONS).unwrap() + 1)
+        let rows: Vec<SessionRow> = (1..=i32::try_from(MAX_SESSIONS).unwrap() + 1)
             .map(|pid| SessionRow {
                 pid,
                 ppid: 0,
@@ -2990,15 +3112,188 @@ pub(crate) mod tests {
                 launch: None,
             })
             .collect();
-        let err = sessions_from_read(Ok(rows), |_| None).unwrap_err();
+        let err = sessions_from_read(Ok(rows.into()), |_| None).unwrap_err();
         assert!(err.contains("more than"), "{err}");
+    }
+
+    fn agent_row(pid: i32, ppid: i32, start_us: u64, kind: AgentKind) -> SessionRow {
+        SessionRow {
+            pid,
+            ppid,
+            start_us,
+            kind,
+            launch: None,
+        }
+    }
+
+    /// A table with the rows and the non-candidate processes between them,
+    /// as `(pid, ppid, start_us)`.
+    fn table_with(rows: Vec<SessionRow>, others: &[(i32, i32, u64)]) -> SessionTable {
+        let mut table = SessionTable::from(rows);
+        for &(pid, ppid, start_us) in others {
+            table.links.insert(pid, ProcLink { ppid, start_us });
+        }
+        table
+    }
+
+    fn parents_of(table: SessionTable) -> Vec<(i32, Option<i32>)> {
+        sessions_from_read(Ok(table), |_| None)
+            .unwrap()
+            .iter()
+            .map(|session| (session.pid, session.parent_pid))
+            .collect()
+    }
+
+    /// The lineage a flat session list throws away: a Claude started by a tool
+    /// call of another Claude sits under a shell, and the shell is not an
+    /// agent, so the parent is found by walking through it.
+    #[test]
+    fn a_session_started_under_a_shell_names_the_session_above_it() {
+        let table = table_with(
+            vec![
+                agent_row(80, 1, 100, AgentKind::Claude),
+                agent_row(100, 90, 300, AgentKind::Claude),
+            ],
+            &[(1, 0, 1), (90, 85, 200), (85, 80, 150)],
+        );
+        assert_eq!(parents_of(table), [(80, None), (100, Some(80))]);
+    }
+
+    /// A direct same-kind child is a wrapper target and still not a second
+    /// session; sessions below it belong to the session it wraps.
+    #[test]
+    fn a_wrapper_target_is_walked_through_and_never_reported_as_a_parent() {
+        let table = table_with(
+            vec![
+                agent_row(10, 1, 100, AgentKind::Codex),
+                agent_row(11, 10, 110, AgentKind::Codex),
+                agent_row(13, 12, 130, AgentKind::Claude),
+            ],
+            &[(12, 11, 120)],
+        );
+        assert_eq!(parents_of(table), [(10, None), (13, Some(10))]);
+    }
+
+    /// A different kind directly under an agent is a session of its own, and
+    /// its parent is that agent.
+    #[test]
+    fn a_different_kind_directly_under_an_agent_is_a_child_session() {
+        let table = table_with(
+            vec![
+                agent_row(10, 1, 100, AgentKind::Claude),
+                agent_row(11, 10, 110, AgentKind::Codex),
+            ],
+            &[],
+        );
+        assert_eq!(parents_of(table), [(10, None), (11, Some(10))]);
+    }
+
+    /// A pid the kernel gave to a newer process is not the child's parent: the
+    /// real one exited and the child was reparented. Reading the stranger as
+    /// the parent would attach this session to someone else's tree.
+    #[test]
+    fn a_parent_that_started_after_its_child_is_a_reused_pid() {
+        let table = table_with(
+            vec![
+                agent_row(80, 1, 900, AgentKind::Claude),
+                agent_row(100, 90, 300, AgentKind::Claude),
+            ],
+            &[(90, 80, 200)],
+        );
+        // 90 is older than 100 and its own parent 80 started at 900, after 90.
+        assert_eq!(parents_of(table), [(80, None), (100, None)]);
+        let direct = table_with(
+            vec![
+                agent_row(80, 1, 900, AgentKind::Codex),
+                agent_row(100, 80, 300, AgentKind::Claude),
+            ],
+            &[],
+        );
+        assert_eq!(parents_of(direct), [(80, None), (100, None)]);
+    }
+
+    /// An unread start time proves nothing either way, so the link stands.
+    #[test]
+    fn an_unread_start_time_does_not_cut_the_chain() {
+        let table = table_with(
+            vec![
+                agent_row(80, 1, 0, AgentKind::Claude),
+                agent_row(100, 90, 300, AgentKind::Claude),
+            ],
+            &[(90, 80, 0)],
+        );
+        assert_eq!(parents_of(table), [(80, None), (100, Some(80))]);
+    }
+
+    /// Missing parents, launchd and a parent cycle that never reaches a
+    /// session all end the walk with no ancestor, in bounded time.
+    #[test]
+    fn a_missing_parent_or_a_cycle_ends_the_walk_with_no_ancestor() {
+        let table = table_with(
+            vec![
+                agent_row(100, 999, 300, AgentKind::Claude),
+                agent_row(101, 1, 300, AgentKind::Claude),
+                agent_row(102, 50, 300, AgentKind::Claude),
+                agent_row(103, 52, 300, AgentKind::Claude),
+            ],
+            &[(1, 0, 1), (50, 51, 100), (51, 50, 100), (52, 52, 100)],
+        );
+        assert_eq!(
+            parents_of(table),
+            [(100, None), (101, None), (102, None), (103, None)]
+        );
+    }
+
+    /// The sampler's scan reads the same lineage from its own table.
+    #[test]
+    fn the_sampler_scan_names_a_sessions_agent_ancestor_too() {
+        let (mut scan, _) = scanner(vec![
+            P {
+                start_us: 100,
+                ..p(20, 1, CLAUDE)
+            },
+            P {
+                start_us: 200,
+                ..p(21, 20, "/bin/zsh")
+            },
+            P {
+                start_us: 300,
+                ..p(22, 21, CLAUDE)
+            },
+            // The wrapper target of 22 is not a session, so not a parent.
+            P {
+                start_us: 310,
+                ..p(23, 22, CLAUDE)
+            },
+            P {
+                start_us: 400,
+                ..p(24, 23, "/bin/sh")
+            },
+            P {
+                start_us: 500,
+                ..p(25, 24, CLAUDE)
+            },
+        ]);
+        let view = scan.scan(&ctx(5_000));
+        let parents: Vec<(i32, Option<i32>)> = view
+            .sessions
+            .iter()
+            .map(|session| (session.pid, session.parent_pid))
+            .collect();
+        assert_eq!(
+            parents,
+            [(20, None), (22, Some(20)), (25, Some(22))],
+            "{view:?}"
+        );
     }
 
     #[test]
     fn unreadable_arguments_still_count_a_resolved_agent_without_a_tree() {
         let row = session_row(7, 1, 4, SessionProbe::ArgsOf(CLAUDE.into()), None, || None).unwrap();
-        let sessions =
-            sessions_from_read(Ok(vec![row]), |_| Some(std::path::PathBuf::from("/r"))).unwrap();
+        let sessions = sessions_from_read(Ok(vec![row].into()), |_| {
+            Some(std::path::PathBuf::from("/r"))
+        })
+        .unwrap();
         assert_eq!(sessions.len(), 1);
         assert!(sessions[0].tree.is_none());
         assert_eq!(sessions[0].kind, AgentKind::Claude);

@@ -24,6 +24,7 @@
   import { runTimelineRows } from "../src/lib/github/runLifecycle.ts";
   import { TIMELINE_PREVIEW_COUNT } from "../src/lib/delivery/timeline.ts";
   import { createChecks } from "./checks.ts";
+  import { outcomeFor } from "../src/lib/github/runOutcomeFixtures.ts";
   const params = new URLSearchParams(location.search);
   const { results, check, stopped } = createChecks();
   const errors = [];
@@ -34,14 +35,19 @@
   const T0 = Date.parse("2026-09-17T08:00:00Z");
   const iso = ms => new Date(ms).toISOString();
 
-  const run = (over = {}) => ({
-    id: 1, name: "CI", title: "Fix the thing",
-    status: "completed", conclusion: "success",
-    head_branch: "main", url: "https://example.invalid/run/1",
-    created_at: iso(T0 - 600_000),
-    started_at: iso(T0), updated_at: iso(T0 + 60_000),
-    head_sha: SHA, event: "push", ...over,
-  });
+  // `outcome` is what Rust's classifier would have made of the words given
+  // (`github/outcome.rs`, through its shared cases), unless a check names one.
+  const run = (over = {}) => {
+    const base = {
+      id: 1, name: "CI", title: "Fix the thing",
+      status: "completed", conclusion: "success",
+      head_branch: "main", url: "https://example.invalid/run/1",
+      created_at: iso(T0 - 600_000),
+      started_at: iso(T0), updated_at: iso(T0 + 60_000),
+      head_sha: SHA, event: "push", ...over,
+    };
+    return { outcome: outcomeFor(base.status, base.conclusion), ...base };
+  };
 
   // No Tauri seam is needed: this component takes rows as props. The only
   // reason to stub it at all is the external-link click path.

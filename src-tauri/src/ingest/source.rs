@@ -57,6 +57,25 @@ impl Parsed {
 /// Reads the lines of one transcript file, in order.
 pub(super) trait RecordParser {
     fn parse(&mut self, line: &str) -> Parsed;
+
+    /// The byte offset and content digest of the line [`RecordParser::parse`]
+    /// is about to be given. A parser that writes a call on a later line than
+    /// the one that holds it needs them to name the line it came from.
+    fn locate(&mut self, _offset: u64, _digest: u64) {}
+
+    /// The earliest line a call the parser is still holding came from. The pass
+    /// leaves its cursor there, so the call is read again, with its result, by
+    /// the next pass if this one ends first. `None` holds nothing.
+    fn held_from(&self) -> Option<u64> {
+        None
+    }
+
+    /// The file has been read to its end. With `give_up`, nothing more is
+    /// expected for what is held (the file has been still for long enough), so
+    /// it is written as it stands; without, it stays held.
+    fn finish(&mut self, _give_up: bool) -> Parsed {
+        Parsed::nothing()
+    }
 }
 
 /// One agent's transcripts.
@@ -114,14 +133,29 @@ pub(super) const RESUME_PASS_BYTES: u64 = 256 << 20;
 /// Claude Code: `~/.claude/projects/**/*.jsonl`.
 pub(super) struct ClaudeSource;
 
-struct ClaudeParser;
+struct ClaudeParser(transcript::Reader);
 
 impl RecordParser for ClaudeParser {
     fn parse(&mut self, line: &str) -> Parsed {
-        match transcript::parse_record(line) {
+        match self.0.read(line) {
             LineOutcome::NoCalls => Parsed::nothing(),
             LineOutcome::Unreadable => Parsed::skipped(),
             LineOutcome::Calls(calls) => Parsed { calls, skipped: 0 },
+        }
+    }
+
+    fn locate(&mut self, offset: u64, digest: u64) {
+        self.0.locate(offset, digest);
+    }
+
+    fn held_from(&self) -> Option<u64> {
+        self.0.held_from()
+    }
+
+    fn finish(&mut self, give_up: bool) -> Parsed {
+        Parsed {
+            calls: self.0.finish(give_up),
+            skipped: 0,
         }
     }
 }
@@ -164,8 +198,8 @@ impl TranscriptSource for ClaudeSource {
         false
     }
 
-    fn open(&self, _path: &Path, _start: u64, _budget: &mut u64) -> Option<Box<dyn RecordParser>> {
-        Some(Box::new(ClaudeParser))
+    fn open(&self, path: &Path, _start: u64, _budget: &mut u64) -> Option<Box<dyn RecordParser>> {
+        Some(Box::new(ClaudeParser(transcript::Reader::for_path(path))))
     }
 }
 

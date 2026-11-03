@@ -19,6 +19,11 @@ pub const OP_LOCAL_SCAN: &str = "local.scan";
 pub const OP_CHAT_PREPARE: &str = "chat.prepare";
 pub const OP_CHAT_SETTLE: &str = "chat.settle";
 pub const OP_CHAT_FORGET: &str = "chat.forget";
+/// The hosted server's own account of itself and its jobs. Answered to a
+/// connection that does not control the server.
+pub const OP_SERVE_STATUS: &str = "serve.status";
+/// Ends every run a hosted server holds, waiting a bounded time (`wait_ms`).
+pub const OP_SERVE_STOP_ALL: &str = "serve.stop_all";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Request {

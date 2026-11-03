@@ -31,13 +31,13 @@ flowchart TB
     subgraph IPC["Tauri 2 IPC Seam (snake_case ↔ camelCase)"]
         direction TB
         Invoke["<code>invoke('cmd_*', args)</code>"]
-        ContractCheck["291 Handlers Enforced by <code>check:ipc</code>"]
+        ContractCheck["292 Handlers Enforced by <code>check:ipc</code>"]
         Invoke -.-> ContractCheck
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
         direction TB
-        CmdRegistry["Command Registry (291 Handlers)<br/><code>src-tauri/src/commands/</code>"]
+        CmdRegistry["Command Registry (292 Handlers)<br/><code>src-tauri/src/commands/</code>"]
         
         subgraph Subsystems["Core Subsystems & In-Process Modules"]
             GitEngine["Git Engine & Sandbox<br/><code>src-tauri/src/engine/</code>"]
@@ -202,7 +202,7 @@ On the backend, a DevMap live refresh never holds its IPC command on the `devmap
 ```mermaid
 classDiagram
     class CommandRegistry {
-        +291 Registered Handlers
+        +292 Registered Handlers
         +Checked by scripts/check-ipc-contract.mjs
     }
     class GitEngine {
@@ -347,9 +347,10 @@ for contracts, regression evidence and platform verification limits.
 - **`workspace_registry`**: Registers open tabs into DevMap's workspace for cross-repo `::` search.
 - **`harness/`**: Sidecar client managing policy gates and local model communication via NDJSON stdio.
 - **`hooks/`**: Agent hook bridge, signal guard, and notification intake (`gitpulse-hook`). The signal guard models Linux process inspection tools (`procps pkill`/`pgrep`, `psmisc killall`, `sysvinit pidof`) natively on Linux, matching names on `comm` or `argv[0]` basename, reading UIDs from `/proc/<pid>/status` with `kill(2)` permission rules, and escalating unmodelled options to confirmation prompts. The notification client records timed drop records in `<socket>.drops` upon reply deadline expiration, rotated to `.prev` at 32 KiB, tightened to `0600` best-effort, and expired after 7 days using `.prev`'s `ctime`.
+- **`agent_mailbox`**: The per-session filesystem mailbox behind **Send to agent** (`<config dir>/agent-mailbox/<claude session uuid>/`): atomic temp+rename publish, one-use claim by atomic rename, bounded size/count/waiters, TTL cleanup, owner and mode and `O_NOFOLLOW` checks. The `gitpulse-hook deliver` subcommand (a second `Stop` entry with `asyncRewake`) waits on it for a GitPulse-launched session and wakes the idle agent with one claimed message; `workbench/send_to_agent.rs` decides the route (mailbox, resume, managed follow-up through Manvi's `work.runs.managed.continue`, or unavailable) and sends only on a confirm of the route that was previewed. See [SECURITY.md](SECURITY.md).
 - **`procguard/`**: Child process supervision and Darwin QoS scheduling. On macOS, background-class processes enter Darwin's background band (`PRIO_DARWIN_PROCESS`) in the child process *before* `exec` via a `pre_exec` hook (`procguard::spawn_background`, `ft-b597add5`), ensuring all subsequent forks and execs permanently inherit background scheduling. Spawns fail explicitly with tagged errnos if the band cannot be entered.
 - **`terminal/`**: Native PTY lifecycle manager (`portable-pty`) with preserved diagnostics and exit status. Each reader has a 512 KiB output window, released by renderer acknowledgements. Writes lock their own session; Close waits for reaping and capacity release. The frontend lifecycle controller prepares event listeners before spawn, serializes restart and input, and retains failed-close ownership in the global session registry. Under the `gitpulse-ptyd` host backend, session existence checks (`Host::knows`) evaluate directly from the client-side vouched snapshot, eliminating IPC round-trips to the host daemon. Authority survives spawns, quits, and wrapped exit records mid-adoption, while newly opened connections revoke previous authority. Session exits are recorded strictly once (`record_exit`), and adoption skips already-reported exits while reading `vouched.late` after proxy scans. Input write timeouts measure idle stalls rather than cumulative totals. Expanding the terminal dock hides and inerts the underlying view to prevent focus leaks. The frontend renderer caches up to 2 hidden WebGL contexts for 5 seconds to eliminate tab-switching lag, recovers from WebGL context loss under a 3-strike budget, wraps output chunks to guarantee termination outside open DEC 2026 synchronized blocks, supports Unicode 11 double-cell glyphs, and defers fitting on hidden panes (`fitSchedule.ts`). See [Terminal](TERMINAL.md), [Terminal Host](TERMINAL_HOST.md), and the [archived terminal audit](https://github.com/bharathvbcr/GitPulse/blob/16483b7de2b5c74003c7e7af046f7142ece7699b/docs/archive/TERMINAL_AUDIT.md).
-- **`workbench/`**: Task workbench bridge and verification runner. The background verification driver (`workbench-verification`) batches claimed card status queries into a single `latest_many` walk, queries `LIMIT 1` for `work.verify.task` rows, and reuses decision records for parked card notes, reducing background CPU overhead.
+- **`workbench/`**: Task workbench bridge and verification runner. The background verification driver (`workbench-verification`) batches claimed card status queries into a single `latest_many` walk, queries `LIMIT 1` for `work.verify.task` rows, and reuses decision records for parked card notes, reducing background CPU overhead. A second driver, `ci_watch` (`workbench-ci-watch`), carries CI results on an agent's `gitpulse/<task>-<id>` branch to its task: it polls `github::load_workflow_runs_report` only for repositories with a live or just-finished attempt branch, in a bounded budget and only for trusted repositories, and reports each finish to the store with the host-only `signals.record`. What counts as a finish is decided once, in `github/outcome.rs` (`RunOutcome`, the transition detector and one baseline per repository), which the Remote panel's "went red" banner reads too (from its own per-repository cursor over a bounded log of red finishes, so the watcher crossing in-flight to failed first never costs the panel its banner, and the panel's first look announces nothing); a finished run is attributed to an attempt only by the attempt branch GitHub reports it ran on, never by the commit the attempt started from, which is the base branch's own CI; `action_required` is `needs_person`, attention-worthy but never a failure. The notice reaches the OS through the existing notification coordinator; `ci_watch` has no delivery code.
 - **`grants/`**: Policy grant model, scoped overrides, and override lifecycle for elevated paths.
 - **`ingest/`**: Attribution sources beyond live commands (reflog and transcript replay) that feed durable provenance and audit history. Transcripts are read through a `TranscriptSource` per agent: Claude Code (`~/.claude/projects`, `GITPULSE_TRANSCRIPT_ROOT`, rows with `actor_id` `claude-code`) and Codex (`$CODEX_HOME/sessions`, default `~/.codex/sessions`, `GITPULSE_CODEX_TRANSCRIPT_ROOT` overriding, `actor_id` `codex`; structured tool calls, plus the straight-line literal calls of code-mode `exec` programs read with tree-sitter-javascript under size, time and node bounds; every other code-mode call is counted in `skipped_lines`). Each source is walked under its own depth and file caps; `walk_complete` is true only when every walked source was whole, and a transcript's saved offset is forgotten only after such a walk. A Codex line this build cannot read is counted in `skipped_lines`, never guessed at. Other agents' transcripts are not read.
 - **`ledger/`**: WAL-backed action store with redaction, cursors, and bounded replay for history projection.
@@ -443,8 +444,8 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 
 | Contract Tool | Command | Description |
 | --- | --- | --- |
-| **IPC Checker** | `bun run check:ipc` | Verifies all 291 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
-| **Type Sync Checker** | `bun run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 1860 data fields, over 259 structs, in 105 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
+| **IPC Checker** | `bun run check:ipc` | Verifies all 292 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
+| **Type Sync Checker** | `bun run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 1873 data fields, over 260 structs, in 105 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
 | **Release Version Gate** | `bun run check:release` | Validates that `package.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, and every discovered plugin manifest agree. Plugin manifests are found under `plugins/<name>/` rather than hardcoded, because one package ships a manifest per agent client and the newest one is the likeliest to be missed. |
 | **MCP Install Doctor** | `bun run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH — the binary the plugin manifests spawn — and asserts both its version and its manifest's store schema match this tree, then asks what source both binaries were built from against the digest `mcp:install` recorded. Version is the release identity and cannot see a fix that landed between releases; the digest can. Missing schema identity is unresponsive, never a pass, and an unrecorded install is *unverifiable*, never an OK. Reports *absent*, *unresponsive*, *stale*, and *unverifiable* as distinct failures. |
 
@@ -727,10 +728,20 @@ pages `items.list` one open column at a time (bounded at 2,000 open cards, with
 `scan_complete` reporting whether that was all of them) and treats a card as
 related when it shares two significant title words, or one and a label that is
 not that same word. Any related card not named in `reviewed_related` refuses the
-add as `related_tasks_exist`. `place` accepts a board item id as the key under
+add as `related_tasks_exist`, except the card the call names as its
+`parent_task_id`: a subtask shares its parent's words by construction, so the
+parent is read by being named and is exempt from that match. `place` accepts a board item id as the key under
 `replace`, so related work can be folded into a card the person made on the
 board; `keep_unsent` keeps every field the call did not send, so a fold-in never
 resets the person's status, priority, owner, criteria or logs.
+`workbench/lineage.rs` answers `items.lineage`: for a bounded batch of card ids
+(at most 256, refused rather than cut), one read-only query over the store's
+`parent` links returns each live card's live parent and how many of its live
+subtasks are `done`. The card list omits `links`, so this is how the board
+(`lineage.ts`, drawn by `TaskBoard.svelte`) shows "Subtask of ..." and "N of M
+subtasks done". A card the store does not hold is left out of the answer and a
+failed read throws; the board shows both as unknown and says so, never as
+"0 of 0".
 Real Git tests cover linked worktrees, distinct clones, malformed/bare/unavailable
 checkouts, unborn/broken HEAD, changed sources, and branch changes at the same
 commit. Observations do not lock external Git writers or identify an otherwise

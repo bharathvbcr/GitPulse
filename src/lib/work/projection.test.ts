@@ -3,6 +3,7 @@ import {
   ALL_STATUSES,
   latestRuns,
   rowNeedsAttention,
+  runNeedsAttention,
   degradedSummary,
   emptyTally,
   insightSummary,
@@ -109,6 +110,7 @@ function run(id: number, head_branch: string): WorkflowRunInfo {
     title: "CI",
     status: "completed",
     conclusion: "success",
+    outcome: "passed",
     head_branch,
     url: `https://example.test/run/${id}`,
     created_at: "",
@@ -235,6 +237,20 @@ describe("projectWork joins", () => {
     expect(
       p.rows.find((r) => r.taskId === UNBOUND_ROW_ID)!.pullRequests.map((x) => x.number),
     ).toEqual([9]);
+  });
+
+  it("does not count a run's token and lifecycle rows as recent events", () => {
+    const p = projectWork(
+      inputs({
+        leases: [lease("TASK-1")],
+        events: [
+          event({ id: 1, task_id: "TASK-1", action: "session.edit" }),
+          event({ id: 2, task_id: "TASK-1", action: "session.usage" }),
+          event({ id: 3, task_id: "TASK-1", action: "session.state" }),
+        ],
+      }),
+    );
+    expect(p.rows.find((r) => r.taskId === "TASK-1")!.verdicts.events).toBe(1);
   });
 
   it("attributes verdicts and grants by what was recorded, never inferred", () => {
@@ -701,7 +717,7 @@ describe("Overview adversarial joins", () => {
 
 it("keeps the latest observed workflow state regardless of response order", () => {
   const passed = { ...run(3, "a"), created_at: "2026-09-07T12:00:00Z" };
-  const failed = { ...run(2, "a"), created_at: "2026-09-06T12:00:00Z", conclusion: "failure" };
+  const failed = { ...run(2, "a"), created_at: "2026-09-06T12:00:00Z", conclusion: "failure", outcome: "failed" as const };
   for (const runs of [[failed, passed], [passed, failed], [failed, passed, passed]]) {
     const p = projectWork(inputs({ worktrees: [worktree("/a", "a")], operations: { "/a": null }, runs }));
     expect(latestRuns(p.rows[0])).toEqual([passed]);
@@ -714,9 +730,28 @@ it("attention includes failed CI, requested changes and unmeasured operations", 
   for (const extra of [
     { pullRequests: [{ ...pr(1, "a"), ci_status: "failure" }] },
     { pullRequests: [{ ...pr(1, "a"), review_decision: "CHANGES_REQUESTED" }] },
-    { runs: [{ ...run(2, "a"), conclusion: "timed_out" }] },
+    { runs: [{ ...run(2, "a"), conclusion: "timed_out", outcome: "failed" as const }] },
     { operations: {} },
   ]) expect(rowNeedsAttention(projectWork(inputs({ ...base, ...extra })).rows[0])).toBe(true);
+});
+
+/**
+ * One rule for what a run's outcome asks of a person, held where Rust decides
+ * the outcome (`github/outcome.rs`): a run held for approval wants someone but
+ * is not a failure; a cancelled or unclassifiable one wants no one.
+ */
+it("reads a run's attention from its outcome, not from its words", () => {
+  const base = { worktrees: [worktree("/a", "a")], operations: { "/a": null } };
+  const attention = (outcome: WorkflowRunInfo["outcome"], conclusion = "success") =>
+    rowNeedsAttention(projectWork(inputs({ ...base, runs: [{ ...run(2, "a"), conclusion, outcome }] })).rows[0]);
+  expect(attention("failed", "failure")).toBe(true);
+  expect(attention("needs_person", "action_required")).toBe(true);
+  for (const outcome of ["passed", "cancelled", "in_flight", "unknown"] as const) {
+    expect(attention(outcome, "failure"), `${outcome} must not be read from a failing conclusion`).toBe(false);
+  }
+  expect(runNeedsAttention({ outcome: "failed" })).toBe(true);
+  expect(runNeedsAttention({ outcome: "needs_person" })).toBe(true);
+  expect(runNeedsAttention({ outcome: "cancelled" })).toBe(false);
 });
 
 it("does not require a working-tree scan for bare repositories", () => {

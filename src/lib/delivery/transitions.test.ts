@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import type { MonitorPhase } from "./phase";
 import {
   anyInFlight,
-  failuresSince,
   settledSince,
   successesSince,
   verdictRate,
@@ -18,20 +17,19 @@ describe("the baseline observation announces nothing", () => {
     // Mounting the panel must not announce every failure already in the
     // window as though it had just happened.
     expect(settledSince([], [row("1", "settled_bad"), row("2", "settled_ok")])).toEqual([]);
-    expect(failuresSince([], [row("1", "settled_bad")])).toEqual([]);
   });
 
   it("reports no transition for a row appearing already settled", () => {
     // It was never observed moving, so its outcome is history, not news.
     const previous = [row("1", "settled_ok")];
     const next = [row("2", "settled_bad"), row("1", "settled_ok")];
-    expect(failuresSince(previous, next)).toEqual([]);
+    expect(settledSince(previous, next)).toEqual([]);
   });
 });
 
 describe("what counts as a transition", () => {
   it("detects in-flight becoming a failure", () => {
-    const transitions = failuresSince([row("1", "in_flight")], [row("1", "settled_bad")]);
+    const transitions = settledSince([row("1", "in_flight")], [row("1", "settled_bad")]);
     expect(transitions).toHaveLength(1);
     expect(transitions[0]).toMatchObject({ from: "in_flight", to: "settled_bad" });
     expect(transitions[0].row.id).toBe("1");
@@ -49,7 +47,6 @@ describe("what counts as a transition", () => {
     const previous = [row("1", "in_flight")];
     const next = [row("1", "unknown")];
     expect(settledSince(previous, next)).toHaveLength(1);
-    expect(failuresSince(previous, next)).toEqual([]);
     expect(successesSince(previous, next)).toEqual([]);
   });
 
@@ -58,7 +55,7 @@ describe("what counts as a transition", () => {
     // "already announced" set unnecessary — and that set is the thing that
     // would grow for the lifetime of the window.
     const settled = [row("1", "settled_bad")];
-    expect(failuresSince(settled, settled)).toEqual([]);
+    expect(settledSince(settled, settled)).toEqual([]);
   });
 
   it("reports nothing for a row that vanished from the listing", () => {
@@ -80,7 +77,7 @@ describe("what counts as a transition", () => {
     const next = [row("1", "settled_bad")];
     // First-wins on the previous snapshot: the listings are newest-first, so
     // the earlier row is the newer one and is what we compare against.
-    expect(failuresSince(previous, next)).toHaveLength(1);
+    expect(settledSince(previous, next)).toHaveLength(1);
   });
 
   it("never reports a transition into in-flight", () => {

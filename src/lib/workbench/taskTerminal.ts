@@ -44,6 +44,7 @@ import { explainError, findConversation, launchManagedRun, WorkbenchError, type 
 import { resolveGitRoot } from "../desktop/nativeShell";
 import { identityKey, isCaseInsensitiveFs, normalizeRepoPath } from "../repos/paths";
 import { relativeStartDir } from "../terminal/tabs";
+import { agentPromptArgs } from "../terminal/launchRequests";
 import { formatError } from "../ui/formatError";
 import { PROVIDER_LABELS } from "./vocabulary";
 import { defaultHandoff, type HandoffSettings } from "./taskHandoff";
@@ -328,10 +329,28 @@ export type ResumeDisposition = "background" | "show";
 export async function resumeTaskConversation(
   run: Pick<TaskRun, "id" | "task_title">,
   disposition: ResumeDisposition = "background",
+  /**
+   * A first message for the resumed conversation: `claude --resume <id> -- <text>`
+   * (`resumeArgs`). Only ever a person's confirmed text (`SendToAgent`). Held to
+   * the launcher's own rules up front, and refused rather than dropped when the
+   * conversation it would join is already running or already waiting to open —
+   * a message that is not sent must not be reported as sent.
+   */
+  prompt?: string,
 ): Promise<{ outcome: TaskTerminalOutcome } | { outcome: "unavailable"; reason: string }> {
+  if (prompt !== undefined) {
+    try {
+      agentPromptArgs("claude", prompt);
+    } catch (cause) {
+      return { outcome: "unavailable", reason: explainError(cause) };
+    }
+    if (get(terminalSessions).some((record) => record.continuesRunId === run.id)) {
+      return { outcome: "unavailable", reason: "A resumed conversation for this attempt is already running. Type the message in its terminal; sending it from here would not reach it." };
+    }
+  }
   const conversation = await findConversation(run.id);
   if (!conversation.resumable) return { outcome: "unavailable", reason: conversation.reason };
-  if (disposition === "show") {
+  if (disposition === "show" && prompt === undefined) {
     const live = get(terminalSessions).find((record) => record.continuesRunId === run.id && record.reveal);
     if (live && (await focusTerminalSession(live)).ok) return { outcome: "opened" };
   }
@@ -345,11 +364,19 @@ export async function resumeTaskConversation(
     repoPath: place.root,
     provider: "claude",
     title: run.task_title,
-    resume: { sessionId: conversation.sessionId, mode: conversation.mode, runId: run.id },
+    resume: { sessionId: conversation.sessionId, mode: conversation.mode, runId: run.id, ...(prompt !== undefined ? { prompt } : {}) },
     ...(place.startDir ? { startDir: place.startDir } : {}),
     ...(place.family ? { family: place.family } : {}),
   };
-  enqueueTaskTerminal(request);
+  try {
+    enqueueTaskTerminal(request);
+  } catch (cause) {
+    // Without a prompt this stays the throw it always was. With one, the
+    // queue refusing it means the message was not added, and the caller must
+    // be told that in the same shape as every other reason it cannot be sent.
+    if (prompt === undefined) throw cause;
+    return { outcome: "unavailable", reason: explainError(cause) };
+  }
   if (disposition === "show") return { outcome: await showCheckout(place.host ?? place.root) };
   if (place.host) return { outcome: "started" };
   return { outcome: (await repoStore.openRepo(place.root, backgroundOpen())) ? "started" : "queued" };

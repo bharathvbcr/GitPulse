@@ -96,6 +96,7 @@ fn notice(key: &str) -> Notice {
         channel: "bell",
         subject: None,
         subagent: false,
+        agent_id: None,
     }
 }
 
@@ -440,6 +441,7 @@ fn hook(key: &str, event: &str, detail: Option<&str>) -> Notice {
         channel: "hook",
         subject: None,
         subagent: false,
+        agent_id: None,
     }
 }
 

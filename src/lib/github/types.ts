@@ -7,7 +7,31 @@ export type { ReleaseInfo };
  * the serde field names as serialized by src-tauri; do not rename fields.
  */
 
+/**
+ * What a run's `status` and `conclusion` mean, decided once in Rust
+ * (`github/outcome.rs`) and carried on every run. The renderer reads this and
+ * keeps no table of its own: two tables are two chances to disagree about
+ * whether a run is red.
+ *
+ * - `needs_person` is `action_required`: a run held for an approval. Nothing
+ *   broke, so it is never `failed`, but someone has to act, so the work view
+ *   still marks it as needing attention.
+ * - `cancelled` is not `failed`, and no red banner is raised for it; the
+ *   delivery timeline still counts it as a bad end (see `runLifecycle.ts`).
+ * - `unknown` is everything the rule does not name, including a payload that
+ *   carried no outcome at all.
+ */
+export const RUN_OUTCOMES = ["in_flight", "passed", "failed", "cancelled", "needs_person", "unknown"] as const;
+export type RunOutcome = (typeof RUN_OUTCOMES)[number];
+
+/** A wire value as an outcome; anything this build does not name is `unknown`, never a verdict. */
+export function asRunOutcome(value: unknown): RunOutcome {
+  return RUN_OUTCOMES.find((outcome) => outcome === value) ?? "unknown";
+}
+
 export interface WorkflowRunInfo {
+  /** See {@link RunOutcome}. */
+  outcome: RunOutcome;
   id: number;
   name: string;
   title: string;
@@ -47,6 +71,13 @@ export interface GitHubRunsReport {
   runs: WorkflowRunInfo[];
   truncated: boolean;
   error: string | null;
+  /**
+   * Runs that finished red (`outcome: "failed"`) since the previous look at
+   * this repository, decided natively by the same observer the CI watcher
+   * uses. Empty on the first look and whenever `checked` is false — which is
+   * what says whether "none" means none.
+   */
+  went_red: WorkflowRunInfo[];
 }
 
 /** One Actions workflow from `gh workflow list`. */
@@ -101,6 +132,12 @@ export interface CiLocalReport {
    * failed".
    */
   not_recorded_reason: string;
+  /**
+   * Empty unless this checkout is an agent attempt's worktree and telling its
+   * task about the result failed; then why. Separate from `not_recorded_reason`:
+   * the git note and the task's notice are two different records.
+   */
+  signal_error?: string;
   /**
    * How test steps were scoped. A fail-closed full suite must never read as
    * "affected tests passed".

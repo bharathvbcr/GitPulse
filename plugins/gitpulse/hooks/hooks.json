@@ -78,6 +78,12 @@
             "command": "gitpulse-hook notify turn_finished",
             "timeout": 5,
             "async": true
+          },
+          {
+            "type": "command",
+            "command": "gitpulse-hook deliver",
+            "timeout": 1800,
+            "asyncRewake": true
           }
         ]
       }

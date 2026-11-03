@@ -166,6 +166,21 @@ describe("WorktreesPanel removal safety", () => {
     expect(fn).toContain('worktreeSetupNotices(merged, "merge")');
   });
 
+  it("offers the squash on the armed merge, on by default for an attempt branch, and sends the choice", () => {
+    const fn = source.slice(source.indexOf("async function mergeTeardown"), source.indexOf("async function fetchAiSummary"));
+    // The choice is armed with the confirm and sent; it is never hard-coded.
+    expect(fn).not.toContain("squash: false");
+    // ...and read when the confirm is taken, before any await, not after the
+    // trust check while another row may have been armed.
+    expect(fn).toMatch(/const squash = mergeSquash;[\s\S]*?await repoStore\.trustRepo[\s\S]*?\n\s+squash,\n/);
+    expect(fn).not.toContain("squash: mergeSquash");
+    expect(fn).toContain("mergeSquash = squashesByDefault(wt.branch)");
+    const armed = source.slice(source.indexOf("{#if mergeConfirmPath === wt.path}"));
+    expect(armed.slice(0, 1200)).toContain("Press merge again to confirm.");
+    expect(armed.slice(0, 1200)).toContain("bind:checked={mergeSquash}");
+    expect(armed.slice(0, 1200)).toContain("Squash into one commit");
+  });
+
   it("keeps the concurrent-session guards across the awaits", () => {
     const fn = source.slice(source.indexOf("async function remove"), source.indexOf("function open"));
     // A fresh read of "the repository in front" after the await is what the old
