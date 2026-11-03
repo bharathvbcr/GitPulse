@@ -381,7 +381,10 @@ fn a_read_counts_the_drops_whose_marker_is_queued_or_taken_but_not_yet_in_the_fi
         .get("term-1-1")
         .copied()
         .unwrap_or(0);
-    assert!(second > 0, "the second overflow left bytes without a marker");
+    assert!(
+        second > 0,
+        "the second overflow left bytes without a marker"
+    );
     let during = wire(store.read("term-1-1", MAX_TRANSCRIPT_TAIL_BYTES, false, None));
     assert_eq!(during["state"], "found", "{during}");
     assert_eq!(during["settled"], false, "the writer is stopped");
