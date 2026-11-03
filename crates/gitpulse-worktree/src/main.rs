@@ -590,10 +590,7 @@ fn parse_cli(argv: &[String]) -> Result<Invocation, (bool, String)> {
                     "--since-seq" => {
                         let raw = take_val(rest, &mut i, "--since-seq").map_err(map_err)?;
                         since_seq = raw.parse::<u64>().map_err(|_| {
-                            (
-                                json_mode,
-                                format!("invalid u64 for --since-seq: {raw:?}"),
-                            )
+                            (json_mode, format!("invalid u64 for --since-seq: {raw:?}"))
                         })?;
                     }
                     other => {
@@ -802,9 +799,8 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
         } => {
             gitpulse_lib::repository_trust::require(Path::new(&repo))
                 .map_err(CommandError::into_message)?;
-            let target_buf =
-                resolve_worktree_path_for_branch(&repo, &branch, target.as_deref())
-                    .map_err(CommandError::into_message)?;
+            let target_buf = resolve_worktree_path_for_branch(&repo, &branch, target.as_deref())
+                .map_err(CommandError::into_message)?;
             let target_str = target_buf
                 .to_str()
                 .ok_or_else(|| "target worktree path is not valid UTF-8".to_string())?;
@@ -812,7 +808,8 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
             let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
             gitpulse_lib::harness::guard_command(&repo, &argv_refs)?;
 
-            let (worktree_path, devmap_seeded, zero_copy_devmap, sparse_cone) = if !sparse.is_empty()
+            let (worktree_path, devmap_seeded, zero_copy_devmap, sparse_cone) = if !sparse
+                .is_empty()
             {
                 let created = add_sparse_worktree_zero_copy(
                     &repo,
@@ -1003,8 +1000,8 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
         } => {
             gitpulse_lib::repository_trust::require(Path::new(&repo))
                 .map_err(CommandError::into_message)?;
-            let family = resolve_worktree_family(&repo, &worktree)
-                .map_err(CommandError::into_message)?;
+            let family =
+                resolve_worktree_family(&repo, &worktree).map_err(CommandError::into_message)?;
             gitpulse_lib::harness::guard_command(&repo, &["git", "worktree", "list"])?;
             let selection = CacheSelection {
                 include_virtualenvs: include_venv,
@@ -1075,8 +1072,7 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
         Subcommand::CompileOverlay { worktree } => {
             gitpulse_lib::repository_trust::require(Path::new(&worktree))
                 .map_err(CommandError::into_message)?;
-            let report =
-                sync_worktree_overlay(&worktree).map_err(CommandError::into_message)?;
+            let report = sync_worktree_overlay(&worktree).map_err(CommandError::into_message)?;
             let zero_copy_ref = load_zero_copy_base_ref(&worktree).ok().flatten();
             Ok(json!({
                 "ok": true,
@@ -1116,17 +1112,14 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                 } else {
                     "none"
                 };
-                let overlay_summary = load_worktree_overlay(&wt.path)
-                    .ok()
-                    .flatten()
-                    .map(|ov| {
-                        json!({
-                            "generation_id": ov.generation,
-                            "modified_files": ov.modified_files.len(),
-                            "tombstoned_files": ov.tombstoned_files.len(),
-                            "dirty_csr_nodes": ov.dirty_nodes.len(),
-                        })
-                    });
+                let overlay_summary = load_worktree_overlay(&wt.path).ok().flatten().map(|ov| {
+                    json!({
+                        "generation_id": ov.generation,
+                        "modified_files": ov.modified_files.len(),
+                        "tombstoned_files": ov.tombstoned_files.len(),
+                        "dirty_csr_nodes": ov.dirty_nodes.len(),
+                    })
+                });
                 let user_dirty = if wt.is_bare {
                     None
                 } else {
@@ -1181,8 +1174,7 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
         Subcommand::Release { repo, agent } => {
             gitpulse_lib::repository_trust::require(Path::new(&repo))
                 .map_err(CommandError::into_message)?;
-            let released =
-                release_lane(&repo, &agent).map_err(CommandError::into_message)?;
+            let released = release_lane(&repo, &agent).map_err(CommandError::into_message)?;
             Ok(json!({
                 "ok": true,
                 "agent_id": agent,
@@ -1199,15 +1191,9 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
         } => {
             gitpulse_lib::repository_trust::require(Path::new(&repo))
                 .map_err(CommandError::into_message)?;
-            let message = post_message(
-                &repo,
-                &from,
-                to.as_deref(),
-                &kind,
-                &body,
-                branch.as_deref(),
-            )
-            .map_err(CommandError::into_message)?;
+            let message =
+                post_message(&repo, &from, to.as_deref(), &kind, &body, branch.as_deref())
+                    .map_err(CommandError::into_message)?;
             Ok(json!({
                 "ok": true,
                 "message": message,
@@ -1230,8 +1216,7 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
         Subcommand::Radar { repo } => {
             gitpulse_lib::repository_trust::require(Path::new(&repo))
                 .map_err(CommandError::into_message)?;
-            let radar =
-                scan_parallel_agent_radar(&repo).map_err(CommandError::into_message)?;
+            let radar = scan_parallel_agent_radar(&repo).map_err(CommandError::into_message)?;
             Ok(json!({
                 "ok": true,
                 "radar": radar,
@@ -1314,12 +1299,11 @@ fn execute_subcommand(cmd: Subcommand) -> Result<Value, String> {
                 }
                 let mut prunable = force;
                 if !prunable {
-                    let is_clean = user_changed_paths(&wt.path)
-                        .is_ok_and(|(dirty, _)| dirty.is_empty());
+                    let is_clean =
+                        user_changed_paths(&wt.path).is_ok_and(|(dirty, _)| dirty.is_empty());
                     if is_clean {
                         if let Some(br) = wt.branch.as_deref() {
-                            if let Ok(verif) =
-                                verify_branch_integration(&anchor, br, &default_base)
+                            if let Ok(verif) = verify_branch_integration(&anchor, br, &default_base)
                             {
                                 prunable = verif.is_integrated;
                             }
@@ -1533,13 +1517,19 @@ fn main() {
     let (json_mode, cmd) = match parse_cli(&argv) {
         Ok(Invocation::Help) => {
             let mut out = io::stdout().lock();
-            let ok = out.write_all(USAGE.as_bytes()).and_then(|()| out.flush()).is_ok();
+            let ok = out
+                .write_all(USAGE.as_bytes())
+                .and_then(|()| out.flush())
+                .is_ok();
             std::process::exit(if ok { 0 } else { 1 });
         }
         Ok(Invocation::Version) => {
             let mut out = io::stdout().lock();
             let line = format!("gitpulse-worktree {VERSION}\n");
-            let ok = out.write_all(line.as_bytes()).and_then(|()| out.flush()).is_ok();
+            let ok = out
+                .write_all(line.as_bytes())
+                .and_then(|()| out.flush())
+                .is_ok();
             std::process::exit(if ok { 0 } else { 1 });
         }
         Ok(Invocation::Command { json, cmd }) => (json, cmd),
@@ -1640,9 +1630,8 @@ mod tests {
         assert!(!err_empty.0);
         assert!(err_empty.1.contains("missing subcommand"));
 
-        let err_missing_branch =
-            parse_cli(&vec_str(&["--json", "create", "--repo", "/tmp/repo"]))
-                .expect_err("missing --branch must fail");
+        let err_missing_branch = parse_cli(&vec_str(&["--json", "create", "--repo", "/tmp/repo"]))
+            .expect_err("missing --branch must fail");
         assert!(err_missing_branch.0);
         assert!(err_missing_branch.1.contains("--branch"));
 
@@ -1673,8 +1662,8 @@ mod tests {
 
     #[test]
     fn parse_cli_handles_build_passthrough_and_cache_stats() {
-        let default_build =
-            parse_cli(&vec_str(&["build", "--repo", "/tmp/repo", "--json"])).expect("default build");
+        let default_build = parse_cli(&vec_str(&["build", "--repo", "/tmp/repo", "--json"]))
+            .expect("default build");
         assert_eq!(
             default_build,
             Invocation::Command {
