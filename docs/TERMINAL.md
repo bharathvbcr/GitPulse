@@ -308,16 +308,18 @@ shown, and does nothing, off macOS.
 
 A terminal you can see draws through xterm's WebGL renderer (`@xterm/addon-webgl`).
 When a terminal session is hidden (such as switching tabs or collapsing the dock),
-its WebGL context is retained briefly in a held cache (up to 2 contexts for 5,000 ms)
-rather than immediately destroyed (`src/lib/terminal/gpuRenderer.ts`). Switching back
+its WebGL context is held for up to `GPU_HIDE_GRACE_MS` (5 minutes) rather than
+immediately destroyed (`src/lib/terminal/gpuRenderer.ts`); a held context keeps its
+slot. Switching back
 to a recently hidden session restores GPU acceleration instantly without re-allocating
 the WebGL context or rebuilding the glyph atlas. When the hold expires or the context
 capacity is reached, the context is released via `loseContext()` and falls back to
 the DOM renderer. At most `MAX_VISIBLE_SESSIONS` (8) live contexts exist at once.
 
 Context loss (e.g. from GPU resets or device sleep) is managed under a bounded recovery
-budget (`MAX_RECOVERIES = 3`). If an active session experiences context loss, the addon
-is re-initialized cleanly up to the budget limit before permanently falling back to DOM
+budget (`GPU_LOSS_BUDGET = 3` losses within `GPU_LOSS_WINDOW_MS`, 10 minutes). If an
+active session experiences context loss, the addon is re-initialized cleanly up to the
+budget limit before permanently falling back to DOM
 rendering (`data-renderer="dom"`). If a held hidden context is lost, the hold simply ends
 without consuming the session's active recovery budget.
 
