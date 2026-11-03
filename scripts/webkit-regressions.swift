@@ -53,12 +53,18 @@ let webview = WKWebView(frame: frame, configuration: config)
 let window = NSWindow(contentRect: frame, styleMask: [.titled, .closable], backing: .buffered, defer: false)
 window.title = "GitPulse WebKit regression test"
 window.contentView = webview
-// A visible window keeps WebKit's background timer throttling from
-// stretching the fixture's bounded waits beyond the runner deadline. Key
-// status is only requested: activation is cooperative, so another frontmost
-// app (or a concurrent run) can refuse it or take it back mid-run, leaving
-// `document.hasFocus()` false. A fixture whose waits depend on the product's
-// focus-gated polls has to say it is in front itself (see tasksChecks.js).
+// The window stays in the on-screen window list but is fully transparent,
+// ignores the mouse and is never activated, so a run neither shows a window
+// nor takes focus from whatever the person is typing into. It must not be
+// ordered out or moved off every screen: a webview without an on-screen
+// window is reported hidden and loses its display-driven animation frames,
+// which none of the switches here cover. Measured against the activated,
+// visible window on this host (3 paired runs): 59-60 fps and a 28 ms mean
+// gap on a 25 ms timer either way, `document.hidden` false in both.
+// `document.hasFocus()` was never something the runner could count on
+// (activation is cooperative and another app can refuse it or take it back),
+// so a fixture whose waits depend on the product's focus-gated polls says it
+// is in front itself (see harness/foreground.ts).
 // WebKit reports `document.hidden` whenever the window is occluded, and a
 // locked screen, a sleeping display or another app's window all occlude it.
 // A hidden page gets no animation frames and heavily throttled timers, so
@@ -74,8 +80,10 @@ if let method = class_getInstanceMethod(WKWebView.self, occlusionSetter) {
 } else {
     fputs("WebKit lacks _setWindowOcclusionDetectionEnabled:; an occluded window will make pages hidden\n", stderr)
 }
-window.makeKeyAndOrderFront(nil)
-if #available(macOS 14.0, *) { app.activate() }
+window.alphaValue = 0
+window.ignoresMouseEvents = true
+window.collectionBehavior = [.transient, .ignoresCycle]
+window.orderFrontRegardless()
 webview.load(URLRequest(url: url))
 Timer.scheduledTimer(withTimeInterval: deadline, repeats: false) { _ in
     fputs("WebKit regression deadline expired\n", stderr)

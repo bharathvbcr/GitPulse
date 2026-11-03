@@ -4,9 +4,9 @@
  * The product's polls stop while `readBackgroundDocument()` is true, and on
  * WKWebView that follows window focus, not visibility: `hasFocus()` is false
  * with `visibilityState` still "visible". The WebKit runner
- * (scripts/webkit-regressions.swift) is an accessory app whose activation is
- * cooperative. Its window may never become key while another app is in
- * front, or it becomes key and then loses it to another app mid-run. Either
+ * (scripts/webkit-regressions.swift) is an accessory app with a transparent
+ * window that never asks to be activated, so it normally never becomes key;
+ * if it does, another app can take that back mid-run. Either
  * way every poll-gated wait times out, and only in WebKit: headless Chrome
  * always reports focus.
  *
