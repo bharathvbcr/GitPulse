@@ -260,21 +260,41 @@ pub(crate) fn continue_params(id: &str, request_id: Option<&str>, message: Optio
     params
 }
 
-/// Manvi's refusals that a retry can cure, and nothing else: a turn is still
-/// in flight, follow-ups came too fast, or the delivery's outcome was not known
-/// yet (the same request id then returns it and never sends twice).
-const RETRYABLE: [&str; 3] = ["E_TURN_IN_FLIGHT", "E_CONTINUE_RATE", "E_CONTINUE_PENDING"];
+/// Manvi's refusals that a retry can cure and that wrote nothing: a turn is
+/// still in flight, or follow-ups came too fast.
+const RETRYABLE: [&str; 2] = ["E_TURN_IN_FLIGHT", "E_CONTINUE_RATE"];
+
+/// What an unresolved delivery is said to be, whether Manvi reported it as an
+/// error (`E_CONTINUE_UNRESOLVED`) or as the run's state.
+pub(crate) const UNRESOLVED_REASON: &str = "Manvi cannot tell whether this follow-up reached the agent, and it will not be sent again. The run is recorded as unresolved.";
+
+/// The codes `docs/WORKBENCH.md` on Manvi's `work.runs.managed.continue` documents as
+/// writing nothing to the provider, so that a refusal with one of them is a
+/// definite "not sent". `E_CONTINUE_UNSUPPORTED` is the seventh, handled as its
+/// own state. A code outside this list is not claimed to have written nothing:
+/// see [`follow_up_answer`].
+pub(crate) const WROTE_NOTHING: [&str; 6] = [
+    "E_TURN_IN_FLIGHT",
+    "E_CONTINUE_RATE",
+    "E_CONTINUE_LIMIT",
+    "E_RUN_ENDED",
+    "E_DEPENDENCY",
+    "E_BAD_REQUEST",
+];
 
 /// Every state a run can report between turns.
 const FOLLOW_UP_STATES: [&str; 5] = ["delivered", "parked", "running", "unresolved", "ended"];
 
 /// A follow-up's answer, as the renderer reads it.
 ///
-/// Three kinds of answer are a result and not an error, because none of them
+/// Kinds of answer that are a result and not an error, because none of them
 /// says anything is wrong with the run: Manvi answered (`ok: true`, its
 /// `state`), Manvi cannot take follow-ups here (`state: "unsupported"`, with
-/// `cause`), or Manvi refused this one (`state: "refused"`, with its `code` and
-/// whether a retry can help). A call that did not reach an answer — Manvi down,
+/// `cause`), Manvi refused this one with a code documented as writing nothing
+/// (`state: "refused"`, with its `code` and whether a retry can help), or the
+/// outcome is not known: `pending` (ask again with the same request id),
+/// `unresolved` (never resent) and `unconfirmed` (a code this build does not
+/// know). Those last three are never reported as "nothing was sent". A call that did not reach an answer — Manvi down,
 /// a timeout — stays an error: it is not evidence about the run.
 pub(crate) fn follow_up_answer(
     outcome: Result<Value, WorkbenchError>,
@@ -321,12 +341,43 @@ pub(crate) fn follow_up_answer(
             "reason": format!("This run cannot take follow-ups: {}", error.message),
             "retryable": false,
         })),
-        Err(error) if error.code.starts_with("E_") => Ok(json!({
+        // Manvi did not learn the outcome in time. Not a refusal: the message
+        // may have been written. Asking again with the same request id returns
+        // the first answer and never sends twice.
+        Err(error) if error.code == "E_CONTINUE_PENDING" => Ok(json!({
+            "ok": false,
+            "state": "pending",
+            "code": error.code,
+            "reason": "Manvi has not yet said whether this follow-up reached the agent, so it may have. Pressing Confirm again with the same request id asks Manvi again and never sends it twice.",
+            "retryable": true,
+        })),
+        // The delivery cannot be told from a lost one; Manvi will not resend it.
+        Err(error) if error.code == "E_CONTINUE_UNRESOLVED" => Ok(json!({
+            "ok": false,
+            "state": "unresolved",
+            "code": error.code,
+            "reason": UNRESOLVED_REASON,
+            "retryable": false,
+        })),
+        Err(error) if WROTE_NOTHING.contains(&error.code.as_str()) => Ok(json!({
             "ok": false,
             "state": "refused",
             "code": error.code,
             "reason": error.message,
             "retryable": RETRYABLE.contains(&error.code.as_str()),
+        })),
+        // An `E_` code this build does not know. Manvi documents which codes
+        // write nothing; this is not one of them, so it is not called "nothing
+        // was sent".
+        Err(error) if error.code.starts_with("E_") => Ok(json!({
+            "ok": false,
+            "state": "unconfirmed",
+            "code": error.code,
+            "reason": format!(
+                "Manvi answered with an error GitPulse does not recognise ({}): {}. If a follow-up was being sent, it is not known whether it reached the agent.",
+                error.code, error.message
+            ),
+            "retryable": false,
         })),
         Err(error) => Err(error),
     }
@@ -929,8 +980,8 @@ mod tests {
     }
 
     #[test]
-    fn only_the_three_curable_refusals_are_retryable() {
-        for code in ["E_TURN_IN_FLIGHT", "E_CONTINUE_RATE", "E_CONTINUE_PENDING"] {
+    fn only_the_two_curable_refusals_are_retryable_and_all_say_nothing_was_written() {
+        for code in ["E_TURN_IN_FLIGHT", "E_CONTINUE_RATE"] {
             let answer = follow_up_answer(refused(code)).unwrap();
             assert_eq!(
                 (answer["state"].as_str(), answer["retryable"].clone()),
@@ -943,8 +994,7 @@ mod tests {
             "E_RUN_ENDED",
             "E_DEPENDENCY",
             "E_CONTINUE_LIMIT",
-            "E_CONTINUE_UNRESOLVED",
-            "E_SOMETHING_NEW",
+            "E_BAD_REQUEST",
         ] {
             let answer = follow_up_answer(refused(code)).unwrap();
             assert_eq!(
@@ -953,6 +1003,66 @@ mod tests {
                 "{code}"
             );
         }
+    }
+
+    /// `E_CONTINUE_PENDING` is "the wait for the outcome ran out": the message
+    /// may have been written. It is not a refusal, so it is not `refused` (the
+    /// state the panel reads as "nothing was sent"), and it can be asked again
+    /// with the same request id.
+    #[test]
+    fn a_pending_outcome_is_not_a_refusal_and_can_be_asked_again() {
+        let answer = follow_up_answer(refused("E_CONTINUE_PENDING")).unwrap();
+        assert_eq!(answer["ok"], false);
+        assert_eq!(answer["state"], "pending");
+        assert_eq!(answer["retryable"], true);
+        assert_eq!(answer["code"], "E_CONTINUE_PENDING");
+        let reason = answer["reason"].as_str().unwrap();
+        assert!(reason.contains("same request id"), "{reason}");
+        assert!(reason.contains("never sends it twice"), "{reason}");
+        assert!(
+            !reason.to_lowercase().contains("nothing was sent"),
+            "{reason}"
+        );
+    }
+
+    /// `E_CONTINUE_UNRESOLVED`: "the delivery cannot be told from a lost one",
+    /// "not a refusal". It will not be resent, so it is not retryable either.
+    #[test]
+    fn an_unresolved_delivery_is_not_a_refusal_and_is_never_retried() {
+        let answer = follow_up_answer(refused("E_CONTINUE_UNRESOLVED")).unwrap();
+        assert_eq!(answer["ok"], false);
+        assert_eq!(answer["state"], "unresolved");
+        assert_eq!(answer["retryable"], false);
+        let reason = answer["reason"].as_str().unwrap();
+        assert!(reason.contains("cannot tell whether"), "{reason}");
+        assert!(reason.contains("will not be sent again"), "{reason}");
+    }
+
+    /// An `E_` code this build has never heard of is not one Manvi documents as
+    /// writing nothing, so it is not reported as "refused".
+    #[test]
+    fn an_unrecognised_code_is_unconfirmed_and_not_a_refusal() {
+        let answer = follow_up_answer(refused("E_SOMETHING_NEW")).unwrap();
+        assert_eq!(answer["state"], "unconfirmed");
+        assert_eq!(answer["retryable"], false);
+        assert_eq!(answer["code"], "E_SOMETHING_NEW");
+        let reason = answer["reason"].as_str().unwrap();
+        assert!(reason.contains("not known whether"), "{reason}");
+        assert!(reason.contains("E_SOMETHING_NEW"), "{reason}");
+    }
+
+    /// Every code in [`WROTE_NOTHING`] is one Manvi's documentation lists, and
+    /// none of the not-known states is.
+    #[test]
+    fn the_codes_that_wrote_nothing_exclude_the_ones_that_may_have() {
+        for code in [
+            "E_CONTINUE_PENDING",
+            "E_CONTINUE_UNRESOLVED",
+            "E_CONTINUE_UNSUPPORTED",
+        ] {
+            assert!(!WROTE_NOTHING.contains(&code), "{code}");
+        }
+        assert!(WROTE_NOTHING.contains(&"E_TURN_IN_FLIGHT"));
     }
 
     #[test]

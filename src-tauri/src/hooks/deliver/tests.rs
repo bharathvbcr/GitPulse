@@ -141,29 +141,104 @@ fn two_copies_of_the_hook_deliver_one_message_once() {
     assert_eq!((wakes, quiet), (1, 1), "{a:?} / {b:?}");
 }
 
+/// The listening window runs from the latest stop. Hooks from an earlier stop
+/// that are still alive give way to a later stop's, so a session whose first
+/// stop's hooks are about to time out is not deaf the moment they do. (Ranking
+/// oldest-first declined every later stop's hooks and left exactly that.)
 #[test]
-fn a_waiter_past_the_per_session_cap_exits_0_at_once() {
+fn a_later_stops_hooks_displace_an_earlier_stops_and_hear_the_message() {
     let (_dir, mailbox) = mailbox();
     let cap = crate::agent_mailbox::MAX_WAITERS_PER_SESSION;
     std::thread::scope(|scope| {
-        let held: Vec<_> = (0..cap)
-            .map(|_| {
-                let handle =
-                    scope.spawn(|| run_in(&mailbox, &stop(SESSION), Duration::from_secs(20)));
-                std::thread::sleep(Duration::from_millis(20));
-                handle
-            })
-            .collect();
-        let seen = Instant::now();
-        while waiters_on(&mailbox, SESSION) < cap {
+        let spawn_stop = || {
+            (0..cap)
+                .map(|_| {
+                    let handle =
+                        scope.spawn(|| run_in(&mailbox, &stop(SESSION), Duration::from_secs(20)));
+                    std::thread::sleep(Duration::from_millis(20));
+                    handle
+                })
+                .collect::<Vec<_>>()
+        };
+        let wait_for = |count: usize| {
+            let seen = Instant::now();
+            while waiters_on(&mailbox, SESSION) < count {
+                assert!(
+                    seen.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
+                    "waiters never registered"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let earlier = spawn_stop();
+        wait_for(cap);
+        let later = spawn_stop();
+        // The earlier stop's hooks leave quietly, well inside their own limit.
+        let began = Instant::now();
+        for handle in earlier {
+            let outcome = handle.join().unwrap();
             assert!(
-                seen.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
+                matches!(outcome, Ok(ref output) if output.is_silent()),
+                "{outcome:?}"
+            );
+        }
+        assert!(
+            began.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5)),
+            "an earlier stop's hooks kept waiting"
+        );
+        // The later stop's are the ones listening: a message wakes one of them.
+        wait_for(cap);
+        for n in 0..cap {
+            mailbox
+                .deposit(
+                    SESSION,
+                    &format!("r{n}"),
+                    "for the latest stop",
+                    SystemTime::now(),
+                )
+                .unwrap();
+        }
+        for handle in later {
+            let outcome = handle.join().unwrap();
+            assert!(matches!(outcome, Err(HookError::Wake(_))), "{outcome:?}");
+        }
+    });
+}
+
+/// A session with no place, arriving when every place in the mailbox is taken,
+/// leaves at once with exit 0 instead of waiting.
+#[test]
+fn a_waiter_past_the_global_cap_exits_0_at_once() {
+    let (_dir, mailbox) = mailbox();
+    let per = crate::agent_mailbox::MAX_WAITERS_PER_SESSION;
+    let sessions = crate::agent_mailbox::MAX_WAITERS_TOTAL / per;
+    let session = |n: usize| format!("6f1c2a7e-0d4b-4c1e-9a55-{n:012x}");
+    std::thread::scope(|scope| {
+        let mut held = Vec::new();
+        for n in 0..sessions {
+            for _ in 0..per {
+                let id = session(n);
+                held.push(scope.spawn({
+                    let mailbox = &mailbox;
+                    move || run_in(mailbox, &stop(&id), Duration::from_secs(20))
+                }));
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let seen = Instant::now();
+        while (0..sessions)
+            .map(|n| waiters_on(&mailbox, &session(n)))
+            .sum::<usize>()
+            < sessions * per
+        {
+            assert!(
+                seen.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(20)),
                 "waiters never registered"
             );
             std::thread::sleep(Duration::from_millis(5));
         }
         let began = Instant::now();
-        let extra = run_in(&mailbox, &stop(SESSION), Duration::from_secs(20));
+        let extra = run_in(&mailbox, &stop(&session(99)), Duration::from_secs(20));
         assert!(
             matches!(extra, Ok(ref output) if output.is_silent()),
             "{extra:?}"
@@ -172,11 +247,12 @@ fn a_waiter_past_the_per_session_cap_exits_0_at_once() {
             began.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)),
             "the extra waiter waited"
         );
-        // Release the ones holding places.
-        for n in 0..cap {
-            mailbox
-                .deposit(SESSION, &format!("r{n}"), "release", SystemTime::now())
-                .unwrap();
+        for n in 0..sessions {
+            for m in 0..per {
+                mailbox
+                    .deposit(&session(n), &format!("r{m}"), "release", SystemTime::now())
+                    .unwrap();
+            }
         }
         for handle in held {
             assert!(matches!(handle.join().unwrap(), Err(HookError::Wake(_))));
@@ -185,32 +261,47 @@ fn a_waiter_past_the_per_session_cap_exits_0_at_once() {
 }
 
 /// `stop_hook_active` is true while Claude is continuing because of a stop
-/// hook, and a chain of stops can fire in quick succession. Each must not
-/// start a waiter that lives for half an hour.
+/// hook, and the turn an `asyncRewake` wake starts is one. The stop that ends
+/// it must still wait, or a session that has just been woken has no waiter
+/// until the person types.
 #[test]
-fn a_repeat_in_a_stop_chain_looks_once_and_does_not_start_another_waiter() {
+fn a_stop_that_continues_a_stop_hook_still_waits_and_hears_a_later_message() {
+    let (_dir, mailbox) = mailbox();
+    let mut chained = stop(SESSION);
+    chained.stop_hook_active = true;
+    let outcome = std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| run_in(&mailbox, &chained, Duration::from_secs(20)));
+        let seen = Instant::now();
+        while waiters_on(&mailbox, SESSION) < 1 {
+            assert!(
+                seen.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
+                "a chained stop never waited"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        mailbox
+            .deposit(SESSION, "late", "after the wake", SystemTime::now())
+            .unwrap();
+        waiter.join().unwrap()
+    });
+    assert!(matches!(outcome, Err(HookError::Wake(_))), "{outcome:?}");
+}
+
+/// …and with nothing to say it waits its own limit like any other stop and
+/// leaves nothing behind.
+#[test]
+fn a_chained_stop_with_nothing_to_say_waits_its_limit_and_cleans_up() {
     let (_dir, mailbox) = mailbox();
     let mut chained = stop(SESSION);
     chained.stop_hook_active = true;
     let began = Instant::now();
-    let outcome = run_in(&mailbox, &chained, Duration::from_secs(30));
+    let outcome = run_in(&mailbox, &chained, Duration::from_millis(500));
     assert!(
         matches!(outcome, Ok(ref output) if output.is_silent()),
         "{outcome:?}"
     );
-    assert!(
-        began.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)),
-        "a chained stop waited"
-    );
+    assert!(began.elapsed() >= Duration::from_millis(500));
     assert_eq!(waiters_on(&mailbox, SESSION), 0);
-    // It still takes a message that is already there.
-    mailbox
-        .deposit(SESSION, "r1", "already here", SystemTime::now())
-        .unwrap();
-    assert!(matches!(
-        run_in(&mailbox, &chained, Duration::from_secs(30)),
-        Err(HookError::Wake(_))
-    ));
 }
 
 #[cfg(unix)]

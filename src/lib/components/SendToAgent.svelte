@@ -13,7 +13,7 @@
   import { onDestroy, untrack } from "svelte";
   import { Send } from "@lucide/svelte";
   import { explainError, getTaskRun, newID, previewAgentMessage, sendAgentMessage, WorkbenchError, type AgentSendPreview, type AttentionSignal } from "../workbench/client";
-  import { AGENT_NOTE_MAX_CHARS, composeAgentMessage, confirmLabel, describeResume, describeSend, messageProblem, routeTitle } from "../workbench/sendToAgent";
+  import { AGENT_NOTE_MAX_CHARS, composeAgentMessage, confirmLabel, describeResume, describeSend, messageProblem, routeTitle, unknownOutcome } from "../workbench/sendToAgent";
   import { resumeTaskConversation } from "../workbench/taskTerminal";
 
   let { runId, taskTitle, signal, label = "Send to agent" }: {
@@ -42,6 +42,17 @@
    * same message twice; writing something different is a new message.
    */
   let done = $state(false);
+  /**
+   * A send whose outcome is not known: Manvi had not learned it (`pending`), cannot tell it from a lost one
+   * (`unresolved`), or answered something this build cannot read. The message may have reached the agent, so the
+   * note editor warns that a different note is a new message that would be sent in addition. Cleared only when
+   * the panel is closed: editing the note does not make the earlier message not have happened.
+   */
+  let maybeDelivered = $state(false);
+  /** Confirm is off and stays off for this message (`unresolved` is never resent), but it is not "Sent". */
+  let closed = $state(false);
+  /** The outcome is pending: Confirm stays armed and asks again with the same request id. */
+  let askAgain = $state(false);
   /** Fresh per message, reused by a retry of the same press: a retry never sends twice. */
   let requestId = $state(newID());
   let generation = 0;
@@ -88,18 +99,20 @@
 
   function toggle() {
     open = !open;
-    if (!open) { outcome = null; done = false; requestId = newID(); }
+    if (!open) { outcome = null; done = false; closed = false; askAgain = false; maybeDelivered = false; requestId = newID(); }
   }
   function edited() {
     // New text is a new message: a request id that carried other text would be refused.
     requestId = newID();
     outcome = null;
     done = false;
+    closed = false;
+    askAgain = false;
   }
 
   async function send() {
-    if (!preview || preview.route === "unavailable" || !settled || problem || sending || done) return;
-    const route = preview.route, sentText = text, id = requestId;
+    if (!preview || preview.route === "unavailable" || !settled || problem || sending || done || closed) return;
+    const route = preview.route, sentText = text, id = requestId, retried = askAgain;
     sending = true; outcome = null;
     try {
       const result = await sendAgentMessage(runId, sentText, id, route);
@@ -117,8 +130,16 @@
       } else {
         outcome = describeSend(result);
         // A refusal that says to try again leaves the message unsent, with the
-        // same request id: a retry cannot send it twice.
-        done = result.sent;
+        // same request id: a retry cannot send it twice. An outcome that is not
+        // known is neither: `pending` keeps Confirm armed on the same request id,
+        // the others close it, and all of them warn the note editor.
+        const unknown = unknownOutcome(result);
+        done = result.sent === true;
+        askAgain = unknown === "ask-again";
+        closed = unknown === "closed";
+        // Asking again with the same request id settles that very message.
+        if (unknown) maybeDelivered = true;
+        else if (retried) maybeDelivered = false;
       }
     } catch (cause) {
       if (disposed) return;
@@ -143,6 +164,13 @@
         <textarea class="gp-field gp-field-multi" rows="3" maxlength={AGENT_NOTE_MAX_CHARS} bind:value={note} oninput={edited} data-testid="send-to-agent-note"
           placeholder={signal ? "Anything to add for the agent" : "What should the agent hear?"}></textarea>
       </label>
+      {#if maybeDelivered}
+        <p class="problem" role="note" data-testid="send-to-agent-edit-warning">
+          {outcome
+            ? "This message may already have reached the agent. Editing the note starts a new message, sent in addition to it, with a new request id."
+            : "An earlier message may already have reached the agent. This is a new message, sent in addition to it."}
+        </p>
+      {/if}
       <p class="caption">The agent is sent exactly this:</p>
       <pre class="text" data-testid="send-to-agent-text">{text || "(nothing yet)"}</pre>
       {#if problem}<p class="problem" role="alert" data-testid="send-to-agent-problem">{problem}</p>{/if}
@@ -157,8 +185,8 @@
         {/if}
       </div>
       <div class="actions">
-        <button type="button" class="gp-btn-primary" onclick={() => void send()} disabled={!settled || !confirm || !!problem || sending || done} data-testid="send-to-agent-confirm">
-          {sending ? "Sending…" : done ? "Sent" : confirm ?? "Cannot be sent"}
+        <button type="button" class="gp-btn-primary" onclick={() => void send()} disabled={!settled || !confirm || !!problem || sending || done || closed} data-testid="send-to-agent-confirm">
+          {sending ? "Sending…" : done ? "Sent" : closed ? "Not sent again" : askAgain ? "Ask again (same message)" : confirm ?? "Cannot be sent"}
         </button>
         <button type="button" class="gp-btn" onclick={toggle} disabled={sending} data-testid="send-to-agent-cancel">Cancel</button>
       </div>

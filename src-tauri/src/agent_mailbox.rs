@@ -40,8 +40,9 @@
 //!   [`MAX_PENDING`] per session, [`MAX_SESSIONS`] directories, a pending
 //!   message expires after [`PENDING_TTL`], and at most
 //!   [`MAX_WAITERS_PER_SESSION`] / [`MAX_WAITERS_TOTAL`] hook processes wait at
-//!   once. A waiter beyond a cap is told to leave, which the hook turns into a
-//!   plain exit 0.
+//!   once. A waiter beyond the global cap is told to leave at once; beyond the
+//!   per-session cap, the *oldest* gives way to the newest, so the session is
+//!   listening from its latest stop. The hook turns either into a plain exit 0.
 //! * **Only this user's files are read.** Directories are created 0700 and
 //!   files 0600 with `O_NOFOLLOW`; a directory or file that is a symlink, is
 //!   not a regular file, is owned by another uid, or is open to group or other
@@ -498,8 +499,8 @@ impl Mailbox {
     }
 
     /// Waits for a message for this session, up to `limit`, by looking every
-    /// [`POLL`]. Takes the message the moment one is there, if this waiter is
-    /// within the caps.
+    /// [`POLL`]. Takes the message the moment one is there, unless this waiter
+    /// is over the global cap or newer waiters have displaced it.
     ///
     /// The deadline is the caller's own and is not shared with any other
     /// budget: a waiter that is clamped to a short budget would give up on a
@@ -507,14 +508,18 @@ impl Mailbox {
     pub(crate) fn wait(&self, session: &str, limit: Duration) -> Result<Wait, MailboxError> {
         let started = Instant::now();
         let dir = self.ensure_session(session, SystemTime::now())?;
-        let key = session_key(session)?;
-        let waiter = match Waiter::register(self, &dir, &key) {
+        let mut waiter = match Waiter::register(self, &dir) {
             Ok(waiter) => waiter,
             Err(MailboxError::Full(why)) => return Ok(Wait::Declined(why)),
             Err(other) => return Err(other),
         };
         let mut last_beat = Instant::now();
         loop {
+            if waiter.displaced()? {
+                return Ok(Wait::Declined(format!(
+                    "{MAX_WAITERS_PER_SESSION} newer hooks are waiting on this session."
+                )));
+            }
             if let Some(claim) = self.claim_next(session, SystemTime::now())? {
                 return Ok(Wait::Message(claim));
             }
@@ -548,16 +553,26 @@ fn nonce(now: SystemTime) -> u32 {
 
 /// A hook waiting on a session. Its file is its registration; dropping it
 /// leaves.
+///
+/// **The newest waiters on a session take precedence.** A session is listening
+/// from its latest stop, not its first: the waiters of an earlier stop that are
+/// still alive give way, at their next look, to the [`MAX_WAITERS_PER_SESSION`]
+/// newest. Ranking the other way (oldest first, as this once did) fills the
+/// session's places with the first stop's hooks, declines every later stop's,
+/// and leaves the session deaf from the moment the first stop's hooks time out
+/// even if it stopped a minute before.
 struct Waiter {
     path: PathBuf,
+    dir: PathBuf,
+    name: String,
     file: File,
 }
 
 impl Waiter {
-    /// Registers, then checks its rank, so two processes arriving together
-    /// cannot both think they were the last one in: whoever sorts past a cap
-    /// leaves, and the same ones leave whichever looked first.
-    fn register(mailbox: &Mailbox, dir: &Path, session: &str) -> Result<Self, MailboxError> {
+    /// Registers, then checks the global cap, so two processes arriving
+    /// together cannot both think they were the last one in. The per-session cap
+    /// never declines a newcomer: it displaces the oldest ([`Self::displaced`]).
+    fn register(mailbox: &Mailbox, dir: &Path) -> Result<Self, MailboxError> {
         let now = SystemTime::now();
         let name = format!(
             "w-{:013}-{}-{:08x}",
@@ -567,28 +582,73 @@ impl Waiter {
         );
         let path = dir.join(&name);
         let file = create_private(&path)?;
-        let waiter = Self { path, file };
+        let waiter = Self {
+            path,
+            dir: dir.to_path_buf(),
+            name: name.clone(),
+            file,
+        };
         let live = mailbox.live_waiters(now);
-        let here = live.iter().filter(|(s, _)| s == session);
-        let session_rank = here.clone().position(|(_, n)| *n == name);
-        let total_rank = live.iter().position(|(_, n)| *n == name);
-        match (session_rank, total_rank) {
-            (Some(s), Some(t)) if s < MAX_WAITERS_PER_SESSION && t < MAX_WAITERS_TOTAL => {
-                Ok(waiter)
-            }
-            (Some(s), _) if s >= MAX_WAITERS_PER_SESSION => Err(MailboxError::Full(format!(
-                "{MAX_WAITERS_PER_SESSION} hooks are already waiting on this session."
-            ))),
-            (_, Some(t)) if t >= MAX_WAITERS_TOTAL => Err(MailboxError::Full(format!(
-                "{MAX_WAITERS_TOTAL} hooks are already waiting on sessions."
-            ))),
-            // Not seen among the live waiters: its own file could not be read
-            // back, so it cannot be counted, and a waiter that cannot be
-            // counted does not wait.
-            _ => Err(MailboxError::Io(
+        // Not seen among the live waiters: its own file could not be read
+        // back, so it cannot be counted, and a waiter that cannot be counted
+        // does not wait.
+        if !live.iter().any(|(_, n)| *n == name) {
+            return Err(MailboxError::Io(
                 "could not register as a waiter in the mailbox".into(),
-            )),
+            ));
         }
+        // The global cap counts the waiters that will stay. A session already
+        // at its own cap gives its oldest places to this newcomer at their next
+        // look, so those do not count against it: otherwise a mailbox full of
+        // other sessions' waiters would decline a later stop on a session it
+        // already holds two places for, and that session would go deaf.
+        let mut per_session: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for (session, _) in &live {
+            *per_session.entry(session.as_str()).or_default() += 1;
+        }
+        let leaving: usize = per_session
+            .values()
+            .map(|count| count.saturating_sub(MAX_WAITERS_PER_SESSION))
+            .sum();
+        if live.len() - leaving > MAX_WAITERS_TOTAL {
+            return Err(MailboxError::Full(format!(
+                "{MAX_WAITERS_TOTAL} hooks are already waiting on sessions."
+            )));
+        }
+        Ok(waiter)
+    }
+
+    /// Whether [`MAX_WAITERS_PER_SESSION`] or more newer waiters are live on
+    /// this session, so this one should leave. Also makes sure this waiter is
+    /// still counted: a process that was suspended long enough for its file to
+    /// be pruned as stale puts it back under its own name, which keeps its
+    /// rank, rather than carry on uncounted.
+    fn displaced(&mut self) -> Result<bool, MailboxError> {
+        let now = SystemTime::now();
+        let (mut newer, mut present) = (0, false);
+        for (name, modified) in regular_files(&self.dir) {
+            if !name.starts_with("w-") || age(now, modified) > WAITER_STALE {
+                continue;
+            }
+            if name == self.name {
+                present = true;
+            } else if name > self.name {
+                newer += 1;
+            }
+        }
+        if !present {
+            match std::fs::symlink_metadata(&self.path) {
+                Ok(_) => {
+                    let _ = self.file.set_modified(now);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.file = create_private(&self.path)?;
+                }
+                Err(e) => return Err(io("could not look at a waiter's registration", &e)),
+            }
+        }
+        Ok(newer >= MAX_WAITERS_PER_SESSION)
     }
 
     fn beat(&self) {

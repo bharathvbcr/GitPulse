@@ -752,22 +752,26 @@ export interface AgentSendPreview {
   managedState?: "parked" | "running";
 }
 /**
- * What a confirmed send did. `sent` is only ever true for a message that left GitPulse: `queued` is in the
+ * What a confirmed send did. `sent` is a tri-state. `true` is a message that left GitPulse: `queued` is in the
  * session's mailbox, `picked_up` is taken by its hook (not read), `delivered` is written to a managed run's
- * provider. `resume` is not sent by the host at all: `action: "open_resume"` tells the renderer to open the
- * conversation with the text as its first prompt. A refused or unsupported managed send is `sent: false` with its
- * reason and whether sending again can help.
+ * provider. `false` is a managed send known to have written nothing: `refused` with a code Manvi documents as
+ * writing nothing, or `unsupported`. `null` is unknown: `pending` (Manvi had not learned the outcome; asking again
+ * with the same request id reports it and never sends twice), `unresolved` (Manvi cannot tell it from a lost one and
+ * will not resend), or `unconfirmed` (an answer this build cannot read). Unknown is never shown as "nothing was
+ * sent". `resume` is not sent by the host at all: `action: "open_resume"` tells the renderer to open the
+ * conversation with the text as its first prompt.
  */
 export interface AgentSendResult extends AgentSendPreview {
-  sent: boolean;
-  status?: "queued" | "picked_up" | "delivered" | "unsupported" | "refused";
+  sent: boolean | null;
+  status?: "queued" | "picked_up" | "delivered" | "unsupported" | "refused" | "pending" | "unresolved" | "unconfirmed";
   action?: "open_resume";
   retryable?: boolean;
   code?: string;
   expiresAtMs?: number;
   duplicate?: boolean;
 }
-const SEND_STATUSES = ["queued", "picked_up", "delivered", "unsupported", "refused"] as const;
+const SEND_STATUSES = ["queued", "picked_up", "delivered", "unsupported", "refused", "pending", "unresolved", "unconfirmed"] as const;
+const UNKNOWN_OUTCOMES: readonly string[] = ["pending", "unresolved", "unconfirmed"];
 function sendPreview(raw: Record<string, unknown>): AgentSendPreview {
   const route = SEND_ROUTES.find((route) => route === raw.route);
   const reason = text(raw.reason);
@@ -784,8 +788,11 @@ export async function sendAgentMessage(runId: string, message: string, requestId
   const raw = object(await request("runs.send_to_agent", { id: runId, text: message, request_id: requestId, confirm: true, expect_route: route }));
   const shown = sendPreview(raw);
   const status = raw.status === undefined ? undefined : (SEND_STATUSES.find((status) => status === raw.status) ?? invalid());
-  const sent = boolean(raw.sent);
+  const sent = raw.sent === null ? null : boolean(raw.sent);
   if (shown.route !== route || (sent && !status && route !== "resume")) return invalid();
+  // Unknown is a claim about the delivery: it needs a status that says which kind of unknown, and no other
+  // status may carry it, so a send of unknown outcome cannot be read as a plain "not sent".
+  if ((sent === null) !== (status !== undefined && UNKNOWN_OUTCOMES.includes(status))) return invalid();
   return {
     ...shown, sent,
     ...(status ? { status } : {}),

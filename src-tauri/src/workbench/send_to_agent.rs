@@ -95,7 +95,7 @@ impl Route {
                 "reason": if *listening {
                     "This agent's Claude Code session is live and a GitPulse hook is waiting on it. The message is handed to the hook and shown to the agent as a reminder."
                 } else {
-                    "This agent's Claude Code session is live, but no GitPulse hook is waiting on it right now: it is in the middle of a turn, or has been idle for over half an hour. The message is held for two hours and shown to the agent the next time its turn ends. If it stays idle, it will not see the message until you type in its terminal."
+                    "No GitPulse hook is waiting on this agent's Claude Code session right now, and GitPulse cannot see why (it may be mid-turn, idle too long, or running a hook build without deliver). The message is held for two hours and is shown only if a hook on this session picks it up."
                 },
             }),
             Self::Resume { found } => json!({
@@ -356,8 +356,9 @@ pub(super) fn send_with(
                 Some(&request.text),
                 &mut call,
             )?;
-            answer["sent"] = json!(outcome["state"] == "delivered");
-            answer["status"] = outcome["state"].clone();
+            let (sent, status, reason) = managed_delivery(&outcome);
+            answer["sent"] = sent;
+            answer["status"] = json!(status);
             for key in [
                 "retryable",
                 "code",
@@ -371,13 +372,48 @@ pub(super) fn send_with(
                     answer[key] = outcome[key].clone();
                 }
             }
-            if outcome["ok"] != true {
-                answer["reason"] = outcome["reason"].clone();
-            } else {
-                answer["reason"] = json!("Delivered to the managed run as its next turn. That the new turn has begun is shown on the run.");
-            }
+            answer["reason"] = json!(reason);
             Ok(answer)
         }
+    }
+}
+
+/// What a managed follow-up's answer says about delivery, as `(sent, status,
+/// reason)`. `sent` is `true` only for a message Manvi wrote to the provider and
+/// `false` only for an answer that is known to have written nothing; for an
+/// outcome Manvi has not settled (`pending`), cannot settle (`unresolved`), or
+/// that this build cannot read (`unconfirmed`, or a state a message send should
+/// not have been answered with) it is `null`: unknown, never "not sent".
+fn managed_delivery(outcome: &Value) -> (Value, String, String) {
+    let state = outcome["state"].as_str().unwrap_or_default();
+    let reason = outcome["reason"].as_str().unwrap_or_default().to_owned();
+    match state {
+        "delivered" => (
+            json!(true),
+            "delivered".into(),
+            "Delivered to the managed run as its next turn. That the new turn has begun is shown on the run.".into(),
+        ),
+        "refused" | "unsupported" => (json!(false), state.into(), reason),
+        "pending" | "unconfirmed" => (Value::Null, state.into(), reason),
+        // An error answer carries its own words; an answered state does not.
+        "unresolved" => (
+            Value::Null,
+            state.into(),
+            if reason.is_empty() {
+                managed_run::UNRESOLVED_REASON.to_owned()
+            } else {
+                reason
+            },
+        ),
+        // Manvi answered a message with a run state instead of a delivery.
+        // Whether the message was written is not something that answer says.
+        other => (
+            Value::Null,
+            "unconfirmed".into(),
+            format!(
+                "Manvi answered with the run's state ({other}) and not with a delivery, so it is not known whether this message reached the agent."
+            ),
+        ),
     }
 }
 

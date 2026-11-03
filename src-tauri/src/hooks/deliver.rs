@@ -30,18 +30,27 @@
 //!   deduplicate a plugin's handler against a settings one), and so does every
 //!   earlier stop's waiter that has not finished. A message is a rename away
 //!   from claimed, and exactly one process wins it.
-//! * **Bounded in number.** At most `MAX_WAITERS_PER_SESSION` hooks wait on a
-//!   session and `MAX_WAITERS_TOTAL` in all; one past a cap exits 0 at once.
+//! * **Bounded in number, newest first.** At most `MAX_WAITERS_PER_SESSION`
+//!   hooks wait on a session and `MAX_WAITERS_TOTAL` in all. One past the
+//!   global cap exits 0 at once; past the per-session cap, the oldest exits 0
+//!   at its next look and the newcomer stays, so a session is listening from
+//!   its latest stop.
 //! * **Only GitPulse's own sessions.** Without `GITPULSE_SESSION_ID` (set on
 //!   every PTY GitPulse spawns) the session is not one GitPulse launched and
 //!   the hook leaves at once.
 //!
 //! `stop_hook_active` is `true` when Claude is already continuing because of a
-//! stop hook, and a `Stop` can then fire several times in a row. The reference
-//! gives it no meaning for an `asyncRewake` hook, so it is used for the one
-//! thing it can mean here: those repeats do not each start another waiter. They
-//! look once, take a message that is already there, and leave; the waiter from
-//! the first stop is still waiting.
+//! stop hook. The reference gives it no meaning for an `asyncRewake` hook, and
+//! this hook does not act on it: **every stop waits.** The turn an
+//! `asyncRewake` wake starts is itself a stop-hook continuation (Claude Code
+//! 2.1.317 queues the wake with `stopHookActive: true`; inferred from the
+//! minified binary, no real turn was run), so a hook that declined to wait on
+//! `stop_hook_active` would leave the session with no waiter from the moment a
+//! message was delivered until the person typed. A waiter that wakes only on a
+//! person's confirmed message does not make a loop, and the bounds do: the
+//! newest [`crate::agent_mailbox::MAX_WAITERS_PER_SESSION`] waiters on a
+//! session take precedence (earlier stops' hooks give way), the global cap, and
+//! Claude Code's own cap on consecutive continuations.
 
 use std::time::Duration;
 
@@ -112,14 +121,8 @@ pub(super) fn run_in(
     if crate::agent_mailbox::session_key(&input.session_id).is_err() {
         return Ok(HookOutput::silent());
     }
-    let waited = if input.stop_hook_active {
-        mailbox
-            .claim_next(&input.session_id, std::time::SystemTime::now())
-            .map(|claim| claim.map_or(Wait::TimedOut, Wait::Message))
-    } else {
-        mailbox.wait(&input.session_id, wait)
-    };
-    match waited {
+    // Every stop waits, `stop_hook_active` or not; see the module documentation.
+    match mailbox.wait(&input.session_id, wait) {
         Ok(Wait::Message(claim)) => Err(HookError::Wake(reminder(&claim.text))),
         Ok(Wait::TimedOut) => Ok(HookOutput::silent()),
         Ok(Wait::Declined(why)) => {

@@ -5,7 +5,7 @@ const native = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => native(...args) }));
 
 const { previewAgentMessage, sendAgentMessage, WorkbenchError } = await import("./client");
-const { AGENT_MESSAGE_MAX_BYTES, composeAgentMessage, confirmLabel, describeResume, describeSend, messageProblem, routeTitle } = await import("./sendToAgent");
+const { AGENT_MESSAGE_MAX_BYTES, WROTE_NOTHING_CODES, composeAgentMessage, confirmLabel, describeResume, describeSend, messageProblem, routeTitle, unknownOutcome } = await import("./sendToAgent");
 type Signal = import("./client").AttentionSignal;
 
 const SIGNAL: Signal = {
@@ -111,6 +111,51 @@ describe("what a send says it did", () => {
     expect(describeSend({ route: "managed", reason: "x", sent: true, status: "delivered" }).tone).toBe("note");
   });
 
+  it("says only what is known when no hook was waiting, and names no cause it did not see", () => {
+    const text = describeSend({ ...base, status: "queued", listening: false }).text;
+    expect(text).toContain("No GitPulse hook was waiting");
+    expect(text).toContain("only if a hook on the session picks it up");
+    expect(text).not.toContain("the next time its turn ends");
+  });
+
+  it("does not say 'Nothing was sent' for a pending outcome: the message may have been written", () => {
+    const pending = describeSend({ route: "managed", reason: "Manvi has not yet said whether this follow-up reached the agent, so it may have.", sent: null, status: "pending", retryable: true, code: "E_CONTINUE_PENDING" });
+    expect(pending.tone).toBe("error");
+    expect(pending.text).toContain("may have");
+    expect(pending.text).not.toMatch(/nothing was sent/i);
+    expect(unknownOutcome({ route: "managed", reason: "r", sent: null, status: "pending" })).toBe("ask-again");
+  });
+
+  it("does not say 'Nothing was sent' for an unresolved delivery, and closes the panel's Confirm", () => {
+    const unresolved = describeSend({ route: "managed", reason: "Manvi cannot tell whether this follow-up reached the agent, and it will not be sent again.", sent: null, status: "unresolved", retryable: false, code: "E_CONTINUE_UNRESOLVED" });
+    expect(unresolved.tone).toBe("error");
+    expect(unresolved.text).not.toMatch(/nothing was sent/i);
+    expect(unknownOutcome({ route: "managed", reason: "r", sent: null, status: "unresolved" })).toBe("closed");
+  });
+
+  it("does not claim nothing was sent for a refusal whose code Manvi does not document as writing nothing", () => {
+    const unknownCode = describeSend({ route: "managed", reason: "Manvi said no.", sent: false, status: "refused", retryable: false, code: "E_SOMETHING_NEW" });
+    expect(unknownCode.text).not.toMatch(/nothing was sent/i);
+    expect(unknownCode.text).toContain("not known");
+    const noCode = describeSend({ route: "managed", reason: "Manvi said no.", sent: false, status: "refused" });
+    expect(noCode.text).not.toMatch(/nothing was sent/i);
+    const unconfirmed = describeSend({ route: "managed", reason: "Manvi answered with an error GitPulse does not recognise.", sent: null, status: "unconfirmed", retryable: false });
+    expect(unconfirmed.text).not.toMatch(/nothing was sent/i);
+  });
+
+  it("says 'Nothing was sent' for exactly the codes Manvi documents as writing nothing, which are the Rust list", () => {
+    const rust = readFileSync(new URL("../../../src-tauri/src/workbench/managed_run.rs", import.meta.url), "utf8");
+    const block = /pub\(crate\) const WROTE_NOTHING: \[&str; \d+\] = \[([^\]]*)\];/.exec(rust);
+    expect(block, "managed_run::WROTE_NOTHING is no longer a string array; update this contract").toBeTruthy();
+    const codes = [...block![1].matchAll(/"(E_[A-Z_]+)"/g)].map((m) => m[1]);
+    expect([...WROTE_NOTHING_CODES].sort()).toEqual([...codes, "E_CONTINUE_UNSUPPORTED"].sort());
+    for (const code of WROTE_NOTHING_CODES) {
+      const result = describeSend({ route: "managed", reason: "r", sent: false, status: code === "E_CONTINUE_UNSUPPORTED" ? "unsupported" : "refused", retryable: false, code });
+      expect(result.text, code).toContain("Nothing was sent.");
+    }
+    for (const code of ["E_CONTINUE_PENDING", "E_CONTINUE_UNRESOLVED"]) expect(WROTE_NOTHING_CODES).not.toContain(code);
+  });
+
   it("describes a resumed conversation as starting with the message, or still waiting for its checkout", () => {
     expect(describeResume("started")).toContain("first prompt");
     expect(describeResume("queued")).toContain("still opening");
@@ -167,6 +212,24 @@ describe("the host's answers, decoded strictly", () => {
     await expect(sendAgentMessage("run", "hi", "r1", "mailbox")).rejects.toBeInstanceOf(WorkbenchError);
     native.mockResolvedValueOnce(answer({ route: "mailbox", sent: true, status: "teleported" }));
     await expect(sendAgentMessage("run", "hi", "r1", "mailbox")).rejects.toBeInstanceOf(WorkbenchError);
+  });
+
+  it.each([
+    ["pending", "E_CONTINUE_PENDING", true],
+    ["unresolved", "E_CONTINUE_UNRESOLVED", false],
+    ["unconfirmed", "E_SOMETHING_NEW", false],
+  ])("reads a managed send of unknown outcome (%s) as sent: null, never as false", async (status, code, retryable) => {
+    native.mockResolvedValueOnce(answer({ route: "managed", sent: null, status, code, retryable, reason: "not known" }));
+    expect(await sendAgentMessage("run", "hi", "r1", "managed")).toMatchObject({ route: "managed", sent: null, status, code, retryable });
+  });
+
+  it("refuses an unknown outcome that does not say which kind, and a kind that claims a known outcome", async () => {
+    native.mockResolvedValueOnce(answer({ route: "managed", sent: null }));
+    await expect(sendAgentMessage("run", "hi", "r1", "managed")).rejects.toBeInstanceOf(WorkbenchError);
+    native.mockResolvedValueOnce(answer({ route: "managed", sent: null, status: "refused" }));
+    await expect(sendAgentMessage("run", "hi", "r1", "managed")).rejects.toBeInstanceOf(WorkbenchError);
+    native.mockResolvedValueOnce(answer({ route: "managed", sent: false, status: "pending" }));
+    await expect(sendAgentMessage("run", "hi", "r1", "managed")).rejects.toBeInstanceOf(WorkbenchError);
   });
 
   it("keeps the host's error code, so a changed route can be told from a failure", async () => {

@@ -93,15 +93,56 @@ export function describeSend(result: AgentSendResult): { tone: "note" | "error";
       tone: "note",
       text: result.listening
         ? `Queued. A hook is waiting on the session, so it should be shown to the agent within a moment.${until} Queued is not read.`
-        : `Queued for the session. It is shown to the agent the next time its turn ends.${until} Queued is not read.`,
+        : `Queued for the session. No GitPulse hook was waiting on it when this was sent, so it is shown only if a hook on the session picks it up.${until} Queued is not read.`,
     };
   }
   if (result.route === "managed") {
-    if (result.sent) return { tone: "note", text: "Delivered to the managed agent as its next turn. That the turn has begun is shown on the run." };
+    if (result.sent === true) return { tone: "note", text: "Delivered to the managed agent as its next turn. That the turn has begun is shown on the run." };
+    if (!wroteNothing(result)) {
+      // The host's reason already says which kind of unknown this is. A status
+      // the renderer cannot place gets the same caution, never "nothing was sent".
+      const unknown = result.status === "pending" || result.status === "unresolved" || result.status === "unconfirmed";
+      return { tone: "error", text: unknown ? result.reason : `${result.reason} Whether this reached the agent is not known.` };
+    }
     const again = result.retryable ? " Nothing was sent; you can send again." : " Nothing was sent.";
     return { tone: "error", text: `${result.reason}${again}` };
   }
   return { tone: "note", text: result.reason };
+}
+
+/**
+ * The refusal codes Manvi documents as writing nothing to the provider
+ * (`docs/WORKBENCH.md`, `work.runs.managed.continue`): the six in
+ * `WROTE_NOTHING` in `src-tauri/src/workbench/managed_run.rs`, which
+ * `sendToAgent.test.ts` holds this list to, and `E_CONTINUE_UNSUPPORTED`.
+ * `E_CONTINUE_PENDING` and `E_CONTINUE_UNRESOLVED` are not here: the message
+ * may have been written.
+ */
+export const WROTE_NOTHING_CODES: readonly string[] = [
+  "E_TURN_IN_FLIGHT",
+  "E_CONTINUE_RATE",
+  "E_CONTINUE_LIMIT",
+  "E_RUN_ENDED",
+  "E_DEPENDENCY",
+  "E_BAD_REQUEST",
+  "E_CONTINUE_UNSUPPORTED",
+];
+
+/** Whether a managed result is known to have written nothing: `sent` is false and the cause is one Manvi says writes nothing. */
+export function wroteNothing(result: AgentSendResult): boolean {
+  if (result.sent !== false) return false;
+  return result.status === "unsupported" || (result.status === "refused" && result.code !== undefined && WROTE_NOTHING_CODES.includes(result.code));
+}
+
+/**
+ * What the panel does after a send whose outcome is not known. `pending` keeps
+ * Confirm armed with the same request id (asking again reports the outcome and
+ * never sends twice); `unresolved` and `unconfirmed` close it, because Manvi will
+ * not resend and an answer this build cannot read is not retried blind.
+ */
+export function unknownOutcome(result: AgentSendResult): "ask-again" | "closed" | null {
+  if (result.sent !== null) return null;
+  return result.status === "pending" ? "ask-again" : "closed";
 }
 
 /** What a resumed conversation's start says: the message is its first prompt, and where the tab is. */

@@ -375,7 +375,7 @@ fn a_preview_sends_nothing_and_a_confirm_sends_only_along_the_route_shown() {
     assert!(preview["reason"]
         .as_str()
         .unwrap()
-        .contains("no GitPulse hook is waiting"));
+        .contains("No GitPulse hook is waiting"));
     assert_eq!(
         mailbox.pending(SESSION),
         0,
@@ -629,4 +629,133 @@ fn a_refusal_after_the_preview_is_reported_as_not_sent_and_says_whether_to_retry
         (json!(false), json!("refused"), json!(true))
     );
     assert_eq!(sent["code"], "E_TURN_IN_FLIGHT");
+}
+
+/// Sends one confirmed managed message to a Manvi that answers the status read
+/// as parked and the message with `answer`.
+fn confirmed_managed_send(answer: Result<Value, WorkbenchError>) -> Value {
+    let dir = tempfile::tempdir().unwrap();
+    let (state, root) = host(dir.path());
+    prepare(&state, &root, "runs.prepare_managed", "run", "claude");
+    claim(&state, "run", Some("managed"));
+    let mailbox = mailbox(dir.path());
+    let mut answer = Some(answer);
+    send_with(
+        &state,
+        &ask("run", "hello", "r1", true, Some("managed")),
+        &mailbox,
+        |_: &str, params: Value| -> Result<Value, WorkbenchError> {
+            if params.get("message").is_some() {
+                answer.take().expect("one message is sent once")
+            } else {
+                Ok(json!({"state": "parked", "turn": 1, "max_turns": 3}))
+            }
+        },
+    )
+    .unwrap()
+}
+
+/// `E_CONTINUE_PENDING` is "the wait for the outcome ran out": the message may
+/// have been written. It was reported as `sent: false`, `refused`, which the
+/// panel read as "Nothing was sent", after which an edit made a second message.
+#[test]
+fn a_pending_outcome_is_unknown_and_never_reported_as_not_sent() {
+    let sent = confirmed_managed_send(Err(WorkbenchError::new(
+        "E_CONTINUE_PENDING",
+        "the wait ran out",
+    )));
+    assert_eq!(sent["sent"], Value::Null, "{sent}");
+    assert_eq!(sent["status"], "pending");
+    assert_eq!(sent["retryable"], true);
+    assert_eq!(sent["code"], "E_CONTINUE_PENDING");
+    let reason = sent["reason"].as_str().unwrap();
+    assert!(reason.contains("same request id"), "{reason}");
+    assert!(
+        !reason.to_lowercase().contains("nothing was sent"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn an_unresolved_delivery_is_unknown_and_not_retryable() {
+    let sent = confirmed_managed_send(Err(WorkbenchError::new(
+        "E_CONTINUE_UNRESOLVED",
+        "cannot tell it from a lost one",
+    )));
+    assert_eq!(sent["sent"], Value::Null, "{sent}");
+    assert_eq!(sent["status"], "unresolved");
+    assert_eq!(sent["retryable"], false);
+    assert!(sent["reason"]
+        .as_str()
+        .unwrap()
+        .contains("will not be sent again"));
+}
+
+#[test]
+fn a_code_this_build_does_not_know_is_unconfirmed_and_not_a_refusal() {
+    let sent = confirmed_managed_send(Err(WorkbenchError::new(
+        "E_SOMETHING_NEW",
+        "a code from a newer Manvi",
+    )));
+    assert_eq!(sent["sent"], Value::Null, "{sent}");
+    assert_eq!(sent["status"], "unconfirmed");
+    assert_eq!(sent["retryable"], false);
+}
+
+/// A message answered with the run's state, not a delivery, says nothing about
+/// whether it was written; the old reason said "Delivered" for an `ended` run.
+#[test]
+fn a_message_answered_with_a_run_state_is_not_called_delivered() {
+    for state in ["parked", "running", "ended"] {
+        let sent = confirmed_managed_send(Ok(json!({"state": state, "turn": 1, "max_turns": 3})));
+        assert_eq!(sent["sent"], Value::Null, "{state}: {sent}");
+        assert_eq!(sent["status"], "unconfirmed", "{state}");
+        let reason = sent["reason"].as_str().unwrap();
+        assert!(!reason.contains("Delivered"), "{state}: {reason}");
+        assert!(reason.contains("not known"), "{state}: {reason}");
+    }
+    // An answered `unresolved` state is the unresolved delivery, in words.
+    let sent = confirmed_managed_send(Ok(
+        json!({"state": "unresolved", "turn": 1, "max_turns": 3}),
+    ));
+    assert_eq!(sent["sent"], Value::Null, "{sent}");
+    assert_eq!(sent["status"], "unresolved");
+    let reason = sent["reason"].as_str().unwrap();
+    assert!(reason.contains("will not be sent again"), "{reason}");
+}
+
+#[test]
+fn a_documented_refusal_is_still_a_definite_not_sent() {
+    for code in [
+        "E_TURN_IN_FLIGHT",
+        "E_CONTINUE_RATE",
+        "E_CONTINUE_LIMIT",
+        "E_RUN_ENDED",
+        "E_DEPENDENCY",
+    ] {
+        let sent = confirmed_managed_send(Err(WorkbenchError::new(code, "refused")));
+        assert_eq!(
+            (sent["sent"].clone(), sent["status"].clone()),
+            (json!(false), json!("refused")),
+            "{code}"
+        );
+    }
+}
+
+/// The preview of the not-listening mailbox route says only what GitPulse
+/// observed: no waiting hook. It names no cause it did not see.
+#[test]
+fn the_not_listening_preview_names_no_unobserved_cause_as_the_cause() {
+    let preview = Route::Mailbox {
+        session: SESSION.into(),
+        listening: false,
+    }
+    .preview();
+    let reason = preview["reason"].as_str().unwrap();
+    assert!(reason.contains("cannot see why"), "{reason}");
+    assert!(reason.contains("hook build without deliver"), "{reason}");
+    assert!(
+        !reason.contains("in the middle of a turn, or has been idle"),
+        "{reason}"
+    );
 }

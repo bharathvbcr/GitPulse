@@ -388,26 +388,91 @@ mod hostile {
     }
 }
 
+/// Registers a waiter and lets the clock tick, so the next one is newer by name.
+fn register_next(mailbox: &Mailbox, dir: &Path) -> Waiter {
+    let waiter = Waiter::register(mailbox, dir).unwrap();
+    std::thread::sleep(Duration::from_millis(3));
+    waiter
+}
+
+/// The per-session cap never declines a newcomer: the newest waiters hold the
+/// places and the oldest gives way. (The reverse, oldest-first, left a session
+/// deaf from the first stop's timeout even if it stopped a minute before.)
 #[test]
-fn a_waiter_beyond_the_per_session_cap_is_told_to_leave() {
+fn the_newest_waiters_on_a_session_take_precedence_over_older_ones() {
     let (_dir, mailbox) = mailbox();
     let dir = mailbox.ensure_session(SESSION, SystemTime::now()).unwrap();
-    let mut held = Vec::new();
-    for _ in 0..MAX_WAITERS_PER_SESSION {
-        held.push(Waiter::register(&mailbox, &dir, SESSION).unwrap());
-        std::thread::sleep(Duration::from_millis(2));
+    let mut earlier: Vec<Waiter> = (0..MAX_WAITERS_PER_SESSION)
+        .map(|_| register_next(&mailbox, &dir))
+        .collect();
+    for waiter in &mut earlier {
+        assert!(!waiter.displaced().unwrap(), "no one is newer yet");
     }
-    assert!(matches!(
-        Waiter::register(&mailbox, &dir, SESSION),
-        Err(MailboxError::Full(_))
-    ));
-    // The refused one removed its own file, so it holds no place.
+    let mut later: Vec<Waiter> = (0..MAX_WAITERS_PER_SESSION)
+        .map(|_| register_next(&mailbox, &dir))
+        .collect();
+    for waiter in &mut later {
+        assert!(!waiter.displaced().unwrap(), "the latest stop's hooks stay");
+    }
+    for waiter in &mut earlier {
+        assert!(waiter.displaced().unwrap(), "an earlier stop's hook stays");
+    }
+    // One newer waiter displaces only the oldest of a full set.
+    let (_dir, mailbox) = self::mailbox();
+    let dir = mailbox.ensure_session(SESSION, SystemTime::now()).unwrap();
+    let mut held: Vec<Waiter> = (0..MAX_WAITERS_PER_SESSION)
+        .map(|_| register_next(&mailbox, &dir))
+        .collect();
+    let mut newcomer = register_next(&mailbox, &dir);
+    assert!(!newcomer.displaced().unwrap());
+    assert!(held[0].displaced().unwrap());
+    assert!(!held[1].displaced().unwrap());
+    // A displaced waiter that is dropped frees its file.
+    drop(held.remove(0));
     assert_eq!(
         mailbox.live_waiters(SystemTime::now()).len(),
         MAX_WAITERS_PER_SESSION
     );
-    drop(held.remove(0));
-    assert!(Waiter::register(&mailbox, &dir, SESSION).is_ok());
+}
+
+/// The wait itself, not only the ranking: a waiter that a later stop's hooks
+/// have displaced gives up with `Declined`, and does not take a message.
+#[test]
+fn a_waiter_displaced_by_a_later_stop_leaves_without_taking_the_message() {
+    let (_dir, mailbox) = mailbox();
+    let dir = mailbox.ensure_session(SESSION, SystemTime::now()).unwrap();
+    let outcome = std::thread::scope(|scope| {
+        let old = scope.spawn(|| mailbox.wait(SESSION, Duration::from_secs(30)).unwrap());
+        let seen = Instant::now();
+        while !mailbox.listening(SESSION, SystemTime::now()) {
+            assert!(
+                seen.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
+                "the waiter never registered"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        // The later stop's hooks arrive.
+        let _newer: Vec<Waiter> = (0..MAX_WAITERS_PER_SESSION)
+            .map(|_| register_next(&mailbox, &dir))
+            .collect();
+        old.join().unwrap()
+    });
+    assert!(matches!(outcome, Wait::Declined(_)), "{outcome:?}");
+}
+
+/// A process suspended long enough for its registration to be pruned as stale
+/// puts it back under its own name, instead of carrying on uncounted.
+#[test]
+fn a_waiter_whose_registration_was_pruned_is_counted_again_under_its_own_name() {
+    let (_dir, mailbox) = mailbox();
+    let dir = mailbox.ensure_session(SESSION, SystemTime::now()).unwrap();
+    let mut waiter = register_next(&mailbox, &dir);
+    std::fs::remove_file(&waiter.path).unwrap();
+    assert!(!mailbox.listening(SESSION, SystemTime::now()));
+    assert!(!waiter.displaced().unwrap());
+    assert!(mailbox.listening(SESSION, SystemTime::now()));
+    assert_eq!(mailbox.live_waiters(SystemTime::now())[0].1, waiter.name);
 }
 
 #[test]
@@ -418,14 +483,14 @@ fn a_waiter_beyond_the_global_cap_is_told_to_leave() {
         let session = session_n(n);
         let dir = mailbox.ensure_session(&session, SystemTime::now()).unwrap();
         for _ in 0..MAX_WAITERS_PER_SESSION {
-            held.push(Waiter::register(&mailbox, &dir, &session).unwrap());
+            held.push(Waiter::register(&mailbox, &dir).unwrap());
             std::thread::sleep(Duration::from_millis(2));
         }
     }
     let extra = session_n(99);
     let dir = mailbox.ensure_session(&extra, SystemTime::now()).unwrap();
     assert!(matches!(
-        Waiter::register(&mailbox, &dir, &extra),
+        Waiter::register(&mailbox, &dir),
         Err(MailboxError::Full(_))
     ));
 }
@@ -434,7 +499,7 @@ fn a_waiter_beyond_the_global_cap_is_told_to_leave() {
 fn a_waiter_that_stops_beating_stops_counting() {
     let (_dir, mailbox) = mailbox();
     let dir = mailbox.ensure_session(SESSION, SystemTime::now()).unwrap();
-    let _waiter = Waiter::register(&mailbox, &dir, SESSION).unwrap();
+    let _waiter = Waiter::register(&mailbox, &dir).unwrap();
     let now = SystemTime::now();
     assert!(mailbox.listening(SESSION, now));
     assert!(!mailbox.listening(SESSION, now + WAITER_STALE + Duration::from_secs(1)));
@@ -504,19 +569,85 @@ fn waiting_with_nothing_to_take_times_out_at_its_own_limit() {
 }
 
 #[test]
-fn a_waiter_over_the_cap_declines_instead_of_waiting() {
+fn a_waiter_over_the_global_cap_declines_instead_of_waiting() {
     let (_dir, mailbox) = mailbox();
-    let dir = mailbox.ensure_session(SESSION, SystemTime::now()).unwrap();
-    let held: Vec<Waiter> = (0..MAX_WAITERS_PER_SESSION)
-        .map(|_| {
-            let w = Waiter::register(&mailbox, &dir, SESSION).unwrap();
-            std::thread::sleep(Duration::from_millis(2));
-            w
-        })
-        .collect();
+    let mut held = Vec::new();
+    for n in 0..MAX_WAITERS_TOTAL / MAX_WAITERS_PER_SESSION {
+        let session = session_n(n);
+        let dir = mailbox.ensure_session(&session, SystemTime::now()).unwrap();
+        for _ in 0..MAX_WAITERS_PER_SESSION {
+            held.push(register_next(&mailbox, &dir));
+        }
+    }
     let began = Instant::now();
     let outcome = mailbox.wait(SESSION, Duration::from_secs(30)).unwrap();
     assert!(matches!(outcome, Wait::Declined(_)), "{outcome:?}");
     assert!(began.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5)));
     drop(held);
+}
+
+/// With every place in the mailbox taken, a later stop on a session that
+/// already holds two is still heard: its older waiters are leaving, so they do
+/// not count against the cap. A session that holds none is declined.
+#[test]
+fn a_saturated_mailbox_still_lets_a_held_session_listen_from_its_latest_stop() {
+    let (_dir, mailbox) = mailbox();
+    let mut held = Vec::new();
+    let mut dirs = Vec::new();
+    for n in 0..MAX_WAITERS_TOTAL / MAX_WAITERS_PER_SESSION {
+        let session = session_n(n);
+        let dir = mailbox.ensure_session(&session, SystemTime::now()).unwrap();
+        for _ in 0..MAX_WAITERS_PER_SESSION {
+            held.push(register_next(&mailbox, &dir));
+        }
+        dirs.push(dir);
+    }
+    assert_eq!(
+        mailbox.live_waiters(SystemTime::now()).len(),
+        MAX_WAITERS_TOTAL
+    );
+    // A later stop on session 0: accepted, and its oldest waiter gives way.
+    let mut newest = Waiter::register(&mailbox, &dirs[0]).expect("a held session was declined");
+    assert!(!newest.displaced().unwrap());
+    assert!(held[0].displaced().unwrap());
+    // A session with no place is still declined at the cap.
+    let extra = session_n(99);
+    let extra_dir = mailbox.ensure_session(&extra, SystemTime::now()).unwrap();
+    assert!(matches!(
+        Waiter::register(&mailbox, &extra_dir),
+        Err(MailboxError::Full(_))
+    ));
+    // The declined one removed its own file.
+    assert_eq!(
+        mailbox.live_waiters(SystemTime::now()).len(),
+        MAX_WAITERS_TOTAL + 1
+    );
+}
+
+/// A full session is not a closed door to the next stop: its hooks wait, and
+/// the oldest waiter gives way. The previous rule declined them at once.
+#[test]
+fn a_waiter_arriving_at_a_full_session_waits_and_hears_the_message() {
+    let (_dir, mailbox) = mailbox();
+    let dir = mailbox.ensure_session(SESSION, SystemTime::now()).unwrap();
+    let mut held: Vec<Waiter> = (0..MAX_WAITERS_PER_SESSION)
+        .map(|_| register_next(&mailbox, &dir))
+        .collect();
+    let outcome = std::thread::scope(|scope| {
+        let newcomer = scope.spawn(|| mailbox.wait(SESSION, Duration::from_secs(30)).unwrap());
+        let seen = Instant::now();
+        while mailbox.live_waiters(SystemTime::now()).len() <= MAX_WAITERS_PER_SESSION {
+            assert!(
+                seen.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
+                "the newcomer never registered"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(held[0].displaced().unwrap(), "the oldest kept its place");
+        mailbox
+            .deposit(SESSION, "r", "for the newest", SystemTime::now())
+            .unwrap();
+        newcomer.join().unwrap()
+    });
+    assert!(matches!(outcome, Wait::Message(_)), "{outcome:?}");
 }

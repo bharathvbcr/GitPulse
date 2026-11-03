@@ -24,7 +24,7 @@
   addEventListener("unhandledrejection", e => { calls.errors.push(String(e.reason)); show(); });
 
   // What the host will say next. A scenario is set by the check that needs it.
-  let scenario = { route: "mailbox", reason: "A GitPulse hook is not waiting; it is shown when the turn ends.", listening: false, managedState: undefined, previewDelay: 0, previewFails: false, confirm: null };
+  let scenario = { route: "mailbox", reason: "No GitPulse hook is waiting on this session right now, and GitPulse cannot see why.", listening: false, managedState: undefined, previewDelay: 0, previewFails: false, confirm: null };
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const preview = () => ({ ok: true, sent: false, route: scenario.route, reason: scenario.reason, ...(scenario.route === "mailbox" ? { listening: scenario.listening, session_id: RUN } : {}), ...(scenario.managedState ? { managed_state: scenario.managedState } : {}) });
 
@@ -114,6 +114,7 @@
       confirmBtn(row).click();
       await wait(() => calls.sends.length === 1 && q(row(), "send-to-agent-outcome"), "the send");
       check("Confirm sends once, with confirm, the route that was shown, and the exact text on screen", () => calls.sends.length === 1 && calls.sends[0].confirm === true && calls.sends[0].expect_route === "mailbox" && calls.sends[0].text === shownBeforeSend);
+      check("A queued message to a session nothing was listening on names no unobserved cause", () => { const t = q(row(), "send-to-agent-outcome").textContent; return t.includes("No GitPulse hook was waiting") && !t.includes("next time its turn ends"); });
       check("A queued message is said to be queued, and not to have been read", () => { const t = q(row(), "send-to-agent-outcome").textContent; return t.includes("Queued") && t.includes("Queued is not read") && !/\bwas read\b/.test(t); });
       check("The button now says Sent and is off", () => confirmBtn(row).textContent.trim() === "Sent" && confirmBtn(row).disabled);
       confirmBtn(row).click(); confirmBtn(row).click();
@@ -168,6 +169,41 @@
       await wait(() => calls.sends.length === 2 && q(row(), "send-to-agent-outcome")?.dataset.tone === "note", "the retry");
       check("The retry carries the same request id, so it cannot send twice", () => calls.sends[1].request_id === calls.sends[0].request_id && calls.sends[1].text === calls.sends[0].text);
       check("A delivered follow-up says delivered", () => q(row(), "send-to-agent-outcome").textContent.includes("Delivered"));
+
+      // ---- an outcome Manvi has not settled: the message may have been written ----
+      reset();
+      let settledCalls = 0;
+      const PENDING_REASON = "Manvi has not yet said whether this follow-up reached the agent, so it may have. Pressing Confirm again with the same request id asks Manvi again and never sends it twice.";
+      scenario = { ...scenario, route: "managed", managedState: "parked", reason: "This managed run is between turns.", confirm: () => settledCalls++ === 0 ? { body: { sent: null, status: "pending", retryable: true, code: "E_CONTINUE_PENDING", reason: PENDING_REASON } } : { body: { sent: true, status: "delivered", turn: 2, max_turns: 3 } } };
+      type(row, "Pending follow-up");
+      await wait(() => calls.previews.length === 1 && settled(row)(), "the pending-scenario preview");
+      confirmBtn(row).click();
+      await wait(() => calls.sends.length === 1 && q(row(), "send-to-agent-outcome"), "the pending answer");
+      check("A pending outcome is not called 'nothing was sent': it may have been written", () => { const o = q(row(), "send-to-agent-outcome"); return o.dataset.tone === "error" && o.textContent.includes("may have") && !/nothing was sent/i.test(o.textContent); });
+      check("Confirm stays armed and says it asks again about the same message", () => !confirmBtn(row).disabled && confirmBtn(row).textContent.trim() === "Ask again (same message)");
+      check("The note editor warns that editing starts a new message", () => { const w = q(row(), "send-to-agent-edit-warning"); return !!w && w.textContent.includes("Editing the note starts a new message"); });
+      confirmBtn(row).click();
+      await wait(() => calls.sends.length === 2 && q(row(), "send-to-agent-outcome")?.dataset.tone === "note", "the settled answer");
+      check("Asking again reuses the request id and the text, so it cannot send twice", () => calls.sends[1].request_id === calls.sends[0].request_id && calls.sends[1].text === calls.sends[0].text);
+      check("Once the same message is settled the warning goes away and the button says Sent", () => !q(row(), "send-to-agent-edit-warning") && confirmBtn(row).textContent.trim() === "Sent" && confirmBtn(row).disabled);
+
+      // ---- a delivery that cannot be told from a lost one -------------------------
+      reset();
+      scenario = { ...scenario, confirm: () => ({ body: { sent: null, status: "unresolved", retryable: false, code: "E_CONTINUE_UNRESOLVED", reason: "Manvi cannot tell whether this follow-up reached the agent, and it will not be sent again. The run is recorded as unresolved." } }) };
+      type(row, "Unresolved follow-up");
+      await wait(() => calls.previews.length === 1 && settled(row)(), "the unresolved-scenario preview");
+      confirmBtn(row).click();
+      await wait(() => calls.sends.length === 1 && q(row(), "send-to-agent-outcome"), "the unresolved answer");
+      check("An unresolved delivery is not called 'nothing was sent', and says it will not be resent", () => { const o = q(row(), "send-to-agent-outcome"); return o.dataset.tone === "error" && o.textContent.includes("will not be sent again") && !/nothing was sent/i.test(o.textContent); });
+      check("Confirm closes for that message without saying Sent, and the editor warns", () => confirmBtn(row).disabled && confirmBtn(row).textContent.trim() === "Not sent again" && !!q(row(), "send-to-agent-edit-warning"));
+      const unresolvedId = calls.sends[0].request_id;
+      type(row, "A different note after the unresolved one");
+      await wait(() => calls.previews.length === 2 && settled(row)(), "the preview of the edited note");
+      check("Editing starts a new message with a new request id, and the earlier one stays flagged as possibly delivered", () => !confirmBtn(row).disabled && calls.previews[1].request_id !== unresolvedId && q(row(), "send-to-agent-edit-warning")?.textContent.includes("An earlier message may already have reached the agent"));
+      q(row(), "send-to-agent-cancel").click();
+      await tick();
+      await open(row);
+      check("Closing and reopening the panel clears the warning", () => !q(row(), "send-to-agent-edit-warning"));
 
       // ---- a Manvi that cannot take follow-ups -----------------------------------
       reset();
