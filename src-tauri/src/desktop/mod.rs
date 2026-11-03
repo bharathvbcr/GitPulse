@@ -271,10 +271,15 @@ impl DesktopState {
 /// goes to the frontend.
 fn route_exit_requested<R: Runtime>(app: &AppHandle<R>, code: Option<i32>) -> exit::Begin {
     if code.is_some() {
-        exit::Begin::Proceed
-    } else {
-        exit::begin(app, exit::Origin::Internal)
+        return exit::Begin::Proceed;
     }
+    let begin = exit::begin(app, exit::Origin::Internal);
+    if begin != exit::Begin::Proceed {
+        // The exit is held for a confirmation, so whatever an earlier approval
+        // chose for the hosted runs is not for this one.
+        crate::harness::hosted::reset_exit_choice();
+    }
+    begin
 }
 
 pub fn handle_run_event<R: Runtime>(app: &AppHandle<R>, event: &RunEvent) {
@@ -717,16 +722,44 @@ pub fn cmd_set_exit_guard_ready(state: State<DesktopState>) {
 /// is the quit's choice for sessions a terminal host holds: `"leave"` keeps
 /// them running for the next launch, `"stop"` ends them. Absent leaves the
 /// backend's default: in-process sessions always stop, a host's are left.
+/// `managed` is the same choice for managed agent runs a hosted Manvi holds
+/// (Settings → Agents → keep running): `"leave"` disconnects and leaves them,
+/// `"stop"` stops them first. Absent leaves them, which is also what an exit
+/// nobody was asked about does; without a hosted Manvi the runs end with the
+/// process whatever this says.
 #[tauri::command(async)]
-pub fn cmd_exit_app(app: AppHandle, terminals: Option<String>) -> Result<(), String> {
+pub fn cmd_exit_app(
+    app: AppHandle,
+    terminals: Option<String>,
+    managed: Option<String>,
+) -> Result<(), String> {
     let sessions = app.state::<crate::terminal::TerminalSessions>();
-    match terminals.as_deref() {
-        None => {}
-        Some("leave") => sessions.set_leave_running(true),
-        Some("stop") => sessions.set_leave_running(false),
+    // Both choices are validated before either is applied, so a refused
+    // request changes nothing.
+    let leave_terminals = match terminals.as_deref() {
+        None => None,
+        Some("leave") => Some(true),
+        Some("stop") => Some(false),
         Some(other) => return Err(format!("Unknown choice for terminals on quit: {other:?}")),
-    }
-    exit::approve(&app);
+    };
+    let managed_exit = match managed.as_deref() {
+        None => None,
+        Some("leave") => Some(crate::harness::hosted::ExitChoice::Leave),
+        Some("stop") => Some(crate::harness::hosted::ExitChoice::Stop),
+        Some(other) => {
+            return Err(format!(
+                "Unknown choice for managed runs on quit: {other:?}"
+            ))
+        }
+    };
+    exit::approve(&app, || {
+        if let Some(leave) = leave_terminals {
+            sessions.set_leave_running(leave);
+        }
+        if let Some(choice) = managed_exit {
+            crate::harness::sidecar::set_managed_exit(choice);
+        }
+    });
     Ok(())
 }
 
@@ -1014,5 +1047,44 @@ mod tests {
         assert_eq!(repository_switcher_key(&a), repository_switcher_key(&b));
         b.active = false;
         assert_ne!(repository_switcher_key(&a), repository_switcher_key(&b));
+    }
+
+    /// The quit's choice for hosted runs is for one approved quit. When that
+    /// quit is held for a confirmation or cancelled, a later exit nobody was
+    /// asked about (a signal) must not find `Stop` still set.
+    #[test]
+    fn a_prevented_or_cancelled_quit_does_not_leave_stop_behind() {
+        use crate::harness::hosted::{exit_choice, set_exit_choice, ExitChoice};
+        let _serial = crate::harness::sidecar::test_serial();
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        app.manage(DesktopState::default());
+        let handle = app.handle();
+        let state = handle.state::<DesktopState>();
+
+        // A quit that proceeds keeps the choice: it is the one it was made for.
+        set_exit_choice(ExitChoice::Stop);
+        assert_eq!(route_exit_requested(handle, Some(0)), exit::Begin::Proceed);
+        assert_eq!(exit_choice(), ExitChoice::Stop);
+
+        // A code-less exit held behind a request already waiting is prevented.
+        state.exit.arm();
+        let (opened, _) = state.exit.open(exit::Origin::Internal);
+        assert_eq!(opened, exit::Begin::Deferred);
+        assert_eq!(
+            route_exit_requested(handle, None),
+            exit::Begin::AlreadyPending
+        );
+        assert_eq!(
+            exit_choice(),
+            ExitChoice::Leave,
+            "a prevented exit must not leave Stop set for a later exit nobody was asked about"
+        );
+
+        // The person cancels the quit they had answered Stop to.
+        set_exit_choice(ExitChoice::Stop);
+        let pending = state.exit.take().expect("the open request");
+        exit::settle(handle, pending, false);
+        assert_eq!(exit_choice(), ExitChoice::Leave);
+        crate::harness::hosted::reset_exit_choice();
     }
 }

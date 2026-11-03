@@ -4,6 +4,7 @@
 mod adv_w3l2_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod adv_w4b_tests;
+mod agent_mailbox;
 pub mod ai;
 pub mod alerts;
 pub mod analyzer;
@@ -246,6 +247,11 @@ pub fn run() {
             {
                 use tauri::Manager as _;
                 workbench::verification_driver::install(
+                    app.state::<workbench::WorkbenchState>().inner().clone(),
+                );
+                // CI results on an agent's branch reach its task and the
+                // inbox; delivery is the notification coordinator above.
+                workbench::ci_watch::install(
                     app.state::<workbench::WorkbenchState>().inner().clone(),
                 );
             }
@@ -543,6 +549,7 @@ pub fn run() {
             cmd_terminal_backend,
             cmd_terminal_context,
             cmd_terminal_sessions,
+            cmd_terminal_transcript,
             cmd_terminal_attach,
             cmd_terminal_detach,
             cmd_terminal_run,

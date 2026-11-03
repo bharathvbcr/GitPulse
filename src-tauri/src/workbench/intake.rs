@@ -183,6 +183,11 @@ pub(crate) struct ExternalTask {
     pub planned_files: Vec<String>,
     pub repositories: Vec<String>,
     pub logs: Option<String>,
+    /// The task this one is a subtask of: a filed task's key, or a board item
+    /// id, in this repository. Written as the store's own `parent` link, so
+    /// the store's rules (a live target, one parent, no cycle, bounded depth)
+    /// decide it, not a second check here.
+    pub parent: Option<String>,
 }
 
 impl ExternalTask {
@@ -202,6 +207,7 @@ impl ExternalTask {
             planned_files: brief.planned_files,
             repositories: brief.repositories,
             logs: brief.logs,
+            parent: None,
         }
     }
 
@@ -656,6 +662,37 @@ fn place_once(
         current => (id, current),
     };
 
+    // A subtask names its parent through the store's own `parent` link, so the
+    // store's rules decide it: a live task, one parent, no cycle, bounded
+    // depth. The link goes in only when it is not already the card's own, and
+    // every other link the card holds is kept.
+    //
+    // The parent was already read before anything was registered (`add_task`);
+    // it is read again here on purpose. Between the two the board is free to
+    // delete or merge it, and the link must name a card that is live at the
+    // moment of the write, which this read decides.
+    if let Some(reference) = &task.parent {
+        let (parent_id, _) = find_live_task(store, repository_id, reference)?;
+        let held: Vec<Value> = current
+            .as_ref()
+            .and_then(|item| item["links"].as_array())
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+        let already = held
+            .iter()
+            .any(|link| link["kind"] == "parent" && link["item_id"] == parent_id.as_str());
+        if !already {
+            let mut links: Vec<Value> = held
+                .into_iter()
+                .filter(|link| link["kind"] != "parent")
+                .collect();
+            links.push(json!({"kind": "parent", "item_id": parent_id}));
+            fields.insert("links".into(), json!(links));
+        }
+    }
+
     let mut input = fields.clone();
     input.insert("id".into(), json!(id));
     input.insert("request_id".into(), json!(fresh_id("intake")));
@@ -1076,7 +1113,26 @@ fn add_task_once(
         .map_err(|message| WorkbenchError::new("invalid_input", message))?;
     let mut related_seen = None;
     let mut scan_sequence = None;
-    if let Some(repository) = find(store, &local.identity)? {
+    // The parent a subtask names, checked before anything is registered or
+    // scanned. A repository the board has never seen has no task to be a
+    // parent of.
+    let mut parent_item = None;
+    // One lookup serves the parent check and the creation checks below.
+    let known_repository = find(store, &local.identity)?;
+    match (&known_repository, &task.parent) {
+        (Some(repository), Some(reference)) => {
+            let repository_id = repository["id"].as_str().unwrap_or_default();
+            parent_item = Some(find_live_task(store, repository_id, reference)?.0);
+        }
+        (None, Some(reference)) => {
+            return Err(WorkbenchError::new(
+                "not_found",
+                format!("No task {reference:?} on the board for this repository: nothing has been filed here yet, so there is no parent to name."),
+            ));
+        }
+        _ => {}
+    }
+    if let Some(repository) = known_repository {
         let repository_id = repository["id"].as_str().unwrap_or_default();
         let own = item_id(repository_id, &task.key);
         let creating = get_item(store, &own)?.is_none()
@@ -1102,10 +1158,14 @@ fn add_task_once(
         if creating {
             scan_sequence = Some(latest_sequence(store)?);
             let related = related_open_tasks(store, repository_id, &own, task)?;
+            // The parent the call names was read by naming it: a subtask
+            // shares its parent's words, and being held back for that would
+            // make a subtask impossible to file.
             let unreviewed: Vec<&Value> = related
                 .tasks
                 .iter()
                 .filter(|t| !is_reviewed(t, reviewed_related))
+                .filter(|t| t["item_id"].as_str() != parent_item.as_deref())
                 .collect();
             if !unreviewed.is_empty() {
                 let listed: Vec<String> = unreviewed
@@ -1195,6 +1255,9 @@ fn add_task_once(
                     "repositories": task.repositories.iter().filter(|r| !r.eq_ignore_ascii_case(&local.name)).count(),
                 },
                 "sequence": placed.sequence,
+                // The board id of the parent this task was filed under; null
+                // for a task filed without one.
+                "parent_item_id": parent_item,
                 // What the related-task check saw. Null when it did not run:
                 // an overwrite, or the repository's first task.
                 "related_check": related_seen,
@@ -2268,6 +2331,10 @@ mod head_cache_adversarial_tests;
 #[cfg(test)]
 #[path = "intake_merge_tests.rs"]
 mod merge_tests;
+
+#[cfg(test)]
+#[path = "lineage_tests.rs"]
+mod lineage_tests;
 
 #[cfg(test)]
 #[path = "profile_upgrade_tests.rs"]

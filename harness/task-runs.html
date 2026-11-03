@@ -28,7 +28,15 @@
   // No Git checkout contains the attempt's directory.
   let gitRootMissing = false;
   const worktreeCalls = [];
+  // A second attempt worktree that can be reviewed and landed: its listing row,
+  // whether the review is approved, and whether the host's merge succeeds.
+  const LAND_PATH = "/fixture/GitPulse/.gitpulse/worktrees/fix-e42-wt2lande", LAND_HEAD = "fed9876";
+  let landListed = false, landApproved = false, landMerges = false;
+  const landReview = () => ({run_id:"wt2landed",branch:"gitpulse/fix-e42-wt2lande",base_oid:"a".repeat(40),head_oid:LAND_HEAD,files_changed:1,ended:true,review:landApproved?{status:"approved",note:null}:{status:"unreviewed"},gate_on:true,gate_error:null});
   const preparations = [];
+  // The ledger rows of the attempts' activity timelines, and the reads made.
+  let ledgerRows = [];
+  const ledgerCalls = [];
   const show = () => document.getElementById("result").textContent = JSON.stringify(report, null, 2);
   addEventListener("error", event => { report.errors.push(event.message); show(); });
   addEventListener("unhandledrejection", event => { report.errors.push(String(event.reason)); show(); });
@@ -133,9 +141,14 @@
       case "cmd_list_worktrees":worktreeCalls.push({cmd,...args});return [
         {path:"/fixture/GitPulse",name:"GitPulse",head:"abc1234",branch:"main",is_bare:false,is_detached:false,is_main:true,is_locked:false,is_prunable:false,dirty_files:0,diff_stat:null,main_divergence:null,active_routes:[]},
         {path:"/fixture/GitPulse/.gitpulse/worktrees/fix-e42-wt0attem",name:"fix-e42-wt0attem",head:"def5678",branch:"gitpulse/fix-e42-wt0attem",is_bare:false,is_detached:false,is_main:false,is_locked:false,is_prunable:false,dirty_files:2,diff_stat:null,main_divergence:null,active_routes:[]},
+        ...(landListed?[{path:LAND_PATH,name:"fix-e42-wt2lande",head:LAND_HEAD,branch:"gitpulse/fix-e42-wt2lande",is_bare:false,is_detached:false,is_main:false,is_locked:false,is_prunable:false,dirty_files:0,diff_stat:null,main_divergence:null,active_routes:[]}]:[]),
       ];
+      case "cmd_attempt_review":return landReview();
+      case "cmd_attempt_review_record":landApproved=args.decision==="approve";return landReview();
       // The backend lane refuses while a live run holds the worktree.
-      case "cmd_worktree_merge_teardown":worktreeCalls.push({cmd,...args});throw new Error("Claude Code is still working in this worktree (attempt wt0attempt). Stop it or wait for it to finish, then merge.");
+      case "cmd_worktree_merge_teardown":worktreeCalls.push({cmd,...args});
+        if (landMerges && args.worktreePath===LAND_PATH) { landListed=false; return {policy:null,output:{merged:true,merged_branch:"gitpulse/fix-e42-wt2lande",target_branch:"main",commits_merged:1,before_oid:"a",after_oid:"b",base_oid:null,worktree_removed:true,removal_error:null,branch_deleted:true,branch_error:null,hook_error:null}}; }
+        throw new Error("Claude Code is still working in this worktree (attempt wt0attempt). Stop it or wait for it to finish, then merge.");
       case "cmd_remove_worktree":worktreeCalls.push({cmd,...args});return {policy:null,output:null};
       case "cmd_delete_branch":worktreeCalls.push({cmd,...args});throw new Error("error: the branch 'gitpulse/fix-e42-wt0attem' is not fully merged");
       case "cmd_terminal_spawn":
@@ -149,6 +162,9 @@
       // One uncommitted file, so the pane has a real status reading to show.
       case "cmd_get_status":return [{path:"src/reconnect.ts",status_code:"M",is_staged:false,is_conflicted:false,additions:3,deletions:1}];
       case "cmd_list_branches":case "cmd_list_remotes":case "cmd_list_submodules":return [];
+      // The rows a run left, as the command filters them: the newest `limit`
+      // of the requested sessions, oldest first.
+      case "cmd_ledger_tail":{ledgerCalls.push(args);const wanted=args.sessionIds??[];return ledgerRows.filter(row=>wanted.includes(row.session_id)).slice(-args.limit);}
       case "cmd_stash_list":return { entries: [], truncated: false };
       case "cmd_list_tags":return {tags:[],truncated:false};
       case "cmd_branch_stats":return {};
@@ -239,6 +255,122 @@
       check("Reconnect attaches without killing or spawning a second task",report.launchCalls===2&&report.taskSpawns===1&&report.kills===0);
       await wait(()=>paneSessions().some(el=>el.dataset.phase==="running"));
       check("The pane shows the session running in this window, with a Stop agent control",!!button("Stop agent"));
+      // ---- The attempt's activity timeline, from the ledger rows it left ----
+      {
+        const run=[...runs.values()].find(item=>item.session_id==="task-session-1"), ptyId=run.session_id;
+        const card=()=>pane().querySelector(`[data-run-id="${run.id}"]`);
+        const activity=()=>card().querySelector('[data-testid="agent-activity"]');
+        const at=seconds=>new Date(Date.parse("2026-09-01T12:00:00.000Z")+seconds*1000).toISOString();
+        let nextId=1;
+        const row=(session,action,object,detail,extra={})=>({id:nextId++,ulid:`01ACTIVITY${String(nextId).padStart(16,"0")}`,ts_utc:at(0),schema_version:1,repo_path:"/fixture/GitPulse",worktree_path:null,actor_kind:"agent",actor_id:"claude-code",session_id:session,task_id:null,action,object,argv_json:null,outcome:"ok",verdict_json:null,before_ref:null,after_ref:null,duration_ms:null,detail_json:JSON.stringify(detail),...extra});
+        const state=(event,seconds)=>row(ptyId,"session.state",event,{event,occurred_at:at(seconds)});
+        const usage=(input,output,cacheRead,cacheCreation,seconds)=>row(run.id,"session.usage","msg",{occurred_at:at(seconds),usage:{input,output,cache_read:cacheRead,cache_creation:cacheCreation}});
+        ledgerRows=[
+          state("prompt_submitted",0),state("permission_request",200),state("tool_finished",230),state("turn_finished",300),
+          row(run.id,"session.command","cargo build",{occurred_at:at(5),result:"ok"},{duration_ms:4200}),
+          row(run.id,"session.command","cargo test --lib",{occurred_at:at(20),result:"error",subagent_id:"a1b2c3d4e5"},{outcome:"failed",duration_ms:90000}),
+          row(run.id,"session.command","sleep 600",{occurred_at:at(130)}),
+          row(run.id,"session.edit","/fixture/GitPulse/src/reconnect.ts",{occurred_at:at(140),result:"ok"}),
+          usage(3,400,1000,70,10),usage(2,100,2000,0,45),
+        ];
+        check("Nothing is read from the ledger until the reader opens the activity",!!activity()&&!activity().open&&ledgerCalls.length===0);
+        activity().open=true;
+        await wait(()=>card().querySelector('[data-testid="agent-activity-items"]'));
+        check("Opening it reads the newest rows of both of the attempt's session ids, once",
+          ledgerCalls.length===1&&ledgerCalls[0].newest===true&&ledgerCalls[0].limit===400
+          &&JSON.stringify(ledgerCalls[0].sessionIds)===JSON.stringify([run.id,ptyId])&&ledgerCalls[0].repoPath===run.cwd);
+        const items=()=>[...card().querySelectorAll('[data-testid="agent-activity-item"]')];
+        check("Every edit and command is listed in the order it ran",
+          items().map(item=>item.querySelector(".label").textContent).join("|")==="cargo build|cargo test --lib|sleep 600|/fixture/GitPulse/src/reconnect.ts");
+        const failed=items().find(item=>item.dataset.outcome==="failed");
+        check("A failed test is marked failed, takes the duration its result gave and names its subagent",
+          failed.dataset.kind==="test"&&failed.querySelector('[data-testid="agent-activity-duration"]').textContent==="1m 30s"&&failed.textContent.includes("subagent a1b2c3d"));
+        const unseen=items().find(item=>item.dataset.outcome==="unobserved"&&item.textContent.includes("sleep 600"));
+        check("A command whose result was never read has no outcome and no duration, never a pass",
+          unseen.textContent.includes("no result seen")&&unseen.querySelector('[data-testid="agent-activity-duration"]').textContent==="—");
+        check("The counts say how many failed and how many have no result",
+          card().querySelector('[data-testid="agent-activity-counts"]').textContent.includes("1 failed · 1 with no result seen"));
+        const spans=()=>[...card().querySelectorAll('[data-testid="agent-activity-segment"]')];
+        check("The state bar splits working where a command measurably ran, and its last span is measured up to the read",
+          spans().map(span=>span.dataset.state).join(">")==="working>waiting_tool>working>waiting_tool>working>waiting_you>working>idle"&&spans()[7].title.endsWith("so far"));
+        const spent=card().querySelector('[data-testid="agent-activity-summary"]').textContent;
+        check("The summary names the time spent per state",
+          spent.includes("2m 55s working")&&spent.includes("1m 34s waiting on a tool")&&spent.includes("30.0s waiting for you"));
+        check("Tokens are summed once per response, and last activity comes from the rows' own times",
+          card().querySelector('[data-testid="agent-activity-tokens"]').textContent.includes("5 in · 500 out · 3.1k cached · 2 responses")&&card().querySelector('[data-testid="agent-activity-tokens"]').textContent.includes("last activity"));
+        check("A read that did not fill its limit does not claim to be capped",!card().querySelector('[data-testid="agent-activity-capped"]'));
+        // A run with no lifecycle rows and no recorded usage says what it does not know.
+        activity().open=false;await wait(()=>!activity().open);
+        ledgerRows=[row(run.id,"session.command","ls",{occurred_at:at(1)})];
+        activity().open=true;
+        await wait(()=>card().querySelector('[data-testid="agent-activity-no-lifecycle"]'));
+        check("With no lifecycle rows the time is not drawn as idle or as anything: it says it is not known",
+          !spans().length&&card().querySelector('[data-testid="agent-activity-tokens"]').textContent.includes("Tokens were not recorded."));
+        // A read that fills its limit says the window is not the whole run.
+        activity().open=false;await wait(()=>!activity().open);
+        ledgerRows=Array.from({length:450},(_,index)=>row(run.id,"session.command",`step ${index}`,{occurred_at:at(index),result:"ok"}));
+        activity().open=true;
+        await wait(()=>card().querySelector('[data-testid="agent-activity-capped"]'));
+        check("A read that fills its row limit says it is capped",/newest 400 rows/.test(card().querySelector('[data-testid="agent-activity-capped"]').textContent));
+        activity().open=false;await wait(()=>!activity().open);
+        ledgerRows=[];
+        check("Reading the timeline raised no error",report.errors.length===0&&!card().querySelector('[data-testid="agent-activity-error"]'));
+      }
+      // ---- A finished attempt's timeline is bounded by the store's own clock ----
+      // The record reaches the pane through the same decoder every run does, so
+      // a store-shaped body (epoch seconds, `started_at`/`finished_at`) is what
+      // proves those times survive it. The rows end at `turn_finished`: a PTY
+      // exit is usually not recorded, so only the run's `finished_at` can say
+      // how long the last span lasted.
+      {
+        const base=Date.parse("2026-09-01T12:00:00.000Z")/1000, at=seconds=>new Date((base+seconds)*1000).toISOString();
+        const template=[...runs.values()].find(item=>item.kind==="external_terminal");
+        // Not a Claude run: a deleted fixture stays in the loaded history, and an
+        // exited Claude attempt there would offer Resume to the checks below.
+        const done={...template,id:"finished-activity",provider:"codex",state:"exited",session_id:"finished-pty",exit_code:0,revision:2,claimed_at:base-70,started_at:base-60,finished_at:base+400};
+        const row=(id,session,action,object,detail)=>({id,ulid:`01FINISHED${String(id).padStart(16,"0")}`,ts_utc:at(0),schema_version:1,repo_path:"/fixture/GitPulse",worktree_path:null,actor_kind:"agent",actor_id:"claude-code",session_id:session,task_id:null,action,object,argv_json:null,outcome:"ok",verdict_json:null,before_ref:null,after_ref:null,duration_ms:null,detail_json:JSON.stringify(detail)});
+        ledgerRows=[
+          row(1,"finished-pty","session.state","prompt_submitted",{event:"prompt_submitted",occurred_at:at(0)}),
+          row(2,"finished-pty","session.state","turn_finished",{event:"turn_finished",occurred_at:at(300)}),
+          row(3,done.id,"session.edit","/fixture/GitPulse/src/done.ts",{occurred_at:at(120),result:"ok"}),
+        ];
+        runs.set(done.id,done);button("Refresh").click();
+        const card=()=>pane().querySelector(`[data-run-id="${done.id}"]`);
+        await wait(()=>card());
+        card().querySelector('[data-testid="agent-activity"]').open=true;
+        await wait(()=>card().querySelector('[data-testid="agent-activity-bar"]'));
+        const spans=[...card().querySelectorAll('[data-testid="agent-activity-segment"]')];
+        check("A finished attempt is drawn from its recorded start: a lead-in nobody observed, the work, then the rest up to its recorded end",
+          spans.map(span=>span.dataset.state).join(">")==="unknown>working>idle");
+        check("…and its last span is bounded by the run's own finish, with a length, not left as not observed",
+          spans.at(-1)?.dataset.bound==="finished"&&!spans.at(-1).title.includes("length not known")&&spans.at(-1).title.endsWith("1m 40s")&&
+          !card().querySelector('[data-testid="agent-activity-unbounded"]'));
+        runs.delete(done.id);ledgerRows=[];button("Refresh").click();await pause(100);
+      }
+      // ---- A reconciled attempt's finished_at is when it was noticed, not when it ended ----
+      // dc-store's reconciliation stamps `finished_at` with the release time and
+      // sets `outcome_uncertain`. The last span must not borrow that stamp as an end.
+      {
+        const base=Date.parse("2026-09-01T12:00:00.000Z")/1000, at=seconds=>new Date((base+seconds)*1000).toISOString();
+        const template=[...runs.values()].find(item=>item.kind==="external_terminal");
+        const released={...template,id:"reconciled-activity",provider:"codex",state:"exited",session_id:"reconciled-pty",exit_code:null,outcome_uncertain:true,reason:"Reconciled: agent process is no longer running",revision:2,claimed_at:base-70,started_at:base-60,finished_at:base+4000};
+        const row=(id,session,action,object,detail)=>({id,ulid:`01RECONCIL${String(id).padStart(16,"0")}`,ts_utc:at(0),schema_version:1,repo_path:"/fixture/GitPulse",worktree_path:null,actor_kind:"agent",actor_id:"claude-code",session_id:session,task_id:null,action,object,argv_json:null,outcome:"ok",verdict_json:null,before_ref:null,after_ref:null,duration_ms:null,detail_json:JSON.stringify(detail)});
+        ledgerRows=[
+          row(1,"reconciled-pty","session.state","prompt_submitted",{event:"prompt_submitted",occurred_at:at(0)}),
+          row(2,"reconciled-pty","session.state","turn_finished",{event:"turn_finished",occurred_at:at(300)}),
+        ];
+        runs.set(released.id,released);button("Refresh").click();
+        const card=()=>pane().querySelector(`[data-run-id="${released.id}"]`);
+        await wait(()=>card());
+        card().querySelector('[data-testid="agent-activity"]').open=true;
+        await wait(()=>card().querySelector('[data-testid="agent-activity-bar"]'));
+        const spans=[...card().querySelectorAll('[data-testid="agent-activity-segment"]')];
+        // A span with no length is not drawn (it has no width); the pane says so instead.
+        check("A reconciled attempt's last span is not bounded by the reconciler's stamp: nothing is drawn as finished, and the pane says the last stretch was not observed",
+          spans.length>0&&!spans.some(span=>span.dataset.bound==="finished")&&!spans.some(span=>span.dataset.state==="idle")&&
+          /not observed/.test(card().querySelector('[data-testid="agent-activity-unbounded"]')?.textContent??""));
+        runs.delete(released.id);ledgerRows=[];button("Refresh").click();await pause(100);
+      }
       // ---- Monitoring one agent from the pane ------------------------------
       {
         const watched=[...runs.values()].find(run=>run.session_id==="task-session-1"), sid=watched.session_id;
@@ -681,6 +813,27 @@
         check("Discard removes the worktree from the main checkout, forced only for the changes it named, and never forces the branch",
           removal.repoPath==="/fixture/GitPulse"&&removal.targetPath===wtPath&&removal.force===true&&branchDelete.force===false
           &&row(attempt.id).querySelector('[data-testid="agent-run-message"]').textContent.includes("not fully merged"));
+        check("Once its worktree is removed the row stops offering Merge, Discard and Review changes for it",
+          !row(attempt.id).querySelector('[data-testid="agent-merge"]')&&!row(attempt.id).querySelector('[data-testid="agent-discard"]')&&!row(attempt.id).querySelector('[data-testid="agent-review"]'));
+        // ---- Landing from the review removes the worktree: the row must not offer it again ----
+        const landed={...template,id:"wt2landed",provider:"codex",state:"exited",session_id:null,exit_code:0,revision:2,cwd:LAND_PATH};
+        landListed=true;runs.set(landed.id,landed);button("Refresh").click();
+        await wait(()=>row(landed.id)?.querySelector('[data-testid="agent-merge"]'));
+        const inRow=text=>[...row(landed.id).querySelectorAll("button")].find(b=>b.textContent.trim()===text);
+        inRow("Merge review").click();
+        await wait(()=>inRow("Approve for merge"));
+        inRow("Approve for merge").click();
+        await wait(()=>inRow("Land and clean up"));
+        check("Before landing, the row offers Merge and Discard for the worktree that is still there",
+          !!row(landed.id).querySelector('[data-testid="agent-merge"]')&&!!row(landed.id).querySelector('[data-testid="agent-discard"]'));
+        landMerges=true;
+        inRow("Land and clean up").click();
+        await wait(()=>read(promptState));completePrompt(true);
+        await wait(()=>row(landed.id)?.querySelector('[data-testid="attempt-landed"]'));
+        check("After Land and clean up the row no longer offers Merge, Discard or Review changes for the removed worktree",
+          !row(landed.id).querySelector('[data-testid="agent-merge"]')&&!row(landed.id).querySelector('[data-testid="agent-discard"]')&&!row(landed.id).querySelector('[data-testid="agent-review"]'));
+        check("and what landing said stays on the row",/Squashed|Merged/i.test(row(landed.id).querySelector('[data-testid="attempt-landed"]').textContent));
+        landMerges=false;runs.delete(landed.id);
         runs.delete(attempt.id);runs.delete(other.id);button("Refresh").click();await pause(100);
         stopToasts();
       }

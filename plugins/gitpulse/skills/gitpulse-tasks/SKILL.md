@@ -123,6 +123,7 @@ the card is theirs: an overwrite that would change it is refused with
 | `logs` | no | Raw evidence kept verbatim, at most 256 KiB. |
 | `overwrite` | no | Replace an existing task's content, by `task_id` or board `item_id`. |
 | `reviewed_related` | no | At most 500 `item_id`s: every task a `related_tasks_exist` refusal listed, once you have read them and judged this separate. A refusal names 25 at a time; pass back everything you have read so far and the next refusal names the following ones. |
+| `parent_task_id` | no | File this task as a subtask of one already on this repository's board: its `task_id`, or an `item_id` from `gitpulse_list_tasks`. The parent must be live, a task has one parent, a cycle or a chain past the board's depth bound is refused, and the parent you name is not held back as related work. With `overwrite`, it moves the task under that parent and keeps its other links. The reply's `parent_item_id` is the parent's board id. |
 
 ## Importing briefs from `tasks/`
 

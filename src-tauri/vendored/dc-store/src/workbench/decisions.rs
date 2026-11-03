@@ -57,7 +57,7 @@ fn refuse(message: &str) -> Error {
         message: message.into(),
     }
 }
-fn lower_hex(value: &str, lengths: &[usize]) -> bool {
+pub(super) fn lower_hex(value: &str, lengths: &[usize]) -> bool {
     lengths.contains(&value.len())
         && value
             .bytes()

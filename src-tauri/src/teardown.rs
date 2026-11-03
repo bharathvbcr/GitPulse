@@ -44,6 +44,11 @@ pub(crate) fn steps(terminals: &TerminalSessions, deadline: Duration, sweep: imp
     // Before anything that can stall, so a hung terminal shutdown cannot lose it.
     crate::logging::performance::flush();
     close_terminals_within(terminals, deadline);
+    // Managed runs in a hosted Manvi are stopped or left as the quit chose
+    // (an exit nobody was asked about leaves them, like the terminals'), and
+    // the connection to it is closed. Never the server: it is not procguard's
+    // child, so the sweep below does not reach it either.
+    crate::harness::sidecar::settle_hosted_for_exit();
     // The sidecar is asked to finish (it closes its runs) before the sweep
     // would kill it outright; the call gives up on its own after ~1.2 s.
     crate::harness::sidecar::shutdown();

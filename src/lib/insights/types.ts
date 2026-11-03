@@ -52,11 +52,32 @@ export interface LiveSession {
   /** The agent's own last-reported state (`busy`, `idle`, …), verbatim. */
   status: string;
   cwd: string;
+  /** `session:<terminal id>` or `run:<attempt id>`: the GitPulse launch this process is in. Absent when none was observed. */
+  tree?: string;
+  /** The task attempt that launched it. */
+  run_id?: string;
+  /**
+   * The nearest agent session above this one in the process tree. Absent is
+   * "none the scan could see", not "started by a person".
+   */
+  parent_pid?: number;
+}
+
+/** A session nested under another in the same worktree. */
+export interface LiveSessionNode {
+  pid: number;
+  kind: string;
+  children: LiveSessionNode[];
 }
 
 export interface LiveWorktree {
   path: string;
+  /** Every session in the worktree, flat; nesting changes none of the counts. */
   sessions: LiveSession[];
+  /** Sessions that sit under another session of this worktree, as a forest rooted at the parents. */
+  children?: LiveSessionNode[];
+  /** True when `children` stopped at its depth bound. */
+  children_truncated?: boolean;
 }
 
 export interface LiveKindStatus {

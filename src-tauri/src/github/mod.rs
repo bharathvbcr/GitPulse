@@ -5,6 +5,8 @@ use crate::engine::git_cli::{
 };
 use crate::ipc_error::CommandError;
 pub mod actions;
+pub mod outcome;
+use outcome::RunOutcome;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
@@ -82,6 +84,11 @@ pub struct WorkflowRunInfo {
     /// What triggered the run (`push`, `pull_request`, `workflow_dispatch`,
     /// …). Empty when unreported; never defaulted to a guess.
     pub event: String,
+    /// What `status` and `conclusion` mean, decided once by
+    /// [`outcome::classify`]. The renderer reads this and holds no table of its
+    /// own; `status` and `conclusion` stay for display words only.
+    #[serde(default)]
+    pub outcome: RunOutcome,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -171,6 +178,14 @@ pub struct GitHubRunsReport {
     pub runs: Vec<WorkflowRunInfo>,
     pub truncated: bool,
     pub error: Option<String>,
+    /// Runs that finished red (`outcome: failed`) that the panel's own previous
+    /// listing of this repository showed in flight, decided by
+    /// [`outcome::Observer`] and not by the panel. Empty on the panel's first
+    /// look (and after a long gap), when it had seen nothing moving, and
+    /// whenever `checked` is false: absent news is not good news, and
+    /// `checked` is what says which.
+    #[serde(default)]
+    pub went_red: Vec<WorkflowRunInfo>,
 }
 
 impl GitHubRunsReport {
@@ -185,15 +200,42 @@ impl GitHubRunsReport {
             runs: Vec::new(),
             truncated: false,
             error: Some(error),
+            went_red: Vec::new(),
         }
     }
 }
 
-/// The workflow-run listing on its own, for the live poll.
+/// The workflow-run listing on its own, for the Remote panel's live poll. It
+/// folds a checked listing into the shared baseline and fills `went_red` from
+/// the panel's own baseline (see `outcome::went_red`).
 ///
 /// Every failure path returns `checked: false` with a reason. A poll that
 /// cannot reach `gh` must never look like a poll that found nothing.
 pub fn load_workflow_runs_report(repo_path: &str) -> GitHubRunsReport {
+    let (mut report, requested_at) = fetch_workflow_runs_report(repo_path);
+    report.went_red = outcome::went_red(&report, requested_at);
+    report
+}
+
+/// The same listing for the CI watcher. It folds a checked listing into the
+/// shared baseline too, but leaves the panel's baseline alone and returns an
+/// empty `went_red`: the watcher takes its news from the observer's queue.
+pub fn watch_workflow_runs_report(repo_path: &str) -> GitHubRunsReport {
+    let (report, requested_at) = fetch_workflow_runs_report(repo_path);
+    outcome::observe_report(&report, requested_at);
+    report
+}
+
+/// One listing, not yet folded into any baseline, and when it was asked for.
+fn fetch_workflow_runs_report(repo_path: &str) -> (GitHubRunsReport, Instant) {
+    // Stamped before the request, so a slow call that lands after a newer one
+    // cannot move the baseline backwards (see `outcome::Observer::observe`).
+    let requested_at = Instant::now();
+    let report = request_workflow_runs_report(repo_path);
+    (report, requested_at)
+}
+
+fn request_workflow_runs_report(repo_path: &str) -> GitHubRunsReport {
     let gh = probe_gh_cli();
     let cli_present = gh_cli_reported_present(&gh);
     let remote = match discover_github_remote(repo_path) {
@@ -222,6 +264,7 @@ pub fn load_workflow_runs_report(repo_path: &str) -> GitHubRunsReport {
             runs,
             truncated,
             error: None,
+            went_red: Vec::new(),
         },
         Err(error) => GitHubRunsReport::unavailable(true, Some(&remote), error.into_message()),
     }
@@ -981,19 +1024,23 @@ fn parse_workflow_runs(
     runs.truncate(display_limit);
     let runs = runs
         .into_iter()
-        .map(|run| WorkflowRunInfo {
-            id: run.database_id,
-            name: run.name,
-            title: run.display_title.unwrap_or_default(),
-            status: run.status,
-            conclusion: run.conclusion.unwrap_or_default(),
-            head_branch: run.head_branch.unwrap_or_default(),
-            url: run.url,
-            created_at: run.created_at.unwrap_or_default(),
-            started_at: run.started_at.unwrap_or_default(),
-            updated_at: run.updated_at.unwrap_or_default(),
-            head_sha: run.head_sha.unwrap_or_default(),
-            event: run.event.unwrap_or_default(),
+        .map(|run| {
+            let conclusion = run.conclusion.unwrap_or_default();
+            WorkflowRunInfo {
+                id: run.database_id,
+                name: run.name,
+                title: run.display_title.unwrap_or_default(),
+                outcome: outcome::classify(&run.status, &conclusion),
+                status: run.status,
+                conclusion,
+                head_branch: run.head_branch.unwrap_or_default(),
+                url: run.url,
+                created_at: run.created_at.unwrap_or_default(),
+                started_at: run.started_at.unwrap_or_default(),
+                updated_at: run.updated_at.unwrap_or_default(),
+                head_sha: run.head_sha.unwrap_or_default(),
+                event: run.event.unwrap_or_default(),
+            }
         })
         .collect();
     Ok((runs, truncated))
@@ -2688,6 +2735,35 @@ mod tests {
         // runner would otherwise report its queue time as execution time.
         assert_eq!(run.created_at, "2026-09-17T07:50:00Z");
         assert_ne!(run.started_at, run.created_at);
+    }
+
+    /// Every run leaves the parser with its outcome, decided here once. A
+    /// renderer that had to work it out from `status` and `conclusion` was a
+    /// second classifier waiting to disagree with this one.
+    #[test]
+    fn run_parsing_decides_each_runs_outcome() {
+        let (runs, _) = parse_workflow_runs(
+            br#"[{"databaseId":1,"status":"in_progress","conclusion":null},
+                 {"databaseId":2,"status":"completed","conclusion":"success"},
+                 {"databaseId":3,"status":"completed","conclusion":"timed_out"},
+                 {"databaseId":4,"status":"completed","conclusion":"cancelled"},
+                 {"databaseId":5,"status":"completed","conclusion":"action_required"},
+                 {"databaseId":6,"status":"completed","conclusion":null}]"#,
+            RUN_DISPLAY_LIMIT,
+        )
+        .unwrap();
+        let outcomes: Vec<_> = runs.iter().map(|run| run.outcome).collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                RunOutcome::InFlight,
+                RunOutcome::Passed,
+                RunOutcome::Failed,
+                RunOutcome::Cancelled,
+                RunOutcome::NeedsPerson,
+                RunOutcome::Unknown,
+            ]
+        );
     }
 
     /// A queued run reports no start time at all. The empty string has to

@@ -1,9 +1,31 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
-import { createTerminalLaunchRequests, agentPromptArgs, PROMPT_LAUNCHERS } from "./launchRequests";
+import { createTerminalLaunchRequests, agentPromptArgs, resumeArgs, PROMPT_LAUNCHERS } from "./launchRequests";
 import { PROVIDER_LABELS } from "../workbench/taskHandoff";
 
 afterEach(() => vi.useRealTimers());
+
+describe("resumeArgs", () => {
+  const ID = "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11";
+
+  it("is the plain resume with no prompt, exactly as before", () => {
+    expect(resumeArgs(ID)).toEqual(["--resume", ID]);
+  });
+
+  it("puts the prompt after `--` as one argument, so no flag or shell word in it is read as one", () => {
+    // The real CLI form: `claude [options] [prompt]` (`claude --help`), and the
+    // `--` separator this repository already uses for every initial prompt.
+    for (const text of ["fix it", "--settings {}", "-p", "$(touch /tmp/x) `id` ; rm -rf ~", "multi\nline\ttext ✓"]) {
+      expect(resumeArgs(ID, text)).toEqual(["--resume", ID, "--", text]);
+    }
+  });
+
+  it("refuses what the initial-prompt path refuses, and a session id that is not one", () => {
+    for (const bad of ["", "  \n", "a\0b", "x".repeat(16001)]) expect(() => resumeArgs(ID, bad)).toThrow();
+    for (const id of ["", "../etc", "6f1c2a7e", `${ID}x`]) expect(() => resumeArgs(id, "hi")).toThrow();
+    expect(() => resumeArgs("--settings")).toThrow();
+  });
+});
 
 describe("terminal agent launch requests", () => {
   it("delivers once to the requested repository and acknowledges tab creation", async () => {

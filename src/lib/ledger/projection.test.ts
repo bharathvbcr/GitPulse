@@ -168,6 +168,24 @@ describe("mergeEvents", () => {
     expect(again.map((e) => e.id)).toEqual([1, 2]);
   });
 
+  it("keeps a run's token counts and lifecycle rows out of the action journal", () => {
+    // They are rows of the run's timeline, not things done, and arrive on
+    // every response and every state change.
+    const merged = mergeEvents(
+      [],
+      [
+        event({ id: 1, action: "session.usage", object: "msg_1" }),
+        event({ id: 2, action: "session.state", object: "working" }),
+        event({ id: 3, action: "session.command", object: "cargo test" }),
+      ],
+      100,
+    );
+    expect(merged.map((action) => action.label)).toEqual(["cargo test"]);
+    // Nothing but timeline rows arrived: the list is the one it was.
+    const first = mergeEvents([], [event({ id: 4 })], 100);
+    expect(mergeEvents(first, [event({ id: 5, action: "session.usage" })], 100)).toBe(first);
+  });
+
   it("returns the same list when there is nothing new", () => {
     const first = mergeEvents([], [event({ id: 1 })], 100);
     expect(mergeEvents(first, [], 100)).toBe(first);

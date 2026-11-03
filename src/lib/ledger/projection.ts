@@ -124,6 +124,19 @@ export function eventTimeMs(event: LedgerEvent): number {
 }
 
 /**
+ * Rows the ledger keeps for a run's timeline (`runTimeline.ts`) and that are
+ * not actions: a response's token counts, and a lifecycle change of a session.
+ * They arrive on every response and every state change, so the action journal,
+ * which is a list of things done, would be mostly them.
+ */
+const TIMELINE_ONLY_ACTIONS: readonly string[] = ["session.usage", "session.state"];
+
+/** Whether a row belongs in the action journal. */
+export function isJournalEvent(event: LedgerEvent): boolean {
+  return !TIMELINE_ONLY_ACTIONS.includes(event.action);
+}
+
+/**
  * Projects one durable event into a journal entry.
  *
  * `ok` is false for anything the gate blocked or that ran and failed — the two
@@ -158,10 +171,11 @@ export function mergeEvents(
   events: LedgerEvent[],
   displayCap: number
 ): AgentActionEntry[] {
-  if (events.length === 0) return existing;
+  const actions = events.filter(isJournalEvent);
+  if (actions.length === 0) return existing;
   const merged = mergeActionEntries(
     existing,
-    events.map(eventToAction),
+    actions.map(eventToAction),
     displayCap,
   );
   // A *display* cap, not a data cap: the rows beyond it are still on disk and

@@ -18,7 +18,12 @@ use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
 /// What this build speaks. Bumped whenever a frame changes shape or meaning.
-pub const PROTOCOL: u32 = 2;
+/// 3 added `Request::Transcript`: a host of protocol 2 ends the connection of
+/// an app that sends a request it cannot decode, and the socket name carries
+/// the protocol, so the two never meet. The request's optional `run_id` and the
+/// transcript answer's `unrecorded_bytes`, `run_id` and `reused` state were
+/// added before protocol 3 was released, so they did not bump it.
+pub const PROTOCOL: u32 = 3;
 
 /// Longest JSON header accepted. A spawn request (argv and environment are
 /// bounded at 128 KiB each by `validate_pty_options`) is the largest a caller
@@ -110,6 +115,20 @@ pub enum Request {
     Release {
         session: String,
     },
+    /// The newest `max_bytes` of the session's saved output, read-only: live
+    /// or finished, it never attaches. Answered with `terminal::TranscriptRead`.
+    /// `redact` masks secrets in the host before the bytes leave it. `run_id`,
+    /// when sent, asks for that run's output only: an id a later session
+    /// reused is answered as such, not read as the run's. Left out on the wire
+    /// when absent, and optional when received, so protocol 3 is unchanged.
+    Transcript {
+        session: String,
+        max_bytes: usize,
+        #[serde(default)]
+        redact: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+    },
 }
 
 /// A request with the id its reply will carry.
@@ -184,6 +203,18 @@ pub struct WireNotice {
     pub channel: String,
     pub subject: Option<String>,
     pub subagent: bool,
+    /// Which subagent, when one was named. Left off the wire when absent, so a
+    /// peer that predates it (and refuses unknown fields) reads every notice
+    /// that does not carry one exactly as before.
+    ///
+    /// That only holds while no sender sets it: today the host forwards only
+    /// its own `SessionWatcher`'s notices, which never name a subagent, so a
+    /// `Some` does not cross this socket. A host-side producer that starts
+    /// setting it would make an app built before this field fail to parse the
+    /// frame (`deny_unknown_fields`; the client logs and drops it), and so
+    /// must bump `PROTOCOL` in the same change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 /// The channels a terminal's own output can raise a notice on: the scanner's,
@@ -202,6 +233,7 @@ impl WireNotice {
             channel: notice.channel.to_owned(),
             subject: notice.subject.clone(),
             subagent: notice.subagent,
+            agent_id: notice.agent_id.clone(),
         }
     }
 
@@ -225,6 +257,13 @@ impl WireNotice {
                     self.channel
                 )
             })?;
+        if self
+            .agent_id
+            .as_deref()
+            .is_some_and(|id| !crate::alerts::bridge::valid_key(id))
+        {
+            return Err("the terminal host named a malformed agent id".to_owned());
+        }
         Ok(crate::alerts::Notice {
             key: self.key,
             origin: crate::alerts::Origin::Terminal,
@@ -236,6 +275,7 @@ impl WireNotice {
             channel,
             subject: self.subject,
             subagent: self.subagent,
+            agent_id: self.agent_id,
         })
     }
 }
@@ -427,6 +467,123 @@ mod tests {
         );
     }
 
+    /// The transcript read is new in protocol 3, so a host and an app of
+    /// different protocols never exchange it: the socket they would meet on is
+    /// named for the protocol.
+    #[test]
+    fn the_transcript_request_has_a_pinned_shape_and_lives_on_protocol_three() {
+        assert_eq!(PROTOCOL, 3);
+        assert_ne!(
+            crate::terminal::host::socket_name(PROTOCOL),
+            crate::terminal::host::socket_name(2)
+        );
+        let request = serde_json::to_value(Envelope {
+            id: 9,
+            request: Request::Transcript {
+                session: "term-1-a".into(),
+                max_bytes: 4096,
+                redact: true,
+                run_id: None,
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            request,
+            serde_json::json!({"id": 9, "op": "transcript", "session": "term-1-a", "max_bytes": 4096, "redact": true})
+        );
+        // A run id rides the same request when the caller has the run, and is
+        // left out when it has not, so a request without one is the request
+        // protocol 3 always had.
+        let named = serde_json::to_value(Envelope {
+            id: 9,
+            request: Request::Transcript {
+                session: "term-1-a".into(),
+                max_bytes: 4096,
+                redact: false,
+                run_id: Some("run-7".into()),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            named,
+            serde_json::json!({"id": 9, "op": "transcript", "session": "term-1-a", "max_bytes": 4096, "redact": false, "run_id": "run-7"})
+        );
+        assert_eq!(
+            serde_json::from_value::<Envelope>(named).unwrap().request,
+            Request::Transcript {
+                session: "term-1-a".into(),
+                max_bytes: 4096,
+                redact: false,
+                run_id: Some("run-7".into())
+            }
+        );
+        // `redact` is optional on the wire: left out it is off.
+        let bare: Envelope = serde_json::from_value(
+            serde_json::json!({"id": 1, "op": "transcript", "session": "term-1-a", "max_bytes": 10}),
+        )
+        .unwrap();
+        assert_eq!(
+            bare.request,
+            Request::Transcript {
+                session: "term-1-a".into(),
+                max_bytes: 10,
+                redact: false,
+                run_id: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_transcript_answer_names_which_of_its_states_it_is() {
+        use crate::terminal::{TranscriptRead, TranscriptTail};
+        for (answer, state) in [
+            (TranscriptRead::Missing, "missing"),
+            (
+                TranscriptRead::Unreadable {
+                    reason: "denied".into(),
+                },
+                "unreadable",
+            ),
+            (
+                TranscriptRead::Unavailable {
+                    reason: "in-process".into(),
+                },
+                "unavailable",
+            ),
+            (
+                TranscriptRead::Reused {
+                    reason: "a later session reused this id".into(),
+                },
+                "reused",
+            ),
+            (
+                TranscriptRead::Found(TranscriptTail {
+                    data_b64: "aGk=".into(),
+                    bytes: 2,
+                    retained: 2,
+                    truncated: false,
+                    rotated: false,
+                    clipped: false,
+                    gap_markers: 0,
+                    unrecorded_bytes: 0,
+                    redacted: false,
+                    live: false,
+                    settled: true,
+                    recording_error: None,
+                    run_id: Some("run-7".into()),
+                }),
+                "found",
+            ),
+        ] {
+            let wire = serde_json::to_value(&answer).unwrap();
+            assert_eq!(wire["state"], state);
+            assert_eq!(
+                serde_json::from_value::<TranscriptRead>(wire).unwrap(),
+                answer
+            );
+        }
+    }
+
     #[test]
     fn a_truncated_or_oversized_frame_is_an_error_not_a_frame() {
         let mut wire = Vec::new();
@@ -464,6 +621,7 @@ mod tests {
             channel: "exit",
             subject: None,
             subagent: false,
+            agent_id: None,
         };
         let wire = WireNotice::from_notice(&notice);
         assert_eq!(wire.clone().into_notice().unwrap(), notice);
@@ -473,5 +631,42 @@ mod tests {
         let mut unknown = wire;
         unknown.event = Some("not_an_event".into());
         assert!(unknown.into_notice().is_err());
+    }
+
+    /// The subagent's id survives the hop, stays off the wire when there is
+    /// none (a peer that refuses unknown fields reads such a notice as it
+    /// always did), and a malformed one is refused rather than carried on.
+    #[test]
+    fn a_subagent_id_crosses_the_socket_and_an_absent_one_leaves_no_trace() {
+        let notice = crate::alerts::Notice {
+            key: "term-1-a".into(),
+            origin: crate::alerts::Origin::Terminal,
+            label: "Claude Code".into(),
+            place: None,
+            event: Some("session_ended"),
+            detail: None,
+            is_agent: true,
+            channel: "exit",
+            subject: None,
+            subagent: true,
+            agent_id: Some("a1b2c3d4e5f6".into()),
+        };
+        let wire = WireNotice::from_notice(&notice);
+        let text = serde_json::to_string(&wire).unwrap();
+        let back: WireNotice = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.into_notice().unwrap(), notice);
+
+        let mut bare = wire.clone();
+        bare.agent_id = None;
+        let json = serde_json::to_value(&bare).unwrap();
+        assert!(json.get("agent_id").is_none(), "{json}");
+        let older: WireNotice = serde_json::from_value(json).unwrap();
+        assert_eq!(older.agent_id, None);
+
+        for bad in ["", "has space", "../x", &"x".repeat(97)] {
+            let mut malformed = wire.clone();
+            malformed.agent_id = Some(bad.into());
+            assert!(malformed.into_notice().is_err(), "{bad:?}");
+        }
     }
 }

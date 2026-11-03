@@ -169,7 +169,8 @@
   import { askChoice, askConfirm, isPromptOpen } from "./lib/stores/modalStore";
   import { terminalSessions } from "./lib/terminal/sessionRegistry";
   import { quitRisks } from "./lib/terminal/quitGuard";
-  import { decideQuitTerminals, type QuitTerminals } from "./lib/terminal/quitChoice";
+  import { decideQuitManagedRuns, decideQuitTerminals, readTerminalBackend, type QuitTerminals } from "./lib/terminal/quitChoice";
+  import { listAllLiveRuns } from "./lib/workbench/client";
   import {
     hasUnsavedEditorDrafts,
     unsavedEditorDrafts,
@@ -371,6 +372,20 @@
     // request, so this answers nothing and must not cancel the first.
     if (exitRequestPending) return;
     exitRequestPending = true;
+    // A managed Codex or Claude run does not outlive this app with either
+    // terminal backend unless a hosted Manvi holds it (Settings → Agents, and
+    // an installed Manvi that can): otherwise the exit closes the sidecar and
+    // the sidecar cancels its runs. So that question is asked before the
+    // terminals', unconditionally; with a hosted Manvi it is the leave/stop one.
+    const managedRuns = await decideQuitManagedRuns({
+      ask: askConfirm,
+      askHosted: askChoice,
+      hosted: async () => (await readTerminalBackend()).managed?.hosted === true,
+      listRuns: listAllLiveRuns,
+      displayName,
+      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Could not check ${what}: ${formatError(error)}`),
+    });
+    if (managedRuns.cancelled) { cancelNativeExitRequest(); return; }
     // With the terminal host, sessions can outlive this app: a quit with any
     // running asks whether to leave them or stop them. In-process, quitting
     // ends every PTY, and an agent's work in progress with it; every other way
@@ -452,7 +467,11 @@
     flushBeforeExit();
     exitApproved = true;
     try {
-      await invoke("cmd_exit_app", terminals ? { terminals } : {});
+      const quitChoices = {
+        ...(terminals ? { terminals } : {}),
+        ...(managedRuns.managed ? { managed: managedRuns.managed } : {}),
+      };
+      await invoke("cmd_exit_app", quitChoices);
     } catch (error) {
       exitApproved = false;
       cancelNativeExitRequest();

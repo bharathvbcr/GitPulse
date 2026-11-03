@@ -135,6 +135,18 @@ impl ExitGate {
         self.slot().take()
     }
 
+    /// Takes the open request for an approved quit and runs `apply` (the
+    /// choices made for that quit) before the slot is released. A quit request
+    /// arriving meanwhile waits on the slot, then finds it empty: it can no
+    /// longer be held behind the request being approved, which is what made it
+    /// discard the choices `apply` had just set.
+    pub fn take_approved(&self, apply: impl FnOnce()) -> Option<Pending> {
+        let mut slot = self.slot();
+        let pending = slot.take();
+        apply();
+        pending
+    }
+
     /// Takes request `id` only if it is still open and unacknowledged.
     pub fn expire(&self, id: u64) -> Option<Pending> {
         let mut slot = self.slot();
@@ -201,6 +213,10 @@ pub fn begin<R: Runtime>(app: &AppHandle<R>, origin: Origin) -> Begin {
 
 /// Gives a taken request its final answer.
 pub fn settle<R: Runtime>(app: &AppHandle<R>, pending: Pending, approve: bool) {
+    if !approve {
+        // The quit the choices were given for is not happening.
+        crate::harness::hosted::reset_exit_choice();
+    }
     match pending.origin {
         Origin::Internal => {
             if approve {
@@ -248,9 +264,11 @@ pub fn disarm<R: Runtime>(app: &AppHandle<R>, why: &str) {
     }
 }
 
-/// Completes a frontend-approved exit.
-pub fn approve<R: Runtime>(app: &AppHandle<R>) {
-    match app.state::<DesktopState>().exit.take() {
+/// Completes a frontend-approved exit. `apply` records the choices made for
+/// this quit; it runs once the open request is taken (see
+/// [`ExitGate::take_approved`]), never while the request could still be held.
+pub fn approve<R: Runtime>(app: &AppHandle<R>, apply: impl FnOnce()) {
+    match app.state::<DesktopState>().exit.take_approved(apply) {
         Some(pending) => settle(app, pending, true),
         // No request is open: the frontend chose to quit on its own. An exit
         // code distinguishes this from an OS/user quit request.
@@ -302,6 +320,38 @@ mod tests {
         assert!(
             gate.expire(id.unwrap()).is_none(),
             "a late deadline settles nothing"
+        );
+    }
+
+    /// The choices for an approved quit are applied once its request is taken.
+    /// Applied first, a code-less quit arriving in between is held behind the
+    /// request (`AlreadyPending`), which discards the choices just applied.
+    #[test]
+    fn a_quit_arriving_while_an_approval_applies_its_choices_is_not_held_behind_it() {
+        use std::sync::{mpsc, Arc};
+        let gate = Arc::new(ExitGate::default());
+        gate.arm();
+        assert_eq!(gate.open(Origin::Internal).0, Begin::Deferred);
+
+        let (applying, applying_rx) = mpsc::channel();
+        let racer = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                applying_rx.recv().expect("the approval started applying");
+                gate.open(Origin::Internal).0
+            })
+        };
+        let taken = gate.take_approved(|| {
+            applying.send(()).unwrap();
+            // Long enough for the racing quit to reach the gate.
+            std::thread::sleep(Duration::from_millis(100));
+        });
+
+        assert!(taken.is_some(), "the approved request is the one taken");
+        assert_eq!(
+            racer.join().unwrap(),
+            Begin::Deferred,
+            "the racing quit found the slot empty, not the approved request"
         );
     }
 

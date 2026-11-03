@@ -275,6 +275,7 @@
     "allow-cmd-terminal-run",
     "allow-cmd-terminal-sessions",
     "allow-cmd-terminal-spawn",
+    "allow-cmd-terminal-transcript",
     "allow-cmd-terminal-write",
     "allow-cmd-tool-capability-refresh",
     "allow-cmd-tool-config-get",

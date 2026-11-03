@@ -83,8 +83,13 @@
 //!
 //! * **Report, v1.** `v` (must be [`PROTOCOL_VERSION`]) and `event` (a name in
 //!   [`EVENTS`]) are required. Optional: `agent`, `session`, `cwd`, `message`,
-//!   `subject`, `subagent`, and `seq`. Fields not listed are ignored, which is
-//!   what lets a field be added without a new version.
+//!   `subject`, `subagent`, `agent_id`, and `seq`. Fields not listed are
+//!   ignored, which is what lets a field be added without a new version.
+//! * **`agent_id`** names which subagent a report came from. It travels beside
+//!   the `subagent` boolean, which stays for a bridge or hook that predates it,
+//!   and is held to [`valid_key`]'s alphabet and length: one that is present
+//!   and not a conforming string refuses the report as `malformed_field`,
+//!   never dropped to a report that merely does not say.
 //! * **`seq`** is the order stamp: the hook reads [`order_stamp_ns`] at process
 //!   entry, before it reads stdin, so reports from one session are ordered by
 //!   when their hooks began and not by which connection happened to be accepted
@@ -1156,6 +1161,16 @@ pub fn parse_report_stamped(bytes: &[u8]) -> Result<(Notice, Option<u64>), Reaso
         None | Some(serde_json::Value::Null) => false,
         Some(value) => value.as_bool().ok_or(Reason::MalformedSubagent)?,
     };
+    let agent_id = match object.get("agent_id") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|id| valid_key(id))
+                .ok_or(Reason::MalformedField)?
+                .to_owned(),
+        ),
+    };
     // An `agent` that is not a string is not a known name either.
     let agent = match object.get("agent") {
         None | Some(serde_json::Value::Null) => "claude",
@@ -1224,6 +1239,7 @@ pub fn parse_report_stamped(bytes: &[u8]) -> Result<(Notice, Option<u64>), Reaso
         channel: "hook",
         subject,
         subagent,
+        agent_id,
     };
     Ok((notice, seq))
 }
@@ -2694,6 +2710,49 @@ mod tests {
         let plain = report(r#"{"v":1,"event":"tool_finished","session":"term-1"}"#).unwrap();
         assert_eq!(plain.subject, None);
         assert!(!plain.subagent);
+    }
+
+    #[test]
+    fn a_report_names_which_subagent_it_came_from() {
+        let notice = report(
+            r#"{"v":1,"event":"tool_finished","session":"term-1","subagent":true,"agent_id":"a1b2-c3_d4"}"#,
+        )
+        .unwrap();
+        assert!(notice.subagent);
+        assert_eq!(notice.agent_id.as_deref(), Some("a1b2-c3_d4"));
+        // An older hook sends the boolean alone, and a null id is no id.
+        for json in [
+            r#"{"v":1,"event":"tool_finished","session":"term-1","subagent":true}"#,
+            r#"{"v":1,"event":"tool_finished","session":"term-1","agent_id":null}"#,
+        ] {
+            assert_eq!(report(json).unwrap().agent_id, None, "{json}");
+        }
+    }
+
+    /// An id that is present and not conforming is refused, as `malformed_field`:
+    /// reading it as "no id" would turn a bad report into a different valid one.
+    #[test]
+    fn a_subagent_id_that_is_not_one_is_refused() {
+        let long = format!("\"{}\"", "x".repeat(97));
+        for id in [
+            r#""""#,
+            r#""has space""#,
+            r#""../etc""#,
+            r#""tab\there""#,
+            "7",
+            "true",
+            r#"["a"]"#,
+            long.as_str(),
+        ] {
+            let json = format!(
+                r#"{{"v":1,"event":"tool_finished","session":"term-1","subagent":true,"agent_id":{id}}}"#
+            );
+            assert_eq!(
+                parse_report_stamped(json.as_bytes()).map(|_| ()),
+                Err(Reason::MalformedField),
+                "accepted {json}"
+            );
+        }
     }
 
     #[test]

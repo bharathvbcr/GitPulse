@@ -37,7 +37,17 @@ export interface TaskCard extends RecordVersion {
   archived: boolean;
   /** When the task last entered Done (Unix seconds); null while it is not Done. The store's, never sent. */
   completed_at: number | null;
+  /**
+   * The live task this one is a subtask of, from `items.lineage`. Absent when
+   * the lineage was not read for this card: absent is unknown, never "no
+   * parent" (that is `null`). Never sent on a write.
+   */
+  parent_item_id?: string | null;
+  /** Live subtasks and how many of them are Done, from `items.lineage`. Absent is unknown, never 0 of 0. Never sent. */
+  children?: ChildProgress;
 }
+/** How many live subtasks a task has, and how many of those are Done. */
+export interface ChildProgress { total: number; done: number }
 /** How one task names another. Read from the other end, `parent` is a subtask and `blocks` is blocked-by. */
 export const LINK_KINDS = ["parent", "blocks", "related", "duplicate_of"] as const;
 export type LinkKind = (typeof LINK_KINDS)[number];
@@ -79,6 +89,12 @@ export interface TaskRun extends RecordVersion {
   provider: AgentProvider; permission_mode: PermissionMode; state: typeof RUN_STATES[number];
   cwd: string; created_at: number; expires_at: number; session_id: string | null;
   exit_code: number | null; reason: string; outcome_uncertain: boolean;
+  /**
+   * The attempt's own clock, in epoch seconds as the store writes it. Each is
+   * absent until that happens (an attempt never claimed has no `claimed_at`),
+   * and absent means "did not happen or was not recorded", never zero.
+   */
+  claimed_at?: number | null; started_at?: number | null; finished_at?: number | null;
   /** The checkout's Git directories as preparation observed them; the store's key for "this checkout is taken". */
   git_dir?: string; git_common_dir?: string;
   /** The model fields this attempt was launched with; null when it used the launcher's own default. */
@@ -100,11 +116,16 @@ export interface RunPreparation {
   model_choice?: LaunchModelChoice;
 }
 /** What a write sends: everything but the store's own stamps. */
-export type TaskDraft = Omit<Task, keyof RecordVersion | "completed_at">;
+export type TaskDraft = Omit<Task, keyof RecordVersion | "completed_at" | "parent_item_id" | "children">;
 export type WorkspaceDraft = Omit<Workspace, keyof RecordVersion>;
 export interface Page<T> { items: T[]; total: number; shown: number; has_more: boolean; next_cursor: string | null }
 export type Scope = { kind: "global" } | { kind: "workspace" | "repository"; id: string };
-export type WorkbenchMethod = "decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "runs.conversation" | "runs.checkout_identity" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.restore" | "items.merge" | "items.history" | "events.list" | "enhancements.complete" | "verifications.status" | "verifications.run" | "verifications.board" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list" | "tasks.suggest";
+/**
+ * Every store method this client names. `signals.record` is listed so the union covers the store's methods, but
+ * it is the host watcher's alone: `WorkbenchState::request` refuses it from here with `host_only`, because a CI
+ * result is the host's observation of GitHub or of a local run and a renderer must not be able to write one.
+ */
+export type WorkbenchMethod ="decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | "signals.record" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "runs.conversation" | "runs.send_to_agent" | "runs.checkout_identity" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.restore" | "items.merge" | "items.lineage" | "items.history" | "events.list" | "enhancements.complete" | "verifications.status" | "verifications.run" | "verifications.board" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list" | "tasks.suggest";
 
 export interface WorkbenchError {
   readonly code: string;
@@ -118,12 +139,49 @@ export const ATTENTION_TITLES = {
   enhancement_ready: "Task enhancement ready to review", enhancement_failed: "Task enhancement failed",
   enhancement_interrupted: "Task enhancement outcome is uncertain",
   decision_permission: "Coding agent needs permission", decision_question: "Coding agent needs input",
+  // A host watcher's CI result on an agent's branch (dc-store `signals.record`). They are `run` targets with a
+  // `run_` kind because every reader holds the closed set run|enhancement|decision and requires the prefix.
+  run_ci_passed: "Coding agent branch passed CI", run_ci_failed: "Coding agent branch failed CI",
+  run_ci_cancelled: "Coding agent branch CI was cancelled",
 } as const;
+/** Where a CI result was observed. */
+export const CI_SOURCES = ["github", "ci_local"] as const;
+/**
+ * The facts a CI notice carries (dc-store `signals.record`). `conclusion` is the source's own word, `url` is null
+ * when the source gave none, and nothing here is output: the run's log never reaches the inbox.
+ */
+export interface AttentionSignal {
+  source: (typeof CI_SOURCES)[number]; external_id: string; kind: "ci_passed" | "ci_failed" | "ci_cancelled";
+  conclusion: string; workflow: string; branch: string; url: string | null; head_sha: string;
+}
 export interface Attention extends RecordVersion {
   source_sequence: number; task_id: string; task_revision: number; target_type: "run" | "enhancement" | "decision";
   target_id: string; target_revision: number; target_status: "current" | "changed" | "task_changed" | "task_deleted" | "unavailable";
   kind: keyof typeof ATTENTION_TITLES; title: string; created_at: number;
   read_at: number | null; dismissed_at: number | null; snoozed_until: number | null;
+  /** Present exactly on the `run_ci_*` kinds. */
+  signal?: AttentionSignal;
+}
+/**
+ * A notice whose kind this build does not know: a newer GitPulse (or an agent on a newer store) recorded something
+ * this one cannot describe. It is a row, not an error, so one new kind cannot blank the page. It carries only what
+ * every notice has; it says it cannot be read and offers nothing to open, because what it targets is unknown.
+ */
+export interface UnreadAttention extends RecordVersion {
+  unreadable: true; source_sequence: number; kind: string; title: typeof UNREADABLE_TITLE; created_at: number;
+  read_at: number | null; dismissed_at: number | null; snoozed_until: number | null;
+}
+export type AttentionRow = Attention | UnreadAttention;
+export const UNREADABLE_TITLE = "A notice this version of GitPulse cannot read";
+const SIGNAL_KIND_OF = { run_ci_passed: "ci_passed", run_ci_failed: "ci_failed", run_ci_cancelled: "ci_cancelled" } as const;
+function attentionSignal(value: unknown, kind: keyof typeof SIGNAL_KIND_OF): AttentionSignal {
+  const raw = object(value), source = CI_SOURCES.find((s) => s === raw.source);
+  const externalID = text(raw.external_id), conclusion = text(raw.conclusion), workflow = text(raw.workflow), branch = text(raw.branch);
+  const url = nullableText(raw.url), sha = text(raw.head_sha);
+  if (!source || raw.kind !== SIGNAL_KIND_OF[kind] || !/^[A-Za-z0-9_-]{1,128}$/.test(externalID) || !/^[a-z0-9_-]{1,32}$/.test(conclusion) ||
+      !workflow.trim() || workflow.length > 200 || !branch.trim() || branch.length > 1024 || /\p{Cc}/u.test(workflow + branch) ||
+      (url !== null && (url.length > 2048 || !/^https:\/\/\S+$/u.test(url) || /\p{Cc}/u.test(url))) || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sha)) return invalid();
+  return { source, external_id: externalID, kind: SIGNAL_KIND_OF[kind], conclusion, workflow, branch, url, head_sha: sha };
 }
 export type AttentionFilter = "active" | "unread" | "all";
 export type AttentionAction = "read" | "unread" | "dismiss" | "restore" | "snooze" | "unsnooze";
@@ -138,12 +196,31 @@ export function attention(value: unknown): Attention {
       (target !== "run" && target !== "enhancement" && target !== "decision") || !kind.startsWith(`${target}_`) ||
       (status !== "current" && status !== "changed" && status !== "task_changed" && status !== "task_deleted" && status !== "unavailable") ||
       ![taskID, targetID].every((id) => /^[A-Za-z0-9_-]{1,128}$/.test(id)) || raw.title !== ATTENTION_TITLES[kind]) return invalid();
+  // The CI kinds carry their facts and no other kind does: a signal on a run notice, or none on a CI one, is a
+  // store this reader does not understand, and is refused like any other mismatch.
+  const ci = kind === "run_ci_passed" || kind === "run_ci_failed" || kind === "run_ci_cancelled" ? kind : null;
+  if ((ci === null) !== (raw.signal === undefined)) return invalid();
+  const signal = ci === null ? undefined : attentionSignal(raw.signal, ci);
   return { ...base, source_sequence: sequence, task_id: taskID, task_revision: taskRevision, target_type: target,
     target_id: targetID, target_revision: targetRevision, target_status: status, kind, title: ATTENTION_TITLES[kind], created_at: integer(raw.created_at),
+    read_at: raw.read_at === null ? null : integer(raw.read_at), dismissed_at: raw.dismissed_at === null ? null : integer(raw.dismissed_at), snoozed_until: raw.snoozed_until === null ? null : integer(raw.snoozed_until),
+    ...(signal ? { signal } : {}) };
+}
+/**
+ * One row of an inbox page. A kind this build does not know becomes an {@link UnreadAttention} row; everything else
+ * is decoded exactly as {@link attention} does, and a known kind that is malformed still refuses the page, because
+ * that is corruption and not a newer writer. A kind that is not even a plain word is corruption too.
+ */
+export function attentionRow(value: unknown): AttentionRow {
+  const raw = object(value);
+  if (typeof raw.kind !== "string" || Object.hasOwn(ATTENTION_TITLES, raw.kind)) return attention(value);
+  const base = version(raw), sequence = integer(raw.source_sequence);
+  if (!/^[a-z][a-z0-9_]{0,63}$/.test(raw.kind) || !sequence || base.id !== `event-${sequence}`) return invalid();
+  return { ...base, unreadable: true, source_sequence: sequence, kind: raw.kind, title: UNREADABLE_TITLE, created_at: integer(raw.created_at),
     read_at: raw.read_at === null ? null : integer(raw.read_at), dismissed_at: raw.dismissed_at === null ? null : integer(raw.dismissed_at), snoozed_until: raw.snoozed_until === null ? null : integer(raw.snoozed_until) };
 }
-export async function listAttention(scope: Scope, filter: AttentionFilter, cursor?: string): Promise<Page<Attention>> {
-  return page(await request("attention.list", { ...scopeParams(scope), filter, limit: 30, ...(cursor ? { cursor } : {}) }), attention);
+export async function listAttention(scope: Scope, filter: AttentionFilter, cursor?: string): Promise<Page<AttentionRow>> {
+  return page(await request("attention.list", { ...scopeParams(scope), filter, limit: 30, ...(cursor ? { cursor } : {}) }), attentionRow);
 }
 export async function getAttention(id: string): Promise<Attention> {
   const result = record(await request("attention.get", { id }), attention);
@@ -534,6 +611,15 @@ export function taskRun(value: unknown): TaskRun {
     cwd: text(raw.cwd), created_at: integer(raw.created_at), expires_at: integer(raw.expires_at), session_id: nullableText(raw.session_id),
     exit_code: raw.exit_code === null ? null : integer(raw.exit_code), reason: text(raw.reason), outcome_uncertain: boolean(raw.outcome_uncertain),
     ...(raw.model_choice === undefined ? {} : { model_choice: modelChoice(raw.model_choice) }),
+    // The attempt's own clock. Absent stays absent (never zero). An outcome nobody observed is
+    // stored two ways in dc-store `runs.rs`: a finish that records it as uncertain leaves
+    // `finished_at` null (kept: a statement, not a gap), while the reconciler's release stamps
+    // `finished_at` with the time it noticed and sets `outcome_uncertain`. That stamp is not
+    // when the agent ended, so a reader of `finished_at` must also read `outcome_uncertain`
+    // (see `runWindowOf`).
+    ...(raw.claimed_at == null ? {} : { claimed_at: integer(raw.claimed_at) }),
+    ...(raw.started_at == null ? {} : { started_at: integer(raw.started_at) }),
+    ...(raw.finished_at === undefined ? {} : { finished_at: raw.finished_at === null ? null : integer(raw.finished_at) }),
     ...(raw.git_dir === undefined ? {} : { git_dir: text(raw.git_dir) }),
     ...(raw.git_common_dir === undefined ? {} : { git_common_dir: text(raw.git_common_dir) }) };
 }
@@ -606,7 +692,7 @@ export async function listLiveTaskRuns(taskID: string): Promise<{ runs: TaskRun[
  * Every attempt, across tasks, that can hold a checkout: what the board needs
  * to mark the cards with agents working on them. Same paging as above.
  */
-export async function listAllLiveRuns(): Promise<{ runs: TaskRun[]; complete: boolean }> {
+export async function listAllLiveRuns(): Promise<{ runs: TaskRun[]; complete: boolean; workingComplete: boolean }> {
   return holdingRuns({}, () => true);
 }
 /**
@@ -616,12 +702,21 @@ export async function listAllLiveRuns(): Promise<{ runs: TaskRun[]; complete: bo
  * one repository, the handoff form could not see which checkouts they held.
  */
 const HOLDING_PAGE = 100;
-async function holdingRuns(scope: { repository_id: string } | { task_id: string } | Record<string, never>, belongs: (run: TaskRun) => boolean): Promise<{ runs: TaskRun[]; complete: boolean }> {
-  const pages = await Promise.all(["prepared", "starting", "running", "unresolved"].map(async (state) => {
+async function holdingRuns(scope: { repository_id: string } | { task_id: string } | Record<string, never>, belongs: (run: TaskRun) => boolean): Promise<{ runs: TaskRun[]; complete: boolean; workingComplete: boolean }> {
+  const states = ["prepared", "starting", "running", "unresolved"];
+  const pages = await Promise.all(states.map(async (state) => {
     const result = page(await request("runs.list", { ...scope, state, limit: HOLDING_PAGE, newest: true }), taskRun);
     return result.items.every((run) => belongs(run) && run.state === state) ? result : invalid();
   }));
-  return { runs: pages.flatMap((result) => result.items), complete: pages.every((result) => !result.has_more) };
+  // `workingComplete` leaves `prepared` out: a prepared row has not started,
+  // can be a long backlog of expired rows, and says nothing about whether the
+  // runs that are working were all seen. A caller deciding what a quit stops
+  // asks this; `complete` stays the answer for every state.
+  return {
+    runs: pages.flatMap((result) => result.items),
+    complete: pages.every((result) => !result.has_more),
+    workingComplete: pages.every((result, index) => states[index] === "prepared" || !result.has_more),
+  };
 }
 export interface RunRelease { released: boolean; reason: string; run: TaskRun }
 /**
@@ -654,6 +749,72 @@ export async function findConversation(id: string): Promise<RunConversation> {
   const sessionId = text(raw.session_id);
   if (!isSessionId(sessionId)) return invalid();
   return { resumable: true, sessionId, cwd: text(raw.cwd), mode, reason: text(raw.reason) };
+}
+/** The ways a message to an attempt's agent can go. `unavailable` is a route with a reason, not an error. */
+export const SEND_ROUTES = ["mailbox", "resume", "managed", "unavailable"] as const;
+export type SendRoute = (typeof SEND_ROUTES)[number];
+/**
+ * What a send would do, from the host (`runs.send_to_agent` without `confirm`). Nothing was sent. `reason` is
+ * always present and says why this route, or why none: it is shown as it is.
+ */
+export interface AgentSendPreview {
+  route: SendRoute; reason: string;
+  /** Mailbox: whether a hook is waiting on the session right now. */
+  listening?: boolean;
+  /** Managed: Manvi's reading of the run, `parked` (between turns) or `running`. */
+  managedState?: "parked" | "running";
+}
+/**
+ * What a confirmed send did. `sent` is a tri-state. `true` is a message that left GitPulse: `queued` is in the
+ * session's mailbox, `picked_up` is taken by its hook (not read), `delivered` is written to a managed run's
+ * provider. `false` is a managed send known to have written nothing: `refused` with a code Manvi documents as
+ * writing nothing, or `unsupported`. `null` is unknown: `pending` (Manvi had not learned the outcome; asking again
+ * with the same request id reports it and never sends twice), `unresolved` (Manvi cannot tell it from a lost one and
+ * will not resend), or `unconfirmed` (an answer this build cannot read). Unknown is never shown as "nothing was
+ * sent". `resume` is not sent by the host at all: `action: "open_resume"` tells the renderer to open the
+ * conversation with the text as its first prompt.
+ */
+export interface AgentSendResult extends AgentSendPreview {
+  sent: boolean | null;
+  status?: "queued" | "picked_up" | "delivered" | "unsupported" | "refused" | "pending" | "unresolved" | "unconfirmed";
+  action?: "open_resume";
+  retryable?: boolean;
+  code?: string;
+  expiresAtMs?: number;
+  duplicate?: boolean;
+}
+const SEND_STATUSES = ["queued", "picked_up", "delivered", "unsupported", "refused", "pending", "unresolved", "unconfirmed"] as const;
+const UNKNOWN_OUTCOMES: readonly string[] = ["pending", "unresolved", "unconfirmed"];
+function sendPreview(raw: Record<string, unknown>): AgentSendPreview {
+  const route = SEND_ROUTES.find((route) => route === raw.route);
+  const reason = text(raw.reason);
+  if (raw.ok !== true || !route || !reason.trim()) return invalid();
+  const managed = raw.managed_state === undefined ? undefined : (raw.managed_state === "parked" || raw.managed_state === "running" ? raw.managed_state : invalid());
+  return { route, reason, ...(raw.listening === undefined ? {} : { listening: boolean(raw.listening) }), ...(managed ? { managedState: managed } : {}) };
+}
+/** Asks which way `text` would go to the agent behind an attempt, and sends nothing. */
+export async function previewAgentMessage(runId: string, message: string, requestId: string): Promise<AgentSendPreview> {
+  return sendPreview(object(await request("runs.send_to_agent", { id: runId, text: message, request_id: requestId, confirm: false })));
+}
+/** Sends `message` to the agent behind an attempt, but only along `route`: the one the person was shown. */
+export async function sendAgentMessage(runId: string, message: string, requestId: string, route: Exclude<SendRoute, "unavailable">): Promise<AgentSendResult> {
+  const raw = object(await request("runs.send_to_agent", { id: runId, text: message, request_id: requestId, confirm: true, expect_route: route }));
+  const shown = sendPreview(raw);
+  const status = raw.status === undefined ? undefined : (SEND_STATUSES.find((status) => status === raw.status) ?? invalid());
+  const sent = raw.sent === null ? null : boolean(raw.sent);
+  if (shown.route !== route || (sent && !status && route !== "resume")) return invalid();
+  // Unknown is a claim about the delivery: it needs a status that says which kind of unknown, and no other
+  // status may carry it, so a send of unknown outcome cannot be read as a plain "not sent".
+  if ((sent === null) !== (status !== undefined && UNKNOWN_OUTCOMES.includes(status))) return invalid();
+  return {
+    ...shown, sent,
+    ...(status ? { status } : {}),
+    ...(raw.action === "open_resume" ? { action: "open_resume" as const } : {}),
+    ...(raw.retryable === undefined ? {} : { retryable: boolean(raw.retryable) }),
+    ...(raw.code === undefined ? {} : { code: text(raw.code) }),
+    ...(raw.expires_at_ms === undefined ? {} : { expiresAtMs: integer(raw.expires_at_ms) }),
+    ...(raw.duplicate === undefined ? {} : { duplicate: boolean(raw.duplicate) }),
+  };
 }
 export async function cancelTaskRun(run: TaskRun): Promise<TaskRun> {
   const saved = record(await request("runs.cancel", { id: run.id, expected_revision: run.revision, request_id: newID() }), taskRun);
@@ -799,7 +960,7 @@ export function freshTaskFields(): Pick<TaskDraft, "archived" | "checklist" | "l
   return { archived: false, checklist: [], links: [] };
 }
 export function taskDraft(full: Task): TaskDraft {
-  const { id: _id, revision: _revision, updated_at: _updated, completed_at: _completed, ...draft } = full;
+  const { id: _id, revision: _revision, updated_at: _updated, completed_at: _completed, parent_item_id: _parent, children: _children, ...draft } = full;
   return draft;
 }
 /** One merged source, as the merge reports it. */

@@ -16,10 +16,14 @@
 //!   `permissionDecisionReason` is shown to the user for `ask` and to Claude for
 //!   `deny`, which is why the collision reason is written for a person and the
 //!   refusal is written for the model.
-//! * Exit 0, always. Exit 2 blocks the tool call whatever the JSON says, and a
-//!   hook that fell over must never be the reason a user's edit is refused.
-//!   Empty stdout on exit 0 is the documented "no decision" answer, which lets
-//!   the user's own permission rules run untouched.
+//! * Exit 0, always, with one exception. Exit 2 blocks the tool call whatever
+//!   the JSON says, and a hook that fell over must never be the reason a user's
+//!   edit is refused. Empty stdout on exit 0 is the documented "no decision"
+//!   answer, which lets the user's own permission rules run untouched. The
+//!   exception is [`deliver`], the `asyncRewake` `Stop` hook: there exit 2 is
+//!   the documented way to wake the agent with what the hook printed on stderr,
+//!   there is no tool call for it to block, and it happens only when a person
+//!   has sent a message and the hook has claimed it.
 //!
 //! The invariant this module exists to keep is the repository's own, the one
 //! `insights` and `harness::policy` are both built around: a check that could
@@ -43,6 +47,7 @@ use crate::harness::{self, PolicyStatus, ScopedVerdict};
 use crate::insights::{self, same_path, CollisionRisk, InsightsSnapshot};
 
 pub mod advisory_once;
+pub mod deliver;
 pub(crate) mod notify_drops;
 mod notify_input;
 mod notify_outcome;
@@ -248,6 +253,13 @@ pub struct HookInput {
     /// Code sends it. Only [`BYPASS_PERMISSIONS`] changes what a gate does
     /// ([`under_bypass`]); every other value, and its absence, is ignored.
     pub permission_mode: String,
+    /// `Stop`'s `stop_hook_active`: Claude is already continuing because of a
+    /// stop hook (<https://code.claude.com/docs/en/hooks.md>). It is parsed so
+    /// the payload is read faithfully, but no hook acts on it: [`deliver`]
+    /// deliberately ignores it and waits on every stop, because the turn an
+    /// `asyncRewake` wake starts is itself a stop-hook continuation (see the
+    /// `stop_hook_active` paragraph of `deliver.rs`'s module documentation).
+    pub stop_hook_active: bool,
 }
 
 impl HookInput {
@@ -294,6 +306,7 @@ impl HookInput {
             permission_mode: Some(string_at(Some(value), "permission_mode"))
                 .filter(|mode| !mode.is_empty())
                 .unwrap_or_else(|| string_at(Some(value), "permissionMode")),
+            stop_hook_active: value.get("stop_hook_active").and_then(Value::as_bool) == Some(true),
         }
     }
 }
@@ -2029,7 +2042,13 @@ pub fn run_session_brief(input: &HookInput) -> HookOutput {
 /* ── Dispatch ─────────────────────────────────────────────────────────────── */
 
 /// Every subcommand `gitpulse-hook` answers to.
-pub const SUBCOMMANDS: [&str; 4] = ["collision-guard", "command-gate", "session-brief", "notify"];
+pub const SUBCOMMANDS: [&str; 5] = [
+    "collision-guard",
+    "command-gate",
+    "session-brief",
+    "notify",
+    "deliver",
+];
 
 /// The subcommands GitPulse puts on the sessions it launches, beside any the
 /// plugin runs (`workbench::claude_hook`). Two copies may judge one call.
@@ -2081,6 +2100,7 @@ pub fn dispatch(
         "command-gate" => Ok(run_command_gate(input)),
         "session-brief" => Ok(run_session_brief(input)),
         "notify" => run_notify(argument, input, notify_send),
+        "deliver" => deliver::run(input),
         other => Err(format!(
             "unknown subcommand '{other}'; expected one of {}",
             SUBCOMMANDS.join(", ")
@@ -2409,6 +2429,13 @@ fn notify_payload(event: &crate::alerts::bridge::Event, input: &HookInput) -> St
     }
     if !input.agent_id.is_empty() {
         report.insert("subagent".into(), json!(true));
+        // Which subagent, when the host's id is one the bridge will take. The
+        // boolean above stays so a bridge that predates the id still hears
+        // that this is a subagent; an id that would not pass is left off
+        // rather than sent for the whole report to be refused over.
+        if crate::alerts::bridge::valid_key(&input.agent_id) {
+            report.insert("agent_id".into(), json!(input.agent_id));
+        }
     }
     // What is left once the fixed fields are in: the place and the message
     // share it, the place first because it names the session and the message
@@ -5293,6 +5320,9 @@ done
             entrypoint: "cli".into(),
             status: "busy".into(),
             cwd: "/repo".into(),
+            tree: None,
+            run_id: None,
+            parent_pid: None,
         };
         let kind = |kind: &str, ok, sessions| LiveKindStatus {
             kind: kind.into(),
@@ -5313,6 +5343,8 @@ done
             worktrees: vec![LiveWorktree {
                 path: "/repo".into(),
                 sessions: vec![session(11), session(12)],
+                children: Vec::new(),
+                children_truncated: false,
             }],
         };
         snapshot.collisions.shared_worktrees = vec![SharedWorktree {
@@ -6398,7 +6430,21 @@ done
 
         let mut inside = tool_event("PostToolUse", json!({"command":"ls"}));
         inside.agent_id = "agent-7".into();
-        assert!(report("tool_finished", &inside).subagent);
+        let from_inside = report("tool_finished", &inside);
+        assert!(from_inside.subagent);
+        // The id is the one signal that says which subagent: it crosses the
+        // hook, the socket and the parse with the boolean beside it.
+        assert_eq!(from_inside.agent_id.as_deref(), Some("agent-7"));
+        assert_eq!(asked.agent_id, None);
+
+        // An id the bridge would refuse is left off, not sent to cost the
+        // report; the boolean still says it came from a subagent.
+        for unsendable in ["has space".to_string(), "x".repeat(97)] {
+            inside.agent_id.clone_from(&unsendable);
+            let degraded = report("tool_finished", &inside);
+            assert!(degraded.subagent, "{unsendable:?}");
+            assert_eq!(degraded.agent_id, None, "{unsendable:?}");
+        }
     }
 
     #[test]

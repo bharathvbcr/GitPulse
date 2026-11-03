@@ -266,7 +266,7 @@ mod child {
             _ => {
                 seen();
                 std::thread::sleep(Duration::from_millis(200));
-                exit::approve(app);
+                exit::approve(app, || {});
             }
         }
     }

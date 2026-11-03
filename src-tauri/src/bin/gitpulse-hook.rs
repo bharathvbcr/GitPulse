@@ -15,7 +15,11 @@
 //!   leak into ours. The one argument that is not a hook invocation —
 //!   `--version`, which no host sends — prints plain text there instead, and
 //!   deliberately prints nothing a host could parse as a decision.
-//! * **Always exit 0.** Exit 2 blocks the tool call whatever the JSON says. A
+//! * **Exit 0, except for one wake.** `deliver`, the `asyncRewake` `Stop` hook,
+//!   exits 2 with the message it claimed on stderr: the documented way to wake
+//!   the agent (<https://code.claude.com/docs/en/hooks.md>), on an event with
+//!   no tool call to block. Every other path, `deliver`'s included, exits 0.
+//!   Exit 2 blocks the tool call whatever the JSON says. A
 //!   hook that crashed, timed out or could not read its input must never be the
 //!   reason a user's edit is refused, so every failure path here degrades to
 //!   "no decision" plus a stderr line. The single exception is a hook the host
@@ -131,6 +135,14 @@ fn decide() -> i32 {
             }
             0
         }
+        // `deliver` claimed a message. The agent reads stderr (the hook is
+        // registered `asyncRewake`, and exit 2 is what wakes it), so the text
+        // goes there as it is, with no log prefix, and the exit code is the
+        // one `diagnostic` fixes for a wake.
+        Err(error @ hooks::HookError::Wake(_)) => {
+            emit_stderr(format!("{error}"));
+            hooks::diagnostic(&error).exit_code
+        }
         // One line per invocation, at the level the outcome calls for: a
         // transport this platform does not have is information, not a failure.
         Err(error) => {
@@ -159,6 +171,25 @@ fn emit(payload: String) {
     .and_then(|output| output.write(payload.as_bytes()));
     if let Err(error) = result {
         log::warn!(target: "hook", "could not deliver hook stdout: {error}; no retry");
+    }
+}
+
+/// What an `asyncRewake` hook says to the agent it wakes: stderr, bounded and
+/// deadlined like stdout, for the same reason (a host that has gone away leaves
+/// a pipe nobody drains). A message that could not be written is logged; there
+/// is no second channel, and the exit code stays the wake's, because the claim
+/// has already happened and it is the host that decides what an unread
+/// reminder is worth.
+fn emit_stderr(payload: String) {
+    let result = gitpulse_lib::output::BoundedOutput::new(
+        io::stderr(),
+        "gitpulse-hook-stderr",
+        hooks::MAX_INPUT_BYTES,
+        std::time::Duration::from_secs(1),
+    )
+    .and_then(|output| output.write(payload.as_bytes()));
+    if let Err(error) = result {
+        log::warn!(target: "hook", "could not deliver the wake message: {error}; no retry");
     }
 }
 

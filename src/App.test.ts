@@ -251,7 +251,10 @@ describe("App overlay wiring", () => {
     expect(source).toContain('invoke("cmd_set_exit_guard_ready")');
     // The quit's choice for sessions the terminal host keeps reaches the
     // backend with the exit itself (`quitChoice.ts`).
-    expect(source).toContain('invoke("cmd_exit_app", terminals ? { terminals } : {})');
+    // Managed runs a hosted Manvi keeps get the same choice, in the same call.
+    expect(source).toContain('invoke("cmd_exit_app", quitChoices)');
+    expect(source).toContain("...(terminals ? { terminals } : {})");
+    expect(source).toContain("...(managedRuns.managed ? { managed: managedRuns.managed } : {})");
     expect(source).toContain("decideQuitTerminals({");
     expect(source).toContain('window.addEventListener("beforeunload"');
     expect(source).toContain("await editorFileSaveQueue.whenIdle()");
@@ -266,6 +269,18 @@ describe("App overlay wiring", () => {
     expect(source.indexOf("decideQuitTerminals({")).toBeLessThan(flushCall);
     expect(source).toContain("for (const failure of flushPendingWrites())");
     expect(source).not.toContain("conflictSessions.flush()");
+  });
+
+  it("asks about managed runs on every quit, whichever terminal backend holds the sessions", () => {
+    const start = source.indexOf("async function answerNativeExitRequest()");
+    const body = source.slice(start, source.indexOf("\n  }\n", start));
+    const managed = body.indexOf("decideQuitManagedRuns({");
+    // Not inside the host-only branch: the sidecar closes its runs with the terminal host on or off.
+    expect(managed).toBeGreaterThan(-1);
+    expect(managed).toBeLessThan(body.indexOf("decideQuitTerminals({"));
+    expect(body).toContain("listRuns: listAllLiveRuns");
+    expect(body).toMatch(/if \(managedRuns\.cancelled\) \{ cancelNativeExitRequest\(\); return; \}/);
+    expect(source).toContain('import { listAllLiveRuns } from "./lib/workbench/client"');
   });
 
   it("answers every native quit request it saw, so a held quit or logout is never stranded", () => {

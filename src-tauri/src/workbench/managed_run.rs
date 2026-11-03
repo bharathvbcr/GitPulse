@@ -241,6 +241,196 @@ pub(super) fn stop(state: &WorkbenchState, input: &str) -> Result<Value, Workben
     state.worker_call_current("work.runs.managed.stop", json!({"id":id}))
 }
 
+/// The op Manvi serves for another turn of a managed run.
+pub(crate) const OP_CONTINUE: &str = "work.runs.managed.continue";
+
+/// What `work.runs.managed.continue` takes: the run, and for a follow-up the
+/// request id (so a retry never sends twice) and the message. Without a message
+/// it is a status read. Kept as the one place these keys are written, so
+/// `scripts/serve-ops-contract.test.ts` can hold them to
+/// `contracts/serve.ops.schema.json`.
+pub(crate) fn continue_params(id: &str, request_id: Option<&str>, message: Option<&str>) -> Value {
+    let mut params = json!({"id": id});
+    if let Some(request_id) = request_id {
+        params["request_id"] = json!(request_id);
+    }
+    if let Some(message) = message {
+        params["message"] = json!(message);
+    }
+    params
+}
+
+/// Manvi's refusals that a retry can cure and that wrote nothing: a turn is
+/// still in flight, or follow-ups came too fast.
+const RETRYABLE: [&str; 2] = ["E_TURN_IN_FLIGHT", "E_CONTINUE_RATE"];
+
+/// What an unresolved delivery is said to be, whether Manvi reported it as an
+/// error (`E_CONTINUE_UNRESOLVED`) or as the run's state.
+pub(crate) const UNRESOLVED_REASON: &str = "Manvi cannot tell whether this follow-up reached the agent, and it will not be sent again. The run is recorded as unresolved.";
+
+/// The codes `docs/WORKBENCH.md` on Manvi's `work.runs.managed.continue` documents as
+/// writing nothing to the provider, so that a refusal with one of them is a
+/// definite "not sent". `E_CONTINUE_UNSUPPORTED` is the seventh, handled as its
+/// own state. A code outside this list is not claimed to have written nothing:
+/// see [`follow_up_answer`].
+pub(crate) const WROTE_NOTHING: [&str; 6] = [
+    "E_TURN_IN_FLIGHT",
+    "E_CONTINUE_RATE",
+    "E_CONTINUE_LIMIT",
+    "E_RUN_ENDED",
+    "E_DEPENDENCY",
+    "E_BAD_REQUEST",
+];
+
+/// Every state a run can report between turns.
+const FOLLOW_UP_STATES: [&str; 5] = ["delivered", "parked", "running", "unresolved", "ended"];
+
+/// A follow-up's answer, as the renderer reads it.
+///
+/// Kinds of answer that are a result and not an error, because none of them
+/// says anything is wrong with the run: Manvi answered (`ok: true`, its
+/// `state`), Manvi cannot take follow-ups here (`state: "unsupported"`, with
+/// `cause`), Manvi refused this one with a code documented as writing nothing
+/// (`state: "refused"`, with its `code` and whether a retry can help), or the
+/// outcome is not known: `pending` (ask again with the same request id),
+/// `unresolved` (never resent) and `unconfirmed` (a code this build does not
+/// know). Those last three are never reported as "nothing was sent". A call that did not reach an answer — Manvi down,
+/// a timeout — stays an error: it is not evidence about the run.
+pub(crate) fn follow_up_answer(
+    outcome: Result<Value, WorkbenchError>,
+) -> Result<Value, WorkbenchError> {
+    match outcome {
+        Ok(result) => {
+            let state = result["state"].as_str().unwrap_or_default();
+            let whole = |key: &str| result[key].as_i64().filter(|n| *n >= 0);
+            if !FOLLOW_UP_STATES.contains(&state)
+                || whole("turn").is_none()
+                || whole("max_turns").is_none()
+            {
+                return Err(WorkbenchError::new(
+                    "protocol_error",
+                    "Manvi answered a follow-up with a state GitPulse does not know.",
+                ));
+            }
+            let mut answer = json!({
+                "ok": true,
+                "state": state,
+                "turn": result["turn"],
+                "max_turns": result["max_turns"],
+            });
+            if let Some(request_id) = result["request_id"].as_str() {
+                answer["request_id"] = json!(request_id);
+            }
+            if let Some(deadline) = whole("idle_deadline") {
+                answer["idle_deadline"] = json!(deadline);
+            }
+            Ok(answer)
+        }
+        // Manvi did not advertise the op: an older build. Said as what it is.
+        Err(error) if error.code == "unsupported_operation" => Ok(json!({
+            "ok": false,
+            "state": "unsupported",
+            "cause": "manvi_too_old",
+            "reason": "This Manvi version cannot take follow-ups. Update Manvi to send one to a running managed agent.",
+            "retryable": false,
+        })),
+        Err(error) if error.code == "E_CONTINUE_UNSUPPORTED" => Ok(json!({
+            "ok": false,
+            "state": "unsupported",
+            "cause": "not_prepared",
+            "reason": format!("This run cannot take follow-ups: {}", error.message),
+            "retryable": false,
+        })),
+        // Manvi did not learn the outcome in time. Not a refusal: the message
+        // may have been written. Asking again with the same request id returns
+        // the first answer and never sends twice.
+        Err(error) if error.code == "E_CONTINUE_PENDING" => Ok(json!({
+            "ok": false,
+            "state": "pending",
+            "code": error.code,
+            "reason": "Manvi has not yet said whether this follow-up reached the agent, so it may have. Pressing Confirm again with the same request id asks Manvi again and never sends it twice.",
+            "retryable": true,
+        })),
+        // The delivery cannot be told from a lost one; Manvi will not resend it.
+        Err(error) if error.code == "E_CONTINUE_UNRESOLVED" => Ok(json!({
+            "ok": false,
+            "state": "unresolved",
+            "code": error.code,
+            "reason": UNRESOLVED_REASON,
+            "retryable": false,
+        })),
+        Err(error) if WROTE_NOTHING.contains(&error.code.as_str()) => Ok(json!({
+            "ok": false,
+            "state": "refused",
+            "code": error.code,
+            "reason": error.message,
+            "retryable": RETRYABLE.contains(&error.code.as_str()),
+        })),
+        // An `E_` code this build does not know. Manvi documents which codes
+        // write nothing; this is not one of them, so it is not called "nothing
+        // was sent".
+        Err(error) if error.code.starts_with("E_") => Ok(json!({
+            "ok": false,
+            "state": "unconfirmed",
+            "code": error.code,
+            "reason": format!(
+                "Manvi answered with an error GitPulse does not recognise ({}): {}. If a follow-up was being sent, it is not known whether it reached the agent.",
+                error.code, error.message
+            ),
+            "retryable": false,
+        })),
+        Err(error) => Err(error),
+    }
+}
+
+/// Reads a live managed run's follow-up state, or delivers one follow-up to it,
+/// through `call` (the profile worker's `work.runs.managed.continue`; a test's
+/// stand-in for it). `message: None` is the status read and sends nothing.
+/// `send_to_agent` is the one caller: it owns the route this belongs to.
+pub(super) fn follow_up_with(
+    state: &WorkbenchState,
+    id: &str,
+    request_id: Option<&str>,
+    message: Option<&str>,
+    call: impl FnOnce(&str, Value) -> Result<Value, WorkbenchError>,
+) -> Result<Value, WorkbenchError> {
+    if !valid_id(id) {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            "Select a saved managed attempt.",
+        ));
+    }
+    if message.is_some() != request_id.is_some() {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            "A follow-up names its request id, and a status read names none.",
+        ));
+    }
+    if let Some(request_id) = request_id {
+        if !valid_id(request_id) {
+            return Err(WorkbenchError::new(
+                "invalid_input",
+                "A request id is letters, digits, - or _.",
+            ));
+        }
+    }
+    if let Some(message) = message {
+        crate::agent_mailbox::validate_message(message)
+            .map_err(|e| WorkbenchError::new("invalid_input", e.to_string()))?;
+    }
+    let row = saved(state, id)?;
+    if !["starting", "running"]
+        .iter()
+        .any(|s| row["item"]["state"] == *s)
+    {
+        return Err(WorkbenchError::new(
+            "invalid_state",
+            "This managed attempt has no running process to send a follow-up to.",
+        ));
+    }
+    follow_up_answer(call(OP_CONTINUE, continue_params(id, request_id, message)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -725,5 +915,269 @@ mod tests {
         }
         assert!(!path.parent().unwrap().exists());
         assert!(state.0.worker.lock().unwrap().is_none());
+    }
+
+    fn refused(code: &str) -> Result<Value, WorkbenchError> {
+        Err(WorkbenchError::new(code, "Manvi said no"))
+    }
+
+    #[test]
+    fn manvi_answers_become_results_the_panel_can_read() {
+        let delivered = follow_up_answer(Ok(json!({
+            "state": "delivered", "request_id": "r1", "turn": 2, "max_turns": 3, "idle_deadline": 1_700_000_600_i64,
+            "future_field": "ignored",
+        })))
+        .unwrap();
+        assert_eq!(
+            delivered,
+            json!({"ok": true, "state": "delivered", "request_id": "r1", "turn": 2, "max_turns": 3, "idle_deadline": 1_700_000_600_i64})
+        );
+        let parked =
+            follow_up_answer(Ok(json!({"state": "parked", "turn": 1, "max_turns": 3}))).unwrap();
+        assert_eq!(parked["state"], "parked");
+        assert!(parked.get("request_id").is_none() && parked.get("idle_deadline").is_none());
+        for state in ["running", "unresolved", "ended"] {
+            let answer =
+                follow_up_answer(Ok(json!({"state": state, "turn": 0, "max_turns": 1}))).unwrap();
+            assert_eq!(answer["ok"], true, "{state}");
+        }
+    }
+
+    #[test]
+    fn an_answer_that_is_not_one_manvi_gives_is_a_protocol_error_not_a_result() {
+        for bad in [
+            json!({}),
+            json!({"state": "parked"}),
+            json!({"state": "parked", "turn": -1, "max_turns": 2}),
+            json!({"state": "parked", "turn": "1", "max_turns": 2}),
+            json!({"state": "flying", "turn": 1, "max_turns": 2}),
+            json!(null),
+        ] {
+            let error = follow_up_answer(Ok(bad.clone())).expect_err(&bad.to_string());
+            assert_eq!(error.code, "protocol_error", "{bad}");
+        }
+    }
+
+    /// The case this exists for: an installed Manvi that predates the op.
+    /// `ProfileConnection` refuses a call the handshake did not list with
+    /// `unsupported_operation`; that is a fact about Manvi, not a failed run.
+    #[test]
+    fn a_manvi_without_the_op_is_a_truthful_unsupported_state_and_not_an_error() {
+        let answer = follow_up_answer(refused("unsupported_operation")).unwrap();
+        assert_eq!(answer["ok"], false);
+        assert_eq!(answer["state"], "unsupported");
+        assert_eq!(answer["cause"], "manvi_too_old");
+        assert_eq!(answer["retryable"], false);
+        assert!(answer["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Manvi version cannot take follow-ups"));
+        // A run prepared without `max_continuations` is a different truth.
+        let unprepared = follow_up_answer(refused("E_CONTINUE_UNSUPPORTED")).unwrap();
+        assert_eq!(unprepared["state"], "unsupported");
+        assert_eq!(unprepared["cause"], "not_prepared");
+        assert_ne!(unprepared["reason"], answer["reason"]);
+    }
+
+    #[test]
+    fn only_the_two_curable_refusals_are_retryable_and_all_say_nothing_was_written() {
+        for code in ["E_TURN_IN_FLIGHT", "E_CONTINUE_RATE"] {
+            let answer = follow_up_answer(refused(code)).unwrap();
+            assert_eq!(
+                (answer["state"].as_str(), answer["retryable"].clone()),
+                (Some("refused"), json!(true)),
+                "{code}"
+            );
+            assert_eq!(answer["code"], code);
+        }
+        for code in [
+            "E_RUN_ENDED",
+            "E_DEPENDENCY",
+            "E_CONTINUE_LIMIT",
+            "E_BAD_REQUEST",
+        ] {
+            let answer = follow_up_answer(refused(code)).unwrap();
+            assert_eq!(
+                (answer["state"].as_str(), answer["retryable"].clone()),
+                (Some("refused"), json!(false)),
+                "{code}"
+            );
+        }
+    }
+
+    /// `E_CONTINUE_PENDING` is "the wait for the outcome ran out": the message
+    /// may have been written. It is not a refusal, so it is not `refused` (the
+    /// state the panel reads as "nothing was sent"), and it can be asked again
+    /// with the same request id.
+    #[test]
+    fn a_pending_outcome_is_not_a_refusal_and_can_be_asked_again() {
+        let answer = follow_up_answer(refused("E_CONTINUE_PENDING")).unwrap();
+        assert_eq!(answer["ok"], false);
+        assert_eq!(answer["state"], "pending");
+        assert_eq!(answer["retryable"], true);
+        assert_eq!(answer["code"], "E_CONTINUE_PENDING");
+        let reason = answer["reason"].as_str().unwrap();
+        assert!(reason.contains("same request id"), "{reason}");
+        assert!(reason.contains("never sends it twice"), "{reason}");
+        assert!(
+            !reason.to_lowercase().contains("nothing was sent"),
+            "{reason}"
+        );
+    }
+
+    /// `E_CONTINUE_UNRESOLVED`: "the delivery cannot be told from a lost one",
+    /// "not a refusal". It will not be resent, so it is not retryable either.
+    #[test]
+    fn an_unresolved_delivery_is_not_a_refusal_and_is_never_retried() {
+        let answer = follow_up_answer(refused("E_CONTINUE_UNRESOLVED")).unwrap();
+        assert_eq!(answer["ok"], false);
+        assert_eq!(answer["state"], "unresolved");
+        assert_eq!(answer["retryable"], false);
+        let reason = answer["reason"].as_str().unwrap();
+        assert!(reason.contains("cannot tell whether"), "{reason}");
+        assert!(reason.contains("will not be sent again"), "{reason}");
+    }
+
+    /// An `E_` code this build has never heard of is not one Manvi documents as
+    /// writing nothing, so it is not reported as "refused".
+    #[test]
+    fn an_unrecognised_code_is_unconfirmed_and_not_a_refusal() {
+        let answer = follow_up_answer(refused("E_SOMETHING_NEW")).unwrap();
+        assert_eq!(answer["state"], "unconfirmed");
+        assert_eq!(answer["retryable"], false);
+        assert_eq!(answer["code"], "E_SOMETHING_NEW");
+        let reason = answer["reason"].as_str().unwrap();
+        assert!(reason.contains("not known whether"), "{reason}");
+        assert!(reason.contains("E_SOMETHING_NEW"), "{reason}");
+    }
+
+    /// Every code in [`WROTE_NOTHING`] is one Manvi's documentation lists, and
+    /// none of the not-known states is.
+    #[test]
+    fn the_codes_that_wrote_nothing_exclude_the_ones_that_may_have() {
+        for code in [
+            "E_CONTINUE_PENDING",
+            "E_CONTINUE_UNRESOLVED",
+            "E_CONTINUE_UNSUPPORTED",
+        ] {
+            assert!(!WROTE_NOTHING.contains(&code), "{code}");
+        }
+        assert!(WROTE_NOTHING.contains(&"E_TURN_IN_FLIGHT"));
+    }
+
+    #[test]
+    fn a_call_that_never_got_an_answer_stays_an_error() {
+        for code in [
+            "timeout",
+            "unavailable",
+            "busy",
+            "not_installed",
+            "protocol_error",
+        ] {
+            let error = follow_up_answer(refused(code)).expect_err(code);
+            assert_eq!(error.code, code);
+        }
+    }
+
+    #[test]
+    fn the_params_name_exactly_the_keys_the_contract_declares() {
+        assert_eq!(continue_params("run", None, None), json!({"id": "run"}));
+        assert_eq!(
+            continue_params("run", Some("r1"), Some("hello")),
+            json!({"id": "run", "request_id": "r1", "message": "hello"})
+        );
+    }
+
+    /// A follow-up reaches Manvi only for a live managed attempt, with a valid
+    /// message and request id, and carries exactly what the person approved.
+    #[test]
+    fn a_follow_up_is_sent_only_for_a_live_managed_run_with_a_valid_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = prepared_attempt(dir.path(), "claude");
+        let never =
+            |_: &str, _: Value| -> Result<Value, WorkbenchError> { panic!("reached Manvi") };
+        // Prepared: no process yet.
+        assert_eq!(
+            follow_up_with(&state, "run", Some("r1"), Some("hi"), never)
+                .unwrap_err()
+                .code,
+            "invalid_state"
+        );
+        state.with_store(|store| query(store, "runs.claim", &json!({"id":"run","request_id":"claim","expected_revision":1,"kind":"managed","owner_id":"owner","session_id":"session"}).to_string())).unwrap();
+        for (request, message) in [
+            (None, Some("hi")),
+            (Some("r1"), None),
+            (Some("r 1"), Some("hi")),
+            (Some("r1"), Some("")),
+            (Some("r1"), Some("   ")),
+            (Some("r1"), Some("bell \u{7}")),
+        ] {
+            let error = follow_up_with(&state, "run", request, message, never).unwrap_err();
+            assert_eq!(error.code, "invalid_input", "{request:?} {message:?}");
+        }
+        let too_long = "x".repeat(crate::agent_mailbox::MAX_MESSAGE_BYTES + 1);
+        assert_eq!(
+            follow_up_with(&state, "run", Some("r1"), Some(&too_long), never)
+                .unwrap_err()
+                .code,
+            "invalid_input"
+        );
+        assert_eq!(
+            follow_up_with(&state, "no/such", None, None, never)
+                .unwrap_err()
+                .code,
+            "invalid_input"
+        );
+
+        let mut seen = None;
+        let answer = follow_up_with(
+            &state,
+            "run",
+            Some("r1"),
+            Some("CI failed.\nSee the run."),
+            |op, params| {
+                seen = Some((op.to_owned(), params));
+                Ok(json!({"state": "delivered", "request_id": "r1", "turn": 2, "max_turns": 3}))
+            },
+        )
+        .unwrap();
+        assert_eq!(answer["state"], "delivered");
+        assert_eq!(
+            seen,
+            Some((
+                "work.runs.managed.continue".to_owned(),
+                json!({"id": "run", "request_id": "r1", "message": "CI failed.\nSee the run."})
+            ))
+        );
+        // The status read sends no message and no request id.
+        let mut read = None;
+        follow_up_with(&state, "run", None, None, |_, params| {
+            read = Some(params);
+            Ok(json!({"state": "parked", "turn": 1, "max_turns": 3}))
+        })
+        .unwrap();
+        assert_eq!(read, Some(json!({"id": "run"})));
+    }
+
+    #[test]
+    fn a_terminal_attempt_is_never_sent_a_managed_follow_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        git_global(&["init", root.to_str().unwrap()]).unwrap();
+        crate::test_support::trust_repo(&root);
+        let state = WorkbenchState(Arc::new(super::super::Inner {
+            path: Some(dir.path().join("profile.sqlite")),
+            ..Default::default()
+        }));
+        state
+            .register(root.to_str().unwrap(), "repo", "register")
+            .unwrap();
+        state.request("items.put", &json!({"id":"task","request_id":"task","expected_revision":0,"title":"Inspect repository","repository_ids":["repo"],"primary_repository_id":"repo"}).to_string()).unwrap();
+        state.request("runs.prepare_terminal", &json!({"id":"run","request_id":"prepare","task_id":"task","source_revision":1,"repository_id":"repo","repository_revision":1,"provider":"claude","permission_mode":"inspect","repo_path":root}).to_string()).unwrap();
+        let error = follow_up_with(&state, "run", Some("r1"), Some("hi"), |_, _| {
+            panic!("reached Manvi")
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "run_kind_mismatch");
     }
 }

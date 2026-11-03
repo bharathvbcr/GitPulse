@@ -137,12 +137,20 @@ pub enum HookError {
     Failed(String),
     /// The hook has nothing to do on this platform. Not a failure.
     Unsupported(String),
+    /// `deliver` took a message and has it to say. Not an error at all: it is
+    /// the one outcome whose exit code is 2, which an `asyncRewake` hook uses
+    /// to wake the agent with what it printed on stderr. It rides this type
+    /// because every other way out of a hook already does, and the binary
+    /// prints it as it is, without a log prefix, since the agent reads it.
+    Wake(String),
 }
 
 impl fmt::Display for HookError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            HookError::Failed(message) | HookError::Unsupported(message) => f.write_str(message),
+            HookError::Failed(message)
+            | HookError::Unsupported(message)
+            | HookError::Wake(message) => f.write_str(message),
         }
     }
 }
@@ -186,8 +194,11 @@ impl From<SendError> for HookError {
 pub struct Diagnostic {
     pub level: log::Level,
     pub line: String,
-    /// Always 0. Exit 2 blocks the user's tool call whatever the JSON says, and
-    /// a hook that could not report must never be the reason an edit is refused.
+    /// 0 for every failure. Exit 2 blocks the user's tool call whatever the JSON
+    /// says, and a hook that could not report must never be the reason an edit
+    /// is refused. The one 2 is a [`HookError::Wake`], which only the
+    /// `asyncRewake` `Stop` entry can produce: there it wakes the agent, and
+    /// there is no tool call for it to block.
     pub exit_code: i32,
 }
 
@@ -201,12 +212,16 @@ pub struct Diagnostic {
 pub fn diagnostic(error: &HookError) -> Diagnostic {
     let level = match error {
         HookError::Failed(_) => log::Level::Warn,
-        HookError::Unsupported(_) => log::Level::Info,
+        HookError::Unsupported(_) | HookError::Wake(_) => log::Level::Info,
     };
     Diagnostic {
         level,
         line: format!("gitpulse-hook: {error}"),
-        exit_code: 0,
+        exit_code: if matches!(error, HookError::Wake(_)) {
+            2
+        } else {
+            0
+        },
     }
 }
 

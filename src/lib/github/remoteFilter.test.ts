@@ -55,6 +55,7 @@ function run(id: number, extra: Partial<WorkflowRunInfo> = {}): WorkflowRunInfo 
     title: `run ${id}`,
     status: "completed",
     conclusion: "success",
+    outcome: "passed",
     head_branch: "main",
     url: `https://example.test/runs/${id}`,
     created_at: "2026-09-04T11:00:00Z",

@@ -16,6 +16,7 @@
  */
 
 import type { Grant } from "../grants/types";
+import { isJournalEvent } from "../ledger/projection";
 import type { LedgerEvent } from "../ledger/types";
 import type { TaskLease } from "../tasks/types";
 import type { WorktreeInfo } from "../branches/types";
@@ -324,6 +325,9 @@ export function projectWork(input: WorkInputs): WorkProjection {
   }
 
   for (const event of input.events ?? []) {
+    // Token counts and lifecycle changes belong to a run's timeline; counting
+    // them would put a row per response in "recent events".
+    if (!isJournalEvent(event)) continue;
     // The ledger records both, so each mode joins on the column it actually
     // keys by rather than inferring one from the other.
     const key = byTask ? event.task_id || UNBOUND_ROW_ID : event.worktree_path || UNBOUND_ROW_ID;
@@ -418,8 +422,19 @@ export function rowNeedsAttention(row: WorkRow): boolean {
   return row.operation !== null || dirty.files > 0 || dirty.scanned < dirty.total ||
     row.worktrees.some(binding => binding.operationChecked === false) ||
     row.pullRequests.some(pr => pr.ci_status.toLowerCase() === "failure" || pr.review_decision.toUpperCase() === "CHANGES_REQUESTED") ||
-    latestRuns(row).some(run => run.status.toLowerCase() === "completed" &&
-      ["failure", "timed_out", "action_required", "startup_failure"].includes(run.conclusion.toLowerCase()));
+    latestRuns(row).some(run => runNeedsAttention(run));
+}
+
+/**
+ * A latest run that wants a person: it failed, or it is held for one.
+ *
+ * Read from the outcome Rust decided (`github/outcome.rs`), not from `status`
+ * and `conclusion`. `needs_person` (`action_required`) counts here because
+ * someone must act before it can go on, while it is never `failed`: the Remote
+ * panel raises no red banner for it. One rule, stated once, at the owner.
+ */
+export function runNeedsAttention(run: Pick<WorkflowRunInfo, "outcome">): boolean {
+  return run.outcome === "failed" || run.outcome === "needs_person";
 }
 
 /** The worktree on this row that is blocked, if any. */

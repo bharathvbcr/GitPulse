@@ -14,7 +14,7 @@ flowchart TD
     subgraph Boundary["Security & Isolation Boundary"]
         direction TB
         Webview["Tauri Webview<br/>(Strict CSP: default-src 'self')"]
-        IPCBoundary["Tauri IPC Seam<br/>(291 Registered cmd_* Handlers)"]
+        IPCBoundary["Tauri IPC Seam<br/>(292 Registered cmd_* Handlers)"]
         LocalEngine["Rust Core Engine<br/>(Validated paths, git sandbox & policy gates)"]
         
         Webview -->|Typed IPC Only| IPCBoundary
@@ -285,6 +285,115 @@ flowchart TD
   in diagnostics, never presented as an all-clear.
 - **Scan local** on the Health panel does not call GitHub. The **Check GitHub
   alerts** button remains a manual refresh.
+
+### CI Results on Agent Branches
+- `workbench/ci_watch.rs` polls GitHub Actions through the same locally
+  authenticated `gh` loader the Remote panel uses, for repositories that have
+  a live or just-finished agent attempt branch (`gitpulse/<task>-<id>`). It
+  asks only repositories the user has trusted; an untrusted repository is
+  reported as untrusted and is never asked, and a trust store that cannot be
+  read is its own state, not "untrusted" and not a `gh` fault. It makes at most
+  two asks per five-second sweep and forty per ten minutes, backs a failing
+  repository off to ten minutes, and keeps its queues bounded. The run table
+  that says which branches to watch is re-read every thirty seconds, not on
+  every sweep.
+- A finish is attributed through the repository the checkout's git remote
+  names (a local git read, no `gh` call, made only for a trusted checkout and
+  at most once per idle period), and is recorded only for a repository that is
+  trusted at that moment. It is attributed to an attempt only by the attempt
+  branch GitHub says the run ran on; a signal never names a branch the run
+  was not on, and CI on the commit an attempt started from (the base branch's
+  own run) is nobody's result. A repository with no GitHub remote cannot be
+  watched, which is reported as its own state and is not a fault. The shared baseline also folds in
+  the Remote panel's own listings, so a finish can exist for a repository this
+  watcher never asked; it is not recorded unless the trust gate admits it.
+- It records a result with `signals.record`, a store method that is
+  **host-only**: the renderer is refused it (`host_only`), so no page can write
+  a "your branch passed CI" notice that GitHub never sent. A signal is a fact
+  the store was told; it never changes a task, a run or a proposal. Its log
+  block on a failed task names the workflow, the run URL, the head commit and
+  the conclusion, and never the run's output.
+- `gh` missing or signed out, a capped listing and an unreadable trust store
+  are reported (Diagnostics lists the first; the Remote panel shows `truncated`),
+  never presented as "no CI". A run already finished when first seen is
+  history, not news.
+- Security impact: no new network endpoint, credential, process or permission.
+  The watcher widens nothing that can run; it adds one reader of `gh` output
+  inside the existing trust gate and one writer of a notice-only store method.
+
+### Send to Agent: The Mailbox and the Waiting Hook
+- **Send to agent** puts a CI result, or a person's note, back into the agent
+  that pushed the branch. It is never automatic: the panel shows the exact
+  text and the route a send would take (live session, resume, managed
+  follow-up, or unavailable with the reason), and sends only on an explicit
+  confirm of that route. The host re-decides the route at confirm time and
+  refuses (`route_changed`, nothing sent) if it is no longer the one shown.
+  Text from the producer (a workflow or branch name, a run URL) has control
+  and bidirectional characters made visible before it is composed, and the
+  message is held to 8 KiB, plain text with line breaks and tabs only.
+- A live Claude session is reached through a **filesystem mailbox**, not a
+  socket: `<config dir>/agent-mailbox/<session uuid>/`. Directories are
+  `0700`, files `0600`, every open is `O_NOFOLLOW`, the mailbox root and each
+  session directory are refused if they are symlinks (the ancestors above the
+  GitPulse config directory are the user's own and are not checked), and an
+  object not owned by the current user or wider than its mode is refused and
+  never read. Writes are temp-file plus
+  `rename`-without-replace; a claim is a second atomic rename, so a message is
+  delivered once even though the plugin's hook and the `--settings` copy both
+  run. Per session: 8 pending messages, 2 waiting hooks; 64 sessions and 16
+  waiting hooks overall; pending messages expire after 2 hours, claimed ones
+  after 10 minutes. The session cap and the waiter caps count every Claude
+  session in any GitPulse terminal (`GITPULSE_SESSION_ID` is set on plain
+  terminals too), not only task attempts, so many plain `claude` tabs can fill
+  them, after which a send answers `mailbox_full`.
+- The newest hooks on a session take precedence: a later stop's two hooks
+  displace an earlier stop's at their next 250 ms look (they exit 0), so a
+  session is listening from its latest stop and not deaf from its first stop's
+  timeout. A hook that claims a message but cannot write it to stderr still
+  exits 2 with the message lost; it is logged, and the message is reported as
+  claimed ("picked up"), never as read.
+- Delivery is a second `Stop` hook entry, `gitpulse-hook deliver`, registered
+  with `asyncRewake: true` and a 1800 s timeout (Claude Code hooks reference,
+  https://code.claude.com/docs/en/hooks.md: an `asyncRewake` hook runs in the
+  background and wakes the session on exit 2, showing stderr as a system
+  reminder). It waits at most 1740 s with a bounded 250 ms poll, claims one
+  message, writes it to stderr and exits 2. Every other outcome (timeout,
+  unknown session, full caps, an untrusted mailbox, any I/O error) exits 0. Only
+  a session GitPulse launched has a mailbox: the hook acts only when
+  `GITPULSE_SESSION_ID` is set and the payload's `session_id` is a canonical
+  UUID, and an unknown session creates nothing on disk. Every stop waits,
+  `stop_hook_active` or not: the turn an `asyncRewake` wake starts is itself a
+  stop-hook continuation (inferred from the Claude Code 2.1.317 binary, where
+  the wake is queued with `stopHookActive: true`; no real turn was run), so a
+  hook that declined to wait there would leave a just-woken session with no
+  waiter until the person types. This is not a self-sustaining loop: a waiter
+  wakes Claude only on a message a person confirmed, and the waiter caps and
+  Claude Code's own cap on consecutive continuations bound it.
+- A **queued** message is not **read**: the panel says queued, picked up, or
+  delivered, and never that the agent read or acted on it. A managed follow-up
+  goes through Manvi's `work.runs.managed.continue`; a Manvi that does not
+  advertise it is reported as "this Manvi version cannot take follow-ups", and
+  a run not prepared for follow-ups as that, neither as a run failure. "Nothing
+  was sent" is said only for the refusal codes Manvi documents as writing
+  nothing (`E_TURN_IN_FLIGHT`, `E_CONTINUE_RATE`, `E_CONTINUE_LIMIT`,
+  `E_RUN_ENDED`, `E_DEPENDENCY`, `E_BAD_REQUEST`, `E_CONTINUE_UNSUPPORTED`). An
+  outcome that may have been written is its own state with `sent: null`:
+  `pending` (`E_CONTINUE_PENDING`; Confirm stays armed and asks again with the
+  same request id, which returns the first answer and never sends twice),
+  `unresolved` (`E_CONTINUE_UNRESOLVED`, or an answered `unresolved` state;
+  never resent) and `unconfirmed` (an `E_` code this build does not know). The
+  note editor warns that a different note is a new message sent in addition.
+  When no hook is waiting on a live session the preview says only that, and
+  that GitPulse cannot see why.
+- Security impact: a same-uid process could always type into an agent's
+  terminal, so the mailbox widens nothing a local user could not already do; it
+  adds one new way for text to reach an agent's context, and that text is only
+  what a person previewed and confirmed. No new network endpoint, credential,
+  socket or Tauri command (the host method is `runs.send_to_agent` on the
+  existing workbench seam). The hook adds a background process per idle
+  GitPulse-launched Claude session, bounded by the waiter caps and the
+  timeout. Expired entries are removed by the deposit and claim paths
+  themselves, not by a daemon.
 
 ### Local Dependency Scans Read, They Do Not Build
 - Health's local dependency scan runs whichever audit CLIs are already on

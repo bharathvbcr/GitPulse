@@ -112,7 +112,13 @@ export function enqueueTaskTerminal(request: TaskTerminalRequest): void {
   }
   const current = get(pending);
   const key = requestKey(request);
-  if (current.some((item) => requestKey(item) === key)) return;
+  if (current.some((item) => requestKey(item) === key)) {
+    // A repeat of a request is the same request, and is absorbed. A repeat that
+    // carries a prompt is not: the prompt is a person's message, and dropping it
+    // into a conversation that is already queued would report it sent.
+    if (request.resume?.prompt !== undefined) throw new Error("This conversation is already waiting to open, so the message was not added to it.");
+    return;
+  }
   if (current.length >= MAX_LIVE_RUNS) {
     throw new Error(`${MAX_LIVE_RUNS} task terminals are already waiting to open. Open or cancel one of those attempts first.`);
   }

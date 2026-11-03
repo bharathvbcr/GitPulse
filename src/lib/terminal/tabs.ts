@@ -74,6 +74,12 @@ export interface ResumeLaunch {
    * is the reader's own and never acts on that attempt's record.
    */
   runId?: string;
+  /**
+   * A first message for the resumed conversation, sent as the prompt of
+   * `claude --resume <id> -- <prompt>` (`resumeArgs`). The first start only: a
+   * restart of the tab resumes without it, or it would be said twice.
+   */
+  prompt?: string;
 }
 
 /**

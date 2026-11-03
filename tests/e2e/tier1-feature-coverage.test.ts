@@ -252,7 +252,7 @@ describe("Tier 1: Feature Coverage (Features 1–15)", () => {
   // Feature 4: DevMap Live Refresh Decoupling (Milestone 1)
   // ---------------------------------------------------------------------------
   describe("Feature 4: DevMap Live Refresh Decoupling (Milestone 1)", () => {
-    it("4.1: bun run check:ipc verifies zero orphaned handlers and zero missing commands across 291 commands", () => {
+    it("4.1: bun run check:ipc verifies zero orphaned handlers and zero missing commands across 292 commands", () => {
       const res = runCommand("bun", ["run", "check:ipc"]);
       expect(res.status).toBe(0);
       expect(res.stdout).toContain("OK: IPC contract holds.");

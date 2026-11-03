@@ -51,6 +51,8 @@ CREATE TABLE IF NOT EXISTS task_leases (
     created_at VARCHAR NOT NULL,
     expires_at VARCHAR,
     released_at VARCHAR,
+    worktree_path VARCHAR,
+    worktree_id VARCHAR,
     PRIMARY KEY (id)
 );
 
@@ -197,6 +199,23 @@ CREATE TABLE IF NOT EXISTS reviews (
     recorded_at VARCHAR NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_reviews_task_criterion ON reviews (task_id, acceptance_criterion_id);
+"#;
+
+/// Indexes over columns added after their table first shipped, applied by
+/// [`migrate`] once those columns exist.
+///
+/// [`SCHEMA`] runs on every open before the migration, and `CREATE TABLE IF NOT
+/// EXISTS` leaves an older table without its newer columns, so an index in
+/// [`SCHEMA`] that names one fails the whole open with "no such column" — every
+/// existing store, while a fresh one works. An index belongs in [`SCHEMA`] only
+/// when every column it names is one [`add_missing_columns`] could not add (a
+/// primary key, or NOT NULL with no default): a column the table must have had
+/// from the start. `an_index_in_schema_names_only_columns_a_table_was_born_with`
+/// holds that line.
+pub const LATE_INDEXES: &str = r#"
+-- At most one active lease per worktree. worktree_path and worktree_id were
+-- added to task_leases after schema 11 shipped.
+CREATE UNIQUE INDEX IF NOT EXISTS ix_task_leases_worktree ON task_leases (worktree_path) WHERE status = 'active' AND worktree_path IS NOT NULL;
 "#;
 
 /// The name of the partial unique index the lease's mutual exclusion rests on.
@@ -454,7 +473,9 @@ fn migrate_inner(
     let missing =
         missing_columns(conn).map_err(|e| format!("columns could not be compared: {e}"))?;
     if missing.is_empty() && current == Some(known as i64) {
-        return Ok(());
+        // Like SCHEMA on every open: IF NOT EXISTS over an index already there
+        // compiles to a no-op and takes no write lock.
+        return create_late_indexes(conn);
     }
 
     conn.execute_batch("BEGIN IMMEDIATE")
@@ -484,8 +505,14 @@ pub(crate) fn bring_current(
     // binary may have stamped a higher version, since the caller last looked.
     check_stored_version(conn, known)?;
     add_missing_columns(conn, budget)?;
+    create_late_indexes(conn)?;
     spend(budget)?;
     ensure_schema_version(conn, known)
+}
+
+fn create_late_indexes(conn: &Connection) -> std::result::Result<(), String> {
+    conn.execute_batch(LATE_INDEXES)
+        .map_err(|e| format!("indexes over added columns could not be created: {e}"))
 }
 
 /// Refuses a stored `schema_version` newer than `known`, touching nothing.
@@ -647,4 +674,156 @@ fn check_version(found: i64, known: u32) -> std::result::Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// Every table, its column names, and every index with its DDL: what two
+    /// stores must agree on to be the same schema.
+    type Shape = (
+        BTreeMap<String, BTreeSet<String>>,
+        BTreeMap<String, Option<String>>,
+    );
+
+    fn shape(conn: &Connection) -> Shape {
+        let mut stmt = conn
+            .prepare("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
+            .expect("read sqlite_master");
+        let rows: Vec<(String, String, Option<String>)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("query sqlite_master")
+            .collect::<rusqlite::Result<_>>()
+            .expect("rows");
+        let mut tables = BTreeMap::new();
+        let mut indexes = BTreeMap::new();
+        for (kind, name, sql) in rows {
+            match kind.as_str() {
+                "table" => {
+                    let columns = table_columns(conn, &name)
+                        .expect("table_info")
+                        .into_iter()
+                        .map(|c| c.name)
+                        .collect();
+                    tables.insert(name, columns);
+                }
+                "index" => {
+                    indexes.insert(name, sql);
+                }
+                _ => {}
+            }
+        }
+        (tables, indexes)
+    }
+
+    /// A column [`add_missing_columns`] refuses to add, so one the table must
+    /// have been created with.
+    fn born_with(column: &Column) -> bool {
+        column.primary_key || (column.not_null && column.default.is_none())
+    }
+
+    fn schema_tables(scratch: &Connection) -> Vec<String> {
+        let mut stmt = scratch
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .expect("list tables");
+        stmt.query_map([], |row| row.get(0))
+            .expect("query tables")
+            .collect::<rusqlite::Result<_>>()
+            .expect("tables")
+    }
+
+    /// The oldest shape any store could have: every table in [`SCHEMA`] with
+    /// only the columns it was necessarily born with, and no indexes. Opening it
+    /// must succeed and leave exactly what a fresh store holds — the columns
+    /// added since, and every index, including those over the added columns.
+    #[test]
+    fn a_store_from_before_every_added_column_opens_into_the_fresh_schema() {
+        let scratch = Connection::open_in_memory().expect("scratch");
+        scratch.execute_batch(SCHEMA).expect("schema");
+        let old = Connection::open_in_memory().expect("old store");
+        for table in schema_tables(&scratch) {
+            let kept: Vec<Column> = table_columns(&scratch, &table)
+                .expect("table_info")
+                .into_iter()
+                .filter(born_with)
+                .collect();
+            let mut parts: Vec<String> = kept
+                .iter()
+                .map(|c| format!("{} {} NOT NULL", c.name, c.ty))
+                .collect();
+            let key: Vec<&str> = kept
+                .iter()
+                .filter(|c| c.primary_key)
+                .map(|c| c.name.as_str())
+                .collect();
+            if !key.is_empty() {
+                parts.push(format!("PRIMARY KEY ({})", key.join(", ")));
+            }
+            old.execute_batch(&format!("CREATE TABLE {table} ({});", parts.join(", ")))
+                .expect("create the old table");
+        }
+        let missing = missing_columns(&old).expect("compare columns");
+        assert!(
+            missing
+                .iter()
+                .any(|(t, c)| t == "task_leases" && c.name == "worktree_path"),
+            "the old store does not lack the columns it is meant to: {:?}",
+            missing
+                .iter()
+                .map(|(t, c)| format!("{t}.{}", c.name))
+                .collect::<Vec<_>>()
+        );
+
+        let migrated =
+            crate::Store::prepare(old).unwrap_or_else(|e| panic!("an old store did not open: {e}"));
+        let fresh = crate::Store::open_in_memory().expect("fresh store");
+        assert_eq!(shape(&migrated.conn), shape(&fresh.conn));
+        assert!(
+            shape(&fresh.conn).1.contains_key("ix_task_leases_worktree"),
+            "the late index was never created"
+        );
+    }
+
+    /// The line [`LATE_INDEXES`] draws: an index in [`SCHEMA`] runs before the
+    /// migration, so it may name only columns no migration ever had to add.
+    #[test]
+    fn an_index_in_schema_names_only_columns_a_table_was_born_with() {
+        let scratch = Connection::open_in_memory().expect("scratch");
+        scratch.execute_batch(SCHEMA).expect("schema");
+        let mut stmt = scratch
+            .prepare(
+                "SELECT name, tbl_name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL",
+            )
+            .expect("list indexes");
+        let indexes: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query indexes")
+            .collect::<rusqlite::Result<_>>()
+            .expect("indexes");
+        assert!(!indexes.is_empty(), "SCHEMA declared no indexes to check");
+        for (index, table) in indexes {
+            let columns = table_columns(&scratch, &table).expect("table_info");
+            let mut info = scratch
+                .prepare(&format!("PRAGMA index_info({index})"))
+                .expect("index_info");
+            let named: Vec<String> = info
+                .query_map([], |row| row.get("name"))
+                .expect("query index_info")
+                .collect::<rusqlite::Result<_>>()
+                .expect("index columns");
+            for name in named {
+                let column = columns
+                    .iter()
+                    .find(|c| c.name == name)
+                    .unwrap_or_else(|| panic!("{index} names {name}, which {table} lacks"));
+                assert!(
+                    born_with(column),
+                    "{index} in SCHEMA names {table}.{name}, a column a migration can add; \
+                     an older store lacks it when SCHEMA runs, so the index belongs in LATE_INDEXES"
+                );
+            }
+        }
+    }
 }

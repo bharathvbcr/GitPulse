@@ -295,6 +295,316 @@ reads both.
   with citations depend on the links and on evidence capture (section 3), so
   they come after the links.
 
+### Design: launching and reading agent runs from outside the app (2026-11-02)
+
+**Status: design only, not built.** The user chose not to build this now. No
+code, tool, wire field or test in this repository implements it, and no row
+above depends on it. It must fit sections 4 and 6: managed launch identity,
+per-attempt bypass, "scoped agent CLI/MCP cannot grant itself authority" and
+"preserve GitPulse MCP's existing read-only contract". Every statement below
+is from reading source: GitPulse at commit `a7a654cb` (symbols first, line
+numbers as of that commit) and the Manvi checkout as found on 2026-11-02 (its
+commit was not recorded). Only searches (`rg`, `git log -S`) were run; no code
+was built or executed for this note, so nothing here is *tested*.
+
+**The ask.** An outside caller starts an agent run on a board task and later
+reads it or reattaches to it. The reference consumer is Infinity Code's
+`infinity -H <task>` plus a reattach. No source for that contract is in this
+repository (`rg -i infinity` over `docs/` and `src-tauri/src` found only
+unrelated words), so its shape is *assumed*: launch by task id, then read
+state, output and pending questions by run id.
+
+**1. What exists (verified in source)**
+
+- *`gitpulse-mcp`* (`src-tauri/src/mcp/mod.rs`). Its writes are the five
+  task-board tools (module doc, lines 17-25; the allowlist in
+  `no_advertised_tool_offers_an_ungated_mutation`, about line 3004), and its
+  instructions say it "never mutates git state" (about line 1470). It is a
+  separate stdio process. It opens the shared profile store itself
+  (`open_task_profile` / `open_shared_profile`, about lines 1559-1584, never
+  upgrading the schema) and has no `WorkbenchState`, no Manvi sidecar, no PTY
+  manager and no terminal registry. Run-shaped reads that exist:
+  `gitpulse_get_task` (the canonical brief), `gitpulse_task_view` and
+  `gitpulse_ledger_events` filtered by `task_id` or `session_id`
+  (`ledger/lifecycle.rs` writes `session.state` rows). No tool reads a run
+  record, so an outside caller cannot see an attempt's state, owner or
+  requests today.
+- *`gitpulsed`* (`src-tauri/src/bin/gitpulsed.rs`). Attribution catch-up only.
+  Its module doc says "It does not serve requests"; `TERMINAL_HOST.md` repeats
+  that it is not a request-server mode.
+- *Managed launch* (`src-tauri/src/workbench.rs`, `request`, about lines
+  461-511). `runs.prepare`, `runs.managed.prepare`, `runs.managed.activate`,
+  `runs.started`, `runs.finish` and `runs.reconcile` are `host_only`. The
+  public operations are `runs.prepare_managed` (`terminal_launch::prepare_managed`),
+  `runs.launch_managed` (`managed_run::launch`), `runs.stop_managed` and the
+  store read `runs.get`. Before Manvi is asked, the app process does work a
+  second process would have to reproduce: it reads the checkout identity with
+  Git in a trusted checkout (`terminal_launch::checkout`), refuses a provider
+  the installed harness lacks (`managed_adapter_gate`), single-flights the
+  attempt id (`managed_launches.try_enter`, `managed_run.rs:67`), may build a
+  worktree with its setup hook (`terminal_launch.rs:299-302`), revalidates the
+  checkout and observes the provider's process creation identity
+  (`process_birth::read`) before `work.runs.managed.activate`. The store
+  admits at most the user's `max_live_runs` (1-64, default 8,
+  `tool_config.rs`) and one writer per working tree.
+- *Lifetime.* The Manvi sidecar is a child of the app and is dropped on exit
+  (`harness/sidecar.rs`, `shutdown`). Managed jobs live in the `manvi serve`
+  process's memory, and its `Stop` answers "this host does not own the managed
+  run" for any id not in its own table (`Manvi/manvi/serve/managed.go`, `ManagedRunner.Stop`).
+  So a managed run does not outlive the app, and no other Manvi process can
+  stop or steer it. A terminal run outlives the app only with "Keep terminals
+  running" on (`gitpulse-ptyd`), and that host serves one app at a time
+  (`TERMINAL_HOST.md`, "One app at a time"), so a second client cannot attach.
+- *`manvi run --task`* (`Manvi/manvi/cmd/manvi/run.go`). A one-turn headless
+  driver with `--json`, `--resume ID` and exit statuses 0-5. Its `--task` takes
+  a **DevCouncil** lease (`checkoutFor` calls `devcouncil_checkout_task`, about
+  line 623), not a GitPulse work item. A search of the file for `workbench`,
+  `GitPulse` and `work.` returns nothing, so it records no `work_runs` row and
+  the board never learns of it. From the `buildRunEnv` call site (its body was not read) its provider is
+  Manvi's native loop; the Codex and Claude managed adapters live in
+  `serve/managed.go`, not here (*inferred*).
+- *`manvi serve`* speaks stdio only and ends when stdin closes (`serve.go`
+  usage). The plan for this work says wave 2 adds a hosted socket. At this
+  commit there is no listener in `cmd/manvi/serve.go` or `serve/protocol.go`,
+  so that socket is *unverified*.
+- *Seams that already accept a process's request.* The single-instance mailbox
+  (`desktop/instance.rs`, `Request`, about line 88: `Open`, `Reveal`,
+  `Notification`, `GateCommand`, `CollisionScan`), the hook bridge
+  (`alerts/bridge.rs`) and `gitpulse-ptyd`. All bind through
+  `local_socket::bind_private` (directory `0700`, socket `0600`, peer uid read
+  on every connection, and a platform that cannot report it is not bound). The
+  mailbox already carries a request the app answers on the connection:
+  `gitpulse-hook` sends `GateCommand` through `reach_owner`
+  (`hooks/mod.rs`, `judged_by_app_in`). Limits: macOS only
+  (`desktop/mod.rs:4-5`), eight handlers, 32 queued requests, and a
+  `HANDLER_TIMEOUT` of four seconds, so a request cannot wait for a person.
+
+**2. The core problem**
+
+Reading and launching are different problems and should be designed apart.
+
+- *Reading needs no app.* `runs.get` is a store read, and `gitpulse-mcp`
+  already opens the same profile read-only for the task tools. A run tool is a
+  new read over a store it already opens. What it must not do is report more
+  than it knows: a row in `running` with the app gone is *unknown*, not
+  running (`reconcile::judge` already holds the liveness evidence), and
+  terminal output must come through redaction (`TERMINAL_HOST.md` says
+  `redact: true` is required for "any surface beyond the local user", and an
+  MCP reply goes to a model).
+- *Launching needs the app.* A launch is the app process doing the checks in
+  item 1, under its trust grant, against its sidecar, with its capacity
+  accounting. `gitpulse-mcp` has none of those. Two ways to launch without the
+  app both fail. If `gitpulse-mcp` spawns its own `manvi serve` and writes
+  `work.runs.managed.*`, the run has a `manvi-{pid}-...` owner in a process the
+  app does not supervise: `reconcile.rs` (`manvi_owner`, `judge_at`) will keep
+  it while that Manvi lives and release it when it is gone, but the app's
+  `runs.stop_managed` and its decision delivery go to the app's own sidecar,
+  which refuses ("does not own the managed run"). Nothing checked the
+  checkout identity, the adapter set, `process_birth`, `max_live_runs` or the
+  single-flight on the app's side. That is a second owner, not a second
+  client. If instead it needs an app channel, none exists for this: the
+  mailbox has no run frame.
+
+**3. Options**
+
+| | (a) App-hosted request over the existing mailbox, per-launch confirmation | (b) Manvi's hosted serve socket, GitPulse owner of record | (c) Converge on `manvi run --task` |
+|---|---|---|---|
+| Works with the app closed | No: refused, never queued | Only if the Manvi host outlives the app | Yes |
+| Host checks (trust display, checkout identity, adapter gate, `process_birth`, capacity) | All of them, in the process that already owns them | Only if the app stays the only caller | None, unless re-implemented in Go |
+| Run visible on the board | Yes, the same `work_runs` row | Yes if the app prepares it | No; needs `--workbench-db` writes by a CLI |
+| Reattach | Re-read the row; managed runs end with the app | Possible after app quit, new supervision problem | `--resume ID` over Manvi's session log |
+| Providers | Codex and Claude managed lanes | Same | Manvi's native loop only (inferred) |
+| New surface | One `Request` variant and its reply | A listener in Manvi plus a supervisor | A second launcher beside GitPulse's |
+
+- *(a)* extends the seam that exists instead of adding a fourth socket. It is
+  two-phase because of the four-second handler bound: the mailbox answers at
+  once with a pending request id, the app asks the person in its own window,
+  and the caller polls the run. The pending record is *not* a prepared run:
+  preparing builds a worktree and runs its hook, which is repository-defined
+  code that must not run before a person approves it. Caveats: macOS only
+  (other platforms must answer `unsupported_platform`, which is not "no run"),
+  and an unattended caller (`-H` is assumed to mean headless) has nobody to
+  confirm. That tension is real
+  and is why pre-authorization (below) is a separate, later, off-by-default
+  step.
+- *(b)* collapses into (a) or into a second owner. If the socket accepts only
+  the app, external callers still go through the app, and the socket merely
+  makes the sidecar outlive it, which moves supervision and the
+  "unrestricted child" risk of section 4 to a process with no window. If the
+  socket accepts external callers directly, the `host_only` fence in
+  `workbench.rs` moves from the app's dispatch to whatever the socket can
+  authenticate, which for a same-user peer is nothing (item 4 below).
+- *(c)* is a different product lane. `manvi run` is Manvi's native loop with a
+  DevCouncil lease; making it the GitPulse launcher means it writes the
+  profile database beside the app, with none of the host checks and no
+  authority from GitPulse's trust grant. One headless launcher for the suite is
+  a goal worth having, but the way to it is `manvi run` for repositories that
+  GitPulse does not manage, not for board tasks.
+
+**4. Security impact (a proposal, for the owner's review before any build)**
+
+- *Who can start an agent with a repository's trust.* Today: the person, from
+  the webview. With (a): any process of the same user that can reach the
+  mailbox can *ask*; only a person in the app can *start*. The invariant that
+  carries this is structural, not a check: the mailbox gets request and status
+  frames and **no frame that confirms**, so a requester cannot confirm itself,
+  and the confirmation is a native dialog or a one-use native claim, never a
+  renderer flag (`repository_trust::grant_confirmed` is the precedent: "the
+  approval cannot be an in-page modal alone").
+- *Peer identity.* Same uid only (`local_socket::peer_uid`, `peer_allowed`);
+  unreported means refused. That is not authentication of *which* program: any
+  same-user process can speak for `infinity` or for an agent, and a token in a
+  user-readable file would not change that (`TERMINAL_HOST.md` makes the same
+  argument). The requester's pid and process creation identity
+  (`process_birth::read`) are recorded and shown as a hint, never trusted.
+  The controls that matter are the confirmation, trust, binding and caps.
+- *Trust.* Refused unless the repository is trusted. An external request
+  should also be refused when the only grant is a session grant: that kind
+  "never grants another process authority" (`repository_trust::grant`), and
+  the requester is another process. There is no persisted-only public check
+  today (`read_grant` is private); that is a prerequisite.
+- *Binding.* The confirmation binds the task id and revision, the repository
+  identity and the brief's digest, and shows the full brief. A task can be
+  filed over MCP by any agent (`gitpulse_add_task`), and the intake carries no
+  field that marks it agent-authored (nothing in `workbench/intake.rs` records
+  an actor; the store row may, which is *unverified*), so brief text is
+  untrusted and an agent could file a task and then ask for it to be run.
+  Confirmation after any change to the task, repository or digest is refused.
+- *Authority is chosen by the person, not the requester.* A request carries a
+  task id, an expected revision, an optional provider hint and a bounded note.
+  It cannot name a permission mode, bypass or a model; unknown fields are
+  rejected. Mode and the per-attempt bypass acknowledgment are set in the
+  confirmation, as today (section 4: bypass never propagates).
+- *Rate and capacity.* A request frame is at most 16 KiB (the size
+  `terminal_launch::parse` already uses). At most four pending requests per
+  uid, a token bucket on requests, a pending request expires at five minutes,
+  and `max_live_runs`, the writer-per-tree rule and `sysload::admit` are
+  checked at request time and again at confirmation. Expiry and timeout never
+  permit.
+- *Recursion.* A launched agent has `gitpulse-mcp` and could ask for another
+  run. The only control is that every request needs a person, plus the pending
+  cap; depth limits cannot be enforced against a same-user caller, and the plan
+  should not claim they are.
+- *Audit.* The request, the decision and the launch each write a ledger row
+  (the path `harness::record_gate` uses), with `ActorKind::Agent` for the
+  requester's *claim* and `Human` for the decision. A failed ledger write
+  fails the request; it is never launched unrecorded.
+- *The MCP contract.* A launch request mutates no git state in the MCP
+  process, but its confirmation ends in a provider process that will. The
+  server instructions ("never mutates git state; its only writes are the
+  task-board tools"), the module doc and the allowlist test all change in the
+  same commit, with the annotation decided on purpose (not destructive,
+  idempotent by `request_id`, and `openWorldHint: true` because a confirmed
+  request ends in a networked provider; `mutating_tool_annotations` hard-codes
+  `false` today). It is a new class of write, not an extra row in the
+  task-board list.
+- *Standing pre-authorization* ("this caller may start up to N inspect-mode
+  runs per hour in this repository") is persistent configuration. It needs
+  its own explicit consent, is off by default, can never include bypass, and
+  is not part of the first step.
+
+**5. Adjacent risk: the worktree tools in the main checkout (dated 2026-11-02)**
+
+Another session has `gitpulse_worktree_create`, `_switch`, `_isolate`,
+`_prune`, `_merge`, `_claim`, `_release`, `_send_message` and `_inbox` in the
+main checkout's `src-tauri/src/mcp/mod.rs`. They are not on this branch (a
+search of this tree finds none), and `git log --all --oneline -S
+gitpulse_worktree_merge -- src-tauri/src/mcp/mod.rs` returns no commit, while
+the same search for `gitpulse_merge_tasks` returns five. So no ref carries them
+and they appear to be uncommitted (a working-tree state that search cannot see).
+The installed plugin's tool list for this session already advertises them. This
+note describes the state read on that date, owned by that session, and is to be
+deleted or rewritten when that work lands or is withdrawn. Read, not edited.
+
+- It is **not ungated**, and this note should not say so. Each handler calls
+  `repository_trust::require`; `merge_worktree_pipeline` and the prune path
+  run `harness::guard_command` on the argv (merge, `worktree remove`,
+  `branch -D`), which also records a ledger row.
+- What is missing is a **human step**. Force prune with process reaping,
+  `git branch -D`, and a squash merge into the default branch followed by
+  worktree teardown run for any MCP client that can reach a trusted
+  repository. `destructiveHint` is advice the client may ignore, not a gate
+  GitPulse owns.
+- The contract was rewritten in that tree (module doc, server instructions,
+  allowlist) while this branch's committed test still allows five tools: the
+  two disagree, and a reader cannot tell which is intended.
+- It swallows two failures it should report: prune runs `git branch -D` as
+  `let _ = ...` after the gate, so a failed delete is reported as pruned, and
+  merge teardown tests `guard_command(...).is_ok()`, discarding the refusal
+  reason.
+- Interaction with this design: the launch tool needs the opposite model
+  (a person confirms in the app). Either the worktree tools get the same
+  treatment or the MCP contract is rewritten once, for both, with the reason.
+  Using the worktree tools as precedent for a launch tool would be wrong.
+
+**6. Recommendation**
+
+Option (a), in three steps, each shippable alone. Stop after any of them.
+
+1. *Read-only run tools, no IPC.* `gitpulse_list_runs` and `gitpulse_get_run`
+   over the store `gitpulse-mcp` already opens: state, owner shape and a
+   liveness field that says `unknown` when it cannot be observed. An output
+   tail only through redaction and with the host's states (`found`, `missing`,
+   `unreadable`) kept distinct from a host that cannot be asked at all: the
+   host admits one app, so a second client's `hello` is refused, and that must
+   read as "not asked", never as `missing`.
+2. *Launch request through the mailbox, managed lane first.* The managed lane
+   gives structured questions and approvals, which a headless caller needs, at
+   the price that a managed run ends with the app. State that limit instead of
+   offering reattach after quit: the row keeps its last recorded state until
+   a reconcile sweep releases it, and that sweep releases only on a definite
+   gone. Terminal-lane launch is a later question because its runs
+   are user-controlled and need a person at a terminal.
+3. *Optional pre-authorization*, only after step 2 has been used.
+
+Do not pursue (c) for board tasks. Revisit (b) when Manvi's socket exists and
+only as the app's own transport.
+
+**7. Acceptance tests the build would need**
+
+Each must fail on the code before the change. Seams are named so the guard
+that already exists is extended, not paralleled.
+
+- *Reads (step 1).* A run read from a profile with a newer schema returns
+  `schema_upgrade_required`, not an empty list. A row in `running` with no
+  live owner is reported with unknown liveness, never `running`. A transcript
+  containing `password=...` comes back masked; a `missing` transcript, an
+  `unreadable` one and a host that refuses a second client are three distinct
+  answers. Pages carry
+  `has_more` and a cap, never a complete-looking truncation. The read tools
+  keep `readOnlyHint` and the "annotated read-only but created nothing" test
+  passes.
+- *Request path (step 2), in `desktop/instance_tests.rs`.* `validate` rejects
+  an oversize frame, an unknown field (including `permission_mode`, `bypass`
+  and `model`), a relative path and a control character. A frame from another
+  uid creates nothing. Exhausting every `Request` variant, none moves a
+  pending request to confirmed. An untrusted repository, and a repository
+  trusted only by a session grant, create no pending record. A pending
+  request creates no `work_runs` row, no worktree, no hook execution and no
+  process.
+- *Confirmation.* A task revision, repository identity or brief digest that
+  changed between request and confirmation is refused. A confirmation after
+  five minutes is refused and a timeout never permits. Replaying the same
+  `request_id` after confirm returns the same run, after decline returns
+  declined, and never makes a second run. A confirmation cannot be supplied by
+  the renderer as a flag.
+- *Bounds.* The fifth pending request and requests over the bucket are refused
+  with typed reasons. At `max_live_runs`, with a writer already on the tree,
+  and under `sysload` pressure the request is refused at request time and
+  again at confirmation. With the app closed, the answer is `app_unavailable`,
+  nothing is queued and `gitpulse-mcp` spawns no Manvi (a spawn counter).
+  On a platform without the mailbox the answer is `unsupported_platform`.
+- *Audit and recovery.* Request, decision and launch each write a ledger row
+  with the requester's pid and process birth; a failed ledger write refuses
+  the request. `reconcile::judge_at` treats an externally requested run
+  exactly as an app-requested one: released only on a definite gone.
+- *Contract guards.* The allowlist test, `tool_input_schemas.snapshot.json`,
+  `scripts/documented-counts-contract.test.ts` and the tool counts in
+  `ARCHITECTURE`, `CONTRIBUTING`, `README`, `SECURITY`, `MODULE_INTEGRATION`,
+  the wiki and `tests/e2e/tier1-feature-coverage.test.ts` all change in the
+  same commit as the tool. The security-impact paragraph above moves into
+  `SECURITY.md` when the work is built.
+
 ### Managed startup recovery checkpoint
 
 - **Verified:** schema ten and preparation protocol version two record native
