@@ -41,12 +41,12 @@ const LIVE_STATES: readonly TaskRun["state"][] = ["starting", "running"];
  * `unknown`, with no length, instead of a duration the run never had.
  */
 export function runWindowOf(
-  run: Pick<TaskRun, "state" | "claimed_at" | "started_at" | "finished_at"> & Partial<Pick<TaskRun, "outcome_uncertain">>,
+  run: Pick<TaskRun, "state" | "claimed_at" | "started_at" | "finished_at" | "outcome_uncertain">,
 ): RunWindow {
   return {
     claimedAt: run.claimed_at ?? null,
     startedAt: run.started_at ?? null,
-    finishedAt: run.outcome_uncertain === true ? null : (run.finished_at ?? null),
+    finishedAt: run.outcome_uncertain ? null : (run.finished_at ?? null),
     live: LIVE_STATES.includes(run.state),
   };
 }

@@ -20,13 +20,13 @@ describe("runSessionIds", () => {
 
 describe("runWindowOf", () => {
   it("carries the run's own clock and whether it is going", () => {
-    expect(runWindowOf({ state: "running", claimed_at: 10, started_at: 12, finished_at: null })).toEqual({
+    expect(runWindowOf({ state: "running", claimed_at: 10, started_at: 12, finished_at: null, outcome_uncertain: false })).toEqual({
       claimedAt: 10,
       startedAt: 12,
       finishedAt: null,
       live: true,
     });
-    expect(runWindowOf({ state: "exited", claimed_at: undefined, started_at: undefined, finished_at: 99 })).toEqual({
+    expect(runWindowOf({ state: "exited", claimed_at: undefined, started_at: undefined, finished_at: 99, outcome_uncertain: false })).toEqual({
       claimedAt: null,
       startedAt: null,
       finishedAt: 99,
@@ -55,10 +55,10 @@ describe("runWindowOf", () => {
 
   it("treats every ended or unresolved state as not live", () => {
     for (const state of ["prepared", "exited", "failed", "cancelled", "unresolved"] as const) {
-      expect(runWindowOf({ state }).live, state).toBe(false);
+      expect(runWindowOf({ state, outcome_uncertain: false }).live, state).toBe(false);
     }
     for (const state of ["starting", "running"] as const) {
-      expect(runWindowOf({ state }).live, state).toBe(true);
+      expect(runWindowOf({ state, outcome_uncertain: false }).live, state).toBe(true);
     }
   });
 });
