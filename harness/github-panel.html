@@ -527,6 +527,11 @@
           // panel's own diff of two listings: the second answer shows run 10
           // red and the observer says nothing new, so the panel must say
           // nothing; the third repeats the rows and carries the observer's news.
+          // That third answer is also the case where the CI watcher crossed
+          // in-flight to failed before the panel looked: the panel's own two
+          // listings both show run 10 red, so nothing the renderer could diff
+          // explains the banner, and it must still appear. The Rust side of it
+          // is `the_panel_still_hears_of_a_red_finish_the_watcher_saw_first`.
           const redTen = withOutcome({ ...runsA.find((r) => r.id === 10), status: "completed", conclusion: "failure" });
           const redRows = runsA.map((r) => r.id === 10 ? redTen : { ...r, title: `polled ${r.id}` });
           pollAnswers.push(

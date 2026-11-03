@@ -18,6 +18,7 @@ mod agent_worktree;
 pub(crate) mod ci_watch;
 pub(crate) mod claude_hook;
 pub(crate) mod conversation;
+#[doc(hidden)]
 pub mod external_changes;
 mod in_flight;
 pub(crate) mod intake;

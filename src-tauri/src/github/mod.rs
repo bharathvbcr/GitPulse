@@ -204,14 +204,37 @@ impl GitHubRunsReport {
     }
 }
 
-/// The workflow-run listing on its own, for the live poll.
+/// The workflow-run listing on its own, for the Remote panel's live poll. It
+/// folds a checked listing into the shared baseline and fills `went_red` from
+/// the panel's own cursor (see `outcome::went_red`).
 ///
 /// Every failure path returns `checked: false` with a reason. A poll that
 /// cannot reach `gh` must never look like a poll that found nothing.
 pub fn load_workflow_runs_report(repo_path: &str) -> GitHubRunsReport {
+    let (mut report, requested_at) = fetch_workflow_runs_report(repo_path);
+    report.went_red = outcome::went_red(&report, requested_at);
+    report
+}
+
+/// The same listing for the CI watcher. It folds a checked listing into the
+/// shared baseline too, but leaves the panel's cursor alone and returns an
+/// empty `went_red`: the watcher takes its news from the observer's queue.
+pub fn watch_workflow_runs_report(repo_path: &str) -> GitHubRunsReport {
+    let (report, requested_at) = fetch_workflow_runs_report(repo_path);
+    outcome::observe_report(&report, requested_at);
+    report
+}
+
+/// One listing, not yet folded into any baseline, and when it was asked for.
+fn fetch_workflow_runs_report(repo_path: &str) -> (GitHubRunsReport, Instant) {
     // Stamped before the request, so a slow call that lands after a newer one
     // cannot move the baseline backwards (see `outcome::Observer::observe`).
     let requested_at = Instant::now();
+    let report = request_workflow_runs_report(repo_path);
+    (report, requested_at)
+}
+
+fn request_workflow_runs_report(repo_path: &str) -> GitHubRunsReport {
     let gh = probe_gh_cli();
     let cli_present = gh_cli_reported_present(&gh);
     let remote = match discover_github_remote(repo_path) {
@@ -231,21 +254,17 @@ pub fn load_workflow_runs_report(repo_path: &str) -> GitHubRunsReport {
         return GitHubRunsReport::unavailable(cli_present, Some(&remote), reason);
     }
     match list_workflow_runs(&remote) {
-        Ok((runs, truncated)) => {
-            let mut report = GitHubRunsReport {
-                available: true,
-                checked: true,
-                cli_present: true,
-                owner: remote.owner.clone(),
-                repo: remote.name.clone(),
-                runs,
-                truncated,
-                error: None,
-                went_red: Vec::new(),
-            };
-            report.went_red = outcome::went_red(&report, requested_at);
-            report
-        }
+        Ok((runs, truncated)) => GitHubRunsReport {
+            available: true,
+            checked: true,
+            cli_present: true,
+            owner: remote.owner.clone(),
+            repo: remote.name.clone(),
+            runs,
+            truncated,
+            error: None,
+            went_red: Vec::new(),
+        },
         Err(error) => GitHubRunsReport::unavailable(true, Some(&remote), error.into_message()),
     }
 }

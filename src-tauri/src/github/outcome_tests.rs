@@ -369,3 +369,157 @@ fn went_red_reports_only_failures_and_nothing_for_an_unchecked_report() {
     // A poll that could not run learns nothing and moves nothing.
     assert!(went_red(&report(Vec::new(), false), later(t0, 2)).is_empty());
 }
+
+fn repo_report(repo: &str, runs: Vec<WorkflowRunInfo>) -> GitHubRunsReport {
+    GitHubRunsReport {
+        available: true,
+        checked: true,
+        cli_present: true,
+        owner: "acme".into(),
+        repo: repo.into(),
+        runs,
+        truncated: false,
+        error: None,
+        went_red: Vec::new(),
+    }
+}
+
+/// The watcher's 30 s poll and the panel's live poll race. Whoever crosses
+/// in-flight to failed first used to consume the finish, so the panel never
+/// raised the banner for a failure the watcher saw first.
+#[test]
+fn a_red_finish_the_watcher_saw_first_is_still_the_panels_news_exactly_once() {
+    let t0 = Instant::now();
+    let key = "acme/panel-after-watcher";
+    assert!(went_red(&repo_report("panel-after-watcher", vec![moving(1)]), t0).is_empty());
+    with_observer(|observer| {
+        observer.observe(key, &[moving(1)], false, later(t0, 1));
+        observer.observe(key, &[ended(1, "failure")], false, later(t0, 2));
+    });
+    let red = went_red(
+        &repo_report("panel-after-watcher", vec![ended(1, "failure")]),
+        later(t0, 3),
+    );
+    assert_eq!(red.iter().map(|r| r.id).collect::<Vec<_>>(), vec![1]);
+    let again = went_red(
+        &repo_report("panel-after-watcher", vec![ended(1, "failure")]),
+        later(t0, 4),
+    );
+    assert!(again.is_empty(), "the panel is told once");
+}
+
+fn ids(runs: &[WorkflowRunInfo]) -> Vec<u64> {
+    runs.iter().map(|run| run.id).collect()
+}
+
+#[test]
+fn the_panel_and_the_watcher_each_get_a_finish_neither_using_up_the_others() {
+    let mut observer = Observer::default();
+    let t0 = Instant::now();
+    assert!(observer
+        .panel_look("acme/app", &[moving(1)], false, t0)
+        .is_empty());
+    observer.observe("acme/app", &[ended(1, "failure")], false, later(t0, 1));
+    assert_eq!(
+        observer.take_pending(10).len(),
+        1,
+        "the watcher drains its queue"
+    );
+    let news = observer.panel_look("acme/app", &[ended(1, "failure")], false, later(t0, 2));
+    assert_eq!(
+        ids(&news),
+        vec![1],
+        "and the panel's cursor is untouched by it"
+    );
+    assert!(observer
+        .panel_look("acme/app", &[ended(1, "failure")], false, later(t0, 3))
+        .is_empty());
+    assert!(observer.take_pending(10).is_empty());
+}
+
+#[test]
+fn the_panels_first_look_announces_nothing_even_when_the_watcher_logged_failures_before_it() {
+    let mut observer = Observer::default();
+    let t0 = Instant::now();
+    observer.observe("acme/app", &[moving(1), moving(2)], false, t0);
+    observer.observe(
+        "acme/app",
+        &[ended(1, "failure"), moving(2)],
+        false,
+        later(t0, 1),
+    );
+    // The panel opens later: run 1 is history to it, run 2 finishing in the
+    // very listing it looks at is news.
+    let first = observer.panel_look(
+        "acme/app",
+        &[ended(1, "failure"), ended(2, "failure")],
+        false,
+        later(t0, 2),
+    );
+    assert_eq!(ids(&first), vec![2]);
+    assert!(observer
+        .panel_look(
+            "acme/app",
+            &[ended(1, "failure"), ended(2, "failure")],
+            false,
+            later(t0, 3)
+        )
+        .is_empty());
+}
+
+#[test]
+fn only_a_red_finish_is_logged_for_the_panel_and_it_is_per_repository() {
+    let mut observer = Observer::default();
+    let t0 = Instant::now();
+    observer.panel_look("acme/app", &[moving(1), moving(2)], false, t0);
+    observer.panel_look("acme/other", &[moving(1)], false, t0);
+    observer.observe(
+        "acme/app",
+        &[ended(1, "cancelled"), ended(2, "success")],
+        false,
+        later(t0, 1),
+    );
+    observer.observe("acme/other", &[ended(1, "failure")], false, later(t0, 1));
+    assert!(observer
+        .panel_look(
+            "acme/app",
+            &[ended(1, "cancelled"), ended(2, "success")],
+            false,
+            later(t0, 2)
+        )
+        .is_empty());
+    assert_eq!(
+        ids(&observer.panel_look("acme/other", &[ended(1, "failure")], false, later(t0, 2))),
+        vec![1]
+    );
+}
+
+#[test]
+fn the_red_log_is_bounded_and_counts_what_it_dropped() {
+    let mut observer = Observer::default();
+    let t0 = Instant::now();
+    let total = (MAX_RED_LOG + 5) as u64;
+    let moving_runs: Vec<_> = (1..=total).map(moving).collect();
+    let red_runs: Vec<_> = (1..=total).map(|id| ended(id, "failure")).collect();
+    observer.panel_look("acme/app", &moving_runs, false, t0);
+    observer.observe("acme/app", &red_runs, false, later(t0, 1));
+    let news = observer.panel_look("acme/app", &red_runs, false, later(t0, 2));
+    assert_eq!(news.len(), MAX_RED_LOG, "the log holds at most its bound");
+    assert_eq!(
+        ids(&news).first().copied(),
+        Some(6),
+        "the oldest went first, the newest stayed"
+    );
+    assert_eq!(observer.red_overflow(), 5, "and the loss is counted");
+}
+
+#[test]
+fn a_stale_listing_still_delivers_what_the_log_already_holds() {
+    let mut observer = Observer::default();
+    let t0 = Instant::now();
+    observer.panel_look("acme/app", &[moving(1)], false, t0);
+    observer.observe("acme/app", &[ended(1, "failure")], false, later(t0, 5));
+    // A slow panel request, made before the watcher saw the finish, lands now.
+    let news = observer.panel_look("acme/app", &[moving(1)], false, later(t0, 2));
+    assert_eq!(ids(&news), vec![1]);
+}

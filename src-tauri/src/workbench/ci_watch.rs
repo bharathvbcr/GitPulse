@@ -14,8 +14,10 @@
 //! - **What is watched.** A run that is live, or ended within
 //!   [`FINISHED_WINDOW_SECS`], whose branch is an attempt branch
 //!   (`refs/heads/gitpulse/…`). A repository is polled only while it has such a
-//!   run, and a finished CI run is attributed to an attempt by its branch, or
-//!   by its head commit being the commit a watched run started from.
+//!   run, and a finished CI run is attributed to an attempt only by the branch
+//!   GitHub says it ran on. Never by commit: an attempt's recorded commit is
+//!   where it started, so CI on it is the base branch's own. A signal's branch
+//!   is the run's, and a record that would name any other is refused.
 //! - **One decision.** What counts as a finish is `github::outcome`: the same
 //!   classifier and the same baseline the Remote panel reads. A run already
 //!   settled when first seen is history, and `cancelled` is its own kind.
@@ -82,8 +84,6 @@ pub(crate) struct Candidate {
     pub task_id: String,
     /// The branch the attempt works on, without `refs/heads/`.
     pub branch: Option<String>,
-    /// The commit the attempt started from.
-    pub head_oid: Option<String>,
     /// The branch is an attempt branch. Only these are matched by branch name
     /// and only these make a repository worth polling.
     pub attempt: bool,
@@ -128,7 +128,6 @@ pub(crate) fn candidate_of(run: &Value, now: i64) -> Option<Candidate> {
         task_id: run["task_id"].as_str()?.to_owned(),
         attempt: head_ref.is_some_and(|name| name.starts_with(ATTEMPT_PREFIX)),
         branch,
-        head_oid: run["head_oid"].as_str().map(str::to_owned),
         checkout,
     })
 }
@@ -157,22 +156,21 @@ fn watch_set(store: &Store, now: i64) -> Result<(Vec<Candidate>, bool), Workbenc
     Ok((found, more))
 }
 
-/// The attempt a finished CI run belongs to: by branch name for an attempt
-/// branch, or by the commit it ran on being the commit a watched run began at.
+/// The attempt a finished CI run belongs to: the one whose attempt branch is
+/// the branch GitHub says the run ran on.
+///
+/// Never by commit. A run's `head_oid` is the commit the attempt *started*
+/// from, not a tip it pushed, so CI on that commit is the base branch's own
+/// (main's push run, say) and is nobody's result here. The store holds no
+/// attempt tip, so branch is the only honest key.
 pub(crate) fn matching<'a>(
     candidates: &'a [Candidate],
     run: &crate::github::WorkflowRunInfo,
 ) -> Option<&'a Candidate> {
     candidates.iter().find(|candidate| {
-        let by_branch = candidate.attempt
+        candidate.attempt
             && !run.head_branch.is_empty()
-            && candidate.branch.as_deref() == Some(run.head_branch.as_str());
-        let by_commit = !run.head_sha.is_empty()
-            && candidate
-                .head_oid
-                .as_deref()
-                .is_some_and(|oid| oid.eq_ignore_ascii_case(&run.head_sha));
-        by_branch || by_commit
+            && candidate.branch.as_deref() == Some(run.head_branch.as_str())
     })
 }
 
@@ -188,8 +186,10 @@ pub(crate) trait Backend {
     fn trusted(&self, checkout: &str) -> Result<bool, String>;
     /// The `owner/repo` the checkout's remote names, read from git and never
     /// from GitHub, so a finish can be attributed before this watcher has
-    /// asked the repository itself. `None` is "could not tell".
-    fn remote(&self, checkout: &str) -> Option<String>;
+    /// asked the repository itself. `Ok(None)` is "the repository has no
+    /// GitHub remote"; `Err` is "could not tell". Each costs a `git`
+    /// process, so the caller asks rarely.
+    fn remote(&self, checkout: &str) -> Result<Option<String>, String>;
     /// One `gh` listing for the repository at `checkout`. It folds a checked
     /// report into the shared baseline (`github::outcome`) before it returns.
     fn runs(&self, checkout: &str) -> GitHubRunsReport;
@@ -222,6 +222,9 @@ pub(crate) enum WatchState {
     Throttled,
     /// The checkout is gone, so there is nowhere to ask from.
     NoCheckout,
+    /// The repository has no GitHub remote, so there is no CI to read. That is
+    /// a fact about the repository, not a fault, and nothing is asked.
+    NoRemote,
 }
 
 /// What the watcher can say about one repository.
@@ -237,8 +240,11 @@ pub(crate) struct RepoStatus {
 }
 
 struct Repo {
-    /// `owner/repo` once a listing has said so.
+    /// `owner/repo` once git or a listing has said so.
     remote: Option<String>,
+    /// Not before this is the remote read from git again. A repository whose
+    /// remote could not be found would otherwise cost a process every sweep.
+    remote_retry: Instant,
     next_due: Instant,
     failures: u32,
     moving: bool,
@@ -355,6 +361,7 @@ impl Watcher {
             if runs.iter().any(|run| run.attempt) {
                 self.repos.entry(checkout.clone()).or_insert_with(|| Repo {
                     remote: None,
+                    remote_retry: now,
                     next_due: now,
                     failures: 0,
                     moving: false,
@@ -369,10 +376,12 @@ impl Watcher {
         }
         // The panel's poll can fold a finish into the shared baseline before
         // this watcher has asked the repository, so which repository a finish
-        // belongs to is read from git, not learned from our own listing.
+        // belongs to is read from git, not learned from our own listing. That
+        // read is a process, so it is made for a trusted checkout only and not
+        // more often than once per idle period.
         for (checkout, repo) in &mut self.repos {
-            if repo.remote.is_none() {
-                repo.remote = backend.remote(checkout);
+            if repo.remote.is_none() && repo.remote_retry <= now {
+                Self::find_remote(checkout, repo, backend, now);
             }
         }
         // A repository that lost its last attempt branch is no longer watched.
@@ -384,7 +393,10 @@ impl Watcher {
         let mut due: Vec<String> = self
             .repos
             .iter()
-            .filter(|(_, repo)| repo.next_due <= now)
+            .filter(|(_, repo)| {
+                repo.next_due <= now
+                    && !(repo.status.state == WatchState::NoRemote && repo.remote.is_none())
+            })
             .map(|(checkout, _)| checkout.clone())
             .collect();
         due.sort();
@@ -400,6 +412,39 @@ impl Watcher {
         self.act(store, backend, &set.candidates, &mut report);
         self.watch = Some(set);
         report
+    }
+
+    /// Reads the repository's GitHub remote from git, if the checkout is
+    /// trusted. Whatever the answer, the next read is an idle period away.
+    fn find_remote(checkout: &str, repo: &mut Repo, backend: &dyn Backend, now: Instant) {
+        repo.remote_retry = now + IDLE_POLL;
+        if !Path::new(checkout).is_dir() || !matches!(backend.trusted(checkout), Ok(true)) {
+            return;
+        }
+        match backend.remote(checkout) {
+            Ok(Some(found)) => {
+                repo.remote = Some(found);
+                if repo.status.state == WatchState::NoRemote {
+                    repo.status.state = WatchState::Waiting;
+                    repo.status.reason = String::new();
+                    repo.next_due = now;
+                }
+            }
+            Ok(None) => {
+                if repo.status.state != WatchState::NoRemote {
+                    log::info!(target: "workbench", "ci watch {checkout}: the repository has no GitHub remote");
+                }
+                repo.status.state = WatchState::NoRemote;
+                repo.status.reason =
+                    "the repository has no GitHub remote, so there is no CI to read".into();
+                repo.status.capped = false;
+                repo.next_due = now + IDLE_POLL;
+            }
+            // Could not tell: the listing's own error will say more if it comes to that.
+            Err(error) => {
+                log::warn!(target: "workbench", "ci watch {checkout}: the git remote could not be read: {error}");
+            }
+        }
     }
 
     /// Asks one repository, unless it must not be asked. True when `gh` ran.
@@ -790,10 +835,15 @@ fn record(
             "GitHub reported no usable head commit for the run".into(),
         ));
     }
-    let branch = candidate
-        .branch
-        .clone()
-        .unwrap_or_else(|| run.head_branch.clone());
+    // The branch is what GitHub reported for the run, and it has to be the
+    // attempt's: a signal must never name a branch the run was not on.
+    let branch = run.head_branch.clone();
+    if branch.is_empty() || candidate.branch.as_deref() != Some(branch.as_str()) {
+        return Ok(Recorded::Unrecordable(format!(
+            "the run ran on {:?}, not on the attempt's branch {:?}",
+            run.head_branch, candidate.branch
+        )));
+    }
     let workflow = if run.name.trim().is_empty() {
         "workflow".to_owned()
     } else {
@@ -864,14 +914,16 @@ impl Backend for HostBackend {
             .map(|preview| preview.scope.admits())
             .map_err(|error| error.into_message())
     }
-    fn remote(&self, checkout: &str) -> Option<String> {
+    fn remote(&self, checkout: &str) -> Result<Option<String>, String> {
         crate::github::discover_github_remote(checkout)
-            .ok()
-            .flatten()
-            .map(|found| crate::github::outcome::repository_key(&found.owner, &found.name))
+            .map(|found| {
+                found.map(|found| crate::github::outcome::repository_key(&found.owner, &found.name))
+            })
+            .map_err(|error| error.into_message())
     }
     fn runs(&self, checkout: &str) -> GitHubRunsReport {
-        crate::github::load_workflow_runs_report(checkout)
+        // Not the panel's loader: that one moves the panel's banner cursor.
+        crate::github::watch_workflow_runs_report(checkout)
     }
     fn take_finished(&self, max: usize) -> Vec<Finished> {
         crate::github::outcome::with_observer(|observer| observer.take_pending(max))

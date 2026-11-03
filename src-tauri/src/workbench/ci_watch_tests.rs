@@ -72,6 +72,9 @@ fn unreadable(why: &str) -> GitHubRunsReport {
 /// the real loader would fold each into, and a clock the test moves.
 struct Fake {
     trusted: RefCell<Result<bool, String>>,
+    /// What git says the checkout's remote is, and how often it was asked.
+    remote: RefCell<Result<Option<String>, String>>,
+    remote_asked: Cell<usize>,
     script: RefCell<VecDeque<GitHubRunsReport>>,
     last: RefCell<Option<GitHubRunsReport>>,
     observer: RefCell<Observer>,
@@ -88,6 +91,8 @@ impl Fake {
     fn new() -> Self {
         Self {
             trusted: RefCell::new(Ok(true)),
+            remote: RefCell::new(Ok(Some(outcome::repository_key("acme", "app")))),
+            remote_asked: Cell::new(0),
             script: RefCell::new(VecDeque::new()),
             last: RefCell::new(None),
             observer: RefCell::new(Observer::default()),
@@ -111,8 +116,9 @@ impl Backend for Fake {
     fn trusted(&self, _: &str) -> Result<bool, String> {
         self.trusted.borrow().clone()
     }
-    fn remote(&self, _: &str) -> Option<String> {
-        Some(outcome::repository_key("acme", "app"))
+    fn remote(&self, _: &str) -> Result<Option<String>, String> {
+        self.remote_asked.set(self.remote_asked.get() + 1);
+        self.remote.borrow().clone()
     }
     fn runs(&self, _: &str) -> GitHubRunsReport {
         self.asked.set(self.asked.get() + 1);
@@ -304,7 +310,7 @@ fn a_run_on_another_branch_is_a_candidate_but_not_an_attempt() {
 }
 
 #[test]
-fn a_finished_ci_run_is_attributed_by_attempt_branch_or_by_the_commit_it_ran() {
+fn a_finished_ci_run_is_attributed_only_by_the_attempt_branch_it_ran_on() {
     let attempt = candidate_of(&run_row(json!({})), 1_000).unwrap();
     let mut other = candidate_of(
         &run_row(json!({"id":"r2","head_ref":"refs/heads/main","head_oid":sha('d')})),
@@ -317,18 +323,70 @@ fn a_finished_ci_run_is_attributed_by_attempt_branch_or_by_the_commit_it_ran() {
     let by_branch = ended(1, "failure");
     assert_eq!(matching(&candidates, &by_branch).unwrap().run_id, "r1");
 
-    let mut by_commit = ci_run(2, "completed", "failure", "somebody-elses-branch");
-    by_commit.head_sha = sha('d');
-    assert_eq!(
-        matching(&candidates, &by_commit).unwrap().run_id,
-        "r2",
-        "a CI run on the commit a run began at belongs to that run"
-    );
+    // `head_oid` is the commit an attempt STARTED from, not a tip it pushed, so
+    // CI on that commit is the base branch's CI. It is nobody's result here,
+    // whatever branch GitHub names for it, and even when it names none.
+    for (id, branch, start) in [
+        (2, "somebody-elses-branch", 'c'),
+        (3, "main", 'c'),
+        (4, "", 'c'),
+        (5, "main", 'd'),
+    ] {
+        let mut on_base = ci_run(id, "completed", "failure", branch);
+        on_base.head_sha = sha(start);
+        assert!(
+            matching(&candidates, &on_base).is_none(),
+            "a run on {branch:?} at a starting commit is not an attempt's result"
+        );
+    }
+    assert!(matching(&candidates, &ci_run(6, "completed", "failure", "")).is_none());
+}
 
-    // A run on `main` is not claimed by an agent merely sitting on `main`.
-    let on_main = ci_run(3, "completed", "failure", "main");
-    assert!(matching(&candidates, &on_main).is_none());
-    assert!(matching(&candidates, &ci_run(4, "completed", "failure", "")).is_none());
+/// The sequence the by-commit rule got wrong: main is pushed, an agent is
+/// launched at main's HEAD while main's CI runs, and main's CI goes red.
+#[test]
+fn main_ci_on_the_commit_an_attempt_started_from_is_not_reported_as_the_agents_failure() {
+    let world = world();
+    let _repo = world.attempt("a", Some(BRANCH));
+    let fake = Fake::new();
+    let mut watcher = Watcher::default();
+    let on_base = |status: &str, conclusion: &str| {
+        let mut run = ci_run(31, status, conclusion, "main");
+        run.head_sha = sha('c');
+        run
+    };
+    fake.say(listing(vec![on_base("in_progress", "")]));
+    sweep(&mut watcher, &world, &fake);
+    fake.say(listing(vec![on_base("completed", "failure")]));
+    let report = sweep(&mut watcher, &world, &fake);
+    assert_eq!((report.recorded, report.unmatched), (0, 1), "{report:?}");
+    assert!(world.inbox().is_empty());
+    assert!(world.native_titles().is_empty());
+    assert!(world.logs("a").is_empty());
+}
+
+#[test]
+fn a_signal_never_names_a_branch_the_run_was_not_on() {
+    let world = world();
+    let _repo = world.attempt("a", Some(BRANCH));
+    let candidate =
+        candidate_of(&run_row(json!({"id":"run-a","task_id":"task-a"})), 1_000).unwrap();
+
+    let elsewhere = ci_run(41, "completed", "failure", "main");
+    let refused = record(&world.store, &candidate, &elsewhere).unwrap();
+    assert!(matches!(refused, Recorded::Unrecordable(_)), "{refused:?}");
+    let unnamed = ci_run(42, "completed", "failure", "");
+    let refused = record(&world.store, &candidate, &unnamed).unwrap();
+    assert!(matches!(refused, Recorded::Unrecordable(_)), "{refused:?}");
+    assert!(world.inbox().is_empty());
+    assert!(world.logs("a").is_empty());
+
+    let on_branch = ended(43, "failure");
+    assert_eq!(
+        record(&world.store, &candidate, &on_branch).unwrap(),
+        Recorded::New
+    );
+    assert_eq!(world.inbox()[0]["signal"]["branch"], BRANCH);
 }
 
 #[test]
@@ -520,6 +578,128 @@ fn a_finish_the_panel_saw_first_is_recorded_before_the_watcher_has_asked_that_re
     assert_eq!(report.recorded, 1, "{report:?}");
     assert_eq!(world.inbox()[0]["kind"], "run_ci_failed");
     assert_eq!(world.native_titles(), vec![FAILED_TITLE.to_owned()]);
+}
+
+/// The reverse order: the watcher's poll crosses in-flight to failed, and the
+/// Remote panel looks afterwards. The panel's banner is its own news, not
+/// whatever the watcher left over.
+#[test]
+fn the_panel_still_hears_of_a_red_finish_the_watcher_saw_first() {
+    let world = world();
+    let _repo = world.attempt("a", Some(BRANCH));
+    let fake = Fake::new();
+    let mut watcher = Watcher::default();
+    let key = outcome::repository_key("acme", "app");
+    let panel = |runs: Vec<WorkflowRunInfo>, fake: &Fake| {
+        fake.observer
+            .borrow_mut()
+            .panel_look(&key, &runs, false, fake.now())
+            .iter()
+            .map(|run| run.id)
+            .collect::<Vec<_>>()
+    };
+    assert!(panel(vec![moving(77)], &fake).is_empty());
+    fake.advance(Duration::from_secs(1));
+
+    fake.say(listing(vec![moving(77)]));
+    sweep(&mut watcher, &world, &fake);
+    fake.say(listing(vec![ended(77, "failure")]));
+    assert_eq!(sweep(&mut watcher, &world, &fake).recorded, 1);
+    assert_eq!(world.inbox()[0]["kind"], "run_ci_failed");
+
+    assert_eq!(
+        panel(vec![ended(77, "failure")], &fake),
+        vec![77],
+        "the watcher recorded it, and the panel is told too"
+    );
+    assert!(panel(vec![ended(77, "failure")], &fake).is_empty());
+}
+
+/// A repository has no GitHub remote: there is nothing to read, which is a
+/// fact about the repository and not a fault. Finding that out costs a `git`
+/// process, so it is not repeated every sweep.
+#[test]
+fn a_repository_with_no_github_remote_is_its_own_state_and_is_looked_up_rarely() {
+    let world = world();
+    let _repo = world.attempt("a", Some(BRANCH));
+    let fake = Fake::new();
+    *fake.remote.borrow_mut() = Ok(None);
+    let mut watcher = Watcher::default();
+    for _ in 0..10 {
+        watcher.sweep(&world.store, &fake);
+        fake.advance(Duration::from_secs(5));
+    }
+    assert_eq!(
+        fake.remote_asked.get(),
+        1,
+        "ten sweeps in under an idle period read the remote once"
+    );
+    assert_eq!(fake.asked.get(), 0, "there is no GitHub to ask");
+    let status = watcher.repos.values().next().unwrap().status.clone();
+    assert_eq!(status.state, WatchState::NoRemote);
+    assert!(
+        status.reason.contains("no GitHub remote"),
+        "{}",
+        status.reason
+    );
+    assert_eq!(watcher.fault(), None, "not being on GitHub is not a fault");
+
+    fake.advance(IDLE_POLL);
+    watcher.sweep(&world.store, &fake);
+    assert_eq!(
+        fake.remote_asked.get(),
+        2,
+        "and again after the idle period"
+    );
+
+    // The remote appears: it is found at the next look and the repository is asked.
+    *fake.remote.borrow_mut() = Ok(Some(outcome::repository_key("acme", "app")));
+    fake.say(listing(vec![moving(1)]));
+    fake.advance(IDLE_POLL + Duration::from_secs(1));
+    assert_eq!(watcher.sweep(&world.store, &fake).polled, 1);
+    assert_eq!(
+        watcher.repos.values().next().unwrap().status.state,
+        WatchState::Watching
+    );
+}
+
+#[test]
+fn a_remote_that_cannot_be_read_is_not_re_read_every_sweep_and_does_not_stop_the_ask() {
+    let world = world();
+    let _repo = world.attempt("a", Some(BRANCH));
+    let fake = Fake::new();
+    *fake.remote.borrow_mut() = Err("git is busy".into());
+    // A listing that names no repository, so nothing else fills the remote in.
+    let mut nameless = unreadable("gh failed");
+    nameless.owner = String::new();
+    nameless.repo = String::new();
+    fake.say(nameless);
+    let mut watcher = Watcher::default();
+    for _ in 0..6 {
+        watcher.sweep(&world.store, &fake);
+        fake.advance(Duration::from_secs(5));
+    }
+    assert_eq!(fake.remote_asked.get(), 1);
+    assert_eq!(
+        fake.asked.get(),
+        1,
+        "the listing is still asked, and says more"
+    );
+    assert_eq!(
+        watcher.repos.values().next().unwrap().status.state,
+        WatchState::Unavailable
+    );
+}
+
+#[test]
+fn the_remote_of_an_untrusted_checkout_is_not_read_from_git() {
+    let world = world();
+    let _repo = world.attempt("a", Some(BRANCH));
+    let fake = Fake::new();
+    *fake.trusted.borrow_mut() = Ok(false);
+    let mut watcher = Watcher::default();
+    watcher.sweep(&world.store, &fake);
+    assert_eq!(fake.remote_asked.get(), 0);
 }
 
 #[test]

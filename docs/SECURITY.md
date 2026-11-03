@@ -298,8 +298,13 @@ flowchart TD
   that says which branches to watch is re-read every thirty seconds, not on
   every sweep.
 - A finish is attributed through the repository the checkout's git remote
-  names (a local git read, no `gh` call), and is recorded only for a
-  repository that is trusted at that moment. The shared baseline also folds in
+  names (a local git read, no `gh` call, made only for a trusted checkout and
+  at most once per idle period), and is recorded only for a repository that is
+  trusted at that moment. It is attributed to an attempt only by the attempt
+  branch GitHub says the run ran on; a signal never names a branch the run
+  was not on, and CI on the commit an attempt started from (the base branch's
+  own run) is nobody's result. A repository with no GitHub remote cannot be
+  watched, which is reported as its own state and is not a fault. The shared baseline also folds in
   the Remote panel's own listings, so a finish can exist for a repository this
   watcher never asked; it is not recorded unless the trust gate admits it.
 - It records a result with `signals.record`, a store method that is
