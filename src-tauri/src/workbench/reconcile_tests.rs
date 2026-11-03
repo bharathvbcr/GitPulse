@@ -900,3 +900,100 @@ fn a_sweep_that_stopped_at_its_page_cap_says_it_is_incomplete() {
         "no page was read, so nothing was examined"
     );
 }
+
+// ----- runs held by a Manvi that survives the app --------------------------------
+
+mod hosted {
+    use super::{judge, managed, no_child, Verdict};
+    use crate::harness::hosted::View;
+    use crate::workbench::process_birth::Liveness;
+    use serde_json::{json, Value};
+
+    const SERVER: u32 = 31_337;
+
+    /// A claim made just now, so the activation grace has not passed.
+    fn claimed_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn owned_by_server() -> String {
+        format!("manvi-{SERVER}-1700-ab12")
+    }
+
+    fn live(jobs: &[(&str, &str)], complete: bool) -> View {
+        View::Live {
+            pid: SERVER,
+            jobs: jobs
+                .iter()
+                .map(|(id, phase)| (id.to_string(), phase.to_string()))
+                .collect(),
+            complete,
+        }
+    }
+
+    /// What plain liveness concludes about a run no process was recorded for
+    /// while its Manvi is alive: it is "still running this attempt".
+    fn by_liveness(run: &Value) -> Verdict {
+        judge(run, Some(false), no_child, |pid, _| {
+            assert_eq!(pid, SERVER);
+            Liveness::Alive
+        })
+    }
+
+    /// The defect: a Manvi that outlives the app is alive whether or not it
+    /// still holds a run, so "the Manvi is alive" kept a run it had dropped
+    /// for ever, with the checkout.
+    #[test]
+    fn a_run_a_live_manvi_no_longer_holds_is_released_not_kept_for_ever() {
+        let run = managed("starting", &owned_by_server(), claimed_now());
+        let before = by_liveness(&run);
+        assert!(matches!(&before, Verdict::Keep(r) if r.contains("still running this attempt")));
+        let after = super::super::apply_hosted(before, &run, &live(&[("other", "running")], true));
+        assert!(
+            matches!(&after, Verdict::Release(r) if r.contains("no longer holds this run")),
+            "{after:?}"
+        );
+    }
+
+    #[test]
+    fn a_run_the_server_holds_is_adopted_whatever_else_looked_gone() {
+        let run = managed("running", &owned_by_server(), 0);
+        let gone = Verdict::Release("its owner looked gone".into());
+        let adopted = super::super::apply_hosted(gone, &run, &live(&[("run", "running")], true));
+        assert!(
+            matches!(&adopted, Verdict::Keep(r) if r.contains("Adopted") && r.contains("running")),
+            "{adopted:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_released_on_a_view_that_cannot_prove_it() {
+        let run = managed("starting", &owned_by_server(), claimed_now());
+        let kept = || Verdict::Keep("kept".into());
+        let same = |view: View, run: &Value| {
+            assert_eq!(
+                super::super::apply_hosted(kept(), run, &view),
+                kept(),
+                "{view:?}"
+            );
+        };
+        // No server, no answer, not hosted: today's verdict stands.
+        same(View::Gone, &run);
+        same(View::NotHosting, &run);
+        same(View::Unknown("another client controls it".into()), &run);
+        // A job list at Manvi's cap may have been cut: absence proves nothing.
+        same(live(&[("other", "running")], false), &run);
+        // A different Manvi's run is not this server's to speak for.
+        same(
+            live(&[], true),
+            &managed("starting", "manvi-4-1700-ab12", 0),
+        );
+        // A recorded agent process is judged by that process, not by the list.
+        let mut with_process = run.clone();
+        with_process["process_id"] = json!(55);
+        same(live(&[], true), &with_process);
+    }
+}

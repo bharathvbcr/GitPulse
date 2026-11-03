@@ -248,15 +248,23 @@ pub async fn cmd_terminal_conversations(
 /// sessions, a host that would not start). The quit dialog asks whether to stop
 /// or leave sessions only when they can outlive the app; Settings says which.
 ///
-/// Inline: two reads of in-memory state, no I/O.
+/// `managed` says the same of managed agent runs (Codex and Claude driven by
+/// Manvi): kept running by a hosted Manvi, or ended with the app, and why.
+/// Answering it may ask the installed Manvi whether it can (once per binary),
+/// so it is read on the terminal control pool; the terminal half is two reads
+/// of in-memory state.
 #[tauri::command(async)]
 pub async fn cmd_terminal_backend(
     state: State<'_, crate::terminal::TerminalSessions>,
 ) -> Result<crate::terminal::TerminalBackendStatus, String> {
-    Ok(crate::terminal::TerminalBackendStatus {
-        backend: state.backend().to_owned(),
-        trouble: state.host_trouble(),
+    crate::terminal::control_async(&state, "terminal_backend", |state| {
+        Ok(crate::terminal::TerminalBackendStatus {
+            backend: state.backend().to_owned(),
+            trouble: state.host_trouble(),
+            managed: crate::harness::sidecar::managed_hosting(),
+        })
     })
+    .await
 }
 
 /// Exports user-selected terminal output through the native save dialog.

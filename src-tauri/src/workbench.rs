@@ -783,9 +783,21 @@ impl WorkbenchState {
                         log::warn!(target: "workbench", "profile worker retire could not acquire the active request; prior generation may remain unresolved");
                     }
                 }
-                let connection =
-                    crate::harness::sidecar::ProfileConnection::new(path.clone(), selection)
-                        .map_err(|error| worker_error(&path, error))?;
+                // Only the app's own profile hosts its agent runtime outside
+                // this process (and only when the person chose that); a state
+                // with a test-supplied profile never reads the machine's
+                // settings, like its run limit.
+                let hosting = if self.0.path.is_none() {
+                    crate::harness::hosted::HostPlan::from_settings()
+                } else {
+                    None
+                };
+                let connection = crate::harness::sidecar::ProfileConnection::new_hosting(
+                    path.clone(),
+                    selection,
+                    hosting,
+                )
+                .map_err(|error| worker_error(&path, error))?;
                 *guard = Some((fingerprint, Arc::new(connection)));
             }
             Arc::clone(&guard.as_ref().expect("worker slot just ensured").1)

@@ -74,13 +74,7 @@ fn native_owner(owner: &str) -> Option<(u32, u128)> {
 /// Manvi process that claimed and when. The token is the random part that
 /// keeps owners unique; only its shape is checked.
 fn manvi_owner(owner: &str) -> Option<(u32, u128)> {
-    let mut parts = owner.strip_prefix("manvi-")?.split('-');
-    let pid = parts.next()?.parse::<u32>().ok().filter(|p| *p > 0)?;
-    let stamp = parts.next()?.parse::<u128>().ok()?;
-    let token = parts.next()?;
-    let opaque =
-        !token.is_empty() && token.len() <= 64 && token.bytes().all(|b| b.is_ascii_hexdigit());
-    (opaque && parts.next().is_none()).then_some((pid, stamp))
+    crate::harness::hosted::manvi_owner(owner)
 }
 
 /// [`judge_at`] against the clock now.
@@ -250,7 +244,81 @@ fn observe(state: &WorkbenchState, run: &Value) -> Verdict {
         process_birth::probe,
         process_birth::running_since,
     );
+    // Only a managed run that still holds its checkout has a hosted Manvi to
+    // ask; and asked after the run was read, so a launch that began since
+    // cannot be missing from the answer.
+    let verdict =
+        if run["kind"] == "managed" && run["state"].as_str().is_some_and(|s| HELD.contains(&s)) {
+            apply_hosted(verdict, run, &hosted_view(state))
+        } else {
+            verdict
+        };
     confirm_vacated(verdict, run, crate::terminal::foreground::working_in)
+}
+
+/// What the hosted Manvi, if there is one, says about its runs. Asking connects
+/// to a server that is already running and adopts it — the profile worker is
+/// then connected to it, so a launch of the app finds its runs controllable
+/// again — and never starts one. Only the app's own profile has one.
+fn hosted_view(state: &WorkbenchState) -> crate::harness::hosted::View {
+    use crate::harness::hosted::{HostPlan, View};
+    if state.0.path.is_some() || HostPlan::from_settings().is_none() {
+        return View::NotHosting;
+    }
+    match state.current_worker() {
+        Ok(worker) => worker.hosted_view(),
+        Err(error) => View::Unknown(error.message),
+    }
+}
+
+/// A verdict, corrected by what the hosted Manvi says about the run.
+///
+/// Plain liveness of the Manvi process cannot tell a run it still holds from
+/// one it has dropped: a hosted server lives on while its runs come and go, so
+/// "the Manvi that ran it is alive" proves nothing about this run. When the
+/// server that stamped the run answers, its job list does:
+///
+/// - it holds the run: the run is adopted, whatever else looked gone;
+/// - it is running, listed every job it has, and does not list this one, and
+///   no agent process was ever recorded for it: the run is over without a
+///   report, and is released.
+///
+/// Anything else — no server, a server of another owner, one that could not be
+/// read, a job list that may have been cut — leaves the verdict as it was.
+pub(crate) fn apply_hosted(
+    verdict: Verdict,
+    run: &Value,
+    view: &crate::harness::hosted::View,
+) -> Verdict {
+    use crate::harness::hosted::View;
+    let View::Live {
+        pid,
+        jobs,
+        complete,
+    } = view
+    else {
+        return verdict;
+    };
+    let Some((owner_pid, _)) = run["owner_id"].as_str().and_then(manvi_owner) else {
+        return verdict;
+    };
+    if owner_pid != *pid {
+        return verdict;
+    }
+    let id = run["id"].as_str().unwrap_or_default();
+    if let Some((_, phase)) = jobs.iter().find(|(job, _)| job == id) {
+        return Verdict::Keep(format!(
+            "Adopted: the hosted Manvi (pid {pid}) still holds this run ({phase})."
+        ));
+    }
+    if *complete && run["process_id"].is_null() {
+        if let Verdict::Keep(_) = verdict {
+            return Verdict::Release(format!(
+                "the hosted Manvi (pid {pid}) is running and no longer holds this run, and no agent process was recorded for it"
+            ));
+        }
+    }
+    verdict
 }
 
 /// A release, kept only once the attempt's own worktree is empty of processes.

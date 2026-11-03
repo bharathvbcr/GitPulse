@@ -95,6 +95,15 @@ pub struct AgentDefaults {
     /// `gitpulse-ptyd`, and keep running when GitPulse quits or crashes
     /// (`docs/TERMINAL_HOST.md`). Absent means off: the sessions live in the
     /// app, as they always have. Read once, when the app starts.
+    ///
+    /// The same choice hosts the managed agent runtime outside the app
+    /// (`harness::hosted`): Manvi's `serve --listen`, so managed Codex and
+    /// Claude runs also keep running when GitPulse quits and are adopted on
+    /// the next launch — when the installed Manvi can serve on a socket, and
+    /// with Settings saying so when it cannot. That half is read each time the
+    /// agent runtime starts, not once. Default off, with the same posture as
+    /// the terminal host: agents keep the repository's trust after the window
+    /// closes, and changing the default is gated on a security sign-off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_terminals_running: Option<bool>,
     /// Which model each agent CLI starts with, keyed by launcher name — for a
