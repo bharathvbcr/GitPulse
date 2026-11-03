@@ -49,6 +49,10 @@ pub const DEFAULT_MAX_CACHE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Maximum size of a single JSON manifest or state file read from the cache (4 MiB).
 const MAX_JSON_STATE_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Largest stderr kept in a manifest. Stderr is stored as a JSON integer array (up to
+/// four bytes per byte), so this keeps a manifest comfortably under the read cap.
+const MAX_STORED_STDERR_BYTES: usize = 512 * 1024;
+
 /// Maximum size of a single `.rlib` / `.rmeta` / `.so` artifact cached (512 MiB).
 const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -82,6 +86,19 @@ pub struct BuildCacheCounters {
     pub stage2_invalidations: u64,
     pub bytes_saved: u64,
     pub bytes_stored: u64,
+    /// Successful compiles whose outputs were NOT cached (a dependency changed while
+    /// rustc ran, a file could not be hashed, the manifest would exceed the read cap,
+    /// ...). Counted so a refused store never reads like a normal miss.
+    #[serde(default)]
+    pub store_failures: u64,
+    /// Cache entries that were found but could not be used: unreadable or corrupt
+    /// manifest, a name or digest that is not a plain value, a missing blob, a blob
+    /// whose content does not match its digest.
+    #[serde(default)]
+    pub restore_failures: u64,
+    /// Times an unreadable `stats.json` was moved aside and the counters restarted.
+    #[serde(default)]
+    pub stats_resets: u64,
 }
 
 /// Full build-cache inspection and optional pruning report.
@@ -298,7 +315,18 @@ fn update_counters(cache_dir: &Path, f: impl FnOnce(&mut BuildCacheCounters)) {
         return;
     };
     let stats_path = cache_dir.join(STATS_FILE);
-    let mut counters: BuildCacheCounters = read_json_bounded(&stats_path).unwrap_or_default();
+    let mut counters: BuildCacheCounters = match read_json_bounded(&stats_path) {
+        Ok(c) => c,
+        Err(_) => {
+            // Keep the unreadable file for inspection instead of silently restarting
+            // from zero, and say so in the new counters.
+            let _ = fs::rename(&stats_path, cache_dir.join(format!("{STATS_FILE}.corrupt")));
+            BuildCacheCounters {
+                stats_resets: 1,
+                ..BuildCacheCounters::default()
+            }
+        }
+    };
     f(&mut counters);
     if let Ok(bytes) = serde_json::to_vec_pretty(&counters) {
         let _ = write_atomic(&stats_path, &bytes);
@@ -312,8 +340,9 @@ pub fn inspect_or_prune_cache(
     max_bytes: Option<u64>,
 ) -> Result<BuildCacheReport, String> {
     let _guard = acquire_stats_lock(cache_dir);
-    let counters: BuildCacheCounters =
-        read_json_bounded(&cache_dir.join(STATS_FILE)).unwrap_or_default();
+    // A corrupt or oversize stats file is an error, never an all-zero report: zero
+    // counters would read as "an empty cache that never hit".
+    let counters: BuildCacheCounters = read_json_bounded(&cache_dir.join(STATS_FILE))?;
 
     let mut blobs: Vec<(PathBuf, String, u64, SystemTime)> = Vec::new();
     let blobs_root = cache_dir.join("blobs");
@@ -332,12 +361,13 @@ pub fn inspect_or_prune_cache(
                 if name.starts_with('.') {
                     continue;
                 }
-                if let Ok(meta) = entry.metadata() {
-                    if meta.is_file() {
-                        let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
-                        let name_owned = name.to_string();
-                        blobs.push((path, name_owned, meta.len(), mtime));
-                    }
+                let meta = entry
+                    .metadata()
+                    .map_err(|e| format!("cannot stat blob {}: {e}", path.display()))?;
+                if meta.is_file() {
+                    let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
+                    let name_owned = name.to_string();
+                    blobs.push((path, name_owned, meta.len(), mtime));
                 }
             }
         }
@@ -440,9 +470,70 @@ fn read_direct_manifest(path: &Path) -> Result<Option<DirectManifest>, String> {
         .map_err(|e| e.to_string())
 }
 
-fn blob_path_for(cache_dir: &Path, digest: &str) -> PathBuf {
-    let shard = digest.get(0..2).unwrap_or("00");
-    cache_dir.join("blobs").join(shard).join(digest)
+/// Prefix `blake3_hash` puts on every digest.
+const DIGEST_PREFIX: &str = "b3_";
+/// Hex digits in a 256-bit digest.
+const DIGEST_HEX_LEN: usize = 64;
+
+/// True for exactly what `blake3_hash` produces: `b3_` plus 64 lowercase hex digits.
+fn is_valid_digest(digest: &str) -> bool {
+    digest.strip_prefix(DIGEST_PREFIX).is_some_and(|hex| {
+        hex.len() == DIGEST_HEX_LEN && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+/// True when `name` is one plain file name: no separators (either flavour), no `.`/`..`,
+/// not absolute, not empty. Anything read from a manifest is joined onto a directory
+/// only after this holds, because the cache is shared by every sibling worktree and a
+/// manifest is untrusted input.
+fn is_single_path_component(name: &str) -> bool {
+    if name.is_empty() || name.contains(['/', '\\', '\0']) {
+        return false;
+    }
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
+
+fn blob_path_for(cache_dir: &Path, digest: &str) -> Result<PathBuf, String> {
+    if !is_valid_digest(digest) {
+        return Err(format!("invalid blob digest {digest:?}"));
+    }
+    Ok(cache_dir.join("blobs").join(&digest[0..2]).join(digest))
+}
+
+/// Rejects a manifest whose names or digests are not plain values, before any path is
+/// built from them.
+fn validate_manifest_names(manifest: &DirectManifest) -> Result<(), String> {
+    if !is_single_path_component(&manifest.dep_file_name) {
+        return Err(format!(
+            "manifest dep_file_name {:?} is not a plain file name",
+            manifest.dep_file_name
+        ));
+    }
+    for art in &manifest.artifacts {
+        if !is_single_path_component(&art.file_name) {
+            return Err(format!(
+                "manifest artifact name {:?} is not a plain file name",
+                art.file_name
+            ));
+        }
+        if !is_valid_digest(&art.blob_blake3) {
+            return Err(format!(
+                "manifest blob digest {:?} is not `b3_` plus 64 lowercase hex digits",
+                art.blob_blake3
+            ));
+        }
+        if art.size_bytes > MAX_ARTIFACT_BYTES {
+            return Err(format!(
+                "manifest artifact {:?} claims {} bytes (limit {MAX_ARTIFACT_BYTES})",
+                art.file_name, art.size_bytes
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn manifest_path_for(cache_dir: &Path, direct_key: &str) -> PathBuf {
@@ -502,8 +593,8 @@ fn compiler_identity_digest(cache_dir: &Path, rustc: &Path) -> Result<String, St
     } else {
         format!("{}#toolchain={toolchain_env}", canon.to_string_lossy())
     };
-    let meta = fs::metadata(&canon)
-        .map_err(|e| format!("cannot stat rustc {}: {e}", canon.display()))?;
+    let meta =
+        fs::metadata(&canon).map_err(|e| format!("cannot stat rustc {}: {e}", canon.display()))?;
     let size = meta.len();
     let mtime_ns = meta
         .modified()
@@ -531,8 +622,7 @@ fn compiler_identity_digest(cache_dir: &Path, rustc: &Path) -> Result<String, St
     let vv_blake3 = blake3_hash(&out.stdout);
 
     if let Some(_guard) = acquire_stats_lock(cache_dir) {
-        let mut cache: CompilerIdCache =
-            read_json_bounded(&compilers_path).unwrap_or_default();
+        let mut cache: CompilerIdCache = read_json_bounded(&compilers_path).unwrap_or_default();
         if cache.entries.len() < 64 {
             cache.entries.insert(
                 key,
@@ -572,11 +662,7 @@ pub fn parse_dep_info(text: &str) -> ParsedDepInfo {
         }
         let trimmed_end = raw_line.trim_end_matches('\r');
         // Count trailing backslashes: odd count means line continuation.
-        let trailing_bs = trimmed_end
-            .chars()
-            .rev()
-            .take_while(|&c| c == '\\')
-            .count();
+        let trailing_bs = trimmed_end.chars().rev().take_while(|&c| c == '\\').count();
         if trailing_bs % 2 == 1 {
             current.push_str(&trimmed_end[..trimmed_end.len() - 1]);
             current.push(' ');
@@ -706,6 +792,115 @@ struct CacheableInvocation {
     input_rs: PathBuf,
     normalized_flags: Vec<String>,
     extern_files: Vec<(String, PathBuf)>,
+    /// `-l [KIND[:MODIFIERS]=]NAME[:RENAME]` libraries, in command-line order.
+    native_libs: Vec<NativeLib>,
+    /// Absolute `-L native=` / `-L all=` / bare `-L` directories searched for them.
+    native_search_dirs: Vec<PathBuf>,
+}
+
+/// One `-l` native library request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeLib {
+    kind: String,
+    name: String,
+    verbatim: bool,
+}
+
+/// Parses `[KIND[:MODIFIERS]=]NAME[:RENAME]`. `link-arg` is a linker argument, not a
+/// library, and yields `None`.
+fn parse_native_lib_spec(spec: &str) -> Option<NativeLib> {
+    let (kind_part, rest) = match spec.split_once('=') {
+        Some((k, r)) => (k, r),
+        None => ("dylib", spec),
+    };
+    let (kind, modifiers) = kind_part.split_once(':').unwrap_or((kind_part, ""));
+    if kind == "link-arg" {
+        return None;
+    }
+    let name = rest.split(':').next().unwrap_or(rest);
+    Some(NativeLib {
+        kind: kind.to_string(),
+        name: name.to_string(),
+        verbatim: modifiers.split(',').any(|m| m == "+verbatim"),
+    })
+}
+
+/// A `-L [KIND=]PATH` directory that rustc searches for native libraries.
+fn parse_native_search_dir(val: &str, cwd: &Path) -> Option<PathBuf> {
+    let (kind, path) = match val.split_once('=') {
+        Some((k, p)) if matches!(k, "dependency" | "crate" | "native" | "framework" | "all") => {
+            (k, p)
+        }
+        _ => ("all", val),
+    };
+    if !matches!(kind, "native" | "all") || path.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(path);
+    Some(if p.is_absolute() { p } else { cwd.join(p) })
+}
+
+/// File names rustc may pick for `lib` in a search directory.
+fn native_lib_candidates(lib: &NativeLib) -> Vec<String> {
+    if lib.verbatim {
+        return vec![lib.name.clone()];
+    }
+    let n = &lib.name;
+    match lib.kind.as_str() {
+        "static" => vec![format!("lib{n}.a"), format!("{n}.lib")],
+        "framework" => Vec::new(),
+        _ => vec![
+            format!("lib{n}.dylib"),
+            format!("lib{n}.so"),
+            format!("{n}.dll"),
+            format!("{n}.dll.lib"),
+            format!("{n}.lib"),
+            format!("lib{n}.a"),
+        ],
+    }
+}
+
+/// Content digests of every native library file the invocation can link, as sorted
+/// key-material lines. rustc's dep-info does not list native libraries and an rlib
+/// bundles `static` ones, so a changed library under an unchanged name must change the
+/// key. The search directory itself is not part of the line, so identical bytes at a
+/// different path still share an entry.
+///
+/// A `static` library that cannot be found is an error (uncacheable): keying it by
+/// name alone would restore an rlib that embeds a stale copy. `dylib` and `framework`
+/// libraries that are not under any `-L` directory are system libraries; they are
+/// keyed by name (already in the flags) and by the compiler identity.
+fn native_lib_key_lines(inv: &CacheableInvocation) -> Result<Vec<String>, String> {
+    let mut lines = BTreeSet::new();
+    for lib in &inv.native_libs {
+        if !is_single_path_component(&lib.name) {
+            return Err(format!(
+                "native library name {:?} is not a plain name",
+                lib.name
+            ));
+        }
+        let mut found = false;
+        for dir in &inv.native_search_dirs {
+            for cand in native_lib_candidates(lib) {
+                let path = dir.join(&cand);
+                if path.is_file() {
+                    let (digest, _) = hash_file_blake3(&path)?;
+                    lines.insert(format!(
+                        "native {}:{}:{cand}={digest}\n",
+                        lib.kind, lib.name
+                    ));
+                    found = true;
+                }
+            }
+        }
+        if !found && lib.kind == "static" {
+            return Err(format!(
+                "static native library {:?} not found in any -L native search directory",
+                lib.name
+            ));
+        }
+    }
+    Ok(lines.into_iter().collect())
 }
 
 fn expand_rustc_response_files(args: &[String], cwd: &Path) -> Result<Vec<String>, ()> {
@@ -790,6 +985,8 @@ fn classify_rustc_args(raw_args: &[String], cwd: &Path) -> Classification {
     let mut emits: Vec<String> = Vec::new();
     let mut extern_files: Vec<(String, PathBuf)> = Vec::new();
     let mut normalized_flags: Vec<String> = Vec::new();
+    let mut native_libs: Vec<NativeLib> = Vec::new();
+    let mut native_search_dirs: Vec<PathBuf> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -876,17 +1073,39 @@ fn classify_rustc_args(raw_args: &[String], cwd: &Path) -> Classification {
             continue;
         }
         if arg == "-L" {
-            let Some(_val) = args.get(i + 1) else {
+            let Some(val) = args.get(i + 1) else {
                 return Classification::Passthrough;
             };
             // Search paths `-L dependency=...` point into the worktree's `target/`;
             // actual linked crates are hashed explicitly via `--extern` and `.d` files.
+            // Native search directories are kept only to resolve `-l` libraries, whose
+            // content (not path) enters the key.
+            native_search_dirs.extend(parse_native_search_dir(val, cwd));
             i += 2;
             continue;
         }
-        if arg.starts_with("-L") {
+        if let Some(val) = arg.strip_prefix("-L") {
+            native_search_dirs.extend(parse_native_search_dir(val, cwd));
             i += 1;
             continue;
+        }
+        if arg == "-l" {
+            let Some(val) = args.get(i + 1) else {
+                return Classification::Passthrough;
+            };
+            native_libs.extend(parse_native_lib_spec(val));
+            normalized_flags.push("-l".to_string());
+            normalized_flags.push(val.clone());
+            i += 2;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("-l") {
+            if !val.is_empty() {
+                native_libs.extend(parse_native_lib_spec(val));
+                normalized_flags.push(arg.clone());
+                i += 1;
+                continue;
+            }
         }
         if arg == "--extern" {
             let Some(val) = args.get(i + 1) else {
@@ -944,7 +1163,8 @@ fn classify_rustc_args(raw_args: &[String], cwd: &Path) -> Classification {
             }
         }
         // Check positional `.rs` input file.
-        if !arg.starts_with('-') && Path::new(arg).extension().and_then(|s| s.to_str()) == Some("rs")
+        if !arg.starts_with('-')
+            && Path::new(arg).extension().and_then(|s| s.to_str()) == Some("rs")
         {
             if input_rs.is_some() {
                 return Classification::Passthrough;
@@ -1025,6 +1245,8 @@ fn classify_rustc_args(raw_args: &[String], cwd: &Path) -> Classification {
         input_rs,
         normalized_flags,
         extern_files,
+        native_libs,
+        native_search_dirs,
     })
 }
 
@@ -1082,7 +1304,8 @@ fn compute_stage1_direct_key(
     material.extend_from_slice(input_hash.as_bytes());
     material.push(b'\n');
 
-    let mut extern_hashes: Vec<(String, String, String)> = Vec::with_capacity(inv.extern_files.len());
+    let mut extern_hashes: Vec<(String, String, String)> =
+        Vec::with_capacity(inv.extern_files.len());
     for (name, path) in &inv.extern_files {
         let ext = path
             .extension()
@@ -1100,6 +1323,10 @@ fn compute_stage1_direct_key(
         material.push(b'=');
         material.extend_from_slice(digest.as_bytes());
         material.push(b'\n');
+    }
+
+    for line in native_lib_key_lines(inv)? {
+        material.extend_from_slice(line.as_bytes());
     }
 
     // Hash Cargo package/cfg/feature/rustflags environment variables deterministically.
@@ -1337,9 +1564,7 @@ fn lex_rust_simple_tokens(src: &str) -> Result<Vec<RustLexToken>, ()> {
                             break;
                         }
                     }
-                    tokens.push(RustLexToken::Ident(
-                        s[..2 + ident_len].to_string(),
-                    ));
+                    tokens.push(RustLexToken::Ident(s[..2 + ident_len].to_string()));
                     i += 2 + ident_len;
                     continue;
                 }
@@ -1705,14 +1930,36 @@ fn verify_stage2_manifest(
     true
 }
 
-fn rewrite_path_prefixes_in_str(
-    input: &str,
-    replacements: &[(&str, &str)],
-) -> String {
+/// True when `c` could continue a path component, so a match followed by it is a
+/// longer name (`lane-10`), not the prefix `lane-1`.
+fn continues_path_component(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '-' | '_' | '.')
+}
+
+/// Replaces `from` with `to` where `from` ends at a path boundary: end of text or a
+/// character that cannot continue a component.
+fn replace_path_prefix(input: &str, from: &str, to: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(at) = rest.find(from) {
+        let after = &rest[at + from.len()..];
+        out.push_str(&rest[..at]);
+        if after.chars().next().is_some_and(continues_path_component) {
+            out.push_str(from);
+        } else {
+            out.push_str(to);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn rewrite_path_prefixes_in_str(input: &str, replacements: &[(&str, &str)]) -> String {
     let mut out = input.to_string();
     for (from, to) in replacements {
         if !from.is_empty() && from != to && out.contains(from) {
-            out = out.replace(from, to);
+            out = replace_path_prefix(&out, from, to);
         }
     }
     out
@@ -1764,22 +2011,48 @@ fn rewrite_stderr_for_worktree(raw_stderr: &[u8], replacements: &[(&str, &str)])
     out
 }
 
-fn materialize_blob_into(blob_path: &Path, dst_path: &Path) -> Result<bool, String> {
-    if let Some(parent) = dst_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
+/// A verified copy of a blob, staged next to its destination and not yet renamed in.
+struct StagedBlob {
+    tmp: PathBuf,
+    dst: PathBuf,
+    is_cow: bool,
+}
+
+/// Clones `blob_path` to a temp file beside `dst` and checks the CLONE (not the blob
+/// in place, which another process could swap between a check and the copy) against
+/// the digest and size the manifest claims. A mismatch removes the temp file and is an
+/// error: a corrupt or planted blob is a miss, never an artifact.
+fn stage_verified_blob(
+    blob_path: &Path,
+    dst_path: &Path,
+    expected_digest: &str,
+    expected_size: u64,
+) -> Result<StagedBlob, String> {
     let tmp = unique_temp_path(dst_path);
     let res = reflink_copy_file(blob_path, &tmp).map_err(|e| e.into_message())?;
-    if let Err(e) = fs::rename(&tmp, dst_path) {
+    let verdict = hash_file_blake3(&tmp).and_then(|(digest, len)| {
+        if digest == expected_digest && len == expected_size {
+            Ok(())
+        } else {
+            Err(format!(
+                "blob {expected_digest} failed verification (content hashes to {digest}, {len} bytes; manifest says {expected_size})"
+            ))
+        }
+    });
+    if let Err(e) = verdict {
         let _ = fs::remove_file(&tmp);
-        return Err(format!("cannot rename staged artifact into {}: {e}", dst_path.display()));
+        return Err(e);
     }
-    Ok(res.is_cow)
+    Ok(StagedBlob {
+        tmp,
+        dst: dst_path.to_path_buf(),
+        is_cow: res.is_cow,
+    })
 }
 
 fn store_blob_from(src_path: &Path, cache_dir: &Path) -> Result<(String, u64, bool), String> {
     let (digest, size) = hash_file_blake3(src_path)?;
-    let blob_path = blob_path_for(cache_dir, &digest);
+    let blob_path = blob_path_for(cache_dir, &digest)?;
     if blob_path.is_file() {
         return Ok((digest, size, false));
     }
@@ -1993,32 +2266,46 @@ pub fn run_rustc_wrapper(wrapper_args: &[String]) -> i32 {
 
     let manifest_path = manifest_path_for(&cache_dir, &direct_key);
     let mut stage2_invalidated = false;
+    // An entry that exists but cannot be used is a counted failure, not a plain miss.
+    let mut restore_failure: Option<String> = None;
 
-    if let Ok(Some(manifest)) = read_direct_manifest(&manifest_path) {
-        if verify_stage2_manifest(
-            &manifest,
-            cargo_out_dir.as_deref(),
-            worktree_root_canon.as_deref(),
-        ) {
-            if try_restore_cached_outputs(
-                &cache_dir,
+    match read_direct_manifest(&manifest_path) {
+        Ok(Some(manifest)) => {
+            if verify_stage2_manifest(
                 &manifest,
-                &inv.out_dir,
                 cargo_out_dir.as_deref(),
                 worktree_root_canon.as_deref(),
-                worktree_root_raw.as_deref(),
-            )
-            .is_ok()
-            {
-                return 0;
+            ) {
+                match try_restore_cached_outputs(
+                    &cache_dir,
+                    &manifest,
+                    &inv.out_dir,
+                    cargo_out_dir.as_deref(),
+                    worktree_root_canon.as_deref(),
+                    worktree_root_raw.as_deref(),
+                ) {
+                    Ok(()) => return 0,
+                    Err(e) => restore_failure = Some(e),
+                }
+            } else {
+                stage2_invalidated = true;
             }
-        } else {
-            stage2_invalidated = true;
         }
+        Ok(None) => {}
+        Err(e) => {
+            restore_failure = Some(format!(
+                "unreadable manifest {}: {e}",
+                manifest_path.display()
+            ));
+        }
+    }
+    if let Some(e) = &restore_failure {
+        note(&format!("cache entry unusable, rebuilding: {e}"));
     }
 
     // Cache miss: execute real `rustc` while capturing stdout/stderr so we can both
     // replay output verbatim and persist stderr diagnostics/artifact lines on success.
+    let compile_started = SystemTime::now();
     let output = match Command::new(rustc).args(rustc_args).output() {
         Ok(o) => o,
         Err(e) => {
@@ -2041,21 +2328,43 @@ pub fn run_rustc_wrapper(wrapper_args: &[String]) -> i32 {
             if stage2_invalidated {
                 c.stage2_invalidations += 1;
             }
+            if restore_failure.is_some() {
+                c.restore_failures += 1;
+            }
         });
         return code;
     }
 
-    let new_blob_bytes = store_successful_compile(
-        &cache_dir,
-        &manifest_path,
+    // A compile that succeeded is never failed because the cache could not keep it;
+    // the failure is counted and named instead.
+    let stored = match recheck_key_unchanged(
+        &compiler_vv,
         &inv,
-        &cwd,
-        cargo_out_dir.as_deref(),
         worktree_root_canon.as_deref(),
         worktree_root_raw.as_deref(),
-        &output.stderr,
-    )
-    .unwrap_or(0);
+        &direct_key,
+    ) {
+        Ok(()) => store_successful_compile(
+            &cache_dir,
+            &manifest_path,
+            &inv,
+            &cwd,
+            cargo_out_dir.as_deref(),
+            worktree_root_canon.as_deref(),
+            worktree_root_raw.as_deref(),
+            &output.stderr,
+            compile_started,
+        ),
+        Err(e) => Err(e),
+    };
+    let store_failed = stored.is_err();
+    let new_blob_bytes = match stored {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            note(&format!("outputs not cached: {e}"));
+            0
+        }
+    };
 
     update_counters(&cache_dir, |c| {
         c.misses += 1;
@@ -2063,9 +2372,40 @@ pub fn run_rustc_wrapper(wrapper_args: &[String]) -> i32 {
         if stage2_invalidated {
             c.stage2_invalidations += 1;
         }
+        if store_failed {
+            c.store_failures += 1;
+        }
+        if restore_failure.is_some() {
+            c.restore_failures += 1;
+        }
     });
 
     0
+}
+
+/// One diagnostic line from the wrapper. Printed only for a cache problem, so a
+/// healthy build stays silent.
+fn note(msg: &str) {
+    let _ = writeln!(std::io::stderr(), "gitpulse-rustc: {msg}");
+}
+
+/// The stage-1 key covers the entry file, every `--extern` artifact, native libraries
+/// and the environment. If any of them changed while rustc ran, the outputs belong to
+/// neither the old key nor the new one and must not be stored under the old one.
+fn recheck_key_unchanged(
+    compiler_vv: &str,
+    inv: &CacheableInvocation,
+    worktree_root_canon: Option<&Path>,
+    worktree_root_raw: Option<&Path>,
+    key_before: &str,
+) -> Result<(), String> {
+    let after = compute_stage1_direct_key(compiler_vv, inv, worktree_root_canon, worktree_root_raw)
+        .map_err(|e| format!("cannot re-hash inputs after the compile: {e}"))?;
+    if after == key_before {
+        Ok(())
+    } else {
+        Err("an input changed while rustc was running".to_string())
+    }
 }
 
 fn try_restore_cached_outputs(
@@ -2076,28 +2416,48 @@ fn try_restore_cached_outputs(
     current_worktree_root_canon: Option<&Path>,
     current_worktree_root_raw: Option<&Path>,
 ) -> Result<(), String> {
+    validate_manifest_names(manifest)?;
     if manifest.artifacts.is_empty() {
         return Err("empty artifact list".to_string());
     }
-    // Verify all blobs exist before materializing any output file.
-    let mut resolved_blobs = Vec::with_capacity(manifest.artifacts.len());
-    for art in &manifest.artifacts {
-        let bp = blob_path_for(cache_dir, &art.blob_blake3);
-        if !bp.is_file() {
-            return Err(format!("missing blob {}", art.blob_blake3));
-        }
-        resolved_blobs.push((art, bp));
-    }
-
     fs::create_dir_all(current_out_dir).map_err(|e| e.to_string())?;
 
-    let mut all_cow = true;
+    // Stage and verify every blob before any output file is replaced, so a bad blob
+    // never leaves a half-restored output directory.
+    let mut staged: Vec<StagedBlob> = Vec::with_capacity(manifest.artifacts.len());
     let mut bytes_restored = 0u64;
-    for (art, bp) in resolved_blobs {
+    let discard = |staged: &[StagedBlob]| {
+        for st in staged {
+            let _ = fs::remove_file(&st.tmp);
+        }
+    };
+    for art in &manifest.artifacts {
+        let bp = blob_path_for(cache_dir, &art.blob_blake3)?;
+        if !bp.is_file() {
+            discard(&staged);
+            return Err(format!("missing blob {}", art.blob_blake3));
+        }
         let dst = current_out_dir.join(&art.file_name);
-        let is_cow = materialize_blob_into(&bp, &dst)?;
-        all_cow &= is_cow;
+        match stage_verified_blob(&bp, &dst, &art.blob_blake3, art.size_bytes) {
+            Ok(st) => staged.push(st),
+            Err(e) => {
+                discard(&staged);
+                return Err(e);
+            }
+        }
         bytes_restored += art.size_bytes;
+    }
+
+    let mut all_cow = true;
+    for (idx, st) in staged.iter().enumerate() {
+        if let Err(e) = fs::rename(&st.tmp, &st.dst) {
+            discard(&staged[idx..]);
+            return Err(format!(
+                "cannot rename staged artifact into {}: {e}",
+                st.dst.display()
+            ));
+        }
+        all_cow &= st.is_cow;
     }
 
     let cur_out_str = current_out_dir.to_string_lossy().into_owned();
@@ -2168,7 +2528,14 @@ fn store_successful_compile(
     worktree_root_canon: Option<&Path>,
     worktree_root_raw: Option<&Path>,
     stderr_bytes: &[u8],
+    compile_started: SystemTime,
 ) -> Result<u64, String> {
+    if stderr_bytes.len() > MAX_STORED_STDERR_BYTES {
+        return Err(format!(
+            "stderr is {} bytes (cap {MAX_STORED_STDERR_BYTES}); the manifest would exceed the {MAX_JSON_STATE_BYTES} byte read cap",
+            stderr_bytes.len()
+        ));
+    }
     let (Some((dep_file_name, dep_path)), emitted) = collect_emitted_artifacts(
         &inv.out_dir,
         &inv.crate_name,
@@ -2185,7 +2552,13 @@ fn store_successful_compile(
     let dep_info_text = fs::read_to_string(&dep_path).map_err(|e| e.to_string())?;
     let mut parsed = parse_dep_info(&dep_info_text);
 
+    // The dependency list only exists once rustc has written it, so it cannot be
+    // hashed beforehand. A dependency modified at or after the compile started may
+    // have been read by rustc before the edit, so its post-compile hash would be
+    // recorded against outputs built from different content: refuse. The set is then
+    // hashed a second time after the blobs are stored, to catch an edit in between.
     let mut deps = Vec::with_capacity(parsed.files.len());
+    let mut dep_paths = Vec::with_capacity(parsed.files.len());
     for raw_dep in &parsed.files {
         if let Some((resolved_path, scope)) = classify_dep_scope(
             raw_dep,
@@ -2194,11 +2567,21 @@ fn store_successful_compile(
             cargo_out_dir,
             worktree_root_canon,
         ) {
+            let mtime = fs::metadata(&resolved_path)
+                .and_then(|m| m.modified())
+                .map_err(|e| format!("cannot stat dependency {}: {e}", resolved_path.display()))?;
+            if mtime >= compile_started {
+                return Err(format!(
+                    "dependency {} was modified while rustc was running",
+                    resolved_path.display()
+                ));
+            }
             let (digest, _) = hash_file_blake3(&resolved_path)?;
             deps.push(RecordedDepFile {
                 scope,
                 blake3: digest,
             });
+            dep_paths.push(resolved_path);
         }
     }
 
@@ -2224,6 +2607,16 @@ fn store_successful_compile(
             blob_blake3,
             size_bytes,
         });
+    }
+
+    for (dep, path) in deps.iter().zip(&dep_paths) {
+        let (again, _) = hash_file_blake3(path)?;
+        if again != dep.blake3 {
+            return Err(format!(
+                "dependency {} changed while its outputs were being stored",
+                path.display()
+            ));
+        }
     }
 
     let recorded_out_dir_canon = fs::canonicalize(&inv.out_dir)
@@ -2254,6 +2647,12 @@ fn store_successful_compile(
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let encoded = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
+    if encoded.len() as u64 > MAX_JSON_STATE_BYTES {
+        return Err(format!(
+            "manifest is {} bytes, over the {MAX_JSON_STATE_BYTES} byte read cap",
+            encoded.len()
+        ));
+    }
     write_atomic(manifest_path, &encoded).map_err(|e| e.to_string())?;
 
     Ok(new_blob_bytes)
@@ -2399,7 +2798,10 @@ mod tests {
             ],
         );
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("/tmp/wt-b/target/debug/deps/libfoo-1.rmeta"), "{text}");
+        assert!(
+            text.contains("/tmp/wt-b/target/debug/deps/libfoo-1.rmeta"),
+            "{text}"
+        );
         assert!(!text.contains("/tmp/wt-a"), "{text}");
     }
 
@@ -2429,5 +2831,72 @@ mod tests {
             let (_, allowed) = check_tokens_out_dir_compile_only(&toks);
             assert!(!allowed, "expected fail-closed rejection for: {bad_src}");
         }
+    }
+
+    #[test]
+    fn path_prefix_rewrite_respects_component_boundaries() {
+        let r = [("/wt/lane-1", "/new/lane-1")];
+        assert_eq!(
+            rewrite_path_prefixes_in_str("/wt/lane-1/src/a.rs /wt/lane-10/src/b.rs /wt/lane-1", &r),
+            "/new/lane-1/src/a.rs /wt/lane-10/src/b.rs /new/lane-1"
+        );
+    }
+
+    #[test]
+    fn manifest_names_must_be_single_plain_components() {
+        for ok in ["libdemo-abc.rlib", "demo-abc.d", ".hidden-but-plain"] {
+            assert!(is_single_path_component(ok), "{ok}");
+        }
+        for bad in [
+            "", ".", "..", "../x", "a/b", "/abs", "a\\b", "C:\\x", "x/", "./x", "a\0b",
+        ] {
+            assert!(!is_single_path_component(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn digests_must_be_prefixed_lowercase_hex_of_the_exact_length() {
+        let good = blake3_hash(b"x");
+        assert!(is_valid_digest(&good), "{good}");
+        assert!(blob_path_for(Path::new("/c"), &good).is_ok());
+        let hex = good.trim_start_matches(DIGEST_PREFIX).to_string();
+        for bad in [
+            String::new(),
+            hex.clone(),
+            format!("{DIGEST_PREFIX}{}", &hex[1..]),
+            format!("{DIGEST_PREFIX}{hex}0"),
+            format!("{DIGEST_PREFIX}{}", hex.to_uppercase().replace('B', "G")),
+            format!("{DIGEST_PREFIX}{}", hex.to_uppercase()),
+            "../../etc/passwd".to_string(),
+            format!("{DIGEST_PREFIX}../{}", &hex[3..]),
+        ] {
+            assert!(!is_valid_digest(&bad), "{bad:?}");
+            assert!(blob_path_for(Path::new("/c"), &bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn native_lib_specs_and_search_dirs_parse() {
+        let cwd = Path::new("/w");
+        assert_eq!(
+            parse_native_lib_spec("static:+whole-archive,+verbatim=libfoo.a:renamed"),
+            Some(NativeLib {
+                kind: "static".into(),
+                name: "libfoo.a".into(),
+                verbatim: true
+            })
+        );
+        assert_eq!(parse_native_lib_spec("z").unwrap().kind, "dylib");
+        assert_eq!(parse_native_lib_spec("link-arg=-fuse-ld=lld"), None);
+        assert_eq!(
+            parse_native_search_dir("native=rel", cwd),
+            Some(PathBuf::from("/w/rel"))
+        );
+        assert_eq!(
+            parse_native_search_dir("/abs", cwd),
+            Some(PathBuf::from("/abs"))
+        );
+        assert_eq!(parse_native_search_dir("dependency=/deps", cwd), None);
+        assert_eq!(parse_native_search_dir("framework=/f", cwd), None);
     }
 }
