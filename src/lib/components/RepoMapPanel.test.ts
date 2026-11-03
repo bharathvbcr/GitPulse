@@ -146,7 +146,7 @@ describe("RepoMapPanel template honesty", () => {
     expect(source).toContain("brokenLinksSection(");
     expect(source).toContain("brokenError = reportMapFailure(");
     expect(source).toContain('data-testid="docs-broken-error"');
-    expect(template).toContain("Could not check links:");
+    expect(template).toContain("Could not check links. {boundStrip(brokenError)}");
     const empty = template.indexOf('{:else if brokenSection === "empty"}');
     const noneFound = template.indexOf("None found in the indexed vault.");
     expect(empty).toBeGreaterThan(-1);
@@ -221,15 +221,41 @@ describe("RepoMapPanel build feedback", () => {
 describe("RepoMapPanel docs search", () => {
   const template = source.slice(source.lastIndexOf("</script>"));
 
-  it("only says 'No hits.' through docsSearchPrompt", () => {
-    expect(source).toContain("docsSearchPrompt(docsQuery, searchedQuery, docsHits.length, docsSearching)");
-    const none = template.indexOf("No hits.");
+  it("only says 'No hits' through docsSearchPrompt, naming the query it answers", () => {
+    expect(source).toContain(
+      "docsSearchPrompt(docsQuery, searchedQuery, docsHits.length, docsSearching, docsError !== null)",
+    );
+    const none = template.indexOf('No hits for "{searchedQuery}".');
     expect(none).toBeGreaterThan(-1);
     expect(template.slice(template.lastIndexOf("{#if", none), none)).toMatch(
       /^\{#if searchPrompt === "none"\}\s*<p[^>]*>\s*$/,
     );
-    expect(template.indexOf("No hits.", none + 1)).toBe(-1);
+    expect(template.indexOf("No hits", none + 1)).toBe(-1);
     expect(template).toContain("Press Enter to search.");
+  });
+
+  it("labels hits that answer an earlier query, through one predicate", () => {
+    expect(source).toContain("docsHitsStale(docsQuery, searchedQuery, docsHits.length)");
+    expect(template).toContain('data-testid="docs-hits-stale"');
+    expect(template).toContain('Results for "{searchedQuery}"');
+    // The label and the dimming read the same derived value, not two copies.
+    expect(template).toContain("class:opacity-60={hitsStale}");
+    expect(template.match(/\{#if hitsStale\}/g)).toHaveLength(1);
+  });
+
+  it("keeps the earlier hits when a search fails and shows the failure", () => {
+    const run = source.slice(source.indexOf("async function runDocsSearch"), source.indexOf("function rememberDocsSearch"));
+    const failed = run.slice(run.indexOf("} catch (err) {"), run.indexOf("} finally {"));
+    expect(failed).toContain('docsError = reportMapFailure("search"');
+    expect(failed).not.toContain("docsHits = []");
+    expect(failed).not.toContain("searchedQuery = ");
+    expect(template).toContain('data-testid="docs-search-error"');
+    expect(template).toMatch(/\{#if docsError\}\s*<p[^>]*role="alert"[^>]*data-testid="docs-search-error"/);
+  });
+
+  it("restores the query, the hits and what they answer when the panel remounts", () => {
+    expect(source).toContain("searchedQuery = memo?.searchedQuery ?? null;");
+    expect(source).not.toContain("docsSubmittedQuery");
   });
 
   it("keeps earlier results (dimmed) while the query is edited", () => {
@@ -238,7 +264,7 @@ describe("RepoMapPanel docs search", () => {
     expect(effect).toContain("docsError = null;");
     // The unconditional wipe is gone: docsHits is only cleared inside the empty-query branch.
     expect(effect.slice(0, effect.indexOf('if (query === "")'))).not.toContain("docsHits = []");
-    expect(template).toContain("class:opacity-60={searchedQuery !== docsQuery.trim()}");
+    expect(template).toContain("class:opacity-60={hitsStale}");
   });
 
   it("disables Search for an empty query", () => {

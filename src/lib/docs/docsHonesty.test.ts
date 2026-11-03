@@ -4,6 +4,7 @@ import {
   brokenLinksHonesty,
   brokenLinksSection,
   docsRenameHonesty,
+  docsHitsStale,
   docsSearchHonesty,
   docsSearchPrompt,
   docsStatusHonesty,
@@ -172,6 +173,32 @@ describe("docsSearchPrompt", () => {
     expect(docsSearchPrompt("foo", null, 0, true)).toBeNull();
     expect(docsSearchPrompt("   ", "foo", 0, false)).toBeNull();
     expect(docsSearchPrompt("foo", "foo", 2, false)).toBeNull();
+  });
+  it("never claims 'no hits' beside a search that failed", () => {
+    // "zzz" came back empty once; searching it again then failed. The error is
+    // showing, so the box must not also say the query has no hits.
+    expect(docsSearchPrompt("zzz", "zzz", 0, false, true)).toBeNull();
+    expect(docsSearchPrompt("zzzq", "zzz", 0, false, true)).toBeNull();
+    expect(docsSearchPrompt("zzz", "zzz", 0, false, false)).toBe("none");
+  });
+});
+
+describe("docsHitsStale", () => {
+  it("is false when the hits answer the query in the box", () => {
+    expect(docsHitsStale("alpha", "alpha", 2)).toBe(false);
+    expect(docsHitsStale("  alpha ", "alpha", 2)).toBe(false);
+  });
+  it("is true once the query is edited away from the one the hits answer", () => {
+    expect(docsHitsStale("alphab", "alpha", 2)).toBe(true);
+    expect(docsHitsStale("", "alpha", 2)).toBe(true);
+  });
+  it("is true after a failed search for another query left the earlier hits up", () => {
+    // searchedQuery only ever advances on success, so it still names "alpha".
+    expect(docsHitsStale("boom", "alpha", 1)).toBe(true);
+  });
+  it("has nothing to label without hits or without a completed search", () => {
+    expect(docsHitsStale("alphab", "alpha", 0)).toBe(false);
+    expect(docsHitsStale("alpha", null, 3)).toBe(false);
   });
 });
 

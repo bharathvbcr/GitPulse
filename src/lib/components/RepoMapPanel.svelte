@@ -8,7 +8,8 @@
    */
   interface DocsSearchMemo {
     docsQuery: string;
-    docsSubmittedQuery: string;
+    /** The query `docsHits` answer; null when no search has completed. */
+    searchedQuery: string | null;
     docsHits: import("../docs/client").DocsSearchHit[];
   }
   const docsSearchMemo = createRepoPanelCache<DocsSearchMemo>();
@@ -71,6 +72,7 @@
   import {
     brokenLinksHonesty,
     brokenLinksSection,
+    docsHitsStale,
     docsSearchHonesty,
     docsSearchPrompt,
     docsStatusHonesty,
@@ -151,12 +153,12 @@
   let docsStatus = $state<DocsStatus | null>(null);
   let docsQuery = $state("");
   let docsHits = $state<DocsSearchHit[]>([]);
-  /** The query `docsHits` answers; set only when a search for it succeeds. */
-  let docsSubmittedQuery = $state("");
   let docsSearching = $state(false);
   // The trimmed query the current `docsHits` answer; null when no search has
-  // completed (or the last one failed).
+  // completed. Set only when a search for it succeeds, so a failed search
+  // leaves the earlier hits labelled with the query they really answer.
   let searchedQuery = $state<string | null>(null);
+  // The last search failed. Broken-links reads own `brokenError`.
   let docsError = $state<string | null>(null);
   let brokenLinks = $state<BrokenLink[]>([]);
   let brokenLoading = $state(false);
@@ -250,7 +252,8 @@
   const docsHonesty = $derived(docsStatusHonesty(docsStatus));
   const searchHonesty = $derived(docsSearchHonesty(docsHits, DOCS_SEARCH_DEFAULT_LIMIT));
   const brokenDisplay = $derived(brokenLinksHonesty(brokenLinks, BROKEN_LINKS_DISPLAY_CAP));
-  const searchPrompt = $derived(docsSearchPrompt(docsQuery, searchedQuery, docsHits.length, docsSearching));
+  const searchPrompt = $derived(docsSearchPrompt(docsQuery, searchedQuery, docsHits.length, docsSearching, docsError !== null));
+  const hitsStale = $derived(docsHitsStale(docsQuery, searchedQuery, docsHits.length));
   const brokenSection = $derived(
     brokenLinksSection({ loading: brokenLoading, error: brokenError, links: brokenLinks }),
   );
@@ -426,7 +429,6 @@
     if (!repoPath || !q) {
       docsHits = [];
       searchedQuery = null;
-      docsSubmittedQuery = "";
       docsSearching = false;
       rememberDocsSearch();
       return;
@@ -439,14 +441,11 @@
       if (live()) {
         docsHits = hits;
         searchedQuery = q;
-        docsSubmittedQuery = q;
         rememberDocsSearch();
       }
     } catch (err) {
       if (!live()) return;
-      docsHits = [];
-      searchedQuery = null;
-      docsSubmittedQuery = "";
+      // The previous hits stay, still labelled with the query they answer.
       docsError = reportMapFailure("search", repoPath, err);
     } finally {
       if (live()) docsSearching = false;
@@ -458,7 +457,7 @@
     if (!repo) return;
     docsSearchMemo.set(repo, {
       docsQuery,
-      docsSubmittedQuery,
+      searchedQuery,
       docsHits: $state.snapshot(docsHits),
     });
   }
@@ -566,8 +565,7 @@
       // A repository's docs search comes back as it was left; nothing re-runs.
       const memo = path ? docsSearchMemo.get(path) : undefined;
       docsQuery = memo?.docsQuery ?? "";
-      searchedQuery = memo?.docsSubmittedQuery || null;
-      docsSubmittedQuery = memo?.docsSubmittedQuery ?? "";
+      searchedQuery = memo?.searchedQuery ?? null;
       docsHits = memo?.docsHits ?? [];
       brokenLinks = [];
       linkResult = null;
@@ -616,7 +614,6 @@
       if (query === "") {
         docsHits = [];
         searchedQuery = null;
-        docsSubmittedQuery = "";
       }
       rememberDocsSearch();
     });
@@ -836,9 +833,6 @@
           {docsHonesty}
         </p>
       {/if}
-      {#if docsError}
-        <p class="text-[11px] text-rose-600 dark:text-rose-400">{boundStrip(docsError)}</p>
-      {/if}
 
       <section aria-labelledby="docs-search-heading">
         <h3 id="docs-search-heading" class="text-[10px] uppercase tracking-wide text-textMuted mb-1.5">
@@ -867,13 +861,19 @@
             {searchHonesty}
           </p>
         {/if}
+        {#if docsError}
+          <p class="mt-2 text-[11px] text-rose-600 dark:text-rose-400" role="alert" data-testid="docs-search-error">{boundStrip(docsError)}</p>
+        {/if}
         {#if searchPrompt === "none"}
-          <p class="mt-2 text-[11px] text-textMuted">No hits.</p>
+          <p class="mt-2 text-[11px] text-textMuted" data-testid="docs-no-hits">No hits for "{searchedQuery}".</p>
         {:else if searchPrompt === "press-enter"}
           <p class="mt-2 text-[11px] text-textMuted" data-testid="docs-search-prompt">Press Enter to search.</p>
         {/if}
         {#if docsHits.length > 0}
-          <ul class="mt-2 space-y-1.5" class:opacity-60={searchedQuery !== docsQuery.trim()}>
+          {#if hitsStale}
+            <p class="mt-2 text-[10px] text-textMuted" data-testid="docs-hits-stale">Results for "{searchedQuery}"</p>
+          {/if}
+          <ul class="mt-2 space-y-1.5" class:opacity-60={hitsStale}>
             {#each keyedList(docsHits, (hit) => JSON.stringify([hit.path, hit.line, hit.score])) as { item: hit, key: renderKey } (renderKey)}
               <li>
                 <button
@@ -901,7 +901,7 @@
         {#if brokenSection === "loading"}
           <p class="text-[11px] text-textMuted">Loading…</p>
         {:else if brokenSection === "error"}
-          <p class="text-[11px] text-rose-600 dark:text-rose-400" role="alert" data-testid="docs-broken-error">Could not check links: {boundStrip(brokenError)}</p>
+          <p class="text-[11px] text-rose-600 dark:text-rose-400" role="alert" data-testid="docs-broken-error">Could not check links. {boundStrip(brokenError)}</p>
           <button type="button" class="gp-btn text-[11px] px-2 py-0.5 mt-1" onclick={() => void reloadDocs()}>Retry</button>
         {:else if brokenSection === "empty"}
           <p class="text-[11px] text-textMuted">None found in the indexed vault.</p>

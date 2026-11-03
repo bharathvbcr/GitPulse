@@ -100,20 +100,36 @@ export function brokenLinksSection(input: {
 }
 
 /**
- * What the search box says about the query as typed. "No hits." is a claim
+ * What the search box says about the query as typed. "No hits" is a claim
  * about a search that ran; typing alone has not run one, and editing a query
- * after a search has not either — those read "press Enter" instead.
+ * after a search has not either — those read "press Enter" instead. While a
+ * search error is showing the box says nothing more: the error is the answer,
+ * and "no hits" beside it would claim a result the failed search never gave.
  */
 export function docsSearchPrompt(
   query: string,
   searchedQuery: string | null,
   hitCount: number,
   searching: boolean,
+  failed = false,
 ): "none" | "press-enter" | null {
   const q = query.trim();
-  if (searching || q === "") return null;
+  if (searching || failed || q === "") return null;
   if (q !== searchedQuery) return "press-enter";
   return hitCount === 0 ? "none" : null;
+}
+
+/**
+ * The hits on screen answer an earlier query than the one in the box. They
+ * stay (editing is not searching, and a failed search keeps the earlier hits),
+ * so they must say which query they answer rather than pass as this one's.
+ */
+export function docsHitsStale(
+  query: string,
+  searchedQuery: string | null,
+  hitCount: number,
+): boolean {
+  return hitCount > 0 && searchedQuery !== null && searchedQuery !== query.trim();
 }
 
 export function brokenLinksHonesty(
