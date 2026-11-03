@@ -17,6 +17,13 @@
 //! seam): no production file builds a `git config` write argv, and none sets
 //! either key to anything but `false` (`storage/mod.rs` passes
 //! `core.fsmonitor=false` so a read cannot start the daemon).
+//!
+//! One key is allowed (owner, 2026-11-03): `extensions.worktreeConfig = true`,
+//! and only as git's own side effect. A sparse worktree needs its cone kept per
+//! worktree, and `git sparse-checkout init` in a linked worktree writes that key
+//! to the shared config itself; GitPulse still builds no `git config` write. The
+//! engine test `a_sparse_creation_changes_the_shared_config_by_worktree_config_only`
+//! holds the shared config to exactly that one addition.
 
 mod common;
 

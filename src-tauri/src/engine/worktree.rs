@@ -5299,7 +5299,9 @@ fn add_sparse_worktree_zero_copy_optional_branch(
         // `git sparse-checkout init` enables `extensions.worktreeConfig` itself
         // when it must keep the cone per worktree: GitPulse writes no repository
         // config of its own (owner decision ft-7450105d), so there is no
-        // `git config` here. Every write below is judged before it runs.
+        // `git config` here. That one key, written by git, is the decision's
+        // only allowance (owner, 2026-11-03). Every write below is judged
+        // before it runs.
         let setup = (|| -> Result<String, CommandError> {
             let init: &[&str] = &["sparse-checkout", "init", "--cone"];
             gate(init)?;
@@ -11984,6 +11986,42 @@ some-future-field whatever
         );
         assert!(judged.iter().all(|a| a[0] != "config"), "{judged:?}");
         assert!(Path::new(&created.path).join("src/lib.rs").is_file());
+    }
+
+    /// The owner's one allowance under ft-7450105d: git's own sparse-checkout
+    /// may add `extensions.worktreeConfig = true` to the shared config. Nothing
+    /// else may change there; the cone itself lives in the lane's
+    /// `config.worktree`.
+    #[test]
+    fn a_sparse_creation_changes_the_shared_config_by_worktree_config_only() {
+        let (_sandbox, anchor, target) = small_sparse_fixture();
+        let shared = anchor.join(".git/config");
+        let lines = |text: String| -> std::collections::BTreeSet<String> {
+            text.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        };
+        let before = lines(std::fs::read_to_string(&shared).unwrap());
+        add_sparse_worktree_zero_copy(
+            anchor.to_str().unwrap(),
+            target.to_str().unwrap(),
+            "agent/shared-config",
+            None,
+            &["src".to_string()],
+            false,
+            &mut |_| Ok(()),
+        )
+        .expect("sparse worktree");
+        let after = lines(std::fs::read_to_string(&shared).unwrap());
+        let added: Vec<&String> = after.difference(&before).collect();
+        let removed: Vec<&String> = before.difference(&after).collect();
+        assert_eq!(
+            added,
+            ["[extensions]", "worktreeConfig = true"],
+            "{after:?}"
+        );
+        assert!(removed.is_empty(), "{removed:?}");
     }
 
     /// A refused write stops the sequence, and the undo is judged too: a
