@@ -213,7 +213,7 @@
   const openLaunchForm=async()=>{if(launchForm().hidden){formToggle().click();await wait(()=>!launchForm().hidden);}};
   const set=(name,value)=>{const el=field(name);if(!el)throw new Error(`Missing ${name}`);el.value=value;el.dispatchEvent(new Event("change",{bubbles:true}));};
   const results=[];
-  const check=(name,pass)=>{if(!pass){results.push({name,pass:false});throw new Error(name);}report.checks.push(name);results.push({name,pass:true});show();};
+  const check=(name,pass,detail)=>{if(!pass){results.push({name,pass:false,detail:typeof detail==="function"?detail():""});throw new Error(name);}report.checks.push(name);results.push({name,pass:true});show();};
   const finish=async()=>{for(const run of runs.values())if(run.state==="running"){run.state="exited";run.revision++;run.exit_code=0;await emitExit(run.session_id,{exit_code:0,signal:"",error:null,reaped:true,ended_by_gitpulse:false});}};
   const params=new URLSearchParams(location.search);
   const runChecks=async()=>{
@@ -391,7 +391,8 @@
         check("The summary and the tab badge count it as needing you",
           pane().querySelector('[data-testid="agents-summary"]').textContent.includes("1 needs you")&&document.querySelector('[data-testid="host-working"]').dataset.asking==="1");
         pushOutput(sid,"still printing\r\n");await pause(1200);
-        check("More output does not answer the agent's question",card().dataset.tone==="needs-you");
+        check("More output does not answer the agent's question",card().dataset.tone==="needs-you",
+          ()=>`tone=${card().dataset.tone} state=${card().dataset.runState} line=${line()?.dataset.tone}: ${line()?.textContent.trim()} · writes=${report.writes.length}`);
         const writesBefore=report.writes.length;
         const terminalInput=document.querySelector('textarea[aria-label="Terminal input"]');
         terminalInput.focus();terminalInput.dispatchEvent(new InputEvent("input",{data:"y",inputType:"insertText",bubbles:true}));
