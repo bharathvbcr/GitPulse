@@ -1584,7 +1584,7 @@
         "type": "boolean"
       },
       "reap_processes": {
-        "description": "Terminate detached background processes running with CWD in the worktree",
+        "description": "Terminate detached background processes running with CWD in the worktree. Default false: without it a worktree with a live process inside is skipped, not removed",
         "type": "boolean"
       },
       "repo_path": {

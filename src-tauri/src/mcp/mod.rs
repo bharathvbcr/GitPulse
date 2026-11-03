@@ -267,6 +267,150 @@ fn mutating_tool_annotations(idempotent: bool) -> Value {
     })
 }
 
+/// What pruning one worktree did. `status` is one of `removed`,
+/// `would_remove` (dry run), `removed_branch_kept`, `skipped` or `failed`;
+/// `reason` is set for everything but a clean `removed`/`would_remove`.
+struct PruneOutcome {
+    status: &'static str,
+    reason: Option<String>,
+    branch_deleted: Option<bool>,
+    reaped: Vec<i32>,
+    cleanup_error: Option<String>,
+}
+
+impl PruneOutcome {
+    fn new(status: &'static str, reason: Option<String>) -> Self {
+        Self {
+            status,
+            reason,
+            branch_deleted: None,
+            reaped: Vec::new(),
+            cleanup_error: None,
+        }
+    }
+}
+
+fn prune_one(
+    repo_path: &str,
+    anchor: &std::path::Path,
+    default_base: &str,
+    wt: &crate::engine::worktree::WorktreeInfo,
+    force: bool,
+    dry_run: bool,
+    reap: bool,
+) -> PruneOutcome {
+    let skipped = |reason: String| PruneOutcome::new("skipped", Some(reason));
+    if !force {
+        // A check that could not run is a skip with its error, never a pass.
+        match crate::engine::worktree::user_changed_paths(&wt.path) {
+            Err(e) => {
+                return skipped(format!(
+                    "could not read the worktree's status: {}",
+                    e.message()
+                ))
+            }
+            Ok((dirty, _)) if !dirty.is_empty() => {
+                return skipped("the worktree has uncommitted changes".to_string())
+            }
+            Ok(_) => {}
+        }
+        let Some(branch) = wt.branch.as_deref() else {
+            return skipped("detached HEAD: no branch to verify as integrated".to_string());
+        };
+        match crate::engine::worktree::verify_branch_integration(anchor, branch, default_base) {
+            Err(e) => {
+                return skipped(format!(
+                    "the integration check could not run: {}",
+                    e.message()
+                ))
+            }
+            Ok(v) if !v.is_integrated => {
+                return skipped(format!("branch is not integrated into {default_base}"))
+            }
+            Ok(_) => {}
+        }
+    }
+    let remove_argv = crate::engine::worktree::remove_worktree_argv(&wt.path, force);
+    let remove_refs: Vec<&str> = remove_argv.iter().map(String::as_str).collect();
+    if let Err(e) = crate::harness::guard_command(repo_path, &remove_refs) {
+        return PruneOutcome::new("failed", Some(format!("refused by the command gate: {e}")));
+    }
+    let mut reaped = Vec::new();
+    if reap {
+        match crate::engine::worktree::reap_processes_in_dir(
+            std::path::Path::new(&wt.path),
+            dry_run,
+        ) {
+            Ok(r) => reaped = r.pids_terminated,
+            Err(e) => {
+                return PruneOutcome::new(
+                    "failed",
+                    Some(format!("could not reap processes: {}", e.message())),
+                )
+            }
+        }
+    } else {
+        // Not removing a worktree out from under a process that is working in it.
+        match crate::sysload::procscan::working_in(std::path::Path::new(&wt.path)) {
+            Err(e) => return skipped(format!("could not check for live processes: {e}")),
+            Ok(pids) if !pids.is_empty() => {
+                return skipped(format!(
+                    "{} live process(es) have their working directory inside (pids {pids:?}); \
+                     stop them, or pass reap_processes: true to terminate them",
+                    pids.len()
+                ))
+            }
+            Ok(_) => {}
+        }
+    }
+    if dry_run {
+        let mut out = PruneOutcome::new("would_remove", None);
+        out.reaped = reaped;
+        return out;
+    }
+    let removal = match crate::engine::worktree::remove_worktree(repo_path, &wt.path, force) {
+        Ok(r) => r,
+        Err(e) => {
+            let mut out = PruneOutcome::new("failed", Some(e.into_message()));
+            out.reaped = reaped;
+            return out;
+        }
+    };
+    let mut out = PruneOutcome::new("removed", None);
+    out.reaped = reaped;
+    out.cleanup_error = removal.cleanup_error;
+    if let Some(br) = wt.branch.as_deref() {
+        let deleted = crate::harness::guard_command(repo_path, &["git", "branch", "-D", br])
+            .map_err(|e| format!("refused by the command gate: {e}"))
+            .and_then(|_| {
+                crate::engine::git_cli::git_text(anchor, &["branch", "-D", br])
+                    .map(drop)
+                    .map_err(|e| e.message().to_string())
+            });
+        match deleted {
+            Ok(()) => out.branch_deleted = Some(true),
+            Err(reason) => {
+                out.status = "removed_branch_kept";
+                out.branch_deleted = Some(false);
+                out.reason = Some(format!("branch {br} was kept: {reason}"));
+            }
+        }
+    }
+    out
+}
+
+/// The overlay's dirty-file count for a worktree and the error that stopped it:
+/// exactly one of the two is `Some`.
+fn overlay_dirty_files(worktree: Option<&str>) -> (Option<usize>, Option<String>) {
+    let Some(path) = worktree else {
+        return (None, Some("worktree path is not valid UTF-8".to_string()));
+    };
+    match crate::codeintel::sync_worktree_overlay(path) {
+        Ok(r) => (Some(r.modified_files + r.tombstoned_files), None),
+        Err(e) => (None, Some(e.into_message())),
+    }
+}
+
 pub(crate) fn mutating_tool(
     name: &str,
     title: &str,
@@ -289,6 +433,13 @@ pub(crate) fn mutating_tool(
         "outputSchema": output,
         "annotations": mutating_tool_annotations(idempotent)
     })
+}
+
+/// A tool that runs a caller-supplied command (`sh -c`) over content from the
+/// repository: it reaches beyond its declared arguments, so it is open-world.
+fn open_world(mut tool: Value) -> Value {
+    tool["annotations"]["openWorldHint"] = json!(true);
+    tool
 }
 
 /// A mutating tool that removes something. MCP clients gate their own
@@ -659,7 +810,7 @@ tool_args! {
     struct WorktreePruneArgs {
         repo_path: String = repo_spec(),
         branch: Option<String> = path_spec("Optional specific branch to prune. If omitted, prunes all integrated worktrees."),
-        reap_processes: Option<bool> = Spec::flag("Terminate detached background processes running with CWD in the worktree"),
+        reap_processes: Option<bool> = Spec::flag("Terminate detached background processes running with CWD in the worktree. Default false: without it a worktree with a live process inside is skipped, not removed"),
         dry_run: Option<bool> = Spec::flag("Simulate pruning and return prunable status without altering disk"),
         force: Option<bool> = Spec::flag("Force removal of dirty or unmerged worktrees"),
     }
@@ -852,7 +1003,8 @@ fn codeintel_output() -> Value {
             "items": { "type": "array" },
             "total": { "type": "integer" },
             "shown": { "type": "integer" },
-            "truncated": { "type": "boolean" }
+            "truncated": { "type": "boolean" },
+            "overlay_note": { "type": ["string", "null"], "description": "Present when uncommitted-overlay symbols were included by a fallback scan, or the overlay or live change list was unreadable, failed or capped: the answer is then not a plain index read. Not an early stop (that is `walk_incomplete`)." }
         },
         "required": ["available", "source_freshness", "items", "total", "shown", "truncated"]
     })
@@ -1444,10 +1596,10 @@ fn build_tools() -> Vec<Value> {
                 "required": ["ok", "outcome", "item_id", "target_live", "repository", "sources", "added", "escalated", "logs_kept_in_history", "next_step"]
             }),
         ),
-        mutating_tool(
+        open_world(mutating_tool(
             "gitpulse_worktree_create",
             "Create worktree",
-            "Create a new git branch and linked worktree with optional DevMap-guided sparse cone checkout, zero-copy shared base graph, parallel CoW build-cache sharing, and policy-gated lifecycle command execution",
+            "Create a new git branch and linked worktree with optional DevMap-guided sparse cone checkout, zero-copy shared base graph, parallel CoW build-cache sharing, and policy-gated lifecycle command execution. The result reports what happened, not what was asked: `cache_shared`, `devmap_outcome` and `problems` name every part that failed, and a failing `execute_command` still returns the worktree it ran in (`ok: false`, `command_exit_code`)",
             WorktreeCreateArgs::properties(),
             &WorktreeCreateArgs::required(),
             json!({
@@ -1460,16 +1612,22 @@ fn build_tools() -> Vec<Value> {
                     "devmap_seeded": { "type": "boolean" },
                     "zero_copy_devmap": { "type": "boolean" },
                     "sparse_cone": { "type": ["array", "null"], "items": { "type": "string" } },
-                    "command_output": { "type": ["string", "null"] }
+                    "command_output": { "type": ["string", "null"] },
+                    "cache_error": { "type": ["string", "null"], "description": "Why the build caches were not (all) shared: a copy that failed, or one skipped for want of disk. Null when none was asked for or all were copied" },
+                    "devmap_outcome": { "type": "object", "description": "What seeding the DevMap store did: `status` is `provisioned` (with `zero_copy`), `skipped` (with `reason`) or `failed` (with `error`)" },
+                    "hook_error": { "type": ["string", "null"] },
+                    "command_exit_code": { "type": ["integer", "null"], "description": "Exit status of `execute_command`; null when none was given or it did not run to an exit" },
+                    "command_error": { "type": ["string", "null"], "description": "Why `execute_command` failed. The worktree and branch exist regardless: `worktree_path` and `branch` are always present" },
+                    "problems": { "type": "array", "items": { "type": "string" }, "description": "Every part of the creation that did not happen; `ok` is true only when this is empty" }
                 },
                 "required": ["ok", "branch", "worktree_path", "cache_shared", "devmap_seeded"]
             }),
             false,
-        ),
+        )),
         mutating_tool(
             "gitpulse_worktree_switch",
             "Switch worktree",
-            "Switch to an existing worktree by branch name or create a new branch and worktree with parallel CoW cache + DevMap seeding if absent",
+            "Switch to an existing worktree by branch name, or with create_if_missing create a new branch and worktree with parallel CoW cache + DevMap seeding. Creating fails when the branch already exists without a worktree; not idempotent because it can create",
             WorktreeSwitchArgs::properties(),
             &WorktreeSwitchArgs::required(),
             json!({
@@ -1479,11 +1637,15 @@ fn build_tools() -> Vec<Value> {
                     "branch": { "type": "string" },
                     "worktree_path": { "type": "string" },
                     "created": { "type": "boolean" },
-                    "devmap_seeded": { "type": "boolean" }
+                    "devmap_seeded": { "type": "boolean" },
+                    "devmap_outcome": { "type": "object" },
+                    "cache_error": { "type": ["string", "null"] },
+                    "hook_error": { "type": ["string", "null"] },
+                    "problem": { "type": ["string", "null"], "description": "Every part of the creation that did not happen, joined; null when `ok`" }
                 },
                 "required": ["ok", "branch", "worktree_path", "created", "devmap_seeded"]
             }),
-            true,
+            false,
         ),
         mutating_tool(
             "gitpulse_worktree_isolate",
@@ -1500,16 +1662,17 @@ fn build_tools() -> Vec<Value> {
                     "cache_error": { "type": ["string", "null"] },
                     "devmap_seeded": { "type": "boolean" },
                     "devmap_mode": { "type": "string" },
-                    "overlay_dirty_files": { "type": "integer", "minimum": 0 }
+                    "overlay_dirty_files": { "type": ["integer", "null"], "minimum": 0, "description": "Files the overlay holds as modified or deleted. Null when the overlay sync failed (see `overlay_error`): zero means it was read and nothing was dirty" },
+                    "overlay_error": { "type": ["string", "null"] }
                 },
-                "required": ["ok", "worktree_path", "caches_cloned", "devmap_seeded", "devmap_mode", "overlay_dirty_files"]
+                "required": ["ok", "worktree_path", "caches_cloned", "devmap_seeded", "devmap_mode", "overlay_dirty_files", "overlay_error"]
             }),
             true,
         ),
         destructive_tool(
             "gitpulse_worktree_prune",
             "Prune worktrees",
-            "Safely prune worktrees and delete branches verified as integrated via 6-point check, optionally reaping detached processes",
+            "Safely prune worktrees and delete branches verified as integrated via 6-point check. A worktree with a live process working inside it is skipped with the reason unless reap_processes is true (opt-in: it terminates those processes). Every worktree gets its own outcome in `outcomes` (removed, would_remove, removed_branch_kept, skipped or failed, with why); one failing never aborts the rest. In a dry run `pruned_worktrees` lists what would be removed",
             WorktreePruneArgs::properties(),
             &WorktreePruneArgs::required(),
             json!({
@@ -1518,9 +1681,25 @@ fn build_tools() -> Vec<Value> {
                     "ok": { "type": "boolean" },
                     "pruned_worktrees": { "type": "array", "items": { "type": "string" } },
                     "reaped_pids": { "type": "array", "items": { "type": "integer" } },
-                    "dry_run": { "type": "boolean" }
+                    "dry_run": { "type": "boolean" },
+                    "outcomes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "worktree_path": { "type": "string" },
+                                "branch": { "type": ["string", "null"] },
+                                "status": { "type": "string", "enum": ["removed", "would_remove", "removed_branch_kept", "skipped", "failed"] },
+                                "reason": { "type": ["string", "null"] },
+                                "branch_deleted": { "type": ["boolean", "null"] },
+                                "reaped_pids": { "type": "array", "items": { "type": "integer" } },
+                                "cleanup_error": { "type": ["string", "null"] }
+                            },
+                            "required": ["worktree_path", "status"]
+                        }
+                    }
                 },
-                "required": ["ok", "pruned_worktrees", "reaped_pids", "dry_run"]
+                "required": ["ok", "pruned_worktrees", "reaped_pids", "dry_run", "outcomes"]
             }),
         ),
         destructive_tool(
@@ -1753,12 +1932,24 @@ fn build_tools() -> Vec<Value> {
                             ]
                         }
                     },
-                    "truncated": { "type": "boolean" }
+                    "truncated": { "type": "boolean" },
+                    "scan_errors": {
+                        "type": "array",
+                        "description": "Why each unscanned worktree, or skipped layer, produced no answer. `worktrees_unscanned` counts them; a worktree whose directory is missing is unscanned without an entry here.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "worktree": { "type": "string" },
+                                "error": { "type": "string" }
+                            },
+                            "required": ["worktree", "error"]
+                        }
+                    }
                 },
                 "required": [
                     "ok", "repo_path", "worktrees_scanned", "worktrees_unscanned",
                     "lanes_registered", "csr_graph_available", "csr_generation",
-                    "claim_conflicts", "semantic_conflicts", "odb_merge_conflicts", "truncated"
+                    "claim_conflicts", "semantic_conflicts", "odb_merge_conflicts", "truncated", "scan_errors"
                 ]
             }),
         ),
@@ -2453,6 +2644,12 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             let a: WorktreeCreateArgs = parse(name, arguments)?;
             crate::repository_trust::require(std::path::Path::new(&a.repo_path))
                 .map_err(CommandError::into_message)?;
+            crate::engine::git_writer::validate_ref_name(&a.branch)
+                .map_err(CommandError::into_message)?;
+            if let Some(base) = a.base.as_deref() {
+                crate::engine::git_writer::validate_ref_name(base)
+                    .map_err(CommandError::into_message)?;
+            }
             let share_cache = a.share_cache.unwrap_or(true);
             let zero_copy = a.zero_copy.unwrap_or(false);
             let target_path = crate::engine::worktree::resolve_worktree_path_for_branch(
@@ -2472,8 +2669,30 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             );
             let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
             crate::harness::guard_command(&a.repo_path, &argv_refs)?;
+            // The command is judged before anything exists, so a refusal
+            // leaves no worktree, branch or cache behind.
+            #[cfg(unix)]
+            let command_argv: Option<Vec<&str>> = a
+                .execute_command
+                .as_deref()
+                .map(|cmd| vec!["sh", "-c", cmd]);
+            #[cfg(windows)]
+            let command_argv: Option<Vec<&str>> = a
+                .execute_command
+                .as_deref()
+                .map(|cmd| vec!["cmd", "/C", cmd]);
+            if let Some(argv) = command_argv.as_deref() {
+                crate::harness::guard_command(&a.repo_path, argv)?;
+            }
 
-            let (worktree_path, devmap_seeded, zero_copy_devmap, sparse_cone) =
+            let mut gate = |args: &[&str]| -> Result<(), CommandError> {
+                let argv: Vec<&str> = std::iter::once("git").chain(args.iter().copied()).collect();
+                crate::harness::guard_command(&a.repo_path, &argv)
+                    .map(|_| ())
+                    .map_err(CommandError::plain)
+            };
+            let selection = crate::engine::cow_clone::CacheSelection::default();
+            let (worktree_path, devmap, sparse_cone, cache_error, low_disk, hook_error) =
                 if let Some(ref sparse) = a.sparse_paths.filter(|p| !p.is_empty()) {
                     let created = crate::engine::worktree::add_sparse_worktree_zero_copy(
                         &a.repo_path,
@@ -2482,124 +2701,118 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                         a.base.as_deref(),
                         sparse,
                         share_cache,
+                        &mut gate,
                     )
                     .map_err(CommandError::into_message)?;
                     (
                         created.path,
-                        created.zero_copy_devmap,
-                        created.zero_copy_devmap,
+                        created.devmap,
                         Some(created.materialized_cone_dirs),
+                        created.cache_error,
+                        None,
+                        None,
                     )
-                } else if zero_copy {
-                    let path = crate::engine::worktree::add_worktree(
-                        &a.repo_path,
-                        target_str,
-                        Some(&a.branch),
-                        a.base.as_deref(),
-                        false,
-                    )
-                    .map_err(CommandError::into_message)?;
-                    let mut zc_seeded = false;
-                    if let Ok(family) =
-                        crate::engine::worktree::resolve_worktree_family(&a.repo_path, &path)
-                    {
-                        let selection = crate::engine::cow_clone::CacheSelection::default();
-                        let (_, dev_res) = std::thread::scope(|scope| {
-                            let c = scope.spawn(|| {
-                                if share_cache {
-                                    let _ = crate::engine::cow_clone::clone_ignored_caches(
-                                        &family.anchor,
-                                        &family.worktree,
-                                        &selection,
-                                    );
-                                }
-                            });
-                            let d = scope.spawn(|| {
-                                crate::codeintel::provision_worktree_devmap_zero_copy(
-                                    &family.anchor,
-                                    &family.worktree,
-                                )
-                            });
-                            let _ = c.join();
-                            ((), d.join().ok().and_then(Result::ok))
-                        });
-                        if let Some(p) = dev_res {
-                            zc_seeded = p.seeded && p.zero_copy_base_ref;
-                        }
-                    }
-                    (path, zc_seeded, zc_seeded, None)
                 } else {
-                    let created = crate::engine::worktree::add_worktree_extended(
+                    // Zero-copy takes no hooks; the default path runs the
+                    // repository's approved `post_create` ones.
+                    let created = crate::engine::worktree::add_worktree_with_devmap(
                         &a.repo_path,
                         target_str,
                         Some(&a.branch),
                         a.base.as_deref(),
                         false,
-                        share_cache,
-                        true,
+                        share_cache.then_some(&selection),
+                        !zero_copy,
+                        if zero_copy {
+                            crate::engine::worktree::DevmapMode::ZeroCopy
+                        } else {
+                            crate::engine::worktree::DevmapMode::Copy
+                        },
                     )
                     .map_err(CommandError::into_message)?;
-                    if !share_cache {
-                        if let Ok(family) = crate::engine::worktree::resolve_worktree_family(
-                            &a.repo_path,
-                            &created.path,
-                        ) {
-                            let _ = crate::codeintel::provision_worktree_devmap(
-                                &family.anchor,
-                                &family.worktree,
-                            );
-                        }
-                    }
-                    let seeded = devmap_query::paths::store_path(std::path::Path::new(
-                        &created.path,
-                    ))
-                    .is_file();
-                    (created.path, seeded, false, None)
+                    (
+                        created.path,
+                        created.devmap,
+                        None,
+                        created.cache_error,
+                        created.low_disk.map(|l| l.message()),
+                        created.hook_error,
+                    )
                 };
 
-            let mut cmd_out = None;
-            if let Some(cmd) = a.execute_command {
-                #[cfg(unix)]
-                let (prog, prog_args): (&str, [&str; 2]) = ("sh", ["-c", cmd.as_str()]);
-                #[cfg(windows)]
-                let (prog, prog_args): (&str, [&str; 2]) = ("cmd", ["/C", cmd.as_str()]);
-                let mut guard_argv = vec![prog];
-                guard_argv.extend_from_slice(&prog_args);
-                crate::harness::guard_command(&worktree_path, &guard_argv)?;
-                let output = crate::engine::git_cli::capture_command(
-                    prog,
-                    &prog_args,
+            // From here the worktree exists: nothing below returns an error
+            // that would hide it. A command that failed is reported in the
+            // result, next to the path and branch it ran in.
+            let mut command_output = None;
+            let mut command_exit_code = None;
+            let mut command_error = None;
+            if let Some(argv) = command_argv.as_deref() {
+                match crate::engine::git_cli::capture_command(
+                    argv[0],
+                    &argv[1..],
                     Some(std::path::Path::new(&worktree_path)),
                     std::time::Duration::from_secs(60),
                     &[],
-                )
-                .map_err(CommandError::into_message)?;
-                let mut combined = output.stdout_text();
-                if !output.success {
-                    let stderr = output.stderr_text();
-                    if !stderr.is_empty() {
-                        if !combined.is_empty() && !combined.ends_with('\n') {
-                            combined.push('\n');
+                ) {
+                    Ok(output) => {
+                        let mut combined = output.stdout_text();
+                        if !output.success {
+                            let stderr = output.stderr_text();
+                            if !stderr.is_empty() {
+                                if !combined.is_empty() && !combined.ends_with('\n') {
+                                    combined.push('\n');
+                                }
+                                combined.push_str(&stderr);
+                            }
+                            command_error = Some(format!(
+                                "execute_command exited with status {}",
+                                output.status_code
+                            ));
                         }
-                        combined.push_str(&stderr);
+                        command_exit_code = Some(output.status_code);
+                        command_output = Some(combined);
                     }
-                    return Err(format!(
-                        "execute_command exited with status {}: {}",
-                        output.status_code,
-                        combined.trim()
-                    ));
+                    Err(e) => command_error = Some(e.into_message()),
                 }
-                cmd_out = Some(combined);
             }
+            let mut problems = Vec::new();
+            if let Some(e) = &cache_error {
+                problems.push(format!("build caches: {e}"));
+            }
+            if let Some(e) = devmap.error() {
+                problems.push(format!("devmap: {e}"));
+            }
+            if let Some(e) = &hook_error {
+                problems.push(format!("post_create hook: {e}"));
+            }
+            if let Some(e) = &command_error {
+                problems.push(e.clone());
+            }
+            let devmap_seeded = matches!(
+                devmap,
+                crate::engine::worktree::DevmapOutcome::Provisioned { .. }
+            );
+            let zero_copy_devmap = matches!(
+                devmap,
+                crate::engine::worktree::DevmapOutcome::Provisioned { zero_copy: true }
+            );
             Ok(json!({
-                "ok": true,
+                "ok": problems.is_empty(),
                 "branch": a.branch,
                 "worktree_path": worktree_path,
-                "cache_shared": share_cache,
+                // What happened, not what was asked for: true only when the
+                // caches were requested, none failed and none were skipped for disk.
+                "cache_shared": share_cache && cache_error.is_none() && low_disk.is_none(),
+                "cache_error": cache_error.or(low_disk),
                 "devmap_seeded": devmap_seeded,
+                "devmap_outcome": devmap,
                 "zero_copy_devmap": zero_copy_devmap,
                 "sparse_cone": sparse_cone,
-                "command_output": cmd_out
+                "hook_error": hook_error,
+                "command_output": command_output,
+                "command_exit_code": command_exit_code,
+                "command_error": command_error,
+                "problems": problems
             }))
         }
         "gitpulse_worktree_switch" => {
@@ -2612,9 +2825,9 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 .iter()
                 .find(|w| w.branch.as_deref() == Some(&a.branch))
             {
-                let devmap_seeded =
-                    devmap_query::paths::store_path(std::path::Path::new(&wt.path)).is_file()
-                        || crate::codeintel::zero_copy_base_ref_path(&wt.path).is_file();
+                let devmap_seeded = devmap_query::paths::store_path(std::path::Path::new(&wt.path))
+                    .is_file()
+                    || crate::codeintel::zero_copy_base_ref_path(&wt.path).is_file();
                 return Ok(json!({
                     "ok": true,
                     "branch": a.branch,
@@ -2624,6 +2837,12 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 }));
             }
             if a.create_if_missing.unwrap_or(false) {
+                crate::engine::git_writer::validate_ref_name(&a.branch)
+                    .map_err(CommandError::into_message)?;
+                if let Some(base) = a.base.as_deref() {
+                    crate::engine::git_writer::validate_ref_name(base)
+                        .map_err(CommandError::into_message)?;
+                }
                 let target_path = crate::engine::worktree::resolve_worktree_path_for_branch(
                     &a.repo_path,
                     &a.branch,
@@ -2641,24 +2860,42 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 );
                 let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
                 crate::harness::guard_command(&a.repo_path, &argv_refs)?;
-                let created = crate::engine::worktree::add_worktree_extended(
+                let selection = crate::engine::cow_clone::CacheSelection::default();
+                let created = crate::engine::worktree::add_worktree_with_devmap(
                     &a.repo_path,
                     target_str,
                     Some(&a.branch),
                     a.base.as_deref(),
                     false,
+                    Some(&selection),
                     true,
-                    true,
+                    crate::engine::worktree::DevmapMode::Copy,
                 )
                 .map_err(CommandError::into_message)?;
-                let devmap_seeded =
-                    devmap_query::paths::store_path(std::path::Path::new(&created.path)).is_file();
+                let devmap_seeded = matches!(
+                    created.devmap,
+                    crate::engine::worktree::DevmapOutcome::Provisioned { .. }
+                );
+                let mut problems = Vec::new();
+                if let Some(e) = &created.cache_error {
+                    problems.push(format!("build caches: {e}"));
+                }
+                if let Some(e) = created.devmap.error() {
+                    problems.push(format!("devmap: {e}"));
+                }
+                if let Some(e) = &created.hook_error {
+                    problems.push(format!("post_create hook: {e}"));
+                }
                 return Ok(json!({
-                    "ok": true,
+                    "ok": problems.is_empty(),
                     "branch": a.branch,
                     "worktree_path": created.path,
                     "created": true,
-                    "devmap_seeded": devmap_seeded
+                    "devmap_seeded": devmap_seeded,
+                    "devmap_outcome": created.devmap,
+                    "cache_error": created.cache_error,
+                    "hook_error": created.hook_error,
+                    "problem": (!problems.is_empty()).then(|| problems.join("; "))
                 }));
             }
             Err(format!("worktree for branch {:?} does not exist", a.branch))
@@ -2667,16 +2904,15 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             let a: WorktreeIsolateArgs = parse(name, arguments)?;
             crate::repository_trust::require(std::path::Path::new(&a.repo_path))
                 .map_err(CommandError::into_message)?;
-            let family = crate::engine::worktree::resolve_worktree_family(
-                &a.repo_path,
-                &a.worktree_path,
-            )
-            .map_err(CommandError::into_message)?;
+            let family =
+                crate::engine::worktree::resolve_worktree_family(&a.repo_path, &a.worktree_path)
+                    .map_err(CommandError::into_message)?;
             crate::harness::guard_command(&a.repo_path, &["git", "worktree", "list"])?;
             let zero_copy = a.zero_copy.unwrap_or(false);
-            let include_virtualenvs = a.cache_directories.as_ref().is_some_and(|dirs| {
-                dirs.iter().any(|d| d == ".venv" || d == "venv")
-            });
+            let include_virtualenvs = a
+                .cache_directories
+                .as_ref()
+                .is_some_and(|dirs| dirs.iter().any(|d| d == ".venv" || d == "venv"));
             let selection = crate::engine::cow_clone::CacheSelection {
                 include_virtualenvs,
                 ..Default::default()
@@ -2702,18 +2938,25 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 });
                 (c, d)
             });
-            let report = cache_res.map_err(CommandError::into_message)?;
-            let caches_cloned: Vec<String> = report
-                .copied
-                .iter()
-                .filter_map(|r| {
-                    std::path::Path::new(&r.destination)
-                        .file_name()?
-                        .to_str()
-                        .map(str::to_owned)
-                })
-                .collect();
-            let (devmap_seeded, devmap_mode) = match devmap_res {
+            // A cache copy that failed is reported, not raised: the devmap and
+            // overlay work below already happened and must not be hidden by an Err.
+            let (caches_cloned, cache_error): (Vec<String>, Option<String>) = match cache_res {
+                Ok(report) => (
+                    report
+                        .copied
+                        .iter()
+                        .filter_map(|r| {
+                            std::path::Path::new(&r.destination)
+                                .file_name()?
+                                .to_str()
+                                .map(str::to_owned)
+                        })
+                        .collect(),
+                    report.error(),
+                ),
+                Err(e) => (Vec::new(), Some(e.into_message())),
+            };
+            let (devmap_seeded, devmap_mode, devmap_failed) = match devmap_res {
                 Ok(p) => {
                     let mode = if !p.seeded {
                         p.reason.unwrap_or_else(|| "not_seeded".to_string())
@@ -2726,23 +2969,22 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                     } else {
                         "byte_copy".to_string()
                     };
-                    (p.seeded, mode)
+                    (p.seeded, mode, false)
                 }
-                Err(e) => (false, format!("failed: {}", e.message())),
+                Err(e) => (false, format!("failed: {}", e.message()), true),
             };
-            let overlay_dirty = target
-                .to_str()
-                .and_then(|s| crate::codeintel::sync_worktree_overlay(s).ok())
-                .map(|r| r.modified_files + r.tombstoned_files)
-                .unwrap_or(0);
+            // A sync that failed is `null` with its error, never 0: zero means
+            // the overlay was read and nothing was dirty.
+            let (overlay_dirty, overlay_error) = overlay_dirty_files(target.to_str());
             Ok(json!({
-                "ok": true,
+                "ok": cache_error.is_none() && !devmap_failed && overlay_error.is_none(),
                 "worktree_path": a.worktree_path,
                 "caches_cloned": caches_cloned,
-                "cache_error": report.error(),
+                "cache_error": cache_error,
                 "devmap_seeded": devmap_seeded,
                 "devmap_mode": devmap_mode,
-                "overlay_dirty_files": overlay_dirty
+                "overlay_dirty_files": overlay_dirty,
+                "overlay_error": overlay_error
             }))
         }
         "gitpulse_worktree_prune" => {
@@ -2751,7 +2993,9 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 .map_err(CommandError::into_message)?;
             let dry_run = a.dry_run.unwrap_or(false);
             let force = a.force.unwrap_or(false);
-            let reap = a.reap_processes.unwrap_or(true);
+            // Opt-in: signalling processes by where they stand can take out
+            // another agent's cargo or dev server.
+            let reap = a.reap_processes.unwrap_or(false);
             let family =
                 crate::engine::worktree::resolve_worktree_family(&a.repo_path, &a.repo_path)
                     .map_err(CommandError::into_message)?;
@@ -2765,7 +3009,11 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 .map_err(CommandError::into_message)?;
             let mut pruned = Vec::new();
             let mut all_reaped = Vec::new();
+            let mut outcomes = Vec::new();
+            let mut all_clean = true;
 
+            // One worktree failing never aborts the others, and every one
+            // reports what happened to it.
             for wt in worktrees {
                 if wt.is_main {
                     continue;
@@ -2775,55 +3023,41 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                         continue;
                     }
                 }
-                let mut prunable = force;
-                if !prunable {
-                    let is_clean = crate::engine::worktree::user_changed_paths(&wt.path)
-                        .is_ok_and(|(dirty, _)| dirty.is_empty());
-                    if is_clean {
-                        if let Some(br) = wt.branch.as_deref() {
-                            if let Ok(verif) = crate::engine::worktree::verify_branch_integration(
-                                &anchor,
-                                br,
-                                &default_base,
-                            ) {
-                                prunable = verif.is_integrated;
-                            }
-                        }
-                    }
+                let outcome = prune_one(
+                    &a.repo_path,
+                    &anchor,
+                    &default_base,
+                    &wt,
+                    force,
+                    dry_run,
+                    reap,
+                );
+                if matches!(
+                    outcome.status,
+                    "removed" | "removed_branch_kept" | "would_remove"
+                ) {
+                    pruned.push(wt.path.clone());
                 }
-                if prunable {
-                    let remove_argv =
-                        crate::engine::worktree::remove_worktree_argv(&wt.path, force);
-                    let remove_refs: Vec<&str> = remove_argv.iter().map(String::as_str).collect();
-                    crate::harness::guard_command(&a.repo_path, &remove_refs)?;
-                    if reap {
-                        let r = crate::engine::worktree::reap_processes_in_dir(
-                            std::path::Path::new(&wt.path),
-                            dry_run,
-                        )
-                        .map_err(CommandError::into_message)?;
-                        all_reaped.extend(r.pids_terminated);
-                    }
-                    if !dry_run {
-                        crate::engine::worktree::remove_worktree(&a.repo_path, &wt.path, force)
-                            .map_err(CommandError::into_message)?;
-                        if let Some(br) = wt.branch.as_deref() {
-                            crate::harness::guard_command(
-                                &a.repo_path,
-                                &["git", "branch", "-D", br],
-                            )?;
-                            let _ =
-                                crate::engine::git_cli::git_text(&anchor, &["branch", "-D", br]);
-                        }
-                    }
-                    pruned.push(wt.path);
+                if matches!(outcome.status, "failed" | "removed_branch_kept") {
+                    all_clean = false;
                 }
+                all_reaped.extend(outcome.reaped.iter().copied());
+                outcomes.push(json!({
+                    "worktree_path": wt.path,
+                    "branch": wt.branch,
+                    "status": outcome.status,
+                    "reason": outcome.reason,
+                    "branch_deleted": outcome.branch_deleted,
+                    "reaped_pids": outcome.reaped,
+                    "cleanup_error": outcome.cleanup_error
+                }));
             }
             Ok(json!({
-                "ok": true,
+                "ok": all_clean,
                 "pruned_worktrees": pruned,
                 "reaped_pids": all_reaped,
-                "dry_run": dry_run
+                "dry_run": dry_run,
+                "outcomes": outcomes
             }))
         }
         "gitpulse_worktree_merge" => {
@@ -2945,7 +3179,9 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 "claim_conflicts": report.claim_conflicts,
                 "semantic_conflicts": report.semantic_conflicts,
                 "odb_merge_conflicts": report.odb_merge_conflicts,
-                "truncated": report.truncated
+                "truncated": report.truncated,
+                // Depends on zc/fix-engine 9b404787 (RadarReport::scan_errors).
+                "scan_errors": report.scan_errors
             }))
         }
         "gitpulse_worktree_overlay_sync" => {
@@ -2953,9 +3189,8 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             crate::repository_trust::require(std::path::Path::new(&a.repo_path))
                 .map_err(CommandError::into_message)?;
             let target_arg = a.worktree_path.as_deref().unwrap_or(&a.repo_path);
-            let family =
-                crate::engine::worktree::resolve_worktree_family(&a.repo_path, target_arg)
-                    .map_err(CommandError::into_message)?;
+            let family = crate::engine::worktree::resolve_worktree_family(&a.repo_path, target_arg)
+                .map_err(CommandError::into_message)?;
             crate::harness::guard_command(&a.repo_path, &["git", "status", "--porcelain=v1"])?;
             let target_str = family
                 .worktree
@@ -4871,11 +5106,26 @@ mod tests {
         ("gitpulse_add_task", "one task record back, no list"),
         ("gitpulse_complete_task", "one task record back, no list"),
         ("gitpulse_delete_task", "one deletion receipt, no list"),
-        ("gitpulse_worktree_switch", "one worktree switch receipt, no list"),
-        ("gitpulse_worktree_merge", "one merge pipeline receipt, no list"),
-        ("gitpulse_worktree_release", "one lane release receipt, no list"),
-        ("gitpulse_worktree_send_message", "one coordination message receipt, no list"),
-        ("gitpulse_worktree_overlay_sync", "one worktree overlay sync report, no list"),
+        (
+            "gitpulse_worktree_switch",
+            "one worktree switch receipt, no list",
+        ),
+        (
+            "gitpulse_worktree_merge",
+            "one merge pipeline receipt, no list",
+        ),
+        (
+            "gitpulse_worktree_release",
+            "one lane release receipt, no list",
+        ),
+        (
+            "gitpulse_worktree_send_message",
+            "one coordination message receipt, no list",
+        ),
+        (
+            "gitpulse_worktree_overlay_sync",
+            "one worktree overlay sync report, no list",
+        ),
         ("gitpulse_provenance", "one provenance record, no list"),
         ("gitpulse_landed", "one landing record, no list"),
         ("devmap_status", "one status envelope, no list"),
@@ -5207,7 +5457,14 @@ mod tests {
         git(&["init", "-q", "-b", "main", &wt_repo]);
         git(&["-C", &wt_repo, "config", "user.name", "Schema Probe"]);
         git(&["-C", &wt_repo, "config", "user.email", "probe@example.com"]);
-        git(&["-C", &wt_repo, "add", ".gitignore", "README.md", "src/lib.rs"]);
+        git(&[
+            "-C",
+            &wt_repo,
+            "add",
+            ".gitignore",
+            "README.md",
+            "src/lib.rs",
+        ]);
         git(&[
             "-C",
             &wt_repo,
@@ -9002,8 +9259,11 @@ mod tests {
         let sandbox = tempfile::tempdir().expect("sandbox");
         let anchor_dir = sandbox.path().join("coord-repo");
         std::fs::create_dir_all(anchor_dir.join("src")).expect("mkdir src");
-        std::fs::write(anchor_dir.join("src/auth.rs"), "pub fn verify() -> bool { true }\n")
-            .expect("write auth.rs");
+        std::fs::write(
+            anchor_dir.join("src/auth.rs"),
+            "pub fn verify() -> bool { true }\n",
+        )
+        .expect("write auth.rs");
         let anchor = anchor_dir.to_string_lossy().into_owned();
         let git = |args: &[&str]| {
             let out = std::process::Command::new("git")
@@ -9183,8 +9443,174 @@ mod tests {
         let (err, radar_after) =
             tool_json("gitpulse_worktree_radar", json!({ "repo_path": anchor }));
         assert!(!err, "{radar_after}");
+        // Depends on zc/fix-engine 9b404787: a failed per-worktree scan is
+        // carried to the client with its reason, never only counted.
+        assert!(radar_after["scan_errors"].is_array(), "{radar_after}");
         assert_eq!(radar_after["lanes_registered"], 1);
         assert_eq!(radar_after["claim_conflicts"].as_array().unwrap().len(), 0);
+    }
+
+    /// A trusted one-commit repository for the worktree-tool honesty tests.
+    fn honesty_repo() -> (tempfile::TempDir, String) {
+        let sandbox = tempfile::tempdir().expect("sandbox");
+        let dir = sandbox.path().join("honesty-repo");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("a.txt"), "a\n").expect("write");
+        let repo = dir.to_string_lossy().into_owned();
+        git_ok(&["init", "-q", "-b", "main", &repo]);
+        git_ok(&["-C", &repo, "add", "a.txt"]);
+        git_ok(&[
+            "-C",
+            &repo,
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        crate::test_support::trust_repo(&dir);
+        (sandbox, repo)
+    }
+
+    fn git_ok(args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .output_locked()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn create_lane(repo: &str, branch: &str) -> String {
+        let (err, created) = tool_json(
+            "gitpulse_worktree_create",
+            json!({ "repo_path": repo, "branch": branch, "share_cache": false }),
+        );
+        assert!(!err, "create {branch}: {created}");
+        created["worktree_path"].as_str().expect("path").to_string()
+    }
+
+    #[test]
+    fn prune_does_not_signal_or_remove_a_worktree_with_a_live_process_by_default() {
+        let (_sandbox, repo) = honesty_repo();
+        let wt = create_lane(&repo, "feat/busy");
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .current_dir(&wt)
+            .spawn_locked()
+            .expect("spawn sleep");
+        let (err, out) = tool_json("gitpulse_worktree_prune", json!({ "repo_path": repo }));
+        let still_running = child.try_wait().expect("try_wait").is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!err, "{out}");
+        assert!(
+            still_running,
+            "prune signalled a process it did not start: {out}"
+        );
+        assert!(
+            std::path::Path::new(&wt).is_dir(),
+            "worktree removed under a live process: {out}"
+        );
+        let outcome = out["outcomes"]
+            .as_array()
+            .and_then(|o| o.iter().find(|o| o["worktree_path"] == wt.as_str()))
+            .unwrap_or_else(|| panic!("no outcome for the busy worktree: {out}"));
+        assert_eq!(outcome["status"], "skipped", "{out}");
+        assert!(
+            outcome["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("process")),
+            "{out}"
+        );
+        assert_eq!(out["reaped_pids"], json!([]));
+    }
+
+    #[test]
+    fn prune_reports_a_kept_branch_and_keeps_going_when_branch_delete_fails() {
+        let (_sandbox, repo) = honesty_repo();
+        let stuck = create_lane(&repo, "feat/stuck");
+        let other = create_lane(&repo, "feat/other");
+        // A held ref lock makes `git branch -D feat/stuck` fail after its worktree is gone.
+        std::fs::write(
+            std::path::Path::new(&repo).join(".git/refs/heads/feat/stuck.lock"),
+            "",
+        )
+        .expect("lock the ref");
+        let (err, out) = tool_json("gitpulse_worktree_prune", json!({ "repo_path": repo }));
+        assert!(!err, "{out}");
+        let find = |path: &str| {
+            out["outcomes"]
+                .as_array()
+                .and_then(|o| o.iter().find(|o| o["worktree_path"] == path))
+                .unwrap_or_else(|| panic!("no outcome for {path}: {out}"))
+                .clone()
+        };
+        let stuck_outcome = find(&stuck);
+        assert_eq!(stuck_outcome["status"], "removed_branch_kept", "{out}");
+        assert_eq!(stuck_outcome["branch_deleted"], false, "{out}");
+        assert!(
+            stuck_outcome["reason"]
+                .as_str()
+                .is_some_and(|r| !r.is_empty()),
+            "{out}"
+        );
+        assert_eq!(find(&other)["status"], "removed", "{out}");
+        assert_eq!(find(&other)["branch_deleted"], true, "{out}");
+        assert_eq!(
+            out["ok"], false,
+            "a kept branch is not a clean prune: {out}"
+        );
+    }
+
+    #[test]
+    fn create_with_a_failing_command_still_returns_the_worktree_it_made() {
+        let (_sandbox, repo) = honesty_repo();
+        let (err, out) = tool_json(
+            "gitpulse_worktree_create",
+            json!({
+                "repo_path": repo,
+                "branch": "feat/cmd-fails",
+                "share_cache": false,
+                "execute_command": "echo boom >&2; exit 3"
+            }),
+        );
+        assert!(
+            !err,
+            "side effects exist, so this is a result, not an error: {out}"
+        );
+        let path = out["worktree_path"]
+            .as_str()
+            .expect("worktree_path in result");
+        assert!(std::path::Path::new(path).is_dir());
+        assert_eq!(out["branch"], "feat/cmd-fails");
+        assert_eq!(out["ok"], false, "{out}");
+        assert_eq!(out["command_exit_code"], 3, "{out}");
+        assert!(
+            out["command_output"]
+                .as_str()
+                .is_some_and(|o| o.contains("boom")),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn create_refuses_a_branch_or_base_that_is_not_a_ref_name_before_touching_git() {
+        let (_sandbox, repo) = honesty_repo();
+        for (branch, base) in [("-evil", None), ("ok/branch", Some("--upload-pack=x"))] {
+            let mut args = json!({ "repo_path": repo, "branch": branch, "share_cache": false });
+            if let Some(base) = base {
+                args["base"] = json!(base);
+            }
+            let (err, out) = tool_json("gitpulse_worktree_create", args);
+            assert!(err, "{branch}/{base:?} must be refused: {out}");
+        }
     }
 }
 

@@ -271,7 +271,7 @@ CARGO_INCREMENTAL=0 RUSTC_WRAPPER=gitpulse-rustc cargo check --workspace
 | `gitpulse_worktree_inbox` | Read direct + broadcast coordination messages since `since_seq` | Read-only (`readOnlyHint: true`) |
 | `gitpulse_worktree_radar` | Run 3-layer collision radar (claims + 1-hop CSR call-graph + ODB merge-tree) | Read-only (`readOnlyHint: true`), capped within 64 KiB MCP wire budget |
 | `gitpulse_worktree_merge` | ODB-quarantined squash or merge-commit integration + worktree teardown | Repository trust + harness gate (`destructiveHint: true`) |
-| `gitpulse_worktree_prune` | Reap orphan processes and prune 6-point-integrated worktrees | Repository trust + harness gate (`destructiveHint: true`) |
+| `gitpulse_worktree_prune` | Prune 6-point-integrated worktrees; skips (with a reason) any with a live process inside unless `reap_processes: true` opts in to reaping; per-worktree `outcomes` | Repository trust + harness gate (`destructiveHint: true`) |
 
 ---
 

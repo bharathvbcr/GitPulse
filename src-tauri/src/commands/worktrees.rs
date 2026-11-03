@@ -78,15 +78,28 @@ pub(crate) fn add_worktree_guarded(
         .unwrap_or(&[])
         .iter()
         .any(|s| !s.trim().is_empty());
-    let argv_owned = crate::engine::worktree::add_worktree_argv_configured(
-        target_path,
-        new_branch,
-        start_point,
-        detach,
-        has_sparse,
-    );
-    let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
-    let policy = gate(repo_path, &refs)?;
+    // The plain add is judged here, as one line. A sparse add is a sequence
+    // (add, sparse-checkout, checkout, and an undo on failure), so the engine
+    // hands each git write to the same gate as it runs; the verdict reported is
+    // the first one, the add's.
+    let mut policy = None;
+    if !has_sparse {
+        let argv_owned = crate::engine::worktree::add_worktree_argv_configured(
+            target_path,
+            new_branch,
+            start_point,
+            detach,
+            false,
+        );
+        let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
+        policy = Some(gate(repo_path, &refs)?);
+    }
+    let mut judge = |args: &[&str]| -> Result<(), CommandError> {
+        let argv: Vec<&str> = std::iter::once("git").chain(args.iter().copied()).collect();
+        let verdict = gate(repo_path, &argv)?;
+        policy.get_or_insert(verdict);
+        Ok(())
+    };
     let created = crate::engine::worktree::add_worktree_configured(
         repo_path,
         target_path,
@@ -99,9 +112,12 @@ pub(crate) fn add_worktree_guarded(
         run_hooks,
         zero_copy_devmap,
         sparse_paths,
+        &mut judge,
     )?;
     Ok(Guarded {
-        policy,
+        policy: policy.ok_or_else(|| {
+            CommandError::plain("The worktree was created without being judged by the policy gate.")
+        })?,
         output: created,
     })
 }
@@ -477,9 +493,11 @@ mod tests {
         let zc_wt = std::path::Path::new(&zc_created.output.path);
         crate::test_support::trust_repo(zc_wt);
         assert!(!devmap_query::paths::store_path(zc_wt).exists());
-        assert!(crate::codeintel::load_zero_copy_base_ref(&zc_created.output.path)
-            .expect("load base ref")
-            .is_some());
+        assert!(
+            crate::codeintel::load_zero_copy_base_ref(&zc_created.output.path)
+                .expect("load base ref")
+                .is_some()
+        );
 
         // 3. Sparse cone checkout judges `--no-checkout` and materializes only `pkg/api`.
         let sparse_target = sandbox.path().join("wt-sparse");
@@ -551,4 +569,3 @@ mod tests {
         );
     }
 }
-
