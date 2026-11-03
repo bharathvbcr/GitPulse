@@ -157,7 +157,7 @@ fn the_cap_counts_distinct_cards_not_names() {
     let refs: Vec<&str> = over.iter().map(String::as_str).collect();
     assert_eq!(lineage(&host, &refs).unwrap_err().code, "invalid_input");
     // A request too long to walk is refused unread.
-    let flood: Vec<&str> = std::iter::repeat("a").take(4097).collect();
+    let flood: Vec<&str> = std::iter::repeat_n("a", 4097).collect();
     assert_eq!(lineage(&host, &flood).unwrap_err().code, "invalid_input");
     drop(dir);
 }

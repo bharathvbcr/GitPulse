@@ -308,7 +308,7 @@ fn a_read_before_the_session_ends_reports_the_bytes_dropped_and_not_yet_marked()
     assert_eq!(during["gap_markers"], 0);
     let pending = during["unrecorded_bytes"].as_u64().unwrap_or(0);
     assert!(
-        (1..=199).contains(&(pending / 300)) && pending % 300 == 0,
+        (1..=199).contains(&(pending / 300)) && pending.is_multiple_of(300),
         "a live read hid the bytes already dropped: {during}"
     );
     drop(tap);
