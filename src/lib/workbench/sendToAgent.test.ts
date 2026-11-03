@@ -233,7 +233,7 @@ describe("the host's answers, decoded strictly", () => {
   });
 
   it("keeps the host's error code, so a changed route can be told from a failure", async () => {
-    native.mockRejectedValueOnce({ code: "route_changed", message: "Nothing was sent; read the preview again." });
+    native.mockRejectedValueOnce({ code: "route_changed", message: "This press sent nothing; read the preview again." });
     await expect(sendAgentMessage("run", "hi", "r1", "mailbox")).rejects.toMatchObject({ code: "route_changed" });
   });
 });

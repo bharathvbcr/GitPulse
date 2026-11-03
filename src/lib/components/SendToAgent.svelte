@@ -148,6 +148,10 @@
         void ask(sentText, id);
       } else {
         outcome = { tone: "error", text: `Not confirmed sent: ${explainError(cause)} Pressing Confirm again retries this same message without sending it twice.` };
+        // A managed follow-up gives up after MANAGED_CONTINUE_TIMEOUT (65 s) but
+        // Manvi may have written it by then, so "not confirmed" is not "not sent":
+        // editing the note must warn that the new text is sent in addition.
+        if (route === "managed") maybeDelivered = true;
       }
     } finally {
       if (!disposed) sending = false;

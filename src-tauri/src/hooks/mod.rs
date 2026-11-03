@@ -254,8 +254,11 @@ pub struct HookInput {
     /// ([`under_bypass`]); every other value, and its absence, is ignored.
     pub permission_mode: String,
     /// `Stop`'s `stop_hook_active`: Claude is already continuing because of a
-    /// stop hook (<https://code.claude.com/docs/en/hooks.md>). Only [`deliver`]
-    /// reads it, to avoid starting a waiter for each repeat of a stop chain.
+    /// stop hook (<https://code.claude.com/docs/en/hooks.md>). It is parsed so
+    /// the payload is read faithfully, but no hook acts on it: [`deliver`]
+    /// deliberately ignores it and waits on every stop, because the turn an
+    /// `asyncRewake` wake starts is itself a stop-hook continuation (see the
+    /// `stop_hook_active` paragraph of `deliver.rs`'s module documentation).
     pub stop_hook_active: bool,
 }
 
