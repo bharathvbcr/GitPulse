@@ -23,6 +23,9 @@ fn short_dir() -> tempfile::TempDir {
 /// What the fake has been asked, and how it answers.
 struct Shared {
     owner: String,
+    /// The process the fake says it is: this one, unless a test stands a real
+    /// child in for the started server.
+    process_id: u32,
     controller: AtomicBool,
     jobs: Mutex<Vec<(String, String)>>,
     ops: Mutex<Vec<String>>,
@@ -45,7 +48,7 @@ impl Shared {
             "serve.status" => json!({
                 "protocol": 1,
                 "owner_id": self.owner,
-                "process_id": std::process::id(),
+                "process_id": self.process_id,
                 "controller": controller,
                 "jobs": relock(&self.jobs).iter().map(|(id, phase)| json!({
                     "id": id, "owner_id": self.owner, "session_id": "s", "process_id": 0,
@@ -86,12 +89,18 @@ struct FakeServer {
 
 impl FakeServer {
     fn start(socket: &Path, jobs: &[(&str, &str)], controller: bool) -> Self {
+        Self::start_as(socket, jobs, controller, std::process::id())
+    }
+
+    /// A fake that answers as process `pid`.
+    fn start_as(socket: &Path, jobs: &[(&str, &str)], controller: bool, pid: u32) -> Self {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let shared = Arc::new(Shared {
-            owner: format!("manvi-{}-{stamp}-abc123", std::process::id()),
+            owner: format!("manvi-{pid}-{stamp}-abc123"),
+            process_id: pid,
             controller: AtomicBool::new(controller),
             jobs: Mutex::new(
                 jobs.iter()
@@ -164,9 +173,11 @@ fn plan_in(dir: &Path, launches: Option<Arc<Mutex<Option<FakeServer>>>>) -> host
     let launch: hosted::Launcher = match launches {
         Some(started) => Arc::new(move |_command, paths: &hosted::HostPaths| {
             *relock(&started) = Some(FakeServer::start(&paths.socket, &[], true));
+            // The fake answers as this process, so this is the process the
+            // started server must turn out to be.
             Ok(hosted::Launched {
                 exited: Arc::new(AtomicBool::new(false)),
-                pid: 0,
+                pid: std::process::id(),
                 start_us: 0,
             })
         }),
@@ -788,10 +799,6 @@ fn a_fresh_server_that_cannot_be_used_is_ended_before_the_fallback() {
     let paths = hosted::HostPaths::under(&dir.path().join("h"));
     let (server_slot, child_slot) = (started.clone(), stand_in.clone());
     let launch: hosted::Launcher = Arc::new(move |_command, paths: &hosted::HostPaths| {
-        let server = FakeServer::start(&paths.socket, &[], true);
-        // A server that does not serve what this build needs.
-        *relock(&server.shared.unadvertised) = Some("serve.stop_all");
-        *relock(&server_slot) = Some(server);
         // The started "server" process: a real one, so there is something to end.
         let child = std::process::Command::new("/bin/sleep")
             .arg("30")
@@ -799,6 +806,11 @@ fn a_fresh_server_that_cannot_be_used_is_ended_before_the_fallback() {
             .spawn_locked()
             .map_err(|e| e.to_string())?;
         let pid = child.id();
+        // The server answering at the socket is that process.
+        let server = FakeServer::start_as(&paths.socket, &[], true, pid);
+        // A server that does not serve what this build needs.
+        *relock(&server.shared.unadvertised) = Some("serve.stop_all");
+        *relock(&server_slot) = Some(server);
         let start_us = crate::sysload::procscan::probe_one(pid as i32)
             .map(|facts| facts.start_us)
             .unwrap_or(0);
@@ -836,4 +848,104 @@ fn a_fresh_server_that_cannot_be_used_is_ended_before_the_fallback() {
     };
     assert_eq!(status.signal(), Some(libc::SIGTERM));
     assert!(connection.shutdown());
+}
+
+/// Another same-user server answering at the socket is not the one this call
+/// started: its identity must not be written into `host.json`, where a later
+/// launch would adopt it as GitPulse's own and stop its runs.
+#[test]
+fn a_fresh_server_that_is_not_the_process_just_started_is_not_recorded() {
+    let serial = test_serial();
+    let _reset = Reset;
+    let dir = short_dir();
+    let binary = listening_binary(dir.path());
+    let _binary = bind_test_binary(&serial, binary.to_str().unwrap());
+
+    let started: Arc<Mutex<Option<FakeServer>>> = Arc::new(Mutex::new(None));
+    let slot = started.clone();
+    let paths = hosted::HostPaths::under(&dir.path().join("h"));
+    let launch: hosted::Launcher = Arc::new(move |_command, paths: &hosted::HostPaths| {
+        // Whoever is listening answers as this process ...
+        *relock(&slot) = Some(FakeServer::start(&paths.socket, &[], true));
+        // ... and the launcher says it started some other one. Pid 0 is never
+        // signalled (`end_unusable` refuses it), so nothing real is touched.
+        Ok(hosted::Launched {
+            exited: Arc::new(AtomicBool::new(false)),
+            pid: 0,
+            start_us: 0,
+        })
+    });
+    let plan = hosted::HostPlan { paths, launch };
+    let (connection, _) = connection(dir.path(), plan.clone(), None);
+
+    // The fallback is the stdio child, which this binary is not; what matters
+    // is that the hosted attempt was given up and nothing was recorded.
+    let _ = connection.call("work.enhancements.configuration", json!({}));
+    let observed = hosted::observed();
+    assert!(
+        matches!(&observed, hosted::Observed::FellBack(why) if why.contains("not the process") && why.contains("not recorded")),
+        "{observed:?}"
+    );
+    assert_eq!(
+        hosted::read_record(&plan.paths),
+        Ok(None),
+        "a server that was not the started one must not become GitPulse's on disk"
+    );
+    assert!(connection.shutdown());
+}
+
+/// A record for a server on another socket describes another server, whatever
+/// owner and pid it names.
+#[test]
+fn a_record_for_another_socket_is_not_adopted() {
+    let _serial = test_serial();
+    let _reset = Reset;
+    let dir = short_dir();
+    let plan = plan_in(dir.path(), None);
+    plan.paths.prepare().unwrap();
+    let server = FakeServer::start(&plan.paths.socket, &[("a", "running")], true);
+    let (connection, profile) = connection(dir.path(), plan.clone(), None);
+    record_for(&plan, &server.shared, &profile, "default");
+    let mut record = hosted::read_record(&plan.paths).unwrap().unwrap();
+    record.socket = "/elsewhere/serve.sock".into();
+    hosted::write_record(&plan.paths, &record).unwrap();
+
+    match connection.hosted_view() {
+        hosted::View::Unknown(why) => {
+            assert!(why.contains("/elsewhere/serve.sock"), "{why}");
+            assert!(why.contains("was not adopted"), "{why}");
+        }
+        other => panic!("a record for another socket was adopted: {other:?}"),
+    }
+    assert_eq!(server.shared.saw("work.runs.managed.stop"), 0);
+}
+
+/// A `host.json` written before the socket was kept cannot be checked against
+/// the dialled path; owner, process and profile still identify the server, so
+/// it is adopted, and the unchecked path is logged rather than reported as
+/// verified.
+#[test]
+fn a_record_without_a_socket_is_adopted_on_the_checks_that_remain() {
+    let _serial = test_serial();
+    let _reset = Reset;
+    let dir = short_dir();
+    let plan = plan_in(dir.path(), None);
+    plan.paths.prepare().unwrap();
+    let server = FakeServer::start(&plan.paths.socket, &[("a", "running")], true);
+    let (connection, profile) = connection(dir.path(), plan.clone(), None);
+    record_for(&plan, &server.shared, &profile, "default");
+    let mut raw: Value =
+        serde_json::from_slice(&std::fs::read(&plan.paths.record).unwrap()).unwrap();
+    raw.as_object_mut().unwrap().remove("socket");
+    std::fs::write(&plan.paths.record, serde_json::to_vec(&raw).unwrap()).unwrap();
+    assert_eq!(
+        hosted::read_record(&plan.paths).unwrap().unwrap().socket,
+        "",
+        "an absent path reads as unrecorded, not as some path"
+    );
+
+    match connection.hosted_view() {
+        hosted::View::Live { jobs, .. } => assert_eq!(jobs.len(), 1),
+        other => panic!("an older record was refused: {other:?}"),
+    }
 }

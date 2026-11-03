@@ -592,7 +592,7 @@ impl Sidecar {
         }
         let wait = hosted::STOP_ALL_WAIT;
         let raw = self.call(
-            "serve.stop_all",
+            OP_SERVE_STOP_ALL,
             Some(serde_json::json!({"wait_ms": wait.as_millis() as u64})),
             wait + ADVERTISED_DEADLINE_MARGIN,
         )?;
@@ -1741,7 +1741,7 @@ pub(crate) fn serve_usage(binary: &str, deadline: Duration) -> Result<String, St
 
 /// Ops a hosted server must serve for a connection to it to be usable.
 #[cfg(unix)]
-const HOSTED_OPS: [&str; 2] = ["serve.status", "serve.stop_all"];
+const HOSTED_OPS: [&str; 2] = [OP_SERVE_STATUS, OP_SERVE_STOP_ALL];
 
 /// Ops whose answer depends on the model the server was started with.
 #[cfg(unix)]
@@ -1839,8 +1839,8 @@ fn spawn_hosted(
         // The server this pass started, if it did: when it cannot be used it
         // is ended, so the stdio child that replaces it is not beside it.
         let mut started: Option<hosted::Launched> = None;
-        let (stream, fresh) = match hosted::connect(&plan.paths.socket) {
-            Ok(stream) => (stream, false),
+        let stream = match hosted::connect(&plan.paths.socket) {
+            Ok(stream) => stream,
             Err(Reach::Refused(why)) => {
                 return Err(HostedFailure::Blocked(HarnessError::Unavailable(format!(
                     "the hosted Manvi's socket cannot be used: {why}"
@@ -1884,7 +1884,7 @@ fn spawn_hosted(
                     }
                 };
                 started = Some(launched);
-                (stream, true)
+                stream
             }
         };
         match attach(
@@ -1894,7 +1894,7 @@ fn spawn_hosted(
             &wanted,
             plan,
             mode,
-            fresh,
+            started.as_ref(),
         ) {
             Attach::Ready(sidecar) => return Ok(*sidecar),
             Attach::Replaced => continue,
@@ -1930,7 +1930,7 @@ fn connect_as_controller(
             .map_err(|e| HarnessError::Unavailable(format!("could not use the socket: {e}")))?;
         // `serve.status` is answered to a connection that does not control the
         // server; nothing else is, hello included.
-        let raw = sidecar.call("serve.status", None, hello_timeout())?;
+        let raw = sidecar.call(OP_SERVE_STATUS, None, hello_timeout())?;
         let status: hosted::ServeStatus = serde_json::from_value(raw)
             .map_err(|e| HarnessError::Protocol(format!("could not decode serve.status: {e}")))?;
         if status.controller {
@@ -1954,6 +1954,8 @@ fn connect_as_controller(
 }
 
 /// Verifies whose server it is and makes a usable connection of `stream`.
+/// `launched` is the server this call just started, if it did: the one process
+/// the answering server must be, which is checked before anything is recorded.
 #[cfg(unix)]
 fn attach(
     stream: std::os::unix::net::UnixStream,
@@ -1962,8 +1964,9 @@ fn attach(
     wanted: &str,
     plan: &hosted::HostPlan,
     mode: HostMode,
-    fresh: bool,
+    launched: Option<&hosted::Launched>,
 ) -> Attach {
+    let fresh = launched.is_some();
     // A server this call just started that cannot be used is a reason to run
     // the stdio child; one that was already there is not (see HostedFailure).
     let fail = |error: HarnessError| {
@@ -1981,6 +1984,20 @@ fn attach(
         Ok(identity) => identity,
         Err(why) => return fail(HarnessError::Protocol(why)),
     };
+    // The server answering at the path must be the process this call started:
+    // another same-user server that got to the socket first (or replaced it) is
+    // not GitPulse's, and writing its identity into `host.json` would make a
+    // later connection adopt and stop it as if it were.
+    if let Some(started) = launched {
+        if status.process_id != started.pid {
+            return fail(HarnessError::Unavailable(format!(
+                "the Manvi answering at {} is process {}, not the process {} GitPulse just started; it was not recorded",
+                plan.paths.socket.display(),
+                status.process_id,
+                started.pid
+            )));
+        }
+    }
     let Some(peer) = sidecar.hosted_peer() else {
         return fail(HarnessError::Protocol("not a hosted connection".into()));
     };
@@ -2003,6 +2020,18 @@ fn attach(
             }
             Err(why) => return fail(HarnessError::Unavailable(why)),
         };
+        match record.verify_socket(&plan.paths) {
+            Ok(true) => {}
+            Ok(false) => log::warn!(
+                target: "harness",
+                "the record of the hosted Manvi names no socket, so the socket it was started on could not be checked; adopting on its owner, process and profile"
+            ),
+            Err(why) => {
+                return fail(HarnessError::Unavailable(format!(
+                    "{why}; the Manvi serving there was not adopted"
+                )))
+            }
+        }
         if record.owner_id != status.owner_id || record.process_id != status.process_id {
             return fail(HarnessError::Unavailable(format!(
                 "the Manvi serving at {} is {} (pid {}), not the {} (pid {}) GitPulse started; it was not adopted",
@@ -2131,7 +2160,7 @@ impl Sidecar {
 
     /// How many jobs the hosted server holds now.
     fn hosted_job_count(&self) -> Result<usize, HarnessError> {
-        let raw = self.call("serve.status", None, DEFAULT_CALL_TIMEOUT)?;
+        let raw = self.call(OP_SERVE_STATUS, None, DEFAULT_CALL_TIMEOUT)?;
         serde_json::from_value::<hosted::ServeStatus>(raw)
             .map(|status| status.jobs.len())
             .map_err(|e| HarnessError::Protocol(format!("could not decode serve.status: {e}")))
@@ -2140,7 +2169,7 @@ impl Sidecar {
     /// What the server holds, for run reconciliation.
     fn hosted_view(&self) -> hosted::View {
         let status = self
-            .call("serve.status", None, DEFAULT_CALL_TIMEOUT)
+            .call(OP_SERVE_STATUS, None, DEFAULT_CALL_TIMEOUT)
             .and_then(|raw| {
                 serde_json::from_value::<hosted::ServeStatus>(raw).map_err(|e| {
                     HarnessError::Protocol(format!("could not decode serve.status: {e}"))
@@ -2510,8 +2539,11 @@ fn call_in_slot(
             ));
         }
         let requires_capability = guard.profile.is_some();
-        #[allow(unused_mut)]
+        // Reassigned only where a hosted server can be replaced (below).
+        #[cfg(unix)]
         let mut sidecar = guard.ensure()?;
+        #[cfg(not(unix))]
+        let sidecar = guard.ensure()?;
         // A hosted server keeps the model it was started with. When runs keep
         // it from being replaced, a call that depends on the model waits for
         // them rather than quietly running on the wrong one; once they have
@@ -2751,6 +2783,7 @@ impl ProfileConnection {
         };
         // A repeat (a worker closed once by a refused call and again by the
         // quit) has nothing left to settle and must not dial again.
+        #[cfg(unix)]
         let repeat = guard.closed;
         guard.closed = true;
         let sidecar = guard.sidecar.take();

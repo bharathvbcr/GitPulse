@@ -178,6 +178,61 @@ fn marking_a_restart_with_no_record_marks_nothing() {
     assert_eq!(read_record(&paths), Ok(None));
 }
 
+/// "Its log ends" must be the end: a server that logged more than the read
+/// window said why it failed on its last lines, not its first.
+#[test]
+fn the_log_tail_is_the_end_of_a_log_longer_than_the_window() {
+    let tmp = dir();
+    let log = tmp.path().join("serve.log");
+    let mut text = String::new();
+    for n in 0..400 {
+        text.push_str(&format!("startup line {n:04} {}\n", "x".repeat(20)));
+    }
+    text.push_str("fatal: cannot open the profile\nfatal: giving up\nexit status 1\n");
+    assert!(text.len() > 2 * 4096, "the log is well over the window");
+    std::fs::write(&log, &text).unwrap();
+    assert_eq!(
+        log_tail(&log),
+        "fatal: cannot open the profile / fatal: giving up / exit status 1"
+    );
+
+    // Short logs, a missing log and an empty one keep their old answers.
+    std::fs::write(&log, "one\ntwo\n").unwrap();
+    assert_eq!(log_tail(&log), "one / two");
+    std::fs::write(&log, "").unwrap();
+    assert_eq!(log_tail(&log), "");
+    assert_eq!(log_tail(&tmp.path().join("missing.log")), "");
+
+    // A window that opens inside a line never reports the fragment.
+    let long_line = "y".repeat(10_000);
+    std::fs::write(&log, format!("{long_line}\nlast words\n")).unwrap();
+    assert_eq!(log_tail(&log), "last words");
+}
+
+#[test]
+fn a_record_is_about_the_socket_that_was_dialled() {
+    let paths = HostPaths::under(Path::new("/x"));
+    let record = Record::new(
+        &paths,
+        &status("manvi-1-1-ab", 1, 1),
+        "default",
+        Path::new("/p"),
+    );
+    assert_eq!(record.verify_socket(&paths), Ok(true));
+    let moved = HostPaths::under(Path::new("/y"));
+    let why = record.verify_socket(&moved).unwrap_err();
+    assert!(
+        why.contains("/x/serve.sock") && why.contains("/y/serve.sock"),
+        "{why}"
+    );
+    // A record from before the path was kept says nothing either way.
+    let unrecorded = Record {
+        socket: String::new(),
+        ..record
+    };
+    assert_eq!(unrecorded.verify_socket(&moved), Ok(false));
+}
+
 #[test]
 fn a_socket_path_too_long_for_a_unix_socket_is_refused_before_anything_starts() {
     let tmp = dir();
