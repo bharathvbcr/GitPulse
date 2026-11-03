@@ -339,7 +339,7 @@ impl WorkbenchState {
     }
 
     pub(crate) fn shutdown(&self) {
-        self.0.closed.store(true, Ordering::Release);
+        let repeat = self.0.closed.swap(true, Ordering::AcqRel);
         // The external-changes loop may be waiting out a hidden window.
         external_changes::wake();
         // Waiting requests are refused now rather than at their deadline.
@@ -354,10 +354,54 @@ impl WorkbenchState {
         if let Some(notifications) = self.0.notifications.get() {
             notifications.wake();
         }
-        let guard = crate::supervisor::lock_or_recover(&self.0.worker);
-        if let Some((_, worker)) = guard.as_ref() {
-            if !worker.shutdown() {
-                log::warn!(target: "workbench", "profile worker shutdown could not acquire the active request; generation outcome may remain unresolved");
+        // Not under the worker lock: with a hosted Manvi and "stop" chosen,
+        // closing the worker waits for its runs to end, and every other
+        // `current_worker` caller would queue behind that wait.
+        let worker = {
+            let guard = crate::supervisor::lock_or_recover(&self.0.worker);
+            guard.as_ref().map(|(_, worker)| Arc::clone(worker))
+        };
+        match worker {
+            Some(worker) => {
+                if !worker.shutdown() {
+                    log::warn!(target: "workbench", "profile worker shutdown could not acquire the active request; generation outcome may remain unresolved");
+                }
+            }
+            // No worker was ever made this launch, so nothing is connected to
+            // a hosted Manvi that an earlier launch left holding runs. A quit
+            // that chose to stop them still has to reach them: a worker that
+            // is built only to be closed does that (it dials, adopting only,
+            // and stops). Only the app's own profile hosts, and only once.
+            None if !repeat
+                && self.0.path.is_none()
+                && crate::harness::hosted::exit_choice()
+                    == crate::harness::hosted::ExitChoice::Stop =>
+            {
+                self.stop_unconnected_hosted_runs();
+            }
+            None => {}
+        }
+    }
+
+    /// [`Self::shutdown`] for a quit that chose to stop a hosted server's runs
+    /// when this launch never made a worker.
+    fn stop_unconnected_hosted_runs(&self) {
+        let Some(plan) = crate::harness::hosted::HostPlan::from_settings() else {
+            return;
+        };
+        let path = match intake::default_profile_path() {
+            Ok(path) => path,
+            Err(error) => {
+                log::warn!(target: "workbench", "could not stop the hosted managed runs before quitting: {}", error.message);
+                return;
+            }
+        };
+        match crate::harness::sidecar::ProfileConnection::new_hosting(path, None, Some(plan)) {
+            Ok(connection) => {
+                connection.shutdown();
+            }
+            Err(error) => {
+                log::warn!(target: "workbench", "could not stop the hosted managed runs before quitting: {}", error.message());
             }
         }
     }
@@ -807,9 +851,21 @@ impl WorkbenchState {
                         log::warn!(target: "workbench", "profile worker retire could not acquire the active request; prior generation may remain unresolved");
                     }
                 }
-                let connection =
-                    crate::harness::sidecar::ProfileConnection::new(path.clone(), selection)
-                        .map_err(|error| worker_error(&path, error))?;
+                // Only the app's own profile hosts its agent runtime outside
+                // this process (and only when the person chose that); a state
+                // with a test-supplied profile never reads the machine's
+                // settings, like its run limit.
+                let hosting = if self.0.path.is_none() {
+                    crate::harness::hosted::HostPlan::from_settings()
+                } else {
+                    None
+                };
+                let connection = crate::harness::sidecar::ProfileConnection::new_hosting(
+                    path.clone(),
+                    selection,
+                    hosting,
+                )
+                .map_err(|error| worker_error(&path, error))?;
                 *guard = Some((fingerprint, Arc::new(connection)));
             }
             Arc::clone(&guard.as_ref().expect("worker slot just ensured").1)

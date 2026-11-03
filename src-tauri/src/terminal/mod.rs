@@ -351,6 +351,10 @@ pub struct TerminalBackendStatus {
     /// What is wrong with the host, plainly: version skew, a host that would
     /// not start. Empty when nothing is known to be wrong.
     pub trouble: Vec<String>,
+    /// Whether managed agent runs (Codex and Claude driven by Manvi) are kept
+    /// running too: the same setting, decided by the installed Manvi. Filled
+    /// by `cmd_terminal_backend`, which can ask it off the async runtime.
+    pub managed: crate::harness::hosted::ManagedHosting,
 }
 
 /// Thread-safe registry of live PTY sessions.

@@ -692,7 +692,7 @@ export async function listLiveTaskRuns(taskID: string): Promise<{ runs: TaskRun[
  * Every attempt, across tasks, that can hold a checkout: what the board needs
  * to mark the cards with agents working on them. Same paging as above.
  */
-export async function listAllLiveRuns(): Promise<{ runs: TaskRun[]; complete: boolean }> {
+export async function listAllLiveRuns(): Promise<{ runs: TaskRun[]; complete: boolean; workingComplete: boolean }> {
   return holdingRuns({}, () => true);
 }
 /**
@@ -702,12 +702,21 @@ export async function listAllLiveRuns(): Promise<{ runs: TaskRun[]; complete: bo
  * one repository, the handoff form could not see which checkouts they held.
  */
 const HOLDING_PAGE = 100;
-async function holdingRuns(scope: { repository_id: string } | { task_id: string } | Record<string, never>, belongs: (run: TaskRun) => boolean): Promise<{ runs: TaskRun[]; complete: boolean }> {
-  const pages = await Promise.all(["prepared", "starting", "running", "unresolved"].map(async (state) => {
+async function holdingRuns(scope: { repository_id: string } | { task_id: string } | Record<string, never>, belongs: (run: TaskRun) => boolean): Promise<{ runs: TaskRun[]; complete: boolean; workingComplete: boolean }> {
+  const states = ["prepared", "starting", "running", "unresolved"];
+  const pages = await Promise.all(states.map(async (state) => {
     const result = page(await request("runs.list", { ...scope, state, limit: HOLDING_PAGE, newest: true }), taskRun);
     return result.items.every((run) => belongs(run) && run.state === state) ? result : invalid();
   }));
-  return { runs: pages.flatMap((result) => result.items), complete: pages.every((result) => !result.has_more) };
+  // `workingComplete` leaves `prepared` out: a prepared row has not started,
+  // can be a long backlog of expired rows, and says nothing about whether the
+  // runs that are working were all seen. A caller deciding what a quit stops
+  // asks this; `complete` stays the answer for every state.
+  return {
+    runs: pages.flatMap((result) => result.items),
+    complete: pages.every((result) => !result.has_more),
+    workingComplete: pages.every((result, index) => states[index] === "prepared" || !result.has_more),
+  };
 }
 export interface RunRelease { released: boolean; reason: string; run: TaskRun }
 /**

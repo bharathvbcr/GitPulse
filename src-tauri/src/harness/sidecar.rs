@@ -24,7 +24,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -35,6 +35,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::claude_key::CLAUDE_KEY_ENV;
+use super::hosted;
 use super::protocol::*;
 
 /// How long a single request may take before the child is considered wedged.
@@ -220,21 +221,53 @@ impl std::fmt::Display for HarnessError {
     }
 }
 
+/// What is on the other end of the wire.
+enum Peer {
+    /// A `manvi serve` child of this process, on its stdio. It dies with us.
+    Child {
+        /// Shared with the two pipe-reader threads so an oversized or failed
+        /// read can kill the child *immediately* instead of waiting for the
+        /// next call to notice the disconnected channel.
+        child: std::sync::Arc<Mutex<Child>>,
+        /// The child's place in `procguard`'s registry, shared with the same
+        /// two reader threads so whichever one kills the child clears the
+        /// registry entry in the same breath. Without it a SIGTERM to
+        /// GitPulse would leave a `manvi serve` running against a scratch
+        /// directory nothing owns.
+        guard: std::sync::Arc<crate::procguard::Registration>,
+    },
+    /// A `manvi serve --listen` process that nothing here owns: a connection
+    /// to it, which can be dropped without ending it.
+    #[cfg(unix)]
+    Hosted(HostedPeer),
+}
+
+/// A connection to a hosted `manvi serve`.
+#[cfg(unix)]
+struct HostedPeer {
+    /// The handle shutdown goes through: `shutdown` on any clone ends the
+    /// reader's blocking read and the writer's blocking write.
+    stream: std::os::unix::net::UnixStream,
+    log: PathBuf,
+    /// The server's process and the moment its owner id was stamped, set once
+    /// `serve.status` has answered; what "is it still there" is judged by.
+    identity: OnceLock<(u32, u128)>,
+    /// Set when the server was started with a model selection other than this
+    /// connection's and holds runs, so it cannot be replaced yet: what to tell
+    /// a caller whose call depends on the model.
+    model_pending: Mutex<Option<String>>,
+    /// Which connection this is, so a late end of an older one cannot undo the
+    /// observation a newer one made (see [`hosted::observe_detached`]).
+    conn_id: u64,
+}
+
 /// A running sidecar and the handshake it answered with.
 struct Sidecar {
-    /// Shared with the two pipe-reader threads so an oversized or failed read
-    /// can kill the child *immediately* instead of waiting for the next call
-    /// to notice the disconnected channel.
-    child: std::sync::Arc<Mutex<Child>>,
-    /// The child's place in `procguard`'s registry, shared with the same two
-    /// reader threads so whichever one kills the child clears the registry
-    /// entry in the same breath. Without it a SIGTERM to GitPulse would leave
-    /// a `manvi serve` running against a scratch directory nothing owns.
-    guard: std::sync::Arc<crate::procguard::Registration>,
-    /// `None` once stdin has been closed for shutdown. An `Option` is what
-    /// lets [`Drop`] hand the pipe back to the OS without moving out of
-    /// `&mut self`.
-    stdin: Mutex<Option<ChildStdin>>,
+    peer: Peer,
+    /// The write end of the wire. `None` once closed for shutdown. An `Option`
+    /// is what lets [`Drop`] hand the pipe back to the OS without moving out
+    /// of `&mut self`.
+    stdin: Mutex<Option<Box<dyn Write + Send>>>,
     inbox: Inbox,
     stderr: std::sync::Arc<Mutex<VecDeque<String>>>,
     hello: HelloResult,
@@ -379,9 +412,69 @@ fn spawn_stdout_pump(
     guard: std::sync::Arc<crate::procguard::Registration>,
     shutting_down: std::sync::Arc<AtomicBool>,
 ) -> Receiver<String> {
+    spawn_pump(stdout, PumpEnd::Child { child, guard }, shutting_down)
+}
+
+/// What a pump does when its stream ends or faults: for a child, reap or kill
+/// it; for a hosted server, drop the connection and leave the server alone.
+enum PumpEnd {
+    Child {
+        child: std::sync::Arc<Mutex<Child>>,
+        guard: std::sync::Arc<crate::procguard::Registration>,
+    },
+    #[cfg(unix)]
+    Socket(std::os::unix::net::UnixStream),
+}
+
+impl PumpEnd {
+    /// The stream ended cleanly.
+    fn ended(&self) {
+        match self {
+            // The child closed its stdout: it is exiting or has exited. Reaped
+            // here, not left a zombie holding its pid (and its runs "still
+            // running") until some later call happens to look.
+            PumpEnd::Child { child, guard } => reap_after_eof(child, guard),
+            // The server closed the connection. Nothing to reap: the channel
+            // closing is what tells every waiter.
+            #[cfg(unix)]
+            PumpEnd::Socket(_) => {}
+        }
+    }
+
+    /// The stream faulted (a read error, an oversized frame): this connection
+    /// is unusable.
+    fn fault(&self) {
+        match self {
+            PumpEnd::Child { child, guard } => force_kill(child, guard),
+            #[cfg(unix)]
+            PumpEnd::Socket(stream) => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
+    /// The queue overflowed. `false` means the fault could not be acted on
+    /// yet (a child's lock was busy) and the pump keeps reading.
+    fn overflow(&self) -> bool {
+        match self {
+            PumpEnd::Child { child, guard } => try_force_kill(child, guard),
+            #[cfg(unix)]
+            PumpEnd::Socket(stream) => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                true
+            }
+        }
+    }
+}
+
+fn spawn_pump<R: std::io::Read + Send + 'static>(
+    stream: R,
+    end: PumpEnd,
+    shutting_down: std::sync::Arc<AtomicBool>,
+) -> Receiver<String> {
     let (tx, rx) = mpsc::sync_channel::<String>(MAX_QUEUED_STDOUT_FRAMES);
     let _ = crate::supervisor::spawn_once("sidecar-stdout", "sidecar stdout pump", move || {
-        let mut reader = BufReader::new(stdout);
+        let mut reader = BufReader::new(stream);
         loop {
             match read_bounded_line(&mut reader, MAX_SIDECAR_FRAME_BYTES) {
                 Ok(Some(line)) => {
@@ -395,21 +488,18 @@ fn spawn_stdout_pump(
                             if shutting_down.load(Ordering::Acquire) {
                                 continue;
                             }
-                            if try_force_kill(&child, &guard) {
+                            if end.overflow() {
                                 return;
                             }
                         }
                     }
                 }
-                // The child closed its stdout: it is exiting or has exited. Reaped
-                // here, not left a zombie holding its pid (and its runs
-                // "still running") until some later call happens to look.
                 Ok(None) => {
-                    reap_after_eof(&child, &guard);
+                    end.ended();
                     return;
                 }
                 Err(_) => {
-                    force_kill(&child, &guard);
+                    end.fault();
                     return;
                 }
             }
@@ -432,9 +522,9 @@ fn spawn_stdout_pump(
 /// reason `procguard` puts each child in a group of its own, and this was the
 /// one shutdown path that never used it: observed with a stub harness whose
 /// helper survived the test binary that started it, reparented to init.
-fn shutdown_child(
+fn shutdown_child<W>(
     child: &mut Child,
-    stdin: Option<ChildStdin>,
+    stdin: Option<W>,
     grace: Duration,
     guard: &crate::procguard::Registration,
 ) {
@@ -457,8 +547,63 @@ impl Sidecar {
             .try_lock()
             .ok()
             .and_then(|mut stdin| stdin.take());
-        let mut child = relock(&self.child);
-        shutdown_child(&mut child, stdin, self.shutdown_grace, &self.guard);
+        match &self.peer {
+            Peer::Child { child, guard } => {
+                let mut child = relock(child);
+                shutdown_child(&mut child, stdin, self.shutdown_grace, guard);
+            }
+            // A hosted server is disconnected from, never stopped: it holds
+            // runs that are meant to outlive this connection. Ending them is
+            // an explicit request ([`Sidecar::stop_hosted_runs`]).
+            #[cfg(unix)]
+            Peer::Hosted(hosted) => {
+                drop(stdin);
+                let _ = hosted.stream.shutdown(std::net::Shutdown::Both);
+                hosted::observe_detached(hosted.conn_id);
+            }
+        }
+    }
+
+    /// The stdio child, for tests that watch it.
+    #[cfg(test)]
+    fn child(&self) -> &std::sync::Arc<Mutex<Child>> {
+        match &self.peer {
+            Peer::Child { child, .. } => child,
+            #[cfg(unix)]
+            Peer::Hosted(_) => panic!("a hosted connection has no child"),
+        }
+    }
+
+    /// Whether this is a connection to a hosted server.
+    fn is_hosted(&self) -> bool {
+        match &self.peer {
+            Peer::Child { .. } => false,
+            #[cfg(unix)]
+            Peer::Hosted(_) => true,
+        }
+    }
+
+    /// Asks a hosted server to stop every run and waits a bounded time for
+    /// them to end. The explicit end of the runs a quit chose to stop; a plain
+    /// disconnect leaves them. `Ok` carries the ids that were still ending.
+    fn stop_hosted_runs(&self) -> Result<Vec<String>, HarnessError> {
+        if !self.is_hosted() {
+            return Ok(Vec::new());
+        }
+        let wait = hosted::STOP_ALL_WAIT;
+        let raw = self.call(
+            "serve.stop_all",
+            Some(serde_json::json!({"wait_ms": wait.as_millis() as u64})),
+            wait + ADVERTISED_DEADLINE_MARGIN,
+        )?;
+        #[derive(serde::Deserialize)]
+        struct Stopped {
+            #[serde(default)]
+            pending: Vec<String>,
+        }
+        serde_json::from_value::<Stopped>(raw)
+            .map(|stopped| stopped.pending)
+            .map_err(|e| HarnessError::Protocol(format!("could not decode serve.stop_all: {e}")))
     }
 
     /// True when this child may host a session that a kill would take with it.
@@ -584,12 +729,21 @@ impl Sidecar {
     /// is "not known", and the caller keeps waiting on the channel, which
     /// closes when the shutdown is over. A call must honour its own deadline.
     fn child_known_exited(&self) -> bool {
-        match self.child.try_lock() {
-            Ok(mut child) => self.guard.exited(&mut child),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                self.guard.exited(&mut poisoned.into_inner())
-            }
-            Err(std::sync::TryLockError::WouldBlock) => false,
+        match &self.peer {
+            Peer::Child { child, guard } => match child.try_lock() {
+                Ok(mut child) => guard.exited(&mut child),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    guard.exited(&mut poisoned.into_inner())
+                }
+                Err(std::sync::TryLockError::WouldBlock) => false,
+            },
+            // The server is not ours to wait on; its process is the evidence.
+            // Until it has said who it is, the closing connection is.
+            #[cfg(unix)]
+            Peer::Hosted(hosted) => hosted.identity.get().is_some_and(|(pid, stamp)| {
+                crate::workbench::process_birth::running_since(*pid, *stamp)
+                    == crate::workbench::process_birth::Liveness::Gone
+            }),
         }
     }
 
@@ -719,6 +873,18 @@ impl Sidecar {
     }
 
     fn stderr_hint(&self) -> String {
+        #[cfg(unix)]
+        if let Peer::Hosted(hosted) = &self.peer {
+            let said = hosted::log_tail(&hosted.log);
+            return if said.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (last diagnostic: {})",
+                    crate::engine::budget::truncate_chars_ellipsis(&said, 200)
+                )
+            };
+        }
         let tail = self
             .stderr
             .lock()
@@ -1475,10 +1641,9 @@ fn spawn_with_profile(
         }
     });
 
-    let mut sidecar = Sidecar {
-        child,
-        guard,
-        stdin: Mutex::new(Some(stdin)),
+    let sidecar = Sidecar {
+        peer: Peer::Child { child, guard },
+        stdin: Mutex::new(Some(Box::new(stdin))),
         inbox: Inbox::new(rx),
         stderr: tail,
         hello: HelloResult::default(),
@@ -1494,7 +1659,17 @@ fn spawn_with_profile(
         },
         shutting_down,
     };
+    handshake_sidecar(sidecar, claude_key.is_some())
+}
 
+/// The handshake every connection makes, over a pipe or a socket: `hello`, the
+/// protocol this build speaks, and — when the process was given the Claude key
+/// — its promise to keep that key from what it starts. Returning an error
+/// drops `sidecar`, which stops a child and disconnects from a server.
+fn handshake_sidecar(
+    mut sidecar: Sidecar,
+    holds_claude_key: bool,
+) -> Result<Sidecar, HarnessError> {
     let raw = sidecar.call(
         OP_HELLO,
         Some(serde_json::json!({"protocol": PROTOCOL_VERSION, "host": "gitpulse"})),
@@ -1513,7 +1688,7 @@ fn spawn_with_profile(
     // The probe in `claude_key_for` asked the binary on disk; this asks the
     // process that actually holds the key. Returning drops `sidecar`, which
     // stops the child.
-    if claude_key.is_some()
+    if holds_claude_key
         && !withholds_claude_key(
             hello.withholds_provider_credentials,
             hello.withheld_provider_env.as_deref(),
@@ -1528,6 +1703,565 @@ fn spawn_with_profile(
     Ok(sidecar)
 }
 
+// ----- the hosted server --------------------------------------------------------
+
+/// What `binary serve --help` prints, for the capability probe: run bounded,
+/// from the temp directory, under the same environment allowlist every other
+/// call of `manvi` gets. Starting nothing and creating nothing.
+#[cfg(unix)]
+pub(crate) fn serve_usage(binary: &str, deadline: Duration) -> Result<String, String> {
+    let mut command = Command::new(binary);
+    command.args(["serve", "--help"]).env_clear();
+    for (name, value) in sidecar_ambient_env(std::env::vars_os()) {
+        command.env(name, value);
+    }
+    command.current_dir(std::env::temp_dir());
+    let run = crate::engine::git_cli::run_bounded_capped(
+        command,
+        "manvi serve --help",
+        deadline,
+        None,
+        64 * 1024,
+    )
+    .and_then(|run| run.require_complete("manvi serve --help"))
+    .map_err(|error| {
+        format!(
+            "could not ask `{binary}` how it serves: {}",
+            error.message()
+        )
+    })?;
+    if !run.success {
+        return Err(format!(
+            "`{binary} serve --help` exited with status {}",
+            run.status_code
+        ));
+    }
+    Ok(String::from_utf8_lossy(&run.stdout).into_owned())
+}
+
+/// Ops a hosted server must serve for a connection to it to be usable.
+#[cfg(unix)]
+const HOSTED_OPS: [&str; 2] = ["serve.status", "serve.stop_all"];
+
+/// Ops whose answer depends on the model the server was started with.
+#[cfg(unix)]
+const MODEL_BOUND_OPS: [&str; 2] = ["work.enhancements.generate", "work.enhancements.refine"];
+
+/// How the profile worker came to ask for a hosted server.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostMode {
+    /// Connect to the server, starting one if none is running.
+    Start,
+    /// Connect to a server that is already running, and only that.
+    Adopt,
+}
+
+/// Why a hosted connection was not made.
+#[cfg(unix)]
+enum HostedFailure {
+    /// Hosting cannot be used and nothing is left behind that the stdio child
+    /// would collide with: run that instead, and say why. A server this call
+    /// started and then could not use is ended first (`hosted::end_unusable`,
+    /// best effort and logged; it held no run, and idles out if the signal
+    /// could not be sent).
+    Fallback(String),
+    /// A server is there and this connection cannot use it. Nothing else is
+    /// started beside it: two Manvi processes on one profile would each run
+    /// the background work.
+    Blocked(HarnessError),
+    /// [`HostMode::Adopt`] found no server, or one with nothing to adopt.
+    Gone,
+}
+
+/// What came of attaching to a server.
+#[cfg(unix)]
+enum Attach {
+    Ready(Box<Sidecar>),
+    /// The server held nothing and was asked to exit so a new one can start.
+    Replaced,
+    Failed(HostedFailure),
+}
+
+#[cfg(unix)]
+fn socket_sidecar(
+    stream: std::os::unix::net::UnixStream,
+    paths: &hosted::HostPaths,
+    binary: &str,
+) -> std::io::Result<Sidecar> {
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let rx = spawn_pump(
+        stream.try_clone()?,
+        PumpEnd::Socket(stream.try_clone()?),
+        shutting_down.clone(),
+    );
+    Ok(Sidecar {
+        stdin: Mutex::new(Some(Box::new(stream.try_clone()?))),
+        peer: Peer::Hosted(HostedPeer {
+            stream,
+            log: paths.log.clone(),
+            identity: OnceLock::new(),
+            model_pending: Mutex::new(None),
+            conn_id: hosted::next_conn_id(),
+        }),
+        inbox: Inbox::new(rx),
+        stderr: Arc::new(Mutex::new(VecDeque::new())),
+        hello: HelloResult::default(),
+        binary: binary.to_string(),
+        next_id: AtomicU64::new(0),
+        in_flight: AtomicUsize::new(0),
+        hosted: Mutex::new(HashSet::new()),
+        write_deadline: WRITE_DEADLINE,
+        shutdown_grace: Duration::ZERO,
+        shutting_down,
+    })
+}
+
+/// Connects to the hosted server (starting one in [`HostMode::Start`] when none
+/// is running) and returns a handshaken connection to it.
+///
+/// One server per profile, at a fixed private path, so a second profile or
+/// another user is never reached by this path.
+#[cfg(unix)]
+fn spawn_hosted(
+    profile: &Path,
+    selection: Option<&ModelSelection>,
+    plan: &hosted::HostPlan,
+    mode: HostMode,
+) -> Result<Sidecar, HostedFailure> {
+    use hosted::Reach;
+    plan.paths.prepare().map_err(HostedFailure::Fallback)?;
+    let wanted = hosted::fingerprint(selection);
+    let binary = resolve_binary();
+    // Twice: the second pass starts the server that replaced one which held
+    // nothing and was out of date.
+    for _ in 0..2 {
+        // The server this pass started, if it did: when it cannot be used it
+        // is ended, so the stdio child that replaces it is not beside it.
+        let mut started: Option<hosted::Launched> = None;
+        let (stream, fresh) = match hosted::connect(&plan.paths.socket) {
+            Ok(stream) => (stream, false),
+            Err(Reach::Refused(why)) => {
+                return Err(HostedFailure::Blocked(HarnessError::Unavailable(format!(
+                    "the hosted Manvi's socket cannot be used: {why}"
+                ))))
+            }
+            Err(Reach::Gone) => {
+                if mode == HostMode::Adopt {
+                    return Err(HostedFailure::Gone);
+                }
+                let binary = binary
+                    .clone()
+                    .ok_or_else(|| HostedFailure::Fallback(resolve_binary_absence()))?;
+                match hosted::probe_support(&binary) {
+                    hosted::Support::Supported => {}
+                    hosted::Support::Unsupported(why) | hosted::Support::Unknown(why) => {
+                        return Err(HostedFailure::Fallback(why))
+                    }
+                }
+                let claude_key = match selection {
+                    Some(ModelSelection::Claude { .. }) => Some(
+                        claude_key_for(&binary)
+                            .map_err(|e| HostedFailure::Fallback(e.message()))?,
+                    ),
+                    _ => None,
+                };
+                let store = crate::tool_install::components::verified_store_binary();
+                let mut command =
+                    sidecar_command(&binary, &plan.paths.dir, selection, claude_key.as_deref());
+                attach_workbench(&mut command, &plan.paths.dir, profile, store.as_deref());
+                command
+                    .arg("--listen")
+                    .arg(&plan.paths.socket)
+                    .args(["--idle-exit", hosted::IDLE_EXIT]);
+                let launched =
+                    (plan.launch)(command, &plan.paths).map_err(HostedFailure::Fallback)?;
+                let stream = match hosted::wait_for_socket(&plan.paths, &launched.exited) {
+                    Ok(stream) => stream,
+                    Err(why) => {
+                        hosted::end_unusable(&launched);
+                        return Err(HostedFailure::Fallback(why));
+                    }
+                };
+                started = Some(launched);
+                (stream, true)
+            }
+        };
+        match attach(
+            stream,
+            binary.as_deref().unwrap_or_default(),
+            profile,
+            &wanted,
+            plan,
+            mode,
+            fresh,
+        ) {
+            Attach::Ready(sidecar) => return Ok(*sidecar),
+            Attach::Replaced => continue,
+            Attach::Failed(failure) => {
+                if let (Some(launched), HostedFailure::Fallback(_)) = (&started, &failure) {
+                    hosted::end_unusable(launched);
+                }
+                return Err(failure);
+            }
+        }
+    }
+    Err(HostedFailure::Blocked(HarnessError::Unavailable(
+        "the hosted Manvi was replaced and the replacement could not be used".into(),
+    )))
+}
+
+/// Takes control of the server on `stream`: a connection that is not the
+/// controller is dropped and redialled until the previous controller's has
+/// been served out, up to [`hosted::CONTROLLER_WAIT`]. Never `serve.takeover`:
+/// GitPulse is a single-instance app, so another controller is not an earlier
+/// GitPulse (the kernel closes that one's connection when it dies) but
+/// something else driving the server, and cancelling its requests is not ours
+/// to do.
+#[cfg(unix)]
+fn connect_as_controller(
+    mut stream: std::os::unix::net::UnixStream,
+    paths: &hosted::HostPaths,
+    binary: &str,
+) -> Result<(Sidecar, hosted::ServeStatus), HarnessError> {
+    let deadline = Instant::now() + hosted::controller_wait();
+    loop {
+        let sidecar = socket_sidecar(stream, paths, binary)
+            .map_err(|e| HarnessError::Unavailable(format!("could not use the socket: {e}")))?;
+        // `serve.status` is answered to a connection that does not control the
+        // server; nothing else is, hello included.
+        let raw = sidecar.call("serve.status", None, hello_timeout())?;
+        let status: hosted::ServeStatus = serde_json::from_value(raw)
+            .map_err(|e| HarnessError::Protocol(format!("could not decode serve.status: {e}")))?;
+        if status.controller {
+            return Ok((sidecar, status));
+        }
+        drop(sidecar);
+        if Instant::now() >= deadline {
+            return Err(HarnessError::Unavailable(format!(
+                "another client controls the hosted Manvi (owner {}); it was not taken over",
+                status.owner_id
+            )));
+        }
+        thread::sleep(Duration::from_millis(250));
+        stream = hosted::connect(&paths.socket).map_err(|reach| match reach {
+            hosted::Reach::Gone => {
+                HarnessError::Unavailable("the hosted Manvi went away while it was busy".into())
+            }
+            hosted::Reach::Refused(why) => HarnessError::Unavailable(why),
+        })?;
+    }
+}
+
+/// Verifies whose server it is and makes a usable connection of `stream`.
+#[cfg(unix)]
+fn attach(
+    stream: std::os::unix::net::UnixStream,
+    binary: &str,
+    profile: &Path,
+    wanted: &str,
+    plan: &hosted::HostPlan,
+    mode: HostMode,
+    fresh: bool,
+) -> Attach {
+    // A server this call just started that cannot be used is a reason to run
+    // the stdio child; one that was already there is not (see HostedFailure).
+    let fail = |error: HarnessError| {
+        Attach::Failed(if fresh {
+            HostedFailure::Fallback(error.message())
+        } else {
+            HostedFailure::Blocked(error)
+        })
+    };
+    let (sidecar, status) = match connect_as_controller(stream, &plan.paths, binary) {
+        Ok(connected) => connected,
+        Err(error) => return fail(error),
+    };
+    let (pid, stamp) = match status.verify_identity() {
+        Ok(identity) => identity,
+        Err(why) => return fail(HarnessError::Protocol(why)),
+    };
+    let Some(peer) = sidecar.hosted_peer() else {
+        return fail(HarnessError::Protocol("not a hosted connection".into()));
+    };
+    let _ = peer.identity.set((pid, stamp));
+    let conn_id = peer.conn_id;
+
+    // The selection the server was started with, which is what it holds (and
+    // so whether it holds the Claude key). A server this call started was
+    // started with `wanted`.
+    let mut started_with = wanted.to_string();
+    if !fresh {
+        // Whose server this is: the one GitPulse started for this profile.
+        let record = match hosted::read_record(&plan.paths) {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                return fail(HarnessError::Unavailable(format!(
+                    "a Manvi is serving at {} but GitPulse has no record of starting it, so it was not adopted",
+                    plan.paths.socket.display()
+                )))
+            }
+            Err(why) => return fail(HarnessError::Unavailable(why)),
+        };
+        if record.owner_id != status.owner_id || record.process_id != status.process_id {
+            return fail(HarnessError::Unavailable(format!(
+                "the Manvi serving at {} is {} (pid {}), not the {} (pid {}) GitPulse started; it was not adopted",
+                plan.paths.socket.display(),
+                status.owner_id,
+                status.process_id,
+                record.owner_id,
+                record.process_id
+            )));
+        }
+        if record.profile != profile.display().to_string() {
+            return fail(HarnessError::Unavailable(format!(
+                "the Manvi serving at {} works on {}, not this profile; it was not adopted",
+                plan.paths.socket.display(),
+                record.profile
+            )));
+        }
+        started_with = record.selection.clone();
+        // Judged against what this connection wants in either mode: an adopted
+        // server that holds runs still keeps the model it was started with, and
+        // a call that depends on the model waits for those runs
+        // (`model_pending`) instead of quietly running on the old one.
+        match hosted::judge_server(&record, wanted, status.jobs.len()) {
+            hosted::Reuse::Yes => {}
+            hosted::Reuse::Replace if mode == HostMode::Adopt => {
+                // Nothing to adopt: it holds no run and is due for replacement,
+                // which the first call that needs it does.
+                return Attach::Failed(HostedFailure::Gone);
+            }
+            hosted::Reuse::Replace => {
+                return match hosted::end_idle_server(&plan.paths, &record, &status)
+                {
+                    Ok(()) => {
+                        drop(sidecar);
+                        Attach::Replaced
+                    }
+                    Err(why) => fail(HarnessError::Unavailable(format!(
+                        "the hosted Manvi was started with another model and could not be replaced: {why}"
+                    ))),
+                };
+            }
+            hosted::Reuse::KeepForRuns(runs) => {
+                *relock(&peer.model_pending) = Some(format!(
+                    "The agent runtime is keeping {runs} managed run{} going with the model it started with; the model you selected applies once {} ended.",
+                    if runs == 1 { "" } else { "s" },
+                    if runs == 1 { "it has" } else { "they have" },
+                ));
+            }
+        }
+    }
+
+    let holds_key = started_with.starts_with("claude|");
+    let sidecar = match handshake_sidecar(sidecar, holds_key) {
+        Ok(sidecar) => sidecar,
+        Err(error) => return fail(error),
+    };
+    if let Some(missing) = HOSTED_OPS.iter().find(|op| !serves(&sidecar.hello, op)) {
+        return fail(HarnessError::Protocol(format!(
+            "the hosted Manvi does not serve {missing}"
+        )));
+    }
+    if fresh {
+        let record = hosted::Record::new(&plan.paths, &status, wanted, profile);
+        if let Err(why) = hosted::write_record(&plan.paths, &record) {
+            return fail(HarnessError::Unavailable(format!(
+                "could not record the hosted Manvi: {why}"
+            )));
+        }
+    }
+    hosted::observe_hosted(conn_id);
+    Attach::Ready(Box::new(sidecar))
+}
+
+/// The profile sidecar: hosted when the person chose that and it works,
+/// otherwise the stdio child, with the reason recorded where Settings reads it.
+fn start_profile_sidecar(
+    profile: &Path,
+    selection: Option<&ModelSelection>,
+    hosting: Option<&hosted::HostPlan>,
+) -> Result<Sidecar, HarnessError> {
+    let Some(plan) = hosting else {
+        return spawn_with_profile(Some(profile), selection);
+    };
+    #[cfg(unix)]
+    match spawn_hosted(profile, selection, plan, HostMode::Start) {
+        Ok(sidecar) => return Ok(sidecar),
+        Err(HostedFailure::Blocked(error)) => {
+            hosted::observe(hosted::Observed::Blocked(error.message()));
+            return Err(error);
+        }
+        Err(HostedFailure::Fallback(why)) => {
+            log::warn!(target: "harness", "managed runs end when GitPulse quits: {why}");
+            hosted::observe(hosted::Observed::FellBack(why));
+        }
+        Err(HostedFailure::Gone) => {
+            hosted::observe(hosted::Observed::FellBack(
+                "no hosted server could be reached".into(),
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = plan;
+        hosted::observe(hosted::Observed::FellBack(
+            "this platform cannot host the agent runtime".into(),
+        ));
+    }
+    spawn_with_profile(Some(profile), selection)
+}
+
+#[cfg(unix)]
+impl Sidecar {
+    fn hosted_peer(&self) -> Option<&HostedPeer> {
+        match &self.peer {
+            Peer::Hosted(hosted) => Some(hosted),
+            Peer::Child { .. } => None,
+        }
+    }
+
+    /// The reason a model-dependent call must wait, when the server cannot yet
+    /// be replaced.
+    fn model_pending(&self) -> Option<String> {
+        self.hosted_peer()
+            .and_then(|peer| relock(&peer.model_pending).clone())
+    }
+
+    /// How many jobs the hosted server holds now.
+    fn hosted_job_count(&self) -> Result<usize, HarnessError> {
+        let raw = self.call("serve.status", None, DEFAULT_CALL_TIMEOUT)?;
+        serde_json::from_value::<hosted::ServeStatus>(raw)
+            .map(|status| status.jobs.len())
+            .map_err(|e| HarnessError::Protocol(format!("could not decode serve.status: {e}")))
+    }
+
+    /// What the server holds, for run reconciliation.
+    fn hosted_view(&self) -> hosted::View {
+        let status = self
+            .call("serve.status", None, DEFAULT_CALL_TIMEOUT)
+            .and_then(|raw| {
+                serde_json::from_value::<hosted::ServeStatus>(raw).map_err(|e| {
+                    HarnessError::Protocol(format!("could not decode serve.status: {e}"))
+                })
+            });
+        match status {
+            Ok(status) => match status.verify_identity() {
+                Ok(_) if status.controller => hosted::View::from_status(&status),
+                Ok(_) => hosted::View::Unknown("another client controls the hosted Manvi".into()),
+                Err(why) => hosted::View::Unknown(why),
+            },
+            Err(error) => hosted::View::Unknown(error.message()),
+        }
+    }
+}
+
+/// Connections to hosted servers that a quit must settle, whoever holds them.
+#[cfg(unix)]
+fn live_hosted() -> &'static Mutex<Vec<std::sync::Weak<Sidecar>>> {
+    static LIVE: OnceLock<Mutex<Vec<std::sync::Weak<Sidecar>>>> = OnceLock::new();
+    LIVE.get_or_init(Mutex::default)
+}
+
+#[cfg(unix)]
+fn register_hosted(sidecar: &Arc<Sidecar>) {
+    let mut live = relock(live_hosted());
+    live.retain(|weak| weak.strong_count() > 0);
+    live.push(Arc::downgrade(sidecar));
+}
+
+/// The quit's end of one hosted connection: stop its runs if that was chosen
+/// (bounded, and never under a lock), then disconnect. Disconnecting alone
+/// leaves the runs going.
+fn settle_hosted(sidecar: &Sidecar, choice: hosted::ExitChoice) {
+    if sidecar.shutting_down.load(Ordering::Acquire) {
+        return;
+    }
+    if choice == hosted::ExitChoice::Stop {
+        match sidecar.stop_hosted_runs() {
+            Ok(pending) if pending.is_empty() => {
+                log::info!(target: "harness", "stopped every hosted managed run before quitting");
+            }
+            Ok(pending) => {
+                log::warn!(target: "harness", "{} hosted managed run(s) were still ending when GitPulse quit: {}", pending.len(), pending.join(", "));
+            }
+            Err(error) => {
+                log::warn!(target: "harness", "could not stop the hosted managed runs before quitting: {error}");
+            }
+        }
+    } else if sidecar.is_hosted() {
+        log::info!(target: "harness", "quitting with every hosted managed run left running");
+    }
+    sidecar.terminate();
+}
+
+/// The quit chose to stop a hosted server's runs and this worker is not
+/// connected to it: dial it (never starting one), bounded by the controller
+/// wait and the stop's own wait, and stop its runs. A server that cannot be
+/// reached or used leaves its runs going, which is logged and not hidden.
+#[cfg(unix)]
+fn stop_unconnected_hosted(
+    profile: &Path,
+    selection: Option<&ModelSelection>,
+    plan: &hosted::HostPlan,
+) {
+    match spawn_hosted(profile, selection, plan, HostMode::Adopt) {
+        Ok(sidecar) => settle_hosted(&sidecar, hosted::ExitChoice::Stop),
+        Err(HostedFailure::Gone) => {
+            log::info!(target: "harness", "no hosted Manvi holds runs to stop");
+        }
+        Err(HostedFailure::Blocked(error)) => {
+            log::warn!(target: "harness", "could not stop the hosted managed runs before quitting: {}", error.message());
+        }
+        Err(HostedFailure::Fallback(why)) => {
+            log::warn!(target: "harness", "could not stop the hosted managed runs before quitting: {why}");
+        }
+    }
+}
+
+/// Settles every hosted connection for an exit that has not closed them yet:
+/// what [`crate::teardown`] runs, so a quit that reaches teardown without
+/// going through the profile worker's own shutdown still stops or leaves the
+/// hosted runs as chosen.
+pub(crate) fn settle_hosted_for_exit() {
+    #[cfg(unix)]
+    {
+        let choice = hosted::exit_choice();
+        let live: Vec<Arc<Sidecar>> = relock(live_hosted())
+            .drain(..)
+            .filter_map(|weak| weak.upgrade())
+            .collect();
+        for sidecar in live {
+            settle_hosted(&sidecar, choice);
+        }
+    }
+}
+
+/// Settings' and the quit question's account of managed-run hosting. Blocking:
+/// it may ask the installed Manvi whether it can serve on a socket (once per
+/// binary), so call it off the async runtime.
+pub fn managed_hosting() -> hosted::ManagedHosting {
+    let requested = crate::tool_config::agent_defaults().keeps_terminals_running();
+    let observed = hosted::observed();
+    #[cfg(unix)]
+    let support = (requested
+        && matches!(
+            observed,
+            hosted::Observed::Untried | hosted::Observed::Detached
+        ))
+    .then(|| resolve_binary().map(|binary| hosted::probe_support(&binary)))
+    .flatten();
+    #[cfg(not(unix))]
+    let support = None;
+    hosted::describe(requested, &observed, support.as_ref())
+}
+
+/// The quit's choice for hosted managed runs (see `cmd_exit_app`).
+pub(crate) fn set_managed_exit(choice: hosted::ExitChoice) {
+    hosted::set_exit_choice(choice);
+}
+
 /// The process-wide sidecar, started on first use and restarted after a fault.
 struct Slot {
     sidecar: Option<Arc<Sidecar>>,
@@ -1536,6 +2270,9 @@ struct Slot {
     profile: Option<PathBuf>,
     selection: Option<ModelSelection>,
     closed: bool,
+    /// Where to host the profile worker's `manvi serve`, when the person chose
+    /// to keep agents running. `None` is the stdio child.
+    hosting: Option<hosted::HostPlan>,
 }
 
 fn slot() -> &'static Mutex<Slot> {
@@ -1548,6 +2285,7 @@ fn slot() -> &'static Mutex<Slot> {
             profile: None,
             selection: None,
             closed: false,
+            hosting: None,
         })
     })
 }
@@ -1571,6 +2309,7 @@ fn hook_slot() -> &'static Mutex<Slot> {
             profile: None,
             selection: None,
             closed: false,
+            hosting: None,
         })
     })
 }
@@ -1626,6 +2365,17 @@ impl Slot {
         }
     }
 
+    /// Makes `sidecar` the live connection, registering a hosted one with the
+    /// quit's settlement.
+    fn install(&mut self, sidecar: Sidecar) {
+        let sidecar = Arc::new(sidecar);
+        #[cfg(unix)]
+        if sidecar.is_hosted() {
+            register_hosted(&sidecar);
+        }
+        self.sidecar = Some(sidecar);
+    }
+
     fn ensure(&mut self) -> Result<Arc<Sidecar>, HarnessError> {
         if self.closed {
             return Err(HarnessError::Unavailable(
@@ -1641,12 +2391,14 @@ impl Slot {
                 }
             }
             let started = match &self.profile {
-                Some(profile) => spawn_with_profile(Some(profile), self.selection.as_ref()),
+                Some(profile) => {
+                    start_profile_sidecar(profile, self.selection.as_ref(), self.hosting.as_ref())
+                }
                 None => spawn(),
             };
             match started {
                 Ok(s) => {
-                    self.sidecar = Some(Arc::new(s));
+                    self.install(s);
                     self.last_error = None;
                     self.backoff_until = None;
                 }
@@ -1758,7 +2510,27 @@ fn call_in_slot(
             ));
         }
         let requires_capability = guard.profile.is_some();
-        let sidecar = guard.ensure()?;
+        #[allow(unused_mut)]
+        let mut sidecar = guard.ensure()?;
+        // A hosted server keeps the model it was started with. When runs keep
+        // it from being replaced, a call that depends on the model waits for
+        // them rather than quietly running on the wrong one; once they have
+        // ended, the server is replaced here and the call goes on.
+        #[cfg(unix)]
+        if MODEL_BOUND_OPS.contains(&op) {
+            if let Some(why) = sidecar.model_pending() {
+                if sidecar.hosted_job_count()? == 0 {
+                    guard.drop_sidecar();
+                    sidecar = guard.ensure()?;
+                } else {
+                    return Err(HarnessError::Refused(WireError {
+                        code: "model_pending".into(),
+                        message: why,
+                        retryable: true,
+                    }));
+                }
+            }
+        }
         if requires_capability && !serves(&sidecar.hello, op) {
             return Err(HarnessError::Refused(WireError {
                 code: "unsupported_operation".into(),
@@ -1842,9 +2614,22 @@ pub(crate) struct ProfileConnection {
 }
 
 impl ProfileConnection {
+    #[cfg(test)]
     pub(crate) fn new(
         profile: PathBuf,
         selection: Option<ModelSelection>,
+    ) -> Result<Self, HarnessError> {
+        Self::new_hosting(profile, selection, None)
+    }
+
+    /// [`Self::new`] for a worker whose `manvi serve` is hosted outside this
+    /// process when `hosting` is given: the app passes the plan its setting
+    /// makes ([`hosted::HostPlan::from_settings`]); anything else is the
+    /// stdio child it always was.
+    pub(crate) fn new_hosting(
+        profile: PathBuf,
+        selection: Option<ModelSelection>,
+        hosting: Option<hosted::HostPlan>,
     ) -> Result<Self, HarnessError> {
         if !profile.is_absolute() {
             return Err(HarnessError::Protocol(
@@ -1859,6 +2644,7 @@ impl ProfileConnection {
                 profile: Some(profile),
                 selection,
                 closed: false,
+                hosting,
             }),
             closing: std::sync::atomic::AtomicBool::new(false),
         })
@@ -1936,12 +2722,25 @@ impl ProfileConnection {
         else {
             return false;
         };
+        // A hosted server keeps what it was started with (the Claude key, the
+        // model), and a retire is the signal that one of them changed. The
+        // server is not stopped here — it may hold runs — but marked, so the
+        // next connection that finds it holding none replaces it.
+        #[cfg(unix)]
+        if let Some(plan) = &guard.hosting {
+            if let Err(why) = hosted::mark_restart(&plan.paths) {
+                log::warn!(target: "harness", "could not mark the hosted Manvi for replacement: {why}");
+            }
+        }
         guard.drop_sidecar();
         guard.last_error = None;
         guard.backoff_until = None;
         true
     }
 
+    /// Closes the worker for an exit. A hosted server is disconnected from —
+    /// and first told to stop its runs when the quit chose that — never
+    /// killed. The round trip to stop them happens with the slot released.
     pub(crate) fn shutdown(&self) -> bool {
         self.closing
             .store(true, std::sync::atomic::Ordering::Release);
@@ -1950,9 +2749,96 @@ impl ProfileConnection {
         else {
             return false;
         };
+        // A repeat (a worker closed once by a refused call and again by the
+        // quit) has nothing left to settle and must not dial again.
+        let repeat = guard.closed;
         guard.closed = true;
-        guard.drop_sidecar();
+        let sidecar = guard.sidecar.take();
+        // What a dial to a server this worker is not connected to would need.
+        #[cfg(unix)]
+        let unconnected = guard.hosting.clone().map(|plan| {
+            (
+                guard.profile.clone().unwrap_or_default(),
+                guard.selection.clone(),
+                plan,
+            )
+        });
+        drop(guard);
+        match sidecar {
+            Some(sidecar) if sidecar.is_hosted() => {
+                settle_hosted(&sidecar, hosted::exit_choice());
+            }
+            Some(sidecar) => sidecar.terminate(),
+            // No connection: a replaced or faulted one, or none made yet this
+            // launch. A hosted server may still hold the runs from an earlier
+            // launch, and a quit that chose to stop them must not leave them
+            // because this worker happened not to be connected.
+            None =>
+            {
+                #[cfg(unix)]
+                if !repeat && hosted::exit_choice() == hosted::ExitChoice::Stop {
+                    if let Some((profile, selection, plan)) = unconnected {
+                        stop_unconnected_hosted(&profile, selection.as_ref(), &plan);
+                    }
+                }
+            }
+        }
         true
+    }
+
+    /// What the hosted server holds, for run reconciliation: connects to one
+    /// that is already running (never starts one) and asks it.
+    pub(crate) fn hosted_view(&self) -> hosted::View {
+        #[cfg(not(unix))]
+        return hosted::View::NotHosting;
+        #[cfg(unix)]
+        {
+            let sidecar = {
+                let Some(mut guard) =
+                    acquire_slot_for(&self.slot, Instant::now() + Duration::from_secs(3))
+                else {
+                    return hosted::View::Unknown(
+                        "the profile worker was busy for the whole budget".into(),
+                    );
+                };
+                let Some(plan) = guard.hosting.clone() else {
+                    return hosted::View::NotHosting;
+                };
+                if guard.closed {
+                    return hosted::View::NotHosting;
+                }
+                match guard.sidecar.clone() {
+                    Some(live) if live.is_hosted() => live,
+                    // Running as the stdio child: the hosted server, if any,
+                    // is not this worker's to read.
+                    Some(_) => return hosted::View::NotHosting,
+                    None => {
+                        let profile = guard.profile.clone().unwrap_or_default();
+                        match spawn_hosted(
+                            &profile,
+                            guard.selection.as_ref(),
+                            &plan,
+                            HostMode::Adopt,
+                        ) {
+                            Ok(adopted) => {
+                                guard.install(adopted);
+                                match guard.sidecar.clone() {
+                                    Some(live) => live,
+                                    None => return hosted::View::Gone,
+                                }
+                            }
+                            Err(HostedFailure::Gone) => return hosted::View::Gone,
+                            Err(HostedFailure::Blocked(error)) => {
+                                hosted::observe(hosted::Observed::Blocked(error.message()));
+                                return hosted::View::Unknown(error.message());
+                            }
+                            Err(HostedFailure::Fallback(why)) => return hosted::View::Unknown(why),
+                        }
+                    }
+                }
+            };
+            sidecar.hosted_view()
+        }
     }
 }
 
@@ -2315,7 +3201,13 @@ mod tests {
     /// `procguard`, so the child leads a process group and the shutdown ladder
     /// has the registration it needs. A child shape the tests can reach but
     /// production cannot is a child shape the tests are not really covering.
-    fn registered_script(script: &str) -> (Child, crate::procguard::Registration, ChildStdin) {
+    fn registered_script(
+        script: &str,
+    ) -> (
+        Child,
+        crate::procguard::Registration,
+        std::process::ChildStdin,
+    ) {
         let mut command = Command::new("sh");
         command
             .args(["-c", script])
@@ -2457,9 +3349,8 @@ mod tests {
         });
 
         Sidecar {
-            child,
-            guard,
-            stdin: Mutex::new(Some(stdin)),
+            peer: Peer::Child { child, guard },
+            stdin: Mutex::new(Some(Box::new(stdin))),
             inbox: Inbox::new(rx),
             stderr: tail,
             hello: HelloResult::default(),
@@ -2480,7 +3371,7 @@ mod tests {
     #[test]
     fn a_child_that_closes_its_stdout_is_reaped_by_the_pump() {
         let sidecar = scripted_sidecar("exit 0", WRITE_DEADLINE);
-        let pid = i32::try_from(relock(&sidecar.child).id()).expect("pid");
+        let pid = i32::try_from(relock(sidecar.child()).id()).expect("pid");
         let deadline = Instant::now() + Duration::from_secs(5);
         // SAFETY: signal 0 only probes; a zombie still answers it, a reaped
         // pid does not.
@@ -2510,7 +3401,7 @@ mod tests {
     /// SIGKILLed (`signal() == Some(9)`).
     #[cfg(unix)]
     fn status_after_shutdown(sidecar: Sidecar) -> (std::process::ExitStatus, Duration) {
-        let child = sidecar.child.clone();
+        let child = sidecar.child().clone();
         let started = Instant::now();
         drop(sidecar);
         let took = started.elapsed();
@@ -2603,7 +3494,7 @@ mod tests {
             ),
             WRITE_DEADLINE,
         );
-        let child = sidecar.child.clone();
+        let child = sidecar.child().clone();
         let status = status_when_it_exits(&child);
         assert_eq!(
             status.code(),
@@ -2625,7 +3516,7 @@ mod tests {
             MAX_QUEUED_STDOUT_FRAMES + 1
         );
         let sidecar = scripted_sidecar(&script, WRITE_DEADLINE);
-        let child = sidecar.child.clone();
+        let child = sidecar.child().clone();
         let status = status_when_it_exits(&child);
         assert_eq!(status.signal(), Some(9), "flood did not kill: {status:?}");
         drop(sidecar);
@@ -2655,6 +3546,7 @@ done"#;
             profile: None,
             selection: None,
             closed: false,
+            hosting: None,
         })));
         let probe = thread::spawn(move || {
             call_in_slot(
@@ -2702,7 +3594,7 @@ done"#;
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let exited = sidecar
-                .child
+                .child()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .try_wait()
@@ -3242,7 +4134,7 @@ done
             .sidecar
             .as_ref()
             .unwrap()
-            .child
+            .child()
             .lock()
             .unwrap()
             .id();
@@ -3256,7 +4148,7 @@ done
             .sidecar
             .as_ref()
             .unwrap()
-            .child
+            .child()
             .lock()
             .unwrap()
             .id();
@@ -3358,7 +4250,9 @@ while IFS= read -r line; do handle "$line" & done
     #[cfg(unix)]
     fn sidecar_pid(connection: &ProfileConnection) -> Option<u32> {
         let slot = connection.slot.lock().unwrap();
-        slot.sidecar.as_ref().map(|s| s.child.lock().unwrap().id())
+        slot.sidecar
+            .as_ref()
+            .map(|s| s.child().lock().unwrap().id())
     }
 
     /// Reproduction: one slow `managed.prepare` used to outlast the call
@@ -4013,7 +4907,7 @@ while IFS= read -r line; do handle "$line" & done
         sidecar.terminate();
         let took = started.elapsed();
         let after = own_rss_kib();
-        let status = status_when_it_exits(&sidecar.child);
+        let status = status_when_it_exits(sidecar.child());
         assert_eq!(status.signal(), Some(9), "{status:?}");
         assert!(
             took < sidecar.shutdown_grace
@@ -4044,7 +4938,7 @@ while IFS= read -r line; do handle "$line" & done
             let started = Instant::now();
             sidecar.terminate();
             let took = started.elapsed();
-            let status = status_when_it_exits(&sidecar.child);
+            let status = status_when_it_exits(sidecar.child());
             assert_eq!(status.signal(), Some(9), "{status:?}");
             assert!(
                 took < sidecar.shutdown_grace
@@ -4068,7 +4962,7 @@ while IFS= read -r line; do handle "$line" & done
             "y".repeat(99)
         );
         let sidecar = graceful(&script, 600);
-        let held = relock(&sidecar.child);
+        let held = relock(sidecar.child());
         thread::sleep(crate::test_support::coverage_relaxed(
             Duration::from_millis(300),
         ));
@@ -4076,7 +4970,7 @@ while IFS= read -r line; do handle "$line" & done
         drop(relock(&sidecar.stdin).take());
         thread::sleep(sidecar.shutdown_grace);
         drop(held);
-        let status = status_when_it_exits(&sidecar.child);
+        let status = status_when_it_exits(sidecar.child());
         assert!(pump_exits(&sidecar), "pump hung behind the child lock");
         assert_eq!(
             status.code(),
@@ -4093,7 +4987,7 @@ while IFS= read -r line; do handle "$line" & done
     #[test]
     fn a_flood_that_met_a_busy_lock_is_killed_once_it_frees() {
         let sidecar = scripted_sidecar(&format!("yes '{}'", "x".repeat(99)), WRITE_DEADLINE);
-        let held = relock(&sidecar.child);
+        let held = relock(sidecar.child());
         thread::sleep(Duration::from_millis(300));
         assert!(
             !sidecar.shutting_down.load(Ordering::Acquire),
@@ -4101,7 +4995,7 @@ while IFS= read -r line; do handle "$line" & done
         );
         let freed = Instant::now();
         drop(held);
-        let status = status_when_it_exits(&sidecar.child);
+        let status = status_when_it_exits(sidecar.child());
         assert_eq!(status.signal(), Some(9), "{status:?}");
         assert!(
             freed.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(3)),
@@ -4128,7 +5022,7 @@ while IFS= read -r line; do handle "$line" & done
                 "step {step}: terminate took {took:?}"
             );
             assert!(pump_exits(&sidecar), "step {step}: pump never exited");
-            let status = status_when_it_exits(&sidecar.child);
+            let status = status_when_it_exits(sidecar.child());
             assert_eq!(status.signal(), Some(9), "step {step}: {status:?}");
         }
     }
@@ -4149,7 +5043,7 @@ while IFS= read -r line; do handle "$line" & done
         );
         let b = scripted_sidecar(&script, WRITE_DEADLINE);
         assert!(!b.shutting_down.load(Ordering::Acquire));
-        let status = status_when_it_exits(&b.child);
+        let status = status_when_it_exits(b.child());
         assert_eq!(status.signal(), Some(9), "{status:?}");
     }
 
@@ -4220,7 +5114,7 @@ while IFS= read -r line; do handle "$line" & done
         let started = Instant::now();
         sidecar.terminate();
         let took = started.elapsed();
-        let status = status_when_it_exits(&sidecar.child);
+        let status = status_when_it_exits(sidecar.child());
         assert_eq!(status.signal(), Some(9), "{status:?}");
         assert!(
             took < sidecar.shutdown_grace
@@ -4404,3 +5298,7 @@ mod scratch_dir_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "hosted_flow_tests.rs"]
+mod hosted_flow_tests;

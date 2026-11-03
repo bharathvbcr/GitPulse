@@ -717,14 +717,41 @@ pub fn cmd_set_exit_guard_ready(state: State<DesktopState>) {
 /// is the quit's choice for sessions a terminal host holds: `"leave"` keeps
 /// them running for the next launch, `"stop"` ends them. Absent leaves the
 /// backend's default: in-process sessions always stop, a host's are left.
+/// `managed` is the same choice for managed agent runs a hosted Manvi holds
+/// (Settings → Agents → keep running): `"leave"` disconnects and leaves them,
+/// `"stop"` stops them first. Absent leaves them, which is also what an exit
+/// nobody was asked about does; without a hosted Manvi the runs end with the
+/// process whatever this says.
 #[tauri::command(async)]
-pub fn cmd_exit_app(app: AppHandle, terminals: Option<String>) -> Result<(), String> {
+pub fn cmd_exit_app(
+    app: AppHandle,
+    terminals: Option<String>,
+    managed: Option<String>,
+) -> Result<(), String> {
     let sessions = app.state::<crate::terminal::TerminalSessions>();
-    match terminals.as_deref() {
-        None => {}
-        Some("leave") => sessions.set_leave_running(true),
-        Some("stop") => sessions.set_leave_running(false),
+    // Both choices are validated before either is applied, so a refused
+    // request changes nothing.
+    let leave_terminals = match terminals.as_deref() {
+        None => None,
+        Some("leave") => Some(true),
+        Some("stop") => Some(false),
         Some(other) => return Err(format!("Unknown choice for terminals on quit: {other:?}")),
+    };
+    let managed_exit = match managed.as_deref() {
+        None => None,
+        Some("leave") => Some(crate::harness::hosted::ExitChoice::Leave),
+        Some("stop") => Some(crate::harness::hosted::ExitChoice::Stop),
+        Some(other) => {
+            return Err(format!(
+                "Unknown choice for managed runs on quit: {other:?}"
+            ))
+        }
+    };
+    if let Some(leave) = leave_terminals {
+        sessions.set_leave_running(leave);
+    }
+    if let Some(choice) = managed_exit {
+        crate::harness::sidecar::set_managed_exit(choice);
     }
     exit::approve(&app);
     Ok(())

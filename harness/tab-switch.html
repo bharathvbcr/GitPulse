@@ -580,7 +580,13 @@
 
           // ---- 6. quitting during a bulk pull asks before it ends the pull -------
           fixtures.cmd_pull = () => ({ policy: null, output: "ok" });
-          fixtures.cmd_exit_request_answer = () => null;
+          const nativeAnswers = [];
+          fixtures.cmd_exit_request_answer = (a) => { nativeAnswers.push(a.answer); return null; };
+          // The quit asks about managed runs first, from the workbench's own
+          // listing; with none recorded it asks nothing and the Git-action
+          // question below is the first prompt.
+          const runsPage = (items) => JSON.stringify({ ok: true, items, shown: items.length, total: items.length, has_more: false, next_cursor: null });
+          fixtures.cmd_workbench_request = (a) => (a.method === "runs.list" ? runsPage([]) : null);
           const releasePull = hold("cmd_pull", ALPHA);
           const sweep = repoStore.runAcrossOpenRepos("pull", { only: [ALPHA] });
           await sleepUntil(() => calls.some((c) => c.cmd === "cmd_pull" && c.repo === ALPHA));
@@ -594,7 +600,66 @@
           await sweep;
           await settle();
           delete fixtures.cmd_pull;
+
+          // ---- 6b. quitting while a managed run is working ------------------------
+          // Without a hosted Manvi the run ends with the app, and the question
+          // says so; with one, it can be left running, and the question offers it.
+          const managedRun = {
+            kind: "managed", id: "run-1", revision: 1, updated_at: 100, task_id: "task", source_revision: 2, task_title: "Ship it",
+            repository_id: "repo", provider: "codex", permission_mode: "ask", state: "running", cwd: `${ALPHA}/.gitpulse/worktrees/run-1`,
+            created_at: 100, expires_at: 400, session_id: "session", exit_code: null, reason: "", outcome_uncertain: false,
+            provider_state: "running", provider_thread_id: "thread", provider_turn_id: "turn",
+          };
+          fixtures.cmd_workbench_request = (a) => (a.method === "runs.list" ? runsPage(JSON.parse(a.input).state === "running" ? [managedRun] : []) : null);
+          const exitCalls = [];
+          // A stop is recorded and then refused, so the page returns to a quit it
+          // can be asked again (an accepted exit leaves the request pending for
+          // good: the process is about to end).
+          fixtures.cmd_exit_app = (a) => {
+            exitCalls.push(a);
+            if (a.managed === "stop") throw new Error("recorded; not exiting");
+            return null;
+          };
+          const buttons = () => $$("button").map((b) => text(b));
+          const askToQuit = async () => {
+            await emit("gitpulse-exit-requested");
+            await sleepUntil(() => promptTitle() !== null, 3000);
+          };
+          const backendWith = (managed) => () => ({ backend: "in-process", trouble: [], managed });
+
+          fixtures.cmd_terminal_backend = backendWith({ requested: false, hosted: false, detail: "Managed agent runs end when GitPulse quits." });
+          await askToQuit();
+          check("quit: with nothing hosting a managed run the question says it will be stopped", () =>
+            promptTitle() === "Quit While a Managed Run Is Working?" && !buttons().includes("Quit and Leave Running"));
+          // That question says the run is stopped, so confirming it asks the
+          // backend to stop: absent would mean "leave" to a backend that does
+          // hold the run (a connection that was dropped reads as not hosted).
+          completePrompt(true);
+          await sleepUntil(() => exitCalls.length > 0, 3000);
+          check("quit: confirming the stop question reaches the exit as managed: stop", () =>
+            exitCalls.length === 1 && JSON.stringify(exitCalls[0]) === JSON.stringify({ managed: "stop" }));
+          exitCalls.length = 0;
+          await settle();
+
+          fixtures.cmd_terminal_backend = backendWith({ requested: true, hosted: true, detail: "Managed agent runs are kept running when GitPulse quits." });
+          await askToQuit();
+          check("quit: with a hosted Manvi the question offers to leave the run, stop it, or keep working", () =>
+            promptTitle() === "Leave the Managed Run Working?"
+            && ["Quit and Leave Running", "Stop It and Quit", "Keep Working"].every((label) => buttons().includes(label)));
+          cancelPrompt();
+          await settle();
+          check("quit: keeping working answers the native quit request with a cancel, never an exit", () =>
+            nativeAnswers.at(-1) === "cancel" && exitCalls.length === 0);
+
+          await askToQuit();
+          completePrompt(true);
+          await sleepUntil(() => exitCalls.length > 0, 3000);
+          check("quit: leaving the run running reaches the exit as managed: leave, with no terminals choice", () =>
+            exitCalls.length === 1 && JSON.stringify(exitCalls[0]) === JSON.stringify({ managed: "leave" }));
+          delete fixtures.cmd_exit_app;
+          delete fixtures.cmd_workbench_request;
           delete fixtures.cmd_exit_request_answer;
+          fixtures.cmd_terminal_backend = () => ({ backend: "in-process", trouble: [] });
 
           // Runs last: it leaves 8 more tabs open and answers the graph command
           // with rows, which the checks above do not expect.
