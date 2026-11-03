@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -27,6 +27,7 @@ interface Field {
   type: string;
   required: boolean;
   fields?: Record<string, Field>;
+  items?: Field;
 }
 interface ServeContract {
   protocol: number;
@@ -42,6 +43,33 @@ const gateRs = read("src-tauri", "src", "workbench", "verification_gate.rs");
 const proposalsRs = read("src-tauri", "src", "workbench", "intake_proposals.rs");
 const workbenchRs = read("src-tauri", "src", "workbench.rs");
 
+/**
+ * The non-test text of every `src-tauri/src/harness/*.rs` file, by file name.
+ * Test modules (an inline `#[cfg(test)] mod`, and `*_tests.rs` files) are cut
+ * off: they name ops as literals on purpose, to talk to fakes.
+ */
+function harnessProduction(): Map<string, string> {
+  const dir = path.join(REPO, "src-tauri", "src", "harness");
+  const files = new Map<string, string>();
+  for (const name of readdirSync(dir).filter((f) => f.endsWith(".rs") && !/_tests?\.rs$/.test(f))) {
+    const text = readFileSync(path.join(dir, name), "utf8");
+    const testMod = /^#\[cfg\((?:all\()?test[^\n]*\n(?:#\[[^\n]*\n)*(?:pub(?:\([^)]*\))? )?mod \w+/m.exec(text);
+    files.set(name, testMod ? text.slice(0, testMod.index) : text);
+  }
+  return files;
+}
+
+/**
+ * Op-shaped string literals passed as the op argument of a sidecar call:
+ * `x.call("a.b", ..)`, `call_typed::<T>("a.b", ..)`, `call_in_slot(owner, "a.b", ..)`.
+ * An op is `hello` or dotted lowercase words, which a path or message is not.
+ */
+const OP_LITERAL_ARG = /\bcall\w*(?:::<[^>]*>)?\(\s*(?:\w+\s*,\s*)?"(hello|[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+)"/g;
+
+function literalOpCalls(source: string): string[] {
+  return [...source.matchAll(OP_LITERAL_ARG)].map((m) => m[1]);
+}
+
 const declared = (type: string) => Object.keys(contract.types[type].fields ?? {});
 
 /** Text from `start` to the first line that is exactly the closing brace. */
@@ -56,7 +84,7 @@ function block(source: string, start: RegExp): string {
 
 /** Field names of a Rust struct, skipping doc comments and attributes. */
 function structFields(source: string, name: string): string[] {
-  const body = block(source, new RegExp(`pub struct ${name} \\{`));
+  const body = block(source, new RegExp(`pub(?:\\(crate\\))? struct ${name} \\{`));
   return [...body.matchAll(/^\s+pub (\w+):/gm)].map((m) => m[1]);
 }
 
@@ -244,5 +272,60 @@ describe("the ops GitPulse names are served", () => {
       expect(contract.ops.optional).toContain(op);
       expect(contract.ops.always).not.toContain(op);
     }
+  });
+});
+
+describe("every op the harness sends is a named, contract-checked constant", () => {
+  const served = new Set([...contract.ops.always, ...contract.ops.optional]);
+
+  it("sidecar calls in the harness name an OP_* constant, never an op literal", () => {
+    // What `every OP_* constant is a served op` cannot see: a literal handed
+    // straight to `call` is in no list, so the hosted `serve.status` and
+    // `serve.stop_all` went out unchecked against the contract.
+    const offenders: string[] = [];
+    for (const [file, text] of harnessProduction()) {
+      for (const op of literalOpCalls(text)) offenders.push(`${file}: ${op}`);
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it("no serve.* op is spelled as a literal outside protocol.rs", () => {
+    // `HOSTED_OPS` lists the hosted server's ops; it is not a call argument.
+    const offenders: string[] = [];
+    for (const [file, text] of harnessProduction()) {
+      if (file === "protocol.rs") continue;
+      // `serve.sock` and `serve.log` are file names; only the contract's ops count.
+      for (const m of text.matchAll(/"(serve\.[a-z_]+)"/g)) if (served.has(m[1])) offenders.push(`${file}: ${m[1]}`);
+    }
+    expect(offenders).toEqual([]);
+  });
+
+  it("the literal-op scan sees a literal in a call (it is not vacuous)", () => {
+    expect(literalOpCalls('let raw = self.call("serve.stop_all", None, t)?;')).toEqual(["serve.stop_all"]);
+    expect(literalOpCalls('call_in_slot(\n owner,\n "policy.check",\n None)')).toEqual(["policy.check"]);
+    expect(literalOpCalls("sidecar::call_typed::<PrepareResult>(OP_CHAT_PREPARE, params, t)")).toEqual([]);
+    expect(literalOpCalls("self.call(OP_SERVE_STATUS, None, t)")).toEqual([]);
+    expect(literalOpCalls('self.call("not an op", None, t)')).toEqual([]);
+  });
+
+  it("the serve ops the hosted lane sends are constants, served, and the shapes Rust reads are declared", () => {
+    const ops = Object.fromEntries([...protocolRs.matchAll(/pub const (OP_\w+): &str = "([^"]+)";/g)].map((m) => [m[1], m[2]]));
+    expect(ops.OP_SERVE_STATUS).toBe("serve.status");
+    expect(ops.OP_SERVE_STOP_ALL).toBe("serve.stop_all");
+    expect(served.has("serve.status") && served.has("serve.stop_all")).toBe(true);
+    // What GitPulse sends with serve.stop_all.
+    expect(declared("ServeStopAllParams")).toContain("wait_ms");
+    expect(sidecarRs).toMatch(/OP_SERVE_STOP_ALL,\s*Some\(serde_json::json!\(\{"wait_ms":/);
+    // What it reads back of serve.status ...
+    const hostedRs = read("src-tauri", "src", "harness", "hosted.rs");
+    const status = structFields(hostedRs, "ServeStatus");
+    expect(status).toEqual(expect.arrayContaining(["protocol", "owner_id", "process_id", "controller", "jobs"]));
+    expect(undeclared(status, "ServeStatusResult")).toEqual([]);
+    const job = structFields(hostedRs, "ServeJob");
+    expect(job).toEqual(expect.arrayContaining(["id", "phase"]));
+    const jobFields = contract.types.ServeStatusResult.fields?.jobs.items?.fields ?? {};
+    expect(job.filter((name) => !(name in jobFields))).toEqual([]);
+    // ... and of serve.stop_all (the `pending` ids sidecar.rs decodes).
+    expect(declared("ServeStopAllResult")).toContain("pending");
   });
 });

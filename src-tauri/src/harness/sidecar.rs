@@ -592,7 +592,7 @@ impl Sidecar {
         }
         let wait = hosted::STOP_ALL_WAIT;
         let raw = self.call(
-            "serve.stop_all",
+            OP_SERVE_STOP_ALL,
             Some(serde_json::json!({"wait_ms": wait.as_millis() as u64})),
             wait + ADVERTISED_DEADLINE_MARGIN,
         )?;
@@ -1741,7 +1741,7 @@ pub(crate) fn serve_usage(binary: &str, deadline: Duration) -> Result<String, St
 
 /// Ops a hosted server must serve for a connection to it to be usable.
 #[cfg(unix)]
-const HOSTED_OPS: [&str; 2] = ["serve.status", "serve.stop_all"];
+const HOSTED_OPS: [&str; 2] = [OP_SERVE_STATUS, OP_SERVE_STOP_ALL];
 
 /// Ops whose answer depends on the model the server was started with.
 #[cfg(unix)]
@@ -1930,7 +1930,7 @@ fn connect_as_controller(
             .map_err(|e| HarnessError::Unavailable(format!("could not use the socket: {e}")))?;
         // `serve.status` is answered to a connection that does not control the
         // server; nothing else is, hello included.
-        let raw = sidecar.call("serve.status", None, hello_timeout())?;
+        let raw = sidecar.call(OP_SERVE_STATUS, None, hello_timeout())?;
         let status: hosted::ServeStatus = serde_json::from_value(raw)
             .map_err(|e| HarnessError::Protocol(format!("could not decode serve.status: {e}")))?;
         if status.controller {
@@ -2131,7 +2131,7 @@ impl Sidecar {
 
     /// How many jobs the hosted server holds now.
     fn hosted_job_count(&self) -> Result<usize, HarnessError> {
-        let raw = self.call("serve.status", None, DEFAULT_CALL_TIMEOUT)?;
+        let raw = self.call(OP_SERVE_STATUS, None, DEFAULT_CALL_TIMEOUT)?;
         serde_json::from_value::<hosted::ServeStatus>(raw)
             .map(|status| status.jobs.len())
             .map_err(|e| HarnessError::Protocol(format!("could not decode serve.status: {e}")))
@@ -2140,7 +2140,7 @@ impl Sidecar {
     /// What the server holds, for run reconciliation.
     fn hosted_view(&self) -> hosted::View {
         let status = self
-            .call("serve.status", None, DEFAULT_CALL_TIMEOUT)
+            .call(OP_SERVE_STATUS, None, DEFAULT_CALL_TIMEOUT)
             .and_then(|raw| {
                 serde_json::from_value::<hosted::ServeStatus>(raw).map_err(|e| {
                     HarnessError::Protocol(format!("could not decode serve.status: {e}"))
