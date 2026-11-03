@@ -59,7 +59,9 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          workspaces: src-tauri
+          workspaces: |
+            src-tauri
+            crates/gitpulse-worktree
           prefix-key: ${{ env.RUST_CACHE_PREFIX }}
 
       # Bun installs and runs the package scripts; Vitest, Vite and
@@ -188,6 +190,23 @@ jobs:
           else
             cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast -- --nocapture --test-threads=1
           fi
+
+      # crates/gitpulse-worktree is its own workspace with its own Cargo.lock and
+      # its own target dir (crates/gitpulse-worktree/target), so it never contends
+      # with src-tauri/target. Nothing above builds it: before these steps the
+      # zero-copy build cache (gitpulse-rustc) shipped with no CI at all. The
+      # subprocess tests it ships are Unix-only, hence no Windows run.
+      - name: Worktree Crate Format Check
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        run: cargo fmt --manifest-path crates/gitpulse-worktree/Cargo.toml -- --check
+
+      - name: Worktree Crate Clippy
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        run: cargo clippy --manifest-path crates/gitpulse-worktree/Cargo.toml --locked --all-targets -- -D warnings
+
+      - name: Worktree Crate Tests
+        if: ${{ !cancelled() && runner.os != 'Windows' }}
+        run: cargo test --manifest-path crates/gitpulse-worktree/Cargo.toml --locked --no-fail-fast -- --test-threads=1
 
       - name: Descriptor inheritance under concurrent spawns
         # The test is #[ignore]d out of the suite above: it is a 12,003-spawn,
