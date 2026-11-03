@@ -125,7 +125,7 @@
     check("20 backlinks on one line render",target.querySelectorAll("li").length===20);
     host.show("map"); await settle();
     const click = async name => {const button=[...target.querySelectorAll("button")].find(b=>b.textContent.trim()===name);if(!button)throw Error(`Missing button ${name}`);button.click();await settle();};
-    await click("Refresh");
+    await click("Refresh index");
     check("build failure remains visible after status reload",target.textContent.includes("BUILD-FAILURE-DETAIL"));
     const copiedLogs = [];
     const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
@@ -136,7 +136,7 @@
       await click("Copy DevMap logs");
       check("map copies native logs and retained failure context",copiedLogs.at(-1)?.includes("native build failure")&&copiedLogs.at(-1)?.includes("BUILD-FAILURE-DETAIL")&&!copiedLogs.at(-1)?.includes("unrelated git log")&&target.textContent.includes("DevMap logs copied."));
       fixture.cmd_devmap_refresh = a => defer("build",a);
-      await click("Refresh");
+      await click("Refresh index");
       const building = take("build");
       await click("Copy DevMap logs");
       check("map logs remain copyable during a running build",copiedLogs.at(-1)?.includes('"building": true'));
