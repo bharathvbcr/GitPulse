@@ -3496,7 +3496,13 @@ pub(crate) mod tests {
             total(view.claude) + total(view.codex) + total(view.other),
             u32::try_from(view.sessions.len()).unwrap()
         );
-        assert_eq!(view.other, SessionCount { launched: 0, observed: 3 });
+        assert_eq!(
+            view.other,
+            SessionCount {
+                launched: 0,
+                observed: 3
+            }
+        );
     }
 
     /// A launched tree keeps a child that was reparented to launchd, through

@@ -2129,7 +2129,10 @@ class C:
         let v = verdict_for(FILE, &left, &right);
         assert_disjoint_means_git_merges(&v, FILE, base, &left, &right);
         assert_eq!(v.kind, EntityCollisionKind::ContendedLine, "{v:?}");
-        assert!(!v.contended_lines.is_empty(), "contended lines must be non-empty");
+        assert!(
+            !v.contended_lines.is_empty(),
+            "contended lines must be non-empty"
+        );
         assert!(v.reason.contains("edits touch"), "{}", v.reason);
     }
 
@@ -2155,7 +2158,10 @@ class C:
         let v = verdict_for(FILE, &left, &right);
         assert_disjoint_means_git_merges(&v, FILE, CLASS_TEXT, &left, &right);
         assert_eq!(v.kind, EntityCollisionKind::ContendedLine, "{v:?}");
-        assert!(!v.contended_lines.is_empty(), "contended lines must be non-empty");
+        assert!(
+            !v.contended_lines.is_empty(),
+            "contended lines must be non-empty"
+        );
         assert!(v.reason.contains("edits touch"), "{}", v.reason);
     }
 
@@ -2169,10 +2175,20 @@ class C:
         // Party A modifies line 3 (footprint [3, 4])
         let left = worktree_named("w1-", FILE, base, &syms, &replace_line(base, 3, "} // a"));
         // Party B modifies line 4 (footprint [4, 5])
-        let right = worktree_named("w2-", FILE, base, &syms, &replace_line(base, 4, "fn b() { // b"));
+        let right = worktree_named(
+            "w2-",
+            FILE,
+            base,
+            &syms,
+            &replace_line(base, 4, "fn b() { // b"),
+        );
         let v = verdict_for(FILE, &left, &right);
         assert_eq!(v.kind, EntityCollisionKind::ContendedLine, "{v:?}");
-        assert!(v.contended_lines.contains(&(4, 4)), "contended lines must capture intersection at 4: {:?}", v.contended_lines);
+        assert!(
+            v.contended_lines.contains(&(4, 4)),
+            "contended lines must capture intersection at 4: {:?}",
+            v.contended_lines
+        );
     }
 
     #[test]
