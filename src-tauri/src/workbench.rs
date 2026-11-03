@@ -389,7 +389,7 @@ impl WorkbenchState {
         let Some(plan) = crate::harness::hosted::HostPlan::from_settings() else {
             return;
         };
-        let path = match intake::default_profile_path() {
+        let path = match self.profile_path() {
             Ok(path) => path,
             Err(error) => {
                 log::warn!(target: "workbench", "could not stop the hosted managed runs before quitting: {}", error.message);

@@ -201,6 +201,10 @@ pub fn begin<R: Runtime>(app: &AppHandle<R>, origin: Origin) -> Begin {
 
 /// Gives a taken request its final answer.
 pub fn settle<R: Runtime>(app: &AppHandle<R>, pending: Pending, approve: bool) {
+    if !approve {
+        // The quit the choices were given for is not happening.
+        crate::harness::hosted::reset_exit_choice();
+    }
     match pending.origin {
         Origin::Internal => {
             if approve {

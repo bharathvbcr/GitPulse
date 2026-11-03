@@ -271,10 +271,15 @@ impl DesktopState {
 /// goes to the frontend.
 fn route_exit_requested<R: Runtime>(app: &AppHandle<R>, code: Option<i32>) -> exit::Begin {
     if code.is_some() {
-        exit::Begin::Proceed
-    } else {
-        exit::begin(app, exit::Origin::Internal)
+        return exit::Begin::Proceed;
     }
+    let begin = exit::begin(app, exit::Origin::Internal);
+    if begin != exit::Begin::Proceed {
+        // The exit is held for a confirmation, so whatever an earlier approval
+        // chose for the hosted runs is not for this one.
+        crate::harness::hosted::reset_exit_choice();
+    }
+    begin
 }
 
 pub fn handle_run_event<R: Runtime>(app: &AppHandle<R>, event: &RunEvent) {
@@ -1041,5 +1046,44 @@ mod tests {
         assert_eq!(repository_switcher_key(&a), repository_switcher_key(&b));
         b.active = false;
         assert_ne!(repository_switcher_key(&a), repository_switcher_key(&b));
+    }
+
+    /// The quit's choice for hosted runs is for one approved quit. When that
+    /// quit is held for a confirmation or cancelled, a later exit nobody was
+    /// asked about (a signal) must not find `Stop` still set.
+    #[test]
+    fn a_prevented_or_cancelled_quit_does_not_leave_stop_behind() {
+        use crate::harness::hosted::{exit_choice, set_exit_choice, ExitChoice};
+        let _serial = crate::harness::sidecar::test_serial();
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        app.manage(DesktopState::default());
+        let handle = app.handle();
+        let state = handle.state::<DesktopState>();
+
+        // A quit that proceeds keeps the choice: it is the one it was made for.
+        set_exit_choice(ExitChoice::Stop);
+        assert_eq!(route_exit_requested(handle, Some(0)), exit::Begin::Proceed);
+        assert_eq!(exit_choice(), ExitChoice::Stop);
+
+        // A code-less exit held behind a request already waiting is prevented.
+        state.exit.arm();
+        let (opened, _) = state.exit.open(exit::Origin::Internal);
+        assert_eq!(opened, exit::Begin::Deferred);
+        assert_eq!(
+            route_exit_requested(handle, None),
+            exit::Begin::AlreadyPending
+        );
+        assert_eq!(
+            exit_choice(),
+            ExitChoice::Leave,
+            "a prevented exit must not leave Stop set for a later exit nobody was asked about"
+        );
+
+        // The person cancels the quit they had answered Stop to.
+        set_exit_choice(ExitChoice::Stop);
+        let pending = state.exit.take().expect("the open request");
+        exit::settle(handle, pending, false);
+        assert_eq!(exit_choice(), ExitChoice::Leave);
+        crate::harness::hosted::reset_exit_choice();
     }
 }

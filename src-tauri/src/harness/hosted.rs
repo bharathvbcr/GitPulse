@@ -95,8 +95,13 @@ pub(crate) fn controller_wait() -> Duration {
 /// Manvi's `socket.go`), shorter than macOS's 103 bytes.
 #[cfg(unix)]
 const MANVI_MAX_SOCKET_PATH: usize = 100;
-/// The most jobs Manvi lists in `serve.status`. A listing this long may have
-/// been cut, so a job missing from it proves nothing.
+/// The most jobs `serve.status` can be expected to list. Manvi does not cut the
+/// list: `ManagedRunner.Jobs()` returns every job that has not ended, and what
+/// bounds it is the number of managed sessions the server admits at all
+/// (`MaxManagedSessions`, 64). A listing this long is therefore at the server's
+/// own ceiling, and this side does not take it for the whole picture: it may
+/// belong to a server whose limit is higher than the one this build knows, so
+/// a job missing from it proves nothing.
 pub(crate) const MAX_LISTED_JOBS: usize = 64;
 
 /// Where the hosted server keeps everything.
@@ -304,14 +309,34 @@ pub(crate) fn wait_for_socket(
     }
 }
 
+/// How much of the end of the server's log [`log_tail`] reads.
+#[cfg(unix)]
+const LOG_TAIL_BYTES: u64 = 4096;
+
 /// The last lines of the server's log, for saying why it failed.
 #[cfg(unix)]
 pub(crate) fn log_tail(log: &Path) -> String {
+    use std::io::{Seek, SeekFrom};
     let Ok(mut file) = std::fs::File::open(log) else {
         return String::new();
     };
+    // The end of the file, not its start: a server that failed says why last.
+    let start = file
+        .metadata()
+        .map(|meta| meta.len().saturating_sub(LOG_TAIL_BYTES))
+        .unwrap_or(0);
+    if start > 0 && file.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
     let mut text = Vec::new();
-    let _ = (&mut file).take(4096).read_to_end(&mut text);
+    let _ = (&mut file).take(LOG_TAIL_BYTES).read_to_end(&mut text);
+    // A window that opens mid-line starts with a fragment; drop it when a
+    // whole line follows.
+    if start > 0 {
+        if let Some(newline) = text.iter().position(|b| *b == b'\n') {
+            text.drain(..=newline);
+        }
+    }
     let text = String::from_utf8_lossy(&text);
     let lines: Vec<&str> = text.lines().rev().take(3).collect();
     lines.into_iter().rev().collect::<Vec<_>>().join(" / ")
@@ -353,8 +378,11 @@ pub(crate) struct ServeJob {
 }
 
 impl ServeStatus {
-    /// Whether the job list may be the whole list: Manvi caps it, and a listing
-    /// at the cap may have been cut.
+    /// Whether the job list may be taken as the whole list. Manvi lists every
+    /// live job and bounds the count only by its session ceiling
+    /// ([`MAX_LISTED_JOBS`]); a listing at that length is treated as possibly
+    /// incomplete because the ceiling is Manvi's to change, not as a cut Manvi
+    /// is known to make.
     pub(crate) fn jobs_complete(&self) -> bool {
         self.jobs.len() < MAX_LISTED_JOBS
     }
@@ -391,6 +419,10 @@ impl ServeStatus {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Record {
     pub version: u8,
+    /// The socket path the server was started on; empty in a record written
+    /// before the path was kept, which says nothing about it (see
+    /// [`Record::verify_socket`]).
+    #[serde(default)]
     pub socket: String,
     pub owner_id: String,
     pub process_id: u32,
@@ -418,6 +450,28 @@ fn start_of(pid: i32) -> Option<u64> {
 }
 
 impl Record {
+    /// Whether this record is about the socket that was dialled. A record that
+    /// names another path describes a different server (the config directory
+    /// moved, or the file was copied), so what it says about owner and
+    /// process proves nothing here. A record with no path (written before the
+    /// path was kept) cannot be checked: the owner, process and profile checks
+    /// still stand, and `Ok(false)` says the path was not among them.
+    pub(crate) fn verify_socket(&self, paths: &HostPaths) -> Result<bool, String> {
+        if self.socket.is_empty() {
+            return Ok(false);
+        }
+        let dialled = paths.socket.display().to_string();
+        if self.socket == dialled {
+            Ok(true)
+        } else {
+            Err(format!(
+                "the record at {} is for a server on {}, not {dialled}",
+                paths.record.display(),
+                self.socket
+            ))
+        }
+    }
+
     pub(crate) fn new(
         paths: &HostPaths,
         status: &ServeStatus,
@@ -825,7 +879,10 @@ pub(crate) fn exit_choice() -> ExitChoice {
     }
 }
 
-#[cfg(test)]
+/// Forgets the quit's choice. The choice belongs to one quit the person
+/// approved; a quit that was then prevented or cancelled must not leave it
+/// behind, or a later exit nobody was asked about (a signal, a crash handler)
+/// would stop runs the person only agreed to stop on that quit.
 pub(crate) fn reset_exit_choice() {
     EXIT_CHOICE.store(EXIT_UNSET, Ordering::Release);
 }
