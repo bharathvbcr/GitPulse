@@ -22,10 +22,12 @@ function foundWire(text: string, over: Record<string, unknown> = {}): Record<str
     rotated: false,
     clipped: false,
     gap_markers: 0,
+    unrecorded_bytes: 0,
     redacted: false,
     live: false,
     settled: true,
     recording_error: null,
+    run_id: null,
     ...over,
   };
 }
@@ -44,9 +46,13 @@ describe("parseSavedTranscript", () => {
     expect(parsed.recordingError).toBeNull();
   });
 
-  it("keeps the four states the host can answer apart", () => {
+  it("keeps the states the host can answer apart", () => {
     expect(parseSavedTranscript({ state: "missing" })).toEqual({ kind: "missing" });
     expect(parseSavedTranscript({ state: "unreadable", reason: "denied" })).toEqual({ kind: "unreadable", reason: "denied" });
+    expect(parseSavedTranscript({ state: "reused", reason: "a later session reused this terminal id" })).toEqual({
+      kind: "reused",
+      reason: "a later session reused this terminal id",
+    });
     expect(parseSavedTranscript({ state: "unavailable", reason: "in-process" })).toEqual({
       kind: "unavailable",
       reason: "in-process",
@@ -62,9 +68,16 @@ describe("parseSavedTranscript", () => {
       { state: "perhaps" },
       { state: "unreadable" },
       { state: "unreadable", reason: "" },
+      { state: "reused" },
+      { state: "reused", reason: "" },
+      foundWire("x", { run_id: 5 }),
+      foundWire("x", { run_id: undefined }),
       foundWire("x", { data_b64: 5 }),
       foundWire("x", { bytes: -1 }),
       foundWire("x", { gap_markers: 1.5 }),
+      foundWire("x", { unrecorded_bytes: -1 }),
+      foundWire("x", { unrecorded_bytes: 1.5 }),
+      foundWire("x", { unrecorded_bytes: undefined }),
       foundWire("x", { truncated: "no" }),
       foundWire("x", { settled: undefined }),
       foundWire("x", { recording_error: 3 }),
@@ -80,7 +93,7 @@ describe("parseSavedTranscript", () => {
 
 describe("readSavedTranscript", () => {
   it("asks for the session's transcript with its bounds and parses the answer", async () => {
-    const asked: Array<{ sessionId: string; maxBytes: number; redact: boolean }> = [];
+    const asked: Array<{ sessionId: string; maxBytes: number; redact: boolean; runId: string | null }> = [];
     const read = await readSavedTranscript(
       "term-1-a",
       { maxBytes: 4096, redact: true },
@@ -95,7 +108,23 @@ describe("readSavedTranscript", () => {
       deadlineMs: 1000,
     };
     expect(await readSavedTranscript("term-1-a", { maxBytes: 4096, redact: true }, spy)).toEqual({ kind: "missing" });
-    expect(asked).toEqual([{ sessionId: "term-1-a", maxBytes: 4096, redact: true }]);
+    expect(asked).toEqual([{ sessionId: "term-1-a", maxBytes: 4096, redact: true, runId: null }]);
+  });
+
+  it("names the run it is asking about, and reads a reused id as reused, not as that run's output", async () => {
+    const asked: Array<{ runId: string | null }> = [];
+    const spy: TranscriptDeps = {
+      read: async (args) => {
+        asked.push(args);
+        return { state: "reused", reason: "a later session reused this terminal id" };
+      },
+      deadlineMs: 1000,
+    };
+    const read = await readSavedTranscript("term-1-a", { runId: "run-7" }, spy);
+    expect(asked).toEqual([{ sessionId: "term-1-a", maxBytes: 128 * 1024, redact: false, runId: "run-7" }]);
+    expect(read).toEqual({ kind: "reused", reason: "a later session reused this terminal id" });
+    const found = parseSavedTranscript(foundWire("mine\r\n", { run_id: "run-7" }));
+    expect(found.kind === "found" && found.runId).toBe("run-7");
   });
 
   it("reports a rejected call as failed with its reason, not as missing", async () => {
@@ -129,10 +158,12 @@ describe("transcriptNotices", () => {
     rotated: false,
     clipped: false,
     gapMarkers: 0,
+    unrecordedBytes: 0,
     redacted: false,
     live: false,
     settled: true,
     recordingError: null,
+    runId: null,
   };
 
   it("says nothing about a complete, finished transcript", () => {
@@ -148,12 +179,13 @@ describe("transcriptNotices", () => {
       rotated: true,
       clipped: true,
       gapMarkers: 2,
+      unrecordedBytes: 58_500,
       redacted: true,
       live: true,
       settled: false,
       recordingError: "disk full.",
     });
-    expect(notices).toHaveLength(7);
+    expect(notices).toHaveLength(8);
     expect(notices.join("\n")).toContain("newest 1,000 bytes");
     expect(notices.join("\n")).not.toContain("5,000");
     expect(notices.join("\n")).toContain("rotated away");
@@ -162,6 +194,13 @@ describe("transcriptNotices", () => {
     expect(notices.join("\n")).toContain("still running");
     expect(notices.join("\n")).toContain("end may be missing");
     expect(notices.join("\n")).toContain("masked");
+    expect(notices.join("\n")).toContain("58,500 more bytes were dropped");
+  });
+
+  it("names the bytes dropped but not yet marked, in the singular too", () => {
+    expect(transcriptNotices({ ...base, unrecordedBytes: 1 })).toEqual([
+      "1 more byte was dropped because the host could not save output fast enough, and the text does not mark where.",
+    ]);
   });
 
   it("tells a rotated-away start from a clipped read", () => {

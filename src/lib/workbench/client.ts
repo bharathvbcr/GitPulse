@@ -550,8 +550,12 @@ export function taskRun(value: unknown): TaskRun {
     cwd: text(raw.cwd), created_at: integer(raw.created_at), expires_at: integer(raw.expires_at), session_id: nullableText(raw.session_id),
     exit_code: raw.exit_code === null ? null : integer(raw.exit_code), reason: text(raw.reason), outcome_uncertain: boolean(raw.outcome_uncertain),
     ...(raw.model_choice === undefined ? {} : { model_choice: modelChoice(raw.model_choice) }),
-    // The attempt's own clock. Absent stays absent (never zero); `finished_at` is stored as
-    // null for an outcome nobody observed, and that null is kept: it is a statement, not a gap.
+    // The attempt's own clock. Absent stays absent (never zero). An outcome nobody observed is
+    // stored two ways in dc-store `runs.rs`: a finish that records it as uncertain leaves
+    // `finished_at` null (kept: a statement, not a gap), while the reconciler's release stamps
+    // `finished_at` with the time it noticed and sets `outcome_uncertain`. That stamp is not
+    // when the agent ended, so a reader of `finished_at` must also read `outcome_uncertain`
+    // (see `runWindowOf`).
     ...(raw.claimed_at == null ? {} : { claimed_at: integer(raw.claimed_at) }),
     ...(raw.started_at == null ? {} : { started_at: integer(raw.started_at) }),
     ...(raw.finished_at === undefined ? {} : { finished_at: raw.finished_at === null ? null : integer(raw.finished_at) }),

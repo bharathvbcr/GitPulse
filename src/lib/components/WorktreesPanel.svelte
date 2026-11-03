@@ -535,6 +535,10 @@
     mergeConfirmPath = null;
     const target = mergeTarget;
     mergeTarget = null;
+    // The choice the confirmed row was showing. `mergeSquash` belongs to
+    // whichever row is armed, and arming another while the trust check below is
+    // out would change what this row sends.
+    const squash = mergeSquash;
     if (!target) return;
     const epoch = tabScope.epoch;
     mergingPath = wt.path;
@@ -558,7 +562,7 @@
         {
           worktreePath: wt.path,
           targetBranch: null,
-          squash: mergeSquash,
+          squash,
           // The commit this row showed: the host merges nothing if the branch moved since.
           expectedTip: wt.head,
         },

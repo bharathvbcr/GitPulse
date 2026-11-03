@@ -31,12 +31,22 @@ export function runSessionIds(run: Pick<TaskRun, "id" | "session_id">): string[]
 /** Whether an attempt in this state is still going. */
 const LIVE_STATES: readonly TaskRun["state"][] = ["starting", "running"];
 
-/** The run's own clock, for the segments the lifecycle rows cannot bound. */
-export function runWindowOf(run: Pick<TaskRun, "state" | "claimed_at" | "started_at" | "finished_at">): RunWindow {
+/**
+ * The run's own clock, for the segments the lifecycle rows cannot bound.
+ *
+ * A run released with `outcome_uncertain` ended in a way nobody observed. The
+ * reconciler that released it stamps `finished_at` with the moment it noticed
+ * (dc-store `runs.rs`, the reconcile path), not the moment the agent stopped, so
+ * that value is not an end and is dropped here: the last span is then
+ * `unknown`, with no length, instead of a duration the run never had.
+ */
+export function runWindowOf(
+  run: Pick<TaskRun, "state" | "claimed_at" | "started_at" | "finished_at" | "outcome_uncertain">,
+): RunWindow {
   return {
     claimedAt: run.claimed_at ?? null,
     startedAt: run.started_at ?? null,
-    finishedAt: run.finished_at ?? null,
+    finishedAt: run.outcome_uncertain ? null : (run.finished_at ?? null),
     live: LIVE_STATES.includes(run.state),
   };
 }

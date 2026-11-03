@@ -746,8 +746,8 @@ function collectProcesses(snapshots: readonly InsightsSnapshot[]): Map<number, L
  * no process above it is not a row (it is the session a terminal or checkout
  * row already stands for, or one this window did not start). A chain that
  * loops, runs past [`MAX_LINEAGE`], ends at nothing the plane shows, or names
- * a parent no probe listed is counted as unplaced, never dropped and never
- * attached to a guess.
+ * a parent no probe listed is counted as unplaced, as is everything below the
+ * process whose parent is missing, never dropped and never attached to a guess.
  */
 function placeSessions(
   processes: ReadonlyMap<number, LiveProcess>,
@@ -779,8 +779,16 @@ function placeSessions(
   const containerOf = (process: LiveProcess, trail: Set<number>): AgentRow | null => {
     const memo = made.get(process.pid);
     if (memo !== undefined) return memo;
-    const parent = process.parentPid === null ? undefined : processes.get(process.parentPid);
-    if (!parent) return ownerOf(process);
+    // Nothing above it: the session a row stands for, placed by its launch id
+    // or directory. A parent that is named and was never listed is the other
+    // case, and says nothing about where this process sits, so neither it nor
+    // anything below it is attached to a guess.
+    if (process.parentPid === null) return ownerOf(process);
+    const parent = processes.get(process.parentPid);
+    if (!parent) {
+      made.set(process.pid, null);
+      return null;
+    }
     if (trail.has(process.pid) || trail.size >= MAX_LINEAGE) {
       made.set(process.pid, null);
       return null;
@@ -803,13 +811,9 @@ function placeSessions(
   let unplaced = 0;
   for (const process of [...processes.values()].sort((a, b) => a.pid - b.pid)) {
     if (process.parentPid === null) continue;
-    // The agent above it was in no probe read (its directory is outside every
-    // probed worktree, or in a repository that was not probed). That is a
-    // child whose place is unknown, not a process with nothing above it.
-    if (!processes.has(process.parentPid)) {
-      unplaced += 1;
-      continue;
-    }
+    // An agent above it that was in no probe read (its directory is outside
+    // every probed worktree, or in a repository that was not probed) makes it,
+    // and every process under that one, a child whose place is unknown.
     if (containerOf(process, new Set()) === null) unplaced += 1;
     else placed += 1;
   }

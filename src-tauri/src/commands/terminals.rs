@@ -111,15 +111,18 @@ pub async fn cmd_terminal_context(
 /// `MAX_TRANSCRIPT_TAIL_BYTES`), for a session still running or one that has
 /// ended, including one that ended before the app or the terminal host
 /// restarted. Read-only: it never attaches. `redact` masks secrets in the
-/// host before the bytes leave it. The answer says which of found, missing,
-/// unreadable (and why) and unavailable (no host) it is; see
-/// `terminal::TranscriptRead`.
+/// host before the bytes leave it. `run_id` names the run the caller is asking
+/// about: terminal ids repeat across reboots, so with it a session that a later
+/// one reused answers `reused`, never the other session's output. The answer
+/// says which of found, missing, unreadable (and why), reused and unavailable
+/// (no host) it is; see `terminal::TranscriptRead`.
 #[tauri::command(async)]
 pub async fn cmd_terminal_transcript(
     state: State<'_, crate::terminal::TerminalSessions>,
     session_id: String,
     max_bytes: Option<usize>,
     redact: Option<bool>,
+    run_id: Option<String>,
 ) -> Result<crate::terminal::TranscriptRead, String> {
     crate::terminal::control_async(&state, "terminal_transcript", move |state| {
         crate::terminal::session_transcript(
@@ -127,6 +130,7 @@ pub async fn cmd_terminal_transcript(
             &session_id,
             max_bytes.unwrap_or(crate::terminal::MAX_TRANSCRIPT_TAIL_BYTES),
             redact.unwrap_or(false),
+            run_id.as_deref(),
         )
     })
     .await

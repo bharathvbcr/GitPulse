@@ -244,8 +244,21 @@ counts for its bytes plus 64). One supervised writer thread (`spawn_service`,
 named `terminal-transcripts`) drains it. When the queue is full the chunk is
 dropped, its size remembered, and `[gitpulse: N bytes of output were not
 recorded]` is written ahead of the next chunk that fits (or when the session
-ends). Recorded bytes plus the counts in the markers always add up to what the
-session printed.
+ends). Once the session has ended and the writer has drained, recorded bytes
+plus the counts in the markers add up to what the session printed, with one
+exception: bytes dropped after the host began shutting down are never marked,
+because no writer is left to mark them. Before that, dropped bytes have no
+marker in the text until the writer has written one, so the sum is short by
+exactly what a read reports as `unrecorded_bytes`. That is the sum of three
+counts the queue keeps for the session, all read in the same lock acquisition
+as its liveness: bytes dropped that no marker has been queued for, bytes whose
+marker is queued or in the writer's hands but not yet in the file (the count
+is released once the writer has appended the marker or has stopped recording
+the session, which the read reports as `recording_error`), and bytes dropped
+after shutdown began. A marker written for the same bytes while the read is
+running can name them in both places; a byte the host dropped is not left out
+of both, unless the recording stopped (`recording_error`), in which case the
+text is known to be incomplete and says so.
 
 **Bounds** (`Limits`):
 
@@ -274,7 +287,29 @@ when the session never started (`discard`). It is *not* removed by `forget`:
 that means "the app has recorded this exit", which is long before anyone reopens
 the run's output, so deleting there would leave the feature with nothing to
 show. A finished session's transcript ends by eviction or age, above. A new
-session under an id that has a transcript replaces it.
+session under an id that has a transcript replaces it, unless the transcript
+was recorded for a different run (below).
+
+**Terminal ids repeat, so a transcript is a run's.** Ids are
+`term-<pid>-<count>`: after a reboot (or a pid that wraps) a new session can
+carry the id an earlier run's output is filed under. When a session is spawned
+for a run, the host writes the run id beside the log (`<id>.log.meta`, `0600`,
+`O_NOFOLLOW`, at most 256 bytes; longer ids are clipped identically on write and
+on compare), and a read reports it (`run_id`). A new session under the same id
+deletes the old files only when the earlier one was recorded for the same run or
+for none; an earlier *run's* files are renamed to `<id>.<16 hex>.log` (and
+`.log.1`, `.log.err`, `.log.meta`), the hex being a hash of that run id, so at
+most one is kept per run. They count toward the 256 MiB total and the 14-day age
+under their own name (the scan recognises that stem), so they are never held
+alive by the new session using the id. A read may name the run it is for
+(`run_id` on the request): it gets the id's own transcript when that was
+recorded for the run, else the kept copy, else `reused`: files exist under the
+id but are not this run's, whether a later run took it or the session was spawned
+for no run. A transcript with no run on record that cannot be told from one still
+being opened (the host has not yet written the record, or its write failed) is
+`unreadable`, not `reused`. The record is checked again after the bytes are read,
+so a session that took the id in between is `reused` as well. A read that names no
+run gets whatever the id holds now and `run_id` says whose it is.
 
 **How the recording ended is on disk.** Whether a transcript is whole is not
 something a host's memory may hold: the host that knew is the one that died.
@@ -290,7 +325,7 @@ is still running has no marker yet and is not reported for it. The marker is
 text a program could print; spoofing it can only make a transcript read as
 closed.
 
-**The read.** `Request::Transcript { session, max_bytes, redact }` is read-only
+**The read.** `Request::Transcript { session, max_bytes, redact, run_id? }` is read-only
 (`attach` means a live session; this never attaches) and works for live and
 finished sessions. `max_bytes` is clamped to 128 KiB. The tail crosses the
 socket as base64 inside the reply header (the same `data_b64` the webview hop
@@ -302,9 +337,10 @@ the 512 KiB header bound. The answer (`terminal::TranscriptRead`) is one of:
 
 | state | meaning |
 |---|---|
-| `found` | the tail, plus `bytes` (after masking, when `redact`), `retained` (on disk, before masking), `truncated` (`rotated` or `clipped`: `rotated` means the start was rotated off the disk, `clipped` that older saved output was left out of this read's bound; both can hold), `gap_markers`, `redacted`, `live`, `settled` (everything queued was written before the answer; false means the end may lag) and `recording_error` (the saved output may stop short: a write failed, or the host that wrote it never closed it) |
+| `found` | the tail, plus `bytes` (after masking, when `redact`), `retained` (on disk, before masking), `truncated` (`rotated` or `clipped`: `rotated` means the start was rotated off the disk, `clipped` that older saved output was left out of this read's bound; both can hold), `gap_markers`, `unrecorded_bytes` (dropped and not yet marked in the text, or dropped after shutdown began and never to be), `redacted`, `live`, `settled` (everything queued was written before the answer; false means the end may lag) and `recording_error` (the saved output may stop short: a write failed, or the host that wrote it never closed it) and `run_id` (the run it was spawned for, or null) |
 | `missing` | no transcript: never recorded, evicted, or aged out |
 | `unreadable` | one exists or should and could not be read; `reason` says why. A transcript that is a symbolic link, is not a regular file, belongs to another user, or could not be recorded (disk full, directory gone) is `unreadable`, as is a host whose transcript store would not open |
+| `reused` | the read named a run and what is saved under the id is not that run's (a later session took the id, or the session had no run); `reason` says which |
 | `unavailable` | the app runs terminals itself (never sent by a host) |
 
 The renderer's `readSavedTranscript` adds `failed` (the call failed, timed out,
@@ -318,7 +354,10 @@ ends the connection of an app that sends a request it cannot decode, so the two
 must never meet; they do not, since the socket and lock names carry the
 protocol. An updated app finds a v2 host the way it finds any other-protocol
 host (`probe_other_protocols`): retired when idle, reported with its session
-count when it holds sessions.
+count when it holds sessions. The optional `run_id` on the request (omitted from
+the wire when absent) and the answer's `unrecorded_bytes`, `run_id` and `reused`
+state were added before protocol 3 was released, so they did not bump it: no
+host of protocol 3 exists without them.
 
 **At-rest posture.** The transcript is the raw terminal stream, escape sequences
 and anything a program echoed included, so it can contain secrets. It is stored

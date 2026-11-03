@@ -557,7 +557,9 @@ fn transcript_text(
     state: &TerminalSessions,
     session: &str,
 ) -> (String, gitpulse_lib::terminal::TranscriptTail) {
-    match gitpulse_lib::terminal::session_transcript(state, session, 64 * 1024, false).unwrap() {
+    match gitpulse_lib::terminal::session_transcript(state, session, 64 * 1024, false, None)
+        .unwrap()
+    {
         gitpulse_lib::terminal::TranscriptRead::Found(tail) => (
             String::from_utf8_lossy(&STANDARD.decode(&tail.data_b64).unwrap()).into_owned(),
             tail,
@@ -613,7 +615,8 @@ fn a_finished_sessions_output_is_read_back_after_the_app_and_the_host_restart() 
     );
     assert_ne!(next.state.host_pid(), Some(host));
     assert_eq!(
-        gitpulse_lib::terminal::session_transcript(&next.state, "term-1-1", 100, false).unwrap(),
+        gitpulse_lib::terminal::session_transcript(&next.state, "term-1-1", 100, false, None)
+            .unwrap(),
         gitpulse_lib::terminal::TranscriptRead::Missing,
         "a session the host never ran is missing, not unreadable"
     );
@@ -654,7 +657,8 @@ fn output_printed_while_no_app_was_there_is_in_the_transcript() {
     let _stop = Stop(next.state.clone());
     let seen = std::cell::RefCell::new((String::new(), None));
     let arrived = wait_for(Duration::from_secs(10), || {
-        let read = gitpulse_lib::terminal::session_transcript(&next.state, &id, 64 * 1024, false);
+        let read =
+            gitpulse_lib::terminal::session_transcript(&next.state, &id, 64 * 1024, false, None);
         let now = match read {
             Ok(gitpulse_lib::terminal::TranscriptRead::Found(tail)) => (
                 String::from_utf8_lossy(&STANDARD.decode(&tail.data_b64).unwrap()).into_owned(),
@@ -681,7 +685,8 @@ fn output_printed_while_no_app_was_there_is_in_the_transcript() {
 #[test]
 fn the_in_process_engine_says_it_keeps_no_transcript() {
     let state = TerminalSessions::default();
-    match gitpulse_lib::terminal::session_transcript(&state, "term-1-1", 100, false).unwrap() {
+    match gitpulse_lib::terminal::session_transcript(&state, "term-1-1", 100, false, None).unwrap()
+    {
         gitpulse_lib::terminal::TranscriptRead::Unavailable { reason } => {
             assert!(reason.contains("terminal host"), "{reason}")
         }

@@ -1518,18 +1518,22 @@ pub fn session_context(
 /// The newest `max_bytes` of a session's saved output, live or finished. Only
 /// the terminal host keeps a transcript (`host::transcripts`); the app's own
 /// engine says so rather than answering as if it had looked. `redact` masks
-/// secrets in the host, before the bytes leave it.
+/// secrets in the host, before the bytes leave it. `run_id`, when the caller
+/// has the run, restricts the answer to that run's output: terminal ids repeat
+/// across reboots, and a later session under the same id is `Reused`, not read
+/// as the run's.
 pub fn session_transcript(
     state: &TerminalSessions,
     session_id: &str,
     max_bytes: usize,
     redact: bool,
+    run_id: Option<&str>,
 ) -> Result<TranscriptRead, String> {
     #[cfg(unix)]
     if let Some(host) = &state.host {
-        return host.transcript(session_id, max_bytes, redact);
+        return host.transcript(session_id, max_bytes, redact, run_id);
     }
-    let _ = (state, session_id, max_bytes, redact);
+    let _ = (state, session_id, max_bytes, redact, run_id);
     Ok(TranscriptRead::Unavailable {
         reason: "Terminal output is saved only when terminals are kept running by the terminal host (Settings > Agents); this app is running them itself.".into(),
     })

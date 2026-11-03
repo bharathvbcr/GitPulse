@@ -46,7 +46,7 @@ const NOT_PAYLOADS = new Set(["Result", "Vec", "Option", "String", "HashMap", "B
 const UNCHECKED = new Map<string, { reason: string; orphanCommand?: string }>([
   [
     "TranscriptRead",
-    { reason: "internally tagged enum, not a struct; parseSavedTranscript in src/lib/terminal/savedTranscript.ts refuses any shape but the four states, pinned by savedTranscript.test.ts and the Rust proto round-trip test" },
+    { reason: "internally tagged enum, not a struct; parseSavedTranscript in src/lib/terminal/savedTranscript.ts refuses any shape but the known states (found, missing, unreadable, reused, unavailable), pinned by savedTranscript.test.ts and the Rust proto round-trip test" },
   ],
   [
     "AutoFetchOutcome",

@@ -5,9 +5,11 @@
 //! outside `host` because the answer reaches the renderer through a command
 //! that exists on every platform, while only a unix host can keep a transcript.
 //!
-//! Four answers, and none of them stands in for another: a transcript that was
-//! never kept (`missing`) is not one that could not be read (`unreadable`), and
-//! neither is the app saying it has no host to ask (`unavailable`).
+//! Five answers, and none of them stands in for another: a transcript that was
+//! never kept (`missing`) is not one that could not be read (`unreadable`), is
+//! not one that belongs to a different session than the run asked about
+//! (`reused`), and neither is the app saying it has no host to ask
+//! (`unavailable`).
 
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +27,12 @@ pub enum TranscriptRead {
     Missing,
     /// One exists, or should, and could not be read; `reason` says why.
     Unreadable { reason: String },
+    /// The read named a run, and what the host saved under this terminal id is
+    /// not that run's: a later session reused the id (terminal ids are
+    /// `term-<pid>-<count>`, so they repeat across reboots), or the transcript
+    /// there was recorded for no run. The run's own output was not kept.
+    /// Never shown as the run's output.
+    Reused { reason: String },
     /// This app has no terminal host to ask, so nothing is recorded anywhere
     /// it could look. Never sent by a host.
     Unavailable { reason: String },
@@ -52,6 +60,16 @@ pub struct TranscriptTail {
     /// Places in `data_b64` where the host could not keep up and dropped
     /// output, each marked in the text itself.
     pub gap_markers: u32,
+    /// Bytes the session printed that the host dropped and that no marker in
+    /// `data_b64` accounts for: dropped while the writer was behind and not yet
+    /// marked (the marker is written ahead of the next chunk that fits, or when
+    /// the session ends), dropped with a marker queued or in the writer's hands
+    /// but not yet in the file, or dropped after the host began shutting down,
+    /// which will never be marked. `0` means none were pending when the host
+    /// answered. A marker written for the same bytes while the read ran can name
+    /// them again; a dropped byte is not left out of both, unless the recording
+    /// stopped (`recording_error`), which says the text is incomplete.
+    pub unrecorded_bytes: u64,
     /// Secrets were masked (`ledger::redact`) before this left the host.
     pub redacted: bool,
     /// The session is still running, so more output may follow.
@@ -65,4 +83,8 @@ pub struct TranscriptTail {
     /// `None` only for a session still being recorded without error, or one
     /// whose end was written down.
     pub recording_error: Option<String>,
+    /// The run the session was spawned for, as the host recorded it; `None`
+    /// when it was spawned for none. A read that named a run only ever returns
+    /// that run's.
+    pub run_id: Option<String>,
 }

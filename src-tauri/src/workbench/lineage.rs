@@ -17,9 +17,14 @@ use dc_store::Store;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 
-/// Most cards one read answers for: a board page is at most 30 cards in each of
-/// seven columns. Past it the read is refused, never cut short.
+/// Most distinct cards one read answers for: a board page is at most 30 cards
+/// in each of seven columns. Past it the read is refused, never cut short. The
+/// bound is on the cards named once each, so a request that repeats an id is
+/// counted by what it asks about, not by how often it says it.
 pub(crate) const MAX_BATCH: usize = 256;
+/// Most names a request may carry before its repeats are even counted: a
+/// request this long is refused unread rather than walked.
+const MAX_NAMED: usize = 16 * MAX_BATCH;
 /// The longest task id the store accepts.
 const MAX_ID: usize = 128;
 
@@ -33,13 +38,13 @@ fn requested(input: &str) -> Result<Vec<String>, WorkbenchError> {
     let named = parsed["ids"]
         .as_array()
         .ok_or_else(|| invalid("ids is required."))?;
-    if named.len() > MAX_BATCH {
+    if named.len() > MAX_NAMED {
         return Err(invalid(format!(
-            "A lineage read names at most {MAX_BATCH} tasks."
+            "A lineage read carries at most {MAX_NAMED} names."
         )));
     }
     let mut seen = HashSet::new();
-    let mut ids = Vec::with_capacity(named.len());
+    let mut ids = Vec::with_capacity(named.len().min(MAX_BATCH));
     for value in named {
         let id = value.as_str().ok_or_else(|| invalid("ids are strings."))?;
         if id.is_empty() || id.len() > MAX_ID {
@@ -48,6 +53,12 @@ fn requested(input: &str) -> Result<Vec<String>, WorkbenchError> {
         if seen.insert(id) {
             ids.push(id.to_owned());
         }
+    }
+    // The bound is on the distinct cards, after repeats are folded.
+    if ids.len() > MAX_BATCH {
+        return Err(invalid(format!(
+            "A lineage read names at most {MAX_BATCH} tasks."
+        )));
     }
     Ok(ids)
 }
