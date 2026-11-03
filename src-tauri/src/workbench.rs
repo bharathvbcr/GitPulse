@@ -30,6 +30,7 @@ mod receipts;
 mod reconcile;
 pub(crate) mod retention;
 pub mod review;
+mod send_to_agent;
 mod suggest;
 pub(crate) mod terminal_command;
 mod terminal_launch;
@@ -532,6 +533,12 @@ impl WorkbenchState {
         }
         if method == "runs.conversation" {
             return conversation::find(self, input);
+        }
+        // A person's confirmed message to the agent behind an attempt. The
+        // preview and the send are one method so the route a send takes is
+        // decided in one place (`send_to_agent`), never re-derived by a caller.
+        if method == "runs.send_to_agent" {
+            return send_to_agent::send(self, input);
         }
         // The board's Merge: the merge `gitpulse_merge_tasks` runs, not a
         // second implementation of it. It is a sequence of store writes, so

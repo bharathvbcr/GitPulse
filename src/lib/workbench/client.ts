@@ -125,7 +125,7 @@ export type Scope = { kind: "global" } | { kind: "workspace" | "repository"; id:
  * it is the host watcher's alone: `WorkbenchState::request` refuses it from here with `host_only`, because a CI
  * result is the host's observation of GitHub or of a local run and a renderer must not be able to write one.
  */
-export type WorkbenchMethod ="decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | "signals.record" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "runs.conversation" | "runs.checkout_identity" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.restore" | "items.merge" | "items.lineage" | "items.history" | "events.list" | "enhancements.complete" | "verifications.status" | "verifications.run" | "verifications.board" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list" | "tasks.suggest";
+export type WorkbenchMethod ="decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | "signals.record" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "runs.conversation" | "runs.send_to_agent" | "runs.checkout_identity" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.restore" | "items.merge" | "items.lineage" | "items.history" | "events.list" | "enhancements.complete" | "verifications.status" | "verifications.run" | "verifications.board" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list" | "tasks.suggest";
 
 export interface WorkbenchError {
   readonly code: string;
@@ -736,6 +736,65 @@ export async function findConversation(id: string): Promise<RunConversation> {
   const sessionId = text(raw.session_id);
   if (!isSessionId(sessionId)) return invalid();
   return { resumable: true, sessionId, cwd: text(raw.cwd), mode, reason: text(raw.reason) };
+}
+/** The ways a message to an attempt's agent can go. `unavailable` is a route with a reason, not an error. */
+export const SEND_ROUTES = ["mailbox", "resume", "managed", "unavailable"] as const;
+export type SendRoute = (typeof SEND_ROUTES)[number];
+/**
+ * What a send would do, from the host (`runs.send_to_agent` without `confirm`). Nothing was sent. `reason` is
+ * always present and says why this route, or why none: it is shown as it is.
+ */
+export interface AgentSendPreview {
+  route: SendRoute; reason: string;
+  /** Mailbox: whether a hook is waiting on the session right now. */
+  listening?: boolean;
+  /** Managed: Manvi's reading of the run, `parked` (between turns) or `running`. */
+  managedState?: "parked" | "running";
+}
+/**
+ * What a confirmed send did. `sent` is only ever true for a message that left GitPulse: `queued` is in the
+ * session's mailbox, `picked_up` is taken by its hook (not read), `delivered` is written to a managed run's
+ * provider. `resume` is not sent by the host at all: `action: "open_resume"` tells the renderer to open the
+ * conversation with the text as its first prompt. A refused or unsupported managed send is `sent: false` with its
+ * reason and whether sending again can help.
+ */
+export interface AgentSendResult extends AgentSendPreview {
+  sent: boolean;
+  status?: "queued" | "picked_up" | "delivered" | "unsupported" | "refused";
+  action?: "open_resume";
+  retryable?: boolean;
+  code?: string;
+  expiresAtMs?: number;
+  duplicate?: boolean;
+}
+const SEND_STATUSES = ["queued", "picked_up", "delivered", "unsupported", "refused"] as const;
+function sendPreview(raw: Record<string, unknown>): AgentSendPreview {
+  const route = SEND_ROUTES.find((route) => route === raw.route);
+  const reason = text(raw.reason);
+  if (raw.ok !== true || !route || !reason.trim()) return invalid();
+  const managed = raw.managed_state === undefined ? undefined : (raw.managed_state === "parked" || raw.managed_state === "running" ? raw.managed_state : invalid());
+  return { route, reason, ...(raw.listening === undefined ? {} : { listening: boolean(raw.listening) }), ...(managed ? { managedState: managed } : {}) };
+}
+/** Asks which way `text` would go to the agent behind an attempt, and sends nothing. */
+export async function previewAgentMessage(runId: string, message: string, requestId: string): Promise<AgentSendPreview> {
+  return sendPreview(object(await request("runs.send_to_agent", { id: runId, text: message, request_id: requestId, confirm: false })));
+}
+/** Sends `message` to the agent behind an attempt, but only along `route`: the one the person was shown. */
+export async function sendAgentMessage(runId: string, message: string, requestId: string, route: Exclude<SendRoute, "unavailable">): Promise<AgentSendResult> {
+  const raw = object(await request("runs.send_to_agent", { id: runId, text: message, request_id: requestId, confirm: true, expect_route: route }));
+  const shown = sendPreview(raw);
+  const status = raw.status === undefined ? undefined : (SEND_STATUSES.find((status) => status === raw.status) ?? invalid());
+  const sent = boolean(raw.sent);
+  if (shown.route !== route || (sent && !status && route !== "resume")) return invalid();
+  return {
+    ...shown, sent,
+    ...(status ? { status } : {}),
+    ...(raw.action === "open_resume" ? { action: "open_resume" as const } : {}),
+    ...(raw.retryable === undefined ? {} : { retryable: boolean(raw.retryable) }),
+    ...(raw.code === undefined ? {} : { code: text(raw.code) }),
+    ...(raw.expires_at_ms === undefined ? {} : { expiresAtMs: integer(raw.expires_at_ms) }),
+    ...(raw.duplicate === undefined ? {} : { duplicate: boolean(raw.duplicate) }),
+  };
 }
 export async function cancelTaskRun(run: TaskRun): Promise<TaskRun> {
   const saved = record(await request("runs.cancel", { id: run.id, expected_revision: run.revision, request_id: newID() }), taskRun);

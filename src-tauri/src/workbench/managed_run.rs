@@ -332,20 +332,11 @@ pub(crate) fn follow_up_answer(
     }
 }
 
-/// Reads a live managed run's follow-up state, or delivers one follow-up to it.
-/// `message: None` is the status read and sends nothing.
-pub(crate) fn follow_up(
-    state: &WorkbenchState,
-    id: &str,
-    request_id: Option<&str>,
-    message: Option<&str>,
-) -> Result<Value, WorkbenchError> {
-    follow_up_with(state, id, request_id, message, |op, params| {
-        state.worker_call_current(op, params)
-    })
-}
-
-fn follow_up_with(
+/// Reads a live managed run's follow-up state, or delivers one follow-up to it,
+/// through `call` (the profile worker's `work.runs.managed.continue`; a test's
+/// stand-in for it). `message: None` is the status read and sends nothing.
+/// `send_to_agent` is the one caller: it owns the route this belongs to.
+pub(super) fn follow_up_with(
     state: &WorkbenchState,
     id: &str,
     request_id: Option<&str>,
