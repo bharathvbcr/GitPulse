@@ -704,8 +704,12 @@ fn an_older_connection_ending_late_does_not_detach_the_live_one() {
     record_for(&plan, &server.shared, &profile, "default");
     let _ = &serial;
 
-    let old = socket_sidecar(hosted::connect(&plan.paths.socket).unwrap(), &plan.paths, "manvi")
-        .unwrap();
+    let old = socket_sidecar(
+        hosted::connect(&plan.paths.socket).unwrap(),
+        &plan.paths,
+        "manvi",
+    )
+    .unwrap();
     connection
         .call("work.runs.managed.stop", json!({"id": "a"}))
         .unwrap();
@@ -745,7 +749,11 @@ fn a_quit_that_stops_the_runs_reaches_a_server_this_worker_is_not_connected_to()
     hosted::set_exit_choice(hosted::ExitChoice::Leave);
     let (left, _) = self::connection(dir.path(), plan.clone(), None);
     assert!(left.shutdown());
-    assert_eq!(server.shared.saw("serve.status"), 0, "leaving must not dial");
+    assert_eq!(
+        server.shared.saw("serve.status"),
+        0,
+        "leaving must not dial"
+    );
     assert_eq!(server.shared.saw("serve.stop_all"), 0);
     assert_eq!(relock(&server.shared.jobs).len(), 2);
 

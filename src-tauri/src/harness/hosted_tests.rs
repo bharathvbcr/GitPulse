@@ -327,6 +327,12 @@ fn a_socket_path_longer_than_manvi_accepts_is_refused_before_it_is_started() {
     let paths = HostPaths::under(&dir);
     assert_eq!(paths.socket.as_os_str().len(), 101);
     let error = paths.prepare().unwrap_err();
-    assert!(error.contains("101 bytes") && error.contains("allows 100"), "{error}");
-    assert!(!dir.exists(), "nothing was created for a path that cannot be used");
+    assert!(
+        error.contains("101 bytes") && error.contains("allows 100"),
+        "{error}"
+    );
+    assert!(
+        !dir.exists(),
+        "nothing was created for a path that cannot be used"
+    );
 }

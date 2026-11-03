@@ -2762,7 +2762,8 @@ impl ProfileConnection {
             // launch. A hosted server may still hold the runs from an earlier
             // launch, and a quit that chose to stop them must not leave them
             // because this worker happened not to be connected.
-            None => {
+            None =>
+            {
                 #[cfg(unix)]
                 if hosted::exit_choice() == hosted::ExitChoice::Stop {
                     if let Some((profile, selection, plan)) = unconnected {

@@ -716,10 +716,7 @@ fn launch_detached(mut command: Command, paths: &HostPaths) -> Result<Launched, 
         .spawn_locked()
         .map_err(|e| format!("could not start the hosted Manvi: {e}"))?;
     let pid = child.id();
-    let start_us = i32::try_from(pid)
-        .ok()
-        .and_then(start_of)
-        .unwrap_or(0);
+    let start_us = i32::try_from(pid).ok().and_then(start_of).unwrap_or(0);
     log::info!(target: "harness", "started the hosted Manvi (pid {pid})");
     let exited = Arc::new(AtomicBool::new(false));
     let flag = exited.clone();
