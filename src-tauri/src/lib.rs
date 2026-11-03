@@ -248,6 +248,11 @@ pub fn run() {
                 workbench::verification_driver::install(
                     app.state::<workbench::WorkbenchState>().inner().clone(),
                 );
+                // CI results on an agent's branch reach its task and the
+                // inbox; delivery is the notification coordinator above.
+                workbench::ci_watch::install(
+                    app.state::<workbench::WorkbenchState>().inner().clone(),
+                );
             }
             // A crash or force-quit leaves its task runs holding their
             // checkouts with no owner left to end them. Release the ones whose

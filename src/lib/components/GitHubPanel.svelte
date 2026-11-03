@@ -93,8 +93,8 @@
   import { crossfade } from "svelte/transition";
   import { isMacOS } from "../platform";
   import { liquidSelection } from "../ui/transitions";
-  import { runTimelineRows } from "../github/runLifecycle";
-  import { anyInFlight, failuresSince } from "../delivery/transitions";
+  import { runTimelineRow, runTimelineRows } from "../github/runLifecycle";
+  import { anyInFlight } from "../delivery/transitions";
   import { createLivePoll, type LiveState } from "../delivery/livePoll";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import type { GitHubRunsReport } from "../github/types";
@@ -285,17 +285,19 @@
     try {
       const report = await invoke<GitHubRunsReport>("cmd_github_runs", { repoPath: repo });
       if ($repoStore.currentPath !== repo) return false;
-      const previous = runTimelineRows(runs);
       liveRuns = report;
       if (report.checked) {
-        // Newly-red runs, diffed against what was on screen a moment ago.
-        // `failuresSince` announces nothing on a first observation, so
-        // mounting the panel cannot replay historical failures as news.
-        const wentRed = failuresSince(previous, runTimelineRows(report.runs));
+        // Which runs just went red is the native observer's call, the one the
+        // CI watcher also acts on (`github/outcome.rs`): it announces nothing
+        // on a first look and keeps one baseline per repository, so mounting
+        // the panel cannot replay historical failures as news and a finish is
+        // reported once however many things are watching. The panel only
+        // words it.
+        const wentRed = report.went_red.map(runTimelineRow);
         if (wentRed.length > 0) {
           failureNotice =
             wentRed.length === 1
-              ? `${wentRed[0].row.label} — ${wentRed[0].row.stateLabel}`
+              ? `${wentRed[0].label} — ${wentRed[0].stateLabel}`
               : `${wentRed.length} runs failed`;
         }
       }
@@ -924,6 +926,13 @@
           <span class="text-textMuted" title={ciReport.not_recorded_reason}>
             not recorded — {ciReport.not_recorded_reason || "no reason was given"}
           </span>
+        {/if}
+        {#if ciReport.signal_error}
+          <!-- The task of an agent attempt was not told. Stated apart from the
+               note above: the two are separate records and either can fail. -->
+          <div class="mt-1 text-amber-700 dark:text-amber-300" role="status" data-testid="ci-signal-error">
+            {ciReport.signal_error}
+          </div>
         {/if}
       </div>
     </div>

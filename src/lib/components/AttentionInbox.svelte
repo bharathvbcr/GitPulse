@@ -6,10 +6,10 @@
   import { createLiveLoader } from "../workbench/liveLoader";
   import { formatRelativeTime } from "../format";
   import { buriedUnread, notificationPile, pileToggleLabel } from "../ui/notificationPile";
-  import { automaticUpdates, explainError, sameAutomaticUpdate, getAttention, listAttention, type Attention, type AttentionFilter, type AutomaticUpdate, type Page, type Scope } from "../workbench/client";
+  import { automaticUpdates, explainError, sameAutomaticUpdate, getAttention, listAttention, type Attention, type AttentionFilter, type AttentionRow, type AutomaticUpdate, type Page, type Scope } from "../workbench/client";
 
   let { scope, active = true, onopen }: { scope: Scope; active?: boolean; onopen: (taskID: string) => Promise<void> } = $props();
-  let filter = $state<AttentionFilter>("active"), result = $state<Page<Attention> | null>(null);
+  let filter = $state<AttentionFilter>("active"), result = $state<Page<AttentionRow> | null>(null);
   let busy = $state(false), error = $state(""), notice = $state("");
   let visible = $state(!readBackgroundDocument());
   let expanded = $state(false);
@@ -90,10 +90,25 @@
   {#if items.length > 0}
     <div class="pile" class:open={pile.peeks === 0} data-testid="notification-pile">
       {#each shown as item (item.id)}
-        <article class="gp-card" class:unread={item.read_at === null}>
-          <div class="summary"><strong>{item.title}</strong><span>{formatRelativeTime(item.created_at)}</span></div>
-          <button type="button" class="gp-btn" onclick={() => open(item)} disabled={busy || item.target_status === "task_deleted" || item.target_status === "unavailable"}>Open</button>
-        </article>
+        {#if "unreadable" in item}
+          <!-- A kind this version does not know. Said plainly as a row of its own: dropping it would hide that
+               something happened, and failing the page would hide everything else. Nothing to open, since what
+               it targets is not known either. -->
+          <article class="gp-card unreadable" class:unread={item.read_at === null} data-notice-unreadable={item.kind}>
+            <div class="summary"><strong>{item.title}</strong><span>Kind “{item.kind}” · {formatRelativeTime(item.created_at)} · update GitPulse to read it</span></div>
+          </article>
+        {:else}
+          <article class="gp-card" class:unread={item.read_at === null} data-notice-kind={item.kind}>
+            <div class="summary">
+              <strong>{item.title}</strong>
+              {#if item.signal}
+                <span data-notice-signal>{item.signal.workflow} · {item.signal.branch} · {item.signal.conclusion}{item.signal.source === "ci_local" ? " (local)" : ""}</span>
+              {/if}
+              <span>{formatRelativeTime(item.created_at)}</span>
+            </div>
+            <button type="button" class="gp-btn" onclick={() => open(item)} disabled={busy || item.target_status === "task_deleted" || item.target_status === "unavailable"}>Open</button>
+          </article>
+        {/if}
       {/each}
       {#each lips as depth (depth)}
         <div class="peek gp-card" style:--depth={depth} aria-hidden="true"></div>
@@ -113,6 +128,7 @@
   .pile.open{max-height:280px;overflow:auto}
   .pile:not(.open){padding-bottom:16px}
   article{position:relative;z-index:1;display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 12px}
+  article.unreadable{border-style:dashed}
   article.unread{box-shadow:var(--shadow-card),inset 3px 0 0 rgb(var(--c-accent))}
   .peek{position:absolute;z-index:0;height:16px;pointer-events:none;left:calc(var(--depth) * 10px);right:calc(var(--depth) * 10px);bottom:calc((2 - var(--depth)) * 8px)}
   .pile + button{margin-top:8px}

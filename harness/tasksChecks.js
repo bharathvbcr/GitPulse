@@ -75,6 +75,8 @@ const deleted = new Set(), deleteWrites = [], restoreWrites = [], mergeWrites = 
 let mergeFailSource = "";
 // Reads of one workspace's membership, and a switch that makes them fail.
 let workspaceGets = 0, failWorkspaceGet = false;
+/** What `attention.list` answers: the inbox's rows, as the store writes them. Empty unless a check sets it. */
+let attentionRows = [];
 let failList = false, corruptSave = false, loseSave = false, holdSave = false, releaseSave, holdSearch = false, heldSearch = [], holdGet = false, releaseGet;
 /** Hold the catalog read a background refresh starts with, and any next-page task read, to open the gap between them. */
 let holdCatalog = false, heldCatalog = [], holdPages = false, heldPages = [];
@@ -254,10 +256,7 @@ mockIPCWithEvents(async (cmd, args) => {
       return JSON.stringify({ok: true, item: saved});
     }
     case "enhancements.wake": case "enhancements.worker": return JSON.stringify({ok:true, state:"disabled", reason:"", task_id:"", proposal_id:"", next_check_at:0});
-    case "attention.list": {
-      const result = JSON.stringify(page([]));
-      return result;
-    }
+    case "attention.list": return JSON.stringify(page(attentionRows));
     case "runs.list": return JSON.stringify(page([]));
     // What Manvi's verification says about a card, as the host reads it from the
     // store. `verdicts` holds the cards that have one; every other card is "none".
@@ -3367,6 +3366,37 @@ if (params.has("check")) {
       check("the header offers New task and an Inbox", Boolean(button("New task")) && Boolean(root.querySelector('[aria-label="Inbox"]')));
       const urgent = card("task-2")?.querySelector('[aria-label$=" priority"]');
       check("a card names its priority for a screen reader, not by colour alone", /^High priority$/.test(urgent?.getAttribute("aria-label") ?? ""));
+
+      guardStep = "claims: CI notices in the inbox";
+      {
+        // What `signals.record` leaves in the inbox (dc-store), plus a kind a newer store might write. The page
+        // must draw the CI facts it understands and name the one it cannot, and one must not blank the other.
+        const notice = (n, kind, title, extra = {}) => ({ id: `event-${n}`, revision: 1, updated_at: 1000, source_sequence: n, task_id: "task-1", task_revision: 1, target_type: "run", target_id: "run-1", target_revision: 1, target_status: "current", kind, title, created_at: 1000, read_at: null, dismissed_at: null, snoozed_until: null, ...extra });
+        const facts = { source: "github", external_id: "77", kind: "ci_failed", conclusion: "failure", workflow: "CI", branch: "gitpulse/fix-1234abcd", url: "https://github.com/acme/app/actions/runs/77", head_sha: "b".repeat(40) };
+        attentionRows = [
+          notice(52, "run_ci_failed", "Coding agent branch failed CI", { signal: facts }),
+          notice(51, "run_ci_passed", "Coding agent branch passed CI", { signal: { ...facts, source: "ci_local", kind: "ci_passed", conclusion: "success", workflow: "ci.local", url: null } }),
+          notice(50, "run_quarantined", "Coding agent was quarantined"),
+        ];
+        // (The board's Inbox *column* is also a section labelled "Inbox"; this is the notification inbox.)
+        const toggle = root.querySelector('.gp-icon-btn[aria-label="Inbox"]');
+        const inbox = () => root.querySelector('section.inbox[aria-label="Inbox"]');
+        if (!inbox()) toggle.click();
+        // Three notices are a pile: the front card and a button that spreads them.
+        // ("3 notifications, 2 unread": the label counts what is buried behind the front card.)
+        const spread = () => [...(inbox() ?? root).querySelectorAll("button")].find(el => el.textContent.trim().startsWith("3 notifications"));
+        await wait(() => Boolean(spread()));
+        spread().click();
+        await wait(() => inbox()?.querySelectorAll("article").length === 3);
+        const rows = [...inbox().querySelectorAll("article")];
+        check("a failed CI notice says what failed, on which branch and how", /Coding agent branch failed CI/.test(rows[0].textContent) && /CI · gitpulse\/fix-1234abcd · failure/.test(rows[0].textContent) && rows[0].dataset.noticeKind === "run_ci_failed");
+        check("a local CI result is marked as local", /ci\.local · gitpulse\/fix-1234abcd · success \(local\)/.test(rows[1].textContent));
+        check("a CI notice opens its task", Boolean(button("Open", rows[0])) && Boolean(button("Open", rows[1])));
+        check("a kind this version cannot read is a row that says so, not an error", /A notice this version of GitPulse cannot read/.test(rows[2].textContent) && /run_quarantined/.test(rows[2].textContent) && !inbox().querySelector('[role="alert"]'));
+        check("and offers nothing to open, since what it targets is unknown", !button("Open", rows[2]));
+        attentionRows = [];
+        toggle.click(); await settle();
+      }
 
       guardStep = "claims: quick add dims";
       const quickRow = () => root.querySelector('[data-testid="task-quick-add-row"]');

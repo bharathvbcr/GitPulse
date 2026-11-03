@@ -120,7 +120,12 @@ export type TaskDraft = Omit<Task, keyof RecordVersion | "completed_at" | "paren
 export type WorkspaceDraft = Omit<Workspace, keyof RecordVersion>;
 export interface Page<T> { items: T[]; total: number; shown: number; has_more: boolean; next_cursor: string | null }
 export type Scope = { kind: "global" } | { kind: "workspace" | "repository"; id: string };
-export type WorkbenchMethod = "decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "runs.conversation" | "runs.checkout_identity" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.restore" | "items.merge" | "items.lineage" | "items.history" | "events.list" | "enhancements.complete" | "verifications.status" | "verifications.run" | "verifications.board" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list" | "tasks.suggest";
+/**
+ * Every store method this client names. `signals.record` is listed so the union covers the store's methods, but
+ * it is the host watcher's alone: `WorkbenchState::request` refuses it from here with `host_only`, because a CI
+ * result is the host's observation of GitHub or of a local run and a renderer must not be able to write one.
+ */
+export type WorkbenchMethod ="decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | "signals.record" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "runs.conversation" | "runs.checkout_identity" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.restore" | "items.merge" | "items.lineage" | "items.history" | "events.list" | "enhancements.complete" | "verifications.status" | "verifications.run" | "verifications.board" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list" | "tasks.suggest";
 
 export interface WorkbenchError {
   readonly code: string;
@@ -134,12 +139,49 @@ export const ATTENTION_TITLES = {
   enhancement_ready: "Task enhancement ready to review", enhancement_failed: "Task enhancement failed",
   enhancement_interrupted: "Task enhancement outcome is uncertain",
   decision_permission: "Coding agent needs permission", decision_question: "Coding agent needs input",
+  // A host watcher's CI result on an agent's branch (dc-store `signals.record`). They are `run` targets with a
+  // `run_` kind because every reader holds the closed set run|enhancement|decision and requires the prefix.
+  run_ci_passed: "Coding agent branch passed CI", run_ci_failed: "Coding agent branch failed CI",
+  run_ci_cancelled: "Coding agent branch CI was cancelled",
 } as const;
+/** Where a CI result was observed. */
+export const CI_SOURCES = ["github", "ci_local"] as const;
+/**
+ * The facts a CI notice carries (dc-store `signals.record`). `conclusion` is the source's own word, `url` is null
+ * when the source gave none, and nothing here is output: the run's log never reaches the inbox.
+ */
+export interface AttentionSignal {
+  source: (typeof CI_SOURCES)[number]; external_id: string; kind: "ci_passed" | "ci_failed" | "ci_cancelled";
+  conclusion: string; workflow: string; branch: string; url: string | null; head_sha: string;
+}
 export interface Attention extends RecordVersion {
   source_sequence: number; task_id: string; task_revision: number; target_type: "run" | "enhancement" | "decision";
   target_id: string; target_revision: number; target_status: "current" | "changed" | "task_changed" | "task_deleted" | "unavailable";
   kind: keyof typeof ATTENTION_TITLES; title: string; created_at: number;
   read_at: number | null; dismissed_at: number | null; snoozed_until: number | null;
+  /** Present exactly on the `run_ci_*` kinds. */
+  signal?: AttentionSignal;
+}
+/**
+ * A notice whose kind this build does not know: a newer GitPulse (or an agent on a newer store) recorded something
+ * this one cannot describe. It is a row, not an error, so one new kind cannot blank the page. It carries only what
+ * every notice has; it says it cannot be read and offers nothing to open, because what it targets is unknown.
+ */
+export interface UnreadAttention extends RecordVersion {
+  unreadable: true; source_sequence: number; kind: string; title: typeof UNREADABLE_TITLE; created_at: number;
+  read_at: number | null; dismissed_at: number | null; snoozed_until: number | null;
+}
+export type AttentionRow = Attention | UnreadAttention;
+export const UNREADABLE_TITLE = "A notice this version of GitPulse cannot read";
+const SIGNAL_KIND_OF = { run_ci_passed: "ci_passed", run_ci_failed: "ci_failed", run_ci_cancelled: "ci_cancelled" } as const;
+function attentionSignal(value: unknown, kind: keyof typeof SIGNAL_KIND_OF): AttentionSignal {
+  const raw = object(value), source = CI_SOURCES.find((s) => s === raw.source);
+  const externalID = text(raw.external_id), conclusion = text(raw.conclusion), workflow = text(raw.workflow), branch = text(raw.branch);
+  const url = nullableText(raw.url), sha = text(raw.head_sha);
+  if (!source || raw.kind !== SIGNAL_KIND_OF[kind] || !/^[A-Za-z0-9_-]{1,128}$/.test(externalID) || !/^[a-z0-9_-]{1,32}$/.test(conclusion) ||
+      !workflow.trim() || workflow.length > 200 || !branch.trim() || branch.length > 1024 || /\p{Cc}/u.test(workflow + branch) ||
+      (url !== null && (url.length > 2048 || !/^https:\/\/\S+$/u.test(url) || /\p{Cc}/u.test(url))) || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sha)) return invalid();
+  return { source, external_id: externalID, kind: SIGNAL_KIND_OF[kind], conclusion, workflow, branch, url, head_sha: sha };
 }
 export type AttentionFilter = "active" | "unread" | "all";
 export type AttentionAction = "read" | "unread" | "dismiss" | "restore" | "snooze" | "unsnooze";
@@ -154,12 +196,31 @@ export function attention(value: unknown): Attention {
       (target !== "run" && target !== "enhancement" && target !== "decision") || !kind.startsWith(`${target}_`) ||
       (status !== "current" && status !== "changed" && status !== "task_changed" && status !== "task_deleted" && status !== "unavailable") ||
       ![taskID, targetID].every((id) => /^[A-Za-z0-9_-]{1,128}$/.test(id)) || raw.title !== ATTENTION_TITLES[kind]) return invalid();
+  // The CI kinds carry their facts and no other kind does: a signal on a run notice, or none on a CI one, is a
+  // store this reader does not understand, and is refused like any other mismatch.
+  const ci = kind === "run_ci_passed" || kind === "run_ci_failed" || kind === "run_ci_cancelled" ? kind : null;
+  if ((ci === null) !== (raw.signal === undefined)) return invalid();
+  const signal = ci === null ? undefined : attentionSignal(raw.signal, ci);
   return { ...base, source_sequence: sequence, task_id: taskID, task_revision: taskRevision, target_type: target,
     target_id: targetID, target_revision: targetRevision, target_status: status, kind, title: ATTENTION_TITLES[kind], created_at: integer(raw.created_at),
+    read_at: raw.read_at === null ? null : integer(raw.read_at), dismissed_at: raw.dismissed_at === null ? null : integer(raw.dismissed_at), snoozed_until: raw.snoozed_until === null ? null : integer(raw.snoozed_until),
+    ...(signal ? { signal } : {}) };
+}
+/**
+ * One row of an inbox page. A kind this build does not know becomes an {@link UnreadAttention} row; everything else
+ * is decoded exactly as {@link attention} does, and a known kind that is malformed still refuses the page, because
+ * that is corruption and not a newer writer. A kind that is not even a plain word is corruption too.
+ */
+export function attentionRow(value: unknown): AttentionRow {
+  const raw = object(value);
+  if (typeof raw.kind !== "string" || Object.hasOwn(ATTENTION_TITLES, raw.kind)) return attention(value);
+  const base = version(raw), sequence = integer(raw.source_sequence);
+  if (!/^[a-z][a-z0-9_]{0,63}$/.test(raw.kind) || !sequence || base.id !== `event-${sequence}`) return invalid();
+  return { ...base, unreadable: true, source_sequence: sequence, kind: raw.kind, title: UNREADABLE_TITLE, created_at: integer(raw.created_at),
     read_at: raw.read_at === null ? null : integer(raw.read_at), dismissed_at: raw.dismissed_at === null ? null : integer(raw.dismissed_at), snoozed_until: raw.snoozed_until === null ? null : integer(raw.snoozed_until) };
 }
-export async function listAttention(scope: Scope, filter: AttentionFilter, cursor?: string): Promise<Page<Attention>> {
-  return page(await request("attention.list", { ...scopeParams(scope), filter, limit: 30, ...(cursor ? { cursor } : {}) }), attention);
+export async function listAttention(scope: Scope, filter: AttentionFilter, cursor?: string): Promise<Page<AttentionRow>> {
+  return page(await request("attention.list", { ...scopeParams(scope), filter, limit: 30, ...(cursor ? { cursor } : {}) }), attentionRow);
 }
 export async function getAttention(id: string): Promise<Attention> {
   const result = record(await request("attention.get", { id }), attention);

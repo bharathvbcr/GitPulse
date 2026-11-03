@@ -71,6 +71,12 @@ pub struct CiLocalReport {
     /// the note failed".
     #[serde(default)]
     pub not_recorded_reason: String,
+    /// Empty unless this checkout is an agent attempt's worktree and telling
+    /// its task about the result failed; then why. Separate from
+    /// `not_recorded_reason`, which is about the git note: a note can be
+    /// written while the task never hears of it, and the reverse.
+    #[serde(default)]
+    pub signal_error: String,
     /// How test steps were scoped — affected files vs full suite — and why.
     ///
     /// Absent from older clients; always present on new reports so a pass
@@ -689,6 +695,16 @@ fn skipped_result(step: &CiStep) -> CiStepResult {
 }
 
 pub fn run_ci_local(repo_path: &str) -> Result<CiLocalReport, CommandError> {
+    run_ci_local_for(repo_path, None)
+}
+
+/// [`run_ci_local`] for a checkout that may be an agent attempt's worktree.
+/// `attempt_task` is that attempt's task, which the verification note then
+/// carries so the result is attributable to it.
+pub fn run_ci_local_for(
+    repo_path: &str,
+    attempt_task: Option<&str>,
+) -> Result<CiLocalReport, CommandError> {
     let repo = validate_repo(repo_path)?;
     let started = Instant::now();
     let seeds = match crate::engine::git_reader::GitReader::get_status(repo_path) {
@@ -712,7 +728,7 @@ pub fn run_ci_local(repo_path: &str) -> Result<CiLocalReport, CommandError> {
                 steps,
                 test_scope: CiTestScope::full_suite(reason, Vec::new()),
             };
-            return Ok(finish_run(&repo, plan, started));
+            return Ok(finish_run(&repo, plan, started, attempt_task));
         }
     };
     let plan = plan_ci_with_affected(&repo, &seeds);
@@ -721,10 +737,15 @@ pub fn run_ci_local(repo_path: &str) -> Result<CiLocalReport, CommandError> {
             "No supported CI manifests found (expected package.json and/or Cargo.toml)".into(),
         );
     }
-    Ok(finish_run(&repo, plan, started))
+    Ok(finish_run(&repo, plan, started, attempt_task))
 }
 
-fn finish_run(repo: &Path, plan: CiPlan, started: Instant) -> CiLocalReport {
+fn finish_run(
+    repo: &Path,
+    plan: CiPlan,
+    started: Instant,
+    attempt_task: Option<&str>,
+) -> CiLocalReport {
     // The tree the steps are about to test, read before they run: the note
     // below attests to this commit, not to whatever HEAD is minutes later.
     let tested = TestedTree::capture(repo);
@@ -777,7 +798,8 @@ fn finish_run(repo: &Path, plan: CiPlan, started: Instant) -> CiLocalReport {
         u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         test_scope,
     );
-    let (recorded_commit, not_recorded_reason) = record_verification(repo, &report, &tested);
+    let (recorded_commit, not_recorded_reason) =
+        record_verification_for(repo, &report, &tested, attempt_task);
     report.recorded_commit = recorded_commit;
     report.not_recorded_reason = not_recorded_reason;
     report
@@ -827,8 +849,24 @@ fn summarize(
         total_duration_ms,
         recorded_commit: String::new(),
         not_recorded_reason: String::new(),
+        signal_error: String::new(),
         test_scope,
     }
+}
+
+/// What a recorded run tells the task of the attempt it ran for: the signal
+/// kind and conclusion, and the commit it attests. `None` when the run was not
+/// recorded: a result about a tree that was dirty, or that moved while the
+/// steps ran, is not a result about any commit, and `not_recorded_reason`
+/// already says so.
+pub(crate) fn attempt_signal(report: &CiLocalReport) -> Option<(&'static str, &'static str)> {
+    if report.recorded_commit.is_empty() {
+        return None;
+    }
+    Some(match run_verdict(report) {
+        "passed" => ("ci_passed", "success"),
+        _ => ("ci_failed", "failure"),
+    })
 }
 
 /// The verdict a completed run records.
@@ -838,7 +876,7 @@ fn summarize(
 /// verdict wrong in the direction that matters — everything not-failed reading
 /// as a pass — so "passed" here means every single step passed, and nothing
 /// else does.
-fn run_verdict(report: &CiLocalReport) -> &'static str {
+pub(crate) fn run_verdict(report: &CiLocalReport) -> &'static str {
     if report.steps.iter().all(|s| s.status == "passed") {
         "passed"
     } else {
@@ -904,10 +942,14 @@ impl TestedTree {
 /// commit and cleanliness are captured up front and re-read after: if either
 /// moved while the steps ran, the run tested something that is no longer the
 /// checkout, and no note is written.
-fn record_verification(
+///
+/// `task_id` is the agent attempt's task when the checkout is an attempt's
+/// worktree, so the note names it; a plain checkout has none.
+fn record_verification_for(
     repo: &Path,
     report: &CiLocalReport,
     tested: &Result<TestedTree, CommandError>,
+    task_id: Option<&str>,
 ) -> (String, String) {
     let repo_str = repo.to_string_lossy().to_string();
 
@@ -941,7 +983,7 @@ fn record_verification(
         verdict: run_verdict(report).to_string(),
         verified_at: i64::try_from(crate::ledger::ids::now_millis() / 1000).unwrap_or(i64::MAX),
         checked_by: "ci.local".to_string(),
-        task_id: None,
+        task_id: task_id.map(str::to_owned),
         // The step *names* and their statuses, never their output: a failure
         // detail is a captured log tail, and git notes are pushed to remotes.
         details: Some(
@@ -1573,6 +1615,15 @@ mod verification_note_tests {
     use super::*;
     use crate::procguard::LockedSpawn;
 
+    /// A run in a plain checkout, which has no task to name.
+    fn record_verification(
+        repo: &Path,
+        report: &CiLocalReport,
+        tested: &Result<TestedTree, CommandError>,
+    ) -> (String, String) {
+        record_verification_for(repo, report, tested, None)
+    }
+
     fn repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
         let git = |args: &[&str]| {
@@ -1639,6 +1690,51 @@ mod verification_note_tests {
         .expect("a note was written");
         assert_eq!(note.verdict, "passed");
         assert_eq!(note.checked_by, "ci.local");
+        assert_eq!(note.task_id, None, "a plain checkout has no task to name");
+    }
+
+    /// In an agent attempt's worktree the note is the attempt's: it names the
+    /// task, so the result is attributable to it from the repository alone.
+    #[test]
+    fn a_run_in_an_attempt_worktree_names_the_attempts_task_in_its_note() {
+        let dir = repo();
+        let r = report(&[("Clippy", "passed")]);
+        let (commit, reason) = record_verification_for(
+            dir.path(),
+            &r,
+            &TestedTree::capture(dir.path()),
+            Some("task-7"),
+        );
+        assert_eq!(reason, "");
+        let note = crate::engine::provenance::read_verification_note(
+            dir.path().to_str().unwrap(),
+            &commit,
+        )
+        .expect("read")
+        .expect("a note was written");
+        assert_eq!(note.task_id.as_deref(), Some("task-7"));
+    }
+
+    /// A signal describes a commit. A run that was not recorded (dirty tree,
+    /// moved checkout) tested no commit, so it is not reported as one; a
+    /// recorded one is reported as the verdict it was.
+    #[test]
+    fn an_attempt_hears_only_of_a_run_that_was_recorded_and_as_the_verdict_it_was() {
+        let mut passed = report(&[("Clippy", "passed")]);
+        assert_eq!(
+            attempt_signal(&passed),
+            None,
+            "not recorded: no commit to describe"
+        );
+        passed.recorded_commit = "a".repeat(40);
+        assert_eq!(attempt_signal(&passed), Some(("ci_passed", "success")));
+        let mut failed = report(&[
+            ("Clippy", "passed"),
+            ("Tests", "failed"),
+            ("Build", "skipped"),
+        ]);
+        failed.recorded_commit = "a".repeat(40);
+        assert_eq!(attempt_signal(&failed), Some(("ci_failed", "failure")));
     }
 
     /// The claim a note makes is about a *commit's tree*. A run against a

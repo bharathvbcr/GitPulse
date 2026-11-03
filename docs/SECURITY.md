@@ -286,6 +286,36 @@ flowchart TD
 - **Scan local** on the Health panel does not call GitHub. The **Check GitHub
   alerts** button remains a manual refresh.
 
+### CI Results on Agent Branches
+- `workbench/ci_watch.rs` polls GitHub Actions through the same locally
+  authenticated `gh` loader the Remote panel uses, for repositories that have
+  a live or just-finished agent attempt branch (`gitpulse/<task>-<id>`). It
+  asks only repositories the user has trusted; an untrusted repository is
+  reported as untrusted and is never asked, and a trust store that cannot be
+  read is its own state, not "untrusted" and not a `gh` fault. It makes at most
+  two asks per five-second sweep and forty per ten minutes, backs a failing
+  repository off to ten minutes, and keeps its queues bounded. The run table
+  that says which branches to watch is re-read every thirty seconds, not on
+  every sweep.
+- A finish is attributed through the repository the checkout's git remote
+  names (a local git read, no `gh` call), and is recorded only for a
+  repository that is trusted at that moment. The shared baseline also folds in
+  the Remote panel's own listings, so a finish can exist for a repository this
+  watcher never asked; it is not recorded unless the trust gate admits it.
+- It records a result with `signals.record`, a store method that is
+  **host-only**: the renderer is refused it (`host_only`), so no page can write
+  a "your branch passed CI" notice that GitHub never sent. A signal is a fact
+  the store was told; it never changes a task, a run or a proposal. Its log
+  block on a failed task names the workflow, the run URL, the head commit and
+  the conclusion, and never the run's output.
+- `gh` missing or signed out, a capped listing and an unreadable trust store
+  are reported (Diagnostics lists the first; the Remote panel shows `truncated`),
+  never presented as "no CI". A run already finished when first seen is
+  history, not news.
+- Security impact: no new network endpoint, credential, process or permission.
+  The watcher widens nothing that can run; it adds one reader of `gh` output
+  inside the existing trust gate and one writer of a notice-only store method.
+
 ### Local Dependency Scans Read, They Do Not Build
 - Health's local dependency scan runs whichever audit CLIs are already on
   PATH, and each is invoked so that it reads dependency metadata instead of
