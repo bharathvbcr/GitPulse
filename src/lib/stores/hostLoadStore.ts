@@ -28,7 +28,7 @@ export type Role = "writer" | "reader" | "not_sampling" | "unsupported";
 export type Platform = "governed" | "advise" | "unavailable";
 export type Thermal = "nominal" | "fair" | "serious" | "critical";
 export type Power = "ac" | "battery";
-export type AgentKind = "claude" | "codex";
+export type AgentKind = "claude" | "codex" | "antigravity" | "dev_council" | "manvi";
 
 export interface SensorReport {
   state: SensorState;

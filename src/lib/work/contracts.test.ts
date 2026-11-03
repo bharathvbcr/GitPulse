@@ -111,6 +111,26 @@ describe("validateWorkResponse", () => {
     ).not.toThrow();
   });
 
+  it("accepts a contended_line entity verdict carrying its contended_lines", () => {
+    const risk = {
+      ok: true, truncated: false, error: "", overlapping_files: 1, worktrees_involved: 2,
+      scanned_worktrees: 2, unscanned_worktrees: 0, failed_worktrees: 0, shared_worktree_files: 0,
+      shared_worktrees: [], sessions_ok: true, sessions_error: "",
+      items: [{
+        path: "src/lib.rs",
+        worktrees: [{ path: "/a", agent_kind: "claude", branch: "main" }, { path: "/b", agent_kind: "", branch: "feat" }],
+        entity: {
+          path: "src/lib.rs", kind: "contended_line", reason: "edits touch at line 4",
+          shared_symbols: [], contended_lines: [[4, 6]],
+        },
+      }],
+    };
+    expect(() => validateWorkResponse("cmd_collision_risk", risk)).not.toThrow();
+    const bad = structuredClone(risk);
+    (bad.items[0].entity as Record<string, unknown>).contended_lines = [[4]];
+    expect(() => validateWorkResponse("cmd_collision_risk", bad)).toThrow(/contended_lines/);
+  });
+
   it("rejects malformed non-object payloads with command-scoped error", () => {
     expect(() => validateWorkResponse("cmd_task_scopes", "not-an-object")).toThrow(
       "cmd_task_scopes: invalid response",
