@@ -84,6 +84,12 @@ fn run_cli(home: &Path, args: &[&str]) -> Output {
     Command::new(worktree_bin())
         .args(args)
         .envs(toolchain_and_profile_env(home))
+        // The fixtures assert on `<worktree>/target/debug/<bin>`. An inherited
+        // target dir (CI and parallel lanes set one) would send the nested
+        // `cargo build` elsewhere, and the binary the test then runs would not
+        // exist.
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
         .output_locked()
         .expect("spawn gitpulse-worktree")
 }
