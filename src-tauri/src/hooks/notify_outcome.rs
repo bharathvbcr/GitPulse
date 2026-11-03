@@ -76,6 +76,10 @@ impl SendError {
 /// * A timeout, with or without a partial reply, is [`SendError::NoReply`]
 ///   (through [`SendError::from_io`]), counted once like the outer budget.
 /// * Any other error is a failure, said as `context: error`.
+///
+/// Compiled where its caller is (the unix-only `exchange`) and in every test
+/// build, which is how it is exercised on hosts without that transport.
+#[cfg(any(unix, test))]
 pub fn classify_exchange(
     reply: &[u8],
     read: Result<(), &std::io::Error>,

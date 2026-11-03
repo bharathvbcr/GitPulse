@@ -12,7 +12,9 @@
 //! ones a neighbour can put back; variables it does not scrub are named here
 //! too (`GIT_COMMITTER_*`, `GIT_CEILING_DIRECTORIES`).
 
-use super::env::{bind_env, env_serial, hermetic, EnvBinding};
+#[cfg(unix)]
+use super::env::hermetic;
+use super::env::{bind_env, env_serial, EnvBinding};
 use super::git_in;
 use std::path::Path;
 

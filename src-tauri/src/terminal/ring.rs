@@ -48,6 +48,8 @@ pub(super) struct Taps {
 
 impl Taps {
     /// The next session started under `session` copies its output to `tap`.
+    /// Its caller, the terminal host, is unix-only; the ring tests use it everywhere.
+    #[cfg(any(unix, test))]
     pub(super) fn arm(&self, session: &str, tap: Arc<dyn Tap>) {
         self.armed
             .lock()
@@ -56,6 +58,7 @@ impl Taps {
     }
 
     /// A spawn that failed before its ring was made leaves nothing armed.
+    #[cfg(any(unix, test))]
     pub(super) fn disarm(&self, session: &str) {
         self.armed
             .lock()

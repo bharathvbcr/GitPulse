@@ -6,9 +6,10 @@
 //! A test whose name starts `adv_w3c_broke_` demonstrates a defect on the lane
 //! tip and FAILS there; every other test here passes and adds coverage.
 
-use crate::hooks::notify_drops::{
-    prev_path, read_record, record_path, DropRecord, READ_CAP_BYTES, ROTATE_BYTES,
-};
+use crate::hooks::notify_drops::{prev_path, read_record, record_path, READ_CAP_BYTES};
+// `DropRecord` and `ROTATE_BYTES` are used only by tests that are `cfg(unix)`.
+#[cfg(unix)]
+use crate::hooks::notify_drops::{DropRecord, ROTATE_BYTES};
 use std::path::{Path, PathBuf};
 
 const NOW: u64 = 1_790_000_000_000;
@@ -23,6 +24,7 @@ fn line(at: u64, event: &str) -> String {
 }
 
 /// Enough whole lines to pass the 32 KiB rotation threshold.
+#[cfg(unix)]
 fn big_record(at: u64) -> (String, usize) {
     let mut text = String::new();
     let mut lines = 0;

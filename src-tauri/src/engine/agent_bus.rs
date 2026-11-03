@@ -205,7 +205,10 @@ fn now_epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
+// Both are read only by `acquire_bus_file_lock`'s unix arm.
+#[cfg(unix)]
 const BUS_LOCK_FILE: &str = ".bus.lock";
+#[cfg(unix)]
 const BUS_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn bus_lock_for(common_dir: &Path) -> Arc<Mutex<()>> {

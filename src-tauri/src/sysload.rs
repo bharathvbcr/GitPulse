@@ -143,6 +143,7 @@ pub(crate) mod no_clock {
     /// Runs `body`, a test that keeps all its assertions without a clock and
     /// only leaves its CPU reading out, as on a platform with no thread CPU
     /// clock, and requires that it did not panic and skipped nothing.
+    #[cfg(unix)]
     pub(crate) fn assert_runs_unmeasured(name: &str, body: impl FnOnce()) {
         let guard = NoClock::new();
         body();

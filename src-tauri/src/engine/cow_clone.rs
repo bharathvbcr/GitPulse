@@ -481,6 +481,8 @@ pub fn reflink_copy_file(src: &Path, dst: &Path) -> Result<ReflinkResult, Comman
         armed: true,
     };
 
+    // Only the clonefile (macOS) and FICLONE (Linux) arms below can set this.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(unused_mut))]
     let mut is_cow = false;
     if !byte_copy_forced() {
         #[cfg(target_os = "macos")]
@@ -956,7 +958,8 @@ fn copy_link(link: &Path, _target: &Path) -> Result<(), CommandError> {
     Err(format!(
         "'{}' is a link, which this platform's copy does not recreate, so the tree was not copied",
         link.display()
-    ))
+    )
+    .into())
 }
 
 #[cfg(target_os = "linux")]

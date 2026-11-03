@@ -56,6 +56,8 @@ impl<S: Timed> DeadlineStream<S> {
     }
 
     /// The wrapped stream, for what is not a read or a write (a half-close).
+    /// Its one caller is the unix-only notify `exchange`.
+    #[cfg(unix)]
     pub fn get_ref(&self) -> &S {
         &self.stream
     }

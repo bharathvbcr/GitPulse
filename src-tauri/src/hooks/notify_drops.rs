@@ -122,7 +122,7 @@ impl DropRecord {
     }
 
     /// The same record, stamped by `now_ms`.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) const fn with_clock(now_ms: fn() -> Option<u64>) -> Self {
         DropRecord { now_ms }
     }

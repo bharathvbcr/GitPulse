@@ -1,6 +1,10 @@
 //! Adversary tests for lane W3b item 2: can the CPU-bounded tests pass
 //! vacuously on a host that has the clock, and is `cpu_since` right?
+// Every test here is gated to the hosts that have the thread CPU clock, so the
+// imports carry the same gate (elsewhere they would be unused).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use super::{clock_or_skip, cpu_since, try_thread_cpu};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::time::{Duration, Instant};
 
 /// A skip taken on a host that has the clock would turn four timing tests into

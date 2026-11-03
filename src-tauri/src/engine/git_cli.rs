@@ -5387,7 +5387,7 @@ fn run_admitted_inner(
         Ok(output) => output,
         Err(error) => {
             guard.stop_and_reap(&mut child, Duration::ZERO).ok();
-            return Err(format!("Failed to prepare {label} output: {error}"));
+            return Err(format!("Failed to prepare {label} output: {error}").into());
         }
     };
 
@@ -5411,7 +5411,7 @@ fn run_admitted_inner(
         Ok(input) => input,
         Err(error) => {
             guard.stop_and_reap(&mut child, Duration::ZERO).ok();
-            return Err(format!("Failed to prepare {label} stdin: {error}"));
+            return Err(format!("Failed to prepare {label} stdin: {error}").into());
         }
     };
 

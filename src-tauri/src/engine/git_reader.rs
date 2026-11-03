@@ -5362,6 +5362,7 @@ mod untracked_probe {
         });
     }
 
+    #[cfg(unix)]
     pub(super) fn set_before_open(hook: impl Fn(&Path) + 'static) {
         BEFORE_OPEN.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
     }

@@ -4497,6 +4497,8 @@ pub struct ProcessReapReport {
 pub fn reap_processes_in_dir(dir: &Path, dry_run: bool) -> Result<ProcessReapReport, CommandError> {
     let pids = crate::sysload::procscan::working_in(dir).map_err(CommandError::plain)?;
 
+    // Only the unix arm of the loop terminates anything; elsewhere every pid is spared.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut terminated = Vec::new();
     let mut spared = Vec::new();
 

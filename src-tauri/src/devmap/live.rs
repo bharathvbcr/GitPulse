@@ -230,7 +230,10 @@ pub fn clear_live_echo_cooldown(repo_path: &str) {
     forget_probe(repo_path);
 }
 
-#[cfg(all(test, unix))]
+/// Test reset for all three process-wide maps. Not unix-specific (it only
+/// clears in-process state), so the ungated `concurrency_stress_*` test can
+/// use it on Windows too.
+#[cfg(test)]
 pub(crate) fn clear_all_live_echo_cooldowns() {
     lock_live_waits().clear();
     lock_finished_builds().clear();
