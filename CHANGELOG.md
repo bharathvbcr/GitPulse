@@ -120,6 +120,14 @@ before that tag is pushed.
 
 ### Changed
 
+- **The task profile moves one way to workbench schema 15** (dc-store vendored
+  from DevCouncil `012c7f8a`; store schema stays 11). CI results are stored as
+  `run_ci_passed` / `run_ci_failed` / `run_ci_cancelled` attention rows, which a
+  schema 14 host cannot read, so a schema 14 build refuses an upgraded profile with
+  `schema_unsupported`. The desktop app performs the upgrade and keeps
+  `<profile>.pre-schema-14.bak` beside it. Update GitPulse (app, `gitpulse-mcp`,
+  `gitpulse-hook` via `bun run mcp:install`), `dcstore` and Manvi together, then
+  confirm with `bun run check:schema-parity`.
 - **Typed Command Errors across IPC.** Rust command runners now carry errors as strongly
   typed `CommandError` instances directly to the command edge (`2bac9304`), replacing
   the thread-local error store (`take_last_error`) with typed, structured errors across
