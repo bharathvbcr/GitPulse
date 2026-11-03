@@ -67,7 +67,8 @@ pub struct TranscriptTail {
     /// but not yet in the file, or dropped after the host began shutting down,
     /// which will never be marked. `0` means none were pending when the host
     /// answered. A marker written for the same bytes while the read ran can name
-    /// them again; a dropped byte is not left out of both.
+    /// them again; a dropped byte is not left out of both, unless the recording
+    /// stopped (`recording_error`), which says the text is incomplete.
     pub unrecorded_bytes: u64,
     /// Secrets were masked (`ledger::redact`) before this left the host.
     pub redacted: bool,

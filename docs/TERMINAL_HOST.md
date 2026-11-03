@@ -253,10 +253,12 @@ exactly what a read reports as `unrecorded_bytes`. That is the sum of three
 counts the queue keeps for the session, all read in the same lock acquisition
 as its liveness: bytes dropped that no marker has been queued for, bytes whose
 marker is queued or in the writer's hands but not yet in the file (the count
-is released only after the writer has appended the marker), and bytes dropped
+is released once the writer has appended the marker or has stopped recording
+the session, which the read reports as `recording_error`), and bytes dropped
 after shutdown began. A marker written for the same bytes while the read is
 running can name them in both places; a byte the host dropped is not left out
-of both.
+of both, unless the recording stopped (`recording_error`), in which case the
+text is known to be incomplete and says so.
 
 **Bounds** (`Limits`):
 

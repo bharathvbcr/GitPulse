@@ -298,9 +298,9 @@ fn a_read_before_the_session_ends_reports_the_bytes_dropped_and_not_yet_marked()
     }
     // How many chunks the writer took before it stalled is the scheduler's,
     // and a chunk that fits after a drop queues the marker for the drops before
-    // it. What overflowed since the last such marker has none queued and the
-    // session is still open: the log shows none, and only the read can say
-    // they are missing.
+    // it. The log shows none of these markers yet, whether queued or still
+    // waiting for a chunk that fits, and only the read can say the bytes are
+    // missing.
     let during = wire(store.read("term-1-1", MAX_TRANSCRIPT_TAIL_BYTES, false, None));
     assert_eq!(during["state"], "found", "{during}");
     assert_eq!(during["live"], true);
@@ -1101,6 +1101,18 @@ fn a_keep_that_fails_part_way_leaves_the_kept_name_with_the_record_of_whose_it_i
         files(&dir).join(format!("{kept}.log.meta")).exists(),
         "the record was left behind, so what is kept cannot say whose it is: {:?}",
         names(&files(&dir))
+    );
+    // The first run's own read finds its record, and under its name only the
+    // blocker where its output would be: not a file this host wrote, so the
+    // read says it cannot be read, and neither serves the next run's output as
+    // the first's nor calls the first's a reuse.
+    assert!(
+        matches!(
+            store.read("term-1-1", 100, false, Some("run-a")),
+            TranscriptRead::Unreadable { .. }
+        ),
+        "{:?}",
+        store.read("term-1-1", 100, false, Some("run-a"))
     );
 }
 

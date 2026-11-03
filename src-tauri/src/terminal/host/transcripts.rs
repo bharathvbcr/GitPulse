@@ -338,6 +338,10 @@ impl Transcripts {
         if !queue.recording.insert(session.to_owned()) {
             return Err(ArmError::Duplicate);
         }
+        // An id is never armed twice in one host's life (`next_session_id`), so
+        // `gaps` is cleared defensively; `marking` is left alone, because a
+        // marker still in flight releases its own bytes and clearing them here
+        // would let that release take another session's count.
         queue.gaps.remove(session);
         queue.push(
             Op::Open(
