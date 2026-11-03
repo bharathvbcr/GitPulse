@@ -2159,6 +2159,65 @@ pub struct WorktreeCreated {
     /// made without hooks, and this says why.
     #[serde(default)]
     pub hook_notice: Option<String>,
+    /// What provisioning the DevMap store did: `not_requested` unless the
+    /// caller asked for it, and never `provisioned` for a store that is not there.
+    #[serde(default)]
+    pub devmap: DevmapOutcome,
+}
+
+/// Whether, and how, creating a worktree also seeds its DevMap store. Seeding
+/// copies a database and syncs an overlay, so it is opt-in: [`Self::None`] is
+/// what every caller that did not ask for it gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevmapMode {
+    None,
+    /// Copy (or CoW-clone) the anchor's store into the worktree.
+    Copy,
+    /// Point at the anchor's store (`base_store_ref.json`) instead of copying it.
+    ZeroCopy,
+}
+
+/// What seeding a worktree's DevMap store actually did.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DevmapOutcome {
+    #[default]
+    NotRequested,
+    Provisioned {
+        zero_copy: bool,
+    },
+    Skipped {
+        reason: String,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+impl DevmapOutcome {
+    fn from_provision(
+        result: Result<crate::codeintel::DevmapWorktreeProvision, CommandError>,
+    ) -> Self {
+        match result {
+            Ok(p) if p.seeded => Self::Provisioned {
+                zero_copy: p.zero_copy_base_ref,
+            },
+            Ok(p) => Self::Skipped {
+                reason: p.reason.unwrap_or_else(|| "not seeded".to_string()),
+            },
+            Err(error) => Self::Failed {
+                error: error.into_message(),
+            },
+        }
+    }
+
+    /// A seeding that was asked for and did not leave a store.
+    pub fn error(&self) -> Option<&str> {
+        match self {
+            Self::Failed { error } => Some(error),
+            _ => None,
+        }
+    }
 }
 
 /// Creates a linked worktree with optional Copy-on-Write cache cloning and,
@@ -2184,9 +2243,16 @@ pub fn add_worktree_extended(
     )
 }
 
+/// A git write inside a multi-step worktree setup, handed to the command gate
+/// before it runs. The arguments exclude the program (`git`). A refusal stops
+/// the sequence; the engine never runs a git write nobody judged.
+pub type GitWriteGate<'a> = &'a mut dyn FnMut(&[&str]) -> Result<(), CommandError>;
+
 /// Creates a linked worktree with optional Copy-on-Write cache cloning,
 /// optional zero-copy DevMap pointer (`base_store_ref.json`), optional
 /// DevMap-guided `--cone` sparse checkout paths, and approved `post_create` hooks.
+/// `gate` judges every git write of the sparse sequence (the plain add is
+/// judged by the caller before this is called).
 #[allow(clippy::too_many_arguments)]
 pub fn add_worktree_configured(
     repo_path: &str,
@@ -2198,6 +2264,7 @@ pub fn add_worktree_configured(
     run_hooks: bool,
     zero_copy_devmap: bool,
     sparse_paths: Option<&[String]>,
+    gate: GitWriteGate<'_>,
 ) -> Result<WorktreeCreated, CommandError> {
     let cleaned_sparse: Vec<String> = sparse_paths
         .unwrap_or(&[])
@@ -2215,6 +2282,7 @@ pub fn add_worktree_configured(
             &cleaned_sparse,
             cow_caches,
             zero_copy_devmap,
+            gate,
         )?;
         let mut created = WorktreeCreated {
             path: sparse.path,
@@ -2223,6 +2291,7 @@ pub fn add_worktree_configured(
             disk_unknown: false,
             hook_error: None,
             hook_notice: None,
+            devmap: sparse.devmap,
         };
         if run_hooks {
             let repo = validate_repo(repo_path)?;
@@ -2244,7 +2313,7 @@ pub fn add_worktree_configured(
     }
 
     let selection = crate::engine::cow_clone::CacheSelection::default();
-    add_worktree_cached_with_devmap_mode(
+    add_worktree_with_devmap(
         repo_path,
         target_path,
         new_branch,
@@ -2252,12 +2321,17 @@ pub fn add_worktree_configured(
         detach,
         cow_caches.then_some(&selection),
         run_hooks,
-        zero_copy_devmap,
+        if zero_copy_devmap {
+            DevmapMode::ZeroCopy
+        } else {
+            DevmapMode::None
+        },
     )
 }
 
 /// [`add_worktree_extended`] with the cache copy's selection (bounds and
-/// free-space reader) given, or `None` for no caches.
+/// free-space reader) given, or `None` for no caches. It seeds no DevMap store:
+/// use [`add_worktree_with_devmap`] to ask for one.
 pub fn add_worktree_cached(
     repo_path: &str,
     target_path: &str,
@@ -2267,7 +2341,7 @@ pub fn add_worktree_cached(
     caches: Option<&crate::engine::cow_clone::CacheSelection>,
     run_hooks: bool,
 ) -> Result<WorktreeCreated, CommandError> {
-    add_worktree_cached_with_devmap_mode(
+    add_worktree_with_devmap(
         repo_path,
         target_path,
         new_branch,
@@ -2275,12 +2349,16 @@ pub fn add_worktree_cached(
         detach,
         caches,
         run_hooks,
-        false,
+        DevmapMode::None,
     )
 }
 
+/// [`add_worktree_cached`] that also seeds the new worktree's DevMap store as
+/// `devmap` says, in parallel with the cache copy, and reports what that did in
+/// [`WorktreeCreated::devmap`]: a seeding that failed is `failed` with its
+/// error, never a silent success.
 #[allow(clippy::too_many_arguments)]
-fn add_worktree_cached_with_devmap_mode(
+pub fn add_worktree_with_devmap(
     repo_path: &str,
     target_path: &str,
     new_branch: Option<&str>,
@@ -2288,7 +2366,7 @@ fn add_worktree_cached_with_devmap_mode(
     detach: bool,
     caches: Option<&crate::engine::cow_clone::CacheSelection>,
     run_hooks: bool,
-    zero_copy_devmap: bool,
+    devmap: DevmapMode,
 ) -> Result<WorktreeCreated, CommandError> {
     let path = add_worktree(repo_path, target_path, new_branch, start_point, detach)?;
     let mut created = WorktreeCreated {
@@ -2298,32 +2376,50 @@ fn add_worktree_cached_with_devmap_mode(
         disk_unknown: false,
         hook_error: None,
         hook_notice: None,
+        devmap: DevmapOutcome::NotRequested,
     };
     let target = Path::new(&created.path);
     let anchor = resolve_worktree_family(repo_path, &created.path)
         .ok()
         .map(|f| f.anchor)
         .unwrap_or_else(|| Path::new(repo_path).to_path_buf());
-    if let Some(selection) = caches {
-        let repo = validate_repo(repo_path)?;
-        let low_space = matches!(
-            crate::engine::cow_clone::read_free(selection.free_space, target),
+    let free_space = caches.map_or(
+        crate::sysload::free_bytes as crate::sysload::FreeSpace,
+        |s| s.free_space,
+    );
+    let low_space = devmap == DevmapMode::Copy
+        && matches!(
+            crate::engine::cow_clone::read_free(free_space, target),
             crate::sysload::Reading::Value(left) if left < crate::sysload::LOW_DISK_FLOOR
         );
-        let cache_outcome = std::thread::scope(|scope| {
+    let provision = || match devmap {
+        DevmapMode::None => DevmapOutcome::NotRequested,
+        DevmapMode::ZeroCopy => DevmapOutcome::from_provision(
+            crate::codeintel::provision_worktree_devmap_zero_copy(&anchor, target),
+        ),
+        DevmapMode::Copy if low_space => DevmapOutcome::Skipped {
+            reason: "skipped local devmap clone under low disk".to_string(),
+        },
+        DevmapMode::Copy => DevmapOutcome::from_provision(
+            crate::codeintel::provision_worktree_devmap(&anchor, target),
+        ),
+    };
+    if let Some(selection) = caches {
+        let repo = validate_repo(repo_path)?;
+        let (cache_outcome, devmap_outcome) = std::thread::scope(|scope| {
             let cache_task = scope.spawn(|| clone_ignored_caches(&repo, target, selection));
-            let devmap_task = scope.spawn(|| {
-                if zero_copy_devmap {
-                    let _ = crate::codeintel::provision_worktree_devmap_zero_copy(&anchor, target);
-                } else if !low_space {
-                    let _ = crate::codeintel::provision_worktree_devmap(&anchor, target);
-                }
-            });
-            let _ = devmap_task.join();
-            cache_task
+            let devmap_task = scope.spawn(provision);
+            let devmap_outcome = devmap_task
                 .join()
-                .unwrap_or_else(|_| Err(CommandError::plain("cache clone worker panicked")))
+                .unwrap_or_else(|_| DevmapOutcome::Failed {
+                    error: "devmap provisioning worker panicked".to_string(),
+                });
+            let cache_outcome = cache_task
+                .join()
+                .unwrap_or_else(|_| Err(CommandError::plain("cache clone worker panicked")));
+            (cache_outcome, devmap_outcome)
         });
+        created.devmap = devmap_outcome;
         match cache_outcome {
             Ok(report) => {
                 created.cache_error = report.error();
@@ -2332,16 +2428,8 @@ fn add_worktree_cached_with_devmap_mode(
             }
             Err(error) => created.cache_error = Some(error.into_message()),
         }
-    } else if zero_copy_devmap {
-        let _ = crate::codeintel::provision_worktree_devmap_zero_copy(&anchor, target);
     } else {
-        let low_space = matches!(
-            crate::engine::cow_clone::read_free(crate::sysload::free_bytes, target),
-            crate::sysload::Reading::Value(left) if left < crate::sysload::LOW_DISK_FLOOR
-        );
-        if !low_space {
-            let _ = crate::codeintel::provision_worktree_devmap(&anchor, target);
-        }
+        created.devmap = provision();
     }
     if run_hooks {
         let repo = validate_repo(repo_path)?;
@@ -4187,7 +4275,13 @@ pub fn prune_worktree_argv() -> Vec<String> {
 pub fn sanitize_branch_name(branch: &str) -> String {
     let sanitized: String = branch
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let trimmed = sanitized.trim_matches(|c| c == '-' || c == '.');
     if trimmed.is_empty() {
@@ -4292,10 +4386,10 @@ pub fn verify_branch_integration(
     validate_ref_name(branch)?;
     validate_ref_name(target)?;
 
-    let branch_sha = git_text(repo, &["rev-parse", "--verify", branch])
-        .map(|s| s.trim().to_string())?;
-    let target_sha = git_text(repo, &["rev-parse", "--verify", target])
-        .map(|s| s.trim().to_string())?;
+    let branch_sha =
+        git_text(repo, &["rev-parse", "--verify", branch]).map(|s| s.trim().to_string())?;
+    let target_sha =
+        git_text(repo, &["rev-parse", "--verify", target]).map(|s| s.trim().to_string())?;
 
     // Check 1: SameCommit
     let same_commit = branch_sha == target_sha;
@@ -4425,15 +4519,7 @@ pub fn reap_processes_in_dir(dir: &Path, dry_run: bool) -> Result<ProcessReapRep
             let base_name = facts.ident.name.trim_start_matches('-');
             let is_interactive_shell = matches!(
                 base_name,
-                "sh" | "bash"
-                    | "zsh"
-                    | "fish"
-                    | "nu"
-                    | "tcsh"
-                    | "csh"
-                    | "ksh"
-                    | "tmux"
-                    | "screen"
+                "sh" | "bash" | "zsh" | "fish" | "nu" | "tcsh" | "csh" | "ksh" | "tmux" | "screen"
             );
             if facts.start_us == 0
                 || facts.uid != me_uid
@@ -4536,8 +4622,7 @@ pub fn is_runtime_state_artifact_path(rel_path: &str) -> bool {
     ) {
         return true;
     }
-    normalized.starts_with(".devcouncil/codeintel/")
-        || normalized.starts_with(".devmap/codeintel/")
+    normalized.starts_with(".devcouncil/codeintel/") || normalized.starts_with(".devmap/codeintel/")
 }
 
 /// Repo-relative uncommitted user/agent paths in `worktree_path`, excluding
@@ -4770,7 +4855,10 @@ pub fn merge_worktree_pipeline(
                 let twt_path = Path::new(&twt.path);
                 git_text(twt_path, &["merge", "--ff-only", &new_commit])?;
             } else {
-                git_text(&anchor, &["update-ref", &target_ref, &new_commit, &target_sha])?;
+                git_text(
+                    &anchor,
+                    &["update-ref", &target_ref, &new_commit, &target_sha],
+                )?;
             }
         }
 
@@ -4778,9 +4866,7 @@ pub fn merge_worktree_pipeline(
             .map(|s| s.trim().to_string())
             .ok();
 
-        let swt_path = source_wt
-            .filter(|w| !w.is_main)
-            .map(|w| w.path);
+        let swt_path = source_wt.filter(|w| !w.is_main).map(|w| w.path);
         (source_sha, swt_path, squashed_sha, final_sha)
     };
 
@@ -4788,7 +4874,11 @@ pub fn merge_worktree_pipeline(
     if remove_wt {
         let current_source_sha = git_text(
             &anchor,
-            &["rev-parse", "--verify", &format!("refs/heads/{source_branch}")],
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("refs/heads/{source_branch}"),
+            ],
         )
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
@@ -4864,6 +4954,9 @@ pub struct SparseWorktreeCreated {
     pub cache_error: Option<String>,
     pub zero_copy_devmap: bool,
     pub overlay_path: Option<String>,
+    /// What seeding the DevMap store did (see [`DevmapOutcome`]); `zero_copy_devmap`
+    /// is true only when this is `provisioned` with `zero_copy`.
+    pub devmap: DevmapOutcome,
 }
 
 fn normalize_sparse_rel_path(raw: &str) -> Result<String, CommandError> {
@@ -4910,7 +5003,10 @@ fn normalize_sparse_rel_path(raw: &str) -> Result<String, CommandError> {
 }
 
 fn cone_dir_for_rel_path(anchor: &Path, rev: Option<&str>, rel: &str) -> Option<String> {
-    let tree_rev = rev.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("HEAD");
+    let tree_rev = rev
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("HEAD");
     let spec = format!("{tree_rev}:{rel}");
     if let Ok(run) = crate::engine::git_cli::git_captured(anchor, &["cat-file", "-t", &spec]) {
         if run.status_code == 0 {
@@ -5130,6 +5226,7 @@ pub fn add_sparse_worktree_zero_copy(
     base: Option<&str>,
     scope_paths: &[String],
     selective_cache: bool,
+    gate: GitWriteGate<'_>,
 ) -> Result<SparseWorktreeCreated, CommandError> {
     add_sparse_worktree_zero_copy_optional_branch(
         repo_path,
@@ -5140,6 +5237,7 @@ pub fn add_sparse_worktree_zero_copy(
         scope_paths,
         selective_cache,
         true,
+        gate,
     )
 }
 
@@ -5153,6 +5251,7 @@ fn add_sparse_worktree_zero_copy_optional_branch(
     scope_paths: &[String],
     selective_cache: bool,
     zero_copy_devmap: bool,
+    gate: GitWriteGate<'_>,
 ) -> Result<SparseWorktreeCreated, CommandError> {
     let repo = validate_repo(repo_path)?;
     validate_target_path(target_path)?;
@@ -5194,35 +5293,60 @@ fn add_sparse_worktree_zero_copy_optional_branch(
         if let Some(start) = base {
             add_args.push(start);
         }
+        gate(&add_args)?;
         git_text(&repo, &add_args)?;
 
+        // `git sparse-checkout init` enables `extensions.worktreeConfig` itself
+        // when it must keep the cone per worktree: GitPulse writes no repository
+        // config of its own (owner decision ft-7450105d), so there is no
+        // `git config` here. Every write below is judged before it runs.
         let setup = (|| -> Result<String, CommandError> {
-            git_text(&repo, &["config", "extensions.worktreeConfig", "true"])?;
-            git_text(target, &["sparse-checkout", "init", "--cone"])?;
+            let init: &[&str] = &["sparse-checkout", "init", "--cone"];
+            gate(init)?;
+            git_text(target, init)?;
             if !cone_dirs.is_empty() {
-                let mut set_args: Vec<&str> = Vec::with_capacity(3 + cone_dirs.len());
+                let mut set_args: Vec<&str> = Vec::with_capacity(4 + cone_dirs.len());
                 set_args.extend_from_slice(&["sparse-checkout", "set", "--cone", "--"]);
                 for dir in &cone_dirs {
                     set_args.push(dir.as_str());
                 }
+                gate(&set_args)?;
                 git_text(target, &set_args)?;
             }
-            let _ = git_text(
-                target,
-                &["config", "--worktree", "core.untrackedCache", "true"],
-            );
-            git_text(target, &["checkout", "-q", "HEAD"])?;
+            let checkout: &[&str] = &["checkout", "-q", "HEAD"];
+            gate(checkout)?;
+            git_text(target, checkout)?;
             git_text(target, &["rev-parse", "--verify", "HEAD"]).map(|s| s.trim().to_string())
         })();
 
         match setup {
             Ok(sha) => sha,
             Err(err) => {
-                let _ = git_text(&repo, &["worktree", "remove", "--force", &target_plain]);
-                if let Some(branch) = new_branch {
-                    let _ = git_text(&repo, &["branch", "-D", branch]);
+                // Roll back, judging each undo like any other write, and say
+                // what is still there when an undo is refused or fails.
+                let mut left_behind = Vec::new();
+                let remove: Vec<&str> = vec!["worktree", "remove", "--force", &target_plain];
+                if let Err(e) = gate(&remove).and_then(|()| git_text(&repo, &remove).map(drop)) {
+                    left_behind.push(format!(
+                        "worktree {target_plain} was not removed: {}",
+                        e.message()
+                    ));
+                } else if let Some(branch) = new_branch {
+                    let delete: Vec<&str> = vec!["branch", "-D", branch];
+                    if let Err(e) = gate(&delete).and_then(|()| git_text(&repo, &delete).map(drop))
+                    {
+                        left_behind
+                            .push(format!("branch {branch} was not deleted: {}", e.message()));
+                    }
                 }
-                return Err(err);
+                if left_behind.is_empty() {
+                    return Err(err);
+                }
+                return Err(CommandError::plain(format!(
+                    "{}; rollback incomplete: {}",
+                    err.message(),
+                    left_behind.join("; ")
+                )));
             }
         }
     };
@@ -5233,36 +5357,54 @@ fn add_sparse_worktree_zero_copy_optional_branch(
             crate::sysload::Reading::Value(left) if left < crate::sysload::LOW_DISK_FLOOR
         );
 
-    let ((caches_cloned, cache_error), devmap_res) = std::thread::scope(|scope| {
-        let cache_task = scope.spawn(|| {
-            if selective_cache {
-                clone_scoped_caches_for_cone(&anchor, target, &cone_dirs)
-            } else {
-                (Vec::new(), None)
-            }
+    let ((caches_cloned, cache_error), devmap_outcome, overlay_path) =
+        std::thread::scope(|scope| {
+            let cache_task = scope.spawn(|| {
+                if selective_cache {
+                    clone_scoped_caches_for_cone(&anchor, target, &cone_dirs)
+                } else {
+                    (Vec::new(), None)
+                }
+            });
+            let devmap_task = scope.spawn(|| {
+                if zero_copy_devmap {
+                    Some(crate::codeintel::provision_worktree_devmap_zero_copy(
+                        &anchor, target,
+                    ))
+                } else if !low_space {
+                    Some(crate::codeintel::provision_worktree_devmap(&anchor, target))
+                } else {
+                    None
+                }
+            });
+            let c = cache_task
+                .join()
+                .unwrap_or_else(|_| (Vec::new(), Some("selective cache worker panicked".into())));
+            let (outcome, overlay) = match devmap_task.join() {
+                Ok(Some(res)) => {
+                    let overlay = res.as_ref().ok().and_then(|p| p.overlay_path.clone());
+                    (DevmapOutcome::from_provision(res), overlay)
+                }
+                Ok(None) => (
+                    DevmapOutcome::Skipped {
+                        reason: "skipped local devmap clone under low disk".to_string(),
+                    },
+                    None,
+                ),
+                Err(_) => (
+                    DevmapOutcome::Failed {
+                        error: "devmap provisioning worker panicked".to_string(),
+                    },
+                    None,
+                ),
+            };
+            (c, outcome, overlay)
         });
-        let devmap_task = scope.spawn(|| {
-            if zero_copy_devmap {
-                crate::codeintel::provision_worktree_devmap_zero_copy(&anchor, target)
-            } else if !low_space {
-                crate::codeintel::provision_worktree_devmap(&anchor, target)
-            } else {
-                Err(CommandError::plain("skipped local devmap clone under low disk"))
-            }
-        });
-        let c = cache_task
-            .join()
-            .unwrap_or_else(|_| (Vec::new(), Some("selective cache worker panicked".into())));
-        let d = devmap_task
-            .join()
-            .unwrap_or_else(|_| Err(CommandError::plain("devmap provisioning worker panicked")));
-        (c, d)
-    });
 
-    let (provisioned_zero_copy, overlay_path) = match devmap_res {
-        Ok(p) => (p.seeded && p.zero_copy_base_ref, p.overlay_path),
-        Err(_) => (false, None),
-    };
+    let provisioned_zero_copy = matches!(
+        devmap_outcome,
+        DevmapOutcome::Provisioned { zero_copy: true }
+    );
 
     Ok(SparseWorktreeCreated {
         path: target_plain,
@@ -5274,6 +5416,7 @@ fn add_sparse_worktree_zero_copy_optional_branch(
         cache_error,
         zero_copy_devmap: provisioned_zero_copy,
         overlay_path,
+        devmap: devmap_outcome,
     })
 }
 
@@ -5285,14 +5428,20 @@ mod tests {
 
     #[test]
     fn test_branch_template_rendering_and_sanitization() {
-        assert_eq!(sanitize_branch_name("feature/add-sync:v1"), "feature-add-sync-v1");
+        assert_eq!(
+            sanitize_branch_name("feature/add-sync:v1"),
+            "feature-add-sync-v1"
+        );
         assert_eq!(sanitize_branch_name("---test/foo---"), "test-foo");
         let template = "../{{ repo }}.{{ branch | sanitize }}";
-        let rendered = render_branch_template(template, "my-repo", "feature/my-work", None, None, None).unwrap();
+        let rendered =
+            render_branch_template(template, "my-repo", "feature/my-work", None, None, None)
+                .unwrap();
         assert_eq!(rendered, "../my-repo.feature-my-work");
 
         let custom = "{{ repo }}/{{ task_id }}/{{ branch | sanitize }}";
-        let res = render_branch_template(custom, "my-repo", "feat/123", Some("TASK-1"), None, None).unwrap();
+        let res = render_branch_template(custom, "my-repo", "feat/123", Some("TASK-1"), None, None)
+            .unwrap();
         assert_eq!(res, "my-repo/TASK-1/feat-123");
 
         assert!(render_branch_template("{{ unknown }}", "r", "b", None, None, None).is_err());
@@ -5346,7 +5495,8 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_worktree_pipeline_preserves_divergent_target_and_refuses_dirty_or_conflicting_lanes() {
+    fn test_merge_worktree_pipeline_preserves_divergent_target_and_refuses_dirty_or_conflicting_lanes(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
         crate::test_support::git_in(repo, &["init", "-b", "main"]);
@@ -5361,7 +5511,14 @@ mod tests {
         let wt_parent = tempfile::tempdir().unwrap();
         let wt_clean = wt_parent.path().join("wt-clean");
         let wt_clean_str = wt_clean.to_str().unwrap();
-        add_worktree(repo_str, wt_clean_str, Some("feat/clean"), Some("main"), false).unwrap();
+        add_worktree(
+            repo_str,
+            wt_clean_str,
+            Some("feat/clean"),
+            Some("main"),
+            false,
+        )
+        .unwrap();
         crate::test_support::trust_repo(&wt_clean);
 
         std::fs::write(wt_clean.join("agent_feature.txt"), "agent work\n").unwrap();
@@ -5375,8 +5532,9 @@ mod tests {
 
         // Uncommitted file in `wt_clean` must block merge_worktree_pipeline.
         std::fs::write(wt_clean.join("uncommitted.txt"), "wip").unwrap();
-        let dirty_err = merge_worktree_pipeline(repo_str, "feat/clean", Some("main"), true, None, true)
-            .expect_err("dirty worktree must be refused");
+        let dirty_err =
+            merge_worktree_pipeline(repo_str, "feat/clean", Some("main"), true, None, true)
+                .expect_err("dirty worktree must be refused");
         assert!(dirty_err.message().contains("uncommitted"));
         std::fs::remove_file(wt_clean.join("uncommitted.txt")).unwrap();
 
@@ -5394,15 +5552,31 @@ mod tests {
         assert!(merged.ok);
         assert!(merged.worktree_removed);
         assert!(merged.squashed_commit.is_some());
-        assert_eq!(std::fs::read_to_string(repo.join("main_progress.txt")).unwrap(), "concurrent main commit\n");
-        assert_eq!(std::fs::read_to_string(repo.join("agent_feature.txt")).unwrap(), "agent work\n");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("main_progress.txt")).unwrap(),
+            "concurrent main commit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("agent_feature.txt")).unwrap(),
+            "agent work\n"
+        );
         let (main_dirty, _) = user_changed_paths(repo_str).unwrap();
-        assert!(main_dirty.is_empty(), "main working tree must stay clean: {main_dirty:?}");
+        assert!(
+            main_dirty.is_empty(),
+            "main working tree must stay clean: {main_dirty:?}"
+        );
 
         // Conflicting branch must fail closed without polluting `main`.
         let wt_conflict = wt_parent.path().join("wt-conflict");
         let wt_conflict_str = wt_conflict.to_str().unwrap();
-        add_worktree(repo_str, wt_conflict_str, Some("feat/conflict"), Some("main"), false).unwrap();
+        add_worktree(
+            repo_str,
+            wt_conflict_str,
+            Some("feat/conflict"),
+            Some("main"),
+            false,
+        )
+        .unwrap();
         crate::test_support::trust_repo(&wt_conflict);
         std::fs::write(wt_conflict.join("shared.txt"), "agent side\n").unwrap();
         crate::test_support::git_in(&wt_conflict, &["add", "shared.txt"]);
@@ -5412,12 +5586,16 @@ mod tests {
         crate::test_support::git_in(repo, &["add", "shared.txt"]);
         crate::test_support::git_in(repo, &["commit", "-m", "conflict side B"]);
 
-        let conflict_err = merge_worktree_pipeline(repo_str, "feat/conflict", Some("main"), true, None, true)
-            .expect_err("conflicting merge must fail closed");
+        let conflict_err =
+            merge_worktree_pipeline(repo_str, "feat/conflict", Some("main"), true, None, true)
+                .expect_err("conflicting merge must fail closed");
         assert!(conflict_err.message().contains("conflicting"));
         let (main_dirty_after, _) = user_changed_paths(repo_str).unwrap();
         assert!(main_dirty_after.is_empty());
-        assert!(wt_conflict.exists(), "conflicting worktree must be preserved");
+        assert!(
+            wt_conflict.exists(),
+            "conflicting worktree must be preserved"
+        );
     }
 
     /// A full family memory used to empty itself: the first family past the
@@ -11754,6 +11932,166 @@ some-future-field whatever
         assert_eq!(finish_teardown(Some(aside), &mut delete_dir_tree), None);
     }
 
+    fn small_sparse_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let sandbox = tempfile::tempdir().unwrap();
+        let anchor = sandbox.path().join("mono").canonicalize_or_create();
+        std::fs::create_dir_all(anchor.join("src")).unwrap();
+        std::fs::write(anchor.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        git_in(&anchor, &["init", "-q", "-b", "main"]);
+        git_in(&anchor, &["config", "user.name", "Sparse Test"]);
+        git_in(&anchor, &["config", "user.email", "sparse@example.com"]);
+        git_in(&anchor, &["add", "."]);
+        git_in(&anchor, &["commit", "-q", "-m", "init"]);
+        let target = sandbox.path().join("lane");
+        (sandbox, anchor, target)
+    }
+
+    trait CanonicalizeOrCreate {
+        fn canonicalize_or_create(self) -> PathBuf;
+    }
+
+    impl CanonicalizeOrCreate for PathBuf {
+        fn canonicalize_or_create(self) -> PathBuf {
+            std::fs::create_dir_all(&self).unwrap();
+            self.canonicalize().unwrap()
+        }
+    }
+
+    /// Every git write of a sparse creation is judged: the add, sparse-checkout
+    /// init/set and the checkout, and none of them is `git config`.
+    #[test]
+    fn a_sparse_creation_hands_every_git_write_to_the_gate_and_writes_no_config() {
+        let (_sandbox, anchor, target) = small_sparse_fixture();
+        let mut judged: Vec<Vec<String>> = Vec::new();
+        let created = add_sparse_worktree_zero_copy(
+            anchor.to_str().unwrap(),
+            target.to_str().unwrap(),
+            "agent/judged",
+            None,
+            &["src".to_string()],
+            false,
+            &mut |args| {
+                judged.push(args.iter().map(|a| a.to_string()).collect());
+                Ok(())
+            },
+        )
+        .expect("sparse worktree");
+        let heads: Vec<&str> = judged.iter().map(|a| a[0].as_str()).collect();
+        assert_eq!(
+            heads,
+            ["worktree", "sparse-checkout", "sparse-checkout", "checkout"],
+            "{judged:?}"
+        );
+        assert!(judged.iter().all(|a| a[0] != "config"), "{judged:?}");
+        assert!(Path::new(&created.path).join("src/lib.rs").is_file());
+    }
+
+    /// A refused write stops the sequence, and the undo is judged too: a
+    /// refusal of the first sparse step leaves no half-made worktree or branch.
+    #[test]
+    fn a_refused_sparse_step_stops_the_sequence_and_rolls_back_through_the_gate() {
+        let (_sandbox, anchor, target) = small_sparse_fixture();
+        let mut judged: Vec<String> = Vec::new();
+        let err = add_sparse_worktree_zero_copy(
+            anchor.to_str().unwrap(),
+            target.to_str().unwrap(),
+            "agent/refused",
+            None,
+            &["src".to_string()],
+            false,
+            &mut |args| {
+                judged.push(args[0].to_string());
+                if args[0] == "sparse-checkout" {
+                    return Err(CommandError::plain("refused by policy"));
+                }
+                Ok(())
+            },
+        )
+        .expect_err("a refusal is an error");
+        assert!(
+            err.message().contains("refused by policy"),
+            "{}",
+            err.message()
+        );
+        assert_eq!(
+            judged,
+            ["worktree", "sparse-checkout", "worktree", "branch"]
+        );
+        assert!(!target.exists(), "the worktree was rolled back");
+        let branches = git_text(&anchor, &["branch", "--list", "agent/refused"]).unwrap();
+        assert!(
+            branches.trim().is_empty(),
+            "the branch was deleted: {branches}"
+        );
+    }
+
+    /// When the undo itself is refused, the error says what is left behind.
+    #[test]
+    fn a_refused_rollback_names_what_it_left_behind() {
+        let (_sandbox, anchor, target) = small_sparse_fixture();
+        let err = add_sparse_worktree_zero_copy(
+            anchor.to_str().unwrap(),
+            target.to_str().unwrap(),
+            "agent/stuck",
+            None,
+            &["src".to_string()],
+            false,
+            &mut |args| {
+                if args[0] == "sparse-checkout" || args[0] == "branch" {
+                    return Err(CommandError::plain("refused"));
+                }
+                Ok(())
+            },
+        )
+        .expect_err("refused");
+        assert!(
+            err.message().contains("rollback incomplete"),
+            "{}",
+            err.message()
+        );
+        assert!(
+            err.message().contains("branch agent/stuck was not deleted"),
+            "{}",
+            err.message()
+        );
+    }
+
+    /// A caller that did not ask for a DevMap store pays nothing for one, and
+    /// the result says so; one that asks is told what happened.
+    #[test]
+    fn a_worktree_created_without_asking_seeds_no_devmap_store_and_says_so() {
+        let (_sandbox, anchor, target) = small_sparse_fixture();
+        let created = add_worktree_cached(
+            anchor.to_str().unwrap(),
+            target.to_str().unwrap(),
+            Some("agent/plain"),
+            None,
+            false,
+            None,
+            false,
+        )
+        .expect("worktree");
+        assert_eq!(created.devmap, DevmapOutcome::NotRequested);
+        assert!(!devmap_query::paths::store_path(Path::new(&created.path)).exists());
+
+        let asked = add_worktree_with_devmap(
+            anchor.to_str().unwrap(),
+            anchor.parent().unwrap().join("lane2").to_str().unwrap(),
+            Some("agent/asked"),
+            None,
+            false,
+            None,
+            false,
+            DevmapMode::Copy,
+        )
+        .expect("worktree");
+        assert_ne!(
+            asked.devmap,
+            DevmapOutcome::NotRequested,
+            "an asked-for seeding reports an outcome"
+        );
+    }
+
     #[test]
     fn test_sparse_worktree_zero_copy_expands_devmap_deps_and_skips_unrelated_dirs() {
         let sandbox = tempfile::tempdir().unwrap();
@@ -11867,6 +12205,7 @@ some-future-field whatever
             None,
             &["crates/api".to_string()],
             true,
+            &mut |_| Ok(()),
         )
         .expect("sparse zero-copy worktree");
 
@@ -11902,11 +12241,17 @@ some-future-field whatever
             "unrelated_heavy must NOT be materialized on disk in sparse worktree"
         );
         // Main checkout remains 100% intact (per-worktree sparse config isolation).
-        assert!(canon_anchor.join("crates/unrelated_heavy/src/lib.rs").is_file());
+        assert!(canon_anchor
+            .join("crates/unrelated_heavy/src/lib.rs")
+            .is_file());
 
         // Selective cache cloning copied `crates/api/node_modules` and NOT `crates/unrelated_heavy/node_modules`!
-        assert!(wt_target.join("crates/api/node_modules/pkg/index.js").is_file());
-        assert!(!wt_target.join("crates/unrelated_heavy/node_modules").exists());
+        assert!(wt_target
+            .join("crates/api/node_modules/pkg/index.js")
+            .is_file());
+        assert!(!wt_target
+            .join("crates/unrelated_heavy/node_modules")
+            .exists());
 
         // Zero-copy DevMap check: no devmap.sqlite copied, base_store_ref.json + overlay.json exist!
         assert!(!devmap_query::paths::store_path(&wt_target).exists());
@@ -11994,6 +12339,7 @@ some-future-field whatever
             None,
             &[".github".to_string()],
             true,
+            &mut |_| Ok(()),
         )
         .expect_err("must refuse .gitpulse/worktrees target");
         assert!(
@@ -12021,6 +12367,7 @@ some-future-field whatever
             None,
             &[".github".to_string()],
             true,
+            &mut |_| Ok(()),
         )
         .expect("wt1 sparse .github");
         assert_eq!(created1.materialized_cone_dirs, vec![".github".to_string()]);
@@ -12040,6 +12387,7 @@ some-future-field whatever
             None,
             &["releases/v1.0".to_string()],
             true,
+            &mut |_| Ok(()),
         )
         .expect("wt2 chained from wt1");
         assert_eq!(
@@ -12054,5 +12402,3 @@ some-future-field whatever
         assert!(!wt2.join("heavy_unwanted").exists());
     }
 }
-
-
