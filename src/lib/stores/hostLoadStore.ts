@@ -197,6 +197,8 @@ export interface ProcView {
   unreadable: number;
   claude: SessionCount;
   codex: SessionCount;
+  /** Antigravity, DevCouncil and Manvi sessions, so the counts add up to `sessions`. */
+  other: SessionCount;
   sessions: AgentSession[];
   sessions_truncated: boolean;
   trees: LaunchedTree[];
