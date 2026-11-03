@@ -44,17 +44,129 @@ const proposalsRs = read("src-tauri", "src", "workbench", "intake_proposals.rs")
 const workbenchRs = read("src-tauri", "src", "workbench.rs");
 
 /**
- * The non-test text of every `src-tauri/src/harness/*.rs` file, by file name.
- * Test modules (an inline `#[cfg(test)] mod`, and `*_tests.rs` files) are cut
- * off: they name ops as literals on purpose, to talk to fakes.
+ * Where the Rust literal, comment or char starting at `i` ends, or `i` when
+ * none starts there. Braces and semicolons inside these do not count when a
+ * test item's extent is measured. (A lifetime such as `'a` is not a literal.)
+ */
+function literalEnd(text: string, i: number): number {
+  const c = text[i];
+  if (c === "/" && text[i + 1] === "/") {
+    const nl = text.indexOf("\n", i);
+    return nl < 0 ? text.length : nl;
+  }
+  if (c === "/" && text[i + 1] === "*") {
+    let depth = 0;
+    for (let j = i; j < text.length - 1; j++) {
+      const pair = text.slice(j, j + 2);
+      if (pair === "/*") (depth++, j++);
+      else if (pair === "*/") {
+        j++;
+        if (--depth === 0) return j + 1;
+      }
+    }
+    return text.length;
+  }
+  if (c === "r") {
+    const raw = /r(#*)"/y;
+    raw.lastIndex = i;
+    const open = raw.exec(text);
+    if (open) {
+      const close = text.indexOf(`"${open[1]}`, i + open[0].length);
+      return close < 0 ? text.length : close + 1 + open[1].length;
+    }
+    return i;
+  }
+  if (c === '"') {
+    for (let j = i + 1; j < text.length; j++) {
+      if (text[j] === "\\") j++;
+      else if (text[j] === '"') return j + 1;
+    }
+    return text.length;
+  }
+  if (c === "'") {
+    const ch = /'(?:\\u\{[0-9a-fA-F_]+\}|\\x[0-9a-fA-F]{2}|\\.|[^\\'\n])'/y;
+    ch.lastIndex = i;
+    const m = ch.exec(text);
+    return m ? i + m[0].length : i;
+  }
+  return i;
+}
+
+/** The index just past the `}` that closes the `{` at `open`. */
+function blockEnd(text: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < text.length; ) {
+    const lit = literalEnd(text, i);
+    if (lit > i) {
+      i = lit;
+      continue;
+    }
+    if (text[i] === "{") depth++;
+    else if (text[i] === "}" && --depth === 0) return i + 1;
+    i++;
+  }
+  return text.length;
+}
+
+/** The index just past the item starting at `from`: up to its `;`, or through its `{ .. }` body. */
+function itemEnd(text: string, from: number): number {
+  let parens = 0;
+  for (let i = from; i < text.length; ) {
+    const lit = literalEnd(text, i);
+    if (lit > i) {
+      i = lit;
+      continue;
+    }
+    const c = text[i];
+    if (c === "(" || c === "[") parens++;
+    else if (c === ")" || c === "]") parens--;
+    else if (c === ";" && parens <= 0) return i + 1;
+    else if (c === "{" && parens <= 0) return blockEnd(text, i);
+    i++;
+  }
+  return text.length;
+}
+
+/**
+ * `text` without the items a `#[cfg(test)]` / `#[cfg(all(test, ..))]`
+ * attribute puts out of the production build: a `mod x;` declaration (its body
+ * is another file), an inline `mod x { .. }` (to its closing brace), a test-only
+ * `fn`, `const` or statement. Everything around them is kept, so code after a
+ * test module is still scanned. Line breaks are kept so positions stay put.
+ */
+function withoutTestItems(text: string): string {
+  const attr = /#\[cfg\((?:all\()?test\b[^\n]*\]/y;
+  let out = "";
+  for (let i = 0; i < text.length; ) {
+    const lit = literalEnd(text, i);
+    if (lit > i) {
+      out += text.slice(i, lit);
+      i = lit;
+      continue;
+    }
+    attr.lastIndex = i;
+    const found = text[i] === "#" ? attr.exec(text) : null;
+    if (!found) {
+      out += text[i++];
+      continue;
+    }
+    const end = itemEnd(text, i + found[0].length);
+    out += text.slice(i, end).replace(/[^\n]/g, "");
+    i = end;
+  }
+  return out;
+}
+
+/**
+ * The production text of every `src-tauri/src/harness/*.rs` file, by file name.
+ * Test items are removed, not the rest of the file after them: they name ops as
+ * literals on purpose, to talk to fakes, and `*_tests.rs` files are skipped.
  */
 function harnessProduction(): Map<string, string> {
   const dir = path.join(REPO, "src-tauri", "src", "harness");
   const files = new Map<string, string>();
   for (const name of readdirSync(dir).filter((f) => f.endsWith(".rs") && !/_tests?\.rs$/.test(f))) {
-    const text = readFileSync(path.join(dir, name), "utf8");
-    const testMod = /^#\[cfg\((?:all\()?test[^\n]*\n(?:#\[[^\n]*\n)*(?:pub(?:\([^)]*\))? )?mod \w+/m.exec(text);
-    files.set(name, testMod ? text.slice(0, testMod.index) : text);
+    files.set(name, withoutTestItems(readFileSync(path.join(dir, name), "utf8")));
   }
   return files;
 }
@@ -64,7 +176,7 @@ function harnessProduction(): Map<string, string> {
  * `x.call("a.b", ..)`, `call_typed::<T>("a.b", ..)`, `call_in_slot(owner, "a.b", ..)`.
  * An op is `hello` or dotted lowercase words, which a path or message is not.
  */
-const OP_LITERAL_ARG = /\bcall\w*(?:::<[^>]*>)?\(\s*(?:\w+\s*,\s*)?"(hello|[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+)"/g;
+const OP_LITERAL_ARG = /\bcall\w*(?:::<[^>]*>)?\(\s*(?:&?(?:mut\s+)?[\w.:]+\s*,\s*){0,2}"(hello|[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+)"/g;
 
 function literalOpCalls(source: string): string[] {
   return [...source.matchAll(OP_LITERAL_ARG)].map((m) => m[1]);
@@ -306,6 +418,43 @@ describe("every op the harness sends is a named, contract-checked constant", () 
     expect(literalOpCalls("sidecar::call_typed::<PrepareResult>(OP_CHAT_PREPARE, params, t)")).toEqual([]);
     expect(literalOpCalls("self.call(OP_SERVE_STATUS, None, t)")).toEqual([]);
     expect(literalOpCalls('self.call("not an op", None, t)')).toEqual([]);
+  });
+
+  it("the test-item stripper keeps the production code after a test module (it does not cut the file)", () => {
+    const decl = [
+      "fn before() {}",
+      "#[cfg(all(test, unix))]",
+      "mod concurrent_tests;",
+      "",
+      'fn after() { let _ = sidecar::call("work.runs.managed.stop", None, t); }',
+    ].join("\n");
+    expect(literalOpCalls(withoutTestItems(decl))).toEqual(["work.runs.managed.stop"]);
+    const inline = [
+      "#[cfg(test)]",
+      "mod tests {",
+      '    fn fake() { self.call("serve.stop_all", None, t); let brace = "}"; let c = \'}\'; /* } */ }',
+      '    const RAW: &str = r#"} mod x {"#;',
+      "}",
+      "pub struct Kept { pub a: u8 }",
+      'fn after() { self.call_in_slot(&self.slot, "serve.status", None, t); }',
+    ].join("\n");
+    const kept = withoutTestItems(inline);
+    expect(kept).toContain("pub struct Kept");
+    expect(literalOpCalls(kept)).toEqual(["serve.status"]);
+    // A test-only function or statement inside production code goes too; its neighbours stay.
+    const stmt = '#[cfg(test)]\nlet lent = sidecar::call("a.b", None);\nlet kept = self.call("c.d", None);\n';
+    expect(literalOpCalls(withoutTestItems(stmt))).toEqual(["c.d"]);
+    expect(withoutTestItems(inline).split("\n")).toHaveLength(inline.split("\n").length);
+  });
+
+  it("the stripper leaves the production items after the test modules of the real harness files", () => {
+    const files = harnessProduction();
+    // Items that follow a `#[cfg(test)] mod` in their file; the old cut-at-first-test-module dropped them.
+    expect(files.get("mod.rs")).toMatch(/\npub(?:\(crate\))? fn guard_files\b/);
+    expect(files.get("mod.rs")).not.toMatch(/guard_files_with_workers_for_bench/);
+    expect(files.get("protocol.rs")).toMatch(/pub struct ScanResult\b/);
+    expect(files.get("policy.rs")).toMatch(/pub fn check_file\(/);
+    for (const [file, text] of files) expect(text, file).not.toMatch(/#\[cfg\((?:all\()?test\b/);
   });
 
   it("the serve ops the hosted lane sends are constants, served, and the shapes Rust reads are declared", () => {
