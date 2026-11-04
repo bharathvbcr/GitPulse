@@ -9805,7 +9805,9 @@ mod tests {
                 cmd
             },
             "git log",
-            Duration::from_millis(300),
+            // Scaled: a starved `sh` that has not run `echo` by the deadline
+            // leaves nothing to keep, which is not the behaviour under test.
+            crate::test_support::coverage_relaxed(Duration::from_millis(300)),
             None,
         )
         .expect("bytes written before the deadline are the result");
@@ -9936,7 +9938,7 @@ mod tests {
                 let run = run_with_gate(
                     &mut cmd,
                     "git log",
-                    Duration::from_millis(400),
+                    crate::test_support::coverage_relaxed(Duration::from_millis(400)),
                     None,
                     MAX_OUTPUT_BYTES,
                     &mut (),
@@ -11375,6 +11377,12 @@ mod tests {
         // report "timed out" for work that had not started. Hold the only
         // slot long enough that the leftover would be less than `sleep`,
         // then prove the child still finishes.
+        // The deadline is scaled so a loaded host can still start `sh` and
+        // finish the 0.4s sleep inside it; the hold scales with it, leaving
+        // 250ms of the deadline after the slot frees, so the old behaviour
+        // would still time out before `sleep 0.4` ends.
+        let deadline = crate::test_support::coverage_relaxed(Duration::from_millis(600));
+        let hold = deadline.saturating_sub(Duration::from_millis(250));
         let gate: &'static SpawnGate = Box::leak(Box::new(SpawnGate::new(1)));
         let holder = gate
             .acquire(Instant::now() + Duration::from_secs(10))
@@ -11386,7 +11394,7 @@ mod tests {
             let result = run_with_gate(
                 &mut cmd,
                 "queued-run",
-                Duration::from_millis(600),
+                deadline,
                 None,
                 MAX_OUTPUT_BYTES,
                 &mut (),
@@ -11394,10 +11402,10 @@ mod tests {
             );
             tx.send(result).unwrap();
         });
-        thread::sleep(Duration::from_millis(350));
+        thread::sleep(hold);
         drop(holder);
         let result = rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(deadline + crate::test_support::coverage_relaxed(Duration::from_secs(5)))
             .expect("queued command must start after the slot is freed")
             .expect("a command that waited in the gate must still get its full runtime");
         worker.join().unwrap();
@@ -12591,7 +12599,9 @@ mod tests {
         let run = run_bounded(
             grace_flooder(GRACE_FLOODER, &marker),
             "flooder",
-            Duration::from_millis(600),
+            // Scaled: SIGTERM before a starved `sh` has installed its trap
+            // kills it outright, so there is no cleanup for the grace to drain.
+            crate::test_support::coverage_relaxed(Duration::from_millis(600)),
             None,
         )
         .expect("a deadline keeps its prefix");
@@ -12668,19 +12678,15 @@ mod tests {
             touch "$1"
             while :; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done
         "#;
+        // Scaled for the same reason as the drained-grace test: the trap has
+        // to be installed before SIGTERM for there to be anything to observe.
+        let deadline = crate::test_support::coverage_relaxed(Duration::from_millis(300));
         let started = Instant::now();
-        let run = run_bounded(
-            grace_flooder(script, &marker),
-            "stubborn",
-            Duration::from_millis(300),
-            None,
-        )
-        .expect("a deadline keeps its prefix");
+        let run = run_bounded(grace_flooder(script, &marker), "stubborn", deadline, None)
+            .expect("a deadline keeps its prefix");
         assert!(
             started.elapsed()
-                < crate::test_support::coverage_relaxed(
-                    Duration::from_millis(300) + Duration::from_secs(2)
-                ),
+                < deadline + crate::test_support::coverage_relaxed(Duration::from_secs(2)),
             "the grace must stay bounded: {:?}",
             started.elapsed()
         );

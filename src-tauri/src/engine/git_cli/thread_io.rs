@@ -1076,7 +1076,11 @@ mod tests {
             take_permit(gate),
         )
         .unwrap();
-        thread::sleep(Duration::from_millis(300));
+        // Scaled: a starved `head` that has written nothing yet leaves no cap
+        // to reach, which is not the behaviour under test.
+        thread::sleep(crate::test_support::coverage_relaxed(
+            Duration::from_millis(300),
+        ));
         let (stdout, _) = drains.finish(Instant::now());
         assert_eq!(stdout.bytes.len(), 10);
         assert!(stdout.truncated);
