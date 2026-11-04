@@ -2,7 +2,7 @@ use crate::diff::{Expect, WriteFailure};
 use crate::ipc_error::CommandError;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(test)]
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -3547,6 +3547,19 @@ struct GateState {
     /// rounding. The mutex makes the decrement atomic with the check.
     tokens: u32,
     tokens_at: Option<Instant>,
+    /// Reactive waiters that have not yet been granted a shared rate token, by
+    /// arrival ticket, oldest first. Only the front may ask the shared budget:
+    /// without an order the waiters race for each token as it lands, so a
+    /// read that waited a whole deadline loses it to one that arrived a
+    /// moment ago and is refused while later arrivals are served. Reactive
+    /// only, on purpose: an interactive caller never waits for a token, a
+    /// background one is shed or held to a reserve that a reactive read is
+    /// not, so putting either in this line would let a head blocked on its own
+    /// floor stall every read behind it. Every reactive waiter is blocked by
+    /// the same slot, class and local-token conditions, so a front that
+    /// cannot ask means none behind it can either.
+    reactive_line: VecDeque<u64>,
+    next_ticket: u64,
     /// Decisions that could not consult the shared budget and fell back to
     /// this process's own (a lock held past its patience, an I/O error).
     shared_fallbacks: u64,
@@ -3860,6 +3873,7 @@ impl SpawnGate {
             gate: self,
             class,
             held: false,
+            ticket: None,
         };
         // A poisoned gate must not deadlock the app: a panic inside a permit
         // holder still ran the `Drop` below, so the count is accurate.
@@ -3875,6 +3889,15 @@ impl SpawnGate {
             state.waiting_interactive += 1;
         }
         reservation.held = background || interactive;
+        // A reactive read that may have to wait for a shared token takes its
+        // place in line on arrival, so a later arrival cannot take a token
+        // from under it (see `GateState::reactive_line`).
+        if class == Admission::Reactive && rate_limited && self.shared.is_some() {
+            let ticket = state.next_ticket;
+            state.next_ticket = ticket.wrapping_add(1);
+            state.reactive_line.push_back(ticket);
+            reservation.ticket = Some(ticket);
+        }
         let mut token_wait_started: Option<Instant> = None;
         // When this waiter may next ask the shared record. A record changes at
         // most once per refill interval, so a waiter that was denied has
@@ -3952,6 +3975,16 @@ impl SpawnGate {
             let mut eligible = eligibility(&state);
             self.refill(&mut state, now);
             let mut tokens_ok = tokens_available(&state);
+            // A reactive read that is not at the front of the line does not
+            // ask: the token that lands next is the oldest waiter's. It naps
+            // like any waiter short of a token, and is woken when the front
+            // changes.
+            if reservation
+                .ticket
+                .is_some_and(|ticket| state.reactive_line.front() != Some(&ticket))
+            {
+                tokens_ok = false;
+            }
             // The shared budget is asked last, and only by a spawn that would
             // otherwise start now, so a granted token is spent at once below
             // and never taken for a waiter that then gives up.
@@ -3985,6 +4018,8 @@ impl SpawnGate {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if self.settle_shared(&mut state, taken) {
                     shared_token_held = true;
+                    // Served: the next in line is now the oldest waiter.
+                    reservation.leave_line(&mut state);
                     // The lock was released: another waiter may have taken the
                     // slot or the local token, so both are read again. The
                     // deadline is not: a token already granted is spent, not
@@ -4157,10 +4192,26 @@ struct WaitReservation<'a> {
     gate: &'a SpawnGate,
     class: Admission,
     held: bool,
+    /// This waiter's place in `GateState::reactive_line`, if it has one.
+    ticket: Option<u64>,
 }
 
 impl WaitReservation<'_> {
+    /// Leaves the reactive line, if in it, and wakes the waiters so the new
+    /// front asks at once. Every exit calls this (normal or by unwinding), so
+    /// a stranded front can never hold the line.
+    fn leave_line(&mut self, state: &mut GateState) {
+        let Some(ticket) = self.ticket.take() else {
+            return;
+        };
+        if let Some(at) = state.reactive_line.iter().position(|t| *t == ticket) {
+            state.reactive_line.remove(at);
+        }
+        self.gate.released.notify_all();
+    }
+
     fn give_back(&mut self, state: &mut GateState) {
+        self.leave_line(state);
         if !std::mem::take(&mut self.held) {
             return;
         }
@@ -4178,7 +4229,7 @@ impl WaitReservation<'_> {
 
 impl Drop for WaitReservation<'_> {
     fn drop(&mut self) {
-        if !self.held {
+        if !self.held && self.ticket.is_none() {
             return;
         }
         let mut state = self

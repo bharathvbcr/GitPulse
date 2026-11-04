@@ -396,6 +396,18 @@ fn drained_gate(rate: u32, burst: u32) -> (tempfile::TempDir, &'static SpawnGate
 
 /// ATTACK 2. Four waiters re-entering `acquire` against a drained record that
 /// refills at 8/s. Prints the grant distribution; every waiter must get some.
+///
+/// What the bound rests on: reactive waiters take the next token in arrival
+/// order (`GateState::reactive_line`), so four threads that each re-enter the
+/// moment they are served rotate through the line and split the record's
+/// grants almost evenly (measured 19 or 20 each of 79, 24 quiet-host runs). The
+/// gate used to have no order: the waiters raced for each token as it landed,
+/// a lottery whose split is a multinomial draw (the same 24 runs gave min 8,
+/// max 29, worst ratio 3.4; a loaded run gave 8/18/19/34), and a read that had
+/// waited a full deadline lost to one that arrived a moment ago. The 4x
+/// bound is therefore slack for a scheduler that stalls one thread, not the
+/// split the design aims at; `reactive_waiters_are_served_in_arrival_order`
+/// asserts the order itself.
 #[test]
 fn four_waiters_each_get_tokens_under_the_nap_schedule() {
     let (_dir, gate) = drained_gate(8, 4);
@@ -434,6 +446,108 @@ fn four_waiters_each_get_tokens_under_the_nap_schedule() {
         total >= 40,
         "the record's 8/s refill was underused: {total}"
     );
+}
+
+/// ATTACK 2d. A read that has waited must not lose a token to one that arrived
+/// after it. The record is drained and lands a token every 125 ms. Reader 0
+/// arrives at 60 ms and is denied (it asks again at about 185 ms); the first
+/// token lands at about 125 ms; readers 1 and 2 arrive at 155 ms and 165 ms, so
+/// without an order the first of them to ask takes the token that landed
+/// before either was there, and reader 0 is served after them.
+#[test]
+fn reactive_waiters_are_served_in_arrival_order() {
+    let (_dir, gate) = drained_gate(8, 4);
+    let began = Instant::now();
+    let served = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        let mut waiters = Vec::new();
+        for (id, arrives_ms) in [(0_usize, 60_u64), (1, 155), (2, 165)] {
+            let served = &served;
+            waiters.push(scope.spawn(move || {
+                let arrives = began + Duration::from_millis(arrives_ms);
+                std::thread::sleep(arrives.saturating_duration_since(Instant::now()));
+                let deadline = Instant::now() + Duration::from_millis(3_000);
+                let got = with_admission(Admission::Reactive, || {
+                    gate.acquire_judged(deadline, &|| false)
+                });
+                assert!(got.is_ok(), "reader {id} was refused");
+                // The grants are a refill interval apart, far more than the
+                // time between a grant and this push.
+                served.lock().unwrap().push(id);
+            }));
+        }
+        for waiter in waiters {
+            waiter.join().unwrap();
+        }
+    });
+    assert_eq!(*served.lock().unwrap(), vec![0, 1, 2]);
+    assert!(
+        gate.state.lock().unwrap().reactive_line.is_empty(),
+        "the line outlived its waiters"
+    );
+}
+
+/// What the line must never do is hold: the oldest waiter leaving by
+/// cancellation, by its deadline or by unwinding has to hand the front to the
+/// next, which still gets its token inside its own deadline.
+#[test]
+fn a_front_waiter_that_leaves_does_not_strand_those_behind() {
+    enum Exit {
+        Cancel,
+        Deadline,
+        Panic,
+    }
+    for exit in [Exit::Cancel, Exit::Deadline, Exit::Panic] {
+        let (_dir, gate) = drained_gate(8, 4);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let (front, behind) = std::thread::scope(|scope| {
+            let front = scope.spawn(|| {
+                let far = Instant::now() + Duration::from_secs(5);
+                let short = Instant::now() + Duration::from_millis(100);
+                match exit {
+                    Exit::Cancel => with_admission(Admission::Reactive, || {
+                        gate.acquire_judged(far, &|| {
+                            cancel.load(std::sync::atomic::Ordering::SeqCst)
+                        })
+                    })
+                    .is_err(),
+                    Exit::Deadline => with_admission(Admission::Reactive, || {
+                        gate.acquire_judged(short, &|| false)
+                    })
+                    .is_err(),
+                    Exit::Panic => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _ = with_admission(Admission::Reactive, || {
+                            gate.acquire_judged(far, &|| {
+                                assert!(
+                                    !cancel.load(std::sync::atomic::Ordering::SeqCst),
+                                    "cancel check blew up"
+                                );
+                                false
+                            })
+                        });
+                    }))
+                    .is_err(),
+                }
+            });
+            std::thread::sleep(Duration::from_millis(30));
+            let behind = scope.spawn(|| {
+                let deadline = Instant::now() + Duration::from_millis(2_000);
+                with_admission(Admission::Reactive, || {
+                    gate.acquire_judged(deadline, &|| false)
+                })
+                .is_ok()
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            (front.join().unwrap(), behind.join().unwrap())
+        });
+        assert!(front, "the front waiter should have left without a permit");
+        assert!(behind, "the waiter behind a departed front was stranded");
+        assert!(
+            gate.state.lock().unwrap().reactive_line.is_empty(),
+            "the line outlived its waiters"
+        );
+    }
 }
 
 /// ATTACK 2b. One impatient hog re-enters instantly against three patient
