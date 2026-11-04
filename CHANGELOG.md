@@ -671,6 +671,15 @@ and `gitpulse-mcp` and `gitpulse-hook` need reinstalling.
 - **The menu-bar status popover keeps its width and place on a second display
   of another scale.** With the menu bar on a 1x display beside a 2x one, it
   opened at half width and half its offset from the icon (`677cb324`).
+- **Git reads waiting for the shared spawn budget are served in arrival
+  order.** Waiters used to race for each token as it landed, so a read that
+  had waited its whole deadline could lose it to one that had just arrived and
+  be refused while later reads ran. Four waiters went from splits as uneven as
+  8 to 34 grants to 19–20 each (`55675d14`).
+- **Opening a terminal menu keeps focus in it.** Unrelated changes (any
+  repository-store update, another tab's first line of output, a tab
+  mounting) re-ran the panel's reveal and moved focus back to the bypass
+  prompt or the grid while the session-type menu was open (`674e29b0`).
 - **A failed read is no longer shown as an empty result:** branch backups
   (`689f48df`), the health rescan, which keeps its last report and says so
   (`e39953d3`), the file tree while it re-lists (`73add72d`), a history commit
