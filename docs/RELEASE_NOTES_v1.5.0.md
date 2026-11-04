@@ -1,8 +1,18 @@
 # GitPulse 1.5.0
 
-GitPulse 1.5.0 is a large release: agents that run in the background with a pane of everyone at work, a much richer task board, pull-request review, repository-wide search, a ledger that now records Codex as well as Claude, and a lot of work on terminal reliability, idle cost and the trust boundary around hooks and notifications. It covers everything since v1.3.1, the last published release, because v1.3.5 and v1.4.0 were never published and their changes are included here. To upgrade, install the 1.5.0 build, then read Breaking changes below: the task profile is migrated one way, and `gitpulse-mcp` and `gitpulse-hook` need reinstalling.
+GitPulse 1.5.0 is a large release: agents that run in the background with a pane of everyone at work, a much richer task board, pull-request review, repository-wide search, a ledger that now records Codex as well as Claude, and a lot of work on terminal reliability, idle cost and the trust boundary around hooks and notifications. It covers everything since v1.3.1, the last published release, because v1.3.5 and v1.4.0 were never published and their changes are included here. To upgrade, install the 1.5.0 build, then read Breaking changes below: the task profile (workbench schema 15) and the DevMap store (schema 29) are migrated one way, the terminal host protocol is now 3, and `gitpulse-mcp` and `gitpulse-hook` need reinstalling.
 
 ## Highlights
+
+- **Zero-copy agentic worktrees.** Eleven `gitpulse_worktree_*` MCP tools (create, switch, isolate, prune, merge, claim, release, send_message, overlay_sync, inbox, radar) give parallel agents their own checkouts and a way to coordinate them, each write gated by repository trust and the command guard. Every tool reports what it did, and prune reaps processes only when asked. (`7b200385`, `4891c590`)
+- **Review and land what an attempt committed.** The agent panel shows an attempt's commits and lands the one that was approved; the guarded merge-teardown path offers a squash. (`f732908e`, `9b826ab1`)
+- **A per-run activity timeline and a thread tree.** Each run shows its session's lifecycle over time, and the Agents plane nests terminals and child sessions under their parent, counting a child whose parent it cannot find as unplaced rather than dropping it. (`e3e22104`, `ba589278`, `1e2148a3`, `618fb52b`, `e40658f0`, `eb287599`, `15b1bffe`)
+- **Saved terminal transcripts.** The terminal host keeps each session's output on disk and GitPulse can read it back. (`55d90664`, `c8fad9ee`, `1185a933`)
+- **CI watching on agent branches, and Send to agent.** GitPulse watches CI on the branches agents push and carries the result to the task and the inbox; a CI notice or run card can send the result back into the agent that pushed, showing the exact text and route and sending only on confirm. (`8970106d`, `8751a9aa`, `3beeb66d`, `58ddafce`)
+- **Managed runs can outlive a quit.** The Manvi sidecar is hosted outside the app, and quitting asks whether to leave or stop the managed runs it keeps. (`635e9249`, `d72fda27`, `1d64fe2f`)
+- **Board: subtasks, filters and Load all.** A card shows its parent and subtask progress, the Filters bar filters by due-date range and status, a column can load beyond its first 30 cards (up to 2,000) and keeps them across refreshes, and the hidden-repository note names the repository. (`a5b35d79`, `c10611e7`, `84fa7f2b`, `e01aa9a4`, `78a3b3a4`)
+- **Collapsible inactive repository groups** in the tab bar, with settings and Command Palette actions. (`a244084f`)
+- **Code map build progress.** Building or refreshing the map index shows it is running, and success notes fade. (`ca75963b`)
 
 - **Agents start in the background.** Launching an agent from a task no longer closes the task sheet. The task's Agents pane lists every attempt working on it, and board cards show how many agents work on them and how many need you. (`576e005c`, `389a3498`)
 - **Several agents at once, each in its own worktree.** You choose how many agents run at once (Settings, Agents, default 8) and how many terminal sessions may be open (default 32, up to 128). An agent can mark its own task done when the work is finished. (`a16e9171`, `5e547be5`, `421b4404`, `acd6116c`)
@@ -29,6 +39,20 @@ GitPulse 1.5.0 is a large release: agents that run in the background with a pane
 
 ## Fixes
 
+- **The cleaner reclaims again.** Its refusal is scoped to the repositories it could not read, each artifact tree is budgeted on its own, and the panel no longer vetoes what the host allows. (`2540db65`, `5e5a380e`, `bb632ca1`)
+- **Pulse velocity and line totals are right.** 30-day velocity no longer reads +100% when the prior period has no data, and Line Changes totals sum the 26 weeks they are labelled with. (`63d8b7c2`, `cb905dc2`)
+- **Diff:** hunk and line staging are off while Ignore whitespace is on, and Copy patch says when it copies only part of a cut diff. (`50f9438f`, `ce52d92f`)
+- **Remote panel:** Refresh shows it is running and a failed one keeps the last good data, and a merge or create confirmation survives the reload after it. (`3c800f80`, `3c00a678`)
+- **The menu-bar status popover keeps its width and place on a second display of another scale.** With the menu bar on a 1x display beside a 2x one, it opened at half width and half its offset from the icon. (`677cb324`)
+- **A failed read is no longer shown as an empty result** in branch backups, the health rescan, the file tree, history, Settings' first load, the code map's broken-links check, the repository section headers and a task's attempts. (`689f48df`, `e39953d3`, `73add72d`, `9c460099`, `ac1facf2`, `1af13742`, `70ee1bdc`, `8d9021d2`, `a132d63f`)
+- **Accessibility:** Settings and Shortcuts handle Escape and IME Escape correctly, the bypass prompt takes and keeps focus, terminal status and AI errors are announced, the commit message box is named, toast buttons are reachable, and the code map's view tabs are a real tablist. (`76b52302`, `546cd67a`, `82c4e49e`, `6c268d55`, `47e2c286`, `93e9083c`)
+- **Run in waves is bounded by the Suggest next priority ceiling.** (`c83a7fb0`)
+- **Terminal:** navigation keys, including application-cursor arrows, no longer count as answering an agent's question, and session failures show in Shell mode too. (`ea287775`, `c1f28c45`, `6dd3ca7a`)
+- **Settings:** launch-at-login and host-load toggles say when they are loading or were refused, and Run setup opens the wizard above Settings. (`536d7750`, `3704204c`, `a55efdbd`)
+- **DevMap live refresh no longer waits on a hung status probe,** and untracked line counting is bounded (2,000 files and 128 MiB per refresh, 64 MiB per file). (`9514886d`, `b7c2e2e8`)
+- **The Tasks board draws every loaded card again,** so Home/End, a moved card's focus and Load all's counts are right in a long column. (`8a611e6e`)
+- **Each repository's view panels are rebuilt on a switch again,** so one repository's scroll offsets, drafts and requests cannot leak into the next. (`10510561`)
+- **The code map's Docs search labels stale hits with the query they answer and says when a vault refresh failed.** (`b606533e`, `323ac038`)
 - **A slow host no longer kills terminal input.** Input waits for the real answer, shows one "responding slowly" notice, and stops only when the session is gone or nothing answers for 60 seconds. (`2e313355`)
 - **Typing and resizing no longer queue behind git.** Terminal commands run on their own bounded executor instead of the pool git shares. (`e2c11933`)
 - **Terminal output travels on a per-session channel** of raw bytes, up to 64 KiB a message, instead of a global event sent to every webview. (`3b1cf774`)
@@ -73,6 +97,14 @@ GitPulse 1.5.0 is a large release: agents that run in the background with a pane
 
 ## Hardening
 
+- **Release bundles are opened before a draft is called verified.** The macOS archive, Debian package and Windows MSI and NSIS installers are opened and checked for every shipped binary; the `.dmg`, `.rpm` and AppImage are not. (`f29d5043`, `c48ed964`, `4260328e`)
+- **7-Zip never sees the release job's GitHub token** while it parses installer bytes. (`ef302a4e`)
+- **zstd 0.14.3 for the DevMap store,** with the fixes for RUSTSEC-2026-0391, -0395 to -0406 and -0410; **pulldown-cmark 0.13.5** for RUSTSEC-2026-0414. (`c9c8ead0`, `4a344600`)
+- **The signal guard models the Linux kill tools on Linux.** (`d9954240`, `1ba087a0`)
+- **Workflow lint forbids piping a download into a shell,** and actionlint is checked against a pinned SHA-256. (`f29d5043`)
+- **Every Rust lint and coverage step in CI passes `--locked`.** (`fd07e56c`)
+- **macOS background-class children enter the background band before `exec`,** and a spawn that cannot enter it fails rather than running at normal priority. (`2ae27514`)
+- **Linux and Windows pass `clippy --all-targets -D warnings`,** and local macOS builds are signed with a team identity. (`b825758e`, `cb9ce6f4`, `c8e05736`, `2937829e`, `77f2ddea`)
 - **The app enforces an ACL on its own commands.** The main window gets only the commands the frontend calls, the status popover only its three, and webviews cannot navigate off the app origin. (`08607bfd`)
 - **Trust and tool changes ask in a native dialog the page cannot answer.** Trusting a repository, and repointing devmap or manvi at a new binary or source root, need a native confirmation. Open-in-default-app requires a trusted repository and confirms executables. (`87d03fc8`)
 - **Remote images in repository Markdown stay withheld until you click them,** and load over https only. (`08607bfd`, `a047354d`)
@@ -104,11 +136,14 @@ GitPulse 1.5.0 is a large release: agents that run in the background with a pane
 
 ## Breaking changes
 
-- **The task profile is migrated one way, to dc-store store schema 11 and workbench schema 14.** A host built against an older schema refuses a migrated profile. Rebuild GitPulse, Manvi and DevCouncil from the same dc-store before any of them opens the profile. (`3a7de123`, `c6b92930`, `6c0e1faa`, `0fdab295`, `ad799955`)
+- **The task profile is migrated one way, to dc-store store schema 11 and workbench schema 15.** A host built against an older schema refuses a migrated profile with `schema_unsupported`; the app keeps `<profile>.pre-schema-14.bak` beside it. Rebuild GitPulse, Manvi and DevCouncil from the same dc-store before any of them opens the profile. (`3a7de123`, `c6b92930`, `6c0e1faa`, `0fdab295`, `ad799955`, `4ddc3fd0`, `54a29019`, `5bba42a2`)
+- **The DevMap store is migrated one way, to schema 29** (from 27, zstd-compressed, reader floor 29). A `devmap` CLI or `gitpulse-mcp` built before this release cannot read an index this build writes; rebuild and reinstall the `devmap` CLI too. (`7ae2fa6a`, `2a919f00`, `d889efd1`)
+- **The terminal host speaks protocol 3.** Terminals still held by a `gitpulse-ptyd` from an earlier build cannot be adopted; finish or close them before updating. (`55d90664`)
+- **`devmap_*` tools on `gitpulse-mcp` default to depth 3, not 10,** matching the standalone `devmap mcp` server. Pass `depth` to keep the old reach. (`8f276a4a`)
 - **The minimum supported Git is now 2.36, up from 2.23.** Worktree listing uses `git worktree list -z` with no fallback; the version check names every feature an older Git lacks. Force push now sends `--force-with-lease --force-if-includes` so a background fetch cannot defeat the lease. (`fec0b896`, `258cc575`, `28ee55a2`)
 - **The ledger schema bumps to writer generation 2 (OD 1).** Additive columns and tables for occurred time, reflog ordinals, and deduplication indexes. Older generation 1 binaries (`gitpulsed`, `gitpulse-mcp`) refuse to write a migrated ledger and must be rebuilt and reinstalled together. (`f053e297`)
 - **Dead `cmd_stash_pop` IPC command removed.** `GitWriter::stash_pop` and `cmd_stash_pop` are removed in favor of `cmd_stash_action` with target OID. Registry stands at 291 handlers. (`6869235a`, `72dea9cc`)
-- **Reinstall `gitpulse-mcp` and `gitpulse-hook`** (`bun run mcp:install`). An older binary carries an older `devmap-store` and cannot read a store a current `devmap` has built. `bun run check:schema-parity` asks every installed reader which schemas it reads, including the devmap extraction schema (97). (`710aa9e0`, `650a587a`, `2cf45493`, `205a72ef`)
+- **Reinstall `gitpulse-mcp` and `gitpulse-hook`** (`bun run mcp:install`). An older binary carries an older `devmap-store` and cannot read a store a current `devmap` has built. `bun run check:schema-parity` asks every installed reader which schemas it reads, including the devmap extraction schema (98). The hook also gains the `deliver` subcommand Send to agent uses. (`710aa9e0`, `650a587a`, `2cf45493`, `205a72ef`, `58ddafce`)
 - **Child processes drop relative `PATH` entries** (`.`, `bin`, `./node_modules/.bin`). A setup that relied on one must use an absolute path. The Manvi sidecar starts from an allowlisted environment, so provider keys and tokens set in the launching shell no longer reach it. (`87d03fc8`)
 - **An agent can no longer mark a task done on its own word.** `gitpulse_complete_task(done)` leaves the task in review unless Manvi recorded a passed verification for the worktree's current head. A person moving a card is unaffected. (`50eedd43`)
 - **`gitpulse_add_task` refuses a new task that looks like open work.** An agent must fold into a listed card, or call again naming every listed `item_id` in `reviewed_related`. (`607ad2da`)
@@ -127,5 +162,6 @@ GitPulse 1.5.0 is a large release: agents that run in the background with a pane
 - **Collision risk cannot see running Codex sessions where there is no process scan.** On Windows a kind with no detector is reported as unknown rather than zero; macOS and Linux count Codex by process. Codex history reaches the ledger only afterwards, from its rollout files. (`f27fc1ae`, `83c1ea6c`)
 - **Ledger limits.** A ledger on a platform with no inode stays on the roots-only rule, and a new checkout that reuses a deleted checkout's inode at the same path is indistinguishable from the original. An identical reflog entry whose older twin lies outside the 200-entry read takes the twin's ordinal, and transcript rows written before deterministic ids can be recorded once more after a reset. (`2e904ff4`, `79bccca6`, `7a1fac03`)
 - **The macOS build is ad-hoc signed and not notarized, and Windows builds are unsigned.** Gatekeeper and SmartScreen warn on first launch. (`src-tauri/tauri.conf.json` `signingIdentity: "-"`; no signing secrets in `release.yml`.)
-- **An installed 1.3.1 may announce 1.5.0 before its installers exist.** Builds older than the published-release check announce the newest tag as soon as it is pushed, so for the minutes before the draft is published that link leads nowhere. 1.5.0 itself waits for the published checksum file. (`cf0fe90f`)
+- **An installed 1.3.1 may announce 1.5.0 before its installers exist.** Every build before 1.4.0, which is every release published so far, announces the newest tag as soon as it is pushed, so for the minutes before the draft is published that link leads nowhere. 1.5.0 itself waits for the published checksum file. (`cf0fe90f`)
+- **The `.dmg`, `.rpm` and AppImage are not opened by the release check.** Their checksums are verified, but unlike the other installers their contents are not inspected before the draft is called verified. (`f29d5043`)
 - **v1.4.0 and v1.3.5 were never published.** Their changes are included in this release. v1.3.5 was withdrawn, and 1.4.0 remains the previous changelog section. People upgrading from v1.3.1 receive everything since v1.3.1. (`00ec2567`)

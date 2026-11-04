@@ -11,206 +11,146 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-### Added
-
-- **Send to agent.** A CI notice that names an agent attempt, and the attempt's
-  run card, can put the result (or a note) back into the agent that pushed the
-  branch. The panel shows the exact text and the route (live Claude session
-  mailbox, resumed conversation with the text as its first prompt, managed
-  follow-up through Manvi, or unavailable with the reason), and sends only on an
-  explicit confirm. A live session is woken by a second `Stop` hook entry,
-  `gitpulse-hook deliver`, registered with `asyncRewake`; a Manvi without
-  `work.runs.managed.continue` is reported as unable to take follow-ups. The
-  installed `gitpulse-hook` must be rebuilt for the new subcommand
-  (`bun run mcp:install`). See `docs/SECURITY.md`.
-- **5-Lane Workflow Separation & Non-Blocking DevMap IPC.** Separated repository
-  and background operations into five isolated execution lanes (`git-read`,
-  `git-write`, `github`, `insights`, `devmap`) (`src/lib/async/lanes.ts`,
-  `src/lib/stores/repo.ts`), ensuring slow background DevMap builds or insights
-  probes never block git reads, commit composition, or UI navigation. DevMap IPC
-  invocations (`src-tauri/src/commands/devmap.rs`) apply a 4-second non-blocking
-  timeout (`try_lock_timeout`) when another build holds the writer lock, returning
-  a structured busy/fallback response instead of stalling Tauri worker threads.
-- **Untracked File Scan Budget & Metadata Cache (`UntrackedBudget`).** Bounded
-  untracked file line-counting (`src-tauri/src/engine/git.rs`) to a 4 MiB total
-  byte budget and 512-file ceiling, opening files with `O_NONBLOCK | O_NOFOLLOW`
-  on Unix to refuse FIFOs and symlinks without blocking, and caching line counts
-  by `(path, mtime, size)` across refreshes.
-- **View DOM Retention & Virtualized Lists.** `ViewSectionPanel.svelte` retains
-  visited view subtrees in the DOM (up to 6 cached panels) and hides inactive
-  sections with `hidden` / `inert` instead of destroying and remounting them on
-  tab switches. Added reusable `VirtualList.svelte` virtualization for large list
-  surfaces.
-- **Full 11-Tool `devmap_*` MCP Parity.** `gitpulse-mcp` now exposes all 11
-  `devmap_*` tools (`status`, `search`, `dependencies`, `impact`, `trace`,
-  `neighbors`, `dead_symbols`, `clones`, `preview`, `explore`, `affected_tests`)
-  with unified schema and envelope parity (`src-tauri/src/mcp/mod.rs`).
-- **UI/UX Enhancements Across 8 Views:**
-  - **Changes (`ChangesView.svelte`, `DiffSection.svelte`, `ConflictView.svelte`):**
-    Side-by-side split diff, blamed hunk headers, and 3-way conflict resolution
-    with current/incoming/both actions and marker navigation.
-  - **Branches (`BranchesView.svelte`, `CompareDrawer.svelte`):** Interactive
-    rebase lane, divergence badges, and branch Compare drawer.
-  - **History (`CommitGraph.svelte`, `HistoryView.svelte`):** Structured filter
-    chips (`author:`, `sha:`, `type:`, `path:`) and commit lane inspection.
-  - **Repo Health (`RepoHealth.svelte`, `PulseView.svelte`):** Bus-factor
-    concentration, local DORA metrics, and commit hygiene cards.
-  - **Terminal (`TerminalDock.svelte`):** Multi-session tabs, split panes, and
-    command history search.
-  - **Settings (`SettingsModal.svelte`):** Live theme token editor and shortcut
-    customization.
-  - **Blame (`BlameView.svelte`):** Interactive code-age timeline, filterable
-    legend bands, and proportional age rail.
-- **Collapsible Inactive Repository Groups & Group Tabs.** In the repository tab bar,
-  inactive repository groups can now be collapsed to declutter multi-repository
-  workspaces (`RepoTabBar.svelte`, `tabGroups.ts`, `groupState.ts`). Inactive tabs
-  within groups can also be collapsed, with an option to keep tabs with active shells
-  visible. Added settings under Settings → Layout (`collapseInactiveGroupTabs`,
-  and `collapseInactiveIncludeShells`, on by default; turn it off to keep shell tabs
-  visible), a strip menu action to collapse inactive groups, and Command Palette
-  actions: *Collapse Inactive Repository Groups*, *Expand All Repository Groups*,
-  *Collapse Inactive Tabs in Groups*, and *Toggle Collapsing Active Shells in Inactive Tabs*.
-- **Tasks Board: "Load all" in a task column.** Users can now click "Load all" in any
-  column on the Tasks board to page beyond the initial 30 tasks (`TaskBoard.svelte`,
-  `boardPaging.ts`, `taskSearchPlan.ts`). Cards are read in 200-card pages up to
-  `MAX_CANDIDATES` (2,000 cards) or until stopped. The loaded column depth is retained
-  across board refreshes (`reloadSize` pages 200 cards when 20 default pages would fall
-  short), and board verdict queries are automatically chunked in batches of 256 IDs
-  (`getBoardVerdicts`) so large boards never trigger host refusals or cleared verdicts.
-- **Tasks Board: Named Hidden Repository Notification.** When tasks belonging to
-  hidden repositories are omitted from the board, the notification banner now
-  explicitly names the hidden repository (`taskHiddenRepositories.ts`) rather than
-  showing an ambiguous count.
-- **Configurable Terminal Bell attention trigger.** Added "Count a terminal bell as
-  waiting for you" in Settings → Agents (default on, `asksForReader`), allowing terminal
-  bell events from Codex, Cursor, and shells to register as reader prompts or be toggled off.
-- **Durable Hook Notify Drop Record (`.drops`).** When a hook notification reply misses its
-  budget (300 ms for `SessionEnd`, 1.5 s for other events), the hook appends a durable drop
-  record (`{"v":1,"at":<unix_ms>,"event":...,"session":...}`) to `<socket>.drops` beside
-  the resolved socket (`ft-6d8ff969`, `ft-878db72b`, `ft-f70ee2bb`). Drop records use
-  single-owner rotation to `.prev` when exceeding 32 KiB (hook halts appends at 64 KiB)
-  and are tightened to `0600` best-effort through the file handle. Settings displays
-  "N hook reports in the last 7 days got no reply from GitPulse in time" (using `.prev`'s
-  `ctime` as the 7-day expiration clock) separately from refused reports, and explicitly
-  not as "lost" since the app may have applied reports the hook stopped waiting for.
-- **Release Bundle Binary Verification.** Added automated installer inspection in
-  `release.yml verify` and `scripts/check-release-assets.mjs` (`ft-ac3bba92`). Downloads
-  bundled installers by asset ID and opens archives across platforms (fat arm64 + x86_64
-  Mach-O in macOS archives, ELF in Debian packages, and PE binaries extracted via 7z in
-  Windows MSIs and NSIS installers) to assert that every `[[bin]]` defined in
-  `src-tauri/Cargo.toml` is present and structurally valid.
-- **Terminal WebGL Context Hold & Loss Recovery.** When a terminal session is hidden,
-  its WebGL context is retained briefly (up to 2 contexts for 5 seconds) rather than
-  instantly torn down (`gpuRenderer.ts`, `term/smooth`), eliminating re-initialization
-  lag and visual flicker when switching between active tabs. WebGL context loss is
-  managed under a recovery budget (up to 3 recoveries), with lost hidden contexts
-  ending the hold cleanly without penalizing the session's active recovery budget (`f1839034`).
-- **DEC 2026 Synchronized Frame Output.** Writes to xterm are monitored to ensure every
-  output chunk ends outside an open DEC 2026 synchronized output block (`\x1b[?2026l`)
-  (`syncFrames.ts`, `eraseGuard.ts`). If a stream or tool ends mid-block, GitPulse closes
-  the frame cleanly so synchronized frames render at native display rates without
-  freezing or stalling the emulator buffer (resolving xterm.js #6071).
-- **Unicode 11 Character Widths in Terminal.** Added `@xterm/addon-unicode11` support
-  (`unicodeWidth.ts`), rendering emojis and wide characters across 2 terminal cells
-  accurately without corrupting adjacent text alignment (`9b908b6c`).
-- **Terminal Footer GPU Status & Atlas Refresh.** Added a status note in the terminal
-  footer when rendering without GPU acceleration, and automatically refreshes the
-  WebGL texture atlas (`clearAtlas()`) on device pixel ratio (DPR) changes to prevent
-  glyph corruption (`1ba2858f`, `e9a7c12d`).
-
-### Changed
-
-- **The task profile moves one way to workbench schema 15** (dc-store vendored
-  from DevCouncil `012c7f8a`; store schema stays 11). CI results are stored as
-  `run_ci_passed` / `run_ci_failed` / `run_ci_cancelled` attention rows, which a
-  schema 14 host cannot read, so a schema 14 build refuses an upgraded profile with
-  `schema_unsupported`. The desktop app performs the upgrade and keeps
-  `<profile>.pre-schema-14.bak` beside it. Update GitPulse (app, `gitpulse-mcp`,
-  `gitpulse-hook` via `bun run mcp:install`), `dcstore` and Manvi together, then
-  confirm with `bun run check:schema-parity`.
-- **Typed Command Errors across IPC.** Rust command runners now carry errors as strongly
-  typed `CommandError` instances directly to the command edge (`2bac9304`), replacing
-  the thread-local error store (`take_last_error`) with typed, structured errors across
-  the Tauri IPC boundary.
-- **Terminal Host `Host::knows` client-side snapshot resolution.** `Host::knows` answers
-  directly from the client's vouched snapshot, eliminating IPC round-trips to `gitpulse-ptyd`
-  for session existence checks (`ft-67f95e2d`). Authority survives spawns, quits, and
-  wrapped exit records mid-adoption, while newly opened connections revoke previous authority.
-- **Terminal Host Adoption & Exit Reporting lifecycle.** `record_exit` is executed strictly
-  once per session (`ft-c113d00b`); `adopt` skips reported exits and reads `vouched.late`
-  after proxy scans. A second exit report during recording leaves proxy and host state intact,
-  preventing race conditions during session adoption.
-- **Terminal Input Write Timeout is a stall bound.** Changed the terminal input write
-  timeout from a cumulative total to an idle stall bound (`cc0cfb90`), preventing large
-  write streams from failing prematurely.
-- **Terminal Expanded Dock UX Isolation.** Expanding the terminal dock now hides and sets
-  `inert` on the underlying workspace view (`TerminalDock.svelte`, `077de305`), preventing
-  focus leaks and background mouse/keyboard interactions while in full terminal mode.
-- **Terminal Tab Title Sanitization.** `cleanTabName` routes through `sessionActivity.clean()`
-  to reliably drop split surrogate pairs, unprintable controls, and ANSI artifacts.
-- **Advisory Table Column Pinning.** Pinned the short columns of advisory tables in
-  `HealthTable.svelte` / `HealthPanel.svelte` (`e60712a0`) for consistent layout and alignment.
-- **Lappi Settings Copy Transparency.** Updated copy in `LappiSettings.svelte` to clearly
-  state that diffs are transmitted, using transparent "nowhere else" phrasing instead of
-  "not an AI provider".
-- **macOS Background Band Pre-Exec Hook.** Background-class child processes enter Darwin's
-  background scheduling band (`PRIO_DARWIN_PROCESS`) in the child process *before* `exec`
-  via a `pre_exec` hook (`procguard::spawn_background`, `ft-b597add5`, `2ae27514`). This
-  prevents race conditions with fast-execing binaries (`sh -c`, `git` wrappers) where
-  post-spawn parent demotion landed after task re-creation. Spawns fail explicitly if the
-  background band cannot be entered (such as under sandbox restrictions) rather than
-  silently running at normal priority.
-- **Batched Workbench Verification Sweep.** Optimized background verification polling
-  (`c7e97f6d`) to read all claimed card verification states in a single batch pass
-  (`latest_many`) rather than performing individual unindexed scans of `evidence_list` per
-  card on every 3-second cycle. Single-card `latest` queries now select `LIMIT 1` directly
-  for `work.verify.task` instead of parsing up to 10,001 rows of history, and parked card notes
-  reuse existing decision records, cutting idle CPU duty cycle from ~80% down to ~27%.
-- **Hidden Terminal Geometry Protection.** Terminals are never fitted (`fit()`) while hidden
-  or zero-dimensioned (`fitSchedule.ts`). Visible panes refit upon presentation, coalescing
-  resize events with shared device pixel ratio changes (`devicePixelRatio.ts`) to eliminate
-  resize storms.
-- **xterm 6.1 Beta Upgrade.** Pinned `@xterm/xterm` (6.1.0-beta.195) and `@xterm/addon-webgl`
-  (0.20.0-beta.57) to resolve WebGL texture atlas corruption at DPR 2 (xterm.js #5847).
-- **DevCouncil Re-Vendor (782b9f16).** Updated vendored DevCouncil crates (`devmap-extract`
-  97 -> 98, store 27, dc-store 11, workbench 14) with Kotlin loss/semi analysis, Swift
-  scoping, and document drift checks.
-- **Claude Code Attribution Suppression.** Configured `.claude/settings.json` with
-  `"attribution": {"commit": false, "pullRequest": false}` to prevent automated attribution
-  trailers in cloud and single-repo sessions.
-
-### Security
-
-- **Linux Signal Guard on Linux.** The signal guard now models Linux process inspection
-  tools (`procps pkill`/`pgrep`, `psmisc killall`, `sysvinit pidof`) on Linux (`ft-06723bb7`,
-  `d9954240`, `1ba087a0`). Matches process names against `comm` or `argv[0]` basename (union
-  with macOS reading), reads UIDs directly from `/proc/<pid>/status` with real `kill(2)`
-  permission enforcement, correctly counts ancestors in `procps pkill`, and escalates
-  unmodelled `psmisc killall` options to explicit user confirmation prompts.
-- **Hook Drop Record Permissions.** Owned `.drops` records are tightened to `0600` best-effort
-  through the file handle; the reader leaves `.prev` untouched to preserve its `ctime`
-  rotation clock for 7-day lower-bound expiration.
-- **CI Workflow Security & Actionlint Checksumming.** Enforced the `no-pipe-to-shell` rule in
-  `check-workflows.mjs`, forbidding piping downloads directly into a shell. Actionlint
-  installation in `ci.yml` is pinned to a verifiable SHA-256 release tarball checksum.
-- **Pulldown-cmark Wikilink Denial of Service Mitigation (`RUSTSEC-2026-0414`).** Upgraded
-  `pulldown-cmark` to 0.13.5 (`4a344600`). Under `ENABLE_WIKILINKS`, malformed wikilinks
-  (`[[a|]]`) previously caused exponential parser event blow-ups that could exhaust memory
-  under `MAX_RENDER_BYTES`. Locked `cssparser-macros` to `syn` 3.0.5.
-
-
-
-## [1.5.0] - 2026-10-25
+## [1.5.0] - 2026-11-03
 
 1.5.0 is the first release published since 1.3.1. 1.3.5 was withdrawn and
 1.4.0 was never published, so upgrading from 1.3.1 also brings everything in
-the 1.4.0 section of `CHANGELOG.md`. Read its **Upgrade** steps first: the task
-profile is migrated one way (to dc-store store schema 11 and workbench
-schema 14), and `gitpulse-mcp` and `gitpulse-hook` need
-reinstalling.
+the 1.4.0 section of `CHANGELOG.md`. Read both **Upgrade** sections first: the
+task profile moves one way (dc-store store schema 11, workbench schema 15), the
+DevMap store moves one way to schema 29, the terminal host protocol is now 3,
+and `gitpulse-mcp` and `gitpulse-hook` need reinstalling.
+
+### Upgrade
+
+- **The task profile moves one way to workbench schema 15** (dc-store vendored
+  from DevCouncil `012c7f8a`; store schema stays 11; `4ddc3fd0`, `54a29019`,
+  `5bba42a2`). CI results are stored as `run_ci_passed` / `run_ci_failed` /
+  `run_ci_cancelled` attention rows, which a schema 14 host cannot read, so a
+  schema 14 build refuses an upgraded profile with `schema_unsupported`. The
+  desktop app performs the upgrade and keeps `<profile>.pre-schema-14.bak`
+  beside it. Update GitPulse (app, `gitpulse-mcp`, `gitpulse-hook` via
+  `bun run mcp:install`), `dcstore` and Manvi together, then confirm with
+  `bun run check:schema-parity`.
+- **The DevMap store moves one way to schema 29** (from 27; `7ae2fa6a`,
+  `2a919f00`, `d889efd1`). Stored extraction documents are zstd-compressed and
+  the reader floor is 29, so a `devmap` CLI or `gitpulse-mcp` from before this
+  release cannot read an index this build writes. Rebuild and reinstall the
+  `devmap` CLI with the app, then confirm with `bun run check:schema-parity`.
+- **The terminal host speaks protocol 3** (from 2; `55d90664`, which adds the
+  saved-transcript request). Sessions still held by a `gitpulse-ptyd` from an
+  earlier build cannot be adopted by this one; finish or close those terminals
+  before updating.
+- **Reinstall `gitpulse-hook` and `gitpulse-mcp`** (`bun run mcp:install`): the
+  hook gains the `deliver` subcommand Send to agent uses, and both must read
+  workbench schema 15.
+- **`devmap_*` tools on `gitpulse-mcp` default to depth 3, not 10** (`8f276a4a`),
+  matching the standalone `devmap mcp` server. A caller that relied on the old
+  default passes `depth` explicitly.
 
 ### Added
 
+- **Zero-copy agentic worktrees.** Eleven `gitpulse_worktree_*` MCP tools
+  (create, switch, isolate, prune, merge, claim, release, send_message,
+  overlay_sync, inbox, radar) give parallel agents their own checkouts and a way
+  to coordinate them, each write gated by repository trust and the command
+  guard (`7b200385`). Every tool reports what it did, and prune and sparse
+  create no longer do work nobody judged or requested; prune reaps processes
+  only when asked (`4891c590`).
+- **Review and land an attempt's commit.** The agent panel shows what an
+  attempt committed and lands the commit that was approved (`f732908e`); the
+  guarded merge-teardown path offers a squash (`9b826ab1`).
+- **Per-run activity timeline.** Each run in the agent panel has a timeline of
+  its session's lifecycle (`e3e22104`), recorded as `session.state` ledger rows
+  (`ba589278`) and read per run by `cmd_ledger_tail` (`1e2148a3`).
+- **Agents plane thread tree.** Terminals and child sessions nest under their
+  parent (`618fb52b`); a child whose parent no probe lists, and everything below
+  it, is counted as unplaced rather than dropped (`e40658f0`, `eb287599`); and
+  process lineage and the subagent id are carried through to the readers
+  (`15b1bffe`).
+- **Saved terminal transcripts.** The terminal host keeps each session's output
+  on disk and answers a read-only transcript request (`55d90664`), which the
+  renderer reads back (`c8fad9ee`; `docs/TERMINAL_HOST.md`, `1185a933`).
+- **CI watching on agent branches.** GitPulse watches CI on the branches agents
+  push and carries the result to the task and the inbox (`8970106d`). The panel
+  has its own banner cursor, CI is attributed by branch only (`8751a9aa`), and a
+  run listing that turns capped says so (`3beeb66d`).
+- **Managed runs can outlive a quit.** The Manvi sidecar is hosted outside the
+  app (`635e9249`); quitting asks before it stops managed agent runs
+  (`d72fda27`) and offers leave or stop for runs a hosted Manvi keeps
+  (`1d64fe2f`).
+- **Board: subtasks and filters.** A card shows its parent and subtask progress
+  from `items.lineage` (`a5b35d79`), and the Filters bar filters by due-date
+  range and by status (`c10611e7`).
+- **Code map build progress.** Building or refreshing the map index shows it is
+  running, and success notes fade (`ca75963b`; the button now reads "Refresh
+  index").
+- **Send to agent.** A CI notice that names an agent attempt, and the attempt's
+  run card, can put the result (or a note) back into the agent that pushed the
+  branch (`58ddafce`). The panel shows the exact text and the route (live Claude
+  session mailbox, resumed conversation with the text as its first prompt,
+  managed follow-up through Manvi, or unavailable with the reason), and sends
+  only on an explicit confirm. A live session is woken by a second `Stop` hook
+  entry, `gitpulse-hook deliver`, registered with `asyncRewake`; a Manvi without
+  `work.runs.managed.continue` is reported as unable to take follow-ups. See
+  `docs/SECURITY.md`.
+- **Collapsible inactive repository groups.** In the repository tab bar,
+  inactive repository groups can be collapsed (`a244084f`; `RepoTabBar.svelte`,
+  `tabGroups.ts`, `groupState.ts`), and so can the inactive tabs within a group.
+  Settings → Layout has `collapseInactiveGroupTabs` (off by default) and
+  `collapseInactiveIncludeShells` (on by default; turn it off to keep tabs with a
+  shell visible). The strip menu can collapse inactive groups, and the Command
+  Palette has *Collapse Inactive Repository Groups*, *Expand All Repository
+  Groups*, *Collapse Inactive Tabs in Groups*, and *Toggle Collapsing Active
+  Shells in Inactive Tabs*.
+- **Tasks board: "Load all" in a column.** A column can page beyond the initial
+  30 tasks (`84fa7f2b`, `e01aa9a4`; `TaskBoard.svelte`, `boardPaging.ts`,
+  `taskSearchPlan.ts`). Cards are read in 200-card pages up to `MAX_CANDIDATES`
+  (2,000 cards) or until stopped. The loaded depth is kept across board
+  refreshes, and board verdict queries are chunked in batches of 256 IDs
+  (`getBoardVerdicts`) so a large board never triggers a host refusal or clears
+  its verdicts.
+- **Tasks board: the hidden-repository note names the repository**
+  (`78a3b3a4`; `taskHiddenRepositories.ts`) instead of giving a bare count.
+- **A setting for whether a terminal bell asks for you.** "Count a terminal bell
+  as waiting for you" in Settings → Agents (`bellAsksForReader`, on by default)
+  decides whether bells from Codex, Cursor and shells count as the agent asking
+  for the reader, on the task's Agents pane and the board's agent chips alike
+  (`19d4ae12`, `cc7ccbd4`).
+- **A durable record of hook reports that got no reply in time (`.drops`).**
+  When a hook notification reply misses its budget (300 ms for `SessionEnd`,
+  1.5 s for other events), the hook appends `{"v":1,"at":<unix_ms>,"event":...,
+  "session":...}` to `<socket>.drops` beside the resolved socket (`51df4dc1`;
+  `ft-6d8ff969`, `ft-878db72b`, `ft-f70ee2bb`). The file rotates to `.prev` past
+  32 KiB with a single owner, appends stop at 64 KiB, and an owned record is
+  tightened to `0600` best effort through the file handle; the reader leaves
+  `.prev` untouched so its `ctime` stays the 7-day expiry clock. Settings shows
+  "N hook reports in the last 7 days got no reply from GitPulse in time",
+  separately from refused reports, and not as "lost": the app may have applied
+  reports the hook stopped waiting for.
+- **Release bundles are opened before a draft is called verified.** The release
+  `verify` job downloads each installer by asset ID and opens it
+  (`scripts/check-release-assets.mjs`; `f29d5043`, `c48ed964`, `4260328e`,
+  `ft-ac3bba92`): the macOS archive's fat arm64 + x86_64 Mach-O binaries, the
+  Debian package's ELF binaries, and the PE binaries 7-Zip extracts from the
+  Windows MSI and NSIS installers, each checked for every `[[bin]]` in
+  `src-tauri/Cargo.toml`. The `.dmg`, `.rpm` and AppImage are not opened.
+- **Terminal WebGL contexts are held briefly when hidden.** A hidden terminal
+  keeps its WebGL context for up to 5 minutes, least recently used first within
+  the 8-slot cap, instead of tearing it down at once, and context loss recovery
+  is bounded to 3 losses in 10 minutes (`35db4e1c`). Losing a held hidden
+  context ends the hold and is not counted as a loss (`f1839034`).
+- **Every xterm write ends outside a DEC 2026 synchronized-output block.** A
+  chunk that ends inside an open `\x1b[?2026h` block has its unfinished tail held
+  back until the block closes or a 100 ms deadline passes, so a stream that
+  stops mid-frame cannot freeze the screen (`369a030c`; `syncFrames.ts`). This
+  is a workaround in GitPulse, not a fix in xterm.js.
+- **Unicode 11 character widths in the terminal.** `@xterm/addon-unicode11` is
+  loaded by `TerminalSession.svelte` (`9b908b6c`), so emoji and other wide
+  characters take two cells without shifting the text beside them.
+- **Terminal footer GPU note and atlas refresh.** The terminal footer says when
+  it renders without GPU acceleration, and the WebGL texture atlas is cleared on
+  a device-pixel-ratio change so glyphs are not corrupted (`1ba2858f`,
+  `e9a7c12d`).
 - **Bypass permissions mode waives the PreToolUse gates.** In a Claude Code
   session the person put in bypass permissions mode (`permission_mode:
   bypassPermissions` on the hook payload), `command-gate` and
@@ -403,6 +343,65 @@ reinstalling.
 
 ### Changed
 
+- **DevMap live refresh no longer waits on a hung status probe.** The status
+  probe is off the live-refresh IPC path: a refresh waits at most a 1 s grace
+  for it and otherwise defers with `probe_pending` (`9514886d`).
+- **Untracked line counting is bounded.** Counting the lines of untracked files
+  (`git_reader.rs`) stops at 2,000 files and 128 MiB per refresh, skips a file
+  over 64 MiB, opens files with `O_NONBLOCK`, and reuses counts through a
+  `ScanIdentity` cache bounded to 8 repositories of 20,000 files each
+  (`b7c2e2e8`).
+- **`devmap_*` tools on `gitpulse-mcp` match the standalone server.** Depth (see
+  Upgrade), `explore` carrying source, callers and callees, the path, language
+  and kind filters, and the freshness fields now answer as `devmap mcp` does
+  (`8f276a4a`, `bd8bac6f`).
+- **Typed command errors across IPC.** Runners carry an error's kind as a
+  `CommandError` to the command edge, which types the error it is handed; the
+  thread-local error record is gone (`6c153062`, `c291f4a3`).
+- **Terminal host `Host::knows` answers from the client's vouched snapshot**,
+  without a round trip to `gitpulse-ptyd` (`ft-67f95e2d`). Authority survives
+  spawns, quits and wrapped exit records mid-adoption, and a newly opened
+  connection revokes the previous one's.
+- **Terminal host adoption and exit reporting.** `record_exit` runs once per
+  session (`ft-c113d00b`); `adopt` skips reported exits and reads `vouched.late`
+  after proxy scans, and a second exit report during recording leaves proxy and
+  host state intact.
+- **The terminal input write timeout is a stall bound**, not a total, so a large
+  write no longer fails because it is long (`cc0cfb90`).
+- **An expanded terminal dock hides the view behind it and makes it `inert`**,
+  so focus and pointer input cannot reach it (`077de305`).
+- **Terminal tab titles are cleaned by `sessionActivity.clean()`**, which drops
+  split surrogate pairs, unprintable controls and ANSI artifacts (`19d4ae12`).
+- **The short columns of the advisory tables are pinned** in `HealthTable.svelte`
+  and `HealthPanel.svelte` (`e60712a0`).
+- **Lappi settings say plainly that diffs are sent**, and to nowhere else,
+  instead of "not an AI provider" (`709ef806`).
+- **macOS background-class children enter the background band before `exec`.**
+  `procguard::spawn_background` sets `PRIO_DARWIN_PROCESS` in the child through
+  a `pre_exec` hook (`2ae27514`, `ft-b597add5`), so a fast-execing `sh -c` or
+  `git` wrapper can no longer run at normal priority because the parent's
+  demotion landed late. A spawn that cannot enter the band (for example under a
+  sandbox) fails rather than running at normal priority.
+- **The workbench verification sweep reads every held card's verdict in one
+  walk** (`latest_many`) instead of scanning `evidence_list` per card every
+  3 seconds; a single-card `latest` selects `LIMIT 1` instead of reading up to
+  10,001 history rows, and parked card notes reuse existing decision records
+  (`c7e97f6d`). On a 1,000-card profile the sweep's idle duty cycle fell from
+  about 80% to about 27%.
+- **A hidden terminal is never fitted.** A terminal that is hidden or has no
+  size is not fitted (`fitSchedule.ts`); a shown pane refits, and resizes are
+  coalesced with theme and device-pixel-ratio changes (`265326b9`).
+- **xterm is the 6.1 beta pair, every `@xterm` package pinned exactly**:
+  `@xterm/xterm` 6.1.0-beta.317 and `@xterm/addon-webgl` 0.20.0-beta.311, with
+  the matching fit, search and unicode11 addon betas (`e0f44df9`).
+- **Vendored DevCouncil crates re-vendored at `7926697d`** (`2a919f00`), with
+  the devmap store at schema 29 and dc-store at workbench schema 15 (see
+  Upgrade); the zstd 0.14.3 lockfile follows (`c9c8ead0`).
+- **The view panels are rebuilt per repository again.** `ViewSectionPanel` keys
+  its content on the current repository, as it did before `cfac83b3` removed
+  the key without untangling any panel, so a file tree, diff or commit table
+  cannot carry one repository's scroll offsets, drafts or requests into the
+  next (`10510561`).
 - The minimum supported Git is now 2.36, up from 2.23, because worktree
   listing uses `git worktree list -z` with no fallback (Ubuntu 22.04 and
   Debian 11 ship older Git). The version check names every feature an older
@@ -656,6 +655,56 @@ reinstalling.
 
 ### Fixed
 
+- **The cleaner reclaims again.** Its refusal is scoped to the repositories it
+  could not read (`2540db65`), each artifact tree is budgeted on its own so a
+  readable one is not condemned with its repository (`5e5a380e`), and the panel
+  no longer vetoes what the host allows (`bb632ca1`).
+- **Pulse:** 30-day velocity no longer reads +100% when the prior period has no
+  data (`63d8b7c2`), and the Line Changes totals sum the 26 weeks they are
+  labelled with (`cb905dc2`).
+- **Diff:** hunk and line staging are off while Ignore whitespace is on
+  (`50f9438f`), and Copy patch says when it copies only the first part of a cut
+  diff (`ce52d92f`).
+- **Remote panel:** Refresh shows it is running and a failed refresh keeps the
+  last good data (`3c800f80`), and a merge or create confirmation survives the
+  reload that follows it (`3c00a678`).
+- **The menu-bar status popover keeps its width and place on a second display
+  of another scale.** With the menu bar on a 1x display beside a 2x one, it
+  opened at half width and half its offset from the icon (`677cb324`).
+- **A failed read is no longer shown as an empty result:** branch backups
+  (`689f48df`), the health rescan, which keeps its last report and says so
+  (`e39953d3`), the file tree while it re-lists (`73add72d`), a history commit
+  read and a filter or load-more reload (`9c460099`, `ac1facf2`), Settings' first
+  load, which now offers Retry (`1af13742`), the code map's broken-links check
+  (`70ee1bdc`), the repository section headers (`8d9021d2`) and a task's attempts
+  (`a132d63f`).
+- **History:** one resolved current commit drives the row highlight, header,
+  details and diff (`a19c4ff9`).
+- **Code map:** the previous graph is cleared when the map view changes
+  (`df53aca5`), and the view tabs have a roving tabindex, arrow keys and a
+  tabpanel (`93e9083c`).
+- **Accessibility:** Escape in Settings search clears it and an IME Escape no
+  longer closes Settings or Shortcuts (`76b52302`); the bypass prompt takes and
+  keeps focus, and terminal spawn, exit and error status is announced
+  (`82c4e49e`, `546cd67a`); the commit message box is named and AI errors are
+  announced (`6c268d55`); and toast Undo and Dismiss are no longer inside an
+  `aria-hidden` pile (`47e2c286`).
+- **Run in waves is bounded by the Suggest next priority ceiling** (`c83a7fb0`).
+- **Terminal:** a navigation key, including an application-cursor (SS3) arrow,
+  no longer counts as answering the program (`ea287775`, `c1f28c45`), and
+  session failures show in Shell mode, not only in the Console input bar
+  (`6dd3ca7a`).
+- **Settings:** launch-at-login says Checking while it loads and reports a
+  refused change (`536d7750`), host-load toggles stay disabled until a read
+  succeeds (`3704204c`), and Run setup closes Settings first so the setup
+  wizard stacks above it (`a55efdbd`).
+- **The Tasks board draws every loaded card again.** `cfac83b3` windowed a column
+  past 35 cards, and the list past 35 rows, at a fixed row height, but a card's
+  height follows its content and the board's keyboard, focus and drop handling
+  find cards in the DOM, so Home/End, a moved card's focus and Load all's counts
+  went wrong (`8a611e6e`).
+- **Code map Docs search labels and vault-refresh failure restored.** The
+  `ui/docs-files` merge (`ce653343`) dropped them (`b606533e`, `323ac038`).
 - **Ledger answers over MCP say how current and how whole they are.** Added
   fields only; nothing is renamed or retyped.
   - `gitpulse_ledger_events`, the `ledger` resource, `gitpulse_status` and the
@@ -938,6 +987,25 @@ reinstalling.
 
 ### Security
 
+- **The signal guard models the Linux tools on Linux** (`d9954240`, `1ba087a0`,
+  `ft-06723bb7`): `procps` `pkill`/`pgrep`, `psmisc` `killall` and `sysvinit`
+  `pidof`. It matches process names against `comm` or the `argv[0]` basename,
+  reads UIDs from `/proc/<pid>/status` and enforces real `kill(2)` permission,
+  counts ancestors as `procps` `pkill` does, and asks the user to confirm
+  `psmisc` `killall` options it does not model.
+- **Workflow lint forbids piping a download into a shell**, and the actionlint
+  download in `ci.yml` is checked against a pinned SHA-256 (`f29d5043`).
+- **pulldown-cmark 0.13.5 for RUSTSEC-2026-0414** (`4a344600`). Under
+  `ENABLE_WIKILINKS`, a malformed wikilink (`[[a|]]`) caused an exponential
+  parser event blow-up that could exhaust memory within `MAX_RENDER_BYTES`.
+  `cssparser-macros` is locked to `syn` 3.0.5.
+- **zstd 0.14.3** (with zstd-safe 8.2.0 and zstd-sys 2.1.2) for the devmap
+  store carries the fixes for RUSTSEC-2026-0391, -0395 to -0406 and -0410
+  (`c9c8ead0`; `src-tauri/vendored/devmap-store/Cargo.toml`).
+- **7-Zip never sees the release job's GitHub token.** The bundle check runs 7z,
+  which parses untrusted installer bytes, with every `*TOKEN*`, `*SECRET*`,
+  `*PASSWORD*` and `*CREDENTIAL*` variable removed from its environment
+  (`ef302a4e`).
 - A withheld Markdown picture loads only from text that parses as an https
   URL, and the parsed URL, not the attribute's text, is what reaches `src`.
 - The release build and the ARM bundle build pass `--locked` to cargo, so the
@@ -985,6 +1053,21 @@ reinstalling.
   decoder is linear.
 - Ledger event strings are bounded, and every cut is recorded in a sibling
   field.
+
+### Hardened
+
+- **Platform builds:** `clippy --all-targets -D warnings` passes on Linux
+  (`b825758e`) and Windows (`c8e05736`, `2937829e`), five
+  integration tests no longer assume macOS behaviour (`cb9ce6f4`), and local
+  macOS builds are signed with a team identity (`77f2ddea`).
+- **Load accounting counts DevCouncil by its real binary and every agent kind**
+  (`c6090735`).
+- **ci:local never reads a coverage report from an earlier run as this run's**
+  (`738417a1`).
+- **Every Rust lint and coverage step in CI refuses a lockfile it would
+  rewrite** (`--locked` on the main crate's clippy in `ci.yml` and
+  `release.yml`, on `cargo llvm-cov` in `coverage.yml`, and in ci:local;
+  `fd07e56c`).
 
 ## [1.4.0] - 2026-10-11
 
@@ -4913,17 +4996,14 @@ graph renderer, and the cross-language contract checks that guard the IPC bounda
 
 [Unreleased]: https://github.com/bharathvbcr/GitPulse/compare/v1.5.0...HEAD
 [1.5.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.3.1...v1.5.0
-[1.4.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/bharathvbcr/GitPulse/compare/v1.3.0...v1.3.1
-[1.3.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.2.1...v1.3.0
-[1.2.1]: https://github.com/bharathvbcr/GitPulse/compare/v1.2.0...v1.2.1
+[1.3.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/bharathvbcr/GitPulse/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.9...v1.0.0
 [0.1.0]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.9...v0.1.0
 [0.0.9]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.8...v0.0.9
 [0.0.8]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.6...v0.0.8
-[0.0.7]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/bharathvbcr/GitPulse/compare/v0.0.3...v0.0.4
