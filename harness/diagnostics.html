@@ -84,6 +84,11 @@
   });
   window.addEventListener("unhandledrejection", e => crashes.push(String(e.reason)));
   const {mount, tick, unmount} = await import("svelte");
+  // The live index runs only while the window is foreground, and the WebKit
+  // runner's window is never key: without this the index stays "scheduled",
+  // which disables Refresh index (harness/foreground.ts).
+  const {describeForeground, holdForeground} = await import("./foreground.ts");
+  holdForeground();
   const {repoStore} = await import("../src/lib/stores/repoStore.ts");
   const {default: Host} = await import("./DiagnosticsHost.svelte");
   const sleep = ms => new Promise(resolve => setTimeout(resolve,ms));
@@ -125,8 +130,9 @@
     check("20 backlinks on one line render",target.querySelectorAll("li").length===20);
     host.show("map"); await settle();
     const click = async name => {const button=[...target.querySelectorAll("button")].find(b=>b.textContent.trim()===name);if(!button)throw Error(`Missing button ${name}`);button.click();await settle();};
+    const refreshButton = () => [...target.querySelectorAll("button")].find(b=>b.textContent.trim()==="Refresh index"||b.textContent.trim()==="Refreshing…");
     await click("Refresh index");
-    check("build failure remains visible after status reload",target.textContent.includes("BUILD-FAILURE-DETAIL"));
+    check("build failure remains visible after status reload",target.textContent.includes("BUILD-FAILURE-DETAIL"),`refresh calls ${calls.get("cmd_devmap_refresh")??0}; button disabled=${refreshButton()?.disabled} title=${JSON.stringify(refreshButton()?.title)}; ${describeForeground()}; text: ${target.textContent.slice(-300)}`);
     const copiedLogs = [];
     const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
     const originalExecCommand = document.execCommand;
