@@ -711,7 +711,9 @@ mod tests {
             fd,
             Some(child.id()),
             Options {
-                safety_net: Duration::from_millis(700),
+                // Scaled so a starved `sleep 0.2` has exited when the net
+                // fires; the 600 ms floor below still proves the net ended it.
+                safety_net: crate::test_support::coverage_relaxed(Duration::from_millis(700)),
                 watch_exit: true,
                 deaf: true,
             },

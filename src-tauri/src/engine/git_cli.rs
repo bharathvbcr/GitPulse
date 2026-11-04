@@ -13528,7 +13528,10 @@ mod qos_band_tests {
             run_bounded(
                 priority_probe(waits),
                 "priority-probe",
-                crate::test_support::coverage_relaxed(Duration::from_secs(120)),
+                // Under coverage on a loaded host the scaled limit passed
+                // 1800 s, which run_bounded refuses before spawning anything.
+                crate::test_support::coverage_relaxed(Duration::from_secs(120))
+                    .min(NETWORK_TIMEOUT),
                 None,
             )
         })
