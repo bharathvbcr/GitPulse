@@ -21,13 +21,22 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
+#[path = "common/nextest_list.rs"]
+mod nextest_list;
+
 #[cfg(not(target_os = "macos"))]
 fn main() {
+    if nextest_list::answer_list("native_quit_guard", false) {
+        return;
+    }
     println!("SKIP native_quit_guard: requires macOS/AppKit");
 }
 
 #[cfg(target_os = "macos")]
 fn main() {
+    if nextest_list::answer_list("native_quit_guard", true) {
+        return;
+    }
     match std::env::var("GP_QUIT_SCENARIO") {
         Ok(scenario) => child::run(&scenario),
         Err(_) => parent(),

@@ -18,6 +18,7 @@ Ensure you have the following tools installed on your development machine:
 | **Node.js** | `22.x`, at least `22.12` | CI uses Node 22. Vite, Vitest and svelte-check still run on Node; the locked Vite/Vitest engines require at least 22.12 on that line; check `bun.lock` before using another major. |
 | **Rust** | `stable`, edition 2021 | Needs the `clippy` and `rustfmt` components — CI fails on either. `rustup component add clippy rustfmt` |
 | **cargo-llvm-cov** | latest | Generates the Rust LCOV report that `bun run ci:local` enforces coverage floors against. `rustup component add llvm-tools-preview` then `cargo install cargo-llvm-cov --locked` |
+| **cargo-nextest** | latest | Runs the Rust suites in `bun run ci:local` (through `cargo llvm-cov nextest`), one process per test, four at a time (`src-tauri/.config/nextest.toml`). CI still runs them under `cargo test`. `cargo install cargo-nextest --locked` |
 | **actionlint** | latest | Lints the GitHub Actions workflows in `bun run ci:local`. `release.yml` runs only on a `v*` tag, so this is the only gate that reads it before a release. `brew install actionlint` |
 | **Git** | any maintained release | Not just for version control: GitPulse shells out to `git` for every repository operation, so the binary on your `PATH` is part of the runtime. |
 | **GitHub CLI** (`gh`) | optional | The GitHub panel (PRs, issues, workflow runs) and Health (Dependabot and code scanning alerts) use it. Everything else works without it. |

@@ -162,12 +162,21 @@ mod macos {
     }
 }
 
+#[path = "common/nextest_list.rs"]
+mod nextest_list;
+
 #[cfg(target_os = "macos")]
 fn main() {
+    if nextest_list::answer_list("native_event_unwind", true) {
+        return;
+    }
     macos::run();
 }
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
+    if nextest_list::answer_list("native_event_unwind", false) {
+        return;
+    }
     println!("native_event_unwind: inapplicable off macOS");
 }

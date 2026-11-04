@@ -9,13 +9,22 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
+#[path = "common/nextest_list.rs"]
+mod nextest_list;
+
 #[cfg(not(target_os = "macos"))]
 fn main() {
+    if nextest_list::answer_list("native_status_material", false) {
+        return;
+    }
     println!("SKIP native_status_material: requires macOS/AppKit");
 }
 
 #[cfg(target_os = "macos")]
 fn main() {
+    if nextest_list::answer_list("native_status_material", true) {
+        return;
+    }
     use gitpulse_lib::desktop::{install_menu, popover, set_menu_state, DesktopState, MenuState};
     use std::sync::mpsc;
     use std::time::Duration;

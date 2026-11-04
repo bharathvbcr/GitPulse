@@ -6,8 +6,14 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
+#[path = "common/nextest_list.rs"]
+mod nextest_list;
+
 #[cfg(target_os = "linux")]
 fn main() {
+    if nextest_list::answer_list("gtk_runtime", true) {
+        return;
+    }
     use gitpulse_lib::desktop::{install_menu, set_recent_menu, DesktopState};
     use gtk::glib::variant::ToVariant;
     use gtk::prelude::GtkWindowExt;
@@ -141,5 +147,8 @@ fn main() {
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
+    if nextest_list::answer_list("gtk_runtime", false) {
+        return;
+    }
     println!("gtk_runtime: not applicable on this platform (Linux GTK test)");
 }

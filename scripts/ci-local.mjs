@@ -173,11 +173,13 @@ export const GATES = [
     id: "cargo-tests",
     name: "Rust tests with coverage",
     program: "cargo",
-    // --no-fail-fast and --locked mirror ci.yml. Without --no-fail-fast cargo
-    // stops at the first failing test BINARY and every later one is skipped,
-    // which is the same masking this runner exists to remove, one level down.
+    // --no-fail-fast and --locked mirror ci.yml. Without --no-fail-fast the
+    // run stops at the first failure and everything after it goes unrun, which
+    // is the same masking this runner exists to remove, one level down.
+    // Concurrency is src-tauri/.config/nextest.toml's: four test processes.
     args: [
       "llvm-cov",
+      "nextest",
       "--manifest-path",
       CARGO_MANIFEST,
       "--workspace",
@@ -186,13 +188,12 @@ export const GATES = [
       "--lcov",
       "--output-path",
       "lcov.info",
-      "--",
-      "--test-threads=1",
     ],
     covers: [
       `cargo test --manifest-path ${CARGO_MANIFEST} --locked --no-fail-fast -- --nocapture --test-threads=1`,
     ],
     produces: ["lcov.info"],
+    why: "CI runs these under cargo test, one test at a time inside each binary's process; here every test is its own process, four at a time. Instrumented on an 18-core Mac (2026-11-04, runs interleaved nextest, cargo test, nextest): 908 s and 813 s against 4,300 s, line coverage 90.5% both ways. What this cannot see, CI's cargo test still does: a test that fails only beside another in the same process, and the doctests",
   },
   {
     id: "worktree-fmt",

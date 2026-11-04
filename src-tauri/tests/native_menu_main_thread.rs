@@ -23,6 +23,9 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
+#[path = "common/nextest_list.rs"]
+mod nextest_list;
+
 use gitpulse_lib::desktop::actions::SECTION_MENUS;
 use gitpulse_lib::desktop::{
     install_menu, menu_state, recent_menu_entries, set_menu_state, set_recent_menu, DesktopState,
@@ -146,6 +149,9 @@ fn check(name: &str, passed: bool, detail: &str, failures: &mut Vec<String>) {
 }
 
 fn main() {
+    if nextest_list::answer_list("native_menu_main_thread", true) {
+        return;
+    }
     #[cfg(target_os = "linux")]
     gtk::init().expect("native menu tests require a display (use xvfb-run)");
     let mut failures: Vec<String> = Vec::new();
