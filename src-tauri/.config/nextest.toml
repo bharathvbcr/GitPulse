@@ -1,0 +1,16 @@
+# cargo-nextest settings for the src-tauri workspace.
+#
+# Four test processes at a time, the same bound `.cargo/config.toml` puts on
+# libtest (`RUST_TEST_THREADS = "4"`) and for the same reason: these tests
+# spawn git, sh and ptys, and several agent sessions each fanning out one
+# process per core put the machine into a process storm that saturated
+# syspolicyd. nextest's default is one per core. `--test-threads` or
+# NEXTEST_TEST_THREADS still wins for one run.
+#
+# Why nextest at all: every test runs in its own process, so tests that hold
+# process-wide locks (environment overrides, sandboxes) stop queueing behind
+# each other. On 2026-11-03 (48948e9f, 18-core Apple silicon, lib suite, 4 at
+# a time, runs alternated) `cargo nextest run --lib` took 507 s and 546 s with
+# all 6734 passing; `cargo test --lib` took 3051 s and 1672 s.
+[profile.default]
+test-threads = 4
