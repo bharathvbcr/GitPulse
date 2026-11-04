@@ -4,8 +4,8 @@ use super::{menu_state, DesktopState, MenuState};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{
-    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Runtime, WebviewUrl,
-    WebviewWindow, WebviewWindowBuilder, WindowEvent,
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize,
+    Position, Runtime, Size, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
 };
 
 pub const LABEL: &str = "status-popover";
@@ -138,6 +138,29 @@ fn placement(icon: [f64; 4], work: [f64; 4], scale: f64, height: f64) -> [f64; 4
     [x, y, width, height]
 }
 
+/// The window frame for a placement made in the icon display's physical units.
+/// tao's macOS window converts a physical frame with the scale of the display
+/// the window is on now, not the one it is moving to, so a popover opening
+/// onto a 1x display beside a 2x one landed at half the offset and half the
+/// width (360 points became 180). macOS monitor and tray coordinates are each
+/// display's points times its own scale, so dividing by that scale gives the
+/// global points AppKit places windows in. Windows and Linux take physical
+/// frames as given.
+fn window_frame(placed: [f64; 4], scale: f64) -> (Position, Size) {
+    let [x, y, width, height] = placed;
+    if cfg!(target_os = "macos") {
+        (
+            LogicalPosition::new(x / scale, y / scale).into(),
+            LogicalSize::new(width / scale, height / scale).into(),
+        )
+    } else {
+        (
+            PhysicalPosition::new(x, y).into(),
+            PhysicalSize::new(width, height).into(),
+        )
+    }
+}
+
 fn position<R: Runtime>(
     app: &AppHandle<R>,
     window: &WebviewWindow<R>,
@@ -171,7 +194,8 @@ fn position<R: Runtime>(
         })
         .ok_or("Status icon display is unavailable")?;
     let work = monitor.work_area();
-    let [x, y, width, height] = placement(
+    let scale = monitor.scale_factor();
+    let placed = placement(
         [point.x, point.y, size.width, size.height],
         [
             work.position.x as f64,
@@ -179,15 +203,12 @@ fn position<R: Runtime>(
             work.size.width as f64,
             work.size.height as f64,
         ],
-        monitor.scale_factor(),
+        scale,
         height,
     );
-    window
-        .set_position(PhysicalPosition::new(x, y))
-        .map_err(|e| e.to_string())?;
-    window
-        .set_size(PhysicalSize::new(width, height))
-        .map_err(|e| e.to_string())
+    let (origin, extent) = window_frame(placed, scale);
+    window.set_position(origin).map_err(|e| e.to_string())?;
+    window.set_size(extent).map_err(|e| e.to_string())
 }
 
 pub fn hide<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
@@ -510,6 +531,43 @@ mod tests {
                     assert!(x >= left && x + width <= left + 1920.0);
                     assert!(y >= 48.0 && y + height <= 1080.0);
                 }
+            }
+        }
+    }
+    #[test]
+    fn the_frame_keeps_the_panel_width_on_a_display_of_any_scale() {
+        // The layout this failed on: a 1x display at (1728, -323) points beside
+        // a 2x built-in one, with the status icon on the 1x display.
+        let one_x = placement(
+            [3648.0, -325.0, 34.0, 33.0],
+            [1728.0, -293.0, 2560.0, 1410.0],
+            1.0,
+            400.0,
+        );
+        // The built-in display, its points doubled.
+        let two_x = placement(
+            [3000.0, 0.0, 44.0, 48.0],
+            [0.0, 132.0, 3456.0, 2036.0],
+            2.0,
+            400.0,
+        );
+        for (placed, scale) in [(one_x, 1.0), (two_x, 2.0)] {
+            let (origin, extent) = window_frame(placed, scale);
+            if cfg!(target_os = "macos") {
+                let Size::Logical(extent) = extent else {
+                    panic!("macOS frames are in points: {extent:?}");
+                };
+                let Position::Logical(origin) = origin else {
+                    panic!("macOS frames are in points: {origin:?}");
+                };
+                assert_eq!((extent.width, extent.height), (WIDTH, 400.0));
+                assert_eq!((origin.x, origin.y), (placed[0] / scale, placed[1] / scale));
+            } else {
+                assert!(
+                    matches!(extent, Size::Physical(PhysicalSize { width, height })
+                    if f64::from(width) == placed[2] && f64::from(height) == placed[3])
+                );
+                assert!(matches!(origin, Position::Physical(_)));
             }
         }
     }
