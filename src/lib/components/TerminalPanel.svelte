@@ -694,15 +694,27 @@
    * to refit — its ResizeObserver only fires after the browser recomputes
    * layout, and the grid it would paint until then is the stale one.
    */
+  // reveal() takes focus, so the effect below may re-run only when the tab
+  // being shown changes, never for anything else. Three things used to re-run
+  // it and pulled focus out of whatever the user had just opened (the
+  // session-type menu's search box) back onto the prompt or the grid:
+  //  - `visible` arrives inside the dock's props object, which is rebuilt on
+  //    every repository-store emission with the same value, so the effect
+  //    depended on the object rather than on the boolean. A derived value
+  //    only propagates when it differs, so the effect reads it instead;
+  //  - `unread` changes when ANOTHER tab prints its first line;
+  //  - `sessions` changes whenever any tab mounts or unmounts.
+  const revealedId = $derived(visible && mode === "shell" ? activeId : null);
   $effect(() => {
-    if (!visible || mode !== "shell") return;
-    const id = activeId;
+    const id = revealedId;
     if (!id) return;
-    if (unread.has(id)) untrack(() => { unread = new Set([...unread].filter((key) => key !== id)); });
-    const session = sessions[id];
+    untrack(() => {
+      if (unread.has(id)) unread = new Set([...unread].filter((key) => key !== id));
+    });
     void tick().then(() => {
       if (!visible || mode !== "shell" || activeId !== id) return;
-      session?.reveal();
+      // Looked up once the tab has mounted, outside the effect's tracking.
+      sessions[id]?.reveal();
       if (focusTabStrip) tabScroller?.querySelector<HTMLButtonElement>(`[id="terminal-tab-${id}"]`)?.focus();
     });
   });

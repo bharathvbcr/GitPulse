@@ -1577,7 +1577,34 @@
           // but reveal() itself can keep focus off the dead grid.
           const opener = button("New session type");
           opener.focus(); opener.click(); await wait();
-          check("the launcher menu took focus away from the prompt", () => visible('[aria-label="Session types"]').length > 0 && document.activeElement !== decline);
+          check("the launcher menu took focus away from the prompt", () => {
+            const menu = visible('[aria-label="Session types"]').length > 0;
+            const at = document.activeElement;
+            const seen = `${at?.tagName}[testid=${at?.dataset?.testid ?? ""} aria-label=${at?.getAttribute("aria-label") ?? ""}]`;
+            if (!menu || at === decline) throw new Error(`menu visible: ${menu}; focus on ${seen}`);
+            return true;
+          });
+          // Another tab printing for the first time marks itself unread, and the
+          // dock rebuilds its props on the store emissions around it. That used
+          // to re-run the panel's reveal effect through dependencies unrelated
+          // to which tab is shown, handing focus back to the prompt (or the
+          // grid) from whatever the user had just opened: the menu's search box
+          // lost focus at a moment set by a background process. The stimulus
+          // has to land on a tab that is not unread yet, or the check would
+          // pass without having tested anything.
+          const menuFocus = document.activeElement;
+          const unreadMarks = () => document.querySelectorAll('[aria-label="Unread output"]').length;
+          const marksBefore = unreadMarks();
+          const quiet = [...sessions.keys()].filter((id) => id !== `fixture-${spawnedBefore + 1}`);
+          let printed = 0;
+          for (const id of quiet) if (unreadMarks() === marksBefore && pushOutput(id, "background output\r\n")) { printed++; await wait(50); }
+          await wait(150);
+          check("a background tab's first output leaves focus where the user put it", () => {
+            if (unreadMarks() <= marksBefore) throw new Error(`the stimulus marked no tab unread (${printed} of ${quiet.length} tabs printed, ${marksBefore} already unread)`);
+            const at = document.activeElement;
+            if (at !== menuFocus || at === decline) throw new Error(`focus moved from ${menuFocus?.getAttribute("aria-label")} to ${at?.getAttribute("aria-label") ?? at?.dataset?.testid ?? at?.tagName}`);
+            return visible('[aria-label="Session types"]').length > 0;
+          });
           opener.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
           await wait(150);
           check("Escape out of a menu returns to the safer answer, not the xterm textarea", () => document.activeElement === decline && !document.activeElement.classList.contains("xterm-helper-textarea"));

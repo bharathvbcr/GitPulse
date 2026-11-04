@@ -86,10 +86,27 @@ describe("TerminalPanel session ownership", () => {
   });
 
   it("refits the visible session when its host is shown again", () => {
-    const body = source.slice(source.indexOf("$effect(() => {", source.indexOf("function handleChord")));
-    expect(body).toContain("if (!visible || mode !== \"shell\") return");
-    expect(body).toContain("session?.reveal()");
+    const body = source.slice(source.indexOf("const revealedId = $derived"));
+    expect(body).toContain('const revealedId = $derived(visible && mode === "shell" ? activeId : null);');
+    expect(body).toContain("sessions[id]?.reveal()");
     expect(body).toContain('if (!visible || mode !== "shell" || activeId !== id) return;');
+  });
+
+  it("re-runs the reveal effect only when the shown tab changes, never for the dock's props, another tab's output or a mount", () => {
+    // reveal() takes focus. Before this, the effect re-ran when the dock rebuilt
+    // its props object (every repository-store emission, `visible` unchanged),
+    // when a background tab printed its first line (`unread`) and when any tab
+    // mounted (`sessions`), each taking focus out of the session-type menu's
+    // search box at a moment set by something else (harness/terminal.html
+    // asserts the behaviour). It may read one derived value and nothing else.
+    const start = source.indexOf("$effect(() => {", source.indexOf("const revealedId = $derived"));
+    const effect = source.slice(start, source.indexOf("\n  });", start));
+    const synchronous = effect.slice(0, effect.indexOf("void tick()")).replace(/^\s*\/\/.*$/gm, "");
+    expect(synchronous).toContain("const id = revealedId;");
+    expect(synchronous).toContain("untrack(() => {");
+    const tracked = synchronous.replace(/untrack\(\(\) => \{[\s\S]*?\n    \}\);/, "");
+    expect(tracked).not.toMatch(/\b(unread|sessions|visible|mode|activeId)\b/);
+    expect(effect.slice(effect.indexOf("void tick()"))).toContain("sessions[id]?.reveal()");
   });
 
   it("holds no PTY lifecycle of its own", () => {
