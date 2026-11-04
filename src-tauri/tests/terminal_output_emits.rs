@@ -672,17 +672,32 @@ fn a_typed_keys_echo_is_not_held_by_a_flood_on_another_session_or_its_own() {
     let _cleanup = TerminalCleanup(state.clone());
     let arrivals = hearing_marks(&app, &state);
     let dir = repo();
-    // `cat` echoes each key back; the tty itself echoes nothing.
+    // `cat` echoes each key back; the tty itself echoes nothing once `stty`
+    // has run. Keys typed before that are echoed by the tty, held in its
+    // line buffer, and handed to `cat` in one burst when raw mode lands, which
+    // reads as echoes heard before their keys were typed. So each echo session
+    // prints one `#` after `stty`, and typing waits for it rather than for a
+    // fixed sleep a loaded host can outrun.
+    let raw = |id: &str| {
+        assert!(
+            wait_for(Duration::from_secs(10), || arrivals
+                .lock()
+                .unwrap()
+                .get(id)
+                .is_some_and(|marks| !marks.is_empty())),
+            "session {id} never reported its tty raw"
+        );
+    };
     let echo = || {
         spawn(
             &app,
             &state,
             &dir,
-            vec!["-c".into(), "stty raw -echo; exec cat".into()],
+            vec!["-c".into(), "stty raw -echo; printf '#'; exec cat".into()],
         )
     };
     let quiet = echo();
-    std::thread::sleep(Duration::from_millis(300));
+    raw(&quiet);
     let idle = echo_latencies(&state, &arrivals, &quiet, KEYS);
 
     // Another session prints a mebibyte at a time, over and over.
@@ -706,10 +721,12 @@ fn a_typed_keys_echo_is_not_held_by_a_flood_on_another_session_or_its_own() {
         &dir,
         vec![
             "-c".into(),
-            "stty raw -echo; (while :; do head -c 1048576 /dev/zero | tr '\\0' 'f'; done) & exec cat"
+            "stty raw -echo; printf '#'; (while :; do head -c 1048576 /dev/zero | tr '\\0' 'f'; done) & exec cat"
                 .into(),
         ],
     );
+    raw(&own);
+    // The flood's own head start, as for the session beside it.
     std::thread::sleep(Duration::from_millis(300));
     let within = echo_latencies(&state, &arrivals, &own, KEYS);
 

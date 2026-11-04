@@ -405,7 +405,10 @@ fn context_names_the_foreground_program_and_follows_cd() {
         gitpulse_lib::terminal::OutputSink::events(h.app.handle()),
     )
     .unwrap();
-    write_to_session(&h.state, &session.id, "cd docs/guide && echo moved\n").unwrap();
+    // `sh -i` echoes the typed line, so the marker is split by quotes there
+    // and whole only in what `echo` prints: a wait for the echoed command
+    // returned before `cd` ran on a loaded host.
+    write_to_session(&h.state, &session.id, "cd docs/guide && echo mo''ved\n").unwrap();
     assert!(wait_for_output(&h.output, "moved", Duration::from_secs(10)));
     let idle = session_context(&h.state, &session.id).unwrap();
     assert_eq!(idle.busy, Some(false), "{idle:?}");
@@ -428,7 +431,7 @@ fn context_names_the_foreground_program_and_follows_cd() {
     assert_eq!(busy.process.as_deref(), Some("sleep"), "{busy:?}");
     assert_eq!(busy.repo_dir.as_deref(), Some("docs/guide"));
 
-    write_to_session(&h.state, &session.id, "\x03cd / && echo outside\n").unwrap();
+    write_to_session(&h.state, &session.id, "\x03cd / && echo out''side\n").unwrap();
     assert!(wait_for_output(
         &h.output,
         "outside",
