@@ -389,6 +389,18 @@ name = "notify_stdin_bench"
 harness = false
 test = false
 
+[profile.dev]
+# File:line debug info only: backtraces and lldb breakpoints keep working, but
+# lldb cannot print locals or types. Measured on an 18-core Apple silicon Mac
+# (2026-11-03, private targets, edits interleaved): cold `--all-targets` build
+# 131 s -> 110 s (one run each), edit-then-`cargo build` 12.4 s -> 11.1 s and
+# edit-then-`cargo test --no-run` 32.4 s -> 30.5 s (min of 5, faster in 5/5
+# pairs), target dir 14.3 GB -> 11.1 GB. For a debugging session that needs
+# locals: `CARGO_PROFILE_DEV_DEBUG=full cargo build`. The test profile inherits
+# this. `split-debuginfo` is left alone: Cargo already defaults to `unpacked`
+# on macOS.
+debug = "line-tables-only"
+
 [profile.release]
 # Thin LTO: cross-crate optimization at a fraction of fat-LTO link time.
 lto = "thin"
