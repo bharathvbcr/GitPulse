@@ -186,6 +186,17 @@ export interface SharedWorktree {
   truncated: boolean;
 }
 
+/** One file claim. A declared claim names the run that planned the path. An observed claim names the session the edit hook let through. */
+export interface FileClaim {
+  source: "declared" | "observed";
+  session_id?: string;
+  run_id?: string;
+  path: string;
+  worktree: string;
+  ts_ms: number;
+  cwd?: string;
+}
+
 export interface CollisionRisk {
   ok: boolean;
   error: string;
@@ -204,6 +215,13 @@ export interface CollisionRisk {
   /** False when some agent kind could not be observed; empty `shared_worktrees` is then not clean. */
   sessions_ok: boolean;
   sessions_error: string;
+  /**
+   * Declared and observed claims for this repository. Omitted when empty.
+   * Empty means none only when `claims_error` is also empty.
+   */
+  file_claims?: FileClaim[];
+  /** Set when the claim store was not read, or the list was cut. Omitted when empty. */
+  claims_error?: string;
 }
 
 export interface InsightsSnapshot {

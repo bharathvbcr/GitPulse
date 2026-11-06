@@ -1169,6 +1169,8 @@ fn collision_risk_output() -> Value {
             "shared_worktrees": { "type": "array" },
             "sessions_ok": { "type": "boolean" },
             "sessions_error": { "type": "string" },
+            "file_claims": { "type": "array" },
+            "claims_error": { "type": "string" },
             "deferred": deferred_property(),
             "retry_after_ms": retry_after_property()
         }),
@@ -1264,7 +1266,7 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_collision_risk",
             "Collision risk",
-            "Files with uncommitted changes in more than one worktree — parallel agent checkouts editing the same path — and, in shared_worktrees, the dirty files of any worktree two or more live agent sessions share, which overlapping_files cannot see. Unscanned worktrees are counted, never implied clean; sessions_ok is false when an agent kind could not be observed. With the optional path (a repo-relative file you are about to edit) it instead answers whether any other worktree holds exactly that file dirty, a single one included, and returns only that row plus the scan coverage counts; ok is false and truncated is true when a worktree could not be read, so an empty list is absence only when ok is true.",
+            "Files with uncommitted changes in more than one worktree — parallel agent checkouts editing the same path — and, in shared_worktrees, the dirty files of any worktree two or more live agent sessions share, which overlapping_files cannot see. Unscanned worktrees are counted, never implied clean; sessions_ok is false when an agent kind could not be observed. file_claims lists declared claims (a card's planned files, recorded when its run starts) and observed claims (the edit hook). A claim is not itself a collision: an observed claim names the holding session, a declared claim names the run, and a dirty file in a shared worktree with no claim is owner unknown. claims_error is set when that store could not be read, so an empty file_claims is 'none' only when claims_error is empty. There is no gitpulse_claim_files write. With the optional path (a repo-relative file you are about to edit) it instead answers whether any other worktree holds exactly that file dirty, a single one included, and returns only that row plus the scan coverage counts and the claims on that path; ok is false and truncated is true when a worktree could not be read, so an empty list is absence only when ok is true.",
             CollisionRiskArgs::properties(),
             &CollisionRiskArgs::required(),
             collision_risk_output(),

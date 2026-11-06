@@ -90,7 +90,22 @@ describe("file-scope collisions", () => {
     const scopes = new Map([["a", ["src/x.ts"]], ["b", ["src/x.ts", "src/y.ts"]], ["c", ["docs/z.md"]]]);
     const plan = planBatch([task("a"), task("b"), task("c")], scopes, 3, new Set());
     expect(plan.chosen.map((c) => c.id)).toEqual(["a", "c"]);
-    expect(plan.skipped).toEqual([{ id: "b", title: "Task b", reason: 'its files overlap "Task a"' }]);
+    expect(plan.skipped).toEqual([{ id: "b", title: "Task b", reason: 'its files overlap "Task a" on src/x.ts' }]);
+  });
+
+  it("holds back a member whose file is already claimed and names the holder, not a collision", () => {
+    const scopes = new Map([["a", ["a.rs"]], ["b", ["b.rs"]]]);
+    const plan = planBatch([task("a"), task("b")], scopes, 2, new Set(), { caseInsensitive: false }, [{ path: "a.rs", holder: "run X" }]);
+    expect(plan.chosen.map((c) => c.id)).toEqual(["b"]);
+    expect(plan.skipped).toEqual([{ id: "a", title: "Task a", reason: "a.rs is claimed by run X" }]);
+    expect(plan.skipped[0].reason).not.toMatch(/collision/i);
+  });
+
+  it("refuses an unknown scope when a claim is held, and names that path", () => {
+    const scopes = new Map<string, string[]>([["b", ["x"]]]);
+    const plan = planBatch([task("a"), task("b")], scopes, 2, new Set(), { caseInsensitive: false }, [{ path: "a.rs", holder: "run X" }]);
+    expect(plan.chosen.map((c) => c.id)).toEqual(["b"]);
+    expect(plan.skipped).toEqual([{ id: "a", title: "Task a", reason: "a.rs is claimed by run X" }]);
   });
 
   it("treats an unknown scope as colliding with everything, so it runs alone", () => {

@@ -1131,6 +1131,8 @@ mod tests {
             shared_worktrees: Vec::new(),
             sessions_ok: true,
             sessions_error: String::new(),
+            file_claims: Vec::new(),
+            claims_error: String::new(),
         }
     }
 
