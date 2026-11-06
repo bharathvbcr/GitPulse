@@ -1679,9 +1679,10 @@ impl GitReader {
         })
     }
 
-    /// The plain git note (the default notes ref, `refs/notes/commits` unless
-    /// `core.notesRef` says otherwise) attached to each of `commit_ids`, in
-    /// input order. One `git log --no-walk` for the whole batch. A commit with
+    /// The plain git notes attached to each of `commit_ids`, in input order:
+    /// whatever `git log --notes` displays, which is the default notes ref
+    /// (`refs/notes/commits` unless `core.notesRef` says otherwise) plus any
+    /// refs `notes.displayRef` adds. One `git log --no-walk` for the whole batch. A commit with
     /// no note answers `None`, which is a measured "no note", never a failed
     /// read: a failed read fails the call.
     pub fn get_commit_notes(

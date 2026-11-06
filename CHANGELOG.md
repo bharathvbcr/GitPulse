@@ -21,8 +21,9 @@ before that tag is pushed.
   so the column never holds two scroll areas, and it loads older history as you
   scroll toward the end.
   - **Hover** a commit for the Graph view's card, plus what the row does not
-    carry: the full message body, the commit's plain git note
-    (`refs/notes/commits`) and its recorded GitPulse verification. Each is read
+    carry: the full message body, the commit's plain git notes (what
+    `git log --notes` shows: `refs/notes/commits` unless `core.notesRef` or
+    `notes.displayRef` say otherwise) and its recorded GitPulse verification. Each is read
     once, on a resting pointer, and a note that could not be read says so rather
     than reading as "no note".
   - **Compare two commits:** Shift+click one (or use its compare button), then
