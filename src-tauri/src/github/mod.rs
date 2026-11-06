@@ -6,6 +6,7 @@ use crate::engine::git_cli::{
 use crate::ipc_error::CommandError;
 pub mod actions;
 pub mod outcome;
+pub mod pr_worktree;
 use outcome::RunOutcome;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -626,7 +627,18 @@ pub fn gh_repo_flags(remote: &GitHubRepoRef) -> Vec<String> {
     vec!["--repo".to_string(), gh_repo_flag_value(remote)]
 }
 
-/// Selects the trusted GitHub remote from `git remote -v` output.
+/// A GitHub fetch remote and the git remote name `git fetch` must use.
+///
+/// The name is what carries the user's credentials and `insteadOf` rules.
+/// Fetching the URL directly would drop both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedGitHubRemote {
+    pub name: String,
+    pub github: GitHubRepoRef,
+}
+
+/// Selects the trusted GitHub remote from `git remote -v` output, keeping
+/// the git remote name beside the parsed repository.
 ///
 /// Only **fetch** URLs are eligible. `remote -v` lists every remote twice —
 /// a fetch line and a push line, told apart by the trailing `(fetch)` /
@@ -635,12 +647,17 @@ pub fn gh_repo_flags(remote: &GitHubRepoRef) -> Vec<String> {
 /// (`--repo`, Dependabot endpoints, checkout, issue creation) at a
 /// repository the user never pulls from. Origin wins over other remotes;
 /// among the rest, the first listed fetch URL is used.
-pub fn pick_github_remote(remote_v_output: &str) -> Option<GitHubRepoRef> {
-    let mut origin: Option<GitHubRepoRef> = None;
-    let mut first: Option<GitHubRepoRef> = None;
+///
+/// A remote name that cannot be a single git argument (leading `-`, whitespace
+/// already split off, or a character git would treat specially) is skipped.
+pub fn pick_named_github_remote(remote_v_output: &str) -> Option<NamedGitHubRemote> {
+    let mut origin: Option<NamedGitHubRemote> = None;
+    let mut first: Option<NamedGitHubRemote> = None;
     for line in remote_v_output.lines() {
         let mut parts = line.split_whitespace();
-        let name = parts.next();
+        let Some(name) = parts.next() else {
+            continue;
+        };
         let Some(url) = parts.next() else {
             continue;
         };
@@ -649,19 +666,46 @@ pub fn pick_github_remote(remote_v_output: &str) -> Option<GitHubRepoRef> {
         if matches!(parts.next(), Some("(push)")) {
             continue;
         }
+        if !git_remote_name_is_safe(name) {
+            continue;
+        }
         if let Some(parsed) = parse_github_remote_url(url) {
             if is_github_host(&parsed.host) {
-                if name == Some("origin") {
-                    origin = Some(parsed);
+                let named = NamedGitHubRemote {
+                    name: name.to_string(),
+                    github: parsed,
+                };
+                if name == "origin" {
+                    origin = Some(named);
                     break;
                 }
                 if first.is_none() {
-                    first = Some(parsed);
+                    first = Some(named);
                 }
             }
         }
     }
     origin.or(first)
+}
+
+/// A git remote name that can be one argument to `git fetch` without changing
+/// the command. Names git itself refuses are not fetched.
+fn git_remote_name_is_safe(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// Selects the trusted GitHub remote from `git remote -v` output.
+///
+/// See [`pick_named_github_remote`] for which line wins. Callers that also
+/// fetch use the named form so the remote name, not the raw URL, is what git
+/// receives.
+pub fn pick_github_remote(remote_v_output: &str) -> Option<GitHubRepoRef> {
+    pick_named_github_remote(remote_v_output).map(|named| named.github)
 }
 
 pub fn discover_github_remote(repo_path: &str) -> Result<Option<GitHubRepoRef>, CommandError> {

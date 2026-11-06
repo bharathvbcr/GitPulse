@@ -131,6 +131,38 @@ pub async fn cmd_github_checkout_pr(
     .await
 }
 
+/// Opens pull request `number` in a new linked worktree. The main checkout is
+/// not switched. `cow_caches` and `run_hooks` are the same options
+/// [`cmd_add_worktree`] takes; the argv is built in `github::pr_worktree` and
+/// `engine::worktree`, and every line is judged before it runs.
+#[tauri::command(async)]
+pub async fn cmd_github_open_pr_worktree(
+    repo_path: String,
+    number: u64,
+    cow_caches: bool,
+    run_hooks: bool,
+) -> Result<Guarded<crate::github::pr_worktree::PrWorktreeOpened>, IpcError> {
+    off_thread(move || {
+        let fold = VerdictFold::default();
+        let gate = |repo: &str, argv: &[&str]| -> Result<(), String> {
+            let verdict = guard(repo, argv)?;
+            fold.record(verdict);
+            Ok(())
+        };
+        let opened = crate::github::pr_worktree::open_pull_request_worktree(
+            &repo_path, number, cow_caches, run_hooks, &gate,
+        )?;
+        let policy = fold
+            .finish()
+            .ok_or_else(|| CommandError::plain("Opening the pull request judged no command."))?;
+        Ok(Guarded {
+            policy,
+            output: opened,
+        })
+    })
+    .await
+}
+
 /// One pull request in detail (`gh pr view`). Read-only and ungated, like the
 /// listings in [`cmd_github_context`].
 #[tauri::command(async)]

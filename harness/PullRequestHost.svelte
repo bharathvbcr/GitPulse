@@ -5,7 +5,12 @@
   let {
     onChanged,
     onCreated,
-  }: { onChanged: (message: string) => void; onCreated: (message: string) => void } = $props();
+    onCheckedOut,
+  }: {
+    onChanged: (message: string) => void;
+    onCreated: (message: string) => void;
+    onCheckedOut: (message: string) => void;
+  } = $props();
 
   /** #7 open, #8 draft, #9 closed, #10 fails its first read — each detail loads its own fixture. */
   const NUMBERS = [7, 8, 9, 10];
@@ -19,6 +24,6 @@
     <PullRequestCreate repoPath="/fixture/GitPulse" slug="acme/gitpulse" headBranch={null} defaultBase="main" {onCreated} onCancel={() => {}} />
   </section>
   {#each NUMBERS as number (number)}
-    <PullRequestDetail repoPath="/fixture/GitPulse" {number} slug="acme/gitpulse" {onChanged} />
+    <PullRequestDetail repoPath="/fixture/GitPulse" {number} slug="acme/gitpulse" {onChanged} {onCheckedOut} />
   {/each}
 </main>

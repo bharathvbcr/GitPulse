@@ -19,6 +19,7 @@ import { parseRustStructs } from "./check-coverage-types.mjs";
 const SOURCES = {
   "github/mod.rs": fileURLToPath(new URL("../src-tauri/src/github/mod.rs", import.meta.url)),
   "github/actions.rs": fileURLToPath(new URL("../src-tauri/src/github/actions.rs", import.meta.url)),
+  "github/pr_worktree.rs": fileURLToPath(new URL("../src-tauri/src/github/pr_worktree.rs", import.meta.url)),
 };
 
 /**
@@ -45,6 +46,7 @@ const LISTINGS = [
     struct: "GhWorkflow",
   },
   { subcommand: "pr", fn: "pr_view_leading_args", source: "github/mod.rs", struct: "GhPullRequestDetail" },
+  { subcommand: "pr", fn: "pr_worktree_view_argv", source: "github/pr_worktree.rs", struct: "GhPrWorktreeView" },
 ] as const;
 
 /** The comma-separated field list passed to `--json` inside `fn`. */

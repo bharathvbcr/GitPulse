@@ -161,6 +161,7 @@
     "allow-cmd-github-context",
     "allow-cmd-github-create-issue",
     "allow-cmd-github-dependabot-alerts",
+    "allow-cmd-github-open-pr-worktree",
     "allow-cmd-github-pr-action",
     "allow-cmd-github-pr-view",
     "allow-cmd-github-rerun-run",

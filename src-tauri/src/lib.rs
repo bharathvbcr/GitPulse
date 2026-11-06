@@ -491,6 +491,7 @@ pub fn run() {
             cmd_github_code_scanning_alerts,
             cmd_github_create_issue,
             cmd_github_checkout_pr,
+            cmd_github_open_pr_worktree,
             cmd_github_pr_view,
             cmd_github_pr_action,
             cmd_github_workflows,
