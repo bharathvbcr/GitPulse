@@ -52,6 +52,9 @@ fn webview_labeled(label: &str) -> tauri::WebviewWindow<tauri::test::MockRuntime
             gitpulse_lib::commands::cmd_list_tags,
             gitpulse_lib::commands::cmd_get_commit_details,
             gitpulse_lib::commands::cmd_get_commit_files,
+            gitpulse_lib::commands::cmd_get_compare_diff,
+            gitpulse_lib::commands::cmd_get_compare_files,
+            gitpulse_lib::commands::cmd_get_commit_notes,
             gitpulse_lib::commands::cmd_get_reflog,
             gitpulse_lib::commands::cmd_hygiene_prepare,
             gitpulse_lib::commands::cmd_hygiene_execute,
@@ -859,6 +862,74 @@ fn a_nested_commit_payload_keeps_its_field_names() {
     }
     // The full commit id round-trips rather than being abbreviated in transit.
     assert_eq!(value["id"].as_str().unwrap_or_default(), head);
+}
+
+/// The Diff view's history rail compares two commits and reads their notes:
+/// the camelCase argument names (and the optional `filePath`) are what the
+/// TypeScript side sends, and the field names are what it reads.
+#[test]
+fn compare_and_notes_reads_keep_their_wire_names() {
+    let repo = repo_with_change();
+    let first = head_of(repo.path());
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo.path())
+            .output_locked()
+            .expect("git on PATH");
+        assert!(out.status.success(), "git {args:?}");
+    };
+    git(&["commit", "-qam", "second"]);
+    git(&["notes", "add", "-m", "reviewed", &first]);
+    let second = head_of(repo.path());
+    let root = repo.path().to_string_lossy().to_string();
+
+    let whole = invoke(
+        "cmd_get_compare_diff",
+        json!({ "repoPath": root, "from": first, "to": second, "filePath": null }),
+    )
+    .expect("compare diff");
+    assert!(
+        whole["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("+changed"),
+        "{whole}"
+    );
+    let one = invoke(
+        "cmd_get_compare_diff",
+        json!({ "repoPath": root, "from": first, "to": second, "filePath": "README.md" }),
+    )
+    .expect("compare file diff");
+    assert!(
+        one["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("README.md"),
+        "{one}"
+    );
+
+    let files = invoke(
+        "cmd_get_compare_files",
+        json!({ "repoPath": root, "from": first, "to": second }),
+    )
+    .expect("compare files");
+    let listed = files["files"].as_array().expect("files array");
+    assert_eq!(listed.len(), 1, "{files}");
+    for field in ["path", "status_code", "additions", "deletions"] {
+        assert!(listed[0].get(field).is_some(), "missing {field} in {files}");
+    }
+
+    let notes = invoke(
+        "cmd_get_commit_notes",
+        json!({ "repoPath": root, "commitIds": [second, first] }),
+    )
+    .expect("notes");
+    let rows = notes.as_array().expect("notes array");
+    assert_eq!(rows.len(), 2, "{notes}");
+    assert!(rows[0]["note"].is_null(), "{notes}");
+    assert_eq!(rows[1]["note"].as_str(), Some("reviewed"), "{notes}");
+    assert!(rows[1].get("commit_id").is_some(), "{notes}");
 }
 
 #[test]

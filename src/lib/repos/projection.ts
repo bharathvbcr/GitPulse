@@ -36,6 +36,7 @@ export function emptyProjected(): RepoState {
     defaultBranch: null,
     statuses: [],
     selectedCommitId: null,
+    selectedCompareBase: null,
     selectedFilePath: null,
     selectedIsStaged: false,
     selectedIgnoreWhitespace: false,
@@ -85,6 +86,7 @@ export function createSession(
     defaultBranch: extras.defaultBranch ?? null,
     statuses: extras.statuses ?? [],
     selectedCommitId: extras.selectedCommitId ?? null,
+    selectedCompareBase: extras.selectedCompareBase ?? null,
     selectedFilePath: extras.selectedFilePath ?? null,
     selectedIsStaged: extras.selectedIsStaged ?? false,
     // Seeded from the Settings > Diff & code preference rather than hardcoded
@@ -234,6 +236,7 @@ function projectRest(
     defaultBranch: active?.defaultBranch ?? null,
     statuses: active?.statuses ?? [],
     selectedCommitId: active?.selectedCommitId ?? null,
+    selectedCompareBase: active?.selectedCompareBase ?? null,
     selectedFilePath: active?.selectedFilePath ?? null,
     selectedIsStaged: active?.selectedIsStaged ?? false,
     selectedIgnoreWhitespace: active?.selectedIgnoreWhitespace ?? false,

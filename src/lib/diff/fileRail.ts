@@ -20,7 +20,7 @@
 
 /** Where a rail's entries came from. `none` renders no rail at all. */
 import { hasUnstagedChanges, statusForSide } from "../files/fileStatus";
-export type RailSource = "commit" | "worktree" | "none";
+export type RailSource = "commit" | "compare" | "worktree" | "none";
 
 export interface RailEntry {
   path: string;
@@ -76,12 +76,15 @@ export interface WorktreeFileLike {
 
 export interface RailInput {
   /** How the current selection was made. */
-  selectionKind: "file" | "commit" | "range";
-  /** The commit's changed files, when a commit is selected. */
+  selectionKind: "file" | "commit" | "range" | "compare";
+  /**
+   * The changed files of the selection on screen: the commit's for a commit,
+   * the comparison's for a compare. Null while they have not landed.
+   */
   commitFiles: readonly CommitFileLike[] | null;
-  /** Whether the backend cut the commit's file list short. */
+  /** Whether the backend cut that file list short. */
   commitFilesTruncated: boolean;
-  /** The commit's true file count, when the list was cut short. */
+  /** The true file count, when the list was cut short and the count is known. */
   commitFilesTotal: number;
   /** The working tree's changed files. */
   statuses: readonly WorktreeFileLike[];
@@ -97,19 +100,20 @@ export const EMPTY_RAIL: FileRail = {
 /**
  * Builds the rail for the current selection.
  *
- * A range diff (`from..to`) gets no rail: the backend returns one combined
+ * A range diff (`from...to`) gets no rail: the backend returns one combined
  * patch, not a per-file list, and inventing entries by parsing the diff text
- * would produce a list that silently disagrees with what is on screen.
+ * would produce a list that silently disagrees with what is on screen. A
+ * comparison (`base..target`) does: its file list is a read of its own.
  */
 export function buildFileRail(input: RailInput): FileRail {
-  if (input.selectionKind === "commit") {
+  if (input.selectionKind === "commit" || input.selectionKind === "compare") {
     const files = input.commitFiles;
     // Null means the details have not landed yet — distinct from a commit
     // that genuinely changed nothing, which is why the rail renders nothing
     // rather than an empty list claiming the commit is empty.
     if (!files || files.length === 0) return EMPTY_RAIL;
     return {
-      source: "commit",
+      source: input.selectionKind,
       entries: files.map((file) => ({
         path: file.path,
         statusCode: file.status_code,

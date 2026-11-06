@@ -243,11 +243,12 @@ async function run(){
   await until(()=>!!preview.querySelector('[aria-label="Files in this diff"]'),"reopened rail");
   check("Preview restores a collapsed file rail",!!preview.querySelector('[aria-label="Files in this diff"]'));
   await repoStore.selectCommitDiff("old");await tick();
-  await until(()=>preview.querySelector('button[title="Show recent commits"]'),"commit picker");
-  preview.querySelector('button[title="Show recent commits"]').click();await tick();
-  [...preview.querySelectorAll('button')].find(button=>button.textContent.includes("Uncommitted changes")&&button.title!=="Show recent commits").click();
-  await until(()=>!get(repoStore).selectedCommitId&&!get(repoStore).selectedDiffPending,"diff picker");
-  check("Diff picker reuses uncommitted preview",preview.textContent.includes(`${other} staged modification`));
+  await until(()=>preview.querySelector('[data-history-tab]'),"history tab");
+  preview.querySelector('[data-history-tab]').click();await tick();
+  await until(()=>preview.querySelector('[data-diff-history]'),"history body");
+  [...preview.querySelector('[data-diff-history]').querySelectorAll('button')].find(button=>button.textContent.includes("Uncommitted changes")).click();
+  await until(()=>!get(repoStore).selectedCommitId&&!get(repoStore).selectedDiffPending,"history uncommitted entry");
+  check("History's uncommitted entry reuses the uncommitted preview",preview.textContent.includes(`${other} staged modification`));
   const stash=(index)=>({index,selector:`stash@{${index}}`,oid:"a".repeat(40),subject:"On main: saved work",message:"saved work",branch:"main",timestamp:1700000000});
   stashEntries=[stash(0),stash(1)];stashTruncated=true;
   await repoStore.refresh();await show("RepoPanel");

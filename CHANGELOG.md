@@ -11,7 +11,36 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- **The Diff view has the commit graph beside the diff.** The file rail gets a
+  History tab (⌥H) that draws the Graph view's own lanes, refs and rows at rail
+  size, so opening another commit or comparing two no longer means a trip to the
+  Graph view. It replaces the folded list of the newest 40 commits, which could
+  not show which branch a commit was on. History takes the rail's whole height,
+  so the column never holds two scroll areas, and it loads older history as you
+  scroll toward the end.
+  - **Hover** a commit for the Graph view's card, plus what the row does not
+    carry: the full message body, the commit's plain git note
+    (`refs/notes/commits`) and its recorded GitPulse verification. Each is read
+    once, on a resting pointer, and a note that could not be read says so rather
+    than reading as "no note".
+  - **Compare two commits:** Shift+click one (or use its compare button), then
+    click the other. The diff is the direct change `older..newer`, whichever was
+    picked first. The Files tab lists the comparison's own files, each opening
+    within it, and the image view and hunk labels read the base as the old side.
+  - **Keyboard:** the list takes ↑/↓, Page Up/Down, Home/End, Enter to open,
+    Shift+Enter to start a comparison and Esc to cancel it.
+- New read commands `cmd_get_compare_diff` (whole or one file, with renames
+  paired to their source like a commit's file), `cmd_get_compare_files` (capped,
+  and says when it was cut) and `cmd_get_commit_notes` (batched, input order).
+
 ### Fixed
+
+- **A branch comparison in the Diff view no longer lists the working tree's
+  files.** The file rail guessed the selection's kind from which ids were set, so
+  a range diff (`main...feature`) read as a worktree file and offered your
+  uncommitted files beside it. It now uses the kind the store recorded.
 
 - **A task agent's new worktree starts with a DevMap index instead of a cold
   rebuild.** Lanes under `.gitpulse/worktrees/` now get a copy-on-write clone of

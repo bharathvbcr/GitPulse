@@ -62,7 +62,7 @@ export type ResetMode = "soft" | "mixed" | "keep" | "hard";
 export type IndexAction = "stage" | "unstage";
 
 /** How the current selection was created; decides what a preference flip may refetch. */
-export type SelectionKind = "file" | "commit" | "range";
+export type SelectionKind = "file" | "commit" | "range" | "compare";
 
 export interface FileStatus {
   path: string;
@@ -199,6 +199,11 @@ export interface RepoSession {
   defaultBranch: string | null;
   statuses: FileStatus[];
   selectedCommitId: string | null;
+  /**
+   * The base of a two-commit comparison (`selectedCompareBase..selectedCommitId`),
+   * set only while `selectionKind` is "compare". Every other selection clears it.
+   */
+  selectedCompareBase: string | null;
   selectedFilePath: string | null;
   /** Which worktree side `selectedDiff` was fetched from; false for commit diffs. */
   selectedIsStaged: boolean;
@@ -347,6 +352,8 @@ export interface RepoState {
   defaultBranch: string | null;
   statuses: FileStatus[];
   selectedCommitId: string | null;
+  /** See the session field: the comparison's base while selectionKind is "compare". */
+  selectedCompareBase: string | null;
   selectedFilePath: string | null;
   selectedIsStaged: boolean;
   selectedIgnoreWhitespace: boolean;

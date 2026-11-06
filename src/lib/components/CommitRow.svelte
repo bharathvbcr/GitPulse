@@ -33,20 +33,7 @@
   import { LAYERS } from "../ui/layers";
   import { popover } from "../ui/popover";
 
-  export interface RefItem {
-    name: string;
-    kind: "head" | "current-branch" | "local-branch" | "remote-branch" | "tag" | "other";
-    /**
-     * For a tag: commits it holds that `comparedTo` does not have.
-     *
-     * A tag lane is shaped exactly like an unmerged branch, so the chip is
-     * where the graph can say which it is. Both fields absent means the tag was
-     * never measured (or is past the tag-list cap) — then the chip says nothing
-     * rather than implying the work has landed.
-     */
-    aheadOfBase?: number | null;
-    comparedTo?: string | null;
-  }
+  import type { RefItem } from "../graph/graphDecorations";
 
   let {
     row,

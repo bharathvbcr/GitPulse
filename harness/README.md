@@ -90,10 +90,26 @@ This mounts the existing status bar, sidebars, view/repository tabs, Workspace
 Overview, workspace status, worktree list, Fleet, and `DiffViewer`. Click checks
 start from an old commit and require the requested worktree's changed-file rail
 and actual modifications. They also cover both sides of a partially staged
-file, reopening the collapsed rail, and the diff's change picker. Unexpected
+file and reopening the collapsed rail. Unexpected
 commands and browser runtime errors fail the run. IPC fixtures do not verify
 the installed native app; store tests separately cover failed loads and late
 repository, view, and diff responses.
+
+## Diff history rail
+
+Run `bun run test:browser -- --harness diff-history` or
+`bun run test:webkit -- --harness diff-history`. For interactive inspection,
+open `/harness/diff-history.html` on the development server.
+
+This mounts `DiffViewer` over a fixture graph of two pages (a side branch near
+the top, then a long straight history) and drives the rail's History tab:
+⌥H and the tab buttons, the painted lane gutter beside windowed rows, the hover
+card's message body, git note and provenance (and that a row only swept across
+is never read), opening a commit, arming and cancelling a comparison, the
+older..newer order whichever commit was picked first, the comparison's own file
+list and per-file reads, leaving the comparison, the keyboard cursor, paging
+older history in, and that a range selection does not borrow the working
+tree's files. Unexpected commands and runtime errors fail the run.
 
 ## Command palette
 

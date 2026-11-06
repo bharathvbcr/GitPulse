@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Diff history rail checks</title>
+<style>body{margin:0}#preview{display:flex;height:560px;width:1000px}#result{position:fixed;bottom:8px;right:8px;max-height:30vh;overflow:auto;font:11px monospace;background:#141a29;color:#e9edf8;z-index:100;white-space:pre}</style></head>
+<body><div id="preview"></div><pre id="result"></pre>
+<script type="module">
+/**
+ * The Diff view's History tab, rendered.
+ *
+ * Moving between commits from the Diff view used to mean a trip to the Graph
+ * view. These checks settle, in a real page against fixture IPC, that the
+ * rail's History tab draws the graph the Graph view solved, opens a commit,
+ * compares two commits (older..newer, whichever was picked first) and lists
+ * the comparison's own files, hovers a card with the message body, the git
+ * note and provenance, pages older history in, answers ⌥H and the keyboard,
+ * and that a range selection no longer borrows the working tree's files.
+ * Nothing here executes git.
+ */
+import "../src/app.css";
+import { createChecks } from "./checks.ts";
+const crashes=[], unexpected=[], calls=[];
+window.addEventListener("error",event=>crashes.push(event.message));
+window.addEventListener("unhandledrejection",event=>crashes.push(String(event.reason)));
+const root="/workspace/alpha";
+const hex=(n)=>n.toString(16).padStart(4,"0").repeat(10);
+const TOTAL=200, FIRST_PAGE=120;
+/** A main line with one side branch near the top, then a long straight history. */
+function graphRows(count){
+ const rows=[];
+ for(let i=0;i<count;i++){
+  const side=i===1;
+  rows.push({
+   id:hex(i),parent_ids:i+1<TOTAL?[hex(i===0?2:i+1)]:[],
+   summary:i===3?"":`commit number ${i}`,author_name:i%2?"Bob":"Ada",author_email:i%2?"bob@example.com":"ada@example.com",
+   timestamp:1_700_000_000-i*3600,lane:side?1:0,color_index:side?1:0,
+   active_lanes:i<=1?[0,1]:[0],active_lane_colors:i<=1?[0,1]:[0],
+   connections:i+1<count?[{from_lane:side?1:0,to_lane:0,to_row_offset:i===0?2:1,is_merge:false,color_index:side?1:0,is_dangling:false}]:(i+1<TOTAL?[{from_lane:0,to_lane:0,to_row_offset:1,is_merge:false,color_index:0,is_dangling:true}]:[]),
+   is_merge:i===5,is_root:i===TOTAL-1,is_mainline:!side,
+  });
+ }
+ return rows;
+}
+const status=(path,is_staged=false,status_code="M")=>({path,is_staged,status_code,is_conflicted:false,additions:1,deletions:1});
+const files=[status("worktree-only.ts")];
+const patch=(path,text)=>`diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-previous value\n+${text}\n`;
+let graphFail=false;
+const fixtures={
+ cmd_resolve_repo:a=>({path:a.repoPath,name:a.repoPath.split("/").pop(),is_bare:false}),
+ cmd_get_head_id:()=>hex(0),
+ cmd_codeintel_symbols_for_file:a=>({available:false,head_matches:false,file_path:a.filePath,requested_head_sha:a.headSha,items:[],reason:"no code index in this fixture"}),
+ cmd_apple_intelligence_status:()=>({compiled:false,state:"unsupported_os",reason:"not_compiled",detail:"Not built into this fixture."}),
+ cmd_get_status:()=>files,cmd_list_branches:()=>[],cmd_list_tags:()=>({tags:[],truncated:false}),
+ cmd_repo_operation:()=>null,cmd_stash_list:()=>({entries:[],truncated:false}),cmd_watch_repo:()=>null,cmd_unwatch_repo:()=>null,
+ cmd_list_remotes:()=>({remotes:[],truncated:false}),cmd_list_submodules:()=>({submodules:[],truncated:false}),
+ cmd_pull_rebase_config:()=>null,cmd_set_recent_menu:()=>null,
+ cmd_branch_stats:()=>({updates:[],capped:false,compute_failures:0,compared_to:"main"}),cmd_workspace_sync:()=>({repos:[]}),
+ cmd_devcouncil_init:()=>({repo:root,state_dir:root+"/.devmap",exclude:{status:"already_ignored",source:"harness"},workspace_registry:null,workspace_reason:null,skipped_untrusted:[],skipped_unavailable:[],devmap_available:false}),
+ cmd_devmap_maybe_refresh:()=>({decision:"skip_unavailable",facts:{available:false,is_fresh:false,schema_ok:false,already_building:false},reason:null}),
+ cmd_get_commit_graph:a=>{
+  calls.push({cmd:"cmd_get_commit_graph",args:a});
+  if(graphFail)throw new Error("walk exploded");
+  const count=a.maxCommits>5000?TOTAL:FIRST_PAGE;
+  return {rows:graphRows(count),head_id:hex(0),refs:[{name:"main",kind:"local",commit_id:hex(0),is_head:true},{name:"feature",kind:"local",commit_id:hex(1),is_head:false}],has_more:count<TOTAL,mainline_id:hex(0),mainline_name:"main"};
+ },
+ cmd_get_file_diff:a=>{calls.push({cmd:"cmd_get_file_diff",args:a});return {text:patch(a.filePath,"worktree change"),truncated:false};},
+ cmd_get_commit_diff:a=>{calls.push({cmd:"cmd_get_commit_diff",args:a});return {text:patch("one.ts",`commit ${a.commitId.slice(0,4)}`),truncated:false};},
+ cmd_get_commit_file_diff:a=>{calls.push({cmd:"cmd_get_commit_file_diff",args:a});return {text:patch(a.filePath,`commit file ${a.commitId.slice(0,4)}`),truncated:false};},
+ cmd_get_commit_files:a=>{calls.push({cmd:"cmd_get_commit_files",args:a});return [{path:`file-of-${a.commitId.slice(0,4)}.ts`,status_code:"M",additions:2,deletions:1}];},
+ cmd_get_range_diff:a=>{calls.push({cmd:"cmd_get_range_diff",args:a});return {text:patch("range.ts","range change"),truncated:false};},
+ cmd_get_compare_diff:a=>{calls.push({cmd:"cmd_get_compare_diff",args:a});return {text:patch(a.filePath??"both.ts",`compare ${a.from.slice(0,4)}..${a.to.slice(0,4)}`),truncated:false};},
+ cmd_get_compare_files:a=>{calls.push({cmd:"cmd_get_compare_files",args:a});return {files:[{path:"compared-a.ts",status_code:"M",additions:3,deletions:1},{path:"compared-b.ts",status_code:"R",additions:0,deletions:0}]};},
+ cmd_get_commit_details:a=>{calls.push({cmd:"cmd_get_commit_details",args:a});return {id:a.commitId,parent_ids:[],author_name:"Ada",author_email:"ada@example.com",author_date:"",committer_name:"Ada",committer_email:"ada@example.com",committer_date:"",summary:"s",body:`Body of ${a.commitId.slice(0,4)}: why this change was made.`,co_authors:[],changed_files:[{path:`file-of-${a.commitId.slice(0,4)}.ts`,status_code:"M",additions:2,deletions:1}],total_additions:2,total_deletions:1};},
+ cmd_get_commit_notes:a=>{calls.push({cmd:"cmd_get_commit_notes",args:a});return a.commitIds.map(id=>({commit_id:id,note:id===hex(2)?"Reviewed by Ana — ship it":null}));},
+ // The card renders the body as Markdown, through the same Rust renderer the
+ // details pane uses; the fixture answers as it would for one plain paragraph.
+ cmd_markdown_render:a=>({html:`<p>${a.text.replace(/[<>&]/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;"}[c]))}</p>`,headings:[],frontmatter:[],omittedBytes:0}),
+ cmd_verify_commit_signature:()=>({state:"unsigned",signer:null,key:null,detail:null}),
+ cmd_provenance_freshness_batch:a=>{calls.push({cmd:"cmd_provenance_freshness_batch",args:a});return a.revisions.map(rev=>({commit_sha:rev,distance:rev===hex(2)?0:null,confidence:rev===hex(2)?1:null,is_fresh:rev===hex(2),unmeasured_reason:"",notes_readable:true,verified:rev===hex(2),verification:rev===hex(2)?{verdict:"pass",verified_at:1_700_000_000,checked_by:"ci",task_id:null,details:null}:null,session:null,landed_on_base:null}));},
+ cmd_get_language_stats:()=>({stats:[],truncated:false}),
+ cmd_last_fetch_at:()=>null,cmd_note_tab_activated:()=>null,
+ cmd_get_file_content:()=>"fixture content",
+ cmd_codeintel_impact_at_rung:()=>({source_freshness:{fresh:null,reason:"this query did not verify whole-tree freshness; ask status for a live check"},available:false,reason:"Not indexed in fixture",items:[],shown:0,total:0,truncated:false}),
+ cmd_codeintel_impact_layered_many:()=>[],cmd_codeintel_cancel:()=>null,
+ cmd_devmap_preview_many:()=>[],
+ cmd_task_view:()=>({available:false,store_path:"",leases:[],error:""}),cmd_list_worktrees:()=>[],
+ cmd_repository_trust:()=>({path:root,git_dir:root+"/.git",common_dir:root+"/.git",identity:"fixture-identity",scope:"repository",worktrees:1}),
+ cmd_worktree_task:()=>null,cmd_ledger_tail:()=>[],cmd_grants_view:()=>({available:false,path:"",grants:[],error:""}),
+ cmd_github_context:()=>({available:false,cli_present:false,owner:"",repo:"",pull_requests:[],workflow_runs:[],issues:[],releases:[],warnings:[],error:null}),
+ cmd_collision_risk:()=>({ok:true,error:"",overlapping_files:0,worktrees_involved:0,scanned_worktrees:1,unscanned_worktrees:0,failed_worktrees:0,truncated:false,items:[],shared_worktree_files:0,shared_worktrees:[],sessions_ok:true,sessions_error:""}),
+ cmd_fleet_snapshot:()=>({repos:[],requested:1,scanned:0,anchor_epoch:0,truncated:true,duration_ms:0}),
+};
+window.__TAURI_INTERNALS__={invoke:async(cmd,args)=>{if(cmd.startsWith("plugin:event|"))return 1;if(fixtures[cmd])return fixtures[cmd](args);unexpected.push(cmd);throw Error(`Unconfigured command: ${cmd}`);},transformCallback:cb=>cb};
+const {mount,tick}=await import("svelte");
+const {get}=await import("svelte/store");
+const {repoStore}=await import("../src/lib/stores/repoStore.ts");
+const {graphStore}=await import("../src/lib/stores/graphStore.ts");
+const DiffViewer=(await import("../src/lib/components/DiffViewer.svelte")).default;
+const {results,check,stopped}=createChecks();
+const preview=document.getElementById("preview");
+const wait=(ms=60)=>new Promise(r=>setTimeout(r,ms));
+const until=async(test,label)=>{const end=Date.now()+8000;while(!test()&&Date.now()<end)await wait();if(!test())throw new Error("Timed out: "+label);};
+const text=()=>preview.textContent;
+const rail=()=>preview.querySelector('[aria-label="Files in this diff"]');
+const tab=(name)=>[...(rail()?.querySelectorAll('[role="tab"]')??[])].find(b=>b.textContent.trim().startsWith(name));
+const list=()=>preview.querySelector('[role="listbox"][aria-label^="Commit history"]');
+const row=(i)=>preview.querySelector(`[data-commit-id="${hex(i)}"]`);
+const card=()=>document.querySelector("[data-diff-history-card]");
+const callsOf=(cmd)=>calls.filter(c=>c.cmd===cmd);
+const altH=()=>window.dispatchEvent(new KeyboardEvent("keydown",{key:"˙",code:"KeyH",altKey:true,bubbles:true,cancelable:true}));
+const key=(el,k,extra={})=>el.dispatchEvent(new KeyboardEvent("keydown",{key:k,bubbles:true,cancelable:true,...extra}));
+const pointerEnter=(el)=>el.dispatchEvent(new PointerEvent("pointerenter",{bubbles:false,pointerType:"mouse"}));
+(async()=>{try{
+ await repoStore.openRepo(root);
+ graphStore.showRepo(root);
+ await graphStore.loadGraph(root,"",null);
+ await repoStore.selectFileDiff("worktree-only.ts",false);
+ mount(DiffViewer,{target:preview});
+ await until(()=>rail(),"rail drawn");
+
+ // --- the tab -------------------------------------------------------------
+ check("the rail offers Files and History tabs, Files first",()=>tab("Files")?.getAttribute("aria-selected")==="true"&&tab("History")?.getAttribute("aria-selected")==="false");
+ check("the change line names uncommitted work while it is on screen",()=>rail().querySelector("[data-change-line]").textContent.includes("Uncommitted changes"));
+ altH();await until(()=>list(),"history after ⌥H");
+ check("⌥H opens History, which takes the column instead of stacking over the file list",()=>tab("History").getAttribute("aria-selected")==="true"&&!preview.querySelector('[aria-label="Filter files in this diff"]'));
+ check("History draws the graph's own rows, newest first",()=>row(0)?.textContent.includes("commit number 0")&&row(1)?.textContent.includes("commit number 1"));
+ check("a branch tip carries its branch's name",()=>row(1).textContent.includes("feature")&&row(0).textContent.includes("main"));
+ check("an empty message is named, not a blank row",()=>row(3).textContent.includes("(no commit message)"));
+ check("a merge is said in words for assistive tech",()=>row(5).textContent.includes("merge commit"));
+ const canvas=list().parentElement.querySelector("canvas");
+ check("the lanes are painted beside the rows",()=>canvas&&canvas.getBoundingClientRect().width>=20&&canvas.width>0&&canvas.height>0);
+ check("rows are windowed, not all drawn",()=>preview.querySelectorAll('[role="option"]').length<FIRST_PAGE);
+ check("uncommitted work stays reachable from History",()=>[...rail().querySelectorAll("button")].some(b=>b.textContent.includes("Uncommitted changes")&&b.getAttribute("aria-current")==="true"));
+ altH();await tick();
+ check("⌥H again goes back to Files",()=>tab("Files").getAttribute("aria-selected")==="true");
+ tab("History").click();await until(()=>list(),"history by click");
+
+ // --- hover card ------------------------------------------------------------
+ pointerEnter(row(2));await until(()=>card(),"card");
+ check("hovering a row shows the commit card beside the rail",()=>card().textContent.includes("commit number 2")&&card().getBoundingClientRect().left>=rail().getBoundingClientRect().right-4);
+ await until(()=>card()?.querySelector("[data-card-body]"),"card body");
+ check("the card reads the message body the row does not carry",()=>card().textContent.includes(`Body of ${hex(2).slice(0,4)}`));
+ await until(()=>card()?.querySelector("[data-card-note]"),"card note");
+ check("the card shows the commit's git note",()=>card().querySelector("[data-card-note]").textContent.includes("Reviewed by Ana"));
+ check("notes are read for the hovered commit only",()=>callsOf("cmd_get_commit_notes").every(c=>c.args.commitIds.length===1));
+ await until(()=>card()?.querySelector("[data-card-provenance]"),"provenance");
+ check("the card shows the commit's recorded verification",()=>card().querySelector("[data-card-provenance]").textContent.length>0);
+ check("provenance is one batch for the rows in view",()=>callsOf("cmd_provenance_freshness_batch").length>=1&&callsOf("cmd_provenance_freshness_batch")[0].args.revisions.length>1);
+ const detailReads=callsOf("cmd_get_commit_details").length;
+ pointerEnter(row(4));await wait(80);pointerEnter(row(2));await wait(350);
+ check("hovering back answers from the cache, and a row only swept across is never read",()=>callsOf("cmd_get_commit_details").length===detailReads);
+ list().dispatchEvent(new PointerEvent("pointerleave",{bubbles:false,pointerType:"mouse"}));await tick();
+ check("leaving the list hides the card",()=>!card());
+
+ // --- opening a commit ------------------------------------------------------
+ row(4).click();
+ await until(()=>get(repoStore).selectedCommitId===hex(4)&&!get(repoStore).selectedDiffPending,"commit opened");
+ check("clicking a row opens that commit's first file",()=>get(repoStore).selectedFilePath===`file-of-${hex(4).slice(0,4)}.ts`&&get(repoStore).selectionKind==="commit");
+ check("and brings Files forward with that commit's files",()=>tab("Files").getAttribute("aria-selected")==="true"&&text().includes(`file-of-${hex(4).slice(0,4)}.ts`)&&!text().includes("worktree-only.ts"));
+ check("the change line names the commit on screen",()=>rail().querySelector("[data-change-line]").textContent.includes("commit number 4"));
+
+ // --- comparing two commits ---------------------------------------------------
+ tab("History").click();await until(()=>list(),"history again");
+ row(1).dispatchEvent(new MouseEvent("click",{bubbles:true,shiftKey:true}));await tick();
+ check("Shift+click arms a comparison and says what to do next",()=>preview.querySelector("[data-compare-armed]")?.textContent.includes(hex(1).slice(0,7)));
+ key(list(),"Escape");await tick();
+ check("Escape cancels an armed comparison",()=>!preview.querySelector("[data-compare-armed]"));
+ row(1).dispatchEvent(new MouseEvent("click",{bubbles:true,shiftKey:true}));await tick();
+ row(6).click();
+ await until(()=>get(repoStore).selectionKind==="compare"&&!get(repoStore).selectedDiffPending,"comparison");
+ const cmp=callsOf("cmd_get_compare_diff").at(-1);
+ check("a newer pick first still compares older..newer",()=>cmp.args.from===hex(6)&&cmp.args.to===hex(1)&&cmp.args.filePath===null);
+ check("the comparison is the direct change, not the merge-base range",()=>callsOf("cmd_get_range_diff").length===0&&text().includes(`compare ${hex(6).slice(0,4)}..${hex(1).slice(0,4)}`));
+ await until(()=>text().includes("compared-a.ts"),"compared files");
+ check("the rail lists the comparison's own files under their own heading",()=>text().includes("Compared files")&&text().includes("compared-b.ts")&&!text().includes(`file-of-${hex(1).slice(0,4)}`));
+ check("the change line names the comparison and offers the way out",()=>rail().querySelector("[data-change-line]").textContent.includes(`${hex(6).slice(0,7)}..${hex(1).slice(0,7)}`)&&rail().querySelector("[data-exit-compare]"));
+ [...rail().querySelectorAll("button")].find(b=>b.title==="compared-a.ts").click();
+ await until(()=>get(repoStore).selectedFilePath==="compared-a.ts"&&!get(repoStore).selectedDiffPending,"compared file");
+ check("a compared file opens within the comparison",()=>callsOf("cmd_get_compare_diff").at(-1).args.filePath==="compared-a.ts"&&get(repoStore).selectedCompareBase===hex(6));
+ tab("History").click();await until(()=>list(),"history in compare");
+ check("the comparison's base is marked in the graph",()=>row(6).textContent.includes("base"));
+ tab("Files").click();await tick();
+ rail().querySelector("[data-exit-compare]").click();
+ await until(()=>get(repoStore).selectionKind==="commit"&&get(repoStore).selectedCommitId===hex(1)&&!get(repoStore).selectedDiffPending,"exit compare");
+ check("leaving the comparison shows the newer commit on its own",()=>get(repoStore).selectedCompareBase===null&&text().includes(`file-of-${hex(1).slice(0,4)}`));
+
+ // --- keyboard ----------------------------------------------------------------
+ tab("History").click();await until(()=>list(),"history for keys");
+ list().focus();await tick();
+ key(list(),"ArrowDown");key(list(),"ArrowDown");await tick();
+ check("the arrows move a cursor the list announces",()=>list().getAttribute("aria-activedescendant")===`diff-history-${hex(3)}`);
+ key(list(),"Enter");
+ await until(()=>get(repoStore).selectedCommitId===hex(3)&&!get(repoStore).selectedDiffPending,"enter opens");
+ check("Enter opens the commit under the cursor",()=>get(repoStore).selectionKind==="commit");
+
+ // --- older history -----------------------------------------------------------
+ tab("History").click();await until(()=>list(),"history for paging");
+ const before=callsOf("cmd_get_commit_graph").length;
+ list().scrollTop=list().scrollHeight;list().dispatchEvent(new Event("scroll"));
+ await until(()=>callsOf("cmd_get_commit_graph").length>before,"older page asked");
+ check("scrolling near the end asks for older history",()=>callsOf("cmd_get_commit_graph").at(-1).args.maxCommits>5000);
+ await until(()=>get(graphStore).rows.length===TOTAL,"older page landed");
+ await wait(150);
+ check("the rail ends by saying it reached the start of history",()=>text().includes("Start of the loaded history"));
+
+ // --- a range selection keeps its own rail ---------------------------------------
+ await repoStore.selectRangeDiff("main","feature");
+ await until(()=>get(repoStore).selectionKind==="range"&&!get(repoStore).selectedDiffPending,"range");
+ tab("Files").click();await tick();
+ check("a range selection does not offer the working tree's files",()=>!text().includes("worktree-only.ts"));
+
+ check("No unexpected commands",()=>unexpected.length===0);
+ check("No runtime errors",()=>crashes.length===0);
+}catch(error){stopped(error);}
+ const result={results,crashes,unexpected};window.__gpResult=result;
+ document.documentElement.dataset.gpResult=encodeURIComponent(JSON.stringify(result));
+ document.getElementById("result").textContent=results.map(r=>(r.pass?"ok   ":"FAIL ")+r.name).join("\n");
+ const report=new URLSearchParams(location.search).get("report");if(report)await fetch(report,{method:"POST",body:document.documentElement.outerHTML});
+})();
+</script></body></html>

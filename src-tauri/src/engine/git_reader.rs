@@ -239,6 +239,38 @@ pub struct CommitFileChange {
     pub deletions: usize,
 }
 
+/// The files two commits differ by ([`GitReader::get_compare_files`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompareFiles {
+    pub files: Vec<CommitFileChange>,
+    /// True when the list was cut at its byte budget: `files` is a prefix.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    /// Why it was cut, as a clause the rail renders; absent when whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation_reason: Option<String>,
+}
+
+/// One commit's plain git note ([`GitReader::get_commit_notes`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitNote {
+    pub commit_id: String,
+    /// The note's text, or `None` when the commit carries no note.
+    pub note: Option<String>,
+}
+
+/// How many commits one notes read may name: the hover card asks for one at a
+/// time, so this bounds a caller that asks for a whole history.
+pub const MAX_NOTES_BATCH: usize = 200;
+
+/// What a patch is read from: one commit against its first parent, or the
+/// direct change between two commits.
+#[derive(Debug, Clone, Copy)]
+enum PatchSource<'a> {
+    Commit(&'a str),
+    Between { from: &'a str, to: &'a str },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitDetails {
     pub id: String,
@@ -1509,21 +1541,31 @@ impl GitReader {
         Self::merge_render_args(git_cli::git_supports(git_cli::DIFF_MERGES_OPTION))
     }
 
-    /// The one `git show` argv for a commit's patch, whole or narrowed to
-    /// `pathspecs`. The file list and the details read below take their merge
+    /// The one argv for a patch from `source`, whole or narrowed to
+    /// `pathspecs`. A commit's file list and details take their merge
     /// rendering from [`Self::merge_render_args`] too, so the list, the counts
     /// and the hunks cannot disagree about a merge. A narrowed read must carry
     /// every path a rename or copy pairs (see [`Self::paired_sources`]).
-    fn commit_show_args<'a>(
-        commit_id: &'a str,
+    fn patch_args<'a>(
+        source: PatchSource<'a>,
         pathspecs: &'a [String],
         diff_filter: Option<&'static str>,
     ) -> Vec<&'a str> {
-        let mut args = vec!["-c", "core.quotepath=off", "show", "--unified=3"];
-        args.extend_from_slice(Self::merge_render_args_here());
-        args.extend(diff_filter);
-        args.push("--format=");
-        args.push(commit_id);
+        let mut args = vec!["-c", "core.quotepath=off"];
+        match source {
+            PatchSource::Commit(commit_id) => {
+                args.extend(["show", "--unified=3"]);
+                args.extend_from_slice(Self::merge_render_args_here());
+                args.extend(diff_filter);
+                args.push("--format=");
+                args.push(commit_id);
+            }
+            PatchSource::Between { from, to } => {
+                args.extend(["diff", "--unified=3"]);
+                args.extend(diff_filter);
+                args.extend([from, to]);
+            }
+        }
         if !pathspecs.is_empty() {
             args.push("--");
             args.extend(pathspecs.iter().map(String::as_str));
@@ -1531,25 +1573,33 @@ impl GitReader {
         args
     }
 
-    /// The source paths of the renames and copies the commit shows for `path`
+    /// The source paths of the renames and copies `source` shows for `path`
     /// (or, for a directory, for anything under it), read with the same merge
-    /// rendering and rename detection as the whole-commit view. Git pairs a
-    /// rename only when both its ends survive the pathspec, so a one-path read
-    /// that leaves the old path out shows the new file as wholly added while
-    /// the file list, which was never narrowed, counts it as the rename it is.
+    /// rendering and rename detection as the whole view. Git pairs a rename
+    /// only when both its ends survive the pathspec, so a one-path read that
+    /// leaves the old path out shows the new file as wholly added while the
+    /// file list, which was never narrowed, counts it as the rename it is.
     ///
     /// The second value says why the list was cut at the byte cap, when it
     /// was: a rename whose record fell past the cut stays unpaired and is
     /// shown as an addition, which the caller must report rather than hide.
     fn paired_sources(
         repo: &Path,
-        commit_id: &str,
+        source: PatchSource<'_>,
         path: &str,
     ) -> Result<(Vec<String>, Option<String>), CommandError> {
-        let mut args = vec!["show", "--name-status", "--diff-filter=RC", "-z"];
-        args.extend_from_slice(Self::merge_render_args_here());
-        args.push("--format=");
-        args.push(commit_id);
+        let mut args = Vec::new();
+        match source {
+            PatchSource::Commit(commit_id) => {
+                args.extend(["show", "--name-status", "--diff-filter=RC", "-z"]);
+                args.extend_from_slice(Self::merge_render_args_here());
+                args.push("--format=");
+                args.push(commit_id);
+            }
+            PatchSource::Between { from, to } => {
+                args.extend(["diff", "--name-status", "--diff-filter=RC", "-z", from, to]);
+            }
+        }
         let (stdout, cut) = git_text_capped(repo, &args, budget::MAX_COMMIT_NUMSTAT_BYTES)?;
         Ok((
             parse_paired_sources(&stdout, path),
@@ -1560,7 +1610,10 @@ impl GitReader {
     pub fn get_commit_diff(repo_path: &str, commit_id: &str) -> Result<DiffPayload, CommandError> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
-        Self::capped_diff(&repo, &Self::commit_show_args(commit_id, &[], None))
+        Self::capped_diff(
+            &repo,
+            &Self::patch_args(PatchSource::Commit(commit_id), &[], None),
+        )
     }
 
     pub fn get_commit_file_diff(
@@ -1570,18 +1623,128 @@ impl GitReader {
     ) -> Result<DiffPayload, CommandError> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
-        sandbox_join(&repo, file_path)?;
+        Self::file_diff_paired(&repo, PatchSource::Commit(commit_id), file_path)
+    }
+
+    /// The direct change from `from` to `to` (`git diff from to`, the two-dot
+    /// reading): what the second commit's tree differs by from the first's,
+    /// whatever their history. Not [`Self::get_range_diff`], which diffs from
+    /// the merge base and so shows only the `to` side of a divergence — the
+    /// right answer for "what does this branch add", the wrong one for "how do
+    /// these two commits differ".
+    pub fn get_compare_diff(
+        repo_path: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<DiffPayload, CommandError> {
+        let repo = validate_repo(repo_path)?;
+        validate_oid(from)?;
+        validate_oid(to)?;
+        Self::capped_diff(
+            &repo,
+            &Self::patch_args(PatchSource::Between { from, to }, &[], None),
+        )
+    }
+
+    /// One file of [`Self::get_compare_diff`], with a rename paired to its
+    /// source exactly as a commit's file is.
+    pub fn get_compare_file_diff(
+        repo_path: &str,
+        from: &str,
+        to: &str,
+        file_path: &str,
+    ) -> Result<DiffPayload, CommandError> {
+        let repo = validate_repo(repo_path)?;
+        validate_oid(from)?;
+        validate_oid(to)?;
+        Self::file_diff_paired(&repo, PatchSource::Between { from, to }, file_path)
+    }
+
+    /// The files [`Self::get_compare_diff`] changes, with their counts, capped
+    /// like a commit's list and saying so when it was cut.
+    pub fn get_compare_files(
+        repo_path: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<CompareFiles, CommandError> {
+        let repo = validate_repo(repo_path)?;
+        validate_oid(from)?;
+        validate_oid(to)?;
+        let args = ["diff", "--numstat", "-z", from, to];
+        let (stdout, cut) = git_text_capped(&repo, &args, budget::MAX_COMMIT_NUMSTAT_BYTES)?;
+        Ok(CompareFiles {
+            files: parse_numstat_files(&stdout),
+            truncated: cut.is_some(),
+            truncation_reason: cut.map(|reason| reason.describe()),
+        })
+    }
+
+    /// The plain git note (the default notes ref, `refs/notes/commits` unless
+    /// `core.notesRef` says otherwise) attached to each of `commit_ids`, in
+    /// input order. One `git log --no-walk` for the whole batch. A commit with
+    /// no note answers `None`, which is a measured "no note", never a failed
+    /// read: a failed read fails the call.
+    pub fn get_commit_notes(
+        repo_path: &str,
+        commit_ids: &[String],
+    ) -> Result<Vec<CommitNote>, CommandError> {
+        let repo = validate_repo(repo_path)?;
+        if commit_ids.len() > MAX_NOTES_BATCH {
+            return Err(format!(
+                "asked for the notes of {} commits; at most {MAX_NOTES_BATCH} are read at once",
+                commit_ids.len()
+            )
+            .into());
+        }
+        for id in commit_ids {
+            validate_oid(id)?;
+        }
+        if commit_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args = vec![
+            "log",
+            "--no-walk=unsorted",
+            "--notes",
+            "--format=%H%x00%N%x1e",
+        ];
+        args.extend(commit_ids.iter().map(String::as_str));
+        let (stdout, cut) = git_text_capped(&repo, &args, budget::MAX_COMMIT_NUMSTAT_BYTES)?;
+        if let Some(reason) = cut {
+            return Err(format!("the notes could not be read whole: {}", reason.describe()).into());
+        }
+        let by_id = parse_commit_notes(&stdout);
+        Ok(commit_ids
+            .iter()
+            .map(|id| CommitNote {
+                commit_id: id.clone(),
+                note: by_id
+                    .iter()
+                    .find(|(full, _)| full.starts_with(id.as_str()))
+                    .and_then(|(_, note)| note.clone()),
+            })
+            .collect())
+    }
+
+    /// One path of a patch from `source`, with renames and copies paired to
+    /// their sources so the file reads as the rename it is.
+    fn file_diff_paired(
+        repo: &Path,
+        source: PatchSource<'_>,
+        file_path: &str,
+    ) -> Result<DiffPayload, CommandError> {
+        sandbox_join(repo, file_path)?;
         let mut specs = vec![literal_pathspec(file_path)];
-        let narrowed = Self::capped_diff(&repo, &Self::commit_show_args(commit_id, &specs, None))?;
+        let narrowed = Self::capped_diff(repo, &Self::patch_args(source, &specs, None))?;
         // Only an added file can be the other end of a rename or copy, so a
         // modified or deleted one costs exactly the one `git show` above, and
         // no path costs more than three.
         if !has_new_file_section(&narrowed.text) {
             return Ok(narrowed);
         }
-        let (sources, list_cut) = Self::paired_sources(&repo, commit_id, file_path)?;
+        let (sources, list_cut) = Self::paired_sources(repo, source, file_path)?;
         if sources.is_empty() {
-            return Ok(Self::note_pairing_list_cut(narrowed, list_cut));
+            return Ok(Self::note_pairing_list_cut(narrowed, list_cut, source));
         }
         // A file is read as added, copied or renamed whatever happened to its
         // source, so the source's own edit is left out of the read; a
@@ -1598,28 +1761,33 @@ impl GitReader {
                 <= MAX_PAIRED_SOURCE_BYTES;
         let read = if fits {
             specs.extend(sources.iter().map(|source| literal_pathspec(source)));
-            Self::capped_diff(
-                &repo,
-                &Self::commit_show_args(commit_id, &specs, diff_filter),
-            )?
+            Self::capped_diff(repo, &Self::patch_args(source, &specs, diff_filter))?
         } else {
-            Self::capped_diff(&repo, &Self::commit_show_args(commit_id, &[], diff_filter))?
+            Self::capped_diff(repo, &Self::patch_args(source, &[], diff_filter))?
         };
         // The source pathspecs can pull in another file's section (an old path
         // reused by a new file), and the whole read is every file's.
         let paired = keep_payload_under(read, file_path).unwrap_or(narrowed);
-        Ok(Self::note_pairing_list_cut(paired, list_cut))
+        Ok(Self::note_pairing_list_cut(paired, list_cut, source))
     }
 
     /// `payload` marked incomplete when the rename list it was paired from was
     /// cut: the text is not a prefix, but it may show a rename as an addition,
     /// and a view that may be wrong must not read as a whole one. The reason is
     /// a clause the viewer renders after "This diff".
-    fn note_pairing_list_cut(mut payload: DiffPayload, list_cut: Option<String>) -> DiffPayload {
+    fn note_pairing_list_cut(
+        mut payload: DiffPayload,
+        list_cut: Option<String>,
+        source: PatchSource<'_>,
+    ) -> DiffPayload {
         if let Some(reason) = list_cut {
+            let whose = match source {
+                PatchSource::Commit(_) => "the commit's",
+                PatchSource::Between { .. } => "the comparison's",
+            };
             payload.truncated = true;
             payload.truncation_reason.get_or_insert(format!(
-                "may show a renamed file as added: the commit's list of renames and copies {reason}"
+                "may show a renamed file as added: {whose} list of renames and copies {reason}"
             ));
         }
         payload
@@ -6124,6 +6292,28 @@ fn parse_paired_sources(stdout: &str, path: &str) -> Vec<String> {
         }
     }
     sources
+}
+
+/// Reads `git log --format=%H%x00%N%x1e` into (full id, note) pairs. Git ends
+/// a note with a newline of its own and `--format` puts one between records;
+/// both are layout, not note text. A blank note is no note.
+fn parse_commit_notes(stdout: &str) -> Vec<(String, Option<String>)> {
+    stdout
+        .split('\u{1e}')
+        .filter_map(|record| {
+            let record = record.trim_start_matches('\n');
+            let (id, note) = record.split_once('\0')?;
+            let id = id.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let note = note.trim_end_matches('\n');
+            Some((
+                id.to_string(),
+                (!note.trim().is_empty()).then(|| note.to_string()),
+            ))
+        })
+        .collect()
 }
 
 /// Whether a patch has a section that adds a whole file, the only section a
@@ -10786,6 +10976,188 @@ diff --git a/mode.sh b/mode.sh\nold mode 100644\nnew mode 100755\n";
         assert!(one.contains("new name.txt"), "{one}");
     }
 
+    /// Two commits on diverged branches: the compare read is the direct
+    /// two-dot change (both sides' edits), where the range read is the
+    /// merge-base one (only the `to` side's). The two must not converge.
+    #[test]
+    fn compare_diff_is_the_direct_change_not_the_merge_base_one() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("shared.txt"), "base\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "base"]);
+        git_in(dir.path(), &["checkout", "-q", "-b", "side"]);
+        std::fs::write(dir.path().join("side.txt"), "side\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "side work"]);
+        let side = rev_parse_at(dir.path(), "HEAD");
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        std::fs::write(dir.path().join("shared.txt"), "main edit\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "main work"]);
+        let main = rev_parse_at(dir.path(), "HEAD");
+
+        let direct = GitReader::get_compare_diff(path, &side, &main)
+            .expect("compare")
+            .text;
+        assert!(
+            direct.contains("diff --git a/side.txt"),
+            "side's file leaves: {direct}"
+        );
+        assert!(
+            direct.contains("+main edit"),
+            "main's edit arrives: {direct}"
+        );
+
+        let merge_base = GitReader::get_range_diff(path, &side, &main)
+            .expect("range")
+            .text;
+        assert!(!merge_base.contains("side.txt"), "{merge_base}");
+        assert!(merge_base.contains("+main edit"), "{merge_base}");
+
+        let files = GitReader::get_compare_files(path, &side, &main).expect("files");
+        let mut names: Vec<&str> = files.files.iter().map(|f| f.path.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["shared.txt", "side.txt"]);
+        assert!(!files.truncated && files.truncation_reason.is_none());
+        let shared = files.files.iter().find(|f| f.path == "shared.txt").unwrap();
+        assert_eq!((shared.additions, shared.deletions), (1, 1));
+
+        let one = GitReader::get_compare_file_diff(path, &side, &main, "shared.txt")
+            .expect("one file")
+            .text;
+        assert!(
+            one.contains("+main edit") && !one.contains("side.txt"),
+            "{one}"
+        );
+    }
+
+    /// A file renamed between the two commits reads as the rename it is, not
+    /// as a new file, through the same pairing a commit's file uses.
+    #[test]
+    fn compare_file_diff_pairs_a_rename_with_its_source() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("old.txt"), "l1\nl2\nl3\nl4\nl5\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "old"]);
+        let before = rev_parse_at(dir.path(), "HEAD");
+        git_in(dir.path(), &["mv", "old.txt", "new name.txt"]);
+        git_in(dir.path(), &["commit", "-m", "rename"]);
+        std::fs::write(dir.path().join("other.txt"), "o\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "other"]);
+        let after = rev_parse_at(dir.path(), "HEAD");
+
+        let one = GitReader::get_compare_file_diff(path, &before, &after, "new name.txt")
+            .expect("renamed file")
+            .text;
+        assert!(one.contains("rename from old.txt"), "{one}");
+        assert!(!one.contains("new file mode"), "{one}");
+        assert!(!one.contains("other.txt"), "{one}");
+
+        let files = GitReader::get_compare_files(path, &before, &after).expect("files");
+        let renamed = files
+            .files
+            .iter()
+            .find(|f| f.path == "new name.txt")
+            .expect("listed");
+        assert_eq!(renamed.status_code, "R");
+    }
+
+    /// The compare reads take commit ids only: a ref name, an option-shaped
+    /// argument or a range is refused before git runs.
+    #[test]
+    fn compare_reads_refuse_anything_but_commit_ids() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "a"]);
+        let head = rev_parse_at(dir.path(), "HEAD");
+        for bad in ["main", "--output=x", "a..b", ""] {
+            assert!(
+                GitReader::get_compare_diff(path, bad, &head).is_err(),
+                "{bad:?}"
+            );
+            assert!(
+                GitReader::get_compare_diff(path, &head, bad).is_err(),
+                "{bad:?}"
+            );
+            assert!(
+                GitReader::get_compare_files(path, bad, &head).is_err(),
+                "{bad:?}"
+            );
+            assert!(
+                GitReader::get_compare_file_diff(path, &head, bad, "a.txt").is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(GitReader::get_compare_file_diff(path, &head, &head, "../escape").is_err());
+    }
+
+    /// Notes come back in input order, one row per id, `None` where a commit
+    /// carries none; an abbreviated id finds its commit's note.
+    #[test]
+    fn commit_notes_answer_each_id_in_order() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "first"]);
+        let first = rev_parse_at(dir.path(), "HEAD");
+        std::fs::write(dir.path().join("a.txt"), "b\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "second"]);
+        let second = rev_parse_at(dir.path(), "HEAD");
+        git_in(
+            dir.path(),
+            &[
+                "notes",
+                "add",
+                "-m",
+                "reviewed by Ana\n\nsecond line",
+                &first,
+            ],
+        );
+
+        let notes = GitReader::get_commit_notes(path, &[second.clone(), first[..12].to_string()])
+            .expect("notes");
+        assert_eq!(
+            notes,
+            vec![
+                CommitNote {
+                    commit_id: second.clone(),
+                    note: None
+                },
+                CommitNote {
+                    commit_id: first[..12].to_string(),
+                    note: Some("reviewed by Ana\n\nsecond line".to_string()),
+                },
+            ]
+        );
+        assert!(GitReader::get_commit_notes(path, &[])
+            .expect("empty")
+            .is_empty());
+        assert!(GitReader::get_commit_notes(path, &["HEAD".to_string()]).is_err());
+        let too_many = vec![second; MAX_NOTES_BATCH + 1];
+        assert!(GitReader::get_commit_notes(path, &too_many).is_err());
+    }
+
+    #[test]
+    fn parse_commit_notes_keeps_note_text_and_drops_layout() {
+        let out = "aaa\0first line\n\nthird\n\n\u{1e}\nbbb\0\n\u{1e}\nccc\0   \n\u{1e}\n";
+        assert_eq!(
+            parse_commit_notes(out),
+            vec![
+                ("aaa".to_string(), Some("first line\n\nthird".to_string())),
+                ("bbb".to_string(), None),
+                ("ccc".to_string(), None),
+            ]
+        );
+        assert!(parse_commit_notes("").is_empty());
+    }
+
     /// Without `--diff-merges` (git < 2.31) the same first-parent rendering is
     /// spelled `-m --first-parent`; the modern spelling must not leak into it.
     #[test]
@@ -14919,6 +15291,7 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
         let marked = GitReader::note_pairing_list_cut(
             whole.clone(),
             Some(git_cli::Incomplete::OverCap(4 * 1024 * 1024).describe()),
+            PatchSource::Commit("abc"),
         );
         assert!(marked.truncated);
         let reason = marked.truncation_reason.unwrap();
@@ -14932,12 +15305,17 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
             truncation_reason: Some("could not be read to the end (eof)".to_string()),
             ..whole.clone()
         };
-        let kept = GitReader::note_pairing_list_cut(already, Some("x".to_string()));
+        let kept = GitReader::note_pairing_list_cut(
+            already,
+            Some("x".to_string()),
+            PatchSource::Commit("abc"),
+        );
         assert_eq!(
             kept.truncation_reason.as_deref(),
             Some("could not be read to the end (eof)")
         );
-        let untouched = GitReader::note_pairing_list_cut(whole.clone(), None);
+        let untouched =
+            GitReader::note_pairing_list_cut(whole.clone(), None, PatchSource::Commit("abc"));
         assert_eq!(
             (
                 untouched.text,
@@ -14987,10 +15365,31 @@ diff --git \"a/\\\"lead.txt\" \"b/\\\"lead.txt\"\nnew file mode 100644\nindex 0.
                 truncation_reason: None,
             },
             Some("exceeded 4 MB".into()),
+            PatchSource::Commit("abc"),
         );
         assert!(
             marked.truncated && marked.truncation_reason.is_some(),
             "{marked:?}"
+        );
+        // A comparison's cut names the comparison, not "the commit".
+        let compared = GitReader::note_pairing_list_cut(
+            DiffPayload {
+                text: String::new(),
+                truncated: false,
+                truncation_reason: None,
+            },
+            Some("exceeded 4 MB".into()),
+            PatchSource::Between {
+                from: "abc",
+                to: "def",
+            },
+        );
+        assert!(
+            compared
+                .truncation_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("the comparison's list")),
+            "{compared:?}"
         );
     }
 

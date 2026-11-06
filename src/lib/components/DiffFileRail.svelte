@@ -14,16 +14,23 @@
    * that cannot be told apart, every one of them a tab stop in the DOM. Rows
    * are labelled by `railRows` now (shortest unique path suffix, or the
    * shared explorer's tree), filtered, and windowed.
+   *
+   * Two tabs share the column: Files (which file of this change) and History
+   * (which change: the commit graph, rendered by the caller's `history`
+   * snippet). One tab at a time owns the whole height, so the column never
+   * holds two scrollers competing for one wheel event.
    */
+  import type { Snippet } from "svelte";
   import {
     ChevronDown,
     ChevronRight,
     FileCode,
     Filter,
+    GitBranch,
     GitCommitHorizontal,
+    GitCompareArrows,
     ListTree,
     PanelLeftClose,
-    Pencil,
     Rows3,
     X,
   } from "@lucide/svelte";
@@ -35,58 +42,52 @@
     type RailMode,
     type RailRow,
   } from "../diff/railRows";
-  import {
-    commitLabel,
-    isCurrentCommit,
-    pickerNote,
-    type CommitEntry,
-    type CommitRail,
-  } from "../diff/commitRail";
-  import { shortHash } from "../format";
-  import { timestampFormat } from "../ui/timestampFormat";
+  import type { RailTab } from "../diff/historyRail";
+  import { crossfade } from "svelte/transition";
+  import { isMacOS } from "../platform";
+  import { liquidSelection } from "../ui/transitions";
+  import { hostPlatform } from "../stores/platformStore";
+  import { shortcutTextLabel } from "../ui/platformCopy";
   import VirtualList from "./VirtualList.svelte";
   import ScrollCue from "./ScrollCue.svelte";
   import type { PreviewMarker } from "../codeintel/previewSummary";
 
   let {
     rail,
-    commits,
     currentPath,
     currentIsStaged,
-    selectedCommitId,
-    workingTreeCount,
+    changeLabel,
+    comparing = null,
+    onExitCompare,
     onOpen,
-    onPickCommit,
-    onPickWorkingTree,
     onCollapse,
     width = 248,
     onResize,
-    commitsOpen = $bindable(false),
+    tab = $bindable<RailTab>("files"),
+    history,
     /** A1 markers from the shared preview store — not a second query path. */
     previewMarkers = null,
   }: {
     rail: FileRail;
-    /** Recent commits, so moving BETWEEN changes needs no trip to Graph. */
-    commits: CommitRail;
     currentPath: string | null;
     currentIsStaged: boolean;
-    selectedCommitId: string | null;
-    /** Uncommitted files; -1 when the count is not known. */
-    workingTreeCount: number;
+    /** What is on screen, in words: a commit's summary, or uncommitted work. */
+    changeLabel: string;
+    /** `base..target` while a comparison is on screen; null otherwise. */
+    comparing?: string | null;
+    /** Leaves the comparison for its target commit. */
+    onExitCompare?: () => void;
     onOpen: (entry: RailEntry) => void;
-    onPickCommit: (entry: CommitEntry) => void;
-    onPickWorkingTree: () => void;
     onCollapse: () => void;
     width?: number;
     onResize?: (next: number) => void;
     /**
-     * Whether the change picker is unfolded.
-     *
-     * Owned by the caller so the choice survives a file switch, and so the
-     * open state is reachable without a click — a folded section is invisible
-     * to anything that renders the component once.
+     * Which tab is showing. Owned by the caller so it survives a file switch
+     * and so a shortcut outside the rail can flip it.
      */
-    commitsOpen?: boolean;
+    tab?: RailTab;
+    /** The History tab's body; the tab is offered only when one is given. */
+    history?: Snippet;
     previewMarkers?: Map<string, PreviewMarker> | null;
   } = $props();
 
@@ -98,22 +99,25 @@
    */
   const VIRTUALIZE_ABOVE = 60;
 
+  /** The tab strip wears the header's glass pill on macOS, like every other tablist. */
+  const macos = isMacOS();
+  const [sendSelection, receiveSelection] = crossfade(liquidSelection());
+
   let query = $state("");
   let mode = $state<RailMode>("list");
   let collapsed = $state<Set<string>>(new Set());
-  // The picker starts folded (see `commitsOpen` above). It used to be a
-  // permanently open 208px scroll box stacked above a second scroll box,
-  // inside a 224px column — two nested scrollers competing for one wheel
-  // event. It answers "which change", asked once per visit; the file list
-  // answers "which file", asked constantly.
   let listScroll = $state(0);
-  let commitScroller: HTMLDivElement | undefined = $state();
   let fileListEl: HTMLUListElement | undefined = $state();
 
   const note = $derived(truncationNote(rail));
-  const commitNote = $derived(pickerNote(commits));
-  /** True while the diff on screen is uncommitted work rather than a commit. */
-  const onWorkingTree = $derived(selectedCommitId === null);
+  const showingHistory = $derived(tab === "history" && history !== undefined);
+  const filesHeading = $derived(
+    rail.source === "commit"
+      ? "Commit files"
+      : rail.source === "compare"
+        ? "Compared files"
+        : "Changed files",
+  );
 
   const result = $derived(
     buildRailRows({
@@ -235,33 +239,64 @@
   style="width: {width}px"
   aria-label="Files in this diff"
 >
-  <!-- Which change: uncommitted work, or one of the recent commits. Folded by
-       default; the file list below is what gets used every few seconds. -->
-  <div class="flex items-center gap-1.5 border-b border-border/60 gp-section-edge px-2 py-1.5">
-    <button
-      type="button"
-      class="flex min-w-0 flex-1 items-center gap-1.5 rounded px-1 py-0.5 text-left hover:bg-surfaceHover"
-      aria-expanded={commitsOpen}
-      onclick={() => (commitsOpen = !commitsOpen)}
-      title="Show recent commits"
-    >
-      {#if commitsOpen}
-        <ChevronDown size={12} class="shrink-0 text-textMuted" />
-      {:else}
-        <ChevronRight size={12} class="shrink-0 text-textMuted" />
-      {/if}
-      <GitCommitHorizontal size={12} class="shrink-0 text-accent" />
-      <span class="text-[11px] font-semibold text-textPrimary">Change</span>
-      <span class="min-w-0 flex-1 truncate text-[10px] text-textMuted">
-        {onWorkingTree
-          ? "Uncommitted changes"
-          : commits.entries.find((c) => isCurrentCommit(c, selectedCommitId))
-            ? commitLabel(commits.entries.find((c) => isCurrentCommit(c, selectedCommitId))!)
-            : selectedCommitId
-              ? shortHash(selectedCommitId)
-              : ""}
-      </span>
-    </button>
+  <!-- Which tab, and which change is on screen. The change line answers
+       "what am I looking at" from either tab, so neither has to be opened to
+       find out. -->
+  <div class="flex items-center gap-1.5 border-b border-border/60 gp-section-edge px-2 py-1">
+    {#if history}
+      <div class="gp-segmented p-0.5!" class:gp-liquid-tabs={macos} role="tablist" aria-label="File rail">
+        <button
+          type="button"
+          role="tab"
+          class="gp-seg-btn flex items-center gap-1 px-1.5! py-0.5! text-[10px]"
+          aria-selected={!showingHistory}
+          data-active={!showingHistory ? "true" : "false"}
+          title="Files in this change"
+          onclick={() => (tab = "files")}
+        >
+          {#if macos && !showingHistory}
+            <span
+              class="gp-liquid-selection gp-gpu"
+              aria-hidden="true"
+              in:receiveSelection={{ key: "rail-tab" }}
+              out:sendSelection={{ key: "rail-tab" }}
+            ></span>
+          {/if}
+          <span class="flex items-center gap-1">
+            <FileCode size={11} />
+            Files
+            <span class="tabular-nums opacity-70">{rail.entries.length}</span>
+          </span>
+        </button>
+        <button
+          type="button"
+          role="tab"
+          class="gp-seg-btn flex items-center gap-1 px-1.5! py-0.5! text-[10px]"
+          aria-selected={showingHistory}
+          data-active={showingHistory ? "true" : "false"}
+          title="Commit history — pick or compare commits ({shortcutTextLabel('⌥H', $hostPlatform.os)})"
+          onclick={() => (tab = "history")}
+          data-history-tab
+        >
+          {#if macos && showingHistory}
+            <span
+              class="gp-liquid-selection gp-gpu"
+              aria-hidden="true"
+              in:receiveSelection={{ key: "rail-tab" }}
+              out:sendSelection={{ key: "rail-tab" }}
+            ></span>
+          {/if}
+          <span class="flex items-center gap-1">
+            <GitBranch size={11} />
+            History
+          </span>
+        </button>
+      </div>
+    {:else}
+      <FileCode size={12} class="shrink-0 text-accent" />
+      <span class="text-[11px] font-semibold text-textPrimary">{filesHeading}</span>
+    {/if}
+    <span class="flex-1"></span>
     <button
       type="button"
       class="gp-icon-btn p-1!"
@@ -273,65 +308,40 @@
     </button>
   </div>
 
-  {#if commitsOpen}
-    <div class="relative max-h-56 shrink-0">
-    <div bind:this={commitScroller} class="max-h-56 overflow-y-auto gp-scroll border-b border-border/60 py-1">
-      <!-- Uncommitted work is first because it is what a reader is most often
-           coming back to, and it is the one entry that is not in the graph. -->
-      <button
-        type="button"
-        class="flex w-full items-center gap-1.5 px-2.5 py-1 text-left text-[11px] hover:bg-surfaceHover {onWorkingTree
-          ? 'bg-accent/10 text-accent'
-          : 'text-textMuted'}"
-        aria-current={onWorkingTree ? "true" : undefined}
-        onclick={onPickWorkingTree}
-      >
-        <Pencil size={11} class="shrink-0" />
-        <span class="min-w-0 flex-1 truncate">Uncommitted changes</span>
-        <!-- -1 is "not counted"; rendering it as 0 would report an unscanned
-             working tree as clean. -->
-        {#if workingTreeCount > 0}
-          <span class="shrink-0 font-mono text-[9px]">{workingTreeCount}</span>
-        {:else if workingTreeCount === 0}
-          <span class="shrink-0 text-[9px]">clean</span>
-        {/if}
-      </button>
-
-      {#each commits.entries as commit (commit.id)}
-        {@const active = isCurrentCommit(commit, selectedCommitId)}
+  <div
+    class="flex items-center gap-1.5 border-b border-border/60 px-2.5 py-1 text-[10px]"
+    data-change-line
+  >
+    {#if comparing}
+      <GitCompareArrows size={11} class="shrink-0 text-accent" />
+      <span class="min-w-0 flex-1 truncate text-textPrimary" title="Comparing {comparing}">
+        Comparing <span class="font-mono">{comparing}</span>
+      </span>
+      {#if onExitCompare}
         <button
           type="button"
-          class="flex w-full items-start gap-1.5 px-2.5 py-1 text-left text-[11px] hover:bg-surfaceHover {active
-            ? 'bg-accent/10 text-accent'
-            : 'text-textMuted'}"
-          aria-current={active ? "true" : undefined}
-          title={commitLabel(commit)}
-          onclick={() => onPickCommit(commit)}
+          class="gp-icon-btn p-0.5!"
+          title="Stop comparing and show the newer commit alone"
+          aria-label="Stop comparing"
+          onclick={onExitCompare}
+          data-exit-compare
         >
-          <span class="mt-px shrink-0 font-mono text-[9px] opacity-70">{shortHash(commit.id)}</span>
-          <span class="min-w-0 flex-1">
-            <span class="block truncate">{commitLabel(commit)}</span>
-            <span class="block truncate text-[9px] opacity-70">
-              {commit.authorName} · {$timestampFormat.text(commit.timestamp)}{commit.isMerge
-                ? " · merge"
-                : ""}
-            </span>
-          </span>
+          <X size={11} />
         </button>
-      {/each}
-
-      {#if commitNote}
-        <p class="px-2.5 py-1 text-[9px] text-textMuted">{commitNote}</p>
       {/if}
-    </div>
-    <ScrollCue target={commitScroller} axis="y" />
-    </div>
-  {/if}
+    {:else}
+      <GitCommitHorizontal size={11} class="shrink-0 text-accent" />
+      <span class="min-w-0 flex-1 truncate text-textMuted" title={changeLabel}>{changeLabel}</span>
+    {/if}
+  </div>
 
+  {#if showingHistory && history}
+    {@render history()}
+  {:else}
   <div class="flex items-center gap-1.5 border-b border-border/60 gp-section-edge px-2.5 py-1.5">
     <FileCode size={12} class="shrink-0 text-accent" />
     <span class="text-[11px] font-semibold text-textPrimary">
-      {rail.source === "commit" ? "Commit files" : "Changed files"}
+      {filesHeading}
     </span>
     <span class="ml-auto text-[10px] tabular-nums text-textMuted">{rail.entries.length}</span>
     <div class="gp-segmented p-0.5!" role="group" aria-label="File list layout">
@@ -486,6 +496,7 @@
     </ul>
     <ScrollCue target={fileListEl} axis="y" />
     </div>
+  {/if}
   {/if}
 
   {#if onResize}

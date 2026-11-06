@@ -80,6 +80,40 @@ pub async fn cmd_get_range_diff(
     off_thread(move || GitReader::get_range_diff(&repo_path, &from, &to)).await
 }
 
+/// The direct change between two commits, `from..to` (see
+/// [`GitReader::get_compare_diff`]); with `file_path`, that one file of it.
+#[tauri::command(async)]
+pub async fn cmd_get_compare_diff(
+    repo_path: String,
+    from: String,
+    to: String,
+    file_path: Option<String>,
+) -> Result<DiffPayload, IpcError> {
+    off_thread(move || match file_path {
+        Some(path) => GitReader::get_compare_file_diff(&repo_path, &from, &to, &path),
+        None => GitReader::get_compare_diff(&repo_path, &from, &to),
+    })
+    .await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_get_compare_files(
+    repo_path: String,
+    from: String,
+    to: String,
+) -> Result<CompareFiles, IpcError> {
+    off_thread(move || GitReader::get_compare_files(&repo_path, &from, &to)).await
+}
+
+/// Plain git notes for a batch of commits, in input order.
+#[tauri::command(async)]
+pub async fn cmd_get_commit_notes(
+    repo_path: String,
+    commit_ids: Vec<String>,
+) -> Result<Vec<CommitNote>, IpcError> {
+    off_thread(move || GitReader::get_commit_notes(&repo_path, &commit_ids)).await
+}
+
 #[tauri::command(async)]
 pub async fn cmd_get_commit_files(
     repo_path: String,

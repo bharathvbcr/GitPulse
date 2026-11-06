@@ -18,7 +18,12 @@
     type GraphTheme,
     type VisualCommitRow,
   } from "../canvas/GraphRenderer";
-  import { authorIdentity } from "../authors/authorIdentity";
+  import {
+    authorCountFor as authorCountIn,
+    buildCloseTargets,
+    buildRefsByCommit,
+    countCommitsByAuthor,
+  } from "../graph/graphDecorations";
   import { formatTimestamp } from "../ui/timestampStyle";
   import { acquireGpu2dContext } from "../canvas/gpuContext";
   import { diagnostics } from "../diagnostics/diagnostics";
@@ -72,7 +77,7 @@
    */
   const COMMIT_OVERSCAN = 8;
   import { LAYERS } from "../ui/layers";
-  import CommitRow, { type RefItem } from "./CommitRow.svelte";
+  import CommitRow from "./CommitRow.svelte";
   import GraphNodeTooltip from "./GraphNodeTooltip.svelte";
   import ScrollCue from "./ScrollCue.svelte";
   import GraphClipNotice from "./GraphClipNotice.svelte";
@@ -243,39 +248,13 @@
    * first, then name) so display-name changes do not split one person's
    * count. Memoized on `filteredRows` identity by `$derived`.
    */
-  let authorCommitCounts = $derived.by(() => {
-    const counts = new Map<string, number>();
-    for (const row of filteredRows) {
-      const key = authorIdentity(row.author_name, row.author_email).key;
-      counts.set(key, (counts.get(key) ?? 0) + 1);
-    }
-    return counts;
-  });
+  let authorCommitCounts = $derived(countCommitsByAuthor(filteredRows));
 
-  /**
-   * Merge destination per closing commit: the parent a commit's
-   * first-parent edge lands on when it leaves its own column. This is the
-   * relationship the graph draws as a descending connector; rows carry it
-   * as screen-reader text and both tooltip modes name it, so the
-   * information is never pointer-only.
-   */
-  let closeTargetById = $derived.by(() => {
-    const map = new Map<string, VisualCommitRow>();
-    for (let i = 0; i < filteredRows.length; i++) {
-      const first = filteredRows[i].connections?.[0];
-      if (!first || first.is_dangling || first.is_merge) continue;
-      if (!Number.isFinite(first.to_lane) || first.to_lane === first.from_lane) continue;
-      const target = i + first.to_row_offset;
-      if (!Number.isFinite(target) || target <= i || target >= filteredRows.length) continue;
-      map.set(filteredRows[i].id, filteredRows[target]);
-    }
-    return map;
-  });
+  /** Merge destination per closing commit; see `buildCloseTargets`. */
+  let closeTargetById = $derived(buildCloseTargets(filteredRows));
 
   function authorCountFor(row: VisualCommitRow): number | null {
-    return (
-      authorCommitCounts.get(authorIdentity(row.author_name, row.author_email).key) ?? null
-    );
+    return authorCountIn(authorCommitCounts, row);
   }
 
   /** One spoken sentence carrying what the tooltip card shows. */
@@ -349,56 +328,7 @@
     schedulePaint();
   }
 
-  // The tag listing the sidebar already loaded carries each tag's standing
-  // against the default base. Reusing it costs the graph nothing: no extra
-  // command, no extra git process on a path that runs on every repo switch.
-  // A tag past the listing's cap is simply absent, and an absent tag makes no
-  // claim rather than a false one.
-  let tagStanding = $derived.by(() => {
-    const map = new Map<string, { ahead: number; base: string | null }>();
-    for (const tag of $repoStore.tags) {
-      map.set(tag.name, {
-        ahead: tag.commits_ahead_of_base,
-        base: tag.compared_to ?? null,
-      });
-    }
-    return map;
-  });
-
-  let refsByCommit = $derived.by(() => {
-    const map = new Map<string, RefItem[]>();
-    for (const ref of $graphStore.refs) {
-      const kind: RefItem["kind"] =
-        ref.kind === "head"
-          ? "head"
-          : ref.kind === "tag"
-            ? "tag"
-            : ref.kind === "remote"
-              ? "remote-branch"
-              // A ref outside branches, remotes and tags — only ever present
-              // under the "all refs" scope. It gets its own chip rather than
-              // falling through to "local-branch": drawing an agent-harness
-              // checkpoint as a branch is the mislabelling this whole path
-              // exists to prevent.
-              : ref.kind === "other"
-                ? "other"
-                : ref.is_head
-                  ? "current-branch"
-                  : "local-branch";
-      const list = map.get(ref.commit_id) ?? [];
-      if (!list.some((r) => r.name === ref.name && r.kind === kind)) {
-        const standing = kind === "tag" ? tagStanding.get(ref.name) : undefined;
-        list.push({
-          name: ref.name,
-          kind,
-          aheadOfBase: standing?.ahead ?? null,
-          comparedTo: standing?.base ?? null,
-        });
-      }
-      map.set(ref.commit_id, list);
-    }
-    return map;
-  });
+  let refsByCommit = $derived(buildRefsByCommit($graphStore.refs, $repoStore.tags));
 
   let totalCommits = $derived(filteredRows.length);
 

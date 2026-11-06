@@ -24,6 +24,11 @@ export interface DiffSelectionSpec {
   read(invoke: InvokeFn, repoPath: string, ignoreWhitespace: boolean): Promise<DiffPayload>;
   filePath: string | null;
   commitId: string | null;
+  /**
+   * The comparison's base, for a "compare" selection. Omitted is null, which
+   * is how every other kind of selection clears a comparison it replaces.
+   */
+  compareBase?: string | null;
   isStaged: boolean;
   kind: SelectionKind;
   /**
@@ -61,11 +66,18 @@ export function createDiffSelection(deps: DiffSelectionDeps) {
    */
   const beginFetch = (
     session: RepoSession,
-    target: { filePath: string | null; commitId: string | null; isStaged: boolean; ignoreWhitespace: boolean },
+    target: {
+      filePath: string | null;
+      commitId: string | null;
+      compareBase: string | null;
+      isStaged: boolean;
+      ignoreWhitespace: boolean;
+    },
   ): void => {
     const unchanged =
       session.selectedFilePath === target.filePath &&
       session.selectedCommitId === target.commitId &&
+      session.selectedCompareBase === target.compareBase &&
       session.selectedIsStaged === target.isStaged &&
       session.selectedIgnoreWhitespace === target.ignoreWhitespace &&
       session.selectedDiff !== null;
@@ -105,15 +117,18 @@ export function createDiffSelection(deps: DiffSelectionDeps) {
       // every refetch of this diff must carry whatever the user last chose.
       const ignoreWhitespace = session.selectedIgnoreWhitespace;
       const token = selectionGeneration.next();
+      const compareBase = spec.compareBase ?? null;
       beginFetch(session, {
         filePath: spec.filePath,
         commitId: spec.commitId,
+        compareBase,
         isStaged: spec.isStaged,
         ignoreWhitespace,
       });
       const target = {
         selectedFilePath: spec.filePath,
         selectedCommitId: spec.commitId,
+        selectedCompareBase: compareBase,
         selectedIsStaged: spec.isStaged,
         selectionKind: spec.kind,
       };

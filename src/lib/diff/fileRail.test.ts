@@ -58,6 +58,27 @@ describe("buildFileRail", () => {
     expect(rail.entries.map((e) => e.isStaged)).toEqual([true, false]);
   });
 
+  it("lists a comparison's files from its own read, as a compare rail", () => {
+    const rail = buildFileRail(
+      input({ selectionKind: "compare", commitFiles: [commitFile("src/a.ts"), commitFile("src/b.ts")] }),
+    );
+    expect(rail.source).toBe("compare");
+    expect(rail.entries.map((e) => e.path)).toEqual(["src/a.ts", "src/b.ts"]);
+    // No staged/unstaged split: the path alone decides the current row.
+    expect(isCurrent(rail.entries[0], "src/a.ts", true, rail.source)).toBe(true);
+  });
+
+  it("renders nothing for a comparison whose files have not landed", () => {
+    expect(buildFileRail(input({ selectionKind: "compare", commitFiles: null }))).toEqual(EMPTY_RAIL);
+  });
+
+  it("carries a cut comparison list's truncation", () => {
+    const rail = buildFileRail(
+      input({ selectionKind: "compare", commitFiles: [commitFile("a")], commitFilesTruncated: true }),
+    );
+    expect(truncationNote(rail)).toBe("showing the first 1 files");
+  });
+
   it("renders nothing for a range diff rather than inventing a list", () => {
     // The backend returns one combined patch for `from..to`; parsing file
     // names out of the diff text would produce a list that silently disagrees

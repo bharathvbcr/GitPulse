@@ -57,7 +57,7 @@
   import { currentHeadTip } from "../stores/headTip";
   import { graphStore } from "../stores/graphStore";
   import { liveIndex } from "../codeintel/liveIndex";
-  import type { CommitFileChange } from "../stores/graphStore";
+  import type { CommitDetails, CommitFileChange } from "../stores/graphStore";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import DiffFileRail from "./DiffFileRail.svelte";
   import {
@@ -66,8 +66,20 @@
     stepFile,
     type RailEntry,
   } from "../diff/fileRail";
-  import { buildCommitRail, type CommitEntry } from "../diff/commitRail";
   import { createCommitPicker, type CommitFilesRead } from "../diff/commitPick";
+  import { commitLabel, compareLabel, type RailTab } from "../diff/historyRail";
+  import { createCommitHover } from "../diff/commitHover";
+  import { shortHash } from "../format";
+  import type { CompareFiles, CommitNote } from "../diff/compareTypes";
+  import {
+    buildCloseTargets,
+    buildRefsByCommit,
+    countCommitsByAuthor,
+  } from "../graph/graphDecorations";
+  import { nextLoadLimit } from "../stores/graphLimits";
+  import { filterStore } from "../stores/filterStore";
+  import { freshnessStore } from "../provenance/store";
+  import DiffHistoryGraph from "./DiffHistoryGraph.svelte";
   import { formatError } from "../ui/formatError";
   import { invoke } from "../ipc/invoke";
   import {
@@ -223,8 +235,8 @@
     if (pending && !currentCommitId) railOpen = true;
   });
   let railWidth = $state(248);
-  /** Owned here so unfolding the change picker survives a file switch. */
-  let commitsOpen = $state(false);
+  /** Owned here so the rail's tab survives a file switch and ⌥H can flip it. */
+  let railTab = $state<RailTab>("files");
   let wordWrap = $state(diffDefaults.diffWordWrap);
   let syntaxOn = $state(diffDefaults.diffSyntaxHighlight);
   let oldSrc = $state<string | null>(null);
@@ -290,6 +302,10 @@
    */
   const currentFilePath = $derived($repoStore.selectedFilePath);
   const currentCommitId = $derived($repoStore.selectedCommitId);
+  /** The comparison's base while one is on screen; a primitive, so effects re-run only when it moves. */
+  const compareBase = $derived(
+    $repoStore.selectionKind === "compare" ? $repoStore.selectedCompareBase : null,
+  );
 
   /**
    * Refresh signals for the codeintel answers below, which no longer re-run
@@ -427,7 +443,11 @@
     outlineTitle(
       outline,
       $repoStore.selectedFilePath ||
-        ($repoStore.selectedCommitId ? `commit ${$repoStore.selectedCommitId.slice(0, 8)}` : "Diff"),
+        (compareBase && $repoStore.selectedCommitId
+          ? `compare ${compareLabel(compareBase, $repoStore.selectedCommitId)}`
+          : $repoStore.selectedCommitId
+            ? `commit ${$repoStore.selectedCommitId.slice(0, 8)}`
+            : "Diff"),
     ),
   );
   const churn = $derived(churnSummary(outline.additions, outline.deletions));
@@ -668,7 +688,7 @@
     const index = indexRevision;
     const key =
       repo && section?.path
-        ? [repo, section.path, commitId ?? "", head, String(index), ...section.hunks.map((h) => h.header)].join("\u0000")
+        ? [repo, section.path, commitId ?? "", compareBase ?? "", head, String(index), ...section.hunks.map((h) => h.header)].join("\u0000")
         : null;
     if (key === hunkSymbolsKey) return;
     hunkSymbolsKey = key;
@@ -693,9 +713,11 @@
     hunkSymbolsGuard = guard;
     void (async () => {
       try {
-        // Work: HEAD. History: parent first (old side), then the commit itself.
+        // Work: HEAD. History: the old side first (a comparison's base, else
+        // the commit's parent), then the commit itself.
+        const oldSide = compareBase ?? `${commitId}^`;
         const candidates = commitId
-          ? [`${commitId}^`, commitId]
+          ? [oldSide, commitId]
           : [await invoke<string>("cmd_get_head_id", { repoPath: repo })];
         for (const headSha of candidates) {
           if (!guard.isLive() || !headSha) continue;
@@ -746,9 +768,10 @@
     const repo = $currentRepoPath;
     const commitId = currentCommitId;
     void filesRetry;
-    // Nothing to fetch when there is no commit, or when the graph store's
-    // details already cover this one.
-    if (!repo || !commitId || details?.id === commitId) return;
+    // Nothing to fetch when there is no commit, when the graph store's
+    // details already cover this one, or when a comparison is on screen (its
+    // files are the comparison's, read below, not the target commit's own).
+    if (!repo || !commitId || compareBase !== null || details?.id === commitId) return;
     if (fetchedFor === commitId) return;
     fetchedFor = commitId;
     filesGuard?.cancel();
@@ -774,8 +797,57 @@
 
   $effect(() => () => filesGuard?.cancel());
 
-  /** This commit's files from whichever source has them. */
+  /**
+   * The comparison's file list, while a comparison is on screen. Read once
+   * per pair (and again on Retry); a failed read is recorded as one, never as
+   * "these commits differ by nothing".
+   */
+  let fetchedCompare = $state<
+    | { key: string; files: CompareFiles; error: null }
+    | { key: string; files: null; error: string }
+    | null
+  >(null);
+  let compareFetchedFor: string | null = null;
+  let compareGuard: AsyncGuard | null = null;
+  const compareKey = $derived(
+    compareBase !== null && currentCommitId ? `${compareBase}..${currentCommitId}` : null,
+  );
+
+  $effect(() => {
+    const repo = $currentRepoPath;
+    const key = compareKey;
+    const base = compareBase;
+    const target = currentCommitId;
+    void filesRetry;
+    if (!repo || !key || !base || !target || compareFetchedFor === key) return;
+    compareFetchedFor = key;
+    compareGuard?.cancel();
+    const guard = createAsyncGuard();
+    compareGuard = guard;
+    void (async () => {
+      try {
+        const files = await invoke<CompareFiles>("cmd_get_compare_files", {
+          repoPath: repo,
+          from: base,
+          to: target,
+        });
+        if (guard.isLive()) fetchedCompare = { key, files, error: null };
+      } catch (error) {
+        if (guard.isLive()) fetchedCompare = { key, files: null, error: formatError(error) };
+      }
+    })();
+  });
+
+  $effect(() => () => compareGuard?.cancel());
+
+  /** The current comparison's read, when it has landed for this pair. */
+  const compareRead = $derived(
+    compareKey !== null && fetchedCompare?.key === compareKey ? fetchedCompare : null,
+  );
+
+  /** The files of the change on screen, from whichever source has them. */
   const commitFiles = $derived.by<CommitFileChange[] | null>(() => {
+    if (compareKey !== null) return compareRead?.files?.files ?? null;
     const commitId = $repoStore.selectedCommitId;
     if (!commitId) return null;
     if (details?.id === commitId) return details.changed_files;
@@ -783,29 +855,37 @@
     return null;
   });
 
-  /** Why this commit's file list is missing, when its read failed. */
+  /** Why the file list of the change on screen is missing, when its read failed. */
   const filesError = $derived(
-    fetchedFiles?.commitId === $repoStore.selectedCommitId ? fetchedFiles?.error ?? null : null,
+    compareKey !== null
+      ? (compareRead?.error ?? null)
+      : fetchedFiles?.commitId === $repoStore.selectedCommitId
+        ? (fetchedFiles?.error ?? null)
+        : null,
   );
 
   function retryCommitFiles(): void {
     fetchedFor = null;
+    compareFetchedFor = null;
     filesRetry += 1;
   }
 
   const rail = $derived(
     buildFileRail({
-      selectionKind: $repoStore.selectedCommitId
-        ? "commit"
-        : $repoStore.selectedFilePath
-          ? "file"
-          : "range",
-      // Only this commit's own file list may be shown: a stale one from the
+      // The store's own record of how the selection was made. Inferring it
+      // from which ids are set read a range selection (`filePath` holding
+      // `from...to`, no commit) as a worktree file, and offered the working
+      // tree's files beside a branch comparison.
+      selectionKind: $repoStore.selectionKind,
+      // Only this change's own file list may be shown: a stale one from the
       // previously selected commit would offer files that are not in the diff
       // on screen.
       commitFiles,
-      commitFilesTruncated: details?.files_list_truncated === true,
-      commitFilesTotal: details?.files_total_count ?? 0,
+      commitFilesTruncated:
+        compareKey !== null
+          ? compareRead?.files?.truncated === true
+          : details?.files_list_truncated === true,
+      commitFilesTotal: compareKey !== null ? 0 : (details?.files_total_count ?? 0),
       statuses: $repoStore.statuses,
     }),
   );
@@ -820,9 +900,95 @@
   );
 
   /** Recent commits, straight from the rows the graph already drew. */
-  const commitRail = $derived(buildCommitRail($graphStore.rows));
+  // --- History tab ----------------------------------------------------------
+  // The rows, refs and decorations the Graph view draws, so the two views
+  // cannot disagree about a commit. Nothing here costs IPC: the graph store
+  // already holds every row it drew.
+  const historyRows = $derived($graphStore.rows);
+  const historyRefs = $derived(buildRefsByCommit($graphStore.refs, $repoStore.tags));
+  const historyCloseTargets = $derived(buildCloseTargets(historyRows));
+  const historyAuthorCounts = $derived(countCommitsByAuthor(historyRows));
+  const historyHasMore = $derived(
+    $graphStore.hasMore && nextLoadLimit($graphStore.maxCommits) !== null,
+  );
+  let historyLoadingMore = $state(false);
+  let historyLoadError = $state<string | null>(null);
 
-  const hasRail = $derived(rail.entries.length > 0 || commitRail.entries.length > 0);
+  async function loadOlderHistory(): Promise<void> {
+    const path = $repoStore.currentPath;
+    if (!path || historyLoadingMore) return;
+    historyLoadingMore = true;
+    historyLoadError = null;
+    try {
+      await graphStore.loadMore(path, $filterStore.searchQuery, $filterStore.selectedBranch);
+      // The store records a failed load on itself rather than throwing.
+      const failed = get(graphStore).error;
+      if (failed) historyLoadError = failed;
+    } catch (error) {
+      historyLoadError = formatError(error);
+    } finally {
+      historyLoadingMore = false;
+    }
+  }
+
+  /**
+   * The hover card's reads beyond the row: the message body (the details
+   * read the Graph view's pane uses, shared when both ask at once) and the
+   * plain git note.
+   */
+  const commitHover = createCommitHover({
+    readBody: async (repoPath, commitId) =>
+      (await invoke<CommitDetails>("cmd_get_commit_details", { repoPath, commitId })).body ?? "",
+    readNote: async (repoPath, commitId) => {
+      const rows = await invoke<CommitNote[]>("cmd_get_commit_notes", {
+        repoPath,
+        commitIds: [commitId],
+      });
+      // One row per id asked, in order; anything else is a malformed answer,
+      // never "no note".
+      if (rows.length !== 1) throw new Error(`asked for 1 note and got ${rows.length}`);
+      return rows[0].note;
+    },
+  });
+  // A reload (a watcher event, a write, a page of older history) may have
+  // changed a note: answers are dropped with the rows they were read beside.
+  $effect(() => {
+    historyRows;
+    $currentRepoPath;
+    untrack(() => commitHover.reset());
+  });
+
+  const historyFreshness = freshnessStore.consumer("diff-history");
+
+  function hoverCommit(commitId: string | null): void {
+    const repo = $repoStore.currentPath;
+    if (!repo || !commitId) commitHover.hide();
+    else commitHover.show(repo, commitId);
+  }
+
+  function historyVisible(commitIds: string[]): void {
+    const repo = $repoStore.currentPath;
+    if (repo) void historyFreshness.load(repo, commitIds);
+  }
+
+  /** What the rail's change line says is on screen. */
+  const changeLabel = $derived.by(() => {
+    const commitId = currentCommitId;
+    if (!commitId) {
+      return $repoStore.selectionKind === "range" && $repoStore.selectedFilePath
+        ? `Range ${$repoStore.selectedFilePath}`
+        : "Uncommitted changes";
+    }
+    const row = historyRows.find((r) => r.id === commitId || r.id.startsWith(commitId));
+    if (row) return commitLabel(row.summary);
+    if (details?.id === commitId) return commitLabel(details.summary);
+    return shortHash(commitId);
+  });
+  const comparingLabel = $derived(
+    compareBase !== null && currentCommitId ? compareLabel(compareBase, currentCommitId) : null,
+  );
+
+  const hasRail = $derived(rail.entries.length > 0 || historyRows.length > 0);
 
   // A3: layered blast over the files in this change set (no min_rung).
   let changeSetPathsKey = $derived(
@@ -927,6 +1093,19 @@
       return;
     }
     if (!event.altKey || event.ctrlKey || event.metaKey) return;
+    // ⌥H: the rail's History tab, and back. By physical key: on macOS Option+H
+    // types "˙", so `event.key` never reads "h".
+    if (event.code === "KeyH" && !event.shiftKey) {
+      if (typing) return;
+      event.preventDefault();
+      if (!railOpen || railTab !== "history") {
+        railOpen = true;
+        railTab = "history";
+      } else {
+        railTab = "files";
+      }
+      return;
+    }
     if (event.key === "PageDown" || event.key === "PageUp") {
       if (typing) return;
       event.preventDefault();
@@ -957,19 +1136,41 @@
     openCommit: (commitId) => void repoStore.selectCommitDiff(commitId),
   });
 
-  async function pickCommit(entry: CommitEntry): Promise<void> {
-    await pickCommitId(entry.id);
+  /**
+   * A commit picked in the History tab. The Files tab comes forward with it:
+   * the next question after "which change" is "which file".
+   */
+  function pickHistoryCommit(commitId: string): void {
+    railTab = "files";
+    void pickCommitId(commitId);
+  }
+
+  /** Two commits picked in the History tab: their direct change, `base..target`. */
+  function compareCommits(base: string, target: string): void {
+    railTab = "files";
+    void repoStore.selectCompareDiff(base, target);
+  }
+
+  /** Leaves a comparison for its newer commit on its own. */
+  function exitCompare(): void {
+    const target = currentCommitId;
+    if (target) void pickCommitId(target);
   }
 
   /** Reuse the same working-tree preview as the workspace's change counts. */
   function pickWorkingTree(): void {
     railOpen = true;
+    railTab = "files";
     void repoStore.previewUncommitted();
   }
 
   /** Opens a rail entry through whichever command its source requires. */
   function openRailEntry(entry: RailEntry): void {
     const commitId = $repoStore.selectedCommitId;
+    if (rail.source === "compare" && commitId && compareBase) {
+      void repoStore.selectCompareFileDiff(compareBase, commitId, entry.path);
+      return;
+    }
     if (rail.source === "commit" && commitId) {
       void repoStore.selectCommitFileDiff(commitId, entry.path);
       return;
@@ -1102,7 +1303,9 @@
     );
   });
   let emptyCopy = $derived(
-    emptyDiffCopy($repoStore.selectedCommitId !== null && selectedGraphRow?.is_merge === true)
+    emptyDiffCopy(
+      $repoStore.selectedCommitId !== null && compareBase === null && selectedGraphRow?.is_merge === true,
+    )
   );
 
   let lastBoundsBlock: (ReplacementBlock & { source: AnnotatedDiffLine[] }) | null = null;
@@ -1192,6 +1395,7 @@
     [
       $repoStore.selectedFilePath,
       $repoStore.selectedCommitId,
+      compareBase ?? "",
       $repoStore.selectedIsStaged,
       $repoStore.selectedIgnoreWhitespace,
     ].join("\u0000"),
@@ -1234,14 +1438,24 @@
 
   let imageBlobKey: string | null = null;
   /** What the current key reads, kept so Retry asks again for exactly that. */
-  let imageRequest: { key: string; repo: string; path: string; commitId: string | null } | null = null;
+  let imageRequest: {
+    key: string;
+    repo: string;
+    path: string;
+    commitId: string | null;
+    /** The old side's commit when a comparison is on screen; else the commit's parent. */
+    baseId: string | null;
+  } | null = null;
 
   $effect(() => {
     const path = singleSection?.path ?? currentFilePath;
     const repo = $currentRepoPath;
     const commitId = currentCommitId;
+    const baseId = compareBase;
     const key =
-      showingImage && path && repo ? `${repo}\u0000${path}\u0000${commitId ?? ""}` : null;
+      showingImage && path && repo
+        ? `${repo}\u0000${path}\u0000${commitId ?? ""}\u0000${baseId ?? ""}`
+        : null;
     if (key === imageBlobKey) return;
     imageBlobKey = key;
     // The previous file's pictures must not sit under the new file's title
@@ -1257,7 +1471,7 @@
       imageStatus = "ready";
       return;
     }
-    const request = { key, repo, path, commitId: commitId || null };
+    const request = { key, repo, path, commitId: commitId || null, baseId };
     imageRequest = request;
     void loadImageBlobs(request);
   });
@@ -1296,12 +1510,16 @@
     repo: string;
     path: string;
     commitId: string | null;
+    baseId: string | null;
   }): Promise<void> {
     imageStatus = "loading";
     imageError = null;
+    // A comparison's old side is its base; a commit's is its first parent;
+    // the working tree's is HEAD.
+    const previousRev = request.baseId ?? (request.commitId ? `${request.commitId}^` : "HEAD");
     const [current, previous] = await Promise.all([
       readImageSide(request.repo, request.path, request.commitId),
-      readImageSide(request.repo, request.path, request.commitId ? `${request.commitId}^` : "HEAD"),
+      readImageSide(request.repo, request.path, previousRev),
     ]);
     if (imageBlobKey !== request.key) return;
     newSrc = current.src;
@@ -1330,10 +1548,19 @@
 
   /** Asks again for the selection whose read failed, through the same store call that failed. */
   function retryDiff(): void {
-    const { selectedCommitId: commitId, selectedFilePath: path, selectedIsStaged: staged, selectionKind } = $repoStore;
+    const {
+      selectedCommitId: commitId,
+      selectedCompareBase: base,
+      selectedFilePath: path,
+      selectedIsStaged: staged,
+      selectionKind,
+    } = $repoStore;
     if (selectionKind === "range" && path) {
       const [from, to] = path.split("...");
       if (from && to) void repoStore.selectRangeDiff(from, to);
+    } else if (selectionKind === "compare" && base && commitId) {
+      if (path) void repoStore.selectCompareFileDiff(base, commitId, path);
+      else void repoStore.selectCompareDiff(base, commitId);
     } else if (commitId && path) void repoStore.selectCommitFileDiff(commitId, path);
     else if (commitId) void repoStore.selectCommitDiff(commitId);
     else if (path) void repoStore.selectFileDiff(path, staged);
@@ -1724,7 +1951,9 @@
        reach the next file except by leaving for the Graph. -->
   {#if filesError}
     <div class="flex shrink-0 items-center gap-2 border-b border-border/60 bg-surface/60 px-3 py-1 font-sans text-[11px] text-amber-500" role="status">
-      <span class="min-w-0 truncate">Could not list this commit's files: {filesError}</span>
+      <span class="min-w-0 truncate">
+        Could not list {compareBase !== null ? "the compared commits'" : "this commit's"} files: {filesError}
+      </span>
       <button type="button" class="gp-btn shrink-0 text-xs py-0.5 px-2" onclick={retryCommitFiles}>Retry</button>
     </div>
   {/if}
@@ -1732,20 +1961,45 @@
     {#if railOpen && hasRail}
       <DiffFileRail
         {rail}
-        commits={commitRail}
         currentPath={$repoStore.selectedFilePath}
         currentIsStaged={$repoStore.selectedIsStaged}
-        selectedCommitId={$repoStore.selectedCommitId}
-        workingTreeCount={$repoStore.statuses.length}
+        {changeLabel}
+        comparing={comparingLabel}
+        onExitCompare={exitCompare}
         previewMarkers={$previewMarkers}
         onOpen={openRailEntry}
-        onPickCommit={pickCommit}
-        onPickWorkingTree={pickWorkingTree}
         onCollapse={() => (railOpen = false)}
         width={railWidth}
         onResize={(next) => (railWidth = next)}
-        bind:commitsOpen
-      />
+        bind:tab={railTab}
+      >
+        {#snippet history()}
+          <DiffHistoryGraph
+            rows={historyRows}
+            refsByCommit={historyRefs}
+            closeTargets={historyCloseTargets}
+            authorCounts={historyAuthorCounts}
+            headId={$graphStore.headId}
+            mainlineName={$graphStore.mainlineName}
+            hasMore={historyHasMore}
+            loadingMore={historyLoadingMore}
+            loadError={historyLoadError}
+            selectedCommitId={$repoStore.selectedCommitId}
+            {compareBase}
+            workingTreeCount={$repoStore.statuses.length}
+            width={railWidth}
+            hover={$commitHover}
+            freshness={$freshnessStore.byRevision}
+            onHover={hoverCommit}
+            onVisible={historyVisible}
+            onLoadMore={() => void loadOlderHistory()}
+            onOpenCommit={pickHistoryCommit}
+            onCompare={compareCommits}
+            onExitCompare={exitCompare}
+            onPickWorkingTree={pickWorkingTree}
+          />
+        {/snippet}
+      </DiffFileRail>
     {/if}
 
     <div class="flex min-w-0 flex-1 flex-col">

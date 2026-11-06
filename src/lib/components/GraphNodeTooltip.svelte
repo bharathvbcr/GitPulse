@@ -8,9 +8,10 @@
     GitMerge,
     Tag,
   } from "@lucide/svelte";
+  import type { Snippet } from "svelte";
   import type { GraphHitKind, VisualCommitRow } from "../canvas/GraphRenderer";
   import type { TooltipPlacement } from "../canvas/graphInteraction";
-  import type { RefItem } from "./CommitRow.svelte";
+  import type { RefItem } from "../graph/graphDecorations";
   import { authorColor, authorIdentity } from "../authors/authorIdentity";
   import { getBranchColor } from "../canvas/Palette";
   import { formatRelativeTime } from "../format";
@@ -25,6 +26,7 @@
     authorCommitCount = null,
     mainlineName = null,
     hasMore = false,
+    children,
   }: {
     row: VisualCommitRow;
     refs?: RefItem[];
@@ -52,6 +54,12 @@
      * branch, so the strip names the parent and, when true, how to reach it.
      */
     hasMore?: boolean;
+    /**
+     * More about the commit than the graph row carries (its message body,
+     * notes, provenance), drawn under the facts above. The Diff view's history
+     * rail fills it; the Graph view has its details pane for that instead.
+     */
+    children?: Snippet;
   } = $props();
 
   /** Parents this row's dangling connections point at, by the k ↔ parent_ids[k] contract. */
@@ -239,4 +247,5 @@
     <dt class="flex items-center gap-1 text-textMuted"><GitCommit size={11} /> Parents</dt>
     <dd class="text-right">{row.parent_ids.length} {row.parent_ids.length === 1 ? "parent" : "parents"}</dd>
   </dl>
+  {@render children?.()}
 </div>

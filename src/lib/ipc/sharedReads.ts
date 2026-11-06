@@ -37,4 +37,6 @@ export const SHARED_READ_COMMANDS: ReadonlySet<string> = new Set([
   "cmd_branch_stats",
   "cmd_get_commit_graph",
   "cmd_get_commit_details",
+  // The history rail's hover card: `git log --no-walk --notes`, a pure read.
+  "cmd_get_commit_notes",
 ]);

@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
+import { createRawSnippet } from "svelte";
 import { render } from "svelte/server";
 import DiffFileRail from "./DiffFileRail.svelte";
+import DiffHistoryGraph from "./DiffHistoryGraph.svelte";
 import { buildFileRail, type RailInput } from "../diff/fileRail";
-import { buildCommitRail } from "../diff/commitRail";
+import type { VisualCommitRow } from "../canvas/GraphRenderer";
 
 function rail(over: Partial<RailInput> = {}) {
   return buildFileRail({
@@ -19,26 +21,20 @@ function rail(over: Partial<RailInput> = {}) {
   });
 }
 
-const commitRows = [
-  { id: "a1b2c3d4e5f6", summary: "Add the parser", author_name: "Ada", timestamp: 1_700_000_000, is_merge: false },
-  { id: "b2c3d4e5f6a1", summary: "", author_name: "Bob", timestamp: 1_699_900_000, is_merge: true },
-];
-
 const props = (over = {}) => ({
   rail: rail(),
-  commits: buildCommitRail(commitRows),
   currentPath: "src/a.ts",
   currentIsStaged: false,
-  selectedCommitId: "a1b2c3d4e5f6",
-  workingTreeCount: 3,
+  changeLabel: "Add the parser",
   onOpen: () => {},
-  onPickCommit: () => {},
-  onPickWorkingTree: () => {},
   onCollapse: () => {},
-  // The picker folds by default; these render it to assert what it says.
-  commitsOpen: true,
   ...over,
 });
+
+/** A stand-in History body, so the rail's tab plumbing is tested on its own. */
+const historyBody = createRawSnippet(() => ({
+  render: () => `<div data-test-history>graph body</div>`,
+}));
 
 describe("DiffFileRail", () => {
   it("lists every file with its churn", () => {
@@ -195,65 +191,184 @@ describe("DiffViewer wiring", () => {
     expect(source).toContain("cmd_get_commit_files");
   });
 
-  it("owns the picker's fold so it survives a file switch", () => {
-    expect(source).toContain("bind:commitsOpen");
+  it("owns the rail's tab so it survives a file switch", () => {
+    expect(source).toContain("bind:tab={railTab}");
+  });
+
+  it("reads a range selection's kind from the store, not from which ids are set", () => {
+    // The regression: `commitId ? "commit" : filePath ? "file" : "range"` read
+    // a range selection (filePath `from...to`, no commit) as a worktree file,
+    // and offered the working tree's files beside a branch comparison.
+    expect(source).toContain("selectionKind: $repoStore.selectionKind,");
+    expect(source).not.toMatch(/selectedFilePath\s*\?\s*"file"\s*:\s*"range"/);
+  });
+
+  it("lists a comparison's files from the comparison, not from either commit", () => {
+    expect(source).toContain('"cmd_get_compare_files"');
+    expect(source).toContain("selectCompareFileDiff(compareBase, commitId, entry.path)");
+  });
+
+  it("toggles the History tab with ⌥H by physical key", () => {
+    // Option+H types "˙" on macOS; matching `event.key` would never fire there.
+    expect(source).toContain('event.code === "KeyH"');
   });
 });
 
-describe("DiffFileRail commit picker", () => {
-  it("lists recent commits so switching change needs no trip to Graph", () => {
-    const { body } = render(DiffFileRail, { props: props() });
+describe("DiffFileRail tabs", () => {
+  it("offers Files and History when a history body is given", () => {
+    const { body } = render(DiffFileRail, { props: props({ history: historyBody }) });
+    expect(body).toContain('role="tablist"');
+    expect(body).toContain("Files");
+    expect(body).toContain("History");
+    // Files is the default: the file list shows, the history body does not.
+    expect(body).toContain('aria-label="Filter files in this diff"');
+    expect(body).not.toContain("data-test-history");
+  });
+
+  it("gives the History tab the whole column, with no file list beside it", () => {
+    // Two stacked scrollers in one narrow column fought over every wheel
+    // event; one tab owns the height at a time.
+    const { body } = render(DiffFileRail, { props: props({ history: historyBody, tab: "history" }) });
+    expect(body).toContain("data-test-history");
+    expect(body).not.toContain('aria-label="Filter files in this diff"');
+  });
+
+  it("offers no tabs when there is no history to show", () => {
+    const { body } = render(DiffFileRail, { props: props({ tab: "history" }) });
+    expect(body).not.toContain('role="tablist"');
+    expect(body).toContain('aria-label="Filter files in this diff"');
+  });
+
+  it("names the change on screen from either tab, so neither has to be opened", () => {
+    for (const tab of ["files", "history"] as const) {
+      const { body } = render(DiffFileRail, { props: props({ history: historyBody, tab }) });
+      expect(body, tab).toContain("Add the parser");
+    }
+  });
+
+  it("names a comparison and offers the way out of it", () => {
+    const { body } = render(DiffFileRail, {
+      props: props({ comparing: "abc1234..def5678", onExitCompare: () => {} }),
+    });
+    expect(body).toContain("abc1234..def5678");
+    expect(body).toContain("data-exit-compare");
+  });
+
+  it("heads a comparison's file list as compared files", () => {
+    const compared = buildFileRail({
+      selectionKind: "compare",
+      commitFiles: [{ path: "src/a.ts", status_code: "M", additions: 1, deletions: 1 }],
+      commitFilesTruncated: false,
+      commitFilesTotal: 0,
+      statuses: [],
+    });
+    expect(render(DiffFileRail, { props: props({ rail: compared }) }).body).toContain("Compared files");
+  });
+});
+
+const graphRow = (id: string, over: Partial<VisualCommitRow> = {}): VisualCommitRow => ({
+  id,
+  parent_ids: [],
+  summary: `summary ${id}`,
+  author_name: "Ada",
+  author_email: "ada@example.com",
+  timestamp: 1_700_000_000,
+  lane: 0,
+  color_index: 0,
+  active_lanes: [0],
+  active_lane_colors: [0],
+  connections: [],
+  is_merge: false,
+  is_root: false,
+  ...over,
+});
+
+const historyRows = [
+  graphRow("a1b2c3d4e5f6", { summary: "Add the parser" }),
+  graphRow("b2c3d4e5f6a1", { summary: "", author_name: "Bob", is_merge: true }),
+];
+
+const historyProps = (over = {}) => ({
+  rows: historyRows,
+  refsByCommit: new Map([["a1b2c3d4e5f6", [{ name: "main", kind: "current-branch" as const }]]]),
+  closeTargets: new Map(),
+  authorCounts: new Map(),
+  selectedCommitId: "a1b2c3d4e5f6",
+  workingTreeCount: 3,
+  width: 248,
+  hover: null,
+  freshness: {},
+  onHover: () => {},
+  onVisible: () => {},
+  onLoadMore: () => {},
+  onOpenCommit: () => {},
+  onCompare: () => {},
+  onExitCompare: () => {},
+  onPickWorkingTree: () => {},
+  ...over,
+});
+
+describe("DiffHistoryGraph", () => {
+  it("lists the graph's commits so switching change needs no trip to Graph", () => {
+    const { body } = render(DiffHistoryGraph, { props: historyProps() });
     expect(body).toContain("Add the parser");
     expect(body).toContain("a1b2c3d");
     expect(body).toContain("Ada");
+    // The branch that points at a commit is on its row.
+    expect(body).toContain(">main<");
   });
 
   it("marks the commit currently on screen", () => {
-    const { body } = render(DiffFileRail, { props: props() });
-    // Both the open commit and the open file are marked.
-    expect((body.match(/aria-current="true"/g) ?? []).length).toBeGreaterThanOrEqual(2);
+    const { body } = render(DiffHistoryGraph, { props: historyProps() });
+    expect(body).toMatch(/data-commit-id="a1b2c3d4e5f6"[^>]*aria-selected="true"|aria-selected="true"[^>]*data-commit-id="a1b2c3d4e5f6"/);
   });
 
   it("offers uncommitted work as a first-class entry", () => {
     // It is the one thing a reader returns to most, and the only entry that
     // is not in the graph at all.
-    const { body } = render(DiffFileRail, { props: props() });
+    const { body } = render(DiffHistoryGraph, { props: historyProps({ selectedCommitId: null }) });
     expect(body).toContain("Uncommitted changes");
+    expect(body).toContain('aria-current="true"');
   });
 
   it("says a clean tree is clean rather than showing a zero", () => {
-    expect(render(DiffFileRail, { props: props({ workingTreeCount: 0 }) }).body).toContain("clean");
+    expect(render(DiffHistoryGraph, { props: historyProps({ workingTreeCount: 0 }) }).body).toContain("clean");
   });
 
   it("shows neither count nor 'clean' when the tree was not counted", () => {
     // -1 is "not counted"; rendering it as clean would assert something the
     // app does not know.
-    const { body } = render(DiffFileRail, { props: props({ workingTreeCount: -1 }) });
-    const picker = body.slice(body.indexOf("Uncommitted changes"), body.indexOf("Uncommitted changes") + 200);
-    expect(picker).not.toContain("clean");
+    const { body } = render(DiffHistoryGraph, { props: historyProps({ workingTreeCount: -1 }) });
+    const entry = body.slice(body.indexOf("Uncommitted changes"), body.indexOf("Uncommitted changes") + 200);
+    expect(entry).not.toContain("clean");
   });
 
   it("names an empty commit message instead of rendering a blank row", () => {
-    expect(render(DiffFileRail, { props: props() }).body).toContain("(no commit message)");
+    expect(render(DiffHistoryGraph, { props: historyProps() }).body).toContain("(no commit message)");
   });
 
-  it("marks a merge commit as one", () => {
-    expect(render(DiffFileRail, { props: props() }).body).toContain("merge");
+  it("says a merge is a merge in words, not only as a canvas shape", () => {
+    expect(render(DiffHistoryGraph, { props: historyProps() }).body).toContain("merge commit");
   });
 
-  it("names the open change in its header, so folding it loses nothing", () => {
-    // Folded is the default; the header has to answer "which change" without
-    // being opened.
-    const { body } = render(DiffFileRail, { props: props({ commitsOpen: false }) });
-    expect(body).toContain("Add the parser");
-    expect(body).not.toContain("(no commit message)");
+  it("marks the comparison's base on its row", () => {
+    const { body } = render(DiffHistoryGraph, { props: historyProps({ compareBase: "b2c3d4e5f6a1" }) });
+    expect(body).toContain(">base<");
   });
 
-  it("names uncommitted work in that header when no commit is selected", () => {
-    const { body } = render(DiffFileRail, {
-      props: props({ commitsOpen: false, selectedCommitId: null }),
-    });
-    expect(body).toContain("Uncommitted changes");
+  it("says where the loaded history ends, and offers Retry when older history failed", () => {
+    expect(render(DiffHistoryGraph, { props: historyProps() }).body).toContain("Start of the loaded history");
+    const failed = render(DiffHistoryGraph, {
+      props: historyProps({ hasMore: true, loadError: "git exploded" }),
+    }).body;
+    expect(failed).toContain("Could not load older history: git exploded");
+    expect(failed).toContain("Retry");
+  });
+
+  it("is one listbox the keyboard can drive", () => {
+    const { body } = render(DiffHistoryGraph, { props: historyProps() });
+    expect(body).toContain('role="listbox"');
+    expect(body).toContain('role="option"');
   });
 });
 

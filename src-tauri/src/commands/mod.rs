@@ -14,8 +14,8 @@ use crate::engine::git_cli::{
     sandbox_save_edited_text, validate_repo, FileWriteError, ResolvedRepo, SavedFile,
 };
 use crate::engine::git_reader::{
-    BlameLine, CommitDetails, CommitFileChange, DiffPayload, DoraReport, FileBlob, KnowledgeReport,
-    LanguageStatsReport, PulseReport, ReflogEntry, ResetPreview,
+    BlameLine, CommitDetails, CommitFileChange, CommitNote, CompareFiles, DiffPayload, DoraReport,
+    FileBlob, KnowledgeReport, LanguageStatsReport, PulseReport, ReflogEntry, ResetPreview,
 };
 use crate::engine::git_writer::{
     reworded_message, validate_oid_or_revision, validate_ref_name, AutoFetchOutcome, CloneOptions,

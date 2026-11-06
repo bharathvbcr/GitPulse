@@ -2958,6 +2958,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       applyToSession(session.id, session.generation, {
         selectedFilePath: file?.path ?? null,
         selectedCommitId: null,
+        selectedCompareBase: null,
         selectedDiff: null,
         selectedDiffTruncated: false,
         selectedDiffTruncationReason: null,
@@ -2994,6 +2995,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       applyToSession(session.id, session.generation, {
         selectedFilePath: filePath,
         selectedCommitId: null,
+        selectedCompareBase: null,
         selectionKind: "file",
       });
     },
@@ -3046,6 +3048,34 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         commitId: null,
         isStaged: false,
         kind: "range",
+        history: "always",
+      }),
+    /**
+     * The direct change from `base` to `target` (two-dot), whole. The target
+     * is the selected commit, so the graph and the rail keep marking it, and
+     * the base rides beside it until any other selection clears it.
+     */
+    selectCompareDiff: (base: string, target: string) =>
+      diffSelection.select({
+        read: (invoke, repoPath) =>
+          invoke<DiffPayload>("cmd_get_compare_diff", { repoPath, from: base, to: target, filePath: null }),
+        filePath: null,
+        commitId: target,
+        compareBase: base,
+        isStaged: false,
+        kind: "compare",
+        history: "always",
+      }),
+    /** One file of {@link selectCompareDiff}'s comparison. */
+    selectCompareFileDiff: (base: string, target: string, filePath: string) =>
+      diffSelection.select({
+        read: (invoke, repoPath) =>
+          invoke<DiffPayload>("cmd_get_compare_diff", { repoPath, from: base, to: target, filePath }),
+        filePath,
+        commitId: target,
+        compareBase: base,
+        isStaged: false,
+        kind: "compare",
         history: "always",
       }),
     stageFile: async (filePath: string) =>
@@ -3783,6 +3813,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (!session || !commitId) return;
       applyToSession(session.id, session.generation, {
         selectedCommitId: commitId,
+        selectedCompareBase: null,
         selectedFilePath: null,
         selectedDiff: null,
         selectedDiffTruncated: false,
