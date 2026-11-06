@@ -11,6 +11,24 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A task agent's new worktree starts with a DevMap index instead of a cold
+  rebuild.** Lanes under `.gitpulse/worktrees/` now get a copy-on-write clone of
+  the main checkout's DevMap store, bound to the lane, before the agent starts.
+  Then GitPulse's live refresh runs the lane's own incremental build in the
+  background whenever the clone is not fresh for the lane's tree. Until that
+  build lands, `devmap status` in the lane reports the index as stale. Before,
+  lanes started with no store, and DevMap's SessionStart hook cold-built a full
+  one in every lane. Measured on this repository: a lane is query-ready in about
+  1.2 s (debug build) instead of about 7.6 s and ~38 CPU-seconds, and costs
+  7–20 MB instead of about 366 MB. Its own build then takes about 2.5 s. With
+  eight lanes at once, a bare clone plus incremental build took about 9 s,
+  against about 42 s cold. A seed that is skipped (low disk, or no index in the
+  main checkout) or fails is logged, and the lane still starts; DevMap's own
+  hook then builds the index as before. Measurements and remaining work are in
+  `docs/ZERO_COPY_AGENTIC_WORKTREES.md` §7.
+
 ## [1.5.0] - 2026-11-03
 
 1.5.0 is the first release published since 1.3.1. 1.3.5 was withdrawn and

@@ -236,7 +236,17 @@ fn provision_with(
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     crate::harness::guard_command(selected, &refs)
         .map_err(|e| WorkbenchError::new("policy_refused", e))?;
-    let created = crate::engine::worktree::add_worktree_cached(
+    // The lane's DevMap store is cloned from the main checkout's (APFS
+    // `clonefile` / Linux `FICLONE`, `repo_root` rebound to the lane), never
+    // left absent. An absent store is not "no index": DevMap's SessionStart
+    // hook answers it with a cold `devmap build` in every new lane — measured
+    // on this repository at ~7.6 s, ~38 CPU-s and ~366 MB per lane, against
+    // ~1.2 s (debug build) and 7–20 MB for this seed, which `devmap build`
+    // then brings up to the lane's tree incrementally with an identical graph
+    // (docs/ZERO_COPY_AGENTIC_WORKTREES.md §7). A zero-copy
+    // pointer is no substitute: the `devmap` binary agents run does not read
+    // `base_store_ref.json`, so the hook cold-builds beside it.
+    let created = crate::engine::worktree::add_worktree_with_devmap(
         selected,
         &path_text,
         Some(&branch),
@@ -245,6 +255,7 @@ fn provision_with(
         Some(caches),
         // Approved hooks only: an unapproved file is reported, not run.
         true,
+        crate::engine::worktree::DevmapMode::Copy,
     )
     .map_err(|e| refused(e.into_message()))?;
     let provisioned = Provisioned {
@@ -272,6 +283,23 @@ fn provision_with(
     let advisory = crate::sysload::Advisory::of(advised);
     if let Some(cache) = &created.cache_error {
         log::warn!(target: "workbench", "agent worktree {} has no copied build caches: {cache}", provisioned.path);
+    }
+    // Like the caches, the index only saves a rebuild: a lane without a seeded
+    // store still gets one from DevMap's own hook, and `devmap status` there
+    // says it is missing until it lands. So this is logged, never refused.
+    let seeded = matches!(
+        created.devmap,
+        crate::engine::worktree::DevmapOutcome::Provisioned { .. }
+    );
+    match &created.devmap {
+        crate::engine::worktree::DevmapOutcome::Skipped { reason } => {
+            log::info!(target: "workbench", "agent worktree {} has no seeded DevMap store: {reason}", provisioned.path);
+        }
+        crate::engine::worktree::DevmapOutcome::Failed { error } => {
+            log::warn!(target: "workbench", "agent worktree {}: seeding its DevMap store failed: {error}", provisioned.path);
+        }
+        crate::engine::worktree::DevmapOutcome::Provisioned { .. }
+        | crate::engine::worktree::DevmapOutcome::NotRequested => {}
     }
     crate::sysload::note_launch_advisory(selected, advisory);
     if let Some(notice) = created.hook_notice {
@@ -343,7 +371,38 @@ fn provision_with(
     }) {
         log::warn!(target: "workbench", "agent worktree {} is set up but could not record it: {error}", provisioned.path, error = error.message());
     }
+    if seeded {
+        refresh_seeded_index(&provisioned.path);
+    }
     Ok(provisioned)
+}
+
+/// Bring a seeded lane's DevMap store to the lane's own tree.
+///
+/// The seed is the main checkout's latest generation, which can trail its HEAD
+/// and carry its uncommitted edits. DevMap reports that honestly
+/// (`is_fresh: false`), but its SessionStart hook only builds where there is
+/// no store, so a seeded lane would otherwise answer from the main
+/// checkout's working state until something else built it. This is the
+/// GitPulse live refresh every open repository gets: it builds only when
+/// `devmap status` says the store is not fresh, incrementally (measured at
+/// ~2.5 s on this repository, against ~7.6 s cold), on a supervised background
+/// thread holding the lane's writer slot, and it answers without waiting for
+/// the build. Called only once setup is complete, so no build runs in a tree a
+/// failed setup is about to remove.
+fn refresh_seeded_index(path: &str) -> crate::devmap::live::LiveRefreshOutcome {
+    let outcome = crate::devmap::live::start_refresh(path, false);
+    log::info!(
+        target: "workbench",
+        "agent worktree {path}: DevMap index refresh {:?}{}",
+        outcome.decision,
+        outcome
+            .reason
+            .as_deref()
+            .map(|reason| format!(" ({reason})"))
+            .unwrap_or_default()
+    );
+    outcome
 }
 
 /// What a removal left to say beyond "removed": the files that could not be
@@ -847,6 +906,175 @@ mod tests {
         assert_eq!(made.branch, "gitpulse/fix-the-watcher-c0ffee00");
         // The hand-made path into the same container is refused.
         assert!(crate::engine::worktree::refuse_gitpulse_lane_target(&made.path).is_err());
+    }
+
+    /// `codeintel`'s one-generation fixture, trusted, with its source
+    /// committed: an indexed main checkout a lane can be cut from.
+    fn indexed_checkout() -> tempfile::TempDir {
+        let dir = crate::codeintel::tests::repo_with_one_generation();
+        let root = dir.path();
+        crate::test_support::trust_repo(root);
+        // The fixture writes its source but commits nothing; a lane is cut
+        // from a commit.
+        git_text(root, &["add", "src"]).unwrap();
+        git_text(
+            root,
+            &[
+                "-c",
+                "user.name=Workbench Test",
+                "-c",
+                "user.email=workbench@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "init",
+            ],
+        )
+        .unwrap();
+        dir
+    }
+
+    /// A `devmap` that answers every `status` "not fresh" and every `build`
+    /// "ok", logging `<cwd> <argv>` to a file outside any worktree (so it can
+    /// never show in a lane's `git status`).
+    #[cfg(unix)]
+    fn stale_devmap(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let log = dir.join("devmap-argv.log");
+        let bin = dir.join("devmap");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\n\
+                 printf '%s %s\\n' \"$PWD\" \"$*\" >> '{log}'\n\
+                 if [ \"$1\" = status ]; then printf '%s\\n' '{{\"is_fresh\":false,\"schema_outdated\":false}}'; exit 0; fi\n\
+                 if [ \"$1\" = build ]; then printf '%s\\n' '{{\"ok\":true}}'; exit 0; fi\n\
+                 exit 2\n",
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (bin, log)
+    }
+
+    /// The seed is the main checkout's generation, which DevMap reports as not
+    /// fresh for the lane — and its SessionStart hook builds only where there
+    /// is no store. So the lane's own incremental build is started here, in
+    /// the lane, once setup is done; without it the lane answers from the main
+    /// checkout's working state until something else happens to build it.
+    #[cfg(unix)]
+    #[test]
+    fn a_seeded_lane_whose_index_is_not_fresh_gets_its_own_build_started() {
+        let bin_dir = tempfile::tempdir().unwrap();
+        let (bin, log) = stale_devmap(bin_dir.path());
+        let _devmap = crate::devmap::cli::bind_test_binary(bin.to_string_lossy().into_owned());
+        let anchor_dir = indexed_checkout();
+        let made = provision_with(
+            anchor_dir.path().to_str().unwrap(),
+            "d15c0000-8",
+            "Stale seed lane",
+            false,
+            &with_reader(plenty),
+        )
+        .expect("an indexed checkout must still give a lane");
+        let lane = Path::new(&made.path).canonicalize().unwrap();
+        assert!(devmap_query::paths::store_path(&lane).is_file());
+
+        let deadline = std::time::Instant::now()
+            + crate::test_support::env::coverage_relaxed(std::time::Duration::from_secs(10));
+        let built_in_lane = |text: &str| {
+            text.lines().any(|line| {
+                line.split_once(' ').is_some_and(|(cwd, argv)| {
+                    Path::new(cwd).canonicalize().ok().as_deref() == Some(lane.as_path())
+                        && argv.split_whitespace().next() == Some("build")
+                })
+            })
+        };
+        loop {
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            if built_in_lane(&text) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no devmap build was started in the seeded lane {}; devmap saw:\n{text}",
+                lane.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    /// A lane cut from an indexed checkout starts with a DevMap store of its
+    /// own — cloned, bound to the lane, queryable before any build — instead
+    /// of none, which DevMap's SessionStart hook answers with a cold
+    /// full-repository build in every lane.
+    #[test]
+    fn a_lane_cut_from_an_indexed_checkout_gets_its_own_seeded_devmap_store() {
+        // The seeded lane asks for a refresh. No real `devmap` runs in a unit
+        // test: the bound binary is one that is not there, so the ask fails
+        // harmlessly (logged) and the seed stays exactly as placed.
+        let bin_dir = tempfile::tempdir().unwrap();
+        let _devmap = crate::devmap::cli::bind_test_binary(
+            bin_dir
+                .path()
+                .join("no-devmap")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let anchor_dir = indexed_checkout();
+        let made = provision_with(
+            anchor_dir.path().to_str().unwrap(),
+            "d15c0000-7",
+            "Indexed lane",
+            false,
+            &with_reader(plenty),
+        )
+        .expect("an indexed checkout must still give a lane");
+        let lane = Path::new(&made.path);
+        let db = devmap_query::paths::store_path(lane);
+        assert!(
+            db.is_file(),
+            "the lane has no DevMap store of its own at {}",
+            db.display()
+        );
+
+        let status = crate::codeintel::status(&made.path);
+        assert!(
+            status.available,
+            "the seeded store does not open: {status:?}"
+        );
+        assert_eq!(status.generation_id, Some(1), "{status:?}");
+
+        // Bound to the lane, not the checkout it was cloned from: a store that
+        // still names a live sibling is one DevMap refuses to open.
+        let conn =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let bound: String = conn
+            .query_row(
+                "SELECT repo_root FROM generations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(
+            Path::new(&bound).canonicalize().unwrap(),
+            lane.canonicalize().unwrap()
+        );
+
+        // Its own inode — two worktrees writing one SQLite file corrupts it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(std::fs::metadata(&db).unwrap().nlink(), 1);
+        }
+
+        // And it never shows in the lane's `git status`.
+        let porcelain = git_text(lane, &["status", "--porcelain"]).unwrap();
+        assert_eq!(porcelain.trim(), "", "seeding dirtied the lane");
     }
 
     #[test]

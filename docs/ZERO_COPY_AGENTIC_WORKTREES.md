@@ -112,6 +112,7 @@ flowchart LR
   - Instead of copying `devmap.sqlite` into every worktree (which violates SQLite inode locks and `pending_state.repo_root` ownership), `provision_worktree_devmap_zero_copy` writes a `<512 B` atomic JSON pointer ([`ZeroCopyBaseRef`](file:///Users/bharath/Code/devtools/GitPulse/src-tauri/src/codeintel/worktree_overlay.rs#L64-L73) at `codeintel/base_store_ref.json`) referencing the anchor repository's read-only `devmap.sqlite`, mmap `.csr` edge index, and content-addressed `cas/ast/` store, pinned to `anchor_generation_id` and `anchor_head_sha`.
   - When an agent modifies, adds, or deletes files in its worktree, `sync_worktree_overlay` diffs the lane against `anchor_head_sha` (including untracked files), stores Blake3-addressed symbol AST blobs under `<anchor>/.devmap/codeintel/cas/ast/<2-hex>/<blake3>.ast`, computes a `RoaringBitmap` of invalidated CSR node IDs (`dirty_nodes`), and atomically writes `overlay.json`. Unchanged files consume zero per-worktree graph storage.
   - Dependency build caches are cloned using filesystem Copy-on-Write ([`cow_clone.rs`](file:///Users/bharath/Code/devtools/GitPulse/src-tauri/src/engine/cow_clone.rs#L1-L60)), sharing physical disk blocks across worktrees with bounds enforced by `CowCaps` (`MAX_COW_DEPTH = 64`, `MAX_COW_ENTRIES = 1,000,000`, `MAX_COW_BYTES = 8 GiB`).
+  - **Limit (measured 2026-11-06, [§7](#7-measured-what-a-new-agent-lane-gets-from-devmap)):** the pointer is read only by GitPulse's in-process readers. The `devmap` binary that agents query (CLI and `devmap mcp`) does not read `base_store_ref.json`: in a pointer-only lane `devmap status` answers `query_ready: false`, and DevMap's SessionStart hook starts a cold `devmap build` there, which lands a full ~289 MB store beside the pointer. For agent lanes, the CoW-cloned store (`provision_worktree_devmap`, `DevmapMode::Copy`) is the seamless mode.
   - Active agent processes (Claude Code, Codex, Antigravity) are tracked via host load process scanning ([`live_sessions.rs`](file:///Users/bharath/Code/devtools/GitPulse/src-tauri/src/insights/live_sessions.rs#L1-L50)), and overlapping file edits are classified by joining uncommitted diff intervals against DevMap symbol spans ([`entity_collision.rs`](file:///Users/bharath/Code/devtools/GitPulse/src-tauri/src/insights/entity_collision.rs#L1-L40)).
 
 ### Pillar 4: Two-Stage Zero-Copy Compiler Wrapper (`gitpulse-rustc` & `gitpulse-worktree build`)
@@ -289,3 +290,77 @@ CARGO_INCREMENTAL=0 RUSTC_WRAPPER=gitpulse-rustc cargo check --workspace
 - **Managed Task-Lane Directory Reservation**: `refuse_gitpulse_lane_target` rejects manual, CLI, and MCP worktree targets inside `<repo>/.gitpulse/worktrees/` so user or external agent checkouts cannot collide with GitPulse's managed task-attempt lanes.
 - **Path-Traversal & Payload Bounds on the Agent Bus**: `sanitize_claim_paths` rejects absolute paths, `..` segments, and NUL bytes. Advisory `flock(2)` on `<git-common-dir>/gitpulse/lanes/.bus.lock` serializes concurrent readers and writers across processes, enforcing hard caps of 64 active lanes, 128 claimed files/symbols per lane, 256 retained messages, 16 KiB per message body, and a 64 KiB MCP wire ceiling on `gitpulse_worktree_radar` (which sets `truncated: true` rather than exceeding the frame limit).
 - **Bounded Compiler Wrapper Inputs & Sound `OUT_DIR` Reuse**: `gitpulse-rustc` refuses `@<rspfile>` response files larger than 8 MiB or nested deeper than four levels, skips caching whenever `-C incremental` or `build_script_build` is active, and strips comments and string literals (`has_compile_only_out_dir_tokens`) before exempting `# env-dep:OUT_DIR` so crates embedding `env!("OUT_DIR")` at runtime never reuse another worktree's path.
+
+---
+
+## 7. Measured: What a New Agent Lane Gets from DevMap
+
+Measured 2026-11-06 on this repository (main at `5394f4d3`, 3,193 indexed files, 55k symbols), `devmap` 0.2.5, macOS on APFS. The scratch tree was a `git clone --shared` placed on a dedicated 40 GB APFS sparse image, so every disk number below is an exact `df` free-space delta on a volume nothing else wrote to. `du` would report a clone's full logical size and was not used. Graph parity is the SHA-256 of `code_graph.json` after `jq -S` normalization with the lane path replaced.
+
+**What the managed lanes actually held.** Each of the six task lanes under `.gitpulse/worktrees/` carried its own 289–308 MB `devmap.sqlite` at generation 1, with `repo_root` set to the lane, plus a 71 MB `code_graph.json`. The main checkout's store was at generation 4,624. Each lane store was therefore a cold full build, about 2 GB of duplicated index across the lanes. Cause: `workbench::agent_worktree` created lanes through `add_worktree_cached`, which asks for `DevmapMode::None`. DevMap's SessionStart hook (`unindexed_worktree_notice` in DevCouncil `devmap-cli/src/hook.rs`) answers a linked worktree with no store, when its main checkout is indexed, by starting a cold `devmap build` in the background. Until that build lands, every `devmap_*` query in the lane answers "nothing".
+
+| Arm (n) | Time to a queryable store | CPU | Disk written | Graph |
+| --- | --- | --- | --- | --- |
+| Cold `devmap build --manifest` (3) | 7.56 / 7.61 / 7.79 s | ~38.7 CPU-s | 366 MB per lane | `ba04666f…` |
+| Bare CoW clone: `clonefile` store + manifests, rebind `repo_root` in shell (3) | 0.077 / 0.079 / 0.098 s (`query_ready: true`) | — | 3.9–16.5 MB | — |
+| …then incremental `devmap build --manifest` (3) | +2.41 / 2.41 / 2.77 s | — | +0.4 MB | `ba04666f…` (identical) |
+| **GitPulse's `provision_worktree_devmap`** (the seed lanes now get; debug build, separate run on a rebuilt anchor) (3) | 1.13 / 1.14 / 1.19 s (`is_cow: true`, `query_ready: true`, `is_fresh: true`). The second over the bare clone is the seeder's own work, most likely building the CSR sidecar the anchor lacks (not profiled) | — | 7.3–19.8 MB | — |
+| …then incremental `devmap build --manifest` (3) | +2.47 / 2.49 / 2.56 s | — | +0.4 MB | identical to a cold lane with `generation_id` masked (`5ae26d36…`) |
+| Zero-copy pointer only (1) | never: `query_ready: false`, and the hook cold-builds a 289 MB store beside the pointer | as cold | as cold | — |
+| 8 lanes at once, cold (1 run of 8) | 40.7–41.5 s each, 41.6 s wall | 8 × cold | 2.93 GB | 8/8 `ba04666f…` |
+| 8 lanes at once, bare clone + incremental (1 run of 8) | 8.3–8.8 s each, 9.3 s wall | — | 69 MB | 8/8 identical to cold except `generation_id` |
+
+**Break tests:**
+- **Stale or dirty anchor.** The anchor was given an uncommitted edit and rebuilt, then a clean lane was seeded from it. `devmap status` in the lane answered honestly: `is_fresh: false`, `source_freshness: false`. One incremental build (6.2 s) produced a graph that differs from a cold lane's only in `generation_id`. Seeding from a store that describes a different working state never presented itself as fresh. (The check that the dirty symbol was in the anchor's dirty generation used the wrong JSON filter, so that half of the test is inconclusive. The convergence and the stale verdict are measured.)
+- **Anchor with a live WAL.** A writer kept 6.6 MB of uncheckpointed frames in the anchor's `-wal` while copying:
+  - `VACUUM INTO`, today's fallback in `provision_worktree_devmap`: 0.58 s and 284 MB written, consistent.
+  - Cloning the db file alone: lost a committed table (`no such table`), which matches SQLite's documented hazard.
+  - Read-transaction-pinned clone (`BEGIN; SELECT …;` then `clonefile` the db, then `clonefile` the `-wal`, then `COMMIT`): 0.023 s, about 0 bytes, `quick_check` ok, and at least as many rows as the pinned reader saw.
+  - That pinned clone is sound by SQLite's mechanics, not by documented guarantee: a reader's read mark stops a checkpoint past it, and the WAL cannot be reset while the reader holds it. The order matters (db first, then wal).
+  - **Stress:** 25 pinned clones of a 289 MB store, taken while a separate writer process committed continuously with `wal_autocheckpoint=50` so that checkpoints wrote into the db file during the clone. Result: 25/25 passed `PRAGMA integrity_check` and held at least the rows the pinned reader saw. Clone time was min 0.011 s, median 0.078 s, max 0.127 s.
+  - The negative control was weak in that run: a db-only clone also passed 25/25 at that checkpoint rate. It lost data only in the run above, where the writer kept frames uncheckpointed. Treat this as evidence, not proof. Shipping it needs `quick_check` on every clone, with a fallback.
+- **Concurrency.** Eight cold builds in parallel took 5.3× longer each than one alone (41 s vs 7.7 s) on 18 cores. Eight seeded lanes stayed at about 8.5 s each, because the incremental build only re-checks. The cold path is what makes a wave of parallel agents slow and disk-hungry, not git.
+
+- **A seed alone leaves the lane stale (found while reviewing the fix).** The anchor got a new commit and its store was not rebuilt, as on this machine, where main's store was built at `7b200385` while HEAD was `5394f4d3`. A lane seeded from it answered `is_fresh: false`, `rebuild_required: false`. DevMap's SessionStart hook then reported "ready (source moved)" and started nothing, because it builds only where no store exists. Twenty seconds later the lane was still stale, and the new symbol on the lane's HEAD was absent from its index. Before the fix, the cold build gave a correct index in about 8 s. A seed on its own would have traded that for an instant but stale index.
+
+**Fix (this change):** `workbench::agent_worktree::provision_with`, the only creator of managed agent lanes, now does two things:
+1. It creates lanes through `add_worktree_with_devmap(…, DevmapMode::Copy)`. The store is cloned and rebound before the agent starts, so the hook finds a store and starts no cold build.
+2. Once the lane's setup has completed, it asks GitPulse's own live refresh for the lane (`devmap::live::start_refresh(lane, false)`). This is the same gate every open repository gets: it probes `devmap status`, builds only when the store is not fresh, runs the incremental build on a supervised background thread under the lane's writer slot, and returns without waiting.
+
+The lane is therefore queryable at once, and is honestly marked stale until its own build lands, about 2.5 s later on this repository. Like the build caches, a skipped or failed seed is logged and never refuses the lane, because DevMap's hook still covers it. `a_lane_cut_from_an_indexed_checkout_gets_its_own_seeded_devmap_store` fails against the previous code. `a_seeded_lane_whose_index_is_not_fresh_gets_its_own_build_started` fails with the refresh removed: a stub `devmap` reporting `is_fresh: false` must see a `build` run in the lane. **Not measured:** the seed's cost when the anchor's store trails HEAD by many commits (a larger overlay diff), and when the anchor's `-wal` is live, which takes the `VACUUM INTO` path (284 MB written, above). The 1.2 s figure is for a clean anchor at the same HEAD. The general `add_worktree_cached` API stays opt-in, so `a_worktree_created_without_asking_seeds_no_devmap_store_and_says_so` still holds.
+
+**Not fixed here, named:**
+1. **DevCouncil hook (owner: DevCouncil).** Every host that makes worktrees outside GitPulse (Claude Code `.claude/worktrees/`, Codex, Cursor, Conductor) still gets a cold build. The fix belongs in `devmap`: `devmap build --seed-from <main checkout>` clones the main store when the target store is missing (clonefile/FICLONE, or the pinned clone when `-wal` is non-empty), rebinds `pending_state.repo_root` and `generations.repo_root`, then continues as an incremental build. `unindexed_worktree_notice` passes `--seed-from` in `detach_build` when the main checkout is indexed. This is a hand-off: it needs a DevCouncil commit, a `devmap` reinstall, and `bun run check:schema-parity`. It changes no schema.
+2. **Worktrees panel `zeroCopyDevmap` default.** Hand-made worktrees from the panel still get only the pointer, so the hook cold-builds there too. Once item 1 lands, the pointer becomes redundant for agents. Until then the panel default should be the CoW seed.
+3. **`VACUUM INTO` fallback.** Replace it with the pinned clone, gated by `PRAGMA quick_check` on the clone before placement, with `VACUUM INTO` kept as the fallback when the check fails.
+
+## 8. Research Notes: Where Others Spend the Bytes (2026-11-06)
+
+Gathered by four research agents from primary sources. Each claim below was checked against its cited page. The agents' recalled-only claims were left out.
+
+- **Agent hosts duplicate everything ignored.**
+  - Claude Code puts worktrees in `.claude/worktrees/<name>`. It copies only gitignored files listed in `.worktreeinclude`. Its `WorktreeCreate` hook *replaces* git creation and receives `name` plus `cwd` ([docs](https://code.claude.com/docs/en/hooks.md)).
+  - Codex keeps the 15 most recent worktrees under `$CODEX_HOME/worktrees` ([docs](https://learn.chatgpt.com/docs/environments/git-worktrees)).
+  - Cursor runs `.cursor/worktrees.json` setup commands with `ROOT_WORKTREE_PATH` and caps at 25 worktrees ([docs](https://cursor.com/docs/configuration/worktrees)).
+  - Reported costs: 13.8 GB across 13 Claude Code worktrees ([anthropics/claude-code#26725](https://github.com/anthropics/claude-code/issues/26725), open since 2026-02-18), and about 140 GB in a week of Cursor worktrees ([forum, 2025-12-13](https://forum.cursor.com/t/146189)).
+  - None of these hosts seeds a code index. A post-creation setup script or `SessionStart` is where one could. That is why the seed belongs in `devmap` itself (§7 item 1).
+- **Per-file reflink, not directory clone.** Worktrunk moved macOS from whole-directory `clonefile()` to per-file reflink after directory cloning saturated disk I/O ([changelog](https://docs.rs/crate/worktrunk/0.14.2/source/CHANGELOG.md)). The `clonefile(2)` man page itself discourages cloning directories. Clone writes can fail with `ENOSPC` because space is not reserved, so a seeded lane is not a disk reservation.
+- **Cargo.**
+  - `build.build-dir` has been stable since Cargo 1.91 (2025-10-30), with `{workspace-path-hash}` templates. It lets every lane's intermediates live under one deletable root outside the repository.
+  - Cargo still has no shared artifact cache: rust-lang/cargo#5931 and #17453 are open, and the latter is a content-addressed store that reflinks build units.
+  - Fine-grained `build-dir` locking landed in 2025–26. Plain `cargo build`s sharing one target still serialize.
+  - Sharing one `CARGO_TARGET_DIR` across live lanes risks a false "Fresh" verdict on path crates. That risk is a third-party report and was not reproduced here. Don't share a target between live lanes.
+- **sccache.** v0.19.0 (2026-10-24) still copies on a hit; reflink PR #2640 was closed unmerged. `SCCACHE_BASEDIRS` normalizes worktree roots. This matches Pillar 4's premise for `gitpulse-rustc`, which reflinks.
+- **JS and Python already clone.** bun's install backend is `clonefile` on macOS, from one global cache. uv's `link-mode` defaults to `clone`. pnpm's `auto` mode tries clone first. Per-lane `node_modules` is near-free on APFS, so `target/` and the DevMap store were the remaining multipliers.
+- **Code-index prior art.**
+  - Glean stacks an immutable base DB under per-change overlays that hide changed units ([2022-12-01](https://glean.software/blog/incremental)).
+  - Sourcegraph serves an unindexed commit from the nearest indexed ancestor, then adjusts for the line diff.
+  - Bazel's action cache keys output by input hash, shared across workspaces.
+  - SQLite documents the backup API, `VACUUM INTO` and a quiescent file copy *with its `-wal`* as safe. It names a db-only copy during a transaction, and hard links, as corruption risks ([howtocorrupt](https://sqlite.org/howtocorrupt.html)).
+
+**Ranked next steps:**
+1. `devmap build --seed-from` in DevCouncil (§7 item 1). This makes every host's new worktree query-ready in about 0.1 s.
+2. A content-addressed extraction cache shared across worktrees, keyed by (blob SHA, extractor version), under the git common dir. Today's `extraction_cache` lives inside each store and diverges after the first incremental build.
+3. The pinned live-WAL clone in place of `VACUUM INTO` (§7 item 3).
+4. Lane teardown that reclaims `target/` and the store with the worktree, plus `build.build-dir` under one root, because the 250 GiB incidents were cleanup failures, not creation costs.
+5. A Glean-style base-plus-overlay read path in `devmap` itself. This is only worth doing if seeded stores still diverge expensively after (2).
