@@ -782,4 +782,82 @@ mod tests {
             "CARGO_PKG_VERSION {CURRENT_VERSION} must be MAJOR.MINOR.PATCH"
         );
     }
+
+    // ---- adversarial review (adv:) ----
+
+    #[test]
+    fn adv_tag_spelling_edges() {
+        let tags = |l: &str| stable_tags(l).unwrap();
+        // capital V, pre-release, build metadata, leading zeros, no refs/tags prefix
+        assert!(tags(&line("V1.5.0")).is_empty());
+        assert!(tags(&line("v1.6.0-rc.1")).is_empty());
+        assert!(tags(&line("v1.6.0+meta")).is_empty());
+        assert!(tags("0123456789abcdef\tv1.5.0\n").is_empty());
+        assert!(tags("0123456789abcdef\trefs/heads/v1.5.0\n").is_empty());
+        // peeled lines are stripped before the spelling merge: bare + peeled v collapse to the v tag
+        let peeled = format!("{}{}", line("1.5.0"), line("v1.5.0^{}"));
+        let t = tags(&peeled);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].0, "v1.5.0");
+        // CRLF + whitespace + duplicates
+        let crlf =
+            "abc\trefs/tags/v1.5.0\r\n  abc\trefs/tags/v1.5.0  \r\nabc\trefs/tags/v1.5.0\r\n";
+        let t = tags(crlf);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].0, "v1.5.0");
+        // leading zeros: same version as v1.5.0 or rejected; must not yield two entries
+        let lz = format!("{}{}", line("v01.5.0"), line("v1.5.0"));
+        let t = tags(&lz);
+        assert_eq!(
+            t.len(),
+            1,
+            "leading-zero spelling duplicated a version: {t:?}"
+        );
+        assert_eq!(t[0].0, "v1.5.0");
+    }
+
+    #[test]
+    fn adv_dedup_scales_to_the_tag_cap() {
+        let n = MAX_TAG_LINES;
+        let listing: String = (0..n).map(|i| line(&format!("v1.{i}.0"))).collect();
+        let start = std::time::Instant::now();
+        let t = stable_tags(&listing).unwrap();
+        let took = start.elapsed();
+        eprintln!("adv stable_tags n={n} took {took:?}");
+        assert_eq!(t.len(), n);
+        assert!(t.windows(2).all(|w| w[0].1 > w[1].1));
+        let over: String = (0..=n).map(|i| line(&format!("v1.{i}.0"))).collect();
+        assert!(stable_tags(&over).is_err(), "cap must fail loud");
+    }
+
+    #[test]
+    fn adv_ordering_is_newest_first_regardless_of_listing_order() {
+        let tagsv = ["v1.6.2", "v1.6.0", "v1.6.4", "1.6.1", "v1.6.3", "v1.5.0"];
+        let listing: String = tagsv.iter().map(|t| line(t)).collect();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let r = evaluate("1.4.0", &listing, &|tag, _| {
+            asked.borrow_mut().push(tag.to_string());
+            Ok(false)
+        });
+        assert_eq!(
+            *asked.borrow(),
+            ["v1.6.4", "v1.6.3", "v1.6.2", "1.6.1", "v1.6.0"]
+        );
+        assert!(!r.checked);
+        // exactly-budget with one published among them is announced, from any position
+        let r = evaluate("1.4.0", &listing, &|tag, _| Ok(tag == "v1.6.0"));
+        assert!(r.checked && r.update_available, "{r:?}");
+        assert_eq!(r.latest_version, "1.6.0");
+    }
+
+    #[test]
+    fn adv_current_version_forms() {
+        let listing = format!("{}{}", line("v1.5.0"), line("v1.4.0"));
+        // `v` prefix on the running version is not a valid MAJOR.MINOR.PATCH: fails loud, never "current"
+        let r = evaluate("v1.4.0", &listing, &|_, _| Ok(true));
+        assert!(!r.checked && !r.update_available, "{r:?}");
+        // pre-release build of the running version: must fail loud, never silently up to date
+        let r = evaluate("1.5.0-dev", &listing, &|_, _| Ok(true));
+        assert!(!r.checked && !r.update_available, "{r:?}");
+    }
 }
