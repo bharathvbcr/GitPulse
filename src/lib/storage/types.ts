@@ -182,6 +182,130 @@ export interface CommitGraphWriteOutcome {
   note: string | null;
 }
 
+/** Mirrors the Rust `ConfigScope`: the config layer a value was read from. */
+export type ConfigScope = "system" | "global" | "local" | "worktree" | "command" | "unknown";
+
+/** Mirrors the Rust `TuningChange`: the three changes the apply may make. */
+export type TuningChange = "many_files" | "fsmonitor" | "maintenance";
+
+/** Mirrors the Rust `IndexReadState`; `unknown` is "could not read", never "missing". */
+export type IndexReadState = "present" | "missing" | "unknown";
+
+/** Global-config maintenance registration. `null` is unknown, never "not registered". */
+export interface MaintenanceState {
+  registered: boolean | null;
+  strategy: string | null;
+  auto: string | null;
+}
+
+/** Pack and loose-object pressure against `gc.auto`. */
+export interface ObjectPressure {
+  packs: number | null;
+  loose_objects: number | null;
+  /** `loose_objects` came from `git count-objects -v`; otherwise git's own estimate. */
+  loose_exact: boolean;
+  gc_auto: number | null;
+  loose_over_gc_auto: boolean | null;
+}
+
+/** What the index header says (`DIRC`, version, entry count). */
+export interface IndexInfo {
+  state: IndexReadState;
+  version: number | null;
+  /** The tracked-file count from the header. */
+  entries: number | null;
+  /** False under split-index or a sparse index, where the header counts only part. */
+  entries_exact: boolean;
+  skip_hash: boolean | null;
+  note: string | null;
+}
+
+/** One tuning key's value and the config layer that supplied it. */
+export interface TuningKeyValue {
+  key: string;
+  /** `null`: unset, or unknown when `config_note` is set. */
+  value: string | null;
+  origin: ConfigScope | null;
+}
+
+/** Read-only repository tuning census (storage/repo_tuning.rs). */
+export interface RepoTuningReport {
+  maintenance: MaintenanceState;
+  midx: boolean | null;
+  objects: ObjectPressure;
+  index: IndexInfo;
+  partial_clone: boolean | null;
+  sparse_checkout: boolean | null;
+  keys: TuningKeyValue[];
+  config_note: string | null;
+  notes: string[];
+}
+
+/** One change worth offering, and why. */
+export interface TuningOffer {
+  change: TuningChange;
+  title: string;
+  reason: string;
+}
+
+/** The detector's report with the offers that clear their measured thresholds. */
+export interface TuningAdvice {
+  report: RepoTuningReport;
+  offers: TuningOffer[];
+  /** Said on their own, e.g. a `core.splitIndex` / `feature.manyFiles` conflict. */
+  warnings: string[];
+  /** An apply is running in this repository right now (set by the storage scan). */
+  apply_in_flight?: boolean;
+}
+
+/** Where a change writes: the repository's config, the user's, or the OS scheduler. */
+export type TuningScope = "repo_config" | "global_config" | "os_scheduler";
+
+export interface TuningWrite {
+  scope: TuningScope;
+  what: string;
+}
+
+export interface TuningStep {
+  change: TuningChange;
+  /** The exact line, program first. Empty when `skipped`. */
+  argv: string[];
+  writes: TuningWrite[];
+  /** Each command that reverses it, program first. */
+  undo: string[][];
+  undo_note: string | null;
+  /** Facts the person must see before confirming. */
+  notes: string[];
+  /** Why nothing runs for this change (already in place). */
+  skipped: string | null;
+}
+
+/** What a click on "Apply" would run (`cmd_tuning_plan`). */
+export interface TuningPlan {
+  common_dir: string;
+  steps: TuningStep[];
+  timeout_secs: number;
+}
+
+export type TuningStepStatus = "applied" | "skipped" | "failed" | "not_run";
+
+export interface TuningStepResult {
+  change: TuningChange;
+  argv: string[];
+  status: TuningStepStatus;
+  detail: string | null;
+}
+
+/** How a confirmed apply ended (`cmd_tuning_apply`). */
+export interface TuningOutcome {
+  cancelled: boolean;
+  joined: boolean;
+  elapsed_ms: number;
+  results: TuningStepResult[];
+  /** The detector's answer after the run. */
+  advice: TuningAdvice;
+}
+
 export interface StorageReport {
   repo_path: string;
   generated_at_epoch_secs: number;
@@ -196,5 +320,7 @@ export interface StorageReport {
   reclaim_summary: ReclaimSummary;
   /** Absent in payloads from before the detector existed. */
   commit_graph?: CommitGraphReport;
+  /** Repository tuning census and offers; absent before the advisor existed or when the git dir could not be resolved. */
+  tuning?: TuningAdvice | null;
   scan: ScanStats;
 }
