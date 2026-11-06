@@ -2558,3 +2558,177 @@ mod tests {
             .contains("no termination signal is handled"));
     }
 }
+
+/// Adversarial tests for the "keep the pid when the kill did not happen" fix.
+#[cfg(all(test, unix))]
+mod adv_keep_pid_tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    fn slot_holding(label: &str, pid: u32) -> Slot {
+        Arc::new(Entry {
+            label: label.to_string(),
+            pid: Mutex::new(Some(pid)),
+            kill_failures: AtomicU32::new(0),
+        })
+    }
+
+    fn bystander() -> Child {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30").stdin(Stdio::null()).stdout(Stdio::null());
+        cmd.spawn_locked().expect("bystander")
+    }
+
+    fn reap(mut c: Child) {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+
+    /// ATTACK 1: `Registration::drop` takes the pid, force_kill is refused, and
+    /// the registry entry is then removed, so the exit sweep can never retry it.
+    #[test]
+    fn adv_drop_after_a_failed_kill_leaves_the_entry_for_the_exit_sweep() {
+        let b = bystander();
+        let slot = slot_holding("adv-drop", b.id());
+        let key = next_key();
+        lock(registry()).insert(key, Arc::clone(&slot));
+        let registration = Registration {
+            key,
+            slot: Arc::clone(&slot),
+        };
+        drop(registration);
+        let still_registered = lock(registry()).remove(&key).is_some();
+        let pid_after = *lock(&slot.pid);
+        reap(b);
+        assert!(
+            still_registered && pid_after.is_some(),
+            "drop forgot a pid whose kill was refused (registered={still_registered}, pid={pid_after:?}); \
+             reap_all can no longer retry it"
+        );
+    }
+
+    /// ATTACK 1b: `kill_tree` ignores the error but must not forget the pid.
+    #[test]
+    fn adv_kill_tree_after_a_failed_kill_keeps_the_pid() {
+        let b = bystander();
+        let key = next_key();
+        let slot = slot_holding("adv-tree", b.id());
+        let registration = Registration {
+            key,
+            slot: Arc::clone(&slot),
+        };
+        let mut backstop = bystander();
+        registration.kill_tree(&mut backstop);
+        let pid_after = *lock(&slot.pid);
+        let alive = b_alive(&b);
+        let _ = backstop.wait();
+        // Not registered in the global registry: forget the Registration's drop.
+        std::mem::forget(registration);
+        reap(b);
+        assert!(
+            pid_after.is_some(),
+            "kill_tree forgot a pid it failed to kill"
+        );
+        assert!(
+            alive,
+            "kill_tree killed a process outside procguard's groups"
+        );
+    }
+
+    fn b_alive(c: &Child) -> bool {
+        unsafe { libc::kill(c.id() as i32, 0) == 0 }
+    }
+
+    /// ATTACK 3a: a reused pid that is a non-leader in a DIFFERENT group from
+    /// the test's own (a grandchild of a registered-style group leader) is
+    /// refused and survives every sweep.
+    #[test]
+    fn adv_reused_pid_in_a_different_group_is_refused() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 30 & echo $!; wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .process_group(0);
+        let mut parent = cmd.spawn_locked().expect("parent");
+        let mut line = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(parent.stdout.take().expect("stdout")),
+            &mut line,
+        )
+        .expect("grandchild pid");
+        let gpid: u32 = line.trim().parse().expect("pid");
+        let slot = slot_holding("adv-othergroup", gpid);
+        for _ in 0..MAX_KILL_ATTEMPTS + 1 {
+            let _ = sweep(&[Arc::clone(&slot)], Duration::ZERO);
+        }
+        let alive = unsafe { libc::kill(gpid as i32, 0) == 0 };
+        unsafe { libc::killpg(parent.id() as i32, libc::SIGKILL) };
+        let _ = parent.wait();
+        assert!(alive, "a process in another group was killed");
+    }
+
+    /// ATTACK 3b: the vet is group-leader + same-session only; it never compares
+    /// a start time. A pid first refused (so now KEPT by the fix) that later
+    /// appears as a group leader in our session, which is what a reused pid
+    /// belonging to any `setpgid` child of this app looks like, is killed by the
+    /// retry. Before the fix the first refusal cleared the pid and this was safe.
+    #[test]
+    fn adv_a_kept_pid_that_later_becomes_a_leader_is_not_killed() {
+        let mut cmd = Command::new("perl");
+        cmd.args(["-e", "<STDIN>; setpgrp(0,0); sleep 30"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null());
+        let mut p = cmd.spawn_locked().expect("perl");
+        let pid = p.id();
+        let slot = slot_holding("adv-leader", pid);
+        let first = sweep(&[Arc::clone(&slot)], Duration::ZERO);
+        assert!(!first.failed.is_empty(), "setup: first sweep must refuse");
+        // The same pid becomes a group leader in our session.
+        p.stdin.take().expect("stdin").write_all(b"\n").expect("go");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while unsafe { libc::getpgid(pid as i32) } != pid as i32 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(unsafe { libc::getpgid(pid as i32) }, pid as i32, "setup");
+        let _ = sweep(&[Arc::clone(&slot)], Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(100));
+        let alive = p.try_wait().expect("try_wait").is_none();
+        unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
+        let _ = p.kill();
+        let _ = p.wait();
+        assert!(
+            alive,
+            "the retry killed a process that merely reused a kept pid: the guard has no start-time identity"
+        );
+    }
+
+    /// ATTACK 4: two sweeps racing on one slot abandon it exactly once.
+    #[test]
+    fn adv_racing_sweeps_abandon_exactly_once() {
+        let b = bystander();
+        let slot = slot_holding("adv-race", b.id());
+        let abandoned = Arc::new(AtomicU32::new(0));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let slot = Arc::clone(&slot);
+                let abandoned = Arc::clone(&abandoned);
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        let r = sweep(&[Arc::clone(&slot)], Duration::ZERO);
+                        abandoned.fetch_add(r.abandoned.len() as u32, Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("sweeper");
+        }
+        let attempts = slot.kill_failures.load(Ordering::SeqCst);
+        reap(b);
+        assert_eq!(abandoned.load(Ordering::SeqCst), 1);
+        assert_eq!(attempts, MAX_KILL_ATTEMPTS);
+        assert_eq!(*lock(&slot.pid), None);
+    }
+}
