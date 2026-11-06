@@ -351,6 +351,12 @@ The lane, MCP and CLI tests each failed with the change removed. The CLI test fa
    - `unindexed_worktree_notice` passes `--seed-from` in `detach_build` when the main checkout is indexed.
    
    It lands as a DevCouncil branch, then a `devmap` reinstall and `bun run check:schema-parity`. It changes no schema. Once it lands, GitPulse's seed and that hook agree, and the pointer is redundant for agents.
+
+   **Built, not landed:** DevCouncil branch `feat/devmap-seed-from` (`d1ca9808`, on the integration branch's head `e5f87197`; 8 files, +895/−10, no dependency change).
+   - **Tests:** the 3 seed integration tests and the 3 hook tests pass when re-run here. The seed tests cover graph equality with a cold build, refusal of unrelated, sibling and forged sources, and a live-WAL source read through SQLite.
+   - **Measured** (release build, GitPulse clone, n=3): a clean seeded worktree in 0.27 / 0.28 / 0.38 s with 16–33 MB physical, against 5.98 / 6.07 / 8.55 s and ~700 MB cold.
+   - **Clippy:** the repository's clippy gate was already red on `e5f87197`, in files the branch does not touch, so there is no clean clippy proof for the new files.
+   - **Sharing decays after the first real build.** With 20 edited files, the seeded worktree's incremental build wrote ~440–510 MB physical. The incremental write rewrites most of the store, so APFS block sharing survives only until a worktree first diverges. That makes the shared content-addressed extraction cache (§8, step 2) the lasting storage fix; the clone is the fast start.
 2. **Pinned live-WAL clone instead of `VACUUM INTO`: measured, deferred.** A clone is a new file, so its `PRAGMA quick_check` is a cold read: 2.18 s on the 363 MB store (0.26–0.27 s warm, n=3). The pinned clone plus its check therefore costs about 2.3 s, against 0.58 s for `VACUUM INTO`, and saves only the 284 MB write. Shipping it unchecked would rest on a 25-run stress result whose negative control also passed. The path is also rare: devmap checkpoints on close, so main's `-wal` is non-empty only mid-build. `VACUUM INTO` stays.
 
 ## 8. Research Notes: Where Others Spend the Bytes (2026-11-06)
