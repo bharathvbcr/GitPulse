@@ -111,7 +111,7 @@ fn isolate_seeds_the_store_and_starts_the_worktrees_own_build() {
     )
     .expect("gitpulse_worktree_isolate succeeds");
     assert_eq!(isolated["devmap_seeded"], true, "{isolated}");
-    assert!(devmap_query::paths::store_path(&lane.canonicalize().unwrap()).is_file());
+    assert!(devmap_query::paths::store_path(lane.canonicalize().unwrap()).is_file());
     assert_build_runs_in(&log, &lane);
 }
 
