@@ -441,3 +441,67 @@ fn advise_bundles_offers_and_warnings() {
         .iter()
         .all(|o| !o.reason.is_empty() && !o.title.is_empty()));
 }
+
+#[test]
+fn the_maintenance_preview_discloses_the_background_fetch_and_the_object_database_lock() {
+    let r = report(10, 1, 50_000);
+    let plan = plan_apply(&r, NEW_GIT, "/r/.git", &[TuningChange::Maintenance]).unwrap();
+    let step = &plan.steps[0];
+    let notes = step.notes.join(" ");
+    // What the incremental strategy runs, as `git help maintenance` lists it.
+    for word in [
+        "commit-graph hourly",
+        "prefetch hourly",
+        "loose-objects daily",
+        "incremental-repack daily",
+    ] {
+        assert!(notes.contains(word), "{word}: {notes}");
+    }
+    // The unattended network use, with the man page's own words and the opt-out.
+    assert!(notes.contains("Background network"), "{notes}");
+    assert!(notes.contains("all registered remotes"), "{notes}");
+    assert!(notes.contains("refs/prefetch/"), "{notes}");
+    assert!(notes.contains("credential"), "{notes}");
+    assert!(notes.contains("skipFetchAll"), "{notes}");
+    // The lock, as documented, without claiming more than the page says.
+    assert!(
+        notes.contains("lock on the repository's object database"),
+        "{notes}"
+    );
+    assert!(
+        notes.contains("does not take the lock in the same way"),
+        "{notes}"
+    );
+    assert!(
+        notes.contains("does not say whether ordinary reads wait"),
+        "{notes}"
+    );
+    // The undo covers the prefetch for this repository.
+    assert!(step
+        .undo
+        .contains(&strings(&["git", "maintenance", "unregister"])));
+    assert!(
+        notes.contains("`git maintenance unregister` stops it"),
+        "{notes}"
+    );
+    assert!(step
+        .undo_note
+        .as_deref()
+        .unwrap()
+        .contains("prefetch included"));
+    // The hint on the offer says the same in short.
+    let offer = recommend(&r, NEW_GIT)
+        .into_iter()
+        .find(|o| o.change == TuningChange::Maintenance)
+        .unwrap();
+    assert!(
+        offer.reason.contains("background fetch of every remote"),
+        "{}",
+        offer.reason
+    );
+    assert!(
+        offer.reason.contains("object database lock"),
+        "{}",
+        offer.reason
+    );
+}

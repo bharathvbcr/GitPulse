@@ -237,8 +237,10 @@ fn maintenance_offer(report: &RepoTuningReport, env: GitEnv) -> Option<TuningOff
         .filter(|_| report.objects.loose_over_gc_auto == Some(true))?;
     let reason = format!(
         "about {loose} loose objects, past gc.auto (offered from \
-         {MAINTENANCE_MIN_LOOSE_OBJECTS}): a history walk over loose objects measured 3 to \
-         13x slower than over a pack at 15,000, and the loose-objects task restored it."
+         {MAINTENANCE_MIN_LOOSE_OBJECTS}). A history walk over loose objects measured 3 to 13x \
+         slower than over a pack at 15,000, and the loose-objects task restored it. It also \
+         schedules an hourly background fetch of every remote and takes the object database \
+         lock while tasks run."
     );
     Some(offer(TuningChange::Maintenance, reason))
 }
@@ -468,24 +470,42 @@ fn step_for(change: TuningChange, report: &RepoTuningReport) -> TuningStep {
                     },
                     TuningWrite {
                         scope: TuningScope::OsScheduler,
-                        what: "a per-user hourly, daily and weekly job (launchd, cron or a \
-                               systemd timer) that runs git maintenance for every registered \
+                        what: "a per-user job that runs hourly (launchd, cron or a systemd \
+                               timer; the daily tasks run at midnight) for every registered \
                                repository"
                             .to_string(),
                     },
                 ],
                 undo,
                 undo_note: Some(
-                    "`git maintenance unregister` removes this repository from the list but \
-                     leaves the scheduler job. `git maintenance stop` removes the scheduler job \
+                    "`git maintenance unregister` removes this repository from the list, so \
+                     the scheduled tasks, prefetch included, stop running for it, but it leaves \
+                     the scheduler job and the repository's maintenance.auto and \
+                     maintenance.strategy values. `git maintenance stop` removes the scheduler job \
                      for every registered repository, so run it only if no other repository \
                      uses background maintenance."
                         .to_string(),
                 ),
                 notes: vec![
                     "Maintenance with the incremental strategy turns git's automatic gc off for \
-                     this repository and runs prefetch, commit-graph, loose-objects and \
-                     incremental-repack (which keeps a multi-pack-index) on a schedule instead."
+                     this repository. `git help maintenance` lists its schedule: commit-graph \
+                     hourly, prefetch hourly, loose-objects daily, incremental-repack daily, and \
+                     gc disabled."
+                        .to_string(),
+                    "Background network: the hourly prefetch task \"updates the object directory \
+                     with the latest objects from all registered remotes. For each remote, a git \
+                     fetch command is run\", into refs/prefetch/ and without updating tags. It \
+                     runs unattended, as you, with your credential helpers. Exclude a remote with \
+                     remote.<name>.skipFetchAll. `git maintenance unregister` stops it for this \
+                     repository."
+                        .to_string(),
+                    "Object database lock: per `git help maintenance`, \"each git maintenance run \
+                     command takes a lock on the repository's object database\", which keeps \
+                     other concurrent maintenance runs out, and a run that finds it held skips \
+                     its task. The page says `git gc` \"does not take the lock in the same way\" \
+                     and should not be combined with maintenance. The page does not say whether \
+                     ordinary reads wait on the lock, so GitPulse does not claim they are \
+                     unaffected while a task runs."
                         .to_string(),
                 ],
                 skipped: None,
