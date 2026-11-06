@@ -55,6 +55,7 @@ export function validateWorkResponse(command: string, value: unknown): void {
       }
       case "cmd_github_context": {
         const v = record(value); flag(v.available); nullableText(v.error); nullableText(v.runs_error);
+        if (v.prs_error != null) nullableText(v.prs_error);
         if (v.warnings != null) texts(v.warnings);
         list(v.pull_requests, entry => {
           const pr = fields(entry, ["title", "head_ref", "url", "ci_status", "review_decision"]);
