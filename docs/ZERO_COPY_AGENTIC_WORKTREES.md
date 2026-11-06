@@ -410,7 +410,7 @@ Each option is judged on the five things a new agent worktree needs:
 | 2 | Zero-copy pointer (`base_store_ref.json`) | Instant for GitPulse; never for the `devmap` agents run | Reads the anchor | Total | under 1 KB, plus a cold build the hook adds anyway | Read-only anchor | Measured: `query_ready:false`, cold build lands beside it | Opt-in only. Redundant once 4 lands |
 | 3 | **CoW-clone the store, rebind, refresh** (shipped in GitPulse) | ~1.2 s seeder (debug), then ~2.5 s own build | Own inode, `nlink` 1, own `repo_root` | Block-level CoW: only written pages diverge | 7–20 MB, then ~29 MiB of pages + ~72 MB of JSON (71 MB `code_graph.json` + 0.9 MB `repo_map.json`) after a 20-file build | APFS blocks with main until written | Measured | **Shipped** for lanes, panel, MCP, CLI |
 | 4 | **`devmap build --seed-from`** in DevCouncil's hook | 0.27–0.38 s for a clean seed (release) | As 3 | As 3 | As 3; one ~440–510 MB figure unexplained (§7) | As 3 | Measured by its agent; tests re-run on macOS and on Linux (copy fallback) | **Built**: DevCouncil branch, owner to land |
-| 5 | Stop writing whole manifests per build: `code_graph.json` incremental, content-addressed, or produced on demand | Saves part of the ~6.6 s manifest build | Unchanged | JSON written only when read or changed | −71 MB per diverged worktree, 70% of what is left | A content-addressed blob shared across worktrees | Measured: the JSON is 71 of ~100 MB of divergence | **Next, highest payoff** (DevCouncil manifest writer) |
+| 5 | **Block-stable manifest rewrite**: `code_graph.json` written by clone-and-patch (stage a CoW clone of the old file, rewrite only the 4 KiB blocks that differ, read back, rename), with JSON-whitespace padding so unchanged records keep their offsets | Build ~4.7 s against ~4.5 s (agent-measured) | Unchanged: atomic rename kept | Block-level: only changed blocks are written | 20-file edit: **93 of 18,956 blocks** (0.49%) against 14,689 of 17,511 (84%); **~0.45 MiB** physical against ~68 MiB (n=3, isolated APFS image); file +8.3% | Patched file keeps sharing blocks with the one it was cloned from | Agent-measured. I re-ran its CLI block test (1/1) and layout tests (12/12). JSON value unchanged; consumers in DevCouncil, GitPulse and Manvi checked (see below) | **Built, not landed**: DevCouncil `feat/devmap-manifest-blocks` (`bccaf1eb`) |
 | 6 | Index churn: `idx_payload_literals_value` rewrote 16.8 of 28.7 MiB on a 20-file build | — | — | — | ~−17 MB per diverged worktree | — | Measured, page-level | Next: insert in key order, or move literals to a per-file blob |
 | 7 | Shared content-addressed extraction cache (blob SHA + extractor version) under the git common dir | Cold builds in new repos reuse parses | Read-mostly shared CAS; per-worktree generations | Parse once per blob, across all worktrees | Saves parse CPU more than bytes: payload rows are only ~1.1 MiB of a 20-file divergence | Every worktree and the main checkout | Measured divergence says bytes are not the bottleneck; CPU is unmeasured | **Deprioritized**: a schema change across DevCouncil, GitPulse, Manvi and Jarvis, for little storage |
 | 8 | Glean-style base + overlay read path in `devmap` | Instant | Overlay per worktree | Total | Overlay only | Base DB | Glean 2022 post; not built | Only if 3–6 still cost too much; every query path must learn overlays |
@@ -421,9 +421,21 @@ Each option is judged on the five things a new agent worktree needs:
 | 13 | Build artifacts: per-lane `target/` CoW clone, `build.build-dir` under one root, cleanup on teardown | Seconds to clone; path crates rebuild | Per lane | Block-level | Diverges at the first build (14 lanes ate 250 GiB) | Until the first build | Memory notes plus Cargo docs (§8) | Cleanup on teardown is the fix; sccache and Cargo's CAS store are third-party or not yet shipped |
 | 14 | Warm pool of pre-seeded worktrees | Hidden behind the pool | Full | — | Pool × (3) | As 3 | Idea (§8) | Worth it only if 3's 1.2 s matters to users |
 
+**Option 5 in detail.** Built by a Sonnet agent on DevCouncil `feat/devmap-manifest-blocks` (`bccaf1eb`, 8 files, +1,268/−11, no schema or dependency change).
+- **Consumers it checked:**
+  - Readers that load the whole file and parse it: DevCouncil `devmap-query` `host.rs`, which GitPulse also uses; the Go `repomap` loader (run on a padded file, `DeepEqual` to the compact one); the streaming `artifact.go` (run as well); and Manvi's `json.load`.
+  - The stamp reader in `artifacts.rs`: it uses size, mtime and inode, and fails closed by regenerating.
+  - None hashes the file or depends on its exact bytes.
+- **Agent-reported costs:**
+  - The first `--manifest` after upgrading rewrites the file once, because an unpadded file has no layout to keep.
+  - An older `devmap` writing over a padded file strips the padding, so the two versions can thrash, though never corrupt.
+  - Peak memory holds both the old and the new file.
+  - The Linux `FICLONE` path was compile-checked only.
+- **Open before landing:** `hook_conformance::briefs_agree_with_status_across_many_worktrees_under_concurrency` is flaky on the unmodified base too (1 of 5 runs failed per the agent). On the branch it failed 3 of 6 isolated runs (agent's 3 plus mine). That sample is too small to say whether the branch's extra read of the previous file widens a timing window. Measure it under load before merging.
+
 **Ranked next steps, from the measurements:**
-1. Land 3 and 4 (owner actions in task ft-0d206de5).
-2. Option 5: the JSON export is now the largest per-worktree cost.
+1. ~~Land 3 and 4~~: landed on 2026-11-06 with owner approval. GitPulse main is at `4ea5909a` and `gitpulse-mcp` was reinstalled. DevCouncil is at `f632b69e` and `devmap` was reinstalled. A plain `git worktree add` lane is now `query_ready` 0.53–0.61 s after SessionStart (n=3). GitPulse.app is not yet rebuilt.
+2. Land option 5 once the flaky-test question above is answered.
 3. Option 6.
 4. Lane teardown that reclaims `target/` (option 13).
 5. Options 7 and 8 only if 2–4 leave a cost worth a cross-app schema change.
