@@ -358,7 +358,15 @@ The lane, MCP and CLI tests each failed with the change removed. The CLI test fa
    - **Tests:** the 3 seed integration tests and the 3 hook tests pass when re-run here. The seed tests cover graph equality with a cold build, refusal of unrelated, sibling and forged sources, and a live-WAL source read through SQLite.
    - **Measured** (release build, GitPulse clone, n=3): a clean seeded worktree in 0.27 / 0.28 / 0.38 s with 16–33 MB physical, against 5.98 / 6.07 / 8.55 s and ~700 MB cold.
    - **Clippy:** the repository's clippy gate was already red on `e5f87197`, in files the branch does not touch, so there is no clean clippy proof for the new files.
-   - **Sharing decays after the first real build.** With 20 edited files, the seeded worktree's incremental build wrote ~440–510 MB physical. The incremental write rewrites most of the store, so APFS block sharing survives only until a worktree first diverges. That makes the shared content-addressed extraction cache (§8, step 2) the lasting storage fix; the clone is the fast start.
+   - **Linux:** checked in a `rust:1.99.0` container (aarch64, overlay filesystem). `devmap-store` and `devmap-cli` compile for all targets, including the `FICLONE` path. The 3 seed tests pass; overlay has no reflink, so this ran the plain-copy fallback. The 3 new hook tests pass. The one failure, `an_unremovable_stale_lock_terminates`, is pre-existing: it cannot build its condition as root ("running as root?").
+   - **Unexplained, not yet trusted:** the agent reported ~440–510 MB `df` growth after a 20-file incremental build in a seeded worktree. That contradicts the page-level measurement below. One candidate is that its seed took the `VACUUM INTO` fallback, which happens whenever the source's `-wal` is non-empty and is a full ~290 MB rewrite. Another is `df` noise on a shared volume. Re-measure on a dedicated APFS image before relying on that number.
+
+**How much sharing survives the first real build (measured).** A lane was CoW-seeded on GitPulse's path, 20 Rust files in it were edited, and `devmap build --manifest` ran (6.6 s).
+- **The store is written in place:** its inode is unchanged, so APFS keeps every block nobody wrote shared.
+- **What diverged:** a 16 KiB-page comparison against the seed found 1,838 changed or new pages, 28.7 MiB, which is 10% of the store. Of that, 16.8 MiB is one index (`idx_payload_literals_value`), and the rest is mostly `generations`, `generation_dead_symbols` and the payload rows of the edited files. The `repo_root` rebind alone touches 4 MiB (`generations`).
+- **The largest unshared cost is outside the store:** `code_graph.json` (71 MB) and `repo_map.json` (0.9 MB) are rewritten whole on every manifest build.
+
+So a seeded lane costs about 100 MB once it diverges, not the full 366 MB of a cold build, and 70% of that is the JSON export.
 2. **Pinned live-WAL clone instead of `VACUUM INTO`: measured, deferred.** A clone is a new file, so its `PRAGMA quick_check` is a cold read: 2.18 s on the 363 MB store (0.26–0.27 s warm, n=3). The pinned clone plus its check therefore costs about 2.3 s, against 0.58 s for `VACUUM INTO`, and saves only the 284 MB write. Shipping it unchecked would rest on a 25-run stress result whose negative control also passed. The path is also rare: devmap checkpoints on close, so main's `-wal` is non-empty only mid-build. `VACUUM INTO` stays.
 
 ## 8. Research Notes: Where Others Spend the Bytes (2026-11-06)
@@ -385,9 +393,37 @@ Gathered by four research agents from primary sources. Each claim below was chec
   - Bazel's action cache keys output by input hash, shared across workspaces.
   - SQLite documents the backup API, `VACUUM INTO` and a quiescent file copy *with its `-wal`* as safe. It names a db-only copy during a transaction, and hard links, as corruption risks ([howtocorrupt](https://sqlite.org/howtocorrupt.html)).
 
-**Ranked next steps:**
-1. `devmap build --seed-from` in DevCouncil (§7 item 1). This makes every host's new worktree query-ready in about 0.1 s.
-2. A content-addressed extraction cache shared across worktrees, keyed by (blob SHA, extractor version), under the git common dir. Today's `extraction_cache` lives inside each store and diverges after the first incremental build.
-3. ~~The pinned live-WAL clone in place of `VACUUM INTO`~~: measured and deferred (§7). Its integrity check on a cold clone costs more than `VACUUM INTO` saves in time.
-4. Lane teardown that reclaims `target/` and the store with the worktree, plus `build.build-dir` under one root, because the 250 GiB incidents were cleanup failures, not creation costs.
-5. A Glean-style base-plus-overlay read path in `devmap` itself. This is only worth doing if seeded stores still diverge expensively after (2).
+### Solutions Matrix: How Each Option Handles a New Agent Worktree
+
+Each option is judged on the five things a new agent worktree needs:
+- **Create:** how long until the agent can work.
+- **Isolate:** whether one worktree's writes can reach another's.
+- **Lazy:** what is copied up front versus on demand.
+- **Store:** bytes held per worktree.
+- **Share:** how caches are shared with the main checkout.
+
+"Measured" means measured on this repository in §7; anything else names its source or says it is unmeasured.
+
+| # | Option | Create | Isolate | Lazy | Store per worktree | Share with main | Evidence | Verdict |
+|---|---|---|---|---|---|---|---|---|
+| 1 | Cold `devmap build` per worktree (before) | 7.6 s, 38 CPU-s; 41 s each with 8 at once | Full | None | 366 MB | None | Measured | Replaced |
+| 2 | Zero-copy pointer (`base_store_ref.json`) | Instant for GitPulse; never for the `devmap` agents run | Reads the anchor | Total | under 1 KB, plus a cold build the hook adds anyway | Read-only anchor | Measured: `query_ready:false`, cold build lands beside it | Opt-in only. Redundant once 4 lands |
+| 3 | **CoW-clone the store, rebind, refresh** (shipped in GitPulse) | ~1.2 s seeder (debug), then ~2.5 s own build | Own inode, `nlink` 1, own `repo_root` | Block-level CoW: only written pages diverge | 7–20 MB, then ~29 MiB of pages + 72 MB of JSON after a 20-file build | APFS blocks with main until written | Measured | **Shipped** for lanes, panel, MCP, CLI |
+| 4 | **`devmap build --seed-from`** in DevCouncil's hook | 0.27–0.38 s for a clean seed (release) | As 3 | As 3 | As 3; one ~440–510 MB figure unexplained (§7) | As 3 | Measured by its agent; tests re-run on macOS and on Linux (copy fallback) | **Built**: DevCouncil branch, owner to land |
+| 5 | Stop writing whole manifests per build: `code_graph.json` incremental, content-addressed, or produced on demand | Saves part of the ~6.6 s manifest build | Unchanged | JSON written only when read or changed | −71 MB per diverged worktree, 70% of what is left | A content-addressed blob shared across worktrees | Measured: the JSON is 71 of ~100 MB of divergence | **Next, highest payoff** (DevCouncil manifest writer) |
+| 6 | Index churn: `idx_payload_literals_value` rewrote 16.8 of 28.7 MiB on a 20-file build | — | — | — | ~−17 MB per diverged worktree | — | Measured, page-level | Next: insert in key order, or move literals to a per-file blob |
+| 7 | Shared content-addressed extraction cache (blob SHA + extractor version) under the git common dir | Cold builds in new repos reuse parses | Read-mostly shared CAS; per-worktree generations | Parse once per blob, across all worktrees | Saves parse CPU more than bytes: payload rows are only ~1.1 MiB of a 20-file divergence | Every worktree and the main checkout | Measured divergence says bytes are not the bottleneck; CPU is unmeasured | **Deprioritized**: a schema change across DevCouncil, GitPulse, Manvi and Jarvis, for little storage |
+| 8 | Glean-style base + overlay read path in `devmap` | Instant | Overlay per worktree | Total | Overlay only | Base DB | Glean 2022 post; not built | Only if 3–6 still cost too much; every query path must learn overlays |
+| 9 | Pinned live-WAL clone instead of `VACUUM INTO` | 0.02–0.13 s copy plus 2.18 s cold `quick_check` | As 3 | Block-level | ~0 instead of 284 MB | As 3 | Measured: 25/25 consistent; control weak | **Deferred**: slower than `VACUUM INTO` once checked, and rare |
+| 10 | Sparse cone checkout (`--sparse`) | Fewer files written | Full | Directory-level | Proportional to the cone | Object store | Existing GitPulse feature; not re-measured | Keep for narrow tasks; DevMap-expanded cone |
+| 11 | Virtual file system (EdenFS / ProjFS / FUSE) | Instant | Full | File-level on read | Materialized files only | Server or daemon | §8 research | Rejected: daemon, entitlements, server |
+| 12 | One working tree, many lanes (GitButler style) | Instant | **None between agents' builds** | — | 0 | Total | §8 research | Rejected for parallel agents |
+| 13 | Build artifacts: per-lane `target/` CoW clone, `build.build-dir` under one root, cleanup on teardown | Seconds to clone; path crates rebuild | Per lane | Block-level | Diverges at the first build (14 lanes ate 250 GiB) | Until the first build | Memory notes plus Cargo docs (§8) | Cleanup on teardown is the fix; sccache and Cargo's CAS store are third-party or not yet shipped |
+| 14 | Warm pool of pre-seeded worktrees | Hidden behind the pool | Full | — | Pool × (3) | As 3 | Idea (§8) | Worth it only if 3's 1.2 s matters to users |
+
+**Ranked next steps, from the measurements:**
+1. Land 3 and 4 (owner actions in task ft-0d206de5).
+2. Option 5: the JSON export is now the largest per-worktree cost.
+3. Option 6.
+4. Lane teardown that reclaims `target/` (option 13).
+5. Options 7 and 8 only if 2–4 leave a cost worth a cross-app schema change.
