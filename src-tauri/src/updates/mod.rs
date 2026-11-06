@@ -198,8 +198,17 @@ pub fn stable_tags(ls_remote_output: &str) -> Result<Vec<(String, Version)>, Str
         let Some(version) = parse_release_tag(tag) else {
             continue;
         };
-        if !found.iter().any(|(_, known)| *known == version) {
-            found.push((tag.to_string(), version));
+        match found.iter_mut().find(|(_, known)| *known == version) {
+            None => found.push((tag.to_string(), version)),
+            // Two spellings of one version: keep the one the release workflow
+            // publishes, whichever `ls-remote` listed first.
+            Some(existing) => {
+                if tag.starts_with(RELEASE_TAG_PREFIX)
+                    && !existing.0.starts_with(RELEASE_TAG_PREFIX)
+                {
+                    existing.0 = tag.to_string();
+                }
+            }
         }
     }
     found.sort_by_key(|(_, version)| std::cmp::Reverse(*version));
@@ -211,10 +220,21 @@ pub fn latest_stable_tag(ls_remote_output: &str) -> Result<Option<(String, Versi
     Ok(stable_tags(ls_remote_output)?.into_iter().next())
 }
 
+/// Prefix of the tags the release workflow publishes.
+///
+/// Coupled to `.github/workflows/release.yml`, which triggers on `v*` tags
+/// only: a bare `1.2.3` tag never gets a release, so when both spellings of a
+/// version exist [`stable_tags`] keeps this one.
+const RELEASE_TAG_PREFIX: char = 'v';
+
 /// How many tags newer than the running build are probed for a published
-/// release before the check gives up and reports nothing to announce. A tag
-/// with no release is the exception, not a queue; the bound keeps a repository
-/// with many such tags from turning one check into many network round trips.
+/// release. A tag with no release is the exception, not a queue; the bound
+/// keeps a repository with many such tags from turning one check into many
+/// network round trips.
+///
+/// Newer tags beyond the bound are unverified, and [`evaluate`] *fails closed*
+/// on them (`checked: false`) rather than raising the bound or reporting up to
+/// date: a published release may sit behind them.
 const MAX_RELEASE_PROBES: usize = 5;
 
 /// Name of the asset a *finished* release carries and a draft does not expose.
@@ -253,7 +273,8 @@ fn release_is_published(tag: &str, version: Version) -> Result<bool, CommandErro
 /// asked only about tags newer than `current_version`, newest first, at most
 /// [`MAX_RELEASE_PROBES`] of them; the first one it confirms is the update. If
 /// it cannot answer, the whole check fails rather than guessing in either
-/// direction: an unverifiable tag is neither announced nor ruled out.
+/// direction: an unverifiable tag is neither announced nor ruled out. Likewise
+/// when the budget is spent and newer tags remain unasked.
 ///
 /// Split from [`check_for_update`] so the whole decision — including the
 /// "remote has no stable tag at all" and "remote is behind us" branches — is
@@ -290,11 +311,11 @@ pub fn evaluate(
     if *newest <= current {
         return up_to_date(*newest);
     }
-    for (tag, version) in tags
+    let newer: Vec<&(String, Version)> = tags
         .iter()
         .filter(|(_, version)| *version > current)
-        .take(MAX_RELEASE_PROBES)
-    {
+        .collect();
+    for (tag, version) in newer.iter().copied().take(MAX_RELEASE_PROBES) {
         match published(tag, *version) {
             Ok(true) => {
                 return UpdateCheck {
@@ -318,7 +339,16 @@ pub fn evaluate(
             }
         }
     }
-    // Tags newer than this build exist, and none of them has a published
+    let unverified = newer.len().saturating_sub(MAX_RELEASE_PROBES);
+    if unverified > 0 {
+        // Fails closed: a published release may sit behind the unpublished
+        // tags that used the budget, so "up to date" is not known.
+        return UpdateCheck::failed(format!(
+            "{unverified} newer {} went unverified after {MAX_RELEASE_PROBES} unpublished tags; see the releases page",
+            if unverified == 1 { "tag" } else { "tags" }
+        ));
+    }
+    // Every tag newer than this build was probed and none has a published
     // release: nothing is installable, so there is nothing to announce.
     up_to_date(current)
 }
@@ -579,8 +609,10 @@ mod tests {
         assert!(result.error.unwrap().contains("curl is not installed"));
     }
 
+    /// Regression (RELEASE-01): the probe budget ran out with newer tags still
+    /// unasked and the check fell through to "up to date".
     #[test]
-    fn release_probes_are_bounded_and_skip_tags_not_newer_than_us() {
+    fn release_probes_are_bounded_and_an_exhausted_budget_fails_closed() {
         let listing: String = (0..40)
             .map(|patch| line(&format!("v1.3.{patch}")))
             .collect::<String>()
@@ -590,9 +622,83 @@ mod tests {
             probes.set(probes.get() + 1);
             Ok(false)
         });
-        assert!(result.checked && !result.update_available);
-        assert_eq!(probes.get(), MAX_RELEASE_PROBES);
+        assert_eq!(probes.get(), MAX_RELEASE_PROBES, "probing stays bounded");
+        assert!(!result.checked, "{result:?}");
+        assert!(!result.update_available, "{result:?}");
+        assert!(result.latest_version.is_empty(), "{result:?}");
+        let error = result.error.expect("a failed check carries its reason");
+        assert!(error.contains("35 newer tags"), "unexpected: {error}");
+        assert!(result.release_url.ends_with("/releases"));
+    }
 
+    /// The audit's failure: build 1.4.0, v1.6.0..v1.6.4 unpublished, v1.5.0
+    /// published. The published release is out of probe reach, so the honest
+    /// answer is "could not check" (the fail-closed option, not a larger bound).
+    #[test]
+    fn a_published_release_behind_the_probe_budget_is_not_reported_as_up_to_date() {
+        let listing: String = ["v1.6.4", "v1.6.3", "v1.6.2", "v1.6.1", "v1.6.0", "v1.5.0"]
+            .iter()
+            .map(|tag| line(tag))
+            .collect();
+        let probes = std::cell::Cell::new(0usize);
+        let result = evaluate("1.4.0", &listing, &|tag, _| {
+            probes.set(probes.get() + 1);
+            Ok(tag == "v1.5.0")
+        });
+        assert_eq!(probes.get(), MAX_RELEASE_PROBES);
+        assert!(!result.checked, "{result:?}");
+        assert!(!result.update_available, "{result:?}");
+        assert!(result.error.unwrap().contains("1 newer tag"));
+    }
+
+    /// Exactly the budget's worth of newer tags, none published: every newer
+    /// tag was asked about, so "nothing installable" is verified, not assumed.
+    #[test]
+    fn covering_every_newer_tag_within_the_budget_is_honestly_up_to_date() {
+        let listing: String = (0..MAX_RELEASE_PROBES)
+            .map(|patch| line(&format!("v1.3.{patch}")))
+            .collect::<String>()
+            + &line("v1.0.0");
+        let probes = std::cell::Cell::new(0usize);
+        let result = evaluate("1.2.0", &listing, &|_, _| {
+            probes.set(probes.get() + 1);
+            Ok(false)
+        });
+        assert_eq!(probes.get(), MAX_RELEASE_PROBES);
+        assert!(result.checked && !result.update_available, "{result:?}");
+        assert_eq!(result.latest_version, "1.2.0");
+        assert_eq!(result.error, None);
+    }
+
+    /// Regression (RELEASE-02): the first spelling listed won, so a bare
+    /// `1.5.0` ahead of `v1.5.0` made the probe ask for a release the `v*`
+    /// workflow never publishes.
+    #[test]
+    fn two_spellings_of_one_version_probe_the_v_tag_the_workflow_publishes() {
+        for listing in [
+            format!("{}{}", line("1.5.0"), line("v1.5.0")),
+            format!("{}{}", line("v1.5.0"), line("1.5.0")),
+        ] {
+            let tags = stable_tags(&listing).unwrap();
+            assert_eq!(tags.len(), 1);
+            assert_eq!(tags[0].0, "v1.5.0");
+
+            let asked = std::cell::RefCell::new(Vec::new());
+            let result = evaluate("1.4.0", &listing, &|tag, _| {
+                asked.borrow_mut().push(tag.to_string());
+                Ok(tag == "v1.5.0")
+            });
+            assert_eq!(*asked.borrow(), ["v1.5.0"]);
+            assert!(result.update_available, "{result:?}");
+            assert!(result.release_url.ends_with("/releases/tag/v1.5.0"));
+        }
+        // A version published only under the bare spelling is still probed.
+        let bare = stable_tags(&line("1.6.0")).unwrap();
+        assert_eq!(bare[0].0, "1.6.0");
+    }
+
+    #[test]
+    fn newer_tags_are_never_probed_for_a_build_that_is_ahead() {
         let probes = std::cell::Cell::new(0usize);
         let behind = evaluate("2.0.0", &line("v1.9.9"), &|_, _| {
             probes.set(probes.get() + 1);
