@@ -331,6 +331,44 @@ fn lock_finished_builds() -> std::sync::MutexGuard<'static, HashMap<String, Live
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Most outcomes [`finished_builds`] holds at once.
+pub(crate) const MAX_FINISHED_BUILDS: usize = 64;
+
+/// Park a background build's outcome for the next ask about `repo_path`.
+///
+/// An outcome is only collected by a later ask for the same path, and a
+/// worktree seeded and refreshed in the background
+/// ([`refresh_seeded_worktree`]) is often never asked about again: a lane
+/// removed after its run, an MCP worktree nobody opens. Unbounded, the map kept
+/// one outcome (with up to a build's captured stdout) per such worktree for the
+/// life of the app or `gitpulse-mcp`. So a park first drops outcomes for paths
+/// that no longer exist, then, if the map is still full, any one other outcome.
+/// Dropping one is safe: an ask that finds nothing parked probes `devmap
+/// status` and decides from that, exactly as it does for a repository no
+/// background build ever ran for, so the cost is one extra probe.
+fn park_finished_build(repo_path: &str, outcome: LiveRefreshOutcome) {
+    park_bounded(
+        &mut lock_finished_builds(),
+        repo_path,
+        outcome,
+        MAX_FINISHED_BUILDS,
+    );
+}
+
+/// [`park_finished_build`]'s rule over any map and cap, so it is testable
+/// without filling the process-wide map other tests' builds park in.
+fn park_bounded<V>(parked: &mut HashMap<String, V>, repo_path: &str, value: V, cap: usize) {
+    if !parked.contains_key(repo_path) && parked.len() >= cap {
+        parked.retain(|path, _| std::path::Path::new(path).exists());
+        if parked.len() >= cap {
+            if let Some(evicted) = parked.keys().next().cloned() {
+                parked.remove(&evicted);
+            }
+        }
+    }
+    parked.insert(repo_path.to_string(), value);
+}
+
 /// How long [`start_refresh`] waits for the `devmap status` probe it started
 /// before answering that the probe is pending. Long enough that an ordinary
 /// probe (tens of milliseconds) never shows the caller a pending answer, short
@@ -1266,7 +1304,7 @@ fn run_detached_build(
     let panicked = settle.clone();
     let settler: BuildSettler = Box::new(move |spawned| {
         let outcome = settle.record(spawned, build_clock.elapsed());
-        lock_finished_builds().insert(settle.repo_path.clone(), outcome);
+        park_finished_build(&settle.repo_path, outcome);
         // Free for the next repository the moment the outcome is
         // collectable, not when this thread finishes unwinding.
         drop(slot);
@@ -1276,7 +1314,7 @@ fn run_detached_build(
             Err("the live index build thread panicked".into()),
             build_clock.elapsed(),
         );
-        lock_finished_builds().insert(panicked.repo_path.clone(), outcome);
+        park_finished_build(&panicked.repo_path, outcome);
         resume_unwind(payload);
     }
 }
@@ -1385,6 +1423,78 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::procguard::LockedSpawn;
+
+    /// A seeded worktree that is never asked about again (removed after its
+    /// run) must not keep its parked outcome for the life of the process: the
+    /// next park drops outcomes for paths that are gone.
+    #[test]
+    fn a_full_park_drops_outcomes_for_worktrees_that_are_gone() {
+        const CAP: usize = 8;
+        // Each fresh map iterates in its own random order, so a rule that
+        // evicted an arbitrary entry instead of the gone one would hide a live
+        // outcome's eviction only about once in eight; ten maps make a chance
+        // pass (1/8)^10.
+        for round in 0..10 {
+            let dir = tempfile::tempdir().unwrap();
+            let mut parked: HashMap<String, usize> = HashMap::new();
+            let gone = dir.path().join("removed-lane");
+            std::fs::create_dir(&gone).unwrap();
+            let gone = gone.to_string_lossy().into_owned();
+            park_bounded(&mut parked, &gone, 0, CAP);
+            let live: Vec<String> = (1..CAP)
+                .map(|i| {
+                    let path = dir.path().join(format!("lane-{i}"));
+                    std::fs::create_dir(&path).unwrap();
+                    path.to_string_lossy().into_owned()
+                })
+                .collect();
+            for (i, path) in live.iter().enumerate() {
+                park_bounded(&mut parked, path, i + 1, CAP);
+            }
+            std::fs::remove_dir(&gone).unwrap();
+
+            let newest = dir.path().join("lane-new");
+            std::fs::create_dir(&newest).unwrap();
+            park_bounded(&mut parked, &newest.to_string_lossy(), CAP, CAP);
+
+            assert!(
+                !parked.contains_key(&gone),
+                "round {round}: a removed worktree's outcome stayed"
+            );
+            assert!(
+                live.iter().all(|path| parked.contains_key(path)),
+                "round {round}: a live outcome was dropped while a gone one could go"
+            );
+            assert_eq!(parked.len(), CAP);
+        }
+    }
+
+    /// However many worktrees park outcomes, the map stays at its cap; and a
+    /// repository already parked is replaced in place, never evicting another.
+    #[test]
+    fn parked_outcomes_never_exceed_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parked: HashMap<String, usize> = HashMap::new();
+        let paths: Vec<String> = (0..10)
+            .map(|i| {
+                let path = dir.path().join(format!("lane-{i}"));
+                std::fs::create_dir(&path).unwrap();
+                path.to_string_lossy().into_owned()
+            })
+            .collect();
+        for (i, path) in paths.iter().enumerate() {
+            park_bounded(&mut parked, path, i, 4);
+            assert!(parked.len() <= 4, "{} parked over a cap of 4", parked.len());
+        }
+        let kept: Vec<String> = parked.keys().cloned().collect();
+        park_bounded(&mut parked, &kept[0], 99, 4);
+        assert_eq!(parked.len(), 4);
+        assert!(
+            kept.iter().all(|path| parked.contains_key(path)),
+            "re-parking one evicted another"
+        );
+        assert_eq!(parked[&kept[0]], 99);
+    }
     use serde_json::json;
 
     /// A build the gate would not start is a deferral, not a failed refresh:
