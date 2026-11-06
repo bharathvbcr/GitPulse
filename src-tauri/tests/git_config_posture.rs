@@ -1,8 +1,9 @@
-//! GitPulse never writes a user's repository configuration, and never turns on
-//! the git performance features that live in it.
+//! GitPulse writes no repository configuration, with one narrow, owner-approved
+//! exception: the user-clicked, previewed, gated tuning apply.
 //!
-//! Owner decision (ft-7450105d, 2026-10-12). `core.untrackedCache` and
-//! `core.fsmonitor` are the user's to enable:
+//! Owner decision (ft-7450105d, 2026-10-12): `core.untrackedCache` and
+//! `core.fsmonitor` were the user's to enable, and nothing in GitPulse wrote
+//! repo config:
 //!
 //! - every git child runs with `GIT_OPTIONAL_LOCKS=0`, which stops `git status`
 //!   from refreshing the index, and the untracked cache is a feature of the
@@ -11,12 +12,29 @@
 //!   repository that nothing in GitPulse owns, supervises or stops, and that
 //!   outlives the application.
 //!
+//! Owner decision (ft-6b68be32, 2026-11-06), "apply recommended git tuning too,
+//! approved": GitPulse may APPLY recommended tuning, but only through a
+//! user-clicked, previewed action behind the command gate. That reverses the
+//! rule for that action alone, and this test is narrowed to exactly it, not
+//! removed:
+//!
+//! - the one file that may build a config-writing argv, or name
+//!   `feature.manyFiles`, is `storage/repo_tuning/advice.rs`, and the one file
+//!   besides it that may name the tuning keys (to read them) is
+//!   `storage/repo_tuning.rs`;
+//! - in that file every `git config` argv is `git config --local <key> true`
+//!   for `feature.manyFiles` or `core.fsmonitor` (never `core.splitIndex`,
+//!   never `--global` or `--system`, never another value) or the undo
+//!   `git config --local --unset <key>`; the only other commands are
+//!   `git maintenance start|unregister` and `git fsmonitor--daemon stop`;
+//! - every other production file still builds no `git config` write and sets
+//!   neither key to anything but `false` (`storage/mod.rs` passes
+//!   `core.fsmonitor=false` so a read cannot start the daemon).
+//!
 //! The watcher already treats the daemon's cookie writes as noise when the user
-//! has enabled it themselves. These properties are of the *source*, so they are
-//! asserted over the source (the way `tests/spawn_seam.rs` asserts the spawn
-//! seam): no production file builds a `git config` write argv, and none sets
-//! either key to anything but `false` (`storage/mod.rs` passes
-//! `core.fsmonitor=false` so a read cannot start the daemon).
+//! (or the apply) has enabled it. These properties are of the *source*, so they
+//! are asserted over the source (the way `tests/spawn_seam.rs` asserts the spawn
+//! seam). Reachability of the apply is pinned by `tests/tuning_apply_reach.rs`.
 //!
 //! One key is allowed (owner, 2026-11-03): `extensions.worktreeConfig = true`,
 //! and only as git's own side effect. A sparse worktree needs its cone kept per
@@ -29,7 +47,21 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-const KEYS: [&str; 2] = ["core.untrackedcache", "core.fsmonitor"];
+const KEYS: [&str; 3] = ["core.untrackedcache", "core.fsmonitor", "feature.manyfiles"];
+
+/// The file that builds the apply's argv, and the one that reads the keys.
+const TUNING_ARGV_FILE: &str = "storage/repo_tuning/advice.rs";
+const TUNING_READ_FILE: &str = "storage/repo_tuning.rs";
+
+/// The keys the apply may write, and the two `git maintenance start` writes
+/// that its undo removes.
+const WRITE_KEYS: [&str; 2] = ["feature.manyFiles", "core.fsmonitor"];
+const UNSET_KEYS: [&str; 4] = [
+    "feature.manyFiles",
+    "core.fsmonitor",
+    "maintenance.auto",
+    "maintenance.strategy",
+];
 
 /// Read-only forms of `git config`, old flags and the `get` / `list`
 /// subcommands. Anything else after `"config"` writes. (`npm config get cache`
@@ -128,8 +160,73 @@ fn violations(production: &str) -> Vec<String> {
     found
 }
 
+/// The string literals of every `strings(&[...])` argv in `production`.
+fn argv_literals(production: &str) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    for (at, _) in production.match_indices("strings(&[") {
+        let rest = &production[at + "strings(&[".len()..];
+        let end = rest.find("])").unwrap_or(rest.len());
+        let tokens: Vec<String> = rest[..end]
+            .split('"')
+            .enumerate()
+            .filter_map(|(i, part)| (i % 2 == 1).then(|| part.to_string()))
+            .collect();
+        out.push(tokens);
+    }
+    out
+}
+
+/// What in the tuning module's `production` text breaks the narrowed posture.
+fn tuning_violations(production: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for flag in [
+        "\"--global\"",
+        "\"--system\"",
+        "\"--add\"",
+        "\"--replace-all\"",
+        "\"--unset-all\"",
+        "\"--file\"",
+        "\"-f\"",
+    ] {
+        if production.contains(flag) {
+            found.push(format!("names the forbidden flag {flag}"));
+        }
+    }
+    for argv in argv_literals(production) {
+        let words: Vec<&str> = argv.iter().map(String::as_str).collect();
+        match words.as_slice() {
+            ["git", "config", "--local", key, "true"] if WRITE_KEYS.contains(key) => {}
+            ["git", "config", "--local", "--unset", key] if UNSET_KEYS.contains(key) => {}
+            ["git", "maintenance", "start" | "unregister"] => {}
+            ["git", "fsmonitor--daemon", "stop"] => {}
+            other => found.push(format!("argv outside the narrowed set: {other:?}")),
+        }
+    }
+    // `git config` must not be built any other way in this file.
+    for needle in ["\"config\",", "\"config\")"] {
+        for (at, _) in production.match_indices(needle) {
+            let before = production[..at].trim_end();
+            let window_start = production[..at]
+                .char_indices()
+                .rev()
+                .nth(80)
+                .map_or(0, |(i, _)| i);
+            let in_strings = production[window_start..at].contains("strings(&[");
+            let as_argv =
+                before.ends_with('[') || before.ends_with(".arg(") || before.ends_with("\"git\",");
+            if as_argv && !in_strings {
+                found.push(format!(
+                    "line {}: a `config` argv not built by strings(&[..])",
+                    line_of(production, at)
+                ));
+            }
+        }
+    }
+    found
+}
+
 #[test]
-fn no_production_code_writes_repo_config_or_enables_untracked_cache_or_fsmonitor() {
+fn no_production_code_writes_repo_config_outside_the_tuning_apply() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     rust_files(&src, &mut files);
@@ -148,15 +245,34 @@ fn no_production_code_writes_repo_config_or_enables_untracked_cache_or_fsmonitor
         }
         scanned += 1;
         let text = std::fs::read_to_string(&path).expect("read source");
-        for finding in violations(&production_text(&text)) {
+        let production = production_text(&text);
+        if rel == TUNING_ARGV_FILE {
+            // The owner-approved apply: the one file that builds its argv.
+            for finding in tuning_violations(&production) {
+                report.push(format!("{rel}: {finding}"));
+            }
+            continue;
+        }
+        if rel == TUNING_READ_FILE {
+            // Names the keys to READ them from git's config list. It builds no
+            // argv at all.
+            for finding in violations(&production)
+                .into_iter()
+                .filter(|f| !f.contains("is set to something other than `=false`"))
+            {
+                report.push(format!("{rel}: {finding}"));
+            }
+            continue;
+        }
+        for finding in violations(&production) {
             report.push(format!("{rel}: {finding}"));
         }
     }
     assert!(scanned > 100, "scanned only {scanned} production files");
     assert!(
         report.is_empty(),
-        "GitPulse must not write repo config or set core.untrackedCache / core.fsmonitor \
-         (owner decision ft-7450105d); the user enables those themselves:\n{}",
+        "GitPulse must not write repo config or set core.untrackedCache / core.fsmonitor / \
+         feature.manyFiles outside the owner-approved tuning apply (ft-7450105d, ft-6b68be32):\n{}",
         report.join("\n")
     );
 }
@@ -201,4 +317,63 @@ fn the_scan_allows_the_reads_the_app_makes_and_the_off_switch() {
 fn the_scan_stops_at_the_test_module() {
     let text = "fn real() {}\n#[cfg(test)]\nmod tests {\n    fn t() { git(&[\"config\", \"core.fsmonitor\", \"true\"]); }\n}\n";
     assert!(violations(&production_text(text)).is_empty());
+}
+
+/// The narrowed check is only worth its green if it goes red on every way of
+/// widening the apply.
+#[test]
+fn the_tuning_check_flags_each_way_of_widening_the_apply() {
+    let flagged = [
+        r#"strings(&["git", "config", "--local", "core.splitIndex", "true"])"#,
+        r#"strings(&["git", "config", "--global", "feature.manyFiles", "true"])"#,
+        r#"strings(&["git", "config", "--local", "feature.manyFiles", "false"])"#,
+        r#"strings(&["git", "config", "--local", "core.fsmonitor", "/evil/hook"])"#,
+        r#"strings(&["git", "config", "--local", "core.hooksPath", "/evil"])"#,
+        r#"strings(&["git", "config", "--local", "--unset", "core.hooksPath"])"#,
+        r#"strings(&["git", "maintenance", "stop"])"#,
+        r#"strings(&["git", "config", "--local", "feature.manyFiles", "true", "x"])"#,
+        r#"let args = ["--add"];"#,
+        r#"git(&["config", "--local", "core.fsmonitor", "true"]);"#,
+    ];
+    for source in flagged {
+        assert!(
+            !tuning_violations(source).is_empty(),
+            "not flagged: {source}"
+        );
+    }
+}
+
+#[test]
+fn the_tuning_check_allows_exactly_the_apply_and_its_undo() {
+    for source in [
+        r#"strings(&["git", "config", "--local", "feature.manyFiles", "true"])"#,
+        r#"strings(&["git", "config", "--local", "core.fsmonitor", "true"])"#,
+        r#"strings(&["git", "maintenance", "start"])"#,
+        r#"strings(&["git", "maintenance", "unregister"])"#,
+        r#"strings(&["git", "fsmonitor--daemon", "stop"])"#,
+        r#"strings(&["git", "config", "--local", "--unset", "maintenance.auto"])"#,
+    ] {
+        assert_eq!(tuning_violations(source), Vec::<String>::new(), "{source}");
+    }
+}
+
+/// The real file, not a fixture: every key the apply writes is in the owner's
+/// list, and `core.splitIndex` is never an argv element anywhere in it.
+#[test]
+fn the_real_tuning_file_passes_its_own_narrowed_check() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join(TUNING_ARGV_FILE);
+    let text = std::fs::read_to_string(&path).expect("tuning advice source");
+    let production = production_text(&text);
+    assert_eq!(tuning_violations(&production), Vec::<String>::new());
+    let argvs = argv_literals(&production);
+    assert!(argvs.len() >= 5, "found only {} argv builders", argvs.len());
+    assert!(
+        !argvs
+            .iter()
+            .flatten()
+            .any(|w| w.to_ascii_lowercase().contains("splitindex")),
+        "core.splitIndex must never be an argv element"
+    );
 }

@@ -603,7 +603,7 @@ fn config_value_is_false(value: &str) -> bool {
 /// `extensions.partialclone`, or any remote marked `promisor`. A promisor value
 /// is a partial clone unless it is plainly false (a bare key counts), so an
 /// unreadable value fails towards refusing the write.
-fn config_is_partial_clone(config: &std::collections::HashMap<String, String>) -> bool {
+pub(super) fn config_is_partial_clone(config: &std::collections::HashMap<String, String>) -> bool {
     config
         .get("extensions.partialclone")
         .is_some_and(|remote| !remote.trim().is_empty())

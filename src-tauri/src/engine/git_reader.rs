@@ -3888,6 +3888,119 @@ fn parse_config_list(text: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// Which config file layer a value came from, as `git config --show-scope`
+/// names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigScope {
+    System,
+    Global,
+    /// The repository's own `.git/config`.
+    Local,
+    /// A linked worktree's `config.worktree`.
+    Worktree,
+    /// `-c` or `GIT_CONFIG_*`: never a file the user can edit for this repo.
+    Command,
+    /// A scope git did not name (some distributions' system config).
+    Unknown,
+}
+
+impl ConfigScope {
+    fn parse(word: &str) -> Self {
+        match word {
+            "system" => Self::System,
+            "global" => Self::Global,
+            "local" => Self::Local,
+            "worktree" => Self::Worktree,
+            "command" => Self::Command,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// One value of the effective config with the layer it was read from. Unlike
+/// [`config_snapshot`] every value of a multi-valued key is kept, in git's
+/// reading order (later wins for a single-valued key).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConfigEntry {
+    /// Lowercased section and variable, subsection case kept.
+    pub key: String,
+    pub value: String,
+    pub scope: ConfigScope,
+}
+
+/// The effective config with each value's scope, through the same cache as
+/// [`config_snapshot`] (a distinct entry: the arguments differ). The repository
+/// tuning detector reads this so it spawns nothing of its own.
+pub(crate) fn config_entries(repo: &Path) -> Result<Vec<ConfigEntry>, CommandError> {
+    config_entries_with(repo, Reads::Cached)
+}
+
+/// [`config_entries`] straight from git, never from the cache. For the apply,
+/// which decides what to write, and reports what it wrote, on the answer: the
+/// cache's stamp does not see the global config `git maintenance start` edits.
+pub(crate) fn config_entries_fresh(repo: &Path) -> Result<Vec<ConfigEntry>, CommandError> {
+    config_entries_with(repo, Reads::Fresh)
+}
+
+fn config_entries_with(repo: &Path, reads: Reads) -> Result<Vec<ConfigEntry>, CommandError> {
+    let args = ["config", "--list", "-z", "--show-origin", "--show-scope"];
+    let text = match reads {
+        Reads::Cached => ref_cache::git_text(repo, &[], &args)?,
+        Reads::Fresh => git_text(repo, &args)?,
+    };
+    parse_config_entries(&text).map_err(CommandError::from)
+}
+
+/// `scope NUL origin NUL key NL value NUL` per entry. A stream that is not a
+/// whole number of entries is refused rather than read part-way.
+fn parse_config_entries(text: &str) -> Result<Vec<ConfigEntry>, String> {
+    let mut tokens: Vec<&str> = text.split('\0').collect();
+    if tokens.last() == Some(&"") {
+        tokens.pop();
+    }
+    if tokens.len() % 3 != 0 {
+        return Err("git config --show-scope printed a truncated entry".to_string());
+    }
+    Ok(tokens
+        .chunks_exact(3)
+        .map(|entry| {
+            let (key, value) = match entry[2].split_once('\n') {
+                Some((key, value)) => (key, value),
+                None => (entry[2], ""),
+            };
+            ConfigEntry {
+                key: key.to_string(),
+                value: value.to_string(),
+                scope: ConfigScope::parse(entry[0]),
+            }
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod config_entries_tests {
+    use super::*;
+
+    #[test]
+    fn scope_origin_key_value_triples_keep_every_value_of_a_multi_valued_key() {
+        let text = "global\0file:/h/.gitconfig\0maintenance.repo\n/a\0global\0file:/h/.gitconfig\0maintenance.repo\n/b\0local\0file:.git/config\0core.bare\nfalse\0unknown\0file:/x\0credential.helper\n\0";
+        let entries = parse_config_entries(text).unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].value, "/a");
+        assert_eq!(entries[1].value, "/b");
+        assert_eq!(entries[2].scope, ConfigScope::Local);
+        assert_eq!(entries[3].scope, ConfigScope::Unknown);
+        assert_eq!(entries[3].value, "");
+    }
+
+    #[test]
+    fn a_truncated_stream_is_an_error_not_a_shorter_config() {
+        assert!(parse_config_entries("global\0file:/h\0a.b\nc\0local\0file:x\0").is_err());
+        assert_eq!(parse_config_entries("").unwrap(), Vec::new());
+    }
+}
+
 /// Remote names configured as `remote.<name>.<key>`, deduplicated. A name
 /// may itself contain dots, so it is everything between the section and the
 /// last component.

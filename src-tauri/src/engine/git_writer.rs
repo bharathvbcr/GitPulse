@@ -3485,6 +3485,22 @@ fn record_commit_graph_write(
     ended: &str,
     elapsed: std::time::Duration,
 ) {
+    record_clicked_write(repo, common, argv, "commit_graph.write", ended == "written", ended, elapsed);
+}
+
+/// Journals how one user-clicked, gated write ended: the shared tail of the
+/// commit-graph write and the tuning apply, so the two cannot drift in what a
+/// ledger row carries. `ok` decides the row's outcome; `ended` is the word the
+/// detail records (`written`, `applied`, `cancelled`, `timed_out`, `failed`).
+pub(crate) fn record_clicked_write(
+    repo: &Path,
+    common: &Path,
+    argv: &[String],
+    kind: &str,
+    ok: bool,
+    ended: &str,
+    elapsed: std::time::Duration,
+) {
     let repo_text = repo.to_string_lossy().into_owned();
     let address = crate::ledger::bindings::repository_address(&repo_text).ok();
     let anchor = address
@@ -3500,14 +3516,14 @@ fn record_commit_graph_write(
         action: crate::ledger::action_for_argv(&GitWriter::argv_refs(argv)),
         object: Some(common.to_string_lossy().into_owned()),
         argv_json: serde_json::to_string(argv).ok(),
-        outcome: Some(if ended == "written" {
+        outcome: Some(if ok {
             crate::ledger::Outcome::Ok
         } else {
             crate::ledger::Outcome::Failed
         }),
         detail_json: serde_json::to_string(&serde_json::json!({
             "phase": "mutate",
-            "kind": "commit_graph.write",
+            "kind": kind,
             "ended": ended,
             "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
         }))

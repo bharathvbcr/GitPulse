@@ -2202,3 +2202,66 @@ Symptoms reported: a blank or flickering pane and laggy output, with GPU renderi
 - **WebGL atlas corruption at DPR 2** (xterm.js #5847/#5883, not transparency). Corrupted runs were 2–5 of 5 on 0.19 in both engines, 0 of 5 on the 6.1.0-beta.316 / 0.20.0-beta.310 pair, and 0 of 5 when the atlas is cleared every 25 chunks. Repro: `node scripts/glass-atlas-repro.mjs webkit "arms=glass-a0&runs=5&frames=300&pace=3&ops=8"`. The branch pins 6.1.0-beta.317 / 0.20.0-beta.311, whose `lib/` matches .316 / .310 apart from the version string.
 - **ghostty-web 0.4.0 spike.** Not adopted. Against xterm's DOM renderer it used 2.3× the CPU and parsed floods 2–4× slower. WASM memory grew about 23× the bytes written. It paints in the middle of DEC 2026 frames, and about half of the xterm APIs GitPulse uses are missing. The raw data is kept, untracked, under `tmp/ghostty-spike-2026-10-28/` in the main checkout.
 - **The WebGL A/B win rule (§ 2026-10-14) is still owed.** It needs the installed app quit and an attended window, and its first blocker, the `allowTransparency` decision (ft-cc4be67b), is still open. The atlas repro above says the corruption that card was opened for is the atlas bug, not transparency.
+
+## 2026-11-06: repository tuning thresholds (ft-6b68be32)
+
+The Storage panel may offer, and on a click apply, three changes: `feature.manyFiles`, `core.fsmonitor` and `git maintenance start` (owner decision, 2026-11-06). Each is offered only from a threshold taken from the measurements below (`storage/repo_tuning/advice.rs`; the test `nothing_is_offered_below_any_threshold` and `each_offer_starts_exactly_at_its_threshold` pin them). Nothing is offered below its threshold, and an input that could not be read offers nothing.
+
+**Method.** `scripts/bench-git-tuning.mjs <packs|loose|files>`: throwaway repositories under a scratch directory built with `git fast-import` (4,000 commits, 4 changed files each, 2,000 files, for `packs`; 500 files for `loose`), git 2.54.0 (Apple Git-157), `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_OPTIONAL_LOCKS=0`, `core.commitGraph=false` so object lookups are what is timed. Arms are interleaved (every round runs each arm once, order rotated), 9 rounds (7 for `files`), min of N reported. The machine was loaded the whole time (load average 17 to 40 on 18 cores, M5 Pro, macOS 27), so the noise floor is wide: at `packs=1` the three arms are the same repository content and differed by up to 1.21x on a history walk and 0.63 to 1.96x on `status`. **`status` figures from `packs` and `loose` are therefore not used**; a history-walk ratio is read only when it is clearly outside about 1.2x. The tables give min-of-9 ratios against the baseline arm (below 1 is faster); raw logs were kept in the lane scratch directory, not committed.
+
+### Packs, and a multi-pack-index (`packs`)
+
+One pack is the baseline. The packs were cut from the same history (`pack-objects` per slice), 286 being 4,000 commits one slice each.
+
+| packs | rev-list --count | log -n 200 --stat | log -- path | rev-list --objects |
+| --- | --- | --- | --- | --- |
+| 10 | 0.94 | 0.89 | 1.09 | 0.97 |
+| 30 | 1.05 | 1.01 | 1.10 | 1.02 |
+| 100 | 1.23 to 1.44 | 1.04 to 1.13 | 1.32 to 1.38 | 1.15 to 1.22 |
+| 286 | 1.78 to 1.97 | 1.43 | 1.61 to 1.86 | 1.59 to 1.77 |
+
+(Where two figures are given they are the two runs, `packs.md` then `packs2.md`.) Many packs cost a history walk 1.2 to 1.4x at 100 and 1.6 to 2.0x at 286, and nothing outside noise at 30 or fewer. Two things did **not** help, and are why pack count is not an offer:
+
+* A multi-pack-index written over the many packs was no faster than the many packs themselves (`rev-list --count` 1.03, 0.91, 1.11, 1.44, 1.97 against 0.97, 0.94, 1.05, 1.44, 1.97 for no index). It is reported by the detector (`midx`) and not offered.
+* One `git maintenance run --task=incremental-repack` over 100 and 286 equal-sized packs left 101 and 287 packs (it added one), and the walk was as slow as before (1.33 and 1.96x `rev-list --count`). Consolidating them is `git repack -a -d`, a different and heavier action that this change does not offer.
+
+### Loose objects (`loose`)
+
+The same history held as loose objects, against packed.
+
+| loose objects | rev-list --count | log -n 200 --stat | log -- path | rev-list --objects |
+| --- | --- | --- | --- | --- |
+| 1,571 | 1.31 | 8.0 | 1.67 | 2.76 |
+| 5,471 | 2.00 | 8.9 | 4.03 | 6.70 |
+| 15,235 | 3.18 to 4.80 | 8.2 to 9.2 | 7.2 to 7.6 | 12.6 to 12.8 |
+| 39,690 | 7.98 | 11.8 | 12.0 | 16.1 |
+
+After one `git maintenance run --task=loose-objects` on the 15,235-object repository the walk was back to the packed figure: 1.09, 1.00, 1.04 and 1.10x for the four operations (one pack made; the loose copies are left for `prune-packed`). That is the action `git maintenance start` schedules, and the one measured benefit that supports an offer.
+
+### Index format (`files`)
+
+`feature.manyFiles` (index v4, `index.skipHash`, untracked cache) against git's defaults, one commit of N files spread over 100 directories, an untracked file present, one priming `status` per arm.
+
+| tracked files | index bytes default / manyFiles | status | ls-files | add (index rewrite) |
+| --- | --- | --- | --- | --- |
+| 5,000 | 402,930 / 357,933 | 0.40 | 1.02 | 0.87 |
+| 20,000 | 1,603,030 / 1,421,249 | 0.57 | 0.98 | 0.96 |
+| 40,000 | 3,203,030 / 2,838,869 | 0.28 | 0.99 | 0.99 |
+| 100,000 | 8,003,130 / 7,091,830 | 0.87 | 1.07 | 0.93 |
+
+The index is 11 percent smaller; `ls-files` and a one-file `add` do not change. `status` is faster in every row, but the size of the gain does not rise with the file count, and it contradicts the 2026-10-13 spike below, which saw no effect from `core.untrackedCache` alone. This run was under load, with a fixture of 50 to 100 directories where the untracked cache saves the directory scans, and I did not separate the three parts of `feature.manyFiles`. The threshold is therefore a policy choice, not the smallest size at which a gain appeared: **20,000 tracked files**, where the gain is outside the noise, and where the cost of the change (a git older than 2.40 reports a corrupt skipHash index on `fsck`, a git older than 2.13 refuses the index) is worth paying. A repository with a split index or a sparse index has an unreliable header count and is never offered it.
+
+### fsmonitor
+
+Unchanged from the 2026-10-13 spike below: 1.29 to 1.73x slower under about 10,000 tracked files, parity near 6,000, 20 to 45 percent faster at 40,000 and above. **40,000 tracked files**, on macOS only (the only platform measured), and only for git 2.35.2 or newer, where a boolean value is read as a boolean. It was not re-measured today.
+
+### Thresholds, as shipped
+
+| change | offered when | evidence |
+| --- | --- | --- |
+| `feature.manyFiles` | 20,000 or more tracked files (exact count), key unset, no split index, git 2.13 or newer | the `files` table |
+| `core.fsmonitor` | 40,000 or more tracked files, macOS, key unset, git 2.35.2 or newer | the 2026-10-13 spike |
+| `git maintenance start` | about 6,700 or more loose objects and past `gc.auto`, not registered, `gc.auto` and `maintenance.auto` not turned off | the `loose` table and the `loose-objects` task row |
+| pack count, multi-pack-index | never offered; reported only | the `packs` tables |
+
+An unset key is the only one offered for: any value the person set (`false`, a hook path, `true`) is respected.
