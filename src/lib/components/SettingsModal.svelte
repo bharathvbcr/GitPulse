@@ -766,6 +766,21 @@
                     </p>
                   </div>
 
+                  <div data-setting="terminal-smooth-wheel" hidden={!shown("terminal-smooth-wheel")}>
+                    <SettingToggle
+                      label="Smooth mouse-wheel scrolling in terminals"
+                      description="A mouse-wheel notch glides over a moment instead of jumping several rows."
+                      ariaLabel="Smooth mouse-wheel scrolling in terminals"
+                      checked={$interfaceStore.terminalSmoothWheel}
+                      onchange={(next) => interfaceStore.setTerminalSmoothWheel(next)}
+                    />
+                    <p class="text-textMuted text-[10px] leading-snug">
+                      On by default. A trackpad always scrolls directly, and a system
+                      setting for reduced motion turns the glide off whatever this says.
+                      Applies to open terminals at once.
+                    </p>
+                  </div>
+
                   <div data-setting="terminal-scrollback" hidden={!shown("terminal-scrollback")}>
                     <div class="text-textMuted text-[10px] mb-1.5">Terminal scrollback: shells (rows)</div>
                     <SettingSegment

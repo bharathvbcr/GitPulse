@@ -161,6 +161,8 @@
   import { observeResize } from "../dom/observeResize";
   import { watchDevicePixelRatio } from "../dom/devicePixelRatio";
   import { createFitScheduler } from "../terminal/fitSchedule";
+  import { createScrollFeel, isScrolledBack, scrollFeelOptions, type ScrollFeel } from "../terminal/scrollFeel";
+  import { wheelDiagnostic } from "../terminal/wheelDiagnostic";
   import { openExternal } from "../desktop/openExternal";
   import { repoStore } from "../stores/repoStore";
   import { linksForRow, resolveLinkAction, type LinkBuffer } from "../terminal/links";
@@ -310,6 +312,7 @@
   let resultCount = $state(0);
   let fontSize = $state(get(interfaceStore).terminalFontSize);
   let scrolledBack = $state(false);
+  let scrollFeel: ScrollFeel | null = null;
   /** What the pointer is currently over, shown in the footer so the target is
    * readable before the click rather than only after it. */
   let hoveredLink = $state<string | null>(null);
@@ -485,6 +488,8 @@
       // background as a plain CSS colour.
       allowTransparency: true,
       scrollback: sessionScrollback(),
+      // Wheel feel: see `terminal/scrollFeel.ts` and docs/PERFORMANCE.md (2026-11-06).
+      ...scrollFeelOptions(get(interfaceStore).terminalSmoothWheel),
       screenReaderMode: get(interfaceStore).terminalScreenReader,
       /**
        * OSC 8 hyperlinks — the ones a program embeds in its own output.
@@ -549,7 +554,7 @@
       },
     });
     created.onScroll(() => {
-      scrolledBack = created.buffer.active.viewportY < created.buffer.active.baseY;
+      scrolledBack = isScrolledBack(created.buffer.active);
     });
     created.onData((data) => {
       const shape = describeTerminalControl(data);
@@ -1365,6 +1370,7 @@
       host.addEventListener("webglcontextlost", onContextLost, true);
       const t = ensureTerm();
       t?.open(host);
+      if (t) scrollFeel = createScrollFeel(t, { enabled: () => get(interfaceStore).terminalSmoothWheel, onSample: wheelDiagnostic() });
       if (t) {
         gpu = createGpuRenderer({
           attach: () => {
@@ -1457,6 +1463,8 @@
       stopResize = null;
       themeObserver?.disconnect();
       themeObserver = null;
+      scrollFeel?.detach();
+      scrollFeel = null;
       // Before the terminal: the addon gives its slot back to the shared pool.
       gpu?.dispose();
       gpu = null;
@@ -1476,6 +1484,12 @@
   $effect(() => {
     const on = $interfaceStore.terminalScreenReader;
     if (term) term.options.screenReaderMode = on;
+  });
+
+  /** The wheel glide follows its setting on live sessions too. */
+  $effect(() => {
+    void $interfaceStore.terminalSmoothWheel;
+    scrollFeel?.refresh();
   });
 
   /** Option as Meta follows its setting on live sessions too (macOS only). */

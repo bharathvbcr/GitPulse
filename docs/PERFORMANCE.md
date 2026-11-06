@@ -2202,3 +2202,137 @@ Symptoms reported: a blank or flickering pane and laggy output, with GPU renderi
 - **WebGL atlas corruption at DPR 2** (xterm.js #5847/#5883, not transparency). Corrupted runs were 2–5 of 5 on 0.19 in both engines, 0 of 5 on the 6.1.0-beta.316 / 0.20.0-beta.310 pair, and 0 of 5 when the atlas is cleared every 25 chunks. Repro: `node scripts/glass-atlas-repro.mjs webkit "arms=glass-a0&runs=5&frames=300&pace=3&ops=8"`. The branch pins 6.1.0-beta.317 / 0.20.0-beta.311, whose `lib/` matches .316 / .310 apart from the version string.
 - **ghostty-web 0.4.0 spike.** Not adopted. Against xterm's DOM renderer it used 2.3× the CPU and parsed floods 2–4× slower. WASM memory grew about 23× the bytes written. It paints in the middle of DEC 2026 frames, and about half of the xterm APIs GitPulse uses are missing. The raw data is kept, untracked, under `tmp/ghostty-spike-2026-10-28/` in the main checkout.
 - **The WebGL A/B win rule (§ 2026-10-14) is still owed.** It needs the installed app quit and an attended window, and its first blocker, the `allowTransparency` decision (ft-cc4be67b), is still open. The atlas repro above says the corruption that card was opened for is the atlas bug, not transparency.
+
+
+## 2026-11-06: terminal scroll smoothness (ft-d779b65338ff15967e69baf8fa5fea7f)
+
+Owner report: flicker is fixed, scrolling could be smoother. This section is the bench, what it showed, the change it supports, and what it says about the framework. Figures are browser-harness figures from one M-series Mac (macOS 27, 60 Hz display, load not controlled), not the installed app.
+
+### What xterm 6.1.0-beta.317 does (source read, not remembered)
+
+- Defaults: `smoothScrollDuration` 0, `scrollSensitivity` 1, `fastScrollSensitivity` 5 (`node_modules/@xterm/xterm/src/common/services/OptionsService.ts:23,38,40`). GitPulse set none of them.
+- A wheel event's distance comes from `wheelDeltaY / 120` when the event has it, else `-deltaY / 40`, times 50 px (`browser/scrollable/mouseEvent.ts:233,247`, `browser/scrollable/scrollableElement.ts:23`). How many rows a notch moves therefore depends on the `wheelDeltaY` the platform reports for it: a Chromium-on-Windows notch (`deltaY` 100, `wheelDeltaY` 120) is 50 px, about 3 rows at the 13 px / 1.15 line height this terminal uses; a faster or accelerated wheel is more.
+- With a duration set, xterm animates only what its `MouseWheelClassifier` calls a physical wheel (`scrollableElement.ts:56,423-425`). That classifier scores a whole-number delta stream as a wheel, and a trackpad can send whole numbers, so GitPulse does not rely on it alone (`isWheelNotch`, below).
+- The viewport is row-quantized: `Viewport._handleScroll` rounds the pixel position to a row (`browser/Viewport.ts:212`) and both renderers index rows as `y + ydisp` (`addon-webgl/src/WebglRenderer.ts:458`; `browser/renderer/dom/DomRenderer.ts:537`). "Smooth" can only mean the same distance in smaller row steps.
+- No public call scrolls without the smooth viewport: `Terminal.scrollLines`, `scrollPages` and `scrollToLine` all go through `Viewport.scrollLines` (`browser/CoreBrowserTerminal.ts:702-707,728-732`), and `Terminal.scrollToBottom()` passes no argument (`browser/public/Terminal.ts:213-215`), though the core method has a `disableSmoothScroll` parameter (`CoreBrowserTerminal.ts:720`).
+
+### The bench
+
+`node scripts/terminal-scroll-bench.mjs <chrome|webkit> [rounds] [deadlineSeconds] [query]`, page `harness/terminal-scroll.html`, code `harness/scrollBench.ts` and `harness/scrollScript.ts`, unit tests `scripts/terminal-scroll-bench.test.ts`. Run it from the checkout to measure (Vite serves from the working directory).
+
+- **Trial:** a fresh 120 × 40 terminal with a 6,000-row scrollback, filled with 5,000 rows of colour-run text (`line` in `scrollScript.ts`), WebGL through the real `createGpuRenderer` and the attach `TerminalSession` uses, or the DOM renderer. Then one scripted gesture and 600 ms of settling.
+- **Input,** as `WheelEvent`s on `.xterm-screen`, one per animation frame (every scripted event that has come due is summed, as a browser coalesces them). A constructed event reports `wheelDeltaY` with the wrong sign and scale for xterm (Chrome: `+100` for `deltaY` 100), so `wheelEvent` sets it. The two relations used are **inferred**, not read from a device: `wheelDeltaY = -1.2 × deltaY` for the wheel inputs (100 px is a notch of 120 units, as Chromium reports on Windows) and `-3 × deltaY` for the trackpad inputs (120 units per 40 px, the relation xterm's `-deltaY / 40` fallback assumes). No real wheel or trackpad was available.
+  - `wheel`: 24 notches of `deltaY` 100, one per 70 ms: 50 px, about 3 rows each.
+  - `wheel-fast`: the same 24 events at three notches each (`deltaY` 300): a spun or accelerated wheel, about 10 rows each.
+  - `pixel`: trackpad-like, 120 Hz, fractional pixel deltas: 48 events of a finger phase, then momentum decaying 4% per event to under half a pixel.
+  - `pixel-int`: the same rounded to whole pixels, the case xterm's classifier would call a wheel.
+- **Output:** idle, or streaming 2 colour lines every 16 ms (about 125 lines/s) throughout. The scrollback is larger than the fill so streaming never trims the buffer and moves the viewport by itself.
+- **Metrics:** per animation frame, the time since the previous frame (p50, p95, max, frames over 18.5 ms, frames over 33 ms; 18.5 is 16.7 ms plus the 1.8 ms WebKit's whole-millisecond timestamps and vsync jitter add, so it reads "missed a vsync" on a 60 Hz panel), and the rows `viewportY` moved (largest step; stalls = frames that did not move between the first move and the last). Stalls are only a smoothness measure when the gesture moves more than a row per frame: at 3 rows per 70 ms (`wheel`) a perfectly even glide still has frames with no row boundary in them, so read `wheel` by its largest step and `wheel-fast` by both. Also the synchronous cost of the wheel dispatch and of the `onScroll` handler, and (`option-cost` lines) what two `smoothScrollDuration` writes cost on a full terminal: synchronous time per pair and the length of the next frame against a frame with no write, 30 pairs per renderer. "Gesture lost" is a streaming trial that ended with the view at the bottom.
+- **Design:** every round runs every arm once, in an order that rotates per round (`roundOrder`). Each metric is computed per trial and reported as min and median over the rounds; N = 5 per arm in the table. The WebKit runner is the system WKWebView (the app's engine), Chrome is headless Chrome; both ran. One WebKit page cannot run more than a few dozen WebGL trials (a 60-trial page never reported in 600 s; cause not investigated, WebKit's active-context cap in `gpuRenderer.ts` is the suspect), so the WebKit rows ran as one page per renderer, output and input. The classifier in xterm is a process-wide singleton with five items of memory, so the first events of a trial can be scored against the previous trial's; the rotation spreads that, it does not remove it.
+- **Not exercised:** fit and resize during a scroll, link scans, a warm glyph atlas (each WebGL trial starts with a cold one, so atlas uploads are inside every number), a display above 60 Hz, a real wheel or trackpad.
+
+### What it showed
+
+1. **Frame pacing is not the problem, with one exception.** On both engines and both renderers, idle and streaming, p50 is one vsync (Chrome 16.7 ms; WebKit 17 ms) and p95 is 16.7-19 ms. Frames over 33 ms: 0 in the 240 DOM trials of both engines; 6 in the 120 Chrome WebGL trials and 8 in the 120 WebKit WebGL trials, scattered across rows, before and after pooled in the table. The WebGL-only jank is **inferred** to be glyph-atlas upload on a cold atlas (every trial starts cold, DOM has no atlas, and the frames are rare and isolated); the bench did not isolate it, and it is the same before and after the change. The `onScroll` handler, including the `scrolledBack` write, costs at most 0.02 ms per event over the 480 trials (WebKit's 1 ms timer makes that an upper bound), most of its events being output lines. **No per-event Svelte write, fit or resize is attributable from these numbers, so none was changed.**
+2. **A discrete wheel moves in whole-row jumps.** With xterm's defaults a `wheel` notch moves 3 rows in one frame and then nothing until the next notch; a `wheel-fast` event moves 9-10. Both are 74 stalled frames of about 100 in a gesture, on every engine and renderer.
+3. **A smooth duration of 150 ms spreads them:** largest step 3 → 2 (`wheel`) and 9 → 5 (`wheel-fast`); `wheel-fast` stalls 74 → 3-7. The benefit grows with the size of the notch; at 3 rows a notch there is little left to smooth.
+4. **Trackpad-like input is not changed.** `pixel` and `pixel-int` are within the spread in every row (below), by design: the glide is on only while the gesture is notch-like.
+5. **Opening the glide opens a race with streaming output** (next section).
+
+Duration sweep (Chrome DOM, idle, N = 5, median; `"renderers=dom&streams=false&inputs=wheel,wheel-fast&smooths=0,100,150,250&guards=false,true"`): `wheel-fast` largest step 9 at 0 ms, 5 at 100, 150 and 250 (4 at 250 unguarded); stalls 74, 14 (4 guarded), 3-4, 3-4. `wheel` is 3 → 2 and 74 → 42-44 at every duration. 150 ms is the shortest duration at which the stalls are gone for the fast wheel and the largest step has stopped improving; longer only adds latency before the view reaches its target.
+
+### The race smooth scrolling opens, and the guard
+
+At the bottom, output moves the view (`ydisp` follows `ybase`) until the buffer counts the user as scrolling, which happens when a whole row of scroll reaches it (`common/services/BufferService.ts:143`). A smooth animation's first frames round to zero rows; a line of output landing in that window makes `Viewport._sync` see a `ydisp` it did not set and cancel the animation (`browser/Viewport.ts:195`). The gesture is swallowed and the view stays at the bottom.
+
+Measured with the first notch model (8 rows a notch, `wheelDeltaY = -3 × deltaY`; `"inputs=wheel&streams=true&smooths=150&guards=false,true"`), 150 ms and no guard: 5 of 50 streaming trials ended at the bottom in Chrome (4/25 WebGL, 1/25 DOM; earlier runs 3/50 and 2/10) and 1 of 10 in WebKit DOM, against 0 of every unsmoothed arm. In the final matrix below (the 3-row and 10-row notches) the same arm lost 1 of 80 streaming trials, and the guarded arm 0 of 80.
+
+The guard (`createScrollFeel` in `src/lib/terminal/scrollFeel.ts`) delivers one row at once on the first notch at the bottom, before xterm's own handler. A first version that called `scrollLines(-1)` without suspending the smoothing was **worse** (14/50 lost against 3/50): `Terminal.scrollLines` goes through the viewport and animates too, so it committed nothing. Because there is no public non-animated scroll, the guard writes `smoothScrollDuration` to 0 around that one call when the glide is on.
+
+**What the option writes cost.** Each write fires `onOptionChange`, which refreshes every row (and the DOM renderer rewrites its CSS). The bench's `option-cost` lines, 30 pairs per renderer per page:
+
+| engine | renderer | two writes, synchronous (min / median / max) | next frame (median / max) | control frame, no write |
+| --- | --- | --- | --- | --- |
+| Chrome | WebGL | 0.00 / 0.10 / 0.20 ms | 16.7 / 16.8 ms | 16.7 / 16.8 ms |
+| Chrome | DOM | 0.10 / 0.20-0.30 / 0.30-0.40 ms | 16.7 / 16.8 ms | 16.7 / 16.7-16.8 ms |
+| WebKit | WebGL | 0 / 0 / 1 ms (1 ms timer) | 16-17 / 18-22 ms | 16-17 / 18-19 ms |
+| WebKit | DOM | 0 / 0 / 1 ms (1 ms timer) | 16-17 / 19 ms | 16-17 / 18-28 ms |
+
+(Chrome: 2 pages per renderer; WebKit: 8 pages per renderer; ranges are across pages.) Under a frame on both engines and both renderers, so the cost is accepted; it is paid at most twice per gesture that starts at the bottom with the glide already on, once when the device changes, and never per event.
+
+### Device class, setting, reduced motion
+
+The glide is on only while the current gesture is a wheel notch, so xterm's own classifier is never the only thing standing between a trackpad and an animation.
+
+- `isWheelNotch` judges one event: `deltaMode` lines, or `wheelDeltaY` a non-zero multiple of 120 (xterm divides it by 120); sub-pixel deltas (under 1 px) are never a notch; with no `wheelDeltaY` (Gecko) a whole-number `deltaY`. A gesture is the events within 250 ms of each other; the first decides its class and any later non-notch event ends the notch class for the rest of it (`createGestureClassifier`). The duration is written only when the class changes, at the first event of a gesture or on a switch of device, not per event.
+- The guard fires only for a notch, so a trackpad's resting jitter (`deltaY` -0.1) never moves a row.
+- **Settings → Appearance → Smooth mouse-wheel scrolling in terminals** (`terminalSmoothWheel`, on by default, applies to open terminals at once). The system's `prefers-reduced-motion: reduce` turns the glide off whatever the setting says, follows changes live, and its listener is removed when the terminal is torn down.
+- **Diagnostic, opt-in:** `localStorage.setItem("gitpulse.debug.wheel", "1")`, then open a terminal. The last 50 wheel events (`deltaY`, `wheelDeltaY`, `deltaMode`, the event's verdict and the gesture's) are readable as `__gitpulseWheelLog()` in the Web Inspector console and each is written to `console.debug("[gitpulse-terminal]", "wheel", ...)` (Verbose level). See docs/TERMINAL.md for how to read it. This is the 2-minute check for whether a real mouse and trackpad are classified as the table assumes.
+
+### Before and after (N = 5 rounds per cell)
+
+"before" is xterm's defaults (`smoothScrollDuration` 0); "after" is what ships: the glide for notches, the guard, and the classifier (the bench's `guard` arm is `createScrollFeel`). p95 and max are the minimum over the rounds, the others the median. The last column is gestures lost to streaming output: before, then smooth 150 without the guard or classifier, then with them.
+
+| engine | renderer | input | output | n | p50 ms | p95 ms (min) | max ms (min) | frames >18.5 ms (med) | frames >33 ms | max rows/frame | stalls (frames) | gestures lost to output |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Chrome | webgl | wheel | idle | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 1 | 3 → 2 | 74 → 44 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | webgl | wheel | stream | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 0 | 3 → 2 | 74 → 44 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | webgl | wheel-fast | idle | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 2 | 9 → 5 | 74 → 4 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | webgl | wheel-fast | stream | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 1 | 9 → 5 | 74 → 4 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | webgl | pixel | idle | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 0 | 11 → 10 | 15 → 15 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | webgl | pixel | stream | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 0 | 10 → 11 | 14 → 16 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | webgl | pixel-int | idle | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 1 | 9 → 10 | 16 → 18 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | webgl | pixel-int | stream | 5 | 16.7 → 16.7 | 16.8 → 16.7 | 16.8 → 16.8 | 0 → 0 | 0 | 10 → 9 | 17 → 17 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | dom | wheel | idle | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 0 | 3 → 2 | 74 → 44 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | dom | wheel | stream | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 0 | 3 → 2 | 74 → 45 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | dom | wheel-fast | idle | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.7 | 0 → 0 | 0 | 9 → 5 | 74 → 4 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | dom | wheel-fast | stream | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 0 | 9 → 5 | 74 → 4 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | dom | pixel | idle | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 0 | 10 → 11 | 16 → 15 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | dom | pixel | stream | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 0 | 10 → 10 | 15 → 15 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | dom | pixel-int | idle | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 0 | 9 → 10 | 17 → 17 | 0/5 → raw 0/5, guarded 0/5 |
+| Chrome | dom | pixel-int | stream | 5 | 16.7 → 16.7 | 16.7 → 16.7 | 16.8 → 16.8 | 0 → 0 | 0 | 10 → 9 | 17 → 17 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | webgl | wheel | idle | 5 | 17.0 → 17.0 | 18.0 → 19.0 | 19.0 → 19.0 | 4 → 15 | 0 | 3 → 2 | 74 → 45 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | webgl | wheel | stream | 5 | 17.0 → 17.0 | 18.0 → 18.0 | 19.0 → 19.0 | 5 → 6 | 0 | 3 → 2 | 75 → 43 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | webgl | wheel-fast | idle | 5 | 17.0 → 17.0 | 19.0 → 18.0 | 30.0 → 21.0 | 14 → 12 | 1 | 9 → 5 | 74 → 7 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | webgl | wheel-fast | stream | 5 | 17.0 → 17.0 | 19.0 → 19.0 | 30.0 → 22.0 | 8 → 7 | 0 | 9 → 5 | 74 → 7 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | webgl | pixel | idle | 5 | 17.0 → 17.0 | 19.0 → 19.0 | 25.0 → 24.0 | 8 → 15 | 2 | 8 → 10 | 15 → 16 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | webgl | pixel | stream | 5 | 17.0 → 17.0 | 19.0 → 18.0 | 26.0 → 20.0 | 9 → 6 | 1 | 10 → 10 | 15 → 16 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | webgl | pixel-int | idle | 5 | 17.0 → 17.0 | 19.0 → 18.0 | 20.0 → 20.0 | 12 → 7 | 2 | 8 → 7 | 18 → 19 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | webgl | pixel-int | stream | 5 | 17.0 → 17.0 | 18.0 → 18.0 | 24.0 → 21.0 | 10 → 7 | 1 | 10 → 8 | 19 → 19 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | dom | wheel | idle | 5 | 17.0 → 17.0 | 19.0 → 19.0 | 19.0 → 19.0 | 14 → 14 | 0 | 3 → 2 | 74 → 42 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | dom | wheel | stream | 5 | 17.0 → 17.0 | 18.0 → 18.0 | 19.0 → 19.0 | 5 → 4 | 0 | 3 → 2 | 74 → 43 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | dom | wheel-fast | idle | 5 | 17.0 → 17.0 | 18.0 → 18.0 | 19.0 → 19.0 | 8 → 5 | 0 | 9 → 5 | 74 → 4 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | dom | wheel-fast | stream | 5 | 17.0 → 17.0 | 18.0 → 18.0 | 19.0 → 19.0 | 5 → 7 | 0 | 9 → 5 | 74 → 3 | 0/5 → raw 1/5, guarded 0/5 |
+| WebKit | dom | pixel | idle | 5 | 17.0 → 17.0 | 18.0 → 18.0 | 19.0 → 19.0 | 7 → 8 | 0 | 9 → 7 | 15 → 15 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | dom | pixel | stream | 5 | 17.0 → 17.0 | 18.0 → 18.0 | 19.0 → 19.0 | 3 → 5 | 0 | 7 → 7 | 15 → 15 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | dom | pixel-int | idle | 5 | 17.0 → 17.0 | 18.0 → 18.0 | 19.0 → 19.0 | 9 → 8 | 0 | 7 → 7 | 19 → 19 | 0/5 → raw 0/5, guarded 0/5 |
+| WebKit | dom | pixel-int | stream | 5 | 17.0 → 17.0 | 18.0 → 18.0 | 19.0 → 19.0 | 7 → 4 | 0 | 7 → 7 | 19 → 19 | 0/5 → raw 0/5, guarded 0/5 |
+
+Reading it: for `wheel-fast`, the largest step falls from 9 rows to 5 and the stalled frames from 74 to 3-7, on both engines and both renderers, idle and streaming; for `wheel` the largest step is 3 → 2 and stalls 74 → 42-45. p50 and p95 are unchanged within the 1 ms timer grain. Frames over 18.5 ms have no consistent direction (Chrome 0 → 0 in all 8 wheel rows; WebKit 3 of 8 rows higher, 5 lower or equal, for example 4 → 15 in WebGL idle `wheel` and 14 → 12 in WebGL idle `wheel-fast`; identical arms swing that far). For `pixel` and `pixel-int` the largest step and stalls are within about two rows, in both directions, in all 16 rows (WebKit `pixel-int`, which an earlier version of this change made worse, is 7 → 7 to 10 → 8). `scripts/terminal-scroll-bench.mjs` asserts what the table assumes: every gesture moved toward history, streaming did not pull a scrolled-back view to the bottom, a smoothed arm ends within a row of the unsmoothed one, and the option-cost probe ran (the runs above passed all of them).
+
+**What this does not settle.** The classifier is judged on the bench's two inferred `wheelDeltaY` relations. A real mouse whose notches are not multiples of 120 in `wheelDeltaY` (a macOS mouse may report others; not checked) is taken for direct input and gets no glide, which is today's behaviour, not a regression; the diagnostic above shows whether that is happening. Use it with the mouse and the trackpad on the installed app before relying on the table.
+
+### What changed
+
+- `src/lib/terminal/scrollFeel.ts`: `SMOOTH_SCROLL_MS = 150`, `scrollFeelOptions()`, `isScrolledBack()`, `isWheelNotch()`, `createGestureClassifier()`, `createScrollFeel()` (glide per gesture class, guard, reduced-motion listener, `refresh()` and `detach()`), `attachScrollGuard()`. `src/lib/terminal/wheelDiagnostic.ts`: the opt-in log.
+- `TerminalSession.svelte`: the options, `isScrolledBack` in `onScroll` (same expression as before), `createScrollFeel` after `open()`, `refresh()` on the setting, `detach()` on teardown. `interfaceStore.ts`, `settingsCatalog.ts`, `SettingsModal.svelte`: `terminalSmoothWheel`, following `terminalOptionAsMeta`.
+- Tests: `scrollFeel.test.ts` (real xterm buffer: scrolled back while output streams stays put and "Latest output" clears it; `scrollOnUserInput` still returns a typed-into view to the bottom; wiring), `scrollFeel.device.test.ts` (classifier, gestures, setting, reduced motion with listener teardown, bounded option writes, the diagnostic), `scrollFeel.adv.test.ts` (review's edge cases on a real xterm; its option-write test now asserts the bound above, with the measurement as its justification), the `interfaceStore` test for the setting, `scripts/terminal-scroll-bench.test.ts`. The race itself is only reproducible in a browser; the bench's streaming check and its "gestures lost" column are its regression test.
+
+### Where the limit is: an owner decision, not built
+
+What is left after the change is whole-row quantization: a trackpad flick still moves up to 7-11 rows between two frames, because xterm moves `ydisp` in integer rows and both renderers draw row `y + ydisp` at an integer position (sources above). A notch is now spread over several frames in steps of at most 2 rows (`wheel`) or 5 (`wheel-fast`), which is as fine as whole rows get at this font size. What a sub-row renderer would take, from the same reading (**inferred**, not prototyped):
+
+- a fractional scroll offset carried from `Viewport` (which already holds a fractional `scrollTop` and rounds it) into the render model, and a translate of the row layer by `scrollTop mod cellHeight`: a DOM-renderer change (one extra transform on the rows container) and, for WebGL, a vertical offset in the cell and glyph vertex shaders plus one extra row drawn at each edge so the translated layer has no gap;
+- selection, link hover, cursor, search decorations and the IME helper position all assume integer rows; each needs the same offset or they drift by up to a row during a scroll;
+- it has to be carried as a patch to `@xterm/xterm` and `@xterm/addon-webgl` (neither exposes it), re-applied on every bump of the beta pins, or replace xterm: the 2026-10-28 ghostty-web spike above measured 2.3x the CPU and 2-4x slower floods and is not an option as it stands.
+
+This bench would be the gate for it: the same `stalls` and `maxStep` columns, plus a sub-row measure it does not have yet. Not started.
+
+### Reproduce
+
+```
+node scripts/terminal-scroll-bench.mjs webkit 5 300 "renderers=dom&streams=true&inputs=wheel-fast&smooths=0,150&guards=false,true"
+node scripts/terminal-scroll-bench.mjs chrome 5 600 "renderers=dom&streams=false&smooths=0,150&guards=false,true"
+```
+
+Keep a WebKit page under about 15 WebGL trials (`3 arms x rounds`); a Chrome page ran 60.

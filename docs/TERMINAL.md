@@ -71,7 +71,13 @@ literal, limited to 256 characters, and searches whatever scrollback the session
 (see **Scrollback** below).
 At 1,000 highlighted results the UI reports **1000+ matches**, not an exact total.
 
-Use **Latest output** to return from scrollback. **Clear scrollback** retains the
+Use **Latest output** to return from scrollback. Scrolling back while a session
+prints keeps your place; the view does not return to the bottom until you press
+**Latest output** or type. A mouse-wheel notch glides over about 150 ms instead of
+jumping several rows at once (**Settings → Appearance → Smooth mouse-wheel
+scrolling in terminals**, on by default; a system "reduce motion" setting turns it
+off). A trackpad always scrolls directly, and a program that has turned on mouse
+reporting keeps the wheel. **Clear scrollback** retains the
 current prompt and session. Text-size controls in the footer change that terminal
 from 10px to 24px; click the size to reset it to 12px. The chosen size becomes the
 default for future sessions. The new-session launcher and dock height are also
@@ -276,6 +282,25 @@ opened for an unrelated reason.
 
 Hyperlinks a program embeds itself (OSC 8) obey the same allowlist, checked
 against the escape sequence's target rather than its display text.
+
+## Checking how the wheel is read
+
+GitPulse decides per gesture whether the input is a mouse-wheel notch (it glides)
+or a trackpad (it does not). To see what your mouse or trackpad sends and what
+GitPulse took it for:
+
+1. In the app's Web Inspector console run
+   `localStorage.setItem("gitpulse.debug.wheel", "1")`, then open a new terminal
+   (the flag is read when a terminal opens).
+2. Scroll with the mouse wheel, then with the trackpad. Run `__gitpulseWheelLog()`
+   to read the last 50 events, or set the console to the Verbose level to see each
+   one as `[gitpulse-terminal] wheel deltaY=… wheelDeltaY=… deltaMode=… notch=…
+   gesture=…`.
+3. A wheel notch should read `notch=true gesture=notch (glide)`: `wheelDeltaY` a
+   multiple of 120, or `deltaMode=1`. Trackpad events should read `notch=false`
+   and `gesture=direct`. If a mouse reads `direct`, its notches are not multiples
+   of 120 and it gets the ordinary jump; report the logged `deltaY` and
+   `wheelDeltaY`. `localStorage.removeItem("gitpulse.debug.wheel")` turns it off.
 
 ## Scrollback
 

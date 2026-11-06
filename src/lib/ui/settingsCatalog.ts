@@ -122,6 +122,12 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "terminal gpu webgl hardware acceleration renderer rendering draw cpu performance glitch shell console",
   },
   {
+    id: "terminal-smooth-wheel",
+    section: "appearance",
+    label: "Smooth mouse-wheel scrolling",
+    keywords: "terminal smooth mouse wheel scroll scrolling glide animate animation notch trackpad shell console",
+  },
+  {
     id: "terminal-scrollback",
     section: "appearance",
     label: "Terminal scrollback",
